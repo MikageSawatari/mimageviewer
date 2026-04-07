@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 
 use eframe::egui;
 use rayon::ThreadPool;
@@ -49,6 +52,8 @@ pub struct App {
     tx: mpsc::Sender<(usize, egui::ColorImage)>,
     rx: mpsc::Receiver<(usize, egui::ColorImage)>,
     thumb_pool: Arc<ThreadPool>,
+    /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
+    cancel_token: Arc<AtomicBool>,
 
     /// スクロールオフセット（行境界にスナップ済み）。自前管理する
     scroll_offset_y: f32,
@@ -79,6 +84,7 @@ impl Default for App {
             tx,
             rx,
             thumb_pool,
+            cancel_token: Arc::new(AtomicBool::new(false)),
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_viewport_h: 600.0,
@@ -89,6 +95,11 @@ impl Default for App {
 
 impl App {
     pub fn load_folder(&mut self, path: PathBuf) {
+        // ── 旧タスクをキャンセル ──────────────────────────────────────
+        self.cancel_token.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_token = Arc::clone(&cancel);
+
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
         self.rx = rx;
@@ -123,9 +134,15 @@ impl App {
             .map(|_| ThumbnailState::Pending)
             .collect();
 
-        // セルサイズに合わせたサムネイルサイズ（前フレームの値を使用）
-        // 4K表示で十分な解像度を確保、最低 512px
         let thumb_px = (self.last_cell_size as u32).max(512).min(1200);
+
+        // ── 可視範囲を計算して優先順に並べる ──────────────────────────
+        // フォルダ移動直後は scroll_offset_y=0 なので先頭が可視範囲
+        let cols = self.grid_cols.max(1);
+        let cell_size = self.last_cell_size.max(1.0);
+        let first_vis_item = (self.scroll_offset_y / cell_size) as usize * cols;
+        let vis_rows = (self.last_viewport_h / cell_size).ceil() as usize + 1;
+        let last_vis_item = first_vis_item + vis_rows * cols;
 
         let image_paths: Vec<(usize, PathBuf)> = self
             .items
@@ -137,19 +154,30 @@ impl App {
             })
             .collect();
 
+        // 可視範囲と範囲外に分割
+        let (visible, rest): (Vec<_>, Vec<_>) = image_paths
+            .into_iter()
+            .partition(|(i, _)| *i >= first_vis_item && *i < last_vis_item);
+
         let pool = Arc::clone(&self.thumb_pool);
         std::thread::spawn(move || {
             pool.install(|| {
                 use rayon::prelude::*;
-                image_paths.par_iter().for_each(|(i, path)| {
-                    if let Ok(img) = image::open(path) {
-                        let thumb = img.thumbnail(thumb_px, thumb_px);
-                        let rgba = thumb.to_rgba8();
-                        let size = [rgba.width() as usize, rgba.height() as usize];
-                        let color_image =
-                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                        let _ = tx.send((*i, color_image));
+
+                // フェーズ1: 可視範囲を最優先で並列ロード
+                visible.par_iter().for_each(|(i, path)| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
                     }
+                    load_one(path, thumb_px, *i, &tx);
+                });
+
+                // フェーズ2: 残りを順番にロード（キャンセル確認しながら）
+                rest.par_iter().for_each(|(i, path)| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    load_one(path, thumb_px, *i, &tx);
                 });
             });
         });
@@ -571,6 +599,22 @@ fn draw_cell(
         egui::Stroke::new(1.0, egui::Color32::from_gray(200))
     };
     painter.rect_stroke(rect, 2.0, border, egui::StrokeKind::Middle);
+}
+
+/// 1枚の画像をロードしてサムネイル化し、チャネルへ送信する
+fn load_one(
+    path: &Path,
+    thumb_px: u32,
+    idx: usize,
+    tx: &mpsc::Sender<(usize, egui::ColorImage)>,
+) {
+    if let Ok(img) = image::open(path) {
+        let thumb = img.thumbnail(thumb_px, thumb_px);
+        let rgba = thumb.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        let _ = tx.send((idx, color_image));
+    }
 }
 
 fn truncate_name(name: &str, max_chars: usize) -> String {
