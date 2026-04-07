@@ -4,11 +4,8 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 use rayon::ThreadPool;
 
-const THUMB_SIZE: u32 = 256;
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
-
-/// サムネイルロードに使うスレッド数の上限（CPU負荷を抑える）
-const THUMB_THREADS: usize = 4;
+const THUMB_THREADS: usize = 8;
 
 // -----------------------------------------------------------------------
 // データモデル
@@ -26,18 +23,15 @@ impl GridItem {
             GridItem::Folder(p) | GridItem::Image(p) => p,
         }
     }
-
     fn name(&self) -> &str {
-        self.path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
+        self.path().file_name().and_then(|n| n.to_str()).unwrap_or("")
     }
 }
 
 pub enum ThumbnailState {
     Pending,
     Loaded(egui::TextureHandle),
+    #[allow(dead_code)]
     Failed,
 }
 
@@ -54,11 +48,15 @@ pub struct App {
     grid_cols: usize,
     tx: mpsc::Sender<(usize, egui::ColorImage)>,
     rx: mpsc::Receiver<(usize, egui::ColorImage)>,
-    /// サムネイルロード専用スレッドプール（負荷上限付き）
     thumb_pool: Arc<ThreadPool>,
-    /// 前フレームのセルサイズ（行単位スクロール計算に使用）
+
+    /// スクロールオフセット（行境界にスナップ済み）。自前管理する
+    scroll_offset_y: f32,
+    /// 前フレームのセルサイズ（スクロール計算に使用）
     last_cell_size: f32,
-    /// true のとき次フレームで選択セルにスクロールする
+    /// 前フレームのビューポート高さ（カーソルキースクロールに使用）
+    last_viewport_h: f32,
+    /// true のとき選択セルが見えるようにオフセットを調整する
     scroll_to_selected: bool,
 }
 
@@ -81,14 +79,15 @@ impl Default for App {
             tx,
             rx,
             thumb_pool,
+            scroll_offset_y: 0.0,
             last_cell_size: 200.0,
+            last_viewport_h: 600.0,
             scroll_to_selected: false,
         }
     }
 }
 
 impl App {
-    /// フォルダを開いてアイテム一覧を構築し、並列サムネイルロードを開始する
     pub fn load_folder(&mut self, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
@@ -97,6 +96,7 @@ impl App {
         self.current_folder = Some(path.clone());
         self.address = path.to_string_lossy().to_string();
         self.selected = None;
+        self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
 
         let mut folders: Vec<GridItem> = Vec::new();
@@ -118,11 +118,14 @@ impl App {
         folders.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
         images.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
         folders.extend(images);
-
         self.items = folders;
         self.thumbnails = (0..self.items.len())
             .map(|_| ThumbnailState::Pending)
             .collect();
+
+        // セルサイズに合わせたサムネイルサイズ（前フレームの値を使用）
+        // 4K表示で十分な解像度を確保、最低 512px
+        let thumb_px = (self.last_cell_size as u32).max(512).min(1200);
 
         let image_paths: Vec<(usize, PathBuf)> = self
             .items
@@ -134,14 +137,13 @@ impl App {
             })
             .collect();
 
-        // 専用スレッドプールで並列ロード（THUMB_THREADS 本まで）
         let pool = Arc::clone(&self.thumb_pool);
         std::thread::spawn(move || {
             pool.install(|| {
                 use rayon::prelude::*;
                 image_paths.par_iter().for_each(|(i, path)| {
                     if let Ok(img) = image::open(path) {
-                        let thumb = img.thumbnail(THUMB_SIZE, THUMB_SIZE);
+                        let thumb = img.thumbnail(thumb_px, thumb_px);
                         let rgba = thumb.to_rgba8();
                         let size = [rgba.width() as usize, rgba.height() as usize];
                         let color_image =
@@ -153,7 +155,6 @@ impl App {
         });
     }
 
-    /// 完成サムネイルをテクスチャに登録する
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         let mut any_new = false;
         while let Ok((i, color_image)) = self.rx.try_recv() {
@@ -172,7 +173,6 @@ impl App {
         }
     }
 
-    /// キーボード操作を処理し、フォルダ移動が必要なら Some(path) を返す
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let cols = self.grid_cols.max(1);
         let n = self.items.len();
@@ -204,7 +204,7 @@ impl App {
 
             if let Some(s) = new_sel {
                 self.selected = Some(s);
-                self.scroll_to_selected = true; // 選択変更時にスクロール
+                self.scroll_to_selected = true;
             }
 
             if enter {
@@ -227,18 +227,52 @@ impl App {
         None
     }
 
-    /// マウスホイールを行単位スクロールに変換する
-    /// （egui のデフォルトピクセルスクロールを上書きする）
-    fn intercept_scroll(&self, ctx: &egui::Context) {
+    /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する
+    fn process_scroll(&mut self, ctx: &egui::Context) {
         let cell_size = self.last_cell_size.max(1.0);
-        let raw_y = ctx.input(|i| i.raw_scroll_delta.y);
-        if raw_y.abs() > 0.5 {
-            // 符号だけ取り出し、1行分の高さに置き換える
-            let row_delta = raw_y.signum() * cell_size;
+
+        // マウスホイールイベントだけを取り出し、egui には渡さない
+        let scroll_delta_y = ctx.input(|i| i.raw_scroll_delta.y);
+        if scroll_delta_y.abs() > 0.5 {
             ctx.input_mut(|i| {
-                i.raw_scroll_delta.y = row_delta;
-                i.smooth_scroll_delta.y = row_delta;
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                // MouseWheel イベントも消費
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
+            // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
+            let direction = -scroll_delta_y.signum();
+            self.scroll_offset_y =
+                (self.scroll_offset_y + direction * cell_size).max(0.0);
+            // 行境界にスナップ
+            self.scroll_offset_y =
+                (self.scroll_offset_y / cell_size).round() * cell_size;
+        }
+    }
+
+    /// カーソルキー移動後、選択行がビューポートに収まるようオフセットを調整する
+    fn apply_scroll_to_selected(&mut self, cols: usize, cell_size: f32) {
+        let sel = match self.selected {
+            Some(s) => s,
+            None => return,
+        };
+        let row = sel / cols;
+        let row_top = row as f32 * cell_size;
+        let row_bottom = row_top + cell_size;
+        let vp_top = self.scroll_offset_y;
+        let vp_bottom = self.scroll_offset_y + self.last_viewport_h;
+
+        if row_top < vp_top {
+            // 選択行が上に隠れている → 選択行が最上行になるようスクロール
+            self.scroll_offset_y = row_top;
+        } else if row_bottom > vp_bottom {
+            // 選択行が下に隠れている → 選択行が最下行になるようスクロール
+            self.scroll_offset_y =
+                (row_bottom - self.last_viewport_h).max(0.0);
+            // 行境界にスナップ
+            self.scroll_offset_y =
+                (self.scroll_offset_y / cell_size).ceil() * cell_size;
         }
     }
 }
@@ -250,7 +284,9 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
-        self.intercept_scroll(ctx);
+
+        // スクロールは egui に触れる前に処理（イベントを消費）
+        self.process_scroll(ctx);
 
         let keyboard_nav = self.handle_keyboard(ctx);
 
@@ -323,37 +359,41 @@ impl eframe::App for App {
                 let cols = self.grid_cols.max(1);
                 let avail_w = ui.available_width();
                 let cell_size = (avail_w / cols as f32).floor();
-                self.last_cell_size = cell_size;
+
+                // ウィンドウリサイズでセルサイズが変わった場合はスナップし直す
+                if (cell_size - self.last_cell_size).abs() > 0.5 {
+                    self.scroll_offset_y =
+                        (self.scroll_offset_y / cell_size).round() * cell_size;
+                    self.last_cell_size = cell_size;
+                }
+
+                if scroll_to {
+                    self.apply_scroll_to_selected(cols, cell_size);
+                }
 
                 let total_rows = self.items.len().div_ceil(cols);
                 let total_h = total_rows as f32 * cell_size;
 
+                // スクロール上限
+                let max_offset = (total_h - self.last_viewport_h).max(0.0);
+                self.scroll_offset_y = self.scroll_offset_y.min(max_offset);
+
                 let mut nav: Option<PathBuf> = None;
 
+                // egui にスクロールを管理させず、自前の offset を毎フレーム注入する
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .vertical_scroll_offset(self.scroll_offset_y)
                     .show_viewport(ui, |ui, viewport| {
+                        // ビューポート高さを記録（次フレームのスクロール計算に使う）
+                        self.last_viewport_h = viewport.height();
+                        // egui が内部で更新したオフセットは無視し、自前値を維持する
+                        // （process_scroll で消費済みなので delta=0 のはず）
+
                         let (content_rect, _) = ui.allocate_exact_size(
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
-
-                        // 選択セルが見えるようにスクロール
-                        if scroll_to {
-                            if let Some(sel) = self.selected {
-                                let row = sel / cols;
-                                let col = sel % cols;
-                                let sel_rect = egui::Rect::from_min_size(
-                                    content_rect.min
-                                        + egui::vec2(
-                                            col as f32 * cell_size,
-                                            row as f32 * cell_size,
-                                        ),
-                                    egui::vec2(cell_size, cell_size),
-                                );
-                                ui.scroll_to_rect(sel_rect, Some(egui::Align::Center));
-                            }
-                        }
 
                         let first_row = (viewport.min.y / cell_size) as usize;
                         let last_row =
@@ -430,7 +470,6 @@ fn draw_cell(
     let padding = 4.0;
     let inner = rect.shrink(padding);
 
-    // 背景: 白ベース、選択時は青みがかった色
     let bg = if is_selected {
         egui::Color32::from_rgb(180, 210, 255)
     } else {
@@ -456,51 +495,46 @@ fn draw_cell(
                 egui::Color32::from_gray(30),
             );
         }
-        GridItem::Image(_) => {
-            match thumb {
-                ThumbnailState::Loaded(tex) => {
-                    let tex_size = tex.size_vec2();
-                    let scale =
-                        (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
-                    let img_size = tex_size * scale;
-                    let img_rect =
-                        egui::Rect::from_center_size(inner.center(), img_size);
-                    painter.image(
-                        tex.id(),
-                        img_rect,
-                        egui::Rect::from_min_max(
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(1.0, 1.0),
-                        ),
-                        egui::Color32::WHITE,
-                    );
-                    // ファイル名は非表示（設定で切り替え予定）
-                }
-                ThumbnailState::Pending => {
-                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
-                    painter.text(
-                        inner.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "読込中",
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_gray(140),
-                    );
-                }
-                ThumbnailState::Failed => {
-                    painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
-                    painter.text(
-                        inner.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "読込失敗",
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::DARK_RED,
-                    );
-                }
+        GridItem::Image(_) => match thumb {
+            ThumbnailState::Loaded(tex) => {
+                let tex_size = tex.size_vec2();
+                let scale =
+                    (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
+                let img_size = tex_size * scale;
+                let img_rect = egui::Rect::from_center_size(inner.center(), img_size);
+                painter.image(
+                    tex.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                    ),
+                    egui::Color32::WHITE,
+                );
             }
-        }
+            ThumbnailState::Pending => {
+                painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
+                painter.text(
+                    inner.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読込中",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_gray(140),
+                );
+            }
+            ThumbnailState::Failed => {
+                painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
+                painter.text(
+                    inner.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読込失敗",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::DARK_RED,
+                );
+            }
+        },
     }
 
-    // ボーダー
     let border = if is_selected {
         egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 120, 220))
     } else {
