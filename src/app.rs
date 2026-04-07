@@ -5,7 +5,6 @@ use std::sync::{
 };
 
 use eframe::egui;
-use rayon::ThreadPool;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
 const THUMB_THREADS: usize = 8;
@@ -51,7 +50,6 @@ pub struct App {
     grid_cols: usize,
     tx: mpsc::Sender<(usize, egui::ColorImage)>,
     rx: mpsc::Receiver<(usize, egui::ColorImage)>,
-    thumb_pool: Arc<ThreadPool>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
     cancel_token: Arc<AtomicBool>,
 
@@ -68,12 +66,6 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
-        let thumb_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(THUMB_THREADS)
-                .build()
-                .expect("スレッドプール作成失敗"),
-        );
         Self {
             address: String::new(),
             current_folder: None,
@@ -83,7 +75,6 @@ impl Default for App {
             grid_cols: 4,
             tx,
             rx,
-            thumb_pool,
             cancel_token: Arc::new(AtomicBool::new(false)),
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
@@ -168,7 +159,16 @@ impl App {
             visible.len() + rest.len(), visible.len(), rest.len()
         ));
 
-        let pool = Arc::clone(&self.thumb_pool);
+        // フォルダごとに新規プールを作成する。
+        // こうすることで旧フォルダのタスクが旧プールのスレッドを占有していても、
+        // 新フォルダのタスクは即座に新プールの専用スレッドで開始できる。
+        // 旧プールは旧OSスレッドの Arc が解放されたタイミングで自動的に破棄される。
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(THUMB_THREADS)
+            .build()
+            .expect("スレッドプール作成失敗");
+        crate::logger::log(format!("  new thread pool created ({THUMB_THREADS} threads)"));
+
         std::thread::spawn(move || {
             pool.install(|| {
                 use rayon::prelude::*;
@@ -207,7 +207,7 @@ impl App {
     }
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
-        let mut any_new = false;
+        let mut count = 0u32;
         while let Ok((i, color_image)) = self.rx.try_recv() {
             if i < self.thumbnails.len() {
                 let handle = ctx.load_texture(
@@ -216,10 +216,12 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 );
                 self.thumbnails[i] = ThumbnailState::Loaded(handle);
-                any_new = true;
+                count += 1;
             }
         }
-        if any_new {
+        if count > 0 {
+            // 最初の1枚受信時はメインスレッド側のタイムスタンプを記録
+            crate::logger::log(format!("  [main] poll_thumbnails: received {count} thumbnail(s)"));
             ctx.request_repaint();
         }
     }
