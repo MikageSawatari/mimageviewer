@@ -177,14 +177,16 @@ impl App {
         let cols = self.grid_cols.max(1);
         let n = self.items.len();
 
-        let (right, left, down, up, enter, ctrl_up) = ctx.input(|i| {
+        let (right, left, down, up, enter, backspace, ctrl_up, ctrl_down) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::ArrowUp),
                 i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Backspace),
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
+                i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
             )
         });
 
@@ -216,10 +218,29 @@ impl App {
             }
         }
 
-        if ctrl_up {
+        // BS: 親フォルダへ
+        if backspace {
             if let Some(ref cur) = self.current_folder.clone() {
                 if let Some(parent) = cur.parent() {
                     return Some(parent.to_path_buf());
+                }
+            }
+        }
+
+        // Ctrl+↓: 深さ優先で次のフォルダへ
+        if ctrl_down {
+            if let Some(ref cur) = self.current_folder.clone() {
+                if let Some(next) = next_folder_dfs(cur) {
+                    return Some(next);
+                }
+            }
+        }
+
+        // Ctrl+↑: 深さ優先で前のフォルダへ
+        if ctrl_up {
+            if let Some(ref cur) = self.current_folder.clone() {
+                if let Some(prev) = prev_folder_dfs(cur) {
+                    return Some(prev);
                 }
             }
         }
@@ -559,4 +580,79 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
     } else {
         chars[..max_chars - 1].iter().collect::<String>() + "…"
     }
+}
+
+// -----------------------------------------------------------------------
+// フォルダツリー走査（深さ優先・前順）
+// -----------------------------------------------------------------------
+
+/// 深さ優先前順で次のフォルダを返す
+/// 子があれば最初の子、なければ次の兄弟、なければ祖先の次の兄弟
+fn next_folder_dfs(current: &std::path::Path) -> Option<PathBuf> {
+    // 1. 子フォルダがあれば最初の子へ
+    if let Some(first_child) = sorted_subdirs(current).into_iter().next() {
+        return Some(first_child);
+    }
+    // 2. 子がなければ、次の兄弟または祖先の次の兄弟を探す
+    next_sibling_or_ancestor_sibling(current)
+}
+
+/// 深さ優先前順で前のフォルダを返す
+/// 前の兄弟がいればその最後の子孫、最初の子であれば親
+fn prev_folder_dfs(current: &std::path::Path) -> Option<PathBuf> {
+    let parent = current.parent()?;
+    let siblings = sorted_subdirs(parent);
+    let pos = siblings.iter().position(|s| path_eq(s, current))?;
+
+    if pos == 0 {
+        // 最初の子 → 親へ
+        Some(parent.to_path_buf())
+    } else {
+        // 前の兄弟の最後の子孫へ
+        Some(last_descendant_dir(&siblings[pos - 1]))
+    }
+}
+
+/// path の次の兄弟を返す。兄弟がなければ親で再帰する
+fn next_sibling_or_ancestor_sibling(path: &std::path::Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let siblings = sorted_subdirs(parent);
+    let pos = siblings.iter().position(|s| path_eq(s, path))?;
+
+    if pos + 1 < siblings.len() {
+        Some(siblings[pos + 1].clone())
+    } else {
+        next_sibling_or_ancestor_sibling(parent)
+    }
+}
+
+/// path の最も深い最後の子孫フォルダを返す（子がなければ path 自身）
+fn last_descendant_dir(path: &std::path::Path) -> PathBuf {
+    let children = sorted_subdirs(path);
+    match children.last() {
+        Some(last) => last_descendant_dir(last),
+        None => path.to_path_buf(),
+    }
+}
+
+/// パス直下のサブフォルダを名前順で返す（隠しフォルダは含む）
+fn sorted_subdirs(path: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path())
+        .collect();
+    dirs.sort_by(|a, b| {
+        a.to_string_lossy()
+            .to_lowercase()
+            .cmp(&b.to_string_lossy().to_lowercase())
+    });
+    dirs
+}
+
+/// Windows のファイルシステムは大文字小文字を区別しないため小文字化して比較
+fn path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
