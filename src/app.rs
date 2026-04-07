@@ -375,7 +375,16 @@ impl eframe::App for App {
                 let total_h = total_rows as f32 * cell_size;
 
                 // スクロール上限
-                let max_offset = (total_h - self.last_viewport_h).max(0.0);
+                // 最大オフセットは「最終行のトップが見える最小の行境界スナップ値」
+                // → ceil((total_h - viewport_h) / cell_size) * cell_size
+                // こうすることで最大スクロール時も先頭行がウィンドウ上部に揃い、
+                // 最終行の下に余白が生じる（ピクセル端数を切り上げて行境界に合わせる）
+                let max_offset = if total_h <= self.last_viewport_h {
+                    0.0
+                } else {
+                    (((total_h - self.last_viewport_h) / cell_size).ceil() * cell_size)
+                        .min(total_h)
+                };
                 self.scroll_offset_y = self.scroll_offset_y.min(max_offset);
 
                 let mut nav: Option<PathBuf> = None;
