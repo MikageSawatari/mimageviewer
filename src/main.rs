@@ -1,8 +1,10 @@
 mod app;
+pub mod logger;
 
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    logger::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mimageviewer")

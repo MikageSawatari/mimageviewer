@@ -95,8 +95,14 @@ impl Default for App {
 
 impl App {
     pub fn load_folder(&mut self, path: PathBuf) {
+        crate::logger::log(format!(
+            "=== load_folder: {} ===",
+            path.display()
+        ));
+
         // ── 旧タスクをキャンセル ──────────────────────────────────────
         self.cancel_token.store(true, Ordering::Relaxed);
+        crate::logger::log("  cancel_token -> true (old tasks will stop)");
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_token = Arc::clone(&cancel);
 
@@ -137,7 +143,6 @@ impl App {
         let thumb_px = (self.last_cell_size as u32).max(512).min(1200);
 
         // ── 可視範囲を計算して優先順に並べる ──────────────────────────
-        // フォルダ移動直後は scroll_offset_y=0 なので先頭が可視範囲
         let cols = self.grid_cols.max(1);
         let cell_size = self.last_cell_size.max(1.0);
         let first_vis_item = (self.scroll_offset_y / cell_size) as usize * cols;
@@ -154,31 +159,49 @@ impl App {
             })
             .collect();
 
-        // 可視範囲と範囲外に分割
         let (visible, rest): (Vec<_>, Vec<_>) = image_paths
             .into_iter()
             .partition(|(i, _)| *i >= first_vis_item && *i < last_vis_item);
+
+        crate::logger::log(format!(
+            "  thumb_px={thumb_px}  total_images={}  visible={} (items {first_vis_item}..{last_vis_item})  rest={}",
+            visible.len() + rest.len(), visible.len(), rest.len()
+        ));
 
         let pool = Arc::clone(&self.thumb_pool);
         std::thread::spawn(move || {
             pool.install(|| {
                 use rayon::prelude::*;
 
-                // フェーズ1: 可視範囲を最優先で並列ロード
+                // フェーズ1: 可視範囲を最優先
+                let t1 = std::time::Instant::now();
+                crate::logger::log(format!("  [Phase1] START {} items", visible.len()));
                 visible.par_iter().for_each(|(i, path)| {
                     if cancel.load(Ordering::Relaxed) {
+                        crate::logger::log(format!("  [Phase1] CANCELLED before idx={i}"));
                         return;
                     }
                     load_one(path, thumb_px, *i, &tx);
                 });
+                crate::logger::log(format!(
+                    "  [Phase1] END  {:.0}ms",
+                    t1.elapsed().as_secs_f64() * 1000.0
+                ));
 
-                // フェーズ2: 残りを順番にロード（キャンセル確認しながら）
+                // フェーズ2: 残り
+                let t2 = std::time::Instant::now();
+                crate::logger::log(format!("  [Phase2] START {} items", rest.len()));
                 rest.par_iter().for_each(|(i, path)| {
                     if cancel.load(Ordering::Relaxed) {
+                        crate::logger::log(format!("  [Phase2] CANCELLED before idx={i}"));
                         return;
                     }
                     load_one(path, thumb_px, *i, &tx);
                 });
+                crate::logger::log(format!(
+                    "  [Phase2] END  {:.0}ms",
+                    t2.elapsed().as_secs_f64() * 1000.0
+                ));
             });
         });
     }
@@ -608,12 +631,26 @@ fn load_one(
     idx: usize,
     tx: &mpsc::Sender<(usize, egui::ColorImage)>,
 ) {
-    if let Ok(img) = image::open(path) {
-        let thumb = img.thumbnail(thumb_px, thumb_px);
-        let rgba = thumb.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-        let _ = tx.send((idx, color_image));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    let t = std::time::Instant::now();
+
+    match image::open(path) {
+        Ok(img) => {
+            let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t2 = std::time::Instant::now();
+            let thumb = img.thumbnail(thumb_px, thumb_px);
+            let resize_ms = t2.elapsed().as_secs_f64() * 1000.0;
+            let rgba = thumb.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            let _ = tx.send((idx, color_image));
+            crate::logger::log(format!(
+                "    idx={idx:>4} decode={decode_ms:>6.1}ms resize={resize_ms:>5.1}ms  {name}"
+            ));
+        }
+        Err(e) => {
+            crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {name}"));
+        }
     }
 }
 
