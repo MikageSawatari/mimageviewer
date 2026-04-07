@@ -1,0 +1,15 @@
+[package]
+name = "mimageviewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
