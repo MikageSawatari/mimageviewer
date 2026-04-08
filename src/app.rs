@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
 };
 
 use eframe::egui;
@@ -52,6 +52,9 @@ pub struct App {
     rx: mpsc::Receiver<(usize, egui::ColorImage)>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
     cancel_token: Arc<AtomicBool>,
+    /// Phase 2b ワーカーが参照する現在の可視先頭アイテムインデックス
+    /// UIスレッドが毎フレーム更新し、バックグラウンドワーカーが優先度に使う
+    scroll_hint: Arc<AtomicUsize>,
 
     /// スクロールオフセット（行境界にスナップ済み）。自前管理する
     scroll_offset_y: f32,
@@ -119,6 +122,7 @@ impl Default for App {
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
+            scroll_hint: Arc::new(AtomicUsize::new(0)),
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
@@ -170,6 +174,7 @@ impl App {
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
+        self.scroll_hint.store(0, Ordering::Relaxed);
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
         let mut folders: Vec<GridItem> = Vec::new();
@@ -290,6 +295,12 @@ impl App {
             .expect("スレッドプール作成失敗");
         crate::logger::log(format!("  new thread pool created ({THUMB_THREADS} threads)"));
 
+        // Phase 2b 用: スクロール位置に応じて動的優先度を付けるキュー
+        // UIスレッドが scroll_hint を毎フレーム更新し、ワーカーが最近傍アイテムを選ぶ
+        let scroll_hint = Arc::clone(&self.scroll_hint);
+        let rest_queue: Arc<Mutex<Vec<(usize, PathBuf, i64, i64)>>> =
+            Arc::new(Mutex::new(rest_needs));
+
         std::thread::spawn(move || {
             pool.install(|| {
                 use rayon::prelude::*;
@@ -314,7 +325,7 @@ impl App {
                 });
                 crate::logger::log(format!("  [1b vis-new    ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
 
-                // Phase 2a: 残り × キャッシュ済み
+                // Phase 2a: 残り × キャッシュ済み（JPEG デコードのみ、高速なので全件 par_iter）
                 let t = std::time::Instant::now();
                 crate::logger::log(format!("  [2a rest-cached] START {}", rest_cached.len()));
                 rest_cached.par_iter().for_each(|(i, jpeg_data)| {
@@ -325,14 +336,46 @@ impl App {
                 });
                 crate::logger::log(format!("  [2a rest-cached] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
 
-                // Phase 2b: 残り × 未キャッシュ
-                let t = std::time::Instant::now();
-                crate::logger::log(format!("  [2b rest-new   ] START {}", rest_needs.len()));
-                rest_needs.par_iter().for_each(|(i, path, mtime, file_size)| {
-                    if cancel.load(Ordering::Relaxed) { return; }
-                    load_one_cached(path, *i, &tx, catalog_arc.as_deref(), *mtime, *file_size, &cache_gen_done);
-                });
-                crate::logger::log(format!("  [2b rest-new   ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
+                // Phase 2b: 残り × 未キャッシュ（動的優先度キュー）
+                // ワーカーが scroll_hint に最も近いアイテムを都度選ぶことで
+                // ユーザーがスクロールしても現在表示中の行を優先してデコードする
+                {
+                    let total = rest_queue.lock().unwrap().len();
+                    let t = std::time::Instant::now();
+                    crate::logger::log(format!("  [2b rest-new   ] START {total}"));
+                    rayon::scope(|s| {
+                        for _ in 0..THUMB_THREADS {
+                            let queue = Arc::clone(&rest_queue);
+                            let tx2 = tx.clone();
+                            let cancel2 = Arc::clone(&cancel);
+                            let hint2 = Arc::clone(&scroll_hint);
+                            let cat2 = catalog_arc.clone();
+                            let done2 = Arc::clone(&cache_gen_done);
+                            s.spawn(move |_| {
+                                loop {
+                                    if cancel2.load(Ordering::Relaxed) { break; }
+                                    let item = {
+                                        let mut q = queue.lock().unwrap();
+                                        if q.is_empty() { break; }
+                                        let vis = hint2.load(Ordering::Relaxed);
+                                        // 現在の可視先頭に最も近いインデックスを選択
+                                        let best = q.iter().enumerate()
+                                            .min_by_key(|(_, (i, _, _, _))| {
+                                                let i = *i;
+                                                if i < vis { vis - i } else { i - vis }
+                                            })
+                                            .map(|(idx, _)| idx)
+                                            .unwrap(); // q が空でないことは確認済み
+                                        q.swap_remove(best)
+                                    };
+                                    if cancel2.load(Ordering::Relaxed) { break; }
+                                    load_one_cached(&item.1, item.0, &tx2, cat2.as_deref(), item.2, item.3, &done2);
+                                }
+                            });
+                        }
+                    });
+                    crate::logger::log(format!("  [2b rest-new   ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
+                }
             });
         });
 
@@ -1235,6 +1278,10 @@ impl eframe::App for App {
                         let first_row = (viewport.min.y / cell_h) as usize;
                         let last_row =
                             ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
+
+                        // Phase 2b ワーカーへ現在の可視先頭アイテムを通知
+                        // ワーカーはこの値に最も近いアイテムを優先してデコードする
+                        self.scroll_hint.store(first_row * cols, Ordering::Relaxed);
 
                         for row in first_row..last_row {
                             for col in 0..cols {
