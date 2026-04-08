@@ -86,6 +86,11 @@ JPEG (.jpg, .jpeg), PNG (.png), WebP (.webp), BMP (.bmp)
 - **キャンセル遅延**: 旧タスクが1枚のデコード中の場合、最大1デコード時間待つ
 - **ログ**: `cargo run` 時に `mimageviewer.log` へ出力（.gitignore 済み）
 
+## Git Workflow
+
+- **コミット指示はローカルコミットのみ**。「コミットして」と言われた場合は `git commit` までで止める。
+  PR（プルリクエスト）の作成は、明示的に「PRを作って」と指示された場合のみ行う。
+
 ## User: Background
 
 - Comfortable reading C++ but not familiar with Rust's borrow checker details
