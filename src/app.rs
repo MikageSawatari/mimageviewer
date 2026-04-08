@@ -372,6 +372,7 @@ impl App {
         // 動画サムネイルスレッド用に先にクローンしておく（画像スレッドが move する前に）
         let tx_for_video = tx.clone();
         let cancel_for_video = Arc::clone(&cancel);
+        let thumb_px = self.settings.thumb_px;
 
         std::thread::spawn(move || {
             pool.install(|| {
@@ -392,7 +393,7 @@ impl App {
                 crate::logger::log(format!("  [1b vis-new    ] START {}", vis_needs.len()));
                 vis_needs.par_iter().for_each(|(i, path, mtime, file_size)| {
                     if cancel.load(Ordering::Relaxed) { return; }
-                    load_one_cached(path, *i, &tx, catalog_arc.as_deref(), *mtime, *file_size, &cache_gen_done);
+                    load_one_cached(path, *i, &tx, catalog_arc.as_deref(), *mtime, *file_size, &cache_gen_done, thumb_px);
                 });
                 crate::logger::log(format!("  [1b vis-new    ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
 
@@ -439,7 +440,7 @@ impl App {
                                         q.swap_remove(best)
                                     };
                                     if cancel2.load(Ordering::Relaxed) { break; }
-                                    load_one_cached(&item.1, item.0, &tx2, cat2.as_deref(), item.2, item.3, &done2);
+                                    load_one_cached(&item.1, item.0, &tx2, cat2.as_deref(), item.2, item.3, &done2, thumb_px);
                                 }
                             });
                         }
@@ -1479,6 +1480,29 @@ impl eframe::App for App {
                     ui.separator();
                     ui.add_space(4.0);
 
+                    // ── サムネイルサイズ設定 ──────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("サムネイルサイズ（長辺）：");
+                        for &px in &[256u32, 512, 768, 1024] {
+                            let checked = self.settings.thumb_px == px;
+                            let prefix = if checked { "✓ " } else { "  " };
+                            if ui.button(format!("{prefix}{px}px")).clicked() && !checked {
+                                self.settings.thumb_px = px;
+                                self.settings.save();
+                                settings_changed = true;
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("※ 変更は次回のキャッシュ生成から反映されます。過去分を変更するにはキャッシュを削除してください。")
+                            .weak()
+                            .small()
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
                     // ── 古いキャッシュの削除 ──────────────────────
                     ui.horizontal(|ui| {
                         let mut days_str = self.cache_manager_days.to_string();
@@ -2043,6 +2067,7 @@ fn load_one_cached(
     mtime: i64,
     file_size: i64,
     gen_done: &Arc<AtomicUsize>,
+    thumb_px: u32,
 ) {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
     let t = std::time::Instant::now();
@@ -2063,7 +2088,7 @@ fn load_one_cached(
             let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t2 = std::time::Instant::now();
 
-            match crate::catalog::encode_thumb_jpeg(&img) {
+            match crate::catalog::encode_thumb_jpeg(&img, thumb_px) {
                 Some((jpeg_data, w, h)) => {
                     let encode_ms = t2.elapsed().as_secs_f64() * 1000.0;
 

@@ -167,11 +167,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 // JPEG エンコード・デコードヘルパー
 // -----------------------------------------------------------------------
 
-/// 画像を THUMB_LONG_SIDE px にリサイズし、JPEG q=80 でエンコードする。
+/// 画像を `long_side` px にリサイズし、JPEG q=80 でエンコードする。
 /// 戻り値: (jpeg_bytes, width, height)
-pub fn encode_thumb_jpeg(img: &image::DynamicImage) -> Option<(Vec<u8>, u32, u32)> {
+pub fn encode_thumb_jpeg(img: &image::DynamicImage, long_side: u32) -> Option<(Vec<u8>, u32, u32)> {
     use image::ImageEncoder;
-    let thumb = img.resize(THUMB_LONG_SIDE, THUMB_LONG_SIDE, image::imageops::FilterType::Lanczos3);
+    let thumb = img.resize(long_side, long_side, image::imageops::FilterType::Lanczos3);
     let rgb = thumb.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     let mut buf = Vec::new();

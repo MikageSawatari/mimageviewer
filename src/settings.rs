@@ -150,12 +150,16 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// サムネイルキャッシュの長辺ピクセル数
+    #[serde(default = "default_thumb_px")]
+    pub thumb_px: u32,
 }
 
 fn default_grid_cols() -> usize { 4 }
 fn default_prefetch_back() -> usize { 4 }
 fn default_prefetch_forward() -> usize { 12 }
 fn default_folder_skip_limit() -> usize { 3 }
+fn default_thumb_px() -> u32 { 512 }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -171,6 +175,7 @@ impl Default for Settings {
             prefetch_forward: default_prefetch_forward(),
             folder_skip_limit: default_folder_skip_limit(),
             sort_order: SortOrder::default(),
+            thumb_px: default_thumb_px(),
         }
     }
 }
