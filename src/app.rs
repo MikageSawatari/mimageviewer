@@ -531,6 +531,13 @@ impl eframe::App for App {
         if let Some(p) = navigate {
             self.load_folder(p);
         }
+
+        // Pending なサムネイルがある間は毎フレーム再描画をリクエストする。
+        // バックグラウンドスレッドがチャネルに送信しても egui は自動では
+        // 起きないため、ここで継続的に repaint を要求しておく必要がある。
+        if self.thumbnails.iter().any(|t| matches!(t, ThumbnailState::Pending)) {
+            ctx.request_repaint();
+        }
     }
 }
 
