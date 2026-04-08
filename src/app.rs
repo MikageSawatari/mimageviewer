@@ -7,7 +7,6 @@ use std::sync::{
 use eframe::egui;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
-const THUMB_THREADS: usize = 8;
 
 // -----------------------------------------------------------------------
 // データモデル
@@ -88,6 +87,11 @@ pub struct App {
     // ── お気に入り編集ポップアップ ────────────────────────────────
     show_favorites_editor: bool,
 
+    // ── 環境設定ポップアップ ─────────────────────────────────────
+    show_preferences: bool,
+    /// 環境設定ダイアログ内の一時的な並列度編集値（Manual時の数値）
+    pref_manual_threads: usize,
+
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     show_cache_manager: bool,
     /// キャッシュ管理の「◯日以上古い」入力値
@@ -136,6 +140,8 @@ impl Default for App {
             fs_cache: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
             show_favorites_editor: false,
+            show_preferences: false,
+            pref_manual_threads: 4,
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,
@@ -289,11 +295,12 @@ impl App {
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
 
         // フォルダごとに新規プールを作成する（旧フォルダのタスクと競合しない）
+        let thumb_threads = self.settings.parallelism.thread_count();
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(THUMB_THREADS)
+            .num_threads(thumb_threads)
             .build()
             .expect("スレッドプール作成失敗");
-        crate::logger::log(format!("  new thread pool created ({THUMB_THREADS} threads)"));
+        crate::logger::log(format!("  new thread pool created ({thumb_threads} threads)"));
 
         // Phase 2b 用: スクロール位置に応じて動的優先度を付けるキュー
         // UIスレッドが scroll_hint を毎フレーム更新し、ワーカーが最近傍アイテムを選ぶ
@@ -344,7 +351,7 @@ impl App {
                     let t = std::time::Instant::now();
                     crate::logger::log(format!("  [2b rest-new   ] START {total}"));
                     rayon::scope(|s| {
-                        for _ in 0..THUMB_THREADS {
+                        for _ in 0..thumb_threads {
                             let queue = Arc::clone(&rest_queue);
                             let tx2 = tx.clone();
                             let cancel2 = Arc::clone(&cancel);
@@ -500,12 +507,13 @@ impl App {
         None
     }
 
-    /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する
+    /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
+    /// Ctrl+ホイールの場合はグリッド列数を変更する。
     fn process_scroll(&mut self, ctx: &egui::Context) {
         let cell_h = self.last_cell_h.max(1.0);
 
         // マウスホイールイベントだけを取り出し、egui には渡さない
-        let scroll_delta_y = ctx.input(|i| i.raw_scroll_delta.y);
+        let (scroll_delta_y, ctrl) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta_y.abs() > 0.5 {
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
@@ -514,13 +522,24 @@ impl App {
                 i.events
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
-            // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
-            let direction = -scroll_delta_y.signum();
-            self.scroll_offset_y =
-                (self.scroll_offset_y + direction * cell_h).max(0.0);
-            // 行境界にスナップ
-            self.scroll_offset_y =
-                (self.scroll_offset_y / cell_h).round() * cell_h;
+
+            if ctrl {
+                // Ctrl+ホイール: 列数を増減（2〜10 の範囲）
+                let delta = -scroll_delta_y.signum() as i32;
+                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(2, 10) as usize;
+                if new_cols != self.settings.grid_cols {
+                    self.settings.grid_cols = new_cols;
+                    self.settings.save();
+                }
+            } else {
+                // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
+                let direction = -scroll_delta_y.signum();
+                self.scroll_offset_y =
+                    (self.scroll_offset_y + direction * cell_h).max(0.0);
+                // 行境界にスナップ
+                self.scroll_offset_y =
+                    (self.scroll_offset_y / cell_h).round() * cell_h;
+            }
         }
     }
 
@@ -859,6 +878,35 @@ impl eframe::App for App {
                             if ctrl_d           { ctrl_nav = Some(1); }
                             if ctrl_u           { ctrl_nav = Some(-1); }
 
+                            // ── ホイール操作 ──────────────────────────
+                            // 下スクロール(delta<0) → 次の画像、上スクロール(delta>0) → 前の画像
+                            let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
+                            if wheel_y.abs() > 0.5 {
+                                ctx.input_mut(|i| {
+                                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                                    i.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+                                });
+                                nav_delta = if wheel_y < 0.0 { 1 } else { -1 };
+                            }
+
+                            // ── マウスクリック操作 ────────────────────
+                            // シングルクリック左半分 → 前の画像、右半分 → 次の画像
+                            let fs_response = ui.interact(
+                                full_rect,
+                                egui::Id::new("fs_click"),
+                                egui::Sense::click(),
+                            );
+                            if fs_response.clicked() {
+                                if let Some(pos) = fs_response.interact_pointer_pos() {
+                                    if pos.x > full_rect.center().x {
+                                        nav_delta = 1;
+                                    } else {
+                                        nav_delta = -1;
+                                    }
+                                }
+                            }
+
                             // ── 画像表示 ─────────────────────────────
                             // フルサイズ優先。未ロードならサムネイルで仮表示する
                             let display_tex = tex.as_ref().or(thumb_tex.as_ref());
@@ -910,6 +958,55 @@ impl eframe::App for App {
                                     egui::FontId::proportional(14.0),
                                     egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200),
                                 );
+                            }
+
+                            // ── ホバー時の閉じるボタン（右上）────────
+                            // 画面上部 60px にマウスがあるときだけ表示する
+                            let hover_in_top = ctx.input(|i| {
+                                i.pointer.hover_pos()
+                                    .map(|p| p.y < 60.0)
+                                    .unwrap_or(false)
+                            });
+                            if hover_in_top {
+                                let btn_size = 40.0;
+                                let margin = 10.0;
+                                let btn_rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        full_rect.max.x - btn_size - margin,
+                                        margin,
+                                    ),
+                                    egui::vec2(btn_size, btn_size),
+                                );
+                                let btn_resp = ui.interact(
+                                    btn_rect,
+                                    egui::Id::new("fs_close_btn"),
+                                    egui::Sense::click(),
+                                );
+                                let bg = if btn_resp.hovered() {
+                                    egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180)
+                                };
+                                ui.painter().rect_filled(btn_rect, 6.0, bg);
+                                // ✕ をフォントに依存せず斜め2線で描画
+                                let c = btn_rect.center();
+                                let r = btn_size * 0.25;
+                                let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
+                                ui.painter().line_segment(
+                                    [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                                    stroke,
+                                );
+                                ui.painter().line_segment(
+                                    [egui::pos2(c.x + r, c.y - r), egui::pos2(c.x - r, c.y + r)],
+                                    stroke,
+                                );
+                                if btn_resp.clicked() {
+                                    close_fs = true;
+                                }
+                                // ×ボタンのクリックが背面の nav_delta に漏れないように上書き
+                                if btn_resp.hovered() {
+                                    nav_delta = 0;
+                                }
                             }
                         });
                 },
@@ -1024,6 +1121,17 @@ impl eframe::App for App {
                         self.cache_manager_stats = Some(crate::catalog::cache_stats(&cache_dir));
                         self.cache_manager_result = None;
                         self.show_cache_manager = true;
+                        ui.close();
+                    }
+                    if ui.button("環境設定…").clicked() {
+                        // ダイアログを開くとき現在値で初期化
+                        self.pref_manual_threads = match &self.settings.parallelism {
+                            crate::settings::Parallelism::Manual(n) => *n,
+                            crate::settings::Parallelism::Auto => {
+                                self.settings.parallelism.thread_count()
+                            }
+                        };
+                        self.show_preferences = true;
                         ui.close();
                     }
                 });
@@ -1164,6 +1272,74 @@ impl eframe::App for App {
 
             if !open {
                 self.show_cache_manager = false;
+            }
+        }
+
+        // ── 環境設定ポップアップ ─────────────────────────────────────
+        if self.show_preferences {
+            let mut open = true;
+            let mut apply = false;
+            let mut cancel = false;
+
+            egui::Window::new("環境設定")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+
+                    ui.heading("並列読み込み");
+                    ui.add_space(4.0);
+
+                    let is_auto = self.settings.parallelism == crate::settings::Parallelism::Auto;
+                    let auto_count = {
+                        let cores = std::thread::available_parallelism()
+                            .map(|n| n.get()).unwrap_or(2);
+                        (cores / 2).max(1)
+                    };
+
+                    if ui.radio(is_auto, format!("自動（CPUコア数の半分: {} スレッド）", auto_count)).clicked() {
+                        self.settings.parallelism = crate::settings::Parallelism::Auto;
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.radio(!is_auto, "手動").clicked() {
+                            self.settings.parallelism =
+                                crate::settings::Parallelism::Manual(self.pref_manual_threads);
+                        }
+                        ui.add_enabled(
+                            !is_auto,
+                            egui::DragValue::new(&mut self.pref_manual_threads)
+                                .range(1..=64)
+                                .suffix(" スレッド"),
+                        );
+                        if !is_auto {
+                            self.settings.parallelism =
+                                crate::settings::Parallelism::Manual(self.pref_manual_threads);
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("  OK  ").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+            if apply {
+                self.settings.save();
+                self.show_preferences = false;
+            } else if cancel || !open {
+                // キャンセル/×ボタン: 変更を破棄するため再ロード
+                self.settings = crate::settings::Settings::load();
+                self.show_preferences = false;
             }
         }
 
@@ -1308,8 +1484,10 @@ impl eframe::App for App {
                                     self.selected = Some(idx);
                                 }
                                 if response.double_clicked() {
-                                    if let Some(GridItem::Folder(p)) = self.items.get(idx) {
-                                        nav = Some(p.clone());
+                                    match self.items.get(idx) {
+                                        Some(GridItem::Folder(p)) => nav = Some(p.clone()),
+                                        Some(GridItem::Image(_)) => self.open_fullscreen(idx),
+                                        None => {}
                                     }
                                 }
 

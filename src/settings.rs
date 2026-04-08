@@ -50,6 +50,36 @@ impl ThumbAspect {
 }
 
 // -----------------------------------------------------------------------
+// Parallelism
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+#[serde(tag = "mode", content = "value")]
+pub enum Parallelism {
+    Auto,
+    Manual(usize),
+}
+
+impl Default for Parallelism {
+    fn default() -> Self { Self::Auto }
+}
+
+impl Parallelism {
+    /// 実際に使うスレッド数を返す
+    pub fn thread_count(&self) -> usize {
+        match self {
+            Self::Auto => {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2);
+                (cores / 2).max(1)
+            }
+            Self::Manual(n) => (*n).max(1),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -69,6 +99,8 @@ pub struct Settings {
     /// ウィンドウサイズ (outer rect)
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub parallelism: Parallelism,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -82,6 +114,7 @@ impl Default for Settings {
             last_folder: None,
             window_pos: None,
             window_size: None,
+            parallelism: Parallelism::default(),
         }
     }
 }

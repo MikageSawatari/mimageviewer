@@ -9,6 +9,14 @@ pub mod settings;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    // NVIDIA オーバーレイが ALT+G を横取りするのを防ぐため先占する。
+    // RegisterHotKey が失敗しても（他プロセスが既に登録済み等）無視してよい。
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT};
+        let _ = RegisterHotKey(None, 0xAF00, MOD_ALT, u32::from(b'G'));
+    }
+
     logger::init();
 
     // 保存済み設定からウィンドウ初期状態を決定する
