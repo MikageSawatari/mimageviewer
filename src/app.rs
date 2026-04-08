@@ -561,19 +561,19 @@ impl App {
             }
         }
 
-        // Ctrl+↓: 深さ優先で次のフォルダへ
+        // Ctrl+↓: 深さ優先で次のフォルダへ（画像なしはスキップ）
         if ctrl_down {
             if let Some(ref cur) = self.current_folder.clone() {
-                if let Some(next) = next_folder_dfs(cur) {
+                if let Some(next) = navigate_folder_with_skip(cur, next_folder_dfs, self.settings.folder_skip_limit) {
                     return Some(next);
                 }
             }
         }
 
-        // Ctrl+↑: 深さ優先で前のフォルダへ
+        // Ctrl+↑: 深さ優先で前のフォルダへ（画像なしはスキップ）
         if ctrl_up {
             if let Some(ref cur) = self.current_folder.clone() {
-                if let Some(prev) = prev_folder_dfs(cur) {
+                if let Some(prev) = navigate_folder_with_skip(cur, prev_folder_dfs, self.settings.folder_skip_limit) {
                     return Some(prev);
                 }
             }
@@ -1222,10 +1222,11 @@ impl eframe::App for App {
             if let Some(delta) = ctrl_nav {
                 // Ctrl+↑↓: フォルダを移動してサムネイルモードに戻る（仕様 §7.2）
                 if let Some(cur) = self.current_folder.clone() {
+                    let skip_limit = self.settings.folder_skip_limit;
                     let next = if delta > 0 {
-                        next_folder_dfs(&cur)
+                        navigate_folder_with_skip(&cur, next_folder_dfs, skip_limit)
                     } else {
-                        prev_folder_dfs(&cur)
+                        navigate_folder_with_skip(&cur, prev_folder_dfs, skip_limit)
                     };
                     if let Some(p) = next {
                         self.load_folder(p);
@@ -1558,6 +1559,23 @@ impl eframe::App for App {
                             egui::DragValue::new(&mut self.settings.prefetch_forward)
                                 .range(0..=50usize)
                                 .suffix(" 枚"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.heading("フォルダ移動");
+                    ui.add_space(4.0);
+                    ui.label("Ctrl+↑↓ で移動先フォルダに画像がない場合、自動でスキップする最大回数。");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("空フォルダのスキップ上限:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.folder_skip_limit)
+                                .range(1..=10usize)
+                                .suffix(" 回"),
                         );
                     });
 
@@ -2065,6 +2083,43 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
 // -----------------------------------------------------------------------
 // フォルダツリー走査（深さ優先・前順）
 // -----------------------------------------------------------------------
+
+/// フォルダ内に対応画像ファイルが1枚以上あるか確認する
+fn folder_has_images(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+}
+
+/// Ctrl+↑↓ フォルダ移動：画像なしフォルダを最大 skip_limit 回スキップする。
+/// skip_limit 回以内に画像ありフォルダが見つかればそこへ移動。
+/// 見つからなければ直近の隣フォルダ（1ステップ先）へ移動。
+fn navigate_folder_with_skip<F>(start: &std::path::Path, nav_fn: F, skip_limit: usize) -> Option<PathBuf>
+where
+    F: Fn(&std::path::Path) -> Option<PathBuf>,
+{
+    let first = nav_fn(start)?;
+    let mut candidate = first.clone();
+    for _ in 0..skip_limit {
+        if folder_has_images(&candidate) {
+            return Some(candidate);
+        }
+        match nav_fn(&candidate) {
+            Some(next) => candidate = next,
+            None => return Some(first),
+        }
+    }
+    // skip_limit 回分全て画像なし → 直近の隣フォルダにフォールバック
+    Some(first)
+}
 
 /// 深さ優先前順で次のフォルダを返す
 /// 子があれば最初の子、なければ次の兄弟、なければ祖先の次の兄弟

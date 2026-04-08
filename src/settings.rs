@@ -107,11 +107,15 @@ pub struct Settings {
     /// フルサイズ表示時の前方先読み枚数（現在位置より後）
     #[serde(default = "default_prefetch_forward")]
     pub prefetch_forward: usize,
+    /// Ctrl+↑↓ フォルダ移動時に画像なしフォルダをスキップする最大回数（1〜10）
+    #[serde(default = "default_folder_skip_limit")]
+    pub folder_skip_limit: usize,
 }
 
 fn default_grid_cols() -> usize { 4 }
 fn default_prefetch_back() -> usize { 4 }
 fn default_prefetch_forward() -> usize { 12 }
+fn default_folder_skip_limit() -> usize { 3 }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -125,6 +129,7 @@ impl Default for Settings {
             parallelism: Parallelism::default(),
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
+            folder_skip_limit: default_folder_skip_limit(),
         }
     }
 }
