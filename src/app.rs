@@ -230,11 +230,28 @@ impl App {
         }
 
         folders.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
-        all_media.sort_by(|(a, _, _, _), (b, _, _, _)| {
-            let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-            let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-            a_name.cmp(&b_name)
-        });
+        match self.settings.sort_order {
+            crate::settings::SortOrder::FileName => {
+                all_media.sort_by(|(a, _, _, _), (b, _, _, _)| {
+                    let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                    let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                    a_name.cmp(&b_name)
+                });
+            }
+            crate::settings::SortOrder::Numeric => {
+                all_media.sort_by(|(a, _, _, _), (b, _, _, _)| {
+                    let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    natural_sort_key(a_name).cmp(&natural_sort_key(b_name))
+                });
+            }
+            crate::settings::SortOrder::DateAsc => {
+                all_media.sort_by(|(_, _, a_mtime, _), (_, _, b_mtime, _)| a_mtime.cmp(b_mtime));
+            }
+            crate::settings::SortOrder::DateDesc => {
+                all_media.sort_by(|(_, _, a_mtime, _), (_, _, b_mtime, _)| b_mtime.cmp(a_mtime));
+            }
+        }
 
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
@@ -1262,6 +1279,7 @@ impl eframe::App for App {
         // ── メニューバー ─────────────────────────────────────────────
         let mut fav_nav: Option<PathBuf> = None;
         let mut settings_changed = false;
+        let mut sort_changed = false;
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("ファイル", |ui| {
@@ -1331,6 +1349,17 @@ impl eframe::App for App {
                             }
                         }
                     });
+                    ui.menu_button("ソート順", |ui| {
+                        for &order in crate::settings::SortOrder::all() {
+                            let checked = self.settings.sort_order == order;
+                            let prefix = if checked { "✓ " } else { "  " };
+                            if ui.button(format!("{prefix}{}", order.label())).clicked() {
+                                self.settings.sort_order = order;
+                                sort_changed = true;
+                                ui.close();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui.button("キャッシュ管理").clicked() {
                         let cache_dir = crate::catalog::default_cache_dir();
@@ -1355,6 +1384,14 @@ impl eframe::App for App {
         });
         if settings_changed {
             self.settings.save();
+        }
+        if sort_changed {
+            self.settings.save();
+            if let Some(path) = self.current_folder.clone() {
+                // スクロール履歴を捨てて先頭から再ロード
+                self.folder_history.remove(&path);
+                self.load_folder(path);
+            }
         }
 
         // ── お気に入り編集ポップアップ ───────────────────────────────
@@ -1602,7 +1639,7 @@ impl eframe::App for App {
             }
         }
 
-        // ── ツールバー（列数・アスペクト比の即時切り替え）────────────
+        // ── ツールバー（列数・アスペクト比・ソート順の即時切り替え）──
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -1621,6 +1658,21 @@ impl eframe::App for App {
                     if ui.selectable_label(selected, aspect.label()).clicked() {
                         self.settings.thumb_aspect = aspect;
                         self.settings.save();
+                    }
+                }
+                ui.separator();
+                ui.label("ソート:");
+                for &order in crate::settings::SortOrder::all() {
+                    let selected = self.settings.sort_order == order;
+                    if ui.selectable_label(selected, order.short_label()).clicked()
+                        && !selected
+                    {
+                        self.settings.sort_order = order;
+                        self.settings.save();
+                        if let Some(path) = self.current_folder.clone() {
+                            self.folder_history.remove(&path);
+                            self.load_folder(path);
+                        }
                     }
                 }
             });
@@ -2069,6 +2121,38 @@ fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
         egui::Color32::WHITE,
         egui::Stroke::NONE,
     ));
+}
+
+/// 自然順ソート用のキーを返す。
+/// ファイル名を「テキスト部分」と「数字部分」に分割し、
+/// 数字部分は数値として比較するので 1 < 2 < 9 < 10 < 11 となる。
+fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
+    let name_lower = name.to_lowercase();
+    let mut chunks = Vec::new();
+    let mut chars = name_lower.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut num_str = String::new();
+            while chars.peek().map(|ch| ch.is_ascii_digit()).unwrap_or(false) {
+                num_str.push(chars.next().unwrap());
+            }
+            let n: u64 = num_str.parse().unwrap_or(0);
+            chunks.push(NaturalChunk::Num(n));
+        } else {
+            let mut text = String::new();
+            while chars.peek().map(|ch| !ch.is_ascii_digit()).unwrap_or(false) {
+                text.push(chars.next().unwrap());
+            }
+            chunks.push(NaturalChunk::Text(text));
+        }
+    }
+    chunks
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum NaturalChunk {
+    Text(String),
+    Num(u64),
 }
 
 fn truncate_name(name: &str, max_chars: usize) -> String {

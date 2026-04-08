@@ -50,6 +50,43 @@ impl ThumbAspect {
 }
 
 // -----------------------------------------------------------------------
+// SortOrder
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Default)]
+pub enum SortOrder {
+    #[default]
+    FileName,   // ファイル名順（辞書順）
+    Numeric,    // 番号順（自然順: 1, 2, 9, 10, 11）
+    DateAsc,    // 日付順（昇順）
+    DateDesc,   // 日付順（降順）
+}
+
+impl SortOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FileName => "ファイル名順",
+            Self::Numeric  => "番号順",
+            Self::DateAsc  => "日付順（古い順）",
+            Self::DateDesc => "日付順（新しい順）",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::FileName => "名前",
+            Self::Numeric  => "番号",
+            Self::DateAsc  => "日付↑",
+            Self::DateDesc => "日付↓",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::FileName, Self::Numeric, Self::DateAsc, Self::DateDesc]
+    }
+}
+
+// -----------------------------------------------------------------------
 // Parallelism
 // -----------------------------------------------------------------------
 
@@ -110,6 +147,9 @@ pub struct Settings {
     /// Ctrl+↑↓ フォルダ移動時に画像なしフォルダをスキップする最大回数（1〜10）
     #[serde(default = "default_folder_skip_limit")]
     pub folder_skip_limit: usize,
+    /// サムネイルグリッドのソート順
+    #[serde(default)]
+    pub sort_order: SortOrder,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -130,6 +170,7 @@ impl Default for Settings {
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
             folder_skip_limit: default_folder_skip_limit(),
+            sort_order: SortOrder::default(),
         }
     }
 }
