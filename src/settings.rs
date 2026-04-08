@@ -101,9 +101,17 @@ pub struct Settings {
     pub window_size: Option<[f32; 2]>,
     #[serde(default)]
     pub parallelism: Parallelism,
+    /// フルサイズ表示時の後方先読み枚数（現在位置より前）
+    #[serde(default = "default_prefetch_back")]
+    pub prefetch_back: usize,
+    /// フルサイズ表示時の前方先読み枚数（現在位置より後）
+    #[serde(default = "default_prefetch_forward")]
+    pub prefetch_forward: usize,
 }
 
 fn default_grid_cols() -> usize { 4 }
+fn default_prefetch_back() -> usize { 4 }
+fn default_prefetch_forward() -> usize { 12 }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -115,6 +123,8 @@ impl Default for Settings {
             window_pos: None,
             window_size: None,
             parallelism: Parallelism::default(),
+            prefetch_back: default_prefetch_back(),
+            prefetch_forward: default_prefetch_forward(),
         }
     }
 }

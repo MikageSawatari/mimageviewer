@@ -47,8 +47,8 @@ pub struct App {
     thumbnails: Vec<ThumbnailState>,
     selected: Option<usize>,
     settings: crate::settings::Settings,
-    tx: mpsc::Sender<(usize, egui::ColorImage)>,
-    rx: mpsc::Receiver<(usize, egui::ColorImage)>,
+    tx: mpsc::Sender<(usize, Option<egui::ColorImage>)>,
+    rx: mpsc::Receiver<(usize, Option<egui::ColorImage>)>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
     cancel_token: Arc<AtomicBool>,
     /// Phase 2b ワーカーが参照する現在の可視先頭アイテムインデックス
@@ -317,9 +317,8 @@ impl App {
                 crate::logger::log(format!("  [1a vis-cached ] START {}", vis_cached.len()));
                 vis_cached.par_iter().for_each(|(i, jpeg_data)| {
                     if cancel.load(Ordering::Relaxed) { return; }
-                    if let Some(ci) = crate::catalog::jpeg_to_color_image(jpeg_data) {
-                        let _ = tx.send((*i, ci));
-                    }
+                    let ci = crate::catalog::jpeg_to_color_image(jpeg_data);
+                    let _ = tx.send((*i, ci));
                 });
                 crate::logger::log(format!("  [1a vis-cached ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
 
@@ -337,9 +336,8 @@ impl App {
                 crate::logger::log(format!("  [2a rest-cached] START {}", rest_cached.len()));
                 rest_cached.par_iter().for_each(|(i, jpeg_data)| {
                     if cancel.load(Ordering::Relaxed) { return; }
-                    if let Some(ci) = crate::catalog::jpeg_to_color_image(jpeg_data) {
-                        let _ = tx.send((*i, ci));
-                    }
+                    let ci = crate::catalog::jpeg_to_color_image(jpeg_data);
+                    let _ = tx.send((*i, ci));
                 });
                 crate::logger::log(format!("  [2a rest-cached] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
 
@@ -402,14 +400,21 @@ impl App {
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         let mut count = 0u32;
-        while let Ok((i, color_image)) = self.rx.try_recv() {
+        while let Ok((i, color_image_opt)) = self.rx.try_recv() {
             if i < self.thumbnails.len() {
-                let handle = ctx.load_texture(
-                    format!("thumb_{i}"),
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                self.thumbnails[i] = ThumbnailState::Loaded(handle);
+                match color_image_opt {
+                    Some(color_image) => {
+                        let handle = ctx.load_texture(
+                            format!("thumb_{i}"),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.thumbnails[i] = ThumbnailState::Loaded(handle);
+                    }
+                    None => {
+                        self.thumbnails[i] = ThumbnailState::Failed;
+                    }
+                }
                 count += 1;
             }
         }
@@ -623,26 +628,35 @@ impl App {
         }
     }
 
-    /// 先読みウィンドウを current_idx 中心の ±2 に更新する。
-    /// ウィンドウ外（±3 超）のキャッシュ・読み込みを破棄し、不足分の読み込みを開始する。
+    /// 先読みウィンドウを更新する。
+    /// settings の prefetch_back / prefetch_forward に従って先読みを開始し、
+    /// ウィンドウ外のキャッシュ・読み込みを破棄する。
     fn update_prefetch_window(&mut self, current_idx: usize) {
         let image_indices = Self::collect_image_indices(&self.items);
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
         let n = image_indices.len();
 
-        const PREFETCH: usize = 2; // 先読みする前後の枚数
-        const KEEP: usize = 3;     // テクスチャを保持する前後の枚数
+        let pf_back    = self.settings.prefetch_back;
+        let pf_forward = self.settings.prefetch_forward;
+        // KEEP はそれぞれ +1 だけ広く保持してテクスチャ破棄を遅延させる
+        let keep_back    = pf_back + 1;
+        let keep_forward = pf_forward + 1;
 
         let keep_set: std::collections::HashSet<usize> =
-            (pos.saturating_sub(KEEP)..=((pos + KEEP).min(n - 1)))
+            (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
                 .map(|p| image_indices[p])
                 .collect();
 
-        let prefetch_targets: Vec<usize> =
-            (pos.saturating_sub(PREFETCH)..=((pos + PREFETCH).min(n - 1)))
-                .map(|p| image_indices[p])
-                .filter(|&i| i != current_idx)
-                .collect();
+        // 前方優先（+1, +2, … , -1, -2, …）の順で起動する
+        let forward_targets = (1..=pf_forward)
+            .map(|d| pos + d)
+            .filter(|&p| p < n)
+            .map(|p| image_indices[p]);
+        let back_targets = (1..=pf_back)
+            .map(|d| pos.wrapping_sub(d))
+            .filter(|&p| p < n) // wrapping_sub で usize がラップした場合も除外
+            .map(|p| image_indices[p]);
+        let prefetch_targets: Vec<usize> = forward_targets.chain(back_targets).collect();
 
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
@@ -1323,6 +1337,32 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
+
+                    ui.heading("先読み設定");
+                    ui.add_space(4.0);
+                    ui.label("フルサイズ表示時に前後の画像を先読みする枚数（各最大 50 枚）。");
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("後方（前の画像）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.prefetch_back)
+                                .range(0..=50usize)
+                                .suffix(" 枚"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("前方（次の画像）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.prefetch_forward)
+                                .range(0..=50usize)
+                                .suffix(" 枚"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("  OK  ").clicked() {
                             apply = true;
@@ -1627,7 +1667,7 @@ fn draw_cell(
 fn load_one_cached(
     path: &Path,
     idx: usize,
-    tx: &mpsc::Sender<(usize, egui::ColorImage)>,
+    tx: &mpsc::Sender<(usize, Option<egui::ColorImage>)>,
     catalog: Option<&crate::catalog::CatalogDb>,
     mtime: i64,
     file_size: i64,
@@ -1636,7 +1676,18 @@ fn load_one_cached(
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
     let t = std::time::Instant::now();
 
-    match image::open(path) {
+    // 拡張子ベースのデコードを試み、失敗した場合はマジックバイトで再試行する。
+    // 拡張子が間違っているファイル（例: WebP に .png）にも対応するため。
+    let img_result = image::open(path).or_else(|_| {
+        use std::io::BufReader;
+        let f = std::fs::File::open(path)?;
+        image::ImageReader::new(BufReader::new(f))
+            .with_guessed_format()
+            .map_err(|e| image::ImageError::IoError(e))?
+            .decode()
+    });
+
+    match img_result {
         Ok(img) => {
             let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
             let t2 = std::time::Instant::now();
@@ -1653,9 +1704,8 @@ fn load_one_cached(
                     }
 
                     // JPEG → ColorImage でチャネルへ送信
-                    if let Some(color_image) = crate::catalog::jpeg_to_color_image(&jpeg_data) {
-                        let _ = tx.send((idx, color_image));
-                    }
+                    let color_image = crate::catalog::jpeg_to_color_image(&jpeg_data);
+                    let _ = tx.send((idx, color_image));
 
                     crate::logger::log(format!(
                         "    idx={idx:>4} decode={decode_ms:>6.1}ms encode={encode_ms:>5.1}ms  {name}"
@@ -1663,11 +1713,13 @@ fn load_one_cached(
                 }
                 None => {
                     crate::logger::log(format!("    idx={idx:>4} JPEG encode FAIL  {name}"));
+                    let _ = tx.send((idx, None));
                 }
             }
         }
         Err(e) => {
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {name}"));
+            let _ = tx.send((idx, None));
         }
     }
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
