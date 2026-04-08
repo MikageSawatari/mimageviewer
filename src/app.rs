@@ -6,7 +6,8 @@ use std::sync::{
 
 use eframe::egui;
 
-const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
+const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 
 // -----------------------------------------------------------------------
 // データモデル
@@ -16,12 +17,13 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
 pub enum GridItem {
     Folder(PathBuf),
     Image(PathBuf),
+    Video(PathBuf),
 }
 
 impl GridItem {
     fn path(&self) -> &Path {
         match self {
-            GridItem::Folder(p) | GridItem::Image(p) => p,
+            GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p) => p,
         }
     }
     fn name(&self) -> &str {
@@ -34,6 +36,24 @@ pub enum ThumbnailState {
     Loaded(egui::TextureHandle),
     #[allow(dead_code)]
     Failed,
+}
+
+/// フルスクリーン読み込みスレッドからUIスレッドへ送るメッセージ
+enum FsLoadResult {
+    /// 静止画（GIF・APNG の1フレーム目のみを含む）
+    Static(egui::ColorImage),
+    /// アニメーション: (フレーム画像, 表示時間[秒]) のベクタ
+    Animated(Vec<(egui::ColorImage, f64)>),
+}
+
+/// フルスクリーンキャッシュエントリ
+enum FsCacheEntry {
+    Static(egui::TextureHandle),
+    Animated {
+        frames: Vec<(egui::TextureHandle, f64)>, // (texture, delay_secs)
+        current_frame: usize,
+        next_frame_at: f64, // ctx.input(|i| i.time) 基準
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -79,10 +99,10 @@ pub struct App {
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
     fullscreen_idx: Option<usize>,
-    /// 先読みキャッシュ: item_idx → ロード済みテクスチャ
-    fs_cache: std::collections::HashMap<usize, egui::TextureHandle>,
+    /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
+    fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル)
-    fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<egui::ColorImage>)>,
+    fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>)>,
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
     show_favorites_editor: bool,
@@ -184,7 +204,8 @@ impl App {
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
         let mut folders: Vec<GridItem> = Vec::new();
-        let mut images: Vec<(PathBuf, i64, i64)> = Vec::new(); // (path, mtime, file_size)
+        // (path, is_video, mtime, file_size)
+        let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
@@ -192,33 +213,57 @@ impl App {
                 if p.is_dir() {
                     folders.push(GridItem::Folder(p));
                 } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
-                        let meta = entry.metadata().ok();
-                        let mtime = meta.as_ref()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map_or(0, |d| d.as_secs() as i64);
-                        let file_size = meta.map_or(0, |m| m.len() as i64);
-                        images.push((p, mtime, file_size));
+                    let ext_lower = ext.to_ascii_lowercase();
+                    let meta = entry.metadata().ok();
+                    let mtime = meta.as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let file_size = meta.map_or(0, |m| m.len() as i64);
+                    if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+                        all_media.push((p, false, mtime, file_size));
+                    } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
+                        all_media.push((p, true, mtime, file_size));
                     }
                 }
             }
         }
 
         folders.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
-        images.sort_by(|(a, _, _), (b, _, _)| {
+        all_media.sort_by(|(a, _, _, _), (b, _, _, _)| {
             let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
             let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
             a_name.cmp(&b_name)
         });
 
-        // items: フォルダ先頭 → 画像
+        // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
         self.items = folders;
-        for (p, _, _) in &images {
-            self.items.push(GridItem::Image(p.clone()));
+        for (p, is_video, _, _) in &all_media {
+            if *is_video {
+                self.items.push(GridItem::Video(p.clone()));
+            } else {
+                self.items.push(GridItem::Image(p.clone()));
+            }
         }
         self.thumbnails = (0..self.items.len()).map(|_| ThumbnailState::Pending).collect();
+
+        // 動画サムネイル用リスト: (item_idx, path)
+        let video_items: Vec<(usize, PathBuf)> = all_media.iter()
+            .enumerate()
+            .filter_map(|(i, (p, is_video, _, _))| {
+                if *is_video { Some((folder_count + i, p.clone())) } else { None }
+            })
+            .collect();
+
+        // 画像リスト（カタログ処理用）: (item_idx, path, mtime, file_size)
+        // item_idx は all_media 内の位置 + folder_count（動画と混在）
+        let images: Vec<(usize, PathBuf, i64, i64)> = all_media.iter()
+            .enumerate()
+            .filter_map(|(i, (p, is_video, mtime, file_size))| {
+                if !is_video { Some((folder_count + i, p.clone(), *mtime, *file_size)) } else { None }
+            })
+            .collect();
 
         // ── カタログを開いてキャッシュ状態を確認 ──────────────────────
         let cache_dir = crate::catalog::default_cache_dir();
@@ -241,16 +286,15 @@ impl App {
         let mut cached: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut needs_decode: Vec<(usize, PathBuf, i64, i64)> = Vec::new();
 
-        for (img_idx, (img_path, mtime, file_size)) in images.iter().enumerate() {
-            let item_idx = folder_count + img_idx;
+        for (item_idx, img_path, mtime, file_size) in images.iter() {
             let filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if let Some(entry) = cache_map.get(filename) {
                 if entry.mtime == *mtime && entry.file_size == *file_size {
-                    cached.push((item_idx, entry.jpeg_data.clone()));
+                    cached.push((*item_idx, entry.jpeg_data.clone()));
                     continue;
                 }
             }
-            needs_decode.push((item_idx, img_path.clone(), *mtime, *file_size));
+            needs_decode.push((*item_idx, img_path.clone(), *mtime, *file_size));
         }
         crate::logger::log(format!(
             "  catalog: {} cached hits, {} need decode",
@@ -262,7 +306,7 @@ impl App {
         if let Some(ref cat) = catalog_arc {
             let existing: std::collections::HashSet<String> = images
                 .iter()
-                .filter_map(|(p, _, _)| p.file_name()?.to_str().map(String::from))
+                .filter_map(|(_, p, _, _)| p.file_name()?.to_str().map(String::from))
                 .collect();
             if let Err(e) = cat.delete_missing(&existing) {
                 crate::logger::log(format!("  catalog delete_missing failed: {e}"));
@@ -307,6 +351,10 @@ impl App {
         let scroll_hint = Arc::clone(&self.scroll_hint);
         let rest_queue: Arc<Mutex<Vec<(usize, PathBuf, i64, i64)>>> =
             Arc::new(Mutex::new(rest_needs));
+
+        // 動画サムネイルスレッド用に先にクローンしておく（画像スレッドが move する前に）
+        let tx_for_video = tx.clone();
+        let cancel_for_video = Arc::clone(&cancel);
 
         std::thread::spawn(move || {
             pool.install(|| {
@@ -383,6 +431,24 @@ impl App {
                 }
             });
         });
+
+        // ── 動画サムネイルを別スレッドで取得（Windows Shell API）─────────
+        if !video_items.is_empty() {
+            let tx_v = tx_for_video;
+            let cancel_v = cancel_for_video;
+            let thumb_size = self.last_cell_size.max(256.0) as i32;
+            std::thread::spawn(move || {
+                for (idx, path) in video_items {
+                    if cancel_v.load(Ordering::Relaxed) { break; }
+                    let ci = crate::video_thumb::get_video_thumbnail(&path, thumb_size);
+                    crate::logger::log(format!(
+                        "  video thumb: idx={idx} {}",
+                        if ci.is_some() { "ok" } else { "FAIL" }
+                    ));
+                    let _ = tx_v.send((idx, ci));
+                }
+            });
+        }
 
         // 履歴があればスクロール位置・選択状態を復元
         if let Some(&(scroll, sel)) = self.folder_history.get(&path) {
@@ -476,6 +542,10 @@ impl App {
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p)) => return Some(p.clone()),
                         Some(GridItem::Image(_)) => self.open_fullscreen(idx),
+                        Some(GridItem::Video(p)) => {
+                            let vp = p.clone();
+                            open_external_player(&vp);
+                        }
                         None => {}
                     }
                 }
@@ -579,33 +649,70 @@ impl App {
 
     /// フルスクリーン表示を開始する。
     /// キャッシュ済みなら即座に表示し、そうでなければ読み込みを開始する。
+    /// 動画アイテムの場合はサムネイル＋再生ボタンを表示するだけで読み込みは不要。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
 
-        if self.fs_cache.contains_key(&idx) {
-            crate::logger::log(format!("  cache hit idx={idx} → instant display"));
-        } else if !self.fs_pending.contains_key(&idx) {
-            // キャッシュにも pending にもない → 最優先で読み込み開始
-            self.start_fs_load(idx);
+        match self.items.get(idx) {
+            Some(GridItem::Image(_)) => {
+                if self.fs_cache.contains_key(&idx) {
+                    crate::logger::log(format!("  cache hit idx={idx} → instant display"));
+                } else if !self.fs_pending.contains_key(&idx) {
+                    self.start_fs_load(idx);
+                }
+                self.update_prefetch_window(idx);
+            }
+            Some(GridItem::Video(_)) => {
+                // 動画はサムネイル + 再生ボタンのみ。高解像度読み込み不要。
+                crate::logger::log(format!("  video idx={idx} → play button mode"));
+            }
+            _ => {}
         }
-
-        // 前後 ±2 枚の先読みウィンドウを更新
-        self.update_prefetch_window(idx);
     }
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
+    /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     fn start_fs_load(&mut self, idx: usize) {
         if let Some(GridItem::Image(path)) = self.items.get(idx) {
             let path = path.clone();
             let cancel = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = mpsc::channel::<egui::ColorImage>();
+            let (tx, rx) = mpsc::channel::<FsLoadResult>();
             self.fs_pending.insert(idx, (Arc::clone(&cancel), rx));
 
             std::thread::spawn(move || {
                 if cancel.load(Ordering::Relaxed) { return; }
                 let t = std::time::Instant::now();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+                // GIF: アニメーション試行
+                if ext == "gif" {
+                    if let Some(frames) = decode_gif_frames(&path) {
+                        crate::logger::log(format!(
+                            "  fs load anim-gif: {:.0}ms  idx={idx}  {name}  {} frames",
+                            t.elapsed().as_secs_f64() * 1000.0,
+                            frames.len()
+                        ));
+                        let _ = tx.send(FsLoadResult::Animated(frames));
+                        return;
+                    }
+                }
+
+                // PNG: APNG アニメーション試行
+                if ext == "png" {
+                    if let Some(frames) = decode_apng_frames(&path) {
+                        crate::logger::log(format!(
+                            "  fs load anim-png: {:.0}ms  idx={idx}  {name}  {} frames",
+                            t.elapsed().as_secs_f64() * 1000.0,
+                            frames.len()
+                        ));
+                        let _ = tx.send(FsLoadResult::Animated(frames));
+                        return;
+                    }
+                }
+
+                // 静止画フォールバック
                 match image::open(&path) {
                     Ok(img) => {
                         // TODO Phase 2: NGX DLISR アップスケール統合ポイント
@@ -618,7 +725,7 @@ impl App {
                             "  fs load: {:.0}ms  idx={idx}  {name}  {w}x{h}",
                             t.elapsed().as_secs_f64() * 1000.0
                         ));
-                        let _ = tx.send(ci);
+                        let _ = tx.send(FsLoadResult::Static(ci));
                     }
                     Err(e) => {
                         crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
@@ -681,12 +788,13 @@ impl App {
         }
     }
 
-    /// items の中の画像アイテムの item_idx 一覧を返す
+    /// items の中の画像アイテムの item_idx 一覧を返す（先読みウィンドウ用）
     fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
         items.iter().enumerate()
             .filter_map(|(i, item)| matches!(item, GridItem::Image(_)).then_some(i))
             .collect()
     }
+
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
     fn close_fullscreen(&mut self) {
@@ -700,21 +808,47 @@ impl App {
 
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
     fn poll_prefetch(&mut self, ctx: &egui::Context) {
-        let mut completed: Vec<(usize, egui::ColorImage)> = Vec::new();
+        let mut completed: Vec<(usize, FsLoadResult)> = Vec::new();
         for (&key, (_, rx)) in &self.fs_pending {
-            if let Ok(ci) = rx.try_recv() {
-                completed.push((key, ci));
+            if let Ok(result) = rx.try_recv() {
+                completed.push((key, result));
             }
         }
         let repaint = !completed.is_empty();
-        for (key, ci) in completed {
+        for (key, result) in completed {
             self.fs_pending.remove(&key);
-            let handle = ctx.load_texture(
-                format!("fs_{key}"),
-                ci,
-                egui::TextureOptions::LINEAR,
-            );
-            self.fs_cache.insert(key, handle);
+            let entry = match result {
+                FsLoadResult::Static(ci) => {
+                    let handle = ctx.load_texture(
+                        format!("fs_{key}"),
+                        ci,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    FsCacheEntry::Static(handle)
+                }
+                FsLoadResult::Animated(frames) => {
+                    let textures: Vec<(egui::TextureHandle, f64)> = frames
+                        .into_iter()
+                        .enumerate()
+                        .map(|(fi, (ci, delay))| {
+                            let handle = ctx.load_texture(
+                                format!("fs_{key}_f{fi}"),
+                                ci,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            (handle, delay)
+                        })
+                        .collect();
+                    let now = ctx.input(|i| i.time);
+                    let first_delay = textures.first().map(|(_, d)| *d).unwrap_or(0.1);
+                    FsCacheEntry::Animated {
+                        frames: textures,
+                        current_frame: 0,
+                        next_frame_at: now + first_delay,
+                    }
+                }
+            };
+            self.fs_cache.insert(key, entry);
         }
         if repaint {
             ctx.request_repaint();
@@ -812,8 +946,41 @@ impl eframe::App for App {
 
         // ── フルスクリーンビューポート ──────────────────────────────────
         if let Some(fs_idx) = self.fullscreen_idx {
-            // クロージャに渡すデータを事前にクローン（self の借用を避ける）
-            let tex        = self.fs_cache.get(&fs_idx).cloned();
+            // 動画か否かを判定
+            let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+            let video_path = if is_video {
+                if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
+                    Some(p.clone())
+                } else { None }
+            } else { None };
+
+            // アニメーションフレームを進める（メインコンテキストの時刻を使う）
+            if !is_video {
+                let now = ctx.input(|i| i.time);
+                if let Some(FsCacheEntry::Animated { frames, current_frame, next_frame_at }) =
+                    self.fs_cache.get_mut(&fs_idx)
+                {
+                    if now >= *next_frame_at && !frames.is_empty() {
+                        *current_frame = (*current_frame + 1) % frames.len();
+                        let delay = frames[*current_frame].1.max(0.02);
+                        *next_frame_at = now + delay;
+                    }
+                }
+            }
+
+            // 表示テクスチャを取得（動画は None、画像はキャッシュエントリから）
+            let tex: Option<egui::TextureHandle> = if is_video {
+                None
+            } else {
+                match self.fs_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Static(h)) => Some(h.clone()),
+                    Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                        frames.get(*current_frame).map(|(h, _)| h.clone())
+                    }
+                    None => None,
+                }
+            };
+
             let thumb_tex  = match self.thumbnails.get(fs_idx) {
                 Some(ThumbnailState::Loaded(h)) => Some(h.clone()),
                 _ => None,
@@ -821,7 +988,8 @@ impl eframe::App for App {
             let filename   = self.items.get(fs_idx)
                 .map(|item| item.name().to_string())
                 .unwrap_or_default();
-            let is_loading = !self.fs_cache.contains_key(&fs_idx);
+            // 画像のみ「高解像度読込中」表示が必要（動画は不要）
+            let is_loading = !is_video && !self.fs_cache.contains_key(&fs_idx);
 
             let mut close_fs   = false;
             let mut nav_delta: i32     = 0;
@@ -905,24 +1073,33 @@ impl eframe::App for App {
                             }
 
                             // ── マウスクリック操作 ────────────────────
-                            // シングルクリック左半分 → 前の画像、右半分 → 次の画像
                             let fs_response = ui.interact(
                                 full_rect,
                                 egui::Id::new("fs_click"),
                                 egui::Sense::click(),
                             );
-                            if fs_response.clicked() {
-                                if let Some(pos) = fs_response.interact_pointer_pos() {
-                                    if pos.x > full_rect.center().x {
-                                        nav_delta = 1;
-                                    } else {
-                                        nav_delta = -1;
+                            if is_video {
+                                // 動画: クリックで外部プレイヤー起動
+                                if fs_response.clicked() {
+                                    if let Some(ref vp) = video_path {
+                                        open_external_player(vp);
+                                    }
+                                }
+                            } else {
+                                // 画像: 左半分 → 前、右半分 → 次
+                                if fs_response.clicked() {
+                                    if let Some(pos) = fs_response.interact_pointer_pos() {
+                                        if pos.x > full_rect.center().x {
+                                            nav_delta = 1;
+                                        } else {
+                                            nav_delta = -1;
+                                        }
                                     }
                                 }
                             }
 
-                            // ── 画像表示 ─────────────────────────────
-                            // フルサイズ優先。未ロードならサムネイルで仮表示する
+                            // ── 画像 / 動画表示 ───────────────────────
+                            // 動画はサムネイルのみ表示。画像はフルサイズ優先。
                             let display_tex = tex.as_ref().or(thumb_tex.as_ref());
                             if let Some(handle) = display_tex {
                                 let tex_size = handle.size_vec2();
@@ -946,13 +1123,25 @@ impl eframe::App for App {
                                 ui.painter().text(
                                     full_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "読込中...",
+                                    if is_video { "動画サムネイル 読込中..." } else { "読込中..." },
                                     egui::FontId::proportional(24.0),
                                     egui::Color32::from_gray(180),
                                 );
                             }
 
-                            // サムネイル仮表示中 → 高解像度読み込み中インジケーター
+                            // ── 動画: 再生ボタンオーバーレイ ─────────
+                            if is_video {
+                                draw_play_icon(ui.painter(), full_rect.center(), 56.0);
+                                // Enter キーでも起動
+                                let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                                if enter {
+                                    if let Some(ref vp) = video_path {
+                                        open_external_player(vp);
+                                    }
+                                }
+                            }
+
+                            // サムネイル仮表示中 → 高解像度読み込み中インジケーター（画像のみ）
                             if is_loading && display_tex.is_some() {
                                 ui.painter().text(
                                     full_rect.min + egui::vec2(16.0, 16.0),
@@ -1043,17 +1232,29 @@ impl eframe::App for App {
                     }
                 }
             } else if !close_fs && nav_delta != 0 {
-                // ←→↑↓: 画像を前後に切り替え
-                if let Some(new_idx) = adjacent_image_idx(&self.items, fs_idx, nav_delta) {
+                // ←→↑↓: 画像・動画を前後に切り替え
+                if let Some(new_idx) = adjacent_navigable_idx(&self.items, fs_idx, nav_delta) {
                     self.open_fullscreen(new_idx);
                     self.selected = Some(new_idx);
                     self.scroll_to_selected = true;
                 }
             }
 
-            // フルサイズ読み込み完了まで毎フレーム再描画
-            if self.fullscreen_idx.map(|i| !self.fs_cache.contains_key(&i)).unwrap_or(false) {
+            // 高解像度読み込み完了まで毎フレーム再描画（画像のみ）
+            let image_loading = !is_video
+                && self.fullscreen_idx.map(|i| !self.fs_cache.contains_key(&i)).unwrap_or(false);
+            if image_loading {
                 ctx.request_repaint();
+            }
+
+            // アニメーション: 次フレームの時刻まで待ってから再描画
+            if !is_video {
+                if let Some(FsCacheEntry::Animated { next_frame_at, .. }) =
+                    self.fs_cache.get(&fs_idx)
+                {
+                    let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
+                }
             }
         }
 
@@ -1527,6 +1728,10 @@ impl eframe::App for App {
                                     match self.items.get(idx) {
                                         Some(GridItem::Folder(p)) => nav = Some(p.clone()),
                                         Some(GridItem::Image(_)) => self.open_fullscreen(idx),
+                                        Some(GridItem::Video(p)) => {
+                                            let vp = p.clone();
+                                            open_external_player(&vp);
+                                        }
                                         None => {}
                                     }
                                 }
@@ -1651,6 +1856,46 @@ fn draw_cell(
                 );
             }
         },
+        GridItem::Video(path) => {
+            match thumb {
+                ThumbnailState::Loaded(tex) => {
+                    let tex_size = tex.size_vec2();
+                    let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
+                    let img_rect = egui::Rect::from_center_size(inner.center(), tex_size * scale);
+                    painter.image(
+                        tex.id(),
+                        img_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                ThumbnailState::Pending => {
+                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
+                    painter.text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "動画",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(160),
+                    );
+                }
+                ThumbnailState::Failed => {
+                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
+                }
+            }
+            // 再生ボタンオーバーレイ（常時表示）
+            let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
+            draw_play_icon(painter, inner.center(), r);
+            // ファイル名
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                truncate_name(name, 18),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(30),
+            );
+        }
     }
 
     let border = if is_selected {
@@ -1659,6 +1904,62 @@ fn draw_cell(
         egui::Stroke::new(1.0, egui::Color32::from_gray(200))
     };
     painter.rect_stroke(rect, 2.0, border, egui::StrokeKind::Middle);
+}
+
+// -----------------------------------------------------------------------
+// アニメーション GIF / APNG デコード
+// -----------------------------------------------------------------------
+
+/// GIF をデコードしてアニメーションフレーム列を返す。
+/// 静止画（1フレーム）や失敗時は None を返す。
+fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
+    use image::codecs::gif::GifDecoder;
+    use image::AnimationDecoder;
+
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let decoder = GifDecoder::new(reader).ok()?;
+    let frames = decoder.into_frames().collect_frames().ok()?;
+    if frames.len() <= 1 { return None; }
+
+    Some(frames.into_iter().map(|frame| {
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay = if denom > 0 { numer as f64 / denom as f64 / 1000.0 } else { 0.1 };
+        let delay = delay.max(0.02); // 最低 20ms（Chrome 互換）
+        let buf = frame.into_buffer();
+        let (w, h) = buf.dimensions();
+        let ci = egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize], buf.as_raw(),
+        );
+        (ci, delay)
+    }).collect())
+}
+
+/// APNG をデコードしてアニメーションフレーム列を返す。
+/// 静止画（1フレーム）・非 APNG・失敗時は None を返す。
+fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
+    use image::codecs::png::PngDecoder;
+    use image::AnimationDecoder;
+
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let decoder = PngDecoder::new(reader).ok()?;
+    if !decoder.is_apng().ok()? { return None; }
+
+    let frames = decoder.apng().ok()?.into_frames().collect_frames().ok()?;
+    if frames.len() <= 1 { return None; }
+
+    Some(frames.into_iter().map(|frame| {
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay = if denom > 0 { numer as f64 / denom as f64 / 1000.0 } else { 0.1 };
+        let delay = delay.max(0.02);
+        let buf = frame.into_buffer();
+        let (w, h) = buf.dimensions();
+        let ci = egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize], buf.as_raw(),
+        );
+        (ci, delay)
+    }).collect())
 }
 
 /// 1枚の画像をデコードしてサムネイルを生成し、カタログに保存してチャネルへ送信する。
@@ -1724,6 +2025,32 @@ fn load_one_cached(
     }
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
     gen_done.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 半透明黒円 + 白三角（再生ボタン）を描画する。
+/// `center` は円の中心、`radius` は円の半径。
+fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    // 背景円
+    painter.circle_filled(
+        center,
+        radius,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+    );
+    // 右向き三角形（ポリゴン）
+    // 視覚的中心を合わせるため若干右にオフセット
+    let tr = radius * 0.45;
+    let cx = center.x + tr * 0.12;
+    let cy = center.y;
+    let points = vec![
+        egui::pos2(cx - tr * 0.55, cy - tr * 0.9),  // 左上
+        egui::pos2(cx - tr * 0.55, cy + tr * 0.9),  // 左下
+        egui::pos2(cx + tr * 0.95, cy),              // 右頂点
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        egui::Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn truncate_name(name: &str, max_chars: usize) -> String {
@@ -1812,6 +2139,7 @@ fn path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 /// items の中で current から delta 分（±1）移動した画像の item index を返す。
 /// 境界では None を返す（ラップアラウンドなし）。
+#[allow(dead_code)]
 fn adjacent_image_idx(items: &[GridItem], current: usize, delta: i32) -> Option<usize> {
     let image_indices: Vec<usize> = items
         .iter()
@@ -1821,4 +2149,28 @@ fn adjacent_image_idx(items: &[GridItem], current: usize, delta: i32) -> Option<
     let pos     = image_indices.iter().position(|&i| i == current)?;
     let new_pos = (pos as i32 + delta).clamp(0, image_indices.len() as i32 - 1) as usize;
     if new_pos == pos { None } else { Some(image_indices[new_pos]) }
+}
+
+/// items の中で current から delta 分（±1）移動した「表示可能」アイテム（画像＋動画）の
+/// item index を返す。境界では None を返す（ラップアラウンドなし）。
+fn adjacent_navigable_idx(items: &[GridItem], current: usize, delta: i32) -> Option<usize> {
+    let nav_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            matches!(item, GridItem::Image(_) | GridItem::Video(_)).then_some(i)
+        })
+        .collect();
+    let pos     = nav_indices.iter().position(|&i| i == current)?;
+    let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
+    if new_pos == pos { None } else { Some(nav_indices[new_pos]) }
+}
+
+/// パスに関連付けられたデフォルトアプリケーション（外部プレイヤー）で開く。
+fn open_external_player(path: &Path) {
+    let path_str = path.to_string_lossy().into_owned();
+    crate::logger::log(format!("open_external_player: {path_str}"));
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path_str])
+        .spawn();
 }

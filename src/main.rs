@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod logger;
 pub mod monitor;
 pub mod settings;
+pub mod video_thumb;
 
 use std::sync::Arc;
 
