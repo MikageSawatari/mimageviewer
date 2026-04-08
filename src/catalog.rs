@@ -171,7 +171,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// 戻り値: (jpeg_bytes, width, height)
 pub fn encode_thumb_jpeg(img: &image::DynamicImage) -> Option<(Vec<u8>, u32, u32)> {
     use image::ImageEncoder;
-    let thumb = img.thumbnail(THUMB_LONG_SIDE, THUMB_LONG_SIDE);
+    let thumb = img.resize(THUMB_LONG_SIDE, THUMB_LONG_SIDE, image::imageops::FilterType::Lanczos3);
     let rgb = thumb.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     let mut buf = Vec::new();
