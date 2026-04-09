@@ -18,6 +18,7 @@ fn main() -> eframe::Result {
         let _ = RegisterHotKey(None, 0xAF00, MOD_ALT, u32::from(b'G'));
     }
 
+    #[cfg(debug_assertions)]
     logger::init();
 
     // 保存済み設定からウィンドウ初期状態を決定する
@@ -28,7 +29,8 @@ fn main() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
-        .with_inner_size(size);
+        .with_inner_size(size)
+        .with_icon(Arc::new(load_icon()));
 
     // 保存済み位置にモニターが接続されている場合のみ適用する。
     // 接続モニターが減って座標が画面外になった場合はデフォルト位置を使う。
@@ -54,6 +56,19 @@ fn main() -> eframe::Result {
     )
 }
 
+
+fn load_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(bytes)
+        .expect("icon.png の読み込み失敗")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
+}
 
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();

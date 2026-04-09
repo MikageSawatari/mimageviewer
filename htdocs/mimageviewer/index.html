@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>mImageViewer - 高速画像ビューワー for Windows</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+                   "游ゴシック体", YuGothic, "Yu Gothic", "メイリオ", Meiryo, sans-serif;
+      background: linear-gradient(135deg, #fff5f9 0%, #ffeef7 100%);
+      background-attachment: fixed;
+      color: #333;
+      line-height: 1.7;
+      min-height: 100vh;
+    }
+
+    a { color: #d63384; text-decoration: none; }
+    a:hover { text-decoration: underline; color: #a02860; }
+
+    /* ── Header ── */
+    header {
+      background: rgba(255, 255, 255, 0.85);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid #ffb0d9;
+      padding: 0 2rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+      height: 56px;
+    }
+    .logo {
+      font-size: 1.2rem;
+      font-weight: 700;
+      background: linear-gradient(90deg, #ff60c0, #d63384);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .site-nav a {
+      color: #a02860;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .site-nav a:hover { color: #d63384; text-decoration: none; }
+
+    /* ── Hero ── */
+    .hero {
+      background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 50%, #ffd0eb 100%);
+      border-bottom: 1px solid #ffb0d9;
+      padding: 4rem 2rem 3.5rem;
+      text-align: center;
+    }
+    .hero h1 {
+      font-size: 3rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #ff60c0, #d63384);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 0.5rem;
+    }
+    .hero .tagline {
+      font-size: 1.1rem;
+      color: #a02860;
+      margin-bottom: 2rem;
+    }
+    .hero .badges {
+      display: flex;
+      gap: 0.6rem;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 2.5rem;
+    }
+    .badge {
+      background: rgba(255, 96, 192, 0.12);
+      border: 1px solid #ffb0d9;
+      border-radius: 20px;
+      padding: 0.25rem 0.85rem;
+      font-size: 0.83rem;
+      color: #a02860;
+      font-weight: 500;
+    }
+    .btn-download {
+      display: inline-block;
+      background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff;
+      padding: 0.9rem 2.5rem;
+      border-radius: 30px;
+      font-size: 1.05rem;
+      font-weight: 700;
+      box-shadow: 0 4px 15px rgba(214, 51, 132, 0.35);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .btn-download:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(214, 51, 132, 0.45);
+      text-decoration: none;
+      color: #fff;
+    }
+    .download-note {
+      margin-top: 0.9rem;
+      font-size: 0.85rem;
+      color: #a02860;
+      opacity: 0.8;
+    }
+
+    /* ── Main ── */
+    main {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 3rem 2rem;
+    }
+    section { margin-bottom: 3.5rem; }
+
+    h2 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #c0255a;
+      margin-bottom: 1.25rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 2px solid #ffb0d9;
+      position: relative;
+    }
+    h2::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      bottom: -2px;
+      width: 60px;
+      height: 2px;
+      background: linear-gradient(90deg, #ff60c0, #d63384);
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #d63384;
+      margin: 1.5rem 0 0.6rem;
+    }
+
+    p { margin-bottom: 0.8rem; color: #444; }
+
+    /* ── Feature cards ── */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 1.1rem;
+    }
+    .feature-card {
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-radius: 15px;
+      padding: 1.25rem 1.35rem;
+      box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08);
+      position: relative;
+      overflow: hidden;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .feature-card::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, #ff60c0, #ffb0d9);
+      transform: translateX(-100%);
+      transition: transform 0.3s ease;
+    }
+    .feature-card:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgba(255, 96, 192, 0.15); }
+    .feature-card:hover::before { transform: translateX(0); }
+    .feature-card .icon { font-size: 1.7rem; margin-bottom: 0.5rem; }
+    .feature-card h3 { margin: 0 0 0.35rem; font-size: 0.97rem; color: #c0255a; }
+    .feature-card p { font-size: 0.88rem; color: #666; margin: 0; }
+
+    /* ── Tables ── */
+    .shortcut-section { margin-bottom: 2rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+      background: #fff;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 2px 10px rgba(255, 96, 192, 0.08);
+    }
+    th {
+      background: linear-gradient(90deg, #ffe0f0, #ffd0eb);
+      color: #a02860;
+      text-align: left;
+      padding: 0.6rem 1rem;
+      font-weight: 600;
+      font-size: 0.82rem;
+    }
+    td {
+      padding: 0.6rem 1rem;
+      border-bottom: 1px solid #ffeef7;
+      vertical-align: top;
+      color: #444;
+    }
+    tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: #fff5fb; }
+
+    kbd {
+      display: inline-block;
+      background: #ffeef7;
+      border: 1px solid #ffb0d9;
+      border-radius: 5px;
+      padding: 0.1em 0.55em;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 0.83em;
+      color: #c0255a;
+      white-space: nowrap;
+    }
+
+    code {
+      background: #ffeef7;
+      border: 1px solid #ffb0d9;
+      border-radius: 4px;
+      padding: 0.1em 0.45em;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 0.88em;
+      color: #c0255a;
+    }
+
+    /* ── Bullet list ── */
+    .pink-list {
+      list-style: none;
+      padding: 0;
+    }
+    .pink-list li {
+      padding: 0.4rem 0 0.4rem 1.4rem;
+      border-bottom: 1px solid #ffeef7;
+      font-size: 0.95rem;
+      color: #444;
+      position: relative;
+    }
+    .pink-list li::before {
+      content: "♦";
+      position: absolute;
+      left: 0;
+      color: #ff60c0;
+      font-size: 0.65rem;
+      top: 0.65rem;
+    }
+    .pink-list li:last-child { border-bottom: none; }
+
+    /* ── Requirements ── */
+    .req-list { list-style: none; padding: 0; }
+    .req-list li {
+      padding: 0.5rem 0;
+      border-bottom: 1px solid #ffeef7;
+      font-size: 0.95rem;
+      color: #444;
+      display: flex;
+      gap: 1rem;
+    }
+    .req-list li:last-child { border-bottom: none; }
+    .req-list .label {
+      min-width: 120px;
+      color: #a02860;
+      font-weight: 600;
+      font-size: 0.85rem;
+    }
+
+    /* ── Info box ── */
+    .info-box {
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-left: 4px solid #ff60c0;
+      border-radius: 8px;
+      padding: 0.85rem 1.1rem;
+      font-size: 0.88rem;
+      color: #666;
+      margin-top: 0.75rem;
+    }
+
+    /* ── Download box ── */
+    .download-box {
+      background: #fff;
+      border: 1px solid #ffb0d9;
+      border-radius: 15px;
+      padding: 1.75rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
+      box-shadow: 0 4px 16px rgba(255, 96, 192, 0.1);
+    }
+    .download-info .version {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #c0255a;
+      margin-bottom: 0.25rem;
+    }
+    .download-info .meta {
+      font-size: 0.85rem;
+      color: #a02860;
+      opacity: 0.75;
+    }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid #ffb0d9;
+      background: rgba(255, 255, 255, 0.6);
+      padding: 2rem;
+      text-align: center;
+      color: #a02860;
+      font-size: 0.85rem;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      .hero h1 { font-size: 2.2rem; }
+      main { padding: 2rem 1rem; }
+      .download-box { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <span class="logo">mikage.to</span>
+    <nav class="site-nav">
+      <a href="/">Home</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ===== Hero ===== -->
+<div class="hero">
+  <h1>mImageViewer</h1>
+  <p class="tagline">Windows 11 向け高速サムネイルビューワー</p>
+  <div class="badges">
+    <span class="badge">Windows 11</span>
+    <span class="badge">GPU アクセラレーション</span>
+    <span class="badge">フリーソフト</span>
+    <span class="badge">Rust 製</span>
+  </div>
+  <a class="btn-download" href="#download">ダウンロード</a>
+  <p class="download-note">無料 &nbsp;·&nbsp; インストール不要 &nbsp;·&nbsp; 単体 exe</p>
+</div>
+
+<main>
+
+  <!-- ===== Overview ===== -->
+  <section id="overview">
+    <h2>概要</h2>
+    <p>
+      mImageViewer は、大量の画像を快適に閲覧するための Windows 11 向け画像ビューワーです。
+      GPU アクセラレーションを使ったサムネイルグリッド表示と、SQLite ベースのサムネイルキャッシュにより、
+      同じフォルダを再度開いたときは瞬時に表示されます。
+    </p>
+    <p>
+      旧来の 32bit ビューワー「ViX」にインスパイアされ、現代の環境に合わせて Rust でゼロから実装しました。
+    </p>
+  </section>
+
+  <!-- ===== Features ===== -->
+  <section id="features">
+    <h2>主な機能</h2>
+    <div class="features">
+      <div class="feature-card">
+        <div class="icon">⚡</div>
+        <h3>高速サムネイルキャッシュ</h3>
+        <p>SQLite にサムネイルを保存。2回目以降は再デコード不要で瞬時に表示。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🖼️</div>
+        <h3>フルスクリーン表示</h3>
+        <p>画像をクリックすると別ウィンドウでフルサイズ表示。前後の画像をプリフェッチ。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🎞️</div>
+        <h3>アニメーション再生</h3>
+        <p>アニメーション GIF・APNG をフルスクリーンでそのまま再生。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🎬</div>
+        <h3>動画サムネイル</h3>
+        <p>MP4・AVI・MKV などの動画ファイルもサムネイル表示。ダブルクリックで外部プレイヤー起動。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">📂</div>
+        <h3>フォルダツリー巡回</h3>
+        <p>Ctrl+↑↓ で深さ優先でフォルダを順番に移動。大量フォルダの一括確認に便利。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">⭐</div>
+        <h3>お気に入りフォルダ</h3>
+        <p>よく使うフォルダをお気に入り登録してメニューから即アクセス。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔢</div>
+        <h3>柔軟なグリッドレイアウト</h3>
+        <p>列数 2〜10、縦横比、ソート順を自由に変更。ウィンドウサイズと設定は保存される。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🗂️</div>
+        <h3>多彩なソート</h3>
+        <p>ファイル名順・数値順（自然順）・更新日昇順・降順の4種類から選択。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Supported Formats ===== -->
+  <section id="formats">
+    <h2>対応フォーマット</h2>
+    <h3>静止画</h3>
+    <p>JPEG (.jpg / .jpeg)、PNG (.png)、WebP (.webp)、BMP (.bmp)</p>
+    <h3>アニメーション</h3>
+    <p>アニメーション GIF (.gif)、アニメーション PNG (.png)</p>
+    <h3>動画（サムネイル表示のみ）</h3>
+    <p>MP4、AVI、MOV、MKV、WMV、MPG / MPEG</p>
+  </section>
+
+  <!-- ===== Usage ===== -->
+  <section id="usage">
+    <h2>使い方</h2>
+
+    <h3>起動と基本操作</h3>
+    <p>
+      <code>mimageviewer.exe</code> をダブルクリックして起動します。
+      画面上部のアドレスバーにフォルダパスを入力して <kbd>Enter</kbd> を押すか、
+      グリッド内のフォルダをダブルクリックして移動します。
+    </p>
+
+    <h3>サムネイルグリッド</h3>
+    <p>
+      フォルダを開くと、サブフォルダが先頭に、続いて画像・動画がグリッド表示されます。
+      初回読み込み時はバックグラウンドでデコードが行われ、2回目以降はキャッシュから即時表示されます。
+    </p>
+    <ul class="pink-list" style="margin-top:0.5rem;">
+      <li><kbd>Ctrl</kbd> + マウスホイール：列数をリアルタイムで増減</li>
+      <li>マウスホイール：スクロール（行単位でスナップ）</li>
+      <li>クリック：アイテムを選択</li>
+      <li>ダブルクリック：フォルダを開く / 画像をフルスクリーン表示</li>
+    </ul>
+
+    <h3>フルスクリーン表示</h3>
+    <p>
+      画像をダブルクリックすると別ウィンドウでフルサイズ表示されます。
+      左右の画面をクリック、または矢印キー / マウスホイールで前後の画像に移動できます。
+    </p>
+
+    <h3>ツールバー</h3>
+    <p>
+      アドレスバー下のツールバーから、列数・サムネイル縦横比・ソート順をワンクリックで変更できます。
+      変更は即座に反映され、設定は自動保存されます。
+    </p>
+
+    <h3>お気に入り</h3>
+    <p>
+      「お気に入り」メニュー → 「このフォルダを追加」で現在のフォルダを登録します。
+      以降はメニューから直接移動できます。「編集」ダイアログで並び順の変更・削除が可能です。
+    </p>
+  </section>
+
+  <!-- ===== Keyboard Shortcuts ===== -->
+  <section id="shortcuts">
+    <h2>キーボードショートカット</h2>
+
+    <div class="shortcut-section">
+      <h3>グリッド表示</h3>
+      <table>
+        <thead>
+          <tr><th style="width:220px">キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></td><td>アイテムを選択移動</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>フォルダを開く / 画像をフルスクリーン表示</td></tr>
+          <tr><td><kbd>Backspace</kbd></td><td>親フォルダへ移動</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>次のフォルダへ（深さ優先）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>前のフォルダへ（深さ優先）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+マウスホイール</td><td>列数を増減</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="shortcut-section">
+      <h3>フルスクリーン表示</h3>
+      <table>
+        <thead>
+          <tr><th style="width:220px">キー / 操作</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>→</kbd> または <kbd>↓</kbd></td><td>次の画像へ</td></tr>
+          <tr><td><kbd>←</kbd> または <kbd>↑</kbd></td><td>前の画像へ</td></tr>
+          <tr><td><kbd>Escape</kbd></td><td>フルスクリーンを閉じる</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>次のフォルダへ移動してフルスクリーン終了</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>前のフォルダへ移動してフルスクリーン終了</td></tr>
+          <tr><td>マウスホイール</td><td>前後の画像に移動</td></tr>
+          <tr><td>右半分クリック</td><td>次の画像へ</td></tr>
+          <tr><td>左半分クリック</td><td>前の画像へ</td></tr>
+          <tr><td>画面上部にカーソル → ✕</td><td>フルスクリーンを閉じる</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===== Settings ===== -->
+  <section id="settings">
+    <h2>設定</h2>
+
+    <h3>メニュー &gt; 設定</h3>
+    <table>
+      <thead><tr><th style="width:180px">項目</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td>サムネイル列数</td><td>2〜10列から選択</td></tr>
+        <tr><td>サムネイル縦横比</td><td>正方形・縦長・横長など複数から選択</td></tr>
+        <tr><td>ソート順</td><td>ファイル名順 / 数値順（自然順）/ 更新日昇順 / 更新日降順</td></tr>
+        <tr><td>キャッシュ管理</td><td>サムネイルサイズ変更・古いキャッシュ削除・全削除・容量確認</td></tr>
+        <tr><td>環境設定</td><td>並列読み込みスレッド数・プリフェッチ枚数・空フォルダスキップ上限</td></tr>
+      </tbody>
+    </table>
+
+    <h3>環境設定の詳細</h3>
+    <table>
+      <thead><tr><th style="width:180px">項目</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td>並列読み込み</td><td>Auto（CPU コア数 / 2）または手動で 1〜64 スレッドを指定</td></tr>
+        <tr><td>プリフェッチ（前方）</td><td>フルスクリーン中に先読みする次方向の枚数（0〜50）</td></tr>
+        <tr><td>プリフェッチ（後方）</td><td>フルスクリーン中に先読みする前方向の枚数（0〜50）</td></tr>
+        <tr><td>空フォルダスキップ上限</td><td>Ctrl+↑↓ で画像のない空フォルダを連続スキップする上限数（1〜10）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>キャッシュ管理</h3>
+    <p>「設定」→「キャッシュ管理」から以下の操作が行えます。</p>
+    <ul class="pink-list" style="margin-top:0.5rem;">
+      <li>サムネイルサイズの変更（256 / 512 / 768 / 1024 px）</li>
+      <li>指定日数以上更新されていないキャッシュの削除</li>
+      <li>すべてのキャッシュを削除</li>
+      <li>キャッシュの合計フォルダ数・容量の確認</li>
+    </ul>
+    <div class="info-box">
+      キャッシュは <code>%APPDATA%\mimageviewer\</code> 以下に保存されます。
+    </div>
+  </section>
+
+  <!-- ===== Requirements ===== -->
+  <section id="requirements">
+    <h2>動作環境</h2>
+    <ul class="req-list">
+      <li><span class="label">OS</span><span>Windows 11（64bit）</span></li>
+      <li><span class="label">GPU</span><span>DirectX 12 対応グラフィックカード（wgpu バックエンド使用）</span></li>
+      <li><span class="label">メモリ</span><span>4GB 以上推奨</span></li>
+      <li><span class="label">ランタイム</span><span>不要（単体 exe、インストール不要）</span></li>
+    </ul>
+  </section>
+
+  <!-- ===== Download ===== -->
+  <section id="download">
+    <h2>ダウンロード</h2>
+    <div class="download-box">
+      <div class="download-info">
+        <div class="version">mImageViewer v0.1.0</div>
+        <div class="meta">Windows 11 64bit &nbsp;·&nbsp; インストール不要</div>
+      </div>
+      <a class="btn-download" href="mimageviewer.exe">mimageviewer.exe をダウンロード</a>
+    </div>
+    <div class="info-box" style="margin-top:1rem;">
+      ダウンロードした <code>mimageviewer.exe</code> を任意のフォルダに置いて実行するだけで使えます。<br>
+      設定は <code>%APPDATA%\mimageviewer\</code> に保存されます。アンインストールはファイルを削除するだけです。
+    </div>
+  </section>
+
+  <!-- ===== License ===== -->
+  <section id="license">
+    <h2>ライセンス</h2>
+    <p>
+      mImageViewer はフリーソフトウェアです。個人・商用を問わず無料でご利用いただけます。
+      再配布・改変はご遠慮ください。
+    </p>
+    <p style="font-size:0.88rem; color:#888;">
+      本ソフトウェアの使用により生じたいかなる損害についても、作者は責任を負いません。
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
+</footer>
+
+</body>
+</html>
