@@ -1344,6 +1344,8 @@ impl App {
                 }
                 Err(e) => {
                     crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
+                    // UI が「読込中...」のまま固まらないよう、失敗を明示的に通知する
+                    let _ = tx.send(FsLoadResult::Failed);
                 }
             }
         });
@@ -1475,6 +1477,7 @@ impl App {
                         next_frame_at: now + first_delay,
                     }
                 }
+                FsLoadResult::Failed => FsCacheEntry::Failed,
             };
             self.fs_cache.insert(key, entry);
         }
@@ -1853,9 +1856,15 @@ impl eframe::App for App {
                     Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
                         frames.get(*current_frame).map(|(h, _)| h.clone())
                     }
-                    None => None,
+                    Some(FsCacheEntry::Failed) | None => None,
                 }
             };
+
+            // フルスクリーンデコードが失敗した場合を検出
+            let fs_load_failed = matches!(
+                self.fs_cache.get(&fs_idx),
+                Some(FsCacheEntry::Failed)
+            );
 
             let thumb_tex  = match self.thumbnails.get(fs_idx) {
                 Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
@@ -1864,8 +1873,11 @@ impl eframe::App for App {
             let filename   = self.items.get(fs_idx)
                 .map(|item| item.name().to_string())
                 .unwrap_or_default();
-            // 画像のみ「高解像度読込中」表示が必要（動画・セパレータは不要）
-            let is_loading = !is_video && !is_separator && !self.fs_cache.contains_key(&fs_idx);
+            // 画像のみ「高解像度読込中」表示が必要（動画・セパレータ・失敗は不要）
+            let is_loading = !is_video
+                && !is_separator
+                && !fs_load_failed
+                && !self.fs_cache.contains_key(&fs_idx);
 
             let mut close_fs   = false;
             let mut nav_delta: i32     = 0;
@@ -2037,6 +2049,22 @@ impl eframe::App for App {
                                             egui::pos2(1.0, 1.0),
                                         ),
                                         egui::Color32::WHITE,
+                                    );
+                                } else if fs_load_failed {
+                                    // デコード失敗 (対応コーデック無し / 壊れたファイル / 特殊サブフォーマット)
+                                    ui.painter().text(
+                                        full_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "読込失敗",
+                                        egui::FontId::proportional(32.0),
+                                        egui::Color32::from_rgb(255, 140, 140),
+                                    );
+                                    ui.painter().text(
+                                        full_rect.center() + egui::vec2(0.0, 40.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        "このファイルはデコードできませんでした",
+                                        egui::FontId::proportional(16.0),
+                                        egui::Color32::from_gray(180),
                                     );
                                 } else {
                                     // テクスチャ未ロード（サムネイルも未完了）

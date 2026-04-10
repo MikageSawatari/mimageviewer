@@ -12,6 +12,9 @@ pub enum FsLoadResult {
     Static(egui::ColorImage),
     /// アニメーション: (フレーム画像, 表示時間[秒]) のベクタ
     Animated(Vec<(egui::ColorImage, f64)>),
+    /// デコードに失敗した (fs_cache に Failed エントリを記録して
+    /// 「読込中...」状態のまま固まらないようにする)
+    Failed,
 }
 
 /// フルスクリーンキャッシュエントリ。
@@ -22,6 +25,8 @@ pub enum FsCacheEntry {
         current_frame: usize,
         next_frame_at: f64, // ctx.input(|i| i.time) 基準
     },
+    /// デコード失敗。UI は「読込失敗」表示を出す。
+    Failed,
 }
 
 /// GIF をデコードしてアニメーションフレーム列を返す。
