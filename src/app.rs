@@ -17,7 +17,8 @@ use crate::thumb_loader::{
     ThumbMsg,
 };
 use crate::ui_helpers::{
-    adjacent_navigable_idx, draw_play_icon, natural_sort_key, open_external_player, truncate_name,
+    adjacent_navigable_idx, draw_play_icon, format_bytes_small, natural_sort_key,
+    open_external_player, truncate_name,
 };
 
 // -----------------------------------------------------------------------
@@ -1873,6 +1874,22 @@ impl eframe::App for App {
             let filename   = self.items.get(fs_idx)
                 .map(|item| item.name().to_string())
                 .unwrap_or_default();
+            // トップバー用: フォルダ (current_folder そのまま、ZIP なら ZIP ファイルのパス)
+            let folder_display = self
+                .current_folder
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            // トップバー用: フルサイズ読込完了時のネイティブ画像サイズ
+            let image_dims: Option<(u32, u32)> = tex.as_ref().map(|t| {
+                let s = t.size_vec2();
+                (s.x as u32, s.y as u32)
+            });
+            // トップバー用: ファイルサイズ (image_metas から)
+            let image_file_size: Option<u64> = self
+                .image_metas
+                .get(fs_idx)
+                .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
             // 画像のみ「高解像度読込中」表示が必要（動画・セパレータ・失敗は不要）
             let is_loading = !is_video
                 && !is_separator
@@ -2103,18 +2120,7 @@ impl eframe::App for App {
                                 );
                             }
 
-                            // ファイル名を右下に表示
-                            if !filename.is_empty() {
-                                ui.painter().text(
-                                    full_rect.max - egui::vec2(16.0, 16.0),
-                                    egui::Align2::RIGHT_BOTTOM,
-                                    &filename,
-                                    egui::FontId::proportional(14.0),
-                                    egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200),
-                                );
-                            }
-
-                            // ── ホバー時の閉じるボタン（右上）────────
+                            // ── ホバー時のトップバー (フォルダ/ファイル名/寸法/×) ──
                             // 画面上部 60px にマウスがあるときだけ表示する
                             let hover_in_top = ctx.input(|i| {
                                 i.pointer.hover_pos()
@@ -2122,12 +2128,36 @@ impl eframe::App for App {
                                     .unwrap_or(false)
                             });
                             if hover_in_top {
-                                let btn_size = 40.0;
-                                let margin = 10.0;
+                                let bar_h = 44.0;
+                                let bar_rect = egui::Rect::from_min_size(
+                                    full_rect.min,
+                                    egui::vec2(full_rect.width(), bar_h),
+                                );
+                                // 半透明の黒背景 (文字が読みやすいよう alpha 高め)
+                                ui.painter().rect_filled(
+                                    bar_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                                );
+                                // 下端に薄い区切り線
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(bar_rect.min.x, bar_rect.max.y),
+                                        egui::pos2(bar_rect.max.x, bar_rect.max.y),
+                                    ],
+                                    egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+                                    ),
+                                );
+
+                                // ── × 閉じるボタン (右端) ──
+                                let btn_size = 32.0;
+                                let btn_margin = 6.0;
                                 let btn_rect = egui::Rect::from_min_size(
                                     egui::pos2(
-                                        full_rect.max.x - btn_size - margin,
-                                        margin,
+                                        bar_rect.max.x - btn_size - btn_margin,
+                                        bar_rect.min.y + btn_margin,
                                     ),
                                     egui::vec2(btn_size, btn_size),
                                 );
@@ -2139,10 +2169,9 @@ impl eframe::App for App {
                                 let bg = if btn_resp.hovered() {
                                     egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
                                 } else {
-                                    egui::Color32::from_rgba_unmultiplied(40, 40, 40, 180)
+                                    egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
                                 };
-                                ui.painter().rect_filled(btn_rect, 6.0, bg);
-                                // ✕ をフォントに依存せず斜め2線で描画
+                                ui.painter().rect_filled(btn_rect, 4.0, bg);
                                 let c = btn_rect.center();
                                 let r = btn_size * 0.25;
                                 let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
@@ -2160,6 +2189,44 @@ impl eframe::App for App {
                                 // ×ボタンのクリックが背面の nav_delta に漏れないように上書き
                                 if btn_resp.hovered() {
                                     nav_delta = 0;
+                                }
+
+                                // ── 左側: フォルダパス ──
+                                if !folder_display.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(
+                                            bar_rect.min.x + 12.0,
+                                            bar_rect.center().y,
+                                        ),
+                                        egui::Align2::LEFT_CENTER,
+                                        &folder_display,
+                                        egui::FontId::proportional(13.0),
+                                        egui::Color32::from_gray(180),
+                                    );
+                                }
+
+                                // ── 中央寄り (× の左): ファイル名 | 寸法 | サイズ ──
+                                let mut info_parts: Vec<String> = Vec::new();
+                                if !filename.is_empty() {
+                                    info_parts.push(filename.clone());
+                                }
+                                if let Some((w, h)) = image_dims {
+                                    info_parts.push(format!("{w} × {h}"));
+                                }
+                                if let Some(bytes) = image_file_size {
+                                    info_parts.push(format_bytes_small(bytes));
+                                }
+                                if !info_parts.is_empty() {
+                                    let info_text = info_parts.join("    ");
+                                    // ×ボタンの左に配置
+                                    let right_edge = btn_rect.min.x - 12.0;
+                                    ui.painter().text(
+                                        egui::pos2(right_edge, bar_rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        info_text,
+                                        egui::FontId::proportional(15.0),
+                                        egui::Color32::WHITE,
+                                    );
                                 }
                             }
                         });
@@ -2421,6 +2488,50 @@ impl eframe::App for App {
                 });
             // 進行中は毎フレーム再描画してバーをスムーズに更新
             ctx.request_repaint();
+        }
+
+        // ── 選択中アイテムの情報オーバーレイ (右下フローティング) ────
+        // フルスクリーン中は出さない (フルスクリーンには独自の上部バーがある)
+        if self.fullscreen_idx.is_none() {
+            if let Some(idx) = self.selected {
+                // 区切り・フォルダはスキップ (無意味)
+                let show_info = matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::Video(_))
+                        | Some(GridItem::ZipImage { .. })
+                );
+                if show_info {
+                    let name = self
+                        .items
+                        .get(idx)
+                        .map(|it| it.name().to_string())
+                        .unwrap_or_default();
+                    let size_str = self
+                        .image_metas
+                        .get(idx)
+                        .and_then(|m| m.map(|(_, sz)| format_bytes_small(sz.max(0) as u64)));
+
+                    egui::Area::new("selection_info".into())
+                        .order(egui::Order::Foreground)
+                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style())
+                                .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
+                                .show(ui, |ui| {
+                                    let text = match size_str {
+                                        Some(s) => format!("{}   {}", s, name),
+                                        None => name,
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::WHITE)
+                                            .monospace(),
+                                    );
+                                });
+                        });
+                }
+            }
         }
 
         self.show_favorites_editor_dialog(ctx);
