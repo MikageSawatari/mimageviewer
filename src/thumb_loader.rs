@@ -239,21 +239,31 @@ pub fn load_one_cached(
     let t = std::time::Instant::now();
 
     // ── デコード経路 ──
-    // 1. ZIP エントリの場合: ZIP を開いてエントリのバイト列を取り出してから decode
-    // 2. 通常ファイル: 拡張子ベース → マジックバイトの二段構え
+    // 1. ZIP エントリ:    ZIP を開いてエントリのバイト列を取り出してから image クレートで decode
+    // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
+    //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
     let img_result = if let Some(entry_name) = zip_entry {
         crate::zip_loader::read_entry_bytes(path, entry_name)
             .map_err(image::ImageError::IoError)
             .and_then(|bytes| image::load_from_memory(&bytes))
     } else {
-        image::open(path).or_else(|_| {
+        let primary = image::open(path).or_else(|_| {
             use std::io::BufReader;
             let f = std::fs::File::open(path)?;
             image::ImageReader::new(BufReader::new(f))
                 .with_guessed_format()
                 .map_err(image::ImageError::IoError)?
                 .decode()
-        })
+        });
+        // image クレートが失敗した場合に WIC を試す
+        // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため)
+        match primary {
+            Ok(img) => Ok(img),
+            Err(e) => match crate::wic_decoder::decode_to_dynamic_image(path) {
+                Some(img) => Ok(img),
+                None => Err(e),
+            },
+        }
     };
 
     let img = match img_result {

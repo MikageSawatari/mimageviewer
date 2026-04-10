@@ -14,7 +14,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // サポート拡張子
 // -----------------------------------------------------------------------
 
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
+/// 標準サポートする画像拡張子。
+///
+/// 前半は `image` クレートで直接デコードできる形式。
+/// 後半は WIC (Windows Imaging Component) でデコードする形式で、
+/// 対応コーデックが Microsoft Store からインストールされている必要がある:
+/// - heic/heif → HEIF Image Extensions
+/// - avif      → AV1 Video Extensions
+/// - jxl       → JPEG XL Image Extensions
+/// - cr2/nef/arw 等 → Raw Image Extension
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    // image クレートで直接デコード
+    "jpg", "jpeg", "png", "webp", "bmp", "gif",
+    // WIC 経由 (モダン形式)
+    "heic", "heif", "avif", "jxl",
+    // WIC 経由 (TIFF: image クレートも対応するが WIC の方が高機能)
+    "tiff", "tif",
+    // WIC 経由 (カメラ RAW)
+    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
+    "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
+];
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] =
     &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 

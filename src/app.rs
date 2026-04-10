@@ -1316,10 +1316,18 @@ impl App {
             }
 
             // 静止画フォールバック
+            // image クレート → (失敗時) WIC の順で試す
+            // ZIP エントリの場合は WIC がファイルパスを必要とするため image クレートのみ
             let open_result = if let Some(bytes) = zip_bytes {
                 image::load_from_memory(&bytes)
             } else {
-                image::open(&path)
+                match image::open(&path) {
+                    Ok(img) => Ok(img),
+                    Err(e) => match crate::wic_decoder::decode_to_dynamic_image(&path) {
+                        Some(img) => Ok(img),
+                        None => Err(e),
+                    },
+                }
             };
             match open_result {
                 Ok(img) => {

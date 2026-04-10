@@ -14,6 +14,7 @@ pub mod thumb_loader;
 pub mod ui_dialogs;
 pub mod ui_helpers;
 pub mod video_thumb;
+pub mod wic_decoder;
 pub mod zip_loader;
 
 use std::sync::Arc;
