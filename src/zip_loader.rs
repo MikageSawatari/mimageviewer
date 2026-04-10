@@ -101,3 +101,47 @@ pub fn entry_basename(entry_name: &str) -> &str {
         None => entry_name,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_dir_root_is_empty() {
+        assert_eq!(entry_dir("img.jpg"), "");
+        assert_eq!(entry_dir("file.png"), "");
+    }
+
+    #[test]
+    fn entry_dir_one_level() {
+        assert_eq!(entry_dir("work1/img.jpg"), "work1");
+        assert_eq!(entry_dir("a/b.png"), "a");
+    }
+
+    #[test]
+    fn entry_dir_nested() {
+        assert_eq!(entry_dir("a/b/c.jpg"), "a/b");
+        assert_eq!(entry_dir("dir/sub/img.png"), "dir/sub");
+    }
+
+    #[test]
+    fn entry_basename_root() {
+        assert_eq!(entry_basename("img.jpg"), "img.jpg");
+    }
+
+    #[test]
+    fn entry_basename_one_level() {
+        assert_eq!(entry_basename("work1/img.jpg"), "img.jpg");
+    }
+
+    #[test]
+    fn entry_basename_nested() {
+        assert_eq!(entry_basename("a/b/c.png"), "c.png");
+    }
+
+    #[test]
+    fn entry_basename_empty_after_slash() {
+        // 通常起こらないが防御
+        assert_eq!(entry_basename("dir/"), "");
+    }
+}

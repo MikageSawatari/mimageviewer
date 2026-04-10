@@ -87,7 +87,7 @@ pub fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
     chunks
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NaturalChunk {
     Text(String),
     Num(u64),
@@ -217,4 +217,100 @@ pub fn open_external_player(path: &Path) {
     let _ = std::process::Command::new("cmd")
         .args(["/c", "start", "", &path_str])
         .spawn();
+}
+
+// -----------------------------------------------------------------------
+// テスト
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_count_basic() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(1), "1");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1000), "1,000");
+        assert_eq!(format_count(1234), "1,234");
+        assert_eq!(format_count(999_999), "999,999");
+        assert_eq!(format_count(1_000_000), "1,000,000");
+        assert_eq!(format_count(1_234_567_890), "1,234,567,890");
+    }
+
+    #[test]
+    fn format_bytes_units() {
+        // < 1 GB → MB
+        assert_eq!(format_bytes(0), "0.0 MB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(500 * 1024 * 1024), "500.0 MB");
+        // ≥ 1 GB → GB
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "2.50 GB");
+    }
+
+    #[test]
+    fn format_bytes_small_units() {
+        // < 1 MB → KB
+        assert_eq!(format_bytes_small(0), "0.0 KB");
+        assert_eq!(format_bytes_small(1024), "1.0 KB");
+        assert_eq!(format_bytes_small(512 * 1024), "512.0 KB");
+        // ≥ 1 MB → MB
+        assert_eq!(format_bytes_small(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes_small(2 * 1024 * 1024 + 512 * 1024), "2.50 MB");
+    }
+
+    #[test]
+    fn truncate_name_short_string_unchanged() {
+        assert_eq!(truncate_name("abc", 10), "abc");
+        assert_eq!(truncate_name("12345", 5), "12345"); // 等しい場合は切らない
+    }
+
+    #[test]
+    fn truncate_name_long_string_gets_ellipsis() {
+        // max_chars = 5 のとき、4 文字 + "…" になる
+        assert_eq!(truncate_name("123456", 5), "1234…");
+        assert_eq!(truncate_name("hello world", 8), "hello w…");
+    }
+
+    #[test]
+    fn truncate_name_handles_multibyte() {
+        // 日本語は char 単位で扱う
+        assert_eq!(truncate_name("あいうえお", 5), "あいうえお");
+        assert_eq!(truncate_name("あいうえおか", 5), "あいうえ…");
+    }
+
+    #[test]
+    fn natural_sort_key_basic_numeric_order() {
+        // 数字部分が数値として比較される
+        let a = natural_sort_key("file2.jpg");
+        let b = natural_sort_key("file10.jpg");
+        // 辞書順だと "file10" < "file2" になるが、自然順では逆
+        assert!(a < b);
+    }
+
+    #[test]
+    fn natural_sort_key_mixed_chunks() {
+        let mut names = vec!["img1.jpg", "img10.jpg", "img2.jpg", "img20.jpg", "img100.jpg"];
+        names.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
+        assert_eq!(
+            names,
+            vec!["img1.jpg", "img2.jpg", "img10.jpg", "img20.jpg", "img100.jpg"]
+        );
+    }
+
+    #[test]
+    fn natural_sort_key_case_insensitive() {
+        let a = natural_sort_key("FILE.jpg");
+        let b = natural_sort_key("file.jpg");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn natural_sort_key_pure_text() {
+        let a = natural_sort_key("apple");
+        let b = natural_sort_key("banana");
+        assert!(a < b);
+    }
 }

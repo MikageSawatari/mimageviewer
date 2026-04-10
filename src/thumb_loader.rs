@@ -328,6 +328,108 @@ pub fn load_one_cached(
 // キャッシュ作成ダイアログ用の非対話版
 // -----------------------------------------------------------------------
 
+// -----------------------------------------------------------------------
+// テスト
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::CachePolicy;
+    use std::path::PathBuf;
+
+    fn make_decision(policy: CachePolicy, threshold_ms: u32, size_bytes: u64) -> CacheDecision {
+        CacheDecision {
+            policy,
+            threshold_ms,
+            size_threshold: size_bytes,
+            webp_always: true,
+        }
+    }
+
+    #[test]
+    fn compute_display_px_clamps_low() {
+        // セルサイズ 50 → 50 だが 256 で下限クランプ
+        assert_eq!(compute_display_px(50.0, 50.0, 1.0), 256);
+        // 0 や負も 256 にクランプ
+        assert_eq!(compute_display_px(0.0, 0.0, 1.0), 256);
+    }
+
+    #[test]
+    fn compute_display_px_clamps_high() {
+        // 巨大セル → 2048 で上限クランプ
+        assert_eq!(compute_display_px(5000.0, 5000.0, 1.0), 2048);
+        // DPI 倍率込みでも上限
+        assert_eq!(compute_display_px(2000.0, 2000.0, 2.0), 2048);
+    }
+
+    #[test]
+    fn compute_display_px_normal_range() {
+        // 通常のセルは そのまま物理ピクセル化
+        assert_eq!(compute_display_px(400.0, 400.0, 1.0), 400);
+        assert_eq!(compute_display_px(400.0, 400.0, 1.5), 600);
+        // cell_w と cell_h の最大値を取る
+        assert_eq!(compute_display_px(300.0, 500.0, 1.0), 500);
+    }
+
+    #[test]
+    fn cache_decision_always_returns_true() {
+        let d = make_decision(CachePolicy::Always, 25, 2_000_000);
+        let p = PathBuf::from("foo.jpg");
+        assert!(d.should_cache(&p, 100, 0.0, 0.0));
+        assert!(d.should_cache(&p, 0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn cache_decision_off_returns_false() {
+        let d = make_decision(CachePolicy::Off, 25, 2_000_000);
+        let p = PathBuf::from("huge.jpg");
+        assert!(!d.should_cache(&p, 100_000_000, 999.0, 999.0));
+    }
+
+    #[test]
+    fn cache_decision_auto_uses_size_threshold() {
+        let d = make_decision(CachePolicy::Auto, 25, 2_000_000);
+        let p = PathBuf::from("foo.jpg");
+        // サイズが 2 MB 以上ならキャッシュ
+        assert!(d.should_cache(&p, 2_000_000, 0.0, 0.0));
+        assert!(d.should_cache(&p, 5_000_000, 0.0, 0.0));
+        // サイズが小さく、時間も短ければキャッシュなし
+        assert!(!d.should_cache(&p, 100_000, 5.0, 5.0));
+    }
+
+    #[test]
+    fn cache_decision_auto_uses_time_threshold() {
+        let d = make_decision(CachePolicy::Auto, 25, 100_000_000);
+        let p = PathBuf::from("foo.jpg");
+        // 合計時間 < 25 ms → キャッシュなし
+        assert!(!d.should_cache(&p, 100, 10.0, 10.0));
+        // 合計時間 == 25 ms → キャッシュ
+        assert!(d.should_cache(&p, 100, 12.0, 13.0));
+        // 合計時間 > 25 ms → キャッシュ
+        assert!(d.should_cache(&p, 100, 30.0, 0.0));
+    }
+
+    #[test]
+    fn cache_decision_auto_webp_always_caches() {
+        let d = make_decision(CachePolicy::Auto, 25, 100_000_000);
+        let webp = PathBuf::from("img.webp");
+        // .webp は常にキャッシュ (size/time 関係なし)
+        assert!(d.should_cache(&webp, 100, 0.0, 0.0));
+        // 大文字 .WEBP も同じ
+        let webp_upper = PathBuf::from("IMG.WEBP");
+        assert!(d.should_cache(&webp_upper, 100, 0.0, 0.0));
+    }
+
+    #[test]
+    fn cache_decision_auto_webp_can_be_disabled() {
+        let mut d = make_decision(CachePolicy::Auto, 25, 100_000_000);
+        d.webp_always = false;
+        let webp = PathBuf::from("img.webp");
+        assert!(!d.should_cache(&webp, 100, 0.0, 0.0));
+    }
+}
+
 /// 画像1枚をデコード・エンコード・カタログ保存する。成功時は WebP バイト数を返す。
 /// load_one_cached と違い、mpsc 送信・ログ出力・進捗更新は行わないバッチ処理専用版。
 pub fn build_and_save_one(

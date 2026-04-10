@@ -194,3 +194,44 @@ pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
 pub fn path_eq(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_eq_same() {
+        assert!(path_eq(Path::new("C:/foo/bar"), Path::new("C:/foo/bar")));
+    }
+
+    #[test]
+    fn path_eq_case_insensitive() {
+        // Windows 想定: 大文字小文字を無視する
+        assert!(path_eq(Path::new("C:/Foo/Bar"), Path::new("c:/foo/bar")));
+        assert!(path_eq(Path::new("D:/IMG.JPG"), Path::new("d:/img.jpg")));
+    }
+
+    #[test]
+    fn path_eq_different() {
+        assert!(!path_eq(Path::new("C:/foo"), Path::new("C:/bar")));
+        assert!(!path_eq(Path::new("C:/foo/a"), Path::new("C:/foo/b")));
+    }
+
+    #[test]
+    fn supported_extensions_contains_common_formats() {
+        for ext in ["jpg", "jpeg", "png", "webp", "bmp", "gif"] {
+            assert!(SUPPORTED_EXTENSIONS.contains(&ext), "missing: {}", ext);
+        }
+    }
+
+    #[test]
+    fn supported_video_extensions_contains_common_formats() {
+        for ext in ["mp4", "mov", "mkv", "avi"] {
+            assert!(
+                SUPPORTED_VIDEO_EXTENSIONS.contains(&ext),
+                "missing: {}",
+                ext
+            );
+        }
+    }
+}

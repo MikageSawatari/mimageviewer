@@ -113,3 +113,104 @@ impl ThumbStats {
             + self.count_other
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_image_buckets_load_time() {
+        let mut s = ThumbStats::new();
+        // 0-4 ms バケット
+        s.record_image(0.0, 0, "jpg");
+        s.record_image(4.9, 0, "jpg");
+        // 5-9 ms バケット
+        s.record_image(5.0, 0, "jpg");
+        s.record_image(9.9, 0, "jpg");
+        // 100+ ms (オーバーフローバケット)
+        s.record_image(150.0, 0, "jpg");
+        s.record_image(9999.0, 0, "jpg");
+
+        assert_eq!(s.load_time_hist[0], 2);
+        assert_eq!(s.load_time_hist[1], 2);
+        assert_eq!(s.load_time_hist[LOAD_TIME_BUCKETS - 1], 2);
+    }
+
+    #[test]
+    fn record_image_buckets_size() {
+        let mut s = ThumbStats::new();
+        // 0-1 MB
+        s.record_image(0.0, 0, "jpg");
+        s.record_image(0.0, 999_999, "jpg");
+        // 1-2 MB
+        s.record_image(0.0, 1_500_000, "jpg");
+        // 10+ MB (オーバーフロー)
+        s.record_image(0.0, 50_000_000, "jpg");
+
+        assert_eq!(s.size_hist[0], 2);
+        assert_eq!(s.size_hist[1], 1);
+        assert_eq!(s.size_hist[SIZE_BUCKETS - 1], 1);
+    }
+
+    #[test]
+    fn record_image_format_counts() {
+        let mut s = ThumbStats::new();
+        s.record_image(0.0, 0, "jpg");
+        s.record_image(0.0, 0, "JPEG"); // 大文字 + 拡張形式
+        s.record_image(0.0, 0, "png");
+        s.record_image(0.0, 0, "webp");
+        s.record_image(0.0, 0, "gif");
+        s.record_image(0.0, 0, "bmp");
+        s.record_image(0.0, 0, "tiff"); // → other
+
+        assert_eq!(s.count_jpg, 2);
+        assert_eq!(s.count_png, 1);
+        assert_eq!(s.count_webp, 1);
+        assert_eq!(s.count_gif, 1);
+        assert_eq!(s.count_bmp, 1);
+        assert_eq!(s.count_other, 1);
+        assert_eq!(s.total_images(), 7);
+    }
+
+    #[test]
+    fn record_video_increments_count_and_size() {
+        let mut s = ThumbStats::new();
+        s.record_video(2_500_000); // 2-3 MB バケット
+        s.record_video(800_000);   // 0-1 MB バケット
+        s.record_video(0);
+
+        assert_eq!(s.count_video, 3);
+        assert_eq!(s.size_hist[2], 1);
+        assert_eq!(s.size_hist[0], 2);
+        // 動画は load_time_hist には記録されない
+        assert!(s.load_time_hist.iter().all(|&n| n == 0));
+        // 動画は total_images() には含まれない
+        assert_eq!(s.total_images(), 0);
+    }
+
+    #[test]
+    fn reset_clears_everything() {
+        let mut s = ThumbStats::new();
+        s.record_image(50.0, 1_000_000, "jpg");
+        s.record_video(2_000_000);
+        s.record_failed();
+        assert!(s.total_images() > 0 || s.count_video > 0 || s.count_failed > 0);
+
+        s.reset();
+        assert_eq!(s.total_images(), 0);
+        assert_eq!(s.count_video, 0);
+        assert_eq!(s.count_failed, 0);
+        assert!(s.load_time_hist.iter().all(|&n| n == 0));
+        assert!(s.size_hist.iter().all(|&n| n == 0));
+    }
+
+    #[test]
+    fn load_time_label_format() {
+        assert_eq!(ThumbStats::load_time_label(0), "  0- 4 ms");
+        assert_eq!(ThumbStats::load_time_label(1), "  5- 9 ms");
+        // 最後のバケットは "100+ ms" 形式
+        let last = ThumbStats::load_time_label(LOAD_TIME_BUCKETS - 1);
+        assert!(last.contains('+'));
+        assert!(last.contains("ms"));
+    }
+}
