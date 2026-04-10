@@ -116,10 +116,17 @@ pub struct App {
     image_metas: Vec<Option<(i64, i64)>>,
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
     reload_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
-    /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）
-    requested: std::collections::HashSet<usize>,
+    /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
+    /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
+    requested: std::collections::HashMap<usize, bool>,
     /// 現在の keep range [start, end)。update_keep_range で毎フレーム更新
     keep_range: (usize, usize),
+
+    // ── 進捗バー (段階 B/E の合算進捗表示) ─────────────────────
+    /// 現フレームで検出された通常読み込みのピーク件数 (current が 0 でリセット)
+    progress_normal_peak: usize,
+    /// 現フレームで検出された高画質化 (アイドルアップグレード) のピーク件数
+    progress_upgrade_peak: usize,
 
     // ── 段階 E: アイドル時の画質向上 ─────────────────────────────
     /// 前フレームでの scroll_offset_y（変化検知用）
@@ -257,8 +264,10 @@ impl Default for App {
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
             reload_queue: None,
-            requested: std::collections::HashSet::new(),
+            requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
+            progress_normal_peak: 0,
+            progress_upgrade_peak: 0,
             last_scroll_offset_y_tracked: 0.0,
             last_scroll_change_time: std::time::Instant::now(),
             display_px_shared: Arc::new(AtomicU32::new(512)),
@@ -751,7 +760,7 @@ impl App {
         let Some(queue) = self.reload_queue.clone() else { return; };
         let mut new_requests: Vec<LoadRequest> = Vec::new();
         for i in keep_start..keep_end {
-            if self.requested.contains(&i) {
+            if self.requested.contains_key(&i) {
                 continue;
             }
             let need_load = matches!(
@@ -777,13 +786,17 @@ impl App {
         if !new_requests.is_empty() {
             let mut q = queue.lock().unwrap();
             for r in new_requests {
-                self.requested.insert(r.idx);
+                // false = 通常読み込み要求
+                self.requested.insert(r.idx, false);
                 q.push(r);
             }
         }
 
         // (3) 段階 E: アイドル時の画質アップグレード
         self.enqueue_idle_upgrades(keep_start, keep_end);
+
+        // (4) 進捗ピーク値の更新 (プログレスバー表示用)
+        self.update_progress_peaks();
     }
 
     /// 段階 E: アイドル時に画質アップグレードの要求を投入する。
@@ -883,9 +896,78 @@ impl App {
         ));
         let mut q = queue.lock().unwrap();
         for r in upgrade_reqs {
-            self.requested.insert(r.idx);
+            // true = 高画質化要求
+            self.requested.insert(r.idx, true);
             q.push(r);
         }
+    }
+
+    /// 現在の要求状況からプログレスバーのピーク値を更新する。
+    ///
+    /// ピークは "current == 0 のときに 0 にリセット、それ以外は current の最大値" で
+    /// 計算される。UI は `(peak - current) / peak` で進捗率を表示する。
+    fn update_progress_peaks(&mut self) {
+        // in-flight を種類別にカウント
+        let (in_flight_normal, in_flight_upgrade) = {
+            let mut n = 0usize;
+            let mut u = 0usize;
+            for &is_upgrade in self.requested.values() {
+                if is_upgrade { u += 1; } else { n += 1; }
+            }
+            (n, u)
+        };
+
+        // キュー内を種類別にカウント (短時間ロック)
+        let (queued_normal, queued_upgrade) = if let Some(queue) = &self.reload_queue {
+            let q = queue.lock().unwrap();
+            let upgrade = q.iter().filter(|r| r.skip_cache).count();
+            let normal = q.len() - upgrade;
+            (normal, upgrade)
+        } else {
+            (0, 0)
+        };
+
+        let cur_normal = in_flight_normal + queued_normal;
+        let cur_upgrade = in_flight_upgrade + queued_upgrade;
+
+        // ピーク更新 or リセット
+        if cur_normal == 0 {
+            self.progress_normal_peak = 0;
+        } else if cur_normal > self.progress_normal_peak {
+            self.progress_normal_peak = cur_normal;
+        }
+        if cur_upgrade == 0 {
+            self.progress_upgrade_peak = 0;
+        } else if cur_upgrade > self.progress_upgrade_peak {
+            self.progress_upgrade_peak = cur_upgrade;
+        }
+    }
+
+    /// プログレスバーの現在値を計算して返す。
+    /// `(normal (cur, peak), upgrade (cur, peak))`
+    fn progress_snapshot(&self) -> ((usize, usize), (usize, usize)) {
+        // peak は update_progress_peaks 時点の値
+        // current は再計算 (毎フレーム少しズレるが UX への影響は無視できる)
+        let (in_flight_normal, in_flight_upgrade) = {
+            let mut n = 0usize;
+            let mut u = 0usize;
+            for &is_upgrade in self.requested.values() {
+                if is_upgrade { u += 1; } else { n += 1; }
+            }
+            (n, u)
+        };
+        let (queued_normal, queued_upgrade) = if let Some(queue) = &self.reload_queue {
+            let q = queue.lock().unwrap();
+            let upgrade = q.iter().filter(|r| r.skip_cache).count();
+            let normal = q.len() - upgrade;
+            (normal, upgrade)
+        } else {
+            (0, 0)
+        };
+        (
+            (in_flight_normal + queued_normal, self.progress_normal_peak),
+            (in_flight_upgrade + queued_upgrade, self.progress_upgrade_peak),
+        )
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
@@ -1576,22 +1658,8 @@ impl eframe::App for App {
         self.update_keep_range_and_requests();
         self.poll_prefetch(ctx);
 
-        // ── タイトルバーにロード状況を表示 ────────────────────────────
-        // 段階 B: in-flight 要求数 + reload_queue 残数を表示
-        {
-            let in_flight = self.requested.len();
-            let queued = self
-                .reload_queue
-                .as_ref()
-                .map(|q| q.lock().unwrap().len())
-                .unwrap_or(0);
-            let title = if in_flight > 0 || queued > 0 {
-                format!("mimageviewer - 読込中 ({} 処理中 / {} 待機)", in_flight, queued)
-            } else {
-                "mimageviewer".to_string()
-            };
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-        }
+        // タイトルバーは常にアプリ名のみ。進捗は UI 内のプログレスバーで表示する。
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("mimageviewer".to_string()));
 
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);
@@ -2060,6 +2128,56 @@ impl eframe::App for App {
                 self.folder_history.remove(&path);
                 self.load_folder(path);
             }
+        }
+
+        // ── 進捗バー (メニュー直下、処理中のみ表示) ──────────────────
+        let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) =
+            self.progress_snapshot();
+        if peak_normal > 0 || peak_upgrade > 0 {
+            egui::TopBottomPanel::top("progress_panel").show(ctx, |ui| {
+                ui.add_space(3.0);
+                if peak_normal > 0 {
+                    let done = peak_normal.saturating_sub(cur_normal);
+                    let progress = done as f32 / peak_normal as f32;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("先読み    ").monospace());
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(280.0)
+                                .fill(egui::Color32::from_rgb(60, 130, 220))
+                                .text(
+                                    egui::RichText::new(format!(
+                                        "{} / {}",
+                                        done, peak_normal
+                                    ))
+                                    .color(egui::Color32::WHITE),
+                                ),
+                        );
+                    });
+                }
+                if peak_upgrade > 0 {
+                    let done = peak_upgrade.saturating_sub(cur_upgrade);
+                    let progress = done as f32 / peak_upgrade as f32;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("高画質化  ").monospace());
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(280.0)
+                                .fill(egui::Color32::from_rgb(100, 170, 240))
+                                .text(
+                                    egui::RichText::new(format!(
+                                        "{} / {}",
+                                        done, peak_upgrade
+                                    ))
+                                    .color(egui::Color32::WHITE),
+                                ),
+                        );
+                    });
+                }
+                ui.add_space(3.0);
+            });
+            // 進行中は毎フレーム再描画してバーをスムーズに更新
+            ctx.request_repaint();
         }
 
         // ── お気に入り編集ポップアップ ───────────────────────────────
