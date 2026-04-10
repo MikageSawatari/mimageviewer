@@ -1722,6 +1722,10 @@ impl eframe::App for App {
                                     }
                                 }
                             }
+                            // 右クリックでフルスクリーン終了 → サムネイル一覧に戻る
+                            if fs_response.secondary_clicked() {
+                                close_fs = true;
+                            }
 
                             // ── 画像 / 動画表示 ───────────────────────
                             // 動画はサムネイルのみ表示。画像はフルサイズ優先。
