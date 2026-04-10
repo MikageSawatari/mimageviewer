@@ -881,7 +881,6 @@ impl App {
     /// LoadRequest として push する。スクロール優先度付きの worker が visible
     /// 側から先に処理する。
     fn enqueue_idle_upgrades(&mut self, keep_start: usize, keep_end: usize) {
-        const BATCH: usize = 4;
         const SCROLL_IDLE_SECS: f64 = 0.5;
 
         if !self.settings.thumb_idle_upgrade {
@@ -914,7 +913,16 @@ impl App {
         // 現在の display_px (アイドル判定とサイズ比較に使用)
         let current_display_px = self.display_px_shared.load(Ordering::Relaxed);
 
-        // 候補集め: keep_range 内で from_cache=true or 解像度不足のものを最大 BATCH 件
+        // 候補集め: keep_range 内で from_cache=true or 解像度不足のものを全件
+        //
+        // ※ 以前は BATCH=4 で小分け push していたが、進捗バーが「0/4 → 4/4 → 消える」
+        //    を繰り返すちらつき現象が発生していた。現在は keep_range 内の全候補を
+        //    一度に push し、進捗バーが 1 本だけ綺麗に伸びるようにする。
+        //    - スクロール時は scroll_idle ガードで新規 push されない
+        //    - 通常ロードが必要なら requested ガードで先送り
+        //    - フォルダ切替は cancel_token で全停止
+        //    なので大量 push しても害は無い (古い結果は poll_thumbnails で
+        //    keep_range 外なら自動破棄される)。
         let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
         for i in keep_start..keep_end {
             let needs_upgrade = match self.thumbnails.get(i) {
@@ -950,9 +958,6 @@ impl App {
                 _ => continue,
             };
             upgrade_reqs.push(req);
-            if upgrade_reqs.len() >= BATCH {
-                break;
-            }
         }
 
         if upgrade_reqs.is_empty() {
@@ -2320,18 +2325,25 @@ impl eframe::App for App {
         let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) =
             self.progress_snapshot();
         if peak_normal > 0 || peak_upgrade > 0 {
+            // 半透明の濃い背景に対して読みやすいよう、ラベル/数値とも明るい白で表示する。
+            let label_color = egui::Color32::from_rgb(235, 240, 250);
+            let text_color = egui::Color32::WHITE;
             egui::Area::new("progress_overlay".into())
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 220))
+                        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
                         .show(ui, |ui| {
                             if peak_normal > 0 {
                                 let done = peak_normal.saturating_sub(cur_normal);
                                 let progress = done as f32 / peak_normal as f32;
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("先読み    ").monospace());
+                                    ui.label(
+                                        egui::RichText::new("先読み    ")
+                                            .monospace()
+                                            .color(label_color),
+                                    );
                                     ui.add(
                                         egui::ProgressBar::new(progress)
                                             .desired_width(220.0)
@@ -2341,7 +2353,7 @@ impl eframe::App for App {
                                                     "{} / {}",
                                                     done, peak_normal
                                                 ))
-                                                .color(egui::Color32::WHITE),
+                                                .color(text_color),
                                             ),
                                     );
                                 });
@@ -2350,7 +2362,11 @@ impl eframe::App for App {
                                 let done = peak_upgrade.saturating_sub(cur_upgrade);
                                 let progress = done as f32 / peak_upgrade as f32;
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("高画質化  ").monospace());
+                                    ui.label(
+                                        egui::RichText::new("高画質化  ")
+                                            .monospace()
+                                            .color(label_color),
+                                    );
                                     ui.add(
                                         egui::ProgressBar::new(progress)
                                             .desired_width(220.0)
@@ -2360,7 +2376,7 @@ impl eframe::App for App {
                                                     "{} / {}",
                                                     done, peak_upgrade
                                                 ))
-                                                .color(egui::Color32::WHITE),
+                                                .color(text_color),
                                             ),
                                     );
                                 });
