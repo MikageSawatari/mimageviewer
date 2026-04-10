@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod settings;
 pub mod stats;
 pub mod thumb_loader;
+pub mod ui_dialogs;
 pub mod ui_helpers;
 pub mod video_thumb;
 pub mod zip_loader;
