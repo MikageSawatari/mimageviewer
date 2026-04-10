@@ -31,61 +31,108 @@ use crate::ui_helpers::{
 impl App {
     pub(crate) fn show_favorites_editor_dialog(&mut self, ctx: &egui::Context) {
         // ── お気に入り編集ポップアップ ───────────────────────────────
-        if self.show_favorites_editor {
-            let mut open = true;
-            let mut swap: Option<(usize, usize)> = None;
-            let mut remove: Option<usize> = None;
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            egui::Window::new("お気に入りの編集")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(360.0);
-                    if self.settings.favorites.is_empty() {
-                        ui.label("お気に入りはまだ登録されていません。");
-                    } else {
-                        let n = self.settings.favorites.len();
-                        egui::Grid::new("fav_edit_grid")
-                            .striped(true)
-                            .num_columns(2)
-                            .show(ui, |ui| {
-                                for i in 0..n {
-                                    let path_str = self.settings.favorites[i].to_string_lossy().to_string();
-                                    ui.label(&path_str);
-                                    ui.horizontal(|ui| {
-                                        let up_en = i > 0;
-                                        let dn_en = i + 1 < n;
-                                        if ui.add_enabled(up_en, egui::Button::new("↑")).clicked() {
-                                            swap = Some((i - 1, i));
-                                        }
-                                        if ui.add_enabled(dn_en, egui::Button::new("↓")).clicked() {
-                                            swap = Some((i, i + 1));
-                                        }
-                                        if ui.button("削除").clicked() {
-                                            remove = Some(i);
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                });
-
-            if let Some((a, b)) = swap {
-                self.settings.favorites.swap(a, b);
-                self.settings.save();
-            }
-            if let Some(i) = remove {
-                self.settings.favorites.remove(i);
-                self.settings.save();
-            }
-            if !open {
-                self.show_favorites_editor = false;
-            }
+        if !self.show_favorites_editor {
+            return;
         }
+        let mut open = true;
+        let mut swap: Option<(usize, usize)> = None;
+        let mut remove: Option<usize> = None;
+        let mut name_changed = false;
+        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
+        egui::Window::new("お気に入りの編集")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_pos(dialog_pos)
+            .show(ctx, |ui| {
+                ui.set_min_width(560.0);
+                if self.settings.favorites.is_empty() {
+                    ui.label("お気に入りはまだ登録されていません。");
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "表示名を編集できます。パスは右側に表示されます。",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+                    let n = self.settings.favorites.len();
+                    egui::Grid::new("fav_edit_grid")
+                        .striped(true)
+                        .num_columns(3)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            // ヘッダ
+                            ui.label(egui::RichText::new("表示名").strong());
+                            ui.label(egui::RichText::new("パス").strong());
+                            ui.label(egui::RichText::new("操作").strong());
+                            ui.end_row();
+
+                            for i in 0..n {
+                                // 表示名 (編集可能)
+                                let name_resp = ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.settings.favorites[i].name,
+                                    )
+                                    .desired_width(160.0),
+                                );
+                                if name_resp.changed() {
+                                    name_changed = true;
+                                }
+
+                                // パス (読み取り専用表示)
+                                let path_str = self.settings.favorites[i]
+                                    .path
+                                    .to_string_lossy()
+                                    .to_string();
+                                ui.label(
+                                    egui::RichText::new(truncate_name(&path_str, 60))
+                                        .monospace()
+                                        .weak(),
+                                )
+                                .on_hover_text(&path_str);
+
+                                // 操作ボタン
+                                ui.horizontal(|ui| {
+                                    let up_en = i > 0;
+                                    let dn_en = i + 1 < n;
+                                    if ui
+                                        .add_enabled(up_en, egui::Button::new("↑"))
+                                        .clicked()
+                                    {
+                                        swap = Some((i - 1, i));
+                                    }
+                                    if ui
+                                        .add_enabled(dn_en, egui::Button::new("↓"))
+                                        .clicked()
+                                    {
+                                        swap = Some((i, i + 1));
+                                    }
+                                    if ui.button("削除").clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+
+        if let Some((a, b)) = swap {
+            self.settings.favorites.swap(a, b);
+            self.settings.save();
+        }
+        if let Some(i) = remove {
+            self.settings.favorites.remove(i);
+            self.settings.save();
+        }
+        if name_changed {
+            // 名前の変更は TextEdit が直接 self.settings.favorites[i].name を編集済み
+            self.settings.save();
+        }
+        if !open {
+            self.show_favorites_editor = false;
+        }
     }
 }

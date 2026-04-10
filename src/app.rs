@@ -110,6 +110,15 @@ pub struct App {
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
 
+    // ── お気に入り追加ダイアログ (名称入力) ───────────────────────
+    pub(crate) show_fav_add_dialog: bool,
+    pub(crate) fav_add_name_input: String,
+    pub(crate) fav_add_target: Option<PathBuf>,
+
+    // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
+    pub(crate) show_open_folder_dialog: bool,
+    pub(crate) open_folder_input: String,
+
     // ── 環境設定ポップアップ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
     /// 環境設定ダイアログ内の一時的な並列度編集値（Manual時の数値）
@@ -233,6 +242,11 @@ impl Default for App {
             fs_cache: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
             show_favorites_editor: false,
+            show_fav_add_dialog: false,
+            fav_add_name_input: String::new(),
+            fav_add_target: None,
+            show_open_folder_dialog: false,
+            open_folder_input: String::new(),
             show_preferences: false,
             pref_manual_threads: 4,
             show_cache_policy_dialog: false,
@@ -1591,7 +1605,7 @@ impl App {
             .favorites
             .iter()
             .zip(self.cache_creator_checked.iter())
-            .filter_map(|(p, &c)| if c { Some(p.clone()) } else { None })
+            .filter_map(|(f, &c)| if c { Some(f.path.clone()) } else { None })
             .collect();
 
         if targets.is_empty() {
@@ -1822,8 +1836,13 @@ impl eframe::App for App {
         self.update_keep_range_and_requests();
         self.poll_prefetch(ctx);
 
-        // タイトルバーは常にアプリ名のみ。進捗は UI 内のプログレスバーで表示する。
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title("mimageviewer".to_string()));
+        // タイトルバーに現在のフォルダパスを表示する。
+        // フォルダ未選択時や読み込み途中はアプリ名のみ。
+        let title = match self.current_folder.as_ref() {
+            Some(p) => format!("{} - mimageviewer", p.display()),
+            None => "mimageviewer".to_string(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);
@@ -2297,19 +2316,36 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("ファイル", |ui| {
+                    if ui.button("フォルダを開く…").clicked() {
+                        // 既に現在フォルダが設定されていれば初期値として補完
+                        self.open_folder_input = self
+                            .current_folder
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        self.show_open_folder_dialog = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("終了").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
 
                 ui.menu_button("お気に入り", |ui| {
-                    // このフォルダを追加
+                    // このフォルダを追加 (クリック時は名称入力ダイアログを開く)
                     let can_add = self.current_folder.is_some();
-                    if ui.add_enabled(can_add, egui::Button::new("このフォルダを追加")).clicked() {
+                    if ui.add_enabled(can_add, egui::Button::new("このフォルダを追加…")).clicked() {
                         if let Some(ref folder) = self.current_folder.clone() {
-                            if self.settings.add_favorite(folder.clone()) {
-                                self.settings.save();
-                            }
+                            // 既定の名前はフォルダ名から補完
+                            let default_name = folder
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            self.fav_add_name_input = default_name;
+                            self.fav_add_target = Some(folder.clone());
+                            self.show_fav_add_dialog = true;
                         }
                         ui.close();
                     }
@@ -2343,11 +2379,8 @@ impl eframe::App for App {
                     } else {
                         let favorites = self.settings.favorites.clone();
                         for fav in &favorites {
-                            let label = fav.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or_else(|| fav.to_str().unwrap_or("?"));
-                            if ui.button(label).clicked() {
-                                fav_nav = Some(fav.clone());
+                            if ui.button(&fav.name).clicked() {
+                                fav_nav = Some(fav.path.clone());
                                 ui.close();
                             }
                         }
@@ -2503,6 +2536,8 @@ impl eframe::App for App {
         }
 
         self.show_favorites_editor_dialog(ctx);
+        self.show_fav_add_dialog_window(ctx);
+        let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_thumb_quality_dialog_window(ctx);
@@ -2513,70 +2548,131 @@ impl eframe::App for App {
         // ── ツールバー（列数・アスペクト比・ソート順の即時切り替え）──
         // horizontal_wrapped により、ウィンドウ幅が足りない場合は自動的に
         // 複数行に折り返し、すべてのボタンにアクセスできる。
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("列:");
-                for cols in 2..=10usize {
-                    let selected = self.settings.grid_cols == cols;
-                    if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
-                        self.settings.grid_cols = cols;
-                        self.settings.save();
-                    }
-                }
-                ui.separator();
-                ui.label("比率:");
-                for &aspect in crate::settings::ThumbAspect::all() {
-                    let selected = self.settings.thumb_aspect == aspect;
-                    if ui.selectable_label(selected, aspect.label()).clicked() {
-                        self.settings.thumb_aspect = aspect;
-                        self.settings.save();
-                    }
-                }
-                ui.separator();
-                ui.label("ソート:");
-                for &order in crate::settings::SortOrder::all() {
-                    let selected = self.settings.sort_order == order;
-                    if ui.selectable_label(selected, order.short_label()).clicked()
-                        && !selected
-                    {
-                        self.settings.sort_order = order;
-                        self.settings.save();
-                        if let Some(path) = self.current_folder.clone() {
-                            self.folder_history.remove(&path);
-                            self.load_folder(path);
+        // ツールバーの各セクションは設定で個別に表示/非表示を切り替えできる。
+        // すべて非表示なら panel 自体を描画せず、グリッドが画面上部まで広がる。
+        let show_cols = self.settings.show_toolbar_cols;
+        let show_aspect = self.settings.show_toolbar_aspect;
+        let show_sort = self.settings.show_toolbar_sort;
+        let show_favs = self.settings.show_toolbar_favorites;
+        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs;
+        let mut toolbar_fav_nav: Option<PathBuf> = None;
+        if any_toolbar_section {
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    let mut first_section = true;
+                    if show_cols {
+                        ui.label("列:");
+                        for cols in 2..=10usize {
+                            let selected = self.settings.grid_cols == cols;
+                            if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
+                                self.settings.grid_cols = cols;
+                                self.settings.save();
+                            }
                         }
+                        first_section = false;
                     }
-                }
-            });
-            ui.add_space(2.0);
-        });
-
-        // ── アドレスバー ─────────────────────────────────────────────
-        let address_nav = egui::TopBottomPanel::top("address_bar")
-            .show(ctx, |ui| -> Option<PathBuf> {
-                ui.add_space(3.0);
-                let mut result = None;
-                ui.horizontal(|ui| {
-                    ui.label("フォルダ:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.address)
-                            .desired_width(f32::INFINITY),
-                    );
-                    self.address_has_focus = resp.has_focus();
-                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        // ZIP ファイルや存在しないパスでも開けるよう、
-                        // resolve_openable_path で最寄りの既存ディレクトリに解決する。
-                        let p = PathBuf::from(&self.address);
-                        if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
-                            result = Some(resolved);
+                    if show_aspect {
+                        if !first_section {
+                            ui.separator();
+                        }
+                        ui.label("比率:");
+                        for &aspect in crate::settings::ThumbAspect::all() {
+                            let selected = self.settings.thumb_aspect == aspect;
+                            if ui.selectable_label(selected, aspect.label()).clicked() {
+                                self.settings.thumb_aspect = aspect;
+                                self.settings.save();
+                            }
+                        }
+                        first_section = false;
+                    }
+                    if show_sort {
+                        if !first_section {
+                            ui.separator();
+                        }
+                        ui.label("ソート:");
+                        for &order in crate::settings::SortOrder::all() {
+                            let selected = self.settings.sort_order == order;
+                            if ui
+                                .selectable_label(selected, order.short_label())
+                                .clicked()
+                                && !selected
+                            {
+                                self.settings.sort_order = order;
+                                self.settings.save();
+                                if let Some(path) = self.current_folder.clone() {
+                                    self.folder_history.remove(&path);
+                                    self.load_folder(path);
+                                }
+                            }
+                        }
+                        first_section = false;
+                    }
+                    if show_favs {
+                        if !first_section {
+                            ui.separator();
+                        }
+                        ui.label("お気に入り:");
+                        if self.settings.favorites.is_empty() {
+                            ui.label(egui::RichText::new("(未登録)").weak());
+                        } else {
+                            // 現在のフォルダと一致するお気に入りをハイライト
+                            let current = self.current_folder.clone();
+                            for fav in &self.settings.favorites {
+                                let selected = current
+                                    .as_ref()
+                                    .map(|c| c == &fav.path)
+                                    .unwrap_or(false);
+                                if ui
+                                    .selectable_label(selected, &fav.name)
+                                    .on_hover_text(fav.path.to_string_lossy())
+                                    .clicked()
+                                {
+                                    toolbar_fav_nav = Some(fav.path.clone());
+                                }
+                            }
                         }
                     }
                 });
-                ui.add_space(3.0);
-                result
-            })
-            .inner;
+                ui.add_space(2.0);
+            });
+        }
+
+        // ── アドレスバー (フォルダ入力) ──────────────────────────────
+        // 表示設定で隠されている場合はフォルダ入力はファイル>フォルダを開く ダイアログへ
+        let address_nav: Option<PathBuf> = if self.settings.show_toolbar_folder {
+            egui::TopBottomPanel::top("address_bar")
+                .show(ctx, |ui| -> Option<PathBuf> {
+                    ui.add_space(3.0);
+                    let mut result = None;
+                    ui.horizontal(|ui| {
+                        ui.label("フォルダ:");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.address)
+                                .desired_width(f32::INFINITY),
+                        );
+                        self.address_has_focus = resp.has_focus();
+                        if resp.lost_focus()
+                            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            // ZIP ファイルや存在しないパスでも開けるよう、
+                            // resolve_openable_path で最寄りの既存ディレクトリに解決する。
+                            let p = PathBuf::from(&self.address);
+                            if let Some(resolved) =
+                                crate::folder_tree::resolve_openable_path(&p)
+                            {
+                                result = Some(resolved);
+                            }
+                        }
+                    });
+                    ui.add_space(3.0);
+                    result
+                })
+                .inner
+        } else {
+            self.address_has_focus = false;
+            None
+        };
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let scroll_to = self.scroll_to_selected;
@@ -2769,7 +2865,12 @@ impl eframe::App for App {
             }
         }
 
-        let navigate = fav_nav.or(keyboard_nav).or(address_nav).or(grid_nav);
+        let navigate = fav_nav
+            .or(toolbar_fav_nav)
+            .or(keyboard_nav)
+            .or(address_nav)
+            .or(open_folder_nav)
+            .or(grid_nav);
         if let Some(p) = navigate {
             self.load_folder(p);
         }

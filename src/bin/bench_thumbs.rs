@@ -88,7 +88,7 @@ fn main() {
         std::process::exit(1);
     }
     for (i, fav) in settings_obj.favorites.iter().enumerate() {
-        println!("  [{}] {}", i + 1, fav.display());
+        println!("  [{}] {}  ({})", i + 1, fav.name, fav.path.display());
     }
     println!();
 
@@ -97,7 +97,7 @@ fn main() {
     let scan_t = Instant::now();
     let mut all_folders: Vec<PathBuf> = Vec::new();
     for fav in &settings_obj.favorites {
-        walk_dirs(fav, &mut all_folders);
+        walk_dirs(&fav.path, &mut all_folders);
     }
     println!(
         "スキャン完了: {} フォルダ ({:.2}秒)",

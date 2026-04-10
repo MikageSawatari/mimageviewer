@@ -67,8 +67,10 @@ impl App {
                             ui.label(egui::RichText::new("（お気に入りが未登録です）").weak());
                         } else {
                             for (i, fav) in self.settings.favorites.iter().enumerate() {
-                                let path_str = fav.to_string_lossy().to_string();
-                                ui.checkbox(&mut self.cache_creator_checked[i], path_str);
+                                // 「表示名 (パス)」の形式でチェックボックスのラベルを作る
+                                let label =
+                                    format!("{}  ({})", fav.name, fav.path.display());
+                                ui.checkbox(&mut self.cache_creator_checked[i], label);
                             }
                         }
 

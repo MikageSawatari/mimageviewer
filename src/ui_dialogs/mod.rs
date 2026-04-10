@@ -10,7 +10,9 @@
 mod cache_creator;
 mod cache_manager;
 mod cache_policy;
+mod fav_add;
 mod favorites_editor;
+mod open_folder;
 mod preferences;
 mod stats_dialog;
 mod thumb_quality;

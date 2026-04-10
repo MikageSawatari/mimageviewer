@@ -3,6 +3,64 @@ use std::path::PathBuf;
 const MAX_FAVORITES: usize = 20;
 
 // -----------------------------------------------------------------------
+// FavoriteEntry
+// -----------------------------------------------------------------------
+
+/// お気に入りフォルダの 1 エントリ。
+///
+/// `name` はユーザが任意に付けられる表示名 (ツールバーのボタンラベル等で使用)。
+/// 既定ではフォルダ名 (`path.file_name()`) が入る。
+///
+/// 旧バージョンとの互換性のため、JSON 上では「文字列のみ (旧)」「オブジェクト (新)」
+/// の両方を受け付ける。旧形式から読み込んだ場合、`name` はフォルダ名で自動補完される。
+#[derive(Clone, Debug)]
+pub struct FavoriteEntry {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl<'de> serde::Deserialize<'de> for FavoriteEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // 旧: 文字列 or パス (例: "C:\\foo")
+        // 新: オブジェクト (例: {"name": "my folder", "path": "C:\\foo"})
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy(PathBuf),
+            Full { name: String, path: PathBuf },
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Legacy(p) => {
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(FavoriteEntry { name, path: p })
+            }
+            Raw::Full { name, path } => Ok(FavoriteEntry { name, path }),
+        }
+    }
+}
+
+impl serde::Serialize for FavoriteEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("FavoriteEntry", 2)?;
+        s.serialize_field("name", &self.name)?;
+        s.serialize_field("path", &self.path)?;
+        s.end()
+    }
+}
+
+// -----------------------------------------------------------------------
 // サムネイルアスペクト比
 // -----------------------------------------------------------------------
 
@@ -154,7 +212,7 @@ pub struct Settings {
     #[serde(default)]
     pub thumb_aspect: ThumbAspect,
     #[serde(default)]
-    pub favorites: Vec<PathBuf>,
+    pub favorites: Vec<FavoriteEntry>,
     #[serde(default)]
     pub last_folder: Option<PathBuf>,
     /// ウィンドウ左上座標 (outer rect)
@@ -219,6 +277,23 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+
+    // ── ツールバー表示設定 ──────────────────────────────────
+    /// ツールバーに「列」セクションを表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_cols: bool,
+    /// ツールバーに「比率」セクションを表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_aspect: bool,
+    /// ツールバーに「ソート」セクションを表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_sort: bool,
+    /// ツールバーに「お気に入り」セクションを表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_favorites: bool,
+    /// アドレスバー (フォルダ入力行) を表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_folder: bool,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -259,6 +334,11 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
             thumb_idle_upgrade: true,
+            show_toolbar_cols: true,
+            show_toolbar_aspect: true,
+            show_toolbar_sort: true,
+            show_toolbar_favorites: true,
+            show_toolbar_folder: true,
         }
     }
 }
@@ -288,16 +368,21 @@ impl Settings {
         }
     }
 
-    /// 現在のフォルダをお気に入りに追加する（重複・上限チェック付き）。
+    /// 指定パスが既にお気に入り (重複) に登録されているかを返す。
+    pub fn is_favorite(&self, path: &std::path::Path) -> bool {
+        self.favorites.iter().any(|f| f.path == path)
+    }
+
+    /// 任意の表示名でお気に入りに追加する（重複・上限チェック付き）。
     /// 追加された場合 true を返す。
-    pub fn add_favorite(&mut self, path: PathBuf) -> bool {
-        if self.favorites.contains(&path) {
+    pub fn add_favorite(&mut self, name: String, path: PathBuf) -> bool {
+        if self.is_favorite(&path) {
             return false;
         }
         if self.favorites.len() >= MAX_FAVORITES {
             return false;
         }
-        self.favorites.push(path);
+        self.favorites.push(FavoriteEntry { name, path });
         true
     }
 }
