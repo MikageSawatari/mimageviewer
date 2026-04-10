@@ -26,167 +26,167 @@ use crate::ui_helpers::{
 // -----------------------------------------------------------------------
 
 pub struct App {
-    address: String,
-    current_folder: Option<PathBuf>,
-    items: Vec<GridItem>,
-    thumbnails: Vec<ThumbnailState>,
-    selected: Option<usize>,
-    settings: crate::settings::Settings,
-    tx: mpsc::Sender<ThumbMsg>,
-    rx: mpsc::Receiver<ThumbMsg>,
+    pub(crate) address: String,
+    pub(crate) current_folder: Option<PathBuf>,
+    pub(crate) items: Vec<GridItem>,
+    pub(crate) thumbnails: Vec<ThumbnailState>,
+    pub(crate) selected: Option<usize>,
+    pub(crate) settings: crate::settings::Settings,
+    pub(crate) tx: mpsc::Sender<ThumbMsg>,
+    pub(crate) rx: mpsc::Receiver<ThumbMsg>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
-    cancel_token: Arc<AtomicBool>,
+    pub(crate) cancel_token: Arc<AtomicBool>,
     /// Phase 2b ワーカーが参照する現在の可視先頭アイテムインデックス
     /// UIスレッドが毎フレーム更新し、バックグラウンドワーカーが優先度に使う
-    scroll_hint: Arc<AtomicUsize>,
+    pub(crate) scroll_hint: Arc<AtomicUsize>,
 
     /// スクロールオフセット（行境界にスナップ済み）。自前管理する
-    scroll_offset_y: f32,
+    pub(crate) scroll_offset_y: f32,
     /// 前フレームのセル幅（ = avail_w / cols）
-    last_cell_size: f32,
+    pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * thumb_aspect.height_ratio()）
-    last_cell_h: f32,
+    pub(crate) last_cell_h: f32,
     /// 前フレームのビューポート高さ（カーソルキースクロールに使用）
-    last_viewport_h: f32,
+    pub(crate) last_viewport_h: f32,
     /// true のとき選択セルが見えるようにオフセットを調整する
-    scroll_to_selected: bool,
+    pub(crate) scroll_to_selected: bool,
 
     /// ウィンドウ状態保存用：最後に確認した outer_rect（最小化・最大化時は更新しない）
-    last_outer_rect: Option<egui::Rect>,
+    pub(crate) last_outer_rect: Option<egui::Rect>,
     /// 現在のウィンドウの DPI スケール（論理→物理変換に使用）
-    last_pixels_per_point: f32,
+    pub(crate) last_pixels_per_point: f32,
 
     /// キャッシュ生成進捗：新規デコードが必要だった画像の総数
-    cache_gen_total: usize,
+    pub(crate) cache_gen_total: usize,
     /// キャッシュ生成進捗：完了した枚数（rayon スレッドからアトミックに更新）
-    cache_gen_done: Arc<AtomicUsize>,
+    pub(crate) cache_gen_done: Arc<AtomicUsize>,
 
     // ── 段階 B: ページ単位先読み / eviction ──────────────────────
     /// アイテム idx → 画像メタデータ (mtime, file_size)。フォルダ・動画は None
-    image_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
-    reload_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
+    pub(crate) reload_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
-    requested: std::collections::HashMap<usize, bool>,
+    pub(crate) requested: std::collections::HashMap<usize, bool>,
     /// 現在の keep range [start, end)。update_keep_range で毎フレーム更新
-    keep_range: (usize, usize),
+    pub(crate) keep_range: (usize, usize),
 
     // ── 進捗バー (段階 B/E の合算進捗表示) ─────────────────────
     /// 現フレームで検出された通常読み込みのピーク件数 (current が 0 でリセット)
-    progress_normal_peak: usize,
+    pub(crate) progress_normal_peak: usize,
     /// 現フレームで検出された高画質化 (アイドルアップグレード) のピーク件数
-    progress_upgrade_peak: usize,
+    pub(crate) progress_upgrade_peak: usize,
 
     // ── 段階 E: アイドル時の画質向上 ─────────────────────────────
     /// 前フレームでの scroll_offset_y（変化検知用）
-    last_scroll_offset_y_tracked: f32,
+    pub(crate) last_scroll_offset_y_tracked: f32,
     /// 最後にスクロールが動いた瞬間の時刻（アイドル検出用）
-    last_scroll_change_time: std::time::Instant,
+    pub(crate) last_scroll_change_time: std::time::Instant,
     /// UI とワーカー間で共有する現在の display_px (列数変更時に追従させる)
     /// update_keep_range_and_requests で毎フレーム更新される。
-    display_px_shared: Arc<AtomicU32>,
+    pub(crate) display_px_shared: Arc<AtomicU32>,
 
     // ── 統計情報 (起動時から累計) ─────────────────────────────
     /// サムネイル読み込みの統計 (時間分布・サイズ分布・フォーマット)。
     /// ワーカースレッドから Arc 経由で更新され、UI スレッドが読み出す。
-    stats: Arc<Mutex<crate::stats::ThumbStats>>,
+    pub(crate) stats: Arc<Mutex<crate::stats::ThumbStats>>,
     /// 統計ダイアログの表示フラグ
-    show_stats_dialog: bool,
+    pub(crate) show_stats_dialog: bool,
 
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
-    fullscreen_idx: Option<usize>,
+    pub(crate) fullscreen_idx: Option<usize>,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
-    fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル)
-    fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>)>,
+    pub(crate) fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>)>,
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
-    show_favorites_editor: bool,
+    pub(crate) show_favorites_editor: bool,
 
     // ── 環境設定ポップアップ ─────────────────────────────────────
-    show_preferences: bool,
+    pub(crate) show_preferences: bool,
     /// 環境設定ダイアログ内の一時的な並列度編集値（Manual時の数値）
-    pref_manual_threads: usize,
+    pub(crate) pref_manual_threads: usize,
 
     // ── キャッシュ生成設定ポップアップ (段階 C) ──────────────────
-    show_cache_policy_dialog: bool,
+    pub(crate) show_cache_policy_dialog: bool,
 
     // ── キャッシュ管理ポップアップ ───────────────────────────────
-    show_cache_manager: bool,
+    pub(crate) show_cache_manager: bool,
     /// キャッシュ管理の「◯日以上古い」入力値
-    cache_manager_days: u32,
+    pub(crate) cache_manager_days: u32,
     /// 開いたときに取得するキャッシュ統計: (フォルダ数, 合計バイト)
-    cache_manager_stats: Option<(usize, u64)>,
+    pub(crate) cache_manager_stats: Option<(usize, u64)>,
     /// 削除後の結果メッセージ
-    cache_manager_result: Option<String>,
+    pub(crate) cache_manager_result: Option<String>,
 
     // ── 最後に選択した画像 (サムネイル画質ダイアログで使用) ──
-    last_selected_image_path: Option<PathBuf>,
+    pub(crate) last_selected_image_path: Option<PathBuf>,
 
     // ── サムネイル画質設定ダイアログ ───────────────────────────
-    show_thumb_quality_dialog: bool,
+    pub(crate) show_thumb_quality_dialog: bool,
     /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)
-    tq_sample: Option<image::DynamicImage>,
+    pub(crate) tq_sample: Option<image::DynamicImage>,
     /// サンプル画像のパス表示用
-    tq_sample_path: Option<PathBuf>,
+    pub(crate) tq_sample_path: Option<PathBuf>,
     /// サンプル画像の元ファイルサイズ (bytes)
-    tq_sample_original_size: u64,
+    pub(crate) tq_sample_original_size: u64,
     /// パネル A: サイズ (long side px)
-    tq_a_size: u32,
+    pub(crate) tq_a_size: u32,
     /// パネル A: 品質 (1–100)
-    tq_a_quality: u8,
+    pub(crate) tq_a_quality: u8,
     /// パネル A: プレビューテクスチャ
-    tq_a_texture: Option<egui::TextureHandle>,
+    pub(crate) tq_a_texture: Option<egui::TextureHandle>,
     /// パネル A: エンコード後のバイト数
-    tq_a_bytes: usize,
+    pub(crate) tq_a_bytes: usize,
     /// パネル B: サイズ
-    tq_b_size: u32,
+    pub(crate) tq_b_size: u32,
     /// パネル B: 品質
-    tq_b_quality: u8,
+    pub(crate) tq_b_quality: u8,
     /// パネル B: プレビューテクスチャ
-    tq_b_texture: Option<egui::TextureHandle>,
+    pub(crate) tq_b_texture: Option<egui::TextureHandle>,
     /// パネル B: エンコード後のバイト数
-    tq_b_bytes: usize,
+    pub(crate) tq_b_bytes: usize,
     /// true = A/B 比較の全画面オーバーレイ表示中
-    tq_fullscreen: bool,
+    pub(crate) tq_fullscreen: bool,
     /// 全画面 A/B 比較時の縦線位置（0.0=すべて B、1.0=すべて A、中央は 0.5）
-    tq_fs_divider: f32,
+    pub(crate) tq_fs_divider: f32,
 
     // ── キャッシュ作成ポップアップ ───────────────────────────────
-    show_cache_creator: bool,
+    pub(crate) show_cache_creator: bool,
     /// 各お気に入りのチェック状態（settings.favorites と同じ長さ）
-    cache_creator_checked: Vec<bool>,
+    pub(crate) cache_creator_checked: Vec<bool>,
     /// 実行中フラグ（UI ボタンの有効/無効とポーリング制御）
-    cache_creator_running: bool,
+    pub(crate) cache_creator_running: bool,
     /// カウントフェーズ中フラグ（total 未確定）
-    cache_creator_counting: Arc<AtomicBool>,
+    pub(crate) cache_creator_counting: Arc<AtomicBool>,
     /// 対象フォルダ総数（Pass 1 完了後に確定）
-    cache_creator_total: Arc<AtomicUsize>,
+    pub(crate) cache_creator_total: Arc<AtomicUsize>,
     /// 処理済みフォルダ数
-    cache_creator_done: Arc<AtomicUsize>,
+    pub(crate) cache_creator_done: Arc<AtomicUsize>,
     /// キャッシュ容量 (バイト単位、累積加算)
-    cache_creator_cache_size: Arc<AtomicU64>,
+    pub(crate) cache_creator_cache_size: Arc<AtomicU64>,
     /// キャンセルトークン
-    cache_creator_cancel: Arc<AtomicBool>,
+    pub(crate) cache_creator_cancel: Arc<AtomicBool>,
     /// 現在処理中のフォルダパス表示用
-    cache_creator_current: Arc<Mutex<String>>,
+    pub(crate) cache_creator_current: Arc<Mutex<String>>,
     /// 完了シグナル（表示切替用）
-    cache_creator_finished: Arc<AtomicBool>,
+    pub(crate) cache_creator_finished: Arc<AtomicBool>,
     /// 完了後のメッセージ
-    cache_creator_result: Option<String>,
+    pub(crate) cache_creator_result: Option<String>,
 
     // ── アドレスバーフォーカス管理 ───────────────────────────────
     /// true のときアドレスバーが入力中 → キーショートカットを無効化
-    address_has_focus: bool,
+    pub(crate) address_has_focus: bool,
 
     // ── フォルダ履歴（スクロール位置・選択状態の復元用）────────────
     /// フォルダパス → (scroll_offset_y, selected_idx)
-    folder_history: std::collections::HashMap<PathBuf, (f32, Option<usize>)>,
+    pub(crate) folder_history: std::collections::HashMap<PathBuf, (f32, Option<usize>)>,
 
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
-    initialized: bool,
+    pub(crate) initialized: bool,
 }
 
 impl Default for App {
@@ -1712,6 +1712,1149 @@ impl App {
             finished.store(true, Ordering::Relaxed);
         });
     }
+    fn show_favorites_editor_dialog(&mut self, ctx: &egui::Context) {
+        // ── お気に入り編集ポップアップ ───────────────────────────────
+        if self.show_favorites_editor {
+            let mut open = true;
+            let mut swap: Option<(usize, usize)> = None;
+            let mut remove: Option<usize> = None;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("お気に入りの編集")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    if self.settings.favorites.is_empty() {
+                        ui.label("お気に入りはまだ登録されていません。");
+                    } else {
+                        let n = self.settings.favorites.len();
+                        egui::Grid::new("fav_edit_grid")
+                            .striped(true)
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                for i in 0..n {
+                                    let path_str = self.settings.favorites[i].to_string_lossy().to_string();
+                                    ui.label(&path_str);
+                                    ui.horizontal(|ui| {
+                                        let up_en = i > 0;
+                                        let dn_en = i + 1 < n;
+                                        if ui.add_enabled(up_en, egui::Button::new("↑")).clicked() {
+                                            swap = Some((i - 1, i));
+                                        }
+                                        if ui.add_enabled(dn_en, egui::Button::new("↓")).clicked() {
+                                            swap = Some((i, i + 1));
+                                        }
+                                        if ui.button("削除").clicked() {
+                                            remove = Some(i);
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                });
+
+            if let Some((a, b)) = swap {
+                self.settings.favorites.swap(a, b);
+                self.settings.save();
+            }
+            if let Some(i) = remove {
+                self.settings.favorites.remove(i);
+                self.settings.save();
+            }
+            if !open {
+                self.show_favorites_editor = false;
+            }
+        }
+
+    }
+
+    fn show_cache_manager_dialog(&mut self, ctx: &egui::Context) {
+        // ── キャッシュ管理ポップアップ ───────────────────────────────
+        if self.show_cache_manager {
+            let mut open = true;
+            let cache_dir = crate::catalog::default_cache_dir();
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("キャッシュ管理")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(380.0);
+
+                    // ── 統計表示 ──────────────────────────────────
+                    if let Some((folders, bytes)) = self.cache_manager_stats {
+                        let size_str = if bytes >= 1024 * 1024 * 1024 {
+                            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                        } else {
+                            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+                        };
+                        ui.label(format!("キャッシュ: {folders} フォルダ / {size_str}"));
+                    } else {
+                        ui.label("キャッシュ情報を取得中...");
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    // ── 古いキャッシュの削除 ──────────────────────
+                    ui.horizontal(|ui| {
+                        let mut days_str = self.cache_manager_days.to_string();
+                        ui.label("最終更新から");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut days_str)
+                                .desired_width(48.0)
+                                .horizontal_align(egui::Align::Center),
+                        );
+                        if resp.changed() {
+                            if let Ok(v) = days_str.parse::<u32>() {
+                                if v > 0 {
+                                    self.cache_manager_days = v;
+                                }
+                            }
+                        }
+                        ui.label("日以上更新がないキャッシュを削除する");
+                    });
+                    ui.add_space(4.0);
+                    if ui.button(format!("  {} 日以上古いキャッシュを削除  ", self.cache_manager_days)).clicked() {
+                        let deleted = crate::catalog::delete_old_cache(&cache_dir, self.cache_manager_days as u64);
+                        let stats = crate::catalog::cache_stats(&cache_dir);
+                        self.cache_manager_stats = Some(stats);
+                        self.cache_manager_result = Some(format!("{} 件のキャッシュを削除しました。", deleted));
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    // ── すべて削除 ────────────────────────────────
+                    if ui.button("  すべてのキャッシュを削除する  ").clicked() {
+                        let deleted = crate::catalog::delete_all_cache(&cache_dir);
+                        self.cache_manager_stats = Some((0, 0));
+                        self.cache_manager_result = Some(format!("{} 件のキャッシュをすべて削除しました。", deleted));
+                    }
+
+                    // ── 結果メッセージ ────────────────────────────
+                    if let Some(ref msg) = self.cache_manager_result {
+                        ui.add_space(8.0);
+                        ui.label(msg.as_str());
+                    }
+                });
+
+            if !open {
+                self.show_cache_manager = false;
+            }
+        }
+
+    }
+
+    fn show_cache_creator_dialog(&mut self, ctx: &egui::Context) {
+        // ── キャッシュ作成ポップアップ ────────────────────────────────
+        if self.show_cache_creator {
+            // 完了初回に結果メッセージをセット
+            if self.cache_creator_finished.load(Ordering::Relaxed)
+                && self.cache_creator_result.is_none()
+            {
+                let done = self.cache_creator_done.load(Ordering::Relaxed);
+                let total = self.cache_creator_total.load(Ordering::Relaxed);
+                let cancelled = self.cache_creator_cancel.load(Ordering::Relaxed);
+                self.cache_creator_result = Some(if cancelled {
+                    format!("キャンセルされました（{} / {} フォルダ処理済み）", done, total)
+                } else {
+                    format!("{} フォルダの処理が完了しました。", done)
+                });
+            }
+
+            let mut open = true;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+            egui::Window::new("キャッシュ作成")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(500.0);
+
+                    if !self.cache_creator_running
+                        && !self.cache_creator_finished.load(Ordering::Relaxed)
+                    {
+                        // ── 選択前画面 ──
+                        ui.label("キャッシュを作成するお気に入りを選んでください：");
+                        ui.add_space(6.0);
+
+                        if self.settings.favorites.is_empty() {
+                            ui.label(egui::RichText::new("（お気に入りが未登録です）").weak());
+                        } else {
+                            for (i, fav) in self.settings.favorites.iter().enumerate() {
+                                let path_str = fav.to_string_lossy().to_string();
+                                ui.checkbox(&mut self.cache_creator_checked[i], path_str);
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        let any_checked = self.cache_creator_checked.iter().any(|&b| b);
+                        if ui
+                            .add_enabled(
+                                any_checked,
+                                egui::Button::new("  キャッシュ作成  "),
+                            )
+                            .clicked()
+                        {
+                            self.start_cache_creation();
+                        }
+                    } else {
+                        // ── 実行中 / 完了画面 ──
+                        let counting = self.cache_creator_counting.load(Ordering::Relaxed);
+                        let total = self.cache_creator_total.load(Ordering::Relaxed);
+                        let done = self.cache_creator_done.load(Ordering::Relaxed);
+                        let size = self.cache_creator_cache_size.load(Ordering::Relaxed);
+
+                        if counting {
+                            ui.label("フォルダを列挙中…");
+                        } else {
+                            ui.label(format!("フォルダ: {} / {}", done, total));
+                        }
+
+                        let current = self.cache_creator_current.lock().unwrap().clone();
+                        if !current.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("現在: {}", current))
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(format!("キャッシュ容量: {}", format_bytes(size)));
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        if self.cache_creator_finished.load(Ordering::Relaxed) {
+                            if let Some(ref msg) = self.cache_creator_result {
+                                ui.label(msg.as_str());
+                                ui.add_space(4.0);
+                            }
+                            if ui.button("  閉じる  ").clicked() {
+                                self.show_cache_creator = false;
+                                self.cache_creator_running = false;
+                            }
+                        } else {
+                            if ui.button("  キャンセル  ").clicked() {
+                                self.cache_creator_cancel.store(true, Ordering::Relaxed);
+                            }
+                            // リアルタイム更新のため繰り返し描画要求
+                            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                    }
+                });
+
+            if !open {
+                if self.cache_creator_running
+                    && !self.cache_creator_finished.load(Ordering::Relaxed)
+                {
+                    self.cache_creator_cancel.store(true, Ordering::Relaxed);
+                }
+                self.show_cache_creator = false;
+                self.cache_creator_running = false;
+            }
+        }
+
+    }
+
+    fn show_thumb_quality_dialog_window(&mut self, ctx: &egui::Context) {
+        // ── サムネイル画質設定ポップアップ ────────────────────────────
+        if self.show_thumb_quality_dialog {
+            let mut open = true;
+            let mut apply_a = false;
+            let mut apply_b = false;
+            let mut reencode_a = false;
+            let mut reencode_b = false;
+            let mut open_fs_a = false;
+            let mut open_fs_b = false;
+
+            // 実グリッドの現在のセルサイズを取得（最小値を確保してスライダーが入るように）
+            let grid_cell_w = self.last_cell_size.max(200.0);
+            let grid_cell_h = self.last_cell_h.max(150.0);
+            // ダイアログのデフォルトサイズ（2カラム + パディング）
+            let default_w = (grid_cell_w * 2.0 + 80.0).clamp(680.0, 1800.0);
+            let default_h = (grid_cell_h + 260.0).clamp(480.0, 1200.0);
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("サムネイル画質設定")
+                .open(&mut open)
+                .resizable(true)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .default_size([default_w, default_h])
+                .show(ctx, |ui| {
+                    if self.tq_sample.is_none() {
+                        ui.set_min_width(360.0);
+                        ui.label("画像を1枚選択してからもう一度お試しください。");
+                        ui.add_space(8.0);
+                        if ui.button("  閉じる  ").clicked() {
+                            self.show_thumb_quality_dialog = false;
+                        }
+                        return;
+                    }
+
+                    // サンプル画像情報
+                    if let Some(ref p) = self.tq_sample_path {
+                        ui.label(
+                            egui::RichText::new(format!("サンプル: {}", p.to_string_lossy()))
+                                .small(),
+                        );
+                    }
+                    if let Some(ref img) = self.tq_sample {
+                        let sz = self.tq_sample_original_size;
+                        let sz_str = if sz >= 1024 * 1024 {
+                            format!("{:.1} MB", sz as f64 / (1024.0 * 1024.0))
+                        } else {
+                            format!("{:.0} KB", sz as f64 / 1024.0)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "（元サイズ {}x{} / {}）",
+                                img.width(),
+                                img.height(),
+                                sz_str
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+
+                    // 現在のグリッド表示サイズ（サイズ選択時の参考用）
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "現在のグリッド表示サイズ: {} × {} px  （{} 列 / アスペクト比 {}）",
+                            self.last_cell_size.round() as i32,
+                            self.last_cell_h.round() as i32,
+                            self.settings.grid_cols,
+                            self.settings.thumb_aspect.label(),
+                        ))
+                        .small(),
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── A / B 2 カラム ────────────────────────
+                    ui.columns(2, |cols| {
+                        // -- A --
+                        cols[0].vertical(|ui| {
+                            ui.heading("A");
+                            ui.add_space(4.0);
+                            let resp = tq_draw_preview(
+                                ui,
+                                &self.tq_a_texture,
+                                grid_cell_w,
+                                grid_cell_h,
+                            );
+                            if resp.clicked() {
+                                open_fs_a = true;
+                            }
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                ui.label("サイズ:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_a_size, 128..=1536)
+                                        .text("px"),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_a = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("品質:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_a_quality, 1..=100),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_a = true;
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(format!("{}  ({}x{})",
+                                format_bytes_small(self.tq_a_bytes as u64),
+                                self.tq_a_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
+                                self.tq_a_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
+                            ));
+                            ui.add_space(4.0);
+                            if ui.button("  A を適用  ").clicked() {
+                                apply_a = true;
+                            }
+                        });
+
+                        // -- B --
+                        cols[1].vertical(|ui| {
+                            ui.heading("B");
+                            ui.add_space(4.0);
+                            let resp = tq_draw_preview(
+                                ui,
+                                &self.tq_b_texture,
+                                grid_cell_w,
+                                grid_cell_h,
+                            );
+                            if resp.clicked() {
+                                open_fs_b = true;
+                            }
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                ui.label("サイズ:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_b_size, 128..=1536)
+                                        .text("px"),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_b = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("品質:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_b_quality, 1..=100),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_b = true;
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(format!("{}  ({}x{})",
+                                format_bytes_small(self.tq_b_bytes as u64),
+                                self.tq_b_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
+                                self.tq_b_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
+                            ));
+                            ui.add_space(4.0);
+                            if ui.button("  B を適用  ").clicked() {
+                                apply_b = true;
+                            }
+                        });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "現在の設定: {}px / q={}",
+                            self.settings.thumb_px, self.settings.thumb_quality
+                        ));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.button("  閉じる  ").clicked() {
+                                    self.show_thumb_quality_dialog = false;
+                                }
+                            },
+                        );
+                    });
+                });
+
+            if reencode_a {
+                self.reencode_tq_panel(ctx, true);
+            }
+            if reencode_b {
+                self.reencode_tq_panel(ctx, false);
+            }
+            if open_fs_a || open_fs_b {
+                self.tq_fullscreen = true;
+                // divider 位置はリセットせず、前回の位置を維持する
+            }
+            if apply_a {
+                self.settings.thumb_px = self.tq_a_size;
+                self.settings.thumb_quality = self.tq_a_quality;
+                self.settings.save();
+                self.close_thumb_quality_dialog();
+            } else if apply_b {
+                self.settings.thumb_px = self.tq_b_size;
+                self.settings.thumb_quality = self.tq_b_quality;
+                self.settings.save();
+                self.close_thumb_quality_dialog();
+            } else if !open {
+                self.close_thumb_quality_dialog();
+            }
+        }
+
+    }
+
+    fn show_thumb_quality_fullscreen_overlay(&mut self, ctx: &egui::Context) {
+        // ── サムネイル画質プレビュー全画面 A/B 比較オーバーレイ ────────
+        if self.tq_fullscreen {
+            let screen = ctx.content_rect();
+
+            // A・B のテクスチャ。両方とも同じソース画像から作られたサムネイルなので
+            // アスペクト比は同一。どちらかのサイズで fit 計算する。
+            let ref_size = self
+                .tq_a_texture
+                .as_ref()
+                .map(|t| t.size_vec2())
+                .or_else(|| self.tq_b_texture.as_ref().map(|t| t.size_vec2()));
+
+            // 画像表示領域を画面中央に計算（下部に情報バー分のスペースを確保）
+            let img_rect_opt: Option<egui::Rect> = ref_size.map(|rs| {
+                let margin = 40.0;
+                let info_bar_h = 80.0;
+                let avail_w = (screen.width() - margin * 2.0).max(1.0);
+                let avail_h = (screen.height() - margin * 2.0 - info_bar_h).max(1.0);
+                let scale = (avail_w / rs.x).min(avail_h / rs.y);
+                let img_size = rs * scale;
+                egui::Rect::from_center_size(
+                    egui::pos2(screen.center().x, screen.center().y - info_bar_h * 0.5),
+                    img_size,
+                )
+            });
+
+            let divider_t = self.tq_fs_divider.clamp(0.0, 1.0);
+
+            let area_resp = egui::Area::new(egui::Id::new("tq_fs_overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    let (rect, response) = ui.allocate_exact_size(
+                        screen.size(),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let painter = ui.painter();
+                    // 背景
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 20, 20));
+
+                    let Some(img_rect) = img_rect_opt else {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "プレビューがありません",
+                            egui::FontId::proportional(18.0),
+                            egui::Color32::from_gray(200),
+                        );
+                        return response;
+                    };
+
+                    let divider_x = img_rect.min.x + img_rect.width() * divider_t;
+
+                    // A (左側) を divider まで描画
+                    if let Some(ta) = &self.tq_a_texture {
+                        let a_rect = egui::Rect::from_min_max(
+                            img_rect.min,
+                            egui::pos2(divider_x, img_rect.max.y),
+                        );
+                        let a_uv = egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(divider_t, 1.0),
+                        );
+                        if a_rect.width() > 0.0 {
+                            painter.image(ta.id(), a_rect, a_uv, egui::Color32::WHITE);
+                        }
+                    }
+
+                    // B (右側) を divider から描画
+                    if let Some(tb) = &self.tq_b_texture {
+                        let b_rect = egui::Rect::from_min_max(
+                            egui::pos2(divider_x, img_rect.min.y),
+                            img_rect.max,
+                        );
+                        let b_uv = egui::Rect::from_min_max(
+                            egui::pos2(divider_t, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        );
+                        if b_rect.width() > 0.0 {
+                            painter.image(tb.id(), b_rect, b_uv, egui::Color32::WHITE);
+                        }
+                    }
+
+                    // 画像の外枠
+                    painter.rect_stroke(
+                        img_rect,
+                        0.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    // 縦境界線
+                    painter.line_segment(
+                        [
+                            egui::pos2(divider_x, img_rect.min.y),
+                            egui::pos2(divider_x, img_rect.max.y),
+                        ],
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    );
+
+                    // ドラッグハンドル（円 + 左右矢印）
+                    let handle_center = egui::pos2(divider_x, img_rect.center().y);
+                    let handle_r = 16.0;
+                    painter.circle_filled(
+                        handle_center,
+                        handle_r,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                    );
+                    painter.circle_stroke(
+                        handle_center,
+                        handle_r,
+                        egui::Stroke::new(2.0, egui::Color32::from_gray(60)),
+                    );
+                    painter.text(
+                        handle_center,
+                        egui::Align2::CENTER_CENTER,
+                        "◀ ▶",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(40),
+                    );
+
+                    // A / B ラベル（画像の角に半透明背景付き）
+                    let label_pad = egui::vec2(10.0, 6.0);
+                    let label_a = "A";
+                    let label_b = "B";
+                    let font = egui::FontId::proportional(24.0);
+
+                    // A ラベル（左上、divider より左にあるときのみ）
+                    if divider_t > 0.05 {
+                        let pos = egui::pos2(img_rect.min.x + 12.0, img_rect.min.y + 12.0);
+                        let galley = painter.layout_no_wrap(
+                            label_a.to_string(),
+                            font.clone(),
+                            egui::Color32::WHITE,
+                        );
+                        let bg_rect = egui::Rect::from_min_size(
+                            pos,
+                            galley.size() + label_pad * 2.0,
+                        );
+                        painter.rect_filled(
+                            bg_rect,
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        );
+                        painter.galley(pos + label_pad, galley, egui::Color32::WHITE);
+                    }
+
+                    // B ラベル（右上、divider より右にあるときのみ）
+                    if divider_t < 0.95 {
+                        let galley = painter.layout_no_wrap(
+                            label_b.to_string(),
+                            font.clone(),
+                            egui::Color32::WHITE,
+                        );
+                        let bg_size = galley.size() + label_pad * 2.0;
+                        let pos = egui::pos2(
+                            img_rect.max.x - 12.0 - bg_size.x,
+                            img_rect.min.y + 12.0,
+                        );
+                        let bg_rect = egui::Rect::from_min_size(pos, bg_size);
+                        painter.rect_filled(
+                            bg_rect,
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        );
+                        painter.galley(pos + label_pad, galley, egui::Color32::WHITE);
+                    }
+
+                    // 情報バー（画像下）
+                    let info_base_y = img_rect.max.y + 24.0;
+                    let a_info = format!(
+                        "A:  {}px  /  q={}  /  {}",
+                        self.tq_a_size,
+                        self.tq_a_quality,
+                        format_bytes_small(self.tq_a_bytes as u64),
+                    );
+                    let b_info = format!(
+                        "B:  {}px  /  q={}  /  {}",
+                        self.tq_b_size,
+                        self.tq_b_quality,
+                        format_bytes_small(self.tq_b_bytes as u64),
+                    );
+                    let info_font = egui::FontId::proportional(14.0);
+                    painter.text(
+                        egui::pos2(rect.center().x - 24.0, info_base_y),
+                        egui::Align2::RIGHT_CENTER,
+                        a_info,
+                        info_font.clone(),
+                        egui::Color32::from_rgb(150, 200, 255),
+                    );
+                    painter.text(
+                        egui::pos2(rect.center().x + 24.0, info_base_y),
+                        egui::Align2::LEFT_CENTER,
+                        b_info,
+                        info_font.clone(),
+                        egui::Color32::from_rgb(255, 220, 150),
+                    );
+                    painter.text(
+                        egui::pos2(rect.center().x, info_base_y + 24.0),
+                        egui::Align2::CENTER_CENTER,
+                        "ドラッグで境界線を移動  /  クリック または ESC で戻る",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(180),
+                    );
+
+                    response
+                });
+
+            // ドラッグ → divider を更新
+            if area_resp.inner.dragged() {
+                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                    if let Some(img_rect) = img_rect_opt {
+                        if img_rect.width() > 0.0 {
+                            let t = ((pos.x - img_rect.min.x) / img_rect.width())
+                                .clamp(0.0, 1.0);
+                            self.tq_fs_divider = t;
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            // 画像上にホバーしているときはリサイズ左右カーソル
+            if let Some(img_rect) = img_rect_opt {
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if img_rect.contains(pos) {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                }
+            }
+
+            // ドラッグしていないクリック → 閉じる
+            let clicked = area_resp.inner.clicked();
+            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            if clicked || esc {
+                self.tq_fullscreen = false;
+            }
+        }
+
+    }
+
+    fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
+        // ── 環境設定ポップアップ ─────────────────────────────────────
+        if self.show_preferences {
+            let mut open = true;
+            let mut apply = false;
+            let mut cancel = false;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("環境設定")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(420.0);
+
+                    ui.heading("並列読み込み");
+                    ui.add_space(4.0);
+
+                    let is_auto = self.settings.parallelism == crate::settings::Parallelism::Auto;
+                    let auto_count = {
+                        let cores = std::thread::available_parallelism()
+                            .map(|n| n.get()).unwrap_or(2);
+                        (cores / 2).max(1)
+                    };
+
+                    if ui.radio(is_auto, format!("自動（CPUコア数の半分: {} スレッド）", auto_count)).clicked() {
+                        self.settings.parallelism = crate::settings::Parallelism::Auto;
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.radio(!is_auto, "手動").clicked() {
+                            self.settings.parallelism =
+                                crate::settings::Parallelism::Manual(self.pref_manual_threads);
+                        }
+                        ui.add_enabled(
+                            !is_auto,
+                            egui::DragValue::new(&mut self.pref_manual_threads)
+                                .range(1..=64)
+                                .suffix(" スレッド"),
+                        );
+                        if !is_auto {
+                            self.settings.parallelism =
+                                crate::settings::Parallelism::Manual(self.pref_manual_threads);
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.heading("フルサイズ画像の先読み");
+                    ui.add_space(4.0);
+                    ui.label("フルサイズ表示時に前後の画像を先読みする枚数（各最大 50 枚）。");
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("後方（前の画像）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.prefetch_back)
+                                .range(0..=50usize)
+                                .suffix(" 枚"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("前方（次の画像）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.prefetch_forward)
+                                .range(0..=50usize)
+                                .suffix(" 枚"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.heading("サムネイルの先読み");
+                    ui.add_space(4.0);
+                    ui.label(
+                        "サムネイルグリッドで現在位置の前後に何ページ分を GPU に保持するか。\n\
+                         範囲外はメモリから破棄され、スクロールで戻ると再読み込みされます。",
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("後方（前のページ）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.thumb_prev_pages)
+                                .range(0..=20u32)
+                                .suffix(" ページ"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("前方（次のページ）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.thumb_next_pages)
+                                .range(0..=20u32)
+                                .suffix(" ページ"),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+                    // プライマリ GPU の VRAM を問い合わせて表示に使う
+                    let vram_mib = crate::gpu_info::query_vram_summary_mib();
+                    let vram_label = match vram_mib {
+                        Some(mib) if mib >= 1024 => {
+                            format!("{:.1} GiB", mib as f64 / 1024.0)
+                        }
+                        Some(mib) => format!("{} MiB", mib),
+                        None => "取得失敗 (4 GiB 仮定)".to_string(),
+                    };
+                    ui.label(format!(
+                        "GPU メモリ上限 (安全ネット):\n\
+                         超過時は先読み範囲を自動的に縮小します。\n\
+                         検出した GPU の VRAM: {vram_label}",
+                    ));
+
+                    ui.horizontal(|ui| {
+                        ui.label("上限:");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.settings.thumb_vram_cap_percent,
+                                0..=100u32,
+                            )
+                            .step_by(5.0)
+                            .suffix(" %"),
+                        );
+                    });
+
+                    // 現在の % が実際に何 MiB に相当するかを補助表示
+                    {
+                        let pct = self.settings.thumb_vram_cap_percent;
+                        let text = if pct == 0 {
+                            "  ↑ 0% = 無制限 (推奨しない)".to_string()
+                        } else {
+                            let cap_mib = crate::gpu_info::vram_cap_from_percent(pct)
+                                / (1024 * 1024);
+                            format!(
+                                "  ↑ VRAM の {}% = 約 {} MiB を上限とします (推奨: 50%)",
+                                pct, cap_mib
+                            )
+                        };
+                        ui.label(text);
+                    }
+
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut self.settings.thumb_idle_upgrade,
+                        "アイドル時にキャッシュ由来のサムネイルを高画質化する",
+                    );
+                    ui.label(
+                        "  ↑ スクロール停止後、キャッシュ復元 (WebP q=75) のサムネイルを\n    \
+                         元画像から再デコードして差し替えます。visible 側から順次処理。",
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.heading("フォルダ移動");
+                    ui.add_space(4.0);
+                    ui.label("Ctrl+↑↓ で移動先フォルダに画像がない場合、自動でスキップする最大回数。");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("空フォルダのスキップ上限:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.folder_skip_limit)
+                                .range(1..=10usize)
+                                .suffix(" 回"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("  OK  ").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+            if apply {
+                self.settings.save();
+                self.show_preferences = false;
+            } else if cancel || !open {
+                // キャンセル/×ボタン: 変更を破棄するため再ロード
+                self.settings = crate::settings::Settings::load();
+                self.show_preferences = false;
+            }
+        }
+
+    }
+
+    fn show_cache_policy_dialog(&mut self, ctx: &egui::Context) {
+        // ── キャッシュ生成設定ポップアップ (段階 C) ─────────────────────
+        if self.show_cache_policy_dialog {
+            let mut open = true;
+            let mut apply = false;
+            let mut cancel = false;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("キャッシュ生成設定")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(480.0);
+
+                    ui.label(
+                        "サムネイルキャッシュをいつ生成するかを指定します。\n\
+                         リリースビルドではキャッシュが無くても十分高速ですが、\n\
+                         重い画像や巨大ファイルはキャッシュすると再訪問時に高速化します。\n\
+                         Off にしても既存のキャッシュは引き続き読み込まれます。",
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.heading("モード");
+                    ui.add_space(4.0);
+                    for policy in [
+                        crate::settings::CachePolicy::Off,
+                        crate::settings::CachePolicy::Auto,
+                        crate::settings::CachePolicy::Always,
+                    ] {
+                        if ui
+                            .radio(
+                                self.settings.cache_policy == policy,
+                                policy.label(),
+                            )
+                            .clicked()
+                        {
+                            self.settings.cache_policy = policy;
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // Auto モード時のみ以下の項目を活性化
+                    let auto_active =
+                        self.settings.cache_policy == crate::settings::CachePolicy::Auto;
+
+                    ui.add_enabled_ui(auto_active, |ui| {
+                        ui.heading("Auto モードのしきい値");
+                        ui.add_space(4.0);
+
+                        ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.settings.cache_threshold_ms,
+                                10..=100,
+                            )
+                            .step_by(5.0)
+                            .suffix(" ms"),
+                        );
+                        ui.label("  小さいほど多くキャッシュ。25 ms 推奨。");
+
+                        ui.add_space(8.0);
+
+                        // サイズしきい値を MB 単位で編集
+                        ui.label("サイズしきい値 (このサイズ以上は無条件キャッシュ):");
+                        let mut size_mb =
+                            (self.settings.cache_size_threshold_bytes as f64) / 1_000_000.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut size_mb, 0.5..=10.0)
+                                    .step_by(0.5)
+                                    .suffix(" MB"),
+                            )
+                            .changed()
+                        {
+                            self.settings.cache_size_threshold_bytes =
+                                (size_mb * 1_000_000.0) as u64;
+                        }
+                        ui.label("  2 MB 推奨。これ以上の重い画像が確実にキャッシュされます。");
+
+                        ui.add_space(8.0);
+
+                        ui.checkbox(
+                            &mut self.settings.cache_webp_always,
+                            "既存 .webp は常にキャッシュ (デコードが重いため推奨)",
+                        );
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("  OK  ").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+            if apply {
+                self.settings.save();
+                self.show_cache_policy_dialog = false;
+            } else if cancel || !open {
+                // キャンセル/×ボタン: 変更を破棄するため再ロード
+                self.settings = crate::settings::Settings::load();
+                self.show_cache_policy_dialog = false;
+            }
+        }
+
+    }
+
+    fn show_stats_dialog_window(&mut self, ctx: &egui::Context) {
+        // ── 統計ダイアログ ──────────────────────────────────────────
+        if self.show_stats_dialog {
+            let mut open = true;
+            let mut reset_clicked = false;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            // スナップショットを取得 (ロック時間を最小化)
+            let snapshot: crate::stats::ThumbStats = {
+                self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+            };
+
+            egui::Window::new("統計")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.label(
+                        "起動時から累計したサムネイル読み込み統計です。\n\
+                         キャッシュ生成設定の参考にしてください。\n\
+                         (キャッシュヒットは対象外。フルデコード時のみ記録)",
+                    );
+                    ui.add_space(8.0);
+
+                    // ── 読み込み時間ヒストグラム ──
+                    ui.heading("読み込み時間 (decode + display)");
+                    ui.add_space(4.0);
+                    draw_histogram(
+                        ui,
+                        &snapshot.load_time_hist,
+                        |bucket| crate::stats::ThumbStats::load_time_label(bucket),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── ファイルサイズヒストグラム ──
+                    ui.heading("ファイルサイズ");
+                    ui.add_space(4.0);
+                    draw_histogram(
+                        ui,
+                        &snapshot.size_hist,
+                        |bucket| crate::stats::ThumbStats::size_label(bucket),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── フォーマット別件数 ──
+                    ui.heading("フォーマット");
+                    ui.add_space(4.0);
+                    let format_rows: [(&str, u64); 7] = [
+                        ("JPEG  ", snapshot.count_jpg),
+                        ("PNG   ", snapshot.count_png),
+                        ("WebP  ", snapshot.count_webp),
+                        ("GIF   ", snapshot.count_gif),
+                        ("BMP   ", snapshot.count_bmp),
+                        ("動画  ", snapshot.count_video),
+                        ("その他", snapshot.count_other),
+                    ];
+                    draw_format_rows(ui, &format_rows);
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── サマリ ──
+                    let total_images = snapshot.total_images();
+                    let total_all = total_images + snapshot.count_video;
+                    ui.label(format!(
+                        "合計: {} 件  (画像 {} / 動画 {} / 失敗 {})",
+                        format_count(total_all),
+                        format_count(total_images),
+                        format_count(snapshot.count_video),
+                        format_count(snapshot.count_failed),
+                    ));
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("リセット").clicked() {
+                            reset_clicked = true;
+                        }
+                        if ui.button("閉じる").clicked() {
+                            // open = false でダイアログを閉じる
+                        }
+                    });
+                });
+
+            if reset_clicked {
+                if let Ok(mut s) = self.stats.lock() {
+                    s.reset();
+                }
+            }
+            if !open {
+                self.show_stats_dialog = false;
+            }
+        }
+
+    }
+
 }
 
 // -----------------------------------------------------------------------
@@ -2355,1125 +3498,14 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        // ── お気に入り編集ポップアップ ───────────────────────────────
-        if self.show_favorites_editor {
-            let mut open = true;
-            let mut swap: Option<(usize, usize)> = None;
-            let mut remove: Option<usize> = None;
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            egui::Window::new("お気に入りの編集")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(360.0);
-                    if self.settings.favorites.is_empty() {
-                        ui.label("お気に入りはまだ登録されていません。");
-                    } else {
-                        let n = self.settings.favorites.len();
-                        egui::Grid::new("fav_edit_grid")
-                            .striped(true)
-                            .num_columns(2)
-                            .show(ui, |ui| {
-                                for i in 0..n {
-                                    let path_str = self.settings.favorites[i].to_string_lossy().to_string();
-                                    ui.label(&path_str);
-                                    ui.horizontal(|ui| {
-                                        let up_en = i > 0;
-                                        let dn_en = i + 1 < n;
-                                        if ui.add_enabled(up_en, egui::Button::new("↑")).clicked() {
-                                            swap = Some((i - 1, i));
-                                        }
-                                        if ui.add_enabled(dn_en, egui::Button::new("↓")).clicked() {
-                                            swap = Some((i, i + 1));
-                                        }
-                                        if ui.button("削除").clicked() {
-                                            remove = Some(i);
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                });
-
-            if let Some((a, b)) = swap {
-                self.settings.favorites.swap(a, b);
-                self.settings.save();
-            }
-            if let Some(i) = remove {
-                self.settings.favorites.remove(i);
-                self.settings.save();
-            }
-            if !open {
-                self.show_favorites_editor = false;
-            }
-        }
-
-        // ── キャッシュ管理ポップアップ ───────────────────────────────
-        if self.show_cache_manager {
-            let mut open = true;
-            let cache_dir = crate::catalog::default_cache_dir();
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            egui::Window::new("キャッシュ管理")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(380.0);
-
-                    // ── 統計表示 ──────────────────────────────────
-                    if let Some((folders, bytes)) = self.cache_manager_stats {
-                        let size_str = if bytes >= 1024 * 1024 * 1024 {
-                            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-                        } else {
-                            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-                        };
-                        ui.label(format!("キャッシュ: {folders} フォルダ / {size_str}"));
-                    } else {
-                        ui.label("キャッシュ情報を取得中...");
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // ── 古いキャッシュの削除 ──────────────────────
-                    ui.horizontal(|ui| {
-                        let mut days_str = self.cache_manager_days.to_string();
-                        ui.label("最終更新から");
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut days_str)
-                                .desired_width(48.0)
-                                .horizontal_align(egui::Align::Center),
-                        );
-                        if resp.changed() {
-                            if let Ok(v) = days_str.parse::<u32>() {
-                                if v > 0 {
-                                    self.cache_manager_days = v;
-                                }
-                            }
-                        }
-                        ui.label("日以上更新がないキャッシュを削除する");
-                    });
-                    ui.add_space(4.0);
-                    if ui.button(format!("  {} 日以上古いキャッシュを削除  ", self.cache_manager_days)).clicked() {
-                        let deleted = crate::catalog::delete_old_cache(&cache_dir, self.cache_manager_days as u64);
-                        let stats = crate::catalog::cache_stats(&cache_dir);
-                        self.cache_manager_stats = Some(stats);
-                        self.cache_manager_result = Some(format!("{} 件のキャッシュを削除しました。", deleted));
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // ── すべて削除 ────────────────────────────────
-                    if ui.button("  すべてのキャッシュを削除する  ").clicked() {
-                        let deleted = crate::catalog::delete_all_cache(&cache_dir);
-                        self.cache_manager_stats = Some((0, 0));
-                        self.cache_manager_result = Some(format!("{} 件のキャッシュをすべて削除しました。", deleted));
-                    }
-
-                    // ── 結果メッセージ ────────────────────────────
-                    if let Some(ref msg) = self.cache_manager_result {
-                        ui.add_space(8.0);
-                        ui.label(msg.as_str());
-                    }
-                });
-
-            if !open {
-                self.show_cache_manager = false;
-            }
-        }
-
-        // ── キャッシュ作成ポップアップ ────────────────────────────────
-        if self.show_cache_creator {
-            // 完了初回に結果メッセージをセット
-            if self.cache_creator_finished.load(Ordering::Relaxed)
-                && self.cache_creator_result.is_none()
-            {
-                let done = self.cache_creator_done.load(Ordering::Relaxed);
-                let total = self.cache_creator_total.load(Ordering::Relaxed);
-                let cancelled = self.cache_creator_cancel.load(Ordering::Relaxed);
-                self.cache_creator_result = Some(if cancelled {
-                    format!("キャンセルされました（{} / {} フォルダ処理済み）", done, total)
-                } else {
-                    format!("{} フォルダの処理が完了しました。", done)
-                });
-            }
-
-            let mut open = true;
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-            egui::Window::new("キャッシュ作成")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(500.0);
-
-                    if !self.cache_creator_running
-                        && !self.cache_creator_finished.load(Ordering::Relaxed)
-                    {
-                        // ── 選択前画面 ──
-                        ui.label("キャッシュを作成するお気に入りを選んでください：");
-                        ui.add_space(6.0);
-
-                        if self.settings.favorites.is_empty() {
-                            ui.label(egui::RichText::new("（お気に入りが未登録です）").weak());
-                        } else {
-                            for (i, fav) in self.settings.favorites.iter().enumerate() {
-                                let path_str = fav.to_string_lossy().to_string();
-                                ui.checkbox(&mut self.cache_creator_checked[i], path_str);
-                            }
-                        }
-
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        let any_checked = self.cache_creator_checked.iter().any(|&b| b);
-                        if ui
-                            .add_enabled(
-                                any_checked,
-                                egui::Button::new("  キャッシュ作成  "),
-                            )
-                            .clicked()
-                        {
-                            self.start_cache_creation();
-                        }
-                    } else {
-                        // ── 実行中 / 完了画面 ──
-                        let counting = self.cache_creator_counting.load(Ordering::Relaxed);
-                        let total = self.cache_creator_total.load(Ordering::Relaxed);
-                        let done = self.cache_creator_done.load(Ordering::Relaxed);
-                        let size = self.cache_creator_cache_size.load(Ordering::Relaxed);
-
-                        if counting {
-                            ui.label("フォルダを列挙中…");
-                        } else {
-                            ui.label(format!("フォルダ: {} / {}", done, total));
-                        }
-
-                        let current = self.cache_creator_current.lock().unwrap().clone();
-                        if !current.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!("現在: {}", current))
-                                    .weak()
-                                    .small(),
-                            );
-                        }
-
-                        ui.add_space(4.0);
-                        ui.label(format!("キャッシュ容量: {}", format_bytes(size)));
-
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        if self.cache_creator_finished.load(Ordering::Relaxed) {
-                            if let Some(ref msg) = self.cache_creator_result {
-                                ui.label(msg.as_str());
-                                ui.add_space(4.0);
-                            }
-                            if ui.button("  閉じる  ").clicked() {
-                                self.show_cache_creator = false;
-                                self.cache_creator_running = false;
-                            }
-                        } else {
-                            if ui.button("  キャンセル  ").clicked() {
-                                self.cache_creator_cancel.store(true, Ordering::Relaxed);
-                            }
-                            // リアルタイム更新のため繰り返し描画要求
-                            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                        }
-                    }
-                });
-
-            if !open {
-                if self.cache_creator_running
-                    && !self.cache_creator_finished.load(Ordering::Relaxed)
-                {
-                    self.cache_creator_cancel.store(true, Ordering::Relaxed);
-                }
-                self.show_cache_creator = false;
-                self.cache_creator_running = false;
-            }
-        }
-
-        // ── サムネイル画質設定ポップアップ ────────────────────────────
-        if self.show_thumb_quality_dialog {
-            let mut open = true;
-            let mut apply_a = false;
-            let mut apply_b = false;
-            let mut reencode_a = false;
-            let mut reencode_b = false;
-            let mut open_fs_a = false;
-            let mut open_fs_b = false;
-
-            // 実グリッドの現在のセルサイズを取得（最小値を確保してスライダーが入るように）
-            let grid_cell_w = self.last_cell_size.max(200.0);
-            let grid_cell_h = self.last_cell_h.max(150.0);
-            // ダイアログのデフォルトサイズ（2カラム + パディング）
-            let default_w = (grid_cell_w * 2.0 + 80.0).clamp(680.0, 1800.0);
-            let default_h = (grid_cell_h + 260.0).clamp(480.0, 1200.0);
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            egui::Window::new("サムネイル画質設定")
-                .open(&mut open)
-                .resizable(true)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .default_size([default_w, default_h])
-                .show(ctx, |ui| {
-                    if self.tq_sample.is_none() {
-                        ui.set_min_width(360.0);
-                        ui.label("画像を1枚選択してからもう一度お試しください。");
-                        ui.add_space(8.0);
-                        if ui.button("  閉じる  ").clicked() {
-                            self.show_thumb_quality_dialog = false;
-                        }
-                        return;
-                    }
-
-                    // サンプル画像情報
-                    if let Some(ref p) = self.tq_sample_path {
-                        ui.label(
-                            egui::RichText::new(format!("サンプル: {}", p.to_string_lossy()))
-                                .small(),
-                        );
-                    }
-                    if let Some(ref img) = self.tq_sample {
-                        let sz = self.tq_sample_original_size;
-                        let sz_str = if sz >= 1024 * 1024 {
-                            format!("{:.1} MB", sz as f64 / (1024.0 * 1024.0))
-                        } else {
-                            format!("{:.0} KB", sz as f64 / 1024.0)
-                        };
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "（元サイズ {}x{} / {}）",
-                                img.width(),
-                                img.height(),
-                                sz_str
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                    }
-
-                    // 現在のグリッド表示サイズ（サイズ選択時の参考用）
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "現在のグリッド表示サイズ: {} × {} px  （{} 列 / アスペクト比 {}）",
-                            self.last_cell_size.round() as i32,
-                            self.last_cell_h.round() as i32,
-                            self.settings.grid_cols,
-                            self.settings.thumb_aspect.label(),
-                        ))
-                        .small(),
-                    );
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // ── A / B 2 カラム ────────────────────────
-                    ui.columns(2, |cols| {
-                        // -- A --
-                        cols[0].vertical(|ui| {
-                            ui.heading("A");
-                            ui.add_space(4.0);
-                            let resp = tq_draw_preview(
-                                ui,
-                                &self.tq_a_texture,
-                                grid_cell_w,
-                                grid_cell_h,
-                            );
-                            if resp.clicked() {
-                                open_fs_a = true;
-                            }
-                            ui.add_space(6.0);
-
-                            ui.horizontal(|ui| {
-                                ui.label("サイズ:");
-                                let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_a_size, 128..=1536)
-                                        .text("px"),
-                                );
-                                if resp.drag_stopped() || resp.lost_focus() {
-                                    reencode_a = true;
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("品質:");
-                                let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_a_quality, 1..=100),
-                                );
-                                if resp.drag_stopped() || resp.lost_focus() {
-                                    reencode_a = true;
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.label(format!("{}  ({}x{})",
-                                format_bytes_small(self.tq_a_bytes as u64),
-                                self.tq_a_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
-                                self.tq_a_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
-                            ));
-                            ui.add_space(4.0);
-                            if ui.button("  A を適用  ").clicked() {
-                                apply_a = true;
-                            }
-                        });
-
-                        // -- B --
-                        cols[1].vertical(|ui| {
-                            ui.heading("B");
-                            ui.add_space(4.0);
-                            let resp = tq_draw_preview(
-                                ui,
-                                &self.tq_b_texture,
-                                grid_cell_w,
-                                grid_cell_h,
-                            );
-                            if resp.clicked() {
-                                open_fs_b = true;
-                            }
-                            ui.add_space(6.0);
-
-                            ui.horizontal(|ui| {
-                                ui.label("サイズ:");
-                                let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_b_size, 128..=1536)
-                                        .text("px"),
-                                );
-                                if resp.drag_stopped() || resp.lost_focus() {
-                                    reencode_b = true;
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("品質:");
-                                let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_b_quality, 1..=100),
-                                );
-                                if resp.drag_stopped() || resp.lost_focus() {
-                                    reencode_b = true;
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.label(format!("{}  ({}x{})",
-                                format_bytes_small(self.tq_b_bytes as u64),
-                                self.tq_b_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
-                                self.tq_b_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
-                            ));
-                            ui.add_space(4.0);
-                            if ui.button("  B を適用  ").clicked() {
-                                apply_b = true;
-                            }
-                        });
-                    });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "現在の設定: {}px / q={}",
-                            self.settings.thumb_px, self.settings.thumb_quality
-                        ));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.button("  閉じる  ").clicked() {
-                                    self.show_thumb_quality_dialog = false;
-                                }
-                            },
-                        );
-                    });
-                });
-
-            if reencode_a {
-                self.reencode_tq_panel(ctx, true);
-            }
-            if reencode_b {
-                self.reencode_tq_panel(ctx, false);
-            }
-            if open_fs_a || open_fs_b {
-                self.tq_fullscreen = true;
-                // divider 位置はリセットせず、前回の位置を維持する
-            }
-            if apply_a {
-                self.settings.thumb_px = self.tq_a_size;
-                self.settings.thumb_quality = self.tq_a_quality;
-                self.settings.save();
-                self.close_thumb_quality_dialog();
-            } else if apply_b {
-                self.settings.thumb_px = self.tq_b_size;
-                self.settings.thumb_quality = self.tq_b_quality;
-                self.settings.save();
-                self.close_thumb_quality_dialog();
-            } else if !open {
-                self.close_thumb_quality_dialog();
-            }
-        }
-
-        // ── サムネイル画質プレビュー全画面 A/B 比較オーバーレイ ────────
-        if self.tq_fullscreen {
-            let screen = ctx.content_rect();
-
-            // A・B のテクスチャ。両方とも同じソース画像から作られたサムネイルなので
-            // アスペクト比は同一。どちらかのサイズで fit 計算する。
-            let ref_size = self
-                .tq_a_texture
-                .as_ref()
-                .map(|t| t.size_vec2())
-                .or_else(|| self.tq_b_texture.as_ref().map(|t| t.size_vec2()));
-
-            // 画像表示領域を画面中央に計算（下部に情報バー分のスペースを確保）
-            let img_rect_opt: Option<egui::Rect> = ref_size.map(|rs| {
-                let margin = 40.0;
-                let info_bar_h = 80.0;
-                let avail_w = (screen.width() - margin * 2.0).max(1.0);
-                let avail_h = (screen.height() - margin * 2.0 - info_bar_h).max(1.0);
-                let scale = (avail_w / rs.x).min(avail_h / rs.y);
-                let img_size = rs * scale;
-                egui::Rect::from_center_size(
-                    egui::pos2(screen.center().x, screen.center().y - info_bar_h * 0.5),
-                    img_size,
-                )
-            });
-
-            let divider_t = self.tq_fs_divider.clamp(0.0, 1.0);
-
-            let area_resp = egui::Area::new(egui::Id::new("tq_fs_overlay"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(screen.min)
-                .show(ctx, |ui| {
-                    let (rect, response) = ui.allocate_exact_size(
-                        screen.size(),
-                        egui::Sense::click_and_drag(),
-                    );
-                    let painter = ui.painter();
-                    // 背景
-                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 20, 20));
-
-                    let Some(img_rect) = img_rect_opt else {
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "プレビューがありません",
-                            egui::FontId::proportional(18.0),
-                            egui::Color32::from_gray(200),
-                        );
-                        return response;
-                    };
-
-                    let divider_x = img_rect.min.x + img_rect.width() * divider_t;
-
-                    // A (左側) を divider まで描画
-                    if let Some(ta) = &self.tq_a_texture {
-                        let a_rect = egui::Rect::from_min_max(
-                            img_rect.min,
-                            egui::pos2(divider_x, img_rect.max.y),
-                        );
-                        let a_uv = egui::Rect::from_min_max(
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(divider_t, 1.0),
-                        );
-                        if a_rect.width() > 0.0 {
-                            painter.image(ta.id(), a_rect, a_uv, egui::Color32::WHITE);
-                        }
-                    }
-
-                    // B (右側) を divider から描画
-                    if let Some(tb) = &self.tq_b_texture {
-                        let b_rect = egui::Rect::from_min_max(
-                            egui::pos2(divider_x, img_rect.min.y),
-                            img_rect.max,
-                        );
-                        let b_uv = egui::Rect::from_min_max(
-                            egui::pos2(divider_t, 0.0),
-                            egui::pos2(1.0, 1.0),
-                        );
-                        if b_rect.width() > 0.0 {
-                            painter.image(tb.id(), b_rect, b_uv, egui::Color32::WHITE);
-                        }
-                    }
-
-                    // 画像の外枠
-                    painter.rect_stroke(
-                        img_rect,
-                        0.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
-                        egui::StrokeKind::Outside,
-                    );
-
-                    // 縦境界線
-                    painter.line_segment(
-                        [
-                            egui::pos2(divider_x, img_rect.min.y),
-                            egui::pos2(divider_x, img_rect.max.y),
-                        ],
-                        egui::Stroke::new(2.0, egui::Color32::WHITE),
-                    );
-
-                    // ドラッグハンドル（円 + 左右矢印）
-                    let handle_center = egui::pos2(divider_x, img_rect.center().y);
-                    let handle_r = 16.0;
-                    painter.circle_filled(
-                        handle_center,
-                        handle_r,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
-                    );
-                    painter.circle_stroke(
-                        handle_center,
-                        handle_r,
-                        egui::Stroke::new(2.0, egui::Color32::from_gray(60)),
-                    );
-                    painter.text(
-                        handle_center,
-                        egui::Align2::CENTER_CENTER,
-                        "◀ ▶",
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_gray(40),
-                    );
-
-                    // A / B ラベル（画像の角に半透明背景付き）
-                    let label_pad = egui::vec2(10.0, 6.0);
-                    let label_a = "A";
-                    let label_b = "B";
-                    let font = egui::FontId::proportional(24.0);
-
-                    // A ラベル（左上、divider より左にあるときのみ）
-                    if divider_t > 0.05 {
-                        let pos = egui::pos2(img_rect.min.x + 12.0, img_rect.min.y + 12.0);
-                        let galley = painter.layout_no_wrap(
-                            label_a.to_string(),
-                            font.clone(),
-                            egui::Color32::WHITE,
-                        );
-                        let bg_rect = egui::Rect::from_min_size(
-                            pos,
-                            galley.size() + label_pad * 2.0,
-                        );
-                        painter.rect_filled(
-                            bg_rect,
-                            4.0,
-                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
-                        );
-                        painter.galley(pos + label_pad, galley, egui::Color32::WHITE);
-                    }
-
-                    // B ラベル（右上、divider より右にあるときのみ）
-                    if divider_t < 0.95 {
-                        let galley = painter.layout_no_wrap(
-                            label_b.to_string(),
-                            font.clone(),
-                            egui::Color32::WHITE,
-                        );
-                        let bg_size = galley.size() + label_pad * 2.0;
-                        let pos = egui::pos2(
-                            img_rect.max.x - 12.0 - bg_size.x,
-                            img_rect.min.y + 12.0,
-                        );
-                        let bg_rect = egui::Rect::from_min_size(pos, bg_size);
-                        painter.rect_filled(
-                            bg_rect,
-                            4.0,
-                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
-                        );
-                        painter.galley(pos + label_pad, galley, egui::Color32::WHITE);
-                    }
-
-                    // 情報バー（画像下）
-                    let info_base_y = img_rect.max.y + 24.0;
-                    let a_info = format!(
-                        "A:  {}px  /  q={}  /  {}",
-                        self.tq_a_size,
-                        self.tq_a_quality,
-                        format_bytes_small(self.tq_a_bytes as u64),
-                    );
-                    let b_info = format!(
-                        "B:  {}px  /  q={}  /  {}",
-                        self.tq_b_size,
-                        self.tq_b_quality,
-                        format_bytes_small(self.tq_b_bytes as u64),
-                    );
-                    let info_font = egui::FontId::proportional(14.0);
-                    painter.text(
-                        egui::pos2(rect.center().x - 24.0, info_base_y),
-                        egui::Align2::RIGHT_CENTER,
-                        a_info,
-                        info_font.clone(),
-                        egui::Color32::from_rgb(150, 200, 255),
-                    );
-                    painter.text(
-                        egui::pos2(rect.center().x + 24.0, info_base_y),
-                        egui::Align2::LEFT_CENTER,
-                        b_info,
-                        info_font.clone(),
-                        egui::Color32::from_rgb(255, 220, 150),
-                    );
-                    painter.text(
-                        egui::pos2(rect.center().x, info_base_y + 24.0),
-                        egui::Align2::CENTER_CENTER,
-                        "ドラッグで境界線を移動  /  クリック または ESC で戻る",
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_gray(180),
-                    );
-
-                    response
-                });
-
-            // ドラッグ → divider を更新
-            if area_resp.inner.dragged() {
-                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                    if let Some(img_rect) = img_rect_opt {
-                        if img_rect.width() > 0.0 {
-                            let t = ((pos.x - img_rect.min.x) / img_rect.width())
-                                .clamp(0.0, 1.0);
-                            self.tq_fs_divider = t;
-                            ctx.request_repaint();
-                        }
-                    }
-                }
-            }
-
-            // 画像上にホバーしているときはリサイズ左右カーソル
-            if let Some(img_rect) = img_rect_opt {
-                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                    if img_rect.contains(pos) {
-                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-                }
-            }
-
-            // ドラッグしていないクリック → 閉じる
-            let clicked = area_resp.inner.clicked();
-            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            if clicked || esc {
-                self.tq_fullscreen = false;
-            }
-        }
-
-        // ── 環境設定ポップアップ ─────────────────────────────────────
-        if self.show_preferences {
-            let mut open = true;
-            let mut apply = false;
-            let mut cancel = false;
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            egui::Window::new("環境設定")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(420.0);
-
-                    ui.heading("並列読み込み");
-                    ui.add_space(4.0);
-
-                    let is_auto = self.settings.parallelism == crate::settings::Parallelism::Auto;
-                    let auto_count = {
-                        let cores = std::thread::available_parallelism()
-                            .map(|n| n.get()).unwrap_or(2);
-                        (cores / 2).max(1)
-                    };
-
-                    if ui.radio(is_auto, format!("自動（CPUコア数の半分: {} スレッド）", auto_count)).clicked() {
-                        self.settings.parallelism = crate::settings::Parallelism::Auto;
-                    }
-
-                    ui.horizontal(|ui| {
-                        if ui.radio(!is_auto, "手動").clicked() {
-                            self.settings.parallelism =
-                                crate::settings::Parallelism::Manual(self.pref_manual_threads);
-                        }
-                        ui.add_enabled(
-                            !is_auto,
-                            egui::DragValue::new(&mut self.pref_manual_threads)
-                                .range(1..=64)
-                                .suffix(" スレッド"),
-                        );
-                        if !is_auto {
-                            self.settings.parallelism =
-                                crate::settings::Parallelism::Manual(self.pref_manual_threads);
-                        }
-                    });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    ui.heading("フルサイズ画像の先読み");
-                    ui.add_space(4.0);
-                    ui.label("フルサイズ表示時に前後の画像を先読みする枚数（各最大 50 枚）。");
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("後方（前の画像）:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.prefetch_back)
-                                .range(0..=50usize)
-                                .suffix(" 枚"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("前方（次の画像）:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.prefetch_forward)
-                                .range(0..=50usize)
-                                .suffix(" 枚"),
-                        );
-                    });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    ui.heading("サムネイルの先読み");
-                    ui.add_space(4.0);
-                    ui.label(
-                        "サムネイルグリッドで現在位置の前後に何ページ分を GPU に保持するか。\n\
-                         範囲外はメモリから破棄され、スクロールで戻ると再読み込みされます。",
-                    );
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("後方（前のページ）:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.thumb_prev_pages)
-                                .range(0..=20u32)
-                                .suffix(" ページ"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("前方（次のページ）:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.thumb_next_pages)
-                                .range(0..=20u32)
-                                .suffix(" ページ"),
-                        );
-                    });
-
-                    ui.add_space(6.0);
-                    // プライマリ GPU の VRAM を問い合わせて表示に使う
-                    let vram_mib = crate::gpu_info::query_vram_summary_mib();
-                    let vram_label = match vram_mib {
-                        Some(mib) if mib >= 1024 => {
-                            format!("{:.1} GiB", mib as f64 / 1024.0)
-                        }
-                        Some(mib) => format!("{} MiB", mib),
-                        None => "取得失敗 (4 GiB 仮定)".to_string(),
-                    };
-                    ui.label(format!(
-                        "GPU メモリ上限 (安全ネット):\n\
-                         超過時は先読み範囲を自動的に縮小します。\n\
-                         検出した GPU の VRAM: {vram_label}",
-                    ));
-
-                    ui.horizontal(|ui| {
-                        ui.label("上限:");
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.settings.thumb_vram_cap_percent,
-                                0..=100u32,
-                            )
-                            .step_by(5.0)
-                            .suffix(" %"),
-                        );
-                    });
-
-                    // 現在の % が実際に何 MiB に相当するかを補助表示
-                    {
-                        let pct = self.settings.thumb_vram_cap_percent;
-                        let text = if pct == 0 {
-                            "  ↑ 0% = 無制限 (推奨しない)".to_string()
-                        } else {
-                            let cap_mib = crate::gpu_info::vram_cap_from_percent(pct)
-                                / (1024 * 1024);
-                            format!(
-                                "  ↑ VRAM の {}% = 約 {} MiB を上限とします (推奨: 50%)",
-                                pct, cap_mib
-                            )
-                        };
-                        ui.label(text);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.checkbox(
-                        &mut self.settings.thumb_idle_upgrade,
-                        "アイドル時にキャッシュ由来のサムネイルを高画質化する",
-                    );
-                    ui.label(
-                        "  ↑ スクロール停止後、キャッシュ復元 (WebP q=75) のサムネイルを\n    \
-                         元画像から再デコードして差し替えます。visible 側から順次処理。",
-                    );
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    ui.heading("フォルダ移動");
-                    ui.add_space(4.0);
-                    ui.label("Ctrl+↑↓ で移動先フォルダに画像がない場合、自動でスキップする最大回数。");
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("空フォルダのスキップ上限:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.folder_skip_limit)
-                                .range(1..=10usize)
-                                .suffix(" 回"),
-                        );
-                    });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("  OK  ").clicked() {
-                            apply = true;
-                        }
-                        if ui.button("キャンセル").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-
-            if apply {
-                self.settings.save();
-                self.show_preferences = false;
-            } else if cancel || !open {
-                // キャンセル/×ボタン: 変更を破棄するため再ロード
-                self.settings = crate::settings::Settings::load();
-                self.show_preferences = false;
-            }
-        }
-
-        // ── キャッシュ生成設定ポップアップ (段階 C) ─────────────────────
-        if self.show_cache_policy_dialog {
-            let mut open = true;
-            let mut apply = false;
-            let mut cancel = false;
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            egui::Window::new("キャッシュ生成設定")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(480.0);
-
-                    ui.label(
-                        "サムネイルキャッシュをいつ生成するかを指定します。\n\
-                         リリースビルドではキャッシュが無くても十分高速ですが、\n\
-                         重い画像や巨大ファイルはキャッシュすると再訪問時に高速化します。\n\
-                         Off にしても既存のキャッシュは引き続き読み込まれます。",
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    ui.heading("モード");
-                    ui.add_space(4.0);
-                    for policy in [
-                        crate::settings::CachePolicy::Off,
-                        crate::settings::CachePolicy::Auto,
-                        crate::settings::CachePolicy::Always,
-                    ] {
-                        if ui
-                            .radio(
-                                self.settings.cache_policy == policy,
-                                policy.label(),
-                            )
-                            .clicked()
-                        {
-                            self.settings.cache_policy = policy;
-                        }
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // Auto モード時のみ以下の項目を活性化
-                    let auto_active =
-                        self.settings.cache_policy == crate::settings::CachePolicy::Auto;
-
-                    ui.add_enabled_ui(auto_active, |ui| {
-                        ui.heading("Auto モードのしきい値");
-                        ui.add_space(4.0);
-
-                        ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.settings.cache_threshold_ms,
-                                10..=100,
-                            )
-                            .step_by(5.0)
-                            .suffix(" ms"),
-                        );
-                        ui.label("  小さいほど多くキャッシュ。25 ms 推奨。");
-
-                        ui.add_space(8.0);
-
-                        // サイズしきい値を MB 単位で編集
-                        ui.label("サイズしきい値 (このサイズ以上は無条件キャッシュ):");
-                        let mut size_mb =
-                            (self.settings.cache_size_threshold_bytes as f64) / 1_000_000.0;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut size_mb, 0.5..=10.0)
-                                    .step_by(0.5)
-                                    .suffix(" MB"),
-                            )
-                            .changed()
-                        {
-                            self.settings.cache_size_threshold_bytes =
-                                (size_mb * 1_000_000.0) as u64;
-                        }
-                        ui.label("  2 MB 推奨。これ以上の重い画像が確実にキャッシュされます。");
-
-                        ui.add_space(8.0);
-
-                        ui.checkbox(
-                            &mut self.settings.cache_webp_always,
-                            "既存 .webp は常にキャッシュ (デコードが重いため推奨)",
-                        );
-                    });
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("  OK  ").clicked() {
-                            apply = true;
-                        }
-                        if ui.button("キャンセル").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-
-            if apply {
-                self.settings.save();
-                self.show_cache_policy_dialog = false;
-            } else if cancel || !open {
-                // キャンセル/×ボタン: 変更を破棄するため再ロード
-                self.settings = crate::settings::Settings::load();
-                self.show_cache_policy_dialog = false;
-            }
-        }
-
-        // ── 統計ダイアログ ──────────────────────────────────────────
-        if self.show_stats_dialog {
-            let mut open = true;
-            let mut reset_clicked = false;
-            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-
-            // スナップショットを取得 (ロック時間を最小化)
-            let snapshot: crate::stats::ThumbStats = {
-                self.stats.lock().map(|s| s.clone()).unwrap_or_default()
-            };
-
-            egui::Window::new("統計")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_pos(dialog_pos)
-                .show(ctx, |ui| {
-                    ui.set_min_width(520.0);
-                    ui.label(
-                        "起動時から累計したサムネイル読み込み統計です。\n\
-                         キャッシュ生成設定の参考にしてください。\n\
-                         (キャッシュヒットは対象外。フルデコード時のみ記録)",
-                    );
-                    ui.add_space(8.0);
-
-                    // ── 読み込み時間ヒストグラム ──
-                    ui.heading("読み込み時間 (decode + display)");
-                    ui.add_space(4.0);
-                    draw_histogram(
-                        ui,
-                        &snapshot.load_time_hist,
-                        |bucket| crate::stats::ThumbStats::load_time_label(bucket),
-                    );
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // ── ファイルサイズヒストグラム ──
-                    ui.heading("ファイルサイズ");
-                    ui.add_space(4.0);
-                    draw_histogram(
-                        ui,
-                        &snapshot.size_hist,
-                        |bucket| crate::stats::ThumbStats::size_label(bucket),
-                    );
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // ── フォーマット別件数 ──
-                    ui.heading("フォーマット");
-                    ui.add_space(4.0);
-                    let format_rows: [(&str, u64); 7] = [
-                        ("JPEG  ", snapshot.count_jpg),
-                        ("PNG   ", snapshot.count_png),
-                        ("WebP  ", snapshot.count_webp),
-                        ("GIF   ", snapshot.count_gif),
-                        ("BMP   ", snapshot.count_bmp),
-                        ("動画  ", snapshot.count_video),
-                        ("その他", snapshot.count_other),
-                    ];
-                    draw_format_rows(ui, &format_rows);
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    // ── サマリ ──
-                    let total_images = snapshot.total_images();
-                    let total_all = total_images + snapshot.count_video;
-                    ui.label(format!(
-                        "合計: {} 件  (画像 {} / 動画 {} / 失敗 {})",
-                        format_count(total_all),
-                        format_count(total_images),
-                        format_count(snapshot.count_video),
-                        format_count(snapshot.count_failed),
-                    ));
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("リセット").clicked() {
-                            reset_clicked = true;
-                        }
-                        if ui.button("閉じる").clicked() {
-                            // open = false でダイアログを閉じる
-                        }
-                    });
-                });
-
-            if reset_clicked {
-                if let Ok(mut s) = self.stats.lock() {
-                    s.reset();
-                }
-            }
-            if !open {
-                self.show_stats_dialog = false;
-            }
-        }
-
+        self.show_favorites_editor_dialog(ctx);
+        self.show_cache_manager_dialog(ctx);
+        self.show_cache_creator_dialog(ctx);
+        self.show_thumb_quality_dialog_window(ctx);
+        self.show_thumb_quality_fullscreen_overlay(ctx);
+        self.show_preferences_dialog(ctx);
+        self.show_cache_policy_dialog(ctx);
+        self.show_stats_dialog_window(ctx);
         // ── ツールバー（列数・アスペクト比・ソート順の即時切り替え）──
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
