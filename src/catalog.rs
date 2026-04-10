@@ -5,8 +5,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
-const CATALOG_VERSION: &str = "1";
-const JPEG_QUALITY: u8 = 80;
+const CATALOG_VERSION: &str = "2";
 pub const THUMB_LONG_SIDE: u32 = 512;
 
 // -----------------------------------------------------------------------
@@ -164,25 +163,28 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 // -----------------------------------------------------------------------
-// JPEG エンコード・デコードヘルパー
+// WebP エンコード・デコードヘルパー
 // -----------------------------------------------------------------------
 
-/// 画像を `long_side` px にリサイズし、JPEG q=80 でエンコードする。
-/// 戻り値: (jpeg_bytes, width, height)
-pub fn encode_thumb_jpeg(img: &image::DynamicImage, long_side: u32) -> Option<(Vec<u8>, u32, u32)> {
-    use image::ImageEncoder;
+/// 画像を `long_side` px にリサイズし、ロッシー WebP でエンコードする。
+/// `quality` は 0.0–100.0 (JPEG の quality と同等の意味)。
+/// 戻り値: (webp_bytes, width, height)
+pub fn encode_thumb_webp(
+    img: &image::DynamicImage,
+    long_side: u32,
+    quality: f32,
+) -> Option<(Vec<u8>, u32, u32)> {
     let thumb = img.resize(long_side, long_side, image::imageops::FilterType::Lanczos3);
     let rgb = thumb.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
-    let mut buf = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY)
-        .write_image(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8)
-        .ok()?;
-    Some((buf, w, h))
+    let encoder = webp::Encoder::from_rgb(rgb.as_raw(), w, h);
+    let webp_data = encoder.encode(quality.clamp(1.0, 100.0));
+    Some((webp_data.to_vec(), w, h))
 }
 
-/// JPEG バイト列を egui::ColorImage にデコードする。
-pub fn jpeg_to_color_image(data: &[u8]) -> Option<egui::ColorImage> {
+/// キャッシュされたサムネイル (WebP あるいは旧 JPEG) を egui::ColorImage にデコードする。
+/// `image::load_from_memory` が自動でフォーマット判定するため両対応。
+pub fn decode_thumb_to_color_image(data: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(data).ok()?;
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];

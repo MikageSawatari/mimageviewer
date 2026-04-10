@@ -2,6 +2,7 @@
 
 mod app;
 pub mod catalog;
+pub mod gpu_info;
 pub mod logger;
 pub mod monitor;
 pub mod settings;

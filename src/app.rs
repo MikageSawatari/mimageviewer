@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 
@@ -32,10 +32,25 @@ impl GridItem {
 }
 
 pub enum ThumbnailState {
+    /// まだロードされていない
     Pending,
-    Loaded(egui::TextureHandle),
+    /// 読み込み済みで GPU テクスチャとして保持中
+    ///
+    /// `from_cache = true` の場合は WebP キャッシュ (q=75) から復元した状態で、
+    /// 段階 E のアイドル時アップグレードで元画像から再デコードされる対象になる。
+    /// `rendered_at_px` は生成時の長辺ピクセル数で、現在のセルサイズと比較して
+    /// 著しく小さい場合 (列数変更後など) もアップグレード対象になる。
+    Loaded {
+        tex: egui::TextureHandle,
+        from_cache: bool,
+        rendered_at_px: u32,
+    },
+    /// 読み込みに失敗した（再試行しない）
     #[allow(dead_code)]
     Failed,
+    /// 段階 B: 先読み範囲外に出て GPU テクスチャを破棄済み
+    /// 再び範囲内に入ったら再ロードされる
+    Evicted,
 }
 
 /// フルスクリーン読み込みスレッドからUIスレッドへ送るメッセージ
@@ -67,8 +82,8 @@ pub struct App {
     thumbnails: Vec<ThumbnailState>,
     selected: Option<usize>,
     settings: crate::settings::Settings,
-    tx: mpsc::Sender<(usize, Option<egui::ColorImage>)>,
-    rx: mpsc::Receiver<(usize, Option<egui::ColorImage>)>,
+    tx: mpsc::Sender<ThumbMsg>,
+    rx: mpsc::Receiver<ThumbMsg>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
     cancel_token: Arc<AtomicBool>,
     /// Phase 2b ワーカーが参照する現在の可視先頭アイテムインデックス
@@ -96,6 +111,25 @@ pub struct App {
     /// キャッシュ生成進捗：完了した枚数（rayon スレッドからアトミックに更新）
     cache_gen_done: Arc<AtomicUsize>,
 
+    // ── 段階 B: ページ単位先読み / eviction ──────────────────────
+    /// アイテム idx → 画像メタデータ (mtime, file_size)。フォルダ・動画は None
+    image_metas: Vec<Option<(i64, i64)>>,
+    /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
+    reload_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
+    /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）
+    requested: std::collections::HashSet<usize>,
+    /// 現在の keep range [start, end)。update_keep_range で毎フレーム更新
+    keep_range: (usize, usize),
+
+    // ── 段階 E: アイドル時の画質向上 ─────────────────────────────
+    /// 前フレームでの scroll_offset_y（変化検知用）
+    last_scroll_offset_y_tracked: f32,
+    /// 最後にスクロールが動いた瞬間の時刻（アイドル検出用）
+    last_scroll_change_time: std::time::Instant,
+    /// UI とワーカー間で共有する現在の display_px (列数変更時に追従させる)
+    /// update_keep_range_and_requests で毎フレーム更新される。
+    display_px_shared: Arc<AtomicU32>,
+
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
     fullscreen_idx: Option<usize>,
@@ -112,6 +146,9 @@ pub struct App {
     /// 環境設定ダイアログ内の一時的な並列度編集値（Manual時の数値）
     pref_manual_threads: usize,
 
+    // ── キャッシュ生成設定ポップアップ (段階 C) ──────────────────
+    show_cache_policy_dialog: bool,
+
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     show_cache_manager: bool,
     /// キャッシュ管理の「◯日以上古い」入力値
@@ -120,6 +157,61 @@ pub struct App {
     cache_manager_stats: Option<(usize, u64)>,
     /// 削除後の結果メッセージ
     cache_manager_result: Option<String>,
+
+    // ── 最後に選択した画像 (サムネイル画質ダイアログで使用) ──
+    last_selected_image_path: Option<PathBuf>,
+
+    // ── サムネイル画質設定ダイアログ ───────────────────────────
+    show_thumb_quality_dialog: bool,
+    /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)
+    tq_sample: Option<image::DynamicImage>,
+    /// サンプル画像のパス表示用
+    tq_sample_path: Option<PathBuf>,
+    /// サンプル画像の元ファイルサイズ (bytes)
+    tq_sample_original_size: u64,
+    /// パネル A: サイズ (long side px)
+    tq_a_size: u32,
+    /// パネル A: 品質 (1–100)
+    tq_a_quality: u8,
+    /// パネル A: プレビューテクスチャ
+    tq_a_texture: Option<egui::TextureHandle>,
+    /// パネル A: エンコード後のバイト数
+    tq_a_bytes: usize,
+    /// パネル B: サイズ
+    tq_b_size: u32,
+    /// パネル B: 品質
+    tq_b_quality: u8,
+    /// パネル B: プレビューテクスチャ
+    tq_b_texture: Option<egui::TextureHandle>,
+    /// パネル B: エンコード後のバイト数
+    tq_b_bytes: usize,
+    /// true = A/B 比較の全画面オーバーレイ表示中
+    tq_fullscreen: bool,
+    /// 全画面 A/B 比較時の縦線位置（0.0=すべて B、1.0=すべて A、中央は 0.5）
+    tq_fs_divider: f32,
+
+    // ── キャッシュ作成ポップアップ ───────────────────────────────
+    show_cache_creator: bool,
+    /// 各お気に入りのチェック状態（settings.favorites と同じ長さ）
+    cache_creator_checked: Vec<bool>,
+    /// 実行中フラグ（UI ボタンの有効/無効とポーリング制御）
+    cache_creator_running: bool,
+    /// カウントフェーズ中フラグ（total 未確定）
+    cache_creator_counting: Arc<AtomicBool>,
+    /// 対象フォルダ総数（Pass 1 完了後に確定）
+    cache_creator_total: Arc<AtomicUsize>,
+    /// 処理済みフォルダ数
+    cache_creator_done: Arc<AtomicUsize>,
+    /// キャッシュ容量 (バイト単位、累積加算)
+    cache_creator_cache_size: Arc<AtomicU64>,
+    /// キャンセルトークン
+    cache_creator_cancel: Arc<AtomicBool>,
+    /// 現在処理中のフォルダパス表示用
+    cache_creator_current: Arc<Mutex<String>>,
+    /// 完了シグナル（表示切替用）
+    cache_creator_finished: Arc<AtomicBool>,
+    /// 完了後のメッセージ
+    cache_creator_result: Option<String>,
 
     // ── アドレスバーフォーカス管理 ───────────────────────────────
     /// true のときアドレスバーが入力中 → キーショートカットを無効化
@@ -156,16 +248,50 @@ impl Default for App {
             last_pixels_per_point: 1.0,
             cache_gen_total: 0,
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
+            image_metas: Vec::new(),
+            reload_queue: None,
+            requested: std::collections::HashSet::new(),
+            keep_range: (0, 0),
+            last_scroll_offset_y_tracked: 0.0,
+            last_scroll_change_time: std::time::Instant::now(),
+            display_px_shared: Arc::new(AtomicU32::new(512)),
             fullscreen_idx: None,
             fs_cache: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
             show_favorites_editor: false,
             show_preferences: false,
             pref_manual_threads: 4,
+            show_cache_policy_dialog: false,
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,
             cache_manager_result: None,
+            last_selected_image_path: None,
+            show_thumb_quality_dialog: false,
+            tq_sample: None,
+            tq_sample_path: None,
+            tq_sample_original_size: 0,
+            tq_a_size: 512,
+            tq_a_quality: 75,
+            tq_a_texture: None,
+            tq_a_bytes: 0,
+            tq_b_size: 512,
+            tq_b_quality: 85,
+            tq_b_texture: None,
+            tq_b_bytes: 0,
+            tq_fullscreen: false,
+            tq_fs_divider: 0.5,
+            show_cache_creator: false,
+            cache_creator_checked: Vec::new(),
+            cache_creator_running: false,
+            cache_creator_counting: Arc::new(AtomicBool::new(false)),
+            cache_creator_total: Arc::new(AtomicUsize::new(0)),
+            cache_creator_done: Arc::new(AtomicUsize::new(0)),
+            cache_creator_cache_size: Arc::new(AtomicU64::new(0)),
+            cache_creator_cancel: Arc::new(AtomicBool::new(false)),
+            cache_creator_current: Arc::new(Mutex::new(String::new())),
+            cache_creator_finished: Arc::new(AtomicBool::new(false)),
+            cache_creator_result: None,
             address_has_focus: false,
             folder_history: std::collections::HashMap::new(),
             initialized: false,
@@ -264,6 +390,23 @@ impl App {
             }
         }
         self.thumbnails = (0..self.items.len()).map(|_| ThumbnailState::Pending).collect();
+        self.requested.clear();
+        self.keep_range = (0, 0);
+
+        // 段階 B: アイテム idx と並行する画像メタデータ配列を構築
+        // フォルダと動画は None、画像は Some((mtime, file_size))
+        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(self.items.len());
+        for _ in 0..folder_count {
+            image_metas.push(None);
+        }
+        for (_, is_video, mtime, file_size) in &all_media {
+            if *is_video {
+                image_metas.push(None);
+            } else {
+                image_metas.push(Some((*mtime, *file_size)));
+            }
+        }
+        self.image_metas = image_metas;
 
         // 動画サムネイル用リスト: (item_idx, path)
         let video_items: Vec<(usize, PathBuf)> = all_media.iter()
@@ -273,8 +416,7 @@ impl App {
             })
             .collect();
 
-        // 画像リスト（カタログ処理用）: (item_idx, path, mtime, file_size)
-        // item_idx は all_media 内の位置 + folder_count（動画と混在）
+        // 画像リスト（カタログ掃除用）: (item_idx, path, mtime, file_size)
         let images: Vec<(usize, PathBuf, i64, i64)> = all_media.iter()
             .enumerate()
             .filter_map(|(i, (p, is_video, mtime, file_size))| {
@@ -290,34 +432,16 @@ impl App {
                 .ok()
                 .map(std::sync::Arc::new);
 
-        let cache_map = if let Some(ref cat) = catalog_arc {
-            cat.load_all().unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        };
+        // 段階 B: 全キャッシュを Arc<HashMap> として一括ロードし、
+        // 永続ワーカー群で共有する
+        let cache_map: Arc<std::collections::HashMap<String, crate::catalog::CacheEntry>> =
+            Arc::new(
+                catalog_arc
+                    .as_ref()
+                    .and_then(|c| c.load_all().ok())
+                    .unwrap_or_default(),
+            );
         crate::logger::log(format!("  catalog: {} entries in DB", cache_map.len()));
-
-        // ── キャッシュ済み / 要デコードに分類 ────────────────────────
-        // cached:      (item_idx, jpeg_data)
-        // needs_decode: (item_idx, path, mtime, file_size)
-        let mut cached: Vec<(usize, Vec<u8>)> = Vec::new();
-        let mut needs_decode: Vec<(usize, PathBuf, i64, i64)> = Vec::new();
-
-        for (item_idx, img_path, mtime, file_size) in images.iter() {
-            let filename = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if let Some(entry) = cache_map.get(filename) {
-                if entry.mtime == *mtime && entry.file_size == *file_size {
-                    cached.push((*item_idx, entry.jpeg_data.clone()));
-                    continue;
-                }
-            }
-            needs_decode.push((*item_idx, img_path.clone(), *mtime, *file_size));
-        }
-        crate::logger::log(format!(
-            "  catalog: {} cached hits, {} need decode",
-            cached.len(),
-            needs_decode.len()
-        ));
 
         // 削除済みファイルのエントリを DB から掃除
         if let Some(ref cat) = catalog_arc {
@@ -330,125 +454,99 @@ impl App {
             }
         }
 
-        // ── 可視範囲優先に4分割 ───────────────────────────────────────
-        let cols = self.settings.grid_cols.max(1);
-        let cell_h = self.last_cell_h.max(1.0);
-        let first_vis_item = (self.scroll_offset_y / cell_h) as usize * cols;
-        let vis_rows = (self.last_viewport_h / cell_h).ceil() as usize + 1;
-        let last_vis_item = first_vis_item + vis_rows * cols;
-
-        let is_visible = |i: usize| i >= first_vis_item && i < last_vis_item;
-
-        let (vis_cached, rest_cached): (Vec<_>, Vec<_>) =
-            cached.into_iter().partition(|(i, _)| is_visible(*i));
-        let (vis_needs, rest_needs): (Vec<_>, Vec<_>) =
-            needs_decode.into_iter().partition(|(i, _, _, _)| is_visible(*i));
-
-        crate::logger::log(format!(
-            "  visible: {} cached + {} new  |  rest: {} cached + {} new",
-            vis_cached.len(), vis_needs.len(), rest_cached.len(), rest_needs.len()
-        ));
-
         // ── 進捗カウンタをリセット ────────────────────────────────────
-        // needs_decode の合計枚数を記録し、完了するたびにインクリメントする
-        self.cache_gen_total = vis_needs.len() + rest_needs.len();
+        // 段階 B: 総数は動的になるので cache_gen_total は 0 にしておき、
+        // タイトルバーには in-flight 件数を表示する
+        self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
 
-        // フォルダごとに新規プールを作成する（旧フォルダのタスクと競合しない）
+        // ── 永続ワーカーのセットアップ (段階 B) ───────────────────────
+        // 共有要求キュー: UI スレッドが push、ワーカーが pop する
+        let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+
         let thumb_threads = self.settings.parallelism.thread_count();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(thumb_threads)
-            .build()
-            .expect("スレッドプール作成失敗");
-        crate::logger::log(format!("  new thread pool created ({thumb_threads} threads)"));
+        crate::logger::log(format!("  spawning {thumb_threads} persistent workers"));
 
-        // Phase 2b 用: スクロール位置に応じて動的優先度を付けるキュー
-        // UIスレッドが scroll_hint を毎フレーム更新し、ワーカーが最近傍アイテムを選ぶ
+        // ワーカーに渡すパラメータ
         let scroll_hint = Arc::clone(&self.scroll_hint);
-        let rest_queue: Arc<Mutex<Vec<(usize, PathBuf, i64, i64)>>> =
-            Arc::new(Mutex::new(rest_needs));
-
-        // 動画サムネイルスレッド用に先にクローンしておく（画像スレッドが move する前に）
         let tx_for_video = tx.clone();
         let cancel_for_video = Arc::clone(&cancel);
         let thumb_px = self.settings.thumb_px;
+        let thumb_quality = self.settings.thumb_quality;
+        // 表示用 ColorImage の解像度を現在のセルサイズから算出 (段階 A)
+        // Arc<AtomicU32> に格納してワーカー間で共有。列数変更時も追従させる。
+        let initial_display_px = compute_display_px(
+            self.last_cell_size,
+            self.last_cell_h,
+            self.last_pixels_per_point,
+        );
+        self.display_px_shared
+            .store(initial_display_px, Ordering::Relaxed);
+        // キャッシュ生成判定パラメータ (段階 C)
+        let cache_decision = CacheDecision::from_settings(&self.settings);
+        crate::logger::log(format!(
+            "  display_px = {initial_display_px}  cache_policy = {}",
+            self.settings.cache_policy.label()
+        ));
 
-        std::thread::spawn(move || {
-            pool.install(|| {
-                use rayon::prelude::*;
+        // 永続ワーカーを spawn（cancel されるまで reload_queue をポーリングし続ける）
+        for worker_idx in 0..thumb_threads {
+            let queue = Arc::clone(&reload_queue);
+            let tx_w = tx.clone();
+            let cancel_w = Arc::clone(&cancel);
+            let hint_w = Arc::clone(&scroll_hint);
+            let cache_map_w = Arc::clone(&cache_map);
+            let catalog_w = catalog_arc.clone();
+            let done_w = Arc::clone(&cache_gen_done);
+            let display_px_w = Arc::clone(&self.display_px_shared);
 
-                // Phase 1a: 可視 × キャッシュ済み（JPEG デコードのみ、最速）
-                let t = std::time::Instant::now();
-                crate::logger::log(format!("  [1a vis-cached ] START {}", vis_cached.len()));
-                vis_cached.par_iter().for_each(|(i, jpeg_data)| {
-                    if cancel.load(Ordering::Relaxed) { return; }
-                    let ci = crate::catalog::jpeg_to_color_image(jpeg_data);
-                    let _ = tx.send((*i, ci));
-                });
-                crate::logger::log(format!("  [1a vis-cached ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
+            std::thread::spawn(move || {
+                crate::logger::log(format!("  worker {worker_idx} started"));
+                loop {
+                    if cancel_w.load(Ordering::Relaxed) { break; }
 
-                // Phase 1b: 可視 × 未キャッシュ（ファイルデコード）
-                let t = std::time::Instant::now();
-                crate::logger::log(format!("  [1b vis-new    ] START {}", vis_needs.len()));
-                vis_needs.par_iter().for_each(|(i, path, mtime, file_size)| {
-                    if cancel.load(Ordering::Relaxed) { return; }
-                    load_one_cached(path, *i, &tx, catalog_arc.as_deref(), *mtime, *file_size, &cache_gen_done, thumb_px);
-                });
-                crate::logger::log(format!("  [1b vis-new    ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
-
-                // Phase 2a: 残り × キャッシュ済み（JPEG デコードのみ、高速なので全件 par_iter）
-                let t = std::time::Instant::now();
-                crate::logger::log(format!("  [2a rest-cached] START {}", rest_cached.len()));
-                rest_cached.par_iter().for_each(|(i, jpeg_data)| {
-                    if cancel.load(Ordering::Relaxed) { return; }
-                    let ci = crate::catalog::jpeg_to_color_image(jpeg_data);
-                    let _ = tx.send((*i, ci));
-                });
-                crate::logger::log(format!("  [2a rest-cached] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
-
-                // Phase 2b: 残り × 未キャッシュ（動的優先度キュー）
-                // ワーカーが scroll_hint に最も近いアイテムを都度選ぶことで
-                // ユーザーがスクロールしても現在表示中の行を優先してデコードする
-                {
-                    let total = rest_queue.lock().unwrap().len();
-                    let t = std::time::Instant::now();
-                    crate::logger::log(format!("  [2b rest-new   ] START {total}"));
-                    rayon::scope(|s| {
-                        for _ in 0..thumb_threads {
-                            let queue = Arc::clone(&rest_queue);
-                            let tx2 = tx.clone();
-                            let cancel2 = Arc::clone(&cancel);
-                            let hint2 = Arc::clone(&scroll_hint);
-                            let cat2 = catalog_arc.clone();
-                            let done2 = Arc::clone(&cache_gen_done);
-                            s.spawn(move |_| {
-                                loop {
-                                    if cancel2.load(Ordering::Relaxed) { break; }
-                                    let item = {
-                                        let mut q = queue.lock().unwrap();
-                                        if q.is_empty() { break; }
-                                        let vis = hint2.load(Ordering::Relaxed);
-                                        // 現在の可視先頭に最も近いインデックスを選択
-                                        let best = q.iter().enumerate()
-                                            .min_by_key(|(_, (i, _, _, _))| {
-                                                let i = *i;
-                                                if i < vis { vis - i } else { i - vis }
-                                            })
-                                            .map(|(idx, _)| idx)
-                                            .unwrap(); // q が空でないことは確認済み
-                                        q.swap_remove(best)
-                                    };
-                                    if cancel2.load(Ordering::Relaxed) { break; }
-                                    load_one_cached(&item.1, item.0, &tx2, cat2.as_deref(), item.2, item.3, &done2, thumb_px);
-                                }
-                            });
+                    // 可視先頭に最も近い要求を選ぶ
+                    let req_opt: Option<LoadRequest> = {
+                        let mut q = queue.lock().unwrap();
+                        if q.is_empty() {
+                            None
+                        } else {
+                            let vis = hint_w.load(Ordering::Relaxed);
+                            let best = q
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, r)| {
+                                    let i = r.idx;
+                                    if i < vis { vis - i } else { i - vis }
+                                })
+                                .map(|(pos, _)| pos)
+                                .unwrap();
+                            Some(q.swap_remove(best))
                         }
-                    });
-                    crate::logger::log(format!("  [2b rest-new   ] END {:.0}ms", t.elapsed().as_secs_f64() * 1000.0));
+                    };
+
+                    match req_opt {
+                        Some(req) => {
+                            if cancel_w.load(Ordering::Relaxed) { break; }
+                            // ワーカーは各リクエスト処理直前に現在の display_px を読む
+                            // → 列数変更で UI が値を更新したら即追従
+                            let display_px = display_px_w.load(Ordering::Relaxed);
+                            process_load_request(
+                                &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
+                                thumb_px, thumb_quality, display_px, cache_decision, &done_w,
+                            );
+                        }
+                        None => {
+                            // キューが空: 短時間スリープしてキャンセル監視 + CPU 負荷軽減
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
                 }
+                crate::logger::log(format!("  worker {worker_idx} stopped"));
             });
-        });
+        }
 
         // ── 動画サムネイルを別スレッドで取得（Windows Shell API）─────────
         if !video_items.is_empty() {
@@ -463,7 +561,8 @@ impl App {
                         "  video thumb: idx={idx} {}",
                         if ci.is_some() { "ok" } else { "FAIL" }
                     ));
-                    let _ = tx_v.send((idx, ci));
+                    // 動画 Shell API はアップグレード経路を持たないので from_cache = false
+                    let _ = tx_v.send((idx, ci, false));
                 }
             });
         }
@@ -484,28 +583,279 @@ impl App {
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         let mut count = 0u32;
-        while let Ok((i, color_image_opt)) = self.rx.try_recv() {
+        let (keep_start, keep_end) = self.keep_range;
+        while let Ok((i, color_image_opt, from_cache)) = self.rx.try_recv() {
             if i < self.thumbnails.len() {
+                // 結果を in-flight セットから除外
+                self.requested.remove(&i);
+
+                // 段階 B: 結果が届いたが既に keep_range 外に出ている場合、
+                // テクスチャ生成を省略し Evicted のままにする (VRAM 節約)
+                let in_keep_range = i >= keep_start && i < keep_end;
+
                 match color_image_opt {
                     Some(color_image) => {
-                        let handle = ctx.load_texture(
-                            format!("thumb_{i}"),
-                            color_image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.thumbnails[i] = ThumbnailState::Loaded(handle);
+                        if in_keep_range {
+                            // ColorImage の長辺ピクセル数を記録しておく (段階 E)
+                            let [w, h] = color_image.size;
+                            let rendered_at_px = w.max(h) as u32;
+                            let handle = ctx.load_texture(
+                                format!("thumb_{i}"),
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            // 段階 E: from_cache と rendered_at_px を記録し、
+                            // アイドル時のアップグレード対象か判定する
+                            self.thumbnails[i] = ThumbnailState::Loaded {
+                                tex: handle,
+                                from_cache,
+                                rendered_at_px,
+                            };
+                        } else {
+                            // 範囲外: ColorImage を drop し Evicted にしておく
+                            self.thumbnails[i] = ThumbnailState::Evicted;
+                        }
                     }
                     None => {
                         self.thumbnails[i] = ThumbnailState::Failed;
                     }
                 }
                 count += 1;
+            } else {
+                // idx がアイテム範囲外 (旧フォルダの結果) は単純に捨てる
+                self.requested.remove(&i);
             }
         }
         if count > 0 {
-            // 最初の1枚受信時はメインスレッド側のタイムスタンプを記録
             crate::logger::log(format!("  [main] poll_thumbnails: received {count} thumbnail(s)"));
             ctx.request_repaint();
+        }
+    }
+
+    /// 段階 B: ページ単位先読み + eviction のメインロジック。
+    /// 段階 D: VRAM 安全ネット (上限超過時に keep_range を縮小)。
+    ///
+    /// 毎フレーム呼ぶ想定。現在のスクロール位置から keep_range を算出し、
+    /// 範囲外の Loaded を Evicted 化し、範囲内の Pending/Evicted を reload_queue に push する。
+    fn update_keep_range_and_requests(&mut self) {
+        let total = self.items.len();
+        if total == 0 {
+            self.keep_range = (0, 0);
+            return;
+        }
+
+        // 毎フレーム display_px を更新してワーカーに追従させる
+        // (列数変更やウィンドウリサイズに対応)
+        let current_display_px = compute_display_px(
+            self.last_cell_size,
+            self.last_cell_h,
+            self.last_pixels_per_point,
+        );
+        self.display_px_shared
+            .store(current_display_px, Ordering::Relaxed);
+
+        let cols = self.settings.grid_cols.max(1);
+        let cell_h = self.last_cell_h.max(1.0);
+        let viewport_h = self.last_viewport_h.max(cell_h);
+
+        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
+        let items_per_page = (rows_per_page * cols).max(1);
+        let cur_first = (self.scroll_offset_y / cell_h) as usize * cols;
+
+        let prev_pages = self.settings.thumb_prev_pages as usize;
+        let next_pages = self.settings.thumb_next_pages as usize;
+
+        let mut keep_start = cur_first.saturating_sub(prev_pages * items_per_page);
+        let mut keep_end = cur_first
+            .saturating_add((1 + next_pages) * items_per_page)
+            .min(total);
+
+        // ── 段階 D: VRAM 安全ネット ──────────────────────────────────
+        // display_px から 1 枚あたりの推定バイト数を算出し、cap を超えそうなら
+        // keep_range を cur_first 中心に縮小する (前方 2/3 優先、後方 1/3)
+        // 上限は "プライマリ GPU VRAM × 設定 %" (0 で無制限)
+        let cap_percent = self.settings.thumb_vram_cap_percent;
+        if cap_percent > 0 {
+            let est_per_thumb: u64 = (current_display_px as u64)
+                .saturating_mul(current_display_px as u64)
+                .saturating_mul(4);
+            let cap_bytes = crate::gpu_info::vram_cap_from_percent(cap_percent);
+            if est_per_thumb > 0 {
+                let max_items = (cap_bytes / est_per_thumb).max(1) as usize;
+                let desired = keep_end.saturating_sub(keep_start);
+                if max_items < desired {
+                    // 上限超過: keep_range を縮小
+                    let half_back = max_items / 3;
+                    let half_forward = max_items - half_back;
+                    let new_start = cur_first.saturating_sub(half_back);
+                    let new_end = cur_first.saturating_add(half_forward).min(total);
+                    crate::logger::log(format!(
+                        "  VRAM cap hit: desired={desired} max_items={max_items} \
+                         (display_px={current_display_px} est/thumb={} MB cap={} MB @ {}%)",
+                        est_per_thumb / (1024 * 1024),
+                        cap_bytes / (1024 * 1024),
+                        cap_percent,
+                    ));
+                    keep_start = new_start;
+                    keep_end = new_end;
+                }
+            }
+        }
+
+        self.keep_range = (keep_start, keep_end);
+
+        // (1) 範囲外の Loaded を Evicted にする (TextureHandle を drop)
+        //     動画サムネイルは一度ロードしたら維持する (別パスのため再要求できない)
+        for i in 0..total {
+            if i >= keep_start && i < keep_end {
+                continue;
+            }
+            if matches!(self.items.get(i), Some(GridItem::Video(_))) {
+                continue;
+            }
+            if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
+                self.thumbnails[i] = ThumbnailState::Evicted;
+            }
+        }
+
+        // (2) 範囲内の Pending/Evicted を reload_queue に push
+        let Some(queue) = self.reload_queue.clone() else { return; };
+        let mut new_requests: Vec<LoadRequest> = Vec::new();
+        for i in keep_start..keep_end {
+            if self.requested.contains(&i) {
+                continue;
+            }
+            let need_load = matches!(
+                self.thumbnails[i],
+                ThumbnailState::Pending | ThumbnailState::Evicted
+            );
+            if !need_load {
+                continue;
+            }
+            // 画像のみ要求。フォルダは描画時にアイコン、動画は別パス
+            let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
+                continue;
+            };
+            let path = match self.items.get(i) {
+                Some(GridItem::Image(p)) => p.clone(),
+                _ => continue,
+            };
+            new_requests.push(LoadRequest {
+                idx: i, path, mtime, file_size,
+                skip_cache: false,
+            });
+        }
+        if !new_requests.is_empty() {
+            let mut q = queue.lock().unwrap();
+            for r in new_requests {
+                self.requested.insert(r.idx);
+                q.push(r);
+            }
+        }
+
+        // (3) 段階 E: アイドル時の画質アップグレード
+        self.enqueue_idle_upgrades(keep_start, keep_end);
+    }
+
+    /// 段階 E: アイドル時に画質アップグレードの要求を投入する。
+    ///
+    /// 発動条件:
+    /// - 設定 `thumb_idle_upgrade` が有効
+    /// - スクロールが一定時間 (500 ms) 停止している
+    /// - `reload_queue` が空で `requested` も空 (他の作業が全て終わっている)
+    ///
+    /// アップグレード対象:
+    /// 1. `Loaded { from_cache: true }` — キャッシュ (WebP q=75) 由来で画質劣化
+    /// 2. `Loaded { rendered_at_px < current_display_px * 0.8 }` —
+    ///    列数変更などで現在のセルサイズより 20% 以上小さい解像度で生成されている
+    ///
+    /// `keep_range` 内の該当セルを最大 `BATCH` 件ずつ、`skip_cache = true` の
+    /// LoadRequest として push する。スクロール優先度付きの worker が visible
+    /// 側から先に処理する。
+    fn enqueue_idle_upgrades(&mut self, keep_start: usize, keep_end: usize) {
+        const BATCH: usize = 4;
+        const SCROLL_IDLE_SECS: f64 = 0.5;
+
+        if !self.settings.thumb_idle_upgrade {
+            return;
+        }
+
+        // スクロール変化の検出
+        if (self.scroll_offset_y - self.last_scroll_offset_y_tracked).abs() > 0.5 {
+            self.last_scroll_change_time = std::time::Instant::now();
+            self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        }
+        let scroll_idle =
+            self.last_scroll_change_time.elapsed().as_secs_f64() >= SCROLL_IDLE_SECS;
+        if !scroll_idle {
+            return;
+        }
+
+        // キューと in-flight が両方空のときだけ走らせる
+        if !self.requested.is_empty() {
+            return;
+        }
+        let Some(queue) = self.reload_queue.clone() else { return; };
+        {
+            let q = queue.lock().unwrap();
+            if !q.is_empty() {
+                return;
+            }
+        }
+
+        // 現在の display_px (アイドル判定とサイズ比較に使用)
+        let current_display_px = self.display_px_shared.load(Ordering::Relaxed);
+
+        // 候補集め: keep_range 内で from_cache=true or 解像度不足のものを最大 BATCH 件
+        let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
+        for i in keep_start..keep_end {
+            let needs_upgrade = match self.thumbnails.get(i) {
+                Some(ThumbnailState::Loaded {
+                    from_cache,
+                    rendered_at_px,
+                    ..
+                }) => {
+                    // 1. キャッシュ由来 (品質アップグレード)
+                    // 2. 現在のセルに対して解像度不足 (rendered < current * 0.8)
+                    //    u32 オーバーフロー対策で u64 で比較
+                    *from_cache
+                        || (*rendered_at_px as u64) * 5
+                            < (current_display_px as u64) * 4
+                }
+                _ => false,
+            };
+            if !needs_upgrade {
+                continue;
+            }
+            let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
+                continue;
+            };
+            let path = match self.items.get(i) {
+                Some(GridItem::Image(p)) => p.clone(),
+                _ => continue,
+            };
+            upgrade_reqs.push(LoadRequest {
+                idx: i, path, mtime, file_size,
+                skip_cache: true,
+            });
+            if upgrade_reqs.len() >= BATCH {
+                break;
+            }
+        }
+
+        if upgrade_reqs.is_empty() {
+            return;
+        }
+
+        crate::logger::log(format!(
+            "  idle upgrade: queued {} items (display_px={})",
+            upgrade_reqs.len(),
+            current_display_px,
+        ));
+        let mut q = queue.lock().unwrap();
+        for r in upgrade_reqs {
+            self.requested.insert(r.idx);
+            q.push(r);
         }
     }
 
@@ -553,6 +903,7 @@ impl App {
             if let Some(s) = new_sel {
                 self.selected = Some(s);
                 self.scroll_to_selected = true;
+                self.update_last_selected_image();
             }
 
             if enter {
@@ -824,6 +1175,16 @@ impl App {
         self.fs_cache.clear();
     }
 
+    /// `self.selected` に対応するアイテムが画像の場合、パスを last_selected_image_path に保存する。
+    /// (フォルダ移動後もサムネイル画質ダイアログで使えるよう、セッション内で保持)
+    fn update_last_selected_image(&mut self) {
+        if let Some(idx) = self.selected {
+            if let Some(GridItem::Image(p)) = self.items.get(idx) {
+                self.last_selected_image_path = Some(p.clone());
+            }
+        }
+    }
+
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
     fn poll_prefetch(&mut self, ctx: &egui::Context) {
         let mut completed: Vec<(usize, FsLoadResult)> = Vec::new();
@@ -871,6 +1232,248 @@ impl App {
         if repaint {
             ctx.request_repaint();
         }
+    }
+
+    // -------------------------------------------------------------------
+    // サムネイル画質設定ダイアログ (A/B 比較)
+    // -------------------------------------------------------------------
+    fn open_thumb_quality_dialog(&mut self, ctx: &egui::Context) {
+        // 既存状態をリセット
+        self.tq_sample = None;
+        self.tq_sample_path = None;
+        self.tq_sample_original_size = 0;
+        self.tq_a_texture = None;
+        self.tq_b_texture = None;
+        self.tq_a_bytes = 0;
+        self.tq_b_bytes = 0;
+
+        // 最後に選択した画像を取得
+        let Some(path) = self.last_selected_image_path.clone() else {
+            // None のままダイアログを開く (メッセージだけ出る)
+            self.show_thumb_quality_dialog = true;
+            return;
+        };
+
+        // サンプル画像をデコード
+        let img = match image::open(&path) {
+            Ok(i) => i,
+            Err(_) => {
+                self.show_thumb_quality_dialog = true;
+                return;
+            }
+        };
+        let orig_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.tq_sample = Some(img);
+        self.tq_sample_path = Some(path);
+        self.tq_sample_original_size = orig_size;
+
+        // 現在の設定で A を初期化、B はちょっと違う組み合わせ
+        self.tq_a_size = self.settings.thumb_px;
+        self.tq_a_quality = self.settings.thumb_quality;
+        self.tq_b_size = self.settings.thumb_px;
+        self.tq_b_quality = (self.settings.thumb_quality as u32 + 10).min(95) as u8;
+
+        self.reencode_tq_panel(ctx, true);
+        self.reencode_tq_panel(ctx, false);
+        self.show_thumb_quality_dialog = true;
+    }
+
+    fn reencode_tq_panel(&mut self, ctx: &egui::Context, is_a: bool) {
+        let Some(img) = self.tq_sample.as_ref() else { return };
+        let (size, quality) = if is_a {
+            (self.tq_a_size, self.tq_a_quality)
+        } else {
+            (self.tq_b_size, self.tq_b_quality)
+        };
+        let (bytes, tex) =
+            match crate::catalog::encode_thumb_webp(img, size, quality as f32) {
+                Some((data, _w, _h)) => {
+                    let byte_len = data.len();
+                    let color_image = crate::catalog::decode_thumb_to_color_image(&data);
+                    let tex = color_image.map(|ci| {
+                        ctx.load_texture(
+                            format!("tq_preview_{}", if is_a { "a" } else { "b" }),
+                            ci,
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    (byte_len, tex)
+                }
+                None => (0, None),
+            };
+        if is_a {
+            self.tq_a_bytes = bytes;
+            self.tq_a_texture = tex;
+        } else {
+            self.tq_b_bytes = bytes;
+            self.tq_b_texture = tex;
+        }
+    }
+
+    fn close_thumb_quality_dialog(&mut self) {
+        self.show_thumb_quality_dialog = false;
+        self.tq_sample = None;
+        self.tq_sample_path = None;
+        self.tq_a_texture = None;
+        self.tq_b_texture = None;
+        self.tq_fullscreen = false;
+    }
+
+    // -------------------------------------------------------------------
+    // キャッシュ作成（バックグラウンドで選択フォルダ以下を再帰処理）
+    // -------------------------------------------------------------------
+    fn start_cache_creation(&mut self) {
+        // 選択されたお気に入りを集める
+        let targets: Vec<PathBuf> = self
+            .settings
+            .favorites
+            .iter()
+            .zip(self.cache_creator_checked.iter())
+            .filter_map(|(p, &c)| if c { Some(p.clone()) } else { None })
+            .collect();
+
+        if targets.is_empty() {
+            return;
+        }
+
+        // 状態リセット
+        self.cache_creator_running = true;
+        self.cache_creator_counting.store(true, Ordering::Relaxed);
+        self.cache_creator_total.store(0, Ordering::Relaxed);
+        self.cache_creator_done.store(0, Ordering::Relaxed);
+        self.cache_creator_finished.store(false, Ordering::Relaxed);
+        self.cache_creator_result = None;
+        *self.cache_creator_current.lock().unwrap() = String::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cache_creator_cancel = Arc::clone(&cancel);
+
+        // 初期キャッシュ容量を取得（ベースライン）
+        let cache_dir = crate::catalog::default_cache_dir();
+        let (_, baseline) = crate::catalog::cache_stats(&cache_dir);
+        self.cache_creator_cache_size
+            .store(baseline, Ordering::Relaxed);
+
+        // atomic クローン
+        let counting = Arc::clone(&self.cache_creator_counting);
+        let total = Arc::clone(&self.cache_creator_total);
+        let done = Arc::clone(&self.cache_creator_done);
+        let size_atomic = Arc::clone(&self.cache_creator_cache_size);
+        let finished = Arc::clone(&self.cache_creator_finished);
+        let current = Arc::clone(&self.cache_creator_current);
+        let thumb_px = self.settings.thumb_px;
+        let thumb_quality = self.settings.thumb_quality;
+        let threads = self.settings.parallelism.thread_count();
+
+        std::thread::spawn(move || {
+            // Pass 1: カウント
+            let mut all_folders: Vec<PathBuf> = Vec::new();
+            for t in &targets {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                walk_dirs_recursive(t, &mut all_folders, &cancel);
+            }
+            total.store(all_folders.len(), Ordering::Relaxed);
+            counting.store(false, Ordering::Relaxed);
+
+            if cancel.load(Ordering::Relaxed) {
+                finished.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            // 処理用 rayon プール
+            let pool = match rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    finished.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // Pass 2: フォルダを順次処理、内部画像は並列デコード
+            for folder in &all_folders {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                *current.lock().unwrap() = folder.to_string_lossy().to_string();
+
+                // 画像列挙（単一フォルダ、再帰なし）
+                let mut images: Vec<(PathBuf, i64, i64)> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(folder) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if !p.is_file() {
+                            continue;
+                        }
+                        let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+                            continue;
+                        };
+                        let ext_lower = ext.to_ascii_lowercase();
+                        if !SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+                            continue;
+                        }
+                        let meta = entry.metadata().ok();
+                        let mtime = meta
+                            .as_ref()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_secs() as i64);
+                        let file_size = meta.map_or(0, |m| m.len() as i64);
+                        images.push((p, mtime, file_size));
+                    }
+                }
+
+                if images.is_empty() {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // カタログを開く（1フォルダ1DB）
+                let Ok(catalog) = crate::catalog::CatalogDb::open(&cache_dir, folder) else {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let cache_map = catalog.load_all().unwrap_or_default();
+
+                // 並列でデコード + 保存
+                pool.install(|| {
+                    use rayon::prelude::*;
+                    images.par_iter().for_each(|(path, mtime, file_size)| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let filename = match path.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => return,
+                        };
+                        // 既存キャッシュチェック
+                        if let Some(entry) = cache_map.get(filename) {
+                            if entry.mtime == *mtime && entry.file_size == *file_size {
+                                return;
+                            }
+                        }
+                        if let Some(bytes) = build_and_save_one(
+                            path,
+                            &catalog,
+                            *mtime,
+                            *file_size,
+                            thumb_px,
+                            thumb_quality,
+                        ) {
+                            size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                        }
+                    });
+                });
+
+                done.fetch_add(1, Ordering::Relaxed);
+            }
+
+            finished.store(true, Ordering::Relaxed);
+        });
     }
 }
 
@@ -941,16 +1544,20 @@ impl eframe::App for App {
         }
 
         self.poll_thumbnails(ctx);
+        self.update_keep_range_and_requests();
         self.poll_prefetch(ctx);
 
-        // ── タイトルバーにキャッシュ生成進捗を表示 ────────────────────
-        // cache_gen_total > 0 のときだけ進捗を表示する。
-        // 全枚完了したらデフォルトタイトルに戻す。
+        // ── タイトルバーにロード状況を表示 ────────────────────────────
+        // 段階 B: in-flight 要求数 + reload_queue 残数を表示
         {
-            let total = self.cache_gen_total;
-            let done = self.cache_gen_done.load(Ordering::Relaxed);
-            let title = if total > 0 && done < total {
-                format!("mimageviewer - キャッシュ生成中 ({}/{})", done, total)
+            let in_flight = self.requested.len();
+            let queued = self
+                .reload_queue
+                .as_ref()
+                .map(|q| q.lock().unwrap().len())
+                .unwrap_or(0);
+            let title = if in_flight > 0 || queued > 0 {
+                format!("mimageviewer - 読込中 ({} 処理中 / {} 待機)", in_flight, queued)
             } else {
                 "mimageviewer".to_string()
             };
@@ -1000,7 +1607,7 @@ impl eframe::App for App {
             };
 
             let thumb_tex  = match self.thumbnails.get(fs_idx) {
-                Some(ThumbnailState::Loaded(h)) => Some(h.clone()),
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
                 _ => None,
             };
             let filename   = self.items.get(fs_idx)
@@ -1256,6 +1863,7 @@ impl eframe::App for App {
                     self.open_fullscreen(new_idx);
                     self.selected = Some(new_idx);
                     self.scroll_to_selected = true;
+                    self.update_last_selected_image();
                 }
             }
 
@@ -1304,6 +1912,20 @@ impl eframe::App for App {
                     // 編集
                     if ui.button("編集").clicked() {
                         self.show_favorites_editor = true;
+                        ui.close();
+                    }
+
+                    // キャッシュ作成
+                    if ui.button("キャッシュ作成").clicked() {
+                        self.cache_creator_checked = vec![false; self.settings.favorites.len()];
+                        self.cache_creator_running = false;
+                        self.cache_creator_result = None;
+                        self.cache_creator_total.store(0, Ordering::Relaxed);
+                        self.cache_creator_done.store(0, Ordering::Relaxed);
+                        self.cache_creator_cache_size.store(0, Ordering::Relaxed);
+                        self.cache_creator_finished.store(false, Ordering::Relaxed);
+                        *self.cache_creator_current.lock().unwrap() = String::new();
+                        self.show_cache_creator = true;
                         ui.close();
                     }
 
@@ -1369,6 +1991,14 @@ impl eframe::App for App {
                         self.show_cache_manager = true;
                         ui.close();
                     }
+                    if ui.button("サムネイル画質…").clicked() {
+                        self.open_thumb_quality_dialog(ctx);
+                        ui.close();
+                    }
+                    if ui.button("キャッシュ生成設定…").clicked() {
+                        self.show_cache_policy_dialog = true;
+                        ui.close();
+                    }
                     if ui.button("環境設定…").clicked() {
                         // ダイアログを開くとき現在値で初期化
                         self.pref_manual_threads = match &self.settings.parallelism {
@@ -1400,12 +2030,13 @@ impl eframe::App for App {
             let mut open = true;
             let mut swap: Option<(usize, usize)> = None;
             let mut remove: Option<usize> = None;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
             egui::Window::new("お気に入りの編集")
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_pos(dialog_pos)
                 .show(ctx, |ui| {
                     ui.set_min_width(360.0);
                     if self.settings.favorites.is_empty() {
@@ -1455,12 +2086,13 @@ impl eframe::App for App {
         if self.show_cache_manager {
             let mut open = true;
             let cache_dir = crate::catalog::default_cache_dir();
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
             egui::Window::new("キャッシュ管理")
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_pos(dialog_pos)
                 .show(ctx, |ui| {
                     ui.set_min_width(380.0);
 
@@ -1475,29 +2107,6 @@ impl eframe::App for App {
                     } else {
                         ui.label("キャッシュ情報を取得中...");
                     }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // ── サムネイルサイズ設定 ──────────────────────
-                    ui.horizontal(|ui| {
-                        ui.label("サムネイルサイズ（長辺）：");
-                        for &px in &[256u32, 512, 768, 1024] {
-                            let checked = self.settings.thumb_px == px;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{px}px")).clicked() && !checked {
-                                self.settings.thumb_px = px;
-                                self.settings.save();
-                                settings_changed = true;
-                            }
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new("※ 変更は次回のキャッシュ生成から反映されます。過去分を変更するにはキャッシュを削除してください。")
-                            .weak()
-                            .small()
-                    );
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -1552,19 +2161,591 @@ impl eframe::App for App {
             }
         }
 
+        // ── キャッシュ作成ポップアップ ────────────────────────────────
+        if self.show_cache_creator {
+            // 完了初回に結果メッセージをセット
+            if self.cache_creator_finished.load(Ordering::Relaxed)
+                && self.cache_creator_result.is_none()
+            {
+                let done = self.cache_creator_done.load(Ordering::Relaxed);
+                let total = self.cache_creator_total.load(Ordering::Relaxed);
+                let cancelled = self.cache_creator_cancel.load(Ordering::Relaxed);
+                self.cache_creator_result = Some(if cancelled {
+                    format!("キャンセルされました（{} / {} フォルダ処理済み）", done, total)
+                } else {
+                    format!("{} フォルダの処理が完了しました。", done)
+                });
+            }
+
+            let mut open = true;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+            egui::Window::new("キャッシュ作成")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(500.0);
+
+                    if !self.cache_creator_running
+                        && !self.cache_creator_finished.load(Ordering::Relaxed)
+                    {
+                        // ── 選択前画面 ──
+                        ui.label("キャッシュを作成するお気に入りを選んでください：");
+                        ui.add_space(6.0);
+
+                        if self.settings.favorites.is_empty() {
+                            ui.label(egui::RichText::new("（お気に入りが未登録です）").weak());
+                        } else {
+                            for (i, fav) in self.settings.favorites.iter().enumerate() {
+                                let path_str = fav.to_string_lossy().to_string();
+                                ui.checkbox(&mut self.cache_creator_checked[i], path_str);
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        let any_checked = self.cache_creator_checked.iter().any(|&b| b);
+                        if ui
+                            .add_enabled(
+                                any_checked,
+                                egui::Button::new("  キャッシュ作成  "),
+                            )
+                            .clicked()
+                        {
+                            self.start_cache_creation();
+                        }
+                    } else {
+                        // ── 実行中 / 完了画面 ──
+                        let counting = self.cache_creator_counting.load(Ordering::Relaxed);
+                        let total = self.cache_creator_total.load(Ordering::Relaxed);
+                        let done = self.cache_creator_done.load(Ordering::Relaxed);
+                        let size = self.cache_creator_cache_size.load(Ordering::Relaxed);
+
+                        if counting {
+                            ui.label("フォルダを列挙中…");
+                        } else {
+                            ui.label(format!("フォルダ: {} / {}", done, total));
+                        }
+
+                        let current = self.cache_creator_current.lock().unwrap().clone();
+                        if !current.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("現在: {}", current))
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(format!("キャッシュ容量: {}", format_bytes(size)));
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        if self.cache_creator_finished.load(Ordering::Relaxed) {
+                            if let Some(ref msg) = self.cache_creator_result {
+                                ui.label(msg.as_str());
+                                ui.add_space(4.0);
+                            }
+                            if ui.button("  閉じる  ").clicked() {
+                                self.show_cache_creator = false;
+                                self.cache_creator_running = false;
+                            }
+                        } else {
+                            if ui.button("  キャンセル  ").clicked() {
+                                self.cache_creator_cancel.store(true, Ordering::Relaxed);
+                            }
+                            // リアルタイム更新のため繰り返し描画要求
+                            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                    }
+                });
+
+            if !open {
+                if self.cache_creator_running
+                    && !self.cache_creator_finished.load(Ordering::Relaxed)
+                {
+                    self.cache_creator_cancel.store(true, Ordering::Relaxed);
+                }
+                self.show_cache_creator = false;
+                self.cache_creator_running = false;
+            }
+        }
+
+        // ── サムネイル画質設定ポップアップ ────────────────────────────
+        if self.show_thumb_quality_dialog {
+            let mut open = true;
+            let mut apply_a = false;
+            let mut apply_b = false;
+            let mut reencode_a = false;
+            let mut reencode_b = false;
+            let mut open_fs_a = false;
+            let mut open_fs_b = false;
+
+            // 実グリッドの現在のセルサイズを取得（最小値を確保してスライダーが入るように）
+            let grid_cell_w = self.last_cell_size.max(200.0);
+            let grid_cell_h = self.last_cell_h.max(150.0);
+            // ダイアログのデフォルトサイズ（2カラム + パディング）
+            let default_w = (grid_cell_w * 2.0 + 80.0).clamp(680.0, 1800.0);
+            let default_h = (grid_cell_h + 260.0).clamp(480.0, 1200.0);
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("サムネイル画質設定")
+                .open(&mut open)
+                .resizable(true)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .default_size([default_w, default_h])
+                .show(ctx, |ui| {
+                    if self.tq_sample.is_none() {
+                        ui.set_min_width(360.0);
+                        ui.label("画像を1枚選択してからもう一度お試しください。");
+                        ui.add_space(8.0);
+                        if ui.button("  閉じる  ").clicked() {
+                            self.show_thumb_quality_dialog = false;
+                        }
+                        return;
+                    }
+
+                    // サンプル画像情報
+                    if let Some(ref p) = self.tq_sample_path {
+                        ui.label(
+                            egui::RichText::new(format!("サンプル: {}", p.to_string_lossy()))
+                                .small(),
+                        );
+                    }
+                    if let Some(ref img) = self.tq_sample {
+                        let sz = self.tq_sample_original_size;
+                        let sz_str = if sz >= 1024 * 1024 {
+                            format!("{:.1} MB", sz as f64 / (1024.0 * 1024.0))
+                        } else {
+                            format!("{:.0} KB", sz as f64 / 1024.0)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "（元サイズ {}x{} / {}）",
+                                img.width(),
+                                img.height(),
+                                sz_str
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+
+                    // 現在のグリッド表示サイズ（サイズ選択時の参考用）
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "現在のグリッド表示サイズ: {} × {} px  （{} 列 / アスペクト比 {}）",
+                            self.last_cell_size.round() as i32,
+                            self.last_cell_h.round() as i32,
+                            self.settings.grid_cols,
+                            self.settings.thumb_aspect.label(),
+                        ))
+                        .small(),
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── A / B 2 カラム ────────────────────────
+                    ui.columns(2, |cols| {
+                        // -- A --
+                        cols[0].vertical(|ui| {
+                            ui.heading("A");
+                            ui.add_space(4.0);
+                            let resp = tq_draw_preview(
+                                ui,
+                                &self.tq_a_texture,
+                                grid_cell_w,
+                                grid_cell_h,
+                            );
+                            if resp.clicked() {
+                                open_fs_a = true;
+                            }
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                ui.label("サイズ:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_a_size, 128..=1536)
+                                        .text("px"),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_a = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("品質:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_a_quality, 1..=100),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_a = true;
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(format!("{}  ({}x{})",
+                                format_bytes_small(self.tq_a_bytes as u64),
+                                self.tq_a_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
+                                self.tq_a_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
+                            ));
+                            ui.add_space(4.0);
+                            if ui.button("  A を適用  ").clicked() {
+                                apply_a = true;
+                            }
+                        });
+
+                        // -- B --
+                        cols[1].vertical(|ui| {
+                            ui.heading("B");
+                            ui.add_space(4.0);
+                            let resp = tq_draw_preview(
+                                ui,
+                                &self.tq_b_texture,
+                                grid_cell_w,
+                                grid_cell_h,
+                            );
+                            if resp.clicked() {
+                                open_fs_b = true;
+                            }
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                ui.label("サイズ:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_b_size, 128..=1536)
+                                        .text("px"),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_b = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("品質:");
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.tq_b_quality, 1..=100),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    reencode_b = true;
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(format!("{}  ({}x{})",
+                                format_bytes_small(self.tq_b_bytes as u64),
+                                self.tq_b_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
+                                self.tq_b_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
+                            ));
+                            ui.add_space(4.0);
+                            if ui.button("  B を適用  ").clicked() {
+                                apply_b = true;
+                            }
+                        });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "現在の設定: {}px / q={}",
+                            self.settings.thumb_px, self.settings.thumb_quality
+                        ));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.button("  閉じる  ").clicked() {
+                                    self.show_thumb_quality_dialog = false;
+                                }
+                            },
+                        );
+                    });
+                });
+
+            if reencode_a {
+                self.reencode_tq_panel(ctx, true);
+            }
+            if reencode_b {
+                self.reencode_tq_panel(ctx, false);
+            }
+            if open_fs_a || open_fs_b {
+                self.tq_fullscreen = true;
+                // divider 位置はリセットせず、前回の位置を維持する
+            }
+            if apply_a {
+                self.settings.thumb_px = self.tq_a_size;
+                self.settings.thumb_quality = self.tq_a_quality;
+                self.settings.save();
+                self.close_thumb_quality_dialog();
+            } else if apply_b {
+                self.settings.thumb_px = self.tq_b_size;
+                self.settings.thumb_quality = self.tq_b_quality;
+                self.settings.save();
+                self.close_thumb_quality_dialog();
+            } else if !open {
+                self.close_thumb_quality_dialog();
+            }
+        }
+
+        // ── サムネイル画質プレビュー全画面 A/B 比較オーバーレイ ────────
+        if self.tq_fullscreen {
+            let screen = ctx.content_rect();
+
+            // A・B のテクスチャ。両方とも同じソース画像から作られたサムネイルなので
+            // アスペクト比は同一。どちらかのサイズで fit 計算する。
+            let ref_size = self
+                .tq_a_texture
+                .as_ref()
+                .map(|t| t.size_vec2())
+                .or_else(|| self.tq_b_texture.as_ref().map(|t| t.size_vec2()));
+
+            // 画像表示領域を画面中央に計算（下部に情報バー分のスペースを確保）
+            let img_rect_opt: Option<egui::Rect> = ref_size.map(|rs| {
+                let margin = 40.0;
+                let info_bar_h = 80.0;
+                let avail_w = (screen.width() - margin * 2.0).max(1.0);
+                let avail_h = (screen.height() - margin * 2.0 - info_bar_h).max(1.0);
+                let scale = (avail_w / rs.x).min(avail_h / rs.y);
+                let img_size = rs * scale;
+                egui::Rect::from_center_size(
+                    egui::pos2(screen.center().x, screen.center().y - info_bar_h * 0.5),
+                    img_size,
+                )
+            });
+
+            let divider_t = self.tq_fs_divider.clamp(0.0, 1.0);
+
+            let area_resp = egui::Area::new(egui::Id::new("tq_fs_overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    let (rect, response) = ui.allocate_exact_size(
+                        screen.size(),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let painter = ui.painter();
+                    // 背景
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 20, 20));
+
+                    let Some(img_rect) = img_rect_opt else {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "プレビューがありません",
+                            egui::FontId::proportional(18.0),
+                            egui::Color32::from_gray(200),
+                        );
+                        return response;
+                    };
+
+                    let divider_x = img_rect.min.x + img_rect.width() * divider_t;
+
+                    // A (左側) を divider まで描画
+                    if let Some(ta) = &self.tq_a_texture {
+                        let a_rect = egui::Rect::from_min_max(
+                            img_rect.min,
+                            egui::pos2(divider_x, img_rect.max.y),
+                        );
+                        let a_uv = egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(divider_t, 1.0),
+                        );
+                        if a_rect.width() > 0.0 {
+                            painter.image(ta.id(), a_rect, a_uv, egui::Color32::WHITE);
+                        }
+                    }
+
+                    // B (右側) を divider から描画
+                    if let Some(tb) = &self.tq_b_texture {
+                        let b_rect = egui::Rect::from_min_max(
+                            egui::pos2(divider_x, img_rect.min.y),
+                            img_rect.max,
+                        );
+                        let b_uv = egui::Rect::from_min_max(
+                            egui::pos2(divider_t, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        );
+                        if b_rect.width() > 0.0 {
+                            painter.image(tb.id(), b_rect, b_uv, egui::Color32::WHITE);
+                        }
+                    }
+
+                    // 画像の外枠
+                    painter.rect_stroke(
+                        img_rect,
+                        0.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    // 縦境界線
+                    painter.line_segment(
+                        [
+                            egui::pos2(divider_x, img_rect.min.y),
+                            egui::pos2(divider_x, img_rect.max.y),
+                        ],
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    );
+
+                    // ドラッグハンドル（円 + 左右矢印）
+                    let handle_center = egui::pos2(divider_x, img_rect.center().y);
+                    let handle_r = 16.0;
+                    painter.circle_filled(
+                        handle_center,
+                        handle_r,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                    );
+                    painter.circle_stroke(
+                        handle_center,
+                        handle_r,
+                        egui::Stroke::new(2.0, egui::Color32::from_gray(60)),
+                    );
+                    painter.text(
+                        handle_center,
+                        egui::Align2::CENTER_CENTER,
+                        "◀ ▶",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(40),
+                    );
+
+                    // A / B ラベル（画像の角に半透明背景付き）
+                    let label_pad = egui::vec2(10.0, 6.0);
+                    let label_a = "A";
+                    let label_b = "B";
+                    let font = egui::FontId::proportional(24.0);
+
+                    // A ラベル（左上、divider より左にあるときのみ）
+                    if divider_t > 0.05 {
+                        let pos = egui::pos2(img_rect.min.x + 12.0, img_rect.min.y + 12.0);
+                        let galley = painter.layout_no_wrap(
+                            label_a.to_string(),
+                            font.clone(),
+                            egui::Color32::WHITE,
+                        );
+                        let bg_rect = egui::Rect::from_min_size(
+                            pos,
+                            galley.size() + label_pad * 2.0,
+                        );
+                        painter.rect_filled(
+                            bg_rect,
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        );
+                        painter.galley(pos + label_pad, galley, egui::Color32::WHITE);
+                    }
+
+                    // B ラベル（右上、divider より右にあるときのみ）
+                    if divider_t < 0.95 {
+                        let galley = painter.layout_no_wrap(
+                            label_b.to_string(),
+                            font.clone(),
+                            egui::Color32::WHITE,
+                        );
+                        let bg_size = galley.size() + label_pad * 2.0;
+                        let pos = egui::pos2(
+                            img_rect.max.x - 12.0 - bg_size.x,
+                            img_rect.min.y + 12.0,
+                        );
+                        let bg_rect = egui::Rect::from_min_size(pos, bg_size);
+                        painter.rect_filled(
+                            bg_rect,
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        );
+                        painter.galley(pos + label_pad, galley, egui::Color32::WHITE);
+                    }
+
+                    // 情報バー（画像下）
+                    let info_base_y = img_rect.max.y + 24.0;
+                    let a_info = format!(
+                        "A:  {}px  /  q={}  /  {}",
+                        self.tq_a_size,
+                        self.tq_a_quality,
+                        format_bytes_small(self.tq_a_bytes as u64),
+                    );
+                    let b_info = format!(
+                        "B:  {}px  /  q={}  /  {}",
+                        self.tq_b_size,
+                        self.tq_b_quality,
+                        format_bytes_small(self.tq_b_bytes as u64),
+                    );
+                    let info_font = egui::FontId::proportional(14.0);
+                    painter.text(
+                        egui::pos2(rect.center().x - 24.0, info_base_y),
+                        egui::Align2::RIGHT_CENTER,
+                        a_info,
+                        info_font.clone(),
+                        egui::Color32::from_rgb(150, 200, 255),
+                    );
+                    painter.text(
+                        egui::pos2(rect.center().x + 24.0, info_base_y),
+                        egui::Align2::LEFT_CENTER,
+                        b_info,
+                        info_font.clone(),
+                        egui::Color32::from_rgb(255, 220, 150),
+                    );
+                    painter.text(
+                        egui::pos2(rect.center().x, info_base_y + 24.0),
+                        egui::Align2::CENTER_CENTER,
+                        "ドラッグで境界線を移動  /  クリック または ESC で戻る",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(180),
+                    );
+
+                    response
+                });
+
+            // ドラッグ → divider を更新
+            if area_resp.inner.dragged() {
+                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                    if let Some(img_rect) = img_rect_opt {
+                        if img_rect.width() > 0.0 {
+                            let t = ((pos.x - img_rect.min.x) / img_rect.width())
+                                .clamp(0.0, 1.0);
+                            self.tq_fs_divider = t;
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            // 画像上にホバーしているときはリサイズ左右カーソル
+            if let Some(img_rect) = img_rect_opt {
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if img_rect.contains(pos) {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                }
+            }
+
+            // ドラッグしていないクリック → 閉じる
+            let clicked = area_resp.inner.clicked();
+            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            if clicked || esc {
+                self.tq_fullscreen = false;
+            }
+        }
+
         // ── 環境設定ポップアップ ─────────────────────────────────────
         if self.show_preferences {
             let mut open = true;
             let mut apply = false;
             let mut cancel = false;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
             egui::Window::new("環境設定")
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_pos(dialog_pos)
                 .show(ctx, |ui| {
-                    ui.set_min_width(300.0);
+                    ui.set_min_width(420.0);
 
                     ui.heading("並列読み込み");
                     ui.add_space(4.0);
@@ -1601,7 +2782,7 @@ impl eframe::App for App {
                     ui.separator();
                     ui.add_space(4.0);
 
-                    ui.heading("先読み設定");
+                    ui.heading("フルサイズ画像の先読み");
                     ui.add_space(4.0);
                     ui.label("フルサイズ表示時に前後の画像を先読みする枚数（各最大 50 枚）。");
                     ui.add_space(4.0);
@@ -1622,6 +2803,89 @@ impl eframe::App for App {
                                 .suffix(" 枚"),
                         );
                     });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.heading("サムネイルの先読み");
+                    ui.add_space(4.0);
+                    ui.label(
+                        "サムネイルグリッドで現在位置の前後に何ページ分を GPU に保持するか。\n\
+                         範囲外はメモリから破棄され、スクロールで戻ると再読み込みされます。",
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("後方（前のページ）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.thumb_prev_pages)
+                                .range(0..=20u32)
+                                .suffix(" ページ"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("前方（次のページ）:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.thumb_next_pages)
+                                .range(0..=20u32)
+                                .suffix(" ページ"),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+                    // プライマリ GPU の VRAM を問い合わせて表示に使う
+                    let vram_mib = crate::gpu_info::query_vram_summary_mib();
+                    let vram_label = match vram_mib {
+                        Some(mib) if mib >= 1024 => {
+                            format!("{:.1} GiB", mib as f64 / 1024.0)
+                        }
+                        Some(mib) => format!("{} MiB", mib),
+                        None => "取得失敗 (4 GiB 仮定)".to_string(),
+                    };
+                    ui.label(format!(
+                        "GPU メモリ上限 (安全ネット):\n\
+                         超過時は先読み範囲を自動的に縮小します。\n\
+                         検出した GPU の VRAM: {vram_label}",
+                    ));
+
+                    ui.horizontal(|ui| {
+                        ui.label("上限:");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.settings.thumb_vram_cap_percent,
+                                0..=100u32,
+                            )
+                            .step_by(5.0)
+                            .suffix(" %"),
+                        );
+                    });
+
+                    // 現在の % が実際に何 MiB に相当するかを補助表示
+                    {
+                        let pct = self.settings.thumb_vram_cap_percent;
+                        let text = if pct == 0 {
+                            "  ↑ 0% = 無制限 (推奨しない)".to_string()
+                        } else {
+                            let cap_mib = crate::gpu_info::vram_cap_from_percent(pct)
+                                / (1024 * 1024);
+                            format!(
+                                "  ↑ VRAM の {}% = 約 {} MiB を上限とします (推奨: 50%)",
+                                pct, cap_mib
+                            )
+                        };
+                        ui.label(text);
+                    }
+
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut self.settings.thumb_idle_upgrade,
+                        "アイドル時にキャッシュ由来のサムネイルを高画質化する",
+                    );
+                    ui.label(
+                        "  ↑ スクロール停止後、キャッシュ復元 (WebP q=75) のサムネイルを\n    \
+                         元画像から再デコードして差し替えます。visible 側から順次処理。",
+                    );
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -1660,6 +2924,122 @@ impl eframe::App for App {
                 // キャンセル/×ボタン: 変更を破棄するため再ロード
                 self.settings = crate::settings::Settings::load();
                 self.show_preferences = false;
+            }
+        }
+
+        // ── キャッシュ生成設定ポップアップ (段階 C) ─────────────────────
+        if self.show_cache_policy_dialog {
+            let mut open = true;
+            let mut apply = false;
+            let mut cancel = false;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            egui::Window::new("キャッシュ生成設定")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(480.0);
+
+                    ui.label(
+                        "サムネイルキャッシュをいつ生成するかを指定します。\n\
+                         リリースビルドではキャッシュが無くても十分高速ですが、\n\
+                         重い画像や巨大ファイルはキャッシュすると再訪問時に高速化します。\n\
+                         Off にしても既存のキャッシュは引き続き読み込まれます。",
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.heading("モード");
+                    ui.add_space(4.0);
+                    for policy in [
+                        crate::settings::CachePolicy::Off,
+                        crate::settings::CachePolicy::Auto,
+                        crate::settings::CachePolicy::Always,
+                    ] {
+                        if ui
+                            .radio(
+                                self.settings.cache_policy == policy,
+                                policy.label(),
+                            )
+                            .clicked()
+                        {
+                            self.settings.cache_policy = policy;
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // Auto モード時のみ以下の項目を活性化
+                    let auto_active =
+                        self.settings.cache_policy == crate::settings::CachePolicy::Auto;
+
+                    ui.add_enabled_ui(auto_active, |ui| {
+                        ui.heading("Auto モードのしきい値");
+                        ui.add_space(4.0);
+
+                        ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.settings.cache_threshold_ms,
+                                10..=100,
+                            )
+                            .step_by(5.0)
+                            .suffix(" ms"),
+                        );
+                        ui.label("  小さいほど多くキャッシュ。25 ms 推奨。");
+
+                        ui.add_space(8.0);
+
+                        // サイズしきい値を MB 単位で編集
+                        ui.label("サイズしきい値 (このサイズ以上は無条件キャッシュ):");
+                        let mut size_mb =
+                            (self.settings.cache_size_threshold_bytes as f64) / 1_000_000.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut size_mb, 0.5..=10.0)
+                                    .step_by(0.5)
+                                    .suffix(" MB"),
+                            )
+                            .changed()
+                        {
+                            self.settings.cache_size_threshold_bytes =
+                                (size_mb * 1_000_000.0) as u64;
+                        }
+                        ui.label("  2 MB 推奨。これ以上の重い画像が確実にキャッシュされます。");
+
+                        ui.add_space(8.0);
+
+                        ui.checkbox(
+                            &mut self.settings.cache_webp_always,
+                            "既存 .webp は常にキャッシュ (デコードが重いため推奨)",
+                        );
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("  OK  ").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+            if apply {
+                self.settings.save();
+                self.show_cache_policy_dialog = false;
+            } else if cancel || !open {
+                // キャンセル/×ボタン: 変更を破棄するため再ロード
+                self.settings = crate::settings::Settings::load();
+                self.show_cache_policy_dialog = false;
             }
         }
 
@@ -1817,6 +3197,7 @@ impl eframe::App for App {
                                 );
                                 if response.clicked() {
                                     self.selected = Some(idx);
+                                    self.update_last_selected_image();
                                 }
                                 if response.double_clicked() {
                                     match self.items.get(idx) {
@@ -1913,7 +3294,7 @@ fn draw_cell(
             );
         }
         GridItem::Image(_) => match thumb {
-            ThumbnailState::Loaded(tex) => {
+            ThumbnailState::Loaded { tex, .. } => {
                 let tex_size = tex.size_vec2();
                 let scale =
                     (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
@@ -1929,7 +3310,9 @@ fn draw_cell(
                     egui::Color32::WHITE,
                 );
             }
-            ThumbnailState::Pending => {
+            ThumbnailState::Pending | ThumbnailState::Evicted => {
+                // 段階 B: Evicted は「一度ロードしたが破棄された」状態だが
+                // 表示上は Pending と同じプレースホルダを描く (再ロード待ち)
                 painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
                 painter.text(
                     inner.center(),
@@ -1952,7 +3335,7 @@ fn draw_cell(
         },
         GridItem::Video(path) => {
             match thumb {
-                ThumbnailState::Loaded(tex) => {
+                ThumbnailState::Loaded { tex, .. } => {
                     let tex_size = tex.size_vec2();
                     let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
                     let img_rect = egui::Rect::from_center_size(inner.center(), tex_size * scale);
@@ -1963,7 +3346,9 @@ fn draw_cell(
                         egui::Color32::WHITE,
                     );
                 }
-                ThumbnailState::Pending => {
+                ThumbnailState::Pending | ThumbnailState::Evicted => {
+                    // 動画は keep_range ロジックの対象外だが、ThumbnailState 自体は共有なので
+                    // Evicted になる可能性もある (update_keep_range_and_requests でスキップ)
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
                     painter.text(
                         inner.center(),
@@ -2056,18 +3441,192 @@ fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
     }).collect())
 }
 
-/// 1枚の画像をデコードしてサムネイルを生成し、カタログに保存してチャネルへ送信する。
+/// サムネイル読み込み結果メッセージ。
+///
+/// `(item_idx, Option<ColorImage>, from_cache)`
+/// - `from_cache = true`: WebP キャッシュから復元 (段階 E アップグレード対象)
+/// - `from_cache = false`: 元画像から直接デコード (高画質) または動画 Shell API
+type ThumbMsg = (usize, Option<egui::ColorImage>, bool);
+
+/// 段階 B: サムネイル読み込み要求。
+///
+/// UI スレッドが `reload_queue` に push し、永続ワーカースレッドが pop して処理する。
+/// ワーカーはまず `cache_map` を参照し、ヒットすれば WebP デコード、
+/// ミスすれば `load_one_cached` に委譲する。
+struct LoadRequest {
+    idx: usize,
+    path: PathBuf,
+    mtime: i64,
+    file_size: i64,
+    /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
+    skip_cache: bool,
+}
+
+/// キャッシュ生成判定用のパラメータ（段階 C）。
+///
+/// Settings から必要なフィールドのみを抽出した Copy 可能な構造体で、
+/// 複数スレッドへ安価に配布できる。
+#[derive(Clone, Copy)]
+struct CacheDecision {
+    policy: crate::settings::CachePolicy,
+    threshold_ms: u32,
+    size_threshold: u64,
+    webp_always: bool,
+    // cache_videos_always は動画が別パス (video_thumb) を通るため load_one_cached では使わない
+}
+
+impl CacheDecision {
+    fn from_settings(s: &crate::settings::Settings) -> Self {
+        Self {
+            policy: s.cache_policy,
+            threshold_ms: s.cache_threshold_ms,
+            size_threshold: s.cache_size_threshold_bytes,
+            webp_always: s.cache_webp_always,
+        }
+    }
+
+    /// 指定画像をキャッシュに保存すべきか判定する。
+    ///
+    /// - `Always`: 常に true
+    /// - `Off`   : 常に false
+    /// - `Auto`  : 事前ヒューリスティック (ext==webp / サイズ) または
+    ///             実測時間 (decode_ms + display_ms) がしきい値以上
+    fn should_cache(
+        &self,
+        path: &Path,
+        file_size: i64,
+        decode_ms: f64,
+        display_ms: f64,
+    ) -> bool {
+        use crate::settings::CachePolicy;
+        match self.policy {
+            CachePolicy::Always => true,
+            CachePolicy::Off    => false,
+            CachePolicy::Auto   => {
+                // 事前ヒューリスティック
+                if self.webp_always {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default();
+                    if ext == "webp" {
+                        return true;
+                    }
+                }
+                if (file_size as u64) >= self.size_threshold {
+                    return true;
+                }
+                // 実測判定
+                (decode_ms + display_ms) >= self.threshold_ms as f64
+            }
+        }
+    }
+}
+
+/// DynamicImage を `display_px` 以下に収まるよう Lanczos3 でリサイズし、
+/// egui::ColorImage に変換する。
+///
+/// 表示用パス (段階 A) で使用。WebP 量子化を通さず元画像から直接生成するため
+/// 画質劣化が無く、キャッシュの WebP(q=75) より高品質。
+fn resize_to_display_color_image(
+    img: &image::DynamicImage,
+    display_px: u32,
+) -> egui::ColorImage {
+    let resized = img.resize(
+        display_px,
+        display_px,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let rgba = resized.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+/// 現在のセルサイズから表示用 ColorImage の画素数を算出する。
+///
+/// 論理ピクセル × DPI スケールで物理ピクセルを求め、256-2048 px にクランプする。
+/// - 下限 256: 起動直後で cell_size が小さすぎる場合の最低品質保証
+/// - 上限 2048: 4K 2列などの巨大セルで過大メモリを防ぐ (最大 16 MB/ColorImage)
+fn compute_display_px(cell_w: f32, cell_h: f32, dpi: f32) -> u32 {
+    let logical_max = cell_w.max(cell_h).max(1.0);
+    let physical = (logical_max * dpi.max(0.5)).ceil();
+    (physical as u32).clamp(256, 2048)
+}
+
+/// 段階 B: 1 つの `LoadRequest` を処理する。
+///
+/// - 通常: `cache_map` を参照しキャッシュヒットしていれば WebP を復号して送信する
+///   (`from_cache = true`)
+/// - ミスまたは `req.skip_cache = true`: `load_one_cached` に委譲してフルデコード
+///   (`from_cache = false`、段階 E のアップグレード経路)
+#[allow(clippy::too_many_arguments)]
+fn process_load_request(
+    req: &LoadRequest,
+    cache_map: &std::collections::HashMap<String, crate::catalog::CacheEntry>,
+    tx: &mpsc::Sender<ThumbMsg>,
+    catalog: Option<&crate::catalog::CatalogDb>,
+    thumb_px: u32,
+    thumb_quality: u8,
+    display_px: u32,
+    cache_decision: CacheDecision,
+    gen_done: &Arc<AtomicUsize>,
+) {
+    let filename = req
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
+    // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
+    if !req.skip_cache {
+        if let Some(entry) = cache_map.get(filename) {
+            if entry.mtime == req.mtime && entry.file_size == req.file_size {
+                let ci = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data);
+                // from_cache = true: アップグレード対象
+                let _ = tx.send((req.idx, ci, true));
+                gen_done.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
+    // load_one_cached は from_cache = false を送信する
+    load_one_cached(
+        &req.path, req.idx, tx, catalog,
+        req.mtime, req.file_size, gen_done,
+        thumb_px, thumb_quality, display_px, cache_decision,
+    );
+}
+
+/// 1枚の画像をデコードしてサムネイルを生成し、(条件を満たせば) カタログに保存して
+/// チャネルへ送信する。
 /// catalog が None の場合はカタログへの保存をスキップする。
 /// gen_done は処理完了時にインクリメントする進捗カウンタ。
+///
+/// 段階 A 以降のフロー:
+/// 1. `image::open` でフルデコード
+/// 2. **表示用 ColorImage を直接生成してチャネル送信** (UI を先に更新)
+/// 3. 段階 C: `CacheDecision` で保存要否を判定
+/// 4. 保存対象かつ catalog が指定されていれば WebP エンコード → DB 保存
+///
+/// 2 → 3/4 の順にすることで、UI 応答性を優先しつつキャッシュも作成する。
+/// 表示は元画像から直接生成するため WebP 量子化の画質劣化が無い。
+#[allow(clippy::too_many_arguments)]
 fn load_one_cached(
     path: &Path,
     idx: usize,
-    tx: &mpsc::Sender<(usize, Option<egui::ColorImage>)>,
+    tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
     mtime: i64,
     file_size: i64,
     gen_done: &Arc<AtomicUsize>,
     thumb_px: u32,
+    thumb_quality: u8,
+    display_px: u32,
+    cache_decision: CacheDecision,
 ) {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
     let t = std::time::Instant::now();
@@ -2079,45 +3638,58 @@ fn load_one_cached(
         let f = std::fs::File::open(path)?;
         image::ImageReader::new(BufReader::new(f))
             .with_guessed_format()
-            .map_err(|e| image::ImageError::IoError(e))?
+            .map_err(image::ImageError::IoError)?
             .decode()
     });
 
-    match img_result {
-        Ok(img) => {
-            let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
-            let t2 = std::time::Instant::now();
-
-            match crate::catalog::encode_thumb_jpeg(&img, thumb_px) {
-                Some((jpeg_data, w, h)) => {
-                    let encode_ms = t2.elapsed().as_secs_f64() * 1000.0;
-
-                    // カタログに保存
-                    if let Some(cat) = catalog {
-                        if let Err(e) = cat.save(name, mtime, file_size, w, h, &jpeg_data) {
-                            crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
-                        }
-                    }
-
-                    // JPEG → ColorImage でチャネルへ送信
-                    let color_image = crate::catalog::jpeg_to_color_image(&jpeg_data);
-                    let _ = tx.send((idx, color_image));
-
-                    crate::logger::log(format!(
-                        "    idx={idx:>4} decode={decode_ms:>6.1}ms encode={encode_ms:>5.1}ms  {name}"
-                    ));
-                }
-                None => {
-                    crate::logger::log(format!("    idx={idx:>4} JPEG encode FAIL  {name}"));
-                    let _ = tx.send((idx, None));
-                }
-            }
-        }
+    let img = match img_result {
+        Ok(i) => i,
         Err(e) => {
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {name}"));
-            let _ = tx.send((idx, None));
+            let _ = tx.send((idx, None, false));
+            gen_done.fetch_add(1, Ordering::Relaxed);
+            return;
         }
+    };
+    let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // (A) 表示用パス: 元画像から直接セルサイズにリサイズして UI へ送信
+    //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
+    //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
+    let t_display = std::time::Instant::now();
+    let display_ci = resize_to_display_color_image(&img, display_px);
+    let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
+    let _ = tx.send((idx, Some(display_ci), false));
+
+    // (B) キャッシュ保存判定 (段階 C)
+    //     catalog 未指定時は保存不可
+    //     それ以外は CacheDecision の判定に従う
+    let should_save = catalog.is_some()
+        && cache_decision.should_cache(path, file_size, decode_ms, display_ms);
+
+    if should_save {
+        let cat = catalog.expect("should_save => catalog is Some");
+        let t_enc = std::time::Instant::now();
+        match crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32) {
+            Some((webp_data, w, h)) => {
+                let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+                if let Err(e) = cat.save(name, mtime, file_size, w, h, &webp_data) {
+                    crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
+                }
+                crate::logger::log(format!(
+                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {name}"
+                ));
+            }
+            None => {
+                crate::logger::log(format!("    idx={idx:>4} WebP encode FAIL  {name}"));
+            }
+        }
+    } else {
+        crate::logger::log(format!(
+            "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {name}"
+        ));
     }
+
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
     gen_done.fetch_add(1, Ordering::Relaxed);
 }
@@ -2277,6 +3849,130 @@ fn last_descendant_dir(path: &std::path::Path) -> PathBuf {
         Some(last) => last_descendant_dir(last),
         None => path.to_path_buf(),
     }
+}
+
+/// path 以下のすべてのサブフォルダ（path 自身を含む）を再帰的に収集する。
+fn walk_dirs_recursive(path: &Path, out: &mut Vec<PathBuf>, cancel: &AtomicBool) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    if !path.is_dir() {
+        return;
+    }
+    out.push(path.to_path_buf());
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk_dirs_recursive(&p, out, cancel);
+            }
+        }
+    }
+}
+
+/// 画像1枚をデコード・エンコード・カタログ保存する。成功時は WebP バイト数を返す。
+/// load_one_cached と違い、mpsc 送信・ログ出力・進捗更新は行わないバッチ処理専用版。
+fn build_and_save_one(
+    path: &Path,
+    catalog: &crate::catalog::CatalogDb,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+) -> Option<usize> {
+    // 拡張子ベース → マジックバイト fallback（load_one_cached と同じ方針）
+    let img = image::open(path)
+        .or_else(|_| {
+            use std::io::BufReader;
+            let f = std::fs::File::open(path)?;
+            image::ImageReader::new(BufReader::new(f))
+                .with_guessed_format()
+                .map_err(image::ImageError::IoError)?
+                .decode()
+        })
+        .ok()?;
+
+    let (webp_data, w, h) =
+        crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32)?;
+    let name = path.file_name()?.to_str()?;
+    catalog.save(name, mtime, file_size, w, h, &webp_data).ok()?;
+    Some(webp_data.len())
+}
+
+/// バイト数を MB / GB 単位の文字列にフォーマットする（cache_manager と同じ方式）。
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// 小さいバイト数 (サムネイル単体) を KB / MB の文字列にフォーマット。
+fn format_bytes_small(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// サムネイル画質プレビュー用: 実グリッドと同じ `cell_w × cell_h` のセルを描画する。
+/// 白背景 + 4px パディング、画像はアスペクト保持で中央配置（draw_cell と同じ方式）。
+/// クリック可能で、クリック時は Response.clicked() が true になる。
+fn tq_draw_preview(
+    ui: &mut egui::Ui,
+    tex: &Option<egui::TextureHandle>,
+    cell_w: f32,
+    cell_h: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(cell_w, cell_h),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter();
+    // 白背景（選択状態ではないグリッドセルと同じ）
+    painter.rect_filled(rect, 2.0, egui::Color32::WHITE);
+
+    let padding = 4.0;
+    let inner = rect.shrink(padding);
+
+    match tex {
+        Some(t) => {
+            let tex_size = t.size_vec2();
+            let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
+            let img_size = tex_size * scale;
+            let img_rect = egui::Rect::from_center_size(inner.center(), img_size);
+            painter.image(
+                t.id(),
+                img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        None => {
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                "エンコード失敗",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_gray(120),
+            );
+        }
+    }
+
+    // ホバー時にカーソル変更 + 縁を青くしてクリック可能さを示す
+    if response.hovered() {
+        painter.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 220)),
+            egui::StrokeKind::Outside,
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    response
 }
 
 /// パス直下のサブフォルダを名前順で返す（隠しフォルダは含む）

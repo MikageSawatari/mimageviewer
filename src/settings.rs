@@ -87,6 +87,33 @@ impl SortOrder {
 }
 
 // -----------------------------------------------------------------------
+// CachePolicy
+// -----------------------------------------------------------------------
+
+/// サムネイルキャッシュの生成ポリシー（段階 C）。
+///
+/// - `Off`: 新規キャッシュを生成しない（既存キャッシュは引き続き読み込む）
+/// - `Auto`: 実測時間としきい値/サイズによる自動判定（推奨デフォルト）
+/// - `Always`: 現状互換の全件生成
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Default)]
+pub enum CachePolicy {
+    Off,
+    #[default]
+    Auto,
+    Always,
+}
+
+impl CachePolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off    => "Off（生成しない）",
+            Self::Auto   => "Auto（自動判定・推奨）",
+            Self::Always => "Always（常に生成）",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Parallelism
 // -----------------------------------------------------------------------
 
@@ -153,6 +180,45 @@ pub struct Settings {
     /// サムネイルキャッシュの長辺ピクセル数
     #[serde(default = "default_thumb_px")]
     pub thumb_px: u32,
+    /// サムネイルキャッシュの WebP 品質 (1–100)
+    #[serde(default = "default_thumb_quality")]
+    pub thumb_quality: u8,
+    /// サムネイルキャッシュ生成ポリシー（段階 C）
+    #[serde(default)]
+    pub cache_policy: CachePolicy,
+    /// Auto モード: `decode + display` がこの値以上のファイルをキャッシュ対象にする（ms, 10-100）
+    #[serde(default = "default_cache_threshold_ms")]
+    pub cache_threshold_ms: u32,
+    /// Auto モード: このサイズ以上のファイルは無条件でキャッシュ対象にする（bytes）
+    #[serde(default = "default_cache_size_threshold_bytes")]
+    pub cache_size_threshold_bytes: u64,
+    /// Auto モード: 動画ファイルを無条件でキャッシュ対象にする
+    #[serde(default = "default_true")]
+    pub cache_videos_always: bool,
+    /// Auto モード: 既存 .webp ファイルを無条件でキャッシュ対象にする（デコードが重いため）
+    #[serde(default = "default_true")]
+    pub cache_webp_always: bool,
+    /// 段階 B: サムネイル先読みの後方ページ数（現在位置より前に保持するページ数）
+    #[serde(default = "default_thumb_prev_pages")]
+    pub thumb_prev_pages: u32,
+    /// 段階 B: サムネイル先読みの前方ページ数（現在位置より後に保持するページ数）
+    #[serde(default = "default_thumb_next_pages")]
+    pub thumb_next_pages: u32,
+    /// 段階 D: サムネイル GPU 使用量の上限 (プライマリ GPU の総 VRAM に対する %)。
+    /// 0 で無制限。
+    ///
+    /// ページ単位先読みで枚数は有界化されるが、巨大セル × 多ページ設定で
+    /// 想定外に増えるケースへの安全ネット。超過時は keep_range を縮める。
+    /// 実機の VRAM を DXGI で取得し、この % 倍を実上限とする。
+    #[serde(default = "default_thumb_vram_cap_percent")]
+    pub thumb_vram_cap_percent: u32,
+    /// 段階 E: アイドル時にキャッシュから復元されたサムネイルを
+    /// 元画像から再デコードして高画質化する。
+    ///
+    /// `Off`: 何もしない (キャッシュ画質のまま)
+    /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
+    #[serde(default = "default_true")]
+    pub thumb_idle_upgrade: bool,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -160,6 +226,13 @@ fn default_prefetch_back() -> usize { 4 }
 fn default_prefetch_forward() -> usize { 12 }
 fn default_folder_skip_limit() -> usize { 3 }
 fn default_thumb_px() -> u32 { 512 }
+fn default_thumb_quality() -> u8 { 75 }
+fn default_cache_threshold_ms() -> u32 { 25 }
+fn default_cache_size_threshold_bytes() -> u64 { 2_000_000 }
+fn default_true() -> bool { true }
+fn default_thumb_prev_pages() -> u32 { 2 }
+fn default_thumb_next_pages() -> u32 { 4 }
+fn default_thumb_vram_cap_percent() -> u32 { 50 }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -176,6 +249,16 @@ impl Default for Settings {
             folder_skip_limit: default_folder_skip_limit(),
             sort_order: SortOrder::default(),
             thumb_px: default_thumb_px(),
+            thumb_quality: default_thumb_quality(),
+            cache_policy: CachePolicy::default(),
+            cache_threshold_ms: default_cache_threshold_ms(),
+            cache_size_threshold_bytes: default_cache_size_threshold_bytes(),
+            cache_videos_always: true,
+            cache_webp_always: true,
+            thumb_prev_pages: default_thumb_prev_pages(),
+            thumb_next_pages: default_thumb_next_pages(),
+            thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
+            thumb_idle_upgrade: true,
         }
     }
 }
