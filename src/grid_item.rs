@@ -68,3 +68,50 @@ pub enum ThumbnailState {
     /// 再び範囲内に入ったら再ロードされる
     Evicted,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_name() {
+        let item = GridItem::Folder(PathBuf::from(r"C:\foo\bar"));
+        assert_eq!(item.name(), "bar");
+    }
+
+    #[test]
+    fn image_name() {
+        let item = GridItem::Image(PathBuf::from(r"D:\photos\sunset.jpg"));
+        assert_eq!(item.name(), "sunset.jpg");
+    }
+
+    #[test]
+    fn video_name() {
+        let item = GridItem::Video(PathBuf::from(r"E:\videos\clip.mp4"));
+        assert_eq!(item.name(), "clip.mp4");
+    }
+
+    #[test]
+    fn zip_image_name() {
+        let item = GridItem::ZipImage {
+            zip_path: PathBuf::from(r"C:\archive.zip"),
+            entry_name: "chapter1/page01.jpg".to_string(),
+        };
+        assert_eq!(item.name(), "page01.jpg");
+    }
+
+    #[test]
+    fn zip_separator_name() {
+        let item = GridItem::ZipSeparator {
+            dir_display: "Chapter 1".to_string(),
+        };
+        assert_eq!(item.name(), "Chapter 1");
+    }
+
+    #[test]
+    fn name_root_path() {
+        // ルートパスの場合、file_name() は None → ""
+        let item = GridItem::Folder(PathBuf::from(r"C:\"));
+        assert_eq!(item.name(), "");
+    }
+}

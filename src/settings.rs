@@ -64,7 +64,7 @@ impl serde::Serialize for FavoriteEntry {
 // サムネイルアスペクト比
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum ThumbAspect {
     Landscape16x9,
     Landscape3x2,
@@ -119,7 +119,7 @@ impl ThumbAspect {
 // SortOrder
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SortOrder {
     #[default]
     FileName,   // ファイル名順（辞書順）
@@ -182,7 +182,7 @@ impl SortOrder {
 /// - `Off`: 新規キャッシュを生成しない（既存キャッシュは引き続き読み込む）
 /// - `Auto`: 実測時間としきい値/サイズによる自動判定（推奨デフォルト）
 /// - `Always`: 現状互換の全件生成
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum CachePolicy {
     Off,
     #[default]
@@ -204,7 +204,7 @@ impl CachePolicy {
 // Parallelism
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "mode", content = "value")]
 pub enum Parallelism {
     Auto,
@@ -418,5 +418,195 @@ impl Settings {
         }
         self.favorites.push(FavoriteEntry { name, path });
         true
+    }
+}
+
+// -----------------------------------------------------------------------
+// テスト
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Settings defaults --
+
+    #[test]
+    fn settings_default_values() {
+        let s = Settings::default();
+        assert_eq!(s.grid_cols, 4);
+        assert_eq!(s.thumb_aspect, ThumbAspect::Square);
+        assert!(s.favorites.is_empty());
+        assert!(s.last_folder.is_none());
+        assert!(s.window_pos.is_none());
+        assert!(s.window_size.is_none());
+        assert_eq!(s.prefetch_back, 4);
+        assert_eq!(s.prefetch_forward, 12);
+        assert_eq!(s.folder_skip_limit, 3);
+        assert_eq!(s.sort_order, SortOrder::FileName);
+        assert_eq!(s.thumb_px, 512);
+        assert_eq!(s.thumb_quality, 75);
+        assert_eq!(s.cache_policy, CachePolicy::Auto);
+        assert_eq!(s.cache_threshold_ms, 25);
+        assert_eq!(s.cache_size_threshold_bytes, 2_000_000);
+        assert!(s.cache_videos_always);
+        assert!(s.cache_webp_always);
+        assert_eq!(s.thumb_prev_pages, 2);
+        assert_eq!(s.thumb_next_pages, 4);
+        assert_eq!(s.thumb_vram_cap_percent, 50);
+        assert!(s.thumb_idle_upgrade);
+        assert!(s.show_toolbar_favorites);
+        assert!(s.show_toolbar_folder);
+    }
+
+    // -- Settings JSON roundtrip --
+
+    #[test]
+    fn settings_roundtrip_json() {
+        let original = Settings::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.grid_cols, original.grid_cols);
+        assert_eq!(loaded.thumb_px, original.thumb_px);
+        assert_eq!(loaded.thumb_quality, original.thumb_quality);
+        assert_eq!(loaded.cache_threshold_ms, original.cache_threshold_ms);
+        assert_eq!(loaded.prefetch_back, original.prefetch_back);
+    }
+
+    #[test]
+    fn settings_missing_fields_use_defaults() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.grid_cols, 4);
+        assert_eq!(loaded.thumb_px, 512);
+        assert_eq!(loaded.thumb_quality, 75);
+        assert!(loaded.favorites.is_empty());
+    }
+
+    // -- FavoriteEntry serde --
+
+    #[test]
+    fn favorite_deserialize_legacy_string() {
+        let json = r#""C:\\foo\\bar""#;
+        let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.name, "bar");
+        assert_eq!(entry.path, PathBuf::from(r"C:\foo\bar"));
+    }
+
+    #[test]
+    fn favorite_deserialize_new_format() {
+        let json = r#"{"name":"My Folder","path":"C:\\foo"}"#;
+        let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.name, "My Folder");
+        assert_eq!(entry.path, PathBuf::from(r"C:\foo"));
+    }
+
+    #[test]
+    fn favorite_serialize_always_object() {
+        let entry = FavoriteEntry {
+            name: "Test".to_string(),
+            path: PathBuf::from(r"C:\test"),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        // オブジェクト形式で出力されることを確認
+        assert!(json.contains("\"name\""));
+        assert!(json.contains("\"path\""));
+    }
+
+    // -- ThumbAspect --
+
+    #[test]
+    fn thumb_aspect_height_ratio() {
+        let eps = 1e-6;
+        assert!((ThumbAspect::Square.height_ratio() - 1.0).abs() < eps);
+        assert!((ThumbAspect::Landscape16x9.height_ratio() - 9.0 / 16.0).abs() < eps);
+        assert!((ThumbAspect::Landscape3x2.height_ratio() - 2.0 / 3.0).abs() < eps);
+        assert!((ThumbAspect::Landscape4x3.height_ratio() - 3.0 / 4.0).abs() < eps);
+        assert!((ThumbAspect::Portrait3x4.height_ratio() - 4.0 / 3.0).abs() < eps);
+        assert!((ThumbAspect::Portrait2x3.height_ratio() - 3.0 / 2.0).abs() < eps);
+        assert!((ThumbAspect::Portrait9x16.height_ratio() - 16.0 / 9.0).abs() < eps);
+    }
+
+    #[test]
+    fn thumb_aspect_all_has_all_variants() {
+        assert_eq!(ThumbAspect::all().len(), 7);
+    }
+
+    // -- SortOrder --
+
+    #[test]
+    fn sort_order_compare_filename() {
+        let ord = SortOrder::FileName;
+        let result = ord.compare("Bbb.jpg", 0, "aaa.jpg", 0, |s: &str| s.to_string());
+        assert_eq!(result, std::cmp::Ordering::Greater); // "bbb" > "aaa"
+    }
+
+    #[test]
+    fn sort_order_compare_date() {
+        assert_eq!(
+            SortOrder::DateAsc.compare("a", 100, "b", 200, |s: &str| s.to_string()),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            SortOrder::DateDesc.compare("a", 100, "b", 200, |s: &str| s.to_string()),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    // -- CachePolicy --
+
+    #[test]
+    fn cache_policy_labels() {
+        // 全バリアントにラベルがあることを確認（空でない）
+        assert!(!CachePolicy::Off.label().is_empty());
+        assert!(!CachePolicy::Auto.label().is_empty());
+        assert!(!CachePolicy::Always.label().is_empty());
+    }
+
+    // -- Parallelism --
+
+    #[test]
+    fn parallelism_manual_min_one() {
+        assert_eq!(Parallelism::Manual(0).thread_count(), 1);
+        assert_eq!(Parallelism::Manual(1).thread_count(), 1);
+        assert_eq!(Parallelism::Manual(4).thread_count(), 4);
+    }
+
+    #[test]
+    fn parallelism_serde_tagged() {
+        let auto: Parallelism = serde_json::from_str(r#"{"mode":"Auto"}"#).unwrap();
+        assert_eq!(auto, Parallelism::Auto);
+
+        let manual: Parallelism =
+            serde_json::from_str(r#"{"mode":"Manual","value":4}"#).unwrap();
+        assert_eq!(manual, Parallelism::Manual(4));
+    }
+
+    // -- add_favorite --
+
+    #[test]
+    fn add_favorite_success() {
+        let mut s = Settings::default();
+        assert!(s.add_favorite("Test".to_string(), PathBuf::from(r"C:\test")));
+        assert_eq!(s.favorites.len(), 1);
+    }
+
+    #[test]
+    fn add_favorite_duplicate() {
+        let mut s = Settings::default();
+        s.add_favorite("Test".to_string(), PathBuf::from(r"C:\test"));
+        assert!(!s.add_favorite("Test2".to_string(), PathBuf::from(r"C:\test")));
+        assert_eq!(s.favorites.len(), 1);
+    }
+
+    #[test]
+    fn add_favorite_max_limit() {
+        let mut s = Settings::default();
+        for i in 0..MAX_FAVORITES {
+            assert!(s.add_favorite(format!("F{i}"), PathBuf::from(format!(r"C:\dir{i}"))));
+        }
+        assert_eq!(s.favorites.len(), MAX_FAVORITES);
+        // 21個目は追加できない
+        assert!(!s.add_favorite("Overflow".to_string(), PathBuf::from(r"C:\overflow")));
+        assert_eq!(s.favorites.len(), MAX_FAVORITES);
     }
 }

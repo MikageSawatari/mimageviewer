@@ -2148,6 +2148,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "webp",
  "windows 0.61.3",
  "winresource",

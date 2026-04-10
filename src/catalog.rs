@@ -300,3 +300,214 @@ fn collect_db_paths(cache_dir: &Path, cb: &mut impl FnMut(&Path, std::fs::Metada
 fn collect_db_files(cache_dir: &Path, cb: &mut impl FnMut(std::fs::Metadata)) {
     collect_db_paths(cache_dir, &mut |_, meta| cb(meta));
 }
+
+// -----------------------------------------------------------------------
+// テスト
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    /// テスト用: in-memory SQLite で CatalogDb を作成する。
+    fn open_in_memory() -> CatalogDb {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        init_schema(&conn).unwrap();
+        CatalogDb {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    // -- normalize_path --
+
+    #[test]
+    fn normalize_path_removes_drive_letter() {
+        let p = Path::new(r"C:\Users\foo");
+        assert_eq!(normalize_path(p), "/users/foo");
+    }
+
+    #[test]
+    fn normalize_path_no_drive() {
+        let p = Path::new(r"\already\unix");
+        assert_eq!(normalize_path(p), "/already/unix");
+    }
+
+    #[test]
+    fn normalize_path_backslash_to_slash() {
+        let p = Path::new(r"D:\a\b\c");
+        let result = normalize_path(p);
+        assert!(!result.contains('\\'), "should not contain backslash: {result}");
+        assert!(result.contains("/a/b/c"));
+    }
+
+    #[test]
+    fn normalize_path_lowercase() {
+        let p = Path::new(r"E:\MyFolder\SubDir");
+        let result = normalize_path(p);
+        assert_eq!(result, "/myfolder/subdir");
+    }
+
+    // -- db_path_for --
+
+    #[test]
+    fn db_path_for_deterministic() {
+        let cache = Path::new(r"C:\cache");
+        let folder = Path::new(r"D:\photos\2024");
+        let a = db_path_for(cache, folder);
+        let b = db_path_for(cache, folder);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn db_path_for_different_paths() {
+        let cache = Path::new(r"C:\cache");
+        let a = db_path_for(cache, Path::new(r"D:\photos\2024"));
+        let b = db_path_for(cache, Path::new(r"D:\photos\2025"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn db_path_for_case_insensitive() {
+        let cache = Path::new(r"C:\cache");
+        let a = db_path_for(cache, Path::new(r"C:\Photos\Vacation"));
+        let b = db_path_for(cache, Path::new(r"D:\photos\vacation"));
+        // ドライブ文字は除去され、小文字化されるので同じパスになるはず
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn db_path_for_structure() {
+        let cache = Path::new(r"C:\cache");
+        let result = db_path_for(cache, Path::new(r"D:\test"));
+        let result_str = result.to_string_lossy();
+        // {cache_dir}/{xx}/{hash}.db の形式
+        assert!(result_str.starts_with(r"C:\cache\"));
+        assert!(result_str.ends_with(".db"));
+        // xx サブディレクトリが2文字の hex
+        let relative = result.strip_prefix(cache).unwrap();
+        let components: Vec<_> = relative.components().collect();
+        assert_eq!(components.len(), 2); // xx/ と hash.db
+    }
+
+    // -- CatalogDb schema --
+
+    #[test]
+    fn catalog_open_and_schema() {
+        let db = open_in_memory();
+        let conn = db.conn.lock().unwrap();
+        // meta テーブルにバージョンが記録されているか
+        let version: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'version'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, CATALOG_VERSION);
+    }
+
+    // -- CatalogDb CRUD --
+
+    #[test]
+    fn catalog_save_and_load_all() {
+        let db = open_in_memory();
+        db.save("test.jpg", 1000, 2048, 256, 192, Some((4000, 3000)), b"fake_webp")
+            .unwrap();
+
+        let map = db.load_all().unwrap();
+        assert_eq!(map.len(), 1);
+        let entry = &map["test.jpg"];
+        assert_eq!(entry.mtime, 1000);
+        assert_eq!(entry.file_size, 2048);
+        assert_eq!(entry.jpeg_data, b"fake_webp");
+        assert_eq!(entry.source_dims, Some((4000, 3000)));
+    }
+
+    #[test]
+    fn catalog_save_overwrites() {
+        let db = open_in_memory();
+        db.save("img.jpg", 100, 500, 128, 96, None, b"data1")
+            .unwrap();
+        db.save("img.jpg", 200, 600, 128, 96, None, b"data2")
+            .unwrap();
+
+        let map = db.load_all().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["img.jpg"].mtime, 200);
+        assert_eq!(map["img.jpg"].jpeg_data, b"data2");
+    }
+
+    #[test]
+    fn catalog_source_dims_none() {
+        let db = open_in_memory();
+        db.save("no_dims.jpg", 100, 500, 128, 96, None, b"data")
+            .unwrap();
+
+        let map = db.load_all().unwrap();
+        assert_eq!(map["no_dims.jpg"].source_dims, None);
+    }
+
+    #[test]
+    fn catalog_delete_missing() {
+        let db = open_in_memory();
+        db.save("keep.jpg", 100, 500, 128, 96, None, b"a").unwrap();
+        db.save("remove.jpg", 200, 600, 128, 96, None, b"b").unwrap();
+        db.save("also_remove.jpg", 300, 700, 128, 96, None, b"c").unwrap();
+
+        let existing: HashSet<String> = ["keep.jpg".to_string()].into_iter().collect();
+        db.delete_missing(&existing).unwrap();
+
+        let map = db.load_all().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("keep.jpg"));
+    }
+
+    #[test]
+    fn catalog_version_mismatch_clears() {
+        // 1) DB を作成してデータを保存
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO thumbnails (filename, mtime, file_size, width, height, thumb_data) \
+             VALUES ('old.jpg', 1, 1, 1, 1, X'00')",
+            [],
+        )
+        .unwrap();
+        // データが存在することを確認
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM thumbnails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // 2) バージョンを不正な値に書き換え
+        conn.execute(
+            "UPDATE meta SET value = 'old_version' WHERE key = 'version'",
+            [],
+        )
+        .unwrap();
+
+        // 3) init_schema を再度呼ぶとバージョン不一致で全削除されるはず
+        init_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM thumbnails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // -- WebP encode/decode --
+
+    #[test]
+    fn encode_thumb_webp_basic() {
+        // 小さな 4x4 テスト画像を生成
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |x, y| {
+            image::Rgb([(x * 60) as u8, (y * 60) as u8, 128])
+        }));
+        let result = encode_thumb_webp(&img, 4, 75.0);
+        assert!(result.is_some());
+        let (data, w, h) = result.unwrap();
+        assert!(!data.is_empty());
+        assert!(w <= 4 && h <= 4);
+    }
+}

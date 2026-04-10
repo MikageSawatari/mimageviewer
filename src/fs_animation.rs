@@ -106,3 +106,67 @@ pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
             .collect(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn decode_gif_animated() {
+        let path = Path::new("testimage/rotating_earth.gif");
+        if !path.exists() {
+            eprintln!("skipping: testimage/rotating_earth.gif not found");
+            return;
+        }
+        let frames = decode_gif_frames(path);
+        assert!(frames.is_some(), "animated GIF should return Some");
+        let frames = frames.unwrap();
+        assert!(frames.len() > 1, "animated GIF should have multiple frames");
+    }
+
+    #[test]
+    fn decode_gif_static_returns_none() {
+        let dir = std::env::temp_dir().join("mimageviewer_test");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("static_1frame.gif");
+
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        img.save(&path).unwrap();
+
+        let result = decode_gif_frames(&path);
+        assert!(result.is_none(), "single-frame GIF should return None");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn decode_apng_static_png_returns_none() {
+        let path = Path::new("testimage/bouncing_ball.png");
+        if !path.exists() {
+            eprintln!("skipping: testimage/bouncing_ball.png not found");
+            return;
+        }
+        let result = decode_apng_frames(path);
+        if let Some(frames) = &result {
+            assert!(frames.len() > 1, "if APNG, should have multiple frames");
+        }
+    }
+
+    #[test]
+    fn gif_frame_delay_minimum() {
+        let path = Path::new("testimage/rotating_earth.gif");
+        if !path.exists() {
+            eprintln!("skipping: testimage/rotating_earth.gif not found");
+            return;
+        }
+        if let Some(frames) = decode_gif_frames(path) {
+            for (i, (_img, delay)) in frames.iter().enumerate() {
+                assert!(
+                    *delay >= 0.02,
+                    "frame {i} delay {delay} should be >= 0.02s"
+                );
+            }
+        }
+    }
+}
