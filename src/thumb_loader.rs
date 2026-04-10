@@ -19,10 +19,11 @@ use std::sync::{mpsc, Arc, Mutex};
 
 /// サムネイル読み込み結果メッセージ。
 ///
-/// `(item_idx, Option<ColorImage>, from_cache)`
+/// `(item_idx, Option<ColorImage>, from_cache, source_dims)`
 /// - `from_cache = true`: WebP キャッシュから復元 (段階 E アップグレード対象)
 /// - `from_cache = false`: 元画像から直接デコード (高画質) または動画 Shell API
-pub type ThumbMsg = (usize, Option<egui::ColorImage>, bool);
+/// - `source_dims`: 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None
+pub type ThumbMsg = (usize, Option<egui::ColorImage>, bool, Option<(u32, u32)>);
 
 /// 段階 B: サムネイル読み込み要求。
 ///
@@ -181,7 +182,9 @@ pub fn process_load_request(
             if entry.mtime == req.mtime && entry.file_size == req.file_size {
                 let ci = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data);
                 // from_cache = true: アップグレード対象
-                let _ = tx.send((req.idx, ci, true));
+                // source_dims はカタログ由来 (旧バージョンで作成された
+                // エントリには None が入っている)
+                let _ = tx.send((req.idx, ci, true, entry.source_dims));
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 // 統計には記録しない: キャッシュヒットは 2-3 ms で
                 // "キャッシュ無し時のコスト" を歪めるため
@@ -270,7 +273,7 @@ pub fn load_one_cached(
         Ok(i) => i,
         Err(e) => {
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {name}"));
-            let _ = tx.send((idx, None, false));
+            let _ = tx.send((idx, None, false, None));
             gen_done.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = stats.lock() {
                 s.record_failed();
@@ -280,13 +283,16 @@ pub fn load_one_cached(
     };
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    // 元画像のピクセル寸法 (サムネイル情報オーバーレイで使う)
+    let source_dims: Option<(u32, u32)> = Some((img.width(), img.height()));
+
     // (A) 表示用パス: 元画像から直接セルサイズにリサイズして UI へ送信
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
     //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
     let t_display = std::time::Instant::now();
     let display_ci = resize_to_display_color_image(&img, display_px);
     let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
-    let _ = tx.send((idx, Some(display_ci), false));
+    let _ = tx.send((idx, Some(display_ci), false, source_dims));
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
     {
@@ -313,7 +319,9 @@ pub fn load_one_cached(
         match crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32) {
             Some((webp_data, w, h)) => {
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                if let Err(e) = cat.save(name, mtime, file_size, w, h, &webp_data) {
+                if let Err(e) =
+                    cat.save(name, mtime, file_size, w, h, source_dims, &webp_data)
+                {
                     crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
                 }
                 crate::logger::log(format!(
@@ -462,9 +470,12 @@ pub fn build_and_save_one(
         })
         .ok()?;
 
+    let source_dims = Some((img.width(), img.height()));
     let (webp_data, w, h) =
         crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32)?;
     let name = path.file_name()?.to_str()?;
-    catalog.save(name, mtime, file_size, w, h, &webp_data).ok()?;
+    catalog
+        .save(name, mtime, file_size, w, h, source_dims, &webp_data)
+        .ok()?;
     Some(webp_data.len())
 }

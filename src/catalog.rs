@@ -40,6 +40,9 @@ pub struct CacheEntry {
     pub mtime: i64,
     pub file_size: i64,
     pub jpeg_data: Vec<u8>,
+    /// 元画像のピクセル寸法 (幅, 高さ)。
+    /// 旧バージョンで保存されたエントリには NULL が入るため Option で表現する。
+    pub source_dims: Option<(u32, u32)>,
 }
 
 // -----------------------------------------------------------------------
@@ -70,7 +73,8 @@ impl CatalogDb {
     pub fn load_all(&self) -> rusqlite::Result<HashMap<String, CacheEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT filename, mtime, file_size, thumb_data FROM thumbnails",
+            "SELECT filename, mtime, file_size, thumb_data, source_width, source_height \
+             FROM thumbnails",
         )?;
         let mut map = HashMap::new();
         let iter = stmt.query_map([], |row| {
@@ -79,16 +83,29 @@ impl CatalogDb {
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<u32>>(5)?,
             ))
         })?;
         for item in iter.flatten() {
-            let (filename, mtime, file_size, jpeg_data) = item;
-            map.insert(filename, CacheEntry { mtime, file_size, jpeg_data });
+            let (filename, mtime, file_size, jpeg_data, src_w, src_h) = item;
+            let source_dims = match (src_w, src_h) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            };
+            map.insert(
+                filename,
+                CacheEntry { mtime, file_size, jpeg_data, source_dims },
+            );
         }
         Ok(map)
     }
 
     /// サムネイルを INSERT OR REPLACE で保存する。
+    ///
+    /// `width` / `height` はキャッシュされる WebP サムネイルの寸法、
+    /// `source_dims` は元画像の寸法 (未取得なら None)。
+    #[allow(clippy::too_many_arguments)]
     pub fn save(
         &self,
         filename: &str,
@@ -96,14 +113,17 @@ impl CatalogDb {
         file_size: i64,
         width: u32,
         height: u32,
+        source_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
+        let src_w: Option<u32> = source_dims.map(|(w, _)| w);
+        let src_h: Option<u32> = source_dims.map(|(_, h)| h);
         conn.execute(
             "INSERT OR REPLACE INTO thumbnails \
-             (filename, mtime, file_size, width, height, thumb_data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![filename, mtime, file_size, width, height, jpeg_data],
+             (filename, mtime, file_size, width, height, thumb_data, source_width, source_height) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![filename, mtime, file_size, width, height, jpeg_data, src_w, src_h],
         )?;
         Ok(())
     }
@@ -136,14 +156,27 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              value TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS thumbnails (
-             filename   TEXT    NOT NULL PRIMARY KEY,
-             mtime      INTEGER NOT NULL,
-             file_size  INTEGER NOT NULL,
-             width      INTEGER NOT NULL,
-             height     INTEGER NOT NULL,
-             thumb_data BLOB    NOT NULL
+             filename       TEXT    NOT NULL PRIMARY KEY,
+             mtime          INTEGER NOT NULL,
+             file_size      INTEGER NOT NULL,
+             width          INTEGER NOT NULL,
+             height         INTEGER NOT NULL,
+             thumb_data     BLOB    NOT NULL,
+             source_width   INTEGER,
+             source_height  INTEGER
          );",
     )?;
+    // 非破壊マイグレーション: 既存 DB で source_width/source_height が欠けていれば追加する。
+    // 列が既にある場合 ALTER TABLE はエラーを返すので、結果は無視する。
+    let _ = conn.execute(
+        "ALTER TABLE thumbnails ADD COLUMN source_width INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE thumbnails ADD COLUMN source_height INTEGER",
+        [],
+    );
+
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
     let version: Option<String> = conn
         .query_row(

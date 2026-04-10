@@ -54,10 +54,12 @@ pub enum ThumbnailState {
     /// 段階 E のアイドル時アップグレードで元画像から再デコードされる対象になる。
     /// `rendered_at_px` は生成時の長辺ピクセル数で、現在のセルサイズと比較して
     /// 著しく小さい場合 (列数変更後など) もアップグレード対象になる。
+    /// `source_dims` は元画像のピクセル寸法 (旧カタログ由来は None)。
     Loaded {
         tex: egui::TextureHandle,
         from_cache: bool,
         rendered_at_px: u32,
+        source_dims: Option<(u32, u32)>,
     },
     /// 読み込みに失敗した（再試行しない）
     #[allow(dead_code)]

@@ -78,6 +78,11 @@ pub struct App {
     /// 現フレームで検出された高画質化 (アイドルアップグレード) のピーク件数
     pub(crate) progress_upgrade_peak: usize,
 
+    /// 前フレームで選択中セルが描画された矩形 (スクリーン座標)。
+    /// 選択情報オーバーレイをセル直下に配置するために使用。
+    /// 選択セルがスクロール圏外だと None。
+    pub(crate) selected_cell_rect: Option<egui::Rect>,
+
     // ── 段階 E: アイドル時の画質向上 ─────────────────────────────
     /// 前フレームでの scroll_offset_y（変化検知用）
     pub(crate) last_scroll_offset_y_tracked: f32,
@@ -218,6 +223,7 @@ impl Default for App {
             keep_range: (0, 0),
             progress_normal_peak: 0,
             progress_upgrade_peak: 0,
+            selected_cell_rect: None,
             last_scroll_offset_y_tracked: 0.0,
             last_scroll_change_time: std::time::Instant::now(),
             display_px_shared: Arc::new(AtomicU32::new(512)),
@@ -677,7 +683,8 @@ impl App {
                     s.record_failed();
                 }
                 // 動画 Shell API はアップグレード経路を持たないので from_cache = false
-                let _ = tx.send((idx, ci, false));
+                // ピクセル寸法は取得できないため None
+                let _ = tx.send((idx, ci, false, None));
             }
         });
     }
@@ -685,7 +692,7 @@ impl App {
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         let mut count = 0u32;
         let (keep_start, keep_end) = self.keep_range;
-        while let Ok((i, color_image_opt, from_cache)) = self.rx.try_recv() {
+        while let Ok((i, color_image_opt, from_cache, source_dims)) = self.rx.try_recv() {
             if i < self.thumbnails.len() {
                 // 結果を in-flight セットから除外
                 self.requested.remove(&i);
@@ -707,10 +714,12 @@ impl App {
                             );
                             // 段階 E: from_cache と rendered_at_px を記録し、
                             // アイドル時のアップグレード対象か判定する
+                            // source_dims は選択オーバーレイで使う
                             self.thumbnails[i] = ThumbnailState::Loaded {
                                 tex: handle,
                                 from_cache,
                                 rendered_at_px,
+                                source_dims,
                             };
                         } else {
                             // 範囲外: ColorImage を drop し Evicted にしておく
@@ -1806,6 +1815,9 @@ impl eframe::App for App {
             }
         }
 
+        // 毎フレームリセット: 選択セルが描画された時に再設定される
+        self.selected_cell_rect = None;
+
         self.poll_thumbnails(ctx);
         self.update_keep_range_and_requests();
         self.poll_prefetch(ctx);
@@ -2490,10 +2502,10 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        // ── 選択中アイテムの情報オーバーレイ (右下フローティング) ────
+        // ── 選択中アイテムの情報オーバーレイ (セル直下、セル幅で展開) ────
         // フルスクリーン中は出さない (フルスクリーンには独自の上部バーがある)
         if self.fullscreen_idx.is_none() {
-            if let Some(idx) = self.selected {
+            if let (Some(idx), Some(cell_rect)) = (self.selected, self.selected_cell_rect) {
                 // 区切り・フォルダはスキップ (無意味)
                 let show_info = matches!(
                     self.items.get(idx),
@@ -2507,26 +2519,43 @@ impl eframe::App for App {
                         .get(idx)
                         .map(|it| it.name().to_string())
                         .unwrap_or_default();
-                    let size_str = self
-                        .image_metas
-                        .get(idx)
-                        .and_then(|m| m.map(|(_, sz)| format_bytes_small(sz.max(0) as u64)));
+                    // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
+                    let dims_str = match self.thumbnails.get(idx) {
+                        Some(ThumbnailState::Loaded {
+                            source_dims: Some((w, h)),
+                            ..
+                        }) => Some(format!("{} × {}", w, h)),
+                        _ => None,
+                    };
+                    let text = match dims_str {
+                        Some(d) => format!("{}   {}", d, name),
+                        None => name,
+                    };
+
+                    // セル幅で配置: セルの左下を基点、セル幅に合わせる
+                    let cell_w = cell_rect.width();
+                    let area_pos = cell_rect.left_bottom() + egui::vec2(0.0, 4.0);
 
                     egui::Area::new("selection_info".into())
                         .order(egui::Order::Foreground)
-                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+                        .fixed_pos(area_pos)
                         .show(ctx, |ui| {
                             egui::Frame::popup(ui.style())
                                 .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
                                 .show(ui, |ui| {
-                                    let text = match size_str {
-                                        Some(s) => format!("{}   {}", s, name),
-                                        None => name,
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(text)
-                                            .color(egui::Color32::WHITE)
-                                            .monospace(),
+                                    // Frame 内部の最大幅をセル幅に揃える
+                                    // (左右パディングぶんだけ余裕を取る)
+                                    let inner_width = (cell_w - 12.0).max(40.0);
+                                    ui.set_min_width(inner_width);
+                                    ui.set_max_width(inner_width);
+                                    // 長いファイル名は右端で切り落とす (折り返さない)
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(text)
+                                                .color(egui::Color32::WHITE)
+                                                .monospace(),
+                                        )
+                                        .truncate(),
                                     );
                                 });
                         });
@@ -2725,6 +2754,11 @@ impl eframe::App for App {
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                 );
+
+                                // 選択中セルの矩形を記録 (オーバーレイ配置用)
+                                if self.selected == Some(idx) {
+                                    self.selected_cell_rect = Some(cell_rect);
+                                }
                             }
                         }
                     });
