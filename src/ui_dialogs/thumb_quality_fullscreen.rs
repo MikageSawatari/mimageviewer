@@ -31,16 +31,16 @@ use crate::ui_helpers::{
 impl App {
     pub(crate) fn show_thumb_quality_fullscreen_overlay(&mut self, ctx: &egui::Context) {
         // ── サムネイル画質プレビュー全画面 A/B 比較オーバーレイ ────────
-        if self.tq_fullscreen {
+        if self.tq.fullscreen {
             let screen = ctx.content_rect();
 
             // A・B のテクスチャ。両方とも同じソース画像から作られたサムネイルなので
             // アスペクト比は同一。どちらかのサイズで fit 計算する。
             let ref_size = self
-                .tq_a_texture
+                .tq.a_texture
                 .as_ref()
                 .map(|t| t.size_vec2())
-                .or_else(|| self.tq_b_texture.as_ref().map(|t| t.size_vec2()));
+                .or_else(|| self.tq.b_texture.as_ref().map(|t| t.size_vec2()));
 
             // 画像表示領域を画面中央に計算（下部に情報バー分のスペースを確保）
             let img_rect_opt: Option<egui::Rect> = ref_size.map(|rs| {
@@ -56,7 +56,7 @@ impl App {
                 )
             });
 
-            let divider_t = self.tq_fs_divider.clamp(0.0, 1.0);
+            let divider_t = self.tq.fs_divider.clamp(0.0, 1.0);
 
             let area_resp = egui::Area::new(egui::Id::new("tq_fs_overlay"))
                 .order(egui::Order::Foreground)
@@ -84,7 +84,7 @@ impl App {
                     let divider_x = img_rect.min.x + img_rect.width() * divider_t;
 
                     // A (左側) を divider まで描画
-                    if let Some(ta) = &self.tq_a_texture {
+                    if let Some(ta) = &self.tq.a_texture {
                         let a_rect = egui::Rect::from_min_max(
                             img_rect.min,
                             egui::pos2(divider_x, img_rect.max.y),
@@ -99,7 +99,7 @@ impl App {
                     }
 
                     // B (右側) を divider から描画
-                    if let Some(tb) = &self.tq_b_texture {
+                    if let Some(tb) = &self.tq.b_texture {
                         let b_rect = egui::Rect::from_min_max(
                             egui::pos2(divider_x, img_rect.min.y),
                             img_rect.max,
@@ -202,15 +202,15 @@ impl App {
                     let info_base_y = img_rect.max.y + 24.0;
                     let a_info = format!(
                         "A:  {}px  /  q={}  /  {}",
-                        self.tq_a_size,
-                        self.tq_a_quality,
-                        format_bytes_small(self.tq_a_bytes as u64),
+                        self.tq.a_size,
+                        self.tq.a_quality,
+                        format_bytes_small(self.tq.a_bytes as u64),
                     );
                     let b_info = format!(
                         "B:  {}px  /  q={}  /  {}",
-                        self.tq_b_size,
-                        self.tq_b_quality,
-                        format_bytes_small(self.tq_b_bytes as u64),
+                        self.tq.b_size,
+                        self.tq.b_quality,
+                        format_bytes_small(self.tq.b_bytes as u64),
                     );
                     let info_font = egui::FontId::proportional(14.0);
                     painter.text(
@@ -245,7 +245,7 @@ impl App {
                         if img_rect.width() > 0.0 {
                             let t = ((pos.x - img_rect.min.x) / img_rect.width())
                                 .clamp(0.0, 1.0);
-                            self.tq_fs_divider = t;
+                            self.tq.fs_divider = t;
                             ctx.request_repaint();
                         }
                     }
@@ -265,7 +265,7 @@ impl App {
             let clicked = area_resp.inner.clicked();
             let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if clicked || esc {
-                self.tq_fullscreen = false;
+                self.tq.fullscreen = false;
             }
         }
 

@@ -67,10 +67,12 @@ impl serde::Serialize for FavoriteEntry {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Default)]
 pub enum ThumbAspect {
     Landscape16x9,
+    Landscape3x2,
     Landscape4x3,
     #[default]
     Square,
     Portrait3x4,
+    Portrait2x3,
     Portrait9x16,
 }
 
@@ -79,9 +81,11 @@ impl ThumbAspect {
     pub fn height_ratio(self) -> f32 {
         match self {
             Self::Landscape16x9 =>  9.0 / 16.0,
+            Self::Landscape3x2  =>  2.0 /  3.0,
             Self::Landscape4x3  =>  3.0 /  4.0,
             Self::Square        =>  1.0,
             Self::Portrait3x4   =>  4.0 /  3.0,
+            Self::Portrait2x3   =>  3.0 /  2.0,
             Self::Portrait9x16  => 16.0 /  9.0,
         }
     }
@@ -89,9 +93,11 @@ impl ThumbAspect {
     pub fn label(self) -> &'static str {
         match self {
             Self::Landscape16x9 => "16:9",
+            Self::Landscape3x2  =>  "3:2",
             Self::Landscape4x3  =>  "4:3",
             Self::Square        =>  "1:1",
             Self::Portrait3x4   =>  "3:4",
+            Self::Portrait2x3   =>  "2:3",
             Self::Portrait9x16  => "9:16",
         }
     }
@@ -99,9 +105,11 @@ impl ThumbAspect {
     pub fn all() -> &'static [Self] {
         &[
             Self::Landscape16x9,
+            Self::Landscape3x2,
             Self::Landscape4x3,
             Self::Square,
             Self::Portrait3x4,
+            Self::Portrait2x3,
             Self::Portrait9x16,
         ]
     }
@@ -141,6 +149,27 @@ impl SortOrder {
 
     pub fn all() -> &'static [Self] {
         &[Self::FileName, Self::Numeric, Self::DateAsc, Self::DateDesc]
+    }
+
+    /// 2 つのメディア項目をこのソート順で比較する。
+    /// `name_a`/`name_b` はファイル名（拡張子付き）、`mtime_a`/`mtime_b` は更新日時。
+    /// `natural_key` は番号順ソート用のキー生成関数。
+    pub fn compare<K: Ord>(
+        self,
+        name_a: &str, mtime_a: i64,
+        name_b: &str, mtime_b: i64,
+        natural_key: impl Fn(&str) -> K,
+    ) -> std::cmp::Ordering {
+        match self {
+            Self::FileName => {
+                name_a.to_lowercase().cmp(&name_b.to_lowercase())
+            }
+            Self::Numeric => {
+                natural_key(name_a).cmp(&natural_key(name_b))
+            }
+            Self::DateAsc  => mtime_a.cmp(&mtime_b),
+            Self::DateDesc => mtime_b.cmp(&mtime_a),
+        }
     }
 }
 
@@ -279,21 +308,23 @@ pub struct Settings {
     pub thumb_idle_upgrade: bool,
 
     // ── ツールバー表示設定 ──────────────────────────────────
-    /// ツールバーに「列」セクションを表示する
-    #[serde(default = "default_true")]
-    pub show_toolbar_cols: bool,
-    /// ツールバーに「比率」セクションを表示する
-    #[serde(default = "default_true")]
-    pub show_toolbar_aspect: bool,
-    /// ツールバーに「ソート」セクションを表示する
-    #[serde(default = "default_true")]
-    pub show_toolbar_sort: bool,
     /// ツールバーに「お気に入り」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_favorites: bool,
     /// アドレスバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
+
+    // ── ツールバー項目フィルタ（Vec が空 = セクション非表示）──
+    /// ツールバーに表示する列数の選択肢
+    #[serde(default = "default_toolbar_cols_items")]
+    pub toolbar_cols_items: Vec<usize>,
+    /// ツールバーに表示するアスペクト比の選択肢
+    #[serde(default = "default_toolbar_aspect_items")]
+    pub toolbar_aspect_items: Vec<ThumbAspect>,
+    /// ツールバーに表示するソート順の選択肢
+    #[serde(default = "default_toolbar_sort_items")]
+    pub toolbar_sort_items: Vec<SortOrder>,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -308,6 +339,9 @@ fn default_true() -> bool { true }
 fn default_thumb_prev_pages() -> u32 { 2 }
 fn default_thumb_next_pages() -> u32 { 4 }
 fn default_thumb_vram_cap_percent() -> u32 { 50 }
+fn default_toolbar_cols_items() -> Vec<usize> { (2..=10).collect() }
+fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
+fn default_toolbar_sort_items() -> Vec<SortOrder> { SortOrder::all().to_vec() }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -334,11 +368,11 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
             thumb_idle_upgrade: true,
-            show_toolbar_cols: true,
-            show_toolbar_aspect: true,
-            show_toolbar_sort: true,
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
+            toolbar_cols_items: default_toolbar_cols_items(),
+            toolbar_aspect_items: default_toolbar_aspect_items(),
+            toolbar_sort_items: default_toolbar_sort_items(),
         }
     }
 }

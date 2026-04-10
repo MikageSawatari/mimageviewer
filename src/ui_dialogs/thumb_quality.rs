@@ -1,7 +1,7 @@
 //! `show_thumb_quality_dialog_window` ダイアログの実装。
 //!
 //! `App` への impl 拡張として書かれており、フィールドアクセスは
-//! `pub(crate)` 経由で行われる。`update()` から `self.show_thumb_quality_dialog_window(ctx)` で呼ばれる。
+//! `pub(crate)` 経由で行われる。`update()` から `self.tq.show_window(ctx)` で呼ばれる。
 
 #![allow(unused_imports)]
 
@@ -31,7 +31,7 @@ use crate::ui_helpers::{
 impl App {
     pub(crate) fn show_thumb_quality_dialog_window(&mut self, ctx: &egui::Context) {
         // ── サムネイル画質設定ポップアップ ────────────────────────────
-        if self.show_thumb_quality_dialog {
+        if self.tq.show {
             let mut open = true;
             let mut apply_a = false;
             let mut apply_b = false;
@@ -55,25 +55,25 @@ impl App {
                 .default_pos(dialog_pos)
                 .default_size([default_w, default_h])
                 .show(ctx, |ui| {
-                    if self.tq_sample.is_none() {
+                    if self.tq.sample.is_none() {
                         ui.set_min_width(360.0);
                         ui.label("画像を1枚選択してからもう一度お試しください。");
                         ui.add_space(8.0);
                         if ui.button("  閉じる  ").clicked() {
-                            self.show_thumb_quality_dialog = false;
+                            self.tq.show = false;
                         }
                         return;
                     }
 
                     // サンプル画像情報
-                    if let Some(ref p) = self.tq_sample_path {
+                    if let Some(ref p) = self.tq.sample_path {
                         ui.label(
                             egui::RichText::new(format!("サンプル: {}", p.to_string_lossy()))
                                 .small(),
                         );
                     }
-                    if let Some(ref img) = self.tq_sample {
-                        let sz = self.tq_sample_original_size;
+                    if let Some(ref img) = self.tq.sample {
+                        let sz = self.tq.sample_original_size;
                         let sz_str = if sz >= 1024 * 1024 {
                             format!("{:.1} MB", sz as f64 / (1024.0 * 1024.0))
                         } else {
@@ -115,7 +115,7 @@ impl App {
                             ui.add_space(4.0);
                             let resp = tq_draw_preview(
                                 ui,
-                                &self.tq_a_texture,
+                                &self.tq.a_texture,
                                 grid_cell_w,
                                 grid_cell_h,
                             );
@@ -127,7 +127,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("サイズ:");
                                 let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_a_size, 128..=1536)
+                                    egui::Slider::new(&mut self.tq.a_size, 128..=1536)
                                         .text("px"),
                                 );
                                 if resp.drag_stopped() || resp.lost_focus() {
@@ -137,7 +137,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("品質:");
                                 let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_a_quality, 1..=100),
+                                    egui::Slider::new(&mut self.tq.a_quality, 1..=100),
                                 );
                                 if resp.drag_stopped() || resp.lost_focus() {
                                     reencode_a = true;
@@ -145,9 +145,9 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.label(format!("{}  ({}x{})",
-                                format_bytes_small(self.tq_a_bytes as u64),
-                                self.tq_a_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
-                                self.tq_a_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
+                                format_bytes_small(self.tq.a_bytes as u64),
+                                self.tq.a_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
+                                self.tq.a_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
                             ));
                             ui.add_space(4.0);
                             if ui.button("  A を適用  ").clicked() {
@@ -161,7 +161,7 @@ impl App {
                             ui.add_space(4.0);
                             let resp = tq_draw_preview(
                                 ui,
-                                &self.tq_b_texture,
+                                &self.tq.b_texture,
                                 grid_cell_w,
                                 grid_cell_h,
                             );
@@ -173,7 +173,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("サイズ:");
                                 let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_b_size, 128..=1536)
+                                    egui::Slider::new(&mut self.tq.b_size, 128..=1536)
                                         .text("px"),
                                 );
                                 if resp.drag_stopped() || resp.lost_focus() {
@@ -183,7 +183,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("品質:");
                                 let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq_b_quality, 1..=100),
+                                    egui::Slider::new(&mut self.tq.b_quality, 1..=100),
                                 );
                                 if resp.drag_stopped() || resp.lost_focus() {
                                     reencode_b = true;
@@ -191,9 +191,9 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.label(format!("{}  ({}x{})",
-                                format_bytes_small(self.tq_b_bytes as u64),
-                                self.tq_b_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
-                                self.tq_b_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
+                                format_bytes_small(self.tq.b_bytes as u64),
+                                self.tq.b_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
+                                self.tq.b_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
                             ));
                             ui.add_space(4.0);
                             if ui.button("  B を適用  ").clicked() {
@@ -215,7 +215,7 @@ impl App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if ui.button("  閉じる  ").clicked() {
-                                    self.show_thumb_quality_dialog = false;
+                                    self.tq.show = false;
                                 }
                             },
                         );
@@ -229,17 +229,17 @@ impl App {
                 self.reencode_tq_panel(ctx, false);
             }
             if open_fs_a || open_fs_b {
-                self.tq_fullscreen = true;
+                self.tq.fullscreen = true;
                 // divider 位置はリセットせず、前回の位置を維持する
             }
             if apply_a {
-                self.settings.thumb_px = self.tq_a_size;
-                self.settings.thumb_quality = self.tq_a_quality;
+                self.settings.thumb_px = self.tq.a_size;
+                self.settings.thumb_quality = self.tq.a_quality;
                 self.settings.save();
                 self.close_thumb_quality_dialog();
             } else if apply_b {
-                self.settings.thumb_px = self.tq_b_size;
-                self.settings.thumb_quality = self.tq_b_quality;
+                self.settings.thumb_px = self.tq.b_size;
+                self.settings.thumb_quality = self.tq.b_quality;
                 self.settings.save();
                 self.close_thumb_quality_dialog();
             } else if !open {

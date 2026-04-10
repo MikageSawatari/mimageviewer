@@ -17,9 +17,90 @@ use crate::thumb_loader::{
     ThumbMsg,
 };
 use crate::ui_helpers::{
-    adjacent_navigable_idx, draw_play_icon, format_bytes_small, natural_sort_key,
+    draw_play_icon, natural_sort_key,
     open_external_player, truncate_name,
 };
+
+// -----------------------------------------------------------------------
+// サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
+// -----------------------------------------------------------------------
+
+#[derive(Default)]
+pub(crate) struct ThumbQualityState {
+    pub show: bool,
+    /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)
+    pub sample: Option<image::DynamicImage>,
+    /// サンプル画像のパス表示用
+    pub sample_path: Option<PathBuf>,
+    /// サンプル画像の元ファイルサイズ (bytes)
+    pub sample_original_size: u64,
+    /// パネル A: サイズ (long side px)
+    pub a_size: u32,
+    /// パネル A: 品質 (1–100)
+    pub a_quality: u8,
+    /// パネル A: プレビューテクスチャ
+    pub a_texture: Option<egui::TextureHandle>,
+    /// パネル A: エンコード後のバイト数
+    pub a_bytes: usize,
+    /// パネル B: サイズ
+    pub b_size: u32,
+    /// パネル B: 品質
+    pub b_quality: u8,
+    /// パネル B: プレビューテクスチャ
+    pub b_texture: Option<egui::TextureHandle>,
+    /// パネル B: エンコード後のバイト数
+    pub b_bytes: usize,
+    /// true = A/B 比較の全画面オーバーレイ表示中
+    pub fullscreen: bool,
+    /// 全画面 A/B 比較時の縦線位置（0.0=すべて B、1.0=すべて A、中央は 0.5）
+    pub fs_divider: f32,
+}
+
+// -----------------------------------------------------------------------
+// サブ構造体: キャッシュ作成バックグラウンドタスクの状態
+// -----------------------------------------------------------------------
+
+pub(crate) struct CacheCreatorState {
+    pub show: bool,
+    /// 各お気に入りのチェック状態（settings.favorites と同じ長さ）
+    pub checked: Vec<bool>,
+    /// 実行中フラグ（UI ボタンの有効/無効とポーリング制御）
+    pub running: bool,
+    /// カウントフェーズ中フラグ（total 未確定）
+    pub counting: Arc<AtomicBool>,
+    /// 対象フォルダ総数（Pass 1 完了後に確定）
+    pub total: Arc<AtomicUsize>,
+    /// 処理済みフォルダ数
+    pub done: Arc<AtomicUsize>,
+    /// キャッシュ容量 (バイト単位、累積加算)
+    pub cache_size: Arc<AtomicU64>,
+    /// キャンセルトークン
+    pub cancel: Arc<AtomicBool>,
+    /// 現在処理中のフォルダパス表示用
+    pub current: Arc<Mutex<String>>,
+    /// 完了シグナル（表示切替用）
+    pub finished: Arc<AtomicBool>,
+    /// 完了後のメッセージ
+    pub result: Option<String>,
+}
+
+impl Default for CacheCreatorState {
+    fn default() -> Self {
+        Self {
+            show: false,
+            checked: Vec::new(),
+            running: false,
+            counting: Arc::new(AtomicBool::new(false)),
+            total: Arc::new(AtomicUsize::new(0)),
+            done: Arc::new(AtomicUsize::new(0)),
+            cache_size: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            current: Arc::new(Mutex::new(String::new())),
+            finished: Arc::new(AtomicBool::new(false)),
+            result: None,
+        }
+    }
+}
 
 // -----------------------------------------------------------------------
 // App
@@ -124,6 +205,9 @@ pub struct App {
     /// 環境設定ダイアログ内の一時的な並列度編集値（Manual時の数値）
     pub(crate) pref_manual_threads: usize,
 
+    // ── ツールバー表示設定ポップアップ ───────────────────────────
+    pub(crate) show_toolbar_settings: bool,
+
     // ── キャッシュ生成設定ポップアップ (段階 C) ──────────────────
     pub(crate) show_cache_policy_dialog: bool,
 
@@ -140,56 +224,10 @@ pub struct App {
     pub(crate) last_selected_image_path: Option<PathBuf>,
 
     // ── サムネイル画質設定ダイアログ ───────────────────────────
-    pub(crate) show_thumb_quality_dialog: bool,
-    /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)
-    pub(crate) tq_sample: Option<image::DynamicImage>,
-    /// サンプル画像のパス表示用
-    pub(crate) tq_sample_path: Option<PathBuf>,
-    /// サンプル画像の元ファイルサイズ (bytes)
-    pub(crate) tq_sample_original_size: u64,
-    /// パネル A: サイズ (long side px)
-    pub(crate) tq_a_size: u32,
-    /// パネル A: 品質 (1–100)
-    pub(crate) tq_a_quality: u8,
-    /// パネル A: プレビューテクスチャ
-    pub(crate) tq_a_texture: Option<egui::TextureHandle>,
-    /// パネル A: エンコード後のバイト数
-    pub(crate) tq_a_bytes: usize,
-    /// パネル B: サイズ
-    pub(crate) tq_b_size: u32,
-    /// パネル B: 品質
-    pub(crate) tq_b_quality: u8,
-    /// パネル B: プレビューテクスチャ
-    pub(crate) tq_b_texture: Option<egui::TextureHandle>,
-    /// パネル B: エンコード後のバイト数
-    pub(crate) tq_b_bytes: usize,
-    /// true = A/B 比較の全画面オーバーレイ表示中
-    pub(crate) tq_fullscreen: bool,
-    /// 全画面 A/B 比較時の縦線位置（0.0=すべて B、1.0=すべて A、中央は 0.5）
-    pub(crate) tq_fs_divider: f32,
+    pub(crate) tq: ThumbQualityState,
 
     // ── キャッシュ作成ポップアップ ───────────────────────────────
-    pub(crate) show_cache_creator: bool,
-    /// 各お気に入りのチェック状態（settings.favorites と同じ長さ）
-    pub(crate) cache_creator_checked: Vec<bool>,
-    /// 実行中フラグ（UI ボタンの有効/無効とポーリング制御）
-    pub(crate) cache_creator_running: bool,
-    /// カウントフェーズ中フラグ（total 未確定）
-    pub(crate) cache_creator_counting: Arc<AtomicBool>,
-    /// 対象フォルダ総数（Pass 1 完了後に確定）
-    pub(crate) cache_creator_total: Arc<AtomicUsize>,
-    /// 処理済みフォルダ数
-    pub(crate) cache_creator_done: Arc<AtomicUsize>,
-    /// キャッシュ容量 (バイト単位、累積加算)
-    pub(crate) cache_creator_cache_size: Arc<AtomicU64>,
-    /// キャンセルトークン
-    pub(crate) cache_creator_cancel: Arc<AtomicBool>,
-    /// 現在処理中のフォルダパス表示用
-    pub(crate) cache_creator_current: Arc<Mutex<String>>,
-    /// 完了シグナル（表示切替用）
-    pub(crate) cache_creator_finished: Arc<AtomicBool>,
-    /// 完了後のメッセージ
-    pub(crate) cache_creator_result: Option<String>,
+    pub(crate) cc: CacheCreatorState,
 
     // ── アドレスバーフォーカス管理 ───────────────────────────────
     /// true のときアドレスバーが入力中 → キーショートカットを無効化
@@ -249,37 +287,22 @@ impl Default for App {
             open_folder_input: String::new(),
             show_preferences: false,
             pref_manual_threads: 4,
+            show_toolbar_settings: false,
             show_cache_policy_dialog: false,
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,
             cache_manager_result: None,
             last_selected_image_path: None,
-            show_thumb_quality_dialog: false,
-            tq_sample: None,
-            tq_sample_path: None,
-            tq_sample_original_size: 0,
-            tq_a_size: 512,
-            tq_a_quality: 75,
-            tq_a_texture: None,
-            tq_a_bytes: 0,
-            tq_b_size: 512,
-            tq_b_quality: 85,
-            tq_b_texture: None,
-            tq_b_bytes: 0,
-            tq_fullscreen: false,
-            tq_fs_divider: 0.5,
-            show_cache_creator: false,
-            cache_creator_checked: Vec::new(),
-            cache_creator_running: false,
-            cache_creator_counting: Arc::new(AtomicBool::new(false)),
-            cache_creator_total: Arc::new(AtomicUsize::new(0)),
-            cache_creator_done: Arc::new(AtomicUsize::new(0)),
-            cache_creator_cache_size: Arc::new(AtomicU64::new(0)),
-            cache_creator_cancel: Arc::new(AtomicBool::new(false)),
-            cache_creator_current: Arc::new(Mutex::new(String::new())),
-            cache_creator_finished: Arc::new(AtomicBool::new(false)),
-            cache_creator_result: None,
+            tq: ThumbQualityState {
+                fs_divider: 0.5,
+                a_size: 512,
+                a_quality: 75,
+                b_size: 512,
+                b_quality: 85,
+                ..Default::default()
+            },
+            cc: CacheCreatorState::default(),
             address_has_focus: false,
             folder_history: std::collections::HashMap::new(),
             initialized: false,
@@ -335,28 +358,12 @@ impl App {
         }
 
         folders.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
-        match self.settings.sort_order {
-            crate::settings::SortOrder::FileName => {
-                all_media.sort_by(|(a, _, _, _), (b, _, _, _)| {
-                    let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-                    let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-                    a_name.cmp(&b_name)
-                });
-            }
-            crate::settings::SortOrder::Numeric => {
-                all_media.sort_by(|(a, _, _, _), (b, _, _, _)| {
-                    let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    natural_sort_key(a_name).cmp(&natural_sort_key(b_name))
-                });
-            }
-            crate::settings::SortOrder::DateAsc => {
-                all_media.sort_by(|(_, _, a_mtime, _), (_, _, b_mtime, _)| a_mtime.cmp(b_mtime));
-            }
-            crate::settings::SortOrder::DateDesc => {
-                all_media.sort_by(|(_, _, a_mtime, _), (_, _, b_mtime, _)| b_mtime.cmp(a_mtime));
-            }
-        }
+        let sort = self.settings.sort_order;
+        all_media.sort_by(|(a, _, a_mt, _), (b, _, b_mt, _)| {
+            let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            sort.compare(an, *a_mt, bn, *b_mt, natural_sort_key)
+        });
 
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
@@ -425,29 +432,13 @@ impl App {
         }
 
         // 各グループ内を sort_order に従ってソート
+        let sort = self.settings.sort_order;
         for (_, list) in groups.iter_mut() {
-            match self.settings.sort_order {
-                crate::settings::SortOrder::FileName => {
-                    list.sort_by(|a, b| {
-                        let an = crate::zip_loader::entry_basename(&a.entry_name).to_lowercase();
-                        let bn = crate::zip_loader::entry_basename(&b.entry_name).to_lowercase();
-                        an.cmp(&bn)
-                    });
-                }
-                crate::settings::SortOrder::Numeric => {
-                    list.sort_by(|a, b| {
-                        let an = crate::zip_loader::entry_basename(&a.entry_name);
-                        let bn = crate::zip_loader::entry_basename(&b.entry_name);
-                        natural_sort_key(an).cmp(&natural_sort_key(bn))
-                    });
-                }
-                crate::settings::SortOrder::DateAsc => {
-                    list.sort_by(|a, b| a.mtime.cmp(&b.mtime));
-                }
-                crate::settings::SortOrder::DateDesc => {
-                    list.sort_by(|a, b| b.mtime.cmp(&a.mtime));
-                }
-            }
+            list.sort_by(|a, b| {
+                let an = crate::zip_loader::entry_basename(&a.entry_name);
+                let bn = crate::zip_loader::entry_basename(&b.entry_name);
+                sort.compare(an, a.mtime, bn, b.mtime, natural_sort_key)
+            });
         }
 
         // ── items / image_metas を構築 ──
@@ -860,16 +851,10 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let req = match self.items.get(i) {
-                Some(GridItem::Image(p)) => LoadRequest {
-                    idx: i, path: p.clone(), mtime, file_size,
-                    skip_cache: false, zip_entry: None,
-                },
-                Some(GridItem::ZipImage { zip_path, entry_name }) => LoadRequest {
-                    idx: i, path: zip_path.clone(), mtime, file_size,
-                    skip_cache: false, zip_entry: Some(entry_name.clone()),
-                },
-                _ => continue,
+            let Some(req) = self.items.get(i).and_then(|item| {
+                make_load_request(item, i, mtime, file_size, false)
+            }) else {
+                continue;
             };
             new_requests.push(req);
         }
@@ -970,16 +955,10 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let req = match self.items.get(i) {
-                Some(GridItem::Image(p)) => LoadRequest {
-                    idx: i, path: p.clone(), mtime, file_size,
-                    skip_cache: true, zip_entry: None,
-                },
-                Some(GridItem::ZipImage { zip_path, entry_name }) => LoadRequest {
-                    idx: i, path: zip_path.clone(), mtime, file_size,
-                    skip_cache: true, zip_entry: Some(entry_name.clone()),
-                },
-                _ => continue,
+            let Some(req) = self.items.get(i).and_then(|item| {
+                make_load_request(item, i, mtime, file_size, true)
+            }) else {
+                continue;
             };
             upgrade_reqs.push(req);
         }
@@ -1001,35 +980,26 @@ impl App {
         }
     }
 
-    /// 現在の要求状況からプログレスバーのピーク値を更新する。
-    ///
-    /// ピークは "current == 0 のときに 0 にリセット、それ以外は current の最大値" で
-    /// 計算される。UI は `(peak - current) / peak` で進捗率を表示する。
-    fn update_progress_peaks(&mut self) {
-        // in-flight を種類別にカウント
-        let (in_flight_normal, in_flight_upgrade) = {
-            let mut n = 0usize;
-            let mut u = 0usize;
-            for &is_upgrade in self.requested.values() {
-                if is_upgrade { u += 1; } else { n += 1; }
-            }
-            (n, u)
-        };
-
-        // キュー内を種類別にカウント (短時間ロック)
-        let (queued_normal, queued_upgrade) = if let Some(queue) = &self.reload_queue {
+    /// in-flight + キュー内の通常/アップグレード件数を返す。
+    fn count_pending(&self) -> (usize, usize) {
+        let (mut in_normal, mut in_upgrade) = (0usize, 0usize);
+        for &is_upgrade in self.requested.values() {
+            if is_upgrade { in_upgrade += 1; } else { in_normal += 1; }
+        }
+        let (q_normal, q_upgrade) = if let Some(queue) = &self.reload_queue {
             let q = queue.lock().unwrap();
             let upgrade = q.iter().filter(|r| r.skip_cache).count();
-            let normal = q.len() - upgrade;
-            (normal, upgrade)
+            (q.len() - upgrade, upgrade)
         } else {
             (0, 0)
         };
+        (in_normal + q_normal, in_upgrade + q_upgrade)
+    }
 
-        let cur_normal = in_flight_normal + queued_normal;
-        let cur_upgrade = in_flight_upgrade + queued_upgrade;
+    /// 現在の要求状況からプログレスバーのピーク値を更新する。
+    fn update_progress_peaks(&mut self) {
+        let (cur_normal, cur_upgrade) = self.count_pending();
 
-        // ピーク更新 or リセット
         if cur_normal == 0 {
             self.progress_normal_peak = 0;
         } else if cur_normal > self.progress_normal_peak {
@@ -1044,28 +1014,11 @@ impl App {
 
     /// プログレスバーの現在値を計算して返す。
     /// `(normal (cur, peak), upgrade (cur, peak))`
-    fn progress_snapshot(&self) -> ((usize, usize), (usize, usize)) {
-        // peak は update_progress_peaks 時点の値
-        // current は再計算 (毎フレーム少しズレるが UX への影響は無視できる)
-        let (in_flight_normal, in_flight_upgrade) = {
-            let mut n = 0usize;
-            let mut u = 0usize;
-            for &is_upgrade in self.requested.values() {
-                if is_upgrade { u += 1; } else { n += 1; }
-            }
-            (n, u)
-        };
-        let (queued_normal, queued_upgrade) = if let Some(queue) = &self.reload_queue {
-            let q = queue.lock().unwrap();
-            let upgrade = q.iter().filter(|r| r.skip_cache).count();
-            let normal = q.len() - upgrade;
-            (normal, upgrade)
-        } else {
-            (0, 0)
-        };
+    pub(crate) fn progress_snapshot(&self) -> ((usize, usize), (usize, usize)) {
+        let (cur_normal, cur_upgrade) = self.count_pending();
         (
-            (in_flight_normal + queued_normal, self.progress_normal_peak),
-            (in_flight_upgrade + queued_upgrade, self.progress_upgrade_peak),
+            (cur_normal, self.progress_normal_peak),
+            (cur_upgrade, self.progress_upgrade_peak),
         )
     }
 
@@ -1200,7 +1153,7 @@ impl App {
     }
 
     /// カーソルキー移動後、選択行がビューポートに収まるようオフセットを調整する
-    fn apply_scroll_to_selected(&mut self, cols: usize, cell_h: f32) {
+    pub(crate) fn apply_scroll_to_selected(&mut self, cols: usize, cell_h: f32) {
         let sel = match self.selected {
             Some(s) => s,
             None => return,
@@ -1441,7 +1394,7 @@ impl App {
 
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
-    fn close_fullscreen(&mut self) {
+    pub(crate) fn close_fullscreen(&mut self) {
         self.fullscreen_idx = None;
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
@@ -1452,7 +1405,7 @@ impl App {
 
     /// `self.selected` に対応するアイテムが画像の場合、パスを last_selected_image_path に保存する。
     /// (フォルダ移動後もサムネイル画質ダイアログで使えるよう、セッション内で保持)
-    fn update_last_selected_image(&mut self) {
+    pub(crate) fn update_last_selected_image(&mut self) {
         if let Some(idx) = self.selected {
             if let Some(GridItem::Image(p)) = self.items.get(idx) {
                 self.last_selected_image_path = Some(p.clone());
@@ -1515,18 +1468,18 @@ impl App {
     // -------------------------------------------------------------------
     pub(crate) fn open_thumb_quality_dialog(&mut self, ctx: &egui::Context) {
         // 既存状態をリセット
-        self.tq_sample = None;
-        self.tq_sample_path = None;
-        self.tq_sample_original_size = 0;
-        self.tq_a_texture = None;
-        self.tq_b_texture = None;
-        self.tq_a_bytes = 0;
-        self.tq_b_bytes = 0;
+        self.tq.sample = None;
+        self.tq.sample_path = None;
+        self.tq.sample_original_size = 0;
+        self.tq.a_texture = None;
+        self.tq.b_texture = None;
+        self.tq.a_bytes = 0;
+        self.tq.b_bytes = 0;
 
         // 最後に選択した画像を取得
         let Some(path) = self.last_selected_image_path.clone() else {
             // None のままダイアログを開く (メッセージだけ出る)
-            self.show_thumb_quality_dialog = true;
+            self.tq.show = true;
             return;
         };
 
@@ -1534,32 +1487,32 @@ impl App {
         let img = match image::open(&path) {
             Ok(i) => i,
             Err(_) => {
-                self.show_thumb_quality_dialog = true;
+                self.tq.show = true;
                 return;
             }
         };
         let orig_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        self.tq_sample = Some(img);
-        self.tq_sample_path = Some(path);
-        self.tq_sample_original_size = orig_size;
+        self.tq.sample = Some(img);
+        self.tq.sample_path = Some(path);
+        self.tq.sample_original_size = orig_size;
 
         // 現在の設定で A を初期化、B はちょっと違う組み合わせ
-        self.tq_a_size = self.settings.thumb_px;
-        self.tq_a_quality = self.settings.thumb_quality;
-        self.tq_b_size = self.settings.thumb_px;
-        self.tq_b_quality = (self.settings.thumb_quality as u32 + 10).min(95) as u8;
+        self.tq.a_size = self.settings.thumb_px;
+        self.tq.a_quality = self.settings.thumb_quality;
+        self.tq.b_size = self.settings.thumb_px;
+        self.tq.b_quality = (self.settings.thumb_quality as u32 + 10).min(95) as u8;
 
         self.reencode_tq_panel(ctx, true);
         self.reencode_tq_panel(ctx, false);
-        self.show_thumb_quality_dialog = true;
+        self.tq.show = true;
     }
 
     pub(crate) fn reencode_tq_panel(&mut self, ctx: &egui::Context, is_a: bool) {
-        let Some(img) = self.tq_sample.as_ref() else { return };
+        let Some(img) = self.tq.sample.as_ref() else { return };
         let (size, quality) = if is_a {
-            (self.tq_a_size, self.tq_a_quality)
+            (self.tq.a_size, self.tq.a_quality)
         } else {
-            (self.tq_b_size, self.tq_b_quality)
+            (self.tq.b_size, self.tq.b_quality)
         };
         let (bytes, tex) =
             match crate::catalog::encode_thumb_webp(img, size, quality as f32) {
@@ -1578,21 +1531,21 @@ impl App {
                 None => (0, None),
             };
         if is_a {
-            self.tq_a_bytes = bytes;
-            self.tq_a_texture = tex;
+            self.tq.a_bytes = bytes;
+            self.tq.a_texture = tex;
         } else {
-            self.tq_b_bytes = bytes;
-            self.tq_b_texture = tex;
+            self.tq.b_bytes = bytes;
+            self.tq.b_texture = tex;
         }
     }
 
     pub(crate) fn close_thumb_quality_dialog(&mut self) {
-        self.show_thumb_quality_dialog = false;
-        self.tq_sample = None;
-        self.tq_sample_path = None;
-        self.tq_a_texture = None;
-        self.tq_b_texture = None;
-        self.tq_fullscreen = false;
+        self.tq.show = false;
+        self.tq.sample = None;
+        self.tq.sample_path = None;
+        self.tq.a_texture = None;
+        self.tq.b_texture = None;
+        self.tq.fullscreen = false;
     }
 
     // -------------------------------------------------------------------
@@ -1604,7 +1557,7 @@ impl App {
             .settings
             .favorites
             .iter()
-            .zip(self.cache_creator_checked.iter())
+            .zip(self.cc.checked.iter())
             .filter_map(|(f, &c)| if c { Some(f.path.clone()) } else { None })
             .collect();
 
@@ -1613,29 +1566,29 @@ impl App {
         }
 
         // 状態リセット
-        self.cache_creator_running = true;
-        self.cache_creator_counting.store(true, Ordering::Relaxed);
-        self.cache_creator_total.store(0, Ordering::Relaxed);
-        self.cache_creator_done.store(0, Ordering::Relaxed);
-        self.cache_creator_finished.store(false, Ordering::Relaxed);
-        self.cache_creator_result = None;
-        *self.cache_creator_current.lock().unwrap() = String::new();
+        self.cc.running = true;
+        self.cc.counting.store(true, Ordering::Relaxed);
+        self.cc.total.store(0, Ordering::Relaxed);
+        self.cc.done.store(0, Ordering::Relaxed);
+        self.cc.finished.store(false, Ordering::Relaxed);
+        self.cc.result = None;
+        *self.cc.current.lock().unwrap() = String::new();
         let cancel = Arc::new(AtomicBool::new(false));
-        self.cache_creator_cancel = Arc::clone(&cancel);
+        self.cc.cancel = Arc::clone(&cancel);
 
         // 初期キャッシュ容量を取得（ベースライン）
         let cache_dir = crate::catalog::default_cache_dir();
         let (_, baseline) = crate::catalog::cache_stats(&cache_dir);
-        self.cache_creator_cache_size
+        self.cc.cache_size
             .store(baseline, Ordering::Relaxed);
 
         // atomic クローン
-        let counting = Arc::clone(&self.cache_creator_counting);
-        let total = Arc::clone(&self.cache_creator_total);
-        let done = Arc::clone(&self.cache_creator_done);
-        let size_atomic = Arc::clone(&self.cache_creator_cache_size);
-        let finished = Arc::clone(&self.cache_creator_finished);
-        let current = Arc::clone(&self.cache_creator_current);
+        let counting = Arc::clone(&self.cc.counting);
+        let total = Arc::clone(&self.cc.total);
+        let done = Arc::clone(&self.cc.done);
+        let size_atomic = Arc::clone(&self.cc.cache_size);
+        let finished = Arc::clone(&self.cc.finished);
+        let current = Arc::clone(&self.cc.current);
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
         let threads = self.settings.parallelism.thread_count();
@@ -1850,691 +1803,15 @@ impl eframe::App for App {
         let keyboard_nav = self.handle_keyboard(ctx);
 
         // ── フルスクリーンビューポート ──────────────────────────────────
-        if let Some(fs_idx) = self.fullscreen_idx {
-            // 動画か否かを判定
-            let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-            // タスク 3: ZIP セパレータ (章タイトル表示)
-            let separator_text: Option<String> = match self.items.get(fs_idx) {
-                Some(GridItem::ZipSeparator { dir_display }) => Some(dir_display.clone()),
-                _ => None,
-            };
-            let is_separator = separator_text.is_some();
-            let video_path = if is_video {
-                if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
-                    Some(p.clone())
-                } else { None }
-            } else { None };
-
-            // アニメーションフレームを進める（メインコンテキストの時刻を使う）
-            if !is_video {
-                let now = ctx.input(|i| i.time);
-                if let Some(FsCacheEntry::Animated { frames, current_frame, next_frame_at }) =
-                    self.fs_cache.get_mut(&fs_idx)
-                {
-                    if now >= *next_frame_at && !frames.is_empty() {
-                        *current_frame = (*current_frame + 1) % frames.len();
-                        let delay = frames[*current_frame].1.max(0.02);
-                        *next_frame_at = now + delay;
-                    }
-                }
-            }
-
-            // 表示テクスチャを取得（動画は None、画像はキャッシュエントリから）
-            let tex: Option<egui::TextureHandle> = if is_video {
-                None
-            } else {
-                match self.fs_cache.get(&fs_idx) {
-                    Some(FsCacheEntry::Static(h)) => Some(h.clone()),
-                    Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
-                        frames.get(*current_frame).map(|(h, _)| h.clone())
-                    }
-                    Some(FsCacheEntry::Failed) | None => None,
-                }
-            };
-
-            // フルスクリーンデコードが失敗した場合を検出
-            let fs_load_failed = matches!(
-                self.fs_cache.get(&fs_idx),
-                Some(FsCacheEntry::Failed)
-            );
-
-            let thumb_tex  = match self.thumbnails.get(fs_idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-                _ => None,
-            };
-            let filename   = self.items.get(fs_idx)
-                .map(|item| item.name().to_string())
-                .unwrap_or_default();
-            // トップバー用: フォルダ (current_folder そのまま、ZIP なら ZIP ファイルのパス)
-            let folder_display = self
-                .current_folder
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            // トップバー用: フルサイズ読込完了時のネイティブ画像サイズ
-            let image_dims: Option<(u32, u32)> = tex.as_ref().map(|t| {
-                let s = t.size_vec2();
-                (s.x as u32, s.y as u32)
-            });
-            // トップバー用: ファイルサイズ (image_metas から)
-            let image_file_size: Option<u64> = self
-                .image_metas
-                .get(fs_idx)
-                .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
-            // 画像のみ「高解像度読込中」表示が必要（動画・セパレータ・失敗は不要）
-            let is_loading = !is_video
-                && !is_separator
-                && !fs_load_failed
-                && !self.fs_cache.contains_key(&fs_idx);
-
-            let mut close_fs   = false;
-            let mut nav_delta: i32     = 0;
-            let mut ctrl_nav: Option<i32> = None;
-
-            // メインウィンドウがあるモニターの論理ピクセル矩形を取得し、
-            // そのモニターを完全に覆う borderless ウィンドウを作成する。
-            // with_fullscreen(true) はプライマリモニター固定になるため使わない。
-            let fs_builder = {
-                let center = self.last_outer_rect.map(|r| r.center());
-                let ppp = self.last_pixels_per_point;
-                crate::logger::log(format!(
-                    "[fullscreen] last_outer_rect center: {:?}  ppp={ppp:.2}",
-                    center.map(|c| format!("({:.1},{:.1})", c.x, c.y))
-                ));
-
-                // MonitorFromPoint は物理座標を要求するため論理座標に ppp を乗算する
-                let monitor_rect = center
-                    .and_then(|c| crate::monitor::get_monitor_logical_rect_at(
-                        c.x * ppp, c.y * ppp,
-                    ));
-
-                let b = egui::ViewportBuilder::default().with_decorations(false);
-                match monitor_rect {
-                    Some(rect) => {
-                        crate::logger::log(format!(
-                            "[fullscreen] using monitor rect: pos=({:.1},{:.1}) size={:.1}x{:.1}",
-                            rect.min.x, rect.min.y, rect.width(), rect.height()
-                        ));
-                        b.with_position(rect.min)
-                         .with_inner_size([rect.width(), rect.height()])
-                    }
-                    None => {
-                        crate::logger::log("[fullscreen] monitor rect not found, fallback to with_fullscreen".to_string());
-                        b.with_fullscreen(true)
-                    }
-                }
-            };
-
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("fullscreen_viewer"),
-                fs_builder,
-                |ctx, _class| {
-                    // プラットフォームの閉じるリクエスト（Alt+F4 など）
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        close_fs = true;
-                    }
-
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                        .show(ctx, |ui| {
-                            let full_rect = ui.max_rect();
-
-                            // ── キー入力（ctx はこのビューポートのコンテキスト）
-                            let esc    = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-                            let right  = ctx.input(|i| {
-                                i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown)
-                            });
-                            let left   = ctx.input(|i| {
-                                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp)
-                            });
-                            let ctrl_d = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown));
-                            let ctrl_u = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
-
-                            if esc              { close_fs = true; }
-                            if right && !ctrl_d { nav_delta =  1; }
-                            if left  && !ctrl_u { nav_delta = -1; }
-                            if ctrl_d           { ctrl_nav = Some(1); }
-                            if ctrl_u           { ctrl_nav = Some(-1); }
-
-                            // ── ホイール操作 ──────────────────────────
-                            // 下スクロール(delta<0) → 次の画像、上スクロール(delta>0) → 前の画像
-                            let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
-                            if wheel_y.abs() > 0.5 {
-                                ctx.input_mut(|i| {
-                                    i.raw_scroll_delta = egui::Vec2::ZERO;
-                                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                                    i.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-                                });
-                                nav_delta = if wheel_y < 0.0 { 1 } else { -1 };
-                            }
-
-                            // ── マウスクリック操作 ────────────────────
-                            let fs_response = ui.interact(
-                                full_rect,
-                                egui::Id::new("fs_click"),
-                                egui::Sense::click(),
-                            );
-                            if is_video {
-                                // 動画: クリックで外部プレイヤー起動
-                                if fs_response.clicked() {
-                                    if let Some(ref vp) = video_path {
-                                        open_external_player(vp);
-                                    }
-                                }
-                            } else {
-                                // 画像 / セパレータ: 左半分 → 前、右半分 → 次
-                                if fs_response.clicked() {
-                                    if let Some(pos) = fs_response.interact_pointer_pos() {
-                                        if pos.x > full_rect.center().x {
-                                            nav_delta = 1;
-                                        } else {
-                                            nav_delta = -1;
-                                        }
-                                    }
-                                }
-                            }
-                            // 右クリックでフルスクリーン終了 → サムネイル一覧に戻る
-                            if fs_response.secondary_clicked() {
-                                close_fs = true;
-                            }
-
-                            // ── 画像 / 動画 / セパレータ表示 ──────────
-                            if let Some(sep) = separator_text.as_ref() {
-                                // タスク 3: ZIP セパレータ → 章タイトル画面
-                                // レイアウト (サムネイルセルと同じ方針):
-                                //   - 中央: フォルダ名 (大きく)
-                                //   - 下部: "── 作品の区切り ──" 案内
-                                let title_size = (full_rect.height() * 0.12).clamp(48.0, 120.0);
-                                let sub_size = (full_rect.height() * 0.030).clamp(20.0, 36.0);
-
-                                // 控えめな背景ハイライト (フォルダ名の周囲のみ)
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_center_size(
-                                        full_rect.center(),
-                                        egui::vec2(
-                                            full_rect.width() * 0.85,
-                                            title_size * 2.2,
-                                        ),
-                                    ),
-                                    16.0,
-                                    egui::Color32::from_rgba_unmultiplied(30, 45, 80, 180),
-                                );
-                                // フォルダ名 (中央、大きく)
-                                ui.painter().text(
-                                    full_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    sep,
-                                    egui::FontId::proportional(title_size),
-                                    egui::Color32::WHITE,
-                                );
-                                // 「作品の区切り」案内 (画面下部)
-                                ui.painter().text(
-                                    egui::pos2(
-                                        full_rect.center().x,
-                                        full_rect.max.y - 48.0,
-                                    ),
-                                    egui::Align2::CENTER_BOTTOM,
-                                    "── 作品の区切り ──",
-                                    egui::FontId::proportional(sub_size),
-                                    egui::Color32::from_rgb(150, 180, 220),
-                                );
-                            } else {
-                                // 動画はサムネイルのみ表示。画像はフルサイズ優先。
-                                let display_tex = tex.as_ref().or(thumb_tex.as_ref());
-                                if let Some(handle) = display_tex {
-                                    let tex_size = handle.size_vec2();
-                                    let scale    = (full_rect.width()  / tex_size.x)
-                                                   .min(full_rect.height() / tex_size.y);
-                                    let img_rect = egui::Rect::from_center_size(
-                                        full_rect.center(),
-                                        tex_size * scale,
-                                    );
-                                    ui.painter().image(
-                                        handle.id(),
-                                        img_rect,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::WHITE,
-                                    );
-                                } else if fs_load_failed {
-                                    // デコード失敗 (対応コーデック無し / 壊れたファイル / 特殊サブフォーマット)
-                                    ui.painter().text(
-                                        full_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "読込失敗",
-                                        egui::FontId::proportional(32.0),
-                                        egui::Color32::from_rgb(255, 140, 140),
-                                    );
-                                    ui.painter().text(
-                                        full_rect.center() + egui::vec2(0.0, 40.0),
-                                        egui::Align2::CENTER_CENTER,
-                                        "このファイルはデコードできませんでした",
-                                        egui::FontId::proportional(16.0),
-                                        egui::Color32::from_gray(180),
-                                    );
-                                } else {
-                                    // テクスチャ未ロード（サムネイルも未完了）
-                                    ui.painter().text(
-                                        full_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        if is_video { "動画サムネイル 読込中..." } else { "読込中..." },
-                                        egui::FontId::proportional(24.0),
-                                        egui::Color32::from_gray(180),
-                                    );
-                                }
-                            }
-
-                            // ── 動画: 再生ボタンオーバーレイ ─────────
-                            if is_video {
-                                draw_play_icon(ui.painter(), full_rect.center(), 56.0);
-                                // Enter キーでも起動
-                                let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-                                if enter {
-                                    if let Some(ref vp) = video_path {
-                                        open_external_player(vp);
-                                    }
-                                }
-                            }
-
-                            // サムネイル仮表示中 → 高解像度読み込み中インジケーター（画像のみ）
-                            // セパレータでない + 何らかのテクスチャが表示されている場合のみ表示
-                            let has_any_tex = tex.is_some() || thumb_tex.is_some();
-                            if is_loading && has_any_tex {
-                                ui.painter().text(
-                                    full_rect.min + egui::vec2(16.0, 16.0),
-                                    egui::Align2::LEFT_TOP,
-                                    "高解像度 読込中...",
-                                    egui::FontId::proportional(14.0),
-                                    egui::Color32::from_rgba_unmultiplied(220, 220, 220, 180),
-                                );
-                            }
-
-                            // ── ホバー時のトップバー (フォルダ/ファイル名/寸法/×) ──
-                            // 画面上部 60px にマウスがあるときだけ表示する
-                            let hover_in_top = ctx.input(|i| {
-                                i.pointer.hover_pos()
-                                    .map(|p| p.y < 60.0)
-                                    .unwrap_or(false)
-                            });
-                            if hover_in_top {
-                                let bar_h = 44.0;
-                                let bar_rect = egui::Rect::from_min_size(
-                                    full_rect.min,
-                                    egui::vec2(full_rect.width(), bar_h),
-                                );
-                                // 半透明の黒背景 (文字が読みやすいよう alpha 高め)
-                                ui.painter().rect_filled(
-                                    bar_rect,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
-                                );
-                                // 下端に薄い区切り線
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(bar_rect.min.x, bar_rect.max.y),
-                                        egui::pos2(bar_rect.max.x, bar_rect.max.y),
-                                    ],
-                                    egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
-                                    ),
-                                );
-
-                                // ── × 閉じるボタン (右端) ──
-                                let btn_size = 32.0;
-                                let btn_margin = 6.0;
-                                let btn_rect = egui::Rect::from_min_size(
-                                    egui::pos2(
-                                        bar_rect.max.x - btn_size - btn_margin,
-                                        bar_rect.min.y + btn_margin,
-                                    ),
-                                    egui::vec2(btn_size, btn_size),
-                                );
-                                let btn_resp = ui.interact(
-                                    btn_rect,
-                                    egui::Id::new("fs_close_btn"),
-                                    egui::Sense::click(),
-                                );
-                                let bg = if btn_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
-                                } else {
-                                    egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-                                };
-                                ui.painter().rect_filled(btn_rect, 4.0, bg);
-                                let c = btn_rect.center();
-                                let r = btn_size * 0.25;
-                                let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
-                                ui.painter().line_segment(
-                                    [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
-                                    stroke,
-                                );
-                                ui.painter().line_segment(
-                                    [egui::pos2(c.x + r, c.y - r), egui::pos2(c.x - r, c.y + r)],
-                                    stroke,
-                                );
-                                if btn_resp.clicked() {
-                                    close_fs = true;
-                                }
-                                // ×ボタンのクリックが背面の nav_delta に漏れないように上書き
-                                if btn_resp.hovered() {
-                                    nav_delta = 0;
-                                }
-
-                                // ── 左側: フォルダパス ──
-                                if !folder_display.is_empty() {
-                                    ui.painter().text(
-                                        egui::pos2(
-                                            bar_rect.min.x + 12.0,
-                                            bar_rect.center().y,
-                                        ),
-                                        egui::Align2::LEFT_CENTER,
-                                        &folder_display,
-                                        egui::FontId::proportional(13.0),
-                                        egui::Color32::from_gray(180),
-                                    );
-                                }
-
-                                // ── 中央寄り (× の左): ファイル名 | 寸法 | サイズ ──
-                                let mut info_parts: Vec<String> = Vec::new();
-                                if !filename.is_empty() {
-                                    info_parts.push(filename.clone());
-                                }
-                                if let Some((w, h)) = image_dims {
-                                    info_parts.push(format!("{w} × {h}"));
-                                }
-                                if let Some(bytes) = image_file_size {
-                                    info_parts.push(format_bytes_small(bytes));
-                                }
-                                if !info_parts.is_empty() {
-                                    let info_text = info_parts.join("    ");
-                                    // ×ボタンの左に配置
-                                    let right_edge = btn_rect.min.x - 12.0;
-                                    ui.painter().text(
-                                        egui::pos2(right_edge, bar_rect.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        info_text,
-                                        egui::FontId::proportional(15.0),
-                                        egui::Color32::WHITE,
-                                    );
-                                }
-                            }
-                        });
-                },
-            );
-
-            // ── フルスクリーン終了・ナビゲーション処理 ────────────────
-            if close_fs || ctrl_nav.is_some() {
-                self.close_fullscreen();
-            }
-            if let Some(delta) = ctrl_nav {
-                // Ctrl+↑↓: フォルダを移動してサムネイルモードに戻る（仕様 §7.2）
-                if let Some(cur) = self.current_folder.clone() {
-                    let skip_limit = self.settings.folder_skip_limit;
-                    let next = if delta > 0 {
-                        navigate_folder_with_skip(&cur, next_folder_dfs, skip_limit)
-                    } else {
-                        navigate_folder_with_skip(&cur, prev_folder_dfs, skip_limit)
-                    };
-                    if let Some(p) = next {
-                        self.load_folder(p);
-                    }
-                }
-            } else if !close_fs && nav_delta != 0 {
-                // ←→↑↓: 画像・動画を前後に切り替え
-                if let Some(new_idx) = adjacent_navigable_idx(&self.items, fs_idx, nav_delta) {
-                    self.open_fullscreen(new_idx);
-                    self.selected = Some(new_idx);
-                    self.scroll_to_selected = true;
-                    self.update_last_selected_image();
-                }
-            }
-
-            // 高解像度読み込み完了まで毎フレーム再描画（画像のみ）
-            let image_loading = !is_video
-                && self.fullscreen_idx.map(|i| !self.fs_cache.contains_key(&i)).unwrap_or(false);
-            if image_loading {
-                ctx.request_repaint();
-            }
-
-            // アニメーション: 次フレームの時刻まで待ってから再描画
-            if !is_video {
-                if let Some(FsCacheEntry::Animated { next_frame_at, .. }) =
-                    self.fs_cache.get(&fs_idx)
-                {
-                    let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
-                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
-                }
-            }
-        }
+        self.render_fullscreen_viewport(ctx);
 
         // ── メニューバー ─────────────────────────────────────────────
-        let mut fav_nav: Option<PathBuf> = None;
-        let mut settings_changed = false;
-        let mut sort_changed = false;
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("ファイル", |ui| {
-                    if ui.button("フォルダを開く…").clicked() {
-                        // 既に現在フォルダが設定されていれば初期値として補完
-                        self.open_folder_input = self
-                            .current_folder
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        self.show_open_folder_dialog = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("終了").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-
-                ui.menu_button("お気に入り", |ui| {
-                    // このフォルダを追加 (クリック時は名称入力ダイアログを開く)
-                    let can_add = self.current_folder.is_some();
-                    if ui.add_enabled(can_add, egui::Button::new("このフォルダを追加…")).clicked() {
-                        if let Some(ref folder) = self.current_folder.clone() {
-                            // 既定の名前はフォルダ名から補完
-                            let default_name = folder
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            self.fav_add_name_input = default_name;
-                            self.fav_add_target = Some(folder.clone());
-                            self.show_fav_add_dialog = true;
-                        }
-                        ui.close();
-                    }
-
-                    // 編集
-                    if ui.button("編集").clicked() {
-                        self.show_favorites_editor = true;
-                        ui.close();
-                    }
-
-                    // キャッシュ作成
-                    if ui.button("キャッシュ作成").clicked() {
-                        self.cache_creator_checked = vec![false; self.settings.favorites.len()];
-                        self.cache_creator_running = false;
-                        self.cache_creator_result = None;
-                        self.cache_creator_total.store(0, Ordering::Relaxed);
-                        self.cache_creator_done.store(0, Ordering::Relaxed);
-                        self.cache_creator_cache_size.store(0, Ordering::Relaxed);
-                        self.cache_creator_finished.store(false, Ordering::Relaxed);
-                        *self.cache_creator_current.lock().unwrap() = String::new();
-                        self.show_cache_creator = true;
-                        ui.close();
-                    }
-
-                    // 区切り線
-                    ui.separator();
-
-                    // 登録済みお気に入り一覧
-                    if self.settings.favorites.is_empty() {
-                        ui.label(egui::RichText::new("（未登録）").weak());
-                    } else {
-                        let favorites = self.settings.favorites.clone();
-                        for fav in &favorites {
-                            if ui.button(&fav.name).clicked() {
-                                fav_nav = Some(fav.path.clone());
-                                ui.close();
-                            }
-                        }
-                    }
-                });
-
-                ui.menu_button("設定", |ui| {
-                    ui.menu_button("サムネイル列数", |ui| {
-                        for cols in 2..=10usize {
-                            let checked = self.settings.grid_cols == cols;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{cols} 列")).clicked() {
-                                self.settings.grid_cols = cols;
-                                settings_changed = true;
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.menu_button("サムネイル比率", |ui| {
-                        for &aspect in crate::settings::ThumbAspect::all() {
-                            let checked = self.settings.thumb_aspect == aspect;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{}", aspect.label())).clicked() {
-                                self.settings.thumb_aspect = aspect;
-                                settings_changed = true;
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.menu_button("ソート順", |ui| {
-                        for &order in crate::settings::SortOrder::all() {
-                            let checked = self.settings.sort_order == order;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{}", order.label())).clicked() {
-                                self.settings.sort_order = order;
-                                sort_changed = true;
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.separator();
-                    if ui.button("キャッシュ管理").clicked() {
-                        let cache_dir = crate::catalog::default_cache_dir();
-                        self.cache_manager_stats = Some(crate::catalog::cache_stats(&cache_dir));
-                        self.cache_manager_result = None;
-                        self.show_cache_manager = true;
-                        ui.close();
-                    }
-                    if ui.button("サムネイル画質…").clicked() {
-                        self.open_thumb_quality_dialog(ctx);
-                        ui.close();
-                    }
-                    if ui.button("キャッシュ生成設定…").clicked() {
-                        self.show_cache_policy_dialog = true;
-                        ui.close();
-                    }
-                    if ui.button("統計…").clicked() {
-                        self.show_stats_dialog = true;
-                        ui.close();
-                    }
-                    if ui.button("環境設定…").clicked() {
-                        // ダイアログを開くとき現在値で初期化
-                        self.pref_manual_threads = match &self.settings.parallelism {
-                            crate::settings::Parallelism::Manual(n) => *n,
-                            crate::settings::Parallelism::Auto => {
-                                self.settings.parallelism.thread_count()
-                            }
-                        };
-                        self.show_preferences = true;
-                        ui.close();
-                    }
-                });
-            });
-        });
-        if settings_changed {
-            self.settings.save();
-        }
-        if sort_changed {
-            self.settings.save();
-            if let Some(path) = self.current_folder.clone() {
-                // スクロール履歴を捨てて先頭から再ロード
-                self.folder_history.remove(&path);
-                self.load_folder(path);
-            }
-        }
+        let (fav_nav, _) = self.render_menubar(ctx);
 
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
-        // egui::Area で配置するため、サムネイルグリッドのレイアウトに影響を与えず
-        // バーが現れたり消えたりしても表示位置がズレない。
-        let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) =
-            self.progress_snapshot();
-        if peak_normal > 0 || peak_upgrade > 0 {
-            // 半透明の濃い背景に対して読みやすいよう、ラベル/数値とも明るい白で表示する。
-            let label_color = egui::Color32::from_rgb(235, 240, 250);
-            let text_color = egui::Color32::WHITE;
-            egui::Area::new("progress_overlay".into())
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
-                        .show(ui, |ui| {
-                            if peak_normal > 0 {
-                                let done = peak_normal.saturating_sub(cur_normal);
-                                let progress = done as f32 / peak_normal as f32;
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("先読み    ")
-                                            .monospace()
-                                            .color(label_color),
-                                    );
-                                    ui.add(
-                                        egui::ProgressBar::new(progress)
-                                            .desired_width(220.0)
-                                            .fill(egui::Color32::from_rgb(60, 130, 220))
-                                            .text(
-                                                egui::RichText::new(format!(
-                                                    "{} / {}",
-                                                    done, peak_normal
-                                                ))
-                                                .color(text_color),
-                                            ),
-                                    );
-                                });
-                            }
-                            if peak_upgrade > 0 {
-                                let done = peak_upgrade.saturating_sub(cur_upgrade);
-                                let progress = done as f32 / peak_upgrade as f32;
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("高画質化  ")
-                                            .monospace()
-                                            .color(label_color),
-                                    );
-                                    ui.add(
-                                        egui::ProgressBar::new(progress)
-                                            .desired_width(220.0)
-                                            .fill(egui::Color32::from_rgb(100, 170, 240))
-                                            .text(
-                                                egui::RichText::new(format!(
-                                                    "{} / {}",
-                                                    done, peak_upgrade
-                                                ))
-                                                .color(text_color),
-                                            ),
-                                    );
-                                });
-                            }
-                        });
-                });
-            // 進行中は毎フレーム再描画してバーをスムーズに更新
-            ctx.request_repaint();
-        }
+        self.render_progress_overlay(ctx);
 
+        // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
@@ -2543,328 +1820,23 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_toolbar_settings_dialog(ctx);
         self.show_cache_policy_dialog(ctx);
         self.show_stats_dialog_window(ctx);
-        // ── ツールバー（列数・アスペクト比・ソート順の即時切り替え）──
-        // horizontal_wrapped により、ウィンドウ幅が足りない場合は自動的に
-        // 複数行に折り返し、すべてのボタンにアクセスできる。
-        // ツールバーの各セクションは設定で個別に表示/非表示を切り替えできる。
-        // すべて非表示なら panel 自体を描画せず、グリッドが画面上部まで広がる。
-        let show_cols = self.settings.show_toolbar_cols;
-        let show_aspect = self.settings.show_toolbar_aspect;
-        let show_sort = self.settings.show_toolbar_sort;
-        let show_favs = self.settings.show_toolbar_favorites;
-        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs;
-        let mut toolbar_fav_nav: Option<PathBuf> = None;
-        if any_toolbar_section {
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
-                    let mut first_section = true;
-                    if show_cols {
-                        ui.label("列:");
-                        for cols in 2..=10usize {
-                            let selected = self.settings.grid_cols == cols;
-                            if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
-                                self.settings.grid_cols = cols;
-                                self.settings.save();
-                            }
-                        }
-                        first_section = false;
-                    }
-                    if show_aspect {
-                        if !first_section {
-                            ui.separator();
-                        }
-                        ui.label("比率:");
-                        for &aspect in crate::settings::ThumbAspect::all() {
-                            let selected = self.settings.thumb_aspect == aspect;
-                            if ui.selectable_label(selected, aspect.label()).clicked() {
-                                self.settings.thumb_aspect = aspect;
-                                self.settings.save();
-                            }
-                        }
-                        first_section = false;
-                    }
-                    if show_sort {
-                        if !first_section {
-                            ui.separator();
-                        }
-                        ui.label("ソート:");
-                        for &order in crate::settings::SortOrder::all() {
-                            let selected = self.settings.sort_order == order;
-                            if ui
-                                .selectable_label(selected, order.short_label())
-                                .clicked()
-                                && !selected
-                            {
-                                self.settings.sort_order = order;
-                                self.settings.save();
-                                if let Some(path) = self.current_folder.clone() {
-                                    self.folder_history.remove(&path);
-                                    self.load_folder(path);
-                                }
-                            }
-                        }
-                        first_section = false;
-                    }
-                    if show_favs {
-                        if !first_section {
-                            ui.separator();
-                        }
-                        ui.label("お気に入り:");
-                        if self.settings.favorites.is_empty() {
-                            ui.label(egui::RichText::new("(未登録)").weak());
-                        } else {
-                            // 現在のフォルダと一致するお気に入りをハイライト
-                            let current = self.current_folder.clone();
-                            for fav in &self.settings.favorites {
-                                let selected = current
-                                    .as_ref()
-                                    .map(|c| c == &fav.path)
-                                    .unwrap_or(false);
-                                if ui
-                                    .selectable_label(selected, &fav.name)
-                                    .on_hover_text(fav.path.to_string_lossy())
-                                    .clicked()
-                                {
-                                    toolbar_fav_nav = Some(fav.path.clone());
-                                }
-                            }
-                        }
-                    }
-                });
-                ui.add_space(2.0);
-            });
-        }
 
-        // ── アドレスバー (フォルダ入力) ──────────────────────────────
-        // 表示設定で隠されている場合はフォルダ入力はファイル>フォルダを開く ダイアログへ
-        let address_nav: Option<PathBuf> = if self.settings.show_toolbar_folder {
-            egui::TopBottomPanel::top("address_bar")
-                .show(ctx, |ui| -> Option<PathBuf> {
-                    ui.add_space(3.0);
-                    let mut result = None;
-                    ui.horizontal(|ui| {
-                        ui.label("フォルダ:");
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.address)
-                                .desired_width(f32::INFINITY),
-                        );
-                        self.address_has_focus = resp.has_focus();
-                        if resp.lost_focus()
-                            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
-                            // ZIP ファイルや存在しないパスでも開けるよう、
-                            // resolve_openable_path で最寄りの既存ディレクトリに解決する。
-                            let p = PathBuf::from(&self.address);
-                            if let Some(resolved) =
-                                crate::folder_tree::resolve_openable_path(&p)
-                            {
-                                result = Some(resolved);
-                            }
-                        }
-                    });
-                    ui.add_space(3.0);
-                    result
-                })
-                .inner
-        } else {
-            self.address_has_focus = false;
-            None
-        };
+        // ── ツールバー ───────────────────────────────────────────────
+        let toolbar_fav_nav = self.render_toolbar(ctx);
+
+        // ── アドレスバー ─────────────────────────────────────────────
+        let address_nav = self.render_address_bar(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
-        let scroll_to = self.scroll_to_selected;
-        self.scroll_to_selected = false;
+        let grid_nav = self.render_grid(ctx);
 
-        let grid_nav = egui::CentralPanel::default()
-            .show(ctx, |ui| -> Option<PathBuf> {
-                if self.items.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("フォルダを入力して Enter キーを押してください");
-                    });
-                    return None;
-                }
+        // ── 選択情報オーバーレイ ─────────────────────────────────────
+        self.render_selection_info(ctx);
 
-                let cols = self.settings.grid_cols.max(1);
-                let avail_w = ui.available_width();
-                let cell_w = (avail_w / cols as f32).floor();
-                let cell_h = (cell_w * self.settings.thumb_aspect.height_ratio()).round().max(1.0);
-
-                // ウィンドウリサイズやアスペクト比変更でセルサイズが変わった場合スナップし直す
-                if (cell_w - self.last_cell_size).abs() > 0.5
-                    || (cell_h - self.last_cell_h).abs() > 0.5
-                {
-                    self.scroll_offset_y =
-                        (self.scroll_offset_y / cell_h).round() * cell_h;
-                    self.last_cell_size = cell_w;
-                    self.last_cell_h = cell_h;
-                }
-
-                if scroll_to {
-                    self.apply_scroll_to_selected(cols, cell_h);
-                }
-
-                let total_rows = self.items.len().div_ceil(cols);
-                let total_h = total_rows as f32 * cell_h;
-
-                // スクロール上限（行境界にスナップ済み）
-                let max_offset = if total_h <= self.last_viewport_h {
-                    0.0
-                } else {
-                    (((total_h - self.last_viewport_h) / cell_h).ceil() * cell_h)
-                        .min(total_h)
-                };
-                self.scroll_offset_y = self.scroll_offset_y.min(max_offset);
-
-                let mut nav: Option<PathBuf> = None;
-
-                // egui にスクロールを管理させず、自前の offset を毎フレーム注入する
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .vertical_scroll_offset(self.scroll_offset_y)
-                    .show_viewport(ui, |ui, viewport| {
-                        // ビューポート高さを記録（次フレームのスクロール計算に使う）
-                        self.last_viewport_h = viewport.height();
-
-                        let (content_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(avail_w, total_h),
-                            egui::Sense::hover(),
-                        );
-
-                        let first_row = (viewport.min.y / cell_h) as usize;
-                        let last_row =
-                            ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
-
-                        // Phase 2b ワーカーへ現在の可視先頭アイテムを通知
-                        // ワーカーはこの値に最も近いアイテムを優先してデコードする
-                        self.scroll_hint.store(first_row * cols, Ordering::Relaxed);
-
-                        for row in first_row..last_row {
-                            for col in 0..cols {
-                                let idx = row * cols + col;
-                                if idx >= self.items.len() {
-                                    break;
-                                }
-
-                                let cell_rect = egui::Rect::from_min_size(
-                                    content_rect.min
-                                        + egui::vec2(
-                                            col as f32 * cell_w,
-                                            row as f32 * cell_h,
-                                        ),
-                                    egui::vec2(cell_w, cell_h),
-                                );
-
-                                let response = ui.interact(
-                                    cell_rect,
-                                    ui.id().with(idx),
-                                    egui::Sense::click(),
-                                );
-                                if response.clicked() {
-                                    self.selected = Some(idx);
-                                    self.update_last_selected_image();
-                                }
-                                if response.double_clicked() {
-                                    match self.items.get(idx) {
-                                        Some(GridItem::Folder(p)) => nav = Some(p.clone()),
-                                        Some(GridItem::Image(_))
-                                        | Some(GridItem::ZipImage { .. })
-                                        | Some(GridItem::ZipSeparator { .. }) => {
-                                            self.open_fullscreen(idx)
-                                        }
-                                        Some(GridItem::Video(p)) => {
-                                            let vp = p.clone();
-                                            open_external_player(&vp);
-                                        }
-                                        None => {}
-                                    }
-                                }
-
-                                draw_cell(
-                                    ui,
-                                    cell_rect,
-                                    self.selected == Some(idx),
-                                    &self.items[idx],
-                                    &self.thumbnails[idx],
-                                );
-
-                                // 選択中セルの矩形を記録 (オーバーレイ配置用)
-                                if self.selected == Some(idx) {
-                                    self.selected_cell_rect = Some(cell_rect);
-                                }
-                            }
-                        }
-                    });
-
-                nav
-            })
-            .inner;
-
-        // ── 選択中アイテムの情報オーバーレイ (セル直下、セル幅で展開) ────
-        // CentralPanel の描画が終わった後に Area を乗せるので、
-        // 上のグリッドループで記録された selected_cell_rect を参照できる。
-        // フルスクリーン中は出さない (独自のホバーヘッダーを持つため)。
-        if self.fullscreen_idx.is_none() {
-            if let (Some(idx), Some(cell_rect)) = (self.selected, self.selected_cell_rect) {
-                // 区切り・フォルダはスキップ
-                let show_info = matches!(
-                    self.items.get(idx),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::Video(_))
-                        | Some(GridItem::ZipImage { .. })
-                );
-                if show_info {
-                    let name = self
-                        .items
-                        .get(idx)
-                        .map(|it| it.name().to_string())
-                        .unwrap_or_default();
-                    // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
-                    let dims_str = match self.thumbnails.get(idx) {
-                        Some(ThumbnailState::Loaded {
-                            source_dims: Some((w, h)),
-                            ..
-                        }) => Some(format!("{} × {}", w, h)),
-                        _ => None,
-                    };
-                    let text = match dims_str {
-                        Some(d) => format!("{}   {}", d, name),
-                        None => name,
-                    };
-
-                    // セル幅で配置: セルの左下を基点、セル幅に合わせる
-                    let cell_w = cell_rect.width();
-                    let area_pos = cell_rect.left_bottom() + egui::vec2(0.0, 4.0);
-
-                    egui::Area::new("selection_info".into())
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(area_pos)
-                        .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style())
-                                .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
-                                .show(ui, |ui| {
-                                    // Frame 内部の最大幅をセル幅に揃える
-                                    // (左右パディングぶんだけ余裕を取る)
-                                    let inner_width = (cell_w - 12.0).max(40.0);
-                                    ui.set_min_width(inner_width);
-                                    ui.set_max_width(inner_width);
-                                    // 長いファイル名は右端で切り落とす (折り返さない)
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(text)
-                                                .color(egui::Color32::WHITE)
-                                                .monospace(),
-                                        )
-                                        .truncate(),
-                                    );
-                                });
-                        });
-                }
-            }
-        }
-
+        // ── ナビゲーション集約 ───────────────────────────────────────
         let navigate = fav_nav
             .or(toolbar_fav_nav)
             .or(keyboard_nav)
@@ -2897,7 +1869,70 @@ impl eframe::App for App {
 // セル描画
 // -----------------------------------------------------------------------
 
-fn draw_cell(
+/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像以外は None を返す。
+fn make_load_request(
+    item: &GridItem,
+    idx: usize,
+    mtime: i64,
+    file_size: i64,
+    skip_cache: bool,
+) -> Option<LoadRequest> {
+    match item {
+        GridItem::Image(p) => Some(LoadRequest {
+            idx, path: p.clone(), mtime, file_size,
+            skip_cache, zip_entry: None,
+        }),
+        GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
+            idx, path: zip_path.clone(), mtime, file_size,
+            skip_cache, zip_entry: Some(entry_name.clone()),
+        }),
+        _ => None,
+    }
+}
+
+/// サムネイルテクスチャをアスペクト保持で中央配置して描画する。
+fn draw_thumb_texture(painter: &egui::Painter, inner: egui::Rect, tex: &egui::TextureHandle) {
+    let tex_size = tex.size_vec2();
+    let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
+    let img_rect = egui::Rect::from_center_size(inner.center(), tex_size * scale);
+    painter.image(
+        tex.id(),
+        img_rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// 画像系アイテム (Image / ZipImage) のサムネイル状態に応じた描画。
+fn draw_thumb(painter: &egui::Painter, inner: egui::Rect, thumb: &ThumbnailState) {
+    match thumb {
+        ThumbnailState::Loaded { tex, .. } => {
+            draw_thumb_texture(painter, inner, tex);
+        }
+        ThumbnailState::Pending | ThumbnailState::Evicted => {
+            painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                "読込中",
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(140),
+            );
+        }
+        ThumbnailState::Failed => {
+            painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                "読込失敗",
+                egui::FontId::proportional(12.0),
+                egui::Color32::DARK_RED,
+            );
+        }
+    }
+}
+
+pub(crate) fn draw_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
     is_selected: bool,
@@ -2937,62 +1972,15 @@ fn draw_cell(
                 egui::Color32::from_gray(30),
             );
         }
-        GridItem::Image(_) => match thumb {
-            ThumbnailState::Loaded { tex, .. } => {
-                let tex_size = tex.size_vec2();
-                let scale =
-                    (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
-                let img_size = tex_size * scale;
-                let img_rect = egui::Rect::from_center_size(inner.center(), img_size);
-                painter.image(
-                    tex.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(1.0, 1.0),
-                    ),
-                    egui::Color32::WHITE,
-                );
-            }
-            ThumbnailState::Pending | ThumbnailState::Evicted => {
-                // 段階 B: Evicted は「一度ロードしたが破棄された」状態だが
-                // 表示上は Pending と同じプレースホルダを描く (再ロード待ち)
-                painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
-                painter.text(
-                    inner.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "読込中",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_gray(140),
-                );
-            }
-            ThumbnailState::Failed => {
-                painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
-                painter.text(
-                    inner.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "読込失敗",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::DARK_RED,
-                );
-            }
-        },
+        GridItem::Image(_) => {
+            draw_thumb(painter, inner, thumb);
+        }
         GridItem::Video(path) => {
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
-                    let tex_size = tex.size_vec2();
-                    let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
-                    let img_rect = egui::Rect::from_center_size(inner.center(), tex_size * scale);
-                    painter.image(
-                        tex.id(),
-                        img_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    draw_thumb_texture(painter, inner, tex);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted => {
-                    // 動画は keep_range ロジックの対象外だが、ThumbnailState 自体は共有なので
-                    // Evicted になる可能性もある (update_keep_range_and_requests でスキップ)
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
                     painter.text(
                         inner.center(),
@@ -3019,40 +2007,9 @@ fn draw_cell(
                 egui::Color32::from_gray(30),
             );
         }
-        GridItem::ZipImage { entry_name: _, .. } => match thumb {
-            ThumbnailState::Loaded { tex, .. } => {
-                let tex_size = tex.size_vec2();
-                let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
-                let img_rect =
-                    egui::Rect::from_center_size(inner.center(), tex_size * scale);
-                painter.image(
-                    tex.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            }
-            ThumbnailState::Pending | ThumbnailState::Evicted => {
-                painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
-                painter.text(
-                    inner.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "読込中",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_gray(140),
-                );
-            }
-            ThumbnailState::Failed => {
-                painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
-                painter.text(
-                    inner.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "読込失敗",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::DARK_RED,
-                );
-            }
-        },
+        GridItem::ZipImage { .. } => {
+            draw_thumb(painter, inner, thumb);
+        }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
             painter.rect_filled(

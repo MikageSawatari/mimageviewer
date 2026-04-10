@@ -89,7 +89,7 @@ impl App {
                     self.settings.save();
                 }
                 // cache_creator_checked は favorites と同じ長さを保つ
-                self.cache_creator_checked
+                self.cc.checked
                     .resize(self.settings.favorites.len(), false);
             }
             self.show_fav_add_dialog = false;

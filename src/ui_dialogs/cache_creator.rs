@@ -1,7 +1,7 @@
 //! `show_cache_creator_dialog` ダイアログの実装。
 //!
 //! `App` への impl 拡張として書かれており、フィールドアクセスは
-//! `pub(crate)` 経由で行われる。`update()` から `self.show_cache_creator_dialog(ctx)` で呼ばれる。
+//! `pub(crate)` 経由で行われる。`update()` から `self.cc.show_dialog(ctx)` で呼ばれる。
 
 #![allow(unused_imports)]
 
@@ -31,15 +31,15 @@ use crate::ui_helpers::{
 impl App {
     pub(crate) fn show_cache_creator_dialog(&mut self, ctx: &egui::Context) {
         // ── キャッシュ作成ポップアップ ────────────────────────────────
-        if self.show_cache_creator {
+        if self.cc.show {
             // 完了初回に結果メッセージをセット
-            if self.cache_creator_finished.load(Ordering::Relaxed)
-                && self.cache_creator_result.is_none()
+            if self.cc.finished.load(Ordering::Relaxed)
+                && self.cc.result.is_none()
             {
-                let done = self.cache_creator_done.load(Ordering::Relaxed);
-                let total = self.cache_creator_total.load(Ordering::Relaxed);
-                let cancelled = self.cache_creator_cancel.load(Ordering::Relaxed);
-                self.cache_creator_result = Some(if cancelled {
+                let done = self.cc.done.load(Ordering::Relaxed);
+                let total = self.cc.total.load(Ordering::Relaxed);
+                let cancelled = self.cc.cancel.load(Ordering::Relaxed);
+                self.cc.result = Some(if cancelled {
                     format!("キャンセルされました（{} / {} フォルダ処理済み）", done, total)
                 } else {
                     format!("{} フォルダの処理が完了しました。", done)
@@ -56,8 +56,8 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(500.0);
 
-                    if !self.cache_creator_running
-                        && !self.cache_creator_finished.load(Ordering::Relaxed)
+                    if !self.cc.running
+                        && !self.cc.finished.load(Ordering::Relaxed)
                     {
                         // ── 選択前画面 ──
                         ui.label("キャッシュを作成するお気に入りを選んでください：");
@@ -70,7 +70,7 @@ impl App {
                                 // 「表示名 (パス)」の形式でチェックボックスのラベルを作る
                                 let label =
                                     format!("{}  ({})", fav.name, fav.path.display());
-                                ui.checkbox(&mut self.cache_creator_checked[i], label);
+                                ui.checkbox(&mut self.cc.checked[i], label);
                             }
                         }
 
@@ -78,7 +78,7 @@ impl App {
                         ui.separator();
                         ui.add_space(4.0);
 
-                        let any_checked = self.cache_creator_checked.iter().any(|&b| b);
+                        let any_checked = self.cc.checked.iter().any(|&b| b);
                         if ui
                             .add_enabled(
                                 any_checked,
@@ -90,10 +90,10 @@ impl App {
                         }
                     } else {
                         // ── 実行中 / 完了画面 ──
-                        let counting = self.cache_creator_counting.load(Ordering::Relaxed);
-                        let total = self.cache_creator_total.load(Ordering::Relaxed);
-                        let done = self.cache_creator_done.load(Ordering::Relaxed);
-                        let size = self.cache_creator_cache_size.load(Ordering::Relaxed);
+                        let counting = self.cc.counting.load(Ordering::Relaxed);
+                        let total = self.cc.total.load(Ordering::Relaxed);
+                        let done = self.cc.done.load(Ordering::Relaxed);
+                        let size = self.cc.cache_size.load(Ordering::Relaxed);
 
                         if counting {
                             ui.label("フォルダを列挙中…");
@@ -101,7 +101,7 @@ impl App {
                             ui.label(format!("フォルダ: {} / {}", done, total));
                         }
 
-                        let current = self.cache_creator_current.lock().unwrap().clone();
+                        let current = self.cc.current.lock().unwrap().clone();
                         if !current.is_empty() {
                             ui.label(
                                 egui::RichText::new(format!("現在: {}", current))
@@ -117,18 +117,18 @@ impl App {
                         ui.separator();
                         ui.add_space(4.0);
 
-                        if self.cache_creator_finished.load(Ordering::Relaxed) {
-                            if let Some(ref msg) = self.cache_creator_result {
+                        if self.cc.finished.load(Ordering::Relaxed) {
+                            if let Some(ref msg) = self.cc.result {
                                 ui.label(msg.as_str());
                                 ui.add_space(4.0);
                             }
                             if ui.button("  閉じる  ").clicked() {
-                                self.show_cache_creator = false;
-                                self.cache_creator_running = false;
+                                self.cc.show = false;
+                                self.cc.running = false;
                             }
                         } else {
                             if ui.button("  キャンセル  ").clicked() {
-                                self.cache_creator_cancel.store(true, Ordering::Relaxed);
+                                self.cc.cancel.store(true, Ordering::Relaxed);
                             }
                             // リアルタイム更新のため繰り返し描画要求
                             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -137,13 +137,13 @@ impl App {
                 });
 
             if !open {
-                if self.cache_creator_running
-                    && !self.cache_creator_finished.load(Ordering::Relaxed)
+                if self.cc.running
+                    && !self.cc.finished.load(Ordering::Relaxed)
                 {
-                    self.cache_creator_cancel.store(true, Ordering::Relaxed);
+                    self.cc.cancel.store(true, Ordering::Relaxed);
                 }
-                self.show_cache_creator = false;
-                self.cache_creator_running = false;
+                self.cc.show = false;
+                self.cc.running = false;
             }
         }
 
