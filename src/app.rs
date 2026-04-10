@@ -130,6 +130,13 @@ pub struct App {
     /// update_keep_range_and_requests で毎フレーム更新される。
     display_px_shared: Arc<AtomicU32>,
 
+    // ── 統計情報 (起動時から累計) ─────────────────────────────
+    /// サムネイル読み込みの統計 (時間分布・サイズ分布・フォーマット)。
+    /// ワーカースレッドから Arc 経由で更新され、UI スレッドが読み出す。
+    stats: Arc<Mutex<crate::stats::ThumbStats>>,
+    /// 統計ダイアログの表示フラグ
+    show_stats_dialog: bool,
+
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
     fullscreen_idx: Option<usize>,
@@ -255,6 +262,8 @@ impl Default for App {
             last_scroll_offset_y_tracked: 0.0,
             last_scroll_change_time: std::time::Instant::now(),
             display_px_shared: Arc::new(AtomicU32::new(512)),
+            stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
+            show_stats_dialog: false,
             fullscreen_idx: None,
             fs_cache: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
@@ -501,6 +510,7 @@ impl App {
             let catalog_w = catalog_arc.clone();
             let done_w = Arc::clone(&cache_gen_done);
             let display_px_w = Arc::clone(&self.display_px_shared);
+            let stats_w = Arc::clone(&self.stats);
 
             std::thread::spawn(move || {
                 crate::logger::log(format!("  worker {worker_idx} started"));
@@ -536,6 +546,7 @@ impl App {
                             process_load_request(
                                 &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
                                 thumb_px, thumb_quality, display_px, cache_decision, &done_w,
+                                &stats_w,
                             );
                         }
                         None => {
@@ -553,6 +564,15 @@ impl App {
             let tx_v = tx_for_video;
             let cancel_v = cancel_for_video;
             let thumb_size = self.last_cell_size.max(256.0) as i32;
+            let stats_v = Arc::clone(&self.stats);
+            // 動画用にメタデータ (file_size) を事前に収集しておく
+            let video_sizes: std::collections::HashMap<usize, u64> = all_media
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, is_vid, _, size))| {
+                    if *is_vid { Some((folder_count + i, (*size).max(0) as u64)) } else { None }
+                })
+                .collect();
             std::thread::spawn(move || {
                 for (idx, path) in video_items {
                     if cancel_v.load(Ordering::Relaxed) { break; }
@@ -561,6 +581,15 @@ impl App {
                         "  video thumb: idx={idx} {}",
                         if ci.is_some() { "ok" } else { "FAIL" }
                     ));
+                    // 統計: 動画件数 + サイズを記録 (成功のみ)
+                    if ci.is_some() {
+                        if let Ok(mut s) = stats_v.lock() {
+                            let size = video_sizes.get(&idx).copied().unwrap_or(0);
+                            s.record_video(size);
+                        }
+                    } else if let Ok(mut s) = stats_v.lock() {
+                        s.record_failed();
+                    }
                     // 動画 Shell API はアップグレード経路を持たないので from_cache = false
                     let _ = tx_v.send((idx, ci, false));
                 }
@@ -2003,6 +2032,10 @@ impl eframe::App for App {
                         self.show_cache_policy_dialog = true;
                         ui.close();
                     }
+                    if ui.button("統計…").clicked() {
+                        self.show_stats_dialog = true;
+                        ui.close();
+                    }
                     if ui.button("環境設定…").clicked() {
                         // ダイアログを開くとき現在値で初期化
                         self.pref_manual_threads = match &self.settings.parallelism {
@@ -3047,6 +3080,107 @@ impl eframe::App for App {
             }
         }
 
+        // ── 統計ダイアログ ──────────────────────────────────────────
+        if self.show_stats_dialog {
+            let mut open = true;
+            let mut reset_clicked = false;
+            let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+
+            // スナップショットを取得 (ロック時間を最小化)
+            let snapshot: crate::stats::ThumbStats = {
+                self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+            };
+
+            egui::Window::new("統計")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_pos(dialog_pos)
+                .show(ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.label(
+                        "起動時から累計したサムネイル読み込み統計です。\n\
+                         キャッシュ生成設定の参考にしてください。\n\
+                         (キャッシュヒットは対象外。フルデコード時のみ記録)",
+                    );
+                    ui.add_space(8.0);
+
+                    // ── 読み込み時間ヒストグラム ──
+                    ui.heading("読み込み時間 (decode + display)");
+                    ui.add_space(4.0);
+                    draw_histogram(
+                        ui,
+                        &snapshot.load_time_hist,
+                        |bucket| crate::stats::ThumbStats::load_time_label(bucket),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── ファイルサイズヒストグラム ──
+                    ui.heading("ファイルサイズ");
+                    ui.add_space(4.0);
+                    draw_histogram(
+                        ui,
+                        &snapshot.size_hist,
+                        |bucket| crate::stats::ThumbStats::size_label(bucket),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── フォーマット別件数 ──
+                    ui.heading("フォーマット");
+                    ui.add_space(4.0);
+                    let format_rows: [(&str, u64); 7] = [
+                        ("JPEG  ", snapshot.count_jpg),
+                        ("PNG   ", snapshot.count_png),
+                        ("WebP  ", snapshot.count_webp),
+                        ("GIF   ", snapshot.count_gif),
+                        ("BMP   ", snapshot.count_bmp),
+                        ("動画  ", snapshot.count_video),
+                        ("その他", snapshot.count_other),
+                    ];
+                    draw_format_rows(ui, &format_rows);
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── サマリ ──
+                    let total_images = snapshot.total_images();
+                    let total_all = total_images + snapshot.count_video;
+                    ui.label(format!(
+                        "合計: {} 件  (画像 {} / 動画 {} / 失敗 {})",
+                        format_count(total_all),
+                        format_count(total_images),
+                        format_count(snapshot.count_video),
+                        format_count(snapshot.count_failed),
+                    ));
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("リセット").clicked() {
+                            reset_clicked = true;
+                        }
+                        if ui.button("閉じる").clicked() {
+                            // open = false でダイアログを閉じる
+                        }
+                    });
+                });
+
+            if reset_clicked {
+                if let Ok(mut s) = self.stats.lock() {
+                    s.reset();
+                }
+            }
+            if !open {
+                self.show_stats_dialog = false;
+            }
+        }
+
         // ── ツールバー（列数・アスペクト比・ソート順の即時切り替え）──
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -3575,6 +3709,7 @@ fn process_load_request(
     display_px: u32,
     cache_decision: CacheDecision,
     gen_done: &Arc<AtomicUsize>,
+    stats: &Arc<Mutex<crate::stats::ThumbStats>>,
 ) {
     let filename = req
         .path
@@ -3591,6 +3726,8 @@ fn process_load_request(
                 // from_cache = true: アップグレード対象
                 let _ = tx.send((req.idx, ci, true));
                 gen_done.fetch_add(1, Ordering::Relaxed);
+                // 統計には記録しない: キャッシュヒットは 2-3 ms で
+                // "キャッシュ無し時のコスト" を歪めるため
                 return;
             }
         }
@@ -3602,6 +3739,7 @@ fn process_load_request(
         &req.path, req.idx, tx, catalog,
         req.mtime, req.file_size, gen_done,
         thumb_px, thumb_quality, display_px, cache_decision,
+        stats,
     );
 }
 
@@ -3631,6 +3769,7 @@ fn load_one_cached(
     thumb_quality: u8,
     display_px: u32,
     cache_decision: CacheDecision,
+    stats: &Arc<Mutex<crate::stats::ThumbStats>>,
 ) {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
     let t = std::time::Instant::now();
@@ -3652,6 +3791,9 @@ fn load_one_cached(
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {name}"));
             let _ = tx.send((idx, None, false));
             gen_done.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut s) = stats.lock() {
+                s.record_failed();
+            }
             return;
         }
     };
@@ -3664,6 +3806,17 @@ fn load_one_cached(
     let display_ci = resize_to_display_color_image(&img, display_px);
     let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
     let _ = tx.send((idx, Some(display_ci), false));
+
+    // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
+    {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if let Ok(mut s) = stats.lock() {
+            s.record_image(decode_ms + display_ms, file_size.max(0) as u64, ext);
+        }
+    }
 
     // (B) キャッシュ保存判定 (段階 C)
     //     catalog 未指定時は保存不可
@@ -3918,6 +4071,71 @@ fn format_bytes_small(bytes: u64) -> String {
         format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// 整数を 3 桁区切りにフォーマット (例: 1234 → "1,234")
+fn format_count(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// 統計ダイアログのヒストグラムを ASCII バー + 件数で描画する。
+/// `label_fn` がバケットインデックスから左端ラベルを返す。
+fn draw_histogram(
+    ui: &mut egui::Ui,
+    hist: &[u64],
+    label_fn: impl Fn(usize) -> String,
+) {
+    const MAX_BAR_WIDTH: usize = 32;
+    let max_count = hist.iter().copied().max().unwrap_or(0);
+    if max_count == 0 {
+        ui.label("  (データなし)");
+        return;
+    }
+
+    // モノスペースフォントで整列
+    let font = egui::FontId::monospace(12.0);
+    for (bucket, &count) in hist.iter().enumerate() {
+        // 末尾の 0 連続をトリミングしない (分布の全体像が見えるように)
+        let label = label_fn(bucket);
+        let bar_len = ((count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
+        let bar: String = std::iter::repeat('=').take(bar_len).collect();
+        let count_str = format_count(count);
+        let line = format!(
+            "  {label}  {bar:<MAX_BAR_WIDTH$}  {count_str:>8}",
+            MAX_BAR_WIDTH = MAX_BAR_WIDTH,
+        );
+        ui.label(egui::RichText::new(line).font(font.clone()));
+    }
+}
+
+/// 統計ダイアログのフォーマット別件数を ASCII バー + 件数で描画する。
+fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64)]) {
+    const MAX_BAR_WIDTH: usize = 32;
+    let max_count = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    if max_count == 0 {
+        ui.label("  (データなし)");
+        return;
+    }
+    let font = egui::FontId::monospace(12.0);
+    for (label, count) in rows {
+        let bar_len = ((*count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
+        let bar: String = std::iter::repeat('=').take(bar_len).collect();
+        let count_str = format_count(*count);
+        let line = format!(
+            "  {label}  {bar:<MAX_BAR_WIDTH$}  {count_str:>8}",
+            MAX_BAR_WIDTH = MAX_BAR_WIDTH,
+        );
+        ui.label(egui::RichText::new(line).font(font.clone()));
     }
 }
 

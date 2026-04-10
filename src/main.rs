@@ -6,6 +6,7 @@ pub mod gpu_info;
 pub mod logger;
 pub mod monitor;
 pub mod settings;
+pub mod stats;
 pub mod video_thumb;
 
 use std::sync::Arc;
