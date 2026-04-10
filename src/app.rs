@@ -284,31 +284,6 @@ impl App {
 
         crate::logger::log(format!("=== load_folder: {} ===", path.display()));
 
-        // 現在のフォルダのスクロール位置・選択状態を履歴に保存
-        if let Some(cur) = self.current_folder.clone() {
-            self.folder_history.insert(cur, (self.scroll_offset_y, self.selected));
-        }
-
-        // フォルダ移動時はフルスクリーンを閉じる（先読みキャッシュも全クリア）
-        self.close_fullscreen();
-
-        // ── 旧タスクをキャンセル ──────────────────────────────────────
-        self.cancel_token.store(true, Ordering::Relaxed);
-        crate::logger::log("  cancel_token -> true (old tasks will stop)");
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel_token = Arc::clone(&cancel);
-
-        let (tx, rx) = mpsc::channel();
-        self.tx = tx.clone();
-        self.rx = rx;
-
-        self.current_folder = Some(path.clone());
-        self.address = path.to_string_lossy().to_string();
-        self.selected = None;
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
-        self.scroll_hint.store(0, Ordering::Relaxed);
-
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
         let mut folders: Vec<GridItem> = Vec::new();
         // (path, is_video, mtime, file_size)
@@ -365,224 +340,32 @@ impl App {
 
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
-        self.items = folders;
-        for (p, is_video, _, _) in &all_media {
-            if *is_video {
-                self.items.push(GridItem::Video(p.clone()));
-            } else {
-                self.items.push(GridItem::Image(p.clone()));
-            }
-        }
-        self.thumbnails = (0..self.items.len()).map(|_| ThumbnailState::Pending).collect();
-        self.requested.clear();
-        self.keep_range = (0, 0);
+        let mut items: Vec<GridItem> = folders;
+        let mut image_metas: Vec<Option<(i64, i64)>> = vec![None; folder_count];
+        let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
 
-        // 段階 B: アイテム idx と並行する画像メタデータ配列を構築
-        // フォルダと動画は None、画像は Some((mtime, file_size))
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(self.items.len());
-        for _ in 0..folder_count {
-            image_metas.push(None);
-        }
-        for (_, is_video, mtime, file_size) in &all_media {
+        for (offset, (p, is_video, mtime, file_size)) in all_media.iter().enumerate() {
+            let item_idx = folder_count + offset;
             if *is_video {
+                items.push(GridItem::Video(p.clone()));
                 image_metas.push(None);
+                video_items.push((item_idx, p.clone(), (*file_size).max(0) as u64));
             } else {
+                items.push(GridItem::Image(p.clone()));
                 image_metas.push(Some((*mtime, *file_size)));
             }
         }
-        self.image_metas = image_metas;
 
-        // 動画サムネイル用リスト: (item_idx, path)
-        let video_items: Vec<(usize, PathBuf)> = all_media.iter()
-            .enumerate()
-            .filter_map(|(i, (p, is_video, _, _))| {
-                if *is_video { Some((folder_count + i, p.clone())) } else { None }
+        // 画像ファイル名集合 (カタログ掃除用キー)
+        let existing_keys: std::collections::HashSet<String> = items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::Image(p) => p.file_name()?.to_str().map(String::from),
+                _ => None,
             })
             .collect();
 
-        // 画像リスト（カタログ掃除用）: (item_idx, path, mtime, file_size)
-        let images: Vec<(usize, PathBuf, i64, i64)> = all_media.iter()
-            .enumerate()
-            .filter_map(|(i, (p, is_video, mtime, file_size))| {
-                if !is_video { Some((folder_count + i, p.clone(), *mtime, *file_size)) } else { None }
-            })
-            .collect();
-
-        // ── カタログを開いてキャッシュ状態を確認 ──────────────────────
-        let cache_dir = crate::catalog::default_cache_dir();
-        let catalog_arc: Option<std::sync::Arc<crate::catalog::CatalogDb>> =
-            crate::catalog::CatalogDb::open(&cache_dir, &path)
-                .map_err(|e| crate::logger::log(format!("  catalog open failed: {e}")))
-                .ok()
-                .map(std::sync::Arc::new);
-
-        // 段階 B: 全キャッシュを Arc<HashMap> として一括ロードし、
-        // 永続ワーカー群で共有する
-        let cache_map: Arc<std::collections::HashMap<String, crate::catalog::CacheEntry>> =
-            Arc::new(
-                catalog_arc
-                    .as_ref()
-                    .and_then(|c| c.load_all().ok())
-                    .unwrap_or_default(),
-            );
-        crate::logger::log(format!("  catalog: {} entries in DB", cache_map.len()));
-
-        // 削除済みファイルのエントリを DB から掃除
-        if let Some(ref cat) = catalog_arc {
-            let existing: std::collections::HashSet<String> = images
-                .iter()
-                .filter_map(|(_, p, _, _)| p.file_name()?.to_str().map(String::from))
-                .collect();
-            if let Err(e) = cat.delete_missing(&existing) {
-                crate::logger::log(format!("  catalog delete_missing failed: {e}"));
-            }
-        }
-
-        // ── 進捗カウンタをリセット ────────────────────────────────────
-        // 段階 B: 総数は動的になるので cache_gen_total は 0 にしておき、
-        // タイトルバーには in-flight 件数を表示する
-        self.cache_gen_total = 0;
-        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
-        let cache_gen_done = Arc::clone(&self.cache_gen_done);
-
-        // ── 永続ワーカーのセットアップ (段階 B) ───────────────────────
-        // 共有要求キュー: UI スレッドが push、ワーカーが pop する
-        let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        self.reload_queue = Some(Arc::clone(&reload_queue));
-
-        let thumb_threads = self.settings.parallelism.thread_count();
-        crate::logger::log(format!("  spawning {thumb_threads} persistent workers"));
-
-        // ワーカーに渡すパラメータ
-        let scroll_hint = Arc::clone(&self.scroll_hint);
-        let tx_for_video = tx.clone();
-        let cancel_for_video = Arc::clone(&cancel);
-        let thumb_px = self.settings.thumb_px;
-        let thumb_quality = self.settings.thumb_quality;
-        // 表示用 ColorImage の解像度を現在のセルサイズから算出 (段階 A)
-        // Arc<AtomicU32> に格納してワーカー間で共有。列数変更時も追従させる。
-        let initial_display_px = compute_display_px(
-            self.last_cell_size,
-            self.last_cell_h,
-            self.last_pixels_per_point,
-        );
-        self.display_px_shared
-            .store(initial_display_px, Ordering::Relaxed);
-        // キャッシュ生成判定パラメータ (段階 C)
-        let cache_decision = CacheDecision::from_settings(&self.settings);
-        crate::logger::log(format!(
-            "  display_px = {initial_display_px}  cache_policy = {}",
-            self.settings.cache_policy.label()
-        ));
-
-        // 永続ワーカーを spawn（cancel されるまで reload_queue をポーリングし続ける）
-        for worker_idx in 0..thumb_threads {
-            let queue = Arc::clone(&reload_queue);
-            let tx_w = tx.clone();
-            let cancel_w = Arc::clone(&cancel);
-            let hint_w = Arc::clone(&scroll_hint);
-            let cache_map_w = Arc::clone(&cache_map);
-            let catalog_w = catalog_arc.clone();
-            let done_w = Arc::clone(&cache_gen_done);
-            let display_px_w = Arc::clone(&self.display_px_shared);
-            let stats_w = Arc::clone(&self.stats);
-
-            std::thread::spawn(move || {
-                crate::logger::log(format!("  worker {worker_idx} started"));
-                loop {
-                    if cancel_w.load(Ordering::Relaxed) { break; }
-
-                    // 可視先頭に最も近い要求を選ぶ
-                    let req_opt: Option<LoadRequest> = {
-                        let mut q = queue.lock().unwrap();
-                        if q.is_empty() {
-                            None
-                        } else {
-                            let vis = hint_w.load(Ordering::Relaxed);
-                            let best = q
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, r)| {
-                                    let i = r.idx;
-                                    if i < vis { vis - i } else { i - vis }
-                                })
-                                .map(|(pos, _)| pos)
-                                .unwrap();
-                            Some(q.swap_remove(best))
-                        }
-                    };
-
-                    match req_opt {
-                        Some(req) => {
-                            if cancel_w.load(Ordering::Relaxed) { break; }
-                            // ワーカーは各リクエスト処理直前に現在の display_px を読む
-                            // → 列数変更で UI が値を更新したら即追従
-                            let display_px = display_px_w.load(Ordering::Relaxed);
-                            process_load_request(
-                                &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
-                                thumb_px, thumb_quality, display_px, cache_decision, &done_w,
-                                &stats_w,
-                            );
-                        }
-                        None => {
-                            // キューが空: 短時間スリープしてキャンセル監視 + CPU 負荷軽減
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
-                    }
-                }
-                crate::logger::log(format!("  worker {worker_idx} stopped"));
-            });
-        }
-
-        // ── 動画サムネイルを別スレッドで取得（Windows Shell API）─────────
-        if !video_items.is_empty() {
-            let tx_v = tx_for_video;
-            let cancel_v = cancel_for_video;
-            let thumb_size = self.last_cell_size.max(256.0) as i32;
-            let stats_v = Arc::clone(&self.stats);
-            // 動画用にメタデータ (file_size) を事前に収集しておく
-            let video_sizes: std::collections::HashMap<usize, u64> = all_media
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (_, is_vid, _, size))| {
-                    if *is_vid { Some((folder_count + i, (*size).max(0) as u64)) } else { None }
-                })
-                .collect();
-            std::thread::spawn(move || {
-                for (idx, path) in video_items {
-                    if cancel_v.load(Ordering::Relaxed) { break; }
-                    let ci = crate::video_thumb::get_video_thumbnail(&path, thumb_size);
-                    crate::logger::log(format!(
-                        "  video thumb: idx={idx} {}",
-                        if ci.is_some() { "ok" } else { "FAIL" }
-                    ));
-                    // 統計: 動画件数 + サイズを記録 (成功のみ)
-                    if ci.is_some() {
-                        if let Ok(mut s) = stats_v.lock() {
-                            let size = video_sizes.get(&idx).copied().unwrap_or(0);
-                            s.record_video(size);
-                        }
-                    } else if let Ok(mut s) = stats_v.lock() {
-                        s.record_failed();
-                    }
-                    // 動画 Shell API はアップグレード経路を持たないので from_cache = false
-                    let _ = tx_v.send((idx, ci, false));
-                }
-            });
-        }
-
-        // 履歴があればスクロール位置・選択状態を復元
-        if let Some(&(scroll, sel)) = self.folder_history.get(&path) {
-            self.scroll_offset_y = scroll;
-            self.selected = sel;
-            if sel.is_some() {
-                self.scroll_to_selected = true;
-            }
-        }
-
-        // 前回フォルダとして保存
-        self.settings.last_folder = Some(path);
-        self.settings.save();
+        self.start_loading_items(path, items, image_metas, existing_keys, video_items);
     }
 
     /// タスク 3: ZIP ファイルを仮想フォルダとして開く。
@@ -593,40 +376,19 @@ impl App {
     pub fn load_zip_as_folder(&mut self, zip_path: PathBuf) {
         crate::logger::log(format!("=== load_zip_as_folder: {} ===", zip_path.display()));
 
-        // 履歴保存 (既存フォルダがあれば)
-        if let Some(cur) = self.current_folder.clone() {
-            self.folder_history.insert(cur, (self.scroll_offset_y, self.selected));
-        }
-
-        self.close_fullscreen();
-
-        // 旧タスクをキャンセル
-        self.cancel_token.store(true, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel_token = Arc::clone(&cancel);
-
-        let (tx, rx) = mpsc::channel();
-        self.tx = tx.clone();
-        self.rx = rx;
-
-        self.current_folder = Some(zip_path.clone());
-        self.address = zip_path.to_string_lossy().to_string();
-        self.selected = None;
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
-        self.scroll_hint.store(0, Ordering::Relaxed);
-
         // ── ZIP エントリ列挙 ──
         let entries = match crate::zip_loader::enumerate_image_entries(&zip_path) {
             Ok(e) => e,
             Err(e) => {
                 crate::logger::log(format!("  zip enumerate failed: {e}"));
-                self.items.clear();
-                self.thumbnails.clear();
-                self.image_metas.clear();
-                self.requested.clear();
-                self.settings.last_folder = Some(zip_path);
-                self.settings.save();
+                // 空状態で表示だけ更新
+                self.start_loading_items(
+                    zip_path,
+                    Vec::new(),
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    Vec::new(),
+                );
                 return;
             }
         };
@@ -673,7 +435,8 @@ impl App {
         // 単一グループ (ルート直下のみ) ならセパレータは不要。
         let insert_separators = groups.len() > 1;
         let mut items: Vec<GridItem> = Vec::new();
-        let mut metas: Vec<Option<(i64, i64)>> = Vec::new();
+        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
+        let mut existing_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (dir, list) in groups {
             if insert_separators {
@@ -683,29 +446,69 @@ impl App {
                     dir.clone()
                 };
                 items.push(GridItem::ZipSeparator { dir_display: display });
-                metas.push(None);
+                image_metas.push(None);
             }
             for e in list {
+                existing_keys.insert(e.entry_name.clone());
                 items.push(GridItem::ZipImage {
                     zip_path: zip_path.clone(),
                     entry_name: e.entry_name,
                 });
-                metas.push(Some((e.mtime, e.uncompressed_size as i64)));
+                image_metas.push(Some((e.mtime, e.uncompressed_size as i64)));
             }
         }
 
+        // ZIP には動画は含まれない (Shell API がファイルパスを要求するため)
+        self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new());
+    }
+
+    /// load_folder と load_zip_as_folder の共通処理。
+    ///
+    /// 与えられた `items` / `image_metas` を新しい状態として設定し、
+    /// 旧タスクをキャンセル → カタログを開く → 永続ワーカー + 動画スレッドを起動 →
+    /// 履歴復元 → last_folder 保存 までを行う。
+    fn start_loading_items(
+        &mut self,
+        source_path: PathBuf,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        catalog_existing_keys: std::collections::HashSet<String>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+    ) {
+        // ── 履歴保存 + 旧タスクキャンセル + 状態リセット ──
+        if let Some(cur) = self.current_folder.clone() {
+            self.folder_history.insert(cur, (self.scroll_offset_y, self.selected));
+        }
+        self.close_fullscreen();
+
+        self.cancel_token.store(true, Ordering::Relaxed);
+        crate::logger::log("  cancel_token -> true (old tasks will stop)");
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_token = Arc::clone(&cancel);
+
+        let (tx, rx) = mpsc::channel();
+        self.tx = tx.clone();
+        self.rx = rx;
+
+        self.current_folder = Some(source_path.clone());
+        self.address = source_path.to_string_lossy().to_string();
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        self.scroll_to_selected = false;
+        self.scroll_hint.store(0, Ordering::Relaxed);
+
         self.items = items;
-        self.image_metas = metas;
+        self.image_metas = image_metas;
         self.thumbnails = (0..self.items.len())
             .map(|_| ThumbnailState::Pending)
             .collect();
         self.requested.clear();
         self.keep_range = (0, 0);
 
-        // ── カタログを ZIP 別に開く ──
+        // ── カタログを開く + cache_map ロード + 削除掃除 ──
         let cache_dir = crate::catalog::default_cache_dir();
         let catalog_arc: Option<Arc<crate::catalog::CatalogDb>> =
-            crate::catalog::CatalogDb::open(&cache_dir, &zip_path)
+            crate::catalog::CatalogDb::open(&cache_dir, &source_path)
                 .map_err(|e| crate::logger::log(format!("  catalog open failed: {e}")))
                 .ok()
                 .map(Arc::new);
@@ -719,40 +522,75 @@ impl App {
             );
         crate::logger::log(format!("  catalog: {} entries in DB", cache_map.len()));
 
-        // 削除済みエントリの掃除 (現在の ZIP に含まれるエントリ名の集合を渡す)
         if let Some(ref cat) = catalog_arc {
-            let existing: std::collections::HashSet<String> = self
-                .items
-                .iter()
-                .filter_map(|it| match it {
-                    GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
-                    _ => None,
-                })
-                .collect();
-            if let Err(e) = cat.delete_missing(&existing) {
+            if let Err(e) = cat.delete_missing(&catalog_existing_keys) {
                 crate::logger::log(format!("  catalog delete_missing failed: {e}"));
             }
         }
 
+        // ── 進捗カウンタリセット + 共有 display_px 更新 ──
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
-        let cache_gen_done = Arc::clone(&self.cache_gen_done);
 
-        // ── 永続ワーカー起動 (load_folder と同じパターン) ──
-        let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        self.reload_queue = Some(Arc::clone(&reload_queue));
-
-        let thumb_threads = self.settings.parallelism.thread_count();
-        let scroll_hint = Arc::clone(&self.scroll_hint);
-        let thumb_px = self.settings.thumb_px;
-        let thumb_quality = self.settings.thumb_quality;
         let initial_display_px = compute_display_px(
             self.last_cell_size,
             self.last_cell_h,
             self.last_pixels_per_point,
         );
         self.display_px_shared.store(initial_display_px, Ordering::Relaxed);
+        crate::logger::log(format!(
+            "  display_px = {initial_display_px}  cache_policy = {}",
+            self.settings.cache_policy.label()
+        ));
+
+        // ── 永続ワーカー + (必要なら) 動画スレッドを起動 ──
+        let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+
+        self.spawn_thumbnail_workers(
+            &tx,
+            Arc::clone(&cancel),
+            reload_queue,
+            cache_map,
+            catalog_arc,
+        );
+        if !video_items.is_empty() {
+            self.spawn_video_thread(tx, cancel, video_items);
+        }
+
+        // ── 履歴復元 + last_folder 保存 ──
+        if let Some(&(scroll, sel)) = self.folder_history.get(&source_path) {
+            self.scroll_offset_y = scroll;
+            self.selected = sel;
+            if sel.is_some() {
+                self.scroll_to_selected = true;
+            }
+        }
+        self.settings.last_folder = Some(source_path);
+        self.settings.save();
+    }
+
+    /// 永続サムネイルワーカープールを `parallelism.thread_count()` 個 spawn する。
+    /// 各ワーカーは `reload_queue` を `scroll_hint` 優先度で消費し続け、
+    /// `cancel` が立つまで動作する。
+    fn spawn_thumbnail_workers(
+        &self,
+        tx: &mpsc::Sender<ThumbMsg>,
+        cancel: Arc<AtomicBool>,
+        reload_queue: Arc<Mutex<Vec<LoadRequest>>>,
+        cache_map: Arc<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
+    ) {
+        let thumb_threads = self.settings.parallelism.thread_count();
+        let thumb_px = self.settings.thumb_px;
+        let thumb_quality = self.settings.thumb_quality;
         let cache_decision = CacheDecision::from_settings(&self.settings);
+        let scroll_hint = Arc::clone(&self.scroll_hint);
+        let display_px_shared = Arc::clone(&self.display_px_shared);
+        let stats = Arc::clone(&self.stats);
+        let cache_gen_done = Arc::clone(&self.cache_gen_done);
+
+        crate::logger::log(format!("  spawning {thumb_threads} persistent workers"));
 
         for worker_idx in 0..thumb_threads {
             let queue = Arc::clone(&reload_queue);
@@ -762,20 +600,24 @@ impl App {
             let cache_map_w = Arc::clone(&cache_map);
             let catalog_w = catalog_arc.clone();
             let done_w = Arc::clone(&cache_gen_done);
-            let display_px_w = Arc::clone(&self.display_px_shared);
-            let stats_w = Arc::clone(&self.stats);
+            let display_px_w = Arc::clone(&display_px_shared);
+            let stats_w = Arc::clone(&stats);
 
             std::thread::spawn(move || {
-                crate::logger::log(format!("  zip worker {worker_idx} started"));
+                crate::logger::log(format!("  worker {worker_idx} started"));
                 loop {
                     if cancel_w.load(Ordering::Relaxed) { break; }
+
+                    // 可視先頭に最も近い要求を選ぶ
                     let req_opt: Option<LoadRequest> = {
                         let mut q = queue.lock().unwrap();
                         if q.is_empty() {
                             None
                         } else {
                             let vis = hint_w.load(Ordering::Relaxed);
-                            let best = q.iter().enumerate()
+                            let best = q
+                                .iter()
+                                .enumerate()
                                 .min_by_key(|(_, r)| {
                                     let i = r.idx;
                                     if i < vis { vis - i } else { i - vis }
@@ -785,6 +627,7 @@ impl App {
                             Some(q.swap_remove(best))
                         }
                     };
+
                     match req_opt {
                         Some(req) => {
                             if cancel_w.load(Ordering::Relaxed) { break; }
@@ -796,25 +639,47 @@ impl App {
                             );
                         }
                         None => {
+                            // キューが空: 短時間スリープしてキャンセル監視 + CPU 負荷軽減
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
                     }
                 }
-                crate::logger::log(format!("  zip worker {worker_idx} stopped"));
+                crate::logger::log(format!("  worker {worker_idx} stopped"));
             });
         }
+    }
 
-        // 履歴復元
-        if let Some(&(scroll, sel)) = self.folder_history.get(&zip_path) {
-            self.scroll_offset_y = scroll;
-            self.selected = sel;
-            if sel.is_some() {
-                self.scroll_to_selected = true;
+    /// 動画サムネイル取得スレッドを起動する。
+    /// 各動画について Windows Shell API でサムネを取り出し、tx 経由で UI に送信する。
+    fn spawn_video_thread(
+        &self,
+        tx: mpsc::Sender<ThumbMsg>,
+        cancel: Arc<AtomicBool>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+    ) {
+        let thumb_size = self.last_cell_size.max(256.0) as i32;
+        let stats = Arc::clone(&self.stats);
+
+        std::thread::spawn(move || {
+            for (idx, path, file_size) in video_items {
+                if cancel.load(Ordering::Relaxed) { break; }
+                let ci = crate::video_thumb::get_video_thumbnail(&path, thumb_size);
+                crate::logger::log(format!(
+                    "  video thumb: idx={idx} {}",
+                    if ci.is_some() { "ok" } else { "FAIL" }
+                ));
+                // 統計: 動画件数 + サイズを記録 (成功のみ)
+                if ci.is_some() {
+                    if let Ok(mut s) = stats.lock() {
+                        s.record_video(file_size);
+                    }
+                } else if let Ok(mut s) = stats.lock() {
+                    s.record_failed();
+                }
+                // 動画 Shell API はアップグレード経路を持たないので from_cache = false
+                let _ = tx.send((idx, ci, false));
             }
-        }
-
-        self.settings.last_folder = Some(zip_path);
-        self.settings.save();
+        });
     }
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
