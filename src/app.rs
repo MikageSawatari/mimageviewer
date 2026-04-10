@@ -2502,67 +2502,6 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        // ── 選択中アイテムの情報オーバーレイ (セル直下、セル幅で展開) ────
-        // フルスクリーン中は出さない (フルスクリーンには独自の上部バーがある)
-        if self.fullscreen_idx.is_none() {
-            if let (Some(idx), Some(cell_rect)) = (self.selected, self.selected_cell_rect) {
-                // 区切り・フォルダはスキップ (無意味)
-                let show_info = matches!(
-                    self.items.get(idx),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::Video(_))
-                        | Some(GridItem::ZipImage { .. })
-                );
-                if show_info {
-                    let name = self
-                        .items
-                        .get(idx)
-                        .map(|it| it.name().to_string())
-                        .unwrap_or_default();
-                    // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
-                    let dims_str = match self.thumbnails.get(idx) {
-                        Some(ThumbnailState::Loaded {
-                            source_dims: Some((w, h)),
-                            ..
-                        }) => Some(format!("{} × {}", w, h)),
-                        _ => None,
-                    };
-                    let text = match dims_str {
-                        Some(d) => format!("{}   {}", d, name),
-                        None => name,
-                    };
-
-                    // セル幅で配置: セルの左下を基点、セル幅に合わせる
-                    let cell_w = cell_rect.width();
-                    let area_pos = cell_rect.left_bottom() + egui::vec2(0.0, 4.0);
-
-                    egui::Area::new("selection_info".into())
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(area_pos)
-                        .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style())
-                                .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
-                                .show(ui, |ui| {
-                                    // Frame 内部の最大幅をセル幅に揃える
-                                    // (左右パディングぶんだけ余裕を取る)
-                                    let inner_width = (cell_w - 12.0).max(40.0);
-                                    ui.set_min_width(inner_width);
-                                    ui.set_max_width(inner_width);
-                                    // 長いファイル名は右端で切り落とす (折り返さない)
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(text)
-                                                .color(egui::Color32::WHITE)
-                                                .monospace(),
-                                        )
-                                        .truncate(),
-                                    );
-                                });
-                        });
-                }
-            }
-        }
-
         self.show_favorites_editor_dialog(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
@@ -2766,6 +2705,69 @@ impl eframe::App for App {
                 nav
             })
             .inner;
+
+        // ── 選択中アイテムの情報オーバーレイ (セル直下、セル幅で展開) ────
+        // CentralPanel の描画が終わった後に Area を乗せるので、
+        // 上のグリッドループで記録された selected_cell_rect を参照できる。
+        // フルスクリーン中は出さない (独自のホバーヘッダーを持つため)。
+        if self.fullscreen_idx.is_none() {
+            if let (Some(idx), Some(cell_rect)) = (self.selected, self.selected_cell_rect) {
+                // 区切り・フォルダはスキップ
+                let show_info = matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::Video(_))
+                        | Some(GridItem::ZipImage { .. })
+                );
+                if show_info {
+                    let name = self
+                        .items
+                        .get(idx)
+                        .map(|it| it.name().to_string())
+                        .unwrap_or_default();
+                    // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
+                    let dims_str = match self.thumbnails.get(idx) {
+                        Some(ThumbnailState::Loaded {
+                            source_dims: Some((w, h)),
+                            ..
+                        }) => Some(format!("{} × {}", w, h)),
+                        _ => None,
+                    };
+                    let text = match dims_str {
+                        Some(d) => format!("{}   {}", d, name),
+                        None => name,
+                    };
+
+                    // セル幅で配置: セルの左下を基点、セル幅に合わせる
+                    let cell_w = cell_rect.width();
+                    let area_pos = cell_rect.left_bottom() + egui::vec2(0.0, 4.0);
+
+                    egui::Area::new("selection_info".into())
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(area_pos)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style())
+                                .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
+                                .show(ui, |ui| {
+                                    // Frame 内部の最大幅をセル幅に揃える
+                                    // (左右パディングぶんだけ余裕を取る)
+                                    let inner_width = (cell_w - 12.0).max(40.0);
+                                    ui.set_min_width(inner_width);
+                                    ui.set_max_width(inner_width);
+                                    // 長いファイル名は右端で切り落とす (折り返さない)
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(text)
+                                                .color(egui::Color32::WHITE)
+                                                .monospace(),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                        });
+                }
+            }
+        }
 
         let navigate = fav_nav.or(keyboard_nav).or(address_nav).or(grid_nav);
         if let Some(p) = navigate {
