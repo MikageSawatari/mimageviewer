@@ -1291,14 +1291,14 @@ impl App {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p)) => return Some(p.clone()),
-                        Some(GridItem::Image(_)) => self.open_fullscreen(idx),
-                        Some(GridItem::ZipImage { .. }) => self.open_fullscreen(idx),
+                        Some(GridItem::Image(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::ZipSeparator { .. }) => self.open_fullscreen(idx),
                         Some(GridItem::Video(p)) => {
                             let vp = p.clone();
                             open_external_player(&vp);
                         }
-                        // ZipSeparator は選択不可・ナビ対象外
-                        Some(GridItem::ZipSeparator { .. }) | None => {}
+                        None => {}
                     }
                 }
             }
@@ -2158,26 +2158,23 @@ impl eframe::App for App {
                             // ── 画像 / 動画 / セパレータ表示 ──────────
                             if let Some(sep) = separator_text.as_ref() {
                                 // タスク 3: ZIP セパレータ → 章タイトル画面
-                                // 大きなフォルダ名とサブテキストを中央に表示
+                                // レイアウト (サムネイルセルと同じ方針):
+                                //   - 中央: フォルダ名 (大きく)
+                                //   - 下部: "── 作品の区切り ──" 案内
                                 let title_size = (full_rect.height() * 0.12).clamp(48.0, 120.0);
-                                let sub_size = (full_rect.height() * 0.025).clamp(16.0, 28.0);
+                                let sub_size = (full_rect.height() * 0.030).clamp(20.0, 36.0);
 
-                                // 控えめな背景ハイライト
+                                // 控えめな背景ハイライト (フォルダ名の周囲のみ)
                                 ui.painter().rect_filled(
                                     egui::Rect::from_center_size(
                                         full_rect.center(),
-                                        egui::vec2(full_rect.width() * 0.8, title_size * 2.0),
+                                        egui::vec2(
+                                            full_rect.width() * 0.85,
+                                            title_size * 2.2,
+                                        ),
                                     ),
-                                    12.0,
+                                    16.0,
                                     egui::Color32::from_rgba_unmultiplied(30, 45, 80, 180),
-                                );
-                                // 「作品の区切り」サブテキスト (上)
-                                ui.painter().text(
-                                    full_rect.center() - egui::vec2(0.0, title_size * 0.75),
-                                    egui::Align2::CENTER_CENTER,
-                                    "── 作品の区切り ──",
-                                    egui::FontId::proportional(sub_size),
-                                    egui::Color32::from_rgb(150, 180, 220),
                                 );
                                 // フォルダ名 (中央、大きく)
                                 ui.painter().text(
@@ -2186,6 +2183,17 @@ impl eframe::App for App {
                                     sep,
                                     egui::FontId::proportional(title_size),
                                     egui::Color32::WHITE,
+                                );
+                                // 「作品の区切り」案内 (画面下部)
+                                ui.painter().text(
+                                    egui::pos2(
+                                        full_rect.center().x,
+                                        full_rect.max.y - 48.0,
+                                    ),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    "── 作品の区切り ──",
+                                    egui::FontId::proportional(sub_size),
+                                    egui::Color32::from_rgb(150, 180, 220),
                                 );
                             } else {
                                 // 動画はサムネイルのみ表示。画像はフルサイズ優先。
@@ -3824,16 +3832,16 @@ impl eframe::App for App {
                                 if response.double_clicked() {
                                     match self.items.get(idx) {
                                         Some(GridItem::Folder(p)) => nav = Some(p.clone()),
-                                        Some(GridItem::Image(_)) => self.open_fullscreen(idx),
-                                        Some(GridItem::ZipImage { .. }) => {
+                                        Some(GridItem::Image(_))
+                                        | Some(GridItem::ZipImage { .. })
+                                        | Some(GridItem::ZipSeparator { .. }) => {
                                             self.open_fullscreen(idx)
                                         }
                                         Some(GridItem::Video(p)) => {
                                             let vp = p.clone();
                                             open_external_player(&vp);
                                         }
-                                        // ZipSeparator はセパレータなのでクリック無効
-                                        Some(GridItem::ZipSeparator { .. }) | None => {}
+                                        None => {}
                                     }
                                 }
 
