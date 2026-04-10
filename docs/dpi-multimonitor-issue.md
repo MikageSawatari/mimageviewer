@@ -6,9 +6,9 @@
 |------|------|
 | OS | Windows 11 Pro |
 | GPU | NVIDIA RTX 4090 |
-| eframe | 0.31 (wgpu バックエンド) |
-| egui | 0.31 |
-| winit | 0.30.13 |
+| eframe | 0.33 (wgpu バックエンド) |
+| egui | 0.33 |
+| winit | 0.30.13（eframe 0.31 当時の調査、eframe 0.33 で winit も更新済み） |
 | モニター構成 | 3台（うち少なくとも2台が DPI 150%、1台が DPI 100%） |
 
 ## 再現手順
@@ -85,7 +85,7 @@ ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
 - winit の `EventLoop` にアクセスできるか確認が必要
 
 #### 案 D: eframe の最新版にアップデート
-- eframe 0.32 以降で修正されている可能性
+- eframe 0.33 に更新済み。問題が継続するか要再確認
 
 #### 案 E: ウィンドウを最大化して使う
 - ユーザー側の回避策として、最大化状態では `Win+Shift+Arrow` の位置ずれが出にくい可能性

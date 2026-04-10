@@ -219,7 +219,7 @@ pub struct Settings {
     pub thumb_next_pages: u32,  // default: 4
 
     // 従: VRAM 安全ネット (段階 C)
-    pub thumb_vram_cap_mb: u32, // default: 2048
+    pub thumb_vram_cap_percent: u32, // default: 50 (VRAM の %)
 }
 ```
 
@@ -295,10 +295,10 @@ pub struct Settings {
     // ── メモリ / 先読み ──
     pub thumb_prev_pages: u32,           // default: 2
     pub thumb_next_pages: u32,           // default: 4
-    pub thumb_vram_cap_mb: u32,          // default: 1024 (本計測ベースの安全ネット)
+    pub thumb_vram_cap_percent: u32,     // default: 50 (VRAM の %, 本計測ベースの安全ネット)
 
     // ── 画質向上 (optional) ──
-    pub thumb_idle_upgrade: bool,        // default: false (まず off で様子見)
+    pub thumb_idle_upgrade: bool,        // default: true
 }
 ```
 
@@ -312,8 +312,8 @@ pub struct Settings {
 | 10 列 × セル 200px | 700 | 0.15 MB | 105 MB |
 | 2 列 4K × セル 1900px | 28 | 14 MB | 400 MB |
 
-**デフォルト 1024 MB** で通常使用はすべてマージン込みで収まる。
-設定選択肢: 256 / 512 / 1024 / 2048 / 4096 MB。
+**デフォルト 50%**（VRAM の 50%）で通常使用はすべてマージン込みで収まる。
+絶対値ではなくパーセントにすることで、異なる GPU 環境に自動追従する。
 
 ---
 
@@ -330,13 +330,15 @@ pub struct Settings {
 | **D** | VRAM 安全ネット (cap) | 小 | B | 低スペック機の保険 |
 | **E** | アイドル時の画質向上 | 中 | B, 設定で OFF 可 | 追加負荷 (opt-in) |
 
-### 5.1 推奨順序
+### 5.1 実装状況
 
-1. **A** を先に入れる (画質改善・副作用小) → v0.2.0 候補
-2. **C** を追加 (ユーザに選択肢を与える) → v0.2.0 同時投入も可
-3. **B** を次期で導入 (メモリ対応のメイン) → v0.3.0
-4. **D** を同時または次期 → v0.3.0 or v0.3.1
-5. **E** は更にその次 → v0.4.0
+v0.2.0 で全段階 (A〜E) を実装済み:
+
+1. **A** 表示用 ColorImage 直送 + キャッシュ用 WebP 別経路 ✅
+2. **B** ページ単位先読み + Evicted 状態 ✅
+3. **C** 3 モード制 (Off/Auto/Always) + Auto しきい値 ✅
+4. **D** VRAM 安全ネット (パーセント指定) ✅
+5. **E** アイドル時高画質化 ✅
 
 ---
 
@@ -350,7 +352,7 @@ pub struct Settings {
   - `ext == "webp"` → 無条件キャッシュ (元が p50 77 ms と異常に遅いため)
   - `file_size > 2 MB` → 無条件キャッシュ (サイズと decode 時間の相関が強い)
   - `kind == Video` → 無条件キャッシュ (min 37 ms / p50 233 ms)
-- **VRAM cap デフォルト: 1024 MB** (低スペック向けに 256/512/1024/2048/4096 選択肢)
+- **VRAM cap デフォルト: 50%** (VRAM の 50%。パーセント指定で異なる GPU に自動追従)
 
 ### 6.2 セルサイズ変更時の扱い
 

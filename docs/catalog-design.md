@@ -89,7 +89,7 @@ CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
--- key='version' value='1'
+-- key='version' value='2'
 -- key='folder_path' value='/photos/2024/夏休み'（正規化済みパス）
 
 -- サムネイルエントリ
@@ -99,7 +99,9 @@ CREATE TABLE thumbnails (
     file_size   INTEGER NOT NULL,              -- ファイルサイズ（バイト）
     width       INTEGER NOT NULL,              -- サムネイル幅（ピクセル）
     height      INTEGER NOT NULL,              -- サムネイル高さ（ピクセル）
-    thumb_data  BLOB    NOT NULL               -- JPEG圧縮サムネイルデータ
+    thumb_data  BLOB    NOT NULL,              -- WebP圧縮サムネイルデータ
+    source_width  INTEGER,                     -- 元画像の幅（ピクセル）
+    source_height INTEGER                      -- 元画像の高さ（ピクセル）
 );
 ```
 
@@ -124,17 +126,17 @@ for each row in thumbnails:
 
 ## 5. サムネイルデータの圧縮形式
 
-カタログ内のサムネイルは **JPEG（品質80）** で保存する。
+カタログ内のサムネイルは **WebP（lossy, 品質75）** で保存する。
 
 | 形式 | 圧縮率 | デコード速度 | 画質 | サイズ目安（512px） |
 |------|--------|------------|------|------------------|
-| **JPEG q=80** | 高 | 速い | 十分 | ~20-50KB |
-| WebP lossy | 高 | やや遅い | やや良い | ~15-40KB |
+| JPEG q=80 | 高 | 速い | 十分 | ~20-50KB |
+| **WebP lossy q=75** | 高 | やや遅い | やや良い | ~15-40KB |
 | QOI | 低 | 非常に速い | 可逆 | ~100-200KB |
 | PNG | 低 | 普通 | 可逆 | ~200-500KB |
 
-→ 512px サムネイルでは JPEG デコードは 1〜3ms 程度。形式による速度差は実用上無視できるため、
-  実績・サイズ・`image` クレート標準サポートを優先して JPEG を採用。
+→ WebP は JPEG より圧縮効率が高く、同サイズで画質が良い。
+  `webp` クレートでエンコード、`image` クレートでデコード。
 
 サムネイルサイズは **固定 512px**（長辺）とする。
 
@@ -155,7 +157,7 @@ for each row in thumbnails:
   ↓
 ⑤ 各ファイルのキャッシュ有効性を確認
   ↓
-  ├─ 有効: JPEG バイト列 → image::load_from_memory() → GPU テクスチャ
+  ├─ 有効: WebP バイト列 → image::load_from_memory() → GPU テクスチャ
   │         （並列処理。デコード数ms以内）
   │
   └─ 無効/未キャッシュ: 元ファイルからサムネイル生成
@@ -186,6 +188,7 @@ src/
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"   # SHA-256 でパスをハッシュ化
+webp = "0.3"    # サムネイル WebP エンコード
 ```
 
 ### CatalogDb インターフェース（案）
@@ -224,7 +227,7 @@ pub struct CachedThumb {
     pub filename: String,
     pub width: u32,
     pub height: u32,
-    pub jpeg_data: Vec<u8>,
+    pub webp_data: Vec<u8>,
 }
 ```
 
