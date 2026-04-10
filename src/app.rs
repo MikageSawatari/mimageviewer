@@ -1728,11 +1728,13 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 初回フレームで前回フォルダを復元
+        // ZIP ファイルや、削除済み・取り外し済みのパスでもクラッシュしないよう
+        // resolve_openable_path で最も近い既存ディレクトリに解決する。
         if !self.initialized {
             self.initialized = true;
             if let Some(folder) = self.settings.last_folder.clone() {
-                if folder.is_dir() {
-                    self.load_folder(folder);
+                if let Some(resolved) = crate::folder_tree::resolve_openable_path(&folder) {
+                    self.load_folder(resolved);
                 }
             }
         }
@@ -2312,52 +2314,59 @@ impl eframe::App for App {
             }
         }
 
-        // ── 進捗バー (メニュー直下、処理中のみ表示) ──────────────────
+        // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
+        // egui::Area で配置するため、サムネイルグリッドのレイアウトに影響を与えず
+        // バーが現れたり消えたりしても表示位置がズレない。
         let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) =
             self.progress_snapshot();
         if peak_normal > 0 || peak_upgrade > 0 {
-            egui::TopBottomPanel::top("progress_panel").show(ctx, |ui| {
-                ui.add_space(3.0);
-                if peak_normal > 0 {
-                    let done = peak_normal.saturating_sub(cur_normal);
-                    let progress = done as f32 / peak_normal as f32;
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("先読み    ").monospace());
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_width(280.0)
-                                .fill(egui::Color32::from_rgb(60, 130, 220))
-                                .text(
-                                    egui::RichText::new(format!(
-                                        "{} / {}",
-                                        done, peak_normal
-                                    ))
-                                    .color(egui::Color32::WHITE),
-                                ),
-                        );
-                    });
-                }
-                if peak_upgrade > 0 {
-                    let done = peak_upgrade.saturating_sub(cur_upgrade);
-                    let progress = done as f32 / peak_upgrade as f32;
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("高画質化  ").monospace());
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_width(280.0)
-                                .fill(egui::Color32::from_rgb(100, 170, 240))
-                                .text(
-                                    egui::RichText::new(format!(
-                                        "{} / {}",
-                                        done, peak_upgrade
-                                    ))
-                                    .color(egui::Color32::WHITE),
-                                ),
-                        );
-                    });
-                }
-                ui.add_space(3.0);
-            });
+            egui::Area::new("progress_overlay".into())
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 220))
+                        .show(ui, |ui| {
+                            if peak_normal > 0 {
+                                let done = peak_normal.saturating_sub(cur_normal);
+                                let progress = done as f32 / peak_normal as f32;
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("先読み    ").monospace());
+                                    ui.add(
+                                        egui::ProgressBar::new(progress)
+                                            .desired_width(220.0)
+                                            .fill(egui::Color32::from_rgb(60, 130, 220))
+                                            .text(
+                                                egui::RichText::new(format!(
+                                                    "{} / {}",
+                                                    done, peak_normal
+                                                ))
+                                                .color(egui::Color32::WHITE),
+                                            ),
+                                    );
+                                });
+                            }
+                            if peak_upgrade > 0 {
+                                let done = peak_upgrade.saturating_sub(cur_upgrade);
+                                let progress = done as f32 / peak_upgrade as f32;
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("高画質化  ").monospace());
+                                    ui.add(
+                                        egui::ProgressBar::new(progress)
+                                            .desired_width(220.0)
+                                            .fill(egui::Color32::from_rgb(100, 170, 240))
+                                            .text(
+                                                egui::RichText::new(format!(
+                                                    "{} / {}",
+                                                    done, peak_upgrade
+                                                ))
+                                                .color(egui::Color32::WHITE),
+                                            ),
+                                    );
+                                });
+                            }
+                        });
+                });
             // 進行中は毎フレーム再描画してバーをスムーズに更新
             ctx.request_repaint();
         }
@@ -2371,9 +2380,11 @@ impl eframe::App for App {
         self.show_cache_policy_dialog(ctx);
         self.show_stats_dialog_window(ctx);
         // ── ツールバー（列数・アスペクト比・ソート順の即時切り替え）──
+        // horizontal_wrapped により、ウィンドウ幅が足りない場合は自動的に
+        // 複数行に折り返し、すべてのボタンにアクセスできる。
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("列:");
                 for cols in 2..=10usize {
                     let selected = self.settings.grid_cols == cols;
@@ -2423,9 +2434,11 @@ impl eframe::App for App {
                     );
                     self.address_has_focus = resp.has_focus();
                     if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        // ZIP ファイルや存在しないパスでも開けるよう、
+                        // resolve_openable_path で最寄りの既存ディレクトリに解決する。
                         let p = PathBuf::from(&self.address);
-                        if p.is_dir() {
-                            result = Some(p);
+                        if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
+                            result = Some(resolved);
                         }
                     }
                 });

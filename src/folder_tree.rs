@@ -195,6 +195,46 @@ pub fn path_eq(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
+/// 与えられたパスを「開けるパス」に解決する。
+///
+/// - 通常のディレクトリならそのまま返す
+/// - `.zip` ファイル (ファイルとして存在) ならそのまま返す
+/// - 存在しない/開けない場合は親ディレクトリを再帰的に遡り、最初に見つかった
+///   有効なディレクトリを返す
+/// - どこにも辿り着けない場合 (ドライブ自体が存在しない等) は `None`
+///
+/// 起動時の last_folder 復元やアドレスバー入力で、削除済み・移動済み・取り外された
+/// ドライブのパスでもクラッシュせず最も近い場所を表示するために使う。
+pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
+    fn is_zip(p: &Path) -> bool {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false)
+    }
+
+    // そのまま開けるか
+    if path.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    if path.is_file() && is_zip(path) {
+        return Some(path.to_path_buf());
+    }
+
+    // 親を再帰的に遡る
+    let mut current = path.parent();
+    while let Some(p) = current {
+        if p.as_os_str().is_empty() {
+            return None;
+        }
+        if p.is_dir() {
+            return Some(p.to_path_buf());
+        }
+        current = p.parent();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
