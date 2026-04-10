@@ -18,16 +18,30 @@ pub enum GridItem {
     Folder(PathBuf),
     Image(PathBuf),
     Video(PathBuf),
+    /// タスク 3: ZIP ファイル内の画像エントリ
+    ZipImage {
+        zip_path: PathBuf,
+        entry_name: String,
+    },
+    /// タスク 3: ZIP 内のサブディレクトリ境界を示す擬似アイテム
+    /// (1 セル分を占め、作品名など大きな文字で表示される)
+    ZipSeparator {
+        /// 表示されるディレクトリ名 (ルート直下の場合は "(root)")
+        dir_display: String,
+    },
 }
 
 impl GridItem {
-    fn path(&self) -> &Path {
-        match self {
-            GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p) => p,
-        }
-    }
     fn name(&self) -> &str {
-        self.path().file_name().and_then(|n| n.to_str()).unwrap_or("")
+        match self {
+            GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p) => {
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            }
+            GridItem::ZipImage { entry_name, .. } => {
+                crate::zip_loader::entry_basename(entry_name)
+            }
+            GridItem::ZipSeparator { dir_display } => dir_display,
+        }
     }
 }
 
@@ -319,6 +333,19 @@ impl Default for App {
 
 impl App {
     pub fn load_folder(&mut self, path: PathBuf) {
+        // タスク 3: パスが .zip ファイルなら ZIP を仮想フォルダとして開く
+        if path.is_file() {
+            let is_zip = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+            if is_zip {
+                self.load_zip_as_folder(path);
+                return;
+            }
+        }
+
         crate::logger::log(format!("=== load_folder: {} ===", path.display()));
 
         // 現在のフォルダのスクロール位置・選択状態を履歴に保存
@@ -368,6 +395,9 @@ impl App {
                         all_media.push((p, false, mtime, file_size));
                     } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
                         all_media.push((p, true, mtime, file_size));
+                    } else if ext_lower == "zip" {
+                        // タスク 3: ZIP ファイルはフォルダのように扱う
+                        folders.push(GridItem::Folder(p));
                     }
                 }
             }
@@ -619,6 +649,238 @@ impl App {
         self.settings.save();
     }
 
+    /// タスク 3: ZIP ファイルを仮想フォルダとして開く。
+    ///
+    /// 内部の画像エントリを列挙し、サブディレクトリごとにグループ化してから
+    /// 各グループに `ZipSeparator` を先頭に挿入する。グループ間はディレクトリ名順、
+    /// グループ内は現在の sort_order でソートされる。
+    pub fn load_zip_as_folder(&mut self, zip_path: PathBuf) {
+        crate::logger::log(format!("=== load_zip_as_folder: {} ===", zip_path.display()));
+
+        // 履歴保存 (既存フォルダがあれば)
+        if let Some(cur) = self.current_folder.clone() {
+            self.folder_history.insert(cur, (self.scroll_offset_y, self.selected));
+        }
+
+        self.close_fullscreen();
+
+        // 旧タスクをキャンセル
+        self.cancel_token.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_token = Arc::clone(&cancel);
+
+        let (tx, rx) = mpsc::channel();
+        self.tx = tx.clone();
+        self.rx = rx;
+
+        self.current_folder = Some(zip_path.clone());
+        self.address = zip_path.to_string_lossy().to_string();
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        self.scroll_to_selected = false;
+        self.scroll_hint.store(0, Ordering::Relaxed);
+
+        // ── ZIP エントリ列挙 ──
+        let entries = match crate::zip_loader::enumerate_image_entries(&zip_path) {
+            Ok(e) => e,
+            Err(e) => {
+                crate::logger::log(format!("  zip enumerate failed: {e}"));
+                self.items.clear();
+                self.thumbnails.clear();
+                self.image_metas.clear();
+                self.requested.clear();
+                self.settings.last_folder = Some(zip_path);
+                self.settings.save();
+                return;
+            }
+        };
+        crate::logger::log(format!("  zip: {} image entries", entries.len()));
+
+        // ── サブディレクトリごとにグループ化 ──
+        let mut groups: std::collections::BTreeMap<
+            String,
+            Vec<crate::zip_loader::ZipImageEntry>,
+        > = std::collections::BTreeMap::new();
+        for e in entries {
+            let dir = crate::zip_loader::entry_dir(&e.entry_name).to_string();
+            groups.entry(dir).or_default().push(e);
+        }
+
+        // 各グループ内を sort_order に従ってソート
+        for (_, list) in groups.iter_mut() {
+            match self.settings.sort_order {
+                crate::settings::SortOrder::FileName => {
+                    list.sort_by(|a, b| {
+                        let an = crate::zip_loader::entry_basename(&a.entry_name).to_lowercase();
+                        let bn = crate::zip_loader::entry_basename(&b.entry_name).to_lowercase();
+                        an.cmp(&bn)
+                    });
+                }
+                crate::settings::SortOrder::Numeric => {
+                    list.sort_by(|a, b| {
+                        let an = crate::zip_loader::entry_basename(&a.entry_name);
+                        let bn = crate::zip_loader::entry_basename(&b.entry_name);
+                        natural_sort_key(an).cmp(&natural_sort_key(bn))
+                    });
+                }
+                crate::settings::SortOrder::DateAsc => {
+                    list.sort_by(|a, b| a.mtime.cmp(&b.mtime));
+                }
+                crate::settings::SortOrder::DateDesc => {
+                    list.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+                }
+            }
+        }
+
+        // ── items / image_metas を構築 ──
+        // 複数グループがあれば各グループ先頭にセパレータを挿入する。
+        // 単一グループ (ルート直下のみ) ならセパレータは不要。
+        let insert_separators = groups.len() > 1;
+        let mut items: Vec<GridItem> = Vec::new();
+        let mut metas: Vec<Option<(i64, i64)>> = Vec::new();
+
+        for (dir, list) in groups {
+            if insert_separators {
+                let display = if dir.is_empty() {
+                    "(ルート)".to_string()
+                } else {
+                    dir.clone()
+                };
+                items.push(GridItem::ZipSeparator { dir_display: display });
+                metas.push(None);
+            }
+            for e in list {
+                items.push(GridItem::ZipImage {
+                    zip_path: zip_path.clone(),
+                    entry_name: e.entry_name,
+                });
+                metas.push(Some((e.mtime, e.uncompressed_size as i64)));
+            }
+        }
+
+        self.items = items;
+        self.image_metas = metas;
+        self.thumbnails = (0..self.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        self.requested.clear();
+        self.keep_range = (0, 0);
+
+        // ── カタログを ZIP 別に開く ──
+        let cache_dir = crate::catalog::default_cache_dir();
+        let catalog_arc: Option<Arc<crate::catalog::CatalogDb>> =
+            crate::catalog::CatalogDb::open(&cache_dir, &zip_path)
+                .map_err(|e| crate::logger::log(format!("  catalog open failed: {e}")))
+                .ok()
+                .map(Arc::new);
+
+        let cache_map: Arc<std::collections::HashMap<String, crate::catalog::CacheEntry>> =
+            Arc::new(
+                catalog_arc
+                    .as_ref()
+                    .and_then(|c| c.load_all().ok())
+                    .unwrap_or_default(),
+            );
+        crate::logger::log(format!("  catalog: {} entries in DB", cache_map.len()));
+
+        // 削除済みエントリの掃除 (現在の ZIP に含まれるエントリ名の集合を渡す)
+        if let Some(ref cat) = catalog_arc {
+            let existing: std::collections::HashSet<String> = self
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
+                    _ => None,
+                })
+                .collect();
+            if let Err(e) = cat.delete_missing(&existing) {
+                crate::logger::log(format!("  catalog delete_missing failed: {e}"));
+            }
+        }
+
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
+        let cache_gen_done = Arc::clone(&self.cache_gen_done);
+
+        // ── 永続ワーカー起動 (load_folder と同じパターン) ──
+        let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+
+        let thumb_threads = self.settings.parallelism.thread_count();
+        let scroll_hint = Arc::clone(&self.scroll_hint);
+        let thumb_px = self.settings.thumb_px;
+        let thumb_quality = self.settings.thumb_quality;
+        let initial_display_px = compute_display_px(
+            self.last_cell_size,
+            self.last_cell_h,
+            self.last_pixels_per_point,
+        );
+        self.display_px_shared.store(initial_display_px, Ordering::Relaxed);
+        let cache_decision = CacheDecision::from_settings(&self.settings);
+
+        for worker_idx in 0..thumb_threads {
+            let queue = Arc::clone(&reload_queue);
+            let tx_w = tx.clone();
+            let cancel_w = Arc::clone(&cancel);
+            let hint_w = Arc::clone(&scroll_hint);
+            let cache_map_w = Arc::clone(&cache_map);
+            let catalog_w = catalog_arc.clone();
+            let done_w = Arc::clone(&cache_gen_done);
+            let display_px_w = Arc::clone(&self.display_px_shared);
+            let stats_w = Arc::clone(&self.stats);
+
+            std::thread::spawn(move || {
+                crate::logger::log(format!("  zip worker {worker_idx} started"));
+                loop {
+                    if cancel_w.load(Ordering::Relaxed) { break; }
+                    let req_opt: Option<LoadRequest> = {
+                        let mut q = queue.lock().unwrap();
+                        if q.is_empty() {
+                            None
+                        } else {
+                            let vis = hint_w.load(Ordering::Relaxed);
+                            let best = q.iter().enumerate()
+                                .min_by_key(|(_, r)| {
+                                    let i = r.idx;
+                                    if i < vis { vis - i } else { i - vis }
+                                })
+                                .map(|(pos, _)| pos)
+                                .unwrap();
+                            Some(q.swap_remove(best))
+                        }
+                    };
+                    match req_opt {
+                        Some(req) => {
+                            if cancel_w.load(Ordering::Relaxed) { break; }
+                            let display_px = display_px_w.load(Ordering::Relaxed);
+                            process_load_request(
+                                &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
+                                thumb_px, thumb_quality, display_px, cache_decision, &done_w,
+                                &stats_w,
+                            );
+                        }
+                        None => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
+                }
+                crate::logger::log(format!("  zip worker {worker_idx} stopped"));
+            });
+        }
+
+        // 履歴復元
+        if let Some(&(scroll, sel)) = self.folder_history.get(&zip_path) {
+            self.scroll_offset_y = scroll;
+            self.selected = sel;
+            if sel.is_some() {
+                self.scroll_to_selected = true;
+            }
+        }
+
+        self.settings.last_folder = Some(zip_path);
+        self.settings.save();
+    }
+
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         let mut count = 0u32;
         let (keep_start, keep_end) = self.keep_range;
@@ -770,18 +1032,22 @@ impl App {
             if !need_load {
                 continue;
             }
-            // 画像のみ要求。フォルダは描画時にアイコン、動画は別パス
+            // 画像 / ZIP 内画像のみ要求。フォルダ・動画・セパレータはスキップ
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let path = match self.items.get(i) {
-                Some(GridItem::Image(p)) => p.clone(),
+            let req = match self.items.get(i) {
+                Some(GridItem::Image(p)) => LoadRequest {
+                    idx: i, path: p.clone(), mtime, file_size,
+                    skip_cache: false, zip_entry: None,
+                },
+                Some(GridItem::ZipImage { zip_path, entry_name }) => LoadRequest {
+                    idx: i, path: zip_path.clone(), mtime, file_size,
+                    skip_cache: false, zip_entry: Some(entry_name.clone()),
+                },
                 _ => continue,
             };
-            new_requests.push(LoadRequest {
-                idx: i, path, mtime, file_size,
-                skip_cache: false,
-            });
+            new_requests.push(req);
         }
         if !new_requests.is_empty() {
             let mut q = queue.lock().unwrap();
@@ -872,14 +1138,18 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let path = match self.items.get(i) {
-                Some(GridItem::Image(p)) => p.clone(),
+            let req = match self.items.get(i) {
+                Some(GridItem::Image(p)) => LoadRequest {
+                    idx: i, path: p.clone(), mtime, file_size,
+                    skip_cache: true, zip_entry: None,
+                },
+                Some(GridItem::ZipImage { zip_path, entry_name }) => LoadRequest {
+                    idx: i, path: zip_path.clone(), mtime, file_size,
+                    skip_cache: true, zip_entry: Some(entry_name.clone()),
+                },
                 _ => continue,
             };
-            upgrade_reqs.push(LoadRequest {
-                idx: i, path, mtime, file_size,
-                skip_cache: true,
-            });
+            upgrade_reqs.push(req);
             if upgrade_reqs.len() >= BATCH {
                 break;
             }
@@ -1022,11 +1292,13 @@ impl App {
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p)) => return Some(p.clone()),
                         Some(GridItem::Image(_)) => self.open_fullscreen(idx),
+                        Some(GridItem::ZipImage { .. }) => self.open_fullscreen(idx),
                         Some(GridItem::Video(p)) => {
                             let vp = p.clone();
                             open_external_player(&vp);
                         }
-                        None => {}
+                        // ZipSeparator は選択不可・ナビ対象外
+                        Some(GridItem::ZipSeparator { .. }) | None => {}
                     }
                 }
             }
@@ -1135,7 +1407,7 @@ impl App {
         self.fullscreen_idx = Some(idx);
 
         match self.items.get(idx) {
-            Some(GridItem::Image(_)) => {
+            Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) => {
                 if self.fs_cache.contains_key(&idx) {
                     crate::logger::log(format!("  cache hit idx={idx} → instant display"));
                 } else if !self.fs_pending.contains_key(&idx) {
@@ -1147,72 +1419,121 @@ impl App {
                 // 動画はサムネイル + 再生ボタンのみ。高解像度読み込み不要。
                 crate::logger::log(format!("  video idx={idx} → play button mode"));
             }
+            Some(GridItem::ZipSeparator { dir_display }) => {
+                // セパレータはテキスト表示のみ (デコード不要)
+                crate::logger::log(format!(
+                    "  zip separator idx={idx} → title mode: {dir_display}"
+                ));
+            }
             _ => {}
         }
     }
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
+    /// 通常画像 / ZIP エントリ の両方に対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     fn start_fs_load(&mut self, idx: usize) {
-        if let Some(GridItem::Image(path)) = self.items.get(idx) {
-            let path = path.clone();
-            let cancel = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = mpsc::channel::<FsLoadResult>();
-            self.fs_pending.insert(idx, (Arc::clone(&cancel), rx));
+        // (path, zip_entry) を取り出し: 通常画像なら (path, None)、ZIP なら (zip_path, Some(entry))
+        let (path, zip_entry) = match self.items.get(idx) {
+            Some(GridItem::Image(p)) => (p.clone(), None),
+            Some(GridItem::ZipImage { zip_path, entry_name }) => {
+                (zip_path.clone(), Some(entry_name.clone()))
+            }
+            _ => return,
+        };
 
-            std::thread::spawn(move || {
-                if cancel.load(Ordering::Relaxed) { return; }
-                let t = std::time::Instant::now();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<FsLoadResult>();
+        self.fs_pending.insert(idx, (Arc::clone(&cancel), rx));
 
-                // GIF: アニメーション試行
-                if ext == "gif" {
-                    if let Some(frames) = decode_gif_frames(&path) {
-                        crate::logger::log(format!(
-                            "  fs load anim-gif: {:.0}ms  idx={idx}  {name}  {} frames",
-                            t.elapsed().as_secs_f64() * 1000.0,
-                            frames.len()
-                        ));
-                        let _ = tx.send(FsLoadResult::Animated(frames));
-                        return;
-                    }
-                }
+        std::thread::spawn(move || {
+            if cancel.load(Ordering::Relaxed) { return; }
+            let t = std::time::Instant::now();
 
-                // PNG: APNG アニメーション試行
-                if ext == "png" {
-                    if let Some(frames) = decode_apng_frames(&path) {
-                        crate::logger::log(format!(
-                            "  fs load anim-png: {:.0}ms  idx={idx}  {name}  {} frames",
-                            t.elapsed().as_secs_f64() * 1000.0,
-                            frames.len()
-                        ));
-                        let _ = tx.send(FsLoadResult::Animated(frames));
-                        return;
-                    }
-                }
+            // 表示名と拡張子を取得
+            let (name, ext) = if let Some(ref entry_name) = zip_entry {
+                let base = crate::zip_loader::entry_basename(entry_name).to_string();
+                let ext = base.rsplit('.').next().unwrap_or("").to_lowercase();
+                (base, ext)
+            } else {
+                let n = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                (n, ext)
+            };
 
-                // 静止画フォールバック
-                match image::open(&path) {
-                    Ok(img) => {
-                        // TODO Phase 2: NGX DLISR アップスケール統合ポイント
-                        let rgba = img.to_rgba8();
-                        let (w, h) = (rgba.width(), rgba.height());
-                        let size = [w as usize, h as usize];
-                        let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                        drop(rgba);
-                        crate::logger::log(format!(
-                            "  fs load: {:.0}ms  idx={idx}  {name}  {w}x{h}",
-                            t.elapsed().as_secs_f64() * 1000.0
-                        ));
-                        let _ = tx.send(FsLoadResult::Static(ci));
-                    }
+            // ZIP エントリの場合は先にバイト列を抽出
+            let zip_bytes: Option<Vec<u8>> = if let Some(ref entry_name) = zip_entry {
+                match crate::zip_loader::read_entry_bytes(&path, entry_name) {
+                    Ok(b) => Some(b),
                     Err(e) => {
-                        crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
+                        crate::logger::log(format!(
+                            "  fs zip read FAIL: {e}  {name}"
+                        ));
+                        return;
                     }
                 }
-            });
-        }
+            } else {
+                None
+            };
+
+            // GIF: アニメーション試行 (通常パスのみ, ZIP は未対応)
+            if ext == "gif" && zip_bytes.is_none() {
+                if let Some(frames) = decode_gif_frames(&path) {
+                    crate::logger::log(format!(
+                        "  fs load anim-gif: {:.0}ms  idx={idx}  {name}  {} frames",
+                        t.elapsed().as_secs_f64() * 1000.0,
+                        frames.len()
+                    ));
+                    let _ = tx.send(FsLoadResult::Animated(frames));
+                    return;
+                }
+            }
+
+            // PNG: APNG アニメーション試行 (通常パスのみ, ZIP は未対応)
+            if ext == "png" && zip_bytes.is_none() {
+                if let Some(frames) = decode_apng_frames(&path) {
+                    crate::logger::log(format!(
+                        "  fs load anim-png: {:.0}ms  idx={idx}  {name}  {} frames",
+                        t.elapsed().as_secs_f64() * 1000.0,
+                        frames.len()
+                    ));
+                    let _ = tx.send(FsLoadResult::Animated(frames));
+                    return;
+                }
+            }
+
+            // 静止画フォールバック
+            let open_result = if let Some(bytes) = zip_bytes {
+                image::load_from_memory(&bytes)
+            } else {
+                image::open(&path)
+            };
+            match open_result {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = (rgba.width(), rgba.height());
+                    let size = [w as usize, h as usize];
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    drop(rgba);
+                    crate::logger::log(format!(
+                        "  fs load: {:.0}ms  idx={idx}  {name}  {w}x{h}",
+                        t.elapsed().as_secs_f64() * 1000.0
+                    ));
+                    let _ = tx.send(FsLoadResult::Static(ci));
+                }
+                Err(e) => {
+                    crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
+                }
+            }
+        });
     }
 
     /// 先読みウィンドウを更新する。
@@ -1268,10 +1589,14 @@ impl App {
         }
     }
 
-    /// items の中の画像アイテムの item_idx 一覧を返す（先読みウィンドウ用）
+    /// items の中の画像アイテム (通常 + ZIP 内) の item_idx 一覧を返す（先読みウィンドウ用）
     fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
-        items.iter().enumerate()
-            .filter_map(|(i, item)| matches!(item, GridItem::Image(_)).then_some(i))
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                matches!(item, GridItem::Image(_) | GridItem::ZipImage { .. }).then_some(i)
+            })
             .collect()
     }
 
@@ -1670,6 +1995,12 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // 動画か否かを判定
             let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+            // タスク 3: ZIP セパレータ (章タイトル表示)
+            let separator_text: Option<String> = match self.items.get(fs_idx) {
+                Some(GridItem::ZipSeparator { dir_display }) => Some(dir_display.clone()),
+                _ => None,
+            };
+            let is_separator = separator_text.is_some();
             let video_path = if is_video {
                 if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
                     Some(p.clone())
@@ -1710,8 +2041,8 @@ impl eframe::App for App {
             let filename   = self.items.get(fs_idx)
                 .map(|item| item.name().to_string())
                 .unwrap_or_default();
-            // 画像のみ「高解像度読込中」表示が必要（動画は不要）
-            let is_loading = !is_video && !self.fs_cache.contains_key(&fs_idx);
+            // 画像のみ「高解像度読込中」表示が必要（動画・セパレータは不要）
+            let is_loading = !is_video && !is_separator && !self.fs_cache.contains_key(&fs_idx);
 
             let mut close_fs   = false;
             let mut nav_delta: i32     = 0;
@@ -1808,7 +2139,7 @@ impl eframe::App for App {
                                     }
                                 }
                             } else {
-                                // 画像: 左半分 → 前、右半分 → 次
+                                // 画像 / セパレータ: 左半分 → 前、右半分 → 次
                                 if fs_response.clicked() {
                                     if let Some(pos) = fs_response.interact_pointer_pos() {
                                         if pos.x > full_rect.center().x {
@@ -1824,35 +2155,68 @@ impl eframe::App for App {
                                 close_fs = true;
                             }
 
-                            // ── 画像 / 動画表示 ───────────────────────
-                            // 動画はサムネイルのみ表示。画像はフルサイズ優先。
-                            let display_tex = tex.as_ref().or(thumb_tex.as_ref());
-                            if let Some(handle) = display_tex {
-                                let tex_size = handle.size_vec2();
-                                let scale    = (full_rect.width()  / tex_size.x)
-                                               .min(full_rect.height() / tex_size.y);
-                                let img_rect = egui::Rect::from_center_size(
-                                    full_rect.center(),
-                                    tex_size * scale,
-                                );
-                                ui.painter().image(
-                                    handle.id(),
-                                    img_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
+                            // ── 画像 / 動画 / セパレータ表示 ──────────
+                            if let Some(sep) = separator_text.as_ref() {
+                                // タスク 3: ZIP セパレータ → 章タイトル画面
+                                // 大きなフォルダ名とサブテキストを中央に表示
+                                let title_size = (full_rect.height() * 0.12).clamp(48.0, 120.0);
+                                let sub_size = (full_rect.height() * 0.025).clamp(16.0, 28.0);
+
+                                // 控えめな背景ハイライト
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        full_rect.center(),
+                                        egui::vec2(full_rect.width() * 0.8, title_size * 2.0),
                                     ),
-                                    egui::Color32::WHITE,
+                                    12.0,
+                                    egui::Color32::from_rgba_unmultiplied(30, 45, 80, 180),
                                 );
-                            } else {
-                                // テクスチャ未ロード（サムネイルも未完了）
+                                // 「作品の区切り」サブテキスト (上)
+                                ui.painter().text(
+                                    full_rect.center() - egui::vec2(0.0, title_size * 0.75),
+                                    egui::Align2::CENTER_CENTER,
+                                    "── 作品の区切り ──",
+                                    egui::FontId::proportional(sub_size),
+                                    egui::Color32::from_rgb(150, 180, 220),
+                                );
+                                // フォルダ名 (中央、大きく)
                                 ui.painter().text(
                                     full_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    if is_video { "動画サムネイル 読込中..." } else { "読込中..." },
-                                    egui::FontId::proportional(24.0),
-                                    egui::Color32::from_gray(180),
+                                    sep,
+                                    egui::FontId::proportional(title_size),
+                                    egui::Color32::WHITE,
                                 );
+                            } else {
+                                // 動画はサムネイルのみ表示。画像はフルサイズ優先。
+                                let display_tex = tex.as_ref().or(thumb_tex.as_ref());
+                                if let Some(handle) = display_tex {
+                                    let tex_size = handle.size_vec2();
+                                    let scale    = (full_rect.width()  / tex_size.x)
+                                                   .min(full_rect.height() / tex_size.y);
+                                    let img_rect = egui::Rect::from_center_size(
+                                        full_rect.center(),
+                                        tex_size * scale,
+                                    );
+                                    ui.painter().image(
+                                        handle.id(),
+                                        img_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                } else {
+                                    // テクスチャ未ロード（サムネイルも未完了）
+                                    ui.painter().text(
+                                        full_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        if is_video { "動画サムネイル 読込中..." } else { "読込中..." },
+                                        egui::FontId::proportional(24.0),
+                                        egui::Color32::from_gray(180),
+                                    );
+                                }
                             }
 
                             // ── 動画: 再生ボタンオーバーレイ ─────────
@@ -1868,7 +2232,9 @@ impl eframe::App for App {
                             }
 
                             // サムネイル仮表示中 → 高解像度読み込み中インジケーター（画像のみ）
-                            if is_loading && display_tex.is_some() {
+                            // セパレータでない + 何らかのテクスチャが表示されている場合のみ表示
+                            let has_any_tex = tex.is_some() || thumb_tex.is_some();
+                            if is_loading && has_any_tex {
                                 ui.painter().text(
                                     full_rect.min + egui::vec2(16.0, 16.0),
                                     egui::Align2::LEFT_TOP,
@@ -3459,11 +3825,15 @@ impl eframe::App for App {
                                     match self.items.get(idx) {
                                         Some(GridItem::Folder(p)) => nav = Some(p.clone()),
                                         Some(GridItem::Image(_)) => self.open_fullscreen(idx),
+                                        Some(GridItem::ZipImage { .. }) => {
+                                            self.open_fullscreen(idx)
+                                        }
                                         Some(GridItem::Video(p)) => {
                                             let vp = p.clone();
                                             open_external_player(&vp);
                                         }
-                                        None => {}
+                                        // ZipSeparator はセパレータなのでクリック無効
+                                        Some(GridItem::ZipSeparator { .. }) | None => {}
                                     }
                                 }
 
@@ -3631,6 +4001,72 @@ fn draw_cell(
                 egui::Color32::from_gray(30),
             );
         }
+        GridItem::ZipImage { entry_name: _, .. } => match thumb {
+            ThumbnailState::Loaded { tex, .. } => {
+                let tex_size = tex.size_vec2();
+                let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
+                let img_rect =
+                    egui::Rect::from_center_size(inner.center(), tex_size * scale);
+                painter.image(
+                    tex.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            ThumbnailState::Pending | ThumbnailState::Evicted => {
+                painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
+                painter.text(
+                    inner.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読込中",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_gray(140),
+                );
+            }
+            ThumbnailState::Failed => {
+                painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
+                painter.text(
+                    inner.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読込失敗",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::DARK_RED,
+                );
+            }
+        },
+        GridItem::ZipSeparator { dir_display } => {
+            // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
+            painter.rect_filled(
+                inner,
+                6.0,
+                egui::Color32::from_rgb(235, 242, 252),
+            );
+            painter.rect_stroke(
+                inner,
+                6.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 160, 220)),
+                egui::StrokeKind::Middle,
+            );
+            // フォルダ名を大きめの太字で中央に
+            let font_size = (inner.height() * 0.14).clamp(14.0, 36.0);
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                truncate_name(dir_display, 24),
+                egui::FontId::proportional(font_size),
+                egui::Color32::from_rgb(40, 70, 140),
+            );
+            // 下部にフォルダアイコン的な記号
+            let small = (inner.height() * 0.08).clamp(9.0, 16.0);
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                "📁  作品の区切り",
+                egui::FontId::proportional(small),
+                egui::Color32::from_gray(100),
+            );
+        }
     }
 
     let border = if is_selected {
@@ -3711,11 +4147,15 @@ type ThumbMsg = (usize, Option<egui::ColorImage>, bool);
 /// ミスすれば `load_one_cached` に委譲する。
 struct LoadRequest {
     idx: usize,
+    /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
     path: PathBuf,
     mtime: i64,
     file_size: i64,
     /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
     skip_cache: bool,
+    /// タスク 3: `Some(name)` なら ZIP エントリとして読む。
+    /// `path` が ZIP ファイル、`name` が内部エントリ名。
+    zip_entry: Option<String>,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -3829,11 +4269,18 @@ fn process_load_request(
     gen_done: &Arc<AtomicUsize>,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
 ) {
-    let filename = req
-        .path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    // カタログキー:
+    // - 通常画像: ファイル名 (例: "foo.jpg")
+    // - ZIP エントリ: エントリ名 (例: "work1/img01.jpg") 丸ごと
+    //   ZIP ごとに別 DB が開かれるため、DB 内で一意
+    let filename: &str = match &req.zip_entry {
+        Some(name) => name.as_str(),
+        None => req
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(""),
+    };
 
     // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
@@ -3854,7 +4301,9 @@ fn process_load_request(
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
     // load_one_cached は from_cache = false を送信する
     load_one_cached(
-        &req.path, req.idx, tx, catalog,
+        &req.path,
+        req.zip_entry.as_deref(),
+        req.idx, tx, catalog,
         req.mtime, req.file_size, gen_done,
         thumb_px, thumb_quality, display_px, cache_decision,
         stats,
@@ -3877,6 +4326,7 @@ fn process_load_request(
 #[allow(clippy::too_many_arguments)]
 fn load_one_cached(
     path: &Path,
+    zip_entry: Option<&str>,
     idx: usize,
     tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
@@ -3889,19 +4339,30 @@ fn load_one_cached(
     cache_decision: CacheDecision,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
 ) {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    // 表示名 (ログ用): ZIP エントリならエントリ名、通常ならファイル名
+    let name = match zip_entry {
+        Some(n) => n,
+        None => path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+    };
     let t = std::time::Instant::now();
 
-    // 拡張子ベースのデコードを試み、失敗した場合はマジックバイトで再試行する。
-    // 拡張子が間違っているファイル（例: WebP に .png）にも対応するため。
-    let img_result = image::open(path).or_else(|_| {
-        use std::io::BufReader;
-        let f = std::fs::File::open(path)?;
-        image::ImageReader::new(BufReader::new(f))
-            .with_guessed_format()
-            .map_err(image::ImageError::IoError)?
-            .decode()
-    });
+    // ── デコード経路 ──
+    // 1. ZIP エントリの場合: ZIP を開いてエントリのバイト列を取り出してから decode
+    // 2. 通常ファイル: 拡張子ベース → マジックバイトの二段構え
+    let img_result = if let Some(entry_name) = zip_entry {
+        crate::zip_loader::read_entry_bytes(path, entry_name)
+            .map_err(|e| image::ImageError::IoError(e))
+            .and_then(|bytes| image::load_from_memory(&bytes))
+    } else {
+        image::open(path).or_else(|_| {
+            use std::io::BufReader;
+            let f = std::fs::File::open(path)?;
+            image::ImageReader::new(BufReader::new(f))
+                .with_guessed_format()
+                .map_err(image::ImageError::IoError)?
+                .decode()
+        })
+    };
 
     let img = match img_result {
         Ok(i) => i,
@@ -3927,10 +4388,12 @@ fn load_one_cached(
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
     {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        // 拡張子の取得元: ZIP エントリならエントリ名、通常ならファイルパス
+        let ext_source: &str = match zip_entry {
+            Some(n) => n,
+            None => path.to_str().unwrap_or(""),
+        };
+        let ext = ext_source.rsplit('.').next().unwrap_or("");
         if let Ok(mut s) = stats.lock() {
             s.record_image(decode_ms + display_ms, file_size.max(0) as u64, ext);
         }
@@ -4040,8 +4503,24 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
 // フォルダツリー走査（深さ優先・前順）
 // -----------------------------------------------------------------------
 
-/// フォルダ内に対応画像ファイルが1枚以上あるか確認する
+/// フォルダ内に対応画像ファイルが1枚以上あるか確認する。
+/// path が .zip ファイルの場合は ZIP 内の画像エントリを確認する (タスク 3)。
 fn folder_has_images(path: &std::path::Path) -> bool {
+    // .zip ファイルなら ZIP 内画像エントリを確認
+    if path.is_file() {
+        let is_zip = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false);
+        if is_zip {
+            return crate::zip_loader::enumerate_image_entries(path)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        }
+        return false;
+    }
+
     std::fs::read_dir(path)
         .into_iter()
         .flatten()
@@ -4317,12 +4796,26 @@ fn tq_draw_preview(
 
 /// パス直下のサブフォルダを名前順で返す（隠しフォルダは含む）
 fn sorted_subdirs(path: &std::path::Path) -> Vec<PathBuf> {
+    // 通常のサブディレクトリに加え、.zip ファイルもナビゲーション対象に含める (タスク 3)
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.path())
+        .filter_map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                Some(p)
+            } else if p.is_file() {
+                let is_zip = p
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("zip"))
+                    .unwrap_or(false);
+                if is_zip { Some(p) } else { None }
+            } else {
+                None
+            }
+        })
         .collect();
     dirs.sort_by(|a, b| {
         a.to_string_lossy()
@@ -4354,11 +4847,20 @@ fn adjacent_image_idx(items: &[GridItem], current: usize, delta: i32) -> Option<
 /// items の中で current から delta 分（±1）移動した「表示可能」アイテム（画像＋動画）の
 /// item index を返す。境界では None を返す（ラップアラウンドなし）。
 fn adjacent_navigable_idx(items: &[GridItem], current: usize, delta: i32) -> Option<usize> {
+    // タスク 3: ZipImage と ZipSeparator もフルスクリーンで切り替え可能にする
+    // (セパレータは "章タイトル" 画面として表示される)
     let nav_indices: Vec<usize> = items
         .iter()
         .enumerate()
         .filter_map(|(i, item)| {
-            matches!(item, GridItem::Image(_) | GridItem::Video(_)).then_some(i)
+            matches!(
+                item,
+                GridItem::Image(_)
+                    | GridItem::Video(_)
+                    | GridItem::ZipImage { .. }
+                    | GridItem::ZipSeparator { .. }
+            )
+            .then_some(i)
         })
         .collect();
     let pos     = nav_indices.iter().position(|&i| i == current)?;

@@ -8,6 +8,7 @@ pub mod monitor;
 pub mod settings;
 pub mod stats;
 pub mod video_thumb;
+pub mod zip_loader;
 
 use std::sync::Arc;
 
