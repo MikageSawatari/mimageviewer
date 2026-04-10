@@ -46,7 +46,7 @@ impl App {
             .collapsible(false)
             .default_pos(dialog_pos)
             .show(ctx, |ui| {
-                ui.set_min_width(560.0);
+                ui.set_min_width(900.0);
                 if self.settings.favorites.is_empty() {
                     ui.label("お気に入りはまだ登録されていません。");
                 } else {
@@ -70,12 +70,13 @@ impl App {
                             ui.end_row();
 
                             for i in 0..n {
-                                // 表示名 (編集可能)
-                                let name_resp = ui.add(
+                                // 表示名 (編集可能) — Grid 内では desired_width が
+                                // 効かないため add_sized で強制指定する
+                                let name_resp = ui.add_sized(
+                                    [100.0, 20.0],
                                     egui::TextEdit::singleline(
                                         &mut self.settings.favorites[i].name,
-                                    )
-                                    .desired_width(160.0),
+                                    ),
                                 );
                                 if name_resp.changed() {
                                     name_changed = true;

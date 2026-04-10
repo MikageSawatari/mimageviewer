@@ -373,12 +373,12 @@
       <div class="feature-card">
         <div class="icon">⚡</div>
         <h3>高速サムネイルキャッシュ</h3>
-        <p>SQLite にサムネイルを保存。2回目以降は再デコード不要で瞬時に表示。</p>
+        <p>SQLite + WebP でサムネイルを保存。2回目以降は再デコード不要で瞬時に表示。キャッシュ生成ポリシーは Off / Auto / Always から選択可能。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🖼️</div>
         <h3>フルスクリーン表示</h3>
-        <p>画像をクリックすると別ウィンドウでフルサイズ表示。前後の画像をプリフェッチ。</p>
+        <p>画像をクリックすると別ウィンドウでフルサイズ表示。前後の画像をプリフェッチ。マウスを上部に移動でファイル情報を表示。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🎞️</div>
@@ -391,6 +391,11 @@
         <p>MP4・AVI・MKV などの動画ファイルもサムネイル表示。ダブルクリックで外部プレイヤー起動。</p>
       </div>
       <div class="feature-card">
+        <div class="icon">📷</div>
+        <h3>RAW / HEIC / AVIF 対応</h3>
+        <p>Windows の WIC (Windows Imaging Component) を活用し、各種 RAW・HEIC・AVIF・JPEG XL・TIFF を表示。</p>
+      </div>
+      <div class="feature-card">
         <div class="icon">📂</div>
         <h3>フォルダツリー巡回</h3>
         <p>Ctrl+↑↓ で深さ優先でフォルダを順番に移動。大量フォルダの一括確認に便利。</p>
@@ -398,17 +403,22 @@
       <div class="feature-card">
         <div class="icon">⭐</div>
         <h3>お気に入りフォルダ</h3>
-        <p>よく使うフォルダをお気に入り登録してメニューから即アクセス。</p>
+        <p>よく使うフォルダに名前を付けて登録。ツールバーからワンクリックで移動。一括キャッシュ作成にも対応。</p>
       </div>
       <div class="feature-card">
-        <div class="icon">🔢</div>
-        <h3>柔軟なグリッドレイアウト</h3>
-        <p>列数 2〜10、縦横比、ソート順を自由に変更。ウィンドウサイズと設定は保存される。</p>
+        <div class="icon">🔧</div>
+        <h3>カスタマイズ可能なツールバー</h3>
+        <p>列数・縦横比（7種）・ソート順・お気に入りの各セクションを個別に表示/非表示。項目単位でもフィルタ可能。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🗂️</div>
-        <h3>多彩なソート</h3>
-        <p>ファイル名順・数値順（自然順）・更新日昇順・降順の4種類から選択。</p>
+        <h3>ZIP アーカイブ対応</h3>
+        <p>ZIP ファイル内の画像をフォルダ構造ごとブラウズ。展開不要でそのまま閲覧。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🎚️</div>
+        <h3>サムネイル画質設定</h3>
+        <p>キャッシュのサイズと品質を A/B 比較プレビューで視覚的に調整。容量と画質のバランスを自分で決められる。</p>
       </div>
     </div>
   </section>
@@ -416,12 +426,48 @@
   <!-- ===== Supported Formats ===== -->
   <section id="formats">
     <h2>対応フォーマット</h2>
-    <h3>静止画</h3>
+
+    <h3>静止画（内蔵デコーダー）</h3>
     <p>JPEG (.jpg / .jpeg)、PNG (.png)、WebP (.webp)、BMP (.bmp)</p>
+
+    <h3>静止画（WIC 経由）</h3>
+    <p>
+      以下のフォーマットは Windows の WIC (Windows Imaging Component) を利用してデコードします。
+      対応する WIC コーデックがシステムにインストールされている必要があります。
+    </p>
+    <table>
+      <thead><tr><th style="width:160px">フォーマット</th><th>拡張子</th><th>必要なコーデック</th></tr></thead>
+      <tbody>
+        <tr><td>HEIC / HEIF</td><td>.heic, .heif</td><td><a href="ms-windows-store://pdp/?ProductId=9pmmsr1cgpwg">HEIF 画像拡張機能</a>（Microsoft Store / 通常はプリインストール）</td></tr>
+        <tr><td>AVIF</td><td>.avif</td><td><a href="ms-windows-store://pdp/?ProductId=9mvzqvxjbq9v">AV1 Video Extension</a>（Microsoft Store）</td></tr>
+        <tr><td>JPEG XL</td><td>.jxl</td><td><a href="ms-windows-store://pdp/?ProductId=9mzprth5c0tb">JPEG XL Image Extension</a>（Microsoft Store / Windows 11 24H2 以降）</td></tr>
+        <tr><td>TIFF</td><td>.tiff, .tif</td><td>標準搭載（追加不要）</td></tr>
+        <tr><td>RAW（各社カメラ）</td><td>.cr2, .cr3, .nef, .nrw, .arw, .srf, .sr2, .raf, .orf, .rw2, .pef, .dng, .iiq, .rwl, .ptx</td><td><a href="ms-windows-store://pdp/?ProductId=9nctdw2w1bh8">Raw Image Extension</a>（Microsoft Store）</td></tr>
+      </tbody>
+    </table>
+    <div class="info-box">
+      WIC コーデックが未インストールの場合、該当ファイルはサムネイル・フルスクリーンともに「読込失敗」と表示されます。
+      Microsoft Store の各リンクからコーデックをインストールしてください。
+    </div>
+
     <h3>アニメーション</h3>
     <p>アニメーション GIF (.gif)、アニメーション PNG (.png)</p>
+
     <h3>動画（サムネイル表示のみ）</h3>
     <p>MP4、AVI、MOV、MKV、WMV、MPG / MPEG</p>
+
+    <h3>ZIP アーカイブ</h3>
+    <p>
+      ZIP ファイル (.zip) をフォルダと同じように開き、中の画像をブラウズできます。
+      内部のフォルダ構造も再現されます。
+    </p>
+
+    <h3>自動除外されるファイル</h3>
+    <p>
+      macOS / iPhone から USB メモリ等を経由してコピーした際に生成される
+      AppleDouble メタデータファイル（<code>._*</code>）は自動的に除外されます。
+      これらのファイルは拡張子が画像と同じですが、中身はメタデータのためデコードできません。
+    </p>
   </section>
 
   <!-- ===== Usage ===== -->
@@ -455,14 +501,24 @@
 
     <h3>ツールバー</h3>
     <p>
-      アドレスバー下のツールバーから、列数・サムネイル縦横比・ソート順をワンクリックで変更できます。
+      アドレスバー下のツールバーから、列数・サムネイル縦横比・ソート順・お気に入りをワンクリックで変更・移動できます。
       変更は即座に反映され、設定は自動保存されます。
+      「設定」→「ツールバー…」で、表示するセクションや個別項目をカスタマイズできます。
+      すべて非表示にするとツールバー自体が消え、グリッドが広く使えます。
     </p>
 
     <h3>お気に入り</h3>
     <p>
-      「お気に入り」メニュー → 「このフォルダを追加」で現在のフォルダを登録します。
-      以降はメニューから直接移動できます。「編集」ダイアログで並び順の変更・削除が可能です。
+      「お気に入り」メニュー → 「このフォルダを追加…」で、表示名を付けて現在のフォルダを登録します。
+      登録後はメニューとツールバーの両方からワンクリックで移動できます。
+      「編集」ダイアログで表示名の変更・並び順の変更・削除が可能です。
+    </p>
+
+    <h3>フォルダを開く</h3>
+    <p>
+      「ファイル」→「フォルダを開く…」から、パスを入力してフォルダを開けます。
+      アドレスバーを非表示にしている場合でも、この方法でフォルダを移動できます。
+      タイトルバーには現在開いているフォルダのパスが常に表示されます。
     </p>
   </section>
 
@@ -514,23 +570,29 @@
 
     <h3>メニュー &gt; 設定</h3>
     <table>
-      <thead><tr><th style="width:180px">項目</th><th>説明</th></tr></thead>
+      <thead><tr><th style="width:200px">項目</th><th>説明</th></tr></thead>
       <tbody>
         <tr><td>サムネイル列数</td><td>2〜10列から選択</td></tr>
-        <tr><td>サムネイル縦横比</td><td>正方形・縦長・横長など複数から選択</td></tr>
+        <tr><td>サムネイル比率</td><td>16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16 の 7 種から選択</td></tr>
         <tr><td>ソート順</td><td>ファイル名順 / 数値順（自然順）/ 更新日昇順 / 更新日降順</td></tr>
-        <tr><td>キャッシュ管理</td><td>サムネイルサイズ変更・古いキャッシュ削除・全削除・容量確認</td></tr>
-        <tr><td>環境設定</td><td>並列読み込みスレッド数・プリフェッチ枚数・空フォルダスキップ上限</td></tr>
+        <tr><td>キャッシュ管理</td><td>古いキャッシュ削除・全削除・容量確認</td></tr>
+        <tr><td>サムネイル画質</td><td>A/B 比較プレビューで長辺サイズと WebP 品質を調整</td></tr>
+        <tr><td>キャッシュ生成設定</td><td>Off / Auto / Always の 3 段階ポリシーと自動判定のしきい値</td></tr>
+        <tr><td>ツールバー</td><td>ツールバーに表示するセクション・個別項目をカスタマイズ</td></tr>
+        <tr><td>統計</td><td>読み込み時間・ファイルサイズ・フォーマット別の分布をリアルタイム表示</td></tr>
+        <tr><td>環境設定</td><td>並列読み込み・プリフェッチ・VRAM 上限などの詳細設定</td></tr>
       </tbody>
     </table>
 
     <h3>環境設定の詳細</h3>
     <table>
-      <thead><tr><th style="width:180px">項目</th><th>説明</th></tr></thead>
+      <thead><tr><th style="width:200px">項目</th><th>説明</th></tr></thead>
       <tbody>
         <tr><td>並列読み込み</td><td>Auto（CPU コア数 / 2）または手動で 1〜64 スレッドを指定</td></tr>
-        <tr><td>プリフェッチ（前方）</td><td>フルスクリーン中に先読みする次方向の枚数（0〜50）</td></tr>
-        <tr><td>プリフェッチ（後方）</td><td>フルスクリーン中に先読みする前方向の枚数（0〜50）</td></tr>
+        <tr><td>フルサイズ先読み（前方 / 後方）</td><td>フルスクリーン中に先読みする前後の枚数（各 0〜50）</td></tr>
+        <tr><td>サムネイル先読み（ページ数）</td><td>サムネイルグリッドで前後に何ページ分を GPU に保持するか</td></tr>
+        <tr><td>GPU メモリ上限</td><td>サムネイルの GPU メモリ使用量を VRAM の何 % に制限するか（安全ネット）</td></tr>
+        <tr><td>アイドル時高画質化</td><td>スクロール停止後にキャッシュ由来のサムネイルを元画像から差し替え</td></tr>
         <tr><td>空フォルダスキップ上限</td><td>Ctrl+↑↓ で画像のない空フォルダを連続スキップする上限数（1〜10）</td></tr>
       </tbody>
     </table>
@@ -538,13 +600,15 @@
     <h3>キャッシュ管理</h3>
     <p>「設定」→「キャッシュ管理」から以下の操作が行えます。</p>
     <ul class="pink-list" style="margin-top:0.5rem;">
-      <li>サムネイルサイズの変更（256 / 512 / 768 / 1024 px）</li>
       <li>指定日数以上更新されていないキャッシュの削除</li>
       <li>すべてのキャッシュを削除</li>
       <li>キャッシュの合計フォルダ数・容量の確認</li>
     </ul>
+    <p style="margin-top:0.5rem;">
+      サムネイルの長辺サイズと WebP 品質は「設定」→「サムネイル画質…」から A/B 比較プレビューで調整できます。
+    </p>
     <div class="info-box">
-      キャッシュは <code>%APPDATA%\mimageviewer\</code> 以下に保存されます。
+      キャッシュは <code>%APPDATA%\mimageviewer\cache\</code> 以下に WebP 形式で保存されます。
     </div>
   </section>
 
@@ -564,7 +628,7 @@
     <h2>ダウンロード</h2>
     <div class="download-box">
       <div class="download-info">
-        <div class="version">mImageViewer v0.1.0</div>
+        <div class="version">mImageViewer v0.2.0</div>
         <div class="meta">Windows 11 64bit &nbsp;·&nbsp; インストール不要</div>
       </div>
       <a class="btn-download" href="mimageviewer.exe">mimageviewer.exe をダウンロード</a>

@@ -124,53 +124,108 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
 
 /// 統計ダイアログのヒストグラムを ASCII バー + 件数で描画する。
 /// `label_fn` がバケットインデックスから左端ラベルを返す。
+/// 統計ダイアログ用: ヒストグラムを egui::Grid で描画する。
+///
+/// 各バケットを「ラベル | バー | 件数」の 3 列グリッドで表示。
+/// `avg_times` が Some のとき、4 列目に平均ロード時間を表示する。
 pub fn draw_histogram(
     ui: &mut egui::Ui,
     hist: &[u64],
     label_fn: impl Fn(usize) -> String,
+    avg_times: Option<&[f64]>,
 ) {
-    const MAX_BAR_WIDTH: usize = 32;
+    const MAX_BAR_WIDTH: usize = 24;
     let max_count = hist.iter().copied().max().unwrap_or(0);
     if max_count == 0 {
         ui.label("  (データなし)");
         return;
     }
 
-    // モノスペースフォントで整列
-    let font = egui::FontId::monospace(12.0);
-    for (bucket, &count) in hist.iter().enumerate() {
-        // 末尾の 0 連続をトリミングしない (分布の全体像が見えるように)
-        let label = label_fn(bucket);
-        let bar_len = ((count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
-        let bar: String = std::iter::repeat('=').take(bar_len).collect();
-        let count_str = format_count(count);
-        let line = format!(
-            "  {label}  {bar:<MAX_BAR_WIDTH$}  {count_str:>8}",
-            MAX_BAR_WIDTH = MAX_BAR_WIDTH,
-        );
-        ui.label(egui::RichText::new(line).font(font.clone()));
-    }
+    let mono = egui::FontId::monospace(12.0);
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(if avg_times.is_some() { 4 } else { 3 })
+        .spacing([4.0, 1.0])
+        .show(ui, |ui| {
+            for (bucket, &count) in hist.iter().enumerate() {
+                // ラベル (右寄せ)
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(label_fn(bucket)).font(mono.clone()));
+                });
+                // バー
+                let bar_len =
+                    ((count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
+                let bar: String = "\u{2588}".repeat(bar_len);
+                ui.label(
+                    egui::RichText::new(format!("{bar:<MAX_BAR_WIDTH$}", MAX_BAR_WIDTH = MAX_BAR_WIDTH))
+                        .font(mono.clone())
+                        .color(egui::Color32::from_rgb(80, 140, 220)),
+                );
+                // 件数 (右寄せ)
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format_count(count)).font(mono.clone()));
+                });
+                // 平均時間 (オプション)
+                if let Some(times) = avg_times {
+                    let avg = if count > 0 {
+                        times.get(bucket).copied().unwrap_or(0.0) / count as f64
+                    } else {
+                        0.0
+                    };
+                    let text = if count > 0 {
+                        format!("({:.0} ms)", avg)
+                    } else {
+                        String::new()
+                    };
+                    ui.label(egui::RichText::new(text).font(mono.clone()).weak());
+                }
+                ui.end_row();
+            }
+        });
 }
 
-/// 統計ダイアログのフォーマット別件数を ASCII バー + 件数で描画する。
-pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64)]) {
-    const MAX_BAR_WIDTH: usize = 32;
-    let max_count = rows.iter().map(|(_, c)| *c).max().unwrap_or(0);
+/// 統計ダイアログ用: フォーマット別件数を egui::Grid で描画する。
+///
+/// 各行を「ラベル | バー | 件数 | 平均時間」の 4 列グリッドで表示。
+pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
+    const MAX_BAR_WIDTH: usize = 24;
+    let max_count = rows.iter().map(|(_, c, _)| *c).max().unwrap_or(0);
     if max_count == 0 {
         ui.label("  (データなし)");
         return;
     }
-    let font = egui::FontId::monospace(12.0);
-    for (label, count) in rows {
-        let bar_len = ((*count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
-        let bar: String = std::iter::repeat('=').take(bar_len).collect();
-        let count_str = format_count(*count);
-        let line = format!(
-            "  {label}  {bar:<MAX_BAR_WIDTH$}  {count_str:>8}",
-            MAX_BAR_WIDTH = MAX_BAR_WIDTH,
-        );
-        ui.label(egui::RichText::new(line).font(font.clone()));
-    }
+    let mono = egui::FontId::monospace(12.0);
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(4)
+        .spacing([4.0, 1.0])
+        .show(ui, |ui| {
+            for (label, count, total_time) in rows {
+                // ラベル
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(*label).font(mono.clone()));
+                });
+                // バー
+                let bar_len =
+                    ((*count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
+                let bar: String = "\u{2588}".repeat(bar_len);
+                ui.label(
+                    egui::RichText::new(format!("{bar:<MAX_BAR_WIDTH$}", MAX_BAR_WIDTH = MAX_BAR_WIDTH))
+                        .font(mono.clone())
+                        .color(egui::Color32::from_rgb(80, 140, 220)),
+                );
+                // 件数
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format_count(*count)).font(mono.clone()));
+                });
+                // 平均時間
+                let avg_text = if *count > 0 {
+                    format!("({:.0} ms)", total_time / *count as f64)
+                } else {
+                    String::new()
+                };
+                ui.label(egui::RichText::new(avg_text).font(mono.clone()).weak());
+                ui.end_row();
+            }
+        });
 }
 
 // -----------------------------------------------------------------------

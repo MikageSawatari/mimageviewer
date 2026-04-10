@@ -62,6 +62,7 @@ impl App {
                         ui,
                         &snapshot.load_time_hist,
                         |bucket| crate::stats::ThumbStats::load_time_label(bucket),
+                        None,
                     );
 
                     ui.add_space(10.0);
@@ -75,6 +76,7 @@ impl App {
                         ui,
                         &snapshot.size_hist,
                         |bucket| crate::stats::ThumbStats::size_label(bucket),
+                        Some(&snapshot.size_time_hist),
                     );
 
                     ui.add_space(10.0);
@@ -84,14 +86,14 @@ impl App {
                     // ── フォーマット別件数 ──
                     ui.heading("フォーマット");
                     ui.add_space(4.0);
-                    let format_rows: [(&str, u64); 7] = [
-                        ("JPEG  ", snapshot.count_jpg),
-                        ("PNG   ", snapshot.count_png),
-                        ("WebP  ", snapshot.count_webp),
-                        ("GIF   ", snapshot.count_gif),
-                        ("BMP   ", snapshot.count_bmp),
-                        ("動画  ", snapshot.count_video),
-                        ("その他", snapshot.count_other),
+                    let format_rows: [(&str, u64, f64); 7] = [
+                        ("JPEG  ", snapshot.count_jpg,   snapshot.time_jpg),
+                        ("PNG   ", snapshot.count_png,   snapshot.time_png),
+                        ("WebP  ", snapshot.count_webp,  snapshot.time_webp),
+                        ("GIF   ", snapshot.count_gif,   snapshot.time_gif),
+                        ("BMP   ", snapshot.count_bmp,   snapshot.time_bmp),
+                        ("動画  ", snapshot.count_video, 0.0),
+                        ("その他", snapshot.count_other, snapshot.time_other),
                     ];
                     draw_format_rows(ui, &format_rows);
 

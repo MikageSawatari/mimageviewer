@@ -17,3 +17,4 @@ mod preferences;
 mod stats_dialog;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
+mod toolbar_settings;

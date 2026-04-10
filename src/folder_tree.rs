@@ -38,6 +38,20 @@ pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] =
     &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 
 // -----------------------------------------------------------------------
+// macOS AppleDouble (._) ファイルの除外
+// -----------------------------------------------------------------------
+
+/// macOS / iPhone から FAT32/NTFS にコピーした際に生成される
+/// AppleDouble メタデータファイル (`._*`) を除外する。
+/// 拡張子は画像と同じだが中身はメタデータなのでデコードできない。
+pub fn is_apple_double(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.starts_with("._"))
+        .unwrap_or(false)
+}
+
+// -----------------------------------------------------------------------
 // 画像有無の判定
 // -----------------------------------------------------------------------
 
@@ -64,8 +78,11 @@ pub fn folder_has_images(path: &Path) -> bool {
         .flatten()
         .flatten()
         .any(|e| {
-            e.path()
-                .extension()
+            let p = e.path();
+            if is_apple_double(&p) {
+                return false;
+            }
+            p.extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
                 .unwrap_or(false)

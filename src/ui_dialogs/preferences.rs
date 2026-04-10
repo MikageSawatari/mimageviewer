@@ -205,25 +205,6 @@ impl App {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
-
-                    ui.heading("ツールバーの表示");
-                    ui.add_space(4.0);
-                    ui.label(
-                        "ウィンドウ上部に表示するセクションを選びます。\n\
-                         すべて非表示にすると、ツールバー自体が消えてグリッドが広く使えます。\n\
-                         フォルダ (アドレスバー) を非表示にした場合は、\n\
-                         「ファイル → フォルダを開く…」で別のフォルダへ移動できます。",
-                    );
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut self.settings.show_toolbar_cols, "列");
-                    ui.checkbox(&mut self.settings.show_toolbar_aspect, "比率");
-                    ui.checkbox(&mut self.settings.show_toolbar_sort, "ソート");
-                    ui.checkbox(&mut self.settings.show_toolbar_favorites, "お気に入り");
-                    ui.checkbox(&mut self.settings.show_toolbar_folder, "フォルダ (アドレスバー)");
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("  OK  ").clicked() {
                             apply = true;

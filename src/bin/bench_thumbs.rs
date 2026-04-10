@@ -151,6 +151,14 @@ fn main() {
                 if !p.is_file() {
                     continue;
                 }
+                // macOS/iPhone AppleDouble メタデータを除外
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.starts_with("._"))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
                     continue;
                 };

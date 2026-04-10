@@ -7,8 +7,8 @@ use std::sync::{
 use eframe::egui;
 
 use crate::folder_tree::{
-    navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs, walk_dirs_recursive,
-    SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS,
+    is_apple_double, navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs,
+    walk_dirs_recursive, SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS,
 };
 use crate::fs_animation::{decode_apng_frames, decode_gif_frames, FsCacheEntry, FsLoadResult};
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -337,6 +337,8 @@ impl App {
                 let p = entry.path();
                 if p.is_dir() {
                     folders.push(GridItem::Folder(p));
+                } else if is_apple_double(&p) {
+                    // macOS/iPhone AppleDouble メタデータ — スキップ
                 } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     let ext_lower = ext.to_ascii_lowercase();
                     let meta = entry.metadata().ok();
@@ -1635,7 +1637,7 @@ impl App {
                 if let Ok(entries) = std::fs::read_dir(folder) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if !p.is_file() {
+                        if !p.is_file() || is_apple_double(&p) {
                             continue;
                         }
                         let Some(ext) = p.extension().and_then(|e| e.to_str()) else {

@@ -34,6 +34,17 @@ pub struct ThumbStats {
     pub count_video: u64,
     pub count_other: u64,
 
+    // ── フォーマット別累計ロード時間 (ms) ──
+    pub time_jpg: f64,
+    pub time_png: f64,
+    pub time_webp: f64,
+    pub time_gif: f64,
+    pub time_bmp: f64,
+    pub time_other: f64,
+
+    // ── ファイルサイズ別累計ロード時間 (ms) ──
+    pub size_time_hist: [f64; SIZE_BUCKETS],
+
     /// 読み込みが FAIL した件数
     pub count_failed: u64,
 }
@@ -54,15 +65,18 @@ impl ThumbStats {
         let size_bucket = ((file_size / SIZE_STEP_BYTES) as usize).min(SIZE_BUCKETS - 1);
         self.size_hist[size_bucket] += 1;
 
+        // ファイルサイズ別ロード時間
+        self.size_time_hist[size_bucket] += total_ms;
+
         // フォーマット
         let ext_lower = ext.to_ascii_lowercase();
         match ext_lower.as_str() {
-            "jpg" | "jpeg" => self.count_jpg += 1,
-            "png" => self.count_png += 1,
-            "webp" => self.count_webp += 1,
-            "gif" => self.count_gif += 1,
-            "bmp" => self.count_bmp += 1,
-            _ => self.count_other += 1,
+            "jpg" | "jpeg" => { self.count_jpg += 1; self.time_jpg += total_ms; }
+            "png"          => { self.count_png += 1; self.time_png += total_ms; }
+            "webp"         => { self.count_webp += 1; self.time_webp += total_ms; }
+            "gif"          => { self.count_gif += 1; self.time_gif += total_ms; }
+            "bmp"          => { self.count_bmp += 1; self.time_bmp += total_ms; }
+            _              => { self.count_other += 1; self.time_other += total_ms; }
         }
     }
 
