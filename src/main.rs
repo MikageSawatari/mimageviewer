@@ -2,11 +2,16 @@
 
 mod app;
 pub mod catalog;
+pub mod folder_tree;
+pub mod fs_animation;
 pub mod gpu_info;
+pub mod grid_item;
 pub mod logger;
 pub mod monitor;
 pub mod settings;
 pub mod stats;
+pub mod thumb_loader;
+pub mod ui_helpers;
 pub mod video_thumb;
 pub mod zip_loader;
 
