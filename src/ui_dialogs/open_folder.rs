@@ -54,15 +54,15 @@ impl App {
                     apply = true;
                 }
 
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(
-                        "ZIP ファイルや存在しないサブパスでも、\
-                         最寄りの開けるフォルダが自動で見つかります。",
-                    )
-                    .weak()
-                    .small(),
-                );
+                // エラーメッセージ
+                if let Some(ref err) = self.open_folder_error {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(err)
+                            .color(egui::Color32::from_rgb(220, 60, 60))
+                            .size(13.0),
+                    );
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -90,15 +90,25 @@ impl App {
             let input = self.open_folder_input.trim().to_string();
             if !input.is_empty() {
                 let p = PathBuf::from(&input);
-                if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
-                    result = Some(resolved);
+                if p.exists() {
+                    if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
+                        result = Some(resolved);
+                        self.show_open_folder_dialog = false;
+                        self.open_folder_input.clear();
+                        self.open_folder_error = None;
+                    } else {
+                        self.open_folder_error =
+                            Some(format!("開けるフォルダが見つかりません: {input}"));
+                    }
+                } else {
+                    self.open_folder_error =
+                        Some(format!("パスが存在しません: {input}"));
                 }
             }
-            self.show_open_folder_dialog = false;
-            self.open_folder_input.clear();
         } else if cancel || !open {
             self.show_open_folder_dialog = false;
             self.open_folder_input.clear();
+            self.open_folder_error = None;
         }
 
         result

@@ -3,9 +3,6 @@
 use std::path::PathBuf;
 use eframe::egui;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
 use crate::grid_item::GridItem;
 
 impl crate::app::App {
@@ -112,6 +109,15 @@ impl crate::app::App {
                         close = true;
                     }
 
+                    // ペースト
+                    if ui.button("ペースト (Ctrl+V)").clicked() {
+                        if let Some(ref folder) = self.current_folder {
+                            paste_files_from_clipboard(folder);
+                            self.pending_reload = true;
+                        }
+                        close = true;
+                    }
+
                     ui.separator();
                     if ui.button("選択解除").clicked() {
                         self.checked.clear();
@@ -123,6 +129,14 @@ impl crate::app::App {
                         GridItem::Image(p) | GridItem::Video(p) => {
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(p.to_string_lossy().to_string());
+                                close = true;
+                            }
+                            if ui.button("ファイル名をコピー").clicked() {
+                                let name = p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ctx.copy_text(name);
                                 close = true;
                             }
                             if matches!(item, GridItem::Image(_)) {
@@ -160,6 +174,14 @@ impl crate::app::App {
                                 self.show_delete_confirm = true;
                                 close = true;
                             }
+                            ui.separator();
+                            if ui.button("ペースト (Ctrl+V)").clicked() {
+                                if let Some(ref folder) = self.current_folder {
+                                    paste_files_from_clipboard(folder);
+                                    self.pending_reload = true;
+                                }
+                                close = true;
+                            }
                         }
                         GridItem::Folder(p) => {
                             if ui.button("パスをコピー").clicked() {
@@ -172,11 +194,30 @@ impl crate::app::App {
                                     .spawn();
                                 close = true;
                             }
+                            ui.separator();
+                            if ui.button("ペースト (Ctrl+V)").clicked() {
+                                if let Some(ref folder) = self.current_folder {
+                                    paste_files_from_clipboard(folder);
+                                    self.pending_reload = true;
+                                }
+                                close = true;
+                            }
                         }
                         GridItem::ZipImage { zip_path, entry_name } => {
                             let display = format!("{}:{}", zip_path.display(), entry_name);
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(display);
+                                close = true;
+                            }
+                            let basename = crate::zip_loader::entry_basename(entry_name);
+                            if ui.button("ファイル名をコピー").clicked() {
+                                ctx.copy_text(basename.to_string());
+                                close = true;
+                            }
+                            if ui.button("画像をクリップボードにコピー").clicked() {
+                                if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                                    copy_image_bytes_to_clipboard(&bytes);
+                                }
                                 close = true;
                             }
                         }
@@ -390,17 +431,12 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
             .collect();
         let arr = paths_str.join(",");
         let script = format!(
-            "$files = @({arr}); \
-             $col = New-Object System.Collections.Specialized.StringCollection; \
-             foreach($f in $files){{ $col.Add($f) | Out-Null }}; \
-             Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.Clipboard]::SetFileDropList($col)"
+            "Add-Type -AssemblyName System.Windows.Forms\n\
+             $col = New-Object System.Collections.Specialized.StringCollection\n\
+             @({arr}) | ForEach-Object {{ $col.Add($_) | Out-Null }}\n\
+             [System.Windows.Forms.Clipboard]::SetFileDropList($col)\n"
         );
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-Command", &script]);
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000);
-        let _ = cmd.spawn();
+        run_ps_script(&script);
     }
     #[cfg(not(windows))]
     {
@@ -409,35 +445,29 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
 }
 
 /// ファイルをクリップボードにカット (移動操作用)。
-fn cut_files_to_clipboard(paths: &[PathBuf]) {
+pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
     #[cfg(windows)]
     {
         if paths.is_empty() {
             return;
         }
-        // Windows ではカットはコピー+PreferredDropEffect=MOVE
         let paths_str: Vec<String> = paths
             .iter()
             .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
             .collect();
         let arr = paths_str.join(",");
         let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             $files = @({arr}); \
-             $col = New-Object System.Collections.Specialized.StringCollection; \
-             foreach($f in $files){{ $col.Add($f) | Out-Null }}; \
-             $data = New-Object System.Windows.Forms.DataObject; \
-             $data.SetFileDropList($col); \
-             $ms = New-Object System.IO.MemoryStream(4); \
-             $ms.Write([BitConverter]::GetBytes(2), 0, 4); \
-             $data.SetData('Preferred DropEffect', $ms); \
-             [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)"
+            "Add-Type -AssemblyName System.Windows.Forms\n\
+             $col = New-Object System.Collections.Specialized.StringCollection\n\
+             @({arr}) | ForEach-Object {{ $col.Add($_) | Out-Null }}\n\
+             $data = New-Object System.Windows.Forms.DataObject\n\
+             $data.SetFileDropList($col)\n\
+             $ms = New-Object System.IO.MemoryStream(4)\n\
+             $ms.Write([BitConverter]::GetBytes(2), 0, 4)\n\
+             $data.SetData('Preferred DropEffect', $ms)\n\
+             [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)\n"
         );
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-Command", &script]);
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000);
-        let _ = cmd.spawn();
+        run_ps_script(&script);
     }
     #[cfg(not(windows))]
     {
@@ -446,26 +476,173 @@ fn cut_files_to_clipboard(paths: &[PathBuf]) {
 }
 
 /// 画像ファイルの内容をクリップボードにコピーする (Windows)。
+/// 画像ファイルをデコードしてクリップボードにコピーする。
+/// image クレートで非対応の形式は WIC にフォールバック。
 fn copy_image_to_clipboard(path: &std::path::Path) {
+    let img = match image::open(path) {
+        Ok(i) => i,
+        Err(_) => {
+            #[cfg(windows)]
+            if let Some(i) = crate::wic_decoder::decode_to_dynamic_image(path) {
+                i
+            } else {
+                return;
+            }
+            #[cfg(not(windows))]
+            return;
+        }
+    };
+    set_image_to_clipboard(&img);
+}
+
+/// バイト列から画像をデコードしてクリップボードにコピー (ZIP 内画像用)。
+fn copy_image_bytes_to_clipboard(bytes: &[u8]) {
+    let img = match image::load_from_memory(bytes) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    set_image_to_clipboard(&img);
+}
+
+/// DynamicImage をクリップボードに CF_DIB として設定する。
+fn set_image_to_clipboard(img: &image::DynamicImage) {
+    let rgba = img.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+
     #[cfg(windows)]
     {
-        let path_str = path.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             $img = [System.Drawing.Image]::FromFile('{}'); \
-             [System.Windows.Forms.Clipboard]::SetImage($img); \
-             $img.Dispose()",
-            path_str
-        );
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-Command", &script]);
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000);
-        let _ = cmd.spawn();
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Ole::CF_DIB;
+        use windows::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS,
+        };
+        use windows::Win32::System::DataExchange::{
+            OpenClipboard, CloseClipboard, EmptyClipboard, SetClipboardData,
+        };
+
+        let row_size = (width * 3 + 3) & !3;
+        let pixel_size = row_size * height;
+        let header_size: u32 = 40;
+        let total_size = header_size as usize + pixel_size as usize;
+
+        unsafe {
+            let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), total_size);
+            let Ok(hmem) = hmem else { return };
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() { return; }
+
+            let buf = std::slice::from_raw_parts_mut(ptr as *mut u8, total_size);
+
+            buf[0..4].copy_from_slice(&header_size.to_le_bytes());
+            buf[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+            buf[8..12].copy_from_slice(&(height as i32).to_le_bytes());
+            buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+            buf[14..16].copy_from_slice(&24u16.to_le_bytes());
+
+            let pixels = &rgba;
+            for y in 0..height {
+                let src_row = (height - 1 - y) as usize;
+                let dst_offset = header_size as usize + (y * row_size) as usize;
+                for x in 0..width {
+                    let src_idx = (src_row * width as usize + x as usize) * 4;
+                    let dst_idx = dst_offset + (x * 3) as usize;
+                    buf[dst_idx] = pixels.as_raw()[src_idx + 2];
+                    buf[dst_idx + 1] = pixels.as_raw()[src_idx + 1];
+                    buf[dst_idx + 2] = pixels.as_raw()[src_idx];
+                }
+            }
+
+            let _ = GlobalUnlock(hmem);
+
+            if OpenClipboard(None).is_ok() {
+                let _ = EmptyClipboard();
+                let _ = SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hmem.0)));
+                let _ = CloseClipboard();
+            }
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = path;
+        let _ = (width, height);
+    }
+}
+
+/// クリップボードにあるファイルを指定フォルダにペースト（コピーまたは移動）する。
+pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let dest = dest_folder.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms\n\
+             $data = [System.Windows.Forms.Clipboard]::GetDataObject()\n\
+             if ($data -eq $null -or -not $data.ContainsFileDropList()) {{ exit }}\n\
+             $files = $data.GetFileDropList()\n\
+             $effect = $data.GetData('Preferred DropEffect')\n\
+             $isMove = $false\n\
+             if ($effect -ne $null) {{\n\
+               $bytes = New-Object byte[] 4\n\
+               $null = $effect.Read($bytes, 0, 4)\n\
+               if ([BitConverter]::ToInt32($bytes, 0) -eq 2) {{ $isMove = $true }}\n\
+             }}\n\
+             foreach ($f in $files) {{\n\
+               if ($isMove) {{\n\
+                 Move-Item -Path $f -Destination '{dest}' -Force\n\
+               }} else {{\n\
+                 Copy-Item -Path $f -Destination '{dest}' -Force -Recurse\n\
+               }}\n\
+             }}\n\
+             if ($isMove) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
+        );
+        let tmp = std::env::temp_dir().join("miv_paste.ps1");
+        if std::fs::write(&tmp, &script).is_ok() {
+            let mut cmd = std::process::Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy", "Bypass",
+                "-File",
+                &tmp.to_string_lossy(),
+            ]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let _ = cmd.status();
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dest_folder;
+    }
+}
+
+/// PowerShell スクリプトを一時ファイル経由で実行する共通ヘルパー。
+/// -STA (クリップボード API 必須) / -ExecutionPolicy Bypass / CREATE_NO_WINDOW で実行。
+/// スクリプトは UTF-8 BOM 付きで書き出す（日本語パス対応）。
+#[cfg(windows)]
+fn run_ps_script(script: &str) {
+    let tmp = std::env::temp_dir().join("miv_ps_cmd.ps1");
+    // UTF-8 BOM (0xEF 0xBB 0xBF) + スクリプト本文
+    let mut content = vec![0xEF, 0xBB, 0xBF];
+    content.extend_from_slice(script.as_bytes());
+    if std::fs::write(&tmp, &content).is_ok() {
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-STA",
+            "-ExecutionPolicy", "Bypass",
+            "-File",
+            &tmp.to_string_lossy(),
+        ]);
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let _ = cmd.status();
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

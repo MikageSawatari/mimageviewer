@@ -711,6 +711,21 @@ impl App {
                                 }
                             }
                         }
+
+                        // グリッドの空白部分で右クリック → フォルダメニュー
+                        // Sense::click() だと左クリックも消費するので、
+                        // ポインタ位置を直接チェックする
+                        let bg_right_clicked = ctx.input(|i| {
+                            i.pointer.secondary_clicked()
+                        });
+                        if bg_right_clicked && self.context_menu_idx.is_none() {
+                            if self.current_folder.is_some() {
+                                self.context_menu_idx = Some(usize::MAX);
+                                self.context_menu_pos = ctx.input(|i| {
+                                    i.pointer.interact_pos().unwrap_or_default()
+                                });
+                            }
+                        }
                     });
 
                 // スクロールバードラッグによるオフセット変化を読み戻す。

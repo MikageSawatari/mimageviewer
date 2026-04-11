@@ -199,6 +199,8 @@ pub struct App {
     // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
     pub(crate) show_open_folder_dialog: bool,
     pub(crate) open_folder_input: String,
+    /// フォルダを開くダイアログのエラーメッセージ
+    pub(crate) open_folder_error: Option<String>,
 
     // ── 環境設定ポップアップ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
@@ -225,6 +227,11 @@ pub struct App {
     pub(crate) show_delete_confirm: bool,
     /// 削除対象のファイルパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
+
+    // ── ペースト後のフォルダ再読み込みフラグ ──────────────────────
+    pub(crate) pending_reload: bool,
+    /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
+    pub(crate) select_after_load: Option<String>,
 
     // ── 同名ファイル処理 ──────────────────────────────────────────
     /// 動画のサムネイルとして使用する同名画像のマッピング (ステム小文字 → 画像パス)
@@ -360,6 +367,7 @@ impl Default for App {
             fav_add_target: None,
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
+            open_folder_error: None,
             show_preferences: false,
             pref_manual_threads: 4,
             show_toolbar_settings: false,
@@ -369,6 +377,8 @@ impl Default for App {
             context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
             delete_targets: Vec::new(),
+            pending_reload: false,
+            select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
             show_duplicate_settings: false,
             show_rotation_reset_confirm: false,
@@ -710,6 +720,15 @@ impl App {
             self.scroll_offset_y = scroll;
             self.selected = sel;
             if sel.is_some() {
+                self.scroll_to_selected = true;
+            }
+        } else if let Some(name) = self.select_after_load.take() {
+            // 履歴がない場合のフォールバック: 指定名のアイテムを探して選択
+            let name_lower = name.to_lowercase();
+            if let Some(idx) = self.items.iter().position(|item| {
+                item.name().to_lowercase() == name_lower
+            }) {
+                self.selected = Some(idx);
                 self.scroll_to_selected = true;
             }
         }
@@ -1281,9 +1300,33 @@ impl App {
                 None
             };
 
+            let shift = ctx.input(|i| i.modifiers.shift);
             let new_sel = new_vis_pos.and_then(|vp| vi.get(vp).copied());
 
             if let Some(s) = new_sel {
+                // Shift+カーソル: 移動元から移動先までの画像をチェックに追加
+                if shift && new_vis_pos.is_some() {
+                    let old_pos = vis_pos;
+                    let new_pos = new_vis_pos.unwrap();
+                    let (start, end) = if old_pos <= new_pos {
+                        (old_pos, new_pos)
+                    } else {
+                        (new_pos, old_pos)
+                    };
+                    for vp in start..=end {
+                        if let Some(&idx) = vi.get(vp) {
+                            match self.items.get(idx) {
+                                Some(GridItem::Image(_))
+                                | Some(GridItem::Video(_))
+                                | Some(GridItem::ZipImage { .. }) => {
+                                    self.checked.insert(idx);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
                 self.selected = Some(s);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -1341,6 +1384,11 @@ impl App {
         if backspace {
             if let Some(ref cur) = self.current_folder.clone() {
                 if let Some(parent) = cur.parent() {
+                    // 親に戻ったとき、元のフォルダ名を選択するようにヒントを設定
+                    self.select_after_load = cur
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
                     return Some(parent.to_path_buf());
                 }
             }
@@ -2420,6 +2468,75 @@ impl eframe::App for App {
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);
 
+        // ── Ctrl+C / Ctrl+X / Ctrl+V ショートカット ─────────────────
+        if !self.any_dialog_open() && !self.address_has_focus && !self.search_has_focus
+            && self.fullscreen_idx.is_none()
+        {
+            // Ctrl+C/X: egui は Copy/Cut イベントに変換する
+            let (ctrl_c, ctrl_x) = ctx.input(|i| {
+                let mut c = false;
+                let mut x = false;
+                for event in &i.events {
+                    match event {
+                        egui::Event::Copy => c = true,
+                        egui::Event::Cut => x = true,
+                        _ => {}
+                    }
+                }
+                (c, x)
+            });
+            // Ctrl+V: egui/winit はクリップボードにテキストがない場合
+            // Paste イベントも Key::V イベントも発生しない。
+            // Windows API (GetAsyncKeyState) で直接キー状態を確認する。
+            let ctrl_v = {
+                #[cfg(windows)]
+                {
+                    // VK_CONTROL=0x11, VK_V=0x56
+                    // GetAsyncKeyState の最上位ビットが 1 ならキーが押されている
+                    let ctrl = unsafe {
+                        windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11)
+                    };
+                    let v = unsafe {
+                        windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56)
+                    };
+                    // 両方が押されている && 前フレームでは押されていなかった
+                    let pressed = (ctrl & (0x8000u16 as i16)) != 0
+                        && (v & (0x8000u16 as i16)) != 0
+                        && (v & 1) != 0; // 1 = 前回チェック以降に押された
+                    pressed
+                }
+                #[cfg(not(windows))]
+                false
+            };
+
+            if ctrl_c || ctrl_x {
+                let paths = if !self.checked.is_empty() {
+                    self.collect_checked_paths()
+                } else if let Some(idx) = self.selected {
+                    match self.items.get(idx) {
+                        Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => vec![p.clone()],
+                        _ => vec![],
+                    }
+                } else {
+                    vec![]
+                };
+                if !paths.is_empty() {
+                    if ctrl_x {
+                        crate::ui_dialogs::context_menu::cut_files_to_clipboard(&paths);
+                    } else {
+                        crate::ui_dialogs::context_menu::copy_files_to_clipboard(&paths);
+                    }
+                }
+            }
+
+            if ctrl_v {
+                if let Some(ref folder) = self.current_folder.clone() {
+                    crate::ui_dialogs::context_menu::paste_files_from_clipboard(folder);
+                    self.pending_reload = true;
+                }
+            }
+        }
+
         let keyboard_nav = self.handle_keyboard(ctx);
 
         // ── フルスクリーンビューポート ──────────────────────────────────
@@ -2491,6 +2608,16 @@ impl eframe::App for App {
 
         // ── DEL キー ──────────────────────────────────────────────────
         self.handle_delete_key(ctx);
+
+        // ── ペースト後のフォルダ再読み込み ────────────────────────
+        if self.pending_reload {
+            self.pending_reload = false;
+            if let Some(folder) = self.current_folder.clone() {
+                // 少し遅延してからリロード（ペースト処理の完了を待つ）
+                ctx.request_repaint();
+                self.load_folder(folder);
+            }
+        }
 
         // ── ナビゲーション集約 ───────────────────────────────────────
         let navigate = fav_nav

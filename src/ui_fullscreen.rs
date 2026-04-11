@@ -209,14 +209,24 @@ impl App {
                         if key_i {
                             self.show_metadata_panel = !self.show_metadata_panel;
                         }
-                        // Space: スライドショー再生/一時停止
+                        // Space: スライドショー中→停止、停止中→画像をチェック
                         if key_s {
-                            self.slideshow_playing = !self.slideshow_playing;
                             if self.slideshow_playing {
-                                self.slideshow_next_at = std::time::Instant::now()
-                                    + std::time::Duration::from_secs_f32(
-                                        self.settings.slideshow_interval_secs,
-                                    );
+                                self.slideshow_playing = false;
+                            } else {
+                                // 画像のチェック ON/OFF
+                                match self.items.get(fs_idx) {
+                                    Some(GridItem::Image(_))
+                                    | Some(GridItem::Video(_))
+                                    | Some(GridItem::ZipImage { .. }) => {
+                                        if self.checked.contains(&fs_idx) {
+                                            self.checked.remove(&fs_idx);
+                                        } else {
+                                            self.checked.insert(fs_idx);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         // R: 時計回り 90° 回転、L: 反時計回り 90° 回転
@@ -332,6 +342,36 @@ impl App {
                                     open_external_player(vp);
                                 }
                             }
+                        }
+
+                        // ── チェックマーク表示（右上）──
+                        if self.checked.contains(&fs_idx) {
+                            let check_r = 18.0;
+                            let check_center = egui::pos2(
+                                full_rect.max.x - check_r - 16.0,
+                                full_rect.min.y + check_r + 16.0,
+                            );
+                            ui.painter().circle_filled(
+                                check_center,
+                                check_r,
+                                egui::Color32::from_rgb(40, 160, 40),
+                            );
+                            let s = check_r * 0.55;
+                            let stroke = egui::Stroke::new(3.0, egui::Color32::WHITE);
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(check_center.x - s * 0.6, check_center.y),
+                                    egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
+                                ],
+                                stroke,
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
+                                    egui::pos2(check_center.x + s * 0.7, check_center.y - s * 0.5),
+                                ],
+                                stroke,
+                            );
                         }
 
                         // サムネイル仮表示中 → 高解像度読み込み中インジケーター（画像のみ）
