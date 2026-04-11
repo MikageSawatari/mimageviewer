@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>グリッド表示 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>グリッド表示</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html" class="active">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">グリッド表示</h1>
+    <p class="page-desc">サムネイル一覧画面の操作方法を説明します。</p>
+
+    <h2>画面構成</h2>
+    <p>グリッド表示画面は上から順に以下の要素で構成されています。</p>
+    <ul>
+      <li><strong>メニューバー：</strong> 「ファイル」「お気に入り」「設定」の 3 つのメニューがあります。</li>
+      <li><strong>ツールバー（任意）：</strong> 列数・サムネイル比率・ソート順・お気に入りの各セクションを表示できます。表示内容は設定でカスタマイズ可能です。</li>
+      <li><strong>アドレスバー（任意）：</strong> 現在のフォルダパスを表示・編集できます。パスを入力して <kbd>Enter</kbd> でそのフォルダに移動します。</li>
+      <li><strong>サムネイルエリア：</strong> サブフォルダが先頭に並び、続いて画像・動画のサムネイルがグリッド状に表示されます。</li>
+    </ul>
+
+    <h2>フォルダの開き方</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>アドレスバーにパス入力 + <kbd>Enter</kbd></td><td>指定したフォルダに移動します</td></tr>
+          <tr><td>ファイル → フォルダを開く…</td><td>パス入力ダイアログを開きます</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>同上</td></tr>
+          <tr><td>サブフォルダをダブルクリック</td><td>そのフォルダに移動</td></tr>
+          <tr><td><kbd>BS</kbd>（Backspace）</td><td>親フォルダへ移動</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>フォルダツリーで前のフォルダへ</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>フォルダツリーで次のフォルダへ</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>フォルダツリー移動（<kbd>Ctrl</kbd>+<kbd>↑↓</kbd>）：</strong>
+        深さ優先前順でフォルダを順番に巡回します。画像のない空フォルダは自動的にスキップされます（スキップ上限は環境設定で変更可能）。
+      </div>
+    </div>
+
+    <h2>画像の表示</h2>
+    <p>サムネイルをダブルクリックするとフルスクリーン表示に切り替わります。
+    <kbd>Enter</kbd> キーでも同様に表示できます。</p>
+
+    <h2>ソート</h2>
+    <p>ツールバーのソートセクション、または設定メニューからソート順を変更できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ソート順</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ファイル名順</td><td>ファイル名のアルファベット・五十音順</td></tr>
+          <tr><td>番号順</td><td>自然順ソート（1, 2, 9, 10, 11 の順に並ぶ）</td></tr>
+          <tr><td>日付順（古い順）</td><td>更新日時が古いファイルが先頭</td></tr>
+          <tr><td>日付順（新しい順）</td><td>更新日時が新しいファイルが先頭</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>列数の変更</h2>
+    <p>サムネイルの列数は以下の操作で変更できます（2〜10列）：</p>
+    <ul>
+      <li><kbd>Ctrl</kbd>+マウスホイール：列数を増減</li>
+      <li>ツールバーの「列:」セクションからボタンで選択</li>
+      <li>設定メニュー → サムネイル列数</li>
+    </ul>
+
+    <h2>ファイル操作</h2>
+    <h3>選択とチェック</h3>
+    <p>mImageViewer では「選択」と「チェック」の 2 つの選択方法があります。</p>
+    <ul>
+      <li><strong>選択（ハイライト）：</strong>サムネイルをクリックで 1 つ選択。矢印キーで移動。</li>
+      <li><strong>チェック（複数選択）：</strong><kbd>Ctrl</kbd>+クリック、または <kbd>Space</kbd> キーでチェックを ON/OFF。<kbd>Shift</kbd>+矢印キーで範囲チェック。</li>
+    </ul>
+    <p>チェックされたアイテムがある場合、ファイル操作（コピー・削除など）はチェック済みのすべてに適用されます。</p>
+
+    <h3>右クリックメニュー</h3>
+    <p>サムネイルを右クリックするとコンテキストメニューが表示されます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>メニュー項目</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>パスをコピー</td><td>ファイルのフルパスをクリップボードにコピー</td></tr>
+          <tr><td>ファイル名をコピー</td><td>ファイル名のみをコピー</td></tr>
+          <tr><td>画像をクリップボードにコピー</td><td>デコードした画像データをコピー（画像のみ）</td></tr>
+          <tr><td>コピー / カット</td><td>ファイルをクリップボードにコピー・カット</td></tr>
+          <tr><td>ペースト（Ctrl+V）</td><td>クリップボードのファイルを現在のフォルダに貼り付け</td></tr>
+          <tr><td>フォルダを開く</td><td>エクスプローラーでファイルの場所を開く</td></tr>
+          <tr><td>左に回転 (L) / 右に回転 (R)</td><td>非破壊回転</td></tr>
+          <tr><td>削除（ゴミ箱）</td><td>ファイルをごみ箱に移動</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        フォルダを右クリックした場合は「パスをコピー」「エクスプローラで開く」「ペースト」が表示されます。
+      </div>
+    </div>
+
+    <h3>ファイルの削除</h3>
+    <p>選択またはチェックしたファイルを <kbd>Delete</kbd> キーで削除できます。削除前に確認ダイアログが表示されます。
+    削除されたファイルはごみ箱に移動します（完全削除ではありません）。</p>
+
+    <h2>メタデータ検索</h2>
+    <p><kbd>Ctrl</kbd>+<kbd>F</kbd> で検索バーが表示されます。
+    ファイル名や AI プロンプトなどのメタデータをキーワード検索し、マッチした画像だけを絞り込み表示できます。</p>
+    <ul>
+      <li><kbd>Enter</kbd> で検索を実行</li>
+      <li><kbd>Esc</kbd> または「×」ボタンで検索バーを閉じる</li>
+    </ul>
+
+    <h2>ZIP アーカイブ</h2>
+    <p>ZIP ファイルをダブルクリックすると、アーカイブ内の画像をその場で一覧表示できます。
+    解凍不要でサムネイルを確認できます。</p>
+    <ul>
+      <li>ZIP 内の画像に対してフルスクリーン表示が使えます</li>
+      <li>ZIP の外に出るには <kbd>BS</kbd>（Backspace）キーを押します</li>
+    </ul>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        ZIP アーカイブ内の画像を表示中は、ファイルの削除・コピー・カットなどのファイル操作はできません。
+      </div>
+    </div>
+
+    <h2>お気に入り</h2>
+    <p>よく使うフォルダをお気に入りに登録しておくと、素早くアクセスできます。</p>
+    <ul>
+      <li>メニュー「お気に入り」→「このフォルダを追加…」で表示名を付けて登録</li>
+      <li>メニュー「お気に入り」→「編集」で並び替え・削除</li>
+      <li>登録したフォルダはメニューまたはツールバーの「お気に入り:」セクションから選択</li>
+    </ul>
+
+    <h2>サムネイルキャッシュ</h2>
+    <p>一度読み込んだサムネイルは SQLite データベースに WebP 形式でキャッシュされ、次回の表示が高速化されます。
+    キャッシュの設定は<a href="settings.html#cache">設定リファレンス</a>を参照してください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>フルスクリーン表示 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>フルスクリーン表示</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html" class="active">フルスクリーン表示</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">フルスクリーン表示</h1>
+    <p class="page-desc">画像を全画面で閲覧する際の操作方法を説明します。</p>
+
+    <h2>フルスクリーンに入る / 出る</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>サムネイルをダブルクリック</td><td>フルスクリーン表示に切り替え</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>選択中のサムネイルをフルスクリーンで開く</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>グリッド表示に戻る</td></tr>
+          <tr><td>右クリック</td><td>グリッド表示に戻る</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>画像の移動（前後）</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>→</kbd> / <kbd>↓</kbd></td><td>次の画像へ</td></tr>
+          <tr><td><kbd>←</kbd> / <kbd>↑</kbd></td><td>前の画像へ</td></tr>
+          <tr><td>マウスホイール（下）</td><td>次の画像へ</td></tr>
+          <tr><td>マウスホイール（上）</td><td>前の画像へ</td></tr>
+          <tr><td>画面の右半分をクリック</td><td>次の画像へ</td></tr>
+          <tr><td>画面の左半分をクリック</td><td>前の画像へ</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        画像は画面にフィットするサイズで表示されます。前後の画像はバックグラウンドで先読みされるため、
+        切り替え時にスムーズに表示されます。
+      </div>
+    </div>
+
+    <h2>フォルダ間の移動</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>次のフォルダへ移動（フルスクリーンを閉じてグリッドに戻る）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>前のフォルダへ移動（同上）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>回転</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>R</kbd></td><td>右に 90° 回転</td></tr>
+          <tr><td><kbd>L</kbd></td><td>左に 90° 回転</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>画面上部のホバーバーにも回転ボタン（R / L）があります。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>非破壊回転：</strong>
+        回転情報は元のファイルを書き換えず、専用データベースに保存されます。
+        元のファイルは一切変更されません。回転情報のリセットは
+        設定メニューから行えます。
+      </div>
+    </div>
+
+    <h2>ホバーバー</h2>
+    <p>画面上部にマウスカーソルを移動すると、ファイル情報と操作ボタンが表示されます。</p>
+    <ul>
+      <li>ファイル名・画像サイズなどの情報表示</li>
+      <li>回転ボタン（R / L）</li>
+      <li>スライドショーの再生 / 停止ボタン</li>
+    </ul>
+
+    <h2>スライドショー</h2>
+    <p>画面上部のホバーバーに表示される再生ボタン（▶）をクリックするとスライドショーが開始されます。
+    矢印キーやマウスホイールで手動移動すると、スライドショーは自動的に停止します。</p>
+    <ul>
+      <li><kbd>Space</kbd> キーでスライドショーを停止できます</li>
+      <li>表示間隔は設定メニュー →「スライドショー…」で変更できます（既定: 3 秒）</li>
+    </ul>
+
+    <h2>チェック（複数選択）</h2>
+    <p>フルスクリーン表示中でも <kbd>Space</kbd> キーで現在の画像をチェック ON/OFF できます
+    （スライドショー再生中でない場合）。グリッドに戻った際にチェック状態が反映されます。</p>
+
+    <h2>メタデータパネル</h2>
+    <p>画像に付属するメタデータ（EXIF 情報・AI 生成情報）をパネルで表示できます。</p>
+
+    <h3>パネルの表示方法</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>カーソルを画面右端 25% に移動</td><td>パネルが自動的にスライドイン表示（ホバー表示）</td></tr>
+          <tr><td><kbd>I</kbd> または <kbd>Tab</kbd></td><td>パネルの表示／非表示を切り替え（固定表示）</td></tr>
+          <tr><td>パネル内のピン留めボタン</td><td>固定表示のON/OFFを切り替え</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        メタデータパネル上にマウスカーソルがある場合、マウスホイールはパネルのスクロールに使われます（画像の移動にはなりません）。
+      </div>
+    </div>
+
+    <h3>EXIF 情報</h3>
+    <p>デジタルカメラで撮影した JPEG・TIFF ファイルには EXIF 情報が含まれています。
+    パネルにはカメラ情報・撮影パラメータ・GPS 情報などが表示されます。
+    不要なタグは設定メニュー →「EXIF 表示設定…」で非表示にできます。</p>
+
+    <h3>AI 生成情報</h3>
+    <p>Stable Diffusion などのツールで生成した PNG 画像には、
+    プロンプト情報が埋め込まれている場合があります。
+    対応している形式を以下に示します：</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>形式</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>AUTOMATIC1111 / Forge 形式</td><td><code>parameters</code> チャンクにプロンプト・ネガティブプロンプト・生成パラメータ</td></tr>
+          <tr><td>NovelAI 形式</td><td><code>Comment</code> チャンクに JSON 形式のパラメータ</td></tr>
+          <tr><td>ComfyUI 形式</td><td><code>workflow</code> / <code>prompt</code> チャンクにノードグラフ情報</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>アニメーション</h2>
+    <p>アニメーション GIF および APNG（アニメーション PNG）は自動的に再生されます。</p>
+
+    <h2>動画</h2>
+    <p>動画ファイルはサムネイル表示のみの対応です。フルスクリーンでは再生ボタンが表示され、
+    クリックまたは <kbd>Enter</kbd> キーで外部プレイヤーが起動します。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

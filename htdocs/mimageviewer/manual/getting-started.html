@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>はじめに — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>はじめに</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html" class="active">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">はじめに</h1>
+    <p class="page-desc">インストールから初回起動、基本的な使い方までを説明します。</p>
+
+    <h2>動作環境</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>要件</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>OS</td><td>Windows 10 / 11（64ビット）</td></tr>
+          <tr><td>CPU</td><td>x86-64（Intel / AMD）</td></tr>
+          <tr><td>メモリ</td><td>4 GB 以上（8 GB 以上推奨）</td></tr>
+          <tr><td>GPU</td><td>DirectX 12 対応 GPU（wgpu バックエンド使用）</td></tr>
+          <tr><td>ストレージ</td><td>インストール不要（ポータブル）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        HEIC / AVIF / JXL / RAW などのフォーマットを表示するには、<strong>Windows イメージング コンポーネント（WIC）</strong> が必要です。
+        Windows 10/11 では標準で利用できますが、一部フォーマットには Microsoft Store からコーデックの追加インストールが必要な場合があります。
+      </div>
+    </div>
+
+    <h2>インストール</h2>
+    <p>mImageViewer はインストーラー不要の単体 exe アプリケーションです。</p>
+    <ol class="step-list">
+      <li>配布ページから <code>mimageviewer.exe</code> をダウンロードします。</li>
+      <li>任意のフォルダに置きます（例：<code>C:\Tools\mImageViewer\</code>）。</li>
+      <li><code>mimageviewer.exe</code> をダブルクリックして起動します。</li>
+    </ol>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        <strong>スタートメニューへの登録：</strong>
+        <code>mimageviewer.exe</code> を右クリック →「スタートにピン留めする」でスタートメニューから起動できます。
+        デスクトップにショートカットを作成するには、右クリック →「ショートカットの作成」を選んでデスクトップに移動してください。
+      </div>
+    </div>
+
+    <h2>初回起動</h2>
+    <p>初回起動時は空のグリッド画面に「フォルダを入力して Enter キーを押してください」と表示されます。
+    以下のいずれかの方法でフォルダを開きましょう。</p>
+    <ul>
+      <li>画面上部のアドレスバーにフォルダパスを入力して <kbd>Enter</kbd></li>
+      <li>メニューの <strong>ファイル → フォルダを開く…</strong> からパスを入力</li>
+      <li>キーボード <kbd>Ctrl</kbd>+<kbd>O</kbd> でフォルダを開くダイアログを表示</li>
+    </ul>
+    <p>フォルダを開くと、画像ファイルのサムネイルが一覧表示されます。
+    2回目以降の起動時は、前回開いていたフォルダが自動的に復元されます。</p>
+
+    <h2>基本的な操作の流れ</h2>
+    <ol class="step-list">
+      <li>フォルダを開いてサムネイル一覧（グリッド表示）を確認します。</li>
+      <li>見たい画像をダブルクリックするとフルスクリーン表示に切り替わります。</li>
+      <li>フルスクリーン中は <kbd>→</kbd> / <kbd>←</kbd> キーで前後の画像に移動できます。</li>
+      <li><kbd>Esc</kbd> キーを押すとグリッド表示に戻ります。</li>
+    </ol>
+
+    <h2>設定の保存場所</h2>
+    <p>アプリの設定は以下の場所に自動保存されます：</p>
+    <pre><code>%APPDATA%\mimageviewer\settings.json</code></pre>
+    <p>設定ファイルを削除すると、すべての設定が初期値にリセットされます。</p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>複数プロファイルの使用：</strong>
+        コマンドライン引数 <code>--data-dir &lt;フォルダ&gt;</code> を指定すると、別の設定フォルダを使用できます。
+        用途別に設定を使い分けたい場合に便利です。
+      </div>
+    </div>
+
+    <h2>アンインストール</h2>
+    <p>mImageViewer はレジストリを一切変更しません。アンインストールは以下の手順です：</p>
+    <ol class="step-list">
+      <li><code>mimageviewer.exe</code> を削除します。</li>
+      <li>設定を削除する場合は <code>%APPDATA%\mimageviewer</code> フォルダも削除します。</li>
+      <li>サムネイルキャッシュも設定フォルダ内の <code>cache</code> ディレクトリに含まれるため、上記の手順で一括削除されます。</li>
+    </ol>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

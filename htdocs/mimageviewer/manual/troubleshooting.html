@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>トラブルシューティング — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>トラブルシューティング</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html" class="active">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">トラブルシューティング</h1>
+    <p class="page-desc">よくある問題と解決方法をまとめています。</p>
+
+    <h2>起動・表示の問題</h2>
+
+    <h3>起動しない / すぐに終了する</h3>
+    <p>以下の点を確認してください：</p>
+    <ul>
+      <li>Windows 10 / 11（64ビット）以外の OS では動作しません</li>
+      <li>DirectX 12 対応 GPU が必要です。グラフィックドライバーを最新に更新してください</li>
+      <li><code>%APPDATA%\mimageviewer\settings.json</code> が破損している場合は削除してください（設定はリセットされます）</li>
+      <li>ウイルス対策ソフトによってブロックされていないか確認してください</li>
+    </ul>
+
+    <h3>画面が真っ黒 / 何も表示されない</h3>
+    <ul>
+      <li>GPU ドライバーを最新バージョンに更新してください</li>
+      <li>ウィンドウを移動したり、最小化して元に戻したりすると改善する場合があります</li>
+      <li>他のアプリを同時にたくさん起動している場合は、GPU メモリ不足の可能性があります</li>
+    </ul>
+
+    <h3>文字化けする</h3>
+    <p>日本語フォントが正しくインストールされているか確認してください。
+    Windows 11 では「游ゴシック」が標準搭載されています。
+    Windows 10 の場合、フォントが欠落している場合があります。</p>
+
+    <h2>画像表示の問題</h2>
+
+    <h3>HEIC / AVIF / RAW ファイルが表示されない</h3>
+    <p>WIC コーデックが必要です。Microsoft Store から対応するコーデックをインストールしてください。</p>
+    <ol class="step-list">
+      <li>Microsoft Store を開きます（スタートメニューから「Microsoft Store」を検索）</li>
+      <li>「HEIF 画像拡張機能」（HEIC/HEIF 用）または「Microsoft Raw 画像拡張機能」（RAW 用）を検索します</li>
+      <li>インストールします（無料）</li>
+      <li>mImageViewer でフォルダを再度開きます（再起動不要）</li>
+    </ol>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        コーデックのインストール後、mImageViewer の再起動は通常不要です。
+        それでも表示されない場合は一度アプリを終了して再起動してください。
+      </div>
+    </div>
+
+    <h3>画像が回転して表示される</h3>
+    <p>スマートフォンで縦向きに撮影した JPEG は EXIF に向き情報が含まれています。
+    また、mImageViewer で非破壊回転を適用した画像は回転情報データベースに保存されます。
+    意図しない回転がある場合は、設定メニュー →「回転情報をリセット…」で
+    すべての回転情報をクリアできます。</p>
+
+    <h3>GIF アニメーションが再生されない</h3>
+    <ul>
+      <li>グリッド表示ではアニメーションは再生されません。ダブルクリックでフルスクリーン表示に切り替えてください</li>
+    </ul>
+
+    <h3>AI 生成メタデータが表示されない</h3>
+    <ul>
+      <li>対応形式は PNG のみです（JPEG などには対応していません）</li>
+      <li>一部の AI ツールは独自形式でメタデータを埋め込むため、表示できない場合があります</li>
+      <li>メタデータが含まれているか確認するには、ファイルのプロパティ → 詳細 タブを参照してください</li>
+    </ul>
+
+    <h2>パフォーマンスの問題</h2>
+
+    <h3>サムネイルの読み込みが遅い</h3>
+    <ul>
+      <li>初回読み込み時は画像をデコードするため時間がかかります。2 回目以降はキャッシュから高速に読み込まれます</li>
+      <li>キャッシュが無効になっている場合は、設定 →「キャッシュ生成設定…」でキャッシュを有効にしてください</li>
+      <li>RAW ファイルや大容量の TIFF ファイルはデコードに時間がかかります</li>
+      <li>ネットワークドライブ上のファイルはローカルより遅くなります</li>
+    </ul>
+
+    <h3>スクロールがカクカクする</h3>
+    <ul>
+      <li>大量の画像（1000 枚以上）が含まれるフォルダでは描画負荷が高くなります</li>
+      <li>サムネイルサイズを小さくすると 1 画面に表示される枚数が増えますが、描画負荷も上がります。適度なサイズに調整してください</li>
+      <li>GPU ドライバーを最新に更新してください</li>
+    </ul>
+
+    <h3>メモリ使用量が多い</h3>
+    <p>mImageViewer はフルスクリーン表示時、前後数ページ分の画像を GPU メモリにキャッシュします。
+    GPU メモリが不足する場合は、表示解像度を下げるか他の GPU を使用するアプリを終了してください。</p>
+
+    <h2>ファイル操作の問題</h2>
+
+    <h3>削除できない / アクセス拒否される</h3>
+    <ul>
+      <li>他のアプリがファイルを開いている場合は削除できません</li>
+      <li>読み取り専用属性が設定されているファイルは削除できません。エクスプローラーでプロパティを確認してください</li>
+      <li>ネットワーク共有やシステムフォルダ内のファイルはアクセス権限が必要です</li>
+    </ul>
+
+    <h3>ZIP 内の画像が表示されない</h3>
+    <ul>
+      <li>パスワード付き ZIP には対応していません</li>
+      <li>ZIP ファイルが破損している可能性があります。別の解凍ツールで確認してください</li>
+      <li>非常に古い形式（ZIP 1.0 以前）には対応していない場合があります</li>
+    </ul>
+
+    <h2>設定・キャッシュのリセット</h2>
+    <h3>設定をリセットしたい</h3>
+    <p>以下のファイル・フォルダを削除するとリセットされます：</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>対象</th><th>パス</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.json</code></td></tr>
+          <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td></tr>
+          <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code></td></tr>
+          <tr><td>すべての設定</td><td><code>%APPDATA%\mimageviewer\</code> フォルダ全体</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <code>rotation.db</code> を削除すると、mImageViewer で設定したすべての回転情報が失われます。
+        元のファイル自体は変更されていないため、ファイルへの影響はありません。
+      </div>
+    </div>
+
+    <h2>NVIDIA GeForce オーバーレイが表示される</h2>
+    <p>mImageViewer は GPU（wgpu / DirectX 12）を利用して描画を行います。
+    NVIDIA GeForce Experience または NVIDIA App がインストールされている環境では、
+    フルスクリーン表示時にゲームオーバーレイが表示されることがあります。</p>
+    <p>これは NVIDIA がグラフィックス API を使用するアプリケーションをゲームとして検出するためで、
+    mImageViewer 側で回避することはできません。以下の手順でオーバーレイを無効化してください：</p>
+    <ul>
+      <li><strong>NVIDIA App</strong> の場合：設定 → 全般 →「ゲーム内オーバーレイ」をオフ</li>
+      <li><strong>GeForce Experience</strong> の場合：設定 → 全般 →「ゲーム内のオーバーレイ」をオフ</li>
+    </ul>
+
+    <h2>それでも解決しない場合</h2>
+    <p>上記の方法で解決しない場合は、設定のリセットをお試しください。
+    それでも改善しない場合は、開発者までお問い合わせください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

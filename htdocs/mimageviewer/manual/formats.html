@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>対応フォーマット — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>対応フォーマット</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html" class="active">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">対応フォーマット</h1>
+    <p class="page-desc">mImageViewer が対応している画像・動画フォーマットの一覧です。</p>
+
+    <h2>静止画（内蔵デコーダ）</h2>
+    <p>以下のフォーマットは追加インストール不要で表示できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>拡張子</th><th>フォーマット</th><th>備考</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.jpg</code> / <code>.jpeg</code></td><td>JPEG</td><td>EXIF メタデータ対応</td></tr>
+          <tr><td><code>.png</code></td><td>PNG</td><td>AI 生成メタデータ（tEXt / iTXt / zTXt）対応</td></tr>
+          <tr><td><code>.gif</code></td><td>GIF</td><td>アニメーション GIF 対応</td></tr>
+          <tr><td><code>.webp</code></td><td>WebP</td><td>アニメーション WebP 対応</td></tr>
+          <tr><td><code>.bmp</code></td><td>BMP</td><td>Windows ビットマップ</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>静止画（WIC 経由）</h2>
+    <p>Windows イメージング コンポーネント（WIC）を使用して表示します。
+    Windows 10 / 11 では標準で利用できますが、一部フォーマットは
+    Microsoft Store からコーデックの追加が必要です。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>拡張子</th><th>フォーマット</th><th>コーデック</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.heic</code> / <code>.heif</code></td><td>HEIC / HEIF</td><td>HEIF 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.avif</code></td><td>AVIF</td><td>AV1 ビデオ拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.jxl</code></td><td>JPEG XL</td><td>JPEG XL Image Extensions（Microsoft Store）</td></tr>
+          <tr><td><code>.tif</code> / <code>.tiff</code></td><td>TIFF</td><td>標準搭載</td></tr>
+          <tr><td><code>.dng</code></td><td>Adobe DNG（RAW）</td><td>標準搭載（Windows 11）</td></tr>
+          <tr><td><code>.cr2</code> / <code>.cr3</code></td><td>Canon RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.nef</code> / <code>.nrw</code></td><td>Nikon RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.arw</code> / <code>.srf</code> / <code>.sr2</code></td><td>Sony RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.raf</code></td><td>Fujifilm RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.orf</code></td><td>Olympus RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.rw2</code></td><td>Panasonic RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.pef</code> / <code>.ptx</code></td><td>Pentax RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.rwl</code></td><td>Leica RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+          <tr><td><code>.iiq</code></td><td>Phase One RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>Microsoft Store コーデックのインストール：</strong>
+        Microsoft Store で「HEIF 画像拡張機能」「Microsoft Raw 画像拡張機能」などを検索してインストールしてください。
+        無料で入手できます。インストール後、mImageViewer の再起動は不要です。
+      </div>
+    </div>
+
+    <h2>動画（サムネイルのみ）</h2>
+    <p>動画ファイルはサムネイル表示のみ対応しています。再生機能はありません。
+    サムネイルは Windows Shell API（IShellItemImageFactory）を使用して取得します。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>拡張子</th><th>フォーマット</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.mp4</code></td><td>MPEG-4</td></tr>
+          <tr><td><code>.avi</code></td><td>AVI</td></tr>
+          <tr><td><code>.mov</code></td><td>QuickTime</td></tr>
+          <tr><td><code>.mkv</code></td><td>Matroska</td></tr>
+          <tr><td><code>.wmv</code></td><td>Windows Media Video</td></tr>
+          <tr><td><code>.mpg</code> / <code>.mpeg</code></td><td>MPEG</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        動画サムネイルが表示されない場合は、対応するコーデックが Windows にインストールされていない可能性があります。
+        <strong>K-Lite Codec Pack</strong> などの一般的なコーデックパックをインストールすることで改善する場合があります。
+      </div>
+    </div>
+
+    <h2>アーカイブ</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>拡張子</th><th>フォーマット</th><th>備考</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.zip</code></td><td>ZIP</td><td>アーカイブ内の画像をそのまま閲覧可能</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>アニメーション対応</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>フォーマット</th><th>アニメーション</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>GIF</td><td>対応（フレームごとに再生）</td></tr>
+          <tr><td>APNG（アニメーション PNG）</td><td>対応</td></tr>
+          <tr><td>アニメーション WebP</td><td>対応</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>AI 生成メタデータ対応</h2>
+    <p>以下の PNG メタデータ形式に対応し、フルスクリーンのメタデータパネルで表示します。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ツール</th><th>メタデータ形式</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>AUTOMATIC1111 (Stable Diffusion WebUI)</td><td><code>tEXt::parameters</code> チャンク</td></tr>
+          <tr><td>NovelAI</td><td><code>tEXt::Comment</code> / <code>tEXt::Description</code> チャンク</td></tr>
+          <tr><td>ComfyUI</td><td><code>tEXt::workflow</code> / <code>tEXt::prompt</code> チャンク</td></tr>
+          <tr><td>その他</td><td>iTXt / zTXt チャンクにも対応</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

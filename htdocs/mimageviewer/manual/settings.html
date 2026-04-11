@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>設定リファレンス — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>設定リファレンス</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html" class="active">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">設定リファレンス</h1>
+    <p class="page-desc">「設定」メニューからアクセスできる全項目を解説します。</p>
+
+    <h2>設定メニューの項目一覧</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>メニュー項目</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>サムネイル列数</td><td>2〜10 列から選択（既定: 4）</td></tr>
+          <tr><td>サムネイル比率</td><td>16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16 の 7 種（既定: 1:1）</td></tr>
+          <tr><td>ソート順</td><td>ファイル名順 / 番号順 / 日付順（古い順）/ 日付順（新しい順）（既定: ファイル名順）</td></tr>
+          <tr><td>キャッシュ管理</td><td>キャッシュの確認・削除</td></tr>
+          <tr><td>サムネイル画質…</td><td>A/B 比較プレビューでサイズと品質を調整</td></tr>
+          <tr><td>キャッシュ生成設定…</td><td>キャッシュの生成ポリシーと閾値を設定</td></tr>
+          <tr><td>統計…</td><td>読み込み時間・フォーマット別の分布を表示</td></tr>
+          <tr><td>ツールバー…</td><td>ツールバーに表示するセクション・項目をカスタマイズ</td></tr>
+          <tr><td>同名ファイル処理…</td><td>重複ファイルの自動整理ルール</td></tr>
+          <tr><td>EXIF 表示設定…</td><td>メタデータパネルに表示する EXIF タグの管理</td></tr>
+          <tr><td>スライドショー…</td><td>スライドショーの切り替え間隔を設定</td></tr>
+          <tr><td>回転情報をリセット…</td><td>保存済みの全回転情報を削除</td></tr>
+          <tr><td>環境設定…</td><td>並列読み込み・先読み・VRAM など詳細設定</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="cache">サムネイルキャッシュ</h2>
+    <p>サムネイルを SQLite データベースに WebP 形式でキャッシュします。
+    同じフォルダを再度開いた際の読み込みが大幅に高速化されます。</p>
+
+    <h3>キャッシュ生成設定</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th><th>既定値</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>キャッシュポリシー</td>
+            <td>
+              <strong>Off：</strong>キャッシュを使用しない<br>
+              <strong>Auto：</strong>読み込み時間やファイルサイズが閾値を超えた場合のみキャッシュ<br>
+              <strong>Always：</strong>すべてのフォルダでキャッシュを生成
+            </td>
+            <td>Auto</td>
+          </tr>
+          <tr>
+            <td>読み込み時間の閾値</td>
+            <td>Auto モードでキャッシュ対象とする最低デコード時間（ミリ秒）</td>
+            <td>25 ms</td>
+          </tr>
+          <tr>
+            <td>ファイルサイズの閾値</td>
+            <td>Auto モードでキャッシュ対象とする最低ファイルサイズ</td>
+            <td>2 MB</td>
+          </tr>
+          <tr>
+            <td>動画は常にキャッシュ</td>
+            <td>動画のサムネイルは閾値に関わらず常にキャッシュする</td>
+            <td>有効</td>
+          </tr>
+          <tr>
+            <td>WebP は常にキャッシュ</td>
+            <td>WebP ファイルは閾値に関わらず常にキャッシュする</td>
+            <td>有効</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>サムネイル画質</h3>
+    <p>A/B 比較プレビューで視覚的にキャッシュの品質を調整できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th><th>既定値</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>サムネイル長辺サイズ</td><td>キャッシュに保存するサムネイルの長辺ピクセル数</td><td>512 px</td></tr>
+          <tr><td>WebP 品質</td><td>WebP 保存品質（1〜100）。高いほど高画質・大容量</td><td>75</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>キャッシュの管理</h3>
+    <p>設定 → キャッシュ管理 から以下の操作ができます：</p>
+    <ul>
+      <li>キャッシュの合計フォルダ数・容量の確認</li>
+      <li>指定日数以上更新されていないキャッシュの削除</li>
+      <li>すべてのキャッシュを削除</li>
+    </ul>
+
+    <p>お気に入りメニューの「キャッシュ作成」から、お気に入りフォルダのキャッシュを一括生成することもできます。</p>
+
+    <h2>ツールバーのカスタマイズ</h2>
+    <p>設定 →「ツールバー…」から、ツールバーに表示するセクションと個別項目を変更できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>セクション</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>列:</td><td>列数の選択ボタン（2〜10）</td></tr>
+          <tr><td>比率:</td><td>サムネイル縦横比の選択</td></tr>
+          <tr><td>ソート:</td><td>ソート順の選択</td></tr>
+          <tr><td>お気に入り:</td><td>登録済みフォルダへのクイックアクセス</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>各セクションの表示・非表示を切り替えられるほか、個別の項目（列数ボタンの 2〜10 のどれを表示するか等）も選択できます。
+    すべて非表示にするとツールバー自体が消え、グリッドが広く使えます。</p>
+
+    <h2>同名ファイル処理</h2>
+    <p>フォルダ内に類似した名前のファイルが存在する場合、自動的に整理して表示をすっきりさせます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>設定</th><th>説明</th><th>既定</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ZIP+フォルダの重複をスキップ</td><td>同名の ZIP とフォルダがある場合、ZIP を非表示にする</td><td>有効</td></tr>
+          <tr><td>動画+画像の重複をスキップ</td><td>同名の動画と画像がある場合、動画を非表示にする</td><td>有効</td></tr>
+          <tr><td>拡張子違いの画像をスキップ</td><td>同名で異なる拡張子の画像がある場合、優先度の低い方を非表示にする</td><td>有効</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>画像の拡張子優先度もカスタマイズ可能です（PNG > BMP > GIF > ... の順）。</p>
+
+    <h2>EXIF 表示設定</h2>
+    <p>メタデータパネルに表示する EXIF タグを管理します。
+    MakerNote などの冗長なタグはデフォルトで非表示に設定されています。
+    設定ダイアログで各タグの表示・非表示を切り替えてください。</p>
+
+    <h2>スライドショー設定</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th><th>既定値</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>表示間隔</td><td>1 枚の画像を表示する秒数（0.5〜30 秒）</td><td>3 秒</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>環境設定</h2>
+    <p>設定 →「環境設定…」から、パフォーマンスに関する詳細設定を変更できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th><th>既定値</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>並列読み込み</td>
+            <td>サムネイルを並列デコードするスレッド数。Auto（CPU コア数 / 2）または手動（1〜64）</td>
+            <td>Auto</td>
+          </tr>
+          <tr>
+            <td>フルサイズ先読み（後方）</td>
+            <td>フルスクリーン中に前方向に先読みする枚数</td>
+            <td>4 枚</td>
+          </tr>
+          <tr>
+            <td>フルサイズ先読み（前方）</td>
+            <td>フルスクリーン中に次方向に先読みする枚数</td>
+            <td>12 枚</td>
+          </tr>
+          <tr>
+            <td>サムネイル先読み（前方ページ数）</td>
+            <td>サムネイルグリッドで前方に GPU メモリに保持するページ数</td>
+            <td>2 ページ</td>
+          </tr>
+          <tr>
+            <td>サムネイル先読み（後方ページ数）</td>
+            <td>サムネイルグリッドで後方に GPU メモリに保持するページ数</td>
+            <td>4 ページ</td>
+          </tr>
+          <tr>
+            <td>GPU メモリ上限</td>
+            <td>サムネイルの GPU メモリ使用量を VRAM の何 % に制限するか</td>
+            <td>50%</td>
+          </tr>
+          <tr>
+            <td>アイドル時高画質化</td>
+            <td>スクロール停止後にキャッシュ由来のサムネイルを元画像から高画質版に差し替え</td>
+            <td>有効</td>
+          </tr>
+          <tr>
+            <td>空フォルダスキップ上限</td>
+            <td><kbd>Ctrl</kbd>+<kbd>↑↓</kbd> で画像のない空フォルダを連続スキップする上限数</td>
+            <td>3</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>起動オプション（コマンドライン引数）</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>引数</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>--data-dir &lt;パス&gt;</code></td>
+            <td>設定・キャッシュの保存フォルダを指定。複数プロファイルの使い分けに便利です。</td>
+          </tr>
+          <tr>
+            <td><code>--window-size &lt;W&gt;x&lt;H&gt;</code></td>
+            <td>起動時のウィンドウサイズを指定（例: <code>--window-size 1920x1080</code>）。ウィンドウ位置は画面左上付近に固定されます。</td>
+          </tr>
+          <tr>
+            <td><code>&lt;パス&gt;</code></td>
+            <td>起動時に開くフォルダまたはファイルのパス。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>使用例（複数プロファイル）：</strong><br>
+        <code>mimageviewer.exe --data-dir "C:\Profiles\work"</code><br>
+        仕事用と趣味用など、設定を完全に分離して使いたい場合に活用できます。
+      </div>
+    </div>
+
+    <h2>設定の保存場所</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>種類</th><th>パス</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.json</code></td></tr>
+          <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td></tr>
+          <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><code>--data-dir</code> を指定した場合は、すべてのデータが指定フォルダ内に保存されます。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

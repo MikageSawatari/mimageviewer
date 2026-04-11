@@ -1,0 +1,314 @@
+/* mImageViewer マニュアル 共通スタイル */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --pink:       #d63384;
+  --pink-light: #ff60c0;
+  --pink-pale:  #ffe0ec;
+  --pink-bg:    #fff5f9;
+  --accent:     #c0255a;
+  --text:       #2c2c2c;
+  --text-sub:   #555;
+  --border:     #e8e8e8;
+  --sidebar-w:  220px;
+  --content-w:  740px;
+}
+
+html { font-size: 15px; scroll-behavior: smooth; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+               "游ゴシック体", YuGothic, "Yu Gothic", "メイリオ", Meiryo, sans-serif;
+  background: #f4f4f6;
+  color: var(--text);
+  line-height: 1.9;
+  min-height: 100vh;
+}
+
+a { color: var(--pink); text-decoration: none; }
+a:hover { text-decoration: underline; color: var(--accent); }
+
+/* ── Header ─────────────────────────────────── */
+.site-header {
+  background: #fff;
+  border-bottom: 2px solid var(--pink-pale);
+  padding: 0 1.5rem;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+}
+.site-header .logo {
+  font-size: 1rem;
+  font-weight: 700;
+  background: linear-gradient(90deg, var(--pink-light), var(--pink));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  white-space: nowrap;
+}
+.site-header .breadcrumb {
+  font-size: 0.82rem;
+  color: #888;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1;
+}
+.site-header .breadcrumb a { color: #888; }
+.site-header .breadcrumb a:hover { color: var(--pink); text-decoration: none; }
+.site-header .breadcrumb .sep { color: #ccc; }
+
+/* ── Layout ─────────────────────────────────── */
+.layout {
+  display: flex;
+  max-width: calc(var(--sidebar-w) + var(--content-w) + 5rem);
+  margin: 0 auto;
+  min-height: calc(100vh - 52px);
+}
+
+/* ── Sidebar ─────────────────────────────────── */
+.sidebar {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  background: #fff;
+  border-right: 1px solid var(--border);
+  padding: 1.75rem 0 3rem;
+  position: sticky;
+  top: 52px;
+  height: calc(100vh - 52px);
+  overflow-y: auto;
+}
+.sidebar-section {
+  margin-bottom: 1.5rem;
+}
+.sidebar-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #aaa;
+  text-transform: uppercase;
+  padding: 0 1.25rem;
+  margin-bottom: 0.3rem;
+}
+.sidebar nav a {
+  display: block;
+  padding: 0.38rem 1.25rem;
+  font-size: 0.875rem;
+  color: var(--text-sub);
+  border-left: 3px solid transparent;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.sidebar nav a:hover {
+  background: var(--pink-bg);
+  color: var(--pink);
+  text-decoration: none;
+  border-left-color: var(--pink-pale);
+}
+.sidebar nav a.active {
+  color: var(--pink);
+  font-weight: 600;
+  border-left-color: var(--pink);
+  background: var(--pink-bg);
+}
+
+/* ── Main content ────────────────────────────── */
+.content {
+  flex: 1;
+  min-width: 0;
+  padding: 2.5rem 2.5rem 4rem;
+  background: #fff;
+  max-width: var(--content-w);
+}
+
+/* ── Page title ──────────────────────────────── */
+.page-title {
+  font-size: 1.7rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 0.3rem;
+  line-height: 1.3;
+}
+.page-desc {
+  color: var(--text-sub);
+  font-size: 0.95rem;
+  margin-bottom: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Headings ────────────────────────────────── */
+h2 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin: 2.5rem 0 0.75rem;
+  padding-left: 0.75rem;
+  border-left: 4px solid var(--pink);
+}
+h2:first-of-type { margin-top: 0; }
+
+h3 {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+  margin: 1.75rem 0 0.5rem;
+}
+
+/* ── Paragraph ───────────────────────────────── */
+p { margin-bottom: 0.9rem; color: var(--text-sub); }
+
+/* ── Table ───────────────────────────────────── */
+.table-wrap { overflow-x: auto; margin: 0.75rem 0 1.25rem; border-radius: 8px; box-shadow: 0 1px 6px rgba(0,0,0,0.07); }
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; background: #fff; }
+thead tr { background: #f9f9fb; }
+th {
+  text-align: left;
+  padding: 0.55rem 0.9rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #777;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+td {
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid #f2f2f2;
+  vertical-align: top;
+  color: var(--text-sub);
+}
+tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--pink-bg); }
+
+/* ── kbd / code ──────────────────────────────── */
+kbd {
+  display: inline-block;
+  background: #f5f5f7;
+  border: 1px solid #d0d0d8;
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 0.1em 0.5em;
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.82em;
+  color: var(--text);
+  white-space: nowrap;
+}
+code {
+  background: #f5f5f7;
+  border: 1px solid #e0e0e8;
+  border-radius: 4px;
+  padding: 0.1em 0.45em;
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 0.875em;
+  color: var(--accent);
+}
+pre {
+  background: #f8f8fa;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.7;
+  margin: 0.75rem 0 1.25rem;
+}
+pre code { background: none; border: none; padding: 0; color: var(--text); font-size: 1em; }
+
+/* ── Lists ───────────────────────────────────── */
+ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+li { margin-bottom: 0.35rem; color: var(--text-sub); }
+ul li::marker { color: var(--pink-light); }
+
+.step-list { list-style: none; margin-left: 0; counter-reset: step; }
+.step-list li {
+  counter-increment: step;
+  padding: 0.6rem 0.75rem 0.6rem 3rem;
+  margin-bottom: 0.5rem;
+  background: #fafafa;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  position: relative;
+}
+.step-list li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0.75rem;
+  top: 0.55rem;
+  width: 1.6rem;
+  height: 1.6rem;
+  background: linear-gradient(135deg, var(--pink-light), var(--pink));
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 700;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── Info / Warning / Tip boxes ──────────────── */
+.box {
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  font-size: 0.9rem;
+  margin: 0.75rem 0 1.25rem;
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+}
+.box-icon { flex-shrink: 0; font-size: 1rem; margin-top: 0.1rem; }
+.box-body { color: var(--text-sub); }
+.box-body strong { color: var(--text); }
+.box.info  { background: #f0f7ff; border: 1px solid #b8d8fa; }
+.box.tip   { background: #f0faf4; border: 1px solid #a3ddb8; }
+.box.warn  { background: #fffbf0; border: 1px solid #f5d87a; }
+
+/* ── TOC cards (index page) ──────────────────── */
+.toc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+.toc-card {
+  display: block;
+  padding: 1.1rem 1.25rem;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  text-decoration: none;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+  border-top: 3px solid var(--pink-pale);
+}
+.toc-card:hover {
+  border-top-color: var(--pink);
+  box-shadow: 0 4px 16px rgba(214,51,132,0.1);
+  transform: translateY(-2px);
+  text-decoration: none;
+}
+.toc-card .toc-icon { font-size: 1.5rem; margin-bottom: 0.4rem; }
+.toc-card .toc-title { font-size: 0.97rem; font-weight: 700; color: var(--accent); margin-bottom: 0.2rem; }
+.toc-card .toc-desc  { font-size: 0.83rem; color: #777; line-height: 1.55; }
+
+/* ── Footer ──────────────────────────────────── */
+footer {
+  text-align: center;
+  font-size: 0.8rem;
+  color: #aaa;
+  padding: 2rem 1rem;
+  background: #f4f4f6;
+  border-top: 1px solid var(--border);
+}
+footer a { color: #aaa; }
+
+/* ── Responsive ──────────────────────────────── */
+@media (max-width: 768px) {
+  .layout { flex-direction: column; }
+  .sidebar { width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid var(--border); padding: 1rem 0; }
+  .content { padding: 1.5rem 1.25rem 3rem; }
+}
