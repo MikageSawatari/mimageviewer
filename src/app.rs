@@ -323,6 +323,8 @@ pub struct App {
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが一度でも作成されたか
     pub(crate) fs_viewport_created: bool,
+    /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
+    pub(crate) fs_viewport_shown: bool,
 
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
@@ -426,6 +428,7 @@ impl Default for App {
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             fs_viewport_created: false,
+            fs_viewport_shown: false,
             initialized: false,
         }
     }
@@ -2083,6 +2086,7 @@ impl App {
     pub(crate) fn close_fullscreen(&mut self) {
         self.fullscreen_idx = None;
         self.slideshow_playing = false;
+        self.fs_viewport_shown = false;
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }

@@ -164,13 +164,17 @@ impl App {
             }
         };
 
+        // 非表示→表示の切り替え時のみ Visible + Focus を送る
+        let need_show = !self.fs_viewport_shown;
+
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("fullscreen_viewer"),
             fs_builder,
             |ctx, _class| {
-                // ビューポートを表示状態にして前面に持ってくる（非表示から復帰時用）
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                if need_show {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
 
                 // プラットフォームの閉じるリクエスト（Alt+F4 など）
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -429,6 +433,7 @@ impl App {
         );
 
         self.fs_viewport_created = true;
+        self.fs_viewport_shown = true;
 
         // ── フルスクリーン終了・ナビゲーション処理 ────────────────
         if close_fs || ctrl_nav.is_some() {
