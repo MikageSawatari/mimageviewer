@@ -14,7 +14,6 @@ pub fn get_video_thumbnail(path: &Path, shell_size: i32) -> Option<egui::ColorIm
         CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectA,
         SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     };
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_RESIZETOFIT,
     };
@@ -22,18 +21,9 @@ pub fn get_video_thumbnail(path: &Path, shell_size: i32) -> Option<egui::ColorIm
     use windows::core::PCWSTR;
 
     unsafe {
-        // スレッドローカルに COM を初期化（S_OK / S_FALSE どちらも成功扱い）
-        let co_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let co_initialized = co_hr.is_ok();
+        let _com = crate::wic_decoder::ComScope::init();
 
-        let result = get_thumbnail_inner(path, shell_size);
-
-        // S_OK の場合のみ CoUninitialize（S_FALSE = 既初期化なら呼ばない）
-        if co_initialized && co_hr == windows::Win32::Foundation::S_OK {
-            CoUninitialize();
-        }
-
-        return result;
+        return get_thumbnail_inner(path, shell_size);
 
         #[allow(unsafe_op_in_unsafe_fn)]
         unsafe fn get_thumbnail_inner(path: &Path, shell_size: i32) -> Option<egui::ColorImage> {

@@ -34,8 +34,12 @@ pub fn log(msg: impl AsRef<str>) {
     let tid = format!("{:?}", std::thread::current().id());
     let tid_num = tid
         .trim_start_matches("ThreadId(")
-        .trim_end_matches(')')
-        .to_owned();
+        .trim_end_matches(')');
+    let tid_num = if tid_num.parse::<u64>().is_ok() {
+        tid_num.to_owned()
+    } else {
+        "?".to_owned()
+    };
 
     if let Some(file) = FILE.get() {
         if let Ok(mut f) = file.lock() {

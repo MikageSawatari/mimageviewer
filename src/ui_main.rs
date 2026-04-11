@@ -12,6 +12,12 @@ use crate::app::App;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::ui_helpers::open_external_player;
 
+// ── 進捗バー定数 ──
+const PROGRESS_LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 240, 250);
+const PROGRESS_BG_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 25, 35, 230);
+const PROGRESS_NORMAL_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 130, 220);
+const PROGRESS_UPGRADE_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 170, 240);
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -224,14 +230,12 @@ impl App {
             return;
         }
 
-        let label_color = egui::Color32::from_rgb(235, 240, 250);
-        let text_color = egui::Color32::WHITE;
         egui::Area::new("progress_overlay".into())
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
+                    .fill(PROGRESS_BG_COLOR)
                     .show(ui, |ui| {
                         if peak_normal > 0 {
                             let done = peak_normal.saturating_sub(cur_normal);
@@ -240,18 +244,18 @@ impl App {
                                 ui.label(
                                     egui::RichText::new("先読み    ")
                                         .monospace()
-                                        .color(label_color),
+                                        .color(PROGRESS_LABEL_COLOR),
                                 );
                                 ui.add(
                                     egui::ProgressBar::new(progress)
                                         .desired_width(220.0)
-                                        .fill(egui::Color32::from_rgb(60, 130, 220))
+                                        .fill(PROGRESS_NORMAL_COLOR)
                                         .text(
                                             egui::RichText::new(format!(
                                                 "{} / {}",
                                                 done, peak_normal
                                             ))
-                                            .color(text_color),
+                                            .color(egui::Color32::WHITE),
                                         ),
                                 );
                             });
@@ -263,18 +267,18 @@ impl App {
                                 ui.label(
                                     egui::RichText::new("高画質化  ")
                                         .monospace()
-                                        .color(label_color),
+                                        .color(PROGRESS_LABEL_COLOR),
                                 );
                                 ui.add(
                                     egui::ProgressBar::new(progress)
                                         .desired_width(220.0)
-                                        .fill(egui::Color32::from_rgb(100, 170, 240))
+                                        .fill(PROGRESS_UPGRADE_COLOR)
                                         .text(
                                             egui::RichText::new(format!(
                                                 "{} / {}",
                                                 done, peak_upgrade
                                             ))
-                                            .color(text_color),
+                                            .color(egui::Color32::WHITE),
                                         ),
                                 );
                             });
@@ -518,6 +522,72 @@ impl App {
         });
     }
 
+    // ── セルインタラクション ─────────────────────────────────────────
+
+    /// グリッドセルのクリック・ダブルクリック・右クリックを処理する。
+    /// ダブルクリックでフォルダに入る場合はそのパスを返す。
+    fn handle_cell_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        cell_rect: egui::Rect,
+        idx: usize,
+    ) -> Option<PathBuf> {
+        let response = ui.interact(
+            cell_rect,
+            ui.id().with(idx),
+            egui::Sense::click(),
+        );
+        let mut nav = None;
+        if response.clicked() {
+            let ctrl = ctx.input(|i| i.modifiers.ctrl);
+            if ctrl {
+                // Ctrl+クリック: チェック ON/OFF トグル + 選択移動
+                match self.items.get(idx) {
+                    Some(GridItem::Image(_))
+                    | Some(GridItem::Video(_))
+                    | Some(GridItem::ZipImage { .. }) => {
+                        if self.checked.contains(&idx) {
+                            self.checked.remove(&idx);
+                        } else {
+                            self.checked.insert(idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.selected = Some(idx);
+            self.update_last_selected_image();
+        }
+        if response.double_clicked() {
+            match self.items.get(idx) {
+                Some(GridItem::Folder(p)) => {
+                    nav = Some(p.clone())
+                }
+                Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::ZipSeparator { .. }) => {
+                    self.open_fullscreen(idx)
+                }
+                Some(GridItem::Video(p)) => {
+                    let vp = p.clone();
+                    open_external_player(&vp);
+                }
+                None => {}
+            }
+        }
+        // 右クリック → コンテキストメニュー
+        if response.secondary_clicked() {
+            self.selected = Some(idx);
+            self.update_last_selected_image();
+            self.context_menu_idx = Some(idx);
+            self.context_menu_pos = ctx.input(|i| {
+                i.pointer.interact_pos().unwrap_or_default()
+            });
+        }
+        nav
+    }
+
     // ── サムネイルグリッド ───────────────────────────────────────────
 
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
@@ -642,56 +712,10 @@ impl App {
                                     egui::vec2(cell_w, cell_h),
                                 );
 
-                                let response = ui.interact(
-                                    cell_rect,
-                                    ui.id().with(idx),
-                                    egui::Sense::click(),
-                                );
-                                if response.clicked() {
-                                    let ctrl = ctx.input(|i| i.modifiers.ctrl);
-                                    if ctrl {
-                                        // Ctrl+クリック: チェック ON/OFF トグル + 選択移動
-                                        match self.items.get(idx) {
-                                            Some(GridItem::Image(_))
-                                            | Some(GridItem::Video(_))
-                                            | Some(GridItem::ZipImage { .. }) => {
-                                                if self.checked.contains(&idx) {
-                                                    self.checked.remove(&idx);
-                                                } else {
-                                                    self.checked.insert(idx);
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    self.selected = Some(idx);
-                                    self.update_last_selected_image();
-                                }
-                                if response.double_clicked() {
-                                    match self.items.get(idx) {
-                                        Some(GridItem::Folder(p)) => {
-                                            nav = Some(p.clone())
-                                        }
-                                        Some(GridItem::Image(_))
-                                        | Some(GridItem::ZipImage { .. })
-                                        | Some(GridItem::ZipSeparator { .. }) => {
-                                            self.open_fullscreen(idx)
-                                        }
-                                        Some(GridItem::Video(p)) => {
-                                            let vp = p.clone();
-                                            open_external_player(&vp);
-                                        }
-                                        None => {}
-                                    }
-                                }
-                                // 右クリック → コンテキストメニュー
-                                if response.secondary_clicked() {
-                                    self.selected = Some(idx);
-                                    self.update_last_selected_image();
-                                    self.context_menu_idx = Some(idx);
-                                    self.context_menu_pos = ctx.input(|i| {
-                                        i.pointer.interact_pos().unwrap_or_default()
-                                    });
+                                if let Some(n) =
+                                    self.handle_cell_interaction(ui, ctx, cell_rect, idx)
+                                {
+                                    nav = Some(n);
                                 }
 
                                 let rot = self.get_rotation(idx);

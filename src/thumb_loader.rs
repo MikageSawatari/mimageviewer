@@ -225,15 +225,20 @@ fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::Dynam
     }
 }
 
+/// 表示用 ColorImage の最小ピクセル数 (起動直後で cell_size が小さすぎる場合の最低品質保証)
+const DISPLAY_PX_MIN: u32 = 256;
+/// 表示用 ColorImage の最大ピクセル数 (4K 2列などの巨大セルで過大メモリを防ぐ)
+const DISPLAY_PX_MAX: u32 = 2048;
+
 /// 現在のセルサイズから表示用 ColorImage の画素数を算出する。
 ///
-/// 論理ピクセル × DPI スケールで物理ピクセルを求め、256-2048 px にクランプする。
-/// - 下限 256: 起動直後で cell_size が小さすぎる場合の最低品質保証
-/// - 上限 2048: 4K 2列などの巨大セルで過大メモリを防ぐ (最大 16 MB/ColorImage)
+/// 論理ピクセル × DPI スケールで物理ピクセルを求め、DISPLAY_PX_MIN-DISPLAY_PX_MAX px にクランプする。
+/// - 下限 DISPLAY_PX_MIN: 起動直後で cell_size が小さすぎる場合の最低品質保証
+/// - 上限 DISPLAY_PX_MAX: 4K 2列などの巨大セルで過大メモリを防ぐ (最大 16 MB/ColorImage)
 pub fn compute_display_px(cell_w: f32, cell_h: f32, dpi: f32) -> u32 {
     let logical_max = cell_w.max(cell_h).max(1.0);
     let physical = (logical_max * dpi.max(0.5)).ceil();
-    (physical as u32).clamp(256, 2048)
+    (physical as u32).clamp(DISPLAY_PX_MIN, DISPLAY_PX_MAX)
 }
 
 // -----------------------------------------------------------------------

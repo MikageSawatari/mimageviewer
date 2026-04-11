@@ -59,8 +59,8 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(err)
-                            .color(egui::Color32::from_rgb(220, 60, 60))
-                            .size(13.0),
+                            .color(crate::ui_helpers::ERROR_TEXT_COLOR)
+                            .size(crate::ui_helpers::ERROR_TEXT_SIZE),
                     );
                 }
 

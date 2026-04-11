@@ -92,9 +92,7 @@ impl App {
 
                     // ── すべて削除 ────────────────────────────────
                     if ui.button("  すべてのキャッシュを削除する  ").clicked() {
-                        let deleted = crate::catalog::delete_all_cache(&cache_dir);
-                        self.cache_manager_stats = Some((0, 0));
-                        self.cache_manager_result = Some(format!("{} 件のキャッシュをすべて削除しました。", deleted));
+                        self.cache_manager_confirm_delete_all = true;
                     }
 
                     // ── 結果メッセージ ────────────────────────────
@@ -106,8 +104,43 @@ impl App {
 
             if !open {
                 self.show_cache_manager = false;
+                self.cache_manager_confirm_delete_all = false;
             }
         }
 
+        // ── 「すべて削除」確認ダイアログ（別ウィンドウ）────────────
+        if self.cache_manager_confirm_delete_all {
+            let mut confirm_open = true;
+            egui::Window::new("キャッシュの全削除")
+                .open(&mut confirm_open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("すべてのサムネイルキャッシュを削除します。");
+                    ui.label("この操作は元に戻せません。");
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("  削除する  ").clicked() {
+                            let cache_dir = crate::catalog::default_cache_dir();
+                            let deleted = crate::catalog::delete_all_cache(&cache_dir);
+                            self.cache_manager_stats = Some((0, 0));
+                            self.cache_manager_result = Some(format!(
+                                "{} 件のキャッシュをすべて削除しました。", deleted
+                            ));
+                            self.cache_manager_confirm_delete_all = false;
+                        }
+                        if ui.button("  キャンセル  ").clicked()
+                            || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
+                            self.cache_manager_confirm_delete_all = false;
+                        }
+                    });
+                });
+            if !confirm_open {
+                self.cache_manager_confirm_delete_all = false;
+            }
+        }
     }
 }

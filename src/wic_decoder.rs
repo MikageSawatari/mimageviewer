@@ -16,6 +16,33 @@
 
 use std::path::Path;
 
+/// COM 初期化スコープガード。Drop 時に自動で CoUninitialize を呼ぶ。
+pub(crate) struct ComScope {
+    needs_uninit: bool,
+}
+
+impl ComScope {
+    /// COM を初期化する。既に初期化済みの場合も安全に扱う。
+    pub fn init() -> Self {
+        unsafe {
+            let hr = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            );
+            let needs_uninit = hr == windows::Win32::Foundation::S_OK;
+            Self { needs_uninit }
+        }
+    }
+}
+
+impl Drop for ComScope {
+    fn drop(&mut self) {
+        if self.needs_uninit {
+            unsafe { windows::Win32::System::Com::CoUninitialize(); }
+        }
+    }
+}
+
 /// WIC で扱える可能性の高い拡張子 (小文字)。
 ///
 /// このリストに含まれる拡張子は、`image` クレートでデコードに失敗した場合に
@@ -55,29 +82,19 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
     #[cfg(windows)]
     unsafe {
         use windows::core::{Interface, GUID, PCWSTR};
-        use windows::Win32::Foundation::{GENERIC_READ, S_OK};
+        use windows::Win32::Foundation::GENERIC_READ;
         use windows::Win32::Graphics::Imaging::{
             CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode,
             IWICBitmapSource, IWICFormatConverter, IWICImagingFactory,
             WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
         };
         use windows::Win32::System::Com::{
-            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED,
+            CoCreateInstance, CLSCTX_INPROC_SERVER,
         };
 
-        // COM 初期化 (S_OK と S_FALSE の両方を成功として扱う)
-        let co_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let co_initialized = co_hr.is_ok();
+        let _com = ComScope::init();
 
-        // 内部処理を inner 関数に分離して、結果に関わらず CoUninitialize できるようにする
-        let result = decode_inner(path);
-
-        if co_initialized && co_hr == S_OK {
-            CoUninitialize();
-        }
-
-        return result;
+        return decode_inner(path);
 
         #[allow(unsafe_op_in_unsafe_fn)]
         unsafe fn decode_inner(path: &Path) -> Option<image::DynamicImage> {
@@ -124,7 +141,8 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
             let mut width = 0u32;
             let mut height = 0u32;
             converter.GetSize(&mut width, &mut height).ok()?;
-            if width == 0 || height == 0 || width > 32768 || height > 32768 {
+            const MAX_WIC_DIMENSION: u32 = 32768;
+            if width == 0 || height == 0 || width > MAX_WIC_DIMENSION || height > MAX_WIC_DIMENSION {
                 return None;
             }
 
@@ -164,25 +182,18 @@ pub fn read_wic_orientation(path: &Path) -> Option<u16> {
     unsafe {
         use windows::core::{GUID, PCWSTR};
         use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-        use windows::Win32::Foundation::{GENERIC_READ, S_OK};
+        use windows::Win32::Foundation::GENERIC_READ;
         use windows::Win32::Graphics::Imaging::{
             CLSID_WICImagingFactory, IWICImagingFactory, IWICMetadataQueryReader,
             WICDecodeMetadataCacheOnDemand,
         };
         use windows::Win32::System::Com::{
-            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED,
+            CoCreateInstance, CLSCTX_INPROC_SERVER,
         };
 
-        let co_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let co_initialized = co_hr.is_ok();
+        let _com = ComScope::init();
 
-        let result = read_orientation_inner(path);
-
-        if co_initialized && co_hr == S_OK {
-            CoUninitialize();
-        }
-        return result;
+        return read_orientation_inner(path);
 
         #[allow(unsafe_op_in_unsafe_fn)]
         unsafe fn read_orientation_inner(path: &Path) -> Option<u16> {

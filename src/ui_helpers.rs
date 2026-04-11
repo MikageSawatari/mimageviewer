@@ -11,6 +11,13 @@ use std::path::Path;
 
 use crate::grid_item::GridItem;
 
+/// エラー表示の標準テキスト色。
+#[allow(dead_code)]
+pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(220, 60, 60);
+/// エラー表示の標準フォントサイズ。
+#[allow(dead_code)]
+pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
+
 // -----------------------------------------------------------------------
 // バイト数 / 件数の整形
 // -----------------------------------------------------------------------

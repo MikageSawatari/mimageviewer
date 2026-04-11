@@ -168,14 +168,19 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // 非破壊マイグレーション: 既存 DB で source_width/source_height が欠けていれば追加する。
     // 列が既にある場合 ALTER TABLE はエラーを返すので、結果は無視する。
-    let _ = conn.execute(
+    if let Err(e) = conn.execute(
         "ALTER TABLE thumbnails ADD COLUMN source_width INTEGER",
         [],
-    );
-    let _ = conn.execute(
+    ) {
+        // "duplicate column name" is expected if column already exists
+        crate::logger::log(format!("catalog migration source_width: {e}"));
+    }
+    if let Err(e) = conn.execute(
         "ALTER TABLE thumbnails ADD COLUMN source_height INTEGER",
         [],
-    );
+    ) {
+        crate::logger::log(format!("catalog migration source_height: {e}"));
+    }
 
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
     let version: Option<String> = conn

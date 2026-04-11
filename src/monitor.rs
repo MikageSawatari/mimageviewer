@@ -107,7 +107,11 @@ pub fn get_monitor_logical_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
 
         let mut dpi_x: u32 = 96;
         let mut dpi_y: u32 = 96;
-        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y); }
+        let dpi_hr = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+        if dpi_hr != 0 {
+            crate::logger::log(format!("[monitor] GetDpiForMonitor failed: HRESULT={dpi_hr:#x}, using 96 DPI"));
+            dpi_x = 96;
+        }
         let scale = dpi_x.max(1) as f32 / 96.0;
 
         let r = &info.rc_monitor;

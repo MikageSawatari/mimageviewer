@@ -62,7 +62,6 @@ pub enum ThumbnailState {
         source_dims: Option<(u32, u32)>,
     },
     /// 読み込みに失敗した（再試行しない）
-    #[allow(dead_code)]
     Failed,
     /// 段階 B: 先読み範囲外に出て GPU テクスチャを破棄済み
     /// 再び範囲内に入ったら再ロードされる

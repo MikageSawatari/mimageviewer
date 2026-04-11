@@ -480,18 +480,33 @@ impl Settings {
         let path = Self::settings_path();
         let data = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => return Self::default(),
+            Err(e) => {
+                eprintln!("settings load failed: {} ({})", path.display(), e);
+                return Self::default();
+            }
         };
-        serde_json::from_str(&data).unwrap_or_default()
+        serde_json::from_str(&data).unwrap_or_else(|e| {
+            eprintln!("settings JSON parse failed: {} ({})", path.display(), e);
+            Self::default()
+        })
     }
 
     pub fn save(&self) {
         let path = Self::settings_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("settings dir create failed: {} ({})", parent.display(), e);
+            }
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            std::fs::write(&path, json).ok();
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    eprintln!("settings save failed: {} ({})", path.display(), e);
+                }
+            }
+            Err(e) => {
+                eprintln!("settings serialize failed: {e}");
+            }
         }
     }
 

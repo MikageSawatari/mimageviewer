@@ -51,6 +51,7 @@ pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
                 let delay = if denom > 0 {
                     numer as f64 / denom as f64 / 1000.0
                 } else {
+                    crate::logger::log("GIF animation frame denom=0, using 0.1s default".to_string());
                     0.1
                 };
                 let delay = delay.max(0.02); // 最低 20ms（Chrome 互換）
@@ -92,6 +93,7 @@ pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
                 let delay = if denom > 0 {
                     numer as f64 / denom as f64 / 1000.0
                 } else {
+                    crate::logger::log("APNG animation frame denom=0, using 0.1s default".to_string());
                     0.1
                 };
                 let delay = delay.max(0.02);

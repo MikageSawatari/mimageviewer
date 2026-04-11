@@ -11,6 +11,47 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::ui_helpers::{draw_play_icon, format_bytes_small, open_external_player};
 
+// ── 定数 ────────────────────────────────────────────────────────────────
+
+/// メタデータパネルの最大幅
+const METADATA_PANEL_WIDTH: f32 = 380.0;
+/// ホバー時トップバーの高さ
+const TOP_BAR_HEIGHT: f32 = 44.0;
+/// バー内ボタンのサイズ
+const BAR_BUTTON_SIZE: f32 = 32.0;
+/// バー内ボタンの上下マージン
+const BAR_BUTTON_MARGIN: f32 = 6.0;
+/// バー内ボタン間の隙間
+const BAR_BUTTON_GAP: f32 = 4.0;
+/// チェックマーク円の半径
+const CHECKMARK_RADIUS: f32 = 18.0;
+/// チェックマーク円のマージン（画面端からの距離）
+const CHECKMARK_MARGIN: f32 = 16.0;
+
+// ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
+
+/// フルスクリーン描画 1 フレーム分の事前計算済み状態。
+struct FsFrameState {
+    is_video: bool,
+    separator_text: Option<String>,
+    video_path: Option<std::path::PathBuf>,
+    tex: Option<egui::TextureHandle>,
+    thumb_tex: Option<egui::TextureHandle>,
+    filename: String,
+    folder_display: String,
+    image_dims: Option<(u32, u32)>,
+    image_file_size: Option<u64>,
+    is_loading: bool,
+    fs_load_failed: bool,
+}
+
+/// フルスクリーンのキー入力結果。
+struct FsKeyAction {
+    close: bool,
+    nav_delta: i32,
+    ctrl_nav: Option<i32>,
+}
+
 impl App {
     /// フルスクリーンビューポートを描画し、終了後のナビゲーション処理も行う。
     /// フルスクリーン表示中でなければ何もしない。
@@ -37,134 +78,16 @@ impl App {
             return;
         };
 
-        // 動画か否かを判定
-        let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        // タスク 3: ZIP セパレータ (章タイトル表示)
-        let separator_text: Option<String> = match self.items.get(fs_idx) {
-            Some(GridItem::ZipSeparator { dir_display }) => Some(dir_display.clone()),
-            _ => None,
-        };
-        let is_separator = separator_text.is_some();
-        let video_path = if is_video {
-            if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
-                Some(p.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // アニメーションフレームを進める（メインコンテキストの時刻を使う）
-        if !is_video {
-            let now = ctx.input(|i| i.time);
-            if let Some(FsCacheEntry::Animated {
-                frames,
-                current_frame,
-                next_frame_at,
-            }) = self.fs_cache.get_mut(&fs_idx)
-            {
-                if now >= *next_frame_at && !frames.is_empty() {
-                    *current_frame = (*current_frame + 1) % frames.len();
-                    let delay = frames[*current_frame].1.max(0.02);
-                    *next_frame_at = now + delay;
-                }
-            }
-        }
-
-        // 表示テクスチャを取得（動画は None、画像はキャッシュエントリから）
-        let tex: Option<egui::TextureHandle> = if is_video {
-            None
-        } else {
-            match self.fs_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Static(h)) => Some(h.clone()),
-                Some(FsCacheEntry::Animated {
-                    frames,
-                    current_frame,
-                    ..
-                }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                Some(FsCacheEntry::Failed) | None => None,
-            }
-        };
-
-        // フルスクリーンデコードが失敗した場合を検出
-        let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
-
-        let thumb_tex = match self.thumbnails.get(fs_idx) {
-            Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-            _ => None,
-        };
-        let filename = self
-            .items
-            .get(fs_idx)
-            .map(|item| item.name().to_string())
-            .unwrap_or_default();
-        // トップバー用: フォルダ (current_folder そのまま、ZIP なら ZIP ファイルのパス)
-        let folder_display = self
-            .current_folder
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        // トップバー用: フルサイズ読込完了時のネイティブ画像サイズ
-        let image_dims: Option<(u32, u32)> = tex.as_ref().map(|t| {
-            let s = t.size_vec2();
-            (s.x as u32, s.y as u32)
-        });
-        // トップバー用: ファイルサイズ (image_metas から)
-        let image_file_size: Option<u64> = self
-            .image_metas
-            .get(fs_idx)
-            .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
-        // 画像のみ「高解像度読込中」表示が必要（動画・セパレータ・失敗は不要）
-        let is_loading =
-            !is_video && !is_separator && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
+        // ── 状態の事前計算 ──
+        self.advance_animation(ctx, fs_idx);
+        let state = self.prepare_fullscreen_state(ctx, fs_idx);
 
         let mut close_fs = false;
         let mut nav_delta: i32 = 0;
         let mut ctrl_nav: Option<i32> = None;
 
-        // メインウィンドウがあるモニターの論理ピクセル矩形を取得し、
-        // そのモニターを完全に覆う borderless ウィンドウを作成する。
-        // with_fullscreen(true) はプライマリモニター固定になるため使わない。
-        let fs_builder = {
-            let center = self.last_outer_rect.map(|r| r.center());
-            let ppp = self.last_pixels_per_point;
-            crate::logger::log(format!(
-                "[fullscreen] last_outer_rect center: {:?}  ppp={ppp:.2}",
-                center.map(|c| format!("({:.1},{:.1})", c.x, c.y))
-            ));
-
-            // MonitorFromPoint は物理座標を要求するため論理座標に ppp を乗算する
-            let monitor_rect = center.and_then(|c| {
-                crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp)
-            });
-
-            let b = egui::ViewportBuilder::default()
-                .with_decorations(false)
-                .with_transparent(true);
-            match monitor_rect {
-                Some(rect) => {
-                    crate::logger::log(format!(
-                        "[fullscreen] using monitor rect: pos=({:.1},{:.1}) size={:.1}x{:.1}",
-                        rect.min.x,
-                        rect.min.y,
-                        rect.width(),
-                        rect.height()
-                    ));
-                    b.with_position(rect.min)
-                        .with_inner_size([rect.width(), rect.height()])
-                }
-                None => {
-                    crate::logger::log(
-                        "[fullscreen] monitor rect not found, fallback to with_fullscreen"
-                            .to_string(),
-                    );
-                    b.with_fullscreen(true)
-                }
-            }
-        };
-
-        // 非表示→表示の切り替え時のみ Visible + Focus を送る
+        // ── ビューポート構築 ──
+        let fs_builder = self.build_fullscreen_viewport_builder();
         let need_show = !self.fs_viewport_shown;
 
         ctx.show_viewport_immediate(
@@ -176,7 +99,6 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
 
-                // プラットフォームの閉じるリクエスト（Alt+F4 など）
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close_fs = true;
                 }
@@ -186,207 +108,49 @@ impl App {
                     .show(ctx, |ui| {
                         let full_rect = ui.max_rect();
 
-                        // ── キー入力（ctx はこのビューポートのコンテキスト）
-                        // ビューポートにフォーカスがない場合はキー入力を無視
-                        let has_focus = ctx
-                            .input(|i| i.viewport().focused)
-                            .unwrap_or(true);
+                        // ── キー入力 ──
+                        let key_action = self.handle_fs_key_input(ctx, fs_idx);
+                        if key_action.close { close_fs = true; }
+                        nav_delta = key_action.nav_delta;
+                        ctrl_nav = key_action.ctrl_nav;
 
-                        let esc = has_focus && ctx.input(|i| i.key_pressed(egui::Key::Escape));
-                        let right = has_focus && ctx.input(|i| {
-                            i.key_pressed(egui::Key::ArrowRight)
-                                || i.key_pressed(egui::Key::ArrowDown)
-                        });
-                        let left = has_focus && ctx.input(|i| {
-                            i.key_pressed(egui::Key::ArrowLeft)
-                                || i.key_pressed(egui::Key::ArrowUp)
-                        });
-                        let ctrl_d = has_focus && ctx.input(|i| {
-                            i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown)
-                        });
-                        let ctrl_u = has_focus && ctx
-                            .input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
-                        let key_i = has_focus && ctx.input(|i| i.key_pressed(egui::Key::I));
-
-                        let key_s = has_focus && ctx.input(|i| i.key_pressed(egui::Key::Space));
-                        let key_r = has_focus && ctx.input(|i| i.key_pressed(egui::Key::R));
-                        let key_l = has_focus && ctx.input(|i| i.key_pressed(egui::Key::L));
-
-                        if esc {
-                            close_fs = true;
-                        }
-                        if key_i {
-                            self.show_metadata_panel = !self.show_metadata_panel;
-                        }
-                        // Space: スライドショー中→停止、停止中→画像をチェック
-                        if key_s {
-                            if self.slideshow_playing {
-                                self.slideshow_playing = false;
-                            } else {
-                                // 画像のチェック ON/OFF
-                                match self.items.get(fs_idx) {
-                                    Some(GridItem::Image(_))
-                                    | Some(GridItem::Video(_))
-                                    | Some(GridItem::ZipImage { .. }) => {
-                                        if self.checked.contains(&fs_idx) {
-                                            self.checked.remove(&fs_idx);
-                                        } else {
-                                            self.checked.insert(fs_idx);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        // R: 時計回り 90° 回転、L: 反時計回り 90° 回転
-                        if key_r {
-                            self.rotate_image_cw(fs_idx);
-                        }
-                        if key_l {
-                            self.rotate_image_ccw(fs_idx);
-                        }
-
-                        if right && !ctrl_d {
-                            nav_delta = 1;
-                            self.slideshow_playing = false; // 手動操作で停止
-                        }
-                        if left && !ctrl_u {
-                            nav_delta = -1;
-                            self.slideshow_playing = false;
-                        }
-                        if ctrl_d {
-                            ctrl_nav = Some(1);
-                        }
-                        if ctrl_u {
-                            ctrl_nav = Some(-1);
-                        }
-
-                        // ── ホイール操作 ──────────────────────────
-                        // メタデータパネル上ではパネル内スクロール、それ以外は画像ナビゲーション
-                        let panel_w = 380.0_f32.min(full_rect.width() * 0.5);
-                        let panel_left = full_rect.max.x - panel_w;
-                        let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
-                        let cursor_in_panel = ctx.input(|i| {
-                            i.pointer.hover_pos().map(|p| {
-                                p.x > panel_left
-                                    && p.y >= 60.0 // 上部バー領域は除外
-                                    && (self.show_metadata_panel || p.x > hover_threshold)
-                            }).unwrap_or(false)
-                        });
-
-                        let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
-                        if wheel_y.abs() > 0.5 && !cursor_in_panel {
-                            // パネル外: ホイールで画像前後移動
-                            ctx.input_mut(|i| {
-                                i.raw_scroll_delta = egui::Vec2::ZERO;
-                                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                                i.events
-                                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-                            });
-                            nav_delta = if wheel_y < 0.0 { 1 } else { -1 };
-                        }
-                        // パネル上: ホイールイベントを消費せず、ScrollArea に委ねる
-
-                        // ── マウスクリック操作 ────────────────────
-                        let fs_response = ui.interact(
-                            full_rect,
-                            egui::Id::new("fs_click"),
-                            egui::Sense::click(),
+                        // ── ホイール & クリック ──
+                        let (wheel_nav, click_close) = self.handle_fs_wheel_and_click(
+                            ui, ctx, full_rect, &state,
                         );
-                        if is_video {
-                            // 動画: クリックで外部プレイヤー起動
-                            if fs_response.clicked() {
-                                if let Some(ref vp) = video_path {
-                                    open_external_player(vp);
-                                }
-                            }
-                        } else {
-                            // 画像 / セパレータ: 左半分 → 前、右半分 → 次
-                            // パネル表示領域のクリックはナビゲーションしない
-                            if fs_response.clicked() {
-                                if let Some(pos) = fs_response.interact_pointer_pos() {
-                                    let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
-                                    let in_panel = pos.y >= 60.0
-                                        && (self.show_metadata_panel
-                                            || pos.x > panel_threshold)
-                                        && pos.x > full_rect.max.x - 380.0_f32.min(full_rect.width() * 0.5);
-                                    if !in_panel {
-                                        if pos.x > full_rect.center().x {
-                                            nav_delta = 1;
-                                        } else {
-                                            nav_delta = -1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // 右クリックでフルスクリーン終了 → サムネイル一覧に戻る
-                        if fs_response.secondary_clicked() {
-                            close_fs = true;
-                        }
+                        if wheel_nav != 0 { nav_delta = wheel_nav; }
+                        if click_close { close_fs = true; }
 
-                        // ── 画像 / 動画 / セパレータ表示 ──────────
-                        if let Some(sep) = separator_text.as_ref() {
+                        // ── 画像 / 動画 / セパレータ描画 ──
+                        if let Some(sep) = state.separator_text.as_ref() {
                             Self::draw_fs_separator(ui, full_rect, sep);
                         } else {
                             let fs_rotation = self.get_rotation(fs_idx);
                             Self::draw_fs_image(
-                                ui,
-                                full_rect,
-                                tex.as_ref(),
-                                thumb_tex.as_ref(),
-                                is_video,
-                                fs_load_failed,
-                                fs_rotation,
+                                ui, full_rect,
+                                state.tex.as_ref(), state.thumb_tex.as_ref(),
+                                state.is_video, state.fs_load_failed, fs_rotation,
                             );
                         }
 
-                        // ── 動画: 再生ボタンオーバーレイ ─────────
-                        if is_video {
+                        // ── 動画: 再生ボタン + Enter ──
+                        if state.is_video {
                             draw_play_icon(ui.painter(), full_rect.center(), 56.0);
-                            // Enter キーでも起動
-                            let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-                            if enter {
-                                if let Some(ref vp) = video_path {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                if let Some(ref vp) = state.video_path {
                                     open_external_player(vp);
                                 }
                             }
                         }
 
-                        // ── チェックマーク表示（右上）──
+                        // ── チェックマーク ──
                         if self.checked.contains(&fs_idx) {
-                            let check_r = 18.0;
-                            let check_center = egui::pos2(
-                                full_rect.max.x - check_r - 16.0,
-                                full_rect.min.y + check_r + 16.0,
-                            );
-                            ui.painter().circle_filled(
-                                check_center,
-                                check_r,
-                                egui::Color32::from_rgb(40, 160, 40),
-                            );
-                            let s = check_r * 0.55;
-                            let stroke = egui::Stroke::new(3.0, egui::Color32::WHITE);
-                            ui.painter().line_segment(
-                                [
-                                    egui::pos2(check_center.x - s * 0.6, check_center.y),
-                                    egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
-                                ],
-                                stroke,
-                            );
-                            ui.painter().line_segment(
-                                [
-                                    egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
-                                    egui::pos2(check_center.x + s * 0.7, check_center.y - s * 0.5),
-                                ],
-                                stroke,
-                            );
+                            draw_fs_checkmark(ui, full_rect);
                         }
 
-                        // サムネイル仮表示中 → 高解像度読み込み中インジケーター（画像のみ）
-                        // セパレータでない + 何らかのテクスチャが表示されている場合のみ表示
-                        let has_any_tex = tex.is_some() || thumb_tex.is_some();
-                        if is_loading && has_any_tex {
+                        // ── 高解像度読込中インジケーター ──
+                        let has_any_tex = state.tex.is_some() || state.thumb_tex.is_some();
+                        if state.is_loading && has_any_tex {
                             ui.painter().text(
                                 full_rect.min + egui::vec2(16.0, 16.0),
                                 egui::Align2::LEFT_TOP,
@@ -396,38 +160,26 @@ impl App {
                             );
                         }
 
-                        // ── メタデータパネル (画像の上にオーバーレイ) ──
-                        // 右パネル表示中は上部バーも強制表示する
+                        // ── メタデータパネル ──
                         let right_panel_visible =
                             self.draw_metadata_panel(ui, ctx, full_rect);
 
-                        // ── ホバー時のトップバー ──
+                        // ── ホバーバー ──
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
                         Self::draw_fs_hover_bar(
-                            ui,
-                            ctx,
-                            full_rect,
-                            &folder_display,
-                            &filename,
-                            image_dims,
-                            image_file_size,
-                            &mut close_fs,
-                            &mut nav_delta,
+                            ui, ctx, full_rect,
+                            &state.folder_display, &state.filename,
+                            state.image_dims, state.image_file_size,
+                            &mut close_fs, &mut nav_delta,
                             &mut self.show_metadata_panel,
                             right_panel_visible,
                             &mut self.slideshow_playing,
                             &mut self.settings.slideshow_interval_secs,
-                            &mut bar_rotate_cw,
-                            &mut bar_rotate_ccw,
+                            &mut bar_rotate_cw, &mut bar_rotate_ccw,
                         );
-                        // ホバーバーの回転ボタンが押された場合
-                        if bar_rotate_cw {
-                            self.rotate_image_cw(fs_idx);
-                        }
-                        if bar_rotate_ccw {
-                            self.rotate_image_ccw(fs_idx);
-                        }
+                        if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
+                        if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
                     });
             },
         );
@@ -435,14 +187,262 @@ impl App {
         self.fs_viewport_created = true;
         self.fs_viewport_shown = true;
 
-        // ── フルスクリーン終了・ナビゲーション処理 ────────────────
+        // ── ナビゲーション & スライドショー処理 ──
+        self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, fs_idx);
+        self.handle_fs_repaint(ctx, fs_idx, state.is_video);
+    }
+
+    // ── 状態準備ヘルパー ────────────────────────────────────────────────
+
+    /// アニメーションフレームを進める（メインコンテキストの時刻を使う）。
+    fn advance_animation(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        if is_video { return; }
+        let now = ctx.input(|i| i.time);
+        if let Some(FsCacheEntry::Animated {
+            frames, current_frame, next_frame_at,
+        }) = self.fs_cache.get_mut(&fs_idx)
+        {
+            if now >= *next_frame_at && !frames.is_empty() {
+                *current_frame = (*current_frame + 1) % frames.len();
+                let delay = frames[*current_frame].1.max(0.02);
+                *next_frame_at = now + delay;
+            }
+        }
+    }
+
+    /// フルスクリーン描画に必要な状態を事前計算する。
+    fn prepare_fullscreen_state(&self, _ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
+        let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let separator_text = match self.items.get(fs_idx) {
+            Some(GridItem::ZipSeparator { dir_display }) => Some(dir_display.clone()),
+            _ => None,
+        };
+        let is_separator = separator_text.is_some();
+        let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
+            Some(p.clone())
+        } else {
+            None
+        };
+
+        let tex: Option<egui::TextureHandle> = if is_video {
+            None
+        } else {
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Static(h)) => Some(h.clone()),
+                Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                    frames.get(*current_frame).map(|(h, _)| h.clone())
+                }
+                Some(FsCacheEntry::Failed) | None => None,
+            }
+        };
+
+        let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
+
+        let thumb_tex = match self.thumbnails.get(fs_idx) {
+            Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+            _ => None,
+        };
+
+        let filename = self.items.get(fs_idx)
+            .map(|item| item.name().to_string())
+            .unwrap_or_default();
+        let folder_display = self.current_folder.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let image_dims: Option<(u32, u32)> = tex.as_ref().map(|t| {
+            let s = t.size_vec2();
+            (s.x as u32, s.y as u32)
+        });
+        let image_file_size: Option<u64> = self.image_metas.get(fs_idx)
+            .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
+        let is_loading =
+            !is_video && !is_separator && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
+
+        FsFrameState {
+            is_video, separator_text, video_path, tex, thumb_tex,
+            filename, folder_display, image_dims, image_file_size,
+            is_loading, fs_load_failed,
+        }
+    }
+
+    /// フルスクリーンビューポートの ViewportBuilder を構築する。
+    fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
+        let center = self.last_outer_rect.map(|r| r.center());
+        let ppp = self.last_pixels_per_point;
+        crate::logger::log(format!(
+            "[fullscreen] last_outer_rect center: {:?}  ppp={ppp:.2}",
+            center.map(|c| format!("({:.1},{:.1})", c.x, c.y))
+        ));
+
+        let monitor_rect = center.and_then(|c| {
+            crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp)
+        });
+
+        let b = egui::ViewportBuilder::default()
+            .with_decorations(false)
+            .with_transparent(true);
+        match monitor_rect {
+            Some(rect) => {
+                crate::logger::log(format!(
+                    "[fullscreen] using monitor rect: pos=({:.1},{:.1}) size={:.1}x{:.1}",
+                    rect.min.x, rect.min.y, rect.width(), rect.height()
+                ));
+                b.with_position(rect.min)
+                    .with_inner_size([rect.width(), rect.height()])
+            }
+            None => {
+                crate::logger::log(
+                    "[fullscreen] monitor rect not found, fallback to with_fullscreen".to_string(),
+                );
+                b.with_fullscreen(true)
+            }
+        }
+    }
+
+    // ── キー入力 ────────────────────────────────────────────────────────
+
+    /// フルスクリーンのキー入力を処理し、アクションを返す。
+    fn handle_fs_key_input(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
+        let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let mut action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None };
+
+        if !has_focus { return action; }
+
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let right = ctx.input(|i| {
+            i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown)
+        });
+        let left = ctx.input(|i| {
+            i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp)
+        });
+        let ctrl_d = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown));
+        let ctrl_u = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
+        let key_i = ctx.input(|i| i.key_pressed(egui::Key::I));
+        let key_s = ctx.input(|i| i.key_pressed(egui::Key::Space));
+        let key_r = ctx.input(|i| i.key_pressed(egui::Key::R));
+        let key_l = ctx.input(|i| i.key_pressed(egui::Key::L));
+
+        if esc { action.close = true; }
+        if key_i { self.show_metadata_panel = !self.show_metadata_panel; }
+
+        // Space: スライドショー中→停止、停止中→画像をチェック
+        if key_s {
+            if self.slideshow_playing {
+                self.slideshow_playing = false;
+            } else {
+                match self.items.get(fs_idx) {
+                    Some(GridItem::Image(_))
+                    | Some(GridItem::Video(_))
+                    | Some(GridItem::ZipImage { .. }) => {
+                        if self.checked.contains(&fs_idx) {
+                            self.checked.remove(&fs_idx);
+                        } else {
+                            self.checked.insert(fs_idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if key_r { self.rotate_image_cw(fs_idx); }
+        if key_l { self.rotate_image_ccw(fs_idx); }
+
+        if right && !ctrl_d {
+            action.nav_delta = 1;
+            self.slideshow_playing = false;
+        }
+        if left && !ctrl_u {
+            action.nav_delta = -1;
+            self.slideshow_playing = false;
+        }
+        if ctrl_d { action.ctrl_nav = Some(1); }
+        if ctrl_u { action.ctrl_nav = Some(-1); }
+
+        action
+    }
+
+    // ── ホイール & クリック ──────────────────────────────────────────────
+
+    /// ホイールとクリックを処理し、(nav_delta, close) を返す。
+    fn handle_fs_wheel_and_click(
+        &self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        state: &FsFrameState,
+    ) -> (i32, bool) {
+        let mut nav_delta = 0i32;
+        let mut close = false;
+
+        // ── ホイール ──
+        let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
+        let panel_left = full_rect.max.x - panel_w;
+        let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
+        let cursor_in_panel = ctx.input(|i| {
+            i.pointer.hover_pos().map(|p| {
+                p.x > panel_left
+                    && p.y >= 60.0
+                    && (self.show_metadata_panel || p.x > hover_threshold)
+            }).unwrap_or(false)
+        });
+
+        let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
+        if wheel_y.abs() > 0.5 && !cursor_in_panel {
+            ctx.input_mut(|i| {
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                i.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+            });
+            nav_delta = if wheel_y < 0.0 { 1 } else { -1 };
+        }
+
+        // ── クリック ──
+        let fs_response = ui.interact(
+            full_rect,
+            egui::Id::new("fs_click"),
+            egui::Sense::click(),
+        );
+        if state.is_video {
+            if fs_response.clicked() {
+                if let Some(ref vp) = state.video_path {
+                    open_external_player(vp);
+                }
+            }
+        } else if fs_response.clicked() {
+            if let Some(pos) = fs_response.interact_pointer_pos() {
+                let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
+                let in_panel = pos.y >= 60.0
+                    && (self.show_metadata_panel || pos.x > panel_threshold)
+                    && pos.x > full_rect.max.x - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
+                if !in_panel {
+                    nav_delta = if pos.x > full_rect.center().x { 1 } else { -1 };
+                }
+            }
+        }
+        if fs_response.secondary_clicked() {
+            close = true;
+        }
+
+        (nav_delta, close)
+    }
+
+    // ── ナビゲーション & スライドショー ─────────────────────────────────
+
+    /// フルスクリーン終了・ナビゲーション・スライドショーを処理する。
+    fn handle_fs_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        close_fs: bool,
+        ctrl_nav: Option<i32>,
+        nav_delta: i32,
+        fs_idx: usize,
+    ) {
         if close_fs || ctrl_nav.is_some() {
             self.close_fullscreen();
-            // メインウィンドウにフォーカスを戻す
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if let Some(delta) = ctrl_nav {
-            // Ctrl+↑↓: フォルダを移動してサムネイルモードに戻る（仕様 §7.2）
             if let Some(cur) = self.current_folder.clone() {
                 let skip_limit = self.settings.folder_skip_limit;
                 let next = if delta > 0 {
@@ -455,10 +455,9 @@ impl App {
                 }
             }
         } else if !close_fs && nav_delta != 0 {
-            // ←→↑↓: 画像・動画を前後に切り替え
-            if let Some(new_idx) =
-                crate::ui_helpers::adjacent_navigable_idx(&self.items, &self.visible_indices, fs_idx, nav_delta)
-            {
+            if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
+                &self.items, &self.visible_indices, fs_idx, nav_delta,
+            ) {
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
@@ -466,26 +465,22 @@ impl App {
             }
         }
 
-        // ── スライドショー タイマー ─────────────────────────────────
+        // ── スライドショー タイマー ──
         if self.slideshow_playing && !close_fs {
             let now = std::time::Instant::now();
             if now >= self.slideshow_next_at {
-                // 次の画像に切り替え（ループ）
                 if let Some(cur) = self.fullscreen_idx {
-                    let next = crate::ui_helpers::adjacent_navigable_idx(&self.items, &self.visible_indices, cur, 1);
+                    let next = crate::ui_helpers::adjacent_navigable_idx(
+                        &self.items, &self.visible_indices, cur, 1,
+                    );
                     let target = match next {
                         Some(idx) => idx,
                         None => {
-                            // 末尾に到達 → visible_indices 内の先頭画像に戻る（ループ）
-                            self.visible_indices
-                                .iter()
-                                .copied()
-                                .find(|&i| {
-                                    matches!(
-                                        self.items.get(i),
-                                        Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. })
-                                    )
-                                })
+                            self.visible_indices.iter().copied()
+                                .find(|&i| matches!(
+                                    self.items.get(i),
+                                    Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. })
+                                ))
                                 .unwrap_or(0)
                         }
                     };
@@ -496,15 +491,16 @@ impl App {
                 self.slideshow_next_at = now
                     + std::time::Duration::from_secs_f32(self.settings.slideshow_interval_secs);
             }
-            // タイマーが発火するまで再描画を継続
             let remaining = self.slideshow_next_at.saturating_duration_since(now);
             ctx.request_repaint_after(remaining);
         }
+    }
 
-        // 高解像度読み込み完了まで毎フレーム再描画（画像のみ）
+    /// フルスクリーンの再描画リクエストを管理する。
+    fn handle_fs_repaint(&self, ctx: &egui::Context, fs_idx: usize, is_video: bool) {
+        // 高解像度読み込み完了まで毎フレーム再描画
         let image_loading = !is_video
-            && self
-                .fullscreen_idx
+            && self.fullscreen_idx
                 .map(|i| !self.fs_cache.contains_key(&i))
                 .unwrap_or(false);
         if image_loading {
@@ -513,24 +509,20 @@ impl App {
 
         // アニメーション: 次フレームの時刻まで待ってから再描画
         if !is_video {
-            if let Some(FsCacheEntry::Animated {
-                next_frame_at, ..
-            }) = self.fs_cache.get(&fs_idx)
-            {
+            if let Some(FsCacheEntry::Animated { next_frame_at, .. }) = self.fs_cache.get(&fs_idx) {
                 let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             }
         }
     }
 
-    // ── フルスクリーン描画ヘルパー ──────────────────────────────────
+    // ── フルスクリーン描画ヘルパー ──────────────────────────────────────
 
     /// ZIP セパレータの章タイトル画面を描画する。
     fn draw_fs_separator(ui: &mut egui::Ui, full_rect: egui::Rect, sep: &str) {
         let title_size = (full_rect.height() * 0.12).clamp(48.0, 120.0);
         let sub_size = (full_rect.height() * 0.030).clamp(20.0, 36.0);
 
-        // 控えめな背景ハイライト (フォルダ名の周囲のみ)
         ui.painter().rect_filled(
             egui::Rect::from_center_size(
                 full_rect.center(),
@@ -539,7 +531,6 @@ impl App {
             16.0,
             egui::Color32::from_rgba_unmultiplied(30, 45, 80, 180),
         );
-        // フォルダ名 (中央、大きく)
         ui.painter().text(
             full_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -547,7 +538,6 @@ impl App {
             egui::FontId::proportional(title_size),
             egui::Color32::WHITE,
         );
-        // 「作品の区切り」案内 (画面下部)
         ui.painter().text(
             egui::pos2(full_rect.center().x, full_rect.max.y - 48.0),
             egui::Align2::CENTER_BOTTOM,
@@ -567,11 +557,9 @@ impl App {
         fs_load_failed: bool,
         rotation: crate::rotation_db::Rotation,
     ) {
-        // 動画はサムネイルのみ表示。画像はフルサイズ優先。
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
-            // 90°/270° 回転時は幅と高さが入れ替わる
             let display_size = match rotation {
                 crate::rotation_db::Rotation::Cw90
                 | crate::rotation_db::Rotation::Cw270 => {
@@ -592,14 +580,10 @@ impl App {
                 );
             } else {
                 crate::app::draw_rotated_image(
-                    ui.painter(),
-                    handle.id(),
-                    img_rect,
-                    rotation,
+                    ui.painter(), handle.id(), img_rect, rotation,
                 );
             }
         } else if fs_load_failed {
-            // デコード失敗
             ui.painter().text(
                 full_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -615,15 +599,10 @@ impl App {
                 egui::Color32::from_gray(180),
             );
         } else {
-            // テクスチャ未ロード（サムネイルも未完了）
             ui.painter().text(
                 full_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                if is_video {
-                    "動画サムネイル 読込中..."
-                } else {
-                    "読込中..."
-                },
+                if is_video { "動画サムネイル 読込中..." } else { "読込中..." },
                 egui::FontId::proportional(24.0),
                 egui::Color32::from_gray(180),
             );
@@ -649,219 +628,105 @@ impl App {
         rotate_cw: &mut bool,
         rotate_ccw: &mut bool,
     ) {
-        // 画面上部 60px にマウスがあるとき、または右パネル表示中は常に表示
         let hover_in_top = ctx
             .input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
         if !hover_in_top && !force_show {
             return;
         }
 
-        let bar_h = 44.0;
-        let bar_rect =
-            egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), bar_h));
-        // 半透明の黒背景 (文字が読みやすいよう alpha 高め)
+        let bar_rect = egui::Rect::from_min_size(
+            full_rect.min,
+            egui::vec2(full_rect.width(), TOP_BAR_HEIGHT),
+        );
         ui.painter().rect_filled(
-            bar_rect,
-            0.0,
+            bar_rect, 0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
         );
-        // 下端に薄い区切り線
         ui.painter().line_segment(
             [
                 egui::pos2(bar_rect.min.x, bar_rect.max.y),
                 egui::pos2(bar_rect.max.x, bar_rect.max.y),
             ],
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
-            ),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
         );
 
-        // ── × 閉じるボタン (右端) ──
-        let btn_size = 32.0;
-        let btn_margin = 6.0;
-        let btn_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                bar_rect.max.x - btn_size - btn_margin,
-                bar_rect.min.y + btn_margin,
-            ),
-            egui::vec2(btn_size, btn_size),
-        );
-        let btn_resp = ui.interact(
-            btn_rect,
-            egui::Id::new("fs_close_btn"),
-            egui::Sense::click(),
-        );
-        let bg = if btn_resp.hovered() {
-            egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-        };
-        ui.painter().rect_filled(btn_rect, 4.0, bg);
-        let c = btn_rect.center();
-        let r = btn_size * 0.25;
-        let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
-        ui.painter().line_segment(
-            [
-                egui::pos2(c.x - r, c.y - r),
-                egui::pos2(c.x + r, c.y + r),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                egui::pos2(c.x + r, c.y - r),
-                egui::pos2(c.x - r, c.y + r),
-            ],
-            stroke,
-        );
-        if btn_resp.clicked() {
-            *close_fs = true;
-        }
-        // ×ボタンのクリックが背面の nav_delta に漏れないように上書き
-        if btn_resp.hovered() {
-            *nav_delta = 0;
-        }
+        // ── ボタン群（右端から左に並べる）──
+        let mut next_x = bar_rect.max.x - BAR_BUTTON_SIZE - BAR_BUTTON_MARGIN;
 
-        // ── ▶/⏸ スライドショーボタン (× の左隣) ──
-        let play_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                btn_rect.min.x - btn_size - 4.0,
-                bar_rect.min.y + btn_margin,
-            ),
-            egui::vec2(btn_size, btn_size),
-        );
-        let play_resp = ui.interact(
-            play_rect,
-            egui::Id::new("fs_play_btn"),
-            egui::Sense::click(),
-        );
-        let play_bg = if *slideshow_playing {
-            egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
-        } else if play_resp.hovered() {
-            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-        };
-        ui.painter().rect_filled(play_rect, 4.0, play_bg);
-        {
-            let c = play_rect.center();
-            let r = btn_size * 0.28;
-            let p = ui.painter();
-            if *slideshow_playing {
-                // 一時停止: 2 本の縦線
-                let bar_w = r * 0.3;
-                let gap = r * 0.35;
-                let stroke = egui::Stroke::new(bar_w, egui::Color32::WHITE);
-                p.line_segment(
-                    [egui::pos2(c.x - gap, c.y - r), egui::pos2(c.x - gap, c.y + r)],
-                    stroke,
-                );
-                p.line_segment(
-                    [egui::pos2(c.x + gap, c.y - r), egui::pos2(c.x + gap, c.y + r)],
-                    stroke,
-                );
+        // × 閉じるボタン
+        let close_resp = draw_bar_button(
+            ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "fs_close_btn",
+            |hovered| if hovered {
+                egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
             } else {
-                // 再生: 右向き三角形
-                let cx = c.x + r * 0.12;
-                let points = vec![
-                    egui::pos2(cx - r * 0.5, c.y - r * 0.75),
-                    egui::pos2(cx - r * 0.5, c.y + r * 0.75),
-                    egui::pos2(cx + r * 0.7, c.y),
-                ];
-                p.add(egui::Shape::convex_polygon(
-                    points,
-                    egui::Color32::WHITE,
-                    egui::Stroke::NONE,
-                ));
-            }
-        }
-        if play_resp.clicked() {
-            *slideshow_playing = !*slideshow_playing;
-        }
-        if play_resp.hovered() {
-            *nav_delta = 0;
-        }
-
-        // ── ↷ 右回転ボタン (▶ の左隣) ──
-        let rcw_rect = egui::Rect::from_min_size(
-            egui::pos2(play_rect.min.x - btn_size - 4.0, bar_rect.min.y + btn_margin),
-            egui::vec2(btn_size, btn_size),
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+            },
+            false, // active 状態なし
+            |p, c, r| draw_close_icon(p, c, r),
         );
-        let rcw_resp = ui.interact(rcw_rect, egui::Id::new("fs_rcw_btn"), egui::Sense::click());
-        let rcw_bg = if rcw_resp.hovered() {
-            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-        };
-        ui.painter().rect_filled(rcw_rect, 4.0, rcw_bg);
-        draw_rotate_icon(ui.painter(), rcw_rect.center(), btn_size * 0.28, true);
+        if close_resp.clicked() { *close_fs = true; }
+        if close_resp.hovered() { *nav_delta = 0; }
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // ▶/⏸ スライドショーボタン
+        let play_resp = draw_bar_button(
+            ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "fs_play_btn",
+            |hovered| if *slideshow_playing {
+                egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
+            } else if hovered {
+                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+            },
+            false,
+            |p, c, r| {
+                if *slideshow_playing {
+                    draw_pause_icon(p, c, r);
+                } else {
+                    draw_play_triangle(p, c, r);
+                }
+            },
+        );
+        if play_resp.clicked() { *slideshow_playing = !*slideshow_playing; }
+        if play_resp.hovered() { *nav_delta = 0; }
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // ↷ 右回転ボタン
+        let rcw_resp = draw_bar_button(
+            ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "fs_rcw_btn",
+            |hovered| bar_button_bg(hovered, false),
+            false,
+            |p, c, r| draw_rotate_icon(p, c, r, true),
+        );
         if rcw_resp.clicked() { *rotate_cw = true; }
         if rcw_resp.hovered() { *nav_delta = 0; }
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // ── ↶ 左回転ボタン (↷ の左隣) ──
-        let rccw_rect = egui::Rect::from_min_size(
-            egui::pos2(rcw_rect.min.x - btn_size - 4.0, bar_rect.min.y + btn_margin),
-            egui::vec2(btn_size, btn_size),
+        // ↶ 左回転ボタン
+        let rccw_resp = draw_bar_button(
+            ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "fs_rccw_btn",
+            |hovered| bar_button_bg(hovered, false),
+            false,
+            |p, c, r| draw_rotate_icon(p, c, r, false),
         );
-        let rccw_resp = ui.interact(rccw_rect, egui::Id::new("fs_rccw_btn"), egui::Sense::click());
-        let rccw_bg = if rccw_resp.hovered() {
-            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-        };
-        ui.painter().rect_filled(rccw_rect, 4.0, rccw_bg);
-        draw_rotate_icon(ui.painter(), rccw_rect.center(), btn_size * 0.28, false);
         if rccw_resp.clicked() { *rotate_ccw = true; }
         if rccw_resp.hovered() { *nav_delta = 0; }
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // ── ℹ Info ボタン (↶ の左隣) ──
-        let info_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                rccw_rect.min.x - btn_size - 4.0,
-                bar_rect.min.y + btn_margin,
-            ),
-            egui::vec2(btn_size, btn_size),
+        // ℹ Info ボタン
+        let info_resp = draw_bar_button(
+            ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "fs_info_btn",
+            |hovered| bar_button_bg(hovered, *show_info),
+            *show_info,
+            |p, c, r| draw_info_icon(p, c, r),
         );
-        let info_resp = ui.interact(
-            info_rect,
-            egui::Id::new("fs_info_btn"),
-            egui::Sense::click(),
-        );
-        let info_bg = if *show_info {
-            egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-        } else if info_resp.hovered() {
-            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-        };
-        ui.painter().rect_filled(info_rect, 4.0, info_bg);
-        {
-            // ℹ アイコンの自前描画: 丸 + 縦線 + 点
-            let c = info_rect.center();
-            let r = btn_size * 0.28;
-            let white = egui::Color32::WHITE;
-            // 外円
-            ui.painter().circle_stroke(c, r, egui::Stroke::new(1.5, white));
-            // 縦線 (i の棒部分)
-            let bar_w = r * 0.22;
-            ui.painter().line_segment(
-                [egui::pos2(c.x, c.y - r * 0.05), egui::pos2(c.x, c.y + r * 0.55)],
-                egui::Stroke::new(bar_w, white),
-            );
-            // 点 (i の上の点)
-            ui.painter().circle_filled(
-                egui::pos2(c.x, c.y - r * 0.45),
-                bar_w * 0.7,
-                white,
-            );
-        }
-        if info_resp.clicked() {
-            *show_info = !*show_info;
-        }
-        if info_resp.hovered() {
-            *nav_delta = 0;
-        }
+        if info_resp.clicked() { *show_info = !*show_info; }
+        if info_resp.hovered() { *nav_delta = 0; }
 
         // ── 左側: フォルダパス ──
         if !folder_display.is_empty() {
@@ -874,47 +739,166 @@ impl App {
             );
         }
 
-        // ── 中央寄り (× の左): ファイル名 | 寸法 | サイズ ──
-        let mut info_parts: Vec<String> = Vec::new();
-        if !filename.is_empty() {
-            info_parts.push(filename.to_string());
-        }
-        if let Some((w, h)) = image_dims {
-            info_parts.push(format!("{w} × {h}"));
-        }
-        if let Some(bytes) = image_file_size {
-            info_parts.push(format_bytes_small(bytes));
-        }
-        if !info_parts.is_empty() {
-            let info_text = info_parts.join("    ");
-            // info ボタンの左に配置
-            let right_edge = info_rect.min.x - 12.0;
-            ui.painter().text(
-                egui::pos2(right_edge, bar_rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                info_text,
-                egui::FontId::proportional(15.0),
-                egui::Color32::WHITE,
-            );
-        }
+        // ── ファイル情報テキスト ──
+        draw_fs_bar_info_text(
+            ui, bar_rect,
+            egui::pos2(next_x - 12.0, bar_rect.center().y),
+            filename, image_dims, image_file_size,
+        );
     }
 }
 
+// ── ホバーバーのアイコン描画関数 ────────────────────────────────────────
+
+/// バーボタンの標準背景色を返す。
+fn bar_button_bg(hovered: bool, active: bool) -> egui::Color32 {
+    if active {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+    } else if hovered {
+        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+    }
+}
+
+/// バーボタンの共通描画。位置とアイコン描画関数を受け取る。
+fn draw_bar_button(
+    ui: &mut egui::Ui,
+    x: f32,
+    y: f32,
+    id: &str,
+    bg_fn: impl FnOnce(bool) -> egui::Color32,
+    _active: bool,
+    icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
+) -> egui::Response {
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(x, y),
+        egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
+    );
+    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let bg = bg_fn(resp.hovered());
+    ui.painter().rect_filled(rect, 4.0, bg);
+    let r = BAR_BUTTON_SIZE * 0.28;
+    icon_fn(ui.painter(), rect.center(), r);
+    resp
+}
+
+/// × アイコンを描画する。
+fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
+    let r = BAR_BUTTON_SIZE * 0.25;
+    let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
+    painter.line_segment(
+        [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(c.x + r, c.y - r), egui::pos2(c.x - r, c.y + r)],
+        stroke,
+    );
+}
+
+/// 一時停止アイコン (2本の縦線) を描画する。
+fn draw_pause_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let bar_w = r * 0.3;
+    let gap = r * 0.35;
+    let stroke = egui::Stroke::new(bar_w, egui::Color32::WHITE);
+    painter.line_segment(
+        [egui::pos2(c.x - gap, c.y - r), egui::pos2(c.x - gap, c.y + r)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(c.x + gap, c.y - r), egui::pos2(c.x + gap, c.y + r)],
+        stroke,
+    );
+}
+
+/// 再生アイコン (右向き三角形) を描画する。
+fn draw_play_triangle(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let cx = c.x + r * 0.12;
+    let points = vec![
+        egui::pos2(cx - r * 0.5, c.y - r * 0.75),
+        egui::pos2(cx - r * 0.5, c.y + r * 0.75),
+        egui::pos2(cx + r * 0.7, c.y),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points, egui::Color32::WHITE, egui::Stroke::NONE,
+    ));
+}
+
+/// ℹ アイコンを描画する。
+fn draw_info_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    painter.circle_stroke(c, r, egui::Stroke::new(1.5, white));
+    let bar_w = r * 0.22;
+    painter.line_segment(
+        [egui::pos2(c.x, c.y - r * 0.05), egui::pos2(c.x, c.y + r * 0.55)],
+        egui::Stroke::new(bar_w, white),
+    );
+    painter.circle_filled(egui::pos2(c.x, c.y - r * 0.45), bar_w * 0.7, white);
+}
+
+/// チェックマーク（右上）を描画する。
+fn draw_fs_checkmark(ui: &mut egui::Ui, full_rect: egui::Rect) {
+    let check_center = egui::pos2(
+        full_rect.max.x - CHECKMARK_RADIUS - CHECKMARK_MARGIN,
+        full_rect.min.y + CHECKMARK_RADIUS + CHECKMARK_MARGIN,
+    );
+    ui.painter().circle_filled(
+        check_center, CHECKMARK_RADIUS,
+        egui::Color32::from_rgb(40, 160, 40),
+    );
+    let s = CHECKMARK_RADIUS * 0.55;
+    let stroke = egui::Stroke::new(3.0, egui::Color32::WHITE);
+    ui.painter().line_segment(
+        [
+            egui::pos2(check_center.x - s * 0.6, check_center.y),
+            egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
+            egui::pos2(check_center.x + s * 0.7, check_center.y - s * 0.5),
+        ],
+        stroke,
+    );
+}
+
+/// ファイル情報テキスト（ファイル名・寸法・サイズ）を描画する。
+fn draw_fs_bar_info_text(
+    ui: &mut egui::Ui,
+    bar_rect: egui::Rect,
+    right_anchor: egui::Pos2,
+    filename: &str,
+    image_dims: Option<(u32, u32)>,
+    image_file_size: Option<u64>,
+) {
+    let mut parts: Vec<String> = Vec::new();
+    if !filename.is_empty() { parts.push(filename.to_string()); }
+    if let Some((w, h)) = image_dims { parts.push(format!("{w} × {h}")); }
+    if let Some(bytes) = image_file_size { parts.push(format_bytes_small(bytes)); }
+    if !parts.is_empty() {
+        ui.painter().text(
+            right_anchor,
+            egui::Align2::RIGHT_CENTER,
+            parts.join("    "),
+            egui::FontId::proportional(15.0),
+            egui::Color32::WHITE,
+        );
+    }
+    let _ = bar_rect; // bar_rect は配置参照のために引数に残す
+}
+
 /// 回転アイコンを自前描画する。
-/// 上部が開いた 270° の円弧 + 端に矢印。
-/// `clockwise`: true=時計回り (R), false=反時計回り (L)。
 fn draw_rotate_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32, clockwise: bool) {
     let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
     let n = 24;
 
-    // 円弧: 角度系 (0°=右, 90°=下, 時計回り)
-    // 開口部は下。start=225° (左下), end=315° (右下) の短い方ではなく、
-    // start=315° → end=315°+270°=585°(=225°) で上を通る 270° の弧。
-    let start_rad = 315.0_f32.to_radians(); // 右下
-    let end_rad = (315.0 + 270.0_f32).to_radians(); // = 585° = 225° (左下)
-    let arc_span = end_rad - start_rad; // 270°
+    let start_rad = 315.0_f32.to_radians();
+    let end_rad = (315.0 + 270.0_f32).to_radians();
+    let arc_span = end_rad - start_rad;
 
-    // 円弧の点を計算（常に時計回り方向 = 角度増加方向に描画）
     let mut points = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let t = i as f32 / n as f32;
@@ -925,28 +909,18 @@ fn draw_rotate_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32, cl
         ));
     }
 
-    // 円弧を描画
     for i in 0..n {
         painter.line_segment([points[i], points[i + 1]], stroke);
     }
 
-    // 矢印: どちらの端に付けるか
-    // 開口部は下。start=315° (右下), end=225° (左下)。
     let (arrow_pt, tangent_x, tangent_y) = if clockwise {
-        // 終端 (225° = 左下) に矢印。進行方向 = 時計回りの接線 = (sin θ, -cos θ)。
         let angle = end_rad;
-        let tx = angle.sin();
-        let ty = -angle.cos();
-        (points[n], tx, ty)
+        (points[n], angle.sin(), -angle.cos())
     } else {
-        // 始端 (315° = 右下) に矢印。進行方向 = 反時計回りの接線 = (-sin θ, cos θ)。
         let angle = start_rad;
-        let tx = -angle.sin();
-        let ty = angle.cos();
-        (points[0], tx, ty)
+        (points[0], -angle.sin(), angle.cos())
     };
 
-    // 矢印の 2 辺
     let nx = -tangent_y;
     let ny = tangent_x;
     let a = radius * 0.55;

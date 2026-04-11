@@ -15,6 +15,10 @@
 mod settings;
 
 #[allow(dead_code)]
+#[path = "../wic_decoder.rs"]
+mod wic_decoder;
+
+#[allow(dead_code)]
 #[path = "../video_thumb.rs"]
 mod video_thumb;
 

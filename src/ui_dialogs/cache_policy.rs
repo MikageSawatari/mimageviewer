@@ -123,7 +123,7 @@ impl App {
                         );
                     });
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {

@@ -340,59 +340,15 @@ fn draw_comfyui_panel(
 
     // Raw JSON sections (collapsible)
     ui.add_space(10.0);
-    if ui
-        .selectable_label(
-            rp,
-            egui::RichText::new(if rp { "▼ Raw Prompt JSON" } else { "▶ Raw Prompt JSON" })
-                .color(DIM_COLOR)
-                .size(BODY_FONT),
-        )
-        .clicked()
     {
-        rp = !rp;
-    }
-    if rp {
         let json_str = serde_json::to_string_pretty(&meta.prompt_json).unwrap_or_default();
-        egui::ScrollArea::vertical()
-            .id_salt("raw_prompt_json")
-            .max_height(300.0)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(&json_str)
-                        .color(JSON_COLOR)
-                        .size(11.0)
-                        .monospace(),
-                );
-            });
+        draw_collapsible_json_section(ui, ctx, "Raw Prompt JSON", &json_str, &mut rp);
     }
 
     if let Some(ref wf) = meta.workflow_json {
         ui.add_space(4.0);
-        if ui
-            .selectable_label(
-                rw,
-                egui::RichText::new(if rw { "▼ Raw Workflow JSON" } else { "▶ Raw Workflow JSON" })
-                    .color(DIM_COLOR)
-                    .size(BODY_FONT),
-            )
-            .clicked()
-        {
-            rw = !rw;
-        }
-        if rw {
-            let json_str = serde_json::to_string_pretty(wf).unwrap_or_default();
-            egui::ScrollArea::vertical()
-                .id_salt("raw_workflow_json")
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(&json_str)
-                            .color(JSON_COLOR)
-                            .size(11.0)
-                            .monospace(),
-                    );
-                });
-        }
+        let json_str = serde_json::to_string_pretty(wf).unwrap_or_default();
+        draw_collapsible_json_section(ui, ctx, "Raw Workflow JSON", &json_str, &mut rw);
     }
 
     (rp, rw)
@@ -511,6 +467,40 @@ fn draw_key_value_wrapped(ui: &mut egui::Ui, key: &str, val: &str) {
         },
     );
     ui.label(job);
+}
+
+/// 折りたたみ可能な JSON セクションを描画する。
+fn draw_collapsible_json_section(
+    ui: &mut egui::Ui,
+    _ctx: &egui::Context,
+    label: &str,
+    json: &str,
+    open: &mut bool,
+) {
+    if ui
+        .selectable_label(
+            *open,
+            egui::RichText::new(if *open { format!("▼ {label}") } else { format!("▶ {label}") })
+                .color(DIM_COLOR)
+                .size(BODY_FONT),
+        )
+        .clicked()
+    {
+        *open = !*open;
+    }
+    if *open {
+        egui::ScrollArea::vertical()
+            .id_salt(label)
+            .max_height(300.0)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(json)
+                        .color(JSON_COLOR)
+                        .size(11.0)
+                        .monospace(),
+                );
+            });
+    }
 }
 
 /// テキストセクション (ラベル + コピーボタン + テキスト) を描画する。
