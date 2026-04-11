@@ -235,21 +235,26 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 /// items の中で current から delta 分（±1）移動した「表示可能」アイテム
 /// (画像 + 動画 + ZIP 画像 + ZIP セパレータ) の item index を返す。
 /// 境界では None を返す（ラップアラウンドなし）。
-pub fn adjacent_navigable_idx(items: &[GridItem], current: usize, delta: i32) -> Option<usize> {
-    // タスク 3: ZipImage と ZipSeparator もフルスクリーンで切り替え可能にする
-    // (セパレータは "章タイトル" 画面として表示される)
-    let nav_indices: Vec<usize> = items
+/// `visible_indices` (フィルタ適用済み) の中からナビゲーション可能な
+/// 前後のアイテムインデックスを返す。
+pub fn adjacent_navigable_idx(
+    items: &[GridItem],
+    visible_indices: &[usize],
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
+    // visible_indices の中でナビゲーション可能なもの (画像・動画・セパレータ)
+    let nav_indices: Vec<usize> = visible_indices
         .iter()
-        .enumerate()
-        .filter_map(|(i, item)| {
+        .copied()
+        .filter(|&i| {
             matches!(
-                item,
-                GridItem::Image(_)
-                    | GridItem::Video(_)
-                    | GridItem::ZipImage { .. }
-                    | GridItem::ZipSeparator { .. }
+                items.get(i),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::Video(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::ZipSeparator { .. })
             )
-            .then_some(i)
         })
         .collect();
     let pos = nav_indices.iter().position(|&i| i == current)?;

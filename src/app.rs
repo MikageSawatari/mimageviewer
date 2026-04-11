@@ -211,6 +211,31 @@ pub struct App {
     // ── キャッシュ生成設定ポップアップ (段階 C) ──────────────────
     pub(crate) show_cache_policy_dialog: bool,
 
+    // ── 複数選択 ──────────────────────────────────────────────────
+    /// チェック済みアイテムの集合 (スペースキーで追加/削除)
+    pub(crate) checked: std::collections::HashSet<usize>,
+
+    // ── 右クリックコンテキストメニュー ─────────────────────────
+    /// コンテキストメニューの対象アイテムインデックス
+    pub(crate) context_menu_idx: Option<usize>,
+    /// コンテキストメニューの表示座標 (右クリック時に記録)
+    pub(crate) context_menu_pos: egui::Pos2,
+
+    // ── 削除確認ダイアログ ───────────────────────────────────────
+    pub(crate) show_delete_confirm: bool,
+    /// 削除対象のファイルパスリスト
+    pub(crate) delete_targets: Vec<(usize, PathBuf)>,
+
+    // ── 回転リセット確認ダイアログ ─────────────────────────────
+    pub(crate) show_rotation_reset_confirm: bool,
+
+    // ── スライドショー設定ポップアップ ─────────────────────────
+    pub(crate) show_slideshow_settings: bool,
+
+    // ── EXIF 表示設定ポップアップ ──────────────────────────────
+    pub(crate) show_exif_settings: bool,
+    pub(crate) exif_add_tag_input: String,
+
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     pub(crate) show_cache_manager: bool,
     /// キャッシュ管理の「◯日以上古い」入力値
@@ -229,6 +254,20 @@ pub struct App {
     // ── キャッシュ作成ポップアップ ───────────────────────────────
     pub(crate) cc: CacheCreatorState,
 
+    // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
+    /// フルスクリーンでメタデータパネルを表示するか
+    pub(crate) show_metadata_panel: bool,
+    /// AI メタデータキャッシュ: ファイルパス → パース結果 (None = メタデータなし)
+    pub(crate) metadata_cache: std::collections::HashMap<PathBuf, Option<crate::png_metadata::AiMetadata>>,
+    /// EXIF キャッシュ: ファイルパス → パース結果 (None = EXIF なし)
+    pub(crate) exif_cache: std::collections::HashMap<PathBuf, Option<crate::exif_reader::ExifInfo>>,
+    /// ComfyUI Raw Prompt JSON の展開状態
+    pub(crate) metadata_show_raw_prompt: bool,
+    /// ComfyUI Raw Workflow JSON の展開状態
+    pub(crate) metadata_show_raw_workflow: bool,
+    /// EXIF セクションの展開状態
+    pub(crate) exif_sections_open: std::collections::HashMap<String, bool>,
+
     // ── アドレスバーフォーカス管理 ───────────────────────────────
     /// true のときアドレスバーが入力中 → キーショートカットを無効化
     pub(crate) address_has_focus: bool,
@@ -236,6 +275,33 @@ pub struct App {
     // ── フォルダ履歴（スクロール位置・選択状態の復元用）────────────
     /// フォルダパス → (scroll_offset_y, selected_idx)
     pub(crate) folder_history: std::collections::HashMap<PathBuf, (f32, Option<usize>)>,
+
+    // ── メタデータ検索 ────────────────────────────────────────────
+    /// 検索バー表示フラグ
+    pub(crate) show_search_bar: bool,
+    /// 検索キーワード入力
+    pub(crate) search_query: String,
+    /// 検索結果フィルタ: Some = フィルタ中（表示するアイテムの元インデックス集合）
+    pub(crate) search_filter: Option<std::collections::HashSet<usize>>,
+    /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
+    /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
+    pub(crate) visible_indices: Vec<usize>,
+    /// 検索バーにフォーカスを当てるフラグ（1フレームだけ true）
+    pub(crate) search_focus_request: bool,
+    /// 検索バーの TextEdit がフォーカスを持っているか（毎フレーム更新）
+    pub(crate) search_has_focus: bool,
+
+    // ── 回転 DB ──────────────────────────────────────────────────
+    /// 回転情報 DB (全体で 1 ファイル)
+    pub(crate) rotation_db: Option<crate::rotation_db::RotationDb>,
+    /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
+    pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+
+    // ── スライドショー ────────────────────────────────────────────
+    /// スライドショー再生中フラグ
+    pub(crate) slideshow_playing: bool,
+    /// 次の画像に切り替える時刻
+    pub(crate) slideshow_next_at: std::time::Instant,
 
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
@@ -289,6 +355,15 @@ impl Default for App {
             pref_manual_threads: 4,
             show_toolbar_settings: false,
             show_cache_policy_dialog: false,
+            checked: std::collections::HashSet::new(),
+            context_menu_idx: None,
+            context_menu_pos: egui::Pos2::ZERO,
+            show_delete_confirm: false,
+            delete_targets: Vec::new(),
+            show_rotation_reset_confirm: false,
+            show_slideshow_settings: false,
+            show_exif_settings: false,
+            exif_add_tag_input: String::new(),
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,
@@ -303,8 +378,24 @@ impl Default for App {
                 ..Default::default()
             },
             cc: CacheCreatorState::default(),
+            show_metadata_panel: false,
+            metadata_cache: std::collections::HashMap::new(),
+            exif_cache: std::collections::HashMap::new(),
+            metadata_show_raw_prompt: false,
+            metadata_show_raw_workflow: false,
+            exif_sections_open: std::collections::HashMap::new(),
             address_has_focus: false,
             folder_history: std::collections::HashMap::new(),
+            show_search_bar: false,
+            search_query: String::new(),
+            search_filter: None,
+            visible_indices: Vec::new(),
+            search_focus_request: false,
+            search_has_focus: false,
+            rotation_db: crate::rotation_db::RotationDb::open().ok(),
+            rotation_cache: std::collections::HashMap::new(),
+            slideshow_playing: false,
+            slideshow_next_at: std::time::Instant::now(),
             initialized: false,
         }
     }
@@ -517,6 +608,14 @@ impl App {
             .collect();
         self.requested.clear();
         self.keep_range = (0, 0);
+        self.rebuild_visible_indices();
+        self.metadata_cache.clear();
+        self.exif_cache.clear();
+        self.checked.clear();
+        self.rotation_cache.clear();
+        self.search_filter = None;
+        self.search_query.clear();
+        // visible_indices はアイテム設定後 (下の行) に再計算される
 
         // ── カタログを開く + cache_map ロード + 削除掃除 ──
         let cache_dir = crate::catalog::default_cache_dir();
@@ -777,19 +876,36 @@ impl App {
 
         let rows_per_page = (viewport_h / cell_h).ceil() as usize;
         let items_per_page = (rows_per_page * cols).max(1);
-        let cur_first = (self.scroll_offset_y / cell_h) as usize * cols;
+        // visible_indices 上の位置で keep_range を計算し、raw index に変換する。
+        // これにより検索フィルタ中でも正しいサムネイルがロードされる。
+        let vis_count = self.visible_indices.len();
+        let vis_first = (self.scroll_offset_y / cell_h) as usize * cols;
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
 
-        let mut keep_start = cur_first.saturating_sub(prev_pages * items_per_page);
-        let mut keep_end = cur_first
+        let vis_keep_start = vis_first.saturating_sub(prev_pages * items_per_page);
+        let vis_keep_end = vis_first
             .saturating_add((1 + next_pages) * items_per_page)
+            .min(vis_count);
+
+        // visible_indices 経由で raw index の範囲を求める
+        let mut keep_start = self
+            .visible_indices
+            .get(vis_keep_start)
+            .copied()
+            .unwrap_or(0);
+        let mut keep_end = self
+            .visible_indices
+            .get(vis_keep_end.saturating_sub(1))
+            .copied()
+            .map(|i| i + 1)
+            .unwrap_or(total)
             .min(total);
 
         // ── 段階 D: VRAM 安全ネット ──────────────────────────────────
         // display_px から 1 枚あたりの推定バイト数を算出し、cap を超えそうなら
-        // keep_range を cur_first 中心に縮小する (前方 2/3 優先、後方 1/3)
+        // keep_range を vis_first 中心に縮小する (前方 2/3 優先、後方 1/3)
         // 上限は "プライマリ GPU VRAM × 設定 %" (0 で無制限)
         let cap_percent = self.settings.thumb_vram_cap_percent;
         if cap_percent > 0 {
@@ -804,8 +920,8 @@ impl App {
                     // 上限超過: keep_range を縮小
                     let half_back = max_items / 3;
                     let half_forward = max_items - half_back;
-                    let new_start = cur_first.saturating_sub(half_back);
-                    let new_end = cur_first.saturating_add(half_forward).min(total);
+                    let new_start = vis_first.saturating_sub(half_back);
+                    let new_end = vis_first.saturating_add(half_forward).min(total);
                     crate::logger::log(format!(
                         "  VRAM cap hit: desired={desired} max_items={max_items} \
                          (display_px={current_display_px} est/thumb={} MB cap={} MB @ {}%)",
@@ -1030,15 +1146,15 @@ impl App {
         if self.fullscreen_idx.is_some() {
             return None;
         }
-        // アドレスバー入力中はすべてのショートカットを無効化
-        if self.address_has_focus {
+        // アドレスバーまたは検索バーの入力欄にフォーカス中はショートカットを無効化
+        if self.address_has_focus || self.search_has_focus {
             return None;
         }
 
         let cols = self.settings.grid_cols.max(1);
-        let n = self.items.len();
 
-        let (right, left, down, up, enter, backspace, ctrl_up, ctrl_down) = ctx.input(|i| {
+        let (right, left, down, up, enter, backspace, ctrl_up, ctrl_down,
+             home, end, page_up, page_down, space, key_r, key_l) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -1048,27 +1164,85 @@ impl App {
                 i.key_pressed(egui::Key::Backspace),
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
                 i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+                i.key_pressed(egui::Key::PageUp),
+                i.key_pressed(egui::Key::PageDown),
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::L),
             )
         });
 
-        if n > 0 {
-            let sel = self.selected.unwrap_or(0);
-            let new_sel = if right {
-                Some((sel + 1).min(n - 1))
+        let vi = &self.visible_indices;
+        let vi_len = vi.len();
+
+        if vi_len > 0 {
+            let sel = self.selected.unwrap_or_else(|| vi.first().copied().unwrap_or(0));
+            // visible_indices 内での現在位置
+            let vis_pos = vi.iter().position(|&i| i == sel).unwrap_or(0);
+            let cell_h = self.last_cell_h.max(1.0);
+            let visible_rows = (self.last_viewport_h / cell_h).floor() as usize;
+            let page_items = visible_rows.max(1) * cols;
+
+            // visible_indices 上で移動し、raw index に変換
+            let new_vis_pos = if right {
+                Some((vis_pos + 1).min(vi_len - 1))
             } else if left {
-                Some(sel.saturating_sub(1))
+                Some(vis_pos.saturating_sub(1))
             } else if down {
-                Some((sel + cols).min(n - 1))
+                Some((vis_pos + cols).min(vi_len - 1))
             } else if up {
-                Some(sel.saturating_sub(cols))
+                Some(vis_pos.saturating_sub(cols))
+            } else if home {
+                Some(0)
+            } else if end {
+                Some(vi_len - 1)
+            } else if page_down {
+                Some((vis_pos + page_items).min(vi_len - 1))
+            } else if page_up {
+                Some(vis_pos.saturating_sub(page_items))
             } else {
                 None
             };
+
+            let new_sel = new_vis_pos.and_then(|vp| vi.get(vp).copied());
 
             if let Some(s) = new_sel {
                 self.selected = Some(s);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
+            }
+
+            // スペースキー: チェック ON/OFF
+            if space {
+                if let Some(idx) = self.selected {
+                    if self.checked.contains(&idx) {
+                        self.checked.remove(&idx);
+                    } else {
+                        // フォルダ・セパレータはチェック対象外
+                        match self.items.get(idx) {
+                            Some(GridItem::Image(_))
+                            | Some(GridItem::Video(_))
+                            | Some(GridItem::ZipImage { .. }) => {
+                                self.checked.insert(idx);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // L/R: 選択画像を回転
+            if key_r {
+                if let Some(idx) = self.selected {
+                    self.rotate_image_cw(idx);
+                }
+            }
+            if key_l {
+                if let Some(idx) = self.selected {
+                    self.rotate_image_ccw(idx);
+                }
             }
 
             if enter {
@@ -1160,7 +1334,13 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        let row = sel / cols;
+        // フィルタ中は visible_indices 内での位置から行を計算する
+        let vis_pos = self
+            .visible_indices
+            .iter()
+            .position(|&i| i == sel)
+            .unwrap_or(sel);
+        let row = vis_pos / cols;
         let row_top = row as f32 * cell_h;
         let row_bottom = row_top + cell_h;
         let vp_top = self.scroll_offset_y;
@@ -1210,6 +1390,179 @@ impl App {
                 ));
             }
             _ => {}
+        }
+
+        // AI メタデータ読み込み (PNG ヘッダのみ読むので高速・同期)
+        self.ensure_metadata_loaded(idx);
+    }
+
+    /// 指定 idx の AI メタデータと EXIF がキャッシュに無ければ読み込む。
+    fn ensure_metadata_loaded(&mut self, idx: usize) {
+        let path = match self.items.get(idx) {
+            Some(GridItem::Image(p)) => p.clone(),
+            Some(GridItem::ZipImage { zip_path, .. }) => zip_path.clone(),
+            _ => return,
+        };
+
+        // AI メタデータ (PNG のみ)
+        if !self.metadata_cache.contains_key(&path) {
+            let meta = match self.items.get(idx) {
+                Some(GridItem::Image(p)) => crate::png_metadata::extract_metadata(p),
+                Some(GridItem::ZipImage { zip_path, entry_name }) => {
+                    if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                        crate::png_metadata::extract_metadata_from_bytes(&bytes)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.metadata_cache.insert(path.clone(), meta);
+        }
+
+        // EXIF (JPEG, PNG, TIFF 等)
+        if !self.exif_cache.contains_key(&path) {
+            let hidden = &self.settings.exif_hidden_tags;
+            let exif = match self.items.get(idx) {
+                Some(GridItem::Image(p)) => crate::exif_reader::read_exif(p, hidden),
+                Some(GridItem::ZipImage { zip_path, entry_name }) => {
+                    if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                        crate::exif_reader::read_exif_from_bytes(&bytes, hidden)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.exif_cache.insert(path, exif);
+        }
+    }
+
+    /// `search_filter` に基づいて `visible_indices` を再計算する。
+    pub(crate) fn rebuild_visible_indices(&mut self) {
+        self.visible_indices = match &self.search_filter {
+            Some(filter) => (0..self.items.len())
+                .filter(|i| filter.contains(i))
+                .collect(),
+            None => (0..self.items.len()).collect(),
+        };
+    }
+
+    /// メタデータキーワード検索を実行する。
+    /// フォルダ内の全 PNG 画像の tEXt チャンクを読み、
+    /// キーワード（大文字小文字無視）にマッチするアイテムのみをフィルタ表示する。
+    pub(crate) fn execute_search(&mut self) {
+        let query = self.search_query.trim().to_lowercase();
+        if query.is_empty() {
+            self.search_filter = None;
+            self.rebuild_visible_indices();
+            return;
+        }
+
+        let mut matches = std::collections::HashSet::new();
+        for (idx, item) in self.items.iter().enumerate() {
+            let path = match item {
+                GridItem::Image(p) => p.clone(),
+                _ => {
+                    // フォルダ・動画・ZIPセパレータは常に表示
+                    matches.insert(idx);
+                    continue;
+                }
+            };
+
+            // PNG のみメタデータ検索
+            let is_png = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("png"))
+                .unwrap_or(false);
+
+            if !is_png {
+                // PNG 以外は名前でマッチ
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if name.contains(&query) {
+                    matches.insert(idx);
+                }
+                continue;
+            }
+
+            // PNG: tEXt チャンクからメタデータを読んで検索
+            let chunks = crate::png_metadata::read_png_text_chunks(&path).unwrap_or_default();
+            let mut found = false;
+            for (_key, value) in &chunks {
+                if value.to_lowercase().contains(&query) {
+                    found = true;
+                    break;
+                }
+            }
+            // ファイル名でもマッチ
+            if !found {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if name.contains(&query) {
+                    found = true;
+                }
+            }
+            if found {
+                matches.insert(idx);
+            }
+        }
+
+        self.search_filter = Some(matches);
+        self.rebuild_visible_indices();
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+    }
+
+    /// 指定 idx の回転角度を取得する（キャッシュ + DB）。
+    pub(crate) fn get_rotation(&mut self, idx: usize) -> crate::rotation_db::Rotation {
+        if let Some(&rot) = self.rotation_cache.get(&idx) {
+            return rot;
+        }
+        let path = match self.items.get(idx) {
+            Some(GridItem::Image(p)) => p.clone(),
+            Some(GridItem::Video(p)) => p.clone(),
+            _ => return crate::rotation_db::Rotation::None,
+        };
+        let rot = self
+            .rotation_db
+            .as_ref()
+            .and_then(|db| db.get(&path))
+            .unwrap_or(crate::rotation_db::Rotation::None);
+        self.rotation_cache.insert(idx, rot);
+        rot
+    }
+
+    /// 指定 idx の画像を時計回りに 90° 回転する。
+    pub(crate) fn rotate_image_cw(&mut self, idx: usize) {
+        let current = self.get_rotation(idx);
+        let new_rot = current.rotate_cw();
+        self.apply_rotation(idx, new_rot);
+    }
+
+    /// 指定 idx の画像を反時計回りに 90° 回転する。
+    pub(crate) fn rotate_image_ccw(&mut self, idx: usize) {
+        let current = self.get_rotation(idx);
+        let new_rot = current.rotate_ccw();
+        self.apply_rotation(idx, new_rot);
+    }
+
+    fn apply_rotation(&mut self, idx: usize, rot: crate::rotation_db::Rotation) {
+        let path = match self.items.get(idx) {
+            Some(GridItem::Image(p)) => p.clone(),
+            Some(GridItem::Video(p)) => p.clone(),
+            _ => return,
+        };
+        self.rotation_cache.insert(idx, rot);
+        if let Some(ref db) = self.rotation_db {
+            let _ = db.set(&path, rot);
         }
     }
 
@@ -1398,6 +1751,7 @@ impl App {
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
     pub(crate) fn close_fullscreen(&mut self) {
         self.fullscreen_idx = None;
+        self.slideshow_playing = false;
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -1825,6 +2179,11 @@ impl eframe::App for App {
         self.show_toolbar_settings_dialog(ctx);
         self.show_cache_policy_dialog(ctx);
         self.show_stats_dialog_window(ctx);
+        self.show_exif_settings_dialog(ctx);
+        self.show_slideshow_settings_dialog(ctx);
+        self.show_rotation_reset_confirm_dialog(ctx);
+        let context_nav = self.show_context_menu(ctx);
+        self.show_delete_confirm_dialog(ctx);
 
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);
@@ -1832,11 +2191,26 @@ impl eframe::App for App {
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
 
+        // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
+        if !self.address_has_focus && self.fullscreen_idx.is_none() {
+            let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
+            if ctrl_f {
+                self.show_search_bar = true;
+                self.search_focus_request = true;
+            }
+        }
+
+        // ── 検索バー ─────────────────────────────────────────────────
+        self.render_search_bar(ctx);
+
         // ── サムネイルグリッド ────────────────────────────────────────
         let grid_nav = self.render_grid(ctx);
 
         // ── 選択情報オーバーレイ ─────────────────────────────────────
         self.render_selection_info(ctx);
+
+        // ── DEL キー ──────────────────────────────────────────────────
+        self.handle_delete_key(ctx);
 
         // ── ナビゲーション集約 ───────────────────────────────────────
         let navigate = fav_nav
@@ -1844,6 +2218,7 @@ impl eframe::App for App {
             .or(keyboard_nav)
             .or(address_nav)
             .or(open_folder_nav)
+            .or(context_nav)
             .or(grid_nav);
         if let Some(p) = navigate {
             self.load_folder(p);
@@ -1892,24 +2267,103 @@ fn make_load_request(
     }
 }
 
-/// サムネイルテクスチャをアスペクト保持で中央配置して描画する。
-fn draw_thumb_texture(painter: &egui::Painter, inner: egui::Rect, tex: &egui::TextureHandle) {
+/// サムネイルテクスチャをアスペクト保持で中央配置して描画する（回転対応）。
+fn draw_thumb_texture(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    tex: &egui::TextureHandle,
+    rotation: crate::rotation_db::Rotation,
+) {
     let tex_size = tex.size_vec2();
-    let scale = (inner.width() / tex_size.x).min(inner.height() / tex_size.y);
-    let img_rect = egui::Rect::from_center_size(inner.center(), tex_size * scale);
-    painter.image(
-        tex.id(),
-        img_rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    // 90°/270° 回転時は幅と高さが入れ替わる
+    let display_size = match rotation {
+        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+            egui::vec2(tex_size.y, tex_size.x)
+        }
+        _ => tex_size,
+    };
+    let scale = (inner.width() / display_size.x).min(inner.height() / display_size.y);
+    let img_rect = egui::Rect::from_center_size(inner.center(), display_size * scale);
+
+    if rotation.is_none() {
+        painter.image(
+            tex.id(),
+            img_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        // 回転したテクスチャを Mesh で描画
+        draw_rotated_image(painter, tex.id(), img_rect, rotation);
+    }
+}
+
+/// 回転した画像を Mesh で描画する。
+pub(crate) fn draw_rotated_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation: crate::rotation_db::Rotation,
+) {
+    // UV 座標を回転に合わせて変換
+    // 頂点順: 左上, 右上, 右下, 左下 (画面座標)
+    // UV は回転に応じて異なる頂点に割り当てる
+    let uvs = match rotation {
+        crate::rotation_db::Rotation::None => [
+            egui::pos2(0.0, 0.0), // 左上
+            egui::pos2(1.0, 0.0), // 右上
+            egui::pos2(1.0, 1.0), // 右下
+            egui::pos2(0.0, 1.0), // 左下
+        ],
+        crate::rotation_db::Rotation::Cw90 => [
+            egui::pos2(0.0, 1.0),
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 0.0),
+            egui::pos2(1.0, 1.0),
+        ],
+        crate::rotation_db::Rotation::Cw180 => [
+            egui::pos2(1.0, 1.0),
+            egui::pos2(0.0, 1.0),
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 0.0),
+        ],
+        crate::rotation_db::Rotation::Cw270 => [
+            egui::pos2(1.0, 0.0),
+            egui::pos2(1.0, 1.0),
+            egui::pos2(0.0, 1.0),
+            egui::pos2(0.0, 0.0),
+        ],
+    };
+
+    let positions = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    for i in 0..4 {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: positions[i],
+            uv: uvs[i],
+            color: egui::Color32::WHITE,
+        });
+    }
+    mesh.indices = vec![0, 1, 2, 0, 2, 3];
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// 画像系アイテム (Image / ZipImage) のサムネイル状態に応じた描画。
-fn draw_thumb(painter: &egui::Painter, inner: egui::Rect, thumb: &ThumbnailState) {
+fn draw_thumb(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    thumb: &ThumbnailState,
+    rotation: crate::rotation_db::Rotation,
+) {
     match thumb {
         ThumbnailState::Loaded { tex, .. } => {
-            draw_thumb_texture(painter, inner, tex);
+            draw_thumb_texture(painter, inner, tex, rotation);
         }
         ThumbnailState::Pending | ThumbnailState::Evicted => {
             painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
@@ -1938,8 +2392,10 @@ pub(crate) fn draw_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
     is_selected: bool,
+    is_checked: bool,
     item: &GridItem,
     thumb: &ThumbnailState,
+    rotation: crate::rotation_db::Rotation,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -1975,12 +2431,12 @@ pub(crate) fn draw_cell(
             );
         }
         GridItem::Image(_) => {
-            draw_thumb(painter, inner, thumb);
+            draw_thumb(painter, inner, thumb, rotation);
         }
         GridItem::Video(path) => {
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
-                    draw_thumb_texture(painter, inner, tex);
+                    draw_thumb_texture(painter, inner, tex, rotation);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted => {
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
@@ -2010,7 +2466,7 @@ pub(crate) fn draw_cell(
             );
         }
         GridItem::ZipImage { .. } => {
-            draw_thumb(painter, inner, thumb);
+            draw_thumb(painter, inner, thumb, rotation);
         }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
@@ -2052,6 +2508,34 @@ pub(crate) fn draw_cell(
         egui::Stroke::new(1.0, egui::Color32::from_gray(200))
     };
     painter.rect_stroke(rect, 2.0, border, egui::StrokeKind::Middle);
+
+    // チェックマークオーバーレイ
+    if is_checked {
+        let check_r = 12.0;
+        let check_center = egui::pos2(rect.max.x - check_r - 4.0, rect.min.y + check_r + 4.0);
+        painter.circle_filled(
+            check_center,
+            check_r,
+            egui::Color32::from_rgb(40, 140, 40),
+        );
+        // チェックマーク (✓)
+        let s = check_r * 0.55;
+        let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
+        painter.line_segment(
+            [
+                egui::pos2(check_center.x - s * 0.6, check_center.y),
+                egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(check_center.x - s * 0.1, check_center.y + s * 0.5),
+                egui::pos2(check_center.x + s * 0.7, check_center.y - s * 0.5),
+            ],
+            stroke,
+        );
+    }
 }
 
 /// サムネイル画質プレビュー用: 実グリッドと同じ `cell_w × cell_h` のセルを描画する。

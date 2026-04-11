@@ -37,6 +37,11 @@ impl App {
                         self.show_open_folder_dialog = true;
                         ui.close();
                     }
+                    if ui.button("メタデータ検索… (Ctrl+F)").clicked() {
+                        self.show_search_bar = true;
+                        self.search_focus_request = true;
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("終了").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -161,6 +166,20 @@ impl App {
                         self.show_toolbar_settings = true;
                         ui.close();
                     }
+                    if ui.button("EXIF 表示設定…").clicked() {
+                        self.show_exif_settings = true;
+                        ui.close();
+                    }
+                    if ui.button("スライドショー…").clicked() {
+                        self.show_slideshow_settings = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("回転情報をリセット…").clicked() {
+                        self.show_rotation_reset_confirm = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("環境設定…").clicked() {
                         // ダイアログを開くとき現在値で初期化
                         self.pref_manual_threads = match &self.settings.parallelism {
@@ -412,6 +431,87 @@ impl App {
             .inner
     }
 
+    // ── 検索バー ─────────────────────────────────────────────────────
+
+    /// メタデータ検索バーを描画する。
+    pub(crate) fn render_search_bar(&mut self, ctx: &egui::Context) {
+        if !self.show_search_bar {
+            return;
+        }
+
+        egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("検索:");
+                let response = ui.add_sized(
+                    [240.0, 18.0],
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("プロンプト・ファイル名…"),
+                );
+
+                // フォーカスリクエスト
+                if self.search_focus_request {
+                    self.search_focus_request = false;
+                    response.request_focus();
+                }
+
+                // フォーカス状態を追跡
+                self.search_has_focus = response.has_focus();
+
+                // Enter で検索実行
+                // TextEdit は Enter でフォーカスを失うので lost_focus() で検知
+                if response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    self.execute_search();
+                    // フォーカスを外してカーソルキーでグリッド操作できるようにする
+                    response.surrender_focus();
+                    self.search_has_focus = false;
+                }
+
+                // × ボタン
+                if ui.small_button("×").clicked() {
+                    self.show_search_bar = false;
+                    self.search_query.clear();
+                    self.search_filter = None;
+                    self.search_has_focus = false;
+                    self.rebuild_visible_indices();
+                }
+
+                // Esc で検索解除（フォーカスの有無に関わらず、検索バー表示中なら有効）
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.show_search_bar = false;
+                    self.search_query.clear();
+                    self.search_filter = None;
+                    self.search_has_focus = false;
+                    self.rebuild_visible_indices();
+                }
+
+                // マッチ件数を同じ行に表示
+                if let Some(ref filter) = self.search_filter {
+                    let image_count = filter
+                        .iter()
+                        .filter(|&&i| {
+                            matches!(
+                                self.items.get(i),
+                                Some(crate::grid_item::GridItem::Image(_))
+                            )
+                        })
+                        .count();
+                    let total_images = self
+                        .items
+                        .iter()
+                        .filter(|it| matches!(it, crate::grid_item::GridItem::Image(_)))
+                        .count();
+                    ui.label(
+                        egui::RichText::new(format!("{image_count}/{total_images} 件"))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                }
+            });
+        });
+    }
+
     // ── サムネイルグリッド ───────────────────────────────────────────
 
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
@@ -424,6 +524,13 @@ impl App {
                 if self.items.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.label("フォルダを入力して Enter キーを押してください");
+                    });
+                    return None;
+                }
+
+                if self.visible_indices.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("検索結果なし");
                     });
                     return None;
                 }
@@ -448,22 +555,32 @@ impl App {
                     self.apply_scroll_to_selected(cols, cell_h);
                 }
 
-                let total_rows = self.items.len().div_ceil(cols);
-                let total_h = total_rows as f32 * cell_h;
+                let total_rows = self.visible_indices.len().div_ceil(cols);
+                let natural_h = total_rows as f32 * cell_h;
 
-                // スクロール上限（行境界にスナップ済み）
+                // egui 内部の max offset = total_h - viewport_h が行境界に揃うよう、
+                // total_h を拡張する。これにより egui と自前の行スナップが一致し振動を防ぐ。
+                // 拡張量は最大 cell_h 未満（端数の補正のみ）。
+                let total_h = if natural_h <= self.last_viewport_h {
+                    natural_h
+                } else {
+                    let raw_max = natural_h - self.last_viewport_h;
+                    let snapped_max = (raw_max / cell_h).ceil() * cell_h;
+                    snapped_max + self.last_viewport_h
+                };
+
                 let max_offset = if total_h <= self.last_viewport_h {
                     0.0
                 } else {
-                    (((total_h - self.last_viewport_h) / cell_h).ceil() * cell_h)
-                        .min(total_h)
+                    total_h - self.last_viewport_h
                 };
-                self.scroll_offset_y = self.scroll_offset_y.min(max_offset);
+                self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
 
                 let mut nav: Option<PathBuf> = None;
 
-                // egui にスクロールを管理させず、自前の offset を毎フレーム注入する
-                egui::ScrollArea::vertical()
+                // egui にスクロールを管理させず、自前の offset を毎フレーム注入する。
+                // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
+                let scroll_output = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(self.scroll_offset_y)
                     .show_viewport(ui, |ui, viewport| {
@@ -480,15 +597,21 @@ impl App {
                             ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
 
                         // Phase 2b ワーカーへ現在の可視先頭アイテムを通知
+                        let vis_first_idx = self
+                            .visible_indices
+                            .get(first_row * cols)
+                            .copied()
+                            .unwrap_or(0);
                         self.scroll_hint
-                            .store(first_row * cols, Ordering::Relaxed);
+                            .store(vis_first_idx, Ordering::Relaxed);
 
                         for row in first_row..last_row {
                             for col in 0..cols {
-                                let idx = row * cols + col;
-                                if idx >= self.items.len() {
+                                let vis_pos = row * cols + col;
+                                if vis_pos >= self.visible_indices.len() {
                                     break;
                                 }
+                                let idx = self.visible_indices[vis_pos];
 
                                 let cell_rect = egui::Rect::from_min_size(
                                     content_rect.min
@@ -525,13 +648,25 @@ impl App {
                                         None => {}
                                     }
                                 }
+                                // 右クリック → コンテキストメニュー
+                                if response.secondary_clicked() {
+                                    self.selected = Some(idx);
+                                    self.update_last_selected_image();
+                                    self.context_menu_idx = Some(idx);
+                                    self.context_menu_pos = ctx.input(|i| {
+                                        i.pointer.interact_pos().unwrap_or_default()
+                                    });
+                                }
 
+                                let rot = self.get_rotation(idx);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
                                     self.selected == Some(idx),
+                                    self.checked.contains(&idx),
                                     &self.items[idx],
                                     &self.thumbnails[idx],
+                                    rot,
                                 );
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
@@ -541,6 +676,15 @@ impl App {
                             }
                         }
                     });
+
+                // スクロールバードラッグによるオフセット変化を読み戻す。
+                // egui が内部で管理するオフセットと自前オフセットを同期させる。
+                // ただし行スナップによる端数差分で毎フレーム振動するのを防ぐため、
+                // 1 行分 (cell_h) 以上ずれた場合のみ同期する。
+                let egui_offset = scroll_output.state.offset.y;
+                if (egui_offset - self.scroll_offset_y).abs() > cell_h * 0.5 {
+                    self.scroll_offset_y = (egui_offset / cell_h).round() * cell_h;
+                }
 
                 nav
             })
@@ -594,7 +738,7 @@ impl App {
         let area_pos = cell_rect.left_bottom() + egui::vec2(0.0, 4.0);
 
         egui::Area::new("selection_info".into())
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .fixed_pos(area_pos)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())

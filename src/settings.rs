@@ -315,6 +315,16 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
 
+    // ── EXIF 表示フィルタ ──────────────────────────────────────
+    /// 非表示にする EXIF タグ名のリスト
+    #[serde(default = "default_exif_hidden_tags")]
+    pub exif_hidden_tags: Vec<String>,
+
+    // ── スライドショー ──────────────────────────────────────────
+    /// スライドショーの切り替え間隔（秒）
+    #[serde(default = "default_slideshow_interval")]
+    pub slideshow_interval_secs: f32,
+
     // ── ツールバー項目フィルタ（Vec が空 = セクション非表示）──
     /// ツールバーに表示する列数の選択肢
     #[serde(default = "default_toolbar_cols_items")]
@@ -339,6 +349,55 @@ fn default_true() -> bool { true }
 fn default_thumb_prev_pages() -> u32 { 2 }
 fn default_thumb_next_pages() -> u32 { 4 }
 fn default_thumb_vram_cap_percent() -> u32 { 50 }
+pub fn default_exif_hidden_tags() -> Vec<String> {
+    [
+        // バイナリ / 巨大データ
+        "MakerNote",
+        "UserComment",
+        "PrintImageMatching",
+        // 空になりがちなフィールド
+        "ImageDescription",
+        "Artist",
+        "Copyright",
+        // 内部フォーマット情報
+        "ComponentsConfiguration",
+        "FlashpixVersion",
+        "ExifVersion",
+        "InteroperabilityIndex",
+        "InteroperabilityVersion",
+        "FileSource",
+        "SceneType",
+        // サムネイル IFD 全体
+        "Compression",
+        "JPEGInterchangeFormat",
+        "JPEGInterchangeFormatLength",
+        // 解像度 (通常は関心なし)
+        "XResolution",
+        "YResolution",
+        "ResolutionUnit",
+        // その他の低価値タグ
+        "YCbCrPositioning",
+        "SensitivityType",
+        "OffsetTime",
+        "OffsetTimeOriginal",
+        "OffsetTimeDigitized",
+        "GPSVersionID",
+        "CustomRendered",
+        "DigitalZoomRatio",
+        "GainControl",
+        "Contrast",
+        "Saturation",
+        "Sharpness",
+        "Temperature",
+        "Pressure",
+        "WaterDepth",
+        "Acceleration",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_slideshow_interval() -> f32 { 3.0 }
 fn default_toolbar_cols_items() -> Vec<usize> { (2..=10).collect() }
 fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
 fn default_toolbar_sort_items() -> Vec<SortOrder> { SortOrder::all().to_vec() }
@@ -368,6 +427,8 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
             thumb_idle_upgrade: true,
+            exif_hidden_tags: default_exif_hidden_tags(),
+            slideshow_interval_secs: default_slideshow_interval(),
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
             toolbar_cols_items: default_toolbar_cols_items(),

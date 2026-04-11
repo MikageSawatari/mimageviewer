@@ -652,6 +652,31 @@
     </p>
   </section>
 
+  <section>
+    <h2>トラブルシューティング</h2>
+
+    <h3>NVIDIA GeForce オーバーレイが表示される</h3>
+    <p>
+      mImageViewer は GPU (wgpu/DirectX 12) を利用して描画を行います。
+      NVIDIA GeForce Experience または NVIDIA App がインストールされている環境では、
+      フルスクリーン表示時に NVIDIA のゲームオーバーレイが表示されることがあります。
+    </p>
+    <p>
+      これは NVIDIA がグラフィックス API を使用するアプリケーションをゲームとして
+      検出するためで、mImageViewer 側で回避することはできません。
+      以下の手順でオーバーレイを無効化してください：
+    </p>
+    <ol style="margin:0.5rem 0 1rem 1.5rem;">
+      <li><strong>NVIDIA App</strong> の場合：設定 → 全般 →「ゲーム内オーバーレイ」をオフ</li>
+      <li><strong>GeForce Experience</strong> の場合：設定 → 全般 →「ゲーム内のオーバーレイ」をオフ</li>
+    </ol>
+    <p style="font-size:0.88rem; color:#888;">
+      ※ オーバーレイを全体的に無効にしたくない場合は、NVIDIA Profile Inspector 等の
+      サードパーティツールでアプリケーション単位の設定を試みることもできますが、
+      現在のドライバではアプリ単位での確実な無効化方法は提供されていません。
+    </p>
+  </section>
+
 </main>
 
 <footer>

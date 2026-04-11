@@ -5,8 +5,8 @@ edition = "2024"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
-    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_Graphics_Gdi",
@@ -19,6 +19,10 @@ windows = { version = "0.61", features = [
 eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
+png = "0.18"
+flate2 = "1"
+kamadak-exif = "0.6"
+rexif = "0.7"
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"

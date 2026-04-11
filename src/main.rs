@@ -6,8 +6,11 @@ pub mod folder_tree;
 pub mod fs_animation;
 pub mod gpu_info;
 pub mod grid_item;
+pub mod exif_reader;
 pub mod logger;
 pub mod monitor;
+pub mod png_metadata;
+pub mod rotation_db;
 pub mod settings;
 pub mod stats;
 pub mod thumb_loader;
@@ -15,6 +18,7 @@ pub mod ui_dialogs;
 mod ui_fullscreen;
 pub mod ui_helpers;
 mod ui_main;
+mod ui_metadata_panel;
 pub mod video_thumb;
 pub mod wic_decoder;
 pub mod zip_loader;
@@ -22,14 +26,6 @@ pub mod zip_loader;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
-    #[cfg(windows)]
-    // NVIDIA オーバーレイが ALT+G を横取りするのを防ぐため先占する。
-    // RegisterHotKey が失敗しても（他プロセスが既に登録済み等）無視してよい。
-    unsafe {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT};
-        let _ = RegisterHotKey(None, 0xAF00, MOD_ALT, u32::from(b'G'));
-    }
-
     #[cfg(debug_assertions)]
     logger::init();
 

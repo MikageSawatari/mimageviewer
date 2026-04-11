@@ -10,10 +10,14 @@
 mod cache_creator;
 mod cache_manager;
 mod cache_policy;
+mod context_menu;
+mod exif_settings;
 mod fav_add;
 mod favorites_editor;
 mod open_folder;
 mod preferences;
+mod rotation_reset;
+mod slideshow_settings;
 mod stats_dialog;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
