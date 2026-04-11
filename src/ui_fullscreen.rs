@@ -183,25 +183,30 @@ impl App {
                         let full_rect = ui.max_rect();
 
                         // ── キー入力（ctx はこのビューポートのコンテキスト）
-                        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-                        let right = ctx.input(|i| {
+                        // ビューポートにフォーカスがない場合はキー入力を無視
+                        let has_focus = ctx
+                            .input(|i| i.viewport().focused)
+                            .unwrap_or(true);
+
+                        let esc = has_focus && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                        let right = has_focus && ctx.input(|i| {
                             i.key_pressed(egui::Key::ArrowRight)
                                 || i.key_pressed(egui::Key::ArrowDown)
                         });
-                        let left = ctx.input(|i| {
+                        let left = has_focus && ctx.input(|i| {
                             i.key_pressed(egui::Key::ArrowLeft)
                                 || i.key_pressed(egui::Key::ArrowUp)
                         });
-                        let ctrl_d = ctx.input(|i| {
+                        let ctrl_d = has_focus && ctx.input(|i| {
                             i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown)
                         });
-                        let ctrl_u = ctx
+                        let ctrl_u = has_focus && ctx
                             .input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
-                        let key_i = ctx.input(|i| i.key_pressed(egui::Key::I));
+                        let key_i = has_focus && ctx.input(|i| i.key_pressed(egui::Key::I));
 
-                        let key_s = ctx.input(|i| i.key_pressed(egui::Key::Space));
-                        let key_r = ctx.input(|i| i.key_pressed(egui::Key::R));
-                        let key_l = ctx.input(|i| i.key_pressed(egui::Key::L));
+                        let key_s = has_focus && ctx.input(|i| i.key_pressed(egui::Key::Space));
+                        let key_r = has_focus && ctx.input(|i| i.key_pressed(egui::Key::R));
+                        let key_l = has_focus && ctx.input(|i| i.key_pressed(egui::Key::L));
 
                         if esc {
                             close_fs = true;

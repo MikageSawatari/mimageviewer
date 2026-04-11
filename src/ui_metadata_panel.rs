@@ -236,6 +236,7 @@ impl App {
 const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(140, 160, 200);
 const TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 const DIM_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+const JSON_COLOR: egui::Color32 = egui::Color32::from_rgb(190, 200, 210);
 const SECTION_FONT: f32 = 14.0;
 const BODY_FONT: f32 = 13.0;
 
@@ -380,7 +381,7 @@ fn draw_comfyui_panel(
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(&json_str)
-                        .color(DIM_COLOR)
+                        .color(JSON_COLOR)
                         .size(11.0)
                         .monospace(),
                 );
@@ -408,7 +409,7 @@ fn draw_comfyui_panel(
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(&json_str)
-                            .color(DIM_COLOR)
+                            .color(JSON_COLOR)
                             .size(11.0)
                             .monospace(),
                     );

@@ -1224,6 +1224,11 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+        // ウィンドウにフォーカスがない場合はキー入力を無視
+        let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if !has_focus {
+            return None;
+        }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
         if self.fullscreen_idx.is_some()
             || self.any_dialog_open()
@@ -2483,8 +2488,9 @@ impl eframe::App for App {
         self.process_scroll(ctx);
 
         // ── Ctrl+C / Ctrl+X / Ctrl+V ショートカット ─────────────────
-        if !self.any_dialog_open() && !self.address_has_focus && !self.search_has_focus
-            && self.fullscreen_idx.is_none()
+        let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if main_focused && !self.any_dialog_open() && !self.address_has_focus
+            && !self.search_has_focus && self.fullscreen_idx.is_none()
         {
             // Ctrl+C/X: egui は Copy/Cut イベントに変換する
             let (ctrl_c, ctrl_x) = ctx.input(|i| {
