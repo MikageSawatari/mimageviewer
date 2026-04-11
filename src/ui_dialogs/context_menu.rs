@@ -366,6 +366,20 @@ impl crate::app::App {
             if idx < self.image_metas.len() {
                 self.image_metas.remove(idx);
             }
+            // search_filter 内のインデックスを調整
+            if let Some(ref mut filter) = self.search_filter {
+                let mut new_filter: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for &i in filter.iter() {
+                    if i < idx {
+                        new_filter.insert(i);
+                    } else if i > idx {
+                        new_filter.insert(i - 1);
+                    }
+                    // i == idx は削除されたので含めない
+                }
+                *filter = new_filter;
+            }
             let n = self.items.len();
             if n == 0 {
                 self.selected = None;
@@ -374,6 +388,7 @@ impl crate::app::App {
                     self.selected = Some(n - 1);
                 }
             }
+            self.rebuild_visible_indices();
             self.requested.clear();
         }
     }
