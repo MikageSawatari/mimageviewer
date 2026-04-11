@@ -14,6 +14,24 @@ use crate::ui_helpers::{draw_play_icon, format_bytes_small, open_external_player
 impl App {
     /// フルスクリーンビューポートを描画し、終了後のナビゲーション処理も行う。
     /// フルスクリーン表示中でなければ何もしない。
+    /// フルスクリーンが非アクティブでもビューポートを非表示で維持する。
+    /// アプリ起動直後から呼ばれ、初回のフルスクリーン表示時のちらつきを防ぐ。
+    pub(crate) fn keep_fullscreen_viewport_alive(&mut self, ctx: &egui::Context) {
+        if self.fullscreen_idx.is_some() {
+            return; // アクティブなときは render_fullscreen_viewport が担当
+        }
+        let fs_builder = egui::ViewportBuilder::default()
+            .with_decorations(false)
+            .with_visible(false)
+            .with_inner_size([1.0, 1.0]);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("fullscreen_viewer"),
+            fs_builder,
+            |_ctx, _class| {},
+        );
+        self.fs_viewport_created = true;
+    }
+
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
@@ -121,7 +139,9 @@ impl App {
                 crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp)
             });
 
-            let b = egui::ViewportBuilder::default().with_decorations(false);
+            let b = egui::ViewportBuilder::default()
+                .with_decorations(false)
+                .with_transparent(true);
             match monitor_rect {
                 Some(rect) => {
                     crate::logger::log(format!(
@@ -148,6 +168,10 @@ impl App {
             egui::ViewportId::from_hash_of("fullscreen_viewer"),
             fs_builder,
             |ctx, _class| {
+                // ビューポートを表示状態にして前面に持ってくる（非表示から復帰時用）
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
                 // プラットフォームの閉じるリクエスト（Alt+F4 など）
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close_fs = true;
@@ -359,9 +383,13 @@ impl App {
             },
         );
 
+        self.fs_viewport_created = true;
+
         // ── フルスクリーン終了・ナビゲーション処理 ────────────────
         if close_fs || ctrl_nav.is_some() {
             self.close_fullscreen();
+            // メインウィンドウにフォーカスを戻す
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if let Some(delta) = ctrl_nav {
             // Ctrl+↑↓: フォルダを移動してサムネイルモードに戻る（仕様 §7.2）

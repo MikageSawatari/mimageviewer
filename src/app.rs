@@ -308,6 +308,10 @@ pub struct App {
     /// 次の画像に切り替える時刻
     pub(crate) slideshow_next_at: std::time::Instant,
 
+    // ── フルスクリーンビューポート ─────────────────────────────
+    /// フルスクリーンビューポートが一度でも作成されたか
+    pub(crate) fs_viewport_created: bool,
+
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
 }
@@ -403,6 +407,7 @@ impl Default for App {
             rotation_cache: std::collections::HashMap::new(),
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
+            fs_viewport_created: false,
             initialized: false,
         }
     }
@@ -2418,6 +2423,8 @@ impl eframe::App for App {
         let keyboard_nav = self.handle_keyboard(ctx);
 
         // ── フルスクリーンビューポート ──────────────────────────────────
+        // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
+        self.keep_fullscreen_viewport_alive(ctx);
         self.render_fullscreen_viewport(ctx);
 
         // ── メニューバー ─────────────────────────────────────────────

@@ -37,6 +37,7 @@ mimageviewer/
 │   ├── ui_main.rs           # メイン画面 UI（グリッド描画）
 │   ├── ui_fullscreen.rs     # フルスクリーン表示
 │   ├── ui_helpers.rs        # UI ヘルパー関数
+│   ├── ui_metadata_panel.rs # フルスクリーン メタデータパネル（AI + EXIF）
 │   ├── ui_dialogs/          # ダイアログ群
 │   │   ├── mod.rs
 │   │   ├── preferences.rs        # 環境設定
@@ -49,7 +50,15 @@ mimageviewer/
 │   │   ├── favorites_editor.rs   # お気に入り編集
 │   │   ├── fav_add.rs            # お気に入り追加
 │   │   ├── open_folder.rs        # フォルダを開く
+│   │   ├── context_menu.rs       # 右クリックコンテキストメニュー
+│   │   ├── duplicate_settings.rs # 同名ファイル処理設定
+│   │   ├── exif_settings.rs      # EXIF 表示設定
+│   │   ├── slideshow_settings.rs # スライドショー設定
+│   │   ├── rotation_reset.rs     # 回転情報リセット確認
 │   │   └── stats_dialog.rs       # 統計
+│   ├── png_metadata.rs      # AI 画像メタデータ読み取り（PNG tEXt/iTXt/zTXt）
+│   ├── exif_reader.rs       # EXIF 読み取り（rexif クレート）
+│   ├── rotation_db.rs       # 回転情報 DB（SQLite、非破壊回転）
 │   ├── settings.rs          # 設定の読み書き（JSON 永続化）
 │   ├── catalog.rs           # SQLite サムネイルカタログ
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー

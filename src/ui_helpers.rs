@@ -274,9 +274,16 @@ pub fn adjacent_navigable_idx(
 pub fn open_external_player(path: &Path) {
     let path_str = path.to_string_lossy().into_owned();
     crate::logger::log(format!("open_external_player: {path_str}"));
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", &path_str])
-        .spawn();
+    // ShellExecute 相当: cmd.exe のコンソールウィンドウが一瞬見える問題を回避するため
+    // CREATE_NO_WINDOW フラグを付与する
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/c", "start", "", &path_str]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let _ = cmd.spawn();
 }
 
 // -----------------------------------------------------------------------

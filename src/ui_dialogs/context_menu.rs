@@ -16,11 +16,24 @@ impl crate::app::App {
             None => return None,
         };
 
-        let item = match self.items.get(idx) {
-            Some(item) => item.clone(),
-            None => {
-                self.context_menu_idx = None;
-                return None;
+        // usize::MAX = 空フォルダでの右クリック（フォルダ操作のみ）
+        let is_folder_context = idx == usize::MAX;
+        let item = if is_folder_context {
+            // 現在のフォルダをフォルダアイテムとして扱う
+            match self.current_folder.clone() {
+                Some(p) => GridItem::Folder(p),
+                None => {
+                    self.context_menu_idx = None;
+                    return None;
+                }
+            }
+        } else {
+            match self.items.get(idx) {
+                Some(item) => item.clone(),
+                None => {
+                    self.context_menu_idx = None;
+                    return None;
+                }
             }
         };
 

@@ -528,9 +528,23 @@ impl App {
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
                 if self.items.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("フォルダを入力して Enter キーを押してください");
+                    let msg = if self.current_folder.is_some() {
+                        "表示するファイルがありません"
+                    } else {
+                        "フォルダを入力して Enter キーを押してください"
+                    };
+                    let r = ui.centered_and_justified(|ui| {
+                        ui.label(msg)
                     });
+                    // 空フォルダでも右クリックでフォルダ操作可能にする
+                    if r.inner.secondary_clicked() {
+                        if self.current_folder.is_some() {
+                            self.context_menu_idx = Some(usize::MAX); // 特殊値: フォルダ操作
+                            self.context_menu_pos = ctx.input(|i| {
+                                i.pointer.interact_pos().unwrap_or_default()
+                            });
+                        }
+                    }
                     return None;
                 }
 
@@ -636,7 +650,7 @@ impl App {
                                 if response.clicked() {
                                     let ctrl = ctx.input(|i| i.modifiers.ctrl);
                                     if ctrl {
-                                        // Ctrl+クリック: チェック ON/OFF トグル
+                                        // Ctrl+クリック: チェック ON/OFF トグル + 選択移動
                                         match self.items.get(idx) {
                                             Some(GridItem::Image(_))
                                             | Some(GridItem::Video(_))
@@ -649,10 +663,9 @@ impl App {
                                             }
                                             _ => {}
                                         }
-                                    } else {
-                                        self.selected = Some(idx);
-                                        self.update_last_selected_image();
                                     }
+                                    self.selected = Some(idx);
+                                    self.update_last_selected_image();
                                 }
                                 if response.double_clicked() {
                                     match self.items.get(idx) {

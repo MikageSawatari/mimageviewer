@@ -420,6 +420,41 @@
         <h3>サムネイル画質設定</h3>
         <p>キャッシュのサイズと品質を A/B 比較プレビューで視覚的に調整。容量と画質のバランスを自分で決められる。</p>
       </div>
+      <div class="feature-card">
+        <div class="icon">🤖</div>
+        <h3>AI 画像メタデータ表示</h3>
+        <p>Stable Diffusion (A1111/Forge)・ComfyUI・Midjourney のプロンプト情報を PNG から自動抽出。フルスクリーンの右パネルで確認。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">📸</div>
+        <h3>EXIF 表示</h3>
+        <p>カメラ・レンズ・露出・GPS 等の撮影情報を表示。不要なタグを設定で非表示にできるフィルタ機能付き。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔄</div>
+        <h3>非破壊回転</h3>
+        <p>元ファイルを変更せずに画像の表示回転を保存。回転情報は専用 DB で管理。R / L キーまたはボタンで操作。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">▶️</div>
+        <h3>スライドショー</h3>
+        <p>フルスクリーンで Space キーまたは ▶ ボタンでスライドショー開始。間隔は 0.5〜30 秒で設定可能。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔍</div>
+        <h3>メタデータ検索</h3>
+        <p>Ctrl+F でフォルダ内の AI プロンプトやファイル名をキーワード検索。マッチした画像だけを絞り込み表示。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">📋</div>
+        <h3>右クリックメニュー</h3>
+        <p>パスコピー・画像コピー・カット・フォルダを開く・回転・削除（ゴミ箱）。複数選択にも対応。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">📁</div>
+        <h3>同名ファイル処理</h3>
+        <p>同名の ZIP+フォルダ、動画+画像、複数拡張子の画像を自動整理。拡張子の優先度もカスタマイズ可能。</p>
+      </div>
     </div>
   </section>
 
@@ -536,9 +571,18 @@
           <tr><td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></td><td>アイテムを選択移動</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>フォルダを開く / 画像をフルスクリーン表示</td></tr>
           <tr><td><kbd>Backspace</kbd></td><td>親フォルダへ移動</td></tr>
+          <tr><td><kbd>Home</kbd> / <kbd>End</kbd></td><td>先頭 / 末尾へ移動</td></tr>
+          <tr><td><kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>1ページ分移動</td></tr>
+          <tr><td><kbd>Space</kbd></td><td>画像をチェック（複数選択）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+クリック</td><td>画像をチェック（複数選択）</td></tr>
+          <tr><td><kbd>R</kbd> / <kbd>L</kbd></td><td>選択画像を右 / 左に回転</td></tr>
+          <tr><td><kbd>Delete</kbd></td><td>選択画像をゴミ箱に移動</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>メタデータ検索バーを表示</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>フォルダを開くダイアログ</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>次のフォルダへ（深さ優先）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>前のフォルダへ（深さ優先）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+マウスホイール</td><td>列数を増減</td></tr>
+          <tr><td>右クリック</td><td>コンテキストメニュー</td></tr>
         </tbody>
       </table>
     </div>
@@ -552,6 +596,9 @@
         <tbody>
           <tr><td><kbd>→</kbd> または <kbd>↓</kbd></td><td>次の画像へ</td></tr>
           <tr><td><kbd>←</kbd> または <kbd>↑</kbd></td><td>前の画像へ</td></tr>
+          <tr><td><kbd>Space</kbd></td><td>スライドショー 再生 / 一時停止</td></tr>
+          <tr><td><kbd>I</kbd></td><td>メタデータパネル（AI プロンプト / EXIF）の固定表示切替</td></tr>
+          <tr><td><kbd>R</kbd> / <kbd>L</kbd></td><td>画像を右 / 左に回転</td></tr>
           <tr><td><kbd>Escape</kbd></td><td>フルスクリーンを閉じる</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>次のフォルダへ移動してフルスクリーン終了</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>前のフォルダへ移動してフルスクリーン終了</td></tr>
@@ -559,7 +606,8 @@
           <tr><td>右半分クリック</td><td>次の画像へ</td></tr>
           <tr><td>左半分クリック</td><td>前の画像へ</td></tr>
           <tr><td>右クリック</td><td>フルスクリーンを閉じる</td></tr>
-          <tr><td>画面上部にカーソル → ✕</td><td>フルスクリーンを閉じる</td></tr>
+          <tr><td>画面右 1/4 にカーソル</td><td>メタデータパネルをホバー表示</td></tr>
+          <tr><td>画面上部にカーソル</td><td>ファイル情報バー + 操作ボタン</td></tr>
         </tbody>
       </table>
     </div>
@@ -580,6 +628,10 @@
         <tr><td>サムネイル画質</td><td>A/B 比較プレビューで長辺サイズと WebP 品質を調整</td></tr>
         <tr><td>キャッシュ生成設定</td><td>Off / Auto / Always の 3 段階ポリシーと自動判定のしきい値</td></tr>
         <tr><td>ツールバー</td><td>ツールバーに表示するセクション・個別項目をカスタマイズ</td></tr>
+        <tr><td>同名ファイル処理</td><td>ZIP+フォルダ重複、動画+画像重複、拡張子重複の自動整理設定</td></tr>
+        <tr><td>EXIF 表示設定</td><td>非表示にする EXIF タグを管理（MakerNote 等はデフォルトで非表示）</td></tr>
+        <tr><td>スライドショー</td><td>スライドショーの切り替え間隔を 0.5〜30 秒で設定</td></tr>
+        <tr><td>回転情報をリセット</td><td>保存されている全画像の回転情報を削除</td></tr>
         <tr><td>統計</td><td>読み込み時間・ファイルサイズ・フォーマット別の分布をリアルタイム表示</td></tr>
         <tr><td>環境設定</td><td>並列読み込み・プリフェッチ・VRAM 上限などの詳細設定</td></tr>
       </tbody>
@@ -629,7 +681,7 @@
     <h2>ダウンロード</h2>
     <div class="download-box">
       <div class="download-info">
-        <div class="version">mImageViewer v0.2.0</div>
+        <div class="version">mImageViewer v0.3.0</div>
         <div class="meta">Windows 11 64bit &nbsp;·&nbsp; インストール不要</div>
       </div>
       <a class="btn-download" href="mimageviewer.exe">mimageviewer.exe をダウンロード</a>
