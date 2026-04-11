@@ -151,6 +151,94 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
     }
 }
 
+/// WIC メタデータから EXIF Orientation 値を読み取る。
+/// rexif が対応しない RAW 形式 (ORF, CR2, NEF 等) でも取得できる。
+pub fn read_wic_orientation(path: &Path) -> Option<u16> {
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        return None;
+    }
+
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::{GUID, PCWSTR};
+        use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+        use windows::Win32::Foundation::{GENERIC_READ, S_OK};
+        use windows::Win32::Graphics::Imaging::{
+            CLSID_WICImagingFactory, IWICImagingFactory, IWICMetadataQueryReader,
+            WICDecodeMetadataCacheOnDemand,
+        };
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_APARTMENTTHREADED,
+        };
+
+        let co_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let co_initialized = co_hr.is_ok();
+
+        let result = read_orientation_inner(path);
+
+        if co_initialized && co_hr == S_OK {
+            CoUninitialize();
+        }
+        return result;
+
+        #[allow(unsafe_op_in_unsafe_fn)]
+        unsafe fn read_orientation_inner(path: &Path) -> Option<u16> {
+            let factory: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+
+            let path_wide: Vec<u16> = path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let null_guid: GUID = GUID::zeroed();
+            let decoder = factory
+                .CreateDecoderFromFilename(
+                    PCWSTR(path_wide.as_ptr()),
+                    Some(&null_guid),
+                    GENERIC_READ,
+                    WICDecodeMetadataCacheOnDemand,
+                )
+                .ok()?;
+
+            let frame = decoder.GetFrame(0).ok()?;
+            let reader: IWICMetadataQueryReader = frame.GetMetadataQueryReader().ok()?;
+
+            // EXIF Orientation のクエリパス (複数パターンを試す)
+            for query in &[
+                "/app1/ifd/{ushort=274}",
+                "/ifd/{ushort=274}",
+                "System.Photo.Orientation",
+            ] {
+                let query_wide: Vec<u16> = query.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut prop = PROPVARIANT::default();
+                if reader
+                    .GetMetadataByName(PCWSTR(query_wide.as_ptr()), &mut prop)
+                    .is_ok()
+                {
+                    // PROPVARIANT から u16 値を取り出す
+                    // VT_UI2 (u16) or VT_UI4 (u32) として返る可能性がある
+                    if let Ok(val) = <u16>::try_from(&prop) {
+                        return Some(val);
+                    }
+                    if let Ok(val) = <u32>::try_from(&prop) {
+                        return Some(val as u16);
+                    }
+                    if let Ok(val) = <i32>::try_from(&prop) {
+                        return Some(val as u16);
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

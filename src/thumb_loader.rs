@@ -160,25 +160,15 @@ pub fn apply_exif_orientation_from_bytes(
 }
 
 fn read_exif_orientation(path: &std::path::Path) -> u16 {
-    // まずファイル自体から EXIF を読む
+    // まず rexif でファイルから EXIF を読む (JPEG, PNG, TIFF 等)
     if let Some(orient) = read_exif_orientation_from_file(path) {
         return orient;
     }
 
-    // RAW ファイル (ORF, CR2, NEF 等) で rexif が対応していない場合、
-    // 同名の JPG/JPEG が存在すればそこから Orientation を借用する。
-    // カメラが RAW+JPEG 同時保存した場合に有効。
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        if let Some(parent) = path.parent() {
-            for ext in &["JPG", "jpg", "JPEG", "jpeg"] {
-                let jpg_path = parent.join(format!("{stem}.{ext}"));
-                if jpg_path.exists() {
-                    if let Some(orient) = read_exif_orientation_from_file(&jpg_path) {
-                        return orient;
-                    }
-                }
-            }
-        }
+    // rexif が対応しない RAW 形式 (ORF, CR2, NEF 等) は
+    // WIC のメタデータクエリリーダーで Orientation を取得する
+    if let Some(orient) = crate::wic_decoder::read_wic_orientation(path) {
+        return orient;
     }
 
     1 // デフォルト: 回転なし
