@@ -234,19 +234,24 @@ pub struct App {
     pub(crate) select_after_load: Option<String>,
 
     // ── 同名ファイル処理 ──────────────────────────────────────────
-    /// 動画のサムネイルとして使用する同名画像のマッピング (ステム小文字 → 画像パス)
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     pub(crate) show_duplicate_settings: bool,
+    /// 同名ファイル処理の一時編集状態
+    pub(crate) dup_edit: Option<crate::ui_dialogs::duplicate_settings::DupEdit>,
 
     // ── 回転リセット確認ダイアログ ─────────────────────────────
     pub(crate) show_rotation_reset_confirm: bool,
 
     // ── スライドショー設定ポップアップ ─────────────────────────
     pub(crate) show_slideshow_settings: bool,
+    /// スライドショー設定の一時編集値
+    pub(crate) slideshow_edit_interval: Option<f32>,
 
     // ── EXIF 表示設定ポップアップ ──────────────────────────────
     pub(crate) show_exif_settings: bool,
     pub(crate) exif_add_tag_input: String,
+    /// EXIF 設定の一時編集状態
+    pub(crate) exif_edit_tags: Option<Vec<String>>,
 
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     pub(crate) show_cache_manager: bool,
@@ -381,10 +386,13 @@ impl Default for App {
             select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
             show_duplicate_settings: false,
+            dup_edit: None,
             show_rotation_reset_confirm: false,
             show_slideshow_settings: false,
+            slideshow_edit_interval: None,
             show_exif_settings: false,
             exif_add_tag_input: String::new(),
+            exif_edit_tags: None,
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,

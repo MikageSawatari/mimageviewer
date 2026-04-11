@@ -35,9 +35,10 @@ impl App {
             return;
         }
         let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
-        let mut name_changed = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
         egui::Window::new("お気に入りの編集")
@@ -78,9 +79,7 @@ impl App {
                                         &mut self.settings.favorites[i].name,
                                     ),
                                 );
-                                if name_resp.changed() {
-                                    name_changed = true;
-                                }
+                                let _ = name_resp;
 
                                 // パス (読み取り専用表示)
                                 let path_str = self.settings.favorites[i]
@@ -118,21 +117,37 @@ impl App {
                             }
                         });
                 }
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("  OK  ").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
             });
 
         if let Some((a, b)) = swap {
             self.settings.favorites.swap(a, b);
-            self.settings.save();
         }
         if let Some(i) = remove {
             self.settings.favorites.remove(i);
-            self.settings.save();
         }
-        if name_changed {
-            // 名前の変更は TextEdit が直接 self.settings.favorites[i].name を編集済み
+
+        if apply {
             self.settings.save();
-        }
-        if !open {
+            self.show_favorites_editor = false;
+        } else if cancel || !open {
+            // キャンセル: 設定を再読み込みして変更を破棄
+            self.settings = crate::settings::Settings::load();
             self.show_favorites_editor = false;
         }
     }

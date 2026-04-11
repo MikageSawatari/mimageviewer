@@ -11,7 +11,7 @@ mod cache_creator;
 mod cache_manager;
 mod cache_policy;
 pub(crate) mod context_menu;
-mod duplicate_settings;
+pub(crate) mod duplicate_settings;
 mod exif_settings;
 mod fav_add;
 mod favorites_editor;
