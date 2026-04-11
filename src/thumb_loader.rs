@@ -160,7 +160,32 @@ pub fn apply_exif_orientation_from_bytes(
 }
 
 fn read_exif_orientation(path: &std::path::Path) -> u16 {
-    rexif::parse_file(path.to_str().unwrap_or(""))
+    // まずファイル自体から EXIF を読む
+    if let Some(orient) = read_exif_orientation_from_file(path) {
+        return orient;
+    }
+
+    // RAW ファイル (ORF, CR2, NEF 等) で rexif が対応していない場合、
+    // 同名の JPG/JPEG が存在すればそこから Orientation を借用する。
+    // カメラが RAW+JPEG 同時保存した場合に有効。
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if let Some(parent) = path.parent() {
+            for ext in &["JPG", "jpg", "JPEG", "jpeg"] {
+                let jpg_path = parent.join(format!("{stem}.{ext}"));
+                if jpg_path.exists() {
+                    if let Some(orient) = read_exif_orientation_from_file(&jpg_path) {
+                        return orient;
+                    }
+                }
+            }
+        }
+    }
+
+    1 // デフォルト: 回転なし
+}
+
+fn read_exif_orientation_from_file(path: &std::path::Path) -> Option<u16> {
+    rexif::parse_file(path.to_str()?)
         .ok()
         .and_then(|exif| {
             exif.entries
@@ -169,7 +194,6 @@ fn read_exif_orientation(path: &std::path::Path) -> u16 {
                 .and_then(|e| e.value_more_readable.trim().parse::<u16>().ok()
                     .or_else(|| orientation_from_text(&e.value_more_readable)))
         })
-        .unwrap_or(1)
 }
 
 fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
