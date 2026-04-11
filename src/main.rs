@@ -2,6 +2,7 @@
 
 mod app;
 pub mod catalog;
+pub mod data_dir;
 pub mod folder_tree;
 pub mod fs_animation;
 pub mod gpu_info;
@@ -26,6 +27,8 @@ pub mod zip_loader;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    data_dir::init();
+
     #[cfg(debug_assertions)]
     logger::init();
 
@@ -33,16 +36,18 @@ fn main() -> eframe::Result {
     let saved = settings::Settings::load();
 
     let default_size = [1280.0_f32, 800.0_f32];
-    let size = saved.window_size.unwrap_or(default_size);
+    // --window-size WxH 引数があればそれを優先（スクリーンショット用）
+    let size = parse_window_size_arg().unwrap_or_else(|| saved.window_size.unwrap_or(default_size));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
         .with_inner_size(size)
         .with_icon(Arc::new(load_icon()));
 
-    // 保存済み位置にモニターが接続されている場合のみ適用する。
-    // 接続モニターが減って座標が画面外になった場合はデフォルト位置を使う。
-    if let Some([x, y]) = saved.window_pos {
+    // --window-size 指定時は位置を画面左上寄りに固定（保存済み位置は無視）
+    if parse_window_size_arg().is_some() {
+        viewport = viewport.with_position(egui::pos2(60.0, 40.0));
+    } else if let Some([x, y]) = saved.window_pos {
         let w = saved.window_size.map(|[w, _]| w).unwrap_or(1280.0);
         if monitor::title_bar_on_some_monitor(x, y, w) {
             viewport = viewport.with_position(egui::pos2(x, y));
@@ -64,6 +69,22 @@ fn main() -> eframe::Result {
     )
 }
 
+
+/// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。
+fn parse_window_size_arg() -> Option<[f32; 2]> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--window-size" {
+            let parts: Vec<&str> = args[i + 1].split('x').collect();
+            if parts.len() == 2 {
+                if let (Ok(w), Ok(h)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
+                    return Some([w, h]);
+                }
+            }
+        }
+    }
+    None
+}
 
 fn load_icon() -> egui::IconData {
     let bytes = include_bytes!("../assets/icon.png");

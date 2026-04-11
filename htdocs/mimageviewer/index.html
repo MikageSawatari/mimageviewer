@@ -318,6 +318,40 @@
       font-size: 0.85rem;
     }
 
+    /* ── Screenshots ── */
+    .screenshots {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 1.2rem;
+    }
+    .screenshot-item {
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12);
+      border: 1px solid #ffe0ec;
+      background: #1a1a1a;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .screenshot-item:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 8px 28px rgba(214, 51, 132, 0.22);
+    }
+    .screenshot-item a { display: block; }
+    .screenshot-item img {
+      width: 100%;
+      display: block;
+      aspect-ratio: 16/9;
+      object-fit: cover;
+    }
+    .screenshot-caption {
+      padding: 0.65rem 0.9rem;
+      font-size: 0.85rem;
+      color: #a02860;
+      font-weight: 600;
+      background: #fff;
+      border-top: 1px solid #ffe0ec;
+    }
+
     /* ── Responsive ── */
     @media (max-width: 600px) {
       .hero h1 { font-size: 2.2rem; }
@@ -364,6 +398,31 @@
     <p>
       旧来の 32bit ビューワー「ViX」にインスパイアされ、現代の環境に合わせて Rust でゼロから実装しました。
     </p>
+  </section>
+
+  <!-- ===== Screenshots ===== -->
+  <section id="screenshots">
+    <h2>スクリーンショット</h2>
+    <div class="screenshots">
+      <div class="screenshot-item">
+        <a href="ss_grid.png" target="_blank">
+          <img src="ss_grid.png" alt="サムネイルグリッド表示" loading="lazy">
+        </a>
+        <div class="screenshot-caption">📁 サムネイルグリッド表示</div>
+      </div>
+      <div class="screenshot-item">
+        <a href="ss_fullscreen.png" target="_blank">
+          <img src="ss_fullscreen.png" alt="フルスクリーン表示" loading="lazy">
+        </a>
+        <div class="screenshot-caption">🖼️ フルスクリーン表示</div>
+      </div>
+      <div class="screenshot-item">
+        <a href="ss_metadata.png" target="_blank">
+          <img src="ss_metadata.png" alt="AI メタデータパネル" loading="lazy">
+        </a>
+        <div class="screenshot-caption">🤖 AI 生成情報パネル（ホバーで表示）</div>
+      </div>
+    </div>
   </section>
 
   <!-- ===== Features ===== -->
@@ -688,7 +747,7 @@
         <div class="version">mImageViewer v0.3.0</div>
         <div class="meta">Windows 11 64bit &nbsp;·&nbsp; インストール不要</div>
       </div>
-      <a class="btn-download" href="mimageviewer.exe">mimageviewer.exe をダウンロード</a>
+      <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">mimageviewer.exe をダウンロード</a>
     </div>
     <div class="info-box" style="margin-top:1rem;">
       ダウンロードした <code>mimageviewer.exe</code> を任意のフォルダに置いて実行するだけで使えます。<br>

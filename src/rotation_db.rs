@@ -84,14 +84,7 @@ impl RotationDb {
 
     /// DB ファイルのパス
     fn db_path() -> PathBuf {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| {
-            let fallback = std::env::temp_dir().to_string_lossy().to_string();
-            crate::logger::log(format!("APPDATA not set, using temp dir: {fallback}"));
-            fallback
-        });
-        PathBuf::from(appdata)
-            .join("mimageviewer")
-            .join("rotation.db")
+        crate::data_dir::get().join("rotation.db")
     }
 
     /// 画像の回転角度を取得。未登録なら None。

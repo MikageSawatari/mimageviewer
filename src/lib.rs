@@ -2,6 +2,7 @@
 //! 統合テストから公開モジュールにアクセスするためのエントリポイント。
 
 pub mod catalog;
+pub mod data_dir;
 pub mod exif_reader;
 pub mod folder_tree;
 pub mod grid_item;

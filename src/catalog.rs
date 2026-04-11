@@ -229,10 +229,9 @@ pub fn decode_thumb_to_color_image(data: &[u8]) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }
 
-/// キャッシュディレクトリのデフォルト位置（%APPDATA%\mimageviewer\cache）
+/// キャッシュディレクトリのデフォルト位置（DATA_DIR\cache）
 pub fn default_cache_dir() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata).join("mimageviewer").join("cache")
+    crate::data_dir::get().join("cache")
 }
 
 // -----------------------------------------------------------------------

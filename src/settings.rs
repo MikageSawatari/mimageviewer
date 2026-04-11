@@ -472,8 +472,7 @@ impl Default for Settings {
 
 impl Settings {
     fn settings_path() -> PathBuf {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(appdata).join("mimageviewer").join("settings.json")
+        crate::data_dir::get().join("settings.json")
     }
 
     pub fn load() -> Self {

@@ -10,6 +10,9 @@
 //!
 //! 結果は `bench_thumbs.tsv` に TSV で出力される。
 
+#[path = "../data_dir.rs"]
+mod data_dir;
+
 #[allow(dead_code)]
 #[path = "../settings.rs"]
 mod settings;
