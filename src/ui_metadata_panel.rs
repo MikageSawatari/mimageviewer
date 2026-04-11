@@ -279,18 +279,7 @@ fn draw_a1111_panel(ui: &mut egui::Ui, ctx: &egui::Context, meta: &A1111Metadata
         );
         ui.add_space(2.0);
         for (key, val) in &meta.params {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("{key}:"))
-                        .color(DIM_COLOR)
-                        .size(BODY_FONT),
-                );
-                ui.label(
-                    egui::RichText::new(val)
-                        .color(TEXT_COLOR)
-                        .size(BODY_FONT),
-                );
-            });
+            draw_key_value_wrapped(ui, key, val);
         }
     }
 }
@@ -345,18 +334,7 @@ fn draw_comfyui_panel(
         );
         ui.add_space(2.0);
         for (key, val) in &meta.sampler_params {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("{key}:"))
-                        .color(DIM_COLOR)
-                        .size(BODY_FONT),
-                );
-                ui.label(
-                    egui::RichText::new(val)
-                        .color(TEXT_COLOR)
-                        .size(BODY_FONT),
-                );
-            });
+            draw_key_value_wrapped(ui, key, val);
         }
     }
 
@@ -500,22 +478,39 @@ fn draw_exif_panel(
         if *open {
             ui.add_space(2.0);
             for (tag_name, value) in fields {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{tag_name}:"))
-                            .color(DIM_COLOR)
-                            .size(BODY_FONT),
-                    );
-                    ui.label(
-                        egui::RichText::new(value)
-                            .color(TEXT_COLOR)
-                            .size(BODY_FONT),
-                    );
-                });
+                draw_key_value_wrapped(ui, tag_name, value);
             }
             ui.add_space(4.0);
         }
     }
+}
+
+/// キー: 値 を1つの LayoutJob で描画し、長い値も確実に折り返す。
+fn draw_key_value_wrapped(ui: &mut egui::Ui, key: &str, val: &str) {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap = egui::text::TextWrapping {
+        max_width: ui.available_width(),
+        ..Default::default()
+    };
+    job.append(
+        &format!("{key}:  "),
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(BODY_FONT),
+            color: DIM_COLOR,
+            ..Default::default()
+        },
+    );
+    job.append(
+        val,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(BODY_FONT),
+            color: TEXT_COLOR,
+            ..Default::default()
+        },
+    );
+    ui.label(job);
 }
 
 /// テキストセクション (ラベル + コピーボタン + テキスト) を描画する。
