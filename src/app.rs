@@ -226,6 +226,11 @@ pub struct App {
     /// 削除対象のファイルパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
 
+    // ── 同名ファイル処理 ──────────────────────────────────────────
+    /// 動画のサムネイルとして使用する同名画像のマッピング (ステム小文字 → 画像パス)
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+    pub(crate) show_duplicate_settings: bool,
+
     // ── 回転リセット確認ダイアログ ─────────────────────────────
     pub(crate) show_rotation_reset_confirm: bool,
 
@@ -360,6 +365,8 @@ impl Default for App {
             context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
             delete_targets: Vec::new(),
+            video_thumb_overrides: std::collections::HashMap::new(),
+            show_duplicate_settings: false,
             show_rotation_reset_confirm: false,
             show_slideshow_settings: false,
             show_exif_settings: false,
@@ -402,6 +409,25 @@ impl Default for App {
 }
 
 impl App {
+    /// いずれかのモーダルダイアログが開いているか。
+    /// true の場合、キーボードショートカットやスクロールを無効化する。
+    pub(crate) fn any_dialog_open(&self) -> bool {
+        self.show_stats_dialog
+            || self.show_favorites_editor
+            || self.show_fav_add_dialog
+            || self.show_open_folder_dialog
+            || self.show_preferences
+            || self.show_toolbar_settings
+            || self.show_cache_policy_dialog
+            || self.show_cache_manager
+            || self.show_delete_confirm
+            || self.show_duplicate_settings
+            || self.show_rotation_reset_confirm
+            || self.show_slideshow_settings
+            || self.show_exif_settings
+            || self.context_menu_idx.is_some()
+    }
+
     pub fn load_folder(&mut self, path: PathBuf) {
         // タスク 3: パスが .zip ファイルなら ZIP を仮想フォルダとして開く
         if path.is_file() {
@@ -457,6 +483,10 @@ impl App {
             let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
             sort.compare(an, *a_mt, bn, *b_mt, natural_sort_key)
         });
+
+        // ── 同名ファイルフィルタ ─────────────────────────────────────
+        self.video_thumb_overrides.clear();
+        self.apply_duplicate_filters(&mut folders, &mut all_media);
 
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
@@ -667,7 +697,7 @@ impl App {
             catalog_arc,
         );
         if !video_items.is_empty() {
-            self.spawn_video_thread(tx, cancel, video_items);
+            self.spawn_video_thread(tx, cancel, video_items, self.video_thumb_overrides.clone());
         }
 
         // ── 履歴復元 + last_folder 保存 ──
@@ -768,14 +798,35 @@ impl App {
         tx: mpsc::Sender<ThumbMsg>,
         cancel: Arc<AtomicBool>,
         video_items: Vec<(usize, PathBuf, u64)>,
+        thumb_overrides: std::collections::HashMap<String, PathBuf>,
     ) {
         let thumb_size = self.last_cell_size.max(256.0) as i32;
+        let display_px = compute_display_px(
+            self.last_cell_size,
+            self.last_cell_h,
+            self.last_pixels_per_point,
+        );
         let stats = Arc::clone(&self.stats);
 
         std::thread::spawn(move || {
             for (idx, path, file_size) in video_items {
                 if cancel.load(Ordering::Relaxed) { break; }
-                let ci = crate::video_thumb::get_video_thumbnail(&path, thumb_size);
+
+                // 同名画像がある場合はそれをサムネイルとして使用
+                let stem = path
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let ci = if let Some(img_path) = thumb_overrides.get(&stem) {
+                    crate::logger::log(format!(
+                        "  video thumb override: idx={idx} stem={stem} img={}",
+                        img_path.display()
+                    ));
+                    crate::thumb_loader::decode_image_for_thumb(img_path, display_px)
+                } else {
+                    crate::video_thumb::get_video_thumbnail(&path, thumb_size)
+                };
                 crate::logger::log(format!(
                     "  video thumb: idx={idx} {}",
                     if ci.is_some() { "ok" } else { "FAIL" }
@@ -1141,19 +1192,33 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
-        // フルスクリーン表示中はサムネイルグリッドのキー操作を無効化
-        // （フルスクリーンビューポートが独自に処理する）
-        if self.fullscreen_idx.is_some() {
-            return None;
-        }
-        // アドレスバーまたは検索バーの入力欄にフォーカス中はショートカットを無効化
-        if self.address_has_focus || self.search_has_focus {
+        // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
+        if self.fullscreen_idx.is_some()
+            || self.any_dialog_open()
+            || self.address_has_focus
+            || self.search_has_focus
+        {
             return None;
         }
 
         let cols = self.settings.grid_cols.max(1);
 
-        let (right, left, down, up, enter, backspace, ctrl_up, ctrl_down,
+        // Ctrl の状態判定。AutoHotKey 等の外部ツールが Ctrl+矢印を送信する場合、
+        // Ctrl と矢印が別フレームで届くことがある。直前フレームの Ctrl 押下も
+        // 考慮するため、egui の全イベントから Ctrl 修飾子を探す。
+        let ctrl_held = ctx.input(|i| {
+            // 現在のフレームで Ctrl が押されている
+            if i.modifiers.ctrl {
+                return true;
+            }
+            // イベントの中に Ctrl 修飾子付きのキーイベントがあるか
+            i.events.iter().any(|e| match e {
+                egui::Event::Key { modifiers, .. } => modifiers.ctrl,
+                _ => false,
+            })
+        });
+
+        let (right, left, down, up, enter, backspace, _ctrl_up_raw, _ctrl_down_raw,
              home, end, page_up, page_down, space, key_r, key_l) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight),
@@ -1174,6 +1239,10 @@ impl App {
             )
         });
 
+        // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定
+        let ctrl_up = ctrl_held && up;
+        let ctrl_down = ctrl_held && down;
+
         let vi = &self.visible_indices;
         let vi_len = vi.len();
 
@@ -1186,13 +1255,14 @@ impl App {
             let page_items = visible_rows.max(1) * cols;
 
             // visible_indices 上で移動し、raw index に変換
-            let new_vis_pos = if right {
+            // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外
+            let new_vis_pos = if right && !ctrl_held {
                 Some((vis_pos + 1).min(vi_len - 1))
-            } else if left {
+            } else if left && !ctrl_held {
                 Some(vis_pos.saturating_sub(1))
-            } else if down {
+            } else if down && !ctrl_down {
                 Some((vis_pos + cols).min(vi_len - 1))
-            } else if up {
+            } else if up && !ctrl_up {
                 Some(vis_pos.saturating_sub(cols))
             } else if home {
                 Some(0)
@@ -1295,6 +1365,12 @@ impl App {
     /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
     /// Ctrl+ホイールの場合はグリッド列数を変更する。
     fn process_scroll(&mut self, ctx: &egui::Context) {
+        // ダイアログやフルスクリーン表示中はスクロールを消費しない
+        // (ダイアログ内の ScrollArea が正しく動くようにする)
+        if self.fullscreen_idx.is_some() || self.any_dialog_open() {
+            return;
+        }
+
         let cell_h = self.last_cell_h.max(1.0);
 
         // マウスホイールイベントだけを取り出し、egui には渡さない
@@ -1435,6 +1511,189 @@ impl App {
                 _ => None,
             };
             self.exif_cache.insert(path, exif);
+        }
+    }
+
+    /// 同名ファイルフィルタを適用する。
+    /// - ZIP+フォルダの重複: ZIPフォルダエントリを除去
+    /// - 動画+画像の重複: 画像を除去
+    /// - 画像の拡張子重複: 優先度の低い拡張子を除去
+    fn apply_duplicate_filters(
+        &mut self,
+        folders: &mut Vec<GridItem>,
+        all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
+    ) {
+        // 1. ZIP + フォルダの重複: 同名フォルダがあれば ZIP エントリをスキップ
+        if self.settings.skip_zip_if_folder_exists {
+            // 実フォルダの名前 (小文字) を収集
+            let real_folder_names: std::collections::HashSet<String> = folders
+                .iter()
+                .filter_map(|item| {
+                    if let GridItem::Folder(p) = item {
+                        // .zip 拡張子でないフォルダのみ
+                        let is_zip = p
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.eq_ignore_ascii_case("zip"))
+                            .unwrap_or(false);
+                        if !is_zip {
+                            return p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.to_lowercase());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            // ZIP フォルダエントリを除去（拡張子なしの名前がフォルダ名と一致するもの）
+            folders.retain(|item| {
+                if let GridItem::Folder(p) = item {
+                    let is_zip = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("zip"))
+                        .unwrap_or(false);
+                    if is_zip {
+                        let stem = p
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        if real_folder_names.contains(&stem) {
+                            return false; // スキップ
+                        }
+                    }
+                }
+                true
+            });
+        }
+
+        // 2. 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
+        //    画像ファイルを動画のサムネイルソースとして記録する
+        if self.settings.skip_image_if_video_exists {
+            // 動画ステム → 同名画像パスのマッピングを構築
+            let video_stems: std::collections::HashSet<String> = all_media
+                .iter()
+                .filter(|(_, is_video, _, _)| *is_video)
+                .filter_map(|(p, _, _, _)| {
+                    p.file_stem()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_lowercase())
+                })
+                .collect();
+
+            if !video_stems.is_empty() {
+                // 同名画像パスを記録（動画サムネイルに使用）
+                for (p, is_video, _, _) in all_media.iter() {
+                    if *is_video {
+                        continue;
+                    }
+                    let stem = p
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if video_stems.contains(&stem) {
+                        self.video_thumb_overrides.insert(stem, p.clone());
+                    }
+                }
+
+                all_media.retain(|(p, is_video, _, _)| {
+                    if *is_video {
+                        return true;
+                    }
+                    let stem = p
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    !video_stems.contains(&stem)
+                });
+            }
+        }
+
+        // 3. 同名画像の拡張子重複: 優先度リストに基づいてフィルタ
+        if self.settings.skip_duplicate_images {
+            let priority = &self.settings.image_ext_priority;
+
+            // ステム → (最優先の拡張子の優先度, インデックス) を記録
+            let mut best: std::collections::HashMap<String, (usize, usize)> =
+                std::collections::HashMap::new();
+
+            for (i, (p, is_video, _, _)) in all_media.iter().enumerate() {
+                if *is_video {
+                    continue;
+                }
+                let stem = p
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let prio = priority
+                    .iter()
+                    .position(|e| e == &ext)
+                    .unwrap_or(usize::MAX);
+
+                match best.get(&stem) {
+                    Some(&(existing_prio, _)) if prio >= existing_prio => {
+                        // 既存のほうが優先度が高い → 何もしない
+                    }
+                    _ => {
+                        best.insert(stem, (prio, i));
+                    }
+                }
+            }
+
+            // 同名ステムの画像が複数あるか判定
+            let mut stem_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (p, is_video, _, _) in all_media.iter() {
+                if *is_video {
+                    continue;
+                }
+                let stem = p
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                *stem_counts.entry(stem).or_insert(0) += 1;
+            }
+
+            // 重複があるステムについて、最優先以外を除去
+            let keep_indices: std::collections::HashSet<usize> = best
+                .iter()
+                .filter(|(stem, _)| stem_counts.get(stem.as_str()).copied().unwrap_or(0) > 1)
+                .map(|(_, &(_, idx))| idx)
+                .collect();
+
+            if !keep_indices.is_empty() {
+                let mut i = 0;
+                all_media.retain(|(p, is_video, _, _)| {
+                    let current_i = i;
+                    i += 1;
+                    if *is_video {
+                        return true;
+                    }
+                    let stem = p
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    // 重複のないステムは常に保持
+                    if stem_counts.get(&stem).copied().unwrap_or(0) <= 1 {
+                        return true;
+                    }
+                    // 重複があるステム: 最優先のもののみ保持
+                    keep_indices.contains(&current_i)
+                });
+            }
         }
     }
 
@@ -2182,6 +2441,7 @@ impl eframe::App for App {
         self.show_exif_settings_dialog(ctx);
         self.show_slideshow_settings_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
+        self.show_duplicate_settings_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
 
@@ -2192,11 +2452,24 @@ impl eframe::App for App {
         let address_nav = self.render_address_bar(ctx);
 
         // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
-        if !self.address_has_focus && self.fullscreen_idx.is_none() {
+        if !self.address_has_focus && self.fullscreen_idx.is_none() && !self.any_dialog_open() {
             let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
             if ctrl_f {
                 self.show_search_bar = true;
                 self.search_focus_request = true;
+            }
+        }
+
+        // ── Ctrl+O: フォルダを開く ───────────────────────────────────
+        if self.fullscreen_idx.is_none() && !self.any_dialog_open() {
+            let ctrl_o = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O));
+            if ctrl_o {
+                self.open_folder_input = self
+                    .current_folder
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.show_open_folder_dialog = true;
             }
         }
 

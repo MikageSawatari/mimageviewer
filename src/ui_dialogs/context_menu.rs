@@ -190,7 +190,7 @@ impl crate::app::App {
     }
 
     /// チェック済みアイテムのパスを収集する。
-    fn collect_checked_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn collect_checked_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for &idx in &self.checked {
             match self.items.get(idx) {
@@ -280,7 +280,7 @@ impl crate::app::App {
 
     /// DEL キーで選択画像を削除するハンドラ。
     pub(crate) fn handle_delete_key(&mut self, ctx: &egui::Context) {
-        if self.fullscreen_idx.is_some() || self.address_has_focus {
+        if self.fullscreen_idx.is_some() || self.address_has_focus || self.any_dialog_open() {
             return;
         }
         let del = ctx.input(|i| i.key_pressed(egui::Key::Delete));
@@ -365,7 +365,7 @@ fn move_to_recycle_bin(path: &std::path::Path) -> bool {
 }
 
 /// ファイルをクリップボードにコピー (エクスプローラのコピーと同等)。
-fn copy_files_to_clipboard(paths: &[PathBuf]) {
+pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
     #[cfg(windows)]
     {
         if paths.is_empty() {

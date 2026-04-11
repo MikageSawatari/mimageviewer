@@ -166,6 +166,10 @@ impl App {
                         self.show_toolbar_settings = true;
                         ui.close();
                     }
+                    if ui.button("同名ファイル処理…").clicked() {
+                        self.show_duplicate_settings = true;
+                        ui.close();
+                    }
                     if ui.button("EXIF 表示設定…").clicked() {
                         self.show_exif_settings = true;
                         ui.close();
@@ -477,8 +481,10 @@ impl App {
                     self.rebuild_visible_indices();
                 }
 
-                // Esc で検索解除（フォーカスの有無に関わらず、検索バー表示中なら有効）
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                // Esc で検索解除（ダイアログが開いていない場合のみ）
+                if !self.any_dialog_open()
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;
@@ -628,8 +634,25 @@ impl App {
                                     egui::Sense::click(),
                                 );
                                 if response.clicked() {
-                                    self.selected = Some(idx);
-                                    self.update_last_selected_image();
+                                    let ctrl = ctx.input(|i| i.modifiers.ctrl);
+                                    if ctrl {
+                                        // Ctrl+クリック: チェック ON/OFF トグル
+                                        match self.items.get(idx) {
+                                            Some(GridItem::Image(_))
+                                            | Some(GridItem::Video(_))
+                                            | Some(GridItem::ZipImage { .. }) => {
+                                                if self.checked.contains(&idx) {
+                                                    self.checked.remove(&idx);
+                                                } else {
+                                                    self.checked.insert(idx);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        self.selected = Some(idx);
+                                        self.update_last_selected_image();
+                                    }
                                 }
                                 if response.double_clicked() {
                                     match self.items.get(idx) {

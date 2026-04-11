@@ -11,6 +11,7 @@ mod cache_creator;
 mod cache_manager;
 mod cache_policy;
 mod context_menu;
+mod duplicate_settings;
 mod exif_settings;
 mod fav_add;
 mod favorites_editor;

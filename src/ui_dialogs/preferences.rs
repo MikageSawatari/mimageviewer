@@ -55,22 +55,25 @@ impl App {
                         (cores / 2).max(1)
                     };
 
-                    if ui.radio(is_auto, format!("自動（CPUコア数の半分: {} スレッド）", auto_count)).clicked() {
+                    let mut current_auto = is_auto;
+                    if ui.radio(current_auto, format!("自動（CPUコア数の半分: {} スレッド）", auto_count)).clicked() {
                         self.settings.parallelism = crate::settings::Parallelism::Auto;
+                        current_auto = true;
                     }
 
                     ui.horizontal(|ui| {
-                        if ui.radio(!is_auto, "手動").clicked() {
+                        if ui.radio(!current_auto, "手動").clicked() {
                             self.settings.parallelism =
                                 crate::settings::Parallelism::Manual(self.pref_manual_threads);
+                            current_auto = false;
                         }
                         ui.add_enabled(
-                            !is_auto,
+                            !current_auto,
                             egui::DragValue::new(&mut self.pref_manual_threads)
                                 .range(1..=64)
                                 .suffix(" スレッド"),
                         );
-                        if !is_auto {
+                        if !current_auto {
                             self.settings.parallelism =
                                 crate::settings::Parallelism::Manual(self.pref_manual_threads);
                         }
@@ -205,6 +208,11 @@ impl App {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
+                    // Esc でキャンセル
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+
                     ui.horizontal(|ui| {
                         if ui.button("  OK  ").clicked() {
                             apply = true;

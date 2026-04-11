@@ -198,26 +198,52 @@ pub fn walk_dirs_recursive(path: &Path, out: &mut Vec<PathBuf>, cancel: &AtomicB
 /// path 配下の "子フォルダ + .zip ファイル" をソート済みで返す。
 /// .zip もナビゲーション対象として扱う (タスク 3)。
 pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
+    // 同名フォルダがある ZIP をスキップするかの設定を読み込む
+    let settings = crate::settings::Settings::load();
+    let skip_zip = settings.skip_zip_if_folder_exists;
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut real_folder_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut zip_candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
-                Some(p)
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    real_folder_names.insert(name.to_lowercase());
+                }
+                dirs.push(p);
             } else if p.is_file() {
                 let is_zip = p
                     .extension()
                     .and_then(|x| x.to_str())
                     .map(|x| x.eq_ignore_ascii_case("zip"))
                     .unwrap_or(false);
-                if is_zip { Some(p) } else { None }
-            } else {
-                None
+                if is_zip {
+                    zip_candidates.push(p);
+                }
             }
-        })
-        .collect();
+        }
+    }
+
+    // ZIP フィルタ: 同名フォルダがあればスキップ
+    for zp in zip_candidates {
+        if skip_zip {
+            let stem = zp
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if real_folder_names.contains(&stem) {
+                continue; // スキップ
+            }
+        }
+        dirs.push(zp);
+    }
+
+    let mut dirs = dirs;
     dirs.sort_by(|a, b| {
         a.to_string_lossy()
             .to_lowercase()

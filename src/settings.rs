@@ -320,6 +320,20 @@ pub struct Settings {
     #[serde(default = "default_exif_hidden_tags")]
     pub exif_hidden_tags: Vec<String>,
 
+    // ── 同名ファイル処理 ──────────────────────────────────────────
+    /// 同名の ZIP ファイルとフォルダがある場合、ZIP をスキップする
+    #[serde(default = "default_true")]
+    pub skip_zip_if_folder_exists: bool,
+    /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
+    #[serde(default = "default_true")]
+    pub skip_image_if_video_exists: bool,
+    /// 同名の画像が複数拡張子で存在する場合、優先度の低いものをスキップする
+    #[serde(default = "default_true")]
+    pub skip_duplicate_images: bool,
+    /// 画像拡張子の優先度リスト（先頭が最優先）
+    #[serde(default = "default_image_ext_priority")]
+    pub image_ext_priority: Vec<String>,
+
     // ── スライドショー ──────────────────────────────────────────
     /// スライドショーの切り替え間隔（秒）
     #[serde(default = "default_slideshow_interval")]
@@ -397,6 +411,20 @@ pub fn default_exif_hidden_tags() -> Vec<String> {
     .map(|s| s.to_string())
     .collect()
 }
+pub fn default_image_ext_priority() -> Vec<String> {
+    // ロスレス系 > ロッシー系 > RAW 系
+    [
+        "png", "bmp", "gif", "tiff", "tif",       // ロスレス
+        "webp", "jxl", "avif", "heic", "heif",     // モダン (ロッシー/ロスレス混在)
+        "jpg", "jpeg",                              // ロッシー
+        "dng", "cr2", "cr3", "nef", "nrw", "arw",  // RAW (現像困難な場合が多い)
+        "srf", "sr2", "raf", "orf", "rw2", "pef",
+        "ptx", "rwl", "iiq",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 fn default_slideshow_interval() -> f32 { 3.0 }
 fn default_toolbar_cols_items() -> Vec<usize> { (2..=10).collect() }
 fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
@@ -428,6 +456,10 @@ impl Default for Settings {
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
             thumb_idle_upgrade: true,
             exif_hidden_tags: default_exif_hidden_tags(),
+            skip_zip_if_folder_exists: true,
+            skip_image_if_video_exists: true,
+            skip_duplicate_images: true,
+            image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
             show_toolbar_favorites: true,
             show_toolbar_folder: true,

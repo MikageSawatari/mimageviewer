@@ -48,8 +48,9 @@ impl App {
                 if !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                     resp.request_focus();
                 }
-                // Enter で決定
-                if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Enter で決定（フォーカス中 or フォーカスを失った瞬間）
+                let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                if enter && (resp.has_focus() || resp.lost_focus()) {
                     apply = true;
                 }
 
@@ -78,6 +79,10 @@ impl App {
                         cancel = true;
                     }
                 });
+                // Esc でキャンセル
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
             });
 
         let mut result: Option<PathBuf> = None;

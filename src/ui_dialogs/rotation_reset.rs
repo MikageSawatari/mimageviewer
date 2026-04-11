@@ -36,7 +36,9 @@ impl crate::app::App {
                         }
                         self.show_rotation_reset_confirm = false;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button("キャンセル").clicked()
+                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
                         self.show_rotation_reset_confirm = false;
                     }
                 });

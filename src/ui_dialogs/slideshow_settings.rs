@@ -40,7 +40,7 @@ impl crate::app::App {
                 }
             });
 
-        if !open {
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_slideshow_settings = false;
         }
     }

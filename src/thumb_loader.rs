@@ -128,6 +128,18 @@ pub fn resize_to_display_color_image(
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
+/// 画像ファイルをデコードし、指定サイズにリサイズした ColorImage を返す。
+/// 動画の同名画像サムネイルオーバーライド用。
+pub fn decode_image_for_thumb(
+    path: &std::path::Path,
+    display_px: u32,
+) -> Option<egui::ColorImage> {
+    let img = image::open(path).ok().or_else(|| {
+        crate::wic_decoder::decode_to_dynamic_image(path)
+    })?;
+    Some(resize_to_display_color_image(&img, display_px))
+}
+
 /// 現在のセルサイズから表示用 ColorImage の画素数を算出する。
 ///
 /// 論理ピクセル × DPI スケールで物理ピクセルを求め、256-2048 px にクランプする。

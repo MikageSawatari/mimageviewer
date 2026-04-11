@@ -79,6 +79,10 @@ impl crate::app::App {
                 }
             });
 
-        self.show_exif_settings = open;
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_exif_settings = false;
+        } else {
+            self.show_exif_settings = open;
+        }
     }
 }
