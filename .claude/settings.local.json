@@ -92,7 +92,26 @@
       "Bash(export PATH=\"$PATH:/c/Users/mikag/.cargo/bin\")",
       "Bash(cmd.exe /c \"cargo build 2>&1\")",
       "Bash(cmd /c \"cd /d H:\\\\\\\\home\\\\\\\\mimageviewer && cargo build 2>&1\")",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(wc -l /h/home/mimageviewer/src/*.rs)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo install:*)",
+      "Bash(rustup component:*)",
+      "Bash(cargo llvm-cov:*)",
+      "Bash(start target/release/mimageviewer.exe)",
+      "Bash(powershell -Command \"Get-Process mimageviewer -ErrorAction SilentlyContinue | Select-Object ProcessName, MainWindowTitle\")",
+      "Bash(cargo check:*)",
+      "Bash(python -c \"from PIL import Image; import piexif; print\\('OK'\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python test_images/create_test_images.py)",
+      "Bash(python -c ':*)",
+      "Bash(cargo run:*)",
+      "Bash(curl -s \"https://crates.io/api/v1/crates?q=nvapi&per_page=20\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/arcnmx/nvapi-rs/master/nvapi-sys/lib.rs\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:developer.nvidia.com)",
+      "WebFetch(domain:developer.download.nvidia.com)"
     ]
   }
 }

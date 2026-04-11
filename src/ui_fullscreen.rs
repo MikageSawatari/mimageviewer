@@ -318,7 +318,7 @@ impl App {
         });
         let ctrl_d = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown));
         let ctrl_u = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
-        let key_i = ctx.input(|i| i.key_pressed(egui::Key::I));
+        let key_i = ctx.input(|i| i.key_pressed(egui::Key::I) || i.key_pressed(egui::Key::Tab));
         let key_s = ctx.input(|i| i.key_pressed(egui::Key::Space));
         let key_r = ctx.input(|i| i.key_pressed(egui::Key::R));
         let key_l = ctx.input(|i| i.key_pressed(egui::Key::L));
