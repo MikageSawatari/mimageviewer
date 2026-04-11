@@ -140,6 +140,77 @@ pub fn decode_image_for_thumb(
     Some(resize_to_display_color_image(&img, display_px))
 }
 
+/// EXIF Orientation に基づいて画像を回転・反転する。
+/// デコード直後の DynamicImage に適用する。
+pub fn apply_exif_orientation(
+    img: image::DynamicImage,
+    path: &std::path::Path,
+) -> image::DynamicImage {
+    let orientation = read_exif_orientation(path);
+    apply_orientation(img, orientation)
+}
+
+/// バイト列から EXIF Orientation を読み取る（ZIP 内画像用）。
+pub fn apply_exif_orientation_from_bytes(
+    img: image::DynamicImage,
+    bytes: &[u8],
+) -> image::DynamicImage {
+    let orientation = read_exif_orientation_from_bytes(bytes);
+    apply_orientation(img, orientation)
+}
+
+fn read_exif_orientation(path: &std::path::Path) -> u16 {
+    rexif::parse_file(path.to_str().unwrap_or(""))
+        .ok()
+        .and_then(|exif| {
+            exif.entries
+                .iter()
+                .find(|e| e.ifd.tag == 274)
+                .and_then(|e| e.value_more_readable.trim().parse::<u16>().ok()
+                    .or_else(|| orientation_from_text(&e.value_more_readable)))
+        })
+        .unwrap_or(1)
+}
+
+fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
+    rexif::parse_buffer(bytes)
+        .ok()
+        .and_then(|exif| {
+            exif.entries
+                .iter()
+                .find(|e| e.ifd.tag == 274)
+                .and_then(|e| e.value_more_readable.trim().parse::<u16>().ok()
+                    .or_else(|| orientation_from_text(&e.value_more_readable)))
+        })
+        .unwrap_or(1)
+}
+
+/// rexif の value_more_readable テキストから Orientation 値を推測する
+fn orientation_from_text(text: &str) -> Option<u16> {
+    let t = text.to_lowercase();
+    if t.contains("straight") || t.contains("normal") { return Some(1); }
+    if t.contains("rotated to left") || t.contains("90 cw") { return Some(6); }
+    if t.contains("upside down") || t.contains("180") { return Some(3); }
+    if t.contains("rotated to right") || t.contains("270 cw") || t.contains("90 ccw") { return Some(8); }
+    if t.contains("mirrored horizontally") { return Some(2); }
+    if t.contains("mirrored vertically") { return Some(4); }
+    None
+}
+
+fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+    match orientation {
+        1 => img,                                          // 正常
+        2 => img.fliph(),                                  // 左右反転
+        3 => img.rotate180(),                              // 180°
+        4 => img.flipv(),                                  // 上下反転
+        5 => img.rotate90().fliph(),                       // 転置
+        6 => img.rotate90(),                               // 90° CW
+        7 => img.rotate90().flipv(),                       // 転置 + 反転
+        8 => img.rotate270(),                              // 270° CW
+        _ => img,
+    }
+}
+
 /// 現在のセルサイズから表示用 ColorImage の画素数を算出する。
 ///
 /// 論理ピクセル × DPI スケールで物理ピクセルを求め、256-2048 px にクランプする。
@@ -293,9 +364,20 @@ pub fn load_one_cached(
             return;
         }
     };
+
+    // EXIF Orientation に基づいて自動回転
+    let img = if zip_entry.is_some() {
+        // ZIP 内画像: バイト列から Orientation を読み取り済みのはずだが、
+        // ここでは再読みが必要。ただしパフォーマンス上、ZIP の場合はスキップ
+        // (ZIPの中のファイルは通常カメラ撮影ではないため)
+        img
+    } else {
+        apply_exif_orientation(img, path)
+    };
+
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // 元画像のピクセル寸法 (サムネイル情報オーバーレイで使う)
+    // 元画像のピクセル寸法 (EXIF 回転適用後)
     let source_dims: Option<(u32, u32)> = Some((img.width(), img.height()));
 
     // (A) 表示用パス: 元画像から直接セルサイズにリサイズして UI へ送信

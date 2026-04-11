@@ -1975,6 +1975,12 @@ impl App {
             };
             match open_result {
                 Ok(img) => {
+                    // EXIF Orientation 自動回転 (ZIP 以外)
+                    let img = if zip_entry.is_none() {
+                        crate::thumb_loader::apply_exif_orientation(img, &path)
+                    } else {
+                        img
+                    };
                     let rgba = img.to_rgba8();
                     let (w, h) = (rgba.width(), rgba.height());
                     let size = [w as usize, h as usize];
