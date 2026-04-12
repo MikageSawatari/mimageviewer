@@ -76,6 +76,26 @@ impl App {
 
                         ui.add_space(8.0);
                         ui.separator();
+                        ui.add_space(6.0);
+
+                        ui.checkbox(
+                            &mut self.settings.batch_cache_zip_contents,
+                            "ZIP ファイルの中身もキャッシュ",
+                        );
+                        ui.checkbox(
+                            &mut self.settings.batch_cache_pdf_contents,
+                            "PDF ファイルの中身もキャッシュ",
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "チェックなしでも先頭1枚/1ページはキャッシュされます"
+                            )
+                            .weak()
+                            .small(),
+                        );
+
+                        ui.add_space(8.0);
+                        ui.separator();
                         ui.add_space(4.0);
 
                         let any_checked = self.cc.checked.iter().any(|&b| b);
@@ -86,6 +106,7 @@ impl App {
                             )
                             .clicked()
                         {
+                            self.settings.save();
                             self.start_cache_creation();
                         }
                     } else {

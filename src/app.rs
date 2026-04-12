@@ -28,7 +28,7 @@ fn stem_lower(path: &std::path::Path) -> String {
 use crate::fs_animation::{decode_apng_frames, decode_gif_frames, FsCacheEntry, FsLoadResult};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
-    build_and_save_one, compute_display_px, process_load_request, CacheDecision, LoadRequest,
+    build_and_save_one, compute_display_px, encode_and_save, process_load_request, CacheDecision, LoadRequest,
     ThumbMsg,
 };
 use crate::ui_helpers::{
@@ -2808,6 +2808,8 @@ impl App {
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
         let threads = self.settings.parallelism.thread_count();
+        let batch_zip = self.settings.batch_cache_zip_contents;
+        let batch_pdf = self.settings.batch_cache_pdf_contents;
 
         std::thread::spawn(move || {
             // Pass 1: カウント
@@ -2846,8 +2848,10 @@ impl App {
 
                 *current.lock().unwrap() = folder.to_string_lossy().to_string();
 
-                // 画像列挙（単一フォルダ、再帰なし）
+                // ファイル列挙（単一フォルダ、再帰なし — 画像・ZIP・PDF を1パスで分類）
                 let mut images: Vec<(PathBuf, i64, i64)> = Vec::new();
+                let mut zip_files: Vec<(PathBuf, i64, i64)> = Vec::new();
+                let mut pdf_files: Vec<(PathBuf, i64, i64)> = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(folder) {
                     for entry in entries.flatten() {
                         let p = entry.path();
@@ -2858,17 +2862,29 @@ impl App {
                             continue;
                         };
                         let ext_lower = ext.to_ascii_lowercase();
-                        if !SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
-                            continue;
+                        let meta = || {
+                            let m = entry.metadata().ok()?;
+                            let mtime = crate::ui_helpers::mtime_secs(&m);
+                            let file_size = m.len() as i64;
+                            Some((mtime, file_size))
+                        };
+                        if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+                            if let Some((mt, fs)) = meta() {
+                                images.push((p, mt, fs));
+                            }
+                        } else if ext_lower == "zip" {
+                            if let Some((mt, fs)) = meta() {
+                                zip_files.push((p, mt, fs));
+                            }
+                        } else if ext_lower == "pdf" {
+                            if let Some((mt, fs)) = meta() {
+                                pdf_files.push((p, mt, fs));
+                            }
                         }
-                        let meta = entry.metadata().ok();
-                        let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-                        let file_size = meta.map_or(0, |m| m.len() as i64);
-                        images.push((p, mtime, file_size));
                     }
                 }
 
-                if images.is_empty() {
+                if images.is_empty() && zip_files.is_empty() && pdf_files.is_empty() {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -2880,35 +2896,223 @@ impl App {
                 };
                 let cache_map = catalog.load_all().unwrap_or_default();
 
-                // 並列でデコード + 保存
-                pool.install(|| {
-                    use rayon::prelude::*;
-                    images.par_iter().for_each(|(path, mtime, file_size)| {
-                        if cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let filename = match path.file_name().and_then(|n| n.to_str()) {
-                            Some(n) => n,
-                            None => return,
-                        };
-                        // 既存キャッシュチェック
-                        if let Some(entry) = cache_map.get(filename) {
-                            if entry.mtime == *mtime && entry.file_size == *file_size {
+                // ── 画像を並列でデコード + 保存 ──
+                if !images.is_empty() {
+                    pool.install(|| {
+                        use rayon::prelude::*;
+                        images.par_iter().for_each(|(path, mtime, file_size)| {
+                            if cancel.load(Ordering::Relaxed) {
                                 return;
                             }
-                        }
-                        if let Some(bytes) = build_and_save_one(
-                            path,
-                            &catalog,
-                            *mtime,
-                            *file_size,
-                            thumb_px,
-                            thumb_quality,
-                        ) {
-                            size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
-                        }
+                            let filename = match path.file_name().and_then(|n| n.to_str()) {
+                                Some(n) => n,
+                                None => return,
+                            };
+                            if let Some(entry) = cache_map.get(filename) {
+                                if entry.mtime == *mtime && entry.file_size == *file_size {
+                                    return;
+                                }
+                            }
+                            if let Some(bytes) = build_and_save_one(
+                                path,
+                                &catalog,
+                                *mtime,
+                                *file_size,
+                                thumb_px,
+                                thumb_quality,
+                            ) {
+                                size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                            }
+                        });
                     });
-                });
+                }
+
+                // ── ZIP ファイルの中身をキャッシュ ──
+                for (zip_path, zip_mtime, zip_file_size) in &zip_files {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let zip_fname = match zip_path.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    let folder_key = format!("{}{}", CACHE_KEY_ZIP, zip_fname);
+
+                    if batch_zip {
+                        *current.lock().unwrap() = zip_path.to_string_lossy().to_string();
+                        let entries = match crate::zip_loader::enumerate_image_entries(zip_path) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        let zip_catalog = match crate::catalog::CatalogDb::open(&cache_dir, zip_path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let zip_cache_map = zip_catalog.load_all().unwrap_or_default();
+                        let entry_count = entries.len();
+
+                        // 先頭エントリの WebP を並列処理中にキャプチャ
+                        let first_webp: Arc<Mutex<Option<(image::DynamicImage, String)>>> =
+                            Arc::new(Mutex::new(None));
+
+                        pool.install(|| {
+                            use rayon::prelude::*;
+                            entries.par_iter().enumerate().for_each(|(i, entry)| {
+                                if cancel.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                *current.lock().unwrap() = format!(
+                                    "{} ({}/{})", zip_fname, i + 1, entry_count
+                                );
+                                if let Some(existing) = zip_cache_map.get(&entry.entry_name) {
+                                    if existing.mtime == entry.mtime
+                                        && existing.file_size == entry.uncompressed_size as i64
+                                    {
+                                        return;
+                                    }
+                                }
+                                let raw = match crate::zip_loader::read_entry_bytes(zip_path, &entry.entry_name) {
+                                    Ok(b) => b,
+                                    Err(_) => return,
+                                };
+                                let img = match image::load_from_memory(&raw) {
+                                    Ok(i) => i,
+                                    Err(_) => return,
+                                };
+                                // 先頭エントリをキャプチャ（親フォルダ用サムネイル再利用）
+                                if i == 0 {
+                                    *first_webp.lock().unwrap() = Some((img.clone(), entry.entry_name.clone()));
+                                }
+                                if let Some(bytes) = encode_and_save(
+                                    &img,
+                                    &entry.entry_name,
+                                    &zip_catalog,
+                                    entry.mtime,
+                                    entry.uncompressed_size as i64,
+                                    thumb_px,
+                                    thumb_quality,
+                                ) {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
+                            });
+                        });
+
+                        // 先頭1枚を親フォルダの DB にも保存（フォルダ一覧用サムネイル）
+                        if !cache_map.contains_key(&folder_key) {
+                            let captured = first_webp.lock().unwrap().take();
+                            if let Some((img, _)) = captured {
+                                if let Some(bytes) = encode_and_save(
+                                    &img, &folder_key, &catalog,
+                                    *zip_mtime, *zip_file_size, thumb_px, thumb_quality,
+                                ) {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    } else {
+                        // 先頭1枚のみ（フォルダ一覧用サムネイル）
+                        if cache_map.contains_key(&folder_key) {
+                            continue;
+                        }
+                        if let Some(first_entry) = crate::zip_loader::first_image_entry(zip_path) {
+                            if let Ok(raw) = crate::zip_loader::read_entry_bytes(zip_path, &first_entry) {
+                                if let Ok(img) = image::load_from_memory(&raw) {
+                                    if let Some(bytes) = encode_and_save(
+                                        &img, &folder_key, &catalog,
+                                        *zip_mtime, *zip_file_size, thumb_px, thumb_quality,
+                                    ) {
+                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── PDF ファイルの中身をキャッシュ ──
+                if !pdf_files.is_empty() && !cancel.load(Ordering::Relaxed) {
+                    let pw_store = crate::pdf_passwords::PdfPasswordStore::load();
+
+                    for (pdf_path, pdf_mtime, pdf_file_size) in &pdf_files {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let pdf_fname = match pdf_path.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n.to_string(),
+                            None => continue,
+                        };
+                        *current.lock().unwrap() = pdf_path.to_string_lossy().to_string();
+                        let password = pw_store.get(pdf_path);
+                        let pw_ref = password.as_deref();
+                        let folder_key = format!("{}{}", CACHE_KEY_PDF, pdf_fname);
+
+                        if batch_pdf {
+                            // enumerate_pages がパスワード不正時に Err を返すので
+                            // check_password_needed は不要
+                            let pages = match crate::pdf_loader::enumerate_pages(pdf_path, pw_ref) {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            let pdf_catalog = match crate::catalog::CatalogDb::open(&cache_dir, pdf_path) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let pdf_cache_map = pdf_catalog.load_all().unwrap_or_default();
+                            let page_count = pages.len();
+
+                            // PDFium ワーカーはシングルスレッド → 順次処理
+                            for i in 0..page_count {
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let page_num = i as u32;
+                                *current.lock().unwrap() = format!(
+                                    "{} ({}/{})", pdf_fname, i + 1, page_count
+                                );
+                                let key = crate::grid_item::pdf_page_cache_key(page_num);
+                                if let Some(existing) = pdf_cache_map.get(&key) {
+                                    if existing.mtime == *pdf_mtime
+                                        && existing.file_size == *pdf_file_size
+                                    {
+                                        continue;
+                                    }
+                                }
+                                if let Some(bytes) = crate::thumb_loader::build_and_save_one_pdf(
+                                    pdf_path, page_num, pw_ref, &pdf_catalog,
+                                    *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
+                                ) {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
+                            }
+
+                            // 先頭1ページを親フォルダの DB にも保存
+                            if page_count > 0 && !cache_map.contains_key(&folder_key) {
+                                if let Ok(img) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
+                                    if let Some(bytes) = encode_and_save(
+                                        &img, &folder_key, &catalog,
+                                        *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
+                                    ) {
+                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        } else {
+                            // 先頭1ページのみ（フォルダ一覧用サムネイル）
+                            if cache_map.contains_key(&folder_key) {
+                                continue;
+                            }
+                            // render_page がパスワード不正時に Err を返すのでそのままスキップ
+                            if let Ok(img) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
+                                if let Some(bytes) = encode_and_save(
+                                    &img, &folder_key, &catalog,
+                                    *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
+                                ) {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 done.fetch_add(1, Ordering::Relaxed);
             }

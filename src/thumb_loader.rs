@@ -738,12 +738,58 @@ pub fn build_and_save_one(
         })
         .ok()?;
 
+    let name = path.file_name()?.to_str()?;
+    encode_and_save(&img, name, catalog, mtime, file_size, thumb_px, thumb_quality)
+}
+
+/// デコード済み画像を WebP エンコードしてカタログに保存する共通ヘルパー。
+pub fn encode_and_save(
+    img: &image::DynamicImage,
+    key: &str,
+    catalog: &crate::catalog::CatalogDb,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+) -> Option<usize> {
     let source_dims = Some((img.width(), img.height()));
     let (webp_data, w, h) =
-        crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32)?;
-    let name = path.file_name()?.to_str()?;
+        crate::catalog::encode_thumb_webp(img, thumb_px, thumb_quality as f32)?;
     catalog
-        .save(name, mtime, file_size, w, h, source_dims, &webp_data)
+        .save(key, mtime, file_size, w, h, source_dims, &webp_data)
         .ok()?;
     Some(webp_data.len())
+}
+
+/// ZIP 内の画像エントリ1つをデコードしてキャッシュに保存する。
+/// バッチキャッシュ作成用。
+pub fn build_and_save_one_zip(
+    zip_path: &Path,
+    entry_name: &str,
+    catalog: &crate::catalog::CatalogDb,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+) -> Option<usize> {
+    let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    encode_and_save(&img, entry_name, catalog, mtime, file_size, thumb_px, thumb_quality)
+}
+
+/// PDF の1ページをレンダリングしてキャッシュに保存する。
+/// バッチキャッシュ作成用。
+pub fn build_and_save_one_pdf(
+    pdf_path: &Path,
+    page_num: u32,
+    password: Option<&str>,
+    catalog: &crate::catalog::CatalogDb,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+) -> Option<usize> {
+    let img = crate::pdf_loader::render_page(pdf_path, page_num, thumb_px, password, None).ok()?;
+    let key = crate::grid_item::pdf_page_cache_key(page_num);
+    encode_and_save(&img, &key, catalog, mtime, file_size, thumb_px, thumb_quality)
 }

@@ -215,6 +215,16 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **出力**: `installer/Output/mImageViewer_setup.exe`
 - **設定保存先**: `%APPDATA%\mimageviewer`（インストーラ版・単体版共通）
 
+## コード修正時のドキュメント同時更新
+
+機能の追加・変更・削除を行った場合は、以下のドキュメントも同時に更新すること:
+
+- `htdocs/mimageviewer/manual/` — ユーザー向けマニュアル（設定・操作方法の変更を反映）
+- `htdocs/mimageviewer/index.html` — 製品ページ（新機能の紹介・機能一覧の更新）
+- `docs/spec.md` — 仕様書（設定項目・内部仕様の変更を反映）
+
+コードだけ修正してドキュメントを放置しない。
+
 ## リリース手順チェックリスト
 
 リリース時は以下を漏れなく更新すること:

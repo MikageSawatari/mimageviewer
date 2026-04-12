@@ -375,6 +375,12 @@ pub struct Settings {
     /// Auto モード: ZIP 内画像を無条件でキャッシュ対象にする（解凍+デコードの二重コスト）
     #[serde(default = "default_true")]
     pub cache_zip_always: bool,
+    /// 一括キャッシュ作成: ZIP 内の全画像をキャッシュ対象にする
+    #[serde(default)]
+    pub batch_cache_zip_contents: bool,
+    /// 一括キャッシュ作成: PDF 内の全ページをキャッシュ対象にする
+    #[serde(default)]
+    pub batch_cache_pdf_contents: bool,
     /// 段階 B: サムネイル先読みの後方ページ数（現在位置より前に保持するページ数）
     #[serde(default = "default_thumb_prev_pages")]
     pub thumb_prev_pages: u32,
@@ -565,6 +571,8 @@ impl Default for Settings {
             cache_webp_always: true,
             cache_pdf_always: true,
             cache_zip_always: true,
+            batch_cache_zip_contents: false,
+            batch_cache_pdf_contents: false,
             thumb_prev_pages: default_thumb_prev_pages(),
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
