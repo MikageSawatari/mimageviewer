@@ -183,16 +183,25 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        GridItem::Folder(p) => {
+                        GridItem::Folder(p)
+                        | GridItem::ZipFile(p)
+                        | GridItem::PdfFile(p) => {
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(p.to_string_lossy().to_string());
                                 close = true;
                             }
-                            if ui.button("エクスプローラで開く").clicked() {
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(p.as_os_str())
-                                    .spawn();
-                                close = true;
+                            if matches!(item, GridItem::Folder(_)) {
+                                if ui.button("エクスプローラで開く").clicked() {
+                                    let _ = std::process::Command::new("explorer")
+                                        .arg(p.as_os_str())
+                                        .spawn();
+                                    close = true;
+                                }
+                            } else {
+                                if ui.button("フォルダを開く").clicked() {
+                                    open_folder_in_explorer(p);
+                                    close = true;
+                                }
                             }
                             ui.separator();
                             if ui.button("ペースト (Ctrl+V)").clicked() {

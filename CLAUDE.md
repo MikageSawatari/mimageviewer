@@ -64,7 +64,7 @@ mimageviewer/
 │   ├── settings.rs          # 設定の読み書き（JSON 永続化）
 │   ├── catalog.rs           # SQLite サムネイルカタログ
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
-│   ├── grid_item.rs         # GridItem / ThumbnailState 定義
+│   ├── grid_item.rs         # GridItem（Folder/Image/Video/ZipFile/PdfFile/ZipImage/PdfPage/ZipSeparator）/ ThumbnailState 定義
 │   ├── thumb_loader.rs      # サムネイル並列ロード
 │   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
 │   ├── video_thumb.rs       # 動画サムネイル取得（Windows Shell API）
@@ -104,7 +104,8 @@ mimageviewer/
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 
 ### サムネイルロード
-- **Grid contents**: フォルダ先頭（名前順）、画像後続（ソート順設定可）。非画像は無視。
+- **Grid contents**: フォルダ・ZIP・PDF 先頭（名前順）、画像後続（ソート順設定可）。
+  ZIP/PDF ファイルは 1 枚目/1 ページ目のサムネイル＋種別バッジで表示。非画像は無視。
 - **Cancellation**: `Arc<AtomicBool>` キャンセルトークン。`load_folder` 呼び出し時に
   旧トークンを `true` にして旧タスクを中断。
 - **Per-load thread pool**: フォルダごとに新規 `rayon::ThreadPool` を作成。

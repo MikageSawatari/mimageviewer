@@ -25,7 +25,7 @@ use crate::thumb_loader::{
     ThumbMsg,
 };
 use crate::ui_helpers::{
-    draw_play_icon, natural_sort_key,
+    draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
     open_external_player, truncate_name,
 };
 
@@ -557,6 +557,8 @@ impl App {
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
         let mut folders: Vec<GridItem> = Vec::new();
+        // フォルダアイテムごとのメタデータ (ZipFile/PdfFile はサムネイルロードに必要)
+        let mut folder_metas: Vec<Option<(i64, i64)>> = Vec::new();
         // (path, is_video, mtime, file_size)
         let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
 
@@ -565,6 +567,7 @@ impl App {
                 let p = entry.path();
                 if p.is_dir() {
                     folders.push(GridItem::Folder(p));
+                    folder_metas.push(None);
                 } else if is_apple_double(&p) {
                     // macOS/iPhone AppleDouble メタデータ — スキップ
                 } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
@@ -580,17 +583,24 @@ impl App {
                     } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
                         all_media.push((p, true, mtime, file_size));
                     } else if ext_lower == "zip" {
-                        // タスク 3: ZIP ファイルはフォルダのように扱う
-                        folders.push(GridItem::Folder(p));
+                        folders.push(GridItem::ZipFile(p));
+                        folder_metas.push(Some((mtime, file_size)));
                     } else if ext_lower == "pdf" {
-                        // PDF ファイルはフォルダのように扱う
-                        folders.push(GridItem::Folder(p));
+                        folders.push(GridItem::PdfFile(p));
+                        folder_metas.push(Some((mtime, file_size)));
                     }
                 }
             }
         }
 
-        folders.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+        {
+            // folders と folder_metas を同じ順序でソート
+            let mut paired: Vec<_> = folders.into_iter().zip(folder_metas).collect();
+            paired.sort_by(|(a, _), (b, _)| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+            let (f, m): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+            folders = f;
+            folder_metas = m;
+        }
         let sort = self.settings.sort_order;
         all_media.sort_by(|(a, _, a_mt, _), (b, _, b_mt, _)| {
             let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -605,7 +615,7 @@ impl App {
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
         let mut items: Vec<GridItem> = folders;
-        let mut image_metas: Vec<Option<(i64, i64)>> = vec![None; folder_count];
+        let mut image_metas: Vec<Option<(i64, i64)>> = folder_metas;
         let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
 
         for (offset, (p, is_video, mtime, file_size)) in all_media.iter().enumerate() {
@@ -625,6 +635,14 @@ impl App {
             .iter()
             .filter_map(|it| match it {
                 GridItem::Image(p) => p.file_name()?.to_str().map(String::from),
+                GridItem::ZipFile(p) => {
+                    let fname = p.file_name()?.to_str()?;
+                    Some(format!("zipthumb:{fname}"))
+                }
+                GridItem::PdfFile(p) => {
+                    let fname = p.file_name()?.to_str()?;
+                    Some(format!("pdfthumb:{fname}"))
+                }
                 _ => None,
             })
             .collect();
@@ -1573,6 +1591,9 @@ impl App {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p)) => return Some(p.clone()),
+                        Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                            return Some(p.clone());
+                        }
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
@@ -2929,16 +2950,39 @@ fn make_load_request(
         GridItem::Image(p) => Some(LoadRequest {
             idx, path: p.clone(), mtime, file_size,
             skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
+            cache_key_override: None,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
             skip_cache, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
+            cache_key_override: None,
         }),
         GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
             skip_cache, zip_entry: None, pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),
+            cache_key_override: None,
         }),
+        GridItem::ZipFile(p) => {
+            // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得
+            let first = crate::zip_loader::first_image_entry(p)?;
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            Some(LoadRequest {
+                idx, path: p.clone(), mtime, file_size,
+                skip_cache, zip_entry: Some(first), pdf_page: None, pdf_password: None,
+                cache_key_override: Some(format!("zipthumb:{fname}")),
+            })
+        }
+        GridItem::PdfFile(p) => {
+            // フォルダ一覧用: PDF の 1 ページ目をサムネイルとして取得
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            Some(LoadRequest {
+                idx, path: p.clone(), mtime, file_size,
+                skip_cache, zip_entry: None, pdf_page: Some(0),
+                pdf_password: pdf_password.map(String::from),
+                cache_key_override: Some(format!("pdfthumb:{fname}")),
+            })
+        }
         _ => None,
     }
 }
@@ -3151,6 +3195,78 @@ pub(crate) fn draw_cell(
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
             draw_thumb(painter, inner, thumb, rotation);
+        }
+        GridItem::ZipFile(path) => {
+            match thumb {
+                ThumbnailState::Loaded { tex, .. } => {
+                    draw_thumb_texture(painter, inner, tex, rotation);
+                }
+                ThumbnailState::Pending | ThumbnailState::Evicted => {
+                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+                    painter.text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "📦",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(120),
+                    );
+                }
+                ThumbnailState::Failed => {
+                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+                    painter.text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "📦",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(120),
+                    );
+                }
+            }
+            draw_zip_badge(painter, inner);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                truncate_name(name, 18),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(30),
+            );
+        }
+        GridItem::PdfFile(path) => {
+            match thumb {
+                ThumbnailState::Loaded { tex, .. } => {
+                    draw_thumb_texture(painter, inner, tex, rotation);
+                }
+                ThumbnailState::Pending | ThumbnailState::Evicted => {
+                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+                    painter.text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "📄",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(120),
+                    );
+                }
+                ThumbnailState::Failed => {
+                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+                    painter.text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "📄",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(120),
+                    );
+                }
+            }
+            draw_pdf_badge(painter, inner);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                truncate_name(name, 18),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(30),
+            );
         }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名

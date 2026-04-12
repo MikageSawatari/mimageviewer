@@ -561,7 +561,9 @@ impl App {
         }
         if response.double_clicked() {
             match self.items.get(idx) {
-                Some(GridItem::Folder(p)) => {
+                Some(GridItem::Folder(p))
+                | Some(GridItem::ZipFile(p))
+                | Some(GridItem::PdfFile(p)) => {
                     nav = Some(p.clone())
                 }
                 Some(GridItem::Image(_))

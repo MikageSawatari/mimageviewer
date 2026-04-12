@@ -68,6 +68,29 @@ pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageE
     Ok(out)
 }
 
+/// ZIP ファイルの最初の画像エントリ名を返す。
+/// フォルダ一覧でのサムネイル表示用 (1枚目のみ高速取得)。
+pub fn first_image_entry(zip_path: &Path) -> Option<String> {
+    let file = File::open(zip_path).ok()?;
+    let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else { continue };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if name.contains("__MACOSX/") || name.starts_with('.') {
+            continue;
+        }
+        let Some(dot) = name.rfind('.') else { continue };
+        let ext = name[dot + 1..].to_ascii_lowercase();
+        if IMAGE_EXTS.contains(&ext.as_str()) {
+            return Some(name.replace('\\', "/"));
+        }
+    }
+    None
+}
+
 /// ZIP 内の特定エントリの生バイト列を取り出す。
 ///
 /// 呼び出しごとに ZIP を開き直すため、多数のエントリを連続で読むと

@@ -1,7 +1,7 @@
 //! グリッド要素のデータモデル。
 //!
-//! `GridItem` は一覧に表示される各セルの種別 (フォルダ・画像・動画・ZIP 内画像・
-//! ZIP 内サブディレクトリ境界) を表す。
+//! `GridItem` は一覧に表示される各セルの種別 (フォルダ・画像・動画・ZIP/PDF ファイル・
+//! ZIP 内画像・ZIP 内サブディレクトリ境界・PDF ページ) を表す。
 //! `ThumbnailState` は各セルのサムネイル読み込み状態。
 //!
 //! どちらも純粋なデータ型で、UI 状態や I/O は持たない。
@@ -14,6 +14,10 @@ pub enum GridItem {
     Folder(PathBuf),
     Image(PathBuf),
     Video(PathBuf),
+    /// フォルダ一覧に表示される ZIP ファイル (1枚目のサムネイル + バッジ)
+    ZipFile(PathBuf),
+    /// フォルダ一覧に表示される PDF ファイル (1ページ目のサムネイル + バッジ)
+    PdfFile(PathBuf),
     /// タスク 3: ZIP ファイル内の画像エントリ
     ZipImage {
         zip_path: PathBuf,
@@ -41,7 +45,8 @@ impl GridItem {
     /// - PdfPage: "Page N" (1-indexed)
     pub fn name(&self) -> Cow<'_, str> {
         match self {
-            GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p) => {
+            GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p)
+            | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                 Cow::Borrowed(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
             }
             GridItem::ZipImage { entry_name, .. } => {

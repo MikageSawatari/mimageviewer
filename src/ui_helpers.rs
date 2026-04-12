@@ -3,7 +3,7 @@
 //! どの関数も `&mut App` には依存せず、純粋な引数だけで動作する。
 //! - 整形系: `format_bytes`, `format_count`, `truncate_name`
 //! - ソート系: `natural_sort_key`, `NaturalChunk`
-//! - 描画系: `draw_play_icon`, `draw_histogram`, `draw_format_rows`
+//! - 描画系: `draw_play_icon`, `draw_zip_badge`, `draw_pdf_badge`, `draw_histogram`, `draw_format_rows`
 //! - ナビ系: `adjacent_navigable_idx`
 //! - 外部連携: `open_external_player`
 
@@ -127,6 +127,51 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
         egui::Color32::WHITE,
         egui::Stroke::NONE,
     ));
+}
+
+/// サムネイル左下にファイル種別バッジを描画する共通関数。
+fn draw_file_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str, bg: egui::Color32) {
+    let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
+    let pad_h = font_size * 0.35;
+    let pad_v = font_size * 0.2;
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(font_size),
+        egui::Color32::WHITE,
+    );
+    let text_size = galley.size();
+    let badge_w = text_size.x + pad_h * 2.0;
+    let badge_h = text_size.y + pad_v * 2.0;
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(cell_rect.min.x + 3.0, cell_rect.max.y - badge_h - 3.0),
+        egui::vec2(badge_w, badge_h),
+    );
+    painter.rect_filled(badge_rect, 3.0, bg);
+    painter.galley(
+        egui::pos2(badge_rect.min.x + pad_h, badge_rect.min.y + pad_v),
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
+/// ZIP アーカイブ内画像のサムネイルに表示するバッジ（左下、青系）。
+pub fn draw_zip_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
+    draw_file_badge(
+        painter,
+        cell_rect,
+        "ZIP",
+        egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
+    );
+}
+
+/// PDF ページのサムネイルに表示するバッジ（左下、赤系）。
+pub fn draw_pdf_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
+    draw_file_badge(
+        painter,
+        cell_rect,
+        "PDF",
+        egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
+    );
 }
 
 /// 統計ダイアログのヒストグラムを ASCII バー + 件数で描画する。

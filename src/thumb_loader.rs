@@ -46,6 +46,9 @@ pub struct LoadRequest {
     pub pdf_page: Option<u32>,
     /// PDF パスワード (パスワード付き PDF 用)
     pub pdf_password: Option<String>,
+    /// フォルダ一覧の ZipFile/PdfFile 用: カタログキーを上書き。
+    /// None の場合はファイル名 / エントリ名 / ページキーから自動生成。
+    pub cache_key_override: Option<String>,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -274,11 +277,14 @@ pub fn process_load_request(
     // - 通常画像: ファイル名 (例: "foo.jpg")
     // - ZIP エントリ: エントリ名 (例: "work1/img01.jpg") 丸ごと
     //   ZIP ごとに別 DB が開かれるため、DB 内で一意
+    // - cache_key_override: フォルダ一覧の ZipFile/PdfFile 用
     // PDF ページの場合はキー名を生成する必要があるので owned を保持
-    let pdf_key: String;
-    let filename: &str = if let Some(page_num) = req.pdf_page {
-        pdf_key = crate::grid_item::pdf_page_cache_key(page_num);
-        &pdf_key
+    let auto_key: String;
+    let filename: &str = if let Some(ref key) = req.cache_key_override {
+        key.as_str()
+    } else if let Some(page_num) = req.pdf_page {
+        auto_key = crate::grid_item::pdf_page_cache_key(page_num);
+        &auto_key
     } else if let Some(ref name) = req.zip_entry {
         name.as_str()
     } else {
@@ -313,6 +319,7 @@ pub fn process_load_request(
         req.zip_entry.as_deref(),
         req.pdf_page,
         req.pdf_password.as_deref(),
+        req.cache_key_override.as_deref(),
         req.idx, tx, catalog,
         req.mtime, req.file_size, gen_done,
         thumb_px, thumb_quality, display_px, cache_decision,
@@ -340,6 +347,7 @@ pub fn load_one_cached(
     zip_entry: Option<&str>,
     pdf_page: Option<u32>,
     pdf_password: Option<&str>,
+    cache_key_override: Option<&str>,
     idx: usize,
     tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
@@ -354,13 +362,17 @@ pub fn load_one_cached(
     cancel: Option<&Arc<AtomicBool>>,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
-    // process_load_request 側と同じキー形式を使うこと。
-    let pdf_cache_key_buf: String;
-    let pdf_display_buf: String;
-    let (name, display_name): (&str, &str) = if let Some(page_num) = pdf_page {
-        pdf_cache_key_buf = crate::grid_item::pdf_page_cache_key(page_num);
-        pdf_display_buf = format!("Page {}", page_num + 1);
-        (&pdf_cache_key_buf, &pdf_display_buf)
+    // process_load_request 側と同じキー形式を使うこと��
+    // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
+    let auto_key_buf: String;
+    let display_buf: String;
+    let (name, display_name): (&str, &str) = if let Some(key) = cache_key_override {
+        let dn = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        (key, dn)
+    } else if let Some(page_num) = pdf_page {
+        auto_key_buf = crate::grid_item::pdf_page_cache_key(page_num);
+        display_buf = format!("Page {}", page_num + 1);
+        (&auto_key_buf, &display_buf)
     } else if let Some(n) = zip_entry {
         (n, n)
     } else {
