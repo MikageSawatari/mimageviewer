@@ -18,6 +18,18 @@ use crate::ui_helpers::{draw_play_icon, format_bytes_small, open_external_player
 const METADATA_PANEL_WIDTH: f32 = 380.0;
 /// ホバー時トップバーの高さ
 const TOP_BAR_HEIGHT: f32 = 44.0;
+/// ホイール感度（raw_scroll_delta の除数）
+const WHEEL_SENSITIVITY: f32 = 30.0;
+/// ズーム倍率の下限
+const ZOOM_MIN: f32 = 0.1;
+/// ズーム倍率の上限
+const ZOOM_MAX: f32 = 50.0;
+/// ズームが 1.0 とみなせるしきい値
+const ZOOM_NEAR_ONE: f32 = 1.001;
+/// 回転・パンがゼロとみなせるしきい値
+const TRANSFORM_EPSILON: f32 = 0.001;
+/// パンがゼロとみなせるしきい値（length_sq）
+const PAN_EPSILON_SQ: f32 = 0.25;
 /// バー内ボタンのサイズ
 const BAR_BUTTON_SIZE: f32 = 32.0;
 /// バー内ボタンの上下マージン
@@ -51,6 +63,37 @@ impl App {
         self.analysis_mosaic_grid = false;
         self.analysis_filter_mag = 0;
         self.analysis_guide_drag = None;
+    }
+
+    /// ホイールによるマウス位置固定ズームを適用する。ズームが変化したら true を返す。
+    fn apply_wheel_zoom(
+        zoom: &mut f32,
+        pan: &mut egui::Vec2,
+        wheel_y: f32,
+        mouse: Option<egui::Pos2>,
+        rect_center: egui::Pos2,
+    ) -> bool {
+        let factor = 1.1_f32.powf(wheel_y / WHEEL_SENSITIVITY);
+        let old_zoom = *zoom;
+        *zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        if let Some(mouse) = mouse {
+            let center = rect_center + *pan;
+            let cx = mouse.x - center.x;
+            let cy = mouse.y - center.y;
+            let ratio = *zoom / old_zoom;
+            pan.x += cx * (1.0 - ratio);
+            pan.y += cy * (1.0 - ratio);
+        }
+        *zoom != old_zoom
+    }
+
+    /// 現在のフルスクリーン画像が PDF ページなら、指定ズームで再レンダリングを要求する。
+    fn maybe_rerender_pdf(&mut self, zoom: f32) {
+        if let Some(idx) = self.fullscreen_idx {
+            if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+                self.request_pdf_rerender(idx, zoom);
+            }
+        }
     }
 }
 
@@ -241,13 +284,17 @@ impl App {
                                     let fs_rotation = self.get_rotation(fs_idx);
                                     let zp = if analysis_active {
                                         Some((self.analysis_zoom, self.analysis_pan))
+                                    } else if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
+                                        Some((self.fs_zoom, self.fs_pan))
                                     } else {
                                         None
                                     };
+                                    let free_rot = if analysis_active { 0.0 } else { self.fs_free_rotation };
                                     Self::draw_fs_image(
                                         ui, image_rect,
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),
                                         state.is_video, state.fs_load_failed, fs_rotation, zp,
+                                        free_rot,
                                     );
                                 }
                                 SpreadPair::Double { left, right } => {
@@ -658,8 +705,14 @@ impl App {
         }
         if key_z && !is_spread_double {
             if self.analysis_mode {
+                // 分析→通常: ズーム/パンを引き継ぐ
+                self.fs_zoom = self.analysis_zoom;
+                self.fs_pan = self.analysis_pan;
                 self.reset_analysis_mode();
             } else {
+                // 通常→分析: ズーム/パンを引き継ぐ
+                self.analysis_zoom = self.fs_zoom;
+                self.analysis_pan = self.fs_pan;
                 self.analysis_mode = true;
             }
         }
@@ -750,38 +803,35 @@ impl App {
             });
             if self.analysis_mode {
                 // 分析モード: ホイールでズーム
-                let factor = 1.1_f32.powf(wheel_y / 30.0);
-                let old_zoom = self.analysis_zoom;
-                self.analysis_zoom = (old_zoom * factor).clamp(0.1, 50.0);
-                // マウス位置を基準にパンを調整（マウス位置固定ズーム）
-                if let Some(mouse) = ctx.input(|i| i.pointer.hover_pos()) {
-                    let image_rect = analysis_image_rect(full_rect);
-                    let center = image_rect.center() + self.analysis_pan;
-                    let cx = mouse.x - center.x;
-                    let cy = mouse.y - center.y;
-                    let ratio = self.analysis_zoom / old_zoom;
-                    self.analysis_pan.x += cx * (1.0 - ratio);
-                    self.analysis_pan.y += cy * (1.0 - ratio);
-                }
-                // PDF ページ: ズーム変更時に解像度を合わせて非同期再レンダリング
-                if self.analysis_zoom != old_zoom {
-                    if let Some(idx) = self.fullscreen_idx {
-                        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-                            self.request_pdf_rerender(idx, self.analysis_zoom);
-                        }
-                    }
-                }
+                let mouse = ctx.input(|i| i.pointer.hover_pos());
+                let image_rect = analysis_image_rect(full_rect);
+                let changed = Self::apply_wheel_zoom(
+                    &mut self.analysis_zoom, &mut self.analysis_pan,
+                    wheel_y, mouse, image_rect.center(),
+                );
+                if changed { self.maybe_rerender_pdf(self.analysis_zoom); }
             } else {
-                let base = if wheel_y < 0.0 { 1 } else { -1 };
-                nav_delta = self.spread_nav_delta(base, false);
+                let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+                if ctrl_held {
+                    // 通常モード: Ctrl+ホイールでズーム
+                    let mouse = ctx.input(|i| i.pointer.hover_pos());
+                    let changed = Self::apply_wheel_zoom(
+                        &mut self.fs_zoom, &mut self.fs_pan,
+                        wheel_y, mouse, full_rect.center(),
+                    );
+                    if changed { self.maybe_rerender_pdf(self.fs_zoom); }
+                } else {
+                    let base = if wheel_y < 0.0 { 1 } else { -1 };
+                    nav_delta = self.spread_nav_delta(base, false);
+                }
             }
         }
 
-        // ── クリック ──
+        // ── クリック & ドラッグ ──
         let fs_response = ui.interact(
             full_rect,
             egui::Id::new("fs_click"),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
         );
         if self.analysis_mode {
             // 分析モード: 左クリックでのナビを無効化（パン用のドラッグは analysis_panel 側）
@@ -789,30 +839,82 @@ impl App {
             if fs_response.double_clicked() {
                 self.analysis_zoom = 1.0;
                 self.analysis_pan = egui::Vec2::ZERO;
-                // PDF ページ: ズームリセット時にベース解像度で再レンダリング
-                if let Some(idx) = self.fullscreen_idx {
-                    if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-                        self.request_pdf_rerender(idx, 1.0);
-                    }
-                }
+                self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
         } else {
-            if state.is_video {
-                if fs_response.clicked() {
-                    if let Some(ref vp) = state.video_path {
-                        open_external_player(vp);
+            // ── 通常モード: ドラッグ操作 ──
+            let mods = ctx.input(|i| i.modifiers);
+            let primary_pressed = fs_response.drag_started_by(egui::PointerButton::Primary);
+            let primary_down = fs_response.dragged_by(egui::PointerButton::Primary);
+            let primary_released = fs_response.drag_stopped_by(egui::PointerButton::Primary);
+            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+
+            if mods.ctrl {
+                // Ctrl+ドラッグ → 回転
+                if primary_pressed {
+                    if let Some(pos) = pointer_pos {
+                        self.fs_rotation_drag_start = Some((pos, self.fs_free_rotation));
+                    }
+                } else if primary_down {
+                    if let Some((start_pos, start_rot)) = self.fs_rotation_drag_start {
+                        if let Some(pos) = pointer_pos {
+                            let center = full_rect.center() + self.fs_pan;
+                            let start_angle = (start_pos.y - center.y).atan2(start_pos.x - center.x);
+                            let cur_angle = (pos.y - center.y).atan2(pos.x - center.x);
+                            self.fs_free_rotation = start_rot + (cur_angle - start_angle);
+                        }
                     }
                 }
-            } else if fs_response.clicked() {
-                if let Some(pos) = fs_response.interact_pointer_pos() {
-                    let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
-                    let in_panel = pos.y >= 60.0
-                        && (self.show_metadata_panel || pos.x > panel_threshold)
-                        && pos.x > full_rect.max.x - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
-                    if !in_panel {
-                        let base = if pos.x > full_rect.center().x { 1 } else { -1 };
-                        nav_delta = self.spread_nav_delta(base, false);
+            } else if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
+                // ズームまたは回転中: ドラッグでパン
+                if primary_pressed {
+                    if let Some(pos) = pointer_pos {
+                        self.fs_pan_drag_start = Some((pos, self.fs_pan));
+                    }
+                } else if primary_down {
+                    if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
+                        if let Some(pos) = pointer_pos {
+                            self.fs_pan = start_pan + (pos - start_pos);
+                        }
+                    }
+                }
+            }
+            if primary_released {
+                self.fs_pan_drag_start = None;
+                self.fs_rotation_drag_start = None;
+            }
+
+            // ダブルクリック → ズーム/パン/回転リセット
+            let has_transform = self.fs_zoom > ZOOM_NEAR_ONE
+                || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
+                || self.fs_pan.length_sq() > PAN_EPSILON_SQ;
+            if fs_response.double_clicked() && has_transform {
+                self.fs_zoom = 1.0;
+                self.fs_pan = egui::Vec2::ZERO;
+                self.fs_free_rotation = 0.0;
+                self.maybe_rerender_pdf(1.0);
+            } else if !has_transform {
+                // 変形なし: 従来の動画/画像クリック動作
+                let was_dragging = fs_response.dragged() && fs_response.drag_delta().length() > 3.0;
+                if !was_dragging {
+                    if state.is_video {
+                        if fs_response.clicked() {
+                            if let Some(ref vp) = state.video_path {
+                                open_external_player(vp);
+                            }
+                        }
+                    } else if fs_response.clicked() {
+                        if let Some(pos) = fs_response.interact_pointer_pos() {
+                            let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
+                            let in_panel = pos.y >= 60.0
+                                && (self.show_metadata_panel || pos.x > panel_threshold)
+                                && pos.x > full_rect.max.x - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
+                            if !in_panel {
+                                let base = if pos.x > full_rect.center().x { 1 } else { -1 };
+                                nav_delta = self.spread_nav_delta(base, false);
+                            }
+                        }
                     }
                 }
             }
@@ -958,6 +1060,7 @@ impl App {
         fs_load_failed: bool,
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
+        free_rotation_rad: f32,
     ) {
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
@@ -974,19 +1077,23 @@ impl App {
                 None => (fit_scale, full_rect.center()),
             };
             let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
-            let painter = if zoom_pan.is_some() {
+            let needs_clip = zoom_pan.is_some() || free_rotation_rad.abs() > TRANSFORM_EPSILON;
+            let painter = if needs_clip {
                 ui.painter().with_clip_rect(full_rect)
             } else {
                 ui.painter().clone()
             };
-            if rotation.is_none() {
+            if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
                 painter.image(
                     handle.id(), img_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
             } else {
-                crate::app::draw_rotated_image(&painter, handle.id(), img_rect, rotation);
+                crate::app::draw_rotated_image_ex(
+                    &painter, handle.id(), img_rect, rotation,
+                    free_rotation_rad, center,
+                );
             }
         } else if fs_load_failed {
             ui.painter().text(

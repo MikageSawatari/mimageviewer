@@ -358,6 +358,18 @@ pub struct App {
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
 
+    // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
+    /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
+    pub(crate) fs_zoom: f32,
+    /// 通常フルスクリーンのパンオフセット（スクリーン座標系）
+    pub(crate) fs_pan: egui::Vec2,
+    /// 通常フルスクリーンのパンドラッグ開始状態
+    pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    /// 任意角度回転（ラジアン、一時的・保存しない）
+    pub(crate) fs_free_rotation: f32,
+    /// 回転ドラッグ開始状態（開始位置, 開始時の回転角）
+    pub(crate) fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
+
     // ── 画像分析パネル ────────────────────────────────────────
     /// フルスクリーンで分析パネルを表示するか
     pub(crate) analysis_mode: bool,
@@ -523,6 +535,11 @@ impl Default for App {
             slideshow_next_at: std::time::Instant::now(),
             fs_viewport_created: false,
             fs_viewport_shown: false,
+            fs_zoom: 1.0,
+            fs_pan: egui::Vec2::ZERO,
+            fs_pan_drag_start: None,
+            fs_free_rotation: 0.0,
+            fs_rotation_drag_start: None,
             analysis_mode: false,
             analysis_hover_color: None,
             analysis_pinned_color: None,
@@ -1998,6 +2015,11 @@ impl App {
         self.analysis_overlay_cache = None;
         self.analysis_hist_cache = None;
         self.analysis_sv_cache = None;
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+        self.fs_pan_drag_start = None;
+        self.fs_free_rotation = 0.0;
+        self.fs_rotation_drag_start = None;
 
         match self.items.get(idx) {
             Some(GridItem::Image(_))
@@ -3433,21 +3455,23 @@ pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::C
 }
 
 /// 回転した画像を Mesh で描画する。
-pub(crate) fn draw_rotated_image(
+/// `free_rotation_rad` が非ゼロの場合、`center` 基準で頂点を任意角度回転する。
+pub(crate) fn draw_rotated_image_ex(
     painter: &egui::Painter,
     texture_id: egui::TextureId,
     rect: egui::Rect,
     rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+    center: egui::Pos2,
 ) {
     // UV 座標を回転に合わせて変換
     // 頂点順: 左上, 右上, 右下, 左下 (画面座標)
-    // UV は回転に応じて異なる頂点に割り当てる
     let uvs = match rotation {
         crate::rotation_db::Rotation::None => [
-            egui::pos2(0.0, 0.0), // 左上
-            egui::pos2(1.0, 0.0), // 右上
-            egui::pos2(1.0, 1.0), // 右下
-            egui::pos2(0.0, 1.0), // 左下
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 0.0),
+            egui::pos2(1.0, 1.0),
+            egui::pos2(0.0, 1.0),
         ],
         crate::rotation_db::Rotation::Cw90 => [
             egui::pos2(0.0, 1.0),
@@ -3469,12 +3493,24 @@ pub(crate) fn draw_rotated_image(
         ],
     };
 
-    let positions = [
+    let mut positions = [
         rect.left_top(),
         rect.right_top(),
         rect.right_bottom(),
         rect.left_bottom(),
     ];
+
+    // 任意角度回転: 頂点を center 基準で回転
+    if free_rotation_rad.abs() > 0.001 {
+        let cos_r = free_rotation_rad.cos();
+        let sin_r = free_rotation_rad.sin();
+        for p in &mut positions {
+            let dx = p.x - center.x;
+            let dy = p.y - center.y;
+            p.x = center.x + dx * cos_r - dy * sin_r;
+            p.y = center.y + dx * sin_r + dy * cos_r;
+        }
+    }
 
     let mut mesh = egui::Mesh::with_texture(texture_id);
     for i in 0..4 {
@@ -3484,8 +3520,18 @@ pub(crate) fn draw_rotated_image(
             color: egui::Color32::WHITE,
         });
     }
-    mesh.indices = vec![0, 1, 2, 0, 2, 3];
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// 回転した画像を Mesh で描画する（90° 単位のみ）。
+pub(crate) fn draw_rotated_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation: crate::rotation_db::Rotation,
+) {
+    draw_rotated_image_ex(painter, texture_id, rect, rotation, 0.0, rect.center());
 }
 
 /// 画像系アイテム (Image / ZipImage) のサムネイル状態に応じた描画。
