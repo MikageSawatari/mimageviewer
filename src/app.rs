@@ -25,7 +25,7 @@ use crate::thumb_loader::{
     ThumbMsg,
 };
 use crate::ui_helpers::{
-    draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
+    draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
     open_external_player, truncate_name,
 };
 
@@ -586,8 +586,13 @@ impl App {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
+                    let meta = entry.metadata().ok();
+                    let mtime = meta.as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs() as i64);
                     folders.push(GridItem::Folder(p));
-                    folder_metas.push(None);
+                    folder_metas.push(Some((mtime, 0)));
                 } else if is_apple_double(&p) {
                     // macOS/iPhone AppleDouble メタデータ — スキップ
                 } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
@@ -662,6 +667,10 @@ impl App {
                 GridItem::PdfFile(p) => {
                     let fname = p.file_name()?.to_str()?;
                     Some(format!("pdfthumb:{fname}"))
+                }
+                GridItem::Folder(p) => {
+                    let fname = p.file_name()?.to_str()?;
+                    Some(format!("folderthumb:{fname}"))
                 }
                 _ => None,
             })
@@ -1319,7 +1328,7 @@ impl App {
                 continue;
             };
             let Some(req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref())
+                make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort))
             }) else {
                 continue;
             };
@@ -1447,7 +1456,7 @@ impl App {
                 continue;
             };
             let Some(req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, true, self.pdf_current_password.as_deref())
+                make_load_request(item, i, mtime, file_size, true, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort))
             }) else {
                 continue;
             };
@@ -3097,7 +3106,7 @@ impl eframe::App for App {
 // セル描画
 // -----------------------------------------------------------------------
 
-/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ以外は None を返す。
+/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
 fn make_load_request(
     item: &GridItem,
     idx: usize,
@@ -3105,23 +3114,24 @@ fn make_load_request(
     file_size: i64,
     skip_cache: bool,
     pdf_password: Option<&str>,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
 ) -> Option<LoadRequest> {
     match item {
         GridItem::Image(p) => Some(LoadRequest {
             idx, path: p.clone(), mtime, file_size,
             skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
-            cache_key_override: None,
+            cache_key_override: None, folder_thumb_sort: None,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
             skip_cache, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
-            cache_key_override: None,
+            cache_key_override: None, folder_thumb_sort: None,
         }),
         GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
             skip_cache, zip_entry: None, pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),
-            cache_key_override: None,
+            cache_key_override: None, folder_thumb_sort: None,
         }),
         GridItem::ZipFile(p) => {
             // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得。
@@ -3132,6 +3142,7 @@ fn make_load_request(
                 idx, path: p.clone(), mtime, file_size,
                 skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("zipthumb:{fname}")),
+                folder_thumb_sort: None,
             })
         }
         GridItem::PdfFile(p) => {
@@ -3142,6 +3153,17 @@ fn make_load_request(
                 skip_cache, zip_entry: None, pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(format!("pdfthumb:{fname}")),
+                folder_thumb_sort: None,
+            })
+        }
+        GridItem::Folder(p) => {
+            // フォルダ一覧用: フォルダ内の代表画像をサムネイルとして取得
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            Some(LoadRequest {
+                idx, path: p.clone(), mtime, file_size,
+                skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
+                cache_key_override: Some(format!("folderthumb:{fname}")),
+                folder_thumb_sort,
             })
         }
         _ => None,
@@ -3303,21 +3325,45 @@ pub(crate) fn draw_cell(
 
     match item {
         GridItem::Folder(path) => {
-            painter.text(
-                inner.center() - egui::vec2(0.0, 14.0),
-                egui::Align2::CENTER_CENTER,
-                "📁",
-                egui::FontId::proportional(42.0),
-                egui::Color32::from_rgb(220, 170, 30),
-            );
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            painter.text(
-                egui::pos2(inner.center().x, inner.max.y - 4.0),
-                egui::Align2::CENTER_BOTTOM,
-                truncate_name(name, 18),
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(30),
-            );
+            match thumb {
+                ThumbnailState::Loaded { tex, .. } => {
+                    draw_thumb_texture(painter, inner, tex, rotation);
+                    draw_folder_badge(painter, inner, name);
+                }
+                ThumbnailState::Pending | ThumbnailState::Evicted => {
+                    painter.text(
+                        inner.center() - egui::vec2(0.0, 14.0),
+                        egui::Align2::CENTER_CENTER,
+                        "📁",
+                        egui::FontId::proportional(42.0),
+                        egui::Color32::from_rgb(220, 170, 30),
+                    );
+                    painter.text(
+                        egui::pos2(inner.center().x, inner.max.y - 4.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        truncate_name(name, 18),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(30),
+                    );
+                }
+                ThumbnailState::Failed => {
+                    painter.text(
+                        inner.center() - egui::vec2(0.0, 14.0),
+                        egui::Align2::CENTER_CENTER,
+                        "📁",
+                        egui::FontId::proportional(42.0),
+                        egui::Color32::from_rgb(220, 170, 30),
+                    );
+                    painter.text(
+                        egui::pos2(inner.center().x, inner.max.y - 4.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        truncate_name(name, 18),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(30),
+                    );
+                }
+            }
         }
         GridItem::Image(_) => {
             draw_thumb(painter, inner, thumb, rotation);

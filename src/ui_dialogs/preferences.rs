@@ -192,6 +192,26 @@ impl App {
                     ui.separator();
                     ui.add_space(4.0);
 
+                    ui.heading("フォルダサムネイル");
+                    ui.add_space(4.0);
+                    ui.label("フォルダの代表画像をどの順序で選ぶか。\n先頭の画像がサムネイルとして表示されます。");
+                    ui.add_space(4.0);
+                    egui::ComboBox::from_label("代表画像の選択基準")
+                        .selected_text(self.settings.folder_thumb_sort.label())
+                        .show_ui(ui, |ui| {
+                            for &order in crate::settings::SortOrder::all() {
+                                ui.selectable_value(
+                                    &mut self.settings.folder_thumb_sort,
+                                    order,
+                                    order.label(),
+                                );
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
                     ui.heading("フォルダ移動");
                     ui.add_space(4.0);
                     ui.label("Ctrl+↑↓ で移動先フォルダに画像がない場合、自動でスキップする最大回数。");

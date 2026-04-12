@@ -49,6 +49,8 @@ pub struct LoadRequest {
     /// フォルダ一覧の ZipFile/PdfFile 用: カタログキーを上書き。
     /// None の場合はファイル名 / エントリ名 / ページキーから自動生成。
     pub cache_key_override: Option<String>,
+    /// フォルダサムネイル用: フォルダ内の画像を選ぶソート順
+    pub folder_thumb_sort: Option<crate::settings::SortOrder>,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -332,13 +334,32 @@ pub fn process_load_request(
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
     // load_one_cached は from_cache = false を送信する
 
+    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
+    let is_folder_thumb = req.cache_key_override.as_deref()
+        .is_some_and(|k| k.starts_with("folderthumb:"));
+    let resolved_folder_image = if is_folder_thumb {
+        let img = resolve_folder_thumb_image(
+            &req.path,
+            req.folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+        );
+        if img.is_none() {
+            let _ = tx.send((req.idx, None, false, None));
+            gen_done.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        img
+    } else {
+        None
+    };
+    let load_path: &Path = resolved_folder_image.as_deref().unwrap_or(&req.path);
+
     // ZipFile (フォルダ一覧用サムネイル) の場合、UI スレッドでの ZIP I/O を避けるため
     // zip_entry が None のまま渡される。ワーカー側で遅延解決する。
     let resolved_zip_entry: Option<String>;
     let zip_entry_ref: Option<&str> = if req.zip_entry.is_some() {
         req.zip_entry.as_deref()
-    } else if req.cache_key_override.is_some() && req.pdf_page.is_none() {
-        // cache_key_override あり + pdf_page なし = ZipFile サムネイル
+    } else if !is_folder_thumb && req.cache_key_override.is_some() && req.pdf_page.is_none() {
+        // cache_key_override あり + pdf_page なし + フォルダでない = ZipFile サムネイル
         resolved_zip_entry = crate::zip_loader::first_image_entry(&req.path);
         if resolved_zip_entry.is_none() {
             // ZIP 内に画像が無い場合は失敗として通知
@@ -352,7 +373,7 @@ pub fn process_load_request(
     };
 
     load_one_cached(
-        &req.path,
+        load_path,
         zip_entry_ref,
         req.pdf_page,
         req.pdf_password.as_deref(),
@@ -364,6 +385,40 @@ pub fn process_load_request(
         stats,
         cancel,
     );
+}
+
+/// フォルダ内をスキャンして代表画像のパスを返す。
+/// `sort` で指定されたソート順で並べ、先頭の画像を選ぶ。
+fn resolve_folder_thumb_image(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+) -> Option<std::path::PathBuf> {
+    use crate::folder_tree::SUPPORTED_EXTENSIONS;
+
+    let entries = std::fs::read_dir(folder).ok()?;
+    let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() { continue; }
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+                let mtime = entry.metadata().ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as i64);
+                images.push((p, mtime));
+            }
+        }
+    }
+    if images.is_empty() {
+        return None;
+    }
+    images.sort_by(|(a, a_mt), (b, b_mt)| {
+        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
+    });
+    Some(images.into_iter().next().unwrap().0)
 }
 
 /// 1枚の画像をデコードしてサムネイルを生成し、(条件を満たせば) カタログに保存して

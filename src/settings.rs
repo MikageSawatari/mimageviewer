@@ -448,6 +448,11 @@ pub struct Settings {
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
 
+    // ── フォルダサムネイル ──────────────────────────────────────
+    /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
+    #[serde(default = "default_folder_thumb_sort")]
+    pub folder_thumb_sort: SortOrder,
+
     // ── アプリケーションで開く ──────────────────────────────────
     /// 最近使ったアプリケーション（最大3件、最新が先頭）
     #[serde(default)]
@@ -469,6 +474,7 @@ fn default_true() -> bool { true }
 fn default_thumb_prev_pages() -> u32 { 2 }
 fn default_thumb_next_pages() -> u32 { 4 }
 fn default_thumb_vram_cap_percent() -> u32 { 50 }
+fn default_folder_thumb_sort() -> SortOrder { SortOrder::Numeric }
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -576,6 +582,7 @@ impl Default for Settings {
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_sort_items: default_toolbar_sort_items(),
+            folder_thumb_sort: default_folder_thumb_sort(),
             recent_open_with_apps: Vec::new(),
             custom_open_with_apps: Vec::new(),
         }

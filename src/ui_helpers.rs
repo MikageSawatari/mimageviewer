@@ -174,6 +174,43 @@ pub fn draw_pdf_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
     );
 }
 
+/// フォルダサムネイルに表示するバッジ（左下、緑系、フォルダ名表示）。
+pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_name: &str) {
+    let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
+    let pad_h = font_size * 0.35;
+    let pad_v = font_size * 0.2;
+    let max_badge_w = cell_rect.width() * 0.80;
+    // フォルダ名が長い場合は切り詰める
+    let mut label = folder_name.to_string();
+    let bg = egui::Color32::from_rgba_unmultiplied(40, 130, 60, 200);
+    loop {
+        let galley = painter.layout_no_wrap(
+            label.clone(),
+            egui::FontId::proportional(font_size),
+            egui::Color32::WHITE,
+        );
+        let badge_w = galley.size().x + pad_h * 2.0;
+        if badge_w <= max_badge_w || label.len() <= 2 {
+            let badge_h = galley.size().y + pad_v * 2.0;
+            let badge_rect = egui::Rect::from_min_size(
+                egui::pos2(cell_rect.min.x + 3.0, cell_rect.max.y - badge_h - 3.0),
+                egui::vec2(badge_w, badge_h),
+            );
+            painter.rect_filled(badge_rect, 3.0, bg);
+            painter.galley(
+                egui::pos2(badge_rect.min.x + pad_h, badge_rect.min.y + pad_v),
+                galley,
+                egui::Color32::WHITE,
+            );
+            return;
+        }
+        // 文字を減らしてリトライ
+        let chars: Vec<char> = label.chars().collect();
+        let keep = chars.len().saturating_sub(2).max(1);
+        label = chars[..keep].iter().collect::<String>() + "…";
+    }
+}
+
 /// 統計ダイアログのヒストグラムを ASCII バー + 件数で描画する。
 /// `label_fn` がバケットインデックスから左端ラベルを返す。
 /// 統計ダイアログ用: ヒストグラムを egui::Grid で描画する。
