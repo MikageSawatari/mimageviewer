@@ -3,7 +3,7 @@
 Windows 向け高速サムネイルビューワー
 
 [![GitHub release](https://img.shields.io/github/v/release/MikageSawatari/mimageviewer)](https://github.com/MikageSawatari/mimageviewer/releases/latest)
-[![License: Freeware](https://img.shields.io/badge/license-freeware-blue)](https://mikage.to/mimageviewer/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## こんな方におすすめ
 
@@ -91,4 +91,4 @@ Windows 向け高速サムネイルビューワー
 
 ## ライセンス
 
-フリーソフトウェアです。個人・商用を問わず無料でご利用いただけます。再配布・改変はご遠慮ください。
+[MIT License](LICENSE) — 無料で利用・改変・再配布が可能です。詳細は LICENSE ファイルを参照してください。
