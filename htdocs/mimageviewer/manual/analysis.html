@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>画像分析モード — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>画像分析モード</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="analysis.html" class="active">画像分析モード</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">画像分析モード</h1>
+    <p class="page-desc">イラスト・写真の色彩やバランスを詳しく分析するためのツールです。
+    フルスクリーン表示中に <kbd>Z</kbd> キーまたはホバーバーの 🔬 ボタンで起動します。</p>
+
+    <h2>分析モードの開始 / 終了</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Z</kbd></td><td>分析モードの ON / OFF を切り替え</td></tr>
+          <tr><td>ホバーバーの 🔬 ボタン</td><td>分析モード ON / OFF</td></tr>
+          <tr><td>分析パネル右上の × ボタン</td><td>分析モード OFF（フルスクリーンは維持）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>ズーム / パン</h2>
+    <p>分析モード中は、ホイールが画像送りではなくズームに変わります。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>マウスホイール</td><td>マウス位置を中心にズーム（1.1 倍刻み、0.1〜50 倍）</td></tr>
+          <tr><td>左ドラッグ（修飾キーなし）</td><td>パン（表示範囲を移動）</td></tr>
+          <tr><td>ダブルクリック</td><td>ズーム / パンをリセット</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        ヒストグラム・SV マップは、ズーム後に画面に表示されている範囲のピクセルのみから計算されます。
+        ズームインして特定箇所の色分布を詳しく確認できます。
+      </div>
+    </div>
+
+    <h2>カラーピッカー / 色比較</h2>
+    <p>画像上にマウスを移動すると、その位置のピクセル色を RGB / HSV / L*a*b* の 3 色空間で表示します。
+    右クリックで色を固定し、ホバー位置との差分（各チャネル差・ΔE 色差）をリアルタイムで確認できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>マウスホバー（画像上）</td><td>カーソル位置のピクセル色を取得（RGB / HSV / L*a*b*）</td></tr>
+          <tr><td>右クリック</td><td>現在の色を「固定色」として保存し、ホバー色との差分を表示</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>用途：</strong>
+        影と光の色温度の差を確認する、肌色のトーンが統一されているか比較する、背景と主題のコントラスト比を数値で把握する、といった使い方ができます。
+        2 点間の色を数値で比較することで、微妙な色の違いを客観的に確認できます。
+      </div>
+    </div>
+
+    <h2>スケールグリッド（等身計測）</h2>
+    <p>修飾キーを押しながら左ドラッグすると、ドラッグした距離を 1 単位として、ドラッグ方向に垂直な等間隔の平行線と同心円を描画します。
+    キャラクターの頭頂から顎までをドラッグすると、頭身が一目で分かります。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Shift</kbd> + 左ドラッグ</td><td>赤色のスケールグリッドを描画</td></tr>
+          <tr><td><kbd>Ctrl</kbd> + 左ドラッグ</td><td>黒色のスケールグリッド</td></tr>
+          <tr><td><kbd>Alt</kbd> + 左ドラッグ</td><td>白色のスケールグリッド</td></tr>
+          <tr><td>右クリック</td><td>表示中のスケールグリッドを消去</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>用途：</strong>
+        イラストの等身バランスを確認する際に使います。頭の大きさを基準にドラッグすることで、全身が何等身かを視覚的に確認できます。
+        線の色は背景色に合わせて選んでください（暗い背景なら白、明るい背景なら黒など）。
+        同心円は関節の位置やプロポーションの確認にも利用できます。
+      </div>
+    </div>
+
+    <h2>色差強調フィルター</h2>
+    <p>修飾キーを押しながら右クリックすると、クリックした位置の色を基準に、画面全体の色差を強調表示します。
+    微妙な塗りの違いが大きく誇張されて見えるため、細部の確認に便利です。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>倍率</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Shift</kbd> + 右クリック</td><td>×2（軽い強調）</td></tr>
+          <tr><td><kbd>Ctrl</kbd> + 右クリック</td><td>×5</td></tr>
+          <tr><td><kbd>Alt</kbd> + 右クリック</td><td>×10</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd> + 右クリック</td><td>×20（最大強調）</td></tr>
+          <tr><td>右クリック（修飾キーなし）</td><td>フィルター解除</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>用途：</strong>
+        イラストの塗りの微妙なグラデーションやムラを視覚的に確認したり、
+        不透明でなければならないモザイク処理が意図せず半透明になっていないか検証する際に利用できます。
+        基準色に近い部分は暗く、異なる部分は明るく表示されるため、塗り残しや色ムラが一目で分かります。
+      </div>
+    </div>
+
+    <h2>モザイクグリッド（<kbd>M</kbd> キー）</h2>
+    <p><kbd>M</kbd> キーを押すと、画像の長辺を 100 等分した赤色の格子線を表示します。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>用途：</strong>
+        一般的な日本のモザイク基準で使われるグリッドサイズの目安を表示し、
+        モザイク処理のピクセルサイズが基準を満たしているか確認できます。
+        5 本ごとに太線で表示されるため、サイズの読み取りが容易です。
+      </div>
+    </div>
+
+    <h2>グレースケール表示（<kbd>G</kbd> キー）</h2>
+    <p><kbd>G</kbd> キーを押すと、画像を L*a*b* 色空間の L*（明度）値に基づいてグレースケール変換して表示します。
+    色情報を取り除くことで、明暗のバランスだけに集中して確認できます。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>用途：</strong>
+        色をいったん無視して、明るさの設計だけを確認できます。
+        主役が背景に対して十分に目立っているか、見せたい場所に視線が自然と向かうか、
+        光の向きが統一されているか、画面全体にメリハリがあるか、
+        といった構図の検証にグレースケール表示が役立ちます。
+        色に惑わされずに「明度だけで絵が成立しているか」を確認する、
+        イラスト制作の基本的なチェック手法です。
+      </div>
+    </div>
+
+    <h2>ヒストグラム / SV マップ</h2>
+    <p>分析パネルには、画面に表示されている範囲の画像データから自動計算された以下の情報が表示されます。</p>
+    <ul>
+      <li><strong>色相ヒストグラム (H)</strong> — 対数スケール（暗い色）と線形スケール（明るい色）の 2 層表示。画像にどの色相が多く使われているか一目で分かります</li>
+      <li><strong>彩度ヒストグラム (S)</strong> — 鮮やかさの分布。彩度が高い色が多いか、くすんだ色が中心かを確認</li>
+      <li><strong>明度ヒストグラム (V)</strong> — 明暗の分布。全体的に明るいか暗いか、コントラストが十分かを確認</li>
+      <li><strong>彩度・明度マップ (SV)</strong> — 2 次元の密度マップ。頻度の高い箇所が赤、低い箇所が緑で表示され、
+        画像の色使いの傾向（鮮やかで明るい色が多い、暗く落ち着いた色が多い等）を視覚的に把握できます</li>
+    </ul>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        ズームすると、表示範囲の色分布だけが集計されます。
+        画像全体と特定箇所のヒストグラムを見比べることで、部分的な色の偏りを確認できます。
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

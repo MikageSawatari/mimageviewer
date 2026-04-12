@@ -131,6 +131,54 @@ mimageviewer/
 - **キャンセル遅延**: 旧タスクが1枚のデコード中の場合、最大1デコード時間待つ
 - **ログ**: `cargo run` 時に `mimageviewer.log` へ出力（.gitignore 済み）
 
+## Screenshot Workflow
+
+製品ページ用スクリーンショットの素材は `htdocs/mimageviewer/sozai/` に配置される。
+ユーザーのディスプレイ環境はマルチモニターで、`mss` による全画面キャプチャが素材として提供される。
+
+### モニター座標の特定方法
+
+```python
+# Python mss でモニター一覧を取得
+import mss
+with mss.mss() as sct:
+    for i, m in enumerate(sct.monitors):
+        print(f'mss monitor {i}: {m}')
+```
+
+mss monitor 0 は全モニターの合成（仮想全画面）。monitor 1以降が個別モニター。
+左4Kモニター（プライマリ）が対象の場合、通常は `left=0, top=0` のモニターを探す。
+
+### 切り出し座標の計算
+
+mss の仮想座標系で全体画像の原点は `(monitors[0]['left'], monitors[0]['top'])`。
+対象モニターが `left=L, top=T, width=W, height=H` のとき、
+画像中の切り出し範囲は:
+
+```
+x0 = L - monitors[0]['left']
+y0 = T - monitors[0]['top']
+crop = img.crop((x0, y0, x0 + W, y0 + H))
+```
+
+### 実績値（2026-04 時点）
+
+- mss monitor 0: `left=0, top=-1124, width=6001, height=3840`
+- 左4Kモニター（monitor 3）: `left=0, top=0, width=3840, height=2160`
+- → 切り出し: `img.crop((0, 1124, 3840, 3284))`
+- 出力サイズ: 2560x1440 にリサイズ（既存 ss_fullscreen.png 等と統一）
+
+詳細手順は `docs/screenshot-howto.md` を参照。
+
+## Distribution
+
+- **mikage.to**: インストーラ (.exe) + exe 単体の両方を提供
+- **窓の杜・Vector**: インストーラ (.exe) のみで申請
+- **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
+- **ビルド**: `cargo build --release` → `ISCC.exe installer\mimageviewer.iss`
+- **出力**: `installer/Output/mImageViewer_<version>_setup.exe`
+- **設定保存先**: `%APPDATA%\mimageviewer`（インストーラ版・単体版共通）
+
 ## Git Workflow
 
 - **コミット指示はローカルコミットのみ**。「コミットして」と言われた場合は `git commit` までで止める。

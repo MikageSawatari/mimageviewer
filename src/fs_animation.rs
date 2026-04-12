@@ -19,7 +19,11 @@ pub enum FsLoadResult {
 
 /// フルスクリーンキャッシュエントリ。
 pub enum FsCacheEntry {
-    Static(egui::TextureHandle),
+    /// 静止画。GPU テクスチャと CPU 側ピクセルデータ（分析パネル用）を保持する。
+    Static {
+        tex: egui::TextureHandle,
+        pixels: std::sync::Arc<egui::ColorImage>,
+    },
     Animated {
         frames: Vec<(egui::TextureHandle, f64)>, // (texture, delay_secs)
         current_frame: usize,

@@ -336,6 +336,34 @@ pub struct App {
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
 
+    // ── 画像分析パネル ────────────────────────────────────────
+    /// フルスクリーンで分析パネルを表示するか
+    pub(crate) analysis_mode: bool,
+    /// 分析パネル: マウス位置のピクセル色（画像座標系で取得）
+    pub(crate) analysis_hover_color: Option<[u8; 4]>,
+    /// 分析パネル: 右クリックで固定した比較色
+    pub(crate) analysis_pinned_color: Option<[u8; 4]>,
+    /// 分析パネル: グレースケール表示モード（G キー）
+    pub(crate) analysis_grayscale: bool,
+    /// 分析パネル: モザイクグリッド表示（M キー）
+    pub(crate) analysis_mosaic_grid: bool,
+    /// 分析パネル: 色差強調フィルターの倍率（0=無効, 2/5/10/20）
+    pub(crate) analysis_filter_mag: u8,
+    /// 分析パネル: ドラッグ計測ライン（開始点, 現在点：画像ピクセル座標, 修飾キー色インデックス）
+    pub(crate) analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
+    /// 分析パネル: ズーム倍率（1.0 = フィット表示）
+    pub(crate) analysis_zoom: f32,
+    /// 分析パネル: パンオフセット（画像ピクセル座標系、画像中心からのズレ）
+    pub(crate) analysis_pan: egui::Vec2,
+    /// 分析パネル: ドラッグ中の開始オフセット
+    pub(crate) analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    /// 分析パネル: フィルター/グレースケールのキャッシュテクスチャ
+    pub(crate) analysis_overlay_cache: Option<(egui::TextureHandle, u8, Option<[u8; 4]>, f32, egui::Vec2, usize)>,
+    /// 分析パネル: ヒストグラムキャッシュ (zoom, pan, image_idx) → 結果
+    pub(crate) analysis_hist_cache: Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
+    /// 分析パネル: SVマップキャッシュ
+    pub(crate) analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
+
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
 }
@@ -440,6 +468,19 @@ impl Default for App {
             slideshow_next_at: std::time::Instant::now(),
             fs_viewport_created: false,
             fs_viewport_shown: false,
+            analysis_mode: false,
+            analysis_hover_color: None,
+            analysis_pinned_color: None,
+            analysis_grayscale: false,
+            analysis_mosaic_grid: false,
+            analysis_filter_mag: 0,
+            analysis_guide_drag: None,
+            analysis_zoom: 1.0,
+            analysis_pan: egui::Vec2::ZERO,
+            analysis_pan_drag_start: None,
+            analysis_overlay_cache: None,
+            analysis_hist_cache: None,
+            analysis_sv_cache: None,
             initialized: false,
         }
     }
@@ -1633,6 +1674,14 @@ impl App {
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
+        // 画像切り替え時にズーム/パン/キャッシュをリセット
+        self.analysis_zoom = 1.0;
+        self.analysis_pan = egui::Vec2::ZERO;
+        self.analysis_pan_drag_start = None;
+        self.analysis_guide_drag = None;
+        self.analysis_overlay_cache = None;
+        self.analysis_hist_cache = None;
+        self.analysis_sv_cache = None;
 
         match self.items.get(idx) {
             Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) => {
@@ -2176,12 +2225,13 @@ impl App {
             self.fs_pending.remove(&key);
             let entry = match result {
                 FsLoadResult::Static(ci) => {
+                    let pixels = std::sync::Arc::new(ci.clone());
                     let handle = ctx.load_texture(
                         format!("fs_{key}"),
                         ci,
                         egui::TextureOptions::LINEAR,
                     );
-                    FsCacheEntry::Static(handle)
+                    FsCacheEntry::Static { tex: handle, pixels }
                 }
                 FsLoadResult::Animated(frames) => {
                     let textures: Vec<(egui::TextureHandle, f64)> = frames

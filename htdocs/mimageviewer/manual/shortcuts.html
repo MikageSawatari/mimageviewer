@@ -28,6 +28,7 @@
         <a href="getting-started.html">はじめに</a>
         <a href="grid.html">グリッド表示</a>
         <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="analysis.html">画像分析モード</a>
         <a href="shortcuts.html" class="active">キーボードショートカット</a>
         <a href="settings.html">設定リファレンス</a>
         <a href="formats.html">対応フォーマット</a>
@@ -156,6 +157,83 @@
           <tr><td>右クリック</td><td>グリッド表示に戻る</td></tr>
           <tr><td>画面右 25% にカーソル移動</td><td>メタデータパネルをホバー表示</td></tr>
           <tr><td>画面上部にカーソル移動</td><td>ファイル情報バーと操作ボタンを表示</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>画像分析モード</h2>
+    <p><kbd>Z</kbd> キーまたはホバーバーの 🔬 ボタンで分析モードに入ります。詳しい用途は<a href="fullscreen.html#analysis">フルスクリーン表示 &gt; 画像分析モード</a>をご覧ください。</p>
+
+    <h3>分析モード — 切り替え</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー / 操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Z</kbd></td><td>分析モード ON / OFF</td></tr>
+          <tr><td>ホバーバー 🔬 ボタン</td><td>分析モード ON / OFF</td></tr>
+          <tr><td>パネル右上 × ボタン</td><td>分析モード OFF</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>分析モード — ズーム / パン</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>マウスホイール</td><td>ズーム（マウス位置中心、0.1〜50 倍）</td></tr>
+          <tr><td>左ドラッグ（修飾キーなし）</td><td>パン（表示範囲を移動）</td></tr>
+          <tr><td>ダブルクリック</td><td>ズーム / パンをリセット</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>分析モード — カラー / フィルター</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>マウスホバー（画像上）</td><td>カーソル位置の色を RGB / HSV / L*a*b* で取得</td></tr>
+          <tr><td>右クリック</td><td>比較色を固定（ガイドライン・フィルターも解除）</td></tr>
+          <tr><td><kbd>G</kbd></td><td>グレースケール表示 ON / OFF</td></tr>
+          <tr><td><kbd>M</kbd></td><td>モザイクグリッド表示 ON / OFF</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>分析モード — スケールグリッド（等身計測）</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Shift</kbd> + 左ドラッグ</td><td>赤色のスケールグリッド</td></tr>
+          <tr><td><kbd>Ctrl</kbd> + 左ドラッグ</td><td>黒色のスケールグリッド</td></tr>
+          <tr><td><kbd>Alt</kbd> + 左ドラッグ</td><td>白色のスケールグリッド</td></tr>
+          <tr><td>右クリック</td><td>スケールグリッドを消去</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>分析モード — 色差強調フィルター</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>倍率</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Shift</kbd> + 右クリック</td><td>×2</td></tr>
+          <tr><td><kbd>Ctrl</kbd> + 右クリック</td><td>×5</td></tr>
+          <tr><td><kbd>Alt</kbd> + 右クリック</td><td>×10</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd> + 右クリック</td><td>×20</td></tr>
+          <tr><td>右クリック（修飾キーなし）</td><td>フィルター解除</td></tr>
         </tbody>
       </table>
     </div>
