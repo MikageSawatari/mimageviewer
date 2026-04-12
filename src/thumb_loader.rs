@@ -61,6 +61,8 @@ pub struct CacheDecision {
     pub threshold_ms: u32,
     pub size_threshold: u64,
     pub webp_always: bool,
+    pub pdf_always: bool,
+    pub zip_always: bool,
     // cache_videos_always は動画が別パス (video_thumb) を通るため load_one_cached では使わない
 }
 
@@ -71,6 +73,8 @@ impl CacheDecision {
             threshold_ms: s.cache_threshold_ms,
             size_threshold: s.cache_size_threshold_bytes,
             webp_always: s.cache_webp_always,
+            pdf_always: s.cache_pdf_always,
+            zip_always: s.cache_zip_always,
         }
     }
 
@@ -78,7 +82,7 @@ impl CacheDecision {
     ///
     /// - `Always`: 常に true
     /// - `Off`   : 常に false
-    /// - `Auto`  : 事前ヒューリスティック (ext==webp / サイズ) または
+    /// - `Auto`  : 事前ヒューリスティック (ext==webp/pdf/zip / サイズ) または
     ///             実測時間 (decode_ms + display_ms) がしきい値以上
     pub fn should_cache(
         &self,
@@ -92,16 +96,20 @@ impl CacheDecision {
             CachePolicy::Always => true,
             CachePolicy::Off    => false,
             CachePolicy::Auto   => {
-                // 事前ヒューリスティック
-                if self.webp_always {
-                    let ext = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|s| s.to_lowercase())
-                        .unwrap_or_default();
-                    if ext == "webp" {
-                        return true;
-                    }
+                // 事前ヒューリスティック: 拡張子ベースの無条件キャッシュ
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                if self.webp_always && ext == "webp" {
+                    return true;
+                }
+                if self.pdf_always && ext == "pdf" {
+                    return true;
+                }
+                if self.zip_always && ext == "zip" {
+                    return true;
                 }
                 if (file_size as u64) >= self.size_threshold {
                     return true;
@@ -567,6 +575,8 @@ mod tests {
             threshold_ms,
             size_threshold: size_bytes,
             webp_always: true,
+            pdf_always: true,
+            zip_always: true,
         }
     }
 

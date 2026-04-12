@@ -302,7 +302,8 @@ impl App {
         let show_aspect = !tb_aspects.is_empty();
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
-        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs;
+        let show_parent = self.settings.show_toolbar_parent_button;
+        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs || show_parent;
 
         if !any_toolbar_section {
             return None;
@@ -310,11 +311,27 @@ impl App {
 
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_sort_changed = false;
+        let mut toolbar_parent_nav = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 let mut first_section = true;
+                if show_parent {
+                    let has_parent = self
+                        .current_folder
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .is_some();
+                    if ui
+                        .add_enabled(has_parent, egui::Button::new("⬆"))
+                        .on_hover_text("上のフォルダへ (BS)")
+                        .clicked()
+                    {
+                        toolbar_parent_nav = true;
+                    }
+                    first_section = false;
+                }
                 if show_cols {
                     ui.label("列:");
                     for &cols in &tb_cols {
@@ -390,6 +407,19 @@ impl App {
             });
             ui.add_space(2.0);
         });
+
+        // 親フォルダへ移動
+        if toolbar_parent_nav {
+            if let Some(ref cur) = self.current_folder.clone() {
+                if let Some(parent) = cur.parent() {
+                    self.select_after_load = cur
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
+                    return Some(parent.to_path_buf());
+                }
+            }
+        }
 
         // ツールバーのソート変更は borrow の関係で遅延実行
         if toolbar_sort_changed {

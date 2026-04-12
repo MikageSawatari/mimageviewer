@@ -359,6 +359,12 @@ pub struct Settings {
     /// Auto モード: 既存 .webp ファイルを無条件でキャッシュ対象にする（デコードが重いため）
     #[serde(default = "default_true")]
     pub cache_webp_always: bool,
+    /// Auto モード: PDF ページを無条件でキャッシュ対象にする（PDFium レンダリングが重いため）
+    #[serde(default = "default_true")]
+    pub cache_pdf_always: bool,
+    /// Auto モード: ZIP 内画像を無条件でキャッシュ対象にする（解凍+デコードの二重コスト）
+    #[serde(default = "default_true")]
+    pub cache_zip_always: bool,
     /// 段階 B: サムネイル先読みの後方ページ数（現在位置より前に保持するページ数）
     #[serde(default = "default_thumb_prev_pages")]
     pub thumb_prev_pages: u32,
@@ -388,6 +394,9 @@ pub struct Settings {
     /// アドレスバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
+    /// ツールバーに「上のフォルダへ」ボタンを表示する
+    #[serde(default)]
+    pub show_toolbar_parent_button: bool,
 
     // ── EXIF 表示フィルタ ──────────────────────────────────────
     /// 非表示にする EXIF タグ名のリスト
@@ -530,6 +539,8 @@ impl Default for Settings {
             cache_size_threshold_bytes: default_cache_size_threshold_bytes(),
             cache_videos_always: true,
             cache_webp_always: true,
+            cache_pdf_always: true,
+            cache_zip_always: true,
             thumb_prev_pages: default_thumb_prev_pages(),
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
@@ -543,6 +554,7 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
+            show_toolbar_parent_button: false,
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_sort_items: default_toolbar_sort_items(),

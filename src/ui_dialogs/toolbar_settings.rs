@@ -37,6 +37,7 @@ impl App {
 
                 ui.checkbox(&mut self.settings.show_toolbar_favorites, "お気に入り");
                 ui.checkbox(&mut self.settings.show_toolbar_folder, "フォルダ (アドレスバー)");
+                ui.checkbox(&mut self.settings.show_toolbar_parent_button, "上のフォルダへ (⬆ ボタン)");
 
                 // ── 列 ──
                 ui.add_space(6.0);

@@ -119,7 +119,15 @@ impl App {
 
                         ui.checkbox(
                             &mut self.settings.cache_webp_always,
-                            "既存 .webp は常にキャッシュ (デコードが重いため推奨)",
+                            "既存 .webp は常にキャッシュ (処理が重いため推奨)",
+                        );
+                        ui.checkbox(
+                            &mut self.settings.cache_pdf_always,
+                            "PDF ページは常にキャッシュ (処理が重いため推奨)",
+                        );
+                        ui.checkbox(
+                            &mut self.settings.cache_zip_always,
+                            "ZIP 内画像は常にキャッシュ (処理が重いため推奨)",
                         );
                     });
 
