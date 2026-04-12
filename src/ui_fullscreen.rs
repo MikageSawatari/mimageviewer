@@ -54,6 +54,15 @@ impl App {
     }
 }
 
+/// 分析モード時の画像表示領域（パネル分を右側に確保した残り）を返す。
+fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
+    let panel_w = 360.0_f32.clamp(full_rect.width() * 0.20, full_rect.width() * 0.35);
+    egui::Rect::from_min_max(
+        full_rect.min,
+        egui::pos2(full_rect.max.x - panel_w, full_rect.max.y),
+    )
+}
+
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
@@ -218,12 +227,7 @@ impl App {
                         // ── 分析モード: 見開き中は無効、画像エリアを左側に制限 ──
                         let analysis_active = self.analysis_mode && !is_spread_double;
                         let image_rect = if analysis_active {
-                            let panel_w = 360.0_f32
-                                .clamp(full_rect.width() * 0.20, full_rect.width() * 0.35);
-                            egui::Rect::from_min_max(
-                                full_rect.min,
-                                egui::pos2(full_rect.max.x - panel_w, full_rect.max.y),
-                            )
+                            analysis_image_rect(full_rect)
                         } else {
                             full_rect
                         };
@@ -751,12 +755,13 @@ impl App {
                 self.analysis_zoom = (old_zoom * factor).clamp(0.1, 50.0);
                 // マウス位置を基準にパンを調整（マウス位置固定ズーム）
                 if let Some(mouse) = ctx.input(|i| i.pointer.hover_pos()) {
-                    // image_rect は呼び出し元で計算済みなので近似的に full_rect を使う
-                    let cx = mouse.x - full_rect.center().x;
-                    let cy = mouse.y - full_rect.center().y;
-                    let dz = 1.0 / self.analysis_zoom - 1.0 / old_zoom;
-                    self.analysis_pan.x -= cx * dz;
-                    self.analysis_pan.y -= cy * dz;
+                    let image_rect = analysis_image_rect(full_rect);
+                    let center = image_rect.center() + self.analysis_pan;
+                    let cx = mouse.x - center.x;
+                    let cy = mouse.y - center.y;
+                    let ratio = self.analysis_zoom / old_zoom;
+                    self.analysis_pan.x += cx * (1.0 - ratio);
+                    self.analysis_pan.y += cy * (1.0 - ratio);
                 }
                 // PDF ページ: ズーム変更時に解像度を合わせて非同期再レンダリング
                 if self.analysis_zoom != old_zoom {

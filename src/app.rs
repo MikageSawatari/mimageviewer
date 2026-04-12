@@ -2768,13 +2768,13 @@ impl App {
     // キャッシュ作成（バックグラウンドで選択フォルダ以下を再帰処理）
     // -------------------------------------------------------------------
     pub(crate) fn start_cache_creation(&mut self) {
-        // 選択されたお気に入りを集める
-        let targets: Vec<PathBuf> = self
+        // 選択されたお気に入りを集める（名前とパスのペア）
+        let targets: Vec<(String, PathBuf)> = self
             .settings
             .favorites
             .iter()
             .zip(self.cc.checked.iter())
-            .filter_map(|(f, &c)| if c { Some(f.path.clone()) } else { None })
+            .filter_map(|(f, &c)| if c { Some((f.name.clone(), f.path.clone())) } else { None })
             .collect();
 
         if targets.is_empty() {
@@ -2814,11 +2814,11 @@ impl App {
         std::thread::spawn(move || {
             // Pass 1: カウント
             let mut all_folders: Vec<PathBuf> = Vec::new();
-            for t in &targets {
+            for (_, path) in &targets {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                walk_dirs_recursive(t, &mut all_folders, &cancel);
+                walk_dirs_recursive(path, &mut all_folders, &cancel);
             }
             total.store(all_folders.len(), Ordering::Relaxed);
             counting.store(false, Ordering::Relaxed);
@@ -2846,7 +2846,18 @@ impl App {
                     break;
                 }
 
-                *current.lock().unwrap() = folder.to_string_lossy().to_string();
+                // お気に入り名 > 相対パス の形式で表示用文字列を生成
+                let folder_display = targets.iter()
+                    .find(|(_, base)| folder.starts_with(base))
+                    .map(|(name, base)| {
+                        match folder.strip_prefix(base) {
+                            Ok(rel) if rel.as_os_str().is_empty() => name.clone(),
+                            Ok(rel) => format!("{} > {}", name, rel.to_string_lossy()),
+                            Err(_) => folder.to_string_lossy().to_string(),
+                        }
+                    })
+                    .unwrap_or_else(|| folder.to_string_lossy().to_string());
+                *current.lock().unwrap() = folder_display.clone();
 
                 // ファイル列挙（単一フォルダ、再帰なし — 画像・ZIP・PDF を1パスで分類）
                 let mut images: Vec<(PathBuf, i64, i64)> = Vec::new();
@@ -2939,7 +2950,7 @@ impl App {
                     let folder_key = format!("{}{}", CACHE_KEY_ZIP, zip_fname);
 
                     if batch_zip {
-                        *current.lock().unwrap() = zip_path.to_string_lossy().to_string();
+                        *current.lock().unwrap() = format!("{} > {}", folder_display, zip_fname);
                         let entries = match crate::zip_loader::enumerate_image_entries(zip_path) {
                             Ok(e) => e,
                             Err(_) => continue,
@@ -2962,7 +2973,7 @@ impl App {
                                     return;
                                 }
                                 *current.lock().unwrap() = format!(
-                                    "{} ({}/{})", zip_fname, i + 1, entry_count
+                                    "{} > {} ({}/{})", folder_display, zip_fname, i + 1, entry_count
                                 );
                                 if let Some(existing) = zip_cache_map.get(&entry.entry_name) {
                                     if existing.mtime == entry.mtime
@@ -3041,7 +3052,7 @@ impl App {
                             Some(n) => n.to_string(),
                             None => continue,
                         };
-                        *current.lock().unwrap() = pdf_path.to_string_lossy().to_string();
+                        *current.lock().unwrap() = format!("{} > {}", folder_display, pdf_fname);
                         let password = pw_store.get(pdf_path);
                         let pw_ref = password.as_deref();
                         let folder_key = format!("{}{}", CACHE_KEY_PDF, pdf_fname);
@@ -3067,7 +3078,7 @@ impl App {
                                 }
                                 let page_num = i as u32;
                                 *current.lock().unwrap() = format!(
-                                    "{} ({}/{})", pdf_fname, i + 1, page_count
+                                    "{} > {} ({}/{})", folder_display, pdf_fname, i + 1, page_count
                                 );
                                 let key = crate::grid_item::pdf_page_cache_key(page_num);
                                 if let Some(existing) = pdf_cache_map.get(&key) {
