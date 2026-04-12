@@ -399,11 +399,51 @@
       text-shadow: 0 1px 3px rgba(0,0,0,0.5);
     }
 
+    /* ── Use-case cards ��─ */
+    .usecases {
+      max-width: 900px;
+      margin: -2rem auto 0;
+      padding: 0 2rem;
+      position: relative;
+      z-index: 10;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 1rem;
+    }
+    .usecase-card {
+      background: #fff;
+      border: 1px solid #ffe0ec;
+      border-radius: 14px;
+      padding: 1.2rem 1.2rem 1rem;
+      box-shadow: 0 4px 18px rgba(214, 51, 132, 0.1);
+      text-align: center;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .usecase-card:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 8px 24px rgba(214, 51, 132, 0.18);
+    }
+    .usecase-card .uc-icon { font-size: 2rem; margin-bottom: 0.4rem; }
+    .usecase-card .uc-title {
+      font-size: 0.92rem;
+      font-weight: 700;
+      color: #c0255a;
+      margin-bottom: 0.3rem;
+      line-height: 1.4;
+    }
+    .usecase-card .uc-desc {
+      font-size: 0.8rem;
+      color: #888;
+      margin: 0;
+      line-height: 1.5;
+    }
+
     /* ── Responsive ── */
     @media (max-width: 600px) {
       .hero h1 { font-size: 2.2rem; }
       main { padding: 2rem 1rem; }
       .download-box { flex-direction: column; align-items: flex-start; }
+      .usecases { grid-template-columns: repeat(2, 1fr); margin-top: -1.5rem; padding: 0 1rem; }
     }
   </style>
 </head>
@@ -431,6 +471,30 @@
   </div>
   <a class="btn-download" href="#download">ダウンロード</a>
   <p class="download-note">無料 &nbsp;·&nbsp; インストーラ or 単体 exe</p>
+</div>
+
+<!-- ===== Use-case Cards ===== -->
+<div class="usecases">
+  <div class="usecase-card">
+    <div class="uc-icon">📷</div>
+    <div class="uc-title">大量の写真を素早く確認したい</div>
+    <p class="uc-desc">RAW・HEIC にも対応。フォルダを開くだけでサムネイル一覧。キャッシュで2回目以降は瞬時表示。</p>
+  </div>
+  <div class="usecase-card">
+    <div class="uc-icon">🤖</div>
+    <div class="uc-title">AI 生成画像のプロンプトを確認しながら閲覧したい</div>
+    <p class="uc-desc">PNG に埋め込まれた Stable Diffusion / ComfyUI のメタデータを自動表示。キーワード検索も可能。</p>
+  </div>
+  <div class="usecase-card">
+    <div class="uc-icon">📚</div>
+    <div class="uc-title">ZIP にまとめた漫画や同人誌をそのまま読みたい</div>
+    <p class="uc-desc">展開不要で ZIP 内をブラウズ。見開き表示・右→左読みに対応。</p>
+  </div>
+  <div class="usecase-card">
+    <div class="uc-icon">📄</div>
+    <div class="uc-title">大量の PDF をサムネイルで見比べたい</div>
+    <p class="uc-desc">PDF をページごとにサムネイル表示。パスワード付きにも対応。</p>
+  </div>
 </div>
 
 <main>
