@@ -91,4 +91,4 @@ Windows 向け高速サムネイルビューワー
 
 ## ライセンス
 
-[MIT License](LICENSE) — 無料で利用・改変・再配布が可能です。詳細は LICENSE ファイルを参照してください。
+[MIT License](LICENSE) — 無料でご利用いただけます。詳細は LICENSE ファイルを参照してください。
