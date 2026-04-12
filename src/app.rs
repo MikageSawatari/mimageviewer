@@ -160,6 +160,13 @@ pub struct App {
     pub(crate) requested: std::collections::HashMap<usize, bool>,
     /// 現在の keep range [start, end)。update_keep_range で毎フレーム更新
     pub(crate) keep_range: (usize, usize),
+    /// poll_thumbnails で 1 フレームのテクスチャ生成上限を超えた分を次フレームに持ち越す
+    texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
+
+    /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
+    /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
+    /// (キャンセルトークン, 結果レシーバー)
+    folder_nav_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<Option<PathBuf>>)>,
 
     // ── 進捗バー (段階 B/E の合算進捗表示) ─────────────────────
     /// 現フレームで検出された通常読み込みのピーク件数 (current が 0 でリセット)
@@ -415,6 +422,8 @@ impl Default for App {
             reload_queue: None,
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
+            texture_backlog: Vec::new(),
+            folder_nav_pending: None,
             progress_normal_peak: 0,
             progress_upgrade_peak: 0,
             selected_cell_rect: None,
@@ -850,6 +859,12 @@ impl App {
         }
         self.close_fullscreen();
 
+        // 進行中のフォルダナビゲーションをキャンセル
+        // (他の経路でフォルダが変更された場合に不要な結果を破棄する)
+        if let Some((cancel_nav, _)) = self.folder_nav_pending.take() {
+            cancel_nav.store(true, Ordering::Relaxed);
+        }
+
         self.cancel_token.store(true, Ordering::Relaxed);
         crate::logger::log("  cancel_token -> true (old tasks will stop)");
         let cancel = Arc::new(AtomicBool::new(false));
@@ -872,6 +887,7 @@ impl App {
             .map(|_| ThumbnailState::Pending)
             .collect();
         self.requested.clear();
+        self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.rebuild_visible_indices();
         self.metadata_cache.clear();
@@ -890,14 +906,14 @@ impl App {
                 .ok()
                 .map(Arc::new);
 
-        let cache_map: Arc<std::collections::HashMap<String, crate::catalog::CacheEntry>> =
-            Arc::new(
+        let cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>> =
+            Arc::new(std::sync::RwLock::new(
                 catalog_arc
                     .as_ref()
                     .and_then(|c| c.load_all().ok())
                     .unwrap_or_default(),
-            );
-        crate::logger::log(format!("  catalog: {} entries in DB", cache_map.len()));
+            ));
+        crate::logger::log(format!("  catalog: {} entries in DB", cache_map.read().unwrap().len()));
 
         if let Some(ref cat) = catalog_arc {
             if let Err(e) = cat.delete_missing(&catalog_existing_keys) {
@@ -964,7 +980,7 @@ impl App {
         tx: &mpsc::Sender<ThumbMsg>,
         cancel: Arc<AtomicBool>,
         reload_queue: Arc<Mutex<Vec<LoadRequest>>>,
-        cache_map: Arc<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
     ) {
         let thumb_threads = self.settings.parallelism.thread_count();
@@ -1088,54 +1104,70 @@ impl App {
     }
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
-        let mut count = 0u32;
+        // 1 フレームあたりのテクスチャ生成数を制限する。
+        // load_texture は GPU テクスチャアップロードを伴い、1 枚 0.5-2 ms かかる。
+        // キャッシュヒット時にワーカー全員が一気に結果を返すと 1 フレームで
+        // 数十枚の upload が走りフレーム落ちするため、上限を設ける。
+        // 上限超過分は texture_backlog に ColorImage のまま保持し次フレームで処理する。
+        const MAX_TEXTURES_PER_FRAME: u32 = 8;
+        let mut textures_created = 0u32;
+        let mut received = 0u32;
         let (keep_start, keep_end) = self.keep_range;
-        while let Ok((i, color_image_opt, from_cache, source_dims)) = self.rx.try_recv() {
-            if i < self.thumbnails.len() {
-                // 結果を in-flight セットから除外
+
+        // バックログ + チャネルから受信した結果を統合して処理する。
+        // バックログを先に処理（既にデコード済みなので優先）。
+        let backlog = std::mem::take(&mut self.texture_backlog);
+        let drain = backlog.into_iter().chain(
+            std::iter::from_fn(|| self.rx.try_recv().ok())
+        );
+
+        for (i, color_image_opt, from_cache, source_dims) in drain {
+            if i >= self.thumbnails.len() {
                 self.requested.remove(&i);
+                continue;
+            }
 
-                // 段階 B: 結果が届いたが既に keep_range 外に出ている場合、
-                // テクスチャ生成を省略し Evicted のままにする (VRAM 節約)
-                let in_keep_range = i >= keep_start && i < keep_end;
-
-                match color_image_opt {
-                    Some(color_image) => {
-                        if in_keep_range {
-                            // ColorImage の長辺ピクセル数を記録しておく (段階 E)
-                            let [w, h] = color_image.size;
-                            let rendered_at_px = w.max(h) as u32;
-                            let handle = ctx.load_texture(
-                                format!("thumb_{i}"),
-                                color_image,
-                                egui::TextureOptions::LINEAR,
-                            );
-                            // 段階 E: from_cache と rendered_at_px を記録し、
-                            // アイドル時のアップグレード対象か判定する
-                            // source_dims は選択オーバーレイで使う
-                            self.thumbnails[i] = ThumbnailState::Loaded {
-                                tex: handle,
-                                from_cache,
-                                rendered_at_px,
-                                source_dims,
-                            };
-                        } else {
-                            // 範囲外: ColorImage を drop し Evicted にしておく
-                            self.thumbnails[i] = ThumbnailState::Evicted;
-                        }
-                    }
-                    None => {
-                        self.thumbnails[i] = ThumbnailState::Failed;
+            let in_keep_range = i >= keep_start && i < keep_end;
+            match color_image_opt {
+                Some(color_image) => {
+                    if in_keep_range && textures_created < MAX_TEXTURES_PER_FRAME {
+                        self.requested.remove(&i);
+                        let [w, h] = color_image.size;
+                        let rendered_at_px = w.max(h) as u32;
+                        let handle = ctx.load_texture(
+                            format!("thumb_{i}"),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.thumbnails[i] = ThumbnailState::Loaded {
+                            tex: handle,
+                            from_cache,
+                            rendered_at_px,
+                            source_dims,
+                        };
+                        textures_created += 1;
+                    } else if in_keep_range {
+                        // 上限到達だが keep_range 内: 次フレームに持ち越す。
+                        // requested は除去しない (重複リクエスト防止)
+                        self.texture_backlog.push((i, Some(color_image), from_cache, source_dims));
+                    } else {
+                        // 範囲外: ColorImage を drop し Evicted にしておく
+                        self.requested.remove(&i);
+                        self.thumbnails[i] = ThumbnailState::Evicted;
                     }
                 }
-                count += 1;
-            } else {
-                // idx がアイテム範囲外 (旧フォルダの結果) は単純に捨てる
-                self.requested.remove(&i);
+                None => {
+                    self.requested.remove(&i);
+                    self.thumbnails[i] = ThumbnailState::Failed;
+                }
             }
+            received += 1;
         }
-        if count > 0 {
-            crate::logger::log(format!("  [main] poll_thumbnails: received {count} thumbnail(s)"));
+        if received > 0 || !self.texture_backlog.is_empty() {
+            crate::logger::log(format!(
+                "  [main] poll_thumbnails: received {received} ({textures_created} textures, {} backlog)",
+                self.texture_backlog.len()
+            ));
             ctx.request_repaint();
         }
     }
@@ -1145,7 +1177,7 @@ impl App {
     ///
     /// 毎フレーム呼ぶ想定。現在のスクロール位置から keep_range を算出し、
     /// 範囲外の Loaded を Evicted 化し、範囲内の Pending/Evicted を reload_queue に push する。
-    fn update_keep_range_and_requests(&mut self) {
+    fn update_keep_range_and_requests(&mut self, frame_t0: std::time::Instant) {
         let total = self.items.len();
         if total == 0 {
             self.keep_range = (0, 0);
@@ -1231,6 +1263,10 @@ impl App {
 
         // (1) 範囲外の Loaded を Evicted にする (TextureHandle を drop)
         //     動画サムネイルは一度ロードしたら維持する (別パスのため再要求できない)
+        //     同時に requested からも除去する (ワーカーが処理中のものは結果受信時に
+        //     keep_range 外判定で Evicted になるが、requested に残っていると
+        //     同じ idx の再リクエストがブロックされてしまう)
+        let t1 = frame_t0.elapsed();
         for i in 0..total {
             if i >= keep_start && i < keep_end {
                 continue;
@@ -1241,9 +1277,14 @@ impl App {
             if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
                 self.thumbnails[i] = ThumbnailState::Evicted;
             }
+            self.requested.remove(&i);
         }
+        let t2 = frame_t0.elapsed();
 
-        // (2) 範囲内の Pending/Evicted を reload_queue に push
+        // (2) reload_queue 内の keep_range 外リクエストを除去し、
+        //     範囲内の Pending/Evicted を新たに push する。
+        //     スクロール中にキューに溜まった古いリクエストをワーカーが無駄に
+        //     処理するのを防ぎ、新しい可視領域のリクエストを優先させる。
         let Some(queue) = self.reload_queue.clone() else { return; };
         let mut new_requests: Vec<LoadRequest> = Vec::new();
         for i in keep_start..keep_end {
@@ -1268,20 +1309,44 @@ impl App {
             };
             new_requests.push(req);
         }
-        if !new_requests.is_empty() {
+        let t3 = frame_t0.elapsed();
+        {
             let mut q = queue.lock().unwrap();
+            let t3b = frame_t0.elapsed();
+            // keep_range 外のリクエストを除去 (ワーカーの無駄な処理を防ぐ)
+            q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
             for r in new_requests {
                 // false = 通常読み込み要求
                 self.requested.insert(r.idx, false);
                 q.push(r);
             }
+            if (t3b - t3).as_millis() > 1 {
+                crate::logger::log(format!(
+                    "    [keep detail] queue.lock() waited {:.1}ms",
+                    (t3b - t3).as_secs_f64() * 1000.0,
+                ));
+            }
         }
+        let t4 = frame_t0.elapsed();
 
         // (3) 段階 E: アイドル時の画質アップグレード
         self.enqueue_idle_upgrades(keep_start, keep_end);
+        let t5 = frame_t0.elapsed();
 
         // (4) 進捗ピーク値の更新 (プログレスバー表示用)
         self.update_progress_peaks();
+        let t6 = frame_t0.elapsed();
+
+        if (t6 - t1).as_millis() > 5 {
+            crate::logger::log(format!(
+                "    [keep detail] evict={:.1}ms scan={:.1}ms lock+push={:.1}ms idle={:.1}ms peaks={:.1}ms",
+                (t2 - t1).as_secs_f64() * 1000.0,
+                (t3 - t2).as_secs_f64() * 1000.0,
+                (t4 - t3).as_secs_f64() * 1000.0,
+                (t5 - t4).as_secs_f64() * 1000.0,
+                (t6 - t5).as_secs_f64() * 1000.0,
+            ));
+        }
     }
 
     /// 段階 E: アイドル時に画質アップグレードの要求を投入する。
@@ -1408,11 +1473,18 @@ impl App {
 
     /// 現在の要求状況からプログレスバーのピーク値を更新する。
     fn update_progress_peaks(&mut self) {
-        let (cur_normal, cur_upgrade) = self.count_pending();
+        let backlog_count = self.texture_backlog.len();
+        let (cur_normal_raw, cur_upgrade) = self.count_pending();
+        // backlog 内のアイテムは requested に残っており count_pending でカウント
+        // 済みだが、実際にはデコード完了済み。pending として見せると分母が膨らむので
+        // 差し引く (ただし 0 以下にはしない)。
+        let cur_normal = cur_normal_raw.saturating_sub(backlog_count);
 
         if cur_normal == 0 {
             self.progress_normal_peak = 0;
         } else if cur_normal > self.progress_normal_peak {
+            // 新しいスクロール位置で新規リクエストが発生した場合は
+            // peak を現在値にリセットする (古い peak が蓄積し続けるのを防ぐ)
             self.progress_normal_peak = cur_normal;
         }
         if cur_upgrade == 0 {
@@ -1623,24 +1695,68 @@ impl App {
         }
 
         // Ctrl+↓: 深さ優先で次のフォルダへ（画像なしはスキップ）
+        // バックグラウンドスレッドで navigate_folder_with_skip を実行し、
+        // 結果は poll_folder_nav で非同期に受信する。
         if ctrl_down {
             if let Some(ref cur) = self.current_folder.clone() {
-                if let Some(next) = navigate_folder_with_skip(cur, next_folder_dfs, self.settings.folder_skip_limit) {
-                    return Some(next);
-                }
+                self.start_folder_nav(cur.clone(), true);
             }
         }
 
         // Ctrl+↑: 深さ優先で前のフォルダへ（画像なしはスキップ）
         if ctrl_up {
             if let Some(ref cur) = self.current_folder.clone() {
-                if let Some(prev) = navigate_folder_with_skip(cur, prev_folder_dfs, self.settings.folder_skip_limit) {
-                    return Some(prev);
-                }
+                self.start_folder_nav(cur.clone(), false);
             }
         }
 
         None
+    }
+
+    /// Ctrl+↑↓ のフォルダナビゲーションをバックグラウンドスレッドで開始する。
+    /// `navigate_folder_with_skip` はフォルダツリーの DFS 走査 + `folder_has_images`
+    /// (`read_dir`) を行うためディスク I/O を伴い、HDD では 20-120ms かかる。
+    /// UI スレッドをブロックしないよう、結果は `poll_folder_nav` で非同期に受信する。
+    fn start_folder_nav(&mut self, current: PathBuf, forward: bool) {
+        // 既存のナビゲーションをキャンセル (連打対応)
+        if let Some((cancel, _)) = self.folder_nav_pending.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
+        let skip_limit = self.settings.folder_skip_limit;
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+
+        std::thread::spawn(move || {
+            let result = if forward {
+                navigate_folder_with_skip(&current, next_folder_dfs, skip_limit)
+            } else {
+                navigate_folder_with_skip(&current, prev_folder_dfs, skip_limit)
+            };
+            if !cancel_w.load(Ordering::Relaxed) {
+                let _ = tx.send(result);
+            }
+        });
+
+        self.folder_nav_pending = Some((cancel, rx));
+    }
+
+    /// バックグラウンドフォルダナビゲーションの結果を非同期にポーリングする。
+    /// 結果が到着していれば `Some(path)` を返し、未完了なら `None` を返す。
+    fn poll_folder_nav(&mut self) -> Option<PathBuf> {
+        let Some((_, ref rx)) = self.folder_nav_pending else { return None; };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.folder_nav_pending = None;
+                result
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.folder_nav_pending = None;
+                None
+            }
+        }
     }
 
     /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
@@ -2800,8 +2916,14 @@ impl eframe::App for App {
         // 毎フレームリセット: 選択セルが描画された時に再設定される
         self.selected_cell_rect = None;
 
+        let frame_t0 = std::time::Instant::now();
+
         self.poll_thumbnails(ctx);
-        self.update_keep_range_and_requests();
+        let t_poll = frame_t0.elapsed();
+
+        self.update_keep_range_and_requests(frame_t0);
+        let t_keep = frame_t0.elapsed();
+
         self.poll_prefetch(ctx);
 
         // タイトルバーに現在のフォルダパスを表示する。
@@ -2883,7 +3005,9 @@ impl eframe::App for App {
         self.render_search_bar(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
+        let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
+        let t_grid = frame_t0.elapsed();
 
         // ── 選択情報オーバーレイ ─────────────────────────────────────
         self.render_selection_info(ctx);
@@ -2901,10 +3025,14 @@ impl eframe::App for App {
             }
         }
 
+        // ── 非同期フォルダナビゲーションのポーリング ────────────────
+        let folder_nav = self.poll_folder_nav();
+
         // ── ナビゲーション集約 ───────────────────────────────────────
         let navigate = fav_nav
             .or(toolbar_fav_nav)
             .or(keyboard_nav)
+            .or(folder_nav)
             .or(address_nav)
             .or(open_folder_nav)
             .or(context_nav)
@@ -2916,10 +3044,26 @@ impl eframe::App for App {
         // Pending なサムネイルがある間は毎フレーム再描画をリクエストする。
         // バックグラウンドスレッドがチャネルに送信しても egui は自動では
         // 起きないため、ここで継続的に repaint を要求しておく必要がある。
-        if self.thumbnails.iter().any(|t| matches!(t, ThumbnailState::Pending))
+        if self.folder_nav_pending.is_some()
+            || self.thumbnails.iter().any(|t| matches!(t, ThumbnailState::Pending))
             || self.pdf_enumerate_pending.is_some()
         {
             ctx.request_repaint();
+        }
+
+        // フレーム計測: 8 ms (≈120 fps) 超えた場合のみログに出力
+        let frame_total = frame_t0.elapsed();
+        if frame_total.as_millis() > 8 {
+            crate::logger::log(format!(
+                "  [SLOW FRAME] {:.1}ms  poll={:.1}ms keep={:.1}ms pre_grid={:.1}ms grid={:.1}ms  backlog={} requested={}",
+                frame_total.as_secs_f64() * 1000.0,
+                t_poll.as_secs_f64() * 1000.0,
+                (t_keep - t_poll).as_secs_f64() * 1000.0,
+                (t_pre_grid - t_keep).as_secs_f64() * 1000.0,
+                (t_grid - t_pre_grid).as_secs_f64() * 1000.0,
+                self.texture_backlog.len(),
+                self.requested.len(),
+            ));
         }
     }
 
@@ -2964,12 +3108,13 @@ fn make_load_request(
             cache_key_override: None,
         }),
         GridItem::ZipFile(p) => {
-            // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得
-            let first = crate::zip_loader::first_image_entry(p)?;
+            // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得。
+            // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
+            // 遅延解決する。UI スレッドで ZIP を開くディスク I/O を避けるため。
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             Some(LoadRequest {
                 idx, path: p.clone(), mtime, file_size,
-                skip_cache, zip_entry: Some(first), pdf_page: None, pdf_password: None,
+                skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("zipthumb:{fname}")),
             })
         }

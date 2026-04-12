@@ -255,7 +255,7 @@ impl App {
                                                 "{} / {}",
                                                 done, peak_normal
                                             ))
-                                            .color(egui::Color32::WHITE),
+                                            .color(egui::Color32::BLACK),
                                         ),
                                 );
                             });
@@ -278,7 +278,7 @@ impl App {
                                                 "{} / {}",
                                                 done, peak_upgrade
                                             ))
-                                            .color(egui::Color32::WHITE),
+                                            .color(egui::Color32::BLACK),
                                         ),
                                 );
                             });

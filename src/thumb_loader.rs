@@ -262,7 +262,7 @@ pub fn compute_display_px(cell_w: f32, cell_h: f32, dpi: f32) -> u32 {
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
     req: &LoadRequest,
-    cache_map: &std::collections::HashMap<String, crate::catalog::CacheEntry>,
+    cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
     thumb_px: u32,
@@ -297,30 +297,60 @@ pub fn process_load_request(
     // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
     if !req.skip_cache {
-        if let Some(entry) = cache_map.get(filename) {
+        // read ロックは最短に保つ: エントリのデータだけ clone して即解放。
+        // WebP デコード (2-3 ms) をロック外で実行することで、
+        // 他ワーカーの write (キャッシュ保存) をブロックしない。
+        let cached = cache_map.read().ok().and_then(|map| {
+            let entry = map.get(filename)?;
             if entry.mtime == req.mtime && entry.file_size == req.file_size {
-                let ci = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data);
-                // from_cache = true: アップグレード対象
-                // source_dims はカタログ由来 (旧バージョンで作成された
-                // エントリには None が入っている)
-                let _ = tx.send((req.idx, ci, true, entry.source_dims));
-                gen_done.fetch_add(1, Ordering::Relaxed);
-                // 統計には記録しない: キャッシュヒットは 2-3 ms で
-                // "キャッシュ無し時のコスト" を歪めるため
-                return;
+                Some((entry.jpeg_data.clone(), entry.source_dims))
+            } else {
+                None
             }
+        });
+        if let Some((webp_data, source_dims)) = cached {
+            let ci = crate::catalog::decode_thumb_to_color_image(&webp_data);
+            // from_cache = true: アップグレード対象
+            // source_dims はカタログ由来 (旧バージョンで作成された
+            // エントリには None が入っている)
+            let _ = tx.send((req.idx, ci, true, source_dims));
+            gen_done.fetch_add(1, Ordering::Relaxed);
+            // 統計には記録しない: キャッシュヒットは 2-3 ms で
+            // "キャッシュ無し時のコスト" を歪めるため
+            return;
         }
     }
 
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
     // load_one_cached は from_cache = false を送信する
+
+    // ZipFile (フォルダ一覧用サムネイル) の場合、UI スレッドでの ZIP I/O を避けるため
+    // zip_entry が None のまま渡される。ワーカー側で遅延解決する。
+    let resolved_zip_entry: Option<String>;
+    let zip_entry_ref: Option<&str> = if req.zip_entry.is_some() {
+        req.zip_entry.as_deref()
+    } else if req.cache_key_override.is_some() && req.pdf_page.is_none() {
+        // cache_key_override あり + pdf_page なし = ZipFile サムネイル
+        resolved_zip_entry = crate::zip_loader::first_image_entry(&req.path);
+        if resolved_zip_entry.is_none() {
+            // ZIP 内に画像が無い場合は失敗として通知
+            let _ = tx.send((req.idx, None, false, None));
+            gen_done.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        resolved_zip_entry.as_deref()
+    } else {
+        None
+    };
+
     load_one_cached(
         &req.path,
-        req.zip_entry.as_deref(),
+        zip_entry_ref,
         req.pdf_page,
         req.pdf_password.as_deref(),
         req.cache_key_override.as_deref(),
         req.idx, tx, catalog,
+        Some(cache_map),
         req.mtime, req.file_size, gen_done,
         thumb_px, thumb_quality, display_px, cache_decision,
         stats,
@@ -351,6 +381,7 @@ pub fn load_one_cached(
     idx: usize,
     tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
+    cache_map: Option<&std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
     mtime: i64,
     file_size: i64,
     gen_done: &Arc<AtomicUsize>,
@@ -486,6 +517,17 @@ pub fn load_one_cached(
                     cat.save(name, mtime, file_size, w, h, source_dims, &webp_data)
                 {
                     crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
+                } else if let Some(cm) = cache_map {
+                    // DB 保存成功 → in-memory cache_map にも反映する。
+                    // Evicted → 再ロード時にキャッシュヒットさせるために必要。
+                    if let Ok(mut map) = cm.write() {
+                        map.insert(name.to_owned(), crate::catalog::CacheEntry {
+                            mtime,
+                            file_size,
+                            jpeg_data: webp_data,
+                            source_dims,
+                        });
+                    }
                 }
                 crate::logger::log(format!(
                     "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {display_name}"
