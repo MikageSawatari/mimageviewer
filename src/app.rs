@@ -1714,7 +1714,7 @@ impl App {
     }
 
     /// Ctrl+↑↓ のフォルダナビゲーションをバックグラウンドスレッドで開始する。
-    /// `navigate_folder_with_skip` はフォルダツリーの DFS 走査 + `folder_has_images`
+    /// `navigate_folder_with_skip` はフォルダツリーの DFS 走査 + `folder_should_stop`
     /// (`read_dir`) を行うためディスク I/O を伴い、HDD では 20-120ms かかる。
     /// UI スレッドをブロックしないよう、結果は `poll_folder_nav` で非同期に受信する。
     fn start_folder_nav(&mut self, current: PathBuf, forward: bool) {

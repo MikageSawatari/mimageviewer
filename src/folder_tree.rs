@@ -65,44 +65,48 @@ pub fn is_virtual_folder(path: &Path) -> bool {
 // 画像有無の判定
 // -----------------------------------------------------------------------
 
-/// フォルダ内に対応画像ファイルが1枚以上あるか確認する。
-/// path が .zip ファイルの場合は ZIP 内の画像エントリを確認する (タスク 3)。
-pub fn folder_has_images(path: &Path) -> bool {
+/// Ctrl+↑↓ でフォルダをスキップすべきか判定する。
+/// スキップしない（＝立ち寄る）条件:
+/// - 画像・動画が1つでもある
+/// - ZIP/PDF が合計2つ以上ある
+///
+/// path が .zip/.pdf ファイル自体の場合は常に立ち寄る（仮想フォルダ）。
+pub fn folder_should_stop(path: &Path) -> bool {
+    // ZIP/PDF ファイル自体はナビゲーション対象として常に立ち寄る
     if path.is_file() && is_virtual_folder(path) {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        if ext == "zip" {
-            return crate::zip_loader::enumerate_image_entries(path)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-        }
-        if ext == "pdf" {
-            // PDF ファイルが存在すればページありと仮定する。
-            // pdf_loader::page_count() は PDFium Mutex を取得するため、
-            // バックグラウンドレンダリング中に UI スレッドがブロックしてしまう。
-            // 壊れた PDF は開いた時にエラーになるだけなので、ここでは楽観判定で十分。
-            return true;
-        }
-        return false;
+        return true;
     }
 
-    std::fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|e| {
-            let p = e.path();
-            if is_apple_double(&p) {
-                return false;
+    let mut virtual_folder_count = 0u32;
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return false,
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if is_apple_double(&p) {
+            continue;
+        }
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            // 画像・動画が1つでもあれば即 true
+            if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str())
+                || SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str())
+            {
+                return true;
             }
-            p.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
+            // ZIP/PDF をカウント
+            if ext_lower == "zip" || ext_lower == "pdf" {
+                virtual_folder_count += 1;
+                if virtual_folder_count >= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 // -----------------------------------------------------------------------
@@ -123,7 +127,7 @@ where
     let first = nav_fn(start)?;
     let mut candidate = first.clone();
     for _ in 0..skip_limit {
-        if folder_has_images(&candidate) {
+        if folder_should_stop(&candidate) {
             return Some(candidate);
         }
         match nav_fn(&candidate) {
