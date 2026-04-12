@@ -60,7 +60,7 @@
           <tr><td>EXIF 表示設定…</td><td>メタデータパネルに表示する EXIF タグの管理</td></tr>
           <tr><td>スライドショー…</td><td>スライドショーの切り替え間隔を設定</td></tr>
           <tr><td>回転情報をリセット…</td><td>保存済みの全回転情報を削除</td></tr>
-          <tr><td>環境設定…</td><td>並列読み込み・先読み・VRAM など詳細設定</td></tr>
+          <tr><td>環境設定…</td><td>並列読み込み・先読み・VRAM・見開き表示のデフォルトなど詳細設定</td></tr>
         </tbody>
       </table>
     </div>
@@ -232,6 +232,11 @@
             <td><kbd>Ctrl</kbd>+<kbd>↑↓</kbd> で画像のない空フォルダを連続スキップする上限数</td>
             <td>3</td>
           </tr>
+          <tr>
+            <td>見開き表示のデフォルト</td>
+            <td>フォルダを初めて開いたときの見開きモード。1ページ表示 / 見開き 左→右 / 見開き 左→右（表紙あり）/ 見開き 右→左 / 見開き 右→左（表紙あり）</td>
+            <td>1ページ表示</td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -277,6 +282,7 @@
         <tbody>
           <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.json</code></td></tr>
           <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td></tr>
+          <tr><td>見開き設定 DB</td><td><code>%APPDATA%\mimageviewer\spread.db</code></td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td></tr>
         </tbody>
       </table>
