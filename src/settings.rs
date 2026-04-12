@@ -395,7 +395,7 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
     /// ツールバーに「上のフォルダへ」ボタンを表示する
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_toolbar_parent_button: bool,
 
     // ── EXIF 表示フィルタ ──────────────────────────────────────
@@ -554,7 +554,7 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
-            show_toolbar_parent_button: false,
+            show_toolbar_parent_button: true,
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_sort_items: default_toolbar_sort_items(),

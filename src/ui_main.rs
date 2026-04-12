@@ -333,6 +333,9 @@ impl App {
                     first_section = false;
                 }
                 if show_cols {
+                    if !first_section {
+                        ui.separator();
+                    }
                     ui.label("列:");
                     for &cols in &tb_cols {
                         let selected = self.settings.grid_cols == cols;
