@@ -212,13 +212,26 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **窓の杜・Vector**: インストーラ (.exe) のみで申請
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
 - **ビルド**: `cargo build --release` → `ISCC.exe installer\mimageviewer.iss`
-- **出力**: `installer/Output/mImageViewer_<version>_setup.exe`
+- **出力**: `installer/Output/mImageViewer_setup.exe`
 - **設定保存先**: `%APPDATA%\mimageviewer`（インストーラ版・単体版共通）
+
+## リリース手順チェックリスト
+
+リリース時は以下を漏れなく更新すること:
+
+1. `Cargo.toml` — バージョン番号
+2. `installer/mimageviewer.iss` — `MyAppVersion`
+3. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記
+4. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
+5. `README.md` — 更新履歴セクションに新バージョンの変更点を追加
+6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
+7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
 
 ## Git Workflow
 
 - **コミット指示はローカルコミットのみ**。「コミットして」と言われた場合は `git commit` までで止める。
   PR（プルリクエスト）の作成は、明示的に「PRを作って」と指示された場合のみ行う。
+- **デフォルトブランチ**: GitHub 上は `main`、ローカルは `master`。リリース時は両方に push する。
 
 ## User: Background
 
