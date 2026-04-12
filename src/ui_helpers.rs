@@ -19,6 +19,18 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 = eframe::egui::Color32
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 
 // -----------------------------------------------------------------------
+// ファイルメタデータ
+// -----------------------------------------------------------------------
+
+/// `std::fs::Metadata` から mtime を UNIX epoch 秒として返す。取得失敗時は 0。
+pub fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+// -----------------------------------------------------------------------
 // バイト数 / 件数の整形
 // -----------------------------------------------------------------------
 

@@ -336,7 +336,7 @@ pub fn process_load_request(
 
     // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
     let is_folder_thumb = req.cache_key_override.as_deref()
-        .is_some_and(|k| k.starts_with("folderthumb:"));
+        .is_some_and(|k| k.starts_with(crate::app::CACHE_KEY_FOLDER));
     let resolved_folder_image = if is_folder_thumb {
         let img = resolve_folder_thumb_image(
             &req.path,
@@ -403,9 +403,7 @@ fn resolve_folder_thumb_image(
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
                 let mtime = entry.metadata().ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs() as i64);
+                    .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
                 images.push((p, mtime));
             }
         }

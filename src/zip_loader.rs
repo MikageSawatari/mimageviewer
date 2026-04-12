@@ -33,10 +33,7 @@ pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageE
     // ZIP 自身の mtime をフォールバックに使う
     let zip_mtime = std::fs::metadata(zip_path)
         .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
 
     let mut out: Vec<ZipImageEntry> = Vec::new();
     for i in 0..archive.len() {

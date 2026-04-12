@@ -41,6 +41,19 @@ pub(crate) enum SpreadPair {
     Double { left: usize, right: usize },
 }
 
+impl App {
+    /// 分析モードを解除し、関連する状態をリセットする。
+    pub(crate) fn reset_analysis_mode(&mut self) {
+        self.analysis_mode = false;
+        self.analysis_hover_color = None;
+        self.analysis_pinned_color = None;
+        self.analysis_grayscale = false;
+        self.analysis_mosaic_grid = false;
+        self.analysis_filter_mag = 0;
+        self.analysis_guide_drag = None;
+    }
+}
+
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
@@ -301,9 +314,7 @@ impl App {
                                 ui, ctx, full_rect, image_rect, pixels.as_deref(),
                             );
                             if close_analysis {
-                                self.analysis_mode = false;
-                                self.analysis_hover_color = None;
-                                self.analysis_pinned_color = None;
+                                self.reset_analysis_mode();
                             }
                         } else if !is_spread_double {
                             // ── メタデータパネル（通常モード・単独表示のみ）──
@@ -338,9 +349,7 @@ impl App {
                                 let _ = db.set(folder, self.spread_mode, self.settings.default_spread_mode);
                             }
                             if self.spread_mode.is_spread() && self.analysis_mode {
-                                self.analysis_mode = false;
-                                self.analysis_hover_color = None;
-                                self.analysis_pinned_color = None;
+                                self.reset_analysis_mode();
                             }
                         }
                     });
@@ -468,13 +477,23 @@ impl App {
 
     // ── 見開きペアリング ────────────────────────────────────────────────
 
+    /// build_nav_indices の結果をキャッシュして返す。
+    fn get_nav_indices(&mut self) -> Vec<usize> {
+        if let Some(ref cached) = self.cached_nav_indices {
+            return cached.clone();
+        }
+        let nav = build_nav_indices(&self.items, &self.visible_indices);
+        self.cached_nav_indices = Some(nav.clone());
+        nav
+    }
+
     /// 現在の見開きモードとインデックスからペア表示を解決する。
-    pub(crate) fn resolve_spread_pair(&self, idx: usize) -> SpreadPair {
+    pub(crate) fn resolve_spread_pair(&mut self, idx: usize) -> SpreadPair {
         if !self.spread_mode.is_spread() {
             return SpreadPair::Single;
         }
 
-        let nav = build_nav_indices(&self.items, &self.visible_indices);
+        let nav = self.get_nav_indices();
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
@@ -530,7 +549,7 @@ impl App {
     /// 見開きモードでの nav_delta を計算する。
     /// 見開き表示中は2ページ送り、Single表示中は1ページ送り。
     /// Shift が押されている場合は常に1ページ送り。
-    pub(crate) fn spread_nav_delta(&self, base_delta: i32, shift_held: bool) -> i32 {
+    pub(crate) fn spread_nav_delta(&mut self, base_delta: i32, shift_held: bool) -> i32 {
         if !self.spread_mode.is_spread() || shift_held {
             return base_delta;
         }
@@ -551,7 +570,7 @@ impl App {
             return;
         }
         let Some(idx) = self.fullscreen_idx else { return };
-        let nav = build_nav_indices(&self.items, &self.visible_indices);
+        let nav = self.get_nav_indices();
         let Some(pos) = nav.iter().position(|&i| i == idx) else { return };
 
         let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
@@ -634,14 +653,10 @@ impl App {
             self.show_metadata_panel = !self.show_metadata_panel;
         }
         if key_z && !is_spread_double {
-            self.analysis_mode = !self.analysis_mode;
-            if !self.analysis_mode {
-                self.analysis_hover_color = None;
-                self.analysis_pinned_color = None;
-                self.analysis_grayscale = false;
-                self.analysis_mosaic_grid = false;
-                self.analysis_filter_mag = 0;
-                self.analysis_guide_drag = None;
+            if self.analysis_mode {
+                self.reset_analysis_mode();
+            } else {
+                self.analysis_mode = true;
             }
         }
         if self.analysis_mode && !is_spread_double {

@@ -11,6 +11,13 @@ use crate::folder_tree::{
     walk_dirs_recursive, SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS,
 };
 
+/// カタログ内の ZipFile サムネイル用キャッシュキープレフィックス
+pub(crate) const CACHE_KEY_ZIP: &str = "zipthumb:";
+/// カタログ内の PdfFile サムネイル用キャッシュキープレフィックス
+pub(crate) const CACHE_KEY_PDF: &str = "pdfthumb:";
+/// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
+pub(crate) const CACHE_KEY_FOLDER: &str = "folderthumb:";
+
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
 fn stem_lower(path: &std::path::Path) -> String {
     path.file_stem()
@@ -401,6 +408,14 @@ pub struct App {
         Option<String>,
         mpsc::Receiver<std::io::Result<Vec<crate::pdf_loader::PdfPageEntry>>>,
     )>,
+
+    // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
+    /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
+    pub(crate) cached_handlers: Option<(String, Vec<crate::open_with::AppHandler>)>,
+
+    // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
+    /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
+    pub(crate) cached_nav_indices: Option<Vec<usize>>,
 }
 
 impl Default for App {
@@ -530,6 +545,8 @@ impl Default for App {
             pdf_password_pending_path: None,
             pdf_current_password: None,
             pdf_enumerate_pending: None,
+            cached_handlers: None,
+            cached_nav_indices: None,
         }
     }
 }
@@ -587,10 +604,7 @@ impl App {
                 let p = entry.path();
                 if p.is_dir() {
                     let meta = entry.metadata().ok();
-                    let mtime = meta.as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs() as i64);
+                    let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
                     folders.push(GridItem::Folder(p));
                     folder_metas.push(Some((mtime, 0)));
                 } else if is_apple_double(&p) {
@@ -598,10 +612,7 @@ impl App {
                 } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     let ext_lower = ext.to_ascii_lowercase();
                     let meta = entry.metadata().ok();
-                    let mtime = meta.as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs() as i64);
+                    let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
                     let file_size = meta.map_or(0, |m| m.len() as i64);
                     if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
                         all_media.push((p, false, mtime, file_size));
@@ -662,15 +673,15 @@ impl App {
                 GridItem::Image(p) => p.file_name()?.to_str().map(String::from),
                 GridItem::ZipFile(p) => {
                     let fname = p.file_name()?.to_str()?;
-                    Some(format!("zipthumb:{fname}"))
+                    Some(format!("{}{fname}", CACHE_KEY_ZIP))
                 }
                 GridItem::PdfFile(p) => {
                     let fname = p.file_name()?.to_str()?;
-                    Some(format!("pdfthumb:{fname}"))
+                    Some(format!("{}{fname}", CACHE_KEY_PDF))
                 }
                 GridItem::Folder(p) => {
                     let fname = p.file_name()?.to_str()?;
-                    Some(format!("folderthumb:{fname}"))
+                    Some(format!("{}{fname}", CACHE_KEY_FOLDER))
                 }
                 _ => None,
             })
@@ -2190,6 +2201,7 @@ impl App {
                 .collect(),
             None => (0..self.items.len()).collect(),
         };
+        self.cached_nav_indices = None;
     }
 
     /// メタデータキーワード検索を実行する。
@@ -2850,11 +2862,7 @@ impl App {
                             continue;
                         }
                         let meta = entry.metadata().ok();
-                        let mtime = meta
-                            .as_ref()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map_or(0, |d| d.as_secs() as i64);
+                        let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
                         let file_size = meta.map_or(0, |m| m.len() as i64);
                         images.push((p, mtime, file_size));
                     }
@@ -3141,7 +3149,7 @@ fn make_load_request(
             Some(LoadRequest {
                 idx, path: p.clone(), mtime, file_size,
                 skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
-                cache_key_override: Some(format!("zipthumb:{fname}")),
+                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
                 folder_thumb_sort: None,
             })
         }
@@ -3152,7 +3160,7 @@ fn make_load_request(
                 idx, path: p.clone(), mtime, file_size,
                 skip_cache, zip_entry: None, pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
-                cache_key_override: Some(format!("pdfthumb:{fname}")),
+                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
                 folder_thumb_sort: None,
             })
         }
@@ -3162,7 +3170,7 @@ fn make_load_request(
             Some(LoadRequest {
                 idx, path: p.clone(), mtime, file_size,
                 skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
-                cache_key_override: Some(format!("folderthumb:{fname}")),
+                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
                 folder_thumb_sort,
             })
         }
@@ -3331,23 +3339,7 @@ pub(crate) fn draw_cell(
                     draw_thumb_texture(painter, inner, tex, rotation);
                     draw_folder_badge(painter, inner, name);
                 }
-                ThumbnailState::Pending | ThumbnailState::Evicted => {
-                    painter.text(
-                        inner.center() - egui::vec2(0.0, 14.0),
-                        egui::Align2::CENTER_CENTER,
-                        "📁",
-                        egui::FontId::proportional(42.0),
-                        egui::Color32::from_rgb(220, 170, 30),
-                    );
-                    painter.text(
-                        egui::pos2(inner.center().x, inner.max.y - 4.0),
-                        egui::Align2::CENTER_BOTTOM,
-                        truncate_name(name, 18),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(30),
-                    );
-                }
-                ThumbnailState::Failed => {
+                ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
                     painter.text(
                         inner.center() - egui::vec2(0.0, 14.0),
                         egui::Align2::CENTER_CENTER,
@@ -3403,69 +3395,25 @@ pub(crate) fn draw_cell(
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
             draw_thumb(painter, inner, thumb, rotation);
         }
-        GridItem::ZipFile(path) => {
+        GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+            let (icon, badge_fn): (&str, fn(&egui::Painter, egui::Rect)) =
+                if matches!(item, GridItem::ZipFile(_)) { ("📦", draw_zip_badge) } else { ("📄", draw_pdf_badge) };
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
                     draw_thumb_texture(painter, inner, tex, rotation);
                 }
-                ThumbnailState::Pending | ThumbnailState::Evicted => {
+                ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
                     painter.text(
                         inner.center(),
                         egui::Align2::CENTER_CENTER,
-                        "📦",
-                        egui::FontId::proportional(32.0),
-                        egui::Color32::from_gray(120),
-                    );
-                }
-                ThumbnailState::Failed => {
-                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
-                    painter.text(
-                        inner.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "📦",
+                        icon,
                         egui::FontId::proportional(32.0),
                         egui::Color32::from_gray(120),
                     );
                 }
             }
-            draw_zip_badge(painter, inner);
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            painter.text(
-                egui::pos2(inner.center().x, inner.max.y - 4.0),
-                egui::Align2::CENTER_BOTTOM,
-                truncate_name(name, 18),
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(30),
-            );
-        }
-        GridItem::PdfFile(path) => {
-            match thumb {
-                ThumbnailState::Loaded { tex, .. } => {
-                    draw_thumb_texture(painter, inner, tex, rotation);
-                }
-                ThumbnailState::Pending | ThumbnailState::Evicted => {
-                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
-                    painter.text(
-                        inner.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "📄",
-                        egui::FontId::proportional(32.0),
-                        egui::Color32::from_gray(120),
-                    );
-                }
-                ThumbnailState::Failed => {
-                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
-                    painter.text(
-                        inner.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "📄",
-                        egui::FontId::proportional(32.0),
-                        egui::Color32::from_gray(120),
-                    );
-                }
-            }
-            draw_pdf_badge(painter, inner);
+            badge_fn(painter, inner);
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             painter.text(
                 egui::pos2(inner.center().x, inner.max.y - 4.0),
