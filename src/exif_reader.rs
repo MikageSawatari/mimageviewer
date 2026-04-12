@@ -191,6 +191,88 @@ fn tag_name_from_id(tag_id: u16) -> String {
     }
 }
 
+/// EXIF タグ名の日本語表示名を返す。
+/// Windows エクスプローラー / NeeView と同等の表記を採用。
+pub fn tag_display_name(tag_name: &str) -> &str {
+    match tag_name {
+        // 0th IFD
+        "ImageWidth" => "画像の幅",
+        "ImageLength" => "画像の高さ",
+        "ImageDescription" => "画像の説明",
+        "Make" => "カメラ メーカー",
+        "Model" => "カメラ モデル",
+        "Orientation" => "向き",
+        "XResolution" => "水平方向の解像度",
+        "YResolution" => "垂直方向の解像度",
+        "ResolutionUnit" => "解像度の単位",
+        "Software" => "プログラム名",
+        "DateTime" => "変更日時",
+        "Artist" => "作成者",
+        "Copyright" => "著作権",
+
+        // Exif IFD
+        "ExposureTime" => "露出時間",
+        "FNumber" => "絞り値",
+        "ExposureProgram" => "露出プログラム",
+        "PhotographicSensitivity" => "ISO 速度",
+        "SensitivityType" => "感度種別",
+        "ExposureBiasValue" => "露出補正",
+        "DateTimeOriginal" => "撮影日時",
+        "DateTimeDigitized" => "取得日時",
+        "ShutterSpeedValue" => "シャッタースピード",
+        "ApertureValue" => "絞り値 (APEX)",
+        "MaxApertureValue" => "最大絞り",
+        "MeteringMode" => "測光モード",
+        "LightSource" => "光源",
+        "Flash" => "フラッシュ モード",
+        "FocalLength" => "焦点距離",
+        "UserComment" => "ユーザー コメント",
+        "FlashpixVersion" => "Flashpix バージョン",
+        "ColorSpace" => "色空間",
+        "PixelXDimension" => "幅 (pixel)",
+        "PixelYDimension" => "高さ (pixel)",
+        "FocalPlaneXResolution" => "焦点面 X 解像度",
+        "FocalPlaneYResolution" => "焦点面 Y 解像度",
+        "FocalPlaneResolutionUnit" => "焦点面解像度の単位",
+        "CustomRendered" => "カスタム レンダリング",
+        "ExposureMode" => "露出モード",
+        "WhiteBalance" => "ホワイト バランス",
+        "DigitalZoomRatio" => "デジタル ズーム",
+        "FocalLengthIn35mmFilm" => "35mm 焦点距離",
+        "SceneCaptureType" => "撮影シーン",
+        "BodySerialNumber" => "カメラ製造番号",
+        "LensMake" => "レンズ メーカー",
+        "LensModel" => "レンズ モデル",
+        "LensSerialNumber" => "レンズ製造番号",
+
+        // GPS
+        "GPSVersionID" => "GPS バージョン",
+        "GPSLatitudeRef" => "緯度基準",
+        "GPSLatitude" => "緯度",
+        "GPSLongitudeRef" => "経度基準",
+        "GPSLongitude" => "経度",
+        "GPSAltitudeRef" => "高度基準",
+        "GPSAltitude" => "高度",
+        "GPSTimeStamp" => "GPS 時刻",
+        "GPSDateStamp" => "GPS 日付",
+
+        // 未知のタグはそのまま返す
+        other => other,
+    }
+}
+
+/// EXIF セクション名の日本語表示名を返す。
+pub fn section_display_name(section: &str) -> &str {
+    match section {
+        "Camera" => "カメラ",
+        "Shooting" => "撮影設定",
+        "Image" => "画像情報",
+        "GPS" => "GPS",
+        "Other" => "その他",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::exif_reader::ExifInfo;
+use crate::exif_reader::{self, ExifInfo};
 use crate::grid_item::GridItem;
 use crate::png_metadata::{AiMetadata, A1111Metadata, ComfyUIMetadata};
 
@@ -414,10 +414,11 @@ fn draw_exif_panel(
 
     for (section_name, fields) in &exif.sections {
         let open = sections_open.entry(section_name.clone()).or_insert(true);
+        let display_section = exif_reader::section_display_name(section_name);
         let header = if *open {
-            format!("▼ {section_name}")
+            format!("▼ {display_section}")
         } else {
-            format!("▶ {section_name}")
+            format!("▶ {display_section}")
         };
         if ui
             .selectable_label(
@@ -434,7 +435,8 @@ fn draw_exif_panel(
         if *open {
             ui.add_space(2.0);
             for (tag_name, value) in fields {
-                draw_key_value_wrapped(ui, tag_name, value);
+                let display_tag = exif_reader::tag_display_name(tag_name);
+                draw_key_value_wrapped(ui, display_tag, value);
             }
             ui.add_space(4.0);
         }
