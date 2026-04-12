@@ -815,14 +815,8 @@ impl App {
             return;
         };
 
-        // 区切り・フォルダはスキップ
-        let show_info = matches!(
-            self.items.get(idx),
-            Some(GridItem::Image(_))
-                | Some(GridItem::Video(_))
-                | Some(GridItem::ZipImage { .. })
-        );
-        if !show_info {
+        // ZipSeparator はスキップ
+        if matches!(self.items.get(idx), Some(GridItem::ZipSeparator { .. }) | None) {
             return;
         }
 

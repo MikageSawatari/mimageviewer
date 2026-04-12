@@ -430,7 +430,7 @@
     <span class="badge">Rust 製</span>
   </div>
   <a class="btn-download" href="#download">ダウンロード</a>
-  <p class="download-note">無料 &nbsp;·&nbsp; インストール不要 &nbsp;·&nbsp; 単体 exe</p>
+  <p class="download-note">無料 &nbsp;·&nbsp; インストーラ or 単体 exe</p>
 </div>
 
 <main>
@@ -540,6 +540,11 @@
         <p>ZIP ファイル内の画像をフォルダ構造ごとブラウズ。展開不要でそのまま閲覧。</p>
       </div>
       <div class="feature-card">
+        <div class="icon">📄</div>
+        <h3>PDF 表示</h3>
+        <p>PDF ファイルをページごとにサムネイル表示・フルスクリーン閲覧。パスワード付き PDF にも対応。PDFium エンジン内蔵。</p>
+      </div>
+      <div class="feature-card">
         <div class="icon">🎚️</div>
         <h3>サムネイル画質設定</h3>
         <p>キャッシュのサイズと品質を A/B 比較プレビューで視覚的に調整。容量と画質のバランスを自分で決められる。</p>
@@ -598,6 +603,7 @@
     <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP（内蔵）／ HEIC・AVIF・JPEG XL・TIFF・各社 RAW（WIC 経由）</p>
     <p><strong>アニメーション：</strong>アニメーション GIF、APNG</p>
     <p><strong>動画：</strong>MP4、AVI、MOV、MKV、WMV、MPEG（サムネイル表示のみ）</p>
+    <p><strong>ドキュメント：</strong>PDF（ページごとに表示、パスワード付き対応）</p>
     <p><strong>アーカイブ：</strong>ZIP（展開不要でブラウズ可）</p>
     <p style="margin-top:0.5rem;"><a href="manual/formats.html">→ 対応フォーマット詳細・コーデックのインストール方法</a></p>
   </section>
@@ -616,16 +622,20 @@
   <!-- ===== Download ===== -->
   <section id="download">
     <h2>ダウンロード</h2>
-    <div class="download-box">
-      <div class="download-info">
-        <div class="version">mImageViewer v0.3.0</div>
-        <div class="meta">Windows 11 64bit &nbsp;·&nbsp; インストール不要</div>
+    <div class="download-box" style="flex-direction:column; align-items:stretch;">
+      <div class="download-info" style="text-align:center;">
+        <div class="version">mImageViewer v0.4.0</div>
+        <div class="meta">Windows 10 / 11（64bit）</div>
       </div>
-      <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">mimageviewer.exe をダウンロード</a>
+      <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
+        <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラをダウンロード</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe をダウンロード</a>
+      </div>
     </div>
     <div class="info-box" style="margin-top:1rem;">
-      ダウンロードした <code>mimageviewer.exe</code> を任意のフォルダに置いて実行するだけで使えます。<br>
-      設定は <code>%APPDATA%\mimageviewer\</code> に保存されます。アンインストールはファイルを削除するだけです。
+      <strong>インストーラ版：</strong>スタートメニューへの登録・アンインストール機能付き。<br>
+      <strong>単体 exe 版：</strong>任意のフォルダに置いて実行するだけで使えます。アンインストールはファイルを削除するだけ。<br>
+      いずれの場合も、設定は <code>%APPDATA%\mimageviewer\</code> に保存されます。
     </div>
   </section>
 

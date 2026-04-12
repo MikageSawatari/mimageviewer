@@ -66,7 +66,16 @@
     </div>
 
     <h2>インストール</h2>
-    <p>mImageViewer はインストーラー不要の単体 exe アプリケーションです。</p>
+    <p>mImageViewer にはインストーラ版と単体 exe 版の 2 つの導入方法があります。</p>
+
+    <h3>インストーラ版</h3>
+    <ol class="step-list">
+      <li>配布ページから <code>mImageViewer_setup.exe</code> をダウンロードします。</li>
+      <li>ダウンロードしたファイルを実行し、画面の指示に従ってインストールします。</li>
+      <li>スタートメニューの「mImageViewer」から起動します。</li>
+    </ol>
+
+    <h3>単体 exe 版（ポータブル）</h3>
     <ol class="step-list">
       <li>配布ページから <code>mimageviewer.exe</code> をダウンロードします。</li>
       <li>任意のフォルダに置きます（例：<code>C:\Tools\mImageViewer\</code>）。</li>
@@ -76,7 +85,7 @@
     <div class="box tip">
       <span class="box-icon">💡</span>
       <div class="box-body">
-        <strong>スタートメニューへの登録：</strong>
+        <strong>単体 exe 版でスタートメニューに登録：</strong>
         <code>mimageviewer.exe</code> を右クリック →「スタートにピン留めする」でスタートメニューから起動できます。
         デスクトップにショートカットを作成するには、右クリック →「ショートカットの作成」を選んでデスクトップに移動してください。
       </div>
@@ -116,7 +125,11 @@
     </div>
 
     <h2>アンインストール</h2>
-    <p>mImageViewer はレジストリを一切変更しません。アンインストールは以下の手順です：</p>
+    <h3>インストーラ版</h3>
+    <p>Windows の「設定」→「アプリ」→「インストールされているアプリ」から「mImageViewer」を選んでアンインストールします。
+    アンインストール時に設定ファイルとキャッシュを削除するか確認されます。</p>
+
+    <h3>単体 exe 版</h3>
     <ol class="step-list">
       <li><code>mimageviewer.exe</code> を削除します。</li>
       <li>設定を削除する場合は <code>%APPDATA%\mimageviewer</code> フォルダも削除します。</li>

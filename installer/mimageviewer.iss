@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\mimageviewer.iss
 
 #define MyAppName "mImageViewer"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "Mikage Sawatari"
 #define MyAppURL "https://mikage.to/mimageviewer/"
 #define MyAppExeName "mimageviewer.exe"
@@ -18,7 +18,7 @@ AppSupportURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 OutputDir=Output
-OutputBaseFilename=mImageViewer_{#MyAppVersion}_setup
+OutputBaseFilename=mImageViewer_setup
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
