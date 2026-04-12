@@ -127,6 +127,7 @@ impl App {
         let fs_builder = egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_visible(false)
+            .with_taskbar(false)
             .with_inner_size([1.0, 1.0]);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("fullscreen_viewer"),
@@ -445,7 +446,8 @@ impl App {
 
         let b = egui::ViewportBuilder::default()
             .with_decorations(false)
-            .with_transparent(true);
+            .with_transparent(true)
+            .with_taskbar(false);
         match monitor_rect {
             Some(rect) => {
                 crate::logger::log(format!(
