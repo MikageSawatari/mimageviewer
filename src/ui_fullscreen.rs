@@ -78,6 +78,11 @@ impl App {
             return;
         };
 
+        // ── pending の PDF 再レンダリング結果を取り込む ──
+        // show_viewport_immediate 内では &mut self が使えるので、
+        // メインの update() を待たずにここで直接 poll する。
+        self.poll_prefetch(ctx);
+
         // ── 状態の事前計算 ──
         self.advance_animation(ctx, fs_idx);
         let state = self.prepare_fullscreen_state(ctx, fs_idx);
@@ -168,8 +173,10 @@ impl App {
                         }
 
                         // ── 高解像度読込中インジケーター ──
+                        // PDF 再レンダリング中は��部に専用インジケータが出るので重複表示しない
                         let has_any_tex = state.tex.is_some() || state.thumb_tex.is_some();
-                        if state.is_loading && has_any_tex {
+                        let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
+                        if state.is_loading && has_any_tex && !pdf_rerendering {
                             ui.painter().text(
                                 image_rect.min + egui::vec2(16.0, 16.0),
                                 egui::Align2::LEFT_TOP,
@@ -177,6 +184,28 @@ impl App {
                                 egui::FontId::proportional(14.0),
                                 egui::Color32::from_rgba_unmultiplied(220, 220, 220, 180),
                             );
+                        }
+
+                        // ── PDF 再レンダリング進捗 ──
+                        if self.fs_pending.contains_key(&fs_idx) {
+                            let label = if matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. })) {
+                                "PDF 再レンダリング中..."
+                            } else {
+                                "読込中..."
+                            };
+                            let font = egui::FontId::proportional(13.0);
+                            let pos = egui::pos2(image_rect.min.x + 12.0, image_rect.max.y - 12.0);
+                            let galley = ui.painter().layout_no_wrap(
+                                label.to_string(), font.clone(), egui::Color32::WHITE,
+                            );
+                            let text_rect = egui::Align2::LEFT_BOTTOM
+                                .anchor_size(pos, galley.size());
+                            let bg = text_rect.expand(4.0);
+                            ui.painter().rect_filled(
+                                bg, 4.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                            );
+                            ui.painter().galley(text_rect.min, galley, egui::Color32::WHITE);
                         }
 
                         // ── 分析パネル（分析モード時、メタデータパネルより優先）──
@@ -397,7 +426,8 @@ impl App {
                 match self.items.get(fs_idx) {
                     Some(GridItem::Image(_))
                     | Some(GridItem::Video(_))
-                    | Some(GridItem::ZipImage { .. }) => {
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. }) => {
                         if self.checked.contains(&fs_idx) {
                             self.checked.remove(&fs_idx);
                         } else {
@@ -471,6 +501,14 @@ impl App {
                     self.analysis_pan.x -= cx * dz;
                     self.analysis_pan.y -= cy * dz;
                 }
+                // PDF ページ: ズーム変更時に解像度を合わせて非同期再レンダリング
+                if self.analysis_zoom != old_zoom {
+                    if let Some(idx) = self.fullscreen_idx {
+                        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+                            self.request_pdf_rerender(idx, self.analysis_zoom);
+                        }
+                    }
+                }
             } else {
                 nav_delta = if wheel_y < 0.0 { 1 } else { -1 };
             }
@@ -488,6 +526,12 @@ impl App {
             if fs_response.double_clicked() {
                 self.analysis_zoom = 1.0;
                 self.analysis_pan = egui::Vec2::ZERO;
+                // PDF ページ: ズームリセット時にベース解像度で再レンダリング
+                if let Some(idx) = self.fullscreen_idx {
+                    if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+                        self.request_pdf_rerender(idx, 1.0);
+                    }
+                }
             }
             // 右クリックは analysis_panel 側で処理
         } else {
@@ -569,7 +613,7 @@ impl App {
                             self.visible_indices.iter().copied()
                                 .find(|&i| matches!(
                                     self.items.get(i),
-                                    Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. })
+                                    Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
                                 ))
                                 .unwrap_or(0)
                         }
@@ -588,12 +632,13 @@ impl App {
 
     /// フルスクリーンの再描画リクエストを管理する。
     fn handle_fs_repaint(&self, ctx: &egui::Context, fs_idx: usize, is_video: bool) {
-        // 高解像度読み込み完了まで毎フレーム再描画
+        // 高解像度読み込み完了まで、またはPDF再レンダリング中は毎フレーム再描画
         let image_loading = !is_video
             && self.fullscreen_idx
                 .map(|i| !self.fs_cache.contains_key(&i))
                 .unwrap_or(false);
-        if image_loading {
+        let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
+        if image_loading || pdf_rerendering {
             ctx.request_repaint();
         }
 

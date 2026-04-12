@@ -15,6 +15,8 @@ dual-window approach.
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
 - **ZIP support**: `zip` crate
+- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み)
+- **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **GPU upscaling (Phase 2, planned)**: NVIDIA NGX DLISR via C FFI
 - **Build tool**: cargo (MSVC toolchain on Windows)
 
@@ -67,6 +69,8 @@ mimageviewer/
 │   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
 │   ├── video_thumb.rs       # 動画サムネイル取得（Windows Shell API）
 │   ├── zip_loader.rs        # ZIP アーカイブ内画像列挙・読み込み
+│   ├── pdf_loader.rs        # PDF ページ列挙・レンダリング（PDFium）
+│   ├── pdf_passwords.rs     # PDF パスワード DPAPI 暗号化保存
 │   ├── fs_animation.rs      # アニメーション GIF / APNG デコード
 │   ├── gpu_info.rs          # GPU 情報取得（VRAM サイズ等）
 │   ├── monitor.rs           # モニター情報取得（DPI 等）
@@ -74,6 +78,11 @@ mimageviewer/
 │   ├── logger.rs            # パフォーマンス分析用ファイルロガー
 │   └── bin/
 │       └── bench_thumbs.rs  # サムネイル生成ベンチマーク
+├── scripts/
+│   └── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
+├── vendor/
+│   └── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
+│       └── bin/pdfium.dll   # include_bytes! で exe に埋め込まれる
 ├── Cargo.toml
 └── Cargo.lock
 ```
@@ -169,6 +178,32 @@ crop = img.crop((x0, y0, x0 + W, y0 + H))
 - 出力サイズ: 2560x1440 にリサイズ（既存 ss_fullscreen.png 等と統一）
 
 詳細手順は `docs/screenshot-howto.md` を参照。
+
+## PDFium 管理
+
+PDF サポートは PDFium ライブラリ (Google Chrome の PDF エンジン) を使用する。
+DLL は exe に `include_bytes!` で埋め込まれ、初回起動時に
+`%APPDATA%\mimageviewer\pdfium.dll` に展開される。
+
+### セットアップ
+
+```bash
+bash scripts/setup-pdfium.sh        # DLL をダウンロード (vendor/pdfium/bin/pdfium.dll)
+bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
+```
+
+- **ソース**: [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
+  (毎週月曜に Chromium 最新版から自動ビルド)
+- **アセット**: `pdfium-win-x64.tgz` (V8 なし版、軽量)
+- **現在のバージョン**: `vendor/pdfium/VERSION` を参照
+
+### リリース前チェック (必須)
+
+**リリースビルドの前に必ず以下を確認すること:**
+
+1. `bash scripts/setup-pdfium.sh check` を実行し、新しいバージョンがないか確認
+2. 新しいバージョンがある場合は `bash scripts/setup-pdfium.sh` で更新
+3. 更新後は PDF の表示が正常か動作確認してからリリース
 
 ## Distribution
 

@@ -22,6 +22,8 @@ pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
 pub mod video_thumb;
+pub mod pdf_loader;
+pub mod pdf_passwords;
 pub mod wic_decoder;
 pub mod zip_loader;
 
@@ -30,8 +32,12 @@ use std::sync::Arc;
 fn main() -> eframe::Result {
     data_dir::init();
 
-    #[cfg(debug_assertions)]
-    logger::init();
+    // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
+    let log_enabled = cfg!(debug_assertions)
+        || std::env::args().any(|a| a == "--log");
+    if log_enabled {
+        logger::init();
+    }
 
     // 保存済み設定からウィンドウ初期状態を決定する
     let saved = settings::Settings::load();

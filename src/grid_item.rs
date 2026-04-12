@@ -6,6 +6,7 @@
 //!
 //! どちらも純粋なデータ型で、UI 状態や I/O は持たない。
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -24,6 +25,12 @@ pub enum GridItem {
         /// 表示されるディレクトリ名 (ルート直下の場合は "(root)")
         dir_display: String,
     },
+    /// PDF ファイル内の 1 ページ
+    PdfPage {
+        pdf_path: PathBuf,
+        /// ページ番号 (0-indexed)
+        page_num: u32,
+    },
 }
 
 impl GridItem {
@@ -31,17 +38,27 @@ impl GridItem {
     /// - 通常: ファイル名
     /// - ZipImage: ZIP 内エントリのベース名
     /// - ZipSeparator: ディレクトリ表示名
-    pub fn name(&self) -> &str {
+    /// - PdfPage: "Page N" (1-indexed)
+    pub fn name(&self) -> Cow<'_, str> {
         match self {
             GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p) => {
-                p.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                Cow::Borrowed(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
             }
             GridItem::ZipImage { entry_name, .. } => {
-                crate::zip_loader::entry_basename(entry_name)
+                Cow::Borrowed(crate::zip_loader::entry_basename(entry_name))
             }
-            GridItem::ZipSeparator { dir_display } => dir_display,
+            GridItem::ZipSeparator { dir_display } => Cow::Borrowed(dir_display),
+            GridItem::PdfPage { page_num, .. } => {
+                Cow::Owned(format!("Page {}", page_num + 1))
+            }
         }
     }
+}
+
+/// PDF ページのカタログキーを生成する。
+/// サムネイルキャッシュの保存・参照で一致させるため、全箇所でこの関数を使うこと。
+pub fn pdf_page_cache_key(page_num: u32) -> String {
+    format!("page_{:04}", page_num)
 }
 
 /// サムネイルセルの読み込み状態。

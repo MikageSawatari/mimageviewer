@@ -366,6 +366,26 @@ pub struct App {
 
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
+
+    // ── PDF パスワード管理 ───────────────────────────────────────
+    pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+    pub(crate) show_pdf_password_dialog: bool,
+    pub(crate) pdf_password_input: String,
+    /// 「パスワードを保存する」チェックボックス (デフォルト OFF)
+    pub(crate) pdf_password_save: bool,
+    pub(crate) pdf_password_error: Option<String>,
+    /// パスワード入力待ちの PDF パス
+    pub(crate) pdf_password_pending_path: Option<PathBuf>,
+    /// 現在開いている PDF のパスワード (セッション中キャッシュ)
+    pub(crate) pdf_current_password: Option<String>,
+
+    // ── PDF 非同期ロード ────────────────────────────────────────
+    /// ページ列挙の非同期応答待ち: (pdf_path, password, receiver)
+    pub(crate) pdf_enumerate_pending: Option<(
+        PathBuf,
+        Option<String>,
+        mpsc::Receiver<std::io::Result<Vec<crate::pdf_loader::PdfPageEntry>>>,
+    )>,
 }
 
 impl Default for App {
@@ -482,6 +502,14 @@ impl Default for App {
             analysis_hist_cache: None,
             analysis_sv_cache: None,
             initialized: false,
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
+            show_pdf_password_dialog: false,
+            pdf_password_input: String::new(),
+            pdf_password_save: false,
+            pdf_password_error: None,
+            pdf_password_pending_path: None,
+            pdf_current_password: None,
+            pdf_enumerate_pending: None,
         }
     }
 }
@@ -503,19 +531,24 @@ impl App {
             || self.show_rotation_reset_confirm
             || self.show_slideshow_settings
             || self.show_exif_settings
+            || self.show_pdf_password_dialog
             || self.context_menu_idx.is_some()
     }
 
     pub fn load_folder(&mut self, path: PathBuf) {
-        // タスク 3: パスが .zip ファイルなら ZIP を仮想フォルダとして開く
+        // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
-            let is_zip = path
+            let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("zip"))
-                .unwrap_or(false);
-            if is_zip {
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext == "zip" {
                 self.load_zip_as_folder(path);
+                return;
+            }
+            if ext == "pdf" {
+                self.load_pdf_as_folder(path);
                 return;
             }
         }
@@ -548,6 +581,9 @@ impl App {
                         all_media.push((p, true, mtime, file_size));
                     } else if ext_lower == "zip" {
                         // タスク 3: ZIP ファイルはフォルダのように扱う
+                        folders.push(GridItem::Folder(p));
+                    } else if ext_lower == "pdf" {
+                        // PDF ファイルはフォルダのように扱う
                         folders.push(GridItem::Folder(p));
                     }
                 }
@@ -672,6 +708,109 @@ impl App {
 
         // ZIP には動画は含まれない (Shell API がファイルパスを要求するため)
         self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new());
+    }
+
+    /// PDF ファイルを仮想フォルダとして開く (非同期)。
+    ///
+    /// ワーカーにページ列挙リクエストを送り、即座に return する。
+    /// 結果は `poll_pdf_enumerate` が次フレーム以降にポーリングして処理する。
+    /// パスワード付き PDF の場合はダイアログで入力を求める。
+    pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
+        crate::logger::log(format!("=== load_pdf_as_folder: {} ===", pdf_path.display()));
+
+        // 旧サムネイルワーカーを即座にキャンセルして PDF ワーカーキューの渋滞を防ぐ。
+        // start_loading_items は enumerate 完了後に呼ばれるため、ここで先行キャンセルする。
+        self.cancel_token.store(true, Ordering::Relaxed);
+
+        // ── パスワード確認 ──
+        let password: Option<String> = self
+            .pdf_passwords
+            .get(&pdf_path)
+            .or_else(|| self.pdf_current_password.clone());
+
+        // パスワードチェックも非同期化したいが、ダイアログ表示のフローが複雑になるため
+        // ここでは簡易判定: 保存済みパスワードがなければ非同期で check_password を含めて
+        // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
+
+        // ── 非同期でページ列挙をリクエスト ──
+        let rx = crate::pdf_loader::enumerate_pages_async(
+            &pdf_path,
+            password.as_deref(),
+        );
+        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, rx));
+
+        // アドレスバーを即座に更新 (ローディング中であることを示す)
+        self.address = pdf_path.to_string_lossy().to_string();
+    }
+
+    /// PDF ページ列挙の非同期応答をポーリングする。
+    /// 毎フレーム `update()` から呼び出す。
+    pub(crate) fn poll_pdf_enumerate(&mut self) {
+        let Some((ref pdf_path, _, ref rx)) = self.pdf_enumerate_pending else {
+            return;
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return, // まだ結果が来ていない
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // ワーカーが切断 (通常起きない)
+                crate::logger::log("  pdf enumerate: worker disconnected");
+                let path = pdf_path.clone();
+                self.pdf_enumerate_pending = None;
+                self.start_loading_items(
+                    path, Vec::new(), Vec::new(),
+                    std::collections::HashSet::new(), Vec::new(),
+                );
+                return;
+            }
+        };
+
+        let (pdf_path, password, _) = self.pdf_enumerate_pending.take().unwrap();
+
+        match result {
+            Ok(pages) => {
+                crate::logger::log(format!("  pdf: {} pages", pages.len()));
+                self.pdf_current_password = password;
+
+                let mut items: Vec<GridItem> = Vec::new();
+                let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
+                let mut existing_keys: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                for page in &pages {
+                    let key = crate::grid_item::pdf_page_cache_key(page.page_num);
+                    existing_keys.insert(key);
+                    items.push(GridItem::PdfPage {
+                        pdf_path: pdf_path.clone(),
+                        page_num: page.page_num,
+                    });
+                    image_metas.push(Some((page.mtime, page.file_size as i64)));
+                }
+
+                self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new());
+            }
+            Err(e) => {
+                let err_msg = format!("{e}");
+                // パスワードエラーかどうかを判定 (エラーメッセージに "Password" が含まれる)
+                if err_msg.contains("Password") || err_msg.contains("password") {
+                    if password.is_none() {
+                        // パスワードが必要 → ダイアログ表示
+                        self.pdf_password_pending_path = Some(pdf_path);
+                        self.show_pdf_password_dialog = true;
+                        self.pdf_password_input.clear();
+                        self.pdf_password_error = None;
+                        self.pdf_password_save = false;
+                        return;
+                    }
+                }
+                crate::logger::log(format!("  pdf enumerate failed: {e}"));
+                self.start_loading_items(
+                    pdf_path, Vec::new(), Vec::new(),
+                    std::collections::HashSet::new(), Vec::new(),
+                );
+            }
+        }
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
@@ -865,6 +1004,7 @@ impl App {
                                 &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
                                 thumb_px, thumb_quality, display_px, cache_decision, &done_w,
                                 &stats_w,
+                                Some(&cancel_w),
                             );
                         }
                         None => {
@@ -1104,7 +1244,7 @@ impl App {
                 continue;
             };
             let Some(req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, false)
+                make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref())
             }) else {
                 continue;
             };
@@ -1208,7 +1348,7 @@ impl App {
                 continue;
             };
             let Some(req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, true)
+                make_load_request(item, i, mtime, file_size, true, self.pdf_current_password.as_deref())
             }) else {
                 continue;
             };
@@ -1382,7 +1522,8 @@ impl App {
                             match self.items.get(idx) {
                                 Some(GridItem::Image(_))
                                 | Some(GridItem::Video(_))
-                                | Some(GridItem::ZipImage { .. }) => {
+                                | Some(GridItem::ZipImage { .. })
+                                | Some(GridItem::PdfPage { .. }) => {
                                     self.checked.insert(idx);
                                 }
                                 _ => {}
@@ -1406,7 +1547,8 @@ impl App {
                         match self.items.get(idx) {
                             Some(GridItem::Image(_))
                             | Some(GridItem::Video(_))
-                            | Some(GridItem::ZipImage { .. }) => {
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. }) => {
                                 self.checked.insert(idx);
                             }
                             _ => {}
@@ -1433,7 +1575,8 @@ impl App {
                         Some(GridItem::Folder(p)) => return Some(p.clone()),
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::ZipSeparator { .. }) => self.open_fullscreen(idx),
+                        | Some(GridItem::ZipSeparator { .. })
+                        | Some(GridItem::PdfPage { .. }) => self.open_fullscreen(idx),
                         Some(GridItem::Video(p)) => {
                             let vp = p.clone();
                             open_external_player(&vp);
@@ -1684,7 +1827,9 @@ impl App {
         self.analysis_sv_cache = None;
 
         match self.items.get(idx) {
-            Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) => {
+            Some(GridItem::Image(_))
+            | Some(GridItem::ZipImage { .. })
+            | Some(GridItem::PdfPage { .. }) => {
                 if self.fs_cache.contains_key(&idx) {
                     crate::logger::log(format!("  cache hit idx={idx} → instant display"));
                 } else if !self.fs_pending.contains_key(&idx) {
@@ -1714,6 +1859,7 @@ impl App {
         let path = match self.items.get(idx) {
             Some(GridItem::Image(p)) => p.clone(),
             Some(GridItem::ZipImage { zip_path, .. }) => zip_path.clone(),
+            Some(GridItem::PdfPage { pdf_path, .. }) => pdf_path.clone(),
             _ => return,
         };
 
@@ -2003,14 +2149,17 @@ impl App {
     }
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
-    /// 通常画像 / ZIP エントリ の両方に対応。
+    /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     fn start_fs_load(&mut self, idx: usize) {
-        // (path, zip_entry) を取り出し: 通常画像なら (path, None)、ZIP なら (zip_path, Some(entry))
-        let (path, zip_entry) = match self.items.get(idx) {
-            Some(GridItem::Image(p)) => (p.clone(), None),
+        // (path, zip_entry, pdf_page, pdf_password) を取り出し
+        let (path, zip_entry, pdf_page, pdf_password) = match self.items.get(idx) {
+            Some(GridItem::Image(p)) => (p.clone(), None, None, None),
             Some(GridItem::ZipImage { zip_path, entry_name }) => {
-                (zip_path.clone(), Some(entry_name.clone()))
+                (zip_path.clone(), Some(entry_name.clone()), None, None)
+            }
+            Some(GridItem::PdfPage { pdf_path, page_num }) => {
+                (pdf_path.clone(), None, Some(*page_num), self.pdf_current_password.clone())
             }
             _ => return,
         };
@@ -2024,7 +2173,9 @@ impl App {
             let t = std::time::Instant::now();
 
             // 表示名と拡張子を取得
-            let (name, ext) = if let Some(ref entry_name) = zip_entry {
+            let (name, ext) = if let Some(page_num) = pdf_page {
+                (format!("Page {}", page_num + 1), "pdf".to_string())
+            } else if let Some(ref entry_name) = zip_entry {
                 let base = crate::zip_loader::entry_basename(entry_name).to_string();
                 let ext = base.rsplit('.').next().unwrap_or("").to_lowercase();
                 (base, ext)
@@ -2041,6 +2192,30 @@ impl App {
                     .to_lowercase();
                 (n, ext)
             };
+
+            // PDF ページの場合はラスタライズ
+            if let Some(page_num) = pdf_page {
+                match crate::pdf_loader::render_page(&path, page_num, 4096, pdf_password.as_deref(), Some(cancel.clone())) {
+                    Ok(img) => {
+                        let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                        crate::logger::log(format!(
+                            "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}",
+                            img.width(), img.height()
+                        ));
+                        let ci = dynamic_image_to_color_image(&img);
+                        let _ = tx.send(FsLoadResult::Static(ci));
+                    }
+                    Err(e) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            crate::logger::log(format!("  fs pdf render cancelled  {name}"));
+                        } else {
+                            crate::logger::log(format!("  fs pdf render FAIL: {e}  {name}"));
+                            let _ = tx.send(FsLoadResult::Failed);
+                        }
+                    }
+                }
+                return;
+            }
 
             // ZIP エントリの場合は先にバイト列を抽出
             let zip_bytes: Option<Vec<u8>> = if let Some(ref entry_name) = zip_entry {
@@ -2105,11 +2280,8 @@ impl App {
                     } else {
                         img
                     };
-                    let rgba = img.to_rgba8();
-                    let (w, h) = (rgba.width(), rgba.height());
-                    let size = [w as usize, h as usize];
-                    let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                    drop(rgba);
+                    let (w, h) = (img.width(), img.height());
+                    let ci = dynamic_image_to_color_image(&img);
                     crate::logger::log(format!(
                         "  fs load: {:.0}ms  idx={idx}  {name}  {w}x{h}",
                         t.elapsed().as_secs_f64() * 1000.0
@@ -2120,6 +2292,69 @@ impl App {
                     crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
                     // UI が「読込中...」のまま固まらないよう、失敗を明示的に通知する
                     let _ = tx.send(FsLoadResult::Failed);
+                }
+            }
+        });
+    }
+
+    /// PDF ページをズーム倍率に応じた解像度で非同期再レンダリングする。
+    ///
+    /// ワーカーに直接リクエストを送り、結果は `poll_pdf_rerender` で受け取る。
+    /// UI スレッドを一切ブロックしない。
+    pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32) {
+        let (pdf_path, page_num, password) = match self.items.get(idx) {
+            Some(GridItem::PdfPage { pdf_path, page_num }) => {
+                (pdf_path.clone(), *page_num, self.pdf_current_password.clone())
+            }
+            _ => return,
+        };
+
+        // 上限 8192: これ以上大きいとテクスチャメモリが巨大になりクラッシュする
+        // (8192px 正方形 ≈ 256 MB RGBA、16384px ≈ 1 GB)
+        let target_px = ((4096.0 * zoom) as u32).clamp(256, 8192);
+
+        // 既に同じ解像度のキャッシュがあれば不要
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
+            let cached_long = pixels.size[0].max(pixels.size[1]) as u32;
+            let ratio = cached_long as f32 / target_px as f32;
+            if (0.9..=1.1).contains(&ratio) {
+                return;
+            }
+        }
+
+        // 進行中の再レンダリングがあればキャンセル
+        if let Some((cancel, _)) = self.fs_pending.remove(&idx) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
+        // ワーカーに非同期リクエスト (UI スレッドをブロックしない)
+        let (cancel, render_rx) = crate::pdf_loader::render_page_async(
+            &pdf_path, page_num, target_px, password.as_deref(),
+        );
+
+        // render_page_async は DynamicImage チャネルを返すが、fs_pending は
+        // FsLoadResult チャネルを期待するため、ブリッジスレッドで変換する
+        let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
+        self.fs_pending.insert(idx, (Arc::clone(&cancel), fs_rx));
+
+        std::thread::spawn(move || {
+            match render_rx.recv() {
+                Ok(Ok(img)) => {
+                    if cancel.load(Ordering::Relaxed) { return; }
+                    crate::logger::log(format!(
+                        "  pdf rerender done: page={} target_px={target_px} {}x{}",
+                        page_num + 1, img.width(), img.height()
+                    ));
+                    let ci = dynamic_image_to_color_image(&img);
+                    let _ = fs_tx.send(FsLoadResult::Static(ci));
+                }
+                Ok(Err(e)) => {
+                    crate::logger::log(format!("  pdf rerender FAIL: {e}"));
+                    let _ = fs_tx.send(FsLoadResult::Failed);
+                }
+                Err(_) => {
+                    crate::logger::log("  pdf rerender: cancelled (channel closed)".to_string());
+                    // キャンセル時は fs_tx を drop して poll_prefetch が Disconnected で除去
                 }
             }
         });
@@ -2184,7 +2419,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                matches!(item, GridItem::Image(_) | GridItem::ZipImage { .. }).then_some(i)
+                matches!(item, GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }).then_some(i)
             })
             .collect()
     }
@@ -2213,12 +2448,19 @@ impl App {
     }
 
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
-    fn poll_prefetch(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
         let mut completed: Vec<(usize, FsLoadResult)> = Vec::new();
+        let mut disconnected: Vec<usize> = Vec::new();
         for (&key, (_, rx)) in &self.fs_pending {
-            if let Ok(result) = rx.try_recv() {
-                completed.push((key, result));
+            match rx.try_recv() {
+                Ok(result) => completed.push((key, result)),
+                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+        // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
+        for key in disconnected {
+            self.fs_pending.remove(&key);
         }
         let repaint = !completed.is_empty();
         for (key, result) in completed {
@@ -2585,6 +2827,8 @@ impl eframe::App for App {
         self.show_duplicate_settings_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
+        self.show_pdf_password_dialog_window(ctx);
+        self.poll_pdf_enumerate();
 
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);
@@ -2651,7 +2895,9 @@ impl eframe::App for App {
         // Pending なサムネイルがある間は毎フレーム再描画をリクエストする。
         // バックグラウンドスレッドがチャネルに送信しても egui は自動では
         // 起きないため、ここで継続的に repaint を要求しておく必要がある。
-        if self.thumbnails.iter().any(|t| matches!(t, ThumbnailState::Pending)) {
+        if self.thumbnails.iter().any(|t| matches!(t, ThumbnailState::Pending))
+            || self.pdf_enumerate_pending.is_some()
+        {
             ctx.request_repaint();
         }
     }
@@ -2670,22 +2916,28 @@ impl eframe::App for App {
 // セル描画
 // -----------------------------------------------------------------------
 
-/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像以外は None を返す。
+/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ以外は None を返す。
 fn make_load_request(
     item: &GridItem,
     idx: usize,
     mtime: i64,
     file_size: i64,
     skip_cache: bool,
+    pdf_password: Option<&str>,
 ) -> Option<LoadRequest> {
     match item {
         GridItem::Image(p) => Some(LoadRequest {
             idx, path: p.clone(), mtime, file_size,
-            skip_cache, zip_entry: None,
+            skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
-            skip_cache, zip_entry: Some(entry_name.clone()),
+            skip_cache, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
+        }),
+        GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
+            idx, path: pdf_path.clone(), mtime, file_size,
+            skip_cache, zip_entry: None, pdf_page: Some(*page_num),
+            pdf_password: pdf_password.map(String::from),
         }),
         _ => None,
     }
@@ -2720,6 +2972,14 @@ fn draw_thumb_texture(
         // 回転したテクスチャを Mesh で描画
         draw_rotated_image(painter, tex.id(), img_rect, rotation);
     }
+}
+
+/// DynamicImage を egui::ColorImage に変換する (リサイズなし)。
+/// フルスクリーン表示や PDF 再レンダリング結果の変換で使用。
+pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
 /// 回転した画像を Mesh で描画する。
@@ -2889,7 +3149,7 @@ pub(crate) fn draw_cell(
                 egui::Color32::from_gray(30),
             );
         }
-        GridItem::ZipImage { .. } => {
+        GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
             draw_thumb(painter, inner, thumb, rotation);
         }
         GridItem::ZipSeparator { dir_display } => {

@@ -22,4 +22,5 @@ mod slideshow_settings;
 mod stats_dialog;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
+mod pdf_password;
 mod toolbar_settings;

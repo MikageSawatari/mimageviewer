@@ -51,6 +51,16 @@ pub fn is_apple_double(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// .zip / .pdf ファイルを仮想フォルダとして扱うかの判定。
+pub fn is_virtual_folder(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    ext == "zip" || ext == "pdf"
+}
+
 // -----------------------------------------------------------------------
 // 画像有無の判定
 // -----------------------------------------------------------------------
@@ -58,17 +68,23 @@ pub fn is_apple_double(path: &Path) -> bool {
 /// フォルダ内に対応画像ファイルが1枚以上あるか確認する。
 /// path が .zip ファイルの場合は ZIP 内の画像エントリを確認する (タスク 3)。
 pub fn folder_has_images(path: &Path) -> bool {
-    // .zip ファイルなら ZIP 内画像エントリを確認
-    if path.is_file() {
-        let is_zip = path
+    if path.is_file() && is_virtual_folder(path) {
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("zip"))
-            .unwrap_or(false);
-        if is_zip {
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "zip" {
             return crate::zip_loader::enumerate_image_entries(path)
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
+        }
+        if ext == "pdf" {
+            // PDF ファイルが存在すればページありと仮定する。
+            // pdf_loader::page_count() は PDFium Mutex を取得するため、
+            // バックグラウンドレンダリング中に UI スレッドがブロックしてしまう。
+            // 壊れた PDF は開いた時にエラーになるだけなので、ここでは楽観判定で十分。
+            return true;
         }
         return false;
     }
@@ -215,15 +231,8 @@ pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
                     real_folder_names.insert(name.to_lowercase());
                 }
                 dirs.push(p);
-            } else if p.is_file() {
-                let is_zip = p
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case("zip"))
-                    .unwrap_or(false);
-                if is_zip {
-                    zip_candidates.push(p);
-                }
+            } else if p.is_file() && is_virtual_folder(&p) {
+                zip_candidates.push(p);
             }
         }
     }
@@ -268,18 +277,11 @@ pub fn path_eq(a: &Path, b: &Path) -> bool {
 /// 起動時の last_folder 復元やアドレスバー入力で、削除済み・移動済み・取り外された
 /// ドライブのパスでもクラッシュせず最も近い場所を表示するために使う。
 pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
-    fn is_zip(p: &Path) -> bool {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("zip"))
-            .unwrap_or(false)
-    }
-
     // そのまま開けるか
     if path.is_dir() {
         return Some(path.to_path_buf());
     }
-    if path.is_file() && is_zip(path) {
+    if path.is_file() && is_virtual_folder(path) {
         return Some(path.to_path_buf());
     }
 

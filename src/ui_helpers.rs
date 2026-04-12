@@ -261,6 +261,7 @@ pub fn adjacent_navigable_idx(
                     | Some(GridItem::Video(_))
                     | Some(GridItem::ZipImage { .. })
                     | Some(GridItem::ZipSeparator { .. })
+                    | Some(GridItem::PdfPage { .. })
             )
         })
         .collect();

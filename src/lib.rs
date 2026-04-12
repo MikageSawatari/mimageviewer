@@ -7,6 +7,8 @@ pub mod exif_reader;
 pub mod folder_tree;
 pub mod grid_item;
 pub mod logger;
+pub mod pdf_loader;
+pub mod pdf_passwords;
 pub mod png_metadata;
 pub mod settings;
 pub mod stats;

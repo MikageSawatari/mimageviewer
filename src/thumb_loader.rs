@@ -10,7 +10,7 @@
 //! 引数で必要な情報をすべて受け取る純粋な関数として設計されている。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // -----------------------------------------------------------------------
@@ -41,6 +41,11 @@ pub struct LoadRequest {
     /// タスク 3: `Some(name)` なら ZIP エントリとして読む。
     /// `path` が ZIP ファイル、`name` が内部エントリ名。
     pub zip_entry: Option<String>,
+    /// `Some(page_num)` なら PDF ページとしてレンダリングする。
+    /// `path` が PDF ファイル、`page_num` が 0-indexed ページ番号。
+    pub pdf_page: Option<u32>,
+    /// PDF パスワード (パスワード付き PDF 用)
+    pub pdf_password: Option<String>,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -263,18 +268,24 @@ pub fn process_load_request(
     cache_decision: CacheDecision,
     gen_done: &Arc<AtomicUsize>,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) {
     // カタログキー:
     // - 通常画像: ファイル名 (例: "foo.jpg")
     // - ZIP エントリ: エントリ名 (例: "work1/img01.jpg") 丸ごと
     //   ZIP ごとに別 DB が開かれるため、DB 内で一意
-    let filename: &str = match &req.zip_entry {
-        Some(name) => name.as_str(),
-        None => req
-            .path
+    // PDF ページの場合はキー名を生成する必要があるので owned を保持
+    let pdf_key: String;
+    let filename: &str = if let Some(page_num) = req.pdf_page {
+        pdf_key = crate::grid_item::pdf_page_cache_key(page_num);
+        &pdf_key
+    } else if let Some(ref name) = req.zip_entry {
+        name.as_str()
+    } else {
+        req.path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(""),
+            .unwrap_or("")
     };
 
     // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
@@ -300,10 +311,13 @@ pub fn process_load_request(
     load_one_cached(
         &req.path,
         req.zip_entry.as_deref(),
+        req.pdf_page,
+        req.pdf_password.as_deref(),
         req.idx, tx, catalog,
         req.mtime, req.file_size, gen_done,
         thumb_px, thumb_quality, display_px, cache_decision,
         stats,
+        cancel,
     );
 }
 
@@ -324,6 +338,8 @@ pub fn process_load_request(
 pub fn load_one_cached(
     path: &Path,
     zip_entry: Option<&str>,
+    pdf_page: Option<u32>,
+    pdf_password: Option<&str>,
     idx: usize,
     tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
@@ -335,19 +351,33 @@ pub fn load_one_cached(
     display_px: u32,
     cache_decision: CacheDecision,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) {
-    // 表示名 (ログ用): ZIP エントリならエントリ名、通常ならファイル名
-    let name = match zip_entry {
-        Some(n) => n,
-        None => path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+    // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
+    // process_load_request 側と同じキー形式を使うこと。
+    let pdf_cache_key_buf: String;
+    let pdf_display_buf: String;
+    let (name, display_name): (&str, &str) = if let Some(page_num) = pdf_page {
+        pdf_cache_key_buf = crate::grid_item::pdf_page_cache_key(page_num);
+        pdf_display_buf = format!("Page {}", page_num + 1);
+        (&pdf_cache_key_buf, &pdf_display_buf)
+    } else if let Some(n) = zip_entry {
+        (n, n)
+    } else {
+        let n = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        (n, n)
     };
     let t = std::time::Instant::now();
 
     // ── デコード経路 ──
+    // 0. PDF ページ:     PDFium でラスタライズ → DynamicImage
     // 1. ZIP エントリ:    ZIP を開いてエントリのバイト列を取り出してから image クレートで decode
     // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
     //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
-    let img_result = if let Some(entry_name) = zip_entry {
+    let img_result = if let Some(page_num) = pdf_page {
+        crate::pdf_loader::render_page(path, page_num, display_px, pdf_password, cancel.map(Arc::clone))
+            .map_err(|e| image::ImageError::IoError(e))
+    } else if let Some(entry_name) = zip_entry {
         crate::zip_loader::read_entry_bytes(path, entry_name)
             .map_err(image::ImageError::IoError)
             .and_then(|bytes| image::load_from_memory(&bytes))
@@ -374,7 +404,14 @@ pub fn load_one_cached(
     let img = match img_result {
         Ok(i) => i,
         Err(e) => {
-            crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {name}"));
+            // キャンセル済みなら失敗を報告しない (フォルダ切替で旧アイテムが
+            // 一瞬ピンク表示になるのを防ぐ)
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                crate::logger::log(format!("    idx={idx:>4} cancelled  {display_name}"));
+                gen_done.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {display_name}"));
             let _ = tx.send((idx, None, false, None));
             gen_done.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = stats.lock() {
@@ -385,10 +422,8 @@ pub fn load_one_cached(
     };
 
     // EXIF Orientation に基づいて自動回転
-    let img = if zip_entry.is_some() {
-        // ZIP 内画像: バイト列から Orientation を読み取り済みのはずだが、
-        // ここでは再読みが必要。ただしパフォーマンス上、ZIP の場合はスキップ
-        // (ZIPの中のファイルは通常カメラ撮影ではないため)
+    let img = if pdf_page.is_some() || zip_entry.is_some() {
+        // PDF ページ / ZIP 内画像: EXIF 回転は不要
         img
     } else {
         apply_exif_orientation(img, path)
@@ -409,10 +444,13 @@ pub fn load_one_cached(
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
     {
-        // 拡張子の取得元: ZIP エントリならエントリ名、通常ならファイルパス
-        let ext_source: &str = match zip_entry {
-            Some(n) => n,
-            None => path.to_str().unwrap_or(""),
+        // 拡張子の取得元: PDF ページなら "pdf"、ZIP エントリならエントリ名、通常ならファイルパス
+        let ext_source: &str = if pdf_page.is_some() {
+            "page.pdf"
+        } else if let Some(n) = zip_entry {
+            n
+        } else {
+            path.to_str().unwrap_or("")
         };
         let ext = ext_source.rsplit('.').next().unwrap_or("");
         if let Ok(mut s) = stats.lock() {
@@ -438,16 +476,16 @@ pub fn load_one_cached(
                     crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
                 }
                 crate::logger::log(format!(
-                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {name}"
+                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {display_name}"
                 ));
             }
             None => {
-                crate::logger::log(format!("    idx={idx:>4} WebP encode FAIL  {name}"));
+                crate::logger::log(format!("    idx={idx:>4} WebP encode FAIL  {display_name}"));
             }
         }
     } else {
         crate::logger::log(format!(
-            "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {name}"
+            "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {display_name}"
         ));
     }
 

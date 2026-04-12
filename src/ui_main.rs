@@ -566,7 +566,8 @@ impl App {
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::ZipSeparator { .. }) => {
+                | Some(GridItem::ZipSeparator { .. })
+                | Some(GridItem::PdfPage { .. }) => {
                     self.open_fullscreen(idx)
                 }
                 Some(GridItem::Video(p)) => {
