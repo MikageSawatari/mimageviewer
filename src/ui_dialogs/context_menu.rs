@@ -157,6 +157,83 @@ impl crate::app::App {
                                 open_folder_in_explorer(p);
                                 close = true;
                             }
+                            // ── アプリケーションで開く ──
+                            ui.separator();
+                            {
+                                let file_path = p.clone();
+                                let ext = file_path.extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|e| format!(".{}", e.to_lowercase()))
+                                    .unwrap_or_default();
+
+                                // 直近使用アプリ（最大3件）
+                                for recent in self.settings.recent_open_with_apps.clone() {
+                                    let label = format!("{}で開く", recent.display_name);
+                                    if ui.button(&label).clicked() {
+                                        crate::open_with::launch_with_app(&recent.exe_path, &file_path);
+                                        self.settings.record_recent_open_with(
+                                            recent.display_name,
+                                            recent.exe_path,
+                                        );
+                                        self.settings.save();
+                                        close = true;
+                                    }
+                                }
+
+                                // アプリ一覧（折りたたみ展開）
+                                egui::CollapsingHeader::new("アプリケーションで開く…")
+                                    .show(ui, |ui| {
+                                        // カスタムアプリ
+                                        let custom_apps = self.settings.custom_open_with_apps.clone();
+                                        if !custom_apps.is_empty() {
+                                            for app in &custom_apps {
+                                                if ui.button(&app.display_name).clicked() {
+                                                    crate::open_with::launch_with_app(&app.exe_path, &file_path);
+                                                    self.settings.record_recent_open_with(
+                                                        app.display_name.clone(),
+                                                        app.exe_path.clone(),
+                                                    );
+                                                    self.settings.save();
+                                                    close = true;
+                                                }
+                                            }
+                                            ui.separator();
+                                        }
+
+                                        // システム関連付けアプリ
+                                        let handlers = crate::open_with::enumerate_handlers(&ext);
+                                        for handler in &handlers {
+                                            if ui.button(&handler.display_name).clicked() {
+                                                crate::open_with::launch_with_app(&handler.exe_path, &file_path);
+                                                self.settings.record_recent_open_with(
+                                                    handler.display_name.clone(),
+                                                    handler.exe_path.clone(),
+                                                );
+                                                self.settings.save();
+                                                close = true;
+                                            }
+                                        }
+
+                                        // アプリ追加ボタン
+                                        ui.separator();
+                                        if ui.button("アプリケーションを追加…").clicked() {
+                                            if let Some(app) = crate::open_with::pick_exe_dialog() {
+                                                // 重複チェック
+                                                let already = self.settings.custom_open_with_apps.iter()
+                                                    .any(|a| a.exe_path.eq_ignore_ascii_case(&app.exe_path));
+                                                if !already {
+                                                    self.settings.custom_open_with_apps.push(
+                                                        crate::settings::RecentApp {
+                                                            display_name: app.display_name,
+                                                            exe_path: app.exe_path,
+                                                        }
+                                                    );
+                                                    self.settings.save();
+                                                }
+                                            }
+                                        }
+                                    });
+                            }
                             ui.separator();
                             ui.horizontal(|ui| {
                                 if ui.button("左に回転 (L)").clicked() {
@@ -201,6 +278,77 @@ impl crate::app::App {
                                 if ui.button("フォルダを開く").clicked() {
                                     open_folder_in_explorer(p);
                                     close = true;
+                                }
+                                // ── アプリケーションで開く (ZipFile/PdfFile) ──
+                                ui.separator();
+                                {
+                                    let file_path = p.clone();
+                                    let ext = file_path.extension()
+                                        .and_then(|e| e.to_str())
+                                        .map(|e| format!(".{}", e.to_lowercase()))
+                                        .unwrap_or_default();
+
+                                    for recent in self.settings.recent_open_with_apps.clone() {
+                                        let label = format!("{}で開く", recent.display_name);
+                                        if ui.button(&label).clicked() {
+                                            crate::open_with::launch_with_app(&recent.exe_path, &file_path);
+                                            self.settings.record_recent_open_with(
+                                                recent.display_name,
+                                                recent.exe_path,
+                                            );
+                                            self.settings.save();
+                                            close = true;
+                                        }
+                                    }
+
+                                    egui::CollapsingHeader::new("アプリケーションで開く…")
+                                        .show(ui, |ui| {
+                                            let custom_apps = self.settings.custom_open_with_apps.clone();
+                                            if !custom_apps.is_empty() {
+                                                for app in &custom_apps {
+                                                    if ui.button(&app.display_name).clicked() {
+                                                        crate::open_with::launch_with_app(&app.exe_path, &file_path);
+                                                        self.settings.record_recent_open_with(
+                                                            app.display_name.clone(),
+                                                            app.exe_path.clone(),
+                                                        );
+                                                        self.settings.save();
+                                                        close = true;
+                                                    }
+                                                }
+                                                ui.separator();
+                                            }
+
+                                            let handlers = crate::open_with::enumerate_handlers(&ext);
+                                            for handler in &handlers {
+                                                if ui.button(&handler.display_name).clicked() {
+                                                    crate::open_with::launch_with_app(&handler.exe_path, &file_path);
+                                                    self.settings.record_recent_open_with(
+                                                        handler.display_name.clone(),
+                                                        handler.exe_path.clone(),
+                                                    );
+                                                    self.settings.save();
+                                                    close = true;
+                                                }
+                                            }
+
+                                            ui.separator();
+                                            if ui.button("アプリケーションを追加…").clicked() {
+                                                if let Some(app) = crate::open_with::pick_exe_dialog() {
+                                                    let already = self.settings.custom_open_with_apps.iter()
+                                                        .any(|a| a.exe_path.eq_ignore_ascii_case(&app.exe_path));
+                                                    if !already {
+                                                        self.settings.custom_open_with_apps.push(
+                                                            crate::settings::RecentApp {
+                                                                display_name: app.display_name,
+                                                                exe_path: app.exe_path,
+                                                            }
+                                                        );
+                                                        self.settings.save();
+                                                    }
+                                                }
+                                            }
+                                        });
                                 }
                             }
                             ui.separator();

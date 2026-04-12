@@ -23,6 +23,7 @@ pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
 pub mod video_thumb;
+pub mod open_with;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod wic_decoder;

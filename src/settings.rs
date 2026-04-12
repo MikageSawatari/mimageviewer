@@ -305,6 +305,16 @@ impl SpreadMode {
 }
 
 // -----------------------------------------------------------------------
+// RecentApp (アプリケーションで開く 履歴)
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct RecentApp {
+    pub display_name: String,
+    pub exe_path: String,
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -437,6 +447,14 @@ pub struct Settings {
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
+
+    // ── アプリケーションで開く ──────────────────────────────────
+    /// 最近使ったアプリケーション（最大3件、最新が先頭）
+    #[serde(default)]
+    pub recent_open_with_apps: Vec<RecentApp>,
+    /// ユーザーが手動で追加したアプリケーション
+    #[serde(default)]
+    pub custom_open_with_apps: Vec<RecentApp>,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -558,6 +576,8 @@ impl Default for Settings {
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_sort_items: default_toolbar_sort_items(),
+            recent_open_with_apps: Vec::new(),
+            custom_open_with_apps: Vec::new(),
         }
     }
 }
@@ -617,6 +637,17 @@ impl Settings {
         }
         self.favorites.push(FavoriteEntry { name, path });
         true
+    }
+
+    /// 「アプリケーションで開く」で使用したアプリを履歴に記録する。
+    /// 同じ exe_path が既にあれば先頭に移動。最大3件。
+    pub fn record_recent_open_with(&mut self, display_name: String, exe_path: String) {
+        const MAX_RECENT_OPEN_WITH: usize = 3;
+        self.recent_open_with_apps
+            .retain(|a| !a.exe_path.eq_ignore_ascii_case(&exe_path));
+        self.recent_open_with_apps
+            .insert(0, RecentApp { display_name, exe_path });
+        self.recent_open_with_apps.truncate(MAX_RECENT_OPEN_WITH);
     }
 }
 
