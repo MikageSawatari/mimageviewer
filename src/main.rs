@@ -13,6 +13,7 @@ pub mod monitor;
 pub mod png_metadata;
 pub mod rotation_db;
 pub mod settings;
+pub mod spread_db;
 pub mod stats;
 pub mod thumb_loader;
 pub mod ui_dialogs;

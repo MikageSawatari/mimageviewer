@@ -9,6 +9,7 @@ use crate::app::App;
 use crate::folder_tree::{navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::settings::SpreadMode;
 use crate::ui_helpers::{draw_play_icon, format_bytes_small, open_external_player};
 
 // ── 定数 ────────────────────────────────────────────────────────────────
@@ -27,6 +28,68 @@ const BAR_BUTTON_GAP: f32 = 4.0;
 const CHECKMARK_RADIUS: f32 = 18.0;
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
+/// 見開き表示の区切り線の幅 (px)
+const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
+
+// ── 見開きペアリング ──────────────────────────────────────────────────────
+
+/// 見開き表示のペア解決結果。
+pub(crate) enum SpreadPair {
+    /// 単独表示（1ページ表示 / 横長画像 / 表紙 / 末尾余り）
+    Single,
+    /// 見開き表示: left=画面左に表示するidx, right=画面右に表示するidx
+    Double { left: usize, right: usize },
+}
+
+/// ナビゲーション可能アイテムのインデックスリストを作成する。
+/// `adjacent_navigable_idx` と同じフィルタ条件。
+fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
+    visible_indices
+        .iter()
+        .copied()
+        .filter(|&i| {
+            matches!(
+                items.get(i),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::Video(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::ZipSeparator { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+        })
+        .collect()
+}
+
+/// 指定インデックスの画像が横長（幅>高さ）かを判定する。
+/// テクスチャサイズが不明な場合は false（縦長として扱う）。
+fn is_landscape(
+    idx: usize,
+    fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+    thumbnails: &[ThumbnailState],
+) -> bool {
+    // フルサイズキャッシュから判定
+    if let Some(entry) = fs_cache.get(&idx) {
+        match entry {
+            FsCacheEntry::Static { tex, .. } => {
+                let s = tex.size_vec2();
+                return s.x > s.y;
+            }
+            FsCacheEntry::Animated { frames, .. } => {
+                if let Some((tex, _)) = frames.first() {
+                    let s = tex.size_vec2();
+                    return s.x > s.y;
+                }
+            }
+            FsCacheEntry::Failed => {}
+        }
+    }
+    // サムネイルから判定
+    if let Some(ThumbnailState::Loaded { tex, .. }) = thumbnails.get(idx) {
+        let s = tex.size_vec2();
+        return s.x > s.y;
+    }
+    false
+}
 
 // ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
 
@@ -85,6 +148,14 @@ impl App {
 
         // ── 状態の事前計算 ──
         self.advance_animation(ctx, fs_idx);
+        // 見開きパートナーの事前読み込み + アニメーション進行
+        if let SpreadPair::Double { left, right } = self.resolve_spread_pair(fs_idx) {
+            let partner = if left == fs_idx { right } else { left };
+            self.advance_animation(ctx, partner);
+            if !self.fs_cache.contains_key(&partner) && !self.fs_pending.contains_key(&partner) {
+                self.start_fs_load(partner);
+            }
+        }
         let state = self.prepare_fullscreen_state(ctx, fs_idx);
 
         let mut close_fs = false;
@@ -126,10 +197,13 @@ impl App {
                         if wheel_nav != 0 { nav_delta = wheel_nav; }
                         if click_close { close_fs = true; }
 
-                        // ── 分析モード: 画像エリアを左側に制限 ──
-                        // パネル幅はコンテンツ基準の固定値（360px）を優先し、
-                        // 画面幅の 20〜35% の範囲に収める。
-                        let image_rect = if self.analysis_mode {
+                        // ── 見開きペア解決 ──
+                        let spread_pair = self.resolve_spread_pair(fs_idx);
+                        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
+
+                        // ── 分析モード: 見開き中は無効、画像エリアを左側に制限 ──
+                        let analysis_active = self.analysis_mode && !is_spread_double;
+                        let image_rect = if analysis_active {
                             let panel_w = 360.0_f32
                                 .clamp(full_rect.width() * 0.20, full_rect.width() * 0.35);
                             egui::Rect::from_min_max(
@@ -144,17 +218,24 @@ impl App {
                         if let Some(sep) = state.separator_text.as_ref() {
                             Self::draw_fs_separator(ui, image_rect, sep);
                         } else {
-                            let fs_rotation = self.get_rotation(fs_idx);
-                            let zp = if self.analysis_mode {
-                                Some((self.analysis_zoom, self.analysis_pan))
-                            } else {
-                                None
-                            };
-                            Self::draw_fs_image(
-                                ui, image_rect,
-                                state.tex.as_ref(), state.thumb_tex.as_ref(),
-                                state.is_video, state.fs_load_failed, fs_rotation, zp,
-                            );
+                            match &spread_pair {
+                                SpreadPair::Single => {
+                                    let fs_rotation = self.get_rotation(fs_idx);
+                                    let zp = if analysis_active {
+                                        Some((self.analysis_zoom, self.analysis_pan))
+                                    } else {
+                                        None
+                                    };
+                                    Self::draw_fs_image(
+                                        ui, image_rect,
+                                        state.tex.as_ref(), state.thumb_tex.as_ref(),
+                                        state.is_video, state.fs_load_failed, fs_rotation, zp,
+                                    );
+                                }
+                                SpreadPair::Double { left, right } => {
+                                    self.draw_fs_spread(ui, image_rect, *left, *right);
+                                }
+                            }
                         }
 
                         // ── 動画: 再生ボタン + Enter ──
@@ -173,7 +254,6 @@ impl App {
                         }
 
                         // ── 高解像度読込中インジケーター ──
-                        // PDF 再レンダリング中は��部に専用インジケータが出るので重複表示しない
                         let has_any_tex = state.tex.is_some() || state.thumb_tex.is_some();
                         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
                         if state.is_loading && has_any_tex && !pdf_rerendering {
@@ -208,8 +288,8 @@ impl App {
                             ui.painter().galley(text_rect.min, galley, egui::Color32::WHITE);
                         }
 
-                        // ── 分析パネル（分析モード時、メタデータパネルより優先）──
-                        if self.analysis_mode {
+                        // ── 分析パネル（分析モード時、見開き中は無効）──
+                        if analysis_active {
                             let pixels = match self.fs_cache.get(&fs_idx) {
                                 Some(FsCacheEntry::Static { pixels, .. }) => {
                                     Some(std::sync::Arc::clone(pixels))
@@ -224,8 +304,8 @@ impl App {
                                 self.analysis_hover_color = None;
                                 self.analysis_pinned_color = None;
                             }
-                        } else {
-                            // ── メタデータパネル（通常モードのみ）──
+                        } else if !is_spread_double {
+                            // ── メタデータパネル（通常モード・単独表示のみ）──
                             let right_panel_visible =
                                 self.draw_metadata_panel(ui, ctx, full_rect);
                             let _ = right_panel_visible;
@@ -234,20 +314,34 @@ impl App {
                         // ── ホバーバー ──
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
+                        let spread_before = self.spread_mode;
                         Self::draw_fs_hover_bar(
                             ui, ctx, full_rect,
                             &state.folder_display, &state.filename,
                             state.image_dims, state.image_file_size,
                             &mut close_fs, &mut nav_delta,
                             &mut self.show_metadata_panel,
-                            false, // force_show: 分析モード中はメタデータパネル非表示
+                            false,
                             &mut self.slideshow_playing,
                             &mut self.settings.slideshow_interval_secs,
                             &mut bar_rotate_cw, &mut bar_rotate_ccw,
                             &mut self.analysis_mode,
+                            &mut self.spread_mode, &mut self.spread_popup_open,
+                            is_spread_double,
                         );
                         if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
                         if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
+                        // ホバーバーのポップアップからモードが変更された場合
+                        if self.spread_mode != spread_before {
+                            if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
+                                let _ = db.set(folder, self.spread_mode, self.settings.default_spread_mode);
+                            }
+                            if self.spread_mode.is_spread() && self.analysis_mode {
+                                self.analysis_mode = false;
+                                self.analysis_hover_color = None;
+                                self.analysis_pinned_color = None;
+                            }
+                        }
                     });
             },
         );
@@ -257,6 +351,8 @@ impl App {
 
         // ── ナビゲーション & スライドショー処理 ──
         self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, fs_idx);
+        // 見開きモード変更後のページ位置正規化（viewport 外で呼ぶ）
+        self.normalize_spread_position();
         self.handle_fs_repaint(ctx, fs_idx, state.is_video);
     }
 
@@ -368,6 +464,107 @@ impl App {
         }
     }
 
+    // ── 見開きペアリング ────────────────────────────────────────────────
+
+    /// 現在の見開きモードとインデックスからペア表示を解決する。
+    pub(crate) fn resolve_spread_pair(&self, idx: usize) -> SpreadPair {
+        if !self.spread_mode.is_spread() {
+            return SpreadPair::Single;
+        }
+
+        let nav = build_nav_indices(&self.items, &self.visible_indices);
+        let Some(pos) = nav.iter().position(|&i| i == idx) else {
+            return SpreadPair::Single;
+        };
+
+        // 表紙モード: pos=0 は常に単独
+        if self.spread_mode.has_cover() && pos == 0 {
+            return SpreadPair::Single;
+        }
+
+        // 横長画像は単独
+        if is_landscape(idx, &self.fs_cache, &self.thumbnails) {
+            return SpreadPair::Single;
+        }
+
+        // ペアリング開始位置: 表紙ありなら pos=1 から、なしなら pos=0 から
+        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
+
+        // ペア内の位置を計算 (0-indexed from pair_start)
+        let relative = pos - pair_start;
+        let is_first_of_pair = relative % 2 == 0;
+
+        // ペア相手の pos を決定
+        let partner_pos = if is_first_of_pair {
+            pos + 1
+        } else {
+            pos - 1
+        };
+
+        // パートナーが存在しない or 横長の場合は単独
+        let partner_idx = match nav.get(partner_pos) {
+            Some(&pidx) => pidx,
+            None => return SpreadPair::Single,
+        };
+        if is_landscape(partner_idx, &self.fs_cache, &self.thumbnails) {
+            return SpreadPair::Single;
+        }
+
+        // 小さい pos のインデックスと大きい pos のインデックス
+        let (small_idx, large_idx) = if is_first_of_pair {
+            (idx, partner_idx)
+        } else {
+            (partner_idx, idx)
+        };
+
+        // LTR: 左=小, 右=大  /  RTL: 左=大, 右=小
+        if self.spread_mode.is_rtl() {
+            SpreadPair::Double { left: large_idx, right: small_idx }
+        } else {
+            SpreadPair::Double { left: small_idx, right: large_idx }
+        }
+    }
+
+    /// 見開きモードでの nav_delta を計算する。
+    /// 見開き表示中は2ページ送り、Single表示中は1ページ送り。
+    /// Shift が押されている場合は常に1ページ送り。
+    pub(crate) fn spread_nav_delta(&self, base_delta: i32, shift_held: bool) -> i32 {
+        if !self.spread_mode.is_spread() || shift_held {
+            return base_delta;
+        }
+        let fs_idx = match self.fullscreen_idx {
+            Some(i) => i,
+            None => return base_delta,
+        };
+        // 現在の表示が Single（横長等）なら1ページ送り
+        match self.resolve_spread_pair(fs_idx) {
+            SpreadPair::Single => base_delta,
+            SpreadPair::Double { .. } => base_delta * 2,
+        }
+    }
+
+    /// 見開きモード切替後、fullscreen_idx をペアの先頭に正規化する。
+    pub(crate) fn normalize_spread_position(&mut self) {
+        if !self.spread_mode.is_spread() {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else { return };
+        let nav = build_nav_indices(&self.items, &self.visible_indices);
+        let Some(pos) = nav.iter().position(|&i| i == idx) else { return };
+
+        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
+        if pos < pair_start {
+            return; // 表紙位置
+        }
+        let relative = pos - pair_start;
+        if relative % 2 != 0 {
+            // ペアの2番目にいるので1番目に戻す
+            let new_idx = nav[pos - 1];
+            self.open_fullscreen(new_idx);
+            self.selected = Some(new_idx);
+        }
+    }
+
     // ── キー入力 ────────────────────────────────────────────────────────
 
     /// フルスクリーンのキー入力を処理し、アクションを返す。
@@ -378,12 +575,12 @@ impl App {
         if !has_focus { return action; }
 
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let right = ctx.input(|i| {
-            i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown)
-        });
-        let left = ctx.input(|i| {
-            i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp)
-        });
+        let shift_held = ctx.input(|i| i.modifiers.shift);
+        // 左右キーは上下と分離して処理（RTL 反転のため）
+        let arrow_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+        let arrow_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let arrow_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        let arrow_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
         let ctrl_d = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown));
         let ctrl_u = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
         let key_i = ctx.input(|i| i.key_pressed(egui::Key::I) || i.key_pressed(egui::Key::Tab));
@@ -394,9 +591,47 @@ impl App {
         let key_g = ctx.input(|i| i.key_pressed(egui::Key::G));
         let key_m = ctx.input(|i| i.key_pressed(egui::Key::M));
 
+        // 見開きモード切替 (1-5 キー)
+        let key_1 = ctx.input(|i| i.key_pressed(egui::Key::Num1));
+        let key_2 = ctx.input(|i| i.key_pressed(egui::Key::Num2));
+        let key_3 = ctx.input(|i| i.key_pressed(egui::Key::Num3));
+        let key_4 = ctx.input(|i| i.key_pressed(egui::Key::Num4));
+        let key_5 = ctx.input(|i| i.key_pressed(egui::Key::Num5));
+
+        let new_spread = if key_1 { Some(SpreadMode::Single) }
+            else if key_2 { Some(SpreadMode::Ltr) }
+            else if key_3 { Some(SpreadMode::LtrCover) }
+            else if key_4 { Some(SpreadMode::Rtl) }
+            else if key_5 { Some(SpreadMode::RtlCover) }
+            else { None };
+
+        if let Some(mode) = new_spread {
+            if mode != self.spread_mode {
+                self.spread_mode = mode;
+                self.spread_popup_open = false;
+                // DB に保存
+                if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
+                    let _ = db.set(folder, mode, self.settings.default_spread_mode);
+                }
+                // 分析モードを解除
+                if mode.is_spread() && self.analysis_mode {
+                    self.analysis_mode = false;
+                    self.analysis_hover_color = None;
+                    self.analysis_pinned_color = None;
+                }
+                // ページ位置を正規化
+                self.normalize_spread_position();
+            }
+        }
+
+        let is_spread_double = matches!(self.resolve_spread_pair(fs_idx), SpreadPair::Double { .. });
+
         if esc { action.close = true; }
-        if key_i { self.show_metadata_panel = !self.show_metadata_panel; }
-        if key_z {
+        // 見開きダブル表示中は I/Z/R/L を無効化
+        if key_i && !is_spread_double {
+            self.show_metadata_panel = !self.show_metadata_panel;
+        }
+        if key_z && !is_spread_double {
             self.analysis_mode = !self.analysis_mode;
             if !self.analysis_mode {
                 self.analysis_hover_color = None;
@@ -407,11 +642,10 @@ impl App {
                 self.analysis_guide_drag = None;
             }
         }
-        if self.analysis_mode {
+        if self.analysis_mode && !is_spread_double {
             if key_g { self.analysis_grayscale = !self.analysis_grayscale; }
             if key_m {
                 self.analysis_mosaic_grid = !self.analysis_mosaic_grid;
-                // モザイクグリッドとガイドラインは排他
                 if self.analysis_mosaic_grid {
                     self.analysis_guide_drag = None;
                 }
@@ -438,15 +672,21 @@ impl App {
                 }
             }
         }
-        if key_r { self.rotate_image_cw(fs_idx); }
-        if key_l { self.rotate_image_ccw(fs_idx); }
+        if key_r && !is_spread_double { self.rotate_image_cw(fs_idx); }
+        if key_l && !is_spread_double { self.rotate_image_ccw(fs_idx); }
 
-        if right && !ctrl_d {
-            action.nav_delta = 1;
+        // ── ナビゲーション ──
+        // RTL モードでは左右キーの意味を反転
+        let rtl = self.spread_mode.is_rtl();
+        let nav_next = (arrow_right && !rtl) || (arrow_left && rtl) || arrow_down;
+        let nav_prev = (arrow_left && !rtl) || (arrow_right && rtl) || arrow_up;
+
+        if nav_next && !ctrl_d {
+            action.nav_delta = self.spread_nav_delta(1, shift_held);
             self.slideshow_playing = false;
         }
-        if left && !ctrl_u {
-            action.nav_delta = -1;
+        if nav_prev && !ctrl_u {
+            action.nav_delta = self.spread_nav_delta(-1, shift_held);
             self.slideshow_playing = false;
         }
         if ctrl_d { action.ctrl_nav = Some(1); }
@@ -510,7 +750,8 @@ impl App {
                     }
                 }
             } else {
-                nav_delta = if wheel_y < 0.0 { 1 } else { -1 };
+                let base = if wheel_y < 0.0 { 1 } else { -1 };
+                nav_delta = self.spread_nav_delta(base, false);
             }
         }
 
@@ -548,7 +789,8 @@ impl App {
                         && (self.show_metadata_panel || pos.x > panel_threshold)
                         && pos.x > full_rect.max.x - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
                     if !in_panel {
-                        nav_delta = if pos.x > full_rect.center().x { 1 } else { -1 };
+                        let base = if pos.x > full_rect.center().x { 1 } else { -1 };
+                        nav_delta = self.spread_nav_delta(base, false);
                     }
                 }
             }
@@ -604,8 +846,9 @@ impl App {
             let now = std::time::Instant::now();
             if now >= self.slideshow_next_at {
                 if let Some(cur) = self.fullscreen_idx {
+                    let slide_delta = self.spread_nav_delta(1, false);
                     let next = crate::ui_helpers::adjacent_navigable_idx(
-                        &self.items, &self.visible_indices, cur, 1,
+                        &self.items, &self.visible_indices, cur, slide_delta,
                     );
                     let target = match next {
                         Some(idx) => idx,
@@ -743,6 +986,161 @@ impl App {
         }
     }
 
+    /// 見開きモードの2ページ描画。
+    /// 2枚の画像を隙間なく中央に配置し、境界に薄い黒線を描画する。
+    fn draw_fs_spread(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        left_idx: usize,
+        right_idx: usize,
+    ) {
+        let left_rot = self.get_rotation(left_idx);
+        let right_rot = self.get_rotation(right_idx);
+
+        // 各ページの表示サイズを計算して、全体をフィットさせる
+        let left_size = Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+        let right_size = Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+
+        if let (Some(ls), Some(rs)) = (left_size, right_size) {
+            // 両ページの高さを揃える（高い方に合わせる）
+            let combined_h = ls.y.max(rs.y);
+            let left_w = ls.x * (combined_h / ls.y);
+            let right_w = rs.x * (combined_h / rs.y);
+            let combined_w = left_w + right_w;
+
+            // 画面にフィットするスケール
+            let fit_scale = (image_rect.width() / combined_w)
+                .min(image_rect.height() / combined_h);
+            let scaled_lw = left_w * fit_scale;
+            let scaled_rw = right_w * fit_scale;
+            let scaled_h = combined_h * fit_scale;
+
+            // 全体を中央に配置
+            let total_w = scaled_lw + scaled_rw;
+            let start_x = image_rect.center().x - total_w * 0.5;
+            let start_y = image_rect.center().y - scaled_h * 0.5;
+
+            let left_rect = egui::Rect::from_min_size(
+                egui::pos2(start_x, start_y),
+                egui::vec2(scaled_lw, scaled_h),
+            );
+            let right_rect = egui::Rect::from_min_size(
+                egui::pos2(start_x + scaled_lw, start_y),
+                egui::vec2(scaled_rw, scaled_h),
+            );
+
+            Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+
+            // 区切り線（2px 黒線）
+            let divider_x = start_x + scaled_lw;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(divider_x, start_y),
+                    egui::pos2(divider_x, start_y + scaled_h),
+                ],
+                egui::Stroke::new(SPREAD_DIVIDER_WIDTH, egui::Color32::BLACK),
+            );
+        } else {
+            // サイズ不明の場合は均等分割フォールバック
+            let half_w = image_rect.width() / 2.0;
+            let left_rect = egui::Rect::from_min_size(
+                image_rect.min,
+                egui::vec2(half_w, image_rect.height()),
+            );
+            let right_rect = egui::Rect::from_min_size(
+                egui::pos2(image_rect.min.x + half_w, image_rect.min.y),
+                egui::vec2(half_w, image_rect.height()),
+            );
+            Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+        }
+    }
+
+    /// テクスチャの表示サイズ（回転考慮）を返す。テクスチャ未取得なら None。
+    fn get_display_size(
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+        thumbnails: &[ThumbnailState],
+    ) -> Option<egui::Vec2> {
+        let tex = match fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
+            Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                frames.get(*current_frame).map(|(h, _)| h.size_vec2())
+            }
+            _ => None,
+        };
+        let size = tex.or_else(|| {
+            if let Some(ThumbnailState::Loaded { tex, .. }) = thumbnails.get(idx) {
+                Some(tex.size_vec2())
+            } else {
+                None
+            }
+        })?;
+        Some(match rotation {
+            crate::rotation_db::Rotation::Cw90
+            | crate::rotation_db::Rotation::Cw270 => egui::vec2(size.y, size.x),
+            _ => size,
+        })
+    }
+
+    /// 見開きモードの1ページ分を指定領域に描画。
+    fn draw_fs_spread_page(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+        thumbnails: &[ThumbnailState],
+    ) {
+        // テクスチャ取得（フルサイズ or サムネイル）
+        let tex = match fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+            Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                frames.get(*current_frame).map(|(h, _)| h.clone())
+            }
+            _ => None,
+        };
+        let thumb_tex = match thumbnails.get(idx) {
+            Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+            _ => None,
+        };
+        let display_tex = tex.as_ref().or(thumb_tex.as_ref());
+
+        if let Some(handle) = display_tex {
+            let tex_size = handle.size_vec2();
+            let display_size = match rotation {
+                crate::rotation_db::Rotation::Cw90
+                | crate::rotation_db::Rotation::Cw270 => egui::vec2(tex_size.y, tex_size.x),
+                _ => tex_size,
+            };
+            let fit_scale =
+                (rect.width() / display_size.x).min(rect.height() / display_size.y);
+            let img_rect = egui::Rect::from_center_size(
+                rect.center(),
+                display_size * fit_scale,
+            );
+            if rotation.is_none() {
+                ui.painter().image(
+                    handle.id(), img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                crate::app::draw_rotated_image(ui.painter(), handle.id(), img_rect, rotation);
+            }
+        } else {
+            // 読込中
+            ui.painter().text(
+                rect.center(), egui::Align2::CENTER_CENTER,
+                "読込中...",
+                egui::FontId::proportional(18.0), egui::Color32::from_gray(150),
+            );
+        }
+    }
+
     /// フルスクリーンのホバー時トップバーを描画する。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_hover_bar(
@@ -762,10 +1160,13 @@ impl App {
         rotate_cw: &mut bool,
         rotate_ccw: &mut bool,
         show_analysis: &mut bool,
+        spread_mode: &mut SpreadMode,
+        spread_popup_open: &mut bool,
+        is_spread_double: bool,
     ) {
         let hover_in_top = ctx
             .input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
-        if !hover_in_top && !force_show {
+        if !hover_in_top && !force_show && !*spread_popup_open {
             return;
         }
 
@@ -864,16 +1265,108 @@ impl App {
         if info_resp.hovered() { *nav_delta = 0; }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // 🔬 分析ボタン
-        let analysis_resp = draw_bar_button(
+        // 🔬 分析ボタン（見開きダブル中は非表示）
+        if !is_spread_double {
+            let analysis_resp = draw_bar_button(
+                ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_analysis_btn",
+                |hovered| bar_button_bg(hovered, *show_analysis),
+                *show_analysis,
+                |p, c, r| draw_analysis_icon(p, c, r),
+            );
+            if analysis_resp.clicked() { *show_analysis = !*show_analysis; }
+            if analysis_resp.hovered() { *nav_delta = 0; }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
+        // 📖 見開きモードボタン (クリックでポップアップ)
+        let spread_active = spread_mode.is_spread();
+        let sm = *spread_mode;
+        let spread_resp = draw_bar_button(
             ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_analysis_btn",
-            |hovered| bar_button_bg(hovered, *show_analysis),
-            *show_analysis,
-            |p, c, r| draw_analysis_icon(p, c, r),
+            "fs_spread_btn",
+            |hovered| bar_button_bg(hovered, spread_active),
+            spread_active,
+            |p, c, r| draw_spread_icon(p, c, r, sm),
         );
-        if analysis_resp.clicked() { *show_analysis = !*show_analysis; }
-        if analysis_resp.hovered() { *nav_delta = 0; }
+        if spread_resp.clicked() {
+            *spread_popup_open = !*spread_popup_open;
+        }
+        if spread_resp.hovered() { *nav_delta = 0; }
+
+        // 見開きポップアップ
+        if *spread_popup_open {
+            let popup_x = next_x;
+            let popup_y = bar_rect.max.y + 4.0;
+            let popup_w = 200.0_f32;
+            let popup_h = 5.0 * 36.0 + 8.0; // 5 items + padding
+            let popup_rect = egui::Rect::from_min_size(
+                egui::pos2(popup_x, popup_y),
+                egui::vec2(popup_w, popup_h),
+            );
+
+            // 背景
+            ui.painter().rect_filled(
+                popup_rect, 6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            ui.painter().rect_stroke(
+                popup_rect, 6.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180)),
+                egui::StrokeKind::Outside,
+            );
+
+            let mut item_y = popup_rect.min.y + 4.0;
+            for &mode in SpreadMode::all() {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_rect.min.x + 4.0, item_y),
+                    egui::vec2(popup_w - 8.0, 32.0),
+                );
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(format!("spread_popup_{}", mode.to_int())),
+                    egui::Sense::click(),
+                );
+                let is_current = *spread_mode == mode;
+                let bg = if is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(item_rect, 4.0, bg);
+
+                // アイコン (左側)
+                let icon_center = egui::pos2(item_rect.min.x + 20.0, item_rect.center().y);
+                draw_spread_icon(ui.painter(), icon_center, 7.0, mode);
+
+                // ラベル (右側)
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    mode.label(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+
+                if item_resp.clicked() {
+                    *spread_mode = mode;
+                    *spread_popup_open = false;
+                }
+                item_y += 36.0;
+            }
+
+            // ポップアップ外クリックで閉じる
+            let pointer_pos = ctx.input(|i| i.pointer.press_origin());
+            if let Some(pos) = pointer_pos {
+                if !popup_rect.contains(pos) && !spread_resp.rect.contains(pos) {
+                    if ctx.input(|i| i.pointer.any_pressed()) {
+                        *spread_popup_open = false;
+                    }
+                }
+            }
+        }
 
         // ── 左側: フォルダパス ──
         if !folder_display.is_empty() {
@@ -1110,4 +1603,110 @@ fn draw_rotate_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32, cl
     );
     painter.line_segment([arrow_pt, p1], stroke);
     painter.line_segment([arrow_pt, p2], stroke);
+}
+
+/// 見開きモードアイコンを描画する。
+fn draw_spread_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, mode: SpreadMode) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.5, white);
+    let page_w = r * 0.7;
+    let page_h = r * 1.1;
+
+    match mode {
+        SpreadMode::Single => {
+            // 単独ページ: 1枚の矩形
+            let rect = egui::Rect::from_center_size(c, egui::vec2(page_w, page_h));
+            painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Outside);
+        }
+        SpreadMode::Ltr | SpreadMode::Rtl => {
+            // 見開き（表紙なし）: 2枚の矩形
+            let gap = r * 0.15;
+            let left_rect = egui::Rect::from_center_size(
+                egui::pos2(c.x - page_w * 0.5 - gap * 0.5, c.y),
+                egui::vec2(page_w, page_h),
+            );
+            let right_rect = egui::Rect::from_center_size(
+                egui::pos2(c.x + page_w * 0.5 + gap * 0.5, c.y),
+                egui::vec2(page_w, page_h),
+            );
+            painter.rect_stroke(left_rect, 1.0, stroke, egui::StrokeKind::Outside);
+            painter.rect_stroke(right_rect, 1.0, stroke, egui::StrokeKind::Outside);
+            // 方向矢印
+            draw_spread_direction_arrow(painter, c, r, mode.is_rtl());
+        }
+        SpreadMode::LtrCover | SpreadMode::RtlCover => {
+            // 表紙あり: 小さい表紙 + 見開き2枚
+            let small_w = page_w * 0.55;
+            let gap = r * 0.12;
+            let total = small_w + gap + page_w * 2.0 + gap;
+            let start_x = c.x - total * 0.5;
+
+            // 表紙（小さい矩形）
+            let cover_rect = egui::Rect::from_center_size(
+                egui::pos2(start_x + small_w * 0.5, c.y),
+                egui::vec2(small_w, page_h),
+            );
+            painter.rect_stroke(cover_rect, 1.0, stroke, egui::StrokeKind::Outside);
+
+            // 見開き2枚
+            let spread_x = start_x + small_w + gap;
+            let left_rect = egui::Rect::from_center_size(
+                egui::pos2(spread_x + page_w * 0.5, c.y),
+                egui::vec2(page_w, page_h),
+            );
+            let right_rect = egui::Rect::from_center_size(
+                egui::pos2(spread_x + page_w * 1.5 + gap, c.y),
+                egui::vec2(page_w, page_h),
+            );
+            painter.rect_stroke(left_rect, 1.0, stroke, egui::StrokeKind::Outside);
+            painter.rect_stroke(right_rect, 1.0, stroke, egui::StrokeKind::Outside);
+            // 方向矢印
+            draw_spread_direction_arrow(painter, c, r, mode.is_rtl());
+        }
+    }
+}
+
+/// 見開きモードの方向矢印（→ or ←）を描画する。
+fn draw_spread_direction_arrow(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    r: f32,
+    rtl: bool,
+) {
+    let white = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180);
+    let arrow_stroke = egui::Stroke::new(1.2, white);
+    let ay = c.y + r * 1.4; // 矩形の下
+    let ax = c.x;
+    let alen = r * 0.6;
+    let ahead = r * 0.3;
+
+    if rtl {
+        // ←
+        painter.line_segment(
+            [egui::pos2(ax + alen, ay), egui::pos2(ax - alen, ay)],
+            arrow_stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(ax - alen, ay), egui::pos2(ax - alen + ahead, ay - ahead)],
+            arrow_stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(ax - alen, ay), egui::pos2(ax - alen + ahead, ay + ahead)],
+            arrow_stroke,
+        );
+    } else {
+        // →
+        painter.line_segment(
+            [egui::pos2(ax - alen, ay), egui::pos2(ax + alen, ay)],
+            arrow_stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(ax + alen, ay), egui::pos2(ax + alen - ahead, ay - ahead)],
+            arrow_stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(ax + alen, ay), egui::pos2(ax + alen - ahead, ay + ahead)],
+            arrow_stroke,
+        );
+    }
 }

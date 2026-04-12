@@ -231,6 +231,80 @@ impl Parallelism {
 }
 
 // -----------------------------------------------------------------------
+// SpreadMode (見開き表示)
+// -----------------------------------------------------------------------
+
+/// 見開き表示モード。
+///
+/// - `Single`: 通常の1ページ表示
+/// - `Ltr`: 見開き 左→右（表紙なし）— [0,1] [2,3] ...
+/// - `LtrCover`: 見開き 左→右（表紙あり）— [0] [1,2] [3,4] ...
+/// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
+/// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [1,2] [3,4] ...
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub enum SpreadMode {
+    #[default]
+    Single,
+    Ltr,
+    LtrCover,
+    Rtl,
+    RtlCover,
+}
+
+impl SpreadMode {
+    /// 見開きモードか
+    pub fn is_spread(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+
+    /// 右→左（RTL）モードか
+    pub fn is_rtl(self) -> bool {
+        matches!(self, Self::Rtl | Self::RtlCover)
+    }
+
+    /// 表紙（1ページ目単独表示）ありか
+    pub fn has_cover(self) -> bool {
+        matches!(self, Self::LtrCover | Self::RtlCover)
+    }
+
+    /// 整数値 (0-4) から生成
+    pub fn from_int(v: i32) -> Self {
+        match v {
+            1 => Self::Ltr,
+            2 => Self::LtrCover,
+            3 => Self::Rtl,
+            4 => Self::RtlCover,
+            _ => Self::Single,
+        }
+    }
+
+    /// 整数値を返す
+    pub fn to_int(self) -> i32 {
+        match self {
+            Self::Single   => 0,
+            Self::Ltr      => 1,
+            Self::LtrCover => 2,
+            Self::Rtl      => 3,
+            Self::RtlCover => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single   => "1ページ表示",
+            Self::Ltr      => "見開き 左→右",
+            Self::LtrCover => "見開き 左→右（表紙あり）",
+            Self::Rtl      => "見開き 右→左",
+            Self::RtlCover => "見開き 右→左（表紙あり）",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Single, Self::Ltr, Self::LtrCover, Self::Rtl, Self::RtlCover]
+    }
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -338,6 +412,11 @@ pub struct Settings {
     /// スライドショーの切り替え間隔（秒）
     #[serde(default = "default_slideshow_interval")]
     pub slideshow_interval_secs: f32,
+
+    // ── 見開き表示 ──────────────────────────────────────────
+    /// デフォルトの見開き表示モード
+    #[serde(default)]
+    pub default_spread_mode: SpreadMode,
 
     // ── ツールバー項目フィルタ（Vec が空 = セクション非表示）──
     /// ツールバーに表示する列数の選択肢
@@ -461,6 +540,7 @@ impl Default for Settings {
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
+            default_spread_mode: SpreadMode::default(),
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
             toolbar_cols_items: default_toolbar_cols_items(),

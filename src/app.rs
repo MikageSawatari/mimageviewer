@@ -331,6 +331,14 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
+    // ── 見開き表示 ──────────────────────────────────────────────
+    /// 見開き DB (フォルダごとのモード永続化)
+    pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
+    /// 現在のフォルダの見開きモード
+    pub(crate) spread_mode: crate::settings::SpreadMode,
+    /// 見開きモード切替ポップアップ表示中
+    pub(crate) spread_popup_open: bool,
+
     // ── スライドショー ────────────────────────────────────────────
     /// スライドショー再生中フラグ
     pub(crate) slideshow_playing: bool,
@@ -493,6 +501,9 @@ impl Default for App {
             search_has_focus: false,
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
             rotation_cache: std::collections::HashMap::new(),
+            spread_db: crate::spread_db::SpreadDb::open().ok(),
+            spread_mode: crate::settings::SpreadMode::default(),
+            spread_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             fs_viewport_created: false,
@@ -894,6 +905,11 @@ impl App {
         self.exif_cache.clear();
         self.checked.clear();
         self.rotation_cache.clear();
+        // 見開きモード: DB から読み込み、なければデフォルト値
+        self.spread_mode = self.spread_db.as_ref()
+            .and_then(|db| db.get(&source_path))
+            .unwrap_or(self.settings.default_spread_mode);
+        self.spread_popup_open = false;
         self.search_filter = None;
         self.search_query.clear();
         // visible_indices はアイテム設定後 (下の行) に再計算される
@@ -2288,7 +2304,7 @@ impl App {
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
-    fn start_fs_load(&mut self, idx: usize) {
+    pub(crate) fn start_fs_load(&mut self, idx: usize) {
         // (path, zip_entry, pdf_page, pdf_password) を取り出し
         let (path, zip_entry, pdf_page, pdf_password) = match self.items.get(idx) {
             Some(GridItem::Image(p)) => (p.clone(), None, None, None),

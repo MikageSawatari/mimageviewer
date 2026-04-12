@@ -208,6 +208,26 @@ impl App {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
+
+                    ui.heading("見開き表示");
+                    ui.add_space(4.0);
+                    ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。");
+                    ui.add_space(4.0);
+                    egui::ComboBox::from_label("デフォルトの表示モード")
+                        .selected_text(self.settings.default_spread_mode.label())
+                        .show_ui(ui, |ui| {
+                            for &mode in crate::settings::SpreadMode::all() {
+                                ui.selectable_value(
+                                    &mut self.settings.default_spread_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
                     // Esc でキャンセル
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         cancel = true;
