@@ -561,7 +561,12 @@
       <div class="feature-card">
         <div class="icon">⚡</div>
         <h3>高速サムネイルキャッシュ</h3>
-        <p>SQLite + WebP でサムネイルを保存。2回目以降は再デコード不要で瞬時に表示。キャッシュ生成ポリシーは Off / Auto / Always から選択可能。</p>
+        <p>SQLite + WebP でサムネイルを保存。2回目以降は再デコード不要で瞬時に表示。キャッシュ生成ポリシーは Off / Auto / Always から選択可能。優先度付きキューで可視範囲を最優先ロード。</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🚀</div>
+        <h3>JPEG 高速デコード</h3>
+        <p>TurboJPEG (libjpeg-turbo) の SIMD 命令で JPEG を 1.5〜2.4 倍高速にデコード。大量の写真フォルダでもサクサク表示。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🖼️</div>
@@ -606,7 +611,7 @@
       <div class="feature-card">
         <div class="icon">📄</div>
         <h3>PDF 表示</h3>
-        <p>PDF ファイルをページごとにサムネイル表示・フルスクリーン閲覧。パスワード付き PDF にも対応。PDFium エンジン内蔵。</p>
+        <p>PDF ファイルをページごとにサムネイル表示・フルスクリーン閲覧。パスワード付き PDF にも対応。PDFium エンジン内蔵、マルチプロセス並列レンダリングで高速表示。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🎚️</div>
@@ -688,7 +693,7 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v0.4.0</div>
+        <div class="version">mImageViewer v0.5.0</div>
         <div class="meta">Windows 10 / 11（64bit）</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">

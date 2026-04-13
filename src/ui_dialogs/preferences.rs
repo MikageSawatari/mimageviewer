@@ -45,6 +45,11 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(420.0);
 
+                    // 1080p でも収まるよう最大高さを制限してスクロール可能にする
+                    egui::ScrollArea::vertical()
+                        .max_height(600.0)
+                        .show(ui, |ui| {
+
                     ui.heading("並列読み込み");
                     ui.add_space(4.0);
 
@@ -229,7 +234,7 @@ impl App {
                     ui.separator();
                     ui.add_space(4.0);
 
-                    ui.heading("フォルダサムネイル");
+                    ui.heading("フォルダサムネイル探索");
                     ui.add_space(4.0);
                     ui.label("フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n0 にすると直接の子ファイルのみ使用します。");
                     ui.add_space(4.0);
@@ -261,6 +266,8 @@ impl App {
                                 );
                             }
                         });
+
+                    }); // ScrollArea end
 
                     ui.add_space(8.0);
                     ui.separator();
