@@ -459,6 +459,10 @@ pub struct Settings {
     #[serde(default = "default_folder_thumb_sort")]
     pub folder_thumb_sort: SortOrder,
 
+    /// フォルダの代表画像を探すときの最大探索階層数（デフォルト: 3）
+    #[serde(default = "default_folder_thumb_depth")]
+    pub folder_thumb_depth: u32,
+
     // ── アプリケーションで開く ──────────────────────────────────
     /// 最近使ったアプリケーション（最大3件、最新が先頭）
     #[serde(default)]
@@ -481,6 +485,7 @@ fn default_thumb_prev_pages() -> u32 { 2 }
 fn default_thumb_next_pages() -> u32 { 4 }
 fn default_thumb_vram_cap_percent() -> u32 { 50 }
 fn default_folder_thumb_sort() -> SortOrder { SortOrder::Numeric }
+fn default_folder_thumb_depth() -> u32 { 3 }
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -591,6 +596,7 @@ impl Default for Settings {
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_sort_items: default_toolbar_sort_items(),
             folder_thumb_sort: default_folder_thumb_sort(),
+            folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
             custom_open_with_apps: Vec::new(),
         }

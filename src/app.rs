@@ -676,7 +676,7 @@ impl App {
 
         // ── 同名ファイルフィルタ ─────────────────────────────────────
         self.video_thumb_overrides.clear();
-        self.apply_duplicate_filters(&mut folders, &mut all_media);
+        self.apply_duplicate_filters(&mut folders, &mut folder_metas, &mut all_media);
 
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
@@ -1428,7 +1428,7 @@ impl App {
                 continue;
             };
             let Some(mut req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort))
+                make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort), self.settings.folder_thumb_depth)
             }) else {
                 continue;
             };
@@ -1571,7 +1571,7 @@ impl App {
                 continue;
             };
             let Some(req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, true, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort))
+                make_load_request(item, i, mtime, file_size, true, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort), self.settings.folder_thumb_depth)
             }) else {
                 continue;
             };
@@ -2187,10 +2187,11 @@ impl App {
     fn apply_duplicate_filters(
         &mut self,
         folders: &mut Vec<GridItem>,
+        folder_metas: &mut Vec<Option<(i64, i64)>>,
         all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
     ) {
         if self.settings.skip_zip_if_folder_exists {
-            Self::filter_zip_duplicates(folders);
+            Self::filter_zip_duplicates(folders, folder_metas);
         }
         if self.settings.skip_image_if_video_exists {
             self.filter_video_image_duplicates(all_media);
@@ -2201,37 +2202,35 @@ impl App {
     }
 
     /// ZIP + フォルダの重複: 同名フォルダがあれば ZIP エントリをスキップ。
-    fn filter_zip_duplicates(folders: &mut Vec<GridItem>) {
+    /// folders と folder_metas は同じ順序で対応しているため、同期して削除する。
+    fn filter_zip_duplicates(
+        folders: &mut Vec<GridItem>,
+        folder_metas: &mut Vec<Option<(i64, i64)>>,
+    ) {
         let real_folder_names: std::collections::HashSet<String> = folders
             .iter()
             .filter_map(|item| {
                 if let GridItem::Folder(p) = item {
-                    let is_zip = p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("zip"))
-                        .unwrap_or(false);
-                    if !is_zip {
-                        return p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| n.to_lowercase());
-                    }
+                    return p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_lowercase());
                 }
                 None
             })
             .collect();
 
-        folders.retain(|item| {
-            if let GridItem::Folder(p) = item {
-                let is_zip = p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("zip"))
-                    .unwrap_or(false);
-                if is_zip && real_folder_names.contains(&stem_lower(p)) {
-                    return false;
+        let mut keep = vec![true; folders.len()];
+        for (i, item) in folders.iter().enumerate() {
+            if let GridItem::ZipFile(p) = item {
+                if real_folder_names.contains(&stem_lower(p)) {
+                    keep[i] = false;
                 }
             }
-            true
-        });
+        }
+        let mut ki = keep.iter();
+        folders.retain(|_| *ki.next().unwrap());
+        let mut ki = keep.iter();
+        folder_metas.retain(|_| *ki.next().unwrap());
     }
 
     /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
@@ -3453,23 +3452,24 @@ fn make_load_request(
     skip_cache: bool,
     pdf_password: Option<&str>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
 ) -> Option<LoadRequest> {
     match item {
         GridItem::Image(p) => Some(LoadRequest {
             idx, path: p.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
-            cache_key_override: None, folder_thumb_sort: None,
+            cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
-            cache_key_override: None, folder_thumb_sort: None,
+            cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
         GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: None, pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),
-            cache_key_override: None, folder_thumb_sort: None,
+            cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
         GridItem::ZipFile(p) => {
             // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得。
@@ -3480,7 +3480,7 @@ fn make_load_request(
                 idx, path: p.clone(), mtime, file_size,
                 skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
-                folder_thumb_sort: None,
+                folder_thumb_sort: None, folder_thumb_depth: 0,
             })
         }
         GridItem::PdfFile(p) => {
@@ -3491,7 +3491,7 @@ fn make_load_request(
                 skip_cache, priority: false, zip_entry: None, pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
-                folder_thumb_sort: None,
+                folder_thumb_sort: None, folder_thumb_depth: 0,
             })
         }
         GridItem::Folder(p) => {
@@ -3501,7 +3501,7 @@ fn make_load_request(
                 idx, path: p.clone(), mtime, file_size,
                 skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
-                folder_thumb_sort,
+                folder_thumb_sort, folder_thumb_depth,
             })
         }
         _ => None,

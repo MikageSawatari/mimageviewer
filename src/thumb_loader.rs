@@ -65,6 +65,8 @@ pub struct LoadRequest {
     pub cache_key_override: Option<String>,
     /// フォルダサムネイル用: フォルダ内の画像を選ぶソート順
     pub folder_thumb_sort: Option<crate::settings::SortOrder>,
+    /// フォルダサムネイル用: サブフォルダを探索する最大階層数
+    pub folder_thumb_depth: u32,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -434,6 +436,7 @@ pub fn process_load_request(
         let img = resolve_folder_thumb_image(
             &req.path,
             req.folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+            req.folder_thumb_depth,
         );
         let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
         if resolve_ms > 10.0 {
@@ -527,34 +530,58 @@ pub fn process_load_request(
 
 /// フォルダ内をスキャンして代表画像のパスを返す。
 /// `sort` で指定されたソート順で並べ、先頭の画像を選ぶ。
+/// 直接の子に画像がなければサブフォルダを再帰的に探索する（最大 `remaining_depth` 階層）。
 fn resolve_folder_thumb_image(
     folder: &Path,
     sort: crate::settings::SortOrder,
+    remaining_depth: u32,
 ) -> Option<std::path::PathBuf> {
     use crate::folder_tree::SUPPORTED_EXTENSIONS;
 
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
+    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+
     for entry in entries.flatten() {
         let p = entry.path();
-        if !p.is_file() { continue; }
-        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
-                let mtime = entry.metadata().ok()
-                    .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
-                images.push((p, mtime));
+        if p.is_dir() {
+            subdirs.push(p);
+        } else if p.is_file() {
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+                    let mtime = entry.metadata().ok()
+                        .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
+                    images.push((p, mtime));
+                }
             }
         }
     }
-    if images.is_empty() {
-        return None;
+
+    // このフォルダに画像があればソートして先頭を返す
+    if !images.is_empty() {
+        images.sort_by(|(a, a_mt), (b, b_mt)| {
+            let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
+        });
+        return Some(images.into_iter().next().unwrap().0);
     }
-    images.sort_by(|(a, a_mt), (b, b_mt)| {
-        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
-    });
-    Some(images.into_iter().next().unwrap().0)
+
+    // 画像がなく、まだ深く探索できるならサブフォルダを再帰探索
+    if remaining_depth > 0 {
+        // サブフォルダを名前順にソートして、最初に画像が見つかったものを採用
+        subdirs.sort_by(|a, b| {
+            a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase()
+                .cmp(&b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase())
+        });
+        for sub in &subdirs {
+            if let Some(img) = resolve_folder_thumb_image(sub, sort, remaining_depth - 1) {
+                return Some(img);
+            }
+        }
+    }
+
+    None
 }
 
 /// 1枚の画像をデコードしてサムネイルを生成し、(条件を満たせば) カタログに保存して

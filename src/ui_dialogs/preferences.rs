@@ -229,6 +229,23 @@ impl App {
                     ui.separator();
                     ui.add_space(4.0);
 
+                    ui.heading("フォルダサムネイル");
+                    ui.add_space(4.0);
+                    ui.label("フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n0 にすると直接の子ファイルのみ使用します。");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("サブフォルダ探索階層:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.folder_thumb_depth)
+                                .range(0..=10u32)
+                                .suffix(" 階層"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
                     ui.heading("見開き表示");
                     ui.add_space(4.0);
                     ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。");

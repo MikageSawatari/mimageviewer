@@ -315,7 +315,7 @@ fn make_load_request(
             pdf_page: None,
             pdf_password: None,
             cache_key_override: None,
-            folder_thumb_sort: None,
+            folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
         GridItem::ZipFile(p) => {
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
@@ -330,7 +330,7 @@ fn make_load_request(
                 pdf_page: None,
                 pdf_password: None,
                 cache_key_override: Some(format!("{CACHE_KEY_ZIP}{fname}")),
-                folder_thumb_sort: None,
+                folder_thumb_sort: None, folder_thumb_depth: 0,
             })
         }
         GridItem::PdfFile(p) => {
@@ -346,7 +346,7 @@ fn make_load_request(
                 pdf_page: Some(0),
                 pdf_password: None,
                 cache_key_override: Some(format!("{CACHE_KEY_PDF}{fname}")),
-                folder_thumb_sort: None,
+                folder_thumb_sort: None, folder_thumb_depth: 0,
             })
         }
         GridItem::Folder(p) => {
@@ -362,7 +362,7 @@ fn make_load_request(
                 pdf_page: None,
                 pdf_password: None,
                 cache_key_override: Some(format!("{CACHE_KEY_FOLDER}{fname}")),
-                folder_thumb_sort: Some(SortOrder::Numeric),
+                folder_thumb_sort: Some(SortOrder::Numeric), folder_thumb_depth: 3,
             })
         }
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
@@ -376,7 +376,7 @@ fn make_load_request(
             pdf_page: None,
             pdf_password: None,
             cache_key_override: None,
-            folder_thumb_sort: None,
+            folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
         GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
             idx,
@@ -389,7 +389,7 @@ fn make_load_request(
             pdf_page: Some(*page_num),
             pdf_password: None,
             cache_key_override: None,
-            folder_thumb_sort: None,
+            folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
         _ => None,
     }
