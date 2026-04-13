@@ -1466,7 +1466,6 @@ impl App {
         let t3 = frame_t0.elapsed();
         {
             let mut q = queue.lock().unwrap();
-            let _t3b = frame_t0.elapsed();
             q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;

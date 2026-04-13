@@ -106,7 +106,6 @@ fn parse_args() -> Args {
 struct FolderContents {
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
-    _existing_keys: HashSet<String>,
     counts: ItemCounts,
 }
 
@@ -174,7 +173,6 @@ fn scan_folder(path: &Path) -> FolderContents {
     });
 
     let mut counts = ItemCounts::default();
-    let _folder_count = folders.len();
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
 
@@ -201,32 +199,7 @@ fn scan_folder(path: &Path) -> FolderContents {
         }
     }
 
-    let existing_keys: HashSet<String> = items
-        .iter()
-        .filter_map(|it| match it {
-            GridItem::Image(p) => p.file_name()?.to_str().map(String::from),
-            GridItem::ZipFile(p) => {
-                let fname = p.file_name()?.to_str()?;
-                Some(format!("{CACHE_KEY_ZIP}{fname}"))
-            }
-            GridItem::PdfFile(p) => {
-                let fname = p.file_name()?.to_str()?;
-                Some(format!("{CACHE_KEY_PDF}{fname}"))
-            }
-            GridItem::Folder(p) => {
-                let fname = p.file_name()?.to_str()?;
-                Some(format!("{CACHE_KEY_FOLDER}{fname}"))
-            }
-            _ => None,
-        })
-        .collect();
-
-    FolderContents {
-        items,
-        image_metas,
-        _existing_keys: existing_keys,
-        counts,
-    }
+    FolderContents { items, image_metas, counts }
 }
 
 /// ZIP ファイルを仮想フォルダとして走査
@@ -237,7 +210,6 @@ fn scan_zip_as_folder(zip_path: &Path) -> FolderContents {
             return FolderContents {
                 items: Vec::new(),
                 image_metas: Vec::new(),
-                _existing_keys: HashSet::new(),
                 counts: ItemCounts::default(),
             };
         }
@@ -245,11 +217,9 @@ fn scan_zip_as_folder(zip_path: &Path) -> FolderContents {
 
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
-    let mut existing_keys: HashSet<String> = HashSet::new();
     let mut counts = ItemCounts::default();
 
     for e in entries {
-        existing_keys.insert(e.entry_name.clone());
         items.push(GridItem::ZipImage {
             zip_path: zip_path.to_path_buf(),
             entry_name: e.entry_name,
@@ -258,7 +228,7 @@ fn scan_zip_as_folder(zip_path: &Path) -> FolderContents {
         counts.images += 1;
     }
 
-    FolderContents { items, image_metas, _existing_keys: existing_keys, counts }
+    FolderContents { items, image_metas, counts }
 }
 
 /// PDF ファイルを仮想フォルダとして走査 (同期版)
@@ -277,12 +247,9 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
 
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
-    let mut existing_keys: HashSet<String> = HashSet::new();
     let counts = ItemCounts { pdfs: page_count as usize, ..Default::default() };
 
     for page in 0..page_count {
-        let key = mimageviewer::grid_item::pdf_page_cache_key(page);
-        existing_keys.insert(key);
         items.push(GridItem::PdfPage {
             pdf_path: pdf_path.to_path_buf(),
             page_num: page,
@@ -290,7 +257,7 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
         image_metas.push(Some((mtime, file_size)));
     }
 
-    FolderContents { items, image_metas, _existing_keys: existing_keys, counts }
+    FolderContents { items, image_metas, counts }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -469,7 +436,6 @@ fn run_bench(
     contents: &FolderContents,
     cache_map: Arc<RwLock<HashMap<String, catalog::CacheEntry>>>,
     catalog_arc: Option<Arc<CatalogDb>>,
-    _label: &str,
 ) -> BenchResult {
     let cols = args.cols;
     let rows = args.rows;
@@ -494,7 +460,6 @@ fn run_bench(
 
     let thumb_px = 512u32;
     let thumb_quality = 75u8;
-    let _display_px = 512u32;
     let cache_decision = CacheDecision {
         policy: CachePolicy::Auto,
         threshold_ms: 25,
@@ -811,14 +776,14 @@ fn main() {
     // ── Run 1: キャッシュあり ──
     {
         let cache_map = Arc::new(RwLock::new(full_cache_map));
-        let result = run_bench(&args, &contents, cache_map, catalog_arc.clone(), "With cache");
+        let result = run_bench(&args, &contents, cache_map, catalog_arc.clone());
         print_result("With cache", &result);
     }
 
     // ── Run 2: キャッシュなし ──
     if !args.no_cache {
         let cache_map = Arc::new(RwLock::new(HashMap::new()));
-        let result = run_bench(&args, &contents, cache_map, catalog_arc.clone(), "Without cache");
+        let result = run_bench(&args, &contents, cache_map, catalog_arc.clone());
         print_result("Without cache", &result);
     }
 }

@@ -33,6 +33,17 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use pdfium_render::prelude::*;
 
 // -----------------------------------------------------------------------
+// 定数
+// -----------------------------------------------------------------------
+
+/// ワーカープロセス起動時の引数。main.rs と pdf_loader.rs の両方で参照。
+pub const PDF_WORKER_ARG: &str = "--pdf-worker";
+
+/// Windows: ワーカープロセスがコンソールウィンドウを表示しないようにするフラグ。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+// -----------------------------------------------------------------------
 // PDFium DLL 埋め込み & 展開
 // -----------------------------------------------------------------------
 
@@ -64,6 +75,70 @@ fn ensure_dll_extracted() -> Result<&'static PathBuf, String> {
         })
         .as_ref()
         .map_err(|e| e.clone())
+}
+
+// -----------------------------------------------------------------------
+// 共通 PDFium 操作 (IPC ワーカー / in-process ワーカー両方で使用)
+// -----------------------------------------------------------------------
+
+/// PDF のページ一覧を列挙する (コアロジック)。
+fn core_enumerate(
+    pdfium: &Pdfium,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<PdfPageEntry>> {
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64);
+    let file_size = meta.len();
+
+    let doc = pdfium
+        .load_pdf_from_file(path, password)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+
+    let count = doc.pages().len() as u32;
+    Ok((0..count)
+        .map(|i| PdfPageEntry {
+            page_num: i,
+            mtime,
+            file_size,
+        })
+        .collect())
+}
+
+/// PDF の 1 ページをレンダリングする (コアロジック)。
+fn core_render(
+    pdfium: &Pdfium,
+    path: &Path,
+    page_num: u32,
+    target_px: u32,
+    password: Option<&str>,
+) -> std::io::Result<image::DynamicImage> {
+    let doc = pdfium
+        .load_pdf_from_file(path, password)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+
+    let page = doc
+        .pages()
+        .get(page_num as u16)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+
+    let page_w = page.width().value;
+    let page_h = page.height().value;
+    let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
+
+    let render_config = PdfRenderConfig::new()
+        .set_target_width(tw as i32)
+        .set_maximum_height(th as i32);
+
+    let bitmap = page
+        .render_with_config(&render_config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+
+    Ok(bitmap.as_image())
 }
 
 // -----------------------------------------------------------------------
@@ -111,15 +186,21 @@ fn read_msg(r: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn encode_enumerate_request(path: &Path, password: Option<&str>) -> Vec<u8> {
-    let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+/// パス + パスワードをバッファに書き込む (Enumerate / Render 共通)。
+fn encode_path_and_password(buf: &mut Vec<u8>, path: &Path, password: Option<&str>) {
+    let path_lossy = path.to_string_lossy();
+    let path_bytes = path_lossy.as_bytes();
     let pw_bytes = password.unwrap_or("").as_bytes();
-    let mut buf = Vec::with_capacity(1 + 2 + path_bytes.len() + 2 + pw_bytes.len());
-    buf.push(MSG_ENUMERATE);
     buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&path_bytes);
+    buf.extend_from_slice(path_bytes);
     buf.extend_from_slice(&(pw_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(pw_bytes);
+}
+
+fn encode_enumerate_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.push(MSG_ENUMERATE);
+    encode_path_and_password(&mut buf, path, password);
     buf
 }
 
@@ -129,13 +210,13 @@ fn encode_render_request(
     target_px: u32,
     password: Option<&str>,
 ) -> Vec<u8> {
-    let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-    let pw_bytes = password.unwrap_or("").as_bytes();
-    let mut buf =
-        Vec::with_capacity(1 + 2 + path_bytes.len() + 4 + 4 + 2 + pw_bytes.len());
+    let mut buf = Vec::with_capacity(64);
     buf.push(MSG_RENDER);
+    let path_lossy = path.to_string_lossy();
+    let path_bytes = path_lossy.as_bytes();
+    let pw_bytes = password.unwrap_or("").as_bytes();
     buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&path_bytes);
+    buf.extend_from_slice(path_bytes);
     buf.extend_from_slice(&page_num.to_le_bytes());
     buf.extend_from_slice(&target_px.to_le_bytes());
     buf.extend_from_slice(&(pw_bytes.len() as u16).to_le_bytes());
@@ -147,67 +228,8 @@ fn encode_shutdown_request() -> Vec<u8> {
     vec![MSG_SHUTDOWN]
 }
 
-fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
-    if data.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "empty request",
-        ));
-    }
-    let msg_type = data[0];
-    let payload = &data[1..];
-    match msg_type {
-        MSG_ENUMERATE => {
-            let (path, password) = decode_path_and_password(payload)?;
-            Ok(DecodedRequest::Enumerate { path, password })
-        }
-        MSG_RENDER => {
-            if payload.len() < 2 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "render request too short",
-                ));
-            }
-            let path_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-            if payload.len() < 2 + path_len + 8 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "render request truncated",
-                ));
-            }
-            let path_str =
-                std::str::from_utf8(&payload[2..2 + path_len]).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
-            let rest = &payload[2 + path_len..];
-            let page_num = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-            let target_px = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
-            let pw_len = u16::from_le_bytes([rest[8], rest[9]]) as usize;
-            let password = if pw_len > 0 {
-                Some(
-                    std::str::from_utf8(&rest[10..10 + pw_len])
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-                        .to_string(),
-                )
-            } else {
-                None
-            };
-            Ok(DecodedRequest::Render {
-                path: PathBuf::from(path_str),
-                page_num,
-                target_px,
-                password,
-            })
-        }
-        MSG_SHUTDOWN => Ok(DecodedRequest::Shutdown),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unknown message type: {msg_type}"),
-        )),
-    }
-}
-
-fn decode_path_and_password(payload: &[u8]) -> std::io::Result<(PathBuf, Option<String>)> {
+/// パス + パスワードをペイロードからデコードし、残りスライスも返す。
+fn decode_path_and_password(payload: &[u8]) -> std::io::Result<(PathBuf, Option<String>, &[u8])> {
     if payload.len() < 2 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -236,7 +258,71 @@ fn decode_path_and_password(payload: &[u8]) -> std::io::Result<(PathBuf, Option<
     } else {
         None
     };
-    Ok((PathBuf::from(path_str), password))
+    let remaining = &rest[2 + pw_len..];
+    Ok((PathBuf::from(path_str), password, remaining))
+}
+
+fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
+    if data.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty request",
+        ));
+    }
+    let msg_type = data[0];
+    let payload = &data[1..];
+    match msg_type {
+        MSG_ENUMERATE => {
+            let (path, password, _) = decode_path_and_password(payload)?;
+            Ok(DecodedRequest::Enumerate { path, password })
+        }
+        MSG_RENDER => {
+            // Render: [path][page_num(4B)][target_px(4B)][password]
+            // path_len(2B) + path + page_num + target_px の後にパスワード
+            if payload.len() < 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "render request too short",
+                ));
+            }
+            let path_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            if payload.len() < 2 + path_len + 8 + 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "render request truncated",
+                ));
+            }
+            let path_str =
+                std::str::from_utf8(&payload[2..2 + path_len]).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
+            let after_path = &payload[2 + path_len..];
+            let page_num = u32::from_le_bytes([after_path[0], after_path[1], after_path[2], after_path[3]]);
+            let target_px = u32::from_le_bytes([after_path[4], after_path[5], after_path[6], after_path[7]]);
+            let pw_payload = &after_path[8..];
+            let pw_len = u16::from_le_bytes([pw_payload[0], pw_payload[1]]) as usize;
+            let password = if pw_len > 0 && pw_payload.len() >= 2 + pw_len {
+                Some(
+                    std::str::from_utf8(&pw_payload[2..2 + pw_len])
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            Ok(DecodedRequest::Render {
+                path: PathBuf::from(path_str),
+                page_num,
+                target_px,
+                password,
+            })
+        }
+        MSG_SHUTDOWN => Ok(DecodedRequest::Shutdown),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown message type: {msg_type}"),
+        )),
+    }
 }
 
 enum DecodedRequest {
@@ -261,7 +347,6 @@ enum DecodedRequest {
 /// stdin からリクエストを読み、PDFium で処理し、stdout にレスポンスを書く。
 /// stdin が閉じたら (メインプロセス終了) 自動終了する。
 pub fn run_worker_process() {
-    // DLL 展開 (メインプロセスで済んでいるはずだが念のため)
     let dll_path = match ensure_dll_extracted() {
         Ok(p) => p.clone(),
         Err(e) => {
@@ -296,7 +381,7 @@ pub fn run_worker_process() {
     loop {
         let msg = match read_msg(&mut stdin) {
             Ok(m) => m,
-            Err(_) => break, // stdin closed → exit
+            Err(_) => break,
         };
 
         let req = match decode_request(&msg) {
@@ -309,28 +394,15 @@ pub fn run_worker_process() {
 
         match req {
             DecodedRequest::Enumerate { path, password } => {
-                match worker_enumerate(&pdfium, &path, password.as_deref()) {
-                    Ok(resp) => {
-                        let _ = write_msg(&mut stdout, &resp);
-                    }
-                    Err(e) => {
-                        let _ = send_error(&mut stdout, &e.to_string());
-                    }
+                match ipc_enumerate(&pdfium, &path, password.as_deref()) {
+                    Ok(resp) => { let _ = write_msg(&mut stdout, &resp); }
+                    Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
                 }
             }
-            DecodedRequest::Render {
-                path,
-                page_num,
-                target_px,
-                password,
-            } => {
-                match worker_render(&pdfium, &path, page_num, target_px, password.as_deref()) {
-                    Ok(resp) => {
-                        let _ = write_msg(&mut stdout, &resp);
-                    }
-                    Err(e) => {
-                        let _ = send_error(&mut stdout, &e.to_string());
-                    }
+            DecodedRequest::Render { path, page_num, target_px, password } => {
+                match ipc_render(&pdfium, &path, page_num, target_px, password.as_deref()) {
+                    Ok(resp) => { let _ = write_msg(&mut stdout, &resp); }
+                    Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
                 }
             }
             DecodedRequest::Shutdown => break,
@@ -345,70 +417,37 @@ fn send_error(w: &mut impl std::io::Write, msg: &str) -> std::io::Result<()> {
     write_msg(w, &buf)
 }
 
-fn worker_enumerate(
+/// core_enumerate の結果を IPC バイナリにシリアライズする。
+fn ipc_enumerate(
     pdfium: &Pdfium,
     path: &Path,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
-    let meta = std::fs::metadata(path)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-    let file_size = meta.len();
-
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    let count = doc.pages().len() as u32;
-    // Response: [status=0][4B count][per page: 8B mtime + 8B file_size]
-    let mut buf = Vec::with_capacity(1 + 4 + count as usize * 16);
+    let entries = core_enumerate(pdfium, path, password)?;
+    let count = entries.len() as u32;
+    let mut buf = Vec::with_capacity(1 + 4 + entries.len() * 16);
     buf.push(STATUS_OK);
     buf.extend_from_slice(&count.to_le_bytes());
-    for _ in 0..count {
-        buf.extend_from_slice(&mtime.to_le_bytes());
-        buf.extend_from_slice(&file_size.to_le_bytes());
+    for e in &entries {
+        buf.extend_from_slice(&e.mtime.to_le_bytes());
+        buf.extend_from_slice(&e.file_size.to_le_bytes());
     }
     Ok(buf)
 }
 
-fn worker_render(
+/// core_render の結果を IPC バイナリ (RGBA ピクセル) にシリアライズする。
+fn ipc_render(
     pdfium: &Pdfium,
     path: &Path,
     page_num: u32,
     target_px: u32,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    let page = doc
-        .pages()
-        .get(page_num as u16)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    let page_w = page.width().value;
-    let page_h = page.height().value;
-    let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
-
-    let render_config = PdfRenderConfig::new()
-        .set_target_width(tw as i32)
-        .set_maximum_height(th as i32);
-
-    let bitmap = page
-        .render_with_config(&render_config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    let img = bitmap.as_image();
+    let img = core_render(pdfium, path, page_num, target_px, password)?;
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
     let pixels = rgba.as_raw();
-
-    // Response: [status=0][4B width][4B height][rgba_bytes]
     let mut buf = Vec::with_capacity(1 + 4 + 4 + pixels.len());
     buf.push(STATUS_OK);
     buf.extend_from_slice(&w.to_le_bytes());
@@ -421,13 +460,10 @@ fn worker_render(
 // ワーカープロセスプール (メインプロセス側)
 // -----------------------------------------------------------------------
 
-/// ワーカープロセス 1 個を管理する。stdin/stdout で通信。
-/// Mutex で排他制御し、同時に 1 リクエストだけ処理する。
 struct ProcessWorker {
     child: Child,
-    /// stdin/stdout はペアで使うため Mutex で包む
     io: Mutex<ProcessWorkerIo>,
-    /// true = 現在リクエスト処理中
+    /// best-effort ヒント (Mutex が実際の排他を保証)
     busy: AtomicBool,
 }
 
@@ -438,14 +474,19 @@ struct ProcessWorkerIo {
 
 impl ProcessWorker {
     fn spawn(exe_path: &Path) -> std::io::Result<Self> {
-        let mut child = Command::new(exe_path)
-            .arg("--pdf-worker")
+        let mut cmd = Command::new(exe_path);
+        cmd.arg(PDF_WORKER_ARG)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            // Windows: ワーカーは GUI ウィンドウを作らない (CREATE_NO_WINDOW)
-            .creation_flags(0x08000000)
-            .spawn()?;
+            .stderr(Stdio::null());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd.spawn()?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "no stdin")
@@ -464,7 +505,6 @@ impl ProcessWorker {
         })
     }
 
-    /// リクエストを送信し、レスポンスを受信する (ブロッキング)。
     fn send_recv(&self, request: &[u8]) -> std::io::Result<Vec<u8>> {
         self.busy.store(true, Ordering::Relaxed);
         let result = {
@@ -492,14 +532,11 @@ impl Drop for ProcessWorker {
     }
 }
 
-/// 複数のワーカープロセスを管理するプール。
 struct PdfWorkerPool {
     workers: Vec<Arc<ProcessWorker>>,
     next: AtomicUsize,
 }
 
-/// ワーカープール内のプロセス数。
-/// HDD シーク競合とレンダリング並列性のバランスから 3 が適切。
 const POOL_SIZE: usize = 3;
 
 static POOL: OnceLock<PdfWorkerPool> = OnceLock::new();
@@ -511,8 +548,6 @@ fn get_pool() -> &'static PdfWorkerPool {
 impl PdfWorkerPool {
     fn start() -> Self {
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
-
-        // DLL が展開済みであることを保証
         let _ = ensure_dll_extracted();
 
         let mut workers = Vec::with_capacity(POOL_SIZE);
@@ -540,7 +575,6 @@ impl PdfWorkerPool {
         }
     }
 
-    /// ラウンドロビンでワーカーを選択し、リクエストを実行する。
     fn execute(&self, request: &[u8]) -> std::io::Result<Vec<u8>> {
         if self.workers.is_empty() {
             return Err(std::io::Error::new(
@@ -549,80 +583,53 @@ impl PdfWorkerPool {
             ));
         }
 
-        // まず idle なワーカーを探す
+        // best-effort: idle ワーカーを優先 (busy フラグは Mutex のヒント)
         for w in &self.workers {
             if !w.busy.load(Ordering::Relaxed) {
                 return w.send_recv(request);
             }
         }
 
-        // 全員 busy ならラウンドロビンで待つ
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         self.workers[idx].send_recv(request)
     }
 
-    /// レスポンスを解析して Enumerate 結果を返す。
     fn parse_enumerate_response(data: &[u8]) -> std::io::Result<Vec<PdfPageEntry>> {
         if data.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "empty response",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
         }
         if data[0] == STATUS_ERR {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
         if data[0] != STATUS_OK || data.len() < 5 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid enumerate response",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid enumerate response"));
         }
-        let count =
-            u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
         let mut entries = Vec::with_capacity(count);
         let mut offset = 5;
         for i in 0..count {
             if offset + 16 > data.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "enumerate response truncated",
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "enumerate response truncated"));
             }
-            let mtime = i64::from_le_bytes(
-                data[offset..offset + 8].try_into().unwrap(),
-            );
-            let file_size = u64::from_le_bytes(
-                data[offset + 8..offset + 16].try_into().unwrap(),
-            );
-            entries.push(PdfPageEntry {
-                page_num: i as u32,
-                mtime,
-                file_size,
-            });
+            let mtime = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let file_size = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+            entries.push(PdfPageEntry { page_num: i as u32, mtime, file_size });
             offset += 16;
         }
         Ok(entries)
     }
 
-    /// レスポンスを解析して Render 結果 (DynamicImage) を返す。
     fn parse_render_response(data: &[u8]) -> std::io::Result<image::DynamicImage> {
         if data.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "empty response",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
         }
         if data[0] == STATUS_ERR {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
         if data[0] != STATUS_OK || data.len() < 9 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid render response",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid render response"));
         }
         let w = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
         let h = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
@@ -631,19 +638,12 @@ impl PdfWorkerPool {
         if pixels.len() != expected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "pixel data mismatch: expected {expected}, got {}",
-                    pixels.len()
-                ),
+                format!("pixel data mismatch: expected {expected}, got {}", pixels.len()),
             ));
         }
-        let img_buf =
-            image::RgbaImage::from_raw(w, h, pixels.to_vec()).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "failed to create RgbaImage",
-                )
-            })?;
+        let img_buf = image::RgbaImage::from_raw(w, h, pixels.to_vec()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to create RgbaImage")
+        })?;
         Ok(image::DynamicImage::ImageRgba8(img_buf))
     }
 }
@@ -652,7 +652,6 @@ impl PdfWorkerPool {
 // In-process ワーカースレッド (UI スレッドの非同期 API 用)
 // -----------------------------------------------------------------------
 
-/// ワーカーへのリクエスト。
 enum WorkerRequest {
     Enumerate {
         path: PathBuf,
@@ -674,10 +673,7 @@ enum WorkerRequest {
 }
 
 struct PdfWorker {
-    /// 通常チャネル (サムネイルワーカーからの Render 用)
     tx: mpsc::Sender<WorkerRequest>,
-    /// 優先チャネル (Enumerate / CheckPassword / ズーム再レンダリング用)
-    /// ワーカーは各リクエスト処理後にこちらを先にチェックする
     priority_tx: mpsc::Sender<WorkerRequest>,
 }
 
@@ -701,7 +697,6 @@ impl PdfWorker {
                     Ok(p) => p,
                     Err(e) => {
                         crate::logger::log(format!("pdf-worker: init failed: {e}"));
-                        // エラー状態で両チャネルのリクエストにエラーを返す
                         loop {
                             match priority_rx.try_recv() {
                                 Ok(req) => { Self::reply_init_error(&req, &e); continue; }
@@ -720,7 +715,6 @@ impl PdfWorker {
                 crate::logger::log("pdf-worker: ready");
 
                 loop {
-                    // 優先チャネルを先にすべて処理する
                     loop {
                         match priority_rx.try_recv() {
                             Ok(req) => Self::handle_request(&pdfium, req),
@@ -731,7 +725,6 @@ impl PdfWorker {
                             }
                         }
                     }
-                    // 通常チャネルから 1 件処理 (タイムアウト付きで優先チャネルを再チェック)
                     match rx.recv_timeout(std::time::Duration::from_millis(10)) {
                         Ok(req) => Self::handle_request(&pdfium, req),
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -747,35 +740,20 @@ impl PdfWorker {
         PdfWorker { tx, priority_tx }
     }
 
-    /// 1 件のリクエストを処理する。
     fn handle_request(pdfium: &Pdfium, req: WorkerRequest) {
         match req {
             WorkerRequest::Enumerate { path, password, reply } => {
-                let result = Self::do_enumerate(pdfium, &path, password.as_deref());
-                let _ = reply.send(result);
+                let _ = reply.send(core_enumerate(pdfium, &path, password.as_deref()));
             }
             WorkerRequest::CheckPassword { path, reply } => {
-                let status = Self::do_check_password(pdfium, &path);
-                let _ = reply.send(status);
+                let _ = reply.send(Self::do_check_password(pdfium, &path));
             }
             WorkerRequest::Render { path, page_num, target_px, password, cancel, reply } => {
-                // キャンセル済みならスキップ (reply を drop → 受信側は RecvError)
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    crate::logger::log(format!(
-                        "pdf-worker: render cancelled (pre-start) page={}",
-                        page_num + 1
-                    ));
                     return;
                 }
-                let result = Self::do_render(
-                    pdfium, &path, page_num, target_px, password.as_deref(),
-                );
-                // レンダリング完了後もキャンセルチェック (結果が不要なら送信しない)
+                let result = core_render(pdfium, &path, page_num, target_px, password.as_deref());
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    crate::logger::log(format!(
-                        "pdf-worker: render cancelled (post-render) page={}",
-                        page_num + 1
-                    ));
                     return;
                 }
                 let _ = reply.send(result);
@@ -801,46 +779,15 @@ impl PdfWorker {
     fn reply_init_error(req: &WorkerRequest, e: &str) {
         match req {
             WorkerRequest::Enumerate { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other, e.to_string(),
-                )));
+                let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
             }
             WorkerRequest::CheckPassword { reply, .. } => {
                 let _ = reply.send(PdfAccessStatus::Error(e.to_string()));
             }
             WorkerRequest::Render { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other, e.to_string(),
-                )));
+                let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
             }
         }
-    }
-
-    fn do_enumerate(
-        pdfium: &Pdfium,
-        path: &Path,
-        password: Option<&str>,
-    ) -> std::io::Result<Vec<PdfPageEntry>> {
-        let meta = std::fs::metadata(path)?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs() as i64);
-        let file_size = meta.len();
-
-        let doc = pdfium
-            .load_pdf_from_file(path, password)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-        let count = doc.pages().len() as u32;
-        Ok((0..count)
-            .map(|i| PdfPageEntry {
-                page_num: i,
-                mtime,
-                file_size,
-            })
-            .collect())
     }
 
     fn do_check_password(pdfium: &Pdfium, path: &Path) -> PdfAccessStatus {
@@ -852,51 +799,18 @@ impl PdfWorker {
             Err(e) => PdfAccessStatus::Error(format!("{e}")),
         }
     }
-
-    fn do_render(
-        pdfium: &Pdfium,
-        path: &Path,
-        page_num: u32,
-        target_px: u32,
-        password: Option<&str>,
-    ) -> std::io::Result<image::DynamicImage> {
-        let doc = pdfium
-            .load_pdf_from_file(path, password)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-        let page = doc
-            .pages()
-            .get(page_num as u16)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-        let page_w = page.width().value;
-        let page_h = page.height().value;
-        let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
-
-        let render_config = PdfRenderConfig::new()
-            .set_target_width(tw as i32)
-            .set_maximum_height(th as i32);
-
-        let bitmap = page
-            .render_with_config(&render_config)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-        Ok(bitmap.as_image())
-    }
 }
 
 // -----------------------------------------------------------------------
 // 公開データ型
 // -----------------------------------------------------------------------
 
-/// PDF の 1 ページの情報。
 pub struct PdfPageEntry {
     pub page_num: u32,
     pub mtime: i64,
     pub file_size: u64,
 }
 
-/// パスワード要否の判定結果。
 pub enum PdfAccessStatus {
     Ok,
     PasswordRequired,
@@ -907,8 +821,6 @@ pub enum PdfAccessStatus {
 // 公開 API — 同期版 (バックグラウンドスレッド用)
 // -----------------------------------------------------------------------
 
-/// PDF のページ一覧を取得する (ブロッキング)。
-/// ワーカープロセスプール経由で並列処理される。
 pub fn enumerate_pages(
     pdf_path: &Path,
     password: Option<&str>,
@@ -930,10 +842,6 @@ pub fn enumerate_pages(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
 }
 
-/// 指定ページをレンダリングする (ブロッキング)。
-/// サムネイルワーカー等のバックグラウンドスレッドから呼ぶ。
-/// ワーカープロセスプール経由で並列処理される。
-/// `cancel` を渡すと、送信前にキャンセルチェックする。
 pub fn render_page(
     pdf_path: &Path,
     page_num: u32,
@@ -941,12 +849,8 @@ pub fn render_page(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<image::DynamicImage> {
-    // キャンセル済みなら即座にエラー
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "cancelled",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
     }
 
     let pool = get_pool();
@@ -970,8 +874,6 @@ pub fn render_page(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
 }
 
-/// パスワードが必要かどうかを判定する (ブロッキング)。優先チャネル経由。
-/// CheckPassword はプロセスプール非対応 (in-process ワーカーを使用)。
 pub fn check_password_needed(pdf_path: &Path) -> PdfAccessStatus {
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::CheckPassword {
@@ -985,10 +887,6 @@ pub fn check_password_needed(pdf_path: &Path) -> PdfAccessStatus {
 // 公開 API — 非同期版 (UI スレッド用)
 // -----------------------------------------------------------------------
 
-/// ページレンダリングを非同期でリクエストする (優先チャネル経由)。
-/// 戻り値: `(cancel_token, receiver)`.
-/// - `cancel_token` を `true` にセットするとワーカーが処理開始前にスキップする
-/// - `receiver` を `.try_recv()` でポーリングする
 pub fn render_page_async(
     pdf_path: &Path,
     page_num: u32,
@@ -1008,7 +906,6 @@ pub fn render_page_async(
     (cancel, rx)
 }
 
-/// ページ列挙を非同期でリクエストする (優先チャネル経由)。
 pub fn enumerate_pages_async(
     pdf_path: &Path,
     password: Option<&str>,
@@ -1022,7 +919,6 @@ pub fn enumerate_pages_async(
     rx
 }
 
-/// パスワードチェックを非同期でリクエストする (優先チャネル経由)。
 pub fn check_password_async(
     pdf_path: &Path,
 ) -> mpsc::Receiver<PdfAccessStatus> {
@@ -1039,8 +935,6 @@ pub fn check_password_async(
 // -----------------------------------------------------------------------
 
 /// PDF ページのポイント寸法を target ピクセルにフィットさせる。
-/// PDF はベクター形式なので、ラスター画像と違って常にターゲット解像度に
-/// スケーリングする（縮小だけでなくスケールアップも行う）。
 fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
     let long = w.max(h);
     if long <= 0.0 {
@@ -1048,24 +942,4 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
     }
     let scale = target / long;
     (w * scale, h * scale)
-}
-
-/// Windows の CREATE_NO_WINDOW フラグ。
-/// ワーカープロセスがコンソールウィンドウを表示しないようにする。
-trait CommandExt {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self;
-}
-
-impl CommandExt for Command {
-    #[cfg(windows)]
-    fn creation_flags(&mut self, flags: u32) -> &mut Self {
-        use std::os::windows::process::CommandExt as WinCommandExt;
-        WinCommandExt::creation_flags(self, flags);
-        self
-    }
-
-    #[cfg(not(windows))]
-    fn creation_flags(&mut self, _flags: u32) -> &mut Self {
-        self
-    }
 }

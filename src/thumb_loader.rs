@@ -280,26 +280,24 @@ fn decode_jpeg_turbo_from_bytes(data: &[u8]) -> Option<image::DynamicImage> {
     Some(image::DynamicImage::ImageRgb8(img))
 }
 
-/// パスの拡張子が JPEG かどうかを判定する。
+const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif"];
+
+fn is_jpeg_extension(ext: &str) -> bool {
+    let lower = ext.to_ascii_lowercase();
+    JPEG_EXTENSIONS.iter().any(|&e| e == lower)
+}
+
 fn is_jpeg_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|s| {
-            let lower = s.to_ascii_lowercase();
-            lower == "jpg" || lower == "jpeg" || lower == "jpe" || lower == "jfif"
-        })
-        .unwrap_or(false)
+        .is_some_and(|s| is_jpeg_extension(s))
 }
 
-/// エントリ名の拡張子が JPEG かどうかを判定する。
 fn is_jpeg_entry(name: &str) -> bool {
-    if let Some(dot_pos) = name.rfind('.') {
-        let ext = &name[dot_pos + 1..];
-        let lower = ext.to_ascii_lowercase();
-        lower == "jpg" || lower == "jpeg" || lower == "jpe" || lower == "jfif"
-    } else {
-        false
-    }
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|s| is_jpeg_extension(s))
 }
 
 fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {

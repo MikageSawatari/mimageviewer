@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 fn main() -> eframe::Result {
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
-    if std::env::args().any(|a| a == "--pdf-worker") {
+    if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
         pdf_loader::run_worker_process();
         std::process::exit(0);
     }
