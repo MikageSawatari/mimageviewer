@@ -90,6 +90,39 @@ impl App {
                     ui.separator();
                     ui.add_space(4.0);
 
+                    // ── 現在のフォルダのキャッシュを削除 ─────────
+                    let has_folder = self.current_folder.is_some();
+                    let btn = egui::Button::new("  現在のフォルダのキャッシュを削除  ");
+                    if ui.add_enabled(has_folder, btn).clicked() {
+                        if let Some(ref folder) = self.current_folder.clone() {
+                            let db_path = crate::catalog::db_path_for(&cache_dir, folder);
+                            if db_path.exists() {
+                                let _ = std::fs::remove_file(&db_path);
+                                self.cache_manager_result = Some(format!(
+                                    "「{}」のキャッシュを削除しました。",
+                                    folder.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                                ));
+                            } else {
+                                self.cache_manager_result = Some(
+                                    "現在のフォルダにはキャッシュがありません。".to_string(),
+                                );
+                            }
+                            let stats = crate::catalog::cache_stats(&cache_dir);
+                            self.cache_manager_stats = Some(stats);
+                        }
+                    }
+                    if !has_folder {
+                        ui.label(
+                            egui::RichText::new("（フォルダを開いていないため無効）")
+                                .small()
+                                .weak(),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
                     // ── すべて削除 ────────────────────────────────
                     if ui.button("  すべてのキャッシュを削除する  ").clicked() {
                         self.cache_manager_confirm_delete_all = true;

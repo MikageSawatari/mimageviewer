@@ -11,12 +11,8 @@ use crate::folder_tree::{
     walk_dirs_recursive, SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS,
 };
 
-/// カタログ内の ZipFile サムネイル用キャッシュキープレフィックス
-pub(crate) const CACHE_KEY_ZIP: &str = "zipthumb:";
-/// カタログ内の PdfFile サムネイル用キャッシュキープレフィックス
-pub(crate) const CACHE_KEY_PDF: &str = "pdfthumb:";
-/// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
-pub(crate) const CACHE_KEY_FOLDER: &str = "folderthumb:";
+// キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
+pub(crate) use crate::thumb_loader::{CACHE_KEY_ZIP, CACHE_KEY_PDF, CACHE_KEY_FOLDER};
 
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
 fn stem_lower(path: &std::path::Path) -> String {
@@ -167,6 +163,10 @@ pub struct App {
     pub(crate) requested: std::collections::HashMap<usize, bool>,
     /// 現在の keep range [start, end)。update_keep_range で毎フレーム更新
     pub(crate) keep_range: (usize, usize),
+    /// ワーカー共有用: keep_range の start/end をアトミックに公開。
+    /// ワーカーは pick 後にこの範囲を確認し、範囲外のリクエストをスキップする。
+    pub(crate) keep_start_shared: Arc<AtomicUsize>,
+    pub(crate) keep_end_shared: Arc<AtomicUsize>,
     /// poll_thumbnails で 1 フレームのテクスチャ生成上限を超えた分を次フレームに持ち越す
     texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
 
@@ -244,6 +244,14 @@ pub struct App {
     pub(crate) context_menu_idx: Option<usize>,
     /// コンテキストメニューの表示座標 (右クリック時に記録)
     pub(crate) context_menu_pos: egui::Pos2,
+
+    // ── フルスクリーン右クリックコンテキストメニュー ─────────
+    /// 右クリック長押し検出用: 押下開始時刻と座標
+    pub(crate) fs_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
+    /// フルスクリーン用コンテキストメニューの対象アイテムインデックス
+    pub(crate) fs_context_menu_idx: Option<usize>,
+    /// フルスクリーン用コンテキストメニューの表示座標
+    pub(crate) fs_context_menu_pos: egui::Pos2,
 
     // ── 削除確認ダイアログ ───────────────────────────────────────
     pub(crate) show_delete_confirm: bool,
@@ -457,6 +465,8 @@ impl Default for App {
             reload_queue: None,
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
+            keep_start_shared: Arc::new(AtomicUsize::new(0)),
+            keep_end_shared: Arc::new(AtomicUsize::new(0)),
             texture_backlog: Vec::new(),
             folder_nav_pending: None,
             progress_normal_peak: 0,
@@ -484,6 +494,9 @@ impl Default for App {
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
+            fs_secondary_press_start: None,
+            fs_context_menu_idx: None,
+            fs_context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
             delete_targets: Vec::new(),
             pending_reload: false,
@@ -1044,6 +1057,11 @@ impl App {
         let display_px_shared = Arc::clone(&self.display_px_shared);
         let stats = Arc::clone(&self.stats);
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
+        let keep_start_shared = Arc::clone(&self.keep_start_shared);
+        let keep_end_shared = Arc::clone(&self.keep_end_shared);
+        // ZIP/フォルダの重い I/O を同時 2 件に制限するセマフォ。
+        // HDD ではヘッドシーク競合、NW ドライブではレイテンシ累積を防ぐ。
+        let heavy_io_semaphore = Arc::new(AtomicUsize::new(0));
 
         crate::logger::log(format!("  spawning {thumb_threads} persistent workers"));
 
@@ -1057,13 +1075,16 @@ impl App {
             let done_w = Arc::clone(&cache_gen_done);
             let display_px_w = Arc::clone(&display_px_shared);
             let stats_w = Arc::clone(&stats);
+            let ks_w = Arc::clone(&keep_start_shared);
+            let ke_w = Arc::clone(&keep_end_shared);
+            let sem_w = Arc::clone(&heavy_io_semaphore);
 
             std::thread::spawn(move || {
                 crate::logger::log(format!("  worker {worker_idx} started"));
                 loop {
                     if cancel_w.load(Ordering::Relaxed) { break; }
 
-                    // 可視先頭に最も近い要求を選ぶ
+                    // priority (可視範囲) を最優先、次に scroll_hint に近い順
                     let req_opt: Option<LoadRequest> = {
                         let mut q = queue.lock().unwrap();
                         if q.is_empty() {
@@ -1074,8 +1095,11 @@ impl App {
                                 .iter()
                                 .enumerate()
                                 .min_by_key(|(_, r)| {
+                                    // priority=true → tier 0, false → tier 1
+                                    let tier: usize = if r.priority { 0 } else { 1 };
                                     let i = r.idx;
-                                    if i < vis { vis - i } else { i - vis }
+                                    let dist = if i < vis { vis - i } else { i - vis };
+                                    (tier, dist)
                                 })
                                 .map(|(pos, _)| pos)
                                 .unwrap();
@@ -1086,12 +1110,36 @@ impl App {
                     match req_opt {
                         Some(req) => {
                             if cancel_w.load(Ordering::Relaxed) { break; }
+                            // keep_range 外に出たリクエストは処理せずスキップ。
+                            // スクロール中に pick したが、その後スクロールが進んで
+                            // 範囲外になった場合に、高コストな I/O (ZIP open 等) を回避する。
+                            let ks = ks_w.load(Ordering::Relaxed);
+                            let ke = ke_w.load(Ordering::Relaxed);
+                            if req.idx < ks || req.idx >= ke {
+                                crate::logger::log(format!(
+                                    "  w{worker_idx} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
+                                    req.idx,
+                                    req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                                ));
+                                // requested からは UI 側の eviction で既に除去されているが、
+                                // 念のため結果を送って poll_thumbnails で整合させる
+                                continue;
+                            }
+                            let vis = hint_w.load(Ordering::Relaxed);
+                            let dist = if req.idx < vis { vis - req.idx } else { req.idx - vis };
+                            crate::logger::log(format!(
+                                "  w{worker_idx} pick idx={:>4} pri={} dist={dist:>4}  {}",
+                                req.idx,
+                                if req.priority { "H" } else { "L" },
+                                req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                            ));
                             let display_px = display_px_w.load(Ordering::Relaxed);
                             process_load_request(
                                 &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
                                 thumb_px, thumb_quality, display_px, cache_decision, &done_w,
                                 &stats_w,
                                 Some(&cancel_w),
+                                &ks_w, &ke_w, &sem_w,
                             );
                         }
                         None => {
@@ -1313,6 +1361,8 @@ impl App {
         }
 
         self.keep_range = (keep_start, keep_end);
+        self.keep_start_shared.store(keep_start, Ordering::Relaxed);
+        self.keep_end_shared.store(keep_end, Ordering::Relaxed);
 
         // (1) 範囲外の Loaded を Evicted にする (TextureHandle を drop)
         //     動画サムネイルは一度ロードしたら維持する (別パスのため再要求できない)
@@ -1338,7 +1388,29 @@ impl App {
         //     範囲内の Pending/Evicted を新たに push する。
         //     スクロール中にキューに溜まった古いリクエストをワーカーが無駄に
         //     処理するのを防ぎ、新しい可視領域のリクエストを優先させる。
+        //
+        //     可視範囲 (1 ページ分) のリクエストは priority=true でマークし、
+        //     ワーカーが先読み要求より常に先に処理するようにする。
         let Some(queue) = self.reload_queue.clone() else { return; };
+
+        // 可視範囲の raw index 範囲を計算 (1 ページ分 + 上下 1 行のマージン)
+        let vis_visible_start = vis_first.saturating_sub(cols);
+        let vis_visible_end = vis_first
+            .saturating_add(items_per_page + cols)
+            .min(vis_count);
+        let visible_raw_start = self
+            .visible_indices
+            .get(vis_visible_start)
+            .copied()
+            .unwrap_or(0);
+        let visible_raw_end = self
+            .visible_indices
+            .get(vis_visible_end.saturating_sub(1))
+            .copied()
+            .map(|i| i + 1)
+            .unwrap_or(total)
+            .min(total);
+
         let mut new_requests: Vec<LoadRequest> = Vec::new();
         for i in keep_start..keep_end {
             if self.requested.contains_key(&i) {
@@ -1355,23 +1427,38 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let Some(req) = self.items.get(i).and_then(|item| {
+            let Some(mut req) = self.items.get(i).and_then(|item| {
                 make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort))
             }) else {
                 continue;
             };
+            req.priority = i >= visible_raw_start && i < visible_raw_end;
             new_requests.push(req);
         }
+        let new_hi = new_requests.iter().filter(|r| r.priority).count();
+        let new_lo = new_requests.len() - new_hi;
         let t3 = frame_t0.elapsed();
         {
             let mut q = queue.lock().unwrap();
             let t3b = frame_t0.elapsed();
             // keep_range 外のリクエストを除去 (ワーカーの無駄な処理を防ぐ)
             q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
+            // スクロールで可視範囲が変わった場合、既存キュー内の priority を更新
+            for r in q.iter_mut() {
+                r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+            }
+            let q_before = q.len();
             for r in new_requests {
                 // false = 通常読み込み要求
                 self.requested.insert(r.idx, false);
                 q.push(r);
+            }
+            if new_hi > 0 || new_lo > 0 {
+                let q_hi = q.iter().filter(|r| r.priority).count();
+                crate::logger::log(format!(
+                    "  [queue] push +{new_hi}H +{new_lo}L  total={} ({}H {}L)  keep=[{keep_start}..{keep_end})  vis=[{visible_raw_start}..{visible_raw_end})  requested={}",
+                    q.len(), q_hi, q.len() - q_hi, self.requested.len(),
+                ));
             }
             if (t3b - t3).as_millis() > 1 {
                 crate::logger::log(format!(
@@ -1509,19 +1596,23 @@ impl App {
     }
 
     /// in-flight + キュー内の通常/アップグレード件数を返す。
+    ///
+    /// `requested` マップは queue に push した時点で insert され、
+    /// 結果を受信した時点で remove されるので、キュー待ち + ワーカー処理中の
+    /// 全件を正確に反映している。queue を別途カウントすると二重計上になるため
+    /// `requested` のみを集計する。
     fn count_pending(&self) -> (usize, usize) {
+        let (keep_start, keep_end) = self.keep_range;
         let (mut in_normal, mut in_upgrade) = (0usize, 0usize);
-        for &is_upgrade in self.requested.values() {
+        for (&idx, &is_upgrade) in &self.requested {
+            // keep_range 外のリクエストは「処理中だがスクロールで不要になった」もの。
+            // 進捗バーに含めない (ワーカー完了時に除去される)。
+            if idx < keep_start || idx >= keep_end {
+                continue;
+            }
             if is_upgrade { in_upgrade += 1; } else { in_normal += 1; }
         }
-        let (q_normal, q_upgrade) = if let Some(queue) = &self.reload_queue {
-            let q = queue.lock().unwrap();
-            let upgrade = q.iter().filter(|r| r.skip_cache).count();
-            (q.len() - upgrade, upgrade)
-        } else {
-            (0, 0)
-        };
-        (in_normal + q_normal, in_upgrade + q_upgrade)
+        (in_normal, in_upgrade)
     }
 
     /// 現在の要求状況からプログレスバーのピーク値を更新する。
@@ -2626,6 +2717,8 @@ impl App {
         self.fullscreen_idx = None;
         self.slideshow_playing = false;
         self.fs_viewport_shown = false;
+        self.fs_secondary_press_start = None;
+        self.fs_context_menu_idx = None;
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -3364,17 +3457,17 @@ fn make_load_request(
     match item {
         GridItem::Image(p) => Some(LoadRequest {
             idx, path: p.clone(), mtime, file_size,
-            skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
+            skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
-            skip_cache, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
+            skip_cache, priority: false, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None,
         }),
         GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
-            skip_cache, zip_entry: None, pdf_page: Some(*page_num),
+            skip_cache, priority: false, zip_entry: None, pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),
             cache_key_override: None, folder_thumb_sort: None,
         }),
@@ -3385,7 +3478,7 @@ fn make_load_request(
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             Some(LoadRequest {
                 idx, path: p.clone(), mtime, file_size,
-                skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
+                skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
                 folder_thumb_sort: None,
             })
@@ -3395,7 +3488,7 @@ fn make_load_request(
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             Some(LoadRequest {
                 idx, path: p.clone(), mtime, file_size,
-                skip_cache, zip_entry: None, pdf_page: Some(0),
+                skip_cache, priority: false, zip_entry: None, pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
                 folder_thumb_sort: None,
@@ -3406,7 +3499,7 @@ fn make_load_request(
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             Some(LoadRequest {
                 idx, path: p.clone(), mtime, file_size,
-                skip_cache, zip_entry: None, pdf_page: None, pdf_password: None,
+                skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
                 folder_thumb_sort,
             })

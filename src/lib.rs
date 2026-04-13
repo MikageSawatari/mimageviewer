@@ -1,5 +1,5 @@
 //! mimageviewer ライブラリクレート。
-//! 統合テストから公開モジュールにアクセスするためのエントリポイント。
+//! 統合テストやベンチマーク bin から公開モジュールにアクセスするためのエントリポイント。
 
 pub mod catalog;
 pub mod data_dir;
@@ -12,5 +12,7 @@ pub mod pdf_passwords;
 pub mod png_metadata;
 pub mod settings;
 pub mod stats;
+pub mod thumb_loader;
 pub mod ui_helpers;
+pub mod wic_decoder;
 pub mod zip_loader;

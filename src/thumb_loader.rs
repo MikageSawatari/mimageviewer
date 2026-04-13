@@ -14,6 +14,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // -----------------------------------------------------------------------
+// キャッシュキー定数 (app.rs / ベンチマーク bin から参照)
+// -----------------------------------------------------------------------
+
+/// カタログ内の ZipFile サムネイル用キャッシュキープレフィックス
+pub const CACHE_KEY_ZIP: &str = "zipthumb:";
+/// カタログ内の PdfFile サムネイル用キャッシュキープレフィックス
+pub const CACHE_KEY_PDF: &str = "pdfthumb:";
+/// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
+pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
+
+// -----------------------------------------------------------------------
 // 共通型
 // -----------------------------------------------------------------------
 
@@ -38,6 +49,9 @@ pub struct LoadRequest {
     pub file_size: i64,
     /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
     pub skip_cache: bool,
+    /// true = 画面上に見えている可視範囲のアイテム。ワーカーは priority 要求を
+    /// 先読み要求より常に先に処理する。
+    pub priority: bool,
     /// タスク 3: `Some(name)` なら ZIP エントリとして読む。
     /// `path` が ZIP ファイル、`name` が内部エントリ名。
     pub zip_entry: Option<String>,
@@ -282,6 +296,9 @@ pub fn process_load_request(
     gen_done: &Arc<AtomicUsize>,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
     cancel: Option<&Arc<AtomicBool>>,
+    keep_start: &Arc<AtomicUsize>,
+    keep_end: &Arc<AtomicUsize>,
+    heavy_io_semaphore: &Arc<AtomicUsize>,
 ) {
     // カタログキー:
     // - 通常画像: ファイル名 (例: "foo.jpg")
@@ -304,6 +321,8 @@ pub fn process_load_request(
             .unwrap_or("")
     };
 
+    let req_t0 = std::time::Instant::now();
+
     // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
     if !req.skip_cache {
@@ -320,13 +339,16 @@ pub fn process_load_request(
         });
         if let Some((webp_data, source_dims)) = cached {
             let ci = crate::catalog::decode_thumb_to_color_image(&webp_data);
+            let cache_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
             // from_cache = true: アップグレード対象
             // source_dims はカタログ由来 (旧バージョンで作成された
             // エントリには None が入っている)
             let _ = tx.send((req.idx, ci, true, source_dims));
             gen_done.fetch_add(1, Ordering::Relaxed);
-            // 統計には記録しない: キャッシュヒットは 2-3 ms で
-            // "キャッシュ無し時のコスト" を歪めるため
+            crate::logger::log(format!(
+                "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
+                req.idx,
+            ));
             return;
         }
     }
@@ -334,14 +356,92 @@ pub fn process_load_request(
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
     // load_one_cached は from_cache = false を送信する
 
-    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
+    // ── stale チェック + I/O セマフォ (重い処理用) ─────────────────
+    // フォルダサムネイル・ZipFile サムネイルは HDD シークを伴う重い I/O。
+    // 12 ワーカーが同時に HDD を叩くとヘッド競合で 1 件あたり数十秒かかるため、
+    // セマフォで同時実行数を制限する。
+    // priority=H (可視範囲) のリクエストはセマフォ制限なしで即座に通す。
+    // priority=L (先読み) のリクエストのみ同時 1 件に制限する。
+    // また I/O 開始前に keep_range を再確認し、スクロールで範囲外になった
+    // リクエストは処理せずスキップする。
+
+    /// セマフォを acquire し、Guard が drop されると自動 release する。
+    struct SemGuard<'a>(&'a Arc<AtomicUsize>);
+    impl<'a> SemGuard<'a> {
+        fn acquire(sem: &'a Arc<AtomicUsize>, max: usize,
+                   cancel: Option<&Arc<AtomicBool>>,
+                   keep_s: &Arc<AtomicUsize>, keep_e: &Arc<AtomicUsize>,
+                   idx: usize) -> Option<Self> {
+            loop {
+                // キャンセル or stale → 諦める
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return None;
+                }
+                let ks = keep_s.load(Ordering::Relaxed);
+                let ke = keep_e.load(Ordering::Relaxed);
+                if idx < ks || idx >= ke {
+                    return None;
+                }
+                let cur = sem.load(Ordering::Relaxed);
+                if cur < max {
+                    if sem.compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        return Some(SemGuard(sem));
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+    impl Drop for SemGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    // 重い I/O が必要かどうか判定
     let is_folder_thumb = req.cache_key_override.as_deref()
-        .is_some_and(|k| k.starts_with(crate::app::CACHE_KEY_FOLDER));
+        .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER));
+    let is_zip_thumb = !is_folder_thumb
+        && req.zip_entry.is_none()
+        && req.cache_key_override.is_some()
+        && req.pdf_page.is_none();
+    let needs_heavy_io = is_folder_thumb || is_zip_thumb;
+
+    // 重い I/O: セマフォで同時 1 件に制限 (priority 問わず)。
+    // ベンチマーク結果: ZIP resolve は直列なら 3-18ms だが、並列だと HDD シーク
+    // 競合で 1-30 秒に膨れ上がる。直列化が最善。
+    // + stale チェック
+    let _sem_guard = if needs_heavy_io {
+        match SemGuard::acquire(heavy_io_semaphore, 1, cancel.as_ref().copied(),
+                                keep_start, keep_end, req.idx) {
+            Some(g) => Some(g),
+            None => {
+                crate::logger::log(format!(
+                    "    idx={:>4} STALE (aborted before I/O)  {}",
+                    req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                ));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
     let resolved_folder_image = if is_folder_thumb {
+        let t_resolve = std::time::Instant::now();
         let img = resolve_folder_thumb_image(
             &req.path,
             req.folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
         );
+        let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
+        if resolve_ms > 10.0 {
+            crate::logger::log(format!(
+                "    idx={:>4} folder_resolve={resolve_ms:>6.1}ms  {}",
+                req.idx, req.path.display(),
+            ));
+        }
         if img.is_none() {
             let _ = tx.send((req.idx, None, false, None));
             gen_done.fetch_add(1, Ordering::Relaxed);
@@ -355,26 +455,64 @@ pub fn process_load_request(
 
     // ZipFile (フォルダ一覧用サムネイル) の場合、UI スレッドでの ZIP I/O を避けるため
     // zip_entry が None のまま渡される。ワーカー側で遅延解決する。
+    //
+    // ネットワークドライブでは ZIP の open (セントラルディレクトリ読み取り) が高コスト
+    // なため、first_image_entry + read_entry_bytes の 2 回 open を
+    // read_first_image_bytes の 1 回 open に統合する。
     let resolved_zip_entry: Option<String>;
+    let preloaded_zip_bytes: Option<Vec<u8>>;
     let zip_entry_ref: Option<&str> = if req.zip_entry.is_some() {
+        preloaded_zip_bytes = None;
         req.zip_entry.as_deref()
-    } else if !is_folder_thumb && req.cache_key_override.is_some() && req.pdf_page.is_none() {
+    } else if is_zip_thumb {
         // cache_key_override あり + pdf_page なし + フォルダでない = ZipFile サムネイル
-        resolved_zip_entry = crate::zip_loader::first_image_entry(&req.path);
-        if resolved_zip_entry.is_none() {
-            // ZIP 内に画像が無い場合は失敗として通知
+        // ZIP を 1 回だけ開いてエントリ名 + バイト列を同時取得
+        let t_zip = std::time::Instant::now();
+        match crate::zip_loader::read_first_image_bytes(&req.path) {
+            Some((name, bytes)) => {
+                let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
+                crate::logger::log(format!(
+                    "    idx={:>4} zip_resolve={zip_ms:>6.1}ms  ({} bytes)  {}",
+                    req.idx, bytes.len(), req.path.display(),
+                ));
+                resolved_zip_entry = Some(name);
+                preloaded_zip_bytes = Some(bytes);
+                resolved_zip_entry.as_deref()
+            }
+            None => {
+                // ZIP 内に画像が無い場合は失敗として通知
+                let _ = tx.send((req.idx, None, false, None));
+                gen_done.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    } else {
+        preloaded_zip_bytes = None;
+        None
+    };
+
+    // 重い I/O (ZIP/フォルダ) 完了後の stale チェック:
+    // resolve に数秒かかった場合、スクロールで keep_range 外になっている可能性がある。
+    // 不要な decode + send を省き、UI 側の requested 除去を早める。
+    if needs_heavy_io {
+        let ks = keep_start.load(Ordering::Relaxed);
+        let ke = keep_end.load(Ordering::Relaxed);
+        if req.idx < ks || req.idx >= ke {
+            crate::logger::log(format!(
+                "    idx={:>4} STALE (after I/O resolve)  {}",
+                req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            ));
+            // None を送信して poll_thumbnails で requested を除去させる
             let _ = tx.send((req.idx, None, false, None));
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        resolved_zip_entry.as_deref()
-    } else {
-        None
-    };
+    }
 
     load_one_cached(
         load_path,
         zip_entry_ref,
+        preloaded_zip_bytes,
         req.pdf_page,
         req.pdf_password.as_deref(),
         req.cache_key_override.as_deref(),
@@ -436,6 +574,9 @@ fn resolve_folder_thumb_image(
 pub fn load_one_cached(
     path: &Path,
     zip_entry: Option<&str>,
+    // プリロード済み ZIP エントリバイト列。Some の場合 read_entry_bytes を省略する。
+    // `read_first_image_bytes` で ZIP 1 回 open に統合した場合に使用。
+    preloaded_zip_bytes: Option<Vec<u8>>,
     pdf_page: Option<u32>,
     pdf_password: Option<&str>,
     cache_key_override: Option<&str>,
@@ -482,9 +623,14 @@ pub fn load_one_cached(
         crate::pdf_loader::render_page(path, page_num, display_px, pdf_password, cancel.map(Arc::clone))
             .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(entry_name) = zip_entry {
-        crate::zip_loader::read_entry_bytes(path, entry_name)
-            .map_err(image::ImageError::IoError)
-            .and_then(|bytes| image::load_from_memory(&bytes))
+        // プリロード済みバイト列があれば ZIP を再度 open せずにデコード
+        let bytes_result = if let Some(bytes) = preloaded_zip_bytes {
+            Ok(bytes)
+        } else {
+            crate::zip_loader::read_entry_bytes(path, entry_name)
+                .map_err(image::ImageError::IoError)
+        };
+        bytes_result.and_then(|bytes| image::load_from_memory(&bytes))
     } else {
         let primary = image::open(path).or_else(|_| {
             use std::io::BufReader;

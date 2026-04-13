@@ -88,6 +88,63 @@ pub fn first_image_entry(zip_path: &Path) -> Option<String> {
     None
 }
 
+/// ZIP を 1 回だけ開き、最初の画像エントリを探してそのバイト列を読み取る。
+///
+/// `first_image_entry` + `read_entry_bytes` を 1 回の open で行う最適化版。
+/// ネットワークドライブでは ZIP の open (セントラルディレクトリ読み取り) が
+/// 高コストなため、2 回 → 1 回に削減することで体感速度が大幅に改善する。
+///
+/// 戻り値: `Some((entry_name, bytes))` or `None` (画像エントリが無い場合)
+pub fn read_first_image_bytes(zip_path: &Path) -> Option<(String, Vec<u8>)> {
+    let file = File::open(zip_path).ok()?;
+    let file_size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    // BufReader はデフォルト 8KB が最適。ZipArchive::new() はファイル末尾から
+    // 逆方向にシークするため、大きなバッファはむしろ有害 (seek 後に不要な大量 read)。
+    let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
+    let entry_count = archive.len();
+
+    let t0 = std::time::Instant::now();
+
+    // まず最初の画像エントリのインデックスと名前を探す
+    let mut found: Option<(usize, String)> = None;
+    for i in 0..entry_count {
+        let Ok(entry) = archive.by_index_raw(i) else { continue };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if name.contains("__MACOSX/") || name.starts_with('.') {
+            continue;
+        }
+        let Some(dot) = name.rfind('.') else { continue };
+        let ext = name[dot + 1..].to_ascii_lowercase();
+        if IMAGE_EXTS.contains(&ext.as_str()) {
+            found = Some((i, name.replace('\\', "/")));
+            break;
+        }
+    }
+
+    let scan_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let (idx, entry_name) = found?;
+    // 同じ archive からエントリを展開して読み取る
+    let mut entry = archive.by_index(idx).ok()?;
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes).ok()?;
+
+    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if total_ms > 50.0 {
+        crate::logger::log(format!(
+            "      [zip detail] entries={entry_count} zip_size={:.1}MB scan={scan_ms:.0}ms read={:.0}ms total={total_ms:.0}ms  {}",
+            file_size as f64 / (1024.0 * 1024.0),
+            total_ms - scan_ms,
+            zip_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+        ));
+    }
+
+    Some((entry_name, bytes))
+}
+
 /// ZIP 内の特定エントリの生バイト列を取り出す。
 ///
 /// 呼び出しごとに ZIP を開き直すため、多数のエントリを連続で読むと
