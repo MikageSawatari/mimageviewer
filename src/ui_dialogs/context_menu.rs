@@ -159,7 +159,7 @@ impl crate::app::App {
                             }
                             // ── アプリケーションで開く ──
                             ui.separator();
-                            self.render_open_with_menu(ui, p, &mut close);
+                            let _ = self.render_open_with_menu(ui, p, &mut close);
                             ui.separator();
                             ui.horizontal(|ui| {
                                 if ui.button("左に回転 (L)").clicked() {
@@ -207,7 +207,7 @@ impl crate::app::App {
                                 }
                                 // ── アプリケーションで開く (ZipFile/PdfFile) ──
                                 ui.separator();
-                                self.render_open_with_menu(ui, p, &mut close);
+                                let _ = self.render_open_with_menu(ui, p, &mut close);
                             }
                             ui.separator();
                             if ui.button("ペースト (Ctrl+V)").clicked() {
@@ -270,20 +270,148 @@ impl crate::app::App {
         nav
     }
 
+    /// フルスクリーン表示中のコンテキストメニューを表示する。
+    /// 右クリック長押しでトリガーされる。
+    /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。
+    pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> bool {
+        let idx = match self.fs_context_menu_idx {
+            Some(i) => i,
+            None => return false,
+        };
+
+        let item = match self.items.get(idx) {
+            Some(item) => item.clone(),
+            None => {
+                self.fs_context_menu_idx = None;
+                return false;
+            }
+        };
+
+        let mut close = false;
+        let mut close_fullscreen = false;
+        let pos = self.fs_context_menu_pos;
+
+        let mut open = true;
+        egui::Window::new("fs_context_menu")
+            .id(egui::Id::new("fs_ctx_menu"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_pos(pos)
+            .order(egui::Order::Tooltip)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(200.0);
+
+                match &item {
+                    GridItem::Image(p) | GridItem::Video(p) => {
+                        if ui.button("パスをコピー").clicked() {
+                            ctx.copy_text(p.to_string_lossy().to_string());
+                            close = true;
+                        }
+                        if ui.button("ファイル名をコピー").clicked() {
+                            let name = p.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            ctx.copy_text(name);
+                            close = true;
+                        }
+                        if matches!(item, GridItem::Image(_)) {
+                            if ui.button("画像をクリップボードにコピー").clicked() {
+                                copy_image_to_clipboard(p);
+                                close = true;
+                            }
+                        }
+                        if ui.button("フォルダを開く").clicked() {
+                            open_folder_in_explorer(p);
+                            close = true;
+                        }
+                        // ── アプリケーションで開く ──
+                        ui.separator();
+                        close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
+                    }
+                    GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        if ui.button("パスをコピー").clicked() {
+                            ctx.copy_text(p.to_string_lossy().to_string());
+                            close = true;
+                        }
+                        if ui.button("フォルダを開く").clicked() {
+                            open_folder_in_explorer(p);
+                            close = true;
+                        }
+                        // ── アプリケーションで開く ──
+                        ui.separator();
+                        close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
+                    }
+                    GridItem::ZipImage { zip_path, entry_name } => {
+                        let display = format!("{}:{}", zip_path.display(), entry_name);
+                        if ui.button("パスをコピー").clicked() {
+                            ctx.copy_text(display);
+                            close = true;
+                        }
+                        let basename = crate::zip_loader::entry_basename(entry_name);
+                        if ui.button("ファイル名をコピー").clicked() {
+                            ctx.copy_text(basename.to_string());
+                            close = true;
+                        }
+                        if ui.button("画像をクリップボードにコピー").clicked() {
+                            if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                                copy_image_bytes_to_clipboard(&bytes);
+                            }
+                            close = true;
+                        }
+                    }
+                    GridItem::PdfPage { pdf_path, page_num } => {
+                        let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
+                        if ui.button("パスをコピー").clicked() {
+                            ctx.copy_text(display);
+                            close = true;
+                        }
+                        if ui.button("ページ名をコピー").clicked() {
+                            ctx.copy_text(format!("Page {}", page_num + 1));
+                            close = true;
+                        }
+                    }
+                    GridItem::Folder(_) | GridItem::ZipSeparator { .. } => {
+                        close = true;
+                    }
+                }
+
+                // メニュー外クリックで閉じる
+                // 右クリック長押しからの遷移時、右ボタンのリリースで
+                // secondary_clicked() が発火するため、左クリックのみで判定する
+                if ui.input(|i| i.pointer.primary_clicked()) && !ui.ui_contains_pointer() {
+                    close = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+
+        if close || !open {
+            self.fs_context_menu_idx = None;
+            self.cached_handlers = None;
+        }
+        close_fullscreen
+    }
+
     /// 「アプリケーションで開く」サブメニューを描画する。
     /// Image / ZipFile / PdfFile で共通のロジック。
+    /// アプリが起動された場合は true を返す。
     fn render_open_with_menu(
         &mut self,
         ui: &mut egui::Ui,
         file_path: &std::path::Path,
         close: &mut bool,
-    ) {
+    ) -> bool {
         let ext = file_path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| format!(".{}", e.to_lowercase()))
             .unwrap_or_default();
         let file_path_owned = file_path.to_path_buf();
+        let mut app_launched = false;
 
         // 直近使用アプリ（最大3件）
         for recent in self.settings.recent_open_with_apps.clone() {
@@ -296,6 +424,7 @@ impl crate::app::App {
                 );
                 self.settings.save();
                 *close = true;
+                app_launched = true;
             }
         }
 
@@ -314,6 +443,7 @@ impl crate::app::App {
                             );
                             self.settings.save();
                             *close = true;
+                            app_launched = true;
                         }
                     }
                     ui.separator();
@@ -337,6 +467,7 @@ impl crate::app::App {
                         );
                         self.settings.save();
                         *close = true;
+                        app_launched = true;
                     }
                 }
 
@@ -358,6 +489,7 @@ impl crate::app::App {
                     }
                 }
             });
+        app_launched
     }
 
     /// チェック済みアイテムのパスを収集する。

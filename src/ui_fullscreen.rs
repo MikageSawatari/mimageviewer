@@ -394,6 +394,12 @@ impl App {
                         );
                         if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
                         if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
+
+                        // ── フルスクリーン用コンテキストメニュー ──
+                        if self.show_fs_context_menu(ctx) {
+                            close_fs = true;
+                        }
+
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
@@ -894,8 +900,8 @@ impl App {
                 self.fs_pan = egui::Vec2::ZERO;
                 self.fs_free_rotation = 0.0;
                 self.maybe_rerender_pdf(1.0);
-            } else if !has_transform {
-                // 変形なし: 従来の動画/画像クリック動作
+            } else if !has_transform && self.fs_context_menu_idx.is_none() {
+                // 変形なし: 従来の動画/画像クリック動作（コンテキストメニュー表示中は無効）
                 let was_dragging = fs_response.dragged() && fs_response.drag_delta().length() > 3.0;
                 if !was_dragging {
                     if state.is_video {
@@ -920,8 +926,40 @@ impl App {
             }
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
-        if fs_response.secondary_clicked() && !self.analysis_mode {
-            close = true;
+        // コンテキストメニュー表示中は右クリック処理をスキップ
+        if !self.analysis_mode && self.fs_context_menu_idx.is_none() {
+            let secondary_down = ctx.input(|i| i.pointer.secondary_down());
+            let secondary_released = ctx.input(|i| i.pointer.secondary_released());
+
+            if secondary_down && self.fs_secondary_press_start.is_none() {
+                // 押下開始を記録
+                let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+                self.fs_secondary_press_start = Some((std::time::Instant::now(), pos));
+            }
+
+            if let Some((start_time, start_pos)) = self.fs_secondary_press_start {
+                let elapsed = start_time.elapsed();
+                let current_pos = ctx.input(|i| {
+                    i.pointer.interact_pos().unwrap_or(start_pos)
+                });
+                let moved = current_pos.distance(start_pos);
+
+                if !secondary_released && elapsed >= std::time::Duration::from_millis(400) && moved < 20.0 {
+                    // 長押ししきい値超過 → 押下中にコンテキストメニューを即表示
+                    self.fs_context_menu_idx = self.fullscreen_idx;
+                    self.fs_context_menu_pos = current_pos;
+                    self.fs_secondary_press_start = None;
+                } else if secondary_released {
+                    if moved < 20.0 && elapsed < std::time::Duration::from_millis(400) {
+                        // 短押し → 従来通り閉じる
+                        close = true;
+                    }
+                    self.fs_secondary_press_start = None;
+                } else if moved >= 20.0 {
+                    // マウスが動きすぎた → キャンセル
+                    self.fs_secondary_press_start = None;
+                }
+            }
         }
 
         (nav_delta, close)
@@ -1007,6 +1045,17 @@ impl App {
         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
         if image_loading || pdf_rerendering {
             ctx.request_repaint();
+        }
+
+        // 右クリック長押し検出中: しきい値チェックのため再描画をリクエスト
+        if let Some((start_time, _)) = self.fs_secondary_press_start {
+            let remaining = std::time::Duration::from_millis(400)
+                .saturating_sub(start_time.elapsed());
+            if remaining.is_zero() {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(remaining);
+            }
         }
 
         // アニメーション: 次フレームの時刻まで待ってから再描画
