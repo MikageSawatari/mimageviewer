@@ -32,6 +32,12 @@ pub mod zip_loader;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
+    if std::env::args().any(|a| a == "--pdf-worker") {
+        pdf_loader::run_worker_process();
+        std::process::exit(0);
+    }
+
     data_dir::init();
 
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化

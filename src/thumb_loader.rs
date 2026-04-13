@@ -168,9 +168,14 @@ pub fn decode_image_for_thumb(
     path: &std::path::Path,
     display_px: u32,
 ) -> Option<egui::ColorImage> {
-    let img = image::open(path).ok().or_else(|| {
-        crate::wic_decoder::decode_to_dynamic_image(path)
-    })?;
+    // JPEG なら TurboJPEG で高速デコードを試す
+    let img = if is_jpeg_ext(path) {
+        decode_jpeg_turbo_from_path(path)
+    } else {
+        None
+    };
+    let img = img.or_else(|| image::open(path).ok())
+        .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
     Some(resize_to_display_color_image(&img, display_px))
 }
 
@@ -243,6 +248,46 @@ fn orientation_from_text(text: &str) -> Option<u16> {
     if t.contains("mirrored horizontally") { return Some(2); }
     if t.contains("mirrored vertically") { return Some(4); }
     None
+}
+
+// -----------------------------------------------------------------------
+// TurboJPEG 高速デコード
+// -----------------------------------------------------------------------
+
+/// JPEG ファイルを TurboJPEG (libjpeg-turbo) でデコードする。
+/// SIMD 最適化により image クレートの純粋 Rust デコーダーより 2-4 倍高速。
+/// 失敗時は None を返す（呼び出し側で image クレートにフォールバック）。
+fn decode_jpeg_turbo_from_path(path: &Path) -> Option<image::DynamicImage> {
+    let data = std::fs::read(path).ok()?;
+    decode_jpeg_turbo_from_bytes(&data)
+}
+
+/// バイト列から JPEG を TurboJPEG でデコードする（ZIP 内 JPEG 用）。
+fn decode_jpeg_turbo_from_bytes(data: &[u8]) -> Option<image::DynamicImage> {
+    let img: image::RgbImage = turbojpeg::decompress_image(data).ok()?;
+    Some(image::DynamicImage::ImageRgb8(img))
+}
+
+/// パスの拡張子が JPEG かどうかを判定する。
+fn is_jpeg_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| {
+            let lower = s.to_ascii_lowercase();
+            lower == "jpg" || lower == "jpeg" || lower == "jpe" || lower == "jfif"
+        })
+        .unwrap_or(false)
+}
+
+/// エントリ名の拡張子が JPEG かどうかを判定する。
+fn is_jpeg_entry(name: &str) -> bool {
+    if let Some(dot_pos) = name.rfind('.') {
+        let ext = &name[dot_pos + 1..];
+        let lower = ext.to_ascii_lowercase();
+        lower == "jpg" || lower == "jpeg" || lower == "jpe" || lower == "jfif"
+    } else {
+        false
+    }
 }
 
 fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
@@ -594,24 +639,42 @@ pub fn load_one_cached(
             crate::zip_loader::read_entry_bytes(path, entry_name)
                 .map_err(image::ImageError::IoError)
         };
-        bytes_result.and_then(|bytes| image::load_from_memory(&bytes))
+        bytes_result.and_then(|bytes| {
+            // JPEG なら TurboJPEG で高速デコードを試す
+            if is_jpeg_entry(entry_name) {
+                if let Some(img) = decode_jpeg_turbo_from_bytes(&bytes) {
+                    return Ok(img);
+                }
+            }
+            image::load_from_memory(&bytes)
+        })
     } else {
-        let primary = image::open(path).or_else(|_| {
-            use std::io::BufReader;
-            let f = std::fs::File::open(path)?;
-            image::ImageReader::new(BufReader::new(f))
-                .with_guessed_format()
-                .map_err(image::ImageError::IoError)?
-                .decode()
-        });
-        // image クレートが失敗した場合に WIC を試す
-        // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため)
-        match primary {
-            Ok(img) => Ok(img),
-            Err(e) => match crate::wic_decoder::decode_to_dynamic_image(path) {
-                Some(img) => Ok(img),
-                None => Err(e),
-            },
+        // 通常ファイル: JPEG なら TurboJPEG を最初に試す
+        let turbo_result = if is_jpeg_ext(path) {
+            decode_jpeg_turbo_from_path(path)
+        } else {
+            None
+        };
+        if let Some(img) = turbo_result {
+            Ok(img)
+        } else {
+            let primary = image::open(path).or_else(|_| {
+                use std::io::BufReader;
+                let f = std::fs::File::open(path)?;
+                image::ImageReader::new(BufReader::new(f))
+                    .with_guessed_format()
+                    .map_err(image::ImageError::IoError)?
+                    .decode()
+            });
+            // image クレートが失敗した場合に WIC を試す
+            // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため)
+            match primary {
+                Ok(img) => Ok(img),
+                Err(e) => match crate::wic_decoder::decode_to_dynamic_image(path) {
+                    Some(img) => Ok(img),
+                    None => Err(e),
+                },
+            }
         }
     };
 
