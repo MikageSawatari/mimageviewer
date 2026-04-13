@@ -63,7 +63,8 @@ Windows 向け高速サムネイルビューワー
 
 - **言語**: Rust (edition 2024)
 - **GUI**: eframe / egui (wgpu バックエンド)
-- **PDF エンジン**: PDFium（exe に埋め込み）
+- **JPEG 高速デコード**: TurboJPEG (libjpeg-turbo, SIMD スタティックリンク)
+- **PDF エンジン**: PDFium（exe に埋め込み、3 プロセス並列レンダリング）
 - **サムネイルキャッシュ**: SQLite + WebP
 
 ## 更新履歴

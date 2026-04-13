@@ -106,7 +106,7 @@ fn parse_args() -> Args {
 struct FolderContents {
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
-    existing_keys: HashSet<String>,
+    _existing_keys: HashSet<String>,
     counts: ItemCounts,
 }
 
@@ -174,7 +174,7 @@ fn scan_folder(path: &Path) -> FolderContents {
     });
 
     let mut counts = ItemCounts::default();
-    let folder_count = folders.len();
+    let _folder_count = folders.len();
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
 
@@ -224,7 +224,7 @@ fn scan_folder(path: &Path) -> FolderContents {
     FolderContents {
         items,
         image_metas,
-        existing_keys,
+        _existing_keys: existing_keys,
         counts,
     }
 }
@@ -237,7 +237,7 @@ fn scan_zip_as_folder(zip_path: &Path) -> FolderContents {
             return FolderContents {
                 items: Vec::new(),
                 image_metas: Vec::new(),
-                existing_keys: HashSet::new(),
+                _existing_keys: HashSet::new(),
                 counts: ItemCounts::default(),
             };
         }
@@ -258,7 +258,7 @@ fn scan_zip_as_folder(zip_path: &Path) -> FolderContents {
         counts.images += 1;
     }
 
-    FolderContents { items, image_metas, existing_keys, counts }
+    FolderContents { items, image_metas, _existing_keys: existing_keys, counts }
 }
 
 /// PDF ファイルを仮想フォルダとして走査 (同期版)
@@ -278,7 +278,7 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
     let mut existing_keys: HashSet<String> = HashSet::new();
-    let mut counts = ItemCounts { pdfs: page_count as usize, ..Default::default() };
+    let counts = ItemCounts { pdfs: page_count as usize, ..Default::default() };
 
     for page in 0..page_count {
         let key = mimageviewer::grid_item::pdf_page_cache_key(page);
@@ -290,7 +290,7 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
         image_metas.push(Some((mtime, file_size)));
     }
 
-    FolderContents { items, image_metas, existing_keys, counts }
+    FolderContents { items, image_metas, _existing_keys: existing_keys, counts }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -469,7 +469,7 @@ fn run_bench(
     contents: &FolderContents,
     cache_map: Arc<RwLock<HashMap<String, catalog::CacheEntry>>>,
     catalog_arc: Option<Arc<CatalogDb>>,
-    label: &str,
+    _label: &str,
 ) -> BenchResult {
     let cols = args.cols;
     let rows = args.rows;
@@ -494,7 +494,7 @@ fn run_bench(
 
     let thumb_px = 512u32;
     let thumb_quality = 75u8;
-    let display_px = 512u32;
+    let _display_px = 512u32;
     let cache_decision = CacheDecision {
         policy: CachePolicy::Auto,
         threshold_ms: 25,

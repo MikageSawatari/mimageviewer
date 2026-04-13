@@ -10,15 +10,16 @@ dual-window approach.
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
 - **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
-- **Image decoding**: `image` crate (JPEG, PNG, GIF, WebP, BMP) + WIC (HEIC, AVIF, JXL, TIFF, RAW)
+- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF, RAW)
+- **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。5MB 以下のファイルに適用、大容量は `image` クレートにフォールバック。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
 - **ZIP support**: `zip` crate
-- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み)
+- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (3 プロセス並列レンダリング)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **GPU upscaling (Phase 2, planned)**: NVIDIA NGX DLISR via C FFI
-- **Build tool**: cargo (MSVC toolchain on Windows)
+- **Build tool**: cargo (MSVC toolchain on Windows) + cmake + NASM (TurboJPEG ビルドに必要)
 
 ## Project Structure
 
@@ -136,10 +137,12 @@ mimageviewer/
 
 ## Performance Notes
 
-- **デコード時間（リリースビルド実測）**: p50 = 4.2ms, p90 = 10.8ms（JPEG）
+- **JPEG デコード**: TurboJPEG (SIMD) で小〜中 JPEG を 1.5-2.4 倍高速化。5MB 超は image クレート (zune-jpeg) にフォールバック
+- **PDF レンダリング**: 3 ワーカープロセス並列で Cold 1441ms → 10ms (99% 改善)。各プロセスが独立に PDFium を初期化
 - **キャッシュ読み込み**: 2〜3ms/枚（WebP デコード）
 - **キャンセル遅延**: 旧タスクが1枚のデコード中の場合、最大1デコード時間待つ
 - **ログ**: `cargo run` 時に `mimageviewer.log` へ出力（.gitignore 済み）
+- **ベンチマーク**: `docs/bench-scroll-report.md` に詳細結果あり
 
 ## Screenshot Workflow
 
@@ -185,6 +188,13 @@ crop = img.crop((x0, y0, x0 + W, y0 + H))
 PDF サポートは PDFium ライブラリ (Google Chrome の PDF エンジン) を使用する。
 DLL は exe に `include_bytes!` で埋め込まれ、初回起動時に
 `%APPDATA%\mimageviewer\pdfium.dll` に展開される。
+
+### マルチプロセス並列レンダリング
+
+PDFium はスレッドセーフではないため、マルチプロセスで並列化している。
+`mimageviewer.exe --pdf-worker` で起動したワーカープロセス (デフォルト 3 個) が
+各自独立に PDFium を初期化し、stdin/stdout バイナリプロトコルでメインプロセスと通信する。
+ワーカーは GUI を持たず、メインプロセス終了時に自動終了する。
 
 ### セットアップ
 

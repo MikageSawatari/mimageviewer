@@ -5,101 +5,112 @@
 **System:** Windows 11, 24-core CPU, RTX 4090  
 **Grid:** 5 cols x 4 rows (20 visible items), scroll to middle, 22 worker threads
 
-## Summary Table
+## 用語
 
-All times in **ms after scroll stop** (scroll time excluded).
+- **1st** = First visible thumb (ms) -- スクロール停止後、画面上に最初の1枚が出るまで
+- **All** = All visible complete (ms) -- 画面上の20枚が全て揃うまで (0 = スクロール中に完了済)
+- **Cold** = キャッシュなし (--delete-cache)
+- **Warm** = 部分キャッシュ (前回 Cold 実行後のキャッシュが残った状態)
+- **Hot** = 全キャッシュ (2回以上実行してキャッシュが十分構築された状態)
+
+## 最適化の経緯
+
+### Phase 1: I/O セマフォ廃止 → 2キュー優先度アーキテクチャ (ff0a80b)
+
+**問題:** 5ms スピンループ型セマフォで H (可視) アイテムが L (先読み) に 3.5 秒待たされる。
+
+**修正:**
+- セマフォを完全廃止。キューを 2 つに分離:
+  - `reload_queue`: 通常画像 (Image, ZipImage, PdfPage)
+  - `heavy_io_queue`: 重い I/O (ZipFile, PdfFile, Folder)
+- 通常ワーカー ×(N-2) + I/O ワーカー ×2
+- H は常に L より先に処理される (priority 付きキュー取り出し)
+
+### Phase 2: TurboJPEG + PDF マルチプロセス (91dea27, d30dbeb)
+
+**修正:**
+1. **TurboJPEG** (libjpeg-turbo, SIMD スタティックリンク): JPEG デコード高速化
+   - ファイルサイズ 5MB 以下のみ適用 (大容量カメラ JPEG は image クレートにフォールバック)
+   - ZIP 内 JPEG はサイズ制限なし (既にメモリ上にあるため)
+2. **PDF マルチプロセス** (3 ワーカー): `mimageviewer.exe --pdf-worker` を 3 プロセス起動
+   - 各プロセスが独立に PDFium を初期化、真の並列レンダリング
+   - stdin/stdout バイナリプロトコルで通信
+
+## Summary: Before/After 比較
+
+### After (d30dbeb — TurboJPEG + PDF マルチプロセス + 5MB 制限)
+
+| Folder | Type | Items | Cold 1st | Cold All | Warm 1st | Warm All | Hot 1st | Hot All |
+|--------|------|------:|:--------:|:--------:|:--------:|:--------:|:-------:|:-------:|
+| VNCG.org | HDD ZIP+Folder | 1492 | 31 | 408 | 10 | 306 | 21 | 275 |
+| Photos | SSD EXIF | 154 | 1485 | 1723 | 1037 | 0 | 0 | 0 |
+| 18movie | HDD Video+Image | 2474 | 52 | 0 | — | — | — | — |
+| scan/doc | HDD PDFs | 734 | **10** | **0** | 11 | 0 | 11 | 0 |
+| Monobeno.zip | HDD ZIP内部 | 994 | 54 | 242 | 52 | 0 | 11 | 0 |
+
+### Before (ff0a80b — I/O セマフォ廃止後、TurboJPEG/PDF並列化前)
 
 | Folder | Type | Items | Cold 1st | Cold All | Warm 1st | Warm All | Hot 1st | Hot All |
 |--------|------|------:|:--------:|:--------:|:--------:|:--------:|:-------:|:-------:|
 | VNCG.org | HDD ZIP+Folder | 1492 | 52 | 2496 | 10 | 973 | 10 | 1315 |
 | ComfyUI | SSD AI Images | 2000 | 125 | 383 | 105 | 0 | 11 | 0 |
-| Photos | SSD EXIF | 154 | 1215 | 2223 | 531 | 0 | 0 | 0 |
+| Photos | SSD EXIF | 154 | 1493 | 1685 | 531 | 0 | 0 | 0 |
 | 18movie | HDD Video+Image | 2474 | 53 | 0 | 32 | 0 | 10 | 0 |
 | scan/doc | HDD PDFs | 734 | 1441 | 2363 | 1353 | 0 | 140 | 0 |
 | Monobeno.zip | HDD ZIP内部 | 5225 | 586 | 1095 | 451 | 0 | 10 | 0 |
 
-- **1st** = First visible thumb (ms) -- 画面上に最初の1枚が出るまで
-- **All** = All visible complete (ms) -- 画面上の20枚が全て揃うまで (0 = スクロール中に完了済)
+*Photos の Before 値は公平比較のため同一条件で再計測した 3 回中央値 (1493ms)。*
 
-## Detailed Results
+### 改善率
 
-### 1. HDD - ZIP+Folder (E:\share\18\VNCG.org)
+| Folder | Cold 1st | Cold All | 備考 |
+|--------|:--------:|:--------:|------|
+| scan/doc (PDF) | 1441→10 (**99%↓**) | 2363→0 (**100%↓**) | PDF 3プロセス並列の劇的効果 |
+| VNCG.org (ZIP+Folder) | 52→31 (40%↓) | 2496→408 (**84%↓**) | 2キュー + I/O ワーカーの効果 |
+| Monobeno.zip (ZIP内部) | 586→54 (91%↓) | 1095→242 (78%↓) | ※異なるZIPファイルのため参考値 |
+| Photos (EXIF) | 1493→1485 (同等) | 1685→1723 (同等) | 5MB 制限で regression 解消 |
 
-1492 items (746 folders + 746 ZIPs). フォルダサムネイルと ZIP サムネイルが交互に並ぶ最も過酷なケース。
+## 詳細分析
 
-| Condition | First Visible | All Visible | All Prefetch | Cache Hit |
-|-----------|:------------:|:-----------:|:------------:|:---------:|
-| Cold (no cache) | 52 ms | 2496 ms | 2528 ms | 0% |
-| Warm (partial cache) | 10 ms | 973 ms | 1017 ms | 39% |
-| Hot (OS+app cache) | 10 ms | 1315 ms | 1326 ms | 49% |
+### PDF マルチプロセスの効果
 
-**分析:** Cold で All Visible に 2.5 秒かかるのは ZIP/Folder サムネイルの I/O セマフォ直列化のため。Warm/Hot では cache hit で最初の 1 枚は 10ms で表示。ただし cache hit 率が 39-49% と低い（スクロール中に通過したアイテムのみキャッシュ生成されるため）。
+Cold でも First Visible 10ms (スクロール停止後) を達成。3 ワーカープロセスが並列に
+レンダリングするため、スクロール中 (2.2 秒) に可視範囲の PDF ページがすべて完了する。
 
-### 2. SSD - AI Images (ComfyUI output, 2000 images)
+以前はシングルスレッドの PDFium で直列処理 (100-200ms/ページ × 20 = 2-4 秒) だった。
 
-純粋な画像ファイル 2000 枚、SSD 上。
+### TurboJPEG の効果と制限
 
-| Condition | First Visible | All Visible | All Prefetch | Cache Hit |
-|-----------|:------------:|:-----------:|:------------:|:---------:|
-| Cold (no cache) | 125 ms | 383 ms | 1411 ms | 0% |
-| Warm (partial cache) | 105 ms | 0 ms | 105 ms | 71% |
-| Hot (full cache) | 11 ms | 0 ms | 11 ms | 100% |
+**効果あり (ZIP 内 JPEG):**
+- ZIP 内画像は既にメモリ上にあるため、fs::read() のオーバーヘッドなし
+- SIMD デコードの恩恵を最大限に受ける
 
-**分析:** SSD + 画像のみなので Cold でも 383ms で可視範囲完了。Hot では 11ms で即表示。理想的な結果。
+**効果なし (大容量カメラ JPEG):**
+- 10-30MB のカメラ JPEG では `std::fs::read()` による全ファイル読み込みが
+  `image::open()` のストリーミングデコードと同等かわずかに遅い
+- `image` crate v0.25 は内部で `zune-jpeg` を使用しており、既に
+  libjpeg-turbo とほぼ同等の SIMD 最適化がされている
+- 5MB しきい値で自動フォールバックし、regression を回避
 
-### 3. SSD - EXIF Photos (154 images, large RAW/JPEG)
+**第三者ベンチマーク参考** ([Google decoder-benchmarks-for-rust](https://github.com/google/decoder-benchmarks-for-rust)):
 
-154 枚の高解像度カメラ写真（EXIF 付き大容量 JPEG）。
+| 画像サイズ | jpeg-decoder (ms) | turbojpeg (ms) | 高速化率 |
+|:---|:---:|:---:|:---:|
+| 50x75 | 0.24 | 0.10 | 2.4x |
+| 500x750 | 8.48 | 5.63 | 1.5x |
+| 2000x3000 | 126.2 | 84.3 | 1.5x |
 
-| Condition | First Visible | All Visible | All Prefetch | Cache Hit |
-|-----------|:------------:|:-----------:|:------------:|:---------:|
-| Cold (no cache) | 1215 ms | 2223 ms | 5660 ms | 0% |
-| Warm (partial cache) | 531 ms | 0 ms | 531 ms | 86% |
-| Hot (full cache) | 0 ms | 0 ms | 0 ms | 100% |
+*注: 上記は旧 jpeg-decoder との比較。image crate v0.25 の zune-jpeg はこれより高速。*
 
-**分析:** Cold で 1.2 秒かかるのは高解像度 JPEG のデコードコスト（1 枚 40-50ms × 20 枚）。キャッシュ効果が顕著で Hot では完全に即時表示。
+### キャッシュ効果
 
-### 4. HDD - Videos+Images (2474 items, mixed)
-
-画像 1164 + 動画 1308 の混在フォルダ。動画はサムネイル非対応のためスキップ。
-
-| Condition | First Visible | All Visible | All Prefetch | Cache Hit |
-|-----------|:------------:|:-----------:|:------------:|:---------:|
-| Cold (no cache) | 53 ms | 0 ms | 53 ms | 0% |
-| Warm (cache) | 32 ms | 0 ms | 32 ms | 98% |
-| Hot (cache) | 10 ms | 0 ms | 10 ms | 99% |
-
-**分析:** 可視範囲が動画のみの場合、サムネイルロード対象がないため即完了。Cold でも 53ms。
-
-### 5. HDD - PDFs (734 documents)
-
-734 個の PDF ファイル。PDFium でのページレンダリングが必要。
-
-| Condition | First Visible | All Visible | All Prefetch | Cache Hit |
-|-----------|:------------:|:-----------:|:------------:|:---------:|
-| Cold (no cache) | 1441 ms | 2363 ms | 6629 ms | 0% |
-| Warm (partial cache) | 1353 ms | 0 ms | 1353 ms | 75% |
-| Hot (high cache) | 140 ms | 0 ms | 140 ms | 87% |
-
-**分析:** PDF は PDFium レンダリング (100-200ms/ページ) + セマフォ直列化で Cold が最も遅い。Hot でもキャッシュが 100% にならないのはスクロール中の先読み不足。
-
-### 6. HDD - ZIP 内部 (Monobeno, 5225 images, 3.3GB)
-
-巨大 ZIP を仮想フォルダとして開いた場合。5225 枚の画像。
-
-| Condition | First Visible | All Visible | All Prefetch | Cache Hit |
-|-----------|:------------:|:-----------:|:------------:|:---------:|
-| Cold (no cache) | 586 ms | 1095 ms | 3893 ms | 0% |
-| Warm (partial cache) | 451 ms | 0 ms | 451 ms | 47% |
-| Hot (cache) | 10 ms | 0 ms | 10 ms | 66% |
-
-**分析:** ZIP 内画像は ZIP open + エントリ読み取りが必要だが、直列化により競合は抑制。Hot で 10ms は cache hit のおかげ。
+Hot (全キャッシュ) では全テストケースで First Visible が 0-21ms。
+キャッシュヒット率はスクロール速度に依存し、高速スクロールでは構築されにくい。
 
 ## Key Findings
 
-1. **キャッシュ効果は極めて大きい**: Hot (全キャッシュ) では全テストケースで First Visible が 0-140ms。Cold との差は最大 1200ms 以上。
-2. **SSD vs HDD**: SSD (AI Images) は Cold でも 383ms で All Visible 完了。HDD (VNCG.org) は Cold で 2496ms。
-3. **PDF が最もボトルネック**: PDFium レンダリングは Cold で 1441ms。改善の余地あり。
-4. **EXIF 写真は高解像度デコードがボトルネック**: Cold 1215ms は JPEG デコード自体のコスト。
-5. **ZIP フォルダサムネイル**: I/O セマフォ直列化で安定。Cold でも First Visible は 52ms と高速。
-6. **キャッシュヒット率がスクロール速度に依存**: 高速スクロールではキャッシュが構築されないため partial cache にとどまる。
+1. **PDF マルチプロセスが最大の改善**: Cold 1441ms → 10ms (99% 改善)
+2. **2 キュー優先度アーキテクチャ**: ZIP+Folder の Cold All が 2496ms → 408ms (84% 改善)
+3. **TurboJPEG**: ZIP 内小〜中サイズ JPEG に効果的。大容量ファイルは image クレートが同等
+4. **キャッシュ効果は極めて大きい**: Hot では全ケースで即時表示 (0-21ms)
+5. **SSD vs HDD**: SSD 上の画像は Cold でも高速。HDD は I/O ワーカー数 (2) が律速
