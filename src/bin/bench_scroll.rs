@@ -487,10 +487,10 @@ fn run_bench(
     let display_px_shared = Arc::new(AtomicU32::new(512));
     let keep_start_shared = Arc::new(AtomicUsize::new(0));
     let keep_end_shared = Arc::new(AtomicUsize::new(0));
-    let heavy_io_semaphore = Arc::new(AtomicUsize::new(0));
     let cache_gen_done = Arc::new(AtomicUsize::new(0));
     let stats = Arc::new(Mutex::new(ThumbStats::new()));
     let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let heavy_io_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
 
     let thumb_px = 512u32;
     let thumb_quality = 75u8;
@@ -507,9 +507,11 @@ fn run_bench(
     // 結果チャネル
     let (tx, rx) = mpsc::channel::<ThumbMsg>();
 
-    // ワーカー起動 (app.rs の spawn_thumbnail_workers と同じ)
-    for worker_idx in 0..args.threads {
-        let queue = Arc::clone(&reload_queue);
+    // ワーカー起動 (app.rs の spawn_thumbnail_workers と同じ 2 種類)
+    let io_threads = if args.threads <= 4 { 1 } else { 2 };
+    let regular_threads = args.threads.saturating_sub(io_threads).max(1);
+
+    let spawn_worker = |queue: Arc<Mutex<Vec<LoadRequest>>>| {
         let tx_w = tx.clone();
         let cancel_w = Arc::clone(&cancel);
         let hint_w = Arc::clone(&scroll_hint);
@@ -520,13 +522,10 @@ fn run_bench(
         let stats_w = Arc::clone(&stats);
         let ks_w = Arc::clone(&keep_start_shared);
         let ke_w = Arc::clone(&keep_end_shared);
-        let sem_w = Arc::clone(&heavy_io_semaphore);
 
         std::thread::spawn(move || {
             loop {
-                if cancel_w.load(Ordering::Relaxed) {
-                    break;
-                }
+                if cancel_w.load(Ordering::Relaxed) { break; }
                 let req_opt: Option<LoadRequest> = {
                     let mut q = queue.lock().unwrap();
                     if q.is_empty() {
@@ -547,33 +546,17 @@ fn run_bench(
                         Some(q.swap_remove(best))
                     }
                 };
-
                 match req_opt {
                     Some(req) => {
-                        if cancel_w.load(Ordering::Relaxed) {
-                            break;
-                        }
+                        if cancel_w.load(Ordering::Relaxed) { break; }
                         let ks = ks_w.load(Ordering::Relaxed);
                         let ke = ke_w.load(Ordering::Relaxed);
-                        if req.idx < ks || req.idx >= ke {
-                            continue;
-                        }
+                        if req.idx < ks || req.idx >= ke { continue; }
                         let dp = display_px_w.load(Ordering::Relaxed);
                         process_load_request(
-                            &req,
-                            &cache_map_w,
-                            &tx_w,
-                            catalog_w.as_deref(),
-                            thumb_px,
-                            thumb_quality,
-                            dp,
-                            cache_decision,
-                            &done_w,
-                            &stats_w,
-                            Some(&cancel_w),
-                            &ks_w,
-                            &ke_w,
-                            &sem_w,
+                            &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
+                            thumb_px, thumb_quality, dp, cache_decision, &done_w, &stats_w,
+                            Some(&cancel_w), &ks_w, &ke_w,
                         );
                     }
                     None => {
@@ -582,6 +565,15 @@ fn run_bench(
                 }
             }
         });
+    };
+
+    // 通常ワーカー: reload_queue
+    for _ in 0..regular_threads {
+        spawn_worker(Arc::clone(&reload_queue));
+    }
+    // I/O ワーカー: heavy_io_queue
+    for _ in 0..io_threads {
+        spawn_worker(Arc::clone(&heavy_io_queue));
     }
     drop(tx); // メインスレッドの tx を閉じる
 
@@ -632,14 +624,26 @@ fn run_bench(
         }
 
         if !new_reqs.is_empty() {
-            let mut q = reload_queue.lock().unwrap();
-            q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
-            for r in q.iter_mut() {
-                r.priority = r.idx >= vis_first && r.idx < vis_end;
-            }
+            let mut regular: Vec<LoadRequest> = Vec::new();
+            let mut heavy: Vec<LoadRequest> = Vec::new();
             for r in new_reqs {
-                requested.insert(r.idx);
-                q.push(r);
+                let is_heavy = matches!(
+                    contents.items.get(r.idx),
+                    Some(GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::Folder(_))
+                );
+                if is_heavy { heavy.push(r); } else { regular.push(r); }
+            }
+            {
+                let mut q = reload_queue.lock().unwrap();
+                q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
+                for r in q.iter_mut() { r.priority = r.idx >= vis_first && r.idx < vis_end; }
+                for r in regular { requested.insert(r.idx); q.push(r); }
+            }
+            {
+                let mut q = heavy_io_queue.lock().unwrap();
+                q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
+                for r in q.iter_mut() { r.priority = r.idx >= vis_first && r.idx < vis_end; }
+                for r in heavy { requested.insert(r.idx); q.push(r); }
             }
         }
 

@@ -300,7 +300,6 @@ pub fn process_load_request(
     cancel: Option<&Arc<AtomicBool>>,
     keep_start: &Arc<AtomicUsize>,
     keep_end: &Arc<AtomicUsize>,
-    heavy_io_semaphore: &Arc<AtomicUsize>,
 ) {
     // カタログキー:
     // - 通常画像: ファイル名 (例: "foo.jpg")
@@ -358,50 +357,8 @@ pub fn process_load_request(
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
     // load_one_cached は from_cache = false を送信する
 
-    // ── stale チェック + I/O セマフォ (重い処理用) ─────────────────
-    // フォルダサムネイル・ZipFile サムネイルは HDD シークを伴う重い I/O。
-    // 12 ワーカーが同時に HDD を叩くとヘッド競合で 1 件あたり数十秒かかるため、
-    // セマフォで同時実行数を制限する。
-    // priority=H (可視範囲) のリクエストはセマフォ制限なしで即座に通す。
-    // priority=L (先読み) のリクエストのみ同時 1 件に制限する。
-    // また I/O 開始前に keep_range を再確認し、スクロールで範囲外になった
-    // リクエストは処理せずスキップする。
-
-    /// セマフォを acquire し、Guard が drop されると自動 release する。
-    struct SemGuard<'a>(&'a Arc<AtomicUsize>);
-    impl<'a> SemGuard<'a> {
-        fn acquire(sem: &'a Arc<AtomicUsize>, max: usize,
-                   cancel: Option<&Arc<AtomicBool>>,
-                   keep_s: &Arc<AtomicUsize>, keep_e: &Arc<AtomicUsize>,
-                   idx: usize) -> Option<Self> {
-            loop {
-                // キャンセル or stale → 諦める
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return None;
-                }
-                let ks = keep_s.load(Ordering::Relaxed);
-                let ke = keep_e.load(Ordering::Relaxed);
-                if idx < ks || idx >= ke {
-                    return None;
-                }
-                let cur = sem.load(Ordering::Relaxed);
-                if cur < max {
-                    if sem.compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                        return Some(SemGuard(sem));
-                    }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        }
-    }
-    impl Drop for SemGuard<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::Release);
-        }
-    }
-
-    // 重い I/O が必要かどうか判定
+    // 重い I/O (ZIP/Folder) は専用 I/O ワーカーキューで処理されるため、
+    // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
     let is_folder_thumb = req.cache_key_override.as_deref()
         .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER));
     let is_zip_thumb = !is_folder_thumb
@@ -409,26 +366,6 @@ pub fn process_load_request(
         && req.cache_key_override.is_some()
         && req.pdf_page.is_none();
     let needs_heavy_io = is_folder_thumb || is_zip_thumb;
-
-    // 重い I/O: セマフォで同時 1 件に制限 (priority 問わず)。
-    // ベンチマーク結果: ZIP resolve は直列なら 3-18ms だが、並列だと HDD シーク
-    // 競合で 1-30 秒に膨れ上がる。直列化が最善。
-    // + stale チェック
-    let _sem_guard = if needs_heavy_io {
-        match SemGuard::acquire(heavy_io_semaphore, 1, cancel.as_ref().copied(),
-                                keep_start, keep_end, req.idx) {
-            Some(g) => Some(g),
-            None => {
-                crate::logger::log(format!(
-                    "    idx={:>4} STALE (aborted before I/O)  {}",
-                    req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                ));
-                return;
-            }
-        }
-    } else {
-        None
-    };
 
     // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
     let resolved_folder_image = if is_folder_thumb {

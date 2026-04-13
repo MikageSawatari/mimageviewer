@@ -157,7 +157,11 @@ pub struct App {
     /// アイテム idx → 画像メタデータ (mtime, file_size)。フォルダ・動画は None
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
+    /// 通常画像 (Image, ZipImage, PdfPage) 用
     pub(crate) reload_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
+    /// 重い I/O (ZipFile, PdfFile, Folder) 用の専用キュー。
+    /// 専用 I/O ワーカー (2本) が priority 順に取り出す。
+    pub(crate) heavy_io_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
     pub(crate) requested: std::collections::HashMap<usize, bool>,
@@ -463,6 +467,7 @@ impl Default for App {
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
             reload_queue: None,
+            heavy_io_queue: None,
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
@@ -1004,12 +1009,15 @@ impl App {
 
         // ── 永続ワーカー + (必要なら) 動画スレッドを起動 ──
         let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let heavy_io_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
         self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
 
         self.spawn_thumbnail_workers(
             &tx,
             Arc::clone(&cancel),
             reload_queue,
+            heavy_io_queue,
             cache_map,
             catalog_arc,
         );
@@ -1046,10 +1054,15 @@ impl App {
         tx: &mpsc::Sender<ThumbMsg>,
         cancel: Arc<AtomicBool>,
         reload_queue: Arc<Mutex<Vec<LoadRequest>>>,
+        heavy_io_queue: Arc<Mutex<Vec<LoadRequest>>>,
         cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
     ) {
-        let thumb_threads = self.settings.parallelism.thread_count();
+        let total_threads = self.settings.parallelism.thread_count();
+        // I/O ワーカー数: 2 本 (HDD シーク競合と並列性のバランス)
+        // ただし全体が 4 本以下なら 1 本に制限
+        let io_threads = if total_threads <= 4 { 1 } else { 2 };
+        let regular_threads = total_threads.saturating_sub(io_threads).max(1);
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
         let cache_decision = CacheDecision::from_settings(&self.settings);
@@ -1059,14 +1072,15 @@ impl App {
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
         let keep_start_shared = Arc::clone(&self.keep_start_shared);
         let keep_end_shared = Arc::clone(&self.keep_end_shared);
-        // ZIP/フォルダの重い I/O を同時 2 件に制限するセマフォ。
-        // HDD ではヘッドシーク競合、NW ドライブではレイテンシ累積を防ぐ。
-        let heavy_io_semaphore = Arc::new(AtomicUsize::new(0));
 
-        crate::logger::log(format!("  spawning {thumb_threads} persistent workers"));
+        crate::logger::log(format!(
+            "  spawning {} regular + {} I/O workers",
+            regular_threads, io_threads,
+        ));
 
-        for worker_idx in 0..thumb_threads {
-            let queue = Arc::clone(&reload_queue);
+        // ── 共通のワーカーループ本体 ──
+        // queue を受け取り、priority 順に取り出して process_load_request を呼ぶ。
+        let spawn_worker = |worker_idx: usize, prefix: &str, queue: Arc<Mutex<Vec<LoadRequest>>>| {
             let tx_w = tx.clone();
             let cancel_w = Arc::clone(&cancel);
             let hint_w = Arc::clone(&scroll_hint);
@@ -1077,10 +1091,10 @@ impl App {
             let stats_w = Arc::clone(&stats);
             let ks_w = Arc::clone(&keep_start_shared);
             let ke_w = Arc::clone(&keep_end_shared);
-            let sem_w = Arc::clone(&heavy_io_semaphore);
+            let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
-                crate::logger::log(format!("  worker {worker_idx} started"));
+                crate::logger::log(format!("  {tag} started"));
                 loop {
                     if cancel_w.load(Ordering::Relaxed) { break; }
 
@@ -1095,7 +1109,6 @@ impl App {
                                 .iter()
                                 .enumerate()
                                 .min_by_key(|(_, r)| {
-                                    // priority=true → tier 0, false → tier 1
                                     let tier: usize = if r.priority { 0 } else { 1 };
                                     let i = r.idx;
                                     let dist = if i < vis { vis - i } else { i - vis };
@@ -1110,25 +1123,20 @@ impl App {
                     match req_opt {
                         Some(req) => {
                             if cancel_w.load(Ordering::Relaxed) { break; }
-                            // keep_range 外に出たリクエストは処理せずスキップ。
-                            // スクロール中に pick したが、その後スクロールが進んで
-                            // 範囲外になった場合に、高コストな I/O (ZIP open 等) を回避する。
                             let ks = ks_w.load(Ordering::Relaxed);
                             let ke = ke_w.load(Ordering::Relaxed);
                             if req.idx < ks || req.idx >= ke {
                                 crate::logger::log(format!(
-                                    "  w{worker_idx} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
+                                    "  {tag} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
                                     req.idx,
                                     req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                                 ));
-                                // requested からは UI 側の eviction で既に除去されているが、
-                                // 念のため結果を送って poll_thumbnails で整合させる
                                 continue;
                             }
                             let vis = hint_w.load(Ordering::Relaxed);
                             let dist = if req.idx < vis { vis - req.idx } else { req.idx - vis };
                             crate::logger::log(format!(
-                                "  w{worker_idx} pick idx={:>4} pri={} dist={dist:>4}  {}",
+                                "  {tag} pick idx={:>4} pri={} dist={dist:>4}  {}",
                                 req.idx,
                                 if req.priority { "H" } else { "L" },
                                 req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
@@ -1139,17 +1147,25 @@ impl App {
                                 thumb_px, thumb_quality, display_px, cache_decision, &done_w,
                                 &stats_w,
                                 Some(&cancel_w),
-                                &ks_w, &ke_w, &sem_w,
+                                &ks_w, &ke_w,
                             );
                         }
                         None => {
-                            // キューが空: 短時間スリープしてキャンセル監視 + CPU 負荷軽減
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
                     }
                 }
-                crate::logger::log(format!("  worker {worker_idx} stopped"));
+                crate::logger::log(format!("  {tag} stopped"));
             });
+        };
+
+        // 通常ワーカー: reload_queue (Image, ZipImage, PdfPage)
+        for i in 0..regular_threads {
+            spawn_worker(i, "w", Arc::clone(&reload_queue));
+        }
+        // I/O ワーカー: heavy_io_queue (ZipFile, PdfFile, Folder)
+        for i in 0..io_threads {
+            spawn_worker(i, "io", Arc::clone(&heavy_io_queue));
         }
     }
 
@@ -1411,7 +1427,9 @@ impl App {
             .unwrap_or(total)
             .min(total);
 
-        let mut new_requests: Vec<LoadRequest> = Vec::new();
+        // 通常リクエストと重い I/O リクエストを分けて収集
+        let mut new_regular: Vec<LoadRequest> = Vec::new();
+        let mut new_heavy: Vec<LoadRequest> = Vec::new();
         for i in keep_start..keep_end {
             if self.requested.contains_key(&i) {
                 continue;
@@ -1423,7 +1441,6 @@ impl App {
             if !need_load {
                 continue;
             }
-            // 画像 / ZIP 内画像のみ要求。フォルダ・動画・セパレータはスキップ
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
@@ -1433,39 +1450,50 @@ impl App {
                 continue;
             };
             req.priority = i >= visible_raw_start && i < visible_raw_end;
-            new_requests.push(req);
+            // ZipFile / PdfFile / Folder → heavy_io_queue、それ以外 → reload_queue
+            let is_heavy = matches!(
+                self.items.get(i),
+                Some(GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::Folder(_))
+            );
+            if is_heavy {
+                new_heavy.push(req);
+            } else {
+                new_regular.push(req);
+            }
         }
-        let new_hi = new_requests.iter().filter(|r| r.priority).count();
-        let new_lo = new_requests.len() - new_hi;
+        let new_hi = new_regular.iter().chain(new_heavy.iter()).filter(|r| r.priority).count();
+        let new_lo = new_regular.len() + new_heavy.len() - new_hi;
         let t3 = frame_t0.elapsed();
         {
             let mut q = queue.lock().unwrap();
             let t3b = frame_t0.elapsed();
-            // keep_range 外のリクエストを除去 (ワーカーの無駄な処理を防ぐ)
             q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
-            // スクロールで可視範囲が変わった場合、既存キュー内の priority を更新
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
             }
-            let q_before = q.len();
-            for r in new_requests {
-                // false = 通常読み込み要求
+            let _q_before = q.len();
+            for r in new_regular {
                 self.requested.insert(r.idx, false);
                 q.push(r);
             }
-            if new_hi > 0 || new_lo > 0 {
-                let q_hi = q.iter().filter(|r| r.priority).count();
-                crate::logger::log(format!(
-                    "  [queue] push +{new_hi}H +{new_lo}L  total={} ({}H {}L)  keep=[{keep_start}..{keep_end})  vis=[{visible_raw_start}..{visible_raw_end})  requested={}",
-                    q.len(), q_hi, q.len() - q_hi, self.requested.len(),
-                ));
+        }
+        // heavy_io_queue にも同様に push
+        if let Some(hq) = self.heavy_io_queue.clone() {
+            let mut q = hq.lock().unwrap();
+            q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
+            for r in q.iter_mut() {
+                r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
             }
-            if (t3b - t3).as_millis() > 1 {
-                crate::logger::log(format!(
-                    "    [keep detail] queue.lock() waited {:.1}ms",
-                    (t3b - t3).as_secs_f64() * 1000.0,
-                ));
+            for r in new_heavy {
+                self.requested.insert(r.idx, false);
+                q.push(r);
             }
+        }
+        if new_hi > 0 || new_lo > 0 {
+            crate::logger::log(format!(
+                "  [queue] push +{new_hi}H +{new_lo}L  keep=[{keep_start}..{keep_end})  vis=[{visible_raw_start}..{visible_raw_end})  requested={}",
+                self.requested.len(),
+            ));
         }
         let t4 = frame_t0.elapsed();
 
