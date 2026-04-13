@@ -254,10 +254,22 @@ fn orientation_from_text(text: &str) -> Option<u16> {
 // TurboJPEG 高速デコード
 // -----------------------------------------------------------------------
 
+/// TurboJPEG を使うファイルサイズ上限 (5 MB)。
+/// 大容量カメラ JPEG (10-30MB) では `std::fs::read()` の全読み込みコストが
+/// `image::open()` のストリーミングデコードを上回るため、通常パスに任せる。
+/// ZIP 内 JPEG は既にメモリ上にあるためこの制限は適用しない。
+const TURBOJPEG_FILE_SIZE_LIMIT: u64 = 5 * 1024 * 1024;
+
 /// JPEG ファイルを TurboJPEG (libjpeg-turbo) でデコードする。
 /// SIMD 最適化により image クレートの純粋 Rust デコーダーより 2-4 倍高速。
-/// 失敗時は None を返す（呼び出し側で image クレートにフォールバック）。
+/// ファイルサイズが `TURBOJPEG_FILE_SIZE_LIMIT` を超える場合は None を返し、
+/// 呼び出し側で image クレートにフォールバックさせる。
 fn decode_jpeg_turbo_from_path(path: &Path) -> Option<image::DynamicImage> {
+    // 大容量ファイルは image::open() のストリーミングデコードに任せる
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > TURBOJPEG_FILE_SIZE_LIMIT {
+        return None;
+    }
     let data = std::fs::read(path).ok()?;
     decode_jpeg_turbo_from_bytes(&data)
 }
