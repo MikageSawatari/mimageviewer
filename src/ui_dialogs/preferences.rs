@@ -267,6 +267,22 @@ impl App {
                             }
                         });
 
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.heading("AI 機能");
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.settings.ai_upscale_feature, "AI アップスケールを使う");
+                    ui.checkbox(&mut self.settings.ai_denoise_feature, "AI ノイズ除去を使う");
+                    ui.checkbox(&mut self.settings.ai_inpaint_feature, "AI 見開き補完を使う");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("※ 変更はアプリ再起動後に反映されます")
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 80, 80)),
+                    );
+
                     }); // ScrollArea end
 
                     ui.add_space(8.0);

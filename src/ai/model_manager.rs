@@ -65,6 +65,12 @@ const MODEL_URLS: &[(ModelKind, &str, &str, u64)] = &[
         6_000_000,
     ),
     (
+        ModelKind::DenoiseRealplksr,
+        "dejpg_realplksr_otf.onnx",
+        "https://github.com/Phhofm/models/releases/download/1xDeJPG_realplksr_otf/1xDeJPG_realplksr_otf_fp32_fullyoptimized.onnx",
+        28_000_000,
+    ),
+    (
         ModelKind::InpaintMiGan,
         "migan.onnx",
         "https://huggingface.co/lxfater/inpaint-web/resolve/main/migan.onnx",
@@ -122,6 +128,7 @@ const ALL_MODELS: &[ModelKind] = &[
     ModelKind::UpscaleWaifu2xCunet,
     ModelKind::UpscaleRealEsrGeneralV3,
     ModelKind::UpscaleRealCugan4x,
+    ModelKind::DenoiseRealplksr,
     ModelKind::InpaintMiGan,
 ];
 
@@ -216,6 +223,34 @@ impl ModelManager {
         }
 
         missing
+    }
+
+    /// ノイズ除去に必要なモデル一覧のうち、未ダウンロードのものを返す。
+    pub fn missing_denoise_models(&self) -> Vec<ModelKind> {
+        let states = self.states.lock().unwrap();
+        ModelKind::denoise_models().iter()
+            .filter(|&&kind| !matches!(states.get(&kind), Some(DownloadState::Ready(_))))
+            .copied()
+            .collect()
+    }
+
+    /// 見開き補完に必要なモデル一覧のうち、未ダウンロードのものを返す。
+    pub fn missing_inpaint_models(&self) -> Vec<ModelKind> {
+        let states = self.states.lock().unwrap();
+        let mut missing = Vec::new();
+        if !matches!(states.get(&ModelKind::InpaintMiGan), Some(DownloadState::Ready(_))) {
+            missing.push(ModelKind::InpaintMiGan);
+        }
+        missing
+    }
+
+    /// 指定されたモデル群のうち未ダウンロードのものをダウンロード開始する。
+    pub fn start_download_models(&self, models: &[ModelKind]) {
+        for &kind in models {
+            if matches!(self.download_state(kind), DownloadState::NotDownloaded | DownloadState::Failed(_)) {
+                self.start_download(kind);
+            }
+        }
     }
 
     /// 指定モデルのダウンロードサイズ（バイト）を返す。

@@ -4,6 +4,7 @@
 //! 画像タイプ分類・アップスケール・Inpainting を提供する。
 
 pub mod classify;
+pub mod denoise;
 pub mod inpaint;
 pub mod model_manager;
 pub mod runtime;
@@ -62,6 +63,8 @@ pub enum ModelKind {
     UpscaleRealEsrGeneralV3,
     /// Real-CUGAN 4x conservative（漫画・スクリーントーン保持向け）
     UpscaleRealCugan4x,
+    /// JPEG ノイズ除去 (RealPLKSR)
+    DenoiseRealplksr,
     /// MI-GAN Inpainting
     InpaintMiGan,
 }
@@ -75,6 +78,7 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrganAnime6B => "realesrgan_anime6b",
             ModelKind::UpscaleWaifu2xCunet => "waifu2x_cunet",
             ModelKind::UpscaleRealEsrGeneralV3 => "realesr_general_v3",
+            ModelKind::DenoiseRealplksr => "denoise_realplksr",
             ModelKind::InpaintMiGan => "inpaint_migan",
             ModelKind::UpscaleRealCugan4x => "realcugan_4x",
         }
@@ -88,6 +92,7 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrganAnime6B => "イラスト (Real-ESRGAN Anime)",
             ModelKind::UpscaleWaifu2xCunet => "漫画 (waifu2x cunet)",
             ModelKind::UpscaleRealEsrGeneralV3 => "汎用 (Real-ESRGAN General)",
+            ModelKind::DenoiseRealplksr => "JPEG ノイズ除去",
             ModelKind::InpaintMiGan => "補完 (MI-GAN)",
             ModelKind::UpscaleRealCugan4x => "漫画 (Real-CUGAN 4x)",
         }
@@ -104,8 +109,16 @@ impl ModelKind {
             // "inpaint_lama" は旧設定ファイルとの互換用
             "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
             "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
+            "denoise_realplksr" => Some(ModelKind::DenoiseRealplksr),
             _ => None,
         }
+    }
+
+    /// デノイズ用モデル一覧（UI プルダウンに表示するもの）。
+    pub fn denoise_models() -> &'static [ModelKind] {
+        &[
+            ModelKind::DenoiseRealplksr,
+        ]
     }
 
     /// アップスケール用モデル一覧（UI プルダウンに表示するもの）。

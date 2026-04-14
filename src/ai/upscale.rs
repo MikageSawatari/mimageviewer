@@ -5,18 +5,40 @@
 //! オーバーラップ領域は線形ブレンド（フェザリング）でタイル境界の継ぎ目を除去する。
 //! モデルの倍率（2x/4x）は推論結果のシェイプから自動検出する。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::runtime::AiRuntime;
 use super::{AiError, ModelKind};
 
-/// タイルサイズ（入力ピクセル）。
+/// ModelKind ごとのスケール倍率キャッシュ。
+/// 同一モデルの detect_scale_factor を毎回実行する無駄を省く。
+static SCALE_CACHE: std::sync::LazyLock<Mutex<HashMap<ModelKind, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// デフォルトのタイルサイズ（入力ピクセル）。
 const TILE_SIZE: u32 = 192;
 
 /// タイル間のオーバーラップ（入力ピクセル）。
 /// スクリーントーン等の規則的パターンで境界が目立たないよう、十分な幅を確保。
 const TILE_OVERLAP: u32 = 32;
+
+/// モデルごとの固定タイルサイズ。None の場合はデフォルト (TILE_SIZE) を使用。
+/// 一部の ONNX モデルは固定入力サイズでエクスポートされているため、
+/// そのサイズに合わせたタイル分割が必要。
+fn model_tile_size(kind: ModelKind) -> u32 {
+    match kind {
+        // RealPLKSR は 256x256 固定入力
+        ModelKind::DenoiseRealplksr => 256,
+        _ => TILE_SIZE,
+    }
+}
+
+/// CPU でロードすべきモデルか（DirectML 非互換）。
+pub fn needs_cpu_fallback(_kind: ModelKind) -> bool {
+    false
+}
 
 /// 高解像度化をスキップする閾値（幅 or 高さがこの値以上なら不要）。
 pub const SKIP_THRESHOLD: u32 = 2048;
@@ -32,17 +54,22 @@ pub fn should_upscale(width: u32, height: u32) -> bool {
     width < SKIP_THRESHOLD && height < SKIP_THRESHOLD
 }
 
-/// 1 タイルを推論してスケール倍率を検出する。
+/// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
 fn detect_scale_factor(
     runtime: &AiRuntime,
     model_kind: ModelKind,
 ) -> Result<u32, AiError> {
-    let test_size = TILE_SIZE as usize;
+    // キャッシュ済みならそのまま返す
+    if let Some(&scale) = SCALE_CACHE.lock().unwrap().get(&model_kind) {
+        return Ok(scale);
+    }
+
+    let test_size = model_tile_size(model_kind) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
     let tensor = ort::value::Tensor::from_array(dummy)
         .map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
 
-    runtime.with_session(model_kind, |session| {
+    let scale = runtime.with_session(model_kind, |session| {
         let outputs = session
             .run(ort::inputs![tensor])
             .map_err(|e| AiError::Ort(format!("detect_scale run: {e}")))?;
@@ -53,16 +80,19 @@ fn detect_scale_factor(
         let dims: Vec<i64> = shape.iter().copied().collect();
         if dims.len() >= 4 {
             let out_h = dims[2] as f64;
-            let scale = (out_h / test_size as f64).round() as u32;
+            let s = (out_h / test_size as f64).round() as u32;
             crate::logger::log(format!(
-                "[AI] detect_scale: {model_kind:?} input={test_size}x{test_size} → output={}x{} → scale={scale}x",
+                "[AI] detect_scale: {model_kind:?} input={test_size}x{test_size} → output={}x{} → scale={s}x",
                 dims[3], dims[2]
             ));
-            Ok(scale.max(1))
+            Ok(s.max(1))
         } else {
             Ok(4)
         }
-    })
+    })?;
+
+    SCALE_CACHE.lock().unwrap().insert(model_kind, scale);
+    Ok(scale)
 }
 
 /// 画像をアップスケールする。
@@ -81,13 +111,15 @@ pub fn upscale(
     let out_w = in_w * scale;
     let out_h = in_h * scale;
 
+    let tile_size = model_tile_size(model_kind);
+
     crate::logger::log(format!(
         "[AI] Upscaling {}x{} → {}x{} ({}x) with {:?}, tile={}px overlap={}px",
-        in_w, in_h, out_w, out_h, scale, model_kind, TILE_SIZE, TILE_OVERLAP
+        in_w, in_h, out_w, out_h, scale, model_kind, tile_size, TILE_OVERLAP
     ));
 
     let rgb = input.to_rgb8();
-    let tiles = compute_tiles(in_w, in_h, TILE_SIZE, TILE_OVERLAP);
+    let tiles = compute_tiles(in_w, in_h, tile_size, TILE_OVERLAP);
 
     // 出力バッファ: RGB float 累積 + 重み累積（ブレンド用）
     let npixels = (out_w * out_h) as usize;

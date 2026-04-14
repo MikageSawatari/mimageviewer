@@ -401,30 +401,23 @@ impl App {
                         let mut bar_rotate_ccw = false;
                         let inpaint_before = self.ai_inpaint_active;
                         let spread_before = self.spread_mode;
-                        // AI アップスケール情報を計算（ホバーバーのファイル情報に表示）
+                        // AI 処理情報を計算（ホバーバーのファイル情報に表示）
                         let ai_info_model_name: String;
-                        let ai_upscale_info = if self.ai_upscale_enabled {
-                            // 使用中のモデル名を判定
-                            let model_label = match self.ai_upscale_model_override {
-                                Some(k) => k.display_label().to_string(),
-                                None => {
-                                    // 自動: 分類結果のカテゴリ名を表示
-                                    self.ai_classify_cache.get(&fs_idx)
-                                        .map(|c| c.display_label().to_string())
-                                        .unwrap_or_else(|| "自動".to_string())
-                                }
-                            };
-                            ai_info_model_name = model_label;
-                            // アップスケール後のサイズ
+                        let ai_upscale_info = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
+                            ai_info_model_name = self.ai_model_label(fs_idx, false);
+                            // 処理後のサイズ
                             if let Some(crate::fs_animation::FsCacheEntry::Static { tex, .. }) =
                                 self.ai_upscale_cache.get(&fs_idx)
                             {
                                 let s = tex.size_vec2();
                                 Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
-                            } else if let Some((w, h)) = state.image_dims {
-                                // まだアップスケール完了していない場合は予測サイズ
-                                if crate::ai::upscale::should_upscale(w, h) {
-                                    Some((ai_info_model_name.as_str(), w * 4, h * 4))
+                            } else if self.ai_upscale_enabled {
+                                if let Some((w, h)) = state.image_dims {
+                                    if crate::ai::upscale::should_upscale(w, h) {
+                                        Some((ai_info_model_name.as_str(), w * 4, h * 4))
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
                                 }
@@ -467,7 +460,7 @@ impl App {
                         }
 
                         // ── フルスクリーン左下ステータス表示 ──
-                        if self.ai_upscale_enabled || self.ai_inpaint_active || self.ai_inpaint_pending.is_some() {
+                        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() || self.ai_inpaint_active || self.ai_inpaint_pending.is_some() {
                             self.draw_fs_ai_status(ui, full_rect, fs_idx);
                         }
 
@@ -551,8 +544,8 @@ impl App {
                 None
             };
 
-            // AI アップスケール有効時: アップスケール済みテクスチャ
-            let ai_tex = if adj_preview.is_none() && adj_tex.is_none() && self.ai_upscale_enabled {
+            // AI 処理有効時（アップスケール or デノイズ）: 処理済みテクスチャ
+            let ai_tex = if adj_preview.is_none() && adj_tex.is_none() && (self.ai_upscale_enabled || self.ai_denoise_model.is_some()) {
                 match self.ai_upscale_cache.get(&fs_idx) {
                     Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
                     _ => None,
@@ -1997,6 +1990,29 @@ impl App {
 // ── フルスクリーン AI ステータスオーバーレイ ────────────────────────────
 
 impl App {
+    /// 現在有効な AI 処理のモデル名を結合して返す。
+    /// `show_auto_prefix` が true の場合、自動選択時に「自動: 」プレフィックスを付ける。
+    fn ai_model_label(&self, fs_idx: usize, show_auto_prefix: bool) -> String {
+        let mut labels = Vec::new();
+        if let Some(denoise_kind) = self.ai_denoise_model {
+            labels.push(denoise_kind.display_label().to_string());
+        }
+        if self.ai_upscale_enabled {
+            let upscale_label = match self.ai_upscale_model_override {
+                Some(k) => k.display_label().to_string(),
+                None => self.ai_classify_cache.get(&fs_idx)
+                    .map(|c| if show_auto_prefix {
+                        format!("自動: {}", c.display_label())
+                    } else {
+                        c.display_label().to_string()
+                    })
+                    .unwrap_or_else(|| "自動".to_string()),
+            };
+            labels.push(upscale_label);
+        }
+        labels.join(" + ")
+    }
+
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, full_rect: egui::Rect, fs_idx: usize) {
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
@@ -2009,37 +2025,24 @@ impl App {
         let is_adjusting = self.adjustment_pending.as_ref().map_or(false, |(i, _)| *i == fs_idx);
 
         let is_inpainting = self.ai_inpaint_pending.is_some();
-        let is_downloading_inpaint = self.ai_inpaint_active && self.ai_model_manager.as_ref().map_or(false, |mgr| {
-            matches!(mgr.download_state(crate::ai::ModelKind::InpaintMiGan), crate::ai::model_manager::DownloadState::Downloading { .. })
-        });
 
         // 何か処理中かどうか
-        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting || is_inpainting || is_downloading_inpaint;
+        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting || is_inpainting;
 
         if is_loading {
             lines.push(("読込中...".to_string(), egui::Color32::from_gray(180)));
         }
 
         if is_upscaling {
-            let model_label = match self.ai_upscale_model_override {
-                Some(k) => k.display_label().to_string(),
-                None => self.ai_classify_cache.get(&fs_idx)
-                    .map(|c| format!("自動: {}", c.display_label()))
-                    .unwrap_or_else(|| "自動".to_string()),
-            };
+            let label = self.ai_model_label(fs_idx, true);
             lines.push((
-                format!("アップスケール中 ({})", model_label),
+                format!("AI 処理中 ({})", label),
                 egui::Color32::from_rgb(255, 200, 80),
             ));
         } else if is_upscaled {
-            let model_label = match self.ai_upscale_model_override {
-                Some(k) => k.display_label().to_string(),
-                None => self.ai_classify_cache.get(&fs_idx)
-                    .map(|c| c.display_label().to_string())
-                    .unwrap_or_else(|| "自動".to_string()),
-            };
+            let label = self.ai_model_label(fs_idx, false);
             lines.push((
-                format!("アップスケール完了 ({})", model_label),
+                format!("AI 処理完了 ({})", label),
                 egui::Color32::from_rgb(80, 220, 80),
             ));
         }
@@ -2052,27 +2055,13 @@ impl App {
             ));
         }
 
-        // MI-GAN モデルダウンロード中の表示
-        if self.ai_inpaint_active {
-            if let Some(ref mgr) = self.ai_model_manager {
-                let state = mgr.download_state(crate::ai::ModelKind::InpaintMiGan);
-                if let crate::ai::model_manager::DownloadState::Downloading { progress, total, .. } = state {
-                    let p = progress.load(std::sync::atomic::Ordering::Relaxed);
-                    let t = total.load(std::sync::atomic::Ordering::Relaxed);
-                    let pct = if t > 0 { (p as f64 / t as f64 * 100.0) as u32 } else { 0 };
-                    lines.push((
-                        format!("MI-GAN モデルダウンロード中... ({}%)", pct),
-                        egui::Color32::from_rgb(255, 200, 80),
-                    ));
-                }
-            }
-        }
+        // ※ モデルダウンロードは起動時ダイアログで行うためここでは表示しない
 
-        // 先読みアップスケールの進捗
+        // 先読み AI 処理の進捗
         let pending_count = self.ai_upscale_pending.len();
         if pending_count > 0 && !is_upscaling {
             lines.push((
-                format!("先読みアップスケール中... ({}枚)", pending_count),
+                format!("先読み AI 処理中... ({}枚)", pending_count),
                 egui::Color32::from_gray(160),
             ));
         }

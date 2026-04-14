@@ -450,6 +450,8 @@ pub struct App {
     pub(crate) ai_upscale_enabled: bool,
     /// AI アップスケールモデルの手動オーバーライド (None = 自動)
     pub(crate) ai_upscale_model_override: Option<crate::ai::ModelKind>,
+    /// AI デノイズモデル (Some = 有効)
+    pub(crate) ai_denoise_model: Option<crate::ai::ModelKind>,
     /// アップスケール済みキャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) ai_upscale_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// アップスケール処理中: item_idx → (キャンセルトークン, 受信チャネル)
@@ -508,10 +510,10 @@ impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         let settings = crate::settings::Settings::load();
-        let ai_upscale_enabled = settings.ai_upscale_enabled;
+        let ai_upscale_enabled = settings.ai_upscale_enabled && settings.ai_upscale_feature;
         let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
             .and_then(crate::ai::ModelKind::from_str);
-        let ai_inpaint_active = settings.ai_inpaint_active;
+        let ai_inpaint_active = settings.ai_inpaint_active && settings.ai_inpaint_feature;
         let ai_inpaint_gap_width = settings.ai_inpaint_gap_width as f32;
         let ai_inpaint_trim = settings.ai_inpaint_trim as f32;
         Self {
@@ -657,6 +659,7 @@ impl Default for App {
             ai_model_manager: None,
             ai_upscale_enabled,
             ai_upscale_model_override,
+            ai_denoise_model: None,
             ai_upscale_cache: std::collections::HashMap::new(),
             ai_upscale_pending: std::collections::HashMap::new(),
             ai_classify_cache: std::collections::HashMap::new(),
@@ -2926,7 +2929,7 @@ impl App {
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
     pub(crate) fn poll_ai_upscale(&mut self, ctx: &egui::Context) {
-        if !self.ai_upscale_enabled {
+        if !self.ai_upscale_enabled && !self.ai_denoise_model.is_some() {
             return;
         }
 
@@ -2971,16 +2974,19 @@ impl App {
         }
     }
 
-    /// 現在のフルスクリーン画像に対して AI アップスケールを開始する。
+    /// 現在のフルスクリーン画像に対して AI 処理（デノイズ / アップスケール）を開始する。
     /// - 先読みが全完了している場合のみ開始
-    /// - すでにアップスケール済み or pending の場合はスキップ
-    /// - 2K 以上の画像はスキップ
+    /// - すでに処理済み or pending の場合はスキップ
+    /// - アップスケール時: 2K 以上の画像はスキップ
     pub(crate) fn maybe_start_ai_upscale(&mut self, current_idx: usize) {
-        if !self.ai_upscale_enabled {
+        let denoise_enabled = self.ai_denoise_model.is_some();
+        let upscale_enabled = self.ai_upscale_enabled;
+
+        if !denoise_enabled && !upscale_enabled {
             return;
         }
 
-        // すでにアップスケール済み、処理中、または失敗済み
+        // すでに処理済み、処理中、または失敗済み
         if self.ai_upscale_cache.contains_key(&current_idx)
             || self.ai_upscale_pending.contains_key(&current_idx)
             || self.ai_upscale_failed.contains(&current_idx)
@@ -3004,7 +3010,7 @@ impl App {
             _ => return,
         };
 
-        // 2K 以上はスキップ
+        // 2K 以上はスキップ（アップスケール・デノイズ共通）
         let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
         if !crate::ai::upscale::should_upscale(w, h) {
             return;
@@ -3016,68 +3022,132 @@ impl App {
         let Some(runtime) = self.ai_runtime.clone() else { return; };
         let Some(manager) = self.ai_model_manager.clone() else { return; };
 
-        // モデル選択
-        let model_kind = match self.ai_upscale_model_override {
-            Some(k) => k,
-            None => {
-                // 自動判別: キャッシュ済みならそれを使用、なければヒューリスティクス
-                let category = self.ai_classify_cache
-                    .get(&current_idx)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        // ヒューリスティクスで判別（モデルなしフォールバック）
-                        let dynimg = color_image_to_dynamic(&source_image);
-                        let cat = crate::ai::classify::classify_heuristic(&dynimg);
-                        self.ai_classify_cache.insert(current_idx, cat);
-                        cat
-                    });
-                category.preferred_upscale_model()
-            }
-        };
-
-        // モデルファイルが存在するか確認
-        let Some(model_path) = manager.model_path(model_kind) else {
-            crate::logger::log(format!(
-                "[AI] Model {:?} not available, skipping upscale for idx={current_idx}",
-                model_kind
-            ));
-            return;
-        };
-
-        // モデルをロード（未ロードの場合）
-        if !runtime.is_loaded(model_kind) {
-            if let Err(e) = runtime.load_model(model_kind, &model_path) {
-                crate::logger::log(format!("[AI] Model load failed: {e}"));
+        // デノイズモデル選択・ロード
+        let denoise_model = if denoise_enabled {
+            let kind = match self.ai_denoise_model {
+                Some(k) => k,
+                None => return, // デノイズ有効だがモデル未設定
+            };
+            let Some(model_path) = manager.model_path(kind) else {
+                // モデル未ダウンロード → スキップ（起動時ダイアログでダウンロード）
                 return;
+            };
+            if !runtime.is_loaded(kind) {
+                let load_result = if crate::ai::upscale::needs_cpu_fallback(kind) {
+                    runtime.load_model_cpu(kind, &model_path)
+                } else {
+                    runtime.load_model(kind, &model_path)
+                };
+                if let Err(e) = load_result {
+                    crate::logger::log(format!("[AI] Denoise model load failed: {e}"));
+                    return;
+                }
             }
+            Some(kind)
+        } else {
+            None
+        };
+
+        // アップスケールモデル選択・ロード
+        let upscale_model = if upscale_enabled && crate::ai::upscale::should_upscale(w, h) {
+            let kind = match self.ai_upscale_model_override {
+                Some(k) => k,
+                None => {
+                    let category = self.ai_classify_cache
+                        .get(&current_idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let dynimg = color_image_to_dynamic(&source_image);
+                            let cat = crate::ai::classify::classify_heuristic(&dynimg);
+                            self.ai_classify_cache.insert(current_idx, cat);
+                            cat
+                        });
+                    category.preferred_upscale_model()
+                }
+            };
+            match manager.model_path(kind) {
+                Some(model_path) => {
+                    if !runtime.is_loaded(kind) {
+                        if let Err(e) = runtime.load_model(kind, &model_path) {
+                            crate::logger::log(format!("[AI] Upscale model load failed: {e}"));
+                            if denoise_model.is_none() { return; }
+                            None
+                        } else {
+                            Some(kind)
+                        }
+                    } else {
+                        Some(kind)
+                    }
+                }
+                None => {
+                    crate::logger::log(format!(
+                        "[AI] Upscale model {:?} not available, skipping for idx={current_idx}",
+                        kind
+                    ));
+                    if denoise_model.is_none() { return; }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if denoise_model.is_none() && upscale_model.is_none() {
+            return;
         }
 
-        // バックグラウンドスレッドでアップスケール実行
+        // バックグラウンドスレッドで AI 処理実行
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let cancel_clone = cancel.clone();
         let idx = current_idx;
 
         std::thread::spawn(move || {
-            // ColorImage → DynamicImage に変換
-            let dynimg = color_image_to_dynamic(&source_image);
-            match crate::ai::upscale::upscale(&runtime, model_kind, &dynimg, &cancel_clone) {
-                Ok(upscaled) => {
-                    let _ = tx.send(crate::ai::upscale::UpscaleResult {
-                        idx,
-                        image: upscaled,
-                    });
+            let mut dynimg = color_image_to_dynamic(&source_image);
+
+            // Step 1: デノイズ (1x)
+            if let Some(denoise_kind) = denoise_model {
+                match crate::ai::denoise::denoise(&runtime, denoise_kind, &dynimg, &cancel_clone) {
+                    Ok(denoised) => {
+                        if upscale_model.is_some() {
+                            // アップスケールが後続する場合のみ DynamicImage に変換
+                            dynimg = color_image_to_dynamic(&denoised);
+                        } else {
+                            // デノイズのみ: 結果をそのまま送信（変換を省略）
+                            let _ = tx.send(crate::ai::upscale::UpscaleResult {
+                                idx,
+                                image: denoised,
+                            });
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("[AI] Denoise failed for idx={idx}: {e}"));
+                        if upscale_model.is_none() { return; }
+                    }
                 }
-                Err(e) => {
-                    crate::logger::log(format!("[AI] Upscale failed for idx={idx}: {e}"));
+            }
+
+            // Step 2: アップスケール (4x)
+            if let Some(upscale_kind) = upscale_model {
+                match crate::ai::upscale::upscale(&runtime, upscale_kind, &dynimg, &cancel_clone) {
+                    Ok(upscaled) => {
+                        let _ = tx.send(crate::ai::upscale::UpscaleResult {
+                            idx,
+                            image: upscaled,
+                        });
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("[AI] Upscale failed for idx={idx}: {e}"));
+                    }
                 }
             }
         });
 
         self.ai_upscale_pending.insert(current_idx, (cancel, rx));
         crate::logger::log(format!(
-            "[AI] Upscale started for idx={current_idx} with {:?}",
-            model_kind
+            "[AI] AI processing started for idx={current_idx} denoise={:?} upscale={:?}",
+            denoise_model, upscale_model
         ));
     }
 
@@ -3189,10 +3259,9 @@ impl App {
             return;
         };
 
-        // MI-GAN モデルが利用可能か確認、なければ自動ダウンロード開始
+        // MI-GAN モデルが利用可能か確認
         let Some(model_path) = manager.model_path(crate::ai::ModelKind::InpaintMiGan) else {
-            crate::logger::log("[AI] MI-GAN model not available, starting download...".to_string());
-            manager.start_download(crate::ai::ModelKind::InpaintMiGan);
+            // モデル未ダウンロード → スキップ（起動時ダイアログでダウンロード）
             return;
         };
 
@@ -3278,7 +3347,7 @@ impl App {
 
     /// AI アップスケールの先読み（表示中画像の前後）。
     fn prefetch_ai_upscale(&mut self, current_idx: usize) {
-        if !self.ai_upscale_enabled {
+        if !self.ai_upscale_enabled && !self.ai_denoise_model.is_some() {
             return;
         }
 
@@ -3327,23 +3396,36 @@ impl App {
             .or(self.adjustment_active_preset);
         if let Some(pi) = preset_idx {
             let params = &self.adjustment_presets.presets[pi as usize];
-            match params.upscale_model_kind() {
-                None => {
-                    self.ai_upscale_enabled = false;
-                    self.ai_upscale_model_override = None;
+            // アップスケール: feature フラグでゲート
+            if self.settings.ai_upscale_feature {
+                match params.upscale_model_kind() {
+                    None => {
+                        self.ai_upscale_enabled = false;
+                        self.ai_upscale_model_override = None;
+                    }
+                    Some(None) => {
+                        self.ai_upscale_enabled = true;
+                        self.ai_upscale_model_override = None;
+                    }
+                    Some(Some(kind)) => {
+                        self.ai_upscale_enabled = true;
+                        self.ai_upscale_model_override = Some(kind);
+                    }
                 }
-                Some(None) => {
-                    self.ai_upscale_enabled = true;
-                    self.ai_upscale_model_override = None;
-                }
-                Some(Some(kind)) => {
-                    self.ai_upscale_enabled = true;
-                    self.ai_upscale_model_override = Some(kind);
-                }
+            } else {
+                self.ai_upscale_enabled = false;
+                self.ai_upscale_model_override = None;
             }
+            // デノイズ: feature フラグでゲート
+            self.ai_denoise_model = if self.settings.ai_denoise_feature {
+                params.denoise_model_kind()
+            } else {
+                None
+            };
         } else {
             self.ai_upscale_enabled = false;
             self.ai_upscale_model_override = None;
+            self.ai_denoise_model = None;
         }
     }
 
@@ -3452,7 +3534,7 @@ impl App {
         // ソース画像を取得（adjustment_cache に色調補正済みがあればそちら、
         // なければ ai_upscale_cache or fs_cache）
         let source = self.adjustment_cache.get(&idx)
-            .or_else(|| if self.ai_upscale_enabled { self.ai_upscale_cache.get(&idx) } else { None })
+            .or_else(|| if self.ai_upscale_enabled || self.ai_denoise_model.is_some() { self.ai_upscale_cache.get(&idx) } else { None })
             .or_else(|| self.fs_cache.get(&idx));
         let Some(FsCacheEntry::Static { pixels, .. }) = source else { return; };
 
@@ -4039,6 +4121,23 @@ impl eframe::App for App {
                     self.load_folder(resolved);
                 }
             }
+
+            // AI 機能が有効で必要モデルが不足していればダウンロードダイアログを表示
+            if self.settings.ai_upscale_feature
+                || self.settings.ai_denoise_feature
+                || self.settings.ai_inpaint_feature
+            {
+                self.ensure_ai_runtime();
+                if let Some(ref mgr) = self.ai_model_manager {
+                    let has_missing =
+                        (self.settings.ai_upscale_feature && !mgr.missing_upscale_models().is_empty())
+                        || (self.settings.ai_denoise_feature && !mgr.missing_denoise_models().is_empty())
+                        || (self.settings.ai_inpaint_feature && !mgr.missing_inpaint_models().is_empty());
+                    if has_missing {
+                        self.show_ai_model_setup = true;
+                    }
+                }
+            }
         }
 
         self.track_window_rect(ctx);
@@ -4076,12 +4175,12 @@ impl eframe::App for App {
             // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール
             let current_done = self.ai_upscale_cache.contains_key(&fs_idx)
                 || self.ai_upscale_failed.contains(&fs_idx)
-                || !self.ai_upscale_enabled
-                || self.fs_cache.get(&fs_idx).map(|e| {
+                || (!self.ai_upscale_enabled && !self.ai_denoise_model.is_some())
+                || (self.ai_upscale_enabled && !self.ai_denoise_model.is_some() && self.fs_cache.get(&fs_idx).map(|e| {
                     if let FsCacheEntry::Static { pixels, .. } = e {
                         !crate::ai::upscale::should_upscale(pixels.size[0] as u32, pixels.size[1] as u32)
                     } else { true }
-                }).unwrap_or(true);
+                }).unwrap_or(true));
             if current_done && self.ai_upscale_pending.is_empty() {
                 self.prefetch_ai_upscale(fs_idx);
             }

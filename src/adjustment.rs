@@ -43,6 +43,9 @@ pub struct AdjustParams {
     pub auto_mode: Option<AutoMode>,
     /// AI アップスケールモデル。None = off, Some("auto") = 自動判別, Some("realcugan_4x") = 指定
     pub upscale_model: Option<String>,
+    /// AI デノイズモデル。None = off, Some("denoise_realplksr") = 指定
+    #[serde(default)]
+    pub denoise_model: Option<String>,
 }
 
 impl Default for AdjustParams {
@@ -60,6 +63,7 @@ impl Default for AdjustParams {
             midtone: 1.0,
             auto_mode: None,
             upscale_model: None,
+            denoise_model: None,
         }
     }
 }
@@ -84,6 +88,11 @@ impl AdjustParams {
         self.upscale_model.is_some()
     }
 
+    /// デノイズが設定されているか。
+    pub fn needs_denoise(&self) -> bool {
+        self.denoise_model.is_some()
+    }
+
     /// アップスケールモデル種別を解決する。
     /// "auto" → Some(None), "realcugan_4x" → Some(Some(ModelKind)), None → None
     pub fn upscale_model_kind(&self) -> Option<Option<crate::ai::ModelKind>> {
@@ -92,6 +101,11 @@ impl AdjustParams {
             Some("auto") => Some(None),
             Some(s) => Some(Some(crate::ai::ModelKind::from_str(s)?)),
         }
+    }
+
+    /// デノイズモデル種別を解決する。
+    pub fn denoise_model_kind(&self) -> Option<crate::ai::ModelKind> {
+        self.denoise_model.as_deref().and_then(crate::ai::ModelKind::from_str)
     }
 }
 
@@ -119,7 +133,7 @@ impl Default for AdjustPresets {
 impl AdjustPresets {
     /// すべてのプリセットがデフォルト値か (DB から削除可能か)。
     pub fn is_all_default(&self) -> bool {
-        self.presets.iter().all(|p| p.is_identity() && !p.needs_upscale())
+        self.presets.iter().all(|p| p.is_identity() && !p.needs_upscale() && !p.needs_denoise())
     }
 }
 

@@ -1,11 +1,18 @@
-//! AI モデルダウンロードダイアログ。
+//! AI モデルダウンロードダイアログ（起動時表示）。
 //!
-//! AI 機能を有効化した際にモデルが未ダウンロードの場合に表示する。
-//! モデル一覧・合計サイズ・ダウンロード進捗を表示し、
-//! バックグラウンドダウンロードを管理する。
+//! AI 機能が有効だが必要モデルが不足している場合に起動時に表示する。
+//! 機能ごとのチェックボックスで ON/OFF 切り替え可能。
+//! OFF にすると設定を保存し、その機能のモデルダウンロードをスキップする。
 
 use crate::ai::ModelKind;
-use crate::ai::model_manager::DownloadState;
+use crate::ai::model_manager::{DownloadState, ModelManager};
+
+/// 機能グループの定義。
+struct FeatureGroup {
+    label: &'static str,
+    enabled: bool,
+    models: &'static [ModelKind],
+}
 
 impl crate::app::App {
     /// AI モデルセットアップダイアログを表示する。
@@ -19,18 +26,45 @@ impl crate::app::App {
             mgr.poll_downloads();
         }
 
-        let mut open = true;
         let mut start_download = false;
+        let mut settings_changed = false;
+
+        // 機能グループ構築
+        let mut groups = vec![
+            FeatureGroup {
+                label: "AI アップスケール",
+                enabled: self.settings.ai_upscale_feature,
+                models: &[
+                    ModelKind::ClassifierMobileNet,
+                    ModelKind::UpscaleRealEsrganX4Plus,
+                    ModelKind::UpscaleRealEsrganAnime6B,
+                    ModelKind::UpscaleRealEsrGeneralV3,
+                    ModelKind::UpscaleRealCugan4x,
+                ],
+            },
+            FeatureGroup {
+                label: "AI ノイズ除去",
+                enabled: self.settings.ai_denoise_feature,
+                models: &[
+                    ModelKind::DenoiseRealplksr,
+                ],
+            },
+            FeatureGroup {
+                label: "AI 見開き補完",
+                enabled: self.settings.ai_inpaint_feature,
+                models: &[ModelKind::InpaintMiGan],
+            },
+        ];
 
         egui::Window::new("AI モデルのセットアップ")
-            .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .default_pos(ctx.content_rect().center() - egui::vec2(220.0, 180.0))
+            .default_pos(ctx.content_rect().center() - egui::vec2(240.0, 200.0))
             .show(ctx, |ui| {
-                ui.set_min_width(440.0);
+                ui.set_min_width(480.0);
 
-                ui.label("AI 機能を使用するには ONNX モデルファイルが必要です。");
+                ui.label("AI 機能を使用するにはモデルファイルのダウンロードが必要です。");
+                ui.label("使用しない機能のチェックを外すとダウンロードをスキップできます。");
                 ui.add_space(8.0);
 
                 let manager = self.ai_model_manager.clone();
@@ -40,97 +74,65 @@ impl crate::app::App {
                 };
 
                 let mut any_downloading = false;
-                let mut all_ready = true;
+                let mut any_missing = false;
 
-                // モデル一覧を表示
-                egui::Grid::new("ai_model_list")
-                    .num_columns(3)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("モデル").strong().size(13.0));
-                        ui.label(egui::RichText::new("サイズ").strong().size(13.0));
-                        ui.label(egui::RichText::new("状態").strong().size(13.0));
-                        ui.end_row();
+                for group in &mut groups {
+                    ui.add_space(4.0);
 
-                        let models = [
-                            ModelKind::ClassifierMobileNet,
-                            ModelKind::UpscaleRealEsrganX4Plus,
-                            ModelKind::UpscaleRealEsrganAnime6B,
-                            ModelKind::UpscaleWaifu2xCunet,
-                            ModelKind::UpscaleRealEsrGeneralV3,
-                            ModelKind::InpaintMiGan,
-                        ];
+                    // 機能チェックボックス
+                    let prev_enabled = group.enabled;
+                    ui.checkbox(&mut group.enabled, egui::RichText::new(group.label).strong());
+                    if group.enabled != prev_enabled {
+                        settings_changed = true;
+                    }
 
-                        for &kind in &models {
-                            ui.label(kind.display_label());
-
-                            let state = manager.download_state(kind);
-                            match &state {
-                                DownloadState::Ready(_) => {
-                                    let size = crate::ai::model_manager::ModelManager::model_size(kind);
-                                    ui.label(format_size(size));
-                                    ui.label(
-                                        egui::RichText::new("✓ 完了")
-                                            .color(egui::Color32::from_rgb(80, 200, 80)),
-                                    );
-                                }
-                                DownloadState::Downloading { progress, total, .. } => {
-                                    any_downloading = true;
-                                    all_ready = false;
-                                    let done = progress.load(std::sync::atomic::Ordering::Relaxed);
-                                    let t = total.load(std::sync::atomic::Ordering::Relaxed);
-                                    ui.label(format!("{} / {}", format_size(done), format_size(t)));
-                                    let pct = if t > 0 {
-                                        done as f32 / t as f32
-                                    } else {
-                                        0.0
-                                    };
-                                    ui.add(
-                                        egui::ProgressBar::new(pct)
-                                            .desired_width(120.0)
-                                            .show_percentage(),
-                                    );
-                                }
-                                DownloadState::Failed(msg) => {
-                                    all_ready = false;
-                                    let size = crate::ai::model_manager::ModelManager::model_size(kind);
-                                    ui.label(format_size(size));
-                                    ui.label(
-                                        egui::RichText::new(format!("✗ {msg}"))
-                                            .color(egui::Color32::from_rgb(220, 80, 80))
-                                            .small(),
-                                    );
-                                }
-                                DownloadState::NotDownloaded => {
-                                    all_ready = false;
-                                    let size = crate::ai::model_manager::ModelManager::model_size(kind);
-                                    ui.label(format_size(size));
-                                    ui.label(
-                                        egui::RichText::new("—")
-                                            .color(egui::Color32::from_gray(130)),
-                                    );
-                                }
-                            }
-                            ui.end_row();
-                        }
-                    });
+                    if group.enabled {
+                        // モデル一覧（インデント）
+                        ui.indent(group.label, |ui| {
+                            egui::Grid::new(format!("model_grid_{}", group.label))
+                                .num_columns(3)
+                                .spacing([12.0, 3.0])
+                                .show(ui, |ui| {
+                                    for &kind in group.models {
+                                        ui.label(kind.display_label());
+                                        let state = manager.download_state(kind);
+                                        draw_model_state(ui, kind, &state);
+                                        match &state {
+                                            DownloadState::Downloading { .. } => {
+                                                any_downloading = true;
+                                            }
+                                            DownloadState::Ready(_) => {}
+                                            _ => {
+                                                any_missing = true;
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
 
-                if all_ready {
-                    ui.label(
-                        egui::RichText::new("すべてのモデルが利用可能です。")
-                            .color(egui::Color32::from_rgb(80, 200, 80)),
-                    );
+                // ステータス
+                if !any_missing && !any_downloading {
+                    let enabled_count = groups.iter().filter(|g| g.enabled).count();
+                    if enabled_count > 0 {
+                        ui.label(
+                            egui::RichText::new("すべての必要なモデルが利用可能です。")
+                                .color(egui::Color32::from_rgb(80, 200, 80)),
+                        );
+                    }
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    if !all_ready && !any_downloading {
-                        if ui.button("全てダウンロード").clicked() {
+                    if any_missing && !any_downloading {
+                        if ui.button("ダウンロード開始").clicked() {
                             start_download = true;
                         }
                     }
@@ -141,12 +143,12 @@ impl crate::app::App {
                                 .color(egui::Color32::from_gray(180))
                                 .italics(),
                         );
-                        // ダウンロード中はリペイントを継続
                         ctx.request_repaint();
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("閉じる").clicked() {
+                        let close_label = if any_missing || any_downloading { "後で" } else { "閉じる" };
+                        if ui.button(close_label).clicked() {
                             self.show_ai_model_setup = false;
                         }
                     });
@@ -162,14 +164,81 @@ impl crate::app::App {
                 );
             });
 
+        // チェックボックスの変更を settings に反映
+        if settings_changed {
+            self.settings.ai_upscale_feature = groups[0].enabled;
+            self.settings.ai_denoise_feature = groups[1].enabled;
+            self.settings.ai_inpaint_feature = groups[2].enabled;
+            self.settings.save();
+        }
+
+        // ダウンロード開始
         if start_download {
             if let Some(ref mgr) = self.ai_model_manager {
-                mgr.start_download_all_missing();
+                for group in &groups {
+                    if group.enabled {
+                        mgr.start_download_models(group.models);
+                    }
+                }
             }
         }
 
-        if !open {
-            self.show_ai_model_setup = false;
+        // 全完了で自動クローズ
+        if let Some(ref mgr) = self.ai_model_manager {
+            let all_enabled_ready = groups.iter().all(|group| {
+                if !group.enabled { return true; }
+                group.models.iter().all(|&kind| {
+                    matches!(mgr.download_state(kind), DownloadState::Ready(_))
+                })
+            });
+            let any_enabled = groups.iter().any(|g| g.enabled);
+            if all_enabled_ready && any_enabled {
+                // 全完了 — 少し待ってから自動クローズ（ユーザーに完了を見せる）
+                // ただし最初から全て揃っている場合は即閉じ
+                self.show_ai_model_setup = false;
+            }
+        }
+    }
+}
+
+/// モデル状態を 2 カラム（サイズ + ステータス）で描画する。
+fn draw_model_state(ui: &mut egui::Ui, kind: ModelKind, state: &DownloadState) {
+    match state {
+        DownloadState::Ready(_) => {
+            let size = ModelManager::model_size(kind);
+            ui.label(format_size(size));
+            ui.label(
+                egui::RichText::new("✓ 完了")
+                    .color(egui::Color32::from_rgb(80, 200, 80)),
+            );
+        }
+        DownloadState::Downloading { progress, total, .. } => {
+            let done = progress.load(std::sync::atomic::Ordering::Relaxed);
+            let t = total.load(std::sync::atomic::Ordering::Relaxed);
+            ui.label(format!("{} / {}", format_size(done), format_size(t)));
+            let pct = if t > 0 { done as f32 / t as f32 } else { 0.0 };
+            ui.add(
+                egui::ProgressBar::new(pct)
+                    .desired_width(120.0)
+                    .show_percentage(),
+            );
+        }
+        DownloadState::Failed(msg) => {
+            let size = ModelManager::model_size(kind);
+            ui.label(format_size(size));
+            ui.label(
+                egui::RichText::new(format!("✗ {msg}"))
+                    .color(egui::Color32::from_rgb(220, 80, 80))
+                    .small(),
+            );
+        }
+        DownloadState::NotDownloaded => {
+            let size = ModelManager::model_size(kind);
+            ui.label(format_size(size));
+            ui.label(
+                egui::RichText::new("—")
+                    .color(egui::Color32::from_gray(130)),
+            );
         }
     }
 }

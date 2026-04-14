@@ -19,6 +19,8 @@ fn draw_preset_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
     panel_width: f32,
+    ai_denoise_available: bool,
+    ai_upscale_available: bool,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut dragging = false;
@@ -113,6 +115,25 @@ fn draw_preset_sliders(
     ui.separator();
     ui.add_space(4.0);
 
+    if ai_denoise_available {
+        // ── AI ノイズ除去 ──
+        ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
+
+        let is_on = params.denoise_model.is_some();
+        let mut toggled = is_on;
+        if ui.checkbox(&mut toggled, "JPEG ノイズ除去を適用").changed() {
+            params.denoise_model = if toggled {
+                Some("denoise_realplksr".to_string())
+            } else {
+                None
+            };
+            changed = true;
+        }
+
+        ui.add_space(8.0);
+    }
+
+    if ai_upscale_available {
     // ── AI アップスケール ──
     ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
 
@@ -148,6 +169,7 @@ fn draw_preset_sliders(
                 }
             }
         });
+    } // ai_upscale_available
 
     ui.add_space(12.0);
     ui.separator();
@@ -235,7 +257,13 @@ impl App {
             .show(&mut scroll_child, |ui| {
                 ui.set_width(panel_rect.width() - 20.0);
                 ui.add_space(8.0);
-                draw_preset_sliders(ui, &mut self.adjustment_presets.presets[preset_idx], panel_rect.width())
+                draw_preset_sliders(
+                    ui,
+                    &mut self.adjustment_presets.presets[preset_idx],
+                    panel_rect.width(),
+                    self.settings.ai_denoise_feature,
+                    self.settings.ai_upscale_feature,
+                )
             }).inner;
 
         self.adjustment_dragging = is_dragging;

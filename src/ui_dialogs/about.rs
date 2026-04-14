@@ -22,7 +22,46 @@ impl App {
                     ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
                     ui.add_space(8.0);
                     ui.label("© 2025 Mikage Sawatari");
-                    ui.add_space(8.0);
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // サードパーティライセンス
+                ui.label(egui::RichText::new("サードパーティ ライセンス").strong());
+                ui.add_space(4.0);
+                egui::Grid::new("third_party_licenses")
+                    .num_columns(2)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        ui.label("ONNX Runtime");
+                        ui.label("MIT — Microsoft");
+                        ui.end_row();
+
+                        ui.label("Real-ESRGAN");
+                        ui.label("BSD-3-Clause — Xintao");
+                        ui.end_row();
+
+                        ui.label("Real-CUGAN");
+                        ui.label("MIT — bilibili");
+                        ui.end_row();
+
+                        ui.label("MI-GAN");
+                        ui.label("MIT");
+                        ui.end_row();
+
+                        ui.label("1xDeJPG_realplksr_otf");
+                        ui.label("CC-BY-4.0 — Phhofm");
+                        ui.end_row();
+
+                        ui.label("anime_classification");
+                        ui.label("MIT — deepghs");
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
                     if ui.button("閉じる").clicked() {
                         self.show_about_dialog = false;
                     }
