@@ -232,16 +232,10 @@ pub struct App {
     /// フォルダを開くダイアログのエラーメッセージ
     pub(crate) open_folder_error: Option<String>,
 
-    // ── 環境設定ポップアップ ─────────────────────────────────────
+    // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
-    /// 環境設定ダイアログ内の一時的な並列度編集値（Manual時の数値）
-    pub(crate) pref_manual_threads: usize,
-
-    // ── ツールバー表示設定ポップアップ ───────────────────────────
-    pub(crate) show_toolbar_settings: bool,
-
-    // ── キャッシュ生成設定ポップアップ (段階 C) ──────────────────
-    pub(crate) show_cache_policy_dialog: bool,
+    /// 統合環境設定の一時編集状態
+    pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
 
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
@@ -273,23 +267,9 @@ pub struct App {
 
     // ── 同名ファイル処理 ──────────────────────────────────────────
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
-    pub(crate) show_duplicate_settings: bool,
-    /// 同名ファイル処理の一時編集状態
-    pub(crate) dup_edit: Option<crate::ui_dialogs::duplicate_settings::DupEdit>,
 
     // ── 回転リセット確認ダイアログ ─────────────────────────────
     pub(crate) show_rotation_reset_confirm: bool,
-
-    // ── スライドショー設定ポップアップ ─────────────────────────
-    pub(crate) show_slideshow_settings: bool,
-    /// スライドショー設定の一時編集値
-    pub(crate) slideshow_edit_interval: Option<f32>,
-
-    // ── EXIF 表示設定ポップアップ ──────────────────────────────
-    pub(crate) show_exif_settings: bool,
-    pub(crate) exif_add_tag_input: String,
-    /// EXIF 設定の一時編集状態
-    pub(crate) exif_edit_tags: Option<Vec<String>>,
 
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     pub(crate) show_cache_manager: bool,
@@ -568,9 +548,7 @@ impl Default for App {
             open_folder_input: String::new(),
             open_folder_error: None,
             show_preferences: false,
-            pref_manual_threads: 4,
-            show_toolbar_settings: false,
-            show_cache_policy_dialog: false,
+            pref_state: None,
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
@@ -582,14 +560,7 @@ impl Default for App {
             pending_reload: false,
             select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
-            show_duplicate_settings: false,
-            dup_edit: None,
             show_rotation_reset_confirm: false,
-            show_slideshow_settings: false,
-            slideshow_edit_interval: None,
-            show_exif_settings: false,
-            exif_add_tag_input: String::new(),
-            exif_edit_tags: None,
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,
@@ -704,14 +675,9 @@ impl App {
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_preferences
-            || self.show_toolbar_settings
-            || self.show_cache_policy_dialog
             || self.show_cache_manager
             || self.show_delete_confirm
-            || self.show_duplicate_settings
             || self.show_rotation_reset_confirm
-            || self.show_slideshow_settings
-            || self.show_exif_settings
             || self.show_pdf_password_dialog
             || self.context_menu_idx.is_some()
     }
@@ -4259,13 +4225,8 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
-        self.show_toolbar_settings_dialog(ctx);
-        self.show_cache_policy_dialog(ctx);
         self.show_stats_dialog_window(ctx);
-        self.show_exif_settings_dialog(ctx);
-        self.show_slideshow_settings_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
-        self.show_duplicate_settings_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);

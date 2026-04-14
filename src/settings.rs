@@ -318,7 +318,7 @@ pub struct RecentApp {
 // Settings
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
     pub grid_cols: usize,
