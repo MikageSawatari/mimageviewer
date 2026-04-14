@@ -260,30 +260,15 @@ impl App {
                     }
                 }
             }
-            // キャッシュクリア
             if let Some(fs_idx) = self.fullscreen_idx {
-                self.adjustment_cache.remove(&fs_idx);
-                self.adjustment_sharpened.remove(&fs_idx);
-                self.adjustment_preview_tex = None;
-                self.ai_upscale_cache.clear();
-                self.ai_upscale_failed.clear();
-                for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
-                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                self.clear_adjustment_caches(fs_idx);
             }
         }
 
         // パラメータ変更があればキャッシュクリア + DB 保存
         if changed {
             if let Some(fs_idx) = self.fullscreen_idx {
-                self.adjustment_cache.remove(&fs_idx);
-                self.adjustment_sharpened.remove(&fs_idx);
-                self.adjustment_preview_tex = None;
-                self.ai_upscale_cache.clear();
-                self.ai_upscale_failed.clear();
-                for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
-                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                self.clear_adjustment_caches(fs_idx);
             }
             if let (Some(db), Some(folder)) = (&self.adjustment_db, &self.current_folder) {
                 let _ = db.set_presets(folder, &self.adjustment_presets);

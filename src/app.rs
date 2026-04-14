@@ -486,6 +486,8 @@ pub struct App {
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// スライダードラッグ中の低解像度プレビュー
     pub(crate) adjustment_preview_tex: Option<egui::TextureHandle>,
+    /// 前回プレビュー生成時のパラメータ（変更検出用）
+    pub(crate) adjustment_preview_params: Option<crate::adjustment::AdjustParams>,
     /// スライダードラッグ中フラグ
     pub(crate) adjustment_dragging: bool,
     /// 補正 DB ハンドル
@@ -666,6 +668,7 @@ impl Default for App {
             adjustment_page_preset: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_preview_tex: None,
+            adjustment_preview_params: None,
             adjustment_dragging: false,
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
             adjustment_pending: None,
@@ -1073,19 +1076,11 @@ impl App {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let page_map = db.load_page_presets(&prefix);
             if !page_map.is_empty() {
-                for (idx, item) in self.items.iter().enumerate() {
-                    let key = match item {
-                        GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
-                        GridItem::ZipImage { zip_path, entry_name } => {
-                            format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if let Some(&preset_idx) = page_map.get(&key) {
+                            self.adjustment_page_preset.insert(idx, preset_idx);
                         }
-                        GridItem::PdfPage { pdf_path, page_num } => {
-                            format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
-                        }
-                        _ => continue,
-                    };
-                    if let Some(&preset_idx) = page_map.get(&key) {
-                        self.adjustment_page_preset.insert(idx, preset_idx);
                     }
                 }
             }
@@ -3180,20 +3175,23 @@ impl App {
         ));
     }
 
-    /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
-    fn evict_ai_upscale_cache(&mut self, current_idx: usize) {
+    /// 先読み範囲内の item_idx 集合を計算する。
+    fn compute_keep_set(&self, current_idx: usize) -> std::collections::HashSet<usize> {
         let image_indices = Self::collect_image_indices(&self.items);
-        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
+            return std::collections::HashSet::new();
+        };
         let n = image_indices.len();
-
         let keep_back = self.settings.prefetch_back + 1;
         let keep_forward = self.settings.prefetch_forward + 1;
+        (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
+            .map(|p| image_indices[p])
+            .collect()
+    }
 
-        let keep_set: std::collections::HashSet<usize> =
-            (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
-                .map(|p| image_indices[p])
-                .collect();
-
+    /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
+    fn evict_ai_upscale_cache(&mut self, current_idx: usize) {
+        let keep_set = self.compute_keep_set(current_idx);
         self.ai_upscale_cache.retain(|k, _| keep_set.contains(k));
 
         // 範囲外の pending をキャンセル
@@ -3314,10 +3312,10 @@ impl App {
     /// poll_prefetch / poll_ai_upscale から呼ばれる。
     pub(crate) fn apply_fast_adjustment(&mut self, ctx: &egui::Context, idx: usize, pixels: &std::sync::Arc<egui::ColorImage>) {
         let Some(params) = self.get_adjustment_params(idx) else { return; };
-        if params.color_is_identity() && !crate::adjustment::needs_sharpen(&params) {
+        if params.is_identity() && !crate::adjustment::needs_sharpen(&params) {
             return; // 補正不要
         }
-        if params.color_is_identity() {
+        if params.is_identity() {
             // 色調補正なし、シャープネスのみ → バックグラウンドで処理
             // adjustment_cache にはソースをそのまま入れない（後で sharpen が更新する）
             return;
@@ -3333,29 +3331,32 @@ impl App {
     }
 
     /// スライダードラッグ中の低解像度プレビューを生成する。
+    /// パラメータが前回と同じなら再処理をスキップする。
     pub(crate) fn update_adjustment_preview(&mut self, ctx: &egui::Context, idx: usize) {
         if !self.adjustment_dragging {
             return;
         }
-        let preset_idx = self.adjustment_page_preset.get(&idx).copied()
-            .or(self.adjustment_active_preset);
-        let Some(pi) = preset_idx else { return; };
-        let params = &self.adjustment_presets.presets[pi as usize];
-        if params.color_is_identity() {
+        let Some(params) = self.get_adjustment_params(idx) else { return; };
+        if params.is_identity() {
             return;
         }
 
-        // ソース画像を取得
+        // パラメータが前回と同じならスキップ
+        if self.adjustment_preview_params.as_ref() == Some(&params) {
+            return;
+        }
+
         let source = self.fs_cache.get(&idx);
         let Some(FsCacheEntry::Static { pixels, .. }) = source else { return; };
 
-        let preview = crate::adjustment::apply_adjustments_preview(pixels, params);
+        let preview = crate::adjustment::apply_adjustments_preview(pixels, &params);
         let tex = ctx.load_texture(
             "adj_preview",
             preview,
             egui::TextureOptions::LINEAR,
         );
         self.adjustment_preview_tex = Some(tex);
+        self.adjustment_preview_params = Some(params);
         ctx.request_repaint();
     }
 
@@ -3396,20 +3397,23 @@ impl App {
         });
     }
 
+    /// 指定ページの補正関連キャッシュをすべてクリアする。
+    /// プリセット切替・パラメータ変更時に呼ぶ。
+    pub(crate) fn clear_adjustment_caches(&mut self, idx: usize) {
+        self.adjustment_cache.remove(&idx);
+        self.adjustment_sharpened.remove(&idx);
+        self.adjustment_preview_tex = None;
+        self.adjustment_preview_params = None;
+        self.ai_upscale_cache.clear();
+        self.ai_upscale_failed.clear();
+        for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// 補正キャッシュを evict する（prefetch 範囲外）。
     pub(crate) fn evict_adjustment_cache(&mut self, current_idx: usize) {
-        let image_indices = Self::collect_image_indices(&self.items);
-        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
-        let n = image_indices.len();
-
-        let keep_back = self.settings.prefetch_back + 1;
-        let keep_forward = self.settings.prefetch_forward + 1;
-
-        let keep_set: std::collections::HashSet<usize> =
-            (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
-                .map(|p| image_indices[p])
-                .collect();
-
+        let keep_set = self.compute_keep_set(current_idx);
         self.adjustment_cache.retain(|k, _| keep_set.contains(k));
         self.adjustment_sharpened.retain(|k| keep_set.contains(k));
     }

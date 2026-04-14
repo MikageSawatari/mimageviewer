@@ -27,17 +27,6 @@ pub enum AutoMode {
     ScanFix,
 }
 
-impl AutoMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            AutoMode::AutoLevel => "自動レベル",
-            AutoMode::AutoContrast => "自動コントラスト",
-            AutoMode::MangaCleanup => "漫画クリーンアップ",
-            AutoMode::ScanFix => "スキャン補正",
-        }
-    }
-}
-
 /// 画像補正パラメータ。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdjustParams {
@@ -88,11 +77,6 @@ impl AdjustParams {
             && self.white_point == 255
             && self.midtone == 1.0
             && self.auto_mode.is_none()
-    }
-
-    /// 色調補正パラメータのみ identity か（アップスケールは除外）。
-    pub fn color_is_identity(&self) -> bool {
-        self.is_identity()
     }
 
     /// アップスケールが設定されているか。

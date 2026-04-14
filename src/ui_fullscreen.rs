@@ -864,15 +864,7 @@ impl App {
                     let _ = db.set_page_preset(&key, Some(pi));
                 }
             }
-            // キャッシュクリア
-            self.adjustment_cache.remove(&fs_idx);
-            self.adjustment_sharpened.remove(&fs_idx);
-            self.adjustment_preview_tex = None;
-            self.ai_upscale_cache.clear();
-            self.ai_upscale_failed.clear();
-            for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.clear_adjustment_caches(fs_idx);
         }
 
         let is_spread_double = matches!(self.resolve_spread_pair(fs_idx), SpreadPair::Double { .. });
