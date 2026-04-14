@@ -160,28 +160,8 @@ impl App {
                         self.open_thumb_quality_dialog(ctx);
                         ui.close();
                     }
-                    if ui.button("キャッシュ生成設定…").clicked() {
-                        self.show_cache_policy_dialog = true;
-                        ui.close();
-                    }
                     if ui.button("統計…").clicked() {
                         self.show_stats_dialog = true;
-                        ui.close();
-                    }
-                    if ui.button("ツールバー…").clicked() {
-                        self.show_toolbar_settings = true;
-                        ui.close();
-                    }
-                    if ui.button("同名ファイル処理…").clicked() {
-                        self.show_duplicate_settings = true;
-                        ui.close();
-                    }
-                    if ui.button("EXIF 表示設定…").clicked() {
-                        self.show_exif_settings = true;
-                        ui.close();
-                    }
-                    if ui.button("スライドショー…").clicked() {
-                        self.show_slideshow_settings = true;
                         ui.close();
                     }
                     ui.separator();
@@ -191,13 +171,6 @@ impl App {
                     }
                     ui.separator();
                     if ui.button("環境設定…").clicked() {
-                        // ダイアログを開くとき現在値で初期化
-                        self.pref_manual_threads = match &self.settings.parallelism {
-                            crate::settings::Parallelism::Manual(n) => *n,
-                            crate::settings::Parallelism::Auto => {
-                                self.settings.parallelism.thread_count()
-                            }
-                        };
                         self.show_preferences = true;
                         ui.close();
                     }

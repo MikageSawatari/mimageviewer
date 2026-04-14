@@ -111,7 +111,32 @@
       "Bash(curl -s \"https://raw.githubusercontent.com/arcnmx/nvapi-rs/master/nvapi-sys/lib.rs\")",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:developer.nvidia.com)",
-      "WebFetch(domain:developer.download.nvidia.com)"
+      "WebFetch(domain:developer.download.nvidia.com)",
+      "WebFetch(domain:forest.watch.impress.co.jp)",
+      "mcp__obsidian-mcp-tools__fetch",
+      "Bash(gh auth:*)",
+      "Bash(git -C H:/home/mimageviewer config credential.helper)",
+      "Bash(git -C H:/home/mimageviewer-releases credential.helper)",
+      "Bash(git -C H:/home/mimageviewer-releases remote -v)",
+      "Bash(printf \"protocol=https\\\\nhost=github.com\\\\n\")",
+      "Bash(git credential:*)",
+      "Bash(python -c \"import sys,json; r=json.load\\(sys.stdin\\); print\\('NAME:', r.get\\('name'\\)\\); print\\('SIZE:', r.get\\('size'\\)\\); print\\('URL:', r.get\\('browser_download_url'\\)\\)\")",
+      "Bash(Start-Process \"H:/home/mimageviewer/target/release/mimageviewer.exe\")",
+      "Bash(tasklist /FI \"IMAGENAME eq mimageviewer.exe\")",
+      "Bash(powershell -Command \"Get-Process -Name mimageviewer -ErrorAction SilentlyContinue | Select-Object Name, Id, MainWindowTitle\")",
+      "Bash(powershell -Command \"Start-Process 'H:\\\\home\\\\mimageviewer\\\\target\\\\release\\\\mimageviewer.exe'; Start-Sleep 3; Get-Process -Name mimageviewer | Select-Object Name, Id, MainWindowTitle\")",
+      "Bash(xargs grep:*)",
+      "Bash(ls H:/home/mimageviewer/src/*.rs)",
+      "Bash(powershell -Command \"Start-Process 'H:\\\\home\\\\mimageviewer\\\\target\\\\release\\\\mimageviewer.exe' '--data-dir C:\\\\temp\\\\miv-default'; Start-Sleep 3; Get-Process -Name mimageviewer | Select-Object Name, Id, MainWindowTitle\")",
+      "Bash(powershell -Command \"Stop-Process -Name mimageviewer -Force -ErrorAction SilentlyContinue; Start-Sleep 1; echo done\")",
+      "Bash(powershell -Command ':*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\take_screenshots.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\take_screenshots2.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\take_screenshots3.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\screenshot_final.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\screenshot_fix.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\screenshot_meta.ps1\")",
+      "Bash(./target/release/bench_scroll.exe \"G:/home/photo/2025/2025-05-05\" --delete-cache --no-cache)"
     ]
   }
 }

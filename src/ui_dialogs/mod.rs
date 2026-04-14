@@ -9,18 +9,13 @@
 
 mod cache_creator;
 mod cache_manager;
-mod cache_policy;
 pub(crate) mod context_menu;
-pub(crate) mod duplicate_settings;
-mod exif_settings;
 mod fav_add;
 mod favorites_editor;
 mod open_folder;
-mod preferences;
+pub(crate) mod preferences;
 mod rotation_reset;
-mod slideshow_settings;
 mod stats_dialog;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
 mod pdf_password;
-mod toolbar_settings;
