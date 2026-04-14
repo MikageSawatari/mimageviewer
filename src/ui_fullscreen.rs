@@ -794,6 +794,7 @@ impl App {
         let key_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z));
         let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
         let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
+        let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
 
         // 画像補正プリセット (1-4 キー)
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
@@ -895,6 +896,15 @@ impl App {
                 if self.analysis_mosaic_grid {
                     self.analysis_guide_drag = None;
                 }
+            }
+        }
+
+        // P: スライドショー開始/停止トグル
+        if key_p {
+            self.slideshow_playing = !self.slideshow_playing;
+            if self.slideshow_playing {
+                self.slideshow_next_at = std::time::Instant::now()
+                    + std::time::Duration::from_secs_f32(self.settings.slideshow_interval_secs);
             }
         }
 
