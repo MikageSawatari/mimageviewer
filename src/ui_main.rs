@@ -348,7 +348,7 @@ impl App {
                         .is_some();
                     if ui
                         .add_enabled(has_parent, egui::Button::new("⬆"))
-                        .on_hover_text("上のフォルダへ (BS)")
+                        .on_hover_text("上のフォルダへ [BS]")
                         .clicked()
                     {
                         toolbar_parent_nav = true;

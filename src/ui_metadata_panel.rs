@@ -142,6 +142,11 @@ impl App {
                 egui::Color32::from_gray(140)
             },
         );
+        let pin_resp = pin_resp.on_hover_text(if self.show_metadata_panel {
+            "常時表示を解除 [I / Tab]"
+        } else {
+            "常時表示に固定 [I / Tab]"
+        });
         if pin_resp.clicked() {
             self.show_metadata_panel = !self.show_metadata_panel;
         }
