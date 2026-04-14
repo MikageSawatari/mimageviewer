@@ -181,31 +181,57 @@ impl App {
                 let available = ui.available_size();
                 let bottom_height = 36.0;
                 let main_height = (available.y - bottom_height - 12.0).max(200.0);
+                let tree_width = 180.0;
 
-                ui.horizontal(|ui| {
-                    ui.set_height(main_height);
+                // StripBuilder の代わりに手動で左右分割
+                // 左ツリーを child_ui で配置し、残りを右パネルにする
+                let outer_rect = ui.available_rect_before_wrap();
+                let left_rect = egui::Rect::from_min_size(
+                    outer_rect.min,
+                    egui::vec2(tree_width, main_height),
+                );
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(outer_rect.min.x + tree_width + 8.0, outer_rect.min.y),
+                    egui::vec2(
+                        (outer_rect.width() - tree_width - 8.0).max(100.0),
+                        main_height,
+                    ),
+                );
 
-                    // ── 左ツリー ──
-                    egui::ScrollArea::vertical()
-                        .id_salt("pref_tree")
-                        .max_width(180.0)
-                        .max_height(main_height)
-                        .show(ui, |ui| {
-                            ui.set_min_width(170.0);
-                            draw_tree(ui, state);
-                        });
+                // 左ツリー
+                let mut left_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(left_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)));
+                egui::ScrollArea::vertical()
+                    .id_salt("pref_tree")
+                    .max_height(main_height)
+                    .show(&mut left_ui, |ui| {
+                        ui.set_min_width(tree_width - 12.0);
+                        draw_tree(ui, state);
+                    });
 
-                    ui.separator();
+                // 区切り線
+                let sep_x = outer_rect.min.x + tree_width + 3.0;
+                ui.painter().vline(
+                    sep_x,
+                    outer_rect.min.y..=outer_rect.min.y + main_height,
+                    ui.visuals().widgets.noninteractive.bg_stroke,
+                );
 
-                    // ── 右パネル ──
-                    egui::ScrollArea::vertical()
-                        .id_salt("pref_panel")
-                        .max_height(main_height)
-                        .show(ui, |ui| {
-                            ui.set_min_width(420.0);
-                            draw_page(ui, state);
-                        });
-                });
+                // 右パネル
+                let mut right_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(right_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)));
+                egui::ScrollArea::vertical()
+                    .id_salt("pref_panel")
+                    .max_height(main_height)
+                    .show(&mut right_ui, |ui| {
+                        ui.set_min_width(400.0);
+                        draw_page(ui, state);
+                    });
+
+                // 全体の高さを確保
+                ui.allocate_space(egui::vec2(available.x, main_height));
 
                 ui.add_space(4.0);
                 ui.separator();
@@ -299,14 +325,13 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
             // 子ページ
             if is_expanded {
-                ui.indent(cat.label, |ui| {
-                    for &child in cat.children {
-                        let selected = state.selected == child;
-                        if ui.selectable_label(selected, child.label()).clicked() {
-                            state.selected = child;
-                        }
+                for &child in cat.children {
+                    let selected = state.selected == child;
+                    let text = format!("    {}", child.label());
+                    if ui.selectable_label(selected, text).clicked() {
+                        state.selected = child;
                     }
-                });
+                }
             }
         }
     }
@@ -365,7 +390,7 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(2.0);
     ui.label(egui::RichText::new("列").strong());
     ui.horizontal_wrapped(|ui| {
-        for cols in 2..=10usize {
+        for cols in 1..=10usize {
             let mut checked = s.toolbar_cols_items.contains(&cols);
             if ui.checkbox(&mut checked, format!("{cols}")).changed() {
                 if checked {
@@ -527,6 +552,29 @@ fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             egui::DragValue::new(&mut s.thumb_next_pages)
                 .range(0..=20u32)
                 .suffix(" ページ"),
+        );
+    });
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("AI アップスケールの先読み").strong());
+    ui.add_space(4.0);
+    ui.label("フルスクリーン表示時に AI アップスケール結果を前後の画像に先読みする枚数。");
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        ui.label("後方（前の画像）:");
+        ui.add(
+            egui::DragValue::new(&mut s.ai_upscale_prefetch_back)
+                .range(0..=10usize)
+                .suffix(" 枚"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("前方（次の画像）:");
+        ui.add(
+            egui::DragValue::new(&mut s.ai_upscale_prefetch_forward)
+                .range(0..=10usize)
+                .suffix(" 枚"),
         );
     });
 }
@@ -809,7 +857,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。");
+    ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 5-9 でも切り替えできます。");
     ui.add_space(4.0);
     egui::ComboBox::from_label("デフォルトの表示モード")
         .selected_text(s.default_spread_mode.label())
