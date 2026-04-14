@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+pub mod adjustment;
+pub mod adjustment_db;
 pub mod ai;
 mod app;
 pub mod catalog;
@@ -18,6 +20,7 @@ pub mod spread_db;
 pub mod stats;
 pub mod thumb_loader;
 pub mod ui_dialogs;
+mod ui_adjustment_panel;
 mod ui_analysis_panel;
 mod ui_fullscreen;
 pub mod ui_helpers;

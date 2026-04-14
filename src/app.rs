@@ -456,8 +456,6 @@ pub struct App {
     pub(crate) ai_upscale_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<crate::ai::upscale::UpscaleResult>)>,
     /// 画像タイプ分類キャッシュ: item_idx → カテゴリ
     pub(crate) ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
-    /// AI モデル選択ポップアップの開閉状態
-    pub(crate) ai_upscale_popup_open: bool,
     /// AI 補完 (inpainting) 有効フラグ
     pub(crate) ai_inpaint_active: bool,
     /// AI 補完の隙間幅 (論理ピクセル)
@@ -468,10 +466,34 @@ pub struct App {
     pub(crate) show_ai_model_setup: bool,
     /// AI アップスケールが失敗した idx の集合（リトライ防止）
     pub(crate) ai_upscale_failed: std::collections::HashSet<usize>,
+    /// AI ステータス表示の完了時刻（全処理完了後に記録、一定時間後に非表示）
+    pub(crate) ai_status_done_at: Option<std::time::Instant>,
     /// AI 補完キャッシュ: (left_idx, right_idx, gap_width) → テクスチャ
     pub(crate) ai_inpaint_cache: std::collections::HashMap<(usize, usize, u32), egui::TextureHandle>,
     /// AI 補完処理中: (キャンセルトークン, 受信チャネル)
     pub(crate) ai_inpaint_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<crate::ai::inpaint::InpaintResult>)>,
+
+    // ── 画像補正 ──────────────────────────────────────────────────
+    /// 補正パネル表示フラグ
+    pub(crate) adjustment_mode: bool,
+    /// 現フォルダ/ZIP/PDF の 4 プリセット
+    pub(crate) adjustment_presets: crate::adjustment::AdjustPresets,
+    /// 現在アクティブなプリセット番号 (0-3)。None = 補正なし。
+    pub(crate) adjustment_active_preset: Option<u8>,
+    /// ページごとのプリセット割り当て: item_idx → preset_idx
+    pub(crate) adjustment_page_preset: std::collections::HashMap<usize, u8>,
+    /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
+    pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// スライダードラッグ中の低解像度プレビュー
+    pub(crate) adjustment_preview_tex: Option<egui::TextureHandle>,
+    /// スライダードラッグ中フラグ
+    pub(crate) adjustment_dragging: bool,
+    /// 補正 DB ハンドル
+    pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
+    /// バックグラウンドシャープネス処理中: (item_idx, receiver)
+    pub(crate) adjustment_pending: Option<(usize, mpsc::Receiver<egui::ColorImage>)>,
+    /// シャープネス適用済みの idx 集合（再適用防止）
+    pub(crate) adjustment_sharpened: std::collections::HashSet<usize>,
 }
 
 impl Default for App {
@@ -628,14 +650,26 @@ impl Default for App {
             ai_upscale_cache: std::collections::HashMap::new(),
             ai_upscale_pending: std::collections::HashMap::new(),
             ai_classify_cache: std::collections::HashMap::new(),
-            ai_upscale_popup_open: false,
             ai_inpaint_active: false,
             ai_inpaint_gap_width,
             ai_inpaint_drag: None,
             show_ai_model_setup: false,
             ai_upscale_failed: std::collections::HashSet::new(),
+            ai_status_done_at: None,
             ai_inpaint_cache: std::collections::HashMap::new(),
             ai_inpaint_pending: None,
+
+            // 画像補正
+            adjustment_mode: false,
+            adjustment_presets: crate::adjustment::AdjustPresets::default(),
+            adjustment_active_preset: None,
+            adjustment_page_preset: std::collections::HashMap::new(),
+            adjustment_cache: std::collections::HashMap::new(),
+            adjustment_preview_tex: None,
+            adjustment_dragging: false,
+            adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
+            adjustment_pending: None,
+            adjustment_sharpened: std::collections::HashSet::new(),
         }
     }
 }
@@ -1021,6 +1055,41 @@ impl App {
         self.spread_popup_open = false;
         self.search_filter = None;
         self.search_query.clear();
+
+        // 画像補正: DB からプリセット読み込み + ページプリセット復元
+        self.adjustment_cache.clear();
+        self.adjustment_sharpened.clear();
+        self.adjustment_page_preset.clear();
+        self.adjustment_preview_tex = None;
+        self.adjustment_dragging = false;
+        self.adjustment_active_preset = None;
+        self.adjustment_mode = false;
+        if let Some((_, _)) = self.adjustment_pending.take() {}
+        self.adjustment_presets = self.adjustment_db.as_ref()
+            .and_then(|db| db.get_presets(&source_path))
+            .unwrap_or_default();
+        // ページごとのプリセット割り当てを DB から復元 → item_idx にマッピング
+        if let Some(db) = &self.adjustment_db {
+            let prefix = crate::adjustment_db::normalize_path(&source_path);
+            let page_map = db.load_page_presets(&prefix);
+            if !page_map.is_empty() {
+                for (idx, item) in self.items.iter().enumerate() {
+                    let key = match item {
+                        GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
+                        GridItem::ZipImage { zip_path, entry_name } => {
+                            format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
+                        }
+                        GridItem::PdfPage { pdf_path, page_num } => {
+                            format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
+                        }
+                        _ => continue,
+                    };
+                    if let Some(&preset_idx) = page_map.get(&key) {
+                        self.adjustment_page_preset.insert(idx, preset_idx);
+                    }
+                }
+            }
+        }
         // visible_indices はアイテム設定後 (下の行) に再計算される
 
         // ── カタログを開く + cache_map ロード + 削除掃除 ──
@@ -2179,6 +2248,12 @@ impl App {
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
+
+        // ページに割り当て済みのプリセットがあれば復元
+        if let Some(&pi) = self.adjustment_page_preset.get(&idx) {
+            self.adjustment_active_preset = Some(pi);
+        }
+
         // 画像切り替え時にズーム/パン/キャッシュをリセット
         self.analysis_zoom = 1.0;
         self.analysis_pan = egui::Vec2::ZERO;
@@ -2869,6 +2944,8 @@ impl App {
                 result.image,
                 egui::TextureOptions::LINEAR,
             );
+            // 色調補正を即座に適用（シャープネス除く）→ adjustment_cache を更新
+            self.apply_fast_adjustment(ctx, key, &pixels);
             self.ai_upscale_cache.insert(key, FsCacheEntry::Static {
                 tex: handle,
                 pixels,
@@ -3158,6 +3235,185 @@ impl App {
         }
     }
 
+    // ── 画像補正 ──────────────────────────────────────────────────
+
+    /// ページの正規化キーを返す（DB 保存用）。
+    pub(crate) fn page_path_key(&self, idx: usize) -> Option<String> {
+        let item = self.items.get(idx)?;
+        let key = match item {
+            GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
+            GridItem::ZipImage { zip_path, entry_name } => {
+                format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
+            }
+            GridItem::PdfPage { pdf_path, page_num } => {
+                format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
+            }
+            _ => return None,
+        };
+        Some(key)
+    }
+
+    /// 現在のプリセット設定に基づいて AI アップスケールの有効/モデルを更新する。
+    pub(crate) fn sync_upscale_from_preset(&mut self, idx: usize) {
+        let preset_idx = self.adjustment_page_preset.get(&idx).copied()
+            .or(self.adjustment_active_preset);
+        if let Some(pi) = preset_idx {
+            let params = &self.adjustment_presets.presets[pi as usize];
+            match params.upscale_model_kind() {
+                None => {
+                    self.ai_upscale_enabled = false;
+                    self.ai_upscale_model_override = None;
+                }
+                Some(None) => {
+                    self.ai_upscale_enabled = true;
+                    self.ai_upscale_model_override = None;
+                }
+                Some(Some(kind)) => {
+                    self.ai_upscale_enabled = true;
+                    self.ai_upscale_model_override = Some(kind);
+                }
+            }
+        } else {
+            self.ai_upscale_enabled = false;
+            self.ai_upscale_model_override = None;
+        }
+    }
+
+    /// 補正バックグラウンド処理の結果をポーリングする。
+    pub(crate) fn poll_adjustment(&mut self, ctx: &egui::Context) {
+        if let Some((idx, ref rx)) = self.adjustment_pending {
+            match rx.try_recv() {
+                Ok(color_image) => {
+                    let pixels = std::sync::Arc::new(color_image);
+                    let tex = ctx.load_texture(
+                        format!("adj_{idx}"),
+                        (*pixels).clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels });
+                    self.adjustment_sharpened.insert(idx);
+                    self.adjustment_pending = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.adjustment_pending = None;
+                }
+            }
+        }
+    }
+
+    /// 指定 idx に対応するプリセットパラメータを取得する。
+    fn get_adjustment_params(&self, idx: usize) -> Option<crate::adjustment::AdjustParams> {
+        let pi = self.adjustment_page_preset.get(&idx).copied()
+            .or(self.adjustment_active_preset)?;
+        Some(self.adjustment_presets.presets[pi as usize].clone())
+    }
+
+    /// 画像に即座に色調補正（シャープネス除く）を適用して adjustment_cache に格納する。
+    /// poll_prefetch / poll_ai_upscale から呼ばれる。
+    pub(crate) fn apply_fast_adjustment(&mut self, ctx: &egui::Context, idx: usize, pixels: &std::sync::Arc<egui::ColorImage>) {
+        let Some(params) = self.get_adjustment_params(idx) else { return; };
+        if params.color_is_identity() && !crate::adjustment::needs_sharpen(&params) {
+            return; // 補正不要
+        }
+        if params.color_is_identity() {
+            // 色調補正なし、シャープネスのみ → バックグラウンドで処理
+            // adjustment_cache にはソースをそのまま入れない（後で sharpen が更新する）
+            return;
+        }
+        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
+        let adjusted_pixels = std::sync::Arc::new(adjusted);
+        let tex = ctx.load_texture(
+            format!("adj_{idx}"),
+            (*adjusted_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels: adjusted_pixels });
+    }
+
+    /// スライダードラッグ中の低解像度プレビューを生成する。
+    pub(crate) fn update_adjustment_preview(&mut self, ctx: &egui::Context, idx: usize) {
+        if !self.adjustment_dragging {
+            return;
+        }
+        let preset_idx = self.adjustment_page_preset.get(&idx).copied()
+            .or(self.adjustment_active_preset);
+        let Some(pi) = preset_idx else { return; };
+        let params = &self.adjustment_presets.presets[pi as usize];
+        if params.color_is_identity() {
+            return;
+        }
+
+        // ソース画像を取得
+        let source = self.fs_cache.get(&idx);
+        let Some(FsCacheEntry::Static { pixels, .. }) = source else { return; };
+
+        let preview = crate::adjustment::apply_adjustments_preview(pixels, params);
+        let tex = ctx.load_texture(
+            "adj_preview",
+            preview,
+            egui::TextureOptions::LINEAR,
+        );
+        self.adjustment_preview_tex = Some(tex);
+        ctx.request_repaint();
+    }
+
+    /// シャープネス処理をバックグラウンドで開始する。
+    /// 色調補正は poll_prefetch / poll_ai_upscale で同期適用済み。
+    /// シャープネスだけ重い（畳み込み）ためバックグラウンド処理。
+    pub(crate) fn maybe_start_adjustment(&mut self, idx: usize) {
+        // 既にシャープネス適用済み or 処理中なら何もしない
+        if self.adjustment_sharpened.contains(&idx) {
+            return;
+        }
+        if self.adjustment_pending.as_ref().map_or(false, |(i, _)| *i == idx) {
+            return;
+        }
+
+        let Some(params) = self.get_adjustment_params(idx) else { return; };
+        if !crate::adjustment::needs_sharpen(&params) {
+            return; // シャープネス不要
+        }
+
+        // ソース画像を取得（adjustment_cache に色調補正済みがあればそちら、
+        // なければ ai_upscale_cache or fs_cache）
+        let source = self.adjustment_cache.get(&idx)
+            .or_else(|| if self.ai_upscale_enabled { self.ai_upscale_cache.get(&idx) } else { None })
+            .or_else(|| self.fs_cache.get(&idx));
+        let Some(FsCacheEntry::Static { pixels, .. }) = source else { return; };
+
+        // 既にシャープネス適用済みかチェック（adjustment_cache にあり、
+        // かつ色調補正済みソースのサイズと一致 = まだシャープネス未適用の可能性）
+        // → pending がなければシャープネスを適用
+        let pixels = std::sync::Arc::clone(pixels);
+
+        let (tx, rx) = mpsc::channel();
+        self.adjustment_pending = Some((idx, rx));
+        std::thread::spawn(move || {
+            let result = crate::adjustment::apply_sharpen_only(&pixels, &params);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// 補正キャッシュを evict する（prefetch 範囲外）。
+    pub(crate) fn evict_adjustment_cache(&mut self, current_idx: usize) {
+        let image_indices = Self::collect_image_indices(&self.items);
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
+        let n = image_indices.len();
+
+        let keep_back = self.settings.prefetch_back + 1;
+        let keep_forward = self.settings.prefetch_forward + 1;
+
+        let keep_set: std::collections::HashSet<usize> =
+            (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
+                .map(|p| image_indices[p])
+                .collect();
+
+        self.adjustment_cache.retain(|k, _| keep_set.contains(k));
+        self.adjustment_sharpened.retain(|k| keep_set.contains(k));
+    }
+
     /// `self.selected` に対応するアイテムが画像の場合、パスを last_selected_image_path に保存する。
     /// (フォルダ移動後もサムネイル画質ダイアログで使えるよう、セッション内で保持)
     pub(crate) fn update_last_selected_image(&mut self) {
@@ -3194,6 +3450,8 @@ impl App {
                         ci,
                         egui::TextureOptions::LINEAR,
                     );
+                    // 色調補正を即座に適用（シャープネス除く）
+                    self.apply_fast_adjustment(ctx, key, &pixels);
                     FsCacheEntry::Static { tex: handle, pixels }
                 }
                 FsLoadResult::Animated(frames) => {
@@ -3722,9 +3980,13 @@ impl eframe::App for App {
         self.poll_prefetch(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_ai_inpaint(ctx);
+        self.poll_adjustment(ctx);
 
-        // フルスクリーン表示中なら AI アップスケールを検討
+        // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
+            // プリセットに基づいてアップスケール設定を同期
+            self.sync_upscale_from_preset(fs_idx);
+
             // 表示中画像を最優先でアップスケール
             self.maybe_start_ai_upscale(fs_idx);
             // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール
@@ -3740,6 +4002,11 @@ impl eframe::App for App {
                 self.prefetch_ai_upscale(fs_idx);
             }
             self.evict_ai_upscale_cache(fs_idx);
+
+            // 画像補正の適用（アップスケール後に適用）
+            self.update_adjustment_preview(ctx, fs_idx);
+            self.maybe_start_adjustment(fs_idx);
+            self.evict_adjustment_cache(fs_idx);
         }
 
         // タイトルバーに現在のフォルダパスを表示する。
