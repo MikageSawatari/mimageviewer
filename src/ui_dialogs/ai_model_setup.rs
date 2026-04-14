@@ -58,7 +58,7 @@ impl crate::app::App {
                             ModelKind::UpscaleRealEsrganAnime6B,
                             ModelKind::UpscaleWaifu2xCunet,
                             ModelKind::UpscaleRealEsrGeneralV3,
-                            ModelKind::InpaintLama,
+                            ModelKind::InpaintMiGan,
                         ];
 
                         for &kind in &models {

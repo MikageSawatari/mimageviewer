@@ -35,15 +35,25 @@ impl AiRuntime {
     /// モデルファイルからセッションをロードしてキャッシュする。
     /// すでにロード済みの場合は何もしない。
     pub fn load_model(&self, kind: ModelKind, model_path: &Path) -> Result<(), AiError> {
+        self.load_model_inner(kind, model_path, false)
+    }
+
+    /// CPU 専用でモデルをロードする（DirectML 非互換モデル用）。
+    pub fn load_model_cpu(&self, kind: ModelKind, model_path: &Path) -> Result<(), AiError> {
+        self.load_model_inner(kind, model_path, true)
+    }
+
+    fn load_model_inner(&self, kind: ModelKind, model_path: &Path, force_cpu: bool) -> Result<(), AiError> {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.contains_key(&kind) {
             return Ok(());
         }
 
         crate::logger::log(format!(
-            "[AI] Loading model {:?} from {}",
+            "[AI] Loading model {:?} from {} ({})",
             kind,
-            model_path.display()
+            model_path.display(),
+            if force_cpu { "CPU" } else { "DirectML" }
         ));
 
         let mut builder = Session::builder()
@@ -57,19 +67,21 @@ impl AiRuntime {
             .with_intra_threads(4)
             .map_err(|e| AiError::Ort(format!("intra_threads: {e}")))?;
 
-        // DirectML EP を登録（失敗時は CPU フォールバック）
-        builder = match builder
-            .with_execution_providers([ort::ep::DirectML::default().build()])
-        {
-            Ok(b) => b,
-            Err(e) => {
-                crate::logger::log(format!(
-                    "[AI] DirectML EP registration failed, falling back to CPU: {}",
-                    e
-                ));
-                e.recover()
-            }
-        };
+        if !force_cpu {
+            // DirectML EP を登録（失敗時は CPU フォールバック）
+            builder = match builder
+                .with_execution_providers([ort::ep::DirectML::default().build()])
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "[AI] DirectML EP registration failed, falling back to CPU: {}",
+                        e
+                    ));
+                    e.recover()
+                }
+            };
+        }
 
         let session = builder
             .commit_from_file(model_path)

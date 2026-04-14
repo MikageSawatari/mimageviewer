@@ -466,7 +466,7 @@ impl App {
                         }
 
                         // ── フルスクリーン左下ステータス表示 ──
-                        if self.ai_upscale_enabled {
+                        if self.ai_upscale_enabled || self.ai_inpaint_active || self.ai_inpaint_pending.is_some() {
                             self.draw_fs_ai_status(ui, full_rect, fs_idx);
                         }
 
@@ -1399,7 +1399,8 @@ impl App {
             // AI 補完が有効な場合: キャッシュ済み inpaint テクスチャがあれば全体を描画
             let inpaint_drawn = if self.ai_inpaint_active && gap > 0.0 {
                 let gap_width_u32 = self.ai_inpaint_gap_width as u32;
-                if let Some(tex) = self.ai_inpaint_cache.get(&(left_idx, right_idx, gap_width_u32)) {
+                let trim_u32 = self.ai_inpaint_trim as u32;
+                if let Some(tex) = self.ai_inpaint_cache.get(&(left_idx, right_idx, gap_width_u32, trim_u32)) {
                     // inpaint 済みテクスチャを全体領域に描画
                     let full_rect = egui::Rect::from_min_size(
                         egui::pos2(start_x, start_y),
@@ -1421,6 +1422,17 @@ impl App {
             if !inpaint_drawn {
                 Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
                 Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+
+                // キャッシュがなく pending もなく失敗済みでもなければ自動的に inpaint を開始
+                if self.ai_inpaint_active && gap > 0.0
+                    && self.ai_inpaint_pending.is_none()
+                    && self.ai_inpaint_drag.is_none()
+                {
+                    let key = (left_idx, right_idx, self.ai_inpaint_gap_width as u32, self.ai_inpaint_trim as u32);
+                    if !self.ai_inpaint_failed.contains(&key) {
+                        self.start_ai_inpaint(left_idx, right_idx, self.ai_inpaint_gap_width as u32, self.ai_inpaint_trim as u32);
+                    }
+                }
             }
 
             if self.ai_inpaint_active && gap > 0.0 {
@@ -1428,6 +1440,7 @@ impl App {
                     egui::pos2(start_x + scaled_lw, start_y),
                     egui::vec2(scaled_gap, scaled_h),
                 );
+                let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
 
                 // ギャップ領域にまだ inpaint がなければ黒で表示
                 if !inpaint_drawn {
@@ -1435,13 +1448,16 @@ impl App {
                 }
 
                 // ドラッグ中のプレビュー枠
-                if let Some((_, preview_width)) = self.ai_inpaint_drag {
+                if let Some((sx, sy, orig_width, orig_trim)) = self.ai_inpaint_drag {
+                    let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
+                    let preview_width = (orig_width + dx / fit_scale)
+                        .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
+                    let preview_trim = (orig_trim - dy / fit_scale).clamp(0.0, 200.0);
+
+                    // gap 幅プレビュー（黄色枠）
                     let preview_gap = preview_width * fit_scale;
                     let preview_rect = egui::Rect::from_min_size(
-                        egui::pos2(
-                            image_rect.center().x - preview_gap * 0.5,
-                            start_y,
-                        ),
+                        egui::pos2(image_rect.center().x - preview_gap * 0.5, start_y),
                         egui::vec2(preview_gap, scaled_h),
                     );
                     ui.painter().rect_stroke(
@@ -1449,6 +1465,25 @@ impl App {
                         egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 100, 200)),
                         egui::StrokeKind::Outside,
                     );
+
+                    // trim プレビュー（赤い半透明帯、gap の左右）
+                    if preview_trim > 0.5 {
+                        let trim_px = preview_trim * fit_scale;
+                        // 左 trim 帯
+                        let lt_rect = egui::Rect::from_min_size(
+                            egui::pos2(preview_rect.min.x - trim_px, start_y),
+                            egui::vec2(trim_px, scaled_h),
+                        );
+                        ui.painter().rect_filled(lt_rect, 0.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 60, 60, 80));
+                        // 右 trim 帯
+                        let rt_rect = egui::Rect::from_min_size(
+                            egui::pos2(preview_rect.max.x, start_y),
+                            egui::vec2(trim_px, scaled_h),
+                        );
+                        ui.painter().rect_filled(rt_rect, 0.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 60, 60, 80));
+                    }
                 }
 
                 // マウスインタラクション: ギャップ付近でリサイズカーソル
@@ -1456,8 +1491,6 @@ impl App {
                     egui::pos2(gap_rect.min.x - 8.0, gap_rect.min.y),
                     egui::pos2(gap_rect.max.x + 8.0, gap_rect.max.y),
                 );
-
-                let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
                 let in_zone = pointer_pos.map(|p| hover_zone.contains(p)).unwrap_or(false);
 
                 if in_zone {
@@ -1467,35 +1500,35 @@ impl App {
 
                     if primary_pressed && self.ai_inpaint_drag.is_none() {
                         if let Some(pos) = pointer_pos {
-                            self.ai_inpaint_drag = Some((pos.x, self.ai_inpaint_gap_width));
+                            self.ai_inpaint_drag = Some((pos.x, pos.y, self.ai_inpaint_gap_width, self.ai_inpaint_trim));
                         }
                     }
                 }
 
                 // ドラッグ中（ゾーン外でも継続）
-                if let Some((start_x_drag, start_width)) = self.ai_inpaint_drag {
+                if let Some((sx, sy, orig_width, orig_trim)) = self.ai_inpaint_drag {
                     let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
                     let primary_released = ui.ctx().input(|i| i.pointer.primary_released());
 
                     if primary_down {
-                        if let Some(pos) = pointer_pos {
-                            let delta = pos.x - start_x_drag;
-                            let new_width = (start_width + delta * 2.0 / fit_scale)
-                                .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
-                            self.ai_inpaint_drag = Some((start_x_drag, new_width));
-                        }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
 
                     if primary_released {
-                        if let Some((_, new_width)) = self.ai_inpaint_drag.take() {
-                            self.ai_inpaint_gap_width = new_width;
-                            // 設定を保存
-                            self.settings.ai_inpaint_gap_width = new_width as u32;
-                            self.settings.save();
-                            // 新しい幅で inpaint 開始
-                            self.start_ai_inpaint(left_idx, right_idx, new_width as u32);
-                        }
+                        self.ai_inpaint_drag = None;
+                        let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
+                        let new_width = (orig_width + dx / fit_scale)
+                            .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
+                        let new_trim = (orig_trim - dy / fit_scale).clamp(0.0, 200.0);
+                        self.ai_inpaint_gap_width = new_width;
+                        self.ai_inpaint_trim = new_trim;
+                        self.ai_inpaint_failed.clear();
+                        // 設定を保存
+                        self.settings.ai_inpaint_gap_width = new_width as u32;
+                        self.settings.ai_inpaint_trim = new_trim as u32;
+                        self.settings.save();
+                        // 新しい幅で inpaint 開始
+                        self.start_ai_inpaint(left_idx, right_idx, new_width as u32, new_trim as u32);
                     }
                 }
             } else {
@@ -1890,9 +1923,11 @@ impl App {
                 }
                 if resp.hovered() { *nav_delta = 0; }
             }
-        }
 
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+            // プリセットボタン全体の幅分だけ next_x を左にずらす
+            // 次のボタンの左端が start_x - GAP - BUTTON_SIZE に来るように
+            next_x = start_x - BAR_BUTTON_GAP - BAR_BUTTON_SIZE;
+        }
 
         // 🖌 AI 補完ボタン（見開きダブル時のみ表示）
         if is_spread_double {
@@ -1945,8 +1980,13 @@ impl App {
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let is_adjusting = self.adjustment_pending.as_ref().map_or(false, |(i, _)| *i == fs_idx);
 
+        let is_inpainting = self.ai_inpaint_pending.is_some();
+        let is_downloading_lama = self.ai_inpaint_active && self.ai_model_manager.as_ref().map_or(false, |mgr| {
+            matches!(mgr.download_state(crate::ai::ModelKind::InpaintMiGan), crate::ai::model_manager::DownloadState::Downloading { .. })
+        });
+
         // 何か処理中かどうか
-        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting;
+        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting || is_inpainting || is_downloading_lama;
 
         if is_loading {
             lines.push(("読込中...".to_string(), egui::Color32::from_gray(180)));
@@ -1974,6 +2014,30 @@ impl App {
                 format!("アップスケール完了 ({})", model_label),
                 egui::Color32::from_rgb(80, 220, 80),
             ));
+        }
+
+        // 見開き AI 補完の進捗
+        if is_inpainting {
+            lines.push((
+                "見開き補完中 (MI-GAN)".to_string(),
+                egui::Color32::from_rgb(255, 200, 80),
+            ));
+        }
+
+        // MI-GAN モデルダウンロード中の表示
+        if self.ai_inpaint_active {
+            if let Some(ref mgr) = self.ai_model_manager {
+                let state = mgr.download_state(crate::ai::ModelKind::InpaintMiGan);
+                if let crate::ai::model_manager::DownloadState::Downloading { progress, total, .. } = state {
+                    let p = progress.load(std::sync::atomic::Ordering::Relaxed);
+                    let t = total.load(std::sync::atomic::Ordering::Relaxed);
+                    let pct = if t > 0 { (p as f64 / t as f64 * 100.0) as u32 } else { 0 };
+                    lines.push((
+                        format!("MI-GAN モデルダウンロード中... ({}%)", pct),
+                        egui::Color32::from_rgb(255, 200, 80),
+                    ));
+                }
+            }
         }
 
         // 先読みアップスケールの進捗

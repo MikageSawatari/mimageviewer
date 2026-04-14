@@ -460,8 +460,10 @@ pub struct App {
     pub(crate) ai_inpaint_active: bool,
     /// AI 補完の隙間幅 (論理ピクセル)
     pub(crate) ai_inpaint_gap_width: f32,
-    /// AI 補完のドラッグ状態: (開始 X, 開始時の幅)
-    pub(crate) ai_inpaint_drag: Option<(f32, f32)>,
+    /// AI 補完のトリム幅（左右の汚れ除去、ピクセル）
+    pub(crate) ai_inpaint_trim: f32,
+    /// AI 補完のドラッグ状態: (開始 X, 開始 Y, 開始時の幅, 開始時のトリム)
+    pub(crate) ai_inpaint_drag: Option<(f32, f32, f32, f32)>,
     /// AI モデルセットアップダイアログの表示フラグ
     pub(crate) show_ai_model_setup: bool,
     /// AI アップスケールが失敗した idx の集合（リトライ防止）
@@ -469,9 +471,11 @@ pub struct App {
     /// AI ステータス表示の完了時刻（全処理完了後に記録、一定時間後に非表示）
     pub(crate) ai_status_done_at: Option<std::time::Instant>,
     /// AI 補完キャッシュ: (left_idx, right_idx, gap_width) → テクスチャ
-    pub(crate) ai_inpaint_cache: std::collections::HashMap<(usize, usize, u32), egui::TextureHandle>,
-    /// AI 補完処理中: (キャンセルトークン, 受信チャネル)
-    pub(crate) ai_inpaint_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<crate::ai::inpaint::InpaintResult>)>,
+    pub(crate) ai_inpaint_cache: std::collections::HashMap<(usize, usize, u32, u32), egui::TextureHandle>,
+    /// AI 補完が失敗したキーの集合（リトライ防止）
+    pub(crate) ai_inpaint_failed: std::collections::HashSet<(usize, usize, u32, u32)>,
+    /// AI 補完処理中: (キャンセルトークン, 受信チャネル, キャッシュキー)
+    pub(crate) ai_inpaint_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<crate::ai::inpaint::InpaintResult>, (usize, usize, u32, u32))>,
 
     // ── 画像補正 ──────────────────────────────────────────────────
     /// 補正パネル表示フラグ
@@ -506,6 +510,7 @@ impl Default for App {
         let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
             .and_then(crate::ai::ModelKind::from_str);
         let ai_inpaint_gap_width = settings.ai_inpaint_gap_width as f32;
+        let ai_inpaint_trim = settings.ai_inpaint_trim as f32;
         Self {
             address: String::new(),
             current_folder: None,
@@ -654,11 +659,13 @@ impl Default for App {
             ai_classify_cache: std::collections::HashMap::new(),
             ai_inpaint_active: false,
             ai_inpaint_gap_width,
+            ai_inpaint_trim,
             ai_inpaint_drag: None,
             show_ai_model_setup: false,
             ai_upscale_failed: std::collections::HashSet::new(),
             ai_status_done_at: None,
             ai_inpaint_cache: std::collections::HashMap::new(),
+            ai_inpaint_failed: std::collections::HashSet::new(),
             ai_inpaint_pending: None,
 
             // 画像補正
@@ -3065,7 +3072,7 @@ impl App {
 
     /// AI 補完の完了をポーリングし、テクスチャに変換してキャッシュする。
     pub(crate) fn poll_ai_inpaint(&mut self, ctx: &egui::Context) {
-        let result = if let Some((_, ref rx)) = self.ai_inpaint_pending {
+        let result = if let Some((_, ref rx, _)) = self.ai_inpaint_pending {
             match rx.try_recv() {
                 Ok(r) => Some(Ok(r)),
                 Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
@@ -3082,10 +3089,16 @@ impl App {
                     inpaint_result.left_idx,
                     inpaint_result.right_idx,
                     inpaint_result.gap_width,
+                    inpaint_result.trim,
                 );
+                crate::logger::log(format!(
+                    "[AI] Inpaint complete: {}x{}, key=({},{},{},{})",
+                    inpaint_result.combined.size[0], inpaint_result.combined.size[1],
+                    key.0, key.1, key.2, key.3
+                ));
                 let handle = ctx.load_texture(
-                    format!("ai_inpaint_{}_{}_{}",
-                        key.0, key.1, key.2),
+                    format!("ai_inpaint_{}_{}_{}_{}",
+                        key.0, key.1, key.2, key.3),
                     inpaint_result.combined,
                     egui::TextureOptions::LINEAR,
                 );
@@ -3093,7 +3106,12 @@ impl App {
                 ctx.request_repaint();
             }
             Some(Err(())) => {
-                // Disconnected — スレッドが送信せずに終了
+                // Disconnected — スレッドが送信せずに終了（エラー）
+                let failed_key = self.ai_inpaint_pending.as_ref().map(|(_, _, k)| *k);
+                crate::logger::log(format!("[AI] Inpaint failed (worker disconnected): key={:?}", failed_key));
+                if let Some(key) = failed_key {
+                    self.ai_inpaint_failed.insert(key);
+                }
                 self.ai_inpaint_pending = None;
             }
             None => {}
@@ -3106,53 +3124,92 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         gap_width: u32,
+        trim: u32,
     ) {
+        crate::logger::log(format!(
+            "[AI] start_ai_inpaint called: left={left_idx}, right={right_idx}, gap={gap_width}, trim={trim}"
+        ));
+
         // 既存の pending をキャンセル
-        if let Some((cancel, _)) = self.ai_inpaint_pending.take() {
+        if let Some((cancel, _, _)) = self.ai_inpaint_pending.take() {
             cancel.store(true, Ordering::Relaxed);
+            crate::logger::log("[AI] Cancelled previous inpaint job".to_string());
         }
 
+        let key = (left_idx, right_idx, gap_width, trim);
+
         // すでにキャッシュにあればスキップ
-        if self.ai_inpaint_cache.contains_key(&(left_idx, right_idx, gap_width)) {
+        if self.ai_inpaint_cache.contains_key(&key) {
+            crate::logger::log("[AI] Inpaint cache hit, skipping".to_string());
+            return;
+        }
+
+        // 以前失敗したキーはスキップ
+        if self.ai_inpaint_failed.contains(&key) {
             return;
         }
 
         // 左右の画像を取得
         let left_pixels = match self.fs_cache.get(&left_idx) {
             Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
-            _ => return,
+            _ => {
+                crate::logger::log(format!("[AI] Inpaint: left image not in fs_cache (idx={left_idx})"));
+                return;
+            }
         };
         let right_pixels = match self.fs_cache.get(&right_idx) {
             Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
-            _ => return,
+            _ => {
+                crate::logger::log(format!("[AI] Inpaint: right image not in fs_cache (idx={right_idx})"));
+                return;
+            }
         };
 
-        let Some(runtime) = self.ai_runtime.clone() else { return; };
-        let Some(manager) = self.ai_model_manager.clone() else { return; };
+        // AI ランタイム / モデルマネージャを遅延初期化
+        self.ensure_ai_runtime();
 
-        // LaMa モデルが利用可能か確認
-        let Some(model_path) = manager.model_path(crate::ai::ModelKind::InpaintLama) else {
-            crate::logger::log("[AI] LaMa model not available".to_string());
+        let Some(runtime) = self.ai_runtime.clone() else {
+            crate::logger::log("[AI] Inpaint: ai_runtime not available".to_string());
+            return;
+        };
+        let Some(manager) = self.ai_model_manager.clone() else {
+            crate::logger::log("[AI] Inpaint: ai_model_manager not available".to_string());
             return;
         };
 
-        if !runtime.is_loaded(crate::ai::ModelKind::InpaintLama) {
-            if let Err(e) = runtime.load_model(crate::ai::ModelKind::InpaintLama, &model_path) {
-                crate::logger::log(format!("[AI] LaMa model load failed: {e}"));
-                return;
-            }
-        }
+        // LaMa モデルが利用可能か確認、なければ自動ダウンロード開始
+        let Some(model_path) = manager.model_path(crate::ai::ModelKind::InpaintMiGan) else {
+            crate::logger::log("[AI] MI-GAN model not available, starting download...".to_string());
+            manager.start_download(crate::ai::ModelKind::InpaintMiGan);
+            return;
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
         let (tx, rx) = mpsc::channel();
 
+        // モデルロード + 推論を全てバックグラウンドスレッドで実行
         std::thread::spawn(move || {
+            // モデルがまだロードされていなければロード（MI-GAN は DirectML 対応）
+            if !runtime.is_loaded(crate::ai::ModelKind::InpaintMiGan) {
+                crate::logger::log("[AI] Loading MI-GAN model in background...".to_string());
+                if let Err(e) = runtime.load_model(crate::ai::ModelKind::InpaintMiGan, &model_path) {
+                    crate::logger::log(format!("[AI] MI-GAN model load failed: {e}"));
+                    return;
+                }
+                crate::logger::log("[AI] MI-GAN model loaded".to_string());
+            }
+
+            if cancel_clone.load(Ordering::Relaxed) {
+                return;
+            }
+
             match crate::ai::inpaint::inpaint_spread(
                 &runtime,
                 &left_pixels,
                 &right_pixels,
                 gap_width,
+                trim,
                 &cancel_clone,
             ) {
                 Ok(combined) => {
@@ -3160,6 +3217,7 @@ impl App {
                         left_idx,
                         right_idx,
                         gap_width,
+                        trim,
                         combined,
                     });
                 }
@@ -3169,7 +3227,7 @@ impl App {
             }
         });
 
-        self.ai_inpaint_pending = Some((cancel, rx));
+        self.ai_inpaint_pending = Some((cancel, rx, key));
         crate::logger::log(format!(
             "[AI] Inpaint started: left={left_idx}, right={right_idx}, gap={gap_width}"
         ));
@@ -3985,6 +4043,11 @@ impl eframe::App for App {
         self.poll_ai_upscale(ctx);
         self.poll_ai_inpaint(ctx);
         self.poll_adjustment(ctx);
+
+        // AI モデルダウンロード中ならポーリング
+        if let Some(ref mgr) = self.ai_model_manager {
+            mgr.poll_downloads();
+        }
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {

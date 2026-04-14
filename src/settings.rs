@@ -485,6 +485,10 @@ pub struct Settings {
     #[serde(default = "default_ai_inpaint_gap_width")]
     pub ai_inpaint_gap_width: u32,
 
+    /// AI 補完: 欠損周辺のトリム幅（左右の汚れを除去するピクセル数）
+    #[serde(default)]
+    pub ai_inpaint_trim: u32,
+
     /// AI アップスケール: 先読み枚数（後方）
     #[serde(default = "default_ai_upscale_prefetch_back")]
     pub ai_upscale_prefetch_back: usize,
@@ -627,6 +631,7 @@ impl Default for Settings {
             ai_upscale_enabled: false,
             ai_upscale_model_override: None,
             ai_inpaint_gap_width: default_ai_inpaint_gap_width(),
+            ai_inpaint_trim: 0,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
         }

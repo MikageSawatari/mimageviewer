@@ -65,10 +65,10 @@ const MODEL_URLS: &[(ModelKind, &str, &str, u64)] = &[
         6_000_000,
     ),
     (
-        ModelKind::InpaintLama,
-        "lama_fp32.onnx",
-        "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
-        208_000_000,
+        ModelKind::InpaintMiGan,
+        "migan.onnx",
+        "https://huggingface.co/lxfater/inpaint-web/resolve/main/migan.onnx",
+        30_000_000,
     ),
 ];
 
@@ -122,7 +122,7 @@ const ALL_MODELS: &[ModelKind] = &[
     ModelKind::UpscaleWaifu2xCunet,
     ModelKind::UpscaleRealEsrGeneralV3,
     ModelKind::UpscaleRealCugan4x,
-    ModelKind::InpaintLama,
+    ModelKind::InpaintMiGan,
 ];
 
 impl ModelManager {

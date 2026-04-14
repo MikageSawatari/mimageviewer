@@ -62,8 +62,8 @@ pub enum ModelKind {
     UpscaleRealEsrGeneralV3,
     /// Real-CUGAN 4x conservative（漫画・スクリーントーン保持向け）
     UpscaleRealCugan4x,
-    /// LaMa Inpainting
-    InpaintLama,
+    /// MI-GAN Inpainting
+    InpaintMiGan,
 }
 
 impl ModelKind {
@@ -75,7 +75,7 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrganAnime6B => "realesrgan_anime6b",
             ModelKind::UpscaleWaifu2xCunet => "waifu2x_cunet",
             ModelKind::UpscaleRealEsrGeneralV3 => "realesr_general_v3",
-            ModelKind::InpaintLama => "inpaint_lama",
+            ModelKind::InpaintMiGan => "inpaint_migan",
             ModelKind::UpscaleRealCugan4x => "realcugan_4x",
         }
     }
@@ -88,7 +88,7 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrganAnime6B => "イラスト (Real-ESRGAN Anime)",
             ModelKind::UpscaleWaifu2xCunet => "漫画 (waifu2x cunet)",
             ModelKind::UpscaleRealEsrGeneralV3 => "汎用 (Real-ESRGAN General)",
-            ModelKind::InpaintLama => "補完 (LaMa)",
+            ModelKind::InpaintMiGan => "補完 (MI-GAN)",
             ModelKind::UpscaleRealCugan4x => "漫画 (Real-CUGAN 4x)",
         }
     }
@@ -101,7 +101,7 @@ impl ModelKind {
             "realesrgan_anime6b" => Some(ModelKind::UpscaleRealEsrganAnime6B),
             "waifu2x_cunet" => Some(ModelKind::UpscaleWaifu2xCunet),
             "realesr_general_v3" => Some(ModelKind::UpscaleRealEsrGeneralV3),
-            "inpaint_lama" => Some(ModelKind::InpaintLama),
+            "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
             "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
             _ => None,
         }
