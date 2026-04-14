@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Condvar, Mutex,
 };
+
+/// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
+/// push 側が notify_one() で起こす。
+pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 
 use eframe::egui;
 
@@ -158,10 +162,10 @@ pub struct App {
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
     /// 通常画像 (Image, ZipImage, PdfPage) 用
-    pub(crate) reload_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
+    pub(crate) reload_queue: Option<Arc<NotifyQueue>>,
     /// 重い I/O (ZipFile, PdfFile, Folder) 用の専用キュー。
     /// 専用 I/O ワーカー (2本) が priority 順に取り出す。
-    pub(crate) heavy_io_queue: Option<Arc<Mutex<Vec<LoadRequest>>>>,
+    pub(crate) heavy_io_queue: Option<Arc<NotifyQueue>>,
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
     pub(crate) requested: std::collections::HashMap<usize, bool>,
@@ -814,6 +818,7 @@ impl App {
         // 旧サムネイルワーカーを即座にキャンセルして PDF ワーカーキューの渋滞を防ぐ。
         // start_loading_items は enumerate 完了後に呼ばれるため、ここで先行キャンセルする。
         self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
 
         // ── パスワード確認 ──
         let password: Option<String> = self
@@ -932,6 +937,7 @@ impl App {
         }
 
         self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
         crate::logger::log("  cancel_token -> true (old tasks will stop)");
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_token = Arc::clone(&cancel);
@@ -1008,8 +1014,8 @@ impl App {
         ));
 
         // ── 永続ワーカー + (必要なら) 動画スレッドを起動 ──
-        let reload_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let heavy_io_queue: Arc<Mutex<Vec<LoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         self.reload_queue = Some(Arc::clone(&reload_queue));
         self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
 
@@ -1046,6 +1052,19 @@ impl App {
         self.settings.save();
     }
 
+    /// condvar.wait() 中の全ワーカーを起床させる。
+    /// cancel_token を true にした直後に呼び、ワーカーが即座にキャンセルを検知できるようにする。
+    fn wake_all_workers(&self) {
+        if let Some(ref q) = self.reload_queue {
+            let (_, ref cvar) = **q;
+            cvar.notify_all();
+        }
+        if let Some(ref q) = self.heavy_io_queue {
+            let (_, ref cvar) = **q;
+            cvar.notify_all();
+        }
+    }
+
     /// 永続サムネイルワーカープールを `parallelism.thread_count()` 個 spawn する。
     /// 各ワーカーは `reload_queue` を `scroll_hint` 優先度で消費し続け、
     /// `cancel` が立つまで動作する。
@@ -1053,8 +1072,8 @@ impl App {
         &self,
         tx: &mpsc::Sender<ThumbMsg>,
         cancel: Arc<AtomicBool>,
-        reload_queue: Arc<Mutex<Vec<LoadRequest>>>,
-        heavy_io_queue: Arc<Mutex<Vec<LoadRequest>>>,
+        reload_queue: Arc<NotifyQueue>,
+        heavy_io_queue: Arc<NotifyQueue>,
         cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
     ) {
@@ -1080,7 +1099,7 @@ impl App {
 
         // ── 共通のワーカーループ本体 ──
         // queue を受け取り、priority 順に取り出して process_load_request を呼ぶ。
-        let spawn_worker = |worker_idx: usize, prefix: &str, queue: Arc<Mutex<Vec<LoadRequest>>>| {
+        let spawn_worker = |worker_idx: usize, prefix: &str, queue: Arc<NotifyQueue>| {
             let tx_w = tx.clone();
             let cancel_w = Arc::clone(&cancel);
             let hint_w = Arc::clone(&scroll_hint);
@@ -1094,66 +1113,65 @@ impl App {
             let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
+                let (ref mtx, ref cvar) = *queue;
                 crate::logger::log(format!("  {tag} started"));
                 loop {
-                    if cancel_w.load(Ordering::Relaxed) { break; }
-
-                    // priority (可視範囲) を最優先、次に scroll_hint に近い順
-                    let req_opt: Option<LoadRequest> = {
-                        let mut q = queue.lock().unwrap();
-                        if q.is_empty() {
-                            None
-                        } else {
-                            let vis = hint_w.load(Ordering::Relaxed);
-                            let best = q
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, r)| {
-                                    let tier: usize = if r.priority { 0 } else { 1 };
-                                    let i = r.idx;
-                                    let dist = if i < vis { vis - i } else { i - vis };
-                                    (tier, dist)
-                                })
-                                .map(|(pos, _)| pos)
-                                .unwrap();
-                            Some(q.swap_remove(best))
+                    // priority (可視範囲) を最優先、次に scroll_hint に近い順。
+                    // キューが空なら condvar で待機し、push 側の notify で起床する。
+                    let req = {
+                        let mut q = mtx.lock().unwrap();
+                        loop {
+                            if cancel_w.load(Ordering::Relaxed) {
+                                break None;
+                            }
+                            if !q.is_empty() {
+                                let vis = hint_w.load(Ordering::Relaxed);
+                                let best = q
+                                    .iter()
+                                    .enumerate()
+                                    .min_by_key(|(_, r)| {
+                                        let tier: usize = if r.priority { 0 } else { 1 };
+                                        let i = r.idx;
+                                        let dist = if i < vis { vis - i } else { i - vis };
+                                        (tier, dist)
+                                    })
+                                    .map(|(pos, _)| pos)
+                                    .unwrap();
+                                break Some(q.swap_remove(best));
+                            }
+                            // キューが空 → condvar で待機（spurious wakeup は外側ループで再チェック）
+                            q = cvar.wait(q).unwrap();
                         }
                     };
 
-                    match req_opt {
-                        Some(req) => {
-                            if cancel_w.load(Ordering::Relaxed) { break; }
-                            let ks = ks_w.load(Ordering::Relaxed);
-                            let ke = ke_w.load(Ordering::Relaxed);
-                            if req.idx < ks || req.idx >= ke {
-                                crate::logger::log(format!(
-                                    "  {tag} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
-                                    req.idx,
-                                    req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                                ));
-                                continue;
-                            }
-                            let vis = hint_w.load(Ordering::Relaxed);
-                            let dist = if req.idx < vis { vis - req.idx } else { req.idx - vis };
-                            crate::logger::log(format!(
-                                "  {tag} pick idx={:>4} pri={} dist={dist:>4}  {}",
-                                req.idx,
-                                if req.priority { "H" } else { "L" },
-                                req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                            ));
-                            let display_px = display_px_w.load(Ordering::Relaxed);
-                            process_load_request(
-                                &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
-                                thumb_px, thumb_quality, display_px, cache_decision, &done_w,
-                                &stats_w,
-                                Some(&cancel_w),
-                                &ks_w, &ke_w,
-                            );
-                        }
-                        None => {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
+                    let Some(req) = req else { break; };
+
+                    let ks = ks_w.load(Ordering::Relaxed);
+                    let ke = ke_w.load(Ordering::Relaxed);
+                    if req.idx < ks || req.idx >= ke {
+                        crate::logger::log(format!(
+                            "  {tag} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
+                            req.idx,
+                            req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        ));
+                        continue;
                     }
+                    let vis = hint_w.load(Ordering::Relaxed);
+                    let dist = if req.idx < vis { vis - req.idx } else { req.idx - vis };
+                    crate::logger::log(format!(
+                        "  {tag} pick idx={:>4} pri={} dist={dist:>4}  {}",
+                        req.idx,
+                        if req.priority { "H" } else { "L" },
+                        req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                    ));
+                    let display_px = display_px_w.load(Ordering::Relaxed);
+                    process_load_request(
+                        &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
+                        thumb_px, thumb_quality, display_px, cache_decision, &done_w,
+                        &stats_w,
+                        Some(&cancel_w),
+                        &ks_w, &ke_w,
+                    );
                 }
                 crate::logger::log(format!("  {tag} stopped"));
             });
@@ -1407,7 +1425,7 @@ impl App {
         //
         //     可視範囲 (1 ページ分) のリクエストは priority=true でマークし、
         //     ワーカーが先読み要求より常に先に処理するようにする。
-        let Some(queue) = self.reload_queue.clone() else { return; };
+        let Some(queue_arc) = self.reload_queue.clone() else { return; };
 
         // 可視範囲の raw index 範囲を計算 (1 ページ分 + 上下 1 行のマージン)
         let vis_visible_start = vis_first.saturating_sub(cols);
@@ -1464,8 +1482,10 @@ impl App {
         let new_hi = new_regular.iter().chain(new_heavy.iter()).filter(|r| r.priority).count();
         let new_lo = new_regular.len() + new_heavy.len() - new_hi;
         let t3 = frame_t0.elapsed();
+        let regular_count = new_regular.len();
         {
-            let mut q = queue.lock().unwrap();
+            let (ref mtx, ref cvar) = *queue_arc;
+            let mut q = mtx.lock().unwrap();
             q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
@@ -1475,10 +1495,16 @@ impl App {
                 self.requested.insert(r.idx, false);
                 q.push(r);
             }
+            drop(q);
+            for _ in 0..regular_count {
+                cvar.notify_one();
+            }
         }
         // heavy_io_queue にも同様に push
+        let heavy_count = new_heavy.len();
         if let Some(hq) = self.heavy_io_queue.clone() {
-            let mut q = hq.lock().unwrap();
+            let (ref mtx, ref cvar) = *hq;
+            let mut q = mtx.lock().unwrap();
             q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
@@ -1486,6 +1512,10 @@ impl App {
             for r in new_heavy {
                 self.requested.insert(r.idx, false);
                 q.push(r);
+            }
+            drop(q);
+            for _ in 0..heavy_count {
+                cvar.notify_one();
             }
         }
         if new_hi > 0 || new_lo > 0 {
@@ -1553,9 +1583,10 @@ impl App {
         if !self.requested.is_empty() {
             return;
         }
-        let Some(queue) = self.reload_queue.clone() else { return; };
+        let Some(queue_arc) = self.reload_queue.clone() else { return; };
         {
-            let q = queue.lock().unwrap();
+            let (ref mtx, _) = *queue_arc;
+            let q = mtx.lock().unwrap();
             if !q.is_empty() {
                 return;
             }
@@ -1614,11 +1645,17 @@ impl App {
             upgrade_reqs.len(),
             current_display_px,
         ));
-        let mut q = queue.lock().unwrap();
+        let upgrade_count = upgrade_reqs.len();
+        let (ref mtx, ref cvar) = *queue_arc;
+        let mut q = mtx.lock().unwrap();
         for r in upgrade_reqs {
             // true = 高画質化要求
             self.requested.insert(r.idx, true);
             q.push(r);
+        }
+        drop(q);
+        for _ in 0..upgrade_count {
+            cvar.notify_one();
         }
     }
 
