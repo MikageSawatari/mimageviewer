@@ -2946,10 +2946,11 @@ impl App {
         let repaint = !completed.is_empty();
         for (key, result) in completed {
             self.ai_upscale_pending.remove(&key);
-            let pixels = std::sync::Arc::new(result.image.clone());
+            let pixels = std::sync::Arc::new(result.image);
+            let upload = clamp_for_gpu(&pixels);
             let handle = ctx.load_texture(
                 format!("ai_fs_{key}"),
-                result.image,
+                upload.into_owned(),
                 egui::TextureOptions::LINEAR,
             );
             // 色調補正を即座に適用（シャープネス除く）→ adjustment_cache を更新
@@ -3102,10 +3103,11 @@ impl App {
                     inpaint_result.combined.size[0], inpaint_result.combined.size[1],
                     key.0, key.1, key.2, key.3
                 ));
+                let upload = clamp_for_gpu(&inpaint_result.combined);
                 let handle = ctx.load_texture(
                     format!("ai_inpaint_{}_{}_{}_{}",
                         key.0, key.1, key.2, key.3),
-                    inpaint_result.combined,
+                    upload.into_owned(),
                     egui::TextureOptions::LINEAR,
                 );
                 self.ai_inpaint_cache.insert(key, handle);
@@ -3347,9 +3349,10 @@ impl App {
             match rx.try_recv() {
                 Ok(color_image) => {
                     let pixels = std::sync::Arc::new(color_image);
+                    let upload = clamp_for_gpu(&pixels);
                     let tex = ctx.load_texture(
                         format!("adj_{idx}"),
-                        (*pixels).clone(),
+                        upload.into_owned(),
                         egui::TextureOptions::LINEAR,
                     );
                     self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels });
@@ -3386,9 +3389,10 @@ impl App {
         }
         let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
         let adjusted_pixels = std::sync::Arc::new(adjusted);
+        let upload = clamp_for_gpu(&adjusted_pixels);
         let tex = ctx.load_texture(
             format!("adj_{idx}"),
-            (*adjusted_pixels).clone(),
+            upload.into_owned(),
             egui::TextureOptions::LINEAR,
         );
         self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels: adjusted_pixels });
@@ -3512,10 +3516,11 @@ impl App {
             self.fs_pending.remove(&key);
             let entry = match result {
                 FsLoadResult::Static(ci) => {
-                    let pixels = std::sync::Arc::new(ci.clone());
+                    let pixels = std::sync::Arc::new(ci);
+                    let upload = clamp_for_gpu(&pixels);
                     let handle = ctx.load_texture(
                         format!("fs_{key}"),
-                        ci,
+                        upload.into_owned(),
                         egui::TextureOptions::LINEAR,
                     );
                     // 色調補正を即座に適用（シャープネス除く）
@@ -4342,6 +4347,30 @@ pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::C
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+/// wgpu テクスチャの最大次元。wgpu デフォルト制限は 8192px。
+/// GPU 実機はもっと大きいが (RTX 4090 = 16384)、eframe が
+/// デフォルト Limits で初期化するため 8192 を超えるとパニックする。
+const MAX_TEXTURE_DIM: usize = 8192;
+
+/// GPU テクスチャ上限を超える `ColorImage` を縮小して返す。
+/// 上限内であればクローンせず共有参照をそのまま `Cow::Borrowed` で返す。
+pub(crate) fn clamp_for_gpu(ci: &egui::ColorImage) -> std::borrow::Cow<'_, egui::ColorImage> {
+    let [w, h] = ci.size;
+    if w <= MAX_TEXTURE_DIM && h <= MAX_TEXTURE_DIM {
+        return std::borrow::Cow::Borrowed(ci);
+    }
+    // 長辺を MAX_TEXTURE_DIM に収めるスケール
+    let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    let dynimg = color_image_to_dynamic(ci);
+    let resized = dynimg.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+    crate::logger::log(format!(
+        "  clamp_for_gpu: {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM})"
+    ));
+    std::borrow::Cow::Owned(dynamic_image_to_color_image(&resized))
 }
 
 /// 回転した画像を Mesh で描画する。

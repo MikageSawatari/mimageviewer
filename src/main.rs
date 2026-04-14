@@ -51,6 +51,30 @@ fn main() -> eframe::Result {
         logger::init();
     }
 
+    // パニック時にログファイルへ記録するフック（windows_subsystem = "windows" では
+    // stderr が見えないため、ここで捕捉しないとクラッシュ原因が不明になる）
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown payload".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("PANIC at {location}: {payload}\n{bt}");
+        logger::log(&msg);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("mimageviewer-panic.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
+        }
+    }));
+
     // 保存済み設定からウィンドウ初期状態を決定する
     let saved = settings::Settings::load();
 
