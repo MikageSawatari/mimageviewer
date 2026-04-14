@@ -267,7 +267,6 @@ fn run_benchmark(
 
     // マスク
     let scale_x = input_w as f32 / strip_w as f32;
-    let scale_y = input_h as f32 / combined_h as f32;
     let mask_x0 = (ctx as f32 * scale_x).round() as u32;
     let mask_x1 = (((ctx + left_trim + gap_width + right_trim) as f32) * scale_x)
         .round()
