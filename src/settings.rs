@@ -502,6 +502,11 @@ pub struct Settings {
     pub ai_upscale_prefetch_forward: usize,
 }
 
+/// グリッド列数の最小値
+pub const MIN_GRID_COLS: usize = 1;
+/// グリッド列数の最大値
+pub const MAX_GRID_COLS: usize = 10;
+
 fn default_grid_cols() -> usize { 4 }
 fn default_prefetch_back() -> usize { 4 }
 fn default_prefetch_forward() -> usize { 12 }
@@ -582,7 +587,7 @@ pub fn default_image_ext_priority() -> Vec<String> {
     .collect()
 }
 fn default_slideshow_interval() -> f32 { 3.0 }
-fn default_toolbar_cols_items() -> Vec<usize> { (1..=10).collect() }
+fn default_toolbar_cols_items() -> Vec<usize> { (MIN_GRID_COLS..=MAX_GRID_COLS).collect() }
 fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
 fn default_toolbar_sort_items() -> Vec<SortOrder> { SortOrder::all().to_vec() }
 

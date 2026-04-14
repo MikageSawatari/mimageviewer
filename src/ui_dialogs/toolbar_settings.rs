@@ -45,7 +45,7 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new("列").strong());
                 ui.horizontal_wrapped(|ui| {
-                    for cols in 1..=10usize {
+                    for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
                         let mut checked = self.settings.toolbar_cols_items.contains(&cols);
                         if ui.checkbox(&mut checked, format!("{cols}")).changed() {
                             if checked {

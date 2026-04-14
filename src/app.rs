@@ -2084,7 +2084,7 @@ impl App {
             if ctrl {
                 // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
-                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(1, 10) as usize;
+                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(crate::settings::MIN_GRID_COLS as i32, crate::settings::MAX_GRID_COLS as i32) as usize;
                 if new_cols != self.settings.grid_cols {
                     self.settings.grid_cols = new_cols;
                     self.settings.save();

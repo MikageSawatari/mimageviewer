@@ -115,7 +115,7 @@ impl App {
 
                 ui.menu_button("設定", |ui| {
                     ui.menu_button("サムネイル列数", |ui| {
-                        for cols in 1..=10usize {
+                        for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
                             let checked = self.settings.grid_cols == cols;
                             let prefix = if checked { "✓ " } else { "  " };
                             if ui.button(format!("{prefix}{cols} 列")).clicked() {
