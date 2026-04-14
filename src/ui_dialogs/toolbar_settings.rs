@@ -45,7 +45,7 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new("列").strong());
                 ui.horizontal_wrapped(|ui| {
-                    for cols in 2..=10usize {
+                    for cols in 1..=10usize {
                         let mut checked = self.settings.toolbar_cols_items.contains(&cols);
                         if ui.checkbox(&mut checked, format!("{cols}")).changed() {
                             if checked {

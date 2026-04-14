@@ -115,7 +115,7 @@ impl App {
 
                 ui.menu_button("設定", |ui| {
                     ui.menu_button("サムネイル列数", |ui| {
-                        for cols in 2..=10usize {
+                        for cols in 1..=10usize {
                             let checked = self.settings.grid_cols == cols;
                             let prefix = if checked { "✓ " } else { "  " };
                             if ui.button(format!("{prefix}{cols} 列")).clicked() {

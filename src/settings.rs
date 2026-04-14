@@ -582,7 +582,7 @@ pub fn default_image_ext_priority() -> Vec<String> {
     .collect()
 }
 fn default_slideshow_interval() -> f32 { 3.0 }
-fn default_toolbar_cols_items() -> Vec<usize> { (2..=10).collect() }
+fn default_toolbar_cols_items() -> Vec<usize> { (1..=10).collect() }
 fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
 fn default_toolbar_sort_items() -> Vec<SortOrder> { SortOrder::all().to_vec() }
 

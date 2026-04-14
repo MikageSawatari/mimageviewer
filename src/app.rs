@@ -2082,9 +2082,9 @@ impl App {
             });
 
             if ctrl {
-                // Ctrl+ホイール: 列数を増減（2〜10 の範囲）
+                // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
-                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(2, 10) as usize;
+                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(1, 10) as usize;
                 if new_cols != self.settings.grid_cols {
                     self.settings.grid_cols = new_cols;
                     self.settings.save();
@@ -4167,6 +4167,26 @@ impl eframe::App for App {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
                 self.show_open_folder_dialog = true;
+            }
+        }
+
+        // ── Alt+1〜0: 列数切り替え ──────────────────────────────────
+        if !self.address_has_focus && self.fullscreen_idx.is_none() && !self.any_dialog_open() {
+            let alt_col = ctx.input(|i| {
+                if !i.modifiers.alt { return None; }
+                let keys = [
+                    (egui::Key::Num1, 1), (egui::Key::Num2, 2), (egui::Key::Num3, 3),
+                    (egui::Key::Num4, 4), (egui::Key::Num5, 5), (egui::Key::Num6, 6),
+                    (egui::Key::Num7, 7), (egui::Key::Num8, 8), (egui::Key::Num9, 9),
+                    (egui::Key::Num0, 10),
+                ];
+                keys.iter().find(|(k, _)| i.key_pressed(*k)).map(|&(_, c)| c)
+            });
+            if let Some(cols) = alt_col {
+                if cols != self.settings.grid_cols {
+                    self.settings.grid_cols = cols;
+                    self.settings.save();
+                }
             }
         }
 
