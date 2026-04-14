@@ -99,13 +99,11 @@ pub(crate) struct PreferencesState {
 
     // ページ固有の一時状態
     pub manual_threads: usize,
-    pub slideshow_edit_interval: f32,
-    pub dup_skip_zip: bool,
-    pub dup_skip_image: bool,
-    pub dup_skip_dup: bool,
-    pub dup_ext_priority: Vec<String>,
-    pub exif_edit_tags: Vec<String>,
     pub exif_add_tag_input: String,
+
+    // 初回に1度だけ取得するキャッシュ値
+    pub auto_thread_count: usize,
+    pub vram_mib: Option<u64>,
 }
 
 impl PreferencesState {
@@ -114,7 +112,12 @@ impl PreferencesState {
             Parallelism::Manual(n) => *n,
             Parallelism::Auto => s.parallelism.thread_count(),
         };
-        // 子を持つカテゴリはデフォルトで展開
+        let auto_thread_count = {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2);
+            (cores / 2).max(1)
+        };
         let mut expanded = HashSet::new();
         for cat in TREE {
             if !cat.children.is_empty() {
@@ -126,26 +129,10 @@ impl PreferencesState {
             selected: PreferencesPage::Thumbnail,
             expanded,
             manual_threads,
-            slideshow_edit_interval: s.slideshow_interval_secs,
-            dup_skip_zip: s.skip_zip_if_folder_exists,
-            dup_skip_image: s.skip_image_if_video_exists,
-            dup_skip_dup: s.skip_duplicate_images,
-            dup_ext_priority: s.image_ext_priority.clone(),
-            exif_edit_tags: s.exif_hidden_tags.clone(),
             exif_add_tag_input: String::new(),
+            auto_thread_count,
+            vram_mib: crate::gpu_info::query_vram_summary_mib(),
         }
-    }
-
-    /// 一時状態を Settings にマージして返す
-    fn into_settings(self) -> Settings {
-        let mut s = self.settings;
-        s.slideshow_interval_secs = self.slideshow_edit_interval;
-        s.skip_zip_if_folder_exists = self.dup_skip_zip;
-        s.skip_image_if_video_exists = self.dup_skip_image;
-        s.skip_duplicate_images = self.dup_skip_dup;
-        s.image_ext_priority = self.dup_ext_priority;
-        s.exif_hidden_tags = self.exif_edit_tags;
-        s
     }
 }
 
@@ -262,7 +249,7 @@ impl App {
                 );
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
-                self.settings = state.into_settings();
+                self.settings = state.settings;
                 self.settings.save();
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み
@@ -277,7 +264,6 @@ impl App {
                         self.load_folder(folder);
                     }
                 }
-                // EXIF 設定が変更された場合はキャッシュをクリア
                 if old_exif != self.settings.exif_hidden_tags {
                     self.exif_cache.clear();
                 }
@@ -452,7 +438,7 @@ fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.horizontal(|ui| {
         ui.label("切り替え間隔:");
         ui.add(
-            egui::Slider::new(&mut state.slideshow_edit_interval, 0.5..=30.0)
+            egui::Slider::new(&mut state.settings.slideshow_interval_secs, 0.5..=30.0)
                 .suffix(" 秒")
                 .fixed_decimals(1),
         );
@@ -468,18 +454,12 @@ fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
     let is_auto = s.parallelism == Parallelism::Auto;
-    let auto_count = {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2);
-        (cores / 2).max(1)
-    };
 
     let mut current_auto = is_auto;
     if ui
         .radio(
             current_auto,
-            format!("自動（CPUコア数の半分: {} スレッド）", auto_count),
+            format!("自動（CPUコア数の半分: {} スレッド）", state.auto_thread_count),
         )
         .clicked()
     {
@@ -490,7 +470,6 @@ fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.horizontal(|ui| {
         if ui.radio(!current_auto, "手動").clicked() {
             s.parallelism = Parallelism::Manual(state.manual_threads);
-            current_auto = false;
         }
         ui.add_enabled(
             !current_auto,
@@ -582,8 +561,7 @@ fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    let vram_mib = crate::gpu_info::query_vram_summary_mib();
-    let vram_label = match vram_mib {
+    let vram_label = match state.vram_mib {
         Some(mib) if mib >= 1024 => format!("{:.1} GiB", mib as f64 / 1024.0),
         Some(mib) => format!("{} MiB", mib),
         None => "取得失敗 (4 GiB 仮定)".to_string(),
@@ -729,22 +707,23 @@ fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
 }
 
 fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
     ui.checkbox(
-        &mut state.dup_skip_zip,
+        &mut s.skip_zip_if_folder_exists,
         "同名の ZIP ファイルとフォルダがある場合、ZIP をスキップ",
     );
     ui.add_space(4.0);
     ui.checkbox(
-        &mut state.dup_skip_image,
+        &mut s.skip_image_if_video_exists,
         "同名の動画と画像がある場合、画像をスキップ",
     );
     ui.add_space(4.0);
     ui.checkbox(
-        &mut state.dup_skip_dup,
+        &mut s.skip_duplicate_images,
         "同名の画像が複数拡張子で存在する場合、優先度で選択",
     );
 
-    if state.dup_skip_dup {
+    if s.skip_duplicate_images {
         ui.add_space(4.0);
         ui.indent("ext_priority", |ui| {
             ui.label(
@@ -755,7 +734,7 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.add_space(2.0);
 
             let mut swap: Option<(usize, usize)> = None;
-            let len = state.dup_ext_priority.len();
+            let len = state.settings.image_ext_priority.len();
 
             egui::ScrollArea::vertical()
                 .max_height(200.0)
@@ -768,7 +747,7 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
                                     .size(11.0)
                                     .color(egui::Color32::from_gray(140)),
                             );
-                            ui.label(&state.dup_ext_priority[i]);
+                            ui.label(&state.settings.image_ext_priority[i]);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -785,12 +764,12 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 });
 
             if let Some((a, b)) = swap {
-                state.dup_ext_priority.swap(a, b);
+                state.settings.image_ext_priority.swap(a, b);
             }
 
             ui.add_space(4.0);
             if ui.button("デフォルトに戻す").clicked() {
-                state.dup_ext_priority = settings::default_image_ext_priority();
+                state.settings.image_ext_priority = settings::default_image_ext_priority();
             }
         });
     }
@@ -808,7 +787,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .id_salt("exif_tags_scroll")
         .show(ui, |ui| {
             ui.set_min_width(avail_w);
-            for (i, tag) in state.exif_edit_tags.iter().enumerate() {
+            for (i, tag) in state.settings.exif_hidden_tags.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.set_min_width(avail_w - 8.0);
                     ui.label(tag);
@@ -825,7 +804,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
         });
 
     if let Some(idx) = to_remove {
-        state.exif_edit_tags.remove(idx);
+        state.settings.exif_hidden_tags.remove(idx);
     }
 
     ui.add_space(8.0);
@@ -841,8 +820,8 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
             && !state.exif_add_tag_input.trim().is_empty()
         {
             let tag = state.exif_add_tag_input.trim().to_string();
-            if !state.exif_edit_tags.contains(&tag) {
-                state.exif_edit_tags.push(tag);
+            if !state.settings.exif_hidden_tags.contains(&tag) {
+                state.settings.exif_hidden_tags.push(tag);
             }
             state.exif_add_tag_input.clear();
         }
@@ -850,7 +829,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.add_space(4.0);
     if ui.button("デフォルトに戻す").clicked() {
-        state.exif_edit_tags = settings::default_exif_hidden_tags();
+        state.settings.exif_hidden_tags = settings::default_exif_hidden_tags();
     }
 }
 
