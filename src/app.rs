@@ -509,6 +509,7 @@ impl Default for App {
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
             .and_then(crate::ai::ModelKind::from_str);
+        let ai_inpaint_active = settings.ai_inpaint_active;
         let ai_inpaint_gap_width = settings.ai_inpaint_gap_width as f32;
         let ai_inpaint_trim = settings.ai_inpaint_trim as f32;
         Self {
@@ -657,7 +658,7 @@ impl Default for App {
             ai_upscale_cache: std::collections::HashMap::new(),
             ai_upscale_pending: std::collections::HashMap::new(),
             ai_classify_cache: std::collections::HashMap::new(),
-            ai_inpaint_active: false,
+            ai_inpaint_active,
             ai_inpaint_gap_width,
             ai_inpaint_trim,
             ai_inpaint_drag: None,

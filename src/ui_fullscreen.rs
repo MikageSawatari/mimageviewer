@@ -399,6 +399,7 @@ impl App {
                         // ── ホバーバー ──
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
+                        let inpaint_before = self.ai_inpaint_active;
                         let spread_before = self.spread_mode;
                         // AI アップスケール情報を計算（ホバーバーのファイル情報に表示）
                         let ai_info_model_name: String;
@@ -470,6 +471,11 @@ impl App {
                             self.draw_fs_ai_status(ui, full_rect, fs_idx);
                         }
 
+                        // 見開き補完の有効/無効が変更された場合
+                        if self.ai_inpaint_active != inpaint_before {
+                            self.settings.ai_inpaint_active = self.ai_inpaint_active;
+                            self.settings.save();
+                        }
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
@@ -1361,8 +1367,23 @@ impl App {
         let right_rot = self.get_rotation(right_idx);
 
         // 各ページの表示サイズを計算して、全体をフィットさせる
-        let left_size = Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-        let right_size = Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+        // 片方だけフルサイズだとアスペクト比の微小差でレイアウトがジャンプするため、
+        // 両方フルサイズが揃うまではサムネイルサイズに統一する
+        let both_in_fs_cache = self.fs_cache.contains_key(&left_idx)
+            && self.fs_cache.contains_key(&right_idx);
+        let (left_size, right_size) = if both_in_fs_cache {
+            (
+                Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
+                Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
+            )
+        } else {
+            // サムネイルのみ使用（fs_cache を空マップとして渡す）
+            let empty = std::collections::HashMap::new();
+            (
+                Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
+                Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
+            )
+        };
 
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
             // 両ページの高さを揃える（高い方に合わせる）
@@ -1371,7 +1392,13 @@ impl App {
             let right_w = rs.x * (combined_h / rs.y);
 
             // AI 補完が有効な場合はギャップを挿入
-            let gap = if self.ai_inpaint_active { self.ai_inpaint_gap_width } else { 0.0 };
+            // gap_width は元画像ピクセル単位なので、フルサイズが両方揃うまでは 0 にする
+            // （サムネイルに対して元画像サイズの gap を適用すると巨大な隙間になるため）
+            let gap = if self.ai_inpaint_active && both_in_fs_cache {
+                self.ai_inpaint_gap_width
+            } else {
+                0.0
+            };
             let combined_w = left_w + right_w + gap;
 
             // 画面にフィットするスケール
