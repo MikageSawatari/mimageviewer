@@ -701,6 +701,7 @@ impl App {
         ui.painter().line_segment(
             [egui::pos2(panel_rect.min.x, header_rect.max.y), egui::pos2(panel_rect.max.x, header_rect.max.y)],
             egui::Stroke::new(1.0, egui::Color32::from_gray(45)));
+        let close_resp = close_resp.on_hover_text("閉じる [Z]");
         if close_resp.clicked() { return true; }
 
         // ── マウス色取得 ──

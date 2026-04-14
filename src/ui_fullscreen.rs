@@ -1379,6 +1379,7 @@ impl App {
             false, // active 状態なし
             |p, c, r| draw_close_icon(p, c, r),
         );
+        let close_resp = close_resp.on_hover_text("閉じる [Esc]");
         if close_resp.clicked() { *close_fs = true; }
         if close_resp.hovered() { *nav_delta = 0; }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -1403,6 +1404,11 @@ impl App {
                 }
             },
         );
+        let play_resp = if *slideshow_playing {
+            play_resp.on_hover_text("スライドショー停止")
+        } else {
+            play_resp.on_hover_text("スライドショー")
+        };
         if play_resp.clicked() { *slideshow_playing = !*slideshow_playing; }
         if play_resp.hovered() { *nav_delta = 0; }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -1415,6 +1421,7 @@ impl App {
             false,
             |p, c, r| draw_rotate_icon(p, c, r, true),
         );
+        let rcw_resp = rcw_resp.on_hover_text("右回転 [R]");
         if rcw_resp.clicked() { *rotate_cw = true; }
         if rcw_resp.hovered() { *nav_delta = 0; }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -1427,6 +1434,7 @@ impl App {
             false,
             |p, c, r| draw_rotate_icon(p, c, r, false),
         );
+        let rccw_resp = rccw_resp.on_hover_text("左回転 [L]");
         if rccw_resp.clicked() { *rotate_ccw = true; }
         if rccw_resp.hovered() { *nav_delta = 0; }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -1439,6 +1447,7 @@ impl App {
             *show_info,
             |p, c, r| draw_info_icon(p, c, r),
         );
+        let info_resp = info_resp.on_hover_text("メタデータ [I / Tab]");
         if info_resp.clicked() { *show_info = !*show_info; }
         if info_resp.hovered() { *nav_delta = 0; }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -1452,6 +1461,7 @@ impl App {
                 *show_analysis,
                 |p, c, r| draw_analysis_icon(p, c, r),
             );
+            let analysis_resp = analysis_resp.on_hover_text("分析ツール [Z]");
             if analysis_resp.clicked() { *show_analysis = !*show_analysis; }
             if analysis_resp.hovered() { *nav_delta = 0; }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -1467,6 +1477,7 @@ impl App {
             spread_active,
             |p, c, r| draw_spread_icon(p, c, r, sm),
         );
+        let spread_resp = spread_resp.on_hover_text("見開き設定 [1-5]");
         if spread_resp.clicked() {
             *spread_popup_open = !*spread_popup_open;
         }
@@ -1526,6 +1537,17 @@ impl App {
                     mode.label(),
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_gray(220),
+                );
+
+                let shortcut_label = match mode.to_int() {
+                    0 => "[1]", 1 => "[2]", 2 => "[3]", 3 => "[4]", _ => "[5]",
+                };
+                ui.painter().text(
+                    egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    shortcut_label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_gray(140),
                 );
 
                 if item_resp.clicked() {
