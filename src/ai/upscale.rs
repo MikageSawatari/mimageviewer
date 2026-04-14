@@ -36,18 +36,15 @@ fn model_tile_size(kind: ModelKind) -> u32 {
 }
 
 
-/// 高解像度化をスキップする閾値（幅 or 高さがこの値以上なら不要）。
-pub const SKIP_THRESHOLD: u32 = 2048;
-
 /// アップスケール要求の結果。
 pub struct UpscaleResult {
     pub idx: usize,
     pub image: egui::ColorImage,
 }
 
-/// アップスケール対象かチェックする。
-pub fn should_upscale(width: u32, height: u32) -> bool {
-    width < SKIP_THRESHOLD && height < SKIP_THRESHOLD
+/// 画像サイズがしきい値未満か（しきい値以上ならスキップ）。
+pub fn should_process(width: u32, height: u32, threshold: u32) -> bool {
+    width < threshold && height < threshold
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。

@@ -3013,9 +3013,11 @@ impl App {
             _ => return,
         };
 
-        // 2K 以上はスキップ（アップスケール・デノイズ共通）
         let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
-        if !crate::ai::upscale::should_upscale(w, h) {
+        let upscale_in_range = crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+        let denoise_in_range = crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+        // 両方の範囲外ならスキップ
+        if (!upscale_enabled || !upscale_in_range) && (!denoise_enabled || !denoise_in_range) {
             return;
         }
 
@@ -3026,7 +3028,7 @@ impl App {
         let Some(manager) = self.ai_model_manager.clone() else { return; };
 
         // デノイズモデル選択・ロード
-        let denoise_model = if denoise_enabled {
+        let denoise_model = if denoise_enabled && denoise_in_range {
             let kind = match self.ai_denoise_model {
                 Some(k) => k,
                 None => return, // デノイズ有効だがモデル未設定
@@ -3047,7 +3049,7 @@ impl App {
         };
 
         // アップスケールモデル選択・ロード
-        let upscale_model = if upscale_enabled && crate::ai::upscale::should_upscale(w, h) {
+        let upscale_model = if upscale_enabled && upscale_in_range {
             let kind = match self.ai_upscale_model_override {
                 Some(k) => k,
                 None => {
@@ -4176,7 +4178,7 @@ impl eframe::App for App {
                 || (!self.ai_upscale_enabled && self.ai_denoise_model.is_none())
                 || (self.ai_upscale_enabled && self.ai_denoise_model.is_none() && self.fs_cache.get(&fs_idx).map(|e| {
                     if let FsCacheEntry::Static { pixels, .. } = e {
-                        !crate::ai::upscale::should_upscale(pixels.size[0] as u32, pixels.size[1] as u32)
+                        !crate::ai::upscale::should_process(pixels.size[0] as u32, pixels.size[1] as u32, self.settings.ai_upscale_skip_px)
                     } else { true }
                 }).unwrap_or(true));
             if current_done && self.ai_upscale_pending.is_empty() {

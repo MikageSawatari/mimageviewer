@@ -413,7 +413,7 @@ impl App {
                                 Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
                             } else if self.ai_upscale_enabled {
                                 if let Some((w, h)) = state.image_dims {
-                                    if crate::ai::upscale::should_upscale(w, h) {
+                                    if crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px) {
                                         Some((ai_info_model_name.as_str(), w * 4, h * 4))
                                     } else {
                                         None

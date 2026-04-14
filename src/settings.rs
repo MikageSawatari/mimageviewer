@@ -513,6 +513,14 @@ pub struct Settings {
     /// AI アップスケール: 先読み枚数（前方）
     #[serde(default = "default_ai_upscale_prefetch_forward")]
     pub ai_upscale_prefetch_forward: usize,
+
+    /// AI アップスケール: スキップしきい値（この値以上の画像はスキップ）
+    #[serde(default = "default_ai_upscale_skip_px")]
+    pub ai_upscale_skip_px: u32,
+
+    /// AI ノイズ除去: スキップしきい値（この値以上の画像はスキップ）
+    #[serde(default = "default_ai_denoise_skip_px")]
+    pub ai_denoise_skip_px: u32,
 }
 
 /// グリッド列数の最小値
@@ -537,6 +545,8 @@ fn default_folder_thumb_depth() -> u32 { 3 }
 fn default_ai_inpaint_gap_width() -> u32 { 40 }
 fn default_ai_upscale_prefetch_back() -> usize { 1 }
 fn default_ai_upscale_prefetch_forward() -> usize { 2 }
+fn default_ai_upscale_skip_px() -> u32 { 2048 }
+fn default_ai_denoise_skip_px() -> u32 { 2048 }
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -660,6 +670,8 @@ impl Default for Settings {
             ai_inpaint_trim: 0,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
+            ai_upscale_skip_px: default_ai_upscale_skip_px(),
+            ai_denoise_skip_px: default_ai_denoise_skip_px(),
         }
     }
 }

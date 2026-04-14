@@ -556,6 +556,27 @@ fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .suffix(" 枚"),
         );
     });
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("AI 処理のスキップしきい値").strong());
+    ui.add_space(4.0);
+    ui.label("画像の幅または高さがしきい値以上の場合、AI 処理をスキップします。");
+    ui.add_space(4.0);
+
+    let skip_options = [512, 1024, 2048];
+
+    ui.horizontal(|ui| {
+        ui.label("アップスケール:");
+        for &px in &skip_options {
+            ui.radio_value(&mut s.ai_upscale_skip_px, px, format!("{px} px"));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("ノイズ除去:");
+        for &px in &skip_options {
+            ui.radio_value(&mut s.ai_denoise_skip_px, px, format!("{px} px"));
+        }
+    });
 }
 
 fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
