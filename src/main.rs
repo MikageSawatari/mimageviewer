@@ -22,6 +22,7 @@ pub mod thumb_loader;
 pub mod ui_dialogs;
 mod ui_adjustment_panel;
 mod ui_analysis_panel;
+mod ui_erase;
 mod ui_fullscreen;
 pub mod ui_helpers;
 mod ui_main;

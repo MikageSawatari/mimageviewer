@@ -488,6 +488,22 @@ pub struct App {
     pub(crate) adjustment_pending: Option<(usize, mpsc::Receiver<egui::ColorImage>)>,
     /// シャープネス適用済みの idx 集合（再適用防止）
     pub(crate) adjustment_sharpened: std::collections::HashSet<usize>,
+
+    // ── 消しゴム (Erase) モード ───────────────────────────────────
+    /// E キーで切り替える消しゴムモード
+    pub(crate) erase_mode: bool,
+    /// マスクビットマップ（画像と同サイズ、true = マスク済み）
+    pub(crate) erase_mask: Option<Vec<bool>>,
+    /// マスク対象の画像サイズ [width, height]
+    pub(crate) erase_mask_size: [usize; 2],
+    /// マスクオーバーレイ用テクスチャ
+    pub(crate) erase_mask_texture: Option<egui::TextureHandle>,
+    /// 消しゴムモードでドラッグ中か（前フレームのポインタ位置を保持）
+    pub(crate) erase_last_paint_pos: Option<egui::Pos2>,
+    /// 元画像のピクセルデータバックアップ（inpaint 実行前に保存）
+    pub(crate) erase_original_pixels: Option<std::sync::Arc<egui::ColorImage>>,
+    /// inpaint 処理中の非同期受信チャネル
+    pub(crate) erase_inpaint_rx: Option<mpsc::Receiver<egui::ColorImage>>,
 }
 
 impl Default for App {
@@ -662,6 +678,15 @@ impl Default for App {
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
             adjustment_pending: None,
             adjustment_sharpened: std::collections::HashSet::new(),
+
+            // 消しゴムモード
+            erase_mode: false,
+            erase_mask: None,
+            erase_mask_size: [0, 0],
+            erase_mask_texture: None,
+            erase_last_paint_pos: None,
+            erase_original_pixels: None,
+            erase_inpaint_rx: None,
         }
     }
 }
@@ -2260,6 +2285,7 @@ impl App {
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
+        self.reset_erase_mode();
 
         // ページに割り当て済みのプリセットがあれば復元
         if let Some(&pi) = self.adjustment_page_preset.get(&idx) {
@@ -2886,6 +2912,7 @@ impl App {
         self.fs_viewport_shown = false;
         self.fs_secondary_press_start = None;
         self.fs_context_menu_idx = None;
+        self.reset_erase_mode();
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
