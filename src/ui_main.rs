@@ -202,6 +202,29 @@ impl App {
                         ui.close();
                     }
                 });
+
+                ui.menu_button("ヘルプ", |ui| {
+                    if ui.button("ヘルプサイトを開く").clicked() {
+                        let url = format!(
+                            "https://www.mikage.to/mimageviewer/manual/index.html?version={}",
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                        crate::ui_helpers::open_url(&url);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("ログフォルダを開く").clicked() {
+                        let dir = crate::data_dir::logs_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        crate::ui_helpers::open_external_player(&dir);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("バージョン情報").clicked() {
+                        self.show_about_dialog = true;
+                        ui.close();
+                    }
+                });
             });
         });
 

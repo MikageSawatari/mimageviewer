@@ -466,6 +466,8 @@ pub struct App {
     pub(crate) ai_inpaint_drag: Option<(f32, f32, f32, f32)>,
     /// AI モデルセットアップダイアログの表示フラグ
     pub(crate) show_ai_model_setup: bool,
+    /// バージョン情報ダイアログ
+    pub(crate) show_about_dialog: bool,
     /// AI アップスケールが失敗した idx の集合（リトライ防止）
     pub(crate) ai_upscale_failed: std::collections::HashSet<usize>,
     /// AI ステータス表示の完了時刻（全処理完了後に記録、一定時間後に非表示）
@@ -663,6 +665,7 @@ impl Default for App {
             ai_inpaint_trim,
             ai_inpaint_drag: None,
             show_ai_model_setup: false,
+            show_about_dialog: false,
             ai_upscale_failed: std::collections::HashSet::new(),
             ai_status_done_at: None,
             ai_inpaint_cache: std::collections::HashMap::new(),
@@ -4136,6 +4139,7 @@ impl eframe::App for App {
         self.show_delete_confirm_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
         self.show_ai_model_setup_dialog(ctx);
+        self.show_about_dialog_window(ctx);
         self.poll_pdf_enumerate();
 
         // ── ツールバー ───────────────────────────────────────────────

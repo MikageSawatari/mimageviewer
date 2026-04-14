@@ -114,6 +114,15 @@ mimageviewer/
   `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 
+### ダイアログ (egui::Window)
+- **ドラッグ移動**: `anchor()` を使うとウィンドウが固定されドラッグできなくなる。
+  必ず `default_pos()` を使う。定番の初期位置は `ctx.content_rect().min + egui::vec2(60.0, 40.0)`。
+- **閉じるボタン**: `.open(&mut open)` でタイトルバーに × ボタンが付く。
+  `open` が `false` になったら `show_*` フラグを落とす。
+- **パターン**: `ui_dialogs/` に 1 ファイル 1 メソッドで追加。
+  `mod.rs` に `mod xxx;` を追加し、`app.rs` の `update()` 内で `self.show_xxx(ctx)` を呼ぶ。
+  `App` 構造体に `show_xxx: bool` フィールドを追加し、`Default` impl で `false` 初期化。
+
 ### サムネイルロード
 - **Grid contents**: フォルダ・ZIP・PDF 先頭（名前順）、画像後続（ソート順設定可）。
   ZIP/PDF ファイルは 1 枚目/1 ページ目のサムネイル＋種別バッジで表示。非画像は無視。

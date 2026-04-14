@@ -66,9 +66,12 @@ fn main() -> eframe::Result {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC at {location}: {payload}\n{bt}");
         logger::log(&msg);
+        let log_dir = data_dir::logs_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let panic_log = log_dir.join("panic.log");
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true).append(true)
-            .open("mimageviewer-panic.log")
+            .open(&panic_log)
         {
             use std::io::Write;
             let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
