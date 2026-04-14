@@ -1,5 +1,8 @@
 #![windows_subsystem = "windows"]
 
+pub mod adjustment;
+pub mod adjustment_db;
+pub mod ai;
 mod app;
 pub mod catalog;
 pub mod data_dir;
@@ -17,6 +20,7 @@ pub mod spread_db;
 pub mod stats;
 pub mod thumb_loader;
 pub mod ui_dialogs;
+mod ui_adjustment_panel;
 mod ui_analysis_panel;
 mod ui_fullscreen;
 pub mod ui_helpers;
@@ -46,6 +50,33 @@ fn main() -> eframe::Result {
     if log_enabled {
         logger::init();
     }
+
+    // パニック時にログファイルへ記録するフック（windows_subsystem = "windows" では
+    // stderr が見えないため、ここで捕捉しないとクラッシュ原因が不明になる）
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown payload".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("PANIC at {location}: {payload}\n{bt}");
+        logger::log(&msg);
+        let log_dir = data_dir::logs_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let panic_log = log_dir.join("panic.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(&panic_log)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
+        }
+    }));
 
     // 保存済み設定からウィンドウ初期状態を決定する
     let saved = settings::Settings::load();

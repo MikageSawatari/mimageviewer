@@ -25,6 +25,11 @@ pub fn get() -> PathBuf {
     DATA_DIR.get().cloned().unwrap_or_else(default)
 }
 
+/// ログ用サブディレクトリ `<data_dir>/logs` を返す。
+pub fn logs_dir() -> PathBuf {
+    get().join("logs")
+}
+
 fn default() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata).join("mimageviewer")

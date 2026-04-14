@@ -39,6 +39,9 @@ turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
 base64 = "0.22"
+ort = { version = "2.0.0-rc.12", features = ["directml", "ndarray"] }
+ndarray = "0.17"
+ureq = "3"
 
 [dev-dependencies]
 tempfile = "3"
@@ -49,5 +52,5 @@ winresource = "0.1"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
 strip = true

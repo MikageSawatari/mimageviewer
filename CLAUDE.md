@@ -18,7 +18,10 @@ dual-window approach.
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (3 プロセス並列レンダリング)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
-- **GPU upscaling (Phase 2, planned)**: NVIDIA NGX DLISR via C FFI
+- **AI upscaling**: `ort` crate (ONNX Runtime v2 + DirectML EP)。Real-ESRGAN / waifu2x ONNX モデルでタイル分割 4x アップスケール
+- **AI image classification**: deepghs/anime_classification MobileNetV3 (ONNX) + ヒューリスティクス。イラスト/漫画/CG/写真を自動判別
+- **AI inpainting**: LaMa (ONNX) で見開きページ中央欠落補完
+- **AI model management**: 初回使用時に自動ダウンロード → `%APPDATA%/mimageviewer/models/` に保存
 - **Build tool**: cargo (MSVC toolchain on Windows) + cmake + NASM (TurboJPEG ビルドに必要)
 
 ## Project Structure
@@ -37,6 +40,13 @@ mimageviewer/
 ├── src/
 │   ├── main.rs              # エントリポイント + フォント設定 + logger::init()
 │   ├── app.rs               # App 構造体 + eframe::App 実装
+│   ├── ai/                  # AI 機能モジュール
+│   │   ├── mod.rs           # ModelKind, ImageCategory, AiError 型定義
+│   │   ├── runtime.rs       # ONNX Runtime (DirectML EP) セッション管理
+│   │   ├── model_manager.rs # モデルダウンロード・検証・パス管理
+│   │   ├── classify.rs      # 画像タイプ分類 (MobileNetV3 + ヒューリスティクス)
+│   │   ├── upscale.rs       # タイル分割 4x アップスケール推論
+│   │   └── inpaint.rs       # LaMa 見開きページ中央補完
 │   ├── ui_main.rs           # メイン画面 UI（グリッド描画）
 │   ├── ui_fullscreen.rs     # フルスクリーン表示
 │   ├── ui_helpers.rs        # UI ヘルパー関数
@@ -92,7 +102,7 @@ mimageviewer/
 
 1. **Phase 1** ✅ — コアビューワー（グリッド・フルスクリーン・設定永続化）
 2. **Phase 1.5** ✅ — サムネイルカタログ（SQLite + WebP）
-3. **Phase 2** 🔜 — AI アップスケール（NVIDIA NGX DLISR）
+3. **Phase 2** 🔧 — AI アップスケール（ONNX Runtime + DirectML、Real-ESRGAN / waifu2x）+ 画像タイプ自動判別 + 見開き AI 補完（LaMa）
 4. **Phase 3** ✅ — お気に入り・ツールバー・ZIP・WIC・動画・アニメーション
 
 ## Key Design Decisions
@@ -103,6 +113,15 @@ mimageviewer/
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
   `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
+
+### ダイアログ (egui::Window)
+- **ドラッグ移動**: `anchor()` を使うとウィンドウが固定されドラッグできなくなる。
+  必ず `default_pos()` を使う。定番の初期位置は `ctx.content_rect().min + egui::vec2(60.0, 40.0)`。
+- **閉じるボタン**: `.open(&mut open)` でタイトルバーに × ボタンが付く。
+  `open` が `false` になったら `show_*` フラグを落とす。
+- **パターン**: `ui_dialogs/` に 1 ファイル 1 メソッドで追加。
+  `mod.rs` に `mod xxx;` を追加し、`app.rs` の `update()` 内で `self.show_xxx(ctx)` を呼ぶ。
+  `App` 構造体に `show_xxx: bool` フィールドを追加し、`Default` impl で `false` 初期化。
 
 ### サムネイルロード
 - **Grid contents**: フォルダ・ZIP・PDF 先頭（名前順）、画像後続（ソート順設定可）。
@@ -127,7 +146,7 @@ mimageviewer/
 ### セキュリティ
 - `image` クレート（純粋Rust、メモリ安全）で画像デコード。
 - HEIC/AVIF/JXL/TIFF/RAW は WIC 経由（`unsafe` ブロックに局所化）。
-- NVIDIA NGX 呼び出し部分のみ `unsafe` ブロックに局所化（Phase 2）。
+- ONNX Runtime (ort crate) 経由の AI 推論は safe Rust API。DirectML EP で GPU アクセラレーション。
 
 ## Supported Image Formats
 

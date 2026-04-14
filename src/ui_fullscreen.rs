@@ -106,6 +106,15 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// 画像補正パネル時の画像表示領域（分析パネルより狭い）を返す。
+fn adjustment_image_rect(full_rect: egui::Rect) -> egui::Rect {
+    let panel_w = 240.0_f32.clamp(full_rect.width() * 0.12, full_rect.width() * 0.22);
+    egui::Rect::from_min_max(
+        full_rect.min,
+        egui::pos2(full_rect.max.x - panel_w, full_rect.max.y),
+    )
+}
+
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
@@ -262,15 +271,21 @@ impl App {
                         );
                         if wheel_nav != 0 { nav_delta = wheel_nav; }
                         if click_close { close_fs = true; }
+                        // ホイール/キーで nav_delta が確定済みなら、
+                        // ホバーバーのボタンホバーで上書きされないよう保護
+                        let nav_locked = nav_delta != 0;
 
                         // ── 見開きペア解決 ──
                         let spread_pair = self.resolve_spread_pair(fs_idx);
                         let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
 
-                        // ── 分析モード: 見開き中は無効、画像エリアを左側に制限 ──
+                        // ── 分析/補正モード: 見開き中は無効、画像エリアを左側に制限 ──
                         let analysis_active = self.analysis_mode && !is_spread_double;
+                        let adjustment_active = self.adjustment_mode && !is_spread_double;
                         let image_rect = if analysis_active {
                             analysis_image_rect(full_rect)
+                        } else if adjustment_active {
+                            adjustment_image_rect(full_rect)
                         } else {
                             full_rect
                         };
@@ -367,6 +382,13 @@ impl App {
                             if close_analysis {
                                 self.reset_analysis_mode();
                             }
+                        } else if adjustment_active {
+                            // ── 画像補正パネル ──
+                            let panel_rect = egui::Rect::from_min_max(
+                                egui::pos2(image_rect.max.x, full_rect.min.y),
+                                full_rect.max,
+                            );
+                            self.draw_adjustment_panel(ui, panel_rect);
                         } else if !is_spread_double {
                             // ── メタデータパネル（通常モード・単独表示のみ）──
                             let right_panel_visible =
@@ -377,21 +399,65 @@ impl App {
                         // ── ホバーバー ──
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
+                        let inpaint_before = self.ai_inpaint_active;
                         let spread_before = self.spread_mode;
-                        Self::draw_fs_hover_bar(
-                            ui, ctx, full_rect,
-                            &state.folder_display, &state.filename,
-                            state.image_dims, state.image_file_size,
-                            &mut close_fs, &mut nav_delta,
-                            &mut self.show_metadata_panel,
-                            false,
-                            &mut self.slideshow_playing,
-                            &mut self.settings.slideshow_interval_secs,
-                            &mut bar_rotate_cw, &mut bar_rotate_ccw,
-                            &mut self.analysis_mode,
-                            &mut self.spread_mode, &mut self.spread_popup_open,
-                            is_spread_double,
-                        );
+                        // AI アップスケール情報を計算（ホバーバーのファイル情報に表示）
+                        let ai_info_model_name: String;
+                        let ai_upscale_info = if self.ai_upscale_enabled {
+                            // 使用中のモデル名を判定
+                            let model_label = match self.ai_upscale_model_override {
+                                Some(k) => k.display_label().to_string(),
+                                None => {
+                                    // 自動: 分類結果のカテゴリ名を表示
+                                    self.ai_classify_cache.get(&fs_idx)
+                                        .map(|c| c.display_label().to_string())
+                                        .unwrap_or_else(|| "自動".to_string())
+                                }
+                            };
+                            ai_info_model_name = model_label;
+                            // アップスケール後のサイズ
+                            if let Some(crate::fs_animation::FsCacheEntry::Static { tex, .. }) =
+                                self.ai_upscale_cache.get(&fs_idx)
+                            {
+                                let s = tex.size_vec2();
+                                Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
+                            } else if let Some((w, h)) = state.image_dims {
+                                // まだアップスケール完了していない場合は予測サイズ
+                                if crate::ai::upscale::should_upscale(w, h) {
+                                    Some((ai_info_model_name.as_str(), w * 4, h * 4))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        {
+                            let saved_nav = nav_delta;
+                            Self::draw_fs_hover_bar(
+                                ui, ctx, full_rect,
+                                &state.folder_display, &state.filename,
+                                state.image_dims, state.image_file_size,
+                                &mut close_fs, &mut nav_delta,
+                                &mut self.show_metadata_panel,
+                                false,
+                                &mut self.slideshow_playing,
+                                &mut self.settings.slideshow_interval_secs,
+                                &mut bar_rotate_cw, &mut bar_rotate_ccw,
+                                &mut self.analysis_mode,
+                                &mut self.spread_mode, &mut self.spread_popup_open,
+                                is_spread_double,
+                                &mut self.ai_inpaint_active,
+                                ai_upscale_info,
+                                &mut self.adjustment_active_preset,
+                                &mut self.adjustment_mode,
+                            );
+                            // ホイール/キーで確定した nav_delta を保護
+                            if nav_locked { nav_delta = saved_nav; }
+                        }
                         if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
                         if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
 
@@ -400,6 +466,16 @@ impl App {
                             close_fs = true;
                         }
 
+                        // ── フルスクリーン左下ステータス表示 ──
+                        if self.ai_upscale_enabled || self.ai_inpaint_active || self.ai_inpaint_pending.is_some() {
+                            self.draw_fs_ai_status(ui, full_rect, fs_idx);
+                        }
+
+                        // 見開き補完の有効/無効が変更された場合
+                        if self.ai_inpaint_active != inpaint_before {
+                            self.settings.ai_inpaint_active = self.ai_inpaint_active;
+                            self.settings.save();
+                        }
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
@@ -408,6 +484,7 @@ impl App {
                             if self.spread_mode.is_spread() && self.analysis_mode {
                                 self.reset_analysis_mode();
                             }
+                            self.normalize_spread_position();
                         }
                     });
             },
@@ -418,8 +495,6 @@ impl App {
 
         // ── ナビゲーション & スライドショー処理 ──
         self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, fs_idx);
-        // 見開きモード変更後のページ位置正規化（viewport 外で呼ぶ）
-        self.normalize_spread_position();
         self.handle_fs_repaint(ctx, fs_idx, state.is_video);
     }
 
@@ -459,13 +534,45 @@ impl App {
         let tex: Option<egui::TextureHandle> = if is_video {
             None
         } else {
-            match self.fs_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
-                    frames.get(*current_frame).map(|(h, _)| h.clone())
+            // 補正プレビュー（スライダードラッグ中）を最優先
+            let adj_preview = if self.adjustment_dragging {
+                self.adjustment_preview_tex.clone()
+            } else {
+                None
+            };
+
+            // 補正済みキャッシュ
+            let adj_tex = if adj_preview.is_none() {
+                match self.adjustment_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                    _ => None,
                 }
-                Some(FsCacheEntry::Failed) | None => None,
-            }
+            } else {
+                None
+            };
+
+            // AI アップスケール有効時: アップスケール済みテクスチャ
+            let ai_tex = if adj_preview.is_none() && adj_tex.is_none() && self.ai_upscale_enabled {
+                match self.ai_upscale_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            adj_preview
+                .or(adj_tex)
+                .or(ai_tex)
+                .or_else(|| {
+                    match self.fs_cache.get(&fs_idx) {
+                        Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                        Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                            frames.get(*current_frame).map(|(h, _)| h.clone())
+                        }
+                        Some(FsCacheEntry::Failed) | None => None,
+                    }
+                })
         };
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
@@ -481,10 +588,29 @@ impl App {
         let folder_display = self.current_folder.as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let image_dims: Option<(u32, u32)> = tex.as_ref().map(|t| {
-            let s = t.size_vec2();
-            (s.x as u32, s.y as u32)
-        });
+        // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
+        // AI テクスチャが選ばれている場合でも、元画像のサイズを使う。
+        let image_dims: Option<(u32, u32)> = {
+            // まず元画像のキャッシュからサイズを取得
+            let original_dims = match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Static { tex, .. }) => {
+                    let s = tex.size_vec2();
+                    Some((s.x as u32, s.y as u32))
+                }
+                Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                    frames.get(*current_frame).map(|(h, _)| {
+                        let s = h.size_vec2();
+                        (s.x as u32, s.y as u32)
+                    })
+                }
+                _ => None,
+            };
+            // 元画像がまだロードされていなければ、表示中のテクスチャから取得
+            original_dims.or_else(|| tex.as_ref().map(|t| {
+                let s = t.size_vec2();
+                (s.x as u32, s.y as u32)
+            }))
+        };
         let image_file_size: Option<u64> = self.image_metas.get(fs_idx)
             .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
         let is_loading =
@@ -501,10 +627,6 @@ impl App {
     fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
         let center = self.last_outer_rect.map(|r| r.center());
         let ppp = self.last_pixels_per_point;
-        crate::logger::log(format!(
-            "[fullscreen] last_outer_rect center: {:?}  ppp={ppp:.2}",
-            center.map(|c| format!("({:.1},{:.1})", c.x, c.y))
-        ));
 
         let monitor_rect = center.and_then(|c| {
             crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp)
@@ -516,17 +638,10 @@ impl App {
             .with_taskbar(false);
         match monitor_rect {
             Some(rect) => {
-                crate::logger::log(format!(
-                    "[fullscreen] using monitor rect: pos=({:.1},{:.1}) size={:.1}x{:.1}",
-                    rect.min.x, rect.min.y, rect.width(), rect.height()
-                ));
                 b.with_position(rect.min)
                     .with_inner_size([rect.width(), rect.height()])
             }
             None => {
-                crate::logger::log(
-                    "[fullscreen] monitor rect not found, fallback to with_fullscreen".to_string(),
-                );
                 b.with_fullscreen(true)
             }
         }
@@ -652,35 +767,59 @@ impl App {
 
         if !has_focus { return action; }
 
-        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
+        // 奪われないようにする
+        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let shift_held = ctx.input(|i| i.modifiers.shift);
         // 左右キーは上下と分離して処理（RTL 反転のため）
-        let arrow_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-        let arrow_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-        let arrow_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
-        let arrow_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
-        let ctrl_d = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown));
-        let ctrl_u = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp));
-        let key_i = ctx.input(|i| i.key_pressed(egui::Key::I) || i.key_pressed(egui::Key::Tab));
-        let key_s = ctx.input(|i| i.key_pressed(egui::Key::Space));
-        let key_r = ctx.input(|i| i.key_pressed(egui::Key::R));
-        let key_l = ctx.input(|i| i.key_pressed(egui::Key::L));
-        let key_z = ctx.input(|i| i.key_pressed(egui::Key::Z));
-        let key_g = ctx.input(|i| i.key_pressed(egui::Key::G));
-        let key_m = ctx.input(|i| i.key_pressed(egui::Key::M));
+        // Shift+矢印（スプレッドナビ）にも対応するため、修飾キーを問わず消費
+        let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown));
+        let ctrl_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp));
+        let arrow_right = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+            || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight)
+        });
+        let arrow_left = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+            || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
+        });
+        let arrow_down = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+            || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
+        });
+        let arrow_up = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+            || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+        });
+        let key_i = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::I)
+            || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+        });
+        let key_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        let key_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
+        let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        let key_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z));
+        let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
+        let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
 
-        // 見開きモード切替 (1-5 キー)
-        let key_1 = ctx.input(|i| i.key_pressed(egui::Key::Num1));
-        let key_2 = ctx.input(|i| i.key_pressed(egui::Key::Num2));
-        let key_3 = ctx.input(|i| i.key_pressed(egui::Key::Num3));
-        let key_4 = ctx.input(|i| i.key_pressed(egui::Key::Num4));
-        let key_5 = ctx.input(|i| i.key_pressed(egui::Key::Num5));
+        // 画像補正プリセット (1-4 キー)
+        let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
+        let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
+        let key_3 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
+        let key_4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
 
-        let new_spread = if key_1 { Some(SpreadMode::Single) }
-            else if key_2 { Some(SpreadMode::Ltr) }
-            else if key_3 { Some(SpreadMode::LtrCover) }
-            else if key_4 { Some(SpreadMode::Rtl) }
-            else if key_5 { Some(SpreadMode::RtlCover) }
+        // 見開きモード切替 (5-9 キー)
+        let key_5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num5));
+        let key_6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num6));
+        let key_7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num7));
+        let key_8 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num8));
+        let key_9 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num9));
+
+        let new_spread = if key_5 { Some(SpreadMode::Single) }
+            else if key_6 { Some(SpreadMode::Ltr) }
+            else if key_7 { Some(SpreadMode::LtrCover) }
+            else if key_8 { Some(SpreadMode::Rtl) }
+            else if key_9 { Some(SpreadMode::RtlCover) }
             else { None };
 
         if let Some(mode) = new_spread {
@@ -702,6 +841,38 @@ impl App {
             }
         }
 
+        // 画像補正プリセット切替
+        let new_preset = if key_1 { Some(0u8) }
+            else if key_2 { Some(1) }
+            else if key_3 { Some(2) }
+            else if key_4 { Some(3) }
+            else { None };
+
+        if let Some(pi) = new_preset {
+            if self.adjustment_active_preset == Some(pi) && self.adjustment_mode {
+                // 同じキー再押下 → パネル閉じる
+                self.adjustment_mode = false;
+            } else {
+                // 異なるプリセット or パネル閉じている → 開く
+                self.adjustment_active_preset = Some(pi);
+                self.adjustment_mode = true;
+                // 分析モードと排他
+                if self.analysis_mode {
+                    self.fs_zoom = self.analysis_zoom;
+                    self.fs_pan = self.analysis_pan;
+                    self.reset_analysis_mode();
+                }
+            }
+            // ページにプリセットを割り当て
+            self.adjustment_page_preset.insert(fs_idx, pi);
+            if let Some(key) = self.page_path_key(fs_idx) {
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.set_page_preset(&key, Some(pi));
+                }
+            }
+            self.clear_adjustment_caches(fs_idx);
+        }
+
         let is_spread_double = matches!(self.resolve_spread_pair(fs_idx), SpreadPair::Double { .. });
 
         if esc { action.close = true; }
@@ -720,6 +891,8 @@ impl App {
                 self.analysis_zoom = self.fs_zoom;
                 self.analysis_pan = self.fs_pan;
                 self.analysis_mode = true;
+                // 補正パネルと排他
+                self.adjustment_mode = false;
             }
         }
         if self.analysis_mode && !is_spread_double {
@@ -789,14 +962,21 @@ impl App {
         let mut close = false;
 
         // ── ホイール ──
-        let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
+        // 右側パネル（メタデータ or 補正）の領域内ではホイールナビゲーションを抑制
+        let adj_panel_w = 240.0_f32.clamp(full_rect.width() * 0.12, full_rect.width() * 0.22);
+        let panel_w = if self.adjustment_mode {
+            adj_panel_w
+        } else {
+            METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5)
+        };
         let panel_left = full_rect.max.x - panel_w;
         let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
+        let has_panel = self.show_metadata_panel || self.adjustment_mode;
         let cursor_in_panel = ctx.input(|i| {
             i.pointer.hover_pos().map(|p| {
                 p.x > panel_left
                     && p.y >= 60.0
-                    && (self.show_metadata_panel || p.x > hover_threshold)
+                    && (has_panel || p.x > hover_threshold)
             }).unwrap_or(false)
         });
 
@@ -911,14 +1091,18 @@ impl App {
                             }
                         }
                     } else if fs_response.clicked() {
-                        if let Some(pos) = fs_response.interact_pointer_pos() {
-                            let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
-                            let in_panel = pos.y >= 60.0
-                                && (self.show_metadata_panel || pos.x > panel_threshold)
-                                && pos.x > full_rect.max.x - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
-                            if !in_panel {
-                                let base = if pos.x > full_rect.center().x { 1 } else { -1 };
-                                nav_delta = self.spread_nav_delta(base, false);
+                        // ポップアップ表示中はクリックでのページ送りを抑制
+                        let any_popup = self.spread_popup_open;
+                        if !any_popup {
+                            if let Some(pos) = fs_response.interact_pointer_pos() {
+                                let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
+                                let in_panel = pos.y >= 60.0
+                                    && (self.show_metadata_panel || pos.x > panel_threshold)
+                                    && pos.x > full_rect.max.x - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
+                                if !in_panel {
+                                    let base = if pos.x > full_rect.center().x { 1 } else { -1 };
+                                    nav_delta = self.spread_nav_delta(base, false);
+                                }
                             }
                         }
                     }
@@ -1000,6 +1184,11 @@ impl App {
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
+            } else {
+                crate::logger::log(format!(
+                    "[NAV] adjacent_navigable_idx returned None: fs_idx={fs_idx}, delta={nav_delta}, items={}, visible={}",
+                    self.items.len(), self.visible_indices.len()
+                ));
             }
         }
 
@@ -1166,6 +1355,7 @@ impl App {
 
     /// 見開きモードの2ページ描画。
     /// 2枚の画像を隙間なく中央に配置し、境界に薄い黒線を描画する。
+    /// AI 補完が有効な場合は中央にギャップを挿入し、ドラッグで幅調整できる。
     fn draw_fs_spread(
         &mut self,
         ui: &mut egui::Ui,
@@ -1177,25 +1367,50 @@ impl App {
         let right_rot = self.get_rotation(right_idx);
 
         // 各ページの表示サイズを計算して、全体をフィットさせる
-        let left_size = Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-        let right_size = Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+        // 片方だけフルサイズだとアスペクト比の微小差でレイアウトがジャンプするため、
+        // 両方フルサイズが揃うまではサムネイルサイズに統一する
+        let both_in_fs_cache = self.fs_cache.contains_key(&left_idx)
+            && self.fs_cache.contains_key(&right_idx);
+        let (left_size, right_size) = if both_in_fs_cache {
+            (
+                Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
+                Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
+            )
+        } else {
+            // サムネイルのみ使用（fs_cache を空マップとして渡す）
+            let empty = std::collections::HashMap::new();
+            (
+                Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
+                Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
+            )
+        };
 
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
             // 両ページの高さを揃える（高い方に合わせる）
             let combined_h = ls.y.max(rs.y);
             let left_w = ls.x * (combined_h / ls.y);
             let right_w = rs.x * (combined_h / rs.y);
-            let combined_w = left_w + right_w;
+
+            // AI 補完が有効な場合はギャップを挿入
+            // gap_width は元画像ピクセル単位なので、フルサイズが両方揃うまでは 0 にする
+            // （サムネイルに対して元画像サイズの gap を適用すると巨大な隙間になるため）
+            let gap = if self.ai_inpaint_active && both_in_fs_cache {
+                self.ai_inpaint_gap_width
+            } else {
+                0.0
+            };
+            let combined_w = left_w + right_w + gap;
 
             // 画面にフィットするスケール
             let fit_scale = (image_rect.width() / combined_w)
                 .min(image_rect.height() / combined_h);
             let scaled_lw = left_w * fit_scale;
             let scaled_rw = right_w * fit_scale;
+            let scaled_gap = gap * fit_scale;
             let scaled_h = combined_h * fit_scale;
 
             // 全体を中央に配置
-            let total_w = scaled_lw + scaled_rw;
+            let total_w = scaled_lw + scaled_gap + scaled_rw;
             let start_x = image_rect.center().x - total_w * 0.5;
             let start_y = image_rect.center().y - scaled_h * 0.5;
 
@@ -1204,22 +1419,157 @@ impl App {
                 egui::vec2(scaled_lw, scaled_h),
             );
             let right_rect = egui::Rect::from_min_size(
-                egui::pos2(start_x + scaled_lw, start_y),
+                egui::pos2(start_x + scaled_lw + scaled_gap, start_y),
                 egui::vec2(scaled_rw, scaled_h),
             );
 
-            Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-            Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+            // AI 補完が有効な場合: キャッシュ済み inpaint テクスチャがあれば全体を描画
+            let inpaint_drawn = if self.ai_inpaint_active && gap > 0.0 {
+                let gap_width_u32 = self.ai_inpaint_gap_width as u32;
+                let trim_u32 = self.ai_inpaint_trim as u32;
+                if let Some(tex) = self.ai_inpaint_cache.get(&(left_idx, right_idx, gap_width_u32, trim_u32)) {
+                    // inpaint 済みテクスチャを全体領域に描画
+                    let full_rect = egui::Rect::from_min_size(
+                        egui::pos2(start_x, start_y),
+                        egui::vec2(total_w, scaled_h),
+                    );
+                    ui.painter().image(
+                        tex.id(), full_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
-            // 区切り線（2px 黒線）
-            let divider_x = start_x + scaled_lw;
-            ui.painter().line_segment(
-                [
-                    egui::pos2(divider_x, start_y),
-                    egui::pos2(divider_x, start_y + scaled_h),
-                ],
-                egui::Stroke::new(SPREAD_DIVIDER_WIDTH, egui::Color32::BLACK),
-            );
+            if !inpaint_drawn {
+                Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+                Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+
+                // キャッシュがなく pending もなく失敗済みでもなければ自動的に inpaint を開始
+                if self.ai_inpaint_active && gap > 0.0
+                    && self.ai_inpaint_pending.is_none()
+                    && self.ai_inpaint_drag.is_none()
+                {
+                    let key = (left_idx, right_idx, self.ai_inpaint_gap_width as u32, self.ai_inpaint_trim as u32);
+                    if !self.ai_inpaint_failed.contains(&key) {
+                        self.start_ai_inpaint(left_idx, right_idx, self.ai_inpaint_gap_width as u32, self.ai_inpaint_trim as u32);
+                    }
+                }
+            }
+
+            if self.ai_inpaint_active && gap > 0.0 {
+                let gap_rect = egui::Rect::from_min_size(
+                    egui::pos2(start_x + scaled_lw, start_y),
+                    egui::vec2(scaled_gap, scaled_h),
+                );
+                let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
+
+                // ギャップ領域にまだ inpaint がなければ黒で表示
+                if !inpaint_drawn {
+                    ui.painter().rect_filled(gap_rect, 0.0, egui::Color32::BLACK);
+                }
+
+                // ドラッグ中のプレビュー枠
+                if let Some((sx, sy, orig_width, orig_trim)) = self.ai_inpaint_drag {
+                    let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
+                    let preview_width = (orig_width + dx / fit_scale)
+                        .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
+                    let preview_trim = (orig_trim - dy / fit_scale).clamp(0.0, crate::ai::inpaint::MAX_TRIM);
+
+                    // gap 幅プレビュー（黄色枠）
+                    let preview_gap = preview_width * fit_scale;
+                    let preview_rect = egui::Rect::from_min_size(
+                        egui::pos2(image_rect.center().x - preview_gap * 0.5, start_y),
+                        egui::vec2(preview_gap, scaled_h),
+                    );
+                    ui.painter().rect_stroke(
+                        preview_rect, 0.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 100, 200)),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    // trim プレビュー（赤い半透明帯、gap の左右）
+                    if preview_trim > 0.5 {
+                        let trim_px = preview_trim * fit_scale;
+                        // 左 trim 帯
+                        let lt_rect = egui::Rect::from_min_size(
+                            egui::pos2(preview_rect.min.x - trim_px, start_y),
+                            egui::vec2(trim_px, scaled_h),
+                        );
+                        ui.painter().rect_filled(lt_rect, 0.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 60, 60, 80));
+                        // 右 trim 帯
+                        let rt_rect = egui::Rect::from_min_size(
+                            egui::pos2(preview_rect.max.x, start_y),
+                            egui::vec2(trim_px, scaled_h),
+                        );
+                        ui.painter().rect_filled(rt_rect, 0.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 60, 60, 80));
+                    }
+                }
+
+                // マウスインタラクション: ギャップ付近でリサイズカーソル
+                let hover_zone = egui::Rect::from_min_max(
+                    egui::pos2(gap_rect.min.x - 8.0, gap_rect.min.y),
+                    egui::pos2(gap_rect.max.x + 8.0, gap_rect.max.y),
+                );
+                let in_zone = pointer_pos.map(|p| hover_zone.contains(p)).unwrap_or(false);
+
+                if in_zone {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+
+                    let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
+
+                    if primary_pressed && self.ai_inpaint_drag.is_none() {
+                        if let Some(pos) = pointer_pos {
+                            self.ai_inpaint_drag = Some((pos.x, pos.y, self.ai_inpaint_gap_width, self.ai_inpaint_trim));
+                        }
+                    }
+                }
+
+                // ドラッグ中（ゾーン外でも継続）
+                if let Some((sx, sy, orig_width, orig_trim)) = self.ai_inpaint_drag {
+                    let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+                    let primary_released = ui.ctx().input(|i| i.pointer.primary_released());
+
+                    if primary_down {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+
+                    if primary_released {
+                        self.ai_inpaint_drag = None;
+                        let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
+                        let new_width = (orig_width + dx / fit_scale)
+                            .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
+                        let new_trim = (orig_trim - dy / fit_scale).clamp(0.0, crate::ai::inpaint::MAX_TRIM);
+                        self.ai_inpaint_gap_width = new_width;
+                        self.ai_inpaint_trim = new_trim;
+                        self.ai_inpaint_failed.clear();
+                        self.ai_inpaint_cache.clear(); // 古い gap/trim の結果を GPU メモリから解放
+                        // 設定を保存
+                        self.settings.ai_inpaint_gap_width = new_width as u32;
+                        self.settings.ai_inpaint_trim = new_trim as u32;
+                        self.settings.save();
+                        // 新しい幅で inpaint 開始
+                        self.start_ai_inpaint(left_idx, right_idx, new_width as u32, new_trim as u32);
+                    }
+                }
+            } else {
+                // 通常の区切り線（2px 黒線）
+                let divider_x = start_x + scaled_lw;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(divider_x, start_y),
+                        egui::pos2(divider_x, start_y + scaled_h),
+                    ],
+                    egui::Stroke::new(SPREAD_DIVIDER_WIDTH, egui::Color32::BLACK),
+                );
+            }
         } else {
             // サイズ不明の場合は均等分割フォールバック
             let half_w = image_rect.width() / 2.0;
@@ -1341,6 +1691,12 @@ impl App {
         spread_mode: &mut SpreadMode,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
+        ai_inpaint_active: &mut bool,
+        // AI アップスケール後のサイズとモデル名（表示用）
+        ai_upscale_info: Option<(&str, u32, u32)>,
+        // 画像補正プリセット
+        adjustment_active_preset: &mut Option<u8>,
+        adjustment_mode: &mut bool,
     ) {
         let hover_in_top = ctx
             .input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
@@ -1546,6 +1902,77 @@ impl App {
             }
         }
 
+        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // 🎨 画像補正プリセットボタン (4つ: 1/2/3/4)
+        {
+            let preset_labels = ["1", "2", "3", "4"];
+            let preset_btn_size = 24.0_f32;
+            let preset_gap = 2.0_f32;
+            let total_w = preset_labels.len() as f32 * (preset_btn_size + preset_gap) - preset_gap;
+            let start_x = next_x + BAR_BUTTON_SIZE - total_w;
+            let btn_y = bar_rect.min.y + BAR_BUTTON_MARGIN + (BAR_BUTTON_SIZE - preset_btn_size) * 0.5;
+
+            for (i, label) in preset_labels.iter().enumerate() {
+                let bx = start_x + i as f32 * (preset_btn_size + preset_gap);
+                let btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(bx, btn_y),
+                    egui::vec2(preset_btn_size, preset_btn_size),
+                );
+                let is_active = *adjustment_active_preset == Some(i as u8);
+                let resp = ui.interact(
+                    btn_rect,
+                    egui::Id::new(format!("fs_preset_{i}")),
+                    egui::Sense::click(),
+                );
+                let bg = if is_active {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
+                } else if resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(60, 60, 60, 180)
+                };
+                ui.painter().rect_filled(btn_rect, 3.0, bg);
+                ui.painter().text(
+                    btn_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    *label,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+                if resp.clicked() {
+                    if is_active {
+                        *adjustment_active_preset = None;
+                        *adjustment_mode = false;
+                    } else {
+                        *adjustment_active_preset = Some(i as u8);
+                        *adjustment_mode = true;
+                    }
+                }
+                if resp.hovered() { *nav_delta = 0; }
+            }
+
+            // プリセットボタン全体の幅分だけ next_x を左にずらす
+            // 次のボタンの左端が start_x - GAP - BUTTON_SIZE に来るように
+            next_x = start_x - BAR_BUTTON_GAP - BAR_BUTTON_SIZE;
+        }
+
+        // 🖌 AI 補完ボタン（見開きダブル時のみ表示）
+        if is_spread_double {
+            let inpaint_resp = draw_bar_button(
+                ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_inpaint_btn",
+                |hovered| bar_button_bg(hovered, *ai_inpaint_active),
+                *ai_inpaint_active,
+                |p, c, r| draw_inpaint_icon(p, c, r),
+            );
+            if inpaint_resp.clicked() {
+                *ai_inpaint_active = !*ai_inpaint_active;
+            }
+            if inpaint_resp.hovered() { *nav_delta = 0; }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
         // ── 左側: フォルダパス ──
         if !folder_display.is_empty() {
             ui.painter().text(
@@ -1562,7 +1989,165 @@ impl App {
             ui, bar_rect,
             egui::pos2(next_x - 12.0, bar_rect.center().y),
             filename, image_dims, image_file_size,
+            ai_upscale_info,
         );
+    }
+}
+
+// ── フルスクリーン AI ステータスオーバーレイ ────────────────────────────
+
+impl App {
+    /// フルスクリーン左下に AI 処理ステータスを表示する。
+    fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, full_rect: egui::Rect, fs_idx: usize) {
+        let mut lines: Vec<(String, egui::Color32)> = Vec::new();
+
+        // 表示中画像の状態
+        let _has_original = self.fs_cache.contains_key(&fs_idx);
+        let is_upscaling = self.ai_upscale_pending.contains_key(&fs_idx);
+        let is_upscaled = self.ai_upscale_cache.contains_key(&fs_idx);
+        let is_loading = self.fs_pending.contains_key(&fs_idx);
+        let is_adjusting = self.adjustment_pending.as_ref().map_or(false, |(i, _)| *i == fs_idx);
+
+        let is_inpainting = self.ai_inpaint_pending.is_some();
+        let is_downloading_inpaint = self.ai_inpaint_active && self.ai_model_manager.as_ref().map_or(false, |mgr| {
+            matches!(mgr.download_state(crate::ai::ModelKind::InpaintMiGan), crate::ai::model_manager::DownloadState::Downloading { .. })
+        });
+
+        // 何か処理中かどうか
+        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting || is_inpainting || is_downloading_inpaint;
+
+        if is_loading {
+            lines.push(("読込中...".to_string(), egui::Color32::from_gray(180)));
+        }
+
+        if is_upscaling {
+            let model_label = match self.ai_upscale_model_override {
+                Some(k) => k.display_label().to_string(),
+                None => self.ai_classify_cache.get(&fs_idx)
+                    .map(|c| format!("自動: {}", c.display_label()))
+                    .unwrap_or_else(|| "自動".to_string()),
+            };
+            lines.push((
+                format!("アップスケール中 ({})", model_label),
+                egui::Color32::from_rgb(255, 200, 80),
+            ));
+        } else if is_upscaled {
+            let model_label = match self.ai_upscale_model_override {
+                Some(k) => k.display_label().to_string(),
+                None => self.ai_classify_cache.get(&fs_idx)
+                    .map(|c| c.display_label().to_string())
+                    .unwrap_or_else(|| "自動".to_string()),
+            };
+            lines.push((
+                format!("アップスケール完了 ({})", model_label),
+                egui::Color32::from_rgb(80, 220, 80),
+            ));
+        }
+
+        // 見開き AI 補完の進捗
+        if is_inpainting {
+            lines.push((
+                "見開き補完中 (MI-GAN)".to_string(),
+                egui::Color32::from_rgb(255, 200, 80),
+            ));
+        }
+
+        // MI-GAN モデルダウンロード中の表示
+        if self.ai_inpaint_active {
+            if let Some(ref mgr) = self.ai_model_manager {
+                let state = mgr.download_state(crate::ai::ModelKind::InpaintMiGan);
+                if let crate::ai::model_manager::DownloadState::Downloading { progress, total, .. } = state {
+                    let p = progress.load(std::sync::atomic::Ordering::Relaxed);
+                    let t = total.load(std::sync::atomic::Ordering::Relaxed);
+                    let pct = if t > 0 { (p as f64 / t as f64 * 100.0) as u32 } else { 0 };
+                    lines.push((
+                        format!("MI-GAN モデルダウンロード中... ({}%)", pct),
+                        egui::Color32::from_rgb(255, 200, 80),
+                    ));
+                }
+            }
+        }
+
+        // 先読みアップスケールの進捗
+        let pending_count = self.ai_upscale_pending.len();
+        if pending_count > 0 && !is_upscaling {
+            lines.push((
+                format!("先読みアップスケール中... ({}枚)", pending_count),
+                egui::Color32::from_gray(160),
+            ));
+        }
+
+        if lines.is_empty() {
+            self.ai_status_done_at = None;
+            return;
+        }
+
+        // 全処理完了後の自動非表示（1秒後にフェードアウト）
+        if any_busy {
+            // 処理中 → 完了時刻をリセット
+            self.ai_status_done_at = None;
+        } else {
+            // 全処理完了
+            let done_at = *self.ai_status_done_at.get_or_insert_with(std::time::Instant::now);
+            let elapsed = done_at.elapsed().as_secs_f32();
+            if elapsed > 2.0 {
+                return; // 完全に非表示
+            }
+        }
+
+        let margin = 12.0;
+        let line_h = 18.0;
+        let pad = 6.0;
+        let total_h = lines.len() as f32 * line_h + pad * 2.0;
+        let max_text_w = lines.iter()
+            .map(|(text, _)| {
+                ui.painter().layout_no_wrap(
+                    text.clone(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                ).size().x
+            })
+            .fold(0.0_f32, f32::max);
+
+        // フェードアウト計算: 完了後 1 秒で表示、1-2 秒でフェードアウト
+        let alpha = if let Some(done_at) = self.ai_status_done_at {
+            let elapsed = done_at.elapsed().as_secs_f32();
+            if elapsed < 1.0 {
+                1.0_f32
+            } else {
+                (1.0 - (elapsed - 1.0)).clamp(0.0, 1.0)
+            }
+        } else {
+            1.0
+        };
+
+        let bg_rect = egui::Rect::from_min_size(
+            egui::pos2(full_rect.min.x + margin, full_rect.max.y - margin - total_h),
+            egui::vec2(max_text_w + pad * 2.0, total_h),
+        );
+
+        ui.painter().rect_filled(
+            bg_rect, 4.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, (180.0 * alpha) as u8),
+        );
+
+        for (i, (text, color)) in lines.iter().enumerate() {
+            let faded = egui::Color32::from_rgba_unmultiplied(
+                color.r(), color.g(), color.b(), (color.a() as f32 * alpha) as u8,
+            );
+            ui.painter().text(
+                egui::pos2(bg_rect.min.x + pad, bg_rect.min.y + pad + i as f32 * line_h),
+                egui::Align2::LEFT_TOP,
+                text,
+                egui::FontId::proportional(13.0),
+                faded,
+            );
+        }
+
+        // フェードアウト中は再描画を要求
+        if self.ai_status_done_at.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -1720,10 +2305,18 @@ fn draw_fs_bar_info_text(
     filename: &str,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
+    ai_upscale_info: Option<(&str, u32, u32)>,
 ) {
     let mut parts: Vec<String> = Vec::new();
     if !filename.is_empty() { parts.push(filename.to_string()); }
-    if let Some((w, h)) = image_dims { parts.push(format!("{w} × {h}")); }
+    if let Some((w, h)) = image_dims {
+        if let Some((model_name, ai_w, ai_h)) = ai_upscale_info {
+            // AI アップスケール情報を表示: "11 × 22 (漫画 44×88)"
+            parts.push(format!("{w} × {h} ({model_name} {ai_w}×{ai_h})"));
+        } else {
+            parts.push(format!("{w} × {h}"));
+        }
+    }
     if let Some(bytes) = image_file_size { parts.push(format_bytes_small(bytes)); }
     if !parts.is_empty() {
         ui.painter().text(
@@ -1734,7 +2327,7 @@ fn draw_fs_bar_info_text(
             egui::Color32::WHITE,
         );
     }
-    let _ = bar_rect; // bar_rect は配置参照のために引数に残す
+    let _ = bar_rect;
 }
 
 /// 回転アイコンを自前描画する。
@@ -1888,3 +2481,37 @@ fn draw_spread_direction_arrow(
         );
     }
 }
+
+/// AI 補完 (inpainting) アイコンを描画する（中央に補完を示すブラシ風アイコン）。
+fn draw_inpaint_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.5, white);
+
+    // 2枚のページを表す縦線
+    let page_gap = r * 0.3;
+    let page_h = r * 0.8;
+    painter.line_segment(
+        [egui::pos2(c.x - page_gap, c.y - page_h), egui::pos2(c.x - page_gap, c.y + page_h)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(c.x + page_gap, c.y - page_h), egui::pos2(c.x + page_gap, c.y + page_h)],
+        stroke,
+    );
+
+    // 中央のギャップを表す波線
+    let wave_amp = r * 0.15;
+    for i in 0..4 {
+        let y = c.y - page_h + (i as f32 + 0.5) * page_h * 0.5;
+        let x_off = if i % 2 == 0 { wave_amp } else { -wave_amp };
+        painter.line_segment(
+            [egui::pos2(c.x - page_gap, y), egui::pos2(c.x + x_off, y)],
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
+        );
+        painter.line_segment(
+            [egui::pos2(c.x + x_off, y), egui::pos2(c.x + page_gap, y)],
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
+        );
+    }
+}
+

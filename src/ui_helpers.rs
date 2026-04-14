@@ -388,6 +388,19 @@ pub fn open_external_player(path: &Path) {
     let _ = cmd.spawn();
 }
 
+/// URL をデフォルトブラウザで開く。
+pub fn open_url(url: &str) {
+    crate::logger::log(format!("open_url: {url}"));
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/c", "start", "", url]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let _ = cmd.spawn();
+}
+
 // -----------------------------------------------------------------------
 // テスト
 // -----------------------------------------------------------------------

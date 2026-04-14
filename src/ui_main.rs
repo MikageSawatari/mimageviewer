@@ -115,7 +115,7 @@ impl App {
 
                 ui.menu_button("設定", |ui| {
                     ui.menu_button("サムネイル列数", |ui| {
-                        for cols in 2..=10usize {
+                        for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
                             let checked = self.settings.grid_cols == cols;
                             let prefix = if checked { "✓ " } else { "  " };
                             if ui.button(format!("{prefix}{cols} 列")).clicked() {
@@ -172,6 +172,29 @@ impl App {
                     ui.separator();
                     if ui.button("環境設定…").clicked() {
                         self.show_preferences = true;
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("ヘルプ", |ui| {
+                    if ui.button("ヘルプサイトを開く").clicked() {
+                        let url = format!(
+                            "https://www.mikage.to/mimageviewer/manual/index.html?version={}",
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                        crate::ui_helpers::open_url(&url);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("ログフォルダを開く").clicked() {
+                        let dir = crate::data_dir::logs_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        crate::ui_helpers::open_external_player(&dir);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("バージョン情報").clicked() {
+                        self.show_about_dialog = true;
                         ui.close();
                     }
                 });

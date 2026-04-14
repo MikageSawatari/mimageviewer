@@ -108,5 +108,26 @@
   <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
 </footer>
 
+<script>
+(function() {
+  var MANUAL_VERSION = "0.5";
+  var params = new URLSearchParams(window.location.search);
+  var appVersion = params.get("version");
+  if (!appVersion) return;
+
+  // major.minor を比較（アプリ版が古い場合のみ警告）
+  var appParts = appVersion.split(".").map(Number);
+  var manualParts = MANUAL_VERSION.split(".").map(Number);
+  var appMajorMinor = (appParts[0] || 0) * 1000 + (appParts[1] || 0);
+  var manualMajorMinor = (manualParts[0] || 0) * 1000 + (manualParts[1] || 0);
+
+  if (appMajorMinor < manualMajorMinor) {
+    alert(
+      "このヘルプは最新版の mImageViewer v" + MANUAL_VERSION + " の内容です。\n" +
+      "ご利用のアプリケーションは v" + appVersion + " のため、最新版への更新をお願いします。"
+    );
+  }
+})();
+</script>
 </body>
 </html>
