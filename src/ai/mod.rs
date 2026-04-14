@@ -101,6 +101,7 @@ impl ModelKind {
             "realesrgan_anime6b" => Some(ModelKind::UpscaleRealEsrganAnime6B),
             "waifu2x_cunet" => Some(ModelKind::UpscaleWaifu2xCunet),
             "realesr_general_v3" => Some(ModelKind::UpscaleRealEsrGeneralV3),
+            // "inpaint_lama" は旧設定ファイルとの互換用
             "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
             "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
             _ => None,

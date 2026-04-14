@@ -1452,7 +1452,7 @@ impl App {
                     let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
                     let preview_width = (orig_width + dx / fit_scale)
                         .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
-                    let preview_trim = (orig_trim - dy / fit_scale).clamp(0.0, 200.0);
+                    let preview_trim = (orig_trim - dy / fit_scale).clamp(0.0, crate::ai::inpaint::MAX_TRIM);
 
                     // gap 幅プレビュー（黄色枠）
                     let preview_gap = preview_width * fit_scale;
@@ -1519,10 +1519,11 @@ impl App {
                         let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
                         let new_width = (orig_width + dx / fit_scale)
                             .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
-                        let new_trim = (orig_trim - dy / fit_scale).clamp(0.0, 200.0);
+                        let new_trim = (orig_trim - dy / fit_scale).clamp(0.0, crate::ai::inpaint::MAX_TRIM);
                         self.ai_inpaint_gap_width = new_width;
                         self.ai_inpaint_trim = new_trim;
                         self.ai_inpaint_failed.clear();
+                        self.ai_inpaint_cache.clear(); // 古い gap/trim の結果を GPU メモリから解放
                         // 設定を保存
                         self.settings.ai_inpaint_gap_width = new_width as u32;
                         self.settings.ai_inpaint_trim = new_trim as u32;
@@ -1981,12 +1982,12 @@ impl App {
         let is_adjusting = self.adjustment_pending.as_ref().map_or(false, |(i, _)| *i == fs_idx);
 
         let is_inpainting = self.ai_inpaint_pending.is_some();
-        let is_downloading_lama = self.ai_inpaint_active && self.ai_model_manager.as_ref().map_or(false, |mgr| {
+        let is_downloading_inpaint = self.ai_inpaint_active && self.ai_model_manager.as_ref().map_or(false, |mgr| {
             matches!(mgr.download_state(crate::ai::ModelKind::InpaintMiGan), crate::ai::model_manager::DownloadState::Downloading { .. })
         });
 
         // 何か処理中かどうか
-        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting || is_inpainting || is_downloading_lama;
+        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_adjusting || is_inpainting || is_downloading_inpaint;
 
         if is_loading {
             lines.push(("読込中...".to_string(), egui::Color32::from_gray(180)));

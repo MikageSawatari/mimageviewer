@@ -29,6 +29,9 @@ const MIGAN_SIZE: u32 = 512;
 /// gap 左右から切り出すコンテキスト幅（ピクセル、元画像スケール）。
 const DEFAULT_CONTEXT_PIXELS: u32 = 256;
 
+/// トリム幅の上限（ピクセル）。
+pub const MAX_TRIM: f32 = 200.0;
+
 /// 見開きページの中央欠落を AI で補完する。
 ///
 /// `trim` はページ端の汚れを除去するピクセル数。
@@ -163,7 +166,7 @@ pub fn inpaint_spread(
         Ok((gap_rgb, gap_w as u32))
     })?;
 
-    let (gap_rgb_lama, gap_small_w) = gap_rgb_small;
+    let (gap_rgb_small, gap_small_w) = gap_rgb_small;
 
     crate::logger::log("[AI] MI-GAN inference done, compositing...".to_string());
 
@@ -173,9 +176,9 @@ pub fn inpaint_spread(
 
     // ── Step 5: gap 部分を元解像度にリサイズ ──
     let inpaint_rgb_full = if gap_small_w != inpaint_w || MIGAN_SIZE != combined_h {
-        resize_rgb_bilinear(&gap_rgb_lama, gap_small_w, MIGAN_SIZE, inpaint_w, combined_h)
+        resize_rgb_bilinear(&gap_rgb_small, gap_small_w, MIGAN_SIZE, inpaint_w, combined_h)
     } else {
-        gap_rgb_lama
+        gap_rgb_small
     };
 
     // ── Step 6: 左 + 補完領域 + 右 の合成画像を生成 ──

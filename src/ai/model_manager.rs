@@ -290,6 +290,11 @@ impl ModelManager {
 
     /// ダウンロード状態をポーリングして更新する。
     /// ダウンロード完了時に Ready / Failed に遷移させる。
+    /// ダウンロード中のモデルがあるか（poll_downloads のガード用）。
+    pub fn has_active_downloads(&self) -> bool {
+        self.states.lock().unwrap().values().any(|s| matches!(s, DownloadState::Downloading { .. }))
+    }
+
     pub fn poll_downloads(&self) {
         let mut states = self.states.lock().unwrap();
         let kinds: Vec<ModelKind> = states.keys().copied().collect();

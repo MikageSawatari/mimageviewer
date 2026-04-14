@@ -2888,6 +2888,12 @@ impl App {
         self.ai_upscale_pending.clear();
         self.ai_upscale_cache.clear();
         self.ai_classify_cache.clear();
+        // Inpaint キャッシュもクリア
+        if let Some((cancel, _, _)) = self.ai_inpaint_pending.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_inpaint_cache.clear();
+        self.ai_inpaint_failed.clear();
     }
 
     // -------------------------------------------------------------------
@@ -3177,7 +3183,7 @@ impl App {
             return;
         };
 
-        // LaMa モデルが利用可能か確認、なければ自動ダウンロード開始
+        // MI-GAN モデルが利用可能か確認、なければ自動ダウンロード開始
         let Some(model_path) = manager.model_path(crate::ai::ModelKind::InpaintMiGan) else {
             crate::logger::log("[AI] MI-GAN model not available, starting download...".to_string());
             manager.start_download(crate::ai::ModelKind::InpaintMiGan);
@@ -4046,7 +4052,9 @@ impl eframe::App for App {
 
         // AI モデルダウンロード中ならポーリング
         if let Some(ref mgr) = self.ai_model_manager {
-            mgr.poll_downloads();
+            if mgr.has_active_downloads() {
+                mgr.poll_downloads();
+            }
         }
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
