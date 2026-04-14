@@ -440,18 +440,55 @@ pub struct App {
     // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
     /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
     pub(crate) cached_nav_indices: Option<Vec<usize>>,
+
+    // ── AI アップスケール ──────────────────────────────────────────
+    /// AI ランタイム (ONNX Runtime)
+    pub(crate) ai_runtime: Option<std::sync::Arc<crate::ai::runtime::AiRuntime>>,
+    /// AI モデルマネージャ
+    pub(crate) ai_model_manager: Option<std::sync::Arc<crate::ai::model_manager::ModelManager>>,
+    /// AI アップスケール有効フラグ
+    pub(crate) ai_upscale_enabled: bool,
+    /// AI アップスケールモデルの手動オーバーライド (None = 自動)
+    pub(crate) ai_upscale_model_override: Option<crate::ai::ModelKind>,
+    /// アップスケール済みキャッシュ: item_idx → テクスチャ + ピクセルデータ
+    pub(crate) ai_upscale_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// アップスケール処理中: item_idx → (キャンセルトークン, 受信チャネル)
+    pub(crate) ai_upscale_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<crate::ai::upscale::UpscaleResult>)>,
+    /// 画像タイプ分類キャッシュ: item_idx → カテゴリ
+    pub(crate) ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
+    /// AI モデル選択ポップアップの開閉状態
+    pub(crate) ai_upscale_popup_open: bool,
+    /// AI 補完 (inpainting) 有効フラグ
+    pub(crate) ai_inpaint_active: bool,
+    /// AI 補完の隙間幅 (論理ピクセル)
+    pub(crate) ai_inpaint_gap_width: f32,
+    /// AI 補完のドラッグ状態: (開始 X, 開始時の幅)
+    pub(crate) ai_inpaint_drag: Option<(f32, f32)>,
+    /// AI モデルセットアップダイアログの表示フラグ
+    pub(crate) show_ai_model_setup: bool,
+    /// AI アップスケールが失敗した idx の集合（リトライ防止）
+    pub(crate) ai_upscale_failed: std::collections::HashSet<usize>,
+    /// AI 補完キャッシュ: (left_idx, right_idx, gap_width) → テクスチャ
+    pub(crate) ai_inpaint_cache: std::collections::HashMap<(usize, usize, u32), egui::TextureHandle>,
+    /// AI 補完処理中: (キャンセルトークン, 受信チャネル)
+    pub(crate) ai_inpaint_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<crate::ai::inpaint::InpaintResult>)>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        let settings = crate::settings::Settings::load();
+        let ai_upscale_enabled = settings.ai_upscale_enabled;
+        let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
+            .and_then(crate::ai::ModelKind::from_str);
+        let ai_inpaint_gap_width = settings.ai_inpaint_gap_width as f32;
         Self {
             address: String::new(),
             current_folder: None,
             items: Vec::new(),
             thumbnails: Vec::new(),
             selected: None,
-            settings: crate::settings::Settings::load(),
+            settings,
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
@@ -582,6 +619,23 @@ impl Default for App {
             pdf_enumerate_pending: None,
             cached_handlers: None,
             cached_nav_indices: None,
+
+            // AI (settings から復元)
+            ai_runtime: None,
+            ai_model_manager: None,
+            ai_upscale_enabled,
+            ai_upscale_model_override,
+            ai_upscale_cache: std::collections::HashMap::new(),
+            ai_upscale_pending: std::collections::HashMap::new(),
+            ai_classify_cache: std::collections::HashMap::new(),
+            ai_upscale_popup_open: false,
+            ai_inpaint_active: false,
+            ai_inpaint_gap_width,
+            ai_inpaint_drag: None,
+            show_ai_model_setup: false,
+            ai_upscale_failed: std::collections::HashSet::new(),
+            ai_inpaint_cache: std::collections::HashMap::new(),
+            ai_inpaint_pending: None,
         }
     }
 }
@@ -2750,6 +2804,358 @@ impl App {
         }
         self.fs_pending.clear();
         self.fs_cache.clear();
+        // AI キャッシュもクリア
+        for (cancel, _) in self.ai_upscale_pending.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_upscale_pending.clear();
+        self.ai_upscale_cache.clear();
+        self.ai_classify_cache.clear();
+    }
+
+    // -------------------------------------------------------------------
+    // AI アップスケール
+    // -------------------------------------------------------------------
+
+    /// AI ランタイムとモデルマネージャを遅延初期化する。
+    pub(crate) fn ensure_ai_runtime(&mut self) {
+        if self.ai_runtime.is_none() {
+            match crate::ai::runtime::AiRuntime::new() {
+                Ok(rt) => {
+                    self.ai_runtime = Some(std::sync::Arc::new(rt));
+                    crate::logger::log("[AI] Runtime initialized".to_string());
+                }
+                Err(e) => {
+                    crate::logger::log(format!("[AI] Runtime init failed: {e}"));
+                }
+            }
+        }
+        if self.ai_model_manager.is_none() {
+            self.ai_model_manager = Some(std::sync::Arc::new(
+                crate::ai::model_manager::ModelManager::new(),
+            ));
+        }
+    }
+
+    /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
+    pub(crate) fn poll_ai_upscale(&mut self, ctx: &egui::Context) {
+        if !self.ai_upscale_enabled {
+            return;
+        }
+
+        let mut completed: Vec<(usize, crate::ai::upscale::UpscaleResult)> = Vec::new();
+        let mut disconnected: Vec<usize> = Vec::new();
+
+        for (&key, (_, rx)) in &self.ai_upscale_pending {
+            match rx.try_recv() {
+                Ok(result) => completed.push((key, result)),
+                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        for key in disconnected {
+            self.ai_upscale_pending.remove(&key);
+            // スレッドが結果を送らずに終了 = 失敗。リトライを防止する。
+            self.ai_upscale_failed.insert(key);
+        }
+
+        let repaint = !completed.is_empty();
+        for (key, result) in completed {
+            self.ai_upscale_pending.remove(&key);
+            let pixels = std::sync::Arc::new(result.image.clone());
+            let handle = ctx.load_texture(
+                format!("ai_fs_{key}"),
+                result.image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.ai_upscale_cache.insert(key, FsCacheEntry::Static {
+                tex: handle,
+                pixels,
+            });
+            crate::logger::log(format!("[AI] Upscale complete for idx={key}"));
+        }
+
+        if repaint {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 現在のフルスクリーン画像に対して AI アップスケールを開始する。
+    /// - 先読みが全完了している場合のみ開始
+    /// - すでにアップスケール済み or pending の場合はスキップ
+    /// - 2K 以上の画像はスキップ
+    pub(crate) fn maybe_start_ai_upscale(&mut self, current_idx: usize) {
+        if !self.ai_upscale_enabled {
+            return;
+        }
+
+        // すでにアップスケール済み、処理中、または失敗済み
+        if self.ai_upscale_cache.contains_key(&current_idx)
+            || self.ai_upscale_pending.contains_key(&current_idx)
+            || self.ai_upscale_failed.contains(&current_idx)
+        {
+            return;
+        }
+
+        // 画像の先読みがまだ完了していない場合はスキップ
+        if !self.fs_pending.is_empty() {
+            return;
+        }
+
+        // 同時実行は 1 枚まで（GPU メモリと帯域の制約）
+        if !self.ai_upscale_pending.is_empty() {
+            return;
+        }
+
+        // 元画像がキャッシュにあるか確認
+        let source_image = match self.fs_cache.get(&current_idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
+            _ => return,
+        };
+
+        // 2K 以上はスキップ
+        let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
+        if !crate::ai::upscale::should_upscale(w, h) {
+            return;
+        }
+
+        // AI ランタイム / モデルマネージャを遅延初期化
+        self.ensure_ai_runtime();
+
+        let Some(runtime) = self.ai_runtime.clone() else { return; };
+        let Some(manager) = self.ai_model_manager.clone() else { return; };
+
+        // モデル選択
+        let model_kind = match self.ai_upscale_model_override {
+            Some(k) => k,
+            None => {
+                // 自動判別: キャッシュ済みならそれを使用、なければヒューリスティクス
+                let category = self.ai_classify_cache
+                    .get(&current_idx)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        // ヒューリスティクスで判別（モデルなしフォールバック）
+                        let dynimg = color_image_to_dynamic(&source_image);
+                        let cat = crate::ai::classify::classify_heuristic(&dynimg);
+                        self.ai_classify_cache.insert(current_idx, cat);
+                        cat
+                    });
+                category.preferred_upscale_model()
+            }
+        };
+
+        // モデルファイルが存在するか確認
+        let Some(model_path) = manager.model_path(model_kind) else {
+            crate::logger::log(format!(
+                "[AI] Model {:?} not available, skipping upscale for idx={current_idx}",
+                model_kind
+            ));
+            return;
+        };
+
+        // モデルをロード（未ロードの場合）
+        if !runtime.is_loaded(model_kind) {
+            if let Err(e) = runtime.load_model(model_kind, &model_path) {
+                crate::logger::log(format!("[AI] Model load failed: {e}"));
+                return;
+            }
+        }
+
+        // バックグラウンドスレッドでアップスケール実行
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let cancel_clone = cancel.clone();
+        let idx = current_idx;
+
+        std::thread::spawn(move || {
+            // ColorImage → DynamicImage に変換
+            let dynimg = color_image_to_dynamic(&source_image);
+            match crate::ai::upscale::upscale(&runtime, model_kind, &dynimg, &cancel_clone) {
+                Ok(upscaled) => {
+                    let _ = tx.send(crate::ai::upscale::UpscaleResult {
+                        idx,
+                        image: upscaled,
+                    });
+                }
+                Err(e) => {
+                    crate::logger::log(format!("[AI] Upscale failed for idx={idx}: {e}"));
+                }
+            }
+        });
+
+        self.ai_upscale_pending.insert(current_idx, (cancel, rx));
+        crate::logger::log(format!(
+            "[AI] Upscale started for idx={current_idx} with {:?}",
+            model_kind
+        ));
+    }
+
+    /// AI 補完の完了をポーリングし、テクスチャに変換してキャッシュする。
+    pub(crate) fn poll_ai_inpaint(&mut self, ctx: &egui::Context) {
+        let result = if let Some((_, ref rx)) = self.ai_inpaint_pending {
+            match rx.try_recv() {
+                Ok(r) => Some(Ok(r)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            }
+        } else {
+            None
+        };
+
+        match result {
+            Some(Ok(inpaint_result)) => {
+                self.ai_inpaint_pending = None;
+                let key = (
+                    inpaint_result.left_idx,
+                    inpaint_result.right_idx,
+                    inpaint_result.gap_width,
+                );
+                let handle = ctx.load_texture(
+                    format!("ai_inpaint_{}_{}_{}",
+                        key.0, key.1, key.2),
+                    inpaint_result.combined,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.ai_inpaint_cache.insert(key, handle);
+                ctx.request_repaint();
+            }
+            Some(Err(())) => {
+                // Disconnected — スレッドが送信せずに終了
+                self.ai_inpaint_pending = None;
+            }
+            None => {}
+        }
+    }
+
+    /// 見開き中央の AI 補完を開始する。
+    pub(crate) fn start_ai_inpaint(
+        &mut self,
+        left_idx: usize,
+        right_idx: usize,
+        gap_width: u32,
+    ) {
+        // 既存の pending をキャンセル
+        if let Some((cancel, _)) = self.ai_inpaint_pending.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
+        // すでにキャッシュにあればスキップ
+        if self.ai_inpaint_cache.contains_key(&(left_idx, right_idx, gap_width)) {
+            return;
+        }
+
+        // 左右の画像を取得
+        let left_pixels = match self.fs_cache.get(&left_idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
+            _ => return,
+        };
+        let right_pixels = match self.fs_cache.get(&right_idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
+            _ => return,
+        };
+
+        let Some(runtime) = self.ai_runtime.clone() else { return; };
+        let Some(manager) = self.ai_model_manager.clone() else { return; };
+
+        // LaMa モデルが利用可能か確認
+        let Some(model_path) = manager.model_path(crate::ai::ModelKind::InpaintLama) else {
+            crate::logger::log("[AI] LaMa model not available".to_string());
+            return;
+        };
+
+        if !runtime.is_loaded(crate::ai::ModelKind::InpaintLama) {
+            if let Err(e) = runtime.load_model(crate::ai::ModelKind::InpaintLama, &model_path) {
+                crate::logger::log(format!("[AI] LaMa model load failed: {e}"));
+                return;
+            }
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            match crate::ai::inpaint::inpaint_spread(
+                &runtime,
+                &left_pixels,
+                &right_pixels,
+                gap_width,
+                &cancel_clone,
+            ) {
+                Ok(combined) => {
+                    let _ = tx.send(crate::ai::inpaint::InpaintResult {
+                        left_idx,
+                        right_idx,
+                        gap_width,
+                        combined,
+                    });
+                }
+                Err(e) => {
+                    crate::logger::log(format!("[AI] Inpaint failed: {e}"));
+                }
+            }
+        });
+
+        self.ai_inpaint_pending = Some((cancel, rx));
+        crate::logger::log(format!(
+            "[AI] Inpaint started: left={left_idx}, right={right_idx}, gap={gap_width}"
+        ));
+    }
+
+    /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
+    fn evict_ai_upscale_cache(&mut self, current_idx: usize) {
+        let image_indices = Self::collect_image_indices(&self.items);
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
+        let n = image_indices.len();
+
+        let keep_back = self.settings.prefetch_back + 1;
+        let keep_forward = self.settings.prefetch_forward + 1;
+
+        let keep_set: std::collections::HashSet<usize> =
+            (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
+                .map(|p| image_indices[p])
+                .collect();
+
+        self.ai_upscale_cache.retain(|k, _| keep_set.contains(k));
+
+        // 範囲外の pending をキャンセル
+        let to_cancel: Vec<usize> = self.ai_upscale_pending.keys()
+            .filter(|k| !keep_set.contains(k))
+            .cloned()
+            .collect();
+        for k in to_cancel {
+            if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// AI アップスケールの先読み（表示中画像の前後）。
+    fn prefetch_ai_upscale(&mut self, current_idx: usize) {
+        if !self.ai_upscale_enabled {
+            return;
+        }
+
+        let image_indices = Self::collect_image_indices(&self.items);
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
+        let n = image_indices.len();
+
+        let pf_back = self.settings.ai_upscale_prefetch_back;
+        let pf_forward = self.settings.ai_upscale_prefetch_forward;
+
+        // 前方優先（+1, +2, … , -1, -2, …）
+        let targets: Vec<usize> = (1..=pf_forward)
+            .filter_map(|d| pos.checked_add(d).filter(|&p| p < n).map(|p| image_indices[p]))
+            .chain(
+                (1..=pf_back)
+                    .filter_map(|d| pos.checked_sub(d).map(|p| image_indices[p]))
+            )
+            .collect();
+
+        for idx in targets {
+            self.maybe_start_ai_upscale(idx);
+        }
     }
 
     /// `self.selected` に対応するアイテムが画像の場合、パスを last_selected_image_path に保存する。
@@ -3314,6 +3720,27 @@ impl eframe::App for App {
         let t_keep = frame_t0.elapsed();
 
         self.poll_prefetch(ctx);
+        self.poll_ai_upscale(ctx);
+        self.poll_ai_inpaint(ctx);
+
+        // フルスクリーン表示中なら AI アップスケールを検討
+        if let Some(fs_idx) = self.fullscreen_idx {
+            // 表示中画像を最優先でアップスケール
+            self.maybe_start_ai_upscale(fs_idx);
+            // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール
+            let current_done = self.ai_upscale_cache.contains_key(&fs_idx)
+                || self.ai_upscale_failed.contains(&fs_idx)
+                || !self.ai_upscale_enabled
+                || self.fs_cache.get(&fs_idx).map(|e| {
+                    if let FsCacheEntry::Static { pixels, .. } = e {
+                        !crate::ai::upscale::should_upscale(pixels.size[0] as u32, pixels.size[1] as u32)
+                    } else { true }
+                }).unwrap_or(true);
+            if current_done && self.ai_upscale_pending.is_empty() {
+                self.prefetch_ai_upscale(fs_idx);
+            }
+            self.evict_ai_upscale_cache(fs_idx);
+        }
 
         // タイトルバーに現在のフォルダパスを表示する。
         // フォルダ未選択時や読み込み途中はアプリ名のみ。
@@ -3360,6 +3787,7 @@ impl eframe::App for App {
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
+        self.show_ai_model_setup_dialog(ctx);
         self.poll_pdf_enumerate();
 
         // ── ツールバー ───────────────────────────────────────────────
@@ -3930,4 +4358,19 @@ pub(crate) fn tq_draw_preview(
     }
 
     response
+}
+
+/// egui::ColorImage → image::DynamicImage 変換ヘルパー。
+/// AI 推論の入力に使う。
+fn color_image_to_dynamic(ci: &egui::ColorImage) -> image::DynamicImage {
+    let w = ci.size[0] as u32;
+    let h = ci.size[1] as u32;
+    let mut buf = image::RgbImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let c = ci.pixels[(y * w + x) as usize];
+            buf.put_pixel(x, y, image::Rgb([c.r(), c.g(), c.b()]));
+        }
+    }
+    image::DynamicImage::ImageRgb8(buf)
 }

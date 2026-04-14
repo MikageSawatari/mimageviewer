@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+pub mod ai;
 mod app;
 pub mod catalog;
 pub mod data_dir;

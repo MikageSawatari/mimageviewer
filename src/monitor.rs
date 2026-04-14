@@ -81,9 +81,7 @@ pub fn get_monitor_logical_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
         use ffi::*;
         use std::mem;
 
-        crate::logger::log(format!(
-            "[monitor] get_monitor_logical_rect_at input: physical=({x:.1}, {y:.1})"
-        ));
+        // (debug log removed — this is called every frame)
 
         // まず論理座標をそのまま物理座標として渡して試みる
         let monitor = unsafe {
@@ -120,13 +118,7 @@ pub fn get_monitor_logical_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
             egui::pos2(r.right as f32 / scale, r.bottom as f32 / scale),
         );
 
-        crate::logger::log(format!(
-            "[monitor] handle={monitor:#x}  DPI={dpi_x}  scale={scale:.2}  \
-             phys=[{},{},{},{}]  logical=[{:.1},{:.1},{:.1},{:.1}]",
-            r.left, r.top, r.right, r.bottom,
-            logical_rect.min.x, logical_rect.min.y,
-            logical_rect.max.x, logical_rect.max.y,
-        ));
+        // (debug log removed — this is called every frame)
 
         Some(logical_rect)
     }

@@ -1,6 +1,7 @@
 //! mimageviewer ライブラリクレート。
 //! 統合テストやベンチマーク bin から公開モジュールにアクセスするためのエントリポイント。
 
+pub mod ai;
 pub mod catalog;
 pub mod data_dir;
 pub mod exif_reader;

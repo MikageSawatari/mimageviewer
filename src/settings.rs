@@ -470,6 +470,28 @@ pub struct Settings {
     /// ユーザーが手動で追加したアプリケーション
     #[serde(default)]
     pub custom_open_with_apps: Vec<RecentApp>,
+
+    // ── AI アップスケール ──────────────────────────────────────
+    /// AI アップスケール: フルスクリーン表示時に有効にするか（デフォルト: false）
+    #[serde(default)]
+    pub ai_upscale_enabled: bool,
+
+    /// AI アップスケール: モデルの手動オーバーライド (None = 自動判別)
+    /// 値は ModelKind::as_str() の文字列（例: "realesrgan_x4plus"）
+    #[serde(default)]
+    pub ai_upscale_model_override: Option<String>,
+
+    /// AI 補完: デフォルトの隙間幅（ピクセル）
+    #[serde(default = "default_ai_inpaint_gap_width")]
+    pub ai_inpaint_gap_width: u32,
+
+    /// AI アップスケール: 先読み枚数（後方）
+    #[serde(default = "default_ai_upscale_prefetch_back")]
+    pub ai_upscale_prefetch_back: usize,
+
+    /// AI アップスケール: 先読み枚数（前方）
+    #[serde(default = "default_ai_upscale_prefetch_forward")]
+    pub ai_upscale_prefetch_forward: usize,
 }
 
 fn default_grid_cols() -> usize { 4 }
@@ -486,6 +508,9 @@ fn default_thumb_next_pages() -> u32 { 4 }
 fn default_thumb_vram_cap_percent() -> u32 { 50 }
 fn default_folder_thumb_sort() -> SortOrder { SortOrder::Numeric }
 fn default_folder_thumb_depth() -> u32 { 3 }
+fn default_ai_inpaint_gap_width() -> u32 { 40 }
+fn default_ai_upscale_prefetch_back() -> usize { 1 }
+fn default_ai_upscale_prefetch_forward() -> usize { 2 }
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -599,6 +624,11 @@ impl Default for Settings {
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
             custom_open_with_apps: Vec::new(),
+            ai_upscale_enabled: false,
+            ai_upscale_model_override: None,
+            ai_inpaint_gap_width: default_ai_inpaint_gap_width(),
+            ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
+            ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
         }
     }
 }
