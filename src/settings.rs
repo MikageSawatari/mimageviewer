@@ -481,6 +481,10 @@ pub struct Settings {
     #[serde(default)]
     pub ai_upscale_model_override: Option<String>,
 
+    /// AI 補完: 見開きページの欠落補完を有効にするか（デフォルト: false）
+    #[serde(default)]
+    pub ai_inpaint_active: bool,
+
     /// AI 補完: デフォルトの隙間幅（ピクセル）
     #[serde(default = "default_ai_inpaint_gap_width")]
     pub ai_inpaint_gap_width: u32,
@@ -630,6 +634,7 @@ impl Default for Settings {
             custom_open_with_apps: Vec::new(),
             ai_upscale_enabled: false,
             ai_upscale_model_override: None,
+            ai_inpaint_active: false,
             ai_inpaint_gap_width: default_ai_inpaint_gap_width(),
             ai_inpaint_trim: 0,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
