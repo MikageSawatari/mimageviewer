@@ -123,7 +123,7 @@ fn draw_preset_sliders(
         let mut toggled = is_on;
         if ui.checkbox(&mut toggled, "JPEG ノイズ除去を適用").changed() {
             params.denoise_model = if toggled {
-                Some("denoise_realplksr".to_string())
+                Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string())
             } else {
                 None
             };

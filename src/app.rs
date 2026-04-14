@@ -2929,7 +2929,7 @@ impl App {
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
     pub(crate) fn poll_ai_upscale(&mut self, ctx: &egui::Context) {
-        if !self.ai_upscale_enabled && !self.ai_denoise_model.is_some() {
+        if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
             return;
         }
 
@@ -3033,12 +3033,7 @@ impl App {
                 return;
             };
             if !runtime.is_loaded(kind) {
-                let load_result = if crate::ai::upscale::needs_cpu_fallback(kind) {
-                    runtime.load_model_cpu(kind, &model_path)
-                } else {
-                    runtime.load_model(kind, &model_path)
-                };
-                if let Err(e) = load_result {
+                if let Err(e) = runtime.load_model(kind, &model_path) {
                     crate::logger::log(format!("[AI] Denoise model load failed: {e}"));
                     return;
                 }
@@ -3347,7 +3342,7 @@ impl App {
 
     /// AI アップスケールの先読み（表示中画像の前後）。
     fn prefetch_ai_upscale(&mut self, current_idx: usize) {
-        if !self.ai_upscale_enabled && !self.ai_denoise_model.is_some() {
+        if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
             return;
         }
 
@@ -4175,8 +4170,8 @@ impl eframe::App for App {
             // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール
             let current_done = self.ai_upscale_cache.contains_key(&fs_idx)
                 || self.ai_upscale_failed.contains(&fs_idx)
-                || (!self.ai_upscale_enabled && !self.ai_denoise_model.is_some())
-                || (self.ai_upscale_enabled && !self.ai_denoise_model.is_some() && self.fs_cache.get(&fs_idx).map(|e| {
+                || (!self.ai_upscale_enabled && self.ai_denoise_model.is_none())
+                || (self.ai_upscale_enabled && self.ai_denoise_model.is_none() && self.fs_cache.get(&fs_idx).map(|e| {
                     if let FsCacheEntry::Static { pixels, .. } = e {
                         !crate::ai::upscale::should_upscale(pixels.size[0] as u32, pixels.size[1] as u32)
                     } else { true }

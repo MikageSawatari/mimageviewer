@@ -7,8 +7,13 @@
 use crate::ai::ModelKind;
 use crate::ai::model_manager::{DownloadState, ModelManager};
 
+/// 機能グループの識別子。
+#[derive(Clone, Copy, PartialEq)]
+enum FeatureId { Upscale, Denoise, Inpaint }
+
 /// 機能グループの定義。
 struct FeatureGroup {
+    id: FeatureId,
     label: &'static str,
     enabled: bool,
     models: &'static [ModelKind],
@@ -32,6 +37,7 @@ impl crate::app::App {
         // 機能グループ構築
         let mut groups = vec![
             FeatureGroup {
+                id: FeatureId::Upscale,
                 label: "AI アップスケール",
                 enabled: self.settings.ai_upscale_feature,
                 models: &[
@@ -43,6 +49,7 @@ impl crate::app::App {
                 ],
             },
             FeatureGroup {
+                id: FeatureId::Denoise,
                 label: "AI ノイズ除去",
                 enabled: self.settings.ai_denoise_feature,
                 models: &[
@@ -50,6 +57,7 @@ impl crate::app::App {
                 ],
             },
             FeatureGroup {
+                id: FeatureId::Inpaint,
                 label: "AI 見開き補完",
                 enabled: self.settings.ai_inpaint_feature,
                 models: &[ModelKind::InpaintMiGan],
@@ -59,7 +67,7 @@ impl crate::app::App {
         egui::Window::new("AI モデルのセットアップ")
             .resizable(false)
             .collapsible(false)
-            .default_pos(ctx.content_rect().center() - egui::vec2(240.0, 200.0))
+            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .show(ctx, |ui| {
                 ui.set_min_width(480.0);
 
@@ -166,9 +174,13 @@ impl crate::app::App {
 
         // チェックボックスの変更を settings に反映
         if settings_changed {
-            self.settings.ai_upscale_feature = groups[0].enabled;
-            self.settings.ai_denoise_feature = groups[1].enabled;
-            self.settings.ai_inpaint_feature = groups[2].enabled;
+            for group in &groups {
+                match group.id {
+                    FeatureId::Upscale => self.settings.ai_upscale_feature = group.enabled,
+                    FeatureId::Denoise => self.settings.ai_denoise_feature = group.enabled,
+                    FeatureId::Inpaint => self.settings.ai_inpaint_feature = group.enabled,
+                }
+            }
             self.settings.save();
         }
 

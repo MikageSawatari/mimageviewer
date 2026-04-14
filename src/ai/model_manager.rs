@@ -22,60 +22,35 @@ struct ModelInfo {
 /// ダウンロード元のベース URL。
 /// 開発中は HuggingFace の各リポジトリから直接取得する。
 /// リリース時には GitHub Releases に複製して差し替える想定。
+/// モデルのダウンロード URL。
+/// GitHub Releases (models-v1) から配布。更新時は新しいタグ (models-v2 等) を作成し差し替える。
 const MODEL_URLS: &[(ModelKind, &str, &str, u64)] = &[
-    // (種類, ファイル名, URL, 概算サイズ)
-    (
-        ModelKind::ClassifierMobileNet,
-        "anime_classifier_mobilenetv3.onnx",
-        "https://huggingface.co/deepghs/anime_classification/resolve/main/mobilenetv3_v1.5_dist/model.onnx",
-        17_000_000,
-    ),
-    (
-        ModelKind::UpscaleRealEsrganX4Plus,
-        "realesrgan_x4plus.onnx",
-        "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/RealESRGAN_x4plus.fp16.onnx",
-        34_000_000,
-    ),
-    (
-        ModelKind::UpscaleRealEsrganAnime6B,
-        "realesrgan_x4plus_anime_6b.onnx",
-        // 自前変換 (scripts/convert_anime6b_to_onnx.py)。リリース時は GitHub Releases に配置。
-        // ダウンロード URL は暫定。ローカル models/ フォルダに配置されていれば URL は不要。
-        "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/RealESRGAN_x4plus_anime_6B.pth",
-        18_000_000,
-    ),
-    (
-        ModelKind::UpscaleWaifu2xCunet,
-        "waifu2x_cunet_noise3_scale2x.onnx",
-        // NOTE: cunet は 2x のみ。4x が必要な場合は swin_unet を使うか、2 回適用する。
+    // (種類, ファイル名, ダウンロード URL, 概算サイズ)
+    (ModelKind::ClassifierMobileNet,      "anime_classifier_mobilenetv3.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/anime_classifier_mobilenetv3.onnx",
+        17_000_000),
+    (ModelKind::UpscaleRealEsrganX4Plus,  "realesrgan_x4plus.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/realesrgan_x4plus.onnx",
+        34_000_000),
+    (ModelKind::UpscaleRealEsrganAnime6B, "realesrgan_x4plus_anime_6b.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/realesrgan_x4plus_anime_6b.onnx",
+        18_000_000),
+    // NOTE: waifu2x cunet は DirectML 非互換のため UI から除外。ダウンロード対象外。
+    (ModelKind::UpscaleWaifu2xCunet,      "waifu2x_cunet_noise3_scale2x.onnx",
         "https://huggingface.co/deepghs/waifu2x_onnx/resolve/main/20250502/onnx_models/cunet/art/noise3_scale2x.onnx",
-        6_000_000,
-    ),
-    (
-        ModelKind::UpscaleRealEsrGeneralV3,
-        "realesr_general_x4v3.onnx",
-        "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/realesr-general-x4v3.onnx",
-        5_000_000,
-    ),
-    (
-        ModelKind::UpscaleRealCugan4x,
-        "realcugan_4x_conservative.onnx",
-        // 自前変換 (scripts/convert_realcugan_to_onnx.py)。リリース時は GitHub Releases に配置。
-        "https://example.com/placeholder/realcugan_4x_conservative.onnx",
-        6_000_000,
-    ),
-    (
-        ModelKind::DenoiseRealplksr,
-        "dejpg_realplksr_otf.onnx",
-        "https://github.com/Phhofm/models/releases/download/1xDeJPG_realplksr_otf/1xDeJPG_realplksr_otf_fp32_fullyoptimized.onnx",
-        28_000_000,
-    ),
-    (
-        ModelKind::InpaintMiGan,
-        "migan.onnx",
-        "https://huggingface.co/lxfater/inpaint-web/resolve/main/migan.onnx",
-        30_000_000,
-    ),
+        6_000_000),
+    (ModelKind::UpscaleRealEsrGeneralV3,  "realesr_general_x4v3.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/realesr_general_x4v3.onnx",
+        5_000_000),
+    (ModelKind::UpscaleRealCugan4x,       "realcugan_4x_conservative.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/realcugan_4x_conservative.onnx",
+        6_000_000),
+    (ModelKind::DenoiseRealplksr,         "dejpg_realplksr_otf.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/dejpg_realplksr_otf.onnx",
+        28_000_000),
+    (ModelKind::InpaintMiGan,             "migan.onnx",
+        "https://github.com/MikageSawatari/mimageviewer/releases/download/models-v1/migan.onnx",
+        30_000_000),
 ];
 
 /// 各モデルのメタ情報を返す。
@@ -106,6 +81,8 @@ pub enum DownloadState {
     Downloading {
         progress: Arc<AtomicU64>,
         total: Arc<AtomicU64>,
+        /// ダウンロードスレッドからのエラーメッセージ
+        error: Arc<Mutex<Option<String>>>,
         cancel: Arc<AtomicBool>,
     },
     /// ダウンロード完了・利用可能
@@ -205,43 +182,31 @@ impl ModelManager {
             .unwrap_or(DownloadState::NotDownloaded)
     }
 
-    /// アップスケールに必要なモデル一覧のうち、未ダウンロードのものを返す。
-    pub fn missing_upscale_models(&self) -> Vec<ModelKind> {
+    /// 指定モデル群のうち、未ダウンロードのものを返す。
+    pub fn missing_models(&self, models: &[ModelKind]) -> Vec<ModelKind> {
         let states = self.states.lock().unwrap();
-        let mut missing = Vec::new();
-
-        // 分類器は必須
-        if !matches!(states.get(&ModelKind::ClassifierMobileNet), Some(DownloadState::Ready(_))) {
-            missing.push(ModelKind::ClassifierMobileNet);
-        }
-
-        // アップスケールモデル
-        for &kind in ModelKind::upscale_models() {
-            if !matches!(states.get(&kind), Some(DownloadState::Ready(_))) {
-                missing.push(kind);
-            }
-        }
-
-        missing
-    }
-
-    /// ノイズ除去に必要なモデル一覧のうち、未ダウンロードのものを返す。
-    pub fn missing_denoise_models(&self) -> Vec<ModelKind> {
-        let states = self.states.lock().unwrap();
-        ModelKind::denoise_models().iter()
+        models.iter()
             .filter(|&&kind| !matches!(states.get(&kind), Some(DownloadState::Ready(_))))
             .copied()
             .collect()
     }
 
+    /// アップスケールに必要なモデル一覧のうち、未ダウンロードのものを返す。
+    /// 分類器 (ClassifierMobileNet) も含む。
+    pub fn missing_upscale_models(&self) -> Vec<ModelKind> {
+        let mut all: Vec<ModelKind> = vec![ModelKind::ClassifierMobileNet];
+        all.extend_from_slice(ModelKind::upscale_models());
+        self.missing_models(&all)
+    }
+
+    /// ノイズ除去に必要なモデル一覧のうち、未ダウンロードのものを返す。
+    pub fn missing_denoise_models(&self) -> Vec<ModelKind> {
+        self.missing_models(ModelKind::denoise_models())
+    }
+
     /// 見開き補完に必要なモデル一覧のうち、未ダウンロードのものを返す。
     pub fn missing_inpaint_models(&self) -> Vec<ModelKind> {
-        let states = self.states.lock().unwrap();
-        let mut missing = Vec::new();
-        if !matches!(states.get(&ModelKind::InpaintMiGan), Some(DownloadState::Ready(_))) {
-            missing.push(ModelKind::InpaintMiGan);
-        }
-        missing
+        self.missing_models(&[ModelKind::InpaintMiGan])
     }
 
     /// 指定されたモデル群のうち未ダウンロードのものをダウンロード開始する。
@@ -272,6 +237,7 @@ impl ModelManager {
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
+        let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let info = model_info(kind);
         total.store(info.approx_size_bytes, Ordering::Relaxed);
@@ -285,6 +251,7 @@ impl ModelManager {
                     progress: progress.clone(),
                     total: total.clone(),
                     cancel: cancel.clone(),
+                    error: error.clone(),
                 },
             );
         }
@@ -293,6 +260,7 @@ impl ModelManager {
         let progress_clone = progress.clone();
         let total_clone = total.clone();
         let cancel_clone = cancel.clone();
+        let error_clone = error.clone();
         let url = info.url.to_string();
         let filename = info.filename.to_string();
 
@@ -315,7 +283,9 @@ impl ModelManager {
                     ));
                 }
                 Err(e) => {
-                    crate::logger::log(format!("[AI] Download failed for {}: {}", filename, e));
+                    let msg = format!("{e}");
+                    crate::logger::log(format!("[AI] Download failed for {}: {}", filename, msg));
+                    *error_clone.lock().unwrap() = Some(msg);
                 }
             }
         });
@@ -336,9 +306,12 @@ impl ModelManager {
 
         for kind in kinds {
             let should_update = match states.get(&kind) {
-                Some(DownloadState::Downloading { cancel, progress, total }) => {
+                Some(DownloadState::Downloading { cancel, progress, total, error }) => {
                     if cancel.load(Ordering::Relaxed) {
                         Some(DownloadState::Failed("キャンセルされました".to_string()))
+                    } else if let Some(err_msg) = error.lock().unwrap().take() {
+                        // ダウンロードスレッドがエラーを報告した
+                        Some(DownloadState::Failed(err_msg))
                     } else {
                         let info = model_info(kind);
                         let path = self.models_dir.join(info.filename);

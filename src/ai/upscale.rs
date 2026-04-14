@@ -35,10 +35,6 @@ fn model_tile_size(kind: ModelKind) -> u32 {
     }
 }
 
-/// CPU でロードすべきモデルか（DirectML 非互換）。
-pub fn needs_cpu_fallback(_kind: ModelKind) -> bool {
-    false
-}
 
 /// 高解像度化をスキップする閾値（幅 or 高さがこの値以上なら不要）。
 pub const SKIP_THRESHOLD: u32 = 2048;
