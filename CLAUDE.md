@@ -1,5 +1,29 @@
 # mimageviewer - Project Context
 
+## 作業開始時に必読
+
+**修正作業を始める前に、必ず `docs/README.md` から関連する設計ドキュメントを開いて全体像を把握すること。**
+
+このプロジェクトはサムネイル / フルスクリーン / 仮想フォルダ (ZIP/PDF) / 補正プリセット / AI /
+消しゴムなど、複数のサブシステムが絡み合っている。片側だけ修正すると逆側で表示が崩れる、
+補正結果が一瞬で消える、ZIP/PDF だけ動かない、といった手戻りが頻発する。
+
+最低限、以下の 2 本はどんな修正でも目を通す:
+
+- [docs/architecture-overview.md](docs/architecture-overview.md) — 全体のレイヤー構造・モジュールマップ
+- [docs/README.md](docs/README.md) — ドキュメント索引 (領域別に何を読むべきか書いてある)
+
+修正対象の領域に応じて追加で読むべきドキュメント:
+
+| 触る領域 | 読むドキュメント |
+| --- | --- |
+| サムネイル / フルスクリーン描画 / 回転 / 表示変換 | [docs/display-pipeline.md](docs/display-pipeline.md) |
+| ワーカー追加・キャッシュ・キャンセル処理 | [docs/async-architecture.md](docs/async-architecture.md) |
+| ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
+| 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
+
+**設計を変えたら該当ドキュメントも同時に更新する** (下の「コード修正時のドキュメント同時更新」参照)。
+
 ## Overview
 
 A Windows 11 native image viewer built in Rust. Inspired by ViX (legacy 32-bit viewer),
@@ -254,8 +278,13 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - `htdocs/mimageviewer/manual/` — ユーザー向けマニュアル（設定・操作方法の変更を反映）
 - `htdocs/mimageviewer/index.html` — 製品ページ（新機能の紹介・機能一覧の更新）
 - `docs/spec.md` — 仕様書（設定項目・内部仕様の変更を反映）
+- `docs/architecture-overview.md` — モジュールが増減した、永続化ストアを追加した等の構造変化
+- `docs/display-pipeline.md` — 表示テクスチャ優先順位・変換合成順序・変換適用ポイントを変えたとき
+- `docs/async-architecture.md` — ワーカーを増やした、共有アトミック/チャネルを追加した、キャンセル規約を変えたとき
+- `docs/virtual-folders.md` — ZIP/PDF の分岐表・キャッシュキー規則・DB キー正規化を変えたとき
+- `docs/preset-and-adjustment.md` — キャッシュ無効化ルール・補正/AI の適用順序・プリセットの保存先を変えたとき
 
-コードだけ修正してドキュメントを放置しない。
+コードだけ修正してドキュメントを放置しない。設計ドキュメントが腐ると次の修正で同じ罠を踏む。
 
 ## リリース手順チェックリスト
 
