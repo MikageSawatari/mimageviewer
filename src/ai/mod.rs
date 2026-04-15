@@ -50,14 +50,16 @@ impl From<std::io::Error> for AiError {
 pub enum ModelKind {
     /// 画像タイプ分類（MobileNetV3）
     ClassifierMobileNet,
-    /// Real-ESRGAN x4plus（写真/CG 向け）
+    /// Real-ESRGAN x4plus（写真・CG、ノイズ除去強）
     UpscaleRealEsrganX4Plus,
-    /// Real-ESRGAN Anime 6B（カラーイラスト向け）
+    /// Real-ESRGAN Anime 6B（イラスト・アニメ、線画シャープ）
     UpscaleRealEsrganAnime6B,
-    /// realesr-general-x4v3（汎用）
+    /// realesr-general-x4v3（高速軽量汎用）
     UpscaleRealEsrGeneralV3,
-    /// Real-CUGAN 4x conservative（漫画・スクリーントーン保持向け）
+    /// Real-CUGAN 4x conservative（漫画、スクリーントーン保持）
     UpscaleRealCugan4x,
+    /// 4x-NMKD-Siax-200k（写真、質感・テクスチャ保持）
+    UpscaleNmkdSiax4x,
     /// JPEG ノイズ除去 (RealPLKSR)
     DenoiseRealplksr,
     /// MI-GAN Inpainting
@@ -72,22 +74,24 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrganX4Plus => "realesrgan_x4plus",
             ModelKind::UpscaleRealEsrganAnime6B => "realesrgan_anime6b",
             ModelKind::UpscaleRealEsrGeneralV3 => "realesr_general_v3",
+            ModelKind::UpscaleNmkdSiax4x => "nmkd_siax_4x",
             ModelKind::DenoiseRealplksr => "denoise_realplksr",
             ModelKind::InpaintMiGan => "inpaint_migan",
             ModelKind::UpscaleRealCugan4x => "realcugan_4x",
         }
     }
 
-    /// UI 表示用のラベル。
+    /// UI 表示用のラベル（用途ベース命名）。
     pub fn display_label(&self) -> &'static str {
         match self {
             ModelKind::ClassifierMobileNet => "分類器 (MobileNetV3)",
-            ModelKind::UpscaleRealEsrganX4Plus => "写真/CG (Real-ESRGAN x4plus)",
-            ModelKind::UpscaleRealEsrganAnime6B => "イラスト (Real-ESRGAN Anime)",
-            ModelKind::UpscaleRealEsrGeneralV3 => "汎用 (Real-ESRGAN General)",
-            ModelKind::DenoiseRealplksr => "JPEG ノイズ除去",
+            ModelKind::UpscaleRealEsrganX4Plus => "写真・CG (ノイズ除去強)",
+            ModelKind::UpscaleRealEsrganAnime6B => "イラスト・アニメ",
+            ModelKind::UpscaleRealCugan4x => "漫画 (トーン保持)",
+            ModelKind::UpscaleNmkdSiax4x => "写真 (質感保持)",
+            ModelKind::UpscaleRealEsrGeneralV3 => "高速汎用",
+            ModelKind::DenoiseRealplksr => "JPEG ノイズ除去 (等倍)",
             ModelKind::InpaintMiGan => "補完 (MI-GAN)",
-            ModelKind::UpscaleRealCugan4x => "漫画 (Real-CUGAN 4x)",
         }
     }
 
@@ -99,6 +103,7 @@ impl ModelKind {
             "realesrgan_anime6b" => Some(ModelKind::UpscaleRealEsrganAnime6B),
             // "waifu2x_cunet" は廃止。旧設定ファイルに存在する場合は無視
             "realesr_general_v3" => Some(ModelKind::UpscaleRealEsrGeneralV3),
+            "nmkd_siax_4x" => Some(ModelKind::UpscaleNmkdSiax4x),
             // "inpaint_lama" は旧設定ファイルとの互換用
             "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
             "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
@@ -115,12 +120,14 @@ impl ModelKind {
     }
 
     /// アップスケール用モデル一覧（UI プルダウンに表示するもの）。
+    /// 順序は: 自動選択対象 3 モデル (写真/イラスト/漫画) → 補助 2 モデル (質感保持/高速汎用)
     pub fn upscale_models() -> &'static [ModelKind] {
         &[
-            ModelKind::UpscaleRealEsrganX4Plus,
-            ModelKind::UpscaleRealEsrganAnime6B,
-            ModelKind::UpscaleRealEsrGeneralV3,
-            ModelKind::UpscaleRealCugan4x,
+            ModelKind::UpscaleRealEsrganX4Plus,   // 写真・CG
+            ModelKind::UpscaleRealEsrganAnime6B,  // イラスト・アニメ
+            ModelKind::UpscaleRealCugan4x,        // 漫画
+            ModelKind::UpscaleNmkdSiax4x,         // 写真 (質感保持)
+            ModelKind::UpscaleRealEsrGeneralV3,   // 高速汎用
         ]
     }
 }

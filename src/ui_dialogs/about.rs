@@ -47,6 +47,10 @@ impl App {
                         ui.label("MIT — bilibili");
                         ui.end_row();
 
+                        ui.label("4x-NMKD-Siax-200k");
+                        ui.label("WTFPL — Nmkd");
+                        ui.end_row();
+
                         ui.label("MI-GAN");
                         ui.label("MIT");
                         ui.end_row();
