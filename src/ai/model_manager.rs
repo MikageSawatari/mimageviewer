@@ -43,6 +43,11 @@ static EMBEDDED_MODELS: &[EmbeddedModel] = &[
         bytes: include_bytes!("../../vendor/models/realcugan_4x_conservative.onnx"),
     },
     EmbeddedModel {
+        kind: ModelKind::UpscaleNmkdSiax4x,
+        filename: "4x_NMKD-Siax_200k.onnx",
+        bytes: include_bytes!("../../vendor/models/4x_NMKD-Siax_200k.onnx"),
+    },
+    EmbeddedModel {
         kind: ModelKind::DenoiseRealplksr,
         filename: "dejpg_realplksr_otf.onnx",
         bytes: include_bytes!("../../vendor/models/dejpg_realplksr_otf.onnx"),
@@ -68,6 +73,11 @@ pub fn ensure_models_extracted() {
 
     for model in EMBEDDED_MODELS {
         let path = dir.join(model.filename);
+        // 防御: 埋め込みバイト列が空 (vendor/models/ が未セットアップの worktree でビルドされた場合)
+        // は既存の実体ファイルを 0 バイトで上書きしないようにスキップする
+        if model.bytes.is_empty() {
+            continue;
+        }
         let needs_extract = match std::fs::metadata(&path) {
             Ok(meta) => meta.len() != model.bytes.len() as u64,
             Err(_) => true,
