@@ -578,32 +578,20 @@ impl App {
                     };
                     for vp in start..=end {
                         if let Some(&vidx) = vi.get(vp) {
-                            match self.items.get(vidx) {
-                                Some(GridItem::Image(_))
-                                | Some(GridItem::Video(_))
-                                | Some(GridItem::ZipImage { .. })
-                                | Some(GridItem::PdfPage { .. }) => {
-                                    self.checked.insert(vidx);
-                                }
-                                _ => {}
+                            if self.items.get(vidx).is_some_and(|it| it.is_checkable()) {
+                                self.checked.insert(vidx);
                             }
                         }
                     }
                 }
             } else if ctrl {
                 // Ctrl+クリック: チェック ON/OFF トグル + 選択移動
-                match self.items.get(idx) {
-                    Some(GridItem::Image(_))
-                    | Some(GridItem::Video(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. }) => {
-                        if self.checked.contains(&idx) {
-                            self.checked.remove(&idx);
-                        } else {
-                            self.checked.insert(idx);
-                        }
+                if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                    if self.checked.contains(&idx) {
+                        self.checked.remove(&idx);
+                    } else {
+                        self.checked.insert(idx);
                     }
-                    _ => {}
                 }
             }
             self.selected = Some(idx);

@@ -58,6 +58,18 @@ impl GridItem {
             }
         }
     }
+
+    /// チェックボックスで選択できるアイテムか (画像・動画・ZIP 内画像・PDF ページ)。
+    /// フォルダ・ZIP/PDF ファイル・ZIP セパレータはナビゲーション用なので対象外。
+    pub fn is_checkable(&self) -> bool {
+        matches!(
+            self,
+            GridItem::Image(_)
+                | GridItem::Video(_)
+                | GridItem::ZipImage { .. }
+                | GridItem::PdfPage { .. }
+        )
+    }
 }
 
 /// PDF ページのカタログキーを生成する。
