@@ -110,10 +110,17 @@
       <li><kbd>Esc</kbd> キーを押すとグリッド表示に戻ります。</li>
     </ol>
 
+    <h2>AI 機能について</h2>
+    <p>AI アップスケール・JPEG ノイズ除去・画像修復（MI-GAN）・画像分類（MobileNetV3）で使用するモデルはすべて
+    <strong>実行ファイルに埋め込まれている</strong>ため、別途ダウンロードする必要はありません。
+    実行時は DirectML を介して GPU で処理されます。</p>
+
     <h2>設定の保存場所</h2>
     <p>アプリの設定は以下の場所に自動保存されます：</p>
     <pre><code>%APPDATA%\mimageviewer\settings.json</code></pre>
     <p>設定ファイルを削除すると、すべての設定が初期値にリセットされます。</p>
+    <p>起動時のエラーログは <code>%APPDATA%\mimageviewer\logs\</code> に保存されます。
+    動作に問題が発生した場合はこのフォルダ内のログファイルをご確認ください。</p>
 
     <div class="box warn">
       <span class="box-icon">⚠️</span>
@@ -139,7 +146,7 @@
 </div>
 
 <footer>
-  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
 </footer>
 
 </body>

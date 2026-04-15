@@ -195,6 +195,28 @@
       </table>
     </div>
 
+    <h2>AI 機能設定（環境設定 → AI）</h2>
+    <p>AI アップスケール・JPEG ノイズ除去で使用するモデルや、自動処理のスキップ判定を調整できます。
+    モデル本体はすべて実行ファイルに埋め込まれており、追加のダウンロードは不要です。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>アップスケールモデル</td><td>Real-ESRGAN のモデルを画像タイプ（イラスト / 漫画 / 3D / 実写）ごとに選択</td></tr>
+          <tr><td>ノイズ除去モデル</td><td>RealPLKSR（高品質）または OmniSR（軽量）を選択</td></tr>
+          <tr><td>アップスケールのスキップ閾値</td><td>元画像の長辺がこの値以上の場合はアップスケールを適用しない</td></tr>
+          <tr><td>ノイズ除去のスキップ閾値</td><td>元画像の長辺がこの値以上の場合はノイズ除去を適用しない</td></tr>
+          <tr><td>見開き AI 補完</td><td>見開き表示時、綴じ部分の欠損を MI-GAN で自動補完する</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>ヘルプメニュー</h2>
+    <p>メニューバーの「ヘルプ」からオンラインマニュアル、バージョン情報、ログフォルダを開けます。
+    問題が発生した場合は「ログフォルダを開く」で <code>%APPDATA%\mimageviewer\logs\</code> を表示できます。</p>
+
     <h2>環境設定（パフォーマンス・フォルダ・見開き）</h2>
     <p>設定 →「環境設定…」から、左側のツリーで項目を選び、右側のパネルで設定を変更できます。
     以下はパフォーマンス・フォルダ・見開き表示に関する設定です。</p>
@@ -297,6 +319,7 @@
           <tr><td>見開き設定 DB</td><td><code>%APPDATA%\mimageviewer\spread.db</code></td></tr>
           <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.db</code></td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td></tr>
+          <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・panic ログ）</td></tr>
         </tbody>
       </table>
     </div>
@@ -305,7 +328,7 @@
 </div>
 
 <footer>
-  <p>mImageViewer &copy; 2025 Mikage Sawatari</p>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
 </footer>
 
 </body>
