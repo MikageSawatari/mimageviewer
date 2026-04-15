@@ -12,6 +12,7 @@ pub mod gpu_info;
 pub mod grid_item;
 pub mod exif_reader;
 pub mod logger;
+pub mod mask_db;
 pub mod monitor;
 pub mod png_metadata;
 pub mod rotation_db;

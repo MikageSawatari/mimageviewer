@@ -2113,6 +2113,14 @@ impl App {
             ));
         }
 
+        // 消しゴムマスク適用済み表示
+        if self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode {
+            lines.push((
+                "消去補完済み".to_string(),
+                egui::Color32::from_rgb(180, 140, 255),
+            ));
+        }
+
         // ※ モデルダウンロードは起動時ダイアログで行うためここでは表示しない
 
         // 先読み AI 処理の進捗

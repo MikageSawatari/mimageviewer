@@ -36,6 +36,23 @@ use crate::ui_helpers::{
     open_external_player, truncate_name,
 };
 
+/// 消しゴムモードのツール種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EraseTool {
+    /// 囲みツール: ドラッグで多角形を描き内側を塗りつぶす
+    Lasso,
+    /// 縦線ツール: ドラッグ幅の縦全体矩形を塗りつぶす
+    VertLine,
+    /// 横線ツール: ドラッグ高さの横全体矩形を塗りつぶす
+    HorizLine,
+    /// 筆ツール: 円形ブラシで自由に塗る
+    Brush,
+}
+
+impl Default for EraseTool {
+    fn default() -> Self { EraseTool::Brush }
+}
+
 // -----------------------------------------------------------------------
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
 // -----------------------------------------------------------------------
@@ -504,6 +521,23 @@ pub struct App {
     pub(crate) erase_original_pixels: Option<std::sync::Arc<egui::ColorImage>>,
     /// inpaint 処理中の非同期受信チャネル
     pub(crate) erase_inpaint_rx: Option<mpsc::Receiver<egui::ColorImage>>,
+    /// 現在のツール種別
+    pub(crate) erase_tool: EraseTool,
+    /// 筆ツールの半径 (画像ピクセル)
+    pub(crate) erase_brush_radius: f32,
+    /// 囲みツールのポイント列 (画像ピクセル座標)
+    pub(crate) erase_lasso_points: Vec<(f32, f32)>,
+    /// 縦線/横線ツールのドラッグ開始点 (画像ピクセル座標)
+    pub(crate) erase_line_start: Option<(f32, f32)>,
+    /// 縦線/横線ツールのドラッグ現在点 (画像ピクセル座標)
+    pub(crate) erase_line_end: Option<(f32, f32)>,
+    /// 描画モード (true) / 消去モード (false)
+    pub(crate) erase_paint_mode: bool,
+    /// inpaint 適用前の元画像キャッシュ: item_idx → ピクセルデータ
+    /// inpaint 実行後も元画像を保持し、マスク変更時に常に元画像から再適用する。
+    pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    /// マスク永続化 DB
+    pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
 }
 
 impl Default for App {
@@ -687,6 +721,14 @@ impl Default for App {
             erase_last_paint_pos: None,
             erase_original_pixels: None,
             erase_inpaint_rx: None,
+            erase_tool: EraseTool::default(),
+            erase_brush_radius: 0.0, // enter_erase_mode で設定
+            erase_lasso_points: Vec::new(),
+            erase_line_start: None,
+            erase_line_end: None,
+            erase_paint_mode: true,
+            erase_base_cache: std::collections::HashMap::new(),
+            mask_db: crate::mask_db::MaskDb::open().ok(),
         }
     }
 }
@@ -2913,6 +2955,7 @@ impl App {
         self.fs_secondary_press_start = None;
         self.fs_context_menu_idx = None;
         self.reset_erase_mode();
+        self.erase_base_cache.clear();
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -3664,6 +3707,8 @@ impl App {
                 FsLoadResult::Failed => FsCacheEntry::Failed,
             };
             self.fs_cache.insert(key, entry);
+            // 保存済みマスクがあれば自動で inpaint 適用
+            self.auto_apply_saved_mask(ctx, key);
         }
         if repaint {
             ctx.request_repaint();
