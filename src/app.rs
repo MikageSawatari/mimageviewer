@@ -1103,7 +1103,10 @@ impl App {
         self.checked.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();
-        // rating_cache をクリアしてから rebuild (レーティングフィルタが正しく効くように)
+        // 1 回のクエリで全アイテムのレーティングを引いてキャッシュに載せる。
+        // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
+        // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
+        self.prewarm_rating_cache();
         self.rebuild_visible_indices();
         // 見開きモード: DB から読み込み、なければデフォルト値
         self.spread_mode = self.spread_db.as_ref()
@@ -2095,14 +2098,10 @@ impl App {
                         .visible_indices
                         .iter()
                         .copied()
-                        .filter(|&idx| {
-                            matches!(
-                                self.items.get(idx),
-                                Some(GridItem::Image(_))
-                                    | Some(GridItem::ZipImage { .. })
-                                    | Some(GridItem::PdfPage { .. })
-                                    | Some(GridItem::Video(_))
-                            )
+                        .filter(|&idx| match self.items.get(idx) {
+                            Some(it) if it.is_ratable() => true,
+                            Some(GridItem::Video(_)) => true,
+                            _ => false,
                         })
                         .collect();
                     let count = targets.len();
@@ -2650,12 +2649,7 @@ impl App {
                 }
             }
             if rating_filter_active {
-                let ratable = matches!(
-                    self.items.get(i),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                );
+                let ratable = matches!(self.items.get(i), Some(it) if it.is_ratable());
                 if ratable {
                     let stars = self.get_rating(i) as usize;
                     if stars > 5 || !rating_filter[stars] {
@@ -2791,32 +2785,21 @@ impl App {
 
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
     /// フォルダ / 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
+    /// 非対象アイテムはキャッシュを汚さないように insert しない。
     pub(crate) fn get_rating(&mut self, idx: usize) -> u8 {
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
-        let is_ratable = matches!(
-            self.items.get(idx),
-            Some(GridItem::Image(_))
-                | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::PdfPage { .. })
-        );
-        if !is_ratable {
-            self.rating_cache.insert(idx, 0);
-            return 0;
-        }
+        let item = match self.items.get(idx) {
+            Some(it) if it.is_ratable() => it,
+            _ => return 0,
+        };
+        let _ = item;
         let key = match self.page_path_key(idx) {
             Some(k) => k,
-            None => {
-                self.rating_cache.insert(idx, 0);
-                return 0;
-            }
+            None => return 0,
         };
-        let stars = self
-            .rating_db
-            .as_ref()
-            .map(|db| db.get(&key))
-            .unwrap_or(0);
+        let stars = self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0);
         self.rating_cache.insert(idx, stars);
         stars
     }
@@ -2824,13 +2807,8 @@ impl App {
     /// 指定 idx のレーティングを設定する (0..=5)。
     /// レーティング対象外アイテムの場合は何もしない。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) {
-        let is_ratable = matches!(
-            self.items.get(idx),
-            Some(GridItem::Image(_))
-                | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::PdfPage { .. })
-        );
-        if !is_ratable {
+        let ratable = matches!(self.items.get(idx), Some(it) if it.is_ratable());
+        if !ratable {
             return;
         }
         let stars = stars.min(5);
@@ -2844,32 +2822,50 @@ impl App {
         }
     }
 
+    /// フォルダ読み込み直後に rating_cache を一括プリウォームする。
+    /// 単発の SELECT を N 回投げる代わりに `WHERE path IN (...)` を 1 回で済ませる。
+    /// 結果に含まれないキーは 0 (未評価) としてキャッシュに入れ、以後の DB アクセスを抑制する。
+    pub(crate) fn prewarm_rating_cache(&mut self) {
+        let db = match self.rating_db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+        let mut idx_keys: Vec<(usize, String)> = Vec::with_capacity(self.items.len());
+        for (idx, item) in self.items.iter().enumerate() {
+            if !item.is_ratable() {
+                continue;
+            }
+            if let Some(k) = self.page_path_key(idx) {
+                idx_keys.push((idx, k));
+            }
+        }
+        let keys: Vec<String> = idx_keys.iter().map(|(_, k)| k.clone()).collect();
+        let map = db.get_many(&keys);
+        for (idx, key) in idx_keys {
+            let stars = map.get(&key).copied().unwrap_or(0);
+            self.rating_cache.insert(idx, stars);
+        }
+    }
+
     /// F1-F6 キー用: チェック済みアイテムがあれば一括で、なければ現在選択にレーティングを適用する。
     /// visible_indices の外に出る可能性があるため、適用後はフィルタを再評価する。
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
         let stars = stars.min(5);
         if !self.checked.is_empty() {
-            let targets: Vec<usize> = self.checked.iter().copied().collect();
-            let mut applied = 0usize;
-            for idx in &targets {
-                let before = self.rating_cache.get(idx).copied().unwrap_or_else(|| 0);
-                let ratable = matches!(
-                    self.items.get(*idx),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                );
-                if !ratable {
-                    continue;
-                }
-                self.set_rating(*idx, stars);
-                if before != stars { applied += 1; }
+            let targets: Vec<usize> = self
+                .checked
+                .iter()
+                .copied()
+                .filter(|&idx| matches!(self.items.get(idx), Some(it) if it.is_ratable()))
+                .collect();
+            for &idx in &targets {
+                self.set_rating(idx, stars);
             }
             crate::logger::log(format!(
-                "[RATING] Bulk apply {} stars to {} items ({} changed)",
-                stars, targets.len(), applied
+                "[RATING] Bulk apply {} stars to {} items",
+                stars,
+                targets.len()
             ));
-            // 一括適用後はチェックをクリアして、フィルタを再評価
             self.checked.clear();
             self.rebuild_visible_indices();
         } else if let Some(idx) = self.selected {

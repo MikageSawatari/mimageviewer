@@ -49,6 +49,43 @@ impl RatingDb {
         .unwrap_or(0)
     }
 
+    /// 複数キーをまとめて取得する。フォルダ読み込み直後のキャッシュプリウォーム用。
+    /// 結果に含まれないキーは未登録 (=0) を意味する。
+    pub fn get_many(&self, keys: &[String]) -> std::collections::HashMap<String, u8> {
+        let mut out = std::collections::HashMap::new();
+        if keys.is_empty() {
+            return out;
+        }
+        // SQLite の式ツリー上限を避けるため 500 件ずつ分割
+        for chunk in keys.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path, stars FROM ratings WHERE path IN ({})",
+                placeholders
+            );
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let path: String = row.get(0)?;
+                let stars: i32 = row.get(1)?;
+                Ok((path, stars.clamp(0, 5) as u8))
+            });
+            if let Ok(rows) = rows {
+                for r in rows.flatten() {
+                    out.insert(r.0, r.1);
+                }
+            }
+        }
+        out
+    }
+
     /// レーティングを設定する。0 の場合はレコードを削除する。
     pub fn set(&self, key: &str, stars: u8) -> Result<(), rusqlite::Error> {
         let stars = stars.min(5);
