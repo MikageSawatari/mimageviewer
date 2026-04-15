@@ -70,11 +70,17 @@ macro_rules! slider_log_with_reset {
 }
 
 /// プリセットのスライダーUI を描画する（self を借用しない純関数）。
+///
+/// `ai_denoise_disabled_threshold` / `ai_upscale_disabled_threshold`:
+///   `Some(px)` のとき、画像サイズが `px` 以上なので AI 機能は無効。
+///   UI 上でその旨を表示しコントロールを disabled にする。
 fn draw_preset_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
     ai_denoise_available: bool,
     ai_upscale_available: bool,
+    ai_denoise_disabled_threshold: Option<u32>,
+    ai_upscale_disabled_threshold: Option<u32>,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut dragging = false;
@@ -176,32 +182,75 @@ fn draw_preset_sliders(
     ui.add_space(4.0);
 
     if ai_denoise_available {
-        ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
-        let is_on = params.denoise_model.is_some();
-        let mut toggled = is_on;
-        if ui.checkbox(&mut toggled, egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR)).changed() {
-            params.denoise_model = if toggled {
-                Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string())
-            } else {
-                None
-            };
-            changed = true;
+        if let Some(px) = ai_denoise_disabled_threshold {
+            ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new(format!("（{}px 以上なので無効）", px))
+                    .size(SECTION_FONT - 1.0)
+                    .color(egui::Color32::from_gray(150))
+                    .italics(),
+            );
+            let is_on = params.denoise_model.is_some();
+            let mut toggled = is_on;
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
+                    &mut toggled,
+                    egui::RichText::new("JPEG ノイズ除去を適用").color(egui::Color32::from_gray(130)),
+                ),
+            );
+        } else {
+            ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
+            let is_on = params.denoise_model.is_some();
+            let mut toggled = is_on;
+            if ui.checkbox(&mut toggled, egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR)).changed() {
+                params.denoise_model = if toggled {
+                    Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string())
+                } else {
+                    None
+                };
+                changed = true;
+            }
         }
         ui.add_space(8.0);
     }
 
     if ai_upscale_available {
-        ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
+        if let Some(px) = ai_upscale_disabled_threshold {
+            ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new(format!("（{}px 以上なので無効）", px))
+                    .size(SECTION_FONT - 1.0)
+                    .color(egui::Color32::from_gray(150))
+                    .italics(),
+            );
+            for (label, val) in crate::adjustment::UPSCALE_MODELS {
+                let is_sel = match (val, params.upscale_model.as_deref()) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => *a == b,
+                    _ => false,
+                };
+                ui.add_enabled(
+                    false,
+                    egui::RadioButton::new(
+                        is_sel,
+                        egui::RichText::new(*label).color(egui::Color32::from_gray(130)),
+                    ),
+                );
+            }
+        } else {
+            ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
 
-        for (label, val) in crate::adjustment::UPSCALE_MODELS {
-            let is_sel = match (val, params.upscale_model.as_deref()) {
-                (None, None) => true,
-                (Some(a), Some(b)) => *a == b,
-                _ => false,
-            };
-            if ui.radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR)).clicked() {
-                params.upscale_model = val.map(|s| s.to_string());
-                changed = true;
+            for (label, val) in crate::adjustment::UPSCALE_MODELS {
+                let is_sel = match (val, params.upscale_model.as_deref()) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => *a == b,
+                    _ => false,
+                };
+                if ui.radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR)).clicked() {
+                    params.upscale_model = val.map(|s| s.to_string());
+                    changed = true;
+                }
             }
         }
     }
@@ -225,6 +274,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         panel_rect: egui::Rect,
+        image_dims: Option<(u32, u32)>,
     ) {
         let preset_idx = self.adjustment_active_preset.unwrap_or(0);
 
@@ -338,6 +388,20 @@ impl App {
             &mut self.adjustment_presets.presets[(preset_idx - 1) as usize]
         };
 
+        // しきい値以上ならスキップされる → その場合は「無効」を UI に反映する
+        let ai_denoise_disabled_threshold = match image_dims {
+            Some((w, h)) if !crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px) => {
+                Some(self.settings.ai_denoise_skip_px)
+            }
+            _ => None,
+        };
+        let ai_upscale_disabled_threshold = match image_dims {
+            Some((w, h)) if !crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px) => {
+                Some(self.settings.ai_upscale_skip_px)
+            }
+            _ => None,
+        };
+
         let (changed, is_dragging) = egui::ScrollArea::vertical()
             .max_height(content_rect.height())
             .show(&mut scroll_child, |ui| {
@@ -348,6 +412,8 @@ impl App {
                     params,
                     self.settings.ai_denoise_feature,
                     self.settings.ai_upscale_feature,
+                    ai_denoise_disabled_threshold,
+                    ai_upscale_disabled_threshold,
                 )
             }).inner;
 
