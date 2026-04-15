@@ -29,26 +29,49 @@ impl App {
     /// 右パネルは常に上部バーの下から開始する。
     ///
     /// 戻り値: 右パネルが表示中なら true（上部バーの強制表示に使う）
+    /// オーバーレイモード用: ホバー判定なしで強制表示する。
+    pub(crate) fn draw_metadata_panel_forced(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) {
+        self.draw_metadata_panel_inner(ui, ctx, full_rect, true);
+    }
+
     pub(crate) fn draw_metadata_panel(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> bool {
+        self.draw_metadata_panel_inner(ui, ctx, full_rect, false)
+    }
+
+    fn draw_metadata_panel_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        force_show: bool,
+    ) -> bool {
         let panel_w = PANEL_WIDTH.min(full_rect.width() * 0.5);
-        let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
 
-        // ホバー判定: 画面右 1/4
-        let hover_in_right = ctx.input(|i| {
-            i.pointer
-                .hover_pos()
-                .map(|p| p.x > hover_threshold)
-                .unwrap_or(false)
-        });
+        if !force_show {
+            let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
 
-        let visible = self.show_metadata_panel || hover_in_right;
-        if !visible {
-            return false;
+            // ホバー判定: 画面右 1/4
+            let hover_in_right = ctx.input(|i| {
+                i.pointer
+                    .hover_pos()
+                    .map(|p| p.x > hover_threshold)
+                    .unwrap_or(false)
+            });
+
+            let visible = self.show_metadata_panel || hover_in_right;
+            if !visible {
+                return false;
+            }
         }
 
         // 右パネルは常に上部バーの下から開始（上バーは常に同時表示される）

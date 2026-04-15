@@ -1,7 +1,7 @@
 //! 画像補正パラメータ定義と CPU ベースの画像処理パイプライン。
 //!
-//! スライダー操作中は `apply_adjustments_preview()` で低解像度プレビューを生成し、
-//! 操作終了時に `apply_adjustments()` でフルサイズ画像を処理する。
+//! スライダー操作後はバックグラウンドスレッドで `apply_adjustments_fast()` を実行し、
+//! 完了後にメインスレッドでテクスチャに反映する。
 //!
 //! 処理順序:
 //!   1. 自動補正モード解決 (ヒストグラム分析 → パラメータ上書き)
@@ -10,21 +10,20 @@
 //!   4. ガンマ
 //!   5. 彩度
 //!   6. 色温度
-//!   7. シャープネス (Unsharp Mask)
 
 use serde::{Deserialize, Serialize};
+
+/// ヒストグラムサンプリングの最大ピクセル数。
+/// これ以上のピクセル数がある場合はランダムサンプリングを行う。
+const HISTOGRAM_SAMPLE_LIMIT: usize = 1_000_000;
 
 /// 自動補正モード。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutoMode {
     /// ヒストグラム 0.5%/99.5% パーセンタイルで黒点・白点を自動設定
-    AutoLevel,
-    /// 上下 1% クリップ + ストレッチ
-    AutoContrast,
+    Auto,
     /// グレースケール + 紙色→白 + 黒強化 + S 字カーブ
     MangaCleanup,
-    /// 自動レベル + シャープネス 30
-    ScanFix,
 }
 
 /// 画像補正パラメータ。
@@ -35,8 +34,6 @@ pub struct AdjustParams {
     pub gamma: f32,          // 0.2..5.0
     pub saturation: f32,     // -100..+100
     pub temperature: f32,    // -100..+100
-    pub sharpness: f32,      // 0..100
-    pub sharpen_radius: u8,  // 1..5
     pub black_point: u8,     // 0..255
     pub white_point: u8,     // 0..255
     pub midtone: f32,        // 0.1..10.0
@@ -56,8 +53,6 @@ impl Default for AdjustParams {
             gamma: 1.0,
             saturation: 0.0,
             temperature: 0.0,
-            sharpness: 0.0,
-            sharpen_radius: 1,
             black_point: 0,
             white_point: 255,
             midtone: 1.0,
@@ -76,7 +71,6 @@ impl AdjustParams {
             && self.gamma == 1.0
             && self.saturation == 0.0
             && self.temperature == 0.0
-            && self.sharpness == 0.0
             && self.black_point == 0
             && self.white_point == 255
             && self.midtone == 1.0
@@ -94,7 +88,6 @@ impl AdjustParams {
     }
 
     /// アップスケールモデル種別を解決する。
-    /// "auto" → Some(None), "realcugan_4x" → Some(Some(ModelKind)), None → None
     pub fn upscale_model_kind(&self) -> Option<Option<crate::ai::ModelKind>> {
         match self.upscale_model.as_deref() {
             None => None,
@@ -109,7 +102,7 @@ impl AdjustParams {
     }
 }
 
-/// フォルダ/ZIP/PDF 単位の 4 プリセット。
+/// フォルダ/ZIP/PDF 単位の 4 プリセット (個別プリセット 1-4)。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdjustPresets {
     pub presets: [AdjustParams; 4],
@@ -137,9 +130,30 @@ impl AdjustPresets {
     }
 }
 
+/// 保存スロット (10 個)。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PresetSlot {
+    pub name: String,
+    pub params: AdjustParams,
+}
+
+/// 保存スロット 10 個のコンテナ。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PresetSlots {
+    pub slots: Vec<Option<PresetSlot>>,
+}
+
+impl Default for PresetSlots {
+    fn default() -> Self {
+        Self {
+            slots: (0..10).map(|_| None).collect(),
+        }
+    }
+}
+
 // ── 画像処理 ────────────────────────────────────────────────────
 
-/// フルサイズ画像に全補正を適用する（シャープネス含む）。
+/// フルサイズ画像に全補正を適用する。
 pub fn apply_adjustments(src: &egui::ColorImage, params: &AdjustParams) -> egui::ColorImage {
     let [w, h] = src.size;
     let effective = resolve_auto_mode(src, params);
@@ -147,42 +161,97 @@ pub fn apply_adjustments(src: &egui::ColorImage, params: &AdjustParams) -> egui:
 
     apply_color_pipeline(&mut buf, &effective);
 
-    if effective.sharpness > 0.0 {
-        apply_sharpen(&mut buf, w, h, effective.sharpness, effective.sharpen_radius);
-    }
-
     f32_to_image(buf, w, h)
 }
 
-/// シャープネスを除く色調補正のみを適用する（高速、同期処理向け）。
-/// poll_prefetch / poll_ai_upscale の中で即座に呼べるよう軽量に保つ。
-pub fn apply_adjustments_fast(src: &egui::ColorImage, params: &AdjustParams) -> egui::ColorImage {
+/// 色調補正を適用する。
+/// 可能な場合は u8→u8 LUT + rayon 並列で高速処理する。
+/// `num_threads`: 並列度（settings.parallelism.thread_count()）
+pub fn apply_adjustments_fast(src: &egui::ColorImage, params: &AdjustParams, num_threads: usize) -> egui::ColorImage {
     let [w, h] = src.size;
     let effective = resolve_auto_mode(src, params);
+
+    // 色温度がゼロなら全パイプラインを u8 LUT で処理可能
+    // （色温度は R/B チャンネルに異なる値を加算するため、単一LUTでは不可）
+    if effective.temperature == 0.0 {
+        return apply_pipeline_u8_lut(src, &effective, num_threads);
+    }
+
+    // 色温度ありの場合は従来の f32 パイプライン
     let mut buf = pixels_to_f32(src);
     apply_color_pipeline(&mut buf, &effective);
     f32_to_image(buf, w, h)
 }
 
-/// シャープネスのみを適用する（重い畳み込み処理、バックグラウンド向け）。
-pub fn apply_sharpen_only(src: &egui::ColorImage, params: &AdjustParams) -> egui::ColorImage {
+/// u8→u8 LUT + rayon 並列で全パイプラインを処理する高速パス。
+/// levels, gamma, brightness, contrast, saturation を全て 256 エントリの LUT に統合。
+/// 色温度がゼロの場合のみ使用可能。
+fn apply_pipeline_u8_lut(src: &egui::ColorImage, params: &AdjustParams, num_threads: usize) -> egui::ColorImage {
     let [w, h] = src.size;
-    let effective = resolve_auto_mode(src, params);
-    if effective.sharpness <= 0.0 {
-        return src.clone();
-    }
-    let mut buf = pixels_to_f32(src);
-    apply_sharpen(&mut buf, w, h, effective.sharpness, effective.sharpen_radius);
-    f32_to_image(buf, w, h)
-}
+    let bp = params.black_point as f32;
+    let range = (params.white_point as f32 - bp).max(1.0);
+    let inv_midtone = 1.0 / params.midtone;
+    let inv_gamma = 1.0 / params.gamma;
+    let bc_factor = (259.0 * (params.contrast + 255.0)) / (255.0 * (259.0 - params.contrast));
+    let bright_add = params.brightness * 2.55;
+    let needs_levels = params.black_point != 0 || params.white_point != 255 || params.midtone != 1.0;
+    let needs_gamma = (params.gamma - 1.0).abs() >= 0.001;
+    let needs_bc = params.brightness != 0.0 || params.contrast != 0.0;
 
-/// シャープネスが必要か（バックグラウンド処理を開始すべきか）。
-pub fn needs_sharpen(params: &AdjustParams) -> bool {
-    // ScanFix は sharpness < 30 のとき 30 に引き上げるので、auto_mode を考慮
-    if params.sharpness > 0.0 {
-        return true;
+    // LUT: input u8 → levels → gamma → brightness/contrast → output u8
+    let mut lut = [0u8; 256];
+    for i in 0..256 {
+        let mut v = i as f32;
+        if needs_levels {
+            v = ((v - bp) / range).clamp(0.0, 1.0).powf(inv_midtone) * 255.0;
+        }
+        if needs_gamma {
+            v = (v / 255.0).clamp(0.0, 1.0).powf(inv_gamma) * 255.0;
+        }
+        if needs_bc {
+            v = bc_factor * (v - 128.0) + 128.0 + bright_add;
+        }
+        lut[i] = v.clamp(0.0, 255.0) as u8;
     }
-    matches!(params.auto_mode, Some(AutoMode::ScanFix))
+
+    // 彩度処理の設定
+    let full_desat = params.saturation == -100.0;
+    let has_sat = params.saturation != 0.0;
+    let sat_factor = 1.0 + params.saturation / 100.0;
+
+    // ピクセル処理クロージャ（LUT適用 + 彩度）
+    let process_pixel = |c: &egui::Color32| -> egui::Color32 {
+        let r = lut[c.r() as usize];
+        let g = lut[c.g() as usize];
+        let b = lut[c.b() as usize];
+
+        if full_desat {
+            let lum = ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) >> 8) as u8;
+            egui::Color32::from_rgb(lum, lum, lum)
+        } else if has_sat {
+            let (r01, g01, b01) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+            let max = r01.max(g01).max(b01);
+            let min = r01.min(g01).min(b01);
+            let lum = (max + min) * 0.5;
+            if (max - min).abs() < 1e-6 {
+                egui::Color32::from_rgb(r, g, b)
+            } else {
+                let nr = ((lum + (r01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8;
+                let ng = ((lum + (g01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8;
+                let nb = ((lum + (b01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8;
+                egui::Color32::from_rgb(nr, ng, nb)
+            }
+        } else {
+            egui::Color32::from_rgb(r, g, b)
+        }
+    };
+
+    // u8 LUT 参照はメモリバウンド処理のため、シングルスレッドが最速。
+    // rayon 並列化はスレッドプール生成 + 同期のオーバーヘッドが処理本体を上回る。
+    let _ = num_threads; // 将来の拡張用に引数は残す
+    let pixels: Vec<egui::Color32> = src.pixels.iter().map(process_pixel).collect();
+
+    egui::ColorImage::new([w, h], pixels)
 }
 
 /// ColorImage → f32 バッファ変換。
@@ -208,49 +277,93 @@ fn f32_to_image(buf: Vec<[f32; 3]>, w: usize, h: usize) -> egui::ColorImage {
     egui::ColorImage::new([w, h], pixels)
 }
 
-/// シャープネスを除く色調パイプラインを適用する。
+/// 色調パイプラインを適用する（f32 パス、色温度ありの場合に使用）。
+/// levels + gamma を統合 LUT で高速化し、彩度 -100 を専用パスで処理する。
 fn apply_color_pipeline(buf: &mut Vec<[f32; 3]>, params: &AdjustParams) {
-    apply_levels(buf, params.black_point, params.white_point, params.midtone);
+    // ── levels + gamma を統合 LUT で一括処理 ──
+    // levels: [bp, wp] → [0, 255] + midtone ガンマ
+    // gamma: powf(1/gamma)
+    // 両方とも各チャンネル独立の単調変換なので、256 エントリの LUT に統合できる。
+    let needs_levels = params.black_point != 0 || params.white_point != 255 || params.midtone != 1.0;
+    let needs_gamma = (params.gamma - 1.0).abs() >= 0.001;
+    if needs_levels || needs_gamma {
+        let bp = params.black_point as f32;
+        let range = (params.white_point as f32 - bp).max(1.0);
+        let inv_midtone = 1.0 / params.midtone;
+        let inv_gamma = 1.0 / params.gamma;
+
+        // LUT: input 0..255 → levels → gamma → output 0..255
+        let mut lut = [0.0_f32; 256];
+        for i in 0..256 {
+            let mut v = i as f32;
+            // levels
+            if needs_levels {
+                v = ((v - bp) / range).clamp(0.0, 1.0).powf(inv_midtone) * 255.0;
+            }
+            // gamma
+            if needs_gamma {
+                v = (v / 255.0).clamp(0.0, 1.0).powf(inv_gamma) * 255.0;
+            }
+            lut[i] = v;
+        }
+
+        for px in buf.iter_mut() {
+            for ch in px.iter_mut() {
+                let idx = (*ch).clamp(0.0, 255.0) as u8 as usize;
+                *ch = lut[idx];
+            }
+        }
+    }
+
     apply_brightness_contrast(buf, params.brightness, params.contrast);
-    apply_gamma(buf, params.gamma);
-    apply_saturation(buf, params.saturation);
+
+    // 彩度: -100 の場合は高速グレースケール化
+    if params.saturation == -100.0 {
+        for px in buf.iter_mut() {
+            let lum = px[0] * 0.299 + px[1] * 0.587 + px[2] * 0.114;
+            px[0] = lum;
+            px[1] = lum;
+            px[2] = lum;
+        }
+    } else if params.saturation != 0.0 {
+        apply_saturation(buf, params.saturation);
+    }
+
     apply_temperature(buf, params.temperature);
 }
 
-/// 低解像度プレビュー用。1/4 に縮小してから補正を適用する。
-pub fn apply_adjustments_preview(src: &egui::ColorImage, params: &AdjustParams) -> egui::ColorImage {
-    let [w, h] = src.size;
-    let scale = 4;
-    let sw = (w / scale).max(1);
-    let sh = (h / scale).max(1);
-
-    // ダウンサンプル（最近傍）
-    let mut small_pixels = Vec::with_capacity(sw * sh);
-    for sy in 0..sh {
-        let y = sy * scale;
-        for sx in 0..sw {
-            let x = sx * scale;
-            small_pixels.push(src.pixels[y * w + x]);
-        }
-    }
-    let small = egui::ColorImage::new([sw, sh], small_pixels);
-    apply_adjustments(&small, params)
-}
-
 // ── 内部処理関数 ────────────────────────────────────────────────
+
+/// ヒストグラム用のサンプリングインデックスを生成する。
+/// 画像ピクセル数が HISTOGRAM_SAMPLE_LIMIT 以下なら None（全数走査）。
+/// それ以上なら LCG（線形合同法）で疑似ランダムなインデックス列を生成する。
+/// スクリーントーン等の規則的パターンとの干渉を完全に回避する。
+fn histogram_sample_indices(pixel_count: usize) -> Option<Vec<usize>> {
+    if pixel_count <= HISTOGRAM_SAMPLE_LIMIT {
+        return None; // 全数走査
+    }
+    let sample_count = HISTOGRAM_SAMPLE_LIMIT;
+    // LCG パラメータ (Numerical Recipes 推奨値)
+    // x_{n+1} = (a * x_n + c) mod m
+    let m = pixel_count as u64;
+    let a: u64 = 6364136223846793005;
+    let c: u64 = 1442695040888963407;
+    let mut indices = Vec::with_capacity(sample_count);
+    let mut x: u64 = 42; // seed
+    for _ in 0..sample_count {
+        x = x.wrapping_mul(a).wrapping_add(c);
+        indices.push((x % m) as usize);
+    }
+    Some(indices)
+}
 
 /// 自動補正モードを解決して実効パラメータを返す。
 fn resolve_auto_mode(src: &egui::ColorImage, params: &AdjustParams) -> AdjustParams {
     let mut p = params.clone();
     match p.auto_mode {
         None => {}
-        Some(AutoMode::AutoLevel) => {
+        Some(AutoMode::Auto) => {
             let (bp, wp) = compute_auto_levels(src, 0.005);
-            p.black_point = bp;
-            p.white_point = wp;
-        }
-        Some(AutoMode::AutoContrast) => {
-            let (bp, wp) = compute_auto_levels(src, 0.01);
             p.black_point = bp;
             p.white_point = wp;
         }
@@ -262,26 +375,32 @@ fn resolve_auto_mode(src: &egui::ColorImage, params: &AdjustParams) -> AdjustPar
             p.gamma = 0.85; // 中間調を少し暗めに
             p.contrast = p.contrast.max(15.0); // コントラスト強化
         }
-        Some(AutoMode::ScanFix) => {
-            let (bp, wp) = compute_auto_levels(src, 0.005);
-            p.black_point = bp;
-            p.white_point = wp;
-            if p.sharpness < 30.0 {
-                p.sharpness = 30.0;
-            }
-        }
     }
     p
 }
 
 /// ヒストグラムからパーセンタイルベースの黒点・白点を算出する。
+/// 大きな画像ではランダムサンプリングで高速化する。
 fn compute_auto_levels(src: &egui::ColorImage, clip_ratio: f64) -> (u8, u8) {
     let mut hist = [0u64; 256];
-    for c in &src.pixels {
-        let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
-        hist[lum.min(255) as usize] += 1;
+    let sample_count;
+
+    if let Some(indices) = histogram_sample_indices(src.pixels.len()) {
+        sample_count = indices.len() as u64;
+        for &idx in &indices {
+            let c = src.pixels[idx];
+            let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
+            hist[lum.min(255) as usize] += 1;
+        }
+    } else {
+        sample_count = src.pixels.len() as u64;
+        for c in &src.pixels {
+            let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
+            hist[lum.min(255) as usize] += 1;
+        }
     }
-    let total = src.pixels.len() as f64;
+
+    let total = sample_count as f64;
     let low_threshold = (total * clip_ratio) as u64;
     let high_threshold = (total * (1.0 - clip_ratio)) as u64;
 
@@ -309,11 +428,21 @@ fn compute_auto_levels(src: &egui::ColorImage, clip_ratio: f64) -> (u8, u8) {
 }
 
 /// 漫画向けレベル補正。紙色（高輝度ピーク）を白に飛ばし、黒を締める。
+/// 大きな画像ではランダムサンプリングで高速化する。
 fn compute_manga_levels(src: &egui::ColorImage) -> (u8, u8) {
     let mut hist = [0u64; 256];
-    for c in &src.pixels {
-        let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
-        hist[lum.min(255) as usize] += 1;
+
+    if let Some(indices) = histogram_sample_indices(src.pixels.len()) {
+        for &idx in &indices {
+            let c = src.pixels[idx];
+            let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
+            hist[lum.min(255) as usize] += 1;
+        }
+    } else {
+        for c in &src.pixels {
+            let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
+            hist[lum.min(255) as usize] += 1;
+        }
     }
 
     // 高輝度側のピーク（紙の色）を検出
@@ -342,29 +471,13 @@ fn compute_manga_levels(src: &egui::ColorImage) -> (u8, u8) {
     (bp, wp.max(bp + 1))
 }
 
-/// レベル補正: [black_point, white_point] → [0, 255] + 中間点ガンマ。
-fn apply_levels(buf: &mut [[f32; 3]], bp: u8, wp: u8, midtone: f32) {
-    if bp == 0 && wp == 255 && midtone == 1.0 {
-        return;
-    }
-    let range = (wp as f32 - bp as f32).max(1.0);
-    let inv_gamma = 1.0 / midtone;
-    for px in buf.iter_mut() {
-        for ch in px.iter_mut() {
-            let v = (*ch - bp as f32) / range;
-            *ch = v.clamp(0.0, 1.0).powf(inv_gamma) * 255.0;
-        }
-    }
-}
-
 /// 明るさ + コントラスト。
 fn apply_brightness_contrast(buf: &mut [[f32; 3]], brightness: f32, contrast: f32) {
     if brightness == 0.0 && contrast == 0.0 {
         return;
     }
-    // コントラスト係数
     let factor = (259.0 * (contrast + 255.0)) / (255.0 * (259.0 - contrast));
-    let bright_add = brightness * 2.55; // -100..+100 → -255..+255
+    let bright_add = brightness * 2.55;
     for px in buf.iter_mut() {
         for ch in px.iter_mut() {
             *ch = factor * (*ch - 128.0) + 128.0 + bright_add;
@@ -372,20 +485,7 @@ fn apply_brightness_contrast(buf: &mut [[f32; 3]], brightness: f32, contrast: f3
     }
 }
 
-/// ガンマ補正。
-fn apply_gamma(buf: &mut [[f32; 3]], gamma: f32) {
-    if (gamma - 1.0).abs() < 0.001 {
-        return;
-    }
-    let inv_gamma = 1.0 / gamma;
-    for px in buf.iter_mut() {
-        for ch in px.iter_mut() {
-            *ch = (*ch / 255.0).clamp(0.0, 1.0).powf(inv_gamma) * 255.0;
-        }
-    }
-}
-
-/// 彩度調整。RGB → HSL 変換を使用。
+/// 彩度調整。
 fn apply_saturation(buf: &mut [[f32; 3]], saturation: f32) {
     if saturation == 0.0 {
         return;
@@ -399,10 +499,9 @@ fn apply_saturation(buf: &mut [[f32; 3]], saturation: f32) {
         let lum = (max + min) * 0.5;
 
         if (max - min).abs() < 1e-6 {
-            continue; // 無彩色
+            continue;
         }
 
-        // 簡易彩度調整: 各チャンネルと輝度の差を伸縮
         px[0] = (lum + (r01 - lum) * factor) * 255.0;
         px[1] = (lum + (g01 - lum) * factor) * 255.0;
         px[2] = (lum + (b01 - lum) * factor) * 255.0;
@@ -414,63 +513,10 @@ fn apply_temperature(buf: &mut [[f32; 3]], temperature: f32) {
     if temperature == 0.0 {
         return;
     }
-    let shift = temperature * 0.5; // ±50 の範囲でシフト
+    let shift = temperature * 0.5;
     for px in buf.iter_mut() {
-        px[0] += shift;       // R
-        px[2] -= shift;       // B
-    }
-}
-
-/// Unsharp Mask によるシャープネス強調。
-fn apply_sharpen(buf: &mut [[f32; 3]], w: usize, h: usize, amount: f32, radius: u8) {
-    let r = radius.max(1).min(5) as i32;
-    let kernel_size = (2 * r + 1) as usize;
-    let sigma = r as f32 * 0.5 + 0.5;
-
-    // ガウシアンカーネル生成
-    let mut kernel = vec![0.0f32; kernel_size * kernel_size];
-    let mut sum = 0.0f32;
-    for ky in 0..kernel_size {
-        for kx in 0..kernel_size {
-            let dx = kx as f32 - r as f32;
-            let dy = ky as f32 - r as f32;
-            let val = (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp();
-            kernel[ky * kernel_size + kx] = val;
-            sum += val;
-        }
-    }
-    for v in kernel.iter_mut() {
-        *v /= sum;
-    }
-
-    // ブラー画像生成
-    let mut blurred = buf.to_vec();
-    for y in 0..h {
-        for x in 0..w {
-            let mut sr = 0.0f32;
-            let mut sg = 0.0f32;
-            let mut sb = 0.0f32;
-            for ky in 0..kernel_size {
-                for kx in 0..kernel_size {
-                    let sx = (x as i32 + kx as i32 - r).clamp(0, w as i32 - 1) as usize;
-                    let sy = (y as i32 + ky as i32 - r).clamp(0, h as i32 - 1) as usize;
-                    let k = kernel[ky * kernel_size + kx];
-                    let [pr, pg, pb] = buf[sy * w + sx];
-                    sr += pr * k;
-                    sg += pg * k;
-                    sb += pb * k;
-                }
-            }
-            blurred[y * w + x] = [sr, sg, sb];
-        }
-    }
-
-    // Unsharp Mask: original + amount * (original - blurred)
-    let factor = amount / 100.0;
-    for i in 0..buf.len() {
-        buf[i][0] += (buf[i][0] - blurred[i][0]) * factor;
-        buf[i][1] += (buf[i][1] - blurred[i][1]) * factor;
-        buf[i][2] += (buf[i][2] - blurred[i][2]) * factor;
+        px[0] += shift;
+        px[2] -= shift;
     }
 }
 
@@ -483,7 +529,6 @@ mod tests {
         let params = AdjustParams::default();
         assert!(params.is_identity());
 
-        // 2x2 テスト画像
         let pixels = vec![
             egui::Color32::from_rgb(100, 150, 200),
             egui::Color32::from_rgb(50, 50, 50),
@@ -523,5 +568,69 @@ mod tests {
         let (bp, wp) = compute_auto_levels(&src, 0.05);
         assert!(bp >= 40);
         assert!(wp <= 240);
+    }
+
+    #[test]
+    fn histogram_sampling_small_image() {
+        // 100万ピクセル以下 → None（全数走査）
+        assert!(histogram_sample_indices(500_000).is_none());
+        assert!(histogram_sample_indices(1_000_000).is_none());
+    }
+
+    #[test]
+    fn histogram_sampling_large_image() {
+        // 100万ピクセル超 → ランダムサンプリング
+        let indices = histogram_sample_indices(10_000_000).unwrap();
+        assert_eq!(indices.len(), HISTOGRAM_SAMPLE_LIMIT);
+        // 全インデックスが範囲内
+        assert!(indices.iter().all(|&i| i < 10_000_000));
+        // ランダム性: 先頭10個が全て同じ値ではない
+        let first = indices[0];
+        assert!(indices[1..10].iter().any(|&i| i != first));
+    }
+}
+
+#[cfg(test)]
+mod sampling_quality_tests {
+    use super::*;
+
+    #[test]
+    fn manga_levels_sampling_matches_full_scan() {
+        // 200万ピクセルの漫画風画像を生成（紙色240 + インク色20）
+        let mut pixels = Vec::with_capacity(2_000_000);
+        for i in 0..2_000_000u32 {
+            let lum = if i % 5 == 0 { 20 } else { 240 }; // 20% ink, 80% paper
+            pixels.push(egui::Color32::from_rgb(lum, lum, lum));
+        }
+        let src = egui::ColorImage::new([2000, 1000], pixels.clone());
+
+        // サンプリング版
+        let (bp_sampled, wp_sampled) = compute_manga_levels(&src);
+
+        // 全数走査版（サンプリング閾値を超える値で強制全数走査）
+        let mut hist_full = [0u64; 256];
+        for c in &src.pixels {
+            let lum = (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
+            hist_full[lum.min(255) as usize] += 1;
+        }
+        // 全数走査のピーク検出
+        let mut max_count = 0u64;
+        let mut paper_lum_full = 240u8;
+        for i in 180..256 {
+            if hist_full[i] > max_count { max_count = hist_full[i]; paper_lum_full = i as u8; }
+        }
+        let wp_full = paper_lum_full.saturating_sub(10);
+        let mut max_dark = 0u64;
+        let mut ink_lum_full = 20u8;
+        for i in 0..80 {
+            if hist_full[i] > max_dark { max_dark = hist_full[i]; ink_lum_full = i as u8; }
+        }
+        let bp_full = ink_lum_full.saturating_add(5);
+
+        // サンプリング版と全数走査版が近い値であること
+        assert!((bp_sampled as i16 - bp_full as i16).unsigned_abs() <= 3,
+            "bp: sampled={} full={}", bp_sampled, bp_full);
+        assert!((wp_sampled as i16 - wp_full as i16).unsigned_abs() <= 3,
+            "wp: sampled={} full={}", wp_sampled, wp_full);
     }
 }

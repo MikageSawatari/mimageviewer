@@ -11,16 +11,19 @@ static FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
 pub fn init() {
     START.set(Instant::now()).ok();
+    let log_dir = crate::data_dir::logs_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("mimageviewer.log");
     match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open("mimageviewer.log")
+        .open(&log_path)
     {
         Ok(f) => {
             FILE.set(Mutex::new(f)).ok();
         }
-        Err(e) => eprintln!("ログファイル作成失敗: {e}"),
+        Err(e) => eprintln!("ログファイル作成失敗: {e} (path: {})", log_path.display()),
     }
 }
 
