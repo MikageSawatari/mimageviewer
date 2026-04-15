@@ -871,23 +871,21 @@ impl App {
             else { None };
 
         if let Some(pi) = new_preset {
-            // プリセットを割り当て (パネルは開かない、右上フィードバックのみ)
+            // 前のプリセットと AI 設定を比較してキャッシュクリア範囲を決定
+            let old_params: Option<crate::adjustment::AdjustParams> = self.get_adjustment_params(fs_idx);
             self.adjustment_active_preset = Some(pi);
-            // 分析モードと排他
             if self.analysis_mode {
                 self.fs_zoom = self.analysis_zoom;
                 self.fs_pan = self.analysis_pan;
                 self.reset_analysis_mode();
             }
-            // ページにプリセットを割り当て
-            self.adjustment_page_preset.insert(fs_idx, pi);
-            if let Some(key) = self.page_path_key(fs_idx) {
-                if let Some(db) = &self.adjustment_db {
-                    let _ = db.set_page_preset(&key, Some(pi));
-                }
+            self.assign_page_preset(fs_idx, pi);
+            let new_params = self.get_preset_params(pi);
+            if old_params.as_ref().map_or(true, |old| !old.ai_settings_eq(&new_params)) {
+                self.clear_all_adjustment_and_ai_caches(fs_idx);
+            } else {
+                self.clear_adjustment_caches(fs_idx);
             }
-            self.clear_all_adjustment_and_ai_caches(fs_idx);
-            // フィードバック表示
             let label = self.preset_display_label(pi);
             self.show_feedback_toast(format!("[{}]", label));
         }
@@ -896,32 +894,16 @@ impl App {
         if key_u {
             if let Some(pi) = self.adjustment_active_preset {
                 let params = self.get_preset_params_mut(pi);
-                let models: &[Option<&str>] = &[
-                    None,
-                    Some("auto"),
-                    Some("realesrgan_x4plus"),
-                    Some("realesrgan_anime6b"),
-                    Some("realcugan_4x"),
-                    Some("realesr_general_v3"),
-                ];
-                let cur = models.iter().position(|m| {
-                    match (m, params.upscale_model.as_deref()) {
+                let cur = crate::adjustment::UPSCALE_MODELS.iter().position(|(_, k)| {
+                    match (k, params.upscale_model.as_deref()) {
                         (None, None) => true,
                         (Some(a), Some(b)) => *a == b,
                         _ => false,
                     }
                 }).unwrap_or(0);
-                let next = (cur + 1) % models.len();
-                params.upscale_model = models[next].map(|s| s.to_string());
-                let label = match models[next] {
-                    None => "なし",
-                    Some("auto") => "自動",
-                    Some("realesrgan_x4plus") => "写真/CG",
-                    Some("realesrgan_anime6b") => "イラスト",
-                    Some("realcugan_4x") => "漫画",
-                    Some("realesr_general_v3") => "汎用",
-                    _ => "不明",
-                };
+                let next = (cur + 1) % crate::adjustment::UPSCALE_MODELS.len();
+                let (label, key) = crate::adjustment::UPSCALE_MODELS[next];
+                params.upscale_model = key.map(|s| s.to_string());
                 self.show_feedback_toast(format!("[U:アップスケール {}]", label));
                 self.clear_all_adjustment_and_ai_caches(fs_idx);
                 self.save_current_preset(pi);
@@ -947,18 +929,7 @@ impl App {
         // Shift+数字キー: 保存スロットから現在のプリセットにロード
         for (slot_idx, &pressed) in shift_keys.iter().enumerate() {
             if pressed {
-                if let Some(pi) = self.adjustment_active_preset {
-                    if let Some(slot) = &self.settings.preset_slots.slots[slot_idx] {
-                        let slot_params = slot.params.clone();
-                        let slot_name = slot.name.clone();
-                        *self.get_preset_params_mut(pi) = slot_params;
-                        self.clear_all_adjustment_and_ai_caches(fs_idx);
-                        self.save_current_preset(pi);
-                        self.show_feedback_toast(format!("[スロット{}:{} → プリセット{}]", slot_idx + 1, slot_name, pi));
-                    } else {
-                        self.show_feedback_toast(format!("[スロット{}: 空]", slot_idx + 1));
-                    }
-                }
+                self.load_slot_to_active_preset(slot_idx);
             }
         }
 
@@ -2685,8 +2656,8 @@ impl App {
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
         );
 
-        // アニメーション中は再描画を要求
-        ctx.request_repaint();
+        // フェードアウト中は 30fps で再描画
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
 

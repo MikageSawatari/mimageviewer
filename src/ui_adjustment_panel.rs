@@ -73,7 +73,6 @@ macro_rules! slider_log_with_reset {
 fn draw_preset_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
-    _panel_width: f32,
     ai_denoise_available: bool,
     ai_upscale_available: bool,
 ) -> (bool, bool) {
@@ -194,16 +193,7 @@ fn draw_preset_sliders(
     if ai_upscale_available {
         ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
 
-        let upscale_items: &[(&str, Option<&str>)] = &[
-            ("なし", None),
-            ("自動 (画像タイプ判別)", Some("auto")),
-            ("写真/CG", Some("realesrgan_x4plus")),
-            ("イラスト", Some("realesrgan_anime6b")),
-            ("漫画", Some("realcugan_4x")),
-            ("汎用", Some("realesr_general_v3")),
-        ];
-
-        for (label, val) in upscale_items {
+        for (label, val) in crate::adjustment::UPSCALE_MODELS {
             let is_sel = match (val, params.upscale_model.as_deref()) {
                 (None, None) => true,
                 (Some(a), Some(b)) => *a == b,
@@ -356,7 +346,6 @@ impl App {
                 draw_preset_sliders(
                     ui,
                     params,
-                    panel_rect.width(),
                     self.settings.ai_denoise_feature,
                     self.settings.ai_upscale_feature,
                 )
@@ -384,15 +373,14 @@ impl App {
             slots_child.horizontal(|ui| {
                 for col in 0..2 {
                     let slot_idx = row * 2 + col;
-                    let key_label = if slot_idx == 9 { "0".to_string() } else { (slot_idx + 1).to_string() };
+                    let key_label = crate::adjustment::slot_key_label(slot_idx);
                     let slot_name = if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                        format!("{}:{}", key_label, truncate_str(&s.name, 6))
+                        format!("{}:{}", key_label, crate::ui_helpers::truncate_name(&s.name, 7))
                     } else {
                         format!("{}:空", key_label)
                     };
                     let has_data = self.settings.preset_slots.slots[slot_idx].is_some();
 
-                    // 名前ボタン → ロード
                     let name_btn = egui::Button::new(
                         egui::RichText::new(&slot_name).size(10.5)
                     ).min_size(egui::vec2(btn_w, 22.0));
@@ -400,14 +388,10 @@ impl App {
                     if name_resp.clicked() {
                         load_from_slot = Some(slot_idx);
                     }
-                    if has_data {
-                        let tt = if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                            format!("{} をロード (Shift+{})", s.name, key_label)
-                        } else { String::new() };
-                        name_resp.on_hover_text(tt);
+                    if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
+                        name_resp.on_hover_text(format!("{} をロード (Shift+{})", s.name, key_label));
                     }
 
-                    // 保存アイコンボタン (💾)
                     let save_btn = egui::Button::new(
                         egui::RichText::new("💾").size(11.0)
                     ).min_size(egui::vec2(22.0, 22.0));
@@ -429,62 +413,44 @@ impl App {
                 } else {
                     self.adjustment_presets.names[(pi - 1) as usize].clone()
                 };
-                let key_label = if slot_idx == 9 { "0".to_string() } else { (slot_idx + 1).to_string() };
                 self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
                     name,
                     params: p,
                 });
                 self.settings.save();
+                let key_label = crate::adjustment::slot_key_label(slot_idx);
                 self.show_feedback_toast(format!("[スロット{}に保存]", key_label));
             }
         }
 
         // ロード処理
         if let Some(slot_idx) = load_from_slot {
-            if let Some(pi) = self.adjustment_active_preset {
-                if let Some(slot) = &self.settings.preset_slots.slots[slot_idx] {
-                    let slot_params = slot.params.clone();
-                    let slot_name = slot.name.clone();
-                    *self.get_preset_params_mut(pi) = slot_params;
-                    if let Some(fs_idx) = self.fullscreen_idx {
-                        self.clear_all_adjustment_and_ai_caches(fs_idx);
-                    }
-                    self.save_current_preset(pi);
-                    self.show_feedback_toast(format!("[{} → プリセット{}にロード]", slot_name, pi));
-                }
-            }
+            self.load_slot_to_active_preset(slot_idx);
         }
 
         // プリセット切替
         if let Some(new_pi) = preset_switch {
+            let old_params = self.adjustment_active_preset.map(|pi| self.get_preset_params(pi));
             self.adjustment_active_preset = Some(new_pi);
             if let Some(fs_idx) = self.fullscreen_idx {
-                self.adjustment_page_preset.insert(fs_idx, new_pi);
-                if let Some(key) = self.page_path_key(fs_idx) {
-                    if let Some(db) = &self.adjustment_db {
-                        let _ = db.set_page_preset(&key, Some(new_pi));
-                    }
+                self.assign_page_preset(fs_idx, new_pi);
+                let new_params = self.get_preset_params(new_pi);
+                if old_params.as_ref().map_or(true, |old| !old.ai_settings_eq(&new_params)) {
+                    self.clear_all_adjustment_and_ai_caches(fs_idx);
+                } else {
+                    self.clear_adjustment_caches(fs_idx);
                 }
-                self.clear_all_adjustment_and_ai_caches(fs_idx);
             }
         }
 
-        // パラメータ変更があればキャッシュクリア + 保存
+        // パラメータ変更があればキャッシュクリア + 保存（ドラッグ中はdisk書き込みを抑制）
         if changed {
             if let Some(fs_idx) = self.fullscreen_idx {
                 self.clear_adjustment_caches(fs_idx);
             }
-            self.save_current_preset(preset_idx);
+            if !is_dragging {
+                self.save_current_preset(preset_idx);
+            }
         }
-    }
-}
-
-/// 文字列を最大 n 文字で切り詰める。
-fn truncate_str(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
-        s.to_string()
-    } else {
-        chars[..max_chars].iter().collect::<String>() + "…"
     }
 }

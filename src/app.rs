@@ -1968,47 +1968,27 @@ impl App {
                 });
                 if let Some(pi) = preset_key {
                     if !self.checked.is_empty() {
-                        // チェック済み全画像にプリセットを割り当て
                         let checked_list: Vec<usize> = self.checked.iter().copied().collect();
                         for &idx in &checked_list {
-                            self.adjustment_page_preset.insert(idx, pi);
-                            if let Some(key) = self.page_path_key(idx) {
-                                if let Some(db) = &self.adjustment_db {
-                                    let _ = db.set_page_preset(&key, if pi == 0 { None } else { Some(pi) });
-                                }
-                            }
-                        }
-                        // グローバル(0)に戻す場合はページプリセットを削除
-                        if pi == 0 {
-                            for &idx in &checked_list {
-                                self.adjustment_page_preset.remove(&idx);
+                            if pi == 0 {
+                                self.remove_page_preset(idx);
+                            } else {
+                                self.assign_page_preset(idx, pi);
                             }
                         }
                         crate::logger::log(format!(
                             "[PRESET] Bulk apply preset {} to {} items", pi, checked_list.len()
                         ));
-                        // チェック解除
                         self.checked.clear();
                     } else if let Some(idx) = self.selected {
-                        // チェックなし: 選択中の1つだけに適用
                         match self.items.get(idx) {
                             Some(GridItem::Image(_))
                             | Some(GridItem::ZipImage { .. })
                             | Some(GridItem::PdfPage { .. }) => {
                                 if pi == 0 {
-                                    self.adjustment_page_preset.remove(&idx);
-                                    if let Some(key) = self.page_path_key(idx) {
-                                        if let Some(db) = &self.adjustment_db {
-                                            let _ = db.set_page_preset(&key, None);
-                                        }
-                                    }
+                                    self.remove_page_preset(idx);
                                 } else {
-                                    self.adjustment_page_preset.insert(idx, pi);
-                                    if let Some(key) = self.page_path_key(idx) {
-                                        if let Some(db) = &self.adjustment_db {
-                                            let _ = db.set_page_preset(&key, Some(pi));
-                                        }
-                                    }
+                                    self.assign_page_preset(idx, pi);
                                 }
                             }
                             _ => {}
@@ -3509,19 +3489,58 @@ impl App {
     /// 現在のプリセットパラメータを DB / Settings に保存する。
     pub(crate) fn save_current_preset(&mut self, preset_idx: u8) {
         if preset_idx == 0 {
-            // グローバルプリセットは settings に保存
             self.settings.save();
         } else {
-            // 個別プリセットは DB に保存
             if let (Some(db), Some(folder)) = (&self.adjustment_db, &self.current_folder) {
                 let _ = db.set_presets(folder, &self.adjustment_presets);
             }
         }
     }
 
+    /// ページにプリセットを割り当てて DB に保存する。
+    pub(crate) fn assign_page_preset(&mut self, idx: usize, preset_idx: u8) {
+        self.adjustment_page_preset.insert(idx, preset_idx);
+        if let Some(key) = self.page_path_key(idx) {
+            if let Some(db) = &self.adjustment_db {
+                let _ = db.set_page_preset(&key, Some(preset_idx));
+            }
+        }
+    }
+
+    /// ページのプリセット割り当てを解除して DB から削除する。
+    pub(crate) fn remove_page_preset(&mut self, idx: usize) {
+        self.adjustment_page_preset.remove(&idx);
+        if let Some(key) = self.page_path_key(idx) {
+            if let Some(db) = &self.adjustment_db {
+                let _ = db.set_page_preset(&key, None);
+            }
+        }
+    }
+
+    /// 保存スロットから現在のアクティブプリセットにロードする。
+    pub(crate) fn load_slot_to_active_preset(&mut self, slot_idx: usize) {
+        let Some(pi) = self.adjustment_active_preset else { return; };
+        let Some(slot) = &self.settings.preset_slots.slots[slot_idx] else { return; };
+        let old_params = self.get_preset_params(pi);
+        let slot_params = slot.params.clone();
+        let slot_name = slot.name.clone();
+        let ai_changed = !old_params.ai_settings_eq(&slot_params);
+        *self.get_preset_params_mut(pi) = slot_params;
+        if let Some(fs_idx) = self.fullscreen_idx {
+            if ai_changed {
+                self.clear_all_adjustment_and_ai_caches(fs_idx);
+            } else {
+                self.clear_adjustment_caches(fs_idx);
+            }
+        }
+        self.save_current_preset(pi);
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        self.show_feedback_toast(format!("[スロット{}:{} → プリセット{}]", key_label, slot_name, pi));
+    }
+
     /// 指定 idx に対応するプリセットパラメータを取得する。
     /// ページ割り当てがなければグローバル(0)を返す。
-    fn get_adjustment_params(&self, idx: usize) -> Option<crate::adjustment::AdjustParams> {
+    pub(crate) fn get_adjustment_params(&self, idx: usize) -> Option<crate::adjustment::AdjustParams> {
         let pi = self.adjustment_page_preset.get(&idx).copied()
             .or(self.adjustment_active_preset)
             .unwrap_or(0); // 常にグローバルにフォールバック
@@ -3558,8 +3577,7 @@ impl App {
         if params.is_identity() {
             return;
         }
-        let num_threads = self.settings.parallelism.thread_count();
-        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params, num_threads);
+        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
         let adjusted_pixels = std::sync::Arc::new(adjusted);
         let upload = clamp_for_gpu(&adjusted_pixels);
         let tex = ctx.load_texture(
@@ -3579,6 +3597,10 @@ impl App {
         }
         // 既にキャッシュがあればスキップ
         if self.adjustment_cache.contains_key(&idx) {
+            return;
+        }
+        // AI 処理中は補正をスキップ（AI完了後に apply_sync_adjustment が呼ばれる）
+        if self.ai_upscale_pending.contains_key(&idx) {
             return;
         }
         let Some(params) = self.get_adjustment_params(idx) else { return; };
