@@ -87,20 +87,18 @@ impl App {
 
                     // インデックス作成
                     if ui.button("インデックス作成").clicked() {
-                        self.ic.checked = vec![false; self.settings.favorites.len()];
-                        // 設定から復元
-                        for (i, fav) in self.settings.favorites.iter().enumerate() {
-                            if self.settings.search_index_checks.iter().any(|p| p == &fav.path) {
-                                self.ic.checked[i] = true;
-                            }
-                        }
-                        self.ic.running = false;
-                        self.ic.result = None;
-                        self.ic.total.store(0, Ordering::Relaxed);
-                        self.ic.done.store(0, Ordering::Relaxed);
-                        self.ic.entries.store(0, Ordering::Relaxed);
-                        self.ic.finished.store(false, Ordering::Relaxed);
-                        *self.ic.current.lock().unwrap() = String::new();
+                        self.ic.checked = self
+                            .settings
+                            .favorites
+                            .iter()
+                            .map(|fav| {
+                                self.settings
+                                    .search_index_checks
+                                    .iter()
+                                    .any(|p| p == &fav.path)
+                            })
+                            .collect();
+                        self.ic.reset_for_open();
                         self.ic.show = true;
                         ui.close();
                     }
@@ -612,12 +610,15 @@ impl App {
                     close_requested = true;
                 }
 
-                if self.favsearch.in_results {
+                if self.favsearch.on_results_grid() {
                     ui.separator();
                     ui.label(
-                        egui::RichText::new(format!("{} 件", self.favsearch.result_count))
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(140)),
+                        egui::RichText::new(format!(
+                            "{} 件",
+                            self.favsearch.results_paths.len()
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(140)),
                     );
                 }
             });

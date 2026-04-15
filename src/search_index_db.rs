@@ -47,8 +47,6 @@ pub struct IndexEntry {
     /// 表示用ファイル名 (ディレクトリの場合はフォルダ名)
     pub display_name: String,
     pub kind: IndexKind,
-    /// どのお気に入り配下か (親お気に入りフォルダの元パス、表示用)
-    pub favorite_root: PathBuf,
     pub mtime: i64,
 }
 
@@ -120,14 +118,13 @@ impl SearchIndexDb {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO entries \
                  (path, display_path, name, display_name, kind, favorite_root, \
-                  favorite_root_display, mtime, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  mtime, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for entry in children {
                 let path_norm = normalize_path(&entry.path);
                 let name_lower = entry.display_name.to_lowercase();
                 let display_path = entry.path.to_string_lossy().to_string();
-                let fav_display = entry.favorite_root.to_string_lossy().to_string();
                 stmt.execute(params![
                     path_norm,
                     display_path,
@@ -135,7 +132,6 @@ impl SearchIndexDb {
                     entry.display_name,
                     entry.kind as i64,
                     fav_norm,
-                    fav_display,
                     entry.mtime,
                     now,
                 ])?;
@@ -191,7 +187,7 @@ impl SearchIndexDb {
 
         let (sql, use_filter) = if favorite_roots.is_empty() {
             (
-                "SELECT display_path, display_name, kind, favorite_root_display, mtime \
+                "SELECT display_path, display_name, kind, mtime \
                  FROM entries \
                  WHERE name LIKE ?1 \
                  ORDER BY display_name COLLATE NOCASE \
@@ -205,7 +201,7 @@ impl SearchIndexDb {
                 .collect();
             (
                 format!(
-                    "SELECT display_path, display_name, kind, favorite_root_display, mtime \
+                    "SELECT display_path, display_name, kind, mtime \
                      FROM entries \
                      WHERE name LIKE ?1 AND favorite_root IN ({}) \
                      ORDER BY display_name COLLATE NOCASE \
@@ -234,13 +230,11 @@ impl SearchIndexDb {
             let display_path: String = row.get(0)?;
             let display_name: String = row.get(1)?;
             let kind_i: i64 = row.get(2)?;
-            let fav_display: String = row.get(3)?;
-            let mtime: i64 = row.get(4)?;
+            let mtime: i64 = row.get(3)?;
             Ok(IndexEntry {
                 path: PathBuf::from(display_path),
                 display_name,
                 kind: IndexKind::from_i64(kind_i).unwrap_or(IndexKind::Folder),
-                favorite_root: PathBuf::from(fav_display),
                 mtime,
             })
         })?;
@@ -285,7 +279,6 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              display_name          TEXT NOT NULL,
              kind                  INTEGER NOT NULL,
              favorite_root         TEXT NOT NULL,
-             favorite_root_display TEXT NOT NULL,
              mtime                 INTEGER NOT NULL DEFAULT 0,
              updated_at            INTEGER NOT NULL DEFAULT 0
          );
@@ -337,17 +330,11 @@ mod tests {
         }
     }
 
-    fn entry(
-        path: &str,
-        name: &str,
-        kind: IndexKind,
-        fav: &str,
-    ) -> IndexEntry {
+    fn entry(path: &str, name: &str, kind: IndexKind) -> IndexEntry {
         IndexEntry {
             path: PathBuf::from(path),
             display_name: name.to_string(),
             kind,
-            favorite_root: PathBuf::from(fav),
             mtime: 0,
         }
     }
@@ -381,9 +368,9 @@ mod tests {
         let fav = PathBuf::from(r"C:\Fav");
         let parent = PathBuf::from(r"C:\Fav\sub");
         let children = vec![
-            entry(r"C:\Fav\sub\alpha", "alpha", IndexKind::Folder, r"C:\Fav"),
-            entry(r"C:\Fav\sub\beta.zip", "beta.zip", IndexKind::ZipFile, r"C:\Fav"),
-            entry(r"C:\Fav\sub\gamma.pdf", "gamma.pdf", IndexKind::PdfFile, r"C:\Fav"),
+            entry(r"C:\Fav\sub\alpha", "alpha", IndexKind::Folder),
+            entry(r"C:\Fav\sub\beta.zip", "beta.zip", IndexKind::ZipFile),
+            entry(r"C:\Fav\sub\gamma.pdf", "gamma.pdf", IndexKind::PdfFile),
         ];
         db.upsert_children(&fav, &parent, &children).unwrap();
         assert_eq!(db.total_count().unwrap(), 3);
@@ -409,18 +396,18 @@ mod tests {
         let parent_b = PathBuf::from(r"C:\Fav\B");
 
         db.upsert_children(&fav, &parent_a, &[
-            entry(r"C:\Fav\A\x", "x", IndexKind::Folder, r"C:\Fav"),
-            entry(r"C:\Fav\A\y", "y", IndexKind::Folder, r"C:\Fav"),
+            entry(r"C:\Fav\A\x", "x", IndexKind::Folder),
+            entry(r"C:\Fav\A\y", "y", IndexKind::Folder),
         ]).unwrap();
         db.upsert_children(&fav, &parent_b, &[
-            entry(r"C:\Fav\B\z", "z", IndexKind::Folder, r"C:\Fav"),
+            entry(r"C:\Fav\B\z", "z", IndexKind::Folder),
         ]).unwrap();
         assert_eq!(db.total_count().unwrap(), 3);
 
         // A 配下を再 upsert (y を消して w を追加)、B は触らない
         db.upsert_children(&fav, &parent_a, &[
-            entry(r"C:\Fav\A\x", "x", IndexKind::Folder, r"C:\Fav"),
-            entry(r"C:\Fav\A\w", "w", IndexKind::Folder, r"C:\Fav"),
+            entry(r"C:\Fav\A\x", "x", IndexKind::Folder),
+            entry(r"C:\Fav\A\w", "w", IndexKind::Folder),
         ]).unwrap();
         let all = db.search("", &[]).unwrap();
         assert_eq!(all.len(), 3);
@@ -437,10 +424,10 @@ mod tests {
         let fav1 = PathBuf::from(r"C:\Fav1");
         let fav2 = PathBuf::from(r"C:\Fav2");
         db.upsert_children(&fav1, &fav1, &[
-            entry(r"C:\Fav1\a", "a", IndexKind::Folder, r"C:\Fav1"),
+            entry(r"C:\Fav1\a", "a", IndexKind::Folder),
         ]).unwrap();
         db.upsert_children(&fav2, &fav2, &[
-            entry(r"C:\Fav2\b", "b", IndexKind::Folder, r"C:\Fav2"),
+            entry(r"C:\Fav2\b", "b", IndexKind::Folder),
         ]).unwrap();
         assert_eq!(db.total_count().unwrap(), 2);
 
@@ -456,14 +443,14 @@ mod tests {
         let fav1 = PathBuf::from(r"C:\Fav1");
         let fav2 = PathBuf::from(r"C:\Fav2");
         db.upsert_children(&fav1, &fav1, &[
-            entry(r"C:\Fav1\match", "match", IndexKind::Folder, r"C:\Fav1"),
+            entry(r"C:\Fav1\match", "match", IndexKind::Folder),
         ]).unwrap();
         db.upsert_children(&fav2, &fav2, &[
-            entry(r"C:\Fav2\match", "match", IndexKind::Folder, r"C:\Fav2"),
+            entry(r"C:\Fav2\match", "match", IndexKind::Folder),
         ]).unwrap();
         let results = db.search("match", &[fav1.clone()]).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].favorite_root, fav1);
+        assert_eq!(results[0].path, PathBuf::from(r"C:\Fav1\match"));
     }
 
     #[test]
@@ -472,10 +459,10 @@ mod tests {
         let fav_keep = PathBuf::from(r"C:\Keep");
         let fav_drop = PathBuf::from(r"C:\Drop");
         db.upsert_children(&fav_keep, &fav_keep, &[
-            entry(r"C:\Keep\a", "a", IndexKind::Folder, r"C:\Keep"),
+            entry(r"C:\Keep\a", "a", IndexKind::Folder),
         ]).unwrap();
         db.upsert_children(&fav_drop, &fav_drop, &[
-            entry(r"C:\Drop\b", "b", IndexKind::Folder, r"C:\Drop"),
+            entry(r"C:\Drop\b", "b", IndexKind::Folder),
         ]).unwrap();
         assert_eq!(db.total_count().unwrap(), 2);
         db.prune_obsolete(&[normalize_path(&fav_keep)]).unwrap();

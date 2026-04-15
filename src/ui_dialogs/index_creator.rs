@@ -277,7 +277,16 @@ impl App {
                         let mtime = meta
                             .as_ref()
                             .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-                        if p.is_dir() {
+                        let kind = if p.is_dir() {
+                            Some(IndexKind::Folder)
+                        } else {
+                            match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase) {
+                                Some(ref e) if e == "zip" => Some(IndexKind::ZipFile),
+                                Some(ref e) if e == "pdf" => Some(IndexKind::PdfFile),
+                                _ => None,
+                            }
+                        };
+                        if let Some(kind) = kind {
                             let name = p
                                 .file_name()
                                 .and_then(|n| n.to_str())
@@ -286,33 +295,9 @@ impl App {
                             children.push(IndexEntry {
                                 path: p,
                                 display_name: name,
-                                kind: IndexKind::Folder,
-                                favorite_root: fav_root.clone(),
+                                kind,
                                 mtime,
                             });
-                        } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                            let ext_lower = ext.to_ascii_lowercase();
-                            let kind = if ext_lower == "zip" {
-                                Some(IndexKind::ZipFile)
-                            } else if ext_lower == "pdf" {
-                                Some(IndexKind::PdfFile)
-                            } else {
-                                None
-                            };
-                            if let Some(kind) = kind {
-                                let name = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                children.push(IndexEntry {
-                                    path: p,
-                                    display_name: name,
-                                    kind,
-                                    favorite_root: fav_root.clone(),
-                                    mtime,
-                                });
-                            }
                         }
                     }
                 }
@@ -368,5 +353,19 @@ impl Default for IndexCreatorState {
             finished: Arc::new(AtomicBool::new(false)),
             result: None,
         }
+    }
+}
+
+impl IndexCreatorState {
+    /// ダイアログを開き直すときの状態リセット (メニュークリック時に呼ばれる)。
+    /// `checked` は呼び出し側が favorites と揃える。
+    pub(crate) fn reset_for_open(&mut self) {
+        self.running = false;
+        self.result = None;
+        self.total.store(0, Ordering::Relaxed);
+        self.done.store(0, Ordering::Relaxed);
+        self.entries.store(0, Ordering::Relaxed);
+        self.finished.store(false, Ordering::Relaxed);
+        *self.current.lock().unwrap() = String::new();
     }
 }

@@ -152,16 +152,19 @@ pub(crate) struct FavSearchState {
     pub has_focus: bool,
     /// 検索モード開始時の current_folder (×/Esc で戻る先)
     pub saved_folder: Option<PathBuf>,
-    /// 検索結果表示中かどうか (synthetic path に居る間 true)
-    pub in_results: bool,
-    /// 最後の検索結果の件数 (UI 表示用)
-    pub result_count: usize,
     /// 検索結果から入ったフォルダのスタック (先頭 = 結果から最初に入ったパス、末尾 = 現在フォルダ)。
     /// BS を押すとここからポップする。空のときは検索結果リストを表示中。
     pub nav_stack: Vec<PathBuf>,
     /// 最後の検索結果に含まれていた対象パス (名前ソート順)。
-    /// Ctrl+↑↓ で前後の検索結果アイテムへ移動するときに参照する。
+    /// Ctrl+↑↓ で前後の検索結果アイテムへ移動するときに参照する。結果件数表示にも使う。
     pub results_paths: Vec<PathBuf>,
+}
+
+impl FavSearchState {
+    /// 検索結果リストを表示している状態か (検索バーを開いていて、まだどこにも潜っていない)。
+    pub fn on_results_grid(&self) -> bool {
+        self.active && self.nav_stack.is_empty()
+    }
 }
 
 /// 検索結果モードで current_folder に設定する合成パス。
@@ -351,6 +354,8 @@ pub struct App {
     pub(crate) favsearch: FavSearchState,
     /// インデックス作成ダイアログの状態
     pub(crate) ic: crate::ui_dialogs::index_creator::IndexCreatorState,
+    /// `auto_index_current_folder` が最後に処理したパス (同じフォルダの再ロード時に書き込みを省く)
+    pub(crate) last_auto_indexed: Option<PathBuf>,
 
     // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
     /// フルスクリーンでメタデータパネルを表示するか
@@ -672,6 +677,7 @@ impl Default for App {
                 .map(Arc::new),
             favsearch: FavSearchState::default(),
             ic: crate::ui_dialogs::index_creator::IndexCreatorState::default(),
+            last_auto_indexed: None,
             show_metadata_panel: false,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
@@ -967,60 +973,45 @@ impl App {
         // お気に入り配下の場合、現在フォルダ直下を検索インデックスに upsert (軽量)
         self.auto_index_current_folder(&path, &items);
 
-        // 検索結果モードから実フォルダへナビゲートした場合は in_results をクリア。
-        // saved_folder は検索を閉じたときの復帰先なのでそのまま保持する。
-        if self.favsearch.in_results {
-            self.favsearch.in_results = false;
-        }
-
         self.start_loading_items(path, items, image_metas, existing_keys, video_items);
     }
 
     /// `path` がいずれかのお気に入り配下であれば、`items` の Folder/ZipFile/PdfFile を
     /// 検索インデックス DB に upsert する (ブラウズ時の軽量更新)。
-    fn auto_index_current_folder(&self, path: &std::path::Path, items: &[GridItem]) {
-        let Some(db) = self.search_index_db.as_ref() else { return };
+    fn auto_index_current_folder(&mut self, path: &std::path::Path, items: &[GridItem]) {
+        let Some(db) = self.search_index_db.clone() else { return };
         let Some(fav_root) = self.find_favorite_root(path) else { return };
-
-        let mut entries: Vec<crate::search_index_db::IndexEntry> = Vec::new();
-        for it in items {
-            match it {
-                GridItem::Folder(p) => {
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                    entries.push(crate::search_index_db::IndexEntry {
-                        path: p.clone(),
-                        display_name: name,
-                        kind: crate::search_index_db::IndexKind::Folder,
-                        favorite_root: fav_root.clone(),
-                        mtime: 0,
-                    });
-                }
-                GridItem::ZipFile(p) => {
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                    entries.push(crate::search_index_db::IndexEntry {
-                        path: p.clone(),
-                        display_name: name,
-                        kind: crate::search_index_db::IndexKind::ZipFile,
-                        favorite_root: fav_root.clone(),
-                        mtime: 0,
-                    });
-                }
-                GridItem::PdfFile(p) => {
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                    entries.push(crate::search_index_db::IndexEntry {
-                        path: p.clone(),
-                        display_name: name,
-                        kind: crate::search_index_db::IndexKind::PdfFile,
-                        favorite_root: fav_root.clone(),
-                        mtime: 0,
-                    });
-                }
-                _ => {}
-            }
+        // 同じフォルダへの往復ナビ時に SQLite 書き込みを回避する
+        if self.last_auto_indexed.as_deref() == Some(path) {
+            return;
         }
+
+        let entries: Vec<crate::search_index_db::IndexEntry> = items
+            .iter()
+            .filter_map(|it| {
+                let (p, kind) = match it {
+                    GridItem::Folder(p) => (p, crate::search_index_db::IndexKind::Folder),
+                    GridItem::ZipFile(p) => (p, crate::search_index_db::IndexKind::ZipFile),
+                    GridItem::PdfFile(p) => (p, crate::search_index_db::IndexKind::PdfFile),
+                    _ => return None,
+                };
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some(crate::search_index_db::IndexEntry {
+                    path: p.clone(),
+                    display_name: name,
+                    kind,
+                    mtime: 0,
+                })
+            })
+            .collect();
         if let Err(e) = db.upsert_children(&fav_root, path, &entries) {
             crate::logger::log(format!("auto-index upsert failed: {e}"));
         }
+        self.last_auto_indexed = Some(path.to_path_buf());
     }
 
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
@@ -1041,8 +1032,6 @@ impl App {
         self.favsearch.has_focus = false;
         self.favsearch.query.clear();
         self.favsearch.last_executed.clear();
-        self.favsearch.result_count = 0;
-        self.favsearch.in_results = false;
         self.favsearch.nav_stack.clear();
         self.favsearch.results_paths.clear();
 
@@ -1091,7 +1080,6 @@ impl App {
             // サブツリー内 — 通常の DFS 移動としてスタックに push
             self.favsearch.nav_stack.push(next.clone());
             self.load_folder(next);
-            self.favsearch.in_results = false;
             self.update_favsearch_address();
         } else {
             // サブツリー外へ出ようとしている → 検索結果の前後へ移動
@@ -1124,7 +1112,6 @@ impl App {
         }
         let next_path = results[next_idx as usize].clone();
         self.favsearch.nav_stack = vec![next_path.clone()];
-        self.favsearch.in_results = false;
         self.load_folder(next_path);
         self.update_favsearch_address();
     }
@@ -1145,21 +1132,16 @@ impl App {
             }
         }
         if let Some(top) = self.favsearch.nav_stack.last().cloned() {
-            // まだスタックに要素があればそこへ戻る。
             // folder_history に古い選択が残っていると select_after_load より優先されるので、
             // 戻り先のエントリをクリアして「直前にいたフォルダ/ファイル」を選ばせる。
             self.folder_history.remove(&top);
             self.load_folder(top);
-            // load_folder は in_results をクリアするので再確認しておく
-            self.favsearch.in_results = false;
             self.update_favsearch_address();
         } else {
             // スタックが空になった = 検索結果リストに戻る。
-            // 検索結果の合成パスについても folder_history を消し、BS で出てきた
-            // フォルダ名を select_after_load で選ばせるようにする。
+            // 合成パスの folder_history も消して select_after_load を活かす。
             let synthetic = search_results_synthetic_path();
             self.folder_history.remove(&synthetic);
-            self.favsearch.query = self.favsearch.last_executed.clone();
             self.execute_favsearch();
         }
     }
@@ -1172,102 +1154,57 @@ impl App {
             return;
         }
         let query = self.favsearch.last_executed.clone();
-        if self.favsearch.in_results || self.favsearch.nav_stack.is_empty() {
-            self.address = format!(
-                "🔍 検索結果: \"{}\"  ({} 件)",
-                query, self.favsearch.result_count,
-            );
+        let count = self.favsearch.results_paths.len();
+        if self.favsearch.nav_stack.is_empty() {
+            self.address = format!("🔍 検索結果: \"{}\"  ({} 件)", query, count);
             return;
         }
         // 現在地 = スタックの末尾 (深い場所)
-        let current = match self.favsearch.nav_stack.last() {
-            Some(p) => p.clone(),
-            None => {
-                self.address = format!(
-                    "🔍 検索結果: \"{}\"  ({} 件)",
-                    query, self.favsearch.result_count,
-                );
-                return;
-            }
-        };
-        // 包含するお気に入り根を探す
-        let fav_root: Option<PathBuf> = self
-            .settings
-            .favorites
-            .iter()
-            .find(|f| crate::search_index_db::is_under(&current, &f.path))
-            .map(|f| f.path.clone());
-        let display = match fav_root {
+        let current = self.favsearch.nav_stack.last().cloned().unwrap();
+        // 包含するお気に入り根を探し、その直下からの相対パスを元のケースで組み立てる
+        let segments: Vec<String> = match self.find_favorite_root(&current) {
             Some(root) => {
-                // ルートのコンポーネント数だけスキップして相対パスを元のケースで取得
-                let cur_components: Vec<_> = current.components().collect();
-                let fav_component_count = root.components().count();
-                let rel: Vec<String> = cur_components
-                    .iter()
-                    .skip(fav_component_count)
-                    .map(|c| c.as_os_str().to_string_lossy().to_string())
-                    .collect();
                 let root_name = root
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                match (root_name.is_empty(), rel.is_empty()) {
-                    (true, true) => current
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    (true, false) => rel.join(" > "),
-                    (false, true) => root_name,
-                    (false, false) => format!("{} > {}", root_name, rel.join(" > ")),
-                }
+                    .map(str::to_string);
+                let rel_components = current.components().skip(root.components().count());
+                root_name
+                    .into_iter()
+                    .chain(rel_components.map(|c| c.as_os_str().to_string_lossy().to_string()))
+                    .collect()
             }
             None => current
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string(),
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default(),
         };
-        self.address = format!("🔍 検索結果: \"{}\" > {}", query, display);
+        self.address = format!("🔍 検索結果: \"{}\" > {}", query, segments.join(" > "));
     }
 
     /// 現在のクエリで検索を実行し、結果をグリッドに反映する。
     pub(crate) fn execute_favsearch(&mut self) {
         self.favsearch.last_executed = self.favsearch.query.clone();
         let query = self.favsearch.query.trim().to_string();
+        self.favsearch.nav_stack.clear();
 
-        // 空クエリなら空の結果を表示 (検索コンテキスト自体は維持)
-        if query.is_empty() {
-            self.favsearch.in_results = true;
-            self.favsearch.result_count = 0;
-            self.favsearch.nav_stack.clear();
-            self.favsearch.results_paths.clear();
-            let synthetic = search_results_synthetic_path();
-            self.start_loading_items(
-                synthetic,
-                Vec::new(),
-                Vec::new(),
-                std::collections::HashSet::new(),
-                Vec::new(),
-            );
-            self.address = "🔍 検索結果: \"\"  (0 件)".to_string();
-            return;
-        }
-
-        let Some(db) = self.search_index_db.as_ref() else { return };
-        let fav_roots: Vec<PathBuf> =
-            self.settings.favorites.iter().map(|f| f.path.clone()).collect();
-        let results = match db.search(&query, &fav_roots) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::logger::log(format!("favsearch query failed: {e}"));
-                return;
+        // 空クエリ: 空結果を合成パスに載せて検索コンテキストを維持
+        let results = if query.is_empty() {
+            Vec::new()
+        } else {
+            let Some(db) = self.search_index_db.as_ref() else { return };
+            let fav_roots: Vec<PathBuf> =
+                self.settings.favorites.iter().map(|f| f.path.clone()).collect();
+            match db.search(&query, &fav_roots) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::logger::log(format!("favsearch query failed: {e}"));
+                    return;
+                }
             }
         };
-        self.favsearch.result_count = results.len();
 
-        // 検索結果を GridItem に変換 + image_metas を用意
         let items: Vec<GridItem> = results
             .iter()
             .map(|e| match e.kind {
@@ -1278,40 +1215,20 @@ impl App {
             .collect();
         let image_metas: Vec<Option<(i64, i64)>> =
             results.iter().map(|e| Some((e.mtime, 0))).collect();
-        // Ctrl+↑↓ 用: 結果の対象パス一覧を保持 (ソート順そのまま)
         self.favsearch.results_paths = results.iter().map(|e| e.path.clone()).collect();
 
-        // 検索結果グリッドに入る (スタックは空にリセット)
-        if self.favsearch.saved_folder.is_none() {
-            self.favsearch.saved_folder = self.current_folder.clone();
-        }
-        self.favsearch.in_results = true;
-        self.favsearch.nav_stack.clear();
-
-        // 合成パスで items を配置 (last_folder 保存はスキップされる)
         let synthetic = search_results_synthetic_path();
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .filter_map(|it| match it {
-                GridItem::Folder(p) => p.file_name()?.to_str().map(|n| {
-                    format!("{}{n}", CACHE_KEY_FOLDER)
-                }),
-                GridItem::ZipFile(p) => p.file_name()?.to_str().map(|n| {
-                    format!("{}{n}", CACHE_KEY_ZIP)
-                }),
-                GridItem::PdfFile(p) => p.file_name()?.to_str().map(|n| {
-                    format!("{}{n}", CACHE_KEY_PDF)
-                }),
+                GridItem::Folder(p) => p.file_name()?.to_str().map(|n| format!("{}{n}", CACHE_KEY_FOLDER)),
+                GridItem::ZipFile(p) => p.file_name()?.to_str().map(|n| format!("{}{n}", CACHE_KEY_ZIP)),
+                GridItem::PdfFile(p) => p.file_name()?.to_str().map(|n| format!("{}{n}", CACHE_KEY_PDF)),
                 _ => None,
             })
             .collect();
         self.start_loading_items(synthetic, items, image_metas, existing_keys, Vec::new());
-
-        // address を検索結果表示に差し替え
-        self.address = format!(
-            "🔍 検索結果: \"{}\"  ({} 件)",
-            query, self.favsearch.result_count
-        );
+        self.update_favsearch_address();
     }
 
     /// `path` を包含するお気に入りのパスを返す (なければ None)。
@@ -4916,7 +4833,6 @@ impl eframe::App for App {
             // (BS は favsearch_back 経由で navigate には流れないので二重 push にならない)
             if self.favsearch.active {
                 self.favsearch.nav_stack.push(p.clone());
-                self.favsearch.in_results = false;
             }
             self.load_folder(p);
             if self.favsearch.active {
