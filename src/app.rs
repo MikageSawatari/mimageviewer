@@ -2611,9 +2611,21 @@ impl App {
         for (idx, item) in self.items.iter().enumerate() {
             let path = match item {
                 GridItem::Image(p) => p.clone(),
-                _ => {
-                    // フォルダ・動画・ZIPセパレータは常に表示
+                // フォルダ・動画・ZIP/PDF ファイル・ZIP セパレータは
+                // ナビゲーション用の構造アイテムとして常に表示する。
+                GridItem::Folder(_)
+                | GridItem::Video(_)
+                | GridItem::ZipFile(_)
+                | GridItem::PdfFile(_)
+                | GridItem::ZipSeparator { .. } => {
                     matches.insert(idx);
+                    continue;
+                }
+                // ZIP 内画像・PDF ページは表示名 (エントリ名 / "Page N") で絞り込む
+                GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
+                    if item.name().to_lowercase().contains(&query) {
+                        matches.insert(idx);
+                    }
                     continue;
                 }
             };
@@ -4378,6 +4390,23 @@ impl eframe::App for App {
             if ctrl_f {
                 self.show_search_bar = true;
                 self.search_focus_request = true;
+            }
+        }
+
+        // ── Ctrl+A: 表示中の全アイテムをチェック ─────────────────────
+        // address/search にフォーカスがあるときはテキスト選択を優先する
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+        {
+            let ctrl_a = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A));
+            if ctrl_a {
+                for &idx in &self.visible_indices {
+                    if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                        self.checked.insert(idx);
+                    }
+                }
             }
         }
 
