@@ -13,7 +13,7 @@ use std::sync::{
 use eframe::egui;
 
 use crate::app::App;
-use crate::folder_tree::{is_apple_double, walk_dirs_recursive};
+use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
 use crate::search_index_db::{IndexEntry, IndexKind};
 
 impl App {
@@ -212,14 +212,32 @@ impl App {
                 let _ = db.clear_for_favorite(fav_path);
             }
 
-            // Pass 1: サブフォルダ列挙
+            // Pass 1: サブフォルダ列挙 (進捗として訪問中フォルダ名を current に反映)
             let mut all_folders: Vec<(PathBuf, PathBuf)> = Vec::new(); // (folder, favorite_root)
+            let mut last_update = std::time::Instant::now();
+            let update_interval = std::time::Duration::from_millis(200);
             for (_, fav_path) in &targets {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 let mut found: Vec<PathBuf> = Vec::new();
-                walk_dirs_recursive(fav_path, &mut found, &cancel);
+                let current_ref = Arc::clone(&current);
+                walk_dirs_recursive_with_progress(
+                    fav_path,
+                    &mut found,
+                    &cancel,
+                    &mut |visited| {
+                        // スロットリング: 最後の更新から update_interval 経過している場合のみ書き込む
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_update) >= update_interval {
+                            last_update = now;
+                            if let Ok(mut s) = current_ref.lock() {
+                                // UI 側は "現在: {s}" と表示するので path だけ入れる
+                                *s = visited.to_string_lossy().to_string();
+                            }
+                        }
+                    },
+                );
                 for f in found {
                     all_folders.push((f, fav_path.clone()));
                 }

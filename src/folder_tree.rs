@@ -194,18 +194,31 @@ fn last_descendant_dir(path: &Path) -> PathBuf {
 
 /// path 以下のすべてのサブフォルダ（path 自身を含む）を再帰的に収集する。
 pub fn walk_dirs_recursive(path: &Path, out: &mut Vec<PathBuf>, cancel: &AtomicBool) {
+    walk_dirs_recursive_with_progress(path, out, cancel, &mut |_| {});
+}
+
+/// `walk_dirs_recursive` の進捗通知付きバージョン。
+/// 訪問するディレクトリごとに `on_visit(path)` を呼ぶ。
+/// 呼び出し側でスロットリング (時間ベースのフィルタ等) を行う想定。
+pub fn walk_dirs_recursive_with_progress(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    cancel: &AtomicBool,
+    on_visit: &mut dyn FnMut(&Path),
+) {
     if cancel.load(Ordering::Relaxed) {
         return;
     }
     if !path.is_dir() {
         return;
     }
+    on_visit(path);
     out.push(path.to_path_buf());
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                walk_dirs_recursive(&p, out, cancel);
+                walk_dirs_recursive_with_progress(&p, out, cancel, on_visit);
             }
         }
     }

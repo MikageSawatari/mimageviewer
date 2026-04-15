@@ -624,8 +624,10 @@ impl App {
             ui.add_space(2.0);
         });
 
-        // Esc で閉じる (IME 変換中はスキップ、他のダイアログが開いていないときのみ)
-        if !self.any_dialog_open() && escape_pressed && self.favsearch.has_focus {
+        // Esc で閉じる (IME 変換中はスキップ、他のダイアログが開いていないときのみ)。
+        // テキストボックスが Esc で focus を失ってから本チェックに達するため、
+        // has_focus は要求せず active のみで判定する (Ctrl+F の検索バーと同じ挙動)。
+        if !self.any_dialog_open() && escape_pressed {
             close_requested = true;
         }
 
