@@ -108,15 +108,6 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
-/// 画像補正パネル時の画像表示領域（左パネル分を右にずらす）を返す。
-fn adjustment_image_rect(full_rect: egui::Rect) -> egui::Rect {
-    let panel_w = crate::ui_adjustment_panel::LEFT_PANEL_WIDTH.min(full_rect.width() * 0.3);
-    egui::Rect::from_min_max(
-        egui::pos2(full_rect.min.x + panel_w, full_rect.min.y),
-        full_rect.max,
-    )
-}
-
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
@@ -281,13 +272,13 @@ impl App {
                         let spread_pair = self.resolve_spread_pair(fs_idx);
                         let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
 
-                        // ── 分析/補正モード: 見開き中は無効、画像エリアを左側に制限 ──
+                        // ── 分析/補正モード: 見開き中は無効 ──
+                        // 分析モードは画像エリアを左側に制限する（右パネルと重ならないよう）。
+                        // 補正モードは左パネルを画像の上にオーバーレイする（画像位置は移動しない）。
                         let analysis_active = self.analysis_mode && !is_spread_double;
                         let adjustment_active = self.adjustment_mode && !is_spread_double;
                         let image_rect = if analysis_active {
                             analysis_image_rect(full_rect)
-                        } else if adjustment_active {
-                            adjustment_image_rect(full_rect)
                         } else {
                             full_rect
                         };
@@ -398,12 +389,13 @@ impl App {
                             }
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
+                            // 上部ホバーバーと重ならないよう、左パネルは上部バーの下から開始する。
                             let panel_w = crate::ui_adjustment_panel::LEFT_PANEL_WIDTH.min(full_rect.width() * 0.3);
                             let panel_rect = egui::Rect::from_min_max(
-                                full_rect.min,
+                                egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
                                 egui::pos2(full_rect.min.x + panel_w, full_rect.max.y),
                             );
-                            self.draw_adjustment_panel(ui, panel_rect);
+                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
                             // 右側にメタデータパネルも同時表示（show_metadata_panel の状態に関係なく）
                             if !is_spread_double {
                                 self.draw_metadata_panel_forced(ui, ctx, full_rect);
