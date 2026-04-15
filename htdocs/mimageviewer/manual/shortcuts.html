@@ -90,7 +90,6 @@
           <tr><td><kbd>Delete</kbd></td><td>選択/チェック済みファイルをごみ箱へ移動</td></tr>
           <tr><td><kbd>R</kbd></td><td>選択画像を右に回転</td></tr>
           <tr><td><kbd>L</kbd></td><td>選択画像を左に回転</td></tr>
-          <tr><td><kbd>0</kbd>〜<kbd>4</kbd></td><td>チェック済み（または選択中）の画像に補正プリセットを一括適用（<kbd>0</kbd>=解除）</td></tr>
         </tbody>
       </table>
     </div>
@@ -131,22 +130,6 @@
       </table>
     </div>
 
-    <h3>画像補正プリセット</h3>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>キー</th><th>操作</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><kbd>0</kbd></td><td>グローバル補正に切り替え（プリセット解除）</td></tr>
-          <tr><td><kbd>1</kbd>〜<kbd>4</kbd></td><td>補正プリセット 1〜4 を適用（再押下で解除）。補正パネルが左側に表示される</td></tr>
-          <tr><td><kbd>U</kbd></td><td>アクティブなプリセットの AI アップスケールモデルを順にサイクル切替</td></tr>
-          <tr><td><kbd>N</kbd></td><td>アクティブなプリセットの AI ノイズ除去を ON / OFF</td></tr>
-          <tr><td><kbd>Shift</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Shift</kbd>+<kbd>0</kbd></td><td>保存スロット 1〜10 からアクティブなプリセットに読み込む</td></tr>
-        </tbody>
-      </table>
-    </div>
-
     <h3>見開き表示</h3>
     <div class="table-wrap">
       <table>
@@ -154,11 +137,11 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>5</kbd></td><td>1ページ表示（通常）</td></tr>
-          <tr><td><kbd>6</kbd></td><td>見開き 左→右</td></tr>
-          <tr><td><kbd>7</kbd></td><td>見開き 左→右（表紙あり）</td></tr>
-          <tr><td><kbd>8</kbd></td><td>見開き 右→左</td></tr>
-          <tr><td><kbd>9</kbd></td><td>見開き 右→左（表紙あり）</td></tr>
+          <tr><td><kbd>1</kbd></td><td>1ページ表示（通常）</td></tr>
+          <tr><td><kbd>2</kbd></td><td>見開き 左→右</td></tr>
+          <tr><td><kbd>3</kbd></td><td>見開き 左→右（表紙あり）</td></tr>
+          <tr><td><kbd>4</kbd></td><td>見開き 右→左</td></tr>
+          <tr><td><kbd>5</kbd></td><td>見開き 右→左（表紙あり）</td></tr>
           <tr><td><kbd>Shift</kbd>+矢印キー</td><td>見開きモード中、1ページ送り</td></tr>
         </tbody>
       </table>
@@ -166,7 +149,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        右→左モード（<kbd>8</kbd>/<kbd>9</kbd>）では <kbd>←</kbd> と <kbd>→</kbd> の意味が反転します。
+        右→左モード（<kbd>4</kbd>/<kbd>5</kbd>）では <kbd>←</kbd> と <kbd>→</kbd> の意味が反転します。
         <kbd>↑</kbd>/<kbd>↓</kbd> は常に前/次です。
       </div>
     </div>
@@ -187,6 +170,28 @@
           <tr><td><kbd>Enter</kbd></td><td>動画の場合、外部プレイヤーで再生</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <h3>画像補正</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>U</kbd></td><td>AI アップスケールモデルを順にサイクル切替（現在のページに個別適用）</td></tr>
+          <tr><td><kbd>N</kbd></td><td>AI ノイズ除去を ON / OFF（現在のページに個別適用）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Shift</kbd>+<kbd>0</kbd></td><td>保存スロット 1〜10 を現在のページに適用（= そのページを個別化）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        補正パネル（画面左端にマウスを寄せると表示）のスライダーを動かすと、自動的にそのページの個別補正として保存されます。
+        パネル上部の「全画像に適用」「全画像から削除」「標準にする」「個別設定を解除」の 4 ボタンで、適用範囲を明示的に操作できます。
+        個別設定のあるページを開くと右上に「ページ補正適用」のトーストが表示されます。
+      </div>
     </div>
 
     <h3>マウス操作</h3>

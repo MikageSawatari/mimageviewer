@@ -94,6 +94,12 @@ impl AdjustParams {
     pub fn needs_upscale(&self) -> bool { self.upscale_model.is_some() }
     pub fn needs_denoise(&self) -> bool { self.denoise_model.is_some() }
 
+    /// ページ個別設定として保存する価値がないか (= identity かつ AI も使わない)。
+    /// true のときは DB から該当行を削除する / 個別設定を作らないで済む。
+    pub fn is_removable(&self) -> bool {
+        self.is_identity() && !self.needs_upscale() && !self.needs_denoise()
+    }
+
     /// AI 設定 (upscale/denoise) が other と同じか。
     /// 色調パラメータのみ変わった場合に AI キャッシュを保持するための比較。
     pub fn ai_settings_eq(&self, other: &Self) -> bool {
@@ -110,33 +116,6 @@ impl AdjustParams {
 
     pub fn denoise_model_kind(&self) -> Option<crate::ai::ModelKind> {
         self.denoise_model.as_deref().and_then(crate::ai::ModelKind::from_str)
-    }
-}
-
-/// フォルダ/ZIP/PDF 単位の 4 プリセット (個別プリセット 1-4)。
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AdjustPresets {
-    pub presets: [AdjustParams; 4],
-    pub names: [String; 4],
-}
-
-impl Default for AdjustPresets {
-    fn default() -> Self {
-        Self {
-            presets: std::array::from_fn(|_| AdjustParams::default()),
-            names: [
-                "プリセット 1".to_string(),
-                "プリセット 2".to_string(),
-                "プリセット 3".to_string(),
-                "プリセット 4".to_string(),
-            ],
-        }
-    }
-}
-
-impl AdjustPresets {
-    pub fn is_all_default(&self) -> bool {
-        self.presets.iter().all(|p| p.is_identity() && !p.needs_upscale() && !p.needs_denoise())
     }
 }
 

@@ -154,6 +154,8 @@ impl App {
         let mut cancel = false;
 
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
             .open(&mut open)
@@ -214,7 +216,7 @@ impl App {
                     .max_height(main_height)
                     .show(&mut right_ui, |ui| {
                         ui.set_min_width(400.0);
-                        draw_page(ui, state);
+                        draw_page(ui, state, enter_pressed);
                     });
 
                 // 全体の高さを確保
@@ -224,8 +226,8 @@ impl App {
                 ui.separator();
                 ui.add_space(4.0);
 
-                // Esc でキャンセル
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                // Esc でキャンセル (IME 変換中はスキップ)
+                if escape_pressed {
                     cancel = true;
                 }
 
@@ -325,7 +327,7 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 // ── 右パネル ページ描画 ─────────────────────────────────────────
 
-fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState) {
+fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: bool) {
     ui.heading(state.selected.label());
     ui.add_space(8.0);
 
@@ -339,7 +341,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState) {
         PreferencesPage::Cache => page_cache(ui, state),
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
-        PreferencesPage::ExifDisplay => page_exif_display(ui, state),
+        PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
     }
 }
@@ -796,7 +798,7 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 }
 
-fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
+fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: bool) {
     ui.label("非表示にする EXIF タグ名:");
     ui.add_space(4.0);
 
@@ -836,8 +838,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.label("追加:");
         let response = ui.text_edit_singleline(&mut state.exif_add_tag_input);
         if (ui.button("追加").clicked()
-            || response.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            || (response.lost_focus() && enter_pressed))
             && !state.exif_add_tag_input.trim().is_empty()
         {
             let tag = state.exif_add_tag_input.trim().to_string();

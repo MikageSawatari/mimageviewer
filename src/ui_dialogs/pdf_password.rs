@@ -16,6 +16,8 @@ impl crate::app::App {
         let mut apply = false;
         let mut cancel = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(80.0, 60.0);
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("PDF パスワード入力")
             .open(&mut open)
@@ -51,8 +53,7 @@ impl crate::app::App {
                     resp.request_focus();
                 }
                 // Enter キーで確定
-                let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter && (resp.has_focus() || resp.lost_focus()) {
+                if enter_pressed && (resp.has_focus() || resp.lost_focus()) {
                     apply = true;
                 }
 
@@ -91,7 +92,7 @@ impl crate::app::App {
                         cancel = true;
                     }
                 });
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if escape_pressed {
                     cancel = true;
                 }
             });

@@ -263,8 +263,7 @@ impl App {
 
             // ドラッグしていないクリック → 閉じる
             let clicked = area_resp.inner.clicked();
-            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            if clicked || esc {
+            if clicked || self.dialog_escape_pressed(ctx) {
                 self.tq.fullscreen = false;
             }
         }

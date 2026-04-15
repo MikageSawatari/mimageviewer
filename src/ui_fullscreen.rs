@@ -238,6 +238,9 @@ impl App {
             egui::ViewportId::from_hash_of("fullscreen_viewer"),
             fs_builder,
             |ctx, _class| {
+                // フルスクリーンビューポート内のイベントで IME 状態を更新する
+                // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)
+                self.update_ime_state(ctx);
                 if need_show {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -441,6 +444,7 @@ impl App {
 
                         {
                             let saved_nav = nav_delta;
+                            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.folder_display, &state.filename,
@@ -456,8 +460,8 @@ impl App {
                                 is_spread_double,
                                 &mut self.ai_inpaint_active,
                                 ai_upscale_info,
-                                &mut self.adjustment_active_preset,
                                 &mut self.adjustment_mode,
+                                has_page_override,
                             );
                             // ホイール/キーで確定した nav_delta を保護
                             if nav_locked { nav_delta = saved_nav; }
@@ -477,6 +481,9 @@ impl App {
 
                         // ── 右上フィードバックトースト ──
                         self.draw_feedback_toast(ui, full_rect, ctx);
+
+                        // ── スロット保存ダイアログ ──
+                        self.draw_slot_save_dialog(ctx);
 
                         // 見開き補完の有効/無効が変更された場合
                         if self.ai_inpaint_active != inpaint_before {
@@ -761,6 +768,9 @@ impl App {
         let mut action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None };
 
         if !has_focus { return action; }
+        // モーダルダイアログ表示中はキー入力を奪わない
+        // (テキスト入力やダイアログ内の Enter/Esc 処理を優先)
+        if self.any_dialog_open() { return action; }
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
@@ -799,24 +809,12 @@ impl App {
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
 
-        // プリセット名編集中はキー入力をスキップ
-        if self.editing_preset_name {
-            return action;
-        }
-
-        // 画像補正プリセット (0=グローバル, 1-4=個別)
-        let key_0 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num0));
+        // 見開きモード切替 (1-5 キー)
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
         let key_3 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
         let key_4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
-
-        // 見開きモード切替 (5-9 キー)
         let key_5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num5));
-        let key_6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num6));
-        let key_7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num7));
-        let key_8 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num8));
-        let key_9 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num9));
 
         // U キー: AI アップスケールサイクル
         let key_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::U));
@@ -838,11 +836,11 @@ impl App {
         ];
 
         // 見開きモード切替 + フィードバック表示
-        let new_spread = if key_5 { Some(SpreadMode::Single) }
-            else if key_6 { Some(SpreadMode::Ltr) }
-            else if key_7 { Some(SpreadMode::LtrCover) }
-            else if key_8 { Some(SpreadMode::Rtl) }
-            else if key_9 { Some(SpreadMode::RtlCover) }
+        let new_spread = if key_1 { Some(SpreadMode::Single) }
+            else if key_2 { Some(SpreadMode::Ltr) }
+            else if key_3 { Some(SpreadMode::LtrCover) }
+            else if key_4 { Some(SpreadMode::Rtl) }
+            else if key_5 { Some(SpreadMode::RtlCover) }
             else { None };
 
         if let Some(mode) = new_spread {
@@ -863,78 +861,46 @@ impl App {
                 self.normalize_spread_position();
             }
             // フィードバック表示
-            let key_num = if key_5 { 5 } else if key_6 { 6 } else if key_7 { 7 } else if key_8 { 8 } else { 9 };
+            let key_num = if key_1 { 1 } else if key_2 { 2 } else if key_3 { 3 } else if key_4 { 4 } else { 5 };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
 
-        // 画像補正プリセット切替 (0=グローバル, 1-4=個別)
-        let new_preset = if key_0 { Some(0u8) }
-            else if key_1 { Some(1) }
-            else if key_2 { Some(2) }
-            else if key_3 { Some(3) }
-            else if key_4 { Some(4) }
-            else { None };
-
-        if let Some(pi) = new_preset {
-            // 前のプリセットと AI 設定を比較してキャッシュクリア範囲を決定
-            let old_params: Option<crate::adjustment::AdjustParams> = self.get_adjustment_params(fs_idx);
-            self.adjustment_active_preset = Some(pi);
-            if self.analysis_mode {
-                self.fs_zoom = self.analysis_zoom;
-                self.fs_pan = self.analysis_pan;
-                self.reset_analysis_mode();
-            }
-            self.assign_page_preset(fs_idx, pi);
-            let new_params = self.get_preset_params(pi);
-            if old_params.as_ref().map_or(true, |old| !old.ai_settings_eq(&new_params)) {
-                self.clear_all_adjustment_and_ai_caches(fs_idx);
-            } else {
-                self.clear_adjustment_caches(fs_idx);
-            }
-            let label = self.preset_display_label(pi);
-            self.show_feedback_toast(format!("[{}]", label));
-        }
-
-        // U キー: AI アップスケールモデルをサイクル
+        // U キー: AI アップスケールモデルをサイクル (現在ページの有効パラメータに対して)
         if key_u {
-            if let Some(pi) = self.adjustment_active_preset {
-                let params = self.get_preset_params_mut(pi);
-                let cur = crate::adjustment::UPSCALE_MODELS.iter().position(|(_, k)| {
-                    match (k, params.upscale_model.as_deref()) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => *a == b,
-                        _ => false,
-                    }
-                }).unwrap_or(0);
-                let next = (cur + 1) % crate::adjustment::UPSCALE_MODELS.len();
-                let (label, key) = crate::adjustment::UPSCALE_MODELS[next];
-                params.upscale_model = key.map(|s| s.to_string());
-                self.show_feedback_toast(format!("[U:アップスケール {}]", label));
-                self.clear_all_adjustment_and_ai_caches(fs_idx);
-                self.save_current_preset(pi);
-            }
-        }
-
-        // N キー: AI デノイズをトグル
-        if key_n {
-            if let Some(pi) = self.adjustment_active_preset {
-                let params = self.get_preset_params_mut(pi);
-                if params.denoise_model.is_some() {
-                    params.denoise_model = None;
-                    self.show_feedback_toast("[N:デノイズ OFF]".to_string());
-                } else {
-                    params.denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
-                    self.show_feedback_toast("[N:デノイズ ON]".to_string());
+            let mut params = self.effective_params(fs_idx).clone();
+            let cur = crate::adjustment::UPSCALE_MODELS.iter().position(|(_, k)| {
+                match (k, params.upscale_model.as_deref()) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => *a == b,
+                    _ => false,
                 }
-                self.clear_all_adjustment_and_ai_caches(fs_idx);
-                self.save_current_preset(pi);
-            }
+            }).unwrap_or(0);
+            let next = (cur + 1) % crate::adjustment::UPSCALE_MODELS.len();
+            let (label, key) = crate::adjustment::UPSCALE_MODELS[next];
+            params.upscale_model = key.map(|s| s.to_string());
+            self.show_feedback_toast(format!("[U:アップスケール {}]", label));
+            self.set_page_params(fs_idx, params);
+            self.clear_all_adjustment_and_ai_caches(fs_idx);
         }
 
-        // Shift+数字キー: 保存スロットから現在のプリセットにロード
+        // N キー: AI デノイズをトグル (現在ページの有効パラメータに対して)
+        if key_n {
+            let mut params = self.effective_params(fs_idx).clone();
+            if params.denoise_model.is_some() {
+                params.denoise_model = None;
+                self.show_feedback_toast("[N:デノイズ OFF]".to_string());
+            } else {
+                params.denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
+                self.show_feedback_toast("[N:デノイズ ON]".to_string());
+            }
+            self.set_page_params(fs_idx, params);
+            self.clear_all_adjustment_and_ai_caches(fs_idx);
+        }
+
+        // Shift+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
         for (slot_idx, &pressed) in shift_keys.iter().enumerate() {
             if pressed {
-                self.load_slot_to_active_preset(slot_idx);
+                self.apply_slot_to_current_page(slot_idx);
             }
         }
 
@@ -1066,7 +1032,7 @@ impl App {
         });
 
         // 左端・上端・右端のホバーでオーバーレイ（上バー＋左パネル＋右パネル）を同時表示/非表示
-        if !self.editing_preset_name {
+        {
             let edge_hover = ctx.input(|i| {
                 i.pointer.hover_pos().map(|p| {
                     p.y < 60.0  // 上端
@@ -1074,7 +1040,7 @@ impl App {
                     || p.x > full_rect.max.x - full_rect.width() * 0.05  // 右端5%
                 }).unwrap_or(false)
             });
-            if edge_hover && self.adjustment_active_preset.is_some() && !self.analysis_mode {
+            if edge_hover && !self.analysis_mode {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel && !edge_hover && self.adjustment_mode && !self.adjustment_dragging {
                 self.adjustment_mode = false;
@@ -1800,9 +1766,10 @@ impl App {
         ai_inpaint_active: &mut bool,
         // AI アップスケール後のサイズとモデル名（表示用）
         ai_upscale_info: Option<(&str, u32, u32)>,
-        // 画像補正プリセット
-        adjustment_active_preset: &mut Option<u8>,
+        // 画像補正パネル表示トグル
         adjustment_mode: &mut bool,
+        // 現在ページに個別補正が適用されているか (ボタン点灯用)
+        has_page_override: bool,
     ) {
         let hover_in_top = ctx
             .input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
@@ -2033,52 +2000,44 @@ impl App {
 
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // 🎨 画像補正プリセットボタン (5つ: G/1/2/3/4)
+        // 🎨 画像補正パネルトグルボタン
         {
-            let preset_labels = ["G", "1", "2", "3", "4"];
-            let preset_btn_size = 24.0_f32;
-            let preset_gap = 2.0_f32;
-            let total_w = preset_labels.len() as f32 * (preset_btn_size + preset_gap) - preset_gap;
-            let start_x = next_x + BAR_BUTTON_SIZE - total_w;
-            let btn_y = bar_rect.min.y + BAR_BUTTON_MARGIN + (BAR_BUTTON_SIZE - preset_btn_size) * 0.5;
-
-            for (i, label) in preset_labels.iter().enumerate() {
-                let pi = i as u8; // 0=グローバル, 1-4=個別
-                let bx = start_x + i as f32 * (preset_btn_size + preset_gap);
-                let btn_rect = egui::Rect::from_min_size(
-                    egui::pos2(bx, btn_y),
-                    egui::vec2(preset_btn_size, preset_btn_size),
-                );
-                let is_active = *adjustment_active_preset == Some(pi);
-                let resp = ui.interact(
-                    btn_rect,
-                    egui::Id::new(format!("fs_preset_{i}")),
-                    egui::Sense::click(),
-                );
-                let bg = if is_active {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
-                } else if resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(60, 60, 60, 180)
-                };
-                ui.painter().rect_filled(btn_rect, 3.0, bg);
-                ui.painter().text(
-                    btn_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    *label,
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::WHITE,
-                );
-                if resp.clicked() {
-                    *adjustment_active_preset = Some(pi);
-                    *adjustment_mode = true;
-                }
-                if resp.hovered() { *nav_delta = 0; }
-            }
-
-            // プリセットボタン全体の幅分だけ next_x を左にずらす
-            next_x = start_x - BAR_BUTTON_GAP - BAR_BUTTON_SIZE;
+            let btn_rect = egui::Rect::from_min_size(
+                egui::pos2(next_x, bar_rect.min.y + BAR_BUTTON_MARGIN),
+                egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
+            );
+            let resp = ui.interact(
+                btn_rect,
+                egui::Id::new("fs_adjust_btn"),
+                egui::Sense::click(),
+            );
+            let bg = if *adjustment_mode {
+                egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
+            } else if has_page_override {
+                // 個別設定が効いているときは薄い警告色でヒント
+                egui::Color32::from_rgba_unmultiplied(120, 100, 60, 200)
+            } else if resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+            };
+            ui.painter().rect_filled(btn_rect, 4.0, bg);
+            ui.painter().text(
+                btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "🎨",
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+            let tooltip = if has_page_override {
+                "画像補正 (このページは個別設定あり)"
+            } else {
+                "画像補正"
+            };
+            let resp = resp.on_hover_text(tooltip);
+            if resp.clicked() { *adjustment_mode = !*adjustment_mode; }
+            if resp.hovered() { *nav_delta = 0; }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
         // 🖌 AI 補完ボタン（見開きダブル時のみ表示）

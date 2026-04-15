@@ -15,6 +15,7 @@ impl crate::app::App {
             .unwrap_or(0);
 
         let mut open = true;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         egui::Window::new("回転情報のリセット")
             .open(&mut open)
             .collapsible(false)
@@ -36,9 +37,7 @@ impl crate::app::App {
                         }
                         self.show_rotation_reset_confirm = false;
                     }
-                    if ui.button("キャンセル").clicked()
-                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                    {
+                    if ui.button("キャンセル").clicked() || escape_pressed {
                         self.show_rotation_reset_confirm = false;
                     }
                 });

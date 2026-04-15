@@ -40,6 +40,7 @@ impl App {
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("お気に入りの編集")
             .open(&mut open)
@@ -118,7 +119,7 @@ impl App {
                         });
                 }
 
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if escape_pressed {
                     cancel = true;
                 }
 

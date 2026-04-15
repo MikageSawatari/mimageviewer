@@ -150,6 +150,41 @@ mimageviewer/
   `mod.rs` に `mod xxx;` を追加し、`app.rs` の `update()` 内で `self.show_xxx(ctx)` を呼ぶ。
   `App` 構造体に `show_xxx: bool` フィールドを追加し、`Default` impl で `false` 初期化。
 
+### IME 対応 (日本語入力) ⚠️ 重要
+TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
+直接 `ctx.input(|i| i.key_pressed(Key::Enter/Escape))` を呼ぶと、**日本語 IME 変換中の Enter
+(変換確定) や Escape (変換キャンセル) をダイアログが奪ってしまい、変換が破壊される**。
+
+- **確定用**: `self.dialog_enter_pressed(ctx)` — IME 変換中は常に false
+- **キャンセル用**: `self.dialog_escape_pressed(ctx)` — IME 変換中は常に false
+- **判定ロジック**: `App::ime_input_active()` は `ime_composing` フラグ (Ime イベントで更新) と
+  直近 300ms 以内の Ime イベント有無の OR で判定。300ms グレースは Windows IME で
+  `Ime::Disabled` と `Key::Escape` が別フレームに届くケースを吸収するため。
+
+**ビューポート別のイベントキュー**:
+egui の `show_viewport_immediate` は独立したイベントキューを持つ。メインビューポートと
+フルスクリーンビューポートは別キュー。IME 状態はビューポートごとに追跡が必要なので、
+`App::update_ime_state(ctx)` は **各ビューポートの入り口**で呼ばれている:
+- メイン: [src/app.rs](src/app.rs) の `App::update` 先頭
+- フルスクリーン: [src/ui_fullscreen.rs](src/ui_fullscreen.rs) の `show_viewport_immediate` closure 先頭
+
+新しいビューポートを追加した場合、closure 先頭で `self.update_ime_state(ctx)` を必ず呼ぶこと。
+
+**借用の注意**:
+`egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは
+借用衝突になりやすい。`dialog_enter_pressed` / `dialog_escape_pressed` は closure の**前**で
+ローカル変数にキャプチャしてから closure 内で参照する:
+```rust
+let enter_pressed = self.dialog_enter_pressed(ctx);
+let escape_pressed = self.dialog_escape_pressed(ctx);
+egui::Window::new("...").show(ctx, |ui| {
+    if response.lost_focus() && enter_pressed { ... }
+    if escape_pressed { cancel = true; }
+});
+```
+深いネスト (例: `preferences.rs` の `draw_page` → `page_exif_display`) では一時構造体
+(`PreferencesState::enter_pressed` 等) のフィールドに載せて伝搬する。
+
 ### サムネイルロード
 - **Grid contents**: フォルダ・ZIP・PDF 先頭（名前順）、画像後続（ソート順設定可）。
   ZIP/PDF ファイルは 1 枚目/1 ページ目のサムネイル＋種別バッジで表示。非画像は無視。

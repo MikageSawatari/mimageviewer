@@ -144,6 +144,7 @@ impl App {
         // ── 「すべて削除」確認ダイアログ（別ウィンドウ）────────────
         if self.cache_manager_confirm_delete_all {
             let mut confirm_open = true;
+            let escape_pressed = self.dialog_escape_pressed(ctx);
             egui::Window::new("キャッシュの全削除")
                 .open(&mut confirm_open)
                 .collapsible(false)
@@ -164,9 +165,7 @@ impl App {
                             ));
                             self.cache_manager_confirm_delete_all = false;
                         }
-                        if ui.button("  キャンセル  ").clicked()
-                            || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                        {
+                        if ui.button("  キャンセル  ").clicked() || escape_pressed {
                             self.cache_manager_confirm_delete_all = false;
                         }
                     });
