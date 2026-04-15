@@ -14,15 +14,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn models_dir() -> PathBuf {
-    let appdata = std::env::var("APPDATA").expect("APPDATA not set");
-    PathBuf::from(appdata).join("mimageviewer").join("models")
+    mimageviewer::data_dir::get().join("models")
 }
 
 /// モデル定義
 struct ModelDef {
     name: &'static str,
     filename: &'static str,
-    url: &'static str,
     /// 入力サイズ (0 = 動的)
     input_size: u32,
     /// image 入力名
@@ -42,7 +40,7 @@ const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "LaMa FP32 512 (Carve)",
         filename: "lama_fp32.onnx",
-        url: "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
+
         input_size: 512,
         image_input: "image",
         mask_input: "mask",
@@ -53,7 +51,7 @@ const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "LaMa FP16 512 (converted)",
         filename: "lama_fp16.onnx",
-        url: "",
+
         input_size: 512,
         image_input: "image",
         mask_input: "mask",
@@ -64,7 +62,7 @@ const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "LaMa Dynamic FP32",
         filename: "lama_dynamic_fp32.onnx",
-        url: "",
+
         input_size: 0,
         image_input: "image",
         mask_input: "mask",
@@ -75,7 +73,7 @@ const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "LaMa Dynamic FP16",
         filename: "lama_dynamic_fp16.onnx",
-        url: "",
+
         input_size: 0,
         image_input: "image",
         mask_input: "mask",
@@ -87,7 +85,7 @@ const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "MI-GAN (lxfater)",
         filename: "migan.onnx",
-        url: "https://huggingface.co/lxfater/inpaint-web/resolve/main/migan.onnx",
+
         input_size: 512,
         image_input: "input",
         mask_input: "",
@@ -98,7 +96,7 @@ const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "DeepFillv2",
         filename: "deepfillv2.onnx",
-        url: "https://huggingface.co/ford442/deepfillv2-inpainting/resolve/main/onnx/deepfillv2.onnx",
+
         input_size: 512,
         image_input: "input",
         mask_input: "",
@@ -143,8 +141,11 @@ fn main() {
     for model in MODELS {
         let path = dir.join(model.filename);
         if !path.exists() {
-            println!("\nDownloading {}...", model.name);
-            download_model(model.url, &path);
+            panic!(
+                "Model not found: {}\nExpected at: {}\nRun the app once to extract embedded models, or place the file manually.",
+                model.name,
+                path.display()
+            );
         }
     }
 
@@ -473,8 +474,7 @@ fn render_pdf_page(pdf_path: &Path, page_num: u32) -> image::DynamicImage {
     }
 
     // PDFium ワーカープールは使えないので、直接 PDFium を初期化して描画
-    let appdata = std::env::var("APPDATA").expect("APPDATA");
-    let dll_path = PathBuf::from(&appdata).join("mimageviewer").join("pdfium.dll");
+    let dll_path = mimageviewer::data_dir::get().join("pdfium.dll");
     if !dll_path.exists() {
         eprintln!("pdfium.dll not found at {}", dll_path.display());
         eprintln!("Alternatively, pre-render pages as bench_page_<N>.png");
@@ -503,14 +503,6 @@ fn render_pdf_page(pdf_path: &Path, page_num: u32) -> image::DynamicImage {
     img.save(&png_path).expect("save page png");
     println!("  Saved pre-rendered page: {}", png_path.display());
     img
-}
-
-fn download_model(url: &str, path: &Path) {
-    println!("  Downloading from: {url}");
-    let resp = ureq::get(url).call().expect("HTTP request failed");
-    let mut file = std::fs::File::create(path).expect("create file");
-    std::io::copy(&mut resp.into_body().as_reader(), &mut file).expect("download");
-    println!("  Saved: {}", path.display());
 }
 
 fn resize_rgb_bilinear(src: &[f32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<f32> {

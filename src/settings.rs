@@ -471,19 +471,6 @@ pub struct Settings {
     #[serde(default)]
     pub custom_open_with_apps: Vec<RecentApp>,
 
-    // ── AI 機能 ──────────────────────────────────────────────
-    /// AI アップスケール機能を使う（マスタースイッチ、再起動で反映）
-    #[serde(default = "default_true")]
-    pub ai_upscale_feature: bool,
-
-    /// AI ノイズ除去機能を使う（マスタースイッチ、再起動で反映）
-    #[serde(default)]
-    pub ai_denoise_feature: bool,
-
-    /// AI 見開き補完機能を使う（マスタースイッチ、再起動で反映）
-    #[serde(default = "default_true")]
-    pub ai_inpaint_feature: bool,
-
     // ── AI セッション設定 ────────────────────────────────────
     /// AI アップスケール: フルスクリーン表示時に有効にするか（デフォルト: false）
     #[serde(default)]
@@ -660,9 +647,6 @@ impl Default for Settings {
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
             custom_open_with_apps: Vec::new(),
-            ai_upscale_feature: true,
-            ai_denoise_feature: false,
-            ai_inpaint_feature: true,
             ai_upscale_enabled: false,
             ai_upscale_model_override: None,
             ai_inpaint_active: false,

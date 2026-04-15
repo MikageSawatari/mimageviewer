@@ -19,8 +19,6 @@ fn draw_preset_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
     panel_width: f32,
-    ai_denoise_available: bool,
-    ai_upscale_available: bool,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut dragging = false;
@@ -115,7 +113,7 @@ fn draw_preset_sliders(
     ui.separator();
     ui.add_space(4.0);
 
-    if ai_denoise_available {
+    {
         // ── AI ノイズ除去 ──
         ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
 
@@ -133,7 +131,7 @@ fn draw_preset_sliders(
         ui.add_space(8.0);
     }
 
-    if ai_upscale_available {
+    {
     // ── AI アップスケール ──
     ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
 
@@ -169,7 +167,7 @@ fn draw_preset_sliders(
                 }
             }
         });
-    } // ai_upscale_available
+    }
 
     ui.add_space(12.0);
     ui.separator();
@@ -261,8 +259,6 @@ impl App {
                     ui,
                     &mut self.adjustment_presets.presets[preset_idx],
                     panel_rect.width(),
-                    self.settings.ai_denoise_feature,
-                    self.settings.ai_upscale_feature,
                 )
             }).inner;
 

@@ -19,8 +19,6 @@ pub enum AiError {
     Ort(String),
     /// モデルファイルが見つからない
     ModelNotFound(ModelKind),
-    /// モデルダウンロード失敗
-    DownloadFailed(String),
     /// 画像処理エラー
     ImageProcessing(String),
     /// IO エラー
@@ -34,7 +32,6 @@ impl fmt::Display for AiError {
         match self {
             AiError::Ort(e) => write!(f, "ONNX Runtime error: {e}"),
             AiError::ModelNotFound(k) => write!(f, "Model not found: {k:?}"),
-            AiError::DownloadFailed(e) => write!(f, "Download failed: {e}"),
             AiError::ImageProcessing(e) => write!(f, "Image processing error: {e}"),
             AiError::Io(e) => write!(f, "IO error: {e}"),
             AiError::Cancelled => write!(f, "Cancelled"),
@@ -57,8 +54,6 @@ pub enum ModelKind {
     UpscaleRealEsrganX4Plus,
     /// Real-ESRGAN Anime 6B（カラーイラスト向け）
     UpscaleRealEsrganAnime6B,
-    /// waifu2x cunet（漫画モノクロ向け）— DirectML 非互換のため無効
-    UpscaleWaifu2xCunet,
     /// realesr-general-x4v3（汎用）
     UpscaleRealEsrGeneralV3,
     /// Real-CUGAN 4x conservative（漫画・スクリーントーン保持向け）
@@ -76,7 +71,6 @@ impl ModelKind {
             ModelKind::ClassifierMobileNet => "classifier_mobilenet",
             ModelKind::UpscaleRealEsrganX4Plus => "realesrgan_x4plus",
             ModelKind::UpscaleRealEsrganAnime6B => "realesrgan_anime6b",
-            ModelKind::UpscaleWaifu2xCunet => "waifu2x_cunet",
             ModelKind::UpscaleRealEsrGeneralV3 => "realesr_general_v3",
             ModelKind::DenoiseRealplksr => "denoise_realplksr",
             ModelKind::InpaintMiGan => "inpaint_migan",
@@ -90,7 +84,6 @@ impl ModelKind {
             ModelKind::ClassifierMobileNet => "分類器 (MobileNetV3)",
             ModelKind::UpscaleRealEsrganX4Plus => "写真/CG (Real-ESRGAN x4plus)",
             ModelKind::UpscaleRealEsrganAnime6B => "イラスト (Real-ESRGAN Anime)",
-            ModelKind::UpscaleWaifu2xCunet => "漫画 (waifu2x cunet)",
             ModelKind::UpscaleRealEsrGeneralV3 => "汎用 (Real-ESRGAN General)",
             ModelKind::DenoiseRealplksr => "JPEG ノイズ除去",
             ModelKind::InpaintMiGan => "補完 (MI-GAN)",
@@ -104,7 +97,7 @@ impl ModelKind {
             "classifier_mobilenet" => Some(ModelKind::ClassifierMobileNet),
             "realesrgan_x4plus" => Some(ModelKind::UpscaleRealEsrganX4Plus),
             "realesrgan_anime6b" => Some(ModelKind::UpscaleRealEsrganAnime6B),
-            "waifu2x_cunet" => Some(ModelKind::UpscaleWaifu2xCunet),
+            // "waifu2x_cunet" は廃止。旧設定ファイルに存在する場合は無視
             "realesr_general_v3" => Some(ModelKind::UpscaleRealEsrGeneralV3),
             // "inpaint_lama" は旧設定ファイルとの互換用
             "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
@@ -122,8 +115,6 @@ impl ModelKind {
     }
 
     /// アップスケール用モデル一覧（UI プルダウンに表示するもの）。
-    /// NOTE: UpscaleWaifu2xCunet は入力端クロップのためタイル分割方式と互換性がなく、
-    /// DirectML でも Pad ノードに問題があるため、一覧から除外。
     pub fn upscale_models() -> &'static [ModelKind] {
         &[
             ModelKind::UpscaleRealEsrganX4Plus,

@@ -44,6 +44,9 @@ fn main() -> eframe::Result {
 
     data_dir::init();
 
+    // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
+    ai::model_manager::ensure_models_extracted();
+
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
     let log_enabled = cfg!(debug_assertions)
         || std::env::args().any(|a| a == "--log");

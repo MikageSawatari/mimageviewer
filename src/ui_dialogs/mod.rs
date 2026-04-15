@@ -19,5 +19,4 @@ mod stats_dialog;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
 mod pdf_password;
-mod ai_model_setup;
 mod about;

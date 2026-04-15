@@ -71,9 +71,10 @@ fn test_runtime_and_model_loading() {
         (mimageviewer::ai::ModelKind::ClassifierMobileNet, "anime_classifier_mobilenetv3.onnx"),
         (mimageviewer::ai::ModelKind::UpscaleRealEsrganX4Plus, "realesrgan_x4plus.onnx"),
         (mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B, "realesrgan_x4plus_anime_6b.onnx"),
-        (mimageviewer::ai::ModelKind::UpscaleWaifu2xCunet, "waifu2x_cunet_noise3_scale2x.onnx"),
         (mimageviewer::ai::ModelKind::UpscaleRealEsrGeneralV3, "realesr_general_x4v3.onnx"),
-        (mimageviewer::ai::ModelKind::InpaintLama, "lama_fp32.onnx"),
+        (mimageviewer::ai::ModelKind::UpscaleRealCugan4x, "realcugan_4x_conservative.onnx"),
+        (mimageviewer::ai::ModelKind::DenoiseRealplksr, "dejpg_realplksr_otf.onnx"),
+        (mimageviewer::ai::ModelKind::InpaintMiGan, "migan.onnx"),
     ];
 
     for (kind, filename) in &models {
@@ -255,102 +256,3 @@ fn test_upscale_full_size() {
     }
 }
 
-/// waifu2x の upscale() 関数テスト — スケール自動検出 + タイル分割。
-#[test]
-fn test_upscale_waifu2x_full() {
-    let models_dir = find_models_dir();
-    let path = models_dir.join("waifu2x_cunet_noise3_scale2x.onnx");
-    if !path.exists() {
-        println!("SKIP: waifu2x model not found");
-        return;
-    }
-
-    let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime.load_model(
-        mimageviewer::ai::ModelKind::UpscaleWaifu2xCunet,
-        &path,
-    ).unwrap();
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    // 200x150 のテスト画像
-    let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(200, 150));
-
-    println!("Testing waifu2x full upscale: {}x{}", img.width(), img.height());
-    let t0 = std::time::Instant::now();
-    let result = mimageviewer::ai::upscale::upscale(
-        &runtime,
-        mimageviewer::ai::ModelKind::UpscaleWaifu2xCunet,
-        &img,
-        &cancel,
-    );
-    let elapsed = t0.elapsed();
-
-    match result {
-        Ok(upscaled) => {
-            let [w, h] = upscaled.size;
-            println!("waifu2x full upscale OK: {}x{} → {}x{} in {:.2}s",
-                img.width(), img.height(), w, h, elapsed.as_secs_f64());
-        }
-        Err(e) => {
-            println!("waifu2x full upscale FAILED: {} ({:.2}s)", e, elapsed.as_secs_f64());
-            panic!("waifu2x upscale failed: {}", e);
-        }
-    }
-}
-
-/// waifu2x (2x) のテスト — スケールファクターが異なるので別テスト。
-#[test]
-fn test_upscale_waifu2x() {
-    let models_dir = find_models_dir();
-    let path = models_dir.join("waifu2x_cunet_noise3_scale2x.onnx");
-    if !path.exists() {
-        println!("SKIP: waifu2x model not found");
-        return;
-    }
-
-    let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime.load_model(
-        mimageviewer::ai::ModelKind::UpscaleWaifu2xCunet,
-        &path,
-    ).unwrap();
-
-    // waifu2x は 2x。64x64 → 128x128 になるはず。
-    // ただし upscale.rs は SCALE_FACTOR=4 でタイル分割するので、
-    // waifu2x の出力は 2x → コードが 4x 出力を期待してサイズ不一致になる。
-    // このテストはモデル単体の推論が動くかを直接テストする。
-    let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 64));
-    let rgb = img.to_rgb8();
-
-    // 直接推論テスト: 64x64 入力
-    let mut tensor = ndarray::Array4::<f32>::zeros((1, 3, 64, 64));
-    for y in 0..64usize {
-        for x in 0..64usize {
-            let px = rgb.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
-                tensor[[0, c, y, x]] = px.0[c] as f32 / 255.0;
-            }
-        }
-    }
-
-    let input_tensor = ort::value::Tensor::from_array(tensor)
-        .expect("Tensor creation failed");
-
-    let result = runtime.with_session(
-        mimageviewer::ai::ModelKind::UpscaleWaifu2xCunet,
-        |session| {
-            let outputs = session
-                .run(ort::inputs![input_tensor])
-                .map_err(|e| mimageviewer::ai::AiError::Ort(format!("run: {e}")))?;
-            let (shape, _data) = outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| mimageviewer::ai::AiError::Ort(format!("extract: {e}")))?;
-            println!("waifu2x output shape: {:?}", shape);
-            Ok(())
-        },
-    );
-
-    match result {
-        Ok(()) => println!("waifu2x direct inference: OK"),
-        Err(e) => panic!("waifu2x direct inference failed: {}", e),
-    }
-}

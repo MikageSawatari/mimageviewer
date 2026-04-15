@@ -429,7 +429,7 @@ pub struct App {
     /// AI ランタイム (ONNX Runtime)
     pub(crate) ai_runtime: Option<std::sync::Arc<crate::ai::runtime::AiRuntime>>,
     /// AI モデルマネージャ
-    pub(crate) ai_model_manager: Option<std::sync::Arc<crate::ai::model_manager::ModelManager>>,
+    pub(crate) ai_model_manager: std::sync::Arc<crate::ai::model_manager::ModelManager>,
     /// AI アップスケール有効フラグ
     pub(crate) ai_upscale_enabled: bool,
     /// AI アップスケールモデルの手動オーバーライド (None = 自動)
@@ -450,8 +450,6 @@ pub struct App {
     pub(crate) ai_inpaint_trim: f32,
     /// AI 補完のドラッグ状態: (開始 X, 開始 Y, 開始時の幅, 開始時のトリム)
     pub(crate) ai_inpaint_drag: Option<(f32, f32, f32, f32)>,
-    /// AI モデルセットアップダイアログの表示フラグ
-    pub(crate) show_ai_model_setup: bool,
     /// バージョン情報ダイアログ
     pub(crate) show_about_dialog: bool,
     /// AI アップスケールが失敗した idx の集合（リトライ防止）
@@ -494,10 +492,10 @@ impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         let settings = crate::settings::Settings::load();
-        let ai_upscale_enabled = settings.ai_upscale_enabled && settings.ai_upscale_feature;
+        let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
             .and_then(crate::ai::ModelKind::from_str);
-        let ai_inpaint_active = settings.ai_inpaint_active && settings.ai_inpaint_feature;
+        let ai_inpaint_active = settings.ai_inpaint_active;
         let ai_inpaint_gap_width = settings.ai_inpaint_gap_width as f32;
         let ai_inpaint_trim = settings.ai_inpaint_trim as f32;
         Self {
@@ -631,7 +629,7 @@ impl Default for App {
 
             // AI (settings から復元)
             ai_runtime: None,
-            ai_model_manager: None,
+            ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
             ai_upscale_enabled,
             ai_upscale_model_override,
             ai_denoise_model: None,
@@ -642,7 +640,6 @@ impl Default for App {
             ai_inpaint_gap_width,
             ai_inpaint_trim,
             ai_inpaint_drag: None,
-            show_ai_model_setup: false,
             show_about_dialog: false,
             ai_upscale_failed: std::collections::HashSet::new(),
             ai_status_done_at: None,
@@ -2923,11 +2920,6 @@ impl App {
                 }
             }
         }
-        if self.ai_model_manager.is_none() {
-            self.ai_model_manager = Some(std::sync::Arc::new(
-                crate::ai::model_manager::ModelManager::new(),
-            ));
-        }
     }
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
@@ -3025,7 +3017,7 @@ impl App {
         self.ensure_ai_runtime();
 
         let Some(runtime) = self.ai_runtime.clone() else { return; };
-        let Some(manager) = self.ai_model_manager.clone() else { return; };
+        let manager = self.ai_model_manager.clone();
 
         // デノイズモデル選択・ロード
         let denoise_model = if denoise_enabled && denoise_in_range {
@@ -3254,14 +3246,10 @@ impl App {
             crate::logger::log("[AI] Inpaint: ai_runtime not available".to_string());
             return;
         };
-        let Some(manager) = self.ai_model_manager.clone() else {
-            crate::logger::log("[AI] Inpaint: ai_model_manager not available".to_string());
-            return;
-        };
+        let manager = self.ai_model_manager.clone();
 
         // MI-GAN モデルが利用可能か確認
         let Some(model_path) = manager.model_path(crate::ai::ModelKind::InpaintMiGan) else {
-            // モデル未ダウンロード → スキップ（起動時ダイアログでダウンロード）
             return;
         };
 
@@ -3396,32 +3384,21 @@ impl App {
             .or(self.adjustment_active_preset);
         if let Some(pi) = preset_idx {
             let params = &self.adjustment_presets.presets[pi as usize];
-            // アップスケール: feature フラグでゲート
-            if self.settings.ai_upscale_feature {
-                match params.upscale_model_kind() {
-                    None => {
-                        self.ai_upscale_enabled = false;
-                        self.ai_upscale_model_override = None;
-                    }
-                    Some(None) => {
-                        self.ai_upscale_enabled = true;
-                        self.ai_upscale_model_override = None;
-                    }
-                    Some(Some(kind)) => {
-                        self.ai_upscale_enabled = true;
-                        self.ai_upscale_model_override = Some(kind);
-                    }
+            match params.upscale_model_kind() {
+                None => {
+                    self.ai_upscale_enabled = false;
+                    self.ai_upscale_model_override = None;
                 }
-            } else {
-                self.ai_upscale_enabled = false;
-                self.ai_upscale_model_override = None;
+                Some(None) => {
+                    self.ai_upscale_enabled = true;
+                    self.ai_upscale_model_override = None;
+                }
+                Some(Some(kind)) => {
+                    self.ai_upscale_enabled = true;
+                    self.ai_upscale_model_override = Some(kind);
+                }
             }
-            // デノイズ: feature フラグでゲート
-            self.ai_denoise_model = if self.settings.ai_denoise_feature {
-                params.denoise_model_kind()
-            } else {
-                None
-            };
+            self.ai_denoise_model = params.denoise_model_kind();
         } else {
             self.ai_upscale_enabled = false;
             self.ai_upscale_model_override = None;
@@ -4122,22 +4099,8 @@ impl eframe::App for App {
                 }
             }
 
-            // AI 機能が有効で必要モデルが不足していればダウンロードダイアログを表示
-            if self.settings.ai_upscale_feature
-                || self.settings.ai_denoise_feature
-                || self.settings.ai_inpaint_feature
-            {
-                self.ensure_ai_runtime();
-                if let Some(ref mgr) = self.ai_model_manager {
-                    let has_missing =
-                        (self.settings.ai_upscale_feature && !mgr.missing_upscale_models().is_empty())
-                        || (self.settings.ai_denoise_feature && !mgr.missing_denoise_models().is_empty())
-                        || (self.settings.ai_inpaint_feature && !mgr.missing_inpaint_models().is_empty());
-                    if has_missing {
-                        self.show_ai_model_setup = true;
-                    }
-                }
-            }
+            // AI ランタイムを初期化
+            self.ensure_ai_runtime();
         }
 
         self.track_window_rect(ctx);
@@ -4157,13 +4120,6 @@ impl eframe::App for App {
         self.poll_ai_upscale(ctx);
         self.poll_ai_inpaint(ctx);
         self.poll_adjustment(ctx);
-
-        // AI モデルダウンロード中ならポーリング
-        if let Some(ref mgr) = self.ai_model_manager {
-            if mgr.has_active_downloads() {
-                mgr.poll_downloads();
-            }
-        }
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
@@ -4232,7 +4188,6 @@ impl eframe::App for App {
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
-        self.show_ai_model_setup_dialog(ctx);
         self.show_about_dialog_window(ctx);
         self.poll_pdf_enumerate();
 

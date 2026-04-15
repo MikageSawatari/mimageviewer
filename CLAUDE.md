@@ -21,7 +21,7 @@ dual-window approach.
 - **AI upscaling**: `ort` crate (ONNX Runtime v2 + DirectML EP)。Real-ESRGAN / waifu2x ONNX モデルでタイル分割 4x アップスケール
 - **AI image classification**: deepghs/anime_classification MobileNetV3 (ONNX) + ヒューリスティクス。イラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: LaMa (ONNX) で見開きページ中央欠落補完
-- **AI model management**: 初回使用時に自動ダウンロード → `%APPDATA%/mimageviewer/models/` に保存
+- **AI model management**: exe に `include_bytes!` で埋め込み → 初回起動時に `%APPDATA%/mimageviewer/models/` に展開
 - **Build tool**: cargo (MSVC toolchain on Windows) + cmake + NASM (TurboJPEG ビルドに必要)
 
 ## Project Structure
@@ -43,7 +43,7 @@ mimageviewer/
 │   ├── ai/                  # AI 機能モジュール
 │   │   ├── mod.rs           # ModelKind, ImageCategory, AiError 型定義
 │   │   ├── runtime.rs       # ONNX Runtime (DirectML EP) セッション管理
-│   │   ├── model_manager.rs # モデルダウンロード・検証・パス管理
+│   │   ├── model_manager.rs # モデル埋め込み・展開・パス管理
 │   │   ├── classify.rs      # 画像タイプ分類 (MobileNetV3 + ヒューリスティクス)
 │   │   ├── upscale.rs       # タイル分割 4x アップスケール推論
 │   │   └── inpaint.rs       # LaMa 見開きページ中央補完
@@ -90,10 +90,13 @@ mimageviewer/
 │   └── bin/
 │       └── bench_thumbs.rs  # サムネイル生成ベンチマーク
 ├── scripts/
-│   └── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
+│   ├── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
+│   └── setup-models.sh      # AI モデルダウンロードスクリプト
 ├── vendor/
-│   └── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
-│       └── bin/pdfium.dll   # include_bytes! で exe に埋め込まれる
+│   ├── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
+│   │   └── bin/pdfium.dll   # include_bytes! で exe に埋め込まれる
+│   └── models/              # AI ONNX モデル（.gitignore、setup-models.sh で取得）
+│       └── *.onnx           # include_bytes! で exe に埋め込まれる
 ├── Cargo.toml
 └── Cargo.lock
 ```
