@@ -136,7 +136,8 @@
       "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\screenshot_final.ps1\")",
       "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\screenshot_fix.ps1\")",
       "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\temp\\\\screenshot_meta.ps1\")",
-      "Bash(./target/release/bench_scroll.exe \"G:/home/photo/2025/2025-05-05\" --delete-cache --no-cache)"
+      "Bash(./target/release/bench_scroll.exe \"G:/home/photo/2025/2025-05-05\" --delete-cache --no-cache)",
+      "Bash(cmd //c \"mklink /J vendor ..\\\\..\\\\..\\\\vendor\")"
     ]
   }
 }

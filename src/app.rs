@@ -2972,7 +2972,7 @@ impl App {
     }
 
     /// items の中の画像アイテム (通常 + ZIP 内) の item_idx 一覧を返す（先読みウィンドウ用）
-    fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
+    pub(crate) fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
         items
             .iter()
             .enumerate()
@@ -3100,14 +3100,34 @@ impl App {
             return;
         }
 
-        // 画像の先読みがまだ完了していない場合はスキップ
-        if !self.fs_pending.is_empty() {
-            return;
-        }
-
         // 同時実行は 1 枚まで（GPU メモリと帯域の制約）
+        // 他の画像ロード（fs_pending）は GPU と競合しないので待たない。
+        // 個別ターゲットのソースが揃っているかは下の fs_cache.get で判定する。
+        //
+        // ただし「現在表示中の画像」を AI 処理するケースでは、
+        // 先読み用の pending (別 idx) を優先キャンセルして枠を空ける。
+        // ユーザーが既に先に進んでいる以上、古い先読みに GPU を使い続ける
+        // 意味はないため、現在画像を最優先する。
+        let is_current_display = self.fullscreen_idx == Some(current_idx);
         if !self.ai_upscale_pending.is_empty() {
-            return;
+            if is_current_display {
+                let to_cancel: Vec<usize> = self.ai_upscale_pending.keys()
+                    .filter(|&&k| k != current_idx)
+                    .copied()
+                    .collect();
+                for k in to_cancel {
+                    if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
+                        cancel.store(true, Ordering::Relaxed);
+                        crate::logger::log(format!(
+                            "[AI] Cancelled prefetch idx={k} to prioritize current idx={current_idx}"
+                        ));
+                    }
+                }
+            }
+            // キャンセル後も残っているなら（現在画像自身が処理中など）スキップ
+            if !self.ai_upscale_pending.is_empty() {
+                return;
+            }
         }
 
         // 元画像がキャッシュにあるか確認
