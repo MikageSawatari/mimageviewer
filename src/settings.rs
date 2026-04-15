@@ -378,6 +378,10 @@ pub struct Settings {
     /// 一括キャッシュ作成: ZIP 内の全画像をキャッシュ対象にする
     #[serde(default)]
     pub batch_cache_zip_contents: bool,
+    /// お気に入り > インデックス作成ダイアログで選択されたお気に入りフォルダ。
+    /// チェック状態をセッションをまたいで保存する (正規化せず元のパスで記録)。
+    #[serde(default)]
+    pub search_index_checks: Vec<PathBuf>,
     /// 一括キャッシュ作成: PDF 内の全ページをキャッシュ対象にする
     #[serde(default)]
     pub batch_cache_pdf_contents: bool,
@@ -644,6 +648,7 @@ impl Default for Settings {
             cache_zip_always: true,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
+            search_index_checks: Vec::new(),
             thumb_prev_pages: default_thumb_prev_pages(),
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),

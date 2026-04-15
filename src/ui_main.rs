@@ -79,6 +79,32 @@ impl App {
                         ui.close();
                     }
 
+                    // 検索 (Ctrl+S)
+                    if ui.button("検索… (Ctrl+S)").clicked() {
+                        self.open_favsearch();
+                        ui.close();
+                    }
+
+                    // インデックス作成
+                    if ui.button("インデックス作成").clicked() {
+                        self.ic.checked = vec![false; self.settings.favorites.len()];
+                        // 設定から復元
+                        for (i, fav) in self.settings.favorites.iter().enumerate() {
+                            if self.settings.search_index_checks.iter().any(|p| p == &fav.path) {
+                                self.ic.checked[i] = true;
+                            }
+                        }
+                        self.ic.running = false;
+                        self.ic.result = None;
+                        self.ic.total.store(0, Ordering::Relaxed);
+                        self.ic.done.store(0, Ordering::Relaxed);
+                        self.ic.entries.store(0, Ordering::Relaxed);
+                        self.ic.finished.store(false, Ordering::Relaxed);
+                        *self.ic.current.lock().unwrap() = String::new();
+                        self.ic.show = true;
+                        ui.close();
+                    }
+
                     // キャッシュ作成
                     if ui.button("キャッシュ作成").clicked() {
                         self.cc.checked =
@@ -543,6 +569,73 @@ impl App {
                 }
             });
         });
+    }
+
+    /// お気に入り検索バー (ツールバー直下の 2 行目) を描画する。
+    /// `favsearch.active` が true のときだけ表示される。
+    pub(crate) fn render_favsearch_bar(&mut self, ctx: &egui::Context) {
+        if !self.favsearch.active {
+            return;
+        }
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+
+        let mut close_requested = false;
+        let mut query_changed = false;
+
+        egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label("🔍 お気に入り検索:");
+                let response = ui.add_sized(
+                    [260.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.favsearch.query)
+                        .hint_text("フォルダ・ZIP・PDF 名の部分一致…"),
+                );
+
+                if self.favsearch.focus_request {
+                    self.favsearch.focus_request = false;
+                    response.request_focus();
+                }
+                self.favsearch.has_focus = response.has_focus();
+
+                // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
+                if response.changed() {
+                    query_changed = true;
+                }
+                // Enter で確定的に再実行 (IME 変換中は enter_pressed が false)
+                if response.lost_focus() && enter_pressed {
+                    query_changed = true;
+                }
+
+                if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
+                    close_requested = true;
+                }
+
+                if self.favsearch.in_results {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{} 件", self.favsearch.result_count))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                }
+            });
+            ui.add_space(2.0);
+        });
+
+        // Esc で閉じる (IME 変換中はスキップ、他のダイアログが開いていないときのみ)
+        if !self.any_dialog_open() && escape_pressed && self.favsearch.has_focus {
+            close_requested = true;
+        }
+
+        if close_requested {
+            self.close_favsearch();
+            return;
+        }
+        if query_changed && self.favsearch.query != self.favsearch.last_executed {
+            self.execute_favsearch();
+        }
     }
 
     // ── セルインタラクション ─────────────────────────────────────────
