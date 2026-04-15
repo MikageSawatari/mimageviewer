@@ -472,7 +472,7 @@ impl App {
 
                         // ── フルスクリーン左下ステータス表示 ──
                         if self.ai_upscale_enabled || self.ai_denoise_model.is_some() || self.ai_inpaint_active || self.ai_inpaint_pending.is_some() {
-                            self.draw_fs_ai_status(ui, full_rect, fs_idx);
+                            self.draw_fs_ai_status(ui, fs_idx);
                         }
 
                         // ── 右上フィードバックトースト ──
@@ -2145,17 +2145,13 @@ impl App {
     }
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。
-    fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, _full_rect: egui::Rect, fs_idx: usize) {
-        // 表示中画像の状態
+    fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
         let is_upscaling = self.ai_upscale_pending.contains_key(&fs_idx);
         let is_upscaled = self.ai_upscale_cache.contains_key(&fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let is_inpainting = self.ai_inpaint_pending.is_some();
-
-        // 何か処理中かどうか
         let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_inpainting;
 
-        // ステータステキスト行
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
 
         if is_loading {
@@ -2164,86 +2160,66 @@ impl App {
 
         if is_upscaling {
             let label = self.ai_model_label(fs_idx, true);
-            lines.push((
-                format!("AI 処理中 ({})", label),
-                egui::Color32::from_rgb(255, 200, 80),
-            ));
+            lines.push((format!("AI 処理中 ({})", label), egui::Color32::from_rgb(255, 200, 80)));
         } else if is_upscaled {
             let label = self.ai_model_label(fs_idx, false);
-            lines.push((
-                format!("AI 処理完了 ({})", label),
-                egui::Color32::from_rgb(80, 220, 80),
-            ));
+            lines.push((format!("AI 処理完了 ({})", label), egui::Color32::from_rgb(80, 220, 80)));
         }
 
         if is_inpainting {
-            lines.push((
-                "見開き補完中 (MI-GAN)".to_string(),
-                egui::Color32::from_rgb(255, 200, 80),
-            ));
+            lines.push(("見開き補完中 (MI-GAN)".to_string(), egui::Color32::from_rgb(255, 200, 80)));
         }
 
         if self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode {
-            lines.push((
-                "消去補完済み".to_string(),
-                egui::Color32::from_rgb(180, 140, 255),
-            ));
+            lines.push(("消去補完済み".to_string(), egui::Color32::from_rgb(180, 140, 255)));
         }
 
-        // 先読み AI 処理の進捗（先読みウィンドウ内の完了数 / 総数）
-        let image_indices = Self::collect_image_indices(&self.items);
-        let prefetch_progress: Option<(usize, usize)> = image_indices.iter()
-            .position(|&i| i == fs_idx)
-            .and_then(|pos| {
-                let n = image_indices.len();
-                let pf_back = self.settings.ai_upscale_prefetch_back;
-                let pf_forward = self.settings.ai_upscale_prefetch_forward;
-                let targets: Vec<usize> = (1..=pf_forward)
-                    .filter_map(|d| pos.checked_add(d).filter(|&p| p < n).map(|p| image_indices[p]))
-                    .chain(
-                        (1..=pf_back)
-                            .filter_map(|d| pos.checked_sub(d).map(|p| image_indices[p]))
-                    )
-                    .collect();
-                let total = targets.len();
-                if total == 0 { return None; }
+        let prefetch_progress: Option<(usize, usize)> = if is_upscaling {
+            None
+        } else {
+            let targets = self.ai_prefetch_targets(fs_idx);
+            let total = targets.len();
+            if total == 0 {
+                None
+            } else {
                 let done = targets.iter()
                     .filter(|&&i| self.ai_upscale_cache.contains_key(&i)
                         || self.ai_upscale_failed.contains(&i))
                     .count();
-                if done < total && !is_upscaling {
-                    Some((done, total))
-                } else {
-                    None
-                }
-            });
+                (done < total).then_some((done, total))
+            }
+        };
 
         if lines.is_empty() && prefetch_progress.is_none() {
             self.ai_status_done_at = None;
             return;
         }
 
-        // 全処理完了後の自動非表示（1秒後にフェードアウト開始、2秒で完全非表示）
+        // 全処理完了後の自動非表示: 完了から 1 秒フル表示、続く 1 秒でフェードアウト。
+        const FADE_START_SECS: f32 = 1.0;
+        const FADE_DURATION_SECS: f32 = 1.0;
         if any_busy {
             self.ai_status_done_at = None;
         } else {
             let done_at = *self.ai_status_done_at.get_or_insert_with(std::time::Instant::now);
-            if done_at.elapsed().as_secs_f32() > 2.0 {
+            if done_at.elapsed().as_secs_f32() > FADE_START_SECS + FADE_DURATION_SECS {
                 return;
             }
         }
 
         let alpha = if let Some(done_at) = self.ai_status_done_at {
             let elapsed = done_at.elapsed().as_secs_f32();
-            if elapsed < 1.0 { 1.0_f32 } else { (1.0 - (elapsed - 1.0)).clamp(0.0, 1.0) }
+            if elapsed < FADE_START_SECS { 1.0 }
+            else { (1.0 - (elapsed - FADE_START_SECS) / FADE_DURATION_SECS).clamp(0.0, 1.0) }
         } else {
             1.0
         };
 
-        // グリッド画面の進捗バーと同デザイン（ui_main.rs の定数と同じ色）
-        const PROGRESS_LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 240, 250);
-        const PROGRESS_BG_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 25, 35, 230);
-        const PROGRESS_UPGRADE_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 170, 240);
+        // Area の available width が 0 のまま描画されるとラベルが 1 文字幅で
+        // 縦に折り返される。min_width で横方向を確保する。
+        const MIN_WIDTH: f32 = 260.0;
+        const BAR_WIDTH: f32 = 180.0;
+        const FONT_SIZE: f32 = 13.0;
 
         let ctx = ui.ctx().clone();
         egui::Area::new("fs_ai_status_overlay".into())
@@ -2251,38 +2227,32 @@ impl App {
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -12.0))
             .show(&ctx, |ui| {
                 ui.set_opacity(alpha);
-                // Area はデフォルトで available size が 0 になり、Label が1文字幅で
-                // 折り返してしまうケースがある。min_width を与えて必ず横方向に
-                // 伸びるようにする（進捗バー幅 + ラベル + パディング相当）。
-                ui.set_min_width(260.0);
+                ui.set_min_width(MIN_WIDTH);
                 egui::Frame::popup(ui.style())
-                    .fill(PROGRESS_BG_COLOR)
+                    .fill(crate::ui_helpers::PROGRESS_BG_COLOR)
                     .show(ui, |ui| {
                         for (text, color) in &lines {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(text)
-                                        .color(*color)
-                                        .size(13.0),
+                                    egui::RichText::new(text).color(*color).size(FONT_SIZE),
                                 )
                                 .wrap_mode(egui::TextWrapMode::Extend),
                             );
                         }
                         if let Some((done, total)) = prefetch_progress {
-                            let progress = done as f32 / total as f32;
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new("先読み AI")
                                             .monospace()
-                                            .color(PROGRESS_LABEL_COLOR),
+                                            .color(crate::ui_helpers::PROGRESS_LABEL_COLOR),
                                     )
                                     .wrap_mode(egui::TextWrapMode::Extend),
                                 );
                                 ui.add(
-                                    egui::ProgressBar::new(progress)
-                                        .desired_width(180.0)
-                                        .fill(PROGRESS_UPGRADE_COLOR)
+                                    egui::ProgressBar::new(done as f32 / total as f32)
+                                        .desired_width(BAR_WIDTH)
+                                        .fill(crate::ui_helpers::PROGRESS_UPGRADE_COLOR)
                                         .text(
                                             egui::RichText::new(format!("{} / {}", done, total))
                                                 .color(egui::Color32::BLACK),
@@ -2293,8 +2263,10 @@ impl App {
                     });
             });
 
-        // 処理中 or フェードアウト中は再描画を要求
-        if any_busy || self.ai_status_done_at.is_some() {
+        // フェードアウト中のみ毎フレーム再描画。処理中の進捗更新は
+        // poll_ai_upscale / poll_prefetch 側が完了時に repaint を要求するので
+        // ここでの busy-loop repaint は不要。
+        if self.ai_status_done_at.is_some() {
             ctx.request_repaint();
         }
     }

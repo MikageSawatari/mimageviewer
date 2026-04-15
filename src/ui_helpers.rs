@@ -18,6 +18,15 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 = eframe::egui::Color32
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 
+/// 進捗バーのラベル色（グリッド/フルスクリーン共通）。
+pub(crate) const PROGRESS_LABEL_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(235, 240, 250);
+/// 進捗バーの背景色（ポップアップ Frame の fill）。
+pub(crate) const PROGRESS_BG_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgba_premultiplied(20, 25, 35, 230);
+/// 通常の先読み進捗バーの塗色（濃い青）。
+pub(crate) const PROGRESS_NORMAL_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(60, 130, 220);
+/// 高画質化 / AI 先読み進捗バーの塗色（薄い青）。
+pub(crate) const PROGRESS_UPGRADE_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(100, 170, 240);
+
 // -----------------------------------------------------------------------
 // ファイルメタデータ
 // -----------------------------------------------------------------------

@@ -12,11 +12,9 @@ use crate::app::App;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::ui_helpers::open_external_player;
 
-// ── 進捗バー定数 ──
-const PROGRESS_LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(235, 240, 250);
-const PROGRESS_BG_COLOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 25, 35, 230);
-const PROGRESS_NORMAL_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 130, 220);
-const PROGRESS_UPGRADE_COLOR: egui::Color32 = egui::Color32::from_rgb(100, 170, 240);
+use crate::ui_helpers::{
+    PROGRESS_BG_COLOR, PROGRESS_LABEL_COLOR, PROGRESS_NORMAL_COLOR, PROGRESS_UPGRADE_COLOR,
+};
 
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────

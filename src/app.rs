@@ -2972,7 +2972,7 @@ impl App {
     }
 
     /// items の中の画像アイテム (通常 + ZIP 内) の item_idx 一覧を返す（先読みウィンドウ用）
-    pub(crate) fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
+    fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
         items
             .iter()
             .enumerate()
@@ -3100,17 +3100,11 @@ impl App {
             return;
         }
 
-        // 同時実行は 1 枚まで（GPU メモリと帯域の制約）
-        // 他の画像ロード（fs_pending）は GPU と競合しないので待たない。
-        // 個別ターゲットのソースが揃っているかは下の fs_cache.get で判定する。
-        //
-        // ただし「現在表示中の画像」を AI 処理するケースでは、
-        // 先読み用の pending (別 idx) を優先キャンセルして枠を空ける。
-        // ユーザーが既に先に進んでいる以上、古い先読みに GPU を使い続ける
-        // 意味はないため、現在画像を最優先する。
-        let is_current_display = self.fullscreen_idx == Some(current_idx);
+        // 同時実行は 1 枚まで（GPU メモリと帯域の制約）。ただし現在表示中の
+        // 画像を処理するケースでは、ユーザーが既に先に進んでいるので古い
+        // 先読み（別 idx）を優先キャンセルして枠を空ける。
         if !self.ai_upscale_pending.is_empty() {
-            if is_current_display {
+            if self.fullscreen_idx == Some(current_idx) {
                 let to_cancel: Vec<usize> = self.ai_upscale_pending.keys()
                     .filter(|&&k| k != current_idx)
                     .copied()
@@ -3124,7 +3118,6 @@ impl App {
                     }
                 }
             }
-            // キャンセル後も残っているなら（現在画像自身が処理中など）スキップ
             if !self.ai_upscale_pending.is_empty() {
                 return;
             }
@@ -3464,29 +3457,28 @@ impl App {
         }
     }
 
-    /// AI アップスケールの先読み（表示中画像の前後）。
-    fn prefetch_ai_upscale(&mut self, current_idx: usize) {
-        if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
-            return;
-        }
-
+    /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
+    pub(crate) fn ai_prefetch_targets(&self, current_idx: usize) -> Vec<usize> {
         let image_indices = Self::collect_image_indices(&self.items);
-        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return Vec::new(); };
         let n = image_indices.len();
-
         let pf_back = self.settings.ai_upscale_prefetch_back;
         let pf_forward = self.settings.ai_upscale_prefetch_forward;
-
-        // 前方優先（+1, +2, … , -1, -2, …）
-        let targets: Vec<usize> = (1..=pf_forward)
+        (1..=pf_forward)
             .filter_map(|d| pos.checked_add(d).filter(|&p| p < n).map(|p| image_indices[p]))
             .chain(
                 (1..=pf_back)
                     .filter_map(|d| pos.checked_sub(d).map(|p| image_indices[p]))
             )
-            .collect();
+            .collect()
+    }
 
-        for idx in targets {
+    /// AI アップスケールの先読み（表示中画像の前後）。
+    fn prefetch_ai_upscale(&mut self, current_idx: usize) {
+        if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
+            return;
+        }
+        for idx in self.ai_prefetch_targets(current_idx) {
             self.maybe_start_ai_upscale(idx);
         }
     }
