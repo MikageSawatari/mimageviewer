@@ -43,6 +43,16 @@ impl GridItem {
     /// - ZipImage: ZIP 内エントリのベース名
     /// - ZipSeparator: ディレクトリ表示名
     /// - PdfPage: "Page N" (1-indexed)
+    /// レーティング (★)・補正プリセット等、ページ単位の永続データを持てるアイテムか。
+    /// 通常画像 / ZIP 内画像 / PDF ページが対象。フォルダ・動画・ZIP/PDF ファイル本体・
+    /// セパレータは対象外。
+    pub fn is_ratable(&self) -> bool {
+        matches!(
+            self,
+            Self::Image(_) | Self::ZipImage { .. } | Self::PdfPage { .. }
+        )
+    }
+
     pub fn name(&self) -> Cow<'_, str> {
         match self {
             GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p)

@@ -809,6 +809,25 @@ impl App {
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
 
+        // F1-F5: レーティング 1〜5 / F6: レーティング解除
+        let rating_key: Option<u8> = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::F1) { Some(1) }
+            else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) { Some(2) }
+            else if i.consume_key(egui::Modifiers::NONE, egui::Key::F3) { Some(3) }
+            else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) { Some(4) }
+            else if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) { Some(5) }
+            else if i.consume_key(egui::Modifiers::NONE, egui::Key::F6) { Some(0) }
+            else { None }
+        });
+        if let Some(stars) = rating_key {
+            self.set_rating(fs_idx, stars);
+            if stars == 0 {
+                self.show_feedback_toast("[★解除]".to_string());
+            } else {
+                self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+            }
+        }
+
         // 見開きモード切替 (1-5 キー)
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));

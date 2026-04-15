@@ -13,6 +13,7 @@ pub mod logger;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod png_metadata;
+pub mod rating_db;
 pub mod settings;
 pub mod stats;
 pub mod thumb_loader;

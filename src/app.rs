@@ -351,6 +351,12 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
+    // ── レーティング DB ──────────────────────────────────────────
+    /// レーティング DB (全体で 1 ファイル)
+    pub(crate) rating_db: Option<crate::rating_db::RatingDb>,
+    /// 現在フォルダのアイテムごとのレーティングキャッシュ (idx → 0..=5)
+    pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
+
     // ── 見開き表示 ──────────────────────────────────────────────
     /// 見開き DB (フォルダごとのモード永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
@@ -638,6 +644,8 @@ impl Default for App {
             search_has_focus: false,
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
             rotation_cache: std::collections::HashMap::new(),
+            rating_db: crate::rating_db::RatingDb::open().ok(),
+            rating_cache: std::collections::HashMap::new(),
             spread_db: crate::spread_db::SpreadDb::open().ok(),
             spread_mode: crate::settings::SpreadMode::default(),
             spread_popup_open: false,
@@ -1148,11 +1156,16 @@ impl App {
         self.requested.clear();
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
-        self.rebuild_visible_indices();
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.checked.clear();
         self.rotation_cache.clear();
+        self.rating_cache.clear();
+        // 1 回のクエリで全アイテムのレーティングを引いてキャッシュに載せる。
+        // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
+        // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
+        self.prewarm_rating_cache();
+        self.rebuild_visible_indices();
         // 見開きモード: DB から読み込み、なければデフォルト値
         self.spread_mode = self.spread_db.as_ref()
             .and_then(|db| db.get(&source_path))
@@ -2073,6 +2086,23 @@ impl App {
                 }
             }
 
+            // F1-F5: レーティング 1〜5 を適用 / F6: レーティング解除
+            // (チェック済みアイテムがあれば一括、なければ選択にのみ)
+            {
+                let rating_key = ctx.input(|i| {
+                    if i.key_pressed(egui::Key::F1) { Some(1u8) }
+                    else if i.key_pressed(egui::Key::F2) { Some(2) }
+                    else if i.key_pressed(egui::Key::F3) { Some(3) }
+                    else if i.key_pressed(egui::Key::F4) { Some(4) }
+                    else if i.key_pressed(egui::Key::F5) { Some(5) }
+                    else if i.key_pressed(egui::Key::F6) { Some(0) }
+                    else { None }
+                });
+                if let Some(stars) = rating_key {
+                    self.apply_rating_to_selection(stars);
+                }
+            }
+
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
@@ -2585,14 +2615,35 @@ impl App {
         }
     }
 
-    /// `search_filter` に基づいて `visible_indices` を再計算する。
+    /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。
+    /// 両者は AND 結合。レーティングフィルタはレーティング対象 (Image/ZipImage/PdfPage) にのみ適用され、
+    /// フォルダ / ZIP / PDF / 動画 / セパレータなどは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
-        self.visible_indices = match &self.search_filter {
-            Some(filter) => (0..self.items.len())
-                .filter(|i| filter.contains(i))
-                .collect(),
-            None => (0..self.items.len()).collect(),
-        };
+        let search_filter = self.search_filter.clone();
+        let rating_filter = self.settings.rating_filter;
+        // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
+        let rating_filter_active = !rating_filter.iter().all(|&b| b);
+
+        let n = self.items.len();
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(ref f) = search_filter {
+                if !f.contains(&i) {
+                    continue;
+                }
+            }
+            if rating_filter_active {
+                let ratable = matches!(self.items.get(i), Some(it) if it.is_ratable());
+                if ratable {
+                    let stars = self.get_rating(i) as usize;
+                    if stars > 5 || !rating_filter[stars] {
+                        continue;
+                    }
+                }
+            }
+            result.push(i);
+        }
+        self.visible_indices = result;
         self.cached_nav_indices = None;
     }
 
@@ -2723,6 +2774,100 @@ impl App {
         self.rotation_cache.insert(idx, rot);
         if let Some(ref db) = self.rotation_db {
             let _ = db.set(&path, rot);
+        }
+    }
+
+    // ── レーティング ───────────────────────────────────────────────
+
+    /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
+    /// フォルダ / 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
+    /// 非対象アイテムはキャッシュを汚さないように insert しない。
+    pub(crate) fn get_rating(&mut self, idx: usize) -> u8 {
+        if let Some(&v) = self.rating_cache.get(&idx) {
+            return v;
+        }
+        let item = match self.items.get(idx) {
+            Some(it) if it.is_ratable() => it,
+            _ => return 0,
+        };
+        let _ = item;
+        let key = match self.page_path_key(idx) {
+            Some(k) => k,
+            None => return 0,
+        };
+        let stars = self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0);
+        self.rating_cache.insert(idx, stars);
+        stars
+    }
+
+    /// 指定 idx のレーティングを設定する (0..=5)。
+    /// レーティング対象外アイテムの場合は何もしない。
+    pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) {
+        let ratable = matches!(self.items.get(idx), Some(it) if it.is_ratable());
+        if !ratable {
+            return;
+        }
+        let stars = stars.min(5);
+        let key = match self.page_path_key(idx) {
+            Some(k) => k,
+            None => return,
+        };
+        self.rating_cache.insert(idx, stars);
+        if let Some(db) = self.rating_db.as_ref() {
+            let _ = db.set(&key, stars);
+        }
+    }
+
+    /// フォルダ読み込み直後に rating_cache を一括プリウォームする。
+    /// 単発の SELECT を N 回投げる代わりに `WHERE path IN (...)` を 1 回で済ませる。
+    /// 結果に含まれないキーは 0 (未評価) としてキャッシュに入れ、以後の DB アクセスを抑制する。
+    pub(crate) fn prewarm_rating_cache(&mut self) {
+        let db = match self.rating_db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+        let mut idx_keys: Vec<(usize, String)> = Vec::with_capacity(self.items.len());
+        for (idx, item) in self.items.iter().enumerate() {
+            if !item.is_ratable() {
+                continue;
+            }
+            if let Some(k) = self.page_path_key(idx) {
+                idx_keys.push((idx, k));
+            }
+        }
+        let keys: Vec<String> = idx_keys.iter().map(|(_, k)| k.clone()).collect();
+        let map = db.get_many(&keys);
+        for (idx, key) in idx_keys {
+            let stars = map.get(&key).copied().unwrap_or(0);
+            self.rating_cache.insert(idx, stars);
+        }
+    }
+
+    /// F1-F6 キー用: チェック済みアイテムがあれば一括で、なければ現在選択にレーティングを適用する。
+    /// visible_indices の外に出る可能性があるため、適用後はフィルタを再評価する。
+    pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
+        let stars = stars.min(5);
+        if !self.checked.is_empty() {
+            let targets: Vec<usize> = self
+                .checked
+                .iter()
+                .copied()
+                .filter(|&idx| matches!(self.items.get(idx), Some(it) if it.is_ratable()))
+                .collect();
+            for &idx in &targets {
+                self.set_rating(idx, stars);
+            }
+            crate::logger::log(format!(
+                "[RATING] Bulk apply {} stars to {} items",
+                stars,
+                targets.len()
+            ));
+            self.checked.clear();
+            self.rebuild_visible_indices();
+        } else if let Some(idx) = self.selected {
+            self.set_rating(idx, stars);
+            crate::logger::log(format!("[RATING] Set {} stars on idx {}", stars, idx));
+            self.rebuild_visible_indices();
         }
     }
 
@@ -4771,6 +4916,7 @@ pub(crate) fn draw_cell(
     is_selected: bool,
     is_checked: bool,
     has_page_override: bool,  // true なら左上に補正済みバッジを表示
+    rating: u8,               // 0 = 非表示, 1-5 = ★バッジ
     item: &GridItem,
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
@@ -4966,6 +5112,31 @@ pub(crate) fn draw_cell(
             "補",
             egui::FontId::proportional(11.0),
             egui::Color32::WHITE,
+        );
+    }
+
+    // レーティングバッジ（1-5 ★、左下に半透明の背景付きで表示）
+    if rating >= 1 && rating <= 5 {
+        let stars_text = "★".repeat(rating as usize);
+        let font = egui::FontId::proportional(12.0);
+        // 背景矩形のサイズを見積もる
+        let text_w = 10.5 * rating as f32 + 6.0;
+        let text_h = 16.0;
+        let bg_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 3.0, rect.max.y - text_h - 3.0),
+            egui::vec2(text_w, text_h),
+        );
+        painter.rect_filled(
+            bg_rect,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+        );
+        painter.text(
+            bg_rect.left_center() + egui::vec2(3.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            stars_text,
+            font,
+            egui::Color32::from_rgb(255, 215, 50),
         );
     }
 }

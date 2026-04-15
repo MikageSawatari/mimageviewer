@@ -371,6 +371,7 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
     ui.checkbox(&mut s.show_toolbar_folder, "フォルダ (アドレスバー)");
     ui.checkbox(&mut s.show_toolbar_parent_button, "上のフォルダへ (⬆ ボタン)");
+    ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
 
     // ── 列 ──
     ui.add_space(6.0);

@@ -15,6 +15,7 @@ pub mod logger;
 pub mod mask_db;
 pub mod monitor;
 pub mod png_metadata;
+pub mod rating_db;
 pub mod rotation_db;
 pub mod settings;
 pub mod spread_db;

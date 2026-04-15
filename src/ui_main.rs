@@ -297,7 +297,9 @@ impl App {
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_parent = self.settings.show_toolbar_parent_button;
-        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs || show_parent;
+        let show_rating = self.settings.show_toolbar_rating;
+        let any_toolbar_section =
+            show_cols || show_aspect || show_sort || show_favs || show_parent || show_rating;
 
         if !any_toolbar_section {
             return None;
@@ -306,6 +308,7 @@ impl App {
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_sort_changed = false;
         let mut toolbar_parent_nav = false;
+        let mut toolbar_rating_changed = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -376,6 +379,42 @@ impl App {
                     }
                     first_section = false;
                 }
+                if show_rating {
+                    if !first_section {
+                        ui.separator();
+                    }
+                    ui.label("★:");
+                    // 「なし」バケット (index 0): ☆ 記号で表現
+                    {
+                        let sel = self.settings.rating_filter[0];
+                        if ui
+                            .selectable_label(sel, "なし")
+                            .on_hover_text("未評価を表示 [F6 で解除]")
+                            .clicked()
+                        {
+                            self.settings.rating_filter[0] = !sel;
+                            toolbar_rating_changed = true;
+                        }
+                    }
+                    // ★1〜★5
+                    for stars in 1u8..=5 {
+                        let idx = stars as usize;
+                        let sel = self.settings.rating_filter[idx];
+                        let label = "★".repeat(stars as usize);
+                        if ui
+                            .selectable_label(sel, label)
+                            .on_hover_text(format!(
+                                "★{} を表示 [F{} で付与]",
+                                stars, stars
+                            ))
+                            .clicked()
+                        {
+                            self.settings.rating_filter[idx] = !sel;
+                            toolbar_rating_changed = true;
+                        }
+                    }
+                    first_section = false;
+                }
                 if show_favs {
                     if !first_section {
                         ui.separator();
@@ -423,6 +462,18 @@ impl App {
             if let Some(path) = self.current_folder.clone() {
                 self.folder_history.remove(&path);
                 self.load_folder(path);
+            }
+        }
+
+        // レーティングフィルタ変更: 設定を保存して visible_indices を再計算
+        if toolbar_rating_changed {
+            self.settings.save();
+            self.rebuild_visible_indices();
+            // 選択が見えなくなった場合は解除
+            if let Some(sel) = self.selected {
+                if !self.visible_indices.contains(&sel) {
+                    self.selected = None;
+                }
             }
         }
 
@@ -761,12 +812,14 @@ impl App {
 
                                 let rot = self.get_rotation(idx);
                                 let has_page_override = self.adjustment_page_params.contains_key(&idx);
+                                let rating = self.get_rating(idx);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
                                     has_page_override,
+                                    rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                     rot,
