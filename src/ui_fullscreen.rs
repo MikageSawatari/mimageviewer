@@ -318,6 +318,18 @@ impl App {
                             }
                         }
 
+                        // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
+                        if self.erase_mode && !is_spread_double {
+                            let zp = if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
+                                Some((self.fs_zoom, self.fs_pan))
+                            } else {
+                                None
+                            };
+                            self.handle_erase_paint(ctx, image_rect, zp);
+                            self.draw_erase_overlay(ui, ctx, image_rect, zp);
+                            ctx.request_repaint();
+                        }
+
                         // ── 動画: 再生ボタン + Enter ──
                         if state.is_video {
                             draw_play_icon(ui.painter(), full_rect.center(), 56.0);
@@ -794,6 +806,7 @@ impl App {
         let key_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z));
         let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
         let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
+        let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
 
         // 画像補正プリセット (1-4 キー)
@@ -896,6 +909,17 @@ impl App {
                 if self.analysis_mosaic_grid {
                     self.analysis_guide_drag = None;
                 }
+            }
+        }
+
+        // E: 消しゴムモード切り替え（見開き・分析・補正中は無効）
+        if key_e && !is_spread_double && !self.analysis_mode && !self.adjustment_mode {
+            if self.erase_mode {
+                // 2回目のE: inpaint実行
+                self.execute_erase_inpaint(ctx, fs_idx);
+            } else {
+                // 1回目のE: マスクモード開始
+                self.enter_erase_mode(fs_idx);
             }
         }
 
@@ -1009,7 +1033,7 @@ impl App {
                         wheel_y, mouse, full_rect.center(),
                     );
                     if changed { self.maybe_rerender_pdf(self.fs_zoom); }
-                } else {
+                } else if !self.erase_mode {
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
                     nav_delta = self.spread_nav_delta(base, false);
                 }
@@ -1022,7 +1046,9 @@ impl App {
             egui::Id::new("fs_click"),
             egui::Sense::click_and_drag(),
         );
-        if self.analysis_mode {
+        if self.erase_mode {
+            // 消しゴムモード: 左クリック/ドラッグはマスク塗りに使うためナビ無効化
+        } else if self.analysis_mode {
             // 分析モード: 左クリックでのナビを無効化（パン用のドラッグは analysis_panel 側）
             // ダブルクリックでズームリセット
             if fs_response.double_clicked() {
@@ -2084,6 +2110,14 @@ impl App {
             lines.push((
                 "見開き補完中 (MI-GAN)".to_string(),
                 egui::Color32::from_rgb(255, 200, 80),
+            ));
+        }
+
+        // 消しゴムマスク適用済み表示
+        if self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode {
+            lines.push((
+                "消去補完済み".to_string(),
+                egui::Color32::from_rgb(180, 140, 255),
             ));
         }
 

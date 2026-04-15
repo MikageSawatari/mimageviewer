@@ -36,6 +36,23 @@ use crate::ui_helpers::{
     open_external_player, truncate_name,
 };
 
+/// 消しゴムモードのツール種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EraseTool {
+    /// 囲みツール: ドラッグで多角形を描き内側を塗りつぶす
+    Lasso,
+    /// 縦線ツール: ドラッグ幅の縦全体矩形を塗りつぶす
+    VertLine,
+    /// 横線ツール: ドラッグ高さの横全体矩形を塗りつぶす
+    HorizLine,
+    /// 筆ツール: 円形ブラシで自由に塗る
+    Brush,
+}
+
+impl Default for EraseTool {
+    fn default() -> Self { EraseTool::Brush }
+}
+
 // -----------------------------------------------------------------------
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
 // -----------------------------------------------------------------------
@@ -486,6 +503,35 @@ pub struct App {
     pub(crate) adjustment_pending: Option<(usize, mpsc::Receiver<egui::ColorImage>)>,
     /// シャープネス適用済みの idx 集合（再適用防止）
     pub(crate) adjustment_sharpened: std::collections::HashSet<usize>,
+
+    // ── 消しゴム (Erase) モード ───────────────────────────────────
+    /// E キーで切り替える消しゴムモード
+    pub(crate) erase_mode: bool,
+    /// マスクビットマップ（画像と同サイズ、true = マスク済み）
+    pub(crate) erase_mask: Option<Vec<bool>>,
+    /// マスク対象の画像サイズ [width, height]
+    pub(crate) erase_mask_size: [usize; 2],
+    /// マスクオーバーレイ用テクスチャ
+    pub(crate) erase_mask_texture: Option<egui::TextureHandle>,
+    /// 消しゴムモードでドラッグ中か（前フレームのポインタ位置を保持）
+    pub(crate) erase_last_paint_pos: Option<egui::Pos2>,
+    /// 現在のツール種別
+    pub(crate) erase_tool: EraseTool,
+    /// 筆ツールの半径 (画像ピクセル)
+    pub(crate) erase_brush_radius: f32,
+    /// 囲みツールのポイント列 (画像ピクセル座標)
+    pub(crate) erase_lasso_points: Vec<(f32, f32)>,
+    /// 縦線/横線ツールのドラッグ開始点 (画像ピクセル座標)
+    pub(crate) erase_line_start: Option<(f32, f32)>,
+    /// 縦線/横線ツールのドラッグ現在点 (画像ピクセル座標)
+    pub(crate) erase_line_end: Option<(f32, f32)>,
+    /// 描画モード (true) / 消去モード (false)
+    pub(crate) erase_paint_mode: bool,
+    /// inpaint 適用前の元画像キャッシュ: item_idx → ピクセルデータ
+    /// inpaint 実行後も元画像を保持し、マスク変更時に常に元画像から再適用する。
+    pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    /// マスク永続化 DB
+    pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
 }
 
 impl Default for App {
@@ -659,6 +705,21 @@ impl Default for App {
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
             adjustment_pending: None,
             adjustment_sharpened: std::collections::HashSet::new(),
+
+            // 消しゴムモード
+            erase_mode: false,
+            erase_mask: None,
+            erase_mask_size: [0, 0],
+            erase_mask_texture: None,
+            erase_last_paint_pos: None,
+            erase_tool: EraseTool::default(),
+            erase_brush_radius: 0.0, // enter_erase_mode で設定
+            erase_lasso_points: Vec::new(),
+            erase_line_start: None,
+            erase_line_end: None,
+            erase_paint_mode: true,
+            erase_base_cache: std::collections::HashMap::new(),
+            mask_db: crate::mask_db::MaskDb::open().ok(),
         }
     }
 }
@@ -2257,6 +2318,7 @@ impl App {
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
+        self.reset_erase_mode();
 
         // ページに割り当て済みのプリセットがあれば復元
         if let Some(&pi) = self.adjustment_page_preset.get(&idx) {
@@ -2883,6 +2945,8 @@ impl App {
         self.fs_viewport_shown = false;
         self.fs_secondary_press_start = None;
         self.fs_context_menu_idx = None;
+        self.reset_erase_mode();
+        self.erase_base_cache.clear();
         for (cancel, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -3614,6 +3678,8 @@ impl App {
                 FsLoadResult::Failed => FsCacheEntry::Failed,
             };
             self.fs_cache.insert(key, entry);
+            // 保存済みマスクがあれば自動で inpaint 適用
+            self.auto_apply_saved_mask(ctx, key);
         }
         if repaint {
             ctx.request_repaint();
