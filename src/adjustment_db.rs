@@ -1,11 +1,13 @@
-//! 画像補正プリセットの永続管理。
+//! 画像補正のページ個別設定を永続管理する。
 //!
-//! `%APPDATA%/mimageviewer/adjustment.db` に保存する。
-//! フォルダ/ZIP/PDF 単位の 4 プリセット + ページごとのプリセット割り当て。
+//! `%APPDATA%/mimageviewer/adjustment.db` に `page_params` テーブルとして保存する。
+//! 旧 (v0.6.0 開発版) の `presets` テーブル / preset_idx 方式は廃止。
+//! 表示時の有効パラメータは `page_params.get(page) ?? settings.global_preset`。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::adjustment::AdjustPresets;
+use crate::adjustment::AdjustParams;
 
 /// 補正設定 DB ハンドル。
 pub struct AdjustmentDb {
@@ -13,22 +15,21 @@ pub struct AdjustmentDb {
 }
 
 impl AdjustmentDb {
-    /// DB を開く (なければ作成)。
+    /// DB を開く (なければ作成)。旧スキーマが残っていれば破棄して作り直す。
     pub fn open() -> Result<Self, rusqlite::Error> {
         let path = Self::db_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = rusqlite::Connection::open(&path)?;
+        // 未リリース機能なのでマイグレーションは行わず旧テーブルを破棄する。
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS presets (
-                container_path TEXT PRIMARY KEY,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS page_presets (
+            "DROP TABLE IF EXISTS presets;
+             DROP TABLE IF EXISTS page_presets;
+             CREATE TABLE IF NOT EXISTS page_params (
                 page_path TEXT PRIMARY KEY,
-                preset_idx INTEGER NOT NULL DEFAULT 0
-            );",
+                params_json TEXT NOT NULL
+             );",
         )?;
         Ok(Self { conn })
     }
@@ -37,76 +38,73 @@ impl AdjustmentDb {
         crate::data_dir::get().join("adjustment.db")
     }
 
-    /// フォルダ/ZIP/PDF のプリセットを取得する。
-    pub fn get_presets(&self, container: &Path) -> Option<AdjustPresets> {
-        let key = normalize_path(container);
+    /// ページのパラメータを取得する。未登録なら None。
+    pub fn get_page_params(&self, page_key: &str) -> Option<AdjustParams> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT data FROM presets WHERE container_path = ?1")
+            .prepare_cached("SELECT params_json FROM page_params WHERE page_path = ?1")
             .ok()?;
-        stmt.query_row([&key], |row| {
-            let json: String = row.get(0)?;
-            serde_json::from_str(&json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-            })
-        })
-        .ok()
+        let json: String = stmt.query_row([page_key], |row| row.get(0)).ok()?;
+        serde_json::from_str(&json).ok()
     }
 
-    /// フォルダ/ZIP/PDF のプリセットを保存する。全デフォルトなら削除。
-    pub fn set_presets(&self, container: &Path, presets: &AdjustPresets) -> Result<(), rusqlite::Error> {
-        let key = normalize_path(container);
-        if presets.is_all_default() {
-            self.conn
-                .execute("DELETE FROM presets WHERE container_path = ?1", [&key])?;
+    /// ページのパラメータを書き込む。`params` が identity かつ AI 未使用なら削除。
+    pub fn set_page_params(&self, page_key: &str, params: &AdjustParams) -> Result<(), rusqlite::Error> {
+        if params.is_removable() {
+            self.remove_page_params(page_key)?;
+            return Ok(());
+        }
+        let json = serde_json::to_string(params).unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
+             ON CONFLICT(page_path) DO UPDATE SET params_json = ?2",
+            rusqlite::params![page_key, json],
+        )?;
+        Ok(())
+    }
+
+    /// ページのパラメータ個別設定を削除する。
+    pub fn remove_page_params(&self, page_key: &str) -> Result<(), rusqlite::Error> {
+        self.conn
+            .execute("DELETE FROM page_params WHERE page_path = ?1", [page_key])?;
+        Ok(())
+    }
+
+    /// 複数ページに同じパラメータを一括書込する (「全画像に適用」ボタン用)。
+    /// `params` が identity なら、対象キー群を一括削除する。
+    pub fn set_page_params_bulk(
+        &mut self,
+        page_keys: &[String],
+        params: &AdjustParams,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.transaction()?;
+        if params.is_removable() {
+            let mut stmt = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
+            for key in page_keys {
+                stmt.execute([key])?;
+            }
+            drop(stmt);
         } else {
-            let json = serde_json::to_string(presets).unwrap_or_default();
-            self.conn.execute(
-                "INSERT INTO presets (container_path, data) VALUES (?1, ?2)
-                 ON CONFLICT(container_path) DO UPDATE SET data = ?2",
-                rusqlite::params![key, json],
+            let json = serde_json::to_string(params).unwrap_or_default();
+            let mut stmt = tx.prepare(
+                "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
+                 ON CONFLICT(page_path) DO UPDATE SET params_json = ?2",
             )?;
+            for key in page_keys {
+                stmt.execute(rusqlite::params![key, json])?;
+            }
+            drop(stmt);
         }
+        tx.commit()?;
         Ok(())
     }
 
-    /// ページのプリセット番号を取得する。
-    pub fn get_page_preset(&self, page_key: &str) -> Option<u8> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT preset_idx FROM page_presets WHERE page_path = ?1")
-            .ok()?;
-        stmt.query_row([page_key], |row| {
-            let idx: i32 = row.get(0)?;
-            Ok(idx as u8)
-        })
-        .ok()
-    }
-
-    /// ページのプリセット番号を設定する。未割り当て (None) なら削除。
-    pub fn set_page_preset(&self, page_key: &str, preset_idx: Option<u8>) -> Result<(), rusqlite::Error> {
-        match preset_idx {
-            None => {
-                self.conn
-                    .execute("DELETE FROM page_presets WHERE page_path = ?1", [page_key])?;
-            }
-            Some(idx) => {
-                self.conn.execute(
-                    "INSERT INTO page_presets (page_path, preset_idx) VALUES (?1, ?2)
-                     ON CONFLICT(page_path) DO UPDATE SET preset_idx = ?2",
-                    rusqlite::params![page_key, idx as i32],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// コンテナ配下の全ページプリセットを一括読み込みする。
+    /// コンテナ配下の全ページ個別パラメータを一括読込する。
     /// `prefix` はコンテナパスの正規化文字列。
-    pub fn load_page_presets(&self, prefix: &str) -> std::collections::HashMap<String, u8> {
-        let mut map = std::collections::HashMap::new();
+    pub fn load_page_params(&self, prefix: &str) -> HashMap<String, AdjustParams> {
+        let mut map = HashMap::new();
         let Ok(mut stmt) = self.conn.prepare_cached(
-            "SELECT page_path, preset_idx FROM page_presets WHERE page_path LIKE ?1 ESCAPE '\\'"
+            "SELECT page_path, params_json FROM page_params WHERE page_path LIKE ?1 ESCAPE '\\'"
         ) else {
             return map;
         };
@@ -119,13 +117,15 @@ impl AdjustmentDb {
         let pattern = format!("{escaped}%");
         let Ok(rows) = stmt.query_map([&pattern], |row| {
             let path: String = row.get(0)?;
-            let idx: i32 = row.get(1)?;
-            Ok((path, idx as u8))
+            let json: String = row.get(1)?;
+            Ok((path, json))
         }) else {
             return map;
         };
         for row in rows.flatten() {
-            map.insert(row.0, row.1);
+            if let Ok(params) = serde_json::from_str::<AdjustParams>(&row.1) {
+                map.insert(row.0, params);
+            }
         }
         map
     }
@@ -139,43 +139,23 @@ pub fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adjustment::AdjustParams;
 
     #[test]
-    fn db_presets_roundtrip() {
-        let db = AdjustmentDb::open().unwrap();
-        let folder = Path::new("C:/test/manga_folder");
-
-        // 初期状態: 未登録
-        assert!(db.get_presets(folder).is_none());
-
-        // 設定
-        let mut presets = AdjustPresets::default();
-        presets.presets[0].brightness = 25.0;
-        presets.names[0] = "テスト".to_string();
-        db.set_presets(folder, &presets).unwrap();
-
-        let loaded = db.get_presets(folder).unwrap();
-        assert_eq!(loaded.presets[0].brightness, 25.0);
-        assert_eq!(loaded.names[0], "テスト");
-
-        // デフォルトに戻すと削除
-        let default_presets = AdjustPresets::default();
-        db.set_presets(folder, &default_presets).unwrap();
-        assert!(db.get_presets(folder).is_none());
-    }
-
-    #[test]
-    fn db_page_presets() {
+    fn db_page_params_roundtrip() {
         let db = AdjustmentDb::open().unwrap();
         let page = "c:/test/folder/page001.jpg";
+        // クリーンな状態を保証
+        db.remove_page_params(page).unwrap();
+        assert!(db.get_page_params(page).is_none());
 
-        assert!(db.get_page_preset(page).is_none());
+        let mut params = AdjustParams::default();
+        params.brightness = 30.0;
+        db.set_page_params(page, &params).unwrap();
+        let loaded = db.get_page_params(page).unwrap();
+        assert_eq!(loaded.brightness, 30.0);
 
-        db.set_page_preset(page, Some(2)).unwrap();
-        assert_eq!(db.get_page_preset(page), Some(2));
-
-        db.set_page_preset(page, None).unwrap();
-        assert!(db.get_page_preset(page).is_none());
+        // identity を書くと削除される
+        db.set_page_params(page, &AdjustParams::default()).unwrap();
+        assert!(db.get_page_params(page).is_none());
     }
 }

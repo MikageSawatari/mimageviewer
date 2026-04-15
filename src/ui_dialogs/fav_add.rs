@@ -24,6 +24,7 @@ impl App {
         let mut apply = false;
         let mut cancel = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(80.0, 60.0);
+        let enter_pressed = self.dialog_enter_pressed(ctx);
 
         egui::Window::new("お気に入りに追加")
             .open(&mut open)
@@ -55,8 +56,8 @@ impl App {
                     {
                         resp.request_focus();
                     }
-                    // Enter で決定
-                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // Enter で決定 (IME 変換中は dialog_enter_pressed が false を返す)
+                    if resp.lost_focus() && enter_pressed {
                         apply = true;
                     }
                 } else {

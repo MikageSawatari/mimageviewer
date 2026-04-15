@@ -438,6 +438,7 @@ impl App {
             return None;
         }
 
+        let enter_pressed = self.dialog_enter_pressed(ctx);
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<PathBuf> {
                 ui.add_space(3.0);
@@ -449,9 +450,7 @@ impl App {
                             .desired_width(f32::INFINITY),
                     );
                     self.address_has_focus = resp.has_focus();
-                    if resp.lost_focus()
-                        && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
+                    if resp.lost_focus() && enter_pressed {
                         let p = PathBuf::from(&self.address);
                         if let Some(resolved) =
                             crate::folder_tree::resolve_openable_path(&p)
@@ -474,6 +473,8 @@ impl App {
             return;
         }
 
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("検索:");
@@ -492,11 +493,8 @@ impl App {
                 // フォーカス状態を追跡
                 self.search_has_focus = response.has_focus();
 
-                // Enter で検索実行
-                // TextEdit は Enter でフォーカスを失うので lost_focus() で検知
-                if response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                {
+                // Enter で検索実行 (IME 変換中は dialog_enter_pressed が false)
+                if response.lost_focus() && enter_pressed {
                     self.execute_search();
                     // フォーカスを外してカーソルキーでグリッド操作できるようにする
                     response.surrender_focus();
@@ -512,10 +510,8 @@ impl App {
                     self.rebuild_visible_indices();
                 }
 
-                // Esc で検索解除（ダイアログが開いていない場合のみ）
-                if !self.any_dialog_open()
-                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
+                // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
+                if !self.any_dialog_open() && escape_pressed {
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;
@@ -776,13 +772,13 @@ impl App {
                                 }
 
                                 let rot = self.get_rotation(idx);
-                                let preset_badge = self.adjustment_page_preset.get(&idx).copied();
+                                let has_page_override = self.adjustment_page_params.contains_key(&idx);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
-                                    preset_badge,
+                                    has_page_override,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                     rot,

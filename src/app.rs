@@ -483,24 +483,26 @@ pub struct App {
     // ── 画像補正 ──────────────────────────────────────────────────
     /// 補正パネル表示フラグ (左パネルホバーで表示)
     pub(crate) adjustment_mode: bool,
-    /// 現フォルダ/ZIP/PDF の個別 4 プリセット (1-4)
-    pub(crate) adjustment_presets: crate::adjustment::AdjustPresets,
-    /// 現在アクティブなプリセット番号。0 = グローバル, 1-4 = 個別。None = 補正なし。
-    pub(crate) adjustment_active_preset: Option<u8>,
-    /// ページごとのプリセット割り当て: item_idx → preset_idx (0=グローバル, 1-4=個別)
-    pub(crate) adjustment_page_preset: std::collections::HashMap<usize, u8>,
+    /// ページ個別の補正パラメータ: item_idx → AdjustParams
+    /// ここに登録されていないページはグローバル (settings.global_preset) が適用される。
+    pub(crate) adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// スライダードラッグ中フラグ（パネル内ウィジェットのドラッグ検出）
     pub(crate) adjustment_dragging: bool,
     /// 補正 DB ハンドル
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
-    /// バックグラウンドシャープネス処理中: (item_idx, receiver)
-    pub(crate) adjustment_pending: Option<(usize, mpsc::Receiver<egui::ColorImage>)>,
     /// シャープネス適用済みの idx 集合（再適用防止）
     pub(crate) adjustment_sharpened: std::collections::HashSet<usize>,
-    /// プリセット名を編集中 (フルスクリーンキー入力をスキップするため)
-    pub(crate) editing_preset_name: bool,
+    /// スロット保存ダイアログ: (slot_idx, 入力中の名前)
+    pub(crate) slot_save_dialog: Option<(usize, String)>,
+    /// IME 変換中フラグ。Ime イベントで更新される持続状態。
+    /// Enabled/Preedit(非空) で true、Preedit("")/Commit/Disabled で false。
+    pub(crate) ime_composing: bool,
+    /// 直近の Ime イベント受信時刻 (時間ベースのガードに使う)。
+    /// Windows IME のキャンセル Escape では Ime::Disabled と Key::Escape が別フレームに
+    /// 分かれて届くことがあるため、Ime イベント後 300ms は IME 入力中として扱う。
+    pub(crate) ime_last_event_at: Option<std::time::Instant>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
 
@@ -695,15 +697,14 @@ impl Default for App {
 
             // 画像補正
             adjustment_mode: false,
-            adjustment_presets: crate::adjustment::AdjustPresets::default(),
-            adjustment_active_preset: None,
-            adjustment_page_preset: std::collections::HashMap::new(),
+            adjustment_page_params: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_dragging: false,
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
-            adjustment_pending: None,
             adjustment_sharpened: std::collections::HashSet::new(),
-            editing_preset_name: false,
+            slot_save_dialog: None,
+            ime_composing: false,
+            ime_last_event_at: None,
             fs_feedback_toast: None,
 
             // 消しゴムモード
@@ -725,6 +726,62 @@ impl Default for App {
 }
 
 impl App {
+    /// IME 変換状態を更新する (毎フレーム先頭で呼ぶ)。
+    /// `ime_input_active_this_frame` に「今フレームを IME 入力として扱うか」を設定する。
+    ///
+    /// 判定は以下の 3 条件の OR:
+    /// 1. 前フレーム末で composition 状態だった (`was_composing`)
+    /// 2. 今フレームに Ime イベントが来ている (`had_ime_event`)
+    /// 3. 直近 300ms 以内に Ime イベントがあった (時間ベースの余韻)
+    ///
+    /// 3 が必要な理由: Windows の一部環境では、IME キャンセル時 (Escape) に
+    /// Ime イベントが先行フレームで発行されて `ime_composing = false` になり、
+    /// Key::Escape 自体は 1〜数フレーム遅れで届くことがある。
+    /// その隙間を埋めるためのガード。
+    /// 現在のビューポートの Ime イベントを処理して `ime_composing` / `ime_last_event_at` を更新する。
+    ///
+    /// **重要**: egui の各ビューポートは独立したイベントキューを持つ。
+    /// `show_viewport_immediate` で別ビューポートを出している場合は、その closure の
+    /// 先頭でも呼ばないと、そのビューポート内の IME を取り逃がす。
+    pub(crate) fn update_ime_state(&mut self, ctx: &egui::Context) {
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::Ime(ime) = event {
+                    self.ime_last_event_at = Some(std::time::Instant::now());
+                    match ime {
+                        egui::ImeEvent::Enabled => self.ime_composing = true,
+                        egui::ImeEvent::Preedit(s) => self.ime_composing = !s.is_empty(),
+                        egui::ImeEvent::Commit(_) => self.ime_composing = false,
+                        egui::ImeEvent::Disabled => self.ime_composing = false,
+                    }
+                }
+            }
+        });
+    }
+
+    /// IME 変換中か (または直近 300ms 以内に Ime イベントがあったか)。
+    /// true の間は Enter / Escape をショートカット・ダイアログ確定/キャンセルとして拾ってはいけない。
+    /// 300ms グレースは Windows IME で `Ime::Disabled` と `Key::Escape` が別フレームに
+    /// 届くケースを吸収するため。
+    pub(crate) fn ime_input_active(&self) -> bool {
+        if self.ime_composing {
+            return true;
+        }
+        self.ime_last_event_at
+            .map(|t| t.elapsed() < std::time::Duration::from_millis(300))
+            .unwrap_or(false)
+    }
+
+    /// ダイアログ確定用の Enter が押されたか。IME 変換中は常に false を返す。
+    pub(crate) fn dialog_enter_pressed(&self, ctx: &egui::Context) -> bool {
+        !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+    }
+
+    /// ダイアログキャンセル用の Escape が押されたか。IME 変換中は常に false を返す。
+    pub(crate) fn dialog_escape_pressed(&self, ctx: &egui::Context) -> bool {
+        !self.ime_input_active() && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    }
+
     /// いずれかのモーダルダイアログが開いているか。
     /// true の場合、キーボードショートカットやスクロールを無効化する。
     pub(crate) fn any_dialog_open(&self) -> bool {
@@ -737,6 +794,7 @@ impl App {
             || self.show_delete_confirm
             || self.show_rotation_reset_confirm
             || self.show_pdf_password_dialog
+            || self.slot_save_dialog.is_some()
             || self.context_menu_idx.is_some()
     }
 
@@ -1103,24 +1161,19 @@ impl App {
         self.search_filter = None;
         self.search_query.clear();
 
-        // 画像補正: DB からプリセット読み込み + ページプリセット復元
+        // 画像補正: ページ個別パラメータを DB から復元
         self.adjustment_cache.clear();
-        self.adjustment_page_preset.clear();
+        self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
-        self.adjustment_active_preset = None;
         self.adjustment_mode = false;
-        self.adjustment_presets = self.adjustment_db.as_ref()
-            .and_then(|db| db.get_presets(&source_path))
-            .unwrap_or_default();
-        // ページごとのプリセット割り当てを DB から復元 → item_idx にマッピング
         if let Some(db) = &self.adjustment_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
-            let page_map = db.load_page_presets(&prefix);
+            let page_map = db.load_page_params(&prefix);
             if !page_map.is_empty() {
                 for idx in 0..self.items.len() {
                     if let Some(key) = self.page_path_key(idx) {
-                        if let Some(&preset_idx) = page_map.get(&key) {
-                            self.adjustment_page_preset.insert(idx, preset_idx);
+                        if let Some(params) = page_map.get(&key) {
+                            self.adjustment_page_params.insert(idx, params.clone());
                         }
                     }
                 }
@@ -2020,47 +2073,6 @@ impl App {
                 }
             }
 
-            // 0-4 キー: チェック済み画像に一括プリセット適用
-            {
-                let preset_key = ctx.input(|i| {
-                    if i.key_pressed(egui::Key::Num0) { Some(0u8) }
-                    else if i.key_pressed(egui::Key::Num1) { Some(1) }
-                    else if i.key_pressed(egui::Key::Num2) { Some(2) }
-                    else if i.key_pressed(egui::Key::Num3) { Some(3) }
-                    else if i.key_pressed(egui::Key::Num4) { Some(4) }
-                    else { None }
-                });
-                if let Some(pi) = preset_key {
-                    if !self.checked.is_empty() {
-                        let checked_list: Vec<usize> = self.checked.iter().copied().collect();
-                        for &idx in &checked_list {
-                            if pi == 0 {
-                                self.remove_page_preset(idx);
-                            } else {
-                                self.assign_page_preset(idx, pi);
-                            }
-                        }
-                        crate::logger::log(format!(
-                            "[PRESET] Bulk apply preset {} to {} items", pi, checked_list.len()
-                        ));
-                        self.checked.clear();
-                    } else if let Some(idx) = self.selected {
-                        match self.items.get(idx) {
-                            Some(GridItem::Image(_))
-                            | Some(GridItem::ZipImage { .. })
-                            | Some(GridItem::PdfPage { .. }) => {
-                                if pi == 0 {
-                                    self.remove_page_preset(idx);
-                                } else {
-                                    self.assign_page_preset(idx, pi);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
@@ -2358,13 +2370,9 @@ impl App {
         self.fullscreen_idx = Some(idx);
         self.reset_erase_mode();
 
-        // ページに割り当て済みのプリセットがあれば復元、なければグローバル(0)
-        let new_pi = self.adjustment_page_preset.get(&idx).copied().unwrap_or(0);
-        self.adjustment_active_preset = Some(new_pi);
-        // グローバル(0)以外なら右上にプリセット名を短時間表示
-        if new_pi != 0 {
-            let label = self.preset_display_label(new_pi);
-            self.show_feedback_toast(format!("[{}]", label));
+        // ページに個別補正があればトースト表示
+        if self.adjustment_page_params.contains_key(&idx) {
+            self.show_feedback_toast("ページ補正適用".to_string());
         }
         // ページ切替時に補正キャッシュをクリア（前ページの補正結果を残さない）
         // ただし ai_upscale_cache は消さない（再処理が重いため）
@@ -3501,35 +3509,28 @@ impl App {
         Some(key)
     }
 
-    /// 現在のプリセット設定に基づいて AI アップスケールの有効/モデルを更新する。
+    /// 現在の有効パラメータに基づいて AI アップスケール/デノイズの状態を更新する。
     pub(crate) fn sync_upscale_from_preset(&mut self, idx: usize) {
-        let preset_idx = self.adjustment_page_preset.get(&idx).copied()
-            .or(self.adjustment_active_preset);
-        if let Some(pi) = preset_idx {
-            let params = self.get_preset_params(pi);
-            // アップスケール: feature フラグでゲート
-            if self.settings.ai_upscale_feature {
-                match params.upscale_model_kind() {
-                    None => {
-                        self.ai_upscale_enabled = false;
-                        self.ai_upscale_model_override = None;
-                    }
-                    Some(None) => {
-                        self.ai_upscale_enabled = true;
-                        self.ai_upscale_model_override = None;
-                    }
-                    Some(Some(kind)) => {
-                        self.ai_upscale_enabled = true;
-                        self.ai_upscale_model_override = Some(kind);
-                    }
+        // effective_params は self を不変借用するので、派生値だけコピーして解放してから代入する
+        let upscale_kind = self.effective_params(idx).upscale_model_kind();
+        let denoise_kind = self.effective_params(idx).denoise_model_kind();
+        if self.settings.ai_upscale_feature {
+            match upscale_kind {
+                None => {
+                    self.ai_upscale_enabled = false;
+                    self.ai_upscale_model_override = None;
+                }
+                Some(None) => {
+                    self.ai_upscale_enabled = true;
+                    self.ai_upscale_model_override = None;
+                }
+                Some(Some(kind)) => {
+                    self.ai_upscale_enabled = true;
+                    self.ai_upscale_model_override = Some(kind);
                 }
             }
-            self.ai_denoise_model = params.denoise_model_kind();
-        } else {
-            self.ai_upscale_enabled = false;
-            self.ai_upscale_model_override = None;
-            self.ai_denoise_model = None;
         }
+        self.ai_denoise_model = denoise_kind;
     }
 
     /// 右上フィードバック表示を設定する。
@@ -3537,109 +3538,118 @@ impl App {
         self.fs_feedback_toast = Some((text, std::time::Instant::now()));
     }
 
-    /// プリセット番号の表示ラベルを返す。
-    pub(crate) fn preset_display_label(&self, preset_idx: u8) -> String {
-        if preset_idx == 0 {
-            "0:グローバル".to_string()
-        } else {
-            let idx = (preset_idx - 1).min(3) as usize;
-            let name = &self.adjustment_presets.names[idx];
-            format!("{}:{}", preset_idx, name)
-        }
+    /// 指定ページの有効パラメータへの参照を返す (ページ個別 > グローバルのフォールバック)。
+    /// 所有権が必要な呼び出し側は `.clone()` する。毎フレーム呼ばれるので無用なクローンを避ける。
+    pub(crate) fn effective_params(&self, idx: usize) -> &crate::adjustment::AdjustParams {
+        self.adjustment_page_params
+            .get(&idx)
+            .unwrap_or(&self.settings.global_preset)
     }
 
-    /// 現在のプリセットパラメータを DB / Settings に保存する。
-    pub(crate) fn save_current_preset(&mut self, preset_idx: u8) {
-        if preset_idx == 0 {
-            self.settings.save();
+    /// 指定ページに個別パラメータを書込む (DB にも保存)。
+    /// 識別パラメータなら個別設定を解除する。
+    pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
+        let is_identity = params.is_removable();
+        if is_identity {
+            self.adjustment_page_params.remove(&idx);
         } else {
-            if let (Some(db), Some(folder)) = (&self.adjustment_db, &self.current_folder) {
-                let _ = db.set_presets(folder, &self.adjustment_presets);
-            }
+            self.adjustment_page_params.insert(idx, params.clone());
         }
-    }
-
-    /// ページにプリセットを割り当てて DB に保存する。
-    pub(crate) fn assign_page_preset(&mut self, idx: usize, preset_idx: u8) {
-        self.adjustment_page_preset.insert(idx, preset_idx);
         if let Some(key) = self.page_path_key(idx) {
             if let Some(db) = &self.adjustment_db {
-                let _ = db.set_page_preset(&key, Some(preset_idx));
+                let _ = db.set_page_params(&key, &params);
             }
         }
     }
 
-    /// ページのプリセット割り当てを解除して DB から削除する。
-    pub(crate) fn remove_page_preset(&mut self, idx: usize) {
-        self.adjustment_page_preset.remove(&idx);
+    /// 指定ページの個別設定を解除する (DB からも削除)。
+    pub(crate) fn clear_page_params(&mut self, idx: usize) {
+        self.adjustment_page_params.remove(&idx);
         if let Some(key) = self.page_path_key(idx) {
             if let Some(db) = &self.adjustment_db {
-                let _ = db.set_page_preset(&key, None);
+                let _ = db.remove_page_params(&key);
             }
         }
     }
 
-    /// 保存スロットから現在のアクティブプリセットにロードする。
-    pub(crate) fn load_slot_to_active_preset(&mut self, slot_idx: usize) {
-        let Some(pi) = self.adjustment_active_preset else { return; };
-        let Some(slot) = &self.settings.preset_slots.slots[slot_idx] else { return; };
-        let old_params = self.get_preset_params(pi);
-        let slot_params = slot.params.clone();
-        let slot_name = slot.name.clone();
-        let ai_changed = !old_params.ai_settings_eq(&slot_params);
-        *self.get_preset_params_mut(pi) = slot_params;
-        if let Some(fs_idx) = self.fullscreen_idx {
-            if ai_changed {
-                self.clear_all_adjustment_and_ai_caches(fs_idx);
-            } else {
-                self.clear_adjustment_caches(fs_idx);
+    /// 画像系グリッドアイテム (`Image` / `ZipImage` / `PdfPage`) の (idx, DB キー) 一覧を集める。
+    fn collect_image_page_keys(&self) -> (Vec<usize>, Vec<String>) {
+        let mut indices: Vec<usize> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for idx in 0..self.items.len() {
+            match self.items.get(idx) {
+                Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. }) => {
+                    if let Some(key) = self.page_path_key(idx) {
+                        indices.push(idx);
+                        keys.push(key);
+                    }
+                }
+                _ => {}
             }
         }
-        self.save_current_preset(pi);
+        (indices, keys)
+    }
+
+    /// 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに同じパラメータを適用する。
+    /// `params` が identity なら個別設定は削除され、全画像が標準設定に戻る。
+    /// AI キャッシュは保持 (色系のみ触る使い方が多い想定、AI 変更時はユーザが U/N で別途調整)。
+    pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
+        let (indices, keys) = self.collect_image_page_keys();
+        if params.is_removable() {
+            for idx in &indices {
+                self.adjustment_page_params.remove(idx);
+            }
+        } else {
+            for idx in &indices {
+                self.adjustment_page_params.insert(*idx, params.clone());
+            }
+        }
+        if let Some(db) = self.adjustment_db.as_mut() {
+            let _ = db.set_page_params_bulk(&keys, &params);
+        }
+        self.adjustment_cache.clear();
+    }
+
+    /// 現在の一覧の全画像ページから個別設定を削除する (= 全画像を標準設定に戻す)。
+    pub(crate) fn clear_all_page_params(&mut self) {
+        self.apply_params_to_all_pages(crate::adjustment::AdjustParams::default());
+    }
+
+    /// 指定パラメータを settings.global_preset にコピーして保存する。
+    pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
+        self.settings.global_preset = params;
+        self.settings.save();
+        // グローバルが変わると、ページ個別を持たないページの表示が変わる
+        self.adjustment_cache.clear();
+    }
+
+    /// 保存スロット slot_idx のパラメータを現在のフルスクリーンページに適用する。
+    /// キャッシュ無効化もここで実施。
+    pub(crate) fn apply_slot_to_current_page(&mut self, slot_idx: usize) {
+        let Some(fs_idx) = self.fullscreen_idx else { return; };
+        let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else { return; };
+        let ai_changed = !self.effective_params(fs_idx).ai_settings_eq(&slot.params);
+        self.set_page_params(fs_idx, slot.params);
+        if ai_changed {
+            self.clear_all_adjustment_and_ai_caches(fs_idx);
+        } else {
+            self.clear_adjustment_caches(fs_idx);
+        }
         let key_label = crate::adjustment::slot_key_label(slot_idx);
-        self.show_feedback_toast(format!("[スロット{}:{} → プリセット{}]", key_label, slot_name, pi));
-    }
-
-    /// 指定 idx に対応するプリセットパラメータを取得する。
-    /// ページ割り当てがなければグローバル(0)を返す。
-    pub(crate) fn get_adjustment_params(&self, idx: usize) -> Option<crate::adjustment::AdjustParams> {
-        let pi = self.adjustment_page_preset.get(&idx).copied()
-            .or(self.adjustment_active_preset)
-            .unwrap_or(0); // 常にグローバルにフォールバック
-        Some(self.get_preset_params(pi))
-    }
-
-    /// プリセット番号からパラメータを取得する。
-    /// 0 = グローバル (settings), 1-4 = 個別 (adjustment_presets[0..3])
-    pub(crate) fn get_preset_params(&self, preset_idx: u8) -> crate::adjustment::AdjustParams {
-        if preset_idx == 0 {
-            self.settings.global_preset.clone()
-        } else {
-            let idx = (preset_idx - 1).min(3) as usize;
-            self.adjustment_presets.presets[idx].clone()
-        }
-    }
-
-    /// プリセット番号に対応するパラメータの可変参照を取得する。
-    /// 0 = グローバル (settings), 1-4 = 個別 (adjustment_presets[0..3])
-    pub(crate) fn get_preset_params_mut(&mut self, preset_idx: u8) -> &mut crate::adjustment::AdjustParams {
-        if preset_idx == 0 {
-            &mut self.settings.global_preset
-        } else {
-            let idx = (preset_idx - 1).min(3) as usize;
-            &mut self.adjustment_presets.presets[idx]
-        }
+        self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
     }
 
     /// 指定ピクセルデータに色調補正を同期適用して adjustment_cache に格納する。
     /// poll_prefetch / poll_ai_upscale の完了時に呼ばれ、
     /// 補正済み画像を即座にテクスチャ化してチラつきを防止する。
     fn apply_sync_adjustment(&mut self, ctx: &egui::Context, idx: usize, pixels: &std::sync::Arc<egui::ColorImage>) {
-        let Some(params) = self.get_adjustment_params(idx) else { return; };
+        let params = self.effective_params(idx);
         if params.is_identity() {
             return;
         }
-        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
+        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, params);
         let adjusted_pixels = std::sync::Arc::new(adjusted);
         let upload = clamp_for_gpu(&adjusted_pixels);
         let tex = ctx.load_texture(
@@ -3665,8 +3675,11 @@ impl App {
         if self.ai_upscale_pending.contains_key(&idx) {
             return;
         }
-        let Some(params) = self.get_adjustment_params(idx) else { return; };
-        if params.is_identity() {
+        // 短絡: 個別設定なし かつ グローバルが identity なら何もしない
+        if !self.adjustment_page_params.contains_key(&idx) && self.settings.global_preset.is_identity() {
+            return;
+        }
+        if self.effective_params(idx).is_identity() {
             return;
         }
         // ソース画像を取得 (AI アップスケール済み or 元画像)
@@ -4247,6 +4260,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
+        // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
+        self.update_ime_state(ctx);
+
         // 初回フレームで前回フォルダを復元
         // ZIP ファイルや、削除済み・取り外し済みのパスでもクラッシュしないよう
         // resolve_openable_path で最も近い既存ディレクトリに解決する。
@@ -4719,23 +4736,12 @@ fn draw_thumb(
     }
 }
 
-/// プリセットバッジの色。番号ごとに異なる色。
-fn preset_badge_color(preset_idx: u8) -> egui::Color32 {
-    match preset_idx {
-        1 => egui::Color32::from_rgb(50, 120, 220),  // 青
-        2 => egui::Color32::from_rgb(40, 160, 60),   // 緑
-        3 => egui::Color32::from_rgb(220, 140, 30),   // 橙
-        4 => egui::Color32::from_rgb(150, 60, 200),   // 紫
-        _ => egui::Color32::from_gray(100),
-    }
-}
-
 pub(crate) fn draw_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
     is_selected: bool,
     is_checked: bool,
-    preset_badge: Option<u8>,  // Some(1-4) でバッジ表示、None or Some(0) は非表示
+    has_page_override: bool,  // true なら左上に補正済みバッジを表示
     item: &GridItem,
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
@@ -4916,24 +4922,22 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // プリセットバッジ（1-4 のみ、左上に表示）
-    if let Some(pi) = preset_badge {
-        if pi >= 1 && pi <= 4 {
-            let badge_w = 18.0;
-            let badge_h = 16.0;
-            let badge_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.min.x + 3.0, rect.min.y + 3.0),
-                egui::vec2(badge_w, badge_h),
-            );
-            painter.rect_filled(badge_rect, 3.0, preset_badge_color(pi));
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                format!("{}", pi),
-                egui::FontId::proportional(11.0),
-                egui::Color32::WHITE,
-            );
-        }
+    // ページ個別補正バッジ（個別設定があるページの左上に表示）
+    if has_page_override {
+        let badge_w = 18.0;
+        let badge_h = 16.0;
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 3.0, rect.min.y + 3.0),
+            egui::vec2(badge_w, badge_h),
+        );
+        painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(50, 120, 220));
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "補",
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
     }
 }
 

@@ -1,9 +1,16 @@
 //! フルスクリーン画像補正パネル（左側オーバーレイ表示）。
 //!
 //! マウスを画面端（左・上・右）に寄せるとオーバーレイとして表示される。
-//! 0=グローバル / 1-4=個別プリセットの選択、
-//! 補正モード（手動/自動/漫画）のラジオ選択、
-//! スライダーによる補正パラメータ調整、AI 設定、保存スロットを提供する。
+//! スコープは標準設定 + ページ個別の 2 つ。
+//!
+//! - パネルでスライダーを操作すると、その瞬間に「現在のページ個別パラメータ」が更新される
+//!   (ページ個別設定が自動生成される)
+//! - アクションボタン 4 種 (2x2 グリッド):
+//!     - 「全画像に適用」   — 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに反映
+//!     - 「全画像から削除」 — 現在の一覧の全画像ページから個別設定を削除 (標準に戻す)
+//!     - 「標準にする」     — 現在のパラメータを settings.global_preset にコピー
+//!     - 「個別設定を解除」 — 現在のページの個別設定を削除 (標準値に戻す)
+//! - 保存スロット 10 個: クリック or Shift+数字で現在のページに適用
 
 use eframe::egui;
 
@@ -24,7 +31,6 @@ macro_rules! slider_with_reset {
     ($ui:expr, $label:expr, $val:expr, $range:expr, $default:expr, $disabled:expr, $changed:expr, $dragging:expr) => {{
         $ui.horizontal(|ui| {
             ui.label(egui::RichText::new($label).size(SECTION_FONT).color(LABEL_COLOR));
-            // 右端にリセットボタン
             if *$val != $default && !$disabled {
                 let reset_resp = ui.small_button("↩");
                 if reset_resp.clicked() {
@@ -69,12 +75,9 @@ macro_rules! slider_log_with_reset {
     }};
 }
 
-/// プリセットのスライダーUI を描画する（self を借用しない純関数）。
-///
-/// `ai_denoise_disabled_threshold` / `ai_upscale_disabled_threshold`:
-///   `Some(px)` のとき、画像サイズが `px` 以上なので AI 機能は無効。
-///   UI 上でその旨を表示しコントロールを disabled にする。
-fn draw_preset_sliders(
+/// スライダー UI (純関数)。ai_denoise_disabled_threshold / ai_upscale_disabled_threshold が
+/// Some なら画像サイズ閾値により AI 機能が無効になる旨を表示する。
+fn draw_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
     ai_denoise_available: bool,
@@ -84,35 +87,26 @@ fn draw_preset_sliders(
 ) -> (bool, bool) {
     let mut changed = false;
     let mut dragging = false;
-
     let is_auto = params.auto_mode.is_some();
 
-    // ── 補正モード（ラジオボタン）──
+    // ── 補正モード ──
     ui.label(egui::RichText::new("補正モード").size(SECTION_FONT).color(LABEL_COLOR));
     ui.add_space(2.0);
     {
         let mut mode_changed = false;
-        if ui.radio(params.auto_mode.is_none(),
-            egui::RichText::new("手動").color(LABEL_COLOR)
-        ).clicked() {
+        if ui.radio(params.auto_mode.is_none(), egui::RichText::new("手動").color(LABEL_COLOR)).clicked() {
             params.auto_mode = None;
             mode_changed = true;
         }
-        if ui.radio(params.auto_mode == Some(AutoMode::Auto),
-            egui::RichText::new("自動補正").color(LABEL_COLOR)
-        ).clicked() {
+        if ui.radio(params.auto_mode == Some(AutoMode::Auto), egui::RichText::new("自動補正").color(LABEL_COLOR)).clicked() {
             params.auto_mode = Some(AutoMode::Auto);
             mode_changed = true;
         }
-        if ui.radio(params.auto_mode == Some(AutoMode::MangaCleanup),
-            egui::RichText::new("モノクロ漫画補正").color(LABEL_COLOR)
-        ).clicked() {
+        if ui.radio(params.auto_mode == Some(AutoMode::MangaCleanup), egui::RichText::new("モノクロ漫画補正").color(LABEL_COLOR)).clicked() {
             params.auto_mode = Some(AutoMode::MangaCleanup);
             mode_changed = true;
         }
-        if mode_changed {
-            changed = true;
-        }
+        if mode_changed { changed = true; }
     }
     ui.add_space(8.0);
 
@@ -182,75 +176,47 @@ fn draw_preset_sliders(
     ui.add_space(4.0);
 
     if ai_denoise_available {
+        ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
         if let Some(px) = ai_denoise_disabled_threshold {
-            ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
             ui.label(
-                egui::RichText::new(format!("（{}px 以上なので無効）", px))
+                egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
                     .size(SECTION_FONT - 1.0)
                     .color(egui::Color32::from_gray(150))
                     .italics(),
             );
-            let is_on = params.denoise_model.is_some();
-            let mut toggled = is_on;
-            ui.add_enabled(
-                false,
-                egui::Checkbox::new(
-                    &mut toggled,
-                    egui::RichText::new("JPEG ノイズ除去を適用").color(egui::Color32::from_gray(130)),
-                ),
-            );
-        } else {
-            ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
-            let is_on = params.denoise_model.is_some();
-            let mut toggled = is_on;
-            if ui.checkbox(&mut toggled, egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR)).changed() {
-                params.denoise_model = if toggled {
-                    Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string())
-                } else {
-                    None
-                };
-                changed = true;
-            }
+        }
+        let is_on = params.denoise_model.is_some();
+        let mut toggled = is_on;
+        if ui.checkbox(&mut toggled, egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR)).changed() {
+            params.denoise_model = if toggled {
+                Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string())
+            } else {
+                None
+            };
+            changed = true;
         }
         ui.add_space(8.0);
     }
 
     if ai_upscale_available {
+        ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
         if let Some(px) = ai_upscale_disabled_threshold {
-            ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
             ui.label(
-                egui::RichText::new(format!("（{}px 以上なので無効）", px))
+                egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
                     .size(SECTION_FONT - 1.0)
                     .color(egui::Color32::from_gray(150))
                     .italics(),
             );
-            for (label, val) in crate::adjustment::UPSCALE_MODELS {
-                let is_sel = match (val, params.upscale_model.as_deref()) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => *a == b,
-                    _ => false,
-                };
-                ui.add_enabled(
-                    false,
-                    egui::RadioButton::new(
-                        is_sel,
-                        egui::RichText::new(*label).color(egui::Color32::from_gray(130)),
-                    ),
-                );
-            }
-        } else {
-            ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
-
-            for (label, val) in crate::adjustment::UPSCALE_MODELS {
-                let is_sel = match (val, params.upscale_model.as_deref()) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => *a == b,
-                    _ => false,
-                };
-                if ui.radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR)).clicked() {
-                    params.upscale_model = val.map(|s| s.to_string());
-                    changed = true;
-                }
+        }
+        for (label, val) in crate::adjustment::UPSCALE_MODELS {
+            let is_sel = match (val, params.upscale_model.as_deref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => *a == b,
+                _ => false,
+            };
+            if ui.radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR)).clicked() {
+                params.upscale_model = val.map(|s| s.to_string());
+                changed = true;
             }
         }
     }
@@ -276,7 +242,8 @@ impl App {
         panel_rect: egui::Rect,
         image_dims: Option<(u32, u32)>,
     ) {
-        let preset_idx = self.adjustment_active_preset.unwrap_or(0);
+        // フルスクリーン対象のページ idx
+        let Some(fs_idx) = self.fullscreen_idx else { return; };
 
         let painter = ui.painter_at(panel_rect);
         painter.rect_filled(panel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230));
@@ -294,86 +261,64 @@ impl App {
             egui::Color32::WHITE,
         );
 
-        // ── プリセットタブ (0=グローバル, 1-4=個別) ──
-        let tab_y = panel_rect.min.y + HEADER_H + 4.0;
-        let tab_labels = ["0", "1", "2", "3", "4"];
-        let tab_w = (panel_rect.width() - 20.0) / tab_labels.len() as f32;
-        let mut preset_switch: Option<u8> = None;
-        for (i, label) in tab_labels.iter().enumerate() {
-            let pi = i as u8;
-            let tab_rect = egui::Rect::from_min_size(
-                egui::pos2(panel_rect.min.x + 10.0 + i as f32 * tab_w, tab_y),
-                egui::vec2(tab_w - 2.0, 28.0),
-            );
-            let is_active = self.adjustment_active_preset == Some(pi);
-            let bg = if is_active {
-                egui::Color32::from_rgb(60, 120, 200)
-            } else {
-                egui::Color32::from_gray(50)
-            };
-            let resp = child.allocate_rect(tab_rect, egui::Sense::click());
-            child.painter().rect_filled(tab_rect, 4.0, bg);
-
-            let display_label = if pi == 0 { "G" } else { *label };
-            child.painter().text(
-                tab_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                display_label,
-                egui::FontId::proportional(13.0),
-                egui::Color32::WHITE,
-            );
-
-            let tooltip = if pi == 0 {
-                "グローバル [0]".to_string()
-            } else {
-                let name = &self.adjustment_presets.names[(pi - 1) as usize];
-                format!("{} [{}]", name, pi)
-            };
-            let resp = resp.on_hover_text(tooltip);
-            if resp.clicked() {
-                preset_switch = Some(pi);
-            }
-        }
-
-        // ── タブ下: プリセット種別表示 ──
-        let label_y = tab_y + 32.0;
-        let label_text = if preset_idx == 0 {
-            "グローバル".to_string()
+        // ── スコープ表示: 標準設定 / 個別設定 ──
+        let has_override = self.adjustment_page_params.contains_key(&fs_idx);
+        let scope_y = panel_rect.min.y + HEADER_H + 4.0;
+        let scope_text = if has_override {
+            "個別設定を適用中"
         } else {
-            let name = &self.adjustment_presets.names[(preset_idx - 1) as usize];
-            format!("個別: {}", name)
+            "標準設定を適用中"
+        };
+        let scope_color = if has_override {
+            egui::Color32::from_rgb(220, 180, 80)
+        } else {
+            egui::Color32::from_gray(180)
         };
         child.painter().text(
-            egui::pos2(panel_rect.min.x + 10.0, label_y),
+            egui::pos2(panel_rect.min.x + 10.0, scope_y),
             egui::Align2::LEFT_TOP,
-            &label_text,
-            egui::FontId::proportional(11.0),
-            egui::Color32::from_gray(180),
+            scope_text,
+            egui::FontId::proportional(12.0),
+            scope_color,
         );
 
-        // ── プリセット名の編集 (個別 1-4 のみ) ──
-        let name_edit_h = if preset_idx >= 1 { 28.0 } else { 0.0 };
-        let name_edit_y = label_y + 16.0;
-        if preset_idx >= 1 {
-            let name_rect = egui::Rect::from_min_size(
-                egui::pos2(panel_rect.min.x + 10.0, name_edit_y),
-                egui::vec2(panel_rect.width() - 20.0, 22.0),
-            );
-            let mut name_child = child.new_child(egui::UiBuilder::new().max_rect(name_rect));
-            let idx = (preset_idx - 1) as usize;
-            let resp = name_child.add(
-                egui::TextEdit::singleline(&mut self.adjustment_presets.names[idx])
-                    .desired_width(name_rect.width())
-                    .font(egui::FontId::proportional(12.0))
-                    .hint_text("プリセット名")
-            );
-            self.editing_preset_name = resp.has_focus();
-        } else {
-            self.editing_preset_name = false;
-        }
+        // ── アクションボタン (2x2 グリッド) ──
+        let buttons_y = scope_y + 20.0;
+        let buttons_h = 28.0 * 2.0 + 4.0; // 2 行分 + 行間マージン
+        let buttons_rect = egui::Rect::from_min_size(
+            egui::pos2(panel_rect.min.x + 8.0, buttons_y),
+            egui::vec2(panel_rect.width() - 16.0, buttons_h),
+        );
+        let mut actions_child = child.new_child(egui::UiBuilder::new().max_rect(buttons_rect));
+        let mut apply_all_clicked = false;
+        let mut clear_all_clicked = false;
+        let mut set_as_global_clicked = false;
+        let mut clear_page_clicked = false;
+        actions_child.vertical(|ui| {
+            ui.horizontal(|ui| {
+                if ui.small_button("全画像に適用").on_hover_text("このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む").clicked() {
+                    apply_all_clicked = true;
+                }
+                if ui.small_button("全画像から削除").on_hover_text("このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す").clicked() {
+                    clear_all_clicked = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("標準にする").on_hover_text("現在のパラメータをアプリ全体の標準設定にする").clicked() {
+                    set_as_global_clicked = true;
+                }
+                if ui
+                    .add_enabled(has_override, egui::Button::new("個別設定を解除").small())
+                    .on_hover_text("このページの個別設定を削除し、標準値に戻す")
+                    .clicked()
+                {
+                    clear_page_clicked = true;
+                }
+            });
+        });
 
         // ── レイアウト計算: スライダー領域と保存スロット領域 ──
-        let content_top = name_edit_y + name_edit_h + 8.0;
+        let content_top = buttons_y + buttons_h + 6.0;
         // 保存スロット: 5行×2列 + ラベル + マージン
         let slots_height = 5.0 * 26.0 + 28.0;
         let content_rect = egui::Rect::from_min_max(
@@ -382,11 +327,9 @@ impl App {
         );
         let mut scroll_child = child.new_child(egui::UiBuilder::new().max_rect(content_rect));
 
-        let params = if preset_idx == 0 {
-            &mut self.settings.global_preset
-        } else {
-            &mut self.adjustment_presets.presets[(preset_idx - 1) as usize]
-        };
+        // 現在の有効パラメータを取得して編集用コピーを作る
+        let mut edit_params = self.effective_params(fs_idx).clone();
+        let original = edit_params.clone();
 
         // しきい値以上ならスキップされる → その場合は「無効」を UI に反映する
         let ai_denoise_disabled_threshold = match image_dims {
@@ -407,9 +350,9 @@ impl App {
             .show(&mut scroll_child, |ui| {
                 ui.set_width(panel_rect.width() - 20.0);
                 ui.add_space(8.0);
-                draw_preset_sliders(
+                draw_sliders(
                     ui,
-                    params,
+                    &mut edit_params,
                     self.settings.ai_denoise_feature,
                     self.settings.ai_upscale_feature,
                     ai_denoise_disabled_threshold,
@@ -419,7 +362,7 @@ impl App {
 
         self.adjustment_dragging = is_dragging;
 
-        // ── 保存スロット (常時表示) ──
+        // ── 保存スロット ──
         let slots_rect = egui::Rect::from_min_max(
             egui::pos2(panel_rect.min.x, panel_rect.max.y - slots_height),
             panel_rect.max,
@@ -433,8 +376,7 @@ impl App {
         slots_child.label(egui::RichText::new("保存スロット").size(11.0).color(LABEL_COLOR));
         slots_child.add_space(2.0);
 
-        let btn_w = (panel_rect.width() - 20.0) * 0.5 - 24.0; // 保存アイコン分を確保
-        // 5行×2列
+        let btn_w = (panel_rect.width() - 20.0) * 0.5 - 24.0;
         for row in 0..5 {
             slots_child.horizontal(|ui| {
                 for col in 0..2 {
@@ -455,7 +397,7 @@ impl App {
                         load_from_slot = Some(slot_idx);
                     }
                     if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                        name_resp.on_hover_text(format!("{} をロード (Shift+{})", s.name, key_label));
+                        name_resp.on_hover_text(format!("{} をこのページに適用 (Shift+{})", s.name, key_label));
                     }
 
                     let save_btn = egui::Button::new(
@@ -470,53 +412,115 @@ impl App {
             });
         }
 
-        // 保存処理
+        // ── スライダー変更を反映 (自動的にページ個別化) ──
+        if changed {
+            let ai_changed = !original.ai_settings_eq(&edit_params);
+            self.set_page_params(fs_idx, edit_params.clone());
+            if ai_changed {
+                self.clear_all_adjustment_and_ai_caches(fs_idx);
+            } else {
+                self.clear_adjustment_caches(fs_idx);
+            }
+        }
+
+        // ── アクションボタン処理 ──
+        if apply_all_clicked {
+            let params = self.effective_params(fs_idx).clone();
+            self.apply_params_to_all_pages(params);
+            self.show_feedback_toast("全画像に適用".to_string());
+        }
+        if clear_all_clicked {
+            self.clear_all_page_params();
+            self.show_feedback_toast("全画像の個別設定を削除".to_string());
+        }
+        if set_as_global_clicked {
+            let params = self.effective_params(fs_idx).clone();
+            self.copy_params_to_global(params);
+            self.show_feedback_toast("標準設定を更新".to_string());
+        }
+        if clear_page_clicked {
+            self.clear_page_params(fs_idx);
+            self.clear_adjustment_caches(fs_idx);
+            self.show_feedback_toast("個別設定を解除".to_string());
+        }
+
+        // ── 保存スロット: ダイアログで名称を入力 ──
         if let Some(slot_idx) = save_to_slot {
-            if let Some(pi) = self.adjustment_active_preset {
-                let p = self.get_preset_params(pi);
-                let name = if pi == 0 {
-                    "グローバル".to_string()
-                } else {
-                    self.adjustment_presets.names[(pi - 1) as usize].clone()
-                };
+            // 既存スロットがあればその名前を初期値に、なければ空で開く
+            let default_name = self.settings.preset_slots.slots[slot_idx]
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            self.slot_save_dialog = Some((slot_idx, default_name));
+        }
+        if let Some(slot_idx) = load_from_slot {
+            self.apply_slot_to_current_page(slot_idx);
+        }
+    }
+
+    /// スロット保存ダイアログを描画する。`slot_save_dialog` が Some の間だけ表示。
+    pub(crate) fn draw_slot_save_dialog(&mut self, ctx: &egui::Context) {
+        let Some((slot_idx, mut name_input)) = self.slot_save_dialog.take() else { return; };
+        let mut open = true;
+        let mut confirmed = false;
+        let mut canceled = false;
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+
+        egui::Window::new("保存スロット名")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let key_label = crate::adjustment::slot_key_label(slot_idx);
+                ui.label(format!("スロット {} に保存する名前を入力:", key_label));
+                ui.add_space(4.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut name_input)
+                        .desired_width(240.0)
+                        .hint_text("例: 漫画モノクロ / スキャン補正"),
+                );
+                if !resp.has_focus() && !resp.lost_focus() {
+                    resp.request_focus();
+                }
+                if resp.lost_focus() && enter_pressed {
+                    confirmed = true;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!name_input.trim().is_empty(), egui::Button::new("保存")).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        canceled = true;
+                    }
+                });
+                if escape_pressed {
+                    canceled = true;
+                }
+            });
+
+        if !open || canceled {
+            // ダイアログを閉じる (State を Some に戻さない)
+            return;
+        }
+
+        if confirmed && !name_input.trim().is_empty() {
+            if let Some(fs_idx) = self.fullscreen_idx {
+                let params = self.effective_params(fs_idx).clone();
                 self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
-                    name,
-                    params: p,
+                    name: name_input.trim().to_string(),
+                    params,
                 });
                 self.settings.save();
                 let key_label = crate::adjustment::slot_key_label(slot_idx);
-                self.show_feedback_toast(format!("[スロット{}に保存]", key_label));
+                self.show_feedback_toast(format!("[スロット{}:{} に保存]", key_label, name_input.trim()));
             }
+            return;
         }
 
-        // ロード処理
-        if let Some(slot_idx) = load_from_slot {
-            self.load_slot_to_active_preset(slot_idx);
-        }
-
-        // プリセット切替
-        if let Some(new_pi) = preset_switch {
-            let old_params = self.adjustment_active_preset.map(|pi| self.get_preset_params(pi));
-            self.adjustment_active_preset = Some(new_pi);
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.assign_page_preset(fs_idx, new_pi);
-                let new_params = self.get_preset_params(new_pi);
-                if old_params.as_ref().map_or(true, |old| !old.ai_settings_eq(&new_params)) {
-                    self.clear_all_adjustment_and_ai_caches(fs_idx);
-                } else {
-                    self.clear_adjustment_caches(fs_idx);
-                }
-            }
-        }
-
-        // パラメータ変更があればキャッシュクリア + 保存（ドラッグ中はdisk書き込みを抑制）
-        if changed {
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.clear_adjustment_caches(fs_idx);
-            }
-            if !is_dragging {
-                self.save_current_preset(preset_idx);
-            }
-        }
+        // まだ開いている → state を書き戻す
+        self.slot_save_dialog = Some((slot_idx, name_input));
     }
 }
