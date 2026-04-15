@@ -124,6 +124,10 @@ match grid_item {
 新しい永続ストレージを追加する時は、`rotation_db.rs` と `adjustment_db.rs` の
 `normalize_path` / page_key 生成に揃えること。**キー規則がズレると ZIP/PDF の回転や補正が保存されない**。
 
+`rating_db.rs` は `App::page_path_key` が返すキー (`adjustment_db::normalize_path` と同形式、
+ZipImage は `::`、PdfPage は `::page_N` 区切り) をそのまま DB パスとして使う。
+新規 DB を追加する際は同じ関数を使うと 3 バリアントへの対応が同時に揃う。
+
 ### 3.4 「先頭 1 枚」の取得
 
 Folder/ZipFile/PdfFile のサムネイルはそれぞれ別ロジックで「代表画像」を取ってくる:

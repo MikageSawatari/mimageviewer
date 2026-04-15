@@ -413,6 +413,15 @@ pub struct Settings {
     /// ツールバーに「上のフォルダへ」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_parent_button: bool,
+    /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_rating: bool,
+
+    // ── レーティングフィルタ ───────────────────────────────────
+    /// レーティングフィルタ (index 0 = 未評価, 1〜5 = ★の数)。
+    /// 選択された星数のアイテムのみ表示。全て true = フィルタなし。
+    #[serde(default = "default_rating_filter")]
+    pub rating_filter: [bool; 6],
 
     // ── EXIF 表示フィルタ ──────────────────────────────────────
     /// 非表示にする EXIF タグ名のリスト
@@ -618,6 +627,7 @@ fn default_slideshow_interval() -> f32 { 3.0 }
 fn default_toolbar_cols_items() -> Vec<usize> { (MIN_GRID_COLS..=MAX_GRID_COLS).collect() }
 fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
 fn default_toolbar_sort_items() -> Vec<SortOrder> { SortOrder::all().to_vec() }
+fn default_rating_filter() -> [bool; 6] { [true; 6] }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -658,6 +668,8 @@ impl Default for Settings {
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
             show_toolbar_parent_button: true,
+            show_toolbar_rating: true,
+            rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_sort_items: default_toolbar_sort_items(),
