@@ -508,6 +508,24 @@ pub struct Settings {
     /// AI ノイズ除去: スキップしきい値（この値以上の画像はスキップ）
     #[serde(default = "default_ai_denoise_skip_px")]
     pub ai_denoise_skip_px: u32,
+
+    /// AI アップスケール機能の有効/無効（プリセットパネルに表示するか）
+    #[serde(default = "default_true")]
+    pub ai_upscale_feature: bool,
+
+    /// AI ノイズ除去機能の有効/無効（プリセットパネルに表示するか）
+    #[serde(default)]
+    pub ai_denoise_feature: bool,
+
+    // ── グローバルプリセット ──────────────────────────────────────
+    /// グローバルプリセット (0キー)。全フォルダ共通の補正設定。
+    #[serde(default)]
+    pub global_preset: crate::adjustment::AdjustParams,
+
+    // ── 保存スロット ──────────────────────────────────────────
+    /// 保存スロット (10個)。名前付きで保存した補正設定。
+    #[serde(default)]
+    pub preset_slots: crate::adjustment::PresetSlots,
 }
 
 /// グリッド列数の最小値
@@ -656,6 +674,10 @@ impl Default for Settings {
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
             ai_upscale_skip_px: default_ai_upscale_skip_px(),
             ai_denoise_skip_px: default_ai_denoise_skip_px(),
+            ai_upscale_feature: true,
+            ai_denoise_feature: false,
+            global_preset: crate::adjustment::AdjustParams::default(),
+            preset_slots: crate::adjustment::PresetSlots::default(),
         }
     }
 }

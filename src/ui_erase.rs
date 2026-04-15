@@ -822,8 +822,7 @@ impl App {
     ) -> Result<egui::ColorImage, crate::ai::AiError> {
         let runtime = self.ai_runtime.clone()
             .ok_or_else(|| crate::ai::AiError::Ort("AI runtime not available".to_string()))?;
-        let manager = self.ai_model_manager.clone()
-            .ok_or_else(|| crate::ai::AiError::Ort("Model manager not available".to_string()))?;
+        let manager = self.ai_model_manager.clone();
 
         let kind = crate::ai::ModelKind::InpaintMiGan;
         let model_path = manager.model_path(kind)

@@ -570,12 +570,39 @@ impl App {
         let mut nav = None;
         if response.clicked() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
-            if ctrl {
+            let shift = ctx.input(|i| i.modifiers.shift);
+            if shift {
+                // Shift+クリック: 前回選択位置から現在位置までを範囲チェック
+                if let Some(prev_sel) = self.selected {
+                    let vi = &self.visible_indices;
+                    let prev_pos = vi.iter().position(|&i| i == prev_sel).unwrap_or(0);
+                    let cur_pos = vi.iter().position(|&i| i == idx).unwrap_or(0);
+                    let (start, end) = if prev_pos <= cur_pos {
+                        (prev_pos, cur_pos)
+                    } else {
+                        (cur_pos, prev_pos)
+                    };
+                    for vp in start..=end {
+                        if let Some(&vidx) = vi.get(vp) {
+                            match self.items.get(vidx) {
+                                Some(GridItem::Image(_))
+                                | Some(GridItem::Video(_))
+                                | Some(GridItem::ZipImage { .. })
+                                | Some(GridItem::PdfPage { .. }) => {
+                                    self.checked.insert(vidx);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            } else if ctrl {
                 // Ctrl+クリック: チェック ON/OFF トグル + 選択移動
                 match self.items.get(idx) {
                     Some(GridItem::Image(_))
                     | Some(GridItem::Video(_))
-                    | Some(GridItem::ZipImage { .. }) => {
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. }) => {
                         if self.checked.contains(&idx) {
                             self.checked.remove(&idx);
                         } else {
@@ -751,11 +778,13 @@ impl App {
                                 }
 
                                 let rot = self.get_rotation(idx);
+                                let preset_badge = self.adjustment_page_preset.get(&idx).copied();
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
+                                    preset_badge,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                     rot,
