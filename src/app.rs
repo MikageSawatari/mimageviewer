@@ -517,10 +517,6 @@ pub struct App {
     pub(crate) erase_mask_texture: Option<egui::TextureHandle>,
     /// 消しゴムモードでドラッグ中か（前フレームのポインタ位置を保持）
     pub(crate) erase_last_paint_pos: Option<egui::Pos2>,
-    /// 元画像のピクセルデータバックアップ（inpaint 実行前に保存）
-    pub(crate) erase_original_pixels: Option<std::sync::Arc<egui::ColorImage>>,
-    /// inpaint 処理中の非同期受信チャネル
-    pub(crate) erase_inpaint_rx: Option<mpsc::Receiver<egui::ColorImage>>,
     /// 現在のツール種別
     pub(crate) erase_tool: EraseTool,
     /// 筆ツールの半径 (画像ピクセル)
@@ -719,8 +715,6 @@ impl Default for App {
             erase_mask_size: [0, 0],
             erase_mask_texture: None,
             erase_last_paint_pos: None,
-            erase_original_pixels: None,
-            erase_inpaint_rx: None,
             erase_tool: EraseTool::default(),
             erase_brush_radius: 0.0, // enter_erase_mode で設定
             erase_lasso_points: Vec::new(),

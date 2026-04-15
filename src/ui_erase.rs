@@ -49,8 +49,8 @@ impl App {
         self.erase_mask_size = [w, h];
         self.erase_mask_texture = None;
         self.erase_last_paint_pos = None;
-        self.erase_original_pixels = Some(pixels);
-        self.erase_inpaint_rx = None;
+
+
         self.erase_lasso_points.clear();
         self.erase_line_start = None;
         self.erase_line_end = None;
@@ -76,8 +76,8 @@ impl App {
         self.erase_mask_size = [0, 0];
         self.erase_mask_texture = None;
         self.erase_last_paint_pos = None;
-        self.erase_original_pixels = None;
-        self.erase_inpaint_rx = None;
+
+
         self.erase_lasso_points.clear();
         self.erase_line_start = None;
         self.erase_line_end = None;
@@ -85,13 +85,12 @@ impl App {
 
     // ── 座標変換 ──────────────────────────────────────────────────
 
-    /// スクリーン座標を画像ピクセル座標 (f32) に変換する。
-    fn screen_to_image_f32(
+    /// 画像レイアウト情報 (total_scale, img_rect) を計算する。
+    fn erase_image_layout(
         &self,
-        screen_pos: egui::Pos2,
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
-    ) -> Option<(f32, f32)> {
+    ) -> Option<(f32, egui::Rect)> {
         let [iw, ih] = self.erase_mask_size;
         if iw == 0 || ih == 0 { return None; }
         let display_size = egui::vec2(iw as f32, ih as f32);
@@ -101,7 +100,18 @@ impl App {
             Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
             None => (fit_scale, full_rect.center()),
         };
-        let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
+        Some((total_scale, egui::Rect::from_center_size(center, display_size * total_scale)))
+    }
+
+    /// スクリーン座標を画像ピクセル座標 (f32) に変換する。
+    fn screen_to_image_f32(
+        &self,
+        screen_pos: egui::Pos2,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) -> Option<(f32, f32)> {
+        let (total_scale, img_rect) = self.erase_image_layout(full_rect, zoom_pan)?;
+        let [iw, ih] = self.erase_mask_size;
         let nx = (screen_pos.x - img_rect.min.x) / total_scale;
         let ny = (screen_pos.y - img_rect.min.y) / total_scale;
         if nx >= 0.0 && ny >= 0.0 && nx < iw as f32 && ny < ih as f32 {
@@ -119,15 +129,8 @@ impl App {
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) -> egui::Pos2 {
-        let [iw, ih] = self.erase_mask_size;
-        let display_size = egui::vec2(iw as f32, ih as f32);
-        let fit_scale = (full_rect.width() / display_size.x)
-            .min(full_rect.height() / display_size.y);
-        let (total_scale, center) = match zoom_pan {
-            Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-            None => (fit_scale, full_rect.center()),
-        };
-        let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
+        let (total_scale, img_rect) = self.erase_image_layout(full_rect, zoom_pan)
+            .unwrap_or((1.0, full_rect));
         egui::pos2(
             img_rect.min.x + img_x * total_scale,
             img_rect.min.y + img_y * total_scale,
@@ -203,11 +206,11 @@ impl App {
         let min_y = points.iter().map(|p| p.1).fold(f32::MAX, f32::min).max(0.0) as usize;
         let max_y = points.iter().map(|p| p.1).fold(f32::MIN, f32::max).min(h as f32) as usize;
 
+        let n = points.len();
+        let mut intersections = Vec::new();
         for y in min_y..max_y {
             let scan_y = y as f32 + 0.5;
-            let mut intersections = Vec::new();
-
-            let n = points.len();
+            intersections.clear();
             for i in 0..n {
                 let (x0, y0) = points[i];
                 let (x1, y1) = points[(i + 1) % n];
@@ -386,15 +389,7 @@ impl App {
         // マスクオーバーレイ描画
         self.ensure_mask_texture(ctx);
         if let Some(ref tex) = self.erase_mask_texture {
-            let [iw, ih] = self.erase_mask_size;
-            let display_size = egui::vec2(iw as f32, ih as f32);
-            let fit_scale = (full_rect.width() / display_size.x)
-                .min(full_rect.height() / display_size.y);
-            let (total_scale, center) = match zoom_pan {
-                Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
-                None => (fit_scale, full_rect.center()),
-            };
-            let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
+            let Some((_total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else { return; };
             let painter = if zoom_pan.is_some() {
                 ui.painter().with_clip_rect(full_rect)
             } else {
@@ -490,14 +485,7 @@ impl App {
         if self.erase_tool != EraseTool::Brush { return; }
         if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
             if full_rect.contains(pos) {
-                let [iw, ih] = self.erase_mask_size;
-                let display_size = egui::vec2(iw as f32, ih as f32);
-                let fit_scale = (full_rect.width() / display_size.x)
-                    .min(full_rect.height() / display_size.y);
-                let total_scale = match zoom_pan {
-                    Some((zoom, _)) => fit_scale * zoom,
-                    None => fit_scale,
-                };
+                let Some((total_scale, _)) = self.erase_image_layout(full_rect, zoom_pan) else { return; };
                 let screen_r = self.erase_brush_radius * total_scale;
                 ui.painter().circle_stroke(
                     pos, screen_r,
@@ -714,7 +702,7 @@ impl App {
             Some(m) => m,
             None => { self.reset_erase_mode(); return; }
         };
-        let original = match &self.erase_original_pixels {
+        let original = match self.erase_base_cache.get(&fs_idx) {
             Some(p) => Arc::clone(p),
             None => { self.reset_erase_mode(); return; }
         };
@@ -944,9 +932,9 @@ fn inpaint_migan(
 
         for iy in 0..s {
             for ix in 0..s {
-                // タイル座標 → region 座標 → 画像座標
-                let rx = tile.x + ix * tile.w / s;
-                let ry = tile.y + iy * tile.h / s;
+                // タイル座標 → region 座標 → 画像座標 (浮動小数点で精密マッピング)
+                let rx = tile.x + (ix as f32 * tile.w as f32 / s as f32) as usize;
+                let ry = tile.y + (iy as f32 * tile.h as f32 / s as f32) as usize;
                 let gx = region_x0 + rx;
                 let gy = region_y0 + ry;
 
@@ -1001,9 +989,9 @@ fn inpaint_migan(
 
         for iy in 0..s {
             for ix in 0..s {
-                // 512 座標 → タイル内座標 → region 座標
-                let tx = ix * tile.w / s;
-                let ty = iy * tile.h / s;
+                // 512 座標 → タイル内座標 → region 座標 (浮動小数点で精密マッピング)
+                let tx = (ix as f32 * tile.w as f32 / s as f32) as usize;
+                let ty = (iy as f32 * tile.h as f32 / s as f32) as usize;
                 let rx = tile.x + tx;
                 let ry = tile.y + ty;
                 if rx >= region_w || ry >= region_h { continue; }
@@ -1108,6 +1096,24 @@ struct TileRect {
 }
 
 fn inpaint_diffuse(original: &egui::ColorImage, mask: &[bool], w: usize, h: usize) -> egui::ColorImage {
+    // マスクのバウンディングボックスに限定して処理
+    let (mut bx0, mut by0, mut bx1, mut by1) = (w, h, 0, 0);
+    for py in 0..h {
+        for px in 0..w {
+            if mask[py * w + px] {
+                bx0 = bx0.min(px);
+                by0 = by0.min(py);
+                bx1 = bx1.max(px + 1);
+                by1 = by1.max(py + 1);
+            }
+        }
+    }
+    // パディング（近傍参照用）
+    let bx0 = bx0.saturating_sub(1);
+    let by0 = by0.saturating_sub(1);
+    let bx1 = (bx1 + 1).min(w);
+    let by1 = (by1 + 1).min(h);
+
     let mut pixels: Vec<[f32; 4]> = original.pixels.iter()
         .map(|c| [c.r() as f32, c.g() as f32, c.b() as f32, c.a() as f32])
         .collect();
@@ -1115,14 +1121,16 @@ fn inpaint_diffuse(original: &egui::ColorImage, mask: &[bool], w: usize, h: usiz
     for i in 0..mask.len() {
         filled[i] = !mask[i];
     }
-    let max_iters = (w.max(h) as u32).min(2000);
+
+    // ダブルバッファで swap（clone を回避）
+    let mut buf_pixels = pixels.clone();
+    let mut buf_filled = filled.clone();
+    let max_iters = ((bx1 - bx0).max(by1 - by0) as u32).min(2000);
     let neighbors: [(isize, isize); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
     for _iter in 0..max_iters {
         let mut any_filled = false;
-        let mut new_pixels = pixels.clone();
-        let mut new_filled = filled.clone();
-        for py in 0..h {
-            for px in 0..w {
+        for py in by0..by1 {
+            for px in bx0..bx1 {
                 let idx = py * w + px;
                 if filled[idx] { continue; }
                 let mut sum = [0.0f32; 4];
@@ -1140,14 +1148,22 @@ fn inpaint_diffuse(original: &egui::ColorImage, mask: &[bool], w: usize, h: usiz
                     }
                 }
                 if count > 0 {
-                    new_pixels[idx] = [sum[0]/count as f32, sum[1]/count as f32, sum[2]/count as f32, sum[3]/count as f32];
-                    new_filled[idx] = true;
+                    buf_pixels[idx] = [sum[0]/count as f32, sum[1]/count as f32, sum[2]/count as f32, sum[3]/count as f32];
+                    buf_filled[idx] = true;
                     any_filled = true;
                 }
             }
         }
-        pixels = new_pixels;
-        filled = new_filled;
+        std::mem::swap(&mut pixels, &mut buf_pixels);
+        std::mem::swap(&mut filled, &mut buf_filled);
+        // swap 後に buf を pixels からコピー（次の反復で読む値を最新にする）
+        for py in by0..by1 {
+            for px in bx0..bx1 {
+                let idx = py * w + px;
+                buf_pixels[idx] = pixels[idx];
+                buf_filled[idx] = filled[idx];
+            }
+        }
         if !any_filled { break; }
     }
     let rgba: Vec<u8> = pixels.iter()
