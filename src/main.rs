@@ -17,6 +17,7 @@ pub mod monitor;
 pub mod png_metadata;
 pub mod rating_db;
 pub mod rotation_db;
+pub mod search_index_db;
 pub mod settings;
 pub mod spread_db;
 pub mod stats;
