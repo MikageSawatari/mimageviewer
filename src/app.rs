@@ -191,6 +191,9 @@ pub struct App {
     /// Phase 2b ワーカーが参照する現在の可視先頭アイテムインデックス
     /// UIスレッドが毎フレーム更新し、バックグラウンドワーカーが優先度に使う
     pub(crate) scroll_hint: Arc<AtomicUsize>,
+    /// 可視範囲の終端 (exclusive) アイテムインデックス。`scroll_hint` と併せて
+    /// ワーカーの前後対称な距離ベース優先度計算に使う。
+    pub(crate) visible_end_shared: Arc<AtomicUsize>,
 
     /// スクロールオフセット（行境界にスナップ済み）。自前管理する
     pub(crate) scroll_offset_y: f32,
@@ -612,6 +615,7 @@ impl Default for App {
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
             scroll_hint: Arc::new(AtomicUsize::new(0)),
+            visible_end_shared: Arc::new(AtomicUsize::new(0)),
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
@@ -1640,6 +1644,7 @@ impl App {
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
         let keep_start_shared = Arc::clone(&self.keep_start_shared);
         let keep_end_shared = Arc::clone(&self.keep_end_shared);
+        let visible_end_shared = Arc::clone(&self.visible_end_shared);
 
         crate::logger::log(format!(
             "  spawning {} regular + {} I/O workers",
@@ -1659,6 +1664,7 @@ impl App {
             let stats_w = Arc::clone(&stats);
             let ks_w = Arc::clone(&keep_start_shared);
             let ke_w = Arc::clone(&keep_end_shared);
+            let ve_w = Arc::clone(&visible_end_shared);
             let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
@@ -1675,14 +1681,12 @@ impl App {
                             }
                             if !q.is_empty() {
                                 let vis = hint_w.load(Ordering::Relaxed);
+                                let vis_end = ve_w.load(Ordering::Relaxed);
                                 let best = q
                                     .iter()
                                     .enumerate()
                                     .min_by_key(|(_, r)| {
-                                        let tier: usize = if r.priority { 0 } else { 1 };
-                                        let i = r.idx;
-                                        let dist = if i < vis { vis - i } else { i - vis };
-                                        (tier, dist)
+                                        crate::thumb_loader::worker_priority_key(r.priority, r.idx, vis, vis_end)
                                     })
                                     .map(|(pos, _)| pos)
                                     .unwrap();
@@ -3449,29 +3453,35 @@ impl App {
                 .map(|p| image_indices[p])
                 .collect();
 
-        // 前方優先（+1, +2, … , -1, -2, …）の順で起動する
-        let forward_targets = (1..=pf_forward)
-            .map(|d| pos + d)
-            .filter(|&p| p < n)
-            .map(|p| image_indices[p]);
-        let back_targets = (1..=pf_back)
-            .map(|d| pos.wrapping_sub(d))
-            .filter(|&p| p < n) // wrapping_sub で usize がラップした場合も除外
-            .map(|p| image_indices[p]);
-        let prefetch_targets: Vec<usize> = forward_targets.chain(back_targets).collect();
+        let prefetch_targets: Vec<usize> =
+            interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
 
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
 
-        // KEEP 範囲外の読み込みをキャンセル・破棄
+        // 現在表示中の画像がまだデコード中 (fs_cache に入っていない) なら、
+        // その画像に CPU を独占させるため他の pending をすべてキャンセルする。
+        // 現在画像が完了したあと poll_prefetch から再度 update_prefetch_window が
+        // 呼ばれ、そこで先読みが開始される。これにより 1→2 遷移 (サムネ → フル解像度) が
+        // 先読みスレッドに待たされなくなる。
+        let current_loading = !self.fs_cache.contains_key(&current_idx);
+
         let to_cancel: Vec<usize> = self.fs_pending.keys()
-            .filter(|k| !keep_set.contains(k))
+            .filter(|&&k| {
+                if k == current_idx { return false; }
+                // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
+                current_loading || !keep_set.contains(&k)
+            })
             .cloned()
             .collect();
         for k in to_cancel {
             if let Some((cancel, _)) = self.fs_pending.remove(&k) {
                 cancel.store(true, Ordering::Relaxed);
             }
+        }
+
+        if current_loading {
+            return;
         }
 
         // まだキャッシュにも pending にもない先読み対象を読み込み開始
@@ -3976,13 +3986,7 @@ impl App {
         let n = image_indices.len();
         let pf_back = self.settings.ai_upscale_prefetch_back;
         let pf_forward = self.settings.ai_upscale_prefetch_forward;
-        (1..=pf_forward)
-            .filter_map(|d| pos.checked_add(d).filter(|&p| p < n).map(|p| image_indices[p]))
-            .chain(
-                (1..=pf_back)
-                    .filter_map(|d| pos.checked_sub(d).map(|p| image_indices[p]))
-            )
-            .collect()
+        interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back)
     }
 
     /// AI アップスケールの先読み（表示中画像の前後）。
@@ -4290,6 +4294,9 @@ impl App {
             self.fs_cache.insert(key, entry);
             // 保存済みマスクがあれば自動で inpaint 適用
             self.auto_apply_saved_mask(ctx, key);
+            if self.fullscreen_idx == Some(key) {
+                self.update_prefetch_window(key);
+            }
         }
         if repaint {
             ctx.request_repaint();
@@ -5054,6 +5061,35 @@ impl eframe::App for App {
 // -----------------------------------------------------------------------
 // セル描画
 // -----------------------------------------------------------------------
+
+/// 先読み対象を距離順・forward 先で交互配置: +1, -1, +2, -2, +3, -3, …
+/// 同距離の組では forward (次ページ方向) が先。片側が尽きたら反対側だけ続く。
+/// fs_cache / AI アップスケール / サムネイルグリッド の全先読みで方針統一。
+fn interleaved_prefetch_targets(
+    image_indices: &[usize],
+    pos: usize,
+    n: usize,
+    pf_forward: usize,
+    pf_back: usize,
+) -> Vec<usize> {
+    let max_d = pf_forward.max(pf_back);
+    let mut out = Vec::with_capacity(pf_forward + pf_back);
+    for d in 1..=max_d {
+        if d <= pf_forward {
+            if let Some(p) = pos.checked_add(d) {
+                if p < n {
+                    out.push(image_indices[p]);
+                }
+            }
+        }
+        if d <= pf_back {
+            if let Some(p) = pos.checked_sub(d) {
+                out.push(image_indices[p]);
+            }
+        }
+    }
+    out
+}
 
 /// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
 fn make_load_request(

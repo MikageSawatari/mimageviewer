@@ -32,6 +32,7 @@
 | `cancel_token` | `Arc<AtomicBool>` | UI (フォルダ切替) | 全ワーカー | 停止シグナル |
 | `scroll_hint` | `Arc<AtomicUsize>` | UI (スクロール) | サムネワーカー | 優先度計算の基準 |
 | `keep_start_shared` / `keep_end_shared` | `Arc<AtomicUsize>` | UI | サムネワーカー | 範囲外の要求を破棄する境界 |
+| `visible_end_shared` | `Arc<AtomicUsize>` | UI | サムネワーカー | 可視範囲の終端 (exclusive)。先読み forward 側の距離計算に使用 |
 | `display_px_shared` | `Arc<AtomicU32>` | UI (設定変更) | サムネワーカー | 生成時の目標ピクセル数 |
 | `cache_gen_done` | `Arc<AtomicUsize>` | キャッシュ生成 rayon | UI | 進捗カウンタ |
 
@@ -55,7 +56,11 @@
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile/PdfFile 要求 |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
 
-ワーカーが要求を取り出すときは **優先度 (priority フラグ) → `scroll_hint` からの距離** でソート。
+ワーカーが要求を取り出すときは **優先度 (priority フラグ) → 距離 → forward/backward** でソート。
+距離計算は可視範囲の端からの歩数: backward は `scroll_hint - idx`, forward は `idx - visible_end + 1`
+で、同距離では forward (次ページ方向) が先。これは `fs_cache` 先読み / AI アップスケール先読み /
+サムネイルグリッドワーカーの全てで統一されており、`+1, -1, +2, -2, ...` の順 (forward 先) となる
+(共通ヘルパ: `interleaved_prefetch_targets`)。
 
 ---
 
@@ -78,6 +83,21 @@
 1 枚ごとに `Arc<AtomicBool>` を `fs_pending[idx]` / `ai_upscale_pending[idx]` に持たせる。
 要求を取り下げるときは個別にこのフラグを立てる。
 ワーカーは大きな処理の合間 (タイル推論の各タイル、フレームデコード直後、など) でフラグを確認する。
+
+### 3.3 フルスクリーン読み込みの優先度制御
+
+`start_fs_load` はプールを持たない使い捨て `std::thread::spawn` なので、素朴に先読みを
+並列起動すると現在表示中の画像のデコードが先読みスレッドに CPU を奪われて遅延する。
+これを防ぐため `update_prefetch_window` は以下のルールで動く:
+
+1. 現在画像が `fs_cache` に入っていない (デコード中) 間は、**他の全ての pending スレッドを
+   キャンセル**する (KEEP 範囲内でも)。現在画像が CPU を独占する。
+2. 同時に、先読みの新規 spawn も **延期**する。
+3. `poll_prefetch` が現在画像の完了を検出したら、再度 `update_prefetch_window` を呼び、
+   そこで初めて先読みが起動する。
+
+AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1 枚のみで、現在画像が
+来たら古い先読みをキャンセル。
 
 ### 3.3 新ワーカー追加時のテンプレ
 

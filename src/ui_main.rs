@@ -874,7 +874,7 @@ impl App {
                         let last_row =
                             ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
 
-                        // Phase 2b ワーカーへ現在の可視先頭アイテムを通知
+                        // Phase 2b ワーカーへ現在の可視先頭/終端アイテムを通知
                         let vis_first_idx = self
                             .visible_indices
                             .get(first_row * cols)
@@ -882,6 +882,20 @@ impl App {
                             .unwrap_or(0);
                         self.scroll_hint
                             .store(vis_first_idx, Ordering::Relaxed);
+                        // 可視範囲の終端 (exclusive)。先読みの forward 側距離計算に使う。
+                        // last_row は exclusive、可視セルの最後の位置は (last_row*cols - 1) だが
+                        // 末尾の行は半分しか埋まっていない場合があるので visible_indices.len() で clamp。
+                        let last_pos_inclusive = (last_row * cols)
+                            .saturating_sub(1)
+                            .min(self.visible_indices.len().saturating_sub(1));
+                        let vis_end_idx = self
+                            .visible_indices
+                            .get(last_pos_inclusive)
+                            .copied()
+                            .map(|i| i + 1)
+                            .unwrap_or(vis_first_idx);
+                        self.visible_end_shared
+                            .store(vis_end_idx, Ordering::Relaxed);
 
                         for row in first_row..last_row {
                             for col in 0..cols {

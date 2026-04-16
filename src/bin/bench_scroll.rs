@@ -450,6 +450,7 @@ fn run_bench(
     // 共有状態
     let cancel = Arc::new(AtomicBool::new(false));
     let scroll_hint = Arc::new(AtomicUsize::new(0));
+    let visible_end_shared = Arc::new(AtomicUsize::new(0));
     let display_px_shared = Arc::new(AtomicU32::new(512));
     let keep_start_shared = Arc::new(AtomicUsize::new(0));
     let keep_end_shared = Arc::new(AtomicUsize::new(0));
@@ -487,6 +488,7 @@ fn run_bench(
         let stats_w = Arc::clone(&stats);
         let ks_w = Arc::clone(&keep_start_shared);
         let ke_w = Arc::clone(&keep_end_shared);
+        let ve_w = Arc::clone(&visible_end_shared);
 
         std::thread::spawn(move || {
             loop {
@@ -497,15 +499,11 @@ fn run_bench(
                         None
                     } else {
                         let vis = hint_w.load(Ordering::Relaxed);
+                        let vis_end = ve_w.load(Ordering::Relaxed);
                         let best = q
                             .iter()
                             .enumerate()
-                            .min_by_key(|(_, r)| {
-                                let tier: usize = if r.priority { 0 } else { 1 };
-                                let i = r.idx;
-                                let dist = if i < vis { vis - i } else { i - vis };
-                                (tier, dist)
-                            })
+                            .min_by_key(|(_, r)| mimageviewer::thumb_loader::worker_priority_key(r.priority, r.idx, vis, vis_end))
                             .map(|(pos, _)| pos)
                             .unwrap();
                         Some(q.swap_remove(best))
@@ -564,6 +562,7 @@ fn run_bench(
         let keep_end = (vis_first + (1 + next_pages) * items_per_page).min(total);
 
         scroll_hint.store(vis_first, Ordering::Relaxed);
+        visible_end_shared.store(vis_end, Ordering::Relaxed);
         keep_start_shared.store(keep_start, Ordering::Relaxed);
         keep_end_shared.store(keep_end, Ordering::Relaxed);
 

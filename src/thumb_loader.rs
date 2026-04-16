@@ -14,6 +14,29 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 // -----------------------------------------------------------------------
+// ワーカーキュー優先度
+// -----------------------------------------------------------------------
+
+/// ワーカーキューの優先度キー。可視範囲を最優先、先読みは距離順 (近い方から)、
+/// 同距離では forward が先。サムネイルワーカー本体と bench で共有する。
+/// 返り値は `(tier, distance, direction)` の tuple で、辞書順で小さいほど優先。
+pub fn worker_priority_key(
+    priority: bool,
+    idx: usize,
+    vis: usize,
+    vis_end: usize,
+) -> (usize, usize, usize) {
+    if priority {
+        let d = if idx < vis { vis - idx } else { idx - vis };
+        (0, d, 0)
+    } else if idx >= vis_end {
+        (1, idx - vis_end + 1, 0)
+    } else {
+        (1, vis.saturating_sub(idx), 1)
+    }
+}
+
+// -----------------------------------------------------------------------
 // キャッシュキー定数 (app.rs / ベンチマーク bin から参照)
 // -----------------------------------------------------------------------
 
