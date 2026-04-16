@@ -29,6 +29,7 @@
         <a href="grid.html">グリッド表示</a>
         <a href="fullscreen.html">フルスクリーン表示</a>
         <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
         <a href="shortcuts.html" class="active">キーボードショートカット</a>
         <a href="settings.html">設定リファレンス</a>
         <a href="formats.html">対応フォーマット</a>
@@ -180,7 +181,7 @@
           <tr><td><kbd>L</kbd></td><td>左に 90° 回転</td></tr>
           <tr><td><kbd>F1</kbd>〜<kbd>F5</kbd></td><td>表示中の画像に★1〜★5 のレーティングを付与</td></tr>
           <tr><td><kbd>F6</kbd></td><td>レーティングを解除</td></tr>
-          <tr><td><kbd>E</kbd></td><td>消しゴムモード ON（マスク指定）/ AI 補完実行</td></tr>
+          <tr><td><kbd>E</kbd></td><td>消しゴムモード ON（マスク指定）/ AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
           <tr><td><kbd>I</kbd> / <kbd>Tab</kbd></td><td>メタデータパネルの固定表示切り替え</td></tr>
           <tr><td><kbd>P</kbd></td><td>スライドショー 再生 / 停止</td></tr>
           <tr><td><kbd>Space</kbd></td><td>スライドショー再生中：停止 ／ 停止中：チェック ON/OFF</td></tr>
@@ -306,6 +307,60 @@
           <tr><td><kbd>Alt</kbd> + 右クリック</td><td>×10</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd> + 右クリック</td><td>×20</td></tr>
           <tr><td>右クリック（修飾キーなし）</td><td>フィルター解除</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>消しゴムモード</h2>
+    <p><kbd>E</kbd> キーで開始。モード中は通常のフルスクリーンショートカットは無効化され、以下の専用キーのみ有効です。
+    詳細は <a href="erase.html">消しゴムモード</a> ページを参照してください。</p>
+
+    <h3>モード操作・ツール切替</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>E</kbd></td><td>開始 / AI 補完実行（2 回目）</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>消しゴムモード終了（フルスクリーンは継続、マスクは自動保存）</td></tr>
+          <tr><td><kbd>B</kbd></td><td>筆ツール</td></tr>
+          <tr><td><kbd>L</kbd></td><td>囲みツール</td></tr>
+          <tr><td><kbd>V</kbd></td><td>縦線ツール</td></tr>
+          <tr><td><kbd>H</kbd></td><td>横線ツール</td></tr>
+          <tr><td><kbd>I</kbd></td><td>直線ツール</td></tr>
+          <tr><td><kbd>D</kbd> / <kbd>F</kbd></td><td>描画モード / 消去モードに切替</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo（最大 20 手）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>マスクスロット</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>1</kbd> / <kbd>2</kbd></td><td>スロット 1 / 2 のマスクをロード（現在のマスクに OR マージ）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>1</kbd> / <kbd>Shift</kbd>+<kbd>2</kbd></td><td>現在のマスクをスロット 1 / 2 に保存</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>マウス操作</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>左ドラッグ</td><td>選択中ツールでマスク描画／消去</td></tr>
+          <tr><td>マウスホイール</td><td>筆・直線ツール時は太さ変更（その他ツール時は無効）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+ホイール</td><td>画像ズーム</td></tr>
+          <tr><td><kbd>Shift</kbd>+ドラッグ（筆・直線）</td><td>太さ変更（右／下＝拡大、左／上＝縮小）</td></tr>
+          <tr><td><kbd>Shift</kbd>+ドラッグ（縦線）</td><td>左右＝線をパン、上下＝線を回転（傾き調整）</td></tr>
+          <tr><td><kbd>Shift</kbd>+ドラッグ（横線）</td><td>上下＝線をパン、左右＝線を回転（傾き調整）</td></tr>
         </tbody>
       </table>
     </div>
