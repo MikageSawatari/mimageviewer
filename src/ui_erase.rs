@@ -735,17 +735,11 @@ impl App {
             result.clone(),
             egui::TextureOptions::LINEAR,
         );
-        if self.ai_upscale_cache.contains_key(&fs_idx) {
-            self.ai_upscale_cache.insert(fs_idx, FsCacheEntry::Static {
-                tex,
-                pixels: Arc::new(result),
-            });
-        } else {
-            self.fs_cache.insert(fs_idx, FsCacheEntry::Static {
-                tex,
-                pixels: Arc::new(result),
-            });
-        }
+        self.fs_cache.insert(fs_idx, FsCacheEntry::Static {
+            tex,
+            pixels: Arc::new(result),
+        });
+        self.invalidate_derived_fs_caches(fs_idx);
         self.reset_erase_mode();
         crate::logger::log("erase: inpaint complete".to_string());
     }
@@ -801,14 +795,18 @@ impl App {
             tex,
             pixels: Arc::new(result),
         });
+        self.invalidate_derived_fs_caches(idx);
+    }
 
-        // AI アップスケールのキャッシュをクリアして、inpaint後の画像で再処理させる
+    /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正) の
+    /// キャッシュを無効化して、新しい元画像で再処理させる。
+    /// 処理中の AI タスクがあればキャンセル。
+    pub(crate) fn invalidate_derived_fs_caches(&mut self, idx: usize) {
         self.ai_upscale_cache.remove(&idx);
         self.ai_upscale_failed.remove(&idx);
         if let Some((cancel, _)) = self.ai_upscale_pending.remove(&idx) {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        // 補正キャッシュもクリア
         self.adjustment_cache.remove(&idx);
         self.adjustment_sharpened.remove(&idx);
     }
