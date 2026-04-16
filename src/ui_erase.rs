@@ -8,7 +8,7 @@
 use eframe::egui;
 use std::sync::Arc;
 
-use crate::app::{App, EraseTool};
+use crate::app::{App, EraseTool, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
 use crate::ui_fullscreen::FsKeyAction;
 
@@ -59,8 +59,7 @@ impl App {
         self.erase_line_start = None;
         self.erase_line_end = None;
         self.erase_line_tilt = 0.0;
-        self.erase_shift_drag_origin = None;
-        self.erase_shift_line_base = None;
+        self.erase_shift_drag = None;
         self.erase_paint_mode = true;
         self.erase_undo_stack.clear();
 
@@ -94,26 +93,23 @@ impl App {
         self.erase_line_start = None;
         self.erase_line_end = None;
         self.erase_line_tilt = 0.0;
-        self.erase_shift_drag_origin = None;
-        self.erase_shift_line_base = None;
+        self.erase_shift_drag = None;
         self.erase_undo_stack.clear();
     }
 
     // ── Undo / Slot ────────────────────────────────────────────────
 
-    /// 現在のマスクを Undo スタックに push する。paint 操作の直前に呼ぶ。
     pub(crate) fn push_undo_snapshot(&mut self) {
         if let Some(mask) = &self.erase_mask {
-            self.erase_undo_stack.push(mask.clone());
+            self.erase_undo_stack.push_back(mask.clone());
             while self.erase_undo_stack.len() > UNDO_MAX {
-                self.erase_undo_stack.remove(0);
+                self.erase_undo_stack.pop_front();
             }
         }
     }
 
-    /// Undo スタックから pop してマスクを復元する。
     pub(crate) fn undo_erase(&mut self) -> bool {
-        if let Some(prev) = self.erase_undo_stack.pop() {
+        if let Some(prev) = self.erase_undo_stack.pop_back() {
             self.erase_mask = Some(prev);
             self.erase_mask_texture = None;
             true
@@ -244,55 +240,39 @@ impl App {
             self.show_feedback_toast("[消去モード]".to_string());
         }
 
-        // 他の通常ショートカット (矢印、R/L 回転、I、Z、P、Tab、Space 等) は
-        // まだ consume されていない。erase_mode では誰にも処理されないよう明示的に
-        // 消費する。マウスイベントはクリアしない (ペイント入力に必要)。
+        // erase_mode 中は通常のフルスクリーンショートカットを無効化するため、
+        // ここで未使用キーを明示的に消費する (マウスイベントはペイントに必要なため除外)。
+        const NAV_KEYS: &[egui::Key] = &[
+            egui::Key::ArrowRight, egui::Key::ArrowLeft,
+            egui::Key::ArrowUp, egui::Key::ArrowDown,
+        ];
+        const SINGLE_KEYS: &[egui::Key] = &[
+            egui::Key::Space, egui::Key::Tab,
+            egui::Key::I, egui::Key::R, egui::Key::Z,
+            egui::Key::G, egui::Key::M, egui::Key::P,
+            egui::Key::U, egui::Key::N,
+            egui::Key::F1, egui::Key::F2, egui::Key::F3,
+            egui::Key::F4, egui::Key::F5, egui::Key::F6,
+        ];
+        // 将来のスロット拡張を見据えて未割当の数字キーも消費
+        const NUM_KEYS: &[egui::Key] = &[
+            egui::Key::Num3, egui::Key::Num4, egui::Key::Num5,
+            egui::Key::Num6, egui::Key::Num7, egui::Key::Num8,
+            egui::Key::Num9, egui::Key::Num0,
+        ];
         ctx.input_mut(|i| {
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
-            let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight);
-            let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft);
-            let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp);
-            let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Space);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::I);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::R);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Z);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::G);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::M);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::P);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::U);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::N);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::F1);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::F2);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::F4);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::F5);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::F6);
-            // Num3-9/0 も消費 (将来のスロット拡張を見据えて)
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num3);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num4);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num5);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num6);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num7);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num8);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num9);
-            let _ = i.consume_key(egui::Modifiers::NONE, egui::Key::Num0);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num3);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num4);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num5);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num6);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num7);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num8);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num9);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num0);
+            for &k in NAV_KEYS {
+                for &m in &[egui::Modifiers::NONE, egui::Modifiers::SHIFT, egui::Modifiers::CTRL] {
+                    let _ = i.consume_key(m, k);
+                }
+            }
+            for &k in SINGLE_KEYS {
+                let _ = i.consume_key(egui::Modifiers::NONE, k);
+            }
+            for &k in NUM_KEYS {
+                let _ = i.consume_key(egui::Modifiers::NONE, k);
+                let _ = i.consume_key(egui::Modifiers::SHIFT, k);
+            }
         });
 
         action
@@ -518,23 +498,24 @@ impl App {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
                             if shift_held {
-                                // Shift+ドラッグ: 起点からの移動量でブラシ半径を調整
                                 // 右/下方向で拡大、左/上方向で縮小
-                                if self.erase_shift_drag_origin.is_none() {
-                                    self.erase_shift_drag_origin = Some((img_pos.0, img_pos.1, self.erase_brush_radius, 0.0));
-                                }
-                                if let Some((ox, oy, base_radius, _)) = self.erase_shift_drag_origin {
-                                    let dx = img_pos.0 - ox;
-                                    let dy = img_pos.1 - oy;
-                                    // X と Y の移動量を合算 (右/下=拡大、左/上=縮小)
-                                    let delta = dx + dy;
+                                let base_radius = match self.erase_shift_drag {
+                                    Some(ShiftDragState::BrushSize { base_radius, .. }) => base_radius,
+                                    _ => {
+                                        self.erase_shift_drag = Some(ShiftDragState::BrushSize {
+                                            origin: img_pos,
+                                            base_radius: self.erase_brush_radius,
+                                        });
+                                        self.erase_brush_radius
+                                    }
+                                };
+                                if let Some(ShiftDragState::BrushSize { origin, .. }) = self.erase_shift_drag {
+                                    let delta = (img_pos.0 - origin.0) + (img_pos.1 - origin.1);
                                     let max_r = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
                                     self.erase_brush_radius = (base_radius + delta).clamp(1.0, max_r);
                                 }
-                                // Shift 中はペイントしない
                             } else {
-                                // 通常のブラシ描画
-                                self.erase_shift_drag_origin = None;
+                                self.erase_shift_drag = None;
                                 if self.erase_last_paint_pos.is_none() {
                                     self.push_undo_snapshot();
                                 }
@@ -548,7 +529,7 @@ impl App {
                     }
                 } else {
                     self.erase_last_paint_pos = None;
-                    self.erase_shift_drag_origin = None;
+                    self.erase_shift_drag = None;
                 }
             }
             EraseTool::Lasso => {
@@ -578,136 +559,16 @@ impl App {
                 }
             }
             EraseTool::VertLine => {
-                if primary_down {
-                    if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
-                            if self.erase_line_start.is_none() {
-                                self.erase_line_start = Some(img_pos);
-                                self.erase_line_tilt = 0.0;
-                            }
-                            if shift_held {
-                                // Shift+ドラッグ: 幅は固定、左右=パン、上下=回転
-                                // 初回は起点と基準線を記録
-                                if self.erase_shift_drag_origin.is_none() {
-                                    self.erase_shift_drag_origin = Some((
-                                        img_pos.0, img_pos.1, self.erase_line_tilt, 0.0,
-                                    ));
-                                    self.erase_shift_line_base = Some((
-                                        self.erase_line_start.unwrap_or(img_pos),
-                                        self.erase_line_end.unwrap_or(img_pos),
-                                    ));
-                                }
-                                if let (Some((ox, oy, base_tilt, _)),
-                                        Some((base_start, base_end))) =
-                                        (self.erase_shift_drag_origin, self.erase_shift_line_base)
-                                {
-                                    let dx = img_pos.0 - ox;
-                                    let dy = img_pos.1 - oy;
-                                    // 左右ドラッグ (dx) で水平パン: x0, x1 を同じ量シフト
-                                    self.erase_line_start = Some((base_start.0 + dx, base_start.1));
-                                    self.erase_line_end = Some((base_end.0 + dx, base_end.1));
-                                    // 上下ドラッグ (dy) で傾きを更新
-                                    self.erase_line_tilt = base_tilt + dy;
-                                }
-                            } else {
-                                // Shift 解除状態: 通常の幅変更ドラッグ。shift 用の状態をクリア
-                                self.erase_shift_drag_origin = None;
-                                self.erase_shift_line_base = None;
-                                self.erase_line_end = Some(img_pos);
-                            }
-                        }
-                    }
-                }
-                if primary_released {
-                    if let (Some((x0, _)), Some((x1, _))) = (self.erase_line_start, self.erase_line_end) {
-                        let [w, h] = self.erase_mask_size;
-                        let lx = x0.min(x1).max(0.0);
-                        let rx = x0.max(x1).ceil().min(w as f32);
-                        let tilt = self.erase_line_tilt;
-                        self.push_undo_snapshot();
-                        if tilt.abs() < 0.5 {
-                            self.paint_rect(lx as usize, 0, rx as usize, h, paint);
-                        } else {
-                            let pts = vec![
-                                (lx + tilt, 0.0),
-                                (rx + tilt, 0.0),
-                                (rx, h as f32),
-                                (lx, h as f32),
-                            ];
-                            self.paint_polygon(&pts, paint);
-                        }
-                    }
-                    self.erase_line_start = None;
-                    self.erase_line_end = None;
-                    self.erase_line_tilt = 0.0;
-                    self.erase_shift_drag_origin = None;
-                    self.erase_shift_line_base = None;
-                }
+                self.handle_line_tool_paint(
+                    primary_down, primary_released, pointer_pos, shift_held, paint,
+                    full_rect, zoom_pan, true,
+                );
             }
             EraseTool::HorizLine => {
-                if primary_down {
-                    if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
-                            if self.erase_line_start.is_none() {
-                                self.erase_line_start = Some(img_pos);
-                                self.erase_line_tilt = 0.0;
-                            }
-                            if shift_held {
-                                // Shift+ドラッグ: 高さは固定、上下=パン、左右=回転
-                                if self.erase_shift_drag_origin.is_none() {
-                                    self.erase_shift_drag_origin = Some((
-                                        img_pos.0, img_pos.1, self.erase_line_tilt, 0.0,
-                                    ));
-                                    self.erase_shift_line_base = Some((
-                                        self.erase_line_start.unwrap_or(img_pos),
-                                        self.erase_line_end.unwrap_or(img_pos),
-                                    ));
-                                }
-                                if let (Some((ox, oy, base_tilt, _)),
-                                        Some((base_start, base_end))) =
-                                        (self.erase_shift_drag_origin, self.erase_shift_line_base)
-                                {
-                                    let dx = img_pos.0 - ox;
-                                    let dy = img_pos.1 - oy;
-                                    // 上下ドラッグ (dy) で垂直パン
-                                    self.erase_line_start = Some((base_start.0, base_start.1 + dy));
-                                    self.erase_line_end = Some((base_end.0, base_end.1 + dy));
-                                    // 左右ドラッグ (dx) で傾き
-                                    self.erase_line_tilt = base_tilt + dx;
-                                }
-                            } else {
-                                self.erase_shift_drag_origin = None;
-                                self.erase_shift_line_base = None;
-                                self.erase_line_end = Some(img_pos);
-                            }
-                        }
-                    }
-                }
-                if primary_released {
-                    if let (Some((_, y0)), Some((_, y1))) = (self.erase_line_start, self.erase_line_end) {
-                        let [w, h] = self.erase_mask_size;
-                        let ty = y0.min(y1).max(0.0);
-                        let by = y0.max(y1).ceil().min(h as f32);
-                        let tilt = self.erase_line_tilt;
-                        self.push_undo_snapshot();
-                        if tilt.abs() < 0.5 {
-                            self.paint_rect(0, ty as usize, w, by as usize, paint);
-                        } else {
-                            let pts = vec![
-                                (0.0, ty),
-                                (w as f32, ty + tilt),
-                                (w as f32, by + tilt),
-                                (0.0, by),
-                            ];
-                            self.paint_polygon(&pts, paint);
-                        }
-                    }
-                    self.erase_line_start = None;
-                    self.erase_line_end = None;
-                    self.erase_line_tilt = 0.0;
-                    self.erase_shift_drag_origin = None;
-                    self.erase_shift_line_base = None;
-                }
+                self.handle_line_tool_paint(
+                    primary_down, primary_released, pointer_pos, shift_held, paint,
+                    full_rect, zoom_pan, false,
+                );
             }
             EraseTool::Line => {
                 if primary_down {
@@ -759,6 +620,106 @@ impl App {
                     self.erase_line_end = None;
                 }
             }
+        }
+    }
+
+    /// 縦線/横線ツール共通の入力処理。is_vertical=true で縦線、false で横線。
+    /// Shift+ドラッグでは線の向きに沿った軸がパン、直交軸が回転になる。
+    fn handle_line_tool_paint(
+        &mut self,
+        primary_down: bool,
+        primary_released: bool,
+        pointer_pos: Option<egui::Pos2>,
+        shift_held: bool,
+        paint: bool,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        is_vertical: bool,
+    ) {
+        if primary_down {
+            if let Some(pos) = pointer_pos {
+                if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                    if self.erase_line_start.is_none() {
+                        self.erase_line_start = Some(img_pos);
+                        self.erase_line_tilt = 0.0;
+                    }
+                    if shift_held {
+                        let (base_tilt, base_start, base_end) = match self.erase_shift_drag {
+                            Some(ShiftDragState::LineAdjust { base_tilt, base_start, base_end, .. }) => {
+                                (base_tilt, base_start, base_end)
+                            }
+                            _ => {
+                                let start = self.erase_line_start.unwrap_or(img_pos);
+                                let end = self.erase_line_end.unwrap_or(img_pos);
+                                self.erase_shift_drag = Some(ShiftDragState::LineAdjust {
+                                    origin: img_pos,
+                                    base_tilt: self.erase_line_tilt,
+                                    base_start: start,
+                                    base_end: end,
+                                });
+                                (self.erase_line_tilt, start, end)
+                            }
+                        };
+                        if let Some(ShiftDragState::LineAdjust { origin, .. }) = self.erase_shift_drag {
+                            let dx = img_pos.0 - origin.0;
+                            let dy = img_pos.1 - origin.1;
+                            // 縦線: 向きに沿う軸 (Y) に沿ったドラッグは幅を変えず、直交する X ドラッグでパン・Y ドラッグで回転
+                            // 横線: X/Y が入れ替わる
+                            let (pan_x, pan_y, tilt_delta) = if is_vertical {
+                                (dx, 0.0, dy)
+                            } else {
+                                (0.0, dy, dx)
+                            };
+                            self.erase_line_start = Some((base_start.0 + pan_x, base_start.1 + pan_y));
+                            self.erase_line_end = Some((base_end.0 + pan_x, base_end.1 + pan_y));
+                            self.erase_line_tilt = base_tilt + tilt_delta;
+                        }
+                    } else {
+                        self.erase_shift_drag = None;
+                        self.erase_line_end = Some(img_pos);
+                    }
+                }
+            }
+        }
+        if primary_released {
+            if let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) {
+                let [w, h] = self.erase_mask_size;
+                let tilt = self.erase_line_tilt;
+                self.push_undo_snapshot();
+                if is_vertical {
+                    let lx = start.0.min(end.0).max(0.0);
+                    let rx = start.0.max(end.0).ceil().min(w as f32);
+                    if tilt.abs() < 0.5 {
+                        self.paint_rect(lx as usize, 0, rx as usize, h, paint);
+                    } else {
+                        let pts = vec![
+                            (lx + tilt, 0.0),
+                            (rx + tilt, 0.0),
+                            (rx, h as f32),
+                            (lx, h as f32),
+                        ];
+                        self.paint_polygon(&pts, paint);
+                    }
+                } else {
+                    let ty = start.1.min(end.1).max(0.0);
+                    let by = start.1.max(end.1).ceil().min(h as f32);
+                    if tilt.abs() < 0.5 {
+                        self.paint_rect(0, ty as usize, w, by as usize, paint);
+                    } else {
+                        let pts = vec![
+                            (0.0, ty),
+                            (w as f32, ty + tilt),
+                            (w as f32, by + tilt),
+                            (0.0, by),
+                        ];
+                        self.paint_polygon(&pts, paint);
+                    }
+                }
+            }
+            self.erase_line_start = None;
+            self.erase_line_end = None;
+            self.erase_line_tilt = 0.0;
+            self.erase_shift_drag = None;
         }
     }
 
@@ -837,60 +798,10 @@ impl App {
                 }
             }
             EraseTool::VertLine => {
-                if let (Some((x0, _)), Some((x1, _))) = (self.erase_line_start, self.erase_line_end) {
-                    let [_w, h] = self.erase_mask_size;
-                    let lx = x0.min(x1);
-                    let rx = x0.max(x1);
-                    let tilt = self.erase_line_tilt;
-                    if tilt.abs() < 0.5 {
-                        let p0 = self.image_to_screen(lx, 0.0, full_rect, zoom_pan);
-                        let p1 = self.image_to_screen(rx, h as f32, full_rect, zoom_pan);
-                        let rect = egui::Rect::from_min_max(p0, p1);
-                        ui.painter().rect_filled(rect, 0.0, color);
-                        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
-                    } else {
-                        // 傾いた平行四辺形
-                        let pts = vec![
-                            self.image_to_screen(lx + tilt, 0.0, full_rect, zoom_pan),
-                            self.image_to_screen(rx + tilt, 0.0, full_rect, zoom_pan),
-                            self.image_to_screen(rx, h as f32, full_rect, zoom_pan),
-                            self.image_to_screen(lx, h as f32, full_rect, zoom_pan),
-                        ];
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            pts,
-                            color,
-                            egui::Stroke::new(1.0, stroke_color),
-                        ));
-                    }
-                }
+                self.draw_line_tool_preview(ui, full_rect, zoom_pan, color, stroke_color, true);
             }
             EraseTool::HorizLine => {
-                if let (Some((_, y0)), Some((_, y1))) = (self.erase_line_start, self.erase_line_end) {
-                    let [w, _h] = self.erase_mask_size;
-                    let ty = y0.min(y1);
-                    let by = y0.max(y1);
-                    let tilt = self.erase_line_tilt;
-                    if tilt.abs() < 0.5 {
-                        let p0 = self.image_to_screen(0.0, ty, full_rect, zoom_pan);
-                        let p1 = self.image_to_screen(w as f32, by, full_rect, zoom_pan);
-                        let rect = egui::Rect::from_min_max(p0, p1);
-                        ui.painter().rect_filled(rect, 0.0, color);
-                        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
-                    } else {
-                        // 傾いた平行四辺形 (左端 (x=0) は ty..by, 右端 (x=w) は ty+tilt..by+tilt)
-                        let pts = vec![
-                            self.image_to_screen(0.0, ty, full_rect, zoom_pan),
-                            self.image_to_screen(w as f32, ty + tilt, full_rect, zoom_pan),
-                            self.image_to_screen(w as f32, by + tilt, full_rect, zoom_pan),
-                            self.image_to_screen(0.0, by, full_rect, zoom_pan),
-                        ];
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            pts,
-                            color,
-                            egui::Stroke::new(1.0, stroke_color),
-                        ));
-                    }
-                }
+                self.draw_line_tool_preview(ui, full_rect, zoom_pan, color, stroke_color, false);
             }
             EraseTool::Line => {
                 if let (Some((x0, y0)), Some((x1, y1))) = (self.erase_line_start, self.erase_line_end) {
@@ -923,6 +834,64 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 縦線/横線ツール共通のプレビュー描画。
+    fn draw_line_tool_preview(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        color: egui::Color32,
+        stroke_color: egui::Color32,
+        is_vertical: bool,
+    ) {
+        let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) else { return };
+        let [w, h] = self.erase_mask_size;
+        let tilt = self.erase_line_tilt;
+
+        // 縦線: y を 0..h で固定し x を drag で決める。横線は X/Y 入れ替え。
+        let (a0, a1, span_min, span_max) = if is_vertical {
+            (start.0.min(end.0), start.0.max(end.0), 0.0f32, h as f32)
+        } else {
+            (start.1.min(end.1), start.1.max(end.1), 0.0f32, w as f32)
+        };
+
+        let corner = |axis: f32, span: f32, tilt_offset: f32| -> egui::Pos2 {
+            if is_vertical {
+                self.image_to_screen(axis + tilt_offset, span, full_rect, zoom_pan)
+            } else {
+                self.image_to_screen(span, axis + tilt_offset, full_rect, zoom_pan)
+            }
+        };
+
+        if tilt.abs() < 0.5 {
+            let p0 = corner(a0, span_min, 0.0);
+            let p1 = corner(a1, span_max, 0.0);
+            let rect = egui::Rect::from_min_max(p0.min(p1), p0.max(p1));
+            ui.painter().rect_filled(rect, 0.0, color);
+            ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
+        } else {
+            // span_min 側は基準、span_max 側に tilt が加わる (is_vertical のとき上端→下端で x が tilt 分だけシフト)
+            let pts = if is_vertical {
+                vec![
+                    corner(a0, span_min, tilt),
+                    corner(a1, span_min, tilt),
+                    corner(a1, span_max, 0.0),
+                    corner(a0, span_max, 0.0),
+                ]
+            } else {
+                vec![
+                    corner(a0, span_min, 0.0),
+                    corner(a0, span_max, tilt),
+                    corner(a1, span_max, tilt),
+                    corner(a1, span_min, 0.0),
+                ]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(
+                pts, color, egui::Stroke::new(1.0, stroke_color),
+            ));
         }
     }
 

@@ -55,6 +55,21 @@ impl Default for EraseTool {
     fn default() -> Self { EraseTool::Brush }
 }
 
+/// Shift+ドラッグ中の基準状態。ドラッグ開始時に記録し、以降のマウス位置との
+/// 差分から操作量を算出する。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ShiftDragState {
+    /// 筆ツール: 起点 + 基準半径。
+    BrushSize { origin: (f32, f32), base_radius: f32 },
+    /// 縦線/横線ツール: 起点 + 基準傾き + 基準の線端点。
+    LineAdjust {
+        origin: (f32, f32),
+        base_tilt: f32,
+        base_start: (f32, f32),
+        base_end: (f32, f32),
+    },
+}
+
 // -----------------------------------------------------------------------
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
 // -----------------------------------------------------------------------
@@ -592,13 +607,8 @@ pub struct App {
     pub(crate) erase_line_tilt: f32,
     /// 直線ツールの幅 (画像ピクセル)。
     pub(crate) erase_line_width: f32,
-    /// Shift+ドラッグの起点 (画像座標) と、変更開始時の基準値。
-    /// - 筆: (origin_x, origin_y, base_radius, 0)
-    /// - 縦線/横線: (origin_x, origin_y, base_tilt, reserved)
-    ///   さらに erase_shift_line_base で線の両端を保存する
-    pub(crate) erase_shift_drag_origin: Option<(f32, f32, f32, f32)>,
-    /// Shift+ドラッグ開始時の縦線/横線の両端 (img_pos)。パン操作の基準。
-    pub(crate) erase_shift_line_base: Option<((f32, f32), (f32, f32))>,
+    /// Shift+ドラッグ中の状態 (None なら未アクティブ)。
+    pub(crate) erase_shift_drag: Option<ShiftDragState>,
     /// 描画モード (true) / 消去モード (false)
     pub(crate) erase_paint_mode: bool,
     /// inpaint 適用前の元画像キャッシュ: item_idx → ピクセルデータ
@@ -607,7 +617,7 @@ pub struct App {
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスクのスナップショット、最大 20 エントリ)
-    pub(crate) erase_undo_stack: Vec<Vec<bool>>,
+    pub(crate) erase_undo_stack: std::collections::VecDeque<Vec<bool>>,
 }
 
 impl Default for App {
@@ -804,12 +814,11 @@ impl Default for App {
             erase_line_end: None,
             erase_line_tilt: 0.0,
             erase_line_width: 0.0, // enter_erase_mode で設定
-            erase_shift_drag_origin: None,
-            erase_shift_line_base: None,
+            erase_shift_drag: None,
             erase_paint_mode: true,
             erase_base_cache: std::collections::HashMap::new(),
             mask_db: crate::mask_db::MaskDb::open().ok(),
-            erase_undo_stack: Vec::new(),
+            erase_undo_stack: std::collections::VecDeque::new(),
         }
     }
 }
