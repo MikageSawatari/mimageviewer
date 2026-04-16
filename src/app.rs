@@ -3544,10 +3544,16 @@ impl App {
 
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
+    ///
+    /// `fs_viewport_shown` はここでは **落とさない**。
+    /// ビューポート自体の非表示化は `keep_fullscreen_viewport_alive` が
+    /// `ViewportCommand::Visible(false)` を送って行い、その直後に
+    /// `fs_viewport_shown` を false にする。ここで先に落とすと
+    /// keep_fullscreen_viewport_alive が「もう非表示済み」と誤判定して
+    /// Visible(false) を送らず、OS 上のウィンドウが残ってしまう。
     pub(crate) fn close_fullscreen(&mut self) {
         self.fullscreen_idx = None;
         self.slideshow_playing = false;
-        self.fs_viewport_shown = false;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
         self.fs_secondary_press_start = None;

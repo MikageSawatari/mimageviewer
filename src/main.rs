@@ -6,6 +6,7 @@ pub mod ai;
 mod app;
 pub mod catalog;
 pub mod data_dir;
+pub mod dwm_transitions;
 pub mod folder_tree;
 pub mod fs_animation;
 pub mod gpu_info;
