@@ -428,6 +428,8 @@ pub struct App {
     pub(crate) fs_viewport_created: bool,
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
+    /// フルスクリーン開始時刻（フォーカス移行のグレース期間用）
+    fs_opened_at: Option<std::time::Instant>,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
     /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
@@ -713,6 +715,7 @@ impl Default for App {
             slideshow_next_at: std::time::Instant::now(),
             fs_viewport_created: false,
             fs_viewport_shown: false,
+            fs_opened_at: None,
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_pan_drag_start: None,
@@ -2749,6 +2752,7 @@ impl App {
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
+        self.fs_opened_at = Some(std::time::Instant::now());
         self.reset_erase_mode();
 
         // ページに個別補正があればトースト表示
@@ -4844,6 +4848,28 @@ impl eframe::App for App {
 
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);
+
+        // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
+        // ボーダーレスウィンドウなので Alt-Tab 等でメインに戻れるが、
+        // そのままだと両方のウィンドウがキー入力を無視して操作不能に見える。
+        // メインにフォーカスが来た = ユーザーがサムネイル一覧に戻りたい意図と解釈し、
+        // フルスクリーンを閉じてメインウィンドウで通常操作を再開する。
+        //
+        // ただし open_fullscreen() 直後はフルスクリーンビューポートへの
+        // ViewportCommand::Focus が反映されるまで数フレームかかるため、
+        // 500ms のグレース期間中はチェックをスキップする。
+        if self.fullscreen_idx.is_some() {
+            let grace_elapsed = self
+                .fs_opened_at
+                .map(|t| t.elapsed().as_millis() > 500)
+                .unwrap_or(true);
+            if grace_elapsed {
+                let main_has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+                if main_has_focus {
+                    self.close_fullscreen();
+                }
+            }
+        }
 
         self.handle_clipboard_shortcuts(ctx);
 
