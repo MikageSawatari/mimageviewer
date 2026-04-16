@@ -253,6 +253,7 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
         items.push(GridItem::PdfPage {
             pdf_path: pdf_path.to_path_buf(),
             page_num: page,
+            content_type: None,
         });
         image_metas.push(Some((mtime, file_size)));
     }
@@ -345,7 +346,7 @@ fn make_load_request(
             cache_key_override: None,
             folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
-        GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
+        GridItem::PdfPage { pdf_path, page_num, .. } => Some(LoadRequest {
             idx,
             path: pdf_path.clone(),
             mtime,

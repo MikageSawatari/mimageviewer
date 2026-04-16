@@ -34,6 +34,9 @@ pub enum GridItem {
         pdf_path: PathBuf,
         /// ページ番号 (0-indexed)
         page_num: u32,
+        /// ページのコンテンツ種別 (ベクター/ラスター)。
+        /// 列挙時は None、フルスクリーンレンダリング完了時に確定。
+        content_type: Option<crate::pdf_loader::PdfPageContentType>,
     },
 }
 

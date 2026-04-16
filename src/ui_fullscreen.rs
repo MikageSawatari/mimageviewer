@@ -9,6 +9,7 @@ use crate::app::App;
 use crate::folder_tree::{navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::pdf_loader::PdfPageContentType;
 use crate::settings::SpreadMode;
 use crate::ui_helpers::{draw_play_icon, format_bytes_small, open_external_player};
 
@@ -173,6 +174,8 @@ struct FsFrameState {
     image_file_size: Option<u64>,
     is_loading: bool,
     fs_load_failed: bool,
+    /// PDF ページのコンテンツ種別 (非 PDF なら None)
+    pdf_content_type: Option<PdfPageContentType>,
 }
 
 /// フルスクリーンのキー入力結果。
@@ -191,11 +194,11 @@ impl App {
         if self.fullscreen_idx.is_some() {
             return; // アクティブなときは render_fullscreen_viewport が担当
         }
-        let fs_builder = egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_visible(false)
-            .with_taskbar(false)
-            .with_inner_size([1.0, 1.0]);
+        // 非表示でもフルスクリーンサイズを維持する。
+        // 1x1 → フルサイズへのリサイズが Visible(true) と同時に発生すると
+        // OS のウィンドウマネージャが中間状態を描画してちらつく。
+        let fs_builder = self.build_fullscreen_viewport_builder()
+            .with_visible(false);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("fullscreen_viewer"),
             fs_builder,
@@ -462,6 +465,7 @@ impl App {
                                 ai_upscale_info,
                                 &mut self.adjustment_mode,
                                 has_page_override,
+                                state.pdf_content_type,
                             );
                             // ホイール/キーで確定した nav_delta を保護
                             if nav_locked { nav_delta = saved_nav; }
@@ -618,10 +622,15 @@ impl App {
         let is_loading =
             !is_video && !is_separator && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
 
+        let pdf_content_type = match self.items.get(fs_idx) {
+            Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+            _ => None,
+        };
+
         FsFrameState {
             is_video, separator_text, video_path, tex, thumb_tex,
             filename, folder_display, image_dims, image_file_size,
-            is_loading, fs_load_failed,
+            is_loading, fs_load_failed, pdf_content_type,
         }
     }
 
@@ -1789,6 +1798,8 @@ impl App {
         adjustment_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         has_page_override: bool,
+        // PDF ページのコンテンツ種別 (非 PDF なら None)
+        pdf_content_type: Option<PdfPageContentType>,
     ) {
         let hover_in_top = ctx
             .input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
@@ -2091,7 +2102,7 @@ impl App {
             ui, bar_rect,
             egui::pos2(next_x - 12.0, bar_rect.center().y),
             filename, image_dims, image_file_size,
-            ai_upscale_info,
+            ai_upscale_info, pdf_content_type,
         );
     }
 }
@@ -2405,9 +2416,21 @@ fn draw_fs_bar_info_text(
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
     ai_upscale_info: Option<(&str, u32, u32)>,
+    pdf_content_type: Option<PdfPageContentType>,
 ) {
     let mut parts: Vec<String> = Vec::new();
     if !filename.is_empty() { parts.push(filename.to_string()); }
+    // PDF コンテンツ種別
+    if let Some(ct) = pdf_content_type {
+        match ct {
+            PdfPageContentType::Raster { w, h } => {
+                parts.push(format!("PDF Raster {w}×{h}"));
+            }
+            PdfPageContentType::Vector => {
+                parts.push("PDF Vector".to_string());
+            }
+        }
+    }
     if let Some((w, h)) = image_dims {
         if let Some((model_name, ai_w, ai_h)) = ai_upscale_info {
             // AI アップスケール情報を表示: "11 × 22 (漫画 44×88)"
