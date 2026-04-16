@@ -2099,7 +2099,12 @@ impl App {
             lines.push(("消去補完済み".to_string(), egui::Color32::from_rgb(180, 140, 255)));
         }
 
-        let prefetch_progress: Option<(usize, usize)> = if is_upscaling {
+        // AI 機能が完全に無効なら先読みバーを出さない。
+        // 以前は AI off でも target があれば「0/N」バーが表示されて
+        // 進捗が進まないように見える UX 不具合があった。
+        let ai_feature_active = self.ai_upscale_enabled || self.ai_denoise_model.is_some();
+
+        let prefetch_progress: Option<(usize, usize)> = if is_upscaling || !ai_feature_active {
             None
         } else {
             let targets = self.ai_prefetch_targets(fs_idx);
@@ -2107,9 +2112,37 @@ impl App {
             if total == 0 {
                 None
             } else {
+                // 「done」の判定: cache 済み / failed / サイズ閾値で skip 確定。
+                // 高解像度スキャン (2048px 超等) は maybe_start_ai_upscale で
+                // should_process に弾かれて AI が走らないが、従来は cache にも
+                // failed にも入らないため「0/N」バーが永久に残った。
+                // ここでサイズを見て「この画像は AI 対象外」と判別できるものは done
+                // 扱いにする。fs_cache に Static が無いものはまだ判定不能なので undone。
+                let upscale_px = self.settings.ai_upscale_skip_px;
+                let denoise_px = self.settings.ai_denoise_skip_px;
+                let upscale_enabled = self.ai_upscale_enabled;
+                let denoise_enabled = self.ai_denoise_model.is_some();
                 let done = targets.iter()
-                    .filter(|&&i| self.ai_upscale_cache.contains_key(&i)
-                        || self.ai_upscale_failed.contains(&i))
+                    .filter(|&&i| {
+                        if self.ai_upscale_cache.contains_key(&i)
+                            || self.ai_upscale_failed.contains(&i)
+                        {
+                            return true;
+                        }
+                        // fs_cache の dims でサイズ閾値判定
+                        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&i) {
+                            let w = pixels.size[0] as u32;
+                            let h = pixels.size[1] as u32;
+                            let upscale_skip = !upscale_enabled
+                                || !crate::ai::upscale::should_process(w, h, upscale_px);
+                            let denoise_skip = !denoise_enabled
+                                || !crate::ai::upscale::should_process(w, h, denoise_px);
+                            if upscale_skip && denoise_skip {
+                                return true;
+                            }
+                        }
+                        false
+                    })
                     .count();
                 (done < total).then_some((done, total))
             }
