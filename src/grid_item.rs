@@ -7,7 +7,7 @@
 //! どちらも純粋なデータ型で、UI 状態や I/O は持たない。
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub enum GridItem {
@@ -99,11 +99,20 @@ impl GridItem {
             GridItem::ZipSeparator { dir_display } => {
                 format!("zipsep::{dir_display}")
             }
-            GridItem::PdfPage { pdf_path, page_num, .. } => {
-                format!("pdf::{}#{}", pdf_path.display(), page_num)
-            }
+            GridItem::PdfPage { pdf_path, page_num, .. } => pdf_page_perf_key(pdf_path, *page_num),
         }
     }
+}
+
+/// PDF ファイル (フォルダ一覧上) 用の perf 相関キー。
+/// `pdf_loader` など GridItem を直接持たない箇所から同じ形式のキーを作るために使う。
+pub fn pdf_file_perf_key(pdf_path: &Path) -> String {
+    format!("pdffile::{}", pdf_path.display())
+}
+
+/// PDF ページ用の perf 相関キー。
+pub fn pdf_page_perf_key(pdf_path: &Path, page_num: u32) -> String {
+    format!("pdf::{}#{}", pdf_path.display(), page_num)
 }
 
 /// PDF ページのカタログキーを生成する。

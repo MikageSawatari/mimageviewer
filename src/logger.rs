@@ -33,16 +33,9 @@ pub fn log(msg: impl AsRef<str>) {
         .map(|s| s.elapsed().as_secs_f64())
         .unwrap_or(0.0);
 
-    // "ThreadId(N)" → "N" に短縮
-    let tid = format!("{:?}", std::thread::current().id());
-    let tid_num = tid
-        .trim_start_matches("ThreadId(")
-        .trim_end_matches(')');
-    let tid_num = if tid_num.parse::<u64>().is_ok() {
-        tid_num.to_owned()
-    } else {
-        "?".to_owned()
-    };
+    let tid_num = current_thread_id_num()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_owned());
 
     if let Some(file) = FILE.get() {
         if let Ok(mut f) = file.lock() {
@@ -54,4 +47,15 @@ pub fn log(msg: impl AsRef<str>) {
             let _ = f.flush();
         }
     }
+}
+
+/// 現在スレッドの ID から数字部分だけを取り出す。
+/// `ThreadId(N)` → `Some(N)`、パースできなければ `None`。
+/// `logger` と `perf` の両方から参照される共通ヘルパ。
+pub fn current_thread_id_num() -> Option<u64> {
+    let tid = format!("{:?}", std::thread::current().id());
+    tid.trim_start_matches("ThreadId(")
+        .trim_end_matches(')')
+        .parse::<u64>()
+        .ok()
 }

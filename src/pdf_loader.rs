@@ -1219,7 +1219,7 @@ pub fn enumerate_pages(
     if pool.worker_count > 0 {
         let req = encode_enumerate_request(pdf_path, password);
         // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
-        let perf_key = format!("pdffile::{}", pdf_path.display());
+        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
         let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key))?;
         return PdfWorkerPool::parse_enumerate_response(&resp);
     }
@@ -1247,7 +1247,7 @@ pub fn render_page(
     }
 
     let perf_enabled = crate::perf::is_enabled();
-    let perf_key = format!("pdf::{}#{}", pdf_path.display(), page_num);
+    let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let t0 = std::time::Instant::now();
 
     let pool = get_pool();
@@ -1341,13 +1341,8 @@ pub fn enumerate_pages_async(
     password: Option<&str>,
 ) -> mpsc::Receiver<std::io::Result<Vec<PdfPageEntry>>> {
     if crate::perf::is_enabled() {
-        crate::perf::event(
-            "pdf",
-            "enumerate_send",
-            Some(&format!("pdffile::{}", pdf_path.display())),
-            0,
-            &[],
-        );
+        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+        crate::perf::event("pdf", "enumerate_send", Some(&perf_key), 0, &[]);
     }
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {

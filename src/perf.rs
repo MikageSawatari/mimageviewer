@@ -80,7 +80,7 @@ pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str
     let Some(file) = FILE.get() else { return };
 
     let t = start.elapsed().as_secs_f64();
-    let tid = thread_id_num();
+    let tid = crate::logger::current_thread_id_num().unwrap_or(0);
 
     // serde_json::Map で構築 → 1 行シリアライズ
     let mut map = serde_json::Map::with_capacity(6 + extras.len());
@@ -122,10 +122,3 @@ pub fn flush() {
     }
 }
 
-fn thread_id_num() -> u64 {
-    let tid = format!("{:?}", std::thread::current().id());
-    tid.trim_start_matches("ThreadId(")
-        .trim_end_matches(')')
-        .parse::<u64>()
-        .unwrap_or(0)
-}

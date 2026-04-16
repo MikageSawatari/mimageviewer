@@ -648,10 +648,6 @@ pub struct App {
     /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
-    /// ワーカーが投入時に使う「現在の input_seq」の共有コピー。
-    /// UI スレッドの `input_seq` 更新と同期して公開し、ワーカー側 (thumb) が
-    /// 自身の処理イベントを発火するときに参照する。
-    pub(crate) input_seq_shared: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for App {
@@ -852,7 +848,6 @@ impl Default for App {
             frame_counter: 0,
             perf_last_flush: None,
             fs_painted_last: None,
-            input_seq_shared: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -873,8 +868,6 @@ impl App {
             self.input_seq = 1;
         }
         self.last_input_at = Some(std::time::Instant::now());
-        self.input_seq_shared
-            .store(self.input_seq, std::sync::atomic::Ordering::Relaxed);
         if crate::perf::is_enabled() {
             crate::perf::event("input", kind, key, self.input_seq, &[]);
         }
