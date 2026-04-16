@@ -1027,9 +1027,16 @@ impl App {
         }
 
         // P: スライドショー開始/停止トグル
+        // 開始時のみ、現在ページが画像系アイテム (Image/ZipImage/PdfPage) かを確認する。
+        // ZipSeparator など非画像アイテム上では開始させない (停止操作は常に許可)。
         if key_p {
-            self.slideshow_playing = !self.slideshow_playing;
             if self.slideshow_playing {
+                self.slideshow_playing = false;
+            } else if matches!(
+                self.items.get(fs_idx),
+                Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
+            ) {
+                self.slideshow_playing = true;
                 self.slideshow_next_at = std::time::Instant::now()
                     + std::time::Duration::from_secs_f32(self.settings.slideshow_interval_secs);
             }
@@ -1374,20 +1381,26 @@ impl App {
                     let next = crate::ui_helpers::adjacent_navigable_idx(
                         &self.items, &self.visible_indices, cur, slide_delta,
                     );
-                    let target = match next {
-                        Some(idx) => idx,
-                        None => {
-                            self.visible_indices.iter().copied()
-                                .find(|&i| matches!(
-                                    self.items.get(i),
-                                    Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
-                                ))
-                                .unwrap_or(0)
+                    // 末尾到達時は先頭の画像系アイテムへループ。
+                    // 画像系がひとつも無い場合はスライドショーを停止 (安全側、
+                    // 旧実装の `unwrap_or(0)` で非画像アイテムへ飛ぶ事故を防ぐ)。
+                    let target = next.or_else(|| {
+                        self.visible_indices.iter().copied()
+                            .find(|&i| matches!(
+                                self.items.get(i),
+                                Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
+                            ))
+                    });
+                    match target {
+                        Some(idx) => {
+                            self.open_fullscreen(idx);
+                            self.selected = Some(idx);
+                            self.scroll_to_selected = true;
                         }
-                    };
-                    self.open_fullscreen(target);
-                    self.selected = Some(target);
-                    self.scroll_to_selected = true;
+                        None => {
+                            self.slideshow_playing = false;
+                        }
+                    }
                 }
                 self.slideshow_next_at = now
                     + std::time::Duration::from_secs_f32(self.settings.slideshow_interval_secs);

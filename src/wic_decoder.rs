@@ -81,12 +81,10 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
 
     #[cfg(windows)]
     unsafe {
-        use windows::core::{Interface, GUID, PCWSTR};
+        use windows::core::{GUID, PCWSTR};
         use windows::Win32::Foundation::GENERIC_READ;
         use windows::Win32::Graphics::Imaging::{
-            CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode,
-            IWICBitmapSource, IWICFormatConverter, IWICImagingFactory,
-            WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+            CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
         };
         use windows::Win32::System::Com::{
             CoCreateInstance, CLSCTX_INPROC_SERVER,
@@ -120,53 +118,121 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
                 )
                 .ok()?;
 
-            // 最初のフレームを取得 (静止画は 1 フレームのみ。アニメ HEIF/AVIF は最初のフレームのみ)
-            let frame: IWICBitmapFrameDecode = decoder.GetFrame(0).ok()?;
-
-            // ピクセルフォーマット変換: 任意の入力 → 32bpp BGRA (straight alpha)
-            let converter: IWICFormatConverter = factory.CreateFormatConverter().ok()?;
-            let frame_source: IWICBitmapSource = frame.cast().ok()?;
-            converter
-                .Initialize(
-                    &frame_source,
-                    &GUID_WICPixelFormat32bppBGRA,
-                    WICBitmapDitherTypeNone,
-                    None,
-                    0.0,
-                    WICBitmapPaletteTypeCustom,
-                )
-                .ok()?;
-
-            // サイズ取得
-            let mut width = 0u32;
-            let mut height = 0u32;
-            converter.GetSize(&mut width, &mut height).ok()?;
-            const MAX_WIC_DIMENSION: u32 = 32768;
-            if width == 0 || height == 0 || width > MAX_WIC_DIMENSION || height > MAX_WIC_DIMENSION {
-                return None;
-            }
-
-            // ピクセル列を読む
-            let stride = width
-                .checked_mul(4)?
-                .min(u32::MAX);
-            let buffer_size = (stride as usize)
-                .checked_mul(height as usize)?;
-            let mut pixels = vec![0u8; buffer_size];
-            converter
-                .CopyPixels(std::ptr::null(), stride, &mut pixels)
-                .ok()?;
-
-            // BGRA → RGBA に並び替え (R と B を入れ替え)
-            for chunk in pixels.chunks_exact_mut(4) {
-                chunk.swap(0, 2);
-            }
-
-            // image::DynamicImage に組み立て
-            let rgba = image::RgbaImage::from_raw(width, height, pixels)?;
-            Some(image::DynamicImage::ImageRgba8(rgba))
+            decode_first_frame(&factory, &decoder)
         }
     }
+}
+
+/// メモリ上のバイト列を WIC でデコードして `image::DynamicImage` を返す。
+///
+/// ZIP エントリのように一時ファイルを介さずデコードしたい場合に使う。
+/// バイト列は `SHCreateMemStream` で WIC に渡す `IStream` に内部コピーされるため、
+/// 戻り後は呼び出し側で `bytes` を解放してよい。
+///
+/// 性能面: コピー 1 回 (典型的な 1〜50 MB の画像で 1 ms 未満) は WIC デコード本体
+/// (HEIC/AVIF/RAW で数十〜数百 ms) に比べ無視できる。
+pub fn decode_to_dynamic_image_from_bytes(bytes: &[u8]) -> Option<image::DynamicImage> {
+    #[cfg(not(windows))]
+    {
+        let _ = bytes;
+        return None;
+    }
+
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Graphics::Imaging::{
+            CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
+        };
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CLSCTX_INPROC_SERVER,
+        };
+        use windows::Win32::UI::Shell::SHCreateMemStream;
+
+        let _com = ComScope::init();
+
+        return decode_inner(bytes);
+
+        #[allow(unsafe_op_in_unsafe_fn)]
+        unsafe fn decode_inner(bytes: &[u8]) -> Option<image::DynamicImage> {
+            // ファクトリ生成
+            let factory: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+
+            // バイト列を IStream に包む (内部でコピーされる)
+            let len: u32 = bytes.len().try_into().ok()?;
+            let stream = SHCreateMemStream(Some(std::slice::from_raw_parts(bytes.as_ptr(), len as usize)))?;
+
+            // デコーダ生成 (ストリームから; マジックバイトで自動判別)
+            let decoder = factory
+                .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+                .ok()?;
+
+            decode_first_frame(&factory, &decoder)
+        }
+    }
+}
+
+/// `IWICBitmapDecoder` から最初のフレームを RGBA8 でデコードする共通処理。
+///
+/// `decode_to_dynamic_image` (ファイル経由) と
+/// `decode_to_dynamic_image_from_bytes` (メモリ経由) で共有される。
+#[cfg(windows)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn decode_first_frame(
+    factory: &windows::Win32::Graphics::Imaging::IWICImagingFactory,
+    decoder: &windows::Win32::Graphics::Imaging::IWICBitmapDecoder,
+) -> Option<image::DynamicImage> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Imaging::{
+        GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICBitmapSource,
+        IWICFormatConverter, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
+    };
+
+    // 最初のフレームを取得 (静止画は 1 フレームのみ。アニメ HEIF/AVIF は最初のフレームのみ)
+    let frame: IWICBitmapFrameDecode = decoder.GetFrame(0).ok()?;
+
+    // ピクセルフォーマット変換: 任意の入力 → 32bpp BGRA (straight alpha)
+    let converter: IWICFormatConverter = factory.CreateFormatConverter().ok()?;
+    let frame_source: IWICBitmapSource = frame.cast().ok()?;
+    converter
+        .Initialize(
+            &frame_source,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )
+        .ok()?;
+
+    // サイズ取得
+    let mut width = 0u32;
+    let mut height = 0u32;
+    converter.GetSize(&mut width, &mut height).ok()?;
+    const MAX_WIC_DIMENSION: u32 = 32768;
+    if width == 0 || height == 0 || width > MAX_WIC_DIMENSION || height > MAX_WIC_DIMENSION {
+        return None;
+    }
+
+    // ピクセル列を読む
+    let stride = width
+        .checked_mul(4)?
+        .min(u32::MAX);
+    let buffer_size = (stride as usize)
+        .checked_mul(height as usize)?;
+    let mut pixels = vec![0u8; buffer_size];
+    converter
+        .CopyPixels(std::ptr::null(), stride, &mut pixels)
+        .ok()?;
+
+    // BGRA → RGBA に並び替え (R と B を入れ替え)
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+    }
+
+    // image::DynamicImage に組み立て
+    let rgba = image::RgbaImage::from_raw(width, height, pixels)?;
+    Some(image::DynamicImage::ImageRgba8(rgba))
 }
 
 /// WIC メタデータから EXIF Orientation 値を読み取る。

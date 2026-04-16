@@ -91,7 +91,8 @@ ui_fullscreen.rs::render_fullscreen_viewport
 ```
           ┌─ GridItem::Image      → image::open() → 失敗時 WIC フォールバック → EXIF 適用
           ├─ GridItem::ZipImage   → zip_loader で bytes 読み出し → image::load_from_memory
-          │                          ※WIC 不可 (パスが必要)、EXIF 不可
+          │                          → 失敗時 WIC ストリームフォールバック (SHCreateMemStream)
+          │                          ※EXIF Orientation 不可
           └─ GridItem::PdfPage    → pdf_loader::render_page (4096px、PDF ワーカープロセス)
                                      ※zoom 分析モードの時はさらに高解像度で再レンダリング
 

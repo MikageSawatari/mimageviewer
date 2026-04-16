@@ -702,6 +702,7 @@ pub fn load_one_cached(
     // ── デコード経路 ──
     // 0. PDF ページ:     PDFium でラスタライズ → DynamicImage
     // 1. ZIP エントリ:    ZIP を開いてエントリのバイト列を取り出してから image クレートで decode
+    //                     失敗時は WIC (SHCreateMemStream + CreateDecoderFromStream) にフォールバック
     // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
     //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
     let img_result = if let Some(page_num) = pdf_page {
@@ -729,7 +730,15 @@ pub fn load_one_cached(
                     return Ok(img);
                 }
             }
-            image::load_from_memory(&bytes)
+            // image クレート → (失敗時) WIC ストリームデコードへフォールバック
+            // (HEIC / AVIF / JXL / RAW など image クレート非対応形式が ZIP 内にあっても開ける)
+            match image::load_from_memory(&bytes) {
+                Ok(img) => Ok(img),
+                Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
+                    Some(img) => Ok(img),
+                    None => Err(e),
+                },
+            }
         })
     } else {
         // 通常ファイル: JPEG なら TurboJPEG を最初に試す
