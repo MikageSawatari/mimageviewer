@@ -208,7 +208,7 @@ fn draw_sliders(
                     .italics(),
             );
         }
-        for (label, val) in crate::adjustment::UPSCALE_MODELS {
+        for (label, val) in &crate::adjustment::upscale_menu_items() {
             let is_sel = match (val, params.upscale_model.as_deref()) {
                 (None, None) => true,
                 (Some(a), Some(b)) => *a == b,
@@ -309,7 +309,7 @@ impl App {
                 }
                 if ui
                     .add_enabled(has_override, egui::Button::new("個別設定を解除").small())
-                    .on_hover_text("このページの個別設定を削除し、標準値に戻す")
+                    .on_hover_text("このページの個別設定を削除し、標準値に戻す (Ctrl+Backspace)")
                     .clicked()
                 {
                     clear_page_clicked = true;

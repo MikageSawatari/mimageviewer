@@ -22,21 +22,29 @@ pub enum AutoMode {
     MangaCleanup,
 }
 
-/// AI アップスケールモデルの定義。ラベルとモデルキーの一覧。
-pub const UPSCALE_MODELS: &[(&str, Option<&str>)] = &[
-    ("なし", None),
-    ("自動 (画像タイプ判別)", Some("auto")),
-    ("写真/CG", Some("realesrgan_x4plus")),
-    ("イラスト", Some("realesrgan_anime6b")),
-    ("漫画", Some("realcugan_4x")),
-    ("汎用", Some("realesr_general_v3")),
-];
+/// AI アップスケールモデル UI メニューの項目一覧を返す。
+///
+/// ラジオボタン / キーサイクルの描画・遷移に使う (ラベル, モデルキー) の組。
+/// 先頭 2 項目 (なし / 自動) は `ModelKind` に無い仮想エントリ。
+/// それ以降は [`crate::ai::ModelKind::upscale_models`] から自動生成して
+/// モデル定義側との二重管理を避ける。
+pub fn upscale_menu_items() -> Vec<(&'static str, Option<&'static str>)> {
+    let mut items: Vec<(&'static str, Option<&'static str>)> = vec![
+        ("なし", None),
+        ("自動 (画像タイプ判別)", Some("auto")),
+    ];
+    for kind in crate::ai::ModelKind::upscale_models() {
+        items.push((kind.display_label(), Some(kind.as_str())));
+    }
+    items
+}
 
 /// アップスケールモデルキーから表示ラベルを取得する。
 pub fn upscale_model_label(key: Option<&str>) -> &'static str {
-    UPSCALE_MODELS.iter()
+    upscale_menu_items()
+        .into_iter()
         .find(|(_, k)| *k == key)
-        .map(|(label, _)| *label)
+        .map(|(label, _)| label)
         .unwrap_or("不明")
 }
 

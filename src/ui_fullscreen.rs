@@ -908,19 +908,23 @@ impl App {
         // N キー: AI デノイズサイクル
         let key_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N));
 
-        // Shift+数字キー: 保存スロットからロード
-        let shift_keys: [bool; 10] = [
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num1)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num2)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num3)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num4)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num5)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num6)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num7)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num8)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num9)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num0)),
+        // Ctrl+数字キー: 保存スロットからロード
+        // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
+        let slot_keys: [bool; 10] = [
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num1)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num2)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num3)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num4)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num5)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num6)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num7)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num8)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num9)),
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0)),
         ];
+
+        // Ctrl+Backspace: 現在ページの個別補正設定を解除 (標準値に戻す)
+        let clear_page_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Backspace));
 
         // 見開きモード切替 + フィードバック表示
         let new_spread = if key_1 { Some(SpreadMode::Single) }
@@ -955,15 +959,16 @@ impl App {
         // U キー: AI アップスケールモデルをサイクル (現在ページの有効パラメータに対して)
         if key_u {
             let mut params = self.effective_params(fs_idx).clone();
-            let cur = crate::adjustment::UPSCALE_MODELS.iter().position(|(_, k)| {
+            let items = crate::adjustment::upscale_menu_items();
+            let cur = items.iter().position(|(_, k)| {
                 match (k, params.upscale_model.as_deref()) {
                     (None, None) => true,
                     (Some(a), Some(b)) => *a == b,
                     _ => false,
                 }
             }).unwrap_or(0);
-            let next = (cur + 1) % crate::adjustment::UPSCALE_MODELS.len();
-            let (label, key) = crate::adjustment::UPSCALE_MODELS[next];
+            let next = (cur + 1) % items.len();
+            let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
             self.show_feedback_toast(format!("[U:アップスケール {}]", label));
             self.set_page_params(fs_idx, params);
@@ -984,10 +989,21 @@ impl App {
             self.clear_all_adjustment_and_ai_caches(fs_idx);
         }
 
-        // Shift+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
-        for (slot_idx, &pressed) in shift_keys.iter().enumerate() {
+        // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
+        for (slot_idx, &pressed) in slot_keys.iter().enumerate() {
             if pressed {
                 self.apply_slot_to_current_page(slot_idx);
+            }
+        }
+
+        // Ctrl+Backspace: 個別設定があれば解除、なければフィードバックのみ
+        if clear_page_key {
+            if self.adjustment_page_params.contains_key(&fs_idx) {
+                self.clear_page_params(fs_idx);
+                self.clear_adjustment_caches(fs_idx);
+                self.show_feedback_toast("[個別設定を解除]".to_string());
+            } else {
+                self.show_feedback_toast("[個別設定なし]".to_string());
             }
         }
 
