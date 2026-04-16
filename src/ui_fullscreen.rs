@@ -1000,7 +1000,6 @@ impl App {
         if clear_page_key {
             if self.adjustment_page_params.contains_key(&fs_idx) {
                 self.clear_page_params(fs_idx);
-                self.clear_adjustment_caches(fs_idx);
                 self.show_feedback_toast("[個別設定を解除]".to_string());
             } else {
                 self.show_feedback_toast("[個別設定なし]".to_string());

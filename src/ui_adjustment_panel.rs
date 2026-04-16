@@ -440,7 +440,6 @@ impl App {
         }
         if clear_page_clicked {
             self.clear_page_params(fs_idx);
-            self.clear_adjustment_caches(fs_idx);
             self.show_feedback_toast("個別設定を解除".to_string());
         }
 
