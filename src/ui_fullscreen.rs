@@ -1351,27 +1351,20 @@ impl App {
             self.close_fullscreen();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-        // Ctrl+↑↓: フルスクリーンを維持したまま前後のフォルダへジャンプし、
-        // Ctrl+↓ なら次フォルダの先頭画像、Ctrl+↑ なら前フォルダの末尾画像を表示する。
-        // `self.selected` も移動先のインデックスに揃えるので、ユーザーがフルスクリーンを
-        // 閉じたときはグリッドでも同じ画像にカーソルが載った状態で戻る。
+        // Ctrl+↑↓ はフルスクリーンを保ったまま前後フォルダへ飛び、先頭/末尾の
+        // 画像系アイテムを開く。self.selected も合わせて更新するので、ここから
+        // フルスクリーンを閉じたときグリッド側のカーソルが最後に観た画像に残る。
         if let Some(delta) = ctrl_nav {
             if let Some(cur) = self.current_folder.clone() {
                 let skip_limit = self.settings.folder_skip_limit;
-                let next = if delta > 0 {
-                    navigate_folder_with_skip(&cur, next_folder_dfs, skip_limit, None)
-                } else {
-                    navigate_folder_with_skip(&cur, prev_folder_dfs, skip_limit, None)
-                };
-                if let Some(p) = next {
-                    // 旧フォルダの fs_cache / ai_upscale_cache は item index を
-                    // キーに持つが load_folder で items が入れ替わるため、ここで
-                    // まとめて破棄する。close_fullscreen はキャッシュクリア + PDF
-                    // Critical 予約解除まで一括で行うが、直後の open_fullscreen で
-                    // 予約は再設定されるので問題ない。
+                let dfs_fn = if delta > 0 { next_folder_dfs } else { prev_folder_dfs };
+                if let Some(p) = navigate_folder_with_skip(&cur, dfs_fn, skip_limit, None) {
+                    // fs_cache / ai_upscale_cache は item index がキーで、
+                    // load_folder で items を入れ替えると古い画像を新しい idx で
+                    // 誤って引く危険がある。close_fullscreen で一括破棄してから
+                    // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                     self.close_fullscreen();
                     self.load_folder(p);
-                    // 新フォルダから Ctrl+↓ は先頭、Ctrl+↑ は末尾の画像系アイテムを選ぶ。
                     let target_idx = {
                         let items = &self.items;
                         let is_image_like = |i: usize| matches!(
@@ -1381,10 +1374,11 @@ impl App {
                             | Some(GridItem::ZipImage { .. })
                             | Some(GridItem::PdfPage { .. })
                         );
+                        let mut it = self.visible_indices.iter().copied();
                         if delta > 0 {
-                            self.visible_indices.iter().copied().find(|&i| is_image_like(i))
+                            it.find(|&i| is_image_like(i))
                         } else {
-                            self.visible_indices.iter().copied().rev().find(|&i| is_image_like(i))
+                            it.rev().find(|&i| is_image_like(i))
                         }
                     };
                     if let Some(new_idx) = target_idx {
@@ -1393,8 +1387,8 @@ impl App {
                         self.scroll_to_selected = true;
                         self.update_last_selected_image();
                     } else {
-                        // 画像系アイテムが見つからない場合はフルスクリーンを閉じてグリッドに戻す。
-                        // navigate_folder_with_skip は基本的に画像ありフォルダを返すので稀。
+                        // navigate_folder_with_skip は画像ありフォルダを返す前提だが、
+                        // レーティングフィルタ等で visible_indices が空の場合はここに来る。
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                 }
