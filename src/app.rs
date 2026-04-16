@@ -45,6 +45,8 @@ pub(crate) enum EraseTool {
     VertLine,
     /// 横線ツール: ドラッグ高さの横全体矩形を塗りつぶす
     HorizLine,
+    /// 直線ツール: ドラッグ始終点を結ぶ太い直線を塗りつぶす。Shift で幅調整。
+    Line,
     /// 筆ツール: 円形ブラシで自由に塗る
     Brush,
 }
@@ -585,6 +587,18 @@ pub struct App {
     pub(crate) erase_line_start: Option<(f32, f32)>,
     /// 縦線/横線ツールのドラッグ現在点 (画像ピクセル座標)
     pub(crate) erase_line_end: Option<(f32, f32)>,
+    /// 縦線/横線ツールの傾き量 (画像ピクセル単位の上端オフセット)。
+    /// Shift+ドラッグ時のみ非ゼロになる。
+    pub(crate) erase_line_tilt: f32,
+    /// 直線ツールの幅 (画像ピクセル)。
+    pub(crate) erase_line_width: f32,
+    /// Shift+ドラッグの起点 (画像座標) と、変更開始時の基準値。
+    /// - 筆: (origin_x, origin_y, base_radius, 0)
+    /// - 縦線/横線: (origin_x, origin_y, base_tilt, reserved)
+    ///   さらに erase_shift_line_base で線の両端を保存する
+    pub(crate) erase_shift_drag_origin: Option<(f32, f32, f32, f32)>,
+    /// Shift+ドラッグ開始時の縦線/横線の両端 (img_pos)。パン操作の基準。
+    pub(crate) erase_shift_line_base: Option<((f32, f32), (f32, f32))>,
     /// 描画モード (true) / 消去モード (false)
     pub(crate) erase_paint_mode: bool,
     /// inpaint 適用前の元画像キャッシュ: item_idx → ピクセルデータ
@@ -592,6 +606,8 @@ pub struct App {
     pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
+    /// 消しゴムの Undo スタック (マスクのスナップショット、最大 20 エントリ)
+    pub(crate) erase_undo_stack: Vec<Vec<bool>>,
 }
 
 impl Default for App {
@@ -786,9 +802,14 @@ impl Default for App {
             erase_lasso_points: Vec::new(),
             erase_line_start: None,
             erase_line_end: None,
+            erase_line_tilt: 0.0,
+            erase_line_width: 0.0, // enter_erase_mode で設定
+            erase_shift_drag_origin: None,
+            erase_shift_line_base: None,
             erase_paint_mode: true,
             erase_base_cache: std::collections::HashMap::new(),
             mask_db: crate::mask_db::MaskDb::open().ok(),
+            erase_undo_stack: Vec::new(),
         }
     }
 }

@@ -80,6 +80,25 @@ impl MaskDb {
         self.conn.execute("DELETE FROM masks WHERE path = ?1", [key])?;
         Ok(())
     }
+
+    /// 名前付きスロットにマスクを保存する。`get` と異なり全 false でも保存する。
+    /// 空白スキャンなどで全域クリアしたい場合にも利用可能。
+    pub fn set_slot(&self, slot: usize, mask: &[bool], w: usize, h: usize) -> rusqlite::Result<()> {
+        let key = format!("__slot_{}", slot);
+        let blob = compress_mask(mask);
+        self.conn.execute(
+            "INSERT INTO masks (path, mask_data, width, height) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4",
+            rusqlite::params![key, blob, w as i64, h as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 名前付きスロットからマスクを取得する。サイズが異なる場合は自動リスケール。
+    pub fn get_slot(&self, slot: usize, expected_w: usize, expected_h: usize) -> Option<Vec<bool>> {
+        let key = format!("__slot_{}", slot);
+        self.get(&key, expected_w, expected_h)
+    }
 }
 
 /// マスク (Vec<bool>) を 1bit/pixel にパックし deflate 圧縮する。

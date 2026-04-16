@@ -176,10 +176,10 @@ struct FsFrameState {
 }
 
 /// フルスクリーンのキー入力結果。
-struct FsKeyAction {
-    close: bool,
-    nav_delta: i32,
-    ctrl_nav: Option<i32>,
+pub(crate) struct FsKeyAction {
+    pub(crate) close: bool,
+    pub(crate) nav_delta: i32,
+    pub(crate) ctrl_nav: Option<i32>,
 }
 
 impl App {
@@ -772,6 +772,12 @@ impl App {
         // (テキスト入力やダイアログ内の Enter/Esc 処理を優先)
         if self.any_dialog_open() { return action; }
 
+        // 消しゴムモード中は専用ショートカットのみ有効にし、通常のフルスクリーンショートカット
+        // (矢印ナビ、R/L 回転、I メタデータ等) を無効化する。
+        if self.erase_mode {
+            return self.handle_erase_keys(ctx, fs_idx);
+        }
+
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -1073,6 +1079,26 @@ impl App {
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
                 i.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
+            // 消しゴムモード: 筆/直線ツールでは修飾なしホイールで太さ調整
+            // (Ctrl+ホイールは通常のズームに残す)
+            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+            if !ctrl_held
+                && self.erase_mode
+                && matches!(self.erase_tool, crate::app::EraseTool::Brush | crate::app::EraseTool::Line)
+            {
+                let max_r = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
+                let factor = if wheel_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                match self.erase_tool {
+                    crate::app::EraseTool::Brush => {
+                        self.erase_brush_radius = (self.erase_brush_radius * factor).clamp(1.0, max_r);
+                    }
+                    crate::app::EraseTool::Line => {
+                        self.erase_line_width = (self.erase_line_width * factor).clamp(1.0, max_r);
+                    }
+                    _ => {}
+                }
+                return (0, false); // ホイールを消費したので終了
+            }
             if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
