@@ -619,7 +619,7 @@ fn run_bench(
         }
 
         // 結果受信 (ノンブロッキング)
-        while let Ok((idx, _color_image, from_cache, _dims)) = rx.try_recv() {
+        while let Ok((idx, _color_image, from_cache, _dims, _canceled)) = rx.try_recv() {
             requested.remove(&idx);
             completed.insert(idx);
             if from_cache {

@@ -53,11 +53,14 @@ pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
 
 /// サムネイル読み込み結果メッセージ。
 ///
-/// `(item_idx, Option<ColorImage>, from_cache, source_dims)`
+/// `(item_idx, Option<ColorImage>, from_cache, source_dims, canceled)`
 /// - `from_cache = true`: WebP キャッシュから復元 (段階 E アップグレード対象)
 /// - `from_cache = false`: 元画像から直接デコード (高画質) または動画 Shell API
 /// - `source_dims`: 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None
-pub type ThumbMsg = (usize, Option<egui::ColorImage>, bool, Option<(u32, u32)>);
+/// - `canceled = true`: ワーカーがロードを中断 (STALE: keep_range 外になった等)。
+///   `ColorImage` は必ず `None`。UI 側は `thumbnails[idx]` を `Evicted` に戻し、
+///   `requested` からも削除して **再試行可能** な状態にする。`Failed` にはしない。
+pub type ThumbMsg = (usize, Option<egui::ColorImage>, bool, Option<(u32, u32)>, bool);
 
 /// 段階 B: サムネイル読み込み要求。
 ///
@@ -438,7 +441,7 @@ pub fn process_load_request(
             // from_cache = true: アップグレード対象
             // source_dims はカタログ由来 (旧バージョンで作成された
             // エントリには None が入っている)
-            let _ = tx.send((req.idx, ci, true, source_dims));
+            let _ = tx.send((req.idx, ci, true, source_dims, false));
             gen_done.fetch_add(1, Ordering::Relaxed);
             crate::logger::log(format!(
                 "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
@@ -490,7 +493,7 @@ pub fn process_load_request(
             ));
         }
         if img.is_none() {
-            let _ = tx.send((req.idx, None, false, None));
+            let _ = tx.send((req.idx, None, false, None, false));
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -528,7 +531,7 @@ pub fn process_load_request(
             }
             None => {
                 // ZIP 内に画像が無い場合は失敗として通知
-                let _ = tx.send((req.idx, None, false, None));
+                let _ = tx.send((req.idx, None, false, None, false));
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -541,6 +544,8 @@ pub fn process_load_request(
     // 重い I/O (ZIP/フォルダ) 完了後の stale チェック:
     // resolve に数秒かかった場合、スクロールで keep_range 外になっている可能性がある。
     // 不要な decode + send を省き、UI 側の requested 除去を早める。
+    // canceled=true で送信 → poll_thumbnails で Evicted (retriable) に戻す。
+    // Failed にしないのは、scroll 戻り時に再ロードできるようにするため。
     if needs_heavy_io {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
@@ -549,8 +554,49 @@ pub fn process_load_request(
                 "    idx={:>4} STALE (after I/O resolve)  {}",
                 req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
             ));
-            // None を送信して poll_thumbnails で requested を除去させる
-            let _ = tx.send((req.idx, None, false, None));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "thumb",
+                    "skip",
+                    None,
+                    req.input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(req.idx)),
+                        ("reason", serde_json::Value::from("stale_after_io")),
+                    ],
+                );
+            }
+            let _ = tx.send((req.idx, None, false, None, true));
+            gen_done.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    // PDF ページの stale チェック:
+    // PDFium レンダは 1 枚 1 秒クラスの重処理なので、cache miss 時にも
+    // 開始前に keep_range 外になっていれば中断する。これがないと
+    // スクロール往復で同じページが複数回レンダされる事故が起きる。
+    if req.pdf_page.is_some() && !req.skip_cache {
+        let ks = keep_start.load(Ordering::Relaxed);
+        let ke = keep_end.load(Ordering::Relaxed);
+        if req.idx < ks || req.idx >= ke {
+            crate::logger::log(format!(
+                "    idx={:>4} STALE (pdf before render)  {}",
+                req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "thumb",
+                    "skip",
+                    None,
+                    req.input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(req.idx)),
+                        ("reason", serde_json::Value::from("stale_pdf_before_render")),
+                    ],
+                );
+            }
+            let _ = tx.send((req.idx, None, false, None, true));
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -781,7 +827,7 @@ pub fn load_one_cached(
                 return;
             }
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {display_name}"));
-            let _ = tx.send((idx, None, false, None));
+            let _ = tx.send((idx, None, false, None, false));
             gen_done.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = stats.lock() {
                 s.record_failed();
@@ -809,7 +855,11 @@ pub fn load_one_cached(
     let t_display = std::time::Instant::now();
     let display_ci = resize_to_display_color_image(&img, display_px);
     let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
-    let _ = tx.send((idx, Some(display_ci), false, source_dims));
+    // 第 1 シグナル: display ColorImage を UI に送る。UI は Loaded 化するが、
+    // from_cache=false のこの経路では `requested` を抜かない (下の cache save が
+    // 完了するまで保持する → cache save 中に同じ idx が再エンキューされて
+    // 二重レンダする事故を防ぐ)。
+    let _ = tx.send((idx, Some(display_ci), false, source_dims, false));
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
     {
@@ -871,6 +921,11 @@ pub fn load_one_cached(
 
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
     gen_done.fetch_add(1, Ordering::Relaxed);
+
+    // 第 2 シグナル: cache save (or skip) 完了を UI に通知し `requested` から
+    // 抜く。canceled=true だが thumbnails[i] が既に Loaded なら state は維持される
+    // (poll_thumbnails の canceled 分岐参照)。
+    let _ = tx.send((idx, None, false, None, true));
 }
 
 // -----------------------------------------------------------------------

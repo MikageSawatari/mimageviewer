@@ -1802,6 +1802,10 @@ impl App {
                                 ],
                             );
                         }
+                        // canceled=true を送信: UI 側の requested を cleanup し、
+                        // Evicted (retriable) に戻す。これを送らないと keep_range が
+                        // 戻ったときに再エンキューされず idx がスタックする。
+                        let _ = tx_w.send((req.idx, None, false, None, true));
                         continue;
                     }
                     let vis = hint_w.load(Ordering::Relaxed);
@@ -1895,7 +1899,7 @@ impl App {
                 }
                 // 動画 Shell API はアップグレード経路を持たないので from_cache = false
                 // ピクセル寸法は取得できないため None
-                let _ = tx.send((idx, ci, false, None));
+                let _ = tx.send((idx, ci, false, None, false));
             }
         });
     }
@@ -1918,17 +1922,36 @@ impl App {
             std::iter::from_fn(|| self.rx.try_recv().ok())
         );
 
-        for (i, color_image_opt, from_cache, source_dims) in drain {
+        for (i, color_image_opt, from_cache, source_dims, canceled) in drain {
             if i >= self.thumbnails.len() {
                 self.requested.remove(&i);
                 continue;
             }
 
             let in_keep_range = i >= keep_start && i < keep_end;
+
+            // canceled = true: ワーカーが処理を中断 (STALE 等)。
+            // Failed にはせず、Evicted に戻して再試行可能にする。
+            // Loaded 状態は維持 (既にテクスチャがある場合は破棄しない)。
+            if canceled {
+                self.requested.remove(&i);
+                if !matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
+                    self.thumbnails[i] = ThumbnailState::Evicted;
+                }
+                received += 1;
+                continue;
+            }
+
             match color_image_opt {
                 Some(color_image) => {
                     if in_keep_range && textures_created < MAX_TEXTURES_PER_FRAME {
-                        self.requested.remove(&i);
+                        // from_cache=true: 1 ショット経路 (cache save なし) → 即 remove。
+                        // from_cache=false: from-source 経路。cache save 完了後の
+                        //   第 2 シグナル (canceled=true) 到着まで `requested` を保持。
+                        //   cache save 進行中の再エンキュー + 二重レンダを防ぐ。
+                        if from_cache {
+                            self.requested.remove(&i);
+                        }
                         let [w, h] = color_image.size;
                         let rendered_at_px = w.max(h) as u32;
                         let prev_state_was_loaded = matches!(
@@ -1970,10 +1993,14 @@ impl App {
                     } else if in_keep_range {
                         // 上限到達だが keep_range 内: 次フレームに持ち越す。
                         // requested は除去しない (重複リクエスト防止)
-                        self.texture_backlog.push((i, Some(color_image), from_cache, source_dims));
+                        self.texture_backlog.push((i, Some(color_image), from_cache, source_dims, false));
                     } else {
-                        // 範囲外: ColorImage を drop し Evicted にしておく
-                        self.requested.remove(&i);
+                        // 範囲外: ColorImage を drop し Evicted にしておく。
+                        // from_cache=true は 1 ショット経路 → 即 remove。
+                        // from_cache=false は第 2 シグナル待ち → requested 保持。
+                        if from_cache {
+                            self.requested.remove(&i);
+                        }
                         self.thumbnails[i] = ThumbnailState::Evicted;
                     }
                 }
@@ -2086,9 +2113,15 @@ impl App {
 
         // (1) 範囲外の Loaded を Evicted にする (TextureHandle を drop)
         //     動画サムネイルは一度ロードしたら維持する (別パスのため再要求できない)
-        //     同時に requested からも除去する (ワーカーが処理中のものは結果受信時に
-        //     keep_range 外判定で Evicted になるが、requested に残っていると
-        //     同じ idx の再リクエストがブロックされてしまう)
+        //
+        //     重要: ここでは `requested` を触らない。ワーカーが処理中の idx を
+        //     requested から抜くと、scroll 戻り時に同じ idx が再エンキューされ、
+        //     二重レンダ (特に PDF) を引き起こすため。
+        //     requested の cleanup は以下で行う:
+        //       - エンキュー済・pop 前の取消: 下の q.retain が dropped idx を remove
+        //       - ワーカー pop 後の STALE: worker が canceled=true を送信し
+        //         poll_thumbnails が remove
+        //       - 正常完了: poll_thumbnails が remove
         let t1 = frame_t0.elapsed();
         for i in 0..total {
             if i >= keep_start && i < keep_end {
@@ -2100,7 +2133,6 @@ impl App {
             if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
                 self.thumbnails[i] = ThumbnailState::Evicted;
             }
-            self.requested.remove(&i);
         }
         let t2 = frame_t0.elapsed();
 
@@ -2188,7 +2220,16 @@ impl App {
         {
             let (ref mtx, ref cvar) = *queue_arc;
             let mut q = mtx.lock().unwrap();
-            q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
+            // 範囲外に出たキューエントリは取消扱い。pop 前なのでワーカーが
+            // 始めてすらいない → requested からも抜いて良い (再入範囲なら次フレームで
+            // 再エンキューされる)。
+            q.retain(|r| {
+                let keep = r.idx >= keep_start && r.idx < keep_end;
+                if !keep {
+                    self.requested.remove(&r.idx);
+                }
+                keep
+            });
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
             }
@@ -2207,7 +2248,13 @@ impl App {
         if let Some(hq) = self.heavy_io_queue.clone() {
             let (ref mtx, ref cvar) = *hq;
             let mut q = mtx.lock().unwrap();
-            q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
+            q.retain(|r| {
+                let keep = r.idx >= keep_start && r.idx < keep_end;
+                if !keep {
+                    self.requested.remove(&r.idx);
+                }
+                keep
+            });
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
             }

@@ -42,7 +42,7 @@
 
 | 名前 | 方向 | 内容 |
 | --- | --- | --- |
-| `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, from_cache, source_dims) |
+| `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, from_cache, source_dims, canceled)。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + canceled=true) → UI は `requested` を抜く。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE でも送信され、その場合 state は Evicted (retriable、Failed にしない) |
 | `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: Static / Animated / Failed |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | `(pages, password_needed)` |
@@ -100,7 +100,40 @@
 AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1 枚のみで、現在画像が
 来たら古い先読みをキャンセル。
 
-### 3.3 新ワーカー追加時のテンプレ
+### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
+
+サムネイルは「keep_range 内かどうか」が毎フレーム変化するため、単純なキャンセルでは
+**同じ idx が in-flight なのに scroll 戻りで再エンキューされ、PDF 再レンダが二重に走る**
+事故を起こす。2026-04 のセッションで以下のルールを確立した:
+
+- **`update_keep_range_and_requests` は `self.requested` を範囲外一括 remove しない**。
+  ワーカー処理中の idx まで抜いてしまい再エンキューを誘発するため。step 1 は Loaded→Evicted
+  の遷移だけ行う。
+- **`requested` の cleanup 経路は 4 本**:
+  1. エンキュー済・pop 前の取消 → step 2 の `q.retain` が dropped idx を `requested.remove`
+  2. ワーカー pop 後の STALE → ワーカーが `ThumbMsg` に `canceled=true` を載せて送信 →
+     `poll_thumbnails` が `requested.remove` + `Evicted` (Failed にしない)
+  3. cache hit 正常完了 → 第 1 シグナルで `poll_thumbnails` が `requested.remove`
+  4. cache miss 正常完了 → **第 1 シグナル (display ColorImage) では remove しない**、
+     第 2 シグナル (cache save 完了、canceled=true) で remove。from_cache=false の判定で分岐
+- **STALE チェックはワーカーパイプラインの 3 箇所**:
+  - `spawn_worker` が pop 直後 (app.rs): キャッシュ lookup すら不要な明白な範囲外
+  - `process_load_request` の heavy I/O resolve 後 (thumb_loader.rs): ZIP/folder の
+    I/O (秒単位) 完了後に範囲外になっていないか
+  - `process_load_request` の PDF レンダ直前 (thumb_loader.rs): cache miss で PDFium
+    に投げる前。これがないと scroll 往復で同じページの 1 秒レンダが重複する
+- 3 箇所とも `canceled=true` を送信して `requested` cleanup する。`continue` だけでは
+  `requested` に残って「再エンキューされない idx=Pending」状態で固まる。
+
+**なぜ 2 シグナル方式か**: `load_one_cached` は decode → tx.send (display) → WebP encode →
+DB save → cache_map.insert の順で処理する。もし第 1 シグナル到着時に `requested` を抜くと、
+cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未登録の窓が開き、
+その間に scroll 往復が起きると別 worker が同じ idx を cache miss 扱いで取得し重い decode
+(ZIP 取り出し・PDFium レンダ等) を二重に走らせる。第 2 シグナルで cache save 完了後に
+初めて `requested` を抜くことで、cache save 中の再エンキューは `requested.contains_key=true`
+で弾かれる。
+
+### 3.5 新ワーカー追加時のテンプレ
 
 ```rust
 let cancel = Arc::clone(&self.cancel_token);  // フォルダ単位のキャンセル
