@@ -90,6 +90,9 @@ pub struct LoadRequest {
     pub folder_thumb_sort: Option<crate::settings::SortOrder>,
     /// フォルダサムネイル用: サブフォルダを探索する最大階層数
     pub folder_thumb_depth: u32,
+    /// パフォーマンス計装用: エンキュー時の input_seq (相関キー)。
+    /// 0 は未設定を意味する。`--perf-log` 無効時は使われない。
+    pub input_seq: u64,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -401,6 +404,19 @@ pub fn process_load_request(
     };
 
     let req_t0 = std::time::Instant::now();
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "thumb",
+            "decode_begin",
+            Some(filename),
+            req.input_seq,
+            &[
+                ("idx", serde_json::Value::from(req.idx)),
+                ("priority", serde_json::Value::from(req.priority)),
+                ("skip_cache", serde_json::Value::from(req.skip_cache)),
+            ],
+        );
+    }
 
     // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
@@ -428,6 +444,19 @@ pub fn process_load_request(
                 "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
                 req.idx,
             ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "thumb",
+                    "decode_end",
+                    Some(filename),
+                    req.input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(req.idx)),
+                        ("ms", serde_json::Value::from(cache_ms)),
+                        ("from_cache", serde_json::Value::from(true)),
+                    ],
+                );
+            }
             return;
         }
     }
@@ -541,6 +570,20 @@ pub fn process_load_request(
         stats,
         cancel,
     );
+    if crate::perf::is_enabled() {
+        let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::perf::event(
+            "thumb",
+            "decode_end",
+            Some(filename),
+            req.input_seq,
+            &[
+                ("idx", serde_json::Value::from(req.idx)),
+                ("ms", serde_json::Value::from(total_ms)),
+                ("from_cache", serde_json::Value::from(false)),
+            ],
+        );
+    }
 }
 
 /// フォルダ内をスキャンして代表画像のパスを返す。
@@ -662,7 +705,13 @@ pub fn load_one_cached(
     // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
     //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
     let img_result = if let Some(page_num) = pdf_page {
-        crate::pdf_loader::render_page(path, page_num, display_px, pdf_password, cancel.map(Arc::clone))
+        // サムネイル用 PDF レンダは Normal 優先度: プールの予約ワーカーは
+        // フルスクリーン現在ページ用に空けておく
+        crate::pdf_loader::render_page(
+            path, page_num, display_px, pdf_password,
+            cancel.map(Arc::clone),
+            crate::pdf_loader::JobPriority::Normal,
+        )
             .map(|(img, _ct)| img)
             .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(entry_name) = zip_entry {
@@ -996,7 +1045,11 @@ pub fn build_and_save_one_pdf(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
-    let (img, _) = crate::pdf_loader::render_page(pdf_path, page_num, thumb_px, password, None).ok()?;
+    // バッチキャッシュ作成は Normal 優先度: フルスクリーン操作より優先されない
+    let (img, _) = crate::pdf_loader::render_page(
+        pdf_path, page_num, thumb_px, password, None,
+        crate::pdf_loader::JobPriority::Normal,
+    ).ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
     encode_and_save(&img, &key, catalog, mtime, file_size, thumb_px, thumb_quality)
 }

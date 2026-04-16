@@ -20,6 +20,15 @@ pub fn denoise(
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, AiError> {
     let (w, h) = (input.width(), input.height());
+    let perf_enabled = crate::perf::is_enabled();
+    let t0 = std::time::Instant::now();
+    if perf_enabled {
+        crate::perf::event("ai", "denoise_begin", None, 0, &[
+            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
+            ("w", serde_json::Value::from(w)),
+            ("h", serde_json::Value::from(h)),
+        ]);
+    }
     crate::logger::log(format!(
         "[AI] Denoise {}x{} with {:?}",
         w, h, model_kind
@@ -31,6 +40,13 @@ pub fn denoise(
         "[AI] Denoise complete: {}x{} with {:?}",
         w, h, model_kind
     ));
+    if perf_enabled {
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        crate::perf::event("ai", "denoise_end", None, 0, &[
+            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
+            ("ms", serde_json::Value::from(ms)),
+        ]);
+    }
 
     Ok(result)
 }

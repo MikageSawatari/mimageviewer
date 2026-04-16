@@ -113,6 +113,18 @@ pub fn upscale(
 
     let rgb = input.to_rgb8();
     let tiles = compute_tiles(in_w, in_h, tile_size, TILE_OVERLAP);
+    let perf_enabled = crate::perf::is_enabled();
+    let t_upscale = std::time::Instant::now();
+    if perf_enabled {
+        crate::perf::event("ai", "upscale_begin", None, 0, &[
+            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
+            ("in_w", serde_json::Value::from(in_w)),
+            ("in_h", serde_json::Value::from(in_h)),
+            ("scale", serde_json::Value::from(scale)),
+            ("tiles", serde_json::Value::from(tiles.len())),
+            ("tile_size", serde_json::Value::from(tile_size)),
+        ]);
+    }
 
     // 出力バッファ: RGB float 累積 + 重み累積（ブレンド用）
     let npixels = (out_w * out_h) as usize;
@@ -123,9 +135,15 @@ pub fn upscale(
 
     for (tile_idx, tile) in tiles.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
+            if perf_enabled {
+                crate::perf::event("ai", "upscale_cancel", None, 0, &[
+                    ("after_tile", serde_json::Value::from(tile_idx)),
+                ]);
+            }
             return Err(AiError::Cancelled);
         }
 
+        let tile_t0 = std::time::Instant::now();
         let tile_input = extract_tile(&rgb, tile);
         let tile_out = run_tile_inference(runtime, model_kind, tile_input)?;
 
@@ -137,6 +155,13 @@ pub fn upscale(
             tile, scale,
             in_w, in_h,
         );
+        if perf_enabled {
+            let tile_ms = tile_t0.elapsed().as_secs_f64() * 1000.0;
+            crate::perf::event("ai", "upscale_tile", None, 0, &[
+                ("tile", serde_json::Value::from(tile_idx)),
+                ("ms", serde_json::Value::from(tile_ms)),
+            ]);
+        }
 
         if (tile_idx + 1) % 10 == 0 {
             crate::logger::log(format!(
@@ -150,6 +175,16 @@ pub fn upscale(
         "[AI] Upscale complete: {} tiles, {}x scale",
         tiles.len(), scale
     ));
+    if perf_enabled {
+        let total_ms = t_upscale.elapsed().as_secs_f64() * 1000.0;
+        crate::perf::event("ai", "upscale_end", None, 0, &[
+            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
+            ("tiles", serde_json::Value::from(tiles.len())),
+            ("out_w", serde_json::Value::from(out_w)),
+            ("out_h", serde_json::Value::from(out_h)),
+            ("total_ms", serde_json::Value::from(total_ms)),
+        ]);
+    }
 
     // 累積バッファを正規化して RGBA ColorImage に変換
     let pixels: Vec<egui::Color32> = (0..npixels)

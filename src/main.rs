@@ -16,6 +16,7 @@ pub mod logger;
 pub mod mask_db;
 pub mod monitor;
 pub mod path_key;
+pub mod perf;
 pub mod png_metadata;
 pub mod rating_db;
 pub mod rotation_db;
@@ -60,6 +61,11 @@ fn main() -> eframe::Result {
     if log_enabled {
         logger::init();
     }
+
+    // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
+    // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。
+    let perf_enabled = std::env::args().any(|a| a == "--perf-log");
+    perf::init(perf_enabled);
 
     // パニック時にログファイルへ記録するフック（windows_subsystem = "windows" では
     // stderr が見えないため、ここで捕捉しないとクラッシュ原因が不明になる）

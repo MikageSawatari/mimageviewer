@@ -287,6 +287,14 @@ impl App {
                         if key_action.close { close_fs = true; }
                         nav_delta = key_action.nav_delta;
                         ctrl_nav = key_action.ctrl_nav;
+                        // perf: キー起因のナビはここで input_seq を進める
+                        if nav_delta != 0 {
+                            self.bump_input_seq("fs_key", Some(&format!("delta={nav_delta}")));
+                        } else if ctrl_nav.is_some() {
+                            self.bump_input_seq("fs_ctrl_nav", None);
+                        } else if key_action.close {
+                            self.bump_input_seq("fs_close_key", None);
+                        }
 
                         // ── ホイール & クリック ──
                         let (wheel_nav, click_close) = self.handle_fs_wheel_and_click(
@@ -294,6 +302,12 @@ impl App {
                         );
                         if wheel_nav != 0 { nav_delta = wheel_nav; }
                         if click_close { close_fs = true; }
+                        // perf: ホイール/クリック起因のナビ
+                        if wheel_nav != 0 {
+                            self.bump_input_seq("fs_wheel", Some(&format!("delta={wheel_nav}")));
+                        } else if click_close {
+                            self.bump_input_seq("fs_close_click", None);
+                        }
                         // ホイール/キーで nav_delta が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
                         let nav_locked = nav_delta != 0;
@@ -322,6 +336,28 @@ impl App {
                                         self.fs_zoom_pan()
                                     };
                                     let free_rot = if analysis_active { 0.0 } else { self.fs_free_rotation };
+                                    // perf: 前フレームと異なる (idx, テクスチャ) の最初の描画で paint を emit
+                                    if crate::perf::is_enabled()
+                                        && let Some(tex) = state.tex.as_ref()
+                                    {
+                                        let cur_id = tex.id();
+                                        let prev = self.fs_painted_last;
+                                        let is_new = !matches!(
+                                            prev,
+                                            Some((prev_idx, prev_id, _)) if prev_idx == fs_idx && prev_id == cur_id
+                                        );
+                                        if is_new {
+                                            let key = self.perf_item_key(fs_idx);
+                                            crate::perf::event(
+                                                "fs",
+                                                "paint",
+                                                key.as_deref(),
+                                                self.input_seq,
+                                                &[("idx", serde_json::Value::from(fs_idx))],
+                                            );
+                                            self.fs_painted_last = Some((fs_idx, cur_id, self.input_seq));
+                                        }
+                                    }
                                     Self::draw_fs_image(
                                         ui, image_rect,
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),

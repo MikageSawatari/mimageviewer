@@ -83,6 +83,27 @@ impl GridItem {
                 | GridItem::PdfPage { .. }
         )
     }
+
+    /// パフォーマンス計装用の相関キー文字列を返す。
+    /// `perf::event` の `key` に渡すことで、解析ツールが同一画像に関する
+    /// 一連のイベントを一意に紐付けられる。
+    pub fn perf_key(&self) -> String {
+        match self {
+            GridItem::Folder(p) => format!("dir::{}", p.display()),
+            GridItem::Image(p) | GridItem::Video(p) => format!("{}", p.display()),
+            GridItem::ZipFile(p) => format!("zipfile::{}", p.display()),
+            GridItem::PdfFile(p) => format!("pdffile::{}", p.display()),
+            GridItem::ZipImage { zip_path, entry_name } => {
+                format!("zip::{}#{}", zip_path.display(), entry_name)
+            }
+            GridItem::ZipSeparator { dir_display } => {
+                format!("zipsep::{dir_display}")
+            }
+            GridItem::PdfPage { pdf_path, page_num, .. } => {
+                format!("pdf::{}#{}", pdf_path.display(), page_num)
+            }
+        }
+    }
 }
 
 /// PDF ページのカタログキーを生成する。

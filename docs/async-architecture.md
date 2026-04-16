@@ -173,3 +173,75 @@ std::thread::spawn(move || {
 - PDF レンダリング: 3 ワーカー並列で Cold 1441ms → 10ms (2 枚目以降)
 - JPEG デコード: turbojpeg で 1.5〜2.4 倍高速化 (5MB 超は image crate にフォールバック)
 - キャンセル遅延: 最大 1 枚デコード分 (数百 ms)
+
+---
+
+## 7. パフォーマンス計装 (perf.rs)
+
+「キー入力 → 画面表示」レイテンシを後から解析するための構造化イベントログ。
+既存 `logger.rs` (人間可読) はそのまま残り、`perf.rs` が JSON Lines を別ファイルに書く。
+
+### 7.1 有効化
+
+- **CLI 引数**: `mimageviewer.exe --perf-log` を付けたときのみ ON
+- **無効時のコスト**: `perf::is_enabled()` の Atomic 1 回読みのみで `perf::event` は即 return
+- **出力先**: `%APPDATA%\mimageviewer\logs\perf_events.jsonl` (起動毎に truncate)
+
+### 7.2 `input_seq` の伝搬規約
+
+`App` が `input_seq: u64` を持ち、**ユーザー入力イベント発生時のみ** `bump_input_seq()` で +1 する。
+フレーム境界では増えない。0 は「相関なし」として予約。
+
+| 発火箇所 | 種別 | 備考 |
+| --- | --- | --- |
+| `ui_fullscreen.rs::render_fullscreen_viewport` | `fs_key` / `fs_wheel` / `fs_close_*` | nav_delta / wheel_nav / close が確定した直後 |
+| `app.rs::handle_keyboard` | `grid_key` | カーソルキーで selected が変わった時 |
+| `app.rs::process_scroll` | `grid_wheel` / `grid_cols` | スクロールオフセットまたは列数が変わった時 |
+| `app.rs::open_fullscreen` | `fs_open` | フルスクリーン遷移 |
+
+**ワーカーへの伝搬**: UI スレッドは enqueue 時点の `input_seq` をタスク構造体にコピーする。
+
+- `thumb_loader::LoadRequest.input_seq` — サムネイルワーカー用
+- フルスクリーン非同期ロード: `start_fs_load` が `perf_seq` をクロージャにムーブする
+- AI アップスケール / 色調補正ジョブ: 同様にクロージャへ
+- PDF ワーカー IPC は seq=0 (プロセス間相関は現状非対応)
+
+`App::input_seq_shared: Arc<AtomicU64>` にも同期公開しているため、必要ならワーカー側が
+即時読み取りして「処理時点での最新 seq」と比較することもできる。
+
+### 7.3 イベント構造
+
+```json
+{"t":12.345,"tid":5,"cat":"fs","kind":"paint","key":"C:\\a.jpg","seq":42,"idx":3}
+```
+
+主なカテゴリ:
+
+- `input`  — ユーザー入力 (seq が振られる唯一のカテゴリ)
+- `frame`  — 毎フレーム begin。`n` はフレーム番号
+- `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`
+- `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`
+- `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
+- `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
+
+### 7.4 解析
+
+`scripts/analyze_perf.py` で集計。主要サブコマンド:
+
+```bash
+python scripts/analyze_perf.py <path>/perf_events.jsonl summary   # 件数/カテゴリ breakdown
+python scripts/analyze_perf.py <path>/perf_events.jsonl latency   # seq → ready/paint ms
+python scripts/analyze_perf.py <path>/perf_events.jsonl priority  # 優先度違反検出
+python scripts/analyze_perf.py <path>/perf_events.jsonl thumbs    # decode 時間分布
+python scripts/analyze_perf.py <path>/perf_events.jsonl dump 42   # 特定 seq の全イベント
+python scripts/analyze_perf.py <path>/perf_events.jsonl timeline  # ガントチャート (matplotlib)
+```
+
+### 7.5 新ワーカー追加時のテンプレ
+
+1. ワーカーに渡すタスク構造体に `input_seq: u64` フィールドを追加
+2. UI スレッドの enqueue 箇所で `req.input_seq = self.input_seq` を設定
+3. UI 側で `perf::event("<cat>", "enqueue", key, self.input_seq, &[...])` を emit
+4. ワーカー側で `perf::event("<cat>", "begin"/"end", key, req.input_seq, &[...])` を emit
+5. Ready 遷移 (texture upload 完了) で `perf::event("<cat>", "ready", ...)` を emit
+6. `docs/async-architecture.md` のこの表にエントリを追加

@@ -632,6 +632,26 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスクのスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<Vec<bool>>,
+
+    // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
+    /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
+    /// などの入力イベントで +1 する。ワーカーに投げるタスクに copy して渡し、
+    /// "入力 → 表示" のレイテンシを相関させる。0 は「未設定」の意味。
+    pub(crate) input_seq: u64,
+    /// 直近のユーザー入力時刻 (`bump_input_seq` で更新)。
+    /// 入力直後のクールダウン中はアイドル品質アップグレードを抑制するために使用。
+    pub(crate) last_input_at: Option<std::time::Instant>,
+    /// フレーム番号 (update 呼出しのたびに +1)
+    pub(crate) frame_counter: u64,
+    /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
+    pub(crate) perf_last_flush: Option<std::time::Instant>,
+    /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
+    /// 変化を検出したフレームで `fs.paint` イベントを発火する。
+    pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
+    /// ワーカーが投入時に使う「現在の input_seq」の共有コピー。
+    /// UI スレッドの `input_seq` 更新と同期して公開し、ワーカー側 (thumb) が
+    /// 自身の処理イベントを発火するときに参照する。
+    pub(crate) input_seq_shared: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for App {
@@ -827,11 +847,40 @@ impl Default for App {
             erase_base_cache: std::collections::HashMap::new(),
             mask_db: crate::mask_db::MaskDb::open().ok(),
             erase_undo_stack: std::collections::VecDeque::new(),
+            input_seq: 0,
+            last_input_at: None,
+            frame_counter: 0,
+            perf_last_flush: None,
+            fs_painted_last: None,
+            input_seq_shared: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
 
 impl App {
+    /// 指定 idx の GridItem から perf 相関キーを生成する (範囲外なら None)。
+    pub(crate) fn perf_item_key(&self, idx: usize) -> Option<String> {
+        self.items.get(idx).map(|g| g.perf_key())
+    }
+
+    /// パフォーマンス計装用の input_seq を +1 してユーザー入力イベントを記録する。
+    /// `--perf-log` 無効時はカウンタのみインクリメントし、イベント発火はしない。
+    /// 戻り値は新しい seq 値 (ワーカーに渡すタスクに埋め込む用)。
+    pub(crate) fn bump_input_seq(&mut self, kind: &str, key: Option<&str>) -> u64 {
+        self.input_seq = self.input_seq.wrapping_add(1);
+        if self.input_seq == 0 {
+            // 0 は "未設定" として予約しているのでスキップ
+            self.input_seq = 1;
+        }
+        self.last_input_at = Some(std::time::Instant::now());
+        self.input_seq_shared
+            .store(self.input_seq, std::sync::atomic::Ordering::Relaxed);
+        if crate::perf::is_enabled() {
+            crate::perf::event("input", kind, key, self.input_seq, &[]);
+        }
+        self.input_seq
+    }
+
     /// IME 変換状態を更新する (毎フレーム先頭で呼ぶ)。
     /// `ime_input_active_this_frame` に「今フレームを IME 入力として扱うか」を設定する。
     ///
@@ -1746,6 +1795,18 @@ impl App {
                             req.idx,
                             req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                         ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "thumb",
+                                "skip",
+                                None,
+                                req.input_seq,
+                                &[
+                                    ("idx", serde_json::Value::from(req.idx)),
+                                    ("reason", serde_json::Value::from("out_of_keep")),
+                                ],
+                            );
+                        }
                         continue;
                     }
                     let vis = hint_w.load(Ordering::Relaxed);
@@ -1756,6 +1817,20 @@ impl App {
                         if req.priority { "H" } else { "L" },
                         req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                     ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "thumb",
+                            "pick",
+                            None,
+                            req.input_seq,
+                            &[
+                                ("idx", serde_json::Value::from(req.idx)),
+                                ("priority", serde_json::Value::from(req.priority)),
+                                ("dist", serde_json::Value::from(dist)),
+                                ("worker", serde_json::Value::from(tag.clone())),
+                            ],
+                        );
+                    }
                     let display_px = display_px_w.load(Ordering::Relaxed);
                     process_load_request(
                         &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
@@ -1861,11 +1936,17 @@ impl App {
                         self.requested.remove(&i);
                         let [w, h] = color_image.size;
                         let rendered_at_px = w.max(h) as u32;
+                        let prev_state_was_loaded = matches!(
+                            self.thumbnails[i],
+                            ThumbnailState::Loaded { .. }
+                        );
+                        let upload_t0 = std::time::Instant::now();
                         let handle = ctx.load_texture(
                             format!("thumb_{i}"),
                             color_image,
                             egui::TextureOptions::LINEAR,
                         );
+                        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
                             from_cache,
@@ -1873,6 +1954,24 @@ impl App {
                             source_dims,
                         };
                         textures_created += 1;
+                        // perf: Pending/Evicted → Loaded の遷移時のみ ready を emit。
+                        // (アップグレードで Loaded→Loaded の遷移も発生するためフィルタ)
+                        if crate::perf::is_enabled() && !prev_state_was_loaded {
+                            let perf_key = self.perf_item_key(i);
+                            crate::perf::event(
+                                "thumb",
+                                "ready",
+                                perf_key.as_deref(),
+                                self.input_seq,
+                                &[
+                                    ("idx", serde_json::Value::from(i)),
+                                    ("w", serde_json::Value::from(w)),
+                                    ("h", serde_json::Value::from(h)),
+                                    ("from_cache", serde_json::Value::from(from_cache)),
+                                    ("upload_ms", serde_json::Value::from(upload_ms)),
+                                ],
+                            );
+                        }
                     } else if in_keep_range {
                         // 上限到達だが keep_range 内: 次フレームに持ち越す。
                         // requested は除去しない (重複リクエスト防止)
@@ -2060,11 +2159,27 @@ impl App {
                 continue;
             };
             req.priority = i >= visible_raw_start && i < visible_raw_end;
+            req.input_seq = self.input_seq;
             // ZipFile / PdfFile / Folder → heavy_io_queue、それ以外 → reload_queue
             let is_heavy = matches!(
                 self.items.get(i),
                 Some(GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::Folder(_))
             );
+            // perf: エンキューイベント (タスク種別 + 優先度 + 相関 seq)
+            if crate::perf::is_enabled() {
+                let perf_key = self.perf_item_key(i);
+                crate::perf::event(
+                    "thumb",
+                    "enqueue",
+                    perf_key.as_deref(),
+                    self.input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(i)),
+                        ("priority", serde_json::Value::from(req.priority)),
+                        ("queue", serde_json::Value::from(if is_heavy { "heavy" } else { "regular" })),
+                    ],
+                );
+            }
             if is_heavy {
                 new_heavy.push(req);
             } else {
@@ -2155,6 +2270,10 @@ impl App {
     /// 側から先に処理する。
     fn enqueue_idle_upgrades(&mut self, keep_start: usize, keep_end: usize) {
         const SCROLL_IDLE_SECS: f64 = 0.5;
+        /// ユーザー入力から何秒アイドル経過したらアップグレードを許可するか。
+        /// スクロール以外のキー操作やフルスクリーン遷移の直後も PDF ワーカーを
+        /// 占有させないために、`last_input_at` ベースのクールダウンを追加している。
+        const INPUT_IDLE_SECS: f64 = 0.5;
 
         if !self.settings.thumb_idle_upgrade {
             return;
@@ -2168,6 +2287,15 @@ impl App {
         let scroll_idle =
             self.last_scroll_change_time.elapsed().as_secs_f64() >= SCROLL_IDLE_SECS;
         if !scroll_idle {
+            return;
+        }
+
+        // 入力クールダウン: スクロール以外の入力 (キー・フルスクリーン遷移・ホイール等)
+        // の直後もアップグレード起動を抑制する。scroll_offset_y は変わらないが
+        // fs_open 等で PDF ワーカーが Critical 要求を処理中かもしれない。
+        if let Some(t) = self.last_input_at
+            && t.elapsed().as_secs_f64() < INPUT_IDLE_SECS
+        {
             return;
         }
 
@@ -2426,6 +2554,8 @@ impl App {
                 self.selected = Some(s);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
+                // perf: グリッドのカーソル移動イベントを記録
+                self.bump_input_seq("grid_key", Some(&format!("sel={s}")));
             }
 
             // スペースキー: チェック ON/OFF
@@ -2621,15 +2751,23 @@ impl App {
                 if new_cols != self.settings.grid_cols {
                     self.settings.grid_cols = new_cols;
                     self.settings.save();
+                    self.bump_input_seq("grid_cols", None);
                 }
             } else {
                 // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
                 let direction = -scroll_delta_y.signum();
+                let prev_offset = self.scroll_offset_y;
                 self.scroll_offset_y =
                     (self.scroll_offset_y + direction * cell_h).max(0.0);
                 // 行境界にスナップ
                 self.scroll_offset_y =
                     (self.scroll_offset_y / cell_h).round() * cell_h;
+                if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+                    self.bump_input_seq(
+                        "grid_wheel",
+                        Some(&format!("offset={:.0}", self.scroll_offset_y)),
+                    );
+                }
             }
         }
     }
@@ -2787,7 +2925,13 @@ impl App {
     /// 動画アイテムの場合はサムネイル＋再生ボタンを表示するだけで読み込みは不要。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
+        // perf: フルスクリーン起動イベント (新しい input_seq を割り当てる)
+        let fs_key = self.perf_item_key(idx);
+        self.bump_input_seq("fs_open", fs_key.as_deref());
         self.fullscreen_idx = Some(idx);
+        // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
+        // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
+        crate::pdf_loader::set_critical_reservation(true);
         self.fs_opened_at = Some(std::time::Instant::now());
         self.fs_focus_grace_elapsed = false;
         self.reset_erase_mode();
@@ -3273,14 +3417,70 @@ impl App {
             _ => return,
         };
 
+        // フルスクリーン現在ページ (ユーザーが待っているもの) は Critical、
+        // それ以外 (先読み) は Normal。Critical はプールの予約ワーカーで即処理される。
+        let pdf_priority = if self.fullscreen_idx == Some(idx) {
+            crate::pdf_loader::JobPriority::Critical
+        } else {
+            crate::pdf_loader::JobPriority::Normal
+        };
+
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
         let pdf_ct_tx = self.pdf_content_type_tx.clone();
         self.fs_pending.insert(idx, (Arc::clone(&cancel), rx));
 
+        // perf: ロード要求発行
+        let perf_key = self.perf_item_key(idx);
+        let perf_seq = self.input_seq;
+        if crate::perf::is_enabled() {
+            crate::perf::event("fs", "load_begin", perf_key.as_deref(), perf_seq, &[
+                ("idx", serde_json::Value::from(idx)),
+                ("is_pdf", serde_json::Value::from(pdf_page.is_some())),
+                ("is_zip", serde_json::Value::from(zip_entry.is_some())),
+                ("priority", serde_json::Value::from(format!("{pdf_priority:?}"))),
+            ]);
+        }
+        let perf_key_worker = perf_key.clone();
+
         std::thread::spawn(move || {
-            if cancel.load(Ordering::Relaxed) { return; }
+            // perf: スレッド起動直後の cancel 状態を記録し、早期終了した本数を把握する
+            let early_cancelled = cancel.load(Ordering::Relaxed);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "fs",
+                    "cancel_check",
+                    perf_key_worker.as_deref(),
+                    perf_seq,
+                    &[("cancelled", serde_json::Value::from(early_cancelled))],
+                );
+            }
+            // スレッド出口で reason を記録する小ヘルパー (全 return 直前に呼ぶ)
+            let emit_exit = |reason: &'static str| {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "fs",
+                        "thread_exit",
+                        perf_key_worker.as_deref(),
+                        perf_seq,
+                        &[("reason", serde_json::Value::from(reason))],
+                    );
+                }
+            };
+            if early_cancelled {
+                emit_exit("early_cancel");
+                return;
+            }
             let t = std::time::Instant::now();
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "fs",
+                    "decode_begin",
+                    perf_key_worker.as_deref(),
+                    perf_seq,
+                    &[],
+                );
+            }
 
             // 表示名と拡張子を取得
             let (name, ext) = if let Some(page_num) = pdf_page {
@@ -3306,14 +3506,24 @@ impl App {
             // PDF ページの場合はラスタライズ
             if let Some(page_num) = pdf_page {
                 let target_px = 4096u32;
-                match crate::pdf_loader::render_page(&path, page_num, target_px, pdf_password.as_deref(), Some(cancel.clone())) {
+                let mut pdf_exit = "pdf_ok";
+                match crate::pdf_loader::render_page(&path, page_num, target_px, pdf_password.as_deref(), Some(cancel.clone()), pdf_priority) {
                     Ok((img, content_type)) => {
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
                             "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}  {:?}",
                             img.width(), img.height(), content_type
                         ));
+                        let (w, h) = (img.width(), img.height());
                         let ci = dynamic_image_to_color_image(&img);
+                        if crate::perf::is_enabled() {
+                            crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
+                                ("ms", serde_json::Value::from(elapsed)),
+                                ("format", serde_json::Value::from("pdf")),
+                                ("w", serde_json::Value::from(w)),
+                                ("h", serde_json::Value::from(h)),
+                            ]);
+                        }
                         let _ = tx.send(FsLoadResult::Static(ci));
                         // content_type をメインスレッドに送る
                         let _ = pdf_ct_tx.send((idx, content_type));
@@ -3321,12 +3531,23 @@ impl App {
                     Err(e) => {
                         if cancel.load(Ordering::Relaxed) {
                             crate::logger::log(format!("  fs pdf render cancelled  {name}"));
+                            if crate::perf::is_enabled() {
+                                crate::perf::event("fs", "decode_cancel", perf_key_worker.as_deref(), perf_seq, &[]);
+                            }
+                            pdf_exit = "pdf_cancel";
                         } else {
                             crate::logger::log(format!("  fs pdf render FAIL: {e}  {name}"));
+                            if crate::perf::is_enabled() {
+                                crate::perf::event("fs", "decode_fail", perf_key_worker.as_deref(), perf_seq, &[
+                                    ("format", serde_json::Value::from("pdf")),
+                                ]);
+                            }
                             let _ = tx.send(FsLoadResult::Failed);
+                            pdf_exit = "pdf_fail";
                         }
                     }
                 }
+                emit_exit(pdf_exit);
                 return;
             }
 
@@ -3338,6 +3559,12 @@ impl App {
                         crate::logger::log(format!(
                             "  fs zip read FAIL: {e}  {name}"
                         ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event("fs", "decode_fail", perf_key_worker.as_deref(), perf_seq, &[
+                                ("format", serde_json::Value::from("zip_read")),
+                            ]);
+                        }
+                        emit_exit("zip_read_fail");
                         return;
                     }
                 }
@@ -3348,12 +3575,20 @@ impl App {
             // GIF: アニメーション試行 (通常パスのみ, ZIP は未対応)
             if ext == "gif" && zip_bytes.is_none() {
                 if let Some(frames) = decode_gif_frames(&path) {
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                     crate::logger::log(format!(
-                        "  fs load anim-gif: {:.0}ms  idx={idx}  {name}  {} frames",
-                        t.elapsed().as_secs_f64() * 1000.0,
+                        "  fs load anim-gif: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
                         frames.len()
                     ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
+                            ("ms", serde_json::Value::from(elapsed)),
+                            ("format", serde_json::Value::from("gif_anim")),
+                            ("frames", serde_json::Value::from(frames.len())),
+                        ]);
+                    }
                     let _ = tx.send(FsLoadResult::Animated(frames));
+                    emit_exit("gif_anim");
                     return;
                 }
             }
@@ -3361,12 +3596,20 @@ impl App {
             // PNG: APNG アニメーション試行 (通常パスのみ, ZIP は未対応)
             if ext == "png" && zip_bytes.is_none() {
                 if let Some(frames) = decode_apng_frames(&path) {
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                     crate::logger::log(format!(
-                        "  fs load anim-png: {:.0}ms  idx={idx}  {name}  {} frames",
-                        t.elapsed().as_secs_f64() * 1000.0,
+                        "  fs load anim-png: {elapsed:.0}ms  idx={idx}  {name}  {} frames",
                         frames.len()
                     ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
+                            ("ms", serde_json::Value::from(elapsed)),
+                            ("format", serde_json::Value::from("png_anim")),
+                            ("frames", serde_json::Value::from(frames.len())),
+                        ]);
+                    }
                     let _ = tx.send(FsLoadResult::Animated(frames));
+                    emit_exit("png_anim");
                     return;
                 }
             }
@@ -3395,16 +3638,31 @@ impl App {
                     };
                     let (w, h) = (img.width(), img.height());
                     let ci = dynamic_image_to_color_image(&img);
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                     crate::logger::log(format!(
-                        "  fs load: {:.0}ms  idx={idx}  {name}  {w}x{h}",
-                        t.elapsed().as_secs_f64() * 1000.0
+                        "  fs load: {elapsed:.0}ms  idx={idx}  {name}  {w}x{h}"
                     ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
+                            ("ms", serde_json::Value::from(elapsed)),
+                            ("format", serde_json::Value::from(ext.clone())),
+                            ("w", serde_json::Value::from(w)),
+                            ("h", serde_json::Value::from(h)),
+                        ]);
+                    }
                     let _ = tx.send(FsLoadResult::Static(ci));
+                    emit_exit("static_ok");
                 }
                 Err(e) => {
                     crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event("fs", "decode_fail", perf_key_worker.as_deref(), perf_seq, &[
+                            ("format", serde_json::Value::from(ext.clone())),
+                        ]);
+                    }
                     // UI が「読込中...」のまま固まらないよう、失敗を明示的に通知する
                     let _ = tx.send(FsLoadResult::Failed);
+                    emit_exit("static_fail");
                 }
             }
         });
@@ -3565,6 +3823,8 @@ impl App {
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
         self.fullscreen_idx = None;
+        // グリッドに戻るので Critical 予約を解除し、全 3 ワーカーを Normal に開放。
+        crate::pdf_loader::set_critical_reservation(false);
         self.slideshow_playing = false;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
@@ -3633,11 +3893,23 @@ impl App {
             self.ai_upscale_pending.remove(&key);
             let pixels = std::sync::Arc::new(result.image);
             let upload = clamp_for_gpu(&pixels);
+            let [w, h] = pixels.size;
+            let upload_t0 = std::time::Instant::now();
             let handle = ctx.load_texture(
                 format!("ai_fs_{key}"),
                 upload.into_owned(),
                 egui::TextureOptions::LINEAR,
             );
+            let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+            if crate::perf::is_enabled() {
+                let perf_key = self.perf_item_key(key);
+                crate::perf::event("ai", "job_ready", perf_key.as_deref(), self.input_seq, &[
+                    ("idx", serde_json::Value::from(key)),
+                    ("w", serde_json::Value::from(w)),
+                    ("h", serde_json::Value::from(h)),
+                    ("upload_ms", serde_json::Value::from(upload_ms)),
+                ]);
+            }
             // 表示中の画像のみ色調補正を即座に適用（チラつき防止）
             if self.fullscreen_idx == Some(key) {
                 self.apply_sync_adjustment(ctx, key, &pixels);
@@ -3839,6 +4111,14 @@ impl App {
             "[AI] AI processing started for idx={current_idx} denoise={:?} upscale={:?}",
             denoise_model, upscale_model
         ));
+        if crate::perf::is_enabled() {
+            let perf_key = self.perf_item_key(current_idx);
+            crate::perf::event("ai", "job_start", perf_key.as_deref(), self.input_seq, &[
+                ("idx", serde_json::Value::from(current_idx)),
+                ("denoise", serde_json::Value::from(format!("{:?}", denoise_model))),
+                ("upscale", serde_json::Value::from(format!("{:?}", upscale_model))),
+            ]);
+        }
     }
 
     /// 先読み範囲内の item_idx 集合を計算する。
@@ -4152,15 +4432,34 @@ impl App {
         let repaint = !completed.is_empty();
         for (key, result) in completed {
             self.fs_pending.remove(&key);
+            let perf_key_str = self.perf_item_key(key);
+            let upload_t0 = std::time::Instant::now();
             let entry = match result {
                 FsLoadResult::Static(ci) => {
                     let pixels = std::sync::Arc::new(ci);
                     let upload = clamp_for_gpu(&pixels);
+                    let [w, h] = pixels.size;
                     let handle = ctx.load_texture(
                         format!("fs_{key}"),
                         upload.into_owned(),
                         egui::TextureOptions::LINEAR,
                     );
+                    let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "ready",
+                            perf_key_str.as_deref(),
+                            self.input_seq,
+                            &[
+                                ("idx", serde_json::Value::from(key)),
+                                ("upload_ms", serde_json::Value::from(upload_ms)),
+                                ("w", serde_json::Value::from(w)),
+                                ("h", serde_json::Value::from(h)),
+                                ("result_kind", serde_json::Value::from("static")),
+                            ],
+                        );
+                    }
                     // 表示中の画像のみ色調補正を即座に適用（チラつき防止）
                     // 先読み分は maybe_apply_adjustment に委ねる
                     if self.fullscreen_idx == Some(key) {
@@ -4622,7 +4921,7 @@ impl App {
 
                             // 先頭1ページを親フォルダの DB にも保存
                             if page_count > 0 && !cache_map.contains_key(&folder_key) {
-                                if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
+                                if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None, crate::pdf_loader::JobPriority::Normal) {
                                     if let Some(bytes) = encode_and_save(
                                         &img, &folder_key, &catalog,
                                         *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
@@ -4637,7 +4936,7 @@ impl App {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
-                            if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
+                            if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None, crate::pdf_loader::JobPriority::Normal) {
                                 if let Some(bytes) = encode_and_save(
                                     &img, &folder_key, &catalog,
                                     *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
@@ -4671,6 +4970,28 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "frame",
+                "begin",
+                None,
+                self.input_seq,
+                &[("n", serde_json::Value::from(self.frame_counter))],
+            );
+            // 約 1 秒に 1 回 flush (BufWriter のデータをディスクへ)
+            let now = std::time::Instant::now();
+            let should_flush = self
+                .perf_last_flush
+                .map(|t| now.duration_since(t).as_millis() >= 1000)
+                .unwrap_or(true);
+            if should_flush {
+                crate::perf::flush();
+                self.perf_last_flush = Some(now);
+            }
+        }
+
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
@@ -5030,17 +5351,20 @@ fn make_load_request(
             idx, path: p.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
+            input_seq: 0,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
+            input_seq: 0,
         }),
         GridItem::PdfPage { pdf_path, page_num, .. } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: None, pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
+            input_seq: 0,
         }),
         GridItem::ZipFile(p) => {
             // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得。
@@ -5052,6 +5376,7 @@ fn make_load_request(
                 skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
                 folder_thumb_sort: None, folder_thumb_depth: 0,
+                input_seq: 0,
             })
         }
         GridItem::PdfFile(p) => {
@@ -5063,6 +5388,7 @@ fn make_load_request(
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
                 folder_thumb_sort: None, folder_thumb_depth: 0,
+                input_seq: 0,
             })
         }
         GridItem::Folder(p) => {
@@ -5073,6 +5399,7 @@ fn make_load_request(
                 skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
                 folder_thumb_sort, folder_thumb_depth,
+                input_seq: 0,
             })
         }
         _ => None,
