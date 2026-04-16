@@ -12,7 +12,7 @@
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile / PdfFile の全体走査 |
 | フルスクリーンロード | `std::thread` (使い捨て) | 1 枚ごとに spawn | フルサイズ画像デコード + アニメ展開 |
-| PDF ワーカー | **別プロセス** (`--pdf-worker`) | 3 (`PDF_WORKERS`) | PDFium は非スレッドセーフ → マルチプロセスで並列化 |
+| PDF ワーカー | **別プロセス** (`--pdf-worker`) + 各プロセス専用のディスパッチャースレッド | 3 (`POOL_SIZE`) | PDFium は非スレッドセーフ → マルチプロセスで並列化。要求は JobQueue に enqueue |
 | PDF ページ列挙 | `std::thread` | 1 (PDF 開く都度) | PDF ワーカーに列挙要求を送る |
 | AI 推論 | `std::thread` + mpsc | 1 (全モデル共通) | ort (DirectML) の upscale/denoise/inpaint |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
@@ -54,6 +54,7 @@
 | --- | --- | --- |
 | `reload_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | 通常サムネイル要求 |
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile/PdfFile 要求 |
+| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `normal` VecDeque + `normal_in_flight` + `workers_busy` を同一 Mutex で保護 |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
 
 ワーカーが要求を取り出すときは **優先度 (priority フラグ) → 距離 → forward/backward** でソート。
@@ -162,6 +163,63 @@ std::thread::spawn(move || {
 
 ワーカープロセスがクラッシュしたら、親は検出して再起動する仕組みになっている。
 新しい PDF 操作を追加する時はタイムアウト処理を忘れずに (stdout 読み取りで詰まらない)。
+
+### 5.5 try_lock + sleep ポーリングループ (禁止パターン)
+
+「`Mutex` を `try_lock` して、失敗したら sleep して再試行」というループは、**複数スレッドが
+同じ Mutex を奪い合う場面では飢餓 (starvation) を起こす**。10ms の sleep 中に fresh arrival が
+割り込んで Mutex を横取りできるため、先に待ち始めたスレッドが秒単位で待たされる。
+
+2026-04 に PDF ワーカープールで実際にこの現象が発生し、Critical 要求が 10 秒ブロックされた
+(1 ワーカーに 62 件の連続ディスパッチが集中、他の 2 ワーカーは完全にアイドル)。
+
+**代わりに使うべき設計**: **Mutex + Condvar で保護した優先度キュー + 専用ディスパッチャー
+スレッド**。
+
+```rust
+// リソース要求側 (UI スレッド等)
+fn execute(&self, job: Job) -> Result<R> {
+    let (tx, rx) = mpsc::channel();
+    {
+        let (mtx, cv) = &*self.queue;
+        let mut q = mtx.lock().unwrap();
+        q.push(job);           // critical / normal などにソート
+        cv.notify_one();       // ディスパッチャーを 1 つ起こす
+    }
+    // タイムアウト付き受信で cancel チェックを挟む
+    rx.recv_timeout(Duration::from_millis(50))
+}
+
+// ディスパッチャースレッド (ワーカーごとに 1 本)
+fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
+    loop {
+        let job = {
+            let (mtx, cv) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            loop {
+                if q.shutdown { return; }
+                if let Some(j) = q.pop_with_priority() { break j; }
+                q = cv.wait(q).unwrap();    // Condvar で起床
+            }
+        };
+        // Mutex 外でリソースを使って処理
+        let result = resource.process(job);
+        let _ = job.reply.send(result);
+    }
+}
+```
+
+**この設計の利点**:
+- 同一優先度内で **FIFO 公平性** (Condvar が queue に並んだ順で起こす)
+- 10ms ポーリングの無駄なスピン消費がなくレイテンシも低い
+- ワーカー選択が「先に空いた方の勝ち」ではなく「空いた瞬間に push されたジョブを pop」になる
+- `shutdown` フラグと `notify_all()` だけで停止シグナルが全スレッドに伝わる
+- cancel は pop 時と requester 側 (`recv_timeout` ループ) の両方でチェック可能
+
+実装は `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher` を参照。
+
+**いつ try_lock を使って良いか**: 非ブロッキングな best-effort 取得 (「取れたら使う、取れなければ
+今回は諦める」) のみ。`try_lock` の後に sleep して再試行する構造は避ける。
 
 ---
 

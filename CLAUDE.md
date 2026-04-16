@@ -211,6 +211,19 @@ egui::Window::new("...").show(ctx, |ui| {
 - HEIC/AVIF/JXL/TIFF/RAW は WIC 経由（`unsafe` ブロックに局所化）。
 - ONNX Runtime (ort crate) 経由の AI 推論は safe Rust API。DirectML EP で GPU アクセラレーション。
 
+### 並行処理: try_lock + sleep は使わない ⚠️
+
+「`Mutex::try_lock` に失敗したら sleep して再試行」というループは **飢餓 (starvation) を
+起こす既知のアンチパターン**。2026-04 に PDF ワーカープールで Critical 要求が 10 秒
+ブロックされる実害が発生した (詳細は [docs/async-architecture.md §5.5](docs/async-architecture.md))。
+
+- 複数スレッドが同じリソースを取り合う場合は **`Mutex + Condvar` で保護した優先度キュー +
+  専用ディスパッチャースレッド** の構造にする
+- リソース利用者は Job を enqueue して `mpsc::Receiver` で応答待ち、ディスパッチャーは
+  `Condvar::wait` で起床してキューから pop する
+- 実例: `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher`
+- `try_lock` 自体は「取れなければ今回は諦める」best-effort 用途のみ OK
+
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
