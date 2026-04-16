@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 /// PDF レンダ要求の優先度。
@@ -608,102 +608,87 @@ fn ipc_render(
 // -----------------------------------------------------------------------
 // ワーカープロセスプール (メインプロセス側)
 // -----------------------------------------------------------------------
-
-struct ProcessWorker {
-    child: Child,
-    io: Mutex<ProcessWorkerIo>,
-    /// best-effort ヒント (Mutex が実際の排他を保証)
-    busy: AtomicBool,
-}
+//
+// 設計: 優先度キュー + ディスパッチャースレッド
+//
+// 従来は `Mutex<ProcessWorkerIo>` を共有して各リクエストが try_lock ポーリング
+// する方式だったが、10ms ポーリングの隙間に新着スレッドが横取りする飢餓バグが
+// あり、特定スレッドが秒単位で詰まることがあった。
+//
+// 新設計:
+// - 共有 JobQueue (Mutex + Condvar) に Critical / Normal の 2 レベル優先度
+// - 各 worker プロセスに専用ディスパッチャースレッドを置き、stdin/stdout を
+//   スレッド内に閉じ込める (共有 Mutex 不要)
+// - リクエスト側は Job を enqueue → `mpsc::Receiver` で応答待ち (途中で
+//   cancel が立てば早期 bail)
+// - worker スレッドは Condvar で起床し、Critical を先に取り、続いて Normal
+//   (予約中は `max_normal` 制限) を pop する。pop 時に cancel チェック、
+//   セットされていれば IPC せず Err を送る。
 
 struct ProcessWorkerIo {
     stdin: std::process::ChildStdin,
     stdout: std::io::BufReader<std::process::ChildStdout>,
 }
 
-impl ProcessWorker {
-    fn spawn(exe_path: &Path) -> std::io::Result<Self> {
-        let mut cmd = Command::new(exe_path);
-        cmd.arg(PDF_WORKER_ARG)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+fn spawn_worker_process(exe_path: &Path) -> std::io::Result<(Child, ProcessWorkerIo)> {
+    let mut cmd = Command::new(exe_path);
+    cmd.arg(PDF_WORKER_ARG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let mut child = cmd.spawn()?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "no stdin")
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "no stdout")
-        })?;
-
-        Ok(ProcessWorker {
-            child,
-            io: Mutex::new(ProcessWorkerIo {
-                stdin,
-                stdout: std::io::BufReader::new(stdout),
-            }),
-            busy: AtomicBool::new(false),
-        })
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    /// Mutex を取得済みの状態で IPC 送信 + 応答受信だけを行う。
-    ///
-    /// 呼び出し側は `io.try_lock()` を成功させてから `busy=true` に設定し、
-    /// この関数を呼ぶこと。戻り時に `busy=false` に戻すのも呼び出し側の責任。
-    fn send_recv_locked(
-        io: &mut ProcessWorkerIo,
-        request: &[u8],
-    ) -> std::io::Result<Vec<u8>> {
-        write_msg(&mut io.stdin, request)?;
-        read_msg(&mut io.stdout)
-    }
-
-    fn shutdown(&self) {
-        if let Ok(mut io) = self.io.lock() {
-            let _ = write_msg(&mut io.stdin, &encode_shutdown_request());
-        }
-    }
+    let mut child = cmd.spawn()?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "no stdin")
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "no stdout")
+    })?;
+    Ok((child, ProcessWorkerIo { stdin, stdout: std::io::BufReader::new(stdout) }))
 }
 
-impl Drop for ProcessWorker {
-    fn drop(&mut self) {
-        self.shutdown();
-        let _ = self.child.wait();
-    }
+fn send_recv_io(
+    io: &mut ProcessWorkerIo,
+    request: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    write_msg(&mut io.stdin, request)?;
+    read_msg(&mut io.stdout)
+}
+
+/// ディスパッチャースレッドに渡される 1 件のジョブ。
+struct Job {
+    request: Vec<u8>,
+    cancel: Option<Arc<AtomicBool>>,
+    reply: mpsc::Sender<std::io::Result<Vec<u8>>>,
+    priority: JobPriority,
+    enqueued_at: std::time::Instant,
+    /// perf 相関キー (存在すれば dispatch/cancel イベントに載せる)
+    perf_key: Option<String>,
+}
+
+struct JobQueue {
+    critical: std::collections::VecDeque<Job>,
+    normal: std::collections::VecDeque<Job>,
+    /// 現在処理中の Normal ジョブ数 (`max_normal` 以下に制限)
+    normal_in_flight: usize,
+    /// 現在 IPC 実行中のワーカー数 (perf 用)
+    workers_busy: usize,
+    /// Drop 時に true になり、ディスパッチャースレッドが cleanly 終了する
+    shutdown: bool,
 }
 
 struct PdfWorkerPool {
-    workers: Vec<Arc<ProcessWorker>>,
-    next: AtomicUsize,
-    /// Normal 優先度ジョブの同時実行数 (`max_normal` 以下に制限)
-    normal_in_flight: Mutex<usize>,
-    normal_cv: Condvar,
-    /// Normal 同時実行の上限 = `workers.len() - 1`
-    /// (ワーカーが 1 つ以下なら 0: Critical のみ走行可)
-    max_normal: usize,
-}
-
-/// `PdfWorkerPool::execute` が `Normal` 優先度で取得した並列スロットを、
-/// 処理終了時 (成功/失敗/panic を問わず) に自動で返却する RAII ガード。
-struct NormalSlotGuard<'a> {
-    pool: &'a PdfWorkerPool,
-}
-
-impl<'a> Drop for NormalSlotGuard<'a> {
-    fn drop(&mut self) {
-        let mut count = self.pool.normal_in_flight.lock().unwrap();
-        *count = count.saturating_sub(1);
-        drop(count);
-        self.pool.normal_cv.notify_one();
-    }
+    queue: Arc<(Mutex<JobQueue>, Condvar)>,
+    /// 起動したワーカープロセス (subprocess) の数
+    worker_count: usize,
+    /// ディスパッチャースレッド (Pool drop 時に join する)
+    dispatcher_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 const POOL_SIZE: usize = 3;
@@ -719,12 +704,31 @@ impl PdfWorkerPool {
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
         let _ = ensure_dll_extracted();
 
-        let mut workers = Vec::with_capacity(POOL_SIZE);
+        let queue = Arc::new((
+            Mutex::new(JobQueue {
+                critical: std::collections::VecDeque::new(),
+                normal: std::collections::VecDeque::new(),
+                normal_in_flight: 0,
+                workers_busy: 0,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+
+        let mut dispatcher_threads = Vec::with_capacity(POOL_SIZE);
+        let mut worker_count = 0usize;
         for i in 0..POOL_SIZE {
-            match ProcessWorker::spawn(&exe_path) {
-                Ok(w) => {
-                    crate::logger::log(format!("pdf-pool: worker {i} started (pid={})", w.child.id()));
-                    workers.push(Arc::new(w));
+            match spawn_worker_process(&exe_path) {
+                Ok((child, io)) => {
+                    let pid = child.id();
+                    crate::logger::log(format!("pdf-pool: worker {i} started (pid={pid})"));
+                    worker_count += 1;
+                    let q = Arc::clone(&queue);
+                    let handle = std::thread::Builder::new()
+                        .name(format!("pdf-pool-{i}"))
+                        .spawn(move || run_dispatcher(i, q, child, io))
+                        .expect("failed to spawn pdf-pool dispatcher thread");
+                    dispatcher_threads.push(handle);
                 }
                 Err(e) => {
                     crate::logger::log(format!("pdf-pool: worker {i} spawn failed: {e}"));
@@ -732,72 +736,22 @@ impl PdfWorkerPool {
             }
         }
 
-        if workers.is_empty() {
+        if worker_count == 0 {
             crate::logger::log("pdf-pool: WARNING: no workers spawned, falling back to in-process");
         } else {
-            crate::logger::log(format!("pdf-pool: {} workers ready", workers.len()));
+            crate::logger::log(format!("pdf-pool: {worker_count} workers ready"));
         }
 
-        let max_normal = workers.len().saturating_sub(1);
         PdfWorkerPool {
-            workers,
-            next: AtomicUsize::new(0),
-            normal_in_flight: Mutex::new(0),
-            normal_cv: Condvar::new(),
-            max_normal,
+            queue,
+            worker_count,
+            dispatcher_threads: Mutex::new(dispatcher_threads),
         }
     }
 
-    /// `Normal` 優先度用の並列スロットを 1 つ取得する。
-    /// `max_normal` 未満になるまで待機し、待機中に cancel が立てば Err を返す。
-    /// 成功時は `NormalSlotGuard` を返し、drop されるとスロットが解放される。
-    ///
-    /// `CRITICAL_RESERVATION_ACTIVE` が false のときはスロット制限を無視して即取得する
-    /// (グリッドのみ表示中: 全 3 ワーカーを Normal に開放)。
-    fn acquire_normal_slot<'a>(
-        &'a self,
-        cancel: Option<&Arc<AtomicBool>>,
-    ) -> std::io::Result<NormalSlotGuard<'a>> {
-        let t_wait_start = std::time::Instant::now();
-        let mut count = self.normal_in_flight.lock().unwrap();
-        loop {
-            if let Some(c) = cancel
-                && c.load(Ordering::Relaxed)
-            {
-                if crate::perf::is_enabled() {
-                    let waited_ms = t_wait_start.elapsed().as_secs_f64() * 1000.0;
-                    crate::perf::event("pdf", "normal_slot_cancel", None, 0, &[
-                        ("waited_ms", serde_json::Value::from(waited_ms)),
-                    ]);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "cancelled while waiting for normal slot",
-                ));
-            }
-            // フルスクリーン非表示中は予約不要 → 即取得
-            let reservation = critical_reservation_active();
-            if !reservation || *count < self.max_normal {
-                *count += 1;
-                if crate::perf::is_enabled() {
-                    let waited_ms = t_wait_start.elapsed().as_secs_f64() * 1000.0;
-                    if waited_ms > 1.0 {
-                        crate::perf::event("pdf", "normal_slot_acquired", None, 0, &[
-                            ("waited_ms", serde_json::Value::from(waited_ms)),
-                            ("in_flight", serde_json::Value::from(*count)),
-                            ("reserved", serde_json::Value::from(reservation)),
-                        ]);
-                    }
-                }
-                return Ok(NormalSlotGuard { pool: self });
-            }
-            // max_normal に達している → cancel チェックのため timeout 付きで待機
-            let (c, _) = self
-                .normal_cv
-                .wait_timeout(count, std::time::Duration::from_millis(50))
-                .unwrap();
-            count = c;
-        }
+    /// 現在 IPC 実行中のワーカー数 (perf イベント用の snapshot)。
+    fn workers_busy(&self) -> usize {
+        self.queue.0.lock().map(|q| q.workers_busy).unwrap_or(0)
     }
 
     fn execute(
@@ -805,94 +759,65 @@ impl PdfWorkerPool {
         request: &[u8],
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
+        perf_key: Option<String>,
     ) -> std::io::Result<Vec<u8>> {
-        if self.workers.is_empty() {
+        if self.worker_count == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "no pdf worker processes available",
             ));
         }
 
-        // Normal 優先度は `max_normal` までしか同時実行できない。
-        // ガードは関数終了時に drop されてスロットを解放する。
-        let _slot = if priority == JobPriority::Normal && self.max_normal > 0 {
-            Some(self.acquire_normal_slot(cancel)?)
-        } else {
-            None
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let job = Job {
+            request: request.to_vec(),
+            cancel: cancel.cloned(),
+            reply: reply_tx,
+            priority,
+            enqueued_at: std::time::Instant::now(),
+            perf_key,
         };
 
-        // Lazy worker selection: 特定のワーカーに縛られず、毎 iteration 全ワーカーの
-        // Mutex を try_lock する。これで「busy な別ワーカーで延々待つ」飢餓を防ぐ。
-        // 先行の try_lock loop 設計 (worker 固定) ではポーリング 10ms の隙間に
-        // fresh arrival が try_lock を横取りして、特定スレッドが何秒も詰まる問題があった。
-        let t_wait_start = std::time::Instant::now();
-        let start_idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        loop {
-            if let Some(c) = cancel
-                && c.load(Ordering::Relaxed)
-            {
-                let waited_ms = t_wait_start.elapsed().as_secs_f64() * 1000.0;
-                if crate::perf::is_enabled() {
-                    crate::perf::event("pdf", "pool_cancel_in_wait", None, 0, &[
-                        ("waited_ms", serde_json::Value::from(waited_ms)),
-                    ]);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "cancelled during queue wait",
-                ));
+        // Job をキューに積んで worker を 1 つ起こす
+        {
+            let (mtx, cv) = &*self.queue;
+            let mut q = mtx.lock().unwrap();
+            match priority {
+                JobPriority::Critical => q.critical.push_back(job),
+                JobPriority::Normal => q.normal.push_back(job),
             }
+            cv.notify_one();
+        }
 
-            // 全ワーカーを start_idx から順に try_lock。成功したワーカーを使う。
-            for offset in 0..self.workers.len() {
-                let idx = (start_idx + offset) % self.workers.len();
-                let w = &self.workers[idx];
-                match w.io.try_lock() {
-                    Ok(mut io_guard) => {
-                        // Mutex 取得成功
-                        w.busy.store(true, Ordering::Relaxed);
-                        let wait_ms = t_wait_start.elapsed().as_secs_f64() * 1000.0;
+        // 応答を待つ。cancel フラグが途中で立てば早期に bail する。
+        // (キューに残ったままのジョブも、最終的に worker が pop 時に cancel を見て捨てる)
+        let t_wait = std::time::Instant::now();
+        loop {
+            match reply_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(c) = cancel
+                        && c.load(Ordering::Relaxed)
+                    {
                         if crate::perf::is_enabled() {
-                            crate::perf::event("pdf", "pool_dispatch", None, 0, &[
-                                ("wait_ms", serde_json::Value::from(wait_ms)),
-                                ("pid", serde_json::Value::from(w.child.id())),
+                            let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+                            crate::perf::event("pdf", "pool_cancel_requester", None, 0, &[
+                                ("waited_ms", serde_json::Value::from(waited_ms)),
                             ]);
                         }
-
-                        // 取得直後に再度 cancel チェック
-                        if let Some(c) = cancel
-                            && c.load(Ordering::Relaxed)
-                        {
-                            w.busy.store(false, Ordering::Relaxed);
-                            if crate::perf::is_enabled() {
-                                crate::perf::event("pdf", "pool_cancel_after_lock", None, 0, &[
-                                    ("wait_ms", serde_json::Value::from(wait_ms)),
-                                    ("pid", serde_json::Value::from(w.child.id())),
-                                ]);
-                            }
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "cancelled after lock",
-                            ));
-                        }
-
-                        let result = ProcessWorker::send_recv_locked(&mut io_guard, request);
-                        drop(io_guard);
-                        w.busy.store(false, Ordering::Relaxed);
-                        return result;
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) => continue,
-                    Err(std::sync::TryLockError::Poisoned(e)) => {
                         return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("lock poisoned: {e}"),
+                            std::io::ErrorKind::Interrupted,
+                            "cancelled while waiting for reply",
                         ));
                     }
                 }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "pdf-pool dispatcher disconnected",
+                    ));
+                }
             }
-
-            // どのワーカーも busy: 10ms 待って再試行
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -956,6 +881,138 @@ impl PdfWorkerPool {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to create RgbaImage")
         })?;
         Ok((image::DynamicImage::ImageRgba8(img_buf), content_type))
+    }
+}
+
+/// ディスパッチャースレッドのメインループ。
+///
+/// キューを覗き込み、Critical > Normal の順に pop して IPC を実行する。
+/// Normal は `critical_reservation_active()` が true のとき
+/// `worker_count - 1` 件までしか同時に走らない (1 ワーカー分を Critical 用に予約)。
+///
+/// `shutdown` フラグが立つと、サブプロセスに shutdown メッセージを送って
+/// 子プロセスの終了を待ち、スレッド自体も終了する。
+fn run_dispatcher(
+    worker_id: usize,
+    queue: Arc<(Mutex<JobQueue>, Condvar)>,
+    mut child: Child,
+    mut io: ProcessWorkerIo,
+) {
+    let pid = child.id();
+    let worker_count = POOL_SIZE;
+
+    loop {
+        // ── キューから 1 件取る ──
+        let job = {
+            let (mtx, cv) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            loop {
+                if q.shutdown {
+                    break None;
+                }
+                // Critical を最優先
+                if let Some(j) = q.critical.pop_front() {
+                    q.workers_busy = q.workers_busy.saturating_add(1);
+                    break Some(j);
+                }
+                // Normal: 予約中なら max_normal 制限
+                let reservation = critical_reservation_active();
+                let max_n = if reservation {
+                    worker_count.saturating_sub(1)
+                } else {
+                    worker_count
+                };
+                if q.normal_in_flight < max_n
+                    && let Some(j) = q.normal.pop_front()
+                {
+                    q.normal_in_flight += 1;
+                    q.workers_busy = q.workers_busy.saturating_add(1);
+                    break Some(j);
+                }
+                // 取れなかった → Condvar で寝る
+                q = cv.wait(q).unwrap();
+            }
+        };
+
+        let Some(job) = job else {
+            // shutdown
+            break;
+        };
+
+        let is_normal = job.priority == JobPriority::Normal;
+
+        // ── cancel チェック (pop 後): 立っていれば IPC せず Err を送る ──
+        let cancelled = job
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+
+        if cancelled {
+            if crate::perf::is_enabled() {
+                let waited_ms = job.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                crate::perf::event("pdf", "pool_cancel_queued", job.perf_key.as_deref(), 0, &[
+                    ("waited_ms", serde_json::Value::from(waited_ms)),
+                    ("pid", serde_json::Value::from(pid)),
+                ]);
+            }
+            let _ = job.reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled in queue",
+            )));
+        } else {
+            // ── IPC 実行 ──
+            if crate::perf::is_enabled() {
+                let wait_ms = job.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                crate::perf::event("pdf", "pool_dispatch", job.perf_key.as_deref(), 0, &[
+                    ("wait_ms", serde_json::Value::from(wait_ms)),
+                    ("pid", serde_json::Value::from(pid)),
+                    ("priority", serde_json::Value::from(format!("{:?}", job.priority))),
+                ]);
+            }
+            let result = send_recv_io(&mut io, &job.request);
+            // reply 側 (requester) が既に recv_timeout で bail していると送信は失敗するが、
+            // 無視してよい (結果は棄却されるだけで副作用なし)
+            let _ = job.reply.send(result);
+        }
+
+        // ── 完了: カウンタ更新 + 他ワーカーを起こす ──
+        {
+            let (mtx, cv) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.workers_busy = q.workers_busy.saturating_sub(1);
+            if is_normal {
+                q.normal_in_flight = q.normal_in_flight.saturating_sub(1);
+            }
+            // 他ワーカーが Normal スロット待ちで寝ている可能性があるので notify_all。
+            // (Critical が来た/Normal スロットが空いた、の両方ともこれで波及する)
+            cv.notify_all();
+        }
+
+        let _ = worker_id; // 名前付きスレッド用の参考、未使用
+    }
+
+    // ── Shutdown パス ──
+    crate::logger::log(format!("pdf-pool: worker {worker_id} shutting down (pid={pid})"));
+    let _ = write_msg(&mut io.stdin, &encode_shutdown_request());
+    let _ = child.wait();
+}
+
+impl Drop for PdfWorkerPool {
+    fn drop(&mut self) {
+        // ディスパッチャースレッドに shutdown を通知
+        {
+            let (mtx, cv) = &*self.queue;
+            if let Ok(mut q) = mtx.lock() {
+                q.shutdown = true;
+                cv.notify_all();
+            }
+        }
+        // 全スレッドを join (各スレッドが自分の子プロセスを終了させる)
+        if let Ok(mut threads) = self.dispatcher_threads.lock() {
+            for h in threads.drain(..) {
+                let _ = h.join();
+            }
+        }
     }
 }
 
@@ -1159,10 +1216,11 @@ pub fn enumerate_pages(
     password: Option<&str>,
 ) -> std::io::Result<Vec<PdfPageEntry>> {
     let pool = get_pool();
-    if !pool.workers.is_empty() {
+    if pool.worker_count > 0 {
         let req = encode_enumerate_request(pdf_path, password);
         // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
-        let resp = pool.execute(&req, None, JobPriority::Normal)?;
+        let perf_key = format!("pdffile::{}", pdf_path.display());
+        let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key))?;
         return PdfWorkerPool::parse_enumerate_response(&resp);
     }
     // フォールバック: in-process ワーカー
@@ -1193,23 +1251,19 @@ pub fn render_page(
     let t0 = std::time::Instant::now();
 
     let pool = get_pool();
-    if !pool.workers.is_empty() {
+    if pool.worker_count > 0 {
         if perf_enabled {
-            let busy_count = pool
-                .workers
-                .iter()
-                .filter(|w| w.busy.load(Ordering::Relaxed))
-                .count();
+            let busy_count = pool.workers_busy();
             crate::perf::event("pdf", "pool_send", Some(&perf_key), 0, &[
                 ("page", serde_json::Value::from(page_num)),
                 ("target_px", serde_json::Value::from(target_px)),
                 ("busy", serde_json::Value::from(busy_count)),
-                ("total", serde_json::Value::from(pool.workers.len())),
+                ("total", serde_json::Value::from(pool.worker_count)),
                 ("priority", serde_json::Value::from(format!("{priority:?}"))),
             ]);
         }
         let req = encode_render_request(pdf_path, page_num, target_px, password);
-        let resp = pool.execute(&req, cancel.as_ref(), priority)?;
+        let resp = pool.execute(&req, cancel.as_ref(), priority, Some(perf_key.clone()))?;
         let result = PdfWorkerPool::parse_render_response(&resp);
         if perf_enabled {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
