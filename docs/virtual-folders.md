@@ -92,8 +92,9 @@ match grid_item {
         // PDF ワーカーで 4096px 描画
     }
     GridItem::ZipImage { zip_path, entry_name } => {
-        // ZIP から bytes 読み出し → image::load_from_memory
-        // EXIF 不可、WIC 不可、アニメーション不可
+        // ZIP から bytes 読み出し → image::load_from_memory → 失敗時 WIC ストリームフォールバック
+        // (SHCreateMemStream + IWICImagingFactory::CreateDecoderFromStream)
+        // EXIF 不可、アニメーション不可
     }
     GridItem::Image(path) => {
         // image::open → 失敗時 WIC フォールバック
@@ -107,11 +108,12 @@ match grid_item {
 **ZipImage でできないことリスト**:
 
 - EXIF Orientation 自動回転 (rexif がパスを要求)
-- HEIC/AVIF/JXL/TIFF/RAW の WIC デコード (WIC もパス API)
 - GIF / APNG アニメーション (fs_animation がパス API)
 
-これらを ZipImage でも動かしたい場合は、バイト版の API を追加する必要がある。
-「ZIP 内の HEIC が開けない」のは仕様ではなくこの制約による。
+WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
+直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF/RAW も開ける
+(対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
+ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
 
 ### 3.3 回転 / 補正 / 消しゴムマスクのキー
 

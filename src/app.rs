@@ -3393,9 +3393,15 @@ impl App {
 
             // 静止画フォールバック
             // image クレート → (失敗時) WIC の順で試す
-            // ZIP エントリの場合は WIC がファイルパスを必要とするため image クレートのみ
+            // ZIP エントリは SHCreateMemStream + CreateDecoderFromStream 経由で WIC へフォールバック
             let open_result = if let Some(bytes) = zip_bytes {
-                image::load_from_memory(&bytes)
+                match image::load_from_memory(&bytes) {
+                    Ok(img) => Ok(img),
+                    Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
+                        Some(img) => Ok(img),
+                        None => Err(e),
+                    },
+                }
             } else {
                 match image::open(&path) {
                     Ok(img) => Ok(img),
