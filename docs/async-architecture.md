@@ -16,7 +16,7 @@
 | PDF ページ列挙 | `std::thread` | 1 (PDF 開く都度) | PDF ワーカーに列挙要求を送る |
 | AI 推論 | `std::thread` + mpsc | 1 (全モデル共通) | ort (DirectML) の upscale/denoise/inpaint |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
-| フォルダナビゲーション | `std::thread` | 1 (Ctrl+↑↓ 都度) | 深さ優先で次フォルダを検索 |
+| フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
@@ -78,6 +78,32 @@
 5. 各種キャッシュ (`fs_cache`, `adjustment_cache`, `ai_upscale_cache`, `rotation_cache` …) をクリア
 
 **旧プールを毎回捨てる**のが肝。同じプールを使い回さないので競合を気にしなくてよい。
+
+### 3.1.5 フォルダナビゲーション (Ctrl+↑↓) のキャンセル + アキュームレート
+
+Ctrl+↑/↓ はフォルダツリーを DFS で辿って次の「画像/動画/ZIP/PDF があるフォルダ」を
+見つけるが、キーリピート (30Hz) で連打すると、過去は毎プレスで新スレッドを spawn +
+旧スレッドに cancel を投げる設計だった。ただし `navigate_folder_with_skip` 自体は
+cancel を見ていなかったので、cancel 済みスレッドも DFS を最後まで走り切り、
+並行 DFS が FS を奪い合って単発 DFS が 200ms → 1s 級に遅延する事故を起こしていた
+(2026-04 セッションで実測、PDF だらけの scan フォルダで顕著)。
+
+現在の挙動 (2026-04 修正後):
+
+- `navigate_folder_with_skip` と `folder_should_stop` は `Option<&AtomicBool>` を受け取り、
+  各 DFS ステップとディレクトリエントリ走査のたびに cancel をチェックする。旧スレッドは
+  cancel 検出時点で `None` を返して即終了 → FS 競合が消える。
+- `start_folder_nav` は in-flight 中の追加プレスを `pending_folder_nav_steps: i32` に
+  累積する (forward=+1 / backward=-1)。**新スレッドは spawn しない**。
+  累積は `±MAX_PENDING_NAV = 5` で飽和する (それ以上のプレスは捨てる) ので、
+  キーを離した後に「離したのに動き続ける」違和感が出ない (drain は最長 ~500ms)。
+- 現 nav が完了 → `load_folder` → `chain_folder_nav_if_pending` で累積が残っていれば
+  1 消費して次のステップ (新しい current からの DFS) を連鎖起動する。
+- 連打中に別経路のナビ (click / favsearch / address / BS) が入ると累積はクリアされ、
+  in-flight もキャンセルされる (`load_folder` → `start_loading_items` の既存処理)。
+
+これにより 30 回連打は 30 ステップ分の DFS を逐次的に進める (並行ではなく直列)。
+各 DFS 間で cancel チェックが入るので、途中で方向が反転しても即座に対応できる。
 
 ### 3.2 フルスクリーン / AI のキャンセル
 

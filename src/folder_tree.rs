@@ -71,7 +71,16 @@ pub fn is_virtual_folder(path: &Path) -> bool {
 /// - ZIP/PDF が合計2つ以上ある
 ///
 /// path が .zip/.pdf ファイル自体の場合は常に立ち寄る（仮想フォルダ）。
-pub fn folder_should_stop(path: &Path) -> bool {
+///
+/// `cancel` が指定された場合、エントリ走査中に定期的に確認し、
+/// セットされていれば `false` を返して早期離脱する (呼び出し元もキャンセルを
+/// 見ている想定なので、この戻り値は「止まるべきではない」ではなく
+/// 「判定を打ち切った」という意味で使われる)。
+pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return false;
+    }
+
     // ZIP/PDF ファイル自体はナビゲーション対象として常に立ち寄る
     if path.is_file() && is_virtual_folder(path) {
         return true;
@@ -84,6 +93,9 @@ pub fn folder_should_stop(path: &Path) -> bool {
         Err(_) => return false,
     };
     for e in entries.flatten() {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return false;
+        }
         let p = e.path();
         if is_apple_double(&p) {
             continue;
@@ -116,18 +128,29 @@ pub fn folder_should_stop(path: &Path) -> bool {
 /// Ctrl+↑↓ フォルダ移動：画像なしフォルダを最大 skip_limit 回スキップする。
 /// skip_limit 回以内に画像ありフォルダが見つかればそこへ移動。
 /// 見つからなければ直近の隣フォルダ（1ステップ先）へ移動。
+///
+/// `cancel` が指定された場合、各ステップ開始時に確認し、セットされていれば
+/// `None` を返して早期離脱する。連打で新しい要求が入ったときに旧スレッドの
+/// DFS をすぐ畳めるようにするための機構。
 pub fn navigate_folder_with_skip<F>(
     start: &Path,
     nav_fn: F,
     skip_limit: usize,
+    cancel: Option<&AtomicBool>,
 ) -> Option<PathBuf>
 where
     F: Fn(&Path) -> Option<PathBuf>,
 {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return None;
+    }
     let first = nav_fn(start)?;
     let mut candidate = first.clone();
     for _ in 0..skip_limit {
-        if folder_should_stop(&candidate) {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return None;
+        }
+        if folder_should_stop(&candidate, cancel) {
             return Some(candidate);
         }
         match nav_fn(&candidate) {

@@ -1348,9 +1348,9 @@ impl App {
             if let Some(cur) = self.current_folder.clone() {
                 let skip_limit = self.settings.folder_skip_limit;
                 let next = if delta > 0 {
-                    navigate_folder_with_skip(&cur, next_folder_dfs, skip_limit)
+                    navigate_folder_with_skip(&cur, next_folder_dfs, skip_limit, None)
                 } else {
-                    navigate_folder_with_skip(&cur, prev_folder_dfs, skip_limit)
+                    navigate_folder_with_skip(&cur, prev_folder_dfs, skip_limit, None)
                 };
                 if let Some(p) = next {
                     self.load_folder(p);

@@ -281,6 +281,10 @@ pub struct App {
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
     /// (キャンセルトークン, 結果レシーバー)
     folder_nav_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<Option<PathBuf>>)>,
+    /// Ctrl+↑↓ 連打アキュームレータ。in-flight 中の追加プレスをここに貯め、
+    /// 現 nav が完了するたびに 1 消費して次の nav を連鎖させる。
+    /// 符号: 正=forward (↓), 負=backward (↑)。異方向を押すと相殺される。
+    pending_folder_nav_steps: i32,
 
     // ── 進捗バー (段階 B/E の合算進捗表示) ─────────────────────
     /// 現フレームで検出された通常読み込みのピーク件数 (current が 0 でリセット)
@@ -690,6 +694,7 @@ impl Default for App {
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             texture_backlog: Vec::new(),
             folder_nav_pending: None,
+            pending_folder_nav_steps: 0,
             progress_normal_peak: 0,
             progress_upgrade_peak: 0,
             selected_cell_rect: None,
@@ -1163,6 +1168,7 @@ impl App {
             &current,
             nav_fn,
             self.settings.folder_skip_limit,
+            None,
         );
         let delta: isize = if forward { 1 } else { -1 };
         let Some(next) = dfs_result else {
@@ -2722,12 +2728,37 @@ impl App {
     /// `navigate_folder_with_skip` はフォルダツリーの DFS 走査 + `folder_should_stop`
     /// (`read_dir`) を行うためディスク I/O を伴い、HDD では 20-120ms かかる。
     /// UI スレッドをブロックしないよう、結果は `poll_folder_nav` で非同期に受信する。
+    ///
+    /// **連打の扱い (Step B アキュームレート)**:
+    /// in-flight 中に追加の Ctrl+↑↓ が来たら、旧スレッドをキャンセルせず
+    /// `pending_folder_nav_steps` に累積する (forward=+1, backward=-1)。
+    /// 現 nav が完了したあと `chain_folder_nav_if_pending` で次のステップを連鎖実行する。
+    /// これにより「30Hz 連打で 30 ステップ進める」挙動になり、かつ
+    /// 同時並行 DFS のファイルシステム競合を避ける。
     fn start_folder_nav(&mut self, current: PathBuf, forward: bool) {
-        // 既存のナビゲーションをキャンセル (連打対応)
-        if let Some((cancel, _)) = self.folder_nav_pending.take() {
-            cancel.store(true, Ordering::Relaxed);
-        }
+        // 連打アキュームレータの上限。キーを離した後に余韻で追加遷移が続くと
+        // 体感上「離したのに動く」違和感になるため、溜められる量を制限する。
+        // 5 なら画像フォルダの load_folder (~100ms/step) で 500ms 弱で drain され、
+        // リピート離脱直後のレスポンスが保たれる。超過分のプレスは捨てる。
+        const MAX_PENDING_NAV: i32 = 5;
 
+        if self.folder_nav_pending.is_some() {
+            // 既に nav 進行中: 連打を累積するだけ (±MAX_PENDING_NAV で飽和)
+            let delta: i32 = if forward { 1 } else { -1 };
+            self.pending_folder_nav_steps = (self.pending_folder_nav_steps + delta)
+                .clamp(-MAX_PENDING_NAV, MAX_PENDING_NAV);
+            return;
+        }
+        // 新しい nav 列開始: アキュームレータをリセットしてから spawn
+        self.pending_folder_nav_steps = 0;
+        self.spawn_folder_nav(current, forward);
+    }
+
+    /// 内部ヘルパー: DFS ワーカースレッドを spawn する。
+    /// `start_folder_nav` (ユーザー押下) と `chain_folder_nav_if_pending` (累積消化) の
+    /// 両方から呼ばれる。cancel トークンは `navigate_folder_with_skip` にも渡し、
+    /// 次のユーザー操作で即座に DFS を畳めるようにする。
+    fn spawn_folder_nav(&mut self, current: PathBuf, forward: bool) {
         let skip_limit = self.settings.folder_skip_limit;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2735,9 +2766,13 @@ impl App {
 
         std::thread::spawn(move || {
             let result = if forward {
-                navigate_folder_with_skip(&current, next_folder_dfs, skip_limit)
+                navigate_folder_with_skip(
+                    &current, next_folder_dfs, skip_limit, Some(&cancel_w),
+                )
             } else {
-                navigate_folder_with_skip(&current, prev_folder_dfs, skip_limit)
+                navigate_folder_with_skip(
+                    &current, prev_folder_dfs, skip_limit, Some(&cancel_w),
+                )
             };
             if !cancel_w.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
@@ -2745,6 +2780,19 @@ impl App {
         });
 
         self.folder_nav_pending = Some((cancel, rx));
+    }
+
+    /// 直前の folder_nav 完了後に呼ぶ。累積ステップが残っていれば次の DFS を連鎖実行。
+    fn chain_folder_nav_if_pending(&mut self) {
+        if self.pending_folder_nav_steps == 0 {
+            return;
+        }
+        let forward = self.pending_folder_nav_steps > 0;
+        // 1 ステップ消費
+        self.pending_folder_nav_steps += if forward { -1 } else { 1 };
+        if let Some(cur) = self.current_folder.clone() {
+            self.spawn_folder_nav(cur, forward);
+        }
     }
 
     /// バックグラウンドフォルダナビゲーションの結果を非同期にポーリングする。
@@ -5310,6 +5358,12 @@ impl eframe::App for App {
 
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
         let folder_nav = self.poll_folder_nav();
+        // 「この navigate は folder_nav 由来で、かつ他の nav 源に上書きされて
+        // いないか」を判定するための事前チェック。後段で連鎖起動するかの分岐に使う。
+        let folder_nav_wins = folder_nav.is_some()
+            && fav_nav.is_none()
+            && toolbar_fav_nav.is_none()
+            && keyboard_nav.is_none();
 
         // ── ナビゲーション集約 ───────────────────────────────────────
         let navigate = fav_nav
@@ -5327,6 +5381,14 @@ impl eframe::App for App {
                 self.favsearch.nav_stack.push(p.clone());
             }
             self.load_folder(p);
+            // Step B: folder_nav が成立した場合、累積ステップが残っていれば次へ連鎖。
+            // それ以外の nav 源 (click, address, favsearch 等) が勝った場合は
+            // ユーザーが Ctrl+↑↓ 連打を放棄したとみなして累積をクリアする。
+            if folder_nav_wins {
+                self.chain_folder_nav_if_pending();
+            } else {
+                self.pending_folder_nav_steps = 0;
+            }
             if self.favsearch.active {
                 self.update_favsearch_address();
             }
