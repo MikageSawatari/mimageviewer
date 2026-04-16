@@ -177,13 +177,9 @@ impl SearchIndexDb {
     /// 部分一致検索 (大文字小文字無視)。結果は表示名で昇順ソート済み。
     /// `favorite_roots` が空の場合は全件対象。
     ///
-    /// クエリは `search_query::parse` で解釈される:
-    /// - スペース区切り = AND
-    /// - `-word` = その語を含まない (NOT)
-    /// - `"..."` = フレーズとして扱う (スペース含む)
-    ///
-    /// 単純に `WHERE name LIKE %q%` ではなく、トークンごとに LIKE / NOT LIKE を
-    /// AND で重ねた WHERE 句を動的に組み立てる。
+    /// クエリ構文は `search_query::parse` を参照。トークンごとに
+    /// `name LIKE ?` / `name NOT LIKE ?` を AND で重ねる。`%` `_` `\` は
+    /// ESCAPE 節でリテラル扱いにする。
     pub fn search(
         &self,
         query: &str,

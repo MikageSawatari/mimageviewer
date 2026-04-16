@@ -26,20 +26,18 @@ fn stem_lower(path: &std::path::Path) -> String {
         .to_lowercase()
 }
 
-/// パスの拡張子が `ext` (ASCII) と一致するか (大文字小文字無視)。
-fn has_extension(path: &std::path::Path, ext: &str) -> bool {
+/// ファイルパスが PNG 拡張子か (大文字小文字無視)。
+fn is_png_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case(ext))
-        .unwrap_or(false)
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
 }
 
-/// ZIP エントリ名の拡張子が `ext` (ASCII) と一致するか (大文字小文字無視)。
-fn entry_has_extension(entry_name: &str, ext: &str) -> bool {
-    match entry_name.rsplit_once('.') {
-        Some((_, e)) => e.eq_ignore_ascii_case(ext),
-        None => false,
-    }
+/// ZIP エントリ名が PNG 拡張子か (大文字小文字無視)。
+fn is_png_entry(entry_name: &str) -> bool {
+    entry_name
+        .rsplit_once('.')
+        .is_some_and(|(_, e)| e.eq_ignore_ascii_case("png"))
 }
 
 /// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
@@ -466,8 +464,6 @@ pub struct App {
     pub(crate) slideshow_next_at: std::time::Instant,
 
     // ── フルスクリーンビューポート ─────────────────────────────
-    /// フルスクリーンビューポートが一度でも作成されたか
-    pub(crate) fs_viewport_created: bool,
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
     /// フルスクリーン開始時刻（フォーカス移行のグレース期間用）
@@ -753,7 +749,6 @@ impl Default for App {
             spread_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
-            fs_viewport_created: false,
             fs_viewport_shown: false,
             fs_opened_at: None,
             fs_focus_grace_elapsed: false,
@@ -3075,7 +3070,7 @@ impl App {
                 }
                 GridItem::Image(path) => {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let meta_text = if has_extension(path, "png") {
+                    let meta_text = if is_png_path(path) {
                         crate::png_metadata::build_searchable_from_path(path)
                     } else {
                         String::new()
@@ -3085,7 +3080,7 @@ impl App {
                     }
                 }
                 GridItem::ZipImage { zip_path, entry_name } => {
-                    if entry_has_extension(entry_name, "png") {
+                    if is_png_entry(entry_name) {
                         zip_png_groups
                             .entry(zip_path.clone())
                             .or_default()
@@ -3565,12 +3560,9 @@ impl App {
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
     ///
-    /// `fs_viewport_shown` はここでは **落とさない**。
-    /// ビューポート自体の非表示化は `keep_fullscreen_viewport_alive` が
-    /// `ViewportCommand::Visible(false)` を送って行い、その直後に
-    /// `fs_viewport_shown` を false にする。ここで先に落とすと
-    /// keep_fullscreen_viewport_alive が「もう非表示済み」と誤判定して
-    /// Visible(false) を送らず、OS 上のウィンドウが残ってしまう。
+    /// `fs_viewport_shown` は意図的に残す: 次フレームの
+    /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
+    /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
         self.fullscreen_idx = None;
         self.slideshow_playing = false;

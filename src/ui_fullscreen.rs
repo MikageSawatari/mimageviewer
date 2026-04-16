@@ -216,22 +216,14 @@ impl App {
             fs_builder,
             |_ctx, _class| {},
         );
-        // ViewportBuilder::with_visible(false) は既存ビューポートの可視性を更新しない
-        // (.with_visible のドキュメント: "Sets whether the window will be initially
-        //  visible or hidden") ため、フルスクリーン終了時に残ったウィンドウを確実に
-        // 非表示化するために明示的に Visible(false) コマンドを送る。
-        // fs_viewport_shown が true だった = ユーザー向けに表示されていた状態なら
-        // コマンドを送って消し、同時にフラグを落として連続送信を防ぐ。
+        // ViewportBuilder::with_visible(false) は「initial」可視性しか制御しないため、
+        // 一度表示済みのビューポートを隠すには明示的に Visible(false) を送る必要がある。
+        // 送信直前に DWM トランジションを無効化して Win11 のフェードアウトを抑止する。
         if self.fs_viewport_shown {
-            // DWM のフェードアウトアニメーションを抑止する。
-            // EnumThreadWindows でメイン + フルスクリーンの HWND を列挙し
-            // DWMWA_TRANSITIONS_FORCEDISABLED を適用 (冪等)。
-            // HWND が確実に存在する隠す直前に呼ぶのが最も安全。
             crate::dwm_transitions::disable_transitions_for_thread_windows();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
             self.fs_viewport_shown = false;
         }
-        self.fs_viewport_created = true;
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
@@ -523,7 +515,6 @@ impl App {
             },
         );
 
-        self.fs_viewport_created = true;
         self.fs_viewport_shown = true;
 
         // ── ナビゲーション & スライドショー処理 ──

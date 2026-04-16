@@ -10,9 +10,11 @@ use std::io::Read;
 use std::path::Path;
 
 /// Negative Prompt を含みうる AI 生成メタデータの tEXt キー。
-/// `detect_and_parse` の分岐キー、および `build_searchable_from_chunks` で
-/// 除外する生キーと一致させる必要がある。片方だけ更新すると検索から
-/// Negative prompt が漏れる。
+/// `build_searchable_from_chunks` の Unknown フォールバックで素の値を
+/// 取り込まないよう除外するためのリスト。`detect_and_parse` に新しい AI
+/// フォーマットの分岐を追加したら、その起点キーをここにも足さないと
+/// 「未検出時に Negative prompt を含んだ生文字列ごと検索対象に入ってしまう」
+/// 不具合になる。
 const AI_METADATA_KEYS: &[&str] = &["parameters", "prompt", "workflow", "Description"];
 
 // ---------------------------------------------------------------------------
@@ -255,8 +257,8 @@ fn detect_and_parse(chunks: &[(String, String)]) -> Option<AiMetadata> {
 /// - ComfyUI: `extracted_prompts` + `sampler_params`
 /// - Unknown: 全チャンク値 (正負の区別ができないため全部含める)
 ///
-/// 各値は改行区切りで連結される。呼び出し側で小文字化してから
-/// `search_query::matches_lower` に渡すこと。
+/// 各値は改行区切りで連結される。`search_query::matches` に渡せば内部で
+/// 小文字化されるので呼び出し側での前処理は不要。
 pub fn build_searchable_text(meta: &AiMetadata) -> String {
     let mut out = String::new();
     match meta {

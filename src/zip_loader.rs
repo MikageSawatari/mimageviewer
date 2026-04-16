@@ -151,15 +151,8 @@ pub fn read_first_image_bytes(zip_path: &Path) -> Option<(String, Vec<u8>)> {
 /// オーバーヘッドが発生する (エントリあたり数 ms)。現状のサムネイル
 /// 生成レート (1 スレッドあたり 50-100 枚/秒) であれば許容範囲。
 pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Vec<u8>> {
-    let file = File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(BufReader::new(file))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut entry = archive
-        .by_name(entry_name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    let mut archive = open_archive(zip_path)?;
+    read_entry_from_archive(&mut archive, entry_name)
 }
 
 /// 複数エントリをまとめて読むときのアーカイブハンドル型。
