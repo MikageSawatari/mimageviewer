@@ -10,7 +10,7 @@
 //!     - 「全画像から削除」 — 現在の一覧の全画像ページから個別設定を削除 (標準に戻す)
 //!     - 「標準にする」     — 現在のパラメータを settings.global_preset にコピー
 //!     - 「個別設定を解除」 — 現在のページの個別設定を削除 (標準値に戻す)
-//! - 保存スロット 10 個: クリック or Shift+数字で現在のページに適用
+//! - 保存スロット 10 個: クリック or Ctrl+数字で現在のページに適用
 
 use eframe::egui;
 
@@ -397,7 +397,7 @@ impl App {
                         load_from_slot = Some(slot_idx);
                     }
                     if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                        name_resp.on_hover_text(format!("{} をこのページに適用 (Shift+{})", s.name, key_label));
+                        name_resp.on_hover_text(format!("{} をこのページに適用 (Ctrl+{})", s.name, key_label));
                     }
 
                     let save_btn = egui::Button::new(

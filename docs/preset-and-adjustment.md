@@ -40,8 +40,14 @@ effective = adjustment_page_params.get(idx) ?? settings.global_preset
 `AdjustParams` が「現在のページ個別パラメータ」として書き込まれる
 (`App::set_page_params(idx, params)`)。スコープ切替という明示操作は存在しない。
 
-結果が identity (無補正 + AI なし) になった場合、DB 側は自動的にレコード削除され、
-次回以降はグローバルへフォールバックする。
+`set_page_params` は **「個別パラメータがグローバルプリセットと完全一致」** したときだけ
+個別レコードを削除する (フォールバックでグローバルが使われるため保存不要)。
+旧バージョンは `is_removable()` (= identity かつ AI 未使用) で削除判定していたが、
+**「グローバルが AI ON、特定ページだけ AI OFF」のような上書き** を保存した直後に
+個別が消えてしまい、ユーザの意図 (デノイズ OFF など) が反映されない不具合があった。
+グローバルとの等価比較に変更した時点で、DB 側 (`AdjustmentDb::set_page_params`) の
+`is_removable` 判定も廃止し、呼び出し側 (`App::set_page_params`) で
+削除/保存の振り分けを行う構造になった。
 
 ### 1.3 アクションボタン
 
@@ -52,13 +58,17 @@ effective = adjustment_page_params.get(idx) ?? settings.global_preset
 | 全画像に適用 | 現在のパラメータを、現フォルダ/ZIP/PDF の全画像ページに一括書込 (`apply_params_to_all_pages`)。色調のみの一斉調整に使う |
 | 全画像から削除 | 現フォルダ/ZIP/PDF の全画像ページから個別設定を削除 (`clear_all_page_params`)。「全画像に適用」の取り消し |
 | 標準にする | 現在のパラメータを `settings.global_preset` にコピー (`copy_params_to_global`)。全フォルダ共通の既定値を更新する |
-| 個別設定を解除 | 現ページの個別レコードを削除 (`clear_page_params`)。標準設定に戻す |
+| 個別設定を解除 | 現ページの個別レコードを削除 (`clear_page_params`)。標準設定に戻す。`Ctrl+Backspace` でも実行可能 |
 
 ### 1.4 保存スロット
 
-10 個の名前付きスロット。フルスクリーンで `Shift+0〜9` を押すと
+10 個の名前付きスロット。フルスクリーンで `Ctrl+0〜9` を押すと
 `App::apply_slot_to_current_page(slot_idx)` が呼ばれ、該当スロットのパラメータを
 **現在のページ個別設定として書き込む** (= そのページを個別化する)。
+
+> 旧来は `Shift+0〜9` だったが、egui の logical-key 方式ではキーボード配列によって
+> Shift+数字が記号 (`!"#$%&'()` など) に置き換わり `Key::Num1` 等にマッチしないため
+> Ctrl 修飾に変更した (JIS 配列の Shift+0 は文字を生成しないため特に致命的だった)。
 
 補正パネルの保存スロット欄 (`💾` ボタン) で現在のパラメータをスロットに保存できる。
 
@@ -143,7 +153,7 @@ AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
 | 保存スロット読込 → 現ページに適用 | 全クリア | AI モデルが異なれば全クリア | 同上 |
 | 「全画像に適用」 | 全クリア | 残す (注: AI 設定が変わる場合は U/N キー操作で別途対応) | — |
 | 「標準にする」 (global_preset 更新) | 全クリア | 残す | — |
-| 「個別設定を解除」 | 該当 idx のみクリア | 残す | — |
+| 「個別設定を解除」 (Ctrl+Backspace) | 該当 idx のみクリア | AI 設定が変わるなら該当 idx のみクリア + pending キャンセル | あり |
 | フォルダ切替 | 全クリア | 全クリア | キャンセル |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | クリアしない | — |
 | 消しゴムマスク変更 | 該当 idx のみクリア (再合成) | 該当 idx のみクリア | — |
@@ -167,6 +177,13 @@ AI モデル変更を伴う可能性がある操作は必ず後者を使う。
 `set_page_params` / `clear_page_params` / `apply_params_to_all_pages` /
 `copy_params_to_global` の実装内でも、必要に応じて `adjustment_cache` を
 クリアしている (全クリア vs 部分クリア)。詳細はソース参照。
+
+特に `clear_page_params(idx)` は、削除後の effective params を見て
+**old.ai_settings_eq(new) が false なら** その `idx` の `ai_upscale_cache` /
+`ai_upscale_failed` / `ai_upscale_pending` をクリアする。これがないと
+「個別で AI OFF にしていたページから個別を解除しても、グローバルの AI が
+再実行されない」という不具合になる (実際、`ui_fullscreen.rs` から
+`Ctrl+Backspace` で解除した直後に上記不具合が発生していた)。
 
 ---
 

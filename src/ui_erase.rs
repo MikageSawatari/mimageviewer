@@ -189,17 +189,19 @@ impl App {
             }
         }
 
-        // Shift+1/2: スロットに保存
-        let shift_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num1));
-        let shift_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num2));
-        if shift_1 { self.save_mask_to_slot(1); }
-        if shift_2 { self.save_mask_to_slot(2); }
+        // Ctrl+Shift+1/2: スロットに保存
+        // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を併用)
+        let ctrl_shift = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        let save_1 = ctx.input_mut(|i| i.consume_key(ctrl_shift, egui::Key::Num1));
+        let save_2 = ctx.input_mut(|i| i.consume_key(ctrl_shift, egui::Key::Num2));
+        if save_1 { self.save_mask_to_slot(1); }
+        if save_2 { self.save_mask_to_slot(2); }
 
-        // 1/2: スロットからロード
-        let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
-        let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
-        if key_1 { self.load_mask_from_slot(1); }
-        if key_2 { self.load_mask_from_slot(2); }
+        // Ctrl+1/2: スロットからロード
+        let load_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num1));
+        let load_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num2));
+        if load_1 { self.load_mask_from_slot(1); }
+        if load_2 { self.load_mask_from_slot(2); }
 
         // B/L/V/H/I: ツール切替
         let key_b = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
@@ -272,6 +274,8 @@ impl App {
             for &k in NUM_KEYS {
                 let _ = i.consume_key(egui::Modifiers::NONE, k);
                 let _ = i.consume_key(egui::Modifiers::SHIFT, k);
+                let _ = i.consume_key(egui::Modifiers::CTRL, k);
+                let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, k);
             }
         });
 

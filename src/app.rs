@@ -4546,27 +4546,52 @@ impl App {
     }
 
     /// 指定ページに個別パラメータを書込む (DB にも保存)。
-    /// 識別パラメータなら個別設定を解除する。
+    ///
+    /// `params` がグローバルプリセットと完全一致するなら個別設定として保存しない
+    /// (= フォールバックでグローバルが使われる)。
+    /// 旧来は `is_removable()` (= identity かつ AI 未使用) で削除判定していたが、
+    /// グローバルが AI ON の状態で個別に「AI OFF」を設定したいケースを取りこぼしたため、
+    /// グローバルとの等価比較に変更した。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
-        let is_identity = params.is_removable();
-        if is_identity {
+        let matches_global = params == self.settings.global_preset;
+        if matches_global {
             self.adjustment_page_params.remove(&idx);
+            if let Some(key) = self.page_path_key(idx) {
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.remove_page_params(&key);
+                }
+            }
         } else {
             self.adjustment_page_params.insert(idx, params.clone());
-        }
-        if let Some(key) = self.page_path_key(idx) {
-            if let Some(db) = &self.adjustment_db {
-                let _ = db.set_page_params(&key, &params);
+            if let Some(key) = self.page_path_key(idx) {
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.set_page_params(&key, &params);
+                }
             }
         }
     }
 
     /// 指定ページの個別設定を解除する (DB からも削除)。
+    ///
+    /// 個別 → グローバル へのフォールバックで AI 設定 (upscale / denoise) が
+    /// 切り替わる場合は、その idx の AI キャッシュ / 失敗マーカ / pending を
+    /// クリアして次フレームで再実行されるようにする。
+    /// 色調 (adjustment) キャッシュは常にクリアする。
     pub(crate) fn clear_page_params(&mut self, idx: usize) {
+        let old_params = self.effective_params(idx).clone();
         self.adjustment_page_params.remove(&idx);
+        let new_params = self.effective_params(idx).clone();
         if let Some(key) = self.page_path_key(idx) {
             if let Some(db) = &self.adjustment_db {
                 let _ = db.remove_page_params(&key);
+            }
+        }
+        self.adjustment_cache.remove(&idx);
+        if !old_params.ai_settings_eq(&new_params) {
+            self.ai_upscale_cache.remove(&idx);
+            self.ai_upscale_failed.remove(&idx);
+            if let Some((cancel, _)) = self.ai_upscale_pending.remove(&idx) {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -4592,28 +4617,39 @@ impl App {
     }
 
     /// 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに同じパラメータを適用する。
-    /// `params` が identity なら個別設定は削除され、全画像が標準設定に戻る。
+    /// `params` がグローバルと等価なら個別設定は削除され、全画像が標準設定に戻る。
     /// AI キャッシュは保持 (色系のみ触る使い方が多い想定、AI 変更時はユーザが U/N で別途調整)。
     pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
         let (indices, keys) = self.collect_image_page_keys();
-        if params.is_removable() {
+        let matches_global = params == self.settings.global_preset;
+        if matches_global {
             for idx in &indices {
                 self.adjustment_page_params.remove(idx);
+            }
+            if let Some(db) = self.adjustment_db.as_mut() {
+                let _ = db.remove_page_params_bulk(&keys);
             }
         } else {
             for idx in &indices {
                 self.adjustment_page_params.insert(*idx, params.clone());
             }
-        }
-        if let Some(db) = self.adjustment_db.as_mut() {
-            let _ = db.set_page_params_bulk(&keys, &params);
+            if let Some(db) = self.adjustment_db.as_mut() {
+                let _ = db.set_page_params_bulk(&keys, &params);
+            }
         }
         self.adjustment_cache.clear();
     }
 
     /// 現在の一覧の全画像ページから個別設定を削除する (= 全画像を標準設定に戻す)。
     pub(crate) fn clear_all_page_params(&mut self) {
-        self.apply_params_to_all_pages(crate::adjustment::AdjustParams::default());
+        let (indices, keys) = self.collect_image_page_keys();
+        for idx in &indices {
+            self.adjustment_page_params.remove(idx);
+        }
+        if let Some(db) = self.adjustment_db.as_mut() {
+            let _ = db.remove_page_params_bulk(&keys);
+        }
+        self.adjustment_cache.clear();
     }
 
     /// 指定パラメータを settings.global_preset にコピーして保存する。

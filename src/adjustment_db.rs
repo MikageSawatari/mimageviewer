@@ -48,12 +48,14 @@ impl AdjustmentDb {
         serde_json::from_str(&json).ok()
     }
 
-    /// ページのパラメータを書き込む。`params` が identity かつ AI 未使用なら削除。
+    /// ページのパラメータを書き込む。
+    ///
+    /// 削除判定 (個別保存する意味があるか) は呼び出し側の責務。
+    /// 旧バージョンでは `params.is_removable()` で内部的に削除に振り分けていたが、
+    /// グローバルが非デフォルトのとき「個別で AI を OFF にする」上書きを保存したい
+    /// ケースを取り逃すため、is_removable 判定を呼び出し側 (`App::set_page_params`) に
+    /// 移した。明示的に削除したいときは `remove_page_params` を呼ぶこと。
     pub fn set_page_params(&self, page_key: &str, params: &AdjustParams) -> Result<(), rusqlite::Error> {
-        if params.is_removable() {
-            self.remove_page_params(page_key)?;
-            return Ok(());
-        }
         let json = serde_json::to_string(params).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
@@ -71,30 +73,39 @@ impl AdjustmentDb {
     }
 
     /// 複数ページに同じパラメータを一括書込する (「全画像に適用」ボタン用)。
-    /// `params` が identity なら、対象キー群を一括削除する。
+    ///
+    /// 削除判定 (= グローバルと等価かどうか) は呼び出し側の責務。
+    /// グローバルと等価な params を渡したい場合は `remove_page_params_bulk` を使う。
     pub fn set_page_params_bulk(
         &mut self,
         page_keys: &[String],
         params: &AdjustParams,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.transaction()?;
-        if params.is_removable() {
-            let mut stmt = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
-            for key in page_keys {
-                stmt.execute([key])?;
-            }
-            drop(stmt);
-        } else {
-            let json = serde_json::to_string(params).unwrap_or_default();
-            let mut stmt = tx.prepare(
-                "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
-                 ON CONFLICT(page_path) DO UPDATE SET params_json = ?2",
-            )?;
-            for key in page_keys {
-                stmt.execute(rusqlite::params![key, json])?;
-            }
-            drop(stmt);
+        let json = serde_json::to_string(params).unwrap_or_default();
+        let mut stmt = tx.prepare(
+            "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
+             ON CONFLICT(page_path) DO UPDATE SET params_json = ?2",
+        )?;
+        for key in page_keys {
+            stmt.execute(rusqlite::params![key, json])?;
         }
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 複数ページの個別パラメータを一括削除する (「全画像から削除」ボタン用)。
+    pub fn remove_page_params_bulk(
+        &mut self,
+        page_keys: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.transaction()?;
+        let mut stmt = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
+        for key in page_keys {
+            stmt.execute([key])?;
+        }
+        drop(stmt);
         tx.commit()?;
         Ok(())
     }
@@ -154,8 +165,14 @@ mod tests {
         let loaded = db.get_page_params(page).unwrap();
         assert_eq!(loaded.brightness, 30.0);
 
-        // identity を書くと削除される
+        // identity でも DB は保存する (削除判定は呼び出し側 App::set_page_params に移った)
+        // 個別を「グローバルが AI ON のとき AI OFF として上書き」したいケースを保存できるように。
         db.set_page_params(page, &AdjustParams::default()).unwrap();
+        let loaded_identity = db.get_page_params(page).unwrap();
+        assert!(loaded_identity.is_identity());
+
+        // 明示削除すれば消える
+        db.remove_page_params(page).unwrap();
         assert!(db.get_page_params(page).is_none());
     }
 }
