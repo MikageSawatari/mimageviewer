@@ -330,19 +330,36 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>種類</th><th>パス</th></tr>
+          <tr><th>種類</th><th>パス</th><th>キーの種類</th></tr>
         </thead>
         <tbody>
-          <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.json</code></td></tr>
-          <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td></tr>
-          <tr><td>見開き設定 DB</td><td><code>%APPDATA%\mimageviewer\spread.db</code></td></tr>
-          <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.db</code></td></tr>
-          <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td></tr>
-          <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・panic ログ）</td></tr>
+          <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.json</code></td><td>—</td></tr>
+          <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td><td>ページ単位（A）</td></tr>
+          <tr><td>画像補正 DB</td><td><code>%APPDATA%\mimageviewer\adjustment.db</code></td><td>ページ単位（A）</td></tr>
+          <tr><td>消去マスク DB</td><td><code>%APPDATA%\mimageviewer\mask.db</code></td><td>ページ単位（A）</td></tr>
+          <tr><td>★レーティング DB</td><td><code>%APPDATA%\mimageviewer\rating.db</code></td><td>ページ単位（A）</td></tr>
+          <tr><td>見開き設定 DB</td><td><code>%APPDATA%\mimageviewer\spread.db</code></td><td>フォルダ単位（A）</td></tr>
+          <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.json</code></td><td>ファイル単位（A）</td></tr>
+          <tr><td>お気に入り検索インデックス</td><td><code>%APPDATA%\mimageviewer\search_index.db</code></td><td>フォルダ単位（B）</td></tr>
+          <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td><td>フォルダ単位（A）</td></tr>
+          <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・panic ログ）</td><td>—</td></tr>
         </tbody>
       </table>
     </div>
     <p><code>--data-dir</code> を指定した場合は、すべてのデータが指定フォルダ内に保存されます。</p>
+
+    <h3>保存情報の紐付け規則</h3>
+    <p>各種情報はファイル / フォルダのパスをキーにして保存されます。キーの作り方には 2 種類あります。</p>
+    <ul>
+      <li><strong>（A）ドライブ文字を除いたパス：</strong>回転・補正・消去マスク・★レーティング・見開き設定・PDF パスワード・サムネイルキャッシュで使用。
+        パスを小文字化しスラッシュ統一したうえで先頭のドライブ文字（<code>C:</code> 等）を除外します。
+        USB メモリや外付け HDD のドライブレターが変わっても情報が保持されます。</li>
+      <li><strong>（B）ドライブ文字を含むパス：</strong>お気に入り検索インデックスで使用。
+        検索結果からフォルダを開く際に実パスが必要なためドライブ文字を保持します。</li>
+    </ul>
+    <p>いずれもパスの文字列をそのままキーにしているため、<strong>ファイルやフォルダを別のパスに移動・リネームすると紐付けが切れ、情報がリセットされたように見えます</strong>（元のパスに戻せば再度参照できます）。
+    ZIP / PDF 内の情報はアーカイブ自体のパス + 内部エントリ名でキーを作るため、アーカイブをリネームすると同様に紐付けが切れます。
+    AppleDouble ファイル（<code>._*</code>）や一時ファイルは対象外です。</p>
   </main>
 </div>
 

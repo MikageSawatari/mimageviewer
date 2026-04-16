@@ -80,7 +80,7 @@ impl PdfPasswordStore {
     }
 
     fn path_hash(pdf_path: &Path) -> String {
-        let normalized = pdf_path.to_string_lossy().to_lowercase();
+        let normalized = crate::path_key::normalize(pdf_path);
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
         format!("{:x}", hasher.finalize())

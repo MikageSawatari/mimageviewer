@@ -12,22 +12,12 @@ pub const THUMB_LONG_SIDE: u32 = 512;
 // DB path helpers
 // -----------------------------------------------------------------------
 
-/// ドライブ文字を除いて小文字化・スラッシュ統一したパス文字列を返す。
-/// リムーバブルデバイスのドライブ文字変化に対応するため、ドライブ文字は含まない。
-fn normalize_path(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    let no_drive = if s.len() >= 2 && s.chars().nth(1) == Some(':') {
-        &s[2..]
-    } else {
-        &s
-    };
-    no_drive.to_lowercase().replace('\\', "/")
-}
+use crate::path_key;
 
 /// `{cache_dir}/{xx}/{sha256}.db` の形式で DB ファイルパスを返す。
 /// xx はハッシュ hex 先頭2文字（256サブフォルダに分散）。
 pub fn db_path_for(cache_dir: &Path, folder_path: &Path) -> PathBuf {
-    let normalized = normalize_path(folder_path);
+    let normalized = path_key::normalize(folder_path);
     let hash = format!("{:x}", Sha256::digest(normalized.as_bytes()));
     cache_dir.join(&hash[..2]).join(format!("{}.db", hash))
 }
@@ -324,35 +314,6 @@ mod tests {
         CatalogDb {
             conn: Mutex::new(conn),
         }
-    }
-
-    // -- normalize_path --
-
-    #[test]
-    fn normalize_path_removes_drive_letter() {
-        let p = Path::new(r"C:\Users\foo");
-        assert_eq!(normalize_path(p), "/users/foo");
-    }
-
-    #[test]
-    fn normalize_path_no_drive() {
-        let p = Path::new(r"\already\unix");
-        assert_eq!(normalize_path(p), "/already/unix");
-    }
-
-    #[test]
-    fn normalize_path_backslash_to_slash() {
-        let p = Path::new(r"D:\a\b\c");
-        let result = normalize_path(p);
-        assert!(!result.contains('\\'), "should not contain backslash: {result}");
-        assert!(result.contains("/a/b/c"));
-    }
-
-    #[test]
-    fn normalize_path_lowercase() {
-        let p = Path::new(r"E:\MyFolder\SubDir");
-        let result = normalize_path(p);
-        assert_eq!(result, "/myfolder/subdir");
     }
 
     // -- db_path_for --

@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::path_key;
 use crate::settings::SpreadMode;
 
 /// 見開き DB ハンドル
@@ -82,9 +83,8 @@ impl SpreadDb {
     }
 }
 
-/// パスを正規化 (小文字化 + バックスラッシュ→スラッシュ)
 fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase().replace('\\', "/")
+    path_key::normalize(path)
 }
 
 #[cfg(test)]

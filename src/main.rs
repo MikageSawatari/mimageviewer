@@ -14,6 +14,7 @@ pub mod exif_reader;
 pub mod logger;
 pub mod mask_db;
 pub mod monitor;
+pub mod path_key;
 pub mod png_metadata;
 pub mod rating_db;
 pub mod rotation_db;
