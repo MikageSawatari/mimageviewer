@@ -619,10 +619,11 @@ fn run_bench(
         }
 
         // 結果受信 (ノンブロッキング)
-        while let Ok((idx, _color_image, from_cache, _dims, _canceled)) = rx.try_recv() {
+        while let Ok(msg) = rx.try_recv() {
+            let idx = msg.idx;
             requested.remove(&idx);
             completed.insert(idx);
-            if from_cache {
+            if msg.from_cache {
                 cache_hits += 1;
             } else {
                 cache_misses += 1;

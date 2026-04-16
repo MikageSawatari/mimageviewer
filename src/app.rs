@@ -318,8 +318,11 @@ pub struct App {
     pub(crate) fullscreen_idx: Option<usize>,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
-    /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル)
-    pub(crate) fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>)>,
+    /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル, load 開始時の input_seq)
+    /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
+    /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
+    /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
+    pub(crate) fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
@@ -879,6 +882,15 @@ impl App {
             crate::perf::event("input", kind, key, self.input_seq, &[]);
         }
         self.input_seq
+    }
+
+    /// アイテム idx 上のユーザー入力イベントを記録する `bump_input_seq` の薄いラッパ。
+    /// perf 無効時は `perf_item_key` の String 生成を省く。
+    pub(crate) fn bump_input_seq_for_item(&mut self, kind: &str, idx: usize) -> u64 {
+        let key = crate::perf::is_enabled()
+            .then(|| self.perf_item_key(idx))
+            .flatten();
+        self.bump_input_seq(kind, key.as_deref())
     }
 
     /// IME 変換状態を更新する (毎フレーム先頭で呼ぶ)。
@@ -1811,7 +1823,14 @@ impl App {
                         // canceled=true を送信: UI 側の requested を cleanup し、
                         // Evicted (retriable) に戻す。これを送らないと keep_range が
                         // 戻ったときに再エンキューされず idx がスタックする。
-                        let _ = tx_w.send((req.idx, None, false, None, true));
+                        let _ = tx_w.send(crate::thumb_loader::ThumbMsg {
+                            idx: req.idx,
+                            image: None,
+                            from_cache: false,
+                            source_dims: None,
+                            canceled: true,
+                            input_seq: req.input_seq,
+                        });
                         continue;
                     }
                     let vis = hint_w.load(Ordering::Relaxed);
@@ -1903,9 +1922,17 @@ impl App {
                 } else if let Ok(mut s) = stats.lock() {
                     s.record_failed();
                 }
-                // 動画 Shell API はアップグレード経路を持たないので from_cache = false
-                // ピクセル寸法は取得できないため None
-                let _ = tx.send((idx, ci, false, None, false));
+                // 動画 Shell API はアップグレード経路を持たないので from_cache = false。
+                // ピクセル寸法は取得できない。動画ロードは LoadRequest を経由しないため
+                // input_seq は 0 (未設定)。
+                let _ = tx.send(crate::thumb_loader::ThumbMsg {
+                    idx,
+                    image: ci,
+                    from_cache: false,
+                    source_dims: None,
+                    canceled: false,
+                    input_seq: 0,
+                });
             }
         });
     }
@@ -1928,7 +1955,15 @@ impl App {
             std::iter::from_fn(|| self.rx.try_recv().ok())
         );
 
-        for (i, color_image_opt, from_cache, source_dims, canceled) in drain {
+        for msg in drain {
+            let crate::thumb_loader::ThumbMsg {
+                idx: i,
+                image: color_image_opt,
+                from_cache,
+                source_dims,
+                canceled,
+                input_seq: req_input_seq,
+            } = msg;
             if i >= self.thumbnails.len() {
                 self.requested.remove(&i);
                 continue;
@@ -1978,15 +2013,17 @@ impl App {
                             source_dims,
                         };
                         textures_created += 1;
-                        // perf: Pending/Evicted → Loaded の遷移時のみ ready を emit。
-                        // (アップグレードで Loaded→Loaded の遷移も発生するためフィルタ)
+                        // Pending/Evicted → Loaded の遷移時のみ ready を emit
+                        // (アップグレードで Loaded→Loaded の遷移も起きるためフィルタ)。
+                        // seq はエンキュー元のを透過し、decode 中のスクロールで
+                        // ready が別操作に紐づくのを防ぐ。
                         if crate::perf::is_enabled() && !prev_state_was_loaded {
                             let perf_key = self.perf_item_key(i);
                             crate::perf::event(
                                 "thumb",
                                 "ready",
                                 perf_key.as_deref(),
-                                self.input_seq,
+                                req_input_seq,
                                 &[
                                     ("idx", serde_json::Value::from(i)),
                                     ("w", serde_json::Value::from(w)),
@@ -1999,7 +2036,14 @@ impl App {
                     } else if in_keep_range {
                         // 上限到達だが keep_range 内: 次フレームに持ち越す。
                         // requested は除去しない (重複リクエスト防止)
-                        self.texture_backlog.push((i, Some(color_image), from_cache, source_dims, false));
+                        self.texture_backlog.push(crate::thumb_loader::ThumbMsg {
+                            idx: i,
+                            image: Some(color_image),
+                            from_cache,
+                            source_dims,
+                            canceled: false,
+                            input_seq: req_input_seq,
+                        });
                     } else {
                         // 範囲外: ColorImage を drop し Evicted にしておく。
                         // from_cache=true は 1 ショット経路 → 即 remove。
@@ -2665,7 +2709,10 @@ impl App {
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
-                        | Some(GridItem::PdfPage { .. }) => self.open_fullscreen(idx),
+                        | Some(GridItem::PdfPage { .. }) => {
+                            self.bump_input_seq_for_item("grid_enter", idx);
+                            self.open_fullscreen(idx);
+                        }
                         Some(GridItem::Video(p)) => {
                             let vp = p.clone();
                             open_external_player(&vp);
@@ -3013,11 +3060,13 @@ impl App {
     /// フルスクリーン表示を開始する。
     /// キャッシュ済みなら即座に表示し、そうでなければ読み込みを開始する。
     /// 動画アイテムの場合はサムネイル＋再生ボタンを表示するだけで読み込みは不要。
+    ///
+    /// **perf 計装の注意**: この関数は `input_seq` を bump しない。呼び出し元が
+    /// ユーザー入力起点の場合は事前に `bump_input_seq` すること。slideshow や
+    /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
+    /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
-        // perf: フルスクリーン起動イベント (新しい input_seq を割り当てる)
-        let fs_key = self.perf_item_key(idx);
-        self.bump_input_seq("fs_open", fs_key.as_deref());
         self.fullscreen_idx = Some(idx);
         // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
         // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
@@ -3536,11 +3585,9 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
         let pdf_ct_tx = self.pdf_content_type_tx.clone();
-        self.fs_pending.insert(idx, (Arc::clone(&cancel), rx));
-
-        // perf: ロード要求発行
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
+        self.fs_pending.insert(idx, (Arc::clone(&cancel), rx, perf_seq));
         if crate::perf::is_enabled() {
             crate::perf::event("fs", "load_begin", perf_key.as_deref(), perf_seq, &[
                 ("idx", serde_json::Value::from(idx)),
@@ -3822,7 +3869,7 @@ impl App {
         }
 
         // 進行中の再レンダリングがあればキャンセル
-        if let Some((cancel, _)) = self.fs_pending.remove(&idx) {
+        if let Some((cancel, _, _)) = self.fs_pending.remove(&idx) {
             cancel.store(true, Ordering::Relaxed);
         }
 
@@ -3834,7 +3881,8 @@ impl App {
         // render_page_async は DynamicImage チャネルを返すが、fs_pending は
         // FsLoadResult チャネルを期待するため、ブリッジスレッドで変換する
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
-        self.fs_pending.insert(idx, (Arc::clone(&cancel), fs_rx));
+        let perf_seq = self.input_seq;
+        self.fs_pending.insert(idx, (Arc::clone(&cancel), fs_rx, perf_seq));
 
         std::thread::spawn(move || {
             match render_rx.recv() {
@@ -3900,7 +3948,7 @@ impl App {
             .cloned()
             .collect();
         for k in to_cancel {
-            if let Some((cancel, _)) = self.fs_pending.remove(&k) {
+            if let Some((cancel, _, _)) = self.fs_pending.remove(&k) {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
@@ -3946,7 +3994,7 @@ impl App {
         self.fs_context_menu_idx = None;
         self.reset_erase_mode();
         self.erase_base_cache.clear();
-        for (cancel, _) in self.fs_pending.values() {
+        for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
         self.fs_pending.clear();
@@ -4028,9 +4076,11 @@ impl App {
             if self.fullscreen_idx == Some(key) {
                 self.apply_sync_adjustment(ctx, key, &pixels);
             }
+            // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
             self.ai_upscale_cache.insert(key, FsCacheEntry::Static {
                 tex: handle,
                 pixels,
+                load_seq: 0,
             });
             crate::logger::log(format!("[AI] Upscale complete for idx={key}"));
         }
@@ -4452,7 +4502,8 @@ impl App {
             upload.into_owned(),
             egui::TextureOptions::LINEAR,
         );
-        self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels: adjusted_pixels });
+        // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
+        self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels: adjusted_pixels, load_seq: 0 });
     }
 
     /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
@@ -4530,11 +4581,11 @@ impl App {
             }
         }
 
-        let mut completed: Vec<(usize, FsLoadResult)> = Vec::new();
+        let mut completed: Vec<(usize, FsLoadResult, u64)> = Vec::new();
         let mut disconnected: Vec<usize> = Vec::new();
-        for (&key, (_, rx)) in &self.fs_pending {
+        for (&key, (_, rx, seq)) in &self.fs_pending {
             match rx.try_recv() {
-                Ok(result) => completed.push((key, result)),
+                Ok(result) => completed.push((key, result, *seq)),
                 Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -4544,7 +4595,7 @@ impl App {
             self.fs_pending.remove(&key);
         }
         let repaint = !completed.is_empty();
-        for (key, result) in completed {
+        for (key, result, load_seq) in completed {
             self.fs_pending.remove(&key);
             let perf_key_str = self.perf_item_key(key);
             let upload_t0 = std::time::Instant::now();
@@ -4559,12 +4610,14 @@ impl App {
                         egui::TextureOptions::LINEAR,
                     );
                     let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    // `load_seq` を使うのは、decode 中に別操作が入っても
+                    // ready が load_begin と同じシーケンスに紐づくようにするため。
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "fs",
                             "ready",
                             perf_key_str.as_deref(),
-                            self.input_seq,
+                            load_seq,
                             &[
                                 ("idx", serde_json::Value::from(key)),
                                 ("upload_ms", serde_json::Value::from(upload_ms)),
@@ -4579,7 +4632,7 @@ impl App {
                     if self.fullscreen_idx == Some(key) {
                         self.apply_sync_adjustment(ctx, key, &pixels);
                     }
-                    FsCacheEntry::Static { tex: handle, pixels }
+                    FsCacheEntry::Static { tex: handle, pixels, load_seq }
                 }
                 FsLoadResult::Animated(frames) => {
                     let textures: Vec<(egui::TextureHandle, f64)> = frames
@@ -4600,6 +4653,7 @@ impl App {
                         frames: textures,
                         current_frame: 0,
                         next_frame_at: now + first_delay,
+                        load_seq,
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,

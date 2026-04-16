@@ -23,14 +23,32 @@ pub enum FsCacheEntry {
     Static {
         tex: egui::TextureHandle,
         pixels: std::sync::Arc<egui::ColorImage>,
+        /// このエントリを生成したロードの `input_seq`。perf 相関用。
+        /// `fs.paint` で `fs.ready` と同じ seq を使うために保持する。
+        /// 計装無効時や内部起因のエントリは 0。
+        load_seq: u64,
     },
     Animated {
         frames: Vec<(egui::TextureHandle, f64)>, // (texture, delay_secs)
         current_frame: usize,
         next_frame_at: f64, // ctx.input(|i| i.time) 基準
+        /// Static と同じく perf 相関用の load_seq。
+        load_seq: u64,
     },
     /// デコード失敗。UI は「読込失敗」表示を出す。
     Failed,
+}
+
+impl FsCacheEntry {
+    /// perf 相関用。Static / Animated なら load_seq、Failed は 0。
+    pub fn load_seq(&self) -> u64 {
+        match self {
+            FsCacheEntry::Static { load_seq, .. } | FsCacheEntry::Animated { load_seq, .. } => {
+                *load_seq
+            }
+            FsCacheEntry::Failed => 0,
+        }
+    }
 }
 
 /// GIF をデコードしてアニメーションフレーム列を返す。

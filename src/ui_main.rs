@@ -755,7 +755,8 @@ impl App {
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::ZipSeparator { .. })
                 | Some(GridItem::PdfPage { .. }) => {
-                    self.open_fullscreen(idx)
+                    self.bump_input_seq_for_item("grid_double_click", idx);
+                    self.open_fullscreen(idx);
                 }
                 Some(GridItem::Video(p)) => {
                     let vp = p.clone();

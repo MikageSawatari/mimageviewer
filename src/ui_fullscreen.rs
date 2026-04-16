@@ -336,7 +336,9 @@ impl App {
                                         self.fs_zoom_pan()
                                     };
                                     let free_rot = if analysis_active { 0.0 } else { self.fs_free_rotation };
-                                    // perf: 前フレームと異なる (idx, テクスチャ) の最初の描画で paint を emit
+                                    // 前フレームと異なる (idx, テクスチャ) の最初の描画で paint を emit。
+                                    // seq はエントリ自身の `load_seq` を使う (self.input_seq だと
+                                    // paint 時点で別操作に更新されていて load→ready→paint の相関が崩れる)。
                                     if crate::perf::is_enabled()
                                         && let Some(tex) = state.tex.as_ref()
                                     {
@@ -348,14 +350,19 @@ impl App {
                                         );
                                         if is_new {
                                             let key = self.perf_item_key(fs_idx);
+                                            let entry_seq = self
+                                                .fs_cache
+                                                .get(&fs_idx)
+                                                .map(|e| e.load_seq())
+                                                .unwrap_or(0);
                                             crate::perf::event(
                                                 "fs",
                                                 "paint",
                                                 key.as_deref(),
-                                                self.input_seq,
+                                                entry_seq,
                                                 &[("idx", serde_json::Value::from(fs_idx))],
                                             );
-                                            self.fs_painted_last = Some((fs_idx, cur_id, self.input_seq));
+                                            self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
                                         }
                                     }
                                     Self::draw_fs_image(
@@ -566,7 +573,7 @@ impl App {
         if is_video { return; }
         let now = ctx.input(|i| i.time);
         if let Some(FsCacheEntry::Animated {
-            frames, current_frame, next_frame_at,
+            frames, current_frame, next_frame_at, ..
         }) = self.fs_cache.get_mut(&fs_idx)
         {
             if now >= *next_frame_at && !frames.is_empty() {

@@ -53,14 +53,25 @@ pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
 
 /// サムネイル読み込み結果メッセージ。
 ///
-/// `(item_idx, Option<ColorImage>, from_cache, source_dims, canceled)`
-/// - `from_cache = true`: WebP キャッシュから復元 (段階 E アップグレード対象)
-/// - `from_cache = false`: 元画像から直接デコード (高画質) または動画 Shell API
-/// - `source_dims`: 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None
-/// - `canceled = true`: ワーカーがロードを中断 (STALE: keep_range 外になった等)。
-///   `ColorImage` は必ず `None`。UI 側は `thumbnails[idx]` を `Evicted` に戻し、
-///   `requested` からも削除して **再試行可能** な状態にする。`Failed` にはしない。
-pub type ThumbMsg = (usize, Option<egui::ColorImage>, bool, Option<(u32, u32)>, bool);
+/// ワーカースレッドが UI スレッドに送る。フィールドを位置に頼らず名前で判別できる
+/// ように struct で保持している (`bool` が隣接するため tuple だと取り違えやすい)。
+pub struct ThumbMsg {
+    pub idx: usize,
+    /// デコード成功時のピクセル。キャンセル / 失敗時は None。
+    pub image: Option<egui::ColorImage>,
+    /// true: WebP キャッシュから復元 (段階 E アップグレード対象)。
+    /// false: 元画像から直接デコード (高画質) または動画 Shell API。
+    pub from_cache: bool,
+    /// 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None。
+    pub source_dims: Option<(u32, u32)>,
+    /// ワーカーがロードを中断した場合 true (STALE: keep_range 外になった等)。
+    /// `image` は必ず `None`。UI 側は `thumbnails[idx]` を `Evicted` に戻し、
+    /// `requested` からも削除して **再試行可能** な状態にする (`Failed` にはしない)。
+    pub canceled: bool,
+    /// エンキュー時の `LoadRequest::input_seq` を透過する。perf ログで enqueue /
+    /// decode / ready を相関付けるのに使う。計装無効時や未設定時は 0。
+    pub input_seq: u64,
+}
 
 /// 段階 B: サムネイル読み込み要求。
 ///
@@ -441,7 +452,14 @@ pub fn process_load_request(
             // from_cache = true: アップグレード対象
             // source_dims はカタログ由来 (旧バージョンで作成された
             // エントリには None が入っている)
-            let _ = tx.send((req.idx, ci, true, source_dims, false));
+            let _ = tx.send(ThumbMsg {
+                idx: req.idx,
+                image: ci,
+                from_cache: true,
+                source_dims,
+                canceled: false,
+                input_seq: req.input_seq,
+            });
             gen_done.fetch_add(1, Ordering::Relaxed);
             crate::logger::log(format!(
                 "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
@@ -493,7 +511,14 @@ pub fn process_load_request(
             ));
         }
         if img.is_none() {
-            let _ = tx.send((req.idx, None, false, None, false));
+            let _ = tx.send(ThumbMsg {
+                idx: req.idx,
+                image: None,
+                from_cache: false,
+                source_dims: None,
+                canceled: false,
+                input_seq: req.input_seq,
+            });
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -531,7 +556,14 @@ pub fn process_load_request(
             }
             None => {
                 // ZIP 内に画像が無い場合は失敗として通知
-                let _ = tx.send((req.idx, None, false, None, false));
+                let _ = tx.send(ThumbMsg {
+                    idx: req.idx,
+                    image: None,
+                    from_cache: false,
+                    source_dims: None,
+                    canceled: false,
+                    input_seq: req.input_seq,
+                });
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -566,7 +598,14 @@ pub fn process_load_request(
                     ],
                 );
             }
-            let _ = tx.send((req.idx, None, false, None, true));
+            let _ = tx.send(ThumbMsg {
+                idx: req.idx,
+                image: None,
+                from_cache: false,
+                source_dims: None,
+                canceled: true,
+                input_seq: req.input_seq,
+            });
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -596,7 +635,14 @@ pub fn process_load_request(
                     ],
                 );
             }
-            let _ = tx.send((req.idx, None, false, None, true));
+            let _ = tx.send(ThumbMsg {
+                idx: req.idx,
+                image: None,
+                from_cache: false,
+                source_dims: None,
+                canceled: true,
+                input_seq: req.input_seq,
+            });
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -615,6 +661,7 @@ pub fn process_load_request(
         thumb_px, thumb_quality, display_px, cache_decision,
         stats,
         cancel,
+        req.input_seq,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -724,6 +771,9 @@ pub fn load_one_cached(
     cache_decision: CacheDecision,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
     cancel: Option<&Arc<AtomicBool>>,
+    // エンキュー元の `LoadRequest::input_seq`。perf 相関用に ThumbMsg にそのまま載せる。
+    // 0 は未設定 (計装無効時)。
+    input_seq: u64,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと��
@@ -827,7 +877,14 @@ pub fn load_one_cached(
                 return;
             }
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {display_name}"));
-            let _ = tx.send((idx, None, false, None, false));
+            let _ = tx.send(ThumbMsg {
+                idx,
+                image: None,
+                from_cache: false,
+                source_dims: None,
+                canceled: false,
+                input_seq,
+            });
             gen_done.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = stats.lock() {
                 s.record_failed();
@@ -859,7 +916,14 @@ pub fn load_one_cached(
     // from_cache=false のこの経路では `requested` を抜かない (下の cache save が
     // 完了するまで保持する → cache save 中に同じ idx が再エンキューされて
     // 二重レンダする事故を防ぐ)。
-    let _ = tx.send((idx, Some(display_ci), false, source_dims, false));
+    let _ = tx.send(ThumbMsg {
+        idx,
+        image: Some(display_ci),
+        from_cache: false,
+        source_dims,
+        canceled: false,
+        input_seq,
+    });
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
     {
@@ -925,7 +989,14 @@ pub fn load_one_cached(
     // 第 2 シグナル: cache save (or skip) 完了を UI に通知し `requested` から
     // 抜く。canceled=true だが thumbnails[i] が既に Loaded なら state は維持される
     // (poll_thumbnails の canceled 分岐参照)。
-    let _ = tx.send((idx, None, false, None, true));
+    let _ = tx.send(ThumbMsg {
+        idx,
+        image: None,
+        from_cache: false,
+        source_dims: None,
+        canceled: true,
+        input_seq,
+    });
 }
 
 // -----------------------------------------------------------------------

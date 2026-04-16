@@ -1172,6 +1172,7 @@ impl App {
                     target.insert(fs_idx, FsCacheEntry::Static {
                         tex,
                         pixels: Arc::clone(base),
+                        load_seq: self.input_seq,
                     });
                 }
             }
@@ -1239,6 +1240,7 @@ impl App {
         self.fs_cache.insert(fs_idx, FsCacheEntry::Static {
             tex,
             pixels: Arc::new(result),
+            load_seq: self.input_seq,
         });
         self.invalidate_derived_fs_caches(fs_idx);
         self.reset_erase_mode();
@@ -1295,6 +1297,7 @@ impl App {
         self.fs_cache.insert(idx, FsCacheEntry::Static {
             tex,
             pixels: Arc::new(result),
+            load_seq: self.input_seq,
         });
         self.invalidate_derived_fs_caches(idx);
     }
