@@ -430,6 +430,8 @@ pub struct App {
     pub(crate) fs_viewport_shown: bool,
     /// フルスクリーン開始時刻（フォーカス移行のグレース期間用）
     fs_opened_at: Option<std::time::Instant>,
+    /// グレース期間を超えたかのキャッシュ（毎フレーム Instant::elapsed() を避ける）
+    fs_focus_grace_elapsed: bool,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
     /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
@@ -716,6 +718,7 @@ impl Default for App {
             fs_viewport_created: false,
             fs_viewport_shown: false,
             fs_opened_at: None,
+            fs_focus_grace_elapsed: false,
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_pan_drag_start: None,
@@ -2753,6 +2756,7 @@ impl App {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         self.fullscreen_idx = Some(idx);
         self.fs_opened_at = Some(std::time::Instant::now());
+        self.fs_focus_grace_elapsed = false;
         self.reset_erase_mode();
 
         // ページに個別補正があればトースト表示
@@ -3514,6 +3518,8 @@ impl App {
         self.fullscreen_idx = None;
         self.slideshow_playing = false;
         self.fs_viewport_shown = false;
+        self.fs_opened_at = None;
+        self.fs_focus_grace_elapsed = false;
         self.fs_secondary_press_start = None;
         self.fs_context_menu_idx = None;
         self.reset_erase_mode();
@@ -4858,16 +4864,18 @@ impl eframe::App for App {
         // ただし open_fullscreen() 直後はフルスクリーンビューポートへの
         // ViewportCommand::Focus が反映されるまで数フレームかかるため、
         // 500ms のグレース期間中はチェックをスキップする。
+        const FS_FOCUS_GRACE_MS: u128 = 500;
         if self.fullscreen_idx.is_some() {
-            let grace_elapsed = self
-                .fs_opened_at
-                .map(|t| t.elapsed().as_millis() > 500)
-                .unwrap_or(true);
-            if grace_elapsed {
-                let main_has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(false);
-                if main_has_focus {
-                    self.close_fullscreen();
-                }
+            if !self.fs_focus_grace_elapsed {
+                self.fs_focus_grace_elapsed = self
+                    .fs_opened_at
+                    .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
+                    .unwrap_or(true);
+            }
+            let main_has_focus = self.fs_focus_grace_elapsed
+                && ctx.input(|i| i.viewport().focused).unwrap_or(false);
+            if main_has_focus {
+                self.close_fullscreen();
             }
         }
 
