@@ -176,54 +176,68 @@ impl SearchIndexDb {
 
     /// 部分一致検索 (大文字小文字無視)。結果は表示名で昇順ソート済み。
     /// `favorite_roots` が空の場合は全件対象。
+    ///
+    /// クエリは `search_query::parse` で解釈される:
+    /// - スペース区切り = AND
+    /// - `-word` = その語を含まない (NOT)
+    /// - `"..."` = フレーズとして扱う (スペース含む)
+    ///
+    /// 単純に `WHERE name LIKE %q%` ではなく、トークンごとに LIKE / NOT LIKE を
+    /// AND で重ねた WHERE 句を動的に組み立てる。
     pub fn search(
         &self,
         query: &str,
         favorite_roots: &[PathBuf],
     ) -> rusqlite::Result<Vec<IndexEntry>> {
-        let conn = self.conn.lock().unwrap();
-        let q_lower = query.to_lowercase();
-        let pattern = format!("%{}%", q_lower);
+        let tokens = crate::search_query::parse(query);
 
-        let (sql, use_filter) = if favorite_roots.is_empty() {
-            (
-                "SELECT display_path, display_name, kind, mtime \
-                 FROM entries \
-                 WHERE name LIKE ?1 \
-                 ORDER BY display_name COLLATE NOCASE \
-                 LIMIT 5000"
-                    .to_string(),
-                false,
-            )
+        let conn = self.conn.lock().unwrap();
+
+        // トークンごとに LIKE / NOT LIKE を 1 プレースホルダずつ積む。
+        // トークンに `%` `_` `\` が含まれてもリテラル照合になるよう ESCAPE 節を付ける。
+        let mut where_clauses: Vec<&str> = Vec::new();
+        let mut bind_strings: Vec<String> = Vec::new();
+
+        for t in &tokens {
+            bind_strings.push(format!("%{}%", escape_like(&t.needle)));
+            where_clauses.push(if t.include {
+                "name LIKE ? ESCAPE '\\'"
+            } else {
+                "name NOT LIKE ? ESCAPE '\\'"
+            });
+        }
+
+        let fav_norm_strs: Vec<String> = favorite_roots.iter().map(|p| normalize_path(p)).collect();
+        let fav_in_clause;
+        if !fav_norm_strs.is_empty() {
+            let placeholders = vec!["?"; fav_norm_strs.len()].join(",");
+            fav_in_clause = format!("favorite_root IN ({placeholders})");
+            where_clauses.push(&fav_in_clause);
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            "1=1".to_string()
         } else {
-            let placeholders: Vec<String> = (2..=favorite_roots.len() + 1)
-                .map(|i| format!("?{}", i))
-                .collect();
-            (
-                format!(
-                    "SELECT display_path, display_name, kind, mtime \
-                     FROM entries \
-                     WHERE name LIKE ?1 AND favorite_root IN ({}) \
-                     ORDER BY display_name COLLATE NOCASE \
-                     LIMIT 5000",
-                    placeholders.join(",")
-                ),
-                true,
-            )
+            where_clauses.join(" AND ")
         };
 
-        let mut stmt = conn.prepare(&sql)?;
-        let fav_norm_strs: Vec<String> = favorite_roots
-            .iter()
-            .map(|p| normalize_path(p))
-            .collect();
+        let sql = format!(
+            "SELECT display_path, display_name, kind, mtime \
+             FROM entries \
+             WHERE {where_sql} \
+             ORDER BY display_name COLLATE NOCASE \
+             LIMIT 5000"
+        );
 
+        let mut stmt = conn.prepare(&sql)?;
+
+        // バインドを順に積む: トークン用 LIKE パターン → お気に入り正規化パス
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
-        params_vec.push(&pattern);
-        if use_filter {
-            for s in &fav_norm_strs {
-                params_vec.push(s as &dyn rusqlite::ToSql);
-            }
+        for s in &bind_strings {
+            params_vec.push(s as &dyn rusqlite::ToSql);
+        }
+        for s in &fav_norm_strs {
+            params_vec.push(s as &dyn rusqlite::ToSql);
         }
 
         let rows = stmt.query_map(params_vec.as_slice(), |row| {
@@ -292,6 +306,18 @@ fn chrono_now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// SQL LIKE のワイルドカード (`%` `_`) と ESCAPE 文字 (`\`) をエスケープする。
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // -----------------------------------------------------------------------
@@ -451,6 +477,73 @@ mod tests {
         let results = db.search("match", &[fav1.clone()]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from(r"C:\Fav1\match"));
+    }
+
+    #[test]
+    fn search_and_tokens() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(&fav, &fav, &[
+            entry(r"C:\Fav\alpha_beta", "alpha_beta", IndexKind::Folder),
+            entry(r"C:\Fav\alpha_gamma", "alpha_gamma", IndexKind::Folder),
+            entry(r"C:\Fav\delta", "delta", IndexKind::Folder),
+        ]).unwrap();
+
+        // AND: 両方含むもの
+        let r = db.search("alpha beta", &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].display_name, "alpha_beta");
+
+        // 片方しかないと落ちる
+        let r = db.search("alpha epsilon", &[]).unwrap();
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn search_not_tokens() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(&fav, &fav, &[
+            entry(r"C:\Fav\good_image", "good_image", IndexKind::Folder),
+            entry(r"C:\Fav\bad_image", "bad_image", IndexKind::Folder),
+            entry(r"C:\Fav\other", "other", IndexKind::Folder),
+        ]).unwrap();
+
+        let r = db.search("image -bad", &[]).unwrap();
+        let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
+        assert!(names.contains(&"good_image"));
+        assert!(!names.contains(&"bad_image"));
+        assert!(!names.contains(&"other"));
+    }
+
+    #[test]
+    fn search_phrase() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(&fav, &fav, &[
+            entry(r"C:\Fav\hello world", "hello world", IndexKind::Folder),
+            entry(r"C:\Fav\hello there", "hello there", IndexKind::Folder),
+        ]).unwrap();
+
+        let r = db.search(r#""hello world""#, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].display_name, "hello world");
+    }
+
+    #[test]
+    fn search_like_wildcards_are_literal() {
+        // '_' や '%' を含むエントリ名は SQL LIKE でそのまま照合される
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(&fav, &fav, &[
+            entry(r"C:\Fav\100_percent", "100_percent", IndexKind::Folder),
+            entry(r"C:\Fav\abcpercent", "abcpercent", IndexKind::Folder),
+        ]).unwrap();
+
+        // `_` はワイルドカードではなくリテラルの underscore として扱う
+        let r = db.search("100_", &[]).unwrap();
+        let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(names, vec!["100_percent"]);
     }
 
     #[test]

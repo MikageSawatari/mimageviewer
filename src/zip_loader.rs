@@ -162,6 +162,32 @@ pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
     Ok(bytes)
 }
 
+/// 複数エントリをまとめて読むときのアーカイブハンドル型。
+/// `zip` クレートの型を隠蔽するため `zip_loader` 外から名前で参照できるようにする。
+pub type ZipArchiveHandle = zip::ZipArchive<BufReader<File>>;
+
+/// ZIP を開いて `ZipArchiveHandle` を返す。
+/// ネットワークドライブなど open が高コストな場合、同じハンドルから複数エントリを
+/// 順に読めるようにするためのバッチ処理用入り口。
+pub fn open_archive(zip_path: &Path) -> std::io::Result<ZipArchiveHandle> {
+    let file = File::open(zip_path)?;
+    zip::ZipArchive::new(BufReader::new(file))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// すでに開いた `ZipArchiveHandle` から 1 エントリの生バイト列を読む。
+pub fn read_entry_from_archive(
+    archive: &mut ZipArchiveHandle,
+    entry_name: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut entry = archive
+        .by_name(entry_name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// ZIP 内エントリ名からサブディレクトリ名 (親ディレクトリ) を取り出す。
 /// ルート直下のエントリは空文字列を返す。
 pub fn entry_dir(entry_name: &str) -> &str {

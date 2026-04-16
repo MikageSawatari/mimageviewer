@@ -95,6 +95,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
 | `search_index_db.rs` | お気に入り配下のフォルダ/ZIP/PDF 名索引 (検索インデックス) |
+| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / NOT / `"..."` フレーズ)。Ctrl+F / Ctrl+S で共用 |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮) |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
 | `ai/` | ONNX Runtime (DirectML) によるアップスケール / デノイズ / Inpainting / 画像種別分類 |

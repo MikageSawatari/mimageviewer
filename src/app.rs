@@ -25,6 +25,31 @@ fn stem_lower(path: &std::path::Path) -> String {
         .unwrap_or("")
         .to_lowercase()
 }
+
+/// パスの拡張子が `ext` (ASCII) と一致するか (大文字小文字無視)。
+fn has_extension(path: &std::path::Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case(ext))
+        .unwrap_or(false)
+}
+
+/// ZIP エントリ名の拡張子が `ext` (ASCII) と一致するか (大文字小文字無視)。
+fn entry_has_extension(entry_name: &str, ext: &str) -> bool {
+    match entry_name.rsplit_once('.') {
+        Some((_, e)) => e.eq_ignore_ascii_case(ext),
+        None => false,
+    }
+}
+
+/// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
+fn hay_of(meta_text: &str, name: &str) -> String {
+    if meta_text.is_empty() {
+        name.to_string()
+    } else {
+        format!("{meta_text}\n{name}")
+    }
+}
 use crate::fs_animation::{decode_apng_frames, decode_gif_frames, FsCacheEntry, FsLoadResult};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
@@ -3023,78 +3048,73 @@ impl App {
     /// フォルダ内の全 PNG 画像の tEXt チャンクを読み、
     /// キーワード（大文字小文字無視）にマッチするアイテムのみをフィルタ表示する。
     pub(crate) fn execute_search(&mut self) {
-        let query = self.search_query.trim().to_lowercase();
-        if query.is_empty() {
+        // クエリ構文: space = AND / `-word` = NOT / `"..."` = フレーズ (`-"..."` も可)。
+        // AI メタデータ検出時は Negative prompt を検索対象から除外する。
+        let tokens = crate::search_query::parse(&self.search_query);
+        if tokens.is_empty() {
             self.search_filter = None;
             self.rebuild_visible_indices();
             return;
         }
 
         let mut matches = std::collections::HashSet::new();
+
+        // ZIP 内 PNG は ZIP ごとにまとめてから処理する (open を 1 回にするため)。
+        let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
+            std::collections::HashMap::new();
+
         for (idx, item) in self.items.iter().enumerate() {
-            let path = match item {
-                GridItem::Image(p) => p.clone(),
-                // フォルダ・動画・ZIP/PDF ファイル・ZIP セパレータは
-                // ナビゲーション用の構造アイテムとして常に表示する。
+            match item {
+                // ナビゲーション用の構造アイテムは常に表示
                 GridItem::Folder(_)
                 | GridItem::Video(_)
                 | GridItem::ZipFile(_)
                 | GridItem::PdfFile(_)
                 | GridItem::ZipSeparator { .. } => {
                     matches.insert(idx);
-                    continue;
                 }
-                // ZIP 内画像・PDF ページは表示名 (エントリ名 / "Page N") で絞り込む
-                GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-                    if item.name().to_lowercase().contains(&query) {
+                GridItem::Image(path) => {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let meta_text = if has_extension(path, "png") {
+                        crate::png_metadata::build_searchable_from_path(path)
+                    } else {
+                        String::new()
+                    };
+                    if crate::search_query::matches(&tokens, &hay_of(&meta_text, name)) {
                         matches.insert(idx);
                     }
-                    continue;
                 }
-            };
+                GridItem::ZipImage { zip_path, entry_name } => {
+                    if entry_has_extension(entry_name, "png") {
+                        zip_png_groups
+                            .entry(zip_path.clone())
+                            .or_default()
+                            .push((idx, entry_name.clone()));
+                    } else {
+                        let name = crate::zip_loader::entry_basename(entry_name);
+                        if crate::search_query::matches(&tokens, name) {
+                            matches.insert(idx);
+                        }
+                    }
+                }
+                GridItem::PdfPage { .. } => {
+                    if crate::search_query::matches(&tokens, &item.name()) {
+                        matches.insert(idx);
+                    }
+                }
+            }
+        }
 
-            // PNG のみメタデータ検索
-            let is_png = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("png"))
-                .unwrap_or(false);
-
-            if !is_png {
-                // PNG 以外は名前でマッチ
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if name.contains(&query) {
+        for (zip_path, entries) in zip_png_groups {
+            let Ok(mut archive) = crate::zip_loader::open_archive(&zip_path) else { continue };
+            for (idx, entry_name) in entries {
+                let meta_text = crate::zip_loader::read_entry_from_archive(&mut archive, &entry_name)
+                    .map(|bytes| crate::png_metadata::build_searchable_from_bytes(&bytes))
+                    .unwrap_or_default();
+                let name = crate::zip_loader::entry_basename(&entry_name);
+                if crate::search_query::matches(&tokens, &hay_of(&meta_text, name)) {
                     matches.insert(idx);
                 }
-                continue;
-            }
-
-            // PNG: tEXt チャンクからメタデータを読んで検索
-            let chunks = crate::png_metadata::read_png_text_chunks(&path).unwrap_or_default();
-            let mut found = false;
-            for (_key, value) in &chunks {
-                if value.to_lowercase().contains(&query) {
-                    found = true;
-                    break;
-                }
-            }
-            // ファイル名でもマッチ
-            if !found {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if name.contains(&query) {
-                    found = true;
-                }
-            }
-            if found {
-                matches.insert(idx);
             }
         }
 

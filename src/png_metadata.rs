@@ -9,6 +9,12 @@
 use std::io::Read;
 use std::path::Path;
 
+/// Negative Prompt を含みうる AI 生成メタデータの tEXt キー。
+/// `detect_and_parse` の分岐キー、および `build_searchable_from_chunks` で
+/// 除外する生キーと一致させる必要がある。片方だけ更新すると検索から
+/// Negative prompt が漏れる。
+const AI_METADATA_KEYS: &[&str] = &["parameters", "prompt", "workflow", "Description"];
+
 // ---------------------------------------------------------------------------
 // データ構造
 // ---------------------------------------------------------------------------
@@ -236,6 +242,120 @@ fn detect_and_parse(chunks: &[(String, String)]) -> Option<AiMetadata> {
     } else {
         Some(AiMetadata::Unknown(interesting))
     }
+}
+
+// ---------------------------------------------------------------------------
+// 検索対象テキスト構築
+// ---------------------------------------------------------------------------
+
+/// メタデータから検索対象文字列を構築する。
+///
+/// **Negative prompt は除外される**。
+/// - A1111 / Forge / Midjourney: `prompt` + `params` (Steps, Sampler, Model 等)
+/// - ComfyUI: `extracted_prompts` + `sampler_params`
+/// - Unknown: 全チャンク値 (正負の区別ができないため全部含める)
+///
+/// 各値は改行区切りで連結される。呼び出し側で小文字化してから
+/// `search_query::matches_lower` に渡すこと。
+pub fn build_searchable_text(meta: &AiMetadata) -> String {
+    let mut out = String::new();
+    match meta {
+        AiMetadata::A1111(m) => {
+            append_line(&mut out, &m.prompt);
+            for (k, v) in &m.params {
+                append_kv(&mut out, k, v);
+            }
+        }
+        AiMetadata::ComfyUI(m) => {
+            for p in &m.extracted_prompts {
+                append_line(&mut out, p);
+            }
+            for (k, v) in &m.sampler_params {
+                append_kv(&mut out, k, v);
+            }
+        }
+        AiMetadata::Unknown(chunks) => {
+            // 未知フォーマットは正負の分離ができないので全部入れる
+            for (_, v) in chunks {
+                append_line(&mut out, v);
+            }
+        }
+    }
+    out
+}
+
+fn append_line(out: &mut String, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(s);
+}
+
+fn append_kv(out: &mut String, k: &str, v: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(k);
+    out.push_str(": ");
+    out.push_str(v);
+}
+
+/// PNG の生 tEXt チャンク群から検索対象文字列を直接構築する高レベルヘルパ。
+///
+/// - AI メタデータ (A1111 / ComfyUI / Midjourney) が認識できた場合は
+///   **Negative prompt を除外した** テキストを採用する。
+/// - Author / Comment / Software など AI 以外のチャンクは常に含める。
+/// - AI メタデータが認識できなかった場合は全チャンクの値を素通しで含める。
+pub fn build_searchable_from_chunks(chunks: &[(String, String)]) -> String {
+    let meta = detect_and_parse(chunks);
+    let mut out = String::new();
+
+    if let Some(ref m) = meta {
+        append_line(&mut out, &build_searchable_text(m));
+    }
+
+    // A1111 / ComfyUI: AI キーの生値には Negative が残っているので再掲しない。
+    //                  非 AI チャンク (Author, Comment 等) だけ追加する。
+    // Unknown:         build_searchable_text ですでに全チャンクを含めた。
+    // なし:            チャンクを素通しで含める (取りこぼし回避)。
+    let include_non_ai_chunks = match meta {
+        Some(AiMetadata::A1111(_)) | Some(AiMetadata::ComfyUI(_)) => true,
+        Some(AiMetadata::Unknown(_)) => false,
+        None => true,
+    };
+
+    if include_non_ai_chunks {
+        for (k, v) in chunks {
+            if AI_METADATA_KEYS.contains(&k.as_str()) {
+                continue;
+            }
+            append_line(&mut out, v);
+        }
+    }
+
+    out
+}
+
+/// PNG ファイルパスから Negative Prompt を除外した検索対象文字列を取得する。
+/// 読み取りに失敗した場合 / 有効な tEXt チャンクが無い場合は空文字列を返す。
+pub fn build_searchable_from_path(path: &Path) -> String {
+    let chunks = read_png_text_chunks(path).unwrap_or_default();
+    if chunks.is_empty() {
+        return String::new();
+    }
+    build_searchable_from_chunks(&chunks)
+}
+
+/// PNG バイト列から Negative Prompt を除外した検索対象文字列を取得する。
+pub fn build_searchable_from_bytes(bytes: &[u8]) -> String {
+    let chunks = read_png_text_chunks_from_bytes(bytes).unwrap_or_default();
+    if chunks.is_empty() {
+        return String::new();
+    }
+    build_searchable_from_chunks(&chunks)
 }
 
 // ---------------------------------------------------------------------------
@@ -657,5 +777,111 @@ mod tests {
         ];
         let result = detect_and_parse(&chunks);
         assert!(matches!(result, Some(AiMetadata::A1111(_))));
+    }
+
+    #[test]
+    fn test_build_searchable_excludes_negative_a1111() {
+        let raw = "beautiful landscape, high quality\n\
+                    Negative prompt: ugly, blurry, low quality\n\
+                    Steps: 20, Sampler: Euler, CFG scale: 7, Seed: 12345, Model: sd_xl_base";
+        let meta = parse_a1111(raw).unwrap();
+        let text = build_searchable_text(&AiMetadata::A1111(meta));
+        let lower = text.to_lowercase();
+        assert!(lower.contains("beautiful landscape"));
+        assert!(lower.contains("high quality"));
+        assert!(lower.contains("sd_xl_base"));
+        // Negative prompt 由来のトークンは含まれない
+        assert!(!lower.contains("ugly"));
+        assert!(!lower.contains("blurry"));
+        assert!(!lower.contains("low quality"));
+    }
+
+    #[test]
+    fn test_build_searchable_excludes_negative_comfyui() {
+        let json_str = r#"{
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
+            },
+            "2": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": "a beautiful sunset", "clip": ["1", 1]}
+            },
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": "ugly blurry", "clip": ["1", 1]}
+            },
+            "4": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "steps": 20,
+                    "cfg": 7.0,
+                    "sampler_name": "euler",
+                    "seed": 42,
+                    "positive": ["2", 0],
+                    "negative": ["3", 0],
+                    "model": ["1", 0],
+                    "latent_image": ["5", 0]
+                }
+            }
+        }"#;
+        let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let meta = parse_comfyui(val, None);
+        let text = build_searchable_text(&AiMetadata::ComfyUI(meta));
+        let lower = text.to_lowercase();
+        assert!(lower.contains("beautiful sunset"));
+        // Negative 由来は含まれない
+        assert!(!lower.contains("ugly"));
+        assert!(!lower.contains("blurry"));
+    }
+
+    #[test]
+    fn test_build_searchable_unknown_passthrough() {
+        let meta = AiMetadata::Unknown(vec![
+            ("foo".to_string(), "bar baz".to_string()),
+            ("qux".to_string(), "quux".to_string()),
+        ]);
+        let text = build_searchable_text(&meta);
+        assert!(text.contains("bar baz"));
+        assert!(text.contains("quux"));
+    }
+
+    #[test]
+    fn test_build_from_chunks_keeps_author_excludes_negative() {
+        // A1111 `parameters` + 非 AI チャンク (Author, Comment) の混在
+        let chunks = vec![
+            (
+                "parameters".to_string(),
+                "masterpiece scene\n\
+                 Negative prompt: bad anatomy, worst quality\n\
+                 Steps: 30, Sampler: DPM++ 2M, Model: my_model"
+                    .to_string(),
+            ),
+            ("Author".to_string(), "alice".to_string()),
+            ("Comment".to_string(), "my favorite".to_string()),
+        ];
+        let text = build_searchable_from_chunks(&chunks);
+        let lower = text.to_lowercase();
+        // 正プロンプト + params は検索可能
+        assert!(lower.contains("masterpiece scene"));
+        assert!(lower.contains("my_model"));
+        // Negative prompt は除外
+        assert!(!lower.contains("bad anatomy"));
+        assert!(!lower.contains("worst quality"));
+        // 非 AI チャンクは残る
+        assert!(lower.contains("alice"));
+        assert!(lower.contains("my favorite"));
+    }
+
+    #[test]
+    fn test_build_from_chunks_no_ai_passthrough() {
+        // AI メタデータなしの場合は全チャンク素通し
+        let chunks = vec![
+            ("Author".to_string(), "bob".to_string()),
+            ("Comment".to_string(), "hello".to_string()),
+        ];
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("bob"));
+        assert!(text.contains("hello"));
     }
 }

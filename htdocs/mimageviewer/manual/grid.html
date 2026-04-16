@@ -165,11 +165,37 @@
 
     <h2>メタデータ検索</h2>
     <p><kbd>Ctrl</kbd>+<kbd>F</kbd> で検索バーが表示されます。
-    ファイル名や AI プロンプトなどのメタデータをキーワード検索し、マッチした画像だけを絞り込み表示できます。</p>
+    ファイル名や AI プロンプトなどのメタデータをキーワード検索し、マッチした画像だけを絞り込み表示できます。
+    ZIP アーカイブ内の PNG についても、ZIP を開いた状態でメタデータ検索が働きます。</p>
     <ul>
       <li><kbd>Enter</kbd> で検索を実行</li>
       <li><kbd>Esc</kbd> または「×」ボタンで検索バーを閉じる</li>
     </ul>
+
+    <h3>検索クエリ構文</h3>
+    <p>スペース区切りの複数キーワードを組み合わせられます。大文字小文字は区別しません。</p>
+    <table>
+      <thead>
+        <tr><th>書き方</th><th>意味</th><th>例</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>A B</code></td><td>A と B の<strong>両方</strong>を含む (AND)</td><td><code>sunset mountain</code></td></tr>
+        <tr><td><code>-A</code></td><td>A を<strong>含まない</strong> (NOT)</td><td><code>landscape -night</code></td></tr>
+        <tr><td><code>"A B"</code></td><td>スペース込みのフレーズ完全一致</td><td><code>"blue sky"</code></td></tr>
+        <tr><td><code>-"A B"</code></td><td>フレーズを含まない</td><td><code>-"low quality"</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>Negative Prompt の扱い:</strong>
+        AI 画像 (AUTOMATIC1111 / Forge / ComfyUI / Midjourney) のメタデータが識別できた場合、
+        Negative Prompt は検索対象から自動的に<strong>除外</strong>されます。
+        これにより、たとえば <code>blurry</code> を含む画像を探すときに、
+        正プロンプトではなくネガティブ側に <code>blurry</code> が入っている画像が誤ヒットするのを防げます。
+      </div>
+    </div>
 
     <h2>ZIP アーカイブ</h2>
     <p>ZIP ファイルをダブルクリックすると、アーカイブ内の画像をその場で一覧表示できます。
@@ -234,6 +260,7 @@
     <ul>
       <li>メニュー「お気に入り」→「検索… (Ctrl+S)」で画面上部に検索バーが表示されます。</li>
       <li>テキストを入力すると、お気に入り全体から部分一致 (大文字小文字無視) でヒットしたフォルダ・ZIP・PDF がサムネイル一覧に表示されます。</li>
+      <li>検索クエリ構文 (AND / <code>-</code> 除外 / <code>"…"</code> フレーズ) はメタデータ検索と<a href="#メタデータ検索">同じ</a>です。</li>
       <li>結果をクリック/ダブルクリックすると通常どおりそのフォルダ・アーカイブを開きます。</li>
       <li>× ボタンまたは Esc で検索を閉じ、元のフォルダに戻ります。</li>
       <li><strong>インデックス作成:</strong> お気に入り配下をブラウズしていると自動的に索引が更新されますが、まとめて再構築したい場合はメニュー「お気に入り」→「インデックス作成」でチェックしたフォルダを一括走査できます。チェック状態は次回以降も保存されます。</li>

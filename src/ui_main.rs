@@ -554,9 +554,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("検索:");
                 let response = ui.add_sized(
-                    [240.0, 18.0],
+                    [280.0, 18.0],
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("プロンプト・ファイル名…"),
+                        .hint_text(r#"プロンプト・ファイル名 (AND / -除外 / "…")"#),
                 );
 
                 // フォーカスリクエスト
@@ -637,9 +637,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("🔍 お気に入り検索:");
                 let response = ui.add_sized(
-                    [260.0, 20.0],
+                    [300.0, 20.0],
                     egui::TextEdit::singleline(&mut self.favsearch.query)
-                        .hint_text("フォルダ・ZIP・PDF 名の部分一致…"),
+                        .hint_text(r#"フォルダ・ZIP・PDF 名 (AND / -除外 / "…")"#),
                 );
 
                 if self.favsearch.focus_request {
