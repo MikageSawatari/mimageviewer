@@ -485,6 +485,9 @@ pub struct App {
     pub(crate) pdf_current_password: Option<String>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
+    /// PDF レンダリング完了時に content_type を受け取るチャネル
+    pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
+    pub(crate) pdf_content_type_rx: mpsc::Receiver<(usize, crate::pdf_loader::PdfPageContentType)>,
     /// ページ列挙の非同期応答待ち: (pdf_path, password, receiver)
     pub(crate) pdf_enumerate_pending: Option<(
         PathBuf,
@@ -597,6 +600,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
         let settings = crate::settings::Settings::load();
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
@@ -739,6 +743,8 @@ impl Default for App {
             pdf_password_error: None,
             pdf_password_pending_path: None,
             pdf_current_password: None,
+            pdf_content_type_tx: pdf_ct_tx,
+            pdf_content_type_rx: pdf_ct_rx,
             pdf_enumerate_pending: None,
             cached_handlers: None,
             cached_nav_indices: None,
@@ -1406,6 +1412,7 @@ impl App {
                     items.push(GridItem::PdfPage {
                         pdf_path: pdf_path.clone(),
                         page_num: page.page_num,
+                        content_type: None, // render 時に解析
                     });
                     image_metas.push(Some((page.mtime, page.file_size as i64)));
                 }
@@ -3226,13 +3233,12 @@ impl App {
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
-        // (path, zip_entry, pdf_page, pdf_password) を取り出し
         let (path, zip_entry, pdf_page, pdf_password) = match self.items.get(idx) {
             Some(GridItem::Image(p)) => (p.clone(), None, None, None),
             Some(GridItem::ZipImage { zip_path, entry_name }) => {
                 (zip_path.clone(), Some(entry_name.clone()), None, None)
             }
-            Some(GridItem::PdfPage { pdf_path, page_num }) => {
+            Some(GridItem::PdfPage { pdf_path, page_num, .. }) => {
                 (pdf_path.clone(), None, Some(*page_num), self.pdf_current_password.clone())
             }
             _ => return,
@@ -3240,6 +3246,7 @@ impl App {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
+        let pdf_ct_tx = self.pdf_content_type_tx.clone();
         self.fs_pending.insert(idx, (Arc::clone(&cancel), rx));
 
         std::thread::spawn(move || {
@@ -3269,15 +3276,18 @@ impl App {
 
             // PDF ページの場合はラスタライズ
             if let Some(page_num) = pdf_page {
-                match crate::pdf_loader::render_page(&path, page_num, 4096, pdf_password.as_deref(), Some(cancel.clone())) {
-                    Ok(img) => {
+                let target_px = 4096u32;
+                match crate::pdf_loader::render_page(&path, page_num, target_px, pdf_password.as_deref(), Some(cancel.clone())) {
+                    Ok((img, content_type)) => {
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
-                            "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}",
-                            img.width(), img.height()
+                            "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}  {:?}",
+                            img.width(), img.height(), content_type
                         ));
                         let ci = dynamic_image_to_color_image(&img);
                         let _ = tx.send(FsLoadResult::Static(ci));
+                        // content_type をメインスレッドに送る
+                        let _ = pdf_ct_tx.send((idx, content_type));
                     }
                     Err(e) => {
                         if cancel.load(Ordering::Relaxed) {
@@ -3376,16 +3386,30 @@ impl App {
     /// ワーカーに直接リクエストを送り、結果は `poll_pdf_rerender` で受け取る。
     /// UI スレッドを一切ブロックしない。
     pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32) {
-        let (pdf_path, page_num, password) = match self.items.get(idx) {
-            Some(GridItem::PdfPage { pdf_path, page_num }) => {
-                (pdf_path.clone(), *page_num, self.pdf_current_password.clone())
+        let (pdf_path, page_num, password, content_type) = match self.items.get(idx) {
+            Some(GridItem::PdfPage { pdf_path, page_num, content_type }) => {
+                (pdf_path.clone(), *page_num, self.pdf_current_password.clone(), *content_type)
             }
             _ => return,
         };
 
         // 上限 8192: これ以上大きいとテクスチャメモリが巨大になりクラッシュする
         // (8192px 正方形 ≈ 256 MB RGBA、16384px ≈ 1 GB)
-        let target_px = ((4096.0 * zoom) as u32).clamp(256, 8192);
+        // ラスターページでネイティブ解像度が AI アップスケール対象内の場合のみ
+        // 原寸基準でレンダリング。それ以外は従来通り 4096px 基準。
+        let base_px = match content_type {
+            Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
+                let native_long = w.max(h);
+                let threshold = self.settings.ai_upscale_skip_px;
+                if native_long < threshold {
+                    native_long as f32
+                } else {
+                    4096.0
+                }
+            }
+            _ => 4096.0, // Vector or not yet analyzed
+        };
+        let target_px = ((base_px * zoom) as u32).clamp(256, 8192);
 
         // 既に同じ解像度のキャッシュがあれば不要
         if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
@@ -3413,7 +3437,7 @@ impl App {
 
         std::thread::spawn(move || {
             match render_rx.recv() {
-                Ok(Ok(img)) => {
+                Ok(Ok((img, _content_type))) => {
                     if cancel.load(Ordering::Relaxed) { return; }
                     crate::logger::log(format!(
                         "  pdf rerender done: page={} target_px={target_px} {}x{}",
@@ -4009,7 +4033,7 @@ impl App {
             GridItem::ZipImage { zip_path, entry_name } => {
                 format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
             }
-            GridItem::PdfPage { pdf_path, page_num } => {
+            GridItem::PdfPage { pdf_path, page_num, .. } => {
                 format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
             }
             _ => return None,
@@ -4236,6 +4260,13 @@ impl App {
 
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
     pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
+        // PDF ページの content_type を更新 (render 完了時にワーカーから受信)
+        while let Ok((idx, ct)) = self.pdf_content_type_rx.try_recv() {
+            if let Some(GridItem::PdfPage { content_type, .. }) = self.items.get_mut(idx) {
+                *content_type = Some(ct);
+            }
+        }
+
         let mut completed: Vec<(usize, FsLoadResult)> = Vec::new();
         let mut disconnected: Vec<usize> = Vec::new();
         for (&key, (_, rx)) in &self.fs_pending {
@@ -4722,7 +4753,7 @@ impl App {
 
                             // 先頭1ページを親フォルダの DB にも保存
                             if page_count > 0 && !cache_map.contains_key(&folder_key) {
-                                if let Ok(img) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
+                                if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
                                     if let Some(bytes) = encode_and_save(
                                         &img, &folder_key, &catalog,
                                         *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
@@ -4737,7 +4768,7 @@ impl App {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
-                            if let Ok(img) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
+                            if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None) {
                                 if let Some(bytes) = encode_and_save(
                                     &img, &folder_key, &catalog,
                                     *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
@@ -5113,7 +5144,7 @@ fn make_load_request(
             skip_cache, priority: false, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
         }),
-        GridItem::PdfPage { pdf_path, page_num } => Some(LoadRequest {
+        GridItem::PdfPage { pdf_path, page_num, .. } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: None, pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),

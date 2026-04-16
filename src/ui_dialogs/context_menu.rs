@@ -239,7 +239,7 @@ impl crate::app::App {
                         GridItem::ZipSeparator { .. } => {
                             close = true;
                         }
-                        GridItem::PdfPage { pdf_path, page_num } => {
+                        GridItem::PdfPage { pdf_path, page_num, .. } => {
                             let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(display);
@@ -362,7 +362,7 @@ impl crate::app::App {
                             close = true;
                         }
                     }
-                    GridItem::PdfPage { pdf_path, page_num } => {
+                    GridItem::PdfPage { pdf_path, page_num, .. } => {
                         let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
                         if ui.button("パスをコピー").clicked() {
                             ctx.copy_text(display);

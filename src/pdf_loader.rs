@@ -81,6 +81,110 @@ fn ensure_dll_extracted() -> Result<&'static PathBuf, String> {
 // 共通 PDFium 操作 (IPC ワーカー / in-process ワーカー両方で使用)
 // -----------------------------------------------------------------------
 
+// ── ページコンテンツ解析 ──
+
+/// ページ内のオブジェクトを走査し、ラスター/ベクターを判定する。
+fn analyze_page_content(page: &PdfPage) -> PdfPageContentType {
+    let mut has_vector = false;
+    let mut image_sizes: Vec<(u32, u32)> = Vec::new();
+
+    analyze_objects(page.objects().iter(), &mut has_vector, &mut image_sizes);
+
+    if has_vector || image_sizes.is_empty() {
+        return PdfPageContentType::Vector;
+    }
+
+    // ラスターのみ: 単一画像ならそのサイズ、複数タイルなら合算推定
+    if image_sizes.len() == 1 {
+        let (w, h) = image_sizes[0];
+        PdfPageContentType::Raster { w, h }
+    } else {
+        estimate_tiled_size(&image_sizes)
+    }
+}
+
+/// オブジェクトイテレータを走査し、ベクター要素の有無と画像サイズを収集する。
+/// XObjectForm は再帰的に走査する。
+fn analyze_objects<'a>(
+    iter: impl Iterator<Item = PdfPageObject<'a>>,
+    has_vector: &mut bool,
+    image_sizes: &mut Vec<(u32, u32)>,
+) {
+    for obj in iter {
+        if *has_vector {
+            return; // 早期打ち切り
+        }
+        match obj {
+            PdfPageObject::Image(ref img) => {
+                let w = img.width().unwrap_or(0).max(0) as u32;
+                let h = img.height().unwrap_or(0).max(0) as u32;
+                if w > 0 && h > 0 {
+                    image_sizes.push((w, h));
+                }
+            }
+            PdfPageObject::Text(ref txt) => {
+                if is_visible_text(txt) {
+                    *has_vector = true;
+                }
+            }
+            PdfPageObject::Path(_) | PdfPageObject::Shading(_) => {
+                *has_vector = true;
+            }
+            PdfPageObject::XObjectForm(ref form) => {
+                analyze_objects(form.iter(), has_vector, image_sizes);
+            }
+            PdfPageObject::Unsupported(_) => {}
+        }
+    }
+}
+
+/// テキストオブジェクトが可視かどうかを判定する。
+/// OCR テキストレイヤー (Invisible モードまたは完全透明) は不可視と見なす。
+fn is_visible_text(txt: &PdfPageTextObject) -> bool {
+    // render_mode が Invisible 系なら不可視
+    let mode = txt.render_mode();
+    if matches!(
+        mode,
+        PdfPageTextRenderMode::Invisible | PdfPageTextRenderMode::InvisibleClipping
+    ) {
+        return false;
+    }
+    // フィルカラーとストロークカラーの両方が完全透明なら不可視
+    let fill_alpha = txt.fill_color().ok().map(|c| c.alpha()).unwrap_or(255);
+    let stroke_alpha = txt.stroke_color().ok().map(|c| c.alpha()).unwrap_or(255);
+    if fill_alpha == 0 && stroke_alpha == 0 {
+        return false;
+    }
+    true
+}
+
+/// 複数タイル画像の合算サイズを推定する。
+/// 同じ幅のタイルが縦に並んでいると仮定し合算する。
+/// 推定できなければ最大画像のサイズを返す。
+fn estimate_tiled_size(sizes: &[(u32, u32)]) -> PdfPageContentType {
+    // 全タイルの幅が一致しているか確認 (横タイリング)
+    let all_same_w = sizes.windows(2).all(|p| p[0].0 == p[1].0);
+    if all_same_w {
+        let w = sizes[0].0;
+        let h: u32 = sizes.iter().map(|(_, h)| h).sum();
+        return PdfPageContentType::Raster { w, h };
+    }
+    // 全タイルの高さが一致しているか確認 (縦タイリング)
+    let all_same_h = sizes.windows(2).all(|p| p[0].1 == p[1].1);
+    if all_same_h {
+        let w: u32 = sizes.iter().map(|(w, _)| w).sum();
+        let h = sizes[0].1;
+        return PdfPageContentType::Raster { w, h };
+    }
+    // 推定不可: 最大面積の画像サイズを返す
+    let (w, h) = sizes
+        .iter()
+        .max_by_key(|(w, h)| (*w as u64) * (*h as u64))
+        .copied()
+        .unwrap_or((0, 0));
+    PdfPageContentType::Raster { w, h }
+}
+
 /// PDF のページ一覧を列挙する (コアロジック)。
 fn core_enumerate(
     pdfium: &Pdfium,
@@ -116,7 +220,7 @@ fn core_render(
     page_num: u32,
     target_px: u32,
     password: Option<&str>,
-) -> std::io::Result<image::DynamicImage> {
+) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
     let doc = pdfium
         .load_pdf_from_file(path, password)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
@@ -125,6 +229,9 @@ fn core_render(
         .pages()
         .get(page_num as u16)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+
+    // ページコンテンツ解析 (レンダリングのついでに実行、追加コストほぼゼロ)
+    let content_type = analyze_page_content(&page);
 
     let page_w = page.width().value;
     let page_h = page.height().value;
@@ -138,7 +245,7 @@ fn core_render(
         .render_with_config(&render_config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
 
-    Ok(bitmap.as_image())
+    Ok((bitmap.as_image(), content_type))
 }
 
 // -----------------------------------------------------------------------
@@ -175,7 +282,7 @@ fn read_msg(r: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 64 * 1024 * 1024 {
+    if len > 512 * 1024 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("message too large: {len} bytes"),
@@ -443,15 +550,28 @@ fn ipc_render(
     target_px: u32,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
-    let img = core_render(pdfium, path, page_num, target_px, password)?;
+    let (img, content_type) = core_render(pdfium, path, page_num, target_px, password)?;
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
     let pixels = rgba.as_raw();
-    let mut buf = Vec::with_capacity(1 + 4 + 4 + pixels.len());
+    // レスポンス: [status][4B w][4B h][1B type_tag][4B raster_w][4B raster_h][rgba_pixels]
+    let mut buf = Vec::with_capacity(1 + 4 + 4 + 9 + pixels.len());
     buf.push(STATUS_OK);
     buf.extend_from_slice(&w.to_le_bytes());
     buf.extend_from_slice(&h.to_le_bytes());
+    match content_type {
+        PdfPageContentType::Vector => {
+            buf.push(0);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        PdfPageContentType::Raster { w: rw, h: rh } => {
+            buf.push(1);
+            buf.extend_from_slice(&rw.to_le_bytes());
+            buf.extend_from_slice(&rh.to_le_bytes());
+        }
+    }
     buf.extend_from_slice(pixels);
     Ok(buf)
 }
@@ -620,7 +740,7 @@ impl PdfWorkerPool {
         Ok(entries)
     }
 
-    fn parse_render_response(data: &[u8]) -> std::io::Result<image::DynamicImage> {
+    fn parse_render_response(data: &[u8]) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
         if data.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
         }
@@ -628,12 +748,21 @@ impl PdfWorkerPool {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
-        if data[0] != STATUS_OK || data.len() < 9 {
+        // [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][pixels...]
+        if data[0] != STATUS_OK || data.len() < 18 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid render response"));
         }
         let w = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
         let h = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
-        let pixels = &data[9..];
+        let type_tag = data[9];
+        let raster_w = u32::from_le_bytes(data[10..14].try_into().unwrap());
+        let raster_h = u32::from_le_bytes(data[14..18].try_into().unwrap());
+        let content_type = if type_tag == 1 {
+            PdfPageContentType::Raster { w: raster_w, h: raster_h }
+        } else {
+            PdfPageContentType::Vector
+        };
+        let pixels = &data[18..];
         let expected = (w as usize) * (h as usize) * 4;
         if pixels.len() != expected {
             return Err(std::io::Error::new(
@@ -644,7 +773,7 @@ impl PdfWorkerPool {
         let img_buf = image::RgbaImage::from_raw(w, h, pixels.to_vec()).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to create RgbaImage")
         })?;
-        Ok(image::DynamicImage::ImageRgba8(img_buf))
+        Ok((image::DynamicImage::ImageRgba8(img_buf), content_type))
     }
 }
 
@@ -668,7 +797,7 @@ enum WorkerRequest {
         target_px: u32,
         password: Option<String>,
         cancel: Option<Arc<AtomicBool>>,
-        reply: mpsc::Sender<std::io::Result<image::DynamicImage>>,
+        reply: mpsc::Sender<std::io::Result<(image::DynamicImage, PdfPageContentType)>>,
     },
 }
 
@@ -805,6 +934,28 @@ impl PdfWorker {
 // 公開データ型
 // -----------------------------------------------------------------------
 
+/// PDF ページのコンテンツ種別。
+/// ラスター画像のみで構成されるページ (スキャン PDF) と、
+/// ベクター要素 (テキスト・パス等) を含むページを区別する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfPageContentType {
+    /// ベクター要素 (可視テキスト・パス・シェーディング等) を含む。
+    Vector,
+    /// ラスター画像のみ (OCR 透明テキストは無視)。原寸ピクセルサイズを保持。
+    Raster { w: u32, h: u32 },
+}
+
+impl PdfPageContentType {
+    /// レンダリング基準解像度 (長辺ピクセル数) を返す。
+    /// ラスターページは画像の原寸、ベクターページは固定 4096px。
+    pub fn base_render_px(&self) -> f32 {
+        match self {
+            Self::Raster { w, h } => (*w).max(*h) as f32,
+            Self::Vector => 4096.0,
+        }
+    }
+}
+
 pub struct PdfPageEntry {
     pub page_num: u32,
     pub mtime: i64,
@@ -848,7 +999,7 @@ pub fn render_page(
     target_px: u32,
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
-) -> std::io::Result<image::DynamicImage> {
+) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
     }
@@ -892,7 +1043,7 @@ pub fn render_page_async(
     page_num: u32,
     target_px: u32,
     password: Option<&str>,
-) -> (Arc<AtomicBool>, mpsc::Receiver<std::io::Result<image::DynamicImage>>) {
+) -> (Arc<AtomicBool>, mpsc::Receiver<std::io::Result<(image::DynamicImage, PdfPageContentType)>>) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Render {

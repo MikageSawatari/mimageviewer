@@ -663,6 +663,7 @@ pub fn load_one_cached(
     //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
     let img_result = if let Some(page_num) = pdf_page {
         crate::pdf_loader::render_page(path, page_num, display_px, pdf_password, cancel.map(Arc::clone))
+            .map(|(img, _ct)| img)
             .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(entry_name) = zip_entry {
         // プリロード済みバイト列があれば ZIP を再度 open せずにデコード
@@ -995,7 +996,7 @@ pub fn build_and_save_one_pdf(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
-    let img = crate::pdf_loader::render_page(pdf_path, page_num, thumb_px, password, None).ok()?;
+    let (img, _) = crate::pdf_loader::render_page(pdf_path, page_num, thumb_px, password, None).ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
     encode_and_save(&img, &key, catalog, mtime, file_size, thumb_px, thumb_quality)
 }
