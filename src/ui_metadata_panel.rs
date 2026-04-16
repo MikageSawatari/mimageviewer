@@ -6,7 +6,6 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::exif_reader::{self, ExifInfo};
-use crate::grid_item::GridItem;
 use crate::png_metadata::{AiMetadata, A1111Metadata, ComfyUIMetadata};
 
 /// パネル幅 (ピクセル)
@@ -236,24 +235,15 @@ impl App {
     /// 現在のフルスクリーン画像の AI メタデータを取得する。
     fn get_current_ai_metadata(&self) -> Option<AiMetadata> {
         let idx = self.fullscreen_idx?;
-        let path = self.fullscreen_image_path(idx)?;
-        self.metadata_cache.get(&path).cloned().flatten()
+        let key = self.metadata_cache_key(idx)?;
+        self.metadata_cache.get(&key).cloned().flatten()
     }
 
     /// 現在のフルスクリーン画像の EXIF 情報を取得する。
     fn get_current_exif(&self) -> Option<ExifInfo> {
         let idx = self.fullscreen_idx?;
-        let path = self.fullscreen_image_path(idx)?;
-        self.exif_cache.get(&path).cloned().flatten()
-    }
-
-    /// フルスクリーン画像のファイルパスを返す。
-    fn fullscreen_image_path(&self, idx: usize) -> Option<std::path::PathBuf> {
-        match self.items.get(idx) {
-            Some(GridItem::Image(p)) => Some(p.clone()),
-            Some(GridItem::ZipImage { zip_path, .. }) => Some(zip_path.clone()),
-            _ => None,
-        }
+        let key = self.metadata_cache_key(idx)?;
+        self.exif_cache.get(&key).cloned().flatten()
     }
 }
 

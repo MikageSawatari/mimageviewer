@@ -403,10 +403,12 @@ pub struct App {
     // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
     /// フルスクリーンでメタデータパネルを表示するか
     pub(crate) show_metadata_panel: bool,
-    /// AI メタデータキャッシュ: ファイルパス → パース結果 (None = メタデータなし)
-    pub(crate) metadata_cache: std::collections::HashMap<PathBuf, Option<crate::png_metadata::AiMetadata>>,
-    /// EXIF キャッシュ: ファイルパス → パース結果 (None = EXIF なし)
-    pub(crate) exif_cache: std::collections::HashMap<PathBuf, Option<crate::exif_reader::ExifInfo>>,
+    /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
+    /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
+    pub(crate) metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
+    /// EXIF キャッシュ: 正規化キー → パース結果 (None = EXIF なし)
+    /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
+    pub(crate) exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -2842,17 +2844,35 @@ impl App {
         self.ensure_metadata_loaded(idx);
     }
 
+    /// メタデータ / EXIF キャッシュ用の正規化キーを返す。
+    ///
+    /// `Image` は正規化パス、`ZipImage` は `zip_path::entry_name`、
+    /// `PdfPage` は `pdf_path::page_N` の形式で、ZIP エントリ・PDF ページごとに
+    /// 衝突しないキーを返す ([`App::page_path_key`] と同じ規約)。
+    pub(crate) fn metadata_cache_key(&self, idx: usize) -> Option<String> {
+        let item = self.items.get(idx)?;
+        let key = match item {
+            GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
+            GridItem::ZipImage { zip_path, entry_name } => {
+                format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
+            }
+            GridItem::PdfPage { pdf_path, page_num, .. } => {
+                format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
+            }
+            _ => return None,
+        };
+        Some(key)
+    }
+
     /// 指定 idx の AI メタデータと EXIF がキャッシュに無ければ読み込む。
     fn ensure_metadata_loaded(&mut self, idx: usize) {
-        let path = match self.items.get(idx) {
-            Some(GridItem::Image(p)) => p.clone(),
-            Some(GridItem::ZipImage { zip_path, .. }) => zip_path.clone(),
-            Some(GridItem::PdfPage { pdf_path, .. }) => pdf_path.clone(),
-            _ => return,
+        let key = match self.metadata_cache_key(idx) {
+            Some(k) => k,
+            None => return,
         };
 
         // AI メタデータ (PNG のみ)
-        if !self.metadata_cache.contains_key(&path) {
+        if !self.metadata_cache.contains_key(&key) {
             let meta = match self.items.get(idx) {
                 Some(GridItem::Image(p)) => crate::png_metadata::extract_metadata(p),
                 Some(GridItem::ZipImage { zip_path, entry_name }) => {
@@ -2864,11 +2884,11 @@ impl App {
                 }
                 _ => None,
             };
-            self.metadata_cache.insert(path.clone(), meta);
+            self.metadata_cache.insert(key.clone(), meta);
         }
 
         // EXIF (JPEG, PNG, TIFF 等)
-        if !self.exif_cache.contains_key(&path) {
+        if !self.exif_cache.contains_key(&key) {
             let hidden = &self.settings.exif_hidden_tags;
             let exif = match self.items.get(idx) {
                 Some(GridItem::Image(p)) => crate::exif_reader::read_exif(p, hidden),
@@ -2881,7 +2901,7 @@ impl App {
                 }
                 _ => None,
             };
-            self.exif_cache.insert(path, exif);
+            self.exif_cache.insert(key, exif);
         }
     }
 
