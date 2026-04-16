@@ -6,7 +6,6 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::folder_tree::{navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::pdf_loader::PdfPageContentType;
@@ -1354,44 +1353,15 @@ impl App {
         // Ctrl+↑↓ はフルスクリーンを保ったまま前後フォルダへ飛び、先頭/末尾の
         // 画像系アイテムを開く。self.selected も合わせて更新するので、ここから
         // フルスクリーンを閉じたときグリッド側のカーソルが最後に観た画像に残る。
+        //
+        // 実装上: `navigate_folder_with_skip` は DFS + `read_dir` で UI スレッドを
+        // ブロックし得るので (深い階層だと 100ms 級)、ここでは発火だけ行い、
+        // 実際の close_fullscreen / load_folder / open_fullscreen は
+        // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
             if let Some(cur) = self.current_folder.clone() {
-                let skip_limit = self.settings.folder_skip_limit;
-                let dfs_fn = if delta > 0 { next_folder_dfs } else { prev_folder_dfs };
-                if let Some(p) = navigate_folder_with_skip(&cur, dfs_fn, skip_limit, None) {
-                    // fs_cache / ai_upscale_cache は item index がキーで、
-                    // load_folder で items を入れ替えると古い画像を新しい idx で
-                    // 誤って引く危険がある。close_fullscreen で一括破棄してから
-                    // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
-                    self.close_fullscreen();
-                    self.load_folder(p);
-                    let target_idx = {
-                        let items = &self.items;
-                        let is_image_like = |i: usize| matches!(
-                            items.get(i),
-                            Some(GridItem::Image(_))
-                            | Some(GridItem::Video(_))
-                            | Some(GridItem::ZipImage { .. })
-                            | Some(GridItem::PdfPage { .. })
-                        );
-                        let mut it = self.visible_indices.iter().copied();
-                        if delta > 0 {
-                            it.find(|&i| is_image_like(i))
-                        } else {
-                            it.rev().find(|&i| is_image_like(i))
-                        }
-                    };
-                    if let Some(new_idx) = target_idx {
-                        self.open_fullscreen(new_idx);
-                        self.selected = Some(new_idx);
-                        self.scroll_to_selected = true;
-                        self.update_last_selected_image();
-                    } else {
-                        // navigate_folder_with_skip は画像ありフォルダを返す前提だが、
-                        // レーティングフィルタ等で visible_indices が空の場合はここに来る。
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                }
+                let forward = delta > 0;
+                self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
             }
         } else if !close_fs && nav_delta != 0 {
             if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(

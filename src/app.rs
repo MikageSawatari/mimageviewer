@@ -8,6 +8,55 @@ use std::sync::{
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 
+/// Ctrl+↑↓ フォルダナビゲーションの発火元モード。DFS 完了後に mode に応じて
+/// 異なる後処理 (grid は load_folder のみ、fullscreen は fs 再オープン、favsearch は
+/// sibling fallback 付き) を行うため、`FolderNavPending` に記憶させる。
+#[derive(Clone, Debug)]
+pub(crate) enum FolderNavMode {
+    /// 通常グリッド。DFS 結果をそのまま `load_folder` する。
+    Grid,
+    /// フルスクリーン表示中。DFS 結果で `load_folder` 後、先頭/末尾の画像系
+    /// アイテムを `open_fullscreen` で再表示する。
+    Fullscreen,
+    /// お気に入り検索コンテキスト。DFS 結果が root 配下なら `nav_stack` に積んで
+    /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
+    Favsearch { root: PathBuf },
+}
+
+/// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
+pub(crate) struct FolderNavPending {
+    /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
+    cancel: Arc<AtomicBool>,
+    /// DFS スレッドからの結果チャネル。
+    rx: mpsc::Receiver<Option<PathBuf>>,
+    /// この DFS ステップの方向 (forward=↓, backward=↑)。結果の後処理に使う。
+    forward: bool,
+    /// この DFS が発火された起点モード。結果の後処理に使う。
+    mode: FolderNavMode,
+}
+
+/// `poll_folder_nav` がワーカー完了を検知したときに返す情報。
+pub(crate) struct FolderNavResult {
+    /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
+    pub path: Option<PathBuf>,
+    /// 起点の方向。
+    pub forward: bool,
+    /// 起点モード。
+    pub mode: FolderNavMode,
+}
+
+/// モードの種類 (variant) のみを比較する。`Favsearch { root }` は root 違いでも
+/// 同一モードとみなす (同一バースト中に root が変わるのはエッジケースだが、
+/// 変わったとしても favsearch 動作は継続するので区別する意味が薄い)。
+fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
+    matches!(
+        (a, b),
+        (FolderNavMode::Grid, FolderNavMode::Grid)
+            | (FolderNavMode::Fullscreen, FolderNavMode::Fullscreen)
+            | (FolderNavMode::Favsearch { .. }, FolderNavMode::Favsearch { .. })
+    )
+}
+
 use eframe::egui;
 
 use crate::folder_tree::{
@@ -279,12 +328,15 @@ pub struct App {
 
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
-    /// (キャンセルトークン, 結果レシーバー)
-    folder_nav_pending: Option<(Arc<AtomicBool>, mpsc::Receiver<Option<PathBuf>>)>,
+    folder_nav_pending: Option<FolderNavPending>,
     /// Ctrl+↑↓ 連打アキュームレータ。in-flight 中の追加プレスをここに貯め、
     /// 現 nav が完了するたびに 1 消費して次の nav を連鎖させる。
     /// 符号: 正=forward (↓), 負=backward (↑)。異方向を押すと相殺される。
     pending_folder_nav_steps: i32,
+    /// 連鎖ステップ時に使うモード (grid / fullscreen / favsearch)。
+    /// folder_nav_pending が走っている間は pending.mode と一致する。
+    /// 一連のバーストが途切れたら `FolderNavMode::Grid` にリセットする。
+    pending_folder_nav_mode: FolderNavMode,
 
     // ── 進捗バー (段階 B/E の合算進捗表示) ─────────────────────
     /// 現フレームで検出された通常読み込みのピーク件数 (current が 0 でリセット)
@@ -698,6 +750,7 @@ impl Default for App {
             texture_backlog: Vec::new(),
             folder_nav_pending: None,
             pending_folder_nav_steps: 0,
+            pending_folder_nav_mode: FolderNavMode::Grid,
             progress_normal_peak: 0,
             progress_upgrade_peak: 0,
             selected_cell_rect: None,
@@ -1161,42 +1214,19 @@ impl App {
     ///    (`favsearch_navigate_sibling`)。
     ///
     /// サブツリー内の移動はスタックに push するので、BS で元の位置に戻れる。
+    ///
+    /// 実装上: `navigate_folder_with_skip` は DFS + `read_dir` で UI スレッドを
+    /// ブロックし得るので、`start_folder_nav` に投げて非同期実行する。結果は
+    /// `apply_folder_nav_result` が `FolderNavMode::Favsearch` ブランチで
+    /// 受け取り、sibling fallback も含めた後処理を行う。
     pub(crate) fn favsearch_ctrl_nav(&mut self, forward: bool) {
         if self.favsearch.nav_stack.is_empty() {
             // 検索結果リスト上ではなにもしない
             return;
         }
         let root = self.favsearch.nav_stack[0].clone();
-        let current = match self.favsearch.nav_stack.last() {
-            Some(p) => p.clone(),
-            None => return,
-        };
-        let nav_fn: fn(&std::path::Path) -> Option<PathBuf> = if forward {
-            crate::folder_tree::next_folder_dfs
-        } else {
-            crate::folder_tree::prev_folder_dfs
-        };
-        let dfs_result = crate::folder_tree::navigate_folder_with_skip(
-            &current,
-            nav_fn,
-            self.settings.folder_skip_limit,
-            None,
-        );
-        let delta: isize = if forward { 1 } else { -1 };
-        let Some(next) = dfs_result else {
-            // DFS が尽きた → 検索結果の前後へ
-            self.favsearch_navigate_sibling(delta);
-            return;
-        };
-        if crate::search_index_db::is_under(&next, &root) {
-            // サブツリー内 — 通常の DFS 移動としてスタックに push
-            self.favsearch.nav_stack.push(next.clone());
-            self.load_folder(next);
-            self.update_favsearch_address();
-        } else {
-            // サブツリー外へ出ようとしている → 検索結果の前後へ移動
-            self.favsearch_navigate_sibling(delta);
-        }
+        let Some(current) = self.favsearch.nav_stack.last().cloned() else { return };
+        self.start_folder_nav(current, forward, FolderNavMode::Favsearch { root });
     }
 
     /// 検索結果の前後アイテムへ移動する (Ctrl+↑↓ 用、`delta` は +1 / -1)。
@@ -1557,9 +1587,12 @@ impl App {
 
         // 進行中のフォルダナビゲーションをキャンセル
         // (他の経路でフォルダが変更された場合に不要な結果を破棄する)
-        if let Some((cancel_nav, _)) = self.folder_nav_pending.take() {
-            cancel_nav.store(true, Ordering::Relaxed);
+        if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
         }
+        // モード・累積もリセット (新しい load_folder が走る = 連打バースト中断)
+        self.pending_folder_nav_steps = 0;
+        self.pending_folder_nav_mode = FolderNavMode::Grid;
 
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
@@ -2755,7 +2788,7 @@ impl App {
             if in_favsearch {
                 self.favsearch_ctrl_nav(true);
             } else if let Some(ref cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur.clone(), true);
+                self.start_folder_nav(cur.clone(), true, FolderNavMode::Grid);
             }
         }
 
@@ -2764,7 +2797,7 @@ impl App {
             if in_favsearch {
                 self.favsearch_ctrl_nav(false);
             } else if let Some(ref cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur.clone(), false);
+                self.start_folder_nav(cur.clone(), false, FolderNavMode::Grid);
             }
         }
 
@@ -2782,30 +2815,47 @@ impl App {
     /// 現 nav が完了したあと `chain_folder_nav_if_pending` で次のステップを連鎖実行する。
     /// これにより「30Hz 連打で 30 ステップ進める」挙動になり、かつ
     /// 同時並行 DFS のファイルシステム競合を避ける。
-    fn start_folder_nav(&mut self, current: PathBuf, forward: bool) {
+    ///
+    /// **モードの扱い**:
+    /// `mode` は DFS の発火元 (grid / fullscreen / favsearch) を示し、
+    /// DFS 完了時に `apply_folder_nav_result` がこの mode を見て後処理を分岐する。
+    /// in-flight 中に異なるモードで start_folder_nav が呼ばれた場合は、
+    /// 旧モードをキャンセルして新モードで仕切り直す (モード混在を避ける)。
+    pub(crate) fn start_folder_nav(
+        &mut self,
+        current: PathBuf,
+        forward: bool,
+        mode: FolderNavMode,
+    ) {
         // 連打アキュームレータの上限。キーを離した後に余韻で追加遷移が続くと
         // 体感上「離したのに動く」違和感になるため、溜められる量を制限する。
         // 5 なら画像フォルダの load_folder (~100ms/step) で 500ms 弱で drain され、
         // リピート離脱直後のレスポンスが保たれる。超過分のプレスは捨てる。
         const MAX_PENDING_NAV: i32 = 5;
 
-        if self.folder_nav_pending.is_some() {
-            // 既に nav 進行中: 連打を累積するだけ (±MAX_PENDING_NAV で飽和)
-            let delta: i32 = if forward { 1 } else { -1 };
-            self.pending_folder_nav_steps = (self.pending_folder_nav_steps + delta)
-                .clamp(-MAX_PENDING_NAV, MAX_PENDING_NAV);
-            return;
+        if let Some(pending) = self.folder_nav_pending.as_ref() {
+            if folder_nav_mode_same_kind(&pending.mode, &mode) {
+                // 既に同一モードで nav 進行中: 連打を累積するだけ
+                let delta: i32 = if forward { 1 } else { -1 };
+                self.pending_folder_nav_steps = (self.pending_folder_nav_steps + delta)
+                    .clamp(-MAX_PENDING_NAV, MAX_PENDING_NAV);
+                return;
+            }
+            // モードが変わった (例: fullscreen → grid) → 旧 DFS をキャンセル
+            pending.cancel.store(true, Ordering::Relaxed);
+            self.folder_nav_pending = None;
         }
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
         self.pending_folder_nav_steps = 0;
-        self.spawn_folder_nav(current, forward);
+        self.pending_folder_nav_mode = mode.clone();
+        self.spawn_folder_nav(current, forward, mode);
     }
 
     /// 内部ヘルパー: DFS ワーカースレッドを spawn する。
     /// `start_folder_nav` (ユーザー押下) と `chain_folder_nav_if_pending` (累積消化) の
     /// 両方から呼ばれる。cancel トークンは `navigate_folder_with_skip` にも渡し、
     /// 次のユーザー操作で即座に DFS を畳めるようにする。
-    fn spawn_folder_nav(&mut self, current: PathBuf, forward: bool) {
+    fn spawn_folder_nav(&mut self, current: PathBuf, forward: bool, mode: FolderNavMode) {
         let skip_limit = self.settings.folder_skip_limit;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2826,10 +2876,16 @@ impl App {
             }
         });
 
-        self.folder_nav_pending = Some((cancel, rx));
+        self.folder_nav_pending = Some(FolderNavPending {
+            cancel,
+            rx,
+            forward,
+            mode,
+        });
     }
 
     /// 直前の folder_nav 完了後に呼ぶ。累積ステップが残っていれば次の DFS を連鎖実行。
+    /// モードは直前バーストと同じ (`pending_folder_nav_mode`) を引き継ぐ。
     fn chain_folder_nav_if_pending(&mut self) {
         if self.pending_folder_nav_steps == 0 {
             return;
@@ -2837,24 +2893,109 @@ impl App {
         let forward = self.pending_folder_nav_steps > 0;
         // 1 ステップ消費
         self.pending_folder_nav_steps += if forward { -1 } else { 1 };
-        if let Some(cur) = self.current_folder.clone() {
-            self.spawn_folder_nav(cur, forward);
+        let mode = self.pending_folder_nav_mode.clone();
+        // mode に応じて「次のステップの起点」は変わる:
+        //   Grid / Fullscreen → self.current_folder
+        //   Favsearch        → favsearch.nav_stack.last() (= 現在位置)
+        let current = match mode {
+            FolderNavMode::Favsearch { .. } => {
+                self.favsearch.nav_stack.last().cloned()
+            }
+            _ => self.current_folder.clone(),
+        };
+        if let Some(cur) = current {
+            self.spawn_folder_nav(cur, forward, mode);
         }
     }
 
     /// バックグラウンドフォルダナビゲーションの結果を非同期にポーリングする。
-    /// 結果が到着していれば `Some(path)` を返し、未完了なら `None` を返す。
-    fn poll_folder_nav(&mut self) -> Option<PathBuf> {
-        let Some((_, ref rx)) = self.folder_nav_pending else { return None; };
-        match rx.try_recv() {
-            Ok(result) => {
-                self.folder_nav_pending = None;
-                result
+    /// 結果が到着していれば `Some(FolderNavResult)` を返し、未完了なら `None` を返す。
+    fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
+        let pending = self.folder_nav_pending.as_ref()?;
+        match pending.rx.try_recv() {
+            Ok(path) => {
+                let pending = self.folder_nav_pending.take().unwrap();
+                Some(FolderNavResult {
+                    path,
+                    forward: pending.forward,
+                    mode: pending.mode,
+                })
             }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.folder_nav_pending = None;
-                None
+                let pending = self.folder_nav_pending.take().unwrap();
+                Some(FolderNavResult {
+                    path: None,
+                    forward: pending.forward,
+                    mode: pending.mode,
+                })
+            }
+        }
+    }
+
+    /// DFS 完了時の後処理。モードに応じて load_folder / open_fullscreen /
+    /// favsearch の stack push や sibling fallback を使い分ける。
+    fn apply_folder_nav_result(&mut self, ctx: &egui::Context, result: FolderNavResult) {
+        let Some(path) = result.path else {
+            // DFS が尽きた (forward で末尾、backward で先頭に達した等)
+            if let FolderNavMode::Favsearch { .. } = result.mode {
+                // favsearch では DFS 尽きた場合は検索結果の前後アイテムへ
+                let delta: isize = if result.forward { 1 } else { -1 };
+                self.favsearch_navigate_sibling(delta);
+            }
+            return;
+        };
+        match result.mode {
+            FolderNavMode::Grid => {
+                self.load_folder(path);
+            }
+            FolderNavMode::Fullscreen => {
+                // fs_cache / ai_upscale_cache は item index がキーで、
+                // load_folder で items を入れ替えると古い画像を新しい idx で
+                // 誤って引く危険がある。close_fullscreen で一括破棄してから
+                // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
+                self.close_fullscreen();
+                self.load_folder(path);
+                let target_idx = {
+                    let items = &self.items;
+                    let is_image_like = |i: usize| matches!(
+                        items.get(i),
+                        Some(GridItem::Image(_))
+                        | Some(GridItem::Video(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::PdfPage { .. })
+                    );
+                    let mut it = self.visible_indices.iter().copied();
+                    if result.forward {
+                        it.find(|&i| is_image_like(i))
+                    } else {
+                        it.rev().find(|&i| is_image_like(i))
+                    }
+                };
+                if let Some(new_idx) = target_idx {
+                    self.open_fullscreen(new_idx);
+                    self.selected = Some(new_idx);
+                    self.scroll_to_selected = true;
+                    self.update_last_selected_image();
+                } else {
+                    // navigate_folder_with_skip は画像ありフォルダを返す前提だが、
+                    // レーティングフィルタ等で visible_indices が空の場合はここに来る。
+                    // fullscreen は close 済みなので、メインビューポートに
+                    // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
+            FolderNavMode::Favsearch { root } => {
+                let delta: isize = if result.forward { 1 } else { -1 };
+                if crate::search_index_db::is_under(&path, &root) {
+                    // サブツリー内 — 通常の DFS 移動としてスタックに push
+                    self.favsearch.nav_stack.push(path.clone());
+                    self.load_folder(path);
+                    self.update_favsearch_address();
+                } else {
+                    // サブツリー外へ出ようとしている → 検索結果の前後へ移動
+                    self.favsearch_navigate_sibling(delta);
+                }
             }
         }
     }
@@ -3984,6 +4125,19 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // フルスクリーン発起点の Ctrl+↑↓ DFS が走っていたら、ユーザーが
+        // フルスクリーンを抜けた = フルスクリーン復帰の意図がなくなったとみなし
+        // キャンセルする。apply_folder_nav_result 内の close_fullscreen
+        // (Fullscreen ブランチ) は既に poll で folder_nav_pending を取り出した後
+        // なので self.folder_nav_pending は None = ここでキャンセルされない。
+        if let Some(pending) = self.folder_nav_pending.as_ref() {
+            if matches!(pending.mode, FolderNavMode::Fullscreen) {
+                pending.cancel.store(true, Ordering::Relaxed);
+                self.folder_nav_pending = None;
+                self.pending_folder_nav_steps = 0;
+                self.pending_folder_nav_mode = FolderNavMode::Grid;
+            }
+        }
         self.fullscreen_idx = None;
         // グリッドに戻るので Critical 予約を解除し、全 3 ワーカーを Normal に開放。
         crate::pdf_loader::set_critical_reservation(false);
@@ -5411,40 +5565,48 @@ impl eframe::App for App {
         }
 
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
-        let folder_nav = self.poll_folder_nav();
-        // 「この navigate は folder_nav 由来で、かつ他の nav 源に上書きされて
-        // いないか」を判定するための事前チェック。後段で連鎖起動するかの分岐に使う。
-        let folder_nav_wins = folder_nav.is_some()
+        // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard_nav > folder_nav
+        //                     > address_nav > open_folder_nav > context_nav > grid_nav
+        // folder_nav は fav/toolbar/keyboard より後、address 以下より先。
+        let folder_nav_result = self.poll_folder_nav();
+        let folder_nav_wins = folder_nav_result.is_some()
             && fav_nav.is_none()
             && toolbar_fav_nav.is_none()
             && keyboard_nav.is_none();
 
-        // ── ナビゲーション集約 ───────────────────────────────────────
-        let navigate = fav_nav
-            .or(toolbar_fav_nav)
-            .or(keyboard_nav)
-            .or(folder_nav)
-            .or(address_nav)
-            .or(open_folder_nav)
-            .or(context_nav)
-            .or(grid_nav);
-        if let Some(p) = navigate {
-            // 検索コンテキスト中の前方ナビゲーションはスタックに積む
-            // (BS は favsearch_back 経由で navigate には流れないので二重 push にならない)
-            if self.favsearch.active {
-                self.favsearch.nav_stack.push(p.clone());
-            }
-            self.load_folder(p);
-            // Step B: folder_nav が成立した場合、累積ステップが残っていれば次へ連鎖。
-            // それ以外の nav 源 (click, address, favsearch 等) が勝った場合は
-            // ユーザーが Ctrl+↑↓ 連打を放棄したとみなして累積をクリアする。
-            if folder_nav_wins {
+        if folder_nav_wins {
+            // folder_nav 勝利: モードに応じて load_folder / close+load+open_fullscreen /
+            // favsearch 処理に分岐。address_nav 以下の低優先度 nav は破棄する
+            // (旧実装の `.or()` 短絡と同じ挙動)。
+            if let Some(result) = folder_nav_result {
+                self.apply_folder_nav_result(ctx, result);
+                // 累積ステップが残っていれば次の DFS を連鎖起動。
                 self.chain_folder_nav_if_pending();
-            } else {
-                self.pending_folder_nav_steps = 0;
             }
-            if self.favsearch.active {
-                self.update_favsearch_address();
+        } else {
+            // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
+            let navigate = fav_nav
+                .or(toolbar_fav_nav)
+                .or(keyboard_nav)
+                .or(address_nav)
+                .or(open_folder_nav)
+                .or(context_nav)
+                .or(grid_nav);
+            if let Some(p) = navigate {
+                // 検索コンテキスト中の前方ナビゲーションはスタックに積む
+                // (BS は favsearch_back 経由で navigate には流れないので二重 push にならない)
+                if self.favsearch.active {
+                    self.favsearch.nav_stack.push(p.clone());
+                }
+                self.load_folder(p);
+                // 他 nav 源が勝った: 累積をクリアして連打バーストを中断する
+                // (start_loading_items が folder_nav_pending と累積をリセット済みだが、
+                //  folder_nav_result が Some かつ他 nav 優先のケースを拾うため明示)
+                self.pending_folder_nav_steps = 0;
+                self.pending_folder_nav_mode = FolderNavMode::Grid;
+                if self.favsearch.active {
+                    self.update_favsearch_address();
+                }
             }
         }
 
