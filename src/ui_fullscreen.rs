@@ -1347,10 +1347,14 @@ impl App {
         nav_delta: i32,
         fs_idx: usize,
     ) {
-        if close_fs || ctrl_nav.is_some() {
+        if close_fs {
             self.close_fullscreen();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        // Ctrl+↑↓: フルスクリーンを維持したまま前後のフォルダへジャンプし、
+        // Ctrl+↓ なら次フォルダの先頭画像、Ctrl+↑ なら前フォルダの末尾画像を表示する。
+        // `self.selected` も移動先のインデックスに揃えるので、ユーザーがフルスクリーンを
+        // 閉じたときはグリッドでも同じ画像にカーソルが載った状態で戻る。
         if let Some(delta) = ctrl_nav {
             if let Some(cur) = self.current_folder.clone() {
                 let skip_limit = self.settings.folder_skip_limit;
@@ -1360,7 +1364,39 @@ impl App {
                     navigate_folder_with_skip(&cur, prev_folder_dfs, skip_limit, None)
                 };
                 if let Some(p) = next {
+                    // 旧フォルダの fs_cache / ai_upscale_cache は item index を
+                    // キーに持つが load_folder で items が入れ替わるため、ここで
+                    // まとめて破棄する。close_fullscreen はキャッシュクリア + PDF
+                    // Critical 予約解除まで一括で行うが、直後の open_fullscreen で
+                    // 予約は再設定されるので問題ない。
+                    self.close_fullscreen();
                     self.load_folder(p);
+                    // 新フォルダから Ctrl+↓ は先頭、Ctrl+↑ は末尾の画像系アイテムを選ぶ。
+                    let target_idx = {
+                        let items = &self.items;
+                        let is_image_like = |i: usize| matches!(
+                            items.get(i),
+                            Some(GridItem::Image(_))
+                            | Some(GridItem::Video(_))
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. })
+                        );
+                        if delta > 0 {
+                            self.visible_indices.iter().copied().find(|&i| is_image_like(i))
+                        } else {
+                            self.visible_indices.iter().copied().rev().find(|&i| is_image_like(i))
+                        }
+                    };
+                    if let Some(new_idx) = target_idx {
+                        self.open_fullscreen(new_idx);
+                        self.selected = Some(new_idx);
+                        self.scroll_to_selected = true;
+                        self.update_last_selected_image();
+                    } else {
+                        // 画像系アイテムが見つからない場合はフルスクリーンを閉じてグリッドに戻す。
+                        // navigate_folder_with_skip は基本的に画像ありフォルダを返すので稀。
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                 }
             }
         } else if !close_fs && nav_delta != 0 {
