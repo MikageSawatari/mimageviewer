@@ -8,8 +8,9 @@
 use eframe::egui;
 use std::sync::Arc;
 
-use crate::app::{App, EraseTool};
+use crate::app::{App, EraseTool, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
+use crate::ui_fullscreen::FsKeyAction;
 
 /// MI-GAN の固定入力サイズ。
 const MIGAN_SIZE: usize = 512;
@@ -19,6 +20,9 @@ const PANEL_W: f32 = 190.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
+
+/// Undo スタックの最大エントリ数。
+const UNDO_MAX: usize = 20;
 
 impl App {
     // ── モード開始/終了 ─────────────────────────────────────────────
@@ -54,11 +58,18 @@ impl App {
         self.erase_lasso_points.clear();
         self.erase_line_start = None;
         self.erase_line_end = None;
+        self.erase_line_tilt = 0.0;
+        self.erase_shift_drag = None;
         self.erase_paint_mode = true;
+        self.erase_undo_stack.clear();
 
         // デフォルトブラシ半径: 長辺の 1/100
         if self.erase_brush_radius <= 0.0 {
             self.erase_brush_radius = (w.max(h) as f32 / 100.0).max(2.0);
+        }
+        // デフォルト直線幅: 長辺の 1/500 (細い線ノイズ除去に適した値)
+        if self.erase_line_width <= 0.0 {
+            self.erase_line_width = (w.max(h) as f32 / 500.0).max(2.0);
         }
 
         // DB からマスクをロード
@@ -81,6 +92,190 @@ impl App {
         self.erase_lasso_points.clear();
         self.erase_line_start = None;
         self.erase_line_end = None;
+        self.erase_line_tilt = 0.0;
+        self.erase_shift_drag = None;
+        self.erase_undo_stack.clear();
+    }
+
+    // ── Undo / Slot ────────────────────────────────────────────────
+
+    pub(crate) fn push_undo_snapshot(&mut self) {
+        if let Some(mask) = &self.erase_mask {
+            self.erase_undo_stack.push_back(mask.clone());
+            while self.erase_undo_stack.len() > UNDO_MAX {
+                self.erase_undo_stack.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn undo_erase(&mut self) -> bool {
+        if let Some(prev) = self.erase_undo_stack.pop_back() {
+            self.erase_mask = Some(prev);
+            self.erase_mask_texture = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 現在のマスクをスロットに保存する。
+    pub(crate) fn save_mask_to_slot(&mut self, slot: usize) {
+        let [w, h] = self.erase_mask_size;
+        let saved = if let (Some(mask), Some(db)) = (&self.erase_mask, &self.mask_db) {
+            db.set_slot(slot, mask, w, h).is_ok()
+        } else {
+            false
+        };
+        if saved {
+            self.show_feedback_toast(format!("[スロット{}に保存]", slot));
+        } else {
+            self.show_feedback_toast(format!("[スロット{}保存失敗]", slot));
+        }
+    }
+
+    /// スロットからマスクをロードして現在のマスクと OR マージする。
+    pub(crate) fn load_mask_from_slot(&mut self, slot: usize) {
+        let [w, h] = self.erase_mask_size;
+        let slot_mask = self.mask_db.as_ref().and_then(|db| db.get_slot(slot, w, h));
+        let Some(slot_mask) = slot_mask else {
+            self.show_feedback_toast(format!("[スロット{}は空です]", slot));
+            return;
+        };
+        self.push_undo_snapshot();
+        if let Some(mask) = self.erase_mask.as_mut() {
+            for (m, s) in mask.iter_mut().zip(slot_mask.iter()) {
+                *m = *m || *s;
+            }
+            self.erase_mask_texture = None;
+            self.show_feedback_toast(format!("[スロット{}をロード]", slot));
+        }
+    }
+
+    // ── キー入力 ──────────────────────────────────────────────────
+
+    /// 消しゴムモード中のキー入力を処理する。
+    /// 通常のフルスクリーンショートカットをブロックし、消しゴム専用キーのみ有効にする。
+    pub(crate) fn handle_erase_keys(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
+        let action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None };
+
+        // ESC: 消しゴムモード終了 (フルスクリーンは閉じない)
+        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if esc {
+            // 終了前にマスクを DB に保存
+            let [w, h] = self.erase_mask_size;
+            if let (Some(mask), Some(key)) = (self.erase_mask.clone(), self.page_path_key(fs_idx)) {
+                if let Some(db) = &self.mask_db {
+                    let _ = db.set(&key, &mask, w, h);
+                }
+            }
+            self.reset_erase_mode();
+            return action;
+        }
+
+        // E: inpaint 実行
+        let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
+        if key_e {
+            self.execute_erase_inpaint(ctx, fs_idx);
+            return action;
+        }
+
+        // Ctrl+Z: Undo
+        let ctrl_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
+        if ctrl_z {
+            if self.undo_erase() {
+                self.show_feedback_toast("[元に戻す]".to_string());
+            } else {
+                self.show_feedback_toast("[履歴なし]".to_string());
+            }
+        }
+
+        // Shift+1/2: スロットに保存
+        let shift_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num1));
+        let shift_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Num2));
+        if shift_1 { self.save_mask_to_slot(1); }
+        if shift_2 { self.save_mask_to_slot(2); }
+
+        // 1/2: スロットからロード
+        let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
+        let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
+        if key_1 { self.load_mask_from_slot(1); }
+        if key_2 { self.load_mask_from_slot(2); }
+
+        // B/L/V/H/I: ツール切替
+        let key_b = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
+        let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        let key_v = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
+        let key_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H));
+        let key_i = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I));
+        if key_b {
+            self.erase_tool = EraseTool::Brush;
+            self.show_feedback_toast("[筆]".to_string());
+        }
+        if key_l {
+            self.erase_tool = EraseTool::Lasso;
+            self.show_feedback_toast("[囲み]".to_string());
+        }
+        if key_v {
+            self.erase_tool = EraseTool::VertLine;
+            self.show_feedback_toast("[縦線]".to_string());
+        }
+        if key_h {
+            self.erase_tool = EraseTool::HorizLine;
+            self.show_feedback_toast("[横線]".to_string());
+        }
+        if key_i {
+            self.erase_tool = EraseTool::Line;
+            self.show_feedback_toast("[直線]".to_string());
+        }
+
+        // D: 描画モード, F: 消去モード
+        let key_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D));
+        let key_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
+        if key_d {
+            self.erase_paint_mode = true;
+            self.show_feedback_toast("[描画モード]".to_string());
+        }
+        if key_f {
+            self.erase_paint_mode = false;
+            self.show_feedback_toast("[消去モード]".to_string());
+        }
+
+        // erase_mode 中は通常のフルスクリーンショートカットを無効化するため、
+        // ここで未使用キーを明示的に消費する (マウスイベントはペイントに必要なため除外)。
+        const NAV_KEYS: &[egui::Key] = &[
+            egui::Key::ArrowRight, egui::Key::ArrowLeft,
+            egui::Key::ArrowUp, egui::Key::ArrowDown,
+        ];
+        const SINGLE_KEYS: &[egui::Key] = &[
+            egui::Key::Space, egui::Key::Tab,
+            egui::Key::I, egui::Key::R, egui::Key::Z,
+            egui::Key::G, egui::Key::M, egui::Key::P,
+            egui::Key::U, egui::Key::N,
+            egui::Key::F1, egui::Key::F2, egui::Key::F3,
+            egui::Key::F4, egui::Key::F5, egui::Key::F6,
+        ];
+        // 将来のスロット拡張を見据えて未割当の数字キーも消費
+        const NUM_KEYS: &[egui::Key] = &[
+            egui::Key::Num3, egui::Key::Num4, egui::Key::Num5,
+            egui::Key::Num6, egui::Key::Num7, egui::Key::Num8,
+            egui::Key::Num9, egui::Key::Num0,
+        ];
+        ctx.input_mut(|i| {
+            for &k in NAV_KEYS {
+                for &m in &[egui::Modifiers::NONE, egui::Modifiers::SHIFT, egui::Modifiers::CTRL] {
+                    let _ = i.consume_key(m, k);
+                }
+            }
+            for &k in SINGLE_KEYS {
+                let _ = i.consume_key(egui::Modifiers::NONE, k);
+            }
+            for &k in NUM_KEYS {
+                let _ = i.consume_key(egui::Modifiers::NONE, k);
+                let _ = i.consume_key(egui::Modifiers::SHIFT, k);
+            }
+        });
+
+        action
     }
 
     // ── 座標変換 ──────────────────────────────────────────────────
@@ -261,9 +456,14 @@ impl App {
     /// ツールパネルの矩形を返す。
     fn erase_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let panel_pos = egui::pos2(full_rect.min.x + PANEL_MARGIN_X, full_rect.min.y + PANEL_MARGIN_Y);
-        let base_h = 210.0;
-        let brush_extra = if self.erase_tool == EraseTool::Brush { 40.0 } else { 0.0 };
-        egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, base_h + brush_extra))
+        // 基本高さ: ヘッダ + 描画/消去 + セパレータ + ツール 3 行 + スロット + セパレータ + マスク全削除 + ヘルプ
+        let base_h = 350.0;
+        let extra = if self.erase_tool == EraseTool::Brush || self.erase_tool == EraseTool::Line {
+            42.0 // サイズスライダー分
+        } else {
+            0.0
+        };
+        egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, base_h + extra))
     }
 
     // ── 入力処理 ──────────────────────────────────────────────────
@@ -288,20 +488,48 @@ impl App {
             }
         }
 
+        let shift_held = ctx.input(|i| i.modifiers.shift);
+
+        // マウスホイールによる筆/直線の太さ調整は handle_fs_wheel_and_click で処理済み。
+
         match self.erase_tool {
             EraseTool::Brush => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
-                            let prev = self.erase_last_paint_pos
-                                .and_then(|p| self.screen_to_image_f32(p, full_rect, zoom_pan))
-                                .unwrap_or(img_pos);
-                            self.paint_brush_line(prev, img_pos, paint);
+                            if shift_held {
+                                // 右/下方向で拡大、左/上方向で縮小
+                                let base_radius = match self.erase_shift_drag {
+                                    Some(ShiftDragState::BrushSize { base_radius, .. }) => base_radius,
+                                    _ => {
+                                        self.erase_shift_drag = Some(ShiftDragState::BrushSize {
+                                            origin: img_pos,
+                                            base_radius: self.erase_brush_radius,
+                                        });
+                                        self.erase_brush_radius
+                                    }
+                                };
+                                if let Some(ShiftDragState::BrushSize { origin, .. }) = self.erase_shift_drag {
+                                    let delta = (img_pos.0 - origin.0) + (img_pos.1 - origin.1);
+                                    let max_r = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
+                                    self.erase_brush_radius = (base_radius + delta).clamp(1.0, max_r);
+                                }
+                            } else {
+                                self.erase_shift_drag = None;
+                                if self.erase_last_paint_pos.is_none() {
+                                    self.push_undo_snapshot();
+                                }
+                                let prev = self.erase_last_paint_pos
+                                    .and_then(|p| self.screen_to_image_f32(p, full_rect, zoom_pan))
+                                    .unwrap_or(img_pos);
+                                self.paint_brush_line(prev, img_pos, paint);
+                            }
                         }
                         self.erase_last_paint_pos = Some(pos);
                     }
                 } else {
                     self.erase_last_paint_pos = None;
+                    self.erase_shift_drag = None;
                 }
             }
             EraseTool::Lasso => {
@@ -323,6 +551,7 @@ impl App {
                     }
                 }
                 if primary_released && self.erase_lasso_points.len() >= 3 {
+                    self.push_undo_snapshot();
                     let pts: Vec<(f32, f32)> = self.erase_lasso_points.drain(..).collect();
                     self.paint_polygon(&pts, paint);
                 } else if primary_released {
@@ -330,49 +559,167 @@ impl App {
                 }
             }
             EraseTool::VertLine => {
-                if primary_down {
-                    if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
-                            if self.erase_line_start.is_none() {
-                                self.erase_line_start = Some(img_pos);
-                            }
-                            self.erase_line_end = Some(img_pos);
-                        }
-                    }
-                }
-                if primary_released {
-                    if let (Some((x0, _)), Some((x1, _))) = (self.erase_line_start, self.erase_line_end) {
-                        let [w, h] = self.erase_mask_size;
-                        let lx = (x0.min(x1).max(0.0)) as usize;
-                        let rx = (x0.max(x1).ceil().min(w as f32)) as usize;
-                        self.paint_rect(lx, 0, rx, h, paint);
-                    }
-                    self.erase_line_start = None;
-                    self.erase_line_end = None;
-                }
+                self.handle_line_tool_paint(
+                    primary_down, primary_released, pointer_pos, shift_held, paint,
+                    full_rect, zoom_pan, true,
+                );
             }
             EraseTool::HorizLine => {
+                self.handle_line_tool_paint(
+                    primary_down, primary_released, pointer_pos, shift_held, paint,
+                    full_rect, zoom_pan, false,
+                );
+            }
+            EraseTool::Line => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
-                            self.erase_line_end = Some(img_pos);
+                            if shift_held {
+                                // Shift+ドラッグ: カーソルから線への垂直距離で線幅を変更
+                                // 線 (erase_line_start → erase_line_end) は shift 開始直前に確定済み
+                                if let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) {
+                                    let dx = end.0 - start.0;
+                                    let dy = end.1 - start.1;
+                                    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                                    let vx = img_pos.0 - start.0;
+                                    let vy = img_pos.1 - start.1;
+                                    // 線の法線方向成分 (符号付き) の絶対値
+                                    let perp = (vx * dy - vy * dx).abs() / len;
+                                    self.erase_line_width = (perp * 2.0).max(1.0);
+                                }
+                            } else {
+                                self.erase_line_end = Some(img_pos);
+                            }
                         }
                     }
                 }
                 if primary_released {
-                    if let (Some((_, y0)), Some((_, y1))) = (self.erase_line_start, self.erase_line_end) {
-                        let [w, h] = self.erase_mask_size;
-                        let ty = (y0.min(y1).max(0.0)) as usize;
-                        let by = (y0.max(y1).ceil().min(h as f32)) as usize;
-                        self.paint_rect(0, ty, w, by, paint);
+                    if let (Some((x0, y0)), Some((x1, y1))) = (self.erase_line_start, self.erase_line_end) {
+                        let dx = x1 - x0;
+                        let dy = y1 - y0;
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len > 1.0 {
+                            // 線の法線単位ベクトル
+                            let nx = -dy / len;
+                            let ny = dx / len;
+                            let half_w = self.erase_line_width * 0.5;
+                            let pts = vec![
+                                (x0 + nx * half_w, y0 + ny * half_w),
+                                (x1 + nx * half_w, y1 + ny * half_w),
+                                (x1 - nx * half_w, y1 - ny * half_w),
+                                (x0 - nx * half_w, y0 - ny * half_w),
+                            ];
+                            self.push_undo_snapshot();
+                            self.paint_polygon(&pts, paint);
+                        }
                     }
                     self.erase_line_start = None;
                     self.erase_line_end = None;
                 }
             }
+        }
+    }
+
+    /// 縦線/横線ツール共通の入力処理。is_vertical=true で縦線、false で横線。
+    /// Shift+ドラッグでは線の向きに沿った軸がパン、直交軸が回転になる。
+    fn handle_line_tool_paint(
+        &mut self,
+        primary_down: bool,
+        primary_released: bool,
+        pointer_pos: Option<egui::Pos2>,
+        shift_held: bool,
+        paint: bool,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        is_vertical: bool,
+    ) {
+        if primary_down {
+            if let Some(pos) = pointer_pos {
+                if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                    if self.erase_line_start.is_none() {
+                        self.erase_line_start = Some(img_pos);
+                        self.erase_line_tilt = 0.0;
+                    }
+                    if shift_held {
+                        let (base_tilt, base_start, base_end) = match self.erase_shift_drag {
+                            Some(ShiftDragState::LineAdjust { base_tilt, base_start, base_end, .. }) => {
+                                (base_tilt, base_start, base_end)
+                            }
+                            _ => {
+                                let start = self.erase_line_start.unwrap_or(img_pos);
+                                let end = self.erase_line_end.unwrap_or(img_pos);
+                                self.erase_shift_drag = Some(ShiftDragState::LineAdjust {
+                                    origin: img_pos,
+                                    base_tilt: self.erase_line_tilt,
+                                    base_start: start,
+                                    base_end: end,
+                                });
+                                (self.erase_line_tilt, start, end)
+                            }
+                        };
+                        if let Some(ShiftDragState::LineAdjust { origin, .. }) = self.erase_shift_drag {
+                            let dx = img_pos.0 - origin.0;
+                            let dy = img_pos.1 - origin.1;
+                            // 縦線: 向きに沿う軸 (Y) に沿ったドラッグは幅を変えず、直交する X ドラッグでパン・Y ドラッグで回転
+                            // 横線: X/Y が入れ替わる
+                            let (pan_x, pan_y, tilt_delta) = if is_vertical {
+                                (dx, 0.0, dy)
+                            } else {
+                                (0.0, dy, dx)
+                            };
+                            self.erase_line_start = Some((base_start.0 + pan_x, base_start.1 + pan_y));
+                            self.erase_line_end = Some((base_end.0 + pan_x, base_end.1 + pan_y));
+                            self.erase_line_tilt = base_tilt + tilt_delta;
+                        }
+                    } else {
+                        self.erase_shift_drag = None;
+                        self.erase_line_end = Some(img_pos);
+                    }
+                }
+            }
+        }
+        if primary_released {
+            if let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) {
+                let [w, h] = self.erase_mask_size;
+                let tilt = self.erase_line_tilt;
+                self.push_undo_snapshot();
+                if is_vertical {
+                    let lx = start.0.min(end.0).max(0.0);
+                    let rx = start.0.max(end.0).ceil().min(w as f32);
+                    if tilt.abs() < 0.5 {
+                        self.paint_rect(lx as usize, 0, rx as usize, h, paint);
+                    } else {
+                        let pts = vec![
+                            (lx + tilt, 0.0),
+                            (rx + tilt, 0.0),
+                            (rx, h as f32),
+                            (lx, h as f32),
+                        ];
+                        self.paint_polygon(&pts, paint);
+                    }
+                } else {
+                    let ty = start.1.min(end.1).max(0.0);
+                    let by = start.1.max(end.1).ceil().min(h as f32);
+                    if tilt.abs() < 0.5 {
+                        self.paint_rect(0, ty as usize, w, by as usize, paint);
+                    } else {
+                        let pts = vec![
+                            (0.0, ty),
+                            (w as f32, ty + tilt),
+                            (w as f32, by + tilt),
+                            (0.0, by),
+                        ];
+                        self.paint_polygon(&pts, paint);
+                    }
+                }
+            }
+            self.erase_line_start = None;
+            self.erase_line_end = None;
+            self.erase_line_tilt = 0.0;
+            self.erase_shift_drag = None;
         }
     }
 
@@ -451,26 +798,100 @@ impl App {
                 }
             }
             EraseTool::VertLine => {
-                if let (Some((x0, _)), Some((x1, _))) = (self.erase_line_start, self.erase_line_end) {
-                    let [_w, h] = self.erase_mask_size;
-                    let p0 = self.image_to_screen(x0.min(x1), 0.0, full_rect, zoom_pan);
-                    let p1 = self.image_to_screen(x0.max(x1), h as f32, full_rect, zoom_pan);
-                    let rect = egui::Rect::from_min_max(p0, p1);
-                    ui.painter().rect_filled(rect, 0.0, color);
-                    ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
-                }
+                self.draw_line_tool_preview(ui, full_rect, zoom_pan, color, stroke_color, true);
             }
             EraseTool::HorizLine => {
-                if let (Some((_, y0)), Some((_, y1))) = (self.erase_line_start, self.erase_line_end) {
-                    let [w, _h] = self.erase_mask_size;
-                    let p0 = self.image_to_screen(0.0, y0.min(y1), full_rect, zoom_pan);
-                    let p1 = self.image_to_screen(w as f32, y0.max(y1), full_rect, zoom_pan);
-                    let rect = egui::Rect::from_min_max(p0, p1);
-                    ui.painter().rect_filled(rect, 0.0, color);
-                    ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
+                self.draw_line_tool_preview(ui, full_rect, zoom_pan, color, stroke_color, false);
+            }
+            EraseTool::Line => {
+                if let (Some((x0, y0)), Some((x1, y1))) = (self.erase_line_start, self.erase_line_end) {
+                    let dx = x1 - x0;
+                    let dy = y1 - y0;
+                    let len = (dx * dx + dy * dy).sqrt();
+                    if len > 1.0 {
+                        let nx = -dy / len;
+                        let ny = dx / len;
+                        let half_w = self.erase_line_width * 0.5;
+                        let pts = vec![
+                            self.image_to_screen(x0 + nx * half_w, y0 + ny * half_w, full_rect, zoom_pan),
+                            self.image_to_screen(x1 + nx * half_w, y1 + ny * half_w, full_rect, zoom_pan),
+                            self.image_to_screen(x1 - nx * half_w, y1 - ny * half_w, full_rect, zoom_pan),
+                            self.image_to_screen(x0 - nx * half_w, y0 - ny * half_w, full_rect, zoom_pan),
+                        ];
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            pts,
+                            color,
+                            egui::Stroke::new(1.0, stroke_color),
+                        ));
+                        // 中心線も重ねて表示
+                        let p0 = self.image_to_screen(x0, y0, full_rect, zoom_pan);
+                        let p1 = self.image_to_screen(x1, y1, full_rect, zoom_pan);
+                        ui.painter().line_segment(
+                            [p0, p1],
+                            egui::Stroke::new(1.0, stroke_color),
+                        );
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 縦線/横線ツール共通のプレビュー描画。
+    fn draw_line_tool_preview(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        color: egui::Color32,
+        stroke_color: egui::Color32,
+        is_vertical: bool,
+    ) {
+        let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) else { return };
+        let [w, h] = self.erase_mask_size;
+        let tilt = self.erase_line_tilt;
+
+        // 縦線: y を 0..h で固定し x を drag で決める。横線は X/Y 入れ替え。
+        let (a0, a1, span_min, span_max) = if is_vertical {
+            (start.0.min(end.0), start.0.max(end.0), 0.0f32, h as f32)
+        } else {
+            (start.1.min(end.1), start.1.max(end.1), 0.0f32, w as f32)
+        };
+
+        let corner = |axis: f32, span: f32, tilt_offset: f32| -> egui::Pos2 {
+            if is_vertical {
+                self.image_to_screen(axis + tilt_offset, span, full_rect, zoom_pan)
+            } else {
+                self.image_to_screen(span, axis + tilt_offset, full_rect, zoom_pan)
+            }
+        };
+
+        if tilt.abs() < 0.5 {
+            let p0 = corner(a0, span_min, 0.0);
+            let p1 = corner(a1, span_max, 0.0);
+            let rect = egui::Rect::from_min_max(p0.min(p1), p0.max(p1));
+            ui.painter().rect_filled(rect, 0.0, color);
+            ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
+        } else {
+            // span_min 側は基準、span_max 側に tilt が加わる (is_vertical のとき上端→下端で x が tilt 分だけシフト)
+            let pts = if is_vertical {
+                vec![
+                    corner(a0, span_min, tilt),
+                    corner(a1, span_min, tilt),
+                    corner(a1, span_max, 0.0),
+                    corner(a0, span_max, 0.0),
+                ]
+            } else {
+                vec![
+                    corner(a0, span_min, 0.0),
+                    corner(a0, span_max, tilt),
+                    corner(a1, span_max, tilt),
+                    corner(a1, span_min, 0.0),
+                ]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(
+                pts, color, egui::Stroke::new(1.0, stroke_color),
+            ));
         }
     }
 
@@ -487,10 +908,7 @@ impl App {
             if full_rect.contains(pos) {
                 let Some((total_scale, _)) = self.erase_image_layout(full_rect, zoom_pan) else { return; };
                 let screen_r = self.erase_brush_radius * total_scale;
-                ui.painter().circle_stroke(
-                    pos, screen_r,
-                    egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
-                );
+                draw_dashed_circle(ui.painter(), pos, screen_r);
             }
         }
     }
@@ -530,7 +948,7 @@ impl App {
         y += 24.0;
 
         // ── 描画/消去 モード切り替え ──
-        let mode_labels = [("描画", true), ("消去", false)];
+        let mode_labels = [("描画 [D]", true), ("消去 [F]", false)];
         let mode_w = (pw - 4.0) / 2.0;
         for (i, &(label, is_paint)) in mode_labels.iter().enumerate() {
             let btn_rect = egui::Rect::from_min_size(
@@ -563,17 +981,27 @@ impl App {
         }
         y += 32.0;
 
+        // ── 区切り線 (描画/消去 と ツール選択を分ける) ──
+        child.painter().line_segment(
+            [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+        );
+        y += 8.0;
+
         // ── ツール選択 ──
         let tools = [
-            ("囲み", EraseTool::Lasso),
-            ("筆", EraseTool::Brush),
-            ("縦線", EraseTool::VertLine),
-            ("横線", EraseTool::HorizLine),
+            ("囲み [L]", EraseTool::Lasso),
+            ("筆 [B]", EraseTool::Brush),
+            ("縦線 [V]", EraseTool::VertLine),
+            ("横線 [H]", EraseTool::HorizLine),
+            ("直線 [I]", EraseTool::Line),
         ];
         let tool_w = (pw - 8.0) / 2.0;
+        let mut rows_used = 0usize;
         for (i, &(label, tool)) in tools.iter().enumerate() {
             let col = i % 2;
             let row = i / 2;
+            rows_used = row + 1;
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(x0 + col as f32 * (tool_w + 8.0), y + row as f32 * 28.0),
                 egui::vec2(tool_w, 24.0),
@@ -598,7 +1026,7 @@ impl App {
                 self.erase_tool = tool;
             }
         }
-        y += 60.0;
+        y += rows_used as f32 * 28.0 + 4.0;
 
         // ── ブラシサイズスライダー（筆ツール時のみ）──
         if self.erase_tool == EraseTool::Brush {
@@ -624,7 +1052,78 @@ impl App {
             y += 26.0;
         }
 
+        // ── 直線幅スライダー (直線ツール時のみ) ──
+        if self.erase_tool == EraseTool::Line {
+            child.painter().text(
+                egui::pos2(x0, y),
+                egui::Align2::LEFT_TOP,
+                "幅",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(180),
+            );
+            y += 16.0;
+            let slider_rect = egui::Rect::from_min_size(
+                egui::pos2(x0, y),
+                egui::vec2(pw, 20.0),
+            );
+            let mut slider_child = child.new_child(egui::UiBuilder::new().max_rect(slider_rect));
+            let max_w = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
+            slider_child.add(
+                egui::Slider::new(&mut self.erase_line_width, 1.0..=max_w)
+                    .step_by(1.0)
+                    .show_value(false),
+            );
+            y += 26.0;
+        }
+
         // ── セパレーター ──
+        child.painter().line_segment(
+            [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+        );
+        y += 6.0;
+
+        // ── スロット保存/ロード (1/2) ──
+        child.painter().text(
+            egui::pos2(x0, y),
+            egui::Align2::LEFT_TOP,
+            "マスクスロット",
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_gray(180),
+        );
+        y += 15.0;
+        // 2 行 × 2 列: 上段 [保存1][保存2]、下段 [ロード1][ロード2]
+        let slot_w = (pw - 4.0) / 2.0;
+        for (row, (action_label, shortcut_prefix)) in [("保存", "S+"), ("ロード", "")].iter().enumerate() {
+            for slot in 1..=2u32 {
+                let btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(x0 + (slot as f32 - 1.0) * (slot_w + 4.0), y + row as f32 * 24.0),
+                    egui::vec2(slot_w, 20.0),
+                );
+                let resp = child.allocate_rect(btn_rect, egui::Sense::click());
+                let bg = if resp.hovered() {
+                    egui::Color32::from_gray(70)
+                } else {
+                    egui::Color32::from_gray(50)
+                };
+                child.painter().rect_filled(btn_rect, 3.0, bg);
+                let label = format!("{}{} [{}{}]", action_label, slot, shortcut_prefix, slot);
+                child.painter().text(
+                    btn_rect.center(), egui::Align2::CENTER_CENTER,
+                    &label, egui::FontId::proportional(10.0), egui::Color32::WHITE,
+                );
+                if resp.clicked() {
+                    if row == 0 {
+                        self.save_mask_to_slot(slot as usize);
+                    } else {
+                        self.load_mask_from_slot(slot as usize);
+                    }
+                }
+            }
+        }
+        y += 52.0;
+
+        // ── セパレーター (2) ──
         child.painter().line_segment(
             [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
             egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
@@ -680,7 +1179,9 @@ impl App {
         y += 28.0;
 
         // ── ヘルプテキスト ──
-        let help = "E: 補完実行  ESC: 終了";
+        let help = "E:補完 ESC:終了 Ctrl+Z:戻す\n\
+                    Shift+ドラッグ/ホイール:\n\
+                    \u{00A0}筆/直線→太さ 縦横線→傾き";
         child.painter().text(
             egui::pos2(x0, y),
             egui::Align2::LEFT_TOP,
@@ -1172,4 +1673,50 @@ fn inpaint_diffuse(original: &egui::ColorImage, mask: &[bool], w: usize, h: usiz
         ])
         .collect();
     egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
+/// 円周に沿って白黒の破線を交互に描画する。
+/// どの背景色 (白/黒/中間色) でも視認できるブラシカーソル用。
+/// 内側を黒線、外側を白線で 1px ずつずらして描くことで
+/// 単色背景でも必ず片方が見える。
+fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    if radius < 1.5 {
+        // 小さい場合はシンプルに十字で表示
+        let s = 4.0;
+        let outer = egui::Stroke::new(3.0, egui::Color32::BLACK);
+        let inner = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        painter.line_segment([center - egui::vec2(s, 0.0), center + egui::vec2(s, 0.0)], outer);
+        painter.line_segment([center - egui::vec2(0.0, s), center + egui::vec2(0.0, s)], outer);
+        painter.line_segment([center - egui::vec2(s, 0.0), center + egui::vec2(s, 0.0)], inner);
+        painter.line_segment([center - egui::vec2(0.0, s), center + egui::vec2(0.0, s)], inner);
+        return;
+    }
+
+    // 円周を N セグメントに分割し、交互に白/黒で描画。
+    // セグメント数は半径に比例 (最小 32、最大 128)。
+    let circumference = 2.0 * std::f32::consts::PI * radius;
+    let seg_len = 8.0f32; // 1 セグメントあたりの円弧長 (screen px)
+    let n = ((circumference / seg_len).round() as usize).clamp(32, 128);
+    // 偶数にして黒/白を均等に
+    let n = if n % 2 == 0 { n } else { n + 1 };
+
+    let black = egui::Stroke::new(2.5, egui::Color32::BLACK);
+    let white = egui::Stroke::new(1.5, egui::Color32::WHITE);
+
+    let mut points: Vec<egui::Pos2> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = (i as f32 / n as f32) * std::f32::consts::TAU;
+        points.push(center + egui::vec2(t.cos() * radius, t.sin() * radius));
+    }
+
+    // 黒い太めの線でベースを全周描画
+    for i in 0..n {
+        painter.line_segment([points[i], points[i + 1]], black);
+    }
+    // その上に白い細めの線を破線状に (偶数番目のセグメントだけ) 描画
+    for i in 0..n {
+        if i % 2 == 0 {
+            painter.line_segment([points[i], points[i + 1]], white);
+        }
+    }
 }

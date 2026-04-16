@@ -66,6 +66,26 @@ impl MaskDb {
         if !mask.iter().any(|&m| m) {
             return self.delete(key);
         }
+        self.upsert_mask(key, mask, w, h)
+    }
+
+    /// マスクを削除する。
+    pub fn delete(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM masks WHERE path = ?1", [key])?;
+        Ok(())
+    }
+
+    /// 名前付きスロットにマスクを保存する。`set` と異なり全 false でも保存する。
+    pub fn set_slot(&self, slot: usize, mask: &[bool], w: usize, h: usize) -> rusqlite::Result<()> {
+        self.upsert_mask(&slot_key(slot), mask, w, h)
+    }
+
+    /// 名前付きスロットからマスクを取得する。サイズが異なる場合は自動リスケール。
+    pub fn get_slot(&self, slot: usize, expected_w: usize, expected_h: usize) -> Option<Vec<bool>> {
+        self.get(&slot_key(slot), expected_w, expected_h)
+    }
+
+    fn upsert_mask(&self, key: &str, mask: &[bool], w: usize, h: usize) -> rusqlite::Result<()> {
         let blob = compress_mask(mask);
         self.conn.execute(
             "INSERT INTO masks (path, mask_data, width, height) VALUES (?1, ?2, ?3, ?4)
@@ -74,12 +94,10 @@ impl MaskDb {
         )?;
         Ok(())
     }
+}
 
-    /// マスクを削除する。
-    pub fn delete(&self, key: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM masks WHERE path = ?1", [key])?;
-        Ok(())
-    }
+fn slot_key(slot: usize) -> String {
+    format!("__slot_{}", slot)
 }
 
 /// マスク (Vec<bool>) を 1bit/pixel にパックし deflate 圧縮する。
