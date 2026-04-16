@@ -49,6 +49,7 @@ const FEEDBACK_TOAST_DURATION: f32 = 1.2;
 // ── 見開きペアリング ──────────────────────────────────────────────────────
 
 /// 見開き表示のペア解決結果。
+#[derive(Copy, Clone)]
 pub(crate) enum SpreadPair {
     /// 単独表示（1ページ表示 / 横長画像 / 表紙 / 末尾余り）
     Single,
@@ -66,6 +67,16 @@ impl App {
         self.analysis_mosaic_grid = false;
         self.analysis_filter_mag = 0;
         self.analysis_guide_drag = None;
+    }
+
+    /// フルスクリーン通常モードのズーム/パンが有効なら返す。
+    /// 閾値以下なら None (描画側で無変換パスに流れるよう明示するため)。
+    pub(crate) fn fs_zoom_pan(&self) -> Option<(f32, egui::Vec2)> {
+        if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
+            Some((self.fs_zoom, self.fs_pan))
+        } else {
+            None
+        }
     }
 
     /// ホイールによるマウス位置固定ズームを適用する。ズームが変化したら true を返す。
@@ -219,8 +230,13 @@ impl App {
 
         // ── 状態の事前計算 ──
         self.advance_animation(ctx, fs_idx);
+        // 見開きペアを 1 回だけ解決し、以降のフレーム処理で再利用する
+        // (resolve_spread_pair は get_nav_indices 内で Vec<usize> をクローンするため、
+        //  毎フレーム 3〜4 回呼ばれるのを避ける)
+        let spread_pair = self.resolve_spread_pair(fs_idx);
+        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
         // 見開きパートナーの事前読み込み + アニメーション進行
-        if let SpreadPair::Double { left, right } = self.resolve_spread_pair(fs_idx) {
+        if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
             self.advance_animation(ctx, partner);
             if !self.fs_cache.contains_key(&partner) && !self.fs_pending.contains_key(&partner) {
@@ -259,24 +275,20 @@ impl App {
                         let full_rect = ui.max_rect();
 
                         // ── キー入力 ──
-                        let key_action = self.handle_fs_key_input(ctx, fs_idx);
+                        let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         if key_action.close { close_fs = true; }
                         nav_delta = key_action.nav_delta;
                         ctrl_nav = key_action.ctrl_nav;
 
                         // ── ホイール & クリック ──
                         let (wheel_nav, click_close) = self.handle_fs_wheel_and_click(
-                            ui, ctx, full_rect, &state,
+                            ui, ctx, full_rect, &state, is_spread_double,
                         );
                         if wheel_nav != 0 { nav_delta = wheel_nav; }
                         if click_close { close_fs = true; }
                         // ホイール/キーで nav_delta が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
                         let nav_locked = nav_delta != 0;
-
-                        // ── 見開きペア解決 ──
-                        let spread_pair = self.resolve_spread_pair(fs_idx);
-                        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
 
                         // ── 分析/補正モード: 見開き中は無効 ──
                         // 分析モードは画像エリアを左側に制限する（右パネルと重ならないよう）。
@@ -293,15 +305,13 @@ impl App {
                         if let Some(sep) = state.separator_text.as_ref() {
                             Self::draw_fs_separator(ui, image_rect, sep);
                         } else {
-                            match &spread_pair {
+                            match spread_pair {
                                 SpreadPair::Single => {
                                     let fs_rotation = self.get_rotation(fs_idx);
                                     let zp = if analysis_active {
                                         Some((self.analysis_zoom, self.analysis_pan))
-                                    } else if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
-                                        Some((self.fs_zoom, self.fs_pan))
                                     } else {
-                                        None
+                                        self.fs_zoom_pan()
                                     };
                                     let free_rot = if analysis_active { 0.0 } else { self.fs_free_rotation };
                                     Self::draw_fs_image(
@@ -312,18 +322,14 @@ impl App {
                                     );
                                 }
                                 SpreadPair::Double { left, right } => {
-                                    self.draw_fs_spread(ui, image_rect, *left, *right);
+                                    self.draw_fs_spread(ui, image_rect, left, right);
                                 }
                             }
                         }
 
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
                         if self.erase_mode && !is_spread_double {
-                            let zp = if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
-                                Some((self.fs_zoom, self.fs_pan))
-                            } else {
-                                None
-                            };
+                            let zp = self.fs_zoom_pan();
                             self.handle_erase_paint(ctx, image_rect, zp);
                             self.draw_erase_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
@@ -765,7 +771,12 @@ impl App {
     // ── キー入力 ────────────────────────────────────────────────────────
 
     /// フルスクリーンのキー入力を処理し、アクションを返す。
-    fn handle_fs_key_input(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
+    fn handle_fs_key_input(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        is_spread_double: bool,
+    ) -> FsKeyAction {
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None };
 
@@ -931,8 +942,6 @@ impl App {
             }
         }
 
-        let is_spread_double = matches!(self.resolve_spread_pair(fs_idx), SpreadPair::Double { .. });
-
         if esc { action.close = true; }
         // 見開きダブル表示中は I/Z/R/L を無効化
         if key_i && !is_spread_double {
@@ -1035,6 +1044,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         state: &FsFrameState,
+        is_spread_double: bool,
     ) -> (i32, bool) {
         let mut nav_delta = 0i32;
         let mut close = false;
@@ -1152,7 +1162,8 @@ impl App {
             let primary_released = fs_response.drag_stopped_by(egui::PointerButton::Primary);
             let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
 
-            if mods.ctrl {
+            // 見開き 2 ページ表示中はフリー回転が描画に反映されないため、Ctrl+ドラッグ回転を無効化する
+            if mods.ctrl && !is_spread_double {
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
@@ -1481,6 +1492,7 @@ impl App {
         left_idx: usize,
         right_idx: usize,
     ) {
+        let zoom_pan = self.fs_zoom_pan();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
 
@@ -1503,6 +1515,14 @@ impl App {
             )
         };
 
+        // ズーム/パンが有効な場合は image_rect でクリップする
+        // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
+        let painter = if zoom_pan.is_some() {
+            ui.painter().with_clip_rect(image_rect)
+        } else {
+            ui.painter().clone()
+        };
+
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
             // 両ページの高さを揃える（高い方に合わせる）
             let combined_h = ls.y.max(rs.y);
@@ -1514,14 +1534,20 @@ impl App {
             // 画面にフィットするスケール
             let fit_scale = (image_rect.width() / combined_w)
                 .min(image_rect.height() / combined_h);
-            let scaled_lw = left_w * fit_scale;
-            let scaled_rw = right_w * fit_scale;
-            let scaled_h = combined_h * fit_scale;
+
+            let (total_scale, center) = match zoom_pan {
+                Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
+                None => (fit_scale, image_rect.center()),
+            };
+
+            let scaled_lw = left_w * total_scale;
+            let scaled_rw = right_w * total_scale;
+            let scaled_h = combined_h * total_scale;
 
             // 全体を中央に配置
             let total_w = scaled_lw + scaled_rw;
-            let start_x = image_rect.center().x - total_w * 0.5;
-            let start_y = image_rect.center().y - scaled_h * 0.5;
+            let start_x = center.x - total_w * 0.5;
+            let start_y = center.y - scaled_h * 0.5;
 
             let left_rect = egui::Rect::from_min_size(
                 egui::pos2(start_x, start_y),
@@ -1532,12 +1558,12 @@ impl App {
                 egui::vec2(scaled_rw, scaled_h),
             );
 
-            Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-            Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(&painter, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(&painter, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
 
             // 区切り線（2px 黒線）
             let divider_x = start_x + scaled_lw;
-            ui.painter().line_segment(
+            painter.line_segment(
                 [
                     egui::pos2(divider_x, start_y),
                     egui::pos2(divider_x, start_y + scaled_h),
@@ -1546,6 +1572,7 @@ impl App {
             );
         } else {
             // サイズ不明の場合は均等分割フォールバック
+            // (ズーム/パンはサイズが分かってからでないと正しく計算できないため適用しない)
             let half_w = image_rect.width() / 2.0;
             let left_rect = egui::Rect::from_min_size(
                 image_rect.min,
@@ -1555,8 +1582,8 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
-            Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-            Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(&painter, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(&painter, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
         }
     }
 
@@ -1589,8 +1616,9 @@ impl App {
     }
 
     /// 見開きモードの1ページ分を指定領域に描画。
+    /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
     fn draw_fs_spread_page(
-        ui: &mut egui::Ui,
+        painter: &egui::Painter,
         rect: egui::Rect,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
@@ -1625,17 +1653,17 @@ impl App {
                 display_size * fit_scale,
             );
             if rotation.is_none() {
-                ui.painter().image(
+                painter.image(
                     handle.id(), img_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
             } else {
-                crate::app::draw_rotated_image(ui.painter(), handle.id(), img_rect, rotation);
+                crate::app::draw_rotated_image(painter, handle.id(), img_rect, rotation);
             }
         } else {
             // 読込中
-            ui.painter().text(
+            painter.text(
                 rect.center(), egui::Align2::CENTER_CENTER,
                 "読込中...",
                 egui::FontId::proportional(18.0), egui::Color32::from_gray(150),

@@ -130,8 +130,18 @@ ui_fullscreen.rs::render_fullscreen_viewport
 6. アスペクト比フィット (余白はレターボックス)
 ```
 
-Spread モード (見開き) の場合は、この処理を左右の画像それぞれに行ってから並べる。
-`resolve_spread_pair` が左右の idx と配置 (LTR/RTL/Cover) を決める。
+Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
+(LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする:
+
+1. 各ページの表示サイズ (回転考慮) を算出し、高い方に揃えた連結幅・高さを計算
+2. `image_rect` にフィットする `fit_scale` を求める
+3. ズーム/パンを `(fit_scale * fs_zoom, image_rect.center() + fs_pan)` として合成し、合成中心から
+   左右ページ矩形を配置する (ズーム/パンは左右ページで共有、ページ間の分割位置は不変)
+4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
+
+見開き中は `fs_free_rotation` (Ctrl+ドラッグのフリー回転) と `rotation_db` の単独ページ回転 (R/L)
+は描画に反映されないため、Ctrl+ドラッグは `handle_fs_wheel_and_click` 側で no-op にしている。
+ズーム中のパン (非修飾ドラッグ) と Ctrl+ホイールズーム、ダブルクリックリセットのみが見開きで有効。
 
 ---
 
