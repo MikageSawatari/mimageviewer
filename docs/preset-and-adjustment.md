@@ -211,7 +211,7 @@ AI モデル変更を伴う可能性がある操作は必ず後者を使う。
 | `model_manager.rs` | exe 埋め込みモデルを `%APPDATA%/mimageviewer/models/` に展開 |
 | `upscale.rs` | タイル分割 + オーバーラップブレンド (2x/4x モデル) |
 | `denoise.rs` | 1x ノイズ除去 (タイル推論は upscale を流用) |
-| `inpaint.rs` | MI-GAN による穴埋め。見開き中央ギャップ補完、消しゴムマスク適用 |
+| `ui_erase.rs` | MI-GAN によるマスク領域 inpaint (`InpaintMiGan` モデルを直接 `with_session` で呼び出し)。見開き中央ギャップ補完は精度不足で削除済み (タグ `v0.6.0-with-spread-inpaint` 参照) |
 | `classify.rs` | 画像種別分類 (MobileNetV3, Illustration/Comic/3D/RealLife) |
 
 `ModelKind` でモデルを識別。セッションは最初の推論時に遅延生成される。

@@ -44,7 +44,8 @@ dual-window approach.
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2 + DirectML EP)。Real-ESRGAN / waifu2x ONNX モデルでタイル分割 4x アップスケール
 - **AI image classification**: deepghs/anime_classification MobileNetV3 (ONNX) + ヒューリスティクス。イラスト/漫画/CG/写真を自動判別
-- **AI inpainting**: LaMa (ONNX) で見開きページ中央欠落補完
+- **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
+  （見開きページ中央欠落補完は精度不足で削除済み。タグ `v0.6.0-with-spread-inpaint` 参照）
 - **AI model management**: exe に `include_bytes!` で埋め込み → 初回起動時に `%APPDATA%/mimageviewer/models/` に展開
 - **Build tool**: cargo (MSVC toolchain on Windows) + cmake + NASM (TurboJPEG ビルドに必要)
 
@@ -69,8 +70,8 @@ mimageviewer/
 │   │   ├── runtime.rs       # ONNX Runtime (DirectML EP) セッション管理
 │   │   ├── model_manager.rs # モデル埋め込み・展開・パス管理
 │   │   ├── classify.rs      # 画像タイプ分類 (MobileNetV3 + ヒューリスティクス)
-│   │   ├── upscale.rs       # タイル分割 4x アップスケール推論
-│   │   └── inpaint.rs       # LaMa 見開きページ中央補完
+│   │   ├── denoise.rs       # JPEG ノイズ除去推論
+│   │   └── upscale.rs       # タイル分割 4x アップスケール推論
 │   ├── ui_main.rs           # メイン画面 UI（グリッド描画）
 │   ├── ui_fullscreen.rs     # フルスクリーン表示
 │   ├── ui_helpers.rs        # UI ヘルパー関数
@@ -129,7 +130,7 @@ mimageviewer/
 
 1. **Phase 1** ✅ — コアビューワー（グリッド・フルスクリーン・設定永続化）
 2. **Phase 1.5** ✅ — サムネイルカタログ（SQLite + WebP）
-3. **Phase 2** 🔧 — AI アップスケール（ONNX Runtime + DirectML、Real-ESRGAN / waifu2x）+ 画像タイプ自動判別 + 見開き AI 補完（LaMa）
+3. **Phase 2** ✅ — AI アップスケール（ONNX Runtime + DirectML、Real-ESRGAN / Real-CUGAN / NMKD-Siax）+ 画像タイプ自動判別 + JPEG ノイズ除去 + 消しゴムツールでの MI-GAN 補完
 4. **Phase 3** ✅ — お気に入り・ツールバー・ZIP・WIC・動画・アニメーション
 
 ## Key Design Decisions

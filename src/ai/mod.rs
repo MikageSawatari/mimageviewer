@@ -2,10 +2,14 @@
 //!
 //! ONNX Runtime (ort crate) + DirectML を使い、
 //! 画像タイプ分類・アップスケール・Inpainting を提供する。
+//!
+//! Inpainting は消しゴムツール (`ui_erase`) からのみ呼ばれる
+//! (`ModelKind::InpaintMiGan`)。見開きページ中央の AI 補完機能は
+//! 精度不足とアーティファクトの問題により削除された
+//! (タグ `v0.6.0-with-spread-inpaint` 参照)。
 
 pub mod classify;
 pub mod denoise;
-pub mod inpaint;
 pub mod model_manager;
 pub mod runtime;
 pub mod upscale;

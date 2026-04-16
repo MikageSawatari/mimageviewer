@@ -416,7 +416,6 @@ impl App {
                         // ── ホバーバー ──
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
-                        let inpaint_before = self.ai_inpaint_active;
                         let spread_before = self.spread_mode;
                         // AI 処理情報を計算（ホバーバーのファイル情報に表示）
                         let ai_info_model_name: String;
@@ -461,7 +460,6 @@ impl App {
                                 &mut self.analysis_mode,
                                 &mut self.spread_mode, &mut self.spread_popup_open,
                                 is_spread_double,
-                                &mut self.ai_inpaint_active,
                                 ai_upscale_info,
                                 &mut self.adjustment_mode,
                                 has_page_override,
@@ -479,7 +477,7 @@ impl App {
                         }
 
                         // ── フルスクリーン左下ステータス表示 ──
-                        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() || self.ai_inpaint_active || self.ai_inpaint_pending.is_some() {
+                        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
                             self.draw_fs_ai_status(ui, fs_idx);
                         }
 
@@ -489,11 +487,6 @@ impl App {
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
 
-                        // 見開き補完の有効/無効が変更された場合
-                        if self.ai_inpaint_active != inpaint_before {
-                            self.settings.ai_inpaint_active = self.ai_inpaint_active;
-                            self.settings.save();
-                        }
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
@@ -1481,7 +1474,6 @@ impl App {
 
     /// 見開きモードの2ページ描画。
     /// 2枚の画像を隙間なく中央に配置し、境界に薄い黒線を描画する。
-    /// AI 補完が有効な場合は中央にギャップを挿入し、ドラッグで幅調整できる。
     fn draw_fs_spread(
         &mut self,
         ui: &mut egui::Ui,
@@ -1517,26 +1509,17 @@ impl App {
             let left_w = ls.x * (combined_h / ls.y);
             let right_w = rs.x * (combined_h / rs.y);
 
-            // AI 補完が有効な場合はギャップを挿入
-            // gap_width は元画像ピクセル単位なので、フルサイズが両方揃うまでは 0 にする
-            // （サムネイルに対して元画像サイズの gap を適用すると巨大な隙間になるため）
-            let gap = if self.ai_inpaint_active && both_in_fs_cache {
-                self.ai_inpaint_gap_width
-            } else {
-                0.0
-            };
-            let combined_w = left_w + right_w + gap;
+            let combined_w = left_w + right_w;
 
             // 画面にフィットするスケール
             let fit_scale = (image_rect.width() / combined_w)
                 .min(image_rect.height() / combined_h);
             let scaled_lw = left_w * fit_scale;
             let scaled_rw = right_w * fit_scale;
-            let scaled_gap = gap * fit_scale;
             let scaled_h = combined_h * fit_scale;
 
             // 全体を中央に配置
-            let total_w = scaled_lw + scaled_gap + scaled_rw;
+            let total_w = scaled_lw + scaled_rw;
             let start_x = image_rect.center().x - total_w * 0.5;
             let start_y = image_rect.center().y - scaled_h * 0.5;
 
@@ -1545,157 +1528,22 @@ impl App {
                 egui::vec2(scaled_lw, scaled_h),
             );
             let right_rect = egui::Rect::from_min_size(
-                egui::pos2(start_x + scaled_lw + scaled_gap, start_y),
+                egui::pos2(start_x + scaled_lw, start_y),
                 egui::vec2(scaled_rw, scaled_h),
             );
 
-            // AI 補完が有効な場合: キャッシュ済み inpaint テクスチャがあれば全体を描画
-            let inpaint_drawn = if self.ai_inpaint_active && gap > 0.0 {
-                let gap_width_u32 = self.ai_inpaint_gap_width as u32;
-                let trim_u32 = self.ai_inpaint_trim as u32;
-                if let Some(tex) = self.ai_inpaint_cache.get(&(left_idx, right_idx, gap_width_u32, trim_u32)) {
-                    // inpaint 済みテクスチャを全体領域に描画
-                    let full_rect = egui::Rect::from_min_size(
-                        egui::pos2(start_x, start_y),
-                        egui::vec2(total_w, scaled_h),
-                    );
-                    ui.painter().image(
-                        tex.id(), full_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
 
-            if !inpaint_drawn {
-                Self::draw_fs_spread_page(ui, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-                Self::draw_fs_spread_page(ui, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
-
-                // キャッシュがなく pending もなく失敗済みでもなければ自動的に inpaint を開始
-                if self.ai_inpaint_active && gap > 0.0
-                    && self.ai_inpaint_pending.is_none()
-                    && self.ai_inpaint_drag.is_none()
-                {
-                    let key = (left_idx, right_idx, self.ai_inpaint_gap_width as u32, self.ai_inpaint_trim as u32);
-                    if !self.ai_inpaint_failed.contains(&key) {
-                        self.start_ai_inpaint(left_idx, right_idx, self.ai_inpaint_gap_width as u32, self.ai_inpaint_trim as u32);
-                    }
-                }
-            }
-
-            if self.ai_inpaint_active && gap > 0.0 {
-                let gap_rect = egui::Rect::from_min_size(
-                    egui::pos2(start_x + scaled_lw, start_y),
-                    egui::vec2(scaled_gap, scaled_h),
-                );
-                let pointer_pos = ui.ctx().input(|i| i.pointer.hover_pos());
-
-                // ギャップ領域にまだ inpaint がなければ黒で表示
-                if !inpaint_drawn {
-                    ui.painter().rect_filled(gap_rect, 0.0, egui::Color32::BLACK);
-                }
-
-                // ドラッグ中のプレビュー枠
-                if let Some((sx, sy, orig_width, orig_trim)) = self.ai_inpaint_drag {
-                    let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
-                    let preview_width = (orig_width + dx / fit_scale)
-                        .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
-                    let preview_trim = (orig_trim - dy / fit_scale).clamp(0.0, crate::ai::inpaint::MAX_TRIM);
-
-                    // gap 幅プレビュー（黄色枠）
-                    let preview_gap = preview_width * fit_scale;
-                    let preview_rect = egui::Rect::from_min_size(
-                        egui::pos2(image_rect.center().x - preview_gap * 0.5, start_y),
-                        egui::vec2(preview_gap, scaled_h),
-                    );
-                    ui.painter().rect_stroke(
-                        preview_rect, 0.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 100, 200)),
-                        egui::StrokeKind::Outside,
-                    );
-
-                    // trim プレビュー（赤い半透明帯、gap の左右）
-                    if preview_trim > 0.5 {
-                        let trim_px = preview_trim * fit_scale;
-                        // 左 trim 帯
-                        let lt_rect = egui::Rect::from_min_size(
-                            egui::pos2(preview_rect.min.x - trim_px, start_y),
-                            egui::vec2(trim_px, scaled_h),
-                        );
-                        ui.painter().rect_filled(lt_rect, 0.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 60, 60, 80));
-                        // 右 trim 帯
-                        let rt_rect = egui::Rect::from_min_size(
-                            egui::pos2(preview_rect.max.x, start_y),
-                            egui::vec2(trim_px, scaled_h),
-                        );
-                        ui.painter().rect_filled(rt_rect, 0.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 60, 60, 80));
-                    }
-                }
-
-                // マウスインタラクション: ギャップ付近でリサイズカーソル
-                let hover_zone = egui::Rect::from_min_max(
-                    egui::pos2(gap_rect.min.x - 8.0, gap_rect.min.y),
-                    egui::pos2(gap_rect.max.x + 8.0, gap_rect.max.y),
-                );
-                let in_zone = pointer_pos.map(|p| hover_zone.contains(p)).unwrap_or(false);
-
-                if in_zone {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-
-                    let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
-
-                    if primary_pressed && self.ai_inpaint_drag.is_none() {
-                        if let Some(pos) = pointer_pos {
-                            self.ai_inpaint_drag = Some((pos.x, pos.y, self.ai_inpaint_gap_width, self.ai_inpaint_trim));
-                        }
-                    }
-                }
-
-                // ドラッグ中（ゾーン外でも継続）
-                if let Some((sx, sy, orig_width, orig_trim)) = self.ai_inpaint_drag {
-                    let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
-                    let primary_released = ui.ctx().input(|i| i.pointer.primary_released());
-
-                    if primary_down {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-
-                    if primary_released {
-                        self.ai_inpaint_drag = None;
-                        let (dx, dy) = pointer_pos.map(|p| (p.x - sx, p.y - sy)).unwrap_or((0.0, 0.0));
-                        let new_width = (orig_width + dx / fit_scale)
-                            .clamp(4.0, crate::ai::inpaint::MAX_GAP_WIDTH as f32);
-                        let new_trim = (orig_trim - dy / fit_scale).clamp(0.0, crate::ai::inpaint::MAX_TRIM);
-                        self.ai_inpaint_gap_width = new_width;
-                        self.ai_inpaint_trim = new_trim;
-                        self.ai_inpaint_failed.clear();
-                        self.ai_inpaint_cache.clear(); // 古い gap/trim の結果を GPU メモリから解放
-                        // 設定を保存
-                        self.settings.ai_inpaint_gap_width = new_width as u32;
-                        self.settings.ai_inpaint_trim = new_trim as u32;
-                        self.settings.save();
-                        // 新しい幅で inpaint 開始
-                        self.start_ai_inpaint(left_idx, right_idx, new_width as u32, new_trim as u32);
-                    }
-                }
-            } else {
-                // 通常の区切り線（2px 黒線）
-                let divider_x = start_x + scaled_lw;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(divider_x, start_y),
-                        egui::pos2(divider_x, start_y + scaled_h),
-                    ],
-                    egui::Stroke::new(SPREAD_DIVIDER_WIDTH, egui::Color32::BLACK),
-                );
-            }
+            // 区切り線（2px 黒線）
+            let divider_x = start_x + scaled_lw;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(divider_x, start_y),
+                    egui::pos2(divider_x, start_y + scaled_h),
+                ],
+                egui::Stroke::new(SPREAD_DIVIDER_WIDTH, egui::Color32::BLACK),
+            );
         } else {
             // サイズ不明の場合は均等分割フォールバック
             let half_w = image_rect.width() / 2.0;
@@ -1817,7 +1665,6 @@ impl App {
         spread_mode: &mut SpreadMode,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
-        ai_inpaint_active: &mut bool,
         // AI アップスケール後のサイズとモデル名（表示用）
         ai_upscale_info: Option<(&str, u32, u32)>,
         // 画像補正パネル表示トグル
@@ -2096,22 +1943,6 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // 🖌 AI 補完ボタン（見開きダブル時のみ表示）
-        if is_spread_double {
-            let inpaint_resp = draw_bar_button(
-                ui, next_x, bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "fs_inpaint_btn",
-                |hovered| bar_button_bg(hovered, *ai_inpaint_active),
-                *ai_inpaint_active,
-                |p, c, r| draw_inpaint_icon(p, c, r),
-            );
-            if inpaint_resp.clicked() {
-                *ai_inpaint_active = !*ai_inpaint_active;
-            }
-            if inpaint_resp.hovered() { *nav_delta = 0; }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-        }
-
         // ── 左側: フォルダパス ──
         if !folder_display.is_empty() {
             ui.painter().text(
@@ -2164,8 +1995,7 @@ impl App {
         let is_upscaling = self.ai_upscale_pending.contains_key(&fs_idx);
         let is_upscaled = self.ai_upscale_cache.contains_key(&fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
-        let is_inpainting = self.ai_inpaint_pending.is_some();
-        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty() || is_inpainting;
+        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty();
 
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
 
@@ -2179,10 +2009,6 @@ impl App {
         } else if is_upscaled {
             let label = self.ai_model_label(fs_idx, false);
             lines.push((format!("AI 処理完了 ({})", label), egui::Color32::from_rgb(80, 220, 80)));
-        }
-
-        if is_inpainting {
-            lines.push(("見開き補完中 (MI-GAN)".to_string(), egui::Color32::from_rgb(255, 200, 80)));
         }
 
         if self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode {
@@ -2626,39 +2452,6 @@ fn draw_spread_direction_arrow(
         painter.line_segment(
             [egui::pos2(ax + alen, ay), egui::pos2(ax + alen - ahead, ay + ahead)],
             arrow_stroke,
-        );
-    }
-}
-
-/// AI 補完 (inpainting) アイコンを描画する（中央に補完を示すブラシ風アイコン）。
-fn draw_inpaint_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
-    let white = egui::Color32::WHITE;
-    let stroke = egui::Stroke::new(1.5, white);
-
-    // 2枚のページを表す縦線
-    let page_gap = r * 0.3;
-    let page_h = r * 0.8;
-    painter.line_segment(
-        [egui::pos2(c.x - page_gap, c.y - page_h), egui::pos2(c.x - page_gap, c.y + page_h)],
-        stroke,
-    );
-    painter.line_segment(
-        [egui::pos2(c.x + page_gap, c.y - page_h), egui::pos2(c.x + page_gap, c.y + page_h)],
-        stroke,
-    );
-
-    // 中央のギャップを表す波線
-    let wave_amp = r * 0.15;
-    for i in 0..4 {
-        let y = c.y - page_h + (i as f32 + 0.5) * page_h * 0.5;
-        let x_off = if i % 2 == 0 { wave_amp } else { -wave_amp };
-        painter.line_segment(
-            [egui::pos2(c.x - page_gap, y), egui::pos2(c.x + x_off, y)],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
-        );
-        painter.line_segment(
-            [egui::pos2(c.x + x_off, y), egui::pos2(c.x + page_gap, y)],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
         );
     }
 }

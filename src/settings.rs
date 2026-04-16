@@ -494,18 +494,6 @@ pub struct Settings {
     #[serde(default)]
     pub ai_upscale_model_override: Option<String>,
 
-    /// AI 補完: 見開きページの欠落補完を有効にするか（デフォルト: false）
-    #[serde(default)]
-    pub ai_inpaint_active: bool,
-
-    /// AI 補完: デフォルトの隙間幅（ピクセル）
-    #[serde(default = "default_ai_inpaint_gap_width")]
-    pub ai_inpaint_gap_width: u32,
-
-    /// AI 補完: 欠損周辺のトリム幅（左右の汚れを除去するピクセル数）
-    #[serde(default)]
-    pub ai_inpaint_trim: u32,
-
     /// AI アップスケール: 先読み枚数（後方）
     #[serde(default = "default_ai_upscale_prefetch_back")]
     pub ai_upscale_prefetch_back: usize,
@@ -560,7 +548,6 @@ fn default_thumb_next_pages() -> u32 { 4 }
 fn default_thumb_vram_cap_percent() -> u32 { 50 }
 fn default_folder_thumb_sort() -> SortOrder { SortOrder::Numeric }
 fn default_folder_thumb_depth() -> u32 { 3 }
-fn default_ai_inpaint_gap_width() -> u32 { 40 }
 fn default_ai_upscale_prefetch_back() -> usize { 1 }
 fn default_ai_upscale_prefetch_forward() -> usize { 2 }
 fn default_ai_upscale_skip_px() -> u32 { 2048 }
@@ -684,9 +671,6 @@ impl Default for Settings {
             custom_open_with_apps: Vec::new(),
             ai_upscale_enabled: false,
             ai_upscale_model_override: None,
-            ai_inpaint_active: false,
-            ai_inpaint_gap_width: default_ai_inpaint_gap_width(),
-            ai_inpaint_trim: 0,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
             ai_upscale_skip_px: default_ai_upscale_skip_px(),
