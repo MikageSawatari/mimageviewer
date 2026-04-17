@@ -3555,7 +3555,7 @@ impl App {
         all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
     ) {
         if self.settings.skip_zip_if_folder_exists {
-            Self::filter_zip_duplicates(folders, folder_metas);
+            Self::filter_virtual_folder_duplicates(folders, folder_metas);
         }
         if self.settings.skip_image_if_video_exists {
             self.filter_video_image_duplicates(all_media);
@@ -3565,9 +3565,13 @@ impl App {
         }
     }
 
-    /// ZIP + フォルダの重複: 同名フォルダがあれば ZIP エントリをスキップ。
+    /// ZIP/PDF + フォルダの重複: 同名フォルダがあれば ZIP/PDF エントリをスキップ。
     /// folders と folder_metas は同じ順序で対応しているため、同期して削除する。
-    fn filter_zip_duplicates(
+    ///
+    /// 仮想フォルダ (ZIP/PDF) 判定は [`folder_tree::sorted_subdirs`] の Ctrl+↑↓ 用
+    /// フィルタと揃える必要がある。片側だけ PDF を除外すると、グリッドに表示されている
+    /// PDF が folder tree 側では sibling 扱いされず Ctrl+↑↓ の位置検索が失敗する。
+    fn filter_virtual_folder_duplicates(
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
     ) {
@@ -3585,7 +3589,7 @@ impl App {
 
         let mut keep = vec![true; folders.len()];
         for (i, item) in folders.iter().enumerate() {
-            if let GridItem::ZipFile(p) = item {
+            if let GridItem::ZipFile(p) | GridItem::PdfFile(p) = item {
                 if real_folder_names.contains(&stem_lower(p)) {
                     keep[i] = false;
                 }
@@ -5772,7 +5776,7 @@ impl App {
                         if cache_map.contains_key(&folder_key) {
                             continue;
                         }
-                        if let Some(first_entry) = crate::zip_loader::first_image_entry(zip_path) {
+                        if let Some(first_entry) = crate::zip_loader::first_image_entry(zip_path, None) {
                             if let Ok(raw) = crate::zip_loader::read_entry_bytes(zip_path, &first_entry) {
                                 if let Ok(img) = image::load_from_memory(&raw) {
                                     if let Some(bytes) = encode_and_save(

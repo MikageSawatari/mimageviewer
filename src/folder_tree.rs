@@ -67,10 +67,16 @@ pub fn is_virtual_folder(path: &Path) -> bool {
 
 /// Ctrl+↑↓ でフォルダをスキップすべきか判定する。
 /// スキップしない（＝立ち寄る）条件:
-/// - 画像・動画が1つでもある
-/// - ZIP/PDF が合計2つ以上ある
+/// - PDF ファイル → 常に立ち寄る（ページが必ずある）
+/// - ZIP ファイル → 中に画像エントリが 1 つでもあれば立ち寄る
+/// - 通常フォルダ → 画像・動画が 1 つでもあれば立ち寄る
 ///
-/// path が .zip/.pdf ファイル自体の場合は常に立ち寄る（仮想フォルダ）。
+/// ZIP の中身検査はセントラルディレクトリを開くのみで、インストーラ等の
+/// 画像なし ZIP をスキップ扱いにするための判定。以前はフォルダ直下の
+/// ZIP/PDF を 2 個以上数えて立ち寄る実装だったが、ドキュメント/インストーラ
+/// ZIP だけのフォルダで誤ヒットしたため廃止した。DFS は `sorted_subdirs`
+/// 経由で ZIP/PDF ファイル自体を個別に訪問するので通常フォルダ側で束ねる
+/// 必要がない。
 ///
 /// `cancel` が指定された場合、エントリ走査中に定期的に確認し、
 /// セットされていれば `false` を返して早期離脱する (呼び出し元もキャンセルを
@@ -81,12 +87,21 @@ pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
         return false;
     }
 
-    // ZIP/PDF ファイル自体はナビゲーション対象として常に立ち寄る
-    if path.is_file() && is_virtual_folder(path) {
-        return true;
+    if path.is_file() {
+        if !is_virtual_folder(path) {
+            return false;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        return match ext.as_str() {
+            "pdf" => true,
+            "zip" => crate::zip_loader::first_image_entry(path, cancel).is_some(),
+            _ => false,
+        };
     }
-
-    let mut virtual_folder_count = 0u32;
 
     let entries = match std::fs::read_dir(path) {
         Ok(rd) => rd,
@@ -102,18 +117,10 @@ pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
         }
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
-            // 画像・動画が1つでもあれば即 true
             if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str())
                 || SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str())
             {
                 return true;
-            }
-            // ZIP/PDF をカウント
-            if ext_lower == "zip" || ext_lower == "pdf" {
-                virtual_folder_count += 1;
-                if virtual_folder_count >= 2 {
-                    return true;
-                }
             }
         }
     }
@@ -480,5 +487,63 @@ mod tests {
         let result = navigate_folder_with_skip(&start, nav_fn2, 2, None).expect("outcome");
         assert_eq!(result.path, image_folder);
         assert!(result.hit_image_folder);
+    }
+
+    fn make_zip_with_entries(zip_path: &Path, entry_names: &[&str]) {
+        use std::io::Write;
+        let file = std::fs::File::create(zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for name in entry_names {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(b"dummy").unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn folder_should_stop_pdf_file_always_true() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let pdf = temp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4 dummy").unwrap();
+        assert!(folder_should_stop(&pdf, None));
+    }
+
+    #[test]
+    fn folder_should_stop_zip_with_image_true() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let zip_path = temp.path().join("comic.zip");
+        make_zip_with_entries(&zip_path, &["page01.jpg"]);
+        assert!(folder_should_stop(&zip_path, None));
+    }
+
+    #[test]
+    fn folder_should_stop_zip_without_image_false() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let zip_path = temp.path().join("installer.zip");
+        make_zip_with_entries(&zip_path, &["readme.pdf"]);
+        assert!(!folder_should_stop(&zip_path, None));
+    }
+
+    /// 以前の「2+ ヒューリスティクス」による偽陽性を避ける回帰テスト。
+    #[test]
+    fn folder_should_stop_dir_with_only_zips_false() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("installer_collection");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.zip"), b"").unwrap();
+        std::fs::write(dir.join("b.zip"), b"").unwrap();
+        std::fs::write(dir.join("c.pdf"), b"").unwrap();
+        assert!(!folder_should_stop(&dir, None));
+    }
+
+    #[test]
+    fn folder_should_stop_dir_with_image_true() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("photos");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.jpg"), b"").unwrap();
+        assert!(folder_should_stop(&dir, None));
     }
 }

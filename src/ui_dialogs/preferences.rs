@@ -724,7 +724,7 @@ fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.label("空フォルダのスキップ上限:");
         ui.add(
             egui::DragValue::new(&mut s.folder_skip_limit)
-                .range(1..=10usize)
+                .range(1..=30usize)
                 .suffix(" 回"),
         );
     });
@@ -757,7 +757,7 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
     ui.checkbox(
         &mut s.skip_zip_if_folder_exists,
-        "同名の ZIP ファイルとフォルダがある場合、ZIP をスキップ",
+        "同名の ZIP/PDF ファイルとフォルダがある場合、ZIP/PDF をスキップ",
     );
     ui.add_space(4.0);
     ui.checkbox(

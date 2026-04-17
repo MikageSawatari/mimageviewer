@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// サムネイル生成対象とする画像拡張子 (`app.rs` の `SUPPORTED_EXTENSIONS` と同じ)
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
@@ -66,11 +67,19 @@ pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageE
 }
 
 /// ZIP ファイルの最初の画像エントリ名を返す。
-/// フォルダ一覧でのサムネイル表示用 (1枚目のみ高速取得)。
-pub fn first_image_entry(zip_path: &Path) -> Option<String> {
+/// フォルダ一覧でのサムネイル表示用 (1枚目のみ高速取得) と、
+/// `folder_should_stop` での画像有無判定に使う。
+///
+/// `cancel` が指定されていれば各エントリ検査前にチェックし、セット時は
+/// `None` を返して早期離脱する (巨大な非画像 ZIP のスキャン中に Ctrl+↑↓
+/// 連打がきたとき DFS をすぐ畳めるようにするため)。
+pub fn first_image_entry(zip_path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
     let file = File::open(zip_path).ok()?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
     for i in 0..archive.len() {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return None;
+        }
         let Ok(entry) = archive.by_index(i) else { continue };
         if !entry.is_file() {
             continue;

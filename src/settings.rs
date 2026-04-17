@@ -536,7 +536,7 @@ pub const MAX_GRID_COLS: usize = 10;
 fn default_grid_cols() -> usize { 4 }
 fn default_prefetch_back() -> usize { 4 }
 fn default_prefetch_forward() -> usize { 12 }
-fn default_folder_skip_limit() -> usize { 3 }
+fn default_folder_skip_limit() -> usize { 5 }
 fn default_thumb_px() -> u32 { 512 }
 fn default_thumb_quality() -> u8 { 75 }
 fn default_cache_threshold_ms() -> u32 { 25 }
@@ -783,7 +783,7 @@ mod tests {
         assert!(s.window_size.is_none());
         assert_eq!(s.prefetch_back, 4);
         assert_eq!(s.prefetch_forward, 12);
-        assert_eq!(s.folder_skip_limit, 3);
+        assert_eq!(s.folder_skip_limit, 5);
         assert_eq!(s.sort_order, SortOrder::FileName);
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);
