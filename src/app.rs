@@ -28,7 +28,7 @@ pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
     cancel: Arc<AtomicBool>,
     /// DFS スレッドからの結果チャネル。
-    rx: mpsc::Receiver<Option<PathBuf>>,
+    rx: mpsc::Receiver<Option<crate::folder_tree::FolderNavOutcome>>,
     /// この DFS ステップの方向 (forward=↓, backward=↑)。結果の後処理に使う。
     forward: bool,
     /// この DFS が発火された起点モード。結果の後処理に使う。
@@ -39,6 +39,11 @@ pub(crate) struct FolderNavPending {
 pub(crate) struct FolderNavResult {
     /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
     pub path: Option<PathBuf>,
+    /// `folder_should_stop` をパスしたフォルダ (= 画像/動画/ZIP/PDF あり) か。
+    /// `false` のときは skip_limit 尽きまたは DFS 末端でのフォールバック、または
+    /// 結果自体が `None` (path も None)。Fullscreen モードの後処理は false なら
+    /// 移動を取りやめて境界ヒントを出す。
+    pub hit_image_folder: bool,
     /// 起点の方向。
     pub forward: bool,
     /// 起点モード。
@@ -699,9 +704,10 @@ pub struct App {
     pub(crate) ime_last_event_at: Option<std::time::Instant>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
-    /// フルスクリーン境界ヒント: (末尾到達=true/先頭到達=false, 表示開始時刻)
-    /// 最後/最初の画像でさらに進もう/戻ろうとしたときに画面中央に出すオーバーレイ。
-    pub(crate) fs_boundary_hint: Option<(bool, std::time::Instant)>,
+    /// フルスクリーン中央のヒントオーバーレイ。
+    /// 最後/最初の画像でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
+    /// 画像のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
+    pub(crate) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
 
     // ── 消しゴム (Erase) モード ───────────────────────────────────
     /// E キーで切り替える消しゴムモード
@@ -3052,10 +3058,15 @@ impl App {
     fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
         let pending = self.folder_nav_pending.as_ref()?;
         match pending.rx.try_recv() {
-            Ok(path) => {
+            Ok(outcome) => {
                 let pending = self.folder_nav_pending.take().unwrap();
+                let (path, hit_image_folder) = match outcome {
+                    Some(o) => (Some(o.path), o.hit_image_folder),
+                    None => (None, false),
+                };
                 Some(FolderNavResult {
                     path,
+                    hit_image_folder,
                     forward: pending.forward,
                     mode: pending.mode,
                 })
@@ -3065,6 +3076,7 @@ impl App {
                 let pending = self.folder_nav_pending.take().unwrap();
                 Some(FolderNavResult {
                     path: None,
+                    hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
                 })
@@ -3077,13 +3089,40 @@ impl App {
     fn apply_folder_nav_result(&mut self, ctx: &egui::Context, result: FolderNavResult) {
         let Some(path) = result.path else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
-            if let FolderNavMode::Favsearch { .. } = result.mode {
-                // favsearch では DFS 尽きた場合は検索結果の前後アイテムへ
-                let delta: isize = if result.forward { 1 } else { -1 };
-                self.favsearch_navigate_sibling(delta);
+            match result.mode {
+                FolderNavMode::Favsearch { .. } => {
+                    // favsearch では DFS 尽きた場合は検索結果の前後アイテムへ
+                    let delta: isize = if result.forward { 1 } else { -1 };
+                    self.favsearch_navigate_sibling(delta);
+                }
+                FolderNavMode::Fullscreen => {
+                    // DFS がツリー末端に達した: フルスクリーンは維持して中央にヒントを出す。
+                    // 累積された連打は打ち切る (次回以降も同じ末端に向かうだけ)。
+                    self.fs_boundary_hint = Some(
+                        crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
+                            forward: result.forward,
+                            at: std::time::Instant::now(),
+                        },
+                    );
+                    self.pending_folder_nav_steps = 0;
+                }
+                FolderNavMode::Grid => {}
             }
             return;
         };
+        // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像の無い
+        // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
+        // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
+        if matches!(result.mode, FolderNavMode::Fullscreen) && !result.hit_image_folder {
+            self.fs_boundary_hint = Some(
+                crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
+                    forward: result.forward,
+                    at: std::time::Instant::now(),
+                },
+            );
+            self.pending_folder_nav_steps = 0;
+            return;
+        }
         match result.mode {
             FolderNavMode::Grid => {
                 self.load_folder(path);

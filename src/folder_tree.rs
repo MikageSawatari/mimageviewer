@@ -125,9 +125,22 @@ pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
 // フォルダツリー走査（深さ優先・前順）
 // -----------------------------------------------------------------------
 
+/// `navigate_folder_with_skip` の結果。画像フォルダを見つけたか、
+/// skip_limit / DFS 末端でのフォールバックかを呼び出し側が区別できるようにする。
+pub struct FolderNavOutcome {
+    /// 移動先フォルダ (DFS が示した次候補、または画像ありフォルダ)。
+    pub path: PathBuf,
+    /// `folder_should_stop` をパスした (= 画像/動画/ZIP/PDF を含む) フォルダか。
+    /// `false` のときは skip_limit 尽きまたは DFS 末端でのフォールバックで、
+    /// 呼び出し側は「見つからなかった」扱いにできる。
+    pub hit_image_folder: bool,
+}
+
 /// Ctrl+↑↓ フォルダ移動：画像なしフォルダを最大 skip_limit 回スキップする。
-/// skip_limit 回以内に画像ありフォルダが見つかればそこへ移動。
-/// 見つからなければ直近の隣フォルダ（1ステップ先）へ移動。
+/// skip_limit 回以内に画像ありフォルダが見つかればそこへ移動
+/// (`hit_image_folder = true`)。見つからなければ直近の隣フォルダ（1ステップ先）に
+/// フォールバックして `hit_image_folder = false` で返す。
+/// DFS 末端 (nav_fn が None を返す) に達した場合も同様。
 ///
 /// `cancel` が指定された場合、各ステップ開始時に確認し、セットされていれば
 /// `None` を返して早期離脱する。連打で新しい要求が入ったときに旧スレッドの
@@ -137,7 +150,7 @@ pub fn navigate_folder_with_skip<F>(
     nav_fn: F,
     skip_limit: usize,
     cancel: Option<&AtomicBool>,
-) -> Option<PathBuf>
+) -> Option<FolderNavOutcome>
 where
     F: Fn(&Path) -> Option<PathBuf>,
 {
@@ -151,15 +164,15 @@ where
             return None;
         }
         if folder_should_stop(&candidate, cancel) {
-            return Some(candidate);
+            return Some(FolderNavOutcome { path: candidate, hit_image_folder: true });
         }
         match nav_fn(&candidate) {
             Some(next) => candidate = next,
-            None => return Some(first),
+            None => return Some(FolderNavOutcome { path: first, hit_image_folder: false }),
         }
     }
     // skip_limit 回分全て画像なし → 直近の隣フォルダにフォールバック
-    Some(first)
+    Some(FolderNavOutcome { path: first, hit_image_folder: false })
 }
 
 /// 深さ優先前順で次のフォルダを返す。

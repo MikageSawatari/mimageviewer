@@ -46,6 +46,28 @@ const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
 const FEEDBACK_TOAST_DURATION: f32 = 1.2;
 /// 境界ヒント（最初/最後の画像に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
+/// 画像フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
+/// ユーザーがフルスクリーンを維持するか Esc で抜けるか判断する時間が要るため、
+/// 境界ヒントより長めに取る。
+const NO_IMAGE_FOLDER_HINT_DURATION: f32 = 4.0;
+
+/// フルスクリーン中央のヒントオーバーレイ。
+#[derive(Copy, Clone)]
+pub(crate) enum FsBoundaryHint {
+    /// 最初/最後の画像に到達 (at_end: true=末尾, false=先頭)。
+    Edge { at_end: bool, at: std::time::Instant },
+    /// Ctrl+↑↓ で画像のある次 (forward=true) / 前 (forward=false) のフォルダが
+    /// skip_limit 以内に見つからなかった。
+    NoImageFolder { forward: bool, at: std::time::Instant },
+}
+
+impl FsBoundaryHint {
+    pub(crate) fn started_at(&self) -> std::time::Instant {
+        match self {
+            FsBoundaryHint::Edge { at, .. } | FsBoundaryHint::NoImageFolder { at, .. } => *at,
+        }
+    }
+}
 
 // ── 見開きペアリング ──────────────────────────────────────────────────────
 
@@ -298,7 +320,7 @@ impl App {
         // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
         // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
         // いれば「このフレームで再設定されていない」= 打ち切ってよい、と判定する。
-        let hint_start_before = self.fs_boundary_hint.map(|(_, t)| t);
+        let hint_start_before = self.fs_boundary_hint.map(|h| h.started_at());
         let mut had_user_input_in_frame = false;
 
         // ── ビューポート構築 ──
@@ -629,7 +651,7 @@ impl App {
         // (= 境界でない方向への移動、別キー入力、等)。操作があれば即消去。
         // 再設定されていた場合 (= 引き続き境界に突き当たった) はそのまま残す。
         if had_user_input_in_frame {
-            let hint_now = self.fs_boundary_hint.map(|(_, t)| t);
+            let hint_now = self.fs_boundary_hint.map(|h| h.started_at());
             if hint_now.is_some() && hint_now == hint_start_before {
                 self.fs_boundary_hint = None;
             }
@@ -1211,7 +1233,10 @@ impl App {
                     action.jump_to = Some(first);
                     self.slideshow_playing = false;
                 } else {
-                    self.fs_boundary_hint = Some((false, std::time::Instant::now()));
+                    self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                        at_end: false,
+                        at: std::time::Instant::now(),
+                    });
                 }
             }
         }
@@ -1223,7 +1248,10 @@ impl App {
                     action.jump_to = Some(last);
                     self.slideshow_playing = false;
                 } else {
-                    self.fs_boundary_hint = Some((true, std::time::Instant::now()));
+                    self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                        at_end: true,
+                        at: std::time::Instant::now(),
+                    });
                 }
             }
         }
@@ -1526,7 +1554,10 @@ impl App {
                     self.update_last_selected_image();
                 } else {
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
-                    self.fs_boundary_hint = Some((nav_delta > 0, std::time::Instant::now()));
+                    self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                        at_end: nav_delta > 0,
+                        at: std::time::Instant::now(),
+                    });
                     crate::logger::log(format!(
                         "[NAV] adjacent_navigable_idx returned None: fs_idx={fs_idx}, delta={nav_delta}, items={}, visible={}",
                         self.items.len(), self.visible_indices.len()
@@ -2781,25 +2812,49 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    /// 画面中央に境界ヒント (最初/最後の画像です…) を描画する。
+    /// 画面中央に境界ヒント (最初/最後の画像です… / 次のフォルダが見つかりません…) を描画する。
     fn draw_boundary_hint(&mut self, ui: &mut egui::Ui, full_rect: egui::Rect, ctx: &egui::Context) {
-        let Some((at_end, start_time)) = self.fs_boundary_hint else { return; };
+        let Some(hint) = self.fs_boundary_hint else { return; };
+        let start_time = hint.started_at();
+        let duration = match hint {
+            FsBoundaryHint::Edge { .. } => BOUNDARY_HINT_DURATION,
+            FsBoundaryHint::NoImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
+        };
         let elapsed = start_time.elapsed().as_secs_f32();
-        if elapsed > BOUNDARY_HINT_DURATION {
+        if elapsed > duration {
             self.fs_boundary_hint = None;
             return;
         }
 
-        let alpha = if elapsed > BOUNDARY_HINT_DURATION - 0.4 {
-            ((BOUNDARY_HINT_DURATION - elapsed) / 0.4).clamp(0.0, 1.0)
+        let alpha = if elapsed > duration - 0.4 {
+            ((duration - elapsed) / 0.4).clamp(0.0, 1.0)
         } else {
             1.0
         };
 
-        let (title, line1, line2) = if at_end {
-            ("最後の画像です", "[Home] 最初に戻る", "[Ctrl]+[↓] 次のフォルダへ")
-        } else {
-            ("最初の画像です", "[End] 最後に移動", "[Ctrl]+[↑] 前のフォルダへ")
+        let (title, body_lines): (&str, Vec<&str>) = match hint {
+            FsBoundaryHint::Edge { at_end: true, .. } => (
+                "最後の画像です",
+                vec!["[Home] 最初に戻る", "[Ctrl]+[↓] 次のフォルダへ"],
+            ),
+            FsBoundaryHint::Edge { at_end: false, .. } => (
+                "最初の画像です",
+                vec!["[End] 最後に移動", "[Ctrl]+[↑] 前のフォルダへ"],
+            ),
+            FsBoundaryHint::NoImageFolder { forward: true, .. } => (
+                "次のフォルダに画像が見つかりません",
+                vec![
+                    "[Esc] でサムネイル一覧に戻り",
+                    "[Ctrl]+[↓] で空フォルダを越えて移動できます",
+                ],
+            ),
+            FsBoundaryHint::NoImageFolder { forward: false, .. } => (
+                "前のフォルダに画像が見つかりません",
+                vec![
+                    "[Esc] でサムネイル一覧に戻り",
+                    "[Ctrl]+[↑] で空フォルダを越えて移動できます",
+                ],
+            ),
         };
 
         let title_font = egui::FontId::proportional(32.0);
@@ -2809,19 +2864,23 @@ impl App {
 
         let painter = ui.painter();
         let title_galley = painter.layout_no_wrap(title.to_string(), title_font.clone(), white);
-        let line1_galley = painter.layout_no_wrap(line1.to_string(), body_font.clone(), white);
-        let line2_galley = painter.layout_no_wrap(line2.to_string(), body_font.clone(), white);
+        let body_galleys: Vec<_> = body_lines
+            .iter()
+            .map(|s| painter.layout_no_wrap(s.to_string(), body_font.clone(), white))
+            .collect();
 
         let line_gap = 10.0;
         let padding = egui::vec2(32.0, 24.0);
-        let content_w = title_galley.size().x
-            .max(line1_galley.size().x)
-            .max(line2_galley.size().x);
-        let content_h = title_galley.size().y
-            + line_gap * 1.5
-            + line1_galley.size().y
-            + line_gap
-            + line2_galley.size().y;
+        let content_w = body_galleys
+            .iter()
+            .map(|g| g.size().x)
+            .fold(title_galley.size().x, f32::max);
+        let body_h: f32 = body_galleys
+            .iter()
+            .map(|g| g.size().y)
+            .sum::<f32>()
+            + line_gap * (body_galleys.len().saturating_sub(1) as f32);
+        let content_h = title_galley.size().y + line_gap * 1.5 + body_h;
         let box_size = egui::vec2(content_w, content_h) + padding * 2.0;
 
         let center = full_rect.center();
@@ -2847,21 +2906,16 @@ impl App {
             accent,
         );
         y += title_galley.size().y + line_gap * 1.5;
-        painter.text(
-            egui::pos2(center.x, y),
-            egui::Align2::CENTER_TOP,
-            line1,
-            body_font.clone(),
-            white,
-        );
-        y += line1_galley.size().y + line_gap;
-        painter.text(
-            egui::pos2(center.x, y),
-            egui::Align2::CENTER_TOP,
-            line2,
-            body_font,
-            white,
-        );
+        for (line, galley) in body_lines.iter().zip(body_galleys.iter()) {
+            painter.text(
+                egui::pos2(center.x, y),
+                egui::Align2::CENTER_TOP,
+                *line,
+                body_font.clone(),
+                white,
+            );
+            y += galley.size().y + line_gap;
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
