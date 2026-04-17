@@ -695,10 +695,22 @@ impl Settings {
                 return Self::default();
             }
         };
-        serde_json::from_str(&data).unwrap_or_else(|e| {
+        let mut settings: Self = serde_json::from_str(&data).unwrap_or_else(|e| {
             eprintln!("settings JSON parse failed: {} ({})", path.display(), e);
             Self::default()
-        })
+        });
+        settings.sanitize();
+        settings
+    }
+
+    /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
+    fn sanitize(&mut self) {
+        // folder_skip_limit == 0 だと navigate_folder_with_skip が first を評価せず
+        // フルスクリーン Ctrl+↑↓ が事実上機能しないため、最低 1 にクランプする。
+        // 環境設定 UI 側のレンジ (1..=10) と整合させる。
+        if self.folder_skip_limit == 0 {
+            self.folder_skip_limit = 1;
+        }
     }
 
     pub fn save(&self) {
@@ -809,6 +821,23 @@ mod tests {
         assert_eq!(loaded.thumb_px, 512);
         assert_eq!(loaded.thumb_quality, 75);
         assert!(loaded.favorites.is_empty());
+    }
+
+    /// JSON 手編集等で `folder_skip_limit: 0` が入っていたら、sanitize で 1 に
+    /// 補正される。0 のままだと navigate_folder_with_skip が first を評価せず
+    /// フルスクリーン Ctrl+↑↓ が事実上機能しなくなるための防衛。
+    #[test]
+    fn sanitize_clamps_folder_skip_limit_to_one() {
+        let mut s = Settings::default();
+        s.folder_skip_limit = 0;
+        s.sanitize();
+        assert_eq!(s.folder_skip_limit, 1);
+
+        // >= 1 の値は据え置き
+        let mut s = Settings::default();
+        s.folder_skip_limit = 5;
+        s.sanitize();
+        assert_eq!(s.folder_skip_limit, 5);
     }
 
     // -- FavoriteEntry serde --

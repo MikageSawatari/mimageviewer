@@ -159,7 +159,12 @@ where
     }
     let first = nav_fn(start)?;
     let mut candidate = first.clone();
-    for _ in 0..skip_limit {
+    // skip_limit == 0 のとき (設定 JSON 手編集等で 0 が入った場合) でも、
+    // 最低 1 回は first を評価する。さもないと first が画像フォルダでも
+    // hit_image_folder = false で返って、フルスクリーン側が「見つからなかった」
+    // 扱いで移動を取り消してしまう。
+    let iterations = skip_limit.max(1);
+    for _ in 0..iterations {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return None;
         }
@@ -390,5 +395,90 @@ mod tests {
                 ext
             );
         }
+    }
+
+    /// skip_limit == 0 でも隣フォルダ `first` を 1 回評価する回帰テスト。
+    /// `first` が画像フォルダなら hit_image_folder=true で返ること。
+    #[test]
+    fn navigate_skip_limit_zero_returns_image_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let start = root.join("start");
+        let image_folder = root.join("images");
+        std::fs::create_dir(&start).unwrap();
+        std::fs::create_dir(&image_folder).unwrap();
+        std::fs::write(image_folder.join("a.jpg"), b"").unwrap();
+
+        let target = image_folder.clone();
+        let nav_fn = move |_: &Path| Some(target.clone());
+
+        let result = navigate_folder_with_skip(&start, nav_fn, 0, None).expect("outcome");
+        assert_eq!(result.path, image_folder);
+        assert!(result.hit_image_folder);
+    }
+
+    /// skip_limit == 0 で `first` が画像フォルダでないときはフォールバックで
+    /// first を返し、hit_image_folder=false を立てること。
+    #[test]
+    fn navigate_skip_limit_zero_falls_back_when_first_empty() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let start = root.join("start");
+        let empty_folder = root.join("empty");
+        std::fs::create_dir(&start).unwrap();
+        std::fs::create_dir(&empty_folder).unwrap();
+
+        let target = empty_folder.clone();
+        let nav_fn = move |_: &Path| Some(target.clone());
+
+        let result = navigate_folder_with_skip(&start, nav_fn, 0, None).expect("outcome");
+        assert_eq!(result.path, empty_folder);
+        assert!(!result.hit_image_folder);
+    }
+
+    /// skip_limit >= 1 の既存挙動が壊れていないこと: 画像を含まない first を
+    /// 1 回スキップして 2 番目の候補 (画像あり) を返す。
+    #[test]
+    fn navigate_skip_limit_one_skips_to_image_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let start = root.join("start");
+        let empty_folder = root.join("empty");
+        let image_folder = root.join("images");
+        std::fs::create_dir(&start).unwrap();
+        std::fs::create_dir(&empty_folder).unwrap();
+        std::fs::create_dir(&image_folder).unwrap();
+        std::fs::write(image_folder.join("a.jpg"), b"").unwrap();
+
+        let empty_clone = empty_folder.clone();
+        let image_clone = image_folder.clone();
+        let nav_fn = move |p: &Path| {
+            if path_eq(p, &empty_clone) {
+                Some(image_clone.clone())
+            } else {
+                Some(empty_clone.clone())
+            }
+        };
+
+        // skip_limit=1 だと first (empty) は評価されるが advance 後の検査はしない想定。
+        // 現実装: iter 0 で empty をチェック→スキップ→advance して image へ。ループ終了。
+        // → fallback path=first=empty, hit_image_folder=false
+        let result = navigate_folder_with_skip(&start, nav_fn, 1, None).expect("outcome");
+        assert_eq!(result.path, empty_folder);
+        assert!(!result.hit_image_folder);
+
+        // skip_limit=2 なら image_folder まで検査されて hit=true になる。
+        let empty_clone2 = empty_folder.clone();
+        let image_clone2 = image_folder.clone();
+        let nav_fn2 = move |p: &Path| {
+            if path_eq(p, &empty_clone2) {
+                Some(image_clone2.clone())
+            } else {
+                Some(empty_clone2.clone())
+            }
+        };
+        let result = navigate_folder_with_skip(&start, nav_fn2, 2, None).expect("outcome");
+        assert_eq!(result.path, image_folder);
+        assert!(result.hit_image_folder);
     }
 }
