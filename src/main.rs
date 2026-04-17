@@ -125,9 +125,14 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "mimageviewer",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::App::default()))
+            let mut app = app::App::default();
+            // DPI 確定後の初回フレームで意図したサイズを再適用する
+            // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
+            // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
+            app.pending_initial_size = Some(size);
+            Ok(Box::new(app))
         }),
     )
 }

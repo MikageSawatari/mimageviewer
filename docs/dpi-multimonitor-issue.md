@@ -90,6 +90,18 @@ ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
 #### 案 E: ウィンドウを最大化して使う
 - ユーザー側の回避策として、最大化状態では `Win+Shift+Arrow` の位置ずれが出にくい可能性
 
+#### 案 F: 初期サイズを初回フレームで再適用（採用済み）
+- `ViewportBuilder::with_inner_size` 段階では マルチモニタ DPI 混在時に
+  論理/物理ピクセルの取り違えで異常サイズ（縦に極端に長い等）のウィンドウが
+  生成される既知バグがある（[egui#4918](https://github.com/emilk/egui/issues/4918) /
+  [winit#923](https://github.com/rust-windowing/winit/issues/923)）。
+- 対策: `App::pending_initial_size` に意図したサイズを保持し、
+  初回 `update()` 呼び出し（= DPI 確定後）で
+  `ctx.send_viewport_cmd(ViewportCommand::InnerSize(..))` により再適用する。
+- 実装: `src/main.rs` → `src/app.rs` の `initialized` ブロック。
+- 通常経路でも無害な no-op になるため、副作用なし。
+- Win+Shift+Arrow による位置ずれ（移動時のバグ）は別問題で、この対策では解消しない。
+
 ## ログ全文
 
 デバッグログ（`mimageviewer.log`）は `target/debug/` ディレクトリに生成される。

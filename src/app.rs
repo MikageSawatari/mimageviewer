@@ -332,6 +332,10 @@ pub struct App {
     pub(crate) last_outer_rect: Option<egui::Rect>,
     /// 現在のウィンドウの DPI スケール（論理→物理変換に使用）
     pub(crate) last_pixels_per_point: f32,
+    /// 初回フレームで適用する inner_size（egui#4918 / winit#923 対策）。
+    /// ViewportBuilder 段階では マルチモニタ DPI 混在時に サイズを誤って設定する
+    /// ケースがあるため、DPI 確定後の初回フレームで再適用する。
+    pub(crate) pending_initial_size: Option<[f32; 2]>,
 
     /// キャッシュ生成進捗：新規デコードが必要だった画像の総数
     pub(crate) cache_gen_total: usize,
@@ -795,6 +799,7 @@ impl Default for App {
             scroll_to_selected: false,
             last_outer_rect: None,
             last_pixels_per_point: 1.0,
+            pending_initial_size: None,
             cache_gen_total: 0,
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
@@ -5895,6 +5900,18 @@ impl eframe::App for App {
 
             // AI ランタイムを初期化
             self.ensure_ai_runtime();
+
+            // ViewportBuilder 段階では マルチモニタ DPI 混在時に
+            // 論理/物理ピクセルの取り違えで異常サイズのウィンドウが
+            // 生成されるケースがある (egui#4918 / winit#923)。
+            // DPI が確定した初回フレームで意図したサイズを再適用して矯正する。
+            if let Some([w, h]) = self.pending_initial_size.take() {
+                let ppp = ctx.input(|i| i.pixels_per_point);
+                crate::logger::log(format!(
+                    "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2}"
+                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+            }
         }
 
         self.track_window_rect(ctx);
