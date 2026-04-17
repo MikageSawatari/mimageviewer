@@ -705,12 +705,11 @@ impl Settings {
 
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     fn sanitize(&mut self) {
-        // folder_skip_limit == 0 だと navigate_folder_with_skip が first を評価せず
-        // フルスクリーン Ctrl+↑↓ が事実上機能しないため、最低 1 にクランプする。
-        // 環境設定 UI 側のレンジ (1..=10) と整合させる。
-        if self.folder_skip_limit == 0 {
-            self.folder_skip_limit = 1;
-        }
+        // 環境設定 UI 側のレンジ (1..=30) と整合させる。
+        // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
+        // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
+        // 長時間走り UI 非応答を招くので、両側クランプする。
+        self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
     }
 
     pub fn save(&self) {
@@ -823,21 +822,26 @@ mod tests {
         assert!(loaded.favorites.is_empty());
     }
 
-    /// JSON 手編集等で `folder_skip_limit: 0` が入っていたら、sanitize で 1 に
-    /// 補正される。0 のままだと navigate_folder_with_skip が first を評価せず
-    /// フルスクリーン Ctrl+↑↓ が事実上機能しなくなるための防衛。
+    /// JSON 手編集等で `folder_skip_limit` が UI レンジ (1..=30) 外に
+    /// なっていれば sanitize でクランプされる。下限 0 は Ctrl+↑↓ が
+    /// 機能しなくなり、上限超過は ZIP 中身検査込みの DFS が長時間走って
+    /// UI 非応答を招くため両側で防衛する。
     #[test]
-    fn sanitize_clamps_folder_skip_limit_to_one() {
+    fn sanitize_clamps_folder_skip_limit() {
         let mut s = Settings::default();
         s.folder_skip_limit = 0;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 1);
 
-        // >= 1 の値は据え置き
         let mut s = Settings::default();
         s.folder_skip_limit = 5;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 5);
+
+        let mut s = Settings::default();
+        s.folder_skip_limit = 999;
+        s.sanitize();
+        assert_eq!(s.folder_skip_limit, 30);
     }
 
     // -- FavoriteEntry serde --
