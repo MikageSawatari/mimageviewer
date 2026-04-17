@@ -111,6 +111,8 @@ use crate::ui_helpers::{
 /// 消しゴムモードのツール種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EraseTool {
+    /// 選択ツール: クリックでベクタオブジェクトを選択 (描画は行わない)
+    Select,
     /// 囲みツール: ドラッグで多角形を描き内側を塗りつぶす
     Lasso,
     /// 縦線ツール: ドラッグ幅の縦全体矩形を塗りつぶす

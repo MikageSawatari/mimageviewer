@@ -262,25 +262,33 @@ impl App {
             self.nudge_mask(dx, dy);
         }
 
-        // [ / ]: 回転 (Shift で 1°)
-        let (rot_step, _) = if shift_held { (ROTATE_DEG_STEP_FAST, true) } else { (ROTATE_DEG_STEP, false) };
+        // [ / ]: 回転 (Ctrl で 1°)
+        // 修飾キーは Ctrl を使う: JIS/US どちらでも Shift+[ / Shift+] は論理キーが { / } に化けて
+        // egui::Key::OpenBracket / CloseBracket にマッチしないため。Ctrl は論理キーを変えない。
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let rot_step = if ctrl_held { ROTATE_DEG_STEP_FAST } else { ROTATE_DEG_STEP };
         let mut rot_deg = 0.0f32;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::OpenBracket) { rot_deg -= rot_step; }
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::OpenBracket) { rot_deg -= rot_step; }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::CloseBracket) { rot_deg += rot_step; }
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::CloseBracket) { rot_deg += rot_step; }
         });
         if rot_deg != 0.0 {
             self.rotate_mask(rot_deg.to_radians());
         }
 
-        // B/L/V/H/I: ツール切替
+        // S/B/L/V/H/I: ツール切替
+        let key_s_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
         let key_b = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
         let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
         let key_v = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
         let key_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H));
         let key_i = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I));
+        if key_s_tool {
+            self.erase_tool = EraseTool::Select;
+            self.show_feedback_toast("[選択]".to_string());
+        }
         if key_b {
             self.erase_tool = EraseTool::Brush;
             self.show_feedback_toast("[筆]".to_string());
@@ -662,8 +670,8 @@ impl App {
     /// ツールパネルの矩形を返す。
     fn erase_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let panel_pos = egui::pos2(full_rect.min.x + PANEL_MARGIN_X, full_rect.min.y + PANEL_MARGIN_Y);
-        // 基本高さ: ヘッダ + 描画/消去 + セパレータ + ツール 3 行 + スロット + 下部ショートカット説明 + セパレータ + マスク全削除 + ヘルプ
-        let base_h = 400.0;
+        // 基本高さ: ヘッダ + 描画/消去 + セパレータ + ツール 3 行 + スロット + 下部ショートカット説明 + セパレータ + マスク全削除 + ヘルプ (6行)
+        let base_h = 430.0;
         let extra = if self.erase_tool == EraseTool::Brush || self.erase_tool == EraseTool::Line {
             42.0 // サイズスライダー分
         } else {
@@ -697,48 +705,56 @@ impl App {
 
         let shift_held = ctx.input(|i| i.modifiers.shift);
 
-        // ── ベクタオブジェクト編集パス ──────────────────────────────
-        // 既存ベクタへのクリックは「選択 + 編集ドラッグ開始」になる。
-        // ドラッグ中は通常のツール入力を完全に奪う。
-        if primary_pressed {
-            if let Some(img_pos) = pointer_pos
-                .and_then(|p| self.screen_to_image_f32(p, full_rect, zoom_pan))
-            {
-                if let Some((hit_idx, hit_endpoint)) = self.hit_test_vector(img_pos) {
-                    self.push_undo_snapshot();
-                    self.erase_selected_vector = Some(hit_idx);
-                    let base = self.erase_vectors[hit_idx];
-                    self.erase_vector_drag = Some(if let Some(which_p1) = hit_endpoint {
-                        EraseVectorDrag::Endpoint { index: hit_idx, base, which_p1 }
-                    } else if shift_held {
-                        EraseVectorDrag::ShiftAdjust { index: hit_idx, base, origin: img_pos }
-                    } else {
-                        EraseVectorDrag::Pan { index: hit_idx, base, origin: img_pos }
-                    });
-                    self.erase_mask_texture = None;
-                    return;
-                } else {
-                    // 空領域のクリック: 選択を解除
-                    if self.erase_selected_vector.is_some() {
-                        self.erase_selected_vector = None;
+        // ── ベクタオブジェクト編集パス (選択ツール時のみ) ───────────
+        // 選択ツール中はドロー系の操作を行わず、クリック=選択/ドラッグ=編集 に徹する。
+        // 他ツールの描画中に近接したベクタを誤選択しないよう、意図的にモーダルにしている。
+        if self.erase_tool == EraseTool::Select {
+            if primary_pressed {
+                if let Some(img_pos) = pointer_pos
+                    .and_then(|p| self.screen_to_image_f32(p, full_rect, zoom_pan))
+                {
+                    if let Some((hit_idx, hit_endpoint)) = self.hit_test_vector(img_pos) {
+                        self.push_undo_snapshot();
+                        self.erase_selected_vector = Some(hit_idx);
+                        let base = self.erase_vectors[hit_idx];
+                        self.erase_vector_drag = Some(if let Some(which_p1) = hit_endpoint {
+                            EraseVectorDrag::Endpoint { index: hit_idx, base, which_p1 }
+                        } else if shift_held {
+                            EraseVectorDrag::ShiftAdjust { index: hit_idx, base, origin: img_pos }
+                        } else {
+                            EraseVectorDrag::Pan { index: hit_idx, base, origin: img_pos }
+                        });
                         self.erase_mask_texture = None;
+                    } else {
+                        // 空領域のクリック: 選択を解除
+                        if self.erase_selected_vector.is_some() {
+                            self.erase_selected_vector = None;
+                            self.erase_mask_texture = None;
+                        }
                     }
                 }
             }
-        }
-
-        // 編集ドラッグ中はツール入力を奪う
-        if self.erase_vector_drag.is_some() {
-            self.update_vector_drag(pointer_pos, full_rect, zoom_pan, shift_held);
-            if primary_released {
-                self.erase_vector_drag = None;
+            if self.erase_vector_drag.is_some() {
+                self.update_vector_drag(pointer_pos, full_rect, zoom_pan, shift_held);
+                if primary_released {
+                    self.erase_vector_drag = None;
+                }
             }
             return;
+        }
+
+        // 他ツールに切り替わったら選択を自動解除 (ドラッグ中は最後まで完走)
+        if self.erase_vector_drag.is_none() && self.erase_selected_vector.is_some() {
+            self.erase_selected_vector = None;
+            self.erase_mask_texture = None;
         }
 
         // マウスホイールによる筆/直線の太さ調整は handle_fs_wheel_and_click で処理済み。
 
         match self.erase_tool {
+            EraseTool::Select => {
+                // Select は上で処理済み。到達しないはず。
+            }
             EraseTool::Brush => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
@@ -1292,8 +1308,9 @@ impl App {
 
         // ── ツール選択 ──
         let tools = [
-            ("囲み [L]", EraseTool::Lasso),
+            ("選択 [S]", EraseTool::Select),
             ("筆 [B]", EraseTool::Brush),
+            ("囲み [L]", EraseTool::Lasso),
             ("縦線 [V]", EraseTool::VertLine),
             ("横線 [H]", EraseTool::HorizLine),
             ("直線 [I]", EraseTool::Line),
@@ -1491,9 +1508,11 @@ impl App {
 
         // ── ヘルプテキスト ──
         let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
-                    矢印:シフト [/]:回転 (Shift:粗く)\n\
-                    ベクタ選択+Shift ドラッグ:\n\
-                    \u{00A0}縦=回転 横=太さ  Del:削除";
+                    矢印:シフト (Shift:10px)\n\
+                    [/]:回転 (Ctrl:1°)\n\
+                    選択ツール+ベクタ: ドラッグ=移動\n\
+                    \u{00A0}Shift+ドラッグ 縦=回転 横=太さ\n\
+                    \u{00A0}Del:削除";
         child.painter().text(
             egui::pos2(x0, y),
             egui::Align2::LEFT_TOP,

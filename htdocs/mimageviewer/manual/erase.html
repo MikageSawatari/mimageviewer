@@ -75,11 +75,12 @@
           <tr><th>ツール</th><th>ショートカット</th><th>操作</th></tr>
         </thead>
         <tbody>
+          <tr><td>選択</td><td><kbd>S</kbd></td><td>ベクタオブジェクト (縦線／横線／直線) をクリックして選択・編集する。描画はしない</td></tr>
           <tr><td>囲み</td><td><kbd>L</kbd></td><td>ドラッグで自由に囲んだ領域の内側を塗りつぶし</td></tr>
           <tr><td>筆</td><td><kbd>B</kbd></td><td>円形ブラシで自由に塗る。ホイールまたは <kbd>Shift</kbd>+ドラッグで太さ調整</td></tr>
-          <tr><td>縦線</td><td><kbd>V</kbd></td><td>ドラッグした横幅で画像の上端から下端まで縦に塗りつぶし</td></tr>
-          <tr><td>横線</td><td><kbd>H</kbd></td><td>ドラッグした縦幅で画像の左端から右端まで横に塗りつぶし</td></tr>
-          <tr><td>直線</td><td><kbd>I</kbd></td><td>ドラッグで始点と終点を結ぶ太い直線を塗る。ホイールまたは <kbd>Shift</kbd>+ドラッグで幅調整</td></tr>
+          <tr><td>縦線</td><td><kbd>V</kbd></td><td>ドラッグした横幅で画像の上端から下端まで縦に塗りつぶし (ベクタとして保存)</td></tr>
+          <tr><td>横線</td><td><kbd>H</kbd></td><td>ドラッグした縦幅で画像の左端から右端まで横に塗りつぶし (ベクタとして保存)</td></tr>
+          <tr><td>直線</td><td><kbd>I</kbd></td><td>ドラッグで始点と終点を結ぶ太い直線を塗る (ベクタとして保存)。ホイールまたは <kbd>Shift</kbd>+ドラッグで幅調整</td></tr>
         </tbody>
       </table>
     </div>
@@ -142,20 +143,22 @@
           <tr><td>矢印キー</td><td>1 ピクセル平行移動</td></tr>
           <tr><td><kbd>Shift</kbd>+矢印</td><td>10 ピクセル平行移動</td></tr>
           <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>±0.1° 回転 (画像中心まわり)</td></tr>
-          <tr><td><kbd>Shift</kbd>+<kbd>[</kbd> / <kbd>]</kbd></td><td>±1° 回転</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd></td><td>±1° 回転</td></tr>
         </tbody>
       </table>
     </div>
 
     <h2>ベクタオブジェクトの後編集</h2>
     <p>縦線・横線・直線ツールで作成した線は、ビットマップではなくベクタオブジェクトとして保存されます。
-    描画後も選択してサイズや位置を変更できます (筆・囲みはビットマップなので後編集不可)。</p>
+    <kbd>S</kbd> キー (または左パネルの「選択」ボタン) で選択ツールに切り替えると、オブジェクトをクリックして後から編集できます
+    (筆・囲みはビットマップなので後編集不可)。他のツール中は誤選択を防ぐため、選択ツール以外ではクリックで選択されません。</p>
     <div class="table-wrap">
       <table>
         <thead>
           <tr><th>操作</th><th>動作</th></tr>
         </thead>
         <tbody>
+          <tr><td>選択ツールに切り替え</td><td><kbd>S</kbd> キー、または左パネル「選択」ボタン</td></tr>
           <tr><td>オブジェクトをクリック</td><td>選択 (黄色の枠が表示される)</td></tr>
           <tr><td>選択中にドラッグ</td><td>平行移動</td></tr>
           <tr><td>選択中に <kbd>Shift</kbd>+ドラッグ</td><td>縦方向=回転、横方向=太さ変更</td></tr>
@@ -163,6 +166,7 @@
           <tr><td>選択中に矢印キー / <kbd>[</kbd>/<kbd>]</kbd></td><td>選択オブジェクトだけを平行移動 / 回転</td></tr>
           <tr><td><kbd>Del</kbd></td><td>選択オブジェクトを削除</td></tr>
           <tr><td><kbd>Esc</kbd> (選択中)</td><td>選択解除 (消しゴムモードは継続)</td></tr>
+          <tr><td>他のツールに切り替え</td><td>自動で選択解除</td></tr>
         </tbody>
       </table>
     </div>
@@ -195,13 +199,13 @@
         <tbody>
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / AI 補完実行（2 回目）</td></tr>
           <tr><td><kbd>Esc</kbd></td><td>消しゴムモードを終了（フルスクリーンは継続、マスクは自動保存）</td></tr>
-          <tr><td><kbd>B</kbd> / <kbd>L</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>I</kbd></td><td>ツール切替: 筆 / 囲み / 縦線 / 横線 / 直線</td></tr>
+          <tr><td><kbd>S</kbd> / <kbd>B</kbd> / <kbd>L</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>I</kbd></td><td>ツール切替: 選択 / 筆 / 囲み / 縦線 / 横線 / 直線</td></tr>
           <tr><td><kbd>D</kbd> / <kbd>F</kbd></td><td>描画モード / 消去モードに切替</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo（最大 20 手）</td></tr>
           <tr><td>矢印キー</td><td>マスク全体 (or 選択ベクタ) を 1 px 平行移動</td></tr>
           <tr><td><kbd>Shift</kbd>+矢印</td><td>同じく 10 px 平行移動</td></tr>
           <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>±0.1° 回転 (画像中心 or 選択ベクタ中心)</td></tr>
-          <tr><td><kbd>Shift</kbd>+<kbd>[</kbd> / <kbd>]</kbd></td><td>±1° 回転</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd></td><td>±1° 回転</td></tr>
           <tr><td><kbd>Del</kbd></td><td>選択中のベクタオブジェクトを削除</td></tr>
           <tr><td><kbd>Shift</kbd>+ドラッグ</td><td>筆・直線→太さ変更、縦線・横線→位置／傾き調整、ベクタ選択中→回転・太さ</td></tr>
           <tr><td>マウスホイール</td><td>筆・直線ツール時は太さ変更（その他ツール時は無効）</td></tr>
