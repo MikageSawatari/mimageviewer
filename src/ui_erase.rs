@@ -609,7 +609,7 @@ impl App {
         pointer_pos: Option<egui::Pos2>,
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
-        shift_held: bool,
+        ctrl_held: bool,
     ) {
         let Some(screen) = pointer_pos else { return; };
         let Some((total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else { return; };
@@ -623,10 +623,10 @@ impl App {
 
         // Shift キーが途中で切り替わったらモード遷移 (Pan ⇄ ShiftAdjust)
         let new_drag = match drag {
-            EraseVectorDrag::Pan { index, base, origin } if shift_held => {
+            EraseVectorDrag::Pan { index, base, origin } if ctrl_held => {
                 EraseVectorDrag::ShiftAdjust { index, base, origin }
             }
-            EraseVectorDrag::ShiftAdjust { index, base, origin } if !shift_held => {
+            EraseVectorDrag::ShiftAdjust { index, base, origin } if !ctrl_held => {
                 EraseVectorDrag::Pan { index, base, origin }
             }
             _ => drag,
@@ -705,7 +705,9 @@ impl App {
             }
         }
 
-        let shift_held = ctx.input(|i| i.modifiers.shift);
+        // 修飾キーは Ctrl で統一: [/] キーは Shift+ が論理キー {/} に化ける制約があり
+        // 回転系を Ctrl にしたため、パン・ツール時のフィット調整もすべて Ctrl に揃える。
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 
         // ── ベクタオブジェクト編集パス (選択ツール時のみ) ───────────
         // 選択ツール中はドロー系の操作を行わず、クリック=選択/ドラッグ=編集 に徹する。
@@ -721,7 +723,7 @@ impl App {
                         let base = self.erase_vectors[hit_idx];
                         self.erase_vector_drag = Some(if let Some(which_p1) = hit_endpoint {
                             EraseVectorDrag::Endpoint { index: hit_idx, base, which_p1 }
-                        } else if shift_held {
+                        } else if ctrl_held {
                             EraseVectorDrag::ShiftAdjust { index: hit_idx, base, origin: img_pos }
                         } else {
                             EraseVectorDrag::Pan { index: hit_idx, base, origin: img_pos }
@@ -737,7 +739,7 @@ impl App {
                 }
             }
             if self.erase_vector_drag.is_some() {
-                self.update_vector_drag(pointer_pos, full_rect, zoom_pan, shift_held);
+                self.update_vector_drag(pointer_pos, full_rect, zoom_pan, ctrl_held);
                 if primary_released {
                     self.erase_vector_drag = None;
                 }
@@ -761,7 +763,7 @@ impl App {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
-                            if shift_held {
+                            if ctrl_held {
                                 // 右/下方向で拡大、左/上方向で縮小
                                 let base_radius = match self.erase_shift_drag {
                                     Some(ShiftDragState::BrushSize { base_radius, .. }) => base_radius,
@@ -824,13 +826,13 @@ impl App {
             }
             EraseTool::VertLine => {
                 self.handle_line_tool_paint(
-                    primary_down, primary_released, pointer_pos, shift_held, paint,
+                    primary_down, primary_released, pointer_pos, ctrl_held, paint,
                     full_rect, zoom_pan, true,
                 );
             }
             EraseTool::HorizLine => {
                 self.handle_line_tool_paint(
-                    primary_down, primary_released, pointer_pos, shift_held, paint,
+                    primary_down, primary_released, pointer_pos, ctrl_held, paint,
                     full_rect, zoom_pan, false,
                 );
             }
@@ -841,7 +843,7 @@ impl App {
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
-                            if shift_held {
+                            if ctrl_held {
                                 // Shift+ドラッグ: カーソルから線への垂直距離で線幅を変更
                                 // 線 (erase_line_start → erase_line_end) は shift 開始直前に確定済み
                                 if let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) {
@@ -900,7 +902,7 @@ impl App {
         primary_down: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
-        shift_held: bool,
+        ctrl_held: bool,
         paint: bool,
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
@@ -913,7 +915,7 @@ impl App {
                         self.erase_line_start = Some(img_pos);
                         self.erase_line_tilt = 0.0;
                     }
-                    if shift_held {
+                    if ctrl_held {
                         let (base_tilt, base_start, base_end) = match self.erase_shift_drag {
                             Some(ShiftDragState::LineAdjust { base_tilt, base_start, base_end, .. }) => {
                                 (base_tilt, base_start, base_end)
@@ -1511,9 +1513,9 @@ impl App {
         // ── ヘルプテキスト ──
         let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
                     矢印:シフト [/]:回転 (Ctrl:10倍)\n\
-                    選択ツール+ベクタ: ドラッグ=移動\n\
-                    \u{00A0}Shift+ドラッグ 縦=回転 横=太さ\n\
-                    \u{00A0}Del:削除";
+                    Ctrl+ドラッグ: 筆/直線→太さ\n\
+                    \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
+                    選択ツール+クリック=選択  Del:削除";
         child.painter().text(
             egui::pos2(x0, y),
             egui::Align2::LEFT_TOP,
