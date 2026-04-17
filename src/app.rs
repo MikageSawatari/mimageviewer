@@ -655,6 +655,9 @@ pub struct App {
     pub(crate) ime_last_event_at: Option<std::time::Instant>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
+    /// フルスクリーン境界ヒント: (末尾到達=true/先頭到達=false, 表示開始時刻)
+    /// 最後/最初の画像でさらに進もう/戻ろうとしたときに画面中央に出すオーバーレイ。
+    pub(crate) fs_boundary_hint: Option<(bool, std::time::Instant)>,
 
     // ── 消しゴム (Erase) モード ───────────────────────────────────
     /// E キーで切り替える消しゴムモード
@@ -887,6 +890,7 @@ impl Default for App {
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
+            fs_boundary_hint: None,
 
             // 消しゴムモード
             erase_mode: false,

@@ -156,7 +156,7 @@ impl App {
     /// 消しゴムモード中のキー入力を処理する。
     /// 通常のフルスクリーンショートカットをブロックし、消しゴム専用キーのみ有効にする。
     pub(crate) fn handle_erase_keys(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
-        let action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None };
+        let action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None, jump_to: None };
 
         // ESC: 消しゴムモード終了 (フルスクリーンは閉じない)
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));

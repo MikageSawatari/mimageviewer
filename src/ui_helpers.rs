@@ -384,6 +384,27 @@ pub fn adjacent_navigable_idx(
     }
 }
 
+/// `visible_indices` の中の「ナビゲーション可能」なアイテム列から、
+/// 末尾 (`last=true`) または先頭 (`last=false`) の item index を返す。
+/// `adjacent_navigable_idx` と同じフィルタを適用する。
+pub fn boundary_navigable_idx(
+    items: &[GridItem],
+    visible_indices: &[usize],
+    last: bool,
+) -> Option<usize> {
+    let mut iter = visible_indices.iter().copied().filter(|&i| {
+        matches!(
+            items.get(i),
+            Some(GridItem::Image(_))
+                | Some(GridItem::Video(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::ZipSeparator { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    });
+    if last { iter.last() } else { iter.next() }
+}
+
 // -----------------------------------------------------------------------
 // 外部連携
 // -----------------------------------------------------------------------

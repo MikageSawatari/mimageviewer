@@ -44,6 +44,8 @@ const CHECKMARK_MARGIN: f32 = 16.0;
 const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
 /// フィードバックトースト表示時間（秒）
 const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+/// 境界ヒント（最初/最後の画像に達した案内）の表示時間（秒）
+const BOUNDARY_HINT_DURATION: f32 = 2.5;
 
 // ── 見開きペアリング ──────────────────────────────────────────────────────
 
@@ -193,6 +195,8 @@ pub(crate) struct FsKeyAction {
     pub(crate) close: bool,
     pub(crate) nav_delta: i32,
     pub(crate) ctrl_nav: Option<i32>,
+    /// Home/End などの絶対ジャンプ先 item index
+    pub(crate) jump_to: Option<usize>,
 }
 
 impl App {
@@ -255,6 +259,10 @@ impl App {
         let mut close_fs = false;
         let mut nav_delta: i32 = 0;
         let mut ctrl_nav: Option<i32> = None;
+        let mut jump_to: Option<usize> = None;
+        // 境界ヒントをフレーム内イベントで打ち切るための状態
+        let hint_start_before = self.fs_boundary_hint.map(|(_, t)| t);
+        let mut had_user_input_in_frame = false;
 
         // ── ビューポート構築 ──
         let fs_builder = self.build_fullscreen_viewport_builder();
@@ -272,6 +280,19 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
 
+                // 境界ヒントを即座に消すため、このフレームに「操作」があったかを
+                // event consume される前に捕捉する。マウス移動は除外。
+                if self.fs_boundary_hint.is_some() {
+                    had_user_input_in_frame = ctx.input(|i| {
+                        i.events.iter().any(|e| matches!(
+                            e,
+                            egui::Event::Key { pressed: true, .. }
+                                | egui::Event::PointerButton { pressed: true, .. }
+                                | egui::Event::MouseWheel { .. }
+                        ))
+                    });
+                }
+
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close_fs = true;
                 }
@@ -286,6 +307,7 @@ impl App {
                         if key_action.close { close_fs = true; }
                         nav_delta = key_action.nav_delta;
                         ctrl_nav = key_action.ctrl_nav;
+                        jump_to = key_action.jump_to;
                         // perf: キー起因のナビはここで input_seq を進める
                         if nav_delta != 0 {
                             self.bump_input_seq("fs_key", Some(&format!("delta={nav_delta}")));
@@ -540,6 +562,9 @@ impl App {
                         // ── 右上フィードバックトースト ──
                         self.draw_feedback_toast(ui, full_rect, ctx);
 
+                        // ── 中央の境界ヒント (最初/最後の画像です…) ──
+                        self.draw_boundary_hint(ui, full_rect, ctx);
+
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
 
@@ -560,7 +585,18 @@ impl App {
         self.fs_viewport_shown = true;
 
         // ── ナビゲーション & スライドショー処理 ──
-        self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, fs_idx);
+        self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, jump_to, fs_idx);
+
+        // 境界ヒント即時消去: このフレームにキー/クリック/ホイール操作があり、
+        // かつ handle_fs_navigation でヒントが再設定されていない (= 境界でない
+        // 方向への移動、別キー入力、等) なら直ちに消す。
+        // 再設定されていた場合 (= 引き続き境界に突き当たった) は残す。
+        if had_user_input_in_frame {
+            let hint_now = self.fs_boundary_hint.map(|(_, t)| t);
+            if hint_now.is_some() && hint_now == hint_start_before {
+                self.fs_boundary_hint = None;
+            }
+        }
         self.handle_fs_repaint(ctx, fs_idx, state.is_video);
     }
 
@@ -827,7 +863,7 @@ impl App {
         is_spread_double: bool,
     ) -> FsKeyAction {
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        let mut action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None };
+        let mut action = FsKeyAction { close: false, nav_delta: 0, ctrl_nav: None, jump_to: None };
 
         if !has_focus { return action; }
         // モーダルダイアログ表示中はキー入力を奪わない
@@ -864,6 +900,8 @@ impl App {
             i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
             || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
         });
+        let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
+        let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
         let key_i = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::I)
             || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
@@ -1102,6 +1140,32 @@ impl App {
         }
         if ctrl_d { action.ctrl_nav = Some(1); }
         if ctrl_u { action.ctrl_nav = Some(-1); }
+
+        // Home/End: 最初/最後の画像へ絶対ジャンプ
+        if key_home {
+            if let Some(first) = crate::ui_helpers::boundary_navigable_idx(
+                &self.items, &self.visible_indices, false,
+            ) {
+                if first != fs_idx {
+                    action.jump_to = Some(first);
+                    self.slideshow_playing = false;
+                } else {
+                    self.fs_boundary_hint = Some((false, std::time::Instant::now()));
+                }
+            }
+        }
+        if key_end {
+            if let Some(last) = crate::ui_helpers::boundary_navigable_idx(
+                &self.items, &self.visible_indices, true,
+            ) {
+                if last != fs_idx {
+                    action.jump_to = Some(last);
+                    self.slideshow_playing = false;
+                } else {
+                    self.fs_boundary_hint = Some((true, std::time::Instant::now()));
+                }
+            }
+        }
 
         action
     }
@@ -1359,6 +1423,7 @@ impl App {
         close_fs: bool,
         ctrl_nav: Option<i32>,
         nav_delta: i32,
+        jump_to: Option<usize>,
         fs_idx: usize,
     ) {
         if close_fs {
@@ -1378,19 +1443,29 @@ impl App {
                 let forward = delta > 0;
                 self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
             }
-        } else if !close_fs && nav_delta != 0 {
-            if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
-                &self.items, &self.visible_indices, fs_idx, nav_delta,
-            ) {
+        } else if !close_fs {
+            if let Some(new_idx) = jump_to {
+                // Home/End: 絶対ジャンプ。境界に達しているかは呼び出し側で判定済み。
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
-            } else {
-                crate::logger::log(format!(
-                    "[NAV] adjacent_navigable_idx returned None: fs_idx={fs_idx}, delta={nav_delta}, items={}, visible={}",
-                    self.items.len(), self.visible_indices.len()
-                ));
+            } else if nav_delta != 0 {
+                if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
+                    &self.items, &self.visible_indices, fs_idx, nav_delta,
+                ) {
+                    self.open_fullscreen(new_idx);
+                    self.selected = Some(new_idx);
+                    self.scroll_to_selected = true;
+                    self.update_last_selected_image();
+                } else {
+                    // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
+                    self.fs_boundary_hint = Some((nav_delta > 0, std::time::Instant::now()));
+                    crate::logger::log(format!(
+                        "[NAV] adjacent_navigable_idx returned None: fs_idx={fs_idx}, delta={nav_delta}, items={}, visible={}",
+                        self.items.len(), self.visible_indices.len()
+                    ));
+                }
             }
         }
 
@@ -2637,6 +2712,96 @@ impl App {
         );
 
         // フェードアウト中は 30fps で再描画
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    /// 画面中央に境界ヒント (最初/最後の画像です…) を描画する。
+    fn draw_boundary_hint(&mut self, ui: &mut egui::Ui, full_rect: egui::Rect, ctx: &egui::Context) {
+        let Some((at_end, start_time)) = self.fs_boundary_hint else { return; };
+        let elapsed = start_time.elapsed().as_secs_f32();
+        if elapsed > BOUNDARY_HINT_DURATION {
+            self.fs_boundary_hint = None;
+            return;
+        }
+
+        // フェードアウト (最後の 0.4 秒)
+        let alpha = if elapsed > BOUNDARY_HINT_DURATION - 0.4 {
+            ((BOUNDARY_HINT_DURATION - elapsed) / 0.4).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        let (title, key1_label, key1_desc, key2_label, key2_desc) = if at_end {
+            ("最後の画像です", "Home", "最初に戻る", "Ctrl]+[↓", "次のフォルダへ")
+        } else {
+            ("最初の画像です", "End", "最後に移動", "Ctrl]+[↑", "前のフォルダへ")
+        };
+
+        let title_font = egui::FontId::proportional(32.0);
+        let body_font = egui::FontId::proportional(22.0);
+        let white = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8);
+        let accent = egui::Color32::from_rgba_unmultiplied(255, 220, 120, (alpha * 255.0) as u8);
+
+        // 各行のレイアウト
+        let painter = ui.painter();
+        let title_galley = painter.layout_no_wrap(title.to_string(), title_font.clone(), white);
+        let line1 = format!("[{}] {}", key1_label, key1_desc);
+        let line2 = format!("[{}] {}", key2_label, key2_desc);
+        let line1_galley = painter.layout_no_wrap(line1.clone(), body_font.clone(), white);
+        let line2_galley = painter.layout_no_wrap(line2.clone(), body_font.clone(), white);
+
+        let line_gap = 10.0;
+        let padding = egui::vec2(32.0, 24.0);
+        let content_w = title_galley.size().x
+            .max(line1_galley.size().x)
+            .max(line2_galley.size().x);
+        let content_h = title_galley.size().y
+            + line_gap * 1.5
+            + line1_galley.size().y
+            + line_gap
+            + line2_galley.size().y;
+        let box_size = egui::vec2(content_w, content_h) + padding * 2.0;
+
+        let center = full_rect.center();
+        let box_rect = egui::Rect::from_center_size(center, box_size);
+
+        let bg_alpha = (alpha * 210.0) as u8;
+        painter.rect_filled(
+            box_rect, 12.0,
+            egui::Color32::from_rgba_unmultiplied(20, 20, 20, bg_alpha),
+        );
+        painter.rect_stroke(
+            box_rect, 12.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(200, 200, 200, (alpha * 120.0) as u8)),
+            egui::StrokeKind::Outside,
+        );
+
+        // 本文を上から順に中央揃えで描画
+        let mut y = box_rect.min.y + padding.y;
+        painter.text(
+            egui::pos2(center.x, y),
+            egui::Align2::CENTER_TOP,
+            title,
+            title_font,
+            accent,
+        );
+        y += title_galley.size().y + line_gap * 1.5;
+        painter.text(
+            egui::pos2(center.x, y),
+            egui::Align2::CENTER_TOP,
+            line1,
+            body_font.clone(),
+            white,
+        );
+        y += line1_galley.size().y + line_gap;
+        painter.text(
+            egui::pos2(center.x, y),
+            egui::Align2::CENTER_TOP,
+            line2,
+            body_font,
+            white,
+        );
+
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
