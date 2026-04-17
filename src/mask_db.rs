@@ -2,6 +2,9 @@
 //!
 //! `%APPDATA%/mimageviewer/mask.db` にマスク情報を保存する。
 //! マスクは 1bit/pixel にパックし、deflate 圧縮して BLOB に格納する。
+//!
+//! 縦線/横線/直線はベクタオブジェクト (`LineObject`) として `vectors` 列に
+//! JSON 文字列で保存する。囲み/筆はビットマップ側にラスタライズ済み。
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -9,6 +12,126 @@ use std::path::PathBuf;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use serde::{Deserialize, Serialize};
+
+/// ベクタ線オブジェクトの種別。作成時のツールで決まる。
+/// 作成時の挙動 (初期幾何) のみに影響し、保存後の編集では区別しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineKind {
+    #[serde(rename = "vert")]
+    Vertical,
+    #[serde(rename = "horiz")]
+    Horizontal,
+    #[serde(rename = "diag")]
+    Diagonal,
+}
+
+/// 1 本のベクタ線オブジェクト。
+///
+/// `p0` → `p1` を結ぶ中心軸に沿った、厚さ `thickness` の矩形としてラスタライズする。
+/// 縦/横線も内部的にはこの形式で保存し、rasterize 時に差異はない。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LineObject {
+    pub kind: LineKind,
+    pub p0: (f32, f32),
+    pub p1: (f32, f32),
+    pub thickness: f32,
+}
+
+impl LineObject {
+    /// オブジェクトの中心点 (回転基準)。
+    pub fn center(&self) -> (f32, f32) {
+        ((self.p0.0 + self.p1.0) * 0.5, (self.p0.1 + self.p1.1) * 0.5)
+    }
+
+    /// オブジェクトを (dx, dy) だけ平行移動する。
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        self.p0.0 += dx;
+        self.p0.1 += dy;
+        self.p1.0 += dx;
+        self.p1.1 += dy;
+    }
+
+    /// 指定中心周りに `angle` [rad] 回転する。
+    pub fn rotate_around(&mut self, cx: f32, cy: f32, angle: f32) {
+        let (s, c) = angle.sin_cos();
+        let rot = |p: (f32, f32)| -> (f32, f32) {
+            let dx = p.0 - cx;
+            let dy = p.1 - cy;
+            (cx + dx * c - dy * s, cy + dx * s + dy * c)
+        };
+        self.p0 = rot(self.p0);
+        self.p1 = rot(self.p1);
+    }
+
+    /// 4 隅の矩形コーナーを返す (ラスタライズ/ヒットテスト用)。
+    /// `extra_thickness` は判定に少し余裕を持たせる用途。
+    pub fn corners(&self, extra_thickness: f32) -> [(f32, f32); 4] {
+        let dx = self.p1.0 - self.p0.0;
+        let dy = self.p1.1 - self.p0.1;
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        let nx = -dy / len;
+        let ny = dx / len;
+        let half = (self.thickness * 0.5 + extra_thickness).max(0.0);
+        [
+            (self.p0.0 + nx * half, self.p0.1 + ny * half),
+            (self.p1.0 + nx * half, self.p1.1 + ny * half),
+            (self.p1.0 - nx * half, self.p1.1 - ny * half),
+            (self.p0.0 - nx * half, self.p0.1 - ny * half),
+        ]
+    }
+}
+
+/// ベクタ群を既存の 1bit マスク上にラスタライズする (in-place OR)。
+pub fn rasterize_vectors_into(mask: &mut [bool], vectors: &[LineObject], w: usize, h: usize) {
+    for v in vectors {
+        paint_line_rect(mask, v, w, h);
+    }
+}
+
+fn paint_line_rect(mask: &mut [bool], v: &LineObject, w: usize, h: usize) {
+    let pts = v.corners(0.0);
+    // スキャンライン充填 (ポリゴン塗り)。
+    let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).max(0.0) as usize;
+    let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).min(h as f32) as usize;
+    let n = pts.len();
+    let mut intersections = Vec::with_capacity(8);
+    for y in min_y..max_y {
+        let scan_y = y as f32 + 0.5;
+        intersections.clear();
+        for i in 0..n {
+            let (x0, y0) = pts[i];
+            let (x1, y1) = pts[(i + 1) % n];
+            if (y0 <= scan_y && y1 > scan_y) || (y1 <= scan_y && y0 > scan_y) {
+                let t = (scan_y - y0) / (y1 - y0);
+                intersections.push(x0 + t * (x1 - x0));
+            }
+        }
+        intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for pair in intersections.chunks(2) {
+            if pair.len() == 2 {
+                let px0 = (pair[0].max(0.0) as usize).min(w);
+                let px1 = (pair[1].max(0.0).ceil() as usize).min(w);
+                for px in px0..px1 {
+                    mask[y * w + px] = true;
+                }
+            }
+        }
+    }
+}
+
+/// ベクタ群を JSON 文字列にシリアライズする。空なら None。
+pub fn vectors_to_json(vectors: &[LineObject]) -> Option<String> {
+    if vectors.is_empty() {
+        return None;
+    }
+    serde_json::to_string(vectors).ok()
+}
+
+/// JSON 文字列からベクタ群をデシリアライズする。失敗時は空。
+pub fn vectors_from_json(s: &str) -> Vec<LineObject> {
+    serde_json::from_str(s).unwrap_or_default()
+}
 
 /// マスク永続化 DB。
 pub struct MaskDb {
@@ -31,9 +154,13 @@ impl MaskDb {
                 path       TEXT PRIMARY KEY,
                 mask_data  BLOB    NOT NULL,
                 width      INTEGER NOT NULL,
-                height     INTEGER NOT NULL
+                height     INTEGER NOT NULL,
+                vectors    TEXT
             )",
         )?;
+        // 既存 DB には vectors 列が無い可能性があるので ALTER で追加する。
+        // 既に列があればエラーになるが無視する。
+        let _ = conn.execute("ALTER TABLE masks ADD COLUMN vectors TEXT", []);
         Ok(Self { conn })
     }
 
@@ -41,36 +168,69 @@ impl MaskDb {
         crate::data_dir::get().join("mask.db")
     }
 
-    /// マスクを取得する。未登録なら None。
-    /// 画像サイズが保存時と異なる場合（PDF再レンダリング等）はリスケールする。
+    /// マスク (ビットマップのみ) を取得する。互換用。
     pub fn get(&self, key: &str, expected_w: usize, expected_h: usize) -> Option<Vec<bool>> {
-        let mut stmt = self.conn
-            .prepare_cached("SELECT mask_data, width, height FROM masks WHERE path = ?1")
-            .ok()?;
-        let (blob, w, h): (Vec<u8>, usize, usize) = stmt.query_row([key], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)? as usize,
-                row.get::<_, i64>(2)? as usize,
-            ))
-        }).ok()?;
-
-        let mask = decompress_mask(&blob, w, h)?;
-
-        if w == expected_w && h == expected_h {
-            Some(mask)
-        } else {
-            // サイズが異なる → 最近傍法でリスケール
-            Some(rescale_mask(&mask, w, h, expected_w, expected_h))
-        }
+        self.get_full(key, expected_w, expected_h).map(|(m, _)| m)
     }
 
-    /// マスクを保存する。全て false なら削除する。
-    pub fn set(&self, key: &str, mask: &[bool], w: usize, h: usize) -> rusqlite::Result<()> {
-        if !mask.iter().any(|&m| m) {
+    /// マスクとベクタ群をまとめて取得する。
+    /// 画像サイズが保存時と異なる場合 (PDF 再レンダリング等) はビットマップをリスケールし、
+    /// ベクタ座標も比率で伸縮する。
+    pub fn get_full(
+        &self,
+        key: &str,
+        expected_w: usize,
+        expected_h: usize,
+    ) -> Option<(Vec<bool>, Vec<LineObject>)> {
+        let mut stmt = self.conn
+            .prepare_cached("SELECT mask_data, width, height, vectors FROM masks WHERE path = ?1")
+            .ok()?;
+        let (blob, w, h, vectors_json): (Vec<u8>, usize, usize, Option<String>) =
+            stmt.query_row([key], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            }).ok()?;
+
+        let mut mask = decompress_mask(&blob, w, h)?;
+        let mut vectors = vectors_json
+            .as_deref()
+            .map(vectors_from_json)
+            .unwrap_or_default();
+
+        if w != expected_w || h != expected_h {
+            mask = rescale_mask(&mask, w, h, expected_w, expected_h);
+            let sx = expected_w as f32 / w.max(1) as f32;
+            let sy = expected_h as f32 / h.max(1) as f32;
+            for v in &mut vectors {
+                v.p0.0 *= sx;
+                v.p0.1 *= sy;
+                v.p1.0 *= sx;
+                v.p1.1 *= sy;
+                // 幅は縦横スケールの平均で伸縮
+                v.thickness *= (sx + sy) * 0.5;
+            }
+        }
+        Some((mask, vectors))
+    }
+
+    /// マスク＋ベクタを保存する。ビットマップが全 false でベクタも空なら削除する。
+    pub fn set(
+        &self,
+        key: &str,
+        mask: &[bool],
+        vectors: &[LineObject],
+        w: usize,
+        h: usize,
+    ) -> rusqlite::Result<()> {
+        let bitmap_empty = !mask.iter().any(|&m| m);
+        if bitmap_empty && vectors.is_empty() {
             return self.delete(key);
         }
-        self.upsert_mask(key, mask, w, h)
+        self.upsert_mask(key, mask, vectors, w, h)
     }
 
     /// マスクを削除する。
@@ -79,34 +239,68 @@ impl MaskDb {
         Ok(())
     }
 
-    /// 名前付きスロットにマスクを保存する。`set` と異なり全 false でも保存する。
-    pub fn set_slot(&self, slot: usize, mask: &[bool], w: usize, h: usize) -> rusqlite::Result<()> {
-        self.upsert_mask(&slot_key(slot), mask, w, h)
+    /// 名前付きスロットにマスクを保存する。`set` と異なりビットマップ全 false でも保存する。
+    pub fn set_slot(
+        &self,
+        slot: usize,
+        mask: &[bool],
+        vectors: &[LineObject],
+        w: usize,
+        h: usize,
+    ) -> rusqlite::Result<()> {
+        self.upsert_mask(&slot_key(slot), mask, vectors, w, h)
     }
 
     /// 既に 1bit/pixel + deflate 圧縮済みの生バイト列を直接保存する。
     /// サイドカー (mimageviewer.dat) からのインポート時に使用する (再圧縮を避ける)。
-    pub fn set_raw(&self, key: &str, compressed: &[u8], w: usize, h: usize) -> rusqlite::Result<()> {
+    pub fn set_raw(
+        &self,
+        key: &str,
+        compressed: &[u8],
+        vectors_json: Option<&str>,
+        w: usize,
+        h: usize,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO masks (path, mask_data, width, height) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4",
-            rusqlite::params![key, compressed, w as i64, h as i64],
+            "INSERT INTO masks (path, mask_data, width, height, vectors)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4, vectors = ?5",
+            rusqlite::params![key, compressed, w as i64, h as i64, vectors_json],
         )?;
         Ok(())
     }
 
 
-    /// 名前付きスロットからマスクを取得する。サイズが異なる場合は自動リスケール。
+    /// 名前付きスロットからマスク (ビットマップのみ) を取得する。互換用。
     pub fn get_slot(&self, slot: usize, expected_w: usize, expected_h: usize) -> Option<Vec<bool>> {
         self.get(&slot_key(slot), expected_w, expected_h)
     }
 
-    fn upsert_mask(&self, key: &str, mask: &[bool], w: usize, h: usize) -> rusqlite::Result<()> {
+    /// 名前付きスロットからマスクとベクタ群を取得する。
+    pub fn get_slot_full(
+        &self,
+        slot: usize,
+        expected_w: usize,
+        expected_h: usize,
+    ) -> Option<(Vec<bool>, Vec<LineObject>)> {
+        self.get_full(&slot_key(slot), expected_w, expected_h)
+    }
+
+    fn upsert_mask(
+        &self,
+        key: &str,
+        mask: &[bool],
+        vectors: &[LineObject],
+        w: usize,
+        h: usize,
+    ) -> rusqlite::Result<()> {
         let blob = compress_mask(mask);
+        let vectors_json = vectors_to_json(vectors);
         self.conn.execute(
-            "INSERT INTO masks (path, mask_data, width, height) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4",
-            rusqlite::params![key, blob, w as i64, h as i64],
+            "INSERT INTO masks (path, mask_data, width, height, vectors)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4, vectors = ?5",
+            rusqlite::params![key, blob, w as i64, h as i64, vectors_json],
         )?;
         Ok(())
     }
@@ -205,5 +399,29 @@ mod tests {
         let compressed = compress_mask(&mask);
         let decompressed = decompress_mask(&compressed, 512, 512).unwrap();
         assert_eq!(mask, decompressed);
+    }
+
+    #[test]
+    fn vector_rasterize_and_serialize() {
+        let v = LineObject {
+            kind: LineKind::Diagonal,
+            p0: (10.0, 10.0),
+            p1: (90.0, 10.0),
+            thickness: 4.0,
+        };
+        let json = vectors_to_json(&[v]).unwrap();
+        let back = vectors_from_json(&json);
+        assert_eq!(back.len(), 1);
+
+        let mut mask = vec![false; 100 * 20];
+        rasterize_vectors_into(&mut mask, &[v], 100, 20);
+        // 中心軸 y=10, thickness=4 → y=8..12 の範囲で x=10..90 が塗られているはず
+        assert!(mask[10 * 100 + 50]);
+        assert!(!mask[0 * 100 + 50]);
+    }
+
+    #[test]
+    fn empty_vectors_serialize_to_none() {
+        assert!(vectors_to_json(&[]).is_none());
     }
 }

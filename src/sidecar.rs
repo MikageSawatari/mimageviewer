@@ -35,6 +35,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::adjustment::AdjustParams;
+use crate::mask_db::LineObject;
 
 /// サイドカーファイル名。`.dat` は Windows 上で「アプリ内部データ」として広く認識される拡張子で、
 /// ユーザが誤って編集・削除する心理的ハードルが高い。
@@ -72,19 +73,23 @@ impl SidecarEntry {
 
 /// 1bit/pixel に packed + deflate 圧縮されたマスクデータの base64。
 /// mask_db と同じバイト列を base64 に掛けたもの。
+/// `vectors` は縦線/横線/直線のベクタオブジェクト (未指定 = なし)。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SidecarMask {
     pub w: u32,
     pub h: u32,
     pub data: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vectors: Vec<LineObject>,
 }
 
 impl SidecarMask {
-    pub fn from_raw(raw: &[u8], w: u32, h: u32) -> Self {
+    pub fn from_raw(raw: &[u8], vectors: &[LineObject], w: u32, h: u32) -> Self {
         Self {
             w,
             h,
             data: base64::engine::general_purpose::STANDARD.encode(raw),
+            vectors: vectors.to_vec(),
         }
     }
 
@@ -429,7 +434,8 @@ pub fn import_to_dbs(
             }
             if db.get(&abs_key, w, h).is_none() {
                 if let Some(raw) = mask.decode() {
-                    if db.set_raw(&abs_key, &raw, w, h).is_ok() {
+                    let vectors_json = crate::mask_db::vectors_to_json(&mask.vectors);
+                    if db.set_raw(&abs_key, &raw, vectors_json.as_deref(), w, h).is_ok() {
                         stats.imported_mask += 1;
                     }
                 }
@@ -512,7 +518,7 @@ mod tests {
     fn entry_empty_after_removing_both() {
         let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
         s.set_adjust("img.jpg", sample_params());
-        s.set_mask("img.jpg", SidecarMask { w: 2, h: 2, data: String::new() });
+        s.set_mask("img.jpg", SidecarMask { w: 2, h: 2, data: String::new(), vectors: Vec::new() });
         assert_eq!(s.items().len(), 1);
         s.remove_adjust("img.jpg");
         assert_eq!(s.items().len(), 1, "mask still present");
@@ -563,7 +569,7 @@ mod tests {
             s.set_adjust("img.jpg", sample_params());
             s.set_mask(
                 "book.zip::001.jpg",
-                SidecarMask::from_raw(&[1, 2, 3, 4], 8, 8),
+                SidecarMask::from_raw(&[1, 2, 3, 4], &[], 8, 8),
             );
             s.flush();
             assert!(!s.is_dirty());

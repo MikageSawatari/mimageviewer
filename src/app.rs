@@ -142,6 +142,47 @@ pub(crate) enum ShiftDragState {
     },
 }
 
+/// 消しゴムの Undo スタックに積むスナップショット。ビットマップとベクタの両方を持つ。
+#[derive(Debug, Clone)]
+pub(crate) struct EraseSnapshot {
+    pub mask: Vec<bool>,
+    pub vectors: Vec<crate::mask_db::LineObject>,
+}
+
+/// ベクタオブジェクト編集のドラッグ状態。
+/// `base` はドラッグ開始時の元オブジェクト、`origin` はそのときのカーソル画像座標。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EraseVectorDrag {
+    /// オブジェクト全体を平行移動。
+    Pan {
+        index: usize,
+        base: crate::mask_db::LineObject,
+        origin: (f32, f32),
+    },
+    /// Shift+ドラッグ: 垂直成分を回転、水平成分を太さ変更に割り当てる。
+    ShiftAdjust {
+        index: usize,
+        base: crate::mask_db::LineObject,
+        origin: (f32, f32),
+    },
+    /// 直線の始点/終点ドラッグ。`which_p1=true` で p1、false で p0。
+    Endpoint {
+        index: usize,
+        base: crate::mask_db::LineObject,
+        which_p1: bool,
+    },
+}
+
+impl EraseVectorDrag {
+    pub(crate) fn index(&self) -> usize {
+        match self {
+            EraseVectorDrag::Pan { index, .. }
+            | EraseVectorDrag::ShiftAdjust { index, .. }
+            | EraseVectorDrag::Endpoint { index, .. } => *index,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
 // -----------------------------------------------------------------------
@@ -694,8 +735,15 @@ pub struct App {
     pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
-    /// 消しゴムの Undo スタック (マスクのスナップショット、最大 20 エントリ)
-    pub(crate) erase_undo_stack: std::collections::VecDeque<Vec<bool>>,
+    /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
+    pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
+    /// 縦線/横線/直線のベクタオブジェクト群 (消しゴムモード中のみ有効)。
+    /// 筆/囲みは `erase_mask` 側に直接ラスタライズされる。
+    pub(crate) erase_vectors: Vec<crate::mask_db::LineObject>,
+    /// 選択中のベクタオブジェクトインデックス (`erase_vectors` への添字)。
+    pub(crate) erase_selected_vector: Option<usize>,
+    /// ベクタオブジェクト編集のドラッグ状態。
+    pub(crate) erase_vector_drag: Option<EraseVectorDrag>,
 
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
@@ -914,6 +962,9 @@ impl Default for App {
             erase_base_cache: std::collections::HashMap::new(),
             mask_db: crate::mask_db::MaskDb::open().ok(),
             erase_undo_stack: std::collections::VecDeque::new(),
+            erase_vectors: Vec::new(),
+            erase_selected_vector: None,
+            erase_vector_drag: None,
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
@@ -4613,22 +4664,32 @@ impl App {
         }
     }
 
-    /// マスクを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
-    /// `mask` が全て false なら DB から削除、サイドカーからも削除する (mask_db.set の仕様と揃える)。
-    pub(crate) fn save_mask_with_sidecar(&mut self, idx: usize, mask: &[bool], w: usize, h: usize) {
+    /// マスクとベクタを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
+    /// ビットマップが全 false かつベクタが空なら DB からもサイドカーからも削除する
+    /// (mask_db.set の仕様と揃える)。
+    pub(crate) fn save_mask_with_sidecar(
+        &mut self,
+        idx: usize,
+        mask: &[bool],
+        vectors: &[crate::mask_db::LineObject],
+        w: usize,
+        h: usize,
+    ) {
         let key = match self.page_path_key(idx) {
             Some(k) => k,
             None => return,
         };
-        let is_empty = !mask.iter().any(|&m| m);
+        let bitmap_empty = !mask.iter().any(|&m| m);
+        let is_empty = bitmap_empty && vectors.is_empty();
         if let Some(db) = &self.mask_db {
-            let _ = db.set(&key, mask, w, h);
+            let _ = db.set(&key, mask, vectors, w, h);
         }
         if is_empty {
             self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
         } else {
             let sidecar_mask = crate::sidecar::SidecarMask::from_raw(
                 &crate::mask_db::compress_mask(mask),
+                vectors,
                 w as u32,
                 h as u32,
             );
