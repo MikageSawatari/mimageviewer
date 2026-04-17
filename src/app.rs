@@ -4830,10 +4830,19 @@ impl App {
 
     /// 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに同じパラメータを適用する。
     /// `params` がグローバルと等価なら個別設定は削除され、全画像が標準設定に戻る。
-    /// AI キャッシュは保持 (色系のみ触る使い方が多い想定、AI 変更時はユーザが U/N で別途調整)。
+    /// 書換の前後で AI 設定 (upscale/denoise) が変わったページは ai_upscale_cache /
+    /// failed / pending もクリアして、次フレームで再実行されるようにする。
     pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
         let (indices, keys) = self.collect_image_page_keys();
         let sidecar_coords = self.collect_image_sidecar_coords();
+        // 書換後の effective params は全画像ページで `params` になる
+        // (matches_global 時は個別削除 → global フォールバック = params、それ以外は params を直接保存)。
+        // 書換前に AI 設定が異なるページを拾っておく。
+        let ai_changed_indices: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|idx| !self.effective_params(*idx).ai_settings_eq(&params))
+            .collect();
         let matches_global = params == self.settings.global_preset;
         if matches_global {
             for idx in &indices {
@@ -4861,12 +4870,20 @@ impl App {
             }
         }
         self.adjustment_cache.clear();
+        self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
     /// 現在の一覧の全画像ページから個別設定を削除する (= 全画像を標準設定に戻す)。
+    /// 個別解除で AI 設定が global に戻って変わるページは AI キャッシュもクリアする。
     pub(crate) fn clear_all_page_params(&mut self) {
         let (indices, keys) = self.collect_image_page_keys();
         let sidecar_coords = self.collect_image_sidecar_coords();
+        let global = self.settings.global_preset.clone();
+        let ai_changed_indices: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|idx| !self.effective_params(*idx).ai_settings_eq(&global))
+            .collect();
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
@@ -4879,14 +4896,33 @@ impl App {
             }
         }
         self.adjustment_cache.clear();
+        self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
     /// 指定パラメータを settings.global_preset にコピーして保存する。
+    /// global の AI 設定が変わった場合、個別設定を持たない (= global を継承している)
+    /// 画像ページの AI キャッシュもクリアして、新 global での再実行を促す。
     pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
+        let ai_changed = !self.settings.global_preset.ai_settings_eq(&params);
+        let ai_changed_indices: Vec<usize> = if ai_changed {
+            (0..self.items.len())
+                .filter(|idx| {
+                    matches!(
+                        self.items.get(*idx),
+                        Some(GridItem::Image(_))
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. })
+                    ) && !self.adjustment_page_params.contains_key(idx)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.settings.global_preset = params;
         self.settings.save();
         // グローバルが変わると、ページ個別を持たないページの表示が変わる
         self.adjustment_cache.clear();
+        self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
     /// 保存スロット slot_idx のパラメータを現在のフルスクリーンページに適用する。
@@ -4972,6 +5008,19 @@ impl App {
         self.ai_upscale_failed.clear();
         for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 指定された複数 idx について AI キャッシュ (ai_upscale_cache / failed / pending) を
+    /// まとめてクリアする。bulk / global 系の補正操作で「AI 設定が変わった idx だけ
+    /// AI 出力を再実行させたい」ときに使う。
+    pub(crate) fn clear_ai_caches_for_indices(&mut self, indices: &[usize]) {
+        for idx in indices {
+            self.ai_upscale_cache.remove(idx);
+            self.ai_upscale_failed.remove(idx);
+            if let Some((cancel, _)) = self.ai_upscale_pending.remove(idx) {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

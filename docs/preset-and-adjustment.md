@@ -151,8 +151,8 @@ AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
 | 色系パラメータ変更* (ページ個別) | 該当 idx のみクリア | 残す | 残す |
 | AI モデル変更 (ページ個別) | 全クリア | **全クリア** | **キャンセル** |
 | 保存スロット読込 → 現ページに適用 | 全クリア | AI モデルが異なれば全クリア | 同上 |
-| 「全画像に適用」 | 全クリア | 残す (注: AI 設定が変わる場合は U/N キー操作で別途対応) | — |
-| 「標準にする」 (global_preset 更新) | 全クリア | 残す | — |
+| 「全画像に適用」 / 「全画像から削除」 | 全クリア | AI 設定が変わる idx のみクリア + pending キャンセル | あり |
+| 「標準にする」 (global_preset 更新) | 全クリア | global の AI 設定が変わった場合、継承ページ (override なし) の idx をまとめてクリア + pending キャンセル | あり |
 | 「個別設定を解除」 (Ctrl+Backspace) | 該当 idx のみクリア | AI 設定が変わるなら該当 idx のみクリア + pending キャンセル | あり |
 | フォルダ切替 | 全クリア | 全クリア | キャンセル |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | クリアしない | — |
@@ -162,7 +162,7 @@ AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
 
 ### 4.1 ヘルパー関数
 
-`App` には 2 系統の無効化ヘルパーがある:
+`App` には 3 系統の無効化ヘルパーがある:
 
 ```rust
 fn clear_adjustment_caches(&mut self, idx: usize)
@@ -170,13 +170,19 @@ fn clear_adjustment_caches(&mut self, idx: usize)
 
 fn clear_all_adjustment_and_ai_caches(&mut self, idx: usize)
     // adjustment_cache[idx] + ai_upscale_cache 全クリア + ai_upscale_pending キャンセル
+    // (単一 idx 操作で AI モデル変更が起きたとき用)
+
+fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
+    // 指定 idx 群の ai_upscale_cache / failed / pending をまとめてクリア
+    // (bulk / global 系の操作で「AI 設定が変わった idx だけ」落とすとき用)
 ```
 
-AI モデル変更を伴う可能性がある操作は必ず後者を使う。
+単一 idx で AI モデル変更を伴う可能性がある操作は `clear_all_adjustment_and_ai_caches`、
+複数ページにまたがる操作は `clear_ai_caches_for_indices` を使う。
 
 `set_page_params` / `clear_page_params` / `apply_params_to_all_pages` /
-`copy_params_to_global` の実装内でも、必要に応じて `adjustment_cache` を
-クリアしている (全クリア vs 部分クリア)。詳細はソース参照。
+`clear_all_page_params` / `copy_params_to_global` の実装内でも、必要に応じて
+`adjustment_cache` をクリアしている (全クリア vs 部分クリア)。詳細はソース参照。
 
 特に `clear_page_params(idx)` は、削除後の effective params を見て
 **old.ai_settings_eq(new) が false なら** その `idx` の `ai_upscale_cache` /
@@ -184,6 +190,15 @@ AI モデル変更を伴う可能性がある操作は必ず後者を使う。
 「個別で AI OFF にしていたページから個別を解除しても、グローバルの AI が
 再実行されない」という不具合になる (実際、`ui_fullscreen.rs` から
 `Ctrl+Backspace` で解除した直後に上記不具合が発生していた)。
+
+同じ考え方を bulk / global 系にも横展開している:
+- `apply_params_to_all_pages(params)`: 書換前の各 idx の effective params と
+  `params` を `ai_settings_eq` で比較し、一致しない idx だけ AI キャッシュを落とす。
+- `clear_all_page_params()`: 個別削除後の effective params は global_preset になるため、
+  書換前の effective params と global を比較して差がある idx だけ落とす。
+- `copy_params_to_global(params)`: 旧 global と新 `params` を比較し、AI 設定が
+  変わった場合のみ「override を持たない (= global 継承) 画像ページ」を対象に落とす。
+  override を持つページは effective params が変わらないので触らない。
 
 ---
 
