@@ -1556,13 +1556,10 @@ impl App {
                     image_metas.push(Some((page.mtime, page.file_size as i64)));
                 }
 
-                // start_loading_items が内部で close_fullscreen を呼んで fs_nav_after_pdf_enumerate を
-                // リセットする可能性はないが、念のため先に取り出してから start_loading_items を呼ぶ。
-                let nav_intent = self.fs_nav_after_pdf_enumerate.take();
                 self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new());
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
-                if let Some(forward) = nav_intent {
+                if let Some(forward) = self.fs_nav_after_pdf_enumerate.take() {
                     if let Some(new_idx) = self.find_fullscreen_nav_target(forward) {
                         self.open_fullscreen(new_idx);
                         self.selected = Some(new_idx);
@@ -3014,11 +3011,17 @@ impl App {
                 self.load_folder(path);
                 // PDF は enumerate_pages_async が非同期なので、load_folder 直後は items が空。
                 // 結果は poll_pdf_enumerate が受信するので、そこで fullscreen を開き直す。
+                // find_fullscreen_nav_target も内部で load_folder を呼んで PDF に自動進入する
+                // ことがあるため、その前後の両方でチェックする。
                 if self.pdf_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
                     return;
                 }
                 let target_idx = self.find_fullscreen_nav_target(result.forward);
+                if self.pdf_enumerate_pending.is_some() {
+                    self.fs_nav_after_pdf_enumerate = Some(result.forward);
+                    return;
+                }
                 if let Some(new_idx) = target_idx {
                     self.open_fullscreen(new_idx);
                     self.selected = Some(new_idx);
