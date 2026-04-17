@@ -1,3 +1,0 @@
-   Compiling mimageviewer v0.5.0 (H:\home\mimageviewer\.claude\worktrees\preferences-redesign)
-    Finished `release` profile [optimized] target(s) in 1m 10s
-     Running `target\release\mimageviewer.exe`
