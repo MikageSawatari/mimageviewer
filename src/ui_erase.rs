@@ -244,28 +244,30 @@ impl App {
             }
         }
 
-        // 矢印キー: 平行移動 (Shift で 10px)
-        let shift_held = ctx.input(|i| i.modifiers.shift);
-        let step = if shift_held { NUDGE_PIXELS_FAST } else { NUDGE_PIXELS };
+        // Ctrl で 10 倍 (平行移動/回転とも同じ修飾キーに揃える)。
+        // Shift を使わない理由: 回転の [/] は Shift+ で論理キーが {/} に化けて
+        // Key::OpenBracket/CloseBracket にマッチしないため Ctrl にせざるを得ない。
+        // 揃えないと覚えにくいので矢印キーもあわせて Ctrl に統一。
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+
+        // 矢印キー: 平行移動 (Ctrl で 10px)
+        let step = if ctrl_held { NUDGE_PIXELS_FAST } else { NUDGE_PIXELS };
         let (mut dx, mut dy) = (0.0f32, 0.0f32);
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) { dx -= step; }
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft) { dx -= step; }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) { dx += step; }
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight) { dx += step; }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) { dy -= step; }
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp) { dy -= step; }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) { dy += step; }
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown) { dy += step; }
         });
         if dx != 0.0 || dy != 0.0 {
             self.nudge_mask(dx, dy);
         }
 
         // [ / ]: 回転 (Ctrl で 1°)
-        // 修飾キーは Ctrl を使う: JIS/US どちらでも Shift+[ / Shift+] は論理キーが { / } に化けて
-        // egui::Key::OpenBracket / CloseBracket にマッチしないため。Ctrl は論理キーを変えない。
-        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
         let rot_step = if ctrl_held { ROTATE_DEG_STEP_FAST } else { ROTATE_DEG_STEP };
         let mut rot_deg = 0.0f32;
         ctx.input_mut(|i| {
@@ -1508,8 +1510,7 @@ impl App {
 
         // ── ヘルプテキスト ──
         let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
-                    矢印:シフト (Shift:10px)\n\
-                    [/]:回転 (Ctrl:1°)\n\
+                    矢印:シフト [/]:回転 (Ctrl:10倍)\n\
                     選択ツール+ベクタ: ドラッグ=移動\n\
                     \u{00A0}Shift+ドラッグ 縦=回転 横=太さ\n\
                     \u{00A0}Del:削除";
