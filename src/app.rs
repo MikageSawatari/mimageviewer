@@ -597,6 +597,10 @@ pub struct App {
         Option<String>,
         mpsc::Receiver<std::io::Result<Vec<crate::pdf_loader::PdfPageEntry>>>,
     )>,
+    /// Ctrl+↑↓ フォルダナビで非同期 PDF に着地したときに保存する方向フラグ。
+    /// `poll_pdf_enumerate` が items を埋めたあとで fullscreen を開き直すために使う。
+    /// `Some(forward)`: DFS 方向 (true=前方/下巻方向, false=後方/上巻方向)。
+    pub(crate) fs_nav_after_pdf_enumerate: Option<bool>,
 
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
     /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
@@ -867,6 +871,7 @@ impl Default for App {
             pdf_content_type_tx: pdf_ct_tx,
             pdf_content_type_rx: pdf_ct_rx,
             pdf_enumerate_pending: None,
+            fs_nav_after_pdf_enumerate: None,
             cached_handlers: None,
             cached_nav_indices: None,
 
@@ -1519,6 +1524,7 @@ impl App {
                 crate::logger::log("  pdf enumerate: worker disconnected");
                 let path = pdf_path.clone();
                 self.pdf_enumerate_pending = None;
+                self.fs_nav_after_pdf_enumerate = None;
                 self.start_loading_items(
                     path, Vec::new(), Vec::new(),
                     std::collections::HashSet::new(), Vec::new(),
@@ -1550,14 +1556,30 @@ impl App {
                     image_metas.push(Some((page.mtime, page.file_size as i64)));
                 }
 
+                // start_loading_items が内部で close_fullscreen を呼んで fs_nav_after_pdf_enumerate を
+                // リセットする可能性はないが、念のため先に取り出してから start_loading_items を呼ぶ。
+                let nav_intent = self.fs_nav_after_pdf_enumerate.take();
                 self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new());
+
+                // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
+                if let Some(forward) = nav_intent {
+                    if let Some(new_idx) = self.find_fullscreen_nav_target(forward) {
+                        self.open_fullscreen(new_idx);
+                        self.selected = Some(new_idx);
+                        self.scroll_to_selected = true;
+                        self.update_last_selected_image();
+                    }
+                }
             }
             Err(e) => {
                 let err_msg = format!("{e}");
                 // パスワードエラーかどうかを判定 (エラーメッセージに "Password" が含まれる)
                 if err_msg.contains("Password") || err_msg.contains("password") {
                     if password.is_none() {
-                        // パスワードが必要 → ダイアログ表示
+                        // パスワードが必要 → ダイアログ表示。
+                        // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
+                        // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
+                        self.fs_nav_after_pdf_enumerate = None;
                         self.pdf_password_pending_path = Some(pdf_path);
                         self.show_pdf_password_dialog = true;
                         self.pdf_password_input.clear();
@@ -1566,6 +1588,8 @@ impl App {
                         return;
                     }
                 }
+                // その他の失敗: deferred 意図をクリアしてグリッド表示にフォールバック
+                self.fs_nav_after_pdf_enumerate = None;
                 crate::logger::log(format!("  pdf enumerate failed: {e}"));
                 self.start_loading_items(
                     pdf_path, Vec::new(), Vec::new(),
@@ -2988,22 +3012,13 @@ impl App {
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                 self.close_fullscreen();
                 self.load_folder(path);
-                let target_idx = {
-                    let items = &self.items;
-                    let is_image_like = |i: usize| matches!(
-                        items.get(i),
-                        Some(GridItem::Image(_))
-                        | Some(GridItem::Video(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                    );
-                    let mut it = self.visible_indices.iter().copied();
-                    if result.forward {
-                        it.find(|&i| is_image_like(i))
-                    } else {
-                        it.rev().find(|&i| is_image_like(i))
-                    }
-                };
+                // PDF は enumerate_pages_async が非同期なので、load_folder 直後は items が空。
+                // 結果は poll_pdf_enumerate が受信するので、そこで fullscreen を開き直す。
+                if self.pdf_enumerate_pending.is_some() {
+                    self.fs_nav_after_pdf_enumerate = Some(result.forward);
+                    return;
+                }
+                let target_idx = self.find_fullscreen_nav_target(result.forward);
                 if let Some(new_idx) = target_idx {
                     self.open_fullscreen(new_idx);
                     self.selected = Some(new_idx);
@@ -3030,6 +3045,51 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Ctrl+↑↓ フルスクリーン遷移後の表示対象 item index を決める。
+    ///
+    /// 1. まず可視アイテムから画像系 (Image/Video/ZipImage/PdfPage) を探す。
+    /// 2. 見つからず、ZIP/PDF ファイルだけ置かれているフォルダだった場合は
+    ///    最初 (backward 時は最後) の ZIP/PDF に入り、その中の画像系を返す。
+    ///    これにより「ZIP/PDF しか入っていない中間フォルダ」でフルスクリーン表示が
+    ///    切れず、マンガ/コミックの連続閲覧が続く。
+    fn find_fullscreen_nav_target(&mut self, forward: bool) -> Option<usize> {
+        let find_image = |app: &Self, fwd: bool| -> Option<usize> {
+            let items = &app.items;
+            let is_image_like = |i: usize| matches!(
+                items.get(i),
+                Some(GridItem::Image(_))
+                | Some(GridItem::Video(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+            );
+            if fwd {
+                app.visible_indices.iter().copied().find(|&i| is_image_like(i))
+            } else {
+                app.visible_indices.iter().copied().rev().find(|&i| is_image_like(i))
+            }
+        };
+
+        if let Some(idx) = find_image(self, forward) {
+            return Some(idx);
+        }
+
+        // 画像系が無い: ZIP/PDF ファイルを探して仮想フォルダに進入する
+        let pick_virtual = |i: usize, items: &[GridItem]| -> Option<PathBuf> {
+            match items.get(i) {
+                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => Some(p.clone()),
+                _ => None,
+            }
+        };
+        let virtual_path = if forward {
+            self.visible_indices.iter().copied().find_map(|i| pick_virtual(i, &self.items))
+        } else {
+            self.visible_indices.iter().copied().rev().find_map(|i| pick_virtual(i, &self.items))
+        };
+        let virtual_path = virtual_path?;
+        self.load_folder(virtual_path);
+        find_image(self, forward)
     }
 
     /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
