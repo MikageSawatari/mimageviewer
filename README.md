@@ -35,7 +35,7 @@ Windows 向け高速サムネイルビューワー
 |------|-----------|
 | 静止画（内蔵） | JPEG, PNG, GIF, WebP, BMP |
 | 静止画（WIC） | HEIC, AVIF, JPEG XL, TIFF, 各社 RAW |
-| アニメーション | GIF, APNG, Animated WebP |
+| アニメーション | GIF, APNG（Animated WebP は先頭フレームのみ表示） |
 | ドキュメント | PDF |
 | アーカイブ | ZIP |
 | 動画（サムネイルのみ） | MP4, AVI, MOV, MKV, WMV, MPEG |

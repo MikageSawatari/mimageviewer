@@ -2854,10 +2854,11 @@ impl App {
 
             // F7/F8: マスクスロット 1/2 を一括適用
             // (チェック済みアイテムがあれば一括、なければ選択 1 件に)
+            // フルスクリーン側 (ui_fullscreen.rs) と揃えて修飾キー無しのみ受け付ける。
             {
-                let slot_key = ctx.input(|i| {
-                    if i.key_pressed(egui::Key::F7) { Some(1usize) }
-                    else if i.key_pressed(egui::Key::F8) { Some(2) }
+                let slot_key = ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::F7) { Some(1usize) }
+                    else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) { Some(2) }
                     else { None }
                 });
                 if let Some(slot) = slot_key {
