@@ -94,7 +94,7 @@ fn write_sidecar(
     }
     if let Some((rel, mask, w, h)) = mask_entry {
         let raw = compress_mask(&mask);
-        sc.set_mask(rel, SidecarMask::from_raw(&raw, w, h));
+        sc.set_mask(rel, SidecarMask::from_raw(&raw, &[], w, h));
     }
     sc.flush();
 }
@@ -293,7 +293,7 @@ fn sidecar_flush_then_load_preserves_data() {
         sc.set_adjust("a.jpg", sample_params(1.5));
         sc.set_adjust("b.jpg", sample_params(-2.0));
         let raw = compress_mask(&sample_mask_8x8());
-        sc.set_mask("a.jpg", SidecarMask::from_raw(&raw, 8, 8));
+        sc.set_mask("a.jpg", SidecarMask::from_raw(&raw, &[], 8, 8));
         sc.flush();
     }
 

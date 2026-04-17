@@ -109,27 +109,59 @@
     <h2>マスクスロット（別ページへの適用）</h2>
     <p>スキャンで汚れが固定位置に出る場合、同じマスクを偶数ページ全体・奇数ページ全体に繰り返し適用したいことがあります。
     マスクスロット機能を使うと、現在のマスクを一時保存して別のページに貼り付けられます。</p>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>操作</th><th>ショートカット</th><th>動作</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>保存 1 / 保存 2</td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>2</kbd></td><td>現在のマスクをスロット 1 / 2 に保存</td></tr>
-          <tr><td>ロード 1 / ロード 2</td><td><kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>2</kbd></td><td>スロット 1 / 2 のマスクを現在のマスクにマージ（OR 結合）</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p>左パネルのマスクスロット欄のボタンからも同じ操作が可能です。
-    ロードは現在のマスクに追加する動作なので、既存のマスクを維持したまま複数のスロットを重ねることもできます。
+    <p>保存・ロードは消しゴムモードの左パネル「マスクスロット」欄のボタンから行います。
+    ロードは現在のマスクに追加する動作 (OR マージ) なので、既存のマスクを維持したまま複数のスロットを重ねることもできます。
     スロットは画像サイズが違っても自動リスケールされるため、解像度の異なる画像間でも共有可能です。</p>
+
+    <h3>F7 / F8: フルスクリーン表示のまま即適用</h3>
+    <p>フルスクリーン表示中 (消しゴムモードに入っていない状態) に <kbd>F7</kbd> / <kbd>F8</kbd> を押すと、
+    保存 1 / 保存 2 のマスクを現在のページに即座に適用して AI 補完まで実行します。
+    消しゴムモードを開く必要がなく、ページをめくりながら 1 キーでマスクを次々に適用できます。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        スロットの使用例: スキャン本の偶数ページに共通のノイズがある場合、1 ページ目でマスクを作成 → <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd> で保存 →
-        他の偶数ページに移動して <kbd>Ctrl</kbd>+<kbd>1</kbd> でロード → <kbd>E</kbd> で補完実行、を繰り返します。
+        スロットの使用例: スキャン本の偶数ページに共通のノイズがある場合、
+        1 ページ目でマスクを作成して保存 1 に保存 →
+        他の偶数ページに移動して <kbd>F7</kbd> で即適用、を繰り返します。
       </div>
+    </div>
+
+    <h2>マスク全体の位置・角度の微調整</h2>
+    <p>スキャン時の用紙のずれで、スロットに保存したマスクの位置や角度が微妙に合わないことがあります。
+    消しゴムモード中に何も選択していない状態で、以下のキーでマスク全体 (ビットマップ + ベクタ) をまとめて動かせます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>矢印キー</td><td>1 ピクセル平行移動</td></tr>
+          <tr><td><kbd>Shift</kbd>+矢印</td><td>10 ピクセル平行移動</td></tr>
+          <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>±0.1° 回転 (画像中心まわり)</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>[</kbd> / <kbd>]</kbd></td><td>±1° 回転</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>ベクタオブジェクトの後編集</h2>
+    <p>縦線・横線・直線ツールで作成した線は、ビットマップではなくベクタオブジェクトとして保存されます。
+    描画後も選択してサイズや位置を変更できます (筆・囲みはビットマップなので後編集不可)。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>オブジェクトをクリック</td><td>選択 (黄色の枠が表示される)</td></tr>
+          <tr><td>選択中にドラッグ</td><td>平行移動</td></tr>
+          <tr><td>選択中に <kbd>Shift</kbd>+ドラッグ</td><td>縦方向=回転、横方向=太さ変更</td></tr>
+          <tr><td>直線の端点 (黄色の丸) をドラッグ</td><td>始点 / 終点の位置変更</td></tr>
+          <tr><td>選択中に矢印キー / <kbd>[</kbd>/<kbd>]</kbd></td><td>選択オブジェクトだけを平行移動 / 回転</td></tr>
+          <tr><td><kbd>Del</kbd></td><td>選択オブジェクトを削除</td></tr>
+          <tr><td><kbd>Esc</kbd> (選択中)</td><td>選択解除 (消しゴムモードは継続)</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <h2>元に戻す（Undo）</h2>
@@ -163,9 +195,12 @@
           <tr><td><kbd>B</kbd> / <kbd>L</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>I</kbd></td><td>ツール切替: 筆 / 囲み / 縦線 / 横線 / 直線</td></tr>
           <tr><td><kbd>D</kbd> / <kbd>F</kbd></td><td>描画モード / 消去モードに切替</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo（最大 20 手）</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>2</kbd></td><td>スロット 1 / 2 のマスクをロード（OR マージ）</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>1</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>2</kbd></td><td>現在のマスクをスロット 1 / 2 に保存</td></tr>
-          <tr><td><kbd>Shift</kbd>+ドラッグ</td><td>筆・直線→太さ変更、縦線・横線→位置／傾き調整</td></tr>
+          <tr><td>矢印キー</td><td>マスク全体 (or 選択ベクタ) を 1 px 平行移動</td></tr>
+          <tr><td><kbd>Shift</kbd>+矢印</td><td>同じく 10 px 平行移動</td></tr>
+          <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>±0.1° 回転 (画像中心 or 選択ベクタ中心)</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>[</kbd> / <kbd>]</kbd></td><td>±1° 回転</td></tr>
+          <tr><td><kbd>Del</kbd></td><td>選択中のベクタオブジェクトを削除</td></tr>
+          <tr><td><kbd>Shift</kbd>+ドラッグ</td><td>筆・直線→太さ変更、縦線・横線→位置／傾き調整、ベクタ選択中→回転・太さ</td></tr>
           <tr><td>マウスホイール</td><td>筆・直線ツール時は太さ変更（その他ツール時は無効）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+マウスホイール</td><td>画像ズーム</td></tr>
         </tbody>

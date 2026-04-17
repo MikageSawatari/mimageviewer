@@ -935,6 +935,17 @@ impl App {
             }
         }
 
+        // F7/F8: マスクスロット 1/2 をフルスクリーン表示のまま現ページに適用
+        // (消しゴムモードに入らず、1 キーで inpaint までを一気に実行)
+        let key_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7));
+        let key_f8 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F8));
+        if key_f7 {
+            self.apply_slot_in_viewing_mode(ctx, 1);
+        }
+        if key_f8 {
+            self.apply_slot_in_viewing_mode(ctx, 2);
+        }
+
         // 見開きモード切替 (1-5 キー)
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
