@@ -4591,6 +4591,20 @@ impl App {
         self.sidecars.get_mut(folder)
     }
 
+    /// 指定 `idx` のページに対応するサイドカーに対し `op` を実行する。
+    /// 設定 OFF・idx が画像系でない・フォルダ解決不能のいずれかなら黙って no-op。
+    /// 書き込みミラーの 1 行化に使う。
+    fn with_sidecar_mut<F>(&mut self, idx: usize, op: F)
+    where
+        F: FnOnce(&mut crate::sidecar::SidecarFile, &str),
+    {
+        if let Some((folder, rel)) = self.sidecar_coords(idx) {
+            if let Some(sc) = self.sidecar_mut(&folder) {
+                op(sc, &rel);
+            }
+        }
+    }
+
     /// すべての dirty なサイドカーをディスクにフラッシュする。
     /// 呼び出し側: フォルダ切替時・アプリ終了時・5 秒アイドル時。
     pub(crate) fn flush_all_sidecars(&mut self) {
@@ -4610,17 +4624,15 @@ impl App {
         if let Some(db) = &self.mask_db {
             let _ = db.set(&key, mask, w, h);
         }
-        if let Some((folder, rel)) = self.sidecar_coords(idx) {
-            if is_empty {
-                if let Some(sc) = self.sidecar_mut(&folder) {
-                    sc.remove_mask(&rel);
-                }
-            } else {
-                let raw = crate::mask_db::compress_mask(mask);
-                if let Some(sc) = self.sidecar_mut(&folder) {
-                    sc.set_mask(&rel, crate::sidecar::SidecarMask::from_raw(&raw, w as u32, h as u32));
-                }
-            }
+        if is_empty {
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
+        } else {
+            let sidecar_mask = crate::sidecar::SidecarMask::from_raw(
+                &crate::mask_db::compress_mask(mask),
+                w as u32,
+                h as u32,
+            );
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
         }
     }
 
@@ -4633,11 +4645,7 @@ impl App {
         if let Some(db) = &self.mask_db {
             let _ = db.delete(&key);
         }
-        if let Some((folder, rel)) = self.sidecar_coords(idx) {
-            if let Some(sc) = self.sidecar_mut(&folder) {
-                sc.remove_mask(&rel);
-            }
-        }
+        self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
     }
 
     /// サイドカーからまだ DB に無いエントリを取り込み、両 DB を更新する。
@@ -4734,7 +4742,6 @@ impl App {
     /// グローバルとの等価比較に変更した。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
         let matches_global = params == self.settings.global_preset;
-        let coords = self.sidecar_coords(idx);
         if matches_global {
             self.adjustment_page_params.remove(&idx);
             if let Some(key) = self.page_path_key(idx) {
@@ -4742,11 +4749,7 @@ impl App {
                     let _ = db.remove_page_params(&key);
                 }
             }
-            if let Some((folder, rel)) = coords {
-                if let Some(sc) = self.sidecar_mut(&folder) {
-                    sc.remove_adjust(&rel);
-                }
-            }
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         } else {
             self.adjustment_page_params.insert(idx, params.clone());
             if let Some(key) = self.page_path_key(idx) {
@@ -4754,11 +4757,7 @@ impl App {
                     let _ = db.set_page_params(&key, &params);
                 }
             }
-            if let Some((folder, rel)) = coords {
-                if let Some(sc) = self.sidecar_mut(&folder) {
-                    sc.set_adjust(&rel, params);
-                }
-            }
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_adjust(rel, params));
         }
     }
 
@@ -4777,11 +4776,7 @@ impl App {
                 let _ = db.remove_page_params(&key);
             }
         }
-        if let Some((folder, rel)) = self.sidecar_coords(idx) {
-            if let Some(sc) = self.sidecar_mut(&folder) {
-                sc.remove_adjust(&rel);
-            }
-        }
+        self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         self.adjustment_cache.remove(&idx);
         if !old_params.ai_settings_eq(&new_params) {
             self.ai_upscale_cache.remove(&idx);

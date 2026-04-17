@@ -745,8 +745,8 @@ fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "OFF 中は既存のバックアップファイルも読み込まれません\n\
-             (ファイル自体は削除されません)。",
+            "OFF 中はバックアップの書き込みも既存ファイルの読み込みも行いません\n\
+             (既存の mimageviewer.dat は削除されず残ります)。",
         )
         .size(11.0)
         .color(egui::Color32::from_gray(150)),

@@ -464,11 +464,9 @@ fn clear_hidden_system(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_NORMAL};
     use windows::core::PCWSTR;
-    if !path.exists() {
-        return;
-    }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     unsafe {
+        // 存在しないパスに対する呼び出しは単にエラーになるだけ (TOCTOU 回避のため exists() チェックなし)。
         let _ = SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_NORMAL);
     }
 }
