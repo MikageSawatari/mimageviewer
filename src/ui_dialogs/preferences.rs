@@ -882,7 +882,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pres
 fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 5-9 でも切り替えできます。");
+    ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。");
     ui.add_space(4.0);
     egui::ComboBox::from_label("デフォルトの表示モード")
         .selected_text(s.default_spread_mode.label())

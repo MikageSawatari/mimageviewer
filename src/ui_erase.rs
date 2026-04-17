@@ -1453,7 +1453,11 @@ impl App {
         );
         if del_resp.clicked() {
             let [w, h] = self.erase_mask_size;
+            self.push_undo_snapshot();
             self.erase_mask = Some(vec![false; w * h]);
+            self.erase_vectors.clear();
+            self.erase_selected_vector = None;
+            self.erase_vector_drag = None;
             self.erase_mask_texture = None;
             if let Some(fs_idx) = self.fullscreen_idx {
                 // DB + サイドカーからも削除

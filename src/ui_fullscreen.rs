@@ -208,12 +208,30 @@ impl App {
         if self.fullscreen_idx.is_some() {
             return; // アクティブなときは render_fullscreen_viewport が担当
         }
+        let fs_id = egui::ViewportId::from_hash_of("fullscreen_viewer");
+
+        // Ctrl+↑↓ で PDF フォルダを挟む遷移中は fullscreen_idx が None のまま
+        // PDF enumerate 完了を待つ。この間ビューポートを隠すとその下のグリッドが
+        // 見えてちらつくので、黒で塗った状態を維持する。
+        if self.fs_viewport_shown && self.fs_nav_after_pdf_enumerate.is_some() {
+            let fs_builder = self.build_fullscreen_viewport_builder();
+            ctx.show_viewport_immediate(
+                fs_id,
+                fs_builder,
+                |ctx, _class| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                        .show(ctx, |_ui| {});
+                },
+            );
+            return;
+        }
+
         // 非表示でもフルスクリーンサイズを維持する。
         // 1x1 → フルサイズへのリサイズが Visible(true) と同時に発生すると
         // OS のウィンドウマネージャが中間状態を描画してちらつく。
         let fs_builder = self.build_fullscreen_viewport_builder()
             .with_visible(false);
-        let fs_id = egui::ViewportId::from_hash_of("fullscreen_viewer");
         ctx.show_viewport_immediate(
             fs_id,
             fs_builder,
@@ -1007,8 +1025,10 @@ impl App {
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
 
-        // U キー: AI アップスケールモデルをサイクル (現在ページの有効パラメータに対して)
+        // U キー: AI アップスケールモデルをサイクル
+        // 現在ページに個別設定があれば個別を書き換え、無ければ標準設定 (global_preset) を書き換える。
         if key_u {
+            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let items = crate::adjustment::upscale_menu_items();
             let cur = items.iter().position(|(_, k)| {
@@ -1021,22 +1041,34 @@ impl App {
             let next = (cur + 1) % items.len();
             let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
-            self.show_feedback_toast(format!("[U:アップスケール {}]", label));
-            self.set_page_params(fs_idx, params);
+            let scope = if has_page_override { "個別" } else { "標準" };
+            self.show_feedback_toast(format!("[U:{}アップスケール {}]", scope, label));
+            if has_page_override {
+                self.set_page_params(fs_idx, params);
+            } else {
+                self.copy_params_to_global(params);
+            }
             self.clear_all_adjustment_and_ai_caches(fs_idx);
         }
 
-        // N キー: AI デノイズをトグル (現在ページの有効パラメータに対して)
+        // N キー: AI デノイズをトグル
+        // 現在ページに個別設定があれば個別を書き換え、無ければ標準設定 (global_preset) を書き換える。
         if key_n {
+            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
+            let scope = if has_page_override { "個別" } else { "標準" };
             if params.denoise_model.is_some() {
                 params.denoise_model = None;
-                self.show_feedback_toast("[N:デノイズ OFF]".to_string());
+                self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope));
             } else {
                 params.denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
-                self.show_feedback_toast("[N:デノイズ ON]".to_string());
+                self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope));
             }
-            self.set_page_params(fs_idx, params);
+            if has_page_override {
+                self.set_page_params(fs_idx, params);
+            } else {
+                self.copy_params_to_global(params);
+            }
             self.clear_all_adjustment_and_ai_caches(fs_idx);
         }
 
@@ -2008,7 +2040,7 @@ impl App {
             spread_active,
             |p, c, r| draw_spread_icon(p, c, r, sm),
         );
-        let spread_resp = spread_resp.on_hover_text("見開き設定 [5-9]");
+        let spread_resp = spread_resp.on_hover_text("見開き設定 [1-5]");
         if spread_resp.clicked() {
             *spread_popup_open = !*spread_popup_open;
         }
