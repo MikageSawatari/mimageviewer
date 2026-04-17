@@ -76,6 +76,7 @@ impl App {
         self.erase_shift_drag = None;
         self.erase_paint_mode = true;
         self.erase_undo_stack.clear();
+        self.erase_last_undo_at = None;
         self.erase_vectors.clear();
         self.erase_selected_vector = None;
         self.erase_vector_drag = None;
@@ -117,6 +118,7 @@ impl App {
         self.erase_line_tilt = 0.0;
         self.erase_shift_drag = None;
         self.erase_undo_stack.clear();
+        self.erase_last_undo_at = None;
         self.erase_vectors.clear();
         self.erase_selected_vector = None;
         self.erase_vector_drag = None;
