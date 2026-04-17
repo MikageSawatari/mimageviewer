@@ -524,7 +524,8 @@ impl App {
                             None
                         };
 
-                        {
+                        // 消しゴムモード中は上部バーを抑制 (自前の消しゴムパネルと競合させない)。
+                        if !self.erase_mode {
                             let saved_nav = nav_delta;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             Self::draw_fs_hover_bar(
@@ -1215,6 +1216,8 @@ impl App {
         });
 
         // 左端・上端・右端のホバーでオーバーレイ（上バー＋左パネル＋右パネル）を同時表示/非表示
+        // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する
+        // (そうしないと消しゴムパネル上のホバーで補正パネルが重なって表示される)。
         {
             let edge_hover = ctx.input(|i| {
                 i.pointer.hover_pos().map(|p| {
@@ -1223,7 +1226,7 @@ impl App {
                     || p.x > full_rect.max.x - full_rect.width() * 0.05  // 右端5%
                 }).unwrap_or(false)
             });
-            if edge_hover && !self.analysis_mode {
+            if edge_hover && !self.analysis_mode && !self.erase_mode {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel && !edge_hover && self.adjustment_mode && !self.adjustment_dragging {
                 self.adjustment_mode = false;

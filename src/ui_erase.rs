@@ -164,7 +164,9 @@ impl App {
         }
     }
 
-    /// スロットからマスクをロードし、現在のマスクと OR マージ & ベクタを追加する。
+    /// スロットからマスクをロードし、現在のマスクを**差し替える**。
+    /// 偶数/奇数ページを取り違えたときに旧マスクが残ると過剰マスクになるため、
+    /// 追記ではなく上書き仕様。直前の状態は Ctrl+Z で戻せる。
     pub(crate) fn load_mask_from_slot(&mut self, slot: usize) {
         let [w, h] = self.erase_mask_size;
         let slot_data = self.mask_db.as_ref().and_then(|db| db.get_slot_full(slot, w, h));
@@ -177,12 +179,8 @@ impl App {
             return;
         }
         self.push_undo_snapshot();
-        if let Some(mask) = self.erase_mask.as_mut() {
-            for (m, s) in mask.iter_mut().zip(slot_mask.iter()) {
-                *m = *m || *s;
-            }
-        }
-        self.erase_vectors.extend(slot_vectors);
+        self.erase_mask = Some(slot_mask);
+        self.erase_vectors = slot_vectors;
         self.erase_selected_vector = None;
         self.erase_mask_texture = None;
         self.show_feedback_toast(format!("[スロット{}をロード]", slot));
@@ -1616,8 +1614,9 @@ impl App {
     }
 
     /// フルスクリーン表示中 (消しゴムモード外) で F7/F8 から呼ばれる。
-    /// スロット N のマスクを現ページに OR マージして保存し、inpaint を実行する。
+    /// スロット N のマスクを現ページに**差し替えて**保存し、inpaint を実行する。
     /// 消しゴムモードに入る必要なく 1 キーでマスクを適用できる。
+    /// 偶数/奇数ページ取り違えで旧マスクと合成されないよう上書き仕様。
     pub(crate) fn apply_slot_in_viewing_mode(&mut self, ctx: &egui::Context, slot: usize) {
         if self.erase_mode {
             return;
@@ -1635,28 +1634,14 @@ impl App {
 
         // スロットのマスクとベクタを取得
         let slot_data = self.mask_db.as_ref().and_then(|db| db.get_slot_full(slot, w, h));
-        let Some((slot_mask, slot_vectors)) = slot_data else {
+        let Some((new_mask, new_vectors)) = slot_data else {
             self.show_feedback_toast(format!("[スロット{slot}は空です]"));
             return;
         };
-        if !slot_mask.iter().any(|&m| m) && slot_vectors.is_empty() {
+        if !new_mask.iter().any(|&m| m) && new_vectors.is_empty() {
             self.show_feedback_toast(format!("[スロット{slot}は空です]"));
             return;
         }
-
-        // 現ページに既存マスクがあれば OR マージ、無ければ空から
-        let key = match self.page_path_key(fs_idx) {
-            Some(k) => k,
-            None => return,
-        };
-        let existing = self.mask_db.as_ref().and_then(|db| db.get_full(&key, w, h));
-        let (mut merged_mask, mut merged_vectors) = existing.unwrap_or_else(
-            || (vec![false; w * h], Vec::new())
-        );
-        for (m, s) in merged_mask.iter_mut().zip(slot_mask.iter()) {
-            *m = *m || *s;
-        }
-        merged_vectors.extend(slot_vectors);
 
         // 元画像を base_cache に保存 (サイズが変わっていれば更新)
         let need_update = self.erase_base_cache.get(&fs_idx)
@@ -1667,15 +1652,15 @@ impl App {
         }
         let original = Arc::clone(self.erase_base_cache.get(&fs_idx).unwrap());
 
-        // 合成マスク
-        let mut composite = merged_mask.clone();
-        crate::mask_db::rasterize_vectors_into(&mut composite, &merged_vectors, w, h);
+        // 合成マスク (スロットの内容だけを使う = 差し替え)
+        let mut composite = new_mask.clone();
+        crate::mask_db::rasterize_vectors_into(&mut composite, &new_vectors, w, h);
         if !composite.iter().any(|&m| m) {
             return;
         }
 
-        // DB + サイドカーに保存
-        self.save_mask_with_sidecar(fs_idx, &merged_mask, &merged_vectors, w, h);
+        // DB + サイドカーに保存 (既存マスクを上書き)
+        self.save_mask_with_sidecar(fs_idx, &new_mask, &new_vectors, w, h);
 
         crate::logger::log(format!(
             "erase: apply_slot_in_viewing_mode slot={slot} idx={fs_idx}"
