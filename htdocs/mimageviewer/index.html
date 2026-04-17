@@ -495,6 +495,16 @@
     <div class="uc-title">大量の PDF をサムネイルで見比べたい</div>
     <p class="uc-desc">PDF をページごとにサムネイル表示。パスワード付きにも対応。</p>
   </div>
+  <div class="usecase-card">
+    <div class="uc-icon">✨</div>
+    <div class="uc-title">AI アップスケールで綺麗な画像で見たい</div>
+    <p class="uc-desc">アップスケールしてきれいな画質で閲覧。モデルは自動選択モードや、用途に応じたモデル切り替えが可能。</p>
+  </div>
+  <div class="usecase-card">
+    <div class="uc-icon">🧹</div>
+    <div class="uc-title">スキャンの汚れを補修したい</div>
+    <p class="uc-desc">非破壊で元のファイルを修正することなしに、スキャン汚れなどを消しゴムツールで補修。</p>
+  </div>
 </div>
 
 <main>
@@ -506,6 +516,11 @@
       mImageViewer は、大量の画像を快適に閲覧するための Windows 11 向け画像ビューワーです。
       GPU アクセラレーションを使ったサムネイルグリッド表示と、SQLite ベースのサムネイルキャッシュにより、
       同じフォルダを再度開いたときは瞬時に表示されます。
+    </p>
+    <p>
+      AI アップスケール (Real-ESRGAN / Real-CUGAN / NMKD-Siax) を内蔵し、低解像度の画像も高精細に拡大して閲覧できます。
+      さらに消しゴムツールによる AI 非破壊修復 (MI-GAN) で、スキャン汚れ・傷・綴じ跡などを
+      元のファイルを書き換えずにマスクで補修でき、いつでも元の状態に戻せます。
     </p>
     <p>
       旧来の 32bit ビューワー「ViX」にインスパイアされ、現代の環境に合わせて Rust でゼロから実装しました。
@@ -539,6 +554,18 @@
           <img src="ss_analysis.png" alt="画像分析モード" loading="lazy">
         </a>
         <div class="screenshot-caption">🔬 画像分析モード</div>
+      </div>
+      <div class="screenshot-item">
+        <a href="ss_upscale.png" target="_blank">
+          <img src="ss_upscale.png" alt="AI アップスケール" loading="lazy">
+        </a>
+        <div class="screenshot-caption">✨ AI アップスケール</div>
+      </div>
+      <div class="screenshot-item">
+        <a href="ss_eraser.png" target="_blank">
+          <img src="ss_eraser.png" alt="AI 非破壊修復" loading="lazy">
+        </a>
+        <div class="screenshot-caption">🧹 AI 非破壊修復</div>
       </div>
     </div>
   </section>
@@ -691,7 +718,7 @@
       <div class="feature-card">
         <div class="icon">📁</div>
         <h3>同名ファイル処理</h3>
-        <p>同名の ZIP+フォルダ、動画+画像、複数拡張子の画像を自動整理。拡張子の優先度もカスタマイズ可能。</p>
+        <p>同名の ZIP/PDF+フォルダ、動画+画像、複数拡張子の画像を自動整理。拡張子の優先度もカスタマイズ可能。</p>
       </div>
     </div>
   </section>
