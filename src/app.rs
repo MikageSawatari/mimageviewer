@@ -129,7 +129,7 @@ impl Default for EraseTool {
     fn default() -> Self { EraseTool::Brush }
 }
 
-/// Shift+ドラッグ中の基準状態。ドラッグ開始時に記録し、以降のマウス位置との
+/// Ctrl+ドラッグ中の基準状態。ドラッグ開始時に記録し、以降のマウス位置との
 /// 差分から操作量を算出する。
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ShiftDragState {
@@ -161,8 +161,8 @@ pub(crate) enum EraseVectorDrag {
         base: crate::mask_db::LineObject,
         origin: (f32, f32),
     },
-    /// Shift+ドラッグ: 垂直成分を回転、水平成分を太さ変更に割り当てる。
-    ShiftAdjust {
+    /// Ctrl+ドラッグ: 垂直成分を回転、水平成分を太さ変更に割り当てる。
+    ModAdjust {
         index: usize,
         base: crate::mask_db::LineObject,
         origin: (f32, f32),
@@ -173,16 +173,6 @@ pub(crate) enum EraseVectorDrag {
         base: crate::mask_db::LineObject,
         which_p1: bool,
     },
-}
-
-impl EraseVectorDrag {
-    pub(crate) fn index(&self) -> usize {
-        match self {
-            EraseVectorDrag::Pan { index, .. }
-            | EraseVectorDrag::ShiftAdjust { index, .. }
-            | EraseVectorDrag::Endpoint { index, .. } => *index,
-        }
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -731,11 +721,11 @@ pub struct App {
     /// 縦線/横線ツールのドラッグ現在点 (画像ピクセル座標)
     pub(crate) erase_line_end: Option<(f32, f32)>,
     /// 縦線/横線ツールの傾き量 (画像ピクセル単位の上端オフセット)。
-    /// Shift+ドラッグ時のみ非ゼロになる。
+    /// Ctrl+ドラッグ時のみ非ゼロになる。
     pub(crate) erase_line_tilt: f32,
     /// 直線ツールの幅 (画像ピクセル)。
     pub(crate) erase_line_width: f32,
-    /// Shift+ドラッグ中の状態 (None なら未アクティブ)。
+    /// Ctrl+ドラッグ中の状態 (None なら未アクティブ)。
     pub(crate) erase_shift_drag: Option<ShiftDragState>,
     /// 描画モード (true) / 消去モード (false)
     pub(crate) erase_paint_mode: bool,
@@ -746,6 +736,9 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
+    /// 直前の push_undo_snapshot 時刻。矢印/[/]キー連打時のスナップショット重複を抑制する
+    /// (OS のキーリピートで毎フレーム full-bitmap clone が走るのを防ぐ)。
+    pub(crate) erase_last_undo_at: Option<std::time::Instant>,
     /// 縦線/横線/直線のベクタオブジェクト群 (消しゴムモード中のみ有効)。
     /// 筆/囲みは `erase_mask` 側に直接ラスタライズされる。
     pub(crate) erase_vectors: Vec<crate::mask_db::LineObject>,
@@ -973,6 +966,7 @@ impl Default for App {
             erase_base_cache: std::collections::HashMap::new(),
             mask_db: crate::mask_db::MaskDb::open().ok(),
             erase_undo_stack: std::collections::VecDeque::new(),
+            erase_last_undo_at: None,
             erase_vectors: Vec::new(),
             erase_selected_vector: None,
             erase_vector_drag: None,
@@ -1735,7 +1729,6 @@ impl App {
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
-        // 消しゴムマスク: フォルダ内でマスクを持つページ集合をリセット
         self.mask_pages.clear();
 
         // ── サイドカー → 中央 DB のインポート ──
@@ -3861,7 +3854,6 @@ impl App {
     /// 実際の inpaint は各ページをフルスクリーンで開いたときに `auto_apply_saved_mask` が走る。
     /// ここでは DB + サイドカーにスロットの内容 (ビットマップ + ベクタ) を書き込むだけで十分。
     pub(crate) fn apply_slot_to_selection(&mut self, slot: usize) {
-        // 対象を決定: チェック済みがあればそちら、無ければ選択中の 1 件
         let targets: Vec<usize> = if !self.checked.is_empty() {
             self.checked
                 .iter()
@@ -3908,14 +3900,17 @@ impl App {
             }
         };
 
-        // 各ページに保存 (差し替え仕様)。フルスクリーンで開いた時点で inpaint 自動適用。
+        // 圧縮・JSON 化はループ外で 1 回だけ: N ページに同じマスクを配るので
+        // deflate を共有する (N=100 等で実測効果が大きい)。
+        let compressed = crate::mask_db::compress_mask(&slot_bitmap);
+        let vectors_json = crate::mask_db::vectors_to_json(&slot_vectors);
         let total = targets.len();
         for idx in &targets {
             // フルスクリーンで現在これらのページを開いている可能性は低い (grid モード) が、
             // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
             self.erase_base_cache.remove(idx);
             self.fs_cache.remove(idx);
-            self.save_mask_with_sidecar(*idx, &slot_bitmap, &slot_vectors, sw, sh);
+            self.save_mask_raw_with_sidecar(*idx, &compressed, &slot_vectors, vectors_json.as_deref(), sw, sh);
         }
 
         self.checked.clear();
@@ -4843,28 +4838,46 @@ impl App {
         w: usize,
         h: usize,
     ) {
+        let bitmap_empty = !mask.iter().any(|&m| m);
+        if bitmap_empty && vectors.is_empty() {
+            // 空マスクは DB + サイドカーから削除
+            self.delete_mask_with_sidecar(idx);
+            return;
+        }
+        // 圧縮とベクタ JSON 化を 1 回だけ行い、DB 書き込みとサイドカー両方で共有。
+        // 一括適用 (apply_slot_to_selection) で N ページに同じマスクを配るときの
+        // N 倍 deflate を回避する。
+        let compressed = crate::mask_db::compress_mask(mask);
+        let vectors_json = crate::mask_db::vectors_to_json(vectors);
+        self.save_mask_raw_with_sidecar(idx, &compressed, vectors, vectors_json.as_deref(), w, h);
+    }
+
+    /// 既に deflate 済みのビットマップ + JSON 済みベクタを DB + サイドカーに書き込む。
+    /// `save_mask_with_sidecar` と一括適用パスの共通バックエンド。
+    fn save_mask_raw_with_sidecar(
+        &mut self,
+        idx: usize,
+        compressed: &[u8],
+        vectors: &[crate::mask_db::LineObject],
+        vectors_json: Option<&str>,
+        w: usize,
+        h: usize,
+    ) {
         let key = match self.page_path_key(idx) {
             Some(k) => k,
             None => return,
         };
-        let bitmap_empty = !mask.iter().any(|&m| m);
-        let is_empty = bitmap_empty && vectors.is_empty();
         if let Some(db) = &self.mask_db {
-            let _ = db.set(&key, mask, vectors, w, h);
+            let _ = db.set_raw(&key, compressed, vectors_json, w, h);
         }
-        if is_empty {
-            self.mask_pages.remove(&idx);
-            self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
-        } else {
-            self.mask_pages.insert(idx);
-            let sidecar_mask = crate::sidecar::SidecarMask::from_raw(
-                &crate::mask_db::compress_mask(mask),
-                vectors,
-                w as u32,
-                h as u32,
-            );
-            self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
-        }
+        self.mask_pages.insert(idx);
+        let sidecar_mask = crate::sidecar::SidecarMask::from_raw(
+            compressed,
+            vectors,
+            w as u32,
+            h as u32,
+        );
+        self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
     }
 
     /// マスクを DB から削除し、サイドカーからも削除する。「マスク全削除」ボタン用。

@@ -85,13 +85,21 @@ impl LineObject {
 /// ベクタ群を既存の 1bit マスク上にラスタライズする (in-place OR)。
 pub fn rasterize_vectors_into(mask: &mut [bool], vectors: &[LineObject], w: usize, h: usize) {
     for v in vectors {
-        paint_line_rect(mask, v, w, h);
+        let pts = v.corners(0.0);
+        scanline_fill_polygon(mask, &pts, w, h, true);
     }
 }
 
-fn paint_line_rect(mask: &mut [bool], v: &LineObject, w: usize, h: usize) {
-    let pts = v.corners(0.0);
-    // スキャンライン充填 (ポリゴン塗り)。
+/// スキャンライン方式の多角形塗り。エラサーモードのビットマップ塗りと
+/// ベクタラスタライズで共用する。`value=true` で塗り、`false` で消去。
+pub fn scanline_fill_polygon(
+    mask: &mut [bool],
+    pts: &[(f32, f32)],
+    w: usize,
+    h: usize,
+    value: bool,
+) {
+    if pts.len() < 3 { return; }
     let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).max(0.0) as usize;
     let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).min(h as f32) as usize;
     let n = pts.len();
@@ -113,7 +121,7 @@ fn paint_line_rect(mask: &mut [bool], v: &LineObject, w: usize, h: usize) {
                 let px0 = (pair[0].max(0.0) as usize).min(w);
                 let px1 = (pair[1].max(0.0).ceil() as usize).min(w);
                 for px in px0..px1 {
-                    mask[y * w + px] = true;
+                    mask[y * w + px] = value;
                 }
             }
         }

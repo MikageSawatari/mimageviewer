@@ -17,13 +17,13 @@ use crate::ui_fullscreen::FsKeyAction;
 const ENDPOINT_HIT_RADIUS: f32 = 12.0;
 /// 矢印キー 1 回あたりの移動量 (ピクセル)。
 const NUDGE_PIXELS: f32 = 1.0;
-/// Shift+矢印の移動量 (ピクセル)。
+/// Ctrl+矢印の移動量 (ピクセル)。
 const NUDGE_PIXELS_FAST: f32 = 10.0;
 /// `[` / `]` キー 1 回あたりの回転量 (度)。
 const ROTATE_DEG_STEP: f32 = 0.1;
-/// Shift+`[` / `]` の回転量 (度)。
+/// Ctrl+`[` / `]` の回転量 (度)。
 const ROTATE_DEG_STEP_FAST: f32 = 1.0;
-/// Shift+ドラッグ: 縦方向 1px あたりの回転角 (度)。
+/// Ctrl+ドラッグ: 縦方向 1px あたりの回転角 (度)。
 const ROTATE_DEG_PER_PIXEL: f32 = 0.2;
 
 /// MI-GAN の固定入力サイズ。
@@ -133,7 +133,20 @@ impl App {
             while self.erase_undo_stack.len() > UNDO_MAX {
                 self.erase_undo_stack.pop_front();
             }
+            self.erase_last_undo_at = Some(std::time::Instant::now());
         }
+    }
+
+    /// キーリピート連打中にスナップショットを毎フレーム取らないための版。
+    /// 直前の push から閾値以内なら何もしない。
+    fn push_undo_snapshot_throttled(&mut self) {
+        const COALESCE_MS: u128 = 500;
+        if let Some(last) = self.erase_last_undo_at {
+            if last.elapsed().as_millis() < COALESCE_MS {
+                return;
+            }
+        }
+        self.push_undo_snapshot();
     }
 
     pub(crate) fn undo_erase(&mut self) -> bool {
@@ -362,7 +375,7 @@ impl App {
     /// マスクをシフトする。選択中ベクタがあればそれだけ、無ければビットマップとすべての
     /// ベクタを移動する。
     fn nudge_mask(&mut self, dx: f32, dy: f32) {
-        self.push_undo_snapshot();
+        self.push_undo_snapshot_throttled();
         match self.erase_selected_vector {
             Some(idx) if idx < self.erase_vectors.len() => {
                 self.erase_vectors[idx].translate(dx, dy);
@@ -384,7 +397,7 @@ impl App {
 
     /// マスクを回転する。選択中ベクタがあればそれだけ、無ければ全体を画像中心周りに回転する。
     fn rotate_mask(&mut self, angle_rad: f32) {
-        self.push_undo_snapshot();
+        self.push_undo_snapshot_throttled();
         match self.erase_selected_vector {
             Some(idx) if idx < self.erase_vectors.len() => {
                 let center = self.erase_vectors[idx].center();
@@ -500,45 +513,11 @@ impl App {
         self.erase_mask_texture = None;
     }
 
-    /// 多角形の内部を scan-line fill で塗る。
+    /// 多角形の内部をビットマップに塗る/消す。`mask_db::scanline_fill_polygon` の薄いラッパ。
     fn paint_polygon(&mut self, points: &[(f32, f32)], paint: bool) {
-        if points.len() < 3 { return; }
         let [w, h] = self.erase_mask_size;
-        let mask = match self.erase_mask.as_mut() {
-            Some(m) => m,
-            None => return,
-        };
-
-        // バウンディングボックス
-        let min_y = points.iter().map(|p| p.1).fold(f32::MAX, f32::min).max(0.0) as usize;
-        let max_y = points.iter().map(|p| p.1).fold(f32::MIN, f32::max).min(h as f32) as usize;
-
-        let n = points.len();
-        let mut intersections = Vec::new();
-        for y in min_y..max_y {
-            let scan_y = y as f32 + 0.5;
-            intersections.clear();
-            for i in 0..n {
-                let (x0, y0) = points[i];
-                let (x1, y1) = points[(i + 1) % n];
-                if (y0 <= scan_y && y1 > scan_y) || (y1 <= scan_y && y0 > scan_y) {
-                    let t = (scan_y - y0) / (y1 - y0);
-                    intersections.push(x0 + t * (x1 - x0));
-                }
-            }
-
-            intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-            for pair in intersections.chunks(2) {
-                if pair.len() == 2 {
-                    let px0 = (pair[0].max(0.0) as usize).min(w);
-                    let px1 = (pair[1].max(0.0).ceil() as usize).min(w);
-                    for px in px0..px1 {
-                        mask[y * w + px] = paint;
-                    }
-                }
-            }
-        }
+        let Some(mask) = self.erase_mask.as_mut() else { return; };
+        crate::mask_db::scanline_fill_polygon(mask, points, w, h, paint);
         self.erase_mask_texture = None;
     }
 
@@ -621,19 +600,23 @@ impl App {
 
         let Some(drag) = self.erase_vector_drag else { return; };
 
-        // Shift キーが途中で切り替わったらモード遷移 (Pan ⇄ ShiftAdjust)
+        // Ctrl キーが途中で切り替わったらモード遷移 (Pan ⇄ ModAdjust)
         let new_drag = match drag {
             EraseVectorDrag::Pan { index, base, origin } if ctrl_held => {
-                EraseVectorDrag::ShiftAdjust { index, base, origin }
+                EraseVectorDrag::ModAdjust { index, base, origin }
             }
-            EraseVectorDrag::ShiftAdjust { index, base, origin } if !ctrl_held => {
+            EraseVectorDrag::ModAdjust { index, base, origin } if !ctrl_held => {
                 EraseVectorDrag::Pan { index, base, origin }
             }
             _ => drag,
         };
         self.erase_vector_drag = Some(new_drag);
 
-        let idx = new_drag.index();
+        let idx = match new_drag {
+            EraseVectorDrag::Pan { index, .. }
+            | EraseVectorDrag::ModAdjust { index, .. }
+            | EraseVectorDrag::Endpoint { index, .. } => index,
+        };
         if idx >= self.erase_vectors.len() { return; }
 
         match new_drag {
@@ -644,7 +627,7 @@ impl App {
                 v.translate(dx, dy);
                 self.erase_vectors[idx] = v;
             }
-            EraseVectorDrag::ShiftAdjust { base, origin, .. } => {
+            EraseVectorDrag::ModAdjust { base, origin, .. } => {
                 let dx = cur.0 - origin.0;
                 let dy = cur.1 - origin.1;
                 // 縦方向: 回転、横方向: 太さ
@@ -724,7 +707,7 @@ impl App {
                         self.erase_vector_drag = Some(if let Some(which_p1) = hit_endpoint {
                             EraseVectorDrag::Endpoint { index: hit_idx, base, which_p1 }
                         } else if ctrl_held {
-                            EraseVectorDrag::ShiftAdjust { index: hit_idx, base, origin: img_pos }
+                            EraseVectorDrag::ModAdjust { index: hit_idx, base, origin: img_pos }
                         } else {
                             EraseVectorDrag::Pan { index: hit_idx, base, origin: img_pos }
                         });
@@ -844,8 +827,8 @@ impl App {
                                 self.erase_line_start = Some(img_pos);
                             }
                             if ctrl_held {
-                                // Shift+ドラッグ: カーソルから線への垂直距離で線幅を変更
-                                // 線 (erase_line_start → erase_line_end) は shift 開始直前に確定済み
+                                // Ctrl+ドラッグ: カーソルから線への垂直距離で線幅を変更
+                                // 線 (erase_line_start → erase_line_end) は Ctrl 開始直前に確定済み
                                 if let (Some(start), Some(end)) = (self.erase_line_start, self.erase_line_end) {
                                     let dx = end.0 - start.0;
                                     let dy = end.1 - start.1;
@@ -869,22 +852,13 @@ impl App {
                         let len = (dx * dx + dy * dy).sqrt();
                         if len > 1.0 {
                             self.push_undo_snapshot();
-                            if paint {
-                                self.erase_vectors.push(LineObject {
-                                    kind: LineKind::Diagonal,
-                                    p0: (x0, y0),
-                                    p1: (x1, y1),
-                                    thickness: self.erase_line_width.max(1.0),
-                                });
-                            } else {
-                                // 消去モード: 該当領域のベクタを削除＋ビットマップも消す
-                                self.erase_vectors_overlapping_polygon(&line_rect_pts(
-                                    (x0, y0), (x1, y1), self.erase_line_width,
-                                ));
-                                self.paint_polygon_erase(&line_rect_pts(
-                                    (x0, y0), (x1, y1), self.erase_line_width,
-                                ));
-                            }
+                            let obj = LineObject {
+                                kind: LineKind::Diagonal,
+                                p0: (x0, y0),
+                                p1: (x1, y1),
+                                thickness: self.erase_line_width.max(1.0),
+                            };
+                            self.commit_line_object(obj, paint);
                             self.erase_mask_texture = None;
                         }
                     }
@@ -896,7 +870,7 @@ impl App {
     }
 
     /// 縦線/横線ツール共通の入力処理。is_vertical=true で縦線、false で横線。
-    /// Shift+ドラッグでは線の向きに沿った軸がパン、直交軸が回転になる。
+    /// Ctrl+ドラッグでは線の向きに沿った軸がパン、直交軸が回転になる。
     fn handle_line_tool_paint(
         &mut self,
         primary_down: bool,
@@ -1000,7 +974,7 @@ impl App {
         } else {
             let corners = obj.corners(0.0).to_vec();
             self.erase_vectors_overlapping_polygon(&corners);
-            self.paint_polygon_erase(&corners);
+            self.paint_polygon(&corners, false);
         }
     }
 
@@ -1011,14 +985,8 @@ impl App {
         self.erase_vectors.retain(|v| {
             let c = v.corners(0.0);
             let (vxmin, vymin, vxmax, vymax) = bounding_box(&c);
-            // AABB オーバーラップで簡易判定 (細かい切り取りはしない)
             !(vxmax < px_min || vxmin > px_max || vymax < py_min || vymin > py_max)
         });
-    }
-
-    /// 多角形内のビットマップを false に塗る (消去モード用)。
-    fn paint_polygon_erase(&mut self, points: &[(f32, f32)]) {
-        self.paint_polygon(points, false);
     }
 
     // ── 描画 ──────────────────────────────────────────────────────
@@ -1533,7 +1501,6 @@ impl App {
 
     /// MI-GAN inpaint を実行。実行前にマスクを DB に保存する。
     pub(crate) fn execute_erase_inpaint(&mut self, ctx: &egui::Context, fs_idx: usize) {
-        // 合成マスクを作って MI-GAN に渡す。ビットマップ単体/ベクタ単体/空はそれぞれ判定。
         let composite = match self.composite_mask() {
             Some(c) if c.iter().any(|&m| m) => c,
             _ => { self.reset_erase_mode(); return; }
@@ -1548,31 +1515,13 @@ impl App {
         };
         let [w, h] = self.erase_mask_size;
 
-        // ビットマップとベクタを別々に DB + サイドカーへ保存 (再編集時に分離できるよう)。
+        // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_vectors.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
 
         let masked_count = composite.iter().filter(|&&m| m).count();
         crate::logger::log(format!("erase: inpaint start, masked pixels={masked_count}"));
-
-        self.ensure_ai_runtime();
-        let result = self.try_migan_inpaint(&original, &composite, w, h)
-            .unwrap_or_else(|e| {
-                crate::logger::log(format!("[erase] MI-GAN failed: {e}, falling back to diffusion"));
-                inpaint_diffuse(&original, &composite, w, h)
-            });
-
-        let tex = ctx.load_texture(
-            format!("fs_inpainted_{fs_idx}"),
-            result.clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        self.fs_cache.insert(fs_idx, FsCacheEntry::Static {
-            tex,
-            pixels: Arc::new(result),
-            load_seq: self.input_seq,
-        });
-        self.invalidate_derived_fs_caches(fs_idx);
+        self.run_inpaint_and_cache(ctx, fs_idx, &original, &composite, w, h, "exec");
         self.reset_erase_mode();
         crate::logger::log("erase: inpaint complete".to_string());
     }
@@ -1599,7 +1548,6 @@ impl App {
             Some(m) => m,
             None => return,
         };
-        // 合成マスクに何もなければスキップ
         let mut composite = bitmap.clone();
         crate::mask_db::rasterize_vectors_into(&mut composite, &vectors, w, h);
         if !composite.iter().any(|&m| m) { return; }
@@ -1614,25 +1562,7 @@ impl App {
             self.erase_base_cache.insert(idx, Arc::clone(&pixels));
         }
 
-        // inpaint 実行
-        self.ensure_ai_runtime();
-        let result = self.try_migan_inpaint(&pixels, &composite, w, h)
-            .unwrap_or_else(|e| {
-                crate::logger::log(format!("[erase] auto-apply MI-GAN failed: {e}, falling back to diffusion"));
-                inpaint_diffuse(&pixels, &composite, w, h)
-            });
-
-        let tex = ctx.load_texture(
-            format!("fs_inpainted_{idx}"),
-            result.clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        self.fs_cache.insert(idx, FsCacheEntry::Static {
-            tex,
-            pixels: Arc::new(result),
-            load_seq: self.input_seq,
-        });
-        self.invalidate_derived_fs_caches(idx);
+        self.run_inpaint_and_cache(ctx, idx, &pixels, &composite, w, h, "auto-apply");
     }
 
     /// フルスクリーン表示中 (消しゴムモード外) で F7/F8 から呼ばれる。
@@ -1674,42 +1604,55 @@ impl App {
         }
         let original = Arc::clone(self.erase_base_cache.get(&fs_idx).unwrap());
 
-        // 合成マスク (スロットの内容だけを使う = 差し替え)
         let mut composite = new_mask.clone();
         crate::mask_db::rasterize_vectors_into(&mut composite, &new_vectors, w, h);
         if !composite.iter().any(|&m| m) {
             return;
         }
 
-        // DB + サイドカーに保存 (既存マスクを上書き)
         self.save_mask_with_sidecar(fs_idx, &new_mask, &new_vectors, w, h);
 
         crate::logger::log(format!(
             "erase: apply_slot_in_viewing_mode slot={slot} idx={fs_idx}"
         ));
 
-        // inpaint 実行
+        self.run_inpaint_and_cache(ctx, fs_idx, &original, &composite, w, h, "viewing-mode");
+        self.show_feedback_toast(format!("[スロット{slot}適用]"));
+    }
+
+    /// MI-GAN (失敗時は拡散フォールバック) で inpaint を走らせ、結果を `fs_cache` に
+    /// 差し込んで上位レイヤ (AI upscale / 補正) のキャッシュを無効化する共通経路。
+    /// E キーの確定・保存済みマスクの自動適用・F7/F8 の 3 つから呼ばれる。
+    /// `log_prefix` はログ行を区別するための識別子。
+    fn run_inpaint_and_cache(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        original: &egui::ColorImage,
+        composite: &[bool],
+        w: usize,
+        h: usize,
+        log_prefix: &str,
+    ) {
         self.ensure_ai_runtime();
-        let result = self.try_migan_inpaint(&original, &composite, w, h)
+        let result = self.try_migan_inpaint(original, composite, w, h)
             .unwrap_or_else(|e| {
                 crate::logger::log(format!(
-                    "[erase] viewing-mode MI-GAN failed: {e}, falling back to diffusion"
+                    "[erase] {log_prefix} MI-GAN failed: {e}, falling back to diffusion"
                 ));
-                inpaint_diffuse(&original, &composite, w, h)
+                inpaint_diffuse(original, composite, w, h)
             });
-
         let tex = ctx.load_texture(
-            format!("fs_inpainted_{fs_idx}"),
+            format!("fs_inpainted_{idx}"),
             result.clone(),
             egui::TextureOptions::LINEAR,
         );
-        self.fs_cache.insert(fs_idx, FsCacheEntry::Static {
+        self.fs_cache.insert(idx, FsCacheEntry::Static {
             tex,
             pixels: Arc::new(result),
             load_seq: self.input_seq,
         });
-        self.invalidate_derived_fs_caches(fs_idx);
-        self.show_feedback_toast(format!("[スロット{slot}適用]"));
+        self.invalidate_derived_fs_caches(idx);
     }
 
     /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正) の
@@ -2173,22 +2116,6 @@ pub(crate) fn point_in_polygon(pt: (f32, f32), poly: &[(f32, f32)]) -> bool {
         j = i;
     }
     inside
-}
-
-/// 直線の中心軸と幅から矩形の 4 隅を返す (画像座標)。
-pub(crate) fn line_rect_pts(p0: (f32, f32), p1: (f32, f32), thickness: f32) -> Vec<(f32, f32)> {
-    let dx = p1.0 - p0.0;
-    let dy = p1.1 - p0.1;
-    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-    let nx = -dy / len;
-    let ny = dx / len;
-    let half = thickness * 0.5;
-    vec![
-        (p0.0 + nx * half, p0.1 + ny * half),
-        (p1.0 + nx * half, p1.1 + ny * half),
-        (p1.0 - nx * half, p1.1 - ny * half),
-        (p0.0 - nx * half, p0.1 - ny * half),
-    ]
 }
 
 /// 円周に沿って白黒の破線を交互に描画する。

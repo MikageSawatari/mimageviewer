@@ -1216,9 +1216,13 @@ impl App {
         });
 
         // 左端・上端・右端のホバーでオーバーレイ（上バー＋左パネル＋右パネル）を同時表示/非表示
-        // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する
-        // (そうしないと消しゴムパネル上のホバーで補正パネルが重なって表示される)。
-        {
+        // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する。
+        // 加えて、消しゴムモードに入る前から adjustment_mode が立っていると、消しゴムパネルが
+        // 左端を占有している間 edge_hover が常に true 扱いになり off へ遷移できないので、
+        // 強制的に落とす。
+        if self.erase_mode {
+            self.adjustment_mode = false;
+        } else {
             let edge_hover = ctx.input(|i| {
                 i.pointer.hover_pos().map(|p| {
                     p.y < 60.0  // 上端
@@ -1226,7 +1230,7 @@ impl App {
                     || p.x > full_rect.max.x - full_rect.width() * 0.05  // 右端5%
                 }).unwrap_or(false)
             });
-            if edge_hover && !self.analysis_mode && !self.erase_mode {
+            if edge_hover && !self.analysis_mode {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel && !edge_hover && self.adjustment_mode && !self.adjustment_dragging {
                 self.adjustment_mode = false;
