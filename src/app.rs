@@ -4991,20 +4991,18 @@ impl App {
         // effective_params は self を不変借用するので、派生値だけコピーして解放してから代入する
         let upscale_kind = self.effective_params(idx).upscale_model_kind();
         let denoise_kind = self.effective_params(idx).denoise_model_kind();
-        if self.settings.ai_upscale_feature {
-            match upscale_kind {
-                None => {
-                    self.ai_upscale_enabled = false;
-                    self.ai_upscale_model_override = None;
-                }
-                Some(None) => {
-                    self.ai_upscale_enabled = true;
-                    self.ai_upscale_model_override = None;
-                }
-                Some(Some(kind)) => {
-                    self.ai_upscale_enabled = true;
-                    self.ai_upscale_model_override = Some(kind);
-                }
+        match upscale_kind {
+            None => {
+                self.ai_upscale_enabled = false;
+                self.ai_upscale_model_override = None;
+            }
+            Some(None) => {
+                self.ai_upscale_enabled = true;
+                self.ai_upscale_model_override = None;
+            }
+            Some(Some(kind)) => {
+                self.ai_upscale_enabled = true;
+                self.ai_upscale_model_override = Some(kind);
             }
         }
         self.ai_denoise_model = denoise_kind;
