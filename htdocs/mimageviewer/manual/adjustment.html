@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>画像補正 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>画像補正</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="adjustment.html" class="active">画像補正</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">画像補正</h1>
+    <p class="page-desc">フルスクリーン表示中に、画像の明るさ・コントラスト・彩度などをリアルタイムで調整できます。
+    スキャン画像の読みやすさ向上や、漫画のクリーンアップに便利です。
+    補正パネルは画面左端・上端・右端にマウスを寄せるか、ホバーバーの 🎨 ボタンで表示されます。</p>
+
+    <h2>2 つのスコープ</h2>
+    <p>補正パラメータは「標準設定」と「個別設定」の 2 スコープで管理されます。</p>
+    <ul>
+      <li><strong>標準設定：</strong>アプリ全体の既定。個別設定のないページに適用されます</li>
+      <li><strong>個別設定：</strong>そのページだけに適用される補正。画面左の補正パネルでスライダーを動かすと自動的に作成されます</li>
+    </ul>
+    <p>画像を切り替えたとき、そのページに個別補正があれば右上に「ページ補正適用」のトーストが一瞬表示されます（個別設定がない場合は何も出ません）。
+    パネル上部には「標準設定を適用中」または「個別設定を適用中」と現在の状態が表示されます。
+    サムネイル一覧では個別設定のあるページの左上に青い「補」バッジが表示されます。</p>
+
+    <h2>補正パネルの操作</h2>
+    <p>画面左端・上端・右端にマウスを寄せると補正パネルが表示されます。スライダーを動かすとその瞬間に現在のページの個別補正として保存されます。</p>
+    <p>パネル上部には 4 つのアクションボタンがあります：</p>
+    <ul>
+      <li><strong>全画像に適用：</strong>現在のフォルダ / ZIP / PDF の全画像ページに、現在のパラメータを一括で書き込みます</li>
+      <li><strong>全画像から削除：</strong>現在のフォルダ / ZIP / PDF の全画像ページから個別設定を削除し、標準設定に戻します（「全画像に適用」の取り消し用）</li>
+      <li><strong>標準にする：</strong>現在のパラメータをアプリ全体の標準設定にコピーします。別フォルダを開いたときも同じ補正が初期値として適用されるようになります</li>
+      <li><strong>個別設定を解除：</strong>現在のページの個別補正を削除し、標準値に戻します（<kbd>Ctrl</kbd>+<kbd>Backspace</kbd>）</li>
+    </ul>
+    <p><kbd>U</kbd> キーで AI アップスケールモデルのサイクル切替、<kbd>N</kbd> キーで AI ノイズ除去の ON/OFF も行えます。
+    現在のページに個別設定がある場合は個別設定を、無い場合は標準設定を書き換えます
+    （トーストに「個別」「標準」と表示され、どちらに書き込まれたかが確認できます）。</p>
+
+    <h2>保存スロット</h2>
+    <p>補正パネルから 10 個の名前付きスロットに補正パラメータを保存できます。
+    気に入った補正設定を保存しておき、別フォルダでも呼び出して使えます。</p>
+    <ul>
+      <li>補正パネル下部の <strong>💾</strong> ボタンで保存ダイアログを開き、スロット名を入力して保存</li>
+      <li><kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> でスロット 1〜10 を現在のページに適用（= そのページを個別化）</li>
+      <li>パネルのスロット名ボタンをクリックしても同じ動作です</li>
+    </ul>
+
+    <h2>補正パラメータ</h2>
+    <p>補正パネルのスライダーで以下のパラメータを調整できます：</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>パラメータ</th><th>範囲</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>明るさ</td><td>-100〜+100</td><td>全体の明るさを調整</td></tr>
+          <tr><td>コントラスト</td><td>-100〜+100</td><td>明暗の差を強調・抑制</td></tr>
+          <tr><td>ガンマ</td><td>0.2〜5.0</td><td>中間調の明るさを非線形に調整（対数スライダー）</td></tr>
+          <tr><td>彩度</td><td>-100〜+100</td><td>色の鮮やかさを調整</td></tr>
+          <tr><td>色温度</td><td>-100〜+100</td><td>暖色（赤み）↔ 寒色（青み）を調整</td></tr>
+          <tr><td>黒点 / 白点</td><td>0〜255</td><td>レベル補正の入力範囲</td></tr>
+          <tr><td>中間点</td><td>0.1〜10.0</td><td>レベル補正のガンマ（対数スライダー）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>補正モード</h2>
+    <p>補正パネル上部のラジオボタンで、補正モードを切り替えられます：</p>
+    <ul>
+      <li><strong>手動：</strong>スライダーで各パラメータを自由に調整</li>
+      <li><strong>自動補正：</strong>ヒストグラムの 0.5%/99.5% 位置で黒点・白点を自動設定</li>
+      <li><strong>モノクロ漫画補正：</strong>グレースケール化 + 紙色除去 + 黒強化 + S 字カーブ（漫画スキャンのクリーンアップ用）</li>
+    </ul>
+    <p>自動補正 / モノクロ漫画補正を選択中は、スライダーは無効化されます。</p>
+
+    <h2>AI ノイズ除去</h2>
+    <p>補正パネルの「AI ノイズ除去」チェックボックスで、JPEG 圧縮ノイズ（ブロックノイズ・モスキートノイズ）を
+    AI で除去できます。標準設定・個別設定のいずれでも ON/OFF を切り替えられ、アップスケールと組み合わせて使用できます
+    （ノイズ除去が先に実行され、その結果に対してアップスケールが適用されます）。</p>
+    <p>画像サイズが環境設定で指定した閾値以上の場合、その画像では実行されませんが、
+    設定自体は編集できます（後から別の画像や標準設定として利用するため）。</p>
+
+    <h2>AI アップスケール</h2>
+    <p>補正パネル下部で、AI アップスケールのモデルを選択できます（標準設定・個別設定のどちらでも設定可能）。
+    補正とアップスケールは同時に動作し、補正済みの画像に対してアップスケールが適用されます。</p>
+    <ul>
+      <li><strong>なし：</strong>アップスケールを適用しない</li>
+      <li><strong>自動 (画像タイプ判別)：</strong>画像タイプ（イラスト / 漫画 / 写真・CG）を AI で自動判別して最適なモデルを選択</li>
+      <li><strong>写真・CG (ノイズ除去強)：</strong>Real-ESRGAN x4plus。汎用の高品質モデル。JPEG ノイズやブラーを強めに除去する</li>
+      <li><strong>イラスト・アニメ：</strong>Real-ESRGAN Anime 6B。線画をくっきりさせて塗りを平坦化する</li>
+      <li><strong>漫画 (トーン保持)：</strong>Real-CUGAN 4x conservative。スクリーントーンの周期パターンを残したまま拡大する</li>
+      <li><strong>写真 (質感保持)：</strong>4x-NMKD-Siax-200k。フィルム粒子や布目など細かい質感を残す写真向け</li>
+      <li><strong>高速汎用：</strong>Real-ESR General V3。他モデルより軽量で処理が速い。補正量も控えめで破綻しにくい</li>
+    </ul>
+    <p>「自動 (画像タイプ判別)」は画像の内容から最適なモデルを自動で選びます。
+    特定のモデル（<em>写真 (質感保持)</em>、<em>高速汎用</em> など）を使いたい場合は、手動で選択してください。</p>
+    <p>画像サイズが環境設定で指定した閾値以上の場合、その画像では実行されませんが、
+    モデルの選択自体は可能です。</p>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        スライダーの右側の「↩」ボタンでそのパラメータをデフォルト値に戻せます。
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
