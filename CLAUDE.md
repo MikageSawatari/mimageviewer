@@ -115,13 +115,14 @@ mimageviewer/
 │   └── bin/
 │       └── bench_thumbs.rs  # サムネイル生成ベンチマーク
 ├── scripts/
-│   ├── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
-│   └── setup-models.sh      # AI モデルダウンロードスクリプト
+│   └── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
 ├── vendor/
 │   ├── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
 │   │   └── bin/pdfium.dll   # include_bytes! で exe に埋め込まれる
-│   └── models/              # AI ONNX モデル（.gitignore、setup-models.sh で取得）
-│       └── *.onnx           # include_bytes! で exe に埋め込まれる
+│   └── models/              # AI ONNX モデル（.gitignore、配布スクリプトなし）
+│       └── *.onnx           # include_bytes! で exe に埋め込まれる。
+│                            # 新規開発環境では %APPDATA%\mimageviewer\models\
+│                            # (インストール済み環境が展開したもの) からコピーする
 ├── Cargo.toml
 └── Cargo.lock
 ```
