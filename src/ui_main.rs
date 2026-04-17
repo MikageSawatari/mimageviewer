@@ -923,6 +923,7 @@ impl App {
 
                                 let rot = self.get_rotation(idx);
                                 let has_page_override = self.adjustment_page_params.contains_key(&idx);
+                                let has_mask = self.mask_pages.contains(&idx);
                                 let rating = self.get_rating(idx);
                                 crate::app::draw_cell(
                                     ui,
@@ -930,6 +931,7 @@ impl App {
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
                                     has_page_override,
+                                    has_mask,
                                     rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],

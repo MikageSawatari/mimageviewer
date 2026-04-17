@@ -683,6 +683,9 @@ pub struct App {
     /// ページ個別の補正パラメータ: item_idx → AdjustParams
     /// ここに登録されていないページはグローバル (settings.global_preset) が適用される。
     pub(crate) adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
+    /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
+    pub(crate) mask_pages: std::collections::HashSet<usize>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// スライダードラッグ中フラグ（パネル内ウィジェットのドラッグ検出）
@@ -941,6 +944,7 @@ impl Default for App {
             // 画像補正
             adjustment_mode: false,
             adjustment_page_params: std::collections::HashMap::new(),
+            mask_pages: std::collections::HashSet::new(),
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_dragging: false,
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
@@ -1731,6 +1735,8 @@ impl App {
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
+        // 消しゴムマスク: フォルダ内でマスクを持つページ集合をリセット
+        self.mask_pages.clear();
 
         // ── サイドカー → 中央 DB のインポート ──
         // フォルダ丸ごと移動された場合など、中央 DB に無いエントリがサイドカーにあれば
@@ -1756,6 +1762,21 @@ impl App {
                     if let Some(key) = self.page_path_key(idx) {
                         if let Some(params) = page_map.get(&key) {
                             self.adjustment_page_params.insert(idx, params.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 消しゴムマスク: フォルダ内でマスクを持つページを列挙
+        if let Some(db) = &self.mask_db {
+            let prefix = crate::adjustment_db::normalize_path(&source_path);
+            let mask_keys = db.load_mask_keys(&prefix);
+            if !mask_keys.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if mask_keys.contains(&key) {
+                            self.mask_pages.insert(idx);
                         }
                     }
                 }
@@ -2838,6 +2859,19 @@ impl App {
                 }
             }
 
+            // F7/F8: マスクスロット 1/2 を一括適用
+            // (チェック済みアイテムがあれば一括、なければ選択 1 件に)
+            {
+                let slot_key = ctx.input(|i| {
+                    if i.key_pressed(egui::Key::F7) { Some(1usize) }
+                    else if i.key_pressed(egui::Key::F8) { Some(2) }
+                    else { None }
+                });
+                if let Some(slot) = slot_key {
+                    self.apply_slot_to_selection(slot);
+                }
+            }
+
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
@@ -3822,6 +3856,75 @@ impl App {
 
     /// F1-F6 キー用: チェック済みアイテムがあれば一括で、なければ現在選択にレーティングを適用する。
     /// visible_indices の外に出る可能性があるため、適用後はフィルタを再評価する。
+    /// グリッド画面から F7/F8 で呼ばれる一括適用。
+    /// チェック済みアイテムがあればそれら、無ければ選択中 1 つにマスクスロットを適用する。
+    /// 実際の inpaint は各ページをフルスクリーンで開いたときに `auto_apply_saved_mask` が走る。
+    /// ここでは DB + サイドカーにスロットの内容 (ビットマップ + ベクタ) を書き込むだけで十分。
+    pub(crate) fn apply_slot_to_selection(&mut self, slot: usize) {
+        // 対象を決定: チェック済みがあればそちら、無ければ選択中の 1 件
+        let targets: Vec<usize> = if !self.checked.is_empty() {
+            self.checked
+                .iter()
+                .copied()
+                .filter(|&idx| self.items.get(idx).is_some_and(|it| it.is_ratable()))
+                .collect()
+        } else if let Some(idx) = self.selected {
+            if self.items.get(idx).is_some_and(|it| it.is_ratable()) {
+                vec![idx]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if targets.is_empty() {
+            self.show_feedback_toast("[適用対象なし]".to_string());
+            return;
+        }
+
+        // スロットのデータを一度だけ取得 (元サイズのまま)。
+        // 各ページに書き込むとき w/h はスロットの元サイズとして記録し、
+        // フルスクリーンで開かれたときに get_full 側で自動リスケールされる。
+        let (slot_bitmap, slot_vectors, sw, sh) = match self.mask_db.as_ref() {
+            Some(db) => {
+                let Some((sw, sh)) = db.slot_size(slot) else {
+                    self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+                    return;
+                };
+                let Some((mask, vectors)) = db.get_slot_full(slot, sw, sh) else {
+                    self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+                    return;
+                };
+                if !mask.iter().any(|&m| m) && vectors.is_empty() {
+                    self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+                    return;
+                }
+                (mask, vectors, sw, sh)
+            }
+            None => {
+                self.show_feedback_toast("[マスクDB未初期化]".to_string());
+                return;
+            }
+        };
+
+        // 各ページに保存 (差し替え仕様)。フルスクリーンで開いた時点で inpaint 自動適用。
+        let total = targets.len();
+        for idx in &targets {
+            // フルスクリーンで現在これらのページを開いている可能性は低い (grid モード) が、
+            // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
+            self.erase_base_cache.remove(idx);
+            self.fs_cache.remove(idx);
+            self.save_mask_with_sidecar(*idx, &slot_bitmap, &slot_vectors, sw, sh);
+        }
+
+        self.checked.clear();
+        crate::logger::log(format!(
+            "[ERASE] Bulk apply slot {slot} to {total} items"
+        ));
+        self.show_feedback_toast(format!("[スロット{slot} を{total}枚に適用]"));
+    }
+
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
         let stars = stars.min(5);
         if !self.checked.is_empty() {
@@ -4731,7 +4834,7 @@ impl App {
 
     /// マスクとベクタを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
     /// ビットマップが全 false かつベクタが空なら DB からもサイドカーからも削除する
-    /// (mask_db.set の仕様と揃える)。
+    /// (mask_db.set の仕様と揃える)。サムネイルバッジ用の `mask_pages` もここで更新する。
     pub(crate) fn save_mask_with_sidecar(
         &mut self,
         idx: usize,
@@ -4750,8 +4853,10 @@ impl App {
             let _ = db.set(&key, mask, vectors, w, h);
         }
         if is_empty {
+            self.mask_pages.remove(&idx);
             self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
         } else {
+            self.mask_pages.insert(idx);
             let sidecar_mask = crate::sidecar::SidecarMask::from_raw(
                 &crate::mask_db::compress_mask(mask),
                 vectors,
@@ -4771,6 +4876,7 @@ impl App {
         if let Some(db) = &self.mask_db {
             let _ = db.delete(&key);
         }
+        self.mask_pages.remove(&idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
     }
 
@@ -6378,7 +6484,8 @@ pub(crate) fn draw_cell(
     rect: egui::Rect,
     is_selected: bool,
     is_checked: bool,
-    has_page_override: bool,  // true なら左上に補正済みバッジを表示
+    has_page_override: bool,  // true なら左上に補正済みバッジ「補」を表示
+    has_mask: bool,           // true なら左上に消しゴムマスクバッジ「消」を表示
     rating: u8,               // 0 = 非表示, 1-5 = ★バッジ
     item: &GridItem,
     thumb: &ThumbnailState,
@@ -6560,22 +6667,41 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // ページ個別補正バッジ（個別設定があるページの左上に表示）
-    if has_page_override {
+    // 左上バッジ: 補 (ページ個別補正) と 消 (消しゴムマスク) を横並びで表示
+    {
         let badge_w = 18.0;
         let badge_h = 16.0;
-        let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x + 3.0, rect.min.y + 3.0),
-            egui::vec2(badge_w, badge_h),
-        );
-        painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(50, 120, 220));
-        painter.text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "補",
-            egui::FontId::proportional(11.0),
-            egui::Color32::WHITE,
-        );
+        let mut x = rect.min.x + 3.0;
+        let y = rect.min.y + 3.0;
+        if has_page_override {
+            let badge_rect = egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(badge_w, badge_h),
+            );
+            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(50, 120, 220));
+            painter.text(
+                badge_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "補",
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            x += badge_w + 2.0;
+        }
+        if has_mask {
+            let badge_rect = egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(badge_w, badge_h),
+            );
+            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(200, 80, 40));
+            painter.text(
+                badge_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "消",
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
 
     // レーティングバッジ（1-5 ★、左下に半透明の背景付きで表示）

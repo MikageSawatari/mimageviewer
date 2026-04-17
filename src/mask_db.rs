@@ -286,6 +286,45 @@ impl MaskDb {
         self.get_full(&slot_key(slot), expected_w, expected_h)
     }
 
+    /// スロットの元のサイズ (width, height) を返す。存在しなければ None。
+    /// 一括適用で元サイズのままデータを配る場合に使う。
+    pub fn slot_size(&self, slot: usize) -> Option<(usize, usize)> {
+        let mut stmt = self.conn
+            .prepare_cached("SELECT width, height FROM masks WHERE path = ?1")
+            .ok()?;
+        stmt.query_row([slot_key(slot)], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+            ))
+        }).ok()
+    }
+
+    /// 指定プレフィックスで始まるパスを持つマスクエントリのキー集合を返す。
+    /// フォルダ単位の「このフォルダ内でマスクを持つページ」列挙に使う。
+    /// スロットキー (`__slot_*`) は除外する。
+    pub fn load_mask_keys(&self, prefix: &str) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT path FROM masks WHERE path LIKE ?1 ESCAPE '\\' AND path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'"
+        ) else {
+            return set;
+        };
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('[', "\\[");
+        let pattern = format!("{escaped}%");
+        let Ok(rows) = stmt.query_map([&pattern], |row| row.get::<_, String>(0)) else {
+            return set;
+        };
+        for r in rows.flatten() {
+            set.insert(r);
+        }
+        set
+    }
+
     fn upsert_mask(
         &self,
         key: &str,
