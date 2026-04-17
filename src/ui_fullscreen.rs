@@ -260,7 +260,9 @@ impl App {
         let mut nav_delta: i32 = 0;
         let mut ctrl_nav: Option<i32> = None;
         let mut jump_to: Option<usize> = None;
-        // 境界ヒントをフレーム内イベントで打ち切るための状態
+        // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
+        // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
+        // いれば「このフレームで再設定されていない」= 打ち切ってよい、と判定する。
         let hint_start_before = self.fs_boundary_hint.map(|(_, t)| t);
         let mut had_user_input_in_frame = false;
 
@@ -280,8 +282,8 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
 
-                // 境界ヒントを即座に消すため、このフレームに「操作」があったかを
-                // event consume される前に捕捉する。マウス移動は除外。
+                // event consume される前に捕捉 (handle_fs_key_input が矢印等を
+                // 消費するとイベントが見えなくなるため)。マウス移動は操作と見なさない。
                 if self.fs_boundary_hint.is_some() {
                     had_user_input_in_frame = ctx.input(|i| {
                         i.events.iter().any(|e| matches!(
@@ -587,10 +589,9 @@ impl App {
         // ── ナビゲーション & スライドショー処理 ──
         self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, jump_to, fs_idx);
 
-        // 境界ヒント即時消去: このフレームにキー/クリック/ホイール操作があり、
-        // かつ handle_fs_navigation でヒントが再設定されていない (= 境界でない
-        // 方向への移動、別キー入力、等) なら直ちに消す。
-        // 再設定されていた場合 (= 引き続き境界に突き当たった) は残す。
+        // hint_start_before と一致 = このフレームで再設定されていない
+        // (= 境界でない方向への移動、別キー入力、等)。操作があれば即消去。
+        // 再設定されていた場合 (= 引き続き境界に突き当たった) はそのまま残す。
         if had_user_input_in_frame {
             let hint_now = self.fs_boundary_hint.map(|(_, t)| t);
             if hint_now.is_some() && hint_now == hint_start_before {
@@ -1141,7 +1142,6 @@ impl App {
         if ctrl_d { action.ctrl_nav = Some(1); }
         if ctrl_u { action.ctrl_nav = Some(-1); }
 
-        // Home/End: 最初/最後の画像へ絶対ジャンプ
         if key_home {
             if let Some(first) = crate::ui_helpers::boundary_navigable_idx(
                 &self.items, &self.visible_indices, false,
@@ -1445,7 +1445,6 @@ impl App {
             }
         } else if !close_fs {
             if let Some(new_idx) = jump_to {
-                // Home/End: 絶対ジャンプ。境界に達しているかは呼び出し側で判定済み。
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
@@ -2724,17 +2723,16 @@ impl App {
             return;
         }
 
-        // フェードアウト (最後の 0.4 秒)
         let alpha = if elapsed > BOUNDARY_HINT_DURATION - 0.4 {
             ((BOUNDARY_HINT_DURATION - elapsed) / 0.4).clamp(0.0, 1.0)
         } else {
             1.0
         };
 
-        let (title, key1_label, key1_desc, key2_label, key2_desc) = if at_end {
-            ("最後の画像です", "Home", "最初に戻る", "Ctrl]+[↓", "次のフォルダへ")
+        let (title, line1, line2) = if at_end {
+            ("最後の画像です", "[Home] 最初に戻る", "[Ctrl]+[↓] 次のフォルダへ")
         } else {
-            ("最初の画像です", "End", "最後に移動", "Ctrl]+[↑", "前のフォルダへ")
+            ("最初の画像です", "[End] 最後に移動", "[Ctrl]+[↑] 前のフォルダへ")
         };
 
         let title_font = egui::FontId::proportional(32.0);
@@ -2742,13 +2740,10 @@ impl App {
         let white = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8);
         let accent = egui::Color32::from_rgba_unmultiplied(255, 220, 120, (alpha * 255.0) as u8);
 
-        // 各行のレイアウト
         let painter = ui.painter();
         let title_galley = painter.layout_no_wrap(title.to_string(), title_font.clone(), white);
-        let line1 = format!("[{}] {}", key1_label, key1_desc);
-        let line2 = format!("[{}] {}", key2_label, key2_desc);
-        let line1_galley = painter.layout_no_wrap(line1.clone(), body_font.clone(), white);
-        let line2_galley = painter.layout_no_wrap(line2.clone(), body_font.clone(), white);
+        let line1_galley = painter.layout_no_wrap(line1.to_string(), body_font.clone(), white);
+        let line2_galley = painter.layout_no_wrap(line2.to_string(), body_font.clone(), white);
 
         let line_gap = 10.0;
         let padding = egui::vec2(32.0, 24.0);
@@ -2776,7 +2771,6 @@ impl App {
             egui::StrokeKind::Outside,
         );
 
-        // 本文を上から順に中央揃えで描画
         let mut y = box_rect.min.y + padding.y;
         painter.text(
             egui::pos2(center.x, y),
