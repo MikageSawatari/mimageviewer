@@ -1459,6 +1459,16 @@ impl App {
             self.erase_selected_vector = None;
             self.erase_vector_drag = None;
             self.erase_mask_texture = None;
+            // 編集中の一時状態も破棄しないと、ドラッグ途中に全削除を押したあと
+            // 次の release/click で描きかけの囲み・直線・シフト分だけの差分が
+            // 復活してしまう。reset_erase_mode() と同じ範囲をクリアするが、
+            // erase_mode 自体は維持してその場で編集を継続できるようにする。
+            self.erase_last_paint_pos = None;
+            self.erase_lasso_points.clear();
+            self.erase_line_start = None;
+            self.erase_line_end = None;
+            self.erase_line_tilt = 0.0;
+            self.erase_shift_drag = None;
             if let Some(fs_idx) = self.fullscreen_idx {
                 // DB + サイドカーからも削除
                 self.delete_mask_with_sidecar(fs_idx);

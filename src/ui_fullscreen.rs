@@ -215,15 +215,32 @@ impl App {
         // 見えてちらつくので、黒で塗った状態を維持する。
         if self.fs_viewport_shown && self.fs_nav_after_pdf_enumerate.is_some() {
             let fs_builder = self.build_fullscreen_viewport_builder();
+            let mut cancel = false;
             ctx.show_viewport_immediate(
                 fs_id,
                 fs_builder,
                 |ctx, _class| {
+                    // 列挙が重い / ワーカー異常停止などで待ちが長くなったときに
+                    // ユーザーが黒画面に閉じ込められないよう、Esc とウィンドウ
+                    // クローズ要求を受け付けて保留中の遷移をキャンセルする。
+                    if ctx.input(|i| i.viewport().close_requested())
+                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        cancel = true;
+                    }
                     egui::CentralPanel::default()
                         .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                         .show(ctx, |_ui| {});
                 },
             );
+            if cancel {
+                // 保留中の「列挙後にフルスクリーン復帰」意図を破棄。
+                // poll_pdf_enumerate 完了時のフルスクリーン再オープンが抑止され、
+                // 次フレーム以降はこの関数の非アクティブ経路でビューポートが
+                // 隠される (グリッドへ戻る)。
+                self.fs_nav_after_pdf_enumerate = None;
+                ctx.request_repaint();
+            }
             return;
         }
 
