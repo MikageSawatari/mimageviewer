@@ -2877,6 +2877,24 @@ impl App {
                 }
             }
 
+            // Ctrl+1〜0: 補正プリセットスロットを一括適用
+            // (フルスクリーン側 ui_fullscreen.rs の Ctrl+Num0-9 と同じスロットに揃える)
+            {
+                const SLOT_KEYS: [egui::Key; 10] = [
+                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+                    egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8,
+                    egui::Key::Num9, egui::Key::Num0,
+                ];
+                let preset_slot = ctx.input_mut(|i| {
+                    SLOT_KEYS.iter().position(|k| {
+                        i.consume_key(egui::Modifiers::CTRL, *k)
+                    })
+                });
+                if let Some(slot) = preset_slot {
+                    self.apply_slot_to_grid_selection(slot);
+                }
+            }
+
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
@@ -5231,6 +5249,64 @@ impl App {
         }
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
+    }
+
+    /// 保存スロットをグリッド上の対象に適用する。Ctrl+1〜0 のキーハンドラから呼ぶ。
+    /// 対象は `apply_rating_to_selection` / `apply_slot_to_selection` と同じ規則:
+    /// チェック済みがあればそれら全て、無ければカーソル位置 (selected)、それも
+    /// 無ければ何もしない。
+    pub(crate) fn apply_slot_to_grid_selection(&mut self, slot_idx: usize) {
+        let targets: Vec<usize> = if !self.checked.is_empty() {
+            self.checked
+                .iter()
+                .copied()
+                .filter(|&idx| self.items.get(idx).is_some_and(|it| it.is_ratable()))
+                .collect()
+        } else if let Some(idx) = self.selected {
+            if self.items.get(idx).is_some_and(|it| it.is_ratable()) {
+                vec![idx]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if targets.is_empty() {
+            self.show_feedback_toast("[適用対象なし]".to_string());
+            return;
+        }
+
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
+            self.show_feedback_toast(format!("[スロット{}は空です]", key_label));
+            return;
+        };
+
+        let mut any_ai_changed = false;
+        for &idx in &targets {
+            if !self.effective_params(idx).ai_settings_eq(&slot.params) {
+                any_ai_changed = true;
+            }
+            self.set_page_params(idx, slot.params.clone());
+            self.clear_adjustment_caches(idx);
+        }
+        // AI 設定が変わった target があれば AI キャッシュ/pending をまとめてクリア。
+        // clear_all_adjustment_and_ai_caches は引数 idx の adjustment_cache を
+        // 再度消すが、上のループで全 target 分クリア済みなので副作用なし。
+        if any_ai_changed {
+            self.clear_all_adjustment_and_ai_caches(targets[0]);
+        }
+
+        let count = targets.len();
+        if count == 1 {
+            self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
+        } else {
+            self.show_feedback_toast(format!(
+                "[スロット{}:{} を{}枚に適用]", key_label, slot.name, count
+            ));
+            self.checked.clear();
+        }
     }
 
     /// 指定ピクセルデータに色調補正を同期適用して adjustment_cache に格納する。
