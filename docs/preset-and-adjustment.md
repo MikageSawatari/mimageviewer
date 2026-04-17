@@ -253,3 +253,99 @@ AI モデル変更を伴う可能性がある操作は必ず後者を使う。
 
 画像補正パネルトグルボタン (🎨) を 1 つだけ置く。
 パネルが開いているときは青、個別設定があるときは薄い警告色、それ以外は通常色。
+
+---
+
+## 9. フォルダ側サイドカーバックアップ
+
+ページ個別補正 (`adjustment.db`) と消しゴムマスク (`mask.db`) は、中央 DB だけだと
+「フォルダを別ドライブへ移動するとパスキーが無効化されて設定が失われる」という弱点がある。
+これを補うため、各ユーザーフォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON)
+をバックアップとして配置する。
+
+### 9.1 ミラーの原則
+
+- **中央 DB が authoritative**。サイドカーはあくまでバックアップ。
+- **すべての書き込みはミラー**: DB 更新と同じタイミングでメモリ上のサイドカー表現
+  (`App::sidecars`) を更新し dirty フラグを立てる。
+- **実ディスク書き込みのタイミング**:
+  1. フォルダ切替時 (`start_loading_items` 冒頭で `flush_all_sidecars`)
+  2. アプリ正常終了時 (`on_exit` 内)
+  3. 5 秒アイドル時 (毎フレーム `flush_idle_sidecars` で `is_dirty && now - last_change >= 5s` を判定)
+- **読み込み**: `start_loading_items` 内で `import_sidecar_to_dbs` が走り、中央 DB に無い
+  エントリだけサイドカーからインポートする (冪等)。
+
+### 9.2 キー規則
+
+サイドカー内のエントリはフォルダ**相対**キーで保存する (絶対パスにすると移動で意味が消えるため):
+
+| GridItem         | サイドカー置き場       | 相対キー                                      |
+| ---------------- | ---------------------- | --------------------------------------------- |
+| `Image(p)`       | `p.parent()`           | `"{filename_lower}"`                          |
+| `ZipImage`       | `zip_path.parent()`    | `"{zip_filename_lower}::{entry_name_lower}"`  |
+| `PdfPage`        | `pdf_path.parent()`    | `"{pdf_filename_lower}::page_{n}"`            |
+
+これらは `App::page_path_key` が返す絶対 DB キーと 1:1 で対応する。ヘルパー:
+
+- `App::sidecar_folder(idx)` → 置き場
+- `App::sidecar_relative_key(idx)` → 相対キー
+- `sidecar::reconstruct_image_key(folder, rel)` / `reconstruct_virtual_key(folder, rel)` → 絶対 DB キー再構成
+
+**キーの整合性はユニットテストで担保**。`adjustment_db::normalize_path` の挙動と揃っていないと
+インポートで復元されない。
+
+### 9.3 マスクの書き込みタイミング
+
+消しゴムマスクは書き込みコストが大きい (1bit/pixel pack + deflate + JSON 埋め込み) ため、
+**消しゴムモードの確定点でのみ** 書く:
+
+1. `ESC` 終了 (ui_erase.rs の ESC ハンドラ内 `save_mask_with_sidecar`)
+2. `E` 補完実行 (ui_erase.rs `execute_erase_inpaint` 内 `save_mask_with_sidecar`)
+3. 「マスク全削除」ボタン (ui_erase.rs 内 `delete_mask_with_sidecar`)
+
+ストローク毎の書き込みは行わない。中央 DB もサイドカーも同じタイミングでしか書かない。
+
+### 9.4 空になったファイル
+
+サイドカーエントリは `{adjust?, mask?}` 構造。`adjust` と `mask` が両方 `None` になると
+`items` マップから削除する。`items` が空のまま flush されると **ファイル自体を `remove_file`**
+する (消しゴムマスクも全削除しないと空にはならないので、ユーザの明示的操作が前提)。
+ファイル削除失敗は黙って無視。
+
+### 9.5 設定トグル (`sidecar_backup_enabled`)
+
+`Preferences > フォルダ > 設定のバックアップ` に配置。デフォルト ON。
+OFF にすると **読み書き両方スキップ** (既存 `.dat` は削除しない)。単一の分岐点 (`App::sidecar_mut`
+が `None` を返す) で済むので、デバッグ面でのコストは最小。
+
+### 9.6 エラーハンドリング
+
+読み取り専用メディアや権限不足で IO が失敗した場合:
+- ログに 1 行書いて無視
+- `SidecarFile::disabled = true` を立てて以降同フォルダは再試行しない (ログ汚染防止)
+- アプリ再起動で `disabled` はリセット
+
+ユーザへのダイアログ表示はしない (視聴体験の邪魔になるため)。
+
+### 9.7 テスト
+
+サイドカーの動作は 3 層で自動テスト済み:
+
+- **単体テスト**: `src/sidecar.rs` の `#[cfg(test)] mod tests` に 9 件
+  (set/remove、空→削除、JSON ラウンドトリップ、キー再構成など)
+- **統合テスト**: [tests/sidecar_import.rs](../tests/sidecar_import.rs) に 12 件
+  - **フォルダ移動シナリオ**: 空 DB + サイドカー → DB に復元
+  - 中央 DB が authoritative (既存エントリが上書きされない)
+  - 部分的重複時の正しいスキップ/インポート振り分け
+  - ZIP / PDF エントリのキー整合 (`adjustment_db::normalize_path` と一致)
+  - サイドカー無しの no-op
+  - 将来バージョンの `.dat` をインポートしない
+  - 書き込み不能パスで panic しない
+  - Hidden+System 属性付きファイルの再読込・上書き
+- **手動 E2E**: フルスクリーン UI 経由での編集→フォルダ移動→復元までは
+  [docs/e2e-smoke-test.md](e2e-smoke-test.md) を参照。
+
+統合テストは `cargo test --test sidecar_import` で 1 秒程度で走る。
+GUI 起動を含まないため CI でも実行可能。テストの多くは
+`AdjustmentDb::open_at` / `MaskDb::open_at` で一時 DB を作って隔離している
+(デフォルトの `open()` は `%APPDATA%` を使うのでテスト用途には不向き)。

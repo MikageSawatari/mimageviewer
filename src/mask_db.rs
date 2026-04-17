@@ -17,11 +17,15 @@ pub struct MaskDb {
 
 impl MaskDb {
     pub fn open() -> Result<Self, rusqlite::Error> {
-        let path = Self::db_path();
+        Self::open_at(&Self::db_path())
+    }
+
+    /// 任意のパスで DB を開く。テスト・統合テスト用。
+    pub fn open_at(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(&path)?;
+        let conn = rusqlite::Connection::open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS masks (
                 path       TEXT PRIMARY KEY,
@@ -80,6 +84,18 @@ impl MaskDb {
         self.upsert_mask(&slot_key(slot), mask, w, h)
     }
 
+    /// 既に 1bit/pixel + deflate 圧縮済みの生バイト列を直接保存する。
+    /// サイドカー (mimageviewer.dat) からのインポート時に使用する (再圧縮を避ける)。
+    pub fn set_raw(&self, key: &str, compressed: &[u8], w: usize, h: usize) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO masks (path, mask_data, width, height) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4",
+            rusqlite::params![key, compressed, w as i64, h as i64],
+        )?;
+        Ok(())
+    }
+
+
     /// 名前付きスロットからマスクを取得する。サイズが異なる場合は自動リスケール。
     pub fn get_slot(&self, slot: usize, expected_w: usize, expected_h: usize) -> Option<Vec<bool>> {
         self.get(&slot_key(slot), expected_w, expected_h)
@@ -101,7 +117,7 @@ fn slot_key(slot: usize) -> String {
 }
 
 /// マスク (Vec<bool>) を 1bit/pixel にパックし deflate 圧縮する。
-fn compress_mask(mask: &[bool]) -> Vec<u8> {
+pub fn compress_mask(mask: &[bool]) -> Vec<u8> {
     // 1bit/pixel にパック
     let byte_count = (mask.len() + 7) / 8;
     let mut packed = vec![0u8; byte_count];

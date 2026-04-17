@@ -728,6 +728,29 @@ fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .suffix(" 回"),
         );
     });
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("設定のバックアップ").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "画像補正・消しゴムマスクの設定をフォルダごとに mimageviewer.dat として\n\
+         隠しファイルで保存します。フォルダを丸ごと別ドライブへ移動しても設定が\n\
+         保持されるようになります。",
+    );
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.sidecar_backup_enabled,
+        "フォルダに補正・マスク設定のバックアップを保存する",
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "OFF 中は既存のバックアップファイルも読み込まれません\n\
+             (ファイル自体は削除されません)。",
+        )
+        .size(11.0)
+        .color(egui::Color32::from_gray(150)),
+    );
 }
 
 fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {

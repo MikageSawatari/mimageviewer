@@ -527,6 +527,13 @@ pub struct Settings {
     /// 保存スロット (10個)。名前付きで保存した補正設定。
     #[serde(default)]
     pub preset_slots: crate::adjustment::PresetSlots,
+
+    // ── フォルダ側サイドカー ───────────────────────────────────
+    /// 補正・消しゴムマスク設定をフォルダごとのサイドカーファイル
+    /// (`mimageviewer.dat`、隠し+システム属性) にバックアップする。
+    /// OFF 時は読み書き両方スキップ (既存の `.dat` は削除しない)。
+    #[serde(default = "default_true")]
+    pub sidecar_backup_enabled: bool,
 }
 
 /// グリッド列数の最小値
@@ -679,6 +686,7 @@ impl Default for Settings {
             ai_denoise_feature: false,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
+            sidecar_backup_enabled: true,
         }
     }
 }

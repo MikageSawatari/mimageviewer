@@ -712,6 +712,10 @@ pub struct App {
     /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
+
+    /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
+    /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
+    pub(crate) sidecars: std::collections::HashMap<std::path::PathBuf, crate::sidecar::SidecarFile>,
 }
 
 impl Default for App {
@@ -915,6 +919,7 @@ impl Default for App {
             frame_counter: 0,
             perf_last_flush: None,
             fs_painted_last: None,
+            sidecars: std::collections::HashMap::new(),
         }
     }
 }
@@ -1583,6 +1588,12 @@ impl App {
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
     ) {
+        // ── サイドカーをフラッシュしてメモリから降ろす ──
+        // フォルダ切替前に dirty なサイドカーをディスクに書き出す。メモリ上の表現は
+        // 破棄して再読み込みに任せる (長時間稼働時のメモリリーク防止)。
+        self.flush_all_sidecars();
+        self.sidecars.clear();
+
         // ── 履歴保存 + 旧タスクキャンセル + 状態リセット ──
         if let Some(cur) = self.current_folder.clone() {
             self.folder_history.insert(cur, (self.scroll_offset_y, self.selected));
@@ -1646,6 +1657,23 @@ impl App {
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
+
+        // ── サイドカー → 中央 DB のインポート ──
+        // フォルダ丸ごと移動された場合など、中央 DB に無いエントリがサイドカーにあれば
+        // 取り込む。DB にあるエントリは authoritative なので上書きしない。
+        // 下の `db.load_page_params` はインポート後に走るので、補填されたエントリも拾える。
+        if self.settings.sidecar_backup_enabled {
+            let sidecar_folder = if source_path.is_dir() {
+                source_path.clone()
+            } else {
+                source_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| source_path.clone())
+            };
+            self.import_sidecar_to_dbs(&sidecar_folder);
+        }
+
         if let Some(db) = &self.adjustment_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let page_map = db.load_page_params(&prefix);
@@ -4512,6 +4540,154 @@ impl App {
         Some(key)
     }
 
+    /// ページのサイドカー置き場 (= 対応する `mimageviewer.dat` が置かれるフォルダ) を返す。
+    /// `page_path_key` と対になるヘルパー。3 バリアント対応漏れを避けるため同じ構造で書いている。
+    pub(crate) fn sidecar_folder(&self, idx: usize) -> Option<std::path::PathBuf> {
+        let item = self.items.get(idx)?;
+        match item {
+            GridItem::Image(p) => p.parent().map(|d| d.to_path_buf()),
+            GridItem::ZipImage { zip_path, .. } => zip_path.parent().map(|d| d.to_path_buf()),
+            GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(|d| d.to_path_buf()),
+            _ => None,
+        }
+    }
+
+    /// サイドカー内のフォルダ相対キーを返す。小文字化され、`page_path_key` で使われる
+    /// セパレータと整合する形式になる。
+    pub(crate) fn sidecar_relative_key(&self, idx: usize) -> Option<String> {
+        let item = self.items.get(idx)?;
+        match item {
+            GridItem::Image(p) => {
+                let name = p.file_name()?.to_string_lossy().to_lowercase();
+                Some(name)
+            }
+            GridItem::ZipImage { zip_path, entry_name } => {
+                let name = zip_path.file_name()?.to_string_lossy().to_lowercase();
+                Some(format!("{name}::{}", entry_name.to_lowercase()))
+            }
+            GridItem::PdfPage { pdf_path, page_num, .. } => {
+                let name = pdf_path.file_name()?.to_string_lossy().to_lowercase();
+                Some(format!("{name}::page_{page_num}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// (sidecar_folder, sidecar_relative_key) のペアを取得する。
+    fn sidecar_coords(&self, idx: usize) -> Option<(std::path::PathBuf, String)> {
+        Some((self.sidecar_folder(idx)?, self.sidecar_relative_key(idx)?))
+    }
+
+    /// 指定フォルダのサイドカーへ可変参照を取得する。メモリ上に未ロードならロードする。
+    /// `sidecar_backup_enabled` が OFF なら None を返す (呼び出し側は no-op になる)。
+    fn sidecar_mut(&mut self, folder: &std::path::Path) -> Option<&mut crate::sidecar::SidecarFile> {
+        if !self.settings.sidecar_backup_enabled {
+            return None;
+        }
+        if !self.sidecars.contains_key(folder) {
+            let loaded = crate::sidecar::SidecarFile::load(folder);
+            self.sidecars.insert(folder.to_path_buf(), loaded);
+        }
+        self.sidecars.get_mut(folder)
+    }
+
+    /// すべての dirty なサイドカーをディスクにフラッシュする。
+    /// 呼び出し側: フォルダ切替時・アプリ終了時・5 秒アイドル時。
+    pub(crate) fn flush_all_sidecars(&mut self) {
+        for sidecar in self.sidecars.values_mut() {
+            sidecar.flush();
+        }
+    }
+
+    /// マスクを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
+    /// `mask` が全て false なら DB から削除、サイドカーからも削除する (mask_db.set の仕様と揃える)。
+    pub(crate) fn save_mask_with_sidecar(&mut self, idx: usize, mask: &[bool], w: usize, h: usize) {
+        let key = match self.page_path_key(idx) {
+            Some(k) => k,
+            None => return,
+        };
+        let is_empty = !mask.iter().any(|&m| m);
+        if let Some(db) = &self.mask_db {
+            let _ = db.set(&key, mask, w, h);
+        }
+        if let Some((folder, rel)) = self.sidecar_coords(idx) {
+            if is_empty {
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.remove_mask(&rel);
+                }
+            } else {
+                let raw = crate::mask_db::compress_mask(mask);
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.set_mask(&rel, crate::sidecar::SidecarMask::from_raw(&raw, w as u32, h as u32));
+                }
+            }
+        }
+    }
+
+    /// マスクを DB から削除し、サイドカーからも削除する。「マスク全削除」ボタン用。
+    pub(crate) fn delete_mask_with_sidecar(&mut self, idx: usize) {
+        let key = match self.page_path_key(idx) {
+            Some(k) => k,
+            None => return,
+        };
+        if let Some(db) = &self.mask_db {
+            let _ = db.delete(&key);
+        }
+        if let Some((folder, rel)) = self.sidecar_coords(idx) {
+            if let Some(sc) = self.sidecar_mut(&folder) {
+                sc.remove_mask(&rel);
+            }
+        }
+    }
+
+    /// サイドカーからまだ DB に無いエントリを取り込み、両 DB を更新する。
+    /// フォルダ丸ごと移動で中央 DB のパスキーが無効化された場合の復旧経路。
+    /// サイドカー自体はメモリに残し、以降の書き込みミラーに使う。
+    /// 実際のインポートロジックは [`crate::sidecar::import_to_dbs`] に委譲。
+    fn import_sidecar_to_dbs(&mut self, sidecar_folder: &std::path::Path) {
+        // メモリにロード (既存なら再利用)
+        if !self.sidecars.contains_key(sidecar_folder) {
+            self.sidecars
+                .insert(sidecar_folder.to_path_buf(), crate::sidecar::SidecarFile::load(sidecar_folder));
+        }
+        let Some(sidecar) = self.sidecars.get(sidecar_folder) else { return; };
+        if sidecar.items().is_empty() {
+            return;
+        }
+
+        let stats = crate::sidecar::import_to_dbs(
+            sidecar_folder,
+            sidecar,
+            self.adjustment_db.as_ref(),
+            self.mask_db.as_ref(),
+        );
+        if stats.imported_adjust > 0 || stats.imported_mask > 0 {
+            crate::logger::log(format!(
+                "sidecar: imported {} adjust + {} mask entries from {}",
+                stats.imported_adjust,
+                stats.imported_mask,
+                sidecar_folder.display()
+            ));
+        }
+    }
+
+    /// アイドル時 (5 秒間変更がない) に dirty なサイドカーをフラッシュする。
+    /// 長時間の編集セッション中にクラッシュや電源断で失う事故への保険。
+    pub(crate) fn flush_idle_sidecars(&mut self) {
+        let now = std::time::Instant::now();
+        const IDLE_THRESHOLD_SECS: u64 = 5;
+        for sidecar in self.sidecars.values_mut() {
+            if !sidecar.is_dirty() {
+                continue;
+            }
+            if let Some(last) = sidecar.last_change() {
+                if now.duration_since(last).as_secs() >= IDLE_THRESHOLD_SECS {
+                    sidecar.flush();
+                }
+            }
+        }
+    }
+
     /// 現在の有効パラメータに基づいて AI アップスケール/デノイズの状態を更新する。
     pub(crate) fn sync_upscale_from_preset(&mut self, idx: usize) {
         // effective_params は self を不変借用するので、派生値だけコピーして解放してから代入する
@@ -4558,6 +4734,7 @@ impl App {
     /// グローバルとの等価比較に変更した。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
         let matches_global = params == self.settings.global_preset;
+        let coords = self.sidecar_coords(idx);
         if matches_global {
             self.adjustment_page_params.remove(&idx);
             if let Some(key) = self.page_path_key(idx) {
@@ -4565,11 +4742,21 @@ impl App {
                     let _ = db.remove_page_params(&key);
                 }
             }
+            if let Some((folder, rel)) = coords {
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.remove_adjust(&rel);
+                }
+            }
         } else {
             self.adjustment_page_params.insert(idx, params.clone());
             if let Some(key) = self.page_path_key(idx) {
                 if let Some(db) = &self.adjustment_db {
                     let _ = db.set_page_params(&key, &params);
+                }
+            }
+            if let Some((folder, rel)) = coords {
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.set_adjust(&rel, params);
                 }
             }
         }
@@ -4588,6 +4775,11 @@ impl App {
         if let Some(key) = self.page_path_key(idx) {
             if let Some(db) = &self.adjustment_db {
                 let _ = db.remove_page_params(&key);
+            }
+        }
+        if let Some((folder, rel)) = self.sidecar_coords(idx) {
+            if let Some(sc) = self.sidecar_mut(&folder) {
+                sc.remove_adjust(&rel);
             }
         }
         self.adjustment_cache.remove(&idx);
@@ -4620,11 +4812,33 @@ impl App {
         (indices, keys)
     }
 
+    /// 画像系グリッドアイテムをサイドカーフォルダでグループ化した (folder, Vec<rel_key>) を返す。
+    /// 一括書き込み系 (apply/clear all) で folder 単位に sidecar を更新するために使う。
+    fn collect_image_sidecar_coords(&self) -> std::collections::HashMap<std::path::PathBuf, Vec<String>> {
+        let mut map: std::collections::HashMap<std::path::PathBuf, Vec<String>> = std::collections::HashMap::new();
+        for idx in 0..self.items.len() {
+            match self.items.get(idx) {
+                Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. }) => {
+                    if let (Some(folder), Some(rel)) =
+                        (self.sidecar_folder(idx), self.sidecar_relative_key(idx))
+                    {
+                        map.entry(folder).or_default().push(rel);
+                    }
+                }
+                _ => {}
+            }
+        }
+        map
+    }
+
     /// 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに同じパラメータを適用する。
     /// `params` がグローバルと等価なら個別設定は削除され、全画像が標準設定に戻る。
     /// AI キャッシュは保持 (色系のみ触る使い方が多い想定、AI 変更時はユーザが U/N で別途調整)。
     pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
         let (indices, keys) = self.collect_image_page_keys();
+        let sidecar_coords = self.collect_image_sidecar_coords();
         let matches_global = params == self.settings.global_preset;
         if matches_global {
             for idx in &indices {
@@ -4633,12 +4847,22 @@ impl App {
             if let Some(db) = self.adjustment_db.as_mut() {
                 let _ = db.remove_page_params_bulk(&keys);
             }
+            for (folder, rels) in sidecar_coords {
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.remove_adjust_bulk(rels);
+                }
+            }
         } else {
             for idx in &indices {
                 self.adjustment_page_params.insert(*idx, params.clone());
             }
             if let Some(db) = self.adjustment_db.as_mut() {
                 let _ = db.set_page_params_bulk(&keys, &params);
+            }
+            for (folder, rels) in sidecar_coords {
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.set_adjust_bulk(rels, &params);
+                }
             }
         }
         self.adjustment_cache.clear();
@@ -4647,11 +4871,17 @@ impl App {
     /// 現在の一覧の全画像ページから個別設定を削除する (= 全画像を標準設定に戻す)。
     pub(crate) fn clear_all_page_params(&mut self) {
         let (indices, keys) = self.collect_image_page_keys();
+        let sidecar_coords = self.collect_image_sidecar_coords();
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
         if let Some(db) = self.adjustment_db.as_mut() {
             let _ = db.remove_page_params_bulk(&keys);
+        }
+        for (folder, rels) in sidecar_coords {
+            if let Some(sc) = self.sidecar_mut(&folder) {
+                sc.remove_adjust_bulk(rels);
+            }
         }
         self.adjustment_cache.clear();
     }
@@ -5332,6 +5562,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
+        // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
+        self.flush_idle_sidecars();
+
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
         if crate::perf::is_enabled() {
@@ -5683,6 +5917,8 @@ impl eframe::App for App {
             self.settings.window_size = Some([rect.width(), rect.height()]);
         }
         self.settings.save();
+        // dirty なサイドカーをディスクへ書き出す
+        self.flush_all_sidecars();
     }
 }
 

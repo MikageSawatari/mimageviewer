@@ -161,12 +161,10 @@ impl App {
         // ESC: 消しゴムモード終了 (フルスクリーンは閉じない)
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if esc {
-            // 終了前にマスクを DB に保存
+            // 終了前にマスクを DB + サイドカーに保存
             let [w, h] = self.erase_mask_size;
-            if let (Some(mask), Some(key)) = (self.erase_mask.clone(), self.page_path_key(fs_idx)) {
-                if let Some(db) = &self.mask_db {
-                    let _ = db.set(&key, &mask, w, h);
-                }
+            if let Some(mask) = self.erase_mask.clone() {
+                self.save_mask_with_sidecar(fs_idx, &mask, w, h);
             }
             self.reset_erase_mode();
             return action;
@@ -1155,12 +1153,8 @@ impl App {
             self.erase_mask = Some(vec![false; w * h]);
             self.erase_mask_texture = None;
             if let Some(fs_idx) = self.fullscreen_idx {
-                // DB からも削除
-                if let Some(key) = self.page_path_key(fs_idx) {
-                    if let Some(db) = &self.mask_db {
-                        let _ = db.delete(&key);
-                    }
-                }
+                // DB + サイドカーからも削除
+                self.delete_mask_with_sidecar(fs_idx);
                 // 表示を元画像に戻す
                 if let Some(base) = self.erase_base_cache.get(&fs_idx) {
                     let tex = ctx.load_texture(
@@ -1219,12 +1213,8 @@ impl App {
             return;
         }
 
-        // マスクを DB に保存
-        if let Some(key) = self.page_path_key(fs_idx) {
-            if let Some(db) = &self.mask_db {
-                let _ = db.set(&key, &mask, w, h);
-            }
-        }
+        // マスクを DB + サイドカーに保存
+        self.save_mask_with_sidecar(fs_idx, &mask, w, h);
 
         let masked_count = mask.iter().filter(|&&m| m).count();
         crate::logger::log(format!("erase: inpaint start, masked pixels={masked_count}"));

@@ -23,6 +23,7 @@ pub mod rotation_db;
 pub mod search_index_db;
 pub mod search_query;
 pub mod settings;
+pub mod sidecar;
 pub mod spread_db;
 pub mod stats;
 pub mod thumb_loader;

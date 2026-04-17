@@ -17,11 +17,17 @@ pub struct AdjustmentDb {
 impl AdjustmentDb {
     /// DB を開く (なければ作成)。旧スキーマが残っていれば破棄して作り直す。
     pub fn open() -> Result<Self, rusqlite::Error> {
-        let path = Self::db_path();
+        Self::open_at(&Self::db_path())
+    }
+
+    /// 任意のパスで DB を開く。テスト・統合テスト用。
+    /// 通常のランタイムパス (`%APPDATA%/mimageviewer/adjustment.db`) を使いたい場合は
+    /// 引数なしの [`open`] を使うこと。
+    pub fn open_at(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(&path)?;
+        let conn = rusqlite::Connection::open(path)?;
         // 未リリース機能なのでマイグレーションは行わず旧テーブルを破棄する。
         conn.execute_batch(
             "DROP TABLE IF EXISTS presets;
