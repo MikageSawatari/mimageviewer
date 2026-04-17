@@ -2878,7 +2878,6 @@ impl App {
             }
 
             // Ctrl+1〜0: 補正プリセットスロットを一括適用
-            // (フルスクリーン側 ui_fullscreen.rs の Ctrl+Num0-9 と同じスロットに揃える)
             {
                 const SLOT_KEYS: [egui::Key; 10] = [
                     egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
@@ -2886,6 +2885,7 @@ impl App {
                     egui::Key::Num9, egui::Key::Num0,
                 ];
                 let preset_slot = ctx.input_mut(|i| {
+                    if !i.modifiers.ctrl { return None; }
                     SLOT_KEYS.iter().position(|k| {
                         i.consume_key(egui::Modifiers::CTRL, *k)
                     })
@@ -3914,14 +3914,12 @@ impl App {
         }
     }
 
-    /// F1-F6 キー用: チェック済みアイテムがあれば一括で、なければ現在選択にレーティングを適用する。
-    /// visible_indices の外に出る可能性があるため、適用後はフィルタを再評価する。
-    /// グリッド画面から F7/F8 で呼ばれる一括適用。
-    /// チェック済みアイテムがあればそれら、無ければ選択中 1 つにマスクスロットを適用する。
-    /// 実際の inpaint は各ページをフルスクリーンで開いたときに `auto_apply_saved_mask` が走る。
-    /// ここでは DB + サイドカーにスロットの内容 (ビットマップ + ベクタ) を書き込むだけで十分。
-    pub(crate) fn apply_slot_to_selection(&mut self, slot: usize) {
-        let targets: Vec<usize> = if !self.checked.is_empty() {
+    /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
+    /// チェック済みがあればそれら、無ければカーソル位置 (selected)、それも無ければ空。
+    /// いずれの場合も `is_ratable` (Image / ZipImage / PdfPage) のみに絞り、
+    /// フォルダや ZIP/PDF ファイル本体を誤って対象にしない。
+    fn ratable_targets(&self) -> Vec<usize> {
+        if !self.checked.is_empty() {
             self.checked
                 .iter()
                 .copied()
@@ -3935,7 +3933,15 @@ impl App {
             }
         } else {
             Vec::new()
-        };
+        }
+    }
+
+    /// グリッド画面から F7/F8 で呼ばれるマスクスロット一括適用。
+    /// 実際の inpaint は各ページをフルスクリーンで開いたときに `auto_apply_saved_mask`
+    /// が走る。ここでは DB + サイドカーにスロットの内容 (ビットマップ + ベクタ) を
+    /// 書き込むだけで十分。
+    pub(crate) fn apply_slot_to_selection(&mut self, slot: usize) {
+        let targets = self.ratable_targets();
 
         if targets.is_empty() {
             self.show_feedback_toast("[適用対象なし]".to_string());
@@ -3989,28 +3995,24 @@ impl App {
 
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
         let stars = stars.min(5);
-        if !self.checked.is_empty() {
-            let targets: Vec<usize> = self
-                .checked
-                .iter()
-                .copied()
-                .filter(|&idx| matches!(self.items.get(idx), Some(it) if it.is_ratable()))
-                .collect();
-            for &idx in &targets {
-                self.set_rating(idx, stars);
-            }
+        let targets = self.ratable_targets();
+        if targets.is_empty() {
+            return;
+        }
+        for &idx in &targets {
+            self.set_rating(idx, stars);
+        }
+        let bulk = targets.len() > 1;
+        if bulk {
             crate::logger::log(format!(
-                "[RATING] Bulk apply {} stars to {} items",
-                stars,
-                targets.len()
+                "[RATING] Bulk apply {stars} stars to {} items",
+                targets.len(),
             ));
             self.checked.clear();
-            self.rebuild_visible_indices();
-        } else if let Some(idx) = self.selected {
-            self.set_rating(idx, stars);
-            crate::logger::log(format!("[RATING] Set {} stars on idx {}", stars, idx));
-            self.rebuild_visible_indices();
+        } else {
+            crate::logger::log(format!("[RATING] Set {stars} stars on idx {}", targets[0]));
         }
+        self.rebuild_visible_indices();
     }
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
@@ -5251,27 +5253,9 @@ impl App {
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
     }
 
-    /// 保存スロットをグリッド上の対象に適用する。Ctrl+1〜0 のキーハンドラから呼ぶ。
-    /// 対象は `apply_rating_to_selection` / `apply_slot_to_selection` と同じ規則:
-    /// チェック済みがあればそれら全て、無ければカーソル位置 (selected)、それも
-    /// 無ければ何もしない。
+    /// 保存スロットをグリッド上の対象に適用する。対象決定は `ratable_targets` を参照。
     pub(crate) fn apply_slot_to_grid_selection(&mut self, slot_idx: usize) {
-        let targets: Vec<usize> = if !self.checked.is_empty() {
-            self.checked
-                .iter()
-                .copied()
-                .filter(|&idx| self.items.get(idx).is_some_and(|it| it.is_ratable()))
-                .collect()
-        } else if let Some(idx) = self.selected {
-            if self.items.get(idx).is_some_and(|it| it.is_ratable()) {
-                vec![idx]
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
+        let targets = self.ratable_targets();
         if targets.is_empty() {
             self.show_feedback_toast("[適用対象なし]".to_string());
             return;
@@ -5279,7 +5263,7 @@ impl App {
 
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
-            self.show_feedback_toast(format!("[スロット{}は空です]", key_label));
+            self.show_feedback_toast(format!("[スロット{key_label}は空です]"));
             return;
         };
 
@@ -5291,9 +5275,8 @@ impl App {
             self.set_page_params(idx, slot.params.clone());
             self.clear_adjustment_caches(idx);
         }
-        // AI 設定が変わった target があれば AI キャッシュ/pending をまとめてクリア。
-        // clear_all_adjustment_and_ai_caches は引数 idx の adjustment_cache を
-        // 再度消すが、上のループで全 target 分クリア済みなので副作用なし。
+        // AI 設定が変わった target が 1 件でもあれば AI キャッシュ / 進行中 pending を
+        // 全体単位で畳む (AI キャッシュは item idx キーでフラグメント化できないため)。
         if any_ai_changed {
             self.clear_all_adjustment_and_ai_caches(targets[0]);
         }
