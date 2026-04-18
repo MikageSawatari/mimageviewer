@@ -18,6 +18,7 @@
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
+| データ移動 (v0.7.0) | `std::thread` (使い捨て) | 1 (起動時のみ) | `MOVE_TARGETS` を copy → verify → delete。UI は `App::update` の先頭で進捗ダイアログに差し替わる。`Local\mimageviewer_data_move` Named Mutex をスレッド寿命分保持し、他インスタンスの起動を拒否する |
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
 

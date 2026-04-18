@@ -6,6 +6,8 @@ pub mod adjustment_db;
 pub mod ai;
 pub mod catalog;
 pub mod data_dir;
+pub mod data_move;
+pub mod instance_lock;
 pub mod exif_reader;
 pub mod folder_tree;
 pub mod grid_item;

@@ -9,6 +9,7 @@
 
 mod cache_creator;
 mod cache_manager;
+mod data_move;
 pub(crate) mod index_creator;
 pub(crate) mod context_menu;
 mod fav_add;
