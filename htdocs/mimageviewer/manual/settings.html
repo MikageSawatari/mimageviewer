@@ -34,6 +34,7 @@
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="settings.html" class="active">設定リファレンス</a>
         <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
         <a href="troubleshooting.html">トラブルシューティング</a>
       </nav>
     </div>
@@ -53,11 +54,12 @@
           <tr><td>サムネイル列数</td><td>1〜10 列から選択（既定: 4）</td></tr>
           <tr><td>サムネイル比率</td><td>16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16 の 7 種（既定: 1:1）</td></tr>
           <tr><td>ソート順</td><td>ファイル名順 / 番号順 / 日付順（古い順）/ 日付順（新しい順）（既定: ファイル名順）</td></tr>
-          <tr><td>キャッシュ管理</td><td>キャッシュの確認・削除</td></tr>
+          <tr><td>サムネイルキャッシュ管理…</td><td>サムネイル（WebP）キャッシュの確認・削除</td></tr>
+          <tr><td>変換済みアーカイブキャッシュ管理…</td><td>7z / LZH から変換した ZIP キャッシュの確認・削除</td></tr>
           <tr><td>サムネイル画質…</td><td>A/B 比較プレビューでサイズと品質を調整</td></tr>
           <tr><td>統計…</td><td>読み込み時間・フォーマット別の分布を表示</td></tr>
           <tr><td>回転情報をリセット…</td><td>保存済みの全回転情報を削除</td></tr>
-          <tr><td>環境設定…</td><td>表示・パフォーマンス・キャッシュ・フォルダ・ファイル処理・見開き表示など全設定を統合したダイアログ</td></tr>
+          <tr><td>環境設定…</td><td>表示・パフォーマンス・キャッシュ・フォルダ・ファイル処理・見開き表示・UI テーマ・Susie プラグインなど全設定を統合したダイアログ</td></tr>
         </tbody>
       </table>
     </div>
@@ -126,7 +128,7 @@
     </div>
 
     <h3>キャッシュの管理</h3>
-    <p>設定 → キャッシュ管理 から以下の操作ができます：</p>
+    <p>設定 → サムネイルキャッシュ管理 から以下の操作ができます：</p>
     <ul>
       <li>キャッシュの合計フォルダ数・容量の確認</li>
       <li>指定日数以上更新されていないキャッシュの削除</li>
@@ -140,6 +142,29 @@
       <li><strong>PDF ファイルの中身もキャッシュ</strong> — PDF 内の全ページをキャッシュします</li>
     </ul>
     <p>どちらもチェックなしの場合でも、先頭1枚/1ページはキャッシュされ、フォルダ一覧でサムネイルが表示されます。</p>
+
+    <h2 id="archive-cache">変換済みアーカイブキャッシュ（設定 → 変換済みアーカイブキャッシュ管理…）</h2>
+    <p>7z / LZH をクリックで ZIP に変換したときに、変換後の ZIP を
+    <code>%APPDATA%\mimageviewer\archive_cache\</code> に保存します。2 回目以降は変換を
+    スキップして即座に開けるため、アーカイブを行き来する閲覧でも高速です。</p>
+    <p>管理ダイアログで以下の操作ができます:</p>
+    <ul>
+      <li>変換済みエントリの一覧表示（元ファイルパス、元サイズ、変換後サイズ、変換日時、最終アクセス日時、画像数）</li>
+      <li>元ファイルが存在しないエントリは赤字で表示</li>
+      <li>個別選択削除（チェックボックスで複数選択可）</li>
+      <li>元ファイルが存在しないエントリの一括削除</li>
+      <li>全キャッシュの削除</li>
+      <li>合計使用容量の表示</li>
+    </ul>
+    <p>マッピング DB は <code>%APPDATA%\mimageviewer\archive_cache.db</code> に保存されます。元ファイルの更新時刻が変わった場合は自動的に再変換されます。</p>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        サムネイルキャッシュ（WebP）と比べて 1 エントリあたりの容量が大きくなりやすい（元ファイルサイズと同等）ため、
+        ディスク容量が気になる場合はこのダイアログで定期的に削除してください。
+        大量にキャッシュしたい場合は <code>--data-dir</code> で別ドライブに保存場所を移せます。
+      </div>
+    </div>
 
     <h2 id="search-index">お気に入り検索インデックス（お気に入り → インデックス作成）</h2>
     <p>お気に入り配下のフォルダ・ZIP・PDF 名を SQLite データベースに記録し、<kbd>Ctrl</kbd>+<kbd>S</kbd> の「お気に入り検索」で横断検索できるようにします。</p>
@@ -177,7 +202,7 @@
           <tr><th>設定</th><th>説明</th><th>既定</th></tr>
         </thead>
         <tbody>
-          <tr><td>ZIP/PDF+フォルダの重複をスキップ</td><td>同名の ZIP/PDF とフォルダがある場合、ZIP/PDF を非表示にする</td><td>有効</td></tr>
+          <tr><td>アーカイブ+フォルダの重複をスキップ</td><td>同名の ZIP/PDF/7z/LZH ファイルとフォルダがある場合、アーカイブ側を非表示にする</td><td>有効</td></tr>
           <tr><td>動画+画像の重複をスキップ</td><td>同名の動画と画像がある場合、動画を非表示にする</td><td>有効</td></tr>
           <tr><td>拡張子違いの画像をスキップ</td><td>同名で異なる拡張子の画像がある場合、優先度の低い方を非表示にする</td><td>有効</td></tr>
         </tbody>
@@ -242,6 +267,67 @@
           <tr><td>AI アップスケール先読み（後方 / 前方）</td><td>フルスクリーンで前後の画像にも AI アップスケール結果を先読みする枚数</td><td>後方 1 / 前方 2</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <h2 id="ui-theme">UI テーマ（環境設定 → 表示 → UI テーマ）</h2>
+    <p>アプリ全体の配色を切り替えます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>システム（既定）</td><td>Windows のアプリ用テーマ（ライト / ダーク）に追従。起動後に OS 側で切り替えても自動反映されます。</td></tr>
+          <tr><td>ライト</td><td>明るい配色で固定</td></tr>
+          <tr><td>ダーク</td><td>暗い配色で固定</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>初回起動時は OS のアプリ用テーマを自動検出してテーマを決定します（「システム」モードの効果）。</p>
+
+    <h2 id="susie-plugins">Susie プラグイン（環境設定 → Susie プラグイン）</h2>
+    <p>Susie 画像プラグイン（<code>.spi</code>、32bit）を経由してレトロ PC の画像形式などを閲覧できます。
+    詳しい用途は <a href="faq.html#format-retro">FAQ</a> を参照してください。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th><th>既定値</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Susie 画像プラグインを有効にする</td>
+            <td>OFF にするとプラグインフォルダを読み込まなくなります。<code>mimageviewer-susie32.exe</code> が見つからない環境では自動的に無効になります。</td>
+            <td>有効</td>
+          </tr>
+          <tr>
+            <td>プラグインを並列実行する</td>
+            <td>OFF にするとワーカープロセス数を 1 に固定します。古いプラグインで一時ファイル衝突・INI の同時書き込み等の問題が疑われるときに OFF にして切り分けに使います。</td>
+            <td>有効（推奨: ON）</td>
+          </tr>
+          <tr>
+            <td>📁 フォルダを開く</td>
+            <td>プラグインフォルダ（<code>%APPDATA%\mimageviewer\susie_plugins\</code>）をエクスプローラで開きます。初回起動時に <code>README.txt</code> が配置されます。</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>⟳ プラグインを再読み込み</td>
+            <td>プラグインを追加・削除・更新した後に押すと、ワーカープロセス全員を再起動してプラグインを再ロードします（アプリ再起動は不要）。</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>ロード済みプラグイン一覧</td>
+            <td>現在ロードされているプラグイン名と対応拡張子を展開表示できます。</td>
+            <td>—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        プラグインは 32bit ワーカープロセス（<code>mimageviewer-susie32.exe</code>）に隔離されます。
+        不正な画像でプラグインがクラッシュしてもメインプロセスには影響せず、ワーカーは自動再起動されます。
+      </div>
     </div>
 
     <h2>ヘルプメニュー</h2>
@@ -353,9 +439,12 @@
           <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.json</code></td><td>ファイル単位（A）</td></tr>
           <tr><td>お気に入り検索インデックス</td><td><code>%APPDATA%\mimageviewer\search_index.db</code></td><td>フォルダ単位（B）</td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td><td>フォルダ単位（A）</td></tr>
+          <tr><td>変換済みアーカイブキャッシュ</td><td><code>%APPDATA%\mimageviewer\archive_cache\</code>（変換済み ZIP）+ <code>archive_cache.db</code>（マッピング）</td><td>ファイル単位（A）</td></tr>
+          <tr><td>Susie プラグイン</td><td><code>%APPDATA%\mimageviewer\susie_plugins\</code>（<code>.spi</code> ファイル配置場所）</td><td>—</td></tr>
           <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・panic ログ）</td><td>—</td></tr>
           <tr><td>AI モデル</td><td><code>%APPDATA%\mimageviewer\models\</code></td><td>—</td></tr>
           <tr><td>PDFium DLL</td><td><code>%APPDATA%\mimageviewer\pdfium.dll</code></td><td>—</td></tr>
+          <tr><td>Susie ワーカー EXE</td><td>mImageViewer インストールフォルダ内 <code>mimageviewer-susie32.exe</code>（32bit バイナリ、同梱）</td><td>—</td></tr>
           <tr><td>補正・マスクのバックアップ<br>（環境設定で ON の場合のみ）</td>
               <td>各フォルダ直下に <code>mimageviewer.dat</code>（Hidden + System 属性の JSON）</td>
               <td>フォルダ単位のバックアップ</td></tr>

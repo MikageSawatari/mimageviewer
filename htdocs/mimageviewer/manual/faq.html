@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FAQ（よくある質問） — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>FAQ（よくある質問）</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html" class="active">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">FAQ（よくある質問）</h1>
+    <p class="page-desc">mImageViewer でよくいただく質問と回答をまとめています。</p>
+
+    <h2>アーカイブ・フォーマットについて</h2>
+
+    <h3 id="archive-7z-lzh">7z / LZH アーカイブに対応していますか？</h3>
+    <p>「開くだけで即サムネイル表示」の形では対応していません。これらの形式は内部構造上、
+    一覧を作るだけで書庫全体の展開が必要になってしまうため、mImageViewer の高速閲覧の
+    前提と相性が悪いためです。</p>
+    <p>代わりに、<strong>これらのファイルをクリックすると ZIP に変換して閲覧できる機能</strong>を
+    ご用意しています（元ファイルはそのまま残ります）。変換は初回のみで、以降は ZIP と
+    同じ高速な閲覧体験になります。</p>
+    <ul>
+      <li>対応形式: <code>.7z</code> / <code>.lzh</code> / <code>.lha</code></li>
+      <li>変換後の ZIP は <code>%APPDATA%\mimageviewer\archive_cache\</code> に保存されます</li>
+      <li>変換時に画像ファイルのみ抽出し、音声・動画・テキスト等は破棄されます</li>
+      <li>再圧縮なしの STORE モードで格納するため、以降の読み出しは最速になります</li>
+      <li>キャッシュの一覧・削除は「設定 → 変換済みアーカイブキャッシュ管理…」から行えます</li>
+    </ul>
+
+    <h3 id="archive-rar">RAR アーカイブには対応していますか？</h3>
+    <p>RAR の展開には RARLAB 社の unRAR ソースコードが必要ですが、このコードには
+    mImageViewer のライセンスと整合しない利用制限があるため、mImageViewer には組み込んで
+    いません。</p>
+    <p>お手数ですが、<strong>WinRAR や 7-Zip 等のツールで一度 ZIP に変換</strong>いただき、
+    変換後のファイルを mImageViewer でお開きください。</p>
+
+    <h3 id="archive-game">ゲーム独自のアーカイブ（xp3、arc、tlg、g00 等）には対応していますか？</h3>
+    <p>ゲーム固有のアーカイブ形式・独自画像形式には対応していません。</p>
+    <p>専用ツールの <strong>GARBro</strong> が数百のゲームエンジンに対応しており、独自画像形式
+    （TLG / G00 等）の PNG 変換まで自動で行ってくれます。GARBro で抽出・変換した
+    画像フォルダや ZIP は、そのまま mImageViewer で高速に閲覧できます。</p>
+
+    <h3 id="format-retro">古い PC の画像形式（MAG、PI、Q0 等）には対応していますか？</h3>
+    <p><strong>Susie 画像プラグイン</strong>を使って対応しています。対応させたい画像形式の
+    Susie 画像プラグイン（<code>.spi</code> ファイル）を、環境設定の「Susie プラグイン → 📁
+    フォルダを開く」から開いたフォルダに置くと、mImageViewer から認識されます。</p>
+    <p>代表的なプラグインで閲覧可能になる形式:</p>
+    <ul>
+      <li><strong>PI</strong>（<code>ifpi.spi</code>）— PC-98 標準の 16/256 色画像</li>
+      <li><strong>MAG</strong>（<code>ifmag.spi</code>）— PC-98 の 256 色画像</li>
+      <li><strong>Q0 / Q4</strong> — PC-98 フルカラー / 16 色</li>
+      <li><strong>PIC / PIC2</strong> — シャープ X68000 系</li>
+      <li><strong>MAKI / HG / XLD</strong> — その他レトロ形式</li>
+    </ul>
+    <p><strong>AI アップスケール機能</strong>と組み合わせることで、640×400 クラスのレトロ CG を
+    2560×1600 の現代モニター解像度で鑑賞できます。</p>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        プラグインを追加・削除・更新した後は「環境設定 → Susie プラグイン → ⟳ プラグインを再読み込み」で反映できます（アプリ再起動は不要）。
+      </div>
+    </div>
+
+    <h3 id="susie-plugin">Susie プラグインは 32bit / 64bit どちらに対応していますか？</h3>
+    <p>古いレトロ画像プラグインが存在する <strong>32bit 版（<code>.spi</code>）のみ</strong>に対応しています。
+    mImageViewer 本体は 64bit ですが、<code>mimageviewer-susie32.exe</code> という 32bit の
+    ワーカープロセスを別途起動してプラグインをロードするしくみです。</p>
+    <p>ワーカープロセスは最大 3 つまで並列動作し、不正な画像でプラグインがクラッシュしても
+    メインプロセスには影響しません。クラッシュしたワーカーは自動的に再起動されます。</p>
+    <p>64bit 版（<code>.sph</code>）には対応していません。モダンフォーマットは mImageViewer 本体が
+    ネイティブ対応しているため、64bit Susie プラグインの追加価値が低いためです。</p>
+
+    <h3 id="susie-config">Susie プラグインの個別設定を変更したい場合は？</h3>
+    <p>mImageViewer からはプラグイン個別の設定ダイアログ（<code>ConfigurationDlg</code>）を開けません。
+    設定が必要な場合は、Susie 本体（<code>Susie.exe</code>）を別途インストールし、そちらでプラグインを
+    登録・設定してください。多くのプラグインは設定を INI ファイル（<code>.spi</code> と同じ階層）
+    またはレジストリに保存するため、同じ <code>.spi</code> ファイルを mImageViewer のプラグイン
+    フォルダに置けば、設定値はそのまま反映されます。</p>
+
+    <h2>機能について</h2>
+
+    <h3 id="ai-upscale-retro">AI アップスケールでレトロ CG を鑑賞したい</h3>
+    <p>おすすめの手順:</p>
+    <ol>
+      <li>Susie プラグイン（<code>ifpi.spi</code> / <code>ifmag.spi</code> など）を「プラグインフォルダ」に配置</li>
+      <li>公式配布の LZH アーカイブをクリックして ZIP に変換</li>
+      <li>変換後の ZIP を開き、フルスクリーンで画像を表示</li>
+      <li>補正パネルの「AI アップスケール」を ON、モデルを選択</li>
+    </ol>
+    <p>例: 16bitセンセーション公式配布ファイルの LZH → 中身の PI / MAG → 4x AI アップスケールで
+    2560×1600 相当の画質で鑑賞できます。</p>
+
+    <h3 id="loupe">ルーペ機能の使い方は？</h3>
+    <p>フルスクリーン表示中にカーソル周辺を拡大表示する機能です。</p>
+    <ul>
+      <li><kbd>Shift</kbd> 押しっぱなし — 押している間だけルーペを表示</li>
+      <li><kbd>M</kbd> キー — ルーペのトグル（長時間の精密作業向け）</li>
+    </ul>
+    <p>消しゴムモード・画像分析モード中でも併用できます。倍率や表示サイズは環境設定で調整できます。</p>
+
+    <h3 id="transparent-bg">透過画像の背景色を変えたい</h3>
+    <p>透過 PNG / WebP / GIF をフルスクリーンで開いているとき、<kbd>B</kbd> キーで背景を循環できます。
+    テーマ既定 → 白 → 黒 → 市松 → テーマ既定 の順に切り替わります。</p>
+    <p>この設定は一時的なもので、画像を開き直すとテーマ既定に戻ります。</p>
+
+    <h3 id="theme">ダークモードに切り替えたい</h3>
+    <p>「環境設定 → 表示 → UI テーマ」で以下から選べます:</p>
+    <ul>
+      <li><strong>システム</strong>（既定）— Windows のアプリ用テーマに追従</li>
+      <li><strong>ライト</strong> — 明るい配色で固定</li>
+      <li><strong>ダーク</strong> — 暗い配色で固定</li>
+    </ul>
+    <p>「システム」選択中は、起動後に Windows 側でライト/ダークを切り替えると mImageViewer も自動的に追従します。</p>
+
+    <h2>対応予定の機能</h2>
+
+    <h3 id="mouse-gesture">マウスジェスチャーには対応していますか？</h3>
+    <p>現時点では未対応です。要望に応じて検討します。</p>
+
+    <h3 id="drag-from-browser">ブラウザからの画像ドロップに対応していますか？</h3>
+    <p>現時点では未対応です。要望に応じて検討します。</p>
+
+    <h2>データ・保存場所</h2>
+
+    <h3 id="data-location">アプリのデータ保存場所を別ドライブに移したい</h3>
+    <p><code>--data-dir</code> オプションを使った手動移動で対応できます。手順は
+    <a href="settings.html#cache">設定リファレンスの「別ドライブへのデータ移動」</a>を参照してください。</p>
+
+    <h3 id="archive-cache-cleanup">変換済みアーカイブキャッシュを削除したい</h3>
+    <p>「設定 → 変換済みアーカイブキャッシュ管理…」から以下の操作ができます:</p>
+    <ul>
+      <li>変換済みキャッシュの一覧・合計サイズ表示</li>
+      <li>個別選択削除（チェックボックス複数選択）</li>
+      <li>元ファイルが既に存在しないエントリの一括削除</li>
+      <li>全キャッシュの削除</li>
+    </ul>
+    <p>サムネイルキャッシュ（WebP）の管理は別メニュー（「キャッシュ管理…」）から行います。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        その他の問題は<a href="troubleshooting.html">トラブルシューティング</a>もご参照ください。
+      </div>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

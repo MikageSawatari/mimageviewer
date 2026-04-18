@@ -34,6 +34,7 @@
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="settings.html">設定リファレンス</a>
         <a href="formats.html" class="active">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
         <a href="troubleshooting.html">トラブルシューティング</a>
       </nav>
     </div>
@@ -143,10 +144,29 @@
           <tr><th>拡張子</th><th>フォーマット</th><th>備考</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>.zip</code></td><td>ZIP</td><td>アーカイブ内の画像をそのまま閲覧可能</td></tr>
+          <tr><td><code>.zip</code></td><td>ZIP</td><td>アーカイブ内の画像をそのまま閲覧可能。ネストされた ZIP（ZIP in ZIP）もフラット展開で表示</td></tr>
+          <tr><td><code>.7z</code></td><td>7z</td><td>クリックで ZIP に変換して閲覧（変換は初回のみ、2 回目以降はキャッシュから高速表示）</td></tr>
+          <tr><td><code>.lzh</code> / <code>.lha</code></td><td>LZH</td><td>クリックで ZIP に変換して閲覧（7z と同様）</td></tr>
         </tbody>
       </table>
     </div>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        RAR はライセンス都合で非対応です。詳しくは <a href="faq.html#archive-rar">FAQ</a> を参照してください。
+        変換済み ZIP のキャッシュは「設定 → 変換済みアーカイブキャッシュ管理…」から一覧・削除できます。
+      </div>
+    </div>
+
+    <h2 id="susie">Susie 画像プラグイン（オプション）</h2>
+    <p>Susie 画像プラグイン（<code>.spi</code> ファイル、32bit 版のみ）を使うことで、上記以外の
+    画像形式にも対応できます。主にレトロ PC 時代の画像形式（PI / MAG / Q0 / PIC / MAKI 等）を
+    閲覧したい場合に利用します。</p>
+    <p>プラグインは環境設定の「Susie プラグイン → 📁 フォルダを開く」で開かれる
+    <code>%APPDATA%\mimageviewer\susie_plugins\</code> に配置します。プラグインは 32bit の
+    ワーカープロセス（<code>mimageviewer-susie32.exe</code>、最大 3 並列）に隔離されるため、
+    プラグインがクラッシュしても本体には影響しません。</p>
+    <p>詳しくは <a href="faq.html#format-retro">FAQ: 古い PC の画像形式に対応していますか？</a> を参照してください。</p>
 
     <h2>アニメーション対応</h2>
     <div class="table-wrap">
