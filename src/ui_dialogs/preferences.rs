@@ -1020,32 +1020,89 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(8.0);
 
-    // ロード済みプラグイン一覧 (読み込みトリガ: pool が未初期化でも try_get_pool は None)
+    // ロード済みプラグイン一覧 / 診断情報
     ui.label(egui::RichText::new("ロード済みプラグイン").strong());
     ui.add_space(4.0);
-    match crate::susie_loader::try_get_pool() {
-        Some(pool) if pool.is_ready() => {
-            for pi in pool.plugins() {
-                ui.collapsing(&pi.name, |ui| {
-                    let exts = pi.extensions.join(", ");
-                    ui.label(egui::RichText::new(format!("対応拡張子: {exts}")).weak());
-                });
-            }
-            if pool.plugins().is_empty() {
-                ui.label(
-                    egui::RichText::new(
-                        "プラグインが 1 つも読み込まれていません。\n\
-                         「フォルダを開く」から .spi ファイルを配置してください。",
-                    )
-                    .weak(),
-                );
+    match crate::susie_loader::pool_status() {
+        crate::susie_loader::PoolStatus::ReadyWithPlugins { .. } => {
+            // 詳細表示はプール直参照 (対応拡張子まで見たいので)
+            if let Some(pool) = crate::susie_loader::try_get_pool() {
+                for pi in pool.plugins() {
+                    ui.collapsing(&pi.name, |ui| {
+                        let exts = pi.extensions.join(", ");
+                        ui.label(
+                            egui::RichText::new(format!("対応拡張子: {exts}")).weak(),
+                        );
+                    });
+                }
             }
         }
-        _ => {
+        crate::susie_loader::PoolStatus::ReadyButEmpty => {
+            ui.label(
+                egui::RichText::new(
+                    "プラグインが 1 つも読み込まれていません。\n\
+                     「📁 フォルダを開く」から .spi ファイル (32bit) を配置し、\n\
+                     「⟳ プラグインを再読み込み」を押してください。",
+                )
+                .weak(),
+            );
+        }
+        crate::susie_loader::PoolStatus::WorkerExeMissing { expected_path } => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "⚠ Susie ワーカー ({}) が見つかりません。",
+                    crate::susie_loader::WORKER_EXE_NAME,
+                ))
+                .color(egui::Color32::from_rgb(200, 100, 50)),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "配置予定パス: {}",
+                    expected_path.display(),
+                ))
+                .monospace()
+                .size(11.0)
+                .weak(),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "インストーラ版では自動配置されます。開発ビルドの場合は\n\
+                     `cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie32`\n\
+                     でビルドして exe と同じフォルダに配置してください。",
+                )
+                .size(11.0)
+                .weak(),
+            );
+        }
+        crate::susie_loader::PoolStatus::WorkerSpawnFailed => {
+            ui.label(
+                egui::RichText::new(
+                    "⚠ ワーカープロセスの起動またはハンドシェイクに失敗しました。",
+                )
+                .color(egui::Color32::from_rgb(200, 100, 50)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "ヘルプ → ログフォルダを開く から詳細を確認できます。",
+                )
+                .size(11.0)
+                .weak(),
+            );
+        }
+        crate::susie_loader::PoolStatus::NotInitialized => {
             ui.label(
                 egui::RichText::new(
                     "プラグインはまだロードされていません。\n\
-                     「プラグインを再読み込み」を押すと起動されます。",
+                     「⟳ プラグインを再読み込み」を押すと起動されます。",
+                )
+                .weak(),
+            );
+        }
+        crate::susie_loader::PoolStatus::DisabledBySettings => {
+            ui.label(
+                egui::RichText::new(
+                    "Susie プラグインは無効化されています\n\
+                     (上の「Susie 画像プラグインを有効にする」を ON にしてください)。",
                 )
                 .weak(),
             );

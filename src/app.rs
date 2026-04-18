@@ -7197,3 +7197,71 @@ pub(crate) fn color_image_to_dynamic_composited(
     }
     image::DynamicImage::ImageRgb8(buf)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive_converter::ArchiveFormat;
+    use std::path::PathBuf;
+
+    /// 同名フォルダがある ZIP/PDF/ConvertibleArchive (7z/LZH) は
+    /// `filter_virtual_folder_duplicates` でスキップされる。
+    /// v0.7.0 の Task 17 で 7z/LZH への拡張を入れた回帰テスト。
+    #[test]
+    fn filter_virtual_folder_skips_archive_matching_folder() {
+        let mut folders: Vec<GridItem> = vec![
+            GridItem::Folder(PathBuf::from("/r/vol01")),
+            GridItem::ZipFile(PathBuf::from("/r/vol01.zip")),      // 同名フォルダあり → 消える
+            GridItem::ZipFile(PathBuf::from("/r/other.zip")),       // 同名フォルダなし → 残る
+            GridItem::PdfFile(PathBuf::from("/r/vol01.pdf")),       // 同名フォルダあり → 消える
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from("/r/vol01.7z"),                 // 同名フォルダあり → 消える
+                format: ArchiveFormat::SevenZ,
+            },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from("/r/bonus.lzh"),                // 同名フォルダなし → 残る
+                format: ArchiveFormat::Lzh,
+            },
+        ];
+        let mut folder_metas: Vec<Option<(i64, i64)>> =
+            vec![None, None, None, None, None, None];
+
+        App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
+
+        let remaining_names: Vec<String> = folders
+            .iter()
+            .map(|item| match item {
+                GridItem::Folder(p)
+                | GridItem::ZipFile(p)
+                | GridItem::PdfFile(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
+                GridItem::ConvertibleArchive { path, .. } =>
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                _ => String::new(),
+            })
+            .collect();
+
+        assert_eq!(
+            remaining_names,
+            vec!["vol01", "other.zip", "bonus.lzh"],
+            "同名フォルダ vol01 があるアーカイブ 3 件は消え、他は残る",
+        );
+        assert_eq!(folders.len(), folder_metas.len(), "metas も同期して削除");
+    }
+
+    /// 大文字小文字は無視して同名判定する (Windows 文化圏での実運用に合わせる)。
+    #[test]
+    fn filter_virtual_folder_case_insensitive() {
+        let mut folders: Vec<GridItem> = vec![
+            GridItem::Folder(PathBuf::from("/r/VOL01")),
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from("/r/vol01.7z"),
+                format: ArchiveFormat::SevenZ,
+            },
+        ];
+        let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None];
+
+        App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
+
+        assert_eq!(folders.len(), 1, "大文字小文字違いでも一致扱い");
+    }
+}

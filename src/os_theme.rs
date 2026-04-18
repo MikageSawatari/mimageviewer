@@ -91,3 +91,97 @@ fn detect_os_preference() -> Option<ResolvedTheme> {
 fn detect_os_preference() -> Option<ResolvedTheme> {
     None
 }
+
+/// WCAG 2.x 相対輝度計算。値は [0, 1]。
+/// sRGB 成分を線形化してから `0.2126R + 0.7152G + 0.0722B` で合成する。
+#[cfg(test)]
+pub(crate) fn relative_luminance(c: egui::Color32) -> f64 {
+    fn srgb_to_linear(v: u8) -> f64 {
+        let x = v as f64 / 255.0;
+        if x <= 0.03928 {
+            x / 12.92
+        } else {
+            ((x + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * srgb_to_linear(c.r())
+        + 0.7152 * srgb_to_linear(c.g())
+        + 0.0722 * srgb_to_linear(c.b())
+}
+
+/// WCAG コントラスト比 (>= 1.0)。4.5 以上で通常テキストの AA 合格、
+/// 7.0 以上で AAA 合格。
+#[cfg(test)]
+pub(crate) fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f64 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Color32;
+
+    /// 代表的な既知の値で `contrast_ratio` を検証 (WCAG 計算の自己チェック)。
+    #[test]
+    fn contrast_ratio_known_values() {
+        // 完全な白黒は 21:1 が理論最大
+        let ratio = contrast_ratio(Color32::WHITE, Color32::BLACK);
+        assert!(
+            (ratio - 21.0).abs() < 0.01,
+            "white/black should be ~21:1, got {ratio:.3}",
+        );
+        // 同色は 1:1
+        let ratio = contrast_ratio(Color32::GRAY, Color32::GRAY);
+        assert!(
+            (ratio - 1.0).abs() < 1e-9,
+            "same color should be 1:1, got {ratio:.3}",
+        );
+    }
+
+    /// ライトテーマ (`Visuals::light`) の本文テキストと panel 背景が
+    /// WCAG AA (>= 4.5:1) を満たす。egui のデフォルト値が崩れたら検知する。
+    #[test]
+    fn light_theme_text_on_panel_meets_wcag_aa() {
+        let v = egui::Visuals::light();
+        let text = v.text_color();
+        let bg = v.panel_fill;
+        let ratio = contrast_ratio(text, bg);
+        assert!(
+            ratio >= 4.5,
+            "Light theme text {:?} on panel {:?} contrast = {:.2} (< 4.5)",
+            text, bg, ratio,
+        );
+    }
+
+    /// ダークテーマの本文テキストと panel 背景が WCAG AA を満たす。
+    #[test]
+    fn dark_theme_text_on_panel_meets_wcag_aa() {
+        let v = egui::Visuals::dark();
+        let text = v.text_color();
+        let bg = v.panel_fill;
+        let ratio = contrast_ratio(text, bg);
+        assert!(
+            ratio >= 4.5,
+            "Dark theme text {:?} on panel {:?} contrast = {:.2} (< 4.5)",
+            text, bg, ratio,
+        );
+    }
+
+    /// フルスクリーン表示は CentralPanel を Color32::BLACK にハードコードしているため、
+    /// 白テキスト (ファイル名・カウンタ表示など) とのコントラストは AAA (>= 7.0) を
+    /// 満たす。テーマに関係なく黒背景なので白が最適。
+    #[test]
+    fn fullscreen_overlay_white_on_black_meets_wcag_aaa() {
+        let ratio = contrast_ratio(Color32::WHITE, Color32::BLACK);
+        assert!(
+            ratio >= 7.0,
+            "Fullscreen white on black contrast = {ratio:.2} (< 7.0 AAA)",
+        );
+    }
+
+    // ハイパーリンク色は mimageviewer では使用していないため検証対象外。
+    // (egui::Visuals::light のデフォルト #009BFF は WCAG AA を満たさない)
+}

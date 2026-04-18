@@ -418,7 +418,8 @@ pub fn decode_bytes(
 // プロセス起動・ハンドシェイク
 // ─────────────────────────────────────────────────────────────────
 
-fn worker_exe_path() -> PathBuf {
+/// ワーカー exe の解決予定パス (診断表示用にも公開)。
+pub fn worker_exe_path() -> PathBuf {
     // テスト / 開発用に `MIV_SUSIE_WORKER` 環境変数で上書き可能。
     // 統合テストは `target/i686-pc-windows-msvc/release/mimageviewer-susie32.exe` を指す。
     if let Ok(p) = std::env::var("MIV_SUSIE_WORKER") {
@@ -431,6 +432,47 @@ fn worker_exe_path() -> PathBuf {
         }
     }
     PathBuf::from(WORKER_EXE_NAME)
+}
+
+/// 診断情報: プール未起動の理由を UI に返すためのステート。
+#[derive(Debug, Clone)]
+pub enum PoolStatus {
+    /// プール未初期化 (起動直後のバックグラウンド初期化が未完了)
+    NotInitialized,
+    /// ワーカー exe が見つからない (Susie サポート無効)
+    WorkerExeMissing { expected_path: PathBuf },
+    /// 設定で Susie を無効化している
+    DisabledBySettings,
+    /// 正常起動したがプラグインが 0 件
+    ReadyButEmpty,
+    /// 正常起動してプラグインもロード済み
+    ReadyWithPlugins { count: usize },
+    /// ワーカー起動に失敗した (exe はあるが spawn/handshake 失敗)
+    WorkerSpawnFailed,
+}
+
+/// UI から状態を問い合わせる。プール未初期化でも軽量に判定できる。
+pub fn pool_status() -> PoolStatus {
+    let settings = crate::settings::Settings::load();
+    if !settings.susie_enabled {
+        return PoolStatus::DisabledBySettings;
+    }
+    let exe = worker_exe_path();
+    if !exe.exists() {
+        return PoolStatus::WorkerExeMissing { expected_path: exe };
+    }
+    match try_get_pool() {
+        None => PoolStatus::NotInitialized,
+        Some(pool) if pool.is_ready() => {
+            let n = pool.plugins().len();
+            if n == 0 {
+                PoolStatus::ReadyButEmpty
+            } else {
+                PoolStatus::ReadyWithPlugins { count: n }
+            }
+        }
+        Some(_) => PoolStatus::WorkerSpawnFailed,
+    }
 }
 
 fn spawn_worker_and_handshake(
