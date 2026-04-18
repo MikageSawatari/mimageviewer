@@ -7,6 +7,8 @@
 //! ダイアログを増やしたい場合は、ここに新しい .rs を追加し、`mod` 宣言を
 //! 加えるだけで `update()` から `self.show_new_dialog(ctx)` として呼べる。
 
+pub(crate) mod archive_cache_manager;
+pub(crate) mod archive_convert;
 mod cache_creator;
 mod cache_manager;
 pub(crate) mod index_creator;

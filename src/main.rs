@@ -4,6 +4,8 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+pub mod archive_cache;
+pub mod archive_converter;
 pub mod catalog;
 pub mod data_dir;
 pub mod dwm_transitions;

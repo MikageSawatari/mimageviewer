@@ -800,7 +800,7 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
     ui.checkbox(
         &mut s.skip_zip_if_folder_exists,
-        "同名の ZIP/PDF ファイルとフォルダがある場合、ZIP/PDF をスキップ",
+        "同名の ZIP/PDF/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
     );
     ui.add_space(4.0);
     ui.checkbox(

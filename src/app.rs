@@ -482,6 +482,31 @@ pub struct App {
     /// 「すべてのキャッシュを削除」の確認ステップ
     pub(crate) cache_manager_confirm_delete_all: bool,
 
+    // ── 変換済みアーカイブキャッシュ (v0.7.0) ───────────────────
+    /// 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
+    pub(crate) archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
+    /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
+    pub(crate) archive_convert:
+        Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
+    /// 変換済みアーカイブを開いているとき、元 (7z/LZH) のパスを保持する。
+    /// `current_folder` はキャッシュ ZIP を指しているので、UI 表示 / BS /
+    /// Ctrl+↑↓ / タイトルバーでは本フィールドを優先する。
+    /// 通常フォルダ / 通常 ZIP / PDF を開いたら load_folder が None にリセットする。
+    pub(crate) archive_source_override: Option<PathBuf>,
+
+    // ── 変換済みアーカイブキャッシュ管理ダイアログ (v0.7.0) ─────
+    /// 「変換済みアーカイブキャッシュ管理」ウィンドウの表示フラグ
+    pub(crate) show_archive_cache_manager: bool,
+    /// 開いたとき / 削除操作後にリフレッシュされる一覧キャッシュ。
+    pub(crate) archive_cache_rows:
+        Option<Vec<crate::archive_cache::ArchiveCacheEntry>>,
+    /// チェックボックス選択状態。行 index が key。
+    pub(crate) archive_cache_selection: std::collections::HashSet<usize>,
+    /// 削除操作後のメッセージ
+    pub(crate) archive_cache_manager_result: Option<String>,
+    /// 「すべて削除」確認ステップ
+    pub(crate) archive_cache_confirm_delete_all: bool,
+
     // ── 最後に選択した画像 (サムネイル画質ダイアログで使用) ──
     pub(crate) last_selected_image_path: Option<PathBuf>,
 
@@ -878,6 +903,17 @@ impl Default for App {
             cache_manager_stats: None,
             cache_manager_result: None,
             cache_manager_confirm_delete_all: false,
+            archive_cache_db: crate::archive_cache::ArchiveCacheDb::open()
+                .map_err(|e| crate::logger::log(format!("archive_cache_db open failed: {e}")))
+                .ok()
+                .map(Arc::new),
+            archive_convert: None,
+            archive_source_override: None,
+            show_archive_cache_manager: false,
+            archive_cache_rows: None,
+            archive_cache_selection: std::collections::HashSet::new(),
+            archive_cache_manager_result: None,
+            archive_cache_confirm_delete_all: false,
             last_selected_image_path: None,
             tq: ThumbQualityState {
                 fs_divider: 0.5,
@@ -1123,6 +1159,15 @@ impl App {
             || self.ic.show
     }
 
+    /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
+    /// 元 (7z/LZH) のパスを返す。通常時は `current_folder` と同じ。
+    /// BS / Ctrl+↑↓ / タイトルバー / アドレスバー表示で使うこと。
+    pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
+        self.archive_source_override
+            .clone()
+            .or_else(|| self.current_folder.clone())
+    }
+
     pub fn load_folder(&mut self, path: PathBuf) {
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
@@ -1178,6 +1223,11 @@ impl App {
                         folder_metas.push(Some((mtime, file_size)));
                     } else if ext_lower == "pdf" {
                         folders.push(GridItem::PdfFile(p));
+                        folder_metas.push(Some((mtime, file_size)));
+                    } else if let Some(fmt) =
+                        crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
+                    {
+                        folders.push(GridItem::ConvertibleArchive { path: p, format: fmt });
                         folder_metas.push(Some((mtime, file_size)));
                     }
                 }
@@ -1743,6 +1793,8 @@ impl App {
 
         self.current_folder = Some(source_path.clone());
         self.address = source_path.to_string_lossy().to_string();
+        // 通常ロードでは変換済みアーカイブ override を解除 (呼び出し元が後で再設定する)。
+        self.archive_source_override = None;
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -2952,6 +3004,15 @@ impl App {
                             let vp = p.clone();
                             open_external_player(&vp);
                         }
+                        Some(GridItem::ConvertibleArchive { path, format }) => {
+                            let pf = path.clone();
+                            let fmt = *format;
+                            if let Some(cached) = self.try_archive_cache_lookup(&pf) {
+                                self.open_archive_via_cache(pf, cached);
+                                return None;
+                            }
+                            self.request_archive_convert(pf, fmt);
+                        }
                         None => {}
                     }
                 }
@@ -2970,7 +3031,7 @@ impl App {
                 // favsearch_back 内で load_folder 済み。navigate 経路には流さない。
                 return None;
             }
-            if let Some(ref cur) = self.current_folder.clone() {
+            if let Some(ref cur) = self.effective_folder() {
                 if let Some(parent) = cur.parent() {
                     // 親に戻ったとき、元のフォルダ名を選択するようにヒントを設定
                     self.select_after_load = cur
@@ -2989,8 +3050,8 @@ impl App {
         if ctrl_down {
             if in_favsearch {
                 self.favsearch_ctrl_nav(true);
-            } else if let Some(ref cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur.clone(), true, FolderNavMode::Grid);
+            } else if let Some(cur) = self.effective_folder() {
+                self.start_folder_nav(cur, true, FolderNavMode::Grid);
             }
         }
 
@@ -2998,8 +3059,8 @@ impl App {
         if ctrl_up {
             if in_favsearch {
                 self.favsearch_ctrl_nav(false);
-            } else if let Some(ref cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur.clone(), false, FolderNavMode::Grid);
+            } else if let Some(cur) = self.effective_folder() {
+                self.start_folder_nav(cur, false, FolderNavMode::Grid);
             }
         }
 
@@ -3649,10 +3710,14 @@ impl App {
 
         let mut keep = vec![true; folders.len()];
         for (i, item) in folders.iter().enumerate() {
-            if let GridItem::ZipFile(p) | GridItem::PdfFile(p) = item {
-                if real_folder_names.contains(&stem_lower(p)) {
-                    keep[i] = false;
-                }
+            let p = match item {
+                GridItem::ZipFile(p)
+                | GridItem::PdfFile(p)
+                | GridItem::ConvertibleArchive { path: p, .. } => p,
+                _ => continue,
+            };
+            if real_folder_names.contains(&stem_lower(p)) {
+                keep[i] = false;
             }
         }
         let mut ki = keep.iter();
@@ -3791,6 +3856,7 @@ impl App {
                 | GridItem::Video(_)
                 | GridItem::ZipFile(_)
                 | GridItem::PdfFile(_)
+                | GridItem::ConvertibleArchive { .. }
                 | GridItem::ZipSeparator { .. } => {
                     matches.insert(idx);
                 }
@@ -6176,7 +6242,8 @@ impl eframe::App for App {
 
         // タイトルバーに現在のフォルダパスを表示する。
         // フォルダ未選択時や読み込み途中はアプリ名のみ。
-        let title = match self.current_folder.as_ref() {
+        // 変換済みアーカイブを開いているときは元 (7z/LZH) のパスを表示する。
+        let title = match self.effective_folder() {
             Some(p) => format!("{} - mimageviewer", p.display()),
             None => "mimageviewer".to_string(),
         };
@@ -6230,7 +6297,9 @@ impl eframe::App for App {
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_cache_manager_dialog(ctx);
+        self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
+        self.show_archive_convert_dialog(ctx);
         self.show_index_creator_dialog(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
@@ -6843,6 +6912,27 @@ pub(crate) fn draw_cell(
                 }
             }
             badge_fn(painter, inner);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            painter.text(
+                egui::pos2(inner.center().x, inner.max.y - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                truncate_name(name, 18),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(30),
+            );
+        }
+        GridItem::ConvertibleArchive { path, format } => {
+            // 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
+            // 汎用アーカイブアイコン + 形式バッジで表示する。
+            painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                "🗜",
+                egui::FontId::proportional(32.0),
+                egui::Color32::from_gray(120),
+            );
+            crate::ui_helpers::draw_archive_badge(painter, inner, format.label());
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             painter.text(
                 egui::pos2(inner.center().x, inner.max.y - 4.0),

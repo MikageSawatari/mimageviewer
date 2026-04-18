@@ -18,6 +18,12 @@ pub enum GridItem {
     ZipFile(PathBuf),
     /// フォルダ一覧に表示される PDF ファイル (1ページ目のサムネイル + バッジ)
     PdfFile(PathBuf),
+    /// 7z / LZH など「ZIP に変換してから閲覧する」対象のアーカイブ (v0.7.0)。
+    /// クリック時に変換ダイアログを表示し、変換済み ZIP を ZipFile 相当として開く。
+    ConvertibleArchive {
+        path: PathBuf,
+        format: crate::archive_converter::ArchiveFormat,
+    },
     /// タスク 3: ZIP ファイル内の画像エントリ
     ZipImage {
         zip_path: PathBuf,
@@ -62,6 +68,9 @@ impl GridItem {
             | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                 Cow::Borrowed(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
             }
+            GridItem::ConvertibleArchive { path, .. } => {
+                Cow::Borrowed(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+            }
             GridItem::ZipImage { entry_name, .. } => {
                 Cow::Borrowed(crate::zip_loader::entry_basename(entry_name))
             }
@@ -100,6 +109,9 @@ impl GridItem {
                 format!("zipsep::{dir_display}")
             }
             GridItem::PdfPage { pdf_path, page_num, .. } => pdf_page_perf_key(pdf_path, *page_num),
+            GridItem::ConvertibleArchive { path, format } => {
+                format!("archive::{}::{}", format.label(), path.display())
+            }
         }
     }
 }

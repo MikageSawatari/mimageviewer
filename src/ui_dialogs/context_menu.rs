@@ -250,6 +250,16 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
+                        GridItem::ConvertibleArchive { path, .. } => {
+                            if ui.button("パスをコピー").clicked() {
+                                ctx.copy_text(path.to_string_lossy().to_string());
+                                close = true;
+                            }
+                            if ui.button("フォルダを開く").clicked() {
+                                open_folder_in_explorer(path);
+                                close = true;
+                            }
+                        }
                     }
                 }
 
@@ -375,6 +385,16 @@ impl crate::app::App {
                     }
                     GridItem::Folder(_) | GridItem::ZipSeparator { .. } => {
                         close = true;
+                    }
+                    GridItem::ConvertibleArchive { path, .. } => {
+                        if ui.button("パスをコピー").clicked() {
+                            ctx.copy_text(path.to_string_lossy().to_string());
+                            close = true;
+                        }
+                        if ui.button("フォルダを開く").clicked() {
+                            open_folder_in_explorer(path);
+                            close = true;
+                        }
                     }
                 }
 

@@ -170,12 +170,16 @@ impl App {
                         }
                     });
                     ui.separator();
-                    if ui.button("キャッシュ管理").clicked() {
+                    if ui.button("サムネイルキャッシュ管理").clicked() {
                         let cache_dir = crate::catalog::default_cache_dir();
                         self.cache_manager_stats =
                             Some(crate::catalog::cache_stats(&cache_dir));
                         self.cache_manager_result = None;
                         self.show_cache_manager = true;
+                        ui.close();
+                    }
+                    if ui.button("変換済みアーカイブキャッシュ管理").clicked() {
+                        self.open_archive_cache_manager();
                         ui.close();
                     }
                     if ui.button("サムネイル画質…").clicked() {
@@ -761,6 +765,15 @@ impl App {
                 Some(GridItem::Video(p)) => {
                     let vp = p.clone();
                     open_external_player(&vp);
+                }
+                Some(GridItem::ConvertibleArchive { path, format }) => {
+                    let pf = path.clone();
+                    let fmt = *format;
+                    if let Some(cached) = self.try_archive_cache_lookup(&pf) {
+                        self.open_archive_via_cache(pf, cached);
+                    } else {
+                        self.request_archive_convert(pf, fmt);
+                    }
                 }
                 None => {}
             }

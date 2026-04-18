@@ -202,6 +202,17 @@ pub fn draw_pdf_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
     );
 }
 
+/// 変換対象アーカイブ (7z / LZH) のサムネイルに表示するバッジ（左下、橙系）。
+/// `label` は "7z" / "LZH" など形式表示。
+pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str) {
+    draw_file_badge(
+        painter,
+        cell_rect,
+        label,
+        egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
+    );
+}
+
 /// フォルダサムネイルに表示するバッジ（左下、緑系、フォルダ名表示）。
 pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_name: &str) {
     let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);

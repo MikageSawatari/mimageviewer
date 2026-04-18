@@ -1,7 +1,9 @@
-//! `show_cache_manager_dialog` ダイアログの実装。
+//! `show_cache_manager_dialog` ダイアログの実装 (サムネイルキャッシュ専用)。
 //!
 //! `App` への impl 拡張として書かれており、フィールドアクセスは
 //! `pub(crate)` 経由で行われる。`update()` から `self.show_cache_manager_dialog(ctx)` で呼ばれる。
+//!
+//! 変換済みアーカイブキャッシュの管理は [`archive_cache_manager`] ダイアログに分離している。
 
 #![allow(unused_imports)]
 
@@ -36,7 +38,7 @@ impl App {
             let cache_dir = crate::catalog::default_cache_dir();
             let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
-            egui::Window::new("キャッシュ管理")
+            egui::Window::new("サムネイルキャッシュ管理")
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
