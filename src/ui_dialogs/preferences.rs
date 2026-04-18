@@ -1027,13 +1027,45 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
         crate::susie_loader::PoolStatus::ReadyWithPlugins { .. } => {
             // 詳細表示はプール直参照 (対応拡張子まで見たいので)
             if let Some(pool) = crate::susie_loader::try_get_pool() {
+                let mut any_shadowed = false;
                 for pi in pool.plugins() {
-                    ui.collapsing(&pi.name, |ui| {
-                        let exts = pi.extensions.join(", ");
+                    // プラグインが名乗る拡張子のうち、本体がネイティブ対応している
+                    // ものは実際には本体が優先されるので "(本体優先)" マークを付ける。
+                    // デコードパスは image → WIC → Susie の順なので、
+                    // SUPPORTED_EXTENSIONS に含まれる拡張子は Susie に回ってこない。
+                    let mut parts: Vec<String> = Vec::with_capacity(pi.extensions.len());
+                    let mut plugin_has_shadow = false;
+                    for e in &pi.extensions {
+                        if crate::folder_tree::SUPPORTED_EXTENSIONS.contains(&e.as_str()) {
+                            parts.push(format!("{e} (本体優先)"));
+                            plugin_has_shadow = true;
+                            any_shadowed = true;
+                        } else {
+                            parts.push(e.clone());
+                        }
+                    }
+                    let header = if plugin_has_shadow {
+                        format!("{}  ⚠", pi.name)
+                    } else {
+                        pi.name.clone()
+                    };
+                    ui.collapsing(header, |ui| {
                         ui.label(
-                            egui::RichText::new(format!("対応拡張子: {exts}")).weak(),
+                            egui::RichText::new(format!("対応拡張子: {}", parts.join(", ")))
+                                .weak(),
                         );
                     });
+                }
+                if any_shadowed {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "(本体優先) の拡張子は mImageViewer 本体の内蔵デコーダが\n\
+                             使われるため、このプラグインは呼ばれません。",
+                        )
+                        .size(11.0)
+                        .weak(),
+                    );
                 }
             }
         }
