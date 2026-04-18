@@ -5,7 +5,7 @@
 //!
 //! - 対応: 7z (sevenz-rust2), LZH (delharc)。RAR はライセンス都合で非対応。
 //! - 出力: 常に STORE モード (中身は既に JPEG/PNG で圧縮済み、再圧縮無意味)。
-//! - 対象: 画像エントリ (`folder_tree::SUPPORTED_EXTENSIONS`) のみ。非画像は破棄。
+//! - 対象: 画像エントリ (`folder_tree::is_recognized_image_ext`、Susie プラグイン対応拡張子も含む) のみ。非画像は破棄。
 //! - キャンセル: `Arc<AtomicBool>` を各エントリ境界でチェック。
 //! - 進捗: `Fn(ConvertProgress)` コールバック。
 //!
@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::folder_tree::SUPPORTED_EXTENSIONS;
+use crate::folder_tree::is_recognized_image_ext;
 
 /// 変換対応アーカイブ形式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +94,10 @@ impl From<std::io::Error> for ConvertError {
 }
 
 /// エントリ名 (アーカイブ内相対パス) が画像拡張子か判定する。
+///
+/// `folder_tree::is_recognized_image_ext` を用いるので、ネイティブ対応拡張子に加え
+/// ロード済み Susie プラグインの対応拡張子 (PI / MAG / Q0 等) も画像として扱う。
+/// これによりフォルダ列挙・本表示での認識と 7z/LZH 変換対象が一致する。
 fn is_image_entry(name: &str) -> bool {
     let Some(dot) = name.rfind('.') else { return false };
     // パス区切り後に '.' があることを確認 (ディレクトリパス中の '.' を誤検出しない)
@@ -102,7 +106,7 @@ fn is_image_entry(name: &str) -> bool {
         return false;
     }
     let ext = name[dot + 1..].to_ascii_lowercase();
-    SUPPORTED_EXTENSIONS.iter().any(|e| *e == ext)
+    is_recognized_image_ext(&ext)
 }
 
 /// エントリ名を ZIP 標準 (区切り '/') に正規化し、危険なパスを排除する。
@@ -422,6 +426,24 @@ mod tests {
         assert!(!is_image_entry("movie.mp4"));
         assert!(!is_image_entry(".hidden"));
         assert!(!is_image_entry("no_extension"));
+    }
+
+    /// 判定が `folder_tree::is_recognized_image_ext` に委譲されていることを確認する。
+    /// これにより起動時にロードされた Susie プラグイン対応拡張子 (PI / MAG / Q0 等) も
+    /// 7z/LZH 変換の対象になる。ユニットテスト環境では Susie プール未初期化なので
+    /// 具体的なレトロ拡張子のテストは実機シナリオで確認する。
+    #[test]
+    fn is_image_entry_matches_recognized_ext_predicate() {
+        use crate::folder_tree::is_recognized_image_ext;
+        // 代表例で委譲関係を確認 (入力はパス末尾の拡張子小文字のみ)
+        for ext in ["jpg", "png", "webp", "gif", "bmp", "txt", "mp4", "rar"] {
+            let entry = format!("file.{}", ext);
+            assert_eq!(
+                is_image_entry(&entry),
+                is_recognized_image_ext(ext),
+                "is_image_entry/is_recognized_image_ext mismatch for .{ext}",
+            );
+        }
     }
 
     #[test]

@@ -283,9 +283,7 @@ impl App {
                     self.settings.image_ext_priority.clone(),
                 );
                 if old_dup != new_dup {
-                    if let Some(folder) = self.current_folder.clone() {
-                        self.load_folder(folder);
-                    }
+                    self.reload_current_folder_preserving_override();
                 }
                 if old_exif != self.settings.exif_hidden_tags {
                     self.exif_cache.clear();
@@ -301,9 +299,7 @@ impl App {
                         self.settings.susie_allow_parallel,
                     );
                     // 対応拡張子が変わる可能性があるので現在のフォルダを再読み込み
-                    if let Some(folder) = self.current_folder.clone() {
-                        self.load_folder(folder);
-                    }
+                    self.reload_current_folder_preserving_override();
                 }
             }
             self.show_preferences = false;

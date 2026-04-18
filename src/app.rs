@@ -1168,6 +1168,24 @@ impl App {
             .or_else(|| self.current_folder.clone())
     }
 
+    /// 現在のフォルダを再読み込みする。変換済みアーカイブ閲覧中 (キャッシュ ZIP を
+    /// `current_folder` に、元 7z/LZH を `archive_source_override` に持っている状態)
+    /// は再読み込み後も override/address を元 7z/LZH に戻し、UI コンテキストを維持する。
+    ///
+    /// 用途: 環境設定 OK 押下時の同名ファイル設定変更・Susie 設定変更など、再読み込みは
+    /// 必要だが元アーカイブの文脈を保ちたいケース。
+    pub(crate) fn reload_current_folder_preserving_override(&mut self) {
+        let Some(folder) = self.current_folder.clone() else {
+            return;
+        };
+        let saved_override = self.archive_source_override.clone();
+        self.load_folder(folder);
+        if let Some(src) = saved_override {
+            self.address = src.to_string_lossy().to_string();
+            self.archive_source_override = Some(src);
+        }
+    }
+
     pub fn load_folder(&mut self, path: PathBuf) {
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
@@ -6432,10 +6450,11 @@ impl eframe::App for App {
         // ── ペースト後のフォルダ再読み込み ────────────────────────
         if self.pending_reload {
             self.pending_reload = false;
-            if let Some(folder) = self.current_folder.clone() {
+            if self.current_folder.is_some() {
                 // 少し遅延してからリロード（ペースト処理の完了を待つ）
                 ctx.request_repaint();
-                self.load_folder(folder);
+                // 変換済みアーカイブ閲覧中は元パス文脈を保持して再読み込みする。
+                self.reload_current_folder_preserving_override();
             }
         }
 
