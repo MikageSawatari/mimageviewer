@@ -55,6 +55,9 @@ ndarray = "0.17"
 
 [dev-dependencies]
 tempfile = "3"
+# egui UI の回帰テスト用 (WCAG 検証 + 見た目のスナップショット)。
+# egui 0.33 系統に合わせて 0.33.x を指定。
+egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
 
 [build-dependencies]
 winresource = "0.1"

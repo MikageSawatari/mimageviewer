@@ -1025,122 +1025,16 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // チェックボックス表示と診断パネルが同じ状態を示すようにする)。
     ui.label(egui::RichText::new("ロード済みプラグイン").strong());
     ui.add_space(4.0);
-    match crate::susie_loader::pool_status(s.susie_enabled) {
-        crate::susie_loader::PoolStatus::ReadyWithPlugins { .. } => {
-            // 詳細表示はプール直参照 (対応拡張子まで見たいので)
-            if let Some(pool) = crate::susie_loader::try_get_pool() {
-                let mut any_shadowed = false;
-                for pi in pool.plugins() {
-                    // プラグインが名乗る拡張子のうち、本体がネイティブ対応している
-                    // ものは実際には本体が優先されるので "(本体優先)" マークを付ける。
-                    // デコードパスは image → WIC → Susie の順なので、
-                    // SUPPORTED_EXTENSIONS に含まれる拡張子は Susie に回ってこない。
-                    let mut parts: Vec<String> = Vec::with_capacity(pi.extensions.len());
-                    let mut plugin_has_shadow = false;
-                    for e in &pi.extensions {
-                        if crate::folder_tree::SUPPORTED_EXTENSIONS.contains(&e.as_str()) {
-                            parts.push(format!("{e} (本体優先)"));
-                            plugin_has_shadow = true;
-                            any_shadowed = true;
-                        } else {
-                            parts.push(e.clone());
-                        }
-                    }
-                    let header = if plugin_has_shadow {
-                        format!("{}  ⚠", pi.name)
-                    } else {
-                        pi.name.clone()
-                    };
-                    ui.collapsing(header, |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("対応拡張子: {}", parts.join(", ")))
-                                .weak(),
-                        );
-                    });
-                }
-                if any_shadowed {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "(本体優先) の拡張子は mImageViewer 本体の内蔵デコーダが\n\
-                             使われるため、このプラグインは呼ばれません。",
-                        )
-                        .size(11.0)
-                        .weak(),
-                    );
-                }
-            }
-        }
-        crate::susie_loader::PoolStatus::ReadyButEmpty => {
-            ui.label(
-                egui::RichText::new(
-                    "プラグインが 1 つも読み込まれていません。\n\
-                     「📁 フォルダを開く」から .spi ファイル (32bit) を配置し、\n\
-                     「⟳ プラグインを再読み込み」を押してください。",
-                )
-                .weak(),
-            );
-        }
-        crate::susie_loader::PoolStatus::WorkerExeMissing { expected_path } => {
-            ui.label(
-                egui::RichText::new(format!(
-                    "⚠ Susie ワーカー ({}) を APPDATA に展開できませんでした。",
-                    crate::susie_loader::WORKER_EXE_NAME,
-                ))
-                .color(egui::Color32::from_rgb(200, 100, 50)),
-            );
-            ui.label(
-                egui::RichText::new(format!(
-                    "展開先パス: {}",
-                    expected_path.display(),
-                ))
-                .monospace()
-                .size(11.0)
-                .weak(),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "通常はアプリ起動時に自動展開されます。\n\
-                     展開先のフォルダに書き込み権限があるか確認してください。",
-                )
-                .size(11.0)
-                .weak(),
-            );
-        }
-        crate::susie_loader::PoolStatus::WorkerSpawnFailed => {
-            ui.label(
-                egui::RichText::new(
-                    "⚠ ワーカープロセスの起動またはハンドシェイクに失敗しました。",
-                )
-                .color(egui::Color32::from_rgb(200, 100, 50)),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "ヘルプ → ログフォルダを開く から詳細を確認できます。",
-                )
-                .size(11.0)
-                .weak(),
-            );
-        }
-        crate::susie_loader::PoolStatus::NotInitialized => {
-            ui.label(
-                egui::RichText::new(
-                    "プラグインはまだロードされていません。\n\
-                     「⟳ プラグインを再読み込み」を押すと起動されます。",
-                )
-                .weak(),
-            );
-        }
-        crate::susie_loader::PoolStatus::DisabledBySettings => {
-            ui.label(
-                egui::RichText::new(
-                    "Susie プラグインは無効化されています\n\
-                     (上の「Susie 画像プラグインを有効にする」を ON にしてください)。",
-                )
-                .weak(),
-            );
-        }
-    }
+    let status = crate::susie_loader::pool_status(s.susie_enabled);
+    let plugins: Vec<crate::susie_loader::PluginInfo> =
+        if matches!(status, crate::susie_loader::PoolStatus::ReadyWithPlugins { .. }) {
+            crate::susie_loader::try_get_pool()
+                .map(|pool| pool.plugins().to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    crate::ui_susie_diagnostic::render_diagnostic(ui, &status, &plugins);
 }
 
 fn open_in_explorer(path: &std::path::Path) {

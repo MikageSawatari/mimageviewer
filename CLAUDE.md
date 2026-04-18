@@ -21,6 +21,7 @@
 | ワーカー追加・キャッシュ・キャンセル処理 | [docs/async-architecture.md](docs/async-architecture.md) |
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
 | 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
+| UI の見た目・配色を変える修正 | [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) (egui_kittest スナップショットの更新手順) |
 
 **設計を変えたら該当ドキュメントも同時に更新する** (下の「コード修正時のドキュメント同時更新」参照)。
 
@@ -347,6 +348,21 @@ bash scripts/setup-susie-worker.sh
 統合テスト (`tests/susie_integration.rs`) は `MIV_SUSIE_WORKER` 環境変数で
 ワーカー exe のパスを直接指定できる。`setup-susie-worker.sh` を走らせて
 `vendor/susie-worker/` に配置済みであれば、テストは自動でそれを拾う。
+
+## UI スナップショットテスト
+
+`tests/ui_snapshot.rs` + `tests/snapshots/*.png` に、`egui_kittest` を使った
+UI 回帰テストを置いている。配色・レイアウトを変える修正を入れた際の
+「意図しない見た目変化」を `cargo test` 段階で検知するのが目的。
+
+```bash
+cargo test --test ui_snapshot              # 既存スナップショットと比較
+UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更の反映
+```
+
+更新後は `tests/snapshots/*.png` を目視で確認してから PNG とコード変更を
+同時にコミットすること。詳細な設計方針・新規テスト追加手順は
+[docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) を参照。
 
 ## Distribution
 

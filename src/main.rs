@@ -44,6 +44,7 @@ pub mod os_theme;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod susie_loader;
+pub mod ui_susie_diagnostic;
 pub mod wic_decoder;
 pub mod zip_loader;
 
