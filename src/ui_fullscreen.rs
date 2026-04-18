@@ -284,8 +284,12 @@ struct FsFrameState {
     video_path: Option<std::path::PathBuf>,
     tex: Option<egui::TextureHandle>,
     thumb_tex: Option<egui::TextureHandle>,
-    filename: String,
-    folder_display: String,
+    /// 上部ホバーバー左側に表示するパス文字列。
+    /// 通常画像は `<folder>\<filename>`、ZIP 内画像は `<archive-path> > <entry>`、
+    /// PDF ページは `<pdf-path> > Page N` の形で事前に整形して格納する。
+    /// 変換済みアーカイブ閲覧中は `archive_source_override` を用いて元の
+    /// 7z/LZH のパスを表示する (キャッシュ ZIP のパスは見せない)。
+    location_display: String,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
     is_loading: bool,
@@ -684,7 +688,7 @@ impl App {
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
-                                &state.folder_display, &state.filename,
+                                &state.location_display,
                                 state.image_dims, state.image_file_size,
                                 &mut close_fs, &mut nav_delta,
                                 &mut self.show_metadata_panel,
@@ -832,9 +836,14 @@ impl App {
         let filename = self.items.get(fs_idx)
             .map(|item| item.name().to_string())
             .unwrap_or_default();
-        let folder_display = self.current_folder.as_ref()
+        let base_folder = self.effective_folder()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        let location_display = compute_location_display(
+            self.items.get(fs_idx),
+            &base_folder,
+            &filename,
+        );
         // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
         // AI テクスチャが選ばれている場合でも、元画像のサイズを使う。
         let image_dims: Option<(u32, u32)> = {
@@ -870,7 +879,7 @@ impl App {
 
         FsFrameState {
             is_video, separator_text, video_path, tex, thumb_tex,
-            filename, folder_display, image_dims, image_file_size,
+            location_display, image_dims, image_file_size,
             is_loading, fs_load_failed, pdf_content_type,
         }
     }
@@ -2302,12 +2311,14 @@ impl App {
 
     /// フルスクリーンのホバー時トップバーを描画する。
     #[allow(clippy::too_many_arguments)]
+    /// 上部ホバーバーを描画する。`location_display` は左側に表示するパス文字列
+    /// (`FsFrameState::location_display`)。通常は `<folder>\<filename>`、ZIP/PDF
+    /// 内は `<archive-path> > <entry>`。
     fn draw_fs_hover_bar(
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-        folder_display: &str,
-        filename: &str,
+        location_display: &str,
         image_dims: Option<(u32, u32)>,
         image_file_size: Option<u64>,
         close_fs: &mut bool,
@@ -2600,22 +2611,33 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // ── 左側: フォルダパス ──
-        if !folder_display.is_empty() {
-            ui.painter().text(
-                egui::pos2(bar_rect.min.x + 12.0, bar_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                folder_display,
+        // ── 左側: フォルダ + ファイル名 (または archive > entry) ──
+        // 右側のボタン / 情報テキストと衝突しないように幅制限して右端を切る。
+        if !location_display.is_empty() {
+            let max_x = next_x - 12.0 - compute_info_text_width(
+                ui, image_dims, image_file_size, ai_upscale_info, pdf_content_type,
+            );
+            let avail_width = (max_x - (bar_rect.min.x + 12.0)).max(40.0);
+            let galley = ui.painter().layout(
+                location_display.to_string(),
                 egui::FontId::proportional(13.0),
-                egui::Color32::from_gray(180),
+                egui::Color32::from_gray(200),
+                avail_width,
+            );
+            let text_y = bar_rect.center().y - galley.size().y * 0.5;
+            ui.painter().galley(
+                egui::pos2(bar_rect.min.x + 12.0, text_y),
+                galley,
+                egui::Color32::from_gray(200),
             );
         }
 
-        // ── ファイル情報テキスト ──
+        // ── 右側: 画像サイズ・ファイルサイズ・PDF 情報 ──
+        // ファイル名は location_display 側へ統合したのでここからは除いている。
         draw_fs_bar_info_text(
             ui, bar_rect,
             egui::pos2(next_x - 12.0, bar_rect.center().y),
-            filename, image_dims, image_file_size,
+            image_dims, image_file_size,
             ai_upscale_info, pdf_content_type,
         );
     }
@@ -2950,20 +2972,86 @@ fn draw_fs_checkmark(ui: &mut egui::Ui, full_rect: egui::Rect) {
     );
 }
 
-/// ファイル情報テキスト（ファイル名・寸法・サイズ）を描画する。
+/// 上部ホバーバー左側の表示文字列を組み立てる。
+///
+/// - `ZipImage`: `<archive-path> > <entry_name>`
+/// - `PdfPage`:  `<pdf-path> > Page N`
+/// - それ以外: `<folder>\<filename>` (Windows パス区切り)
+///
+/// `base_folder` は `effective_folder()` の表示文字列を想定 (変換済みアーカイブ
+/// 閲覧中は元 7z/LZH のパスが渡ってくる)。空文字列なら基底パス部分を省略する。
+fn compute_location_display(
+    item: Option<&GridItem>,
+    base_folder: &str,
+    filename: &str,
+) -> String {
+    match item {
+        Some(GridItem::ZipImage { entry_name, .. }) => {
+            if base_folder.is_empty() {
+                entry_name.clone()
+            } else {
+                format!("{base_folder} > {entry_name}")
+            }
+        }
+        Some(GridItem::PdfPage { page_num, .. }) => {
+            if base_folder.is_empty() {
+                format!("Page {}", page_num + 1)
+            } else {
+                format!("{base_folder} > Page {}", page_num + 1)
+            }
+        }
+        _ => {
+            // 通常画像・動画・ZipSeparator 等: folder + basename を連結。
+            if base_folder.is_empty() {
+                filename.to_string()
+            } else if filename.is_empty() {
+                base_folder.to_string()
+            } else {
+                let ends_with_sep = base_folder.ends_with(std::path::MAIN_SEPARATOR)
+                    || base_folder.ends_with('/');
+                if ends_with_sep {
+                    format!("{base_folder}{filename}")
+                } else {
+                    format!("{base_folder}{}{filename}", std::path::MAIN_SEPARATOR)
+                }
+            }
+        }
+    }
+}
+
+/// ファイル情報テキスト (PDF 種別・寸法・AI・ファイルサイズ) を描画する。
+/// ファイル名は左側 `location_display` に統合済みなのでここでは扱わない。
 fn draw_fs_bar_info_text(
     ui: &mut egui::Ui,
     bar_rect: egui::Rect,
     right_anchor: egui::Pos2,
-    filename: &str,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
     ai_upscale_info: Option<(&str, u32, u32)>,
     pdf_content_type: Option<PdfPageContentType>,
 ) {
+    let text = build_info_text(image_dims, image_file_size, ai_upscale_info, pdf_content_type);
+    if !text.is_empty() {
+        ui.painter().text(
+            right_anchor,
+            egui::Align2::RIGHT_CENTER,
+            text,
+            egui::FontId::proportional(15.0),
+            egui::Color32::WHITE,
+        );
+    }
+    let _ = bar_rect;
+}
+
+/// 上部バー右側に表示する画像情報テキスト (PDF 種別 / 寸法 / AI / サイズ) を組み立てる。
+/// `draw_fs_bar_info_text` と `compute_info_text_width` 両方から使う。
+fn build_info_text(
+    image_dims: Option<(u32, u32)>,
+    image_file_size: Option<u64>,
+    ai_upscale_info: Option<(&str, u32, u32)>,
+    pdf_content_type: Option<PdfPageContentType>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if !filename.is_empty() { parts.push(filename.to_string()); }
-    // PDF コンテンツ種別
     if let Some(ct) = pdf_content_type {
         match ct {
             PdfPageContentType::Raster { w, h } => {
@@ -2976,23 +3064,36 @@ fn draw_fs_bar_info_text(
     }
     if let Some((w, h)) = image_dims {
         if let Some((model_name, ai_w, ai_h)) = ai_upscale_info {
-            // AI アップスケール情報を表示: "11 × 22 (漫画 44×88)"
+            // AI アップスケール情報: "11 × 22 (漫画 44×88)"
             parts.push(format!("{w} × {h} ({model_name} {ai_w}×{ai_h})"));
         } else {
             parts.push(format!("{w} × {h}"));
         }
     }
-    if let Some(bytes) = image_file_size { parts.push(format_bytes_small(bytes)); }
-    if !parts.is_empty() {
-        ui.painter().text(
-            right_anchor,
-            egui::Align2::RIGHT_CENTER,
-            parts.join("    "),
-            egui::FontId::proportional(15.0),
-            egui::Color32::WHITE,
-        );
+    if let Some(bytes) = image_file_size {
+        parts.push(format_bytes_small(bytes));
     }
-    let _ = bar_rect;
+    parts.join("    ")
+}
+
+/// 右側情報テキストの描画幅を返す。左側 `location_display` を折り詰めするのに使う。
+fn compute_info_text_width(
+    ui: &egui::Ui,
+    image_dims: Option<(u32, u32)>,
+    image_file_size: Option<u64>,
+    ai_upscale_info: Option<(&str, u32, u32)>,
+    pdf_content_type: Option<PdfPageContentType>,
+) -> f32 {
+    let text = build_info_text(image_dims, image_file_size, ai_upscale_info, pdf_content_type);
+    if text.is_empty() {
+        return 0.0;
+    }
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        egui::FontId::proportional(15.0),
+        egui::Color32::WHITE,
+    );
+    galley.size().x
 }
 
 /// 回転アイコンを自前描画する。
@@ -3298,6 +3399,102 @@ impl App {
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid_item::GridItem;
+    use std::path::PathBuf;
+
+    #[test]
+    fn location_display_regular_image_joins_folder_and_filename() {
+        let out = compute_location_display(
+            Some(&GridItem::Image(PathBuf::from(r"C:\photos\2024\img.jpg"))),
+            r"C:\photos\2024",
+            "img.jpg",
+        );
+        assert_eq!(out, r"C:\photos\2024\img.jpg");
+    }
+
+    #[test]
+    fn location_display_regular_image_handles_trailing_separator() {
+        // ドライブルート直下 "C:\" のような末尾 '\' ケース
+        let out = compute_location_display(
+            Some(&GridItem::Image(PathBuf::from(r"C:\img.jpg"))),
+            r"C:\",
+            "img.jpg",
+        );
+        assert_eq!(out, r"C:\img.jpg");
+    }
+
+    #[test]
+    fn location_display_zip_image_uses_arrow_separator() {
+        let out = compute_location_display(
+            Some(&GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\archives\book.zip"),
+                entry_name: "ch01/page01.jpg".to_string(),
+            }),
+            r"C:\archives\book.zip",
+            "page01.jpg",
+        );
+        assert_eq!(out, r"C:\archives\book.zip > ch01/page01.jpg");
+    }
+
+    #[test]
+    fn location_display_pdf_page_shows_page_number() {
+        let out = compute_location_display(
+            Some(&GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\docs\manual.pdf"),
+                page_num: 4, // 0-indexed なので表示は "Page 5"
+                content_type: None,
+            }),
+            r"C:\docs\manual.pdf",
+            "Page 5",
+        );
+        assert_eq!(out, r"C:\docs\manual.pdf > Page 5");
+    }
+
+    /// 変換済み 7z/LZH を閲覧中は `effective_folder()` が元アーカイブのパスを
+    /// 返す想定。`base_folder` にその値が渡ってくるので、キャッシュ ZIP のパス
+    /// ではなく元 7z/LZH が表示される。
+    #[test]
+    fn location_display_uses_override_path_for_converted_archives() {
+        let out = compute_location_display(
+            Some(&GridItem::ZipImage {
+                // zip_path はキャッシュ ZIP 側 (UI 表示には使わない)
+                zip_path: PathBuf::from(r"C:\AppData\cache\abc\book.zip"),
+                entry_name: "page01.jpg".to_string(),
+            }),
+            // base_folder は effective_folder() → 元 LZH
+            r"C:\downloads\book.lzh",
+            "page01.jpg",
+        );
+        assert_eq!(out, r"C:\downloads\book.lzh > page01.jpg");
+    }
+
+    #[test]
+    fn location_display_empty_base_falls_back_to_filename() {
+        let out = compute_location_display(
+            Some(&GridItem::Image(PathBuf::from("img.jpg"))),
+            "",
+            "img.jpg",
+        );
+        assert_eq!(out, "img.jpg");
+    }
+
+    #[test]
+    fn location_display_empty_base_zip_falls_back_to_entry() {
+        let out = compute_location_display(
+            Some(&GridItem::ZipImage {
+                zip_path: PathBuf::from("book.zip"),
+                entry_name: "page01.jpg".to_string(),
+            }),
+            "",
+            "page01.jpg",
+        );
+        assert_eq!(out, "page01.jpg");
     }
 }
 
