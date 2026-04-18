@@ -427,13 +427,22 @@ pub fn try_get_pool() -> Option<Arc<SusieWorkerPool>> {
     POOL.get().map(|lock| Arc::clone(&lock.read().unwrap()))
 }
 
-/// ある拡張子が Susie プラグインで扱えるか (プール未初期化時は false)。
-/// `folder_tree::is_recognized_image_ext` から呼ばれる軽量判定。
+/// ある拡張子が Susie プラグインで扱えるか。
+/// `folder_tree::is_recognized_image_ext` から呼ばれる判定。
+///
+/// プール未初期化時は `get_pool()` が handshake 完了まで待機するため、ここで
+/// ブロックする可能性がある (通常数百 ms、バックグラウンド init スレッドが
+/// 走っているならその join を待つだけ)。ネイティブ対応拡張子は
+/// `is_recognized_image_ext` 内の `SUPPORTED_EXTENSIONS.contains` でショート
+/// サーキットされるため、ここに来るのは非ネイティブ拡張子 (PI / MAG 等、または
+/// 未知の拡張子) のみ。Susie を無効化している場合は `get_pool()` が即座に
+/// `empty_pool()` を返すのでブロックしない。
+///
+/// 以前は `try_get_pool()` を使っていたが、起動直後の「last folder 復元」等で
+/// プール初期化より先に ZIP / フォルダ列挙が走ると Susie 拡張子が false で
+/// 返ってしまい、MAG / PI がサムネイル一覧から落ちる race があった (v0.7.0 修正)。
 pub fn supports_extension(ext_lower: &str) -> bool {
-    match try_get_pool() {
-        Some(pool) => pool.supports_extension(ext_lower),
-        None => false,
-    }
+    get_pool().supports_extension(ext_lower)
 }
 
 /// プラグインフォルダ更新 / 並列オプション変更時にワーカープールを再起動する。

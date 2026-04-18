@@ -246,3 +246,157 @@ fn decode_works_with_parallel_off() {
     // パラレル ON に戻しておく (後続テストが影響を受けないように)
     susie_loader::reload(true, true);
 }
+
+// -----------------------------------------------------------------------
+// ZIP / 7z から Susie 対応拡張子 (PI / MAG) を検出できるかの end-to-end テスト
+// -----------------------------------------------------------------------
+//
+// v0.7.0 Phase A では zip_loader が独自ハードコードの IMAGE_EXTS
+// (jpg/jpeg/png/webp/bmp/gif) しか見ておらず、ZIP 内の PI / MAG がサムネイル
+// 一覧から落ちる不整合があった。`is_recognized_image_ext` 経由への統一 +
+// Susie プール初期化待ちを行うようにした上で、以下のテストで回帰を検知する。
+
+use std::io::Write as _;
+
+fn make_zip_with_entries(
+    path: &std::path::Path,
+    entries: &[(&str, &[u8])],
+) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in entries {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(data).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+fn make_7z_with_entries(
+    path: &std::path::Path,
+    entries: &[(&str, &[u8])],
+) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = sevenz_rust2::ArchiveWriter::new(file).unwrap();
+    for (name, data) in entries {
+        let entry = sevenz_rust2::ArchiveEntry::new_file(name);
+        writer.push_archive_entry::<&[u8]>(entry, Some(*data)).unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// ZIP 内の `.pi` / `.mag` エントリが `enumerate_image_entries` で列挙される。
+/// ZIP の中身は空バイトで十分 (デコードは呼ばれない)。
+#[test]
+fn zip_enumerates_susie_extensions() {
+    setup_env();
+    if !testdata_ok() {
+        eprintln!("skip: missing worker exe or testdata");
+        return;
+    }
+    // プール未起動なら起動し、Susie が pi/mag を報告する状態にする。
+    susie_loader::reload(true, true);
+    assert!(
+        susie_loader::try_get_pool()
+            .map(|p| p.supports_extension("pi") && p.supports_extension("mag"))
+            .unwrap_or(false),
+        "test precondition: Susie plugins for pi/mag must be loaded",
+    );
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let zip_path = tmp.path().join("retro.zip");
+    make_zip_with_entries(
+        &zip_path,
+        &[
+            ("page01.pi", b"stub_pi_bytes"),
+            ("page02.mag", b"stub_mag_bytes"),
+            ("page03.jpg", b"stub_jpg_bytes"),
+            ("notes.txt", b"skip"),
+        ],
+    );
+
+    let entries = mimageviewer::zip_loader::enumerate_image_entries(&zip_path)
+        .expect("enumerate_image_entries should succeed");
+    let names: Vec<String> = entries.iter().map(|e| e.entry_name.clone()).collect();
+    eprintln!("enumerated: {names:?}");
+    assert_eq!(names.len(), 3, "expected 3 image entries, got {names:?}");
+    assert!(
+        names.contains(&"page01.pi".to_string()),
+        "PI entry missing from ZIP enumeration",
+    );
+    assert!(
+        names.contains(&"page02.mag".to_string()),
+        "MAG entry missing from ZIP enumeration",
+    );
+    assert!(names.contains(&"page03.jpg".to_string()));
+    assert!(!names.iter().any(|n| n.ends_with("notes.txt")));
+}
+
+/// 7z → ZIP 変換が `.pi` / `.mag` を画像として抽出する。
+/// `archive_converter::is_image_entry` が Susie 対応拡張子も含めて画像扱いすることを確認。
+#[test]
+fn sevenz_convert_includes_susie_extensions() {
+    setup_env();
+    if !testdata_ok() {
+        eprintln!("skip: missing worker exe or testdata");
+        return;
+    }
+    susie_loader::reload(true, true);
+    assert!(
+        susie_loader::try_get_pool()
+            .map(|p| p.supports_extension("pi") && p.supports_extension("mag"))
+            .unwrap_or(false),
+        "test precondition: Susie plugins for pi/mag must be loaded",
+    );
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = tmp.path().join("retro.7z");
+    let dst = tmp.path().join("retro_out.zip");
+    make_7z_with_entries(
+        &src,
+        &[
+            ("page01.pi", b"stub_pi_bytes"),
+            ("page02.mag", b"stub_mag_bytes"),
+            ("page03.jpg", b"stub_jpg_bytes"),
+            ("notes.txt", b"skip"),
+        ],
+    );
+
+    let summary = mimageviewer::archive_converter::scan_summary(
+        &src,
+        mimageviewer::archive_converter::ArchiveFormat::SevenZ,
+    )
+    .expect("scan_summary should succeed");
+    assert_eq!(
+        summary.image_count, 3,
+        "scan should find PI + MAG + JPG, got {}",
+        summary.image_count,
+    );
+
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let stats = mimageviewer::archive_converter::convert_to_zip(
+        &src,
+        &dst,
+        mimageviewer::archive_converter::ArchiveFormat::SevenZ,
+        &cancel,
+        None,
+    )
+    .expect("convert_to_zip should succeed");
+    assert_eq!(stats.image_count, 3);
+
+    let file = std::fs::File::open(&dst).unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(
+        names.contains(&"page01.pi".to_string()),
+        "PI not carried into converted ZIP: {names:?}",
+    );
+    assert!(
+        names.contains(&"page02.mag".to_string()),
+        "MAG not carried into converted ZIP: {names:?}",
+    );
+    assert!(!names.iter().any(|n| n.ends_with("notes.txt")));
+}

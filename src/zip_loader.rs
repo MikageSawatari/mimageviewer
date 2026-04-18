@@ -27,8 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
-/// サムネイル生成対象とする画像拡張子 (`app.rs` の `SUPPORTED_EXTENSIONS` と同じ)
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
 const ZIP_EXT: &str = "zip";
 
 // ── 内側 ZIP バイト列キャッシュ ──────────────────────────────────
@@ -152,8 +150,18 @@ fn lowercase_ext(name: &str) -> Option<String> {
     Some(name[dot + 1..].to_ascii_lowercase())
 }
 
+/// ZIP 内エントリが画像として扱える拡張子か判定する。
+///
+/// 通常フォルダ・7z/LZH 変換と同じ [`crate::folder_tree::is_recognized_image_ext`]
+/// に委譲することで、ネイティブ (image クレート) ・WIC (HEIC / AVIF / JXL / TIFF /
+/// RAW) ・ロード済み Susie プラグイン (PI / MAG / Q0 等) の対応拡張子が
+/// すべて ZIP 内でも同じように認識される。
+///
+/// 以前はここに独自のハードコードリスト (jpg/jpeg/png/webp/bmp/gif) を持っていて、
+/// ZIP 内の HEIC や MAG が本体では開けるのにサムネイル一覧に出てこないという
+/// 不整合があった (v0.7.0 で修正)。
 fn is_image_ext(ext_lower: &str) -> bool {
-    IMAGE_EXTS.iter().any(|e| *e == ext_lower)
+    crate::folder_tree::is_recognized_image_ext(ext_lower)
 }
 
 /// エントリ名に ".zip/" 境界があれば境界位置 (境界 '/' の絶対 byte 位置) を列挙。
@@ -613,6 +621,35 @@ mod tests {
     fn lowercase_ext_simple() {
         assert_eq!(lowercase_ext("img.JPG").as_deref(), Some("jpg"));
         assert_eq!(lowercase_ext("dir/a.PNG").as_deref(), Some("png"));
+    }
+
+    /// `is_image_ext` がネイティブ対応拡張子に加え WIC 対応拡張子 (HEIC/AVIF/JXL/
+    /// TIFF/RAW) も ZIP 内で認識することを確認する回帰テスト。以前はハードコードの
+    /// 6 種 (jpg/jpeg/png/webp/bmp/gif) だけを見ていて、ZIP 内の HEIC などが本体
+    /// で開けるのにサムネイル一覧に出てこない不整合があった。
+    ///
+    /// Susie 対応拡張子 (PI / MAG 等) はテスト環境ではプール未初期化のため
+    /// ここでは検証できないが、実行時は同じ `is_recognized_image_ext` を通るので
+    /// ZIP でも認識される。
+    #[test]
+    fn is_image_ext_includes_native_and_wic_formats() {
+        // ネイティブ (image クレート)
+        assert!(is_image_ext("jpg"));
+        assert!(is_image_ext("png"));
+        assert!(is_image_ext("webp"));
+        assert!(is_image_ext("bmp"));
+        assert!(is_image_ext("gif"));
+        // WIC
+        assert!(is_image_ext("heic"));
+        assert!(is_image_ext("avif"));
+        assert!(is_image_ext("jxl"));
+        assert!(is_image_ext("tiff"));
+        assert!(is_image_ext("cr2"));
+        assert!(is_image_ext("arw"));
+        // 画像でないもの
+        assert!(!is_image_ext("mp4"));
+        assert!(!is_image_ext("txt"));
+        assert!(!is_image_ext("zip"));
     }
 
     #[test]

@@ -27,6 +27,27 @@ fn make_test_7z(path: &std::path::Path) {
     writer.finish().unwrap();
 }
 
+/// WIC 対応拡張子 (HEIC / AVIF / JXL / TIFF / RAW) を含む 7z を生成する。
+/// 中身は適当なバイト列でよい (decoder は test では呼ばれない)。
+fn make_test_7z_with_wic_exts(path: &std::path::Path) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = sevenz_rust2::ArchiveWriter::new(file).unwrap();
+    let entries = [
+        ("photo.heic", &b"fake_heic"[..]),
+        ("img.avif", &b"fake_avif"[..]),
+        ("art.jxl", &b"fake_jxl"[..]),
+        ("scan.tiff", &b"fake_tiff"[..]),
+        ("raw.cr2", &b"fake_cr2"[..]),
+        ("raw.arw", &b"fake_arw"[..]),
+        ("notes.txt", &b"skip"[..]),
+    ];
+    for (name, data) in entries.iter() {
+        let entry = sevenz_rust2::ArchiveEntry::new_file(name);
+        writer.push_archive_entry::<&[u8]>(entry, Some(data)).unwrap();
+    }
+    writer.finish().unwrap();
+}
+
 #[test]
 fn convert_7z_extracts_only_images() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -66,6 +87,42 @@ fn convert_7z_extracts_only_images() {
             e.compression()
         );
     }
+}
+
+/// 7z 変換が WIC 対応拡張子 (HEIC / AVIF / JXL / TIFF / RAW) を
+/// 画像として扱うことを確認する回帰テスト。
+/// 以前は archive_converter::is_image_entry がネイティブ拡張子しか見ておらず、
+/// HEIC を含む 7z が NoImages で落ちていた。
+#[test]
+fn convert_7z_extracts_wic_extensions() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = tmp.path().join("wic.7z");
+    let dst = tmp.path().join("wic_out.zip");
+    make_test_7z_with_wic_exts(&src);
+
+    // 事前スキャン: heic/avif/jxl/tiff/cr2/arw の 6 枚、notes.txt は除外
+    let summary = scan_summary(&src, ArchiveFormat::SevenZ).unwrap();
+    assert_eq!(
+        summary.image_count, 6,
+        "scan should find all 6 WIC-supported entries"
+    );
+
+    let cancel = AtomicBool::new(false);
+    let stats = convert_to_zip(&src, &dst, ArchiveFormat::SevenZ, &cancel, None).unwrap();
+    assert_eq!(stats.image_count, 6);
+
+    let file = std::fs::File::open(&dst).unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    for expected in ["photo.heic", "img.avif", "art.jxl", "scan.tiff", "raw.cr2", "raw.arw"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected} in converted ZIP: {names:?}",
+        );
+    }
+    assert!(!names.iter().any(|n| n.ends_with("notes.txt")));
 }
 
 #[test]
