@@ -268,6 +268,15 @@ std::thread::spawn(move || {
 オプションを用意している。環境設定 → Susie プラグイン → 「プラグインを並列実行する」
 チェックで切り替え可能。問題プラグインの切り分けはユーザー側に委ねる方針。
 
+**Susie プール初期化の race (v0.7.0 修正済み)**: `susie_loader::supports_extension()`
+は初期は `try_get_pool()` (プール未初期化時は None→false を返す) で判定していたが、
+起動直後に Susie 対応拡張子を含む ZIP / フォルダを開くと、バックグラウンド init
+スレッドの完了前に列挙が走って PI / MAG / Q0 などが無視されていた。
+`get_pool()` (未初期化ならブロック) に切り替え、一度だけ数百 ms ブロックして
+プールを取得する方式に変更。ネイティブ拡張子は `is_recognized_image_ext` 内の
+`SUPPORTED_EXTENSIONS.contains` でショートサーキットされるためここに到達しない。
+Susie を無効化していれば `get_pool()` は即座に empty プールを返すので無害。
+
 ### 5.5 try_lock + sleep ポーリングループ (禁止パターン)
 
 「`Mutex` を `try_lock` して、失敗したら sleep して再試行」というループは、**複数スレッドが

@@ -79,11 +79,13 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 
 | モジュール | 役割 |
 | --- | --- |
-| `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) はフラット展開し、内側 ZIP バイト列は 256MB LRU キャッシュに保持 |
+| `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) はフラット展開し、内側 ZIP バイト列は 256MB LRU キャッシュに保持。画像判定は `folder_tree::is_recognized_image_ext` に委譲 (ネイティブ + WIC + Susie) |
 | `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
-| `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング |
+| `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング。32bit ワーカー exe は本体に `include_bytes!` で埋め込み、初回起動時に `%APPDATA%\mimageviewer\mimageviewer-susie32.exe` へ自動展開 |
+| `archive_converter.rs` | 7z / LZH → 無圧縮 ZIP 変換 (sevenz-rust2 / delharc)。画像判定は `is_recognized_image_ext` 経由 (Susie 対応拡張子も含む) |
+| `archive_cache.rs` | 変換済み ZIP のマッピング DB (`%APPDATA%/mimageviewer/archive_cache.db`)。元ファイルパス + mtime + size で lookup、変換後 ZIP は `archive_cache/<hash[..2]>/<hash>/*.zip` |
 | `fs_animation.rs` | GIF / APNG アニメーションのフレーム展開 |
 | `video_thumb.rs` | 動画サムネイル取得 (Windows Shell API) |
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |
@@ -112,7 +114,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_analysis_panel.rs` | 画像分析パネル (右端オーバーレイ)。色情報・ヒストグラム |
 | `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF) |
 | `ui_erase.rs` | 消しゴムモード (Lasso/縦線/横線/ブラシ → MI-GAN で inpaint) |
-| `ui_dialogs/` | 環境設定・キャッシュ管理・お気に入り編集・スライドショー設定等 |
+| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等 |
+| `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
 
 ### その他
 

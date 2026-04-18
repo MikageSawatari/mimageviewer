@@ -257,7 +257,54 @@ $miv = Get-Process mimageviewer
 - 次の画像を開くと既定に戻る（保存されない）
 - 不透明画像では B キーが視覚的に何もしない
 
-### 7. 設定永続化テスト
+### 7. WIC / Susie 画像 × ZIP / LZH のサムネイル認識（v0.7.0）
+
+**目的:** v0.7.0 で `zip_loader::IMAGE_EXTS` の独自ハードコードを廃して
+`folder_tree::is_recognized_image_ext` に統一したため、ZIP/7z/LZH の中に
+HEIC / AVIF / JXL / RAW や PI / MAG のような非ネイティブ画像があっても
+本体・通常フォルダと同じ集合で認識される。
+
+**事前準備:**
+- `testimage/16bit/zip/C165_206.ZIP`（PI / MAG が混在する実サンプル）
+- HEIC / AVIF / RAW などを含む任意の ZIP（`testimage/heic_sample.zip` 等）
+- `testimage/16bit/lzh/C165.LZH` のような実 LZH ファイル
+- Susie プラグイン (ifpi.spi / ifmag.spi) が `susie_plugins/` に配置済み
+
+#### 7-1. ZIP 内 PI / MAG の列挙
+
+**手順:**
+1. `C165_206.ZIP` をダブルクリックして開く
+2. グリッドに全 PI / MAG エントリが表示されることを確認
+3. 1 枚を開いて画像が表示されることを確認
+
+**確認項目:**
+- BMP だけでなく PI / MAG が全てグリッドに現れる
+- サムネイルが生成される（Susie 経由デコード）
+- フルスクリーンでも正常表示
+
+#### 7-2. ZIP 内 WIC 画像の列挙
+
+**手順:**
+1. HEIC / AVIF / JXL / RAW を含む ZIP を開く
+
+**確認項目:**
+- 対応拡張子がすべてグリッドに出る（ハードコード時代は落ちていた）
+
+#### 7-3. 変換済み LZH でホバーバーのパス表示
+
+**手順:**
+1. `C165.LZH` をクリック → 変換ダイアログ → 「変換して開く」
+2. 変換後のグリッドから画像を 1 枚フルスクリーンで開く
+3. マウスを画面上部にホバー
+
+**確認項目:**
+- ホバーバー左側に `<元 LZH のパス> > <entry>` と表示される
+  （キャッシュ ZIP の `%APPDATA%\mimageviewer\archive_cache\...` パスではない）
+- 同じフォーマットが ZIP / PDF でも一貫している
+  （ZIP: `<archive> > <entry>`、PDF: `<pdf> > Page N`、通常画像: `<folder>\<filename>`）
+- 右側の画像サイズ・AI アップスケール情報・ファイルサイズの表示は従来通り
+
+### 8. 設定永続化テスト
 
 **手順:**
 1. ツールバーで列数を変更（例: 9 → 4）
