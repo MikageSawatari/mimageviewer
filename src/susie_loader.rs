@@ -80,11 +80,17 @@ fn worker_exe_cached_path() -> PathBuf {
             if SUSIE_WORKER_BYTES.is_empty() {
                 return exe_path;
             }
-            let needs_extract = match std::fs::metadata(&exe_path) {
-                Ok(meta) => meta.len() != SUSIE_WORKER_BYTES.len() as u64,
+            // サイズ比較だけではアップデート時に同サイズ・別内容のバイナリを
+            // 取り違える可能性があるため、既存ファイル全体を読んで中身比較する。
+            // 169KB 程度なので起動時の 1 回読みは許容範囲。
+            let needs_extract = match std::fs::read(&exe_path) {
+                Ok(existing) => existing.as_slice() != SUSIE_WORKER_BYTES,
                 Err(_) => true,
             };
             if needs_extract {
+                // 他プロセス (旧 mImageViewer インスタンス) がワーカーを起動中で
+                // ファイルをロックしている場合 write は失敗する。その場合は
+                // 古いバイナリのまま続行 (次回起動で書き換わる)。
                 match std::fs::write(&exe_path, SUSIE_WORKER_BYTES) {
                     Ok(()) => {
                         crate::logger::log(format!(
@@ -513,9 +519,13 @@ pub enum PoolStatus {
 }
 
 /// UI から状態を問い合わせる。プール未初期化でも軽量に判定できる。
-pub fn pool_status() -> PoolStatus {
-    let settings = crate::settings::Settings::load();
-    if !settings.susie_enabled {
+///
+/// `enabled` は呼び出し側の "今表示中の有効フラグ" (Preferences ダイアログなら
+/// 編集中の `state.settings.susie_enabled`、それ以外なら `Settings::load()` の
+/// `susie_enabled`) を渡す。これによりチェックボックス操作直後の表示と
+/// 診断パネルが食い違わない。
+pub fn pool_status(enabled: bool) -> PoolStatus {
+    if !enabled {
         return PoolStatus::DisabledBySettings;
     }
     let exe = worker_exe_path();

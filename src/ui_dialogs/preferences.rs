@@ -1021,9 +1021,11 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(8.0);
 
     // ロード済みプラグイン一覧 / 診断情報
+    // 診断は "編集中の" enabled フラグを見る (OK 前にトグルした直後でも
+    // チェックボックス表示と診断パネルが同じ状態を示すようにする)。
     ui.label(egui::RichText::new("ロード済みプラグイン").strong());
     ui.add_space(4.0);
-    match crate::susie_loader::pool_status() {
+    match crate::susie_loader::pool_status(s.susie_enabled) {
         crate::susie_loader::PoolStatus::ReadyWithPlugins { .. } => {
             // 詳細表示はプール直参照 (対応拡張子まで見たいので)
             if let Some(pool) = crate::susie_loader::try_get_pool() {
