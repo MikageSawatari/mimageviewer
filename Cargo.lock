@@ -2334,6 +2334,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimageviewer-susie32"
+version = "0.1.0"
+dependencies = [
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

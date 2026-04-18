@@ -39,11 +39,11 @@ v0.7.0 で一括公開する機能の設計方針をまとめる。
 | # | タスク | 見積 | 状態 |
 |---|---|---|---|
 | 7 | `egui_kittest` スナップショット基盤 | 1〜2 日 | 未着手 |
-| 9 | 32bit ワーカー用バイナリ雛形 | 1 日 | 未着手 |
-| 10 | Susie プラグイン API バインディング | 2 日 | 未着手 |
-| 11 | 複数プロセスワーカープール + IPC | 2〜3 日 | 未着手 |
-| 12 | プラグイン配置フォルダ管理 + 「フォルダを開く」ボタン | 0.5 日 | 未着手 |
-| 13 | 画像デコードルーティング（拡張子 → Susie / ネイティブ） | 1 日 | 未着手 |
+| 9 | 32bit ワーカー用バイナリ雛形 | 1 日 | ✅ 実装済み (`crates/susie-worker/`、Inno Setup にも同梱設定を追加) |
+| 10 | Susie プラグイン API バインディング | 2 日 | ✅ 実装済み (`crates/susie-worker/src/plugin.rs`、GetPluginInfo/IsSupported/GetPicture + BITMAPINFO 変換 1/4/8/24/32 bpp) |
+| 11 | 複数プロセスワーカープール + IPC | 2〜3 日 | ✅ 実装済み (`src/susie_loader.rs`、`Settings::susie_allow_parallel=false` でプール数を 1 に落とせる並列問題切り分け用オプション付き) |
+| 12 | プラグイン配置フォルダ管理 + 「フォルダを開く」ボタン | 0.5 日 | ✅ 実装済み (環境設定 → Susie プラグインページ: フォルダを開く/再読み込み/プラグイン一覧) |
+| 13 | 画像デコードルーティング（拡張子 → Susie / ネイティブ） | 1 日 | ✅ 実装済み (`folder_tree::is_recognized_image_ext`、`thumb_loader` / `app.rs` の image → WIC → Susie フォールバック) |
 | 14 | RAR / 7z / LZH の ZIP 変換ワーカー | 2 日 | 未着手 |
 | 15 | 変換ダイアログ UI + 進捗表示 + キャンセル | 1〜2 日 | 未着手 |
 | 16 | 変換キャッシュ DB + 手動削除 UI | 1〜2 日 | 未着手 |
@@ -52,7 +52,18 @@ v0.7.0 で一括公開する機能の設計方針をまとめる。
 | 19 | FAQ ページ作成・リンク | 0.5 日 | 未着手 |
 | 20 | マニュアル本体・index.html 更新 | 0.5 日 | 未着手 |
 
-**次の順序候補**: B2 (RAR/7z/LZH 変換、Task 14-17) → B3 (Susie プラグイン、Task 9-13) → 仕上げ (Task 18-20、infra 7)。Task 6 (WCAG コントラスト) は Task 7 と同時に扱うのが自然。
+**次の順序候補**: B2 (RAR/7z/LZH 変換、Task 14-17) → 仕上げ (Task 18-20、infra 7)。B3 (Susie プラグイン、Task 9-13) は 2026-04-18 に完了。Task 6 (WCAG コントラスト) は Task 7 と同時に扱うのが自然。
+
+### ✅ Phase B3 完了 (2026-04-18) — Susie プラグイン対応
+
+- `crates/susie-worker/` を workspace 配下に新設。32bit ビルド専用。
+  `cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie32` で ~165KB の exe が生成される。
+- `src/susie_loader.rs` (480 行) で 3 プロセス並列のワーカープール + IPC を実装。
+- 設定: `susie_enabled` / `susie_allow_parallel` (並列問題切り分け用)。
+- デコードルーティング: image → WIC → Susie の順にフォールバック。`folder_tree::is_recognized_image_ext` がネイティブ対応拡張子と Susie 拡張子の両方を認識するように変更。
+- プラグインフォルダ: `<data_dir>/susie_plugins/` (初回起動時に `README.txt` 配置)。
+- 環境設定に「Susie プラグイン」ページ追加: 有効化トグル・並列実行トグル・フォルダを開く・再読み込み・ロード済みプラグイン一覧。
+- Inno Setup スクリプトに `mimageviewer-susie32.exe` の同梱を追加。
 
 ---
 

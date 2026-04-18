@@ -29,6 +29,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - サムネイルワーカー (通常/重 I/O の 2 系統)                 │
 │   - フルスクリーンロードスレッド (1 画像ごとに spawn)          │
 │   - PDF ワーカープロセス (--pdf-worker サブプロセス × 3)       │
+│   - Susie 32bit ワーカープロセス (mimageviewer-susie32.exe × N)│
 │   - AI 推論スレッド (ort + DirectML)                           │
 │   - 動画サムネイルスレッド, フォルダナビゲーション, etc.       │
 └───────────────┬──────────────────────────────────────────────┘
@@ -82,6 +83,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
+| `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング |
 | `fs_animation.rs` | GIF / APNG アニメーションのフレーム展開 |
 | `video_thumb.rs` | 動画サムネイル取得 (Windows Shell API) |
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |

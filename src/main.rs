@@ -41,6 +41,7 @@ pub mod open_with;
 pub mod os_theme;
 pub mod pdf_loader;
 pub mod pdf_passwords;
+pub mod susie_loader;
 pub mod wic_decoder;
 pub mod zip_loader;
 
@@ -57,6 +58,16 @@ fn main() -> eframe::Result {
 
     // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
     ai::model_manager::ensure_models_extracted();
+
+    // Susie プラグインワーカープール: バックグラウンドで初期化する
+    // (プラグインが多いと handshake に数百ms かかる可能性があるため、
+    //  起動 UI をブロックしないようスレッドに逃がす)
+    std::thread::Builder::new()
+        .name("susie-init".to_string())
+        .spawn(|| {
+            let _ = susie_loader::get_pool();
+        })
+        .ok();
 
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
     let log_enabled = cfg!(debug_assertions)

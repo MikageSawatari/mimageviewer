@@ -568,6 +568,17 @@ pub struct Settings {
     /// OFF 時は読み書き両方スキップ (既存の `.dat` は削除しない)。
     #[serde(default = "default_true")]
     pub sidecar_backup_enabled: bool,
+
+    // ── Susie プラグイン (v0.7.0) ──────────────────────────────
+    /// Susie 画像プラグイン機能全体の ON/OFF (デフォルト: true、ワーカー exe が無い環境では自動的に無効化される)。
+    #[serde(default = "default_true")]
+    pub susie_enabled: bool,
+
+    /// Susie プラグインを複数プロセスで並列実行する (デフォルト: true)。
+    /// 古いプラグインで一時ファイル衝突・INI の race 書き込みが疑われる場合は false にして
+    /// プール数を 1 に固定し、問題プラグインの切り分けを可能にする。
+    #[serde(default = "default_true")]
+    pub susie_allow_parallel: bool,
 }
 
 /// グリッド列数の最小値
@@ -722,6 +733,8 @@ impl Default for Settings {
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             sidecar_backup_enabled: true,
+            susie_enabled: true,
+            susie_allow_parallel: true,
         }
     }
 }

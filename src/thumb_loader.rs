@@ -687,8 +687,6 @@ fn resolve_folder_thumb_image(
     sort: crate::settings::SortOrder,
     remaining_depth: u32,
 ) -> Option<std::path::PathBuf> {
-    use crate::folder_tree::SUPPORTED_EXTENSIONS;
-
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
     let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
@@ -699,7 +697,7 @@ fn resolve_folder_thumb_image(
             subdirs.push(p);
         } else if p.is_file() {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+                if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
                     let mtime = entry.metadata().ok()
                         .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
                     images.push((p, mtime));
@@ -826,13 +824,16 @@ pub fn load_one_cached(
                     return Ok(img);
                 }
             }
-            // image クレート → (失敗時) WIC ストリームデコードへフォールバック
+            // image クレート → (失敗時) WIC → (失敗時) Susie プラグインへフォールバック
             // (HEIC / AVIF / JXL / RAW など image クレート非対応形式が ZIP 内にあっても開ける)
             match image::load_from_memory(&bytes) {
                 Ok(img) => Ok(img),
                 Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
                     Some(img) => Ok(img),
-                    None => Err(e),
+                    None => match crate::susie_loader::decode_bytes(entry_name, &bytes, cancel.cloned()) {
+                        Ok(img) => Ok(img),
+                        Err(_) => Err(e),
+                    },
                 },
             }
         })
@@ -854,13 +855,17 @@ pub fn load_one_cached(
                     .map_err(image::ImageError::IoError)?
                     .decode()
             });
-            // image クレートが失敗した場合に WIC を試す
-            // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため)
+            // image クレートが失敗した場合に WIC → Susie プラグインの順にフォールバック
+            // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため WIC、
+            //  PI / MAG / Q0 / PIC / MAKI 等のレトロ形式は Susie プラグインで対応)
             match primary {
                 Ok(img) => Ok(img),
                 Err(e) => match crate::wic_decoder::decode_to_dynamic_image(path) {
                     Some(img) => Ok(img),
-                    None => Err(e),
+                    None => match crate::susie_loader::decode_file(path, cancel.cloned()) {
+                        Ok(img) => Ok(img),
+                        Err(_) => Err(e),
+                    },
                 },
             }
         }

@@ -37,6 +37,18 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] =
     &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 
+/// 拡張子 (小文字、先頭 `.` なし) が画像として扱えるか判定する。
+///
+/// ネイティブ対応の `SUPPORTED_EXTENSIONS` に加え、起動時にロードした Susie プラグイン
+/// が対応する拡張子もここで画像扱いとする。Susie がロード前、または無効の場合は
+/// `SUPPORTED_EXTENSIONS` のみで判定する。
+pub fn is_recognized_image_ext(ext_lower: &str) -> bool {
+    if SUPPORTED_EXTENSIONS.contains(&ext_lower) {
+        return true;
+    }
+    crate::susie_loader::supports_extension(ext_lower)
+}
+
 // -----------------------------------------------------------------------
 // macOS AppleDouble (._) ファイルの除外
 // -----------------------------------------------------------------------
@@ -117,7 +129,7 @@ pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
         }
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
-            if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str())
+            if is_recognized_image_ext(&ext_lower)
                 || SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str())
             {
                 return true;
