@@ -83,7 +83,7 @@ static DLL_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 fn ensure_dll_extracted() -> Result<&'static PathBuf, String> {
     DLL_PATH
         .get_or_init(|| {
-            let dir = crate::data_dir::bootstrap();
+            let dir = crate::data_dir::get();
             std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("data_dir create failed: {e}"))?;
             let dll_path = dir.join("pdfium.dll");

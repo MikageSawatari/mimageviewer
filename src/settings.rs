@@ -568,30 +568,6 @@ pub struct Settings {
     /// OFF 時は読み書き両方スキップ (既存の `.dat` は削除しない)。
     #[serde(default = "default_true")]
     pub sidecar_backup_enabled: bool,
-
-    // ── データ保存場所 (v0.7.0) ─────────────────────────────────
-    /// アプリデータ (DB / サムネイルキャッシュ / アーカイブ変換キャッシュ) の
-    /// 保存場所。`None` で既定 (`%APPDATA%\mimageviewer`)。
-    /// settings.json / logs / AI モデル / pdfium.dll は常に既定場所に残る。
-    #[serde(default)]
-    pub data_root: Option<PathBuf>,
-
-    /// 次回起動時に実行する予約済みデータ移動。ユーザーが環境設定で
-    /// 「データ保存場所を変更」を押した時点で設定される。移動が完了すると
-    /// クリアされ、`data_root` が `to` に更新される。
-    /// 移動前提は「このフィールドが `Some` かつ他の mimageviewer インスタンスが
-    /// 起動していないこと」。
-    #[serde(default)]
-    pub pending_move: Option<PendingMove>,
-}
-
-/// 次回起動時に実行するデータ移動の予約。
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct PendingMove {
-    /// 移動元 (現在の effective data dir)。
-    pub from: PathBuf,
-    /// 移動先 (ユーザーが選んだ新しい data root)。
-    pub to: PathBuf,
 }
 
 /// グリッド列数の最小値
@@ -746,17 +722,13 @@ impl Default for Settings {
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             sidecar_backup_enabled: true,
-            data_root: None,
-            pending_move: None,
         }
     }
 }
 
 impl Settings {
     fn settings_path() -> PathBuf {
-        // settings.json はブートストラップ解決が必要なため常に bootstrap 側。
-        // data_root で切り替わる対象ではない。
-        crate::data_dir::bootstrap().join("settings.json")
+        crate::data_dir::get().join("settings.json")
     }
 
     pub fn load() -> Self {

@@ -795,14 +795,6 @@ pub struct App {
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
     pub(crate) sidecars: std::collections::HashMap<std::path::PathBuf, crate::sidecar::SidecarFile>,
-
-    // ── データ移動モード (v0.7.0) ────────────────────────────────
-    /// 起動時に保留中の移動を実行中の状態。`Some` の間はメイン UI を
-    /// 止め、進捗ダイアログだけを表示する。完了後は App を close して
-    /// 再起動を促す。
-    pub(crate) data_move_state: Option<std::sync::Arc<crate::data_move::MoveRunState>>,
-    /// 移動結果のメッセージ (完了後に進捗ダイアログで表示)。
-    pub(crate) data_move_result_message: Option<String>,
 }
 
 impl Default for App {
@@ -1020,8 +1012,6 @@ impl Default for App {
             perf_last_flush: None,
             fs_painted_last: None,
             sidecars: std::collections::HashMap::new(),
-            data_move_state: None,
-            data_move_result_message: None,
         }
     }
 }
@@ -6066,16 +6056,6 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // データ移動モード: 通常 UI は一切描画せず、進捗ダイアログだけを出す。
-        // ワーカーや DB アクセスもこの間は起こさない (App::default で開いた
-        // DB ハンドルは既に Drop 済み、後述の main.rs 参照)。
-        if self.data_move_state.is_some() {
-            self.update_ime_state(ctx);
-            self.show_data_move_progress_window(ctx);
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            return;
-        }
-
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
         self.flush_idle_sidecars();

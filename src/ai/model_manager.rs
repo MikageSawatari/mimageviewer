@@ -105,7 +105,7 @@ pub fn ensure_models_extracted() {
 /// モデル展開先ディレクトリを返す。
 fn models_dir() -> PathBuf {
     MODELS_DIR
-        .get_or_init(|| crate::data_dir::bootstrap().join("models"))
+        .get_or_init(|| crate::data_dir::get().join("models"))
         .clone()
 }
 

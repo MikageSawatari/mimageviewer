@@ -5,12 +5,10 @@
 
 use eframe::egui;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use crate::app::App;
 use crate::settings::{
-    self, CachePolicy, Parallelism, PendingMove, Settings, SortOrder, SpreadMode, ThumbAspect,
-    UiTheme,
+    self, CachePolicy, Parallelism, Settings, SortOrder, SpreadMode, ThumbAspect, UiTheme,
 };
 
 // ── ページ列挙 ──────────────────────────────────────────────────
@@ -29,7 +27,6 @@ pub(crate) enum PreferencesPage {
     DuplicateFiles,
     ExifDisplay,
     SpreadMode,
-    DataRoot,
 }
 
 impl PreferencesPage {
@@ -47,7 +44,6 @@ impl PreferencesPage {
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "見開き表示",
-            Self::DataRoot => "データ保存場所",
         }
     }
 }
@@ -98,11 +94,6 @@ const TREE: &[TreeCategory] = &[
         page: Some(PreferencesPage::SpreadMode),
         children: &[],
     },
-    TreeCategory {
-        label: "データ保存場所",
-        page: Some(PreferencesPage::DataRoot),
-        children: &[],
-    },
 ];
 
 // ── 一時編集状態 ────────────────────────────────────────────────
@@ -122,18 +113,6 @@ pub(crate) struct PreferencesState {
     // 初回に1度だけ取得するキャッシュ値
     pub auto_thread_count: usize,
     pub vram_mib: Option<u64>,
-
-    // ── データ保存場所ページ ────────────────────────────────
-    /// 新しいデータ保存場所の入力文字列
-    pub data_root_input: String,
-    /// ページ内に表示する直近のメッセージ (成功/失敗)
-    pub data_root_message: Option<(DataRootMsgKind, String)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum DataRootMsgKind {
-    Info,
-    Error,
 }
 
 impl PreferencesState {
@@ -154,11 +133,6 @@ impl PreferencesState {
                 expanded.insert(cat.label);
             }
         }
-        let data_root_input = s
-            .data_root
-            .clone()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
         Self {
             settings: s.clone(),
             selected: PreferencesPage::Thumbnail,
@@ -167,8 +141,6 @@ impl PreferencesState {
             exif_add_tag_input: String::new(),
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
-            data_root_input,
-            data_root_message: None,
         }
     }
 }
@@ -381,7 +353,6 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
-        PreferencesPage::DataRoot => page_data_root(ui, state),
     }
 }
 
@@ -963,188 +934,4 @@ fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
             }
         });
-}
-
-// ── データ保存場所ページ ─────────────────────────────────────────
-//
-// DB / サムネイルキャッシュ / アーカイブ変換キャッシュなど可動データの保存先を
-// システムドライブ以外 (D: などの大容量ドライブ) に移す機能。
-//
-// 移動はこのダイアログでは実行されず、「次回起動時に移動する」予約を作る。
-// 実際の移動は次回起動時に main.rs 側で実行される (他インスタンスなし & Named Mutex
-// 取得成功が条件)。詳細は docs/plan-v0.7.0.md 参照。
-fn page_data_root(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    let bootstrap = crate::data_dir::bootstrap();
-    let current = crate::data_dir::get();
-
-    ui.label(egui::RichText::new("現在のデータ保存場所").strong());
-    ui.label(format!("  {}", current.display()));
-    ui.add_space(6.0);
-
-    ui.label(
-        egui::RichText::new(
-            "DB・サムネイルキャッシュ・アーカイブ変換キャッシュを、別ドライブに置く\n\
-             ことができます。設定ファイル・ログ・AI モデル・PDFium DLL は常に既定の\n\
-             場所に残ります (ブートストラップに必要なため)。",
-        )
-        .weak(),
-    );
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(format!("  既定の場所: {}", bootstrap.display()))
-            .weak()
-            .size(11.0),
-    );
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-
-    ui.label(egui::RichText::new("新しい保存場所").strong());
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut state.data_root_input)
-                .desired_width(f32::INFINITY)
-                .hint_text(r"例: D:\mimageviewer-data"),
-        );
-    });
-    ui.add_space(6.0);
-
-    // 既に移動予約がある場合は強調表示
-    if let Some(pending) = &state.settings.pending_move {
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "⚠ 移動予約あり: {} → {}\n  次回起動時に実行されます。",
-                pending.from.display(),
-                pending.to.display(),
-            ))
-            .color(egui::Color32::from_rgb(200, 150, 40)),
-        );
-        if ui.button("予約をキャンセル").clicked() {
-            state.settings.pending_move = None;
-            state.data_root_message = Some((
-                DataRootMsgKind::Info,
-                "予約をキャンセルしました。".to_string(),
-            ));
-        }
-        ui.add_space(8.0);
-    }
-
-    ui.horizontal(|ui| {
-        let can_move = !state.data_root_input.trim().is_empty()
-            && state.settings.pending_move.is_none();
-        if ui
-            .add_enabled(can_move, egui::Button::new("次回起動時に移動"))
-            .on_hover_text(
-                "全ての mimageviewer インスタンスを終了した状態で再起動すると、\n\
-                 起動直後にデータ移動が実行されます。",
-            )
-            .clicked()
-        {
-            try_schedule_move(state, current.clone());
-        }
-
-        if state.settings.data_root.is_some() {
-            if ui
-                .button("既定の場所に戻す")
-                .on_hover_text("既定の場所 (%APPDATA%\\mimageviewer) へ移動予約します。")
-                .clicked()
-            {
-                state.data_root_input = bootstrap.display().to_string();
-                try_schedule_move(state, current.clone());
-            }
-        }
-    });
-
-    // メッセージ表示
-    if let Some((kind, msg)) = &state.data_root_message {
-        ui.add_space(8.0);
-        let color = match kind {
-            DataRootMsgKind::Info => egui::Color32::from_rgb(60, 170, 60),
-            DataRootMsgKind::Error => crate::ui_helpers::ERROR_TEXT_COLOR,
-        };
-        ui.label(egui::RichText::new(msg).color(color));
-    }
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(
-            "移動中は他のインスタンスの起動がブロックされます。\n\
-             複数の mimageviewer を起動している場合は、先に全て閉じてから再起動して\n\
-             ください。",
-        )
-        .weak()
-        .size(11.0),
-    );
-}
-
-fn try_schedule_move(state: &mut PreferencesState, current: PathBuf) {
-    let input = state.data_root_input.trim().to_string();
-    if input.is_empty() {
-        state.data_root_message =
-            Some((DataRootMsgKind::Error, "パスを入力してください。".to_string()));
-        return;
-    }
-    let new_path = PathBuf::from(&input);
-    let canonical_new = new_path.canonicalize().unwrap_or_else(|_| new_path.clone());
-    let canonical_cur = current.canonicalize().unwrap_or_else(|_| current.clone());
-    if canonical_new == canonical_cur {
-        state.data_root_message = Some((
-            DataRootMsgKind::Error,
-            "移動先が現在地と同じです。".to_string(),
-        ));
-        return;
-    }
-
-    // 他インスタンスチェック (Windows のみ)
-    #[cfg(windows)]
-    {
-        let other = crate::instance_lock::count_other_mimageviewer_processes();
-        if other > 0 {
-            state.data_root_message = Some((
-                DataRootMsgKind::Error,
-                format!(
-                    "他の mimageviewer インスタンスが {other} 個起動中です。\n\
-                     全て閉じてから再試行してください。"
-                ),
-            ));
-            return;
-        }
-    }
-
-    // 書き込みテスト
-    let parent_dir = if new_path.exists() {
-        new_path.clone()
-    } else {
-        // 親ディレクトリまで作成を試みる
-        if let Err(e) = std::fs::create_dir_all(&new_path) {
-            state.data_root_message = Some((
-                DataRootMsgKind::Error,
-                format!("フォルダを作成できません: {e}"),
-            ));
-            return;
-        }
-        new_path.clone()
-    };
-    if let Err(e) = crate::data_move::probe_writable(&parent_dir) {
-        state.data_root_message = Some((DataRootMsgKind::Error, e));
-        return;
-    }
-
-    // 予約をセット
-    state.settings.pending_move = Some(PendingMove {
-        from: current,
-        to: new_path.clone(),
-    });
-    state.data_root_message = Some((
-        DataRootMsgKind::Info,
-        format!(
-            "移動を予約しました: {}\n環境設定を OK で閉じた後、mimageviewer を再起動してください。",
-            new_path.display()
-        ),
-    ));
 }
