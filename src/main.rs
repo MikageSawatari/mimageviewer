@@ -133,9 +133,10 @@ fn main() -> eframe::Result {
             // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから
             // 効くため、App::update 内で適用すると 1 フレームだけデフォルト
             // ダーク表示になる)。
-            os_theme::apply(&cc.egui_ctx, saved.ui_theme);
+            let resolved = os_theme::resolve(saved.ui_theme);
+            os_theme::apply_resolved(&cc.egui_ctx, resolved);
             let mut app = app::App::default();
-            app.applied_ui_theme = Some(app.settings.ui_theme);
+            app.applied_ui_theme = Some(resolved);
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。

@@ -11,15 +11,19 @@
 use crate::settings::UiTheme;
 
 /// 実際に egui に適用する解決後のテーマ (Light / Dark のみ)。
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ResolvedTheme {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedTheme {
     Light,
     Dark,
 }
 
 /// `UiTheme` から実際に描画に使う Light / Dark を解決する。
 /// `System` はレジストリから取得、失敗時は Light。
-fn resolve(theme: UiTheme) -> ResolvedTheme {
+///
+/// 呼び出し側は毎フレーム呼んで前回値と比較することで、`System` 選択中に
+/// Windows 側の Light/Dark トグルにも追従できる。レジストリ参照は
+/// `RegGetValueW` 一発なのでホットパスで呼んでも十分軽い。
+pub fn resolve(theme: UiTheme) -> ResolvedTheme {
     match theme {
         UiTheme::Dark => ResolvedTheme::Dark,
         UiTheme::Light | UiTheme::Standard => ResolvedTheme::Light,
@@ -27,13 +31,17 @@ fn resolve(theme: UiTheme) -> ResolvedTheme {
     }
 }
 
-/// 選択されたテーマを `ctx` に適用する。
-/// 毎フレーム呼んでよいが、`Settings::ui_theme` が変わったときだけ呼ぶ前提。
-pub fn apply(ctx: &egui::Context, theme: UiTheme) {
-    match resolve(theme) {
+/// 解決済みの Light / Dark を `ctx` に適用する。
+pub fn apply_resolved(ctx: &egui::Context, resolved: ResolvedTheme) {
+    match resolved {
         ResolvedTheme::Light => ctx.set_visuals(egui::Visuals::light()),
         ResolvedTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
     }
+}
+
+/// 選択されたテーマを `ctx` に適用する (`resolve` + `apply_resolved`)。
+pub fn apply(ctx: &egui::Context, theme: UiTheme) {
+    apply_resolved(ctx, resolve(theme));
 }
 
 /// `UiTheme` を解決した結果が Dark かを返す (System の場合は OS 設定に追従)。

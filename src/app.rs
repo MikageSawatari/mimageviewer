@@ -631,8 +631,11 @@ pub struct App {
     pub(crate) initialized: bool,
 
     // ── UI テーマ (v0.7.0) ──────────────────────────────────────
-    /// 直近に ctx に適用したテーマ。`settings.ui_theme` と乖離すると再適用される。
-    pub(crate) applied_ui_theme: Option<crate::settings::UiTheme>,
+    /// 直近に ctx に適用した「解決後」のテーマ (Light / Dark)。
+    /// `settings.ui_theme` が `System` のとき、設定値は変わらなくても
+    /// Windows 側の Light/Dark 切替で解決後の値が変わるため、毎フレーム
+    /// `os_theme::resolve` の結果と比較して再適用する。
+    pub(crate) applied_ui_theme: Option<crate::os_theme::ResolvedTheme>,
 
     // ── PDF パスワード管理 ───────────────────────────────────────
     pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
@@ -6086,10 +6089,13 @@ impl eframe::App for App {
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
 
-        // UI テーマを適用 (設定変更やテーマ初期化で変化したときだけ set_visuals を呼ぶ)
-        if self.applied_ui_theme != Some(self.settings.ui_theme) {
-            crate::os_theme::apply(ctx, self.settings.ui_theme);
-            self.applied_ui_theme = Some(self.settings.ui_theme);
+        // UI テーマを適用 (変化したときだけ set_visuals を呼ぶ)。
+        // `UiTheme::System` 選択時は設定値が変わらなくても Windows の Light/Dark
+        // 切替に追従する必要があるので、毎フレーム resolve して解決後の値で比較する。
+        let resolved_theme = crate::os_theme::resolve(self.settings.ui_theme);
+        if self.applied_ui_theme != Some(resolved_theme) {
+            crate::os_theme::apply_resolved(ctx, resolved_theme);
+            self.applied_ui_theme = Some(resolved_theme);
         }
 
         // 初回フレームで前回フォルダを復元
