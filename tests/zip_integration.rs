@@ -78,3 +78,117 @@ fn entry_name_helpers() {
     assert_eq!(zip_loader::entry_dir("work1/ch01/page01.jpg"), "work1/ch01");
     assert_eq!(zip_loader::entry_dir("root_image.png"), "");
 }
+
+/// 内側に ZIP を含む外側 ZIP を作る。
+fn write_inner_zip() -> Vec<u8> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("inner_img1.jpg", options).unwrap();
+        w.write_all(b"inner jpg 1").unwrap();
+        w.start_file("sub/inner_img2.png", options).unwrap();
+        w.write_all(b"inner png 2").unwrap();
+        w.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[test]
+fn enumerate_includes_nested_zip_entries() {
+    let tmp = TempDir::new().unwrap();
+    let zip_path = tmp.path().join("outer.zip");
+    let inner_bytes = write_inner_zip();
+
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("cover.jpg", options).unwrap();
+        w.write_all(b"cover jpg").unwrap();
+        w.start_file("chapters/ch01.zip", options).unwrap();
+        w.write_all(&inner_bytes).unwrap();
+        w.finish().unwrap();
+    }
+
+    let entries = zip_loader::enumerate_image_entries(&zip_path).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.entry_name.as_str()).collect();
+    assert!(names.contains(&"cover.jpg"));
+    assert!(names.contains(&"chapters/ch01.zip/inner_img1.jpg"));
+    assert!(names.contains(&"chapters/ch01.zip/sub/inner_img2.png"));
+    assert_eq!(entries.len(), 3);
+}
+
+#[test]
+fn read_entry_bytes_from_nested_zip() {
+    let tmp = TempDir::new().unwrap();
+    let zip_path = tmp.path().join("outer.zip");
+    let inner_bytes = write_inner_zip();
+
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("chapters/ch01.zip", options).unwrap();
+        w.write_all(&inner_bytes).unwrap();
+        w.finish().unwrap();
+    }
+
+    let data =
+        zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/inner_img1.jpg").unwrap();
+    assert_eq!(data, b"inner jpg 1");
+    let data =
+        zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/sub/inner_img2.png").unwrap();
+    assert_eq!(data, b"inner png 2");
+}
+
+#[test]
+fn enumerate_two_level_nested_zip() {
+    let tmp = TempDir::new().unwrap();
+    let zip_path = tmp.path().join("outer.zip");
+
+    // Level 2 inner: contains just img.png
+    let mut l2 = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut l2);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("img.png", options).unwrap();
+        w.write_all(b"deepest").unwrap();
+        w.finish().unwrap();
+    }
+    let l2_bytes = l2.into_inner();
+
+    // Level 1: contains l2.zip
+    let mut l1 = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut l1);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("l2.zip", options).unwrap();
+        w.write_all(&l2_bytes).unwrap();
+        w.finish().unwrap();
+    }
+    let l1_bytes = l1.into_inner();
+
+    // Outer: contains l1.zip
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("l1.zip", options).unwrap();
+        w.write_all(&l1_bytes).unwrap();
+        w.finish().unwrap();
+    }
+
+    let entries = zip_loader::enumerate_image_entries(&zip_path).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].entry_name, "l1.zip/l2.zip/img.png");
+
+    let data = zip_loader::read_entry_bytes(&zip_path, "l1.zip/l2.zip/img.png").unwrap();
+    assert_eq!(data, b"deepest");
+}

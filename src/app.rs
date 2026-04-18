@@ -585,6 +585,19 @@ pub struct App {
     pub(crate) fs_free_rotation: f32,
     /// 回転ドラッグ開始状態（開始位置, 開始時の回転角）
     pub(crate) fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
+    /// ルーペ常時表示トグル (M キー)。Shift ホールドは独立に追加表示される。
+    /// フルスクリーンを閉じても保持されるが、フォーカス喪失中はレンダリングしない。
+    pub(crate) fs_loupe_locked: bool,
+    /// 見開きモード描画後のページ矩形。ルーペ描画がカーソル位置から該当ページを
+    /// 特定するのに使う。毎フレーム描画後に更新、非見開き時は None。
+    pub(crate) fs_spread_layout: Option<crate::ui_fullscreen::FsSpreadLayout>,
+    /// 透過画像の背景サイクル (B キー): 0=テーマ既定 / 1=白 / 2=黒 / 3=市松
+    /// 画像切替時にリセット。永続化しない。
+    pub(crate) fs_transparent_bg_mode: u8,
+    /// 16×16 の市松テクスチャ (Wrap=Repeat)。最初に B キーで市松にしたとき lazy init。
+    pub(crate) fs_checker_texture: Option<egui::TextureHandle>,
+    /// 背景モード変更直後に表示するインジケータの消去期限。
+    pub(crate) fs_transparent_bg_indicator_until: Option<std::time::Instant>,
 
     // ── 画像分析パネル ────────────────────────────────────────
     /// フルスクリーンで分析パネルを表示するか
@@ -616,6 +629,10 @@ pub struct App {
 
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
+
+    // ── UI テーマ (v0.7.0) ──────────────────────────────────────
+    /// 直近に ctx に適用したテーマ。`settings.ui_theme` と乖離すると再適用される。
+    pub(crate) applied_ui_theme: Option<crate::settings::UiTheme>,
 
     // ── PDF パスワード管理 ───────────────────────────────────────
     pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
@@ -663,16 +680,18 @@ pub struct App {
     pub(crate) ai_upscale_model_override: Option<crate::ai::ModelKind>,
     /// AI デノイズモデル (Some = 有効)
     pub(crate) ai_denoise_model: Option<crate::ai::ModelKind>,
-    /// アップスケール済みキャッシュ: item_idx → テクスチャ + ピクセルデータ
-    pub(crate) ai_upscale_cache: std::collections::HashMap<usize, FsCacheEntry>,
-    /// アップスケール処理中: item_idx → (キャンセルトークン, 受信チャネル)
-    pub(crate) ai_upscale_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<crate::ai::upscale::UpscaleResult>)>,
+    /// アップスケール済みキャッシュ: (item_idx, bg_mode) → テクスチャ + ピクセルデータ。
+    /// bg_mode は 0 (黒) / 1 (白) のみ (composite-first 方式で背景色が出力に焼き付くため、
+    /// 高速切替のために 2 バリアントを保持する)。
+    pub(crate) ai_upscale_cache: std::collections::HashMap<(usize, u8), FsCacheEntry>,
+    /// アップスケール処理中: (item_idx, bg_mode) → (キャンセルトークン, 受信チャネル)
+    pub(crate) ai_upscale_pending: std::collections::HashMap<(usize, u8), (Arc<AtomicBool>, mpsc::Receiver<crate::ai::upscale::UpscaleResult>)>,
     /// 画像タイプ分類キャッシュ: item_idx → カテゴリ
     pub(crate) ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
     /// バージョン情報ダイアログ
     pub(crate) show_about_dialog: bool,
-    /// AI アップスケールが失敗した idx の集合（リトライ防止）
-    pub(crate) ai_upscale_failed: std::collections::HashSet<usize>,
+    /// AI アップスケールが失敗した (item_idx, bg_mode) の集合（リトライ防止）
+    pub(crate) ai_upscale_failed: std::collections::HashSet<(usize, u8)>,
     /// AI ステータス表示の完了時刻（全処理完了後に記録、一定時間後に非表示）
     pub(crate) ai_status_done_at: Option<std::time::Instant>,
 
@@ -904,6 +923,11 @@ impl Default for App {
             fs_pan_drag_start: None,
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
+            fs_loupe_locked: false,
+            fs_spread_layout: None,
+            fs_transparent_bg_mode: 0,
+            fs_checker_texture: None,
+            fs_transparent_bg_indicator_until: None,
             analysis_mode: false,
             analysis_hover_color: None,
             analysis_pinned_color: None,
@@ -918,6 +942,7 @@ impl Default for App {
             analysis_hist_cache: None,
             analysis_sv_cache: None,
             initialized: false,
+            applied_ui_theme: None,
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             show_pdf_password_dialog: false,
             pdf_password_input: String::new(),
@@ -1114,6 +1139,10 @@ impl App {
         }
 
         crate::logger::log(format!("=== load_folder: {} ===", path.display()));
+
+        // 外側の ZIP/PDF/フォルダを切り替えたので、ネスト ZIP バイト列キャッシュを破棄する。
+        // これで古い外側アーカイブのバイト列が RAM に居残るのを防ぐ。
+        crate::zip_loader::clear_nested_cache();
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
         let mut folders: Vec<GridItem> = Vec::new();
@@ -1467,6 +1496,10 @@ impl App {
     pub fn load_zip_as_folder(&mut self, zip_path: PathBuf) {
         crate::logger::log(format!("=== load_zip_as_folder: {} ===", zip_path.display()));
 
+        // 別の外側 ZIP に切り替える場合、古いネスト ZIP バイト列キャッシュを破棄する。
+        // 同じ ZIP を開き直す場合も一度クリアして、壊れたエントリが居残らないようにする。
+        crate::zip_loader::clear_nested_cache();
+
         // ── ZIP エントリ列挙 ──
         let entries = match crate::zip_loader::enumerate_image_entries(&zip_path) {
             Ok(e) => e,
@@ -1544,6 +1577,9 @@ impl App {
     /// パスワード付き PDF の場合はダイアログで入力を求める。
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
         crate::logger::log(format!("=== load_pdf_as_folder: {} ===", pdf_path.display()));
+
+        // PDF を開く際、直前に ZIP を見ていた可能性があるためネスト ZIP キャッシュを破棄する。
+        crate::zip_loader::clear_nested_cache();
 
         // 旧サムネイルワーカーを即座にキャンセルして PDF ワーカーキューの渋滞を防ぐ。
         // start_loading_items は enumerate 完了後に呼ばれるため、ここで先行キャンセルする。
@@ -3475,6 +3511,9 @@ impl App {
         self.fs_pan_drag_start = None;
         self.fs_free_rotation = 0.0;
         self.fs_rotation_drag_start = None;
+        // 透過背景は「一時的な好み」なので画像切替時にリセット (plan-v0.7.0.md の方針)
+        self.fs_transparent_bg_mode = 0;
+        self.fs_transparent_bg_indicator_until = None;
 
         match self.items.get(idx) {
             Some(GridItem::Image(_))
@@ -3784,10 +3823,21 @@ impl App {
             }
         }
 
+        // 外側 ZIP は open_archive で 1 回開いて再利用するが、ネスト ZIP 内の
+        // エントリは `entry_name` に ".zip/" 境界を含むため read_entry_bytes 経由で
+        // ネストキャッシュを使って取り出す。
         for (zip_path, entries) in zip_png_groups {
-            let Ok(mut archive) = crate::zip_loader::open_archive(&zip_path) else { continue };
+            let mut direct_archive = crate::zip_loader::open_archive(&zip_path).ok();
             for (idx, entry_name) in entries {
-                let meta_text = crate::zip_loader::read_entry_from_archive(&mut archive, &entry_name)
+                let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
+                let bytes_result = if is_nested {
+                    crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+                } else if let Some(archive) = direct_archive.as_mut() {
+                    crate::zip_loader::read_entry_from_archive(archive, &entry_name)
+                } else {
+                    crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+                };
+                let meta_text = bytes_result
                     .map(|bytes| crate::png_metadata::build_searchable_from_bytes(&bytes))
                     .unwrap_or_default();
                 let name = crate::zip_loader::entry_basename(&entry_name);
@@ -4481,6 +4531,32 @@ impl App {
     // AI アップスケール
     // -------------------------------------------------------------------
 
+    /// AI アップスケール時の有効な背景モード (0=黒 / 1=白)。
+    /// composite-first 方式では市松 (mode 2) は使えないので 0 に丸める。
+    /// アップスケール無効時 (デノイズのみ or 完全 OFF) は出力が背景非依存になるので、
+    /// キャッシュキーを単一 (0) に固定する。
+    pub(crate) fn effective_upscale_bg_mode(&self) -> u8 {
+        if !self.ai_upscale_enabled {
+            0
+        } else if self.fs_transparent_bg_mode == 1 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 指定 idx の AI アップスケールキャッシュ・pending・failed を全 bg バリアント分まとめて削除する。
+    /// pending はキャンセルトークンも立てる。
+    pub(crate) fn purge_upscale_for_idx(&mut self, idx: usize) {
+        for bg in [0u8, 1u8] {
+            self.ai_upscale_cache.remove(&(idx, bg));
+            self.ai_upscale_failed.remove(&(idx, bg));
+            if let Some((cancel, _)) = self.ai_upscale_pending.remove(&(idx, bg)) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// AI ランタイムとモデルマネージャを遅延初期化する。
     pub(crate) fn ensure_ai_runtime(&mut self) {
         if self.ai_runtime.is_none() {
@@ -4502,8 +4578,8 @@ impl App {
             return;
         }
 
-        let mut completed: Vec<(usize, crate::ai::upscale::UpscaleResult)> = Vec::new();
-        let mut disconnected: Vec<usize> = Vec::new();
+        let mut completed: Vec<((usize, u8), crate::ai::upscale::UpscaleResult)> = Vec::new();
+        let mut disconnected: Vec<(usize, u8)> = Vec::new();
 
         for (&key, (_, rx)) in &self.ai_upscale_pending {
             match rx.try_recv() {
@@ -4521,29 +4597,31 @@ impl App {
 
         let repaint = !completed.is_empty();
         for (key, result) in completed {
+            let (idx, bg) = key;
             self.ai_upscale_pending.remove(&key);
             let pixels = std::sync::Arc::new(result.image);
             let upload = clamp_for_gpu(&pixels);
             let [w, h] = pixels.size;
             let upload_t0 = std::time::Instant::now();
             let handle = ctx.load_texture(
-                format!("ai_fs_{key}"),
+                format!("ai_fs_{idx}_{bg}"),
                 upload.into_owned(),
                 egui::TextureOptions::LINEAR,
             );
             let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
-                let perf_key = self.perf_item_key(key);
+                let perf_key = self.perf_item_key(idx);
                 crate::perf::event("ai", "job_ready", perf_key.as_deref(), self.input_seq, &[
-                    ("idx", serde_json::Value::from(key)),
+                    ("idx", serde_json::Value::from(idx)),
+                    ("bg", serde_json::Value::from(bg)),
                     ("w", serde_json::Value::from(w)),
                     ("h", serde_json::Value::from(h)),
                     ("upload_ms", serde_json::Value::from(upload_ms)),
                 ]);
             }
-            // 表示中の画像のみ色調補正を即座に適用（チラつき防止）
-            if self.fullscreen_idx == Some(key) {
-                self.apply_sync_adjustment(ctx, key, &pixels);
+            // 表示中かつ現在の bg と一致するもののみ色調補正を即座に適用（チラつき防止）
+            if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
+                self.apply_sync_adjustment(ctx, idx, &pixels);
             }
             // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
             self.ai_upscale_cache.insert(key, FsCacheEntry::Static {
@@ -4551,7 +4629,7 @@ impl App {
                 pixels,
                 load_seq: 0,
             });
-            crate::logger::log(format!("[AI] Upscale complete for idx={key}"));
+            crate::logger::log(format!("[AI] Upscale complete for idx={idx} bg={bg}"));
         }
 
         if repaint {
@@ -4571,28 +4649,34 @@ impl App {
             return;
         }
 
+        // composite-first 方式: 現在の bg と一致するエントリのみが対象。
+        // 他 bg バリアントは別キャッシュに残るので独立にスケジュールする。
+        let bg = self.effective_upscale_bg_mode();
+        let cur_key = (current_idx, bg);
+
         // すでに処理済み、処理中、または失敗済み
-        if self.ai_upscale_cache.contains_key(&current_idx)
-            || self.ai_upscale_pending.contains_key(&current_idx)
-            || self.ai_upscale_failed.contains(&current_idx)
+        if self.ai_upscale_cache.contains_key(&cur_key)
+            || self.ai_upscale_pending.contains_key(&cur_key)
+            || self.ai_upscale_failed.contains(&cur_key)
         {
             return;
         }
 
         // 同時実行は 1 枚まで（GPU メモリと帯域の制約）。ただし現在表示中の
         // 画像を処理するケースでは、ユーザーが既に先に進んでいるので古い
-        // 先読み（別 idx）を優先キャンセルして枠を空ける。
+        // 先読み（別 idx or 別 bg）を優先キャンセルして枠を空ける。
         if !self.ai_upscale_pending.is_empty() {
             if self.fullscreen_idx == Some(current_idx) {
-                let to_cancel: Vec<usize> = self.ai_upscale_pending.keys()
-                    .filter(|&&k| k != current_idx)
+                let to_cancel: Vec<(usize, u8)> = self.ai_upscale_pending.keys()
+                    .filter(|&&k| k != cur_key)
                     .copied()
                     .collect();
                 for k in to_cancel {
                     if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
                         cancel.store(true, Ordering::Relaxed);
                         crate::logger::log(format!(
-                            "[AI] Cancelled prefetch idx={k} to prioritize current idx={current_idx}"
+                            "[AI] Cancelled prefetch {:?} to prioritize current {:?}",
+                            k, cur_key
                         ));
                     }
                 }
@@ -4696,9 +4780,23 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let cancel_clone = cancel.clone();
         let idx = current_idx;
+        // composite-first 用の背景色 (bg=1 のみ白、それ以外は黒)
+        let bg_rgb: [u8; 3] = if bg == 1 { [255, 255, 255] } else { [0, 0, 0] };
+        // composite-first はアップスケールパスのみ必要 (1x のデノイズは Lanczos 拡大の
+        // ズレが生じないため、アルファ保持パスでそのまま処理できる)。
+        let composite_first = upscale_model.is_some();
 
         std::thread::spawn(move || {
-            let mut dynimg = color_image_to_dynamic(&source_image);
+            // composite-first: アップスケールあり時のみ bg 単色に合成してから AI に渡す。
+            // これにより AI モデルがアルファ境界の RGB ガベージに引きずられず、
+            // 輪郭がきれいにアップスケールされる。背景色は出力に焼き付くため、
+            // bg 切替時は別キャッシュエントリとして再生成する。
+            // デノイズのみの場合はアルファ保持パスを通って透明度がそのまま残る。
+            let mut dynimg = if composite_first {
+                color_image_to_dynamic_composited(&source_image, bg_rgb)
+            } else {
+                color_image_to_dynamic(&source_image)
+            };
 
             // Step 1: デノイズ (1x)
             if let Some(denoise_kind) = denoise_model {
@@ -4706,6 +4804,7 @@ impl App {
                     Ok(denoised) => {
                         if upscale_model.is_some() {
                             // アップスケールが後続する場合のみ DynamicImage に変換
+                            // (denoised は補正済み RGB なのでアルファ合成は不要)
                             dynimg = color_image_to_dynamic(&denoised);
                         } else {
                             // デノイズのみ: 結果をそのまま送信（変換を省略）
@@ -4739,15 +4838,16 @@ impl App {
             }
         });
 
-        self.ai_upscale_pending.insert(current_idx, (cancel, rx));
+        self.ai_upscale_pending.insert(cur_key, (cancel, rx));
         crate::logger::log(format!(
-            "[AI] AI processing started for idx={current_idx} denoise={:?} upscale={:?}",
+            "[AI] AI processing started for idx={current_idx} bg={bg} denoise={:?} upscale={:?}",
             denoise_model, upscale_model
         ));
         if crate::perf::is_enabled() {
             let perf_key = self.perf_item_key(current_idx);
             crate::perf::event("ai", "job_start", perf_key.as_deref(), self.input_seq, &[
                 ("idx", serde_json::Value::from(current_idx)),
+                ("bg", serde_json::Value::from(bg)),
                 ("denoise", serde_json::Value::from(format!("{:?}", denoise_model))),
                 ("upscale", serde_json::Value::from(format!("{:?}", upscale_model))),
             ]);
@@ -4771,11 +4871,12 @@ impl App {
     /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
     fn evict_ai_upscale_cache(&mut self, current_idx: usize) {
         let keep_set = self.compute_keep_set(current_idx);
-        self.ai_upscale_cache.retain(|k, _| keep_set.contains(k));
+        // 全 bg バリアントとも、idx が範囲外なら破棄
+        self.ai_upscale_cache.retain(|k, _| keep_set.contains(&k.0));
 
         // 範囲外の pending をキャンセル
-        let to_cancel: Vec<usize> = self.ai_upscale_pending.keys()
-            .filter(|k| !keep_set.contains(k))
+        let to_cancel: Vec<(usize, u8)> = self.ai_upscale_pending.keys()
+            .filter(|k| !keep_set.contains(&k.0))
             .cloned()
             .collect();
         for k in to_cancel {
@@ -5030,6 +5131,11 @@ impl App {
             }
         }
         self.ai_denoise_model = denoise_kind;
+        // composite-first: アップスケール有効時は市松 bg を使えないので黒に丸める。
+        // (デノイズのみの場合はアルファ保持パスを通るので市松 OK)
+        if self.ai_upscale_enabled && self.fs_transparent_bg_mode == 2 {
+            self.fs_transparent_bg_mode = 0;
+        }
     }
 
     /// 右上フィードバック表示を設定する。
@@ -5091,11 +5197,7 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         self.adjustment_cache.remove(&idx);
         if !old_params.ai_settings_eq(&new_params) {
-            self.ai_upscale_cache.remove(&idx);
-            self.ai_upscale_failed.remove(&idx);
-            if let Some((cancel, _)) = self.ai_upscale_pending.remove(&idx) {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.purge_upscale_for_idx(idx);
         }
     }
 
@@ -5323,8 +5425,9 @@ impl App {
         if self.adjustment_cache.contains_key(&idx) {
             return;
         }
+        let bg = self.effective_upscale_bg_mode();
         // AI 処理中は補正をスキップ（AI完了後に apply_sync_adjustment が呼ばれる）
-        if self.ai_upscale_pending.contains_key(&idx) {
+        if self.ai_upscale_pending.contains_key(&(idx, bg)) {
             return;
         }
         // 短絡: 個別設定なし かつ グローバルが identity なら何もしない
@@ -5336,7 +5439,7 @@ impl App {
         }
         // ソース画像を取得 (AI アップスケール済み or 元画像)
         let source = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-            self.ai_upscale_cache.get(&idx).or_else(|| self.fs_cache.get(&idx))
+            self.ai_upscale_cache.get(&(idx, bg)).or_else(|| self.fs_cache.get(&idx))
         } else {
             self.fs_cache.get(&idx)
         };
@@ -5367,11 +5470,7 @@ impl App {
     /// AI 出力を再実行させたい」ときに使う。
     pub(crate) fn clear_ai_caches_for_indices(&mut self, indices: &[usize]) {
         for idx in indices {
-            self.ai_upscale_cache.remove(idx);
-            self.ai_upscale_failed.remove(idx);
-            if let Some((cancel, _)) = self.ai_upscale_pending.remove(idx) {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.purge_upscale_for_idx(*idx);
         }
     }
 
@@ -5987,11 +6086,22 @@ impl eframe::App for App {
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
 
+        // UI テーマを適用 (設定変更やテーマ初期化で変化したときだけ set_visuals を呼ぶ)
+        if self.applied_ui_theme != Some(self.settings.ui_theme) {
+            crate::os_theme::apply(ctx, self.settings.ui_theme);
+            self.applied_ui_theme = Some(self.settings.ui_theme);
+        }
+
         // 初回フレームで前回フォルダを復元
         // ZIP ファイルや、削除済み・取り外し済みのパスでもクラッシュしないよう
         // resolve_openable_path で最も近い既存ディレクトリに解決する。
         if !self.initialized {
             self.initialized = true;
+
+            // テーマは Settings::ui_theme が `System` であれば OS 設定に追従し、
+            // 明示的な Light / Dark 選択はそのまま使う。起動ダイアログは出さない
+            // (v0.7.0 フィードバック反映で撤去)。
+
             if let Some(folder) = self.settings.last_folder.clone() {
                 if let Some(resolved) = crate::folder_tree::resolve_openable_path(&folder) {
                     self.load_folder(resolved);
@@ -6038,8 +6148,9 @@ impl eframe::App for App {
             // 表示中画像を最優先でアップスケール
             self.maybe_start_ai_upscale(fs_idx);
             // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール
-            let current_done = self.ai_upscale_cache.contains_key(&fs_idx)
-                || self.ai_upscale_failed.contains(&fs_idx)
+            let cur_bg = self.effective_upscale_bg_mode();
+            let current_done = self.ai_upscale_cache.contains_key(&(fs_idx, cur_bg))
+                || self.ai_upscale_failed.contains(&(fs_idx, cur_bg))
                 || (!self.ai_upscale_enabled && self.ai_denoise_model.is_none())
                 || (self.ai_upscale_enabled && self.ai_denoise_model.is_none() && self.fs_cache.get(&fs_idx).map(|e| {
                     if let FsCacheEntry::Static { pixels, .. } = e {
@@ -6106,6 +6217,7 @@ impl eframe::App for App {
 
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
+
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
@@ -6450,6 +6562,11 @@ fn draw_thumb_texture(
     };
     let scale = (inner.width() / display_size.x).min(inner.height() / display_size.y);
     let img_rect = egui::Rect::from_center_size(inner.center(), display_size * scale);
+
+    // 透過画像の背景はフルスクリーンと同じ黒に揃える (v0.7.0 フィードバック反映)。
+    // セル全体ではなく img_rect (実際に画像が描かれる領域) だけを塗るので、
+    // フォルダラベルや letterbox の白背景は維持される。
+    painter.rect_filled(img_rect, 0.0, egui::Color32::BLACK);
 
     if rotation.is_none() {
         painter.image(
@@ -6924,11 +7041,36 @@ pub(crate) fn tq_draw_preview(
 fn color_image_to_dynamic(ci: &egui::ColorImage) -> image::DynamicImage {
     let w = ci.size[0] as u32;
     let h = ci.size[1] as u32;
+    // Color32 は premultiplied で格納されているため、unmultiply してから書き出す。
+    let mut buf = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let c = ci.pixels[(y * w + x) as usize];
+            buf.put_pixel(x, y, image::Rgba(c.to_srgba_unmultiplied()));
+        }
+    }
+    image::DynamicImage::ImageRgba8(buf)
+}
+
+/// 透明度を持つ ColorImage を単色背景に合成して RGB の DynamicImage を返す。
+/// AI アップスケールの composite-first 入力作成用。完全不透明の画像なら合成は no-op になる。
+pub(crate) fn color_image_to_dynamic_composited(
+    ci: &egui::ColorImage,
+    bg: [u8; 3],
+) -> image::DynamicImage {
+    let w = ci.size[0] as u32;
+    let h = ci.size[1] as u32;
     let mut buf = image::RgbImage::new(w, h);
     for y in 0..h {
         for x in 0..w {
             let c = ci.pixels[(y * w + x) as usize];
-            buf.put_pixel(x, y, image::Rgb([c.r(), c.g(), c.b()]));
+            // Color32 は premultiplied 格納。 result = fg_premul + bg * (1 - a)
+            let a = c.a() as u32;
+            let inv = 255 - a;
+            let r = ((c.r() as u32 * 255 + bg[0] as u32 * inv) / 255).min(255) as u8;
+            let g = ((c.g() as u32 * 255 + bg[1] as u32 * inv) / 255).min(255) as u8;
+            let b = ((c.b() as u32 * 255 + bg[2] as u32 * inv) / 255).min(255) as u8;
+            buf.put_pixel(x, y, image::Rgb([r, g, b]));
         }
     }
     image::DynamicImage::ImageRgb8(buf)

@@ -240,6 +240,37 @@ impl Parallelism {
 /// - `Ltr`: 見開き 左→右（表紙なし）— [0,1] [2,3] ...
 /// - `LtrCover`: 見開き 左→右（表紙あり）— [0] [1,2] [3,4] ...
 /// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
+/// UI 背景色テーマ (v0.7.0)。
+///
+/// - `System` (デフォルト): Windows の「アプリ用の色」に追従。レジストリから検出し、
+///   起動時に Light または Dark を適用する。取得失敗時は Light にフォールバック。
+/// - `Light`: メインウィンドウ・サムネイルは白基調、フルスクリーンは黒地
+///   (フルスクリーン枠は `ui_fullscreen.rs` で `Color32::BLACK` にハードコード済み)
+/// - `Dark`: メインウィンドウ・サムネイルとも暗色基調、フルスクリーンは黒地
+///
+/// `Standard` は v0.7.0 開発初期の互換のために残置されているが、視覚的には `Light` と同じ。
+/// 新規 UI は `System` / `Light` / `Dark` の 3 択をユーザーに提示する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub enum UiTheme {
+    #[default]
+    System,
+    /// 互換目的。視覚的には `Light` と等価。
+    Standard,
+    Light,
+    Dark,
+}
+
+impl UiTheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "システムに合わせる",
+            Self::Standard => "標準",
+            Self::Light => "ライト",
+            Self::Dark => "ダーク",
+        }
+    }
+}
+
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [1,2] [3,4] ...
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
@@ -456,6 +487,17 @@ pub struct Settings {
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
 
+    // ── UI テーマ (v0.7.0) ──────────────────────────────────────
+    /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
+    #[serde(default)]
+    pub ui_theme: UiTheme,
+    /// v0.7.0 開発初期に使っていた起動ダイアログ関連フラグ。互換目的で残置 (読み書きのみ)。
+    #[serde(default)]
+    pub ui_theme_user_set: bool,
+    /// v0.7.0 開発初期の OS テーマ自動検出済みフラグ。互換目的で残置 (読み書きのみ)。
+    #[serde(default)]
+    pub ui_theme_initialized: bool,
+
     // ── ツールバー項目フィルタ（Vec が空 = セクション非表示）──
     /// ツールバーに表示する列数の選択肢
     #[serde(default = "default_toolbar_cols_items")]
@@ -656,6 +698,9 @@ impl Default for Settings {
             image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
             default_spread_mode: SpreadMode::default(),
+            ui_theme: UiTheme::default(),
+            ui_theme_user_set: false,
+            ui_theme_initialized: false,
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
             show_toolbar_parent_button: true,

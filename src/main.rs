@@ -26,6 +26,7 @@ pub mod settings;
 pub mod sidecar;
 pub mod spread_db;
 pub mod stats;
+pub mod sys_memory;
 pub mod thumb_loader;
 pub mod ui_dialogs;
 mod ui_adjustment_panel;
@@ -37,6 +38,7 @@ mod ui_main;
 mod ui_metadata_panel;
 pub mod video_thumb;
 pub mod open_with;
+pub mod os_theme;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod wic_decoder;
@@ -127,7 +129,13 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
+            // 起動時点で UI テーマを先行適用して、初回フレームでの
+            // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから
+            // 効くため、App::update 内で適用すると 1 フレームだけデフォルト
+            // ダーク表示になる)。
+            os_theme::apply(&cc.egui_ctx, saved.ui_theme);
             let mut app = app::App::default();
+            app.applied_ui_theme = Some(app.settings.ui_theme);
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。

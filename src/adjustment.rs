@@ -178,7 +178,7 @@ pub fn apply_adjustments_fast(src: &egui::ColorImage, params: &AdjustParams) -> 
     // 色温度ありは f32 パイプライン
     let mut buf = pixels_to_f32(src);
     apply_color_pipeline(&mut buf, &effective);
-    f32_to_image(buf, w, h)
+    f32_to_image(src, buf, w, h)
 }
 
 /// levels + gamma + brightness/contrast を統合した u8 LUT を生成する。
@@ -219,29 +219,33 @@ fn apply_pipeline_u8_lut(src: &egui::ColorImage, params: &AdjustParams) -> egui:
     let sat_factor = 1.0 + params.saturation / 100.0;
 
     let pixels: Vec<egui::Color32> = src.pixels.iter().map(|c| {
+        // Color32 は premultiplied 格納。元のアルファを保持するため unmultiplied 経由で再構築する。
+        let [_, _, _, a] = c.to_srgba_unmultiplied();
         let r = lut[c.r() as usize];
         let g = lut[c.g() as usize];
         let b = lut[c.b() as usize];
 
-        if full_desat {
+        let (nr, ng, nb) = if full_desat {
             let lum = pixel_lum(&egui::Color32::from_rgb(r, g, b));
-            egui::Color32::from_rgb(lum, lum, lum)
+            (lum, lum, lum)
         } else if has_sat {
             let (r01, g01, b01) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
             let max = r01.max(g01).max(b01);
             let min = r01.min(g01).min(b01);
             let lum = (max + min) * 0.5;
             if (max - min).abs() < 1e-6 {
-                egui::Color32::from_rgb(r, g, b)
+                (r, g, b)
             } else {
-                let nr = ((lum + (r01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8;
-                let ng = ((lum + (g01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8;
-                let nb = ((lum + (b01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8;
-                egui::Color32::from_rgb(nr, ng, nb)
+                (
+                    ((lum + (r01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
+                    ((lum + (g01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
+                    ((lum + (b01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
+                )
             }
         } else {
-            egui::Color32::from_rgb(r, g, b)
-        }
+            (r, g, b)
+        };
+        egui::Color32::from_rgba_unmultiplied(nr, ng, nb, a)
     }).collect();
 
     egui::ColorImage::new([w, h], pixels)
@@ -251,10 +255,11 @@ fn pixels_to_f32(src: &egui::ColorImage) -> Vec<[f32; 3]> {
     src.pixels.iter().map(|c| [c.r() as f32, c.g() as f32, c.b() as f32]).collect()
 }
 
-fn f32_to_image(buf: Vec<[f32; 3]>, w: usize, h: usize) -> egui::ColorImage {
-    let pixels = buf.iter().map(|[r, g, b]| {
-        egui::Color32::from_rgb(
-            r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8,
+fn f32_to_image(src: &egui::ColorImage, buf: Vec<[f32; 3]>, w: usize, h: usize) -> egui::ColorImage {
+    let pixels = buf.iter().zip(src.pixels.iter()).map(|([r, g, b], c)| {
+        let [_, _, _, a] = c.to_srgba_unmultiplied();
+        egui::Color32::from_rgba_unmultiplied(
+            r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8, a,
         )
     }).collect();
     egui::ColorImage::new([w, h], pixels)

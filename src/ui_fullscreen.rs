@@ -38,6 +38,88 @@ const BAR_BUTTON_MARGIN: f32 = 6.0;
 const BAR_BUTTON_GAP: f32 = 4.0;
 /// チェックマーク円の半径
 const CHECKMARK_RADIUS: f32 = 18.0;
+/// 透過画像背景の市松 1 タイルサイズ (px)
+const CHECKER_TILE_PX: f32 = 16.0;
+
+/// 見開き描画時に書き出されるページ矩形レイアウト。
+/// ルーペ描画がカーソル位置からどちらのページかを判定し、UV サンプリングに使う。
+#[derive(Clone, Copy)]
+pub struct FsSpreadLayout {
+    pub left_idx: usize,
+    pub left_rect: egui::Rect,
+    pub right_idx: usize,
+    pub right_rect: egui::Rect,
+}
+
+/// 透過背景の描画スタイル。B キーで 3 モードを循環する。
+///
+/// フルスクリーンのビューポート背景は `ui_fullscreen.rs` で `Color32::BLACK` に
+/// ハードコードされており、テーマ設定 (Light/Dark/System) に関係なく常に黒。
+/// そのため B キー循環は「黒 (= ビューポート既定) → 白 → 市松」のテーマ非依存
+/// 3 モードとした。以前はテーマの反対色を計算していたが、Light テーマ時に
+/// `反対色 = 黒 = ビューポート既定` となり 2 モード連続で視覚変化なしになるバグが
+/// あったため撤去 (v0.7.0 フィードバック)。
+pub(crate) enum FsBgStyle<'a> {
+    /// 塗らない (0 = ビューポート既定 / 常に黒地)
+    Default,
+    /// 単色で塗りつぶす (1 = 白)
+    Solid(egui::Color32),
+    /// 市松パターン (2)。テクスチャは Wrap=Repeat で作成済みであること。
+    Checker(&'a egui::TextureHandle),
+}
+
+/// B キーで選択されたモードから描画スタイルを構築する。
+///
+/// - mode = 0: `Default` (塗らない — ビューポート既定の黒が透けて見える)
+/// - mode = 1: `Solid(WHITE)`
+/// - mode = 2: `Checker` (中間グレー市松)
+pub(crate) fn transparent_bg_style<'a>(
+    mode: u8,
+    checker: Option<&'a egui::TextureHandle>,
+) -> FsBgStyle<'a> {
+    match mode {
+        1 => FsBgStyle::Solid(egui::Color32::WHITE),
+        2 => match checker {
+            Some(t) => FsBgStyle::Checker(t),
+            None => FsBgStyle::Default,
+        },
+        _ => FsBgStyle::Default,
+    }
+}
+
+/// B キー循環で使うモードのトーストラベル。
+pub(crate) fn transparent_bg_toast(mode: u8) -> &'static str {
+    match mode {
+        1 => "[背景: 白]",
+        2 => "[背景: 市松]",
+        _ => "[背景: 黒]",
+    }
+}
+
+/// `rect` 内に透過背景を描画する。画像テクスチャを描く**直前**に呼ぶこと。
+pub(crate) fn paint_transparent_bg(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    style: &FsBgStyle<'_>,
+) {
+    match style {
+        FsBgStyle::Default => {}
+        FsBgStyle::Solid(color) => {
+            painter.rect_filled(rect, 0.0, *color);
+        }
+        FsBgStyle::Checker(tex) => {
+            // テクスチャは Wrap=Repeat で 16×16 の市松。
+            // rect 全域をカバーするよう UV を rect_size / tile_px で指定する。
+            let uv_max = egui::pos2(
+                rect.width() / CHECKER_TILE_PX,
+                rect.height() / CHECKER_TILE_PX,
+            );
+            let uv_rect =
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), uv_max);
+            painter.image(tex.id(), rect, uv_rect, egui::Color32::WHITE);
+        }
+    }
+}
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// 見開き表示の区切り線の幅 (px)
@@ -445,15 +527,18 @@ impl App {
                                             self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
                                         }
                                     }
+                                    let bg_style = self.fs_bg_style(ctx);
                                     Self::draw_fs_image(
                                         ui, image_rect,
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),
                                         state.is_video, state.fs_load_failed, fs_rotation, zp,
-                                        free_rot,
+                                        free_rot, &bg_style,
                                     );
+                                    // 単一表示時は見開きレイアウトキャッシュを破棄
+                                    self.fs_spread_layout = None;
                                 }
                                 SpreadPair::Double { left, right } => {
-                                    self.draw_fs_spread(ui, image_rect, left, right);
+                                    self.draw_fs_spread(ui, ctx, image_rect, left, right);
                                 }
                             }
                         }
@@ -465,6 +550,18 @@ impl App {
                             self.draw_erase_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
                         }
+
+                        // ── ルーペ (Shift ホールド / M トグル) ──
+                        // 見開き・分析・補正モードでは内部で早期 return する。
+                        // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
+                        self.draw_fs_loupe_if_active(
+                            ui, ctx, full_rect, fs_idx,
+                            state.tex.as_ref(), state.thumb_tex.as_ref(),
+                            is_spread_double,
+                        );
+
+                        // ── 透過背景インジケータ (B キー変更直後のみフェード表示) ──
+                        self.draw_fs_transparent_bg_indicator(ui, full_rect);
 
                         // ── 動画: 再生ボタン + Enter ──
                         if state.is_video {
@@ -560,7 +657,7 @@ impl App {
                             ai_info_model_name = self.ai_model_label(fs_idx, false);
                             // 処理後のサイズ
                             if let Some(crate::fs_animation::FsCacheEntry::Static { tex, .. }) =
-                                self.ai_upscale_cache.get(&fs_idx)
+                                self.ai_upscale_cache.get(&(fs_idx, self.effective_upscale_bg_mode()))
                             {
                                 let s = tex.size_vec2();
                                 Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
@@ -703,7 +800,8 @@ impl App {
 
             // AI 処理有効時（アップスケール or デノイズ）: 処理済みテクスチャ
             let ai_tex = if adj_tex.is_none() && (self.ai_upscale_enabled || self.ai_denoise_model.is_some()) {
-                match self.ai_upscale_cache.get(&fs_idx) {
+                let bg = self.effective_upscale_bg_mode();
+                match self.ai_upscale_cache.get(&(fs_idx, bg)) {
                     Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
                     _ => None,
                 }
@@ -973,6 +1071,9 @@ impl App {
         let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
+        // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
+        let key_b_bg =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
 
         // F1-F5: レーティング 1〜5 / F6: レーティング解除
         let rating_key: Option<u8> = ctx.input_mut(|i| {
@@ -1156,6 +1257,27 @@ impl App {
                     self.analysis_guide_drag = None;
                 }
             }
+        } else if key_m && !self.adjustment_mode {
+            // M: ルーペ表示のトグル (分析モード外でのみ。分析モードでは既存のモザイクグリッド操作)
+            self.fs_loupe_locked = !self.fs_loupe_locked;
+            self.show_feedback_toast(
+                if self.fs_loupe_locked { "[ルーペ ON]".to_string() }
+                else { "[ルーペ OFF]".to_string() },
+            );
+        }
+
+        // B: 透過画像の背景サイクル (分析・補正・動画モード外)。
+        // 消しゴムモードは別ブランチ (handle_erase_keys) で処理済みのためここには来ない。
+        // 通常: 黒 → 白 → 市松 の 3 モード循環。
+        // AI アップスケール有効時 (composite-first): 市松は出力にパターンが焼き込まれて崩れるので
+        // 黒/白の 2 モード循環に制限する。デノイズのみの場合はアルファ保持パスを通るので市松 OK。
+        if key_b_bg && !self.analysis_mode && !self.adjustment_mode {
+            let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
+            self.fs_transparent_bg_mode = (self.fs_transparent_bg_mode + 1) % modulo;
+            self.fs_transparent_bg_indicator_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(1200));
+            let label = transparent_bg_toast(self.fs_transparent_bg_mode);
+            self.show_feedback_toast(label.to_string());
         }
 
         // E: 消しゴムモード切り替え（見開き・分析・補正中は無効）
@@ -1669,6 +1791,8 @@ impl App {
 
     /// フルスクリーンの画像 / 動画 / 読込中 / 失敗 表示を描画する。
     /// zoom/pan が Some のとき分析モードのズーム/パンを適用する。
+    /// `bg_style` が Default 以外のとき、画像 rect の直下に透過背景を塗る。
+    #[allow(clippy::too_many_arguments)]
     fn draw_fs_image(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
@@ -1679,6 +1803,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
         free_rotation_rad: f32,
+        bg_style: &FsBgStyle<'_>,
     ) {
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
@@ -1701,6 +1826,11 @@ impl App {
             } else {
                 ui.painter().clone()
             };
+            // 透過画像用背景 (B キーで切替)。回転時は img_rect が回転前の bbox になるため
+            // 視覚的ズレを避けて rotation が None のときのみ適用する。
+            if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
+                paint_transparent_bg(&painter, img_rect, bg_style);
+            }
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
                 painter.image(
                     handle.id(), img_rect,
@@ -1733,11 +1863,239 @@ impl App {
         }
     }
 
+    /// 16×16 の市松テクスチャを lazy 生成する。
+    /// B キーで「市松」モードになったとき初めて呼ばれる。
+    pub(crate) fn ensure_checker_texture(&mut self, ctx: &egui::Context) {
+        if self.fs_checker_texture.is_some() {
+            return;
+        }
+        // 16×16 の 2 値グレー。タイルは 8×8 の 2 色。
+        // Photoshop / GIMP 標準に近い中間グレーで、目に邪魔にならない配色。
+        let mut rgba = Vec::with_capacity(16 * 16 * 4);
+        for y in 0..16 {
+            for x in 0..16 {
+                let cell = ((x / 8) + (y / 8)) % 2;
+                let v: u8 = if cell == 0 { 224 } else { 176 };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let ci = egui::ColorImage::from_rgba_unmultiplied([16, 16], &rgba);
+        let options = egui::TextureOptions {
+            magnification: egui::TextureFilter::Nearest,
+            minification: egui::TextureFilter::Nearest,
+            wrap_mode: egui::TextureWrapMode::Repeat,
+            mipmap_mode: None,
+        };
+        let tex = ctx.load_texture("fs_transparent_checker", ci, options);
+        self.fs_checker_texture = Some(tex);
+    }
+
+    /// 現在の `fs_transparent_bg_mode` から描画スタイルを返す。
+    /// 市松モードのときはテクスチャを lazy 生成する。
+    fn fs_bg_style<'a>(&'a mut self, ctx: &egui::Context) -> FsBgStyle<'a> {
+        if self.fs_transparent_bg_mode == 2 {
+            self.ensure_checker_texture(ctx);
+        }
+        transparent_bg_style(self.fs_transparent_bg_mode, self.fs_checker_texture.as_ref())
+    }
+
+    /// 透過背景モードが Default 以外のとき、画面右上に現在モードを示す。
+    /// モード変更直後 (`fs_transparent_bg_indicator_until` 有効) のみ表示。
+    fn draw_fs_transparent_bg_indicator(&mut self, ui: &egui::Ui, full_rect: egui::Rect) {
+        let Some(until) = self.fs_transparent_bg_indicator_until else { return };
+        let now = std::time::Instant::now();
+        if now >= until {
+            self.fs_transparent_bg_indicator_until = None;
+            return;
+        }
+        // フェードアウト: 最後 400ms で alpha を下げる
+        let remaining = until.saturating_duration_since(now);
+        let alpha_f = (remaining.as_millis().min(400) as f32) / 400.0;
+        let alpha = (alpha_f * 220.0) as u8;
+        // 3 モード循環 (テーマ非依存): ビューポート既定の黒 (0) / 白 (1) / 市松 (2)。
+        let label = match self.fs_transparent_bg_mode {
+            1 => "背景: 白",
+            2 => "背景: 市松",
+            _ => "背景: 黒",
+        };
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(14.0);
+        let galley = painter.layout_no_wrap(
+            label.to_string(),
+            font,
+            egui::Color32::from_white_alpha(alpha),
+        );
+        let pos = egui::pos2(full_rect.max.x - galley.size().x - 16.0, full_rect.min.y + 12.0);
+        let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
+        painter.rect_filled(
+            bg,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, alpha.saturating_sub(40)),
+        );
+        painter.galley(pos, galley, egui::Color32::from_white_alpha(alpha));
+        ui.ctx().request_repaint(); // フェードを継続
+    }
+
+    /// ルーペ (局所拡大) 描画。
+    ///
+    /// 有効条件:
+    /// - `fs_loupe_locked` が true (M キーでトグル) か、Shift キーホールド中
+    /// - ビューポートにフォーカスがある
+    /// - 分析モード・補正モードに入っていない
+    /// - カーソルが `full_rect` 内
+    /// - 画像が回転 0 / 任意回転なし (回転時は UV 逆変換が複雑なため v0.7.0 では非対応)
+    /// - 現在 Single (非見開き) 表示で、テクスチャが存在する
+    ///
+    /// 見開き時は現状は未対応 (v0.7.0 のスコープ外)。
+    pub(crate) fn draw_fs_loupe_if_active(
+        &mut self,
+        ui: &egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+        tex: Option<&egui::TextureHandle>,
+        thumb_tex: Option<&egui::TextureHandle>,
+        spread_double: bool,
+    ) {
+        if self.analysis_mode || self.adjustment_mode {
+            return;
+        }
+        let (hover, shift_held, focused) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.modifiers.shift,
+                i.viewport().focused.unwrap_or(true),
+            )
+        });
+        if !focused {
+            return;
+        }
+        if !self.fs_loupe_locked && !shift_held {
+            return;
+        }
+        let Some(cursor) = hover else { return };
+        if !full_rect.contains(cursor) {
+            return;
+        }
+
+        // ── 対象のページ矩形 + テクスチャを決定 ───────────────────────
+        // Single / Spread で分岐。見開きはカーソル直下のページを選ぶ。
+        let (img_rect, handle_owned, idx_for_rot) = if spread_double {
+            let Some(layout) = self.fs_spread_layout else { return };
+            let (page_idx, page_rect) = if layout.left_rect.contains(cursor) {
+                (layout.left_idx, layout.left_rect)
+            } else if layout.right_rect.contains(cursor) {
+                (layout.right_idx, layout.right_rect)
+            } else {
+                return;
+            };
+            // 見開き時はページ rect がそのまま image rect (draw_fs_spread が高さ統一で
+            // アスペクトをぴったり合わせた矩形を組むため、leterbox は発生しない)。
+            // テクスチャ取得 (fs_cache → thumbnail)
+            let page_tex: Option<egui::TextureHandle> = match self.fs_cache.get(&page_idx) {
+                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
+                    frames.get(*current_frame).map(|(h, _)| h.clone())
+                }
+                _ => None,
+            };
+            let page_thumb: Option<egui::TextureHandle> = match self.thumbnails.get(page_idx) {
+                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+                _ => None,
+            };
+            let Some(handle) = page_tex.or(page_thumb) else { return };
+            (page_rect, handle, page_idx)
+        } else {
+            let Some(handle) = tex.or(thumb_tex) else { return };
+            let tex_size = handle.size_vec2();
+            if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                return;
+            }
+            let fit_scale =
+                (full_rect.width() / tex_size.x).min(full_rect.height() / tex_size.y);
+            let (total_scale, img_center) = match self.fs_zoom_pan() {
+                Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
+                None => (fit_scale, full_rect.center()),
+            };
+            let size = tex_size * total_scale;
+            let rect = egui::Rect::from_center_size(img_center, size);
+            (rect, handle.clone(), fs_idx)
+        };
+
+        // 回転 / 任意回転時は UV 逆変換が複雑なためルーペ非対応
+        let rotation = self.get_rotation(idx_for_rot);
+        if !rotation.is_none() || self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
+            return;
+        }
+
+        let tex_size = handle_owned.size_vec2();
+        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+            return;
+        }
+        if !img_rect.contains(cursor) {
+            return;
+        }
+
+        // 画面 px → テクスチャ px の変換倍率 (見開きでも単一でも共通のスカラー)
+        let total_scale = img_rect.width() / tex_size.x;
+        let uv_center = egui::vec2(
+            (cursor.x - img_rect.min.x) / img_rect.width(),
+            (cursor.y - img_rect.min.y) / img_rect.height(),
+        );
+
+        // ルーペパラメータ (将来設定化)
+        const LOUPE_SIZE: f32 = 300.0;
+        const LOUPE_ZOOM: f32 = 3.0;
+        const LOUPE_OFFSET: f32 = 40.0;
+
+        // サンプル UV: LOUPE_SIZE / LOUPE_ZOOM をテクスチャピクセル単位に変換
+        let sample_px_half = LOUPE_SIZE * 0.5 / (total_scale * LOUPE_ZOOM);
+        let half_uv = egui::vec2(sample_px_half / tex_size.x, sample_px_half / tex_size.y);
+        let uv_min = egui::pos2(
+            (uv_center.x - half_uv.x).clamp(0.0, 1.0),
+            (uv_center.y - half_uv.y).clamp(0.0, 1.0),
+        );
+        let uv_max = egui::pos2(
+            (uv_center.x + half_uv.x).clamp(0.0, 1.0),
+            (uv_center.y + half_uv.y).clamp(0.0, 1.0),
+        );
+        let uv_rect = egui::Rect::from_min_max(uv_min, uv_max);
+
+        // ポップアップ位置: カーソル右下 → はみ出すなら反転
+        let mut popup_pos = cursor + egui::vec2(LOUPE_OFFSET, LOUPE_OFFSET);
+        if popup_pos.x + LOUPE_SIZE > full_rect.max.x {
+            popup_pos.x = cursor.x - LOUPE_OFFSET - LOUPE_SIZE;
+        }
+        if popup_pos.y + LOUPE_SIZE > full_rect.max.y {
+            popup_pos.y = cursor.y - LOUPE_OFFSET - LOUPE_SIZE;
+        }
+        // それでも画面外に出る場合は full_rect の内側に寄せる
+        popup_pos.x = popup_pos.x.max(full_rect.min.x + 4.0);
+        popup_pos.y = popup_pos.y.max(full_rect.min.y + 4.0);
+        let loupe_rect = egui::Rect::from_min_size(popup_pos, egui::vec2(LOUPE_SIZE, LOUPE_SIZE));
+
+        let painter = ui.painter();
+        // 背景 (黒で囲う) + 画像 + 枠線
+        painter.rect_filled(loupe_rect.expand(3.0), 4.0, egui::Color32::BLACK);
+        painter.image(handle_owned.id(), loupe_rect, uv_rect, egui::Color32::WHITE);
+        painter.rect_stroke(
+            loupe_rect,
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::StrokeKind::Outside,
+        );
+        // Shift ホールド中は再描画を継続 (キー離したら止める)
+        if shift_held {
+            ctx.request_repaint();
+        }
+    }
+
     /// 見開きモードの2ページ描画。
     /// 2枚の画像を隙間なく中央に配置し、境界に薄い黒線を描画する。
     fn draw_fs_spread(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         image_rect: egui::Rect,
         left_idx: usize,
         right_idx: usize,
@@ -1745,6 +2103,16 @@ impl App {
         let zoom_pan = self.fs_zoom_pan();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
+        // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
+        // fs_bg_style は &mut self を要求するため先に解決してから以降は shared borrow に切り替える。
+        // 透過画像が見開きの片方だけの場合もあるので両ページに同じ bg を適用する。
+        let bg_tex = if self.fs_transparent_bg_mode == 2 {
+            self.ensure_checker_texture(ctx);
+            self.fs_checker_texture.clone()
+        } else {
+            None
+        };
+        let bg_style = transparent_bg_style(self.fs_transparent_bg_mode, bg_tex.as_ref());
 
         // 各ページの表示サイズを計算して、全体をフィットさせる
         // 片方だけフルサイズだとアスペクト比の微小差でレイアウトがジャンプするため、
@@ -1808,8 +2176,13 @@ impl App {
                 egui::vec2(scaled_rw, scaled_h),
             );
 
-            Self::draw_fs_spread_page(&painter, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-            Self::draw_fs_spread_page(&painter, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(&painter, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails, &bg_style);
+            Self::draw_fs_spread_page(&painter, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails, &bg_style);
+
+            // ルーペが参照するレイアウトを記録 (両ページのサイズが既知のときのみ信頼できる)
+            self.fs_spread_layout = Some(FsSpreadLayout {
+                left_idx, left_rect, right_idx, right_rect,
+            });
 
             // 区切り線（2px 黒線）
             let divider_x = start_x + scaled_lw;
@@ -1832,8 +2205,11 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
-            Self::draw_fs_spread_page(&painter, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails);
-            Self::draw_fs_spread_page(&painter, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails);
+            Self::draw_fs_spread_page(&painter, left_rect, left_idx, left_rot, &self.fs_cache, &self.thumbnails, &bg_style);
+            Self::draw_fs_spread_page(&painter, right_rect, right_idx, right_rot, &self.fs_cache, &self.thumbnails, &bg_style);
+            // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
+            // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
+            self.fs_spread_layout = None;
         }
     }
 
@@ -1874,6 +2250,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
         thumbnails: &[ThumbnailState],
+        bg_style: &FsBgStyle<'_>,
     ) {
         // テクスチャ取得（フルサイズ or サムネイル）
         let tex = match fs_cache.get(&idx) {
@@ -1902,7 +2279,9 @@ impl App {
                 rect.center(),
                 display_size * fit_scale,
             );
+            // 回転中は bbox のズレを避けて背景を適用しない
             if rotation.is_none() {
+                paint_transparent_bg(painter, img_rect, bg_style);
                 painter.image(
                     handle.id(), img_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -2270,8 +2649,9 @@ impl App {
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
-        let is_upscaling = self.ai_upscale_pending.contains_key(&fs_idx);
-        let is_upscaled = self.ai_upscale_cache.contains_key(&fs_idx);
+        let bg = self.effective_upscale_bg_mode();
+        let is_upscaling = self.ai_upscale_pending.contains_key(&(fs_idx, bg));
+        let is_upscaled = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty();
 
@@ -2318,8 +2698,8 @@ impl App {
                 let denoise_enabled = self.ai_denoise_model.is_some();
                 let done = targets.iter()
                     .filter(|&&i| {
-                        if self.ai_upscale_cache.contains_key(&i)
-                            || self.ai_upscale_failed.contains(&i)
+                        if self.ai_upscale_cache.contains_key(&(i, bg))
+                            || self.ai_upscale_failed.contains(&(i, bg))
                         {
                             return true;
                         }

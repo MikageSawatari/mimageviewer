@@ -7,12 +7,15 @@ use eframe::egui;
 use std::collections::HashSet;
 
 use crate::app::App;
-use crate::settings::{self, CachePolicy, Parallelism, Settings, SortOrder, SpreadMode, ThumbAspect};
+use crate::settings::{
+    self, CachePolicy, Parallelism, Settings, SortOrder, SpreadMode, ThumbAspect, UiTheme,
+};
 
 // ── ページ列挙 ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PreferencesPage {
+    Theme,
     Thumbnail,
     Toolbar,
     Slideshow,
@@ -29,6 +32,7 @@ pub(crate) enum PreferencesPage {
 impl PreferencesPage {
     fn label(self) -> &'static str {
         match self {
+            Self::Theme => "テーマ",
             Self::Thumbnail => "サムネイル",
             Self::Toolbar => "ツールバー",
             Self::Slideshow => "スライドショー",
@@ -58,7 +62,12 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "表示",
         page: None,
-        children: &[PreferencesPage::Thumbnail, PreferencesPage::Toolbar, PreferencesPage::Slideshow],
+        children: &[
+            PreferencesPage::Theme,
+            PreferencesPage::Thumbnail,
+            PreferencesPage::Toolbar,
+            PreferencesPage::Slideshow,
+        ],
     },
     TreeCategory {
         label: "パフォーマンス",
@@ -332,6 +341,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
     ui.add_space(8.0);
 
     match state.selected {
+        PreferencesPage::Theme => page_theme(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Toolbar => page_toolbar(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
@@ -347,6 +357,39 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 }
 
 // ── 個別ページ実装 ──────────────────────────────────────────────
+
+fn page_theme(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.label("背景色テーマ (v0.7.0)");
+    ui.add_space(4.0);
+    // Standard は旧設定互換のため enum に残っているが、UI では表示しない (System = 追従 or Light)。
+    // 保存値が Standard になっていたら Light に寄せる (System に勝手に戻すのは避ける)。
+    if state.settings.ui_theme == UiTheme::Standard {
+        state.settings.ui_theme = UiTheme::Light;
+    }
+    ui.radio_value(
+        &mut state.settings.ui_theme,
+        UiTheme::System,
+        "システムに合わせる (Windows のアプリ用色に追従)",
+    );
+    ui.radio_value(
+        &mut state.settings.ui_theme,
+        UiTheme::Light,
+        "ライト (サムネイル白基調 / フルスクリーン黒)",
+    );
+    ui.radio_value(
+        &mut state.settings.ui_theme,
+        UiTheme::Dark,
+        "ダーク (全体暗色 / フルスクリーン黒)",
+    );
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new(
+            "フルスクリーン表示は画像鑑賞のためテーマに関係なく黒背景になります。\n\
+             B キーで透過画像の背景色を循環させられます (黒 → 白 → 市松)。",
+        )
+        .weak(),
+    );
+}
 
 fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(

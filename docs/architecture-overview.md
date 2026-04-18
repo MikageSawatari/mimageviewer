@@ -78,7 +78,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 
 | モジュール | 役割 |
 | --- | --- |
-| `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出 |
+| `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) はフラット展開し、内側 ZIP バイト列は 256MB LRU キャッシュに保持 |
 | `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
@@ -119,6 +119,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `gpu_info.rs` | GPU 情報取得 (VRAM サイズ等、キャッシュ容量の自動決定に使用) |
 | `monitor.rs` | モニター情報取得 (DPI 等) |
 | `open_with.rs` | 外部アプリで開く |
+| `os_theme.rs` | Windows の「アプリ用の色」(レジストリ) を検出し、egui::Visuals へ適用。初回起動時に `Settings::ui_theme` の初期値を決める |
 
 ---
 

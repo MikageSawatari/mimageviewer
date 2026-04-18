@@ -47,7 +47,8 @@ impl App {
         let pixels = if let Some(base) = self.erase_base_cache.get(&fs_idx) {
             Arc::clone(base)
         } else {
-            let from_cache = self.ai_upscale_cache.get(&fs_idx)
+            let bg = self.effective_upscale_bg_mode();
+            let from_cache = self.ai_upscale_cache.get(&(fs_idx, bg))
                 .or_else(|| self.fs_cache.get(&fs_idx))
                 .and_then(|entry| match entry {
                     FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
@@ -1479,16 +1480,17 @@ impl App {
                         base.as_ref().clone(),
                         egui::TextureOptions::LINEAR,
                     );
-                    let target = if self.ai_upscale_cache.contains_key(&fs_idx) {
-                        &mut self.ai_upscale_cache
-                    } else {
-                        &mut self.fs_cache
-                    };
-                    target.insert(fs_idx, FsCacheEntry::Static {
+                    let bg = self.effective_upscale_bg_mode();
+                    let entry = FsCacheEntry::Static {
                         tex,
                         pixels: Arc::clone(base),
                         load_seq: self.input_seq,
-                    });
+                    };
+                    if self.ai_upscale_cache.contains_key(&(fs_idx, bg)) {
+                        self.ai_upscale_cache.insert((fs_idx, bg), entry);
+                    } else {
+                        self.fs_cache.insert(fs_idx, entry);
+                    }
                 }
             }
         }
@@ -1675,11 +1677,7 @@ impl App {
     /// キャッシュを無効化して、新しい元画像で再処理させる。
     /// 処理中の AI タスクがあればキャンセル。
     pub(crate) fn invalidate_derived_fs_caches(&mut self, idx: usize) {
-        self.ai_upscale_cache.remove(&idx);
-        self.ai_upscale_failed.remove(&idx);
-        if let Some((cancel, _)) = self.ai_upscale_pending.remove(&idx) {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.purge_upscale_for_idx(idx);
         self.adjustment_cache.remove(&idx);
         self.adjustment_sharpened.remove(&idx);
     }

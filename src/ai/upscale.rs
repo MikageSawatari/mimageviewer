@@ -112,6 +112,32 @@ pub fn upscale(
     ));
 
     let rgb = input.to_rgb8();
+
+    // 透明度を持つ画像はアルファを別途 Lanczos3 でリサイズして再結合する。
+    // AI モデル (Real-ESRGAN 等) は RGB 3ch 専用で、アルファを直接扱えないため。
+    let alpha_resized: Option<Vec<u8>> = if input.color().has_alpha() {
+        let rgba = input.to_rgba8();
+        let any_transparent = rgba.pixels().any(|p| p.0[3] < 255);
+        if any_transparent {
+            let alpha_data: Vec<u8> = rgba.pixels().map(|p| p.0[3]).collect();
+            let alpha_img = image::GrayImage::from_raw(in_w, in_h, alpha_data)
+                .expect("alpha buffer dimensions match");
+            let resized = image::imageops::resize(
+                &alpha_img, out_w, out_h,
+                image::imageops::FilterType::Lanczos3,
+            );
+            crate::logger::log(format!(
+                "[AI] Upscale: alpha channel resampled via Lanczos3 ({}x{} → {}x{})",
+                in_w, in_h, out_w, out_h
+            ));
+            Some(resized.into_raw())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let tiles = compute_tiles(in_w, in_h, tile_size, TILE_OVERLAP);
     let perf_enabled = crate::perf::is_enabled();
     let t_upscale = std::time::Instant::now();
@@ -193,7 +219,8 @@ pub fn upscale(
             let r = (accum_r[i] / w).clamp(0.0, 255.0) as u8;
             let g = (accum_g[i] / w).clamp(0.0, 255.0) as u8;
             let b = (accum_b[i] / w).clamp(0.0, 255.0) as u8;
-            egui::Color32::from_rgb(r, g, b)
+            let a = alpha_resized.as_ref().map_or(255, |v| v[i]);
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
         })
         .collect();
 
