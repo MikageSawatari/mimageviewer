@@ -1,0 +1,31 @@
+[package]
+name = "mimageviewer-susie32"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 32bit Susie 画像プラグイン (`.spi`) をロード・実行する専用ワーカーバイナリ。
+# メインの `mimageviewer.exe` (64bit) から子プロセスとして spawn され、
+# stdin/stdout のバイナリプロトコルでデコード要求を受けて DIB → BGRA を返す。
+#
+# 32bit ターゲットでのみビルドする:
+#   cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie32
+#
+# 依存は標準ライブラリ + `windows` クレート + `widestring` のみ。
+# pdfium / ort / turbojpeg 等の 64bit 専用クレートは一切含めない。
+
+[lib]
+name = "mimageviewer_susie32"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mimageviewer-susie32"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_Graphics_Gdi",
+] }

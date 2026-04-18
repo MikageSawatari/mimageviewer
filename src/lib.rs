@@ -25,6 +25,7 @@ pub mod mask_db;
 pub mod settings;
 pub mod sidecar;
 pub mod stats;
+pub mod susie_loader;
 pub mod sys_memory;
 pub mod thumb_loader;
 pub mod ui_helpers;

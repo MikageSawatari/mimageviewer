@@ -27,6 +27,7 @@ pub(crate) enum PreferencesPage {
     DuplicateFiles,
     ExifDisplay,
     SpreadMode,
+    SusiePlugins,
 }
 
 impl PreferencesPage {
@@ -44,6 +45,7 @@ impl PreferencesPage {
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "見開き表示",
+            Self::SusiePlugins => "Susie プラグイン",
         }
     }
 }
@@ -92,6 +94,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "見開き表示",
         page: Some(PreferencesPage::SpreadMode),
+        children: &[],
+    },
+    TreeCategory {
+        label: "Susie プラグイン",
+        page: Some(PreferencesPage::SusiePlugins),
         children: &[],
     },
 ];
@@ -260,6 +267,11 @@ impl App {
                 );
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
+                let old_susie = (
+                    self.settings.susie_enabled,
+                    self.settings.susie_allow_parallel,
+                );
+
                 self.settings = state.settings;
                 self.settings.save();
 
@@ -277,6 +289,21 @@ impl App {
                 }
                 if old_exif != self.settings.exif_hidden_tags {
                     self.exif_cache.clear();
+                }
+
+                let new_susie = (
+                    self.settings.susie_enabled,
+                    self.settings.susie_allow_parallel,
+                );
+                if old_susie != new_susie {
+                    crate::susie_loader::reload(
+                        self.settings.susie_enabled,
+                        self.settings.susie_allow_parallel,
+                    );
+                    // 対応拡張子が変わる可能性があるので現在のフォルダを再読み込み
+                    if let Some(folder) = self.current_folder.clone() {
+                        self.load_folder(folder);
+                    }
                 }
             }
             self.show_preferences = false;
@@ -353,6 +380,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
+        PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
     }
 }
 
@@ -934,4 +962,114 @@ fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
             }
         });
+}
+
+fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.checkbox(
+        &mut s.susie_enabled,
+        "Susie 画像プラグインを有効にする",
+    );
+    ui.label(
+        egui::RichText::new(
+            "OFF にするとプラグインフォルダを読み込まなくなります。\n\
+             有効時は `mimageviewer-susie32.exe` (32bit ワーカープロセス) を起動して\n\
+             プラグインをロードします。ワーカーが存在しない環境では自動的に無効化されます。",
+        )
+        .weak(),
+    );
+    ui.add_space(8.0);
+
+    ui.add_enabled_ui(s.susie_enabled, |ui| {
+        ui.checkbox(
+            &mut s.susie_allow_parallel,
+            "プラグインを並列実行する (推奨: ON)",
+        );
+        ui.label(
+            egui::RichText::new(
+                "OFF にするとワーカープロセス数を 1 に固定します。\n\
+                 古いプラグインで一時ファイル衝突・INI の同時書き込み等の\n\
+                 問題が疑われる場合に切り分け用として OFF にしてください。",
+            )
+            .weak(),
+        );
+    });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    let plugin_dir = crate::susie_loader::plugin_dir();
+    ui.horizontal(|ui| {
+        ui.label("プラグインフォルダ:");
+    });
+    ui.label(
+        egui::RichText::new(plugin_dir.display().to_string())
+            .monospace()
+            .weak(),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("📁 フォルダを開く").clicked() {
+            let _ = crate::susie_loader::ensure_plugin_dir();
+            open_in_explorer(&plugin_dir);
+        }
+        if ui.button("⟳ プラグインを再読み込み").clicked() {
+            crate::susie_loader::reload(s.susie_enabled, s.susie_allow_parallel);
+        }
+    });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    // ロード済みプラグイン一覧 (読み込みトリガ: pool が未初期化でも try_get_pool は None)
+    ui.label(egui::RichText::new("ロード済みプラグイン").strong());
+    ui.add_space(4.0);
+    match crate::susie_loader::try_get_pool() {
+        Some(pool) if pool.is_ready() => {
+            for pi in pool.plugins() {
+                ui.collapsing(&pi.name, |ui| {
+                    let exts = pi.extensions.join(", ");
+                    ui.label(egui::RichText::new(format!("対応拡張子: {exts}")).weak());
+                });
+            }
+            if pool.plugins().is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "プラグインが 1 つも読み込まれていません。\n\
+                         「フォルダを開く」から .spi ファイルを配置してください。",
+                    )
+                    .weak(),
+                );
+            }
+        }
+        _ => {
+            ui.label(
+                egui::RichText::new(
+                    "プラグインはまだロードされていません。\n\
+                     「プラグインを再読み込み」を押すと起動されます。",
+                )
+                .weak(),
+            );
+        }
+    }
+}
+
+fn open_in_explorer(path: &std::path::Path) {
+    // Explorer でフォルダを開く。path が存在しなければ何もしない。
+    if !path.exists() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
 }

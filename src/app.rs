@@ -66,7 +66,7 @@ use eframe::egui;
 
 use crate::folder_tree::{
     is_apple_double, navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs,
-    walk_dirs_recursive, SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS,
+    walk_dirs_recursive, SUPPORTED_VIDEO_EXTENSIONS,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -1214,7 +1214,7 @@ impl App {
                     let meta = entry.metadata().ok();
                     let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
                     let file_size = meta.map_or(0, |m| m.len() as i64);
-                    if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+                    if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
                         all_media.push((p, false, mtime, file_size));
                     } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
                         all_media.push((p, true, mtime, file_size));
@@ -4345,14 +4345,18 @@ impl App {
             }
 
             // 静止画フォールバック
-            // image クレート → (失敗時) WIC の順で試す
+            // image クレート → WIC → Susie プラグインの順で試す
             // ZIP エントリは SHCreateMemStream + CreateDecoderFromStream 経由で WIC へフォールバック
             let open_result = if let Some(bytes) = zip_bytes {
+                let hint = zip_entry.as_deref().unwrap_or("");
                 match image::load_from_memory(&bytes) {
                     Ok(img) => Ok(img),
                     Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
                         Some(img) => Ok(img),
-                        None => Err(e),
+                        None => match crate::susie_loader::decode_bytes(hint, &bytes, None) {
+                            Ok(img) => Ok(img),
+                            Err(_) => Err(e),
+                        },
                     },
                 }
             } else {
@@ -4360,7 +4364,10 @@ impl App {
                     Ok(img) => Ok(img),
                     Err(e) => match crate::wic_decoder::decode_to_dynamic_image(&path) {
                         Some(img) => Ok(img),
-                        None => Err(e),
+                        None => match crate::susie_loader::decode_file(&path, None) {
+                            Ok(img) => Ok(img),
+                            Err(_) => Err(e),
+                        },
                     },
                 }
             };
@@ -5857,7 +5864,7 @@ impl App {
                             let file_size = m.len() as i64;
                             Some((mtime, file_size))
                         };
-                        if SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+                        if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
                             if let Some((mt, fs)) = meta() {
                                 images.push((p, mt, fs));
                             }

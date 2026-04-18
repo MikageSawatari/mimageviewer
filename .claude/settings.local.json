@@ -204,7 +204,8 @@
       "Bash(\"/c/Program Files/7-Zip/7z.exe\" a -t7z test_nonsolid.7z src/*.png src/*.jpg -mx=5 -ms=off)",
       "Bash(\"/c/Program Files/7-Zip/7z.exe\" a -tzip test_reference.zip src/*.png src/*.jpg)",
       "Bash(grep -q \"^/testdata/\" .gitignore)",
-      "Bash(echo \"/testdata/\")"
+      "Bash(echo \"/testdata/\")",
+      "Bash(rustup target *)"
     ]
   }
 }
