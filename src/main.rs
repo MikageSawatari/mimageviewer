@@ -61,6 +61,10 @@ fn main() -> eframe::Result {
     // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
     ai::model_manager::ensure_models_extracted();
 
+    // Susie 32bit ワーカー exe を %APPDATA%\mimageviewer\mimageviewer-susie32.exe に展開。
+    // PDFium DLL と同じパターンで本体 exe に埋め込み、初回起動時に書き出す。
+    susie_loader::ensure_worker_extracted();
+
     // Susie プラグインワーカープール: バックグラウンドで初期化する
     // (プラグインが多いと handshake に数百ms かかる可能性があるため、
     //  起動 UI をブロックしないようスレッドに逃がす)

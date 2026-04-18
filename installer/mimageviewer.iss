@@ -37,9 +37,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-; Susie 32bit ワーカー (Susie 画像プラグイン .spi をロードするサブプロセス)
-; 事前に `cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie32` で生成しておく
-Source: "..\target\i686-pc-windows-msvc\release\mimageviewer-susie32.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Susie 32bit ワーカーは本体 exe に include_bytes! で埋め込まれており、
+; 初回起動時に %APPDATA%\mimageviewer\mimageviewer-susie32.exe へ自動展開される。
+; そのため別ファイルとしては同梱しない。
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -6,4 +6,5 @@ bench_thumbs.tsv
 /installer/Output
 /vendor/pdfium
 /vendor/models
+/vendor/susie-worker
 /testdata/

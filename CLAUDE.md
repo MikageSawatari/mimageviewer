@@ -115,14 +115,18 @@ mimageviewer/
 │   └── bin/
 │       └── bench_thumbs.rs  # サムネイル生成ベンチマーク
 ├── scripts/
-│   └── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
+│   ├── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
+│   └── setup-susie-worker.sh # Susie 32bit ワーカーのビルド＆配置スクリプト
 ├── vendor/
 │   ├── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
 │   │   └── bin/pdfium.dll   # include_bytes! で exe に埋め込まれる
-│   └── models/              # AI ONNX モデル（.gitignore、配布スクリプトなし）
-│       └── *.onnx           # include_bytes! で exe に埋め込まれる。
-│                            # 新規開発環境では %APPDATA%\mimageviewer\models\
-│                            # (インストール済み環境が展開したもの) からコピーする
+│   ├── models/              # AI ONNX モデル（.gitignore、配布スクリプトなし）
+│   │   └── *.onnx           # include_bytes! で exe に埋め込まれる。
+│   │                        # 新規開発環境では %APPDATA%\mimageviewer\models\
+│   │                        # (インストール済み環境が展開したもの) からコピーする
+│   └── susie-worker/        # 32bit Susie ワーカー exe（.gitignore、setup-susie-worker.sh で生成）
+│       └── mimageviewer-susie32.exe  # include_bytes! で exe に埋め込まれ、
+│                                     # 初回起動時に APPDATA へ自動展開
 ├── Cargo.toml
 └── Cargo.lock
 ```
@@ -312,6 +316,38 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 2. 新しいバージョンがある場合は `bash scripts/setup-pdfium.sh` で更新
 3. 更新後は PDF の表示が正常か動作確認してからリリース
 
+## Susie 32bit ワーカー管理
+
+Susie 画像プラグイン (`.spi`, 32bit DLL) は 64bit メインプロセスから直接ロードできないため、
+`mimageviewer-susie32.exe` という 32bit のワーカープロセスを子プロセスとして起動して使う。
+
+### exe 埋め込み + APPDATA 展開方式 (PDFium と同じパターン)
+
+- 32bit ワーカーは `include_bytes!` でメインの `mimageviewer.exe` に埋め込む。
+- 初回起動時に `%APPDATA%\mimageviewer\mimageviewer-susie32.exe` に展開される。
+- インストール先 (`Program Files`) には追加ファイルを置かない。
+- 展開時のサイズ一致チェックで、同一バイナリなら書き戻しをスキップ。
+
+### セットアップ (メインビルド前に必須)
+
+```bash
+bash scripts/setup-susie-worker.sh
+# 内部で以下を実行:
+#   cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie32
+#   cp target/i686-pc-windows-msvc/release/mimageviewer-susie32.exe vendor/susie-worker/
+```
+
+- 前提: `rustup target add i686-pc-windows-msvc` 済みであること。
+- 出力: `vendor/susie-worker/mimageviewer-susie32.exe` (.gitignore)。
+- メイン exe のリリースビルド前には **必ず** 実行する。未実行だとコンパイル時に
+  `include_bytes!` が失敗する。
+
+### テスト
+
+統合テスト (`tests/susie_integration.rs`) は `MIV_SUSIE_WORKER` 環境変数で
+ワーカー exe のパスを直接指定できる。`setup-susie-worker.sh` を走らせて
+`vendor/susie-worker/` に配置済みであれば、テストは自動でそれを拾う。
+
 ## Distribution
 
 - **mikage.to**: インストーラ (.exe) + exe 単体の両方を提供
@@ -347,6 +383,7 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 5. `README.md` — 更新履歴セクションに新バージョンの変更点を追加
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
+8. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
 
 ## Git Workflow
 

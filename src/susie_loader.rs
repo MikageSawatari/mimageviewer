@@ -36,6 +36,76 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
 
+// -----------------------------------------------------------------------
+// ワーカー exe の埋め込みと APPDATA への展開
+// -----------------------------------------------------------------------
+
+/// 32bit Susie ワーカー exe (PDFium DLL と同じパターンで本体 exe に埋め込む)。
+/// 初回起動時に `%APPDATA%/mimageviewer/mimageviewer-susie32.exe` へ展開される。
+/// インストール先 (Program Files) に書き込み不要で、本体 exe のフォルダにも
+/// 追加ファイルを置かない。
+static SUSIE_WORKER_BYTES: &[u8] =
+    include_bytes!("../vendor/susie-worker/mimageviewer-susie32.exe");
+
+static WORKER_EXE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// 埋め込みバイト列を APPDATA に展開する。サイズ一致でスキップ。
+/// 起動時に一度だけ呼ぶ (main.rs の data_dir 初期化直後)。
+pub fn ensure_worker_extracted() {
+    let _ = worker_exe_cached_path();
+}
+
+/// ワーカー exe の展開先パス。
+/// 環境変数 `MIV_SUSIE_WORKER` が指定されていればそれを優先 (テスト/開発用)。
+/// そうでなければ `<data_dir>/mimageviewer-susie32.exe` に埋め込みバイト列を
+/// 必要に応じて書き出し、そのパスを返す。
+fn worker_exe_cached_path() -> PathBuf {
+    if let Ok(p) = std::env::var("MIV_SUSIE_WORKER") {
+        return PathBuf::from(p);
+    }
+    WORKER_EXE_PATH
+        .get_or_init(|| {
+            let dir = crate::data_dir::get();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                crate::logger::log(format!(
+                    "susie: data_dir create failed: {e} (path: {})",
+                    dir.display()
+                ));
+                // 展開失敗時も期待パスを返す (is_ready=false で UI にエラーが出る)
+                return dir.join(WORKER_EXE_NAME);
+            }
+            let exe_path = dir.join(WORKER_EXE_NAME);
+            // 埋め込みが空 (開発時 vendor/susie-worker 未設置) の場合は展開しない。
+            // 既存の実ファイルを 0 バイトで上書きして壊すのを避ける。
+            if SUSIE_WORKER_BYTES.is_empty() {
+                return exe_path;
+            }
+            let needs_extract = match std::fs::metadata(&exe_path) {
+                Ok(meta) => meta.len() != SUSIE_WORKER_BYTES.len() as u64,
+                Err(_) => true,
+            };
+            if needs_extract {
+                match std::fs::write(&exe_path, SUSIE_WORKER_BYTES) {
+                    Ok(()) => {
+                        crate::logger::log(format!(
+                            "susie: worker extracted to {} ({} bytes)",
+                            exe_path.display(),
+                            SUSIE_WORKER_BYTES.len(),
+                        ));
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "susie: worker extract failed: {e} (path: {})",
+                            exe_path.display()
+                        ));
+                    }
+                }
+            }
+            exe_path
+        })
+        .clone()
+}
+
 // ─────────────────────────────────────────────────────────────────
 // 定数 / プロトコル定数 (worker 側と一致)
 // ─────────────────────────────────────────────────────────────────
@@ -418,20 +488,11 @@ pub fn decode_bytes(
 // プロセス起動・ハンドシェイク
 // ─────────────────────────────────────────────────────────────────
 
-/// ワーカー exe の解決予定パス (診断表示用にも公開)。
+/// ワーカー exe のパス (診断表示用にも公開)。
+/// 展開先は `<data_dir>/mimageviewer-susie32.exe`。環境変数
+/// `MIV_SUSIE_WORKER` が指定されていればそちらを使う (テスト用)。
 pub fn worker_exe_path() -> PathBuf {
-    // テスト / 開発用に `MIV_SUSIE_WORKER` 環境変数で上書き可能。
-    // 統合テストは `target/i686-pc-windows-msvc/release/mimageviewer-susie32.exe` を指す。
-    if let Ok(p) = std::env::var("MIV_SUSIE_WORKER") {
-        return PathBuf::from(p);
-    }
-    // 通常: mimageviewer.exe と同じディレクトリに mimageviewer-susie32.exe を配置する。
-    if let Ok(main_exe) = std::env::current_exe() {
-        if let Some(dir) = main_exe.parent() {
-            return dir.join(WORKER_EXE_NAME);
-        }
-    }
-    PathBuf::from(WORKER_EXE_NAME)
+    worker_exe_cached_path()
 }
 
 /// 診断情報: プール未起動の理由を UI に返すためのステート。

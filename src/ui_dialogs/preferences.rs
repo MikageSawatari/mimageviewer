@@ -1050,14 +1050,14 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
         crate::susie_loader::PoolStatus::WorkerExeMissing { expected_path } => {
             ui.label(
                 egui::RichText::new(format!(
-                    "⚠ Susie ワーカー ({}) が見つかりません。",
+                    "⚠ Susie ワーカー ({}) を APPDATA に展開できませんでした。",
                     crate::susie_loader::WORKER_EXE_NAME,
                 ))
                 .color(egui::Color32::from_rgb(200, 100, 50)),
             );
             ui.label(
                 egui::RichText::new(format!(
-                    "配置予定パス: {}",
+                    "展開先パス: {}",
                     expected_path.display(),
                 ))
                 .monospace()
@@ -1066,9 +1066,8 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
             ui.label(
                 egui::RichText::new(
-                    "インストーラ版では自動配置されます。開発ビルドの場合は\n\
-                     `cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie32`\n\
-                     でビルドして exe と同じフォルダに配置してください。",
+                    "通常はアプリ起動時に自動展開されます。\n\
+                     展開先のフォルダに書き込み権限があるか確認してください。",
                 )
                 .size(11.0)
                 .weak(),
