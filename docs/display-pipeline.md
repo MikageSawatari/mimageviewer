@@ -135,6 +135,9 @@ ui_fullscreen.rs::render_fullscreen_viewport
   ならば出力も 8192 以内。AI 結果 / fs_cache の `pixels` を入力に取るので成立する。
 - 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も
   同じ上限を尊重する。
+- GIF / APNG アニメーションは `fs_animation::clamp_rgba_frame_for_gpu` で各フレームを
+  `MAX_TEXTURE_DIM` 以下に縮めてから `ColorImage` 化する (巨大 animated 画像で
+  `ctx.load_texture` が panic するのを防ぐ安全網)。
 
 新しい経路で `FsCacheEntry::Static` を作るときは、`pixels` が 8192 以内であることを
 自分で保証するか、`clamp_dynamic_for_gpu` を掛けてから格納する。UI スレッド側の

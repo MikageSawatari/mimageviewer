@@ -71,6 +71,26 @@ impl FsCacheEntry {
     }
 }
 
+/// 単一フレームを GPU テクスチャ上限 (`MAX_TEXTURE_DIM`) 以下に縮める。
+/// 上限内ならそのまま返す。巨大 animated GIF/APNG が `ctx.load_texture` で
+/// panic しないようにするための安全網。
+fn clamp_rgba_frame_for_gpu(buf: image::RgbaImage) -> image::RgbaImage {
+    let limit = crate::app::MAX_TEXTURE_DIM as u32;
+    let (w, h) = buf.dimensions();
+    if w <= limit && h <= limit {
+        return buf;
+    }
+    let scale = limit as f64 / w.max(h) as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    crate::fast_resize::resize_rgba8_exact(
+        &buf,
+        new_w,
+        new_h,
+        crate::fast_resize::Quality::Bilinear,
+    )
+}
+
 /// GIF をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）や失敗時は None を返す。
 pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
@@ -97,7 +117,7 @@ pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
                     0.1
                 };
                 let delay = delay.max(0.02); // 最低 20ms（Chrome 互換）
-                let buf = frame.into_buffer();
+                let buf = clamp_rgba_frame_for_gpu(frame.into_buffer());
                 let (w, h) = buf.dimensions();
                 let ci = egui::ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
@@ -139,7 +159,7 @@ pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
                     0.1
                 };
                 let delay = delay.max(0.02);
-                let buf = frame.into_buffer();
+                let buf = clamp_rgba_frame_for_gpu(frame.into_buffer());
                 let (w, h) = buf.dimensions();
                 let ci = egui::ColorImage::from_rgba_unmultiplied(
                     [w as usize, h as usize],
@@ -195,6 +215,26 @@ mod tests {
         if let Some(frames) = &result {
             assert!(frames.len() > 1, "if APNG, should have multiple frames");
         }
+    }
+
+    #[test]
+    fn clamp_rgba_frame_noop_when_within_limit() {
+        let buf = image::RgbaImage::from_pixel(1024, 768, image::Rgba([10, 20, 30, 255]));
+        let out = clamp_rgba_frame_for_gpu(buf);
+        assert_eq!(out.dimensions(), (1024, 768));
+    }
+
+    #[test]
+    fn clamp_rgba_frame_shrinks_oversized_dims() {
+        let limit = crate::app::MAX_TEXTURE_DIM as u32;
+        let w = limit + 2048;
+        // 本番と同じ比率で縮小されることを小さい画像で検証する。
+        // 巨大バッファを確保すると CI で遅いので、内部スケールの丸め挙動のみ確認。
+        let buf = image::RgbaImage::from_pixel(w, limit / 2, image::Rgba([0, 0, 0, 255]));
+        let out = clamp_rgba_frame_for_gpu(buf);
+        let (ow, oh) = out.dimensions();
+        assert!(ow <= limit && oh <= limit, "clamped size should fit limit");
+        assert_eq!(ow, limit, "long side should be pinned to limit");
     }
 
     #[test]
