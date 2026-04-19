@@ -1177,8 +1177,12 @@ impl App {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0)),
         ];
 
-        // Ctrl+Backspace: 現在ページの個別補正設定を解除 (標準値に戻す)
-        let clear_page_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Backspace));
+        // Ctrl+Backspace / Q: 現在ページの個別補正設定を解除 (標準値に戻す)
+        // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
+        let clear_page_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL, egui::Key::Backspace)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
+        });
 
         // 見開きモード切替 + フィードバック表示
         let new_spread = if key_1 { Some(SpreadMode::Single) }

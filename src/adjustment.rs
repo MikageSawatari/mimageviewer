@@ -67,11 +67,62 @@ pub enum PostFilter {
     ComboMegaDriveCrt,
     /// 複合: スーパーファミコン減色 + CRT シンプル
     ComboSfcCrt,
+
+    // ── カラーグレーディング (写真向け) ─────────────────────────────
+    /// セピア (古写真風の暖色モノクロ)
+    Sepia,
+    /// モノクロ (ニュートラル BT.601 輝度)
+    MonoNeutral,
+    /// モノクロ (冷調、青み付き)
+    MonoCool,
+    /// モノクロ (暖調、茶み付き)
+    MonoWarm,
+    /// シネマ風 Teal & Orange (影=青緑、ハイライト=橙)
+    TealOrange,
+    /// Kodak Portra 風 (肌色の血色、落ち着いた彩度)
+    KodakPortra,
+    /// Fuji Velvia 風 (高彩度、緑・青強調)
+    FujiVelvia,
+    /// ブリーチバイパス (低彩度・高コントラスト、シネマ調)
+    BleachBypass,
+    /// クロスプロセス (影=青緑、ハイライト=黄、高彩度)
+    CrossProcess,
+    /// ビンテージ / 褪色 (低コントラスト + 紫シャドウ + 黄色ハイライト)
+    Vintage,
+    /// 暖色調 (全体に赤寄せ)
+    WarmTone,
+    /// 寒色調 (全体に青寄せ)
+    CoolTone,
+
+    // ── アナログ写真エフェクト ──────────────────────────────────────
+    /// フィルムグレイン (粒状ノイズ)
+    FilmGrain,
+    /// ビネット (周辺減光)
+    Vignette,
+    /// ライトリーク (古いフィルムカメラ風の光漏れ)
+    LightLeak,
+    /// ソフトフォーカス (明部にじみのポートレート風)
+    SoftFocus,
+
+    // ── 絵画・描画風 ────────────────────────────────────────────────
+    /// ハーフトーン (漫画風スクリーントーン、グレー + ドット)
+    Halftone,
+    /// オイルペイント風 (Kuwahara フィルタ)
+    OilPaint,
+    /// スケッチ風 (エッジ抽出 + グレー化)
+    Sketch,
+
+    // ── 実用 ────────────────────────────────────────────────────────
+    /// シャープ化 (アンシャープマスク)
+    Sharpen,
 }
 
 impl PostFilter {
-    /// 全プリセットを UI 順で列挙する (減色は色数昇順、複合は機種順)。
+    /// 全プリセットを UI 順で列挙する。
+    /// - レトロ系: 減色は色数昇順、複合は機種順
+    /// - 写真系: カラーグレーディング → アナログ → 描画風 → 実用 の順
     pub const ALL: &'static [Self] = &[
+        // レトロ系
         Self::None, Self::Nearest,
         Self::CrtSimple, Self::CrtFull, Self::CrtArcade,
         Self::Dither1bit, Self::GameBoy,
@@ -79,6 +130,17 @@ impl PostFilter {
         Self::Msx2Plus, Self::Sfc,
         Self::ComboFamicomCrt, Self::ComboPc98Crt, Self::ComboMsx2PlusCrt,
         Self::ComboMegaDriveCrt, Self::ComboSfcCrt,
+        // 写真系 カラーグレーディング
+        Self::Sepia, Self::MonoNeutral, Self::MonoCool, Self::MonoWarm,
+        Self::WarmTone, Self::CoolTone,
+        Self::TealOrange, Self::KodakPortra, Self::FujiVelvia,
+        Self::BleachBypass, Self::CrossProcess, Self::Vintage,
+        // 写真系 アナログフィルム
+        Self::FilmGrain, Self::Vignette, Self::LightLeak, Self::SoftFocus,
+        // 絵画・描画風
+        Self::Halftone, Self::OilPaint, Self::Sketch,
+        // 実用
+        Self::Sharpen,
     ];
 
     /// UI 表示用の日本語ラベル。
@@ -102,6 +164,26 @@ impl PostFilter {
             Self::ComboMsx2PlusCrt => "CRT × MSX2+",
             Self::ComboMegaDriveCrt => "CRT × メガドライブ",
             Self::ComboSfcCrt => "CRT × スーパーファミコン",
+            Self::Sepia => "セピア",
+            Self::MonoNeutral => "モノクロ（ニュートラル）",
+            Self::MonoCool => "モノクロ（冷調）",
+            Self::MonoWarm => "モノクロ（暖調）",
+            Self::TealOrange => "Teal & Orange（シネマ調）",
+            Self::KodakPortra => "Kodak Portra 風",
+            Self::FujiVelvia => "Fuji Velvia 風",
+            Self::BleachBypass => "ブリーチバイパス",
+            Self::CrossProcess => "クロスプロセス",
+            Self::Vintage => "ビンテージ / 褪色",
+            Self::WarmTone => "暖色調",
+            Self::CoolTone => "寒色調",
+            Self::FilmGrain => "フィルムグレイン",
+            Self::Vignette => "ビネット（周辺減光）",
+            Self::LightLeak => "ライトリーク",
+            Self::SoftFocus => "ソフトフォーカス",
+            Self::Halftone => "ハーフトーン（漫画風）",
+            Self::OilPaint => "オイルペイント風",
+            Self::Sketch => "スケッチ風",
+            Self::Sharpen => "シャープ化",
         }
     }
 

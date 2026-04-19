@@ -173,7 +173,7 @@ fn draw_sliders(
     ui.separator();
     ui.add_space(4.0);
 
-    ui.label(egui::RichText::new("AI ノイズ除去").size(SECTION_FONT).color(LABEL_COLOR));
+    ui.label(egui::RichText::new("AI ノイズ除去 [N: ON/OFF]").size(SECTION_FONT).color(LABEL_COLOR));
     if let Some(px) = ai_denoise_disabled_threshold {
         ui.label(
             egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
@@ -194,7 +194,11 @@ fn draw_sliders(
     }
     ui.add_space(8.0);
 
-    ui.label(egui::RichText::new("AI アップスケール").size(SECTION_FONT).color(LABEL_COLOR));
+    ui.label(
+        egui::RichText::new("AI アップスケール [U: 次 / Shift+U: 前 / Alt+U: リセット]")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
     if let Some(px) = ai_upscale_disabled_threshold {
         ui.label(
             egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
@@ -215,9 +219,13 @@ fn draw_sliders(
         }
     }
 
-    // ── ポストフィルタ (レトロ系表示エフェクト) ──
+    // ── ポストフィルタ (レトロ系 + 写真系エフェクト) ──
     ui.add_space(12.0);
-    ui.label(egui::RichText::new("ポストフィルタ").size(SECTION_FONT).color(LABEL_COLOR));
+    ui.label(
+        egui::RichText::new("ポストフィルタ [P: 次 / Shift+P: 前 / Alt+P: リセット]")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
     let before_pf = params.post_filter;
     egui::ComboBox::from_id_salt("post_filter_combo")
         .selected_text(params.post_filter.display_label())
@@ -256,6 +264,34 @@ fn draw_sliders(
             ui.selectable_value(&mut params.post_filter, PostFilter::ComboMsx2PlusCrt, PostFilter::ComboMsx2PlusCrt.display_label());
             ui.selectable_value(&mut params.post_filter, PostFilter::ComboMegaDriveCrt, PostFilter::ComboMegaDriveCrt.display_label());
             ui.selectable_value(&mut params.post_filter, PostFilter::ComboSfcCrt, PostFilter::ComboSfcCrt.display_label());
+            ui.separator();
+            group_heading(ui, "── カラーグレーディング ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::Sepia, PostFilter::Sepia.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::MonoNeutral, PostFilter::MonoNeutral.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::MonoCool, PostFilter::MonoCool.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::MonoWarm, PostFilter::MonoWarm.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::WarmTone, PostFilter::WarmTone.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::CoolTone, PostFilter::CoolTone.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::TealOrange, PostFilter::TealOrange.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::KodakPortra, PostFilter::KodakPortra.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::FujiVelvia, PostFilter::FujiVelvia.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::BleachBypass, PostFilter::BleachBypass.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::CrossProcess, PostFilter::CrossProcess.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Vintage, PostFilter::Vintage.display_label());
+            ui.separator();
+            group_heading(ui, "── アナログフィルム ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::FilmGrain, PostFilter::FilmGrain.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Vignette, PostFilter::Vignette.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::LightLeak, PostFilter::LightLeak.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::SoftFocus, PostFilter::SoftFocus.display_label());
+            ui.separator();
+            group_heading(ui, "── 絵画・描画風 ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::Halftone, PostFilter::Halftone.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::OilPaint, PostFilter::OilPaint.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Sketch, PostFilter::Sketch.display_label());
+            ui.separator();
+            group_heading(ui, "── 実用 ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::Sharpen, PostFilter::Sharpen.display_label());
         });
     if params.post_filter != before_pf {
         changed = true;
@@ -348,8 +384,8 @@ impl App {
                     set_as_global_clicked = true;
                 }
                 if ui
-                    .add_enabled(has_override, egui::Button::new("個別設定を解除").small())
-                    .on_hover_text("このページの個別設定を削除し、標準値に戻す (Ctrl+Backspace)")
+                    .add_enabled(has_override, egui::Button::new("個別設定を解除 [Q]").small())
+                    .on_hover_text("このページの個別設定を削除し、標準値に戻す (Q または Ctrl+Backspace)")
                     .clicked()
                 {
                     clear_page_clicked = true;

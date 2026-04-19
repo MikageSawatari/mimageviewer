@@ -1,10 +1,15 @@
-//! レトロ系ポストフィルタ (CRT ブラウン管・減色・複合プリセット)。
+//! ポストフィルタ (レトロ系 + 写真系プリセット)。
 //!
 //! 色調補正後の [`egui::ColorImage`] を受け取り、変換後の ColorImage を返す。
 //! 各フィルタは `rayon` で並列化しており、4K 画像でも 50〜80ms 程度で完了する想定。
 //!
 //! 合成順序:
 //!   apply_adjustments_fast (色調) → [post_filter::apply] → テクスチャ化 (NEAREST サンプラー)
+//!
+//! 系統:
+//! - `crt` — ブラウン管エミュレート (Simple/Full/Arcade + 非液晶機種との複合)
+//! - `palette` — ハード別の減色・ディザ (GameBoy/PC-98/MD/SFC…)
+//! - `photo` — 写真向け (カラーグレーディング、アナログ、絵画風、実用)
 
 use crate::adjustment::PostFilter;
 use egui::{Color32, ColorImage};
@@ -31,6 +36,30 @@ pub fn apply(src: &ColorImage, filter: PostFilter) -> ColorImage {
         PostFilter::ComboMsx2PlusCrt => crt::apply_simple(&palette::apply_msx2plus(src)),
         PostFilter::ComboMegaDriveCrt => crt::apply_simple(&palette::apply_mega_drive(src)),
         PostFilter::ComboSfcCrt => crt::apply_simple(&palette::apply_sfc(src)),
+        // ── 写真系カラーグレーディング ──────────────────────────
+        PostFilter::Sepia => photo::apply_sepia(src),
+        PostFilter::MonoNeutral => photo::apply_mono_neutral(src),
+        PostFilter::MonoCool => photo::apply_mono_cool(src),
+        PostFilter::MonoWarm => photo::apply_mono_warm(src),
+        PostFilter::TealOrange => photo::apply_teal_orange(src),
+        PostFilter::KodakPortra => photo::apply_kodak_portra(src),
+        PostFilter::FujiVelvia => photo::apply_fuji_velvia(src),
+        PostFilter::BleachBypass => photo::apply_bleach_bypass(src),
+        PostFilter::CrossProcess => photo::apply_cross_process(src),
+        PostFilter::Vintage => photo::apply_vintage(src),
+        PostFilter::WarmTone => photo::apply_warm_tone(src),
+        PostFilter::CoolTone => photo::apply_cool_tone(src),
+        // ── アナログフィルム ─────────────────────────────────────
+        PostFilter::FilmGrain => photo::apply_film_grain(src),
+        PostFilter::Vignette => photo::apply_vignette(src),
+        PostFilter::LightLeak => photo::apply_light_leak(src),
+        PostFilter::SoftFocus => photo::apply_soft_focus(src),
+        // ── 絵画・描画風 ─────────────────────────────────────────
+        PostFilter::Halftone => photo::apply_halftone(src),
+        PostFilter::OilPaint => photo::apply_oil_paint(src),
+        PostFilter::Sketch => photo::apply_sketch(src),
+        // ── 実用 ─────────────────────────────────────────────────
+        PostFilter::Sharpen => photo::apply_sharpen(src),
     }
 }
 
@@ -128,6 +157,13 @@ impl BilinearYCtx {
 
     #[inline]
     fn sample(&self, src: &[Color32], sx: f32) -> (f32, f32, f32) {
+        let (r, g, b, _a) = self.sample_rgba(src, sx);
+        (r, g, b)
+    }
+
+    /// alpha も含めてサンプリングする。透過画像で CRT 系が不透明化するのを防ぐ。
+    #[inline]
+    fn sample_rgba(&self, src: &[Color32], sx: f32) -> (f32, f32, f32, f32) {
         let fx = sx.clamp(0.0, self.src_w as f32 - 1.0);
         let x0 = fx.floor() as usize;
         let x1 = (x0 + 1).min(self.max_x);
@@ -142,14 +178,17 @@ impl BilinearYCtx {
         let top_r = c00.r() as f32 * one_minus_tx + c10.r() as f32 * tx;
         let top_g = c00.g() as f32 * one_minus_tx + c10.g() as f32 * tx;
         let top_b = c00.b() as f32 * one_minus_tx + c10.b() as f32 * tx;
+        let top_a = c00.a() as f32 * one_minus_tx + c10.a() as f32 * tx;
         let bot_r = c01.r() as f32 * one_minus_tx + c11.r() as f32 * tx;
         let bot_g = c01.g() as f32 * one_minus_tx + c11.g() as f32 * tx;
         let bot_b = c01.b() as f32 * one_minus_tx + c11.b() as f32 * tx;
+        let bot_a = c01.a() as f32 * one_minus_tx + c11.a() as f32 * tx;
 
         (
             top_r * self.one_minus_ty + bot_r * self.ty,
             top_g * self.one_minus_ty + bot_g * self.ty,
             top_b * self.one_minus_ty + bot_b * self.ty,
+            top_a * self.one_minus_ty + bot_a * self.ty,
         )
     }
 }
@@ -275,8 +314,8 @@ mod crt {
                 // 同一走査線で最大 3 箇所サンプルするため y 補間係数を事前計算
                 let yctx = BilinearYCtx::new(src_w, src_h, sy_f);
 
-                // bilinear サンプリングで柔らかいピクセル境界
-                let (mut r, mut g, mut b) = yctx.sample(src_pixels, sx_f);
+                // bilinear サンプリングで柔らかいピクセル境界 (alpha 保持)
+                let (mut r, mut g, mut b, a_src) = yctx.sample_rgba(src_pixels, sx_f);
 
                 // 水平方向の追加ブラー: ±0.5 px ぶん左右もサンプルしてブレンド
                 if params.h_blur > 0.0 {
@@ -323,7 +362,9 @@ mod crt {
                     b += add;
                 }
 
-                row[ox] = Color32::from_rgb(clamp_u8(r), clamp_u8(g), clamp_u8(b));
+                row[ox] = Color32::from_rgba_unmultiplied(
+                    clamp_u8(r), clamp_u8(g), clamp_u8(b), clamp_u8(a_src),
+                );
             }
         });
 
@@ -586,7 +627,7 @@ mod palette {
                 let lum = crate::adjustment::pixel_lum_f32(c);
                 let t = bayer4_threshold(x, y);
                 let v = if lum + t > 0.5 { 255 } else { 0 };
-                row[x] = Color32::from_rgb(v, v, v);
+                row[x] = Color32::from_rgba_unmultiplied(v, v, v, c.a());
             }
         });
         ColorImage::new([w, h], out)
@@ -613,7 +654,7 @@ mod palette {
                 let b = (c.b() as f32 + t).clamp(0.0, 255.0) as u32;
                 let idx = lut[lut_index(r, g, b)] as usize;
                 let p = palette[idx];
-                row[x] = Color32::from_rgb(p[0], p[1], p[2]);
+                row[x] = Color32::from_rgba_unmultiplied(p[0], p[1], p[2], c.a());
             }
         });
         ColorImage::new([w, h], out)
@@ -667,6 +708,591 @@ mod palette {
             }
         }
         best
+    }
+}
+
+// ── 写真系ポストフィルタ ────────────────────────────────────────
+//
+// カラーグレーディング: 3×3 色行列 + チャンネル別トーンカーブの組み合わせで
+//   大半の「フィルム風ルック」を 1〜2 ms/MP 程度で再現する。
+// アナログエフェクト: フィルムグレイン・ビネット・ライトリーク・ソフトフォーカス。
+// 絵画・描画風: ハーフトーン・Kuwahara オイルペイント・Sobel スケッチ。
+// 実用: アンシャープマスクによるシャープ化。
+//
+// すべて ColorImage → ColorImage のピュア変換で、rayon 並列化で 4K 画像も実用速度。
+
+mod photo {
+    use super::*;
+
+    // ── 共通ヘルパー ────────────────────────────────────────────
+
+    /// 3×3 RGB 行列をピクセルに適用する (クランプあり、alpha 保持)。
+    #[inline]
+    fn apply_matrix(c: Color32, m: [[f32; 3]; 3]) -> Color32 {
+        let r = c.r() as f32;
+        let g = c.g() as f32;
+        let b = c.b() as f32;
+        let nr = m[0][0] * r + m[0][1] * g + m[0][2] * b;
+        let ng = m[1][0] * r + m[1][1] * g + m[1][2] * b;
+        let nb = m[2][0] * r + m[2][1] * g + m[2][2] * b;
+        Color32::from_rgba_unmultiplied(clamp_u8(nr), clamp_u8(ng), clamp_u8(nb), c.a())
+    }
+
+    /// S 字コントラストカーブ (低入力をより暗く、高入力をより明るく)。
+    /// `strength`: 0.0 で無変化、1.0 強めの S 字
+    #[inline]
+    fn s_curve(v: f32, strength: f32) -> f32 {
+        // v: 0..255。正規化 → スムーズステップ的な S 字 → 再スケール
+        let n = (v / 255.0).clamp(0.0, 1.0);
+        let s = n * n * (3.0 - 2.0 * n); // smoothstep
+        (n * (1.0 - strength) + s * strength) * 255.0
+    }
+
+    /// 輝度保持の彩度調整 (saturation: -1..+1、0 で無変化、alpha 保持)。
+    #[inline]
+    fn adjust_saturation(c: Color32, saturation: f32) -> Color32 {
+        let r = c.r() as f32;
+        let g = c.g() as f32;
+        let b = c.b() as f32;
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        let mul = 1.0 + saturation;
+        Color32::from_rgba_unmultiplied(
+            clamp_u8(lum + (r - lum) * mul),
+            clamp_u8(lum + (g - lum) * mul),
+            clamp_u8(lum + (b - lum) * mul),
+            c.a(),
+        )
+    }
+
+    /// 輝度マップ (0..1)。
+    #[inline]
+    fn luminance(c: Color32) -> f32 {
+        crate::adjustment::pixel_lum_f32(c)
+    }
+
+    /// ピクセル毎の単純変換を並列に実行するヘルパー。
+    fn map_parallel<F>(src: &ColorImage, f: F) -> ColorImage
+    where
+        F: Fn(Color32) -> Color32 + Sync,
+    {
+        let [w, h] = src.size;
+        let pixels: Vec<Color32> = src.pixels.par_iter().map(|c| f(*c)).collect();
+        ColorImage::new([w, h], pixels)
+    }
+
+    /// 座標 (x, y) を見るピクセル毎並列変換。
+    fn map_parallel_xy<F>(src: &ColorImage, f: F) -> ColorImage
+    where
+        F: Fn(usize, usize, Color32) -> Color32 + Sync,
+    {
+        let [w, h] = src.size;
+        let src_pixels = &src.pixels;
+        let mut out = vec![Color32::BLACK; w * h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                row[x] = f(x, y, src_pixels[y * w + x]);
+            }
+        });
+        ColorImage::new([w, h], out)
+    }
+
+    // ── カラーグレーディング ────────────────────────────────────
+
+    /// セピア (古写真風)。Microsoft の典型的なセピアフィルタ係数。
+    pub fn apply_sepia(src: &ColorImage) -> ColorImage {
+        const M: [[f32; 3]; 3] = [
+            [0.393, 0.769, 0.189],
+            [0.349, 0.686, 0.168],
+            [0.272, 0.534, 0.131],
+        ];
+        map_parallel(src, |c| apply_matrix(c, M))
+    }
+
+    /// ニュートラルモノクロ (ITU-R BT.601 輝度のまま)。
+    pub fn apply_mono_neutral(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            let y = (luminance(c) * 255.0) as u8;
+            Color32::from_rgba_unmultiplied(y, y, y, c.a())
+        })
+    }
+
+    /// 冷調モノクロ (青みの影)。
+    pub fn apply_mono_cool(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            let y = luminance(c);
+            let r = y * 0.88;
+            let g = y * 0.95;
+            let b = (y * 1.05).min(1.0);
+            Color32::from_rgba_unmultiplied(
+                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+            )
+        })
+    }
+
+    /// 暖調モノクロ (茶み付きのセピアより薄めの仕上げ)。
+    pub fn apply_mono_warm(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            let y = luminance(c);
+            let r = (y * 1.08).min(1.0);
+            let g = y * 0.98;
+            let b = y * 0.82;
+            Color32::from_rgba_unmultiplied(
+                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+            )
+        })
+    }
+
+    /// シネマ風 Teal & Orange。影を青緑、ハイライトを橙に振る。
+    pub fn apply_teal_orange(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            let y = luminance(c);
+            // 影 (y<0.5): 青緑、ハイライト (y>=0.5): 橙 を線形補間で混ぜる
+            let t = (y - 0.5) * 2.0; // -1..+1
+            let r_shift = 18.0 * t;
+            let b_shift = -18.0 * t;
+            let g_shift = 6.0 * t.abs() * t.signum() * 0.5;
+            let out = Color32::from_rgba_unmultiplied(
+                clamp_u8(c.r() as f32 + r_shift),
+                clamp_u8(c.g() as f32 + g_shift),
+                clamp_u8(c.b() as f32 + b_shift),
+                c.a(),
+            );
+            // 少しだけ彩度を上げる (adjust_saturation も alpha を保持)
+            adjust_saturation(out, 0.12)
+        })
+    }
+
+    /// Kodak Portra 風。落ち着いた彩度、肌色を少し血色よく、緑をやや抑制。
+    pub fn apply_kodak_portra(src: &ColorImage) -> ColorImage {
+        const M: [[f32; 3]; 3] = [
+            [1.04, 0.00, -0.02],
+            [-0.01, 0.98, 0.01],
+            [-0.02, 0.02, 0.96],
+        ];
+        map_parallel(src, |c| {
+            let out = apply_matrix(c, M);
+            // やや低彩度でフィルム調 (adjust_saturation が alpha を保持)
+            let out = adjust_saturation(out, -0.05);
+            // 軽い lift (暗部を持ち上げる)、alpha は元画像から継承
+            Color32::from_rgba_unmultiplied(
+                clamp_u8(out.r() as f32 + 5.0),
+                clamp_u8(out.g() as f32 + 5.0),
+                clamp_u8(out.b() as f32 + 5.0),
+                c.a(),
+            )
+        })
+    }
+
+    /// Fuji Velvia 風。高彩度、緑と青を強調、コントラスト強め。
+    pub fn apply_fuji_velvia(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            // チャンネル別ゲイン
+            let r = c.r() as f32 * 1.02;
+            let g = c.g() as f32 * 1.08;
+            let b = c.b() as f32 * 1.10;
+            // S 字コントラスト
+            let r = s_curve(r, 0.35);
+            let g = s_curve(g, 0.35);
+            let b = s_curve(b, 0.35);
+            let out = Color32::from_rgba_unmultiplied(clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a());
+            // 強めの彩度ブースト (adjust_saturation は alpha を保持)
+            adjust_saturation(out, 0.35)
+        })
+    }
+
+    /// ブリーチバイパス (銀残し): 低彩度 × 高コントラスト。
+    pub fn apply_bleach_bypass(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            // 彩度を大幅ダウン + 強い S 字 (desat 経由で alpha が継承される)
+            let desat = adjust_saturation(c, -0.55);
+            let r = s_curve(desat.r() as f32, 0.55);
+            let g = s_curve(desat.g() as f32, 0.55);
+            let b = s_curve(desat.b() as f32, 0.55);
+            Color32::from_rgba_unmultiplied(clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a())
+        })
+    }
+
+    /// クロスプロセス風。影は青緑に振り、ハイライトは黄色に振る。高彩度。
+    pub fn apply_cross_process(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            let y = luminance(c);
+            // 影 → 青緑、ハイライト → 黄
+            let r = c.r() as f32 + if y < 0.5 { -12.0 } else { 15.0 };
+            let g = c.g() as f32 + if y < 0.5 { 6.0 } else { 10.0 };
+            let b = c.b() as f32 + if y < 0.5 { 12.0 } else { -20.0 };
+            let out = Color32::from_rgba_unmultiplied(clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a());
+            adjust_saturation(out, 0.25)
+        })
+    }
+
+    /// ビンテージ / 褪色。コントラストを抑え、シャドウを紫、ハイライトを黄に褪色。
+    pub fn apply_vintage(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            let y = luminance(c);
+            // lift/gain: 影を持ち上げ、ハイライトを落とす (コントラスト圧縮)
+            let lift = 25.0 * (1.0 - y); // 影ほど強く持ち上げる
+            let compress = -12.0 * y; // ハイライトを少し落とす
+            let r = c.r() as f32 + lift + compress + 8.0; // 赤寄りのシャドウ
+            let g = c.g() as f32 + lift * 0.6 + compress;
+            let b = c.b() as f32 + lift * 0.9 + compress - 8.0; // 黄色ハイライト
+            let out = Color32::from_rgba_unmultiplied(clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a());
+            adjust_saturation(out, -0.20) // 少し褪せる
+        })
+    }
+
+    /// 暖色調 (全体に +R/-B)。
+    pub fn apply_warm_tone(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            Color32::from_rgba_unmultiplied(
+                clamp_u8(c.r() as f32 + 14.0),
+                clamp_u8(c.g() as f32 + 4.0),
+                clamp_u8(c.b() as f32 - 14.0),
+                c.a(),
+            )
+        })
+    }
+
+    /// 寒色調 (全体に -R/+B)。
+    pub fn apply_cool_tone(src: &ColorImage) -> ColorImage {
+        map_parallel(src, |c| {
+            Color32::from_rgba_unmultiplied(
+                clamp_u8(c.r() as f32 - 14.0),
+                clamp_u8(c.g() as f32 + 0.0),
+                clamp_u8(c.b() as f32 + 14.0),
+                c.a(),
+            )
+        })
+    }
+
+    // ── アナログ写真エフェクト ──────────────────────────────────
+
+    /// ピクセル位置から決定論的な擬似乱数 (0..1)。画像内で再現性のあるノイズを作るのに使う。
+    /// integer hash (wang hash 変種) で十分ばらける。
+    #[inline]
+    fn pixel_hash(x: usize, y: usize, salt: u32) -> f32 {
+        let mut h = (x as u32).wrapping_mul(374761393)
+            ^ (y as u32).wrapping_mul(668265263)
+            ^ salt.wrapping_mul(2246822519);
+        h ^= h >> 13;
+        h = h.wrapping_mul(1274126177);
+        h ^= h >> 16;
+        (h as f32) / (u32::MAX as f32)
+    }
+
+    /// フィルムグレイン (輝度ノイズ、暗部で強め)。
+    /// 振幅 32/255 ≒ ISO 3200 相当の明瞭な粒状感。
+    pub fn apply_film_grain(src: &ColorImage) -> ColorImage {
+        map_parallel_xy(src, |x, y, c| {
+            let noise = (pixel_hash(x, y, 1) - 0.5) * 2.0; // -1..+1
+            // 暗部ほどグレインが目立つフィルム特性
+            let y_norm = luminance(c);
+            let amount = 32.0 * (1.0 - y_norm * 0.5);
+            let n = noise * amount;
+            Color32::from_rgba_unmultiplied(
+                clamp_u8(c.r() as f32 + n),
+                clamp_u8(c.g() as f32 + n),
+                clamp_u8(c.b() as f32 + n),
+                c.a(),
+            )
+        })
+    }
+
+    /// ビネット (周辺減光)。中心からの距離^2 で周辺を暗くする。
+    /// 中心 1.0 → 対角端 0.30 (−70%) のはっきりした落ち込み。
+    pub fn apply_vignette(src: &ColorImage) -> ColorImage {
+        let [w, h] = src.size;
+        let cx = (w as f32) * 0.5;
+        let cy = (h as f32) * 0.5;
+        let max_d2 = cx * cx + cy * cy;
+        map_parallel_xy(src, move |x, y, c| {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d2 = dx * dx + dy * dy;
+            let t = (d2 / max_d2).clamp(0.0, 1.0);
+            let mult = 1.0 - t * t * 0.70;
+            Color32::from_rgba_unmultiplied(
+                clamp_u8(c.r() as f32 * mult),
+                clamp_u8(c.g() as f32 * mult),
+                clamp_u8(c.b() as f32 * mult),
+                c.a(),
+            )
+        })
+    }
+
+    /// ライトリーク (左上角から暖色の光漏れ)。Screen ブレンドで明るく加算。
+    /// ピーク 0.70 でしっかり「漏れてる」感を出す。
+    pub fn apply_light_leak(src: &ColorImage) -> ColorImage {
+        let [w, h] = src.size;
+        let inv_diag = 1.0 / ((w as f32).hypot(h as f32));
+        map_parallel_xy(src, move |x, y, c| {
+            // 左上から対角で減衰 (0..1)
+            let d = ((x as f32).hypot(y as f32)) * inv_diag;
+            let leak = (1.0 - d).clamp(0.0, 1.0).powi(3) * 0.70; // ピーク 0..0.70
+            // Screen blend: 1 - (1-a)(1-b)。光源色は暖色 (240, 150, 80)
+            let lr = 240.0 / 255.0 * leak;
+            let lg = 150.0 / 255.0 * leak;
+            let lb = 80.0 / 255.0 * leak;
+            let cr = c.r() as f32 / 255.0;
+            let cg = c.g() as f32 / 255.0;
+            let cb = c.b() as f32 / 255.0;
+            let r = 1.0 - (1.0 - cr) * (1.0 - lr);
+            let g = 1.0 - (1.0 - cg) * (1.0 - lg);
+            let b = 1.0 - (1.0 - cb) * (1.0 - lb);
+            Color32::from_rgba_unmultiplied(
+                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+            )
+        })
+    }
+
+    /// ソフトフォーカス (明部にじみ)。広めのブラーと強めの glow でしっかり夢見心地に。
+    pub fn apply_soft_focus(src: &ColorImage) -> ColorImage {
+        let [w, h] = src.size;
+        let src_pixels = &src.pixels;
+        // 明部 (luminance > 0.45) を広めに拾って glow 源に
+        let glow_src: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
+            let y = luminance(*c);
+            let factor = ((y - 0.45).max(0.0) * 1.8).min(1.0);
+            [c.r() as f32 * factor, c.g() as f32 * factor, c.b() as f32 * factor]
+        }).collect();
+        // 分離可能ボックスブラー 2 回適用で擬似ガウシアン化 + 半径も拡大 (7 → 15-tap)
+        let hblur1 = separable_box_blur(&glow_src, w, h, 7, true);
+        let vblur1 = separable_box_blur(&hblur1, w, h, 7, false);
+        let hblur2 = separable_box_blur(&vblur1, w, h, 7, true);
+        let glow = separable_box_blur(&hblur2, w, h, 7, false);
+        // Screen blend を強めに
+        const GLOW_STRENGTH: f32 = 0.80;
+        let mut out = vec![Color32::BLACK; w * h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let c = src_pixels[y * w + x];
+                let [gr, gg, gb] = glow[y * w + x];
+                let cr = c.r() as f32 / 255.0;
+                let cg = c.g() as f32 / 255.0;
+                let cb = c.b() as f32 / 255.0;
+                let lr = (gr / 255.0).clamp(0.0, 1.0) * GLOW_STRENGTH;
+                let lg = (gg / 255.0).clamp(0.0, 1.0) * GLOW_STRENGTH;
+                let lb = (gb / 255.0).clamp(0.0, 1.0) * GLOW_STRENGTH;
+                let r = 1.0 - (1.0 - cr) * (1.0 - lr);
+                let g = 1.0 - (1.0 - cg) * (1.0 - lg);
+                let b = 1.0 - (1.0 - cb) * (1.0 - lb);
+                row[x] = Color32::from_rgba_unmultiplied(
+                    (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+                );
+            }
+        });
+        ColorImage::new([w, h], out)
+    }
+
+    /// 分離可能ボックスブラー。`horizontal = true` で水平方向、false で垂直方向。
+    /// 入力は [f32; 3] 配列。radius は片側の画素数 (例: 5 なら 11 タップ)。
+    fn separable_box_blur(src: &[[f32; 3]], w: usize, h: usize, radius: usize, horizontal: bool) -> Vec<[f32; 3]> {
+        let mut out = vec![[0.0_f32; 3]; w * h];
+        let window = (radius * 2 + 1) as f32;
+        if horizontal {
+            out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                let base = y * w;
+                for x in 0..w {
+                    let x0 = x.saturating_sub(radius);
+                    let x1 = (x + radius + 1).min(w);
+                    let mut sum = [0.0_f32; 3];
+                    let mut count = 0.0_f32;
+                    for xi in x0..x1 {
+                        let p = src[base + xi];
+                        sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2];
+                        count += 1.0;
+                    }
+                    // 境界で count 不足を avg 補正 (window 固定だと端で暗くなる)
+                    let c = if count > 0.0 { count } else { window };
+                    row[x] = [sum[0] / c, sum[1] / c, sum[2] / c];
+                }
+            });
+        } else {
+            out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                let y0 = y.saturating_sub(radius);
+                let y1 = (y + radius + 1).min(h);
+                for x in 0..w {
+                    let mut sum = [0.0_f32; 3];
+                    let mut count = 0.0_f32;
+                    for yi in y0..y1 {
+                        let p = src[yi * w + x];
+                        sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2];
+                        count += 1.0;
+                    }
+                    let c = if count > 0.0 { count } else { window };
+                    row[x] = [sum[0] / c, sum[1] / c, sum[2] / c];
+                }
+            });
+        }
+        out
+    }
+
+    // ── 絵画・描画風 ────────────────────────────────────────────
+
+    /// ハーフトーン (漫画風)。輝度をグレー化し、6×6 セルごとのドットで濃淡表現。
+    pub fn apply_halftone(src: &ColorImage) -> ColorImage {
+        const CELL: usize = 6;
+        let [w, h] = src.size;
+        let src_pixels = &src.pixels;
+        // セル平均輝度を前計算
+        let cells_w = w.div_ceil(CELL);
+        let cells_h = h.div_ceil(CELL);
+        let mut cell_lum = vec![0.0_f32; cells_w * cells_h];
+        for cy in 0..cells_h {
+            for cx in 0..cells_w {
+                let y0 = cy * CELL;
+                let y1 = ((cy + 1) * CELL).min(h);
+                let x0 = cx * CELL;
+                let x1 = ((cx + 1) * CELL).min(w);
+                let mut sum = 0.0_f32;
+                let mut count = 0.0_f32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        sum += luminance(src_pixels[y * w + x]);
+                        count += 1.0;
+                    }
+                }
+                cell_lum[cy * cells_w + cx] = if count > 0.0 { sum / count } else { 1.0 };
+            }
+        }
+        map_parallel_xy(src, move |x, y, c| {
+            let cx = x / CELL;
+            let cy = y / CELL;
+            let lum = cell_lum[cy * cells_w + cx];
+            // セル中心からの距離でドット半径を決める
+            let local_x = (x % CELL) as f32 - (CELL as f32 / 2.0) + 0.5;
+            let local_y = (y % CELL) as f32 - (CELL as f32 / 2.0) + 0.5;
+            let d = (local_x * local_x + local_y * local_y).sqrt();
+            // 暗いセル → 大きなドット、明るいセル → 小さなドット
+            let max_r = (CELL as f32) * 0.55;
+            let r_needed = (1.0 - lum) * max_r;
+            let v = if d < r_needed { 0 } else { 255 };
+            Color32::from_rgba_unmultiplied(v, v, v, c.a())
+        })
+    }
+
+    /// オイルペイント風 (Kuwahara フィルタ)。
+    /// 近傍を 4 つの象限に分け、輝度分散最小の領域の平均色を採る。
+    /// 半径 5 (11×11) にして塗り重ね感を強める。処理コストはピクセル毎 ~120 ops だが rayon で吸収。
+    pub fn apply_oil_paint(src: &ColorImage) -> ColorImage {
+        const R: isize = 5;
+        let [w, h] = src.size;
+        let src_pixels = &src.pixels;
+        let iw = w as isize;
+        let ih = h as isize;
+        map_parallel_xy(src, move |x, y, c| {
+            let cx = x as isize;
+            let cy = y as isize;
+            // 4 つの象限それぞれで平均と分散を計算 (輝度ベース)
+            let mut best_mean = [0.0_f32; 3];
+            let mut best_var = f32::MAX;
+            let quads: [(isize, isize, isize, isize); 4] = [
+                (-R, 0, -R, 0), // 左上
+                (0, R, -R, 0),  // 右上
+                (-R, 0, 0, R),  // 左下
+                (0, R, 0, R),   // 右下
+            ];
+            for &(dx0, dx1, dy0, dy1) in &quads {
+                let mut sum = [0.0_f32; 3];
+                let mut sum_sq_lum = 0.0_f32;
+                let mut sum_lum = 0.0_f32;
+                let mut count = 0.0_f32;
+                for dy in dy0..=dy1 {
+                    let ny = cy + dy;
+                    if ny < 0 || ny >= ih { continue; }
+                    let row = ny as usize * w;
+                    for dx in dx0..=dx1 {
+                        let nx = cx + dx;
+                        if nx < 0 || nx >= iw { continue; }
+                        let p = src_pixels[row + nx as usize];
+                        let r = p.r() as f32;
+                        let g = p.g() as f32;
+                        let b = p.b() as f32;
+                        sum[0] += r; sum[1] += g; sum[2] += b;
+                        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                        sum_lum += lum;
+                        sum_sq_lum += lum * lum;
+                        count += 1.0;
+                    }
+                }
+                if count > 0.0 {
+                    let mean_lum = sum_lum / count;
+                    let var = (sum_sq_lum / count - mean_lum * mean_lum).max(0.0);
+                    if var < best_var {
+                        best_var = var;
+                        best_mean = [sum[0] / count, sum[1] / count, sum[2] / count];
+                    }
+                }
+            }
+            // alpha は中心ピクセルから継承 (Kuwahara は選択的平均なので alpha も単純継承が自然)
+            Color32::from_rgba_unmultiplied(
+                clamp_u8(best_mean[0]), clamp_u8(best_mean[1]), clamp_u8(best_mean[2]), c.a(),
+            )
+        })
+    }
+
+    /// スケッチ風 (Sobel エッジ検出 → 反転グレー)。
+    pub fn apply_sketch(src: &ColorImage) -> ColorImage {
+        let [w, h] = src.size;
+        let src_pixels = &src.pixels;
+        // 輝度マップ前計算
+        let lum: Vec<f32> = src_pixels.par_iter().map(|c| luminance(*c) * 255.0).collect();
+        let iw = w as isize;
+        let ih = h as isize;
+        let sample = |x: isize, y: isize| -> f32 {
+            let x = x.clamp(0, iw - 1) as usize;
+            let y = y.clamp(0, ih - 1) as usize;
+            lum[y * w + x]
+        };
+        map_parallel_xy(src, move |x, y, c| {
+            let xi = x as isize;
+            let yi = y as isize;
+            // Sobel 3×3 勾配
+            let gx = -sample(xi - 1, yi - 1) + sample(xi + 1, yi - 1)
+                    -2.0 * sample(xi - 1, yi) + 2.0 * sample(xi + 1, yi)
+                    -sample(xi - 1, yi + 1) + sample(xi + 1, yi + 1);
+            let gy = -sample(xi - 1, yi - 1) - 2.0 * sample(xi, yi - 1) - sample(xi + 1, yi - 1)
+                    +sample(xi - 1, yi + 1) + 2.0 * sample(xi, yi + 1) + sample(xi + 1, yi + 1);
+            let mag = (gx * gx + gy * gy).sqrt();
+            // 閾値を強めにかけて紙の上の鉛筆風に
+            let intensity = (mag * 0.6).min(255.0);
+            // エッジ = 黒、非エッジ = 白 (反転)
+            let v = 255 - intensity as u8;
+            Color32::from_rgba_unmultiplied(v, v, v, c.a())
+        })
+    }
+
+    // ── 実用: シャープ化 ────────────────────────────────────────
+
+    /// アンシャープマスク: 元画像 − ガウシアンブラー の差分を重み付きで加算。
+    /// amount 1.2, 半径 3 (7-tap × 2 回) でしっかり輪郭補強。
+    pub fn apply_sharpen(src: &ColorImage) -> ColorImage {
+        let [w, h] = src.size;
+        let src_pixels = &src.pixels;
+        // f32 RGB に変換 → ブラー
+        let rgb: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
+            [c.r() as f32, c.g() as f32, c.b() as f32]
+        }).collect();
+        // 半径 3 のボックスブラーを 2 回重ねて擬似ガウシアン化
+        let hblur1 = separable_box_blur(&rgb, w, h, 3, true);
+        let vblur1 = separable_box_blur(&hblur1, w, h, 3, false);
+        let hblur2 = separable_box_blur(&vblur1, w, h, 3, true);
+        let blur = separable_box_blur(&hblur2, w, h, 3, false);
+        const AMOUNT: f32 = 1.2;
+        let mut out = vec![Color32::BLACK; w * h];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let idx = y * w + x;
+                let orig = rgb[idx];
+                let blurred = blur[idx];
+                let r = orig[0] + AMOUNT * (orig[0] - blurred[0]);
+                let g = orig[1] + AMOUNT * (orig[1] - blurred[1]);
+                let b = orig[2] + AMOUNT * (orig[2] - blurred[2]);
+                row[x] = Color32::from_rgba_unmultiplied(
+                    clamp_u8(r), clamp_u8(g), clamp_u8(b), src_pixels[idx].a(),
+                );
+            }
+        });
+        ColorImage::new([w, h], out)
     }
 }
 
@@ -787,6 +1413,97 @@ mod tests {
             let decoded: PostFilter = serde_json::from_str(&json).unwrap();
             assert_eq!(f, decoded, "round-trip failed for {:?}", f);
         }
+    }
+
+    #[test]
+    fn photo_filters_preserve_size() {
+        // 写真系フィルタはすべてソース解像度を維持する (CRT のようなアップスケールなし)
+        let src = make_test_image(32, 32);
+        for &f in &[
+            PostFilter::Sepia, PostFilter::MonoNeutral, PostFilter::MonoCool,
+            PostFilter::MonoWarm, PostFilter::TealOrange, PostFilter::KodakPortra,
+            PostFilter::FujiVelvia, PostFilter::BleachBypass, PostFilter::CrossProcess,
+            PostFilter::Vintage, PostFilter::WarmTone, PostFilter::CoolTone,
+            PostFilter::FilmGrain, PostFilter::Vignette, PostFilter::LightLeak,
+            PostFilter::SoftFocus, PostFilter::Halftone, PostFilter::OilPaint,
+            PostFilter::Sketch, PostFilter::Sharpen,
+        ] {
+            let out = apply(&src, f);
+            assert_eq!(out.size, [32, 32], "{:?} changed size", f);
+            assert_eq!(out.pixels.len(), 32 * 32);
+        }
+    }
+
+    #[test]
+    fn mono_neutral_is_grayscale() {
+        let src = make_test_image(16, 16);
+        let out = apply(&src, PostFilter::MonoNeutral);
+        for p in &out.pixels {
+            assert_eq!(p.r(), p.g(), "R != G in MonoNeutral");
+            assert_eq!(p.g(), p.b(), "G != B in MonoNeutral");
+        }
+    }
+
+    #[test]
+    fn sketch_is_grayscale() {
+        let src = make_test_image(16, 16);
+        let out = apply(&src, PostFilter::Sketch);
+        for p in &out.pixels {
+            assert_eq!(p.r(), p.g());
+            assert_eq!(p.g(), p.b());
+        }
+    }
+
+    #[test]
+    fn halftone_is_binary_grayscale() {
+        let src = make_test_image(16, 16);
+        let out = apply(&src, PostFilter::Halftone);
+        // ハーフトーンは 0 / 255 の 2 階調グレー
+        for p in &out.pixels {
+            assert_eq!(p.r(), p.g());
+            assert_eq!(p.g(), p.b());
+            assert!(p.r() == 0 || p.r() == 255, "halftone produced grey value {}", p.r());
+        }
+    }
+
+    #[test]
+    fn filters_preserve_alpha_channel() {
+        // 左半分が完全透過 (alpha=0)、右半分が不透明 (alpha=255) の画像。
+        // 全フィルタ回帰テスト: from_rgb は alpha=255 を強制するので Codex が検出した退行を防ぐ。
+        // CRT 系は bilinear で補間するが、十分広い領域なら中央部の alpha=0/255 は保存される。
+        let w = 32_usize;
+        let h = 32_usize;
+        let mut pixels = Vec::with_capacity(w * h);
+        for _y in 0..h {
+            for x in 0..w {
+                let a = if x < w / 2 { 0 } else { 255 };
+                pixels.push(Color32::from_rgba_unmultiplied(180, 100, 60, a));
+            }
+        }
+        let src = ColorImage::new([w, h], pixels);
+        for &f in PostFilter::ALL {
+            if matches!(f, PostFilter::None | PostFilter::Nearest) {
+                continue; // これらは clone なので自明
+            }
+            let out = apply(&src, f);
+            let has_transparent = out.pixels.iter().any(|p| p.a() < 10);
+            let has_opaque = out.pixels.iter().any(|p| p.a() > 245);
+            assert!(
+                has_transparent && has_opaque,
+                "{:?} failed alpha preservation (has_transparent={}, has_opaque={})",
+                f, has_transparent, has_opaque,
+            );
+        }
+    }
+
+    #[test]
+    fn vignette_center_brighter_than_corner() {
+        // 中央は暗化が最小、対角端は最大暗化
+        let src = ColorImage::new([100, 100], vec![Color32::WHITE; 100 * 100]);
+        let out = apply(&src, PostFilter::Vignette);
+        let center = out.pixels[50 * 100 + 50];
+        let corner = out.pixels[0];
+        assert!(center.r() > corner.r(), "vignette should darken corners more than center");
     }
 
     #[test]

@@ -515,7 +515,7 @@ fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new("フルスクリーンで Space キーまたは ▶ ボタンで開始")
+        egui::RichText::new("フルスクリーンで S キーまたは ▶ ボタンで開始 / 停止")
             .size(11.0)
             .color(egui::Color32::from_gray(140)),
     );
