@@ -6,12 +6,9 @@ use std::time::Instant;
 
 use eframe::egui;
 
-/// Shell API 呼び出しの診断情報。ログ調査用に細かく分ける。
-#[derive(Debug)]
+/// Shell API 呼び出しの診断情報。呼び出し側のログに流し込むための構造体。
 pub struct VideoThumbDiag {
-    /// 要求したサイズ (px, 正方形の辺)
-    pub shell_size: i32,
-    /// GetImage の HRESULT。Ok=0、エラー時は負値 (下位 32bit を符号なしで見る)
+    /// GetImage の HRESULT (Ok=0、エラー時は負値)
     pub hresult: i32,
     /// GetImage 呼び出しの所要時間 (ms)
     pub get_image_ms: u32,
@@ -21,33 +18,35 @@ pub struct VideoThumbDiag {
     pub avg_rgb: Option<(u8, u8, u8)>,
     /// 取得できた場合のピクセル R/G/B の最大 - 最小。< 10 は「ほぼ単色」
     pub span_rgb: Option<(u8, u8, u8)>,
-    /// どの段階で失敗したか
-    pub stage: VideoThumbStage,
+    /// 失敗した場合だけ Some。Some のときは結果の ColorImage は None。
+    pub fail_stage: Option<VideoThumbFailStage>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoThumbStage {
-    Success,
-    CreateItemFail,
-    CastFail,
-    GetImageFail,
-    GetObjectFail,
-    GetDibitsFail,
-    InvalidBitmap,
-}
-
-impl VideoThumbStage {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "ok",
-            Self::CreateItemFail => "SHCreateItem-fail",
-            Self::CastFail => "IShellItemImageFactory-cast-fail",
-            Self::GetImageFail => "GetImage-fail",
-            Self::GetObjectFail => "GetObject-fail",
-            Self::GetDibitsFail => "GetDIBits-fail",
-            Self::InvalidBitmap => "invalid-bitmap-size",
+impl VideoThumbDiag {
+    pub fn stage_label(&self) -> &'static str {
+        match self.fail_stage {
+            None => "ok",
+            Some(VideoThumbFailStage::CreateItem) => "SHCreateItem-fail",
+            Some(VideoThumbFailStage::Cast) => "IShellItemImageFactory-cast-fail",
+            Some(VideoThumbFailStage::GetImage) => "GetImage-fail",
+            Some(VideoThumbFailStage::GetObject) => "GetObject-fail",
+            Some(VideoThumbFailStage::GetDibits) => "GetDIBits-fail",
+            Some(VideoThumbFailStage::InvalidBitmap) => "invalid-bitmap-size",
         }
     }
+
+    pub fn hresult_hex(&self) -> String {
+        format!("0x{:08x}", self.hresult as u32)
+    }
+}
+
+pub enum VideoThumbFailStage {
+    CreateItem,
+    Cast,
+    GetImage,
+    GetObject,
+    GetDibits,
+    InvalidBitmap,
 }
 
 /// 動画ファイルから Windows Shell API でサムネイルを取得する。
@@ -72,13 +71,12 @@ pub fn get_video_thumbnail(
     use windows::core::PCWSTR;
 
     let mut diag = VideoThumbDiag {
-        shell_size,
         hresult: 0,
         get_image_ms: 0,
         dims: None,
         avg_rgb: None,
         span_rgb: None,
-        stage: VideoThumbStage::Success,
+        fail_stage: None,
     };
 
     unsafe {
@@ -91,7 +89,7 @@ pub fn get_video_thumbnail(
                 Ok(it) => it,
                 Err(e) => {
                     diag.hresult = e.code().0;
-                    diag.stage = VideoThumbStage::CreateItemFail;
+                    diag.fail_stage = Some(VideoThumbFailStage::CreateItem);
                     return (None, diag);
                 }
             };
@@ -100,7 +98,7 @@ pub fn get_video_thumbnail(
             Ok(f) => f,
             Err(e) => {
                 diag.hresult = e.code().0;
-                diag.stage = VideoThumbStage::CastFail;
+                diag.fail_stage = Some(VideoThumbFailStage::Cast);
                 return (None, diag);
             }
         };
@@ -117,7 +115,7 @@ pub fn get_video_thumbnail(
             Err(e) => {
                 diag.get_image_ms = t0.elapsed().as_millis() as u32;
                 diag.hresult = e.code().0;
-                diag.stage = VideoThumbStage::GetImageFail;
+                diag.fail_stage = Some(VideoThumbFailStage::GetImage);
                 return (None, diag);
             }
         };
@@ -130,13 +128,13 @@ pub fn get_video_thumbnail(
         );
         if bm_size == 0 {
             let _ = DeleteObject(hbmp.into());
-            diag.stage = VideoThumbStage::GetObjectFail;
+            diag.fail_stage = Some(VideoThumbFailStage::GetObject);
             return (None, diag);
         }
         if bm.bmWidth <= 0 || bm.bmHeight == 0 {
             let _ = DeleteObject(hbmp.into());
             diag.dims = Some((bm.bmWidth, bm.bmHeight));
-            diag.stage = VideoThumbStage::InvalidBitmap;
+            diag.fail_stage = Some(VideoThumbFailStage::InvalidBitmap);
             return (None, diag);
         }
         let width = bm.bmWidth;
@@ -175,7 +173,7 @@ pub fn get_video_thumbnail(
         let _ = DeleteObject(hbmp.into());
 
         if rows == 0 {
-            diag.stage = VideoThumbStage::GetDibitsFail;
+            diag.fail_stage = Some(VideoThumbFailStage::GetDibits);
             return (None, diag);
         }
 

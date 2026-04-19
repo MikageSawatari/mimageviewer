@@ -2218,6 +2218,14 @@ impl App {
         std::thread::spawn(move || {
             use std::time::{Duration, Instant};
 
+            struct PendingVideo {
+                idx: usize,
+                path: PathBuf,
+                file_size: u64,
+                retries: u32,
+                next_attempt: Instant,
+            }
+
             // Shell がまだサムネ抽出中の動画に対して `SIIGBF_THUMBNAILONLY` は
             // エラーを返す (= ここで None)。バックオフしながらリトライすると、
             // Windows のバックグラウンド抽出完了後に本物のサムネが取れる。
@@ -2228,7 +2236,7 @@ impl App {
             // そこで以下の 2 段構えにする:
             //
             // 1. 連続失敗は 8 回 (最大 25.5 秒) までは指数バックオフで待つ。
-            // 2. **他の動画が 1 件でも成功したら**、同じフォルダ内の全残アイテムの
+            // 2. 他の動画が 1 件でも成功したら、同じフォルダ内の全残アイテムの
             //    retries を 0 にリセットし next_attempt を now に戻す。Shell が
             //    前進している限り何度でもリトライする (= 他動画が成功し続ける限り
             //    実質無制限)。
@@ -2248,20 +2256,23 @@ impl App {
                 display_px,
             ));
 
-            // (idx, path, file_size, consec_retries, next_attempt)
             let now0 = Instant::now();
-            let mut remaining: Vec<(usize, PathBuf, u64, u32, Instant)> = video_items
+            let mut remaining: Vec<PendingVideo> = video_items
                 .into_iter()
-                .map(|(i, p, s)| (i, p, s, 0u32, now0))
+                .map(|(idx, path, file_size)| PendingVideo {
+                    idx,
+                    path,
+                    file_size,
+                    retries: 0,
+                    next_attempt: now0,
+                })
                 .collect();
-            let mut had_success = false;
             let mut success_count = 0u32;
             let mut fail_count = 0u32;
 
             while !remaining.is_empty() {
                 if cancel.load(Ordering::Relaxed) { break; }
 
-                // 可視範囲に最も近い「いま処理可能な」動画を選ぶ。
                 // worker_priority_key と同じロジックで可視アイテムを tier 0、
                 // その他を距離順に並べる。next_attempt が未来のアイテムは除外。
                 let now = Instant::now();
@@ -2270,19 +2281,19 @@ impl App {
                 let best_pos = remaining
                     .iter()
                     .enumerate()
-                    .filter(|(_, (_, _, _, _, next))| *next <= now)
-                    .min_by_key(|(_, (idx, _, _, _, _))| {
-                        let priority = *idx >= vis && *idx < ve;
-                        crate::thumb_loader::worker_priority_key(priority, *idx, vis, ve)
+                    .filter(|(_, v)| v.next_attempt <= now)
+                    .min_by_key(|(_, v)| {
+                        let priority = v.idx >= vis && v.idx < ve;
+                        crate::thumb_loader::worker_priority_key(priority, v.idx, vis, ve)
                     })
                     .map(|(i, _)| i);
 
                 let Some(best_pos) = best_pos else {
                     // 全件リトライ待機中: 最も近い next_attempt まで寝る。
-                    // ただしキャンセル応答のため 200ms 刻みで区切る。
+                    // キャンセル応答のため 200ms 刻みで区切る。
                     let earliest = remaining
                         .iter()
-                        .map(|(_, _, _, _, n)| *n)
+                        .map(|v| v.next_attempt)
                         .min()
                         .expect("remaining is non-empty");
                     let delay = earliest
@@ -2291,7 +2302,8 @@ impl App {
                     std::thread::sleep(delay);
                     continue;
                 };
-                let (idx, path, file_size, retries, _) = remaining.swap_remove(best_pos);
+                let PendingVideo { idx, path, file_size, retries, .. } =
+                    remaining.swap_remove(best_pos);
                 let fname = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -2299,7 +2311,6 @@ impl App {
                     .to_string();
                 let call_t0 = Instant::now();
 
-                // 同名画像がある場合はそれをサムネイルとして使用
                 let stem = stem_lower(&path);
                 let (ci, source_tag) = if let Some(img_path) = thumb_overrides.get(&stem) {
                     if retries == 0 {
@@ -2315,27 +2326,31 @@ impl App {
                 } else {
                     let (img, diag) =
                         crate::video_thumb::get_video_thumbnail(&path, thumb_size);
-                    // 毎回の Shell 呼び出し結果を診断ログに残す。
-                    let avg = diag
-                        .avg_rgb
-                        .map(|(r, g, b)| format!("{r},{g},{b}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    let span = diag
-                        .span_rgb
-                        .map(|(r, g, b)| format!("{r},{g},{b}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    let dims = diag
-                        .dims
-                        .map(|(w, h)| format!("{w}x{h}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    crate::logger::log(format!(
-                        "  video shell: idx={idx} retry={retries} req_sz={} \
-                         stage={} hr=0x{:08x} get_ms={} dims={dims} avg_rgb=[{avg}] span_rgb=[{span}]  {fname}",
-                        diag.shell_size,
-                        diag.stage.as_str(),
-                        diag.hresult as u32,
-                        diag.get_image_ms,
-                    ));
+                    // 失敗ケースだけ Shell の生データをログする (毎回出すと動画多数の
+                    // フォルダで mimageviewer.log が肥大するため)。成功時は下の
+                    // 最終 OK 行に dims を載せる。
+                    if img.is_none() {
+                        crate::logger::log(format!(
+                            "  video shell FAIL: idx={idx} retry={retries} req_sz={thumb_size} \
+                             stage={} hr={} get_ms={}  {fname}",
+                            diag.stage_label(),
+                            diag.hresult_hex(),
+                            diag.get_image_ms,
+                        ));
+                    } else if let (Some((w, h)), Some(avg), Some(span)) =
+                        (diag.dims, diag.avg_rgb, diag.span_rgb)
+                    {
+                        // 成功時は avg/span が極端 (真っ黒疑い) のときだけ注記する。
+                        let avg_max = avg.0.max(avg.1).max(avg.2);
+                        let span_max = span.0.max(span.1).max(span.2);
+                        if avg_max < 16 || span_max < 10 {
+                            crate::logger::log(format!(
+                                "  video shell suspicious: idx={idx} dims={w}x{h} \
+                                 avg_rgb=[{},{},{}] span_rgb=[{},{},{}]  {fname}",
+                                avg.0, avg.1, avg.2, span.0, span.1, span.2,
+                            ));
+                        }
+                    }
                     (img, "shell")
                 };
                 let call_ms = call_t0.elapsed().as_millis();
@@ -2353,32 +2368,29 @@ impl App {
                         backoff.as_millis(),
                         remaining.len(),
                     ));
-                    remaining.push((idx, path, file_size, retries + 1, next));
+                    remaining.push(PendingVideo {
+                        idx,
+                        path,
+                        file_size,
+                        retries: retries + 1,
+                        next_attempt: next,
+                    });
                     continue;
                 }
 
                 if ci.is_some() {
                     // 成功: 残アイテムの retries をリセットし即時再試行を許可する。
                     // Shell が反応している証拠 = 他のアイテムも抽出が進んでいる可能性が高い。
-                    let reset_count = remaining.iter().filter(|(_, _, _, r, _)| *r > 0).count();
+                    let reset_count = remaining.iter().filter(|v| v.retries > 0).count();
                     if reset_count > 0 {
                         crate::logger::log(format!(
                             "  video thumb progress: reset {reset_count} retry counters  (trigger idx={idx})"
                         ));
-                        for r in remaining.iter_mut() {
-                            r.3 = 0;
-                            r.4 = now;
+                        for v in remaining.iter_mut() {
+                            v.retries = 0;
+                            v.next_attempt = now;
                         }
                     }
-                    had_success = true;
-                } else if had_success {
-                    // 過去に成功実績があるのに今回は MAX に到達。
-                    // Shell がこのアイテムだけずっと未抽出を返しているので、もう一度長めに待つ。
-                    // (上で continue せずここに来たということは MAX_CONSEC_RETRIES 到達済み)
-                    crate::logger::log(format!(
-                        "  video thumb give-up-soft: idx={idx} after {} retries  {fname}",
-                        retries
-                    ));
                 }
 
                 crate::logger::log(format!(
@@ -2387,7 +2399,6 @@ impl App {
                     if ci.is_some() { "OK" } else { "FAIL-final" },
                     remaining.len(),
                 ));
-                // 統計: 動画件数 + サイズを記録 (成功のみ)
                 if ci.is_some() {
                     success_count += 1;
                     if let Ok(mut s) = stats.lock() {
@@ -2493,13 +2504,14 @@ impl App {
                 continue;
             }
 
-            // 動画は「最初に作った動画サムネは以後ずっと保持する」設計
-                // (update_keep_range_and_requests は Video を Evicted 化しない、
-                // make_load_request は Video を返さない)。
-                // そのため動画は keep_range 外でも Evicted に落としてはいけない。
-                // 下の分岐で常に in_range 扱いする。
-                let is_video = matches!(self.items.get(i), Some(GridItem::Video(_)));
-                let treat_as_in_range = in_keep_range || is_video;
+            // 動画は「最初に作った動画サムネは以後ずっと保持する」設計 —
+            // update_keep_range_and_requests は Video を Evicted 化しないし
+            // make_load_request も Video に None を返すため、一度 Evicted に
+            // 落とすと再リクエストされず永遠に復帰しない。下の分岐で keep_range
+            // 外でも常に in_range 扱いにすることで、out-of-range 受信でも
+            // 必ずテクスチャ化する。
+            let is_video = matches!(self.items.get(i), Some(GridItem::Video(_)));
+            let treat_as_in_range = in_keep_range || is_video;
 
             match color_image_opt {
                 Some(color_image) => {
