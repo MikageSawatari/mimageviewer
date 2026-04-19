@@ -1048,10 +1048,12 @@ mod photo {
     pub fn apply_soft_focus(src: &ColorImage) -> ColorImage {
         let [w, h] = src.size;
         let src_pixels = &src.pixels;
-        // 明部 (luminance > 0.45) を広めに拾って glow 源に
+        // 明部 (luminance > 0.45) を広めに拾って glow 源に。alpha で pre-multiply し、
+        // 透明ピクセルの hidden RGB がブラーに漏れ出さないようにする。
         let glow_src: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
+            let a_norm = c.a() as f32 / 255.0;
             let y = luminance(*c);
-            let factor = ((y - 0.45).max(0.0) * 1.8).min(1.0);
+            let factor = ((y - 0.45).max(0.0) * 1.8).min(1.0) * a_norm;
             [c.r() as f32 * factor, c.g() as f32 * factor, c.b() as f32 * factor]
         }).collect();
         // 分離可能ボックスブラー 2 回適用で擬似ガウシアン化 + 半径も拡大 (7 → 15-tap)
@@ -1133,7 +1135,8 @@ mod photo {
         const CELL: usize = 6;
         let [w, h] = src.size;
         let src_pixels = &src.pixels;
-        // セル平均輝度を前計算
+        // セル平均輝度を前計算。透明ピクセル (hidden RGB 持ち得る) は除外して、
+        // 透明領域境界で誤った濃度にならないようにする。
         let cells_w = w.div_ceil(CELL);
         let cells_h = h.div_ceil(CELL);
         let mut cell_lum = vec![0.0_f32; cells_w * cells_h];
@@ -1147,10 +1150,13 @@ mod photo {
                 let mut count = 0.0_f32;
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        sum += luminance(src_pixels[y * w + x]);
+                        let p = src_pixels[y * w + x];
+                        if p.a() == 0 { continue; }
+                        sum += luminance(p);
                         count += 1.0;
                     }
                 }
+                // 全て透明のセルは「白 (ドットなし)」扱い
                 cell_lum[cy * cells_w + cx] = if count > 0.0 { sum / count } else { 1.0 };
             }
         }
@@ -1204,6 +1210,8 @@ mod photo {
                         let nx = cx + dx;
                         if nx < 0 || nx >= iw { continue; }
                         let p = src_pixels[row + nx as usize];
+                        // 完全透明ピクセルは hidden RGB を持ち得るため統計から除外する
+                        if p.a() == 0 { continue; }
                         let r = p.r() as f32;
                         let g = p.g() as f32;
                         let b = p.b() as f32;
@@ -1234,8 +1242,13 @@ mod photo {
     pub fn apply_sketch(src: &ColorImage) -> ColorImage {
         let [w, h] = src.size;
         let src_pixels = &src.pixels;
-        // 輝度マップ前計算
-        let lum: Vec<f32> = src_pixels.par_iter().map(|c| luminance(*c) * 255.0).collect();
+        // 輝度マップ前計算。透明ピクセルは hidden RGB を持ち得るため alpha で pre-multiply し、
+        // Sobel の差分計算に漏れ込むのを防ぐ。alpha=0 の点は luminance=0 となり、
+        // 透明境界には alpha 差分由来のエッジが出る (これは意図通りの輪郭線)。
+        let lum: Vec<f32> = src_pixels.par_iter().map(|c| {
+            let a_norm = c.a() as f32 / 255.0;
+            luminance(*c) * 255.0 * a_norm
+        }).collect();
         let iw = w as isize;
         let ih = h as isize;
         let sample = |x: isize, y: isize| -> f32 {
@@ -1265,30 +1278,53 @@ mod photo {
 
     /// アンシャープマスク: 元画像 − ガウシアンブラー の差分を重み付きで加算。
     /// amount 1.2, 半径 3 (7-tap × 2 回) でしっかり輪郭補強。
+    ///
+    /// 透明ピクセルの hidden RGB が近傍ブラーに漏れないよう、RGB を alpha で pre-multiply
+    /// してブラーし、alpha ブラーで un-normalize する (alpha-weighted blur)。
     pub fn apply_sharpen(src: &ColorImage) -> ColorImage {
         let [w, h] = src.size;
         let src_pixels = &src.pixels;
-        // f32 RGB に変換 → ブラー
-        let rgb: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
-            [c.r() as f32, c.g() as f32, c.b() as f32]
+        // f32 RGB (pre-multiplied) と alpha マップ (3 chan にパック) を並行作成
+        let rgb_premul: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
+            let a = c.a() as f32 / 255.0;
+            [c.r() as f32 * a, c.g() as f32 * a, c.b() as f32 * a]
         }).collect();
+        let alpha_map: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
+            let a = c.a() as f32 / 255.0;
+            [a, a, a]
+        }).collect();
+
         // 半径 3 のボックスブラーを 2 回重ねて擬似ガウシアン化
-        let hblur1 = separable_box_blur(&rgb, w, h, 3, true);
-        let vblur1 = separable_box_blur(&hblur1, w, h, 3, false);
-        let hblur2 = separable_box_blur(&vblur1, w, h, 3, true);
-        let blur = separable_box_blur(&hblur2, w, h, 3, false);
+        let blur_rgb_premul = {
+            let h1 = separable_box_blur(&rgb_premul, w, h, 3, true);
+            let v1 = separable_box_blur(&h1, w, h, 3, false);
+            let h2 = separable_box_blur(&v1, w, h, 3, true);
+            separable_box_blur(&h2, w, h, 3, false)
+        };
+        let blur_alpha = {
+            let h1 = separable_box_blur(&alpha_map, w, h, 3, true);
+            let v1 = separable_box_blur(&h1, w, h, 3, false);
+            let h2 = separable_box_blur(&v1, w, h, 3, true);
+            separable_box_blur(&h2, w, h, 3, false)
+        };
+
         const AMOUNT: f32 = 1.2;
         let mut out = vec![Color32::BLACK; w * h];
         out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for x in 0..w {
                 let idx = y * w + x;
-                let orig = rgb[idx];
-                let blurred = blur[idx];
-                let r = orig[0] + AMOUNT * (orig[0] - blurred[0]);
-                let g = orig[1] + AMOUNT * (orig[1] - blurred[1]);
-                let b = orig[2] + AMOUNT * (orig[2] - blurred[2]);
+                let c = src_pixels[idx];
+                // 透明部分ではシャープ化を適用せず元色をそのまま返す
+                let blur_a = blur_alpha[idx][0].max(1e-6);
+                // RGB ブラーを alpha 総重みで割って実効ブラー色を得る
+                let blur_r = blur_rgb_premul[idx][0] / blur_a;
+                let blur_g = blur_rgb_premul[idx][1] / blur_a;
+                let blur_b = blur_rgb_premul[idx][2] / blur_a;
+                let r = c.r() as f32 + AMOUNT * (c.r() as f32 - blur_r);
+                let g = c.g() as f32 + AMOUNT * (c.g() as f32 - blur_g);
+                let b = c.b() as f32 + AMOUNT * (c.b() as f32 - blur_b);
                 row[x] = Color32::from_rgba_unmultiplied(
-                    clamp_u8(r), clamp_u8(g), clamp_u8(b), src_pixels[idx].a(),
+                    clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a(),
                 );
             }
         });
@@ -1492,6 +1528,58 @@ mod tests {
                 has_transparent && has_opaque,
                 "{:?} failed alpha preservation (has_transparent={}, has_opaque={})",
                 f, has_transparent, has_opaque,
+            );
+        }
+    }
+
+    #[test]
+    fn neighbor_filters_ignore_transparent_hidden_rgb() {
+        // 左半分: alpha=0, RGB=(255,255,255) のハイコントラスト hidden 値
+        // 右半分: alpha=255, RGB=(0,0,0)
+        // neighbor 系フィルタが左側の hidden 白を右側の黒に漏らさないこと。
+        //
+        // 「透明側が存在しなかった場合と同じ出力になるか」を検証する: 右半分だけの
+        // 純黒画像にフィルタを掛けた結果と、混合画像の右半分中央を比較する。
+        let w = 32_usize;
+        let h = 16_usize;
+        let mut mixed = Vec::with_capacity(w * h);
+        let mut pure_black = Vec::with_capacity(w * h);
+        for _y in 0..h {
+            for x in 0..w {
+                if x < w / 2 {
+                    mixed.push(Color32::from_rgba_unmultiplied(255, 255, 255, 0));
+                } else {
+                    mixed.push(Color32::from_rgba_unmultiplied(0, 0, 0, 255));
+                }
+                pure_black.push(Color32::from_rgba_unmultiplied(0, 0, 0, 255));
+            }
+        }
+        let mixed_src = ColorImage::new([w, h], mixed);
+        let pure_src = ColorImage::new([w, h], pure_black);
+
+        // 右端中央部 (境界から十分離れた位置) でサンプリング
+        let sample_x = w - 3;
+        let sample_y = h / 2;
+        let sample_idx = sample_y * w + sample_x;
+
+        for &f in &[
+            PostFilter::SoftFocus, PostFilter::Sharpen,
+            PostFilter::OilPaint, PostFilter::Sketch, PostFilter::Halftone,
+        ] {
+            let mixed_out = apply(&mixed_src, f);
+            let pure_out = apply(&pure_src, f);
+            let m = mixed_out.pixels[sample_idx];
+            let p = pure_out.pixels[sample_idx];
+            // 差分が小さければ hidden RGB が漏れていない
+            let dr = (m.r() as i32 - p.r() as i32).abs();
+            let dg = (m.g() as i32 - p.g() as i32).abs();
+            let db = (m.b() as i32 - p.b() as i32).abs();
+            let max_d = dr.max(dg).max(db);
+            assert!(
+                max_d < 12,
+                "{:?} leaked hidden RGB from transparent region. \
+                 mixed=({},{},{}) pure=({},{},{}) max_diff={}",
+                f, m.r(), m.g(), m.b(), p.r(), p.g(), p.b(), max_d,
             );
         }
     }
