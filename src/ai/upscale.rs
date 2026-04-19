@@ -42,6 +42,31 @@ pub struct UpscaleResult {
     pub image: egui::ColorImage,
 }
 
+/// 1 タイル分のタイミング内訳（ベンチマーク用）。
+#[derive(Debug, Clone, Copy)]
+pub struct TileTiming {
+    pub extract_ms: f64,
+    pub infer_ms: f64,
+    pub blend_ms: f64,
+}
+
+/// `upscale_with_timings` が返す全体タイミング内訳。
+#[derive(Debug, Clone)]
+pub struct UpscaleTimings {
+    pub total_ms: f64,
+    pub prep_ms: f64,
+    pub alpha_resample_ms: f64,
+    pub finalize_ms: f64,
+    /// GPU 推論ループ完了後に blender スレッドの残タスクを待った時間。
+    /// 0 に近いほど blend がボトルネックになっていない (推論と並走できている)。
+    pub blend_wait_ms: f64,
+    pub tiles: Vec<TileTiming>,
+    pub tile_size: u32,
+    pub scale: u32,
+    pub in_w: u32,
+    pub in_h: u32,
+}
+
 /// 画像サイズがしきい値未満か（しきい値以上ならスキップ）。
 pub fn should_process(width: u32, height: u32, threshold: u32) -> bool {
     width < threshold && height < threshold
@@ -98,6 +123,23 @@ pub fn upscale(
     input: &image::DynamicImage,
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, AiError> {
+    upscale_with_timings(runtime, model_kind, input, cancel).map(|(img, _)| img)
+}
+
+/// `upscale` のタイミング計測版。ベンチマーク用。
+///
+/// 本体の処理は `upscale` と同一で、各タイルの extract / inference / blend 時間と
+/// 全体の prep / alpha_resample / finalize 時間を `UpscaleTimings` として返す。
+/// 追加コストは `Instant::now()` を数回呼ぶ程度 (~ns/タイル) で無視できる。
+pub fn upscale_with_timings(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(egui::ColorImage, UpscaleTimings), AiError> {
+    let t_all = std::time::Instant::now();
+    let t_prep = std::time::Instant::now();
+
     let (in_w, in_h) = (input.width(), input.height());
 
     let scale = detect_scale_factor(runtime, model_kind)?;
@@ -115,6 +157,7 @@ pub fn upscale(
 
     // 透明度を持つ画像はアルファを別途 Lanczos3 でリサイズして再結合する。
     // AI モデル (Real-ESRGAN 等) は RGB 3ch 専用で、アルファを直接扱えないため。
+    let t_alpha = std::time::Instant::now();
     let alpha_resized: Option<Vec<u8>> = if input.color().has_alpha() {
         let rgba = input.to_rgba8();
         let any_transparent = rgba.pixels().any(|p| p.0[3] < 255);
@@ -137,6 +180,7 @@ pub fn upscale(
     } else {
         None
     };
+    let alpha_resample_ms = t_alpha.elapsed().as_secs_f64() * 1000.0;
 
     let tiles = compute_tiles(in_w, in_h, tile_size, TILE_OVERLAP);
     let perf_enabled = crate::perf::is_enabled();
@@ -158,44 +202,98 @@ pub fn upscale(
     let mut accum_g = vec![0.0f32; npixels];
     let mut accum_b = vec![0.0f32; npixels];
     let mut accum_w = vec![0.0f32; npixels];
+    let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0 - alpha_resample_ms;
 
-    for (tile_idx, tile) in tiles.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+    // パイプライン: 推論スレッド (メイン) が GPU 推論を回し、タイル出力を
+    // blender スレッドへ mpsc で流す。blender が累積バッファに blend_tile する。
+    // これにより GPU 推論中に前タイルの blend が走り、GPU アイドルを削減。
+    //
+    // blend_tile は accum_r/g/b/w を排他的に書くので、スレッドは 1 本で十分。
+    // std::thread::scope を使い、accum と timings は `&mut` 借用で受け渡す。
+    let (tile_timings, blend_wait_ms): (Vec<TileTiming>, f64) =
+        std::thread::scope(|s| -> Result<(Vec<TileTiming>, f64), AiError> {
+        let (tx, rx) = std::sync::mpsc::channel::<(TileRect, TileOutput, f64, f64)>();
+        let accum_r_ref = &mut accum_r;
+        let accum_g_ref = &mut accum_g;
+        let accum_b_ref = &mut accum_b;
+        let accum_w_ref = &mut accum_w;
+        let tiles_len = tiles.len();
+
+        let blender = s.spawn(move || -> Vec<TileTiming> {
+            let mut timings: Vec<TileTiming> = Vec::with_capacity(tiles_len);
+            while let Ok((tile, tile_out, extract_ms, infer_ms)) = rx.recv() {
+                let t_blend = std::time::Instant::now();
+                blend_tile(
+                    accum_r_ref, accum_g_ref, accum_b_ref, accum_w_ref,
+                    out_w, out_h,
+                    &tile_out,
+                    &tile, scale,
+                    in_w, in_h,
+                );
+                let blend_ms = t_blend.elapsed().as_secs_f64() * 1000.0;
+                timings.push(TileTiming { extract_ms, infer_ms, blend_ms });
+            }
+            timings
+        });
+
+        // メインスレッド: 推論ループ
+        for (tile_idx, tile) in tiles.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                if perf_enabled {
+                    crate::perf::event("ai", "upscale_cancel", None, 0, &[
+                        ("after_tile", serde_json::Value::from(tile_idx)),
+                    ]);
+                }
+                drop(tx);
+                let _ = blender.join();
+                return Err(AiError::Cancelled);
+            }
+
+            let tile_t0 = std::time::Instant::now();
+            let tile_input = extract_tile(&rgb, tile);
+            let t_infer_begin = std::time::Instant::now();
+            let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
+            let tile_out = match run_tile_inference(runtime, model_kind, tile_input) {
+                Ok(out) => out,
+                Err(e) => {
+                    drop(tx);
+                    let _ = blender.join();
+                    return Err(e);
+                }
+            };
+            let t_send = std::time::Instant::now();
+            let infer_ms = t_send.duration_since(t_infer_begin).as_secs_f64() * 1000.0;
+
+            if tx.send((tile.clone(), tile_out, extract_ms, infer_ms)).is_err() {
+                let _ = blender.join();
+                return Err(AiError::Ort(String::from("blender thread died")));
+            }
+
             if perf_enabled {
-                crate::perf::event("ai", "upscale_cancel", None, 0, &[
-                    ("after_tile", serde_json::Value::from(tile_idx)),
+                let tile_ms = tile_t0.elapsed().as_secs_f64() * 1000.0;
+                crate::perf::event("ai", "upscale_tile", None, 0, &[
+                    ("tile", serde_json::Value::from(tile_idx)),
+                    ("ms", serde_json::Value::from(tile_ms)),
                 ]);
             }
-            return Err(AiError::Cancelled);
+
+            if (tile_idx + 1) % 10 == 0 {
+                crate::logger::log(format!(
+                    "[AI] Upscale progress: {}/{} tiles",
+                    tile_idx + 1, tiles.len()
+                ));
+            }
         }
 
-        let tile_t0 = std::time::Instant::now();
-        let tile_input = extract_tile(&rgb, tile);
-        let tile_out = run_tile_inference(runtime, model_kind, tile_input)?;
-
-        // タイル出力を重み付きで出力バッファに加算
-        blend_tile(
-            &mut accum_r, &mut accum_g, &mut accum_b, &mut accum_w,
-            out_w, out_h,
-            &tile_out,
-            tile, scale,
-            in_w, in_h,
-        );
-        if perf_enabled {
-            let tile_ms = tile_t0.elapsed().as_secs_f64() * 1000.0;
-            crate::perf::event("ai", "upscale_tile", None, 0, &[
-                ("tile", serde_json::Value::from(tile_idx)),
-                ("ms", serde_json::Value::from(tile_ms)),
-            ]);
-        }
-
-        if (tile_idx + 1) % 10 == 0 {
-            crate::logger::log(format!(
-                "[AI] Upscale progress: {}/{} tiles",
-                tile_idx + 1, tiles.len()
-            ));
-        }
-    }
+        // 全タイル送信完了 → blender の残作業を待つ (blend_wait_ms)
+        let t_wait_begin = std::time::Instant::now();
+        drop(tx);
+        let timings = blender.join().map_err(|_| {
+            AiError::Ort(String::from("blender thread panicked"))
+        })?;
+        let blend_wait_ms = t_wait_begin.elapsed().as_secs_f64() * 1000.0;
+        Ok((timings, blend_wait_ms))
+    })?;
 
     crate::logger::log(format!(
         "[AI] Upscale complete: {} tiles, {}x scale",
@@ -213,6 +311,7 @@ pub fn upscale(
     }
 
     // 累積バッファを正規化して RGBA ColorImage に変換
+    let t_finalize = std::time::Instant::now();
     let pixels: Vec<egui::Color32> = (0..npixels)
         .map(|i| {
             let w = accum_w[i].max(1e-6);
@@ -223,11 +322,25 @@ pub fn upscale(
             egui::Color32::from_rgba_unmultiplied(r, g, b, a)
         })
         .collect();
+    let finalize_ms = t_finalize.elapsed().as_secs_f64() * 1000.0;
 
-    Ok(egui::ColorImage::new(
-        [out_w as usize, out_h as usize],
-        pixels,
-    ))
+    let color_image = egui::ColorImage::new([out_w as usize, out_h as usize], pixels);
+    let total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
+
+    let timings = UpscaleTimings {
+        total_ms,
+        prep_ms,
+        alpha_resample_ms,
+        finalize_ms,
+        blend_wait_ms,
+        tiles: tile_timings,
+        tile_size,
+        scale,
+        in_w,
+        in_h,
+    };
+
+    Ok((color_image, timings))
 }
 
 #[derive(Debug, Clone)]
@@ -321,19 +434,17 @@ fn run_tile_inference(
             return Err(AiError::Ort(format!("Unexpected output shape: {dims:?}")));
         };
 
-        // NCHW float → RGB float [0, 255] の平面配置で保存
+        // NCHW float → RGB float [0, 255] の平面配置で保存。
+        // 入出力のインデックス構造は同一 (同じ c * plane_size + y * W + x) なので、
+        // 先頭 ch * plane_size 要素を単純スカラ変換するだけで済む。
+        // ch < 3 の場合は余りを 0 のままにする (vec! の初期値)。
         let ch = out_ch.min(3);
         let plane_size = actual_out_h * actual_out_w;
+        let filled = ch * plane_size;
         let mut data = vec![0.0f32; 3 * plane_size];
-        for c in 0..ch {
-            for y in 0..actual_out_h {
-                for x in 0..actual_out_w {
-                    let src_idx = c * plane_size + y * actual_out_w + x;
-                    let dst_idx = c * plane_size + y * actual_out_w + x;
-                    let val = raw.get(src_idx).copied().unwrap_or(0.0);
-                    data[dst_idx] = (val * 255.0).clamp(0.0, 255.0);
-                }
-            }
+        for i in 0..filled {
+            let v = raw.get(i).copied().unwrap_or(0.0);
+            data[i] = (v * 255.0).clamp(0.0, 255.0);
         }
 
         Ok(TileOutput {
