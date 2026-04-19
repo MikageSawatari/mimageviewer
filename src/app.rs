@@ -3127,6 +3127,19 @@ impl App {
                 }
             }
 
+            // Q / Ctrl+Backspace: チェック済み (なければ選択 1 件) の個別補正を一括解除
+            // フルスクリーン側 (ui_fullscreen.rs) と同じキー割当。
+            // Ctrl+Backspace は consume_key しておかないと後段の「BS で親フォルダ」と衝突する。
+            {
+                let clear_key = ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::CTRL, egui::Key::Backspace)
+                        || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
+                });
+                if clear_key {
+                    self.clear_page_params_for_selection();
+                }
+            }
+
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
@@ -3166,7 +3179,8 @@ impl App {
         let in_favsearch = self.favsearch.active;
 
         // BS: 親フォルダへ (検索中はスタックを戻る)
-        if backspace {
+        // Ctrl+BS は個別補正の解除に使うので除外する
+        if backspace && !ctrl_held {
             if in_favsearch {
                 self.favsearch_back();
                 // favsearch_back 内で load_folder 済み。navigate 経路には流さない。
@@ -5612,6 +5626,36 @@ impl App {
             self.show_feedback_toast(format!(
                 "[スロット{}:{} を{}枚に適用]", key_label, slot.name, count
             ));
+            self.checked.clear();
+        }
+    }
+
+    /// グリッド上の対象 (チェック済み、なければ選択 1 件) の個別補正を一括解除する。
+    /// Q / Ctrl+Backspace から呼ばれる。フルスクリーン側の単発版 (`clear_page_params`) と同じく
+    /// AI 設定が変わる idx については AI キャッシュ / pending も落とす (clear_page_params 内で処理)。
+    pub(crate) fn clear_page_params_for_selection(&mut self) {
+        let targets = self.ratable_targets();
+        if targets.is_empty() {
+            self.show_feedback_toast("[対象なし]".to_string());
+            return;
+        }
+        let to_clear: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|idx| self.adjustment_page_params.contains_key(idx))
+            .collect();
+        if to_clear.is_empty() {
+            self.show_feedback_toast("[個別設定なし]".to_string());
+            return;
+        }
+        for &idx in &to_clear {
+            self.clear_page_params(idx);
+        }
+        let count = to_clear.len();
+        if count == 1 {
+            self.show_feedback_toast("[個別設定を解除]".to_string());
+        } else {
+            self.show_feedback_toast(format!("[{}枚の個別設定を解除]", count));
             self.checked.clear();
         }
     }

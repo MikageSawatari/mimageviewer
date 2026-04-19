@@ -58,7 +58,7 @@ effective = adjustment_page_params.get(idx) ?? settings.global_preset
 | 全画像に適用 | 現在のパラメータを、現フォルダ/ZIP/PDF の全画像ページに一括書込 (`apply_params_to_all_pages`)。色調のみの一斉調整に使う |
 | 全画像から削除 | 現フォルダ/ZIP/PDF の全画像ページから個別設定を削除 (`clear_all_page_params`)。「全画像に適用」の取り消し |
 | 標準にする | 現在のパラメータを `settings.global_preset` にコピー (`copy_params_to_global`)。全フォルダ共通の既定値を更新する |
-| 個別設定を解除 | 現ページの個別レコードを削除 (`clear_page_params`)。標準設定に戻す。`Ctrl+Backspace` でも実行可能 |
+| 個別設定を解除 | 現ページの個別レコードを削除 (`clear_page_params`)。標準設定に戻す。フルスクリーンは `Q` / `Ctrl+Backspace`、グリッドも `Q` / `Ctrl+Backspace` でチェック済み (なければ選択 1 件) に一括適用可能 (`clear_page_params_for_selection`) |
 
 ### 1.4 保存スロット
 
