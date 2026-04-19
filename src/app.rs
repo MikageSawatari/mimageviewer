@@ -774,7 +774,8 @@ pub struct App {
     /// Windows IME のキャンセル Escape では Ime::Disabled と Key::Escape が別フレームに
     /// 分かれて届くことがあるため、Ime イベント後 300ms は IME 入力中として扱う。
     pub(crate) ime_last_event_at: Option<std::time::Instant>,
-    /// 右上フィードバック表示: (テキスト, 表示開始時刻)
+    /// 右上フィードバック表示: (テキスト, 表示開始時刻)。フルスクリーン / グリッド共通。
+    /// 命名の `fs_` プレフィックスはフルスクリーン専用だった頃の名残。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の画像でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で

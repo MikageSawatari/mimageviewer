@@ -983,6 +983,12 @@ impl App {
                     self.scroll_offset_y = (egui_offset / cell_h).round() * cell_h;
                 }
 
+                // 右上フィードバックトースト (Q / Ctrl+Backspace / F7/F8 / レーティング等)
+                // show_feedback_toast でセットされたテキストをグリッド画面でも描画する。
+                // フルスクリーン側は render_fullscreen_viewport が別途呼ぶ。
+                let full_rect = ui.max_rect();
+                self.draw_feedback_toast(ui, full_rect, ctx);
+
                 nav
             })
             .inner

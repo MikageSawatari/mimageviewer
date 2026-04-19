@@ -3325,7 +3325,10 @@ fn draw_spread_direction_arrow(
 
 impl App {
     /// 右上にフィードバックトーストを描画する。
-    fn draw_feedback_toast(&mut self, ui: &mut egui::Ui, full_rect: egui::Rect, ctx: &egui::Context) {
+    /// フルスクリーン側 (`render_fullscreen_viewport`) とグリッド側 (`render_grid`) の
+    /// 両方から呼ばれる。どちらで描画しても同じ見た目になるよう、描画先 `ui` と
+    /// トーストの基準矩形 `full_rect` を呼び出し側が渡す。
+    pub(crate) fn draw_feedback_toast(&mut self, ui: &mut egui::Ui, full_rect: egui::Rect, ctx: &egui::Context) {
         let Some((ref text, start_time)) = self.fs_feedback_toast else { return; };
         let elapsed = start_time.elapsed().as_secs_f32();
         if elapsed > FEEDBACK_TOAST_DURATION {
