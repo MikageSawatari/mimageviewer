@@ -25,6 +25,7 @@ impl App {
         let mut cancel = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(80.0, 60.0);
         let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("お気に入りに追加")
             .open(&mut open)
@@ -96,7 +97,7 @@ impl App {
             self.show_fav_add_dialog = false;
             self.fav_add_name_input.clear();
             self.fav_add_target = None;
-        } else if cancel || !open {
+        } else if cancel || !open || escape_pressed {
             self.show_fav_add_dialog = false;
             self.fav_add_name_input.clear();
             self.fav_add_target = None;

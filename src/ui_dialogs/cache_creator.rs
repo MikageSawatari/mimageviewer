@@ -47,6 +47,7 @@ impl App {
             }
 
             let mut open = true;
+            let escape_pressed = self.dialog_escape_pressed(ctx);
             let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
             egui::Window::new("キャッシュ作成")
                 .open(&mut open)
@@ -157,7 +158,7 @@ impl App {
                     }
                 });
 
-            if !open {
+            if !open || escape_pressed {
                 if self.cc.running
                     && !self.cc.finished.load(Ordering::Relaxed)
                 {

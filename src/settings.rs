@@ -491,12 +491,6 @@ pub struct Settings {
     /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
     #[serde(default)]
     pub ui_theme: UiTheme,
-    /// v0.7.0 開発初期に使っていた起動ダイアログ関連フラグ。互換目的で残置 (読み書きのみ)。
-    #[serde(default)]
-    pub ui_theme_user_set: bool,
-    /// v0.7.0 開発初期の OS テーマ自動検出済みフラグ。互換目的で残置 (読み書きのみ)。
-    #[serde(default)]
-    pub ui_theme_initialized: bool,
 
     // ── ツールバー項目フィルタ（Vec が空 = セクション非表示）──
     /// ツールバーに表示する列数の選択肢
@@ -710,8 +704,6 @@ impl Default for Settings {
             slideshow_interval_secs: default_slideshow_interval(),
             default_spread_mode: SpreadMode::default(),
             ui_theme: UiTheme::default(),
-            ui_theme_user_set: false,
-            ui_theme_initialized: false,
             show_toolbar_favorites: true,
             show_toolbar_folder: true,
             show_toolbar_parent_button: true,

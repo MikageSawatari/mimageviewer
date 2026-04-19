@@ -9,6 +9,7 @@ impl App {
             return;
         }
         let mut open = true;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         egui::Window::new("バージョン情報")
             .open(&mut open)
@@ -71,7 +72,7 @@ impl App {
                     }
                 });
             });
-        if !open {
+        if !open || escape_pressed {
             self.show_about_dialog = false;
         }
     }

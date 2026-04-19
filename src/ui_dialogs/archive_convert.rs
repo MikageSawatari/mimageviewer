@@ -169,6 +169,7 @@ impl App {
         let mut should_close = false;
         let mut start_convert = false;
         let mut cancel_convert = false;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let title = match &state.phase {
             ArchiveConvertPhase::Scanning => format!("{fmt_label} を読み込み中..."),
@@ -296,7 +297,7 @@ impl App {
                 }
             });
 
-        if !open {
+        if !open || escape_pressed {
             should_close = true;
         }
 

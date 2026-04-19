@@ -30,7 +30,7 @@
 //! 作成し、`README.txt` を配置する (入手先案内)。
 
 use std::collections::HashSet;
-use std::io::{BufReader, Read, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,13 +116,16 @@ fn worker_exe_cached_path() -> PathBuf {
 // 定数 / プロトコル定数 (worker 側と一致)
 // ─────────────────────────────────────────────────────────────────
 
-const MSG_HANDSHAKE: u8 = 1;
-const MSG_DECODE_FILE: u8 = 2;
-const MSG_DECODE_BYTES: u8 = 3;
-const MSG_SHUTDOWN: u8 = 4;
+// 32bit ワーカー側の `crates/susie-worker/src/protocol.rs` を直接 include して
+// 定数を共有する。ワーカーは別ターゲット (i686) でビルドされるため Cargo 依存は
+// 張れないが、ファイル共有で MSG_* / STATUS_* がドリフトする事故を防げる。
+#[path = "../crates/susie-worker/src/protocol.rs"]
+mod susie_protocol;
 
-const STATUS_OK: u8 = 0;
-const STATUS_ERR: u8 = 1;
+use susie_protocol::{
+    read_msg, write_msg, MSG_DECODE_BYTES, MSG_DECODE_FILE, MSG_HANDSHAKE, MSG_SHUTDOWN,
+    STATUS_ERR, STATUS_OK,
+};
 
 /// ワーカーバイナリ名 (リリース時には `mimageviewer.exe` と同じディレクトリに配置)。
 pub const WORKER_EXE_NAME: &str = "mimageviewer-susie32.exe";
@@ -712,32 +715,6 @@ fn run_dispatcher(
 fn send_recv(io: &mut WorkerIo, request: &[u8]) -> std::io::Result<Vec<u8>> {
     write_msg(&mut io.stdin, request)?;
     read_msg(&mut io.stdout)
-}
-
-// ─────────────────────────────────────────────────────────────────
-// バイナリフレーム IO
-// ─────────────────────────────────────────────────────────────────
-
-fn write_msg<W: Write>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
-    let len = data.len() as u32;
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(data)?;
-    w.flush()
-}
-
-fn read_msg<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 256 * 1024 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("susie: message too large ({len} bytes)"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 // ─────────────────────────────────────────────────────────────────

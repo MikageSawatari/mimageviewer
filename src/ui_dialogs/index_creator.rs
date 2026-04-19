@@ -42,6 +42,7 @@ impl App {
         }
 
         let mut open = true;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         egui::Window::new("インデックス作成")
             .open(&mut open)
@@ -153,7 +154,7 @@ impl App {
                 }
             });
 
-        if !open {
+        if !open || escape_pressed {
             if self.ic.running && !self.ic.finished.load(Ordering::Relaxed) {
                 self.ic.cancel.store(true, Ordering::Relaxed);
             }

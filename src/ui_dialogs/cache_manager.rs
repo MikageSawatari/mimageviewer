@@ -35,6 +35,7 @@ impl App {
         // ── キャッシュ管理ポップアップ ───────────────────────────────
         if self.show_cache_manager {
             let mut open = true;
+            let escape_pressed = self.dialog_escape_pressed(ctx);
             let cache_dir = crate::catalog::default_cache_dir();
             let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
@@ -137,7 +138,7 @@ impl App {
                     }
                 });
 
-            if !open {
+            if !open || (escape_pressed && !self.cache_manager_confirm_delete_all) {
                 self.show_cache_manager = false;
                 self.cache_manager_confirm_delete_all = false;
             }

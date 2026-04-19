@@ -33,6 +33,7 @@ impl App {
         }
 
         let mut open = true;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
         egui::Window::new("変換済みアーカイブキャッシュ管理")
@@ -44,7 +45,7 @@ impl App {
                 draw_body(self, ui);
             });
 
-        if !open {
+        if !open || (escape_pressed && !self.archive_cache_confirm_delete_all) {
             self.show_archive_cache_manager = false;
             self.archive_cache_confirm_delete_all = false;
         }

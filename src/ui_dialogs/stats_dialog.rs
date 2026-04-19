@@ -34,6 +34,8 @@ impl App {
         if self.show_stats_dialog {
             let mut open = true;
             let mut reset_clicked = false;
+            let mut close_clicked = false;
+            let escape_pressed = self.dialog_escape_pressed(ctx);
             let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
             // スナップショットを取得 (ロック時間を最小化)
@@ -167,7 +169,7 @@ impl App {
                             reset_clicked = true;
                         }
                         if ui.button("閉じる").clicked() {
-                            // open = false でダイアログを閉じる
+                            close_clicked = true;
                         }
                     });
                 });
@@ -177,7 +179,7 @@ impl App {
                     s.reset();
                 }
             }
-            if !open {
+            if !open || close_clicked || escape_pressed {
                 self.show_stats_dialog = false;
             }
         }

@@ -39,6 +39,7 @@ impl App {
             let mut reencode_b = false;
             let mut open_fs_a = false;
             let mut open_fs_b = false;
+            let escape_pressed = self.dialog_escape_pressed(ctx);
 
             // 実グリッドの現在のセルサイズを取得（最小値を確保してスライダーが入るように）
             let grid_cell_w = self.last_cell_size.max(200.0);
@@ -242,7 +243,7 @@ impl App {
                 self.settings.thumb_quality = self.tq.b_quality;
                 self.settings.save();
                 self.close_thumb_quality_dialog();
-            } else if !open {
+            } else if !open || escape_pressed {
                 self.close_thumb_quality_dialog();
             }
         }
