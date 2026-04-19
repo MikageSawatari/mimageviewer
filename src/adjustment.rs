@@ -261,6 +261,13 @@ fn pixel_lum(c: &egui::Color32) -> u8 {
     ((c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8) as u8
 }
 
+/// ピクセルの相対輝度 0..1 (ITU-R BT.601 厳密)。
+/// 微細な閾値比較 (bloom, 1bit dither 等) で誤差を出したくないときに使う。
+#[inline]
+pub fn pixel_lum_f32(c: egui::Color32) -> f32 {
+    (c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114) / 255.0
+}
+
 /// フルサイズ画像に全補正を適用する (テスト用)。
 pub fn apply_adjustments(src: &egui::ColorImage, params: &AdjustParams) -> egui::ColorImage {
     apply_adjustments_fast(src, params)

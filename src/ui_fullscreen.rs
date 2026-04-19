@@ -41,6 +41,12 @@ const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
 const CHECKER_TILE_PX: f32 = 16.0;
 
+/// 補正ショートカット (U/P/N) のトースト表示でスコープを示すラベル。
+#[inline]
+fn scope_label(has_page_override: bool) -> &'static str {
+    if has_page_override { "個別" } else { "標準" }
+}
+
 /// 見開き描画時に書き出されるページ矩形レイアウト。
 /// ルーペ描画がカーソル位置からどちらのページかを判定し、UV サンプリングに使う。
 #[derive(Clone, Copy)]
@@ -1216,7 +1222,7 @@ impl App {
             };
             let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
-            let scope = if has_page_override { "個別" } else { "標準" };
+            let scope = scope_label(has_page_override);
             self.show_feedback_toast(format!("[U:{}アップスケール {}]", scope, label));
             if has_page_override {
                 self.set_page_params(fs_idx, params);
@@ -1231,7 +1237,7 @@ impl App {
         if key_n {
             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
-            let scope = if has_page_override { "個別" } else { "標準" };
+            let scope = scope_label(has_page_override);
             if params.denoise_model.is_some() {
                 params.denoise_model = None;
                 self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope));
@@ -1265,7 +1271,7 @@ impl App {
             };
             let next = all[next_idx];
             params.post_filter = next;
-            let scope = if has_page_override { "個別" } else { "標準" };
+            let scope = scope_label(has_page_override);
             self.show_feedback_toast(format!("[P: {} / {}]", scope, next.display_label()));
             if has_page_override {
                 self.set_page_params(fs_idx, params);

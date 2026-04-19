@@ -97,35 +97,61 @@ fn clamp_u8(v: f32) -> u8 {
     v.round().clamp(0.0, 255.0) as u8
 }
 
-/// ソース画像から線形補間 (bilinear) でサンプリング。
-/// `sx`, `sy` は ソース画像座標 (0..src_w, 0..src_h のサブピクセル)。
-fn sample_bilinear(src: &[Color32], src_w: usize, src_h: usize, sx: f32, sy: f32) -> (f32, f32, f32) {
-    let fx = sx.clamp(0.0, src_w as f32 - 1.0);
-    let fy = sy.clamp(0.0, src_h as f32 - 1.0);
-    let x0 = fx.floor() as usize;
-    let y0 = fy.floor() as usize;
-    let x1 = (x0 + 1).min(src_w - 1);
-    let y1 = (y0 + 1).min(src_h - 1);
-    let tx = fx - x0 as f32;
-    let ty = fy - y0 as f32;
+/// y 方向の補間係数を事前計算したコンテキスト。
+/// CRT 合成のように同一走査線で複数 x 位置をサンプルする用途で y 計算を共有する。
+#[derive(Clone, Copy)]
+struct BilinearYCtx {
+    src_w: usize,
+    row0: usize,    // y0 * src_w
+    row1: usize,    // y1 * src_w
+    ty: f32,
+    one_minus_ty: f32,
+    max_x: usize,   // src_w - 1
+}
 
-    let c00 = src[y0 * src_w + x0];
-    let c10 = src[y0 * src_w + x1];
-    let c01 = src[y1 * src_w + x0];
-    let c11 = src[y1 * src_w + x1];
+impl BilinearYCtx {
+    #[inline]
+    fn new(src_w: usize, src_h: usize, sy: f32) -> Self {
+        let fy = sy.clamp(0.0, src_h as f32 - 1.0);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let ty = fy - y0 as f32;
+        Self {
+            src_w,
+            row0: y0 * src_w,
+            row1: y1 * src_w,
+            ty,
+            one_minus_ty: 1.0 - ty,
+            max_x: src_w - 1,
+        }
+    }
 
-    let lerp = |a: u8, b: u8, t: f32| a as f32 * (1.0 - t) + b as f32 * t;
-    let top_r = lerp(c00.r(), c10.r(), tx);
-    let top_g = lerp(c00.g(), c10.g(), tx);
-    let top_b = lerp(c00.b(), c10.b(), tx);
-    let bot_r = lerp(c01.r(), c11.r(), tx);
-    let bot_g = lerp(c01.g(), c11.g(), tx);
-    let bot_b = lerp(c01.b(), c11.b(), tx);
+    #[inline]
+    fn sample(&self, src: &[Color32], sx: f32) -> (f32, f32, f32) {
+        let fx = sx.clamp(0.0, self.src_w as f32 - 1.0);
+        let x0 = fx.floor() as usize;
+        let x1 = (x0 + 1).min(self.max_x);
+        let tx = fx - x0 as f32;
+        let one_minus_tx = 1.0 - tx;
 
-    let r = top_r * (1.0 - ty) + bot_r * ty;
-    let g = top_g * (1.0 - ty) + bot_g * ty;
-    let b = top_b * (1.0 - ty) + bot_b * ty;
-    (r, g, b)
+        let c00 = src[self.row0 + x0];
+        let c10 = src[self.row0 + x1];
+        let c01 = src[self.row1 + x0];
+        let c11 = src[self.row1 + x1];
+
+        let top_r = c00.r() as f32 * one_minus_tx + c10.r() as f32 * tx;
+        let top_g = c00.g() as f32 * one_minus_tx + c10.g() as f32 * tx;
+        let top_b = c00.b() as f32 * one_minus_tx + c10.b() as f32 * tx;
+        let bot_r = c01.r() as f32 * one_minus_tx + c11.r() as f32 * tx;
+        let bot_g = c01.g() as f32 * one_minus_tx + c11.g() as f32 * tx;
+        let bot_b = c01.b() as f32 * one_minus_tx + c11.b() as f32 * tx;
+
+        (
+            top_r * self.one_minus_ty + bot_r * self.ty,
+            top_g * self.one_minus_ty + bot_g * self.ty,
+            top_b * self.one_minus_ty + bot_b * self.ty,
+        )
+    }
 }
 
 // ── CRT ブラウン管エミュレーション ──────────────────────────────
@@ -246,13 +272,16 @@ mod crt {
                 let sx_f = ux * src_w as f32 - 0.5;
                 let sy_f = uy * src_h as f32 - 0.5;
 
+                // 同一走査線で最大 3 箇所サンプルするため y 補間係数を事前計算
+                let yctx = BilinearYCtx::new(src_w, src_h, sy_f);
+
                 // bilinear サンプリングで柔らかいピクセル境界
-                let (mut r, mut g, mut b) = sample_bilinear(src_pixels, src_w, src_h, sx_f, sy_f);
+                let (mut r, mut g, mut b) = yctx.sample(src_pixels, sx_f);
 
                 // 水平方向の追加ブラー: ±0.5 px ぶん左右もサンプルしてブレンド
                 if params.h_blur > 0.0 {
-                    let (lr, lg, lb) = sample_bilinear(src_pixels, src_w, src_h, sx_f - 0.5, sy_f);
-                    let (rr, rg, rb) = sample_bilinear(src_pixels, src_w, src_h, sx_f + 0.5, sy_f);
+                    let (lr, lg, lb) = yctx.sample(src_pixels, sx_f - 0.5);
+                    let (rr, rg, rb) = yctx.sample(src_pixels, sx_f + 0.5);
                     let w = params.h_blur * 0.5;  // 両隣の重み
                     let c = 1.0 - params.h_blur;  // 中央の重み
                     r = r * c + (lr + rr) * w;
@@ -304,7 +333,7 @@ mod crt {
     /// 明度 > 閾値のピクセルを 0..1 でマップ化 (bloom 用)。
     fn build_bloom_map(src: &ColorImage) -> Vec<f32> {
         src.pixels.par_iter().map(|c| {
-            let lum = (c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114) / 255.0;
+            let lum = crate::adjustment::pixel_lum_f32(*c);
             ((lum - 0.55).max(0.0) * 2.5).min(1.0)
         }).collect()
     }
@@ -459,20 +488,29 @@ mod palette {
     /// MSX2+ SCREEN 8 の 256 色固定パレット (GRB 3:3:2)。
     /// G=3bit (8 levels), R=3bit (8 levels), B=2bit (4 levels) = 8×8×4 = 256 colors.
     /// やや青が粗く、緑・赤が細かいのが特徴 (人間の視覚感度に合わせた設計)。
-    fn msx2plus_palette() -> Vec<[u8; 3]> {
-        let mut pal = Vec::with_capacity(256);
-        for g in 0..8u32 {
-            for r in 0..8u32 {
-                for b in 0..4u32 {
-                    let rv = (r * 255 / 7) as u8;
-                    let gv = (g * 255 / 7) as u8;
-                    let bv = (b * 255 / 3) as u8;
-                    pal.push([rv, gv, bv]);
+    pub(super) const MSX2PLUS_PALETTE: [[u8; 3]; 256] = {
+        let mut pal = [[0u8; 3]; 256];
+        let mut i = 0usize;
+        let mut g = 0u32;
+        while g < 8 {
+            let mut r = 0u32;
+            while r < 8 {
+                let mut b = 0u32;
+                while b < 4 {
+                    pal[i] = [
+                        (r * 255 / 7) as u8,
+                        (g * 255 / 7) as u8,
+                        (b * 255 / 3) as u8,
+                    ];
+                    i += 1;
+                    b += 1;
                 }
+                r += 1;
             }
+            g += 1;
         }
         pal
-    }
+    };
 
     /// ファミコン (NES) 代表パレット (約 52 色)。
     const FAMICOM_PALETTE: &[[u8; 3]] = &[
@@ -514,8 +552,7 @@ mod palette {
     /// MSX2+ SCREEN 8 相当。GRB 3:3:2 の 256 色固定パレット。
     /// 青が粗い (4 段階) ためグラデーションはややボケる。
     pub fn apply_msx2plus(src: &ColorImage) -> ColorImage {
-        let pal = msx2plus_palette();
-        quantize_with_dither(src, &pal, 0.08)
+        quantize_with_dither(src, &MSX2PLUS_PALETTE, 0.08)
     }
 
     /// メガドライブ (Genesis) 相当。各チャンネル 3bit (8 階調) から 61 色を適応選択。
@@ -546,7 +583,7 @@ mod palette {
         out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for x in 0..w {
                 let c = src_pixels[y * w + x];
-                let lum = (c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114) / 255.0;
+                let lum = crate::adjustment::pixel_lum_f32(c);
                 let t = bayer4_threshold(x, y);
                 let v = if lum + t > 0.5 { 255 } else { 0 };
                 row[x] = Color32::from_rgb(v, v, v);
@@ -557,20 +594,24 @@ mod palette {
 
     /// Bayer ディザを使ってソースを指定パレットの最近傍色に量子化する。
     /// `dither_strength`: ディザノイズの振幅 (0..1、小さいほど原画に近い)。
+    ///
+    /// 最近傍探索は 32³=32768 エントリの 5bit/ch LUT を使い O(1) 化。
+    /// 4K 画像に 256 色パレットを適用する場合、ナイーブ実装で 20〜40ms → LUT で数 ms に短縮。
     fn quantize_with_dither(src: &ColorImage, palette: &[[u8; 3]], dither_strength: f32) -> ColorImage {
         let [w, h] = src.size;
         let mut out = vec![Color32::BLACK; w * h];
         let src_pixels = &src.pixels;
         let noise_scale = 255.0 * dither_strength;
+        let lut = build_palette_lut(palette);
 
         out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for x in 0..w {
                 let c = src_pixels[y * w + x];
                 let t = bayer4_threshold(x, y) * noise_scale;
-                let r = (c.r() as f32 + t).clamp(0.0, 255.0);
-                let g = (c.g() as f32 + t).clamp(0.0, 255.0);
-                let b = (c.b() as f32 + t).clamp(0.0, 255.0);
-                let idx = nearest_palette_idx(palette, r, g, b);
+                let r = (c.r() as f32 + t).clamp(0.0, 255.0) as u32;
+                let g = (c.g() as f32 + t).clamp(0.0, 255.0) as u32;
+                let b = (c.b() as f32 + t).clamp(0.0, 255.0) as u32;
+                let idx = lut[lut_index(r, g, b)] as usize;
                 let p = palette[idx];
                 row[x] = Color32::from_rgb(p[0], p[1], p[2]);
             }
@@ -578,7 +619,40 @@ mod palette {
         ColorImage::new([w, h], out)
     }
 
+    const LUT_BITS: u32 = 5; // 5bit/ch → 32³ = 32768 bins
+    const LUT_DIM: u32 = 1 << LUT_BITS; // 32
+    const LUT_MAX: u32 = LUT_DIM - 1; // 31
+    const LUT_SIZE: usize = (LUT_DIM * LUT_DIM * LUT_DIM) as usize; // 32768
+
+    #[inline]
+    fn lut_index(r: u32, g: u32, b: u32) -> usize {
+        // (255 * LUT_MAX + 127) / 255 == LUT_MAX の四捨五入量子化
+        let ri = (r * LUT_MAX + 127) / 255;
+        let gi = (g * LUT_MAX + 127) / 255;
+        let bi = (b * LUT_MAX + 127) / 255;
+        ((ri * LUT_DIM + gi) * LUT_DIM + bi) as usize
+    }
+
+    /// パレットに対する 3D LUT (5bit/ch) を並列構築する。
+    /// 各 bin の中心色から最近傍パレット index を求める。返り値は `LUT_SIZE` 要素の u8 配列。
+    /// 構築コスト: LUT_SIZE * palette_len × 数 ops = パレット 256 で約 8M ops (≈ 1〜3ms、並列化後)
+    fn build_palette_lut(palette: &[[u8; 3]]) -> Vec<u8> {
+        let mut lut = vec![0u8; LUT_SIZE];
+        lut.par_iter_mut().enumerate().for_each(|(bin, slot)| {
+            let bi = bin as u32 % LUT_DIM;
+            let gi = (bin as u32 / LUT_DIM) % LUT_DIM;
+            let ri = bin as u32 / (LUT_DIM * LUT_DIM);
+            // bin 中心の色 (0..=255)
+            let r = (ri * 255 / LUT_MAX) as f32;
+            let g = (gi * 255 / LUT_MAX) as f32;
+            let b = (bi * 255 / LUT_MAX) as f32;
+            *slot = nearest_palette_idx(palette, r, g, b) as u8;
+        });
+        lut
+    }
+
     /// ユークリッド距離 (RGB) 最小のパレットインデックスを返す。
+    /// LUT 構築時のみ呼ばれる。実行時のピクセル量子化では LUT 経由で O(1) 参照。
     fn nearest_palette_idx(palette: &[[u8; 3]], r: f32, g: f32, b: f32) -> usize {
         let mut best = 0usize;
         let mut best_d = f32::MAX;
