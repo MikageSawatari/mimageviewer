@@ -32,11 +32,19 @@ pub fn resolve(theme: UiTheme) -> ResolvedTheme {
 }
 
 /// 解決済みの Light / Dark を `ctx` に適用する。
+///
+/// egui 0.33 の `set_visuals` は現在解決されているテーマに対してだけ Style.visuals を
+/// 書き換えるため、`theme_preference = System` (egui のデフォルト) の状態だと
+/// 起動時に `system_theme` が未取得で `fallback_theme = Dark` 側にしか反映されず、
+/// 直後に egui-winit が Windows の Light を拾うと未変更の Light Style で描画されてしまう。
+/// `set_theme` で `theme_preference` 自体を上書きすれば system_theme に関係なく
+/// 常に目的のテーマに解決されるため、そちらを使う。
 pub fn apply_resolved(ctx: &egui::Context, resolved: ResolvedTheme) {
-    match resolved {
-        ResolvedTheme::Light => ctx.set_visuals(egui::Visuals::light()),
-        ResolvedTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
-    }
+    let preference = match resolved {
+        ResolvedTheme::Light => egui::ThemePreference::Light,
+        ResolvedTheme::Dark => egui::ThemePreference::Dark,
+    };
+    ctx.set_theme(preference);
 }
 
 /// 選択されたテーマを `ctx` に適用する (`resolve` + `apply_resolved`)。
