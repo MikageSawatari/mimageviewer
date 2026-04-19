@@ -82,7 +82,7 @@ impl App {
                         }
 
                         let fav_scroll_h =
-                            (ctx.content_rect().height() - 280.0).clamp(160.0, 480.0);
+                            (ctx.content_rect().height() - 280.0).min(480.0).max(80.0);
                         egui::ScrollArea::vertical()
                             .id_salt("index_creator_favs")
                             .max_height(fav_scroll_h)

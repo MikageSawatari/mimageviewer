@@ -68,7 +68,7 @@ impl App {
                             ui.label(egui::RichText::new("（お気に入りが未登録です）").weak());
                         } else {
                             let fav_scroll_h =
-                                (ctx.content_rect().height() - 260.0).clamp(160.0, 480.0);
+                                (ctx.content_rect().height() - 260.0).min(480.0).max(80.0);
                             egui::ScrollArea::vertical()
                                 .id_salt("cache_creator_favs")
                                 .max_height(fav_scroll_h)

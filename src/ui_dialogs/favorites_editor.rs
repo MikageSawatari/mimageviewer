@@ -42,7 +42,7 @@ impl App {
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
-        let scroll_max_h = (ctx.content_rect().height() - 180.0).clamp(260.0, 640.0);
+        let scroll_max_h = (ctx.content_rect().height() - 180.0).min(640.0).max(80.0);
         egui::Window::new("お気に入りの編集")
             .open(&mut open)
             .resizable(false)

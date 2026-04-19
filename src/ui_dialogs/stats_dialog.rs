@@ -44,7 +44,9 @@ impl App {
             };
 
             // ダイアログ高さは画面に収める。ボタン行を常時表示するため内部を ScrollArea で包む。
-            let scroll_max_h = (ctx.content_rect().height() - 160.0).clamp(320.0, 720.0);
+            // 下限は小さく: 画面高が極端に低いとき、下限が大きいと逆にダイアログ全体が
+            // ビューポートを越えて下部ボタンが見切れる。
+            let scroll_max_h = (ctx.content_rect().height() - 160.0).min(720.0).max(80.0);
             egui::Window::new("統計")
                 .open(&mut open)
                 .resizable(false)
