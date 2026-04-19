@@ -201,7 +201,13 @@ struct Job {
 }
 
 struct JobQueue {
-    jobs: std::collections::VecDeque<Job>,
+    /// 可視セル等の優先ジョブ。dispatcher はこちらを先に pop する。
+    /// 2 本に分けて FIFO(priority) → FIFO(regular) の順で処理することで、
+    /// app 側が `worker_priority_key()` で決めた順序 (例: 可視セルを近い順) を
+    /// キューが反転させない (旧実装は 1 本の VecDeque + push_front で priority 内が
+    /// LIFO になり、serial worker 時に体感読み込み順が逆転した)。
+    priority_jobs: std::collections::VecDeque<Job>,
+    regular_jobs: std::collections::VecDeque<Job>,
     shutdown: bool,
 }
 
@@ -243,7 +249,8 @@ impl SusieWorkerPool {
 
         let queue = Arc::new((
             Mutex::new(JobQueue {
-                jobs: std::collections::VecDeque::new(),
+                priority_jobs: std::collections::VecDeque::new(),
+                regular_jobs: std::collections::VecDeque::new(),
                 shutdown: false,
             }),
             Condvar::new(),
@@ -350,14 +357,13 @@ impl SusieWorkerPool {
         {
             let (mtx, cv) = &*self.queue;
             let mut q = mtx.lock().unwrap();
-            // 可視セルは前方に挿入してすぐ処理されるようにする。priority=true ジョブが
-            // 連続して投入された場合、後着のものが先着のものを追い越す挙動になる
-            // (LIFO of priority + FIFO of regular) が、可視範囲内ジョブはどれを先に
-            // 処理しても体感差は無いので問題なし。
+            // priority ジョブは priority 用キューの末尾、regular は regular 用キューの
+            // 末尾に積む。dispatcher は priority を先に pop するので、priority 同士は
+            // FIFO、regular より常に先。これで app 側が決めた読み込み順を壊さない。
             if priority {
-                q.jobs.push_front(job);
+                q.priority_jobs.push_back(job);
             } else {
-                q.jobs.push_back(job);
+                q.regular_jobs.push_back(job);
             }
             cv.notify_one();
         }
@@ -389,7 +395,8 @@ fn empty_pool() -> SusieWorkerPool {
     SusieWorkerPool {
         queue: Arc::new((
             Mutex::new(JobQueue {
-                jobs: std::collections::VecDeque::new(),
+                priority_jobs: std::collections::VecDeque::new(),
+                regular_jobs: std::collections::VecDeque::new(),
                 shutdown: false,
             }),
             Condvar::new(),
@@ -648,7 +655,12 @@ fn run_dispatcher(
                 if q.shutdown {
                     break None;
                 }
-                if let Some(j) = q.jobs.pop_front() {
+                // priority を先に、空なら regular を取り出す。どちらも FIFO なので
+                // enqueue 順が保持される。
+                if let Some(j) = q.priority_jobs.pop_front() {
+                    break Some(j);
+                }
+                if let Some(j) = q.regular_jobs.pop_front() {
                     break Some(j);
                 }
                 q = cv.wait(q).unwrap();

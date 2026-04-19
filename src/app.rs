@@ -2287,7 +2287,15 @@ impl App {
             // 抜くと、次フレームに Pending && !requested.contains で再エンキュー →
             // 同じ画像を何度も decode する無限ループになるため、そのケースは
             // `pending_finalize` に idx を積んでアップロード完了時に remove する。
+            //
+            // `requested` に無い idx への finalized は、第1シグナルが keep 範囲外で
+            // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
+            // 残り続けるので無視する。
             if finalized {
+                if !self.requested.contains_key(&i) {
+                    received += 1;
+                    continue;
+                }
                 if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
                     self.requested.remove(&i);
                 } else {
@@ -2403,11 +2411,14 @@ impl App {
                         });
                     } else {
                         // 範囲外: ColorImage を drop し Evicted にしておく。
-                        // from_cache=true は 1 ショット経路 → 即 remove。
-                        // from_cache=false は第 2 シグナル待ち → requested 保持。
-                        if from_cache {
-                            self.requested.remove(&i);
-                        }
+                        // from_cache / from_source に関わらず、UI 側の要求はここで完了扱い。
+                        // from_source 用に requested を残すと、後から届く finalized=true と
+                        // 合わせて `pending_finalize` が stale 化し、スクロールで戻っても
+                        // `requested.contains_key(&i)` により再エンキューが阻まれる
+                        // (= サムネイルが復帰しない) 状態に陥る。
+                        // pending_finalize も念のため掃除する (第 2 シグナル先着の場合)。
+                        self.requested.remove(&i);
+                        self.pending_finalize.remove(&i);
                         self.thumbnails[i] = ThumbnailState::Evicted;
                     }
                 }
