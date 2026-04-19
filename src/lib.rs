@@ -18,6 +18,7 @@ pub mod pdf_loader;
 pub mod perf;
 pub mod pdf_passwords;
 pub mod png_metadata;
+pub mod post_filter;
 pub mod rating_db;
 pub mod search_index_db;
 pub mod search_query;

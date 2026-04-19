@@ -146,16 +146,24 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 
 ---
 
-## 3. 補正・AI キャッシュと再描画
+## 3. 補正・AI・ポストフィルタキャッシュと再描画
 
 詳細は [preset-and-adjustment.md](preset-and-adjustment.md) に譲る。ここでは要点のみ:
 
-- **補正 (adjustment)**: CPU 側で LUT 計算 → ColorImage → GPU テクスチャ。
-  `maybe_apply_adjustment(idx)` が毎フレーム呼ばれ、必要なら同期的に適用する。
+- **補正 (adjustment)**: CPU 側で LUT 計算 → ColorImage → [ポストフィルタ (post_filter::apply)]
+  → GPU テクスチャ。`maybe_apply_adjustment(idx)` が毎フレーム呼ばれ、必要なら同期的に適用する。
+- **ポストフィルタ**: 色調補正の後段で CPU 処理 (CRT/減色/複合)。rayon 並列化で 4K 画像でも
+  40〜80ms 程度。`PostFilter::None` 以外はテクスチャサンプラーを NEAREST にして
+  スキャンライン/ドットを維持する。
+- **消しゴム/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
+  `apply_sync_adjustment` が post-filter 段をスキップし color-only の `adjustment_cache` を生成。
+  モード解除時に false に戻し該当 idx をクリアして post-filter 適用状態で再生成させる。
 - **AI アップスケール/デノイズ**: 別スレッドで推論。完了時に `ai_upscale_cache` に格納。
 - **何かを変えたら正しいキャッシュをクリア**:
   - 補正パラメータ変更 → `adjustment_cache[idx]` のみクリア
+  - ポストフィルタ変更 → `adjustment_cache[idx]` のみクリア (色系変更と同じ扱い)
   - AI モデル変更 → `adjustment_cache` + `ai_upscale_cache` 両方をクリア + 実行中ジョブをキャンセル
+  - 消しゴム/分析モード入出 → `adjustment_cache[idx]` のみクリア (bypass 切替のため)
   - フォルダ切替 → 両方をグローバルクリア
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)
 

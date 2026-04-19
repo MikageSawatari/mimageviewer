@@ -20,6 +20,7 @@ pub mod monitor;
 pub mod path_key;
 pub mod perf;
 pub mod png_metadata;
+pub mod post_filter;
 pub mod rating_db;
 pub mod rotation_db;
 pub mod search_index_db;

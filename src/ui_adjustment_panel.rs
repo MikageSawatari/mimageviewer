@@ -15,7 +15,7 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::adjustment::{AdjustParams, AutoMode, PresetSlot};
+use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 
 const HEADER_H: f32 = 36.0;
 const SECTION_FONT: f32 = 12.0;
@@ -213,6 +213,52 @@ fn draw_sliders(
             params.upscale_model = val.map(|s| s.to_string());
             changed = true;
         }
+    }
+
+    // ── ポストフィルタ (レトロ系表示エフェクト) ──
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("ポストフィルタ").size(SECTION_FONT).color(LABEL_COLOR));
+    let before_pf = params.post_filter;
+    egui::ComboBox::from_id_salt("post_filter_combo")
+        .selected_text(params.post_filter.display_label())
+        .width(ui.available_width() - 8.0)
+        .show_ui(ui, |ui| {
+            let group_heading = |ui: &mut egui::Ui, text: &str| {
+                ui.label(
+                    egui::RichText::new(text)
+                        .size(SECTION_FONT - 1.0)
+                        .color(egui::Color32::from_gray(150)),
+                );
+            };
+
+            group_heading(ui, "── 基本 ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::None, PostFilter::None.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Nearest, PostFilter::Nearest.display_label());
+            ui.separator();
+            group_heading(ui, "── CRT ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::CrtSimple, PostFilter::CrtSimple.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::CrtFull, PostFilter::CrtFull.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::CrtArcade, PostFilter::CrtArcade.display_label());
+            ui.separator();
+            group_heading(ui, "── 減色・ディザ (色数昇順) ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::Dither1bit, PostFilter::Dither1bit.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::GameBoy, PostFilter::GameBoy.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Pc98, PostFilter::Pc98.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::GameGear, PostFilter::GameGear.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Famicom, PostFilter::Famicom.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::MegaDrive, PostFilter::MegaDrive.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Msx2Plus, PostFilter::Msx2Plus.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::Sfc, PostFilter::Sfc.display_label());
+            ui.separator();
+            group_heading(ui, "── CRT × 非液晶機種 ──");
+            ui.selectable_value(&mut params.post_filter, PostFilter::ComboFamicomCrt, PostFilter::ComboFamicomCrt.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::ComboPc98Crt, PostFilter::ComboPc98Crt.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::ComboMsx2PlusCrt, PostFilter::ComboMsx2PlusCrt.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::ComboMegaDriveCrt, PostFilter::ComboMegaDriveCrt.display_label());
+            ui.selectable_value(&mut params.post_filter, PostFilter::ComboSfcCrt, PostFilter::ComboSfcCrt.display_label());
+        });
+    if params.post_filter != before_pf {
+        changed = true;
     }
 
     ui.add_space(12.0);

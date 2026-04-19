@@ -22,6 +22,98 @@ pub enum AutoMode {
     MangaCleanup,
 }
 
+/// ポストフィルタ (レトロ系表示エフェクト)。
+///
+/// 色調補正の後段で CPU 処理として適用される。`None` = 現状挙動、
+/// `Nearest` = CPU 変換はしないが NEAREST サンプラーで拡大する。
+/// その他は CRT ブラウン管風 / 減色 / 複合プリセット。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PostFilter {
+    /// フィルタ無し (補間あり、LINEAR サンプラー) = デフォルト
+    #[default]
+    None,
+    /// 補間なし (NEAREST サンプラー、ピクセル転送のみ)
+    Nearest,
+    /// CRT シンプル: スキャンライン + シャドウマスク
+    CrtSimple,
+    /// CRT フル: CRT Simple + 樽型歪み + bloom
+    CrtFull,
+    /// CRT アーケード: 太スキャンライン + 高輝度
+    CrtArcade,
+    /// GameBoy 風 4 階調 (緑系)
+    GameBoy,
+    /// PC-98 アナログモード相当 (画像ごとに適応的に 16 色を選択)
+    Pc98,
+    /// ファミコン (NES) 固定 52 色パレット
+    Famicom,
+    /// MSX2+ SCREEN 8 (256 色固定 GRB 3:3:2)
+    Msx2Plus,
+    /// メガドライブ (9bit 色空間から 61 色適応)
+    MegaDrive,
+    /// ゲームギア (12bit 色空間から 32 色適応)
+    GameGear,
+    /// スーパーファミコン (15bit 色空間から 256 色適応)
+    Sfc,
+    /// 2 階調 Bayer ディザ
+    Dither1bit,
+    /// 複合: ファミコン減色 + CRT シンプル (非液晶機種の実機体験風)
+    ComboFamicomCrt,
+    /// 複合: PC-98 減色 + CRT シンプル
+    ComboPc98Crt,
+    /// 複合: MSX2+ 減色 + CRT シンプル
+    ComboMsx2PlusCrt,
+    /// 複合: メガドライブ減色 + CRT シンプル
+    ComboMegaDriveCrt,
+    /// 複合: スーパーファミコン減色 + CRT シンプル
+    ComboSfcCrt,
+}
+
+impl PostFilter {
+    /// 全プリセットを UI 順で列挙する (減色は色数昇順、複合は機種順)。
+    pub const ALL: &'static [Self] = &[
+        Self::None, Self::Nearest,
+        Self::CrtSimple, Self::CrtFull, Self::CrtArcade,
+        Self::Dither1bit, Self::GameBoy,
+        Self::Pc98, Self::GameGear, Self::Famicom, Self::MegaDrive,
+        Self::Msx2Plus, Self::Sfc,
+        Self::ComboFamicomCrt, Self::ComboPc98Crt, Self::ComboMsx2PlusCrt,
+        Self::ComboMegaDriveCrt, Self::ComboSfcCrt,
+    ];
+
+    /// UI 表示用の日本語ラベル。
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::None => "標準（補間あり）",
+            Self::Nearest => "ニアレスト（補間なし）",
+            Self::CrtSimple => "CRT シンプル（控えめ）",
+            Self::CrtFull => "CRT フル（歪み+強グロー）",
+            Self::CrtArcade => "CRT アーケード（高コントラスト）",
+            Self::GameBoy => "GameBoy（緑4階調）",
+            Self::Pc98 => "PC-98（16色・適応）",
+            Self::Famicom => "ファミコン（52色・固定）",
+            Self::Msx2Plus => "MSX2+（256色・GRB）",
+            Self::MegaDrive => "メガドライブ（61色・9bit）",
+            Self::GameGear => "ゲームギア（32色・12bit）",
+            Self::Sfc => "スーパーファミコン（256色・15bit）",
+            Self::Dither1bit => "1bit ディザ",
+            Self::ComboFamicomCrt => "CRT × ファミコン",
+            Self::ComboPc98Crt => "CRT × PC-98",
+            Self::ComboMsx2PlusCrt => "CRT × MSX2+",
+            Self::ComboMegaDriveCrt => "CRT × メガドライブ",
+            Self::ComboSfcCrt => "CRT × スーパーファミコン",
+        }
+    }
+
+    /// NEAREST サンプラーでテクスチャを作るべきか。
+    /// `Nearest` プリセットのみ NEAREST を使う (ユーザーが「補間なし」を明示的に選んだ場合)。
+    /// CRT はアナログ感を出すために LINEAR を使う (縮小時のモアレも防げる)。
+    /// 減色系も LINEAR (画面スケールでディザドットを滑らかに表示)。
+    pub fn needs_nearest_sampler(self) -> bool {
+        matches!(self, Self::Nearest)
+    }
+}
+
 /// AI アップスケールモデル UI メニューの項目一覧を返す。
 ///
 /// ラジオボタン / キーサイクルの描画・遷移に使う (ラベル, モデルキー) の組。
@@ -65,6 +157,9 @@ pub struct AdjustParams {
     /// AI デノイズモデル。None = off
     #[serde(default)]
     pub denoise_model: Option<String>,
+    /// ポストフィルタ (レトロ系表示エフェクト)。デフォルト = None
+    #[serde(default)]
+    pub post_filter: PostFilter,
 }
 
 impl Default for AdjustParams {
@@ -81,13 +176,20 @@ impl Default for AdjustParams {
             auto_mode: None,
             upscale_model: None,
             denoise_model: None,
+            post_filter: PostFilter::None,
         }
     }
 }
 
 impl AdjustParams {
-    /// すべてのパラメータがデフォルト値 (無補正) か。
+    /// すべてのパラメータがデフォルト値 (無補正かつ post-filter 無し) か。
     pub fn is_identity(&self) -> bool {
+        self.is_color_identity() && self.post_filter == PostFilter::None
+    }
+
+    /// 色調パラメータのみ無補正か (post-filter は問わない)。
+    /// 消しゴム / 分析モードで post-filter をバイパスするときの早期 return 判定に使う。
+    pub fn is_color_identity(&self) -> bool {
         self.brightness == 0.0
             && self.contrast == 0.0
             && self.gamma == 1.0
@@ -157,6 +259,13 @@ pub fn slot_key_label(slot_idx: usize) -> String {
 #[inline]
 fn pixel_lum(c: &egui::Color32) -> u8 {
     ((c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8) as u8
+}
+
+/// ピクセルの相対輝度 0..1 (ITU-R BT.601 厳密)。
+/// 微細な閾値比較 (bloom, 1bit dither 等) で誤差を出したくないときに使う。
+#[inline]
+pub fn pixel_lum_f32(c: egui::Color32) -> f32 {
+    (c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114) / 255.0
 }
 
 /// フルサイズ画像に全補正を適用する (テスト用)。
