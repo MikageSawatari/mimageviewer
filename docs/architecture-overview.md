@@ -104,7 +104,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
 | `ai/` | ONNX Runtime (DirectML) によるアップスケール / デノイズ / Inpainting / 画像種別分類 |
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
-| `exif_reader.rs` | EXIF 読み取り (rexif) |
+| `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
+| `xmp_reader.rs` | XMP 読み取り (quick-xml)。mXD (mxdownloader) が埋め込む `xtw:*` 名前空間を抽出し「X ツイート情報」パネルに表示 |
 
 ### UI オーバーレイ / ダイアログ
 
@@ -112,7 +113,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | --- | --- |
 | `ui_adjustment_panel.rs` | 画像補正パネル (左端オーバーレイ)。プリセット切替・AI 設定・保存スロット |
 | `ui_analysis_panel.rs` | 画像分析パネル (右端オーバーレイ)。色情報・ヒストグラム |
-| `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF) |
+| `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF + X ツイート情報) |
 | `ui_erase.rs` | 消しゴムモード (Lasso/縦線/横線/ブラシ → MI-GAN で inpaint) |
 | `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |

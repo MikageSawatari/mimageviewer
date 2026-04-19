@@ -33,4 +33,5 @@ pub mod sys_memory;
 pub mod thumb_loader;
 pub mod ui_helpers;
 pub mod wic_decoder;
+pub mod xmp_reader;
 pub mod zip_loader;

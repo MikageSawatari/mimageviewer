@@ -541,6 +541,9 @@ pub struct App {
     /// EXIF キャッシュ: 正規化キー → パース結果 (None = EXIF なし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
+    /// XMP (mXD X/Twitter メタデータ) キャッシュ: 正規化キー → パース結果。
+    /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
+    pub(crate) xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -967,6 +970,7 @@ impl Default for App {
             show_metadata_panel: false,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
+            xmp_cache: std::collections::HashMap::new(),
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -1868,6 +1872,7 @@ impl App {
         self.keep_range = (0, 0);
         self.metadata_cache.clear();
         self.exif_cache.clear();
+        self.xmp_cache.clear();
         self.checked.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();
@@ -4017,7 +4022,23 @@ impl App {
                 }
                 _ => None,
             };
-            self.exif_cache.insert(key, exif);
+            self.exif_cache.insert(key.clone(), exif);
+        }
+
+        // XMP (mXD の X/Twitter メタデータ)
+        if !self.xmp_cache.contains_key(&key) {
+            let xmp = match self.items.get(idx) {
+                Some(GridItem::Image(p)) => crate::xmp_reader::read_tweet_info(p),
+                Some(GridItem::ZipImage { zip_path, entry_name }) => {
+                    if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                        crate::xmp_reader::read_tweet_info_from_bytes(&bytes)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.xmp_cache.insert(key, xmp);
         }
     }
 

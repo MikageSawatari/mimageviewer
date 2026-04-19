@@ -48,6 +48,7 @@ pub mod pdf_passwords;
 pub mod susie_loader;
 pub mod ui_susie_diagnostic;
 pub mod wic_decoder;
+pub mod xmp_reader;
 pub mod zip_loader;
 
 use std::sync::Arc;

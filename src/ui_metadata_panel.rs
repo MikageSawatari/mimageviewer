@@ -7,6 +7,7 @@ use eframe::egui;
 use crate::app::App;
 use crate::exif_reader::{self, ExifInfo};
 use crate::png_metadata::{AiMetadata, A1111Metadata, ComfyUIMetadata};
+use crate::xmp_reader::{self, XmpTweetInfo};
 
 /// パネル幅 (ピクセル)
 const PANEL_WIDTH: f32 = 380.0;
@@ -182,6 +183,7 @@ impl App {
 
         let ai_metadata = self.get_current_ai_metadata();
         let exif_info = self.get_current_exif();
+        let tweet_info = self.get_current_tweet_info();
 
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(
@@ -194,6 +196,16 @@ impl App {
             .id_salt("metadata_scroll")
             .show(&mut child_ui, |ui| {
                 ui.set_width(inner_rect.width());
+
+                // X ツイート情報 (mXD 由来) — 最上段に出す
+                if let Some(ref t) = tweet_info {
+                    draw_tweet_panel(ui, ctx, t);
+                    if ai_metadata.is_some() || exif_info.is_some() {
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                }
 
                 // AI メタデータセクション
                 match ai_metadata {
@@ -224,7 +236,7 @@ impl App {
                 }
 
                 // 何もない場合
-                if ai_metadata.is_none() && exif_info.is_none() {
+                if ai_metadata.is_none() && exif_info.is_none() && tweet_info.is_none() {
                     draw_no_metadata(ui);
                 }
             });
@@ -244,6 +256,13 @@ impl App {
         let idx = self.fullscreen_idx?;
         let key = self.metadata_cache_key(idx)?;
         self.exif_cache.get(&key).cloned().flatten()
+    }
+
+    /// 現在のフルスクリーン画像の XMP (X/Twitter) 情報を取得する。
+    fn get_current_tweet_info(&self) -> Option<XmpTweetInfo> {
+        let idx = self.fullscreen_idx?;
+        let key = self.metadata_cache_key(idx)?;
+        self.xmp_cache.get(&key).cloned().flatten()
     }
 }
 
@@ -521,6 +540,182 @@ fn draw_collapsible_json_section(
                 );
             });
     }
+}
+
+/// 「X ツイート情報」セクションを描画する。
+/// `xtw:TweetId` がある画像 (mXD が保存したもの) のときだけ呼ばれる。
+fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
+    // ヘッダー
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("X ツイート情報")
+                .color(egui::Color32::WHITE)
+                .size(16.0)
+                .strong(),
+        );
+        if let Some(src) = &t.source {
+            let (label, color) = match src.as_str() {
+                "Likes" => ("いいね", egui::Color32::from_rgb(240, 100, 140)),
+                "Bookmarks" => ("ブックマーク", egui::Color32::from_rgb(100, 160, 240)),
+                other => (other, egui::Color32::from_rgb(180, 180, 180)),
+            };
+            ui.label(
+                egui::RichText::new(label)
+                    .color(color)
+                    .size(12.0)
+                    .background_color(egui::Color32::from_rgba_unmultiplied(
+                        color.r(), color.g(), color.b(), 30,
+                    )),
+            );
+        }
+    });
+    ui.add_space(8.0);
+
+    // 投稿者
+    if t.author_display_name.is_some() || t.author_screen_name.is_some() {
+        let display = t
+            .author_display_name
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let screen = t
+            .author_screen_name
+            .as_deref()
+            .map(|s| format!("@{s}"))
+            .unwrap_or_default();
+        let combined = match (display.is_empty(), screen.is_empty()) {
+            (false, false) => format!("{display} ({screen})"),
+            (true, false) => screen,
+            (false, true) => display,
+            _ => String::new(),
+        };
+        draw_key_value_wrapped(ui, "投稿者", &combined);
+    }
+
+    if let Some(ts) = t.posted_at.as_deref() {
+        draw_key_value_wrapped(ui, "投稿日時", &format_xmp_datetime(ts));
+    }
+    if let Some(ts) = t.discovered_at.as_deref() {
+        draw_key_value_wrapped(ui, "発見日時", &format_xmp_datetime(ts));
+    }
+
+    // スレッド / メディア位置 (単独投稿・単枚は省略)
+    let thread_interesting = t.thread_part.map(|n| n > 1).unwrap_or(false);
+    let media_interesting = t.media_count.map(|n| n > 1).unwrap_or(false);
+    if thread_interesting || media_interesting {
+        let mut parts = Vec::new();
+        if let Some(tp) = t.thread_part {
+            parts.push(format!("スレッド {tp} 番目"));
+        }
+        if let (Some(mi), Some(mc)) = (t.media_index, t.media_count) {
+            parts.push(format!("メディア {mi}/{mc}"));
+        }
+        if !parts.is_empty() {
+            draw_key_value_wrapped(ui, "位置", &parts.join(" / "));
+        }
+    }
+
+    // 本文
+    if let Some(body) = t.description.as_deref().filter(|s| !s.is_empty()) {
+        ui.add_space(4.0);
+        draw_text_section(ui, ctx, "本文", body);
+    }
+
+    // アクションボタン
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        if let Some(url) = t.tweet_url.as_deref() {
+            if xmp_reader::is_safe_tweet_url(url)
+                && ui.button("元ツイートを開く").on_hover_text(url).clicked()
+            {
+                let _ = opener::open(url);
+            }
+        }
+        if let Some(url) = t.author_url.as_deref() {
+            if xmp_reader::is_safe_tweet_url(url)
+                && ui
+                    .button("投稿者のタイムラインを開く")
+                    .on_hover_text(url)
+                    .clicked()
+            {
+                let _ = opener::open(url);
+            }
+        }
+        if let Some(url) = t.tweet_url.as_deref() {
+            if xmp_reader::is_safe_tweet_url(url)
+                && ui.small_button("URL コピー").clicked()
+            {
+                ctx.copy_text(url.to_string());
+            }
+        }
+    });
+
+    // 引用元 (別ツイートが RT/引用したことで保存された場合のみ)
+    if let Some(qurl) = t.quoted_by_url.as_deref() {
+        ui.add_space(4.0);
+        let by = t
+            .quoted_by_author_display_name
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        let handle = t
+            .quoted_by_screen_name
+            .as_deref()
+            .map(|s| format!("@{s}"))
+            .unwrap_or_default();
+        let label = match (by.is_empty(), handle.is_empty()) {
+            (false, false) => format!("{by} ({handle}) が引用"),
+            (_, false) => format!("{handle} が引用"),
+            (false, _) => format!("{by} が引用"),
+            _ => "別ツイートから引用".to_string(),
+        };
+        ui.label(
+            egui::RichText::new(label)
+                .color(DIM_COLOR)
+                .size(BODY_FONT),
+        );
+        if xmp_reader::is_safe_tweet_url(qurl)
+            && ui
+                .button("引用した投稿を開く")
+                .on_hover_text(qurl)
+                .clicked()
+        {
+            let _ = opener::open(qurl);
+        }
+    }
+}
+
+/// mXD / ExifTool が書く "2026:04:16 04:09:58.0000000+00:00" 形式を
+/// 視認性の高い "2026-04-16 04:09:58 UTC" に整形する。失敗したら原文を返す。
+fn format_xmp_datetime(raw: &str) -> String {
+    // 日付部は `:` 区切り。最初の 2 個だけ `-` に置換。
+    let mut s = raw.to_string();
+    let mut replaced = 0;
+    let bytes: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in bytes.iter().enumerate() {
+        if *c == ':' && replaced < 2 && i < 10 {
+            out.push('-');
+            replaced += 1;
+        } else {
+            out.push(*c);
+        }
+    }
+    s = out;
+    // 秒以下の過剰精度 (.0000000) と +00:00 を簡略化
+    if let Some(dot) = s.find('.') {
+        if let Some(end) = s[dot..].find(|c: char| c == '+' || c == '-' || c == 'Z') {
+            let offset_start = dot + end;
+            let offset = &s[offset_start..];
+            let offset_label = if offset.starts_with("+00:00") || offset == "Z" {
+                " UTC"
+            } else {
+                ""
+            };
+            s = format!("{}{}", &s[..dot], offset_label);
+        }
+    }
+    s
 }
 
 /// テキストセクション (ラベル + コピーボタン + テキスト) を描画する。

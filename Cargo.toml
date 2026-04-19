@@ -55,6 +55,12 @@ windows-dpapi = "0.2"
 base64 = "0.22"
 ort = { version = "2.0.0-rc.12", features = ["directml", "ndarray"] }
 ndarray = "0.17"
+# mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
+# JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。
+quick-xml = "0.39"
+# URL をブラウザで開くため (「元ツイートを開く」等)。cmd /c start を書くより
+# 安全でクロスプラットフォーム。
+opener = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
