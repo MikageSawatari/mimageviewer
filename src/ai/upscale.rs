@@ -24,13 +24,21 @@ const TILE_SIZE: u32 = 192;
 /// スクリーントーン等の規則的パターンで境界が目立たないよう、十分な幅を確保。
 const TILE_OVERLAP: u32 = 32;
 
-/// モデルごとの固定タイルサイズ。None の場合はデフォルト (TILE_SIZE) を使用。
-/// 一部の ONNX モデルは固定入力サイズでエクスポートされているため、
-/// そのサイズに合わせたタイル分割が必要。
+/// モデルごとの最適タイルサイズ (RTX 4090 + DirectML で実測、`bench_ai --tile-size` 参照)。
+///
+/// - 固定入力サイズのモデルはそのサイズでしか動かない (例: RealPLKSR 256)。
+/// - それ以外のモデルは本来任意サイズで動くが、ONNX ランタイム/GPU の実行効率が
+///   特定サイズでピークになる。実測結果は概ね 192 が最適だったが、
+///   軽量モデルの `UpscaleRealEsrGeneralV3` のみ 512 の方が 18% 速い
+///   (タイル当たり GPU 処理が短くカーネル起動オーバーヘッドが支配的なため、
+///    大タイル化で起動回数を 1/8 に減らすと効果が大きい)。
+///   画質差は平均 0.06/255、p99.9 ≤ 2/255 で実質同等。
 fn model_tile_size(kind: ModelKind) -> u32 {
     match kind {
         // RealPLKSR は 256x256 固定入力
         ModelKind::DenoiseRealplksr => 256,
+        // 軽量モデル: 大タイルで GPU カーネル起動オーバーヘッドを削減
+        ModelKind::UpscaleRealEsrGeneralV3 => 512,
         _ => TILE_SIZE,
     }
 }

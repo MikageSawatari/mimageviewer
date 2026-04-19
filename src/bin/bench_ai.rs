@@ -57,6 +57,9 @@ struct Args {
     /// カンマ区切りでタイルサイズを複数指定すると、各サイズで計測してまとめて表示する。
     /// 空のときはモデル既定値 (model_tile_size) で 1 回のみ測定。
     tile_sizes: Vec<u32>,
+    /// 出力された ColorImage を PNG として保存するディレクトリ (画質目視比較用)。
+    /// ファイル名: <image_stem>__<model>__tile<N>.png
+    save_output: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -66,6 +69,7 @@ fn parse_args() -> Args {
     let mut runs: usize = 3;
     let mut warmup: usize = 1;
     let mut tile_sizes: Vec<u32> = Vec::new();
+    let mut save_output: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -99,6 +103,10 @@ fn parse_args() -> Args {
                     tile_sizes.push(n);
                 }
             }
+            "--save-output" => {
+                i += 1;
+                save_output = Some(PathBuf::from(&raw[i]));
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -115,7 +123,7 @@ fn parse_args() -> Args {
         models = default_models();
     }
 
-    Args { images, models, runs, warmup, tile_sizes }
+    Args { images, models, runs, warmup, tile_sizes, save_output }
 }
 
 fn print_help() {
@@ -129,6 +137,8 @@ fn print_help() {
     println!("  --warmup <N>            Warmup runs per (image,model) [default: 1]");
     println!("  --tile-size <a,b,c>     Comma-separated tile sizes to sweep (overrides");
     println!("                          model_tile_size). Fixed-size models may fail.");
+    println!("  --save-output <DIR>     Save the last measured run's output PNG per");
+    println!("                          (image, model, tile_size) for visual comparison.");
     println!("  --help, -h              Show this help\n");
     println!("Model names:");
     println!("  realesrgan_x4plus, realesrgan_anime6b, realesr_general_v3,");
@@ -191,18 +201,58 @@ fn main() {
             };
 
             for ts in &sweep {
-                // warmup
+                // warmup (固定入力モデル等で失敗した場合はこの tile_size をスキップ)
+                let mut warmup_failed = false;
                 for _ in 0..args.warmup {
-                    let _ = upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts)
-                        .expect("warmup upscale");
+                    if let Err(e) = upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts) {
+                        eprintln!("  skip [{}] tile_size={:?}: {}", label, ts, e);
+                        warmup_failed = true;
+                        break;
+                    }
+                }
+                if warmup_failed {
+                    continue;
                 }
 
-                // measured runs
+                // measured runs。 --save-output 指定時は最後のランの出力を PNG に保存。
                 let mut runs_timings: Vec<UpscaleTimings> = Vec::new();
-                for _ in 0..args.runs {
-                    let (_out, t) = upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts)
-                        .expect("upscale");
-                    runs_timings.push(t);
+                let mut run_failed = false;
+                let mut last_output: Option<egui::ColorImage> = None;
+                for run_idx in 0..args.runs {
+                    match upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts) {
+                        Ok((out, t)) => {
+                            runs_timings.push(t);
+                            if args.save_output.is_some() && run_idx + 1 == args.runs {
+                                last_output = Some(out);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  skip [{}] tile_size={:?} mid-run: {}", label, ts, e);
+                            run_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if run_failed || runs_timings.is_empty() {
+                    continue;
+                }
+
+                // 出力 PNG 保存
+                if let (Some(dir), Some(out)) = (args.save_output.as_ref(), last_output.as_ref()) {
+                    let stem = img_path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("image");
+                    let ts_tag = match ts {
+                        Some(n) => format!("tile{}", n),
+                        None => String::from("tiledefault"),
+                    };
+                    let filename = format!("{}__{}__{}.png", stem, label, ts_tag);
+                    let path = dir.join(&filename);
+                    if let Err(e) = save_color_image_png(out, &path) {
+                        eprintln!("  failed to save {}: {}", path.display(), e);
+                    } else {
+                        println!("  saved: {}", path.display());
+                    }
                 }
 
                 let ts_label = match ts {
@@ -307,11 +357,34 @@ fn print_model_summary(
     println!("      blend:   {:6.2} ms ({:4.1}%)", avg_blend, pct_blend);
     println!("      total:   {:6.2} ms", tile_sum);
 
-    // 各ラン総時間の分布
+    // 各ラン総時間の分布 (min / avg / max + stddev + CI)
     let totals: Vec<f64> = runs.iter().map(|r| r.total_ms).collect();
     let min_t = totals.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_t = totals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    println!("    run-total min/avg/max: {:.1} / {:.1} / {:.1} ms", min_t, avg_total, max_t);
+    let n = totals.len() as f64;
+    let mean = avg_total;
+    let variance = totals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    let stddev = variance.sqrt();
+    let cv_pct = 100.0 * stddev / mean.max(1e-9);
+    // 95% CI (正規近似; t 分布ではないが小 N でもおおまかな目安)
+    let ci95 = 1.96 * stddev / n.sqrt();
+    println!("    run-total min/avg/max: {:.1} / {:.1} / {:.1} ms", min_t, mean, max_t);
+    println!("    run-total stddev:      {:.1} ms  (CV {:.1}%, 95% CI ±{:.1} ms, N={})",
+             stddev, cv_pct, ci95, totals.len());
+}
+
+/// egui::ColorImage を PNG として保存する (RGBA8)。
+fn save_color_image_png(img: &egui::ColorImage, path: &std::path::Path) -> Result<(), String> {
+    let w = img.size[0] as u32;
+    let h = img.size[1] as u32;
+    let mut rgba = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let c = img.pixels[(y as usize) * (w as usize) + (x as usize)];
+            rgba.put_pixel(x, y, image::Rgba([c.r(), c.g(), c.b(), c.a()]));
+        }
+    }
+    rgba.save(path).map_err(|e| e.to_string())
 }
 
 // 未使用警告を回避するため (TileTiming は print_* からのみ参照)
