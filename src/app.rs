@@ -560,6 +560,26 @@ pub struct App {
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
+
+    /// 第2シグナル (`finalized=true`) を受け取ったが、第1シグナルの ColorImage が
+    /// `texture_backlog` でアップロード待ちのため `requested` から remove できなかった
+    /// idx の集合。次回その idx が Loaded 化したタイミングで `requested` から remove する。
+    ///
+    /// これがないと: backlog 詰まり中に finalized で requested を remove → 次フレームに
+    /// `need_load && !requested.contains` で再エンキュー → 同じ画像を何度も decode する
+    /// 無限ループ (重複デコード地獄) になる。
+    pub(crate) pending_finalize: std::collections::HashSet<usize>,
+
+    // ── スクロール体感ロギング (--log 時) ──────────────────────────
+    /// 直近のフレームで計算した可視範囲 (raw idx)。
+    pub(crate) last_vis_range: (usize, usize),
+    /// 可視範囲が安定 (= 1 フレーム以上同じ) になった瞬間。
+    /// vis 範囲が変わるたびに `None` にリセットされる。
+    pub(crate) vis_settle_at: Option<std::time::Instant>,
+    /// 安定後、可視範囲内の最初のサムネイルが Loaded 化したことをログ済みか。
+    pub(crate) vis_first_logged: bool,
+    /// 安定後、可視範囲内の全サムネイルが Loaded 化したことをログ済みか。
+    pub(crate) vis_all_logged: bool,
     /// 検索バーにフォーカスを当てるフラグ（1フレームだけ true）
     pub(crate) search_focus_request: bool,
     /// 検索バーの TextEdit がフォーカスを持っているか（毎フレーム更新）
@@ -943,6 +963,11 @@ impl Default for App {
             search_query: String::new(),
             search_filter: None,
             visible_indices: Vec::new(),
+            pending_finalize: std::collections::HashSet::new(),
+            last_vis_range: (0, 0),
+            vis_settle_at: None,
+            vis_first_logged: false,
+            vis_all_logged: false,
             search_focus_request: false,
             search_has_focus: false,
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
@@ -1824,6 +1849,7 @@ impl App {
             .map(|_| ThumbnailState::Pending)
             .collect();
         self.requested.clear();
+        self.pending_finalize.clear();
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.metadata_cache.clear();
@@ -2102,6 +2128,7 @@ impl App {
                             from_cache: false,
                             source_dims: None,
                             canceled: true,
+                            finalized: false,
                             input_seq: req.input_seq,
                         });
                         continue;
@@ -2204,6 +2231,7 @@ impl App {
                     from_cache: false,
                     source_dims: None,
                     canceled: false,
+                    finalized: false,
                     input_seq: 0,
                 });
             }
@@ -2235,6 +2263,7 @@ impl App {
                 from_cache,
                 source_dims,
                 canceled,
+                finalized,
                 input_seq: req_input_seq,
             } = msg;
             if i >= self.thumbnails.len() {
@@ -2244,11 +2273,30 @@ impl App {
 
             let in_keep_range = i >= keep_start && i < keep_end;
 
+            // finalized = true: 第 2 シグナル (decode 成功 + cache save 完了)。
+            // **`thumbnails[i]` の状態は変更しない**。
+            //
+            // requested.remove は **Loaded 化が完了している場合のみ** 実行する。
+            // 第1シグナルが texture_backlog でアップロード待ちのときに requested を
+            // 抜くと、次フレームに Pending && !requested.contains で再エンキュー →
+            // 同じ画像を何度も decode する無限ループになるため、そのケースは
+            // `pending_finalize` に idx を積んでアップロード完了時に remove する。
+            if finalized {
+                if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
+                    self.requested.remove(&i);
+                } else {
+                    self.pending_finalize.insert(i);
+                }
+                received += 1;
+                continue;
+            }
+
             // canceled = true: ワーカーが処理を中断 (STALE 等)。
             // Failed にはせず、Evicted に戻して再試行可能にする。
             // Loaded 状態は維持 (既にテクスチャがある場合は破棄しない)。
             if canceled {
                 self.requested.remove(&i);
+                self.pending_finalize.remove(&i);
                 if !matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
                     self.thumbnails[i] = ThumbnailState::Evicted;
                 }
@@ -2286,6 +2334,10 @@ impl App {
                             source_dims,
                         };
                         textures_created += 1;
+                        // 第2シグナル先着の場合の遅延 requested.remove を実行。
+                        if self.pending_finalize.remove(&i) {
+                            self.requested.remove(&i);
+                        }
                         // Pending/Evicted → Loaded の遷移時のみ ready を emit
                         // (アップグレードで Loaded→Loaded の遷移も起きるためフィルタ)。
                         // seq はエンキュー元のを透過し、decode 中のスクロールで
@@ -2306,6 +2358,31 @@ impl App {
                                 ],
                             );
                         }
+                        // ── スクロール体感: vis 内の Pending → Loaded 遷移を計測 ──
+                        if !prev_state_was_loaded
+                            && i >= self.last_vis_range.0
+                            && i < self.last_vis_range.1
+                            && let Some(settle_t) = self.vis_settle_at
+                        {
+                            let elapsed_ms = settle_t.elapsed().as_secs_f64() * 1000.0;
+                            if !self.vis_first_logged {
+                                crate::logger::log(format!(
+                                    "[vis] first_visible idx={i} +{elapsed_ms:.1}ms after settle",
+                                ));
+                                self.vis_first_logged = true;
+                            }
+                            if !self.vis_all_logged {
+                                let all_loaded = (self.last_vis_range.0..self.last_vis_range.1)
+                                    .all(|j| matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. })));
+                                if all_loaded {
+                                    crate::logger::log(format!(
+                                        "[vis] all_loaded vis=[{}..{}) +{elapsed_ms:.1}ms after settle",
+                                        self.last_vis_range.0, self.last_vis_range.1,
+                                    ));
+                                    self.vis_all_logged = true;
+                                }
+                            }
+                        }
                     } else if in_keep_range {
                         // 上限到達だが keep_range 内: 次フレームに持ち越す。
                         // requested は除去しない (重複リクエスト防止)
@@ -2315,6 +2392,7 @@ impl App {
                             from_cache,
                             source_dims,
                             canceled: false,
+                            finalized: false,
                             input_seq: req_input_seq,
                         });
                     } else {
@@ -2329,6 +2407,7 @@ impl App {
                 }
                 None => {
                     self.requested.remove(&i);
+                    self.pending_finalize.remove(&i);
                     self.thumbnails[i] = ThumbnailState::Failed;
                 }
             }
@@ -2485,6 +2564,33 @@ impl App {
             .map(|i| i + 1)
             .unwrap_or(total)
             .min(total);
+
+        // ── スクロール体感ロギング ─────────────────────────────────────
+        // vis 範囲が変化した瞬間 → 安定した瞬間 → 範囲内サムネイルが揃った瞬間を
+        // ログに残し、「スクロール停止後にサムネイルが描かれるまでの遅延」を可視化する。
+        let cur_vis_range = (visible_raw_start, visible_raw_end);
+        if cur_vis_range != self.last_vis_range {
+            self.last_vis_range = cur_vis_range;
+            self.vis_settle_at = None;
+            self.vis_first_logged = false;
+            self.vis_all_logged = false;
+        } else if self.vis_settle_at.is_none() && cur_vis_range.0 < cur_vis_range.1 {
+            self.vis_settle_at = Some(std::time::Instant::now());
+            crate::logger::log(format!(
+                "[vis] settle vis=[{}..{}) ({} cells)",
+                visible_raw_start,
+                visible_raw_end,
+                visible_raw_end - visible_raw_start,
+            ));
+            // 安定した瞬間に既に全 Loaded ならその場で all_loaded ログ
+            let all_loaded_now = (visible_raw_start..visible_raw_end)
+                .all(|j| matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. })));
+            if all_loaded_now {
+                crate::logger::log("[vis] all_loaded 0ms after settle (already cached)".to_string());
+                self.vis_first_logged = true;
+                self.vis_all_logged = true;
+            }
+        }
 
         // 通常リクエストと重い I/O リクエストを分けて収集
         let mut new_regular: Vec<LoadRequest> = Vec::new();
@@ -4371,7 +4477,8 @@ impl App {
                     Ok(img) => Ok(img),
                     Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
                         Some(img) => Ok(img),
-                        None => match crate::susie_loader::decode_bytes(hint, &bytes, None) {
+                        // フルスクリーン画像ロードは現在表示中のため priority=true
+                        None => match crate::susie_loader::decode_bytes(hint, &bytes, true, None) {
                             Ok(img) => Ok(img),
                             Err(_) => Err(e),
                         },
@@ -4382,7 +4489,8 @@ impl App {
                     Ok(img) => Ok(img),
                     Err(e) => match crate::wic_decoder::decode_to_dynamic_image(&path) {
                         Some(img) => Ok(img),
-                        None => match crate::susie_loader::decode_file(&path, None) {
+                        // フルスクリーン画像ロードは現在表示中のため priority=true
+                        None => match crate::susie_loader::decode_file(&path, true, None) {
                             Ok(img) => Ok(img),
                             Err(_) => Err(e),
                         },

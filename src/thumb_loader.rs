@@ -68,6 +68,14 @@ pub struct ThumbMsg {
     /// `image` は必ず `None`。UI 側は `thumbnails[idx]` を `Evicted` に戻し、
     /// `requested` からも削除して **再試行可能** な状態にする (`Failed` にはしない)。
     pub canceled: bool,
+    /// **第2シグナル**: デコード成功後にキャッシュ保存判定 (or 保存スキップ) が完了して
+    /// `requested` から idx を抜くだけの通知 (`canceled` と排他、両方 true にはしない)。
+    /// UI 側は `requested.remove(&idx)` のみ行い、**`thumbnails[idx]` の状態は変更しない**。
+    ///
+    /// 理由: 第1シグナル (image=Some) が `texture_backlog` に積まれて Pending のまま
+    /// アップロード待ちになっているケースで、第2シグナルが Pending を Evicted に
+    /// 書き換えると、次フレームに同じセルが再エンキュー → 重複デコード地獄になる。
+    pub finalized: bool,
     /// エンキュー時の `LoadRequest::input_seq` を透過する。perf ログで enqueue /
     /// decode / ready を相関付けるのに使う。計装無効時や未設定時は 0。
     pub input_seq: u64,
@@ -320,6 +328,75 @@ fn decode_jpeg_turbo_from_bytes(data: &[u8]) -> Option<image::DynamicImage> {
     Some(image::DynamicImage::ImageRgb8(img))
 }
 
+/// 拡張子 (小文字、先頭 `.` なし) が **Susie プラグイン専用** か判定する。
+///
+/// 「ネイティブ (image クレート / WIC) でデコード不可、かつ Susie が対応する」
+/// 場合に true。MAG / PI / PIC / Q4 / MAKI 等が該当。
+///
+/// この場合 image::open + WIC を試行する分のオーバーヘッド (約 5ms/枚) を
+/// 省くため、デコードチェーンを直接 Susie へショートカットする。
+fn is_susie_only_ext(ext_lower: &str) -> bool {
+    !crate::folder_tree::SUPPORTED_EXTENSIONS.contains(&ext_lower)
+        && crate::susie_loader::supports_extension(ext_lower)
+}
+
+/// パスから小文字拡張子を抜き出すヘルパ。拡張子なしなら空文字列。
+fn ext_lower(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// ZIP エントリ名から小文字拡張子を抜き出すヘルパ。
+fn ext_lower_str(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// ZIP エントリのバイト列を image → WIC → Susie の順にフォールバックしてデコード。
+/// 成功した経路を `decode_source` に書き戻す (Native はデフォルト、変更しない)。
+///
+/// 拡張子が Susie 専用 (MAG/PI 等) の場合は image::open + WIC をスキップし、
+/// 直接 Susie へ送ることで約 5ms/枚のオーバーヘッドを削減する。
+fn decode_zip_chain(
+    bytes: &[u8],
+    entry_name: &str,
+    priority: bool,
+    cancel: Option<Arc<AtomicBool>>,
+    decode_source: &mut crate::stats::DecodeSource,
+) -> Result<image::DynamicImage, image::ImageError> {
+    // Susie 専用拡張子の高速パス (image / WIC で確実に失敗する分を省略)
+    if is_susie_only_ext(&ext_lower_str(entry_name)) {
+        return match crate::susie_loader::decode_bytes(entry_name, bytes, priority, cancel) {
+            Ok(img) => {
+                *decode_source = crate::stats::DecodeSource::Susie;
+                Ok(img)
+            }
+            Err(e) => Err(image::ImageError::IoError(e)),
+        };
+    }
+    match image::load_from_memory(bytes) {
+        Ok(img) => Ok(img),
+        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes) {
+            Some(img) => {
+                *decode_source = crate::stats::DecodeSource::Wic;
+                Ok(img)
+            }
+            None => match crate::susie_loader::decode_bytes(entry_name, bytes, priority, cancel) {
+                Ok(img) => {
+                    *decode_source = crate::stats::DecodeSource::Susie;
+                    Ok(img)
+                }
+                Err(_) => Err(e),
+            },
+        },
+    }
+}
+
 const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif"];
 
 fn is_jpeg_extension(ext: &str) -> bool {
@@ -458,6 +535,7 @@ pub fn process_load_request(
                 from_cache: true,
                 source_dims,
                 canceled: false,
+                finalized: false,
                 input_seq: req.input_seq,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
@@ -517,6 +595,7 @@ pub fn process_load_request(
                 from_cache: false,
                 source_dims: None,
                 canceled: false,
+                finalized: false,
                 input_seq: req.input_seq,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
@@ -562,6 +641,7 @@ pub fn process_load_request(
                     from_cache: false,
                     source_dims: None,
                     canceled: false,
+                    finalized: false,
                     input_seq: req.input_seq,
                 });
                 gen_done.fetch_add(1, Ordering::Relaxed);
@@ -604,6 +684,7 @@ pub fn process_load_request(
                 from_cache: false,
                 source_dims: None,
                 canceled: true,
+                finalized: false,
                 input_seq: req.input_seq,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
@@ -641,6 +722,7 @@ pub fn process_load_request(
                 from_cache: false,
                 source_dims: None,
                 canceled: true,
+                finalized: false,
                 input_seq: req.input_seq,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
@@ -661,6 +743,7 @@ pub fn process_load_request(
         thumb_px, thumb_quality, display_px, cache_decision,
         stats,
         cancel,
+        req.priority,
         req.input_seq,
     );
     if crate::perf::is_enabled() {
@@ -769,6 +852,8 @@ pub fn load_one_cached(
     cache_decision: CacheDecision,
     stats: &Arc<Mutex<crate::stats::ThumbStats>>,
     cancel: Option<&Arc<AtomicBool>>,
+    // 可視セルの要求は true。Susie プールへ priority=true で渡され、キュー先頭に挿入される。
+    priority: bool,
     // エンキュー元の `LoadRequest::input_seq`。perf 相関用に ThumbMsg にそのまま載せる。
     // 0 は未設定 (計装無効時)。
     input_seq: u64,
@@ -799,6 +884,9 @@ pub fn load_one_cached(
     //                     失敗時は WIC (SHCreateMemStream + CreateDecoderFromStream) にフォールバック
     // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
     //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
+    //
+    // どのデコーダ経路で成功したかを `decode_source` に記録し、後段の統計に渡す。
+    let mut decode_source = crate::stats::DecodeSource::Native;
     let img_result = if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダは Normal 優先度: プールの予約ワーカーは
         // フルスクリーン現在ページ用に空けておく
@@ -817,26 +905,32 @@ pub fn load_one_cached(
             crate::zip_loader::read_entry_bytes(path, entry_name)
                 .map_err(image::ImageError::IoError)
         };
-        bytes_result.and_then(|bytes| {
-            // JPEG なら TurboJPEG で高速デコードを試す
-            if is_jpeg_entry(entry_name) {
-                if let Some(img) = decode_jpeg_turbo_from_bytes(&bytes) {
-                    return Ok(img);
+        match bytes_result {
+            Err(e) => Err(e),
+            Ok(bytes) => {
+                // JPEG なら TurboJPEG で高速デコードを試す
+                if is_jpeg_entry(entry_name) {
+                    if let Some(img) = decode_jpeg_turbo_from_bytes(&bytes) {
+                        Ok(img)
+                    } else {
+                        // image → WIC → Susie のフォールバック
+                        decode_zip_chain(&bytes, entry_name, priority, cancel.cloned(), &mut decode_source)
+                    }
+                } else {
+                    decode_zip_chain(&bytes, entry_name, priority, cancel.cloned(), &mut decode_source)
                 }
             }
-            // image クレート → (失敗時) WIC → (失敗時) Susie プラグインへフォールバック
-            // (HEIC / AVIF / JXL / RAW など image クレート非対応形式が ZIP 内にあっても開ける)
-            match image::load_from_memory(&bytes) {
-                Ok(img) => Ok(img),
-                Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
-                    Some(img) => Ok(img),
-                    None => match crate::susie_loader::decode_bytes(entry_name, &bytes, cancel.cloned()) {
-                        Ok(img) => Ok(img),
-                        Err(_) => Err(e),
-                    },
-                },
+        }
+    } else if is_susie_only_ext(&ext_lower(path)) {
+        // Susie 専用拡張子の高速パス: image::open + WIC をスキップして直接 Susie へ。
+        // MAG / PI / PIC / Q4 / MAKI 等で 1 枚あたり約 5ms 短縮。
+        match crate::susie_loader::decode_file(path, priority, cancel.cloned()) {
+            Ok(img) => {
+                decode_source = crate::stats::DecodeSource::Susie;
+                Ok(img)
             }
-        })
+            Err(e) => Err(image::ImageError::IoError(e)),
+        }
     } else {
         // 通常ファイル: JPEG なら TurboJPEG を最初に試す
         let turbo_result = if is_jpeg_ext(path) {
@@ -861,9 +955,15 @@ pub fn load_one_cached(
             match primary {
                 Ok(img) => Ok(img),
                 Err(e) => match crate::wic_decoder::decode_to_dynamic_image(path) {
-                    Some(img) => Ok(img),
-                    None => match crate::susie_loader::decode_file(path, cancel.cloned()) {
-                        Ok(img) => Ok(img),
+                    Some(img) => {
+                        decode_source = crate::stats::DecodeSource::Wic;
+                        Ok(img)
+                    }
+                    None => match crate::susie_loader::decode_file(path, priority, cancel.cloned()) {
+                        Ok(img) => {
+                            decode_source = crate::stats::DecodeSource::Susie;
+                            Ok(img)
+                        }
                         Err(_) => Err(e),
                     },
                 },
@@ -888,6 +988,7 @@ pub fn load_one_cached(
                 from_cache: false,
                 source_dims: None,
                 canceled: false,
+                finalized: false,
                 input_seq,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
@@ -927,10 +1028,11 @@ pub fn load_one_cached(
         from_cache: false,
         source_dims,
         canceled: false,
+        finalized: false,
         input_seq,
     });
 
-    // 統計: 画像のフルデコード時間・サイズ・フォーマットを記録
+    // 統計: 画像のフルデコード時間・サイズ・フォーマット・デコーダ経路を記録
     {
         // 拡張子の取得元: PDF ページなら "pdf"、ZIP エントリならエントリ名、通常ならファイルパス
         let ext_source: &str = if pdf_page.is_some() {
@@ -942,7 +1044,7 @@ pub fn load_one_cached(
         };
         let ext = ext_source.rsplit('.').next().unwrap_or("");
         if let Ok(mut s) = stats.lock() {
-            s.record_image(decode_ms + display_ms, file_size.max(0) as u64, ext);
+            s.record_image(decode_ms + display_ms, file_size.max(0) as u64, ext, decode_source);
         }
     }
 
@@ -991,15 +1093,16 @@ pub fn load_one_cached(
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
     gen_done.fetch_add(1, Ordering::Relaxed);
 
-    // 第 2 シグナル: cache save (or skip) 完了を UI に通知し `requested` から
-    // 抜く。canceled=true だが thumbnails[i] が既に Loaded なら state は維持される
-    // (poll_thumbnails の canceled 分岐参照)。
+    // 第 2 シグナル: cache save (or skip) 完了を UI に通知し `requested` から抜く。
+    // `finalized=true` を立てることで poll_thumbnails 側は **状態を変更せず** requested
+    // からの削除のみ行う (texture_backlog で Pending アップロード待ちのケースを保護)。
     let _ = tx.send(ThumbMsg {
         idx,
         image: None,
         from_cache: false,
         source_dims: None,
-        canceled: true,
+        canceled: false,
+        finalized: true,
         input_seq,
     });
 }

@@ -101,6 +101,55 @@ impl App {
                     ui.separator();
                     ui.add_space(6.0);
 
+                    // ── デコーダ経路別件数 ──
+                    // フォーマット集計とは独立した軸。同じ画像が両方に 1 件ずつ加算される。
+                    ui.heading("デコーダ経路");
+                    ui.add_space(4.0);
+                    let total_imgs = snapshot.total_images();
+                    let count_native = total_imgs.saturating_sub(snapshot.count_wic + snapshot.count_susie);
+                    let time_native = (snapshot.time_jpg
+                        + snapshot.time_png
+                        + snapshot.time_webp
+                        + snapshot.time_gif
+                        + snapshot.time_bmp
+                        + snapshot.time_other
+                        - snapshot.time_wic
+                        - snapshot.time_susie)
+                        .max(0.0);
+                    let decoder_rows: [(&str, u64, f64); 3] = [
+                        ("Native", count_native,           time_native),
+                        ("WIC   ", snapshot.count_wic,    snapshot.time_wic),
+                        ("Susie ", snapshot.count_susie,  snapshot.time_susie),
+                    ];
+                    draw_format_rows(ui, &decoder_rows);
+
+                    // Susie 拡張子別内訳 (Susie 経由が 1 件以上ある場合のみ)
+                    if snapshot.count_susie > 0 {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("  Susie プラグイン (拡張子別)")
+                                .strong(),
+                        );
+                        ui.add_space(2.0);
+                        // BTreeMap なので拡張子順で並ぶ。表示時は (".mag", N, ms) 形式に整形。
+                        let labels: Vec<String> = snapshot
+                            .susie_by_ext
+                            .keys()
+                            .map(|e| format!(".{e:<5}"))
+                            .collect();
+                        let susie_rows: Vec<(&str, u64, f64)> = snapshot
+                            .susie_by_ext
+                            .values()
+                            .zip(labels.iter())
+                            .map(|((c, t), label)| (label.as_str(), *c, *t))
+                            .collect();
+                        draw_format_rows(ui, &susie_rows);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
                     // ── サマリ ──
                     let total_images = snapshot.total_images();
                     let total_all = total_images + snapshot.count_video;

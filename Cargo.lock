@@ -3303,6 +3303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "png2mag"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "color_quant",
+ "image",
+ "rayon",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
