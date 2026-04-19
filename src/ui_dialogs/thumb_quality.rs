@@ -243,7 +243,9 @@ impl App {
                 self.settings.thumb_quality = self.tq.b_quality;
                 self.settings.save();
                 self.close_thumb_quality_dialog();
-            } else if !open || escape_pressed {
+            } else if !open || (escape_pressed && !self.tq.fullscreen) {
+                // fullscreen preview overlay 表示中は overlay 側 (後続呼び出し) が
+                // Escape を処理する。親ダイアログまで閉じてしまわないようガード。
                 self.close_thumb_quality_dialog();
             }
         }
