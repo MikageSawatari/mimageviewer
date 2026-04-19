@@ -54,6 +54,9 @@ struct Args {
     models: Vec<(&'static str, ModelKind)>,
     runs: usize,
     warmup: usize,
+    /// カンマ区切りでタイルサイズを複数指定すると、各サイズで計測してまとめて表示する。
+    /// 空のときはモデル既定値 (model_tile_size) で 1 回のみ測定。
+    tile_sizes: Vec<u32>,
 }
 
 fn parse_args() -> Args {
@@ -62,6 +65,7 @@ fn parse_args() -> Args {
     let mut models: Vec<(&'static str, ModelKind)> = Vec::new();
     let mut runs: usize = 3;
     let mut warmup: usize = 1;
+    let mut tile_sizes: Vec<u32> = Vec::new();
 
     let mut i = 0;
     while i < raw.len() {
@@ -88,6 +92,13 @@ fn parse_args() -> Args {
                 i += 1;
                 warmup = raw[i].parse().expect("--warmup expects integer");
             }
+            "--tile-size" => {
+                i += 1;
+                for s in raw[i].split(',') {
+                    let n: u32 = s.trim().parse().expect("--tile-size expects comma-separated integers");
+                    tile_sizes.push(n);
+                }
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -104,7 +115,7 @@ fn parse_args() -> Args {
         models = default_models();
     }
 
-    Args { images, models, runs, warmup }
+    Args { images, models, runs, warmup, tile_sizes }
 }
 
 fn print_help() {
@@ -116,6 +127,8 @@ fn print_help() {
     println!("  --models <a,b,c>        Comma-separated model names");
     println!("  --runs <N>              Measured runs per (image,model) [default: 3]");
     println!("  --warmup <N>            Warmup runs per (image,model) [default: 1]");
+    println!("  --tile-size <a,b,c>     Comma-separated tile sizes to sweep (overrides");
+    println!("                          model_tile_size). Fixed-size models may fail.");
     println!("  --help, -h              Show this help\n");
     println!("Model names:");
     println!("  realesrgan_x4plus, realesrgan_anime6b, realesr_general_v3,");
@@ -169,27 +182,46 @@ fn main() {
         println!("================================================================");
 
         for (label, model) in &args.models {
-            // warmup
-            for _ in 0..args.warmup {
-                let (_img, _t) = upscale::upscale_with_timings(&runtime, *model, &img, &cancel)
-                    .expect("warmup upscale");
-            }
+            // タイルサイズ指定なしの場合はモデル既定値で 1 回だけ測定、
+            // 指定ありなら各サイズで測定して並べる。
+            let sweep: Vec<Option<u32>> = if args.tile_sizes.is_empty() {
+                vec![None]
+            } else {
+                args.tile_sizes.iter().map(|&s| Some(s)).collect()
+            };
 
-            // measured runs
-            let mut runs_timings: Vec<UpscaleTimings> = Vec::new();
-            for _ in 0..args.runs {
-                let (_img, t) = upscale::upscale_with_timings(&runtime, *model, &img, &cancel)
-                    .expect("upscale");
-                runs_timings.push(t);
-            }
+            for ts in &sweep {
+                // warmup
+                for _ in 0..args.warmup {
+                    let _ = upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts)
+                        .expect("warmup upscale");
+                }
 
-            print_model_summary(label, *model, &runs_timings);
-            println!();
+                // measured runs
+                let mut runs_timings: Vec<UpscaleTimings> = Vec::new();
+                for _ in 0..args.runs {
+                    let (_out, t) = upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts)
+                        .expect("upscale");
+                    runs_timings.push(t);
+                }
+
+                let ts_label = match ts {
+                    Some(n) => format!("{} (override)", n),
+                    None => String::from("default"),
+                };
+                print_model_summary(label, *model, &runs_timings, &ts_label);
+                println!();
+            }
         }
     }
 }
 
-fn print_model_summary(label: &str, _model: ModelKind, runs: &[UpscaleTimings]) {
+fn print_model_summary(
+    label: &str,
+    _model: ModelKind,
+    runs: &[UpscaleTimings],
+    tile_size_label: &str,
+) {
     let n_runs = runs.len();
     let sample = &runs[0];
     let n_tiles = sample.tiles.len();
@@ -198,21 +230,34 @@ fn print_model_summary(label: &str, _model: ModelKind, runs: &[UpscaleTimings]) 
     let mut sum_extract = 0.0f64;
     let mut sum_infer = 0.0f64;
     let mut sum_blend = 0.0f64;
+    let mut sum_tbuild = 0.0f64;
+    let mut sum_srun = 0.0f64;
+    let mut sum_textract = 0.0f64;
+    let mut sum_pcopy = 0.0f64;
     for r in runs {
         for t in &r.tiles {
             sum_extract += t.extract_ms;
             sum_infer += t.infer_ms;
             sum_blend += t.blend_ms;
+            sum_tbuild += t.tensor_build_ms;
+            sum_srun += t.session_run_ms;
+            sum_textract += t.tensor_extract_ms;
+            sum_pcopy += t.post_copy_ms;
         }
     }
     let n_total_tiles = (n_runs * n_tiles) as f64;
     let avg_extract = sum_extract / n_total_tiles;
     let avg_infer = sum_infer / n_total_tiles;
     let avg_blend = sum_blend / n_total_tiles;
+    let avg_tbuild = sum_tbuild / n_total_tiles;
+    let avg_srun = sum_srun / n_total_tiles;
+    let avg_textract = sum_textract / n_total_tiles;
+    let avg_pcopy = sum_pcopy / n_total_tiles;
     let tile_sum = avg_extract + avg_infer + avg_blend;
     let pct_extract = 100.0 * avg_extract / tile_sum.max(1e-9);
     let pct_infer = 100.0 * avg_infer / tile_sum.max(1e-9);
     let pct_blend = 100.0 * avg_blend / tile_sum.max(1e-9);
+    let infer_overhead = avg_infer - (avg_tbuild + avg_srun + avg_textract + avg_pcopy);
 
     // タイル単位の中央値・最大・最小 (推論時間の分布確認)
     let mut infer_all: Vec<f64> = runs.iter().flat_map(|r| r.tiles.iter().map(|t| t.infer_ms)).collect();
@@ -235,8 +280,9 @@ fn print_model_summary(label: &str, _model: ModelKind, runs: &[UpscaleTimings]) 
     let scale = sample.scale;
     let tile_size = sample.tile_size;
 
-    println!("  [{}] {}x{} → {}x{} ({}x), tile={}px, tiles/run={}",
-             label, in_w, in_h, in_w * scale, in_h * scale, scale, tile_size, n_tiles);
+    println!("  [{}] tile_size={}  actual={}px  {}x{} → {}x{} ({}x), tiles/run={}",
+             label, tile_size_label, tile_size,
+             in_w, in_h, in_w * scale, in_h * scale, scale, n_tiles);
     println!("    wall total (avg of {} runs): {:8.1} ms", n_runs, avg_total);
     println!("      prep (decode to rgb8 etc): {:8.1} ms", avg_prep);
     println!("      alpha resample (Lanczos3): {:8.1} ms", avg_alpha);
@@ -249,6 +295,15 @@ fn print_model_summary(label: &str, _model: ModelKind, runs: &[UpscaleTimings]) 
     println!("      extract: {:6.2} ms ({:4.1}%)", avg_extract, pct_extract);
     println!("      infer:   {:6.2} ms ({:4.1}%)   [min {:6.2} / median {:6.2} / max {:6.2}]",
              avg_infer, pct_infer, infer_min, infer_median, infer_max);
+    println!("        tensor_build:    {:6.3} ms ({:4.1}% of infer)",
+             avg_tbuild, 100.0 * avg_tbuild / avg_infer.max(1e-9));
+    println!("        session_run:     {:6.3} ms ({:4.1}% of infer)  <- GPU compute + transfer",
+             avg_srun, 100.0 * avg_srun / avg_infer.max(1e-9));
+    println!("        tensor_extract:  {:6.3} ms ({:4.1}% of infer)",
+             avg_textract, 100.0 * avg_textract / avg_infer.max(1e-9));
+    println!("        post_copy:       {:6.3} ms ({:4.1}% of infer)",
+             avg_pcopy, 100.0 * avg_pcopy / avg_infer.max(1e-9));
+    println!("        (residual):      {:6.3} ms (with_session lock/Mutex etc)", infer_overhead);
     println!("      blend:   {:6.2} ms ({:4.1}%)", avg_blend, pct_blend);
     println!("      total:   {:6.2} ms", tile_sum);
 

@@ -45,8 +45,19 @@ pub struct UpscaleResult {
 /// 1 タイル分のタイミング内訳（ベンチマーク用）。
 #[derive(Debug, Clone, Copy)]
 pub struct TileTiming {
+    /// RgbImage → Array4<f32> コピー (CPU)
     pub extract_ms: f64,
+    /// `run_tile_inference` 全体 (以下 4 項目の合計 + ORT 呼び出しオーバーヘッド)
     pub infer_ms: f64,
+    /// `ort::value::Tensor::from_array` (CPU, ndarray → ORT tensor)
+    pub tensor_build_ms: f64,
+    /// `session.run(...)` (GPU 計算 + host↔device 転送を含む)
+    pub session_run_ms: f64,
+    /// `outputs[0].try_extract_tensor::<f32>()` (CPU, ORT tensor → 参照取得)
+    pub tensor_extract_ms: f64,
+    /// 出力テンソルから `data: Vec<f32>` へのスカラ変換コピー (CPU)
+    pub post_copy_ms: f64,
+    /// 累積バッファへの blend (CPU、Case B 以降は別スレッドで並列実行)
     pub blend_ms: f64,
 }
 
@@ -137,6 +148,18 @@ pub fn upscale_with_timings(
     input: &image::DynamicImage,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(egui::ColorImage, UpscaleTimings), AiError> {
+    upscale_with_timings_opts(runtime, model_kind, input, cancel, None)
+}
+
+/// `upscale_with_timings` に `tile_size_override` を加えた版。
+/// 固定入力サイズの ONNX モデル (例: RealPLKSR 256) では override すると推論が失敗する。
+pub fn upscale_with_timings_opts(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+    tile_size_override: Option<u32>,
+) -> Result<(egui::ColorImage, UpscaleTimings), AiError> {
     let t_all = std::time::Instant::now();
     let t_prep = std::time::Instant::now();
 
@@ -146,7 +169,7 @@ pub fn upscale_with_timings(
     let out_w = in_w * scale;
     let out_h = in_h * scale;
 
-    let tile_size = model_tile_size(model_kind);
+    let tile_size = tile_size_override.unwrap_or_else(|| model_tile_size(model_kind));
 
     crate::logger::log(format!(
         "[AI] Upscaling {}x{} → {}x{} ({}x) with {:?}, tile={}px overlap={}px",
@@ -212,7 +235,11 @@ pub fn upscale_with_timings(
     // std::thread::scope を使い、accum と timings は `&mut` 借用で受け渡す。
     let (tile_timings, blend_wait_ms): (Vec<TileTiming>, f64) =
         std::thread::scope(|s| -> Result<(Vec<TileTiming>, f64), AiError> {
-        let (tx, rx) = std::sync::mpsc::channel::<(TileRect, TileOutput, f64, f64)>();
+        // sync_channel(2): 推論と blend の 1 タイル分オーバーラップは保ちつつ、
+        // blend が詰まっても TileOutput が 2 個以上積まれないように背圧を掛ける
+        // (VRAM が厳しい環境で OOM を避けるための保険)。
+        type Msg = (TileRect, TileOutput, f64, f64, InferBreakdown);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Msg>(2);
         let accum_r_ref = &mut accum_r;
         let accum_g_ref = &mut accum_g;
         let accum_b_ref = &mut accum_b;
@@ -221,7 +248,7 @@ pub fn upscale_with_timings(
 
         let blender = s.spawn(move || -> Vec<TileTiming> {
             let mut timings: Vec<TileTiming> = Vec::with_capacity(tiles_len);
-            while let Ok((tile, tile_out, extract_ms, infer_ms)) = rx.recv() {
+            while let Ok((tile, tile_out, extract_ms, infer_ms, brk)) = rx.recv() {
                 let t_blend = std::time::Instant::now();
                 blend_tile(
                     accum_r_ref, accum_g_ref, accum_b_ref, accum_w_ref,
@@ -231,7 +258,15 @@ pub fn upscale_with_timings(
                     in_w, in_h,
                 );
                 let blend_ms = t_blend.elapsed().as_secs_f64() * 1000.0;
-                timings.push(TileTiming { extract_ms, infer_ms, blend_ms });
+                timings.push(TileTiming {
+                    extract_ms,
+                    infer_ms,
+                    tensor_build_ms: brk.tensor_build_ms,
+                    session_run_ms: brk.session_run_ms,
+                    tensor_extract_ms: brk.tensor_extract_ms,
+                    post_copy_ms: brk.post_copy_ms,
+                    blend_ms,
+                });
             }
             timings
         });
@@ -253,7 +288,7 @@ pub fn upscale_with_timings(
             let tile_input = extract_tile(&rgb, tile);
             let t_infer_begin = std::time::Instant::now();
             let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
-            let tile_out = match run_tile_inference(runtime, model_kind, tile_input) {
+            let (tile_out, breakdown) = match run_tile_inference(runtime, model_kind, tile_input) {
                 Ok(out) => out,
                 Err(e) => {
                     drop(tx);
@@ -264,7 +299,7 @@ pub fn upscale_with_timings(
             let t_send = std::time::Instant::now();
             let infer_ms = t_send.duration_since(t_infer_begin).as_secs_f64() * 1000.0;
 
-            if tx.send((tile.clone(), tile_out, extract_ms, infer_ms)).is_err() {
+            if tx.send((tile.clone(), tile_out, extract_ms, infer_ms, breakdown)).is_err() {
                 let _ = blender.join();
                 return Err(AiError::Ort(String::from("blender thread died")));
             }
@@ -409,23 +444,38 @@ struct TileOutput {
     height: u32,
 }
 
+/// `run_tile_inference` 内部の CPU/GPU 時間内訳 (ms)。
+#[derive(Debug, Clone, Copy, Default)]
+struct InferBreakdown {
+    tensor_build_ms: f64,
+    session_run_ms: f64,
+    tensor_extract_ms: f64,
+    post_copy_ms: f64,
+}
+
 /// 1 タイルの推論を実行する。
 fn run_tile_inference(
     runtime: &AiRuntime,
     model_kind: ModelKind,
     input: ndarray::Array4<f32>,
-) -> Result<TileOutput, AiError> {
+) -> Result<(TileOutput, InferBreakdown), AiError> {
+    let t0 = std::time::Instant::now();
     let input_tensor = ort::value::Tensor::from_array(input)
         .map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
+    let tensor_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     runtime.with_session(model_kind, |session| {
+        let t_run = std::time::Instant::now();
         let outputs = session
             .run(ort::inputs![input_tensor])
             .map_err(|e| AiError::Ort(format!("run ({model_kind:?}): {e}")))?;
+        let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
 
+        let t_extract = std::time::Instant::now();
         let (shape, raw) = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(|e| AiError::Ort(format!("extract ({model_kind:?}): {e}")))?;
+        let tensor_extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
 
         let dims: Vec<i64> = shape.iter().copied().collect();
         let (out_ch, actual_out_h, actual_out_w) = if dims.len() >= 4 {
@@ -438,6 +488,7 @@ fn run_tile_inference(
         // 入出力のインデックス構造は同一 (同じ c * plane_size + y * W + x) なので、
         // 先頭 ch * plane_size 要素を単純スカラ変換するだけで済む。
         // ch < 3 の場合は余りを 0 のままにする (vec! の初期値)。
+        let t_copy = std::time::Instant::now();
         let ch = out_ch.min(3);
         let plane_size = actual_out_h * actual_out_w;
         let filled = ch * plane_size;
@@ -446,12 +497,21 @@ fn run_tile_inference(
             let v = raw.get(i).copied().unwrap_or(0.0);
             data[i] = (v * 255.0).clamp(0.0, 255.0);
         }
+        let post_copy_ms = t_copy.elapsed().as_secs_f64() * 1000.0;
 
-        Ok(TileOutput {
-            data,
-            width: actual_out_w as u32,
-            height: actual_out_h as u32,
-        })
+        Ok((
+            TileOutput {
+                data,
+                width: actual_out_w as u32,
+                height: actual_out_h as u32,
+            },
+            InferBreakdown {
+                tensor_build_ms,
+                session_run_ms,
+                tensor_extract_ms,
+                post_copy_ms,
+            },
+        ))
     })
 }
 
