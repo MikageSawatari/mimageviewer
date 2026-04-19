@@ -157,7 +157,7 @@ fn decode_pi_matches_bmp_reference() {
     };
     susie_loader::reload(true, true);
 
-    let decoded = susie_loader::decode_file(&pi, None).expect("IPC decode failed");
+    let decoded = susie_loader::decode_file(&pi, true, None).expect("IPC decode failed");
     let decoded_rgba = decoded.to_rgba8();
     let reference = image::open(&bmp).expect("BMP open failed").to_rgba8();
     eprintln!(
@@ -191,7 +191,7 @@ fn decode_mag_matches_bmp_reference() {
     };
     susie_loader::reload(true, true);
 
-    let decoded = susie_loader::decode_file(&mag, None).expect("IPC decode failed");
+    let decoded = susie_loader::decode_file(&mag, true, None).expect("IPC decode failed");
     let decoded_rgba = decoded.to_rgba8();
     let reference = image::open(&bmp).expect("BMP open failed").to_rgba8();
     assert_eq!(decoded_rgba.dimensions(), reference.dimensions());
@@ -219,7 +219,7 @@ fn decode_bytes_via_ipc() {
 
     let bytes = std::fs::read(&pi).unwrap();
     let decoded =
-        susie_loader::decode_bytes("C165.PI", &bytes, None).expect("bytes decode failed");
+        susie_loader::decode_bytes("C165.PI", &bytes, true, None).expect("bytes decode failed");
     let decoded_rgba = decoded.to_rgba8();
     let reference = image::open(&bmp).expect("BMP open failed").to_rgba8();
     assert_eq!(decoded_rgba.dimensions(), reference.dimensions());
@@ -240,7 +240,7 @@ fn decode_works_with_parallel_off() {
     };
     // parallel = false: プールサイズ 1 で再起動
     susie_loader::reload(true, false);
-    let decoded = susie_loader::decode_file(&pi, None).expect("single-worker decode failed");
+    let decoded = susie_loader::decode_file(&pi, true, None).expect("single-worker decode failed");
     assert!(decoded.width() > 0 && decoded.height() > 0);
 
     // パラレル ON に戻しておく (後続テストが影響を受けないように)

@@ -43,7 +43,7 @@
 
 | 名前 | 方向 | 内容 |
 | --- | --- | --- |
-| `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, from_cache, source_dims, canceled)。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + canceled=true) → UI は `requested` を抜く。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE でも送信され、その場合 state は Evicted (retriable、Failed にしない) |
+| `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, from_cache, source_dims, canceled, finalized)。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false, finalized=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + finalized=true) → UI は `requested` を抜くだけで **`thumbnails[i]` は変更しない**。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE 専用 (worker bail-out) で、UI は Evicted に戻して再試行可能にする (Failed にしない)。`finalized=true` と `canceled=true` は排他 |
 | `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: Static / Animated / Failed |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | `(pages, password_needed)` |
@@ -174,7 +174,20 @@ AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1
      `poll_thumbnails` が `requested.remove` + `Evicted` (Failed にしない)
   3. cache hit 正常完了 → 第 1 シグナルで `poll_thumbnails` が `requested.remove`
   4. cache miss 正常完了 → **第 1 シグナル (display ColorImage) では remove しない**、
-     第 2 シグナル (cache save 完了、canceled=true) で remove。from_cache=false の判定で分岐
+     第 2 シグナル (cache save 完了、`finalized=true`) で remove。`finalized=true` の場合は
+     `thumbnails[i]` を **変更しない** (texture アップロード待ちの Pending を Evicted に
+     書き換えると次フレームに再エンキュー → 重複デコード地獄になる事故を防ぐ)。
+     旧実装は STALE と同じ `canceled=true` で送信していたため、texture_backlog に
+     アップロード待ちが詰まっている時に Pending → Evicted の上書きが起きていた。
+
+     **さらに finalized-vs-backlog レース**: 第 2 シグナルが先着したが第 1 シグナルの
+     ColorImage は `texture_backlog` に積まれてアップロード待ち、というケースで
+     即 `requested.remove` すると `Pending && !requested.contains` → 次フレーム再エンキュー
+     の無限ループになる。対策として `pending_finalize: HashSet<usize>` を追加し、
+     finalized 受信時に thumbnails[i] が **まだ Loaded でなければ** idx を
+     pending_finalize へ積む。アップロード完了 (新規 or backlog から) で Loaded 化した
+     瞬間に `pending_finalize.remove(&i)` が true を返せばその場で `requested.remove` する。
+     `canceled` / 失敗 / `load_folder` リセット時にも pending_finalize をクリア
 - **STALE チェックはワーカーパイプラインの 3 箇所**:
   - `spawn_worker` が pop 直後 (app.rs): キャッシュ lookup すら不要な明白な範囲外
   - `process_load_request` の heavy I/O resolve 後 (thumb_loader.rs): ZIP/folder の
@@ -276,6 +289,41 @@ std::thread::spawn(move || {
 プールを取得する方式に変更。ネイティブ拡張子は `is_recognized_image_ext` 内の
 `SUPPORTED_EXTENSIONS.contains` でショートサーキットされるためここに到達しない。
 Susie を無効化していれば `get_pool()` は即座に empty プールを返すので無害。
+
+**Susie プールキューの 2 レベル優先度**: `Job::priority` フィールドで可視セルかどうかを
+区別し、`SusieWorkerPool::execute(req, hint, priority, cancel)` の `priority=true` 引数で
+キュー先頭 (`push_front`)、`false` でキュー末尾 (`push_back`) に挿入する。
+
+スクロール中の動作:
+- 既に Susie キューに居座っていた古い (画面外) ジョブは末尾側
+- 新しく投入された可視セルは先頭側 → ワーカーが次に pop する
+- 結果として **画面外ジョブを待たずに可視セルが処理される**
+
+priority 内の順序は LIFO (後着の push_front が先着を追い越す) になるが、可視範囲内で
+あればどのセルから埋まっても体感上問題ないため許容。完全な FIFO 内優先度が必要に
+なったら priority 用のサブキューを足すと良い。
+
+`thumb_loader::process_load_request` から `req.priority` を `load_one_cached` に
+渡し、その中の `decode_file` / `decode_bytes` 呼び出しに伝播。フルスクリーン読み込み
+は常に priority=true (現在表示中の画像)。
+
+**Susie 1 ジョブごとの計測ログ (環境変数で ON/OFF)**: 環境変数
+`MIV_SUSIE_PERF_LOG=1` を設定して起動すると、各 Susie デコード呼び出しごとに
+`mimageviewer.log` へ次の形式で計測ログを出す。サムネイル一括ロード時に
+何が遅いか (キュー待ち / IPC 自体 / プラグイン処理) を切り分けるため。
+
+```
+susie: w0 OK  P ext=mag    queue=  0.4ms ipc=   12.3ms req=64B resp=512080B
+```
+
+- `w0` … ワーカー番号 (0..2)
+- `queue` … `execute()` で enqueue された時刻 から ディスパッチャが pop した時刻
+- `ipc` … `write_msg`+`read_msg` の合計 (32bit ifmag.spi 等のプラグイン処理時間も含む)
+- `req`/`resp` … バイナリフレーム長
+- `P`/`-` … priority フラグ (P=可視セル、-=背景ロード)
+
+常時 ON だと数千件のサムネイルロードでログが膨大になるため、調査時のみ手動で
+ON にする運用。GUI 設定には出していない。
 
 ### 5.5 try_lock + sleep ポーリングループ (禁止パターン)
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/susie-worker"]
+members = ["crates/susie-worker", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"

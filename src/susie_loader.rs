@@ -191,6 +191,13 @@ struct Job {
     reply: mpsc::Sender<std::io::Result<Vec<u8>>>,
     cancel: Option<Arc<AtomicBool>>,
     enqueued_at: std::time::Instant,
+    /// 診断ログ用ヒント (拡張子 or "(bytes:<filename>)")。リクエストペイロードを
+    /// パースし直さずに済ませるための軽量メタ。
+    hint: String,
+    /// 可視セルのデコード要求は true。プールキュー先頭に push される。
+    /// false (通常) は末尾に push される。スクロール中に画面外へ出た残存ジョブが
+    /// キュー前方に居座って新しい可視セルを待たせる現象を回避する。
+    priority: bool,
 }
 
 struct JobQueue {
@@ -321,6 +328,8 @@ impl SusieWorkerPool {
     fn execute(
         &self,
         request: &[u8],
+        hint: &str,
+        priority: bool,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> std::io::Result<Vec<u8>> {
         if self.worker_count == 0 {
@@ -335,11 +344,21 @@ impl SusieWorkerPool {
             reply: reply_tx,
             cancel: cancel.cloned(),
             enqueued_at: std::time::Instant::now(),
+            hint: hint.to_string(),
+            priority,
         };
         {
             let (mtx, cv) = &*self.queue;
             let mut q = mtx.lock().unwrap();
-            q.jobs.push_back(job);
+            // 可視セルは前方に挿入してすぐ処理されるようにする。priority=true ジョブが
+            // 連続して投入された場合、後着のものが先着のものを追い越す挙動になる
+            // (LIFO of priority + FIFO of regular) が、可視範囲内ジョブはどれを先に
+            // 処理しても体感差は無いので問題なし。
+            if priority {
+                q.jobs.push_front(job);
+            } else {
+                q.jobs.push_back(job);
+            }
             cv.notify_one();
         }
         loop {
@@ -465,8 +484,12 @@ pub fn reload(enabled: bool, parallel: bool) {
 
 /// 指定ファイルパスをワーカーに渡してデコードする。
 /// 戻り値は BGRA (top-down、行優先) ピクセル + 幅 + 高さ。
+///
+/// `priority = true` (可視セルなど) の場合、プールキュー先頭に挿入されて
+/// すぐ処理される。スクロール中に画面外へ出た残存ジョブの後ろに並ぶのを避ける。
 pub fn decode_file(
     path: &Path,
+    priority: bool,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<image::DynamicImage> {
     let pool = get_pool();
@@ -477,7 +500,12 @@ pub fn decode_file(
         ));
     }
     let req = encode_decode_file_request(path);
-    let resp = pool.execute(&req, cancel.as_ref())?;
+    let hint = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("?")
+        .to_ascii_lowercase();
+    let resp = pool.execute(&req, &hint, priority, cancel.as_ref())?;
     parse_decode_response(&resp)
 }
 
@@ -485,6 +513,7 @@ pub fn decode_file(
 pub fn decode_bytes(
     filename_hint: &str,
     bytes: &[u8],
+    priority: bool,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<image::DynamicImage> {
     let pool = get_pool();
@@ -495,7 +524,12 @@ pub fn decode_bytes(
         ));
     }
     let req = encode_decode_bytes_request(filename_hint, bytes);
-    let resp = pool.execute(&req, cancel.as_ref())?;
+    let hint = std::path::Path::new(filename_hint)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("?")
+        .to_ascii_lowercase();
+    let resp = pool.execute(&req, &hint, priority, cancel.as_ref())?;
     parse_decode_response(&resp)
 }
 
@@ -600,6 +634,12 @@ fn run_dispatcher(
     mut io: WorkerIo,
 ) {
     let pid = child.id();
+    // 環境変数 MIV_SUSIE_PERF_LOG=1 で 1 ジョブごとの計測ログを出す。
+    // (常時 ON だと数千枚のサムネイル一括ロード時にログが膨大になるため非推奨)
+    let perf_log = std::env::var("MIV_SUSIE_PERF_LOG")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
     loop {
         let job = {
             let (mtx, cv) = &*queue;
@@ -628,8 +668,25 @@ fn run_dispatcher(
             continue;
         }
 
-        let _ = job.enqueued_at; // 将来 perf 計装で使う
+        // キュー待ち時間 = ディスパッチャが pop した時刻 - execute() が enqueue した時刻
+        let dequeued_at = std::time::Instant::now();
+        let queue_wait_ms = (dequeued_at - job.enqueued_at).as_secs_f64() * 1000.0;
+
+        let req_size = job.request.len();
+        let ipc_start = std::time::Instant::now();
         let result = send_recv(&mut io, &job.request);
+        let ipc_ms = ipc_start.elapsed().as_secs_f64() * 1000.0;
+
+        if perf_log {
+            let resp_size = result.as_ref().map(|r| r.len()).unwrap_or(0);
+            let status = if result.is_ok() { "OK " } else { "ERR" };
+            let prio = if job.priority { "P" } else { "-" };
+            crate::logger::log(format!(
+                "susie: w{worker_id} {status} {prio} ext={:6} queue={:6.1}ms ipc={:7.1}ms req={}B resp={}B",
+                job.hint, queue_wait_ms, ipc_ms, req_size, resp_size,
+            ));
+        }
+
         let _ = job.reply.send(result);
     }
 
