@@ -901,8 +901,8 @@ impl App {
                     // 原寸が GPU 上限超なら、本デコード完了後に clamp が発動することが
                     // 事前に判るのでこの時点で⚠ダウンスケール警告を出してよい。
                     if let Some([sw, sh]) = self.fs_early_dims.get(&fs_idx).copied() {
-                        const LIMIT: usize = crate::app::MAX_TEXTURE_DIM_PUB;
-                        let will_clamp = sw > LIMIT || sh > LIMIT;
+                        let will_clamp =
+                            sw > crate::app::MAX_TEXTURE_DIM || sh > crate::app::MAX_TEXTURE_DIM;
                         (Some((sw as u32, sh as u32)), will_clamp)
                     } else {
                         // 最後の頼り: フォールバックサムネイル/テクスチャから寸法を取得。
@@ -3121,9 +3121,7 @@ fn compute_location_display(
     }
 }
 
-/// ダウンスケール表示中に dims のあとに付けるマーカー文字列。
-/// テキスト幅計算とレンダリングで同じ文字を使うために関数化している。
-fn downscale_marker() -> &'static str { " ⚠ ダウンスケール表示中" }
+const DOWNSCALE_MARKER: &str = " ⚠ ダウンスケール表示中";
 
 /// ファイル情報テキスト (PDF 種別・寸法・AI・ファイルサイズ) を描画する。
 /// ファイル名は左側 `location_display` に統合済みなのでここでは扱わない。
@@ -3142,13 +3140,12 @@ fn draw_fs_bar_info_text(
     );
     if !text.is_empty() {
         // ダウンスケール警告だけ黄色で強調したいのでマーカー部分を切り分けて描画する。
-        // マーカーはテキスト末尾の " ⚠ ダウンスケール表示中" 部分 (単独)。
-        let marker = downscale_marker();
-        let (main_text, has_marker) = if image_downscaled && text.ends_with(marker) {
-            (&text[..text.len() - marker.len()], true)
+        let (main_text, has_marker) = if image_downscaled && text.ends_with(DOWNSCALE_MARKER) {
+            (&text[..text.len() - DOWNSCALE_MARKER.len()], true)
         } else {
             (text.as_str(), false)
         };
+        let marker = DOWNSCALE_MARKER;
         let font = egui::FontId::proportional(15.0);
         if has_marker {
             // 右詰で書くので、まず marker を右端に、次に main_text をその左に置く。
@@ -3214,7 +3211,7 @@ fn build_info_text(
             format!("{w} × {h}")
         };
         if image_downscaled {
-            dims_part.push_str(downscale_marker());
+            dims_part.push_str(DOWNSCALE_MARKER);
         }
         parts.push(dims_part);
     }

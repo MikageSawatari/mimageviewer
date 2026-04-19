@@ -4375,12 +4375,8 @@ impl App {
                 );
             }
 
-            // ── 先行 dims ヒント ───────────────────────────────────────
-            // ローカル画像ファイル (ZIP/PDF 以外) はヘッダ数バイトだけ読めば
-            // 寸法が取れる。フルデコードより桁違いに速い (数 ms) ので、
-            // ホバーバーに即サイズと⚠ダウンスケール警告を出せるように
-            // 本デコード前に `DimsOnly` を送る。失敗しても致命的ではないので
-            // 黙って無視して本デコードに進む。
+            // ローカル画像ファイルはヘッダ数バイトで寸法が取れる (数 ms)。
+            // 本デコード前にホバーバーへサイズ / ダウンスケール警告を出すため先行送信。
             if pdf_page.is_none() && zip_entry.is_none() {
                 if let Some(dims) = crate::fast_resize::probe_dims(&path) {
                     let _ = tx.send(FsLoadResult::DimsOnly { source_dims: dims });
@@ -5824,12 +5820,9 @@ impl App {
             }
         }
 
-        // drain ループ: 各 pending からメッセージを可能な限り取り出す。
-        // `DimsOnly` は非終端なので fs_early_dims に積むだけで fs_pending は維持、
-        // 同一フレーム内で続けて本体 (Static など) が届く可能性があるので再度 try_recv を
-        // 回す。`Static` / `Animated` / `Failed` は終端で break してその idx を完了扱い。
-        // `self.fs_pending` を借用中に `self.fs_early_dims` を変更できないので、
-        // 一旦ローカル vec に集めてから後段で apply する。
+        // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して
+        // drain を続ける。fs_early_dims への書き込みは fs_pending 借用中はできないので
+        // ローカル vec に積んでから後段で apply する。
         let mut completed: Vec<(usize, FsLoadResult, u64)> = Vec::new();
         let mut disconnected: Vec<usize> = Vec::new();
         let mut early_dims_updates: Vec<(usize, [usize; 2])> = Vec::new();
@@ -5933,7 +5926,6 @@ impl App {
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
-                // drain 側で弾いているのでここには来ない。unreachable を防御的に残す。
                 FsLoadResult::DimsOnly { .. } => unreachable!(
                     "DimsOnly should be drained before reaching completion match"
                 ),
@@ -6962,8 +6954,6 @@ pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::C
 /// GPU 実機はもっと大きいが (RTX 4090 = 16384)、eframe が
 /// デフォルト Limits で初期化するため 8192 を超えるとパニックする。
 pub(crate) const MAX_TEXTURE_DIM: usize = 8192;
-/// UI モジュールから参照する用。`const` は可視性があれば外でも使えるのでエクスポート。
-pub(crate) const MAX_TEXTURE_DIM_PUB: usize = MAX_TEXTURE_DIM;
 
 /// GPU テクスチャ上限を超える `ColorImage` を縮小して返す。
 /// 上限内であればクローンせず共有参照をそのまま `Cow::Borrowed` で返す。

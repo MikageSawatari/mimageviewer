@@ -1497,16 +1497,7 @@ impl App {
                         egui::TextureOptions::LINEAR,
                     );
                     let bg = self.effective_upscale_bg_mode();
-                    // fs_cache を上書きするケースでは、既存エントリに保存されている
-                    // 原寸 (source_dims) をそのまま引き継ぐ。ai_upscale_cache 側は
-                    // 派生キャッシュなので None で良い。
-                    let prev_source_dims = self.fs_cache.get(&fs_idx).and_then(|e| {
-                        if let FsCacheEntry::Static { source_dims, .. } = e {
-                            *source_dims
-                        } else {
-                            None
-                        }
-                    });
+                    let prev_source_dims = self.fs_cache_source_dims(fs_idx);
                     let write_to_ai = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
                     let entry = FsCacheEntry::Static {
                         tex,
@@ -1693,15 +1684,7 @@ impl App {
             result.clone(),
             egui::TextureOptions::LINEAR,
         );
-        // Inpaint で fs_cache を上書きするので、原寸 (source_dims) は既存エントリから
-        // 引き継ぐ (inpaint はサイズ保存のため)。
-        let prev_source_dims = self.fs_cache.get(&idx).and_then(|e| {
-            if let FsCacheEntry::Static { source_dims, .. } = e {
-                *source_dims
-            } else {
-                None
-            }
-        });
+        let prev_source_dims = self.fs_cache_source_dims(idx);
         self.fs_cache.insert(idx, FsCacheEntry::Static {
             tex,
             pixels: Arc::new(result),
@@ -1718,6 +1701,19 @@ impl App {
         self.purge_upscale_for_idx(idx);
         self.adjustment_cache.remove(&idx);
         self.adjustment_sharpened.remove(&idx);
+    }
+
+    /// `fs_cache` に `Static` エントリがあれば、その `source_dims` を返す。
+    /// fs_cache を上書きする経路 (消しゴム restore / inpaint) で、元画像の原寸ヒントを
+    /// 失わないようにするためのヘルパー。
+    pub(crate) fn fs_cache_source_dims(&self, idx: usize) -> Option<[usize; 2]> {
+        self.fs_cache.get(&idx).and_then(|e| {
+            if let FsCacheEntry::Static { source_dims, .. } = e {
+                *source_dims
+            } else {
+                None
+            }
+        })
     }
 
     fn try_migan_inpaint(

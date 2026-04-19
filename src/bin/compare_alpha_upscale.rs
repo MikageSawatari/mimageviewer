@@ -34,17 +34,6 @@ struct Args {
     model: ModelKind,
 }
 
-fn parse_model(s: &str) -> Option<ModelKind> {
-    match s {
-        "realesrgan_x4plus" => Some(ModelKind::UpscaleRealEsrganX4Plus),
-        "realesrgan_anime6b" => Some(ModelKind::UpscaleRealEsrganAnime6B),
-        "realesr_general_v3" => Some(ModelKind::UpscaleRealEsrGeneralV3),
-        "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
-        "nmkd_siax_4x" => Some(ModelKind::UpscaleNmkdSiax4x),
-        _ => None,
-    }
-}
-
 fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut src_dir = None;
@@ -59,7 +48,7 @@ fn parse_args() -> Args {
             }
             "--model" => {
                 i += 1;
-                model = parse_model(&raw[i]).expect("unknown model name");
+                model = ModelKind::from_str(&raw[i]).expect("unknown model name");
             }
             other if !other.starts_with("--") && src_dir.is_none() => {
                 src_dir = Some(PathBuf::from(other));

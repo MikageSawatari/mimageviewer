@@ -35,8 +35,7 @@ impl From<Quality> for FilterType {
 
 /// RGBA8 画像を指定サイズに正確にリサイズする。
 pub fn resize_rgba8_exact(src: &RgbaImage, new_w: u32, new_h: u32, quality: Quality) -> RgbaImage {
-    let mut dst = RgbaImage::new(new_w, new_h.max(1));
-    let _ = new_w.max(1);
+    let mut dst = RgbaImage::new(new_w.max(1), new_h.max(1));
     let mut resizer = Resizer::new();
     let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(quality.into()));
     // src/dst とも `image` feature 経由で `IntoImageView`/`IntoImageViewMut`。

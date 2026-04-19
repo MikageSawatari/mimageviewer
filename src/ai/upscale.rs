@@ -142,26 +142,14 @@ pub fn upscale(
     input: &image::DynamicImage,
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, AiError> {
-    upscale_with_timings(runtime, model_kind, input, cancel).map(|(img, _)| img)
+    upscale_with_timings(runtime, model_kind, input, cancel, None).map(|(img, _)| img)
 }
 
 /// `upscale` のタイミング計測版。ベンチマーク用。
 ///
-/// 本体の処理は `upscale` と同一で、各タイルの extract / inference / blend 時間と
-/// 全体の prep / alpha_resample / finalize 時間を `UpscaleTimings` として返す。
-/// 追加コストは `Instant::now()` を数回呼ぶ程度 (~ns/タイル) で無視できる。
-pub fn upscale_with_timings(
-    runtime: &AiRuntime,
-    model_kind: ModelKind,
-    input: &image::DynamicImage,
-    cancel: &Arc<AtomicBool>,
-) -> Result<(egui::ColorImage, UpscaleTimings), AiError> {
-    upscale_with_timings_opts(runtime, model_kind, input, cancel, None)
-}
-
-/// `upscale_with_timings` に `tile_size_override` を加えた版。
+/// `tile_size_override` で既定タイルサイズを上書きできる。
 /// 固定入力サイズの ONNX モデル (例: RealPLKSR 256) では override すると推論が失敗する。
-pub fn upscale_with_timings_opts(
+pub fn upscale_with_timings(
     runtime: &AiRuntime,
     model_kind: ModelKind,
     input: &image::DynamicImage,

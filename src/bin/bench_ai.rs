@@ -1,7 +1,7 @@
 //! AI アップスケール/デノイズのタイル単位性能ベンチマーク。
 //!
 //! 「GPU 使用率 30% 弱」が CPU 前処理待ちか GPU 推論律速かを切り分けるための計測ツール。
-//! `upscale::upscale_with_timings()` を呼び、各タイルの extract / infer / blend 時間を
+//! `upscale::upscale_with_timings()` を呼んで各タイルの extract / infer / blend 時間を
 //! 計測して平均・合計・パーセント内訳を表示する。
 //!
 //! デフォルトテスト画像:
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mimageviewer::ai::{model_manager, runtime::AiRuntime, upscale, ModelKind};
-use mimageviewer::ai::upscale::{TileTiming, UpscaleTimings};
+use mimageviewer::ai::upscale::UpscaleTimings;
 
 const DEFAULT_IMAGES: &[&str] = &[
     "testimage/うちのこ/ComfyUI_2_0003.png",
@@ -38,15 +38,7 @@ fn default_models() -> Vec<(&'static str, ModelKind)> {
 }
 
 fn parse_model(s: &str) -> Option<(&'static str, ModelKind)> {
-    match s {
-        "realesrgan_x4plus" => Some(("realesrgan_x4plus", ModelKind::UpscaleRealEsrganX4Plus)),
-        "realesrgan_anime6b" => Some(("realesrgan_anime6b", ModelKind::UpscaleRealEsrganAnime6B)),
-        "realesr_general_v3" => Some(("realesr_general_v3", ModelKind::UpscaleRealEsrGeneralV3)),
-        "realcugan_4x" => Some(("realcugan_4x", ModelKind::UpscaleRealCugan4x)),
-        "nmkd_siax_4x" => Some(("nmkd_siax_4x", ModelKind::UpscaleNmkdSiax4x)),
-        "denoise_realplksr" => Some(("denoise_realplksr", ModelKind::DenoiseRealplksr)),
-        _ => None,
-    }
+    ModelKind::from_str(s).map(|k| (k.as_str(), k))
 }
 
 struct Args {
@@ -204,7 +196,7 @@ fn main() {
                 // warmup (固定入力モデル等で失敗した場合はこの tile_size をスキップ)
                 let mut warmup_failed = false;
                 for _ in 0..args.warmup {
-                    if let Err(e) = upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts) {
+                    if let Err(e) = upscale::upscale_with_timings(&runtime, *model, &img, &cancel, *ts) {
                         eprintln!("  skip [{}] tile_size={:?}: {}", label, ts, e);
                         warmup_failed = true;
                         break;
@@ -219,7 +211,7 @@ fn main() {
                 let mut run_failed = false;
                 let mut last_output: Option<egui::ColorImage> = None;
                 for run_idx in 0..args.runs {
-                    match upscale::upscale_with_timings_opts(&runtime, *model, &img, &cancel, *ts) {
+                    match upscale::upscale_with_timings(&runtime, *model, &img, &cancel, *ts) {
                         Ok((out, t)) => {
                             runs_timings.push(t);
                             if args.save_output.is_some() && run_idx + 1 == args.runs {
@@ -385,10 +377,4 @@ fn save_color_image_png(img: &egui::ColorImage, path: &std::path::Path) -> Resul
         }
     }
     rgba.save(path).map_err(|e| e.to_string())
-}
-
-// 未使用警告を回避するため (TileTiming は print_* からのみ参照)
-#[allow(dead_code)]
-fn _touch_types(t: &TileTiming) -> f64 {
-    t.extract_ms + t.infer_ms + t.blend_ms
 }
