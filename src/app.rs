@@ -4838,7 +4838,10 @@ impl App {
                     ("upload_ms", serde_json::Value::from(upload_ms)),
                 ]);
             }
-            // 表示中かつ現在の bg と一致するもののみ色調補正を即座に適用（チラつき防止）
+            // AI 完了時、fs_cache ベースで先に作られた仮 adjustment_cache を無効化する
+            // (そのまま残ると次回来訪時に低解像度の補正結果が使われてしまう)。
+            // 表示中かつ現在の bg と一致するもののみ、AI 結果に対して色調補正を即座に適用（チラつき防止）
+            self.adjustment_cache.remove(&idx);
             if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
                 self.apply_sync_adjustment(ctx, idx, &pixels);
             }
@@ -5653,10 +5656,10 @@ impl App {
             return;
         }
         let bg = self.effective_upscale_bg_mode();
-        // AI 処理中は補正をスキップ（AI完了後に apply_sync_adjustment が呼ばれる）
-        if self.ai_upscale_pending.contains_key(&(idx, bg)) {
-            return;
-        }
+        // AI 処理中でも fs_cache ベースの仮 adjustment_cache を用意する。
+        // AI 完了時に poll_ai_upscale が adjustment_cache を無効化し、AI 結果で再生成する。
+        // これがないと AI 完了まで「補正前の fs_cache」がそのまま表示され、
+        // 完了瞬間に補正適用で濃度が跳ねて見えてしまう。
         // 短絡: 個別設定なし かつ グローバルが identity なら何もしない
         if !self.adjustment_page_params.contains_key(&idx) && self.settings.global_preset.is_identity() {
             return;

@@ -235,6 +235,21 @@ AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
 - **先に AI アップスケール** → それを入力として**後から補正**
 - つまり `adjustment_cache` の中身は「AI 後に補正を掛けた」テクスチャ
 
+### 3.3 AI 処理中の暫定補正 (pre-AI adjustment)
+
+AI 処理には数秒〜数十秒かかるため、その間も `maybe_apply_adjustment` は **`fs_cache` を入力に
+補正を同期適用して `adjustment_cache` を埋める**。これを省くと AI 完了までユーザーには
+「補正が掛かっていない生の `fs_cache`」が表示され、AI 完了の瞬間に補正分 (特にモノクロ系
+ポストフィルタなどコントラストが強いもの) が一気に乗って濃度が跳ねて見える。
+
+- AI 完了時 (`poll_ai_upscale`): **無条件に `adjustment_cache.remove(idx)` して仮版を破棄**
+  してから、表示中かつ bg 一致の場合のみ AI 結果に対して再度 `apply_sync_adjustment` を呼ぶ。
+  表示中でないページで AI が完了したときは `adjustment_cache` を空にしておけば、次回来訪時に
+  `maybe_apply_adjustment` が `ai_upscale_cache` から再生成する。
+- 仮版は `fs_cache` の解像度で作られるため AI 結果と比べて低解像度。仮版がそのまま残ると
+  表示優先順位 `adjustment > ai_upscale > fs` により AI 結果が覆い隠されてしまうので、
+  上記の明示的な `remove` が必須。
+
 ---
 
 ## 4. キャッシュ無効化ルール (早見表)
