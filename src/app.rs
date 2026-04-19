@@ -6985,13 +6985,15 @@ fn draw_thumb(
     inner: egui::Rect,
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
+    dark: bool,
 ) {
     match thumb {
         ThumbnailState::Loaded { tex, .. } => {
             draw_thumb_texture(painter, inner, tex, rotation);
         }
         ThumbnailState::Pending | ThumbnailState::Evicted => {
-            painter.rect_filled(inner, 2.0, egui::Color32::from_gray(220));
+            let bg = if dark { egui::Color32::from_gray(50) } else { egui::Color32::from_gray(220) };
+            painter.rect_filled(inner, 2.0, bg);
             painter.text(
                 inner.center(),
                 egui::Align2::CENTER_CENTER,
@@ -7001,13 +7003,23 @@ fn draw_thumb(
             );
         }
         ThumbnailState::Failed => {
-            painter.rect_filled(inner, 2.0, egui::Color32::from_rgb(255, 220, 220));
+            let bg = if dark {
+                egui::Color32::from_rgb(80, 30, 30)
+            } else {
+                egui::Color32::from_rgb(255, 220, 220)
+            };
+            let fg = if dark {
+                egui::Color32::from_rgb(255, 160, 160)
+            } else {
+                egui::Color32::DARK_RED
+            };
+            painter.rect_filled(inner, 2.0, bg);
             painter.text(
                 inner.center(),
                 egui::Align2::CENTER_CENTER,
                 "読込失敗",
                 egui::FontId::proportional(12.0),
-                egui::Color32::DARK_RED,
+                fg,
             );
         }
     }
@@ -7033,8 +7045,26 @@ pub(crate) fn draw_cell(
     let padding = 4.0;
     let inner = rect.shrink(padding);
 
+    let dark = ui.visuals().dark_mode;
+    let name_text_color = if dark {
+        egui::Color32::from_gray(210)
+    } else {
+        egui::Color32::from_gray(30)
+    };
+    let pending_placeholder_bg = if dark {
+        egui::Color32::from_gray(50)
+    } else {
+        egui::Color32::from_gray(230)
+    };
+
     let bg = if is_selected {
-        egui::Color32::from_rgb(180, 210, 255)
+        if dark {
+            egui::Color32::from_rgb(40, 70, 110)
+        } else {
+            egui::Color32::from_rgb(180, 210, 255)
+        }
+    } else if dark {
+        egui::Color32::from_gray(28)
     } else {
         egui::Color32::WHITE
     };
@@ -7061,13 +7091,13 @@ pub(crate) fn draw_cell(
                         egui::Align2::CENTER_BOTTOM,
                         truncate_name(name, 18),
                         egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(30),
+                        name_text_color,
                     );
                 }
             }
         }
         GridItem::Image(_) => {
-            draw_thumb(painter, inner, thumb, rotation);
+            draw_thumb(painter, inner, thumb, rotation, dark);
         }
         GridItem::Video(path) => {
             match thumb {
@@ -7098,11 +7128,11 @@ pub(crate) fn draw_cell(
                 egui::Align2::CENTER_BOTTOM,
                 truncate_name(name, 18),
                 egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(30),
+                name_text_color,
             );
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-            draw_thumb(painter, inner, thumb, rotation);
+            draw_thumb(painter, inner, thumb, rotation, dark);
         }
         GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
             let (icon, badge_fn): (&str, fn(&egui::Painter, egui::Rect)) =
@@ -7112,7 +7142,7 @@ pub(crate) fn draw_cell(
                     draw_thumb_texture(painter, inner, tex, rotation);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
-                    painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+                    painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                     painter.text(
                         inner.center(),
                         egui::Align2::CENTER_CENTER,
@@ -7129,13 +7159,13 @@ pub(crate) fn draw_cell(
                 egui::Align2::CENTER_BOTTOM,
                 truncate_name(name, 18),
                 egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(30),
+                name_text_color,
             );
         }
         GridItem::ConvertibleArchive { path, format } => {
             // 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
             // 汎用アーカイブアイコン + 形式バッジで表示する。
-            painter.rect_filled(inner, 2.0, egui::Color32::from_gray(230));
+            painter.rect_filled(inner, 2.0, pending_placeholder_bg);
             painter.text(
                 inner.center(),
                 egui::Align2::CENTER_CENTER,
@@ -7150,20 +7180,31 @@ pub(crate) fn draw_cell(
                 egui::Align2::CENTER_BOTTOM,
                 truncate_name(name, 18),
                 egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(30),
+                name_text_color,
             );
         }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
-            painter.rect_filled(
-                inner,
-                6.0,
-                egui::Color32::from_rgb(235, 242, 252),
-            );
+            let (sep_bg, sep_stroke, sep_title, sep_small) = if dark {
+                (
+                    egui::Color32::from_rgb(35, 55, 85),
+                    egui::Color32::from_rgb(100, 140, 200),
+                    egui::Color32::from_rgb(200, 220, 250),
+                    egui::Color32::from_gray(180),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgb(235, 242, 252),
+                    egui::Color32::from_rgb(120, 160, 220),
+                    egui::Color32::from_rgb(40, 70, 140),
+                    egui::Color32::from_gray(100),
+                )
+            };
+            painter.rect_filled(inner, 6.0, sep_bg);
             painter.rect_stroke(
                 inner,
                 6.0,
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 160, 220)),
+                egui::Stroke::new(2.0, sep_stroke),
                 egui::StrokeKind::Middle,
             );
             // フォルダ名を大きめの太字で中央に
@@ -7173,7 +7214,7 @@ pub(crate) fn draw_cell(
                 egui::Align2::CENTER_CENTER,
                 truncate_name(dir_display, 24),
                 egui::FontId::proportional(font_size),
-                egui::Color32::from_rgb(40, 70, 140),
+                sep_title,
             );
             // 下部にフォルダアイコン的な記号
             let small = (inner.height() * 0.08).clamp(9.0, 16.0);
@@ -7182,7 +7223,7 @@ pub(crate) fn draw_cell(
                 egui::Align2::CENTER_BOTTOM,
                 "📁  作品の区切り",
                 egui::FontId::proportional(small),
-                egui::Color32::from_gray(100),
+                sep_small,
             );
         }
     }
@@ -7190,7 +7231,7 @@ pub(crate) fn draw_cell(
     let border = if is_selected {
         egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 120, 220))
     } else {
-        egui::Stroke::new(1.0, egui::Color32::from_gray(200))
+        egui::Stroke::new(1.0, if dark { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(200) })
     };
     painter.rect_stroke(rect, 2.0, border, egui::StrokeKind::Middle);
 
