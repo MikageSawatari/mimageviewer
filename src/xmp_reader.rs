@@ -62,18 +62,57 @@ const DC_NAMESPACE: &[u8] = b"http://purl.org/dc/elements/1.1/";
 // 公開 API
 // ---------------------------------------------------------------------------
 
+/// mXD が出力し得るコンテナ形式 — XMP が入っている可能性がある拡張子だけ許可。
+/// BMP / RAW / AVIF 等は mXD の出力対象外 + 当モジュールで解釈できないので
+/// 無駄なファイル読み出しを避けるため早期に弾く。
+fn extension_might_have_xmp(path: &Path) -> bool {
+    match path.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()) {
+        Some(ext) => matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "jfif" | "png" | "tif" | "tiff" | "mp4" | "mov" | "m4v"
+        ),
+        None => false,
+    }
+}
+
 /// パスから読み取って [`XmpTweetInfo`] を返す。
 /// XMP パケットが無い / `xtw:*` プロパティが無い場合は None。
 pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
+    if !extension_might_have_xmp(path) {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     read_tweet_info_from_bytes(&bytes)
 }
 
-/// バイト列版 (ZIP 内画像などで使用)。
+/// バイト列版 (ZIP 内画像などで使用)。拡張子で事前フィルタできないので、
+/// マジックバイトで JPEG / PNG / ISO BMFF 系かどうかを判別してから parse に進む。
 pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
+    if !has_xmp_capable_magic(bytes) {
+        return None;
+    }
     let xmp = extract_xmp_packet(bytes)?;
     let info = parse_xmp(&xmp)?;
     if info.is_populated() { Some(info) } else { None }
+}
+
+/// XMP が入り得るコンテナのマジックバイトか判定。
+fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return true; // JPEG
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return true; // PNG
+    }
+    // ISO BMFF (MP4/MOV/HEIC): 4バイト長 + "ftyp"
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return true;
+    }
+    // TIFF: "II*\0" (LE) or "MM\0*" (BE)
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -178,16 +217,20 @@ fn extract_xmp_from_png(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// 最後の手段: ファイル全体から `<x:xmpmeta` の開始と対応する終端を探す。
+/// 最後の手段: ファイル先頭部分から `<x:xmpmeta` の開始と対応する終端を探す。
 /// MP4 の `uuid` アトム (Adobe XMP の UUID) や TIFF tag 700 等を専用にパースする
 /// 代わりに、バイト列中の XML サブストリングを切り出す。
+///
+/// 全域走査すると 100MB 超の動画でミリ秒〜秒オーダーの時間を食うので、
+/// 先頭 512KB に制限する。mXD / ExifTool が書く XMP は常にコンテナ先頭部に
+/// 配置されるので実用上十分。
+const FALLBACK_SCAN_LIMIT: usize = 512 * 1024;
 fn extract_xmp_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
-    // 256KB 以上のファイルで先頭だけ見ても XMP が末尾にあるケースがあるので
-    // 全域を走査する (バイナリ安全なサブストリング探索)。
-    let start = find_subsequence(bytes, b"<x:xmpmeta")?;
+    let scan = &bytes[..bytes.len().min(FALLBACK_SCAN_LIMIT)];
+    let start = find_subsequence(scan, b"<x:xmpmeta")?;
     let end_needle = b"</x:xmpmeta>";
-    let rel_end = find_subsequence(&bytes[start..], end_needle)?;
-    Some(bytes[start..start + rel_end + end_needle.len()].to_vec())
+    let rel_end = find_subsequence(&scan[start..], end_needle)?;
+    Some(scan[start..start + rel_end + end_needle.len()].to_vec())
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -516,5 +559,31 @@ mod tests {
     #[test]
     fn read_from_empty_bytes_returns_none() {
         assert!(read_tweet_info_from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn extension_gate_filters_non_xmp_formats() {
+        use std::path::Path;
+        assert!(extension_might_have_xmp(Path::new("a.jpg")));
+        assert!(extension_might_have_xmp(Path::new("A.JPEG")));
+        assert!(extension_might_have_xmp(Path::new("b.png")));
+        assert!(extension_might_have_xmp(Path::new("c.mp4")));
+        assert!(extension_might_have_xmp(Path::new("d.tiff")));
+        assert!(!extension_might_have_xmp(Path::new("e.bmp")));
+        assert!(!extension_might_have_xmp(Path::new("f.heic")));
+        assert!(!extension_might_have_xmp(Path::new("g.cr2")));
+        assert!(!extension_might_have_xmp(Path::new("no-extension")));
+    }
+
+    #[test]
+    fn magic_gate_rejects_unknown_binaries() {
+        assert!(has_xmp_capable_magic(&[0xFF, 0xD8, 0xFF, 0xE0])); // JPEG
+        assert!(has_xmp_capable_magic(b"\x89PNG\r\n\x1a\n\x00"));
+        let mut mp4 = vec![0u8; 12];
+        mp4[4..8].copy_from_slice(b"ftyp");
+        assert!(has_xmp_capable_magic(&mp4));
+        assert!(!has_xmp_capable_magic(b"GIF89a...")); // GIF は XMP 抽出器が無いので除外
+        assert!(!has_xmp_capable_magic(b"BM")); // BMP
+        assert!(!has_xmp_capable_magic(&[]));
     }
 }

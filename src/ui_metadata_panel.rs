@@ -685,37 +685,96 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
     }
 }
 
-/// mXD / ExifTool が書く "2026:04:16 04:09:58.0000000+00:00" 形式を
-/// 視認性の高い "2026-04-16 04:09:58 UTC" に整形する。失敗したら原文を返す。
+/// mXD / ExifTool が書く日時を視認しやすい形に整える。
+/// 入力例: `"2026:04:16 04:09:58.0000000+00:00"` (ExifTool の `:` 区切り)
+///         `"2026-04-16T04:09:58.0000000+00:00"` (ISO-8601)
+/// 出力例: `"2026-04-16 04:09:58 UTC"` / `"2026-04-16 04:09:58 +09:00"`
+/// パターンに合わなければ原文を返す。
 fn format_xmp_datetime(raw: &str) -> String {
-    // 日付部は `:` 区切り。最初の 2 個だけ `-` に置換。
-    let mut s = raw.to_string();
-    let mut replaced = 0;
-    let bytes: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    for (i, c) in bytes.iter().enumerate() {
-        if *c == ':' && replaced < 2 && i < 10 {
-            out.push('-');
-            replaced += 1;
-        } else {
-            out.push(*c);
-        }
-    }
-    s = out;
-    // 秒以下の過剰精度 (.0000000) と +00:00 を簡略化
-    if let Some(dot) = s.find('.') {
-        if let Some(end) = s[dot..].find(|c: char| c == '+' || c == '-' || c == 'Z') {
-            let offset_start = dot + end;
-            let offset = &s[offset_start..];
-            let offset_label = if offset.starts_with("+00:00") || offset == "Z" {
-                " UTC"
+    // 日付部の `:` を `-` に (ExifTool 形式対策)。先頭 10 文字内の最初の 2 個が対象。
+    // 10 文字境界で切るのは日付と時刻を混同しないため ("YYYY:MM:DD" の 10 文字)。
+    let date_part: String = raw
+        .chars()
+        .take(10)
+        .scan(0u8, |replaced, c| {
+            let out = if c == ':' && *replaced < 2 {
+                *replaced += 1;
+                '-'
             } else {
-                ""
+                c
             };
-            s = format!("{}{}", &s[..dot], offset_label);
-        }
+            Some(out)
+        })
+        .collect();
+    let rest: String = raw.chars().skip(10).collect();
+    // ISO-8601 の `T` を空白に揃える (UI の読みやすさ)
+    let rest = rest.replacen('T', " ", 1);
+
+    // タイムゾーンを先に切り出す: `Z` / `+HH:MM` / `-HH:MM` のいずれか。
+    // 小数秒(.0000000) の位置より後ろの `+`/`-`/`Z` を採用する。
+    let tz_search_start = rest.find('.').map(|d| d + 1).unwrap_or(0);
+    let tz_pos = rest[tz_search_start..]
+        .find(|c: char| c == '+' || c == '-' || c == 'Z')
+        .map(|i| tz_search_start + i);
+    let (body, tz_suffix) = match tz_pos {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest.as_str(), ""),
+    };
+    // 小数秒を捨てる
+    let time = match body.find('.') {
+        Some(dot) => &body[..dot],
+        None => body,
+    };
+    let tz_label = match tz_suffix {
+        "+00:00" | "Z" => " UTC".to_string(),
+        "" => String::new(),
+        other => format!(" {other}"),
+    };
+    format!("{date_part}{time}{tz_label}")
+}
+
+#[cfg(test)]
+mod format_datetime_tests {
+    use super::format_xmp_datetime;
+
+    #[test]
+    fn utc_iso8601_collapses_offset() {
+        assert_eq!(
+            format_xmp_datetime("2026-04-16T04:09:58.0000000+00:00"),
+            "2026-04-16 04:09:58 UTC"
+        );
     }
-    s
+
+    #[test]
+    fn utc_exiftool_colon_date_converted() {
+        assert_eq!(
+            format_xmp_datetime("2026:04:16 04:09:58.0000000+00:00"),
+            "2026-04-16 04:09:58 UTC"
+        );
+    }
+
+    #[test]
+    fn non_utc_offset_preserved() {
+        assert_eq!(
+            format_xmp_datetime("2026-04-16T04:09:58.500+09:00"),
+            "2026-04-16 04:09:58 +09:00"
+        );
+    }
+
+    #[test]
+    fn no_fractional_seconds() {
+        assert_eq!(
+            format_xmp_datetime("2026-04-16T04:09:58Z"),
+            "2026-04-16 04:09:58 UTC"
+        );
+    }
+
+    #[test]
+    fn unparseable_returns_near_original() {
+        // `:` 置換は走るが壊れた文字列はそのまま (日付部 10 文字を超える位置は保持)
+        let out = format_xmp_datetime("not a date");
+        assert_eq!(out, "not a date");
+    }
 }
 
 /// テキストセクション (ラベル + コピーボタン + テキスト) を描画する。
