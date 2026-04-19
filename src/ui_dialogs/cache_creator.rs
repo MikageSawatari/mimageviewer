@@ -67,12 +67,19 @@ impl App {
                         if self.settings.favorites.is_empty() {
                             ui.label(egui::RichText::new("（お気に入りが未登録です）").weak());
                         } else {
-                            for (i, fav) in self.settings.favorites.iter().enumerate() {
-                                // 「表示名 (パス)」の形式でチェックボックスのラベルを作る
-                                let label =
-                                    format!("{}  ({})", fav.name, fav.path.display());
-                                ui.checkbox(&mut self.cc.checked[i], label);
-                            }
+                            let fav_scroll_h =
+                                (ctx.content_rect().height() - 260.0).clamp(160.0, 480.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("cache_creator_favs")
+                                .max_height(fav_scroll_h)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for (i, fav) in self.settings.favorites.iter().enumerate() {
+                                        let label =
+                                            format!("{}  ({})", fav.name, fav.path.display());
+                                        ui.checkbox(&mut self.cc.checked[i], label);
+                                    }
+                                });
                         }
 
                         ui.add_space(8.0);

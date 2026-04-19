@@ -81,10 +81,18 @@ impl App {
                             }
                         }
 
-                        for (i, fav) in self.settings.favorites.iter().enumerate() {
-                            let label = format!("{}  ({})", fav.name, fav.path.display());
-                            ui.checkbox(&mut self.ic.checked[i], label);
-                        }
+                        let fav_scroll_h =
+                            (ctx.content_rect().height() - 280.0).clamp(160.0, 480.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("index_creator_favs")
+                            .max_height(fav_scroll_h)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (i, fav) in self.settings.favorites.iter().enumerate() {
+                                    let label = format!("{}  ({})", fav.name, fav.path.display());
+                                    ui.checkbox(&mut self.ic.checked[i], label);
+                                }
+                            });
                     }
 
                     ui.add_space(8.0);

@@ -42,6 +42,7 @@ impl App {
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
+        let scroll_max_h = (ctx.content_rect().height() - 180.0).clamp(260.0, 640.0);
         egui::Window::new("お気に入りの編集")
             .open(&mut open)
             .resizable(false)
@@ -60,7 +61,12 @@ impl App {
                     );
                     ui.add_space(6.0);
                     let n = self.settings.favorites.len();
-                    egui::Grid::new("fav_edit_grid")
+                    egui::ScrollArea::vertical()
+                        .id_salt("fav_edit_scroll")
+                        .max_height(scroll_max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("fav_edit_grid")
                         .striped(true)
                         .num_columns(3)
                         .spacing([8.0, 4.0])
@@ -116,6 +122,7 @@ impl App {
                                 });
                                 ui.end_row();
                             }
+                        });
                         });
                 }
 

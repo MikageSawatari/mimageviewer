@@ -43,6 +43,8 @@ impl App {
                 self.stats.lock().map(|s| s.clone()).unwrap_or_default()
             };
 
+            // ダイアログ高さは画面に収める。ボタン行を常時表示するため内部を ScrollArea で包む。
+            let scroll_max_h = (ctx.content_rect().height() - 160.0).clamp(320.0, 720.0);
             egui::Window::new("統計")
                 .open(&mut open)
                 .resizable(false)
@@ -50,6 +52,11 @@ impl App {
                 .default_pos(dialog_pos)
                 .show(ctx, |ui| {
                     ui.set_min_width(520.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("stats_scroll")
+                        .max_height(scroll_max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
                     ui.label(
                         "起動時から累計したサムネイル読み込み統計です。\n\
                          キャッシュ生成設定の参考にしてください。\n\
@@ -162,8 +169,11 @@ impl App {
                         format_count(snapshot.count_video),
                         format_count(snapshot.count_failed),
                     ));
+                        });
 
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("リセット").clicked() {
                             reset_clicked = true;
