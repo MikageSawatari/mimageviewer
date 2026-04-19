@@ -165,13 +165,31 @@ pub(crate) enum SpreadPair {
 impl App {
     /// 分析モードを解除し、関連する状態をリセットする。
     pub(crate) fn reset_analysis_mode(&mut self) {
+        let restore_idx = self.fullscreen_idx;
         self.analysis_mode = false;
+        // post-filter バイパスを解除 (消しゴムモード中ならそちらが保持する)
+        if self.post_filter_bypassed && !self.erase_mode {
+            self.post_filter_bypassed = false;
+            if let Some(idx) = restore_idx {
+                self.clear_adjustment_caches(idx);
+            }
+        }
         self.analysis_hover_color = None;
         self.analysis_pinned_color = None;
         self.analysis_grayscale = false;
         self.analysis_mosaic_grid = false;
         self.analysis_filter_mag = 0;
         self.analysis_guide_drag = None;
+    }
+
+    /// 分析モード ON 時に post-filter を一時バイパスする。Z キーハンドラから呼ぶ。
+    pub(crate) fn enter_analysis_mode_bypass(&mut self) {
+        if !self.post_filter_bypassed {
+            self.post_filter_bypassed = true;
+            if let Some(idx) = self.fullscreen_idx {
+                self.clear_adjustment_caches(idx);
+            }
+        }
     }
 
     /// フルスクリーン通常モードのズーム/パンが有効なら返す。
@@ -1063,14 +1081,16 @@ impl App {
             i.consume_key(egui::Modifiers::NONE, egui::Key::I)
             || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
         });
-        let key_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)
+        let key_space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)
+        let key_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
         let key_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
         let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
         let key_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z));
         let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
         let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
-        let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
         let key_b_bg =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
@@ -1112,10 +1132,20 @@ impl App {
         let key_4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
         let key_5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num5));
 
-        // U キー: AI アップスケールサイクル
+        // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
+        // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
+        // Shift/Alt を伴う入力まで吸収する。具体的な修飾子から先に consume する必要がある。
+        let key_u_alt = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::U));
+        let key_u_shift = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::U));
         let key_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::U));
         // N キー: AI デノイズサイクル
         let key_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N));
+        // P / Shift+P / Alt+P: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
+        // Ctrl+F はグリッドで検索に使っているため避けて Alt 修飾を採用。
+        // 同様に Alt+P → Shift+P → P の順で consume (matches_logically 対策)。
+        let key_p_alt = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::P));
+        let key_p_shift = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::P));
+        let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
@@ -1151,11 +1181,9 @@ impl App {
                 if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                     let _ = db.set(folder, mode, self.settings.default_spread_mode);
                 }
-                // 分析モードを解除
+                // 分析モードを解除 (post-filter バイパスも戻す)
                 if mode.is_spread() && self.analysis_mode {
-                    self.analysis_mode = false;
-                    self.analysis_hover_color = None;
-                    self.analysis_pinned_color = None;
+                    self.reset_analysis_mode();
                 }
                 // ページ位置を正規化
                 self.normalize_spread_position();
@@ -1167,7 +1195,7 @@ impl App {
 
         // U キー: AI アップスケールモデルをサイクル
         // 現在ページに個別設定があれば個別を書き換え、無ければ標準設定 (global_preset) を書き換える。
-        if key_u {
+        if key_u || key_u_shift || key_u_alt {
             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let items = crate::adjustment::upscale_menu_items();
@@ -1178,7 +1206,14 @@ impl App {
                     _ => false,
                 }
             }).unwrap_or(0);
-            let next = (cur + 1) % items.len();
+            let next = if key_u_alt {
+                // Alt+U: 「なし」へリセット (items[0] が None 相当)
+                0
+            } else if key_u_shift {
+                (cur + items.len() - 1) % items.len()
+            } else {
+                (cur + 1) % items.len()
+            };
             let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
             let scope = if has_page_override { "個別" } else { "標準" };
@@ -1210,6 +1245,35 @@ impl App {
                 self.copy_params_to_global(params);
             }
             self.clear_all_adjustment_and_ai_caches(fs_idx);
+        }
+
+        // P / Shift+P / Alt+P: ポストフィルタの次/前/なしへ切替。
+        // 現在ページに個別設定があれば個別を書き換え、無ければ標準 (global_preset) を書き換える。
+        // AI 再実行は発生させないため clear_adjustment_caches のみ使う。
+        if key_p || key_p_shift || key_p_alt {
+            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+            let mut params = self.effective_params(fs_idx).clone();
+            let all = crate::adjustment::PostFilter::ALL;
+            let cur = all.iter().position(|f| *f == params.post_filter).unwrap_or(0);
+            let next_idx = if key_p_alt {
+                // Alt+P: 「標準 (None)」へリセット (all[0] = PostFilter::None)
+                0
+            } else if key_p_shift {
+                (cur + all.len() - 1) % all.len()
+            } else {
+                (cur + 1) % all.len()
+            };
+            let next = all[next_idx];
+            params.post_filter = next;
+            let scope = if has_page_override { "個別" } else { "標準" };
+            self.show_feedback_toast(format!("[P: {} / {}]", scope, next.display_label()));
+            if has_page_override {
+                self.set_page_params(fs_idx, params);
+                self.clear_adjustment_caches(fs_idx);
+            } else {
+                // copy_params_to_global は adjustment_cache を全クリアする
+                self.copy_params_to_global(params);
+            }
         }
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
@@ -1245,6 +1309,7 @@ impl App {
                 self.analysis_zoom = self.fs_zoom;
                 self.analysis_pan = self.fs_pan;
                 self.analysis_mode = true;
+                self.enter_analysis_mode_bypass();
                 // 補正パネルと排他
                 self.adjustment_mode = false;
             }
@@ -1291,10 +1356,10 @@ impl App {
             }
         }
 
-        // P: スライドショー開始/停止トグル
+        // S: スライドショー開始/停止トグル (旧 P、左手で押しやすいよう S へ移行)
         // 開始時のみ、現在ページが画像系アイテム (Image/ZipImage/PdfPage) かを確認する。
         // ZipSeparator など非画像アイテム上では開始させない (停止操作は常に許可)。
-        if key_p {
+        if key_s {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
             } else if matches!(
@@ -1308,7 +1373,7 @@ impl App {
         }
 
         // Space: スライドショー中→停止、停止中→画像をチェック
-        if key_s {
+        if key_space {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
             } else {

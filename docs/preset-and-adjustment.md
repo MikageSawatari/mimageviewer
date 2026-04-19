@@ -83,19 +83,92 @@ effective = adjustment_page_params.get(idx) ?? settings.global_preset
 - `black_point`, `white_point`, `midtone` (トーンカーブのレベル補正)
 - `auto_mode`: `None` / `Auto` / `MangaCleanup` (自動補正モード)
 - AI 関連: `upscale_model`, `denoise_model` (`Option<String>`)
+- **ポストフィルタ**: `post_filter: PostFilter` (レトロ系表示エフェクト、色調補正の後に適用)
 
 ### 2.1 適用順序
 
-`adjustment.rs::apply_adjustments_fast`:
+`adjustment.rs::apply_adjustments_fast` → `post_filter::apply`:
 
 ```
-Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturation → Temperature
+Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturation → Temperature → ポストフィルタ
 ```
 
 - `temperature == 0` なら u8→u8 LUT で高速処理
 - `temperature != 0` なら f32 パイプライン (やや遅い)
+- ポストフィルタは `PostFilter::None` 以外のときだけ追加適用
 
-### 2.2 Auto モード
+### 2.2 ポストフィルタ (PostFilter enum)
+
+CRT ブラウン管風・減色・複合プリセットを表示するエフェクト。全 16 バリアント:
+
+| グループ | バリアント | 内容 |
+| --- | --- | --- |
+| 基本 | `None` | フィルタなし (LINEAR サンプラー、デフォルト) |
+| 基本 | `Nearest` | ピクセル補完なし (NEAREST サンプラーのみ、CPU 変換は clone) |
+| CRT | `CrtSimple` | sin² スキャンライン + RGB アパーチャマスク + 微 glow |
+| CRT | `CrtFull` | CrtSimple + 樽型歪み + 強 phosphor glow |
+| CRT | `CrtArcade` | 太スキャンライン + 濃マスク + 高輝度 |
+| 減色 (色数昇順) | `Dither1bit` | 2 階調 Bayer ディザ |
+| 減色 | `GameBoy` | 緑系 4 階調 (固定) |
+| 減色 | `Pc98` | PC-98 アナログモード (適応 16 色、`palette_gen::generate` で median cut) |
+| 減色 | `GameGear` | ゲームギア (12bit → 32 色適応) |
+| 減色 | `Famicom` | NES 固定 ~52 色ハードパレット |
+| 減色 | `MegaDrive` | メガドライブ (9bit → 61 色適応、3bit/ch の階段階調) |
+| 減色 | `Msx2Plus` | MSX2+ SCREEN 8 (256 色固定 GRB 3:3:2) |
+| 減色 | `Sfc` | スーパーファミコン (15bit → 256 色適応) |
+| 複合 | `ComboFamicomCrt` | Famicom 固定 + CRT Simple |
+| 複合 | `ComboPc98Crt` | PC-98 適応 + CRT Simple |
+| 複合 | `ComboMsx2PlusCrt` | MSX2+ 固定 + CRT Simple |
+| 複合 | `ComboMegaDriveCrt` | メガドライブ適応 + CRT Simple |
+| 複合 | `ComboSfcCrt` | スーパーファミコン適応 + CRT Simple |
+
+**複合プリセットの方針**: **非液晶機種 (CRT TV / モニタ接続が標準)** とブラウン管フィルタを
+セットにして、実機の視聴体験に近づける。GameBoy / ゲームギアは LCD なので CRT 合成は除外。
+
+### 減色の分類: 固定 vs 適応
+
+- **固定パレット** (GameBoy/Famicom/MSX2+/Dither1bit): ハードウェア仕様で定義された色セットをそのまま使う。
+  実機の挙動を再現するが、パレットに無い色味 (例: NES の肌色) は画像によって大きく変化する。
+- **適応パレット** (PC-98/ゲームギア/メガドライブ/SFC): 実機では各ゲームが画像に合わせて色を選んで
+  いた機種。median cut で画像から最適な N 色を抽出し、ハードウェアの bit 深度に
+  `quantize_channel_bits` で丸める。`palette_gen::generate` がサンプル 50k 制限で median cut を行う。
+
+### CRT 系の設計方針
+
+**明るさ均等化**: 3 プリセットとも `brightness_boost = 1 / (scan_atten × mask_atten)` を
+適用し、フィルタなしとほぼ同じ輝度になるよう補正。スキャンライン・マスクの輝度低下を
+ブーストで相殺する (実機 CRT のビーム出力と同等の考え方)。CrtArcade のみ +10% で高輝度に。
+
+**パターンの滑らかさ**: sin² falloff のスキャンライン + sin² 分布の RGB アパーチャ +
+bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「硬い矩形ピクセル」ではなく
+アナログ CRT 特有の「柔らかく滲む phosphor ドット」感を出す。
+
+**出力解像度**: 適応アップスケール (長辺 1024px 以下 → 4x / 2048px 以下 → 2x / 超 → 1x)、
+出力長辺 4096px ハードキャップ。減色系はソース解像度を維持。
+
+### サンプラー選択
+
+- `PostFilter::Nearest` のみ `TextureOptions::NEAREST` でアップロード
+- その他 (CRT/減色/複合) は `LINEAR` でアップロード。縮小時のモアレを防ぎ、CRT の phosphor
+  感を出すため。NEAREST だと CRT 結果を画面スケールに合わせる際に周期的黒線が出る。
+
+**並列化**: `rayon::par_chunks_mut` で行単位に並列処理。4K 画像でも 4080ms 程度。
+
+### 2.3 ポストフィルタの一時バイパス
+
+消しゴム / 分析モード中は `App::post_filter_bypassed: bool` が `true` になり、
+`apply_sync_adjustment` が post-filter 段をスキップし color-only の `adjustment_cache` を生成する。
+モード解除時に false に戻し、`clear_adjustment_caches(idx)` で該当ページのキャッシュを
+クリアして post-filter 適用状態で再生成させる。
+
+- **消しゴム**: 減色プリセット (GameBoy 4 色など) が有効だと境界が潰れてマスクを精密に塗れないため
+- **分析**: ヒストグラムは `fs_cache` の生ピクセルから計算されるため、表示だけを生に揃える
+
+`AdjustParams` には:
+- `is_identity()` = 色調 identity **かつ** `post_filter == None`
+- `is_color_identity()` = 色調 identity のみ (バイパス中の早期 return 判定用)
+
+### 2.4 Auto モード
 
 - **Auto**: ヒストグラムの 0.5/99.5 パーセンタイルでレベル補正
 - **MangaCleanup**: 紙/インク検出 → グレースケール → S 字カーブ → γ=0.85 → コントラスト ≥15
@@ -149,6 +222,8 @@ AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
 | 変更された内容 | `adjustment_cache` | `ai_upscale_cache` | 実行中 AI ジョブ |
 | --- | --- | --- | --- |
 | 色系パラメータ変更* (ページ個別) | 該当 idx のみクリア | 残す | 残す |
+| **ポストフィルタ変更** (ページ個別) | **該当 idx のみクリア** (サンプラー切替のため再アップロードが必要) | 残す | 残す |
+| 消しゴム/分析モードの入出 (`post_filter_bypassed` 切替) | 該当 idx のみクリア (color-only ⇔ post-filtered の切替) | 残す | 残す |
 | AI モデル変更 (ページ個別) | 全クリア | **全クリア** | **キャンセル** |
 | 保存スロット読込 → 現ページに適用 | 全クリア | AI モデルが異なれば全クリア | 同上 |
 | 「全画像に適用」 / 「全画像から削除」 | 全クリア | AI 設定が変わる idx のみクリア + pending キャンセル | あり |
@@ -159,6 +234,7 @@ AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
 | 消しゴムマスク変更 | 該当 idx のみクリア (再合成) | 該当 idx のみクリア | — |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
+(ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
 
 ### 4.1 ヘルパー関数
 

@@ -623,6 +623,11 @@ pub struct App {
     pub(crate) fs_checker_texture: Option<egui::TextureHandle>,
     /// 背景モード変更直後に表示するインジケータの消去期限。
     pub(crate) fs_transparent_bg_indicator_until: Option<std::time::Instant>,
+    /// ポストフィルタ (AdjustParams.post_filter) を一時的にバイパスするフラグ。
+    /// 消しゴム / 分析モード中は true にして、apply_sync_adjustment が post-filter
+    /// 段をスキップし color-only のテクスチャを作るようにする。
+    /// モード終了時に false に戻し、adjustment_cache をクリアして post-filter を復帰させる。
+    pub(crate) post_filter_bypassed: bool,
 
     // ── 画像分析パネル ────────────────────────────────────────
     /// フルスクリーンで分析パネルを表示するか
@@ -966,6 +971,7 @@ impl Default for App {
             fs_spread_layout: None,
             fs_transparent_bg_mode: 0,
             fs_checker_texture: None,
+            post_filter_bypassed: false,
             fs_transparent_bg_indicator_until: None,
             analysis_mode: false,
             analysis_hover_color: None,
@@ -5492,18 +5498,26 @@ impl App {
     /// poll_prefetch / poll_ai_upscale の完了時に呼ばれ、
     /// 補正済み画像を即座にテクスチャ化してチラつきを防止する。
     fn apply_sync_adjustment(&mut self, ctx: &egui::Context, idx: usize, pixels: &std::sync::Arc<egui::ColorImage>) {
-        let params = self.effective_params(idx);
-        if params.is_identity() {
+        let params = self.effective_params(idx).clone();
+        // post-filter をバイパスする場合: 色調も identity ならスキップ可能
+        let apply_pf = !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
+        if params.is_color_identity() && !apply_pf {
             return;
         }
-        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, params);
-        let adjusted_pixels = std::sync::Arc::new(adjusted);
+        let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
+        let post_filtered = if apply_pf {
+            crate::post_filter::apply(&adjusted, params.post_filter)
+        } else {
+            adjusted
+        };
+        let adjusted_pixels = std::sync::Arc::new(post_filtered);
         let upload = clamp_for_gpu(&adjusted_pixels);
-        let tex = ctx.load_texture(
-            format!("adj_{idx}"),
-            upload.into_owned(),
-            egui::TextureOptions::LINEAR,
-        );
+        let tex_opts = if apply_pf && params.post_filter.needs_nearest_sampler() {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        };
+        let tex = ctx.load_texture(format!("adj_{idx}"), upload.into_owned(), tex_opts);
         // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
         self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels: adjusted_pixels, load_seq: 0 });
     }
@@ -5528,7 +5542,11 @@ impl App {
         if !self.adjustment_page_params.contains_key(&idx) && self.settings.global_preset.is_identity() {
             return;
         }
-        if self.effective_params(idx).is_identity() {
+        // bypass 中は post-filter を考慮せず、色調のみで判定する
+        let params_ref = self.effective_params(idx);
+        let apply_pf = !self.post_filter_bypassed
+            && params_ref.post_filter != crate::adjustment::PostFilter::None;
+        if params_ref.is_color_identity() && !apply_pf {
             return;
         }
         // ソース画像を取得 (AI アップスケール済み or 元画像)

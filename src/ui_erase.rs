@@ -65,6 +65,12 @@ impl App {
         };
         let [w, h] = pixels.size;
         self.erase_mode = true;
+        // post-filter (CRT / 減色など) を編集中だけ一時バイパス。マスクは元画像ベースで
+        // 塗るため、減色プリセットのドット表示が混ざると精密な境界操作が難しくなる。
+        if !self.post_filter_bypassed {
+            self.post_filter_bypassed = true;
+            self.clear_adjustment_caches(fs_idx);
+        }
         self.erase_mask_size = [w, h];
         self.erase_mask_texture = None;
         self.erase_last_paint_pos = None;
@@ -106,7 +112,17 @@ impl App {
 
     /// 消しゴムモードをリセットする。
     pub(crate) fn reset_erase_mode(&mut self) {
+        let restore_idx = self.fullscreen_idx;
         self.erase_mode = false;
+        // post-filter バイパスを解除し、該当ページの adjustment_cache をクリアして
+        // post-filter 適用状態で再生成させる。分析モード中に誤って reset されても
+        // analysis_mode が true なら post_filter_bypassed は分析モード側で保持される想定。
+        if self.post_filter_bypassed && !self.analysis_mode {
+            self.post_filter_bypassed = false;
+            if let Some(idx) = restore_idx {
+                self.clear_adjustment_caches(idx);
+            }
+        }
         self.erase_mask = None;
         self.erase_mask_size = [0, 0];
         self.erase_mask_texture = None;
