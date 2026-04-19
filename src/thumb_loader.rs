@@ -196,14 +196,18 @@ impl CacheDecision {
 ///
 /// 表示用パス (段階 A) で使用。WebP 量子化を通さず元画像から直接生成するため
 /// 画質劣化が無く、キャッシュの WebP(q=75) より高品質。
+///
+/// SIMD 実装の `fast_image_resize` を使用。image crate の `imageops::resize`
+/// (スカラー) に比べてサムネイル生成が 3-5 倍速い。フィルタは同じ Lanczos3。
 pub fn resize_to_display_color_image(
     img: &image::DynamicImage,
     display_px: u32,
 ) -> egui::ColorImage {
-    let resized = img.resize(
+    let resized = crate::fast_resize::resize_dynamic_fit(
+        img,
         display_px,
         display_px,
-        image::imageops::FilterType::Lanczos3,
+        crate::fast_resize::Quality::Lanczos3,
     );
     let rgba = resized.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];

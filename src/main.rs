@@ -14,6 +14,7 @@ pub mod fs_animation;
 pub mod gpu_info;
 pub mod grid_item;
 pub mod exif_reader;
+pub mod fast_resize;
 pub mod logger;
 pub mod mask_db;
 pub mod monitor;

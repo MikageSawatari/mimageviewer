@@ -316,6 +316,9 @@ struct FsFrameState {
     location_display: String,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
+    /// 原寸が GPU テクスチャ上限 (MAX_TEXTURE_DIM=8192) を超えていて、
+    /// 表示は縮小版を使っているとき true。ホバーバーに⚠マーカーを出すのに使う。
+    image_downscaled: bool,
     is_loading: bool,
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
@@ -714,6 +717,7 @@ impl App {
                                 ui, ctx, full_rect,
                                 &state.location_display,
                                 state.image_dims, state.image_file_size,
+                                state.image_downscaled,
                                 &mut close_fs, &mut nav_delta,
                                 &mut self.show_metadata_panel,
                                 false,
@@ -870,26 +874,46 @@ impl App {
         );
         // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
         // AI テクスチャが選ばれている場合でも、元画像のサイズを使う。
-        let image_dims: Option<(u32, u32)> = {
-            // まず元画像のキャッシュからサイズを取得
-            let original_dims = match self.fs_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Static { tex, .. }) => {
-                    let s = tex.size_vec2();
-                    Some((s.x as u32, s.y as u32))
+        // GPU 上限超過で worker が clamp した画像は `source_dims` に原寸が入っており、
+        // ホバー表示はそれを使う。clamp が発動していたら後段で警告マーカーを出す。
+        // fs_cache が未到達でも `fs_early_dims` (ヘッダ解析結果) にヒントがあれば使う。
+        let (image_dims, image_downscaled): (Option<(u32, u32)>, bool) = {
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Static { tex, source_dims, .. }) => {
+                    let tex_size = tex.size_vec2();
+                    match source_dims {
+                        Some([sw, sh]) => {
+                            let clamped = (*sw, *sh) != (tex_size.x as usize, tex_size.y as usize);
+                            (Some((*sw as u32, *sh as u32)), clamped)
+                        }
+                        None => (Some((tex_size.x as u32, tex_size.y as u32)), false),
+                    }
                 }
                 Some(FsCacheEntry::Animated { frames, current_frame, .. }) => {
-                    frames.get(*current_frame).map(|(h, _)| {
+                    let dims = frames.get(*current_frame).map(|(h, _)| {
                         let s = h.size_vec2();
                         (s.x as u32, s.y as u32)
-                    })
+                    });
+                    (dims, false)
                 }
-                _ => None,
-            };
-            // 元画像がまだロードされていなければ、表示中のテクスチャから取得
-            original_dims.or_else(|| tex.as_ref().map(|t| {
-                let s = t.size_vec2();
-                (s.x as u32, s.y as u32)
-            }))
+                _ => {
+                    // まだ fs_cache が埋まっていない段階: ヘッダ解析済みなら原寸ヒントを使う。
+                    // 原寸が GPU 上限超なら、本デコード完了後に clamp が発動することが
+                    // 事前に判るのでこの時点で⚠ダウンスケール警告を出してよい。
+                    if let Some([sw, sh]) = self.fs_early_dims.get(&fs_idx).copied() {
+                        const LIMIT: usize = crate::app::MAX_TEXTURE_DIM_PUB;
+                        let will_clamp = sw > LIMIT || sh > LIMIT;
+                        (Some((sw as u32, sh as u32)), will_clamp)
+                    } else {
+                        // 最後の頼り: フォールバックサムネイル/テクスチャから寸法を取得。
+                        let dims = tex.as_ref().map(|t| {
+                            let s = t.size_vec2();
+                            (s.x as u32, s.y as u32)
+                        });
+                        (dims, false)
+                    }
+                }
+            }
         };
         let image_file_size: Option<u64> = self.image_metas.get(fs_idx)
             .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
@@ -903,7 +927,7 @@ impl App {
 
         FsFrameState {
             is_video, separator_text, video_path, tex, thumb_tex,
-            location_display, image_dims, image_file_size,
+            location_display, image_dims, image_file_size, image_downscaled,
             is_loading, fs_load_failed, pdf_content_type,
         }
     }
@@ -2396,6 +2420,8 @@ impl App {
         location_display: &str,
         image_dims: Option<(u32, u32)>,
         image_file_size: Option<u64>,
+        // 原寸が GPU 上限超で表示が縮小版のとき true。dims のあとに⚠マーカーを出す。
+        image_downscaled: bool,
         close_fs: &mut bool,
         nav_delta: &mut i32,
         show_info: &mut bool,
@@ -2690,7 +2716,8 @@ impl App {
         // 右側のボタン / 情報テキストと衝突しないように幅制限して右端を切る。
         if !location_display.is_empty() {
             let max_x = next_x - 12.0 - compute_info_text_width(
-                ui, image_dims, image_file_size, ai_upscale_info, pdf_content_type,
+                ui, image_dims, image_file_size, image_downscaled,
+                ai_upscale_info, pdf_content_type,
             );
             let avail_width = (max_x - (bar_rect.min.x + 12.0)).max(40.0);
             let galley = ui.painter().layout(
@@ -2712,7 +2739,7 @@ impl App {
         draw_fs_bar_info_text(
             ui, bar_rect,
             egui::pos2(next_x - 12.0, bar_rect.center().y),
-            image_dims, image_file_size,
+            image_dims, image_file_size, image_downscaled,
             ai_upscale_info, pdf_content_type,
         );
     }
@@ -3094,6 +3121,10 @@ fn compute_location_display(
     }
 }
 
+/// ダウンスケール表示中に dims のあとに付けるマーカー文字列。
+/// テキスト幅計算とレンダリングで同じ文字を使うために関数化している。
+fn downscale_marker() -> &'static str { " ⚠ ダウンスケール表示中" }
+
 /// ファイル情報テキスト (PDF 種別・寸法・AI・ファイルサイズ) を描画する。
 /// ファイル名は左側 `location_display` に統合済みなのでここでは扱わない。
 fn draw_fs_bar_info_text(
@@ -3102,27 +3133,65 @@ fn draw_fs_bar_info_text(
     right_anchor: egui::Pos2,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
+    image_downscaled: bool,
     ai_upscale_info: Option<(&str, u32, u32)>,
     pdf_content_type: Option<PdfPageContentType>,
 ) {
-    let text = build_info_text(image_dims, image_file_size, ai_upscale_info, pdf_content_type);
+    let text = build_info_text(
+        image_dims, image_file_size, image_downscaled, ai_upscale_info, pdf_content_type,
+    );
     if !text.is_empty() {
-        ui.painter().text(
-            right_anchor,
-            egui::Align2::RIGHT_CENTER,
-            text,
-            egui::FontId::proportional(15.0),
-            egui::Color32::WHITE,
-        );
+        // ダウンスケール警告だけ黄色で強調したいのでマーカー部分を切り分けて描画する。
+        // マーカーはテキスト末尾の " ⚠ ダウンスケール表示中" 部分 (単独)。
+        let marker = downscale_marker();
+        let (main_text, has_marker) = if image_downscaled && text.ends_with(marker) {
+            (&text[..text.len() - marker.len()], true)
+        } else {
+            (text.as_str(), false)
+        };
+        let font = egui::FontId::proportional(15.0);
+        if has_marker {
+            // 右詰で書くので、まず marker を右端に、次に main_text をその左に置く。
+            let marker_galley = ui.painter().layout_no_wrap(
+                marker.to_string(),
+                font.clone(),
+                egui::Color32::from_rgb(255, 210, 80),
+            );
+            ui.painter().galley(
+                egui::pos2(right_anchor.x - marker_galley.size().x,
+                           right_anchor.y - marker_galley.size().y * 0.5),
+                marker_galley.clone(),
+                egui::Color32::from_rgb(255, 210, 80),
+            );
+            let main_anchor = egui::pos2(right_anchor.x - marker_galley.size().x, right_anchor.y);
+            ui.painter().text(
+                main_anchor,
+                egui::Align2::RIGHT_CENTER,
+                main_text,
+                font,
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().text(
+                right_anchor,
+                egui::Align2::RIGHT_CENTER,
+                text,
+                font,
+                egui::Color32::WHITE,
+            );
+        }
     }
     let _ = bar_rect;
 }
 
 /// 上部バー右側に表示する画像情報テキスト (PDF 種別 / 寸法 / AI / サイズ) を組み立てる。
 /// `draw_fs_bar_info_text` と `compute_info_text_width` 両方から使う。
+/// `image_downscaled` が true の場合、dims の直後 (AI 情報がある場合はその後) に
+/// `⚠ ダウンスケール表示中` マーカーを挿入する。
 fn build_info_text(
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
+    image_downscaled: bool,
     ai_upscale_info: Option<(&str, u32, u32)>,
     pdf_content_type: Option<PdfPageContentType>,
 ) -> String {
@@ -3138,12 +3207,16 @@ fn build_info_text(
         }
     }
     if let Some((w, h)) = image_dims {
-        if let Some((model_name, ai_w, ai_h)) = ai_upscale_info {
+        let mut dims_part = if let Some((model_name, ai_w, ai_h)) = ai_upscale_info {
             // AI アップスケール情報: "11 × 22 (漫画 44×88)"
-            parts.push(format!("{w} × {h} ({model_name} {ai_w}×{ai_h})"));
+            format!("{w} × {h} ({model_name} {ai_w}×{ai_h})")
         } else {
-            parts.push(format!("{w} × {h}"));
+            format!("{w} × {h}")
+        };
+        if image_downscaled {
+            dims_part.push_str(downscale_marker());
         }
+        parts.push(dims_part);
     }
     if let Some(bytes) = image_file_size {
         parts.push(format_bytes_small(bytes));
@@ -3156,10 +3229,13 @@ fn compute_info_text_width(
     ui: &egui::Ui,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
+    image_downscaled: bool,
     ai_upscale_info: Option<(&str, u32, u32)>,
     pdf_content_type: Option<PdfPageContentType>,
 ) -> f32 {
-    let text = build_info_text(image_dims, image_file_size, ai_upscale_info, pdf_content_type);
+    let text = build_info_text(
+        image_dims, image_file_size, image_downscaled, ai_upscale_info, pdf_content_type,
+    );
     if text.is_empty() {
         return 0.0;
     }
@@ -3573,6 +3649,43 @@ mod tests {
             "page01.jpg",
         );
         assert_eq!(out, "page01.jpg");
+    }
+
+    // ── build_info_text: ダウンスケール警告 ─────────────────────────
+
+    #[test]
+    fn info_text_dims_only_no_marker_when_not_downscaled() {
+        let s = build_info_text(Some((1920, 1080)), None, false, None, None);
+        assert_eq!(s, "1920 × 1080");
+    }
+
+    #[test]
+    fn info_text_appends_downscale_marker_when_flag_set() {
+        let s = build_info_text(Some((7168, 9216)), None, true, None, None);
+        assert!(s.starts_with("7168 × 9216"));
+        assert!(s.contains("ダウンスケール表示中"), "warning marker present: {s:?}");
+    }
+
+    #[test]
+    fn info_text_marker_comes_after_ai_info() {
+        // AI 情報 "(漫画 ...)" の内側に警告が混入しないこと。
+        let s = build_info_text(
+            Some((7168, 9216)),
+            None,
+            true,
+            Some(("漫画", 28672, 36864)),
+            None,
+        );
+        let ai_end = s.find(')').expect("AI closing paren exists");
+        let marker_pos = s.find("ダウンスケール").expect("marker present");
+        assert!(marker_pos > ai_end, "marker should come after AI info: {s:?}");
+    }
+
+    #[test]
+    fn info_text_no_marker_when_dims_missing() {
+        // dims が None のとき (まだロード中) は downscaled=true でも警告を出さない。
+        let s = build_info_text(None, Some(1_234_567), true, None, None);
+        assert!(!s.contains("ダウンスケール"), "no marker without dims: {s:?}");
     }
 }
 

@@ -1497,12 +1497,24 @@ impl App {
                         egui::TextureOptions::LINEAR,
                     );
                     let bg = self.effective_upscale_bg_mode();
+                    // fs_cache を上書きするケースでは、既存エントリに保存されている
+                    // 原寸 (source_dims) をそのまま引き継ぐ。ai_upscale_cache 側は
+                    // 派生キャッシュなので None で良い。
+                    let prev_source_dims = self.fs_cache.get(&fs_idx).and_then(|e| {
+                        if let FsCacheEntry::Static { source_dims, .. } = e {
+                            *source_dims
+                        } else {
+                            None
+                        }
+                    });
+                    let write_to_ai = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
                     let entry = FsCacheEntry::Static {
                         tex,
                         pixels: Arc::clone(base),
+                        source_dims: if write_to_ai { None } else { prev_source_dims },
                         load_seq: self.input_seq,
                     };
-                    if self.ai_upscale_cache.contains_key(&(fs_idx, bg)) {
+                    if write_to_ai {
                         self.ai_upscale_cache.insert((fs_idx, bg), entry);
                     } else {
                         self.fs_cache.insert(fs_idx, entry);
@@ -1681,9 +1693,19 @@ impl App {
             result.clone(),
             egui::TextureOptions::LINEAR,
         );
+        // Inpaint で fs_cache を上書きするので、原寸 (source_dims) は既存エントリから
+        // 引き継ぐ (inpaint はサイズ保存のため)。
+        let prev_source_dims = self.fs_cache.get(&idx).and_then(|e| {
+            if let FsCacheEntry::Static { source_dims, .. } = e {
+                *source_dims
+            } else {
+                None
+            }
+        });
         self.fs_cache.insert(idx, FsCacheEntry::Static {
             tex,
             pixels: Arc::new(result),
+            source_dims: prev_source_dims,
             load_seq: self.input_seq,
         });
         self.invalidate_derived_fs_caches(idx);

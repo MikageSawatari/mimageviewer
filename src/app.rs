@@ -418,6 +418,12 @@ pub struct App {
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
     pub(crate) fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
 
+    /// fs_load ワーカーがヘッダ解析だけで取得した先行寸法 (fullscreen 用)。
+    /// `FsLoadResult::DimsOnly` を受信すると登録され、本体 (`Static` など) で
+    /// fs_cache が埋まったら削除される。ホバーバーはデコード完了前でも
+    /// これを見て即サイズを表示できる (⚠ ダウンスケール警告もここで判定可能)。
+    pub(crate) fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
+
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
 
@@ -903,6 +909,7 @@ impl Default for App {
             fullscreen_idx: None,
             fs_cache: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
+            fs_early_dims: std::collections::HashMap::new(),
             show_favorites_editor: false,
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
@@ -4368,6 +4375,18 @@ impl App {
                 );
             }
 
+            // ── 先行 dims ヒント ───────────────────────────────────────
+            // ローカル画像ファイル (ZIP/PDF 以外) はヘッダ数バイトだけ読めば
+            // 寸法が取れる。フルデコードより桁違いに速い (数 ms) ので、
+            // ホバーバーに即サイズと⚠ダウンスケール警告を出せるように
+            // 本デコード前に `DimsOnly` を送る。失敗しても致命的ではないので
+            // 黙って無視して本デコードに進む。
+            if pdf_page.is_none() && zip_entry.is_none() {
+                if let Some(dims) = crate::fast_resize::probe_dims(&path) {
+                    let _ = tx.send(FsLoadResult::DimsOnly { source_dims: dims });
+                }
+            }
+
             // 表示名と拡張子を取得
             let (name, ext) = if let Some(page_num) = pdf_page {
                 (format!("Page {}", page_num + 1), "pdf".to_string())
@@ -4400,6 +4419,10 @@ impl App {
                             "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}  {:?}",
                             img.width(), img.height(), content_type
                         ));
+                        // GPU テクスチャ上限に収まらない巨大レンダ結果をここで縮小しておく。
+                        // (request_pdf_rerender は 8192 に clamp 済なので通常は no-op)
+                        let source_dims = [img.width() as usize, img.height() as usize];
+                        let img = clamp_dynamic_for_gpu(img);
                         let (w, h) = (img.width(), img.height());
                         let ci = dynamic_image_to_color_image(&img);
                         if crate::perf::is_enabled() {
@@ -4410,7 +4433,7 @@ impl App {
                                 ("h", serde_json::Value::from(h)),
                             ]);
                         }
-                        let _ = tx.send(FsLoadResult::Static(ci));
+                        let _ = tx.send(FsLoadResult::Static { ci, source_dims });
                         // content_type をメインスレッドに送る
                         let _ = pdf_ct_tx.send((idx, content_type));
                     }
@@ -4537,6 +4560,12 @@ impl App {
                     } else {
                         img
                     };
+                    // GPU テクスチャ上限 (MAX_TEXTURE_DIM=8192) を超える巨大画像は
+                    // worker で DynamicImage のまま Triangle リサイズしておく。
+                    // UI スレッド側の clamp_for_gpu は ColorImage↔DynamicImage の
+                    // premultiply/unmultiply ループが重く、7K-9K クラスで 5s/回ブロックする。
+                    let source_dims = [img.width() as usize, img.height() as usize];
+                    let img = clamp_dynamic_for_gpu(img);
                     let (w, h) = (img.width(), img.height());
                     let ci = dynamic_image_to_color_image(&img);
                     let elapsed = t.elapsed().as_secs_f64() * 1000.0;
@@ -4551,7 +4580,7 @@ impl App {
                             ("h", serde_json::Value::from(h)),
                         ]);
                     }
-                    let _ = tx.send(FsLoadResult::Static(ci));
+                    let _ = tx.send(FsLoadResult::Static { ci, source_dims });
                     emit_exit("static_ok");
                 }
                 Err(e) => {
@@ -4632,8 +4661,13 @@ impl App {
                         "  pdf rerender done: page={} target_px={target_px} {}x{}",
                         page_num + 1, img.width(), img.height()
                     ));
+                    // PDF 再レンダ結果は request_pdf_rerender が 8192 に clamp してから
+                    // 投げているので `clamp_dynamic_for_gpu` は実質 no-op だが、不変条件
+                    // (fs_cache.pixels ≤ MAX_TEXTURE_DIM) を型レベルで保つため通す。
+                    let source_dims = [img.width() as usize, img.height() as usize];
+                    let img = clamp_dynamic_for_gpu(img);
                     let ci = dynamic_image_to_color_image(&img);
-                    let _ = fs_tx.send(FsLoadResult::Static(ci));
+                    let _ = fs_tx.send(FsLoadResult::Static { ci, source_dims });
                 }
                 Ok(Err(e)) => {
                     crate::logger::log(format!("  pdf rerender FAIL: {e}"));
@@ -4691,6 +4725,8 @@ impl App {
             if let Some((cancel, _, _)) = self.fs_pending.remove(&k) {
                 cancel.store(true, Ordering::Relaxed);
             }
+            // 先行 dims ヒントはキャンセルされた idx では意味がないので破棄。
+            self.fs_early_dims.remove(&k);
         }
 
         if current_loading {
@@ -4751,6 +4787,7 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         self.fs_pending.clear();
+        self.fs_early_dims.clear();
         self.fs_cache.clear();
         // AI キャッシュもクリア
         for (cancel, _) in self.ai_upscale_pending.values() {
@@ -4861,9 +4898,12 @@ impl App {
                 self.apply_sync_adjustment(ctx, idx, &pixels);
             }
             // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
+            // source_dims はダウンスケール警告用で、派生エントリは元画像の fs_cache 側を
+            // 参照すればよいのでここでは None を入れておく。
             self.ai_upscale_cache.insert(key, FsCacheEntry::Static {
                 tex: handle,
                 pixels,
+                source_dims: None,
                 load_seq: 0,
             });
             crate::logger::log(format!("[AI] Upscale complete for idx={idx} bg={bg}"));
@@ -5686,7 +5726,13 @@ impl App {
         };
         let tex = ctx.load_texture(format!("adj_{idx}"), upload.into_owned(), tex_opts);
         // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
-        self.adjustment_cache.insert(idx, FsCacheEntry::Static { tex, pixels: adjusted_pixels, load_seq: 0 });
+        // source_dims は fs_cache 側に保存されているのでここは None でよい。
+        self.adjustment_cache.insert(idx, FsCacheEntry::Static {
+            tex,
+            pixels: adjusted_pixels,
+            source_dims: None,
+            load_seq: 0,
+        });
     }
 
     /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
@@ -5778,26 +5824,54 @@ impl App {
             }
         }
 
+        // drain ループ: 各 pending からメッセージを可能な限り取り出す。
+        // `DimsOnly` は非終端なので fs_early_dims に積むだけで fs_pending は維持、
+        // 同一フレーム内で続けて本体 (Static など) が届く可能性があるので再度 try_recv を
+        // 回す。`Static` / `Animated` / `Failed` は終端で break してその idx を完了扱い。
+        // `self.fs_pending` を借用中に `self.fs_early_dims` を変更できないので、
+        // 一旦ローカル vec に集めてから後段で apply する。
         let mut completed: Vec<(usize, FsLoadResult, u64)> = Vec::new();
         let mut disconnected: Vec<usize> = Vec::new();
+        let mut early_dims_updates: Vec<(usize, [usize; 2])> = Vec::new();
         for (&key, (_, rx, seq)) in &self.fs_pending {
-            match rx.try_recv() {
-                Ok(result) => completed.push((key, result, *seq)),
-                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
-                Err(mpsc::TryRecvError::Empty) => {}
+            loop {
+                match rx.try_recv() {
+                    Ok(FsLoadResult::DimsOnly { source_dims }) => {
+                        early_dims_updates.push((key, source_dims));
+                        continue;
+                    }
+                    Ok(result) => {
+                        completed.push((key, result, *seq));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected.push(key);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
             }
+        }
+        let early_dims_repaint = !early_dims_updates.is_empty();
+        for (key, dims) in early_dims_updates {
+            self.fs_early_dims.insert(key, dims);
         }
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for key in disconnected {
             self.fs_pending.remove(&key);
+            self.fs_early_dims.remove(&key);
         }
-        let repaint = !completed.is_empty();
+        let repaint = !completed.is_empty() || early_dims_repaint;
         for (key, result, load_seq) in completed {
             self.fs_pending.remove(&key);
+            // 本体メッセージで fs_cache が埋まるので先行ヒントはもう不要。
+            // (ホバーバーは fs_cache.source_dims を優先して見るため、残っていても
+            // 実害はないが HashMap が膨張しないようクリーンアップする)
+            self.fs_early_dims.remove(&key);
             let perf_key_str = self.perf_item_key(key);
             let upload_t0 = std::time::Instant::now();
             let entry = match result {
-                FsLoadResult::Static(ci) => {
+                FsLoadResult::Static { ci, source_dims } => {
                     let pixels = std::sync::Arc::new(ci);
                     let upload = clamp_for_gpu(&pixels);
                     let [w, h] = pixels.size;
@@ -5829,7 +5903,12 @@ impl App {
                     if self.fullscreen_idx == Some(key) {
                         self.apply_sync_adjustment(ctx, key, &pixels);
                     }
-                    FsCacheEntry::Static { tex: handle, pixels, load_seq }
+                    FsCacheEntry::Static {
+                        tex: handle,
+                        pixels,
+                        source_dims: Some(source_dims),
+                        load_seq,
+                    }
                 }
                 FsLoadResult::Animated(frames) => {
                     let textures: Vec<(egui::TextureHandle, f64)> = frames
@@ -5854,6 +5933,10 @@ impl App {
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
+                // drain 側で弾いているのでここには来ない。unreachable を防御的に残す。
+                FsLoadResult::DimsOnly { .. } => unreachable!(
+                    "DimsOnly should be drained before reaching completion match"
+                ),
             };
             self.fs_cache.insert(key, entry);
             // 保存済みマスクがあれば自動で inpaint 適用
@@ -6878,10 +6961,18 @@ pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::C
 /// wgpu テクスチャの最大次元。wgpu デフォルト制限は 8192px。
 /// GPU 実機はもっと大きいが (RTX 4090 = 16384)、eframe が
 /// デフォルト Limits で初期化するため 8192 を超えるとパニックする。
-const MAX_TEXTURE_DIM: usize = 8192;
+pub(crate) const MAX_TEXTURE_DIM: usize = 8192;
+/// UI モジュールから参照する用。`const` は可視性があれば外でも使えるのでエクスポート。
+pub(crate) const MAX_TEXTURE_DIM_PUB: usize = MAX_TEXTURE_DIM;
 
 /// GPU テクスチャ上限を超える `ColorImage` を縮小して返す。
 /// 上限内であればクローンせず共有参照をそのまま `Cow::Borrowed` で返す。
+///
+/// UI スレッドからの呼び出し時に上限超過を検知するとここで
+/// `resize_exact(Triangle)` が走り、7K-9K クラスの画像で 5 秒単位の同期ハングになる。
+/// フルスクリーン静止画の主経路 (start_fs_load) は worker 側で先に
+/// `clamp_dynamic_for_gpu` を掛けているので、ここは通常 `Cow::Borrowed` のみを
+/// 辿る前提になっている。異常経路の安全網として残してある。
 pub(crate) fn clamp_for_gpu(ci: &egui::ColorImage) -> std::borrow::Cow<'_, egui::ColorImage> {
     let [w, h] = ci.size;
     if w <= MAX_TEXTURE_DIM && h <= MAX_TEXTURE_DIM {
@@ -6891,12 +6982,40 @@ pub(crate) fn clamp_for_gpu(ci: &egui::ColorImage) -> std::borrow::Cow<'_, egui:
     let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
     let new_w = ((w as f64 * scale).round() as u32).max(1);
     let new_h = ((h as f64 * scale).round() as u32).max(1);
+    let t0 = std::time::Instant::now();
     let dynimg = color_image_to_dynamic(ci);
     let resized = dynimg.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
     crate::logger::log(format!(
-        "  clamp_for_gpu: {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM})"
+        "  clamp_for_gpu (UI-thread fallback): {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM}) in {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
     ));
     std::borrow::Cow::Owned(dynamic_image_to_color_image(&resized))
+}
+
+/// worker スレッド向け: GPU 上限を超える `DynamicImage` を Bilinear リサイズで縮小する。
+/// `fast_image_resize` (AVX2/SSE4.1 SIMD) 実装を使うので、image crate の
+/// スカラー `resize_exact(Triangle)` に比べて 7K-9K クラスで 5-10 倍速い。
+/// 上限内なら入力をそのまま返す (クローンなし)。
+pub(crate) fn clamp_dynamic_for_gpu(img: image::DynamicImage) -> image::DynamicImage {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w <= MAX_TEXTURE_DIM && h <= MAX_TEXTURE_DIM {
+        return img;
+    }
+    let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    let t0 = std::time::Instant::now();
+    let resized = crate::fast_resize::resize_dynamic_exact(
+        &img,
+        new_w,
+        new_h,
+        crate::fast_resize::Quality::Bilinear,
+    );
+    crate::logger::log(format!(
+        "  clamp_dynamic_for_gpu: {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM}) in {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    ));
+    resized
 }
 
 /// 回転した画像を Mesh で描画する。
@@ -7489,5 +7608,32 @@ mod tests {
         App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
 
         assert_eq!(folders.len(), 1, "大文字小文字違いでも一致扱い");
+    }
+
+    /// `clamp_dynamic_for_gpu` は 8192 以内の画像には触れず、超えるときだけ
+    /// 長辺 8192 にアスペクト比保持で縮小する。
+    #[test]
+    fn clamp_dynamic_for_gpu_noop_within_limit() {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(4096, 2048));
+        let out = clamp_dynamic_for_gpu(img);
+        assert_eq!((out.width(), out.height()), (4096, 2048));
+    }
+
+    #[test]
+    fn clamp_dynamic_for_gpu_scales_portrait_oversize() {
+        // 7168x9216 は再現バグのテストサイズ。長辺 9216 → 8192 で縮小され、
+        // 短辺もアスペクト比を保って縮む (7168 * 8192/9216 = 6371.55… ≈ 6372)。
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(7168, 9216));
+        let out = clamp_dynamic_for_gpu(img);
+        assert_eq!(out.height(), 8192, "long edge clamped to MAX_TEXTURE_DIM");
+        assert_eq!(out.width(), 6372, "aspect-preserving short edge");
+    }
+
+    #[test]
+    fn clamp_dynamic_for_gpu_scales_landscape_oversize() {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(16384, 4096));
+        let out = clamp_dynamic_for_gpu(img);
+        assert_eq!(out.width(), 8192);
+        assert_eq!(out.height(), 2048);
     }
 }

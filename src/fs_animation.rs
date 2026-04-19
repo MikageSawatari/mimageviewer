@@ -7,9 +7,25 @@
 use std::path::Path;
 
 /// フルスクリーン読み込みスレッドからUIスレッドへ送るメッセージ。
+///
+/// デコードは時間がかかるので、メッセージは **2 段階** で送られることがある:
+/// 1. `DimsOnly`  (任意)  — ファイルヘッダから寸法だけ取り出して先行送信。
+///    ホバーバーにサイズと⚠ダウンスケール警告を即座に出すためのヒント。
+///    受信しても fs_pending からは抜かない (本デコードが続く)。
+/// 2. 本体 (`Static` / `Animated` / `Failed`) — 終端メッセージ。受信したら
+///    fs_pending から該当エントリを削除する。
+///
+/// `DimsOnly` が送られずに `Static` がいきなり来るケースもある (PDF や
+/// probe が失敗した場合など)。UI 側はそれも普通に扱えるよう、drain ループで
+/// すべての受信メッセージを消化する。
 pub enum FsLoadResult {
-    /// 静止画（GIF・APNG の1フレーム目のみを含む）
-    Static(egui::ColorImage),
+    /// ヘッダ解析だけで取れた EXIF 後相当の表示向き寸法。終端ではない。
+    DimsOnly { source_dims: [usize; 2] },
+    /// 静止画（GIF・APNG の1フレーム目のみを含む）。
+    /// `source_dims` はワーカーがデコードした直後・GPU 上限 clamp 前の寸法で、
+    /// ホバーバーに原寸を表示したり「ダウンスケール表示中」警告を出すために使う。
+    /// `ci.size` は clamp 後なので両者が一致しないとき = clamp が発動したケース。
+    Static { ci: egui::ColorImage, source_dims: [usize; 2] },
     /// アニメーション: (フレーム画像, 表示時間[秒]) のベクタ
     Animated(Vec<(egui::ColorImage, f64)>),
     /// デコードに失敗した (fs_cache に Failed エントリを記録して
@@ -23,6 +39,10 @@ pub enum FsCacheEntry {
     Static {
         tex: egui::TextureHandle,
         pixels: std::sync::Arc<egui::ColorImage>,
+        /// GPU 上限 clamp 前の原寸 (幅, 高さ)。`pixels.size` と一致しないとき
+        /// ダウンスケール表示中を意味する。派生キャッシュ (AI 結果・補正結果・
+        /// 消しゴム結果) では `None` でよい。
+        source_dims: Option<[usize; 2]>,
         /// このエントリを生成したロードの `input_seq`。perf 相関用。
         /// `fs.paint` で `fs.ready` と同じ seq を使うために保持する。
         /// 計装無効時や内部起因のエントリは 0。

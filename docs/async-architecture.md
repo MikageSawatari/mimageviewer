@@ -44,7 +44,7 @@
 | 名前 | 方向 | 内容 |
 | --- | --- | --- |
 | `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, from_cache, source_dims, canceled, finalized)。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false, finalized=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + finalized=true) → UI は `requested` を抜くだけで **`thumbnails[i]` は変更しない**。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE 専用 (worker bail-out) で、UI は Evicted に戻して再試行可能にする (Failed にしない)。`finalized=true` と `canceled=true` は排他 |
-| `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: Static / Animated / Failed |
+| `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly (非終端) / Static / Animated / Failed**。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は `fs_early_dims` に積み fs_pending は維持する (本デコードが続く)。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | `(pages, password_needed)` |
 | PDF ワーカー stdin/stdout | UI プロセス ↔ PDF ワーカープロセス | 長さプレフィクス付きバイナリプロトコル (Enumerate / Render / Shutdown) |
@@ -263,6 +263,16 @@ std::thread::spawn(move || {
 - 補正の LUT 計算: 軽いので同期 OK (`maybe_apply_adjustment`)
 - AI 推論: 絶対に別スレッド
 - 画像デコード: 絶対に別スレッド
+- **GPU 上限超過画像のリサイズ**: 2026-04 に 7168×9216 の PNG をフルスクリーンで開くと
+  UI が 10 秒近く固まる事故があった。`clamp_for_gpu(&ColorImage)` を UI スレッドで
+  呼ぶと ColorImage → DynamicImage への premultiply 往復 (ピクセル毎ループ) と
+  `resize_exact(Triangle)` が同期で走って 1 発 5 秒級になる。`start_fs_load` の
+  worker 側で `clamp_dynamic_for_gpu(DynamicImage)` を先に掛ける方針に変更し、
+  `fs_cache` / `ai_upscale_cache` / `adjustment_cache` の `Static.pixels` は
+  **常に 8192px 以内** という不変条件に格上げした。UI スレッドの `clamp_for_gpu`
+  は異常経路の安全網として残してあるが、通常パスでは `Cow::Borrowed` で返り
+  リサイズは走らない。発動したらログに `clamp_for_gpu (UI-thread fallback)` が出る。
+  詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照。
 
 ### 5.4 PDF ワーカー / Susie ワーカーの想定外終了
 

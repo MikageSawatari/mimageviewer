@@ -197,12 +197,20 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// 画像を `long_side` px にリサイズし、ロッシー WebP でエンコードする。
 /// `quality` は 0.0–100.0 (JPEG の quality と同等の意味)。
 /// 戻り値: (webp_bytes, width, height)
+///
+/// リサイズは SIMD 実装の `fast_image_resize` を Lanczos3 で使用する
+/// (image crate のスカラー Lanczos3 より 3-5 倍速い)。
 pub fn encode_thumb_webp(
     img: &image::DynamicImage,
     long_side: u32,
     quality: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let thumb = img.resize(long_side, long_side, image::imageops::FilterType::Lanczos3);
+    let thumb = crate::fast_resize::resize_dynamic_fit(
+        img,
+        long_side,
+        long_side,
+        crate::fast_resize::Quality::Lanczos3,
+    );
     let rgb = thumb.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     let encoder = webp::Encoder::from_rgb(rgb.as_raw(), w, h);

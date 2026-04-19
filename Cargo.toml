@@ -33,6 +33,9 @@ windows = { version = "0.61", features = [
 eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
+# SIMD (SSE4.1/AVX2) 実装のリサイズ。image crate の imageops::resize はスカラー実装で
+# 7K-9K クラスの画像で秒単位かかるため、clamp_dynamic_for_gpu とサムネイル生成で使用。
+fast_image_resize = { version = "5", features = ["image"] }
 png = "0.18"
 flate2 = "1"
 kamadak-exif = "0.6"

@@ -100,8 +100,79 @@ ui_fullscreen.rs::render_fullscreen_viewport
   ├─ .gif      → fs_animation::decode_gif_frames
   └─ .png/APNG → fs_animation::decode_apng_frames
 
-結果: FsCacheEntry (Static / Animated / Failed) を fs_cache に格納
+→ EXIF 適用済の DynamicImage に `clamp_dynamic_for_gpu` を掛けて長辺 8192 以内に縮小
+   (wgpu デフォルト上限)。7K-9K クラスの画像で過去に UI スレッドで 5s 級の
+   Triangle リサイズが走ってしまい応答なしになった実害から、worker で先に縮小する。
+
+→ 結果: FsCacheEntry (Static / Animated / Failed) を fs_cache に格納
 ```
+
+**リサイズ実装 (`src/fast_resize.rs`)**:
+
+リサイズは `image::imageops::resize` (スカラー) ではなく、`fast_image_resize`
+(AVX2 / SSE4.1 SIMD) ラッパの `crate::fast_resize` 経由で呼ぶ。実測で 3-10 倍速く、
+7K-9K クラスの画像でも数百 ms で完了する。フィルタは `Quality::Bilinear` (≈ Triangle) と
+`Quality::Lanczos3` の 2 択。使用箇所:
+
+- `clamp_dynamic_for_gpu` — GPU 上限クランプ (Bilinear、縮小前提で速度優先)
+- `thumb_loader::resize_to_display_color_image` — 表示用サムネ (Lanczos3、品質重視)
+- `catalog::encode_thumb_webp` — キャッシュ用サムネ (Lanczos3、品質重視)
+
+新規リサイズ経路を増やすときは `image::DynamicImage::resize(_exact)` を直接呼ばず、
+`fast_resize::resize_dynamic_fit` / `resize_dynamic_exact` を使うこと。`image` crate の
+`resize` は UI スレッドに乗ったとき秒単位の応答なしを招きやすい。
+
+**GPU テクスチャ上限の規約 (MAX_TEXTURE_DIM = 8192)**:
+
+- `fs_cache` / `ai_upscale_cache` / `adjustment_cache` に入る `Static.pixels` は
+  **常に 8192px 以内**。worker 側 `clamp_dynamic_for_gpu` で担保される。
+- UI スレッドの `clamp_for_gpu(&ColorImage)` は異常経路の安全網。通常パスでは
+  `Cow::Borrowed` で返り、Triangle リサイズは走らない。発動したらログに
+  `clamp_for_gpu (UI-thread fallback)` が出る。
+- AI アップスケールは `ai_upscale_skip_px` (既定 2048) で長辺 2047 以下のみ処理、
+  ×4 倍で最大 8188 なので 8192 を越えない。
+- `apply_sync_adjustment` は pointwise 変換なので入力サイズを保つ → 入力が 8192 以内
+  ならば出力も 8192 以内。AI 結果 / fs_cache の `pixels` を入力に取るので成立する。
+- 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も
+  同じ上限を尊重する。
+
+新しい経路で `FsCacheEntry::Static` を作るときは、`pixels` が 8192 以内であることを
+自分で保証するか、`clamp_dynamic_for_gpu` を掛けてから格納する。UI スレッド側の
+同期 Triangle リサイズを増やさないこと。
+
+**原寸表示とダウンスケール警告 (`source_dims`)**:
+
+`FsCacheEntry::Static.source_dims: Option<[usize; 2]>` は **clamp 前** の原寸。
+fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録して送る。ホバーバーの
+画像サイズ表示はこれを優先して使い、`pixels.size` と不一致なら「⚠ ダウンスケール
+表示中」マーカーを出す (利用者が縮小表示に気づけるように)。
+
+派生キャッシュ (`ai_upscale_cache` / `adjustment_cache`) や消しゴム再挿入の entry は
+`source_dims: None` で良い。ホバー UI は `fs_cache` 側のエントリから原寸を読むため、
+派生側は参照されない。ただし消しゴム inpaint / マスク解除で `fs_cache` を上書きする
+ケースは既存 entry の `source_dims` を必ず引き継ぐこと (上書きで原寸情報が消えて
+警告が出なくなる事故を防ぐ)。
+
+**先行 dims ヒント (`fs_early_dims` / `FsLoadResult::DimsOnly`)**:
+
+フルデコードには数百 ms-数秒かかるが、画像の**寸法だけ**ならヘッダ数バイトで
+取れる (PNG の IHDR、JPEG の SOF マーカー等、通常 2-10 ms)。この時間差を活かして
+「ロード中はホバーバーに何も出ない」状態を短縮する経路を設けている:
+
+1. `start_fs_load` ワーカーは perf `decode_begin` 直後、ローカル画像パス限定で
+   `fast_resize::probe_dims(&path)` を呼び、成功したら `FsLoadResult::DimsOnly {
+   source_dims }` を先行送信する (PDF / ZIP は probe がそもそも遅いので対象外)。
+2. `poll_prefetch` は各 `fs_pending` に対して **drain ループ** で try_recv を回し、
+   `DimsOnly` を受信したら `App::fs_early_dims: HashMap<usize, [usize; 2]>` に格納し、
+   fs_pending はそのまま残す (本デコードが続く)。
+3. ホバーバー (`build_fs_frame_state`) は `fs_cache` にエントリがないケースで
+   `fs_early_dims` を見に行き、あれば原寸をそのまま表示。原寸が MAX_TEXTURE_DIM を
+   超えていればダウンスケール警告もこの時点で出せる (本デコード完了まで待たない)。
+4. 本体 (`Static` / `Animated` / `Failed`) 受信で `fs_early_dims[idx]` は削除される。
+   `load_folder` / キャンセル時も一緒に drop して HashMap が肥大化しないようにする。
+
+この設計は `DimsOnly` 省略時 (probe 失敗 / PDF / ZIP) でも問題なく動く。drain ループが
+終端メッセージ 1 個で `completed` に積んで抜けるだけなので、従来挙動と互換。
 
 ### 2.3 表示テクスチャの優先順位 (決定版)
 
