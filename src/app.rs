@@ -95,12 +95,28 @@ fn is_png_entry(entry_name: &str) -> bool {
 }
 
 /// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
-fn hay_of(meta_text: &str, name: &str) -> String {
-    if meta_text.is_empty() {
+/// mXD が埋めた XMP tweet 情報 (本文・投稿者) があれば末尾に追記する。
+fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetInfo>) -> String {
+    let mut out = if meta_text.is_empty() {
         name.to_string()
     } else {
         format!("{meta_text}\n{name}")
+    };
+    if let Some(x) = xmp {
+        for field in [
+            x.description.as_deref(),
+            x.creator.as_deref(),
+            x.author_screen_name.as_deref(),
+            x.author_display_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push('\n');
+            out.push_str(field);
+        }
     }
+    out
 }
 use crate::fs_animation::{decode_apng_frames, decode_gif_frames, FsCacheEntry, FsLoadResult};
 use crate::grid_item::{GridItem, ThumbnailState};
@@ -4304,7 +4320,6 @@ impl App {
             match item {
                 // ナビゲーション用の構造アイテムは常に表示
                 GridItem::Folder(_)
-                | GridItem::Video(_)
                 | GridItem::ZipFile(_)
                 | GridItem::PdfFile(_)
                 | GridItem::ConvertibleArchive { .. }
@@ -4318,7 +4333,15 @@ impl App {
                     } else {
                         String::new()
                     };
-                    if crate::search_query::matches(&tokens, &hay_of(&meta_text, name)) {
+                    let xmp = crate::xmp_reader::read_tweet_info(path);
+                    if crate::search_query::matches(&tokens, &hay_of(&meta_text, name, xmp.as_ref())) {
+                        matches.insert(idx);
+                    }
+                }
+                GridItem::Video(path) => {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let xmp = crate::xmp_reader::read_tweet_info(path);
+                    if crate::search_query::matches(&tokens, &hay_of("", name, xmp.as_ref())) {
                         matches.insert(idx);
                     }
                 }
@@ -4357,11 +4380,15 @@ impl App {
                 } else {
                     crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
                 };
-                let meta_text = bytes_result
-                    .map(|bytes| crate::png_metadata::build_searchable_from_bytes(&bytes))
-                    .unwrap_or_default();
+                let (meta_text, xmp) = match bytes_result {
+                    Ok(bytes) => (
+                        crate::png_metadata::build_searchable_from_bytes(&bytes),
+                        crate::xmp_reader::read_tweet_info_from_bytes(&bytes),
+                    ),
+                    Err(_) => (String::new(), None),
+                };
                 let name = crate::zip_loader::entry_basename(&entry_name);
-                if crate::search_query::matches(&tokens, &hay_of(&meta_text, name)) {
+                if crate::search_query::matches(&tokens, &hay_of(&meta_text, name, xmp.as_ref())) {
                     matches.insert(idx);
                 }
             }
