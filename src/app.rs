@@ -768,6 +768,18 @@ pub struct App {
     pub(crate) mask_pages: std::collections::HashSet<usize>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// サムネイル補正用ソースピクセル: idx → Arc<ColorImage>。
+    /// keep_range 内の Loaded サムネに対して保持し、補正パラメータ変更で
+    /// 同期的に `apply_adjustments_fast` を掛け直すための元ソース。
+    /// 範囲外に evict されたら drop する。post_filter は適用しない (色調のみ)。
+    pub(crate) thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    /// サムネイル補正済みテクスチャ: idx → TextureHandle。
+    /// `effective_params(idx)` が色調 identity でないときのみ格納。
+    /// サムネ描画時は `thumbnails[idx].tex` より優先される。
+    pub(crate) thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    /// 前フレームのスライダードラッグ状態。true→false 遷移を検知して
+    /// release 時に `thumb_adjust_tex` を全無効化する。
+    pub(crate) thumb_adjust_was_dragging: bool,
     /// スライダードラッグ中フラグ（パネル内ウィジェットのドラッグ検出）
     pub(crate) adjustment_dragging: bool,
     /// 補正 DB ハンドル
@@ -1057,6 +1069,9 @@ impl Default for App {
             adjustment_page_params: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             adjustment_cache: std::collections::HashMap::new(),
+            thumb_pixels: std::collections::HashMap::new(),
+            thumb_adjust_tex: std::collections::HashMap::new(),
+            thumb_adjust_was_dragging: false,
             adjustment_dragging: false,
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
             adjustment_sharpened: std::collections::HashSet::new(),
@@ -1891,6 +1906,9 @@ impl App {
 
         // 画像補正: ページ個別パラメータを DB から復元
         self.adjustment_cache.clear();
+        self.thumb_pixels.clear();
+        self.thumb_adjust_tex.clear();
+        self.thumb_adjust_was_dragging = false;
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
@@ -2535,12 +2553,29 @@ impl App {
                             ThumbnailState::Loaded { .. }
                         );
                         let upload_t0 = std::time::Instant::now();
+                        // サムネ補正用に `color_image` を Arc で保持してからテクスチャ化する。
+                        // テクスチャアップロードは ColorImage を消費するので、保持用に clone が必要。
+                        // 動画サムネは補正対象外 (keep_range 外に出ないので leak を避けるため)。
+                        let retain_pixels_for_adjust = !is_video;
+                        let (arc_pixels_opt, image_to_upload) = if retain_pixels_for_adjust {
+                            let arc = std::sync::Arc::new(color_image);
+                            let img = (*arc).clone();
+                            (Some(arc), img)
+                        } else {
+                            (None, color_image)
+                        };
                         let handle = ctx.load_texture(
                             format!("thumb_{i}"),
-                            color_image,
+                            image_to_upload,
                             egui::TextureOptions::LINEAR,
                         );
                         let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                        if let Some(arc) = arc_pixels_opt {
+                            self.thumb_pixels.insert(i, arc);
+                        }
+                        // 新しいピクセルに差し替わったので、古い補正済みテクスチャは捨てる。
+                        // 次フレームで `maybe_apply_thumb_adjustment` により再生成される。
+                        self.thumb_adjust_tex.remove(&i);
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
                             from_cache,
@@ -2622,6 +2657,8 @@ impl App {
                         ));
                         self.requested.remove(&i);
                         self.pending_finalize.remove(&i);
+                        self.thumb_pixels.remove(&i);
+                        self.thumb_adjust_tex.remove(&i);
                         self.thumbnails[i] = ThumbnailState::Evicted;
                     }
                 }
@@ -2755,6 +2792,10 @@ impl App {
             if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
                 self.thumbnails[i] = ThumbnailState::Evicted;
             }
+            // サムネ補正用ピクセル/テクスチャも keep_range 外では破棄する。
+            // 動画は上で skip 済みなのでここには来ない。
+            self.thumb_pixels.remove(&i);
+            self.thumb_adjust_tex.remove(&i);
         }
         let t2 = frame_t0.elapsed();
 
@@ -5685,6 +5726,7 @@ impl App {
         }
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         self.adjustment_cache.remove(&idx);
+        self.thumb_adjust_tex.remove(&idx);
         if !old_params.ai_settings_eq(&new_params) {
             self.purge_upscale_for_idx(idx);
         }
@@ -5772,7 +5814,7 @@ impl App {
                 }
             }
         }
-        self.adjustment_cache.clear();
+        self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
@@ -5798,7 +5840,7 @@ impl App {
                 sc.remove_adjust_bulk(rels);
             }
         }
-        self.adjustment_cache.clear();
+        self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
@@ -5823,8 +5865,9 @@ impl App {
         };
         self.settings.global_preset = params;
         self.settings.save();
-        // グローバルが変わると、ページ個別を持たないページの表示が変わる
-        self.adjustment_cache.clear();
+        // グローバルが変わると、ページ個別を持たないページの表示が変わる。
+        // サムネ側も override 有無を判別するより全クリア → visible 優先で再生成が単純。
+        self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
@@ -5990,11 +6033,100 @@ impl App {
     /// AI モデル設定変更時は ai_upscale_cache もクリアする。
     pub(crate) fn clear_adjustment_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
+        // サムネ側の補正済みテクスチャも同時に落とす (ピクセルは保持)。
+        // 次フレーム以降 maybe_apply_thumb_adjustment で再生成される。
+        self.thumb_adjust_tex.remove(&idx);
+    }
+
+    /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
+    /// バルク系操作 (apply_params_to_all_pages / clear_all_page_params /
+    /// copy_params_to_global) で表示優先順位の上位キャッシュを一掃するためのヘルパー。
+    /// `thumb_pixels` (ソースピクセル) は keep_range で管理されているのでここでは触らない。
+    pub(crate) fn clear_all_color_caches(&mut self) {
+        self.adjustment_cache.clear();
+        self.thumb_adjust_tex.clear();
+    }
+
+    /// サムネイル補正を同期適用する (色調のみ、post_filter は対象外)。
+    /// 既に `thumb_adjust_tex[idx]` があればスキップ。ピクセル未保持ならスキップ
+    /// (keep_range 外で evict 済み)。identity (無補正) なら再描画時に生サムネを
+    /// そのまま使うため、キャッシュ生成も行わない。
+    pub(crate) fn maybe_apply_thumb_adjustment(&mut self, ctx: &egui::Context, idx: usize) {
+        if self.thumb_adjust_tex.contains_key(&idx) {
+            return;
+        }
+        let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else { return; };
+        let adjusted = {
+            let params = self.effective_params(idx);
+            if params.is_color_identity() {
+                return;
+            }
+            crate::adjustment::apply_adjustments_fast(&pixels, params)
+        };
+        let handle = ctx.load_texture(
+            format!("thumb_adj_{idx}"),
+            adjusted,
+            egui::TextureOptions::LINEAR,
+        );
+        self.thumb_adjust_tex.insert(idx, handle);
+    }
+
+    /// keep_range 内の「ピクセルは持っているが補正テクスチャがまだ無い」idx を
+    /// 最大 `budget` 件処理する。可視範囲は ui_main 側で同期適用済みなので、
+    /// ここでは主に先読み範囲 (可視外) の補正を背後で埋めるのに使う。
+    /// スライダードラッグ中は 1 件も処理しない (リリース時にまとめて再生成)。
+    pub(crate) fn process_thumb_adjust_budget(&mut self, ctx: &egui::Context, budget: usize) {
+        if self.adjustment_dragging {
+            return;
+        }
+        let (start, end) = self.keep_range;
+        let mut processed = 0usize;
+        for idx in start..end {
+            if processed >= budget {
+                break;
+            }
+            if self.thumb_adjust_tex.contains_key(&idx) {
+                continue;
+            }
+            if !self.thumb_pixels.contains_key(&idx) {
+                continue;
+            }
+            if self.effective_params(idx).is_color_identity() {
+                continue;
+            }
+            self.maybe_apply_thumb_adjustment(ctx, idx);
+            processed += 1;
+        }
+        if processed > 0 {
+            ctx.request_repaint();
+        }
+    }
+
+    /// スライダードラッグの true → false 遷移を検知して `thumb_adjust_tex`
+    /// を全無効化する。ピクセル (`thumb_pixels`) は保持し続けるので、次フレーム
+    /// 以降の `maybe_apply_thumb_adjustment` が新パラメータで再生成する。
+    /// 毎フレーム update() の終盤に呼ぶ。
+    ///
+    /// フルスクリーン外 (補正パネル非描画) では `adjustment_dragging` が真の値に
+    /// 更新されないため、ここで強制的に false に戻す。フルスクリーンをドラッグ
+    /// 途中で閉じても、release 検知が正しく走ってサムネ補正が再生成される。
+    pub(crate) fn update_thumb_adjust_drag_state(&mut self) {
+        if self.fullscreen_idx.is_none() {
+            self.adjustment_dragging = false;
+        }
+        let was = self.thumb_adjust_was_dragging;
+        let now = self.adjustment_dragging;
+        if was && !now {
+            self.thumb_adjust_tex.clear();
+        }
+        self.thumb_adjust_was_dragging = now;
     }
 
     /// AI モデル設定が変わった場合に AI キャッシュを含めてクリアする。
     pub(crate) fn clear_all_adjustment_and_ai_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
+        // サムネ側の補正済みテクスチャも該当 idx のみクリア (色調系と同じ粒度)。
+        self.thumb_adjust_tex.remove(&idx);
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
         for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
@@ -6786,6 +6918,11 @@ impl eframe::App for App {
         self.keep_fullscreen_viewport_alive(ctx);
         self.render_fullscreen_viewport(ctx);
 
+        // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
+        // サムネ補正テクスチャを全無効化する (次フレームに visible は同期適用、
+        // 先読み分は process_thumb_adjust_budget がフレーム分割で埋める)。
+        self.update_thumb_adjust_drag_state();
+
         // ── メニューバー ─────────────────────────────────────────────
         let (fav_nav, _) = self.render_menubar(ctx);
 
@@ -6916,6 +7053,11 @@ impl eframe::App for App {
         let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
+
+        // 可視外 keep_range のサムネ補正を背後で逐次適用する。
+        // 1 フレーム 8 枚: 600px で ~3ms/枚 = 最大 24ms (半フレーム分の UI 予算)。
+        // ドラッグ中はスキップ (process_thumb_adjust_budget 内で判定)。
+        self.process_thumb_adjust_budget(ctx, 8);
 
         // ── 選択情報オーバーレイ ─────────────────────────────────────
         self.render_selection_info(ctx);
@@ -7311,10 +7453,12 @@ fn draw_thumb(
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
     dark: bool,
+    adjusted_tex: Option<&egui::TextureHandle>,
 ) {
     match thumb {
         ThumbnailState::Loaded { tex, .. } => {
-            draw_thumb_texture(painter, inner, tex, rotation);
+            let use_tex = adjusted_tex.unwrap_or(tex);
+            draw_thumb_texture(painter, inner, use_tex, rotation);
         }
         ThumbnailState::Pending | ThumbnailState::Evicted => {
             let bg = if dark { egui::Color32::from_gray(50) } else { egui::Color32::from_gray(220) };
@@ -7361,6 +7505,9 @@ pub(crate) fn draw_cell(
     item: &GridItem,
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
+    // Some(tex) なら `ThumbnailState::Loaded.tex` の代わりにこちらを描画する
+    // (色調補正済みサムネイルテクスチャ)。None または Loaded 以外なら生サムネ。
+    adjusted_tex: Option<&egui::TextureHandle>,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -7400,7 +7547,8 @@ pub(crate) fn draw_cell(
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
-                    draw_thumb_texture(painter, inner, tex, rotation);
+                    let use_tex = adjusted_tex.unwrap_or(tex);
+                    draw_thumb_texture(painter, inner, use_tex, rotation);
                     draw_folder_badge(painter, inner, name);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
@@ -7422,11 +7570,12 @@ pub(crate) fn draw_cell(
             }
         }
         GridItem::Image(_) => {
-            draw_thumb(painter, inner, thumb, rotation, dark);
+            draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
         }
         GridItem::Video(path) => {
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
+                    // 動画サムネは補正対象外 (adjusted_tex は常に None)
                     draw_thumb_texture(painter, inner, tex, rotation);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted => {
@@ -7457,13 +7606,14 @@ pub(crate) fn draw_cell(
             );
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-            draw_thumb(painter, inner, thumb, rotation, dark);
+            draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
         }
         GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
             let (icon, badge_fn): (&str, fn(&egui::Painter, egui::Rect)) =
                 if matches!(item, GridItem::ZipFile(_)) { ("📦", draw_zip_badge) } else { ("📄", draw_pdf_badge) };
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
+                    // ZipFile/PdfFile の代表サムネは補正対象外 (adjusted_tex は常に None)
                     draw_thumb_texture(painter, inner, tex, rotation);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {

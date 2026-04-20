@@ -53,14 +53,56 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 
 ### 1.4 表示時の変換
 
-**サムネイルに補正は掛からない**。適用されるのは:
+サムネイルには以下が適用される:
 
 | 変換 | 適用場所 | 備考 |
 | --- | --- | --- |
 | 回転 (DB) | 描画時の GPU 行列 | `get_rotation(idx)` で毎フレーム参照、結果は `rotation_cache` にキャッシュ |
 | EXIF Orientation | **デコード時**に適用 (通常画像のみ) | ZIP/PDF 経由のエントリには適用不可 |
-| プリセット補正 | **適用されない** | パネル UI ではプリセット割当バッジのみ表示 |
-| AI アップスケール | **適用されない** | |
+| プリセット補正 (色調のみ) | **UI スレッド同期適用** | `thumb_adjust_tex[idx]` に保持、§1.5 参照 |
+| ポストフィルタ | **適用されない** | コスト/実装維持のためサムネは色調のみ |
+| AI アップスケール | **適用されない** | 1 枚 10 秒級のためサムネでは非現実的 |
+
+### 1.5 サムネイル補正パイプライン (色調)
+
+「黄ばんだ紙のスキャンをモノクロ漫画補正して見る」等、サムネ一覧とフルスクリーンの
+見え方を揃えるため、グリッド描画時に色調補正を適用する。LUT 路ならサムネサイズ
+(600 px 級) で ~3ms/枚 で済むが、70 枚同時に UI スレッドで掛けると 200ms 級の
+フリーズになるため、以下の構造にしている。
+
+**対象**: 画像系グリッドアイテムのみ (`Image` / `ZipImage` / `PdfPage`)。
+フォルダ / 動画 / ZipFile / PdfFile / ConvertibleArchive / ZipSeparator の
+代表サムネには適用しない (`adjusted_tex` は `None` で素通し)。
+
+**データ構造** (`App` 内):
+
+- `thumb_pixels: HashMap<usize, Arc<ColorImage>>` — 補正のソースとなる生ピクセル。
+  `poll_thumbnails` でテクスチャアップロードと同時に `Arc::new` し格納する。
+  `keep_range` 外に出たら drop (§1.2 のエビクション時)。`is_video` な idx は対象外。
+- `thumb_adjust_tex: HashMap<usize, TextureHandle>` — 補正済みテクスチャ。
+  `effective_params(idx).is_color_identity()` が `true` の idx は**エントリを持たない**
+  (= 生サムネがそのまま描画される)。ポストフィルタは判定に含めない (サムネ非適用のため)。
+
+**適用タイミング**:
+
+1. **可視セル**: `ui_main::render_grid` がセル描画直前に `maybe_apply_thumb_adjustment(idx)`
+   を同期呼び出し。`thumb_adjust_tex[idx]` がすでにあるか identity ならスキップ。
+2. **先読み分 (keep_range 内, 非可視)**: `update()` 終盤で `process_thumb_adjust_budget(ctx, 8)`
+   が最大 8 枚/フレーム処理する (600px で ~3ms/枚 × 8 = 24ms 予算)。
+3. **スライダードラッグ中** (`App::adjustment_dragging == true`): 両経路ともスキップし、
+   `draw_cell` も `adjusted_tex = None` を渡して生サムネを表示。
+4. **ドラッグ解放** (`adjustment_dragging` が `true → false` 遷移): `update_thumb_adjust_drag_state`
+   が `thumb_adjust_tex.clear()` → 次フレームで visible 優先で再生成される。
+
+**キャッシュ無効化** ([preset-and-adjustment.md §4](preset-and-adjustment.md) の早見表に追補):
+
+- `clear_adjustment_caches(idx)` 経路で `thumb_adjust_tex[idx]` も落とす。
+- `clear_all_adjustment_and_ai_caches(idx)` 経路も `thumb_adjust_tex[idx]` を落とす。
+- バルク系 (`apply_params_to_all_pages` / `clear_all_page_params` / `copy_params_to_global`) は
+  `thumb_adjust_tex.clear()` で全部落とす (対象 idx を絞る判定より単純かつ安全)。
+- `start_loading_items` (フォルダ切替) で `thumb_pixels` と `thumb_adjust_tex` を全クリア。
+- **ピクセル (`thumb_pixels`) は keep_range を出るまで保持**。補正テクスチャだけ
+  捨てて差し替えるのが基本、ピクセルを捨てるのは範囲外 evict とフォルダ切替のみ。
 
 ---
 
@@ -263,7 +305,9 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 ### 4.2 サムネイル / フルスクリーンの整合性
 
 - サムネイルに適用する変換を増やすなら、フルスクリーン側も同じ処理が走っているか確認
-- 逆も同様。**フルスクリーンで補正が効くのにサムネは生のまま** という現状は仕様なので、サムネ側に安易に追加しない (グリッド全体で CPU/GPU 負荷が跳ね上がる)
+- 逆も同様。サムネは**色調のみ**を適用する (§1.5)。ポストフィルタ / AI は意図的に非対象。
+  フルスクリーンでポストフィルタ / AI を掛けても、サムネは色調止まり — ユーザの
+  「ざっくり一覧で雰囲気をつかむ」用途に揃えた割り切り。
 
 ### 4.3 キャンセル安全性
 

@@ -938,6 +938,18 @@ impl App {
                                 let has_page_override = self.adjustment_page_params.contains_key(&idx);
                                 let has_mask = self.mask_pages.contains(&idx);
                                 let rating = self.get_rating(idx);
+                                // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
+                                // process_thumb_adjust_budget が逐次処理する。
+                                // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
+                                // (70 枚毎フレーム再生成は ~200ms のフリーズになるため)。
+                                if !self.adjustment_dragging {
+                                    self.maybe_apply_thumb_adjustment(ctx, idx);
+                                }
+                                let adjusted_tex = if self.adjustment_dragging {
+                                    None
+                                } else {
+                                    self.thumb_adjust_tex.get(&idx)
+                                };
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
@@ -949,6 +961,7 @@ impl App {
                                     &self.items[idx],
                                     &self.thumbnails[idx],
                                     rot,
+                                    adjusted_tex,
                                 );
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
