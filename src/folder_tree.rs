@@ -276,9 +276,10 @@ pub fn walk_dirs_recursive_with_progress(
     out.push(path.to_path_buf());
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                walk_dirs_recursive_with_progress(&p, out, cancel, on_visit);
+            // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if is_dir {
+                walk_dirs_recursive_with_progress(&entry.path(), out, cancel, on_visit);
             }
         }
     }
@@ -302,13 +303,22 @@ pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
 
     if let Ok(entries) = std::fs::read_dir(path) {
         for e in entries.flatten() {
+            // Windows: `DirEntry::file_type()` は FindFirstFile のキャッシュ読み
+            // (追加 syscall なし)。`Path::is_dir()` / `is_file()` は都度
+            // `GetFileAttributes` を呼ぶので、数百ファイルのフォルダで
+            // 数百 ms のブロック源になる。DFS は毎ステップ sorted_subdirs を
+            // 呼ぶため影響が大きい。必ず file_type 経由で判定する。
+            let ft = match e.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             let p = e.path();
-            if p.is_dir() {
+            if ft.is_dir() {
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     real_folder_names.insert(name.to_lowercase());
                 }
                 dirs.push(p);
-            } else if p.is_file() && is_virtual_folder(&p) {
+            } else if ft.is_file() && is_virtual_folder(&p) {
                 zip_candidates.push(p);
             }
         }

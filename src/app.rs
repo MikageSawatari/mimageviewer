@@ -116,11 +116,17 @@ pub(crate) struct ScannedDir {
     pub all_media: Vec<(PathBuf, bool, i64, i64)>,
 }
 
-/// ディレクトリ走査: `read_dir` + 各エントリの `.metadata()` 呼び出し。
+/// ディレクトリ走査: `read_dir` + 各エントリの `file_type()` / `metadata()` 呼び出し。
 ///
-/// 実測で 152 枚の HDD フォルダで 179ms かかる。UI スレッドからこれを呼ぶと
-/// 明確な引っかかりになるため、Ctrl+↑↓ 連打時は DFS スレッドで事前実行し、
-/// UI スレッドはスキャン結果を受け取るだけにする。
+/// **Windows パフォーマンス上の注意**: `entry.file_type()` と `entry.metadata()` は
+/// `FindFirstFile`/`FindNextFile` が返した WIN32_FIND_DATA をそのまま再利用するので
+/// syscall は不要。対して `Path::is_dir()` は都度 `GetFileAttributes` を呼び出すため
+/// 数百枚のフォルダで per-entry 1-5ms、合計 500-1000ms のブロック源になる。
+/// 必ず `entry.file_type()` 側を使うこと。
+///
+/// 元実装 (`p.is_dir()` 使用) は Ctrl+↑↓ の DFS スレッドで実測 p95=525ms / max=970ms を
+/// 記録していた (対策 B 投入後の計測ログ)。AI 画像フォルダ (1 ディレクトリに
+/// 数百枚の PNG/JPEG) で顕著。
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
@@ -129,8 +135,11 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
         return ScannedDir { folders, all_media };
     };
     for entry in entries.flatten() {
+        // file_type() は FindFirstFile のキャッシュ読み (syscall なし)。
+        // metadata() も同様にキャッシュから返るが、失敗しても fallback 0 で続行する。
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let p = entry.path();
-        if p.is_dir() {
+        if is_dir {
             let meta = entry.metadata().ok();
             let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
             folders.push((GridItem::Folder(p), Some((mtime, 0))));
