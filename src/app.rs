@@ -4322,6 +4322,26 @@ impl App {
 
         let mut matches = std::collections::HashSet::new();
 
+        // XMP は xmp_cache に事前一括投入する。キーワードを変えて検索を繰り返しても
+        // JPEG/MP4 を再オープンしないようにするため (read_tweet_info は JPEG/PNG で
+        // ファイル全体、MP4/MOV は先頭 512KB を読む)。キーは metadata_cache_key と
+        // 同じ形式で、フォルダ遷移時に xmp_cache.clear() で破棄される。
+        let mut xmp_to_load: Vec<(String, PathBuf)> = Vec::new();
+        for item in &self.items {
+            let path = match item {
+                GridItem::Image(p) | GridItem::Video(p) => p,
+                _ => continue,
+            };
+            let key = crate::adjustment_db::normalize_path(path);
+            if !self.xmp_cache.contains_key(&key) {
+                xmp_to_load.push((key, path.clone()));
+            }
+        }
+        for (key, path) in xmp_to_load {
+            let xmp = crate::xmp_reader::read_tweet_info(&path);
+            self.xmp_cache.insert(key, xmp);
+        }
+
         // ZIP 内 PNG は ZIP ごとにまとめてから処理する (open を 1 回にするため)。
         let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
             std::collections::HashMap::new();
@@ -4343,15 +4363,21 @@ impl App {
                     } else {
                         String::new()
                     };
-                    let xmp = crate::xmp_reader::read_tweet_info(path);
-                    if crate::search_query::matches(&tokens, &hay_of(&meta_text, name, xmp.as_ref())) {
+                    let xmp = self
+                        .xmp_cache
+                        .get(&crate::adjustment_db::normalize_path(path))
+                        .and_then(|o| o.as_ref());
+                    if crate::search_query::matches(&tokens, &hay_of(&meta_text, name, xmp)) {
                         matches.insert(idx);
                     }
                 }
                 GridItem::Video(path) => {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let xmp = crate::xmp_reader::read_tweet_info(path);
-                    if crate::search_query::matches(&tokens, &hay_of("", name, xmp.as_ref())) {
+                    let xmp = self
+                        .xmp_cache
+                        .get(&crate::adjustment_db::normalize_path(path))
+                        .and_then(|o| o.as_ref());
+                    if crate::search_query::matches(&tokens, &hay_of("", name, xmp)) {
                         matches.insert(idx);
                     }
                 }
