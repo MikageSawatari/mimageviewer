@@ -300,6 +300,20 @@ pub(crate) fn search_results_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__search_results__")
 }
 
+/// サムネイル色調補正の対象アイテムかどうか。
+///
+/// 補正は「ページ単位の色調を持つ画像系」だけに掛ける ([docs/display-pipeline.md §1.5](docs/display-pipeline.md))。
+/// フォルダ・ZipFile・PdfFile・ConvertibleArchive・Video・ZipSeparator の代表
+/// サムネは対象外で、`global_preset` を意図せず適用するとフォルダ表紙が変色する等の
+/// バグになる。`thumb_pixels` の保持・`maybe_apply_thumb_adjustment` の実行・
+/// `process_thumb_adjust_budget` の対象判定のすべてでこのヘルパーを通すこと。
+pub(crate) fn is_thumb_adjust_target(item: Option<&GridItem>) -> bool {
+    matches!(
+        item,
+        Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+    )
+}
+
 // -----------------------------------------------------------------------
 // App
 // -----------------------------------------------------------------------
@@ -627,6 +641,16 @@ pub struct App {
     fs_opened_at: Option<std::time::Instant>,
     /// グレース期間を超えたかのキャッシュ（毎フレーム Instant::elapsed() を避ける）
     fs_focus_grace_elapsed: bool,
+    /// フルスクリーンビューポートの前フレームのフォーカス状態。
+    /// フォーカス復帰クリックの検出に使う。
+    pub(crate) fs_prev_focused: bool,
+    /// フルスクリーンビューポートがフォーカスを取り戻した時刻。
+    /// この直後のクリックは他アプリからの復帰クリックとみなし、
+    /// ナビ・ドラッグ等のアプリ側処理を抑制する。
+    pub(crate) fs_focus_regained_at: Option<std::time::Instant>,
+    /// フォーカス復帰クリックを検出中で、離されるまで全ての左クリック操作を抑制するフラグ。
+    /// 押下 → 離しの間に複数フレームあるため、時間ベースだけでなく状態でも追跡する。
+    pub(crate) fs_suppress_primary_until_release: bool,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
     /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
@@ -1011,6 +1035,9 @@ impl Default for App {
             fs_viewport_shown: false,
             fs_opened_at: None,
             fs_focus_grace_elapsed: false,
+            fs_prev_focused: false,
+            fs_focus_regained_at: None,
+            fs_suppress_primary_until_release: false,
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_pan_drag_start: None,
@@ -2555,8 +2582,10 @@ impl App {
                         let upload_t0 = std::time::Instant::now();
                         // サムネ補正用に `color_image` を Arc で保持してからテクスチャ化する。
                         // テクスチャアップロードは ColorImage を消費するので、保持用に clone が必要。
-                        // 動画サムネは補正対象外 (keep_range 外に出ないので leak を避けるため)。
-                        let retain_pixels_for_adjust = !is_video;
+                        // 補正対象は Image / ZipImage / PdfPage のみ
+                        // (display-pipeline.md §1.5)。動画 / フォルダ / ZIP・PDF
+                        // 代表サムネに global_preset が漏れないようゲートする。
+                        let retain_pixels_for_adjust = is_thumb_adjust_target(self.items.get(i));
                         let (arc_pixels_opt, image_to_upload) = if retain_pixels_for_adjust {
                             let arc = std::sync::Arc::new(color_image);
                             let img = (*arc).clone();
@@ -3951,6 +3980,11 @@ impl App {
         crate::pdf_loader::set_critical_reservation(true);
         self.fs_opened_at = Some(std::time::Instant::now());
         self.fs_focus_grace_elapsed = false;
+        // 初回フレームでフォーカス遷移 (false→true) が誤検出されないように
+        // true 始まりにする (グレース期間中にフォーカス復帰扱いされるのを防ぐ)
+        self.fs_prev_focused = true;
+        self.fs_focus_regained_at = None;
+        self.fs_suppress_primary_until_release = false;
         self.reset_erase_mode();
 
         // ページに個別補正があればトースト表示
@@ -5032,6 +5066,9 @@ impl App {
         self.slideshow_playing = false;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
+        self.fs_prev_focused = false;
+        self.fs_focus_regained_at = None;
+        self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
         self.fs_context_menu_idx = None;
         self.reset_erase_mode();
@@ -6052,6 +6089,9 @@ impl App {
     /// (keep_range 外で evict 済み)。identity (無補正) なら再描画時に生サムネを
     /// そのまま使うため、キャッシュ生成も行わない。
     pub(crate) fn maybe_apply_thumb_adjustment(&mut self, ctx: &egui::Context, idx: usize) {
+        if !is_thumb_adjust_target(self.items.get(idx)) {
+            return;
+        }
         if self.thumb_adjust_tex.contains_key(&idx) {
             return;
         }
@@ -6084,6 +6124,9 @@ impl App {
         for idx in start..end {
             if processed >= budget {
                 break;
+            }
+            if !is_thumb_adjust_target(self.items.get(idx)) {
+                continue;
             }
             if self.thumb_adjust_tex.contains_key(&idx) {
                 continue;
