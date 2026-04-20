@@ -62,17 +62,21 @@ const DC_NAMESPACE: &[u8] = b"http://purl.org/dc/elements/1.1/";
 // 公開 API
 // ---------------------------------------------------------------------------
 
+/// 拡張子を小文字 ASCII で取り出す。拡張子なし / 非 UTF-8 なら None。
+fn lowercase_ext(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+}
+
 /// mXD が出力し得るコンテナ形式 — XMP が入っている可能性がある拡張子だけ許可。
 /// BMP / RAW / AVIF 等は mXD の出力対象外 + 当モジュールで解釈できないので
 /// 無駄なファイル読み出しを避けるため早期に弾く。
 fn extension_might_have_xmp(path: &Path) -> bool {
-    match path.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()) {
-        Some(ext) => matches!(
-            ext.as_str(),
-            "jpg" | "jpeg" | "jfif" | "png" | "tif" | "tiff" | "mp4" | "mov" | "m4v"
-        ),
-        None => false,
-    }
+    matches!(
+        lowercase_ext(path).as_deref(),
+        Some("jpg" | "jpeg" | "jfif" | "png" | "tif" | "tiff" | "mp4" | "mov" | "m4v")
+    )
 }
 
 /// パスから読み取って [`XmpTweetInfo`] を返す。
@@ -90,12 +94,8 @@ pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
     if !extension_might_have_xmp(path) {
         return None;
     }
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase());
     let small_image = matches!(
-        ext.as_deref(),
+        lowercase_ext(path).as_deref(),
         Some("jpg" | "jpeg" | "jfif" | "png")
     );
     if small_image {

@@ -1617,20 +1617,17 @@ impl App {
         // 押下〜離すまでの全期間にわたってアプリ側の左クリック処理を無効化する。
         // グレースを跨いだ正常クリックには影響しないよう、状態ベースで追跡する。
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+        let (primary_down, primary_released) =
+            ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
         if let Some(t) = self.fs_focus_regained_at {
             if t.elapsed() >= FOCUS_RESTORE_GRACE {
-                // 期限切れ: 以降の per-frame elapsed() 呼び出しを止める
                 self.fs_focus_regained_at = None;
-            } else if !self.fs_suppress_primary_until_release
-                && ctx.input(|i| i.pointer.primary_down())
-            {
+            } else if !self.fs_suppress_primary_until_release && primary_down {
                 self.fs_suppress_primary_until_release = true;
                 self.fs_focus_regained_at = None;
             }
         }
-        if self.fs_suppress_primary_until_release
-            && ctx.input(|i| i.pointer.primary_released())
-        {
+        if self.fs_suppress_primary_until_release && primary_released {
             self.fs_suppress_primary_until_release = false;
         }
         if self.fs_suppress_primary_until_release {

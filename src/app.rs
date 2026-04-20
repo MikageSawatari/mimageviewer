@@ -305,13 +305,10 @@ pub(crate) fn search_results_synthetic_path() -> PathBuf {
 /// 補正は「ページ単位の色調を持つ画像系」だけに掛ける ([docs/display-pipeline.md §1.5](docs/display-pipeline.md))。
 /// フォルダ・ZipFile・PdfFile・ConvertibleArchive・Video・ZipSeparator の代表
 /// サムネは対象外で、`global_preset` を意図せず適用するとフォルダ表紙が変色する等の
-/// バグになる。`thumb_pixels` の保持・`maybe_apply_thumb_adjustment` の実行・
-/// `process_thumb_adjust_budget` の対象判定のすべてでこのヘルパーを通すこと。
+/// バグになる。「ページ単位データを持てるか」と概念的に一致するので
+/// [`GridItem::is_ratable`] を流用する。
 pub(crate) fn is_thumb_adjust_target(item: Option<&GridItem>) -> bool {
-    matches!(
-        item,
-        Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
-    )
+    item.is_some_and(|it| it.is_ratable())
 }
 
 // -----------------------------------------------------------------------
