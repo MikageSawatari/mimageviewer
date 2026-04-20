@@ -118,6 +118,8 @@ pub(crate) struct PreferencesState {
     pub exif_add_tag_input: String,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
+    /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
+    pub exif_scroll_to_added: Option<String>,
 
     // 初回に1度だけ取得するキャッシュ値
     pub auto_thread_count: usize,
@@ -149,6 +151,7 @@ impl PreferencesState {
             manual_threads,
             exif_add_tag_input: String::new(),
             exif_collapsed_groups: HashSet::new(),
+            exif_scroll_to_added: None,
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
         }
@@ -901,16 +904,14 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pres
     );
     ui.add_space(8.0);
 
-    egui::ScrollArea::vertical()
-        .max_height(420.0)
-        .id_salt("exif_tags_scroll")
-        .show(ui, |ui| {
-            for &group in TagGroup::ordered() {
-                draw_exif_group(ui, state, group);
-                ui.add_space(2.0);
-            }
-            draw_exif_custom_tags(ui, state);
-        });
+    // 内側で max_height スクロールを作ると外側の pref_panel ScrollArea と
+    // 二重スクロールになり、内側のスクロールバーが操作しづらい。外側の単一スクロールに
+    // 任せる。
+    for &group in TagGroup::ordered() {
+        draw_exif_group(ui, state, group);
+        ui.add_space(2.0);
+    }
+    draw_exif_custom_tags(ui, state);
 
     ui.add_space(8.0);
     ui.separator();
@@ -925,8 +926,10 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pres
         {
             let tag = state.exif_add_tag_input.trim().to_string();
             if !state.settings.exif_hidden_tags.contains(&tag) {
-                state.settings.exif_hidden_tags.push(tag);
+                state.settings.exif_hidden_tags.push(tag.clone());
             }
+            // 次フレームで該当行を viewport にスクロールするマーカー
+            state.exif_scroll_to_added = Some(tag);
             state.exif_add_tag_input.clear();
         }
     });
@@ -1064,6 +1067,7 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 
     let mut to_remove: Option<String> = None;
+    let scroll_target = state.exif_scroll_to_added.clone();
     egui::Frame::NONE
         .inner_margin(egui::Margin {
             left: 18,
@@ -1073,7 +1077,7 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
         })
         .show(ui, |ui| {
             for tag in &custom {
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
                     ui.label(tag);
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1084,11 +1088,19 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         },
                     );
                 });
+                // 直前に追加された行を viewport にスクロールイン
+                if scroll_target.as_deref() == Some(tag.as_str()) {
+                    row.response.scroll_to_me(Some(egui::Align::Center));
+                }
             }
         });
 
     if let Some(t) = to_remove {
         state.settings.exif_hidden_tags.retain(|x| x != &t);
+    }
+    // マーカーを 1 フレームで消費
+    if state.exif_scroll_to_added.is_some() {
+        state.exif_scroll_to_added = None;
     }
 }
 
