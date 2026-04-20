@@ -262,6 +262,23 @@ worker 化の定型パターン (`XxxPending { cancel, rx }` + `start_xxx` / `po
 cancel) は [docs/ui-responsiveness.md §2](docs/ui-responsiveness.md) に実装テンプレを
 載せている。
 
+### レビュー時: UI 応答性の性能観点
+
+レビューでは、差分に次の呼び出しが出たら **UI スレッドから同期到達しないか** を必ず確認する。
+`App::update`、描画関数、入力ハンドラ、`open_fullscreen`、`load_folder`、`execute_*`、
+`ensure_*` / `start_*` の呼び出し元まで追うこと。
+
+- `std::fs::read`, `File::open`, `read_to_end`, `std::fs::read_dir`, `metadata`,
+  `Path::is_dir` / `Path::is_file`
+- `xmp_reader::read_tweet_info`, `png_metadata::extract_*`, `exif_reader::read_*`,
+  `zip_loader::read_entry_bytes`
+- `ctx.load_texture`
+- `rusqlite` / `search_index_db` / catalog DB の open・全件 load・search
+
+UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx 整合・1 フレーム予算・perf 計装が
+揃っていることを確認する。特に `decide_partial` のような lazy 化でも、cheap miss や
+除外トークンだけの検索など「追加情報が必要になる最悪ケース」で UI を止めないかを見る。
+
 測定は `--perf-log` + `python scripts/analyze_perf.py <path> {startup,nav,hitches}` で。
 追加した同期処理の区間には perf::event を必ず差し込む (悪化を検知できるように)。
 
