@@ -452,6 +452,15 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
 
+                // 他アプリからフォーカスが戻ってきた瞬間を記録。
+                // この直後のクリックはナビ目的ではなく「フォーカスを戻すだけのクリック」
+                // とみなし、アプリ側の処理を抑制する（ページ送り・パン開始など）。
+                let focused_now = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+                if focused_now && !self.fs_prev_focused {
+                    self.fs_focus_regained_at = Some(std::time::Instant::now());
+                }
+                self.fs_prev_focused = focused_now;
+
                 // event consume される前に捕捉 (handle_fs_key_input が矢印等を
                 // 消費するとイベントが見えなくなるため)。マウス移動は操作と見なさない。
                 if self.fs_boundary_hint.is_some() {
@@ -1603,7 +1612,31 @@ impl App {
             egui::Id::new("fs_click"),
             egui::Sense::click_and_drag(),
         );
-        if self.erase_mode {
+        // ── フォーカス復帰クリックの抑制 ──
+        // 他アプリから戻ってきた直後に押された左ボタンはナビ目的ではないとみなし、
+        // 押下〜離すまでの全期間にわたってアプリ側の左クリック処理を無効化する。
+        // グレースを跨いだ正常クリックには影響しないよう、状態ベースで追跡する。
+        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+        if let Some(t) = self.fs_focus_regained_at {
+            if t.elapsed() >= FOCUS_RESTORE_GRACE {
+                // 期限切れ: 以降の per-frame elapsed() 呼び出しを止める
+                self.fs_focus_regained_at = None;
+            } else if !self.fs_suppress_primary_until_release
+                && ctx.input(|i| i.pointer.primary_down())
+            {
+                self.fs_suppress_primary_until_release = true;
+                self.fs_focus_regained_at = None;
+            }
+        }
+        if self.fs_suppress_primary_until_release
+            && ctx.input(|i| i.pointer.primary_released())
+        {
+            self.fs_suppress_primary_until_release = false;
+        }
+        if self.fs_suppress_primary_until_release {
+            // フォーカス復帰クリック: 左ボタン経由の分岐をすべてスキップ。
+            // 右クリック処理 (下の secondary ブロック) は別系統なので走らせる
+        } else if self.erase_mode {
             // 消しゴムモード: 左クリック/ドラッグはマスク塗りに使うためナビ無効化
         } else if self.analysis_mode {
             // 分析モード: 左クリックでのナビを無効化（パン用のドラッグは analysis_panel 側）

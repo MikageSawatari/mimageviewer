@@ -693,6 +693,11 @@ impl App {
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) {
+        // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
+        // (handle_fs_wheel_and_click で検出・セットされる)
+        if self.fs_suppress_primary_until_release {
+            return;
+        }
         let primary_down = ctx.input(|i| i.pointer.primary_down());
         let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
         let primary_released = ctx.input(|i| i.pointer.primary_released());
