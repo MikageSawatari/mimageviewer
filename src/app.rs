@@ -71,9 +71,6 @@ pub(crate) struct FolderNavResult {
 /// (AI metadata と EXIF は数 ms だが、XMP が主犯)。
 /// 新 fullscreen idx が開かれたら旧 pending を cancel する (連打時は最新のみ処理)。
 pub(crate) struct MetadataLoadPending {
-    /// どの idx 向けの読み込みか (デバッグ / perf 相関用、現状は使わない)。
-    #[allow(dead_code)]
-    idx: usize,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<MetadataLoadResult>,
 }
@@ -96,9 +93,6 @@ pub(crate) struct MetadataLoadResult {
 pub(crate) struct FavSearchPending {
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<rusqlite::Result<Vec<crate::search_index_db::IndexEntry>>>,
-    /// 検索クエリ (UI 側に結果表示用アドレス更新をさせるため)
-    #[allow(dead_code)]
-    query: String,
 }
 
 /// ディレクトリ走査結果 (read_dir + 各エントリ metadata 取得の成果物)。
@@ -121,12 +115,9 @@ pub(crate) struct ScannedDir {
 /// **Windows パフォーマンス上の注意**: `entry.file_type()` と `entry.metadata()` は
 /// `FindFirstFile`/`FindNextFile` が返した WIN32_FIND_DATA をそのまま再利用するので
 /// syscall は不要。対して `Path::is_dir()` は都度 `GetFileAttributes` を呼び出すため
-/// 数百枚のフォルダで per-entry 1-5ms、合計 500-1000ms のブロック源になる。
-/// 必ず `entry.file_type()` 側を使うこと。
-///
-/// 元実装 (`p.is_dir()` 使用) は Ctrl+↑↓ の DFS スレッドで実測 p95=525ms / max=970ms を
-/// 記録していた (対策 B 投入後の計測ログ)。AI 画像フォルダ (1 ディレクトリに
-/// 数百枚の PNG/JPEG) で顕著。
+/// 数百枚のフォルダで per-entry 1-5ms、合計 500-1000ms のブロック源になる
+/// (AI 画像フォルダで計測実績あり)。必ず `entry.file_type()` 側を使うこと。
+/// 方針は [docs/ui-responsiveness.md §1.1](../docs/ui-responsiveness.md) にまとめてある。
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
@@ -182,9 +173,6 @@ pub(crate) struct SearchPending {
     cancel: Arc<AtomicBool>,
     /// ワーカースレッドから結果を受け取るチャネル。
     rx: mpsc::Receiver<SearchThreadResult>,
-    /// 相関用の input_seq。perf ログで入力 → 検索完了を紐付けるため。
-    #[allow(dead_code)]
-    seq: u64,
 }
 
 /// 検索ワーカースレッドからの結果。
@@ -196,6 +184,18 @@ pub(crate) enum SearchThreadResult {
         matches: std::collections::HashSet<usize>,
         xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)>,
     },
+}
+
+impl FolderNavMode {
+    /// perf ログに載せる短い識別子。variant 名のみでパスなどを含めず、
+    /// ユーザーパスが診断ログに混入しないようにする。
+    pub fn perf_tag(&self) -> &'static str {
+        match self {
+            FolderNavMode::Grid => "grid",
+            FolderNavMode::Fullscreen => "fullscreen",
+            FolderNavMode::Favsearch { .. } => "favsearch",
+        }
+    }
 }
 
 /// モードの種類 (variant) のみを比較する。`Favsearch { root }` は root 違いでも
@@ -945,13 +945,6 @@ pub struct App {
     /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
     /// 100ms 級にブロックしていた問題を解消する。
     pub(crate) metadata_pending: Option<MetadataLoadPending>,
-
-    /// main() 入口で取得した Instant。起動時間計測の t=0 基準に使う。
-    /// perf-log 無効時は None のまま。`startup.*` イベントの `total_ms` 計算に参照。
-    pub(crate) program_start: Option<std::time::Instant>,
-    /// 初回 frame.begin が emit 済みかどうか。起動から初回フレームまでの時間を
-    /// `startup.first_frame` として 1 回だけ打刻するために使う。
-    pub(crate) startup_first_frame_emitted: bool,
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -1390,8 +1383,6 @@ impl Default for App {
             search_pending: None,
             favsearch_pending: None,
             metadata_pending: None,
-            program_start: None,
-            startup_first_frame_emitted: false,
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -1666,8 +1657,14 @@ impl App {
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
         let lf_t0 = std::time::Instant::now();
         let lf_seq = self.input_seq;
-        let lf_path_disp = path.display().to_string();
         let pre_scanned = pre_scan.is_some();
+        // path.display().to_string() のアロケーションを perf-log 有効時に限定する
+        // (通常起動では空文字のまま放置する)。
+        let lf_path_disp: String = if crate::perf::is_enabled() {
+            path.display().to_string()
+        } else {
+            String::new()
+        };
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -2081,20 +2078,19 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
-        let query_clone = query.clone();
 
         std::thread::Builder::new()
             .name("favsearch-db".to_string())
             .spawn(move || {
                 if cancel_w.load(Ordering::Relaxed) { return; }
-                let result = db.search(&query_clone, &fav_roots);
+                let result = db.search(&query, &fav_roots);
                 // キャンセル後の送信は無意味なので捨てる (UI 側 pending も None に戻っている)
                 if cancel_w.load(Ordering::Relaxed) { return; }
                 let _ = tx.send(result);
             })
             .ok();
 
-        self.favsearch_pending = Some(FavSearchPending { cancel, rx, query });
+        self.favsearch_pending = Some(FavSearchPending { cancel, rx });
     }
 
     /// お気に入り検索の結果をポーリングする。
@@ -2412,10 +2408,9 @@ impl App {
         }
         self.close_fullscreen();
 
-        // close_fullscreen_end と sli_prewarm_rating の間に 374ms のギャップが
-        // 起動直後 1 回だけ観測されたため (docs/perf-investigation-handoff.md 参照)、
-        // 以下 3 区間 (nav cancel / items 割当 / キャッシュ clear) に分けて
-        // perf イベントを打ち、真因を特定できるようにする。
+        // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
+        // 計測する (nav cancel / items 割当 / キャッシュ clear)。UI が止まる潜在箇所を
+        // 特定できるようにするため。
         let cancel_t0 = std::time::Instant::now();
         // 進行中のフォルダナビゲーションをキャンセル
         // (他の経路でフォルダが変更された場合に不要な結果を破棄する)
@@ -2434,18 +2429,8 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
-        // 古い rx の drop が走る。mpsc::Receiver 自体の drop は軽いが、
-        // 送信前にバッファ内に残ったメッセージ (ColorImage 等) は drop される。
         self.rx = rx;
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "sli_nav_cancel",
-                None,
-                sli_seq,
-                &[("ms", serde_json::Value::from(cancel_t0.elapsed().as_secs_f64() * 1000.0))],
-            );
-        }
+        crate::perf::emit_ms("nav", "sli_nav_cancel", sli_seq, cancel_t0);
 
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
@@ -2457,7 +2442,6 @@ impl App {
         self.scroll_to_selected = false;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
-        // items 代入は旧 items (PathBuf 含む) の drop も含む。
         self.items = items;
         self.image_metas = image_metas;
         self.thumbnails = (0..self.items.len())
@@ -2476,10 +2460,6 @@ impl App {
             );
         }
 
-        // ── キャッシュクリア区間 ──
-        // 複数の HashMap を順次 drop する。ColorImage (metadata_cache は None/AiMetadata
-        // のみなので軽い) や texture_backlog (大きなピクセル配列) を保持している場合は
-        // ここで大量のメモリ解放が発生する可能性がある (起動直後の謎 374ms 容疑区間)。
         let clear_t0 = std::time::Instant::now();
         let texture_backlog_len = self.texture_backlog.len();
         let fs_upload_backlog_len = self.fs_upload_backlog.len();
@@ -4271,8 +4251,12 @@ impl App {
         // chain_folder_nav_if_pending 経由の連鎖 DFS でも同じ seq が伝搬するので、
         // 1 回のキー押下で起きた DFS バーストを 1 つの seq でまとめて追える。
         let perf_seq = self.input_seq;
-        let perf_mode = format!("{mode:?}");
-        let start_path_disp = current.display().to_string();
+        let perf_mode = mode.perf_tag();
+        let start_path_disp = if crate::perf::is_enabled() {
+            current.display().to_string()
+        } else {
+            String::new()
+        };
 
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
@@ -4284,7 +4268,7 @@ impl App {
                     perf_seq,
                     &[
                         ("forward", serde_json::Value::from(forward)),
-                        ("mode", serde_json::Value::from(perf_mode.clone())),
+                        ("mode", serde_json::Value::from(perf_mode)),
                         ("start", serde_json::Value::from(start_path_disp.clone())),
                     ],
                 );
@@ -4300,10 +4284,10 @@ impl App {
             };
             let dfs_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            // 事前スキャン (対策 B): ヒットしたのが通常ディレクトリなら、
-            // この DFS スレッドで `read_dir` + メタデータ取得まで済ませる。
-            // UI スレッドの lf_scan (実測 p95=61ms, max=179ms) を除去できる。
-            // ZIP/PDF ファイルは専用ローダーが別経路で処理するのでここではスキャンしない。
+            // DFS スレッドで事前スキャンまで済ませる: ヒットした先が通常ディレクトリなら、
+            // ここで `read_dir` + メタデータ取得を終わらせて UI スレッドの lf_scan
+            // (HDD で 100-180ms 級) を除去する。ZIP/PDF ファイルは専用ローダーが
+            // 別経路で処理するのでここではスキャンしない。
             let scanned = if cancel_w.load(Ordering::Relaxed) {
                 None
             } else if let Some(o) = outcome.as_ref() {
@@ -4437,7 +4421,7 @@ impl App {
         // 原因がここに集まるため、ms を必ず記録する。
         let apply_t0 = std::time::Instant::now();
         let apply_seq = self.input_seq;
-        let apply_mode_str = format!("{:?}", result.mode);
+        let apply_mode_tag = result.mode.perf_tag();
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -4446,14 +4430,14 @@ impl App {
                 apply_seq,
                 &[
                     ("forward", serde_json::Value::from(result.forward)),
-                    ("mode", serde_json::Value::from(apply_mode_str.clone())),
+                    ("mode", serde_json::Value::from(apply_mode_tag)),
                     ("found", serde_json::Value::from(result.path.is_some())),
                     ("hit_image_folder", serde_json::Value::from(result.hit_image_folder)),
                 ],
             );
         }
         // 内部関数として展開して、全 early-return 前に emit_end を呼ぶ。
-        let emit_end = |t0: std::time::Instant, seq: u64, mode: &str, reason: &'static str| {
+        let emit_end = |t0: std::time::Instant, seq: u64, mode: &'static str, reason: &'static str| {
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "nav",
@@ -4462,7 +4446,7 @@ impl App {
                     seq,
                     &[
                         ("ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
-                        ("mode", serde_json::Value::from(mode.to_string())),
+                        ("mode", serde_json::Value::from(mode)),
                         ("reason", serde_json::Value::from(reason)),
                     ],
                 );
@@ -4489,7 +4473,7 @@ impl App {
                 }
                 FolderNavMode::Grid => {}
             }
-            emit_end(apply_t0, apply_seq, &apply_mode_str, "dfs_empty");
+            emit_end(apply_t0, apply_seq, apply_mode_tag, "dfs_empty");
             return;
         };
         // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像の無い
@@ -4503,10 +4487,10 @@ impl App {
                 },
             );
             self.pending_folder_nav_steps = 0;
-            emit_end(apply_t0, apply_seq, &apply_mode_str, "fs_boundary");
+            emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
             return;
         }
-        // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける (対策 B)
+        // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。
         let scanned = result.scanned;
         match result.mode {
             FolderNavMode::Grid => {
@@ -4525,13 +4509,13 @@ impl App {
                 // ことがあるため、その前後の両方でチェックする。
                 if self.pdf_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
-                    emit_end(apply_t0, apply_seq, &apply_mode_str, "pdf_enumerate_defer");
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, "pdf_enumerate_defer");
                     return;
                 }
                 let target_idx = self.find_fullscreen_nav_target(result.forward);
                 if self.pdf_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
-                    emit_end(apply_t0, apply_seq, &apply_mode_str, "pdf_enumerate_defer");
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, "pdf_enumerate_defer");
                     return;
                 }
                 if let Some(new_idx) = target_idx {
@@ -4560,7 +4544,7 @@ impl App {
                 }
             }
         }
-        emit_end(apply_t0, apply_seq, &apply_mode_str, "done");
+        emit_end(apply_t0, apply_seq, apply_mode_tag, "done");
     }
 
     /// Ctrl+↑↓ フルスクリーン遷移後の表示対象 item index を決める。
@@ -4880,7 +4864,7 @@ impl App {
 
         // AI / EXIF / XMP メタデータ読み込みは **バックグラウンドスレッド** で実行する。
         // XMP は JPEG/PNG 全体を読むため UI スレッドで同期実行すると 20MP 画像で
-        // 100ms 級にブロックしていた (対策 E)。メタデータパネルは値到着まで空表示。
+        // 100ms 級にブロックする。メタデータパネルは値到着まで空表示。
         self.start_metadata_load(idx);
     }
 
@@ -4950,7 +4934,7 @@ impl App {
             })
             .ok();
 
-        self.metadata_pending = Some(MetadataLoadPending { idx, cancel, rx });
+        self.metadata_pending = Some(MetadataLoadPending { cancel, rx });
     }
 
     /// メタデータ読み込み結果を非同期に受信してキャッシュに投入する。
@@ -5164,7 +5148,8 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
-        let seq = self.bump_input_seq("search", Some(&self.search_query.clone()));
+        // perf 計装上、検索開始を input イベントとして記録する (input_seq は副作用で更新)。
+        self.bump_input_seq("search", Some(&self.search_query.clone()));
 
         std::thread::Builder::new()
             .name("metadata-search".to_string())
@@ -5174,7 +5159,7 @@ impl App {
             })
             .ok();
 
-        self.search_pending = Some(SearchPending { cancel, rx, seq });
+        self.search_pending = Some(SearchPending { cancel, rx });
     }
 
     /// in-flight 検索があればキャンセルする (検索バーを閉じる等の経路で呼ぶ)。
@@ -7085,7 +7070,7 @@ impl App {
 
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
     ///
-    /// **GPU アップロード ペーシング (対策 A)**: デコード完了した `FsLoadResult` は
+    /// **GPU アップロード ペーシング**: デコード完了した `FsLoadResult` は
     /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
     /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
@@ -7147,41 +7132,30 @@ impl App {
         }
 
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
-        // 1. 現在フルスクリーン表示中の idx が backlog にあれば即時アップロード
-        //    (表示遅延をなくすため。ユーザーが今見る画像は待たせない)
-        // 2. それ以外の backlog は 1 フレーム 1 枚まで
-        let pick_indices: Vec<usize> = {
-            let mut picks: Vec<usize> = Vec::new();
-            // 現在ページ優先
-            if let Some(cur) = self.fullscreen_idx
-                && let Some(pos) = self.fs_upload_backlog.iter().position(|(k, _, _)| *k == cur)
-            {
-                picks.push(pos);
+        // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
+        // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
+        // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
+        let cur = self.fullscreen_idx;
+        let (mut cur_pos, mut other_pos) = (None, None);
+        for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
+            if Some(*k) == cur {
+                cur_pos = Some(i);
+            } else if other_pos.is_none() {
+                other_pos = Some(i);
             }
-            // 次に backlog の先頭から 1 枚 (現在ページを既に含まない)
-            if picks.len() < 2 {
-                for (pos, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
-                    if picks.contains(&pos) {
-                        continue;
-                    }
-                    if self.fullscreen_idx == Some(*k) {
-                        continue; // 現在ページは上で拾った
-                    }
-                    picks.push(pos);
-                    break;
-                }
+            if cur_pos.is_some() && other_pos.is_some() {
+                break;
             }
-            picks
-        };
-
-        // 取り出す位置を降順でソートしてから swap_remove (位置ずれ回避)
-        let mut pick_sorted = pick_indices.clone();
-        pick_sorted.sort_unstable_by(|a, b| b.cmp(a));
-        let mut to_process: Vec<(usize, FsLoadResult, u64)> = Vec::with_capacity(pick_sorted.len());
-        for pos in pick_sorted {
-            to_process.push(self.fs_upload_backlog.swap_remove(pos));
         }
-        // 取り出し時に降順で積んだので元の先頭→末尾順に戻す
+
+        // 両方ある場合は元の位置順 (FIFO) を維持するため、大きい位置から remove する。
+        let mut positions: Vec<usize> = [cur_pos, other_pos].into_iter().flatten().collect();
+        positions.sort_unstable_by(|a, b| b.cmp(a));
+        let mut to_process: Vec<(usize, FsLoadResult, u64)> = positions
+            .into_iter()
+            .map(|pos| self.fs_upload_backlog.remove(pos))
+            .collect();
+        // descending で取り出したので元の位置順に直す
         to_process.reverse();
 
         let has_more_backlog = !self.fs_upload_backlog.is_empty();
@@ -7757,20 +7731,19 @@ impl eframe::App for App {
             // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
             // `total_ms` に main() 入口からの累計経過を載せる。creator_exit との差分が
             // wgpu パイプライン構築 + winit 初期描画準備の時間になる。
-            if !self.startup_first_frame_emitted {
-                self.startup_first_frame_emitted = true;
-                if let Some(prog) = self.program_start {
-                    crate::perf::event(
-                        "startup",
-                        "first_frame",
-                        None,
-                        0,
-                        &[(
-                            "total_ms",
-                            serde_json::Value::from(prog.elapsed().as_secs_f64() * 1000.0),
-                        )],
-                    );
-                }
+            if self.frame_counter == 1
+                && let Some(prog) = crate::perf::program_start()
+            {
+                crate::perf::event(
+                    "startup",
+                    "first_frame",
+                    None,
+                    0,
+                    &[(
+                        "total_ms",
+                        serde_json::Value::from(prog.elapsed().as_secs_f64() * 1000.0),
+                    )],
+                );
             }
             // 約 1 秒に 1 回 flush (BufWriter のデータをディスクへ)
             let now = std::time::Instant::now();

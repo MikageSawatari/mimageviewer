@@ -54,23 +54,22 @@ pub mod zip_loader;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// 起動時間計測ヘルパー: `startup.<step>` perf イベントを emit する。
-/// `prog_start` は main() 入口で取得した Instant、`phase_start` は当該フェーズ開始時。
-/// ユーザーの perf-log 有効時のみ実際にレコードされる。
-fn emit_startup(step: &str, prog_start: Instant, phase_start: Instant) {
+/// `startup.<step>` perf イベントを emit する共通ヘルパー。
+/// `phase_start` を渡すと当該フェーズの `ms` + 累計 `total_ms` を、
+/// `None` を渡すとマーカー用として `total_ms` のみを記録する。
+/// `total_ms` は `perf::program_start()` (= `perf::init` に渡した基準 Instant)
+/// 経由で計算するので、事前に `perf::init(enabled, Some(prog_start))` を呼んでおくこと。
+/// `perf::is_enabled()` が false なら no-op。
+fn emit_startup(step: &str, phase_start: Option<Instant>) {
     if !perf::is_enabled() { return; }
-    let total_ms = prog_start.elapsed().as_secs_f64() * 1000.0;
-    let ms = phase_start.elapsed().as_secs_f64() * 1000.0;
-    perf::event(
-        "startup",
-        step,
-        None,
-        0,
-        &[
-            ("ms", serde_json::Value::from(ms)),
-            ("total_ms", serde_json::Value::from(total_ms)),
-        ],
-    );
+    let Some(base) = perf::program_start() else { return };
+    let total_ms = base.elapsed().as_secs_f64() * 1000.0;
+    let mut extras: Vec<(&str, serde_json::Value)> = Vec::with_capacity(2);
+    if let Some(start) = phase_start {
+        extras.push(("ms", serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0)));
+    }
+    extras.push(("total_ms", serde_json::Value::from(total_ms)));
+    perf::event("startup", step, None, 0, &extras);
 }
 
 fn main() -> eframe::Result {
@@ -103,30 +102,27 @@ fn main() -> eframe::Result {
     let perf_enabled = std::env::args().any(|a| a == "--perf-log");
     perf::init(perf_enabled, Some(prog_start));
 
-    // 起動時間計測: data_dir 初期化の所要時間 (先行ステップなので perf::init 後に打つ)
+    // 起動時間計測: data_dir 初期化は先行ステップなので perf::init 後に後追いで打つ。
+    // phase_start を渡すと ms を載せられるが、ここは経過分を再現できないので
+    // data_dir_elapsed を直接 ms として埋める。
     if perf::is_enabled() {
-        perf::event(
-            "startup",
-            "data_dir_init",
-            None,
-            0,
-            &[
-                ("ms", serde_json::Value::from(data_dir_elapsed.as_secs_f64() * 1000.0)),
-                ("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0)),
-            ],
-        );
+        let total_ms = prog_start.elapsed().as_secs_f64() * 1000.0;
+        perf::event("startup", "data_dir_init", None, 0, &[
+            ("ms", serde_json::Value::from(data_dir_elapsed.as_secs_f64() * 1000.0)),
+            ("total_ms", serde_json::Value::from(total_ms)),
+        ]);
     }
 
     // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
     let t = Instant::now();
     ai::model_manager::ensure_models_extracted();
-    emit_startup("models_extract", prog_start, t);
+    emit_startup("models_extract", Some(t));
 
     // Susie 32bit ワーカー exe を %APPDATA%\mimageviewer\mimageviewer-susie32.exe に展開。
     // PDFium DLL と同じパターンで本体 exe に埋め込み、初回起動時に書き出す。
     let t = Instant::now();
     susie_loader::ensure_worker_extracted();
-    emit_startup("susie_worker_extract", prog_start, t);
+    emit_startup("susie_worker_extract", Some(t));
 
     // Susie プラグインワーカープール: バックグラウンドで初期化する
     // (プラグインが多いと handshake に数百ms かかる可能性があるため、
@@ -168,7 +164,7 @@ fn main() -> eframe::Result {
     // 保存済み設定からウィンドウ初期状態を決定する
     let t = Instant::now();
     let saved = settings::Settings::load();
-    emit_startup("settings_load", prog_start, t);
+    emit_startup("settings_load", Some(t));
 
     let default_size = [1280.0_f32, 800.0_f32];
     // --window-size WxH 引数があればそれを優先（スクリーンショット用）
@@ -176,7 +172,7 @@ fn main() -> eframe::Result {
 
     let t = Instant::now();
     let icon = Arc::new(load_icon());
-    emit_startup("load_icon", prog_start, t);
+    emit_startup("load_icon", Some(t));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
@@ -200,15 +196,7 @@ fn main() -> eframe::Result {
 
     // eframe::run_native に入る手前までを 1 つの marker として記録する。
     // これ以降は eframe (winit + wgpu) の初期化が走り、creator closure が呼ばれる。
-    if perf::is_enabled() {
-        perf::event(
-            "startup",
-            "before_run_native",
-            None,
-            0,
-            &[("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0))],
-        );
-    }
+    emit_startup("before_run_native", None);
 
     eframe::run_native(
         "mimageviewer",
@@ -216,18 +204,10 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
-            if perf::is_enabled() {
-                perf::event(
-                    "startup",
-                    "creator_enter",
-                    None,
-                    0,
-                    &[("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0))],
-                );
-            }
+            emit_startup("creator_enter", None);
             let t = Instant::now();
             setup_fonts(&cc.egui_ctx);
-            emit_startup("setup_fonts", prog_start, t);
+            emit_startup("setup_fonts", Some(t));
             // 起動時点で UI テーマを先行適用して、初回フレームでの
             // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから
             // 効くため、App::update 内で適用すると 1 フレームだけデフォルト
@@ -235,25 +215,16 @@ fn main() -> eframe::Result {
             let t = Instant::now();
             let resolved = os_theme::resolve(saved.ui_theme);
             os_theme::apply_resolved(&cc.egui_ctx, resolved);
-            emit_startup("apply_theme", prog_start, t);
+            emit_startup("apply_theme", Some(t));
             let t = Instant::now();
             let mut app = app::App::default();
-            emit_startup("app_default", prog_start, t);
+            emit_startup("app_default", Some(t));
             app.applied_ui_theme = Some(resolved);
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
             app.pending_initial_size = Some(size);
-            app.program_start = Some(prog_start);
-            if perf::is_enabled() {
-                perf::event(
-                    "startup",
-                    "creator_exit",
-                    None,
-                    0,
-                    &[("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0))],
-                );
-            }
+            emit_startup("creator_exit", None);
             Ok(Box::new(app))
         }),
     )

@@ -74,6 +74,23 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// perf-log 有効時に `init` が基準として設定した `Instant` を返す。
+/// 起動時間計測 (`startup.first_frame` 等) で `main()` 入口からの経過を
+/// 計算するのに使う。無効時 / 未初期化時は `None`。
+pub fn program_start() -> Option<Instant> {
+    START.get().copied()
+}
+
+/// 共通ヘルパー: `t0.elapsed()` を `ms` として perf イベントを emit する。
+/// `is_enabled()` が false なら即 return。`ms` は必ず最初の extra として付く。
+/// 追加の `extras` を渡したい場合はこのヘルパーではなく `event()` を直接呼ぶ。
+#[inline]
+pub fn emit_ms(cat: &str, kind: &str, seq: u64, t0: Instant) {
+    if !is_enabled() { return; }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    event(cat, kind, None, seq, &[("ms", serde_json::Value::from(ms))]);
+}
+
 /// 1 イベントを 1 行書き込む。`is_enabled()` が false なら即 return。
 ///
 /// `key` と `seq` はそれぞれ省略可能 (None / 0)。
