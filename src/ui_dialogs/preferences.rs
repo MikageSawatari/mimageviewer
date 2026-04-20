@@ -116,6 +116,8 @@ pub(crate) struct PreferencesState {
     // ページ固有の一時状態
     pub manual_threads: usize,
     pub exif_add_tag_input: String,
+    /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
+    pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
 
     // 初回に1度だけ取得するキャッシュ値
     pub auto_thread_count: usize,
@@ -146,6 +148,7 @@ impl PreferencesState {
             expanded,
             manual_threads,
             exif_add_tag_input: String::new(),
+            exif_collapsed_groups: HashSet::new(),
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
         }
@@ -890,43 +893,31 @@ fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
 }
 
 fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: bool) {
-    ui.label("非表示にする EXIF タグ名:");
-    ui.add_space(4.0);
+    use crate::exif_reader::TagGroup;
 
-    let mut to_remove: Option<usize> = None;
-    let avail_w = ui.available_width();
+    ui.label(
+        "メタデータパネルで非表示にする EXIF タグを選択します。\n\
+         チェックを入れたタグは「Image Info」サイドパネルに表示されません。",
+    );
+    ui.add_space(8.0);
 
     egui::ScrollArea::vertical()
-        .max_height(300.0)
+        .max_height(420.0)
         .id_salt("exif_tags_scroll")
         .show(ui, |ui| {
-            ui.set_min_width(avail_w);
-            for (i, tag) in state.settings.exif_hidden_tags.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.set_min_width(avail_w - 8.0);
-                    ui.label(tag);
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("×").clicked() {
-                                to_remove = Some(i);
-                            }
-                        },
-                    );
-                });
+            for &group in TagGroup::ordered() {
+                draw_exif_group(ui, state, group);
+                ui.add_space(2.0);
             }
+            draw_exif_custom_tags(ui, state);
         });
-
-    if let Some(idx) = to_remove {
-        state.settings.exif_hidden_tags.remove(idx);
-    }
 
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
 
     ui.horizontal(|ui| {
-        ui.label("追加:");
+        ui.label("カスタム追加:");
         let response = ui.text_edit_singleline(&mut state.exif_add_tag_input);
         if (ui.button("追加").clicked()
             || (response.lost_focus() && enter_pressed))
@@ -939,10 +930,165 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pres
             state.exif_add_tag_input.clear();
         }
     });
+    ui.label(
+        egui::RichText::new("MakerNote 系などリストに無いタグはここから追加できます (内部名で入力)。")
+            .small()
+            .color(egui::Color32::from_gray(140)),
+    );
 
     ui.add_space(4.0);
     if ui.button("デフォルトに戻す").clicked() {
         state.settings.exif_hidden_tags = settings::default_exif_hidden_tags();
+    }
+}
+
+/// 1 グループ分のヘッダー (折りたたみ + 全選択/全解除) と、展開中ならチェックリストを描画する。
+fn draw_exif_group(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    group: crate::exif_reader::TagGroup,
+) {
+    use crate::exif_reader;
+
+    // チェックリストに出すタグ一覧 (登録順)
+    let tags: Vec<&'static exif_reader::TagInfo> =
+        exif_reader::known_tags_in_group(group).collect();
+    let total = tags.len();
+    let hidden_count = tags
+        .iter()
+        .filter(|t| state.settings.exif_hidden_tags.iter().any(|h| h == t.name))
+        .count();
+
+    let collapsed = state.exif_collapsed_groups.contains(&group);
+    let arrow = if collapsed { "▶" } else { "▼" };
+    let header = format!(
+        "{arrow} {}  ({hidden_count}/{total} 非表示)",
+        group.display_name()
+    );
+
+    ui.horizontal(|ui| {
+        if ui.selectable_label(false, header).clicked() {
+            if collapsed {
+                state.exif_collapsed_groups.remove(&group);
+            } else {
+                state.exif_collapsed_groups.insert(group);
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("全解除").clicked() {
+                let names: Vec<&str> = tags.iter().map(|t| t.name).collect();
+                state
+                    .settings
+                    .exif_hidden_tags
+                    .retain(|h| !names.iter().any(|n| n == h));
+            }
+            if ui.small_button("全選択").clicked() {
+                for tag in &tags {
+                    if !state
+                        .settings
+                        .exif_hidden_tags
+                        .iter()
+                        .any(|h| h == tag.name)
+                    {
+                        state.settings.exif_hidden_tags.push(tag.name.to_string());
+                    }
+                }
+            }
+        });
+    });
+
+    if collapsed {
+        return;
+    }
+
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 0,
+            top: 0,
+            bottom: 4,
+        })
+        .show(ui, |ui| {
+            for tag in &tags {
+                let mut hidden = state
+                    .settings
+                    .exif_hidden_tags
+                    .iter()
+                    .any(|h| h == tag.name);
+                let label = format!("{}  —  {}", tag.name, tag.display);
+                if ui.checkbox(&mut hidden, label).changed() {
+                    if hidden {
+                        if !state
+                            .settings
+                            .exif_hidden_tags
+                            .iter()
+                            .any(|h| h == tag.name)
+                        {
+                            state.settings.exif_hidden_tags.push(tag.name.to_string());
+                        }
+                    } else {
+                        state.settings.exif_hidden_tags.retain(|h| h != tag.name);
+                    }
+                }
+            }
+        });
+}
+
+/// `TAG_REGISTRY` に無い「カスタム」タグ (ユーザーが手動追加したもの) のリスト + × 削除。
+fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::exif_reader::{self, TagGroup};
+
+    let known: std::collections::HashSet<&'static str> = TagGroup::ordered()
+        .iter()
+        .flat_map(|&g| exif_reader::known_tags_in_group(g))
+        .map(|t| t.name)
+        .collect();
+
+    let custom: Vec<String> = state
+        .settings
+        .exif_hidden_tags
+        .iter()
+        .filter(|t| !known.contains(t.as_str()))
+        .cloned()
+        .collect();
+
+    if custom.is_empty() {
+        return;
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(format!("▼ カスタム  ({} 件)", custom.len()))
+            .color(egui::Color32::from_gray(180))
+            .size(13.0),
+    );
+
+    let mut to_remove: Option<String> = None;
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 0,
+            top: 0,
+            bottom: 4,
+        })
+        .show(ui, |ui| {
+            for tag in &custom {
+                ui.horizontal(|ui| {
+                    ui.label(tag);
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("×").clicked() {
+                                to_remove = Some(tag.clone());
+                            }
+                        },
+                    );
+                });
+            }
+        });
+
+    if let Some(t) = to_remove {
+        state.settings.exif_hidden_tags.retain(|x| x != &t);
     }
 }
 

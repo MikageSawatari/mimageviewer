@@ -449,9 +449,10 @@ fn draw_exif_panel(
     );
     ui.add_space(6.0);
 
-    for (section_name, fields) in &exif.sections {
-        let open = sections_open.entry(section_name.clone()).or_insert(true);
-        let display_section = exif_reader::section_display_name(section_name);
+    for (group, fields) in &exif.sections {
+        let key = format!("{:?}", group);
+        let open = sections_open.entry(key).or_insert(true);
+        let display_section = group.display_name();
         let header = if *open {
             format!("▼ {display_section}")
         } else {
