@@ -23,12 +23,22 @@ pub(crate) enum FolderNavMode {
     Favsearch { root: PathBuf },
 }
 
+/// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
+/// ヒット先が通常ディレクトリだった場合の事前スキャン結果を載せる。
+/// 事前スキャンがあれば UI スレッドの `load_folder` は `read_dir` をスキップできる。
+pub(crate) struct FolderNavThreadResult {
+    outcome: Option<crate::folder_tree::FolderNavOutcome>,
+    /// `outcome.path` がディレクトリのときのみ Some。ZIP/PDF ファイルは
+    /// 専用ローダーに委譲するので事前スキャンしない。
+    scanned: Option<ScannedDir>,
+}
+
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
     cancel: Arc<AtomicBool>,
     /// DFS スレッドからの結果チャネル。
-    rx: mpsc::Receiver<Option<crate::folder_tree::FolderNavOutcome>>,
+    rx: mpsc::Receiver<FolderNavThreadResult>,
     /// この DFS ステップの方向 (forward=↓, backward=↑)。結果の後処理に使う。
     forward: bool,
     /// この DFS が発火された起点モード。結果の後処理に使う。
@@ -48,6 +58,135 @@ pub(crate) struct FolderNavResult {
     pub forward: bool,
     /// 起点モード。
     pub mode: FolderNavMode,
+    /// DFS スレッドで事前走査した `path` の中身。`path` がディレクトリのときのみ Some。
+    /// UI スレッドの `load_folder` で read_dir をスキップするために使う。
+    pub scanned: Option<ScannedDir>,
+}
+
+/// 非同期メタデータ読み込み (フルスクリーン表示対象画像の AI/EXIF/XMP) の状態。
+///
+/// `open_fullscreen` から起動され、`poll_metadata_load` で結果を受信する。
+/// **背景**: XMP リーダーは JPEG/PNG 全体を読むため (`read_tweet_info`)、
+/// 20MP 級の写真で UI スレッドが 100ms 級でブロックしていた
+/// (AI metadata と EXIF は数 ms だが、XMP が主犯)。
+/// 新 fullscreen idx が開かれたら旧 pending を cancel する (連打時は最新のみ処理)。
+pub(crate) struct MetadataLoadPending {
+    /// どの idx 向けの読み込みか (デバッグ / perf 相関用、現状は使わない)。
+    #[allow(dead_code)]
+    idx: usize,
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<MetadataLoadResult>,
+}
+
+/// メタデータ読み込みワーカーの結果。キー (metadata_cache_key の形式) と
+/// 3 つのパース結果をまとめて返す。UI 側はそれぞれのキャッシュに投入する。
+pub(crate) struct MetadataLoadResult {
+    key: String,
+    metadata: Option<crate::png_metadata::AiMetadata>,
+    exif: Option<crate::exif_reader::ExifInfo>,
+    xmp: Option<crate::xmp_reader::XmpTweetInfo>,
+}
+
+/// 非同期お気に入り検索 (Ctrl+S) の状態。
+///
+/// `search_index_db.search()` は SQLite クエリでインデックス化された名前検索だが、
+/// 大規模お気に入りツリーでは 10〜100ms 級のブロックになり得る。さらにその後に
+/// 走る `start_loading_items` が数百ms の UI ブロック源になるので、DB 問い合わせ
+/// だけでもバックグラウンドに退避する。
+pub(crate) struct FavSearchPending {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<rusqlite::Result<Vec<crate::search_index_db::IndexEntry>>>,
+    /// 検索クエリ (UI 側に結果表示用アドレス更新をさせるため)
+    #[allow(dead_code)]
+    query: String,
+}
+
+/// ディレクトリ走査結果 (read_dir + 各エントリ metadata 取得の成果物)。
+///
+/// Ctrl+↑↓ 移動時は DFS スレッドで事前に走査しておき、UI スレッドの
+/// `load_folder` で `read_dir` を走らせずに items を組み立てるために使う。
+/// 通常パス (ユーザーが明示的に開いたフォルダ等) では `scan_directory` を
+/// UI スレッドで呼んで即座に生成する。
+pub(crate) struct ScannedDir {
+    /// (GridItem, (mtime, file_size)) の対。GridItem は Folder / ZipFile /
+    /// PdfFile / ConvertibleArchive のいずれか。load_folder 内でソートされる。
+    pub folders: Vec<(GridItem, Option<(i64, i64)>)>,
+    /// (path, is_video, mtime, file_size) のタプル。load_folder 内で sort_order
+    /// 設定に基づいてソートされる。
+    pub all_media: Vec<(PathBuf, bool, i64, i64)>,
+}
+
+/// ディレクトリ走査: `read_dir` + 各エントリの `.metadata()` 呼び出し。
+///
+/// 実測で 152 枚の HDD フォルダで 179ms かかる。UI スレッドからこれを呼ぶと
+/// 明確な引っかかりになるため、Ctrl+↑↓ 連打時は DFS スレッドで事前実行し、
+/// UI スレッドはスキャン結果を受け取るだけにする。
+pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
+    let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
+    let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return ScannedDir { folders, all_media };
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let meta = entry.metadata().ok();
+            let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
+            folders.push((GridItem::Folder(p), Some((mtime, 0))));
+        } else if is_apple_double(&p) {
+            // macOS/iPhone AppleDouble メタデータ — スキップ
+        } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_ascii_lowercase();
+            let meta = entry.metadata().ok();
+            let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
+            let file_size = meta.map_or(0, |m| m.len() as i64);
+            if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
+                all_media.push((p, false, mtime, file_size));
+            } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
+                all_media.push((p, true, mtime, file_size));
+            } else if ext_lower == "zip" {
+                folders.push((GridItem::ZipFile(p), Some((mtime, file_size))));
+            } else if ext_lower == "pdf" {
+                folders.push((GridItem::PdfFile(p), Some((mtime, file_size))));
+            } else if let Some(fmt) =
+                crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
+            {
+                folders.push((
+                    GridItem::ConvertibleArchive { path: p, format: fmt },
+                    Some((mtime, file_size)),
+                ));
+            }
+        }
+    }
+    ScannedDir { folders, all_media }
+}
+
+/// 非同期メタデータ検索 (Ctrl+F) の状態。
+///
+/// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
+/// `xmp_reader::read_tweet_info` など、ファイル I/O を伴う読み取りが必要。
+/// フォルダに数百〜数千枚の画像があると UI スレッドで数秒ブロックしていたため、
+/// バックグラウンドスレッドで実行して結果を `poll_search` で受け取る構造に変更した。
+pub(crate) struct SearchPending {
+    /// 検索キャンセル用トークン。新クエリ / 検索バー閉じ / フォルダ切替で立てる。
+    cancel: Arc<AtomicBool>,
+    /// ワーカースレッドから結果を受け取るチャネル。
+    rx: mpsc::Receiver<SearchThreadResult>,
+    /// 相関用の input_seq。perf ログで入力 → 検索完了を紐付けるため。
+    #[allow(dead_code)]
+    seq: u64,
+}
+
+/// 検索ワーカースレッドからの結果。
+pub(crate) enum SearchThreadResult {
+    /// 検索完了。`matches` は該当アイテムの原インデックス集合、
+    /// `xmp_additions` はワーカーが新規に読み取った XMP エントリの (key, value) 対で、
+    /// UI スレッドで `xmp_cache` にマージする。
+    Done {
+        matches: std::collections::HashSet<usize>,
+        xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)>,
+    },
 }
 
 /// モードの種類 (variant) のみを比較する。`Favsearch { root }` は root 違いでも
@@ -92,6 +231,189 @@ fn is_png_entry(entry_name: &str) -> bool {
     entry_name
         .rsplit_once('.')
         .is_some_and(|(_, e)| e.eq_ignore_ascii_case("png"))
+}
+
+/// フルスクリーン画像のメタデータ (AI プロンプト / EXIF / XMP) を読み込むワーカー本体。
+/// ZipImage は ZIP エントリを 1 回だけ開いて 3 パーサー間で bytes を共有する。
+/// それ以外 (Image / Video) はファイルを直接パーサーに渡す。パーサー側で
+/// 必要に応じて full-file read が行われる (XMP の JPEG/PNG は全体読み)。
+fn run_metadata_load(
+    key: String,
+    item: GridItem,
+    hidden: &[String],
+    cancel: &AtomicBool,
+) -> Option<MetadataLoadResult> {
+    // 各段で cancel チェック。ZIP の bytes 読み → AI → EXIF → XMP の順で重い。
+    if cancel.load(Ordering::Relaxed) { return None; }
+
+    let (metadata, exif, xmp) = match &item {
+        GridItem::Image(p) => {
+            let metadata = crate::png_metadata::extract_metadata(p);
+            if cancel.load(Ordering::Relaxed) { return None; }
+            let exif = crate::exif_reader::read_exif(p, hidden);
+            if cancel.load(Ordering::Relaxed) { return None; }
+            let xmp = crate::xmp_reader::read_tweet_info(p);
+            (metadata, exif, xmp)
+        }
+        GridItem::Video(p) => {
+            // 動画は AI/EXIF なし、XMP のみ (mXD が MP4/MOV に X/Twitter 情報を埋める)
+            let xmp = crate::xmp_reader::read_tweet_info(p);
+            (None, None, xmp)
+        }
+        GridItem::ZipImage { zip_path, entry_name } => {
+            // ZIP エントリは 1 回展開して bytes を 3 パーサーで共有する
+            let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
+            if cancel.load(Ordering::Relaxed) { return None; }
+            let metadata = bytes
+                .as_ref()
+                .and_then(|b| crate::png_metadata::extract_metadata_from_bytes(b));
+            if cancel.load(Ordering::Relaxed) { return None; }
+            let exif = bytes
+                .as_ref()
+                .and_then(|b| crate::exif_reader::read_exif_from_bytes(b, hidden));
+            if cancel.load(Ordering::Relaxed) { return None; }
+            let xmp = bytes
+                .as_ref()
+                .and_then(|b| crate::xmp_reader::read_tweet_info_from_bytes(b));
+            (metadata, exif, xmp)
+        }
+        _ => (None, None, None),
+    };
+
+    Some(MetadataLoadResult { key, metadata, exif, xmp })
+}
+
+/// Ctrl+F メタデータ検索のワーカー本体。UI スレッドから spawn され、結果は
+/// `SearchPending.rx` で受信される。`cancel` が立ったら中断して Cancelled を返す
+/// (呼び出し側はキャンセル時に Pending をクリアするので Done のみ送る実装でも OK)。
+fn run_metadata_search(
+    tokens: &[crate::search_query::Token],
+    items: &[GridItem],
+    xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    cancel: &AtomicBool,
+) -> SearchThreadResult {
+    let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)> = Vec::new();
+    // スレッド内の追加分を重複読み取りなしで引くためのローカル HashMap。
+    let mut additions_lookup: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>> =
+        std::collections::HashMap::new();
+    let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+
+    // Pass 1: 構造アイテム + ZIP/PDF 系 (cheap な分類のみ、I/O なし)
+    for (idx, item) in items.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return SearchThreadResult::Done { matches, xmp_additions };
+        }
+        match item {
+            GridItem::Folder(_)
+            | GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. }
+            | GridItem::ZipSeparator { .. } => {
+                matches.insert(idx);
+            }
+            GridItem::Image(_) | GridItem::Video(_) => {
+                // Pass 2 で処理
+            }
+            GridItem::ZipImage { zip_path, entry_name } => {
+                if is_png_entry(entry_name) {
+                    zip_png_groups
+                        .entry(zip_path.clone())
+                        .or_default()
+                        .push((idx, entry_name.clone()));
+                } else {
+                    let name = crate::zip_loader::entry_basename(entry_name);
+                    if crate::search_query::matches(tokens, name) {
+                        matches.insert(idx);
+                    }
+                }
+            }
+            GridItem::PdfPage { .. } => {
+                if crate::search_query::matches(tokens, &item.name()) {
+                    matches.insert(idx);
+                }
+            }
+        }
+    }
+
+    // Pass 2: Image/Video — cheap hay で決まらなければ XMP を lazy 読み取り (ファイル I/O)
+    for (idx, item) in items.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return SearchThreadResult::Done { matches, xmp_additions };
+        }
+        let (path, is_image) = match item {
+            GridItem::Image(p) => (p, true),
+            GridItem::Video(p) => (p, false),
+            _ => continue,
+        };
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let meta_text = if is_image && is_png_path(path) {
+            crate::png_metadata::build_searchable_from_path(path)
+        } else {
+            String::new()
+        };
+        let hay_no_xmp = hay_of(&meta_text, &name, None);
+        match crate::search_query::decide_partial(tokens, &hay_no_xmp) {
+            crate::search_query::PartialResult::Decided(true) => {
+                matches.insert(idx);
+            }
+            crate::search_query::PartialResult::Decided(false) => {}
+            crate::search_query::PartialResult::NeedsMore => {
+                let key = crate::adjustment_db::normalize_path(path);
+                // スナップショット → ローカル追加分 → 今読む、の順でルックアップ。
+                // &Option<XmpTweetInfo> の借用ライフタイムを揃えるため clone を介す。
+                let xmp_opt = if let Some(cached) = xmp_snapshot.get(&key) {
+                    cached.clone()
+                } else if let Some(added) = additions_lookup.get(&key) {
+                    added.clone()
+                } else {
+                    let xmp = crate::xmp_reader::read_tweet_info(path);
+                    additions_lookup.insert(key.clone(), xmp.clone());
+                    xmp_additions.push((key.clone(), xmp.clone()));
+                    xmp
+                };
+                let hay = hay_of(&meta_text, &name, xmp_opt.as_ref());
+                if crate::search_query::matches(tokens, &hay) {
+                    matches.insert(idx);
+                }
+            }
+        }
+    }
+
+    // Pass 3: ZIP 内 PNG — ZIP を 1 回開いてまとめて処理 (ファイル I/O)
+    for (zip_path, entries) in zip_png_groups {
+        if cancel.load(Ordering::Relaxed) {
+            return SearchThreadResult::Done { matches, xmp_additions };
+        }
+        let mut direct_archive = crate::zip_loader::open_archive(&zip_path).ok();
+        for (idx, entry_name) in entries {
+            if cancel.load(Ordering::Relaxed) {
+                return SearchThreadResult::Done { matches, xmp_additions };
+            }
+            let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
+            let bytes_result = if is_nested {
+                crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+            } else if let Some(archive) = direct_archive.as_mut() {
+                crate::zip_loader::read_entry_from_archive(archive, &entry_name)
+            } else {
+                crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+            };
+            let (meta_text, xmp) = match bytes_result {
+                Ok(bytes) => (
+                    crate::png_metadata::build_searchable_from_bytes(&bytes),
+                    crate::xmp_reader::read_tweet_info_from_bytes(&bytes),
+                ),
+                Err(_) => (String::new(), None),
+            };
+            let name = crate::zip_loader::entry_basename(&entry_name);
+            if crate::search_query::matches(tokens, &hay_of(&meta_text, name, xmp.as_ref())) {
+                matches.insert(idx);
+            }
+        }
+    }
+
+    SearchThreadResult::Done { matches, xmp_additions }
 }
 
 /// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
@@ -451,6 +773,14 @@ pub struct App {
     /// これを見て即サイズを表示できる (⚠ ダウンスケール警告もここで判定可能)。
     pub(crate) fs_early_dims: std::collections::HashMap<usize, [usize; 2]>,
 
+    /// デコード完了済みだが GPU アップロード未了の先読みエントリ。
+    /// 20MP 級 JPEG の `ctx.load_texture` は UI スレッドで 25-60ms/枚かかり、
+    /// 10 枚連続で来ると 500ms 超の UI フリーズになる (計測実績あり)。
+    /// `poll_prefetch` では受信を drain してここに溜め、フレームあたり最大 1 枚だけ
+    /// アップロードする (現在ページは即時)。
+    /// `(idx, FsLoadResult, load_seq)` — FIFO 順で消化する。
+    pub(crate) fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
+
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
 
@@ -593,6 +923,19 @@ pub struct App {
     pub(crate) search_query: String,
     /// 検索結果フィルタ: Some = フィルタ中（表示するアイテムの元インデックス集合）
     pub(crate) search_filter: Option<std::collections::HashSet<usize>>,
+
+    /// 非同期実行中のメタデータ検索。`execute_search` で spawn、`poll_search` で受信。
+    /// 大フォルダで `read_tweet_info` / `build_searchable_from_path` が UI スレッドを
+    /// ブロックしていた問題 (100ms〜秒単位) を解消する。同期版のインライン処理は廃止。
+    pub(crate) search_pending: Option<SearchPending>,
+    /// 非同期実行中のお気に入り検索 (Ctrl+S)。`execute_favsearch` で spawn、
+    /// `poll_favsearch` で受信 → `start_loading_items` を呼ぶ。
+    pub(crate) favsearch_pending: Option<FavSearchPending>,
+    /// フルスクリーン画像の AI/EXIF/XMP メタデータを非同期読み込み中。
+    /// `open_fullscreen` で spawn、`poll_metadata_load` で受信してキャッシュに投入。
+    /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
+    /// 100ms 級にブロックしていた問題を解消する。
+    pub(crate) metadata_pending: Option<MetadataLoadPending>,
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -961,6 +1304,7 @@ impl Default for App {
             fullscreen_idx: None,
             fs_cache: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
+            fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
             show_favorites_editor: false,
             show_fav_add_dialog: false,
@@ -1027,6 +1371,9 @@ impl Default for App {
             folder_history: std::collections::HashMap::new(),
             show_search_bar: false,
             search_query: String::new(),
+            search_pending: None,
+            favsearch_pending: None,
+            metadata_pending: None,
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -1284,19 +1631,35 @@ impl App {
         }
     }
 
+    /// 通常の (事前スキャンなしの) フォルダロード。`scan_directory` を UI スレッドで
+    /// 同期実行する。初期化 / 履歴復元 / 直接パス指定など、Ctrl+↑↓ 連打以外の
+    /// すべての呼び出しが通る。
     pub fn load_folder(&mut self, path: PathBuf) {
+        self.load_folder_with_scan(path, None);
+    }
+
+    /// 事前スキャン済みディレクトリを受け取れる load_folder の本体。
+    /// Ctrl+↑↓ の DFS スレッドが `scan_directory` を済ませている場合、
+    /// `pre_scan=Some(...)` を渡すことで UI スレッドの read_dir (= 最大 179ms)
+    /// をスキップできる。`path` が ZIP/PDF ファイルのときは仮想フォルダとして
+    /// 別ルートに入るため `pre_scan` は無視される (None 相当で委譲)。
+    pub fn load_folder_with_scan(&mut self, path: PathBuf, pre_scan: Option<ScannedDir>) {
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
         let lf_t0 = std::time::Instant::now();
         let lf_seq = self.input_seq;
         let lf_path_disp = path.display().to_string();
+        let pre_scanned = pre_scan.is_some();
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
                 "load_folder_begin",
                 None,
                 lf_seq,
-                &[("path", serde_json::Value::from(lf_path_disp.clone()))],
+                &[
+                    ("path", serde_json::Value::from(lf_path_disp.clone())),
+                    ("pre_scanned", serde_json::Value::from(pre_scanned)),
+                ],
             );
         }
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
@@ -1349,47 +1712,13 @@ impl App {
         crate::zip_loader::clear_nested_cache();
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
+        // pre_scan が与えられていれば DFS スレッドで既に走査済み (UI 非ブロック)。
+        // 無ければ UI スレッドで scan_directory を呼ぶ (従来挙動)。
         let scan_t0 = std::time::Instant::now();
-        let mut folders: Vec<GridItem> = Vec::new();
-        // フォルダアイテムごとのメタデータ (ZipFile/PdfFile はサムネイルロードに必要)
-        let mut folder_metas: Vec<Option<(i64, i64)>> = Vec::new();
-        // (path, is_video, mtime, file_size)
-        let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    let meta = entry.metadata().ok();
-                    let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-                    folders.push(GridItem::Folder(p));
-                    folder_metas.push(Some((mtime, 0)));
-                } else if is_apple_double(&p) {
-                    // macOS/iPhone AppleDouble メタデータ — スキップ
-                } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    let ext_lower = ext.to_ascii_lowercase();
-                    let meta = entry.metadata().ok();
-                    let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-                    let file_size = meta.map_or(0, |m| m.len() as i64);
-                    if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
-                        all_media.push((p, false, mtime, file_size));
-                    } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
-                        all_media.push((p, true, mtime, file_size));
-                    } else if ext_lower == "zip" {
-                        folders.push(GridItem::ZipFile(p));
-                        folder_metas.push(Some((mtime, file_size)));
-                    } else if ext_lower == "pdf" {
-                        folders.push(GridItem::PdfFile(p));
-                        folder_metas.push(Some((mtime, file_size)));
-                    } else if let Some(fmt) =
-                        crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
-                    {
-                        folders.push(GridItem::ConvertibleArchive { path: p, format: fmt });
-                        folder_metas.push(Some((mtime, file_size)));
-                    }
-                }
-            }
-        }
+        let scan = pre_scan.unwrap_or_else(|| scan_directory(&path));
+        let (mut folders, mut folder_metas): (Vec<GridItem>, Vec<Option<(i64, i64)>>) =
+            scan.folders.into_iter().unzip();
+        let mut all_media = scan.all_media;
 
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
         let scan_folders = folders.len();
@@ -1404,6 +1733,7 @@ impl App {
                     ("ms", serde_json::Value::from(scan_ms)),
                     ("folders", serde_json::Value::from(scan_folders)),
                     ("media", serde_json::Value::from(scan_media)),
+                    ("pre_scanned", serde_json::Value::from(pre_scanned)),
                 ],
             );
         }
@@ -1576,6 +1906,9 @@ impl App {
         self.favsearch.last_executed.clear();
         self.favsearch.nav_stack.clear();
         self.favsearch.results_paths.clear();
+        if let Some(pending) = self.favsearch_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
 
         // 検索モードで保存していた元フォルダがあれば戻す
         if let Some(saved) = self.favsearch.saved_folder.take() {
@@ -1704,27 +2037,69 @@ impl App {
     }
 
     /// 現在のクエリで検索を実行し、結果をグリッドに反映する。
+    /// お気に入り検索 (Ctrl+S) をバックグラウンドスレッドで開始する。
+    /// SQLite FTS クエリは通常数 ms だが、インデックスが大きいと数十〜数百 ms に
+    /// 達し UI を止め得る。結果は `poll_favsearch` で受信する。
     pub(crate) fn execute_favsearch(&mut self) {
         self.favsearch.last_executed = self.favsearch.query.clone();
         let query = self.favsearch.query.trim().to_string();
         self.favsearch.nav_stack.clear();
 
-        // 空クエリ: 空結果を合成パスに載せて検索コンテキストを維持
-        let results = if query.is_empty() {
-            Vec::new()
-        } else {
-            let Some(db) = self.search_index_db.as_ref() else { return };
-            let fav_roots: Vec<PathBuf> =
-                self.settings.favorites.iter().map(|f| f.path.clone()).collect();
-            match db.search(&query, &fav_roots) {
-                Ok(r) => r,
-                Err(e) => {
-                    crate::logger::log(format!("favsearch query failed: {e}"));
-                    return;
-                }
-            }
-        };
+        // 既存 in-flight をキャンセル
+        if let Some(pending) = self.favsearch_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
 
+        // 空クエリ: 空結果で即座に start_loading_items (待ち時間なし)
+        if query.is_empty() {
+            self.apply_favsearch_results(Vec::new());
+            return;
+        }
+
+        let Some(db) = self.search_index_db.clone() else { return };
+        let fav_roots: Vec<PathBuf> =
+            self.settings.favorites.iter().map(|f| f.path.clone()).collect();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let query_clone = query.clone();
+
+        std::thread::Builder::new()
+            .name("favsearch-db".to_string())
+            .spawn(move || {
+                if cancel_w.load(Ordering::Relaxed) { return; }
+                let result = db.search(&query_clone, &fav_roots);
+                // キャンセル後の送信は無意味なので捨てる (UI 側 pending も None に戻っている)
+                if cancel_w.load(Ordering::Relaxed) { return; }
+                let _ = tx.send(result);
+            })
+            .ok();
+
+        self.favsearch_pending = Some(FavSearchPending { cancel, rx, query });
+    }
+
+    /// お気に入り検索の結果をポーリングする。
+    pub(crate) fn poll_favsearch(&mut self) {
+        let Some(pending) = self.favsearch_pending.as_ref() else { return };
+        match pending.rx.try_recv() {
+            Ok(Ok(results)) => {
+                self.favsearch_pending = None;
+                self.apply_favsearch_results(results);
+            }
+            Ok(Err(e)) => {
+                crate::logger::log(format!("favsearch query failed: {e}"));
+                self.favsearch_pending = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.favsearch_pending = None;
+            }
+        }
+    }
+
+    /// SQLite 検索結果を `start_loading_items` に流し込む共通処理。
+    fn apply_favsearch_results(&mut self, results: Vec<crate::search_index_db::IndexEntry>) {
         let items: Vec<GridItem> = results
             .iter()
             .map(|e| match e.kind {
@@ -2084,6 +2459,15 @@ impl App {
         self.spread_popup_open = false;
         self.search_filter = None;
         self.search_query.clear();
+        // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
+        // 検索結果インデックスが意味を失う)
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        // メタデータ読み込みも idx ベースなのでフォルダ切替時にキャンセル
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
 
         // 画像補正: ページ個別パラメータを DB から復元
         self.adjustment_cache.clear();
@@ -3836,7 +4220,7 @@ impl App {
                     ],
                 );
             }
-            let result = if forward {
+            let outcome = if forward {
                 navigate_folder_with_skip(
                     &current, next_folder_dfs, skip_limit, Some(&cancel_w),
                 )
@@ -3845,13 +4229,46 @@ impl App {
                     &current, prev_folder_dfs, skip_limit, Some(&cancel_w),
                 )
             };
+            let dfs_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            // 事前スキャン (対策 B): ヒットしたのが通常ディレクトリなら、
+            // この DFS スレッドで `read_dir` + メタデータ取得まで済ませる。
+            // UI スレッドの lf_scan (実測 p95=61ms, max=179ms) を除去できる。
+            // ZIP/PDF ファイルは専用ローダーが別経路で処理するのでここではスキャンしない。
+            let scanned = if cancel_w.load(Ordering::Relaxed) {
+                None
+            } else if let Some(o) = outcome.as_ref() {
+                if o.path.is_dir() {
+                    let scan_t0 = std::time::Instant::now();
+                    let s = scan_directory(&o.path);
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "nav",
+                            "dfs_scan",
+                            None,
+                            perf_seq,
+                            &[
+                                ("ms", serde_json::Value::from(scan_t0.elapsed().as_secs_f64() * 1000.0)),
+                                ("folders", serde_json::Value::from(s.folders.len())),
+                                ("media", serde_json::Value::from(s.all_media.len())),
+                            ],
+                        );
+                    }
+                    Some(s)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let cancelled = cancel_w.load(Ordering::Relaxed);
             if crate::perf::is_enabled() {
-                let hit = result
+                let hit = outcome
                     .as_ref()
                     .map(|o| o.path.display().to_string())
                     .unwrap_or_else(|| "-".to_string());
-                let hit_image_folder = result
+                let hit_image_folder = outcome
                     .as_ref()
                     .map(|o| o.hit_image_folder)
                     .unwrap_or(false);
@@ -3861,18 +4278,20 @@ impl App {
                     None,
                     perf_seq,
                     &[
-                        ("ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
+                        ("ms", serde_json::Value::from(dfs_ms)),
+                        ("total_ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
                         ("forward", serde_json::Value::from(forward)),
                         ("mode", serde_json::Value::from(perf_mode)),
                         ("cancelled", serde_json::Value::from(cancelled)),
-                        ("found", serde_json::Value::from(result.is_some())),
+                        ("found", serde_json::Value::from(outcome.is_some())),
                         ("hit_image_folder", serde_json::Value::from(hit_image_folder)),
                         ("hit_path", serde_json::Value::from(hit)),
+                        ("pre_scanned", serde_json::Value::from(scanned.is_some())),
                     ],
                 );
             }
             if !cancelled {
-                let _ = tx.send(result);
+                let _ = tx.send(FolderNavThreadResult { outcome, scanned });
             }
         });
 
@@ -3913,9 +4332,9 @@ impl App {
     fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
         let pending = self.folder_nav_pending.as_ref()?;
         match pending.rx.try_recv() {
-            Ok(outcome) => {
+            Ok(thread_result) => {
                 let pending = self.folder_nav_pending.take().unwrap();
-                let (path, hit_image_folder) = match outcome {
+                let (path, hit_image_folder) = match thread_result.outcome {
                     Some(o) => (Some(o.path), o.hit_image_folder),
                     None => (None, false),
                 };
@@ -3924,6 +4343,7 @@ impl App {
                     hit_image_folder,
                     forward: pending.forward,
                     mode: pending.mode,
+                    scanned: thread_result.scanned,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -3934,6 +4354,7 @@ impl App {
                     hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
+                    scanned: None,
                 })
             }
         }
@@ -4016,9 +4437,11 @@ impl App {
             emit_end(apply_t0, apply_seq, &apply_mode_str, "fs_boundary");
             return;
         }
+        // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける (対策 B)
+        let scanned = result.scanned;
         match result.mode {
             FolderNavMode::Grid => {
-                self.load_folder(path);
+                self.load_folder_with_scan(path, scanned);
             }
             FolderNavMode::Fullscreen => {
                 // fs_cache / ai_upscale_cache は item index がキーで、
@@ -4026,7 +4449,7 @@ impl App {
                 // 誤って引く危険がある。close_fullscreen で一括破棄してから
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                 self.close_fullscreen();
-                self.load_folder(path);
+                self.load_folder_with_scan(path, scanned);
                 // PDF は enumerate_pages_async が非同期なので、load_folder 直後は items が空。
                 // 結果は poll_pdf_enumerate が受信するので、そこで fullscreen を開き直す。
                 // find_fullscreen_nav_target も内部で load_folder を呼んで PDF に自動進入する
@@ -4060,7 +4483,7 @@ impl App {
                 if crate::search_index_db::is_under(&path, &root) {
                     // サブツリー内 — 通常の DFS 移動としてスタックに push
                     self.favsearch.nav_stack.push(path.clone());
-                    self.load_folder(path);
+                    self.load_folder_with_scan(path, scanned);
                     self.update_favsearch_address();
                 } else {
                     // サブツリー外へ出ようとしている → 検索結果の前後へ移動
@@ -4386,8 +4809,10 @@ impl App {
             _ => {}
         }
 
-        // AI メタデータ読み込み (PNG ヘッダのみ読むので高速・同期)
-        self.ensure_metadata_loaded(idx);
+        // AI / EXIF / XMP メタデータ読み込みは **バックグラウンドスレッド** で実行する。
+        // XMP は JPEG/PNG 全体を読むため UI スレッドで同期実行すると 20MP 画像で
+        // 100ms 級にブロックしていた (対策 E)。メタデータパネルは値到着まで空表示。
+        self.start_metadata_load(idx);
     }
 
     /// メタデータ / EXIF / XMP キャッシュ用の正規化キーを返す。
@@ -4412,63 +4837,68 @@ impl App {
         Some(key)
     }
 
-    /// 指定 idx の AI メタデータと EXIF がキャッシュに無ければ読み込む。
-    fn ensure_metadata_loaded(&mut self, idx: usize) {
-        let key = match self.metadata_cache_key(idx) {
-            Some(k) => k,
+    /// 指定 idx の AI/EXIF/XMP メタデータ読み込みをバックグラウンドで開始する。
+    /// 全キャッシュが既にヒットしていれば spawn しない (no-op)。
+    /// 既存 pending があれば cancel して置き換える (連打時は最新だけ処理)。
+    ///
+    /// UI 側 (`ui_metadata_panel`) はキャッシュヒット時のみ内容を表示するので、
+    /// 結果到着まではパネルは空表示のまま (None 扱い) になる。
+    fn start_metadata_load(&mut self, idx: usize) {
+        let Some(key) = self.metadata_cache_key(idx) else { return };
+
+        // 全キャッシュが既に揃っているなら何もしない
+        let ai_hit = self.metadata_cache.contains_key(&key);
+        let exif_hit = self.exif_cache.contains_key(&key);
+        let xmp_hit = self.xmp_cache.contains_key(&key);
+        if ai_hit && exif_hit && xmp_hit {
+            return;
+        }
+
+        // 既存の in-flight を cancel (新 idx なら旧結果は不要)
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+
+        // スレッドに渡すため item を snapshot (clone)
+        let item = match self.items.get(idx) {
+            Some(g) => g.clone(),
             None => return,
         };
+        let hidden: Vec<String> = self.settings.exif_hidden_tags.clone();
+        let key_owned = key.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
 
-        // AI メタデータ (PNG のみ)
-        if !self.metadata_cache.contains_key(&key) {
-            let meta = match self.items.get(idx) {
-                Some(GridItem::Image(p)) => crate::png_metadata::extract_metadata(p),
-                Some(GridItem::ZipImage { zip_path, entry_name }) => {
-                    if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
-                        crate::png_metadata::extract_metadata_from_bytes(&bytes)
-                    } else {
-                        None
-                    }
+        std::thread::Builder::new()
+            .name(format!("metadata-load-{idx}"))
+            .spawn(move || {
+                let result = run_metadata_load(key_owned, item, &hidden, &cancel_w);
+                if cancel_w.load(Ordering::Relaxed) { return; }
+                if let Some(r) = result {
+                    let _ = tx.send(r);
                 }
-                _ => None,
-            };
-            self.metadata_cache.insert(key.clone(), meta);
-        }
+            })
+            .ok();
 
-        // EXIF (JPEG, PNG, TIFF 等)
-        if !self.exif_cache.contains_key(&key) {
-            let hidden = &self.settings.exif_hidden_tags;
-            let exif = match self.items.get(idx) {
-                Some(GridItem::Image(p)) => crate::exif_reader::read_exif(p, hidden),
-                Some(GridItem::ZipImage { zip_path, entry_name }) => {
-                    if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
-                        crate::exif_reader::read_exif_from_bytes(&bytes, hidden)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            self.exif_cache.insert(key.clone(), exif);
-        }
+        self.metadata_pending = Some(MetadataLoadPending { idx, cancel, rx });
+    }
 
-        // XMP (mXD の X/Twitter メタデータ)。mXD は MP4/MOV にも XMP を埋めるので
-        // Video item でも読む。
-        if !self.xmp_cache.contains_key(&key) {
-            let xmp = match self.items.get(idx) {
-                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => {
-                    crate::xmp_reader::read_tweet_info(p)
-                }
-                Some(GridItem::ZipImage { zip_path, entry_name }) => {
-                    if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
-                        crate::xmp_reader::read_tweet_info_from_bytes(&bytes)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            self.xmp_cache.insert(key, xmp);
+    /// メタデータ読み込み結果を非同期に受信してキャッシュに投入する。
+    /// 毎フレーム呼ばれる。ヒット時はパネルが自動的に内容を表示する。
+    pub(crate) fn poll_metadata_load(&mut self) {
+        let Some(pending) = self.metadata_pending.as_ref() else { return };
+        match pending.rx.try_recv() {
+            Ok(r) => {
+                self.metadata_cache.insert(r.key.clone(), r.metadata);
+                self.exif_cache.insert(r.key.clone(), r.exif);
+                self.xmp_cache.insert(r.key, r.xmp);
+                self.metadata_pending = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.metadata_pending = None;
+            }
         }
     }
 
@@ -4637,9 +5067,19 @@ impl App {
     /// メタデータキーワード検索を実行する。
     /// フォルダ内の全 PNG 画像の tEXt チャンクを読み、
     /// キーワード（大文字小文字無視）にマッチするアイテムのみをフィルタ表示する。
+    /// メタデータ検索 (Ctrl+F) をバックグラウンドスレッドで開始する。
+    ///
+    /// 旧実装は UI スレッドで `read_tweet_info` / `build_searchable_from_path` を
+    /// 同期実行しており、大フォルダで数秒フリーズしていた。このメソッドでは
+    /// スレッドを spawn し、結果は `poll_search` で受け取る。連打/新クエリで
+    /// 既存検索をキャンセルできるよう `SearchPending.cancel` を立てる。
     pub(crate) fn execute_search(&mut self) {
+        // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+
         // クエリ構文: space = AND / `-word` = NOT / `"..."` = フレーズ (`-"..."` も可)。
-        // AI メタデータ検出時は Negative prompt を検索対象から除外する。
         let tokens = crate::search_query::parse(&self.search_query);
         if tokens.is_empty() {
             self.search_filter = None;
@@ -4647,141 +5087,63 @@ impl App {
             return;
         }
 
-        let mut matches = std::collections::HashSet::new();
+        // スレッドに渡すスナップショット: items は中身 PathBuf を含むので clone コストは
+        // あるが、検索は低頻度操作なので許容範囲。xmp_cache は既読分のルックアップ
+        // 専用で、スレッドは自分が読み取った分は `xmp_additions` で UI に返す。
+        let items_snapshot = self.items.clone();
+        let xmp_snapshot = self.xmp_cache.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let seq = self.bump_input_seq("search", Some(&self.search_query.clone()));
 
-        // Image/Video は XMP を lazy に読む。**全件事前ロードすると大フォルダで
-        // UI スレッドが数百ms〜数秒ブロックする** (JPEG/PNG はファイル全体、
-        // MP4/MOV は先頭 512KB)。先にファイル名 + PNG メタ (cheap) で
-        // `decide_partial` し、XMP を読まないと結果が決まらない時だけ読み出す。
-        // 典型例「ファイル名に 'cat' を含む」なら XMP ゼロ回読み出しで済む。
-        //
-        // NOTE: 事前に Image/Video の path を収集してから処理するのは、
-        // ループ内で `self.xmp_cache.insert(...)` による可変借用が
-        // `&self.items` の不変借用と衝突しないようにするため。
-        #[derive(Clone, Copy)]
-        enum MediaKind { Image, Video }
-        let media: Vec<(usize, PathBuf, MediaKind)> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| match item {
-                GridItem::Image(p) => Some((idx, p.clone(), MediaKind::Image)),
-                GridItem::Video(p) => Some((idx, p.clone(), MediaKind::Video)),
-                _ => None,
+        std::thread::Builder::new()
+            .name("metadata-search".to_string())
+            .spawn(move || {
+                let result = run_metadata_search(&tokens, &items_snapshot, &xmp_snapshot, &cancel_w);
+                let _ = tx.send(result);
             })
-            .collect();
+            .ok();
 
-        // ZIP 内 PNG は ZIP ごとにまとめてから処理する (open を 1 回にするため)。
-        let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
-            std::collections::HashMap::new();
+        self.search_pending = Some(SearchPending { cancel, rx, seq });
+    }
 
-        // 構造アイテム + ZIP/PDF 系は `self.items` を借用するだけなので先に処理。
-        for (idx, item) in self.items.iter().enumerate() {
-            match item {
-                // ナビゲーション用の構造アイテムは常に表示
-                GridItem::Folder(_)
-                | GridItem::ZipFile(_)
-                | GridItem::PdfFile(_)
-                | GridItem::ConvertibleArchive { .. }
-                | GridItem::ZipSeparator { .. } => {
-                    matches.insert(idx);
+    /// in-flight 検索があればキャンセルする (検索バーを閉じる等の経路で呼ぶ)。
+    pub(crate) fn cancel_search_pending(&mut self) {
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// in-flight 検索の結果を非同期に受信する。
+    /// フォルダ切替 / 検索バー閉じ / 新検索で旧スレッドはキャンセルされるため、
+    /// 受信時は「まだ同じ検索コンテキストか」の追加チェックは不要 (cancel されれば
+    /// スレッドは結果を送らない)。
+    ///
+    /// 検索 in-flight 中は毎フレーム repaint を要求する必要がある (egui はアイドルで
+    /// 寝るため、ワーカーが送信しても UI が拾いに来ない)。呼び出し元の update() が
+    /// ctx.request_repaint() を最後に呼ぶのでそちらに任せる (個別 ctx 保持不要)。
+    pub(crate) fn poll_search(&mut self) {
+        let Some(pending) = self.search_pending.as_ref() else { return };
+        match pending.rx.try_recv() {
+            Ok(SearchThreadResult::Done { matches, xmp_additions }) => {
+                // ワーカーが新規に読み取った XMP をキャッシュにマージする。
+                // 既存キーは上書きしない (並行して別スレッドが先に書き込んだケースを尊重)。
+                for (key, xmp) in xmp_additions {
+                    self.xmp_cache.entry(key).or_insert(xmp);
                 }
-                GridItem::Image(_) | GridItem::Video(_) => {
-                    // 下の lazy ループで処理する
-                }
-                GridItem::ZipImage { zip_path, entry_name } => {
-                    if is_png_entry(entry_name) {
-                        zip_png_groups
-                            .entry(zip_path.clone())
-                            .or_default()
-                            .push((idx, entry_name.clone()));
-                    } else {
-                        let name = crate::zip_loader::entry_basename(entry_name);
-                        if crate::search_query::matches(&tokens, name) {
-                            matches.insert(idx);
-                        }
-                    }
-                }
-                GridItem::PdfPage { .. } => {
-                    if crate::search_query::matches(&tokens, &item.name()) {
-                        matches.insert(idx);
-                    }
-                }
+                self.search_filter = Some(matches);
+                self.rebuild_visible_indices();
+                self.selected = None;
+                self.scroll_offset_y = 0.0;
+                self.search_pending = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // キャンセル済みで送信されなかった or スレッドパニック。
+                self.search_pending = None;
             }
         }
-
-        // Image/Video: cheap な判定で決着しないものだけ XMP を読む。
-        for (idx, path, kind) in &media {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            let meta_text = if matches!(kind, MediaKind::Image) && is_png_path(path) {
-                crate::png_metadata::build_searchable_from_path(path)
-            } else {
-                String::new()
-            };
-            // XMP 無しで判定できるか試す
-            let hay_without_xmp = hay_of(&meta_text, &name, None);
-            match crate::search_query::decide_partial(&tokens, &hay_without_xmp) {
-                crate::search_query::PartialResult::Decided(true) => {
-                    matches.insert(*idx);
-                }
-                crate::search_query::PartialResult::Decided(false) => {
-                    // 不一致確定 — XMP を読む必要なし
-                }
-                crate::search_query::PartialResult::NeedsMore => {
-                    // XMP で補う必要がある。キャッシュになければ今読んでキャッシュに保存。
-                    let key = crate::adjustment_db::normalize_path(path);
-                    if !self.xmp_cache.contains_key(&key) {
-                        let xmp = crate::xmp_reader::read_tweet_info(path);
-                        self.xmp_cache.insert(key.clone(), xmp);
-                    }
-                    let xmp_opt = self
-                        .xmp_cache
-                        .get(&key)
-                        .and_then(|o| o.as_ref());
-                    let hay = hay_of(&meta_text, &name, xmp_opt);
-                    if crate::search_query::matches(&tokens, &hay) {
-                        matches.insert(*idx);
-                    }
-                }
-            }
-        }
-
-        // 外側 ZIP は open_archive で 1 回開いて再利用するが、ネスト ZIP 内の
-        // エントリは `entry_name` に ".zip/" 境界を含むため read_entry_bytes 経由で
-        // ネストキャッシュを使って取り出す。
-        for (zip_path, entries) in zip_png_groups {
-            let mut direct_archive = crate::zip_loader::open_archive(&zip_path).ok();
-            for (idx, entry_name) in entries {
-                let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
-                let bytes_result = if is_nested {
-                    crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                } else if let Some(archive) = direct_archive.as_mut() {
-                    crate::zip_loader::read_entry_from_archive(archive, &entry_name)
-                } else {
-                    crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                };
-                let (meta_text, xmp) = match bytes_result {
-                    Ok(bytes) => (
-                        crate::png_metadata::build_searchable_from_bytes(&bytes),
-                        crate::xmp_reader::read_tweet_info_from_bytes(&bytes),
-                    ),
-                    Err(_) => (String::new(), None),
-                };
-                let name = crate::zip_loader::entry_basename(&entry_name);
-                if crate::search_query::matches(&tokens, &hay_of(&meta_text, name, xmp.as_ref())) {
-                    matches.insert(idx);
-                }
-            }
-        }
-
-        self.search_filter = Some(matches);
-        self.rebuild_visible_indices();
-        self.selected = None;
-        self.scroll_offset_y = 0.0;
     }
 
     /// 指定 idx の回転角度を取得する（キャッシュ + DB）。
@@ -5508,6 +5870,9 @@ impl App {
         self.fs_pending.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
+        // backlog はフォルダ外の画像 ColorImage を保持しているため、閉じたら破棄する。
+        // 保持していると次フォルダで同 idx に違う画像が割当たって表示が化ける。
+        self.fs_upload_backlog.clear();
         // AI キャッシュもクリア
         for (cancel, _) in self.ai_upscale_pending.values() {
             cancel.store(true, Ordering::Relaxed);
@@ -5515,6 +5880,10 @@ impl App {
         self.ai_upscale_pending.clear();
         self.ai_upscale_cache.clear();
         self.ai_classify_cache.clear();
+        // フルスクリーン向けメタデータ読み込みもキャンセル (閉じた後のキャッシュ書き込みを防ぐ)
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -6646,6 +7015,11 @@ impl App {
     }
 
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
+    ///
+    /// **GPU アップロード ペーシング (対策 A)**: デコード完了した `FsLoadResult` は
+    /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
+    /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
+    /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
     pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
         // PDF ページの content_type を更新 (render 完了時にワーカーから受信)
         while let Ok((idx, ct)) = self.pdf_content_type_rx.try_recv() {
@@ -6688,9 +7062,62 @@ impl App {
             self.fs_pending.remove(&key);
             self.fs_early_dims.remove(&key);
         }
-        let repaint = !completed.is_empty() || early_dims_repaint;
+        // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
+        // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
+        for (key, _, _) in &completed {
+            self.fs_pending.remove(key);
+            self.fs_early_dims.remove(key);
+        }
+        // 既存 backlog の重複エントリ (同 idx で再ロードされたケース) は新しい方で置換。
         for (key, result, load_seq) in completed {
-            self.fs_pending.remove(&key);
+            if let Some(pos) = self.fs_upload_backlog.iter().position(|(k, _, _)| *k == key) {
+                self.fs_upload_backlog[pos] = (key, result, load_seq);
+            } else {
+                self.fs_upload_backlog.push((key, result, load_seq));
+            }
+        }
+
+        // ── ペーシング: このフレームで何枚アップロードするか決める ──
+        // 1. 現在フルスクリーン表示中の idx が backlog にあれば即時アップロード
+        //    (表示遅延をなくすため。ユーザーが今見る画像は待たせない)
+        // 2. それ以外の backlog は 1 フレーム 1 枚まで
+        let pick_indices: Vec<usize> = {
+            let mut picks: Vec<usize> = Vec::new();
+            // 現在ページ優先
+            if let Some(cur) = self.fullscreen_idx
+                && let Some(pos) = self.fs_upload_backlog.iter().position(|(k, _, _)| *k == cur)
+            {
+                picks.push(pos);
+            }
+            // 次に backlog の先頭から 1 枚 (現在ページを既に含まない)
+            if picks.len() < 2 {
+                for (pos, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
+                    if picks.contains(&pos) {
+                        continue;
+                    }
+                    if self.fullscreen_idx == Some(*k) {
+                        continue; // 現在ページは上で拾った
+                    }
+                    picks.push(pos);
+                    break;
+                }
+            }
+            picks
+        };
+
+        // 取り出す位置を降順でソートしてから swap_remove (位置ずれ回避)
+        let mut pick_sorted = pick_indices.clone();
+        pick_sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let mut to_process: Vec<(usize, FsLoadResult, u64)> = Vec::with_capacity(pick_sorted.len());
+        for pos in pick_sorted {
+            to_process.push(self.fs_upload_backlog.swap_remove(pos));
+        }
+        // 取り出し時に降順で積んだので元の先頭→末尾順に戻す
+        to_process.reverse();
+
+        let has_more_backlog = !self.fs_upload_backlog.is_empty();
+        let repaint = !to_process.is_empty() || early_dims_repaint || has_more_backlog;
+        for (key, result, load_seq) in to_process {
             // 本体メッセージで fs_cache が埋まるので先行ヒントはもう不要。
             // (ホバーバーは fs_cache.source_dims を優先して見るため、残っていても
             // 実害はないが HashMap が膨張しないようクリーンアップする)
@@ -7330,6 +7757,16 @@ impl eframe::App for App {
 
         self.poll_prefetch(ctx);
         self.poll_ai_upscale(ctx);
+        self.poll_search();
+        self.poll_favsearch();
+        self.poll_metadata_load();
+        // 非同期 pending が走っている間は次フレームも poll させる (egui アイドル寝防止)
+        if self.search_pending.is_some()
+            || self.favsearch_pending.is_some()
+            || self.metadata_pending.is_some()
+        {
+            ctx.request_repaint();
+        }
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {

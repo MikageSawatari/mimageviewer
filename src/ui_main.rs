@@ -592,6 +592,7 @@ impl App {
                     self.search_query.clear();
                     self.search_filter = None;
                     self.search_has_focus = false;
+                    self.cancel_search_pending();
                     self.rebuild_visible_indices();
                 }
 
@@ -601,11 +602,18 @@ impl App {
                     self.search_query.clear();
                     self.search_filter = None;
                     self.search_has_focus = false;
+                    self.cancel_search_pending();
                     self.rebuild_visible_indices();
                 }
 
-                // マッチ件数を同じ行に表示
-                if let Some(ref filter) = self.search_filter {
+                // 検索中インジケータ or マッチ件数 (同じ行に表示)
+                if self.search_pending.is_some() {
+                    ui.label(
+                        egui::RichText::new("検索中...")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                    );
+                } else if let Some(ref filter) = self.search_filter {
                     let image_count = filter
                         .iter()
                         .filter(|&&i| {
@@ -673,7 +681,14 @@ impl App {
                     close_requested = true;
                 }
 
-                if self.favsearch.on_results_grid() {
+                if self.favsearch_pending.is_some() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("検索中...")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                    );
+                } else if self.favsearch.on_results_grid() {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(format!(
