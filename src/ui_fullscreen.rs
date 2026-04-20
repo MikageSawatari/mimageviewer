@@ -1627,10 +1627,12 @@ impl App {
                 self.fs_focus_regained_at = None;
             }
         }
-        if self.fs_suppress_primary_until_release && primary_released {
-            self.fs_suppress_primary_until_release = false;
-        }
-        if self.fs_suppress_primary_until_release {
+        // フレーム冒頭の状態をスナップ。release フレームでは primary_released と
+        // fs_response.clicked() が同一フレームで立つので、フラグのクリアを先に
+        // 行うと抑制対象のクリックがそのままナビを走らせてしまう。判定は
+        // スナップショットで行い、クリアは左クリック分岐が終わった後に回す。
+        let suppress_this_frame = self.fs_suppress_primary_until_release;
+        if suppress_this_frame {
             // フォーカス復帰クリック: 左ボタン経由の分岐をすべてスキップ。
             // 右クリック処理 (下の secondary ブロック) は別系統なので走らせる
         } else if self.erase_mode {
@@ -1728,6 +1730,11 @@ impl App {
                     }
                 }
             }
+        }
+        // 抑制対象クリックの release フレームでここに来るので、左クリック分岐の
+        // スキップが終わったこのタイミングでフラグを落とす。
+        if suppress_this_frame && primary_released {
+            self.fs_suppress_primary_until_release = false;
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
         // コンテキストメニュー表示中は右クリック処理をスキップ
