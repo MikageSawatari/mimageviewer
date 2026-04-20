@@ -78,14 +78,31 @@ fn extension_might_have_xmp(path: &Path) -> bool {
 /// パスから読み取って [`XmpTweetInfo`] を返す。
 /// XMP パケットが無い / `xtw:*` プロパティが無い場合は None。
 ///
-/// 数百 MB の動画や巨大 TIFF を全読みすると `ensure_metadata_loaded` (UI 同期)
-/// が固まるので、先頭 [`FALLBACK_SCAN_LIMIT`] バイトだけ読む。mXD / ExifTool が
-/// 書く XMP は JPEG APP1 / PNG iTXt / MP4 uuid いずれもコンテナ先頭部に置かれる
-/// 仕様で、512KB あれば実用上十分。
+/// **フォーマット別の読み込み戦略**:
+/// - JPEG / PNG (通常 ≤50MB): ファイル全体を読む。専用パーサーが
+///   APP1 / iTXt をコンテナ末尾まで走査するので、optipng や jpegtran 等で
+///   XMP セグメントが先頭から離れた位置に置かれていても拾える。
+/// - MP4 / MOV / M4V / TIFF (数百MB ありうる): 先頭 [`FALLBACK_SCAN_LIMIT`]
+///   バイトだけ読む。mXD / ExifTool が書く XMP は uuid アトム / IFD0 の
+///   先頭付近に置かれるので 512KB あれば実用上十分。これにより UI 同期スレッド
+///   での丸読みハングを防ぐ。
 pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
     if !extension_might_have_xmp(path) {
         return None;
     }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let small_image = matches!(
+        ext.as_deref(),
+        Some("jpg" | "jpeg" | "jfif" | "png")
+    );
+    if small_image {
+        let bytes = std::fs::read(path).ok()?;
+        return read_tweet_info_from_bytes(&bytes);
+    }
+    // 大容量コンテナ系: 先頭 FALLBACK_SCAN_LIMIT のみ
     use std::io::Read;
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
@@ -593,5 +610,64 @@ mod tests {
         assert!(!has_xmp_capable_magic(b"GIF89a...")); // GIF は XMP 抽出器が無いので除外
         assert!(!has_xmp_capable_magic(b"BM")); // BMP
         assert!(!has_xmp_capable_magic(&[]));
+    }
+
+    /// `<x:xmpmeta>...</x:xmpmeta>` を含む有効な APP1 ペイロードを 1 つ持つ
+    /// 最小 JPEG をでっち上げる。`junk_app1_size` バイトのダミー APP1 を
+    /// XMP の **前に** 挟むことで、ファイル先頭からの距離を増やせる。
+    fn build_jpeg_with_xmp_at_offset(junk_app1_size: usize) -> Vec<u8> {
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let xmp_payload: Vec<u8> = xmp_id
+            .iter()
+            .chain(SAMPLE_XMP_STR.as_bytes())
+            .copied()
+            .collect();
+
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+
+        // ダミー APP1 (Exif 風) を 64KB 単位で繰り返し挿入。APP* は length が 16bit (max 65535)。
+        let mut remaining = junk_app1_size;
+        while remaining > 0 {
+            let chunk = remaining.min(65533);
+            out.extend_from_slice(&[0xFF, 0xE1]); // APP1
+            let seg_len = (chunk + 2) as u16;
+            out.extend_from_slice(&seg_len.to_be_bytes());
+            // length 値は length 自体の 2 バイト含む。中身は適当な 0 埋め
+            out.extend(std::iter::repeat_n(0u8, chunk));
+            remaining -= chunk;
+        }
+
+        // 本物の XMP APP1
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        let seg_len = (xmp_payload.len() + 2) as u16;
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&xmp_payload);
+
+        // SOS + EOI (画像本体は無くても extract_xmp_from_jpeg は SOS で打ち切るのでここまでで十分)
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
+        out
+    }
+
+    /// XMP が先頭から 512KB 超の位置にあっても、JPEG は全読みするので拾える。
+    #[test]
+    fn jpeg_with_xmp_past_512kb_is_found() {
+        // FALLBACK_SCAN_LIMIT = 512KB。それを超える junk を XMP の前に置く。
+        let bytes = build_jpeg_with_xmp_at_offset(700 * 1024);
+        assert!(bytes.len() > FALLBACK_SCAN_LIMIT);
+        let info = read_tweet_info_from_bytes(&bytes).expect("XMP should be parsed");
+        assert_eq!(info.tweet_id.as_deref(), Some("2044629346967773284"));
+    }
+
+    /// `read_tweet_info(path)` のファイルベース経路でも、JPEG は全読みパスを
+    /// 通るので 512KB 超の位置にある XMP を拾えること (Codex Finding 2 のリグレッション)。
+    #[test]
+    fn read_tweet_info_path_reads_full_jpeg() {
+        let bytes = build_jpeg_with_xmp_at_offset(700 * 1024);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.jpg");
+        std::fs::write(&path, &bytes).expect("write tempfile");
+        let info = read_tweet_info(&path).expect("XMP should be parsed via path");
+        assert_eq!(info.tweet_id.as_deref(), Some("2044629346967773284"));
     }
 }
