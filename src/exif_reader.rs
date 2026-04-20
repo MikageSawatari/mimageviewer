@@ -37,15 +37,13 @@ fn build_exif_info(entries: &[rexif::ExifEntry], hidden_tags: &[String]) -> Opti
     let mut other_fields = Vec::new();
 
     for e in entries {
-        let tag_id = e.ifd.tag;
-
         // 構造タグ (IFD へのオフセット / バイナリ blob) は常に抑止。
         // ユーザーにとって意味がなく、設定での hide 操作の対象にもしない。
-        if is_structural_tag(tag_id) {
+        if is_structural(e) {
             continue;
         }
 
-        let tag_name = tag_name_from_id(tag_id);
+        let tag_name = canonical_tag_name(e);
 
         // 非表示タグはスキップ
         if hidden_tags.iter().any(|h| h == &tag_name) {
@@ -78,28 +76,36 @@ fn build_exif_info(entries: &[rexif::ExifEntry], hidden_tags: &[String]) -> Opti
             value.to_string()
         };
 
-        // タグ固有の整形
-        display = format_value(tag_id, &display);
+        // タグ固有の整形 (バージョン文字列など)
+        display = format_value(e.ifd.tag, &display);
 
         let entry = (tag_name.clone(), display);
 
-        match tag_id {
+        // GPS IFD は IFD 種別で確実に判定する (タグ ID は他 IFD と衝突するため)。
+        // それ以外はタグ ID で大カテゴリに振り分け。
+        if e.kind == rexif::IfdKind::Gps {
+            gps_fields.push(entry);
+            continue;
+        }
+        match e.ifd.tag {
             // カメラ情報
-            271 | 272 | 42036 | 42035 | 42033 | 42037 | 305 => {
+            271 | 272 | 305 | 42032 | 42033 | 42035 | 42036 | 42037 => {
                 camera_fields.push(entry);
             }
             // 撮影設定
-            33434 | 33437 | 34855 | 34850 | 37380 | 37383 | 37385 | 37386
-            | 41989 | 34864 | 37377 | 37378 | 37381 | 34858 => {
+            33434 | 33437 | 34850 | 34855 | 34858 | 34864
+            | 37377 | 37378 | 37380 | 37381 | 37383 | 37385 | 37386
+            | 37888 | 37889 | 37890 | 37891 | 37892 | 37893
+            | 41486 | 41487 | 41488 | 41986 | 41987 | 41988 | 41989
+            | 41990 | 41991 | 41992 | 41993 | 41994 | 41996
+            | 42034 => {
                 shooting_fields.push(entry);
             }
             // 画像情報
-            306 | 36867 | 36868 | 274 | 40961 | 256 | 257 | 40962 | 40963 => {
+            256 | 257 | 274 | 306 | 36867 | 36868 | 36880 | 36881 | 36882
+            | 37520 | 37521 | 37522
+            | 40961 | 40962 | 40963 => {
                 image_fields.push(entry);
-            }
-            // GPS (tag IDs 0-31 in GPS IFD, but rexif uses different numbering)
-            _ if tag_name.starts_with("GPS") => {
-                gps_fields.push(entry);
             }
             _ => {
                 other_fields.push(entry);
@@ -153,162 +159,220 @@ fn format_value(tag_id: u16, raw: &str) -> String {
 /// 構造的な「IFD オフセット / 内部バイナリ」タグかどうか。
 ///
 /// これらはファイル形式のプラミングで、ユーザー表示上の意味が無い。
-/// 値の型や長さで判別できないものもあるので、タグ ID で明示的に抑止する。
-fn is_structural_tag(tag_id: u16) -> bool {
-    matches!(
-        tag_id,
-        // 34665 ExifOffset: ExifIFD へのポインタ
-        // 34853 GPSInfo: GPS IFD へのポインタ (GPS* タグ自体は別途展開される)
-        // 40965 InteropIFDPointer: 相互運用性 IFD へのポインタ
-        // 37500 MakerNote: メーカー固有バイナリ (rexif は Blob として出す)
-        34665 | 34853 | 40965 | 37500
-    )
+/// rexif の typed enum で拾えるものは enum で、拾えないもの (InteropIFDPointer)
+/// は raw ID で抑止する。
+fn is_structural(e: &rexif::ExifEntry) -> bool {
+    use rexif::ExifTag;
+    if matches!(
+        e.tag,
+        ExifTag::ExifOffset | ExifTag::GPSOffset | ExifTag::MakerNote
+    ) {
+        return true;
+    }
+    matches!(e.ifd.tag, 40965 /* InteropIFDPointer */)
 }
 
-/// EXIF タグ ID からタグ名を返す。
-/// `rexif` の `ExifTag` を参照し、既知タグには読みやすい名前を使う。
-fn tag_name_from_id(tag_id: u16) -> String {
-    match tag_id {
+/// EXIF エントリの canonical タグ名を返す。
+///
+/// rexif の `ExifTag` enum (~70タグ網羅) に該当すれば typed match で名前を返し、
+/// そうでなければ IFD 種別 + raw ID から補助テーブルで解決する。
+/// canonical 名は本プロジェクトの命名 (空白なしの PascalCase) で固定し、
+/// `default_exif_hidden_tags` の hide フィルタおよび `tag_display_name` の
+/// 日本語マッピングと突き合わせる前提。
+fn canonical_tag_name(e: &rexif::ExifEntry) -> String {
+    use rexif::ExifTag;
+    match e.tag {
         // 0th IFD
-        256 => "ImageWidth".to_string(),
-        257 => "ImageLength".to_string(),
-        270 => "ImageDescription".to_string(),
-        271 => "Make".to_string(),
-        272 => "Model".to_string(),
-        274 => "Orientation".to_string(),
-        282 => "XResolution".to_string(),
-        283 => "YResolution".to_string(),
-        296 => "ResolutionUnit".to_string(),
-        305 => "Software".to_string(),
-        306 => "DateTime".to_string(),
-        315 => "Artist".to_string(),
-        33432 => "Copyright".to_string(),
+        ExifTag::ImageDescription => "ImageDescription".into(),
+        ExifTag::Make => "Make".into(),
+        ExifTag::Model => "Model".into(),
+        ExifTag::Orientation => "Orientation".into(),
+        ExifTag::XResolution => "XResolution".into(),
+        ExifTag::YResolution => "YResolution".into(),
+        ExifTag::ResolutionUnit => "ResolutionUnit".into(),
+        ExifTag::Software => "Software".into(),
+        ExifTag::DateTime => "DateTime".into(),
+        ExifTag::HostComputer => "HostComputer".into(),
+        ExifTag::WhitePoint => "WhitePoint".into(),
+        ExifTag::PrimaryChromaticities => "PrimaryChromaticities".into(),
+        ExifTag::YCbCrCoefficients => "YCbCrCoefficients".into(),
+        ExifTag::ReferenceBlackWhite => "ReferenceBlackWhite".into(),
+        ExifTag::Copyright => "Copyright".into(),
 
-        // Exif IFD
-        33434 => "ExposureTime".to_string(),
-        33437 => "FNumber".to_string(),
-        34850 => "ExposureProgram".to_string(),
-        34852 => "SpectralSensitivity".to_string(),
-        34855 => "PhotographicSensitivity".to_string(),
-        34856 => "OECF".to_string(),
-        34857 => "Interlace".to_string(),
-        34858 => "SensitivityType".to_string(),
-        34859 => "StandardOutputSensitivity".to_string(),
-        34860 => "RecommendedExposureIndex".to_string(),
-        34861 => "ISOSpeed".to_string(),
-        34862 => "ISOSpeedLatitudeyyy".to_string(),
-        34863 => "ISOSpeedLatitudezzz".to_string(),
-        34864 => "SensitivityType".to_string(),
-        36864 => "ExifVersion".to_string(),
-        36867 => "DateTimeOriginal".to_string(),
-        36868 => "DateTimeDigitized".to_string(),
-        36880 => "OffsetTime".to_string(),
-        36881 => "OffsetTimeOriginal".to_string(),
-        36882 => "OffsetTimeDigitized".to_string(),
-        37121 => "ComponentsConfiguration".to_string(),
-        37122 => "CompressedBitsPerPixel".to_string(),
-        37377 => "ShutterSpeedValue".to_string(),
-        37378 => "ApertureValue".to_string(),
-        37379 => "BrightnessValue".to_string(),
-        37380 => "ExposureBiasValue".to_string(),
-        37381 => "MaxApertureValue".to_string(),
-        37382 => "SubjectDistance".to_string(),
-        37383 => "MeteringMode".to_string(),
-        37384 => "LightSource".to_string(),
-        37385 => "Flash".to_string(),
-        37386 => "FocalLength".to_string(),
-        37396 => "SubjectArea".to_string(),
-        37510 => "UserComment".to_string(),
-        37520 => "SubSecTime".to_string(),
-        37521 => "SubSecTimeOriginal".to_string(),
-        37522 => "SubSecTimeDigitized".to_string(),
-        37888 => "Temperature".to_string(),
-        37889 => "Humidity".to_string(),
-        37890 => "Pressure".to_string(),
-        37891 => "WaterDepth".to_string(),
-        37892 => "Acceleration".to_string(),
-        37893 => "CameraElevationAngle".to_string(),
-        40091 => "XPTitle".to_string(),
-        40092 => "XPComment".to_string(),
-        40093 => "XPAuthor".to_string(),
-        40094 => "XPKeywords".to_string(),
-        40095 => "XPSubject".to_string(),
-        40960 => "FlashpixVersion".to_string(),
-        40961 => "ColorSpace".to_string(),
-        40962 => "PixelXDimension".to_string(),
-        40963 => "PixelYDimension".to_string(),
-        40964 => "RelatedSoundFile".to_string(),
-        41483 => "FlashEnergy".to_string(),
-        41484 => "SpatialFrequencyResponse".to_string(),
-        41486 => "FocalPlaneXResolution".to_string(),
-        41487 => "FocalPlaneYResolution".to_string(),
-        41488 => "FocalPlaneResolutionUnit".to_string(),
-        41492 => "SubjectLocation".to_string(),
-        41493 => "ExposureIndex".to_string(),
-        41495 => "SensingMethod".to_string(),
-        41728 => "FileSource".to_string(),
-        41729 => "SceneType".to_string(),
-        41730 => "CFAPattern".to_string(),
-        41985 => "CustomRendered".to_string(),
-        41986 => "ExposureMode".to_string(),
-        41987 => "WhiteBalance".to_string(),
-        41988 => "DigitalZoomRatio".to_string(),
-        41989 => "FocalLengthIn35mmFilm".to_string(),
-        41990 => "SceneCaptureType".to_string(),
-        41991 => "GainControl".to_string(),
-        41992 => "Contrast".to_string(),
-        41993 => "Saturation".to_string(),
-        41994 => "Sharpness".to_string(),
-        41995 => "DeviceSettingDescription".to_string(),
-        41996 => "SubjectDistanceRange".to_string(),
-        42016 => "ImageUniqueID".to_string(),
-        42032 => "CameraOwnerName".to_string(),
-        42033 => "BodySerialNumber".to_string(),
-        42034 => "LensSpecification".to_string(),
-        42035 => "LensMake".to_string(),
-        42036 => "LensModel".to_string(),
-        42037 => "LensSerialNumber".to_string(),
-        42080 => "CompositeImage".to_string(),
-        42240 => "Gamma".to_string(),
+        // Exif Sub IFD
+        ExifTag::ExposureTime => "ExposureTime".into(),
+        ExifTag::FNumber => "FNumber".into(),
+        ExifTag::ExposureProgram => "ExposureProgram".into(),
+        ExifTag::SpectralSensitivity => "SpectralSensitivity".into(),
+        // EXIF 2.3 で ISOSpeedRatings → PhotographicSensitivity に改名
+        ExifTag::ISOSpeedRatings => "PhotographicSensitivity".into(),
+        ExifTag::OECF => "OECF".into(),
+        ExifTag::SensitivityType => "SensitivityType".into(),
+        ExifTag::ExifVersion => "ExifVersion".into(),
+        ExifTag::DateTimeOriginal => "DateTimeOriginal".into(),
+        ExifTag::DateTimeDigitized => "DateTimeDigitized".into(),
+        ExifTag::ShutterSpeedValue => "ShutterSpeedValue".into(),
+        ExifTag::ApertureValue => "ApertureValue".into(),
+        ExifTag::BrightnessValue => "BrightnessValue".into(),
+        ExifTag::ExposureBiasValue => "ExposureBiasValue".into(),
+        ExifTag::MaxApertureValue => "MaxApertureValue".into(),
+        ExifTag::SubjectDistance => "SubjectDistance".into(),
+        ExifTag::MeteringMode => "MeteringMode".into(),
+        ExifTag::LightSource => "LightSource".into(),
+        ExifTag::Flash => "Flash".into(),
+        ExifTag::FocalLength => "FocalLength".into(),
+        ExifTag::SubjectArea => "SubjectArea".into(),
+        ExifTag::UserComment => "UserComment".into(),
+        ExifTag::FlashPixVersion => "FlashpixVersion".into(),
+        ExifTag::ColorSpace => "ColorSpace".into(),
+        ExifTag::RelatedSoundFile => "RelatedSoundFile".into(),
+        ExifTag::FlashEnergy => "FlashEnergy".into(),
+        ExifTag::FocalPlaneXResolution => "FocalPlaneXResolution".into(),
+        ExifTag::FocalPlaneYResolution => "FocalPlaneYResolution".into(),
+        ExifTag::FocalPlaneResolutionUnit => "FocalPlaneResolutionUnit".into(),
+        ExifTag::SubjectLocation => "SubjectLocation".into(),
+        ExifTag::ExposureIndex => "ExposureIndex".into(),
+        ExifTag::SensingMethod => "SensingMethod".into(),
+        ExifTag::FileSource => "FileSource".into(),
+        ExifTag::SceneType => "SceneType".into(),
+        ExifTag::CFAPattern => "CFAPattern".into(),
+        ExifTag::CustomRendered => "CustomRendered".into(),
+        ExifTag::ExposureMode => "ExposureMode".into(),
+        // rexif は WhiteBalanceMode 名だが、当プロジェクトは WhiteBalance を採用
+        ExifTag::WhiteBalanceMode => "WhiteBalance".into(),
+        ExifTag::DigitalZoomRatio => "DigitalZoomRatio".into(),
+        ExifTag::FocalLengthIn35mmFilm => "FocalLengthIn35mmFilm".into(),
+        ExifTag::SceneCaptureType => "SceneCaptureType".into(),
+        ExifTag::GainControl => "GainControl".into(),
+        ExifTag::Contrast => "Contrast".into(),
+        ExifTag::Saturation => "Saturation".into(),
+        ExifTag::Sharpness => "Sharpness".into(),
+        ExifTag::DeviceSettingDescription => "DeviceSettingDescription".into(),
+        ExifTag::SubjectDistanceRange => "SubjectDistanceRange".into(),
+        ExifTag::ImageUniqueID => "ImageUniqueID".into(),
+        ExifTag::LensSpecification => "LensSpecification".into(),
+        ExifTag::LensMake => "LensMake".into(),
+        ExifTag::LensModel => "LensModel".into(),
+        ExifTag::Gamma => "Gamma".into(),
 
-        // GPS IFD のタグ (0x0000〜0x001F)。Interop IFD の 1/2
-        // (InteroperabilityIndex/Version) と ID が衝突するが、実ファイル上で
-        // 観測頻度の高い GPS 側を優先する。Interop IFD は既定で 40965 の
-        // ポインタごと is_structural_tag で抑止済み。
-        0 => "GPSVersionID".to_string(),
-        1 => "GPSLatitudeRef".to_string(),
-        2 => "GPSLatitude".to_string(),
-        3 => "GPSLongitudeRef".to_string(),
-        4 => "GPSLongitude".to_string(),
-        5 => "GPSAltitudeRef".to_string(),
-        6 => "GPSAltitude".to_string(),
-        7 => "GPSTimeStamp".to_string(),
-        8 => "GPSSatellites".to_string(),
-        9 => "GPSStatus".to_string(),
-        10 => "GPSMeasureMode".to_string(),
-        11 => "GPSDOP".to_string(),
-        12 => "GPSSpeedRef".to_string(),
-        13 => "GPSSpeed".to_string(),
-        14 => "GPSTrackRef".to_string(),
-        15 => "GPSTrack".to_string(),
-        16 => "GPSImgDirectionRef".to_string(),
-        17 => "GPSImgDirection".to_string(),
-        18 => "GPSMapDatum".to_string(),
-        19 => "GPSDestLatitudeRef".to_string(),
-        20 => "GPSDestLatitude".to_string(),
-        21 => "GPSDestLongitudeRef".to_string(),
-        22 => "GPSDestLongitude".to_string(),
-        23 => "GPSDestBearingRef".to_string(),
-        24 => "GPSDestBearing".to_string(),
-        25 => "GPSDestDistanceRef".to_string(),
-        26 => "GPSDestDistance".to_string(),
-        27 => "GPSProcessingMethod".to_string(),
-        28 => "GPSAreaInformation".to_string(),
-        29 => "GPSDateStamp".to_string(),
-        30 => "GPSDifferential".to_string(),
-        31 => "GPSHPositioningError".to_string(),
+        // GPS IFD
+        ExifTag::GPSVersionID => "GPSVersionID".into(),
+        ExifTag::GPSLatitudeRef => "GPSLatitudeRef".into(),
+        ExifTag::GPSLatitude => "GPSLatitude".into(),
+        ExifTag::GPSLongitudeRef => "GPSLongitudeRef".into(),
+        ExifTag::GPSLongitude => "GPSLongitude".into(),
+        ExifTag::GPSAltitudeRef => "GPSAltitudeRef".into(),
+        ExifTag::GPSAltitude => "GPSAltitude".into(),
+        ExifTag::GPSTimeStamp => "GPSTimeStamp".into(),
+        ExifTag::GPSSatellites => "GPSSatellites".into(),
+        ExifTag::GPSStatus => "GPSStatus".into(),
+        ExifTag::GPSMeasureMode => "GPSMeasureMode".into(),
+        ExifTag::GPSDOP => "GPSDOP".into(),
+        ExifTag::GPSSpeedRef => "GPSSpeedRef".into(),
+        ExifTag::GPSSpeed => "GPSSpeed".into(),
+        ExifTag::GPSTrackRef => "GPSTrackRef".into(),
+        ExifTag::GPSTrack => "GPSTrack".into(),
+        ExifTag::GPSImgDirectionRef => "GPSImgDirectionRef".into(),
+        ExifTag::GPSImgDirection => "GPSImgDirection".into(),
+        ExifTag::GPSMapDatum => "GPSMapDatum".into(),
+        ExifTag::GPSDestLatitudeRef => "GPSDestLatitudeRef".into(),
+        ExifTag::GPSDestLatitude => "GPSDestLatitude".into(),
+        ExifTag::GPSDestLongitudeRef => "GPSDestLongitudeRef".into(),
+        ExifTag::GPSDestLongitude => "GPSDestLongitude".into(),
+        ExifTag::GPSDestBearingRef => "GPSDestBearingRef".into(),
+        ExifTag::GPSDestBearing => "GPSDestBearing".into(),
+        ExifTag::GPSDestDistanceRef => "GPSDestDistanceRef".into(),
+        ExifTag::GPSDestDistance => "GPSDestDistance".into(),
+        ExifTag::GPSProcessingMethod => "GPSProcessingMethod".into(),
+        ExifTag::GPSAreaInformation => "GPSAreaInformation".into(),
+        ExifTag::GPSDateStamp => "GPSDateStamp".into(),
+        ExifTag::GPSDifferential => "GPSDifferential".into(),
 
-        _ => format!("Tag({})", tag_id),
+        // 構造系: is_structural で先に弾かれる想定 (到達した場合のセーフネット)
+        ExifTag::ExifOffset | ExifTag::GPSOffset | ExifTag::MakerNote => String::new(),
+
+        // rexif が認識しなかったタグ → 補助テーブルへ
+        ExifTag::UnknownToMe => name_for_unknown_tag(e.kind, e.ifd.tag),
+    }
+}
+
+/// rexif の `ExifTag` enum に無いタグを `(IFD種別, 生 ID)` で解決する補助テーブル。
+/// EXIF 2.31/2.32 で追加されたタグ、Windows XP 拡張、TIFF/EP 等を補完する。
+/// 新しいタグが「Tag(NNNN)」で出てきたら ExifTool 等で正体を確認してここに追加する。
+fn name_for_unknown_tag(kind: rexif::IfdKind, raw: u16) -> String {
+    use rexif::IfdKind;
+    match (kind, raw) {
+        // ── TIFF Rev 6.0 (0th IFD) で rexif が拾わないもの ──
+        (_, 256) => "ImageWidth".into(),
+        (_, 257) => "ImageLength".into(),
+        (_, 274) => "Orientation".into(),
+        (_, 282) => "XResolution".into(),
+        (_, 283) => "YResolution".into(),
+        (_, 296) => "ResolutionUnit".into(),
+        (_, 305) => "Software".into(),
+        (_, 306) => "DateTime".into(),
+        (_, 315) => "Artist".into(),
+        (_, 33432) => "Copyright".into(),
+        // YCbCrPositioning など低価値タグも名前は付けておく (デフォ非表示)
+        (_, 531) => "YCbCrPositioning".into(),
+
+        // ── Exif Sub IFD で rexif が拾わないもの ──
+        (_, 33434) => "ExposureTime".into(),
+        (_, 33437) => "FNumber".into(),
+        (_, 34850) => "ExposureProgram".into(),
+        (_, 34855) => "PhotographicSensitivity".into(),
+        (_, 34856) => "OECF".into(),
+        (_, 34858) => "SensitivityType".into(),
+        (_, 34859) => "StandardOutputSensitivity".into(),
+        (_, 34860) => "RecommendedExposureIndex".into(),
+        (_, 34861) => "ISOSpeed".into(),
+        (_, 34862) => "ISOSpeedLatitudeyyy".into(),
+        (_, 34863) => "ISOSpeedLatitudezzz".into(),
+        (_, 34864) => "SensitivityType".into(),
+        (_, 36864) => "ExifVersion".into(),
+        // EXIF 2.31 の時刻タイムゾーン
+        (_, 36880) => "OffsetTime".into(),
+        (_, 36881) => "OffsetTimeOriginal".into(),
+        (_, 36882) => "OffsetTimeDigitized".into(),
+        (_, 37121) => "ComponentsConfiguration".into(),
+        (_, 37122) => "CompressedBitsPerPixel".into(),
+        (_, 37520) => "SubSecTime".into(),
+        (_, 37521) => "SubSecTimeOriginal".into(),
+        (_, 37522) => "SubSecTimeDigitized".into(),
+        // EXIF 2.31 環境センサー
+        (_, 37888) => "Temperature".into(),
+        (_, 37889) => "Humidity".into(),
+        (_, 37890) => "Pressure".into(),
+        (_, 37891) => "WaterDepth".into(),
+        (_, 37892) => "Acceleration".into(),
+        (_, 37893) => "CameraElevationAngle".into(),
+        // Microsoft Windows 拡張
+        (_, 40091) => "XPTitle".into(),
+        (_, 40092) => "XPComment".into(),
+        (_, 40093) => "XPAuthor".into(),
+        (_, 40094) => "XPKeywords".into(),
+        (_, 40095) => "XPSubject".into(),
+        (_, 40960) => "FlashpixVersion".into(),
+        (_, 40962) => "PixelXDimension".into(),
+        (_, 40963) => "PixelYDimension".into(),
+        (_, 41484) => "SpatialFrequencyResponse".into(),
+        (_, 41985) => "CustomRendered".into(),
+        (_, 41995) => "DeviceSettingDescription".into(),
+        (_, 42016) => "ImageUniqueID".into(),
+        (_, 42032) => "CameraOwnerName".into(),
+        (_, 42033) => "BodySerialNumber".into(),
+        (_, 42037) => "LensSerialNumber".into(),
+        (_, 42080) => "CompositeImage".into(),
+        (_, 42240) => "Gamma".into(),
+
+        // ── Interop IFD ──
+        (IfdKind::Interoperability, 1) => "InteroperabilityIndex".into(),
+        (IfdKind::Interoperability, 2) => "InteroperabilityVersion".into(),
+
+        // ── GPS IFD: rexif の enum に無い拡張 ──
+        (IfdKind::Gps, 31) => "GPSHPositioningError".into(),
+
+        _ => format!("Tag({})", raw),
     }
 }
 
@@ -361,6 +425,12 @@ pub fn tag_display_name(tag_name: &str) -> &str {
         "DigitalZoomRatio" => "デジタル ズーム",
         "FocalLengthIn35mmFilm" => "35mm 焦点距離",
         "SceneCaptureType" => "撮影シーン",
+        "HostComputer" => "ホスト コンピュータ",
+        "WhitePoint" => "白色点",
+        "PrimaryChromaticities" => "原色色度",
+        "YCbCrCoefficients" => "YCbCr 係数",
+        "YCbCrPositioning" => "YCbCr 配置",
+        "ReferenceBlackWhite" => "基準白黒点",
         "BodySerialNumber" => "カメラ製造番号",
         "LensMake" => "レンズ メーカー",
         "LensModel" => "レンズ モデル",
@@ -477,11 +547,20 @@ mod tests {
     }
 
     #[test]
-    fn structural_tags_are_suppressed() {
-        assert!(is_structural_tag(34665));
-        assert!(is_structural_tag(34853));
-        assert!(is_structural_tag(40965));
-        assert!(is_structural_tag(37500));
-        assert!(!is_structural_tag(271)); // Make は通常タグ
+    fn unknown_tag_lookup_covers_extensions() {
+        use rexif::IfdKind;
+        // EXIF 2.31 タイムゾーン
+        assert_eq!(name_for_unknown_tag(IfdKind::Exif, 36880), "OffsetTime");
+        // Microsoft Windows
+        assert_eq!(name_for_unknown_tag(IfdKind::Ifd0, 40092), "XPComment");
+        // GPS IFD 拡張
+        assert_eq!(name_for_unknown_tag(IfdKind::Gps, 31), "GPSHPositioningError");
+        // Interop IFD は同じ raw でも GPS と区別される
+        assert_eq!(
+            name_for_unknown_tag(IfdKind::Interoperability, 1),
+            "InteroperabilityIndex"
+        );
+        // 未登録 → Tag(N) フォールバック
+        assert_eq!(name_for_unknown_tag(IfdKind::Exif, 65535), "Tag(65535)");
     }
 }
