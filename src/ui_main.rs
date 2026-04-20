@@ -552,7 +552,13 @@ impl App {
             return;
         }
 
-        let enter_pressed = self.dialog_enter_pressed(ctx);
+        // Enter は **raw** で読む。`dialog_enter_pressed` は IME 変換直後 300ms の
+        // グレース中も false を返すため、日本語で「おはよう[Enter]」と確定兼送信した
+        // ケースで検索が走らず、代わりにグリッドの Enter ショートカット (フルスクリーン)
+        // が走ってしまう。ここでは `response.lost_focus()` が Tab / クリック外しでも
+        // true になる性質を raw Enter との AND で打ち消し、"Enter でフォーカスを失った"
+        // ときだけ execute_search を呼ぶ。search_query は IME Commit で既に確定済み。
+        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed = self.dialog_escape_pressed(ctx);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -572,8 +578,8 @@ impl App {
                 // フォーカス状態を追跡
                 self.search_has_focus = response.has_focus();
 
-                // Enter で検索実行 (IME 変換中は dialog_enter_pressed が false)
-                if response.lost_focus() && enter_pressed {
+                // Enter で検索実行 (IME 変換確定の Enter も同じ扱い)
+                if response.lost_focus() && raw_enter_pressed {
                     self.execute_search();
                     // フォーカスを外してカーソルキーでグリッド操作できるようにする
                     response.surrender_focus();
@@ -630,7 +636,9 @@ impl App {
         if !self.favsearch.active {
             return;
         }
-        let enter_pressed = self.dialog_enter_pressed(ctx);
+        // Ctrl+F 側と同じく raw Enter で判定する (IME 変換確定の Enter も送信扱い)。
+        // `response.lost_focus()` と AND することで Tab / クリック外しの誤発火は弾ける。
+        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         let mut close_requested = false;
@@ -656,8 +664,8 @@ impl App {
                 if response.changed() {
                     query_changed = true;
                 }
-                // Enter で確定的に再実行 (IME 変換中は enter_pressed が false)
-                if response.lost_focus() && enter_pressed {
+                // Enter で確定的に再実行 (IME 変換確定の Enter も同じ扱い)
+                if response.lost_focus() && raw_enter_pressed {
                     query_changed = true;
                 }
 

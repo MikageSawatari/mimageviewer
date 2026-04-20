@@ -3222,6 +3222,16 @@ impl App {
             return None;
         }
 
+        // IME 変換直後の Enter 漏れ対策:
+        // 検索バー / お気に入り検索バーが表示中で、かつ直近に IME イベントがあった場合、
+        // この `handle_keyboard` 呼び出しをスキップして Enter がグリッドの
+        // フルスクリーン起動ショートカットに回らないようにする。
+        // (IME が Commit を吐いたフレームで TextEdit が一瞬 lost_focus → search_has_focus
+        //  が false になり、次フレームで Enter が grid 側に漏れるレースをガードする)。
+        if (self.show_search_bar || self.favsearch.active) && self.ime_input_active() {
+            return None;
+        }
+
         let cols = self.settings.grid_cols.max(1);
 
         // Ctrl の状態判定。AutoHotKey 等の外部ツールが Ctrl+矢印を送信する場合、
