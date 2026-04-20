@@ -649,6 +649,16 @@ mod tests {
         out
     }
 
+    /// fallback-only コンテナの代用として、ftyp マジックを持つ最小 MP4 風バイト列を作る。
+    fn build_mp4_with_xmp_at_offset(offset: usize) -> Vec<u8> {
+        let offset = offset.max(12);
+        let mut out = vec![0u8; offset];
+        // ISO BMFF magic: 4-byte box size + "ftyp"
+        out[4..8].copy_from_slice(b"ftyp");
+        out.extend_from_slice(SAMPLE_XMP_STR.as_bytes());
+        out
+    }
+
     /// XMP が先頭から 512KB 超の位置にあっても、JPEG は全読みするので拾える。
     #[test]
     fn jpeg_with_xmp_past_512kb_is_found() {
@@ -669,5 +679,28 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write tempfile");
         let info = read_tweet_info(&path).expect("XMP should be parsed via path");
         assert_eq!(info.tweet_id.as_deref(), Some("2044629346967773284"));
+    }
+
+    /// MP4/MOV/M4V/TIFF など fallback-only の大容量コンテナは、パス経由では
+    /// 先頭 FALLBACK_SCAN_LIMIT だけを読む。先頭付近の XMP は拾える。
+    #[test]
+    fn read_tweet_info_path_finds_mp4_xmp_near_start() {
+        let bytes = build_mp4_with_xmp_at_offset(128);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("early.mp4");
+        std::fs::write(&path, &bytes).expect("write tempfile");
+        let info = read_tweet_info(&path).expect("XMP should be parsed via bounded path");
+        assert_eq!(info.tweet_id.as_deref(), Some("2044629346967773284"));
+    }
+
+    /// MP4/MOV/M4V/TIFF など fallback-only の大容量コンテナでは全読みしない。
+    /// 512KB より後ろの XMP を拾わないことを回帰テストにして、bounded read を保つ。
+    #[test]
+    fn read_tweet_info_path_bounds_mp4_fallback_scan() {
+        let bytes = build_mp4_with_xmp_at_offset(700 * 1024);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("late.mp4");
+        std::fs::write(&path, &bytes).expect("write tempfile");
+        assert!(read_tweet_info(&path).is_none());
     }
 }
