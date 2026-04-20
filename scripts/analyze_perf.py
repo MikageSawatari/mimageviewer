@@ -16,6 +16,10 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
     thumbs              サムネイル decode 時間の分布 (priority=H/L 別)
+    nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
+                        start_loading_items / close_fullscreen) を集計
+    hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
+                        表示 (デフォルト 33ms = 30fps 閾値)
 
 依存:
     標準ライブラリのみ必須。timeline は matplotlib、latency 詳細統計は任意で pandas。
@@ -363,6 +367,170 @@ def cmd_timeline(events: list[dict], only_seq: int | None) -> None:
 
 
 # -----------------------------------------------------------------------
+# nav
+# -----------------------------------------------------------------------
+
+def cmd_nav(events: list[dict]) -> None:
+    """Ctrl+↑↓ ナビの区間別 wall time 統計。
+
+    対象イベント (src/app.rs で emit):
+      nav.dfs_begin / dfs_end             — DFS スレッド (UI ブロックせず)
+      nav.apply_begin / apply_end         — DFS 結果の UI 適用区間
+      nav.load_folder_begin / _end        — load_folder 全体 (UI ブロック)
+      nav.lf_{scan,sort,dup_filter,auto_index}  — load_folder 内の小区間
+      nav.sli_begin / sli_end             — start_loading_items 全体
+      nav.sli_{sidecar_flush,prewarm_rating,sidecar_import,adjustment_db,
+               mask_db,catalog_open,catalog_load_all,catalog_delete_missing,
+               spawn_workers,settings_save}  — 内訳
+      nav.close_fullscreen_begin/_end     — close_fullscreen 区間
+    """
+    buckets: dict[str, list[float]] = defaultdict(list)
+
+    for e in events:
+        if e.get("cat") != "nav":
+            continue
+        kind = e.get("kind", "")
+        ms = e.get("ms")
+        if ms is None:
+            continue
+        # "dfs_end" -> "dfs" のように集約
+        if kind.endswith("_end"):
+            label = kind[: -len("_end")]
+        else:
+            label = kind
+        buckets[label].append(float(ms))
+
+    def stats(label: str, xs: list[float]) -> None:
+        if not xs:
+            return
+        xs_sorted = sorted(xs)
+        n = len(xs)
+        p50 = xs_sorted[n // 2]
+        p95 = xs_sorted[min(n - 1, int(n * 0.95))]
+        p99 = xs_sorted[min(n - 1, int(n * 0.99))]
+        print(
+            f"  {label:<32} n={n:<4} min={min(xs):>6.1f} p50={p50:>6.1f} "
+            f"p95={p95:>7.1f} p99={p99:>7.1f} max={max(xs):>7.1f} ms"
+        )
+
+    # 親区間 → 子区間の階層で表示する
+    groups: list[tuple[str, list[str]]] = [
+        ("DFS (別スレッド)", ["dfs"]),
+        ("apply_folder_nav_result (UI)", ["apply"]),
+        ("load_folder 全体 (UI)", ["load_folder"]),
+        ("  load_folder 内訳", ["lf_scan", "lf_sort", "lf_dup_filter", "lf_auto_index"]),
+        ("close_fullscreen (UI)", ["close_fullscreen"]),
+        ("start_loading_items 全体 (UI)", ["sli"]),
+        ("  sli 内訳", [
+            "sli_sidecar_flush", "sli_prewarm_rating", "sli_sidecar_import",
+            "sli_adjustment_db", "sli_mask_db",
+            "sli_catalog_open", "sli_catalog_load_all", "sli_catalog_delete_missing",
+            "sli_spawn_workers", "sli_settings_save",
+        ]),
+    ]
+
+    print("Ctrl+↑↓ ナビ区間の wall time:")
+    for title, labels in groups:
+        print(f"\n[{title}]")
+        found = False
+        for lab in labels:
+            if buckets.get(lab):
+                stats(lab, buckets[lab])
+                found = True
+        if not found:
+            print("  (イベントなし)")
+
+    # DFS 由来の input_seq ごとの End-to-End レイテンシ
+    # input.grid_ctrl_nav / fs_ctrl_nav から nav.apply_end までの経過
+    print("\n[End-to-End: input → apply_end (同一 seq)]")
+    input_t: dict[int, tuple[float, str]] = {}
+    apply_end_t: dict[int, float] = {}
+    for e in events:
+        seq = e.get("seq", 0)
+        if not seq:
+            continue
+        cat = e.get("cat", "")
+        kind = e.get("kind", "")
+        if cat == "input" and kind in ("grid_ctrl_nav", "fs_ctrl_nav"):
+            input_t.setdefault(seq, (e.get("t", 0.0), kind))
+        elif cat == "nav" and kind == "apply_end":
+            # 同一 seq で apply が複数回走る (連鎖 DFS) 場合は最後を採用
+            apply_end_t[seq] = e.get("t", 0.0)
+
+    e2e: list[float] = []
+    for seq, (t0, _) in input_t.items():
+        if seq in apply_end_t:
+            e2e.append((apply_end_t[seq] - t0) * 1000.0)
+    if e2e:
+        stats("input → apply_end (ms)", e2e)
+    else:
+        print("  (相関できる seq が見つからなかった — input.grid_ctrl_nav / fs_ctrl_nav と nav.apply_end の対が必要)")
+
+
+# -----------------------------------------------------------------------
+# hitches — フレーム間隔の分布と nav 区間との重なり
+# -----------------------------------------------------------------------
+
+def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
+    """frame.begin の間隔が threshold_ms を超えたヒッチを検出し、
+    その直前 500ms に発生した nav.* 区間を表示する。"""
+    frame_ts: list[float] = []
+    for e in events:
+        if e.get("cat") == "frame" and e.get("kind") == "begin":
+            frame_ts.append(e.get("t", 0.0))
+
+    if len(frame_ts) < 2:
+        print("(frame.begin が 2 件未満)")
+        return
+
+    gaps: list[tuple[float, float]] = []  # (t_end, gap_ms)
+    for i in range(1, len(frame_ts)):
+        gap = (frame_ts[i] - frame_ts[i - 1]) * 1000.0
+        if gap >= threshold_ms:
+            gaps.append((frame_ts[i], gap))
+
+    print(f"フレーム数: {len(frame_ts)}  間隔 >= {threshold_ms}ms のヒッチ: {len(gaps)} 件")
+    if not gaps:
+        return
+
+    gaps_sorted = sorted(g for _, g in gaps)
+    n = len(gaps_sorted)
+    p50 = gaps_sorted[n // 2]
+    p95 = gaps_sorted[min(n - 1, int(n * 0.95))]
+    print(
+        f"ヒッチ間隔: min={min(gaps_sorted):.1f} p50={p50:.1f} "
+        f"p95={p95:.1f} max={max(gaps_sorted):.1f} ms"
+    )
+
+    # nav 区間 (end イベント) を直前 500ms 以内に含むものを列挙
+    nav_ends = [
+        e for e in events
+        if e.get("cat") == "nav" and e.get("kind", "").endswith("_end")
+    ]
+
+    print("\n最も大きいヒッチ 10 件:")
+    for t_end, gap in sorted(gaps, key=lambda x: -x[1])[:10]:
+        t_start = t_end - gap / 1000.0
+        # 直前 500ms ウィンドウ
+        window_start = t_start - 0.5
+        nearby = [
+            e for e in nav_ends
+            if window_start <= e.get("t", 0.0) <= t_end
+        ]
+        # ms 上位 3 件だけ出す
+        nearby.sort(key=lambda e: -float(e.get("ms", 0.0)))
+        tags = [
+            f"{e.get('kind')}={float(e.get('ms', 0.0)):.1f}ms"
+            for e in nearby[:3]
+        ]
+        tags_str = ", ".join(tags) if tags else "(nav イベントなし)"
+        print(
+            f"  t={t_end:>8.3f}s  gap={gap:>6.1f}ms  "
+            f"直前 nav: {tags_str}"
+        )
+
+
+# -----------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------
 
@@ -376,6 +544,9 @@ def main() -> None:
     subs.add_parser("latency")
     subs.add_parser("priority")
     subs.add_parser("thumbs")
+    subs.add_parser("nav")
+    p_hit = subs.add_parser("hitches")
+    p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
     p_dump = subs.add_parser("dump")
     p_dump.add_argument("seq", type=int)
     p_dump.add_argument("--with-frames", action="store_true", help="frame.begin も表示する")
@@ -398,6 +569,10 @@ def main() -> None:
         cmd_priority(events)
     elif args.cmd == "thumbs":
         cmd_thumbs(events)
+    elif args.cmd == "nav":
+        cmd_nav(events)
+    elif args.cmd == "hitches":
+        cmd_hitches(events, args.ms)
     elif args.cmd == "dump":
         cmd_dump(events, args.seq, args.with_frames)
     elif args.cmd == "timeline":

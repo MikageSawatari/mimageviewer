@@ -1285,6 +1285,20 @@ impl App {
     }
 
     pub fn load_folder(&mut self, path: PathBuf) {
+        // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
+        // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
+        let lf_t0 = std::time::Instant::now();
+        let lf_seq = self.input_seq;
+        let lf_path_disp = path.display().to_string();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "load_folder_begin",
+                None,
+                lf_seq,
+                &[("path", serde_json::Value::from(lf_path_disp.clone()))],
+            );
+        }
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
             let ext = path
@@ -1294,10 +1308,36 @@ impl App {
                 .unwrap_or_default();
             if ext == "zip" {
                 self.load_zip_as_folder(path);
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "nav",
+                        "load_folder_end",
+                        None,
+                        lf_seq,
+                        &[
+                            ("ms", serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0)),
+                            ("kind", serde_json::Value::from("zip")),
+                            ("path", serde_json::Value::from(lf_path_disp)),
+                        ],
+                    );
+                }
                 return;
             }
             if ext == "pdf" {
                 self.load_pdf_as_folder(path);
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "nav",
+                        "load_folder_end",
+                        None,
+                        lf_seq,
+                        &[
+                            ("ms", serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0)),
+                            ("kind", serde_json::Value::from("pdf")),
+                            ("path", serde_json::Value::from(lf_path_disp)),
+                        ],
+                    );
+                }
                 return;
             }
         }
@@ -1309,6 +1349,7 @@ impl App {
         crate::zip_loader::clear_nested_cache();
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
+        let scan_t0 = std::time::Instant::now();
         let mut folders: Vec<GridItem> = Vec::new();
         // フォルダアイテムごとのメタデータ (ZipFile/PdfFile はサムネイルロードに必要)
         let mut folder_metas: Vec<Option<(i64, i64)>> = Vec::new();
@@ -1350,6 +1391,24 @@ impl App {
             }
         }
 
+        let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
+        let scan_folders = folders.len();
+        let scan_media = all_media.len();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "lf_scan",
+                None,
+                lf_seq,
+                &[
+                    ("ms", serde_json::Value::from(scan_ms)),
+                    ("folders", serde_json::Value::from(scan_folders)),
+                    ("media", serde_json::Value::from(scan_media)),
+                ],
+            );
+        }
+
+        let sort_t0 = std::time::Instant::now();
         {
             // folders と folder_metas を同じ順序でソート
             let mut paired: Vec<_> = folders.into_iter().zip(folder_metas).collect();
@@ -1364,10 +1423,29 @@ impl App {
             let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
             sort.compare(an, *a_mt, bn, *b_mt, natural_sort_key)
         });
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "lf_sort",
+                None,
+                lf_seq,
+                &[("ms", serde_json::Value::from(sort_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
         // ── 同名ファイルフィルタ ─────────────────────────────────────
+        let dup_t0 = std::time::Instant::now();
         self.video_thumb_overrides.clear();
         self.apply_duplicate_filters(&mut folders, &mut folder_metas, &mut all_media);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "lf_dup_filter",
+                None,
+                lf_seq,
+                &[("ms", serde_json::Value::from(dup_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
         // items: フォルダ先頭 → メディア（画像・動画を名前順混在）
         let folder_count = folders.len();
@@ -1409,9 +1487,35 @@ impl App {
             .collect();
 
         // お気に入り配下の場合、現在フォルダ直下を検索インデックスに upsert (軽量)
+        let ai_t0 = std::time::Instant::now();
         self.auto_index_current_folder(&path, &items);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "lf_auto_index",
+                None,
+                lf_seq,
+                &[("ms", serde_json::Value::from(ai_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
+        let items_len = items.len();
         self.start_loading_items(path, items, image_metas, existing_keys, video_items);
+
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "load_folder_end",
+                None,
+                lf_seq,
+                &[
+                    ("ms", serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0)),
+                    ("kind", serde_json::Value::from("folder")),
+                    ("path", serde_json::Value::from(lf_path_disp)),
+                    ("items", serde_json::Value::from(items_len)),
+                ],
+            );
+        }
     }
 
     /// `path` がいずれかのお気に入り配下であれば、`items` の Folder/ZipFile/PdfFile を
@@ -1876,11 +1980,38 @@ impl App {
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
     ) {
+        // perf: start_loading_items 全体 + 内訳 (sidecar_flush / close_fullscreen /
+        // state_reset / prewarm_rating / adjustment_db / mask_db / catalog_open /
+        // catalog_load_all / catalog_delete_missing / spawn_workers / settings_save)。
+        // UI スレッドブロックの真犯人を特定するため、区間ごとに ms を記録する。
+        let sli_t0 = std::time::Instant::now();
+        let sli_seq = self.input_seq;
+        let items_len = items.len();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_begin",
+                None,
+                sli_seq,
+                &[("items", serde_json::Value::from(items_len))],
+            );
+        }
+
         // ── サイドカーをフラッシュしてメモリから降ろす ──
         // フォルダ切替前に dirty なサイドカーをディスクに書き出す。メモリ上の表現は
         // 破棄して再読み込みに任せる (長時間稼働時のメモリリーク防止)。
+        let sidecar_t0 = std::time::Instant::now();
         self.flush_all_sidecars();
         self.sidecars.clear();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_sidecar_flush",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(sidecar_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
         // ── 履歴保存 + 旧タスクキャンセル + 状態リセット ──
         if let Some(cur) = self.current_folder.clone() {
@@ -1934,8 +2065,18 @@ impl App {
         // 1 回のクエリで全アイテムのレーティングを引いてキャッシュに載せる。
         // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
+        let prewarm_t0 = std::time::Instant::now();
         self.prewarm_rating_cache();
         self.rebuild_visible_indices();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_prewarm_rating",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(prewarm_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
         // 見開きモード: DB から読み込み、なければデフォルト値
         self.spread_mode = self.spread_db.as_ref()
             .and_then(|db| db.get(&source_path))
@@ -1958,6 +2099,7 @@ impl App {
         // フォルダ丸ごと移動された場合など、中央 DB に無いエントリがサイドカーにあれば
         // 取り込む。DB にあるエントリは authoritative なので上書きしない。
         // 下の `db.load_page_params` はインポート後に走るので、補填されたエントリも拾える。
+        let sidecar_import_t0 = std::time::Instant::now();
         if self.settings.sidecar_backup_enabled {
             let sidecar_folder = if source_path.is_dir() {
                 source_path.clone()
@@ -1969,7 +2111,17 @@ impl App {
             };
             self.import_sidecar_to_dbs(&sidecar_folder);
         }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_sidecar_import",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(sidecar_import_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
+        let adj_t0 = std::time::Instant::now();
         if let Some(db) = &self.adjustment_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let page_map = db.load_page_params(&prefix);
@@ -1983,8 +2135,18 @@ impl App {
                 }
             }
         }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_adjustment_db",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(adj_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
         // 消しゴムマスク: フォルダ内でマスクを持つページを列挙
+        let mask_t0 = std::time::Instant::now();
         if let Some(db) = &self.mask_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
             let mask_keys = db.load_mask_keys(&prefix);
@@ -1998,16 +2160,36 @@ impl App {
                 }
             }
         }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_mask_db",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(mask_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
         // visible_indices はアイテム設定後 (下の行) に再計算される
 
         // ── カタログを開く + cache_map ロード + 削除掃除 ──
+        let catalog_open_t0 = std::time::Instant::now();
         let cache_dir = crate::catalog::default_cache_dir();
         let catalog_arc: Option<Arc<crate::catalog::CatalogDb>> =
             crate::catalog::CatalogDb::open(&cache_dir, &source_path)
                 .map_err(|e| crate::logger::log(format!("  catalog open failed: {e}")))
                 .ok()
                 .map(Arc::new);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_catalog_open",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(catalog_open_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
+        let catalog_load_t0 = std::time::Instant::now();
         let cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>> =
             Arc::new(std::sync::RwLock::new(
                 catalog_arc
@@ -2015,14 +2197,37 @@ impl App {
                     .and_then(|c| c.load_all().ok())
                     .unwrap_or_default(),
             ));
-        crate::logger::log(format!("  catalog: {} entries in DB", cache_map.read().unwrap().len()));
+        let catalog_entries = cache_map.read().unwrap().len();
+        crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_catalog_load_all",
+                None,
+                sli_seq,
+                &[
+                    ("ms", serde_json::Value::from(catalog_load_t0.elapsed().as_secs_f64() * 1000.0)),
+                    ("entries", serde_json::Value::from(catalog_entries)),
+                ],
+            );
+        }
 
+        let catalog_del_t0 = std::time::Instant::now();
         if source_path != search_results_synthetic_path() {
             if let Some(ref cat) = catalog_arc {
                 if let Err(e) = cat.delete_missing(&catalog_existing_keys) {
                     crate::logger::log(format!("  catalog delete_missing failed: {e}"));
                 }
             }
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_catalog_delete_missing",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(catalog_del_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
         }
 
         // ── 進捗カウンタリセット + 共有 display_px 更新 ──
@@ -2041,6 +2246,7 @@ impl App {
         ));
 
         // ── 永続ワーカー + (必要なら) 動画スレッドを起動 ──
+        let spawn_t0 = std::time::Instant::now();
         let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         self.reload_queue = Some(Arc::clone(&reload_queue));
@@ -2056,6 +2262,15 @@ impl App {
         );
         if !video_items.is_empty() {
             self.spawn_video_thread(tx, cancel, video_items, self.video_thumb_overrides.clone());
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_spawn_workers",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(spawn_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
         }
 
         // ── 履歴復元 + last_folder 保存 ──
@@ -2076,9 +2291,29 @@ impl App {
             }
         }
         // 検索結果用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
+        let save_t0 = std::time::Instant::now();
         if source_path != search_results_synthetic_path() {
             self.settings.last_folder = Some(source_path);
             self.settings.save();
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_settings_save",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(save_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+            crate::perf::event(
+                "nav",
+                "sli_end",
+                None,
+                sli_seq,
+                &[
+                    ("ms", serde_json::Value::from(sli_t0.elapsed().as_secs_f64() * 1000.0)),
+                    ("items", serde_json::Value::from(items_len)),
+                ],
+            );
         }
     }
 
@@ -3499,6 +3734,9 @@ impl App {
         // 結果は poll_folder_nav で非同期に受信する。
         // 検索コンテキスト中は検索結果内での前後移動に置き換える。
         if ctrl_down {
+            // perf: グリッドの Ctrl+↓ を input イベントとして記録 (fullscreen 側と対称)。
+            // これで入力 → DFS → load_folder → 初フレームまでを seq で相関できる。
+            self.bump_input_seq("grid_ctrl_nav", Some("forward"));
             if in_favsearch {
                 self.favsearch_ctrl_nav(true);
             } else if let Some(cur) = self.effective_folder() {
@@ -3508,6 +3746,7 @@ impl App {
 
         // Ctrl+↑: 深さ優先で前のフォルダへ（画像なしはスキップ）
         if ctrl_up {
+            self.bump_input_seq("grid_ctrl_nav", Some("backward"));
             if in_favsearch {
                 self.favsearch_ctrl_nav(false);
             } else if let Some(cur) = self.effective_folder() {
@@ -3575,7 +3814,28 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
 
+        // perf: DFS のユーザー入力相関 seq を thread に渡す。
+        // chain_folder_nav_if_pending 経由の連鎖 DFS でも同じ seq が伝搬するので、
+        // 1 回のキー押下で起きた DFS バーストを 1 つの seq でまとめて追える。
+        let perf_seq = self.input_seq;
+        let perf_mode = format!("{mode:?}");
+        let start_path_disp = current.display().to_string();
+
         std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "nav",
+                    "dfs_begin",
+                    None,
+                    perf_seq,
+                    &[
+                        ("forward", serde_json::Value::from(forward)),
+                        ("mode", serde_json::Value::from(perf_mode.clone())),
+                        ("start", serde_json::Value::from(start_path_disp.clone())),
+                    ],
+                );
+            }
             let result = if forward {
                 navigate_folder_with_skip(
                     &current, next_folder_dfs, skip_limit, Some(&cancel_w),
@@ -3585,7 +3845,33 @@ impl App {
                     &current, prev_folder_dfs, skip_limit, Some(&cancel_w),
                 )
             };
-            if !cancel_w.load(Ordering::Relaxed) {
+            let cancelled = cancel_w.load(Ordering::Relaxed);
+            if crate::perf::is_enabled() {
+                let hit = result
+                    .as_ref()
+                    .map(|o| o.path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let hit_image_folder = result
+                    .as_ref()
+                    .map(|o| o.hit_image_folder)
+                    .unwrap_or(false);
+                crate::perf::event(
+                    "nav",
+                    "dfs_end",
+                    None,
+                    perf_seq,
+                    &[
+                        ("ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
+                        ("forward", serde_json::Value::from(forward)),
+                        ("mode", serde_json::Value::from(perf_mode)),
+                        ("cancelled", serde_json::Value::from(cancelled)),
+                        ("found", serde_json::Value::from(result.is_some())),
+                        ("hit_image_folder", serde_json::Value::from(hit_image_folder)),
+                        ("hit_path", serde_json::Value::from(hit)),
+                    ],
+                );
+            }
+            if !cancelled {
                 let _ = tx.send(result);
             }
         });
@@ -3656,6 +3942,42 @@ impl App {
     /// DFS 完了時の後処理。モードに応じて load_folder / open_fullscreen /
     /// favsearch の stack push や sibling fallback を使い分ける。
     fn apply_folder_nav_result(&mut self, ctx: &egui::Context, result: FolderNavResult) {
+        // perf: DFS 結果を UI スレッドで適用する区間 (close_fullscreen + load_folder +
+        // open_fullscreen 等) の wall time を計測する。Ctrl+↑↓ 連打中に UI が詰まる
+        // 原因がここに集まるため、ms を必ず記録する。
+        let apply_t0 = std::time::Instant::now();
+        let apply_seq = self.input_seq;
+        let apply_mode_str = format!("{:?}", result.mode);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "apply_begin",
+                None,
+                apply_seq,
+                &[
+                    ("forward", serde_json::Value::from(result.forward)),
+                    ("mode", serde_json::Value::from(apply_mode_str.clone())),
+                    ("found", serde_json::Value::from(result.path.is_some())),
+                    ("hit_image_folder", serde_json::Value::from(result.hit_image_folder)),
+                ],
+            );
+        }
+        // 内部関数として展開して、全 early-return 前に emit_end を呼ぶ。
+        let emit_end = |t0: std::time::Instant, seq: u64, mode: &str, reason: &'static str| {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "nav",
+                    "apply_end",
+                    None,
+                    seq,
+                    &[
+                        ("ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
+                        ("mode", serde_json::Value::from(mode.to_string())),
+                        ("reason", serde_json::Value::from(reason)),
+                    ],
+                );
+            }
+        };
         let Some(path) = result.path else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
@@ -3677,6 +3999,7 @@ impl App {
                 }
                 FolderNavMode::Grid => {}
             }
+            emit_end(apply_t0, apply_seq, &apply_mode_str, "dfs_empty");
             return;
         };
         // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像の無い
@@ -3690,6 +4013,7 @@ impl App {
                 },
             );
             self.pending_folder_nav_steps = 0;
+            emit_end(apply_t0, apply_seq, &apply_mode_str, "fs_boundary");
             return;
         }
         match result.mode {
@@ -3709,11 +4033,13 @@ impl App {
                 // ことがあるため、その前後の両方でチェックする。
                 if self.pdf_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
+                    emit_end(apply_t0, apply_seq, &apply_mode_str, "pdf_enumerate_defer");
                     return;
                 }
                 let target_idx = self.find_fullscreen_nav_target(result.forward);
                 if self.pdf_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
+                    emit_end(apply_t0, apply_seq, &apply_mode_str, "pdf_enumerate_defer");
                     return;
                 }
                 if let Some(new_idx) = target_idx {
@@ -3742,6 +4068,7 @@ impl App {
                 }
             }
         }
+        emit_end(apply_t0, apply_seq, &apply_mode_str, "done");
     }
 
     /// Ctrl+↑↓ フルスクリーン遷移後の表示対象 item index を決める。
@@ -4322,30 +4649,33 @@ impl App {
 
         let mut matches = std::collections::HashSet::new();
 
-        // XMP は xmp_cache に事前一括投入する。キーワードを変えて検索を繰り返しても
-        // JPEG/MP4 を再オープンしないようにするため (read_tweet_info は JPEG/PNG で
-        // ファイル全体、MP4/MOV は先頭 512KB を読む)。キーは metadata_cache_key と
-        // 同じ形式で、フォルダ遷移時に xmp_cache.clear() で破棄される。
-        let mut xmp_to_load: Vec<(String, PathBuf)> = Vec::new();
-        for item in &self.items {
-            let path = match item {
-                GridItem::Image(p) | GridItem::Video(p) => p,
-                _ => continue,
-            };
-            let key = crate::adjustment_db::normalize_path(path);
-            if !self.xmp_cache.contains_key(&key) {
-                xmp_to_load.push((key, path.clone()));
-            }
-        }
-        for (key, path) in xmp_to_load {
-            let xmp = crate::xmp_reader::read_tweet_info(&path);
-            self.xmp_cache.insert(key, xmp);
-        }
+        // Image/Video は XMP を lazy に読む。**全件事前ロードすると大フォルダで
+        // UI スレッドが数百ms〜数秒ブロックする** (JPEG/PNG はファイル全体、
+        // MP4/MOV は先頭 512KB)。先にファイル名 + PNG メタ (cheap) で
+        // `decide_partial` し、XMP を読まないと結果が決まらない時だけ読み出す。
+        // 典型例「ファイル名に 'cat' を含む」なら XMP ゼロ回読み出しで済む。
+        //
+        // NOTE: 事前に Image/Video の path を収集してから処理するのは、
+        // ループ内で `self.xmp_cache.insert(...)` による可変借用が
+        // `&self.items` の不変借用と衝突しないようにするため。
+        #[derive(Clone, Copy)]
+        enum MediaKind { Image, Video }
+        let media: Vec<(usize, PathBuf, MediaKind)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| match item {
+                GridItem::Image(p) => Some((idx, p.clone(), MediaKind::Image)),
+                GridItem::Video(p) => Some((idx, p.clone(), MediaKind::Video)),
+                _ => None,
+            })
+            .collect();
 
         // ZIP 内 PNG は ZIP ごとにまとめてから処理する (open を 1 回にするため)。
         let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
             std::collections::HashMap::new();
 
+        // 構造アイテム + ZIP/PDF 系は `self.items` を借用するだけなので先に処理。
         for (idx, item) in self.items.iter().enumerate() {
             match item {
                 // ナビゲーション用の構造アイテムは常に表示
@@ -4356,30 +4686,8 @@ impl App {
                 | GridItem::ZipSeparator { .. } => {
                     matches.insert(idx);
                 }
-                GridItem::Image(path) => {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let meta_text = if is_png_path(path) {
-                        crate::png_metadata::build_searchable_from_path(path)
-                    } else {
-                        String::new()
-                    };
-                    let xmp = self
-                        .xmp_cache
-                        .get(&crate::adjustment_db::normalize_path(path))
-                        .and_then(|o| o.as_ref());
-                    if crate::search_query::matches(&tokens, &hay_of(&meta_text, name, xmp)) {
-                        matches.insert(idx);
-                    }
-                }
-                GridItem::Video(path) => {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let xmp = self
-                        .xmp_cache
-                        .get(&crate::adjustment_db::normalize_path(path))
-                        .and_then(|o| o.as_ref());
-                    if crate::search_query::matches(&tokens, &hay_of("", name, xmp)) {
-                        matches.insert(idx);
-                    }
+                GridItem::Image(_) | GridItem::Video(_) => {
+                    // 下の lazy ループで処理する
                 }
                 GridItem::ZipImage { zip_path, entry_name } => {
                     if is_png_entry(entry_name) {
@@ -4397,6 +4705,46 @@ impl App {
                 GridItem::PdfPage { .. } => {
                     if crate::search_query::matches(&tokens, &item.name()) {
                         matches.insert(idx);
+                    }
+                }
+            }
+        }
+
+        // Image/Video: cheap な判定で決着しないものだけ XMP を読む。
+        for (idx, path, kind) in &media {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let meta_text = if matches!(kind, MediaKind::Image) && is_png_path(path) {
+                crate::png_metadata::build_searchable_from_path(path)
+            } else {
+                String::new()
+            };
+            // XMP 無しで判定できるか試す
+            let hay_without_xmp = hay_of(&meta_text, &name, None);
+            match crate::search_query::decide_partial(&tokens, &hay_without_xmp) {
+                crate::search_query::PartialResult::Decided(true) => {
+                    matches.insert(*idx);
+                }
+                crate::search_query::PartialResult::Decided(false) => {
+                    // 不一致確定 — XMP を読む必要なし
+                }
+                crate::search_query::PartialResult::NeedsMore => {
+                    // XMP で補う必要がある。キャッシュになければ今読んでキャッシュに保存。
+                    let key = crate::adjustment_db::normalize_path(path);
+                    if !self.xmp_cache.contains_key(&key) {
+                        let xmp = crate::xmp_reader::read_tweet_info(path);
+                        self.xmp_cache.insert(key.clone(), xmp);
+                    }
+                    let xmp_opt = self
+                        .xmp_cache
+                        .get(&key)
+                        .and_then(|o| o.as_ref());
+                    let hay = hay_of(&meta_text, &name, xmp_opt);
+                    if crate::search_query::matches(&tokens, &hay) {
+                        matches.insert(*idx);
                     }
                 }
             }
@@ -5107,6 +5455,27 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
+        // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
+        // 実行される。ms を計測してブロックの所在を特定する。
+        let cf_t0 = std::time::Instant::now();
+        let cf_seq = self.input_seq;
+        let cf_was_open = self.fullscreen_idx.is_some();
+        let cf_fs_cache = self.fs_cache.len();
+        let cf_ai_cache = self.ai_upscale_cache.len();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "close_fullscreen_begin",
+                None,
+                cf_seq,
+                &[
+                    ("was_open", serde_json::Value::from(cf_was_open)),
+                    ("fs_cache", serde_json::Value::from(cf_fs_cache)),
+                    ("ai_cache", serde_json::Value::from(cf_ai_cache)),
+                ],
+            );
+        }
         // フルスクリーン発起点の Ctrl+↑↓ DFS が走っていたら、ユーザーが
         // フルスクリーンを抜けた = フルスクリーン復帰の意図がなくなったとみなし
         // キャンセルする。apply_folder_nav_result 内の close_fullscreen
@@ -5146,6 +5515,20 @@ impl App {
         self.ai_upscale_pending.clear();
         self.ai_upscale_cache.clear();
         self.ai_classify_cache.clear();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "close_fullscreen_end",
+                None,
+                cf_seq,
+                &[
+                    ("ms", serde_json::Value::from(cf_t0.elapsed().as_secs_f64() * 1000.0)),
+                    ("was_open", serde_json::Value::from(cf_was_open)),
+                    ("fs_cache", serde_json::Value::from(cf_fs_cache)),
+                    ("ai_cache", serde_json::Value::from(cf_ai_cache)),
+                ],
+            );
+        }
     }
 
     // -------------------------------------------------------------------

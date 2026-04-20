@@ -95,6 +95,55 @@ pub fn matches(tokens: &[Token], hay: &str) -> bool {
     true
 }
 
+/// `decide_partial` の戻り値。追加情報 (XMP 等) を取得する必要があるかを示す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialResult {
+    /// 現在の hay のみで結果が確定した。追加情報を読む必要はない。
+    Decided(bool),
+    /// `include` トークンが hay に未発見、または `exclude` トークンが hay に
+    /// 未発見 (= 追加情報に混入している可能性あり) のため、追加情報が必要。
+    NeedsMore,
+}
+
+/// hay_so_far だけで確定判定できるかを返す。Ctrl+F メタデータ検索で、
+/// 高コストな XMP 読み込みを「避けられる時は避ける」ための事前判定に使う。
+///
+/// 戻り値は以下 3 種類:
+/// - `Decided(false)`: `exclude` トークンが hay_so_far に**含まれている** 。
+///   追加情報に関わらず不一致確定なので XMP を読む必要なし。
+/// - `Decided(true)`: 全 `include` トークンが hay_so_far に含まれ、かつ `exclude`
+///   トークンが**1 つも無い** (クエリに `-X` が無い)。追加情報が増えても
+///   結果は変わらないので XMP を読む必要なし。
+/// - `NeedsMore`: 上記以外 — include が欠けているか、exclude が存在して未確認。
+///   追加情報で結果が覆り得るので、追加情報を読んでから `matches` で再判定する。
+pub fn decide_partial(tokens: &[Token], hay_so_far: &str) -> PartialResult {
+    if tokens.is_empty() {
+        return PartialResult::Decided(true);
+    }
+    let hay_lower = hay_so_far.to_lowercase();
+    let mut any_include_missing = false;
+    let mut has_exclude = false;
+    for t in tokens {
+        if t.include {
+            if !hay_lower.contains(&t.needle) {
+                any_include_missing = true;
+            }
+        } else {
+            has_exclude = true;
+            if hay_lower.contains(&t.needle) {
+                return PartialResult::Decided(false);
+            }
+        }
+    }
+    if any_include_missing || has_exclude {
+        // include が足りない場合は追加情報で補える可能性あり。
+        // exclude が存在する場合は追加情報にも含まれていないかを確認する必要あり。
+        PartialResult::NeedsMore
+    } else {
+        PartialResult::Decided(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +251,59 @@ mod tests {
     fn matches_empty_tokens() {
         // トークン 0 個は常にマッチ
         assert!(matches(&[], "anything"));
+    }
+
+    // ---- decide_partial ----
+
+    #[test]
+    fn decide_partial_all_includes_no_excludes() {
+        // 全 include が hay にあり exclude なし → Decided(true)
+        let t = parse("foo bar");
+        assert_eq!(decide_partial(&t, "foo and bar"), PartialResult::Decided(true));
+    }
+
+    #[test]
+    fn decide_partial_include_missing() {
+        // include が hay に欠けている → 追加情報で補えるかもしれないので NeedsMore
+        let t = parse("foo bar");
+        assert_eq!(decide_partial(&t, "only foo"), PartialResult::NeedsMore);
+    }
+
+    #[test]
+    fn decide_partial_exclude_hit() {
+        // exclude が hay に存在する時点で不一致確定 → Decided(false)
+        let t = parse("foo -bad");
+        assert_eq!(decide_partial(&t, "foo has bad"), PartialResult::Decided(false));
+    }
+
+    #[test]
+    fn decide_partial_exclude_not_found_yet() {
+        // exclude が未発見でも、追加情報に入っているかを検証する必要あり → NeedsMore
+        let t = parse("foo -bad");
+        assert_eq!(decide_partial(&t, "foo is clean"), PartialResult::NeedsMore);
+    }
+
+    #[test]
+    fn decide_partial_exclude_only_missing_in_hay() {
+        // "-bad" のみの場合、hay に bad が無くても追加情報確認が必要 → NeedsMore
+        let t = parse("-bad");
+        assert_eq!(decide_partial(&t, "anything"), PartialResult::NeedsMore);
+    }
+
+    #[test]
+    fn decide_partial_empty_tokens() {
+        // トークン 0 個は常に Decided(true) (追加情報を読む必要なし)
+        assert_eq!(decide_partial(&[], "anything"), PartialResult::Decided(true));
+    }
+
+    #[test]
+    fn decide_partial_exclude_hit_short_circuits_missing_include() {
+        // exclude が見つかれば、他の include が欠けていても Decided(false) を返す
+        // (追加情報を読む必要なし)
+        let t = parse("missing -bad");
+        assert_eq!(
+            decide_partial(&t, "text with bad here"),
+            PartialResult::Decided(false),
+        );
     }
 }
