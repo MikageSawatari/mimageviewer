@@ -544,6 +544,11 @@ const TAG_REGISTRY: &[TagInfo] = &[
     TagInfo { name: "XPSubject",                display: "件名 (Windows)",        group: TagGroup::Other },
     TagInfo { name: "MakerNote",                display: "メーカーノート",        group: TagGroup::Other },
     TagInfo { name: "PrintImageMatching",       display: "Print Image Matching",  group: TagGroup::Other },
+    // TIFF Rev 6.0 の構造系タグ。1st IFD (サムネイル) の保管情報で、
+    // 一般ユーザーには無価値。default_exif_hidden_tags で既定非表示。
+    TagInfo { name: "Compression",              display: "圧縮方式",              group: TagGroup::Other },
+    TagInfo { name: "JPEGInterchangeFormat",    display: "JPEG オフセット",       group: TagGroup::Other },
+    TagInfo { name: "JPEGInterchangeFormatLength", display: "JPEG データ長",      group: TagGroup::Other },
 ];
 
 /// canonical タグ名から日本語表示名を返す。未登録ならそのまま。
