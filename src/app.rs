@@ -3965,15 +3965,17 @@ impl App {
         self.ensure_metadata_loaded(idx);
     }
 
-    /// メタデータ / EXIF キャッシュ用の正規化キーを返す。
+    /// メタデータ / EXIF / XMP キャッシュ用の正規化キーを返す。
     ///
-    /// `Image` は正規化パス、`ZipImage` は `zip_path::entry_name`、
+    /// `Image` / `Video` は正規化パス、`ZipImage` は `zip_path::entry_name`、
     /// `PdfPage` は `pdf_path::page_N` の形式で、ZIP エントリ・PDF ページごとに
     /// 衝突しないキーを返す ([`App::page_path_key`] と同じ規約)。
+    /// 動画は EXIF/AI metadata は持たないが、mXD が埋めた XMP (X ツイート情報)
+    /// を表示する必要があるため、メタデータキーを発行する。
     pub(crate) fn metadata_cache_key(&self, idx: usize) -> Option<String> {
         let item = self.items.get(idx)?;
         let key = match item {
-            GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
+            GridItem::Image(p) | GridItem::Video(p) => crate::adjustment_db::normalize_path(p),
             GridItem::ZipImage { zip_path, entry_name } => {
                 format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
             }
@@ -4025,10 +4027,13 @@ impl App {
             self.exif_cache.insert(key.clone(), exif);
         }
 
-        // XMP (mXD の X/Twitter メタデータ)
+        // XMP (mXD の X/Twitter メタデータ)。mXD は MP4/MOV にも XMP を埋めるので
+        // Video item でも読む。
         if !self.xmp_cache.contains_key(&key) {
             let xmp = match self.items.get(idx) {
-                Some(GridItem::Image(p)) => crate::xmp_reader::read_tweet_info(p),
+                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => {
+                    crate::xmp_reader::read_tweet_info(p)
+                }
                 Some(GridItem::ZipImage { zip_path, entry_name }) => {
                     if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
                         crate::xmp_reader::read_tweet_info_from_bytes(&bytes)

@@ -77,12 +77,20 @@ fn extension_might_have_xmp(path: &Path) -> bool {
 
 /// パスから読み取って [`XmpTweetInfo`] を返す。
 /// XMP パケットが無い / `xtw:*` プロパティが無い場合は None。
+///
+/// 数百 MB の動画や巨大 TIFF を全読みすると `ensure_metadata_loaded` (UI 同期)
+/// が固まるので、先頭 [`FALLBACK_SCAN_LIMIT`] バイトだけ読む。mXD / ExifTool が
+/// 書く XMP は JPEG APP1 / PNG iTXt / MP4 uuid いずれもコンテナ先頭部に置かれる
+/// 仕様で、512KB あれば実用上十分。
 pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
     if !extension_might_have_xmp(path) {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    read_tweet_info_from_bytes(&bytes)
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
+    f.take(FALLBACK_SCAN_LIMIT as u64).read_to_end(&mut buf).ok()?;
+    read_tweet_info_from_bytes(&buf)
 }
 
 /// バイト列版 (ZIP 内画像などで使用)。拡張子で事前フィルタできないので、
