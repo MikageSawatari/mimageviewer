@@ -19,6 +19,7 @@
 | --- | --- |
 | サムネイル / フルスクリーン描画 / 回転 / 表示変換 | [docs/display-pipeline.md](docs/display-pipeline.md) |
 | ワーカー追加・キャッシュ・キャンセル処理 | [docs/async-architecture.md](docs/async-architecture.md) |
+| UI スレッドから新しい同期 I/O / GPU アップロード / read_dir 走査を呼ぶ | [docs/ui-responsiveness.md](docs/ui-responsiveness.md) (§4 チェックリスト) |
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
 | 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
 | UI の見た目・配色を変える修正 | [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) (egui_kittest スナップショットの更新手順) |
@@ -236,6 +237,34 @@ egui::Window::new("...").show(ctx, |ui| {
 - 実例: `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher`
 - `try_lock` 自体は「取れなければ今回は諦める」best-effort 用途のみ OK
 
+### UI スレッドでの同期 I/O は即 worker 化する ⚠️
+
+`App::update` から (呼び出し先を含めて) 同期実行される処理で以下を行うと、
+Ctrl+↑↓ 連打や Ctrl+F 検索で UI が引っかかる。**新機能追加時は必ず
+[docs/ui-responsiveness.md](docs/ui-responsiveness.md) §4 のチェックリストを通す**。
+
+禁止 / worker 化必須な処理:
+
+- **ファイル全体を読む** (`std::fs::read`, `File::open` + `read_to_end`): 画像デコード・
+  XMP/EXIF/PNG メタ抽出など。worker thread + mpsc + cancel トークンに移す。
+  実例: `start_fs_load`, `start_metadata_load`, `execute_search`。
+- **`ctx.load_texture` を 1 フレームに複数回**: 20MP RGBA で 26-58ms/枚。`fs_upload_backlog`
+  パターンで 1 フレーム 1 枚、現在ページのみ即時にする。
+- **`std::fs::read_dir` ループで `Path::is_dir()` / `is_file()`**: Windows で per-entry
+  `GetFileAttributes` syscall が走り、数百ファイルで 500-1000ms ブロック。
+  **必ず `entry.file_type()` を使う** (`FindFirstFile` のキャッシュ再利用)。
+- **SQLite の `CatalogDb::open` 相当の cold open**: warm で 5ms 以下だが cold で
+  150ms 超のことあり。毎ステップ走る箇所は避ける。
+- **DFS フォルダ走査**: `navigate_folder_with_skip` は HDD で 1 秒超の事例あり。
+  `spawn_folder_nav` のように別スレッドで走らせる。
+
+worker 化の定型パターン (`XxxPending { cancel, rx }` + `start_xxx` / `poll_xxx` + 3 箇所
+cancel) は [docs/ui-responsiveness.md §2](docs/ui-responsiveness.md) に実装テンプレを
+載せている。
+
+測定は `--perf-log` + `python scripts/analyze_perf.py <path> {startup,nav,hitches}` で。
+追加した同期処理の区間には perf::event を必ず差し込む (悪化を検知できるように)。
+
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
@@ -389,6 +418,7 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 - `docs/architecture-overview.md` — モジュールが増減した、永続化ストアを追加した等の構造変化
 - `docs/display-pipeline.md` — 表示テクスチャ優先順位・変換合成順序・変換適用ポイントを変えたとき
 - `docs/async-architecture.md` — ワーカーを増やした、共有アトミック/チャネルを追加した、キャンセル規約を変えたとき
+- `docs/ui-responsiveness.md` — UI スレッドから新しい I/O / GPU アップロード / read_dir 走査を呼ぶとき、または関連の計装/チェックリストを改定したとき
 - `docs/virtual-folders.md` — ZIP/PDF の分岐表・キャッシュキー規則・DB キー正規化を変えたとき
 - `docs/preset-and-adjustment.md` — キャッシュ無効化ルール・補正/AI の適用順序・プリセットの保存先を変えたとき
 

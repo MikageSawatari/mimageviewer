@@ -274,6 +274,13 @@ std::thread::spawn(move || {
   リサイズは走らない。発動したらログに `clamp_for_gpu (UI-thread fallback)` が出る。
   詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照。
 
+**Ctrl+↑↓ / Ctrl+F / Ctrl+S / open_fullscreen の UI ブロック事件 (2026-04)**:
+ファイル読込・SQLite・GPU アップロード・read_dir など、一見軽そうな処理が per-operation
+で 100ms超ブロックする事例が複数判明した。対策と設計方針は
+[ui-responsiveness.md](ui-responsiveness.md) にまとめてある。新機能追加前に
+§4 チェックリストを必ず見ること。Windows 特有の罠として `Path::is_dir()` が
+per-entry で `GetFileAttributes` syscall を呼ぶ件も記載。
+
 ### 5.4 PDF ワーカー / Susie ワーカーの想定外終了
 
 ワーカープロセスがクラッシュしたら、親は検出して再起動する仕組みになっている。

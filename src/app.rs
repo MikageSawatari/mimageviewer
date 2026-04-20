@@ -945,6 +945,13 @@ pub struct App {
     /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
     /// 100ms 級にブロックしていた問題を解消する。
     pub(crate) metadata_pending: Option<MetadataLoadPending>,
+
+    /// main() 入口で取得した Instant。起動時間計測の t=0 基準に使う。
+    /// perf-log 無効時は None のまま。`startup.*` イベントの `total_ms` 計算に参照。
+    pub(crate) program_start: Option<std::time::Instant>,
+    /// 初回 frame.begin が emit 済みかどうか。起動から初回フレームまでの時間を
+    /// `startup.first_frame` として 1 回だけ打刻するために使う。
+    pub(crate) startup_first_frame_emitted: bool,
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -1383,6 +1390,8 @@ impl Default for App {
             search_pending: None,
             favsearch_pending: None,
             metadata_pending: None,
+            program_start: None,
+            startup_first_frame_emitted: false,
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -2403,6 +2412,11 @@ impl App {
         }
         self.close_fullscreen();
 
+        // close_fullscreen_end と sli_prewarm_rating の間に 374ms のギャップが
+        // 起動直後 1 回だけ観測されたため (docs/perf-investigation-handoff.md 参照)、
+        // 以下 3 区間 (nav cancel / items 割当 / キャッシュ clear) に分けて
+        // perf イベントを打ち、真因を特定できるようにする。
+        let cancel_t0 = std::time::Instant::now();
         // 進行中のフォルダナビゲーションをキャンセル
         // (他の経路でフォルダが変更された場合に不要な結果を破棄する)
         if let Some(pending) = self.folder_nav_pending.take() {
@@ -2420,8 +2434,20 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
+        // 古い rx の drop が走る。mpsc::Receiver 自体の drop は軽いが、
+        // 送信前にバッファ内に残ったメッセージ (ColorImage 等) は drop される。
         self.rx = rx;
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_nav_cancel",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(cancel_t0.elapsed().as_secs_f64() * 1000.0))],
+            );
+        }
 
+        let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
         self.address = source_path.to_string_lossy().to_string();
         // 通常ロードでは変換済みアーカイブ override を解除 (呼び出し元が後で再設定する)。
@@ -2431,11 +2457,32 @@ impl App {
         self.scroll_to_selected = false;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
+        // items 代入は旧 items (PathBuf 含む) の drop も含む。
         self.items = items;
         self.image_metas = image_metas;
         self.thumbnails = (0..self.items.len())
             .map(|_| ThumbnailState::Pending)
             .collect();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_items_assign",
+                None,
+                sli_seq,
+                &[
+                    ("ms", serde_json::Value::from(assign_t0.elapsed().as_secs_f64() * 1000.0)),
+                    ("items", serde_json::Value::from(self.items.len())),
+                ],
+            );
+        }
+
+        // ── キャッシュクリア区間 ──
+        // 複数の HashMap を順次 drop する。ColorImage (metadata_cache は None/AiMetadata
+        // のみなので軽い) や texture_backlog (大きなピクセル配列) を保持している場合は
+        // ここで大量のメモリ解放が発生する可能性がある (起動直後の謎 374ms 容疑区間)。
+        let clear_t0 = std::time::Instant::now();
+        let texture_backlog_len = self.texture_backlog.len();
+        let fs_upload_backlog_len = self.fs_upload_backlog.len();
         self.requested.clear();
         self.pending_finalize.clear();
         self.texture_backlog.clear();
@@ -2446,6 +2493,19 @@ impl App {
         self.checked.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_cache_clear",
+                None,
+                sli_seq,
+                &[
+                    ("ms", serde_json::Value::from(clear_t0.elapsed().as_secs_f64() * 1000.0)),
+                    ("texture_backlog", serde_json::Value::from(texture_backlog_len)),
+                    ("fs_upload_backlog", serde_json::Value::from(fs_upload_backlog_len)),
+                ],
+            );
+        }
         // 1 回のクエリで全アイテムのレーティングを引いてキャッシュに載せる。
         // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
@@ -7694,6 +7754,24 @@ impl eframe::App for App {
                 self.input_seq,
                 &[("n", serde_json::Value::from(self.frame_counter))],
             );
+            // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
+            // `total_ms` に main() 入口からの累計経過を載せる。creator_exit との差分が
+            // wgpu パイプライン構築 + winit 初期描画準備の時間になる。
+            if !self.startup_first_frame_emitted {
+                self.startup_first_frame_emitted = true;
+                if let Some(prog) = self.program_start {
+                    crate::perf::event(
+                        "startup",
+                        "first_frame",
+                        None,
+                        0,
+                        &[(
+                            "total_ms",
+                            serde_json::Value::from(prog.elapsed().as_secs_f64() * 1000.0),
+                        )],
+                    );
+                }
+            }
             // 約 1 秒に 1 回 flush (BufWriter のデータをディスクへ)
             let now = std::time::Instant::now();
             let should_flush = self

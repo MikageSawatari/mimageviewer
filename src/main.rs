@@ -52,32 +52,43 @@ pub mod xmp_reader;
 pub mod zip_loader;
 
 use std::sync::Arc;
+use std::time::Instant;
+
+/// 起動時間計測ヘルパー: `startup.<step>` perf イベントを emit する。
+/// `prog_start` は main() 入口で取得した Instant、`phase_start` は当該フェーズ開始時。
+/// ユーザーの perf-log 有効時のみ実際にレコードされる。
+fn emit_startup(step: &str, prog_start: Instant, phase_start: Instant) {
+    if !perf::is_enabled() { return; }
+    let total_ms = prog_start.elapsed().as_secs_f64() * 1000.0;
+    let ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+    perf::event(
+        "startup",
+        step,
+        None,
+        0,
+        &[
+            ("ms", serde_json::Value::from(ms)),
+            ("total_ms", serde_json::Value::from(total_ms)),
+        ],
+    );
+}
 
 fn main() -> eframe::Result {
+    // main() 入口の Instant を起動時間計測の t=0 とする。
+    // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
+    // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
+    let prog_start = Instant::now();
+
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
     if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
         pdf_loader::run_worker_process();
         std::process::exit(0);
     }
 
+    // data_dir::init() は perf::init が logs_dir を使うため先行させる必要がある。
+    let t0 = Instant::now();
     data_dir::init();
-
-    // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
-    ai::model_manager::ensure_models_extracted();
-
-    // Susie 32bit ワーカー exe を %APPDATA%\mimageviewer\mimageviewer-susie32.exe に展開。
-    // PDFium DLL と同じパターンで本体 exe に埋め込み、初回起動時に書き出す。
-    susie_loader::ensure_worker_extracted();
-
-    // Susie プラグインワーカープール: バックグラウンドで初期化する
-    // (プラグインが多いと handshake に数百ms かかる可能性があるため、
-    //  起動 UI をブロックしないようスレッドに逃がす)
-    std::thread::Builder::new()
-        .name("susie-init".to_string())
-        .spawn(|| {
-            let _ = susie_loader::get_pool();
-        })
-        .ok();
+    let data_dir_elapsed = t0.elapsed();
 
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
     let log_enabled = cfg!(debug_assertions)
@@ -88,8 +99,44 @@ fn main() -> eframe::Result {
 
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。
+    // prog_start を基準にすることで startup.* イベントの `total_ms` が真の経過時間を指す。
     let perf_enabled = std::env::args().any(|a| a == "--perf-log");
-    perf::init(perf_enabled);
+    perf::init(perf_enabled, Some(prog_start));
+
+    // 起動時間計測: data_dir 初期化の所要時間 (先行ステップなので perf::init 後に打つ)
+    if perf::is_enabled() {
+        perf::event(
+            "startup",
+            "data_dir_init",
+            None,
+            0,
+            &[
+                ("ms", serde_json::Value::from(data_dir_elapsed.as_secs_f64() * 1000.0)),
+                ("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0)),
+            ],
+        );
+    }
+
+    // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
+    let t = Instant::now();
+    ai::model_manager::ensure_models_extracted();
+    emit_startup("models_extract", prog_start, t);
+
+    // Susie 32bit ワーカー exe を %APPDATA%\mimageviewer\mimageviewer-susie32.exe に展開。
+    // PDFium DLL と同じパターンで本体 exe に埋め込み、初回起動時に書き出す。
+    let t = Instant::now();
+    susie_loader::ensure_worker_extracted();
+    emit_startup("susie_worker_extract", prog_start, t);
+
+    // Susie プラグインワーカープール: バックグラウンドで初期化する
+    // (プラグインが多いと handshake に数百ms かかる可能性があるため、
+    //  起動 UI をブロックしないようスレッドに逃がす)
+    std::thread::Builder::new()
+        .name("susie-init".to_string())
+        .spawn(|| {
+            let _ = susie_loader::get_pool();
+        })
+        .ok();
 
     // パニック時にログファイルへ記録するフック（windows_subsystem = "windows" では
     // stderr が見えないため、ここで捕捉しないとクラッシュ原因が不明になる）
@@ -119,16 +166,22 @@ fn main() -> eframe::Result {
     }));
 
     // 保存済み設定からウィンドウ初期状態を決定する
+    let t = Instant::now();
     let saved = settings::Settings::load();
+    emit_startup("settings_load", prog_start, t);
 
     let default_size = [1280.0_f32, 800.0_f32];
     // --window-size WxH 引数があればそれを優先（スクリーンショット用）
     let size = parse_window_size_arg().unwrap_or_else(|| saved.window_size.unwrap_or(default_size));
 
+    let t = Instant::now();
+    let icon = Arc::new(load_icon());
+    emit_startup("load_icon", prog_start, t);
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
         .with_inner_size(size)
-        .with_icon(Arc::new(load_icon()));
+        .with_icon(icon);
 
     // --window-size 指定時は位置を画面左上寄りに固定（保存済み位置は無視）
     if parse_window_size_arg().is_some() {
@@ -145,23 +198,62 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // eframe::run_native に入る手前までを 1 つの marker として記録する。
+    // これ以降は eframe (winit + wgpu) の初期化が走り、creator closure が呼ばれる。
+    if perf::is_enabled() {
+        perf::event(
+            "startup",
+            "before_run_native",
+            None,
+            0,
+            &[("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0))],
+        );
+    }
+
     eframe::run_native(
         "mimageviewer",
         options,
         Box::new(move |cc| {
+            // creator closure: wgpu/winit 初期化後に 1 回だけ呼ばれる。
+            // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
+            if perf::is_enabled() {
+                perf::event(
+                    "startup",
+                    "creator_enter",
+                    None,
+                    0,
+                    &[("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0))],
+                );
+            }
+            let t = Instant::now();
             setup_fonts(&cc.egui_ctx);
+            emit_startup("setup_fonts", prog_start, t);
             // 起動時点で UI テーマを先行適用して、初回フレームでの
             // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから
             // 効くため、App::update 内で適用すると 1 フレームだけデフォルト
             // ダーク表示になる)。
+            let t = Instant::now();
             let resolved = os_theme::resolve(saved.ui_theme);
             os_theme::apply_resolved(&cc.egui_ctx, resolved);
+            emit_startup("apply_theme", prog_start, t);
+            let t = Instant::now();
             let mut app = app::App::default();
+            emit_startup("app_default", prog_start, t);
             app.applied_ui_theme = Some(resolved);
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
             app.pending_initial_size = Some(size);
+            app.program_start = Some(prog_start);
+            if perf::is_enabled() {
+                perf::event(
+                    "startup",
+                    "creator_exit",
+                    None,
+                    0,
+                    &[("total_ms", serde_json::Value::from(prog_start.elapsed().as_secs_f64() * 1000.0))],
+                );
+            }
             Ok(Box::new(app))
         }),
     )

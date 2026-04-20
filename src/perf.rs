@@ -32,11 +32,17 @@ static START: OnceLock<Instant> = OnceLock::new();
 static FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
 
 /// 起動時に 1 回だけ呼ぶ。`enabled=false` なら何もしない。
-pub fn init(enabled: bool) {
+///
+/// `start_override` に `Some(Instant)` を渡すと、それを `t=0` の基準にする。
+/// `main()` 冒頭で取得した Instant を渡すことで、perf::init よりも前に実行された
+/// 初期化ステップ (data_dir / モデル展開 / Susie 展開 等) の時間も、
+/// 後からイベントとして打刻できる。`None` なら `Instant::now()` を基準にする。
+pub fn init(enabled: bool, start_override: Option<Instant>) {
     if !enabled {
         return;
     }
-    START.set(Instant::now()).ok();
+    let start = start_override.unwrap_or_else(Instant::now);
+    START.set(start).ok();
     let log_dir = crate::data_dir::logs_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("perf_events.jsonl");

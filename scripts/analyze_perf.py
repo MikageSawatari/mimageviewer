@@ -20,6 +20,9 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
                         start_loading_items / close_fullscreen) を集計
     hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
                         表示 (デフォルト 33ms = 30fps 閾値)
+    startup             起動時間のフェーズ別 breakdown (data_dir / models /
+                        susie_worker / settings / icon / fonts / theme / app_default /
+                        creator_enter/exit / first_frame) を表示
 
 依存:
     標準ライブラリのみ必須。timeline は matplotlib、latency 詳細統計は任意で pandas。
@@ -468,6 +471,58 @@ def cmd_nav(events: list[dict]) -> None:
 
 
 # -----------------------------------------------------------------------
+# startup — 起動時間のフェーズ別 breakdown
+# -----------------------------------------------------------------------
+
+def cmd_startup(events: list[dict]) -> None:
+    """main() 入口から first_frame までの各フェーズ経過時間を表示する。
+
+    emit 側 (main.rs / app.rs) から打たれるイベント:
+      - data_dir_init / models_extract / susie_worker_extract /
+        settings_load / load_icon / before_run_native / creator_enter /
+        setup_fonts / apply_theme / app_default / creator_exit / first_frame
+
+    `ms` はそのフェーズ単体の所要時間、`total_ms` は main() 入口からの累計。
+    """
+    startup_events = [e for e in events if e.get("cat") == "startup"]
+    if not startup_events:
+        print("(startup イベントなし — --perf-log 有効で再測定してください)")
+        return
+
+    # 出力順は emit 順を尊重する (t 昇順 = main() の実行順)
+    startup_events.sort(key=lambda e: e.get("t", 0.0))
+
+    print("起動時間フェーズ別 breakdown:")
+    print(f"{'step':<26} {'phase ms':>10} {'total ms':>10}")
+    print("-" * 50)
+    prev_total = 0.0
+    for e in startup_events:
+        step = e.get("kind", "?")
+        ms = e.get("ms")
+        total = e.get("total_ms")
+        # total_ms だけで ms がないマーカーは、差分を計算して表示する
+        if ms is None and total is not None:
+            ms_str = f"{total - prev_total:>10.1f}"
+        elif ms is not None:
+            ms_str = f"{float(ms):>10.1f}"
+        else:
+            ms_str = f"{'-':>10}"
+        total_str = f"{float(total):>10.1f}" if total is not None else f"{'-':>10}"
+        print(f"{step:<26} {ms_str} {total_str}")
+        if total is not None:
+            prev_total = float(total)
+
+    # 最後の first_frame の total_ms を起動時間として明示
+    final = next(
+        (e for e in reversed(startup_events) if e.get("kind") == "first_frame"),
+        None,
+    )
+    if final and final.get("total_ms") is not None:
+        print()
+        print(f"=> 起動から初回フレームまで: {float(final['total_ms']):.0f} ms")
+
+
+# -----------------------------------------------------------------------
 # hitches — フレーム間隔の分布と nav 区間との重なり
 # -----------------------------------------------------------------------
 
@@ -545,6 +600,7 @@ def main() -> None:
     subs.add_parser("priority")
     subs.add_parser("thumbs")
     subs.add_parser("nav")
+    subs.add_parser("startup")
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
     p_dump = subs.add_parser("dump")
@@ -571,6 +627,8 @@ def main() -> None:
         cmd_thumbs(events)
     elif args.cmd == "nav":
         cmd_nav(events)
+    elif args.cmd == "startup":
+        cmd_startup(events)
     elif args.cmd == "hitches":
         cmd_hitches(events, args.ms)
     elif args.cmd == "dump":
