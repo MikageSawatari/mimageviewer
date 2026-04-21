@@ -13,6 +13,8 @@ pub mod folder_tree;
 pub mod fs_animation;
 pub mod fts_index;
 pub mod fts_meta;
+pub mod ingest_text;
+pub mod ingest_worker;
 pub mod gpu_info;
 pub mod io_semaphore;
 pub mod grid_item;

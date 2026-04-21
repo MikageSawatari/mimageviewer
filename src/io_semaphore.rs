@@ -173,19 +173,25 @@ mod tests {
         let sem = Arc::new(GlobalIoSemaphore::new(1));
         let _holder = sem.acquire(IoPriority::Normal); // 先に 1 つ掴む
 
-        // high 優先で acquire する別スレッドを起動 (待機状態に入るのを待つ)
+        // high 優先で acquire する別スレッドを起動
         let sem_h = Arc::clone(&sem);
-        let high_started = Arc::new(AtomicUsize::new(0));
-        let h = Arc::clone(&high_started);
         let handle = std::thread::spawn(move || {
-            h.store(1, Ordering::SeqCst);
             let _p = sem_h.acquire(IoPriority::High);
         });
-        // high が waiting[High] をインクリメントするまで軽く待つ (CI 耐性)
-        while high_started.load(Ordering::SeqCst) == 0 {
+        // high が実際に waiting 状態に入るまで spin-wait (CI 耐性、時間依存を排除)
+        let start = std::time::Instant::now();
+        loop {
+            {
+                let (mu, _) = &*sem.inner;
+                if mu.lock().unwrap().waiting[IoPriority::High as usize] >= 1 {
+                    break;
+                }
+            }
+            if start.elapsed() >= Duration::from_secs(2) {
+                panic!("high waiter did not reach waiting state");
+            }
             std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(30));
 
         // Low 優先で try_acquire: high 待機者がいるので取れない
         assert!(sem.try_acquire(IoPriority::Low).is_none());
@@ -198,7 +204,20 @@ mod tests {
     #[test]
     fn high_priority_acquires_before_low_waiting_longer() {
         // permit=1、Low が先に 1 つ掴む → Low がさらに 1 人待機 + High が 1 人待機 →
-        // holder を release したとき High が先に取得すること
+        // holder を release したとき High が先に取得すること。
+        //
+        // 並列テスト実行時のスケジュール揺れに耐えるため、スレッドが本当に wait 状態に
+        // 入ったことを `waiting` カウンタで spin-wait で確認する (sleep だけだと CI で flaky)。
+        fn wait_until<F: Fn() -> bool>(cond: F, deadline: Duration) {
+            let start = std::time::Instant::now();
+            while !cond() {
+                if start.elapsed() >= deadline {
+                    panic!("wait_until timeout ({deadline:?})");
+                }
+                std::thread::yield_now();
+            }
+        }
+
         let sem = Arc::new(GlobalIoSemaphore::new(1));
         let holder = sem.acquire(IoPriority::Normal);
 
@@ -209,21 +228,34 @@ mod tests {
         let low_handle = std::thread::spawn(move || {
             let _p = sem_low.acquire(IoPriority::Low);
             order_low.lock().unwrap().push("low");
-            std::thread::sleep(Duration::from_millis(10));
         });
 
-        // Low が待機状態に入るのを少し待ってから High を投入
-        std::thread::sleep(Duration::from_millis(20));
+        // Low が本当に wait 状態に入るまで spin
+        let sem_ref = Arc::clone(&sem);
+        wait_until(
+            || {
+                let (mu, _) = &*sem_ref.inner;
+                mu.lock().unwrap().waiting[IoPriority::Low as usize] == 1
+            },
+            Duration::from_secs(2),
+        );
 
         let sem_high = Arc::clone(&sem);
         let order_high = Arc::clone(&order);
         let high_handle = std::thread::spawn(move || {
             let _p = sem_high.acquire(IoPriority::High);
             order_high.lock().unwrap().push("high");
-            std::thread::sleep(Duration::from_millis(10));
         });
 
-        std::thread::sleep(Duration::from_millis(20));
+        // High も wait 状態に入るまで spin
+        let sem_ref = Arc::clone(&sem);
+        wait_until(
+            || {
+                let (mu, _) = &*sem_ref.inner;
+                mu.lock().unwrap().waiting[IoPriority::High as usize] == 1
+            },
+            Duration::from_secs(2),
+        );
         drop(holder); // release
 
         high_handle.join().unwrap();
