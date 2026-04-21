@@ -2053,6 +2053,46 @@ impl App {
         self.last_auto_indexed = Some(path.to_path_buf());
     }
 
+    /// 名前索引フル索引化フラグが ON の favorite について、まだ索引が空なら
+    /// バックグラウンドでバルクスキャンを 1 回走らせる。「お気に入り」ダイアログの
+    /// OK 時に呼ばれる (v0.8.0 Phase 2b)。
+    ///
+    /// - `count_for_favorite` が 0 のもの → 未索引とみなしてバルク起動
+    /// - 1 件でも入っていればスキップ (更新は閲覧時追記と自動で追いつく)
+    /// - ユーザーが明示的に再走査したいときは「名前索引を一括作成…」ボタンから
+    pub(crate) fn trigger_name_bulk_for_enabled_favorites(&mut self) {
+        let Some(db) = self.search_index_db.clone() else {
+            return;
+        };
+        for fav in &self.settings.favorites {
+            if !fav.auto_index_structure {
+                continue;
+            }
+            // 既に索引登録があればスキップ (冪等化)
+            match db.count_for_favorite(&fav.path) {
+                Ok(0) => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "trigger_name_bulk: count_for_favorite failed for {}: {e}",
+                        fav.path.display()
+                    ));
+                    continue;
+                }
+            }
+            let fav_path = fav.path.clone();
+            let db_clone = Arc::clone(&db);
+            // 「お気に入り」ダイアログからの起動なので、キャンセルトークンは引き回さず
+            // プロセス終了まで走らせる (数秒〜数十秒で完了する想定)。
+            let cancel = Arc::new(AtomicBool::new(false));
+            crate::logger::log(format!(
+                "trigger_name_bulk: starting bulk for {}",
+                fav_path.display()
+            ));
+            let _ = crate::name_bulk_indexer::spawn_bulk(fav_path, db_clone, cancel);
+        }
+    }
+
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
     pub(crate) fn open_favsearch(&mut self) {
         self.favsearch.active = true;

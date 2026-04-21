@@ -27,6 +27,7 @@ pub mod fast_resize;
 pub mod logger;
 pub mod mask_db;
 pub mod monitor;
+pub mod name_bulk_indexer;
 pub mod path_key;
 pub mod perf;
 pub mod png_metadata;

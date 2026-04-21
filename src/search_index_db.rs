@@ -83,6 +83,15 @@ impl SearchIndexDb {
         })
     }
 
+    /// メモリ上に空の DB を開く (テスト / 仮計算用)。
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        init_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// 親フォルダ配下の指定アイテムを一括 upsert する。
     /// 親フォルダ直下の既存エントリのうち、`children` に含まれないものは削除する
     /// (差分反映)。

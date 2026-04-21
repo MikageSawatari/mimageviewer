@@ -36,6 +36,7 @@ pub mod search_query;
 pub mod search_walker;
 pub mod search_watcher;
 pub mod mask_db;
+pub mod name_bulk_indexer;
 pub mod settings;
 pub mod sidecar;
 pub mod stats;

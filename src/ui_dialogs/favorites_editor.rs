@@ -362,6 +362,9 @@ impl App {
             if let Some(mgr) = self.indexer_manager.as_mut() {
                 mgr.sync_with_favorites(&self.settings.favorites);
             }
+            // 「名前」フル索引化フラグが ON かつまだ索引未作成の favorite について、
+            // バックグラウンドで 1 回フルスキャンを走らせる (Phase 2b)。
+            self.trigger_name_bulk_for_enabled_favorites();
             self.show_favorites_editor = false;
         } else if cancel || !open {
             // キャンセル: 設定を再読み込みして変更を破棄
