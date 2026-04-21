@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Digest, Sha256};
-use windows_dpapi::{encrypt_data, decrypt_data, Scope};
+use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 
 // -----------------------------------------------------------------------
 // PdfPasswordStore

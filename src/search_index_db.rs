@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 // -----------------------------------------------------------------------
 // 種別
@@ -177,8 +177,10 @@ impl SearchIndexDb {
             "DELETE FROM entries WHERE favorite_root NOT IN ({})",
             placeholders.join(",")
         );
-        let params_vec: Vec<&dyn rusqlite::ToSql> =
-            active_roots.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params_vec: Vec<&dyn rusqlite::ToSql> = active_roots
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
         conn.execute(&sql, params_vec.as_slice())?;
         Ok(())
     }
@@ -281,6 +283,19 @@ impl SearchIndexDb {
                 let v: i64 = r.get(0)?;
                 Ok(v as u64)
             },
+        )
+    }
+
+    /// 指定お気に入り配下にエントリが 1 件でもあるか。
+    /// `count_for_favorite` と異なり **`EXISTS` なので O(log N)** で早く返る。
+    /// バルク起動判定など「0 件か否か」だけを知りたい場面で使う。
+    pub fn has_any_for_favorite(&self, favorite_root: &Path) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let fav_norm = normalize_path(favorite_root);
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE favorite_root = ?1 LIMIT 1)",
+            params![fav_norm],
+            |r| r.get::<_, bool>(0),
         )
     }
 }
@@ -386,10 +401,7 @@ mod tests {
 
     #[test]
     fn is_under_negative() {
-        assert!(!is_under(
-            Path::new(r"C:\Photos2"),
-            Path::new(r"C:\Photos"),
-        ));
+        assert!(!is_under(Path::new(r"C:\Photos2"), Path::new(r"C:\Photos"),));
         assert!(!is_under(Path::new(r"D:\Photos"), Path::new(r"C:\Photos")));
     }
 
@@ -426,20 +438,33 @@ mod tests {
         let parent_a = PathBuf::from(r"C:\Fav\A");
         let parent_b = PathBuf::from(r"C:\Fav\B");
 
-        db.upsert_children(&fav, &parent_a, &[
-            entry(r"C:\Fav\A\x", "x", IndexKind::Folder),
-            entry(r"C:\Fav\A\y", "y", IndexKind::Folder),
-        ]).unwrap();
-        db.upsert_children(&fav, &parent_b, &[
-            entry(r"C:\Fav\B\z", "z", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav,
+            &parent_a,
+            &[
+                entry(r"C:\Fav\A\x", "x", IndexKind::Folder),
+                entry(r"C:\Fav\A\y", "y", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &parent_b,
+            &[entry(r"C:\Fav\B\z", "z", IndexKind::Folder)],
+        )
+        .unwrap();
         assert_eq!(db.total_count().unwrap(), 3);
 
         // A 配下を再 upsert (y を消して w を追加)、B は触らない
-        db.upsert_children(&fav, &parent_a, &[
-            entry(r"C:\Fav\A\x", "x", IndexKind::Folder),
-            entry(r"C:\Fav\A\w", "w", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav,
+            &parent_a,
+            &[
+                entry(r"C:\Fav\A\x", "x", IndexKind::Folder),
+                entry(r"C:\Fav\A\w", "w", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
         let all = db.search("", &[]).unwrap();
         assert_eq!(all.len(), 3);
         let names: Vec<&str> = all.iter().map(|e| e.display_name.as_str()).collect();
@@ -454,12 +479,10 @@ mod tests {
         let db = open_mem();
         let fav1 = PathBuf::from(r"C:\Fav1");
         let fav2 = PathBuf::from(r"C:\Fav2");
-        db.upsert_children(&fav1, &fav1, &[
-            entry(r"C:\Fav1\a", "a", IndexKind::Folder),
-        ]).unwrap();
-        db.upsert_children(&fav2, &fav2, &[
-            entry(r"C:\Fav2\b", "b", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(&fav1, &fav1, &[entry(r"C:\Fav1\a", "a", IndexKind::Folder)])
+            .unwrap();
+        db.upsert_children(&fav2, &fav2, &[entry(r"C:\Fav2\b", "b", IndexKind::Folder)])
+            .unwrap();
         assert_eq!(db.total_count().unwrap(), 2);
 
         db.clear_for_favorite(&fav1).unwrap();
@@ -473,12 +496,18 @@ mod tests {
         let db = open_mem();
         let fav1 = PathBuf::from(r"C:\Fav1");
         let fav2 = PathBuf::from(r"C:\Fav2");
-        db.upsert_children(&fav1, &fav1, &[
-            entry(r"C:\Fav1\match", "match", IndexKind::Folder),
-        ]).unwrap();
-        db.upsert_children(&fav2, &fav2, &[
-            entry(r"C:\Fav2\match", "match", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav1,
+            &fav1,
+            &[entry(r"C:\Fav1\match", "match", IndexKind::Folder)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav2,
+            &fav2,
+            &[entry(r"C:\Fav2\match", "match", IndexKind::Folder)],
+        )
+        .unwrap();
         let results = db.search("match", &[fav1.clone()]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from(r"C:\Fav1\match"));
@@ -488,11 +517,16 @@ mod tests {
     fn search_and_tokens() {
         let db = open_mem();
         let fav = PathBuf::from(r"C:\Fav");
-        db.upsert_children(&fav, &fav, &[
-            entry(r"C:\Fav\alpha_beta", "alpha_beta", IndexKind::Folder),
-            entry(r"C:\Fav\alpha_gamma", "alpha_gamma", IndexKind::Folder),
-            entry(r"C:\Fav\delta", "delta", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\alpha_beta", "alpha_beta", IndexKind::Folder),
+                entry(r"C:\Fav\alpha_gamma", "alpha_gamma", IndexKind::Folder),
+                entry(r"C:\Fav\delta", "delta", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
 
         // AND: 両方含むもの
         let r = db.search("alpha beta", &[]).unwrap();
@@ -508,11 +542,16 @@ mod tests {
     fn search_not_tokens() {
         let db = open_mem();
         let fav = PathBuf::from(r"C:\Fav");
-        db.upsert_children(&fav, &fav, &[
-            entry(r"C:\Fav\good_image", "good_image", IndexKind::Folder),
-            entry(r"C:\Fav\bad_image", "bad_image", IndexKind::Folder),
-            entry(r"C:\Fav\other", "other", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\good_image", "good_image", IndexKind::Folder),
+                entry(r"C:\Fav\bad_image", "bad_image", IndexKind::Folder),
+                entry(r"C:\Fav\other", "other", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
 
         let r = db.search("image -bad", &[]).unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
@@ -525,10 +564,15 @@ mod tests {
     fn search_phrase() {
         let db = open_mem();
         let fav = PathBuf::from(r"C:\Fav");
-        db.upsert_children(&fav, &fav, &[
-            entry(r"C:\Fav\hello world", "hello world", IndexKind::Folder),
-            entry(r"C:\Fav\hello there", "hello there", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\hello world", "hello world", IndexKind::Folder),
+                entry(r"C:\Fav\hello there", "hello there", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
 
         let r = db.search(r#""hello world""#, &[]).unwrap();
         assert_eq!(r.len(), 1);
@@ -540,10 +584,15 @@ mod tests {
         // '_' や '%' を含むエントリ名は SQL LIKE でそのまま照合される
         let db = open_mem();
         let fav = PathBuf::from(r"C:\Fav");
-        db.upsert_children(&fav, &fav, &[
-            entry(r"C:\Fav\100_percent", "100_percent", IndexKind::Folder),
-            entry(r"C:\Fav\abcpercent", "abcpercent", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\100_percent", "100_percent", IndexKind::Folder),
+                entry(r"C:\Fav\abcpercent", "abcpercent", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
 
         // `_` はワイルドカードではなくリテラルの underscore として扱う
         let r = db.search("100_", &[]).unwrap();
@@ -556,12 +605,18 @@ mod tests {
         let db = open_mem();
         let fav_keep = PathBuf::from(r"C:\Keep");
         let fav_drop = PathBuf::from(r"C:\Drop");
-        db.upsert_children(&fav_keep, &fav_keep, &[
-            entry(r"C:\Keep\a", "a", IndexKind::Folder),
-        ]).unwrap();
-        db.upsert_children(&fav_drop, &fav_drop, &[
-            entry(r"C:\Drop\b", "b", IndexKind::Folder),
-        ]).unwrap();
+        db.upsert_children(
+            &fav_keep,
+            &fav_keep,
+            &[entry(r"C:\Keep\a", "a", IndexKind::Folder)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav_drop,
+            &fav_drop,
+            &[entry(r"C:\Drop\b", "b", IndexKind::Folder)],
+        )
+        .unwrap();
         assert_eq!(db.total_count().unwrap(), 2);
         db.prune_obsolete(&[normalize_path(&fav_keep)]).unwrap();
         assert_eq!(db.total_count().unwrap(), 1);

@@ -130,11 +130,11 @@ fn argmax_to_category(scores: &[f32]) -> ImageCategory {
     }
 
     match max_idx {
-        0 => ImageCategory::ThreeD,          // 3d
-        1 => ImageCategory::Illustration,     // bangumi → illustration 扱い
-        2 => ImageCategory::Comic,            // comic
-        3 => ImageCategory::Illustration,     // illustration
-        4 => ImageCategory::RealLife,         // not_painting → 写真扱い
+        0 => ImageCategory::ThreeD,       // 3d
+        1 => ImageCategory::Illustration, // bangumi → illustration 扱い
+        2 => ImageCategory::Comic,        // comic
+        3 => ImageCategory::Illustration, // illustration
+        4 => ImageCategory::RealLife,     // not_painting → 写真扱い
         _ => ImageCategory::RealLife,
     }
 }

@@ -25,8 +25,7 @@ static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 fn ensure_ort_initialized() -> Result<(), AiError> {
     let result = ORT_INIT.get_or_init(|| -> Result<(), String> {
         let dir = crate::data_dir::get();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("data_dir create failed: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("data_dir create failed: {e}"))?;
 
         let dll_path = dir.join("onnxruntime.dll");
         let providers_path = dir.join("onnxruntime_providers_shared.dll");
@@ -87,7 +86,12 @@ impl AiRuntime {
         self.load_model_inner(kind, model_path, true)
     }
 
-    fn load_model_inner(&self, kind: ModelKind, model_path: &Path, force_cpu: bool) -> Result<(), AiError> {
+    fn load_model_inner(
+        &self,
+        kind: ModelKind,
+        model_path: &Path,
+        force_cpu: bool,
+    ) -> Result<(), AiError> {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.contains_key(&kind) {
             return Ok(());
@@ -100,8 +104,8 @@ impl AiRuntime {
             if force_cpu { "CPU" } else { "DirectML" }
         ));
 
-        let mut builder = Session::builder()
-            .map_err(|e| AiError::Ort(format!("Session::builder: {e}")))?;
+        let mut builder =
+            Session::builder().map_err(|e| AiError::Ort(format!("Session::builder: {e}")))?;
 
         builder = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
@@ -113,8 +117,7 @@ impl AiRuntime {
 
         if !force_cpu {
             // DirectML EP を登録（失敗時は CPU フォールバック）
-            builder = match builder
-                .with_execution_providers([ort::ep::DirectML::default().build()])
+            builder = match builder.with_execution_providers([ort::ep::DirectML::default().build()])
             {
                 Ok(b) => b,
                 Err(e) => {

@@ -123,10 +123,8 @@ mod tests {
     fn set_get_clear() {
         // 一時 DB 用に in-memory を使う
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL)",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL)")
+            .unwrap();
         let db = RatingDb { conn };
 
         assert_eq!(db.get("a.jpg"), 0);
@@ -141,10 +139,8 @@ mod tests {
     #[test]
     fn clamp_to_5() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL)",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL)")
+            .unwrap();
         let db = RatingDb { conn };
         db.set("x", 99).unwrap();
         assert_eq!(db.get("x"), 5);

@@ -99,12 +99,30 @@ impl ThumbStats {
         // フォーマット (拡張子)
         let ext_lower = ext.to_ascii_lowercase();
         match ext_lower.as_str() {
-            "jpg" | "jpeg" => { self.count_jpg += 1; self.time_jpg += total_ms; }
-            "png"          => { self.count_png += 1; self.time_png += total_ms; }
-            "webp"         => { self.count_webp += 1; self.time_webp += total_ms; }
-            "gif"          => { self.count_gif += 1; self.time_gif += total_ms; }
-            "bmp"          => { self.count_bmp += 1; self.time_bmp += total_ms; }
-            _              => { self.count_other += 1; self.time_other += total_ms; }
+            "jpg" | "jpeg" => {
+                self.count_jpg += 1;
+                self.time_jpg += total_ms;
+            }
+            "png" => {
+                self.count_png += 1;
+                self.time_png += total_ms;
+            }
+            "webp" => {
+                self.count_webp += 1;
+                self.time_webp += total_ms;
+            }
+            "gif" => {
+                self.count_gif += 1;
+                self.time_gif += total_ms;
+            }
+            "bmp" => {
+                self.count_bmp += 1;
+                self.time_bmp += total_ms;
+            }
+            _ => {
+                self.count_other += 1;
+                self.time_other += total_ms;
+            }
         }
 
         // デコーダ経路 (フォーマット集計とは独立。同じ画像は両方に 1 件ずつ加算される。)
@@ -144,7 +162,10 @@ impl ThumbStats {
     /// 読み込み時間ヒストグラムのバケット範囲ラベル (例: "  0- 4 ms", "100+  ms")
     pub fn load_time_label(bucket: usize) -> String {
         if bucket >= LOAD_TIME_BUCKETS - 1 {
-            format!("{:>3}+   ms", ((LOAD_TIME_BUCKETS - 1) as f64 * LOAD_TIME_STEP_MS) as u32)
+            format!(
+                "{:>3}+   ms",
+                ((LOAD_TIME_BUCKETS - 1) as f64 * LOAD_TIME_STEP_MS) as u32
+            )
         } else {
             let lo = (bucket as f64 * LOAD_TIME_STEP_MS) as u32;
             let hi = lo + LOAD_TIME_STEP_MS as u32 - 1;
@@ -234,7 +255,7 @@ mod tests {
     fn record_video_increments_count_and_size() {
         let mut s = ThumbStats::new();
         s.record_video(2_500_000); // 2-3 MB バケット
-        s.record_video(800_000);   // 0-1 MB バケット
+        s.record_video(800_000); // 0-1 MB バケット
         s.record_video(0);
 
         assert_eq!(s.count_video, 3);

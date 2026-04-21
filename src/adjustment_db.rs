@@ -61,7 +61,11 @@ impl AdjustmentDb {
     /// グローバルが非デフォルトのとき「個別で AI を OFF にする」上書きを保存したい
     /// ケースを取り逃すため、is_removable 判定を呼び出し側 (`App::set_page_params`) に
     /// 移した。明示的に削除したいときは `remove_page_params` を呼ぶこと。
-    pub fn set_page_params(&self, page_key: &str, params: &AdjustParams) -> Result<(), rusqlite::Error> {
+    pub fn set_page_params(
+        &self,
+        page_key: &str,
+        params: &AdjustParams,
+    ) -> Result<(), rusqlite::Error> {
         let json = serde_json::to_string(params).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
@@ -102,10 +106,7 @@ impl AdjustmentDb {
     }
 
     /// 複数ページの個別パラメータを一括削除する (「全画像から削除」ボタン用)。
-    pub fn remove_page_params_bulk(
-        &mut self,
-        page_keys: &[String],
-    ) -> Result<(), rusqlite::Error> {
+    pub fn remove_page_params_bulk(&mut self, page_keys: &[String]) -> Result<(), rusqlite::Error> {
         let tx = self.conn.transaction()?;
         let mut stmt = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
         for key in page_keys {
@@ -121,7 +122,7 @@ impl AdjustmentDb {
     pub fn load_page_params(&self, prefix: &str) -> HashMap<String, AdjustParams> {
         let mut map = HashMap::new();
         let Ok(mut stmt) = self.conn.prepare_cached(
-            "SELECT page_path, params_json FROM page_params WHERE page_path LIKE ?1 ESCAPE '\\'"
+            "SELECT page_path, params_json FROM page_params WHERE page_path LIKE ?1 ESCAPE '\\'",
         ) else {
             return map;
         };

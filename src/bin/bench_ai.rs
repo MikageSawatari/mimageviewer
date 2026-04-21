@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use mimageviewer::ai::{model_manager, runtime::AiRuntime, upscale, ModelKind};
 use mimageviewer::ai::upscale::UpscaleTimings;
+use mimageviewer::ai::{ModelKind, model_manager, runtime::AiRuntime, upscale};
 
 const DEFAULT_IMAGES: &[&str] = &[
     "testimage/うちのこ/ComfyUI_2_0003.png",
@@ -91,7 +91,10 @@ fn parse_args() -> Args {
             "--tile-size" => {
                 i += 1;
                 for s in raw[i].split(',') {
-                    let n: u32 = s.trim().parse().expect("--tile-size expects comma-separated integers");
+                    let n: u32 = s
+                        .trim()
+                        .parse()
+                        .expect("--tile-size expects comma-separated integers");
                     tile_sizes.push(n);
                 }
             }
@@ -115,7 +118,14 @@ fn parse_args() -> Args {
         models = default_models();
     }
 
-    Args { images, models, runs, warmup, tile_sizes, save_output }
+    Args {
+        images,
+        models,
+        runs,
+        warmup,
+        tile_sizes,
+        save_output,
+    }
 }
 
 fn print_help() {
@@ -159,9 +169,11 @@ fn main() {
 
     // 先に全モデルをロード (セッション初期化コストを計測対象外にする)
     for (label, model) in &args.models {
-        let path = mm.model_path(*model)
+        let path = mm
+            .model_path(*model)
             .unwrap_or_else(|| panic!("model not found: {label}"));
-        runtime.load_model(*model, &path)
+        runtime
+            .load_model(*model, &path)
             .unwrap_or_else(|e| panic!("load_model {label}: {e}"));
         println!("loaded model: {}", label);
     }
@@ -180,7 +192,12 @@ fn main() {
 
         println!("================================================================");
         println!("image: {}", img_path.display());
-        println!("  size: {}x{}  color: {:?}", img.width(), img.height(), img.color());
+        println!(
+            "  size: {}x{}  color: {:?}",
+            img.width(),
+            img.height(),
+            img.color()
+        );
         println!("================================================================");
 
         for (label, model) in &args.models {
@@ -196,7 +213,9 @@ fn main() {
                 // warmup (固定入力モデル等で失敗した場合はこの tile_size をスキップ)
                 let mut warmup_failed = false;
                 for _ in 0..args.warmup {
-                    if let Err(e) = upscale::upscale_with_timings(&runtime, *model, &img, &cancel, *ts) {
+                    if let Err(e) =
+                        upscale::upscale_with_timings(&runtime, *model, &img, &cancel, *ts)
+                    {
                         eprintln!("  skip [{}] tile_size={:?}: {}", label, ts, e);
                         warmup_failed = true;
                         break;
@@ -231,7 +250,8 @@ fn main() {
 
                 // 出力 PNG 保存
                 if let (Some(dir), Some(out)) = (args.save_output.as_ref(), last_output.as_ref()) {
-                    let stem = img_path.file_stem()
+                    let stem = img_path
+                        .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("image");
                     let ts_tag = match ts {
@@ -302,7 +322,10 @@ fn print_model_summary(
     let infer_overhead = avg_infer - (avg_tbuild + avg_srun + avg_textract + avg_pcopy);
 
     // タイル単位の中央値・最大・最小 (推論時間の分布確認)
-    let mut infer_all: Vec<f64> = runs.iter().flat_map(|r| r.tiles.iter().map(|t| t.infer_ms)).collect();
+    let mut infer_all: Vec<f64> = runs
+        .iter()
+        .flat_map(|r| r.tiles.iter().map(|t| t.infer_ms))
+        .collect();
     infer_all.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let infer_median = infer_all[infer_all.len() / 2];
     let infer_min = infer_all[0];
@@ -322,30 +345,68 @@ fn print_model_summary(
     let scale = sample.scale;
     let tile_size = sample.tile_size;
 
-    println!("  [{}] tile_size={}  actual={}px  {}x{} → {}x{} ({}x), tiles/run={}",
-             label, tile_size_label, tile_size,
-             in_w, in_h, in_w * scale, in_h * scale, scale, n_tiles);
-    println!("    wall total (avg of {} runs): {:8.1} ms", n_runs, avg_total);
+    println!(
+        "  [{}] tile_size={}  actual={}px  {}x{} → {}x{} ({}x), tiles/run={}",
+        label,
+        tile_size_label,
+        tile_size,
+        in_w,
+        in_h,
+        in_w * scale,
+        in_h * scale,
+        scale,
+        n_tiles
+    );
+    println!(
+        "    wall total (avg of {} runs): {:8.1} ms",
+        n_runs, avg_total
+    );
     println!("      prep (decode to rgb8 etc): {:8.1} ms", avg_prep);
     println!("      alpha resample (Lanczos3): {:8.1} ms", avg_alpha);
-    println!("      tile loop (sum of tiles):  {:8.1} ms  ({:.1}%)",
-             tile_total_ms, 100.0 * tile_total_ms / avg_total);
+    println!(
+        "      tile loop (sum of tiles):  {:8.1} ms  ({:.1}%)",
+        tile_total_ms,
+        100.0 * tile_total_ms / avg_total
+    );
     println!("      blend wait (after loop):   {:8.1} ms", avg_blend_wait);
     println!("      finalize (pixel convert):  {:8.1} ms", avg_finalize);
     println!("      unaccounted overhead:      {:8.1} ms", overhead_ms);
-    println!("    per-tile avg (across {} tile samples):", infer_all.len());
-    println!("      extract: {:6.2} ms ({:4.1}%)", avg_extract, pct_extract);
-    println!("      infer:   {:6.2} ms ({:4.1}%)   [min {:6.2} / median {:6.2} / max {:6.2}]",
-             avg_infer, pct_infer, infer_min, infer_median, infer_max);
-    println!("        tensor_build:    {:6.3} ms ({:4.1}% of infer)",
-             avg_tbuild, 100.0 * avg_tbuild / avg_infer.max(1e-9));
-    println!("        session_run:     {:6.3} ms ({:4.1}% of infer)  <- GPU compute + transfer",
-             avg_srun, 100.0 * avg_srun / avg_infer.max(1e-9));
-    println!("        tensor_extract:  {:6.3} ms ({:4.1}% of infer)",
-             avg_textract, 100.0 * avg_textract / avg_infer.max(1e-9));
-    println!("        post_copy:       {:6.3} ms ({:4.1}% of infer)",
-             avg_pcopy, 100.0 * avg_pcopy / avg_infer.max(1e-9));
-    println!("        (residual):      {:6.3} ms (with_session lock/Mutex etc)", infer_overhead);
+    println!(
+        "    per-tile avg (across {} tile samples):",
+        infer_all.len()
+    );
+    println!(
+        "      extract: {:6.2} ms ({:4.1}%)",
+        avg_extract, pct_extract
+    );
+    println!(
+        "      infer:   {:6.2} ms ({:4.1}%)   [min {:6.2} / median {:6.2} / max {:6.2}]",
+        avg_infer, pct_infer, infer_min, infer_median, infer_max
+    );
+    println!(
+        "        tensor_build:    {:6.3} ms ({:4.1}% of infer)",
+        avg_tbuild,
+        100.0 * avg_tbuild / avg_infer.max(1e-9)
+    );
+    println!(
+        "        session_run:     {:6.3} ms ({:4.1}% of infer)  <- GPU compute + transfer",
+        avg_srun,
+        100.0 * avg_srun / avg_infer.max(1e-9)
+    );
+    println!(
+        "        tensor_extract:  {:6.3} ms ({:4.1}% of infer)",
+        avg_textract,
+        100.0 * avg_textract / avg_infer.max(1e-9)
+    );
+    println!(
+        "        post_copy:       {:6.3} ms ({:4.1}% of infer)",
+        avg_pcopy,
+        100.0 * avg_pcopy / avg_infer.max(1e-9)
+    );
+    println!(
+        "        (residual):      {:6.3} ms (with_session lock/Mutex etc)",
+        infer_overhead
+    );
     println!("      blend:   {:6.2} ms ({:4.1}%)", avg_blend, pct_blend);
     println!("      total:   {:6.2} ms", tile_sum);
 
@@ -360,9 +421,17 @@ fn print_model_summary(
     let cv_pct = 100.0 * stddev / mean.max(1e-9);
     // 95% CI (正規近似; t 分布ではないが小 N でもおおまかな目安)
     let ci95 = 1.96 * stddev / n.sqrt();
-    println!("    run-total min/avg/max: {:.1} / {:.1} / {:.1} ms", min_t, mean, max_t);
-    println!("    run-total stddev:      {:.1} ms  (CV {:.1}%, 95% CI ±{:.1} ms, N={})",
-             stddev, cv_pct, ci95, totals.len());
+    println!(
+        "    run-total min/avg/max: {:.1} / {:.1} / {:.1} ms",
+        min_t, mean, max_t
+    );
+    println!(
+        "    run-total stddev:      {:.1} ms  (CV {:.1}%, 95% CI ±{:.1} ms, N={})",
+        stddev,
+        cv_pct,
+        ci95,
+        totals.len()
+    );
 }
 
 /// egui::ColorImage を PNG として保存する (RGBA8)。

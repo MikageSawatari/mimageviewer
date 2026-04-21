@@ -152,25 +152,25 @@ impl ThumbAspect {
     /// セル幅に対するセル高さの比率
     pub fn height_ratio(self) -> f32 {
         match self {
-            Self::Landscape16x9 =>  9.0 / 16.0,
-            Self::Landscape3x2  =>  2.0 /  3.0,
-            Self::Landscape4x3  =>  3.0 /  4.0,
-            Self::Square        =>  1.0,
-            Self::Portrait3x4   =>  4.0 /  3.0,
-            Self::Portrait2x3   =>  3.0 /  2.0,
-            Self::Portrait9x16  => 16.0 /  9.0,
+            Self::Landscape16x9 => 9.0 / 16.0,
+            Self::Landscape3x2 => 2.0 / 3.0,
+            Self::Landscape4x3 => 3.0 / 4.0,
+            Self::Square => 1.0,
+            Self::Portrait3x4 => 4.0 / 3.0,
+            Self::Portrait2x3 => 3.0 / 2.0,
+            Self::Portrait9x16 => 16.0 / 9.0,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Landscape16x9 => "16:9",
-            Self::Landscape3x2  =>  "3:2",
-            Self::Landscape4x3  =>  "4:3",
-            Self::Square        =>  "1:1",
-            Self::Portrait3x4   =>  "3:4",
-            Self::Portrait2x3   =>  "2:3",
-            Self::Portrait9x16  => "9:16",
+            Self::Landscape3x2 => "3:2",
+            Self::Landscape4x3 => "4:3",
+            Self::Square => "1:1",
+            Self::Portrait3x4 => "3:4",
+            Self::Portrait2x3 => "2:3",
+            Self::Portrait9x16 => "9:16",
         }
     }
 
@@ -194,18 +194,18 @@ impl ThumbAspect {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SortOrder {
     #[default]
-    FileName,   // ファイル名順（辞書順）
-    Numeric,    // 番号順（自然順: 1, 2, 9, 10, 11）
-    DateAsc,    // 日付順（昇順）
-    DateDesc,   // 日付順（降順）
+    FileName, // ファイル名順（辞書順）
+    Numeric,  // 番号順（自然順: 1, 2, 9, 10, 11）
+    DateAsc,  // 日付順（昇順）
+    DateDesc, // 日付順（降順）
 }
 
 impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
             Self::FileName => "ファイル名順",
-            Self::Numeric  => "番号順",
-            Self::DateAsc  => "日付順（古い順）",
+            Self::Numeric => "番号順",
+            Self::DateAsc => "日付順（古い順）",
             Self::DateDesc => "日付順（新しい順）",
         }
     }
@@ -213,8 +213,8 @@ impl SortOrder {
     pub fn short_label(self) -> &'static str {
         match self {
             Self::FileName => "名前",
-            Self::Numeric  => "番号",
-            Self::DateAsc  => "日付↑",
+            Self::Numeric => "番号",
+            Self::DateAsc => "日付↑",
             Self::DateDesc => "日付↓",
         }
     }
@@ -228,18 +228,16 @@ impl SortOrder {
     /// `natural_key` は番号順ソート用のキー生成関数。
     pub fn compare<K: Ord>(
         self,
-        name_a: &str, mtime_a: i64,
-        name_b: &str, mtime_b: i64,
+        name_a: &str,
+        mtime_a: i64,
+        name_b: &str,
+        mtime_b: i64,
         natural_key: impl Fn(&str) -> K,
     ) -> std::cmp::Ordering {
         match self {
-            Self::FileName => {
-                name_a.to_lowercase().cmp(&name_b.to_lowercase())
-            }
-            Self::Numeric => {
-                natural_key(name_a).cmp(&natural_key(name_b))
-            }
-            Self::DateAsc  => mtime_a.cmp(&mtime_b),
+            Self::FileName => name_a.to_lowercase().cmp(&name_b.to_lowercase()),
+            Self::Numeric => natural_key(name_a).cmp(&natural_key(name_b)),
+            Self::DateAsc => mtime_a.cmp(&mtime_b),
             Self::DateDesc => mtime_b.cmp(&mtime_a),
         }
     }
@@ -265,8 +263,8 @@ pub enum CachePolicy {
 impl CachePolicy {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off    => "Off（生成しない）",
-            Self::Auto   => "Auto（自動判定・推奨）",
+            Self::Off => "Off（生成しない）",
+            Self::Auto => "Auto（自動判定・推奨）",
             Self::Always => "Always（常に生成）",
         }
     }
@@ -329,7 +327,9 @@ pub enum Parallelism {
 }
 
 impl Default for Parallelism {
-    fn default() -> Self { Self::Auto }
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl Parallelism {
@@ -429,26 +429,32 @@ impl SpreadMode {
     /// 整数値を返す
     pub fn to_int(self) -> i32 {
         match self {
-            Self::Single   => 0,
-            Self::Ltr      => 1,
+            Self::Single => 0,
+            Self::Ltr => 1,
             Self::LtrCover => 2,
-            Self::Rtl      => 3,
+            Self::Rtl => 3,
             Self::RtlCover => 4,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Single   => "1ページ表示",
-            Self::Ltr      => "見開き 左→右",
+            Self::Single => "1ページ表示",
+            Self::Ltr => "見開き 左→右",
             Self::LtrCover => "見開き 左→右（表紙あり）",
-            Self::Rtl      => "見開き 右→左",
+            Self::Rtl => "見開き 右→左",
             Self::RtlCover => "見開き 右→左（表紙あり）",
         }
     }
 
     pub fn all() -> &'static [Self] {
-        &[Self::Single, Self::Ltr, Self::LtrCover, Self::Rtl, Self::RtlCover]
+        &[
+            Self::Single,
+            Self::Ltr,
+            Self::LtrCover,
+            Self::Rtl,
+            Self::RtlCover,
+        ]
     }
 }
 
@@ -702,24 +708,60 @@ pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
 pub const MAX_GRID_COLS: usize = 10;
 
-fn default_grid_cols() -> usize { 4 }
-fn default_prefetch_back() -> usize { 4 }
-fn default_prefetch_forward() -> usize { 12 }
-fn default_folder_skip_limit() -> usize { 5 }
-fn default_thumb_px() -> u32 { 512 }
-fn default_thumb_quality() -> u8 { 75 }
-fn default_cache_threshold_ms() -> u32 { 25 }
-fn default_cache_size_threshold_bytes() -> u64 { 2_000_000 }
-fn default_true() -> bool { true }
-fn default_thumb_prev_pages() -> u32 { 2 }
-fn default_thumb_next_pages() -> u32 { 4 }
-fn default_thumb_vram_cap_percent() -> u32 { 50 }
-fn default_folder_thumb_sort() -> SortOrder { SortOrder::Numeric }
-fn default_folder_thumb_depth() -> u32 { 3 }
-fn default_ai_upscale_prefetch_back() -> usize { 1 }
-fn default_ai_upscale_prefetch_forward() -> usize { 2 }
-fn default_ai_upscale_skip_px() -> u32 { 2048 }
-fn default_ai_denoise_skip_px() -> u32 { 2048 }
+fn default_grid_cols() -> usize {
+    4
+}
+fn default_prefetch_back() -> usize {
+    4
+}
+fn default_prefetch_forward() -> usize {
+    12
+}
+fn default_folder_skip_limit() -> usize {
+    5
+}
+fn default_thumb_px() -> u32 {
+    512
+}
+fn default_thumb_quality() -> u8 {
+    75
+}
+fn default_cache_threshold_ms() -> u32 {
+    25
+}
+fn default_cache_size_threshold_bytes() -> u64 {
+    2_000_000
+}
+fn default_true() -> bool {
+    true
+}
+fn default_thumb_prev_pages() -> u32 {
+    2
+}
+fn default_thumb_next_pages() -> u32 {
+    4
+}
+fn default_thumb_vram_cap_percent() -> u32 {
+    50
+}
+fn default_folder_thumb_sort() -> SortOrder {
+    SortOrder::Numeric
+}
+fn default_folder_thumb_depth() -> u32 {
+    3
+}
+fn default_ai_upscale_prefetch_back() -> usize {
+    1
+}
+fn default_ai_upscale_prefetch_forward() -> usize {
+    2
+}
+fn default_ai_upscale_skip_px() -> u32 {
+    2048
+}
+fn default_ai_denoise_skip_px() -> u32 {
+    2048
+}
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -771,22 +813,31 @@ pub fn default_exif_hidden_tags() -> Vec<String> {
 pub fn default_image_ext_priority() -> Vec<String> {
     // ロスレス系 > ロッシー系 > RAW 系
     [
-        "png", "bmp", "gif", "tiff", "tif",       // ロスレス
-        "webp", "jxl", "avif", "heic", "heif",     // モダン (ロッシー/ロスレス混在)
-        "jpg", "jpeg",                              // ロッシー
-        "dng", "cr2", "cr3", "nef", "nrw", "arw",  // RAW (現像困難な場合が多い)
-        "srf", "sr2", "raf", "orf", "rw2", "pef",
-        "ptx", "rwl", "iiq",
+        "png", "bmp", "gif", "tiff", "tif", // ロスレス
+        "webp", "jxl", "avif", "heic", "heif", // モダン (ロッシー/ロスレス混在)
+        "jpg", "jpeg", // ロッシー
+        "dng", "cr2", "cr3", "nef", "nrw", "arw", // RAW (現像困難な場合が多い)
+        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect()
 }
-fn default_slideshow_interval() -> f32 { 3.0 }
-fn default_toolbar_cols_items() -> Vec<usize> { (MIN_GRID_COLS..=MAX_GRID_COLS).collect() }
-fn default_toolbar_aspect_items() -> Vec<ThumbAspect> { ThumbAspect::all().to_vec() }
-fn default_toolbar_sort_items() -> Vec<SortOrder> { SortOrder::all().to_vec() }
-fn default_rating_filter() -> [bool; 6] { [true; 6] }
+fn default_slideshow_interval() -> f32 {
+    3.0
+}
+fn default_toolbar_cols_items() -> Vec<usize> {
+    (MIN_GRID_COLS..=MAX_GRID_COLS).collect()
+}
+fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
+    ThumbAspect::all().to_vec()
+}
+fn default_toolbar_sort_items() -> Vec<SortOrder> {
+    SortOrder::all().to_vec()
+}
+fn default_rating_filter() -> [bool; 6] {
+    [true; 6]
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -948,8 +999,13 @@ impl Settings {
         const MAX_RECENT_OPEN_WITH: usize = 3;
         self.recent_open_with_apps
             .retain(|a| !a.exe_path.eq_ignore_ascii_case(&exe_path));
-        self.recent_open_with_apps
-            .insert(0, RecentApp { display_name, exe_path });
+        self.recent_open_with_apps.insert(
+            0,
+            RecentApp {
+                display_name,
+                exe_path,
+            },
+        );
         self.recent_open_with_apps.truncate(MAX_RECENT_OPEN_WITH);
     }
 }
@@ -1113,7 +1169,10 @@ mod tests {
         legacy_fav.id = Uuid::nil();
         s.favorites.push(legacy_fav);
         s.sanitize();
-        assert!(!s.favorites[0].id.is_nil(), "sanitize で UUID が発行されるはず");
+        assert!(
+            !s.favorites[0].id.is_nil(),
+            "sanitize で UUID が発行されるはず"
+        );
     }
 
     // -- ThumbAspect --
@@ -1208,8 +1267,7 @@ mod tests {
         let auto: Parallelism = serde_json::from_str(r#"{"mode":"Auto"}"#).unwrap();
         assert_eq!(auto, Parallelism::Auto);
 
-        let manual: Parallelism =
-            serde_json::from_str(r#"{"mode":"Manual","value":4}"#).unwrap();
+        let manual: Parallelism = serde_json::from_str(r#"{"mode":"Manual","value":4}"#).unwrap();
         assert_eq!(manual, Parallelism::Manual(4));
     }
 

@@ -123,9 +123,7 @@ impl<'a> IngestSession<'a> {
             }
             // fts_meta: tombstone 化
             if let Err(e) = self.meta_db.mark_tombstone(&[path.clone()]) {
-                crate::logger::log(format!(
-                    "ingest: mark_tombstone failed for {path}: {e}"
-                ));
+                crate::logger::log(format!("ingest: mark_tombstone failed for {path}: {e}"));
                 continue;
             }
             fts_index::delete_doc(writer, fields, path);
@@ -223,11 +221,7 @@ impl<'a> IngestSession<'a> {
         Ok(stats)
     }
 
-    fn ingest_image(
-        &self,
-        cand: &CandidateFile,
-        writer: &IndexWriter,
-    ) -> Result<(), String> {
+    fn ingest_image(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
         // 1. メタ抽出 (all_text_norm を作る)
         let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
 
@@ -324,11 +318,7 @@ impl<'a> IngestSession<'a> {
     }
 
     /// ZIP / PDF の最小 ingest (ファイル名 + 基本メタのみ)。
-    fn ingest_name_only(
-        &self,
-        cand: &CandidateFile,
-        writer: &IndexWriter,
-    ) -> Result<(), String> {
+    fn ingest_name_only(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
         let name = cand
             .abs_path
             .file_name()
@@ -368,15 +358,9 @@ impl<'a> IngestSession<'a> {
         Ok(())
     }
 
-    fn should_flush(
-        &self,
-        tombstone: &[String],
-        pending: &[String],
-        last_flush: Instant,
-    ) -> bool {
+    fn should_flush(&self, tombstone: &[String], pending: &[String], last_flush: Instant) -> bool {
         let total = tombstone.len() + pending.len();
-        total >= BATCH_FLUSH_COUNT
-            || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
+        total >= BATCH_FLUSH_COUNT || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
     }
 
     /// Tantivy commit → fts_meta を ok / purge に遷移 (§5.6.1 step 3-4 + §5.6.2 step 4)。
@@ -473,7 +457,14 @@ mod tests {
         let cand = make_image_file(tmp.path(), "sunset_夕焼け.jpg");
         let key = cand.key.clone();
         let stats = session
-            .apply(vec![cand], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![cand],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+            )
             .unwrap();
         assert_eq!(stats.ingested_ok, 1);
         assert_eq!(stats.ingested_failed, 0);
@@ -505,7 +496,14 @@ mod tests {
         let cand = make_image_file(tmp.path(), "a.jpg");
         let key = cand.key.clone();
         session
-            .apply(vec![cand], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![cand],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+            )
             .unwrap();
         fts.reload_reader().unwrap();
         assert!(meta.get(&key).unwrap().is_some());
@@ -546,7 +544,14 @@ mod tests {
         cand.kind = CandidateKind::Zip;
         let key = cand.key.clone();
         let stats = session
-            .apply(vec![cand], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![cand],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+            )
             .unwrap();
         assert_eq!(stats.ingested_ok, 1);
         let row = meta.get(&key).unwrap().unwrap();
@@ -566,7 +571,14 @@ mod tests {
 
         let cand = make_image_file(tmp.path(), "skip.jpg");
         let stats = session
-            .apply(vec![cand], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![cand],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+            )
             .unwrap();
         assert!(stats.cancelled);
         assert_eq!(stats.ingested_ok, 0);
@@ -584,14 +596,28 @@ mod tests {
         let cand = make_image_file(tmp.path(), "a.jpg");
         let key = cand.key.clone();
         session
-            .apply(vec![cand.clone()], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![cand.clone()],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+            )
             .unwrap();
 
         let gen1 = meta.get(&key).unwrap().unwrap().index_generation;
 
         // 再 ingest (例: ファイル更新シミュレーション)
         session
-            .apply(vec![cand], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![cand],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+            )
             .unwrap();
         let gen2 = meta.get(&key).unwrap().unwrap().index_generation;
         assert!(gen2 > gen1, "generation が増える");
@@ -610,7 +636,8 @@ mod tests {
         let cand = make_image_file(tmp.path(), "crash.jpg");
         let key = cand.key.clone();
         let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
-        meta.mark_pending(&key, fav, &root, cand.mtime, cand.file_size, &all_text).unwrap();
+        meta.mark_pending(&key, fav, &root, cand.mtime, cand.file_size, &all_text)
+            .unwrap();
         let mut writer = fts.writer().unwrap();
         fts_index::upsert_doc(
             &writer,
@@ -636,12 +663,16 @@ mod tests {
 
         // Ctrl+G 検索では pending は結果に現れない (lookup_all_text_norm が status=0 のみ返す)
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), &["crash.jpg"], Some(&[fav])).unwrap();
+        let q =
+            fts_index::build_bigram_and_query(fts.fields(), &["crash.jpg"], Some(&[fav])).unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1, "Tantivy には残っている");
         let lookup = meta.lookup_all_text_norm(&[key.clone()]).unwrap();
-        assert!(lookup.is_empty(), "post-filter では pending は除外 → 検索結果に出ない");
+        assert!(
+            lookup.is_empty(),
+            "post-filter では pending は除外 → 検索結果に出ない"
+        );
 
         // reconciliation hook で検出できる (次回起動時の再 ingest 対象)
         let not_ok = meta.list_not_ok_paths(fav).unwrap();

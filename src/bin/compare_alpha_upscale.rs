@@ -18,11 +18,11 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use image::{DynamicImage, RgbImage, RgbaImage};
-use mimageviewer::ai::{model_manager, runtime::AiRuntime, upscale, ModelKind};
+use mimageviewer::ai::{ModelKind, model_manager, runtime::AiRuntime, upscale};
 
 const DEFAULT_SRC: &str = "testimage/transparent";
 const DEFAULT_OUT: &str = "testimage/transparent_compare";
@@ -76,14 +76,20 @@ fn main() {
     let mm = model_manager::ModelManager::new();
     let model_path = mm.model_path(args.model).expect("model path not found");
     let runtime = AiRuntime::new().expect("AiRuntime::new");
-    runtime.load_model(args.model, &model_path).expect("load_model");
+    runtime
+        .load_model(args.model, &model_path)
+        .expect("load_model");
 
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&args.src_dir)
         .expect("read_dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.is_file())
         .filter(|p| {
-            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
             matches!(ext.as_str(), "png" | "webp" | "tiff" | "tif")
         })
         .collect();
@@ -103,11 +109,16 @@ fn main() {
                 continue;
             }
         };
-        println!("  size: {}x{}, color: {:?}", img.width(), img.height(), img.color());
+        println!(
+            "  size: {}x{}, color: {:?}",
+            img.width(),
+            img.height(),
+            img.color()
+        );
 
         // Method A: 現方式 (RGBA upscale を 1 回だけ実行 → 各背景に合成)
-        let upscaled_a = upscale::upscale(&runtime, args.model, &img, &cancel)
-            .expect("upscale A failed");
+        let upscaled_a =
+            upscale::upscale(&runtime, args.model, &img, &cancel).expect("upscale A failed");
         let out_w = upscaled_a.size[0] as u32;
         let out_h = upscaled_a.size[1] as u32;
 

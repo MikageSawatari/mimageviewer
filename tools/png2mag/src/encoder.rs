@@ -85,7 +85,10 @@ pub fn encode(
     }
 
     // ── 3. Pack two flags per byte into Flag B; Flag A is a 1-bit-per-pair bitmap.
-    assert!(pixels_x % 2 == 0, "pixels_x must be even (width must be multiple of 8)");
+    assert!(
+        pixels_x % 2 == 0,
+        "pixels_x must be even (width must be multiple of 8)"
+    );
     let pairs_per_row = pixels_x / 2;
     let total_pairs = height * pairs_per_row;
     let mut flag_a_bits = vec![0u8; total_pairs];
@@ -158,7 +161,12 @@ pub fn encode(
     let pixel_size = pixel_buf.len() as u32;
 
     let mut header: Vec<u8> = Vec::with_capacity(32);
-    header.extend_from_slice(&[header_top, header_machine_code, header_machine_flag, screen_mode]);
+    header.extend_from_slice(&[
+        header_top,
+        header_machine_code,
+        header_machine_flag,
+        screen_mode,
+    ]);
     header.extend_from_slice(&pos_x0.to_le_bytes());
     header.extend_from_slice(&pos_y0.to_le_bytes());
     header.extend_from_slice(&pos_x1.to_le_bytes());
@@ -172,7 +180,12 @@ pub fn encode(
 
     // ── 6. Concatenate everything.
     let mut out: Vec<u8> = Vec::with_capacity(
-        meta.len() + header.len() + pal_bytes.len() + flag_a_bytes.len() + flag_b.len() + pixel_buf.len(),
+        meta.len()
+            + header.len()
+            + pal_bytes.len()
+            + flag_a_bytes.len()
+            + flag_b.len()
+            + pixel_buf.len(),
     );
     out.extend_from_slice(&meta);
     out.extend_from_slice(&header);

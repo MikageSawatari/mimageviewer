@@ -7,8 +7,9 @@
 
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 
 use eframe::egui;
@@ -21,7 +22,7 @@ use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings;
 use crate::stats;
 use crate::thumb_loader::{
-    build_and_save_one, compute_display_px, CacheDecision, LoadRequest, ThumbMsg,
+    CacheDecision, LoadRequest, ThumbMsg, build_and_save_one, compute_display_px,
 };
 use crate::ui_helpers::{
     draw_format_rows, draw_histogram, format_bytes, format_bytes_small, format_count,
@@ -37,7 +38,8 @@ impl App {
             // A・B のテクスチャ。両方とも同じソース画像から作られたサムネイルなので
             // アスペクト比は同一。どちらかのサイズで fit 計算する。
             let ref_size = self
-                .tq.a_texture
+                .tq
+                .a_texture
                 .as_ref()
                 .map(|t| t.size_vec2())
                 .or_else(|| self.tq.b_texture.as_ref().map(|t| t.size_vec2()));
@@ -62,10 +64,8 @@ impl App {
                 .order(egui::Order::Foreground)
                 .fixed_pos(screen.min)
                 .show(ctx, |ui| {
-                    let (rect, response) = ui.allocate_exact_size(
-                        screen.size(),
-                        egui::Sense::click_and_drag(),
-                    );
+                    let (rect, response) =
+                        ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
                     let painter = ui.painter();
                     // 背景
                     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 20, 20));
@@ -165,10 +165,8 @@ impl App {
                             font.clone(),
                             egui::Color32::WHITE,
                         );
-                        let bg_rect = egui::Rect::from_min_size(
-                            pos,
-                            galley.size() + label_pad * 2.0,
-                        );
+                        let bg_rect =
+                            egui::Rect::from_min_size(pos, galley.size() + label_pad * 2.0);
                         painter.rect_filled(
                             bg_rect,
                             4.0,
@@ -185,10 +183,8 @@ impl App {
                             egui::Color32::WHITE,
                         );
                         let bg_size = galley.size() + label_pad * 2.0;
-                        let pos = egui::pos2(
-                            img_rect.max.x - 12.0 - bg_size.x,
-                            img_rect.min.y + 12.0,
-                        );
+                        let pos =
+                            egui::pos2(img_rect.max.x - 12.0 - bg_size.x, img_rect.min.y + 12.0);
                         let bg_rect = egui::Rect::from_min_size(pos, bg_size);
                         painter.rect_filled(
                             bg_rect,
@@ -243,8 +239,7 @@ impl App {
                 if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                     if let Some(img_rect) = img_rect_opt {
                         if img_rect.width() > 0.0 {
-                            let t = ((pos.x - img_rect.min.x) / img_rect.width())
-                                .clamp(0.0, 1.0);
+                            let t = ((pos.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0);
                             self.tq.fs_divider = t;
                             ctx.request_repaint();
                         }
@@ -267,6 +262,5 @@ impl App {
                 self.tq.fullscreen = false;
             }
         }
-
     }
 }

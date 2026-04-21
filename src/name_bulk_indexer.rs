@@ -9,8 +9,8 @@
 //! - Tantivy writer 制約は無いので複数 favorite を並列に走らせても問題ない。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
 use crate::search_index_db::{IndexEntry, IndexKind, SearchIndexDb};
@@ -54,7 +54,9 @@ pub fn run_bulk_name_index(
             break;
         }
         let mut children: Vec<IndexEntry> = Vec::new();
-        let Ok(entries) = std::fs::read_dir(folder) else { continue };
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if is_apple_double(&p) {
@@ -63,18 +65,9 @@ pub fn run_bulk_name_index(
             // `entry.file_type()` は FindFirstFile の内部キャッシュから取るので追加 syscall なし
             // (Windows での per-entry metadata 取得は重いので避ける)
             let Ok(ft) = entry.file_type() else { continue };
-            let kind = if ft.is_dir() {
-                Some(IndexKind::Folder)
-            } else if ft.is_file() {
-                match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase) {
-                    Some(ref e) if e == "zip" => Some(IndexKind::ZipFile),
-                    Some(ref e) if e == "pdf" => Some(IndexKind::PdfFile),
-                    _ => None,
-                }
-            } else {
-                None
+            let Some(kind) = classify_name_index_kind(&p, &ft) else {
+                continue;
             };
-            let Some(kind) = kind else { continue };
             let name = p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -101,6 +94,29 @@ pub fn run_bulk_name_index(
     }
 
     summary
+}
+
+/// DirEntry を名前索引の `IndexKind` に分類する共通ヘルパ。
+/// index_creator / name_bulk_indexer から共有する (UI-responsiveness の観点で
+/// `entry.file_type()` 経由で判定する経路に寄せる)。
+pub fn classify_name_index_kind(
+    path: &std::path::Path,
+    file_type: &std::fs::FileType,
+) -> Option<IndexKind> {
+    if file_type.is_dir() {
+        return Some(IndexKind::Folder);
+    }
+    if !file_type.is_file() {
+        return None;
+    }
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    if ext.eq_ignore_ascii_case("zip") {
+        Some(IndexKind::ZipFile)
+    } else if ext.eq_ignore_ascii_case("pdf") {
+        Some(IndexKind::PdfFile)
+    } else {
+        None
+    }
 }
 
 /// `std::thread::spawn` ラッパ。呼び出し側は `Arc<SearchIndexDb>` と `Arc<AtomicBool>` を

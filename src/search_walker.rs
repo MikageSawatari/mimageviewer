@@ -19,8 +19,8 @@
 //! - ZIP ファイルは「1 ZIP = 1 ingest 候補」として扱い、内容が変わったかは mtime/size で判定する
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use uuid::Uuid;
 
@@ -90,7 +90,10 @@ pub struct ScanParams {
 /// 進捗通知 (UI への stream)。Walker は I/O-bound なので頻繁に通知しすぎないこと。
 pub enum WalkerEvent {
     /// 定期的な進捗
-    Progress { scanned: usize, current_dir: Option<PathBuf> },
+    Progress {
+        scanned: usize,
+        current_dir: Option<PathBuf>,
+    },
     /// 完了
     Done(ScanResult),
     /// エラー (フォルダが消えた等)
@@ -295,11 +298,7 @@ mod tests {
         (dir, db)
     }
 
-    fn scan_sync(
-        fav_id: Uuid,
-        root: &Path,
-        db: &FtsMetaDb,
-    ) -> ScanResult {
+    fn scan_sync(fav_id: Uuid, root: &Path, db: &FtsMetaDb) -> ScanResult {
         let sem = GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
         scan(
@@ -370,7 +369,8 @@ mod tests {
         let key = normalize_path(&abs);
 
         // DB に同じ mtime/size で登録済み
-        db.mark_pending(&key, fav, &root, mtime, size, "text").unwrap();
+        db.mark_pending(&key, fav, &root, mtime, size, "text")
+            .unwrap();
         db.mark_ok(&[key.clone()]).unwrap();
 
         let r = scan_sync(fav, &root, &db);
@@ -417,8 +417,15 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        db.mark_pending(&surv_key, fav, &root, surv_mtime, surv_meta.len() as i64, "")
-            .unwrap();
+        db.mark_pending(
+            &surv_key,
+            fav,
+            &root,
+            surv_mtime,
+            surv_meta.len() as i64,
+            "",
+        )
+        .unwrap();
         db.mark_ok(&[surv_key.clone()]).unwrap();
 
         let r = scan_sync(fav, &root, &db);
@@ -473,7 +480,10 @@ mod tests {
 
         // fav_a の scan 結果に fav_b は出てこない
         let r = scan_sync(fav_a, &root_a, &db);
-        assert!(r.to_delete.is_empty(), "別 favorite の deleted は検出しない");
+        assert!(
+            r.to_delete.is_empty(),
+            "別 favorite の deleted は検出しない"
+        );
     }
 
     #[test]

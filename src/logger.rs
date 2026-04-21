@@ -39,11 +39,7 @@ pub fn log(msg: impl AsRef<str>) {
 
     if let Some(file) = FILE.get() {
         if let Ok(mut f) = file.lock() {
-            let _ = writeln!(
-                f,
-                "[{elapsed:>8.3}s][t{tid_num:>3}] {}",
-                msg.as_ref()
-            );
+            let _ = writeln!(f, "[{elapsed:>8.3}s][t{tid_num:>3}] {}", msg.as_ref());
             let _ = f.flush();
         }
     }

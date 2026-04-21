@@ -9,9 +9,9 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
-use flate2::Compression;
 use serde::{Deserialize, Serialize};
 
 /// ベクタ線オブジェクトの種別。作成時のツールで決まる。
@@ -99,9 +99,15 @@ pub fn scanline_fill_polygon(
     h: usize,
     value: bool,
 ) {
-    if pts.len() < 3 { return; }
+    if pts.len() < 3 {
+        return;
+    }
     let min_y = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).max(0.0) as usize;
-    let max_y = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).min(h as f32) as usize;
+    let max_y = pts
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::MIN, f32::max)
+        .min(h as f32) as usize;
     let n = pts.len();
     let mut intersections = Vec::with_capacity(8);
     for y in min_y..max_y {
@@ -190,18 +196,20 @@ impl MaskDb {
         expected_w: usize,
         expected_h: usize,
     ) -> Option<(Vec<bool>, Vec<LineObject>)> {
-        let mut stmt = self.conn
+        let mut stmt = self
+            .conn
             .prepare_cached("SELECT mask_data, width, height, vectors FROM masks WHERE path = ?1")
             .ok()?;
-        let (blob, w, h, vectors_json): (Vec<u8>, usize, usize, Option<String>) =
-            stmt.query_row([key], |row| {
+        let (blob, w, h, vectors_json): (Vec<u8>, usize, usize, Option<String>) = stmt
+            .query_row([key], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, i64>(1)? as usize,
                     row.get::<_, i64>(2)? as usize,
                     row.get::<_, Option<String>>(3)?,
                 ))
-            }).ok()?;
+            })
+            .ok()?;
 
         let mut mask = decompress_mask(&blob, w, h)?;
         let mut vectors = vectors_json
@@ -243,7 +251,8 @@ impl MaskDb {
 
     /// マスクを削除する。
     pub fn delete(&self, key: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM masks WHERE path = ?1", [key])?;
+        self.conn
+            .execute("DELETE FROM masks WHERE path = ?1", [key])?;
         Ok(())
     }
 
@@ -278,7 +287,6 @@ impl MaskDb {
         Ok(())
     }
 
-
     /// 名前付きスロットからマスク (ビットマップのみ) を取得する。互換用。
     pub fn get_slot(&self, slot: usize, expected_w: usize, expected_h: usize) -> Option<Vec<bool>> {
         self.get(&slot_key(slot), expected_w, expected_h)
@@ -297,7 +305,8 @@ impl MaskDb {
     /// スロットの元のサイズ (width, height) を返す。存在しなければ None。
     /// 一括適用で元サイズのままデータを配る場合に使う。
     pub fn slot_size(&self, slot: usize) -> Option<(usize, usize)> {
-        let mut stmt = self.conn
+        let mut stmt = self
+            .conn
             .prepare_cached("SELECT width, height FROM masks WHERE path = ?1")
             .ok()?;
         stmt.query_row([slot_key(slot)], |row| {
@@ -305,7 +314,8 @@ impl MaskDb {
                 row.get::<_, i64>(0)? as usize,
                 row.get::<_, i64>(1)? as usize,
             ))
-        }).ok()
+        })
+        .ok()
     }
 
     /// 指定プレフィックスで始まるパスを持つマスクエントリのキー集合を返す。
@@ -397,13 +407,7 @@ fn decompress_mask(blob: &[u8], w: usize, h: usize) -> Option<Vec<bool>> {
 }
 
 /// マスクを最近傍法でリスケールする。
-fn rescale_mask(
-    src: &[bool],
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-) -> Vec<bool> {
+fn rescale_mask(src: &[bool], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<bool> {
     let mut dst = vec![false; dst_w * dst_h];
     let x_ratio = src_w as f32 / dst_w as f32;
     let y_ratio = src_h as f32 / dst_h as f32;
@@ -437,7 +441,11 @@ mod tests {
     fn empty_mask_compresses() {
         let mask = vec![false; 5000];
         let compressed = compress_mask(&mask);
-        assert!(compressed.len() < 50, "empty mask should compress well: {} bytes", compressed.len());
+        assert!(
+            compressed.len() < 50,
+            "empty mask should compress well: {} bytes",
+            compressed.len()
+        );
     }
 
     #[test]

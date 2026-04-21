@@ -23,16 +23,22 @@ pub fn denoise(
     let perf_enabled = crate::perf::is_enabled();
     let t0 = std::time::Instant::now();
     if perf_enabled {
-        crate::perf::event("ai", "denoise_begin", None, 0, &[
-            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
-            ("w", serde_json::Value::from(w)),
-            ("h", serde_json::Value::from(h)),
-        ]);
+        crate::perf::event(
+            "ai",
+            "denoise_begin",
+            None,
+            0,
+            &[
+                (
+                    "model",
+                    serde_json::Value::from(format!("{:?}", model_kind)),
+                ),
+                ("w", serde_json::Value::from(w)),
+                ("h", serde_json::Value::from(h)),
+            ],
+        );
     }
-    crate::logger::log(format!(
-        "[AI] Denoise {}x{} with {:?}",
-        w, h, model_kind
-    ));
+    crate::logger::log(format!("[AI] Denoise {}x{} with {:?}", w, h, model_kind));
 
     let result = super::upscale::upscale(runtime, model_kind, input, cancel)?;
 
@@ -42,10 +48,19 @@ pub fn denoise(
     ));
     if perf_enabled {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        crate::perf::event("ai", "denoise_end", None, 0, &[
-            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
-            ("ms", serde_json::Value::from(ms)),
-        ]);
+        crate::perf::event(
+            "ai",
+            "denoise_end",
+            None,
+            0,
+            &[
+                (
+                    "model",
+                    serde_json::Value::from(format!("{:?}", model_kind)),
+                ),
+                ("ms", serde_json::Value::from(ms)),
+            ],
+        );
     }
 
     Ok(result)

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 const CATALOG_VERSION: &str = "2";
@@ -85,7 +85,12 @@ impl CatalogDb {
             };
             map.insert(
                 filename,
-                CacheEntry { mtime, file_size, jpeg_data, source_dims },
+                CacheEntry {
+                    mtime,
+                    file_size,
+                    jpeg_data,
+                    source_dims,
+                },
             );
         }
         Ok(map)
@@ -113,7 +118,9 @@ impl CatalogDb {
             "INSERT OR REPLACE INTO thumbnails \
              (filename, mtime, file_size, width, height, thumb_data, source_width, source_height) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![filename, mtime, file_size, width, height, jpeg_data, src_w, src_h],
+            params![
+                filename, mtime, file_size, width, height, jpeg_data, src_w, src_h
+            ],
         )?;
         Ok(())
     }
@@ -123,16 +130,11 @@ impl CatalogDb {
         let conn = self.conn.lock().unwrap();
         let db_names: Vec<String> = {
             let mut stmt = conn.prepare("SELECT filename FROM thumbnails")?;
-            stmt.query_map([], |r| r.get(0))?
-                .flatten()
-                .collect()
+            stmt.query_map([], |r| r.get(0))?.flatten().collect()
         };
         for name in db_names {
             if !existing.contains(&name) {
-                conn.execute(
-                    "DELETE FROM thumbnails WHERE filename = ?1",
-                    params![name],
-                )?;
+                conn.execute("DELETE FROM thumbnails WHERE filename = ?1", params![name])?;
             }
         }
         Ok(())
@@ -158,10 +160,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // 非破壊マイグレーション: 既存 DB で source_width/source_height が欠けていれば追加する。
     // 列が既にある場合 ALTER TABLE はエラーを返すので、結果は無視する。
-    if let Err(e) = conn.execute(
-        "ALTER TABLE thumbnails ADD COLUMN source_width INTEGER",
-        [],
-    ) {
+    if let Err(e) = conn.execute("ALTER TABLE thumbnails ADD COLUMN source_width INTEGER", []) {
         // "duplicate column name" is expected if column already exists
         crate::logger::log(format!("catalog migration source_width: {e}"));
     }
@@ -174,11 +173,9 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
     let version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'version'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT value FROM meta WHERE key = 'version'", [], |r| {
+            r.get(0)
+        })
         .ok();
     if version.as_deref() != Some(CATALOG_VERSION) {
         conn.execute_batch("DELETE FROM thumbnails;")?;
@@ -224,7 +221,10 @@ pub fn decode_thumb_to_color_image(data: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(data).ok()?;
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        rgba.as_raw(),
+    ))
 }
 
 /// キャッシュディレクトリのデフォルト位置（DATA_DIR\cache）
@@ -282,11 +282,17 @@ pub fn delete_all_cache(cache_dir: &Path) -> usize {
 
 /// cache_dir 配下の .db ファイルのパスとメタデータを列挙してコールバックを呼ぶ。
 fn collect_db_paths(cache_dir: &Path, cb: &mut impl FnMut(&Path, std::fs::Metadata)) {
-    let Ok(top) = std::fs::read_dir(cache_dir) else { return };
+    let Ok(top) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
     for entry in top.flatten() {
         let sub = entry.path();
-        if !sub.is_dir() { continue; }
-        let Ok(sub_entries) = std::fs::read_dir(&sub) else { continue };
+        if !sub.is_dir() {
+            continue;
+        }
+        let Ok(sub_entries) = std::fs::read_dir(&sub) else {
+            continue;
+        };
         for file in sub_entries.flatten() {
             let p = file.path();
             if p.extension().and_then(|e| e.to_str()) == Some("db") {
@@ -386,8 +392,16 @@ mod tests {
     #[test]
     fn catalog_save_and_load_all() {
         let db = open_in_memory();
-        db.save("test.jpg", 1000, 2048, 256, 192, Some((4000, 3000)), b"fake_webp")
-            .unwrap();
+        db.save(
+            "test.jpg",
+            1000,
+            2048,
+            256,
+            192,
+            Some((4000, 3000)),
+            b"fake_webp",
+        )
+        .unwrap();
 
         let map = db.load_all().unwrap();
         assert_eq!(map.len(), 1);
@@ -426,8 +440,10 @@ mod tests {
     fn catalog_delete_missing() {
         let db = open_in_memory();
         db.save("keep.jpg", 100, 500, 128, 96, None, b"a").unwrap();
-        db.save("remove.jpg", 200, 600, 128, 96, None, b"b").unwrap();
-        db.save("also_remove.jpg", 300, 700, 128, 96, None, b"c").unwrap();
+        db.save("remove.jpg", 200, 600, 128, 96, None, b"b")
+            .unwrap();
+        db.save("also_remove.jpg", 300, 700, 128, 96, None, b"c")
+            .unwrap();
 
         let existing: HashSet<String> = ["keep.jpg".to_string()].into_iter().collect();
         db.delete_missing(&existing).unwrap();

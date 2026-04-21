@@ -6,7 +6,7 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::exif_reader::{self, ExifInfo};
-use crate::png_metadata::{AiMetadata, A1111Metadata, ComfyUIMetadata};
+use crate::png_metadata::{A1111Metadata, AiMetadata, ComfyUIMetadata};
 use crate::xmp_reader::{self, XmpTweetInfo};
 
 /// パネル幅 (ピクセル)
@@ -91,7 +91,10 @@ impl App {
         // 左端に区切り線
         ui.painter().line_segment(
             [panel_rect.left_top(), panel_rect.left_bottom()],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+            ),
         );
 
         // パネルのクリックイベントを消費
@@ -102,10 +105,8 @@ impl App {
         );
 
         // ── タイトルバー (ピン留めボタン付き) ──
-        let title_rect = egui::Rect::from_min_size(
-            panel_rect.min,
-            egui::vec2(panel_rect.width(), TITLE_BAR_H),
-        );
+        let title_rect =
+            egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), TITLE_BAR_H));
         // タイトルバー背景 (やや明るめ)
         ui.painter().rect_filled(
             title_rect,
@@ -118,7 +119,10 @@ impl App {
                 egui::pos2(title_rect.min.x, title_rect.max.y),
                 egui::pos2(title_rect.max.x, title_rect.max.y),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+            ),
         );
 
         // タイトルテキスト
@@ -157,7 +161,11 @@ impl App {
         ui.painter().text(
             pin_rect.center(),
             egui::Align2::CENTER_CENTER,
-            if self.show_metadata_panel { "📌" } else { "📌" },
+            if self.show_metadata_panel {
+                "📌"
+            } else {
+                "📌"
+            },
             egui::FontId::proportional(14.0),
             if self.show_metadata_panel {
                 egui::Color32::WHITE
@@ -176,20 +184,15 @@ impl App {
 
         // ── コンテンツ領域 (タイトルバーの下) ──
         let content_top = title_rect.max.y;
-        let content_rect = egui::Rect::from_min_max(
-            egui::pos2(panel_rect.min.x, content_top),
-            panel_rect.max,
-        );
+        let content_rect =
+            egui::Rect::from_min_max(egui::pos2(panel_rect.min.x, content_top), panel_rect.max);
 
         let ai_metadata = self.get_current_ai_metadata();
         let exif_info = self.get_current_exif();
         let tweet_info = self.get_current_tweet_info();
 
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
-        let mut child_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(inner_rect),
-        );
+        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
         child_ui.set_clip_rect(content_rect);
 
         egui::ScrollArea::vertical()
@@ -215,7 +218,8 @@ impl App {
                     Some(AiMetadata::ComfyUI(ref meta)) => {
                         let show_raw_prompt = self.metadata_show_raw_prompt;
                         let show_raw_workflow = self.metadata_show_raw_workflow;
-                        let (new_rp, new_rw) = draw_comfyui_panel(ui, ctx, meta, show_raw_prompt, show_raw_workflow);
+                        let (new_rp, new_rw) =
+                            draw_comfyui_panel(ui, ctx, meta, show_raw_prompt, show_raw_workflow);
                         self.metadata_show_raw_prompt = new_rp;
                         self.metadata_show_raw_workflow = new_rw;
                     }
@@ -520,9 +524,13 @@ fn draw_collapsible_json_section(
     if ui
         .selectable_label(
             *open,
-            egui::RichText::new(if *open { format!("▼ {label}") } else { format!("▶ {label}") })
-                .color(DIM_COLOR)
-                .size(BODY_FONT),
+            egui::RichText::new(if *open {
+                format!("▼ {label}")
+            } else {
+                format!("▶ {label}")
+            })
+            .color(DIM_COLOR)
+            .size(BODY_FONT),
         )
         .clicked()
     {
@@ -565,7 +573,10 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
                     .color(color)
                     .size(12.0)
                     .background_color(egui::Color32::from_rgba_unmultiplied(
-                        color.r(), color.g(), color.b(), 30,
+                        color.r(),
+                        color.g(),
+                        color.b(),
+                        30,
                     )),
             );
         }
@@ -643,9 +654,7 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
             }
         }
         if let Some(url) = t.tweet_url.as_deref() {
-            if xmp_reader::is_safe_tweet_url(url)
-                && ui.small_button("URL コピー").clicked()
-            {
+            if xmp_reader::is_safe_tweet_url(url) && ui.small_button("URL コピー").clicked() {
                 ctx.copy_text(url.to_string());
             }
         }
@@ -670,11 +679,7 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
             (false, _) => format!("{by} が引用"),
             _ => "別ツイートから引用".to_string(),
         };
-        ui.label(
-            egui::RichText::new(label)
-                .color(DIM_COLOR)
-                .size(BODY_FONT),
-        );
+        ui.label(egui::RichText::new(label).color(DIM_COLOR).size(BODY_FONT));
         if xmp_reader::is_safe_tweet_url(qurl)
             && ui
                 .button("引用した投稿を開く")
@@ -795,9 +800,5 @@ fn draw_text_section(ui: &mut egui::Ui, ctx: &egui::Context, label: &str, text: 
         }
     });
     ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(text)
-            .color(TEXT_COLOR)
-            .size(BODY_FONT),
-    );
+    ui.label(egui::RichText::new(text).color(TEXT_COLOR).size(BODY_FONT));
 }

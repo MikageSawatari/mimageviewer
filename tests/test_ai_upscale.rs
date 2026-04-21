@@ -9,8 +9,8 @@
 //!   TEST_IMAGE_PATH="D:\path\to\image.jpg" cargo test --test test_ai_upscale -- --nocapture
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// テスト用画像のパスを返す。
 /// 環境変数 TEST_IMAGE_PATH があればそれを使い、なければデフォルトのテスト画像を生成。
@@ -54,7 +54,9 @@ fn find_models_dir() -> PathBuf {
         }
     }
 
-    panic!("models/ directory not found. Place ONNX models in ./models/ or %APPDATA%/mimageviewer/models/");
+    panic!(
+        "models/ directory not found. Place ONNX models in ./models/ or %APPDATA%/mimageviewer/models/"
+    );
 }
 
 /// ONNX Runtime + DirectML で各モデルをロードし、タイル1枚で推論できるか確認。
@@ -63,17 +65,34 @@ fn test_runtime_and_model_loading() {
     let models_dir = find_models_dir();
     println!("Models directory: {}", models_dir.display());
 
-    let runtime = mimageviewer::ai::runtime::AiRuntime::new()
-        .expect("Failed to create AiRuntime");
+    let runtime = mimageviewer::ai::runtime::AiRuntime::new().expect("Failed to create AiRuntime");
 
     // 全モデルのロードテスト
     let models = [
-        (mimageviewer::ai::ModelKind::ClassifierMobileNet, "anime_classifier_mobilenetv3.onnx"),
-        (mimageviewer::ai::ModelKind::UpscaleRealEsrganX4Plus, "realesrgan_x4plus.onnx"),
-        (mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B, "realesrgan_x4plus_anime_6b.onnx"),
-        (mimageviewer::ai::ModelKind::UpscaleRealEsrGeneralV3, "realesr_general_x4v3.onnx"),
-        (mimageviewer::ai::ModelKind::UpscaleRealCugan4x, "realcugan_4x_conservative.onnx"),
-        (mimageviewer::ai::ModelKind::DenoiseRealplksr, "dejpg_realplksr_otf.onnx"),
+        (
+            mimageviewer::ai::ModelKind::ClassifierMobileNet,
+            "anime_classifier_mobilenetv3.onnx",
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealEsrganX4Plus,
+            "realesrgan_x4plus.onnx",
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B,
+            "realesrgan_x4plus_anime_6b.onnx",
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealEsrGeneralV3,
+            "realesr_general_x4v3.onnx",
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
+            "realcugan_4x_conservative.onnx",
+        ),
+        (
+            mimageviewer::ai::ModelKind::DenoiseRealplksr,
+            "dejpg_realplksr_otf.onnx",
+        ),
         (mimageviewer::ai::ModelKind::InpaintMiGan, "migan.onnx"),
     ];
 
@@ -105,10 +124,12 @@ fn test_classifier() {
     }
 
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime.load_model(
-        mimageviewer::ai::ModelKind::ClassifierMobileNet,
-        &classifier_path,
-    ).unwrap();
+    runtime
+        .load_model(
+            mimageviewer::ai::ModelKind::ClassifierMobileNet,
+            &classifier_path,
+        )
+        .unwrap();
 
     let img = get_test_image();
     println!("Image size: {}x{}", img.width(), img.height());
@@ -122,7 +143,11 @@ fn test_classifier() {
 
     // ヒューリスティクス分類
     let heuristic = mimageviewer::ai::classify::classify_heuristic(&img);
-    println!("Heuristic result: {:?} ({})", heuristic, heuristic.display_label());
+    println!(
+        "Heuristic result: {:?} ({})",
+        heuristic,
+        heuristic.display_label()
+    );
 }
 
 /// 各アップスケールモデルで小さいタイルを推論してみるテスト。
@@ -139,10 +164,26 @@ fn test_upscale_all_models() {
     let cancel = Arc::new(AtomicBool::new(false));
 
     let upscale_models = [
-        (mimageviewer::ai::ModelKind::UpscaleRealEsrganX4Plus, "realesrgan_x4plus.onnx", 4),
-        (mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B, "realesrgan_x4plus_anime_6b.onnx", 4),
-        (mimageviewer::ai::ModelKind::UpscaleRealEsrGeneralV3, "realesr_general_x4v3.onnx", 4),
-        (mimageviewer::ai::ModelKind::UpscaleRealCugan4x, "realcugan_4x_conservative.onnx", 4),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealEsrganX4Plus,
+            "realesrgan_x4plus.onnx",
+            4,
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B,
+            "realesrgan_x4plus_anime_6b.onnx",
+            4,
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealEsrGeneralV3,
+            "realesr_general_x4v3.onnx",
+            4,
+        ),
+        (
+            mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
+            "realcugan_4x_conservative.onnx",
+            4,
+        ),
     ];
 
     for (kind, filename, expected_scale) in &upscale_models {
@@ -156,12 +197,7 @@ fn test_upscale_all_models() {
         runtime.load_model(*kind, &path).expect("Model load failed");
 
         let t0 = std::time::Instant::now();
-        let result = mimageviewer::ai::upscale::upscale(
-            &runtime,
-            *kind,
-            &small,
-            &cancel,
-        );
+        let result = mimageviewer::ai::upscale::upscale(&runtime, *kind, &small, &cancel);
         let elapsed = t0.elapsed();
 
         match result {
@@ -169,8 +205,10 @@ fn test_upscale_all_models() {
                 let [w, h] = upscaled.size;
                 println!(
                     "OK: {}x{} → {}x{} in {:.2}s",
-                    small.width(), small.height(),
-                    w, h,
+                    small.width(),
+                    small.height(),
+                    w,
+                    h,
                     elapsed.as_secs_f64()
                 );
                 assert_eq!(w, small.width() as usize * expected_scale);
@@ -196,7 +234,9 @@ fn test_upscale_full_size() {
     println!("Full-size test image: {}x{}", img.width(), img.height());
 
     if img.width() <= 64 && img.height() <= 64 {
-        println!("SKIP: Image too small for multi-tile test. Set TEST_IMAGE_PATH to a larger image.");
+        println!(
+            "SKIP: Image too small for multi-tile test. Set TEST_IMAGE_PATH to a larger image."
+        );
         return;
     }
 
@@ -221,7 +261,10 @@ fn test_upscale_full_size() {
                 println!("SKIP: no suitable model found");
                 return;
             }
-            (mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B, anime_path)
+            (
+                mimageviewer::ai::ModelKind::UpscaleRealEsrganAnime6B,
+                anime_path,
+            )
         }
     };
     runtime.load_model(kind, &model_path).unwrap();
@@ -235,7 +278,11 @@ fn test_upscale_full_size() {
             let [w, h] = upscaled.size;
             println!(
                 "Full-size OK: {}x{} → {}x{} in {:.2}s",
-                img.width(), img.height(), w, h, elapsed.as_secs_f64()
+                img.width(),
+                img.height(),
+                w,
+                h,
+                elapsed.as_secs_f64()
             );
             assert_eq!(w, img.width() as usize * 4);
             assert_eq!(h, img.height() as usize * 4);
@@ -255,4 +302,3 @@ fn test_upscale_full_size() {
         Err(e) => panic!("Full-size upscale failed: {}", e),
     }
 }
-

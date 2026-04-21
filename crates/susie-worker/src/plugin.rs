@@ -24,22 +24,20 @@
 //! このワーカー自体が隔離プロセスなので、プラグインが落ちてもメインプロセスには
 //! 影響しない。ここでは panic やエラーを拾って次のプラグインへ進むだけでよい。
 
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::path::{Path, PathBuf};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{FreeLibrary, HANDLE, HLOCAL, HMODULE, LocalFree, FARPROC};
+use windows::Win32::Foundation::{FARPROC, FreeLibrary, HANDLE, HLOCAL, HMODULE, LocalFree};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{LocalLock, LocalUnlock};
+use windows::core::PCWSTR;
 
 // ─────────────────────────────────────────────────────────────────
 // C ABI 型
 // ─────────────────────────────────────────────────────────────────
 
-type GetPluginInfoFn =
-    unsafe extern "system" fn(infono: i32, buf: *mut u8, buflen: i32) -> i32;
-type IsSupportedFn =
-    unsafe extern "system" fn(filename: *const u8, dw: *const c_void) -> i32;
+type GetPluginInfoFn = unsafe extern "system" fn(infono: i32, buf: *mut u8, buflen: i32) -> i32;
+type IsSupportedFn = unsafe extern "system" fn(filename: *const u8, dw: *const c_void) -> i32;
 type GetPictureFn = unsafe extern "system" fn(
     buf: *const c_void,
     len: i32,
@@ -137,7 +135,9 @@ impl PluginHost {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase())
+                if p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase())
                     != Some("spi".to_string())
                 {
                     continue;
@@ -185,19 +185,25 @@ impl LoadedPlugin {
             return Err("LoadLibraryW returned invalid handle".into());
         }
 
-        let p_get_info = unsafe { GetProcAddress(hmod, pcstr(b"GetPluginInfo\0")) }
-            .ok_or_else(|| {
-                unsafe { let _ = FreeLibrary(hmod); }
+        let p_get_info =
+            unsafe { GetProcAddress(hmod, pcstr(b"GetPluginInfo\0")) }.ok_or_else(|| {
+                unsafe {
+                    let _ = FreeLibrary(hmod);
+                }
                 "GetPluginInfo not found".to_string()
             })?;
-        let p_is_supported = unsafe { GetProcAddress(hmod, pcstr(b"IsSupported\0")) }
-            .ok_or_else(|| {
-                unsafe { let _ = FreeLibrary(hmod); }
+        let p_is_supported =
+            unsafe { GetProcAddress(hmod, pcstr(b"IsSupported\0")) }.ok_or_else(|| {
+                unsafe {
+                    let _ = FreeLibrary(hmod);
+                }
                 "IsSupported not found".to_string()
             })?;
-        let p_get_picture = unsafe { GetProcAddress(hmod, pcstr(b"GetPicture\0")) }
-            .ok_or_else(|| {
-                unsafe { let _ = FreeLibrary(hmod); }
+        let p_get_picture =
+            unsafe { GetProcAddress(hmod, pcstr(b"GetPicture\0")) }.ok_or_else(|| {
+                unsafe {
+                    let _ = FreeLibrary(hmod);
+                }
                 "GetPicture not found".to_string()
             })?;
 
@@ -256,8 +262,12 @@ impl LoadedPlugin {
         let n = bytes.len().min(2048);
         header[..n].copy_from_slice(&bytes[..n]);
 
-        let supported =
-            unsafe { (self.p_is_supported)(hint_cstr.as_ptr() as *const u8, header.as_ptr() as *const c_void) };
+        let supported = unsafe {
+            (self.p_is_supported)(
+                hint_cstr.as_ptr() as *const u8,
+                header.as_ptr() as *const c_void,
+            )
+        };
         if supported == 0 {
             return Err("not supported by this plugin".into());
         }
@@ -472,10 +482,7 @@ unsafe fn convert_dib_inner(
             8 => {
                 for x in 0..w as usize {
                     let idx = unsafe { *row_src.add(x) } as usize;
-                    let quad = palette
-                        .get(idx)
-                        .copied()
-                        .unwrap_or([0, 0, 0, 0]);
+                    let quad = palette.get(idx).copied().unwrap_or([0, 0, 0, 0]);
                     row_dst[x * 4] = quad[0];
                     row_dst[x * 4 + 1] = quad[1];
                     row_dst[x * 4 + 2] = quad[2];
@@ -490,10 +497,7 @@ unsafe fn convert_dib_inner(
                     } else {
                         byte & 0x0F
                     };
-                    let quad = palette
-                        .get(nib as usize)
-                        .copied()
-                        .unwrap_or([0, 0, 0, 0]);
+                    let quad = palette.get(nib as usize).copied().unwrap_or([0, 0, 0, 0]);
                     row_dst[x * 4] = quad[0];
                     row_dst[x * 4 + 1] = quad[1];
                     row_dst[x * 4 + 2] = quad[2];

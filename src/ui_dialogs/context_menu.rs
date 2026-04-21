@@ -1,7 +1,7 @@
 //! サムネイルグリッドの右クリックコンテキストメニュー。
 
-use std::path::PathBuf;
 use eframe::egui;
+use std::path::PathBuf;
 
 use crate::grid_item::GridItem;
 
@@ -102,7 +102,10 @@ impl crate::app::App {
                     ui.separator();
 
                     // 削除 (ゴミ箱)
-                    if ui.button(format!("削除 (ゴミ箱) [{checked_count}件]")).clicked() {
+                    if ui
+                        .button(format!("削除 (ゴミ箱) [{checked_count}件]"))
+                        .clicked()
+                    {
                         let targets: Vec<(usize, PathBuf)> = self.collect_checked_indexed_paths();
                         self.delete_targets = targets;
                         self.show_delete_confirm = true;
@@ -132,7 +135,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if ui.button("ファイル名をコピー").clicked() {
-                                let name = p.file_name()
+                                let name = p
+                                    .file_name()
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("")
                                     .to_string();
@@ -140,7 +144,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if matches!(item, GridItem::Image(_)) {
-                                if ui.button("画像をクリップボードにコピー").clicked() {
+                                if ui.button("画像をクリップボードにコピー").clicked()
+                                {
                                     copy_image_to_clipboard(p);
                                     close = true;
                                 }
@@ -186,9 +191,7 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        GridItem::Folder(p)
-                        | GridItem::ZipFile(p)
-                        | GridItem::PdfFile(p) => {
+                        GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(p.to_string_lossy().to_string());
                                 close = true;
@@ -218,7 +221,10 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        GridItem::ZipImage { zip_path, entry_name } => {
+                        GridItem::ZipImage {
+                            zip_path,
+                            entry_name,
+                        } => {
                             let display = format!("{}:{}", zip_path.display(), entry_name);
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(display);
@@ -230,7 +236,9 @@ impl crate::app::App {
                                 close = true;
                             }
                             if ui.button("画像をクリップボードにコピー").clicked() {
-                                if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                                if let Ok(bytes) =
+                                    crate::zip_loader::read_entry_bytes(zip_path, entry_name)
+                                {
                                     copy_image_bytes_to_clipboard(&bytes);
                                 }
                                 close = true;
@@ -246,7 +254,9 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        GridItem::PdfPage { pdf_path, page_num, .. } => {
+                        GridItem::PdfPage {
+                            pdf_path, page_num, ..
+                        } => {
                             let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(display);
@@ -327,7 +337,8 @@ impl crate::app::App {
                             close = true;
                         }
                         if ui.button("ファイル名をコピー").clicked() {
-                            let name = p.file_name()
+                            let name = p
+                                .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("")
                                 .to_string();
@@ -361,7 +372,10 @@ impl crate::app::App {
                         ui.separator();
                         close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
                     }
-                    GridItem::ZipImage { zip_path, entry_name } => {
+                    GridItem::ZipImage {
+                        zip_path,
+                        entry_name,
+                    } => {
                         let display = format!("{}:{}", zip_path.display(), entry_name);
                         if ui.button("パスをコピー").clicked() {
                             ctx.copy_text(display);
@@ -373,13 +387,17 @@ impl crate::app::App {
                             close = true;
                         }
                         if ui.button("画像をクリップボードにコピー").clicked() {
-                            if let Ok(bytes) = crate::zip_loader::read_entry_bytes(zip_path, entry_name) {
+                            if let Ok(bytes) =
+                                crate::zip_loader::read_entry_bytes(zip_path, entry_name)
+                            {
                                 copy_image_bytes_to_clipboard(&bytes);
                             }
                             close = true;
                         }
                     }
-                    GridItem::PdfPage { pdf_path, page_num, .. } => {
+                    GridItem::PdfPage {
+                        pdf_path, page_num, ..
+                    } => {
                         let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
                         if ui.button("パスをコピー").clicked() {
                             ctx.copy_text(display);
@@ -456,10 +474,8 @@ impl crate::app::App {
             let label = format!("{}で開く", recent.display_name);
             if ui.button(&label).clicked() {
                 crate::open_with::launch_with_app(&recent.exe_path, &file_path_owned);
-                self.settings.record_recent_open_with(
-                    recent.display_name,
-                    recent.exe_path,
-                );
+                self.settings
+                    .record_recent_open_with(recent.display_name, recent.exe_path);
                 self.settings.save();
                 *close = true;
                 app_launched = true;
@@ -467,66 +483,68 @@ impl crate::app::App {
         }
 
         // アプリ一覧（折りたたみ展開）
-        egui::CollapsingHeader::new("アプリケーションで開く…")
-            .show(ui, |ui| {
-                // カスタムアプリ
-                let custom_apps = self.settings.custom_open_with_apps.clone();
-                if !custom_apps.is_empty() {
-                    for app in &custom_apps {
-                        if ui.button(&app.display_name).clicked() {
-                            crate::open_with::launch_with_app(&app.exe_path, &file_path_owned);
-                            self.settings.record_recent_open_with(
-                                app.display_name.clone(),
-                                app.exe_path.clone(),
-                            );
-                            self.settings.save();
-                            *close = true;
-                            app_launched = true;
-                        }
-                    }
-                    ui.separator();
-                }
-
-                // システム関連付けアプリ（キャッシュ）
-                let handlers = match &self.cached_handlers {
-                    Some((cached_ext, h)) if cached_ext == &ext => h.clone(),
-                    _ => {
-                        let h = crate::open_with::enumerate_handlers(&ext);
-                        self.cached_handlers = Some((ext.clone(), h.clone()));
-                        h
-                    }
-                };
-                for handler in &handlers {
-                    if ui.button(&handler.display_name).clicked() {
-                        crate::open_with::launch_with_app(&handler.exe_path, &file_path_owned);
+        egui::CollapsingHeader::new("アプリケーションで開く…").show(ui, |ui| {
+            // カスタムアプリ
+            let custom_apps = self.settings.custom_open_with_apps.clone();
+            if !custom_apps.is_empty() {
+                for app in &custom_apps {
+                    if ui.button(&app.display_name).clicked() {
+                        crate::open_with::launch_with_app(&app.exe_path, &file_path_owned);
                         self.settings.record_recent_open_with(
-                            handler.display_name.clone(),
-                            handler.exe_path.clone(),
+                            app.display_name.clone(),
+                            app.exe_path.clone(),
                         );
                         self.settings.save();
                         *close = true;
                         app_launched = true;
                     }
                 }
-
-                // アプリ追加ボタン
                 ui.separator();
-                if ui.button("アプリケーションを追加…").clicked() {
-                    if let Some(app) = crate::open_with::pick_exe_dialog() {
-                        let already = self.settings.custom_open_with_apps.iter()
-                            .any(|a| a.exe_path.eq_ignore_ascii_case(&app.exe_path));
-                        if !already {
-                            self.settings.custom_open_with_apps.push(
-                                crate::settings::RecentApp {
-                                    display_name: app.display_name,
-                                    exe_path: app.exe_path,
-                                }
-                            );
-                            self.settings.save();
-                        }
+            }
+
+            // システム関連付けアプリ（キャッシュ）
+            let handlers = match &self.cached_handlers {
+                Some((cached_ext, h)) if cached_ext == &ext => h.clone(),
+                _ => {
+                    let h = crate::open_with::enumerate_handlers(&ext);
+                    self.cached_handlers = Some((ext.clone(), h.clone()));
+                    h
+                }
+            };
+            for handler in &handlers {
+                if ui.button(&handler.display_name).clicked() {
+                    crate::open_with::launch_with_app(&handler.exe_path, &file_path_owned);
+                    self.settings.record_recent_open_with(
+                        handler.display_name.clone(),
+                        handler.exe_path.clone(),
+                    );
+                    self.settings.save();
+                    *close = true;
+                    app_launched = true;
+                }
+            }
+
+            // アプリ追加ボタン
+            ui.separator();
+            if ui.button("アプリケーションを追加…").clicked() {
+                if let Some(app) = crate::open_with::pick_exe_dialog() {
+                    let already = self
+                        .settings
+                        .custom_open_with_apps
+                        .iter()
+                        .any(|a| a.exe_path.eq_ignore_ascii_case(&app.exe_path));
+                    if !already {
+                        self.settings
+                            .custom_open_with_apps
+                            .push(crate::settings::RecentApp {
+                                display_name: app.display_name,
+                                exe_path: app.exe_path,
+                            });
+                        self.settings.save();
                     }
                 }
-            });
+            }
+        });
         app_launched
     }
 
@@ -691,8 +709,8 @@ fn move_to_recycle_bin(path: &std::path::Path) -> bool {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::UI::Shell::{
-            SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE,
-            FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT,
+            FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, SHFILEOPSTRUCTW,
+            SHFileOperationW,
         };
 
         let wide: Vec<u16> = path
@@ -815,13 +833,13 @@ fn set_image_to_clipboard(img: &image::DynamicImage) {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::Ole::CF_DIB;
-        use windows::Win32::System::Memory::{
-            GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS,
-        };
         use windows::Win32::System::DataExchange::{
-            OpenClipboard, CloseClipboard, EmptyClipboard, SetClipboardData,
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
         };
+        use windows::Win32::System::Memory::{
+            GLOBAL_ALLOC_FLAGS, GlobalAlloc, GlobalLock, GlobalUnlock,
+        };
+        use windows::Win32::System::Ole::CF_DIB;
 
         let row_size = (width * 3 + 3) & !3;
         let pixel_size = row_size * height;
@@ -832,7 +850,9 @@ fn set_image_to_clipboard(img: &image::DynamicImage) {
             let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), total_size);
             let Ok(hmem) = hmem else { return };
             let ptr = GlobalLock(hmem);
-            if ptr.is_null() { return; }
+            if ptr.is_null() {
+                return;
+            }
 
             let buf = std::slice::from_raw_parts_mut(ptr as *mut u8, total_size);
 
@@ -902,7 +922,8 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) {
             cmd.args([
                 "-NoProfile",
                 "-STA",
-                "-ExecutionPolicy", "Bypass",
+                "-ExecutionPolicy",
+                "Bypass",
                 "-File",
                 &tmp.to_string_lossy(),
             ]);
@@ -935,7 +956,8 @@ fn run_ps_script(script: &str) {
         cmd.args([
             "-NoProfile",
             "-STA",
-            "-ExecutionPolicy", "Bypass",
+            "-ExecutionPolicy",
+            "Bypass",
             "-File",
             &tmp.to_string_lossy(),
         ]);

@@ -1,7 +1,7 @@
 //! バージョン情報ダイアログ。
 
-use eframe::egui;
 use crate::app::App;
+use eframe::egui;
 
 impl App {
     pub(crate) fn show_about_dialog_window(&mut self, ctx: &egui::Context) {

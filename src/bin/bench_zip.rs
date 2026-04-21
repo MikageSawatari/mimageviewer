@@ -31,10 +31,16 @@ fn bench_one(zip_path: &Path) {
 
         let mut found_idx: Option<(usize, String)> = None;
         for i in 0..entry_count {
-            let Ok(entry) = archive.by_index_raw(i) else { continue };
-            if !entry.is_file() { continue; }
+            let Ok(entry) = archive.by_index_raw(i) else {
+                continue;
+            };
+            if !entry.is_file() {
+                continue;
+            }
             let name = entry.name().to_string();
-            if name.contains("__MACOSX/") || name.starts_with('.') { continue; }
+            if name.contains("__MACOSX/") || name.starts_with('.') {
+                continue;
+            }
             let Some(dot) = name.rfind('.') else { continue };
             let ext = name[dot + 1..].to_ascii_lowercase();
             if IMAGE_EXTS.contains(&ext.as_str()) {
@@ -59,7 +65,10 @@ fn bench_one(zip_path: &Path) {
                 bytes.len(),
             );
         } else {
-            println!("  [8KB buf]  entries={entry_count}  no image found  total={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+            println!(
+                "  [8KB buf]  entries={entry_count}  no image found  total={:.1}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
 
@@ -74,10 +83,16 @@ fn bench_one(zip_path: &Path) {
 
         let mut found_idx: Option<(usize, String)> = None;
         for i in 0..entry_count {
-            let Ok(entry) = archive.by_index_raw(i) else { continue };
-            if !entry.is_file() { continue; }
+            let Ok(entry) = archive.by_index_raw(i) else {
+                continue;
+            };
+            if !entry.is_file() {
+                continue;
+            }
             let name = entry.name().to_string();
-            if name.contains("__MACOSX/") || name.starts_with('.') { continue; }
+            if name.contains("__MACOSX/") || name.starts_with('.') {
+                continue;
+            }
             let Some(dot) = name.rfind('.') else { continue };
             let ext = name[dot + 1..].to_ascii_lowercase();
             if IMAGE_EXTS.contains(&ext.as_str()) {
@@ -102,7 +117,10 @@ fn bench_one(zip_path: &Path) {
                 bytes.len(),
             );
         } else {
-            println!("  [256KB buf] entries={entry_count}  no image found  total={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+            println!(
+                "  [256KB buf] entries={entry_count}  no image found  total={:.1}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
 
@@ -118,10 +136,16 @@ fn bench_one(zip_path: &Path) {
 
         let mut found_idx: Option<(usize, String)> = None;
         for i in 0..entry_count {
-            let Ok(entry) = archive.by_index_raw(i) else { continue };
-            if !entry.is_file() { continue; }
+            let Ok(entry) = archive.by_index_raw(i) else {
+                continue;
+            };
+            if !entry.is_file() {
+                continue;
+            }
             let name = entry.name().to_string();
-            if name.contains("__MACOSX/") || name.starts_with('.') { continue; }
+            if name.contains("__MACOSX/") || name.starts_with('.') {
+                continue;
+            }
             let Some(dot) = name.rfind('.') else { continue };
             let ext = name[dot + 1..].to_ascii_lowercase();
             if IMAGE_EXTS.contains(&ext.as_str()) {
@@ -146,7 +170,10 @@ fn bench_one(zip_path: &Path) {
                 bytes.len(),
             );
         } else {
-            println!("  [in-memory] entries={entry_count}  no image found  total={:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+            println!(
+                "  [in-memory] entries={entry_count}  no image found  total={:.1}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
 }
@@ -181,36 +208,57 @@ fn main() {
     // 並列テスト
     if parallel > 0 && files.len() > 1 {
         println!("\n\n--- Parallel ({parallel} threads) ---");
-        let paths: Vec<std::path::PathBuf> = files.iter().map(|f| Path::new(f).to_path_buf()).collect();
+        let paths: Vec<std::path::PathBuf> =
+            files.iter().map(|f| Path::new(f).to_path_buf()).collect();
         let t = Instant::now();
-        let handles: Vec<_> = paths.into_iter().enumerate().map(|(idx, p)| {
-            std::thread::spawn(move || {
-                let t0 = Instant::now();
-                let file = std::fs::File::open(&p).unwrap();
-                let mut archive = zip::ZipArchive::new(BufReader::with_capacity(256 * 1024, file)).unwrap();
-                for i in 0..archive.len() {
-                    let Ok(entry) = archive.by_index_raw(i) else { continue };
-                    if !entry.is_file() { continue; }
-                    let name = entry.name().to_string();
-                    if name.contains("__MACOSX/") { continue; }
-                    let Some(dot) = name.rfind('.') else { continue };
-                    let ext = name[dot + 1..].to_ascii_lowercase();
-                    if IMAGE_EXTS.contains(&ext.as_str()) {
-                        drop(entry);
-                        let mut e = archive.by_index(i).unwrap();
-                        let mut bytes = Vec::with_capacity(e.size() as usize);
-                        e.read_to_end(&mut bytes).unwrap();
-                        println!("  [t{idx}] {:.1}ms  {}", t0.elapsed().as_secs_f64() * 1000.0,
-                            p.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
-                        return;
+        let handles: Vec<_> = paths
+            .into_iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                std::thread::spawn(move || {
+                    let t0 = Instant::now();
+                    let file = std::fs::File::open(&p).unwrap();
+                    let mut archive =
+                        zip::ZipArchive::new(BufReader::with_capacity(256 * 1024, file)).unwrap();
+                    for i in 0..archive.len() {
+                        let Ok(entry) = archive.by_index_raw(i) else {
+                            continue;
+                        };
+                        if !entry.is_file() {
+                            continue;
+                        }
+                        let name = entry.name().to_string();
+                        if name.contains("__MACOSX/") {
+                            continue;
+                        }
+                        let Some(dot) = name.rfind('.') else { continue };
+                        let ext = name[dot + 1..].to_ascii_lowercase();
+                        if IMAGE_EXTS.contains(&ext.as_str()) {
+                            drop(entry);
+                            let mut e = archive.by_index(i).unwrap();
+                            let mut bytes = Vec::with_capacity(e.size() as usize);
+                            e.read_to_end(&mut bytes).unwrap();
+                            println!(
+                                "  [t{idx}] {:.1}ms  {}",
+                                t0.elapsed().as_secs_f64() * 1000.0,
+                                p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                            );
+                            return;
+                        }
                     }
-                }
-                println!("  [t{idx}] no image  {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                    println!(
+                        "  [t{idx}] no image  {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                })
             })
-        }).collect();
+            .collect();
         for h in handles {
             h.join().unwrap();
         }
-        println!("  Total parallel time: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "  Total parallel time: {:.1}ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }

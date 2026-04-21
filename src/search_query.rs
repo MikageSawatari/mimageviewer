@@ -192,10 +192,7 @@ mod tests {
 
     #[test]
     fn parse_quoted_not() {
-        assert_eq!(
-            parse(r#"-"low quality""#),
-            vec![exc("low quality")],
-        );
+        assert_eq!(parse(r#"-"low quality""#), vec![exc("low quality")],);
     }
 
     #[test]
@@ -259,7 +256,10 @@ mod tests {
     fn decide_partial_all_includes_no_excludes() {
         // 全 include が hay にあり exclude なし → Decided(true)
         let t = parse("foo bar");
-        assert_eq!(decide_partial(&t, "foo and bar"), PartialResult::Decided(true));
+        assert_eq!(
+            decide_partial(&t, "foo and bar"),
+            PartialResult::Decided(true)
+        );
     }
 
     #[test]
@@ -273,7 +273,10 @@ mod tests {
     fn decide_partial_exclude_hit() {
         // exclude が hay に存在する時点で不一致確定 → Decided(false)
         let t = parse("foo -bad");
-        assert_eq!(decide_partial(&t, "foo has bad"), PartialResult::Decided(false));
+        assert_eq!(
+            decide_partial(&t, "foo has bad"),
+            PartialResult::Decided(false)
+        );
     }
 
     #[test]
@@ -293,7 +296,10 @@ mod tests {
     #[test]
     fn decide_partial_empty_tokens() {
         // トークン 0 個は常に Decided(true) (追加情報を読む必要なし)
-        assert_eq!(decide_partial(&[], "anything"), PartialResult::Decided(true));
+        assert_eq!(
+            decide_partial(&[], "anything"),
+            PartialResult::Decided(true)
+        );
     }
 
     #[test]

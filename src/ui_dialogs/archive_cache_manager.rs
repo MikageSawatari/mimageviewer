@@ -74,10 +74,8 @@ impl App {
                         if let Some(db) = self.archive_cache_db.as_ref() {
                             match db.clear_all() {
                                 Ok(n) => {
-                                    self.archive_cache_manager_result = Some(format!(
-                                        "{} 件のキャッシュを削除しました。",
-                                        n
-                                    ));
+                                    self.archive_cache_manager_result =
+                                        Some(format!("{} 件のキャッシュを削除しました。", n));
                                 }
                                 Err(e) => {
                                     self.archive_cache_manager_result =
@@ -136,7 +134,11 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     };
 
     let total_bytes = db.total_size().unwrap_or(0);
-    let row_count = app.archive_cache_rows.as_ref().map(|v| v.len()).unwrap_or(0);
+    let row_count = app
+        .archive_cache_rows
+        .as_ref()
+        .map(|v| v.len())
+        .unwrap_or(0);
     let missing_count = app
         .archive_cache_rows
         .as_ref()
@@ -236,8 +238,7 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
                     ui.end_row();
 
                     for (idx, entry) in rows.iter().enumerate() {
-                        let mut selected =
-                            app.archive_cache_selection.contains(&idx);
+                        let mut selected = app.archive_cache_selection.contains(&idx);
                         if ui.checkbox(&mut selected, "").changed() {
                             if selected {
                                 app.archive_cache_selection.insert(idx);
@@ -268,10 +269,7 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-fn delete_selected(
-    app: &mut App,
-    db: &crate::archive_cache::ArchiveCacheDb,
-) {
+fn delete_selected(app: &mut App, db: &crate::archive_cache::ArchiveCacheDb) {
     let Some(rows) = app.archive_cache_rows.as_ref() else {
         return;
     };

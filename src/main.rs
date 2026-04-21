@@ -9,26 +9,30 @@ pub mod archive_converter;
 pub mod catalog;
 pub mod data_dir;
 pub mod dwm_transitions;
+pub mod exif_reader;
+pub mod fast_resize;
 pub mod folder_tree;
 pub mod fs_animation;
 pub mod fts_index;
 pub mod fts_meta;
 pub mod global_search;
 mod global_search_ui;
+pub mod gpu_info;
+pub mod grid_item;
 pub mod indexer_manager;
 pub mod indexer_supervisor;
 pub mod ingest_text;
 pub mod ingest_worker;
-pub mod gpu_info;
 pub mod io_semaphore;
-pub mod grid_item;
-pub mod exif_reader;
-pub mod fast_resize;
 pub mod logger;
 pub mod mask_db;
 pub mod monitor;
 pub mod name_bulk_indexer;
+pub mod open_with;
+pub mod os_theme;
 pub mod path_key;
+pub mod pdf_loader;
+pub mod pdf_passwords;
 pub mod perf;
 pub mod png_metadata;
 pub mod post_filter;
@@ -43,23 +47,19 @@ pub mod settings;
 pub mod sidecar;
 pub mod spread_db;
 pub mod stats;
+pub mod susie_loader;
 pub mod sys_memory;
 pub mod thumb_loader;
-pub mod ui_dialogs;
 mod ui_adjustment_panel;
 mod ui_analysis_panel;
+pub mod ui_dialogs;
 mod ui_erase;
 mod ui_fullscreen;
 pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
-pub mod video_thumb;
-pub mod open_with;
-pub mod os_theme;
-pub mod pdf_loader;
-pub mod pdf_passwords;
-pub mod susie_loader;
 pub mod ui_susie_diagnostic;
+pub mod video_thumb;
 pub mod wic_decoder;
 pub mod xmp_reader;
 pub mod zip_loader;
@@ -74,12 +74,19 @@ use std::time::Instant;
 /// 経由で計算するので、事前に `perf::init(enabled, Some(prog_start))` を呼んでおくこと。
 /// `perf::is_enabled()` が false なら no-op。
 fn emit_startup(step: &str, phase_start: Option<Instant>) {
-    if !perf::is_enabled() { return; }
-    let Some(base) = perf::program_start() else { return };
+    if !perf::is_enabled() {
+        return;
+    }
+    let Some(base) = perf::program_start() else {
+        return;
+    };
     let total_ms = base.elapsed().as_secs_f64() * 1000.0;
     let mut extras: Vec<(&str, serde_json::Value)> = Vec::with_capacity(2);
     if let Some(start) = phase_start {
-        extras.push(("ms", serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0)));
+        extras.push((
+            "ms",
+            serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+        ));
     }
     extras.push(("total_ms", serde_json::Value::from(total_ms)));
     perf::event("startup", step, None, 0, &extras);
@@ -103,8 +110,7 @@ fn main() -> eframe::Result {
     let data_dir_elapsed = t0.elapsed();
 
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
-    let log_enabled = cfg!(debug_assertions)
-        || std::env::args().any(|a| a == "--log");
+    let log_enabled = cfg!(debug_assertions) || std::env::args().any(|a| a == "--log");
     if log_enabled {
         logger::init();
     }
@@ -120,10 +126,19 @@ fn main() -> eframe::Result {
     // data_dir_elapsed を直接 ms として埋める。
     if perf::is_enabled() {
         let total_ms = prog_start.elapsed().as_secs_f64() * 1000.0;
-        perf::event("startup", "data_dir_init", None, 0, &[
-            ("ms", serde_json::Value::from(data_dir_elapsed.as_secs_f64() * 1000.0)),
-            ("total_ms", serde_json::Value::from(total_ms)),
-        ]);
+        perf::event(
+            "startup",
+            "data_dir_init",
+            None,
+            0,
+            &[
+                (
+                    "ms",
+                    serde_json::Value::from(data_dir_elapsed.as_secs_f64() * 1000.0),
+                ),
+                ("total_ms", serde_json::Value::from(total_ms)),
+            ],
+        );
     }
 
     // AI モデルを %APPDATA%\mimageviewer\models\ に展開（サイズ一致ならスキップ）
@@ -157,7 +172,9 @@ fn main() -> eframe::Result {
         } else {
             "unknown payload".to_string()
         };
-        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC at {location}: {payload}\n{bt}");
@@ -166,7 +183,8 @@ fn main() -> eframe::Result {
         let _ = std::fs::create_dir_all(&log_dir);
         let panic_log = log_dir.join("panic.log");
         if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
+            .create(true)
+            .append(true)
             .open(&panic_log)
         {
             use std::io::Write;
@@ -242,7 +260,6 @@ fn main() -> eframe::Result {
         }),
     )
 }
-
 
 /// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。
 fn parse_window_size_arg() -> Option<[f32; 2]> {

@@ -7,8 +7,9 @@
 
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 
 use eframe::egui;
@@ -21,7 +22,7 @@ use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings;
 use crate::stats;
 use crate::thumb_loader::{
-    build_and_save_one, compute_display_px, CacheDecision, LoadRequest, ThumbMsg,
+    CacheDecision, LoadRequest, ThumbMsg, build_and_save_one, compute_display_px,
 };
 use crate::ui_helpers::{
     draw_format_rows, draw_histogram, format_bytes, format_bytes_small, format_count,
@@ -33,14 +34,15 @@ impl App {
         // ── キャッシュ作成ポップアップ ────────────────────────────────
         if self.cc.show {
             // 完了初回に結果メッセージをセット
-            if self.cc.finished.load(Ordering::Relaxed)
-                && self.cc.result.is_none()
-            {
+            if self.cc.finished.load(Ordering::Relaxed) && self.cc.result.is_none() {
                 let done = self.cc.done.load(Ordering::Relaxed);
                 let total = self.cc.total.load(Ordering::Relaxed);
                 let cancelled = self.cc.cancel.load(Ordering::Relaxed);
                 self.cc.result = Some(if cancelled {
-                    format!("キャンセルされました（{} / {} フォルダ処理済み）", done, total)
+                    format!(
+                        "キャンセルされました（{} / {} フォルダ処理済み）",
+                        done, total
+                    )
                 } else {
                     format!("{} フォルダの処理が完了しました。", done)
                 });
@@ -57,9 +59,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(500.0);
 
-                    if !self.cc.running
-                        && !self.cc.finished.load(Ordering::Relaxed)
-                    {
+                    if !self.cc.running && !self.cc.finished.load(Ordering::Relaxed) {
                         // ── 選択前画面 ──
                         ui.label("キャッシュを作成するお気に入りを選んでください：");
                         ui.add_space(6.0);
@@ -96,7 +96,7 @@ impl App {
                         );
                         ui.label(
                             egui::RichText::new(
-                                "チェックなしでも先頭1枚/1ページはキャッシュされます"
+                                "チェックなしでも先頭1枚/1ページはキャッシュされます",
                             )
                             .weak()
                             .small(),
@@ -108,10 +108,7 @@ impl App {
 
                         let any_checked = self.cc.checked.iter().any(|&b| b);
                         if ui
-                            .add_enabled(
-                                any_checked,
-                                egui::Button::new("  キャッシュ作成  "),
-                            )
+                            .add_enabled(any_checked, egui::Button::new("  キャッシュ作成  "))
                             .clicked()
                         {
                             self.settings.save();
@@ -166,15 +163,12 @@ impl App {
                 });
 
             if !open || escape_pressed {
-                if self.cc.running
-                    && !self.cc.finished.load(Ordering::Relaxed)
-                {
+                if self.cc.running && !self.cc.finished.load(Ordering::Relaxed) {
                     self.cc.cancel.store(true, Ordering::Relaxed);
                 }
                 self.cc.show = false;
                 self.cc.running = false;
             }
         }
-
     }
 }

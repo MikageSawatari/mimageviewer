@@ -99,9 +99,13 @@ impl From<std::io::Error> for ConvertError {
 /// ロード済み Susie プラグインの対応拡張子 (PI / MAG / Q0 等) も画像として扱う。
 /// これによりフォルダ列挙・本表示での認識と 7z/LZH 変換対象が一致する。
 fn is_image_entry(name: &str) -> bool {
-    let Some(dot) = name.rfind('.') else { return false };
+    let Some(dot) = name.rfind('.') else {
+        return false;
+    };
     // パス区切り後に '.' があることを確認 (ディレクトリパス中の '.' を誤検出しない)
-    let last_sep = name.rfind(|c: char| c == '/' || c == '\\').map_or(0, |i| i + 1);
+    let last_sep = name
+        .rfind(|c: char| c == '/' || c == '\\')
+        .map_or(0, |i| i + 1);
     if dot < last_sep {
         return false;
     }
@@ -165,8 +169,7 @@ fn scan_summary_7z(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
 }
 
 fn scan_summary_lzh(path: &Path) -> Result<ArchiveImageSummary, ConvertError> {
-    let mut reader = delharc::parse_file(path)
-        .map_err(|e| ConvertError::Archive(e.to_string()))?;
+    let mut reader = delharc::parse_file(path).map_err(|e| ConvertError::Archive(e.to_string()))?;
     let mut count = 0u32;
     let mut bytes = 0u64;
     loop {
@@ -329,8 +332,7 @@ fn convert_lzh(
 ) -> Result<ArchiveImageSummary, ConvertError> {
     // LZH は事前にもう一度開いて総数を数える (ヘッダスキャンなので軽い)
     let files_total: u32 = {
-        let mut r = delharc::parse_file(src)
-            .map_err(|e| ConvertError::Archive(e.to_string()))?;
+        let mut r = delharc::parse_file(src).map_err(|e| ConvertError::Archive(e.to_string()))?;
         let mut total = 0u32;
         loop {
             let header = r.header();
@@ -349,8 +351,7 @@ fn convert_lzh(
         total
     };
 
-    let mut reader = delharc::parse_file(src)
-        .map_err(|e| ConvertError::Archive(e.to_string()))?;
+    let mut reader = delharc::parse_file(src).map_err(|e| ConvertError::Archive(e.to_string()))?;
     let opts = store_options();
     let mut files_done: u32 = 0;
     let mut bytes_written: u64 = 0;
@@ -362,9 +363,8 @@ fn convert_lzh(
         let header = reader.header();
         let pathname = header.parse_pathname();
         let raw_name = pathname.to_string_lossy().to_string();
-        let should_copy = !header.is_directory()
-            && is_image_entry(&raw_name)
-            && reader.is_decoder_supported();
+        let should_copy =
+            !header.is_directory() && is_image_entry(&raw_name) && reader.is_decoder_supported();
         if should_copy {
             if let Some(name) = normalize_entry_name(&raw_name) {
                 zw.start_file(&name, opts)
@@ -408,11 +408,26 @@ mod tests {
 
     #[test]
     fn format_from_extension() {
-        assert_eq!(ArchiveFormat::from_extension("7z"), Some(ArchiveFormat::SevenZ));
-        assert_eq!(ArchiveFormat::from_extension("7Z"), Some(ArchiveFormat::SevenZ));
-        assert_eq!(ArchiveFormat::from_extension("lzh"), Some(ArchiveFormat::Lzh));
-        assert_eq!(ArchiveFormat::from_extension("lha"), Some(ArchiveFormat::Lzh));
-        assert_eq!(ArchiveFormat::from_extension("LHA"), Some(ArchiveFormat::Lzh));
+        assert_eq!(
+            ArchiveFormat::from_extension("7z"),
+            Some(ArchiveFormat::SevenZ)
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension("7Z"),
+            Some(ArchiveFormat::SevenZ)
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension("lzh"),
+            Some(ArchiveFormat::Lzh)
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension("lha"),
+            Some(ArchiveFormat::Lzh)
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension("LHA"),
+            Some(ArchiveFormat::Lzh)
+        );
         assert_eq!(ArchiveFormat::from_extension("zip"), None);
         assert_eq!(ArchiveFormat::from_extension("rar"), None);
     }
@@ -448,9 +463,18 @@ mod tests {
 
     #[test]
     fn normalize_entry_name_zip_slip() {
-        assert_eq!(normalize_entry_name("foo/bar.jpg"), Some("foo/bar.jpg".to_string()));
-        assert_eq!(normalize_entry_name("foo\\bar.jpg"), Some("foo/bar.jpg".to_string()));
-        assert_eq!(normalize_entry_name("/abs/path.jpg"), Some("abs/path.jpg".to_string()));
+        assert_eq!(
+            normalize_entry_name("foo/bar.jpg"),
+            Some("foo/bar.jpg".to_string())
+        );
+        assert_eq!(
+            normalize_entry_name("foo\\bar.jpg"),
+            Some("foo/bar.jpg".to_string())
+        );
+        assert_eq!(
+            normalize_entry_name("/abs/path.jpg"),
+            Some("abs/path.jpg".to_string())
+        );
         assert_eq!(normalize_entry_name("../escape.jpg"), None);
         assert_eq!(normalize_entry_name("a/../b.jpg"), None);
         assert_eq!(normalize_entry_name(""), None);

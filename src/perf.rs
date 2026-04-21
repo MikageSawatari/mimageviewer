@@ -53,16 +53,19 @@ pub fn init(enabled: bool, start_override: Option<Instant>) {
         .open(&log_path)
     {
         Ok(f) => {
-            if FILE.set(Mutex::new(BufWriter::with_capacity(64 * 1024, f))).is_ok() {
+            if FILE
+                .set(Mutex::new(BufWriter::with_capacity(64 * 1024, f)))
+                .is_ok()
+            {
                 ENABLED.store(true, Ordering::Release);
-                crate::logger::log(format!(
-                    "perf: JSONL log enabled at {}",
-                    log_path.display()
-                ));
+                crate::logger::log(format!("perf: JSONL log enabled at {}", log_path.display()));
             }
         }
         Err(e) => {
-            eprintln!("perf ログファイル作成失敗: {e} (path: {})", log_path.display());
+            eprintln!(
+                "perf ログファイル作成失敗: {e} (path: {})",
+                log_path.display()
+            );
             crate::logger::log(format!("perf: init failed: {e}"));
         }
     }
@@ -86,7 +89,9 @@ pub fn program_start() -> Option<Instant> {
 /// 追加の `extras` を渡したい場合はこのヘルパーではなく `event()` を直接呼ぶ。
 #[inline]
 pub fn emit_ms(cat: &str, kind: &str, seq: u64, t0: Instant) {
-    if !is_enabled() { return; }
+    if !is_enabled() {
+        return;
+    }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     event(cat, kind, None, seq, &[("ms", serde_json::Value::from(ms))]);
 }
@@ -144,4 +149,3 @@ pub fn flush() {
         let _ = f.flush();
     }
 }
-

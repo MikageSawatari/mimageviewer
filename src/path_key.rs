@@ -26,17 +26,26 @@ mod tests {
     #[test]
     fn strips_drive_letter() {
         assert_eq!(normalize(Path::new(r"C:\Foo\Bar")), "/foo/bar");
-        assert_eq!(normalize(Path::new(r"D:\Photos\IMG.jpg")), "/photos/img.jpg");
+        assert_eq!(
+            normalize(Path::new(r"D:\Photos\IMG.jpg")),
+            "/photos/img.jpg"
+        );
     }
 
     #[test]
     fn no_drive_letter_passthrough() {
         assert_eq!(normalize(Path::new("/foo/bar")), "/foo/bar");
-        assert_eq!(normalize(Path::new(r"\\server\share\file")), "//server/share/file");
+        assert_eq!(
+            normalize(Path::new(r"\\server\share\file")),
+            "//server/share/file"
+        );
     }
 
     #[test]
     fn lowercases_and_unifies_slashes() {
-        assert_eq!(normalize(Path::new(r"C:\Mixed/Slash\Path")), "/mixed/slash/path");
+        assert_eq!(
+            normalize(Path::new(r"C:\Mixed/Slash\Path")),
+            "/mixed/slash/path"
+        );
     }
 }

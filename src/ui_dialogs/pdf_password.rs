@@ -29,10 +29,7 @@ impl crate::app::App {
                 ui.label("このPDFファイルを開くにはパスワードが必要です:");
 
                 if let Some(ref path) = self.pdf_password_pending_path {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?");
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                     ui.label(
                         egui::RichText::new(name)
                             .size(12.0)

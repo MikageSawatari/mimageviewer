@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::search_index_db::normalize_path;
@@ -164,10 +164,7 @@ impl FtsMetaDb {
     /// ingest 失敗を記録。次回再試行 (retry 抑制は上位レイヤーで管理)。
     pub fn mark_failed(&self, path: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE files SET status = 2 WHERE path = ?1",
-            params![path],
-        )?;
+        conn.execute("UPDATE files SET status = 2 WHERE path = ?1", params![path])?;
         Ok(())
     }
 
@@ -350,15 +347,11 @@ impl FtsMetaDb {
 
     /// favorite_id でフィルタしつつ総数と status 別の件数を返す。
     /// インデックス管理ダイアログの進捗表示 (§8.4) で使用。
-    pub fn count_by_status(
-        &self,
-        favorite_id: Uuid,
-    ) -> rusqlite::Result<StatusCounts> {
+    pub fn count_by_status(&self, favorite_id: Uuid) -> rusqlite::Result<StatusCounts> {
         let conn = self.conn.lock().unwrap();
         let mut counts = StatusCounts::default();
-        let mut stmt = conn.prepare(
-            "SELECT status, COUNT(*) FROM files WHERE favorite_id = ?1 GROUP BY status",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT status, COUNT(*) FROM files WHERE favorite_id = ?1 GROUP BY status")?;
         let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -382,8 +375,9 @@ impl FtsMetaDb {
 
 fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let uuid_str: String = row.get(1)?;
-    let favorite_id = Uuid::parse_str(&uuid_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+    let favorite_id = Uuid::parse_str(&uuid_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let favorite_root: String = row.get(2)?;
     let status_i: i64 = row.get(8)?;
     Ok(FileMeta {
@@ -509,8 +503,10 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/1.jpg", fav, &root, 1, 10, "one").unwrap();
-        db.mark_pending("c:/p/2.jpg", fav, &root, 2, 20, "two").unwrap();
+        db.mark_pending("c:/p/1.jpg", fav, &root, 1, 10, "one")
+            .unwrap();
+        db.mark_pending("c:/p/2.jpg", fav, &root, 2, 20, "two")
+            .unwrap();
         db.mark_ok(&["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()])
             .unwrap();
 
@@ -542,9 +538,12 @@ mod tests {
         let fav_b = Uuid::new_v4();
         let root_a = PathBuf::from("C:/a");
         let root_b = PathBuf::from("C:/b");
-        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, 1, 1, "").unwrap();
-        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, 2, 2, "").unwrap();
-        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, 3, 3, "").unwrap();
+        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, 1, 1, "")
+            .unwrap();
+        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, 2, 2, "")
+            .unwrap();
+        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, 3, 3, "")
+            .unwrap();
 
         // 全部 pending のまま → list_favorite_files には出てこない
         assert!(db.list_favorite_files(fav_a).unwrap().is_empty());
@@ -571,8 +570,10 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/a.jpg", fav, &root, 1, 1, "alpha").unwrap();
-        db.mark_pending("c:/p/b.jpg", fav, &root, 2, 2, "beta").unwrap();
+        db.mark_pending("c:/p/a.jpg", fav, &root, 1, 1, "alpha")
+            .unwrap();
+        db.mark_pending("c:/p/b.jpg", fav, &root, 2, 2, "beta")
+            .unwrap();
 
         // 両方 pending → lookup は空
         let rows = db
@@ -622,15 +623,8 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/y");
         for i in 0..5 {
-            db.mark_pending(
-                &format!("c:/y/{}.jpg", i),
-                fav,
-                &root,
-                i,
-                1,
-                "",
-            )
-            .unwrap();
+            db.mark_pending(&format!("c:/y/{}.jpg", i), fav, &root, i, 1, "")
+                .unwrap();
         }
         db.mark_ok(&["c:/y/0.jpg".to_string(), "c:/y/1.jpg".to_string()])
             .unwrap();
@@ -652,17 +646,16 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/z");
-        db.mark_pending("c:/z/a.jpg", fav, &root, 1, 1, "alpha").unwrap();
-        db.mark_pending("c:/z/b.jpg", fav, &root, 2, 2, "beta").unwrap();
+        db.mark_pending("c:/z/a.jpg", fav, &root, 1, 1, "alpha")
+            .unwrap();
+        db.mark_pending("c:/z/b.jpg", fav, &root, 2, 2, "beta")
+            .unwrap();
         db.mark_ok(&["c:/z/a.jpg".to_string(), "c:/z/b.jpg".to_string()])
             .unwrap();
 
         // 存在しない path を含むクエリでも、存在するものだけ返る
         let rows = db
-            .lookup_all_text_norm(&[
-                "c:/z/a.jpg".to_string(),
-                "c:/z/missing.jpg".to_string(),
-            ])
+            .lookup_all_text_norm(&["c:/z/a.jpg".to_string(), "c:/z/missing.jpg".to_string()])
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "c:/z/a.jpg");

@@ -108,12 +108,7 @@ fn quantize_color_bits(c: Color32, bits: u8) -> [u8; 3] {
 }
 
 /// Bayer 4x4 ディザ閾値マップ (0..16 → 0..255)。
-const BAYER4: [[u8; 4]; 4] = [
-    [0, 8, 2, 10],
-    [12, 4, 14, 6],
-    [3, 11, 1, 9],
-    [15, 7, 13, 5],
-];
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 #[inline]
 fn bayer4_threshold(x: usize, y: usize) -> f32 {
@@ -131,11 +126,11 @@ fn clamp_u8(v: f32) -> u8 {
 #[derive(Clone, Copy)]
 struct BilinearYCtx {
     src_w: usize,
-    row0: usize,    // y0 * src_w
-    row1: usize,    // y1 * src_w
+    row0: usize, // y0 * src_w
+    row1: usize, // y1 * src_w
     ty: f32,
     one_minus_ty: f32,
-    max_x: usize,   // src_w - 1
+    max_x: usize, // src_w - 1
 }
 
 impl BilinearYCtx {
@@ -217,28 +212,34 @@ mod crt {
     pub fn apply_simple(src: &ColorImage) -> ColorImage {
         // scan_atten = 1 - 0.32*0.5 = 0.840 ; mask_atten = 1 - 0.25*0.12 = 0.970
         // product = 0.815 → boost = 1/0.815 ≈ 1.227
-        crt_common(src, CrtParams {
-            scanline_depth: 0.32,
-            mask_strength: 0.12,
-            brightness_boost: 1.23,
-            curvature: 0.0,
-            bloom: 0.08,
-            h_blur: 0.30,
-        })
+        crt_common(
+            src,
+            CrtParams {
+                scanline_depth: 0.32,
+                mask_strength: 0.12,
+                brightness_boost: 1.23,
+                curvature: 0.0,
+                bloom: 0.08,
+                h_blur: 0.30,
+            },
+        )
     }
 
     /// CRT フル: シンプル相当+樽型歪み+強めの phosphor glow。明るさは Simple と同等。
     pub fn apply_full(src: &ColorImage) -> ColorImage {
         // Simple と同じ scan_depth/mask_strength にして brightness を揃え、
         // bloom/curvature/h_blur だけ強化して「没入版」として差別化。
-        crt_common(src, CrtParams {
-            scanline_depth: 0.32,
-            mask_strength: 0.12,
-            brightness_boost: 1.23,
-            curvature: 0.07,
-            bloom: 0.25,
-            h_blur: 0.40,
-        })
+        crt_common(
+            src,
+            CrtParams {
+                scanline_depth: 0.32,
+                mask_strength: 0.12,
+                brightness_boost: 1.23,
+                curvature: 0.07,
+                bloom: 0.25,
+                h_blur: 0.40,
+            },
+        )
     }
 
     /// CRT アーケード: 太いスキャンライン+濃いマスク。わずかに高輝度 (arcade 筐体風)。
@@ -246,14 +247,17 @@ mod crt {
         // scan_atten = 1 - 0.55*0.5 = 0.725 ; mask_atten = 1 - 0.25*0.26 = 0.935
         // product = 0.678 → parity boost = 1.475
         // 業務用モニタは実機でも輝度を上げていたので、+10% で 1.62 にして「少し眩しい」感を出す
-        crt_common(src, CrtParams {
-            scanline_depth: 0.55,
-            mask_strength: 0.26,
-            brightness_boost: 1.62,
-            curvature: 0.0,
-            bloom: 0.18,
-            h_blur: 0.45,
-        })
+        crt_common(
+            src,
+            CrtParams {
+                scanline_depth: 0.55,
+                mask_strength: 0.26,
+                brightness_boost: 1.62,
+                curvature: 0.0,
+                bloom: 0.18,
+                h_blur: 0.45,
+            },
+        )
     }
 
     struct CrtParams {
@@ -304,7 +308,10 @@ mod crt {
                     }
                     ((dx * 0.5 + 0.5), (dy * 0.5 + 0.5))
                 } else {
-                    ((ox as f32 + 0.5) / out_w as f32, (oy as f32 + 0.5) / out_h as f32)
+                    (
+                        (ox as f32 + 0.5) / out_w as f32,
+                        (oy as f32 + 0.5) / out_h as f32,
+                    )
                 };
 
                 // ソース座標 (サブピクセル精度)
@@ -321,29 +328,31 @@ mod crt {
                 if params.h_blur > 0.0 {
                     let (lr, lg, lb) = yctx.sample(src_pixels, sx_f - 0.5);
                     let (rr, rg, rb) = yctx.sample(src_pixels, sx_f + 0.5);
-                    let w = params.h_blur * 0.5;  // 両隣の重み
-                    let c = 1.0 - params.h_blur;  // 中央の重み
+                    let w = params.h_blur * 0.5; // 両隣の重み
+                    let c = 1.0 - params.h_blur; // 中央の重み
                     r = r * c + (lr + rr) * w;
                     g = g * c + (lg + rg) * w;
                     b = b * c + (lb + rb) * w;
                 }
 
                 // sin² スキャンライン: factor ごとに 1 周期、暗部がなだらかに落ちる
-                let scan_phase = ((oy as f32 + 0.5) % factor_f) / factor_f;  // 0..1
-                let scan_curve = (scan_phase * std::f32::consts::PI).sin();  // 0..1..0
+                let scan_phase = ((oy as f32 + 0.5) % factor_f) / factor_f; // 0..1
+                let scan_curve = (scan_phase * std::f32::consts::PI).sin(); // 0..1..0
                 let scan_mult = 1.0 - params.scanline_depth * (1.0 - scan_curve * scan_curve);
 
                 // RGB アパーチャマスク (滑らかな sin² 分布): ox%3 で R/G/B の強弱
                 // 3 ピクセル周期で R G B をそれぞれ sin² 強調。総和が概ね 1 になるよう正規化
-                let mask_phase = (ox as f32) / 3.0;  // 1 周期 = 3 ピクセル
+                let mask_phase = (ox as f32) / 3.0; // 1 周期 = 3 ピクセル
                 let two_pi = std::f32::consts::TAU;
                 let rm = 1.0 - params.mask_strength
                     + params.mask_strength * 3.0 * (mask_phase * two_pi).sin().max(0.0).powi(2);
                 let gm = 1.0 - params.mask_strength
-                    + params.mask_strength * 3.0
+                    + params.mask_strength
+                        * 3.0
                         * ((mask_phase + 1.0 / 3.0) * two_pi).sin().max(0.0).powi(2);
                 let bm = 1.0 - params.mask_strength
-                    + params.mask_strength * 3.0
+                    + params.mask_strength
+                        * 3.0
                         * ((mask_phase + 2.0 / 3.0) * two_pi).sin().max(0.0).powi(2);
 
                 let boost = params.brightness_boost;
@@ -363,7 +372,10 @@ mod crt {
                 }
 
                 row[ox] = Color32::from_rgba_unmultiplied(
-                    clamp_u8(r), clamp_u8(g), clamp_u8(b), clamp_u8(a_src),
+                    clamp_u8(r),
+                    clamp_u8(g),
+                    clamp_u8(b),
+                    clamp_u8(a_src),
                 );
             }
         });
@@ -373,10 +385,13 @@ mod crt {
 
     /// 明度 > 閾値のピクセルを 0..1 でマップ化 (bloom 用)。
     fn build_bloom_map(src: &ColorImage) -> Vec<f32> {
-        src.pixels.par_iter().map(|c| {
-            let lum = crate::adjustment::pixel_lum_f32(*c);
-            ((lum - 0.55).max(0.0) * 2.5).min(1.0)
-        }).collect()
+        src.pixels
+            .par_iter()
+            .map(|c| {
+                let lum = crate::adjustment::pixel_lum_f32(*c);
+                ((lum - 0.55).max(0.0) * 2.5).min(1.0)
+            })
+            .collect()
     }
 
     /// 5x5 近傍の bloom 平均 (より広い範囲で滲ませて phosphor glow 風に)。
@@ -470,13 +485,15 @@ mod palette_gen {
         let mut max = [0u8; 3];
         for p in b {
             for i in 0..3 {
-                if p[i] < min[i] { min[i] = p[i]; }
-                if p[i] > max[i] { max[i] = p[i]; }
+                if p[i] < min[i] {
+                    min[i] = p[i];
+                }
+                if p[i] > max[i] {
+                    max[i] = p[i];
+                }
             }
         }
-        (max[0] - min[0])
-            .max(max[1] - min[1])
-            .max(max[2] - min[2]) as u32
+        (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2]) as u32
     }
 
     fn split_box(mut b: Vec<[u8; 3]>) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
@@ -485,8 +502,12 @@ mod palette_gen {
         let mut max = [0u8; 3];
         for p in &b {
             for i in 0..3 {
-                if p[i] < min[i] { min[i] = p[i]; }
-                if p[i] > max[i] { max[i] = p[i]; }
+                if p[i] < min[i] {
+                    min[i] = p[i];
+                }
+                if p[i] > max[i] {
+                    max[i] = p[i];
+                }
             }
         }
         let ranges = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
@@ -555,21 +576,59 @@ mod palette {
 
     /// ファミコン (NES) 代表パレット (約 52 色)。
     const FAMICOM_PALETTE: &[[u8; 3]] = &[
-        [0x7C, 0x7C, 0x7C], [0x00, 0x00, 0xFC], [0x00, 0x00, 0xBC], [0x44, 0x28, 0xBC],
-        [0x94, 0x00, 0x84], [0xA8, 0x00, 0x20], [0xA8, 0x10, 0x00], [0x88, 0x14, 0x00],
-        [0x50, 0x30, 0x00], [0x00, 0x78, 0x00], [0x00, 0x68, 0x00], [0x00, 0x58, 0x00],
-        [0x00, 0x40, 0x58], [0x00, 0x00, 0x00],
-        [0xBC, 0xBC, 0xBC], [0x00, 0x78, 0xF8], [0x00, 0x58, 0xF8], [0x68, 0x44, 0xFC],
-        [0xD8, 0x00, 0xCC], [0xE4, 0x00, 0x58], [0xF8, 0x38, 0x00], [0xE4, 0x5C, 0x10],
-        [0xAC, 0x7C, 0x00], [0x00, 0xB8, 0x00], [0x00, 0xA8, 0x00], [0x00, 0xA8, 0x44],
+        [0x7C, 0x7C, 0x7C],
+        [0x00, 0x00, 0xFC],
+        [0x00, 0x00, 0xBC],
+        [0x44, 0x28, 0xBC],
+        [0x94, 0x00, 0x84],
+        [0xA8, 0x00, 0x20],
+        [0xA8, 0x10, 0x00],
+        [0x88, 0x14, 0x00],
+        [0x50, 0x30, 0x00],
+        [0x00, 0x78, 0x00],
+        [0x00, 0x68, 0x00],
+        [0x00, 0x58, 0x00],
+        [0x00, 0x40, 0x58],
+        [0x00, 0x00, 0x00],
+        [0xBC, 0xBC, 0xBC],
+        [0x00, 0x78, 0xF8],
+        [0x00, 0x58, 0xF8],
+        [0x68, 0x44, 0xFC],
+        [0xD8, 0x00, 0xCC],
+        [0xE4, 0x00, 0x58],
+        [0xF8, 0x38, 0x00],
+        [0xE4, 0x5C, 0x10],
+        [0xAC, 0x7C, 0x00],
+        [0x00, 0xB8, 0x00],
+        [0x00, 0xA8, 0x00],
+        [0x00, 0xA8, 0x44],
         [0x00, 0x88, 0x88],
-        [0xF8, 0xF8, 0xF8], [0x3C, 0xBC, 0xFC], [0x68, 0x88, 0xFC], [0x98, 0x78, 0xF8],
-        [0xF8, 0x78, 0xF8], [0xF8, 0x58, 0x98], [0xF8, 0x78, 0x58], [0xFC, 0xA0, 0x44],
-        [0xF8, 0xB8, 0x00], [0xB8, 0xF8, 0x18], [0x58, 0xD8, 0x54], [0x58, 0xF8, 0x98],
-        [0x00, 0xE8, 0xD8], [0x78, 0x78, 0x78],
-        [0xFC, 0xFC, 0xFC], [0xA4, 0xE4, 0xFC], [0xB8, 0xB8, 0xF8], [0xD8, 0xB8, 0xF8],
-        [0xF8, 0xB8, 0xF8], [0xF8, 0xA4, 0xC0], [0xF0, 0xD0, 0xB0], [0xFC, 0xE0, 0xA8],
-        [0xF8, 0xD8, 0x78], [0xD8, 0xF8, 0x78], [0xB8, 0xF8, 0xB8], [0xB8, 0xF8, 0xD8],
+        [0xF8, 0xF8, 0xF8],
+        [0x3C, 0xBC, 0xFC],
+        [0x68, 0x88, 0xFC],
+        [0x98, 0x78, 0xF8],
+        [0xF8, 0x78, 0xF8],
+        [0xF8, 0x58, 0x98],
+        [0xF8, 0x78, 0x58],
+        [0xFC, 0xA0, 0x44],
+        [0xF8, 0xB8, 0x00],
+        [0xB8, 0xF8, 0x18],
+        [0x58, 0xD8, 0x54],
+        [0x58, 0xF8, 0x98],
+        [0x00, 0xE8, 0xD8],
+        [0x78, 0x78, 0x78],
+        [0xFC, 0xFC, 0xFC],
+        [0xA4, 0xE4, 0xFC],
+        [0xB8, 0xB8, 0xF8],
+        [0xD8, 0xB8, 0xF8],
+        [0xF8, 0xB8, 0xF8],
+        [0xF8, 0xA4, 0xC0],
+        [0xF0, 0xD0, 0xB0],
+        [0xFC, 0xE0, 0xA8],
+        [0xF8, 0xD8, 0x78],
+        [0xD8, 0xF8, 0x78],
+        [0xB8, 0xF8, 0xB8],
+        [0xB8, 0xF8, 0xD8],
     ];
 
     pub fn apply_gameboy(src: &ColorImage) -> ColorImage {
@@ -638,7 +697,11 @@ mod palette {
     ///
     /// 最近傍探索は 32³=32768 エントリの 5bit/ch LUT を使い O(1) 化。
     /// 4K 画像に 256 色パレットを適用する場合、ナイーブ実装で 20〜40ms → LUT で数 ms に短縮。
-    fn quantize_with_dither(src: &ColorImage, palette: &[[u8; 3]], dither_strength: f32) -> ColorImage {
+    fn quantize_with_dither(
+        src: &ColorImage,
+        palette: &[[u8; 3]],
+        dither_strength: f32,
+    ) -> ColorImage {
         let [w, h] = src.size;
         let mut out = vec![Color32::BLACK; w * h];
         let src_pixels = &src.pixels;
@@ -824,7 +887,10 @@ mod photo {
             let g = y * 0.95;
             let b = (y * 1.05).min(1.0);
             Color32::from_rgba_unmultiplied(
-                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8,
+                c.a(),
             )
         })
     }
@@ -837,7 +903,10 @@ mod photo {
             let g = y * 0.98;
             let b = y * 0.82;
             Color32::from_rgba_unmultiplied(
-                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8,
+                c.a(),
             )
         })
     }
@@ -1039,7 +1108,10 @@ mod photo {
             let g = 1.0 - (1.0 - cg) * (1.0 - lg);
             let b = 1.0 - (1.0 - cb) * (1.0 - lb);
             Color32::from_rgba_unmultiplied(
-                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8,
+                c.a(),
             )
         })
     }
@@ -1050,12 +1122,19 @@ mod photo {
         let src_pixels = &src.pixels;
         // 明部 (luminance > 0.45) を広めに拾って glow 源に。alpha で pre-multiply し、
         // 透明ピクセルの hidden RGB がブラーに漏れ出さないようにする。
-        let glow_src: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
-            let a_norm = c.a() as f32 / 255.0;
-            let y = luminance(*c);
-            let factor = ((y - 0.45).max(0.0) * 1.8).min(1.0) * a_norm;
-            [c.r() as f32 * factor, c.g() as f32 * factor, c.b() as f32 * factor]
-        }).collect();
+        let glow_src: Vec<[f32; 3]> = src_pixels
+            .par_iter()
+            .map(|c| {
+                let a_norm = c.a() as f32 / 255.0;
+                let y = luminance(*c);
+                let factor = ((y - 0.45).max(0.0) * 1.8).min(1.0) * a_norm;
+                [
+                    c.r() as f32 * factor,
+                    c.g() as f32 * factor,
+                    c.b() as f32 * factor,
+                ]
+            })
+            .collect();
         // 分離可能ボックスブラー 2 回適用で擬似ガウシアン化 + 半径も拡大 (7 → 15-tap)
         let hblur1 = separable_box_blur(&glow_src, w, h, 7, true);
         let vblur1 = separable_box_blur(&hblur1, w, h, 7, false);
@@ -1078,7 +1157,10 @@ mod photo {
                 let g = 1.0 - (1.0 - cg) * (1.0 - lg);
                 let b = 1.0 - (1.0 - cb) * (1.0 - lb);
                 row[x] = Color32::from_rgba_unmultiplied(
-                    (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a(),
+                    (r * 255.0) as u8,
+                    (g * 255.0) as u8,
+                    (b * 255.0) as u8,
+                    c.a(),
                 );
             }
         });
@@ -1087,7 +1169,13 @@ mod photo {
 
     /// 分離可能ボックスブラー。`horizontal = true` で水平方向、false で垂直方向。
     /// 入力は [f32; 3] 配列。radius は片側の画素数 (例: 5 なら 11 タップ)。
-    fn separable_box_blur(src: &[[f32; 3]], w: usize, h: usize, radius: usize, horizontal: bool) -> Vec<[f32; 3]> {
+    fn separable_box_blur(
+        src: &[[f32; 3]],
+        w: usize,
+        h: usize,
+        radius: usize,
+        horizontal: bool,
+    ) -> Vec<[f32; 3]> {
         let mut out = vec![[0.0_f32; 3]; w * h];
         let window = (radius * 2 + 1) as f32;
         if horizontal {
@@ -1100,7 +1188,9 @@ mod photo {
                     let mut count = 0.0_f32;
                     for xi in x0..x1 {
                         let p = src[base + xi];
-                        sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2];
+                        sum[0] += p[0];
+                        sum[1] += p[1];
+                        sum[2] += p[2];
                         count += 1.0;
                     }
                     // 境界で count 不足を avg 補正 (window 固定だと端で暗くなる)
@@ -1117,7 +1207,9 @@ mod photo {
                     let mut count = 0.0_f32;
                     for yi in y0..y1 {
                         let p = src[yi * w + x];
-                        sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2];
+                        sum[0] += p[0];
+                        sum[1] += p[1];
+                        sum[2] += p[2];
                         count += 1.0;
                     }
                     let c = if count > 0.0 { count } else { window };
@@ -1151,7 +1243,9 @@ mod photo {
                 for y in y0..y1 {
                     for x in x0..x1 {
                         let p = src_pixels[y * w + x];
-                        if p.a() == 0 { continue; }
+                        if p.a() == 0 {
+                            continue;
+                        }
                         sum += luminance(p);
                         count += 1.0;
                     }
@@ -1204,18 +1298,26 @@ mod photo {
                 let mut count = 0.0_f32;
                 for dy in dy0..=dy1 {
                     let ny = cy + dy;
-                    if ny < 0 || ny >= ih { continue; }
+                    if ny < 0 || ny >= ih {
+                        continue;
+                    }
                     let row = ny as usize * w;
                     for dx in dx0..=dx1 {
                         let nx = cx + dx;
-                        if nx < 0 || nx >= iw { continue; }
+                        if nx < 0 || nx >= iw {
+                            continue;
+                        }
                         let p = src_pixels[row + nx as usize];
                         // 完全透明ピクセルは hidden RGB を持ち得るため統計から除外する
-                        if p.a() == 0 { continue; }
+                        if p.a() == 0 {
+                            continue;
+                        }
                         let r = p.r() as f32;
                         let g = p.g() as f32;
                         let b = p.b() as f32;
-                        sum[0] += r; sum[1] += g; sum[2] += b;
+                        sum[0] += r;
+                        sum[1] += g;
+                        sum[2] += b;
                         let lum = 0.299 * r + 0.587 * g + 0.114 * b;
                         sum_lum += lum;
                         sum_sq_lum += lum * lum;
@@ -1233,7 +1335,10 @@ mod photo {
             }
             // alpha は中心ピクセルから継承 (Kuwahara は選択的平均なので alpha も単純継承が自然)
             Color32::from_rgba_unmultiplied(
-                clamp_u8(best_mean[0]), clamp_u8(best_mean[1]), clamp_u8(best_mean[2]), c.a(),
+                clamp_u8(best_mean[0]),
+                clamp_u8(best_mean[1]),
+                clamp_u8(best_mean[2]),
+                c.a(),
             )
         })
     }
@@ -1245,10 +1350,13 @@ mod photo {
         // 輝度マップ前計算。透明ピクセルは hidden RGB を持ち得るため alpha で pre-multiply し、
         // Sobel の差分計算に漏れ込むのを防ぐ。alpha=0 の点は luminance=0 となり、
         // 透明境界には alpha 差分由来のエッジが出る (これは意図通りの輪郭線)。
-        let lum: Vec<f32> = src_pixels.par_iter().map(|c| {
-            let a_norm = c.a() as f32 / 255.0;
-            luminance(*c) * 255.0 * a_norm
-        }).collect();
+        let lum: Vec<f32> = src_pixels
+            .par_iter()
+            .map(|c| {
+                let a_norm = c.a() as f32 / 255.0;
+                luminance(*c) * 255.0 * a_norm
+            })
+            .collect();
         let iw = w as isize;
         let ih = h as isize;
         let sample = |x: isize, y: isize| -> f32 {
@@ -1260,11 +1368,14 @@ mod photo {
             let xi = x as isize;
             let yi = y as isize;
             // Sobel 3×3 勾配
-            let gx = -sample(xi - 1, yi - 1) + sample(xi + 1, yi - 1)
-                    -2.0 * sample(xi - 1, yi) + 2.0 * sample(xi + 1, yi)
-                    -sample(xi - 1, yi + 1) + sample(xi + 1, yi + 1);
+            let gx = -sample(xi - 1, yi - 1) + sample(xi + 1, yi - 1) - 2.0 * sample(xi - 1, yi)
+                + 2.0 * sample(xi + 1, yi)
+                - sample(xi - 1, yi + 1)
+                + sample(xi + 1, yi + 1);
             let gy = -sample(xi - 1, yi - 1) - 2.0 * sample(xi, yi - 1) - sample(xi + 1, yi - 1)
-                    +sample(xi - 1, yi + 1) + 2.0 * sample(xi, yi + 1) + sample(xi + 1, yi + 1);
+                + sample(xi - 1, yi + 1)
+                + 2.0 * sample(xi, yi + 1)
+                + sample(xi + 1, yi + 1);
             let mag = (gx * gx + gy * gy).sqrt();
             // 閾値を強めにかけて紙の上の鉛筆風に
             let intensity = (mag * 0.6).min(255.0);
@@ -1285,14 +1396,20 @@ mod photo {
         let [w, h] = src.size;
         let src_pixels = &src.pixels;
         // f32 RGB (pre-multiplied) と alpha マップ (3 chan にパック) を並行作成
-        let rgb_premul: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
-            let a = c.a() as f32 / 255.0;
-            [c.r() as f32 * a, c.g() as f32 * a, c.b() as f32 * a]
-        }).collect();
-        let alpha_map: Vec<[f32; 3]> = src_pixels.par_iter().map(|c| {
-            let a = c.a() as f32 / 255.0;
-            [a, a, a]
-        }).collect();
+        let rgb_premul: Vec<[f32; 3]> = src_pixels
+            .par_iter()
+            .map(|c| {
+                let a = c.a() as f32 / 255.0;
+                [c.r() as f32 * a, c.g() as f32 * a, c.b() as f32 * a]
+            })
+            .collect();
+        let alpha_map: Vec<[f32; 3]> = src_pixels
+            .par_iter()
+            .map(|c| {
+                let a = c.a() as f32 / 255.0;
+                [a, a, a]
+            })
+            .collect();
 
         // 半径 3 のボックスブラーを 2 回重ねて擬似ガウシアン化
         let blur_rgb_premul = {
@@ -1323,9 +1440,8 @@ mod photo {
                 let r = c.r() as f32 + AMOUNT * (c.r() as f32 - blur_r);
                 let g = c.g() as f32 + AMOUNT * (c.g() as f32 - blur_g);
                 let b = c.b() as f32 + AMOUNT * (c.b() as f32 - blur_b);
-                row[x] = Color32::from_rgba_unmultiplied(
-                    clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a(),
-                );
+                row[x] =
+                    Color32::from_rgba_unmultiplied(clamp_u8(r), clamp_u8(g), clamp_u8(b), c.a());
             }
         });
         ColorImage::new([w, h], out)
@@ -1391,8 +1507,13 @@ mod tests {
             .map(|c| (c[0], c[1], c[2]))
             .collect();
         for p in &out.pixels {
-            assert!(allowed.contains(&(p.r(), p.g(), p.b())),
-                "pixel ({},{},{}) not in GameBoy palette", p.r(), p.g(), p.b());
+            assert!(
+                allowed.contains(&(p.r(), p.g(), p.b())),
+                "pixel ({},{},{}) not in GameBoy palette",
+                p.r(),
+                p.g(),
+                p.b()
+            );
         }
     }
 
@@ -1414,8 +1535,16 @@ mod tests {
         let out = apply(&src, PostFilter::Pc98);
         let unique: std::collections::HashSet<(u8, u8, u8)> =
             out.pixels.iter().map(|p| (p.r(), p.g(), p.b())).collect();
-        assert!(unique.len() <= 16, "PC-98 adaptive used {} unique colors, expected ≤16", unique.len());
-        assert!(unique.len() >= 2, "PC-98 adaptive used only {} unique colors, expected variety", unique.len());
+        assert!(
+            unique.len() <= 16,
+            "PC-98 adaptive used {} unique colors, expected ≤16",
+            unique.len()
+        );
+        assert!(
+            unique.len() >= 2,
+            "PC-98 adaptive used only {} unique colors, expected variety",
+            unique.len()
+        );
     }
 
     #[test]
@@ -1426,9 +1555,21 @@ mod tests {
         let valid_levels: std::collections::HashSet<u8> =
             (0..8u32).map(|i| ((i * 255 + 3) / 7) as u8).collect();
         for p in &out.pixels {
-            assert!(valid_levels.contains(&p.r()), "R={} not on 3-bit grid", p.r());
-            assert!(valid_levels.contains(&p.g()), "G={} not on 3-bit grid", p.g());
-            assert!(valid_levels.contains(&p.b()), "B={} not on 3-bit grid", p.b());
+            assert!(
+                valid_levels.contains(&p.r()),
+                "R={} not on 3-bit grid",
+                p.r()
+            );
+            assert!(
+                valid_levels.contains(&p.g()),
+                "G={} not on 3-bit grid",
+                p.g()
+            );
+            assert!(
+                valid_levels.contains(&p.b()),
+                "B={} not on 3-bit grid",
+                p.b()
+            );
         }
     }
 
@@ -1439,7 +1580,11 @@ mod tests {
         let out = apply(&src, PostFilter::Msx2Plus);
         let unique: std::collections::HashSet<(u8, u8, u8)> =
             out.pixels.iter().map(|p| (p.r(), p.g(), p.b())).collect();
-        assert!(unique.len() <= 256, "MSX2+ used {} colors, expected ≤256", unique.len());
+        assert!(
+            unique.len() <= 256,
+            "MSX2+ used {} colors, expected ≤256",
+            unique.len()
+        );
     }
 
     #[test]
@@ -1456,13 +1601,26 @@ mod tests {
         // 写真系フィルタはすべてソース解像度を維持する (CRT のようなアップスケールなし)
         let src = make_test_image(32, 32);
         for &f in &[
-            PostFilter::Sepia, PostFilter::MonoNeutral, PostFilter::MonoCool,
-            PostFilter::MonoWarm, PostFilter::TealOrange, PostFilter::KodakPortra,
-            PostFilter::FujiVelvia, PostFilter::BleachBypass, PostFilter::CrossProcess,
-            PostFilter::Vintage, PostFilter::WarmTone, PostFilter::CoolTone,
-            PostFilter::FilmGrain, PostFilter::Vignette, PostFilter::LightLeak,
-            PostFilter::SoftFocus, PostFilter::Halftone, PostFilter::OilPaint,
-            PostFilter::Sketch, PostFilter::Sharpen,
+            PostFilter::Sepia,
+            PostFilter::MonoNeutral,
+            PostFilter::MonoCool,
+            PostFilter::MonoWarm,
+            PostFilter::TealOrange,
+            PostFilter::KodakPortra,
+            PostFilter::FujiVelvia,
+            PostFilter::BleachBypass,
+            PostFilter::CrossProcess,
+            PostFilter::Vintage,
+            PostFilter::WarmTone,
+            PostFilter::CoolTone,
+            PostFilter::FilmGrain,
+            PostFilter::Vignette,
+            PostFilter::LightLeak,
+            PostFilter::SoftFocus,
+            PostFilter::Halftone,
+            PostFilter::OilPaint,
+            PostFilter::Sketch,
+            PostFilter::Sharpen,
         ] {
             let out = apply(&src, f);
             assert_eq!(out.size, [32, 32], "{:?} changed size", f);
@@ -1498,7 +1656,11 @@ mod tests {
         for p in &out.pixels {
             assert_eq!(p.r(), p.g());
             assert_eq!(p.g(), p.b());
-            assert!(p.r() == 0 || p.r() == 255, "halftone produced grey value {}", p.r());
+            assert!(
+                p.r() == 0 || p.r() == 255,
+                "halftone produced grey value {}",
+                p.r()
+            );
         }
     }
 
@@ -1527,7 +1689,9 @@ mod tests {
             assert!(
                 has_transparent && has_opaque,
                 "{:?} failed alpha preservation (has_transparent={}, has_opaque={})",
-                f, has_transparent, has_opaque,
+                f,
+                has_transparent,
+                has_opaque,
             );
         }
     }
@@ -1563,8 +1727,11 @@ mod tests {
         let sample_idx = sample_y * w + sample_x;
 
         for &f in &[
-            PostFilter::SoftFocus, PostFilter::Sharpen,
-            PostFilter::OilPaint, PostFilter::Sketch, PostFilter::Halftone,
+            PostFilter::SoftFocus,
+            PostFilter::Sharpen,
+            PostFilter::OilPaint,
+            PostFilter::Sketch,
+            PostFilter::Halftone,
         ] {
             let mixed_out = apply(&mixed_src, f);
             let pure_out = apply(&pure_src, f);
@@ -1579,7 +1746,14 @@ mod tests {
                 max_d < 12,
                 "{:?} leaked hidden RGB from transparent region. \
                  mixed=({},{},{}) pure=({},{},{}) max_diff={}",
-                f, m.r(), m.g(), m.b(), p.r(), p.g(), p.b(), max_d,
+                f,
+                m.r(),
+                m.g(),
+                m.b(),
+                p.r(),
+                p.g(),
+                p.b(),
+                max_d,
             );
         }
     }
@@ -1591,7 +1765,10 @@ mod tests {
         let out = apply(&src, PostFilter::Vignette);
         let center = out.pixels[50 * 100 + 50];
         let corner = out.pixels[0];
-        assert!(center.r() > corner.r(), "vignette should darken corners more than center");
+        assert!(
+            center.r() > corner.r(),
+            "vignette should darken corners more than center"
+        );
     }
 
     #[test]
@@ -1619,7 +1796,10 @@ mod tests {
         let start = std::time::Instant::now();
         let _out = apply(&src, PostFilter::CrtSimple);
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 200,
-            "CRT Simple on 1920×1080 took {:?}, expected < 200ms", elapsed);
+        assert!(
+            elapsed.as_millis() < 200,
+            "CRT Simple on 1920×1080 took {:?}, expected < 200ms",
+            elapsed
+        );
     }
 }

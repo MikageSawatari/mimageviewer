@@ -85,7 +85,8 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
     let mut pos = 8; // skip signature
 
     while pos + 8 <= data.len() {
-        let length = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let length =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         let chunk_type = &data[pos + 4..pos + 8];
         let data_start = pos + 8;
         let data_end = data_start + length;
@@ -221,9 +222,10 @@ fn detect_and_parse(chunks: &[(String, String)]) -> Option<AiMetadata> {
             return Some(AiMetadata::A1111(meta));
         }
         // Description があるが A1111 形式でない場合は Unknown として表示
-        return Some(AiMetadata::Unknown(vec![
-            ("Description".to_string(), raw.clone()),
-        ]));
+        return Some(AiMetadata::Unknown(vec![(
+            "Description".to_string(),
+            raw.clone(),
+        )]));
     }
 
     // 何らかの tEXt チャンクはあるが既知フォーマットに一致しない
@@ -533,13 +535,23 @@ fn parse_comfyui(
         let mut negative_refs: Vec<String> = Vec::new();
 
         for (_node_id, node) in nodes {
-            let class = node.get("class_type").and_then(|c| c.as_str()).unwrap_or("");
+            let class = node
+                .get("class_type")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
 
             match class {
                 "KSampler" | "KSamplerAdvanced" | "SamplerCustom" => {
                     // 生成パラメータを抽出
                     if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
-                        for &key in &["steps", "cfg", "sampler_name", "scheduler", "seed", "denoise"] {
+                        for &key in &[
+                            "steps",
+                            "cfg",
+                            "sampler_name",
+                            "scheduler",
+                            "seed",
+                            "denoise",
+                        ] {
                             if let Some(val) = inputs.get(key) {
                                 let val_str = match val {
                                     serde_json::Value::Number(n) => n.to_string(),
@@ -594,7 +606,10 @@ fn parse_comfyui(
         // 参照関係が解決できなかった場合、全 CLIPTextEncode からテキストを集める
         if extracted_prompts.is_empty() && extracted_negatives.is_empty() {
             for (_node_id, node) in nodes {
-                let class = node.get("class_type").and_then(|c| c.as_str()).unwrap_or("");
+                let class = node
+                    .get("class_type")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
                 if class.contains("CLIPTextEncode") {
                     if let Some(text) = node
                         .get("inputs")
@@ -626,7 +641,10 @@ fn extract_text_from_node(
     all_nodes: &serde_json::Map<String, serde_json::Value>,
     out: &mut Vec<String>,
 ) {
-    let class = node.get("class_type").and_then(|c| c.as_str()).unwrap_or("");
+    let class = node
+        .get("class_type")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
 
     if class.contains("CLIPTextEncode") {
         if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
@@ -708,7 +726,11 @@ mod tests {
         assert_eq!(meta.negative_prompt, "ugly, blurry");
         assert!(meta.params.iter().any(|(k, v)| k == "Steps" && v == "20"));
         assert!(meta.params.iter().any(|(k, v)| k == "Seed" && v == "12345"));
-        assert!(meta.params.iter().any(|(k, v)| k == "Model" && v == "sd_xl_base"));
+        assert!(
+            meta.params
+                .iter()
+                .any(|(k, v)| k == "Model" && v == "sd_xl_base")
+        );
     }
 
     #[test]
@@ -757,26 +779,39 @@ mod tests {
         }"#;
         let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let meta = parse_comfyui(val, None);
-        assert!(meta.extracted_prompts.contains(&"a beautiful sunset".to_string()));
+        assert!(
+            meta.extracted_prompts
+                .contains(&"a beautiful sunset".to_string())
+        );
         assert!(meta.extracted_negatives.contains(&"ugly".to_string()));
-        assert!(meta.sampler_params.iter().any(|(k, v)| k == "steps" && v == "20"));
-        assert!(meta.sampler_params.iter().any(|(k, v)| k == "model" && v == "sd_xl_base_1.0.safetensors"));
+        assert!(
+            meta.sampler_params
+                .iter()
+                .any(|(k, v)| k == "steps" && v == "20")
+        );
+        assert!(
+            meta.sampler_params
+                .iter()
+                .any(|(k, v)| k == "model" && v == "sd_xl_base_1.0.safetensors")
+        );
     }
 
     #[test]
     fn test_detect_comfyui() {
-        let chunks = vec![
-            ("prompt".to_string(), r#"{"1": {"class_type": "KSampler", "inputs": {"steps": 10}}}"#.to_string()),
-        ];
+        let chunks = vec![(
+            "prompt".to_string(),
+            r#"{"1": {"class_type": "KSampler", "inputs": {"steps": 10}}}"#.to_string(),
+        )];
         let result = detect_and_parse(&chunks);
         assert!(matches!(result, Some(AiMetadata::ComfyUI(_))));
     }
 
     #[test]
     fn test_detect_a1111() {
-        let chunks = vec![
-            ("parameters".to_string(), "hello world\nSteps: 20, Sampler: Euler".to_string()),
-        ];
+        let chunks = vec![(
+            "parameters".to_string(),
+            "hello world\nSteps: 20, Sampler: Euler".to_string(),
+        )];
         let result = detect_and_parse(&chunks);
         assert!(matches!(result, Some(AiMetadata::A1111(_))));
     }

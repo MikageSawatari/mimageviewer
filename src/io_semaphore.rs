@@ -274,7 +274,11 @@ mod tests {
         low_handle.join().unwrap();
 
         let ord = order.lock().unwrap();
-        assert_eq!(ord.as_slice(), &["high", "low"], "High が Low より先に取得するはず");
+        assert_eq!(
+            ord.as_slice(),
+            &["high", "low"],
+            "High が Low より先に取得するはず"
+        );
     }
 
     #[test]
@@ -298,7 +302,9 @@ mod tests {
                 done.fetch_add(1, Ordering::SeqCst);
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert_eq!(done.load(Ordering::SeqCst), 8);
         // 最終的に available が 2 に戻っていること
         assert_eq!(sem.stats().0, 2);

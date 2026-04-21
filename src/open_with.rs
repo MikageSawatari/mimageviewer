@@ -31,9 +31,11 @@ pub fn enumerate_handlers(_extension: &str) -> Vec<AppHandler> {
 }
 
 #[cfg(windows)]
-fn enumerate_handlers_inner(extension: &str) -> Result<Vec<AppHandler>, Box<dyn std::error::Error>> {
-    use windows::Win32::UI::Shell::{SHAssocEnumHandlers, ASSOC_FILTER_RECOMMENDED};
-    use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+fn enumerate_handlers_inner(
+    extension: &str,
+) -> Result<Vec<AppHandler>, Box<dyn std::error::Error>> {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
+    use windows::Win32::UI::Shell::{ASSOC_FILTER_RECOMMENDED, SHAssocEnumHandlers};
     use windows::core::PCWSTR;
 
     // COM 初期化（既に初期化済みなら S_FALSE が返るだけで問題ない）
@@ -41,9 +43,8 @@ fn enumerate_handlers_inner(extension: &str) -> Result<Vec<AppHandler>, Box<dyn 
 
     let ext_wide: Vec<u16> = extension.encode_utf16().chain(std::iter::once(0)).collect();
 
-    let enum_handlers = unsafe {
-        SHAssocEnumHandlers(PCWSTR(ext_wide.as_ptr()), ASSOC_FILTER_RECOMMENDED)?
-    };
+    let enum_handlers =
+        unsafe { SHAssocEnumHandlers(PCWSTR(ext_wide.as_ptr()), ASSOC_FILTER_RECOMMENDED)? };
 
     let mut result = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
@@ -90,14 +91,12 @@ fn enumerate_handlers_inner(extension: &str) -> Result<Vec<AppHandler>, Box<dyn 
 #[cfg(windows)]
 pub fn pick_exe_dialog() -> Option<AppHandler> {
     use windows::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OPENFILENAMEW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OFN_NOCHANGEDIR,
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows::core::PCWSTR;
 
     // フィルタ文字列: "実行ファイル (*.exe)\0*.exe\0\0"
-    let filter: Vec<u16> = "実行ファイル (*.exe)\0*.exe\0\0"
-        .encode_utf16()
-        .collect();
+    let filter: Vec<u16> = "実行ファイル (*.exe)\0*.exe\0\0".encode_utf16().collect();
 
     let mut file_buf = vec![0u16; 512];
 
@@ -114,7 +113,10 @@ pub fn pick_exe_dialog() -> Option<AppHandler> {
     }
 
     let path_str = String::from_utf16_lossy(
-        &file_buf[..file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len())]
+        &file_buf[..file_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(file_buf.len())],
     );
     let path = std::path::Path::new(&path_str);
 

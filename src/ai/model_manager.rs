@@ -92,10 +92,7 @@ pub fn ensure_models_extracted() {
                     ));
                 }
                 Err(e) => {
-                    crate::logger::log(format!(
-                        "[AI] Failed to extract {}: {e}",
-                        model.filename,
-                    ));
+                    crate::logger::log(format!("[AI] Failed to extract {}: {e}", model.filename,));
                 }
             }
         }
@@ -127,16 +124,13 @@ impl ModelManager {
     pub fn model_path(&self, kind: ModelKind) -> Option<PathBuf> {
         let filename = Self::model_filename(kind)?;
         let path = self.models_dir.join(filename);
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.exists() { Some(path) } else { None }
     }
 
     /// ModelKind に対応するファイル名を返す。
     fn model_filename(kind: ModelKind) -> Option<&'static str> {
-        EMBEDDED_MODELS.iter()
+        EMBEDDED_MODELS
+            .iter()
             .find(|m| m.kind == kind)
             .map(|m| m.filename)
     }

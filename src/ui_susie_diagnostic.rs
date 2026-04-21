@@ -41,8 +41,7 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
                 };
                 ui.collapsing(header, |ui| {
                     ui.label(
-                        egui::RichText::new(format!("対応拡張子: {}", parts.join(", ")))
-                            .weak(),
+                        egui::RichText::new(format!("対応拡張子: {}", parts.join(", "))).weak(),
                     );
                 });
             }
@@ -77,13 +76,10 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
                 .color(egui::Color32::from_rgb(200, 100, 50)),
             );
             ui.label(
-                egui::RichText::new(format!(
-                    "展開先パス: {}",
-                    expected_path.display(),
-                ))
-                .monospace()
-                .size(11.0)
-                .weak(),
+                egui::RichText::new(format!("展開先パス: {}", expected_path.display(),))
+                    .monospace()
+                    .size(11.0)
+                    .weak(),
             );
             ui.label(
                 egui::RichText::new(
@@ -96,10 +92,8 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
         }
         PoolStatus::WorkerSpawnFailed => {
             ui.label(
-                egui::RichText::new(
-                    "⚠ ワーカープロセスの起動またはハンドシェイクに失敗しました。",
-                )
-                .color(egui::Color32::from_rgb(200, 100, 50)),
+                egui::RichText::new("⚠ ワーカープロセスの起動またはハンドシェイクに失敗しました。")
+                    .color(egui::Color32::from_rgb(200, 100, 50)),
             );
             ui.label(
                 egui::RichText::new("ヘルプ → ログフォルダを開く から詳細を確認できます。")

@@ -22,11 +22,11 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use mimageviewer::adjustment::AdjustParams;
-use mimageviewer::adjustment_db::{normalize_path, AdjustmentDb};
-use mimageviewer::mask_db::{compress_mask, MaskDb};
+use mimageviewer::adjustment_db::{AdjustmentDb, normalize_path};
+use mimageviewer::mask_db::{MaskDb, compress_mask};
 use mimageviewer::sidecar::{
-    self, reconstruct_image_key, reconstruct_virtual_key, SidecarFile, SidecarMask,
-    SIDECAR_FILENAME,
+    self, SIDECAR_FILENAME, SidecarFile, SidecarMask, reconstruct_image_key,
+    reconstruct_virtual_key,
 };
 
 // ── ヘルパー ────────────────────────────────────────────────────────
@@ -160,7 +160,10 @@ fn central_db_is_authoritative_over_sidecar() {
         Some(&env.mask_db),
     );
 
-    assert_eq!(stats.imported_adjust, 0, "must not overwrite existing DB entry");
+    assert_eq!(
+        stats.imported_adjust, 0,
+        "must not overwrite existing DB entry"
+    );
     assert_eq!(stats.skipped_adjust, 1);
 
     // DB は元の値のまま
@@ -269,7 +272,11 @@ fn newer_version_sidecar_is_skipped() {
 
     let loaded_sidecar = SidecarFile::load(folder);
     // items は空扱いになる (disabled フラグが立ち、読み込まれない)
-    assert_eq!(loaded_sidecar.items().len(), 0, "newer version must not leak items");
+    assert_eq!(
+        loaded_sidecar.items().len(),
+        0,
+        "newer version must not leak items"
+    );
 
     let stats = sidecar::import_to_dbs(
         folder,
@@ -327,7 +334,10 @@ fn flush_removes_dat_when_all_entries_cleared() {
     // 削除 → flush → ファイルが消える
     sc.remove_adjust("a.jpg");
     sc.flush();
-    assert!(!path.exists(), "sidecar file must be removed when items empty");
+    assert!(
+        !path.exists(),
+        "sidecar file must be removed when items empty"
+    );
 }
 
 // ── テスト 9: 書き込み不能フォルダで落ちない ────────────────────────
@@ -335,7 +345,8 @@ fn flush_removes_dat_when_all_entries_cleared() {
 #[test]
 fn flush_on_nonexistent_folder_does_not_panic() {
     // 存在しないパスを指定 (読み取り専用メディアの代用)。flush がクラッシュしないことを確認。
-    let mut sc = SidecarFile::new("Z:/this/path/definitely/does/not/exist/__mimageviewer_test__".into());
+    let mut sc =
+        SidecarFile::new("Z:/this/path/definitely/does/not/exist/__mimageviewer_test__".into());
     sc.set_adjust("a.jpg", sample_params(1.0));
     sc.flush(); // 失敗するはずだが panic してはいけない
 
@@ -429,7 +440,13 @@ fn flush_succeeds_and_file_readable_even_with_hidden_attrs() {
     }
     let sc4 = SidecarFile::load(folder);
     assert_eq!(
-        sc4.items().get("x.jpg").unwrap().adjust.as_ref().unwrap().brightness,
+        sc4.items()
+            .get("x.jpg")
+            .unwrap()
+            .adjust
+            .as_ref()
+            .unwrap()
+            .brightness,
         2.71
     );
 }

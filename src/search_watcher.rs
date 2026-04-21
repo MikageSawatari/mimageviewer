@@ -160,8 +160,7 @@ fn debounce_loop(
         {
             let mut guard = pending.lock().unwrap();
             guard.retain(|path, entry| {
-                if now.saturating_duration_since(entry.last_seen).as_millis() as u64
-                    >= DEBOUNCE_MS
+                if now.saturating_duration_since(entry.last_seen).as_millis() as u64 >= DEBOUNCE_MS
                 {
                     to_emit.push((path.clone(), entry.kind));
                     false
@@ -313,10 +312,7 @@ mod tests {
         let mut pending = HashMap::new();
         for _ in 0..10 {
             absorb_event(
-                &make_event(
-                    EventKind::Modify(ModifyKind::Any),
-                    vec![p.clone()],
-                ),
+                &make_event(EventKind::Modify(ModifyKind::Any), vec![p.clone()]),
                 &mut pending,
             );
         }

@@ -46,10 +46,7 @@ pub enum SearchStreamEvent {
         valid_hits: usize,
     },
     /// 正常終了
-    Done {
-        truncated: bool,
-        reason: DoneReason,
-    },
+    Done { truncated: bool, reason: DoneReason },
     /// エラー
     Error(String),
 }
@@ -134,11 +131,9 @@ pub fn run(
         return;
     }
 
-    let Some(query) = fts_index::build_bigram_and_query(
-        fts.fields(),
-        &include_tokens,
-        Some(favorite_ids),
-    ) else {
+    let Some(query) =
+        fts_index::build_bigram_and_query(fts.fields(), &include_tokens, Some(favorite_ids))
+    else {
         // bigram が作れない (どこかのトークンが 1 文字等) → early return
         let _ = tx.send(SearchStreamEvent::Done {
             truncated: false,
@@ -162,13 +157,8 @@ pub fn run(
         }
 
         // 5a. ページ取得
-        let page = match fts_index::search_page(
-            &searcher,
-            fts.fields(),
-            &query,
-            offset,
-            PAGE_SIZE,
-        ) {
+        let page = match fts_index::search_page(&searcher, fts.fields(), &query, offset, PAGE_SIZE)
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = tx.send(SearchStreamEvent::Error(format!(
@@ -189,9 +179,7 @@ pub fn run(
                 .into_iter()
                 .collect::<std::collections::HashMap<_, _>>(),
             Err(e) => {
-                let _ = tx.send(SearchStreamEvent::Error(format!(
-                    "fts_meta lookup: {e}"
-                )));
+                let _ = tx.send(SearchStreamEvent::Error(format!("fts_meta lookup: {e}")));
                 return;
             }
         };
@@ -313,9 +301,7 @@ impl RejectReason {
             RejectReason::TooShort => {
                 "検索キーワードが短すぎます (日本語は 2 文字以上、英数字は 3 文字以上)"
             }
-            RejectReason::NotOnly => {
-                "含める語を 1 つ以上入力してください (除外だけの検索は不可)"
-            }
+            RejectReason::NotOnly => "含める語を 1 つ以上入力してください (除外だけの検索は不可)",
         }
     }
 }
@@ -332,7 +318,7 @@ pub fn hit_to_pathbuf(hit: &GlobalHit) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fts_index::{upsert_doc, Container, IndexDoc};
+    use crate::fts_index::{Container, IndexDoc, upsert_doc};
     use crate::search_index_db::normalize_path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
@@ -345,24 +331,11 @@ mod tests {
         (tmp, meta, fts)
     }
 
-    fn ingest(
-        meta: &FtsMetaDb,
-        fts: &FtsIndex,
-        fav: Uuid,
-        path_str: &str,
-        text: &str,
-    ) {
+    fn ingest(meta: &FtsMetaDb, fts: &FtsIndex, fav: Uuid, path_str: &str, text: &str) {
         let key = normalize_path(&PathBuf::from(path_str));
         let all_text_norm = crate::search_norm::normalize_for_match(text);
-        meta.mark_pending(
-            &key,
-            fav,
-            &PathBuf::from("C:/"),
-            0,
-            0,
-            &all_text_norm,
-        )
-        .unwrap();
+        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text_norm)
+            .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
             &w,
@@ -374,11 +347,7 @@ mod tests {
                 favorite_id: fav,
                 mtime: 0,
                 file_size: 0,
-                name: path_str
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(path_str)
-                    .to_string(),
+                name: path_str.rsplit('/').next().unwrap_or(path_str).to_string(),
                 all_text: all_text_norm,
             },
         )
@@ -404,7 +373,10 @@ mod tests {
         while let Ok(ev) = rx.recv() {
             match ev {
                 SearchStreamEvent::Batch { hits, .. } => all_hits.extend(hits),
-                SearchStreamEvent::Done { truncated: t, reason: r } => {
+                SearchStreamEvent::Done {
+                    truncated: t,
+                    reason: r,
+                } => {
                     reason = r;
                     truncated = t;
                 }
@@ -564,7 +536,10 @@ mod tests {
         let (hits, reason, _) = collect_events("夕焼け 海辺", &[fav], &fts, &meta);
         assert_eq!(reason, DoneReason::Complete);
         let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
-        assert!(paths.contains(&"c:/a.jpg"), "句読点を挟んで含む doc もヒット");
+        assert!(
+            paths.contains(&"c:/a.jpg"),
+            "句読点を挟んで含む doc もヒット"
+        );
         assert!(paths.contains(&"c:/b.jpg"), "逆順で含む doc もヒット");
         assert!(!paths.contains(&"c:/c.jpg"), "片方のみは除外");
     }
@@ -611,7 +586,8 @@ mod tests {
         let fav = Uuid::new_v4();
         let key = normalize_path(&PathBuf::from("c:/a.jpg"));
         let all_text = crate::search_norm::normalize_for_match("夕焼け");
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text).unwrap();
+        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text)
+            .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
             &w,
@@ -626,7 +602,8 @@ mod tests {
                 name: "a.jpg".to_string(),
                 all_text,
             },
-        ).unwrap();
+        )
+        .unwrap();
         w.commit().unwrap();
         meta.mark_ok(&[key.clone()]).unwrap();
         fts.reload_reader().unwrap();

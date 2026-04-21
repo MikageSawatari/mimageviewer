@@ -13,7 +13,7 @@ pub fn query_primary_gpu_vram_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Dxgi::{
-            CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
         };
 
         unsafe {

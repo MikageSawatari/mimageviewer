@@ -19,15 +19,15 @@
 #![cfg(windows)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::ffi::{c_void, CStr, CString, OsString};
+use std::ffi::{CStr, CString, OsString, c_void};
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use mimageviewer_susie32::plugin::{PluginHost, PluginSet};
 use mimageviewer_susie32::protocol::{
-    read_msg, write_msg, MSG_DECODE_BYTES, MSG_DECODE_FILE, MSG_HANDSHAKE, MSG_SHUTDOWN,
-    STATUS_ERR, STATUS_OK,
+    MSG_DECODE_BYTES, MSG_DECODE_FILE, MSG_HANDSHAKE, MSG_SHUTDOWN, STATUS_ERR, STATUS_OK,
+    read_msg, write_msg,
 };
 
 fn main() {
@@ -80,36 +80,32 @@ fn main() {
             continue;
         }
         match msg[0] {
-            MSG_DECODE_FILE => {
-                match decode_file_request(&msg[1..]) {
-                    Ok(path) => match plugins.decode_file(&path) {
-                        Ok((w, h, bgra)) => {
-                            let _ = write_msg(&mut stdout, &encode_decode_response(w, h, &bgra));
-                        }
-                        Err(e) => {
-                            let _ = write_err(&mut stdout, &e);
-                        }
-                    },
-                    Err(e) => {
-                        let _ = write_err(&mut stdout, &format!("decode_file request: {e}"));
+            MSG_DECODE_FILE => match decode_file_request(&msg[1..]) {
+                Ok(path) => match plugins.decode_file(&path) {
+                    Ok((w, h, bgra)) => {
+                        let _ = write_msg(&mut stdout, &encode_decode_response(w, h, &bgra));
                     }
-                }
-            }
-            MSG_DECODE_BYTES => {
-                match decode_bytes_request(&msg[1..]) {
-                    Ok((hint, bytes)) => match plugins.decode_bytes(&hint, &bytes) {
-                        Ok((w, h, bgra)) => {
-                            let _ = write_msg(&mut stdout, &encode_decode_response(w, h, &bgra));
-                        }
-                        Err(e) => {
-                            let _ = write_err(&mut stdout, &e);
-                        }
-                    },
                     Err(e) => {
-                        let _ = write_err(&mut stdout, &format!("decode_bytes request: {e}"));
+                        let _ = write_err(&mut stdout, &e);
                     }
+                },
+                Err(e) => {
+                    let _ = write_err(&mut stdout, &format!("decode_file request: {e}"));
                 }
-            }
+            },
+            MSG_DECODE_BYTES => match decode_bytes_request(&msg[1..]) {
+                Ok((hint, bytes)) => match plugins.decode_bytes(&hint, &bytes) {
+                    Ok((w, h, bgra)) => {
+                        let _ = write_msg(&mut stdout, &encode_decode_response(w, h, &bgra));
+                    }
+                    Err(e) => {
+                        let _ = write_err(&mut stdout, &e);
+                    }
+                },
+                Err(e) => {
+                    let _ = write_err(&mut stdout, &format!("decode_bytes request: {e}"));
+                }
+            },
             MSG_SHUTDOWN => return,
             t => {
                 let _ = write_err(&mut stdout, &format!("unknown msg type {t}"));

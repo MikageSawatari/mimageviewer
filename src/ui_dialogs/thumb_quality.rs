@@ -7,13 +7,14 @@
 
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 
 use eframe::egui;
 
-use crate::app::{tq_draw_preview, App};
+use crate::app::{App, tq_draw_preview};
 use crate::catalog;
 use crate::folder_tree;
 use crate::gpu_info;
@@ -21,7 +22,7 @@ use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings;
 use crate::stats;
 use crate::thumb_loader::{
-    build_and_save_one, compute_display_px, CacheDecision, LoadRequest, ThumbMsg,
+    CacheDecision, LoadRequest, ThumbMsg, build_and_save_one, compute_display_px,
 };
 use crate::ui_helpers::{
     draw_format_rows, draw_histogram, format_bytes, format_bytes_small, format_count,
@@ -114,12 +115,8 @@ impl App {
                         cols[0].vertical(|ui| {
                             ui.heading("A");
                             ui.add_space(4.0);
-                            let resp = tq_draw_preview(
-                                ui,
-                                &self.tq.a_texture,
-                                grid_cell_w,
-                                grid_cell_h,
-                            );
+                            let resp =
+                                tq_draw_preview(ui, &self.tq.a_texture, grid_cell_w, grid_cell_h);
                             if resp.clicked() {
                                 open_fs_a = true;
                             }
@@ -128,8 +125,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("サイズ:");
                                 let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq.a_size, 128..=1536)
-                                        .text("px"),
+                                    egui::Slider::new(&mut self.tq.a_size, 128..=1536).text("px"),
                                 );
                                 if resp.drag_stopped() || resp.lost_focus() {
                                     reencode_a = true;
@@ -137,15 +133,15 @@ impl App {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("品質:");
-                                let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq.a_quality, 1..=100),
-                                );
+                                let resp =
+                                    ui.add(egui::Slider::new(&mut self.tq.a_quality, 1..=100));
                                 if resp.drag_stopped() || resp.lost_focus() {
                                     reencode_a = true;
                                 }
                             });
                             ui.add_space(4.0);
-                            ui.label(format!("{}  ({}x{})",
+                            ui.label(format!(
+                                "{}  ({}x{})",
                                 format_bytes_small(self.tq.a_bytes as u64),
                                 self.tq.a_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
                                 self.tq.a_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
@@ -160,12 +156,8 @@ impl App {
                         cols[1].vertical(|ui| {
                             ui.heading("B");
                             ui.add_space(4.0);
-                            let resp = tq_draw_preview(
-                                ui,
-                                &self.tq.b_texture,
-                                grid_cell_w,
-                                grid_cell_h,
-                            );
+                            let resp =
+                                tq_draw_preview(ui, &self.tq.b_texture, grid_cell_w, grid_cell_h);
                             if resp.clicked() {
                                 open_fs_b = true;
                             }
@@ -174,8 +166,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label("サイズ:");
                                 let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq.b_size, 128..=1536)
-                                        .text("px"),
+                                    egui::Slider::new(&mut self.tq.b_size, 128..=1536).text("px"),
                                 );
                                 if resp.drag_stopped() || resp.lost_focus() {
                                     reencode_b = true;
@@ -183,15 +174,15 @@ impl App {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("品質:");
-                                let resp = ui.add(
-                                    egui::Slider::new(&mut self.tq.b_quality, 1..=100),
-                                );
+                                let resp =
+                                    ui.add(egui::Slider::new(&mut self.tq.b_quality, 1..=100));
                                 if resp.drag_stopped() || resp.lost_focus() {
                                     reencode_b = true;
                                 }
                             });
                             ui.add_space(4.0);
-                            ui.label(format!("{}  ({}x{})",
+                            ui.label(format!(
+                                "{}  ({}x{})",
                                 format_bytes_small(self.tq.b_bytes as u64),
                                 self.tq.b_texture.as_ref().map(|t| t.size()[0]).unwrap_or(0),
                                 self.tq.b_texture.as_ref().map(|t| t.size()[1]).unwrap_or(0),
@@ -212,14 +203,11 @@ impl App {
                             "現在の設定: {}px / q={}",
                             self.settings.thumb_px, self.settings.thumb_quality
                         ));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.button("  閉じる  ").clicked() {
-                                    self.tq.show = false;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("  閉じる  ").clicked() {
+                                self.tq.show = false;
+                            }
+                        });
                     });
                 });
 
@@ -249,6 +237,5 @@ impl App {
                 self.close_thumb_quality_dialog();
             }
         }
-
     }
 }

@@ -20,10 +20,7 @@ impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
     /// メニューバーを描画し、ナビゲーション先とソート変更の有無を返す。
-    pub(crate) fn render_menubar(
-        &mut self,
-        ctx: &egui::Context,
-    ) -> (Option<PathBuf>, bool) {
+    pub(crate) fn render_menubar(&mut self, ctx: &egui::Context) -> (Option<PathBuf>, bool) {
         let mut fav_nav: Option<PathBuf> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
@@ -85,12 +82,7 @@ impl App {
                             self.settings
                                 .favorites
                                 .iter()
-                                .map(|f| {
-                                    (
-                                        f.id,
-                                        (f.auto_index_structure, f.auto_index_metadata),
-                                    )
-                                })
+                                .map(|f| (f.id, (f.auto_index_structure, f.auto_index_metadata)))
                                 .collect(),
                         );
                         ui.close();
@@ -124,7 +116,8 @@ impl App {
 
                 ui.menu_button("設定", |ui| {
                     ui.menu_button("サムネイル列数", |ui| {
-                        for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
+                        for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
+                        {
                             let checked = self.settings.grid_cols == cols;
                             let prefix = if checked { "✓ " } else { "  " };
                             if ui.button(format!("{prefix}{cols} 列")).clicked() {
@@ -159,8 +152,7 @@ impl App {
                     ui.separator();
                     if ui.button("サムネイルキャッシュ管理").clicked() {
                         let cache_dir = crate::catalog::default_cache_dir();
-                        self.cache_manager_stats =
-                            Some(crate::catalog::cache_stats(&cache_dir));
+                        self.cache_manager_stats = Some(crate::catalog::cache_stats(&cache_dir));
                         self.cache_manager_result = None;
                         self.show_cache_manager = true;
                         ui.close();
@@ -233,8 +225,7 @@ impl App {
 
     /// 進捗バーオーバーレイ（左下フローティング）を描画する。
     pub(crate) fn render_progress_overlay(&self, ctx: &egui::Context) {
-        let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) =
-            self.progress_snapshot();
+        let ((cur_normal, peak_normal), (cur_upgrade, peak_upgrade)) = self.progress_snapshot();
         if peak_normal == 0 && peak_upgrade == 0 {
             return;
         }
@@ -351,10 +342,7 @@ impl App {
                     ui.label("列:");
                     for &cols in &tb_cols {
                         let selected = self.settings.grid_cols == cols;
-                        if ui
-                            .selectable_label(selected, format!(" {cols} "))
-                            .clicked()
-                        {
+                        if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
                             self.settings.grid_cols = cols;
                             self.settings.save();
                         }
@@ -382,10 +370,7 @@ impl App {
                     ui.label("ソート:");
                     for &order in &tb_sorts {
                         let selected = self.settings.sort_order == order;
-                        if ui
-                            .selectable_label(selected, order.short_label())
-                            .clicked()
-                            && !selected
+                        if ui.selectable_label(selected, order.short_label()).clicked() && !selected
                         {
                             self.settings.sort_order = order;
                             self.settings.save();
@@ -418,10 +403,7 @@ impl App {
                         let label = "★".repeat(stars as usize);
                         if ui
                             .selectable_label(sel, label)
-                            .on_hover_text(format!(
-                                "★{} を表示 [F{} で付与]",
-                                stars, stars
-                            ))
+                            .on_hover_text(format!("★{} を表示 [F{} で付与]", stars, stars))
                             .clicked()
                         {
                             self.settings.rating_filter[idx] = !sel;
@@ -441,10 +423,8 @@ impl App {
                         // 現在のフォルダと一致するお気に入りをハイライト
                         let current = self.current_folder.clone();
                         for fav in &self.settings.favorites {
-                            let selected = current
-                                .as_ref()
-                                .map(|c| c == &fav.path)
-                                .unwrap_or(false);
+                            let selected =
+                                current.as_ref().map(|c| c == &fav.path).unwrap_or(false);
                             if ui
                                 .selectable_label(selected, &fav.name)
                                 .on_hover_text(fav.path.to_string_lossy())
@@ -512,15 +492,12 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("フォルダ:");
                     let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.address)
-                            .desired_width(f32::INFINITY),
+                        egui::TextEdit::singleline(&mut self.address).desired_width(f32::INFINITY),
                     );
                     self.address_has_focus = resp.has_focus();
                     if resp.lost_focus() && enter_pressed {
                         let p = PathBuf::from(&self.address);
-                        if let Some(resolved) =
-                            crate::folder_tree::resolve_openable_path(&p)
-                        {
+                        if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
                             result = Some(resolved);
                         }
                     }
@@ -678,12 +655,9 @@ impl App {
                 } else if self.favsearch.on_results_grid() {
                     ui.separator();
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} 件",
-                            self.favsearch.results_paths.len()
-                        ))
-                        .size(11.0)
-                        .color(egui::Color32::from_gray(140)),
+                        egui::RichText::new(format!("{} 件", self.favsearch.results_paths.len()))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
                     );
                 }
             });
@@ -717,11 +691,7 @@ impl App {
         cell_rect: egui::Rect,
         idx: usize,
     ) -> Option<PathBuf> {
-        let response = ui.interact(
-            cell_rect,
-            ui.id().with(idx),
-            egui::Sense::click(),
-        );
+        let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click());
         let mut nav = None;
         if response.clicked() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
@@ -775,9 +745,7 @@ impl App {
                         nav = Some(p.clone())
                     }
                 }
-                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
-                    nav = Some(p.clone())
-                }
+                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => nav = Some(p.clone()),
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::ZipSeparator { .. })
@@ -802,10 +770,7 @@ impl App {
                     // Ctrl+G 結果ビューのコンテナ: ダブルクリックで drill-down view に遷移
                     // (docs §10.3 [3] 絞り込みビュー)
                     let p = path.clone();
-                    let is_zip = matches!(
-                        kind,
-                        crate::grid_item::SearchContainerKind::Zip
-                    );
+                    let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
                     self.drill_into_container(p, is_zip);
                 }
                 None => {}
@@ -816,9 +781,7 @@ impl App {
             self.selected = Some(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
-            self.context_menu_pos = ctx.input(|i| {
-                i.pointer.interact_pos().unwrap_or_default()
-            });
+            self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
         }
         nav
     }
@@ -838,16 +801,13 @@ impl App {
                     } else {
                         "フォルダを入力して Enter キーを押してください"
                     };
-                    let r = ui.centered_and_justified(|ui| {
-                        ui.label(msg)
-                    });
+                    let r = ui.centered_and_justified(|ui| ui.label(msg));
                     // 空フォルダでも右クリックでフォルダ操作可能にする
                     if r.inner.secondary_clicked() {
                         if self.current_folder.is_some() {
                             self.context_menu_idx = Some(usize::MAX); // 特殊値: フォルダ操作
-                            self.context_menu_pos = ctx.input(|i| {
-                                i.pointer.interact_pos().unwrap_or_default()
-                            });
+                            self.context_menu_pos =
+                                ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
                         }
                     }
                     return None;
@@ -863,15 +823,15 @@ impl App {
                 let cols = self.settings.grid_cols.max(1);
                 let avail_w = ui.available_width();
                 let cell_w = (avail_w / cols as f32).floor();
-                let cell_h =
-                    (cell_w * self.settings.thumb_aspect.height_ratio()).round().max(1.0);
+                let cell_h = (cell_w * self.settings.thumb_aspect.height_ratio())
+                    .round()
+                    .max(1.0);
 
                 // ウィンドウリサイズやアスペクト比変更でセルサイズが変わった場合スナップし直す
                 if (cell_w - self.last_cell_size).abs() > 0.5
                     || (cell_h - self.last_cell_h).abs() > 0.5
                 {
-                    self.scroll_offset_y =
-                        (self.scroll_offset_y / cell_h).round() * cell_h;
+                    self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
                     self.last_cell_size = cell_w;
                     self.last_cell_h = cell_h;
                 }
@@ -918,8 +878,7 @@ impl App {
                         );
 
                         let first_row = (viewport.min.y / cell_h) as usize;
-                        let last_row =
-                            ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
+                        let last_row = ((viewport.max.y / cell_h) as usize + 2).min(total_rows);
 
                         // Phase 2b ワーカーへ現在の可視先頭/終端アイテムを通知
                         let vis_first_idx = self
@@ -927,8 +886,7 @@ impl App {
                             .get(first_row * cols)
                             .copied()
                             .unwrap_or(0);
-                        self.scroll_hint
-                            .store(vis_first_idx, Ordering::Relaxed);
+                        self.scroll_hint.store(vis_first_idx, Ordering::Relaxed);
                         // 可視範囲の終端 (exclusive)。先読みの forward 側距離計算に使う。
                         // last_row は exclusive、可視セルの最後の位置は (last_row*cols - 1) だが
                         // 末尾の行は半分しか埋まっていない場合があるので visible_indices.len() で clamp。
@@ -954,10 +912,7 @@ impl App {
 
                                 let cell_rect = egui::Rect::from_min_size(
                                     content_rect.min
-                                        + egui::vec2(
-                                            col as f32 * cell_w,
-                                            row as f32 * cell_h,
-                                        ),
+                                        + egui::vec2(col as f32 * cell_w, row as f32 * cell_h),
                                     egui::vec2(cell_w, cell_h),
                                 );
 
@@ -979,7 +934,8 @@ impl App {
                                 }
 
                                 let rot = self.get_rotation(idx);
-                                let has_page_override = self.adjustment_page_params.contains_key(&idx);
+                                let has_page_override =
+                                    self.adjustment_page_params.contains_key(&idx);
                                 let has_mask = self.mask_pages.contains(&idx);
                                 let rating = self.get_rating(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
@@ -1018,15 +974,12 @@ impl App {
                         // グリッドの空白部分で右クリック → フォルダメニュー
                         // Sense::click() だと左クリックも消費するので、
                         // ポインタ位置を直接チェックする
-                        let bg_right_clicked = ctx.input(|i| {
-                            i.pointer.secondary_clicked()
-                        });
+                        let bg_right_clicked = ctx.input(|i| i.pointer.secondary_clicked());
                         if bg_right_clicked && self.context_menu_idx.is_none() {
                             if self.current_folder.is_some() {
                                 self.context_menu_idx = Some(usize::MAX);
-                                self.context_menu_pos = ctx.input(|i| {
-                                    i.pointer.interact_pos().unwrap_or_default()
-                                });
+                                self.context_menu_pos =
+                                    ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
                             }
                         }
                     });
@@ -1065,7 +1018,10 @@ impl App {
         };
 
         // ZipSeparator はスキップ
-        if matches!(self.items.get(idx), Some(GridItem::ZipSeparator { .. }) | None) {
+        if matches!(
+            self.items.get(idx),
+            Some(GridItem::ZipSeparator { .. }) | None
+        ) {
             return;
         }
 

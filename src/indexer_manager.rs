@@ -38,8 +38,8 @@
 //!   同期化により supervisor 群の spawn と writer 競合しなくなった。
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::{Receiver, Sender};
 use uuid::Uuid;
@@ -66,8 +66,7 @@ pub struct SearchHandle {
 
 impl Drop for SearchHandle {
     fn drop(&mut self) {
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         // ワーカースレッドは自分で finish する。ここで join しない
         // (Ctrl+G の UI フレーム内で drop されるので、長時間ブロックしない契約)。
     }
@@ -191,18 +190,15 @@ impl IndexerManager {
             .iter()
             .filter_map(|f| {
                 let old_path = self.favorite_info.get(&f.id).map(|(_, p)| p.clone())?;
-                if old_path != f.path {
-                    Some(f.id)
-                } else {
-                    None
-                }
+                if old_path != f.path { Some(f.id) } else { None }
             })
             .collect();
 
         // favorite_info を最新化
         self.favorite_info.clear();
         for f in favorites {
-            self.favorite_info.insert(f.id, (f.name.clone(), f.path.clone()));
+            self.favorite_info
+                .insert(f.id, (f.name.clone(), f.path.clone()));
         }
 
         // 削除 / OFF 化 / **path 変更** されたものを drop 対象に含める
@@ -259,9 +255,7 @@ impl IndexerManager {
                 SupervisorStatsView {
                     favorite_id: *id,
                     favorite_name: info.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
-                    favorite_path: info
-                        .map(|(_, p)| p)
-                        .unwrap_or_else(std::path::PathBuf::new),
+                    favorite_path: info.map(|(_, p)| p).unwrap_or_else(std::path::PathBuf::new),
                     stats: handle.snapshot_stats(),
                 }
             })
@@ -304,10 +298,7 @@ impl IndexerManager {
     ///
     /// **UI スレッドから直接呼ばないこと** — App 側の worker 経由で呼ぶ契約。
     /// 返るのは (path, all_text_norm) で、status != ok の path は含まれない。
-    pub fn lookup_local_texts(
-        &self,
-        paths: &[String],
-    ) -> Result<Vec<(String, String)>, String> {
+    pub fn lookup_local_texts(&self, paths: &[String]) -> Result<Vec<(String, String)>, String> {
         self.meta_db
             .lookup_all_text_norm(paths)
             .map_err(|e| format!("{e}"))
@@ -434,9 +425,7 @@ fn run_reconciliation(
     favorites: &[FavoriteEntry],
 ) -> Result<ReconciliationReport, String> {
     let mut report = ReconciliationReport::default();
-    let mut writer = fts
-        .writer()
-        .map_err(|e| format!("fts writer init: {e}"))?;
+    let mut writer = fts.writer().map_err(|e| format!("fts writer init: {e}"))?;
     let fields = fts.fields();
 
     for fav in favorites {
@@ -477,9 +466,7 @@ fn run_reconciliation(
         }
     }
     // 1 回だけ commit
-    writer
-        .commit()
-        .map_err(|e| format!("writer.commit: {e}"))?;
+    writer.commit().map_err(|e| format!("writer.commit: {e}"))?;
     crate::logger::log(format!(
         "reconciliation done: pending/failed cleaned = {}, tombstone purged = {}",
         report.pending_cleaned, report.tombstone_purged
@@ -513,7 +500,7 @@ struct ReconciliationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fts_index::{upsert_doc, Container, IndexDoc};
+    use crate::fts_index::{Container, IndexDoc, upsert_doc};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -570,12 +557,8 @@ mod tests {
 
         // Tantivy 側も delete_doc + commit 済み
         fts.reload_reader().unwrap();
-        let q = crate::fts_index::build_bigram_and_query(
-            fts.fields(),
-            &["txt"],
-            Some(&[fav.id]),
-        )
-        .unwrap();
+        let q = crate::fts_index::build_bigram_and_query(fts.fields(), &["txt"], Some(&[fav.id]))
+            .unwrap();
         let searcher = fts.searcher();
         let hits = crate::fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 0, "Tantivy からも削除されているはず");
@@ -615,7 +598,10 @@ mod tests {
             .unwrap();
 
         let r = run_reconciliation(&meta, &fts, &[fav]).unwrap();
-        assert_eq!(r.pending_cleaned, 0, "OFF の favorite は reconciliation 対象外");
+        assert_eq!(
+            r.pending_cleaned, 0,
+            "OFF の favorite は reconciliation 対象外"
+        );
         // 行はそのまま残っているはず
         assert!(meta.get("c:/a/1.jpg").unwrap().is_some());
     }
@@ -637,14 +623,7 @@ mod tests {
         let fts_cl = Arc::clone(&fts);
         let cancel_cl = Arc::clone(&cancel);
         std::thread::spawn(move || {
-            crate::global_search::run(
-                "dummy",
-                &[fav_id],
-                &fts_cl,
-                &meta_cl,
-                &cancel_cl,
-                &tx,
-            );
+            crate::global_search::run("dummy", &[fav_id], &fts_cl, &meta_cl, &cancel_cl, &tx);
         });
         // 何らかの SearchStreamEvent が返ることを確認
         let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();

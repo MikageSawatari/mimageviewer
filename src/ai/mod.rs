@@ -118,20 +118,18 @@ impl ModelKind {
 
     /// デノイズ用モデル一覧（UI プルダウンに表示するもの）。
     pub fn denoise_models() -> &'static [ModelKind] {
-        &[
-            ModelKind::DenoiseRealplksr,
-        ]
+        &[ModelKind::DenoiseRealplksr]
     }
 
     /// アップスケール用モデル一覧（UI プルダウンに表示するもの）。
     /// 順序は: 自動選択対象 3 モデル (写真/イラスト/漫画) → 補助 2 モデル (質感保持/高速汎用)
     pub fn upscale_models() -> &'static [ModelKind] {
         &[
-            ModelKind::UpscaleRealEsrganX4Plus,   // 写真・CG
-            ModelKind::UpscaleRealEsrganAnime6B,  // イラスト・アニメ
-            ModelKind::UpscaleRealCugan4x,        // 漫画
-            ModelKind::UpscaleNmkdSiax4x,         // 写真 (質感保持)
-            ModelKind::UpscaleRealEsrGeneralV3,   // 高速汎用
+            ModelKind::UpscaleRealEsrganX4Plus,  // 写真・CG
+            ModelKind::UpscaleRealEsrganAnime6B, // イラスト・アニメ
+            ModelKind::UpscaleRealCugan4x,       // 漫画
+            ModelKind::UpscaleNmkdSiax4x,        // 写真 (質感保持)
+            ModelKind::UpscaleRealEsrGeneralV3,  // 高速汎用
         ]
     }
 }

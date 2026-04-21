@@ -106,7 +106,9 @@ pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
     use std::io::Read;
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
-    f.take(FALLBACK_SCAN_LIMIT as u64).read_to_end(&mut buf).ok()?;
+    f.take(FALLBACK_SCAN_LIMIT as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
     read_tweet_info_from_bytes(&buf)
 }
 
@@ -118,7 +120,11 @@ pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
     }
     let xmp = extract_xmp_packet(bytes)?;
     let info = parse_xmp(&xmp)?;
-    if info.is_populated() { Some(info) } else { None }
+    if info.is_populated() {
+        Some(info)
+    } else {
+        None
+    }
 }
 
 /// XMP が入り得るコンテナのマジックバイトか判定。
@@ -202,9 +208,9 @@ fn extract_xmp_from_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
 fn extract_xmp_from_png(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 8; // PNG シグネチャをスキップ
     while pos + 8 <= bytes.len() {
-        let length = u32::from_be_bytes([
-            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
-        ]) as usize;
+        let length =
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
         let chunk_type = &bytes[pos + 4..pos + 8];
         let data_start = pos + 8;
         let data_end = data_start.checked_add(length)?;
@@ -287,9 +293,9 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
 
     // 現在キャプチャ中の「リーフ文字列を溜める先」
     enum Capture {
-        Xtw(String),        // xtw:* のローカル名
-        DcDescLi,           // dc:description の中の rdf:li
-        DcCreatorLi,        // dc:creator の中の rdf:li
+        Xtw(String), // xtw:* のローカル名
+        DcDescLi,    // dc:description の中の rdf:li
+        DcCreatorLi, // dc:creator の中の rdf:li
     }
     let mut capture: Option<Capture> = None;
     // dc:description / dc:creator 内部にいるか
@@ -345,9 +351,7 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
                 let mut resource: Option<String> = None;
                 for attr in e.attributes().flatten() {
                     let (attr_ns, attr_local) = resolver.resolve_attribute(attr.key);
-                    let ns_is = |uri: &[u8]| {
-                        matches!(&attr_ns, quick_xml::name::ResolveResult::Bound(ns) if ns.as_ref() == uri)
-                    };
+                    let ns_is = |uri: &[u8]| matches!(&attr_ns, quick_xml::name::ResolveResult::Bound(ns) if ns.as_ref() == uri);
                     if ns_is(XTW_NAMESPACE) {
                         let k = String::from_utf8_lossy(attr_local.as_ref()).into_owned();
                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
@@ -359,12 +363,18 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
                         }
                     }
                 }
-                Ev::Open { is_empty, local, ns, xtw_attrs, resource }
+                Ev::Open {
+                    is_empty,
+                    local,
+                    ns,
+                    xtw_attrs,
+                    resource,
+                }
             } else {
                 match ev {
-                    Event::Text(t) => Ev::Text(
-                        t.decode().map(|s| s.into_owned()).unwrap_or_default(),
-                    ),
+                    Event::Text(t) => {
+                        Ev::Text(t.decode().map(|s| s.into_owned()).unwrap_or_default())
+                    }
                     Event::End(e) => Ev::Close(e.local_name().as_ref().to_vec()),
                     Event::Eof => Ev::Eof,
                     _ => Ev::Other,
@@ -373,7 +383,13 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
         };
 
         match event {
-            Ev::Open { is_empty, local, ns, xtw_attrs, resource } => {
+            Ev::Open {
+                is_empty,
+                local,
+                ns,
+                xtw_attrs,
+                resource,
+            } => {
                 for (k, v) in xtw_attrs {
                     xtw_fields.entry(k).or_insert(v);
                 }
@@ -450,7 +466,11 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
     info.quoted_by_author_id = take(&mut m, "QuotedByAuthorId");
     info.quoted_by_author_display_name = take(&mut m, "QuotedByAuthorDisplayName");
 
-    if info.is_populated() { Some(info) } else { None }
+    if info.is_populated() {
+        Some(info)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +561,10 @@ mod tests {
         </x:xmpmeta>"#;
         let info = parse_xmp(xml).expect("should parse");
         assert_eq!(info.tweet_id.as_deref(), Some("111"));
-        assert_eq!(info.tweet_url.as_deref(), Some("https://x.com/a/status/111"));
+        assert_eq!(
+            info.tweet_url.as_deref(),
+            Some("https://x.com/a/status/111")
+        );
         assert_eq!(info.author_screen_name.as_deref(), Some("a"));
     }
 

@@ -33,11 +33,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
 #[cfg(test)]
 use std::time::Duration;
+use std::time::Instant;
 
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, select};
 use uuid::Uuid;
 
 use crate::fts_index::FtsIndex;
@@ -168,15 +168,7 @@ pub fn spawn(
         .name(format!("indexer-{}", fav_id.as_simple()))
         .spawn(move || {
             supervisor_loop(
-                fav_id,
-                root,
-                meta_db,
-                fts,
-                io_sem,
-                cancel_cl,
-                stats_cl,
-                cmd_rx,
-                change_tx,
+                fav_id, root, meta_db, fts, io_sem, cancel_cl, stats_cl, cmd_rx, change_tx,
                 change_rx,
             );
         })
@@ -211,9 +203,7 @@ fn supervisor_loop(
     let mut writer = match fts.writer() {
         Ok(w) => w,
         Err(e) => {
-            crate::logger::log(format!(
-                "indexer[{favorite_id}]: writer init failed: {e}"
-            ));
+            crate::logger::log(format!("indexer[{favorite_id}]: writer init failed: {e}"));
             return;
         }
     };
@@ -342,9 +332,7 @@ fn run_initial_scan(
     ) {
         Ok(r) => r,
         Err(e) => {
-            crate::logger::log(format!(
-                "indexer[{favorite_id}]: walker scan failed: {e}"
-            ));
+            crate::logger::log(format!("indexer[{favorite_id}]: walker scan failed: {e}"));
             return;
         }
     };
@@ -361,9 +349,7 @@ fn run_initial_scan(
     ) {
         Ok(s) => s,
         Err(e) => {
-            crate::logger::log(format!(
-                "indexer[{favorite_id}]: ingest apply failed: {e}"
-            ));
+            crate::logger::log(format!("indexer[{favorite_id}]: ingest apply failed: {e}"));
             return;
         }
     };
@@ -504,7 +490,6 @@ fn mark_activity(stats: &Mutex<SupervisorStats>) {
     lock.last_activity_ms_ago = Some(0);
 }
 
-
 // -----------------------------------------------------------------------
 // tests
 // -----------------------------------------------------------------------
@@ -516,7 +501,12 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, Arc<FtsMetaDb>, Arc<FtsIndex>, Arc<GlobalIoSemaphore>) {
+    fn setup() -> (
+        TempDir,
+        Arc<FtsMetaDb>,
+        Arc<FtsIndex>,
+        Arc<GlobalIoSemaphore>,
+    ) {
         let tmp = TempDir::new().unwrap();
         let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
         let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());

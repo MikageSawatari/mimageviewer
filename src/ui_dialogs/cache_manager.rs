@@ -9,8 +9,9 @@
 
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 
 use eframe::egui;
@@ -23,7 +24,7 @@ use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings;
 use crate::stats;
 use crate::thumb_loader::{
-    build_and_save_one, compute_display_px, CacheDecision, LoadRequest, ThumbMsg,
+    CacheDecision, LoadRequest, ThumbMsg, build_and_save_one, compute_display_px,
 };
 use crate::ui_helpers::{
     draw_format_rows, draw_histogram, format_bytes, format_bytes_small, format_count,
@@ -82,11 +83,21 @@ impl App {
                         ui.label("日以上更新がないキャッシュを削除する");
                     });
                     ui.add_space(4.0);
-                    if ui.button(format!("  {} 日以上古いキャッシュを削除  ", self.cache_manager_days)).clicked() {
-                        let deleted = crate::catalog::delete_old_cache(&cache_dir, self.cache_manager_days as u64);
+                    if ui
+                        .button(format!(
+                            "  {} 日以上古いキャッシュを削除  ",
+                            self.cache_manager_days
+                        ))
+                        .clicked()
+                    {
+                        let deleted = crate::catalog::delete_old_cache(
+                            &cache_dir,
+                            self.cache_manager_days as u64,
+                        );
                         let stats = crate::catalog::cache_stats(&cache_dir);
                         self.cache_manager_stats = Some(stats);
-                        self.cache_manager_result = Some(format!("{} 件のキャッシュを削除しました。", deleted));
+                        self.cache_manager_result =
+                            Some(format!("{} 件のキャッシュを削除しました。", deleted));
                     }
 
                     ui.add_space(8.0);
@@ -106,9 +117,8 @@ impl App {
                                     folder.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                                 ));
                             } else {
-                                self.cache_manager_result = Some(
-                                    "現在のフォルダにはキャッシュがありません。".to_string(),
-                                );
+                                self.cache_manager_result =
+                                    Some("現在のフォルダにはキャッシュがありません。".to_string());
                             }
                             let stats = crate::catalog::cache_stats(&cache_dir);
                             self.cache_manager_stats = Some(stats);
@@ -163,9 +173,8 @@ impl App {
                             let cache_dir = crate::catalog::default_cache_dir();
                             let deleted = crate::catalog::delete_all_cache(&cache_dir);
                             self.cache_manager_stats = Some((0, 0));
-                            self.cache_manager_result = Some(format!(
-                                "{} 件のキャッシュをすべて削除しました。", deleted
-                            ));
+                            self.cache_manager_result =
+                                Some(format!("{} 件のキャッシュをすべて削除しました。", deleted));
                             self.cache_manager_confirm_delete_all = false;
                         }
                         if ui.button("  キャンセル  ").clicked() || escape_pressed {

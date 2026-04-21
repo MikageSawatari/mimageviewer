@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use eframe::egui;
@@ -23,8 +23,7 @@ use eframe::egui;
 use crate::app::App;
 use crate::archive_cache::ArchiveCacheDb;
 use crate::archive_converter::{
-    convert_to_zip, scan_summary, ArchiveFormat, ArchiveImageSummary, ConvertError,
-    ConvertProgress,
+    ArchiveFormat, ArchiveImageSummary, ConvertError, ConvertProgress, convert_to_zip, scan_summary,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -109,11 +108,7 @@ impl App {
 
     /// 変換ダイアログを開始する (スキャン fase から)。
     /// 既に別のダイアログが動作中なら無視 (二重起動防止)。
-    pub(crate) fn request_archive_convert(
-        &mut self,
-        src: PathBuf,
-        format: ArchiveFormat,
-    ) {
+    pub(crate) fn request_archive_convert(&mut self, src: PathBuf, format: ArchiveFormat) {
         if self.archive_convert.is_some() {
             return;
         }
@@ -214,9 +209,7 @@ impl App {
                             "元ファイルはそのまま残り、変換したファイルが\
                              キャッシュとして作成されます。",
                         );
-                        ui.label(
-                            "キャッシュ管理メニューから削除することができます。",
-                        );
+                        ui.label("キャッシュ管理メニューから削除することができます。");
                         ui.add_space(10.0);
                         ui.separator();
                         ui.add_space(6.0);
@@ -229,9 +222,7 @@ impl App {
                             egui::RichText::new(format!(
                                 "画像ファイル数: {} / 変換後 ZIP の目安: 約 {}",
                                 summary.image_count,
-                                crate::ui_helpers::format_bytes(
-                                    summary.total_uncompressed_bytes
-                                )
+                                crate::ui_helpers::format_bytes(summary.total_uncompressed_bytes)
                             ))
                             .size(12.0)
                             .color(egui::Color32::from_gray(160)),
@@ -344,11 +335,7 @@ impl App {
                         message: format!("スキャン失敗: {e}"),
                     };
                 }
-                ArchiveConvertMsg::ConvertDone(Ok((
-                    summary,
-                    cached_zip,
-                    cached_size,
-                ))) => {
+                ArchiveConvertMsg::ConvertDone(Ok((summary, cached_zip, cached_size))) => {
                     // キャッシュ DB に記録
                     if let Some(db) = self.archive_cache_db.as_ref() {
                         if let Ok(meta) = std::fs::metadata(&state.src_path) {
@@ -424,8 +411,7 @@ impl App {
             let result = convert_to_zip(&src, &dst, format, &cancel_worker, Some(&cb));
             let msg = match result {
                 Ok(summary) => {
-                    let cached_size =
-                        std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
+                    let cached_size = std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
                     ArchiveConvertMsg::ConvertDone(Ok((summary, dst, cached_size)))
                 }
                 Err(e) => ArchiveConvertMsg::ConvertDone(Err(e)),

@@ -105,7 +105,10 @@ pub fn resize_dynamic_fit(
 /// デコードはせず、PNG/JPEG/GIF/WebP/BMP のヘッダから幅×高さだけ取る。
 /// 失敗したら None (呼び出し側はフルデコード完了まで dims を出さない)。
 pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
-    let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
     let (w, h) = reader.into_dimensions().ok()?;
     Some([w as usize, h as usize])
 }
@@ -147,11 +150,8 @@ mod tests {
 
     #[test]
     fn dynamic_fit_noop_when_within_box() {
-        let src = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
-            100,
-            100,
-            image::Rgba([5, 5, 5, 255]),
-        ));
+        let src =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(100, 100, image::Rgba([5, 5, 5, 255])));
         let out = resize_dynamic_fit(&src, 200, 200, Quality::Bilinear);
         assert_eq!((out.width(), out.height()), (100, 100));
     }

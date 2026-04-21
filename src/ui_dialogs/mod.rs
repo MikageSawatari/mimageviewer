@@ -7,19 +7,19 @@
 //! ダイアログを増やしたい場合は、ここに新しい .rs を追加し、`mod` 宣言を
 //! 加えるだけで `update()` から `self.show_new_dialog(ctx)` として呼べる。
 
+mod about;
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
 mod cache_creator;
 mod cache_manager;
-pub(crate) mod index_creator;
 pub(crate) mod context_menu;
 mod fav_add;
 mod favorites_editor;
+pub(crate) mod index_creator;
 mod open_folder;
+mod pdf_password;
 pub(crate) mod preferences;
 mod rotation_reset;
 mod stats_dialog;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
-mod pdf_password;
-mod about;

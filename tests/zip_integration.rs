@@ -27,7 +27,9 @@ fn enumerate_image_entries_from_real_zip() {
         zip_writer.start_file("subdir/img2.png", options).unwrap();
         zip_writer.write_all(b"fake png data").unwrap();
 
-        zip_writer.start_file("deep/nested/img3.webp", options).unwrap();
+        zip_writer
+            .start_file("deep/nested/img3.webp", options)
+            .unwrap();
         zip_writer.write_all(b"fake webp data").unwrap();
 
         // 非画像ファイル（除外されるはず）
@@ -73,8 +75,14 @@ fn enumerate_empty_zip_returns_empty() {
 
 #[test]
 fn entry_name_helpers() {
-    assert_eq!(zip_loader::entry_basename("work1/ch01/page01.jpg"), "page01.jpg");
-    assert_eq!(zip_loader::entry_basename("root_image.png"), "root_image.png");
+    assert_eq!(
+        zip_loader::entry_basename("work1/ch01/page01.jpg"),
+        "page01.jpg"
+    );
+    assert_eq!(
+        zip_loader::entry_basename("root_image.png"),
+        "root_image.png"
+    );
     assert_eq!(zip_loader::entry_dir("work1/ch01/page01.jpg"), "work1/ch01");
     assert_eq!(zip_loader::entry_dir("root_image.png"), "");
 }
@@ -137,8 +145,7 @@ fn read_entry_bytes_from_nested_zip() {
         w.finish().unwrap();
     }
 
-    let data =
-        zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/inner_img1.jpg").unwrap();
+    let data = zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/inner_img1.jpg").unwrap();
     assert_eq!(data, b"inner jpg 1");
     let data =
         zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/sub/inner_img2.png").unwrap();

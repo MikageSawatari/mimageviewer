@@ -168,9 +168,7 @@ fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
 }
 
 /// ContainerHit を hit_count 降順 / 名前昇順 でソートした Vec を返す。
-pub fn sorted_containers(
-    containers: &HashMap<PathBuf, ContainerHit>,
-) -> Vec<ContainerHit> {
+pub fn sorted_containers(containers: &HashMap<PathBuf, ContainerHit>) -> Vec<ContainerHit> {
     let mut v: Vec<ContainerHit> = containers.values().cloned().collect();
     v.sort_by(|a, b| {
         b.hit_count
@@ -232,7 +230,9 @@ pub(crate) fn build_drilled_items(
             continue; // ZIP ヒットはスキップ
         }
         let hp = PathBuf::from(&h.path);
-        let Some(hp_parent) = hp.parent() else { continue };
+        let Some(hp_parent) = hp.parent() else {
+            continue;
+        };
         // current_path の配下でなければ無関係
         if !path_is_under_or_eq(hp_parent, current_path) {
             continue;
@@ -260,11 +260,9 @@ pub(crate) fn build_drilled_items(
     let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
 
-    // Codex P2 対応: 大量ヒット (最大 HARD_MAX=10000) で path_metadata を同期呼びすると
-    // ネットワークドライブなどで UI が固まるため、mtime/file_size はダミー (0, 0) に落とす。
-    // thumb_loader のキャッシュキーはパスを含むので衝突は発生しない。mtime ベースの
-    // invalidate は効かないが、検索結果は一時的なビューなので許容される。
-    // 将来は GlobalHit に Tantivy STORED mtime/file_size を持たせて置き換える予定 (v0.8.x)。
+    // image_metas は placeholder (0,0) を使う。path_metadata の同期 fs::metadata は
+    // 大量ヒット (最大 HARD_MAX=10000) で UI を止めるため避ける。キャッシュキーはパスを
+    // 含むので衝突せず、mtime ベースの invalidate が効かない副作用は一時ビューのため許容。
     let placeholder = Some((0_i64, 0_i64));
     for (sub_path, _hits) in &sub_vec {
         items.push(GridItem::Folder(sub_path.clone()));
@@ -284,7 +282,7 @@ fn build_drilled_zip_items(
     zip_path: &Path,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let zip_key = crate::search_index_db::normalize_path(zip_path);
-    // Codex P2 対応: sync I/O 除去 (フォルダ版と同じ理由)。
+    // sync I/O 除去 (フォルダ版と同じ理由)。
     let placeholder = Some((0_i64, 0_i64));
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
@@ -313,9 +311,7 @@ fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
 fn is_fullscreen_target(item: Option<&GridItem>) -> bool {
     matches!(
         item,
-        Some(GridItem::Image(_))
-            | Some(GridItem::ZipImage { .. })
-            | Some(GridItem::PdfPage { .. })
+        Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
     )
 }
 
@@ -392,7 +388,9 @@ pub(crate) fn collect_hit_folders_dfs(
             continue; // ZIP ヒットはスキップ (container_root が ZIP のときは未対応)
         }
         let hp = PathBuf::from(&h.path);
-        let Some(mut cur) = hp.parent().map(Path::to_path_buf) else { continue };
+        let Some(mut cur) = hp.parent().map(Path::to_path_buf) else {
+            continue;
+        };
         while path_is_under_or_eq(&cur, container_root) {
             folders.insert(cur.clone());
             if cur == container_root {
@@ -442,13 +440,7 @@ impl App {
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel();
         }
-        self.items = items;
-        self.image_metas = image_metas;
-        self.thumbnails = (0..self.items.len())
-            .map(|_| crate::grid_item::ThumbnailState::Pending)
-            .collect();
-        // 世代をインクリメント (Codex P2 対応): 旧ワーカー結果の混入を防ぐ
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.install_new_items(items, image_metas);
         self.selected = None;
         self.checked.clear();
         self.requested.clear();
@@ -770,11 +762,10 @@ impl App {
                     self.rebuild_items_from_global_search();
                 }
                 // 「最後/最初の検索結果です」ヒントを中央に表示
-                self.fs_boundary_hint =
-                    Some(crate::ui_fullscreen::FsBoundaryHint::SearchEnd {
-                        forward,
-                        at: std::time::Instant::now(),
-                    });
+                self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::SearchEnd {
+                    forward,
+                    at: std::time::Instant::now(),
+                });
                 return;
             }
             // rebuild_items_from_global_search 済みなので visible_indices を見て
@@ -831,7 +822,11 @@ impl App {
             .or_else(|| flat.iter().position(|e| e.path == current_path));
         let Some(pos) = pos else { return };
         let next_pos = if forward {
-            if pos + 1 < flat.len() { pos + 1 } else { return }
+            if pos + 1 < flat.len() {
+                pos + 1
+            } else {
+                return;
+            }
         } else if pos > 0 {
             pos - 1
         } else {
@@ -1184,7 +1179,10 @@ mod tests {
             path: "c:/photos/x.jpg".into(),
             score: 1.0,
         });
-        let zip = state.containers.get(&PathBuf::from("c:/album.zip")).unwrap();
+        let zip = state
+            .containers
+            .get(&PathBuf::from("c:/album.zip"))
+            .unwrap();
         assert_eq!(zip.hit_count, 2);
         assert_eq!(zip.kind, SearchContainerKind::Zip);
         let folder = state.containers.get(&PathBuf::from("c:/photos")).unwrap();
@@ -1197,9 +1195,18 @@ mod tests {
     #[test]
     fn collect_hit_folders_dfs_is_preorder() {
         let hits = vec![
-            GlobalHit { path: "C:/root/a.jpg".into(), score: 1.0 },
-            GlobalHit { path: "C:/root/sub/b.jpg".into(), score: 1.0 },
-            GlobalHit { path: "C:/root/sub/deeper/c.jpg".into(), score: 1.0 },
+            GlobalHit {
+                path: "C:/root/a.jpg".into(),
+                score: 1.0,
+            },
+            GlobalHit {
+                path: "C:/root/sub/b.jpg".into(),
+                score: 1.0,
+            },
+            GlobalHit {
+                path: "C:/root/sub/deeper/c.jpg".into(),
+                score: 1.0,
+            },
         ];
         let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
         assert_eq!(
@@ -1239,7 +1246,10 @@ mod tests {
             "C:/A/sub/a3.jpg",
             "C:/B/b1.jpg",
         ] {
-            state.accumulate_hit(&GlobalHit { path: p.into(), score: 1.0 });
+            state.accumulate_hit(&GlobalHit {
+                path: p.into(),
+                score: 1.0,
+            });
         }
         let flat = build_cross_container_nav_list(&state);
         let paths: Vec<_> = flat.iter().map(|e| e.path.clone()).collect();
@@ -1293,7 +1303,10 @@ mod tests {
             "C:/root/sub/c.jpg",
             "C:/other/z.jpg", // 別ツリー, current_path 配下ではない
         ] {
-            state.accumulate_hit(&GlobalHit { path: p.into(), score: 1.0 });
+            state.accumulate_hit(&GlobalHit {
+                path: p.into(),
+                score: 1.0,
+            });
         }
         let (items, metas) = build_drilled_items(&state, Path::new("C:/root"), false);
         assert_eq!(items.len(), metas.len());

@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Condvar, Mutex,
+    mpsc,
 };
 
 /// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
@@ -138,14 +139,18 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
         let p = entry.path();
         if is_dir {
             let meta = entry.metadata().ok();
-            let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
+            let mtime = meta
+                .as_ref()
+                .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
             folders.push((GridItem::Folder(p), Some((mtime, 0))));
         } else if is_apple_double(&p) {
             // macOS/iPhone AppleDouble メタデータ — スキップ
         } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_ascii_lowercase();
             let meta = entry.metadata().ok();
-            let mtime = meta.as_ref().map_or(0, |m| crate::ui_helpers::mtime_secs(m));
+            let mtime = meta
+                .as_ref()
+                .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
             let file_size = meta.map_or(0, |m| m.len() as i64);
             if crate::folder_tree::is_recognized_image_ext(&ext_lower) {
                 all_media.push((p, false, mtime, file_size));
@@ -159,13 +164,31 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
                 crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
                 folders.push((
-                    GridItem::ConvertibleArchive { path: p, format: fmt },
+                    GridItem::ConvertibleArchive {
+                        path: p,
+                        format: fmt,
+                    },
                     Some((mtime, file_size)),
                 ));
             }
         }
     }
     ScannedDir { folders, all_media }
+}
+
+/// 「お気に入り」ダイアログ OK 時に検出する索引化フラグの遷移。
+///
+/// - `newly_on_structure`: 名前索引 false→true (bulk を起動して埋める)
+/// - `newly_off_structure`: 名前索引 true→false (search_index_db から即削除)
+/// - `newly_off_metadata`: メタ索引 true→false (fts_meta を tombstone 化)
+///
+/// metadata false→true は `sync_with_favorites` で supervisor が起動して初期
+/// スキャンを走らせるため、ここでは追跡しない。
+#[derive(Default)]
+pub(crate) struct FavoriteIndexTransitions {
+    pub newly_on_structure: Vec<(uuid::Uuid, PathBuf)>,
+    pub newly_off_structure: Vec<(uuid::Uuid, PathBuf)>,
+    pub newly_off_metadata: Vec<(uuid::Uuid, PathBuf)>,
 }
 
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
@@ -218,19 +241,22 @@ fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
         (a, b),
         (FolderNavMode::Grid, FolderNavMode::Grid)
             | (FolderNavMode::Fullscreen, FolderNavMode::Fullscreen)
-            | (FolderNavMode::Favsearch { .. }, FolderNavMode::Favsearch { .. })
+            | (
+                FolderNavMode::Favsearch { .. },
+                FolderNavMode::Favsearch { .. }
+            )
     )
 }
 
 use eframe::egui;
 
 use crate::folder_tree::{
-    is_apple_double, navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs,
-    walk_dirs_recursive, SUPPORTED_VIDEO_EXTENSIONS,
+    SUPPORTED_VIDEO_EXTENSIONS, is_apple_double, navigate_folder_with_skip, next_folder_dfs,
+    prev_folder_dfs, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
-pub(crate) use crate::thumb_loader::{CACHE_KEY_ZIP, CACHE_KEY_PDF, CACHE_KEY_FOLDER};
+pub(crate) use crate::thumb_loader::{CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_ZIP};
 
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
 fn stem_lower(path: &std::path::Path) -> String {
@@ -265,14 +291,20 @@ fn run_metadata_load(
     cancel: &AtomicBool,
 ) -> Option<MetadataLoadResult> {
     // 各段で cancel チェック。ZIP の bytes 読み → AI → EXIF → XMP の順で重い。
-    if cancel.load(Ordering::Relaxed) { return None; }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
     let (metadata, exif, xmp) = match &item {
         GridItem::Image(p) => {
             let metadata = crate::png_metadata::extract_metadata(p);
-            if cancel.load(Ordering::Relaxed) { return None; }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let exif = crate::exif_reader::read_exif(p, hidden);
-            if cancel.load(Ordering::Relaxed) { return None; }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let xmp = crate::xmp_reader::read_tweet_info(p);
             (metadata, exif, xmp)
         }
@@ -281,18 +313,27 @@ fn run_metadata_load(
             let xmp = crate::xmp_reader::read_tweet_info(p);
             (None, None, xmp)
         }
-        GridItem::ZipImage { zip_path, entry_name } => {
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => {
             // ZIP エントリは 1 回展開して bytes を 3 パーサーで共有する
             let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
-            if cancel.load(Ordering::Relaxed) { return None; }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let metadata = bytes
                 .as_ref()
                 .and_then(|b| crate::png_metadata::extract_metadata_from_bytes(b));
-            if cancel.load(Ordering::Relaxed) { return None; }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let exif = bytes
                 .as_ref()
                 .and_then(|b| crate::exif_reader::read_exif_from_bytes(b, hidden));
-            if cancel.load(Ordering::Relaxed) { return None; }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let xmp = bytes
                 .as_ref()
                 .and_then(|b| crate::xmp_reader::read_tweet_info_from_bytes(b));
@@ -301,7 +342,12 @@ fn run_metadata_load(
         _ => (None, None, None),
     };
 
-    Some(MetadataLoadResult { key, metadata, exif, xmp })
+    Some(MetadataLoadResult {
+        key,
+        metadata,
+        exif,
+        xmp,
+    })
 }
 
 /// Ctrl+F メタデータ検索のワーカー本体。UI スレッドから spawn され、結果は
@@ -317,8 +363,10 @@ fn run_metadata_search(
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)> = Vec::new();
     // スレッド内の追加分を重複読み取りなしで引くためのローカル HashMap。
-    let mut additions_lookup: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>> =
-        std::collections::HashMap::new();
+    let mut additions_lookup: std::collections::HashMap<
+        String,
+        Option<crate::xmp_reader::XmpTweetInfo>,
+    > = std::collections::HashMap::new();
     let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
         std::collections::HashMap::new();
 
@@ -330,9 +378,7 @@ fn run_metadata_search(
         let keys: Vec<String> = items
             .iter()
             .filter_map(|it| match it {
-                GridItem::Image(p) => {
-                    Some(crate::search_index_db::normalize_path(p))
-                }
+                GridItem::Image(p) => Some(crate::search_index_db::normalize_path(p)),
                 _ => None,
             })
             .collect();
@@ -350,7 +396,10 @@ fn run_metadata_search(
     // Pass 1: 構造アイテム + ZIP/PDF 系 (cheap な分類のみ、I/O なし)
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return SearchThreadResult::Done { matches, xmp_additions };
+            return SearchThreadResult::Done {
+                matches,
+                xmp_additions,
+            };
         }
         match item {
             GridItem::Folder(_)
@@ -367,7 +416,10 @@ fn run_metadata_search(
             GridItem::Image(_) | GridItem::Video(_) => {
                 // Pass 2 で処理
             }
-            GridItem::ZipImage { zip_path, entry_name } => {
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
                 if is_png_entry(entry_name) {
                     zip_png_groups
                         .entry(zip_path.clone())
@@ -391,7 +443,10 @@ fn run_metadata_search(
     // Pass 2: Image/Video — cheap hay で決まらなければ XMP を lazy 読み取り (ファイル I/O)
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return SearchThreadResult::Done { matches, xmp_additions };
+            return SearchThreadResult::Done {
+                matches,
+                xmp_additions,
+            };
         }
         let (path, is_image) = match item {
             GridItem::Image(p) => (p, true),
@@ -409,7 +464,11 @@ fn run_metadata_search(
                 continue;
             }
         }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         // 最初は PNG tEXt だけ読む (cheap hay)。EXIF / XMP は NeedsMore の時だけ lazy 読み。
         // EXIF を fallback にも含める方針 (Codex round-8 Should-fix #1) はその branch で実施。
         let meta_text = if is_image && is_png_path(path) {
@@ -463,12 +522,18 @@ fn run_metadata_search(
     // Pass 3: ZIP 内 PNG — ZIP を 1 回開いてまとめて処理 (ファイル I/O)
     for (zip_path, entries) in zip_png_groups {
         if cancel.load(Ordering::Relaxed) {
-            return SearchThreadResult::Done { matches, xmp_additions };
+            return SearchThreadResult::Done {
+                matches,
+                xmp_additions,
+            };
         }
         let mut direct_archive = crate::zip_loader::open_archive(&zip_path).ok();
         for (idx, entry_name) in entries {
             if cancel.load(Ordering::Relaxed) {
-                return SearchThreadResult::Done { matches, xmp_additions };
+                return SearchThreadResult::Done {
+                    matches,
+                    xmp_additions,
+                };
             }
             let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
             let bytes_result = if is_nested {
@@ -492,7 +557,10 @@ fn run_metadata_search(
         }
     }
 
-    SearchThreadResult::Done { matches, xmp_additions }
+    SearchThreadResult::Done {
+        matches,
+        xmp_additions,
+    }
 }
 
 /// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
@@ -549,11 +617,11 @@ fn exif_hay(info: &crate::exif_reader::ExifInfo) -> String {
     }
     out
 }
-use crate::fs_animation::{decode_apng_frames, decode_gif_frames, FsCacheEntry, FsLoadResult};
+use crate::fs_animation::{FsCacheEntry, FsLoadResult, decode_apng_frames, decode_gif_frames};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
-    build_and_save_one, compute_display_px, encode_and_save, process_load_request, CacheDecision, LoadRequest,
-    ThumbMsg,
+    CacheDecision, LoadRequest, ThumbMsg, build_and_save_one, compute_display_px, encode_and_save,
+    process_load_request,
 };
 use crate::ui_helpers::{
     draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
@@ -578,7 +646,9 @@ pub(crate) enum EraseTool {
 }
 
 impl Default for EraseTool {
-    fn default() -> Self { EraseTool::Brush }
+    fn default() -> Self {
+        EraseTool::Brush
+    }
 }
 
 /// Ctrl+ドラッグ中の基準状態。ドラッグ開始時に記録し、以降のマウス位置との
@@ -586,7 +656,10 @@ impl Default for EraseTool {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ShiftDragState {
     /// 筆ツール: 起点 + 基準半径。
-    BrushSize { origin: (f32, f32), base_radius: f32 },
+    BrushSize {
+        origin: (f32, f32),
+        base_radius: f32,
+    },
     /// 縦線/横線ツール: 起点 + 基準傾き + 基準の線端点。
     LineAdjust {
         origin: (f32, f32),
@@ -874,7 +947,8 @@ pub struct App {
     /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
     /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
-    pub(crate) fs_pending: std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
+    pub(crate) fs_pending:
+        std::collections::HashMap<usize, (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64)>,
 
     /// fs_load ワーカーがヘッダ解析だけで取得した先行寸法 (fullscreen 用)。
     /// `FsLoadResult::DimsOnly` を受信すると登録され、本体 (`Static` など) で
@@ -890,7 +964,7 @@ pub struct App {
     /// `(idx, FsLoadResult, load_seq)` — FIFO 順で消化する。
     pub(crate) fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
 
-    /// items が差し替わるたびにインクリメントする世代カウンタ (Codex P2 対応)。
+    /// items が差し替わるたびにインクリメントする世代カウンタ。
     /// `LoadRequest::items_gen` → worker → `ThumbMsg::items_gen` を経由して poll_thumbnails
     /// まで透過され、世代が一致しないメッセージは破棄される。
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
@@ -984,8 +1058,7 @@ pub struct App {
     /// 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
     pub(crate) archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
-    pub(crate) archive_convert:
-        Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
+    pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
     /// 変換済みアーカイブを開いているとき、元 (7z/LZH) のパスを保持する。
     /// `current_folder` はキャッシュ ZIP を指しているので、UI 表示 / BS /
     /// Ctrl+↑↓ / タイトルバーでは本フィールドを優先する。
@@ -996,8 +1069,7 @@ pub struct App {
     /// 「変換済みアーカイブキャッシュ管理」ウィンドウの表示フラグ
     pub(crate) show_archive_cache_manager: bool,
     /// 開いたとき / 削除操作後にリフレッシュされる一覧キャッシュ。
-    pub(crate) archive_cache_rows:
-        Option<Vec<crate::archive_cache::ArchiveCacheEntry>>,
+    pub(crate) archive_cache_rows: Option<Vec<crate::archive_cache::ArchiveCacheEntry>>,
     /// チェックボックス選択状態。行 index が key。
     pub(crate) archive_cache_selection: std::collections::HashSet<usize>,
     /// 削除操作後のメッセージ
@@ -1021,21 +1093,21 @@ pub struct App {
     pub(crate) favsearch: FavSearchState,
     /// インデックス作成ダイアログの状態
     pub(crate) ic: crate::ui_dialogs::index_creator::IndexCreatorState,
-    /// `auto_index_current_folder` が最後に処理したパス (同じフォルダの再ロード時に書き込みを省く)
-    pub(crate) last_auto_indexed: Option<PathBuf>,
 
     // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
     /// フルスクリーンでメタデータパネルを表示するか
     pub(crate) show_metadata_panel: bool,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
-    pub(crate) metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
+    pub(crate) metadata_cache:
+        std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
     /// EXIF キャッシュ: 正規化キー → パース結果 (None = EXIF なし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     /// XMP (mXD X/Twitter メタデータ) キャッシュ: 正規化キー → パース結果。
     /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
-    pub(crate) xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    pub(crate) xmp_cache:
+        std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -1200,9 +1272,17 @@ pub struct App {
     /// 分析パネル: ドラッグ中の開始オフセット
     pub(crate) analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     /// 分析パネル: フィルター/グレースケールのキャッシュテクスチャ
-    pub(crate) analysis_overlay_cache: Option<(egui::TextureHandle, u8, Option<[u8; 4]>, f32, egui::Vec2, usize)>,
+    pub(crate) analysis_overlay_cache: Option<(
+        egui::TextureHandle,
+        u8,
+        Option<[u8; 4]>,
+        f32,
+        egui::Vec2,
+        usize,
+    )>,
     /// 分析パネル: ヒストグラムキャッシュ (zoom, pan, image_idx) → 結果
-    pub(crate) analysis_hist_cache: Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
+    pub(crate) analysis_hist_cache:
+        Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
     /// 分析パネル: SVマップキャッシュ
     pub(crate) analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
 
@@ -1267,7 +1347,13 @@ pub struct App {
     /// 高速切替のために 2 バリアントを保持する)。
     pub(crate) ai_upscale_cache: std::collections::HashMap<(usize, u8), FsCacheEntry>,
     /// アップスケール処理中: (item_idx, bg_mode) → (キャンセルトークン, 受信チャネル)
-    pub(crate) ai_upscale_pending: std::collections::HashMap<(usize, u8), (Arc<AtomicBool>, mpsc::Receiver<crate::ai::upscale::UpscaleResult>)>,
+    pub(crate) ai_upscale_pending: std::collections::HashMap<
+        (usize, u8),
+        (
+            Arc<AtomicBool>,
+            mpsc::Receiver<crate::ai::upscale::UpscaleResult>,
+        ),
+    >,
     /// 画像タイプ分類キャッシュ: item_idx → カテゴリ
     pub(crate) ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
     /// バージョン情報ダイアログ
@@ -1282,7 +1368,8 @@ pub struct App {
     pub(crate) adjustment_mode: bool,
     /// ページ個別の補正パラメータ: item_idx → AdjustParams
     /// ここに登録されていないページはグローバル (settings.global_preset) が適用される。
-    pub(crate) adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    pub(crate) adjustment_page_params:
+        std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
@@ -1398,7 +1485,9 @@ impl Default for App {
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
         let settings = crate::settings::Settings::load();
         let ai_upscale_enabled = settings.ai_upscale_enabled;
-        let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
+        let ai_upscale_model_override = settings
+            .ai_upscale_model_override
+            .as_deref()
             .and_then(crate::ai::ModelKind::from_str);
         // 全文検索インデクサを起動。DB/index オープンに失敗した場合 (ディスク容量不足等)
         // は None となり、Ctrl+G 機能は無効だが他の機能は継続動作する。
@@ -1512,7 +1601,6 @@ impl Default for App {
                 .map(Arc::new),
             favsearch: FavSearchState::default(),
             ic: crate::ui_dialogs::index_creator::IndexCreatorState::default(),
-            last_auto_indexed: None,
             show_metadata_panel: false,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
@@ -1854,7 +1942,10 @@ impl App {
                         None,
                         lf_seq,
                         &[
-                            ("ms", serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0)),
+                            (
+                                "ms",
+                                serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0),
+                            ),
                             ("kind", serde_json::Value::from("zip")),
                             ("path", serde_json::Value::from(lf_path_disp)),
                         ],
@@ -1871,7 +1962,10 @@ impl App {
                         None,
                         lf_seq,
                         &[
-                            ("ms", serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0)),
+                            (
+                                "ms",
+                                serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0),
+                            ),
                             ("kind", serde_json::Value::from("pdf")),
                             ("path", serde_json::Value::from(lf_path_disp)),
                         ],
@@ -1935,7 +2029,10 @@ impl App {
                 "lf_sort",
                 None,
                 lf_seq,
-                &[("ms", serde_json::Value::from(sort_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(sort_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
@@ -1949,7 +2046,10 @@ impl App {
                 "lf_dup_filter",
                 None,
                 lf_seq,
-                &[("ms", serde_json::Value::from(dup_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(dup_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
@@ -1992,9 +2092,8 @@ impl App {
             })
             .collect();
 
-        // v0.8.0 Phase 2c: 訪問時自動索引化は廃止。お気に入り編集で
-        // 「名前」フル索引化 ON にした favorite のみ name_bulk_indexer 経由で全走査する
-        // (検索結果が閲覧履歴に左右されないようにするため)。
+        // 訪問時自動索引化は廃止。「名前」フル索引化 ON のお気に入りのみ
+        // name_bulk_indexer 経由で全走査する (検索結果が閲覧履歴に依らないように)。
 
         let items_len = items.len();
         self.start_loading_items(path, items, image_metas, existing_keys, video_items);
@@ -2006,7 +2105,10 @@ impl App {
                 None,
                 lf_seq,
                 &[
-                    ("ms", serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0)),
+                    (
+                        "ms",
+                        serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
                     ("kind", serde_json::Value::from("folder")),
                     ("path", serde_json::Value::from(lf_path_disp)),
                     ("items", serde_json::Value::from(items_len)),
@@ -2015,86 +2117,78 @@ impl App {
         }
     }
 
-    /// `path` がいずれかのお気に入り配下であれば、`items` の Folder/ZipFile/PdfFile を
-    /// 検索インデックス DB に upsert する (ブラウズ時の軽量更新)。
-    #[allow(dead_code)] // v0.8.0 Phase 2c 以降は未使用 (訪問時自動索引化は廃止)。
-    // 「お気に入り編集 > 名前 索引化 ON」で全走査 + watcher 経由で維持する方式に移行したため、
-    // 閲覧に追従した追記は行わない (検索結果の予測可能性のため, docs/search-expansion-design.md 更新)。
-    // 将来 watcher 実装を待つ間の移行期には呼び出し元を復活させる余地を残すために残置。
-    fn auto_index_current_folder(&mut self, path: &std::path::Path, items: &[GridItem]) {
-        let Some(db) = self.search_index_db.clone() else { return };
-        let Some(fav_root) = self.find_favorite_root(path) else { return };
-        // 同じフォルダへの往復ナビ時に SQLite 書き込みを回避する
-        if self.last_auto_indexed.as_deref() == Some(path) {
-            return;
+    /// 「お気に入り」ダイアログの pre-edit snapshot と現在値を突き合わせて、
+    /// 索引化フラグの遷移を分類する。snapshot が無い (ダイアログを開いていない)
+    /// ときは空の結果。
+    pub(crate) fn compute_favorite_index_transitions(&self) -> FavoriteIndexTransitions {
+        let mut t = FavoriteIndexTransitions::default();
+        let Some(pre) = self.favorites_pre_edit_snapshot.as_ref() else {
+            return t;
+        };
+        for fav in &self.settings.favorites {
+            let (old_structure, old_metadata) = pre.get(&fav.id).copied().unwrap_or((false, false));
+            if !old_structure && fav.auto_index_structure {
+                t.newly_on_structure.push((fav.id, fav.path.clone()));
+            }
+            if old_structure && !fav.auto_index_structure {
+                t.newly_off_structure.push((fav.id, fav.path.clone()));
+            }
+            if old_metadata && !fav.auto_index_metadata {
+                t.newly_off_metadata.push((fav.id, fav.path.clone()));
+            }
         }
-
-        let entries: Vec<crate::search_index_db::IndexEntry> = items
-            .iter()
-            .filter_map(|it| {
-                let (p, kind) = match it {
-                    GridItem::Folder(p) => (p, crate::search_index_db::IndexKind::Folder),
-                    GridItem::ZipFile(p) => (p, crate::search_index_db::IndexKind::ZipFile),
-                    GridItem::PdfFile(p) => (p, crate::search_index_db::IndexKind::PdfFile),
-                    _ => return None,
-                };
-                let name = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some(crate::search_index_db::IndexEntry {
-                    path: p.clone(),
-                    display_name: name,
-                    kind,
-                    mtime: 0,
-                })
-            })
-            .collect();
-        if let Err(e) = db.upsert_children(&fav_root, path, &entries) {
-            crate::logger::log(format!("auto-index upsert failed: {e}"));
-        }
-        self.last_auto_indexed = Some(path.to_path_buf());
+        t
     }
 
-    /// 名前索引フル索引化フラグが ON の favorite について、まだ索引が空なら
-    /// バックグラウンドでバルクスキャンを 1 回走らせる。「お気に入り」ダイアログの
-    /// OK 時に呼ばれる (v0.8.0 Phase 2b)。
-    ///
-    /// - `count_for_favorite` が 0 のもの → 未索引とみなしてバルク起動
-    /// - 1 件でも入っていればスキップ (更新は閲覧時追記と自動で追いつく)
-    /// - ユーザーが明示的に再走査したいときは「名前索引を一括作成…」ボタンから
-    pub(crate) fn trigger_name_bulk_for_enabled_favorites(&mut self) {
+    /// true→false 遷移の索引データを削除する (`sync_with_favorites` より前に呼ぶ)。
+    /// 名前索引は `search_index_db` の直接削除、メタ索引は fts_meta 行を tombstone 化
+    /// (Tantivy doc 削除は次回起動時 reconciliation が処理)。
+    pub(crate) fn apply_favorite_index_cleanup(&self, t: &FavoriteIndexTransitions) {
+        for (_, path) in &t.newly_off_structure {
+            if let Some(db) = self.search_index_db.as_ref() {
+                if let Err(e) = db.clear_for_favorite(path) {
+                    crate::logger::log(format!(
+                        "favorites: clear name index for {} failed: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if let Some(mgr) = self.indexer_manager.as_ref() {
+            for (id, _) in &t.newly_off_metadata {
+                mgr.purge_favorite_metadata(*id);
+            }
+        }
+        // favorites_pre_edit_snapshot は OK 完了のシグナル。次回 open 時に再取得する。
+    }
+
+    /// false→true 遷移について、未索引の favorite のバックグラウンドバルクを起動する。
+    /// 冪等性: 既に search_index_db にエントリがあるものはスキップ。
+    pub(crate) fn apply_favorite_index_bulk_start(&mut self, t: &FavoriteIndexTransitions) {
         let Some(db) = self.search_index_db.clone() else {
             return;
         };
-        for fav in &self.settings.favorites {
-            if !fav.auto_index_structure {
-                continue;
-            }
-            // 既に索引登録があればスキップ (冪等化)
-            match db.count_for_favorite(&fav.path) {
-                Ok(0) => {}
-                Ok(_) => continue,
+        for (_, fav_path) in &t.newly_on_structure {
+            match db.has_any_for_favorite(fav_path) {
+                Ok(true) => continue,
+                Ok(false) => {}
                 Err(e) => {
                     crate::logger::log(format!(
-                        "trigger_name_bulk: count_for_favorite failed for {}: {e}",
-                        fav.path.display()
+                        "favorites: has_any_for_favorite({}) failed: {e}",
+                        fav_path.display()
                     ));
                     continue;
                 }
             }
-            let fav_path = fav.path.clone();
             let db_clone = Arc::clone(&db);
-            // 「お気に入り」ダイアログからの起動なので、キャンセルトークンは引き回さず
-            // プロセス終了まで走らせる (数秒〜数十秒で完了する想定)。
             let cancel = Arc::new(AtomicBool::new(false));
             crate::logger::log(format!(
-                "trigger_name_bulk: starting bulk for {}",
+                "favorites: starting name bulk for {}",
                 fav_path.display()
             ));
-            let _ = crate::name_bulk_indexer::spawn_bulk(fav_path, db_clone, cancel);
+            let _ = crate::name_bulk_indexer::spawn_bulk(fav_path.clone(), db_clone, cancel);
         }
+        self.favorites_pre_edit_snapshot = None;
     }
 
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
@@ -2147,7 +2241,9 @@ impl App {
             return;
         }
         let root = self.favsearch.nav_stack[0].clone();
-        let Some(current) = self.favsearch.nav_stack.last().cloned() else { return };
+        let Some(current) = self.favsearch.nav_stack.last().cloned() else {
+            return;
+        };
         self.start_folder_nav(current, forward, FolderNavMode::Favsearch { root });
     }
 
@@ -2267,9 +2363,15 @@ impl App {
             return;
         }
 
-        let Some(db) = self.search_index_db.clone() else { return };
-        let fav_roots: Vec<PathBuf> =
-            self.settings.favorites.iter().map(|f| f.path.clone()).collect();
+        let Some(db) = self.search_index_db.clone() else {
+            return;
+        };
+        let fav_roots: Vec<PathBuf> = self
+            .settings
+            .favorites
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -2278,10 +2380,14 @@ impl App {
         std::thread::Builder::new()
             .name("favsearch-db".to_string())
             .spawn(move || {
-                if cancel_w.load(Ordering::Relaxed) { return; }
+                if cancel_w.load(Ordering::Relaxed) {
+                    return;
+                }
                 let result = db.search(&query, &fav_roots);
                 // キャンセル後の送信は無意味なので捨てる (UI 側 pending も None に戻っている)
-                if cancel_w.load(Ordering::Relaxed) { return; }
+                if cancel_w.load(Ordering::Relaxed) {
+                    return;
+                }
                 let _ = tx.send(result);
             })
             .ok();
@@ -2291,7 +2397,9 @@ impl App {
 
     /// お気に入り検索の結果をポーリングする。
     pub(crate) fn poll_favsearch(&mut self) {
-        let Some(pending) = self.favsearch_pending.as_ref() else { return };
+        let Some(pending) = self.favsearch_pending.as_ref() else {
+            return;
+        };
         match pending.rx.try_recv() {
             Ok(Ok(results)) => {
                 self.favsearch_pending = None;
@@ -2326,9 +2434,18 @@ impl App {
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .filter_map(|it| match it {
-                GridItem::Folder(p) => p.file_name()?.to_str().map(|n| format!("{}{n}", CACHE_KEY_FOLDER)),
-                GridItem::ZipFile(p) => p.file_name()?.to_str().map(|n| format!("{}{n}", CACHE_KEY_ZIP)),
-                GridItem::PdfFile(p) => p.file_name()?.to_str().map(|n| format!("{}{n}", CACHE_KEY_PDF)),
+                GridItem::Folder(p) => p
+                    .file_name()?
+                    .to_str()
+                    .map(|n| format!("{}{n}", CACHE_KEY_FOLDER)),
+                GridItem::ZipFile(p) => p
+                    .file_name()?
+                    .to_str()
+                    .map(|n| format!("{}{n}", CACHE_KEY_ZIP)),
+                GridItem::PdfFile(p) => p
+                    .file_name()?
+                    .to_str()
+                    .map(|n| format!("{}{n}", CACHE_KEY_PDF)),
                 _ => None,
             })
             .collect();
@@ -2352,7 +2469,10 @@ impl App {
     /// 各グループに `ZipSeparator` を先頭に挿入する。グループ間はディレクトリ名順、
     /// グループ内は現在の sort_order でソートされる。
     pub fn load_zip_as_folder(&mut self, zip_path: PathBuf) {
-        crate::logger::log(format!("=== load_zip_as_folder: {} ===", zip_path.display()));
+        crate::logger::log(format!(
+            "=== load_zip_as_folder: {} ===",
+            zip_path.display()
+        ));
 
         // 別の外側 ZIP に切り替える場合、古いネスト ZIP バイト列キャッシュを破棄する。
         // 同じ ZIP を開き直す場合も一度クリアして、壊れたエントリが居残らないようにする。
@@ -2377,10 +2497,8 @@ impl App {
         crate::logger::log(format!("  zip: {} image entries", entries.len()));
 
         // ── サブディレクトリごとにグループ化 ──
-        let mut groups: std::collections::BTreeMap<
-            String,
-            Vec<crate::zip_loader::ZipImageEntry>,
-        > = std::collections::BTreeMap::new();
+        let mut groups: std::collections::BTreeMap<String, Vec<crate::zip_loader::ZipImageEntry>> =
+            std::collections::BTreeMap::new();
         for e in entries {
             let dir = crate::zip_loader::entry_dir(&e.entry_name).to_string();
             groups.entry(dir).or_default().push(e);
@@ -2411,7 +2529,9 @@ impl App {
                 } else {
                     dir.clone()
                 };
-                items.push(GridItem::ZipSeparator { dir_display: display });
+                items.push(GridItem::ZipSeparator {
+                    dir_display: display,
+                });
                 image_metas.push(None);
             }
             for e in list {
@@ -2434,7 +2554,10 @@ impl App {
     /// 結果は `poll_pdf_enumerate` が次フレーム以降にポーリングして処理する。
     /// パスワード付き PDF の場合はダイアログで入力を求める。
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
-        crate::logger::log(format!("=== load_pdf_as_folder: {} ===", pdf_path.display()));
+        crate::logger::log(format!(
+            "=== load_pdf_as_folder: {} ===",
+            pdf_path.display()
+        ));
 
         // PDF を開く際、直前に ZIP を見ていた可能性があるためネスト ZIP キャッシュを破棄する。
         crate::zip_loader::clear_nested_cache();
@@ -2455,10 +2578,7 @@ impl App {
         // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
 
         // ── 非同期でページ列挙をリクエスト ──
-        let rx = crate::pdf_loader::enumerate_pages_async(
-            &pdf_path,
-            password.as_deref(),
-        );
+        let rx = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
         self.pdf_enumerate_pending = Some((pdf_path.clone(), password, rx));
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
@@ -2482,8 +2602,11 @@ impl App {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
                 self.start_loading_items(
-                    path, Vec::new(), Vec::new(),
-                    std::collections::HashSet::new(), Vec::new(),
+                    path,
+                    Vec::new(),
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    Vec::new(),
                 );
                 return;
             }
@@ -2545,8 +2668,11 @@ impl App {
                 self.fs_nav_after_pdf_enumerate = None;
                 crate::logger::log(format!("  pdf enumerate failed: {e}"));
                 self.start_loading_items(
-                    pdf_path, Vec::new(), Vec::new(),
-                    std::collections::HashSet::new(), Vec::new(),
+                    pdf_path,
+                    Vec::new(),
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    Vec::new(),
                 );
             }
         }
@@ -2594,13 +2720,17 @@ impl App {
                 "sli_sidecar_flush",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(sidecar_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(sidecar_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
         // ── 履歴保存 + 旧タスクキャンセル + 状態リセット ──
         if let Some(cur) = self.current_folder.clone() {
-            self.folder_history.insert(cur, (self.scroll_offset_y, self.selected));
+            self.folder_history
+                .insert(cur, (self.scroll_offset_y, self.selected));
         }
         self.close_fullscreen();
 
@@ -2638,13 +2768,7 @@ impl App {
         self.scroll_to_selected = false;
         self.scroll_hint.store(0, Ordering::Relaxed);
 
-        self.items = items;
-        self.image_metas = image_metas;
-        self.thumbnails = (0..self.items.len())
-            .map(|_| ThumbnailState::Pending)
-            .collect();
-        // 世代をインクリメント (Codex P2 対応): 旧ワーカー結果の混入を防ぐ
-        self.items_generation = self.items_generation.wrapping_add(1);
+        self.install_new_items(items, image_metas);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -2652,7 +2776,10 @@ impl App {
                 None,
                 sli_seq,
                 &[
-                    ("ms", serde_json::Value::from(assign_t0.elapsed().as_secs_f64() * 1000.0)),
+                    (
+                        "ms",
+                        serde_json::Value::from(assign_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
                     ("items", serde_json::Value::from(self.items.len())),
                 ],
             );
@@ -2678,9 +2805,18 @@ impl App {
                 None,
                 sli_seq,
                 &[
-                    ("ms", serde_json::Value::from(clear_t0.elapsed().as_secs_f64() * 1000.0)),
-                    ("texture_backlog", serde_json::Value::from(texture_backlog_len)),
-                    ("fs_upload_backlog", serde_json::Value::from(fs_upload_backlog_len)),
+                    (
+                        "ms",
+                        serde_json::Value::from(clear_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "texture_backlog",
+                        serde_json::Value::from(texture_backlog_len),
+                    ),
+                    (
+                        "fs_upload_backlog",
+                        serde_json::Value::from(fs_upload_backlog_len),
+                    ),
                 ],
             );
         }
@@ -2696,11 +2832,16 @@ impl App {
                 "sli_prewarm_rating",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(prewarm_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(prewarm_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
         // 見開きモード: DB から読み込み、なければデフォルト値
-        self.spread_mode = self.spread_db.as_ref()
+        self.spread_mode = self
+            .spread_db
+            .as_ref()
             .and_then(|db| db.get(&source_path))
             .unwrap_or(self.settings.default_spread_mode);
         self.spread_popup_open = false;
@@ -2748,7 +2889,10 @@ impl App {
                 "sli_sidecar_import",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(sidecar_import_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(sidecar_import_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
@@ -2772,7 +2916,10 @@ impl App {
                 "sli_adjustment_db",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(adj_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(adj_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
@@ -2797,7 +2944,10 @@ impl App {
                 "sli_mask_db",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(mask_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(mask_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
         // visible_indices はアイテム設定後 (下の行) に再計算される
@@ -2816,18 +2966,22 @@ impl App {
                 "sli_catalog_open",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(catalog_open_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(catalog_open_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
         let catalog_load_t0 = std::time::Instant::now();
-        let cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>> =
-            Arc::new(std::sync::RwLock::new(
-                catalog_arc
-                    .as_ref()
-                    .and_then(|c| c.load_all().ok())
-                    .unwrap_or_default(),
-            ));
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(
+            catalog_arc
+                .as_ref()
+                .and_then(|c| c.load_all().ok())
+                .unwrap_or_default(),
+        ));
         let catalog_entries = cache_map.read().unwrap().len();
         crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
         if crate::perf::is_enabled() {
@@ -2837,7 +2991,10 @@ impl App {
                 None,
                 sli_seq,
                 &[
-                    ("ms", serde_json::Value::from(catalog_load_t0.elapsed().as_secs_f64() * 1000.0)),
+                    (
+                        "ms",
+                        serde_json::Value::from(catalog_load_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
                     ("entries", serde_json::Value::from(catalog_entries)),
                 ],
             );
@@ -2857,7 +3014,10 @@ impl App {
                 "sli_catalog_delete_missing",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(catalog_del_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(catalog_del_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
@@ -2870,7 +3030,8 @@ impl App {
             self.last_cell_h,
             self.last_pixels_per_point,
         );
-        self.display_px_shared.store(initial_display_px, Ordering::Relaxed);
+        self.display_px_shared
+            .store(initial_display_px, Ordering::Relaxed);
         crate::logger::log(format!(
             "  display_px = {initial_display_px}  cache_policy = {}",
             self.settings.cache_policy.label()
@@ -2900,7 +3061,10 @@ impl App {
                 "sli_spawn_workers",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(spawn_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(spawn_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
         }
 
@@ -2914,9 +3078,11 @@ impl App {
         } else if let Some(name) = self.select_after_load.take() {
             // 履歴がない場合のフォールバック: 指定名のアイテムを探して選択
             let name_lower = name.to_lowercase();
-            if let Some(idx) = self.items.iter().position(|item| {
-                item.name().to_lowercase() == name_lower
-            }) {
+            if let Some(idx) = self
+                .items
+                .iter()
+                .position(|item| item.name().to_lowercase() == name_lower)
+            {
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
             }
@@ -2933,7 +3099,10 @@ impl App {
                 "sli_settings_save",
                 None,
                 sli_seq,
-                &[("ms", serde_json::Value::from(save_t0.elapsed().as_secs_f64() * 1000.0))],
+                &[(
+                    "ms",
+                    serde_json::Value::from(save_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
             crate::perf::event(
                 "nav",
@@ -2941,11 +3110,35 @@ impl App {
                 None,
                 sli_seq,
                 &[
-                    ("ms", serde_json::Value::from(sli_t0.elapsed().as_secs_f64() * 1000.0)),
+                    (
+                        "ms",
+                        serde_json::Value::from(sli_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
                     ("items", serde_json::Value::from(items_len)),
                 ],
             );
         }
+    }
+
+    /// items / image_metas / thumbnails を新しい並びで差し替え、items_generation を bump する。
+    ///
+    /// 世代更新と thumbnails の Pending 初期化を 1 箇所に集約するためのヘルパ。
+    /// 呼び出し側 (`start_loading_items` / `replace_search_view_items`) はこの後で
+    /// セッションの残り (キャッシュ clear 等) を進める。世代 bump を忘れると、旧
+    /// ワーカーの ThumbMsg が新 items の同じ idx に適用されてサムネが化ける race
+    /// が起きる。
+    pub(crate) fn install_new_items(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+    ) {
+        debug_assert_eq!(items.len(), image_metas.len());
+        self.items = items;
+        self.image_metas = image_metas;
+        self.thumbnails = (0..self.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        self.items_generation = self.items_generation.wrapping_add(1);
     }
 
     /// condvar.wait() 中の全ワーカーを起床させる。
@@ -2970,7 +3163,9 @@ impl App {
         cancel: Arc<AtomicBool>,
         reload_queue: Arc<NotifyQueue>,
         heavy_io_queue: Arc<NotifyQueue>,
-        cache_map: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
+        cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
     ) {
         let total_threads = self.settings.parallelism.thread_count();
@@ -3029,7 +3224,9 @@ impl App {
                                     .iter()
                                     .enumerate()
                                     .min_by_key(|(_, r)| {
-                                        crate::thumb_loader::worker_priority_key(r.priority, r.idx, vis, vis_end)
+                                        crate::thumb_loader::worker_priority_key(
+                                            r.priority, r.idx, vis, vis_end,
+                                        )
                                     })
                                     .map(|(pos, _)| pos)
                                     .unwrap();
@@ -3040,7 +3237,9 @@ impl App {
                         }
                     };
 
-                    let Some(req) = req else { break; };
+                    let Some(req) = req else {
+                        break;
+                    };
 
                     let ks = ks_w.load(Ordering::Relaxed);
                     let ke = ke_w.load(Ordering::Relaxed);
@@ -3078,7 +3277,11 @@ impl App {
                         continue;
                     }
                     let vis = hint_w.load(Ordering::Relaxed);
-                    let dist = if req.idx < vis { vis - req.idx } else { req.idx - vis };
+                    let dist = if req.idx < vis {
+                        vis - req.idx
+                    } else {
+                        req.idx - vis
+                    };
                     crate::logger::log(format!(
                         "  {tag} pick idx={:>4} pri={} dist={dist:>4}  {}",
                         req.idx,
@@ -3101,11 +3304,19 @@ impl App {
                     }
                     let display_px = display_px_w.load(Ordering::Relaxed);
                     process_load_request(
-                        &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
-                        thumb_px, thumb_quality, display_px, cache_decision, &done_w,
+                        &req,
+                        &cache_map_w,
+                        &tx_w,
+                        catalog_w.as_deref(),
+                        thumb_px,
+                        thumb_quality,
+                        display_px,
+                        cache_decision,
+                        &done_w,
                         &stats_w,
                         Some(&cancel_w),
-                        &ks_w, &ke_w,
+                        &ks_w,
+                        &ke_w,
                     );
                 }
                 crate::logger::log(format!("  {tag} stopped"));
@@ -3201,7 +3412,9 @@ impl App {
             let mut fail_count = 0u32;
 
             while !remaining.is_empty() {
-                if cancel.load(Ordering::Relaxed) { break; }
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 // worker_priority_key と同じロジックで可視アイテムを tier 0、
                 // その他を距離順に並べる。next_attempt が未来のアイテムは除外。
@@ -3232,8 +3445,13 @@ impl App {
                     std::thread::sleep(delay);
                     continue;
                 };
-                let PendingVideo { idx, path, file_size, retries, .. } =
-                    remaining.swap_remove(best_pos);
+                let PendingVideo {
+                    idx,
+                    path,
+                    file_size,
+                    retries,
+                    ..
+                } = remaining.swap_remove(best_pos);
                 let fname = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -3254,8 +3472,7 @@ impl App {
                         "override",
                     )
                 } else {
-                    let (img, diag) =
-                        crate::video_thumb::get_video_thumbnail(&path, thumb_size);
+                    let (img, diag) = crate::video_thumb::get_video_thumbnail(&path, thumb_size);
                     // 失敗ケースだけ Shell の生データをログする (毎回出すと動画多数の
                     // フォルダで mimageviewer.log が肥大するため)。成功時は下の
                     // 最終 OK 行に dims を載せる。
@@ -3376,9 +3593,9 @@ impl App {
         // バックログ + チャネルから受信した結果を統合して処理する。
         // バックログを先に処理（既にデコード済みなので優先）。
         let backlog = std::mem::take(&mut self.texture_backlog);
-        let drain = backlog.into_iter().chain(
-            std::iter::from_fn(|| self.rx.try_recv().ok())
-        );
+        let drain = backlog
+            .into_iter()
+            .chain(std::iter::from_fn(|| self.rx.try_recv().ok()));
 
         for msg in drain {
             let crate::thumb_loader::ThumbMsg {
@@ -3391,8 +3608,9 @@ impl App {
                 input_seq: req_input_seq,
                 items_gen: msg_items_gen,
             } = msg;
-            // Codex P2 対応: 世代が一致しないメッセージ (旧 items 由来) は破棄する。
-            // msg_items_gen == 0 は未設定 (動画スレッド等の特別経路) なので常に受理。
+            // 世代不一致 (旧 items 由来) のメッセージは破棄する。items が差し替わった
+            // あとに旧ワーカーの結果が同じ idx の新 items に適用されると画像が化ける。
+            // msg_items_gen == 0 は動画スレッド等の未設定経路 (常に受理)。
             if msg_items_gen != 0 && msg_items_gen != self.items_generation {
                 // 旧 worker の結果: thumbnails[i] は新 items の画像なので触らない。
                 // requested からも引かない (このメッセージは新 items と無関係)。
@@ -3489,10 +3707,8 @@ impl App {
                         }
                         let [w, h] = color_image.size;
                         let rendered_at_px = w.max(h) as u32;
-                        let prev_state_was_loaded = matches!(
-                            self.thumbnails[i],
-                            ThumbnailState::Loaded { .. }
-                        );
+                        let prev_state_was_loaded =
+                            matches!(self.thumbnails[i], ThumbnailState::Loaded { .. });
                         let upload_t0 = std::time::Instant::now();
                         // サムネ補正用に `color_image` を Arc で保持してからテクスチャ化する。
                         // テクスチャアップロードは ColorImage を消費するので、保持用に clone が必要。
@@ -3565,7 +3781,12 @@ impl App {
                             }
                             if !self.vis_all_logged {
                                 let all_loaded = (self.last_vis_range.0..self.last_vis_range.1)
-                                    .all(|j| matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. })));
+                                    .all(|j| {
+                                        matches!(
+                                            self.thumbnails.get(j),
+                                            Some(ThumbnailState::Loaded { .. })
+                                        )
+                                    });
                                 if all_loaded {
                                     crate::logger::log(format!(
                                         "[vis] all_loaded vis=[{}..{}) +{elapsed_ms:.1}ms after settle",
@@ -3750,7 +3971,9 @@ impl App {
         //
         //     可視範囲 (1 ページ分) のリクエストは priority=true でマークし、
         //     ワーカーが先読み要求より常に先に処理するようにする。
-        let Some(queue_arc) = self.reload_queue.clone() else { return; };
+        let Some(queue_arc) = self.reload_queue.clone() else {
+            return;
+        };
 
         // 可視範囲の raw index 範囲を計算 (1 ページ分 + 上下 1 行のマージン)
         let vis_visible_start = vis_first.saturating_sub(cols);
@@ -3791,7 +4014,9 @@ impl App {
             let all_loaded_now = (visible_raw_start..visible_raw_end)
                 .all(|j| matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. })));
             if all_loaded_now {
-                crate::logger::log("[vis] all_loaded 0ms after settle (already cached)".to_string());
+                crate::logger::log(
+                    "[vis] all_loaded 0ms after settle (already cached)".to_string(),
+                );
                 self.vis_first_logged = true;
                 self.vis_all_logged = true;
             }
@@ -3815,7 +4040,16 @@ impl App {
                 continue;
             };
             let Some(mut req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, false, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort), self.settings.folder_thumb_depth)
+                make_load_request(
+                    item,
+                    i,
+                    mtime,
+                    file_size,
+                    false,
+                    self.pdf_current_password.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                )
             }) else {
                 continue;
             };
@@ -3838,7 +4072,10 @@ impl App {
                     &[
                         ("idx", serde_json::Value::from(i)),
                         ("priority", serde_json::Value::from(req.priority)),
-                        ("queue", serde_json::Value::from(if is_heavy { "heavy" } else { "regular" })),
+                        (
+                            "queue",
+                            serde_json::Value::from(if is_heavy { "heavy" } else { "regular" }),
+                        ),
                     ],
                 );
             }
@@ -3848,7 +4085,11 @@ impl App {
                 new_regular.push(req);
             }
         }
-        let new_hi = new_regular.iter().chain(new_heavy.iter()).filter(|r| r.priority).count();
+        let new_hi = new_regular
+            .iter()
+            .chain(new_heavy.iter())
+            .filter(|r| r.priority)
+            .count();
         let new_lo = new_regular.len() + new_heavy.len() - new_hi;
         let t3 = frame_t0.elapsed();
         let regular_count = new_regular.len();
@@ -3998,8 +4239,7 @@ impl App {
             self.last_scroll_change_time = std::time::Instant::now();
             self.last_scroll_offset_y_tracked = self.scroll_offset_y;
         }
-        let scroll_idle =
-            self.last_scroll_change_time.elapsed().as_secs_f64() >= SCROLL_IDLE_SECS;
+        let scroll_idle = self.last_scroll_change_time.elapsed().as_secs_f64() >= SCROLL_IDLE_SECS;
         if !scroll_idle {
             return;
         }
@@ -4017,7 +4257,9 @@ impl App {
         if !self.requested.is_empty() {
             return;
         }
-        let Some(queue_arc) = self.reload_queue.clone() else { return; };
+        let Some(queue_arc) = self.reload_queue.clone() else {
+            return;
+        };
         {
             let (ref mtx, _) = *queue_arc;
             let q = mtx.lock().unwrap();
@@ -4062,9 +4304,7 @@ impl App {
                     let target_px = source_long_edge
                         .map(|src| src.min(current_display_px))
                         .unwrap_or(current_display_px);
-                    *from_cache
-                        || (*rendered_at_px as u64) * 5
-                            < (target_px as u64) * 4
+                    *from_cache || (*rendered_at_px as u64) * 5 < (target_px as u64) * 4
                 }
                 _ => false,
             };
@@ -4075,7 +4315,16 @@ impl App {
                 continue;
             };
             let Some(req) = self.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size, true, self.pdf_current_password.as_deref(), Some(self.settings.folder_thumb_sort), self.settings.folder_thumb_depth)
+                make_load_request(
+                    item,
+                    i,
+                    mtime,
+                    file_size,
+                    true,
+                    self.pdf_current_password.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                )
             }) else {
                 continue;
             };
@@ -4120,7 +4369,11 @@ impl App {
             if idx < keep_start || idx >= keep_end {
                 continue;
             }
-            if is_upgrade { in_upgrade += 1; } else { in_normal += 1; }
+            if is_upgrade {
+                in_upgrade += 1;
+            } else {
+                in_normal += 1;
+            }
         }
         (in_normal, in_upgrade)
     }
@@ -4201,8 +4454,23 @@ impl App {
             })
         });
 
-        let (right, left, down, up, enter, backspace, _ctrl_up_raw, _ctrl_down_raw,
-             home, end, page_up, page_down, space, key_r, key_l) = ctx.input(|i| {
+        let (
+            right,
+            left,
+            down,
+            up,
+            enter,
+            backspace,
+            _ctrl_up_raw,
+            _ctrl_down_raw,
+            home,
+            end,
+            page_up,
+            page_down,
+            space,
+            key_r,
+            key_l,
+        ) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -4243,7 +4511,9 @@ impl App {
         let vi_len = vi.len();
 
         if vi_len > 0 {
-            let sel = self.selected.unwrap_or_else(|| vi.first().copied().unwrap_or(0));
+            let sel = self
+                .selected
+                .unwrap_or_else(|| vi.first().copied().unwrap_or(0));
             // visible_indices 内での現在位置
             let vis_pos = vi.iter().position(|&i| i == sel).unwrap_or(0);
             let cell_h = self.last_cell_h.max(1.0);
@@ -4343,13 +4613,21 @@ impl App {
             // (チェック済みアイテムがあれば一括、なければ選択にのみ)
             {
                 let rating_key = ctx.input(|i| {
-                    if i.key_pressed(egui::Key::F1) { Some(1u8) }
-                    else if i.key_pressed(egui::Key::F2) { Some(2) }
-                    else if i.key_pressed(egui::Key::F3) { Some(3) }
-                    else if i.key_pressed(egui::Key::F4) { Some(4) }
-                    else if i.key_pressed(egui::Key::F5) { Some(5) }
-                    else if i.key_pressed(egui::Key::F6) { Some(0) }
-                    else { None }
+                    if i.key_pressed(egui::Key::F1) {
+                        Some(1u8)
+                    } else if i.key_pressed(egui::Key::F2) {
+                        Some(2)
+                    } else if i.key_pressed(egui::Key::F3) {
+                        Some(3)
+                    } else if i.key_pressed(egui::Key::F4) {
+                        Some(4)
+                    } else if i.key_pressed(egui::Key::F5) {
+                        Some(5)
+                    } else if i.key_pressed(egui::Key::F6) {
+                        Some(0)
+                    } else {
+                        None
+                    }
                 });
                 if let Some(stars) = rating_key {
                     self.apply_rating_to_selection(stars);
@@ -4361,9 +4639,13 @@ impl App {
             // フルスクリーン側 (ui_fullscreen.rs) と揃えて修飾キー無しのみ受け付ける。
             {
                 let slot_key = ctx.input_mut(|i| {
-                    if i.consume_key(egui::Modifiers::NONE, egui::Key::F7) { Some(1usize) }
-                    else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) { Some(2) }
-                    else { None }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::F7) {
+                        Some(1usize)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
+                        Some(2)
+                    } else {
+                        None
+                    }
                 });
                 if let Some(slot) = slot_key {
                     self.apply_slot_to_selection(slot);
@@ -4373,15 +4655,24 @@ impl App {
             // Ctrl+1〜0: 補正プリセットスロットを一括適用
             {
                 const SLOT_KEYS: [egui::Key; 10] = [
-                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
-                    egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8,
-                    egui::Key::Num9, egui::Key::Num0,
+                    egui::Key::Num1,
+                    egui::Key::Num2,
+                    egui::Key::Num3,
+                    egui::Key::Num4,
+                    egui::Key::Num5,
+                    egui::Key::Num6,
+                    egui::Key::Num7,
+                    egui::Key::Num8,
+                    egui::Key::Num9,
+                    egui::Key::Num0,
                 ];
                 let preset_slot = ctx.input_mut(|i| {
-                    if !i.modifiers.ctrl { return None; }
-                    SLOT_KEYS.iter().position(|k| {
-                        i.consume_key(egui::Modifiers::CTRL, *k)
-                    })
+                    if !i.modifiers.ctrl {
+                        return None;
+                    }
+                    SLOT_KEYS
+                        .iter()
+                        .position(|k| i.consume_key(egui::Modifiers::CTRL, *k))
                 });
                 if let Some(slot) = preset_slot {
                     self.apply_slot_to_grid_selection(slot);
@@ -4432,10 +4723,7 @@ impl App {
                             // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
                             // → drill-down view に切り替え (v1: 1 階層のみ, docs §10.3)
                             let p = path.clone();
-                            let is_zip = matches!(
-                                kind,
-                                crate::grid_item::SearchContainerKind::Zip
-                            );
+                            let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
@@ -4609,13 +4897,9 @@ impl App {
                 );
             }
             let outcome = if forward {
-                navigate_folder_with_skip(
-                    &current, next_folder_dfs, skip_limit, Some(&cancel_w),
-                )
+                navigate_folder_with_skip(&current, next_folder_dfs, skip_limit, Some(&cancel_w))
             } else {
-                navigate_folder_with_skip(
-                    &current, prev_folder_dfs, skip_limit, Some(&cancel_w),
-                )
+                navigate_folder_with_skip(&current, prev_folder_dfs, skip_limit, Some(&cancel_w))
             };
             let dfs_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -4636,7 +4920,12 @@ impl App {
                             None,
                             perf_seq,
                             &[
-                                ("ms", serde_json::Value::from(scan_t0.elapsed().as_secs_f64() * 1000.0)),
+                                (
+                                    "ms",
+                                    serde_json::Value::from(
+                                        scan_t0.elapsed().as_secs_f64() * 1000.0,
+                                    ),
+                                ),
                                 ("folders", serde_json::Value::from(s.folders.len())),
                                 ("media", serde_json::Value::from(s.all_media.len())),
                             ],
@@ -4667,12 +4956,18 @@ impl App {
                     perf_seq,
                     &[
                         ("ms", serde_json::Value::from(dfs_ms)),
-                        ("total_ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
+                        (
+                            "total_ms",
+                            serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                        ),
                         ("forward", serde_json::Value::from(forward)),
                         ("mode", serde_json::Value::from(perf_mode)),
                         ("cancelled", serde_json::Value::from(cancelled)),
                         ("found", serde_json::Value::from(outcome.is_some())),
-                        ("hit_image_folder", serde_json::Value::from(hit_image_folder)),
+                        (
+                            "hit_image_folder",
+                            serde_json::Value::from(hit_image_folder),
+                        ),
                         ("hit_path", serde_json::Value::from(hit)),
                         ("pre_scanned", serde_json::Value::from(scanned.is_some())),
                     ],
@@ -4705,9 +5000,7 @@ impl App {
         //   Grid / Fullscreen → self.current_folder
         //   Favsearch        → favsearch.nav_stack.last() (= 現在位置)
         let current = match mode {
-            FolderNavMode::Favsearch { .. } => {
-                self.favsearch.nav_stack.last().cloned()
-            }
+            FolderNavMode::Favsearch { .. } => self.favsearch.nav_stack.last().cloned(),
             _ => self.current_folder.clone(),
         };
         if let Some(cur) = current {
@@ -4767,26 +5060,33 @@ impl App {
                     ("forward", serde_json::Value::from(result.forward)),
                     ("mode", serde_json::Value::from(apply_mode_tag)),
                     ("found", serde_json::Value::from(result.path.is_some())),
-                    ("hit_image_folder", serde_json::Value::from(result.hit_image_folder)),
+                    (
+                        "hit_image_folder",
+                        serde_json::Value::from(result.hit_image_folder),
+                    ),
                 ],
             );
         }
         // 内部関数として展開して、全 early-return 前に emit_end を呼ぶ。
-        let emit_end = |t0: std::time::Instant, seq: u64, mode: &'static str, reason: &'static str| {
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "nav",
-                    "apply_end",
-                    None,
-                    seq,
-                    &[
-                        ("ms", serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0)),
-                        ("mode", serde_json::Value::from(mode)),
-                        ("reason", serde_json::Value::from(reason)),
-                    ],
-                );
-            }
-        };
+        let emit_end =
+            |t0: std::time::Instant, seq: u64, mode: &'static str, reason: &'static str| {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "nav",
+                        "apply_end",
+                        None,
+                        seq,
+                        &[
+                            (
+                                "ms",
+                                serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                            ("mode", serde_json::Value::from(mode)),
+                            ("reason", serde_json::Value::from(reason)),
+                        ],
+                    );
+                }
+            };
         let Some(path) = result.path else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
@@ -4798,12 +5098,11 @@ impl App {
                 FolderNavMode::Fullscreen => {
                     // DFS がツリー末端に達した: フルスクリーンは維持して中央にヒントを出す。
                     // 累積された連打は打ち切る (次回以降も同じ末端に向かうだけ)。
-                    self.fs_boundary_hint = Some(
-                        crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
+                    self.fs_boundary_hint =
+                        Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
                             forward: result.forward,
                             at: std::time::Instant::now(),
-                        },
-                    );
+                        });
                     self.pending_folder_nav_steps = 0;
                 }
                 FolderNavMode::Grid => {}
@@ -4815,12 +5114,10 @@ impl App {
         // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
         if matches!(result.mode, FolderNavMode::Fullscreen) && !result.hit_image_folder {
-            self.fs_boundary_hint = Some(
-                crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
-                    forward: result.forward,
-                    at: std::time::Instant::now(),
-                },
-            );
+            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
+                forward: result.forward,
+                at: std::time::Instant::now(),
+            });
             self.pending_folder_nav_steps = 0;
             emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
             return;
@@ -4892,17 +5189,26 @@ impl App {
     fn find_fullscreen_nav_target(&mut self, forward: bool) -> Option<usize> {
         let find_image = |app: &Self, fwd: bool| -> Option<usize> {
             let items = &app.items;
-            let is_image_like = |i: usize| matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                | Some(GridItem::Video(_))
-                | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::PdfPage { .. })
-            );
+            let is_image_like = |i: usize| {
+                matches!(
+                    items.get(i),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::Video(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::PdfPage { .. })
+                )
+            };
             if fwd {
-                app.visible_indices.iter().copied().find(|&i| is_image_like(i))
+                app.visible_indices
+                    .iter()
+                    .copied()
+                    .find(|&i| is_image_like(i))
             } else {
-                app.visible_indices.iter().copied().rev().find(|&i| is_image_like(i))
+                app.visible_indices
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|&i| is_image_like(i))
             }
         };
 
@@ -4918,9 +5224,16 @@ impl App {
             }
         };
         let virtual_path = if forward {
-            self.visible_indices.iter().copied().find_map(|i| pick_virtual(i, &self.items))
+            self.visible_indices
+                .iter()
+                .copied()
+                .find_map(|i| pick_virtual(i, &self.items))
         } else {
-            self.visible_indices.iter().copied().rev().find_map(|i| pick_virtual(i, &self.items))
+            self.visible_indices
+                .iter()
+                .copied()
+                .rev()
+                .find_map(|i| pick_virtual(i, &self.items))
         };
         let virtual_path = virtual_path?;
         self.load_folder(virtual_path);
@@ -4952,7 +5265,10 @@ impl App {
             if ctrl {
                 // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
-                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(crate::settings::MIN_GRID_COLS as i32, crate::settings::MAX_GRID_COLS as i32) as usize;
+                let new_cols = (self.settings.grid_cols as i32 + delta).clamp(
+                    crate::settings::MIN_GRID_COLS as i32,
+                    crate::settings::MAX_GRID_COLS as i32,
+                ) as usize;
                 if new_cols != self.settings.grid_cols {
                     self.settings.grid_cols = new_cols;
                     self.settings.save();
@@ -4962,11 +5278,9 @@ impl App {
                 // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
                 let direction = -scroll_delta_y.signum();
                 let prev_offset = self.scroll_offset_y;
-                self.scroll_offset_y =
-                    (self.scroll_offset_y + direction * cell_h).max(0.0);
+                self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h).max(0.0);
                 // 行境界にスナップ
-                self.scroll_offset_y =
-                    (self.scroll_offset_y / cell_h).round() * cell_h;
+                self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
                 if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
                     self.bump_input_seq(
                         "grid_wheel",
@@ -5000,33 +5314,35 @@ impl App {
             self.scroll_offset_y = row_top;
         } else if row_bottom > vp_bottom {
             // 選択行が下に隠れている → 選択行が最下行になるようスクロール
-            self.scroll_offset_y =
-                (row_bottom - self.last_viewport_h).max(0.0);
+            self.scroll_offset_y = (row_bottom - self.last_viewport_h).max(0.0);
             // 行境界にスナップ
-            self.scroll_offset_y =
-                (self.scroll_offset_y / cell_h).ceil() * cell_h;
+            self.scroll_offset_y = (self.scroll_offset_y / cell_h).ceil() * cell_h;
         }
     }
 
     /// ウィンドウ位置を記録する（最小化・最大化中は更新しない）。
     fn track_window_rect(&mut self, ctx: &egui::Context) {
-        let (outer_rect, inner_rect, pixels_per_point, minimized, maximized) =
-            ctx.input(|i| {
-                let vp = i.viewport();
-                (
-                    vp.outer_rect,
-                    vp.inner_rect,
-                    i.pixels_per_point,
-                    vp.minimized.unwrap_or(false),
-                    vp.maximized.unwrap_or(false),
-                )
-            });
+        let (outer_rect, inner_rect, pixels_per_point, minimized, maximized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (
+                vp.outer_rect,
+                vp.inner_rect,
+                i.pixels_per_point,
+                vp.minimized.unwrap_or(false),
+                vp.maximized.unwrap_or(false),
+            )
+        });
 
         if outer_rect.is_none() && self.last_outer_rect.is_none() {
             crate::logger::log(format!(
                 "[viewport] outer_rect=None  inner_rect={:?}  pixels_per_point={pixels_per_point:.2}",
-                inner_rect.map(|r| format!("pos=({:.0},{:.0}) size={:.0}x{:.0}",
-                    r.min.x, r.min.y, r.width(), r.height()))
+                inner_rect.map(|r| format!(
+                    "pos=({:.0},{:.0}) size={:.0}x{:.0}",
+                    r.min.x,
+                    r.min.y,
+                    r.width(),
+                    r.height()
+                ))
             ));
         }
 
@@ -5035,15 +5351,20 @@ impl App {
 
         if !minimized && !maximized {
             if let Some(rect) = best_rect {
-                let changed = self.last_outer_rect
-                    .map(|r| (r.min - rect.min).length() > 1.0
-                             || (r.size() - rect.size()).length() > 1.0)
+                let changed = self
+                    .last_outer_rect
+                    .map(|r| {
+                        (r.min - rect.min).length() > 1.0 || (r.size() - rect.size()).length() > 1.0
+                    })
                     .unwrap_or(true);
                 if changed {
                     crate::logger::log(format!(
                         "[viewport] rect updated: pos=({:.0},{:.0}) size={:.0}x{:.0}  \
                          outer={:?}  inner={:?}  ppp={pixels_per_point:.2}",
-                        rect.min.x, rect.min.y, rect.width(), rect.height(),
+                        rect.min.x,
+                        rect.min.y,
+                        rect.width(),
+                        rect.height(),
                         outer_rect.map(|_| "Some"),
                         inner_rect.map(|_| "Some"),
                     ));
@@ -5056,8 +5377,11 @@ impl App {
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused || self.any_dialog_open() || self.address_has_focus
-            || self.search_has_focus || self.favsearch.has_focus
+        if !main_focused
+            || self.any_dialog_open()
+            || self.address_has_focus
+            || self.search_has_focus
+            || self.favsearch.has_focus
             || self.fullscreen_idx.is_some()
         {
             return;
@@ -5079,15 +5403,11 @@ impl App {
         let ctrl_v = {
             #[cfg(windows)]
             {
-                let ctrl = unsafe {
-                    windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11)
-                };
-                let v = unsafe {
-                    windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56)
-                };
-                (ctrl & (0x8000u16 as i16)) != 0
-                    && (v & (0x8000u16 as i16)) != 0
-                    && (v & 1) != 0
+                let ctrl =
+                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) };
+                let v =
+                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56) };
+                (ctrl & (0x8000u16 as i16)) != 0 && (v & (0x8000u16 as i16)) != 0 && (v & 1) != 0
             }
             #[cfg(not(windows))]
             false
@@ -5214,11 +5534,24 @@ impl App {
         let item = self.items.get(idx)?;
         let key = match item {
             GridItem::Image(p) | GridItem::Video(p) => crate::adjustment_db::normalize_path(p),
-            GridItem::ZipImage { zip_path, entry_name } => {
-                format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                format!(
+                    "{}::{}",
+                    crate::adjustment_db::normalize_path(zip_path),
+                    entry_name.to_lowercase()
+                )
             }
-            GridItem::PdfPage { pdf_path, page_num, .. } => {
-                format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => {
+                format!(
+                    "{}::page_{}",
+                    crate::adjustment_db::normalize_path(pdf_path),
+                    page_num
+                )
             }
             _ => return None,
         };
@@ -5232,7 +5565,9 @@ impl App {
     /// UI 側 (`ui_metadata_panel`) はキャッシュヒット時のみ内容を表示するので、
     /// 結果到着まではパネルは空表示のまま (None 扱い) になる。
     fn start_metadata_load(&mut self, idx: usize) {
-        let Some(key) = self.metadata_cache_key(idx) else { return };
+        let Some(key) = self.metadata_cache_key(idx) else {
+            return;
+        };
 
         // 全キャッシュが既に揃っているなら何もしない
         let ai_hit = self.metadata_cache.contains_key(&key);
@@ -5262,7 +5597,9 @@ impl App {
             .name(format!("metadata-load-{idx}"))
             .spawn(move || {
                 let result = run_metadata_load(key_owned, item, &hidden, &cancel_w);
-                if cancel_w.load(Ordering::Relaxed) { return; }
+                if cancel_w.load(Ordering::Relaxed) {
+                    return;
+                }
                 if let Some(r) = result {
                     let _ = tx.send(r);
                 }
@@ -5275,7 +5612,9 @@ impl App {
     /// メタデータ読み込み結果を非同期に受信してキャッシュに投入する。
     /// 毎フレーム呼ばれる。ヒット時はパネルが自動的に内容を表示する。
     pub(crate) fn poll_metadata_load(&mut self) {
-        let Some(pending) = self.metadata_pending.as_ref() else { return };
+        let Some(pending) = self.metadata_pending.as_ref() else {
+            return;
+        };
         match pending.rx.try_recv() {
             Ok(r) => {
                 self.metadata_cache.insert(r.key.clone(), r.metadata);
@@ -5322,7 +5661,8 @@ impl App {
             .iter()
             .filter_map(|item| {
                 if let GridItem::Folder(p) = item {
-                    return p.file_name()
+                    return p
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .map(|n| n.to_lowercase());
                 }
@@ -5350,28 +5690,28 @@ impl App {
 
     /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
     /// 画像ファイルを動画のサムネイルソースとして記録する。
-    fn filter_video_image_duplicates(
-        &mut self,
-        all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
-    ) {
-        let video_stems: std::collections::HashSet<String> = all_media.iter()
+    fn filter_video_image_duplicates(&mut self, all_media: &mut Vec<(PathBuf, bool, i64, i64)>) {
+        let video_stems: std::collections::HashSet<String> = all_media
+            .iter()
             .filter(|(_, is_video, _, _)| *is_video)
             .map(|(p, _, _, _)| stem_lower(p))
             .collect();
 
-        if video_stems.is_empty() { return; }
+        if video_stems.is_empty() {
+            return;
+        }
 
         for (p, is_video, _, _) in all_media.iter() {
-            if *is_video { continue; }
+            if *is_video {
+                continue;
+            }
             let stem = stem_lower(p);
             if video_stems.contains(&stem) {
                 self.video_thumb_overrides.insert(stem, p.clone());
             }
         }
 
-        all_media.retain(|(p, is_video, _, _)| {
-            *is_video || !video_stems.contains(&stem_lower(p))
-        });
+        all_media.retain(|(p, is_video, _, _)| *is_video || !video_stems.contains(&stem_lower(p)));
     }
 
     /// 同名画像の拡張子重複: 優先度リストに基づいてフィルタ。
@@ -5384,13 +5724,24 @@ impl App {
             std::collections::HashMap::new();
 
         for (i, (p, is_video, _, _)) in all_media.iter().enumerate() {
-            if *is_video { continue; }
+            if *is_video {
+                continue;
+            }
             let stem = stem_lower(p);
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            let prio = priority.iter().position(|e| e == &ext).unwrap_or(usize::MAX);
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let prio = priority
+                .iter()
+                .position(|e| e == &ext)
+                .unwrap_or(usize::MAX);
             match best.get(&stem) {
                 Some(&(existing_prio, _)) if prio >= existing_prio => {}
-                _ => { best.insert(stem, (prio, i)); }
+                _ => {
+                    best.insert(stem, (prio, i));
+                }
             }
         }
 
@@ -5398,11 +5749,14 @@ impl App {
         let mut stem_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for (p, is_video, _, _) in all_media.iter() {
-            if *is_video { continue; }
+            if *is_video {
+                continue;
+            }
             *stem_counts.entry(stem_lower(p)).or_insert(0) += 1;
         }
 
-        let keep_indices: std::collections::HashSet<usize> = best.iter()
+        let keep_indices: std::collections::HashSet<usize> = best
+            .iter()
             .filter(|(stem, _)| stem_counts.get(stem.as_str()).copied().unwrap_or(0) > 1)
             .map(|(_, &(_, idx))| idx)
             .collect();
@@ -5412,9 +5766,13 @@ impl App {
             all_media.retain(|(p, is_video, _, _)| {
                 let current_i = i;
                 i += 1;
-                if *is_video { return true; }
+                if *is_video {
+                    return true;
+                }
                 let stem = stem_lower(p);
-                if stem_counts.get(&stem).copied().unwrap_or(0) <= 1 { return true; }
+                if stem_counts.get(&stem).copied().unwrap_or(0) <= 1 {
+                    return true;
+                }
                 keep_indices.contains(&current_i)
             });
         }
@@ -5528,9 +5886,14 @@ impl App {
     /// 寝るため、ワーカーが送信しても UI が拾いに来ない)。呼び出し元の update() が
     /// ctx.request_repaint() を最後に呼ぶのでそちらに任せる (個別 ctx 保持不要)。
     pub(crate) fn poll_search(&mut self) {
-        let Some(pending) = self.search_pending.as_ref() else { return };
+        let Some(pending) = self.search_pending.as_ref() else {
+            return;
+        };
         match pending.rx.try_recv() {
-            Ok(SearchThreadResult::Done { matches, xmp_additions }) => {
+            Ok(SearchThreadResult::Done {
+                matches,
+                xmp_additions,
+            }) => {
                 // ワーカーが新規に読み取った XMP をキャッシュにマージする。
                 // 既存キーは上書きしない (並行して別スレッドが先に書き込んだケースを尊重)。
                 for (key, xmp) in xmp_additions {
@@ -5730,13 +6093,18 @@ impl App {
             // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
             self.erase_base_cache.remove(idx);
             self.fs_cache.remove(idx);
-            self.save_mask_raw_with_sidecar(*idx, &compressed, &slot_vectors, vectors_json.as_deref(), sw, sh);
+            self.save_mask_raw_with_sidecar(
+                *idx,
+                &compressed,
+                &slot_vectors,
+                vectors_json.as_deref(),
+                sw,
+                sh,
+            );
         }
 
         self.checked.clear();
-        crate::logger::log(format!(
-            "[ERASE] Bulk apply slot {slot} to {total} items"
-        ));
+        crate::logger::log(format!("[ERASE] Bulk apply slot {slot} to {total} items"));
         self.show_feedback_toast(format!("[スロット{slot} を{total}枚に適用]"));
     }
 
@@ -5768,12 +6136,18 @@ impl App {
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
         let (path, zip_entry, pdf_page, pdf_password) = match self.items.get(idx) {
             Some(GridItem::Image(p)) => (p.clone(), None, None, None),
-            Some(GridItem::ZipImage { zip_path, entry_name }) => {
-                (zip_path.clone(), Some(entry_name.clone()), None, None)
-            }
-            Some(GridItem::PdfPage { pdf_path, page_num, .. }) => {
-                (pdf_path.clone(), None, Some(*page_num), self.pdf_current_password.clone())
-            }
+            Some(GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            }) => (zip_path.clone(), Some(entry_name.clone()), None, None),
+            Some(GridItem::PdfPage {
+                pdf_path, page_num, ..
+            }) => (
+                pdf_path.clone(),
+                None,
+                Some(*page_num),
+                self.pdf_current_password.clone(),
+            ),
             _ => return,
         };
 
@@ -5790,14 +6164,24 @@ impl App {
         let pdf_ct_tx = self.pdf_content_type_tx.clone();
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
-        self.fs_pending.insert(idx, (Arc::clone(&cancel), rx, perf_seq));
+        self.fs_pending
+            .insert(idx, (Arc::clone(&cancel), rx, perf_seq));
         if crate::perf::is_enabled() {
-            crate::perf::event("fs", "load_begin", perf_key.as_deref(), perf_seq, &[
-                ("idx", serde_json::Value::from(idx)),
-                ("is_pdf", serde_json::Value::from(pdf_page.is_some())),
-                ("is_zip", serde_json::Value::from(zip_entry.is_some())),
-                ("priority", serde_json::Value::from(format!("{pdf_priority:?}"))),
-            ]);
+            crate::perf::event(
+                "fs",
+                "load_begin",
+                perf_key.as_deref(),
+                perf_seq,
+                &[
+                    ("idx", serde_json::Value::from(idx)),
+                    ("is_pdf", serde_json::Value::from(pdf_page.is_some())),
+                    ("is_zip", serde_json::Value::from(zip_entry.is_some())),
+                    (
+                        "priority",
+                        serde_json::Value::from(format!("{pdf_priority:?}")),
+                    ),
+                ],
+            );
         }
         let perf_key_worker = perf_key.clone();
 
@@ -5873,12 +6257,21 @@ impl App {
             if let Some(page_num) = pdf_page {
                 let target_px = 4096u32;
                 let mut pdf_exit = "pdf_ok";
-                match crate::pdf_loader::render_page(&path, page_num, target_px, pdf_password.as_deref(), Some(cancel.clone()), pdf_priority) {
+                match crate::pdf_loader::render_page(
+                    &path,
+                    page_num,
+                    target_px,
+                    pdf_password.as_deref(),
+                    Some(cancel.clone()),
+                    pdf_priority,
+                ) {
                     Ok((img, content_type)) => {
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
                             "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}  {:?}",
-                            img.width(), img.height(), content_type
+                            img.width(),
+                            img.height(),
+                            content_type
                         ));
                         // GPU テクスチャ上限に収まらない巨大レンダ結果をここで縮小しておく。
                         // (request_pdf_rerender は 8192 に clamp 済なので通常は no-op)
@@ -5887,12 +6280,18 @@ impl App {
                         let (w, h) = (img.width(), img.height());
                         let ci = dynamic_image_to_color_image(&img);
                         if crate::perf::is_enabled() {
-                            crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
-                                ("ms", serde_json::Value::from(elapsed)),
-                                ("format", serde_json::Value::from("pdf")),
-                                ("w", serde_json::Value::from(w)),
-                                ("h", serde_json::Value::from(h)),
-                            ]);
+                            crate::perf::event(
+                                "fs",
+                                "decode_end",
+                                perf_key_worker.as_deref(),
+                                perf_seq,
+                                &[
+                                    ("ms", serde_json::Value::from(elapsed)),
+                                    ("format", serde_json::Value::from("pdf")),
+                                    ("w", serde_json::Value::from(w)),
+                                    ("h", serde_json::Value::from(h)),
+                                ],
+                            );
                         }
                         let _ = tx.send(FsLoadResult::Static { ci, source_dims });
                         // content_type をメインスレッドに送る
@@ -5902,15 +6301,25 @@ impl App {
                         if cancel.load(Ordering::Relaxed) {
                             crate::logger::log(format!("  fs pdf render cancelled  {name}"));
                             if crate::perf::is_enabled() {
-                                crate::perf::event("fs", "decode_cancel", perf_key_worker.as_deref(), perf_seq, &[]);
+                                crate::perf::event(
+                                    "fs",
+                                    "decode_cancel",
+                                    perf_key_worker.as_deref(),
+                                    perf_seq,
+                                    &[],
+                                );
                             }
                             pdf_exit = "pdf_cancel";
                         } else {
                             crate::logger::log(format!("  fs pdf render FAIL: {e}  {name}"));
                             if crate::perf::is_enabled() {
-                                crate::perf::event("fs", "decode_fail", perf_key_worker.as_deref(), perf_seq, &[
-                                    ("format", serde_json::Value::from("pdf")),
-                                ]);
+                                crate::perf::event(
+                                    "fs",
+                                    "decode_fail",
+                                    perf_key_worker.as_deref(),
+                                    perf_seq,
+                                    &[("format", serde_json::Value::from("pdf"))],
+                                );
                             }
                             let _ = tx.send(FsLoadResult::Failed);
                             pdf_exit = "pdf_fail";
@@ -5926,13 +6335,15 @@ impl App {
                 match crate::zip_loader::read_entry_bytes(&path, entry_name) {
                     Ok(b) => Some(b),
                     Err(e) => {
-                        crate::logger::log(format!(
-                            "  fs zip read FAIL: {e}  {name}"
-                        ));
+                        crate::logger::log(format!("  fs zip read FAIL: {e}  {name}"));
                         if crate::perf::is_enabled() {
-                            crate::perf::event("fs", "decode_fail", perf_key_worker.as_deref(), perf_seq, &[
-                                ("format", serde_json::Value::from("zip_read")),
-                            ]);
+                            crate::perf::event(
+                                "fs",
+                                "decode_fail",
+                                perf_key_worker.as_deref(),
+                                perf_seq,
+                                &[("format", serde_json::Value::from("zip_read"))],
+                            );
                         }
                         emit_exit("zip_read_fail");
                         return;
@@ -5951,11 +6362,17 @@ impl App {
                         frames.len()
                     ));
                     if crate::perf::is_enabled() {
-                        crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
-                            ("ms", serde_json::Value::from(elapsed)),
-                            ("format", serde_json::Value::from("gif_anim")),
-                            ("frames", serde_json::Value::from(frames.len())),
-                        ]);
+                        crate::perf::event(
+                            "fs",
+                            "decode_end",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[
+                                ("ms", serde_json::Value::from(elapsed)),
+                                ("format", serde_json::Value::from("gif_anim")),
+                                ("frames", serde_json::Value::from(frames.len())),
+                            ],
+                        );
                     }
                     let _ = tx.send(FsLoadResult::Animated(frames));
                     emit_exit("gif_anim");
@@ -5972,11 +6389,17 @@ impl App {
                         frames.len()
                     ));
                     if crate::perf::is_enabled() {
-                        crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
-                            ("ms", serde_json::Value::from(elapsed)),
-                            ("format", serde_json::Value::from("png_anim")),
-                            ("frames", serde_json::Value::from(frames.len())),
-                        ]);
+                        crate::perf::event(
+                            "fs",
+                            "decode_end",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[
+                                ("ms", serde_json::Value::from(elapsed)),
+                                ("format", serde_json::Value::from("png_anim")),
+                                ("frames", serde_json::Value::from(frames.len())),
+                            ],
+                        );
                     }
                     let _ = tx.send(FsLoadResult::Animated(frames));
                     emit_exit("png_anim");
@@ -5991,14 +6414,18 @@ impl App {
                 let hint = zip_entry.as_deref().unwrap_or("");
                 match image::load_from_memory(&bytes) {
                     Ok(img) => Ok(img),
-                    Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
-                        Some(img) => Ok(img),
-                        // フルスクリーン画像ロードは現在表示中のため priority=true
-                        None => match crate::susie_loader::decode_bytes(hint, &bytes, true, None) {
-                            Ok(img) => Ok(img),
-                            Err(_) => Err(e),
-                        },
-                    },
+                    Err(e) => {
+                        match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
+                            Some(img) => Ok(img),
+                            // フルスクリーン画像ロードは現在表示中のため priority=true
+                            None => {
+                                match crate::susie_loader::decode_bytes(hint, &bytes, true, None) {
+                                    Ok(img) => Ok(img),
+                                    Err(_) => Err(e),
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 match image::open(&path) {
@@ -6034,12 +6461,18 @@ impl App {
                         "  fs load: {elapsed:.0}ms  idx={idx}  {name}  {w}x{h}"
                     ));
                     if crate::perf::is_enabled() {
-                        crate::perf::event("fs", "decode_end", perf_key_worker.as_deref(), perf_seq, &[
-                            ("ms", serde_json::Value::from(elapsed)),
-                            ("format", serde_json::Value::from(ext.clone())),
-                            ("w", serde_json::Value::from(w)),
-                            ("h", serde_json::Value::from(h)),
-                        ]);
+                        crate::perf::event(
+                            "fs",
+                            "decode_end",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[
+                                ("ms", serde_json::Value::from(elapsed)),
+                                ("format", serde_json::Value::from(ext.clone())),
+                                ("w", serde_json::Value::from(w)),
+                                ("h", serde_json::Value::from(h)),
+                            ],
+                        );
                     }
                     let _ = tx.send(FsLoadResult::Static { ci, source_dims });
                     emit_exit("static_ok");
@@ -6047,9 +6480,13 @@ impl App {
                 Err(e) => {
                     crate::logger::log(format!("  fs load FAIL: {e}  {name}"));
                     if crate::perf::is_enabled() {
-                        crate::perf::event("fs", "decode_fail", perf_key_worker.as_deref(), perf_seq, &[
-                            ("format", serde_json::Value::from(ext.clone())),
-                        ]);
+                        crate::perf::event(
+                            "fs",
+                            "decode_fail",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[("format", serde_json::Value::from(ext.clone()))],
+                        );
                     }
                     // UI が「読込中...」のまま固まらないよう、失敗を明示的に通知する
                     let _ = tx.send(FsLoadResult::Failed);
@@ -6065,9 +6502,16 @@ impl App {
     /// UI スレッドを一切ブロックしない。
     pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32) {
         let (pdf_path, page_num, password, content_type) = match self.items.get(idx) {
-            Some(GridItem::PdfPage { pdf_path, page_num, content_type }) => {
-                (pdf_path.clone(), *page_num, self.pdf_current_password.clone(), *content_type)
-            }
+            Some(GridItem::PdfPage {
+                pdf_path,
+                page_num,
+                content_type,
+            }) => (
+                pdf_path.clone(),
+                *page_num,
+                self.pdf_current_password.clone(),
+                *content_type,
+            ),
             _ => return,
         };
 
@@ -6105,22 +6549,30 @@ impl App {
 
         // ワーカーに非同期リクエスト (UI スレッドをブロックしない)
         let (cancel, render_rx) = crate::pdf_loader::render_page_async(
-            &pdf_path, page_num, target_px, password.as_deref(),
+            &pdf_path,
+            page_num,
+            target_px,
+            password.as_deref(),
         );
 
         // render_page_async は DynamicImage チャネルを返すが、fs_pending は
         // FsLoadResult チャネルを期待するため、ブリッジスレッドで変換する
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
         let perf_seq = self.input_seq;
-        self.fs_pending.insert(idx, (Arc::clone(&cancel), fs_rx, perf_seq));
+        self.fs_pending
+            .insert(idx, (Arc::clone(&cancel), fs_rx, perf_seq));
 
         std::thread::spawn(move || {
             match render_rx.recv() {
                 Ok(Ok((img, _content_type))) => {
-                    if cancel.load(Ordering::Relaxed) { return; }
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
                     crate::logger::log(format!(
                         "  pdf rerender done: page={} target_px={target_px} {}x{}",
-                        page_num + 1, img.width(), img.height()
+                        page_num + 1,
+                        img.width(),
+                        img.height()
                     ));
                     // PDF 再レンダ結果は request_pdf_rerender が 8192 に clamp してから
                     // 投げているので `clamp_dynamic_for_gpu` は実質 no-op だが、不変条件
@@ -6147,19 +6599,21 @@ impl App {
     /// ウィンドウ外のキャッシュ・読み込みを破棄する。
     fn update_prefetch_window(&mut self, current_idx: usize) {
         let image_indices = Self::collect_image_indices(&self.items);
-        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return; };
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
+            return;
+        };
         let n = image_indices.len();
 
-        let pf_back    = self.settings.prefetch_back;
+        let pf_back = self.settings.prefetch_back;
         let pf_forward = self.settings.prefetch_forward;
         // KEEP はそれぞれ +1 だけ広く保持してテクスチャ破棄を遅延させる
-        let keep_back    = pf_back + 1;
+        let keep_back = pf_back + 1;
         let keep_forward = pf_forward + 1;
 
-        let keep_set: std::collections::HashSet<usize> =
-            (pos.saturating_sub(keep_back)..=((pos + keep_forward).min(n - 1)))
-                .map(|p| image_indices[p])
-                .collect();
+        let keep_set: std::collections::HashSet<usize> = (pos.saturating_sub(keep_back)
+            ..=((pos + keep_forward).min(n - 1)))
+            .map(|p| image_indices[p])
+            .collect();
 
         let prefetch_targets: Vec<usize> =
             interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
@@ -6174,9 +6628,13 @@ impl App {
         // 先読みスレッドに待たされなくなる。
         let current_loading = !self.fs_cache.contains_key(&current_idx);
 
-        let to_cancel: Vec<usize> = self.fs_pending.keys()
+        let to_cancel: Vec<usize> = self
+            .fs_pending
+            .keys()
             .filter(|&&k| {
-                if k == current_idx { return false; }
+                if k == current_idx {
+                    return false;
+                }
                 // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
                 current_loading || !keep_set.contains(&k)
             })
@@ -6209,11 +6667,14 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                matches!(item, GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }).then_some(i)
+                matches!(
+                    item,
+                    GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+                )
+                .then_some(i)
             })
             .collect()
     }
-
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
     ///
@@ -6295,7 +6756,10 @@ impl App {
                 None,
                 cf_seq,
                 &[
-                    ("ms", serde_json::Value::from(cf_t0.elapsed().as_secs_f64() * 1000.0)),
+                    (
+                        "ms",
+                        serde_json::Value::from(cf_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
                     ("was_open", serde_json::Value::from(cf_was_open)),
                     ("fs_cache", serde_json::Value::from(cf_fs_cache)),
                     ("ai_cache", serde_json::Value::from(cf_ai_cache)),
@@ -6388,13 +6852,19 @@ impl App {
             let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
                 let perf_key = self.perf_item_key(idx);
-                crate::perf::event("ai", "job_ready", perf_key.as_deref(), self.input_seq, &[
-                    ("idx", serde_json::Value::from(idx)),
-                    ("bg", serde_json::Value::from(bg)),
-                    ("w", serde_json::Value::from(w)),
-                    ("h", serde_json::Value::from(h)),
-                    ("upload_ms", serde_json::Value::from(upload_ms)),
-                ]);
+                crate::perf::event(
+                    "ai",
+                    "job_ready",
+                    perf_key.as_deref(),
+                    self.input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(idx)),
+                        ("bg", serde_json::Value::from(bg)),
+                        ("w", serde_json::Value::from(w)),
+                        ("h", serde_json::Value::from(h)),
+                        ("upload_ms", serde_json::Value::from(upload_ms)),
+                    ],
+                );
             }
             // AI 完了時、fs_cache ベースで先に作られた仮 adjustment_cache を無効化する
             // (そのまま残ると次回来訪時に低解像度の補正結果が使われてしまう)。
@@ -6406,12 +6876,15 @@ impl App {
             // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
             // source_dims はダウンスケール警告用で、派生エントリは元画像の fs_cache 側を
             // 参照すればよいのでここでは None を入れておく。
-            self.ai_upscale_cache.insert(key, FsCacheEntry::Static {
-                tex: handle,
-                pixels,
-                source_dims: None,
-                load_seq: 0,
-            });
+            self.ai_upscale_cache.insert(
+                key,
+                FsCacheEntry::Static {
+                    tex: handle,
+                    pixels,
+                    source_dims: None,
+                    load_seq: 0,
+                },
+            );
             crate::logger::log(format!("[AI] Upscale complete for idx={idx} bg={bg}"));
         }
 
@@ -6450,7 +6923,9 @@ impl App {
         // 先読み（別 idx or 別 bg）を優先キャンセルして枠を空ける。
         if !self.ai_upscale_pending.is_empty() {
             if self.fullscreen_idx == Some(current_idx) {
-                let to_cancel: Vec<(usize, u8)> = self.ai_upscale_pending.keys()
+                let to_cancel: Vec<(usize, u8)> = self
+                    .ai_upscale_pending
+                    .keys()
                     .filter(|&&k| k != cur_key)
                     .copied()
                     .collect();
@@ -6476,8 +6951,10 @@ impl App {
         };
 
         let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
-        let upscale_in_range = crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
-        let denoise_in_range = crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+        let upscale_in_range =
+            crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+        let denoise_in_range =
+            crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
         // 両方の範囲外ならスキップ
         if (!upscale_enabled || !upscale_in_range) && (!denoise_enabled || !denoise_in_range) {
             return;
@@ -6486,7 +6963,9 @@ impl App {
         // AI ランタイム / モデルマネージャを遅延初期化
         self.ensure_ai_runtime();
 
-        let Some(runtime) = self.ai_runtime.clone() else { return; };
+        let Some(runtime) = self.ai_runtime.clone() else {
+            return;
+        };
         let manager = self.ai_model_manager.clone();
 
         // デノイズモデル選択・ロード
@@ -6515,7 +6994,8 @@ impl App {
             let kind = match self.ai_upscale_model_override {
                 Some(k) => k,
                 None => {
-                    let category = self.ai_classify_cache
+                    let category = self
+                        .ai_classify_cache
                         .get(&current_idx)
                         .copied()
                         .unwrap_or_else(|| {
@@ -6532,7 +7012,9 @@ impl App {
                     if !runtime.is_loaded(kind) {
                         if let Err(e) = runtime.load_model(kind, &model_path) {
                             crate::logger::log(format!("[AI] Upscale model load failed: {e}"));
-                            if denoise_model.is_none() { return; }
+                            if denoise_model.is_none() {
+                                return;
+                            }
                             None
                         } else {
                             Some(kind)
@@ -6546,7 +7028,9 @@ impl App {
                         "[AI] Upscale model {:?} not available, skipping for idx={current_idx}",
                         kind
                     ));
-                    if denoise_model.is_none() { return; }
+                    if denoise_model.is_none() {
+                        return;
+                    }
                     None
                 }
             }
@@ -6600,7 +7084,9 @@ impl App {
                     }
                     Err(e) => {
                         crate::logger::log(format!("[AI] Denoise failed for idx={idx}: {e}"));
-                        if upscale_model.is_none() { return; }
+                        if upscale_model.is_none() {
+                            return;
+                        }
                     }
                 }
             }
@@ -6628,12 +7114,24 @@ impl App {
         ));
         if crate::perf::is_enabled() {
             let perf_key = self.perf_item_key(current_idx);
-            crate::perf::event("ai", "job_start", perf_key.as_deref(), self.input_seq, &[
-                ("idx", serde_json::Value::from(current_idx)),
-                ("bg", serde_json::Value::from(bg)),
-                ("denoise", serde_json::Value::from(format!("{:?}", denoise_model))),
-                ("upscale", serde_json::Value::from(format!("{:?}", upscale_model))),
-            ]);
+            crate::perf::event(
+                "ai",
+                "job_start",
+                perf_key.as_deref(),
+                self.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(current_idx)),
+                    ("bg", serde_json::Value::from(bg)),
+                    (
+                        "denoise",
+                        serde_json::Value::from(format!("{:?}", denoise_model)),
+                    ),
+                    (
+                        "upscale",
+                        serde_json::Value::from(format!("{:?}", upscale_model)),
+                    ),
+                ],
+            );
         }
     }
 
@@ -6658,7 +7156,9 @@ impl App {
         self.ai_upscale_cache.retain(|k, _| keep_set.contains(&k.0));
 
         // 範囲外の pending をキャンセル
-        let to_cancel: Vec<(usize, u8)> = self.ai_upscale_pending.keys()
+        let to_cancel: Vec<(usize, u8)> = self
+            .ai_upscale_pending
+            .keys()
             .filter(|k| !keep_set.contains(&k.0))
             .cloned()
             .collect();
@@ -6672,7 +7172,9 @@ impl App {
     /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
     pub(crate) fn ai_prefetch_targets(&self, current_idx: usize) -> Vec<usize> {
         let image_indices = Self::collect_image_indices(&self.items);
-        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else { return Vec::new(); };
+        let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
+            return Vec::new();
+        };
         let n = image_indices.len();
         let pf_back = self.settings.ai_upscale_prefetch_back;
         let pf_forward = self.settings.ai_upscale_prefetch_forward;
@@ -6696,11 +7198,24 @@ impl App {
         let item = self.items.get(idx)?;
         let key = match item {
             GridItem::Image(p) => crate::adjustment_db::normalize_path(p),
-            GridItem::ZipImage { zip_path, entry_name } => {
-                format!("{}::{}", crate::adjustment_db::normalize_path(zip_path), entry_name.to_lowercase())
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                format!(
+                    "{}::{}",
+                    crate::adjustment_db::normalize_path(zip_path),
+                    entry_name.to_lowercase()
+                )
             }
-            GridItem::PdfPage { pdf_path, page_num, .. } => {
-                format!("{}::page_{}", crate::adjustment_db::normalize_path(pdf_path), page_num)
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => {
+                format!(
+                    "{}::page_{}",
+                    crate::adjustment_db::normalize_path(pdf_path),
+                    page_num
+                )
             }
             _ => return None,
         };
@@ -6728,11 +7243,16 @@ impl App {
                 let name = p.file_name()?.to_string_lossy().to_lowercase();
                 Some(name)
             }
-            GridItem::ZipImage { zip_path, entry_name } => {
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
                 let name = zip_path.file_name()?.to_string_lossy().to_lowercase();
                 Some(format!("{name}::{}", entry_name.to_lowercase()))
             }
-            GridItem::PdfPage { pdf_path, page_num, .. } => {
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => {
                 let name = pdf_path.file_name()?.to_string_lossy().to_lowercase();
                 Some(format!("{name}::page_{page_num}"))
             }
@@ -6747,7 +7267,10 @@ impl App {
 
     /// 指定フォルダのサイドカーへ可変参照を取得する。メモリ上に未ロードならロードする。
     /// `sidecar_backup_enabled` が OFF なら None を返す (呼び出し側は no-op になる)。
-    fn sidecar_mut(&mut self, folder: &std::path::Path) -> Option<&mut crate::sidecar::SidecarFile> {
+    fn sidecar_mut(
+        &mut self,
+        folder: &std::path::Path,
+    ) -> Option<&mut crate::sidecar::SidecarFile> {
         if !self.settings.sidecar_backup_enabled {
             return None;
         }
@@ -6824,12 +7347,8 @@ impl App {
             let _ = db.set_raw(&key, compressed, vectors_json, w, h);
         }
         self.mask_pages.insert(idx);
-        let sidecar_mask = crate::sidecar::SidecarMask::from_raw(
-            compressed,
-            vectors,
-            w as u32,
-            h as u32,
-        );
+        let sidecar_mask =
+            crate::sidecar::SidecarMask::from_raw(compressed, vectors, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
     }
 
@@ -6853,10 +7372,14 @@ impl App {
     fn import_sidecar_to_dbs(&mut self, sidecar_folder: &std::path::Path) {
         // メモリにロード (既存なら再利用)
         if !self.sidecars.contains_key(sidecar_folder) {
-            self.sidecars
-                .insert(sidecar_folder.to_path_buf(), crate::sidecar::SidecarFile::load(sidecar_folder));
+            self.sidecars.insert(
+                sidecar_folder.to_path_buf(),
+                crate::sidecar::SidecarFile::load(sidecar_folder),
+            );
         }
-        let Some(sidecar) = self.sidecars.get(sidecar_folder) else { return; };
+        let Some(sidecar) = self.sidecars.get(sidecar_folder) else {
+            return;
+        };
         if sidecar.items().is_empty() {
             return;
         }
@@ -7007,8 +7530,11 @@ impl App {
 
     /// 画像系グリッドアイテムをサイドカーフォルダでグループ化した (folder, Vec<rel_key>) を返す。
     /// 一括書き込み系 (apply/clear all) で folder 単位に sidecar を更新するために使う。
-    fn collect_image_sidecar_coords(&self) -> std::collections::HashMap<std::path::PathBuf, Vec<String>> {
-        let mut map: std::collections::HashMap<std::path::PathBuf, Vec<String>> = std::collections::HashMap::new();
+    fn collect_image_sidecar_coords(
+        &self,
+    ) -> std::collections::HashMap<std::path::PathBuf, Vec<String>> {
+        let mut map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
+            std::collections::HashMap::new();
         for idx in 0..self.items.len() {
             match self.items.get(idx) {
                 Some(GridItem::Image(_))
@@ -7127,8 +7653,12 @@ impl App {
     /// 保存スロット slot_idx のパラメータを現在のフルスクリーンページに適用する。
     /// キャッシュ無効化もここで実施。
     pub(crate) fn apply_slot_to_current_page(&mut self, slot_idx: usize) {
-        let Some(fs_idx) = self.fullscreen_idx else { return; };
-        let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else { return; };
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
+            return;
+        };
         let ai_changed = !self.effective_params(fs_idx).ai_settings_eq(&slot.params);
         self.set_page_params(fs_idx, slot.params);
         if ai_changed {
@@ -7173,7 +7703,8 @@ impl App {
             self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
         } else {
             self.show_feedback_toast(format!(
-                "[スロット{}:{} を{}枚に適用]", key_label, slot.name, count
+                "[スロット{}:{} を{}枚に適用]",
+                key_label, slot.name, count
             ));
             self.checked.clear();
         }
@@ -7212,10 +7743,16 @@ impl App {
     /// 指定ピクセルデータに色調補正を同期適用して adjustment_cache に格納する。
     /// poll_prefetch / poll_ai_upscale の完了時に呼ばれ、
     /// 補正済み画像を即座にテクスチャ化してチラつきを防止する。
-    fn apply_sync_adjustment(&mut self, ctx: &egui::Context, idx: usize, pixels: &std::sync::Arc<egui::ColorImage>) {
+    fn apply_sync_adjustment(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        pixels: &std::sync::Arc<egui::ColorImage>,
+    ) {
         let params = self.effective_params(idx).clone();
         // post-filter をバイパスする場合: 色調も identity ならスキップ可能
-        let apply_pf = !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
+        let apply_pf =
+            !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
         if params.is_color_identity() && !apply_pf {
             return;
         }
@@ -7235,12 +7772,15 @@ impl App {
         let tex = ctx.load_texture(format!("adj_{idx}"), upload.into_owned(), tex_opts);
         // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
         // source_dims は fs_cache 側に保存されているのでここは None でよい。
-        self.adjustment_cache.insert(idx, FsCacheEntry::Static {
-            tex,
-            pixels: adjusted_pixels,
-            source_dims: None,
-            load_seq: 0,
-        });
+        self.adjustment_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels: adjusted_pixels,
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
     }
 
     /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
@@ -7260,7 +7800,9 @@ impl App {
         // これがないと AI 完了まで「補正前の fs_cache」がそのまま表示され、
         // 完了瞬間に補正適用で濃度が跳ねて見えてしまう。
         // 短絡: 個別設定なし かつ グローバルが identity なら何もしない
-        if !self.adjustment_page_params.contains_key(&idx) && self.settings.global_preset.is_identity() {
+        if !self.adjustment_page_params.contains_key(&idx)
+            && self.settings.global_preset.is_identity()
+        {
             return;
         }
         // bypass 中は post-filter を考慮せず、色調のみで判定する
@@ -7272,11 +7814,15 @@ impl App {
         }
         // ソース画像を取得 (AI アップスケール済み or 元画像)
         let source = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-            self.ai_upscale_cache.get(&(idx, bg)).or_else(|| self.fs_cache.get(&idx))
+            self.ai_upscale_cache
+                .get(&(idx, bg))
+                .or_else(|| self.fs_cache.get(&idx))
         } else {
             self.fs_cache.get(&idx)
         };
-        let Some(FsCacheEntry::Static { pixels, .. }) = source else { return; };
+        let Some(FsCacheEntry::Static { pixels, .. }) = source else {
+            return;
+        };
         let pixels = std::sync::Arc::clone(pixels);
         self.apply_sync_adjustment(ctx, idx, &pixels);
     }
@@ -7311,7 +7857,9 @@ impl App {
         if self.thumb_adjust_tex.contains_key(&idx) {
             return;
         }
-        let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else { return; };
+        let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else {
+            return;
+        };
         let adjusted = {
             let params = self.effective_params(idx);
             if params.is_color_identity() {
@@ -7474,7 +8022,11 @@ impl App {
         }
         // 既存 backlog の重複エントリ (同 idx で再ロードされたケース) は新しい方で置換。
         for (key, result, load_seq) in completed {
-            if let Some(pos) = self.fs_upload_backlog.iter().position(|(k, _, _)| *k == key) {
+            if let Some(pos) = self
+                .fs_upload_backlog
+                .iter()
+                .position(|(k, _, _)| *k == key)
+            {
                 self.fs_upload_backlog[pos] = (key, result, load_seq);
             } else {
                 self.fs_upload_backlog.push((key, result, load_seq));
@@ -7580,9 +8132,9 @@ impl App {
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
-                FsLoadResult::DimsOnly { .. } => unreachable!(
-                    "DimsOnly should be drained before reaching completion match"
-                ),
+                FsLoadResult::DimsOnly { .. } => {
+                    unreachable!("DimsOnly should be drained before reaching completion match")
+                }
             };
             self.fs_cache.insert(key, entry);
             // 保存済みマスクがあれば自動で inpaint 適用
@@ -7641,28 +8193,29 @@ impl App {
     }
 
     pub(crate) fn reencode_tq_panel(&mut self, ctx: &egui::Context, is_a: bool) {
-        let Some(img) = self.tq.sample.as_ref() else { return };
+        let Some(img) = self.tq.sample.as_ref() else {
+            return;
+        };
         let (size, quality) = if is_a {
             (self.tq.a_size, self.tq.a_quality)
         } else {
             (self.tq.b_size, self.tq.b_quality)
         };
-        let (bytes, tex) =
-            match crate::catalog::encode_thumb_webp(img, size, quality as f32) {
-                Some((data, _w, _h)) => {
-                    let byte_len = data.len();
-                    let color_image = crate::catalog::decode_thumb_to_color_image(&data);
-                    let tex = color_image.map(|ci| {
-                        ctx.load_texture(
-                            format!("tq_preview_{}", if is_a { "a" } else { "b" }),
-                            ci,
-                            egui::TextureOptions::LINEAR,
-                        )
-                    });
-                    (byte_len, tex)
-                }
-                None => (0, None),
-            };
+        let (bytes, tex) = match crate::catalog::encode_thumb_webp(img, size, quality as f32) {
+            Some((data, _w, _h)) => {
+                let byte_len = data.len();
+                let color_image = crate::catalog::decode_thumb_to_color_image(&data);
+                let tex = color_image.map(|ci| {
+                    ctx.load_texture(
+                        format!("tq_preview_{}", if is_a { "a" } else { "b" }),
+                        ci,
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+                (byte_len, tex)
+            }
+            None => (0, None),
+        };
         if is_a {
             self.tq.a_bytes = bytes;
             self.tq.a_texture = tex;
@@ -7691,7 +8244,13 @@ impl App {
             .favorites
             .iter()
             .zip(self.cc.checked.iter())
-            .filter_map(|(f, &c)| if c { Some((f.name.clone(), f.path.clone())) } else { None })
+            .filter_map(|(f, &c)| {
+                if c {
+                    Some((f.name.clone(), f.path.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         if targets.is_empty() {
@@ -7712,8 +8271,7 @@ impl App {
         // 初期キャッシュ容量を取得（ベースライン）
         let cache_dir = crate::catalog::default_cache_dir();
         let (_, baseline) = crate::catalog::cache_stats(&cache_dir);
-        self.cc.cache_size
-            .store(baseline, Ordering::Relaxed);
+        self.cc.cache_size.store(baseline, Ordering::Relaxed);
 
         // atomic クローン
         let counting = Arc::clone(&self.cc.counting);
@@ -7746,10 +8304,7 @@ impl App {
             }
 
             // 処理用 rayon プール
-            let pool = match rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-            {
+            let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
                 Ok(p) => p,
                 Err(_) => {
                     finished.store(true, Ordering::Relaxed);
@@ -7764,14 +8319,13 @@ impl App {
                 }
 
                 // お気に入り名 > 相対パス の形式で表示用文字列を生成
-                let folder_display = targets.iter()
+                let folder_display = targets
+                    .iter()
                     .find(|(_, base)| folder.starts_with(base))
-                    .map(|(name, base)| {
-                        match folder.strip_prefix(base) {
-                            Ok(rel) if rel.as_os_str().is_empty() => name.clone(),
-                            Ok(rel) => format!("{} > {}", name, rel.to_string_lossy()),
-                            Err(_) => folder.to_string_lossy().to_string(),
-                        }
+                    .map(|(name, base)| match folder.strip_prefix(base) {
+                        Ok(rel) if rel.as_os_str().is_empty() => name.clone(),
+                        Ok(rel) => format!("{} > {}", name, rel.to_string_lossy()),
+                        Err(_) => folder.to_string_lossy().to_string(),
                     })
                     .unwrap_or_else(|| folder.to_string_lossy().to_string());
                 *current.lock().unwrap() = folder_display.clone();
@@ -7872,10 +8426,11 @@ impl App {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
-                        let zip_catalog = match crate::catalog::CatalogDb::open(&cache_dir, zip_path) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
+                        let zip_catalog =
+                            match crate::catalog::CatalogDb::open(&cache_dir, zip_path) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
                         let zip_cache_map = zip_catalog.load_all().unwrap_or_default();
                         let entry_count = entries.len();
 
@@ -7890,7 +8445,11 @@ impl App {
                                     return;
                                 }
                                 *current.lock().unwrap() = format!(
-                                    "{} > {} ({}/{})", folder_display, zip_fname, i + 1, entry_count
+                                    "{} > {} ({}/{})",
+                                    folder_display,
+                                    zip_fname,
+                                    i + 1,
+                                    entry_count
                                 );
                                 if let Some(existing) = zip_cache_map.get(&entry.entry_name) {
                                     if existing.mtime == entry.mtime
@@ -7899,7 +8458,10 @@ impl App {
                                         return;
                                     }
                                 }
-                                let raw = match crate::zip_loader::read_entry_bytes(zip_path, &entry.entry_name) {
+                                let raw = match crate::zip_loader::read_entry_bytes(
+                                    zip_path,
+                                    &entry.entry_name,
+                                ) {
                                     Ok(b) => b,
                                     Err(_) => return,
                                 };
@@ -7909,7 +8471,8 @@ impl App {
                                 };
                                 // 先頭エントリをキャプチャ（親フォルダ用サムネイル再利用）
                                 if i == 0 {
-                                    *first_webp.lock().unwrap() = Some((img.clone(), entry.entry_name.clone()));
+                                    *first_webp.lock().unwrap() =
+                                        Some((img.clone(), entry.entry_name.clone()));
                                 }
                                 if let Some(bytes) = encode_and_save(
                                     &img,
@@ -7930,8 +8493,13 @@ impl App {
                             let captured = first_webp.lock().unwrap().take();
                             if let Some((img, _)) = captured {
                                 if let Some(bytes) = encode_and_save(
-                                    &img, &folder_key, &catalog,
-                                    *zip_mtime, *zip_file_size, thumb_px, thumb_quality,
+                                    &img,
+                                    &folder_key,
+                                    &catalog,
+                                    *zip_mtime,
+                                    *zip_file_size,
+                                    thumb_px,
+                                    thumb_quality,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -7942,12 +8510,21 @@ impl App {
                         if cache_map.contains_key(&folder_key) {
                             continue;
                         }
-                        if let Some(first_entry) = crate::zip_loader::first_image_entry(zip_path, None) {
-                            if let Ok(raw) = crate::zip_loader::read_entry_bytes(zip_path, &first_entry) {
+                        if let Some(first_entry) =
+                            crate::zip_loader::first_image_entry(zip_path, None)
+                        {
+                            if let Ok(raw) =
+                                crate::zip_loader::read_entry_bytes(zip_path, &first_entry)
+                            {
                                 if let Ok(img) = image::load_from_memory(&raw) {
                                     if let Some(bytes) = encode_and_save(
-                                        &img, &folder_key, &catalog,
-                                        *zip_mtime, *zip_file_size, thumb_px, thumb_quality,
+                                        &img,
+                                        &folder_key,
+                                        &catalog,
+                                        *zip_mtime,
+                                        *zip_file_size,
+                                        thumb_px,
+                                        thumb_quality,
                                     ) {
                                         size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                     }
@@ -7981,10 +8558,11 @@ impl App {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            let pdf_catalog = match crate::catalog::CatalogDb::open(&cache_dir, pdf_path) {
-                                Ok(c) => c,
-                                Err(_) => continue,
-                            };
+                            let pdf_catalog =
+                                match crate::catalog::CatalogDb::open(&cache_dir, pdf_path) {
+                                    Ok(c) => c,
+                                    Err(_) => continue,
+                                };
                             let pdf_cache_map = pdf_catalog.load_all().unwrap_or_default();
                             let page_count = pages.len();
 
@@ -7995,7 +8573,11 @@ impl App {
                                 }
                                 let page_num = i as u32;
                                 *current.lock().unwrap() = format!(
-                                    "{} > {} ({}/{})", folder_display, pdf_fname, i + 1, page_count
+                                    "{} > {} ({}/{})",
+                                    folder_display,
+                                    pdf_fname,
+                                    i + 1,
+                                    page_count
                                 );
                                 let key = crate::grid_item::pdf_page_cache_key(page_num);
                                 if let Some(existing) = pdf_cache_map.get(&key) {
@@ -8006,8 +8588,14 @@ impl App {
                                     }
                                 }
                                 if let Some(bytes) = crate::thumb_loader::build_and_save_one_pdf(
-                                    pdf_path, page_num, pw_ref, &pdf_catalog,
-                                    *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
+                                    pdf_path,
+                                    page_num,
+                                    pw_ref,
+                                    &pdf_catalog,
+                                    *pdf_mtime,
+                                    *pdf_file_size,
+                                    thumb_px,
+                                    thumb_quality,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -8015,10 +8603,22 @@ impl App {
 
                             // 先頭1ページを親フォルダの DB にも保存
                             if page_count > 0 && !cache_map.contains_key(&folder_key) {
-                                if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None, crate::pdf_loader::JobPriority::Normal) {
+                                if let Ok((img, _)) = crate::pdf_loader::render_page(
+                                    pdf_path,
+                                    0,
+                                    thumb_px,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::JobPriority::Normal,
+                                ) {
                                     if let Some(bytes) = encode_and_save(
-                                        &img, &folder_key, &catalog,
-                                        *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
+                                        &img,
+                                        &folder_key,
+                                        &catalog,
+                                        *pdf_mtime,
+                                        *pdf_file_size,
+                                        thumb_px,
+                                        thumb_quality,
                                     ) {
                                         size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                     }
@@ -8030,10 +8630,22 @@ impl App {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
-                            if let Ok((img, _)) = crate::pdf_loader::render_page(pdf_path, 0, thumb_px, pw_ref, None, crate::pdf_loader::JobPriority::Normal) {
+                            if let Ok((img, _)) = crate::pdf_loader::render_page(
+                                pdf_path,
+                                0,
+                                thumb_px,
+                                pw_ref,
+                                None,
+                                crate::pdf_loader::JobPriority::Normal,
+                            ) {
                                 if let Some(bytes) = encode_and_save(
-                                    &img, &folder_key, &catalog,
-                                    *pdf_mtime, *pdf_file_size, thumb_px, thumb_quality,
+                                    &img,
+                                    &folder_key,
+                                    &catalog,
+                                    *pdf_mtime,
+                                    *pdf_file_size,
+                                    thumb_px,
+                                    thumb_quality,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -8048,14 +8660,6 @@ impl App {
             finished.store(true, Ordering::Relaxed);
         });
     }
-
-
-
-
-
-
-
-
 }
 
 // -----------------------------------------------------------------------
@@ -8193,11 +8797,23 @@ impl eframe::App for App {
             let current_done = self.ai_upscale_cache.contains_key(&(fs_idx, cur_bg))
                 || self.ai_upscale_failed.contains(&(fs_idx, cur_bg))
                 || (!self.ai_upscale_enabled && self.ai_denoise_model.is_none())
-                || (self.ai_upscale_enabled && self.ai_denoise_model.is_none() && self.fs_cache.get(&fs_idx).map(|e| {
-                    if let FsCacheEntry::Static { pixels, .. } = e {
-                        !crate::ai::upscale::should_process(pixels.size[0] as u32, pixels.size[1] as u32, self.settings.ai_upscale_skip_px)
-                    } else { true }
-                }).unwrap_or(true));
+                || (self.ai_upscale_enabled
+                    && self.ai_denoise_model.is_none()
+                    && self
+                        .fs_cache
+                        .get(&fs_idx)
+                        .map(|e| {
+                            if let FsCacheEntry::Static { pixels, .. } = e {
+                                !crate::ai::upscale::should_process(
+                                    pixels.size[0] as u32,
+                                    pixels.size[1] as u32,
+                                    self.settings.ai_upscale_skip_px,
+                                )
+                            } else {
+                                true
+                            }
+                        })
+                        .unwrap_or(true));
             if current_done && self.ai_upscale_pending.is_empty() {
                 self.prefetch_ai_upscale(fs_idx);
             }
@@ -8238,8 +8854,8 @@ impl eframe::App for App {
                     .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
                     .unwrap_or(true);
             }
-            let main_has_focus = self.fs_focus_grace_elapsed
-                && ctx.input(|i| i.viewport().focused).unwrap_or(false);
+            let main_has_focus =
+                self.fs_focus_grace_elapsed && ctx.input(|i| i.viewport().focused).unwrap_or(false);
             if main_has_focus {
                 self.close_fullscreen();
             }
@@ -8264,7 +8880,6 @@ impl eframe::App for App {
 
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
-
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
@@ -8391,14 +9006,24 @@ impl eframe::App for App {
             && !self.any_dialog_open()
         {
             let alt_col = ctx.input(|i| {
-                if !i.modifiers.alt { return None; }
+                if !i.modifiers.alt {
+                    return None;
+                }
                 let keys = [
-                    (egui::Key::Num1, 1), (egui::Key::Num2, 2), (egui::Key::Num3, 3),
-                    (egui::Key::Num4, 4), (egui::Key::Num5, 5), (egui::Key::Num6, 6),
-                    (egui::Key::Num7, 7), (egui::Key::Num8, 8), (egui::Key::Num9, 9),
+                    (egui::Key::Num1, 1),
+                    (egui::Key::Num2, 2),
+                    (egui::Key::Num3, 3),
+                    (egui::Key::Num4, 4),
+                    (egui::Key::Num5, 5),
+                    (egui::Key::Num6, 6),
+                    (egui::Key::Num7, 7),
+                    (egui::Key::Num8, 8),
+                    (egui::Key::Num9, 9),
                     (egui::Key::Num0, 10),
                 ];
-                keys.iter().find(|(k, _)| i.key_pressed(*k)).map(|&(_, c)| c)
+                keys.iter()
+                    .find(|(k, _)| i.key_pressed(*k))
+                    .map(|&(_, c)| c)
             });
             if let Some(cols) = alt_col {
                 if cols != self.settings.grid_cols {
@@ -8494,7 +9119,10 @@ impl eframe::App for App {
         // バックグラウンドスレッドがチャネルに送信しても egui は自動では
         // 起きないため、ここで継続的に repaint を要求しておく必要がある。
         if self.folder_nav_pending.is_some()
-            || self.thumbnails.iter().any(|t| matches!(t, ThumbnailState::Pending))
+            || self
+                .thumbnails
+                .iter()
+                .any(|t| matches!(t, ThumbnailState::Pending))
             || self.pdf_enumerate_pending.is_some()
         {
             ctx.request_repaint();
@@ -8519,7 +9147,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // 終了時にウィンドウ位置・サイズを保存
         if let Some(rect) = self.last_outer_rect {
-            self.settings.window_pos  = Some([rect.min.x, rect.min.y]);
+            self.settings.window_pos = Some([rect.min.x, rect.min.y]);
             self.settings.window_size = Some([rect.width(), rect.height()]);
         }
         self.settings.save();
@@ -8572,66 +9200,76 @@ fn make_load_request(
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
 ) -> Option<LoadRequest> {
+    // 共通フィールド (idx/path/mtime/file_size/skip_cache) 以外は Default (0/None/false)
+    // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
+    let base = LoadRequest {
+        idx,
+        mtime,
+        file_size,
+        skip_cache,
+        ..Default::default()
+    };
     match item {
         GridItem::Image(p) => Some(LoadRequest {
-            idx, path: p.clone(), mtime, file_size,
-            skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
-            cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
-            input_seq: 0,
-            items_gen: 0,
+            path: p.clone(),
+            ..base
         }),
-        GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
-            idx, path: zip_path.clone(), mtime, file_size,
-            skip_cache, priority: false, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
-            cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
-            input_seq: 0,
-            items_gen: 0,
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => Some(LoadRequest {
+            path: zip_path.clone(),
+            zip_entry: Some(entry_name.clone()),
+            ..base
         }),
-        GridItem::PdfPage { pdf_path, page_num, .. } => Some(LoadRequest {
-            idx, path: pdf_path.clone(), mtime, file_size,
-            skip_cache, priority: false, zip_entry: None, pdf_page: Some(*page_num),
+        GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => Some(LoadRequest {
+            path: pdf_path.clone(),
+            pdf_page: Some(*page_num),
             pdf_password: pdf_password.map(String::from),
-            cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
-            input_seq: 0,
-            items_gen: 0,
+            ..base
         }),
         GridItem::ZipFile(p) => {
-            // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得。
             // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
-            // 遅延解決する。UI スレッドで ZIP を開くディスク I/O を避けるため。
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            // 遅延解決する (UI スレッドで ZIP を開く I/O を避けるため)。
+            let fname = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             Some(LoadRequest {
-                idx, path: p.clone(), mtime, file_size,
-                skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
+                path: p.clone(),
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
-                folder_thumb_sort: None, folder_thumb_depth: 0,
-                input_seq: 0,
-                items_gen: 0,
+                ..base
             })
         }
         GridItem::PdfFile(p) => {
-            // フォルダ一覧用: PDF の 1 ページ目をサムネイルとして取得
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let fname = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             Some(LoadRequest {
-                idx, path: p.clone(), mtime, file_size,
-                skip_cache, priority: false, zip_entry: None, pdf_page: Some(0),
+                path: p.clone(),
+                pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
-                folder_thumb_sort: None, folder_thumb_depth: 0,
-                input_seq: 0,
-                items_gen: 0,
+                ..base
             })
         }
         GridItem::Folder(p) => {
-            // フォルダ一覧用: フォルダ内の代表画像をサムネイルとして取得
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let fname = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             Some(LoadRequest {
-                idx, path: p.clone(), mtime, file_size,
-                skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
+                path: p.clone(),
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
-                folder_thumb_sort, folder_thumb_depth,
-                input_seq: 0,
-                items_gen: 0,
+                folder_thumb_sort,
+                folder_thumb_depth,
+                ..base
             })
         }
         _ => None,
@@ -8835,7 +9473,11 @@ fn draw_thumb(
             draw_thumb_texture(painter, inner, use_tex, rotation);
         }
         ThumbnailState::Pending | ThumbnailState::Evicted => {
-            let bg = if dark { egui::Color32::from_gray(50) } else { egui::Color32::from_gray(220) };
+            let bg = if dark {
+                egui::Color32::from_gray(50)
+            } else {
+                egui::Color32::from_gray(220)
+            };
             painter.rect_filled(inner, 2.0, bg);
             painter.text(
                 inner.center(),
@@ -8873,9 +9515,9 @@ pub(crate) fn draw_cell(
     rect: egui::Rect,
     is_selected: bool,
     is_checked: bool,
-    has_page_override: bool,  // true なら左上に補正済みバッジ「補」を表示
-    has_mask: bool,           // true なら左上に消しゴムマスクバッジ「消」を表示
-    rating: u8,               // 0 = 非表示, 1-5 = ★バッジ
+    has_page_override: bool, // true なら左上に補正済みバッジ「補」を表示
+    has_mask: bool,          // true なら左上に消しゴムマスクバッジ「消」を表示
+    rating: u8,              // 0 = 非表示, 1-5 = ★バッジ
     item: &GridItem,
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
@@ -8984,7 +9626,11 @@ pub(crate) fn draw_cell(
         }
         GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
             let (icon, badge_fn): (&str, fn(&egui::Painter, egui::Rect)) =
-                if matches!(item, GridItem::ZipFile(_)) { ("📦", draw_zip_badge) } else { ("📄", draw_pdf_badge) };
+                if matches!(item, GridItem::ZipFile(_)) {
+                    ("📦", draw_zip_badge)
+                } else {
+                    ("📄", draw_pdf_badge)
+                };
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
                     // ZipFile/PdfFile の代表サムネは補正対象外 (adjusted_tex は常に None)
@@ -9075,20 +9721,30 @@ pub(crate) fn draw_cell(
                 sep_small,
             );
         }
-        GridItem::SearchContainer { path, kind, hit_count } => {
+        GridItem::SearchContainer {
+            path,
+            kind,
+            hit_count,
+        } => {
             // Ctrl+G 結果のコンテナセル: フォルダ/ZIP アイコン風表示 + ヒット件数バッジ
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("(?)");
             let (icon, label_color) = match kind {
-                crate::grid_item::SearchContainerKind::Folder => ("📁", if dark {
-                    egui::Color32::from_gray(220)
-                } else {
-                    egui::Color32::from_gray(60)
-                }),
-                crate::grid_item::SearchContainerKind::Zip => ("📦", if dark {
-                    egui::Color32::from_rgb(220, 200, 150)
-                } else {
-                    egui::Color32::from_rgb(130, 90, 30)
-                }),
+                crate::grid_item::SearchContainerKind::Folder => (
+                    "📁",
+                    if dark {
+                        egui::Color32::from_gray(220)
+                    } else {
+                        egui::Color32::from_gray(60)
+                    },
+                ),
+                crate::grid_item::SearchContainerKind::Zip => (
+                    "📦",
+                    if dark {
+                        egui::Color32::from_rgb(220, 200, 150)
+                    } else {
+                        egui::Color32::from_rgb(130, 90, 30)
+                    },
+                ),
             };
             let size_icon = (inner.height() * 0.3).clamp(24.0, 72.0);
             painter.text(
@@ -9128,7 +9784,14 @@ pub(crate) fn draw_cell(
     let border = if is_selected {
         egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 120, 220))
     } else {
-        egui::Stroke::new(1.0, if dark { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(200) })
+        egui::Stroke::new(
+            1.0,
+            if dark {
+                egui::Color32::from_gray(70)
+            } else {
+                egui::Color32::from_gray(200)
+            },
+        )
     };
     painter.rect_stroke(rect, 2.0, border, egui::StrokeKind::Middle);
 
@@ -9136,11 +9799,7 @@ pub(crate) fn draw_cell(
     if is_checked {
         let check_r = 12.0;
         let check_center = egui::pos2(rect.max.x - check_r - 4.0, rect.min.y + check_r + 4.0);
-        painter.circle_filled(
-            check_center,
-            check_r,
-            egui::Color32::from_rgb(40, 140, 40),
-        );
+        painter.circle_filled(check_center, check_r, egui::Color32::from_rgb(40, 140, 40));
         // チェックマーク (✓)
         let s = check_r * 0.55;
         let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
@@ -9167,10 +9826,8 @@ pub(crate) fn draw_cell(
         let mut x = rect.min.x + 3.0;
         let y = rect.min.y + 3.0;
         if has_page_override {
-            let badge_rect = egui::Rect::from_min_size(
-                egui::pos2(x, y),
-                egui::vec2(badge_w, badge_h),
-            );
+            let badge_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
             painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(50, 120, 220));
             painter.text(
                 badge_rect.center(),
@@ -9182,10 +9839,8 @@ pub(crate) fn draw_cell(
             x += badge_w + 2.0;
         }
         if has_mask {
-            let badge_rect = egui::Rect::from_min_size(
-                egui::pos2(x, y),
-                egui::vec2(badge_w, badge_h),
-            );
+            let badge_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
             painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(200, 80, 40));
             painter.text(
                 badge_rect.center(),
@@ -9232,10 +9887,7 @@ pub(crate) fn tq_draw_preview(
     cell_w: f32,
     cell_h: f32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(cell_w, cell_h),
-        egui::Sense::click(),
-    );
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::click());
     let painter = ui.painter();
     // 白背景（選択状態ではないグリッドセルと同じ）
     painter.rect_filled(rect, 2.0, egui::Color32::WHITE);
@@ -9334,31 +9986,31 @@ mod tests {
     fn filter_virtual_folder_skips_archive_matching_folder() {
         let mut folders: Vec<GridItem> = vec![
             GridItem::Folder(PathBuf::from("/r/vol01")),
-            GridItem::ZipFile(PathBuf::from("/r/vol01.zip")),      // 同名フォルダあり → 消える
-            GridItem::ZipFile(PathBuf::from("/r/other.zip")),       // 同名フォルダなし → 残る
-            GridItem::PdfFile(PathBuf::from("/r/vol01.pdf")),       // 同名フォルダあり → 消える
+            GridItem::ZipFile(PathBuf::from("/r/vol01.zip")), // 同名フォルダあり → 消える
+            GridItem::ZipFile(PathBuf::from("/r/other.zip")), // 同名フォルダなし → 残る
+            GridItem::PdfFile(PathBuf::from("/r/vol01.pdf")), // 同名フォルダあり → 消える
             GridItem::ConvertibleArchive {
-                path: PathBuf::from("/r/vol01.7z"),                 // 同名フォルダあり → 消える
+                path: PathBuf::from("/r/vol01.7z"), // 同名フォルダあり → 消える
                 format: ArchiveFormat::SevenZ,
             },
             GridItem::ConvertibleArchive {
-                path: PathBuf::from("/r/bonus.lzh"),                // 同名フォルダなし → 残る
+                path: PathBuf::from("/r/bonus.lzh"), // 同名フォルダなし → 残る
                 format: ArchiveFormat::Lzh,
             },
         ];
-        let mut folder_metas: Vec<Option<(i64, i64)>> =
-            vec![None, None, None, None, None, None];
+        let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None, None, None, None, None];
 
         App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
 
         let remaining_names: Vec<String> = folders
             .iter()
             .map(|item| match item {
-                GridItem::Folder(p)
-                | GridItem::ZipFile(p)
-                | GridItem::PdfFile(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
-                GridItem::ConvertibleArchive { path, .. } =>
-                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                    p.file_name().unwrap().to_string_lossy().into_owned()
+                }
+                GridItem::ConvertibleArchive { path, .. } => {
+                    path.file_name().unwrap().to_string_lossy().into_owned()
+                }
                 _ => String::new(),
             })
             .collect();

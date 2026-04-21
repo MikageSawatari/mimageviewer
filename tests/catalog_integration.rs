@@ -17,8 +17,16 @@ fn catalog_db_full_lifecycle() {
     let db = catalog::CatalogDb::open(&cache_dir, folder).unwrap();
 
     // 2) save → load_all のラウンドトリップ
-    db.save("img1.jpg", 1000, 5000, 256, 192, Some((4000, 3000)), b"webp_data_1")
-        .unwrap();
+    db.save(
+        "img1.jpg",
+        1000,
+        5000,
+        256,
+        192,
+        Some((4000, 3000)),
+        b"webp_data_1",
+    )
+    .unwrap();
     db.save("img2.png", 2000, 8000, 256, 256, None, b"webp_data_2")
         .unwrap();
 
@@ -36,8 +44,16 @@ fn catalog_db_full_lifecycle() {
     assert!(map.contains_key("img1.jpg"));
 
     // 4) 上書き保存
-    db.save("img1.jpg", 3000, 6000, 256, 192, Some((4000, 3000)), b"updated")
-        .unwrap();
+    db.save(
+        "img1.jpg",
+        3000,
+        6000,
+        256,
+        192,
+        Some((4000, 3000)),
+        b"updated",
+    )
+    .unwrap();
     let map = db.load_all().unwrap();
     assert_eq!(map["img1.jpg"].mtime, 3000);
     assert_eq!(map["img1.jpg"].jpeg_data, b"updated");
@@ -53,7 +69,11 @@ fn db_path_for_creates_subdirectory() {
     let _db = catalog::CatalogDb::open(&cache_dir, folder).unwrap();
 
     let db_path = catalog::db_path_for(&cache_dir, folder);
-    assert!(db_path.exists(), "DB file should exist at {}", db_path.display());
+    assert!(
+        db_path.exists(),
+        "DB file should exist at {}",
+        db_path.display()
+    );
 }
 
 #[test]
@@ -109,8 +129,16 @@ fn reopen_db_preserves_data() {
     // 1) 開いてデータ保存
     {
         let db = catalog::CatalogDb::open(&cache_dir, folder).unwrap();
-        db.save("photo.jpg", 999, 1234, 128, 96, Some((1920, 1080)), b"persistent_data")
-            .unwrap();
+        db.save(
+            "photo.jpg",
+            999,
+            1234,
+            128,
+            96,
+            Some((1920, 1080)),
+            b"persistent_data",
+        )
+        .unwrap();
     }
 
     // 2) 再度開いてデータが残っていることを確認

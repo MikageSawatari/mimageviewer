@@ -90,8 +90,7 @@ fn decode_pi_c165() {
         return;
     }
 
-    let (exp_w, exp_h) = read_bmp_dims(&bmp_path)
-        .expect("BMP header parse failed");
+    let (exp_w, exp_h) = read_bmp_dims(&bmp_path).expect("BMP header parse failed");
     eprintln!("reference BMP: {exp_w}x{exp_h}");
 
     let host = PluginHost::load_dir(&plugin_dir);

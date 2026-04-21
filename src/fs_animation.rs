@@ -25,7 +25,10 @@ pub enum FsLoadResult {
     /// `source_dims` はワーカーがデコードした直後・GPU 上限 clamp 前の寸法で、
     /// ホバーバーに原寸を表示したり「ダウンスケール表示中」警告を出すために使う。
     /// `ci.size` は clamp 後なので両者が一致しないとき = clamp が発動したケース。
-    Static { ci: egui::ColorImage, source_dims: [usize; 2] },
+    Static {
+        ci: egui::ColorImage,
+        source_dims: [usize; 2],
+    },
     /// アニメーション: (フレーム画像, 表示時間[秒]) のベクタ
     Animated(Vec<(egui::ColorImage, f64)>),
     /// デコードに失敗した (fs_cache に Failed エントリを記録して
@@ -94,8 +97,8 @@ fn clamp_rgba_frame_for_gpu(buf: image::RgbaImage) -> image::RgbaImage {
 /// GIF をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）や失敗時は None を返す。
 pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
-    use image::codecs::gif::GifDecoder;
     use image::AnimationDecoder;
+    use image::codecs::gif::GifDecoder;
 
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
@@ -113,7 +116,9 @@ pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
                 let delay = if denom > 0 {
                     numer as f64 / denom as f64 / 1000.0
                 } else {
-                    crate::logger::log("GIF animation frame denom=0, using 0.1s default".to_string());
+                    crate::logger::log(
+                        "GIF animation frame denom=0, using 0.1s default".to_string(),
+                    );
                     0.1
                 };
                 let delay = delay.max(0.02); // 最低 20ms（Chrome 互換）
@@ -132,8 +137,8 @@ pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
 /// APNG をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）・非 APNG・失敗時は None を返す。
 pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
-    use image::codecs::png::PngDecoder;
     use image::AnimationDecoder;
+    use image::codecs::png::PngDecoder;
 
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
@@ -155,7 +160,9 @@ pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
                 let delay = if denom > 0 {
                     numer as f64 / denom as f64 / 1000.0
                 } else {
-                    crate::logger::log("APNG animation frame denom=0, using 0.1s default".to_string());
+                    crate::logger::log(
+                        "APNG animation frame denom=0, using 0.1s default".to_string(),
+                    );
                     0.1
                 };
                 let delay = delay.max(0.02);
@@ -246,10 +253,7 @@ mod tests {
         }
         if let Some(frames) = decode_gif_frames(path) {
             for (i, (_img, delay)) in frames.iter().enumerate() {
-                assert!(
-                    *delay >= 0.02,
-                    "frame {i} delay {delay} should be >= 0.02s"
-                );
+                assert!(*delay >= 0.02, "frame {i} delay {delay} should be >= 0.02s");
             }
         }
     }

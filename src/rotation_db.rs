@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 /// 回転角度 (時計回り)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rotation {
-    None,       // 0°
-    Cw90,       // 90°
-    Cw180,      // 180°
-    Cw270,      // 270° (= 反時計回り 90°)
+    None,  // 0°
+    Cw90,  // 90°
+    Cw180, // 180°
+    Cw270, // 270° (= 反時計回り 90°)
 }
 
 impl Rotation {

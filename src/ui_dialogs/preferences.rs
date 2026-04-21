@@ -77,7 +77,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "パフォーマンス",
         page: None,
-        children: &[PreferencesPage::Parallelism, PreferencesPage::Prefetch, PreferencesPage::GpuMemory],
+        children: &[
+            PreferencesPage::Parallelism,
+            PreferencesPage::Prefetch,
+            PreferencesPage::GpuMemory,
+        ],
     },
     TreeCategory {
         label: "キャッシュ",
@@ -92,7 +96,10 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "ファイル処理",
         page: None,
-        children: &[PreferencesPage::DuplicateFiles, PreferencesPage::ExifDisplay],
+        children: &[
+            PreferencesPage::DuplicateFiles,
+            PreferencesPage::ExifDisplay,
+        ],
     },
     TreeCategory {
         label: "見開き表示",
@@ -206,10 +213,8 @@ impl App {
                 // StripBuilder の代わりに手動で左右分割
                 // 左ツリーを child_ui で配置し、残りを右パネルにする
                 let outer_rect = ui.available_rect_before_wrap();
-                let left_rect = egui::Rect::from_min_size(
-                    outer_rect.min,
-                    egui::vec2(tree_width, main_height),
-                );
+                let left_rect =
+                    egui::Rect::from_min_size(outer_rect.min, egui::vec2(tree_width, main_height));
                 let right_rect = egui::Rect::from_min_size(
                     egui::pos2(outer_rect.min.x + tree_width + 8.0, outer_rect.min.y),
                     egui::vec2(
@@ -219,9 +224,11 @@ impl App {
                 );
 
                 // 左ツリー
-                let mut left_ui = ui.new_child(egui::UiBuilder::new()
-                    .max_rect(left_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)));
+                let mut left_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(left_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
                 egui::ScrollArea::vertical()
                     .id_salt("pref_tree")
                     .max_height(main_height)
@@ -239,9 +246,11 @@ impl App {
                 );
 
                 // 右パネル
-                let mut right_ui = ui.new_child(egui::UiBuilder::new()
-                    .max_rect(right_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)));
+                let mut right_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(right_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
                 egui::ScrollArea::vertical()
                     .id_salt("pref_panel")
                     .max_height(main_height)
@@ -346,7 +355,8 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
             // カテゴリヘッダ: クリックで展開/折り畳み
             // カテゴリ自体がページを持つ場合は選択もする
             let is_cat_selected = cat.page.is_some_and(|p| state.selected == p);
-            let resp = ui.selectable_label(is_cat_selected, egui::RichText::new(header_text).strong());
+            let resp =
+                ui.selectable_label(is_cat_selected, egui::RichText::new(header_text).strong());
             if resp.clicked() {
                 if is_expanded {
                     state.expanded.remove(cat.label);
@@ -453,7 +463,10 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
     ui.checkbox(&mut s.show_toolbar_folder, "フォルダ (アドレスバー)");
-    ui.checkbox(&mut s.show_toolbar_parent_button, "上のフォルダへ (⬆ ボタン)");
+    ui.checkbox(
+        &mut s.show_toolbar_parent_button,
+        "上のフォルダへ (⬆ ボタン)",
+    );
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
 
     // ── 列 ──
@@ -487,9 +500,8 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 if checked {
                     s.toolbar_aspect_items.push(aspect);
                     let order: Vec<_> = ThumbAspect::all().to_vec();
-                    s.toolbar_aspect_items.sort_by_key(|a| {
-                        order.iter().position(|o| o == a).unwrap_or(usize::MAX)
-                    });
+                    s.toolbar_aspect_items
+                        .sort_by_key(|a| order.iter().position(|o| o == a).unwrap_or(usize::MAX));
                 } else {
                     s.toolbar_aspect_items.retain(|&a| a != aspect);
                 }
@@ -545,7 +557,10 @@ fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if ui
         .radio(
             current_auto,
-            format!("自動（CPUコア数の半分: {} スレッド）", state.auto_thread_count),
+            format!(
+                "自動（CPUコア数の半分: {} スレッド）",
+                state.auto_thread_count
+            ),
         )
         .clicked()
     {
@@ -971,8 +986,7 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pres
     ui.horizontal(|ui| {
         ui.label("カスタム追加:");
         let response = ui.text_edit_singleline(&mut state.exif_add_tag_input);
-        if (ui.button("追加").clicked()
-            || (response.lost_focus() && enter_pressed))
+        if (ui.button("追加").clicked() || (response.lost_focus() && enter_pressed))
             && !state.exif_add_tag_input.trim().is_empty()
         {
             let tag = state.exif_add_tag_input.trim().to_string();
@@ -985,9 +999,11 @@ fn page_exif_display(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pres
         }
     });
     ui.label(
-        egui::RichText::new("MakerNote 系などリストに無いタグはここから追加できます (内部名で入力)。")
-            .small()
-            .color(egui::Color32::from_gray(140)),
+        egui::RichText::new(
+            "MakerNote 系などリストに無いタグはここから追加できます (内部名で入力)。",
+        )
+        .small()
+        .color(egui::Color32::from_gray(140)),
     );
 
     ui.add_space(4.0);
@@ -1130,14 +1146,11 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
             for tag in &custom {
                 let row = ui.horizontal(|ui| {
                     ui.label(tag);
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("×").clicked() {
-                                to_remove = Some(tag.clone());
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            to_remove = Some(tag.clone());
+                        }
+                    });
                 });
                 // 直前に追加された行を viewport にスクロールイン
                 if scroll_target.as_deref() == Some(tag.as_str()) {
@@ -1158,7 +1171,9 @@ fn draw_exif_custom_tags(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    ui.label("フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。");
+    ui.label(
+        "フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。",
+    );
     ui.add_space(4.0);
     egui::ComboBox::from_label("デフォルトの表示モード")
         .selected_text(s.default_spread_mode.label())
@@ -1172,10 +1187,7 @@ fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    ui.checkbox(
-        &mut s.susie_enabled,
-        "Susie 画像プラグインを有効にする",
-    );
+    ui.checkbox(&mut s.susie_enabled, "Susie 画像プラグインを有効にする");
     ui.label(
         egui::RichText::new(
             "OFF にするとプラグインフォルダを読み込まなくなります。\n\
@@ -1235,14 +1247,16 @@ fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(egui::RichText::new("ロード済みプラグイン").strong());
     ui.add_space(4.0);
     let status = crate::susie_loader::pool_status(s.susie_enabled);
-    let plugins: Vec<crate::susie_loader::PluginInfo> =
-        if matches!(status, crate::susie_loader::PoolStatus::ReadyWithPlugins { .. }) {
-            crate::susie_loader::try_get_pool()
-                .map(|pool| pool.plugins().to_vec())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    let plugins: Vec<crate::susie_loader::PluginInfo> = if matches!(
+        status,
+        crate::susie_loader::PoolStatus::ReadyWithPlugins { .. }
+    ) {
+        crate::susie_loader::try_get_pool()
+            .map(|pool| pool.plugins().to_vec())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     crate::ui_susie_diagnostic::render_diagnostic(ui, &status, &plugins);
 }
 
@@ -1253,9 +1267,7 @@ fn open_in_explorer(path: &std::path::Path) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer.exe")
-            .arg(path)
-            .spawn();
+        let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
     }
     #[cfg(not(windows))]
     {

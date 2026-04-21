@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 /// PDF レンダ要求の優先度。
 ///
@@ -84,8 +84,7 @@ fn ensure_dll_extracted() -> Result<&'static PathBuf, String> {
     DLL_PATH
         .get_or_init(|| {
             let dir = crate::data_dir::get();
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("data_dir create failed: {e}"))?;
+            std::fs::create_dir_all(&dir).map_err(|e| format!("data_dir create failed: {e}"))?;
             let dll_path = dir.join("pdfium.dll");
             crate::data_dir::extract_embedded_file(&dll_path, PDFIUM_DLL_BYTES, "pdfium.dll")
                 .map_err(|e| format!("pdfium.dll extract failed: {e}"))?;
@@ -378,10 +377,8 @@ fn decode_path_and_password(payload: &[u8]) -> std::io::Result<(PathBuf, Option<
             "payload truncated",
         ));
     }
-    let path_str =
-        std::str::from_utf8(&payload[2..2 + path_len]).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+    let path_str = std::str::from_utf8(&payload[2..2 + path_len])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let rest = &payload[2 + path_len..];
     let pw_len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
     let password = if pw_len > 0 {
@@ -427,13 +424,13 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
                     "render request truncated",
                 ));
             }
-            let path_str =
-                std::str::from_utf8(&payload[2..2 + path_len]).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
+            let path_str = std::str::from_utf8(&payload[2..2 + path_len])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let after_path = &payload[2 + path_len..];
-            let page_num = u32::from_le_bytes([after_path[0], after_path[1], after_path[2], after_path[3]]);
-            let target_px = u32::from_le_bytes([after_path[4], after_path[5], after_path[6], after_path[7]]);
+            let page_num =
+                u32::from_le_bytes([after_path[0], after_path[1], after_path[2], after_path[3]]);
+            let target_px =
+                u32::from_le_bytes([after_path[4], after_path[5], after_path[6], after_path[7]]);
             let pw_payload = &after_path[8..];
             let pw_len = u16::from_le_bytes([pw_payload[0], pw_payload[1]]) as usize;
             let password = if pw_len > 0 && pw_payload.len() >= 2 + pw_len {
@@ -505,11 +502,9 @@ pub fn run_worker_process() {
         }
     };
 
-    let bindings = match Pdfium::bind_to_library(
-        Pdfium::pdfium_platform_library_name_at_path(
-            dll_dir.to_str().unwrap_or(""),
-        ),
-    ) {
+    let bindings = match Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+        dll_dir.to_str().unwrap_or(""),
+    )) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("pdf-worker: PDFium binding failed: {e}");
@@ -538,20 +533,35 @@ pub fn run_worker_process() {
         match req {
             DecodedRequest::Enumerate { path, password } => {
                 match ipc_enumerate(&pdfium, &path, password.as_deref()) {
-                    Ok(resp) => { let _ = write_msg(&mut stdout, &resp); }
-                    Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
+                    Ok(resp) => {
+                        let _ = write_msg(&mut stdout, &resp);
+                    }
+                    Err(e) => {
+                        let _ = send_error(&mut stdout, &e.to_string());
+                    }
                 }
             }
-            DecodedRequest::Render { path, page_num, target_px, password } => {
-                match ipc_render(&pdfium, &path, page_num, target_px, password.as_deref()) {
-                    Ok(resp) => { let _ = write_msg(&mut stdout, &resp); }
-                    Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
+            DecodedRequest::Render {
+                path,
+                page_num,
+                target_px,
+                password,
+            } => match ipc_render(&pdfium, &path, page_num, target_px, password.as_deref()) {
+                Ok(resp) => {
+                    let _ = write_msg(&mut stdout, &resp);
                 }
-            }
+                Err(e) => {
+                    let _ = send_error(&mut stdout, &e.to_string());
+                }
+            },
             DecodedRequest::GetInfo { path, password } => {
                 match ipc_get_info(&pdfium, &path, password.as_deref()) {
-                    Ok(resp) => { let _ = write_msg(&mut stdout, &resp); }
-                    Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
+                    Ok(resp) => {
+                        let _ = write_msg(&mut stdout, &resp);
+                    }
+                    Err(e) => {
+                        let _ = send_error(&mut stdout, &e.to_string());
+                    }
                 }
             }
             DecodedRequest::Shutdown => break,
@@ -567,11 +577,7 @@ fn send_error(w: &mut impl std::io::Write, msg: &str) -> std::io::Result<()> {
 }
 
 /// core_enumerate の結果を IPC バイナリにシリアライズする。
-fn ipc_enumerate(
-    pdfium: &Pdfium,
-    path: &Path,
-    password: Option<&str>,
-) -> std::io::Result<Vec<u8>> {
+fn ipc_enumerate(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io::Result<Vec<u8>> {
     let entries = core_enumerate(pdfium, path, password)?;
     let count = entries.len() as u32;
     let mut buf = Vec::with_capacity(1 + 4 + entries.len() * 16);
@@ -616,11 +622,7 @@ fn core_get_info(
 
 /// core_get_info の結果を IPC バイナリにシリアライズする。
 /// フォーマット: [status][4B title_len][title_bytes][4B author_len][author_bytes]...×4
-fn ipc_get_info(
-    pdfium: &Pdfium,
-    path: &Path,
-    password: Option<&str>,
-) -> std::io::Result<Vec<u8>> {
+fn ipc_get_info(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io::Result<Vec<u8>> {
     let info = core_get_info(pdfium, path, password)?;
     let mut buf = Vec::with_capacity(256);
     buf.push(STATUS_OK);
@@ -706,19 +708,24 @@ fn spawn_worker_process(exe_path: &Path) -> std::io::Result<(Child, ProcessWorke
     }
 
     let mut child = cmd.spawn()?;
-    let stdin = child.stdin.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "no stdin")
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "no stdout")
-    })?;
-    Ok((child, ProcessWorkerIo { stdin, stdout: std::io::BufReader::new(stdout) }))
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
+    Ok((
+        child,
+        ProcessWorkerIo {
+            stdin,
+            stdout: std::io::BufReader::new(stdout),
+        },
+    ))
 }
 
-fn send_recv_io(
-    io: &mut ProcessWorkerIo,
-    request: &[u8],
-) -> std::io::Result<Vec<u8>> {
+fn send_recv_io(io: &mut ProcessWorkerIo, request: &[u8]) -> std::io::Result<Vec<u8>> {
     write_msg(&mut io.stdin, request)?;
     read_msg(&mut io.stdout)
 }
@@ -763,7 +770,8 @@ fn get_pool() -> &'static PdfWorkerPool {
 
 impl PdfWorkerPool {
     fn start() -> Self {
-        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
+        let exe_path =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
         let _ = ensure_dll_extracted();
 
         let queue = Arc::new((
@@ -863,9 +871,13 @@ impl PdfWorkerPool {
                     {
                         if crate::perf::is_enabled() {
                             let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
-                            crate::perf::event("pdf", "pool_cancel_requester", None, 0, &[
-                                ("waited_ms", serde_json::Value::from(waited_ms)),
-                            ]);
+                            crate::perf::event(
+                                "pdf",
+                                "pool_cancel_requester",
+                                None,
+                                0,
+                                &[("waited_ms", serde_json::Value::from(waited_ms))],
+                            );
                         }
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
@@ -885,25 +897,38 @@ impl PdfWorkerPool {
 
     fn parse_enumerate_response(data: &[u8]) -> std::io::Result<Vec<PdfPageEntry>> {
         if data.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty response",
+            ));
         }
         if data[0] == STATUS_ERR {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
         if data[0] != STATUS_OK || data.len() < 5 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid enumerate response"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid enumerate response",
+            ));
         }
         let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
         let mut entries = Vec::with_capacity(count);
         let mut offset = 5;
         for i in 0..count {
             if offset + 16 > data.len() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "enumerate response truncated"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "enumerate response truncated",
+                ));
             }
             let mtime = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             let file_size = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
-            entries.push(PdfPageEntry { page_num: i as u32, mtime, file_size });
+            entries.push(PdfPageEntry {
+                page_num: i as u32,
+                mtime,
+                file_size,
+            });
             offset += 16;
         }
         Ok(entries)
@@ -914,24 +939,36 @@ impl PdfWorkerPool {
     ///             [4B subject_len][subject_bytes][4B keywords_len][keywords_bytes]
     fn parse_get_info_response(data: &[u8]) -> std::io::Result<PdfDocumentInfo> {
         if data.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty response",
+            ));
         }
         if data[0] == STATUS_ERR {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
         if data[0] != STATUS_OK {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid get_info response"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid get_info response",
+            ));
         }
         let mut offset = 1;
         let read_field = |data: &[u8], offset: &mut usize| -> std::io::Result<Option<String>> {
             if *offset + 4 > data.len() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "get_info truncated"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "get_info truncated",
+                ));
             }
             let len = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
             *offset += 4;
             if *offset + len > data.len() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "get_info field truncated"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "get_info field truncated",
+                ));
             }
             let s = if len == 0 {
                 None
@@ -947,12 +984,22 @@ impl PdfWorkerPool {
         let author = read_field(data, &mut offset)?;
         let subject = read_field(data, &mut offset)?;
         let keywords = read_field(data, &mut offset)?;
-        Ok(PdfDocumentInfo { title, author, subject, keywords })
+        Ok(PdfDocumentInfo {
+            title,
+            author,
+            subject,
+            keywords,
+        })
     }
 
-    fn parse_render_response(data: &[u8]) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
+    fn parse_render_response(
+        data: &[u8],
+    ) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
         if data.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty response",
+            ));
         }
         if data[0] == STATUS_ERR {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
@@ -960,7 +1007,10 @@ impl PdfWorkerPool {
         }
         // [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][pixels...]
         if data[0] != STATUS_OK || data.len() < 18 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid render response"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid render response",
+            ));
         }
         let w = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
         let h = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
@@ -968,7 +1018,10 @@ impl PdfWorkerPool {
         let raster_w = u32::from_le_bytes(data[10..14].try_into().unwrap());
         let raster_h = u32::from_le_bytes(data[14..18].try_into().unwrap());
         let content_type = if type_tag == 1 {
-            PdfPageContentType::Raster { w: raster_w, h: raster_h }
+            PdfPageContentType::Raster {
+                w: raster_w,
+                h: raster_h,
+            }
         } else {
             PdfPageContentType::Vector
         };
@@ -977,11 +1030,17 @@ impl PdfWorkerPool {
         if pixels.len() != expected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("pixel data mismatch: expected {expected}, got {}", pixels.len()),
+                format!(
+                    "pixel data mismatch: expected {expected}, got {}",
+                    pixels.len()
+                ),
             ));
         }
         let img_buf = image::RgbaImage::from_raw(w, h, pixels.to_vec()).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to create RgbaImage")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "failed to create RgbaImage",
+            )
         })?;
         Ok((image::DynamicImage::ImageRgba8(img_buf), content_type))
     }
@@ -1053,10 +1112,16 @@ fn run_dispatcher(
         if cancelled {
             if crate::perf::is_enabled() {
                 let waited_ms = job.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                crate::perf::event("pdf", "pool_cancel_queued", job.perf_key.as_deref(), 0, &[
-                    ("waited_ms", serde_json::Value::from(waited_ms)),
-                    ("pid", serde_json::Value::from(pid)),
-                ]);
+                crate::perf::event(
+                    "pdf",
+                    "pool_cancel_queued",
+                    job.perf_key.as_deref(),
+                    0,
+                    &[
+                        ("waited_ms", serde_json::Value::from(waited_ms)),
+                        ("pid", serde_json::Value::from(pid)),
+                    ],
+                );
             }
             let _ = job.reply.send(Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -1066,11 +1131,20 @@ fn run_dispatcher(
             // ── IPC 実行 ──
             if crate::perf::is_enabled() {
                 let wait_ms = job.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                crate::perf::event("pdf", "pool_dispatch", job.perf_key.as_deref(), 0, &[
-                    ("wait_ms", serde_json::Value::from(wait_ms)),
-                    ("pid", serde_json::Value::from(pid)),
-                    ("priority", serde_json::Value::from(format!("{:?}", job.priority))),
-                ]);
+                crate::perf::event(
+                    "pdf",
+                    "pool_dispatch",
+                    job.perf_key.as_deref(),
+                    0,
+                    &[
+                        ("wait_ms", serde_json::Value::from(wait_ms)),
+                        ("pid", serde_json::Value::from(pid)),
+                        (
+                            "priority",
+                            serde_json::Value::from(format!("{:?}", job.priority)),
+                        ),
+                    ],
+                );
             }
             let result = send_recv_io(&mut io, &job.request);
             // reply 側 (requester) が既に recv_timeout で bail していると送信は失敗するが、
@@ -1095,7 +1169,9 @@ fn run_dispatcher(
     }
 
     // ── Shutdown パス ──
-    crate::logger::log(format!("pdf-pool: worker {worker_id} shutting down (pid={pid})"));
+    crate::logger::log(format!(
+        "pdf-pool: worker {worker_id} shutting down (pid={pid})"
+    ));
     let _ = write_msg(&mut io.stdin, &encode_shutdown_request());
     let _ = child.wait();
 }
@@ -1176,7 +1252,10 @@ impl PdfWorker {
                         crate::logger::log(format!("pdf-worker: init failed: {e}"));
                         loop {
                             match priority_rx.try_recv() {
-                                Ok(req) => { Self::reply_init_error(&req, &e); continue; }
+                                Ok(req) => {
+                                    Self::reply_init_error(&req, &e);
+                                    continue;
+                                }
                                 Err(mpsc::TryRecvError::Disconnected) => return,
                                 Err(mpsc::TryRecvError::Empty) => {}
                             }
@@ -1219,13 +1298,24 @@ impl PdfWorker {
 
     fn handle_request(pdfium: &Pdfium, req: WorkerRequest) {
         match req {
-            WorkerRequest::Enumerate { path, password, reply } => {
+            WorkerRequest::Enumerate {
+                path,
+                password,
+                reply,
+            } => {
                 let _ = reply.send(core_enumerate(pdfium, &path, password.as_deref()));
             }
             WorkerRequest::CheckPassword { path, reply } => {
                 let _ = reply.send(Self::do_check_password(pdfium, &path));
             }
-            WorkerRequest::Render { path, page_num, target_px, password, cancel, reply } => {
+            WorkerRequest::Render {
+                path,
+                page_num,
+                target_px,
+                password,
+                cancel,
+                reply,
+            } => {
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                     return;
                 }
@@ -1235,7 +1325,11 @@ impl PdfWorker {
                 }
                 let _ = reply.send(result);
             }
-            WorkerRequest::GetInfo { path, password, reply } => {
+            WorkerRequest::GetInfo {
+                path,
+                password,
+                reply,
+            } => {
                 let _ = reply.send(core_get_info(pdfium, &path, password.as_deref()));
             }
         }
@@ -1247,11 +1341,9 @@ impl PdfWorker {
             .parent()
             .ok_or_else(|| "cannot determine DLL directory".to_string())?;
 
-        let bindings = Pdfium::bind_to_library(
-            Pdfium::pdfium_platform_library_name_at_path(
-                dll_dir.to_str().ok_or("non-UTF8 path")?,
-            ),
-        )
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+            dll_dir.to_str().ok_or("non-UTF8 path")?,
+        ))
         .map_err(|e| format!("PDFium binding failed: {e}"))?;
         Ok(Pdfium::new(bindings))
     }
@@ -1259,16 +1351,25 @@ impl PdfWorker {
     fn reply_init_error(req: &WorkerRequest, e: &str) {
         match req {
             WorkerRequest::Enumerate { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
             }
             WorkerRequest::CheckPassword { reply, .. } => {
                 let _ = reply.send(PdfAccessStatus::Error(e.to_string()));
             }
             WorkerRequest::Render { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
             }
             WorkerRequest::GetInfo { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                let _ = reply.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )));
             }
         }
     }
@@ -1276,9 +1377,9 @@ impl PdfWorker {
     fn do_check_password(pdfium: &Pdfium, path: &Path) -> PdfAccessStatus {
         match pdfium.load_pdf_from_file(path, None) {
             Ok(_) => PdfAccessStatus::Ok,
-            Err(PdfiumError::PdfiumLibraryInternalError(
-                PdfiumInternalError::PasswordError,
-            )) => PdfAccessStatus::PasswordRequired,
+            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
+                PdfAccessStatus::PasswordRequired
+            }
             Err(e) => PdfAccessStatus::Error(format!("{e}")),
         }
     }
@@ -1331,10 +1432,26 @@ impl PdfDocumentInfo {
     /// `search_norm::normalize_for_match` は呼ばない (呼び出し側で行う)。
     pub fn as_search_text(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
-        if let Some(s) = self.title.as_deref() { if !s.is_empty() { parts.push(s); } }
-        if let Some(s) = self.author.as_deref() { if !s.is_empty() { parts.push(s); } }
-        if let Some(s) = self.subject.as_deref() { if !s.is_empty() { parts.push(s); } }
-        if let Some(s) = self.keywords.as_deref() { if !s.is_empty() { parts.push(s); } }
+        if let Some(s) = self.title.as_deref() {
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
+        if let Some(s) = self.author.as_deref() {
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
+        if let Some(s) = self.subject.as_deref() {
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
+        if let Some(s) = self.keywords.as_deref() {
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
         parts.join(" ")
     }
 }
@@ -1407,7 +1524,10 @@ pub fn render_page(
     priority: JobPriority,
 ) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
     }
 
     let perf_enabled = crate::perf::is_enabled();
@@ -1418,33 +1538,49 @@ pub fn render_page(
     if pool.worker_count > 0 {
         if perf_enabled {
             let busy_count = pool.workers_busy();
-            crate::perf::event("pdf", "pool_send", Some(&perf_key), 0, &[
-                ("page", serde_json::Value::from(page_num)),
-                ("target_px", serde_json::Value::from(target_px)),
-                ("busy", serde_json::Value::from(busy_count)),
-                ("total", serde_json::Value::from(pool.worker_count)),
-                ("priority", serde_json::Value::from(format!("{priority:?}"))),
-            ]);
+            crate::perf::event(
+                "pdf",
+                "pool_send",
+                Some(&perf_key),
+                0,
+                &[
+                    ("page", serde_json::Value::from(page_num)),
+                    ("target_px", serde_json::Value::from(target_px)),
+                    ("busy", serde_json::Value::from(busy_count)),
+                    ("total", serde_json::Value::from(pool.worker_count)),
+                    ("priority", serde_json::Value::from(format!("{priority:?}"))),
+                ],
+            );
         }
         let req = encode_render_request(pdf_path, page_num, target_px, password);
         let resp = pool.execute(&req, cancel.as_ref(), priority, Some(perf_key.clone()))?;
         let result = PdfWorkerPool::parse_render_response(&resp);
         if perf_enabled {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            crate::perf::event("pdf", "pool_recv", Some(&perf_key), 0, &[
-                ("page", serde_json::Value::from(page_num)),
-                ("rtt_ms", serde_json::Value::from(ms)),
-                ("ok", serde_json::Value::from(result.is_ok())),
-            ]);
+            crate::perf::event(
+                "pdf",
+                "pool_recv",
+                Some(&perf_key),
+                0,
+                &[
+                    ("page", serde_json::Value::from(page_num)),
+                    ("rtt_ms", serde_json::Value::from(ms)),
+                    ("ok", serde_json::Value::from(result.is_ok())),
+                ],
+            );
         }
         return result;
     }
 
     // フォールバック: in-process ワーカー
     if perf_enabled {
-        crate::perf::event("pdf", "inproc_send", Some(&perf_key), 0, &[
-            ("page", serde_json::Value::from(page_num)),
-        ]);
+        crate::perf::event(
+            "pdf",
+            "inproc_send",
+            Some(&perf_key),
+            0,
+            &[("page", serde_json::Value::from(page_num))],
+        );
     }
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().tx.send(WorkerRequest::Render {
@@ -1455,15 +1591,22 @@ pub fn render_page(
         cancel,
         reply: tx,
     });
-    let result = rx.recv()
+    let result = rx
+        .recv()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
     if perf_enabled {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        crate::perf::event("pdf", "inproc_recv", Some(&perf_key), 0, &[
-            ("page", serde_json::Value::from(page_num)),
-            ("rtt_ms", serde_json::Value::from(ms)),
-            ("ok", serde_json::Value::from(result.is_ok())),
-        ]);
+        crate::perf::event(
+            "pdf",
+            "inproc_recv",
+            Some(&perf_key),
+            0,
+            &[
+                ("page", serde_json::Value::from(page_num)),
+                ("rtt_ms", serde_json::Value::from(ms)),
+                ("ok", serde_json::Value::from(result.is_ok())),
+            ],
+        );
     }
     result
 }
@@ -1474,7 +1617,8 @@ pub fn check_password_needed(pdf_path: &Path) -> PdfAccessStatus {
         path: pdf_path.to_path_buf(),
         reply: tx,
     });
-    rx.recv().unwrap_or(PdfAccessStatus::Error("worker channel closed".to_string()))
+    rx.recv()
+        .unwrap_or(PdfAccessStatus::Error("worker channel closed".to_string()))
 }
 
 // -----------------------------------------------------------------------
@@ -1486,7 +1630,10 @@ pub fn render_page_async(
     page_num: u32,
     target_px: u32,
     password: Option<&str>,
-) -> (Arc<AtomicBool>, mpsc::Receiver<std::io::Result<(image::DynamicImage, PdfPageContentType)>>) {
+) -> (
+    Arc<AtomicBool>,
+    mpsc::Receiver<std::io::Result<(image::DynamicImage, PdfPageContentType)>>,
+) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Render {
@@ -1517,9 +1664,7 @@ pub fn enumerate_pages_async(
     rx
 }
 
-pub fn check_password_async(
-    pdf_path: &Path,
-) -> mpsc::Receiver<PdfAccessStatus> {
+pub fn check_password_async(pdf_path: &Path) -> mpsc::Receiver<PdfAccessStatus> {
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::CheckPassword {
         path: pdf_path.to_path_buf(),

@@ -34,7 +34,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 
 // -----------------------------------------------------------------------
 // ワーカー exe の埋め込みと APPDATA への展開
@@ -123,8 +123,8 @@ fn worker_exe_cached_path() -> PathBuf {
 mod susie_protocol;
 
 use susie_protocol::{
-    read_msg, write_msg, MSG_DECODE_BYTES, MSG_DECODE_FILE, MSG_HANDSHAKE, MSG_SHUTDOWN,
-    STATUS_ERR, STATUS_OK,
+    MSG_DECODE_BYTES, MSG_DECODE_FILE, MSG_HANDSHAKE, MSG_SHUTDOWN, STATUS_ERR, STATUS_OK,
+    read_msg, write_msg,
 };
 
 /// ワーカーバイナリ名 (リリース時には `mimageviewer.exe` と同じディレクトリに配置)。
@@ -476,9 +476,7 @@ pub fn supports_extension(ext_lower: &str) -> bool {
 
 /// プラグインフォルダ更新 / 並列オプション変更時にワーカープールを再起動する。
 pub fn reload(enabled: bool, parallel: bool) {
-    let lock = POOL.get_or_init(|| {
-        RwLock::new(Arc::new(empty_pool()))
-    });
+    let lock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
     let new_pool = if enabled {
         SusieWorkerPool::start(parallel)
     } else {

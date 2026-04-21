@@ -25,17 +25,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// - cr2/nef/arw 等 → Raw Image Extension
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // image クレートで直接デコード
-    "jpg", "jpeg", "png", "webp", "bmp", "gif",
-    // WIC 経由 (モダン形式)
+    "jpg", "jpeg", "png", "webp", "bmp", "gif", // WIC 経由 (モダン形式)
     "heic", "heif", "avif", "jxl",
     // WIC 経由 (TIFF: image クレートも対応するが WIC の方が高機能)
-    "tiff", "tif",
-    // WIC 経由 (カメラ RAW)
-    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
-    "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
+    "tiff", "tif", // WIC 経由 (カメラ RAW)
+    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
+    "rwl", "iiq",
 ];
-pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] =
-    &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 
 /// 拡張子 (小文字、先頭 `.` なし) が画像として扱えるか判定する。
 ///
@@ -188,15 +185,26 @@ where
             return None;
         }
         if folder_should_stop(&candidate, cancel) {
-            return Some(FolderNavOutcome { path: candidate, hit_image_folder: true });
+            return Some(FolderNavOutcome {
+                path: candidate,
+                hit_image_folder: true,
+            });
         }
         match nav_fn(&candidate) {
             Some(next) => candidate = next,
-            None => return Some(FolderNavOutcome { path: first, hit_image_folder: false }),
+            None => {
+                return Some(FolderNavOutcome {
+                    path: first,
+                    hit_image_folder: false,
+                });
+            }
         }
     }
     // skip_limit 回分全て画像なし → 直近の隣フォルダにフォールバック
-    Some(FolderNavOutcome { path: first, hit_image_folder: false })
+    Some(FolderNavOutcome {
+        path: first,
+        hit_image_folder: false,
+    })
 }
 
 /// 深さ優先前順で次のフォルダを返す。
@@ -297,8 +305,7 @@ pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
     let skip_zip = settings.skip_zip_if_folder_exists;
 
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut real_folder_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut real_folder_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut zip_candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(path) {

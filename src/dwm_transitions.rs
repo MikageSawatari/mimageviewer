@@ -14,7 +14,7 @@
 //! Windows 11 で効きが不安定という報告があるため、失敗は無視 (ベストエフォート)。
 
 use windows::Win32::Foundation::{HWND, LPARAM};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
 use windows::core::BOOL;

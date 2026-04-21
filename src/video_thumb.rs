@@ -60,8 +60,8 @@ pub fn get_video_thumbnail(
 ) -> (Option<egui::ColorImage>, VideoThumbDiag) {
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDIBits, GetObjectA, SelectObject,
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+        DeleteObject, GetDIBits, GetObjectA, SelectObject,
     };
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_RESIZETOFIT,
@@ -105,7 +105,10 @@ pub fn get_video_thumbnail(
 
         // SIIGBF_THUMBNAILONLY: 汎用アイコンにフォールバックせず、本物のサムネだけ返す。
         // 未抽出なら失敗扱い (呼び出し側でリトライ)。
-        let sz = SIZE { cx: shell_size, cy: shell_size };
+        let sz = SIZE {
+            cx: shell_size,
+            cy: shell_size,
+        };
         let t0 = Instant::now();
         let hbmp = match factory.GetImage(sz, SIIGBF_RESIZETOFIT | SIIGBF_THUMBNAILONLY) {
             Ok(h) => {

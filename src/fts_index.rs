@@ -35,11 +35,11 @@ use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED,
-    STRING,
+    Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
+    Value,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer};
-use tantivy::{doc, DocAddress, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term};
+use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term, doc};
 use uuid::Uuid;
 
 const BIGRAM_TOKENIZER_NAME: &str = "mimv_bigram";
@@ -95,7 +95,9 @@ impl Fields {
             path: schema.get_field("path").expect("schema: path"),
             container: schema.get_field("container").expect("schema: container"),
             zip_entry: schema.get_field("zip_entry").expect("schema: zip_entry"),
-            favorite_id: schema.get_field("favorite_id").expect("schema: favorite_id"),
+            favorite_id: schema
+                .get_field("favorite_id")
+                .expect("schema: favorite_id"),
             mtime: schema.get_field("mtime").expect("schema: mtime"),
             file_size: schema.get_field("file_size").expect("schema: file_size"),
             name: schema.get_field("name").expect("schema: name"),
@@ -166,11 +168,7 @@ impl FtsIndex {
 }
 
 /// `IndexWriter` に 1 doc を追加する。`delete + add` パターンで更新も兼ねる (§5.6.1)。
-pub fn upsert_doc(
-    writer: &IndexWriter,
-    fields: &Fields,
-    d: &IndexDoc,
-) -> tantivy::Result<()> {
+pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantivy::Result<()> {
     // 既存 doc を delete してから add (Tantivy の更新は delete + reinsert が基本)
     writer.delete_term(Term::from_field_text(fields.path, &d.path));
     writer.add_document(doc!(
@@ -224,7 +222,8 @@ pub fn build_bigram_and_query(
     }
 
     // 各 include トークンを個別に bigram 化し、トークン毎に AND の BooleanQuery を作る
-    let mut token_queries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(include_tokens.len() + 1);
+    let mut token_queries: Vec<(Occur, Box<dyn Query>)> =
+        Vec::with_capacity(include_tokens.len() + 1);
     for tok in include_tokens {
         let lowered = crate::search_norm::normalize_for_match(tok);
         let mut tokenizer = NgramTokenizer::new(2, 2, false).ok()?;
@@ -388,7 +387,12 @@ mod tests {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "cat photo")).unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav, "cat photo"),
+        )
+        .unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
@@ -399,7 +403,12 @@ mod tests {
         assert_eq!(hits.len(), 1);
 
         // 同じ path で別テキスト → 更新
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "dog photo")).unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav, "dog photo"),
+        )
+        .unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
@@ -417,8 +426,7 @@ mod tests {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "alpha"))
-            .unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "alpha")).unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
@@ -524,7 +532,10 @@ mod tests {
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
-        assert!(paths.contains(&"c:/a.jpg"), "句読点挟み doc がヒットするはず");
+        assert!(
+            paths.contains(&"c:/a.jpg"),
+            "句読点挟み doc がヒットするはず"
+        );
         assert!(paths.contains(&"c:/b.jpg"), "逆順 doc もヒットするはず");
         assert!(!paths.contains(&"c:/c.jpg"), "片方だけは除外");
     }
@@ -534,10 +545,13 @@ mod tests {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "夕焼け"))
-            .unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav, "海辺"))
-            .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav, "夕焼け"),
+        )
+        .unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav, "海辺")).unwrap();
         upsert_doc(
             &writer,
             idx.fields(),
@@ -556,7 +570,10 @@ mod tests {
         let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"c:/a.jpg"));
         assert!(paths.contains(&"c:/c.jpg"));
-        assert!(!paths.contains(&"c:/b.jpg"), "海辺 doc には夕焼けの bigram なし");
+        assert!(
+            !paths.contains(&"c:/b.jpg"),
+            "海辺 doc には夕焼けの bigram なし"
+        );
     }
 
     #[test]
@@ -568,11 +585,7 @@ mod tests {
             upsert_doc(
                 &writer,
                 idx.fields(),
-                &sample_doc(
-                    &format!("c:/p/{:03}.jpg", i),
-                    fav,
-                    "夕焼け",
-                ),
+                &sample_doc(&format!("c:/p/{:03}.jpg", i), fav, "夕焼け"),
             )
             .unwrap();
         }

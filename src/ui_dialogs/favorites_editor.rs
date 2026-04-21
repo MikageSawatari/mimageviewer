@@ -358,53 +358,17 @@ impl App {
 
         if apply {
             self.settings.save();
-            // ── チェック OFF への遷移を検出して索引データをクリーンアップ (Phase 2c) ──
-            // 先に SQLite 側をクリアしてから supervisor 同期に進む。supervisor 同期は
-            // false になった favorite の supervisor を drop するだけで、データ本体は
-            // 消さないため、ここで明示的に消す必要がある。
-            if let Some(pre) = self.favorites_pre_edit_snapshot.take() {
-                for fav in &self.settings.favorites {
-                    let Some(&(old_structure, old_metadata)) = pre.get(&fav.id) else {
-                        continue;
-                    };
-                    // 名前索引 ON → OFF: search_index_db のそのお気に入り分を即削除
-                    if old_structure && !fav.auto_index_structure {
-                        if let Some(db) = self.search_index_db.as_ref() {
-                            match db.clear_for_favorite(&fav.path) {
-                                Ok(()) => crate::logger::log(format!(
-                                    "favorites_editor: cleared name index for {}",
-                                    fav.path.display()
-                                )),
-                                Err(e) => crate::logger::log(format!(
-                                    "favorites_editor: clear name index for {} failed: {e}",
-                                    fav.path.display()
-                                )),
-                            }
-                        }
-                    }
-                    // メタ索引 ON → OFF: fts_meta を tombstone 化 (検索結果から即除外)。
-                    // Tantivy doc 削除は次回起動時の reconciliation が処理する。
-                    if old_metadata && !fav.auto_index_metadata {
-                        if let Some(mgr) = self.indexer_manager.as_ref() {
-                            let n = mgr.purge_favorite_metadata(fav.id);
-                            crate::logger::log(format!(
-                                "favorites_editor: tombstoned {n} meta rows for {}",
-                                fav.path.display()
-                            ));
-                        }
-                    }
-                }
-            }
+            // 編集前後のフラグ差分から「false→true で bulk 起動」「true→false で索引削除」を決める。
+            // snapshot に無い favorite は新規追加なので、fav_add 側で起動済み (TODO: fav_add 側でまだ bulk 呼ばれていない)。
+            let transitions = self.compute_favorite_index_transitions();
+            self.apply_favorite_index_cleanup(&transitions);
             // インデクサに反映: ON/OFF 切り替えで Supervisor を spawn/stop する。
             if let Some(mgr) = self.indexer_manager.as_mut() {
                 mgr.sync_with_favorites(&self.settings.favorites);
             }
-            // 「名前」フル索引化フラグが ON かつまだ索引未作成の favorite について、
-            // バックグラウンドで 1 回フルスキャンを走らせる (Phase 2b)。
-            self.trigger_name_bulk_for_enabled_favorites();
+            self.apply_favorite_index_bulk_start(&transitions);
             self.show_favorites_editor = false;
         } else if cancel || !open {
-            // キャンセル: 設定を再読み込みして変更を破棄
             self.settings = crate::settings::Settings::load();
             self.favorites_pre_edit_snapshot = None;
             self.show_favorites_editor = false;
@@ -433,9 +397,11 @@ impl App {
             self.cc.result = None;
             self.cc.total.store(0, std::sync::atomic::Ordering::Relaxed);
             self.cc.done.store(0, std::sync::atomic::Ordering::Relaxed);
-            self.cc.cache_size
+            self.cc
+                .cache_size
                 .store(0, std::sync::atomic::Ordering::Relaxed);
-            self.cc.finished
+            self.cc
+                .finished
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             *self.cc.current.lock().unwrap() = String::new();
             self.cc.show = true;

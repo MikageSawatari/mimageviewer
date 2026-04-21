@@ -134,11 +134,7 @@ impl SidecarFile {
             Ok(s) => s,
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return me,
             Err(e) => {
-                crate::logger::log(format!(
-                    "sidecar: read failed: {} ({})",
-                    path.display(),
-                    e
-                ));
+                crate::logger::log(format!("sidecar: read failed: {} ({})", path.display(), e));
                 return me;
             }
         };
@@ -314,11 +310,7 @@ impl SidecarFile {
         // アトミック書き込み: temp → rename
         let tmp = self.folder.join(format!("{SIDECAR_FILENAME}.tmp"));
         if let Err(e) = std::fs::write(&tmp, &json) {
-            crate::logger::log(format!(
-                "sidecar: write failed: {} ({})",
-                tmp.display(),
-                e
-            ));
+            crate::logger::log(format!("sidecar: write failed: {} ({})", tmp.display(), e));
             self.disabled = true;
             return;
         }
@@ -435,7 +427,10 @@ pub fn import_to_dbs(
             if db.get(&abs_key, w, h).is_none() {
                 if let Some(raw) = mask.decode() {
                     let vectors_json = crate::mask_db::vectors_to_json(&mask.vectors);
-                    if db.set_raw(&abs_key, &raw, vectors_json.as_deref(), w, h).is_ok() {
+                    if db
+                        .set_raw(&abs_key, &raw, vectors_json.as_deref(), w, h)
+                        .is_ok()
+                    {
                         stats.imported_mask += 1;
                     }
                 }
@@ -453,7 +448,7 @@ pub fn import_to_dbs(
 fn mark_hidden_system(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
-        SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW,
     };
     use windows::core::PCWSTR;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
@@ -468,7 +463,7 @@ fn mark_hidden_system(path: &Path) {
 #[cfg(windows)]
 fn clear_hidden_system(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_NORMAL};
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
     use windows::core::PCWSTR;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     unsafe {
@@ -518,7 +513,15 @@ mod tests {
     fn entry_empty_after_removing_both() {
         let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
         s.set_adjust("img.jpg", sample_params());
-        s.set_mask("img.jpg", SidecarMask { w: 2, h: 2, data: String::new(), vectors: Vec::new() });
+        s.set_mask(
+            "img.jpg",
+            SidecarMask {
+                w: 2,
+                h: 2,
+                data: String::new(),
+                vectors: Vec::new(),
+            },
+        );
         assert_eq!(s.items().len(), 1);
         s.remove_adjust("img.jpg");
         assert_eq!(s.items().len(), 1, "mask still present");

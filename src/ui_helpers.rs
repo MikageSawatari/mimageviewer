@@ -13,7 +13,8 @@ use crate::grid_item::GridItem;
 
 /// エラー表示の標準テキスト色。
 #[allow(dead_code)]
-pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(220, 60, 60);
+pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(220, 60, 60);
 /// エラー表示の標準フォントサイズ。
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
@@ -23,16 +24,20 @@ pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 /// `#[allow(dead_code)]` は lib クレート側で使用者が見えないため。実体は
 /// バイナリクレート側の `ui_main` / `ui_fullscreen` から参照される。
 #[allow(dead_code)]
-pub(crate) const PROGRESS_LABEL_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(235, 240, 250);
+pub(crate) const PROGRESS_LABEL_COLOR: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(235, 240, 250);
 /// 進捗バーの背景色（ポップアップ Frame の fill）。
 #[allow(dead_code)]
-pub(crate) const PROGRESS_BG_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgba_premultiplied(20, 25, 35, 230);
+pub(crate) const PROGRESS_BG_COLOR: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgba_premultiplied(20, 25, 35, 230);
 /// 通常の先読み進捗バーの塗色（濃い青）。
 #[allow(dead_code)]
-pub(crate) const PROGRESS_NORMAL_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(60, 130, 220);
+pub(crate) const PROGRESS_NORMAL_COLOR: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(60, 130, 220);
 /// 高画質化 / AI 先読み進捗バーの塗色（薄い青）。
 #[allow(dead_code)]
-pub(crate) const PROGRESS_UPGRADE_COLOR: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(100, 170, 240);
+pub(crate) const PROGRESS_UPGRADE_COLOR: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(100, 170, 240);
 
 // -----------------------------------------------------------------------
 // ファイルメタデータ
@@ -280,13 +285,15 @@ pub fn draw_histogram(
                     ui.label(egui::RichText::new(label_fn(bucket)).font(mono.clone()));
                 });
                 // バー
-                let bar_len =
-                    ((count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
+                let bar_len = ((count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
                 let bar: String = "\u{2588}".repeat(bar_len);
                 ui.label(
-                    egui::RichText::new(format!("{bar:<MAX_BAR_WIDTH$}", MAX_BAR_WIDTH = MAX_BAR_WIDTH))
-                        .font(mono.clone())
-                        .color(egui::Color32::from_rgb(80, 140, 220)),
+                    egui::RichText::new(format!(
+                        "{bar:<MAX_BAR_WIDTH$}",
+                        MAX_BAR_WIDTH = MAX_BAR_WIDTH
+                    ))
+                    .font(mono.clone())
+                    .color(egui::Color32::from_rgb(80, 140, 220)),
                 );
                 // 件数 (右寄せ)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -332,13 +339,15 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
                     ui.label(egui::RichText::new(*label).font(mono.clone()));
                 });
                 // バー
-                let bar_len =
-                    ((*count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
+                let bar_len = ((*count as f64 / max_count as f64) * MAX_BAR_WIDTH as f64) as usize;
                 let bar: String = "\u{2588}".repeat(bar_len);
                 ui.label(
-                    egui::RichText::new(format!("{bar:<MAX_BAR_WIDTH$}", MAX_BAR_WIDTH = MAX_BAR_WIDTH))
-                        .font(mono.clone())
-                        .color(egui::Color32::from_rgb(80, 140, 220)),
+                    egui::RichText::new(format!(
+                        "{bar:<MAX_BAR_WIDTH$}",
+                        MAX_BAR_WIDTH = MAX_BAR_WIDTH
+                    ))
+                    .font(mono.clone())
+                    .color(egui::Color32::from_rgb(80, 140, 220)),
                 );
                 // 件数
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -477,7 +486,10 @@ mod tests {
         assert_eq!(format_bytes(500 * 1024 * 1024), "500.0 MB");
         // ≥ 1 GB → GB
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "2.50 GB");
+        assert_eq!(
+            format_bytes(2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "2.50 GB"
+        );
     }
 
     #[test]
@@ -522,11 +534,23 @@ mod tests {
 
     #[test]
     fn natural_sort_key_mixed_chunks() {
-        let mut names = vec!["img1.jpg", "img10.jpg", "img2.jpg", "img20.jpg", "img100.jpg"];
+        let mut names = vec![
+            "img1.jpg",
+            "img10.jpg",
+            "img2.jpg",
+            "img20.jpg",
+            "img100.jpg",
+        ];
         names.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
         assert_eq!(
             names,
-            vec!["img1.jpg", "img2.jpg", "img10.jpg", "img20.jpg", "img100.jpg"]
+            vec![
+                "img1.jpg",
+                "img2.jpg",
+                "img10.jpg",
+                "img20.jpg",
+                "img100.jpg"
+            ]
         );
     }
 

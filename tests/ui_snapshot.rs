@@ -212,7 +212,9 @@ fn susie_diagnostic_ready_with_plugins() {
     let plugins = ready_with_plugins_fixture();
     snapshot_diagnostic(
         "susie_diagnostic_ready_with_plugins",
-        PoolStatus::ReadyWithPlugins { count: plugins.len() },
+        PoolStatus::ReadyWithPlugins {
+            count: plugins.len(),
+        },
         plugins,
     );
 }
@@ -224,7 +226,9 @@ fn susie_diagnostic_ready_with_plugins_dark() {
     snapshot_diagnostic_themed(
         "susie_diagnostic_ready_with_plugins_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        PoolStatus::ReadyWithPlugins { count: plugins.len() },
+        PoolStatus::ReadyWithPlugins {
+            count: plugins.len(),
+        },
         plugins,
     );
 }

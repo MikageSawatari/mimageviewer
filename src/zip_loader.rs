@@ -79,7 +79,9 @@ impl NestedZipCache {
     }
 
     fn insert(&self, zip_path: PathBuf, nested_path: String, bytes: Arc<Vec<u8>>) {
-        let Ok(mut inner) = self.inner.lock() else { return };
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
         if let Some(pos) = inner
             .entries
             .iter()
@@ -244,7 +246,9 @@ fn enumerate_recursive<R: Read + Seek>(
 ) {
     let len = archive.len();
     for i in 0..len {
-        let Ok(mut entry) = archive.by_index(i) else { continue };
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
         if !entry.is_file() {
             continue;
         }
@@ -253,7 +257,9 @@ fn enumerate_recursive<R: Read + Seek>(
         if should_ignore(&name) {
             continue;
         }
-        let Some(ext) = lowercase_ext(&name) else { continue };
+        let Some(ext) = lowercase_ext(&name) else {
+            continue;
+        };
         let full_name = format!("{prefix}{name}");
         if is_image_ext(&ext) {
             out.push(ZipImageEntry {
@@ -287,7 +293,9 @@ fn enumerate_recursive<R: Read + Seek>(
                 }
             };
             let cursor = Cursor::new(bytes.as_slice());
-            let Ok(mut inner) = zip::ZipArchive::new(cursor) else { continue };
+            let Ok(mut inner) = zip::ZipArchive::new(cursor) else {
+                continue;
+            };
             let new_prefix = format!("{full_name}/");
             enumerate_recursive(&mut inner, outer_zip_path, &new_prefix, zip_mtime, out);
         }
@@ -319,7 +327,9 @@ fn first_image_recursive<R: Read + Seek>(
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return None;
         }
-        let Ok(mut entry) = archive.by_index(i) else { continue };
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
         if !entry.is_file() {
             continue;
         }
@@ -327,7 +337,9 @@ fn first_image_recursive<R: Read + Seek>(
         if should_ignore(&name) {
             continue;
         }
-        let Some(ext) = lowercase_ext(&name) else { continue };
+        let Some(ext) = lowercase_ext(&name) else {
+            continue;
+        };
         let full_name = format!("{prefix}{name}");
         if is_image_ext(&ext) {
             return Some(full_name);
@@ -356,7 +368,9 @@ fn first_image_recursive<R: Read + Seek>(
                 }
             };
             let cursor = Cursor::new(bytes.as_slice());
-            let Ok(mut inner) = zip::ZipArchive::new(cursor) else { continue };
+            let Ok(mut inner) = zip::ZipArchive::new(cursor) else {
+                continue;
+            };
             let new_prefix = format!("{full_name}/");
             if let Some(found) =
                 first_image_recursive(&mut inner, outer_zip_path, &new_prefix, cancel)
@@ -389,10 +403,7 @@ pub fn read_first_image_bytes(zip_path: &Path) -> Option<(String, Vec<u8>)> {
                 file_size as f64 / (1024.0 * 1024.0),
                 bytes.len(),
                 name,
-                zip_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?"),
+                zip_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
             ));
         }
     }
@@ -406,7 +417,9 @@ fn read_first_image_recursive<R: Read + Seek>(
 ) -> Option<(String, Vec<u8>)> {
     let len = archive.len();
     for i in 0..len {
-        let Ok(mut entry) = archive.by_index(i) else { continue };
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
         if !entry.is_file() {
             continue;
         }
@@ -414,7 +427,9 @@ fn read_first_image_recursive<R: Read + Seek>(
         if should_ignore(&name) {
             continue;
         }
-        let Some(ext) = lowercase_ext(&name) else { continue };
+        let Some(ext) = lowercase_ext(&name) else {
+            continue;
+        };
         let full_name = format!("{prefix}{name}");
         if is_image_ext(&ext) {
             let mut bytes = Vec::with_capacity(entry.size() as usize);
@@ -447,7 +462,9 @@ fn read_first_image_recursive<R: Read + Seek>(
                 }
             };
             let cursor = Cursor::new(bytes.as_slice());
-            let Ok(mut inner) = zip::ZipArchive::new(cursor) else { continue };
+            let Ok(mut inner) = zip::ZipArchive::new(cursor) else {
+                continue;
+            };
             let new_prefix = format!("{full_name}/");
             if let Some(found) = read_first_image_recursive(&mut inner, outer_zip_path, &new_prefix)
             {

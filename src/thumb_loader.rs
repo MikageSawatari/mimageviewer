@@ -11,7 +11,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 // -----------------------------------------------------------------------
 // ワーカーキュー優先度
@@ -79,10 +79,8 @@ pub struct ThumbMsg {
     /// エンキュー時の `LoadRequest::input_seq` を透過する。perf ログで enqueue /
     /// decode / ready を相関付けるのに使う。計装無効時や未設定時は 0。
     pub input_seq: u64,
-    /// エンキュー時の `LoadRequest::items_gen` を透過する (Codex P2 対応)。
-    /// UI 側は自分の `items_generation` と一致しないメッセージを破棄する。
-    /// これにより Ctrl+G 等で items を差し替えた後に、旧 items に対するワーカーの
-    /// 結果が新 items に適用されてサムネが化ける race を防ぐ。
+    /// エンキュー時の `LoadRequest::items_gen` を透過する。UI 側は自分の
+    /// `items_generation` と一致しないメッセージを破棄する (世代分離)。
     pub items_gen: u64,
 }
 
@@ -91,6 +89,7 @@ pub struct ThumbMsg {
 /// UI スレッドが `reload_queue` に push し、永続ワーカースレッドが pop して処理する。
 /// ワーカーはまず `cache_map` を参照し、ヒットすれば WebP デコード、
 /// ミスすれば `load_one_cached` に委譲する。
+#[derive(Default)]
 pub struct LoadRequest {
     pub idx: usize,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
@@ -120,9 +119,8 @@ pub struct LoadRequest {
     /// パフォーマンス計装用: エンキュー時の input_seq (相関キー)。
     /// 0 は未設定を意味する。`--perf-log` 無効時は使われない。
     pub input_seq: u64,
-    /// items 世代番号 (Codex P2 対応): items が差し替わるたびにインクリメントされる
-    /// `App::items_generation` の値。ワーカーはこれを ThumbMsg にエコーバックし、
-    /// UI 側は自分の現在値と一致しないメッセージを破棄する。
+    /// items 世代番号: `App::items_generation` のスナップショット。
+    /// ワーカーは ThumbMsg にエコーバックし、UI 側は現行世代と一致しないメッセージを破棄する。
     pub items_gen: u64,
 }
 
@@ -169,8 +167,8 @@ impl CacheDecision {
         use crate::settings::CachePolicy;
         match self.policy {
             CachePolicy::Always => true,
-            CachePolicy::Off    => false,
-            CachePolicy::Auto   => {
+            CachePolicy::Off => false,
+            CachePolicy::Auto => {
                 // 事前ヒューリスティック: 拡張子ベースの無条件キャッシュ
                 let ext = path
                     .extension()
@@ -225,17 +223,15 @@ pub fn resize_to_display_color_image(
 
 /// 画像ファイルをデコードし、指定サイズにリサイズした ColorImage を返す。
 /// 動画の同名画像サムネイルオーバーライド用。
-pub fn decode_image_for_thumb(
-    path: &std::path::Path,
-    display_px: u32,
-) -> Option<egui::ColorImage> {
+pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option<egui::ColorImage> {
     // JPEG なら TurboJPEG で高速デコードを試す
     let img = if is_jpeg_ext(path) {
         decode_jpeg_turbo_from_path(path)
     } else {
         None
     };
-    let img = img.or_else(|| image::open(path).ok())
+    let img = img
+        .or_else(|| image::open(path).ok())
         .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
     Some(resize_to_display_color_image(&img, display_px))
 }
@@ -275,15 +271,18 @@ fn read_exif_orientation(path: &std::path::Path) -> u16 {
 }
 
 fn read_exif_orientation_from_file(path: &std::path::Path) -> Option<u16> {
-    rexif::parse_file(path.to_str()?)
-        .ok()
-        .and_then(|exif| {
-            exif.entries
-                .iter()
-                .find(|e| e.ifd.tag == 274)
-                .and_then(|e| e.value_more_readable.trim().parse::<u16>().ok()
-                    .or_else(|| orientation_from_text(&e.value_more_readable)))
-        })
+    rexif::parse_file(path.to_str()?).ok().and_then(|exif| {
+        exif.entries
+            .iter()
+            .find(|e| e.ifd.tag == 274)
+            .and_then(|e| {
+                e.value_more_readable
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .or_else(|| orientation_from_text(&e.value_more_readable))
+            })
+    })
 }
 
 fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
@@ -293,8 +292,13 @@ fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
             exif.entries
                 .iter()
                 .find(|e| e.ifd.tag == 274)
-                .and_then(|e| e.value_more_readable.trim().parse::<u16>().ok()
-                    .or_else(|| orientation_from_text(&e.value_more_readable)))
+                .and_then(|e| {
+                    e.value_more_readable
+                        .trim()
+                        .parse::<u16>()
+                        .ok()
+                        .or_else(|| orientation_from_text(&e.value_more_readable))
+                })
         })
         .unwrap_or(1)
 }
@@ -302,12 +306,24 @@ fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
 /// rexif の value_more_readable テキストから Orientation 値を推測する
 fn orientation_from_text(text: &str) -> Option<u16> {
     let t = text.to_lowercase();
-    if t.contains("straight") || t.contains("normal") { return Some(1); }
-    if t.contains("rotated to left") || t.contains("90 cw") { return Some(6); }
-    if t.contains("upside down") || t.contains("180") { return Some(3); }
-    if t.contains("rotated to right") || t.contains("270 cw") || t.contains("90 ccw") { return Some(8); }
-    if t.contains("mirrored horizontally") { return Some(2); }
-    if t.contains("mirrored vertically") { return Some(4); }
+    if t.contains("straight") || t.contains("normal") {
+        return Some(1);
+    }
+    if t.contains("rotated to left") || t.contains("90 cw") {
+        return Some(6);
+    }
+    if t.contains("upside down") || t.contains("180") {
+        return Some(3);
+    }
+    if t.contains("rotated to right") || t.contains("270 cw") || t.contains("90 ccw") {
+        return Some(8);
+    }
+    if t.contains("mirrored horizontally") {
+        return Some(2);
+    }
+    if t.contains("mirrored vertically") {
+        return Some(4);
+    }
     None
 }
 
@@ -432,14 +448,14 @@ fn is_jpeg_entry(name: &str) -> bool {
 
 fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
     match orientation {
-        1 => img,                                          // 正常
-        2 => img.fliph(),                                  // 左右反転
-        3 => img.rotate180(),                              // 180°
-        4 => img.flipv(),                                  // 上下反転
-        5 => img.rotate90().fliph(),                       // 転置
-        6 => img.rotate90(),                               // 90° CW
-        7 => img.rotate90().flipv(),                       // 転置 + 反転
-        8 => img.rotate270(),                              // 270° CW
+        1 => img,                    // 正常
+        2 => img.fliph(),            // 左右反転
+        3 => img.rotate180(),        // 180°
+        4 => img.flipv(),            // 上下反転
+        5 => img.rotate90().fliph(), // 転置
+        6 => img.rotate90(),         // 90° CW
+        7 => img.rotate90().flipv(), // 転置 + 反転
+        8 => img.rotate270(),        // 270° CW
         _ => img,
     }
 }
@@ -501,10 +517,7 @@ pub fn process_load_request(
     } else if let Some(ref name) = req.zip_entry {
         name.as_str()
     } else {
-        req.path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
+        req.path.file_name().and_then(|n| n.to_str()).unwrap_or("")
     };
 
     let req_t0 = std::time::Instant::now();
@@ -579,7 +592,9 @@ pub fn process_load_request(
 
     // 重い I/O (ZIP/Folder) は専用 I/O ワーカーキューで処理されるため、
     // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
-    let is_folder_thumb = req.cache_key_override.as_deref()
+    let is_folder_thumb = req
+        .cache_key_override
+        .as_deref()
         .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER));
     let is_zip_thumb = !is_folder_thumb
         && req.zip_entry.is_none()
@@ -592,14 +607,16 @@ pub fn process_load_request(
         let t_resolve = std::time::Instant::now();
         let img = resolve_folder_thumb_image(
             &req.path,
-            req.folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+            req.folder_thumb_sort
+                .unwrap_or(crate::settings::SortOrder::Numeric),
             req.folder_thumb_depth,
         );
         let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
         if resolve_ms > 10.0 {
             crate::logger::log(format!(
                 "    idx={:>4} folder_resolve={resolve_ms:>6.1}ms  {}",
-                req.idx, req.path.display(),
+                req.idx,
+                req.path.display(),
             ));
         }
         if img.is_none() {
@@ -642,7 +659,9 @@ pub fn process_load_request(
                 let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
                 crate::logger::log(format!(
                     "    idx={:>4} zip_resolve={zip_ms:>6.1}ms  ({} bytes)  {}",
-                    req.idx, bytes.len(), req.path.display(),
+                    req.idx,
+                    bytes.len(),
+                    req.path.display(),
                 ));
                 resolved_zip_entry = Some(name);
                 preloaded_zip_bytes = Some(bytes);
@@ -680,7 +699,8 @@ pub fn process_load_request(
         if req.idx < ks || req.idx >= ke {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (after I/O resolve)  {}",
-                req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                req.idx,
+                req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
             ));
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -719,7 +739,8 @@ pub fn process_load_request(
         if req.idx < ks || req.idx >= ke {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (pdf before render)  {}",
-                req.idx, req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                req.idx,
+                req.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
             ));
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -755,10 +776,17 @@ pub fn process_load_request(
         req.pdf_page,
         req.pdf_password.as_deref(),
         req.cache_key_override.as_deref(),
-        req.idx, tx, catalog,
+        req.idx,
+        tx,
+        catalog,
         Some(cache_map),
-        req.mtime, req.file_size, gen_done,
-        thumb_px, thumb_quality, display_px, cache_decision,
+        req.mtime,
+        req.file_size,
+        gen_done,
+        thumb_px,
+        thumb_quality,
+        display_px,
+        cache_decision,
         stats,
         cancel,
         req.priority,
@@ -800,7 +828,9 @@ fn resolve_folder_thumb_image(
         } else if p.is_file() {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
-                    let mtime = entry.metadata().ok()
+                    let mtime = entry
+                        .metadata()
+                        .ok()
                         .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
                     images.push((p, mtime));
                 }
@@ -822,8 +852,16 @@ fn resolve_folder_thumb_image(
     if remaining_depth > 0 {
         // サブフォルダを名前順にソートして、最初に画像が見つかったものを採用
         subdirs.sort_by(|a, b| {
-            a.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase()
-                .cmp(&b.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase())
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase()
+                .cmp(
+                    &b.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_lowercase(),
+                )
         });
         for sub in &subdirs {
             if let Some(img) = resolve_folder_thumb_image(sub, sort, remaining_depth - 1) {
@@ -861,7 +899,9 @@ pub fn load_one_cached(
     idx: usize,
     tx: &mpsc::Sender<ThumbMsg>,
     catalog: Option<&crate::catalog::CatalogDb>,
-    cache_map: Option<&std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
+    cache_map: Option<
+        &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    >,
     mtime: i64,
     file_size: i64,
     gen_done: &Arc<AtomicUsize>,
@@ -912,12 +952,15 @@ pub fn load_one_cached(
         // サムネイル用 PDF レンダは Normal 優先度: プールの予約ワーカーは
         // フルスクリーン現在ページ用に空けておく
         crate::pdf_loader::render_page(
-            path, page_num, display_px, pdf_password,
+            path,
+            page_num,
+            display_px,
+            pdf_password,
             cancel.map(Arc::clone),
             crate::pdf_loader::JobPriority::Normal,
         )
-            .map(|(img, _ct)| img)
-            .map_err(|e| image::ImageError::IoError(e))
+        .map(|(img, _ct)| img)
+        .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(entry_name) = zip_entry {
         // プリロード済みバイト列があれば ZIP を再度 open せずにデコード
         let bytes_result = if let Some(bytes) = preloaded_zip_bytes {
@@ -935,10 +978,22 @@ pub fn load_one_cached(
                         Ok(img)
                     } else {
                         // image → WIC → Susie のフォールバック
-                        decode_zip_chain(&bytes, entry_name, priority, cancel.cloned(), &mut decode_source)
+                        decode_zip_chain(
+                            &bytes,
+                            entry_name,
+                            priority,
+                            cancel.cloned(),
+                            &mut decode_source,
+                        )
                     }
                 } else {
-                    decode_zip_chain(&bytes, entry_name, priority, cancel.cloned(), &mut decode_source)
+                    decode_zip_chain(
+                        &bytes,
+                        entry_name,
+                        priority,
+                        cancel.cloned(),
+                        &mut decode_source,
+                    )
                 }
             }
         }
@@ -980,7 +1035,8 @@ pub fn load_one_cached(
                         decode_source = crate::stats::DecodeSource::Wic;
                         Ok(img)
                     }
-                    None => match crate::susie_loader::decode_file(path, priority, cancel.cloned()) {
+                    None => match crate::susie_loader::decode_file(path, priority, cancel.cloned())
+                    {
                         Ok(img) => {
                             decode_source = crate::stats::DecodeSource::Susie;
                             Ok(img)
@@ -1067,15 +1123,20 @@ pub fn load_one_cached(
         };
         let ext = ext_source.rsplit('.').next().unwrap_or("");
         if let Ok(mut s) = stats.lock() {
-            s.record_image(decode_ms + display_ms, file_size.max(0) as u64, ext, decode_source);
+            s.record_image(
+                decode_ms + display_ms,
+                file_size.max(0) as u64,
+                ext,
+                decode_source,
+            );
         }
     }
 
     // (B) キャッシュ保存判定 (段階 C)
     //     catalog 未指定時は保存不可
     //     それ以外は CacheDecision の判定に従う
-    let should_save = catalog.is_some()
-        && cache_decision.should_cache(path, file_size, decode_ms, display_ms);
+    let should_save =
+        catalog.is_some() && cache_decision.should_cache(path, file_size, decode_ms, display_ms);
 
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
@@ -1083,20 +1144,21 @@ pub fn load_one_cached(
         match crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32) {
             Some((webp_data, w, h)) => {
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                if let Err(e) =
-                    cat.save(name, mtime, file_size, w, h, source_dims, &webp_data)
-                {
+                if let Err(e) = cat.save(name, mtime, file_size, w, h, source_dims, &webp_data) {
                     crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
                 } else if let Some(cm) = cache_map {
                     // DB 保存成功 → in-memory cache_map にも反映する。
                     // Evicted → 再ロード時にキャッシュヒットさせるために必要。
                     if let Ok(mut map) = cm.write() {
-                        map.insert(name.to_owned(), crate::catalog::CacheEntry {
-                            mtime,
-                            file_size,
-                            jpeg_data: webp_data,
-                            source_dims,
-                        });
+                        map.insert(
+                            name.to_owned(),
+                            crate::catalog::CacheEntry {
+                                mtime,
+                                file_size,
+                                jpeg_data: webp_data,
+                                source_dims,
+                            },
+                        );
                     }
                 }
                 crate::logger::log(format!(
@@ -1262,7 +1324,15 @@ pub fn build_and_save_one(
         .ok()?;
 
     let name = path.file_name()?.to_str()?;
-    encode_and_save(&img, name, catalog, mtime, file_size, thumb_px, thumb_quality)
+    encode_and_save(
+        &img,
+        name,
+        catalog,
+        mtime,
+        file_size,
+        thumb_px,
+        thumb_quality,
+    )
 }
 
 /// デコード済み画像を WebP エンコードしてカタログに保存する共通ヘルパー。
@@ -1276,8 +1346,7 @@ pub fn encode_and_save(
     thumb_quality: u8,
 ) -> Option<usize> {
     let source_dims = Some((img.width(), img.height()));
-    let (webp_data, w, h) =
-        crate::catalog::encode_thumb_webp(img, thumb_px, thumb_quality as f32)?;
+    let (webp_data, w, h) = crate::catalog::encode_thumb_webp(img, thumb_px, thumb_quality as f32)?;
     catalog
         .save(key, mtime, file_size, w, h, source_dims, &webp_data)
         .ok()?;
@@ -1297,7 +1366,15 @@ pub fn build_and_save_one_zip(
 ) -> Option<usize> {
     let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
-    encode_and_save(&img, entry_name, catalog, mtime, file_size, thumb_px, thumb_quality)
+    encode_and_save(
+        &img,
+        entry_name,
+        catalog,
+        mtime,
+        file_size,
+        thumb_px,
+        thumb_quality,
+    )
 }
 
 /// PDF の1ページをレンダリングしてキャッシュに保存する。
@@ -1314,9 +1391,22 @@ pub fn build_and_save_one_pdf(
 ) -> Option<usize> {
     // バッチキャッシュ作成は Normal 優先度: フルスクリーン操作より優先されない
     let (img, _) = crate::pdf_loader::render_page(
-        pdf_path, page_num, thumb_px, password, None,
+        pdf_path,
+        page_num,
+        thumb_px,
+        password,
+        None,
         crate::pdf_loader::JobPriority::Normal,
-    ).ok()?;
+    )
+    .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
-    encode_and_save(&img, &key, catalog, mtime, file_size, thumb_px, thumb_quality)
+    encode_and_save(
+        &img,
+        &key,
+        catalog,
+        mtime,
+        file_size,
+        thumb_px,
+        thumb_quality,
+    )
 }

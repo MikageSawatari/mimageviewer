@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::archive_converter::ArchiveFormat;
@@ -123,12 +123,7 @@ impl ArchiveCacheDb {
     /// - 変換済み ZIP ファイルがディスク上に存在する
     ///
     /// いずれかが満たせない場合は `None` を返し、無効エントリは DB から掃除する。
-    pub fn lookup(
-        &self,
-        src_path: &Path,
-        src_mtime: i64,
-        src_size: i64,
-    ) -> Option<PathBuf> {
+    pub fn lookup(&self, src_path: &Path, src_mtime: i64, src_size: i64) -> Option<PathBuf> {
         let key = crate::path_key::normalize(src_path);
         let conn = self.conn.lock().ok()?;
         let row: Option<(i64, i64, String)> = conn
@@ -299,8 +294,7 @@ impl ArchiveCacheDb {
     pub fn clear_all(&self) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
         let cached_paths: Vec<String> = {
-            let mut stmt =
-                conn.prepare("SELECT cached_zip_path FROM converted_archives")?;
+            let mut stmt = conn.prepare("SELECT cached_zip_path FROM converted_archives")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .flatten()
                 .collect()
@@ -410,9 +404,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // テストごとに DATA_DIR は上書きできないので、OnceLock の初回 set 狙い。
         // 既に設定されていれば current DATA_DIR を尊重する。
-        crate::data_dir::DATA_DIR
-            .set(tmp.path().to_path_buf())
-            .ok();
+        crate::data_dir::DATA_DIR.set(tmp.path().to_path_buf()).ok();
         tmp
     }
 

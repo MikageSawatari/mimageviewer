@@ -10,11 +10,11 @@ use std::path::Path;
 /// 仕様 (IFD) ではなく「ユーザーが何を見たいか / 隠したいか」で分類している。
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TagGroup {
-    Camera,    // カメラ / レンズ
-    Shooting,  // 撮影設定 (露出・絞り・ISO 等)
-    Image,     // 画像情報 (サイズ・日時・色空間 等)
-    Gps,       // GPS / 位置情報
-    Other,     // その他 (拡張・Windows・環境センサー 等)
+    Camera,   // カメラ / レンズ
+    Shooting, // 撮影設定 (露出・絞り・ISO 等)
+    Image,    // 画像情報 (サイズ・日時・色空間 等)
+    Gps,      // GPS / 位置情報
+    Other,    // その他 (拡張・Windows・環境センサー 等)
 }
 
 impl TagGroup {
@@ -398,157 +398,717 @@ fn name_for_unknown_tag(kind: rexif::IfdKind, raw: u16) -> String {
 /// [`TagGroup`] のドキュメント参照。
 const TAG_REGISTRY: &[TagInfo] = &[
     // ── カメラ / レンズ ──
-    TagInfo { name: "Make",              display: "カメラ メーカー",   group: TagGroup::Camera },
-    TagInfo { name: "Model",             display: "カメラ モデル",     group: TagGroup::Camera },
-    TagInfo { name: "Software",          display: "プログラム名",       group: TagGroup::Camera },
-    TagInfo { name: "HostComputer",      display: "ホスト コンピュータ", group: TagGroup::Camera },
-    TagInfo { name: "CameraOwnerName",   display: "カメラ所有者名",     group: TagGroup::Camera },
-    TagInfo { name: "BodySerialNumber",  display: "カメラ製造番号",     group: TagGroup::Camera },
-    TagInfo { name: "LensMake",          display: "レンズ メーカー",   group: TagGroup::Camera },
-    TagInfo { name: "LensModel",         display: "レンズ モデル",     group: TagGroup::Camera },
-    TagInfo { name: "LensSerialNumber",  display: "レンズ製造番号",     group: TagGroup::Camera },
-    TagInfo { name: "LensSpecification", display: "レンズ スペック",   group: TagGroup::Camera },
-
+    TagInfo {
+        name: "Make",
+        display: "カメラ メーカー",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "Model",
+        display: "カメラ モデル",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "Software",
+        display: "プログラム名",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "HostComputer",
+        display: "ホスト コンピュータ",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "CameraOwnerName",
+        display: "カメラ所有者名",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "BodySerialNumber",
+        display: "カメラ製造番号",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "LensMake",
+        display: "レンズ メーカー",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "LensModel",
+        display: "レンズ モデル",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "LensSerialNumber",
+        display: "レンズ製造番号",
+        group: TagGroup::Camera,
+    },
+    TagInfo {
+        name: "LensSpecification",
+        display: "レンズ スペック",
+        group: TagGroup::Camera,
+    },
     // ── 撮影設定 ──
-    TagInfo { name: "ExposureTime",                display: "露出時間",                 group: TagGroup::Shooting },
-    TagInfo { name: "FNumber",                     display: "絞り値",                   group: TagGroup::Shooting },
-    TagInfo { name: "ExposureProgram",             display: "露出プログラム",           group: TagGroup::Shooting },
-    TagInfo { name: "SpectralSensitivity",         display: "分光感度",                 group: TagGroup::Shooting },
-    TagInfo { name: "PhotographicSensitivity",     display: "ISO 速度",                 group: TagGroup::Shooting },
-    TagInfo { name: "OECF",                        display: "OECF",                     group: TagGroup::Shooting },
-    TagInfo { name: "SensitivityType",             display: "感度種別",                 group: TagGroup::Shooting },
-    TagInfo { name: "StandardOutputSensitivity",   display: "標準出力感度",             group: TagGroup::Shooting },
-    TagInfo { name: "RecommendedExposureIndex",    display: "推奨露出指数",             group: TagGroup::Shooting },
-    TagInfo { name: "ISOSpeed",                    display: "ISO スピード",             group: TagGroup::Shooting },
-    TagInfo { name: "ISOSpeedLatitudeyyy",         display: "ISO スピード Latitude yyy", group: TagGroup::Shooting },
-    TagInfo { name: "ISOSpeedLatitudezzz",         display: "ISO スピード Latitude zzz", group: TagGroup::Shooting },
-    TagInfo { name: "ShutterSpeedValue",           display: "シャッタースピード",       group: TagGroup::Shooting },
-    TagInfo { name: "ApertureValue",               display: "絞り値 (APEX)",            group: TagGroup::Shooting },
-    TagInfo { name: "BrightnessValue",             display: "輝度値",                   group: TagGroup::Shooting },
-    TagInfo { name: "ExposureBiasValue",           display: "露出補正",                 group: TagGroup::Shooting },
-    TagInfo { name: "MaxApertureValue",            display: "最大絞り",                 group: TagGroup::Shooting },
-    TagInfo { name: "SubjectDistance",             display: "被写体距離",               group: TagGroup::Shooting },
-    TagInfo { name: "MeteringMode",                display: "測光モード",               group: TagGroup::Shooting },
-    TagInfo { name: "LightSource",                 display: "光源",                     group: TagGroup::Shooting },
-    TagInfo { name: "Flash",                       display: "フラッシュ モード",        group: TagGroup::Shooting },
-    TagInfo { name: "FocalLength",                 display: "焦点距離",                 group: TagGroup::Shooting },
-    TagInfo { name: "FocalLengthIn35mmFilm",       display: "35mm 焦点距離",            group: TagGroup::Shooting },
-    TagInfo { name: "FocalPlaneXResolution",       display: "焦点面 X 解像度",          group: TagGroup::Shooting },
-    TagInfo { name: "FocalPlaneYResolution",       display: "焦点面 Y 解像度",          group: TagGroup::Shooting },
-    TagInfo { name: "FocalPlaneResolutionUnit",    display: "焦点面解像度の単位",       group: TagGroup::Shooting },
-    TagInfo { name: "SubjectArea",                 display: "被写体領域",               group: TagGroup::Shooting },
-    TagInfo { name: "SubjectLocation",             display: "被写体位置",               group: TagGroup::Shooting },
-    TagInfo { name: "SubjectDistanceRange",        display: "被写体距離レンジ",         group: TagGroup::Shooting },
-    TagInfo { name: "ExposureIndex",               display: "露出指数",                 group: TagGroup::Shooting },
-    TagInfo { name: "SensingMethod",               display: "撮像方式",                 group: TagGroup::Shooting },
-    TagInfo { name: "ExposureMode",                display: "露出モード",               group: TagGroup::Shooting },
-    TagInfo { name: "WhiteBalance",                display: "ホワイト バランス",        group: TagGroup::Shooting },
-    TagInfo { name: "DigitalZoomRatio",            display: "デジタル ズーム",          group: TagGroup::Shooting },
-    TagInfo { name: "SceneCaptureType",            display: "撮影シーン",               group: TagGroup::Shooting },
-    TagInfo { name: "GainControl",                 display: "ゲイン制御",               group: TagGroup::Shooting },
-    TagInfo { name: "Contrast",                    display: "コントラスト",             group: TagGroup::Shooting },
-    TagInfo { name: "Saturation",                  display: "彩度",                     group: TagGroup::Shooting },
-    TagInfo { name: "Sharpness",                   display: "シャープネス",             group: TagGroup::Shooting },
-    TagInfo { name: "DeviceSettingDescription",    display: "デバイス設定情報",         group: TagGroup::Shooting },
-    TagInfo { name: "FlashEnergy",                 display: "フラッシュ強度",           group: TagGroup::Shooting },
-    TagInfo { name: "SpatialFrequencyResponse",    display: "空間周波数応答",           group: TagGroup::Shooting },
-    TagInfo { name: "Temperature",                 display: "温度",                     group: TagGroup::Shooting },
-    TagInfo { name: "Humidity",                    display: "湿度",                     group: TagGroup::Shooting },
-    TagInfo { name: "Pressure",                    display: "気圧",                     group: TagGroup::Shooting },
-    TagInfo { name: "WaterDepth",                  display: "水深",                     group: TagGroup::Shooting },
-    TagInfo { name: "Acceleration",                display: "加速度",                   group: TagGroup::Shooting },
-    TagInfo { name: "CameraElevationAngle",        display: "カメラ仰角",               group: TagGroup::Shooting },
-
+    TagInfo {
+        name: "ExposureTime",
+        display: "露出時間",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FNumber",
+        display: "絞り値",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ExposureProgram",
+        display: "露出プログラム",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SpectralSensitivity",
+        display: "分光感度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "PhotographicSensitivity",
+        display: "ISO 速度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "OECF",
+        display: "OECF",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SensitivityType",
+        display: "感度種別",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "StandardOutputSensitivity",
+        display: "標準出力感度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "RecommendedExposureIndex",
+        display: "推奨露出指数",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ISOSpeed",
+        display: "ISO スピード",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ISOSpeedLatitudeyyy",
+        display: "ISO スピード Latitude yyy",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ISOSpeedLatitudezzz",
+        display: "ISO スピード Latitude zzz",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ShutterSpeedValue",
+        display: "シャッタースピード",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ApertureValue",
+        display: "絞り値 (APEX)",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "BrightnessValue",
+        display: "輝度値",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ExposureBiasValue",
+        display: "露出補正",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "MaxApertureValue",
+        display: "最大絞り",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SubjectDistance",
+        display: "被写体距離",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "MeteringMode",
+        display: "測光モード",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "LightSource",
+        display: "光源",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Flash",
+        display: "フラッシュ モード",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FocalLength",
+        display: "焦点距離",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FocalLengthIn35mmFilm",
+        display: "35mm 焦点距離",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FocalPlaneXResolution",
+        display: "焦点面 X 解像度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FocalPlaneYResolution",
+        display: "焦点面 Y 解像度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FocalPlaneResolutionUnit",
+        display: "焦点面解像度の単位",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SubjectArea",
+        display: "被写体領域",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SubjectLocation",
+        display: "被写体位置",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SubjectDistanceRange",
+        display: "被写体距離レンジ",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ExposureIndex",
+        display: "露出指数",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SensingMethod",
+        display: "撮像方式",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "ExposureMode",
+        display: "露出モード",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "WhiteBalance",
+        display: "ホワイト バランス",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "DigitalZoomRatio",
+        display: "デジタル ズーム",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SceneCaptureType",
+        display: "撮影シーン",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "GainControl",
+        display: "ゲイン制御",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Contrast",
+        display: "コントラスト",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Saturation",
+        display: "彩度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Sharpness",
+        display: "シャープネス",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "DeviceSettingDescription",
+        display: "デバイス設定情報",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "FlashEnergy",
+        display: "フラッシュ強度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "SpatialFrequencyResponse",
+        display: "空間周波数応答",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Temperature",
+        display: "温度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Humidity",
+        display: "湿度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Pressure",
+        display: "気圧",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "WaterDepth",
+        display: "水深",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "Acceleration",
+        display: "加速度",
+        group: TagGroup::Shooting,
+    },
+    TagInfo {
+        name: "CameraElevationAngle",
+        display: "カメラ仰角",
+        group: TagGroup::Shooting,
+    },
     // ── 画像情報 ──
-    TagInfo { name: "ImageDescription",     display: "画像の説明",                 group: TagGroup::Image },
-    TagInfo { name: "ImageWidth",           display: "画像の幅",                   group: TagGroup::Image },
-    TagInfo { name: "ImageLength",          display: "画像の高さ",                 group: TagGroup::Image },
-    TagInfo { name: "PixelXDimension",      display: "幅 (pixel)",                 group: TagGroup::Image },
-    TagInfo { name: "PixelYDimension",      display: "高さ (pixel)",               group: TagGroup::Image },
-    TagInfo { name: "Orientation",          display: "向き",                       group: TagGroup::Image },
-    TagInfo { name: "XResolution",          display: "水平方向の解像度",           group: TagGroup::Image },
-    TagInfo { name: "YResolution",          display: "垂直方向の解像度",           group: TagGroup::Image },
-    TagInfo { name: "ResolutionUnit",       display: "解像度の単位",               group: TagGroup::Image },
-    TagInfo { name: "DateTime",             display: "変更日時",                   group: TagGroup::Image },
-    TagInfo { name: "DateTimeOriginal",     display: "撮影日時",                   group: TagGroup::Image },
-    TagInfo { name: "DateTimeDigitized",    display: "取得日時",                   group: TagGroup::Image },
-    TagInfo { name: "OffsetTime",           display: "時差",                       group: TagGroup::Image },
-    TagInfo { name: "OffsetTimeOriginal",   display: "撮影時の時差",               group: TagGroup::Image },
-    TagInfo { name: "OffsetTimeDigitized",  display: "デジタル化時の時差",         group: TagGroup::Image },
-    TagInfo { name: "SubSecTime",           display: "秒以下の時刻",               group: TagGroup::Image },
-    TagInfo { name: "SubSecTimeOriginal",   display: "秒以下の撮影時刻",           group: TagGroup::Image },
-    TagInfo { name: "SubSecTimeDigitized",  display: "秒以下のデジタル化時刻",     group: TagGroup::Image },
-    TagInfo { name: "ColorSpace",           display: "色空間",                     group: TagGroup::Image },
-    TagInfo { name: "Gamma",                display: "ガンマ",                     group: TagGroup::Image },
-    TagInfo { name: "WhitePoint",           display: "白色点",                     group: TagGroup::Image },
-    TagInfo { name: "PrimaryChromaticities", display: "原色色度",                  group: TagGroup::Image },
-    TagInfo { name: "YCbCrCoefficients",    display: "YCbCr 係数",                 group: TagGroup::Image },
-    TagInfo { name: "YCbCrPositioning",     display: "YCbCr 配置",                 group: TagGroup::Image },
-    TagInfo { name: "ReferenceBlackWhite",  display: "基準白黒点",                 group: TagGroup::Image },
-    TagInfo { name: "Artist",               display: "作成者",                     group: TagGroup::Image },
-    TagInfo { name: "Copyright",            display: "著作権",                     group: TagGroup::Image },
-    TagInfo { name: "ImageUniqueID",        display: "画像固有 ID",                group: TagGroup::Image },
-    TagInfo { name: "FileSource",           display: "ファイル ソース",            group: TagGroup::Image },
-    TagInfo { name: "SceneType",            display: "シーン タイプ",              group: TagGroup::Image },
-    TagInfo { name: "CFAPattern",           display: "CFA パターン",               group: TagGroup::Image },
-    TagInfo { name: "CustomRendered",       display: "カスタム レンダリング",      group: TagGroup::Image },
-    TagInfo { name: "CompositeImage",       display: "合成画像",                   group: TagGroup::Image },
-
+    TagInfo {
+        name: "ImageDescription",
+        display: "画像の説明",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "ImageWidth",
+        display: "画像の幅",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "ImageLength",
+        display: "画像の高さ",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "PixelXDimension",
+        display: "幅 (pixel)",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "PixelYDimension",
+        display: "高さ (pixel)",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "Orientation",
+        display: "向き",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "XResolution",
+        display: "水平方向の解像度",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "YResolution",
+        display: "垂直方向の解像度",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "ResolutionUnit",
+        display: "解像度の単位",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "DateTime",
+        display: "変更日時",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "DateTimeOriginal",
+        display: "撮影日時",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "DateTimeDigitized",
+        display: "取得日時",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "OffsetTime",
+        display: "時差",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "OffsetTimeOriginal",
+        display: "撮影時の時差",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "OffsetTimeDigitized",
+        display: "デジタル化時の時差",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "SubSecTime",
+        display: "秒以下の時刻",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "SubSecTimeOriginal",
+        display: "秒以下の撮影時刻",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "SubSecTimeDigitized",
+        display: "秒以下のデジタル化時刻",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "ColorSpace",
+        display: "色空間",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "Gamma",
+        display: "ガンマ",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "WhitePoint",
+        display: "白色点",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "PrimaryChromaticities",
+        display: "原色色度",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "YCbCrCoefficients",
+        display: "YCbCr 係数",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "YCbCrPositioning",
+        display: "YCbCr 配置",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "ReferenceBlackWhite",
+        display: "基準白黒点",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "Artist",
+        display: "作成者",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "Copyright",
+        display: "著作権",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "ImageUniqueID",
+        display: "画像固有 ID",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "FileSource",
+        display: "ファイル ソース",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "SceneType",
+        display: "シーン タイプ",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "CFAPattern",
+        display: "CFA パターン",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "CustomRendered",
+        display: "カスタム レンダリング",
+        group: TagGroup::Image,
+    },
+    TagInfo {
+        name: "CompositeImage",
+        display: "合成画像",
+        group: TagGroup::Image,
+    },
     // ── GPS ──
-    TagInfo { name: "GPSVersionID",          display: "GPS バージョン",          group: TagGroup::Gps },
-    TagInfo { name: "GPSLatitudeRef",        display: "緯度基準",                group: TagGroup::Gps },
-    TagInfo { name: "GPSLatitude",           display: "緯度",                    group: TagGroup::Gps },
-    TagInfo { name: "GPSLongitudeRef",       display: "経度基準",                group: TagGroup::Gps },
-    TagInfo { name: "GPSLongitude",          display: "経度",                    group: TagGroup::Gps },
-    TagInfo { name: "GPSAltitudeRef",        display: "高度基準",                group: TagGroup::Gps },
-    TagInfo { name: "GPSAltitude",           display: "高度",                    group: TagGroup::Gps },
-    TagInfo { name: "GPSTimeStamp",          display: "GPS 時刻",                group: TagGroup::Gps },
-    TagInfo { name: "GPSSatellites",         display: "GPS 衛星",                group: TagGroup::Gps },
-    TagInfo { name: "GPSStatus",             display: "GPS 受信状態",            group: TagGroup::Gps },
-    TagInfo { name: "GPSMeasureMode",        display: "GPS 測位モード",          group: TagGroup::Gps },
-    TagInfo { name: "GPSDOP",                display: "GPS 測位精度 (DOP)",      group: TagGroup::Gps },
-    TagInfo { name: "GPSSpeedRef",           display: "速度単位",                group: TagGroup::Gps },
-    TagInfo { name: "GPSSpeed",              display: "移動速度",                group: TagGroup::Gps },
-    TagInfo { name: "GPSTrackRef",           display: "進行方向基準",            group: TagGroup::Gps },
-    TagInfo { name: "GPSTrack",              display: "進行方向",                group: TagGroup::Gps },
-    TagInfo { name: "GPSImgDirectionRef",    display: "撮影方位基準",            group: TagGroup::Gps },
-    TagInfo { name: "GPSImgDirection",       display: "撮影方位",                group: TagGroup::Gps },
-    TagInfo { name: "GPSMapDatum",           display: "測地系",                  group: TagGroup::Gps },
-    TagInfo { name: "GPSDestLatitudeRef",    display: "目的地 緯度基準",         group: TagGroup::Gps },
-    TagInfo { name: "GPSDestLatitude",       display: "目的地 緯度",             group: TagGroup::Gps },
-    TagInfo { name: "GPSDestLongitudeRef",   display: "目的地 経度基準",         group: TagGroup::Gps },
-    TagInfo { name: "GPSDestLongitude",      display: "目的地 経度",             group: TagGroup::Gps },
-    TagInfo { name: "GPSDestBearingRef",     display: "目的地 方位基準",         group: TagGroup::Gps },
-    TagInfo { name: "GPSDestBearing",        display: "目的地 方位",             group: TagGroup::Gps },
-    TagInfo { name: "GPSDestDistanceRef",    display: "目的地までの距離単位",     group: TagGroup::Gps },
-    TagInfo { name: "GPSDestDistance",       display: "目的地までの距離",         group: TagGroup::Gps },
-    TagInfo { name: "GPSProcessingMethod",   display: "GPS 処理方法",            group: TagGroup::Gps },
-    TagInfo { name: "GPSAreaInformation",    display: "GPS エリア情報",          group: TagGroup::Gps },
-    TagInfo { name: "GPSDateStamp",          display: "GPS 日付",                group: TagGroup::Gps },
-    TagInfo { name: "GPSDifferential",       display: "ディファレンシャル補正",   group: TagGroup::Gps },
-    TagInfo { name: "GPSHPositioningError",  display: "水平方向の測位誤差",       group: TagGroup::Gps },
-
+    TagInfo {
+        name: "GPSVersionID",
+        display: "GPS バージョン",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSLatitudeRef",
+        display: "緯度基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSLatitude",
+        display: "緯度",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSLongitudeRef",
+        display: "経度基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSLongitude",
+        display: "経度",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSAltitudeRef",
+        display: "高度基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSAltitude",
+        display: "高度",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSTimeStamp",
+        display: "GPS 時刻",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSSatellites",
+        display: "GPS 衛星",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSStatus",
+        display: "GPS 受信状態",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSMeasureMode",
+        display: "GPS 測位モード",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDOP",
+        display: "GPS 測位精度 (DOP)",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSSpeedRef",
+        display: "速度単位",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSSpeed",
+        display: "移動速度",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSTrackRef",
+        display: "進行方向基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSTrack",
+        display: "進行方向",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSImgDirectionRef",
+        display: "撮影方位基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSImgDirection",
+        display: "撮影方位",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSMapDatum",
+        display: "測地系",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestLatitudeRef",
+        display: "目的地 緯度基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestLatitude",
+        display: "目的地 緯度",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestLongitudeRef",
+        display: "目的地 経度基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestLongitude",
+        display: "目的地 経度",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestBearingRef",
+        display: "目的地 方位基準",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestBearing",
+        display: "目的地 方位",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestDistanceRef",
+        display: "目的地までの距離単位",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDestDistance",
+        display: "目的地までの距離",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSProcessingMethod",
+        display: "GPS 処理方法",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSAreaInformation",
+        display: "GPS エリア情報",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDateStamp",
+        display: "GPS 日付",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSDifferential",
+        display: "ディファレンシャル補正",
+        group: TagGroup::Gps,
+    },
+    TagInfo {
+        name: "GPSHPositioningError",
+        display: "水平方向の測位誤差",
+        group: TagGroup::Gps,
+    },
     // ── その他 / 拡張 ──
-    TagInfo { name: "ExifVersion",              display: "EXIF バージョン",       group: TagGroup::Other },
-    TagInfo { name: "FlashpixVersion",          display: "Flashpix バージョン",   group: TagGroup::Other },
-    TagInfo { name: "ComponentsConfiguration",  display: "色成分構成",            group: TagGroup::Other },
-    TagInfo { name: "CompressedBitsPerPixel",   display: "圧縮ビット/ピクセル",   group: TagGroup::Other },
-    TagInfo { name: "UserComment",              display: "ユーザー コメント",     group: TagGroup::Other },
-    TagInfo { name: "RelatedSoundFile",         display: "関連サウンドファイル",  group: TagGroup::Other },
-    TagInfo { name: "InteroperabilityIndex",    display: "相互運用性インデックス", group: TagGroup::Other },
-    TagInfo { name: "InteroperabilityVersion",  display: "相互運用性バージョン",  group: TagGroup::Other },
-    TagInfo { name: "XPTitle",                  display: "タイトル (Windows)",    group: TagGroup::Other },
-    TagInfo { name: "XPComment",                display: "コメント (Windows)",    group: TagGroup::Other },
-    TagInfo { name: "XPAuthor",                 display: "作成者 (Windows)",      group: TagGroup::Other },
-    TagInfo { name: "XPKeywords",               display: "キーワード (Windows)",  group: TagGroup::Other },
-    TagInfo { name: "XPSubject",                display: "件名 (Windows)",        group: TagGroup::Other },
-    TagInfo { name: "MakerNote",                display: "メーカーノート",        group: TagGroup::Other },
-    TagInfo { name: "PrintImageMatching",       display: "Print Image Matching",  group: TagGroup::Other },
+    TagInfo {
+        name: "ExifVersion",
+        display: "EXIF バージョン",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "FlashpixVersion",
+        display: "Flashpix バージョン",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "ComponentsConfiguration",
+        display: "色成分構成",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "CompressedBitsPerPixel",
+        display: "圧縮ビット/ピクセル",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "UserComment",
+        display: "ユーザー コメント",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "RelatedSoundFile",
+        display: "関連サウンドファイル",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "InteroperabilityIndex",
+        display: "相互運用性インデックス",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "InteroperabilityVersion",
+        display: "相互運用性バージョン",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "XPTitle",
+        display: "タイトル (Windows)",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "XPComment",
+        display: "コメント (Windows)",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "XPAuthor",
+        display: "作成者 (Windows)",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "XPKeywords",
+        display: "キーワード (Windows)",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "XPSubject",
+        display: "件名 (Windows)",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "MakerNote",
+        display: "メーカーノート",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "PrintImageMatching",
+        display: "Print Image Matching",
+        group: TagGroup::Other,
+    },
     // TIFF Rev 6.0 の構造系タグ。1st IFD (サムネイル) の保管情報で、
     // 一般ユーザーには無価値。default_exif_hidden_tags で既定非表示。
-    TagInfo { name: "Compression",              display: "圧縮方式",              group: TagGroup::Other },
-    TagInfo { name: "JPEGInterchangeFormat",    display: "JPEG オフセット",       group: TagGroup::Other },
-    TagInfo { name: "JPEGInterchangeFormatLength", display: "JPEG データ長",      group: TagGroup::Other },
+    TagInfo {
+        name: "Compression",
+        display: "圧縮方式",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "JPEGInterchangeFormat",
+        display: "JPEG オフセット",
+        group: TagGroup::Other,
+    },
+    TagInfo {
+        name: "JPEGInterchangeFormatLength",
+        display: "JPEG データ長",
+        group: TagGroup::Other,
+    },
 ];
 
 /// canonical タグ名から日本語表示名を返す。未登録ならそのまま。
@@ -605,7 +1165,10 @@ mod tests {
         // Microsoft Windows
         assert_eq!(name_for_unknown_tag(IfdKind::Ifd0, 40092), "XPComment");
         // GPS IFD 拡張
-        assert_eq!(name_for_unknown_tag(IfdKind::Gps, 31), "GPSHPositioningError");
+        assert_eq!(
+            name_for_unknown_tag(IfdKind::Gps, 31),
+            "GPSHPositioningError"
+        );
         // Interop IFD は同じ raw でも GPS と区別される
         assert_eq!(
             name_for_unknown_tag(IfdKind::Interoperability, 1),

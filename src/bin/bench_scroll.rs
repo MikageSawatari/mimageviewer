@@ -18,17 +18,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Instant;
 
 use mimageviewer::catalog::{self, CatalogDb};
-use mimageviewer::folder_tree::{is_apple_double, SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS};
+use mimageviewer::folder_tree::{
+    SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS, is_apple_double,
+};
 use mimageviewer::grid_item::GridItem;
 use mimageviewer::settings::{CachePolicy, SortOrder};
 use mimageviewer::stats::ThumbStats;
 use mimageviewer::thumb_loader::{
-    process_load_request, CacheDecision, LoadRequest, ThumbMsg,
-    CACHE_KEY_ZIP, CACHE_KEY_PDF, CACHE_KEY_FOLDER,
+    CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_ZIP, CacheDecision, LoadRequest, ThumbMsg,
+    process_load_request,
 };
 use mimageviewer::ui_helpers::{mtime_secs, natural_sort_key};
 
@@ -49,7 +51,9 @@ struct Args {
 fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.is_empty() {
-        eprintln!("Usage: bench_scroll <folder> [--cols N] [--rows N] [--scroll-to N] [--threads N] [--no-cache] [--delete-cache]");
+        eprintln!(
+            "Usage: bench_scroll <folder> [--cols N] [--rows N] [--scroll-to N] [--threads N] [--no-cache] [--delete-cache]"
+        );
         std::process::exit(1);
     }
     let mut args = Args {
@@ -199,7 +203,11 @@ fn scan_folder(path: &Path) -> FolderContents {
         }
     }
 
-    FolderContents { items, image_metas, counts }
+    FolderContents {
+        items,
+        image_metas,
+        counts,
+    }
 }
 
 /// ZIP ファイルを仮想フォルダとして走査
@@ -228,7 +236,11 @@ fn scan_zip_as_folder(zip_path: &Path) -> FolderContents {
         counts.images += 1;
     }
 
-    FolderContents { items, image_metas, counts }
+    FolderContents {
+        items,
+        image_metas,
+        counts,
+    }
 }
 
 /// PDF ファイルを仮想フォルダとして走査 (同期版)
@@ -247,7 +259,10 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
 
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
-    let counts = ItemCounts { pdfs: page_count as usize, ..Default::default() };
+    let counts = ItemCounts {
+        pdfs: page_count as usize,
+        ..Default::default()
+    };
 
     for page in 0..page_count {
         items.push(GridItem::PdfPage {
@@ -258,7 +273,11 @@ fn scan_pdf_as_folder(pdf_path: &Path) -> FolderContents {
         image_metas.push(Some((mtime, file_size)));
     }
 
-    FolderContents { items, image_metas, counts }
+    FolderContents {
+        items,
+        image_metas,
+        counts,
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -271,105 +290,70 @@ fn make_load_request(
     mtime: i64,
     file_size: i64,
 ) -> Option<LoadRequest> {
+    let base = LoadRequest {
+        idx,
+        mtime,
+        file_size,
+        ..Default::default()
+    };
     match item {
         GridItem::Image(p) => Some(LoadRequest {
-            idx,
             path: p.clone(),
-            mtime,
-            file_size,
-            skip_cache: false,
-            priority: false,
-            zip_entry: None,
-            pdf_page: None,
-            pdf_password: None,
-            cache_key_override: None,
-            folder_thumb_sort: None, folder_thumb_depth: 0,
-            input_seq: 0,
-            items_gen: 0,
+            ..base
         }),
         GridItem::ZipFile(p) => {
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let fname = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             Some(LoadRequest {
-                idx,
                 path: p.clone(),
-                mtime,
-                file_size,
-                skip_cache: false,
-                priority: false,
-                zip_entry: None,
-                pdf_page: None,
-                pdf_password: None,
                 cache_key_override: Some(format!("{CACHE_KEY_ZIP}{fname}")),
-                folder_thumb_sort: None, folder_thumb_depth: 0,
-                input_seq: 0,
-                items_gen: 0,
+                ..base
             })
         }
         GridItem::PdfFile(p) => {
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let fname = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             Some(LoadRequest {
-                idx,
                 path: p.clone(),
-                mtime,
-                file_size,
-                skip_cache: false,
-                priority: false,
-                zip_entry: None,
                 pdf_page: Some(0),
-                pdf_password: None,
                 cache_key_override: Some(format!("{CACHE_KEY_PDF}{fname}")),
-                folder_thumb_sort: None, folder_thumb_depth: 0,
-                input_seq: 0,
-                items_gen: 0,
+                ..base
             })
         }
         GridItem::Folder(p) => {
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let fname = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             Some(LoadRequest {
-                idx,
                 path: p.clone(),
-                mtime,
-                file_size,
-                skip_cache: false,
-                priority: false,
-                zip_entry: None,
-                pdf_page: None,
-                pdf_password: None,
                 cache_key_override: Some(format!("{CACHE_KEY_FOLDER}{fname}")),
-                folder_thumb_sort: Some(SortOrder::Numeric), folder_thumb_depth: 3,
-                    input_seq: 0,
-                items_gen: 0,
+                folder_thumb_sort: Some(SortOrder::Numeric),
+                folder_thumb_depth: 3,
+                ..base
             })
         }
-        GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
-            idx,
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => Some(LoadRequest {
             path: zip_path.clone(),
-            mtime,
-            file_size,
-            skip_cache: false,
-            priority: false,
             zip_entry: Some(entry_name.clone()),
-            pdf_page: None,
-            pdf_password: None,
-            cache_key_override: None,
-            folder_thumb_sort: None, folder_thumb_depth: 0,
-            input_seq: 0,
-            items_gen: 0,
+            ..base
         }),
-        GridItem::PdfPage { pdf_path, page_num, .. } => Some(LoadRequest {
-            idx,
+        GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => Some(LoadRequest {
             path: pdf_path.clone(),
-            mtime,
-            file_size,
-            skip_cache: false,
-            priority: false,
-            zip_entry: None,
             pdf_page: Some(*page_num),
-            pdf_password: None,
-            cache_key_override: None,
-            folder_thumb_sort: None, folder_thumb_depth: 0,
-            input_seq: 0,
-            items_gen: 0,
+            ..base
         }),
         _ => None,
     }
@@ -402,9 +386,18 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 fn print_result(label: &str, r: &BenchResult) {
     println!("--- {label} ---");
     println!("  Scroll time:           {:>7.0} ms", r.scroll_time_ms);
-    println!("  First visible thumb:   {:>7.0} ms  (after scroll stop)", r.first_visible_ms);
-    println!("  All visible complete:  {:>7.0} ms  (after scroll stop)", r.all_visible_ms);
-    println!("  All prefetch complete: {:>7.0} ms  (after scroll stop)", r.all_prefetch_ms);
+    println!(
+        "  First visible thumb:   {:>7.0} ms  (after scroll stop)",
+        r.first_visible_ms
+    );
+    println!(
+        "  All visible complete:  {:>7.0} ms  (after scroll stop)",
+        r.all_visible_ms
+    );
+    println!(
+        "  All prefetch complete: {:>7.0} ms  (after scroll stop)",
+        r.all_prefetch_ms
+    );
     let total = r.cache_hits + r.cache_misses;
     if total > 0 {
         println!(
@@ -455,7 +448,10 @@ fn run_bench(
     let items_per_page = cols * rows;
     let total = contents.items.len();
     let total_rows = total.div_ceil(cols);
-    let target_row = args.scroll_to.unwrap_or(total_rows / 2).min(total_rows.saturating_sub(1));
+    let target_row = args
+        .scroll_to
+        .unwrap_or(total_rows / 2)
+        .min(total_rows.saturating_sub(1));
 
     let prev_pages: usize = 2;
     let next_pages: usize = 4;
@@ -505,7 +501,9 @@ fn run_bench(
 
         std::thread::spawn(move || {
             loop {
-                if cancel_w.load(Ordering::Relaxed) { break; }
+                if cancel_w.load(Ordering::Relaxed) {
+                    break;
+                }
                 let req_opt: Option<LoadRequest> = {
                     let mut q = queue.lock().unwrap();
                     if q.is_empty() {
@@ -516,7 +514,11 @@ fn run_bench(
                         let best = q
                             .iter()
                             .enumerate()
-                            .min_by_key(|(_, r)| mimageviewer::thumb_loader::worker_priority_key(r.priority, r.idx, vis, vis_end))
+                            .min_by_key(|(_, r)| {
+                                mimageviewer::thumb_loader::worker_priority_key(
+                                    r.priority, r.idx, vis, vis_end,
+                                )
+                            })
                             .map(|(pos, _)| pos)
                             .unwrap();
                         Some(q.swap_remove(best))
@@ -524,15 +526,29 @@ fn run_bench(
                 };
                 match req_opt {
                     Some(req) => {
-                        if cancel_w.load(Ordering::Relaxed) { break; }
+                        if cancel_w.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let ks = ks_w.load(Ordering::Relaxed);
                         let ke = ke_w.load(Ordering::Relaxed);
-                        if req.idx < ks || req.idx >= ke { continue; }
+                        if req.idx < ks || req.idx >= ke {
+                            continue;
+                        }
                         let dp = display_px_w.load(Ordering::Relaxed);
                         process_load_request(
-                            &req, &cache_map_w, &tx_w, catalog_w.as_deref(),
-                            thumb_px, thumb_quality, dp, cache_decision, &done_w, &stats_w,
-                            Some(&cancel_w), &ks_w, &ke_w,
+                            &req,
+                            &cache_map_w,
+                            &tx_w,
+                            catalog_w.as_deref(),
+                            thumb_px,
+                            thumb_quality,
+                            dp,
+                            cache_decision,
+                            &done_w,
+                            &stats_w,
+                            Some(&cancel_w),
+                            &ks_w,
+                            &ke_w,
                         );
                     }
                     None => {
@@ -591,9 +607,11 @@ fn run_bench(
             let Some((mtime, file_size)) = contents.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let Some(mut req) = contents.items.get(i).and_then(|item| {
-                make_load_request(item, i, mtime, file_size)
-            }) else {
+            let Some(mut req) = contents
+                .items
+                .get(i)
+                .and_then(|item| make_load_request(item, i, mtime, file_size))
+            else {
                 continue;
             };
             req.priority = i >= vis_first && i < vis_end;
@@ -608,19 +626,33 @@ fn run_bench(
                     contents.items.get(r.idx),
                     Some(GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::Folder(_))
                 );
-                if is_heavy { heavy.push(r); } else { regular.push(r); }
+                if is_heavy {
+                    heavy.push(r);
+                } else {
+                    regular.push(r);
+                }
             }
             {
                 let mut q = reload_queue.lock().unwrap();
                 q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
-                for r in q.iter_mut() { r.priority = r.idx >= vis_first && r.idx < vis_end; }
-                for r in regular { requested.insert(r.idx); q.push(r); }
+                for r in q.iter_mut() {
+                    r.priority = r.idx >= vis_first && r.idx < vis_end;
+                }
+                for r in regular {
+                    requested.insert(r.idx);
+                    q.push(r);
+                }
             }
             {
                 let mut q = heavy_io_queue.lock().unwrap();
                 q.retain(|r| r.idx >= keep_start && r.idx < keep_end);
-                for r in q.iter_mut() { r.priority = r.idx >= vis_first && r.idx < vis_end; }
-                for r in heavy { requested.insert(r.idx); q.push(r); }
+                for r in q.iter_mut() {
+                    r.priority = r.idx >= vis_first && r.idx < vis_end;
+                }
+                for r in heavy {
+                    requested.insert(r.idx);
+                    q.push(r);
+                }
             }
         }
 
@@ -680,7 +712,13 @@ fn run_bench(
         let keep_end_final = (vis_first_final + (1 + next_pages) * items_per_page).min(total);
         let keep_loadable: Vec<usize> = (keep_start_final..keep_end_final)
             .filter(|&i| contents.image_metas.get(i).copied().flatten().is_some())
-            .filter(|i| contents.items.get(*i).and_then(|item| make_load_request(item, *i, 0, 0)).is_some())
+            .filter(|i| {
+                contents
+                    .items
+                    .get(*i)
+                    .and_then(|item| make_load_request(item, *i, 0, 0))
+                    .is_some()
+            })
             .collect();
 
         let keep_done = keep_loadable.iter().all(|i| completed.contains(i));
@@ -707,7 +745,7 @@ fn run_bench(
         cache_hits,
         cache_misses,
         total_received: completed.len(),
-        zip_resolve_ms: Vec::new(),   // ログパース不要 — 全体時間で判断
+        zip_resolve_ms: Vec::new(), // ログパース不要 — 全体時間で判断
         folder_resolve_ms: Vec::new(),
     }
 }

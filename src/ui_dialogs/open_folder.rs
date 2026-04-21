@@ -102,8 +102,7 @@ impl App {
                             Some(format!("開けるフォルダが見つかりません: {input}"));
                     }
                 } else {
-                    self.open_folder_error =
-                        Some(format!("パスが存在しません: {input}"));
+                    self.open_folder_error = Some(format!("パスが存在しません: {input}"));
                 }
             }
         } else if cancel || !open {

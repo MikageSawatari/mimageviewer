@@ -7,9 +7,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use mimageviewer::archive_converter::{
-    convert_to_zip, scan_summary, ArchiveFormat, ConvertError,
-};
+use mimageviewer::archive_converter::{ArchiveFormat, ConvertError, convert_to_zip, scan_summary};
 
 fn make_test_7z(path: &std::path::Path) {
     let file = std::fs::File::create(path).unwrap();
@@ -22,7 +20,9 @@ fn make_test_7z(path: &std::path::Path) {
     ];
     for (name, data) in entries.iter() {
         let entry = sevenz_rust2::ArchiveEntry::new_file(name);
-        writer.push_archive_entry::<&[u8]>(entry, Some(data)).unwrap();
+        writer
+            .push_archive_entry::<&[u8]>(entry, Some(data))
+            .unwrap();
     }
     writer.finish().unwrap();
 }
@@ -43,7 +43,9 @@ fn make_test_7z_with_wic_exts(path: &std::path::Path) {
     ];
     for (name, data) in entries.iter() {
         let entry = sevenz_rust2::ArchiveEntry::new_file(name);
-        writer.push_archive_entry::<&[u8]>(entry, Some(data)).unwrap();
+        writer
+            .push_archive_entry::<&[u8]>(entry, Some(data))
+            .unwrap();
     }
     writer.finish().unwrap();
 }
@@ -116,7 +118,14 @@ fn convert_7z_extracts_wic_extensions() {
     let names: Vec<String> = (0..archive.len())
         .map(|i| archive.by_index(i).unwrap().name().to_string())
         .collect();
-    for expected in ["photo.heic", "img.avif", "art.jxl", "scan.tiff", "raw.cr2", "raw.arw"] {
+    for expected in [
+        "photo.heic",
+        "img.avif",
+        "art.jxl",
+        "scan.tiff",
+        "raw.cr2",
+        "raw.arw",
+    ] {
         assert!(
             names.contains(&expected.to_string()),
             "missing {expected} in converted ZIP: {names:?}",
@@ -176,4 +185,3 @@ fn convert_format_detection_from_path() {
     assert_eq!(ArchiveFormat::from_extension("zip"), None);
     assert_eq!(ArchiveFormat::from_extension("rar"), None);
 }
-

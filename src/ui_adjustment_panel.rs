@@ -14,8 +14,8 @@
 
 use eframe::egui;
 
-use crate::app::App;
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
+use crate::app::App;
 
 const HEADER_H: f32 = 36.0;
 const SECTION_FONT: f32 = 12.0;
@@ -30,7 +30,11 @@ pub const LEFT_PANEL_WIDTH: f32 = 260.0;
 macro_rules! slider_with_reset {
     ($ui:expr, $label:expr, $val:expr, $range:expr, $default:expr, $disabled:expr, $changed:expr, $dragging:expr) => {{
         $ui.horizontal(|ui| {
-            ui.label(egui::RichText::new($label).size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new($label)
+                    .size(SECTION_FONT)
+                    .color(LABEL_COLOR),
+            );
             if *$val != $default && !$disabled {
                 let reset_resp = ui.small_button("↩");
                 if reset_resp.clicked() {
@@ -46,15 +50,23 @@ macro_rules! slider_with_reset {
         } else {
             $ui.add(slider)
         };
-        if r.changed() { $changed = true; }
-        if r.dragged() { $dragging = true; }
+        if r.changed() {
+            $changed = true;
+        }
+        if r.dragged() {
+            $dragging = true;
+        }
     }};
 }
 
 macro_rules! slider_log_with_reset {
     ($ui:expr, $label:expr, $val:expr, $range:expr, $step:expr, $default:expr, $disabled:expr, $changed:expr, $dragging:expr) => {{
         $ui.horizontal(|ui| {
-            ui.label(egui::RichText::new($label).size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new($label)
+                    .size(SECTION_FONT)
+                    .color(LABEL_COLOR),
+            );
             if (*$val - $default).abs() > 0.001 && !$disabled {
                 let reset_resp = ui.small_button("↩");
                 if reset_resp.clicked() {
@@ -64,14 +76,20 @@ macro_rules! slider_log_with_reset {
                 reset_resp.on_hover_text("デフォルトに戻す");
             }
         });
-        let slider = egui::Slider::new($val, $range).logarithmic(true).step_by($step);
+        let slider = egui::Slider::new($val, $range)
+            .logarithmic(true)
+            .step_by($step);
         let r = if $disabled {
             $ui.add_enabled(false, slider)
         } else {
             $ui.add(slider)
         };
-        if r.changed() { $changed = true; }
-        if r.dragged() { $dragging = true; }
+        if r.changed() {
+            $changed = true;
+        }
+        if r.dragged() {
+            $dragging = true;
+        }
     }};
 }
 
@@ -88,43 +106,125 @@ fn draw_sliders(
     let is_auto = params.auto_mode.is_some();
 
     // ── 補正モード ──
-    ui.label(egui::RichText::new("補正モード").size(SECTION_FONT).color(LABEL_COLOR));
+    ui.label(
+        egui::RichText::new("補正モード")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
     ui.add_space(2.0);
     {
         let mut mode_changed = false;
-        if ui.radio(params.auto_mode.is_none(), egui::RichText::new("手動").color(LABEL_COLOR)).clicked() {
+        if ui
+            .radio(
+                params.auto_mode.is_none(),
+                egui::RichText::new("手動").color(LABEL_COLOR),
+            )
+            .clicked()
+        {
             params.auto_mode = None;
             mode_changed = true;
         }
-        if ui.radio(params.auto_mode == Some(AutoMode::Auto), egui::RichText::new("自動補正").color(LABEL_COLOR)).clicked() {
+        if ui
+            .radio(
+                params.auto_mode == Some(AutoMode::Auto),
+                egui::RichText::new("自動補正").color(LABEL_COLOR),
+            )
+            .clicked()
+        {
             params.auto_mode = Some(AutoMode::Auto);
             mode_changed = true;
         }
-        if ui.radio(params.auto_mode == Some(AutoMode::MangaCleanup), egui::RichText::new("モノクロ漫画補正").color(LABEL_COLOR)).clicked() {
+        if ui
+            .radio(
+                params.auto_mode == Some(AutoMode::MangaCleanup),
+                egui::RichText::new("モノクロ漫画補正").color(LABEL_COLOR),
+            )
+            .clicked()
+        {
             params.auto_mode = Some(AutoMode::MangaCleanup);
             mode_changed = true;
         }
-        if mode_changed { changed = true; }
+        if mode_changed {
+            changed = true;
+        }
     }
     ui.add_space(8.0);
 
-    slider_with_reset!(ui, "明るさ", &mut params.brightness, -100.0..=100.0, 0.0_f32, is_auto, changed, dragging);
-    slider_with_reset!(ui, "コントラスト", &mut params.contrast, -100.0..=100.0, 0.0_f32, is_auto, changed, dragging);
-    slider_log_with_reset!(ui, "ガンマ", &mut params.gamma, 0.2..=5.0, 0.01, 1.0_f32, is_auto, changed, dragging);
-    slider_with_reset!(ui, "彩度", &mut params.saturation, -100.0..=100.0, 0.0_f32, is_auto, changed, dragging);
-    slider_with_reset!(ui, "色温度", &mut params.temperature, -100.0..=100.0, 0.0_f32, is_auto, changed, dragging);
+    slider_with_reset!(
+        ui,
+        "明るさ",
+        &mut params.brightness,
+        -100.0..=100.0,
+        0.0_f32,
+        is_auto,
+        changed,
+        dragging
+    );
+    slider_with_reset!(
+        ui,
+        "コントラスト",
+        &mut params.contrast,
+        -100.0..=100.0,
+        0.0_f32,
+        is_auto,
+        changed,
+        dragging
+    );
+    slider_log_with_reset!(
+        ui,
+        "ガンマ",
+        &mut params.gamma,
+        0.2..=5.0,
+        0.01,
+        1.0_f32,
+        is_auto,
+        changed,
+        dragging
+    );
+    slider_with_reset!(
+        ui,
+        "彩度",
+        &mut params.saturation,
+        -100.0..=100.0,
+        0.0_f32,
+        is_auto,
+        changed,
+        dragging
+    );
+    slider_with_reset!(
+        ui,
+        "色温度",
+        &mut params.temperature,
+        -100.0..=100.0,
+        0.0_f32,
+        is_auto,
+        changed,
+        dragging
+    );
 
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
 
-    ui.label(egui::RichText::new("レベル補正").size(SECTION_FONT).color(LABEL_COLOR));
+    ui.label(
+        egui::RichText::new("レベル補正")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
     {
         let mut bp = params.black_point as f32;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("黒点").size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new("黒点")
+                    .size(SECTION_FONT)
+                    .color(LABEL_COLOR),
+            );
             if bp != 0.0 && !is_auto {
-                if ui.small_button("↩").on_hover_text("デフォルトに戻す").clicked() {
+                if ui
+                    .small_button("↩")
+                    .on_hover_text("デフォルトに戻す")
+                    .clicked()
+                {
                     bp = 0.0;
                     params.black_point = 0;
                     changed = true;
@@ -132,16 +232,33 @@ fn draw_sliders(
             }
         });
         let slider = egui::Slider::new(&mut bp, 0.0..=254.0).step_by(1.0);
-        let r = if is_auto { ui.add_enabled(false, slider) } else { ui.add(slider) };
-        if r.changed() { params.black_point = bp as u8; changed = true; }
-        if r.dragged() { dragging = true; }
+        let r = if is_auto {
+            ui.add_enabled(false, slider)
+        } else {
+            ui.add(slider)
+        };
+        if r.changed() {
+            params.black_point = bp as u8;
+            changed = true;
+        }
+        if r.dragged() {
+            dragging = true;
+        }
     }
     {
         let mut wp = params.white_point as f32;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("白点").size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new("白点")
+                    .size(SECTION_FONT)
+                    .color(LABEL_COLOR),
+            );
             if wp != 255.0 && !is_auto {
-                if ui.small_button("↩").on_hover_text("デフォルトに戻す").clicked() {
+                if ui
+                    .small_button("↩")
+                    .on_hover_text("デフォルトに戻す")
+                    .clicked()
+                {
                     wp = 255.0;
                     params.white_point = 255;
                     changed = true;
@@ -149,31 +266,62 @@ fn draw_sliders(
             }
         });
         let slider = egui::Slider::new(&mut wp, 1.0..=255.0).step_by(1.0);
-        let r = if is_auto { ui.add_enabled(false, slider) } else { ui.add(slider) };
-        if r.changed() { params.white_point = wp as u8; changed = true; }
-        if r.dragged() { dragging = true; }
+        let r = if is_auto {
+            ui.add_enabled(false, slider)
+        } else {
+            ui.add(slider)
+        };
+        if r.changed() {
+            params.white_point = wp as u8;
+            changed = true;
+        }
+        if r.dragged() {
+            dragging = true;
+        }
     }
     {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("中間点").size(SECTION_FONT).color(LABEL_COLOR));
+            ui.label(
+                egui::RichText::new("中間点")
+                    .size(SECTION_FONT)
+                    .color(LABEL_COLOR),
+            );
             if (params.midtone - 1.0).abs() > 0.001 && !is_auto {
-                if ui.small_button("↩").on_hover_text("デフォルトに戻す").clicked() {
+                if ui
+                    .small_button("↩")
+                    .on_hover_text("デフォルトに戻す")
+                    .clicked()
+                {
                     params.midtone = 1.0;
                     changed = true;
                 }
             }
         });
-        let slider = egui::Slider::new(&mut params.midtone, 0.1..=10.0).logarithmic(true).step_by(0.01);
-        let r = if is_auto { ui.add_enabled(false, slider) } else { ui.add(slider) };
-        if r.changed() { changed = true; }
-        if r.dragged() { dragging = true; }
+        let slider = egui::Slider::new(&mut params.midtone, 0.1..=10.0)
+            .logarithmic(true)
+            .step_by(0.01);
+        let r = if is_auto {
+            ui.add_enabled(false, slider)
+        } else {
+            ui.add(slider)
+        };
+        if r.changed() {
+            changed = true;
+        }
+        if r.dragged() {
+            dragging = true;
+        }
     }
 
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
 
-    ui.label(egui::RichText::new("AI ノイズ除去 [N: ON/OFF]").size(SECTION_FONT).color(LABEL_COLOR));
+    ui.label(
+        egui::RichText::new("AI ノイズ除去 [N: ON/OFF]")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
     if let Some(px) = ai_denoise_disabled_threshold {
         ui.label(
             egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
@@ -184,7 +332,13 @@ fn draw_sliders(
     }
     let is_on = params.denoise_model.is_some();
     let mut toggled = is_on;
-    if ui.checkbox(&mut toggled, egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR)).changed() {
+    if ui
+        .checkbox(
+            &mut toggled,
+            egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR),
+        )
+        .changed()
+    {
         params.denoise_model = if toggled {
             Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string())
         } else {
@@ -213,7 +367,10 @@ fn draw_sliders(
             (Some(a), Some(b)) => *a == b,
             _ => false,
         };
-        if ui.radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR)).clicked() {
+        if ui
+            .radio(is_sel, egui::RichText::new(*label).color(LABEL_COLOR))
+            .clicked()
+        {
             params.upscale_model = val.map(|s| s.to_string());
             changed = true;
         }
@@ -240,58 +397,210 @@ fn draw_sliders(
             };
 
             group_heading(ui, "── 基本 ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::None, PostFilter::None.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Nearest, PostFilter::Nearest.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::None,
+                PostFilter::None.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Nearest,
+                PostFilter::Nearest.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── CRT ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::CrtSimple, PostFilter::CrtSimple.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::CrtFull, PostFilter::CrtFull.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::CrtArcade, PostFilter::CrtArcade.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::CrtSimple,
+                PostFilter::CrtSimple.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::CrtFull,
+                PostFilter::CrtFull.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::CrtArcade,
+                PostFilter::CrtArcade.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── 減色・ディザ (色数昇順) ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::Dither1bit, PostFilter::Dither1bit.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::GameBoy, PostFilter::GameBoy.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Pc98, PostFilter::Pc98.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::GameGear, PostFilter::GameGear.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Famicom, PostFilter::Famicom.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::MegaDrive, PostFilter::MegaDrive.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Msx2Plus, PostFilter::Msx2Plus.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Sfc, PostFilter::Sfc.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Dither1bit,
+                PostFilter::Dither1bit.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::GameBoy,
+                PostFilter::GameBoy.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Pc98,
+                PostFilter::Pc98.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::GameGear,
+                PostFilter::GameGear.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Famicom,
+                PostFilter::Famicom.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::MegaDrive,
+                PostFilter::MegaDrive.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Msx2Plus,
+                PostFilter::Msx2Plus.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Sfc,
+                PostFilter::Sfc.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── CRT × 非液晶機種 ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::ComboFamicomCrt, PostFilter::ComboFamicomCrt.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::ComboPc98Crt, PostFilter::ComboPc98Crt.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::ComboMsx2PlusCrt, PostFilter::ComboMsx2PlusCrt.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::ComboMegaDriveCrt, PostFilter::ComboMegaDriveCrt.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::ComboSfcCrt, PostFilter::ComboSfcCrt.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::ComboFamicomCrt,
+                PostFilter::ComboFamicomCrt.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::ComboPc98Crt,
+                PostFilter::ComboPc98Crt.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::ComboMsx2PlusCrt,
+                PostFilter::ComboMsx2PlusCrt.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::ComboMegaDriveCrt,
+                PostFilter::ComboMegaDriveCrt.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::ComboSfcCrt,
+                PostFilter::ComboSfcCrt.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── カラーグレーディング ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::Sepia, PostFilter::Sepia.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::MonoNeutral, PostFilter::MonoNeutral.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::MonoCool, PostFilter::MonoCool.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::MonoWarm, PostFilter::MonoWarm.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::WarmTone, PostFilter::WarmTone.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::CoolTone, PostFilter::CoolTone.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::TealOrange, PostFilter::TealOrange.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::KodakPortra, PostFilter::KodakPortra.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::FujiVelvia, PostFilter::FujiVelvia.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::BleachBypass, PostFilter::BleachBypass.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::CrossProcess, PostFilter::CrossProcess.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Vintage, PostFilter::Vintage.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Sepia,
+                PostFilter::Sepia.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::MonoNeutral,
+                PostFilter::MonoNeutral.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::MonoCool,
+                PostFilter::MonoCool.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::MonoWarm,
+                PostFilter::MonoWarm.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::WarmTone,
+                PostFilter::WarmTone.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::CoolTone,
+                PostFilter::CoolTone.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::TealOrange,
+                PostFilter::TealOrange.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::KodakPortra,
+                PostFilter::KodakPortra.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::FujiVelvia,
+                PostFilter::FujiVelvia.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::BleachBypass,
+                PostFilter::BleachBypass.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::CrossProcess,
+                PostFilter::CrossProcess.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Vintage,
+                PostFilter::Vintage.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── アナログフィルム ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::FilmGrain, PostFilter::FilmGrain.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Vignette, PostFilter::Vignette.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::LightLeak, PostFilter::LightLeak.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::SoftFocus, PostFilter::SoftFocus.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::FilmGrain,
+                PostFilter::FilmGrain.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Vignette,
+                PostFilter::Vignette.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::LightLeak,
+                PostFilter::LightLeak.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::SoftFocus,
+                PostFilter::SoftFocus.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── 絵画・描画風 ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::Halftone, PostFilter::Halftone.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::OilPaint, PostFilter::OilPaint.display_label());
-            ui.selectable_value(&mut params.post_filter, PostFilter::Sketch, PostFilter::Sketch.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Halftone,
+                PostFilter::Halftone.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::OilPaint,
+                PostFilter::OilPaint.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Sketch,
+                PostFilter::Sketch.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── 実用 ──");
-            ui.selectable_value(&mut params.post_filter, PostFilter::Sharpen, PostFilter::Sharpen.display_label());
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::Sharpen,
+                PostFilter::Sharpen.display_label(),
+            );
         });
     if params.post_filter != before_pf {
         changed = true;
@@ -319,16 +628,23 @@ impl App {
         image_dims: Option<(u32, u32)>,
     ) {
         // フルスクリーン対象のページ idx
-        let Some(fs_idx) = self.fullscreen_idx else { return; };
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
 
         let painter = ui.painter_at(panel_rect);
-        painter.rect_filled(panel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230));
+        painter.rect_filled(
+            panel_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+        );
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel_rect));
         child.set_clip_rect(panel_rect);
 
         // ── ヘッダー ──
-        let header_rect = egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
+        let header_rect =
+            egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         child.painter().text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -372,20 +688,39 @@ impl App {
         let mut clear_page_clicked = false;
         actions_child.vertical(|ui| {
             ui.horizontal(|ui| {
-                if ui.small_button("全画像に適用").on_hover_text("このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む").clicked() {
+                if ui
+                    .small_button("全画像に適用")
+                    .on_hover_text("このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む")
+                    .clicked()
+                {
                     apply_all_clicked = true;
                 }
-                if ui.small_button("全画像から削除").on_hover_text("このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す").clicked() {
+                if ui
+                    .small_button("全画像から削除")
+                    .on_hover_text(
+                        "このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す",
+                    )
+                    .clicked()
+                {
                     clear_all_clicked = true;
                 }
             });
             ui.horizontal(|ui| {
-                if ui.small_button("標準にする").on_hover_text("現在のパラメータをアプリ全体の標準設定にする").clicked() {
+                if ui
+                    .small_button("標準にする")
+                    .on_hover_text("現在のパラメータをアプリ全体の標準設定にする")
+                    .clicked()
+                {
                     set_as_global_clicked = true;
                 }
                 if ui
-                    .add_enabled(has_override, egui::Button::new("個別設定を解除 [Q]").small())
-                    .on_hover_text("このページの個別設定を削除し、標準値に戻す (Q または Ctrl+Backspace)")
+                    .add_enabled(
+                        has_override,
+                        egui::Button::new("個別設定を解除 [Q]").small(),
+                    )
+                    .on_hover_text(
+                        "このページの個別設定を削除し、標準値に戻す (Q または Ctrl+Backspace)",
+                    )
                     .clicked()
                 {
                     clear_page_clicked = true;
@@ -409,13 +744,17 @@ impl App {
 
         // しきい値以上ならスキップされる → その場合は「無効」を UI に反映する
         let ai_denoise_disabled_threshold = match image_dims {
-            Some((w, h)) if !crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px) => {
+            Some((w, h))
+                if !crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px) =>
+            {
                 Some(self.settings.ai_denoise_skip_px)
             }
             _ => None,
         };
         let ai_upscale_disabled_threshold = match image_dims {
-            Some((w, h)) if !crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px) => {
+            Some((w, h))
+                if !crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px) =>
+            {
                 Some(self.settings.ai_upscale_skip_px)
             }
             _ => None,
@@ -432,7 +771,8 @@ impl App {
                     ai_denoise_disabled_threshold,
                     ai_upscale_disabled_threshold,
                 )
-            }).inner;
+            })
+            .inner;
 
         self.adjustment_dragging = is_dragging;
 
@@ -447,7 +787,11 @@ impl App {
 
         slots_child.separator();
         slots_child.add_space(4.0);
-        slots_child.label(egui::RichText::new("保存スロット").size(11.0).color(LABEL_COLOR));
+        slots_child.label(
+            egui::RichText::new("保存スロット")
+                .size(11.0)
+                .color(LABEL_COLOR),
+        );
         slots_child.add_space(2.0);
 
         let btn_w = (panel_rect.width() - 20.0) * 0.5 - 24.0;
@@ -457,26 +801,31 @@ impl App {
                     let slot_idx = row * 2 + col;
                     let key_label = crate::adjustment::slot_key_label(slot_idx);
                     let slot_name = if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                        format!("{}:{}", key_label, crate::ui_helpers::truncate_name(&s.name, 7))
+                        format!(
+                            "{}:{}",
+                            key_label,
+                            crate::ui_helpers::truncate_name(&s.name, 7)
+                        )
                     } else {
                         format!("{}:空", key_label)
                     };
                     let has_data = self.settings.preset_slots.slots[slot_idx].is_some();
 
-                    let name_btn = egui::Button::new(
-                        egui::RichText::new(&slot_name).size(10.5)
-                    ).min_size(egui::vec2(btn_w, 22.0));
+                    let name_btn = egui::Button::new(egui::RichText::new(&slot_name).size(10.5))
+                        .min_size(egui::vec2(btn_w, 22.0));
                     let name_resp = ui.add_enabled(has_data, name_btn);
                     if name_resp.clicked() {
                         load_from_slot = Some(slot_idx);
                     }
                     if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                        name_resp.on_hover_text(format!("{} をこのページに適用 (Ctrl+{})", s.name, key_label));
+                        name_resp.on_hover_text(format!(
+                            "{} をこのページに適用 (Ctrl+{})",
+                            s.name, key_label
+                        ));
                     }
 
-                    let save_btn = egui::Button::new(
-                        egui::RichText::new("💾").size(11.0)
-                    ).min_size(egui::vec2(22.0, 22.0));
+                    let save_btn = egui::Button::new(egui::RichText::new("💾").size(11.0))
+                        .min_size(egui::vec2(22.0, 22.0));
                     let save_resp = ui.add(save_btn);
                     if save_resp.clicked() {
                         save_to_slot = Some(slot_idx);
@@ -533,7 +882,9 @@ impl App {
 
     /// スロット保存ダイアログを描画する。`slot_save_dialog` が Some の間だけ表示。
     pub(crate) fn draw_slot_save_dialog(&mut self, ctx: &egui::Context) {
-        let Some((slot_idx, mut name_input)) = self.slot_save_dialog.take() else { return; };
+        let Some((slot_idx, mut name_input)) = self.slot_save_dialog.take() else {
+            return;
+        };
         let mut open = true;
         let mut confirmed = false;
         let mut canceled = false;
@@ -562,7 +913,10 @@ impl App {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!name_input.trim().is_empty(), egui::Button::new("保存")).clicked() {
+                    if ui
+                        .add_enabled(!name_input.trim().is_empty(), egui::Button::new("保存"))
+                        .clicked()
+                    {
                         confirmed = true;
                     }
                     if ui.button("キャンセル").clicked() {
@@ -588,7 +942,11 @@ impl App {
                 });
                 self.settings.save();
                 let key_label = crate::adjustment::slot_key_label(slot_idx);
-                self.show_feedback_toast(format!("[スロット{}:{} に保存]", key_label, name_input.trim()));
+                self.show_feedback_toast(format!(
+                    "[スロット{}:{} に保存]",
+                    key_label,
+                    name_input.trim()
+                ));
             }
             return;
         }

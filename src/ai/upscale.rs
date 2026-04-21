@@ -43,7 +43,6 @@ fn model_tile_size(kind: ModelKind) -> u32 {
     }
 }
 
-
 /// アップスケール要求の結果。
 pub struct UpscaleResult {
     pub idx: usize,
@@ -92,10 +91,7 @@ pub fn should_process(width: u32, height: u32, threshold: u32) -> bool {
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
-fn detect_scale_factor(
-    runtime: &AiRuntime,
-    model_kind: ModelKind,
-) -> Result<u32, AiError> {
+fn detect_scale_factor(runtime: &AiRuntime, model_kind: ModelKind) -> Result<u32, AiError> {
     // キャッシュ済みならそのまま返す
     if let Some(&scale) = SCALE_CACHE.lock().unwrap().get(&model_kind) {
         return Ok(scale);
@@ -103,8 +99,8 @@ fn detect_scale_factor(
 
     let test_size = model_tile_size(model_kind) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
-    let tensor = ort::value::Tensor::from_array(dummy)
-        .map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
+    let tensor =
+        ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
 
     let scale = runtime.with_session(model_kind, |session| {
         let outputs = session
@@ -185,7 +181,9 @@ pub fn upscale_with_timings(
             let alpha_img = image::GrayImage::from_raw(in_w, in_h, alpha_data)
                 .expect("alpha buffer dimensions match");
             let resized = image::imageops::resize(
-                &alpha_img, out_w, out_h,
+                &alpha_img,
+                out_w,
+                out_h,
                 image::imageops::FilterType::Lanczos3,
             );
             crate::logger::log(format!(
@@ -205,14 +203,23 @@ pub fn upscale_with_timings(
     let perf_enabled = crate::perf::is_enabled();
     let t_upscale = std::time::Instant::now();
     if perf_enabled {
-        crate::perf::event("ai", "upscale_begin", None, 0, &[
-            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
-            ("in_w", serde_json::Value::from(in_w)),
-            ("in_h", serde_json::Value::from(in_h)),
-            ("scale", serde_json::Value::from(scale)),
-            ("tiles", serde_json::Value::from(tiles.len())),
-            ("tile_size", serde_json::Value::from(tile_size)),
-        ]);
+        crate::perf::event(
+            "ai",
+            "upscale_begin",
+            None,
+            0,
+            &[
+                (
+                    "model",
+                    serde_json::Value::from(format!("{:?}", model_kind)),
+                ),
+                ("in_w", serde_json::Value::from(in_w)),
+                ("in_h", serde_json::Value::from(in_h)),
+                ("scale", serde_json::Value::from(scale)),
+                ("tiles", serde_json::Value::from(tiles.len())),
+                ("tile_size", serde_json::Value::from(tile_size)),
+            ],
+        );
     }
 
     // 出力バッファ: RGB float 累積 + 重み累積（ブレンド用）
@@ -231,114 +238,145 @@ pub fn upscale_with_timings(
     // std::thread::scope を使い、accum と timings は `&mut` 借用で受け渡す。
     let (tile_timings, blend_wait_ms): (Vec<TileTiming>, f64) =
         std::thread::scope(|s| -> Result<(Vec<TileTiming>, f64), AiError> {
-        // sync_channel(2): 推論と blend の 1 タイル分オーバーラップは保ちつつ、
-        // blend が詰まっても TileOutput が 2 個以上積まれないように背圧を掛ける
-        // (VRAM が厳しい環境で OOM を避けるための保険)。
-        type Msg = (TileRect, TileOutput, f64, f64, InferBreakdown);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Msg>(2);
-        let accum_r_ref = &mut accum_r;
-        let accum_g_ref = &mut accum_g;
-        let accum_b_ref = &mut accum_b;
-        let accum_w_ref = &mut accum_w;
-        let tiles_len = tiles.len();
+            // sync_channel(2): 推論と blend の 1 タイル分オーバーラップは保ちつつ、
+            // blend が詰まっても TileOutput が 2 個以上積まれないように背圧を掛ける
+            // (VRAM が厳しい環境で OOM を避けるための保険)。
+            type Msg = (TileRect, TileOutput, f64, f64, InferBreakdown);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Msg>(2);
+            let accum_r_ref = &mut accum_r;
+            let accum_g_ref = &mut accum_g;
+            let accum_b_ref = &mut accum_b;
+            let accum_w_ref = &mut accum_w;
+            let tiles_len = tiles.len();
 
-        let blender = s.spawn(move || -> Vec<TileTiming> {
-            let mut timings: Vec<TileTiming> = Vec::with_capacity(tiles_len);
-            while let Ok((tile, tile_out, extract_ms, infer_ms, brk)) = rx.recv() {
-                let t_blend = std::time::Instant::now();
-                blend_tile(
-                    accum_r_ref, accum_g_ref, accum_b_ref, accum_w_ref,
-                    out_w, out_h,
-                    &tile_out,
-                    &tile, scale,
-                    in_w, in_h,
-                );
-                let blend_ms = t_blend.elapsed().as_secs_f64() * 1000.0;
-                timings.push(TileTiming {
-                    extract_ms,
-                    infer_ms,
-                    tensor_build_ms: brk.tensor_build_ms,
-                    session_run_ms: brk.session_run_ms,
-                    tensor_extract_ms: brk.tensor_extract_ms,
-                    post_copy_ms: brk.post_copy_ms,
-                    blend_ms,
-                });
-            }
-            timings
-        });
-
-        // メインスレッド: 推論ループ
-        for (tile_idx, tile) in tiles.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                if perf_enabled {
-                    crate::perf::event("ai", "upscale_cancel", None, 0, &[
-                        ("after_tile", serde_json::Value::from(tile_idx)),
-                    ]);
+            let blender = s.spawn(move || -> Vec<TileTiming> {
+                let mut timings: Vec<TileTiming> = Vec::with_capacity(tiles_len);
+                while let Ok((tile, tile_out, extract_ms, infer_ms, brk)) = rx.recv() {
+                    let t_blend = std::time::Instant::now();
+                    blend_tile(
+                        accum_r_ref,
+                        accum_g_ref,
+                        accum_b_ref,
+                        accum_w_ref,
+                        out_w,
+                        out_h,
+                        &tile_out,
+                        &tile,
+                        scale,
+                        in_w,
+                        in_h,
+                    );
+                    let blend_ms = t_blend.elapsed().as_secs_f64() * 1000.0;
+                    timings.push(TileTiming {
+                        extract_ms,
+                        infer_ms,
+                        tensor_build_ms: brk.tensor_build_ms,
+                        session_run_ms: brk.session_run_ms,
+                        tensor_extract_ms: brk.tensor_extract_ms,
+                        post_copy_ms: brk.post_copy_ms,
+                        blend_ms,
+                    });
                 }
-                drop(tx);
-                let _ = blender.join();
-                return Err(AiError::Cancelled);
-            }
+                timings
+            });
 
-            let tile_t0 = std::time::Instant::now();
-            let tile_input = extract_tile(&rgb, tile);
-            let t_infer_begin = std::time::Instant::now();
-            let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
-            let (tile_out, breakdown) = match run_tile_inference(runtime, model_kind, tile_input) {
-                Ok(out) => out,
-                Err(e) => {
+            // メインスレッド: 推論ループ
+            for (tile_idx, tile) in tiles.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    if perf_enabled {
+                        crate::perf::event(
+                            "ai",
+                            "upscale_cancel",
+                            None,
+                            0,
+                            &[("after_tile", serde_json::Value::from(tile_idx))],
+                        );
+                    }
                     drop(tx);
                     let _ = blender.join();
-                    return Err(e);
+                    return Err(AiError::Cancelled);
                 }
-            };
-            let t_send = std::time::Instant::now();
-            let infer_ms = t_send.duration_since(t_infer_begin).as_secs_f64() * 1000.0;
 
-            if tx.send((tile.clone(), tile_out, extract_ms, infer_ms, breakdown)).is_err() {
-                let _ = blender.join();
-                return Err(AiError::Ort(String::from("blender thread died")));
+                let tile_t0 = std::time::Instant::now();
+                let tile_input = extract_tile(&rgb, tile);
+                let t_infer_begin = std::time::Instant::now();
+                let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
+                let (tile_out, breakdown) =
+                    match run_tile_inference(runtime, model_kind, tile_input) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            drop(tx);
+                            let _ = blender.join();
+                            return Err(e);
+                        }
+                    };
+                let t_send = std::time::Instant::now();
+                let infer_ms = t_send.duration_since(t_infer_begin).as_secs_f64() * 1000.0;
+
+                if tx
+                    .send((tile.clone(), tile_out, extract_ms, infer_ms, breakdown))
+                    .is_err()
+                {
+                    let _ = blender.join();
+                    return Err(AiError::Ort(String::from("blender thread died")));
+                }
+
+                if perf_enabled {
+                    let tile_ms = tile_t0.elapsed().as_secs_f64() * 1000.0;
+                    crate::perf::event(
+                        "ai",
+                        "upscale_tile",
+                        None,
+                        0,
+                        &[
+                            ("tile", serde_json::Value::from(tile_idx)),
+                            ("ms", serde_json::Value::from(tile_ms)),
+                        ],
+                    );
+                }
+
+                if (tile_idx + 1) % 10 == 0 {
+                    crate::logger::log(format!(
+                        "[AI] Upscale progress: {}/{} tiles",
+                        tile_idx + 1,
+                        tiles.len()
+                    ));
+                }
             }
 
-            if perf_enabled {
-                let tile_ms = tile_t0.elapsed().as_secs_f64() * 1000.0;
-                crate::perf::event("ai", "upscale_tile", None, 0, &[
-                    ("tile", serde_json::Value::from(tile_idx)),
-                    ("ms", serde_json::Value::from(tile_ms)),
-                ]);
-            }
-
-            if (tile_idx + 1) % 10 == 0 {
-                crate::logger::log(format!(
-                    "[AI] Upscale progress: {}/{} tiles",
-                    tile_idx + 1, tiles.len()
-                ));
-            }
-        }
-
-        // 全タイル送信完了 → blender の残作業を待つ (blend_wait_ms)
-        let t_wait_begin = std::time::Instant::now();
-        drop(tx);
-        let timings = blender.join().map_err(|_| {
-            AiError::Ort(String::from("blender thread panicked"))
+            // 全タイル送信完了 → blender の残作業を待つ (blend_wait_ms)
+            let t_wait_begin = std::time::Instant::now();
+            drop(tx);
+            let timings = blender
+                .join()
+                .map_err(|_| AiError::Ort(String::from("blender thread panicked")))?;
+            let blend_wait_ms = t_wait_begin.elapsed().as_secs_f64() * 1000.0;
+            Ok((timings, blend_wait_ms))
         })?;
-        let blend_wait_ms = t_wait_begin.elapsed().as_secs_f64() * 1000.0;
-        Ok((timings, blend_wait_ms))
-    })?;
 
     crate::logger::log(format!(
         "[AI] Upscale complete: {} tiles, {}x scale",
-        tiles.len(), scale
+        tiles.len(),
+        scale
     ));
     if perf_enabled {
         let total_ms = t_upscale.elapsed().as_secs_f64() * 1000.0;
-        crate::perf::event("ai", "upscale_end", None, 0, &[
-            ("model", serde_json::Value::from(format!("{:?}", model_kind))),
-            ("tiles", serde_json::Value::from(tiles.len())),
-            ("out_w", serde_json::Value::from(out_w)),
-            ("out_h", serde_json::Value::from(out_h)),
-            ("total_ms", serde_json::Value::from(total_ms)),
-        ]);
+        crate::perf::event(
+            "ai",
+            "upscale_end",
+            None,
+            0,
+            &[
+                (
+                    "model",
+                    serde_json::Value::from(format!("{:?}", model_kind)),
+                ),
+                ("tiles", serde_json::Value::from(tiles.len())),
+                ("out_w", serde_json::Value::from(out_w)),
+                ("out_h", serde_json::Value::from(out_h)),
+                ("total_ms", serde_json::Value::from(total_ms)),
+            ],
+        );
     }
 
     // 累積バッファを正規化して RGBA ColorImage に変換
@@ -390,23 +428,36 @@ fn compute_tiles(img_w: u32, img_h: u32, tile_size: u32, overlap: u32) -> Vec<Ti
     loop {
         let ty = y;
         let th = tile_size.min(img_h.saturating_sub(ty));
-        if th == 0 { break; }
+        if th == 0 {
+            break;
+        }
 
         let mut x = 0u32;
         loop {
             let tx = x;
             let tw = tile_size.min(img_w.saturating_sub(tx));
-            if tw == 0 { break; }
-            tiles.push(TileRect { x: tx, y: ty, w: tw, h: th });
+            if tw == 0 {
+                break;
+            }
+            tiles.push(TileRect {
+                x: tx,
+                y: ty,
+                w: tw,
+                h: th,
+            });
 
-            if tx + tw >= img_w { break; }
+            if tx + tw >= img_w {
+                break;
+            }
             x += step;
             if x + tile_size > img_w {
                 x = img_w.saturating_sub(tile_size);
             }
         }
 
-        if ty + th >= img_h { break; }
+        if ty + th >= img_h {
+            break;
+        }
         y += step;
         if y + tile_size > img_h {
             y = img_h.saturating_sub(tile_size);
@@ -456,8 +507,8 @@ fn run_tile_inference(
     input: ndarray::Array4<f32>,
 ) -> Result<(TileOutput, InferBreakdown), AiError> {
     let t0 = std::time::Instant::now();
-    let input_tensor = ort::value::Tensor::from_array(input)
-        .map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
+    let input_tensor =
+        ort::value::Tensor::from_array(input).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
     let tensor_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     runtime.with_session(model_kind, |session| {
@@ -518,12 +569,17 @@ fn run_tile_inference(
 /// 画像の端に接する辺は常に高重み（ランプなし）。
 /// 隣接タイルのオーバーラップ量が不均一でも正しく正規化される。
 fn blend_tile(
-    accum_r: &mut [f32], accum_g: &mut [f32], accum_b: &mut [f32], accum_w: &mut [f32],
-    out_w: u32, out_h: u32,
+    accum_r: &mut [f32],
+    accum_g: &mut [f32],
+    accum_b: &mut [f32],
+    accum_w: &mut [f32],
+    out_w: u32,
+    out_h: u32,
     tile_out: &TileOutput,
     tile: &TileRect,
     scale: u32,
-    img_w: u32, img_h: u32,
+    img_w: u32,
+    img_h: u32,
 ) {
     let tw = tile_out.width as usize;
     let th = tile_out.height as usize;
@@ -542,20 +598,32 @@ fn blend_tile(
 
     for sy in 0..th {
         let dy = dst_y0 + sy;
-        if dy >= out_h as usize { break; }
+        if dy >= out_h as usize {
+            break;
+        }
 
         // Y方向の辺からの距離
         let dist_top = if is_first_y { ramp } else { sy as f32 };
-        let dist_bot = if is_last_y { ramp } else { (th - 1 - sy) as f32 };
+        let dist_bot = if is_last_y {
+            ramp
+        } else {
+            (th - 1 - sy) as f32
+        };
         let wy = (dist_top.min(dist_bot) / ramp).clamp(1e-4, 1.0);
 
         for sx in 0..tw {
             let dx = dst_x0 + sx;
-            if dx >= out_w as usize { break; }
+            if dx >= out_w as usize {
+                break;
+            }
 
             // X方向の辺からの距離
             let dist_left = if is_first_x { ramp } else { sx as f32 };
-            let dist_right = if is_last_x { ramp } else { (tw - 1 - sx) as f32 };
+            let dist_right = if is_last_x {
+                ramp
+            } else {
+                (tw - 1 - sx) as f32
+            };
             let wx = (dist_left.min(dist_right) / ramp).clamp(1e-4, 1.0);
 
             let weight = wx * wy;

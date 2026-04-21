@@ -8,11 +8,7 @@ impl crate::app::App {
             return;
         }
 
-        let count = self
-            .rotation_db
-            .as_ref()
-            .map(|db| db.count())
-            .unwrap_or(0);
+        let count = self.rotation_db.as_ref().map(|db| db.count()).unwrap_or(0);
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);

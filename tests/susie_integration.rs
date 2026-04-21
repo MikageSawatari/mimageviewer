@@ -85,13 +85,23 @@ fn testdata_ok() -> bool {
 
 fn bmp_path(name: &str) -> Option<PathBuf> {
     find_testdata_root()
-        .map(|r| r.join("retro-images").join("formats").join("bmp").join(name))
+        .map(|r| {
+            r.join("retro-images")
+                .join("formats")
+                .join("bmp")
+                .join(name)
+        })
         .filter(|p| p.exists())
 }
 
 fn retro_path(format: &str, name: &str) -> Option<PathBuf> {
     find_testdata_root()
-        .map(|r| r.join("retro-images").join("formats").join(format).join(name))
+        .map(|r| {
+            r.join("retro-images")
+                .join("formats")
+                .join(format)
+                .join(name)
+        })
         .filter(|p| p.exists())
 }
 
@@ -258,10 +268,7 @@ fn decode_works_with_parallel_off() {
 
 use std::io::Write as _;
 
-fn make_zip_with_entries(
-    path: &std::path::Path,
-    entries: &[(&str, &[u8])],
-) {
+fn make_zip_with_entries(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     let file = std::fs::File::create(path).unwrap();
     let mut zw = zip::ZipWriter::new(file);
     let opts: zip::write::FileOptions<()> =
@@ -273,15 +280,14 @@ fn make_zip_with_entries(
     zw.finish().unwrap();
 }
 
-fn make_7z_with_entries(
-    path: &std::path::Path,
-    entries: &[(&str, &[u8])],
-) {
+fn make_7z_with_entries(path: &std::path::Path, entries: &[(&str, &[u8])]) {
     let file = std::fs::File::create(path).unwrap();
     let mut writer = sevenz_rust2::ArchiveWriter::new(file).unwrap();
     for (name, data) in entries {
         let entry = sevenz_rust2::ArchiveEntry::new_file(name);
-        writer.push_archive_entry::<&[u8]>(entry, Some(*data)).unwrap();
+        writer
+            .push_archive_entry::<&[u8]>(entry, Some(*data))
+            .unwrap();
     }
     writer.finish().unwrap();
 }

@@ -52,7 +52,8 @@ impl App {
                             .desired_width(f32::INFINITY),
                     );
                     // 初回フォーカス
-                    if !resp.has_focus() && ctx.input(|i| i.focused)
+                    if !resp.has_focus()
+                        && ctx.input(|i| i.focused)
                         && !ui.memory(|m| m.focused().is_some())
                     {
                         resp.request_focus();
@@ -91,8 +92,8 @@ impl App {
                 ui.separator();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let can_apply = self.fav_add_target.is_some()
-                        && !self.fav_add_name_input.trim().is_empty();
+                    let can_apply =
+                        self.fav_add_target.is_some() && !self.fav_add_name_input.trim().is_empty();
                     if ui
                         .add_enabled(can_apply, egui::Button::new("  追加  "))
                         .clicked()
@@ -124,8 +125,7 @@ impl App {
                     }
                 }
                 // cache_creator_checked は favorites と同じ長さを保つ
-                self.cc.checked
-                    .resize(self.settings.favorites.len(), false);
+                self.cc.checked.resize(self.settings.favorites.len(), false);
             }
             self.show_fav_add_dialog = false;
             self.fav_add_name_input.clear();

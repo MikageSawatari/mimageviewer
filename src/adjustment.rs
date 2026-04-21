@@ -123,22 +123,46 @@ impl PostFilter {
     /// - 写真系: カラーグレーディング → アナログ → 描画風 → 実用 の順
     pub const ALL: &'static [Self] = &[
         // レトロ系
-        Self::None, Self::Nearest,
-        Self::CrtSimple, Self::CrtFull, Self::CrtArcade,
-        Self::Dither1bit, Self::GameBoy,
-        Self::Pc98, Self::GameGear, Self::Famicom, Self::MegaDrive,
-        Self::Msx2Plus, Self::Sfc,
-        Self::ComboFamicomCrt, Self::ComboPc98Crt, Self::ComboMsx2PlusCrt,
-        Self::ComboMegaDriveCrt, Self::ComboSfcCrt,
+        Self::None,
+        Self::Nearest,
+        Self::CrtSimple,
+        Self::CrtFull,
+        Self::CrtArcade,
+        Self::Dither1bit,
+        Self::GameBoy,
+        Self::Pc98,
+        Self::GameGear,
+        Self::Famicom,
+        Self::MegaDrive,
+        Self::Msx2Plus,
+        Self::Sfc,
+        Self::ComboFamicomCrt,
+        Self::ComboPc98Crt,
+        Self::ComboMsx2PlusCrt,
+        Self::ComboMegaDriveCrt,
+        Self::ComboSfcCrt,
         // 写真系 カラーグレーディング
-        Self::Sepia, Self::MonoNeutral, Self::MonoCool, Self::MonoWarm,
-        Self::WarmTone, Self::CoolTone,
-        Self::TealOrange, Self::KodakPortra, Self::FujiVelvia,
-        Self::BleachBypass, Self::CrossProcess, Self::Vintage,
+        Self::Sepia,
+        Self::MonoNeutral,
+        Self::MonoCool,
+        Self::MonoWarm,
+        Self::WarmTone,
+        Self::CoolTone,
+        Self::TealOrange,
+        Self::KodakPortra,
+        Self::FujiVelvia,
+        Self::BleachBypass,
+        Self::CrossProcess,
+        Self::Vintage,
         // 写真系 アナログフィルム
-        Self::FilmGrain, Self::Vignette, Self::LightLeak, Self::SoftFocus,
+        Self::FilmGrain,
+        Self::Vignette,
+        Self::LightLeak,
+        Self::SoftFocus,
         // 絵画・描画風
-        Self::Halftone, Self::OilPaint, Self::Sketch,
+        Self::Halftone,
+        Self::OilPaint,
+        Self::Sketch,
         // 実用
         Self::Sharpen,
     ];
@@ -203,10 +227,8 @@ impl PostFilter {
 /// それ以降は [`crate::ai::ModelKind::upscale_models`] から自動生成して
 /// モデル定義側との二重管理を避ける。
 pub fn upscale_menu_items() -> Vec<(&'static str, Option<&'static str>)> {
-    let mut items: Vec<(&'static str, Option<&'static str>)> = vec![
-        ("なし", None),
-        ("自動 (画像タイプ判別)", Some("auto")),
-    ];
+    let mut items: Vec<(&'static str, Option<&'static str>)> =
+        vec![("なし", None), ("自動 (画像タイプ判別)", Some("auto"))];
     for kind in crate::ai::ModelKind::upscale_models() {
         items.push((kind.display_label(), Some(kind.as_str())));
     }
@@ -225,14 +247,14 @@ pub fn upscale_model_label(key: Option<&str>) -> &'static str {
 /// 画像補正パラメータ。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdjustParams {
-    pub brightness: f32,     // -100..+100
-    pub contrast: f32,       // -100..+100
-    pub gamma: f32,          // 0.2..5.0
-    pub saturation: f32,     // -100..+100
-    pub temperature: f32,    // -100..+100
-    pub black_point: u8,     // 0..255
-    pub white_point: u8,     // 0..255
-    pub midtone: f32,        // 0.1..10.0
+    pub brightness: f32,  // -100..+100
+    pub contrast: f32,    // -100..+100
+    pub gamma: f32,       // 0.2..5.0
+    pub saturation: f32,  // -100..+100
+    pub temperature: f32, // -100..+100
+    pub black_point: u8,  // 0..255
+    pub white_point: u8,  // 0..255
+    pub midtone: f32,     // 0.1..10.0
     pub auto_mode: Option<AutoMode>,
     /// AI アップスケールモデル。None = off, Some("auto") = 自動判別
     pub upscale_model: Option<String>,
@@ -283,8 +305,12 @@ impl AdjustParams {
             && self.auto_mode.is_none()
     }
 
-    pub fn needs_upscale(&self) -> bool { self.upscale_model.is_some() }
-    pub fn needs_denoise(&self) -> bool { self.denoise_model.is_some() }
+    pub fn needs_upscale(&self) -> bool {
+        self.upscale_model.is_some()
+    }
+    pub fn needs_denoise(&self) -> bool {
+        self.denoise_model.is_some()
+    }
 
     /// ページ個別設定として保存する価値がないか (= identity かつ AI も使わない)。
     /// true のときは DB から該当行を削除する / 個別設定を作らないで済む。
@@ -307,7 +333,9 @@ impl AdjustParams {
     }
 
     pub fn denoise_model_kind(&self) -> Option<crate::ai::ModelKind> {
-        self.denoise_model.as_deref().and_then(crate::ai::ModelKind::from_str)
+        self.denoise_model
+            .as_deref()
+            .and_then(crate::ai::ModelKind::from_str)
     }
 }
 
@@ -326,13 +354,19 @@ pub struct PresetSlots {
 
 impl Default for PresetSlots {
     fn default() -> Self {
-        Self { slots: Default::default() }
+        Self {
+            slots: Default::default(),
+        }
     }
 }
 
 /// スロットインデックス (0-9) → 表示用キーラベル ("1"-"9", "0")
 pub fn slot_key_label(slot_idx: usize) -> String {
-    if slot_idx == 9 { "0".to_string() } else { (slot_idx + 1).to_string() }
+    if slot_idx == 9 {
+        "0".to_string()
+    } else {
+        (slot_idx + 1).to_string()
+    }
 }
 
 // ── 画像処理 ────────────────────────────────────────────────────
@@ -380,7 +414,8 @@ fn build_u8_lut(params: &AdjustParams) -> [u8; 256] {
     let inv_gamma = 1.0 / params.gamma;
     let bc_factor = (259.0 * (params.contrast + 255.0)) / (255.0 * (259.0 - params.contrast));
     let bright_add = params.brightness * 2.55;
-    let needs_levels = params.black_point != 0 || params.white_point != 255 || params.midtone != 1.0;
+    let needs_levels =
+        params.black_point != 0 || params.white_point != 255 || params.midtone != 1.0;
     let needs_gamma = (params.gamma - 1.0).abs() >= 0.001;
     let needs_bc = params.brightness != 0.0 || params.contrast != 0.0;
 
@@ -409,56 +444,76 @@ fn apply_pipeline_u8_lut(src: &egui::ColorImage, params: &AdjustParams) -> egui:
     let has_sat = params.saturation != 0.0;
     let sat_factor = 1.0 + params.saturation / 100.0;
 
-    let pixels: Vec<egui::Color32> = src.pixels.iter().map(|c| {
-        // Color32 は premultiplied 格納。元のアルファを保持するため unmultiplied 経由で再構築する。
-        let [_, _, _, a] = c.to_srgba_unmultiplied();
-        let r = lut[c.r() as usize];
-        let g = lut[c.g() as usize];
-        let b = lut[c.b() as usize];
+    let pixels: Vec<egui::Color32> = src
+        .pixels
+        .iter()
+        .map(|c| {
+            // Color32 は premultiplied 格納。元のアルファを保持するため unmultiplied 経由で再構築する。
+            let [_, _, _, a] = c.to_srgba_unmultiplied();
+            let r = lut[c.r() as usize];
+            let g = lut[c.g() as usize];
+            let b = lut[c.b() as usize];
 
-        let (nr, ng, nb) = if full_desat {
-            let lum = pixel_lum(&egui::Color32::from_rgb(r, g, b));
-            (lum, lum, lum)
-        } else if has_sat {
-            let (r01, g01, b01) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
-            let max = r01.max(g01).max(b01);
-            let min = r01.min(g01).min(b01);
-            let lum = (max + min) * 0.5;
-            if (max - min).abs() < 1e-6 {
-                (r, g, b)
+            let (nr, ng, nb) = if full_desat {
+                let lum = pixel_lum(&egui::Color32::from_rgb(r, g, b));
+                (lum, lum, lum)
+            } else if has_sat {
+                let (r01, g01, b01) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+                let max = r01.max(g01).max(b01);
+                let min = r01.min(g01).min(b01);
+                let lum = (max + min) * 0.5;
+                if (max - min).abs() < 1e-6 {
+                    (r, g, b)
+                } else {
+                    (
+                        ((lum + (r01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
+                        ((lum + (g01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
+                        ((lum + (b01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
+                    )
+                }
             } else {
-                (
-                    ((lum + (r01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
-                    ((lum + (g01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
-                    ((lum + (b01 - lum) * sat_factor) * 255.0).clamp(0.0, 255.0) as u8,
-                )
-            }
-        } else {
-            (r, g, b)
-        };
-        egui::Color32::from_rgba_unmultiplied(nr, ng, nb, a)
-    }).collect();
+                (r, g, b)
+            };
+            egui::Color32::from_rgba_unmultiplied(nr, ng, nb, a)
+        })
+        .collect();
 
     egui::ColorImage::new([w, h], pixels)
 }
 
 fn pixels_to_f32(src: &egui::ColorImage) -> Vec<[f32; 3]> {
-    src.pixels.iter().map(|c| [c.r() as f32, c.g() as f32, c.b() as f32]).collect()
+    src.pixels
+        .iter()
+        .map(|c| [c.r() as f32, c.g() as f32, c.b() as f32])
+        .collect()
 }
 
-fn f32_to_image(src: &egui::ColorImage, buf: Vec<[f32; 3]>, w: usize, h: usize) -> egui::ColorImage {
-    let pixels = buf.iter().zip(src.pixels.iter()).map(|([r, g, b], c)| {
-        let [_, _, _, a] = c.to_srgba_unmultiplied();
-        egui::Color32::from_rgba_unmultiplied(
-            r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8, a,
-        )
-    }).collect();
+fn f32_to_image(
+    src: &egui::ColorImage,
+    buf: Vec<[f32; 3]>,
+    w: usize,
+    h: usize,
+) -> egui::ColorImage {
+    let pixels = buf
+        .iter()
+        .zip(src.pixels.iter())
+        .map(|([r, g, b], c)| {
+            let [_, _, _, a] = c.to_srgba_unmultiplied();
+            egui::Color32::from_rgba_unmultiplied(
+                r.clamp(0.0, 255.0) as u8,
+                g.clamp(0.0, 255.0) as u8,
+                b.clamp(0.0, 255.0) as u8,
+                a,
+            )
+        })
+        .collect();
     egui::ColorImage::new([w, h], pixels)
 }
 
 /// f32 パイプライン (色温度ありの場合に使用)。
 fn apply_color_pipeline(buf: &mut Vec<[f32; 3]>, params: &AdjustParams) {
-    let needs_levels = params.black_point != 0 || params.white_point != 255 || params.midtone != 1.0;
+    let needs_levels =
+        params.black_point != 0 || params.white_point != 255 || params.midtone != 1.0;
     let needs_gamma = (params.gamma - 1.0).abs() >= 0.001;
     if needs_levels || needs_gamma {
         // levels + gamma を f32 LUT で処理
@@ -469,12 +524,18 @@ fn apply_color_pipeline(buf: &mut Vec<[f32; 3]>, params: &AdjustParams) {
         let mut lut = [0.0_f32; 256];
         for i in 0..256 {
             let mut v = i as f32;
-            if needs_levels { v = ((v - bp) / range).clamp(0.0, 1.0).powf(inv_midtone) * 255.0; }
-            if needs_gamma { v = (v / 255.0).clamp(0.0, 1.0).powf(inv_gamma) * 255.0; }
+            if needs_levels {
+                v = ((v - bp) / range).clamp(0.0, 1.0).powf(inv_midtone) * 255.0;
+            }
+            if needs_gamma {
+                v = (v / 255.0).clamp(0.0, 1.0).powf(inv_gamma) * 255.0;
+            }
             lut[i] = v;
         }
         for px in buf.iter_mut() {
-            for ch in px.iter_mut() { *ch = lut[(*ch).clamp(0.0, 255.0) as u8 as usize]; }
+            for ch in px.iter_mut() {
+                *ch = lut[(*ch).clamp(0.0, 255.0) as u8 as usize];
+            }
         }
     }
     apply_brightness_contrast(buf, params.brightness, params.contrast);
@@ -548,13 +609,19 @@ fn compute_auto_levels(src: &egui::ColorImage, clip_ratio: f64) -> (u8, u8) {
     let mut bp = 0u8;
     for (i, &count) in hist.iter().enumerate() {
         cum += count;
-        if cum >= low_threshold { bp = i as u8; break; }
+        if cum >= low_threshold {
+            bp = i as u8;
+            break;
+        }
     }
     cum = 0;
     let mut wp = 255u8;
     for (i, &count) in hist.iter().enumerate() {
         cum += count;
-        if cum >= high_threshold { wp = i as u8; break; }
+        if cum >= high_threshold {
+            wp = i as u8;
+            break;
+        }
     }
     (bp, wp.max(bp + 1))
 }
@@ -565,37 +632,51 @@ fn compute_manga_levels(src: &egui::ColorImage) -> (u8, u8) {
     let mut max_count = 0u64;
     let mut paper_lum = 240u8;
     for i in 180..256 {
-        if hist[i] > max_count { max_count = hist[i]; paper_lum = i as u8; }
+        if hist[i] > max_count {
+            max_count = hist[i];
+            paper_lum = i as u8;
+        }
     }
     let wp = paper_lum.saturating_sub(10);
 
     let mut max_dark = 0u64;
     let mut ink_lum = 20u8;
     for i in 0..80 {
-        if hist[i] > max_dark { max_dark = hist[i]; ink_lum = i as u8; }
+        if hist[i] > max_dark {
+            max_dark = hist[i];
+            ink_lum = i as u8;
+        }
     }
     let bp = ink_lum.saturating_add(5);
     (bp, wp.max(bp + 1))
 }
 
 fn apply_brightness_contrast(buf: &mut [[f32; 3]], brightness: f32, contrast: f32) {
-    if brightness == 0.0 && contrast == 0.0 { return; }
+    if brightness == 0.0 && contrast == 0.0 {
+        return;
+    }
     let factor = (259.0 * (contrast + 255.0)) / (255.0 * (259.0 - contrast));
     let bright_add = brightness * 2.55;
     for px in buf.iter_mut() {
-        for ch in px.iter_mut() { *ch = factor * (*ch - 128.0) + 128.0 + bright_add; }
+        for ch in px.iter_mut() {
+            *ch = factor * (*ch - 128.0) + 128.0 + bright_add;
+        }
     }
 }
 
 fn apply_saturation(buf: &mut [[f32; 3]], saturation: f32) {
-    if saturation == 0.0 { return; }
+    if saturation == 0.0 {
+        return;
+    }
     let factor = 1.0 + saturation / 100.0;
     for px in buf.iter_mut() {
         let [r, g, b] = *px;
         let (r01, g01, b01) = (r / 255.0, g / 255.0, b / 255.0);
         let max = r01.max(g01).max(b01);
         let min = r01.min(g01).min(b01);
-        if (max - min).abs() < 1e-6 { continue; }
+        if (max - min).abs() < 1e-6 {
+            continue;
+        }
         let lum = (max + min) * 0.5;
         px[0] = (lum + (r01 - lum) * factor) * 255.0;
         px[1] = (lum + (g01 - lum) * factor) * 255.0;
@@ -604,9 +685,14 @@ fn apply_saturation(buf: &mut [[f32; 3]], saturation: f32) {
 }
 
 fn apply_temperature(buf: &mut [[f32; 3]], temperature: f32) {
-    if temperature == 0.0 { return; }
+    if temperature == 0.0 {
+        return;
+    }
     let shift = temperature * 0.5;
-    for px in buf.iter_mut() { px[0] += shift; px[2] -= shift; }
+    for px in buf.iter_mut() {
+        px[0] += shift;
+        px[2] -= shift;
+    }
 }
 
 #[cfg(test)]
@@ -618,8 +704,10 @@ mod tests {
         let params = AdjustParams::default();
         assert!(params.is_identity());
         let pixels = vec![
-            egui::Color32::from_rgb(100, 150, 200), egui::Color32::from_rgb(50, 50, 50),
-            egui::Color32::from_rgb(200, 200, 200), egui::Color32::from_rgb(0, 0, 0),
+            egui::Color32::from_rgb(100, 150, 200),
+            egui::Color32::from_rgb(50, 50, 50),
+            egui::Color32::from_rgb(200, 200, 200),
+            egui::Color32::from_rgb(0, 0, 0),
         ];
         let src = egui::ColorImage::new([2, 2], pixels.clone());
         let result = apply_adjustments(&src, &params);
@@ -628,7 +716,10 @@ mod tests {
 
     #[test]
     fn brightness_increases() {
-        let params = AdjustParams { brightness: 50.0, ..Default::default() };
+        let params = AdjustParams {
+            brightness: 50.0,
+            ..Default::default()
+        };
         let src = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(100, 100, 100)]);
         let result = apply_adjustments(&src, &params);
         assert!(result.pixels[0].r() > 100);
@@ -637,9 +728,15 @@ mod tests {
     #[test]
     fn auto_level_sets_points() {
         let mut pixels = Vec::new();
-        for _ in 0..100 { pixels.push(egui::Color32::from_rgb(50, 50, 50)); }
-        for _ in 0..800 { pixels.push(egui::Color32::from_rgb(128, 128, 128)); }
-        for _ in 0..100 { pixels.push(egui::Color32::from_rgb(230, 230, 230)); }
+        for _ in 0..100 {
+            pixels.push(egui::Color32::from_rgb(50, 50, 50));
+        }
+        for _ in 0..800 {
+            pixels.push(egui::Color32::from_rgb(128, 128, 128));
+        }
+        for _ in 0..100 {
+            pixels.push(egui::Color32::from_rgb(230, 230, 230));
+        }
         let src = egui::ColorImage::new([100, 10], pixels);
         let (bp, wp) = compute_auto_levels(&src, 0.05);
         assert!(bp >= 40);
@@ -648,20 +745,28 @@ mod tests {
 
     #[test]
     fn histogram_sampling_large_image() {
-        let (hist, count) = build_luma_histogram(
-            &vec![egui::Color32::from_rgb(128, 128, 128); 2_000_000]
-        );
+        let (hist, count) =
+            build_luma_histogram(&vec![egui::Color32::from_rgb(128, 128, 128); 2_000_000]);
         assert_eq!(count, HISTOGRAM_SAMPLE_LIMIT as u64);
         assert!(hist[128] > 0);
     }
 
     #[test]
     fn ai_settings_eq_check() {
-        let a = AdjustParams { brightness: 50.0, ..Default::default() };
-        let b = AdjustParams { brightness: -20.0, ..Default::default() };
+        let a = AdjustParams {
+            brightness: 50.0,
+            ..Default::default()
+        };
+        let b = AdjustParams {
+            brightness: -20.0,
+            ..Default::default()
+        };
         assert!(a.ai_settings_eq(&b)); // 色調のみ異なる
 
-        let c = AdjustParams { upscale_model: Some("auto".into()), ..Default::default() };
+        let c = AdjustParams {
+            upscale_model: Some("auto".into()),
+            ..Default::default()
+        };
         assert!(!a.ai_settings_eq(&c)); // AI設定が異なる
     }
 
@@ -688,12 +793,26 @@ mod sampling_quality_tests {
         let (bp_sampled, wp_sampled) = compute_manga_levels(&src);
         // Full scan reference
         let mut hist_full = [0u64; 256];
-        for c in &src.pixels { hist_full[pixel_lum(c) as usize] += 1; }
-        let mut mc = 0u64; let mut pl = 240u8;
-        for i in 180..256 { if hist_full[i] > mc { mc = hist_full[i]; pl = i as u8; } }
+        for c in &src.pixels {
+            hist_full[pixel_lum(c) as usize] += 1;
+        }
+        let mut mc = 0u64;
+        let mut pl = 240u8;
+        for i in 180..256 {
+            if hist_full[i] > mc {
+                mc = hist_full[i];
+                pl = i as u8;
+            }
+        }
         let wp_full = pl.saturating_sub(10);
-        let mut md = 0u64; let mut il = 20u8;
-        for i in 0..80 { if hist_full[i] > md { md = hist_full[i]; il = i as u8; } }
+        let mut md = 0u64;
+        let mut il = 20u8;
+        for i in 0..80 {
+            if hist_full[i] > md {
+                md = hist_full[i];
+                il = i as u8;
+            }
+        }
         let bp_full = il.saturating_add(5);
         assert!((bp_sampled as i16 - bp_full as i16).unsigned_abs() <= 3);
         assert!((wp_sampled as i16 - wp_full as i16).unsigned_abs() <= 3);

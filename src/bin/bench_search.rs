@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
-use tantivy::schema::{IndexRecordOption, Schema, Value, STORED, STRING};
+use tantivy::schema::{IndexRecordOption, STORED, STRING, Schema, Value};
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer};
-use tantivy::{doc, Index, IndexWriter, Term};
+use tantivy::{Index, IndexWriter, Term, doc};
 
 // ============================================================================
 // 設定
@@ -52,7 +52,9 @@ struct Rng {
     state: u64,
 }
 impl Rng {
-    fn new(seed: u64) -> Self { Self { state: seed.max(1) } }
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
     fn next(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x << 13;
@@ -73,36 +75,114 @@ impl Rng {
 // "rare" "medium" "generic" の周期ビンに分けてあるので、
 // クエリ側でこのビンを使って頻度をコントロールできる。
 const JP_GENERIC: &[&str] = &[
-    "の", "と", "が", "は", "を", "に", "で", "から", "まで",
-    "カメラ", "写真", "画像", "風景", "人物", "女性", "男性",
+    "の",
+    "と",
+    "が",
+    "は",
+    "を",
+    "に",
+    "で",
+    "から",
+    "まで",
+    "カメラ",
+    "写真",
+    "画像",
+    "風景",
+    "人物",
+    "女性",
+    "男性",
 ];
 const JP_MEDIUM: &[&str] = &[
-    "夕焼け", "海辺", "雪景色", "紅葉", "桜並木", "猫", "犬",
-    "空港", "駅前", "商店街", "庭園", "神社", "寺院", "温泉",
-    "街並み", "夜景", "霧", "虹", "湖畔", "公園",
+    "夕焼け",
+    "海辺",
+    "雪景色",
+    "紅葉",
+    "桜並木",
+    "猫",
+    "犬",
+    "空港",
+    "駅前",
+    "商店街",
+    "庭園",
+    "神社",
+    "寺院",
+    "温泉",
+    "街並み",
+    "夜景",
+    "霧",
+    "虹",
+    "湖畔",
+    "公園",
 ];
 const JP_RARE: &[&str] = &[
-    "美濃焼", "黒楽茶碗", "斑鳩宮", "飛鳥時代",
-    "曜変天目", "龍泉窯", "金継ぎ", "瑠璃色",
-    "銅鏡研磨", "蒔絵螺鈿", "千歳飴屋台",
+    "美濃焼",
+    "黒楽茶碗",
+    "斑鳩宮",
+    "飛鳥時代",
+    "曜変天目",
+    "龍泉窯",
+    "金継ぎ",
+    "瑠璃色",
+    "銅鏡研磨",
+    "蒔絵螺鈿",
+    "千歳飴屋台",
 ];
 const EN_COMMON: &[&str] = &[
-    "the", "and", "in", "of", "with", "for", "from", "by", "at", "on",
-    "photo", "image", "camera", "landscape", "portrait", "beach",
-    "sunset", "night", "city", "forest",
+    "the",
+    "and",
+    "in",
+    "of",
+    "with",
+    "for",
+    "from",
+    "by",
+    "at",
+    "on",
+    "photo",
+    "image",
+    "camera",
+    "landscape",
+    "portrait",
+    "beach",
+    "sunset",
+    "night",
+    "city",
+    "forest",
 ];
 const EN_AI: &[&str] = &[
-    "stable diffusion", "lora", "sampler", "euler", "dpm++", "karras",
-    "cfg", "scale", "steps", "seed", "negative prompt", "clip skip",
-    "hires fix", "refiner", "controlnet", "ipadapter",
+    "stable diffusion",
+    "lora",
+    "sampler",
+    "euler",
+    "dpm++",
+    "karras",
+    "cfg",
+    "scale",
+    "steps",
+    "seed",
+    "negative prompt",
+    "clip skip",
+    "hires fix",
+    "refiner",
+    "controlnet",
+    "ipadapter",
 ];
 const CAMERAS: &[&str] = &[
-    "SONY ILCE-7M4", "Canon EOS R5", "Nikon Z9", "FUJIFILM X-T5",
-    "iPhone 15 Pro", "Pixel 8 Pro", "RICOH GR IIIx", "Leica Q3",
+    "SONY ILCE-7M4",
+    "Canon EOS R5",
+    "Nikon Z9",
+    "FUJIFILM X-T5",
+    "iPhone 15 Pro",
+    "Pixel 8 Pro",
+    "RICOH GR IIIx",
+    "Leica Q3",
 ];
 const LENSES: &[&str] = &[
-    "FE 24-70mm F2.8 GM", "EF 70-200mm f/2.8L", "NIKKOR Z 50mm f/1.2 S",
-    "XF 16-55mm f/2.8 R", "Summilux 35mm f/1.4",
+    "FE 24-70mm F2.8 GM",
+    "EF 70-200mm f/2.8L",
+    "NIKKOR Z 50mm f/1.2 S",
+    "XF 16-55mm f/2.8 R",
+    "Summilux 35mm f/1.4",
 ];
 
 fn generate_corpus(num_docs: usize, seed: u64) -> Vec<SyntheticDoc> {
@@ -118,7 +198,10 @@ fn make_doc(idx: usize, rng: &mut Rng) -> SyntheticDoc {
     // path: 疑似的なフォルダ階層
     let folder = rng.range(0, 100);
     let sub = rng.range(0, 20);
-    let path = format!("d:/photos/fav_{:03}/sub_{:02}/img_{:06}.jpg", folder, sub, idx);
+    let path = format!(
+        "d:/photos/fav_{:03}/sub_{:02}/img_{:06}.jpg",
+        folder, sub, idx
+    );
 
     // all_text: ~2KB の合成テキスト
     let mut text = String::with_capacity(2200);
@@ -130,11 +213,22 @@ fn make_doc(idx: usize, rng: &mut Rng) -> SyntheticDoc {
     text.push_str(rng.pick(CAMERAS));
     text.push(' ');
     text.push_str(rng.pick(LENSES));
-    text.push_str(&format!(" ISO{} f/{:.1} 1/{} ", rng.range(100, 6400), (rng.range(14, 280) as f32) / 10.0, rng.range(30, 2000)));
+    text.push_str(&format!(
+        " ISO{} f/{:.1} 1/{} ",
+        rng.range(100, 6400),
+        (rng.range(14, 280) as f32) / 10.0,
+        rng.range(30, 2000)
+    ));
 
     // 日本語 (generic を多め、medium を中、rare を少量)
-    for _ in 0..rng.range(8, 16) { text.push_str(rng.pick(JP_GENERIC)); text.push(' '); }
-    for _ in 0..rng.range(2, 6)  { text.push_str(rng.pick(JP_MEDIUM)); text.push(' '); }
+    for _ in 0..rng.range(8, 16) {
+        text.push_str(rng.pick(JP_GENERIC));
+        text.push(' ');
+    }
+    for _ in 0..rng.range(2, 6) {
+        text.push_str(rng.pick(JP_MEDIUM));
+        text.push(' ');
+    }
     if rng.next() % 20 == 0 {
         // 20 件に 1 件だけ rare が混じる → rare クエリの期待ヒット数 ≈ num_docs / 20
         text.push_str(rng.pick(JP_RARE));
@@ -142,8 +236,14 @@ fn make_doc(idx: usize, rng: &mut Rng) -> SyntheticDoc {
     }
 
     // 英語
-    for _ in 0..rng.range(6, 12) { text.push_str(rng.pick(EN_COMMON)); text.push(' '); }
-    for _ in 0..rng.range(1, 4)  { text.push_str(rng.pick(EN_AI)); text.push(' '); }
+    for _ in 0..rng.range(6, 12) {
+        text.push_str(rng.pick(EN_COMMON));
+        text.push(' ');
+    }
+    for _ in 0..rng.range(1, 4) {
+        text.push_str(rng.pick(EN_AI));
+        text.push(' ');
+    }
 
     // 詰め物: 2KB に満たない場合は generic を追加
     while text.len() < 2000 {
@@ -151,33 +251,39 @@ fn make_doc(idx: usize, rng: &mut Rng) -> SyntheticDoc {
         text.push(' ');
     }
 
-    SyntheticDoc { path, all_text: text }
+    SyntheticDoc {
+        path,
+        all_text: text,
+    }
 }
 
 // ============================================================================
 // Tantivy インデックス構築
 // ============================================================================
 
-fn build_schema() -> (Schema, tantivy::schema::Field, tantivy::schema::Field, tantivy::schema::Field) {
+fn build_schema() -> (
+    Schema,
+    tantivy::schema::Field,
+    tantivy::schema::Field,
+    tantivy::schema::Field,
+) {
     let mut b = Schema::builder();
     let path = b.add_text_field("path", STRING | STORED);
     let name = b.add_text_field(
         "name",
-        tantivy::schema::TextOptions::default()
-            .set_indexing_options(
-                tantivy::schema::TextFieldIndexing::default()
-                    .set_tokenizer(BIGRAM_TOKENIZER_NAME)
-                    .set_index_option(IndexRecordOption::WithFreqs),
-            ),
+        tantivy::schema::TextOptions::default().set_indexing_options(
+            tantivy::schema::TextFieldIndexing::default()
+                .set_tokenizer(BIGRAM_TOKENIZER_NAME)
+                .set_index_option(IndexRecordOption::WithFreqs),
+        ),
     );
     let all_text = b.add_text_field(
         "all_text",
-        tantivy::schema::TextOptions::default()
-            .set_indexing_options(
-                tantivy::schema::TextFieldIndexing::default()
-                    .set_tokenizer(BIGRAM_TOKENIZER_NAME)
-                    .set_index_option(IndexRecordOption::WithFreqs),
-            ),
+        tantivy::schema::TextOptions::default().set_indexing_options(
+            tantivy::schema::TextFieldIndexing::default()
+                .set_tokenizer(BIGRAM_TOKENIZER_NAME)
+                .set_index_option(IndexRecordOption::WithFreqs),
+        ),
     );
     (b.build(), path, name, all_text)
 }
@@ -191,10 +297,7 @@ fn register_bigram(index: &Index) {
 
 /// Tantivy index を作り、全 doc を投入して commit。
 /// インデックス時間とインデックスサイズを返す。
-fn build_index(
-    corpus: &[SyntheticDoc],
-    index_dir: &std::path::Path,
-) -> (Index, Duration, u64) {
+fn build_index(corpus: &[SyntheticDoc], index_dir: &std::path::Path) -> (Index, Duration, u64) {
     std::fs::create_dir_all(index_dir).unwrap();
     let (schema, path_f, name_f, all_text_f) = build_schema();
 
@@ -228,8 +331,11 @@ fn dir_size(path: &std::path::Path) -> u64 {
     if let Ok(entries) = std::fs::read_dir(path) {
         for e in entries.flatten() {
             if let Ok(md) = e.metadata() {
-                if md.is_file() { total += md.len(); }
-                else if md.is_dir() { total += dir_size(&e.path()); }
+                if md.is_file() {
+                    total += md.len();
+                } else if md.is_dir() {
+                    total += dir_size(&e.path());
+                }
             }
         }
     }
@@ -274,14 +380,15 @@ fn build_sqlite_meta(corpus: &[SyntheticDoc], db_path: &std::path::Path) -> Dura
 fn sqlite_lookup_batch(db_path: &std::path::Path, paths: &[String]) -> (Duration, usize) {
     let conn = Connection::open(db_path).unwrap();
     let placeholders = (0..paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT path, all_text_norm FROM files WHERE path IN ({})", placeholders);
+    let sql = format!(
+        "SELECT path, all_text_norm FROM files WHERE path IN ({})",
+        placeholders
+    );
 
     let t = Instant::now();
     let mut stmt = conn.prepare(&sql).unwrap();
-    let params_vec: Vec<&dyn rusqlite::ToSql> = paths
-        .iter()
-        .map(|s| s as &dyn rusqlite::ToSql)
-        .collect();
+    let params_vec: Vec<&dyn rusqlite::ToSql> =
+        paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).unwrap();
     let mut count = 0;
     while let Some(row) = rows.next().unwrap() {
@@ -298,11 +405,7 @@ fn sqlite_lookup_batch(db_path: &std::path::Path, paths: &[String]) -> (Duration
 
 /// クエリ文字列を bigram に分解して AND の BooleanQuery を作る。
 /// v1 設計では 2 文字未満はクエリ側で弾くが、ここでは計測用に生成だけする。
-fn build_and_query(
-    index: &Index,
-    field: tantivy::schema::Field,
-    query_text: &str,
-) -> BooleanQuery {
+fn build_and_query(index: &Index, field: tantivy::schema::Field, query_text: &str) -> BooleanQuery {
     let lowered = query_text.to_lowercase();
     let mut tokenizer = NgramTokenizer::new(2, 2, false).unwrap();
     let mut stream: Box<dyn TokenStream> = Box::new(tokenizer.token_stream(&lowered));
@@ -373,7 +476,9 @@ fn run_paged_query(
             .unwrap();
         let page_fetch = t_page.elapsed();
 
-        if top_docs.is_empty() { break; }
+        if top_docs.is_empty() {
+            break;
+        }
 
         let page_count = top_docs.len();
         total_fetched += page_count;
@@ -392,7 +497,9 @@ fn run_paged_query(
             // Tantivy の all_text は STORED ではないので、ここでは false-positive 率は計測外。
             // valid_hits を「Tantivy が返した候補 = 全て真ヒット」として扱う (簡略化)。
             valid_hits += 1;
-            if valid_hits >= HARD_MAX { break; }
+            if valid_hits >= HARD_MAX {
+                break;
+            }
         }
         post_time += t_post.elapsed();
 
@@ -400,11 +507,17 @@ fn run_paged_query(
         pages += 1;
         offset += PAGE_SIZE;
 
-        if valid_hits >= HARD_MAX { break; }
-        if page_count < PAGE_SIZE { break; } // 候補使い切り
+        if valid_hits >= HARD_MAX {
+            break;
+        }
+        if page_count < PAGE_SIZE {
+            break;
+        } // 候補使い切り
 
         // 計測目的なら生産性のためページ打ち切り上限を設ける
-        if pages >= 30 { break; } // 30 * 500 = 15,000 doc 程度まで
+        if pages >= 30 {
+            break;
+        } // 30 * 500 = 15,000 doc 程度まで
     }
 
     let _ = q_lower; // 未使用 warning 抑制
@@ -432,7 +545,8 @@ struct QuerySpec {
 fn summarize(r: &PagingResult) -> String {
     let total_ms = r.time_total.as_secs_f64() * 1000.0;
     let avg = if !r.time_per_page.is_empty() {
-        r.time_per_page.iter().sum::<Duration>().as_secs_f64() * 1000.0 / r.time_per_page.len() as f64
+        r.time_per_page.iter().sum::<Duration>().as_secs_f64() * 1000.0
+            / r.time_per_page.len() as f64
     } else {
         0.0
     };
@@ -447,7 +561,11 @@ fn summarize(r: &PagingResult) -> String {
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
     let post_ms = r.time_post_filter_total.as_secs_f64() * 1000.0;
-    let trunc = if r.truncated { " [TRUNCATED at HARD_MAX]" } else { "" };
+    let trunc = if r.truncated {
+        " [TRUNCATED at HARD_MAX]"
+    } else {
+        ""
+    };
 
     format!(
         "  pages={:>3} fetched={:>6} valid={:>6}  total={:>8.1}ms  page_first={:>6.1}ms  page_avg={:>6.1}ms  page_worst={:>6.1}ms  post_filter={:>6.1}ms{}",
@@ -488,7 +606,10 @@ fn main() {
     std::fs::create_dir_all(&tmp_root).unwrap();
 
     // 1. コーパス生成
-    println!("[1/4] 合成コーパスを生成中 ({} docs, ~2KB/doc) ...", num_docs);
+    println!(
+        "[1/4] 合成コーパスを生成中 ({} docs, ~2KB/doc) ...",
+        num_docs
+    );
     let t = Instant::now();
     let corpus = generate_corpus(num_docs, 0xC0FFEE);
     let total_bytes: usize = corpus.iter().map(|d| d.all_text.len()).sum();
@@ -515,7 +636,9 @@ fn main() {
     // 3. SQLite meta 構築
     println!("[3/4] fts_meta.db 相当の SQLite 構築中 ...");
     let sqlite_build = build_sqlite_meta(&corpus, &sqlite_path);
-    let sqlite_size = std::fs::metadata(&sqlite_path).map(|m| m.len()).unwrap_or(0);
+    let sqlite_size = std::fs::metadata(&sqlite_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     println!(
         "      構築時間: {:.1}s, DB サイズ: {:.1} MB",
         sqlite_build.as_secs_f64(),
@@ -525,16 +648,56 @@ fn main() {
     // 4. クエリ計測
     println!("[4/4] クエリ計測 ...");
     let queries = [
-        QuerySpec { label: "rare_jp",      text: "美濃焼",             expected: "~5% of docs (JP_RARE 1/20)" },
-        QuerySpec { label: "rare_jp_and",  text: "美濃焼 斑鳩宮",      expected: "~0.01%" },
-        QuerySpec { label: "medium_jp",    text: "夕焼け",             expected: "~20-30% of docs (JP_MEDIUM)" },
-        QuerySpec { label: "medium_jp_and",text: "夕焼け 海辺",        expected: "~5-10%" },
-        QuerySpec { label: "medium_jp_3",  text: "夕焼け 海辺 紅葉",   expected: "~1-2%" },
-        QuerySpec { label: "generic_jp",   text: "カメラ",             expected: "~80%+ (JP_GENERIC)" },
-        QuerySpec { label: "super_generic",text: "の",                 expected: "100% (単文字 – 仕様では NG だが測定用)" },
-        QuerySpec { label: "en_common",    text: "photo",              expected: "~60-80%" },
-        QuerySpec { label: "en_ai_phrase", text: "lora sampler",       expected: "~5-10% (AI 用語 AND)" },
-        QuerySpec { label: "unique_id",    text: "img_042000",         expected: "1 doc only" },
+        QuerySpec {
+            label: "rare_jp",
+            text: "美濃焼",
+            expected: "~5% of docs (JP_RARE 1/20)",
+        },
+        QuerySpec {
+            label: "rare_jp_and",
+            text: "美濃焼 斑鳩宮",
+            expected: "~0.01%",
+        },
+        QuerySpec {
+            label: "medium_jp",
+            text: "夕焼け",
+            expected: "~20-30% of docs (JP_MEDIUM)",
+        },
+        QuerySpec {
+            label: "medium_jp_and",
+            text: "夕焼け 海辺",
+            expected: "~5-10%",
+        },
+        QuerySpec {
+            label: "medium_jp_3",
+            text: "夕焼け 海辺 紅葉",
+            expected: "~1-2%",
+        },
+        QuerySpec {
+            label: "generic_jp",
+            text: "カメラ",
+            expected: "~80%+ (JP_GENERIC)",
+        },
+        QuerySpec {
+            label: "super_generic",
+            text: "の",
+            expected: "100% (単文字 – 仕様では NG だが測定用)",
+        },
+        QuerySpec {
+            label: "en_common",
+            text: "photo",
+            expected: "~60-80%",
+        },
+        QuerySpec {
+            label: "en_ai_phrase",
+            text: "lora sampler",
+            expected: "~5-10% (AI 用語 AND)",
+        },
+        QuerySpec {
+            label: "unique_id",
+            text: "img_042000",
+            expected: "1 doc only",
+        },
     ];
 
     // field を別経路で取り直すと ID がズレるので index から取る
@@ -561,7 +724,10 @@ fn main() {
         let mut rows = 0;
         for _ in 0..3 {
             let (t, r) = sqlite_lookup_batch(&sqlite_path, &paths);
-            if t < best { best = t; rows = r; }
+            if t < best {
+                best = t;
+                rows = r;
+            }
         }
         println!(
             "  batch={:>5}  best={:>6.1}ms  rows={:>5}  per-row={:>5.2}ms",
@@ -574,13 +740,17 @@ fn main() {
 
     println!();
     println!("=== SUMMARY ===");
-    println!("  Tantivy build: {:.1}s, size {:.1} MB ({:.2}x raw text)",
+    println!(
+        "  Tantivy build: {:.1}s, size {:.1} MB ({:.2}x raw text)",
         build_time.as_secs_f64(),
         index_size as f64 / (1024.0 * 1024.0),
-        index_size as f64 / total_bytes as f64);
-    println!("  SQLite build:  {:.1}s, size {:.1} MB",
+        index_size as f64 / total_bytes as f64
+    );
+    println!(
+        "  SQLite build:  {:.1}s, size {:.1} MB",
         sqlite_build.as_secs_f64(),
-        sqlite_size as f64 / (1024.0 * 1024.0));
+        sqlite_size as f64 / (1024.0 * 1024.0)
+    );
     println!();
     println!("  Index dir:   {}", index_dir.display());
     println!("  SQLite file: {}", sqlite_path.display());

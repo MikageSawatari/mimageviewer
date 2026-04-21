@@ -1,8 +1,10 @@
 //! settings モジュールの統合テスト。
 //! JSON ファイル経由での設定読み書きをテストする。
 
+use mimageviewer::settings::{
+    CachePolicy, FavoriteEntry, Parallelism, Settings, SortOrder, ThumbAspect,
+};
 use tempfile::TempDir;
-use mimageviewer::settings::{Settings, FavoriteEntry, ThumbAspect, SortOrder, CachePolicy, Parallelism};
 
 /// Settings を JSON ファイルに保存し、そこから読み込むラウンドトリップ。
 /// Settings::load/save は固定パスを使うので、直接 serde を使ってテストする。
@@ -51,7 +53,10 @@ fn legacy_favorites_migration() {
     let loaded: Settings = serde_json::from_str(json).unwrap();
     assert_eq!(loaded.favorites.len(), 2);
     assert_eq!(loaded.favorites[0].name, "folder");
-    assert_eq!(loaded.favorites[0].path, std::path::PathBuf::from(r"C:\old_style\folder"));
+    assert_eq!(
+        loaded.favorites[0].path,
+        std::path::PathBuf::from(r"C:\old_style\folder")
+    );
     assert_eq!(loaded.favorites[1].name, "New Style");
 }
 
@@ -88,7 +93,11 @@ fn all_enums_survive_roundtrip() {
         assert_eq!(*policy, loaded);
     }
 
-    for par in &[Parallelism::Auto, Parallelism::Manual(1), Parallelism::Manual(8)] {
+    for par in &[
+        Parallelism::Auto,
+        Parallelism::Manual(1),
+        Parallelism::Manual(8),
+    ] {
         let json = serde_json::to_string(par).unwrap();
         let loaded: Parallelism = serde_json::from_str(&json).unwrap();
         assert_eq!(*par, loaded);

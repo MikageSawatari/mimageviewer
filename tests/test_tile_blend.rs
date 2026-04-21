@@ -6,16 +6,20 @@
 //! 実行方法:
 //!   cargo test --test test_tile_blend -- --nocapture
 
-use std::sync::atomic::{AtomicBool};
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 fn find_models_dir() -> PathBuf {
     let cwd_models = std::env::current_dir().unwrap().join("models");
-    if cwd_models.exists() { return cwd_models; }
+    if cwd_models.exists() {
+        return cwd_models;
+    }
     if let Ok(appdata) = std::env::var("APPDATA") {
         let p = PathBuf::from(appdata).join("mimageviewer").join("models");
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     panic!("models/ directory not found");
 }
@@ -54,11 +58,7 @@ fn generate_screentone(width: u32, height: u32, period: u32, radius: f32) -> ima
 
 /// 出力画像のタイル境界付近の平均輝度と中央部の平均輝度を比較する。
 /// 差が大きいほどタイル境界が目立つ。
-fn analyze_tile_boundaries(
-    img: &egui::ColorImage,
-    tile_size: u32,
-    scale: u32,
-) -> (f64, f64, f64) {
+fn analyze_tile_boundaries(img: &egui::ColorImage, tile_size: u32, scale: u32) -> (f64, f64, f64) {
     let [w, h] = img.size;
     let scaled_tile = (tile_size * scale) as usize;
 
@@ -78,11 +78,15 @@ fn analyze_tile_boundaries(
             let dist_x = if scaled_tile > 0 {
                 let pos_in_tile = x % scaled_tile;
                 pos_in_tile.min(scaled_tile - pos_in_tile)
-            } else { 999 };
+            } else {
+                999
+            };
             let dist_y = if scaled_tile > 0 {
                 let pos_in_tile = y % scaled_tile;
                 pos_in_tile.min(scaled_tile - pos_in_tile)
-            } else { 999 };
+            } else {
+                999
+            };
             let dist = dist_x.min(dist_y);
 
             if dist <= band {
@@ -95,8 +99,16 @@ fn analyze_tile_boundaries(
         }
     }
 
-    let boundary_avg = if boundary_count > 0 { boundary_sum / boundary_count as f64 } else { 0.0 };
-    let center_avg = if center_count > 0 { center_sum / center_count as f64 } else { 0.0 };
+    let boundary_avg = if boundary_count > 0 {
+        boundary_sum / boundary_count as f64
+    } else {
+        0.0
+    };
+    let center_avg = if center_count > 0 {
+        center_sum / center_count as f64
+    } else {
+        0.0
+    };
     let diff = (boundary_avg - center_avg).abs();
 
     (boundary_avg, center_avg, diff)
@@ -122,13 +134,17 @@ fn test_manga_tile_blend() {
     }
 
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime.load_model(
-        mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
-        &cugan_path,
-    ).unwrap();
+    runtime
+        .load_model(mimageviewer::ai::ModelKind::UpscaleRealCugan4x, &cugan_path)
+        .unwrap();
 
     let img = image::open(&img_path).expect("Failed to open test image");
-    println!("Manga image: {}x{} from {}", img.width(), img.height(), img_path);
+    println!(
+        "Manga image: {}x{} from {}",
+        img.width(),
+        img.height(),
+        img_path
+    );
 
     let cancel = Arc::new(AtomicBool::new(false));
     let t0 = std::time::Instant::now();
@@ -137,7 +153,8 @@ fn test_manga_tile_blend() {
         mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
         &img,
         &cancel,
-    ).expect("Upscale failed");
+    )
+    .expect("Upscale failed");
     let elapsed = t0.elapsed();
 
     let [w, h] = result.size;
@@ -174,25 +191,27 @@ fn test_screentone_patterns() {
     }
 
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime.load_model(
-        mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
-        &cugan_path,
-    ).unwrap();
+    runtime
+        .load_model(mimageviewer::ai::ModelKind::UpscaleRealCugan4x, &cugan_path)
+        .unwrap();
 
     let cancel = Arc::new(AtomicBool::new(false));
 
     // 複数のスクリーントーンパターン: (名前, 画像サイズ, ドット間隔, ドット半径, 背景グレー)
     let patterns: Vec<(&str, u32, u32, f32, u8)> = vec![
-        ("fine_8px_r2",     400, 8,  2.0, 255),   // 細かい (8px間隔, r=2)
-        ("medium_12px_r3",  400, 12, 3.0, 255),   // 中程度 (12px間隔, r=3)
-        ("coarse_16px_r4",  400, 16, 4.0, 255),   // 粗い (16px間隔, r=4)
-        ("large_24px_r6",   400, 24, 6.0, 255),   // 大きい (24px間隔, r=6)
-        ("gray_bg_12px",    400, 12, 3.0, 220),   // グレー背景
-        ("dense_6px_r1",    400, 6,  1.5, 255),   // 非常に細かい
-        ("wide_500px",      500, 14, 3.5, 255),   // 横長 (タイル境界が多い)
+        ("fine_8px_r2", 400, 8, 2.0, 255),     // 細かい (8px間隔, r=2)
+        ("medium_12px_r3", 400, 12, 3.0, 255), // 中程度 (12px間隔, r=3)
+        ("coarse_16px_r4", 400, 16, 4.0, 255), // 粗い (16px間隔, r=4)
+        ("large_24px_r6", 400, 24, 6.0, 255),  // 大きい (24px間隔, r=6)
+        ("gray_bg_12px", 400, 12, 3.0, 220),   // グレー背景
+        ("dense_6px_r1", 400, 6, 1.5, 255),    // 非常に細かい
+        ("wide_500px", 500, 14, 3.5, 255),     // 横長 (タイル境界が多い)
     ];
 
-    println!("{:<20} {:>6} {:>8} {:>8} {:>8}", "Pattern", "Time", "Bnd.Avg", "Ctr.Avg", "Diff");
+    println!(
+        "{:<20} {:>6} {:>8} {:>8} {:>8}",
+        "Pattern", "Time", "Bnd.Avg", "Ctr.Avg", "Diff"
+    );
     println!("{}", "-".repeat(60));
 
     for (name, size, period, radius, bg) in &patterns {
@@ -207,7 +226,8 @@ fn test_screentone_patterns() {
             mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
             &img,
             &cancel,
-        ).expect("Upscale failed");
+        )
+        .expect("Upscale failed");
         let elapsed = t0.elapsed();
 
         let [w, h] = result.size;
@@ -215,20 +235,39 @@ fn test_screentone_patterns() {
         save_color_image(&result, &out_path);
 
         let tile_step = 192 - 32;
-        let (boundary_avg, center_avg, diff) = analyze_tile_boundaries(&result, tile_step as u32, 4);
+        let (boundary_avg, center_avg, diff) =
+            analyze_tile_boundaries(&result, tile_step as u32, 4);
 
-        let quality = if diff < 2.0 { "Excellent" }
-            else if diff < 5.0 { "Good" }
-            else if diff < 10.0 { "Acceptable" }
-            else { "VISIBLE" };
+        let quality = if diff < 2.0 {
+            "Excellent"
+        } else if diff < 5.0 {
+            "Good"
+        } else if diff < 10.0 {
+            "Acceptable"
+        } else {
+            "VISIBLE"
+        };
 
-        println!("{:<20} {:>5.1}s {:>8.1} {:>8.1} {:>7.1} {}", name, elapsed.as_secs_f64(),
-            boundary_avg, center_avg, diff, quality);
+        println!(
+            "{:<20} {:>5.1}s {:>8.1} {:>8.1} {:>7.1} {}",
+            name,
+            elapsed.as_secs_f64(),
+            boundary_avg,
+            center_avg,
+            diff,
+            quality
+        );
     }
 }
 
 /// 背景色指定可能なスクリーントーン生成。
-fn generate_screentone_with_bg(width: u32, height: u32, period: u32, radius: f32, bg: u8) -> image::DynamicImage {
+fn generate_screentone_with_bg(
+    width: u32,
+    height: u32,
+    period: u32,
+    radius: f32,
+    bg: u8,
+) -> image::DynamicImage {
     let mut img = image::RgbImage::new(width, height);
     for p in img.pixels_mut() {
         *p = image::Rgb([bg, bg, bg]);
@@ -280,14 +319,17 @@ fn test_screentone_tile_blend() {
     }
 
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime.load_model(
-        mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
-        &cugan_path,
-    ).unwrap();
+    runtime
+        .load_model(mimageviewer::ai::ModelKind::UpscaleRealCugan4x, &cugan_path)
+        .unwrap();
 
     // テスト用スクリーントーン画像: 400x400, ドット間隔 8px, 半径 2.5px
     let screentone = generate_screentone(400, 400, 8, 2.5);
-    println!("Screentone test image: {}x{}", screentone.width(), screentone.height());
+    println!(
+        "Screentone test image: {}x{}",
+        screentone.width(),
+        screentone.height()
+    );
 
     // 入力画像も保存
     screentone.save("target/test_screentone_input.png").unwrap();
@@ -300,7 +342,8 @@ fn test_screentone_tile_blend() {
         mimageviewer::ai::ModelKind::UpscaleRealCugan4x,
         &screentone,
         &cancel,
-    ).expect("Upscale failed");
+    )
+    .expect("Upscale failed");
     let elapsed = t0.elapsed();
 
     let [w, h] = result.size;
@@ -327,6 +370,9 @@ fn test_screentone_tile_blend() {
     println!("  (< 2.0 is excellent, < 5.0 is acceptable, > 10.0 is visible)");
 
     if diff > 10.0 {
-        println!("WARNING: Tile boundary seam is likely visible (diff={:.2})", diff);
+        println!(
+            "WARNING: Tile boundary seam is likely visible (diff={:.2})",
+            diff
+        );
     }
 }

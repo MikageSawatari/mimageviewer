@@ -13,7 +13,8 @@ pub static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// `main()` の先頭で一度だけ呼ぶこと。
 pub fn init() {
     let args: Vec<String> = std::env::args().collect();
-    let dir = args.windows(2)
+    let dir = args
+        .windows(2)
         .find(|w| w[0] == "--data-dir")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(default);

@@ -6,15 +6,15 @@
 
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use eframe::egui;
 
 use crate::app::App;
 use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
-use crate::search_index_db::{IndexEntry, IndexKind};
+use crate::search_index_db::IndexEntry;
 
 impl App {
     pub(crate) fn show_index_creator_dialog(&mut self, ctx: &egui::Context) {
@@ -34,10 +34,7 @@ impl App {
                     done, total, entries,
                 )
             } else {
-                format!(
-                    "{} フォルダを走査し、{} 件を登録しました。",
-                    done, entries,
-                )
+                format!("{} フォルダを走査し、{} 件を登録しました。", done, entries,)
             });
         }
 
@@ -180,7 +177,13 @@ impl App {
             .favorites
             .iter()
             .zip(self.ic.checked.iter())
-            .filter_map(|(f, &c)| if c { Some((f.name.clone(), f.path.clone())) } else { None })
+            .filter_map(|(f, &c)| {
+                if c {
+                    Some((f.name.clone(), f.path.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
         if targets.is_empty() {
             return;
@@ -231,22 +234,17 @@ impl App {
                 }
                 let mut found: Vec<PathBuf> = Vec::new();
                 let current_ref = Arc::clone(&current);
-                walk_dirs_recursive_with_progress(
-                    fav_path,
-                    &mut found,
-                    &cancel,
-                    &mut |visited| {
-                        // スロットリング: 最後の更新から update_interval 経過している場合のみ書き込む
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_update) >= update_interval {
-                            last_update = now;
-                            if let Ok(mut s) = current_ref.lock() {
-                                // UI 側は "現在: {s}" と表示するので path だけ入れる
-                                *s = visited.to_string_lossy().to_string();
-                            }
+                walk_dirs_recursive_with_progress(fav_path, &mut found, &cancel, &mut |visited| {
+                    // スロットリング: 最後の更新から update_interval 経過している場合のみ書き込む
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_update) >= update_interval {
+                        last_update = now;
+                        if let Ok(mut s) = current_ref.lock() {
+                            // UI 側は "現在: {s}" と表示するので path だけ入れる
+                            *s = visited.to_string_lossy().to_string();
                         }
-                    },
-                );
+                    }
+                });
                 for f in found {
                     all_folders.push((f, fav_path.clone()));
                 }
@@ -282,32 +280,30 @@ impl App {
                         if is_apple_double(&p) {
                             continue;
                         }
-                        let meta = entry.metadata().ok();
-                        let mtime = meta
-                            .as_ref()
-                            .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-                        let kind = if p.is_dir() {
-                            Some(IndexKind::Folder)
-                        } else {
-                            match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase) {
-                                Some(ref e) if e == "zip" => Some(IndexKind::ZipFile),
-                                Some(ref e) if e == "pdf" => Some(IndexKind::PdfFile),
-                                _ => None,
-                            }
+                        // `entry.file_type()` は Windows FindFirstFile キャッシュから取るので
+                        // per-entry syscall を発生させない (`p.is_dir()` は避ける)。
+                        let Ok(ft) = entry.file_type() else { continue };
+                        let Some(kind) =
+                            crate::name_bulk_indexer::classify_name_index_kind(&p, &ft)
+                        else {
+                            continue;
                         };
-                        if let Some(kind) = kind {
-                            let name = p
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            children.push(IndexEntry {
-                                path: p,
-                                display_name: name,
-                                kind,
-                                mtime,
-                            });
-                        }
+                        let mtime = entry
+                            .metadata()
+                            .ok()
+                            .as_ref()
+                            .map_or(0, crate::ui_helpers::mtime_secs);
+                        let name = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        children.push(IndexEntry {
+                            path: p,
+                            display_name: name,
+                            kind,
+                            mtime,
+                        });
                     }
                 }
 

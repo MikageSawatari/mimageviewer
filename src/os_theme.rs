@@ -68,10 +68,9 @@ fn detect_os_preference() -> Option<ResolvedTheme> {
     };
     use windows::core::PCWSTR;
 
-    let subkey: Vec<u16> =
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
-            .encode_utf16()
-            .collect();
+    let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect();
     let value: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
 
     let mut data: u32 = 0;
@@ -89,7 +88,11 @@ fn detect_os_preference() -> Option<ResolvedTheme> {
         )
     };
     if result.is_ok() {
-        Some(if data == 0 { ResolvedTheme::Dark } else { ResolvedTheme::Light })
+        Some(if data == 0 {
+            ResolvedTheme::Dark
+        } else {
+            ResolvedTheme::Light
+        })
     } else {
         None
     }
@@ -112,9 +115,7 @@ pub(crate) fn relative_luminance(c: egui::Color32) -> f64 {
             ((x + 0.055) / 1.055).powf(2.4)
         }
     }
-    0.2126 * srgb_to_linear(c.r())
-        + 0.7152 * srgb_to_linear(c.g())
-        + 0.0722 * srgb_to_linear(c.b())
+    0.2126 * srgb_to_linear(c.r()) + 0.7152 * srgb_to_linear(c.g()) + 0.0722 * srgb_to_linear(c.b())
 }
 
 /// WCAG コントラスト比 (>= 1.0)。4.5 以上で通常テキストの AA 合格、
@@ -160,7 +161,9 @@ mod tests {
         assert!(
             ratio >= 4.5,
             "Light theme text {:?} on panel {:?} contrast = {:.2} (< 4.5)",
-            text, bg, ratio,
+            text,
+            bg,
+            ratio,
         );
     }
 
@@ -174,7 +177,9 @@ mod tests {
         assert!(
             ratio >= 4.5,
             "Dark theme text {:?} on panel {:?} contrast = {:.2} (< 4.5)",
-            text, bg, ratio,
+            text,
+            bg,
+            ratio,
         );
     }
 

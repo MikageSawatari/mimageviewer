@@ -85,8 +85,11 @@ impl GridItem {
 
     pub fn name(&self) -> Cow<'_, str> {
         match self {
-            GridItem::Folder(p) | GridItem::Image(p) | GridItem::Video(p)
-            | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+            GridItem::Folder(p)
+            | GridItem::Image(p)
+            | GridItem::Video(p)
+            | GridItem::ZipFile(p)
+            | GridItem::PdfFile(p) => {
                 Cow::Borrowed(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
             }
             GridItem::ConvertibleArchive { path, .. } => {
@@ -96,9 +99,7 @@ impl GridItem {
                 Cow::Borrowed(crate::zip_loader::entry_basename(entry_name))
             }
             GridItem::ZipSeparator { dir_display } => Cow::Borrowed(dir_display),
-            GridItem::PdfPage { page_num, .. } => {
-                Cow::Owned(format!("Page {}", page_num + 1))
-            }
+            GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
             GridItem::SearchContainer { path, .. } => {
                 Cow::Borrowed(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
             }
@@ -126,13 +127,18 @@ impl GridItem {
             GridItem::Image(p) | GridItem::Video(p) => format!("{}", p.display()),
             GridItem::ZipFile(p) => format!("zipfile::{}", p.display()),
             GridItem::PdfFile(p) => format!("pdffile::{}", p.display()),
-            GridItem::ZipImage { zip_path, entry_name } => {
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
                 format!("zip::{}#{}", zip_path.display(), entry_name)
             }
             GridItem::ZipSeparator { dir_display } => {
                 format!("zipsep::{dir_display}")
             }
-            GridItem::PdfPage { pdf_path, page_num, .. } => pdf_page_perf_key(pdf_path, *page_num),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => pdf_page_perf_key(pdf_path, *page_num),
             GridItem::ConvertibleArchive { path, format } => {
                 format!("archive::{}::{}", format.label(), path.display())
             }

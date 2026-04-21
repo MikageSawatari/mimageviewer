@@ -38,7 +38,9 @@ impl ComScope {
 impl Drop for ComScope {
     fn drop(&mut self) {
         if self.needs_uninit {
-            unsafe { windows::Win32::System::Com::CoUninitialize(); }
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
         }
     }
 }
@@ -52,10 +54,9 @@ pub const WIC_SUPPORTED_EXTENSIONS: &[&str] = &[
     // モダン形式
     "heic", "heif", "avif", "jxl",
     // TIFF (image クレートも対応するが WIC の方が高機能)
-    "tiff", "tif",
-    // カメラ RAW (Raw Image Extension が必要)
-    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
-    "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
+    "tiff", "tif", // カメラ RAW (Raw Image Extension が必要)
+    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
+    "rwl", "iiq",
 ];
 
 /// 拡張子が WIC で扱える可能性があるか判定する。
@@ -81,14 +82,12 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
 
     #[cfg(windows)]
     unsafe {
-        use windows::core::{GUID, PCWSTR};
         use windows::Win32::Foundation::GENERIC_READ;
         use windows::Win32::Graphics::Imaging::{
             CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
         };
-        use windows::Win32::System::Com::{
-            CoCreateInstance, CLSCTX_INPROC_SERVER,
-        };
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::core::{GUID, PCWSTR};
 
         let _com = ComScope::init();
 
@@ -102,10 +101,7 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
 
             // パスをワイド文字列に変換
             let path_str = path.to_string_lossy();
-            let path_wide: Vec<u16> = path_str
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            let path_wide: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
 
             // デコーダ生成 (ファイル名から)
             let null_guid: GUID = GUID::zeroed();
@@ -143,9 +139,7 @@ pub fn decode_to_dynamic_image_from_bytes(bytes: &[u8]) -> Option<image::Dynamic
         use windows::Win32::Graphics::Imaging::{
             CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
         };
-        use windows::Win32::System::Com::{
-            CoCreateInstance, CLSCTX_INPROC_SERVER,
-        };
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
         use windows::Win32::UI::Shell::SHCreateMemStream;
 
         let _com = ComScope::init();
@@ -160,7 +154,10 @@ pub fn decode_to_dynamic_image_from_bytes(bytes: &[u8]) -> Option<image::Dynamic
 
             // バイト列を IStream に包む (内部でコピーされる)
             let len: u32 = bytes.len().try_into().ok()?;
-            let stream = SHCreateMemStream(Some(std::slice::from_raw_parts(bytes.as_ptr(), len as usize)))?;
+            let stream = SHCreateMemStream(Some(std::slice::from_raw_parts(
+                bytes.as_ptr(),
+                len as usize,
+            )))?;
 
             // デコーダ生成 (ストリームから; マジックバイトで自動判別)
             let decoder = factory
@@ -182,11 +179,11 @@ unsafe fn decode_first_frame(
     factory: &windows::Win32::Graphics::Imaging::IWICImagingFactory,
     decoder: &windows::Win32::Graphics::Imaging::IWICBitmapDecoder,
 ) -> Option<image::DynamicImage> {
-    use windows::core::Interface;
     use windows::Win32::Graphics::Imaging::{
-        GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICBitmapSource,
-        IWICFormatConverter, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
+        GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICBitmapSource, IWICFormatConverter,
+        WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
     };
+    use windows::core::Interface;
 
     // 最初のフレームを取得 (静止画は 1 フレームのみ。アニメ HEIF/AVIF は最初のフレームのみ)
     let frame: IWICBitmapFrameDecode = decoder.GetFrame(0).ok()?;
@@ -215,11 +212,8 @@ unsafe fn decode_first_frame(
     }
 
     // ピクセル列を読む
-    let stride = width
-        .checked_mul(4)?
-        .min(u32::MAX);
-    let buffer_size = (stride as usize)
-        .checked_mul(height as usize)?;
+    let stride = width.checked_mul(4)?.min(u32::MAX);
+    let buffer_size = (stride as usize).checked_mul(height as usize)?;
     let mut pixels = vec![0u8; buffer_size];
     converter
         .CopyPixels(std::ptr::null(), stride, &mut pixels)
@@ -246,16 +240,14 @@ pub fn read_wic_orientation(path: &Path) -> Option<u16> {
 
     #[cfg(windows)]
     unsafe {
-        use windows::core::{GUID, PCWSTR};
-        use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
         use windows::Win32::Foundation::GENERIC_READ;
         use windows::Win32::Graphics::Imaging::{
             CLSID_WICImagingFactory, IWICImagingFactory, IWICMetadataQueryReader,
             WICDecodeMetadataCacheOnDemand,
         };
-        use windows::Win32::System::Com::{
-            CoCreateInstance, CLSCTX_INPROC_SERVER,
-        };
+        use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::core::{GUID, PCWSTR};
 
         let _com = ComScope::init();
 
@@ -314,7 +306,6 @@ pub fn read_wic_orientation(path: &Path) -> Option<u16> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
