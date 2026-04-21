@@ -1751,6 +1751,8 @@ impl App {
             || self.slot_save_dialog.is_some()
             || self.context_menu_idx.is_some()
             || self.ic.show
+            // v0.8.0 新規: インデックス管理ダイアログ (Codex round-10 Must-fix)
+            || self.show_index_manager
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは

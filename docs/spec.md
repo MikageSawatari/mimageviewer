@@ -31,7 +31,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 | メニュー | 項目 |
 |---------|------|
 | ファイル | フォルダを開く… (Ctrl+O) / メタデータ検索… (Ctrl+F) / グローバルメタ検索… (Ctrl+G) / 終了 |
-| お気に入り | このフォルダを追加… / 編集 / 検索…(Ctrl+S) / インデックス作成 / キャッシュ作成 / [登録済みフォルダ一覧] |
+| お気に入り | このフォルダを追加… / 編集 / 検索…(Ctrl+S) / インデックス作成 / キャッシュ作成 / **インデックス管理… (v0.8.0)** / [登録済みフォルダ一覧] |
 | 設定 | サムネイル列数 / 比率 / ソート順 / キャッシュ管理… / サムネイル画質… / 統計… / 回転情報をリセット… / 環境設定… |
 
 ### 2.2 アドレスバー
@@ -358,8 +358,8 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 | ショートカット | 対象 | 検索経路 | 備考 |
 |---|---|---|---|
 | Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF 名 | `search_index.db` (SQLite LIKE) | 既存実装を継続 |
-| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | `fts_meta.db` 直接 lookup (fast path) → 未登録 path はオンデマンド (PNG tEXt + EXIF + XMP) fallback | ZIP 内画像含む、PDF はメタ対象外 |
-| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → `fts_meta.db` で all_text_norm 一括取得 → `matches()` で phrase/NOT/AND 正確判定 (streaming) | ZIP 内画像含む、PDF は document info のみ |
+| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | `fts_meta.db` 直接 lookup (fast path) → 未登録 path はオンデマンド (PNG tEXt + EXIF + XMP) fallback | ZIP 展開中は ZIP 内エントリ画像も対象、PDF はメタ対象外 |
+| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → `fts_meta.db` で all_text_norm 一括取得 → `matches()` で phrase/NOT/AND 正確判定 (streaming) | v0.8.0 は **通常ファイル (画像) + ZIP ファイル名 + PDF document info** が対象。ZIP 内エントリのメタ展開は v0.8.x 以降に予定 |
 
 #### AI メタデータ検索の Negative Prompt 除外
 

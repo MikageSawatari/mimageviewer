@@ -82,8 +82,26 @@ impl SupervisorHandle {
     }
 
     /// 完全再スキャン要求 (インデックス管理ダイアログの「今すぐ再構築」で使用)。
+    ///
+    /// **非ブロッキング** (Codex round-10 Should-fix #1): `try_send` を使うため、
+    /// cmd_tx は bounded(4) だがキューがフルなら silently drop する。
+    /// これは長時間スキャン中に UI スレッドから連打された場合の UI freeze を防ぐため。
+    /// "coalescing" 挙動: 同じ FullRescan が既にキューにあるなら追加リクエストは冗長なので
+    /// 落としてよい (Supervisor は次のイベントで reconcile する)。
     pub fn request_full_rescan(&self) {
-        let _ = self.cmd_tx.send(SupervisorCommand::FullRescan);
+        match self.cmd_tx.try_send(SupervisorCommand::FullRescan) {
+            Ok(_) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                // キューにもう溜まっている → no-op (既にスキャン要求が届く予定)
+                crate::logger::log(format!(
+                    "indexer[{}]: request_full_rescan coalesced (queue full)",
+                    self.favorite_id
+                ));
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                // supervisor は既に終了している
+            }
+        }
     }
 
     /// 明示停止。

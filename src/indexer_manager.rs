@@ -33,7 +33,9 @@
 //! - `sync_with_favorites()`: Supervisor drop が発生する可能性あり。drop は内部で FsWatcher
 //!   join (最大 ~250ms) を伴う。**環境設定ダイアログの OK ボタン押下時のみ** 呼ぶ方針 (毎フレーム不可)。
 //! - `spawn_search()`: 別スレッド起動のみなので O(1)。
-//! - `new()` の起動時 reconciliation: バックグラウンドスレッドで遅延実行する設計にしてある。
+//! - `new()` の起動時 reconciliation: **同期実行** に変更済み (Codex round-8 Must-fix #1)。
+//!   通常クラッシュ残留の僅かな行だけを処理するので 100ms 以下で完了する見込み。
+//!   同期化により supervisor 群の spawn と writer 競合しなくなった。
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
