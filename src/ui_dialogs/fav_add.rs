@@ -61,6 +61,25 @@ impl App {
                     if resp.lost_focus() && enter_pressed {
                         apply = true;
                     }
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("自動インデックス (あとで編集可能):")
+                            .weak(),
+                    );
+                    ui.add_space(2.0);
+                    ui.checkbox(
+                        &mut self.fav_add_auto_index_structure,
+                        "フォルダ名 / ZIP・PDF 名で検索できるようにする (Ctrl+S)",
+                    );
+                    ui.checkbox(
+                        &mut self.fav_add_auto_index_metadata,
+                        "メタデータ (EXIF / XMP / PNG tEXt) を検索できるようにする (Ctrl+F/G)",
+                    );
+                    ui.checkbox(
+                        &mut self.fav_add_auto_index_thumbs,
+                        "サムネイルを事前キャッシュする",
+                    );
                 } else {
                     ui.label("追加対象のフォルダが不明です。");
                 }
@@ -88,6 +107,12 @@ impl App {
                 let name = self.fav_add_name_input.trim().to_string();
                 let added = self.settings.add_favorite(name, target);
                 if added {
+                    // 追加した最後のエントリに自動インデックスフラグを反映
+                    if let Some(last) = self.settings.favorites.last_mut() {
+                        last.auto_index_structure = self.fav_add_auto_index_structure;
+                        last.auto_index_metadata = self.fav_add_auto_index_metadata;
+                        last.auto_index_thumbs = self.fav_add_auto_index_thumbs;
+                    }
                     self.settings.save();
                 }
                 // cache_creator_checked は favorites と同じ長さを保つ
@@ -97,10 +122,17 @@ impl App {
             self.show_fav_add_dialog = false;
             self.fav_add_name_input.clear();
             self.fav_add_target = None;
+            // 次回デフォルト値は false リセット (design doc §8.2 の "環境設定のデフォルトから取る" は v1.x で検討)
+            self.fav_add_auto_index_structure = false;
+            self.fav_add_auto_index_metadata = false;
+            self.fav_add_auto_index_thumbs = false;
         } else if cancel || !open || escape_pressed {
             self.show_fav_add_dialog = false;
             self.fav_add_name_input.clear();
             self.fav_add_target = None;
+            self.fav_add_auto_index_structure = false;
+            self.fav_add_auto_index_metadata = false;
+            self.fav_add_auto_index_thumbs = false;
         }
     }
 }

@@ -35,6 +35,8 @@
 | [bench-scroll-report.md](bench-scroll-report.md) | スクロール性能ベンチマーク結果 |
 | [perf-investigation-handoff.md](perf-investigation-handoff.md) | パフォーマンス調査の進行中メモ (AI アップスケール優先度 / スクロール中の重複エンキュー抑制) |
 | [plan-v0.7.0.md](plan-v0.7.0.md) | v0.7.0 実装計画 + 完了ステータス + リリース直前チェックリスト |
+| [search-expansion-design.md](search-expansion-design.md) | 検索機能拡充 (Ctrl+G グローバルメタ検索 + 自動インデックス) の設計ドキュメント (v0.8.0 予定) |
+| [search-bench-results.md](search-bench-results.md) | Tantivy + bigram プロトタイプ計測結果 (§15.1.1) |
 
 ---
 

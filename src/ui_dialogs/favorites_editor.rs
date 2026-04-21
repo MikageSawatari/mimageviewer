@@ -49,13 +49,13 @@ impl App {
             .collapsible(false)
             .default_pos(dialog_pos)
             .show(ctx, |ui| {
-                ui.set_min_width(900.0);
+                ui.set_min_width(1040.0);
                 if self.settings.favorites.is_empty() {
                     ui.label("お気に入りはまだ登録されていません。");
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "表示名を編集できます。パスは右側に表示されます。",
+                            "表示名を編集できます。右側のチェックで自動インデックスの対象を選択できます。",
                         )
                         .weak(),
                     );
@@ -68,12 +68,24 @@ impl App {
                         .show(ui, |ui| {
                             egui::Grid::new("fav_edit_grid")
                         .striped(true)
-                        .num_columns(3)
+                        .num_columns(6)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                             // ヘッダ
                             ui.label(egui::RichText::new("表示名").strong());
                             ui.label(egui::RichText::new("パス").strong());
+                            ui.label(egui::RichText::new("構造").strong())
+                                .on_hover_text(
+                                    "Ctrl+S フォルダ/ZIP/PDF 名検索のインデックス対象にする\n\
+                                     (自動で増減を追跡)",
+                                );
+                            ui.label(egui::RichText::new("メタ").strong())
+                                .on_hover_text(
+                                    "Ctrl+F/G 全文メタデータ検索のインデックス対象にする\n\
+                                     (EXIF / XMP / PNG tEXt を含む)",
+                                );
+                            ui.label(egui::RichText::new("サムネ").strong())
+                                .on_hover_text("サムネイルを事前キャッシュする");
                             ui.label(egui::RichText::new("操作").strong());
                             ui.end_row();
 
@@ -94,11 +106,25 @@ impl App {
                                     .to_string_lossy()
                                     .to_string();
                                 ui.label(
-                                    egui::RichText::new(truncate_name(&path_str, 60))
+                                    egui::RichText::new(truncate_name(&path_str, 56))
                                         .monospace()
                                         .weak(),
                                 )
                                 .on_hover_text(&path_str);
+
+                                // 自動インデックス フラグ 3 つ (v0.8.0 新規)
+                                ui.checkbox(
+                                    &mut self.settings.favorites[i].auto_index_structure,
+                                    "",
+                                );
+                                ui.checkbox(
+                                    &mut self.settings.favorites[i].auto_index_metadata,
+                                    "",
+                                );
+                                ui.checkbox(
+                                    &mut self.settings.favorites[i].auto_index_thumbs,
+                                    "",
+                                );
 
                                 // 操作ボタン
                                 ui.horizontal(|ui| {
@@ -124,6 +150,29 @@ impl App {
                             }
                         });
                         });
+                    // 一括 ON/OFF ボタン (design doc §8.1 mockup)
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("一括操作:").weak());
+                        if ui.button("構造 全ON").clicked() {
+                            for f in &mut self.settings.favorites { f.auto_index_structure = true; }
+                        }
+                        if ui.button("構造 全OFF").clicked() {
+                            for f in &mut self.settings.favorites { f.auto_index_structure = false; }
+                        }
+                        if ui.button("メタ 全ON").clicked() {
+                            for f in &mut self.settings.favorites { f.auto_index_metadata = true; }
+                        }
+                        if ui.button("メタ 全OFF").clicked() {
+                            for f in &mut self.settings.favorites { f.auto_index_metadata = false; }
+                        }
+                        if ui.button("サムネ 全ON").clicked() {
+                            for f in &mut self.settings.favorites { f.auto_index_thumbs = true; }
+                        }
+                        if ui.button("サムネ 全OFF").clicked() {
+                            for f in &mut self.settings.favorites { f.auto_index_thumbs = false; }
+                        }
+                    });
                 }
 
                 if escape_pressed {

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use uuid::Uuid;
 
 const MAX_FAVORITES: usize = 20;
 
@@ -11,12 +12,29 @@ const MAX_FAVORITES: usize = 20;
 /// `name` はユーザが任意に付けられる表示名 (ツールバーのボタンラベル等で使用)。
 /// 既定ではフォルダ名 (`path.file_name()`) が入る。
 ///
-/// 旧バージョンとの互換性のため、JSON 上では「文字列のみ (旧)」「オブジェクト (新)」
-/// の両方を受け付ける。旧形式から読み込んだ場合、`name` はフォルダ名で自動補完される。
+/// `id` は Tantivy / fts_meta.db の `favorite_id` として使われる安定 UUID。
+/// お気に入りを表示名 rename しても保持される。root path を変更すると index は
+/// 再スキャンされる (docs/search-expansion-design.md §5.5)。
+///
+/// `auto_index_*` はお気に入り単位の自動インデックス管理フラグ (v0.8.0 新設)。
+/// 既存お気に入りは全て false 初期値で読み込まれ、後段の UI で個別 ON にする。
+///
+/// JSON 上の互換性:
+/// - 旧 (v0.7 以前): 文字列 (パス) または `{"name", "path"}` の 2 フィールドオブジェクト
+/// - 新 (v0.8): 上記 + `id`, `auto_index_*` (欠落時はデフォルト値)
 #[derive(Clone, Debug)]
 pub struct FavoriteEntry {
+    /// 安定 UUID。Tantivy / fts_meta.db の favorite_id。
+    /// 既存エントリ or 旧形式は読込時に `Uuid::new_v4()` で発行される。
+    pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
+    /// Ctrl+S (フォルダ/ZIP/PDF 名) の自動インデックス対象にするか。
+    pub auto_index_structure: bool,
+    /// Ctrl+F/G (全文メタデータ) の自動インデックス対象にするか。
+    pub auto_index_metadata: bool,
+    /// サムネイル事前キャッシュを自動生成するか。
+    pub auto_index_thumbs: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for FavoriteEntry {
@@ -25,12 +43,27 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
         D: serde::Deserializer<'de>,
     {
         // 旧: 文字列 or パス (例: "C:\\foo")
-        // 新: オブジェクト (例: {"name": "my folder", "path": "C:\\foo"})
+        // 新 v0.7 系: {"name", "path"} の 2 フィールド
+        // 新 v0.8 系: + id, auto_index_* (欠落時デフォルト値)
+        //
+        // id 欠落時は Uuid::nil() をプレースホルダとして deserialize し、
+        // 後段 (Settings::load の sanitize) で nil を検出したら新規 UUID を発行する。
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
         enum Raw {
             Legacy(PathBuf),
-            Full { name: String, path: PathBuf },
+            Full {
+                #[serde(default)]
+                id: Option<Uuid>,
+                name: String,
+                path: PathBuf,
+                #[serde(default)]
+                auto_index_structure: bool,
+                #[serde(default)]
+                auto_index_metadata: bool,
+                #[serde(default)]
+                auto_index_thumbs: bool,
+            },
         }
 
         match Raw::deserialize(deserializer)? {
@@ -40,9 +73,30 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_string();
-                Ok(FavoriteEntry { name, path: p })
+                Ok(FavoriteEntry {
+                    id: Uuid::nil(), // 後段の sanitize で UUID v4 を発行
+                    name,
+                    path: p,
+                    auto_index_structure: false,
+                    auto_index_metadata: false,
+                    auto_index_thumbs: false,
+                })
             }
-            Raw::Full { name, path } => Ok(FavoriteEntry { name, path }),
+            Raw::Full {
+                id,
+                name,
+                path,
+                auto_index_structure,
+                auto_index_metadata,
+                auto_index_thumbs,
+            } => Ok(FavoriteEntry {
+                id: id.unwrap_or_else(Uuid::nil),
+                name,
+                path,
+                auto_index_structure,
+                auto_index_metadata,
+                auto_index_thumbs,
+            }),
         }
     }
 }
@@ -53,10 +107,28 @@ impl serde::Serialize for FavoriteEntry {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("FavoriteEntry", 2)?;
+        let mut s = serializer.serialize_struct("FavoriteEntry", 6)?;
+        s.serialize_field("id", &self.id)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("path", &self.path)?;
+        s.serialize_field("auto_index_structure", &self.auto_index_structure)?;
+        s.serialize_field("auto_index_metadata", &self.auto_index_metadata)?;
+        s.serialize_field("auto_index_thumbs", &self.auto_index_thumbs)?;
         s.end()
+    }
+}
+
+impl FavoriteEntry {
+    /// 新しいお気に入りエントリを作る (UUID は自動発行、フラグは全 false)。
+    pub fn new(name: String, path: PathBuf) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            path,
+            auto_index_structure: false,
+            auto_index_metadata: false,
+            auto_index_thumbs: false,
+        }
     }
 }
 
@@ -749,17 +821,37 @@ impl Settings {
             eprintln!("settings JSON parse failed: {} ({})", path.display(), e);
             Self::default()
         });
+        // migration: UUID nil チェック → 割り当てが発生したかを検出
+        let had_nil_uuids = settings.favorites.iter().any(|f| f.id.is_nil());
         settings.sanitize();
+        // 新規 UUID を発行したので settings.json に書き戻して永続化する。
+        // これで次回起動以降は sanitize でのマイグレーションが不要になる。
+        if had_nil_uuids {
+            settings.save();
+        }
         settings
     }
 
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
+    /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
         // 環境設定 UI 側のレンジ (1..=30) と整合させる。
         // 下限 0 は navigate_folder_with_skip が first を評価せず Ctrl+↑↓ が
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
         // 長時間走り UI 非応答を招くので、両側クランプする。
         self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
+
+        // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
+        // 旧形式 / id フィールド欠落時は deserialize で Uuid::nil() が入っているので、
+        // ここで検出して新規 UUID を割り当てる。設定は次回 save で JSON に書き戻される。
+        //
+        // 安全性の観点: nil UUID 同士が複数あっても個別に別の UUID が割り振られる
+        // (タイミングが同時でも Uuid::new_v4 は衝突しない)。
+        for fav in self.favorites.iter_mut() {
+            if fav.id.is_nil() {
+                fav.id = Uuid::new_v4();
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -787,7 +879,7 @@ impl Settings {
     }
 
     /// 任意の表示名でお気に入りに追加する（重複・上限チェック付き）。
-    /// 追加された場合 true を返す。
+    /// 追加された場合 true を返す。UUID は自動発行、index フラグは全 false。
     pub fn add_favorite(&mut self, name: String, path: PathBuf) -> bool {
         if self.is_favorite(&path) {
             return false;
@@ -795,7 +887,7 @@ impl Settings {
         if self.favorites.len() >= MAX_FAVORITES {
             return false;
         }
-        self.favorites.push(FavoriteEntry { name, path });
+        self.favorites.push(FavoriteEntry::new(name, path));
         true
     }
 
@@ -914,14 +1006,63 @@ mod tests {
 
     #[test]
     fn favorite_serialize_always_object() {
-        let entry = FavoriteEntry {
-            name: "Test".to_string(),
-            path: PathBuf::from(r"C:\test"),
-        };
+        let entry = FavoriteEntry::new("Test".to_string(), PathBuf::from(r"C:\test"));
         let json = serde_json::to_string(&entry).unwrap();
         // オブジェクト形式で出力されることを確認
         assert!(json.contains("\"name\""));
         assert!(json.contains("\"path\""));
+        assert!(json.contains("\"id\""));
+        assert!(json.contains("\"auto_index_structure\""));
+        assert!(json.contains("\"auto_index_metadata\""));
+        assert!(json.contains("\"auto_index_thumbs\""));
+    }
+
+    #[test]
+    fn favorite_legacy_string_migrates_to_new_uuid() {
+        // 旧形式 (文字列のみ) → UUID は nil で deserialize 後、sanitize で発行される
+        let json = r#""C:\\foo\\bar""#;
+        let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.id.is_nil(), "deserialize 時点では nil");
+        assert_eq!(entry.name, "bar");
+        assert!(!entry.auto_index_structure);
+        assert!(!entry.auto_index_metadata);
+        assert!(!entry.auto_index_thumbs);
+    }
+
+    #[test]
+    fn favorite_new_format_defaults_flags_false() {
+        let json = r#"{"name":"a","path":"C:\\x"}"#;
+        let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.id.is_nil(), "id 欠落時は nil (sanitize で発行)");
+        assert_eq!(entry.name, "a");
+        assert!(!entry.auto_index_structure);
+        assert!(!entry.auto_index_metadata);
+        assert!(!entry.auto_index_thumbs);
+    }
+
+    #[test]
+    fn favorite_full_v08_roundtrip() {
+        let mut e = FavoriteEntry::new("x".to_string(), PathBuf::from(r"C:\x"));
+        e.auto_index_structure = true;
+        e.auto_index_metadata = true;
+        e.auto_index_thumbs = false;
+        let json = serde_json::to_string(&e).unwrap();
+        let back: FavoriteEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, e.id);
+        assert_eq!(back.name, "x");
+        assert!(back.auto_index_structure);
+        assert!(back.auto_index_metadata);
+        assert!(!back.auto_index_thumbs);
+    }
+
+    #[test]
+    fn sanitize_assigns_uuid_to_nil_favorites() {
+        let mut s = Settings::default();
+        let mut legacy_fav = FavoriteEntry::new("a".to_string(), PathBuf::from(r"C:\a"));
+        legacy_fav.id = Uuid::nil();
+        s.favorites.push(legacy_fav);
+        s.sanitize();
+        assert!(!s.favorites[0].id.is_nil(), "sanitize で UUID が発行されるはず");
     }
 
     // -- ThumbAspect --

@@ -793,10 +793,16 @@ pub struct App {
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
 
-    // ── お気に入り追加ダイアログ (名称入力) ───────────────────────
+    // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
     pub(crate) fav_add_name_input: String,
     pub(crate) fav_add_target: Option<PathBuf>,
+    // v0.8.0: 追加時にチェックした自動インデックス対象
+    // 既存お気に入りは全て false なので、ここもデフォルト false で一貫させる。
+    // ユーザは後で「お気に入りの編集」からも切り替えられる。
+    pub(crate) fav_add_auto_index_structure: bool,
+    pub(crate) fav_add_auto_index_metadata: bool,
+    pub(crate) fav_add_auto_index_thumbs: bool,
 
     // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
     pub(crate) show_open_folder_dialog: bool,
@@ -1324,6 +1330,9 @@ impl Default for App {
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
+            fav_add_auto_index_structure: false,
+            fav_add_auto_index_metadata: false,
+            fav_add_auto_index_thumbs: false,
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
             open_folder_error: None,
