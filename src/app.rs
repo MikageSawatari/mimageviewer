@@ -3355,6 +3355,9 @@ impl App {
         let stats = Arc::clone(&self.stats);
         let hint = Arc::clone(&self.scroll_hint);
         let vis_end = Arc::clone(&self.visible_end_shared);
+        // 世代スナップショット: items が差し替わる前にフリーズ。以降 ThumbMsg に載せ、
+        // UI 側は自 items_generation と一致しないものを破棄する (旧 items 混入防止)。
+        let items_gen = self.items_generation;
 
         std::thread::spawn(move || {
             use std::time::{Duration, Instant};
@@ -3559,8 +3562,7 @@ impl App {
                 }
                 // 動画 Shell API はアップグレード経路を持たないので from_cache = false。
                 // ピクセル寸法は取得できない。動画ロードは LoadRequest を経由しないため
-                // input_seq は 0 (未設定)。items_gen も 0 (この経路は初期ロード以外では
-                // 走らない想定、かつ ThumbMsg 受信時 items_gen == 0 は常に受理される)。
+                // input_seq は動画スレッドでは未使用 (計装経路でエンキューされない)。
                 let _ = tx.send(crate::thumb_loader::ThumbMsg {
                     idx,
                     image: ci,
@@ -3569,7 +3571,7 @@ impl App {
                     canceled: false,
                     finalized: false,
                     input_seq: 0,
-                    items_gen: 0,
+                    items_gen,
                 });
             }
             crate::logger::log(format!(
@@ -3608,12 +3610,11 @@ impl App {
                 input_seq: req_input_seq,
                 items_gen: msg_items_gen,
             } = msg;
-            // 世代不一致 (旧 items 由来) のメッセージは破棄する。items が差し替わった
-            // あとに旧ワーカーの結果が同じ idx の新 items に適用されると画像が化ける。
-            // msg_items_gen == 0 は動画スレッド等の未設定経路 (常に受理)。
-            if msg_items_gen != 0 && msg_items_gen != self.items_generation {
-                // 旧 worker の結果: thumbnails[i] は新 items の画像なので触らない。
-                // requested からも引かない (このメッセージは新 items と無関係)。
+            // 世代不一致 (旧 items 由来) のメッセージは破棄する。items 差し替え後に
+            // 旧ワーカー結果が同じ idx の新 items に適用されるとサムネが化けるため。
+            // 全エンキュー経路 (通常 / idle upgrade / 動画スレッド) で現世代をスナップ
+            // ショットして載せるので、不一致 = 旧経路と判定してよい。
+            if msg_items_gen != self.items_generation {
                 continue;
             }
             if i >= self.thumbnails.len() {
@@ -4314,7 +4315,7 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
-            let Some(req) = self.items.get(i).and_then(|item| {
+            let Some(mut req) = self.items.get(i).and_then(|item| {
                 make_load_request(
                     item,
                     i,
@@ -4328,6 +4329,8 @@ impl App {
             }) else {
                 continue;
             };
+            // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
+            req.items_gen = self.items_generation;
             upgrade_reqs.push(req);
         }
 
