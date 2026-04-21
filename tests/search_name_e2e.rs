@@ -24,12 +24,15 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use common::{
     FS_EVENT_TIMEOUT, FixtureRoot, make_favorite, name_index_search, start_name_index_at,
     wait_for_name_index_hits, wait_name_scan_done, write_png_plain,
 };
-use mimageviewer::search_index_db::IndexKind;
+use mimageviewer::name_bulk_indexer::run_bulk_name_index;
+use mimageviewer::search_index_db::{IndexKind, SearchIndexDb};
 
 /// サブフォルダを掘って空の画像を置く (フォルダが画像コンテナ扱いされるように)。
 fn mkdir_with_image(root: &FixtureRoot, subdir: &str) -> PathBuf {
@@ -264,11 +267,6 @@ fn query_supports_exclude_token() {
 /// スキップしていたため、空になった親フォルダの下の古い行が残ったまま。
 #[test]
 fn full_scan_removes_stale_entries_from_became_empty_folder() {
-    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
-    use mimageviewer::search_index_db::SearchIndexDb;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
     // /root/P/ に Q フォルダ + a.zip + b.pdf
@@ -345,11 +343,6 @@ fn full_scan_removes_stale_entries_from_became_empty_folder() {
 /// すり抜けて **検索ヒットが 0 件になる**。
 #[test]
 fn nested_favorites_both_scopes_find_shared_path() {
-    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
-    use mimageviewer::search_index_db::SearchIndexDb;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
     // 共有パス: /root/photo/a.zip
@@ -463,11 +456,6 @@ fn name_search_classifies_folder_zip_and_pdf() {
 /// 孫以下は触らない。結果として Ctrl+S で存在しない Q / a.zip / b.pdf がヒットする。
 #[test]
 fn full_scan_removes_offline_deleted_subtree() {
-    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
-    use mimageviewer::search_index_db::SearchIndexDb;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
     // /root/P/Q 配下の構造 + /root/other.zip
@@ -550,11 +538,6 @@ fn full_scan_removes_offline_deleted_subtree() {
 /// 保証される設計不変量を回帰テストとして固定する。
 #[test]
 fn prune_stale_does_not_touch_nested_sibling_favorite() {
-    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
-    use mimageviewer::search_index_db::SearchIndexDb;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
     // /root/photo/ = fav A (親)

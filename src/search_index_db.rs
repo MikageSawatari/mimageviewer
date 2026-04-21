@@ -170,24 +170,16 @@ impl SearchIndexDb {
         tx.commit()
     }
 
-    /// フルスキャン完了後に「今回の scan で観測されなかった (stale)」行を一掃する。
+    /// `favorite_root` 配下で `updated_at < cutoff` の行を一括削除する。
     ///
-    /// ## 目的
+    /// フルバルクスキャン完了後に呼ぶ。`upsert_children` は親フォルダ直下の行しか
+    /// DELETE しないため、アプリ停止中に親フォルダごと消えたサブツリーの孫行は
+    /// upsert の経路で掃除できない。cutoff = scan 開始時刻にすれば、scan 中に
+    /// 観測した行は `updated_at >= cutoff`、未観測の stale 行は `< cutoff` で
+    /// 分離できる。
     ///
-    /// `upsert_children` は親フォルダ **直下** の既存行だけを DELETE するため、
-    /// アプリ停止中に `/root/P` がサブツリーごと消されたケースでは、walk が
-    /// `/root/P` を踏まず upsert も走らないため、深い子孫 (e.g. `/root/P/Q/a.zip`)
-    /// の行が永久に残り続ける (Codex 2026-04 P2 指摘)。
-    ///
-    /// 回避策: scan 開始時刻 (= `chrono_now_secs()`) を cutoff として記録し、
-    /// scan 中に upsert_children が触った行は `updated_at >= cutoff` になる。
-    /// scan 完了後に `updated_at < cutoff` の行を一括 DELETE すれば、観測されなかった
-    /// (= FS 上から消えた) 行だけが残らず掃除される。
-    ///
-    /// nested favorites でも安全: `favorite_root = ?` で対象を絞っているので、
-    /// 親 favorite の prune が子 favorite の行を巻き込まない。
-    ///
-    /// 戻り値: 削除された行数 (診断用)。
+    /// `favorite_root = ?` スコープなので nested favorites の他 favorite の行は
+    /// 巻き込まない。戻り値: 削除行数 (診断用)。
     pub fn prune_stale_for_favorite(
         &self,
         favorite_root: &Path,
@@ -362,6 +354,11 @@ impl SearchIndexDb {
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     // 新規 DB 用: 複合 PRIMARY KEY `(favorite_root, path)` で作る。
     // 同じ実体 path が複数 favorite に所属する (nested favorites) ケースを表現できる。
+    // idx_entries_fav_updated は `prune_stale_for_favorite` の
+    // `WHERE favorite_root = ? AND updated_at < ?` を index-only で解決するため
+    // の複合 index。favorite_root を先頭に置いているので
+    // `WHERE favorite_root = ?` 単独クエリ (search / count_for_favorite /
+    // has_any_for_favorite / clear_for_favorite) も prefix でこの index を使える。
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS entries (
              path                  TEXT NOT NULL,
@@ -375,7 +372,10 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              PRIMARY KEY (favorite_root, path)
          );
          CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
-         CREATE INDEX IF NOT EXISTS idx_entries_fav  ON entries(favorite_root);",
+         CREATE INDEX IF NOT EXISTS idx_entries_fav_updated \
+             ON entries(favorite_root, updated_at);
+         -- 旧 idx_entries_fav は idx_entries_fav_updated が prefix で置換できるので落とす
+         DROP INDEX IF EXISTS idx_entries_fav;",
     )?;
 
     // Migration 1 (2026-04): コミット 7883750 で `favorite_root_display` カラムを
@@ -438,14 +438,20 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE entries;
              ALTER TABLE entries_new RENAME TO entries;
              CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
-             CREATE INDEX IF NOT EXISTS idx_entries_fav  ON entries(favorite_root);",
+             CREATE INDEX IF NOT EXISTS idx_entries_fav_updated \
+                 ON entries(favorite_root, updated_at);",
         )?;
         crate::logger::log("search_index_db: migration complete");
     }
     Ok(())
 }
 
-fn chrono_now_secs() -> i64 {
+/// UNIX epoch 秒精度の現在時刻を `i64` で返す。
+///
+/// `upsert_children` が書き込む `updated_at` と、`prune_stale_for_favorite` の
+/// cutoff を **同じ関数** で生成するための共有ヘルパ。
+/// `run_bulk_name_index` からも呼ばれる (`pub(crate)`)。
+pub(crate) fn chrono_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
