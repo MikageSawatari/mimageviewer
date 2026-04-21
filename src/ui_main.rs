@@ -802,10 +802,15 @@ impl App {
                         self.request_archive_convert(pf, fmt);
                     }
                 }
-                Some(GridItem::SearchContainer { path, .. }) => {
-                    // Ctrl+G 結果ビューのコンテナ: ダブルクリックで親フォルダに入る
-                    // (drill-down UX の最小版。本格 drill-down は後続 commit で実装)
-                    nav = Some(path.clone());
+                Some(GridItem::SearchContainer { path, kind, .. }) => {
+                    // Ctrl+G 結果ビューのコンテナ: ダブルクリックで drill-down view に遷移
+                    // (docs §10.3 [3] 絞り込みビュー)
+                    let p = path.clone();
+                    let is_zip = matches!(
+                        kind,
+                        crate::grid_item::SearchContainerKind::Zip
+                    );
+                    self.drill_into_container(p, is_zip);
                 }
                 None => {}
             }

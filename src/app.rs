@@ -4332,10 +4332,16 @@ impl App {
                             }
                             self.request_archive_convert(pf, fmt);
                         }
-                        Some(GridItem::SearchContainer { path, .. }) => {
-                            // Ctrl+G 結果ビューのコンテナを Enter → 通常フォルダ遷移と同じ挙動。
-                            // (v1 では drill-down は別途実装予定、最小限は通常ナビで代用)
-                            return Some(path.clone());
+                        Some(GridItem::SearchContainer { path, kind, .. }) => {
+                            // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
+                            // → drill-down view に切り替え (v1: 1 階層のみ, docs §10.3)
+                            let p = path.clone();
+                            let is_zip = matches!(
+                                kind,
+                                crate::grid_item::SearchContainerKind::Zip
+                            );
+                            self.drill_into_container(p, is_zip);
+                            return None;
                         }
                         None => {}
                     }
@@ -4351,6 +4357,16 @@ impl App {
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
         if backspace && !ctrl_held {
+            // Ctrl+G drill-down 中なら Aggregated view に戻る (docs §10.3)
+            if self.global_search.active {
+                if matches!(
+                    self.global_search.view,
+                    crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+                ) {
+                    self.drill_back_to_aggregated();
+                    return None;
+                }
+            }
             if in_favsearch {
                 self.favsearch_back();
                 // favsearch_back 内で load_folder 済み。navigate 経路には流さない。

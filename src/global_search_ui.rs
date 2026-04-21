@@ -30,6 +30,15 @@ const MAX_EVENTS_PER_FRAME: usize = 8;
 /// ContainerHit の再ソート間隔 (チラつき防止、docs §10.4.3)。
 const RESORT_INTERVAL_MS: u64 = 1000;
 
+/// Ctrl+G のビュー状態 (v1 は 1 階層 drill-down のみ、docs §10.3 [2]-[3])。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GlobalSearchView {
+    /// トップレベル集約表示。SearchContainer セルがヒット件数降順で並ぶ
+    Aggregated,
+    /// drill-down 中。`container` の配下のヒットファイル一覧を表示する
+    DrilledInto { container: PathBuf, is_zip: bool },
+}
+
 /// Ctrl+G 検索の状態 (App が所有する)。
 pub struct GlobalSearchState {
     /// true のとき、トップバー表示 + 検索結果ビュー有効
@@ -50,6 +59,10 @@ pub struct GlobalSearchState {
     pub pending: Option<SearchHandle>,
     /// 親コンテナ path → 集約済みヒット (docs §10.4.2 ContainerHit)
     pub containers: HashMap<PathBuf, ContainerHit>,
+    /// 生の全ヒット (drill-down 時に container でフィルタするため保持)
+    pub all_hits: Vec<GlobalHit>,
+    /// 現在のビューモード (Aggregated or DrilledInto)
+    pub view: GlobalSearchView,
     /// streaming 経過統計
     pub total_valid: usize,
     pub total_scanned: usize,
@@ -75,6 +88,8 @@ impl Default for GlobalSearchState {
             last_sort_at: None,
             pending: None,
             containers: HashMap::new(),
+            all_hits: Vec::new(),
+            view: GlobalSearchView::Aggregated,
             total_valid: 0,
             total_scanned: 0,
             done: false,
@@ -96,10 +111,11 @@ pub struct ContainerHit {
 impl GlobalSearchState {
     /// 新規検索を開始する (既存 pending があれば cancel してから)。
     pub fn reset_for_new_query(&mut self) {
-        if let Some(h) = self.pending.take() {
-            h.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        // SearchHandle は Drop で cancel するので、take() だけで OK
+        self.pending = None;
         self.containers.clear();
+        self.all_hits.clear();
+        self.view = GlobalSearchView::Aggregated; // 新クエリで drill state もリセット
         self.total_valid = 0;
         self.total_scanned = 0;
         self.done = false;
@@ -107,17 +123,20 @@ impl GlobalSearchState {
         self.reject_message = None;
     }
 
-    /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加
+    /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
     fn accumulate_hit(&mut self, hit: &GlobalHit) {
         let (container_path, kind) = parent_container(&hit.path);
-        let entry = self.containers.entry(container_path.clone()).or_insert_with(|| {
-            ContainerHit {
+        let entry = self
+            .containers
+            .entry(container_path.clone())
+            .or_insert_with(|| ContainerHit {
                 path: container_path,
                 kind,
                 hit_count: 0,
-            }
-        });
+            });
         entry.hit_count += 1;
+        // drill-down 用に生のヒットも保持 (path で後でフィルタする)
+        self.all_hits.push(hit.clone());
     }
 }
 
@@ -314,23 +333,85 @@ impl App {
         }
     }
 
-    /// ContainerHit リストから App::items を再構築する。
-    /// 既存 items は全て捨てて SearchContainer のみに入れ替える。
+    /// 現在の view モードに応じて App::items を再構築する。
+    /// 既存 items は全て捨てて置き換える。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
         self.items.clear();
         self.thumbnails.clear();
         self.selected = None;
 
-        let containers = sorted_containers(&self.global_search.containers);
-        for c in containers {
-            self.push_grid_item_pending(GridItem::SearchContainer {
-                path: c.path,
-                kind: c.kind,
-                hit_count: c.hit_count,
-            });
+        match self.global_search.view.clone() {
+            GlobalSearchView::Aggregated => {
+                let containers = sorted_containers(&self.global_search.containers);
+                for c in containers {
+                    self.push_grid_item_pending(GridItem::SearchContainer {
+                        path: c.path,
+                        kind: c.kind,
+                        hit_count: c.hit_count,
+                    });
+                }
+            }
+            GlobalSearchView::DrilledInto { container, is_zip } => {
+                // container 配下のヒットを Image or ZipImage として展開。
+                // self.global_search.all_hits は unmutable borrow、self.push_grid_item_pending
+                // は mutable なので、先に filter した path 群を Vec<String> として確定させる。
+                let container_key = crate::search_index_db::normalize_path(&container);
+                let hit_paths: Vec<String> = self
+                    .global_search
+                    .all_hits
+                    .iter()
+                    .filter_map(|h| {
+                        if is_zip {
+                            h.path
+                                .split_once('!')
+                                .filter(|(zip, _)| *zip == container_key)
+                                .map(|_| h.path.clone())
+                        } else if PathBuf::from(&h.path)
+                            .parent()
+                            .map(|p| {
+                                crate::search_index_db::normalize_path(p) == container_key
+                            })
+                            .unwrap_or(false)
+                        {
+                            Some(h.path.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                for hit_path in hit_paths {
+                    let grid_item = if is_zip {
+                        // "<zippath>!<entry>" から entry を抽出
+                        if let Some((_, entry)) = hit_path.split_once('!') {
+                            GridItem::ZipImage {
+                                zip_path: container.clone(),
+                                entry_name: entry.to_string(),
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        GridItem::Image(PathBuf::from(&hit_path))
+                    };
+                    self.push_grid_item_pending(grid_item);
+                }
+            }
         }
         // scroll を先頭に戻す
         self.scroll_offset_y = 0.0;
+    }
+
+    /// drill-down view に切り替える (SearchContainer クリック時)。
+    pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
+        self.global_search.view = GlobalSearchView::DrilledInto { container, is_zip };
+        self.rebuild_items_from_global_search();
+    }
+
+    /// Aggregated view に戻る (drill-down 状態から)。
+    pub(crate) fn drill_back_to_aggregated(&mut self) {
+        self.global_search.view = GlobalSearchView::Aggregated;
+        self.rebuild_items_from_global_search();
     }
 
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
@@ -344,9 +425,28 @@ impl App {
         let mut close_requested = false;
         let mut query_changed = false;
 
+        let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
+                // drill-down 中は「← 戻る」ボタン + 現在のコンテナ表示
+                if let GlobalSearchView::DrilledInto { container, .. } =
+                    self.global_search.view.clone()
+                {
+                    if ui
+                        .button("←")
+                        .on_hover_text("検索結果一覧に戻る (BS でも可)")
+                        .clicked()
+                    {
+                        drill_back = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("📁 {}", container.display()))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                    ui.separator();
+                }
                 ui.label("🌐 全検索:");
                 let response = ui.add_sized(
                     [360.0, 20.0],
@@ -413,8 +513,13 @@ impl App {
             self.close_global_search();
             return;
         }
+        if drill_back {
+            self.drill_back_to_aggregated();
+        }
         if query_changed {
             self.global_search.last_change_at = Some(Instant::now());
+            // クエリが変わったら drill state もリセット (sorted_containers 側で処理)
+            self.global_search.view = GlobalSearchView::Aggregated;
         }
     }
 }
@@ -495,6 +600,40 @@ mod tests {
         assert_eq!(v[0].path, PathBuf::from("c:/high"));
         assert_eq!(v[1].path, PathBuf::from("c:/mid"));
         assert_eq!(v[2].path, PathBuf::from("c:/low"));
+    }
+
+    #[test]
+    fn drill_state_transitions_roundtrip() {
+        let mut state = GlobalSearchState::default();
+        assert_eq!(state.view, GlobalSearchView::Aggregated);
+        state.view = GlobalSearchView::DrilledInto {
+            container: PathBuf::from("c:/photos"),
+            is_zip: false,
+        };
+        assert!(matches!(state.view, GlobalSearchView::DrilledInto { .. }));
+        // クエリリセットで drill state もリセットされる契約
+        state.reset_for_new_query();
+        assert_eq!(state.view, GlobalSearchView::Aggregated);
+    }
+
+    #[test]
+    fn all_hits_preserved_for_drill_down() {
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/1.jpg".into(),
+            score: 1.0,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/2.jpg".into(),
+            score: 1.0,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/b/x.jpg".into(),
+            score: 1.0,
+        });
+        // containers は 2 つに集約されているが、all_hits は 3 つ保持
+        assert_eq!(state.containers.len(), 2);
+        assert_eq!(state.all_hits.len(), 3);
     }
 
     #[test]
