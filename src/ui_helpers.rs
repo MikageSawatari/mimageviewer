@@ -462,12 +462,8 @@ pub fn open_url(url: &str) {
 // Ctrl+G 結果コンテナ: 階層パス表示
 // -----------------------------------------------------------------------
 
-/// パス文字列を階層コンポーネントに分解する。
-///
-/// `/` と `\` の両方を区切りとして扱い、空要素 (連続セパレータ、先頭 / 末尾の `/`) は
-/// 除去する。ドライブ文字 (`c:`) も 1 コンポーネントとしてそのまま返す。
-///
-/// Ctrl+G 検索結果コンテナセル (`GridItem::SearchContainer`) の階層表示で使う。
+/// パス文字列を `/` と `\` の両方で分割し、空要素を落としたコンポーネント列を返す。
+/// ドライブ文字 (`c:`) は 1 コンポーネントとして保持する。
 pub fn split_path_components(path_str: &str) -> Vec<&str> {
     path_str
         .split(['/', '\\'])
@@ -475,23 +471,36 @@ pub fn split_path_components(path_str: &str) -> Vec<&str> {
         .collect()
 }
 
-/// 階層パスのテキストレイアウトをサムネイルセルに収める。
+/// `rect` の中央に階層パスを描画する。
 ///
-/// 戦略 (ユーザー要望 2026-04 「はみ出す場合は末端優先 or 縮小」):
-/// 1. `max_font` から `min_font` まで 1pt 刻みで shrink して全コンポーネントが
-///    入る font を探す (width / height 両方を満たす必要あり)
-/// 2. `min_font` でも収まらない場合: 先頭 (ルート側) コンポーネントを 1 個ずつ削り、
-///    先頭行に `…` プレースホルダを置いて「省略されている」ことを示す
-/// 3. 末端 1 行すら入らない場合 (想定外): 末端 1 行を返してはみ出しを許容する
-///
-/// 戻り値の `Galley` は描画位置を呼び出し側が決めてから `painter.galley(pos, ..)`
-/// で描く。
-pub fn layout_path_hierarchy(
+/// フィット戦略:
+/// 1. max_font→min_font を 1pt 刻みで shrink (width/height 両方を満たす font を探す)
+/// 2. min_font でも溢れたら先頭コンポーネントを 1 個ずつ削り、先頭行に `…` を置く
+/// 3. 末端 1 行すら入らない場合はそのまま描画してはみ出しを許容する
+pub fn draw_path_hierarchy(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    components: &[&str],
+    color: egui::Color32,
+    max_font: f32,
+    min_font: f32,
+) {
+    let galley = layout_path_hierarchy(painter, components, color, rect.size(), max_font, min_font);
+    let gs = galley.size();
+    let pos = egui::pos2(
+        rect.center().x - gs.x * 0.5,
+        rect.min.y + ((rect.height() - gs.y).max(0.0)) * 0.5,
+    );
+    painter.galley(pos, galley, color);
+}
+
+/// `draw_path_hierarchy` のレイアウト部分だけを返す (位置決め / 描画は呼び出し側)。
+/// 単体テストしやすいように分離してある。
+fn layout_path_hierarchy(
     painter: &egui::Painter,
     components: &[&str],
     color: egui::Color32,
-    max_w: f32,
-    max_h: f32,
+    max_size: egui::Vec2,
     max_font: f32,
     min_font: f32,
 ) -> std::sync::Arc<egui::Galley> {
@@ -502,13 +511,19 @@ pub fn layout_path_hierarchy(
             color,
         );
     }
-    // Phase 1: 全コンポーネントで font size を max→min へ試す
+    // Phase 1: 全コンポーネントで font を max→min へ shrink。
+    // 深いパスで max_font が確実に縦にはみ出す場合、高さベースで推定した上限まで
+    // 一気に落として Phase 1 ループの空振りを避ける (層 6+ で効いてくる)。
+    const LINE_H_RATIO: f32 = 1.3;
+    let height_fit_font = (max_size.y / (components.len() as f32 * LINE_H_RATIO)).floor();
+    let start_font = max_font.min(height_fit_font).max(min_font);
+
     let full = components.join("\n");
-    let mut font = max_font;
+    let mut font = start_font;
     while font >= min_font {
         let galley =
             painter.layout_no_wrap(full.clone(), egui::FontId::proportional(font), color);
-        if galley.size().x <= max_w && galley.size().y <= max_h {
+        if galley.size().x <= max_size.x && galley.size().y <= max_size.y {
             return galley;
         }
         font -= 1.0;
@@ -523,13 +538,14 @@ pub fn layout_path_hierarchy(
             egui::FontId::proportional(min_font),
             color,
         );
-        if galley.size().x <= max_w && galley.size().y <= max_h {
+        if galley.size().x <= max_size.x && galley.size().y <= max_size.y {
             return galley;
         }
     }
-    // Phase 3: 末端 1 行のみ (はみ出しを受け入れる)
+    // Phase 3: 末端 1 行のみ (components は上で非空を確認済み)
+    let tail = *components.last().expect("components is non-empty above");
     painter.layout_no_wrap(
-        components.last().copied().unwrap_or("").to_string(),
+        tail.to_string(),
         egui::FontId::proportional(min_font),
         color,
     )
