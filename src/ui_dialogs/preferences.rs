@@ -111,7 +111,7 @@ const TREE: &[TreeCategory] = &[
         page: Some(PreferencesPage::SusiePlugins),
         children: &[],
     },
-    // v0.8.0: 自動インデクサ (Ctrl+G 用) の速度プロファイル
+    // 全文検索インデクサ (Ctrl+F / Ctrl+G 用) の速度プロファイル
     TreeCategory {
         label: "全文検索インデクサ",
         page: Some(PreferencesPage::IndexerSpeed),
@@ -817,8 +817,7 @@ fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
              ※ PDF ワーカー / サムネイル読み込みとも I/O を共有するため、\n  \
              High にするとインデックス中に通常操作がもたつく可能性があります。\n\
              ※ 未使用で放置してもアクティブなインデクサが無ければ I/O は消費しません。\n\
-             ※ 索引化の対象はお気に入りごとに選べます (「お気に入り > 編集」ダイアログ)。\n  \
-             閲覧追従の自動索引化は v0.8.0 で廃止しました。",
+             ※ 索引化の対象はお気に入りごとに選べます (「お気に入り > 編集」ダイアログ)。",
         )
         .weak()
         .size(11.0),

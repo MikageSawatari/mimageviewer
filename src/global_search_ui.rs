@@ -906,11 +906,12 @@ impl App {
         let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                // 絞り込みビュー中は「← 戻る」ボタン + 現在地を表示
-                if let GlobalSearchView::DrilledInto { current_path, .. } =
-                    self.global_search.view.clone()
-                {
+            // 絞り込みビュー中は「← 戻る」+ 現在地を検索バーの **上** の行に表示する
+            // (下の検索バーの入力欄位置が他のモードとブレないようにするため)
+            if let GlobalSearchView::DrilledInto { current_path, .. } =
+                self.global_search.view.clone()
+            {
+                ui.horizontal(|ui| {
                     if ui
                         .button("←")
                         .on_hover_text("1 段戻る (BS でも可)")
@@ -923,13 +924,14 @@ impl App {
                             .size(11.0)
                             .color(egui::Color32::from_gray(150)),
                     );
-                    ui.separator();
-                }
-                ui.label("🌐 全検索:");
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("検索:");
                 let response = ui.add_sized(
-                    [360.0, 20.0],
+                    [320.0, 20.0],
                     egui::TextEdit::singleline(&mut self.global_search.query)
-                        .hint_text(r#"お気に入り全体のメタデータ検索 (AND / -除外 / "…")"#),
+                        .hint_text(r#"お気に入り配下のメタデータ (AND / -除外 / "…")"#),
                 );
                 if self.global_search.focus_request {
                     self.global_search.focus_request = false;

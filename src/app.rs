@@ -1091,8 +1091,6 @@ pub struct App {
     pub(crate) search_index_db: Option<Arc<crate::search_index_db::SearchIndexDb>>,
     /// お気に入り検索バー + 結果モードの状態
     pub(crate) favsearch: FavSearchState,
-    /// インデックス作成ダイアログの状態
-    pub(crate) ic: crate::ui_dialogs::index_creator::IndexCreatorState,
 
     // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
     /// フルスクリーンでメタデータパネルを表示するか
@@ -1600,7 +1598,6 @@ impl Default for App {
                 .ok()
                 .map(Arc::new),
             favsearch: FavSearchState::default(),
-            ic: crate::ui_dialogs::index_creator::IndexCreatorState::default(),
             show_metadata_panel: false,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
@@ -1859,7 +1856,6 @@ impl App {
             || self.show_pdf_password_dialog
             || self.slot_save_dialog.is_some()
             || self.context_menu_idx.is_some()
-            || self.ic.show
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
@@ -8892,7 +8888,6 @@ impl eframe::App for App {
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
-        self.show_index_creator_dialog(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);

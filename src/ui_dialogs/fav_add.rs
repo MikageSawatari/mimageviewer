@@ -66,21 +66,20 @@ impl App {
                     ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new(
-                            "フル索引化 (あとで編集可能):\n\
-                             チェックしたものは、このお気に入り配下を今すぐ一括スキャンし\n\
-                             以降は notify-rs と起動時スキャンで自動更新します。\n\
-                             未チェックでも閲覧したフォルダは軽い索引追記が走ります。",
+                            "索引化 (あとで編集可能):\n\
+                             チェックした項目はこの場で 1 回全走査し、以降は notify-rs と\n\
+                             起動時スキャンで自動更新します。",
                         )
                         .weak(),
                     );
                     ui.add_space(2.0);
                     ui.checkbox(
                         &mut self.fav_add_auto_index_structure,
-                        "名前索引 (フォルダ/ZIP/PDF 名 — Ctrl+S 検索用)",
+                        "名前索引 (ファイル名を Ctrl+S で検索)",
                     );
                     ui.checkbox(
                         &mut self.fav_add_auto_index_metadata,
-                        "メタ索引 (EXIF / XMP / PNG tEXt — Ctrl+F/G 検索用)",
+                        "メタデータ索引 (AI プロンプト / EXIF / XMP を Ctrl+F・Ctrl+G で検索)",
                     );
                     // サムネイルは I/O が重い (GB 規模) ため自動化から外し、手動バルクのみ
                     // (「お気に入り」ダイアログからサムネ一括作成ボタンで起動)

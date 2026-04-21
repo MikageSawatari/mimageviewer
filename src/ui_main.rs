@@ -38,7 +38,7 @@ impl App {
                         self.show_open_folder_dialog = true;
                         ui.close();
                     }
-                    if ui.button("メタデータ検索… (Ctrl+F)").clicked() {
+                    if ui.button("メタデータ検索 (Ctrl+F)").clicked() {
                         // Ctrl+G と相互排他: 起動中なら閉じる (Codex round-8 Must-fix #3)
                         if self.global_search.active {
                             self.close_global_search();
@@ -88,14 +88,21 @@ impl App {
                         ui.close();
                     }
 
-                    // 検索 (Ctrl+S)
-                    if ui.button("検索… (Ctrl+S)").clicked() {
+                    // 名前で検索 (Ctrl+S)
+                    if ui.button("名前で検索 (Ctrl+S)").clicked() {
                         self.open_favsearch();
                         ui.close();
                     }
 
-                    // 名前索引 / サムネの一括作成は「お気に入り > 編集」ダイアログの
-                    // 下部ボタンから起動する (v0.8.0 で単独メニュー項目を廃止)。
+                    // メタデータ検索 (Ctrl+G)
+                    if ui.button("メタデータ検索 (Ctrl+G)").clicked() {
+                        // Ctrl+F と相互排他
+                        if self.show_search_bar {
+                            self.show_search_bar = false;
+                        }
+                        self.toggle_global_search();
+                        ui.close();
+                    }
 
                     // 区切り線
                     ui.separator();
@@ -525,12 +532,13 @@ impl App {
         let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape_pressed = self.dialog_escape_pressed(ctx);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("検索:");
                 let response = ui.add_sized(
-                    [280.0, 18.0],
+                    [320.0, 20.0],
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text(r#"プロンプト・ファイル名 (AND / -除外 / "…")"#),
+                        .hint_text(r#"このフォルダ内のメタデータ (AND / -除外 / "…")"#),
                 );
 
                 // フォーカスリクエスト
@@ -551,7 +559,7 @@ impl App {
                 }
 
                 // × ボタン
-                if ui.small_button("×").clicked() {
+                if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;
@@ -570,14 +578,16 @@ impl App {
                     self.rebuild_visible_indices();
                 }
 
-                // 検索中インジケータ or マッチ件数 (同じ行に表示)
+                // 検索中インジケータ or マッチ件数 (separator の後に表示)
                 if self.search_pending.is_some() {
+                    ui.separator();
                     ui.label(
                         egui::RichText::new("検索中...")
                             .size(11.0)
                             .color(egui::Color32::from_rgb(180, 180, 80)),
                     );
                 } else if let Some(ref filter) = self.search_filter {
+                    ui.separator();
                     let image_count = filter
                         .iter()
                         .filter(|&&i| {
@@ -599,6 +609,7 @@ impl App {
                     );
                 }
             });
+            ui.add_space(2.0);
         });
     }
 
@@ -619,11 +630,11 @@ impl App {
         egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("🔍 お気に入り検索:");
+                ui.label("検索:");
                 let response = ui.add_sized(
-                    [300.0, 20.0],
+                    [320.0, 20.0],
                     egui::TextEdit::singleline(&mut self.favsearch.query)
-                        .hint_text(r#"フォルダ・ZIP・PDF 名 (AND / -除外 / "…")"#),
+                        .hint_text(r#"お気に入り配下の名前 (AND / -除外 / "…")"#),
                 );
 
                 if self.favsearch.focus_request {

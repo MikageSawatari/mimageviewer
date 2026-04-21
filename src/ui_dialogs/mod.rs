@@ -15,7 +15,6 @@ mod cache_manager;
 pub(crate) mod context_menu;
 mod fav_add;
 mod favorites_editor;
-pub(crate) mod index_creator;
 mod open_folder;
 mod pdf_password;
 pub(crate) mod preferences;
