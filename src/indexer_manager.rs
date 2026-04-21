@@ -457,7 +457,6 @@ struct ReconciliationReport {
 mod tests {
     use super::*;
     use crate::fts_index::{upsert_doc, Container, IndexDoc};
-    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -466,10 +465,6 @@ mod tests {
         let mut fav = FavoriteEntry::new(name.to_string(), path.to_path_buf());
         fav.auto_index_metadata = metadata;
         fav
-    }
-
-    fn write_image(dir: &std::path::Path, name: &str) {
-        std::fs::write(dir.join(name), b"fake-image").unwrap();
     }
 
     // run_reconciliation の単体テスト。IndexerManager::new は APPDATA に

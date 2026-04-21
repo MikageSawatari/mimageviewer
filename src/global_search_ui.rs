@@ -405,6 +405,10 @@ impl App {
                 }
             }
         }
+        // items を差し替えたら visible_indices も再計算する。怠ると、前に表示していた
+        // フォルダのインデックス値 (新 items 外) が残って、グリッド描画で items[idx] が
+        // panic する (panic.log で ui_main.rs:1013 の out-of-bounds として観測)。
+        self.rebuild_visible_indices();
         // scroll を先頭に戻す
         self.scroll_offset_y = 0.0;
     }
