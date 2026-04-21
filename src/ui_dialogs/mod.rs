@@ -12,7 +12,6 @@ pub(crate) mod archive_convert;
 mod cache_creator;
 mod cache_manager;
 pub(crate) mod index_creator;
-pub(crate) mod index_manager;
 pub(crate) mod context_menu;
 mod fav_add;
 mod favorites_editor;

@@ -122,21 +122,6 @@ impl App {
                         ui.close();
                     }
 
-                    ui.separator();
-
-                    // v0.8.0: インデックス管理 (自動インデックス・全文検索用)
-                    if ui
-                        .button("インデックス管理…")
-                        .on_hover_text(
-                            "Ctrl+G グローバルメタ検索で使う自動インデックスの\n\
-                             状態確認・手動再構築を行います (v0.8.0)。",
-                        )
-                        .clicked()
-                    {
-                        self.show_index_manager = true;
-                        ui.close();
-                    }
-
                     // 区切り線
                     ui.separator();
 
