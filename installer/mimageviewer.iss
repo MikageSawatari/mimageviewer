@@ -28,6 +28,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 MinVersion=10.0
+; インストール開始画面で readme.txt を表示する (Vector 申請要件の一部を兼ねる)。
+InfoBeforeFile=readme.txt
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
@@ -37,6 +39,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; readme.txt はインストール先にも配置する (Vector 申請要件に合わせ、
+; インストーラ単体でもそのまま使える形を保つ)。
+Source: "readme.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; Susie 32bit ワーカーは本体 exe に include_bytes! で埋め込まれており、
 ; 初回起動時に %APPDATA%\mimageviewer\mimageviewer-susie32.exe へ自動展開される。
 ; そのため別ファイルとしては同梱しない。

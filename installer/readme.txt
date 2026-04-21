@@ -54,13 +54,19 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
  3. 動作環境
 ----------------------------------------------------------------
 
-  OS        : Windows 10 / 11（64bit 版のみ）
+  OS        : Windows 10 バージョン 1903（2019年5月）以降 / Windows 11
+              （64bit 版のみ）
   CPU       : x86-64（Intel / AMD）
   メモリ    : 4 GB 以上（8 GB 以上推奨）
   GPU       : DirectX 12 対応 GPU
   ストレージ: インストール時 約 200 MB
 
 追加ソフト: 不要
+
+AI アップスケール / JPEG ノイズ除去 / 消しゴム (画像修復) 等の
+AI 機能は DirectML（Microsoft 公式）を利用します。
+DirectML.dll は Windows 10 バージョン 1903 以降に標準で同梱
+されているため、対応 OS ならば追加インストールは不要です。
 
 HEIC / AVIF / JPEG XL / RAW を表示するには Windows Imaging
 Component（WIC）が必要ですが、Windows 10 / 11 には標準で

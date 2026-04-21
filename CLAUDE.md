@@ -509,6 +509,8 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 8. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
 9. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 10. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
+    ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
+      不足していると `cargo build` が復旧手順付きで止まるようになっている。
 11. `cargo build --release` → `ISCC.exe installer\mimageviewer.iss` でインストーラを生成
 12. 配布成果物を 3 種類用意する:
     - `mimageviewer.exe` (ポータブル版、mikage.to のみ)
