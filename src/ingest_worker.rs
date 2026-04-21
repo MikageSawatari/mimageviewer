@@ -172,8 +172,8 @@ impl<'a> IngestSession<'a> {
                         }
                     }
                 }
-                CandidateKind::Zip | CandidateKind::Pdf => {
-                    // v1: ZIP / PDF はファイル名のみ ingest (ZIP 内展開は v1.x で対応)
+                CandidateKind::Zip => {
+                    // v1: ZIP はファイル名のみ ingest (ZIP 内展開は v1.x で対応)
                     let _permit = io_sem.acquire(priority);
                     match self.ingest_name_only(&cand, writer) {
                         Ok(()) => {
@@ -183,6 +183,26 @@ impl<'a> IngestSession<'a> {
                         Err(e) => {
                             crate::logger::log(format!(
                                 "ingest: container {:?} failed: {e}",
+                                cand.abs_path
+                            ));
+                            let _ = self.meta_db.mark_failed(&cand.key);
+                            stats.ingested_failed += 1;
+                        }
+                    }
+                }
+                CandidateKind::Pdf => {
+                    // §16 step 17: PDF は document info (Title/Author/Subject/Keywords) を
+                    // 取り込む。PDFium ワーカー (別プロセス) を使うのでメイン process の
+                    // pdfium スレッド制約を気にしなくてよい。
+                    let _permit = io_sem.acquire(priority);
+                    match self.ingest_pdf(&cand, writer) {
+                        Ok(()) => {
+                            pending_paths.push(cand.key.clone());
+                            stats.ingested_ok += 1;
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "ingest: pdf {:?} failed: {e}",
                                 cand.abs_path
                             ));
                             let _ = self.meta_db.mark_failed(&cand.key);
@@ -233,6 +253,64 @@ impl<'a> IngestSession<'a> {
         let doc = IndexDoc {
             path: cand.key.clone(),
             container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: self.favorite_id,
+            mtime: cand.mtime,
+            file_size: cand.file_size,
+            name,
+            all_text,
+        };
+        fts_index::upsert_doc(writer, self.fts.fields(), &doc)
+            .map_err(|e| format!("upsert_doc: {e}"))?;
+        Ok(())
+    }
+
+    /// PDF を ingest (§16 step 17)。ファイル名 + PDFium document info を検索対象にする。
+    /// パスワード保護 PDF や破損 PDF は name_only にフォールバック。
+    fn ingest_pdf(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
+        let name = cand
+            .abs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        // 1. PDFium document info を worker プロセス経由で取得
+        //    パスワード未指定で失敗したらパスワード保護 PDF → name_only fallback
+        let info_text = match crate::pdf_loader::get_document_info(&cand.abs_path, None) {
+            Ok(info) => info.as_search_text(),
+            Err(e) => {
+                crate::logger::log(format!(
+                    "ingest_pdf: get_document_info failed (falling back to name-only): {e}"
+                ));
+                String::new()
+            }
+        };
+
+        // 2. ファイル名 + document info を結合して all_text を作る
+        let mut combined = name.clone();
+        if !info_text.is_empty() {
+            combined.push(' ');
+            combined.push_str(&info_text);
+        }
+        let all_text = crate::search_norm::normalize_for_match(&combined);
+
+        // 3. fts_meta に pending で書き込む
+        self.meta_db
+            .mark_pending(
+                &cand.key,
+                self.favorite_id,
+                &self.favorite_root,
+                cand.mtime,
+                cand.file_size,
+                &all_text,
+            )
+            .map_err(|e| format!("mark_pending: {e}"))?;
+
+        // 4. Tantivy にバッファリング
+        let doc = IndexDoc {
+            path: cand.key.clone(),
+            container: Container::Fs, // PDF はコンテナ種別として Fs 扱い (v1)
             zip_entry: String::new(),
             favorite_id: self.favorite_id,
             mtime: cand.mtime,

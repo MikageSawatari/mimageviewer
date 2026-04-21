@@ -297,6 +297,9 @@ fn core_render(
 const MSG_ENUMERATE: u8 = 1;
 const MSG_RENDER: u8 = 2;
 const MSG_SHUTDOWN: u8 = 3;
+/// PDF document info (Title / Author / Subject / Keywords) を返す。
+/// 全文検索インデクサが PDF メタ情報を ingest するために使う (§16 step 17)。
+const MSG_GET_INFO: u8 = 4;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 
@@ -336,6 +339,13 @@ fn encode_path_and_password(buf: &mut Vec<u8>, path: &Path, password: Option<&st
 fn encode_enumerate_request(path: &Path, password: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_ENUMERATE);
+    encode_path_and_password(&mut buf, path, password);
+    buf
+}
+
+fn encode_get_info_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.push(MSG_GET_INFO);
     encode_path_and_password(&mut buf, path, password);
     buf
 }
@@ -454,6 +464,10 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             })
         }
         MSG_SHUTDOWN => Ok(DecodedRequest::Shutdown),
+        MSG_GET_INFO => {
+            let (path, password, _) = decode_path_and_password(payload)?;
+            Ok(DecodedRequest::GetInfo { path, password })
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown message type: {msg_type}"),
@@ -470,6 +484,10 @@ enum DecodedRequest {
         path: PathBuf,
         page_num: u32,
         target_px: u32,
+        password: Option<String>,
+    },
+    GetInfo {
+        path: PathBuf,
         password: Option<String>,
     },
     Shutdown,
@@ -541,6 +559,12 @@ pub fn run_worker_process() {
                     Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
                 }
             }
+            DecodedRequest::GetInfo { path, password } => {
+                match ipc_get_info(&pdfium, &path, password.as_deref()) {
+                    Ok(resp) => { let _ = write_msg(&mut stdout, &resp); }
+                    Err(e) => { let _ = send_error(&mut stdout, &e.to_string()); }
+                }
+            }
             DecodedRequest::Shutdown => break,
         }
     }
@@ -567,6 +591,55 @@ fn ipc_enumerate(
     for e in &entries {
         buf.extend_from_slice(&e.mtime.to_le_bytes());
         buf.extend_from_slice(&e.file_size.to_le_bytes());
+    }
+    Ok(buf)
+}
+
+/// PDF document metadata (Title / Author / Subject / Keywords) を取得する。
+///
+/// 全文検索インデクサが PDF のタイトル等を ingest するために使う (§16 step 17)。
+/// pdfium-render の PdfDocument::metadata() で取れる 4 タグだけを抽出する。
+/// v1 では他のタグ (Creator / Producer / *Date) は取らない (検索価値が低い)。
+fn core_get_info(
+    pdfium: &Pdfium,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<PdfDocumentInfo> {
+    use pdfium_render::prelude::PdfDocumentMetadataTagType;
+
+    let doc = pdfium
+        .load_pdf_from_file(path, password)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let metadata = doc.metadata();
+    let extract = |tag: PdfDocumentMetadataTagType| -> Option<String> {
+        metadata.get(tag).and_then(|t| {
+            let v = t.value().to_string();
+            if v.is_empty() { None } else { Some(v) }
+        })
+    };
+    Ok(PdfDocumentInfo {
+        title: extract(PdfDocumentMetadataTagType::Title),
+        author: extract(PdfDocumentMetadataTagType::Author),
+        subject: extract(PdfDocumentMetadataTagType::Subject),
+        keywords: extract(PdfDocumentMetadataTagType::Keywords),
+    })
+}
+
+/// core_get_info の結果を IPC バイナリにシリアライズする。
+/// フォーマット: [status][4B title_len][title_bytes][4B author_len][author_bytes]...×4
+fn ipc_get_info(
+    pdfium: &Pdfium,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    let info = core_get_info(pdfium, path, password)?;
+    let mut buf = Vec::with_capacity(256);
+    buf.push(STATUS_OK);
+    for field in [&info.title, &info.author, &info.subject, &info.keywords] {
+        let s = field.as_deref().unwrap_or("");
+        let bytes = s.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
     }
     Ok(buf)
 }
@@ -847,6 +920,47 @@ impl PdfWorkerPool {
         Ok(entries)
     }
 
+    /// `ipc_get_info` レスポンスを PdfDocumentInfo にデコード。
+    /// フォーマット: [status][4B title_len][title_bytes][4B author_len][author_bytes]
+    ///             [4B subject_len][subject_bytes][4B keywords_len][keywords_bytes]
+    fn parse_get_info_response(data: &[u8]) -> std::io::Result<PdfDocumentInfo> {
+        if data.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
+        }
+        if data[0] == STATUS_ERR {
+            let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+        }
+        if data[0] != STATUS_OK {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid get_info response"));
+        }
+        let mut offset = 1;
+        let read_field = |data: &[u8], offset: &mut usize| -> std::io::Result<Option<String>> {
+            if *offset + 4 > data.len() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "get_info truncated"));
+            }
+            let len = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+            *offset += 4;
+            if *offset + len > data.len() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "get_info field truncated"));
+            }
+            let s = if len == 0 {
+                None
+            } else {
+                let text = std::str::from_utf8(&data[*offset..*offset + len])
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Some(text.to_string())
+            };
+            *offset += len;
+            Ok(s)
+        };
+        let title = read_field(data, &mut offset)?;
+        let author = read_field(data, &mut offset)?;
+        let subject = read_field(data, &mut offset)?;
+        let keywords = read_field(data, &mut offset)?;
+        Ok(PdfDocumentInfo { title, author, subject, keywords })
+    }
+
     fn parse_render_response(data: &[u8]) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
         if data.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty response"));
@@ -1038,6 +1152,12 @@ enum WorkerRequest {
         cancel: Option<Arc<AtomicBool>>,
         reply: mpsc::Sender<std::io::Result<(image::DynamicImage, PdfPageContentType)>>,
     },
+    /// PDF document info (§16 step 17, ingest_worker 経由で呼ばれる)
+    GetInfo {
+        path: PathBuf,
+        password: Option<String>,
+        reply: mpsc::Sender<std::io::Result<PdfDocumentInfo>>,
+    },
 }
 
 struct PdfWorker {
@@ -1126,6 +1246,9 @@ impl PdfWorker {
                 }
                 let _ = reply.send(result);
             }
+            WorkerRequest::GetInfo { path, password, reply } => {
+                let _ = reply.send(core_get_info(pdfium, &path, password.as_deref()));
+            }
         }
     }
 
@@ -1153,6 +1276,9 @@ impl PdfWorker {
                 let _ = reply.send(PdfAccessStatus::Error(e.to_string()));
             }
             WorkerRequest::Render { reply, .. } => {
+                let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+            }
+            WorkerRequest::GetInfo { reply, .. } => {
                 let _ = reply.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
             }
         }
@@ -1201,6 +1327,29 @@ pub struct PdfPageEntry {
     pub file_size: u64,
 }
 
+/// PDF document metadata (§16 step 17)。全文検索インデクサが ingest する。
+/// pdfium-render の `PdfDocument::metadata()` から 4 タグを抜き取ったもの。
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct PdfDocumentInfo {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub keywords: Option<String>,
+}
+
+impl PdfDocumentInfo {
+    /// 検索用テキストを 1 本の文字列にして返す (空白区切り、空フィールドは省略)。
+    /// `search_norm::normalize_for_match` は呼ばない (呼び出し側で行う)。
+    pub fn as_search_text(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(s) = self.title.as_deref() { if !s.is_empty() { parts.push(s); } }
+        if let Some(s) = self.author.as_deref() { if !s.is_empty() { parts.push(s); } }
+        if let Some(s) = self.subject.as_deref() { if !s.is_empty() { parts.push(s); } }
+        if let Some(s) = self.keywords.as_deref() { if !s.is_empty() { parts.push(s); } }
+        parts.join(" ")
+    }
+}
+
 pub enum PdfAccessStatus {
     Ok,
     PasswordRequired,
@@ -1210,6 +1359,32 @@ pub enum PdfAccessStatus {
 // -----------------------------------------------------------------------
 // 公開 API — 同期版 (バックグラウンドスレッド用)
 // -----------------------------------------------------------------------
+
+/// PDF document info (Title / Author / Subject / Keywords) を取得する。
+/// 全文検索インデクサ (`ingest_worker`) が PDF メタを ingest するときに呼ぶ (§16 step 17)。
+///
+/// worker プロセスプールがあれば IPC 経由、なければ in-process ワーカーにフォールバック。
+pub fn get_document_info(
+    pdf_path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<PdfDocumentInfo> {
+    let pool = get_pool();
+    if pool.worker_count > 0 {
+        let req = encode_get_info_request(pdf_path, password);
+        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+        let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key))?;
+        return PdfWorkerPool::parse_get_info_response(&resp);
+    }
+    // in-process フォールバック
+    let (tx, rx) = mpsc::channel();
+    let _ = get_worker().priority_tx.send(WorkerRequest::GetInfo {
+        path: pdf_path.to_path_buf(),
+        password: password.map(String::from),
+        reply: tx,
+    });
+    rx.recv()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
+}
 
 pub fn enumerate_pages(
     pdf_path: &Path,
@@ -1376,4 +1551,74 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
     }
     let scale = target / long;
     (w * scale, h * scale)
+}
+
+// -----------------------------------------------------------------------
+// tests
+// -----------------------------------------------------------------------
+//
+// PDFium を実際に使うテストは CI で flakey (DLL 展開が走る等) なので、
+// ここでは純粋ロジック — IPC のシリアライズ/デシリアライズと PdfDocumentInfo の整形 — だけ検証。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_document_info_as_search_text_joins_fields() {
+        let info = PdfDocumentInfo {
+            title: Some("夕焼けの記録".to_string()),
+            author: Some("Tarō Yamada".to_string()),
+            subject: None,
+            keywords: Some("landscape, sunset".to_string()),
+        };
+        let t = info.as_search_text();
+        assert!(t.contains("夕焼けの記録"));
+        assert!(t.contains("Tarō Yamada"));
+        assert!(t.contains("landscape, sunset"));
+        assert!(!t.contains("  "), "連続空白なし (空フィールドは落ちる)");
+    }
+
+    #[test]
+    fn pdf_document_info_empty_gives_empty_string() {
+        let info = PdfDocumentInfo::default();
+        assert_eq!(info.as_search_text(), "");
+    }
+
+    #[test]
+    fn parse_get_info_response_roundtrip() {
+        // IPC エンコード (ipc_get_info) とデコード (parse_get_info_response) の往復
+        let mut buf = Vec::new();
+        buf.push(STATUS_OK);
+        for field in ["Title-abc", "", "件名", "key1 key2"] {
+            let bytes = field.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        let info = PdfWorkerPool::parse_get_info_response(&buf).unwrap();
+        assert_eq!(info.title.as_deref(), Some("Title-abc"));
+        assert_eq!(info.author, None, "空文字列は None にデコードされる");
+        assert_eq!(info.subject.as_deref(), Some("件名"));
+        assert_eq!(info.keywords.as_deref(), Some("key1 key2"));
+    }
+
+    #[test]
+    fn parse_get_info_response_handles_error_status() {
+        let mut buf = vec![STATUS_ERR];
+        buf.extend_from_slice(b"file not found");
+        let result = PdfWorkerPool::parse_get_info_response(&buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn parse_get_info_response_rejects_truncated_field() {
+        // title_len = 100 だが実際のバイト数は 4 バイトだけ → エラー
+        let mut buf = vec![STATUS_OK];
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(b"abcd");
+        let result = PdfWorkerPool::parse_get_info_response(&buf);
+        assert!(result.is_err());
+    }
 }
