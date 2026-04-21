@@ -196,16 +196,23 @@ impl App {
         if !self.global_search.active {
             return;
         }
-        // pending があれば cancel
-        if let Some(h) = self.global_search.pending.take() {
-            h.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        // pending があれば SearchHandle の Drop impl で cancel される
+        self.global_search.pending = None;
         self.global_search.active = false;
         self.global_search.has_focus = false;
+        // Codex round-9 Should-fix #2: drill state / all_hits / done フラグも明示クリア。
+        // 旧実装は containers だけクリアしていたため、DrilledInto のまま閉じて再度 Ctrl+G を
+        // 開くと、検索前なのに戻るボタンや古い drill-down UI が残る可能性があった。
         self.global_search.containers.clear();
+        self.global_search.all_hits.clear();
+        self.global_search.view = GlobalSearchView::Aggregated;
         self.global_search.query.clear();
         self.global_search.last_executed.clear();
         self.global_search.reject_message = None;
+        self.global_search.done = false;
+        self.global_search.truncated = false;
+        self.global_search.total_valid = 0;
+        self.global_search.total_scanned = 0;
         // 元のフォルダに戻る
         if let Some(folder) = self.global_search.saved_folder.take() {
             self.load_folder(folder);
@@ -614,6 +621,37 @@ mod tests {
         // クエリリセットで drill state もリセットされる契約
         state.reset_for_new_query();
         assert_eq!(state.view, GlobalSearchView::Aggregated);
+    }
+
+    #[test]
+    fn reset_clears_all_transient_state() {
+        // Codex round-9 Should-fix #2 回帰: reset_for_new_query で all_hits / view /
+        // done / truncated / total_* が全部クリアされる (close 時に相当の処理を走らせる想定)
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/1.jpg".into(),
+            score: 1.0,
+        });
+        state.view = GlobalSearchView::DrilledInto {
+            container: PathBuf::from("c:/a"),
+            is_zip: false,
+        };
+        state.done = true;
+        state.truncated = true;
+        state.total_valid = 42;
+        state.total_scanned = 100;
+        state.reject_message = Some("test".into());
+
+        state.reset_for_new_query();
+
+        assert!(state.all_hits.is_empty());
+        assert!(state.containers.is_empty());
+        assert_eq!(state.view, GlobalSearchView::Aggregated);
+        assert!(!state.done);
+        assert!(!state.truncated);
+        assert_eq!(state.total_valid, 0);
+        assert_eq!(state.total_scanned, 0);
+        assert!(state.reject_message.is_none());
     }
 
     #[test]

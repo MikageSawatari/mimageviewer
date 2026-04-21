@@ -484,12 +484,12 @@ fn run_metadata_search(
 }
 
 /// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
-/// mXD が埋めた XMP tweet 情報 (本文・投稿者) があれば末尾に追記する。
+/// mXD が埋めた XMP tweet 情報 (本文・投稿者・引用元) があれば末尾に追記する。
 ///
-/// **Codex round-8 Should-fix #1 対応**: fts_meta.db fast path (ingest_text::build_all_text_for_file)
-/// と互換な検索対象を作るため、呼び出し側で EXIF もここに含めて渡す設計に変更した。
-/// 詳細: `hay_of` 自体は meta_text をそのまま連結するだけなので、呼び出し側が
-/// EXIF を meta_text に含めるか別の追加引数で渡すかの分担になる。ここでは前者を採用。
+/// **Codex round-8 Should-fix #1 + round-9 #1 対応**:
+/// fts_meta.db fast path (ingest_text::build_all_text_for_file → append_xmp) と互換な
+/// 検索対象を作る。EXIF は呼び出し側で meta_text に含めて渡し、XMP 全フィールドは
+/// この関数内で `ingest_text::append_xmp` と同じフィールド集合を連結する。
 fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetInfo>) -> String {
     let mut out = if meta_text.is_empty() {
         name.to_string()
@@ -497,11 +497,17 @@ fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetI
         format!("{meta_text}\n{name}")
     };
     if let Some(x) = xmp {
+        // ingest_text::append_xmp と同じ 9 フィールドを連結 (Codex round-9 Should-fix #1)
         for field in [
-            x.description.as_deref(),
-            x.creator.as_deref(),
+            x.tweet_id.as_deref(),
             x.author_screen_name.as_deref(),
             x.author_display_name.as_deref(),
+            x.posted_at.as_deref(),
+            x.description.as_deref(),
+            x.creator.as_deref(),
+            x.quoted_by_screen_name.as_deref(),
+            x.quoted_by_tweet_id.as_deref(),
+            x.source.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -4142,6 +4148,19 @@ impl App {
         // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定
         let ctrl_up = ctrl_held && up;
         let ctrl_down = ctrl_held && down;
+
+        // Codex round-9 Nice-to-have: ← キーでも drill-back できるように
+        // (BS と同じ挙動、docs §10.3)。通常のグリッド左移動より先に判定する。
+        // Ctrl+← はフォルダナビに使われるので除外 (ctrl_held なら通常処理へ)
+        if left && !ctrl_held && self.global_search.active {
+            if matches!(
+                self.global_search.view,
+                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+            ) {
+                self.drill_back_to_aggregated();
+                return None;
+            }
+        }
 
         let vi = &self.visible_indices;
         let vi_len = vi.len();
