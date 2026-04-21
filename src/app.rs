@@ -1382,8 +1382,10 @@ impl Default for App {
             .and_then(crate::ai::ModelKind::from_str);
         // 全文検索インデクサを起動。DB/index オープンに失敗した場合 (ディスク容量不足等)
         // は None となり、Ctrl+G 機能は無効だが他の機能は継続動作する。
-        let indexer_manager =
-            crate::indexer_manager::IndexerManager::new(&settings.favorites);
+        let indexer_manager = crate::indexer_manager::IndexerManager::new(
+            &settings.favorites,
+            settings.indexer_speed_profile,
+        );
         Self {
             address: String::new(),
             current_folder: None,

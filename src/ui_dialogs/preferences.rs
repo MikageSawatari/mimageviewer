@@ -28,6 +28,8 @@ pub(crate) enum PreferencesPage {
     ExifDisplay,
     SpreadMode,
     SusiePlugins,
+    /// v0.8.0: 自動インデクサ速度プロファイル
+    IndexerSpeed,
 }
 
 impl PreferencesPage {
@@ -46,6 +48,7 @@ impl PreferencesPage {
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "見開き表示",
             Self::SusiePlugins => "Susie プラグイン",
+            Self::IndexerSpeed => "自動インデクサ速度",
         }
     }
 }
@@ -99,6 +102,12 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "Susie プラグイン",
         page: Some(PreferencesPage::SusiePlugins),
+        children: &[],
+    },
+    // v0.8.0: 自動インデクサ (Ctrl+G 用) の速度プロファイル
+    TreeCategory {
+        label: "全文検索インデクサ",
+        page: Some(PreferencesPage::IndexerSpeed),
         children: &[],
     },
 ];
@@ -383,6 +392,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
+        PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
     }
 }
 
@@ -757,6 +767,45 @@ fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "ZIP 内画像は常にキャッシュ (処理が重いため推奨)",
         );
     });
+}
+
+/// v0.8.0: 自動インデクサの速度プロファイル設定ページ。
+///
+/// `IndexerSpeedProfile` は `GlobalIoSemaphore` の permit 数を決める。
+/// 値の変更は **次回起動時に反映** される (ランタイム差し替えは `sync_with_favorites`
+/// でも反映されないので現状は再起動が必要)。
+fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::settings::IndexerSpeedProfile;
+    let s = &mut state.settings;
+
+    ui.label(
+        "Ctrl+G グローバルメタ検索用のバックグラウンドインデクサの速度を設定します。\n\
+         I/O 同時実行数 (permit 数) を切り替えて、UI 応答性とインデックス速度のバランスを調整します。",
+    );
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("速度プロファイル").strong());
+    ui.add_space(4.0);
+
+    for profile in IndexerSpeedProfile::all() {
+        let selected = s.indexer_speed_profile == *profile;
+        if ui.radio(selected, profile.label()).clicked() {
+            s.indexer_speed_profile = *profile;
+        }
+    }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "※ 設定変更は次回起動時に反映されます。\n\
+             ※ PDF ワーカー / サムネイル読み込みとも I/O を共有するため、\n  \
+             High にするとインデックス中に通常操作がもたつく可能性があります。\n\
+             ※ 未使用で放置してもアクティブなインデクサが無ければ I/O は消費しません。",
+        )
+        .weak()
+        .size(11.0),
+    );
 }
 
 fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

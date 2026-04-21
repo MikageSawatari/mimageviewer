@@ -49,9 +49,8 @@ use crate::indexer_supervisor::{self, SupervisorHandle, SupervisorParams, Superv
 use crate::io_semaphore::GlobalIoSemaphore;
 use crate::settings::FavoriteEntry;
 
-/// 全 Supervisor の I/O 同時実行上限。ハードコード値で v1 は OK。
-/// (§7.6 の Low/Med/High プロファイルで調整できるようにするのは v1.x)
-const IO_PERMITS: usize = 2;
+// 注: IO permits は `IndexerSpeedProfile::io_permits()` から決まる (Low=1/Med=2/High=4)。
+// IndexerManager::new の `speed` 引数経由で渡される。
 
 /// 検索ハンドル。UI 側が `try_recv` で stream を受け取る。
 ///
@@ -98,7 +97,10 @@ impl IndexerManager {
     /// supervisor thread が即 return する race があった。
     /// reconciliation は通常クラッシュ残留の僅かな行だけを処理するので、
     /// アプリ起動の許容範囲内 (通常 100ms 以下) で終わる。
-    pub fn new(favorites: &[FavoriteEntry]) -> Option<Self> {
+    pub fn new(
+        favorites: &[FavoriteEntry],
+        speed: crate::settings::IndexerSpeedProfile,
+    ) -> Option<Self> {
         let meta_db = match FtsMetaDb::open() {
             Ok(db) => Arc::new(db),
             Err(e) => {
@@ -113,7 +115,12 @@ impl IndexerManager {
                 return None;
             }
         };
-        let io_sem = Arc::new(GlobalIoSemaphore::new(IO_PERMITS));
+        let permits = speed.io_permits().max(1); // 0 は GlobalIoSemaphore で panic するので防御
+        crate::logger::log(format!(
+            "IndexerManager: speed profile = {:?} → io_permits = {permits}",
+            speed
+        ));
+        let io_sem = Arc::new(GlobalIoSemaphore::new(permits));
 
         // === 起動時 reconciliation を先に同期実行 ===
         // supervisor が走る前に status != ok の残留行を整理することで、

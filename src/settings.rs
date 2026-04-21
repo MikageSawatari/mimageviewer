@@ -273,6 +273,47 @@ impl CachePolicy {
 }
 
 // -----------------------------------------------------------------------
+// インデクサ速度プロファイル (v0.8.0, docs/search-expansion-design.md §7.5)
+// -----------------------------------------------------------------------
+
+/// バックグラウンドインデクサの速度プロファイル。
+/// I/O 同時実行数 (GlobalIoSemaphore の permits) を決定する。
+///
+/// - `Low`: HDD / NAS / バッテリー向け。1 permit で UI 操作を最優先
+/// - `Medium`: HDD + SSD 混成。2 permits (デフォルト)
+/// - `High`: NVMe SSD。4 permits で初回インデックスを高速化
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IndexerSpeedProfile {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl IndexerSpeedProfile {
+    /// `GlobalIoSemaphore` の permit 数。
+    pub fn io_permits(self) -> usize {
+        match self {
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low (1 permit, UI 優先)",
+            Self::Medium => "Medium (2 permits, 既定)",
+            Self::High => "High (4 permits, NVMe 向け)",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Low, Self::Medium, Self::High]
+    }
+}
+
+// -----------------------------------------------------------------------
 // Parallelism
 // -----------------------------------------------------------------------
 
@@ -485,6 +526,11 @@ pub struct Settings {
     /// チェック状態をセッションをまたいで保存する (正規化せず元のパスで記録)。
     #[serde(default)]
     pub search_index_checks: Vec<PathBuf>,
+    /// v0.8.0: 自動インデクサの速度プロファイル (docs/search-expansion-design.md §7.5)。
+    /// I/O 同時実行数 (GlobalIoSemaphore permits) を決める。
+    /// 変更は次回起動時に反映 (IndexerManager::new で読まれる)。
+    #[serde(default)]
+    pub indexer_speed_profile: IndexerSpeedProfile,
     /// 一括キャッシュ作成: PDF 内の全ページをキャッシュ対象にする
     #[serde(default)]
     pub batch_cache_pdf_contents: bool,
@@ -764,6 +810,7 @@ impl Default for Settings {
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
             search_index_checks: Vec::new(),
+            indexer_speed_profile: IndexerSpeedProfile::default(),
             thumb_prev_pages: default_thumb_prev_pages(),
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
@@ -1082,6 +1129,34 @@ mod tests {
     #[test]
     fn thumb_aspect_all_has_all_variants() {
         assert_eq!(ThumbAspect::all().len(), 7);
+    }
+
+    // -- IndexerSpeedProfile (v0.8.0) --
+
+    #[test]
+    fn indexer_speed_profile_io_permits() {
+        assert_eq!(IndexerSpeedProfile::Low.io_permits(), 1);
+        assert_eq!(IndexerSpeedProfile::Medium.io_permits(), 2);
+        assert_eq!(IndexerSpeedProfile::High.io_permits(), 4);
+    }
+
+    #[test]
+    fn indexer_speed_profile_default_is_medium() {
+        assert_eq!(IndexerSpeedProfile::default(), IndexerSpeedProfile::Medium);
+    }
+
+    #[test]
+    fn indexer_speed_profile_all_has_three_variants() {
+        assert_eq!(IndexerSpeedProfile::all().len(), 3);
+    }
+
+    #[test]
+    fn indexer_speed_profile_roundtrip_serde() {
+        for p in IndexerSpeedProfile::all() {
+            let json = serde_json::to_string(p).unwrap();
+            let back: IndexerSpeedProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, *p);
+        }
     }
 
     // -- SortOrder --
