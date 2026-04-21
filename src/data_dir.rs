@@ -5,9 +5,17 @@
 //! 設定・キャッシュ・回転DB が全てここを参照する。
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// テスト用の data_dir 上書き。`None` なら本番の OnceLock を参照する。
+///
+/// Phase C で `App::new_for_test()` が TempDir を割り当てるために使う。
+/// プロセス全体で 1 箇所のグローバル状態 (`OnceLock` は再代入不可 + App の
+/// 子スレッドが同じ dir を参照する必要があるため thread-local 化できない)
+/// なので、Phase C テストは `#[serial]` 相当で同時 1 本に絞って動かす前提。
+static TEST_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// 起動引数を解析してデータディレクトリを初期化する。
 /// `main()` の先頭で一度だけ呼ぶこと。
@@ -21,9 +29,28 @@ pub fn init() {
     DATA_DIR.set(dir).ok();
 }
 
-/// データディレクトリを返す。`init()` 未呼び出しの場合はデフォルト値を返す。
+/// データディレクトリを返す。
+///
+/// 優先順位: `TEST_OVERRIDE` (テスト時) → `DATA_DIR` (本番 OnceLock) →
+/// `default()` (%APPDATA% + mimageviewer)。
 pub fn get() -> PathBuf {
+    if let Ok(guard) = TEST_OVERRIDE.lock() {
+        if let Some(p) = guard.as_ref() {
+            return p.clone();
+        }
+    }
     DATA_DIR.get().cloned().unwrap_or_else(default)
+}
+
+/// テスト用: data_dir をテンポラリディレクトリに差し替える (None で解除)。
+///
+/// Phase C の `App::new_for_test` から呼ぶ。`TempDir` の `close()` が先に走ると
+/// テスト中の supervisor スレッドが生き残って disk を触りに行くので、呼び出し側は
+/// `TempDir` を App より長生きさせること。
+pub fn set_test_override(path: Option<PathBuf>) {
+    if let Ok(mut guard) = TEST_OVERRIDE.lock() {
+        *guard = path;
+    }
 }
 
 /// ログ用サブディレクトリ `<data_dir>/logs` を返す。

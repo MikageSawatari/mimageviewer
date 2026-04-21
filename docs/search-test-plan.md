@@ -80,7 +80,44 @@ master に `NameIndexSupervisor` が入った 2026-04 に着手。`tests/search_
 
 ### Phase C: App-level E2E (Ctrl+G / Ctrl+↑↓)
 
-**未着手**。キー操作レベルのバグは過去複数回出ているため、本 phase が本丸。
+**Phase C 下準備 + 起動ロジック回帰テスト 完了 (2026-04)**。
+eframe::Frame モックを伴うフルスタック (update() ループ経由) は未着手 (次のマイルストーン)。
+
+#### 完了した下準備
+
+1. **`data_dir::set_test_override(Option<PathBuf>)`** — `Mutex<Option<PathBuf>>` ベース。
+   `data_dir::get()` は `TEST_OVERRIDE` → `DATA_DIR` (本番 OnceLock) → `default()` の
+   順で評価する。プロセス全体のグローバルなので Phase C テストは `PHASE_C_LOCK` で
+   直列化する必要あり。
+
+2. **`App::new_for_test(AppTestConfig)`** (`#[cfg(test)]`) — TempDir と settings を
+   受け取り `App::default()` の経路をそのまま通す軽量コンストラクタ。font/theme/dpi は
+   設定しない、`spawn_initial_name_index_supervisors` は呼ばない (必要なテストが明示的に呼ぶ)。
+   supervisor スレッドの Drop 順序: App → OverrideGuard → TempDir で file handle を先に
+   閉じて Windows の使用中削除エラーを回避する。
+
+3. **`PHASE_C_LOCK` + `OverrideGuard`** (`src/app.rs::phase_c_key_tests`) —
+   テスト間の data_dir 干渉を防ぐ serialization + panic-safe override clear。
+
+#### 完了したテスト (8 本、`src/app.rs::phase_c_key_tests`)
+
+| テスト | カバー内容 |
+| --- | --- |
+| `new_app_has_no_search_bar_open` | 起動直後は全検索バー閉じている |
+| `open_local_metadata_search_activates_only_ctrl_f` | Ctrl+F 起動で Ctrl+F のみ active |
+| `open_favsearch_activates_only_ctrl_s` | Ctrl+S 起動で Ctrl+S のみ active |
+| `open_global_search_activates_only_ctrl_g` | Ctrl+G 起動で Ctrl+G のみ active |
+| `ctrl_f_closes_ctrl_s_and_ctrl_g` | Ctrl+F が他 2 つを閉じる |
+| `ctrl_s_closes_ctrl_f` | Ctrl+S が Ctrl+F を閉じる |
+| `ctrl_g_closes_ctrl_f` | Ctrl+G が Ctrl+F を閉じる |
+| `at_most_one_search_bar_ever_active` | F→S→G→F→G→S→F の 7 段階で常に active ≤ 1 |
+
+2026-04 ユーザー報告「検索バーが 2 つでることがある」回帰ガードとして機能。
+
+#### 残タスク (次マイルストーン: フルスタック UI テスト)
+
+フルキーストローク → UI 応答のフルスタックは `eframe::Frame` モックが必要で egui_kittest
+の `Harness::builder().build_eframe(|cc| ...)` を使う方向。以下は未着手。
 
 #### 必要な下準備
 

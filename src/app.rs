@@ -1744,6 +1744,54 @@ impl Default for App {
     }
 }
 
+/// `App::new_for_test` に渡すテスト設定。
+///
+/// Phase C では実プロセスの `data_dir::init` を経由せず、`set_test_override` で
+/// `TempDir` を差し込む。App 内の全 DB/インデクサ open はその data_dir を参照する。
+#[cfg(test)]
+pub struct AppTestConfig {
+    /// テスト用データディレクトリ。`data_dir::set_test_override(Some(...))` に設定済みの
+    /// パスを渡す。(呼び出し側の `TempDir` が App より長生きする必要あり)
+    pub data_dir: std::path::PathBuf,
+    /// 起動時に `settings.json` をこの内容で上書きしてから App::default を呼ぶ。
+    /// None なら `Settings::load` が空ファイルから default 設定を作る。
+    pub settings: Option<crate::settings::Settings>,
+}
+
+#[cfg(test)]
+impl App {
+    /// テスト用コンストラクタ。本番の `App::default` と同じ DB/indexer open 経路を
+    /// 通すが、以下が異なる:
+    ///
+    /// 1. `config.data_dir` を `data_dir::set_test_override` 経由で強制する前提 (呼び出し側で)
+    /// 2. `config.settings` があれば `settings.json` に書き出してから load する
+    /// 3. 名前索引 supervisor の初期 spawn は行わない
+    ///    (呼び出し側が `spawn_initial_name_index_supervisors()` を明示的に呼ぶ)
+    /// 4. 初期サイズ / font / theme は設定しない (テスト側で Context を用意する想定)
+    ///
+    /// 注意: Tantivy / SQLite / notify-rs などの実スレッドは通常どおり起動するので、
+    /// テスト終了時には `drop(app)` で正しく停止すること (IndexerManager::drop が
+    /// supervisor を signal_stop→join で止める)。
+    pub fn new_for_test(config: AppTestConfig) -> Self {
+        // settings.json をあらかじめ書いておく (App::default 内の Settings::load が拾う)
+        if let Some(settings) = &config.settings {
+            std::fs::create_dir_all(&config.data_dir).ok();
+            let json = serde_json::to_string_pretty(settings).expect("serialize settings");
+            std::fs::write(config.data_dir.join("settings.json"), json)
+                .expect("write settings.json");
+        }
+        // data_dir::get() はこの時点で config.data_dir を返さなければならない
+        debug_assert_eq!(
+            crate::data_dir::get(),
+            config.data_dir,
+            "data_dir::set_test_override(Some(config.data_dir)) を先に呼ぶこと"
+        );
+        let app = App::default();
+        // `spawn_initial_name_index_supervisors` はテスト側で必要なときだけ呼ぶ契約
+        app
+    }
+}
+
 impl App {
     /// 指定 idx の GridItem から perf 相関キーを生成する (範囲外なら None)。
     pub(crate) fn perf_item_key(&self, idx: usize) -> Option<String> {
@@ -10133,5 +10181,175 @@ mod tests {
         let out = clamp_dynamic_for_gpu(img);
         assert_eq!(out.width(), 8192);
         assert_eq!(out.height(), 2048);
+    }
+}
+
+// =======================================================================
+// Phase C (App-level) テスト
+//
+// docs/search-test-plan.md §Phase C の位置付け。App 全体を構築して、
+// 検索バー起動ヘルパ (open_favsearch / open_global_search /
+// open_local_metadata_search) の相互排他ロジックを回帰テストとして固定する。
+//
+// 完全な Ctrl+G キー → update() 経由のフルスタックテストは eframe::Frame の
+// モック化が必要で重いため、本ラウンドでは **public 起動 API の状態遷移** を
+// 対象にする。検索バー同時表示バグ (2026-04 ユーザー報告) の回帰防止が主目的。
+// =======================================================================
+
+#[cfg(test)]
+mod phase_c_key_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    /// Phase C テストは `data_dir::TEST_OVERRIDE` (プロセス全体のグローバル状態) を
+    /// 共有するため、並列実行すると data_dir が干渉する。このロックで同時 1 テストに絞る。
+    static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
+
+    /// テスト終了時に必ず `data_dir::set_test_override(None)` を呼ぶ RAII ガード。
+    /// panic 経路でも確実にオーバーライドを解除して後続テストに影響させない。
+    struct OverrideGuard;
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            crate::data_dir::set_test_override(None);
+        }
+    }
+
+    /// TempDir を data_dir として差し替え、空の settings で App を構築する。
+    /// TempDir / OverrideGuard / App は declared order と逆順で drop されるので、
+    /// App (supervisor join 含む) → OverrideGuard (data_dir clear) → TempDir (削除)
+    /// の正しい順序で片付く。
+    fn setup_app() -> (App, OverrideGuard, TempDir, std::sync::MutexGuard<'static, ()>) {
+        let lock = PHASE_C_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().expect("tempdir");
+        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
+        let guard = OverrideGuard;
+        let config = AppTestConfig {
+            data_dir: tmp.path().to_path_buf(),
+            settings: None,
+        };
+        let app = App::new_for_test(config);
+        (app, guard, tmp, lock)
+    }
+
+    /// ベースライン: 新規 App はどの検索バーも開いていないこと。
+    #[test]
+    fn new_app_has_no_search_bar_open() {
+        let (app, _g, _tmp, _l) = setup_app();
+        assert!(!app.show_search_bar, "Ctrl+F bar must be closed");
+        assert!(!app.favsearch.active, "Ctrl+S bar must be closed");
+        assert!(!app.global_search.active, "Ctrl+G bar must be closed");
+    }
+
+    /// Ctrl+F 相当の起動ヘルパを呼ぶと Ctrl+F バーのみが立ち、他 2 つは閉じたままであること。
+    #[test]
+    fn open_local_metadata_search_activates_only_ctrl_f() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_local_metadata_search();
+        assert!(app.show_search_bar);
+        assert!(!app.favsearch.active);
+        assert!(!app.global_search.active);
+    }
+
+    /// Ctrl+S 相当の起動ヘルパを呼ぶと Ctrl+S バーのみが立つこと。
+    #[test]
+    fn open_favsearch_activates_only_ctrl_s() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_favsearch();
+        assert!(!app.show_search_bar);
+        assert!(app.favsearch.active);
+        assert!(!app.global_search.active);
+    }
+
+    /// Ctrl+G 相当の起動ヘルパを呼ぶと Ctrl+G バーのみが立つこと。
+    #[test]
+    fn open_global_search_activates_only_ctrl_g() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_global_search();
+        assert!(!app.show_search_bar);
+        assert!(!app.favsearch.active);
+        assert!(app.global_search.active);
+    }
+
+    /// 既に別の検索バーが開いているところで Ctrl+F を起動すると、先行バーが閉じて
+    /// Ctrl+F だけが残ること (相互排他、2026-04 バグ回帰ガード)。
+    #[test]
+    fn ctrl_f_closes_ctrl_s_and_ctrl_g() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_favsearch();
+        app.open_global_search();
+        assert!(!app.favsearch.active, "Ctrl+G should have closed Ctrl+S");
+        assert!(app.global_search.active);
+        app.open_local_metadata_search();
+        assert!(app.show_search_bar);
+        assert!(!app.favsearch.active);
+        assert!(!app.global_search.active, "Ctrl+F should close Ctrl+G");
+    }
+
+    /// 既に Ctrl+F が開いているところで Ctrl+S を起動すると Ctrl+F が閉じて
+    /// Ctrl+S だけが残ること (回帰)。
+    #[test]
+    fn ctrl_s_closes_ctrl_f() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_local_metadata_search();
+        assert!(app.show_search_bar);
+        app.open_favsearch();
+        assert!(app.favsearch.active);
+        assert!(!app.show_search_bar, "Ctrl+S should close Ctrl+F");
+        assert!(!app.global_search.active);
+    }
+
+    /// 既に Ctrl+F が開いているところで Ctrl+G を起動すると Ctrl+F が閉じて
+    /// Ctrl+G だけが残ること (回帰)。
+    #[test]
+    fn ctrl_g_closes_ctrl_f() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_local_metadata_search();
+        app.open_global_search();
+        assert!(app.global_search.active);
+        assert!(!app.show_search_bar, "Ctrl+G should close Ctrl+F");
+        assert!(!app.favsearch.active);
+    }
+
+    /// どの順番で 3 検索モードを切り替えても、同時に 2 つ以上が active にならないこと。
+    /// 2026-04 報告「検索バーが 2 つでることがあった」の総合回帰ガード。
+    #[test]
+    fn at_most_one_search_bar_ever_active() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let check_invariant = |app: &App, label: &str| {
+            let count = [
+                app.show_search_bar,
+                app.favsearch.active,
+                app.global_search.active,
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            assert!(
+                count <= 1,
+                "{label}: 同時に active なバーが {count} 個 (F={}, S={}, G={})",
+                app.show_search_bar,
+                app.favsearch.active,
+                app.global_search.active,
+            );
+        };
+        // F → S → G → F → G → S → F と順番に切り替えて各ステップで不変量を確認
+        check_invariant(&app, "initial");
+        app.open_local_metadata_search();
+        check_invariant(&app, "after open F");
+        app.open_favsearch();
+        check_invariant(&app, "after open S (should close F)");
+        app.open_global_search();
+        check_invariant(&app, "after open G (should close S)");
+        app.open_local_metadata_search();
+        check_invariant(&app, "after open F (should close G)");
+        app.open_global_search();
+        check_invariant(&app, "after open G (should close F)");
+        app.open_favsearch();
+        check_invariant(&app, "after open S (should close G)");
+        app.open_local_metadata_search();
+        check_invariant(&app, "after open F (should close S)");
     }
 }
