@@ -75,6 +75,12 @@ pub(crate) struct MetadataLoadPending {
     rx: mpsc::Receiver<MetadataLoadResult>,
 }
 
+impl MetadataLoadPending {
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 /// メタデータ読み込みワーカーの結果。キー (metadata_cache_key の形式) と
 /// 3 つのパース結果をまとめて返す。UI 側はそれぞれのキャッシュに投入する。
 pub(crate) struct MetadataLoadResult {
@@ -173,6 +179,12 @@ pub(crate) struct SearchPending {
     cancel: Arc<AtomicBool>,
     /// ワーカースレッドから結果を受け取るチャネル。
     rx: mpsc::Receiver<SearchThreadResult>,
+}
+
+impl SearchPending {
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// 検索ワーカースレッドからの結果。
@@ -2503,7 +2515,7 @@ impl App {
     /// 与えられた `items` / `image_metas` を新しい状態として設定し、
     /// 旧タスクをキャンセル → カタログを開く → 永続ワーカー + 動画スレッドを起動 →
     /// 履歴復元 → last_folder 保存 までを行う。
-    pub(crate) fn start_loading_items(
+    fn start_loading_items(
         &mut self,
         source_path: PathBuf,
         items: Vec<GridItem>,
@@ -4384,13 +4396,14 @@ impl App {
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
         if backspace && !ctrl_held {
-            // Ctrl+G drill-down 中なら Aggregated view に戻る (docs §10.3)
+            // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
+            // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
             if self.global_search.active {
                 if matches!(
                     self.global_search.view,
                     crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
                 ) {
-                    self.drill_back_to_aggregated();
+                    self.drill_back_one_level();
                     return None;
                 }
             }
@@ -4415,11 +4428,23 @@ impl App {
         // バックグラウンドスレッドで navigate_folder_with_skip を実行し、
         // 結果は poll_folder_nav で非同期に受信する。
         // 検索コンテキスト中は検索結果内での前後移動に置き換える。
+        // Ctrl+G 中は file system 遡行を禁止して Ctrl+G の範囲に閉じる
+        // (Aggregated 時は Ctrl+↑↓ は no-op、DrilledInto 時は drill-tree DFS)。
+        let in_global_search = self.global_search.active;
+        let in_global_search_drilled = in_global_search
+            && matches!(
+                self.global_search.view,
+                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+            );
         if ctrl_down {
             // perf: グリッドの Ctrl+↓ を input イベントとして記録 (fullscreen 側と対称)。
             // これで入力 → DFS → load_folder → 初フレームまでを seq で相関できる。
             self.bump_input_seq("grid_ctrl_nav", Some("forward"));
-            if in_favsearch {
+            if in_global_search_drilled {
+                self.global_search_ctrl_nav(true);
+            } else if in_global_search {
+                // Aggregated 中は何もしない (fs ツリー遡行はユーザ期待に反する)
+            } else if in_favsearch {
                 self.favsearch_ctrl_nav(true);
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::Grid);
@@ -4429,7 +4454,11 @@ impl App {
         // Ctrl+↑: 深さ優先で前のフォルダへ（画像なしはスキップ）
         if ctrl_up {
             self.bump_input_seq("grid_ctrl_nav", Some("backward"));
-            if in_favsearch {
+            if in_global_search_drilled {
+                self.global_search_ctrl_nav(false);
+            } else if in_global_search {
+                // Aggregated 中は何もしない
+            } else if in_favsearch {
                 self.favsearch_ctrl_nav(false);
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);

@@ -13,7 +13,7 @@
 //!   後続コミットで追加予定 (docs §10.3 の [3] 絞り込みビュー)
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -30,13 +30,24 @@ const MAX_EVENTS_PER_FRAME: usize = 8;
 /// ContainerHit の再ソート間隔 (チラつき防止、docs §10.4.3)。
 const RESORT_INTERVAL_MS: u64 = 1000;
 
-/// Ctrl+G のビュー状態 (v1 は 1 階層 drill-down のみ、docs §10.3 [2]-[3])。
+/// Ctrl+G のビュー状態 (docs §10.3 [2]-[3])。
+///
+/// DrilledInto 時は「現在地 (current_path) 直下に落ちるヒット + ヒットを含む子フォルダ」
+/// だけを表示する (ヒットが 1 件もない枝は枝刈り)。Ctrl+↑↓ はこの枝刈り済みツリー
+/// 上で移動する。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GlobalSearchView {
     /// トップレベル集約表示。SearchContainer セルがヒット件数降順で並ぶ
     Aggregated,
-    /// drill-down 中。`container` の配下のヒットファイル一覧を表示する
-    DrilledInto { container: PathBuf, is_zip: bool },
+    /// drill-down 中。
+    /// - `container_root`: ドリルインの起点 (SearchContainer のパス)
+    /// - `current_path`: 現在地 (container_root と同じか、その配下の子フォルダ)
+    /// - `is_zip`: container が ZIP ファイルか
+    DrilledInto {
+        container_root: PathBuf,
+        current_path: PathBuf,
+        is_zip: bool,
+    },
 }
 
 /// Ctrl+G 検索の状態 (App が所有する)。
@@ -170,10 +181,234 @@ pub fn sorted_containers(
 }
 
 // -----------------------------------------------------------------------
+// 絞り込みビュー (DrilledInto) 用のアイテム構築ヘルパ
+// -----------------------------------------------------------------------
+
+/// Aggregated view の items + image_metas を組み立てる。
+pub(crate) fn build_aggregated_items(
+    state: &GlobalSearchState,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    let containers = sorted_containers(&state.containers);
+    let items: Vec<GridItem> = containers
+        .iter()
+        .map(|c| GridItem::SearchContainer {
+            path: c.path.clone(),
+            kind: c.kind,
+            hit_count: c.hit_count,
+        })
+        .collect();
+    // SearchContainer はサムネイル不要 (make_load_request で None) だが、image_metas は
+    // items と同じ長さに揃えておく (Option<(0,0)>) ことで thumb_loader 側の
+    // image_metas.get(i).flatten() が panic ではなく「enqueue skip」になる。
+    let image_metas: Vec<Option<(i64, i64)>> = vec![None; items.len()];
+    (items, image_metas)
+}
+
+/// DrilledInto view の items + image_metas を組み立てる。
+///
+/// `current_path` 直下のヒット (Image/ZipImage) と、`current_path` の直下でヒットを
+/// 含む子フォルダ (Folder 枝、件数バッジ付き) だけを並べる。ヒットを含まない枝は
+/// 枝刈りされる。
+///
+/// image_metas は UI スレッドでの `fs::metadata` 同期呼び出しで埋める。ヒット件数は
+/// 通常数 〜 数百件で、1 ディレクトリあたり 10ms オーダー以内に収まる想定。
+/// 大量ヒット環境でのボトルネック化が観測されたら、GlobalHit に mtime/file_size を
+/// 持たせて Tantivy の STORED フィールドから取り出す方式に切り替える (v0.8.x 課題)。
+pub(crate) fn build_drilled_items(
+    state: &GlobalSearchState,
+    current_path: &Path,
+    is_zip: bool,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    if is_zip {
+        return build_drilled_zip_items(state, current_path);
+    }
+    // ── 通常フォルダ配下の絞り込み ──
+    let mut direct_files: Vec<PathBuf> = Vec::new();
+    // 直下子フォルダ → その配下のヒット件数
+    let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
+
+    for h in &state.all_hits {
+        if h.path.contains('!') {
+            continue; // ZIP ヒットはスキップ
+        }
+        let hp = PathBuf::from(&h.path);
+        let Some(hp_parent) = hp.parent() else { continue };
+        // current_path の配下でなければ無関係
+        if !path_is_under_or_eq(hp_parent, current_path) {
+            continue;
+        }
+        if hp_parent == current_path {
+            direct_files.push(hp);
+        } else {
+            // current_path の直下の子フォルダ名を拾う
+            let rel = match hp_parent.strip_prefix(current_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if let Some(first) = rel.components().next() {
+                let child = current_path.join(first.as_os_str());
+                *sub_counts.entry(child).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // サブフォルダ (Folder) を名前昇順 → 続いて直下ファイル (Image) を名前昇順
+    let mut sub_vec: Vec<(PathBuf, usize)> = sub_counts.into_iter().collect();
+    sub_vec.sort_by(|a, b| a.0.cmp(&b.0));
+    direct_files.sort();
+
+    let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
+    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
+
+    for (sub_path, _hits) in &sub_vec {
+        // Folder セルは通常 make_load_request でフォルダ内代表画像を拾うので、
+        // image_metas はフォルダ自身の mtime を入れておけば cache キーが安定する。
+        items.push(GridItem::Folder(sub_path.clone()));
+        image_metas.push(path_metadata(sub_path));
+    }
+    for f in &direct_files {
+        items.push(GridItem::Image(f.clone()));
+        image_metas.push(path_metadata(f));
+    }
+
+    (items, image_metas)
+}
+
+/// ZIP コンテナをドリルインしたときのアイテム構築 (v0.8.0 はフラット表示)。
+fn build_drilled_zip_items(
+    state: &GlobalSearchState,
+    zip_path: &Path,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    let zip_key = crate::search_index_db::normalize_path(zip_path);
+    let zip_meta = path_metadata(zip_path);
+    let mut items: Vec<GridItem> = Vec::new();
+    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
+    for h in &state.all_hits {
+        let Some((zip_part, entry)) = h.path.split_once('!') else {
+            continue;
+        };
+        if zip_part != zip_key {
+            continue;
+        }
+        items.push(GridItem::ZipImage {
+            zip_path: zip_path.to_path_buf(),
+            entry_name: entry.to_string(),
+        });
+        // ZIP エントリの mtime/size は zip_loader が必要時に解決するので、
+        // ここでは外側 ZIP ファイルの mtime を共有値として入れておく (cache キー安定)。
+        image_metas.push(zip_meta);
+    }
+    (items, image_metas)
+}
+
+/// ファイルの mtime + file_size を取得する (失敗時 None)。
+fn path_metadata(p: &Path) -> Option<(i64, i64)> {
+    let md = std::fs::metadata(p).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let size = md.len() as i64;
+    Some((mtime, size))
+}
+
+/// `child` が `ancestor` と等しいか配下にあれば true。
+fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
+    child == ancestor || child.starts_with(ancestor)
+}
+
+/// `container_root` 配下でヒットを含むフォルダを DFS 順で列挙する。
+/// 先頭は常に `container_root` 自身。
+pub(crate) fn collect_hit_folders_dfs(
+    all_hits: &[GlobalHit],
+    container_root: &Path,
+) -> Vec<PathBuf> {
+    // ヒットの直上フォルダ + その container_root までの祖先を全部集める
+    let mut folders: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    folders.insert(container_root.to_path_buf());
+    for h in all_hits {
+        if h.path.contains('!') {
+            continue; // ZIP ヒットはスキップ (container_root が ZIP のときは未対応)
+        }
+        let hp = PathBuf::from(&h.path);
+        let Some(mut cur) = hp.parent().map(Path::to_path_buf) else { continue };
+        while path_is_under_or_eq(&cur, container_root) {
+            folders.insert(cur.clone());
+            if cur == container_root {
+                break;
+            }
+            match cur.parent() {
+                Some(parent) => cur = parent.to_path_buf(),
+                None => break,
+            }
+        }
+    }
+    // PathBuf の lexicographic 順 = DFS pre-order (親 < 子、兄弟は名前順) になる
+    folders.into_iter().collect()
+}
+
+// -----------------------------------------------------------------------
 // App 側との連携 (impl App 拡張)
 // -----------------------------------------------------------------------
 
 impl App {
+    /// Ctrl+G 検索結果ビュー専用の軽量 items 差し替え (Codex P2 指摘対応)。
+    ///
+    /// `start_loading_items` がやるフォルダ切替フルコース (sidecar flush / fullscreen 閉じ /
+    /// catalog open / prewarm_rating_cache / worker spawn / settings.last_folder 保存) は
+    /// **実行しない**。この関数は以下の最小限を整合させるだけ:
+    ///
+    /// - items / thumbnails / image_metas を新しい並びに差し替え
+    /// - 旧インデックスを参照していた requested / checked / pending_finalize / selected を解除
+    /// - search_filter / search_query をクリア (Ctrl+F と共存させないため)
+    /// - in-flight の search_pending / metadata_pending を cancel
+    /// - visible_indices を再計算
+    /// - スクロールを先頭に戻す
+    ///
+    /// catalog / folder_history / current_folder は触らない — Ctrl+G は `saved_folder` で
+    /// 独自に戻り先を保持するため、実フォルダの概念は介入させない。
+    pub(crate) fn replace_search_view_items(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+    ) {
+        debug_assert_eq!(items.len(), image_metas.len());
+        // 旧タスク停止: インデックスが付け替わるので in-flight は意味を失う
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel();
+        }
+        self.items = items;
+        self.image_metas = image_metas;
+        self.thumbnails = (0..self.items.len())
+            .map(|_| crate::grid_item::ThumbnailState::Pending)
+            .collect();
+        self.selected = None;
+        self.checked.clear();
+        self.requested.clear();
+        self.pending_finalize.clear();
+        self.keep_range = (0, 0);
+        // 旧 items 参照の値は意味を失うので metadata / exif / xmp / rotation / rating
+        // のキャッシュもリセットする (idx ベース)。
+        self.metadata_cache.clear();
+        self.exif_cache.clear();
+        self.xmp_cache.clear();
+        self.rotation_cache.clear();
+        self.rating_cache.clear();
+        // Codex P2-1: Ctrl+F フィルタの残留を解除
+        self.search_filter = None;
+        self.search_query.clear();
+        self.scroll_offset_y = 0.0;
+        self.scroll_to_selected = false;
+        self.scroll_hint
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.rebuild_visible_indices();
+    }
+
     /// Ctrl+G を押したときのエントリ (open or close toggle)。
     pub(crate) fn toggle_global_search(&mut self) {
         if self.global_search.active {
@@ -330,12 +565,7 @@ impl App {
                 Some(t) => t.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS),
             };
             if should_resort || self.global_search.done {
-                // DrilledInto の間は実フォルダが load_folder 済みなので Aggregated view の
-                // items を上書きしない。containers / all_hits への accumulate だけ継続し、
-                // drill_back_to_aggregated で呼び出されたときに反映する。
-                if matches!(self.global_search.view, GlobalSearchView::Aggregated) {
-                    self.rebuild_items_from_global_search();
-                }
+                self.rebuild_items_from_global_search();
                 self.global_search.last_sort_at = Some(Instant::now());
             }
         }
@@ -345,59 +575,53 @@ impl App {
         }
     }
 
-    /// Aggregated view の items を SearchContainer セルで組み直す。
+    /// 現在の view に応じて items を組み立て、軽量 helper で差し替える。
     ///
-    /// DrilledInto state では呼ばれない (drill-in は `load_folder` で実物のフォルダを
-    /// 開く方式に変更済み, docs §10.3)。
-    ///
-    /// `start_loading_items` 経由で搬入するのは以下の理由:
-    /// - image_metas が items と同じ長さで詰まる (push_grid_item_pending 単体では同期しない)
-    /// - requested / checked / search_filter / metadata_cache 等を一括クリア (Codex P2 指摘)
-    /// - visible_indices 再計算 + prewarm_rating_cache も起動時と同じ契約で走る
+    /// Codex P2 指摘対応: フォルダ切替フルコース (catalog open / worker spawn /
+    /// sidecar flush / settings save 等) は走らせず、items / image_metas /
+    /// thumbnails / visible_indices と、Codex P2-1/P2-2 で指摘された
+    /// search_filter / checked を整合させるだけに留める。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
-        // Aggregated 以外で呼ばれるのは想定外 (DrilledInto 中は実フォルダ load 済みなので
-        // rebuild する対象はない)。呼び出し元はすべて view=Aggregated を確定させてから呼ぶ。
-        debug_assert!(matches!(
-            self.global_search.view,
-            GlobalSearchView::Aggregated
-        ));
-
-        let containers = sorted_containers(&self.global_search.containers);
-        let items: Vec<GridItem> = containers
-            .iter()
-            .map(|c| GridItem::SearchContainer {
-                path: c.path.clone(),
-                kind: c.kind,
-                hit_count: c.hit_count,
-            })
-            .collect();
-        // SearchContainer はサムネイル不要 (make_load_request で None) なので
-        // image_metas は None の並びでよい。ただし長さは items と一致させる。
-        let image_metas: Vec<Option<(i64, i64)>> = vec![None; items.len()];
-
-        let synthetic = crate::app::search_results_synthetic_path();
-        // Ctrl+G 結果リストは catalog 管理対象外なので existing_keys は空で OK。
-        self.start_loading_items(
-            synthetic,
-            items,
-            image_metas,
-            std::collections::HashSet::new(),
-            Vec::new(),
-        );
+        let (items, image_metas) = match self.global_search.view.clone() {
+            GlobalSearchView::Aggregated => build_aggregated_items(&self.global_search),
+            GlobalSearchView::DrilledInto {
+                ref current_path,
+                is_zip,
+                ..
+            } => build_drilled_items(&self.global_search, current_path, is_zip),
+        };
+        self.replace_search_view_items(items, image_metas);
         self.update_global_search_address();
     }
 
-    /// SearchContainer をダブルクリックしたときの遷移。実際のフォルダ / ZIP を開いて
-    /// 通常のグリッド操作にそのまま乗せる (Ctrl+S の検索結果クリックと同じ UX)。
+    /// SearchContainer をダブルクリックしたときの遷移。
+    /// 絞り込みビューに切り替える (docs §10.3 [3] 絞り込みビュー)。
+    /// 実フォルダ全体ではなく「検索にヒットしたものだけ (+ ヒットを含む子フォルダ)」
+    /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
         self.global_search.view = GlobalSearchView::DrilledInto {
-            container: container.clone(),
+            container_root: container.clone(),
+            current_path: container,
             is_zip,
         };
-        if is_zip {
-            self.load_zip_as_folder(container);
-        } else {
-            self.load_folder(container);
+        self.rebuild_items_from_global_search();
+    }
+
+    /// 絞り込みビューで子フォルダのセルをクリックしたとき、そのフォルダに潜る。
+    /// container_root と is_zip は不変、current_path だけ更新する。
+    pub(crate) fn drill_into_subfolder(&mut self, sub_path: PathBuf) {
+        if let GlobalSearchView::DrilledInto {
+            container_root,
+            is_zip,
+            ..
+        } = self.global_search.view.clone()
+        {
+            self.global_search.view = GlobalSearchView::DrilledInto {
+                container_root,
+                current_path: sub_path,
+                is_zip,
+            };
+            self.rebuild_items_from_global_search();
         }
     }
 
@@ -407,14 +631,79 @@ impl App {
         self.rebuild_items_from_global_search();
     }
 
-    /// Ctrl+G アドレスバー表示を現在の view に合わせて更新する。
-    /// - Aggregated: `🌐 全検索: "query" (N 件)`
-    /// - DrilledInto: 既に load_folder が普通のパスをセット済みなので何もしない
-    pub(crate) fn update_global_search_address(&mut self) {
-        if !self.global_search.active {
+    /// BS キー (または drill-back ボタン) が押されたときの「一段戻る」処理。
+    /// - current_path == container_root: Aggregated ビューに戻る
+    /// - container_root の下に居る: 親フォルダに戻る
+    pub(crate) fn drill_back_one_level(&mut self) {
+        if let GlobalSearchView::DrilledInto {
+            container_root,
+            current_path,
+            is_zip,
+        } = self.global_search.view.clone()
+        {
+            if current_path == container_root {
+                self.drill_back_to_aggregated();
+            } else if let Some(parent) = current_path.parent() {
+                let parent_pb = parent.to_path_buf();
+                // container_root 外へは出さない (出るなら Aggregated に戻る)
+                if parent_pb.starts_with(&container_root) {
+                    self.global_search.view = GlobalSearchView::DrilledInto {
+                        container_root,
+                        current_path: parent_pb,
+                        is_zip,
+                    };
+                    self.rebuild_items_from_global_search();
+                } else {
+                    self.drill_back_to_aggregated();
+                }
+            } else {
+                self.drill_back_to_aggregated();
+            }
+        }
+    }
+
+    /// Ctrl+↑↓: 絞り込みビューでヒットを含むフォルダを DFS 順で前後に移動する。
+    /// - forward=true: 次のフォルダ
+    /// - forward=false: 前のフォルダ
+    /// 見つからなければ何もしない (現在地維持)。
+    pub(crate) fn global_search_ctrl_nav(&mut self, forward: bool) {
+        let (container_root, current_path, is_zip) = match self.global_search.view.clone() {
+            GlobalSearchView::DrilledInto {
+                container_root,
+                current_path,
+                is_zip,
+            } => (container_root, current_path, is_zip),
+            _ => return,
+        };
+        if is_zip {
+            // ZIP 内部の DFS ナビゲーションは v0.8.0 では未対応
             return;
         }
-        if !matches!(self.global_search.view, GlobalSearchView::Aggregated) {
+        let ordered = collect_hit_folders_dfs(&self.global_search.all_hits, &container_root);
+        let Some(pos) = ordered.iter().position(|p| p == &current_path) else {
+            return;
+        };
+        let next_pos = if forward {
+            if pos + 1 < ordered.len() { pos + 1 } else { return }
+        } else if pos > 0 {
+            pos - 1
+        } else {
+            return;
+        };
+        let next_path = ordered[next_pos].clone();
+        self.global_search.view = GlobalSearchView::DrilledInto {
+            container_root,
+            current_path: next_path,
+            is_zip,
+        };
+        self.rebuild_items_from_global_search();
+    }
+
+    /// Ctrl+G アドレスバー表示を現在の view に合わせて更新する。
+    /// - Aggregated: `🌐 全検索: "query" (N 件)`
+    /// - DrilledInto: `🌐 全検索: "query" > container_name > sub_path...`
+    pub(crate) fn update_global_search_address(&mut self) {
+        if !self.global_search.active {
             return;
         }
         let query = if self.global_search.last_executed.is_empty() {
@@ -422,11 +711,42 @@ impl App {
         } else {
             self.global_search.last_executed.clone()
         };
-        let n = self.global_search.containers.len();
-        if query.is_empty() {
-            self.address = "🌐 全検索".to_string();
-        } else {
-            self.address = format!("🌐 全検索: \"{query}\"  ({n} 件)");
+        match self.global_search.view.clone() {
+            GlobalSearchView::Aggregated => {
+                let n = self.global_search.containers.len();
+                if query.is_empty() {
+                    self.address = "🌐 全検索".to_string();
+                } else {
+                    self.address = format!("🌐 全検索: \"{query}\"  ({n} 件)");
+                }
+            }
+            GlobalSearchView::DrilledInto {
+                container_root,
+                current_path,
+                ..
+            } => {
+                // container_root までを 1 セグメントで、その下の相対パスを分解して >表示
+                let root_name = container_root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| container_root.to_string_lossy().to_string());
+                let rel: Vec<String> = if current_path == container_root {
+                    Vec::new()
+                } else {
+                    current_path
+                        .strip_prefix(&container_root)
+                        .map(|rel| {
+                            rel.components()
+                                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let mut segs = vec![root_name];
+                segs.extend(rel);
+                self.address = format!("🌐 全検索: \"{query}\" > {}", segs.join(" > "));
+            }
         }
     }
 
@@ -445,19 +765,19 @@ impl App {
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                // drill-down 中は「← 戻る」ボタン + 現在のコンテナ表示
-                if let GlobalSearchView::DrilledInto { container, .. } =
+                // 絞り込みビュー中は「← 戻る」ボタン + 現在地を表示
+                if let GlobalSearchView::DrilledInto { current_path, .. } =
                     self.global_search.view.clone()
                 {
                     if ui
                         .button("←")
-                        .on_hover_text("検索結果一覧に戻る (BS でも可)")
+                        .on_hover_text("1 段戻る (BS でも可)")
                         .clicked()
                     {
                         drill_back = true;
                     }
                     ui.label(
-                        egui::RichText::new(format!("📁 {}", container.display()))
+                        egui::RichText::new(format!("📁 {}", current_path.display()))
                             .size(11.0)
                             .color(egui::Color32::from_gray(150)),
                     );
@@ -530,12 +850,24 @@ impl App {
             return;
         }
         if drill_back {
-            self.drill_back_to_aggregated();
+            // ボタン押下は「1 段上げる」で統一 (BS と同じ UX)。
+            self.drill_back_one_level();
         }
         if query_changed {
             self.global_search.last_change_at = Some(Instant::now());
-            // クエリが変わったら drill state もリセット (sorted_containers 側で処理)
+            // Codex P3 対応: クエリが変わったら drill state を即 Aggregated に戻し、
+            // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
+            // Aggregated view として rebuild する (debounce 完了までの間、旧結果で
+            // drill-back 判定が残ったり、旧クエリでの rebuild race が起きないように)。
             self.global_search.view = GlobalSearchView::Aggregated;
+            self.global_search.pending = None; // SearchHandle::Drop で cancel
+            self.global_search.containers.clear();
+            self.global_search.all_hits.clear();
+            self.global_search.done = false;
+            self.global_search.truncated = false;
+            self.global_search.total_valid = 0;
+            self.global_search.total_scanned = 0;
+            self.rebuild_items_from_global_search();
         }
     }
 }
@@ -623,7 +955,8 @@ mod tests {
         let mut state = GlobalSearchState::default();
         assert_eq!(state.view, GlobalSearchView::Aggregated);
         state.view = GlobalSearchView::DrilledInto {
-            container: PathBuf::from("c:/photos"),
+            container_root: PathBuf::from("c:/photos"),
+            current_path: PathBuf::from("c:/photos"),
             is_zip: false,
         };
         assert!(matches!(state.view, GlobalSearchView::DrilledInto { .. }));
@@ -642,7 +975,8 @@ mod tests {
             score: 1.0,
         });
         state.view = GlobalSearchView::DrilledInto {
-            container: PathBuf::from("c:/a"),
+            container_root: PathBuf::from("c:/a"),
+            current_path: PathBuf::from("c:/a"),
             is_zip: false,
         };
         state.done = true;
@@ -704,5 +1038,69 @@ mod tests {
         let folder = state.containers.get(&PathBuf::from("c:/photos")).unwrap();
         assert_eq!(folder.hit_count, 1);
         assert_eq!(folder.kind, SearchContainerKind::Folder);
+    }
+
+    // ヒット: C:/root/a.jpg, C:/root/sub/b.jpg, C:/root/sub/deeper/c.jpg
+    // ドリルルート: C:/root → DFS 順列は [root, sub, sub/deeper]。
+    #[test]
+    fn collect_hit_folders_dfs_is_preorder() {
+        let hits = vec![
+            GlobalHit { path: "C:/root/a.jpg".into(), score: 1.0 },
+            GlobalHit { path: "C:/root/sub/b.jpg".into(), score: 1.0 },
+            GlobalHit { path: "C:/root/sub/deeper/c.jpg".into(), score: 1.0 },
+        ];
+        let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("C:/root"),
+                PathBuf::from("C:/root/sub"),
+                PathBuf::from("C:/root/sub/deeper"),
+            ]
+        );
+    }
+
+    // 同階層 2 兄弟のうち片方にしかヒットがない場合、枝刈りされる。
+    #[test]
+    fn collect_hit_folders_dfs_prunes_empty_branches() {
+        let hits = vec![GlobalHit {
+            path: "C:/root/yes/found.jpg".into(),
+            score: 1.0,
+        }];
+        let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
+        // "no" サブフォルダはヒットを持たないので列挙されない
+        assert_eq!(
+            got,
+            vec![PathBuf::from("C:/root"), PathBuf::from("C:/root/yes")]
+        );
+    }
+
+    // build_drilled_items: current_path に直接ヒット + ヒット持ちサブを Folder として
+    // 並べる。current_path と異なる兄弟 (別 container) のヒットは無視される。
+    #[test]
+    fn build_drilled_items_mixes_subfolders_and_direct_files() {
+        let mut state = GlobalSearchState::default();
+        for p in [
+            "C:/root/a.jpg",
+            "C:/root/b.jpg",
+            "C:/root/sub/c.jpg",
+            "C:/other/z.jpg", // 別ツリー, current_path 配下ではない
+        ] {
+            state.accumulate_hit(&GlobalHit { path: p.into(), score: 1.0 });
+        }
+        let (items, metas) = build_drilled_items(&state, Path::new("C:/root"), false);
+        assert_eq!(items.len(), metas.len());
+        // 期待: Folder("C:/root/sub") + Image("C:/root/a.jpg") + Image("C:/root/b.jpg")
+        let paths: Vec<_> = items
+            .iter()
+            .map(|it| match it {
+                GridItem::Folder(p) => ("Folder", p.clone()),
+                GridItem::Image(p) => ("Image", p.clone()),
+                _ => ("Other", PathBuf::new()),
+            })
+            .collect();
+        assert_eq!(paths[0], ("Folder", PathBuf::from("C:/root/sub")));
+        assert_eq!(paths[1], ("Image", PathBuf::from("C:/root/a.jpg")));
+        assert_eq!(paths[2], ("Image", PathBuf::from("C:/root/b.jpg")));
     }
 }

@@ -792,9 +792,22 @@ impl App {
         }
         if response.double_clicked() {
             match self.items.get(idx) {
-                Some(GridItem::Folder(p))
-                | Some(GridItem::ZipFile(p))
-                | Some(GridItem::PdfFile(p)) => {
+                Some(GridItem::Folder(p)) => {
+                    // Ctrl+G 絞り込みビューでは「ヒットを含む子フォルダ」を Folder として
+                    // 並べているので、通常の load_folder ではなく絞り込みをさらに 1 段潜る
+                    // 経路に流す (docs §10.3 [3] 絞り込みビュー)。
+                    if self.global_search.active
+                        && matches!(
+                            self.global_search.view,
+                            crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+                        )
+                    {
+                        self.drill_into_subfolder(p.clone());
+                    } else {
+                        nav = Some(p.clone())
+                    }
+                }
+                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
                     nav = Some(p.clone())
                 }
                 Some(GridItem::Image(_))
