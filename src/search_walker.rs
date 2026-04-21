@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::folder_tree;
 use crate::fts_meta::FtsMetaDb;
+use crate::indexer_progress::ProgressReporter;
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_index_db::normalize_path;
 
@@ -85,6 +86,9 @@ pub struct ScanParams {
     pub favorite_id: Uuid,
     pub root: PathBuf,
     pub cancel: Arc<AtomicBool>,
+    /// "今どこを walk してる" を UI に見せるためのレポーター。
+    /// None なら通知しない (テスト等で便利)。
+    pub progress: Option<ProgressReporter>,
 }
 
 /// 進捗通知 (UI への stream)。Walker は I/O-bound なので頻繁に通知しすぎないこと。
@@ -116,12 +120,22 @@ pub fn scan(
         favorite_id,
         root,
         cancel,
+        progress,
     } = params;
 
     // 1. FS を walk して候補を集める
     let mut fs_map = std::collections::HashMap::<String, CandidateFile>::new();
     let mut diag = ScanDiag::default();
-    walk_dir_recursive(&root, io_sem, priority, &cancel, &mut fs_map, &mut diag, 0)?;
+    walk_dir_recursive(
+        &root,
+        io_sem,
+        priority,
+        &cancel,
+        progress.as_ref(),
+        &mut fs_map,
+        &mut diag,
+        0,
+    )?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -165,11 +179,13 @@ pub fn scan(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_dir_recursive(
     dir: &Path,
     io_sem: &GlobalIoSemaphore,
     priority: IoPriority,
     cancel: &AtomicBool,
+    progress: Option<&ProgressReporter>,
     out: &mut std::collections::HashMap<String, CandidateFile>,
     diag: &mut ScanDiag,
     depth: u32,
@@ -182,6 +198,11 @@ fn walk_dir_recursive(
     if depth > MAX_DEPTH {
         diag.depth_limit_hits += 1;
         return Ok(());
+    }
+
+    // このディレクトリに入る時点で UI に通知 (1 ディレクトリ 1 回なので mutex 競合は軽微)
+    if let Some(p) = progress {
+        p.set(format!("スキャン: {} ({} 件)", dir.display(), out.len()));
     }
 
     let _permit = io_sem.acquire(priority);
@@ -272,7 +293,9 @@ fn walk_dir_recursive(
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        walk_dir_recursive(&sub, io_sem, priority, cancel, out, diag, depth + 1)?;
+        walk_dir_recursive(
+            &sub, io_sem, priority, cancel, progress, out, diag, depth + 1,
+        )?;
     }
     Ok(())
 }
@@ -306,6 +329,7 @@ mod tests {
                 favorite_id: fav_id,
                 root: root.to_path_buf(),
                 cancel,
+                progress: None,
             },
             db,
             &sem,
@@ -500,6 +524,7 @@ mod tests {
                 favorite_id: fav,
                 root,
                 cancel,
+                progress: None,
             },
             &db,
             &sem,
@@ -529,6 +554,7 @@ mod tests {
                 favorite_id: fav,
                 root: root.clone(),
                 cancel,
+                progress: None,
             },
             &db,
             &sem,

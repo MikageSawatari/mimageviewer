@@ -39,6 +39,7 @@ use uuid::Uuid;
 
 use crate::fts_index::{self, Container, FtsIndex, IndexDoc};
 use crate::fts_meta::FtsMetaDb;
+use crate::indexer_progress::ProgressReporter;
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_walker::{CandidateFile, CandidateKind};
 
@@ -95,6 +96,7 @@ impl<'a> IngestSession<'a> {
     /// - `to_delete` の各 path について、fts_meta.mark_tombstone → Tantivy delete_doc
     /// - バッチ境界 (BATCH_FLUSH_COUNT 件 or BATCH_FLUSH_INTERVAL) で
     ///   writer.commit() → fts_meta.mark_ok / purge_tombstone
+    #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         to_ingest: Vec<CandidateFile>,
@@ -103,6 +105,7 @@ impl<'a> IngestSession<'a> {
         io_sem: &GlobalIoSemaphore,
         priority: IoPriority,
         cancel: &AtomicBool,
+        progress: Option<&ProgressReporter>,
     ) -> tantivy::Result<IngestStats> {
         let mut stats = IngestStats::default();
         let fields = self.fts.fields();
@@ -112,14 +115,19 @@ impl<'a> IngestSession<'a> {
         // tombstone 中のパス (commit 後に purge する)
         let mut tombstone_paths: Vec<String> = Vec::new();
         let mut last_flush = Instant::now();
+        let ingest_total = to_ingest.len();
+        let delete_total = to_delete.len();
 
         // === 1. 削除フェーズ ===
         // stats.deleted は **実際に tombstone 化 + Tantivy delete を push したもの** のみカウント
         // (Codex 6 回目指摘 nice-to-have #1)。mark_tombstone 失敗や cancel で処理されなかった分は数えない。
-        for path in &to_delete {
+        for (i, path) in to_delete.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 stats.cancelled = true;
                 break;
+            }
+            if let Some(p) = progress {
+                p.set(format!("削除: {} ({}/{})", path, i + 1, delete_total));
             }
             // fts_meta: tombstone 化
             if let Err(e) = self.meta_db.mark_tombstone(&[path.clone()]) {
@@ -143,10 +151,18 @@ impl<'a> IngestSession<'a> {
         }
 
         // === 2. Ingest フェーズ ===
-        for cand in to_ingest {
+        for (i, cand) in to_ingest.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 stats.cancelled = true;
                 break;
+            }
+            if let Some(p) = progress {
+                let name = cand
+                    .abs_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| cand.abs_path.display().to_string());
+                p.set(format!("取込: {} ({}/{})", name, i + 1, ingest_total));
             }
 
             // Ingest 対象の種類で分岐。v1 スコープ: Image のみ詳細メタ抽出、
@@ -438,7 +454,15 @@ mod tests {
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
         let stats = session
-            .apply(vec![], vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                vec![],
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
             .unwrap();
         assert_eq!(stats.ingested_ok, 0);
         assert_eq!(stats.deleted, 0);
@@ -464,6 +488,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
         assert_eq!(stats.ingested_ok, 1);
@@ -503,6 +528,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
         fts.reload_reader().unwrap();
@@ -517,6 +543,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
         assert_eq!(stats.deleted, 1);
@@ -551,6 +578,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
         assert_eq!(stats.ingested_ok, 1);
@@ -578,6 +606,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(stats.cancelled);
@@ -603,6 +632,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
 
@@ -617,6 +647,7 @@ mod tests {
                 &sem,
                 IoPriority::Low,
                 &cancel,
+                None,
             )
             .unwrap();
         let gen2 = meta.get(&key).unwrap().unwrap().index_generation;
@@ -696,7 +727,15 @@ mod tests {
             cands.push(make_image_file(tmp.path(), &format!("b{:03}.jpg", i)));
         }
         let stats = session
-            .apply(cands, vec![], &mut writer, &sem, IoPriority::Low, &cancel)
+            .apply(
+                cands,
+                vec![],
+                &mut writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
             .unwrap();
         assert_eq!(stats.ingested_ok, 130);
         // 全 ok になっている

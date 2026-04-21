@@ -17,6 +17,7 @@ pub mod global_search;
 // global_search_ui は App (main.rs 側 private module) に impl するため bin crate のみで公開する
 pub mod grid_item;
 pub mod indexer_manager;
+pub mod indexer_progress;
 pub mod indexer_supervisor;
 pub mod ingest_text;
 pub mod ingest_worker;

@@ -13,6 +13,8 @@
 //! 手動再構築・一括作成系の UI は v0.8.0 で外し、索引が壊れたときはプロセス再起動で
 //! 初期スキャンから作り直す運用にしている。
 
+use std::time::Duration;
+
 use eframe::egui;
 
 use crate::app::App;
@@ -262,6 +264,48 @@ impl App {
                             open_cache_creator = true;
                         }
                     });
+
+                    // ── バックグラウンドインデクサのライブ進捗 ──
+                    // 初期スキャン中 / ingest 中の supervisor の "今何してる" を
+                    // 1 行ずつ列挙する。完了済み or アイドル supervisor は出さない。
+                    // スキャン完了の瞬間に progress.clear() されるので、何も出ない=
+                    // 全インデクサがアイドルという意味。
+                    let active: Vec<(String, String)> = self
+                        .settings
+                        .favorites
+                        .iter()
+                        .filter_map(|fav| {
+                            stats_by_id
+                                .get(&fav.id)
+                                .and_then(|s| s.current_activity.as_ref())
+                                .map(|msg| (fav.name.clone(), msg.clone()))
+                        })
+                        .collect();
+                    if !active.is_empty() {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new("🔄 バックグラウンドインデクサ")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(200, 170, 60)),
+                        );
+                        for (name, msg) in &active {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  {}: {}",
+                                    name,
+                                    truncate_name(msg, 100)
+                                ))
+                                .size(11.0)
+                                .monospace()
+                                .color(egui::Color32::from_gray(150)),
+                            )
+                            .on_hover_text(format!("{name}: {msg}"));
+                        }
+                        // ライブ更新: 100ms ごとに再描画を要求して進捗を流す
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                    }
                 }
 
                 if escape_pressed {

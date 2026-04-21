@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use crate::fts_index::FtsIndex;
 use crate::fts_meta::FtsMetaDb;
+use crate::indexer_progress::ProgressReporter;
 use crate::ingest_worker::{IngestSession, IngestStats};
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_walker::{self, CandidateFile, ScanParams};
@@ -65,6 +66,10 @@ pub struct SupervisorStats {
     pub last_scan_total_scanned: usize,
     /// 直近のスキャン診断統計 (read_dir 失敗など)
     pub last_scan_diag: crate::search_walker::ScanDiag,
+    /// "今何してる" の短い説明 (UI のリアルタイム進捗表示用)。
+    /// walker / ingest_worker が ProgressReporter 経由で書き込み、snapshot 時に
+    /// 読み出される。scan 区間外は None。
+    pub current_activity: Option<String>,
 }
 
 /// UI → Supervisor へのコマンド。
@@ -81,13 +86,17 @@ pub struct SupervisorHandle {
     cmd_tx: Sender<SupervisorCommand>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
+    progress: ProgressReporter,
     thread: Option<JoinHandle<()>>,
 }
 
 impl SupervisorHandle {
-    /// スナップショット取得 (短時間のロック)。
+    /// スナップショット取得 (短時間のロック)。`current_activity` は ProgressReporter
+    /// 側から最新値を読み出して合成する (snapshot 時点のライブ状態)。
     pub fn snapshot_stats(&self) -> SupervisorStats {
-        self.stats.lock().unwrap().clone()
+        let mut s = self.stats.lock().unwrap().clone();
+        s.current_activity = self.progress.snapshot();
+        s
     }
 
     /// 完全再スキャン要求 (インデックス管理ダイアログの「今すぐ再構築」で使用)。
@@ -156,6 +165,7 @@ pub fn spawn(
 
     let cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(SupervisorStats::default()));
+    let progress = ProgressReporter::new();
     let (cmd_tx, cmd_rx) = bounded::<SupervisorCommand>(4);
     let (change_tx, change_rx) = crossbeam_channel::unbounded::<DebouncedChange>();
 
@@ -163,12 +173,22 @@ pub fn spawn(
     let root = params.favorite_root.clone();
     let cancel_cl = Arc::clone(&cancel);
     let stats_cl = Arc::clone(&stats);
+    let progress_cl = progress.clone();
 
     let thread = std::thread::Builder::new()
         .name(format!("indexer-{}", fav_id.as_simple()))
         .spawn(move || {
             supervisor_loop(
-                fav_id, root, meta_db, fts, io_sem, cancel_cl, stats_cl, cmd_rx, change_tx,
+                fav_id,
+                root,
+                meta_db,
+                fts,
+                io_sem,
+                cancel_cl,
+                stats_cl,
+                progress_cl,
+                cmd_rx,
+                change_tx,
                 change_rx,
             );
         })
@@ -179,6 +199,7 @@ pub fn spawn(
         cmd_tx,
         cancel,
         stats,
+        progress,
         thread: Some(thread),
     }
 }
@@ -193,6 +214,7 @@ fn supervisor_loop(
     io_sem: Arc<GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
+    progress: ProgressReporter,
     cmd_rx: Receiver<SupervisorCommand>,
     change_tx: Sender<DebouncedChange>,
     change_rx: Receiver<DebouncedChange>,
@@ -225,9 +247,12 @@ fn supervisor_loop(
         &io_sem,
         Arc::clone(&cancel),
         &stats,
+        &progress,
     );
     mark_activity(&stats);
     stats.lock().unwrap().initial_scan_done = true;
+    // スキャン完了後は "今の作業" を消す (UI が ⏳→✅ に切り替わるタイミング)
+    progress.clear();
 
     // 3. 以降は watcher イベント + cmd を select で受信するループ
     loop {
@@ -247,8 +272,10 @@ fn supervisor_loop(
                             &io_sem,
                             Arc::clone(&cancel),
                             &stats,
+                            &progress,
                         );
                         mark_activity(&stats);
+                        progress.clear();
                     }
                     Err(_) => break, // Sender dropped
                 }
@@ -274,8 +301,10 @@ fn supervisor_loop(
                                 &io_sem,
                                 Arc::clone(&cancel),
                                 &stats,
+                                &progress,
                             );
                             mark_activity(&stats);
+                            progress.clear();
                             continue;
                         }
                         apply_single_change(
@@ -284,10 +313,12 @@ fn supervisor_loop(
                             &io_sem,
                             &cancel,
                             &stats,
+                            &progress,
                             path,
                             kind,
                         );
                         mark_activity(&stats);
+                        progress.clear();
                     }
                     Err(_) => break, // watcher ended
                 }
@@ -302,6 +333,7 @@ fn supervisor_loop(
     drop(watcher); // 明示的に FsWatcher を drop
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_initial_scan(
     favorite_id: Uuid,
     favorite_root: &std::path::Path,
@@ -310,6 +342,7 @@ fn run_initial_scan(
     io_sem: &GlobalIoSemaphore,
     cancel: Arc<AtomicBool>,
     stats: &Mutex<SupervisorStats>,
+    progress: &ProgressReporter,
 ) {
     // 所要時間計測: walker + ingest を含むフル scan の時間を拾う
     // (初期スキャンは supervisor 起動後 1 度のみ "initial"、以降の FullRescan /
@@ -325,6 +358,7 @@ fn run_initial_scan(
             favorite_id,
             root: favorite_root.to_path_buf(),
             cancel: Arc::clone(&cancel),
+            progress: Some(progress.clone()),
         },
         session.meta_db,
         io_sem,
@@ -346,6 +380,7 @@ fn run_initial_scan(
         io_sem,
         IoPriority::Low,
         &cancel,
+        Some(progress),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -375,12 +410,14 @@ fn run_initial_scan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_single_change(
     session: &IngestSession,
     writer: &mut tantivy::IndexWriter,
     io_sem: &GlobalIoSemaphore,
     cancel: &AtomicBool,
     stats: &Mutex<SupervisorStats>,
+    progress: &ProgressReporter,
     path: PathBuf,
     kind: ChangeKind,
 ) {
@@ -396,6 +433,7 @@ fn apply_single_change(
                 io_sem,
                 IoPriority::Normal,
                 cancel,
+                Some(progress),
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -421,6 +459,7 @@ fn apply_single_change(
                 io_sem,
                 IoPriority::Normal,
                 cancel,
+                Some(progress),
             ) {
                 Ok(s) => s,
                 Err(e) => {

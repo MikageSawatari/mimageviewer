@@ -20,6 +20,7 @@ mod global_search_ui;
 pub mod gpu_info;
 pub mod grid_item;
 pub mod indexer_manager;
+pub mod indexer_progress;
 pub mod indexer_supervisor;
 pub mod ingest_text;
 pub mod ingest_worker;
