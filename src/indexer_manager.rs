@@ -85,6 +85,21 @@ pub struct IndexerManager {
     favorite_info: HashMap<Uuid, (String, std::path::PathBuf)>,
     /// reconciliation が進行中なら true (UI に "DB 初期化中" 表示用)
     pub reconciliation_in_progress: Arc<AtomicBool>,
+    /// 起動時 reconciliation の診断情報 (UI 表示用)
+    startup_diag: StartupDiag,
+}
+
+/// 起動時 reconciliation の統計スナップショット (UI 表示用)。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StartupDiag {
+    /// reconciliation に要した時間 (ms)
+    pub reconciliation_ms: u64,
+    /// Tantivy から delete した残留 pending/failed 行数
+    pub pending_cleaned: usize,
+    /// 削除マーク済みだった行の物理削除数
+    pub tombstone_purged: usize,
+    /// スピードプロファイル (io_permits 数) — 診断時に見たいので保存
+    pub io_permits: usize,
 }
 
 impl IndexerManager {
@@ -128,14 +143,18 @@ impl IndexerManager {
         // supervisor が走る前に status != ok の残留行を整理することで、
         // Tantivy writer の競合も DB 上の race もなくなる。
         let t_recon = std::time::Instant::now();
-        if let Err(e) = run_reconciliation(&meta_db, &fts, favorites) {
-            crate::logger::log(format!(
-                "IndexerManager: reconciliation failed (continuing anyway): {e}"
-            ));
-        }
+        let report = match run_reconciliation(&meta_db, &fts, favorites) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::logger::log(format!(
+                    "IndexerManager: reconciliation failed (continuing anyway): {e}"
+                ));
+                ReconciliationReport::default()
+            }
+        };
+        let reconciliation_ms = t_recon.elapsed().as_millis() as u64;
         crate::logger::log(format!(
-            "IndexerManager: reconciliation completed in {} ms",
-            t_recon.elapsed().as_millis()
+            "IndexerManager: reconciliation completed in {reconciliation_ms} ms"
         ));
 
         let mut mgr = IndexerManager {
@@ -145,6 +164,12 @@ impl IndexerManager {
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_diag: StartupDiag {
+                reconciliation_ms,
+                pending_cleaned: report.pending_cleaned,
+                tombstone_purged: report.tombstone_purged,
+                io_permits: permits,
+            },
         };
         // reconciliation 完了後に supervisor 群を起動 (writer 競合なし)
         mgr.sync_with_favorites(favorites);
@@ -304,6 +329,11 @@ impl IndexerManager {
     pub fn is_reconciling(&self) -> bool {
         self.reconciliation_in_progress
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 起動時 reconciliation の結果 (UI 診断表示用)。
+    pub fn startup_diag(&self) -> StartupDiag {
+        self.startup_diag
     }
 }
 
@@ -617,6 +647,7 @@ mod tests {
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_diag: StartupDiag::default(),
         };
 
         let mut fav = mk_fav("A", &root_old, true);

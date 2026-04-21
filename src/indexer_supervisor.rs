@@ -33,8 +33,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_channel::{bounded, select, Receiver, Sender};
 use uuid::Uuid;
@@ -43,7 +44,7 @@ use crate::fts_index::FtsIndex;
 use crate::fts_meta::FtsMetaDb;
 use crate::ingest_worker::{IngestSession, IngestStats};
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
-use crate::search_walker::{self, CandidateFile, ScanParams, ScanResult};
+use crate::search_walker::{self, CandidateFile, ScanParams};
 use crate::search_watcher::{ChangeKind, DebouncedChange, FsWatcher, OVERFLOW_MARKER_PATH};
 
 /// Supervisor が UI に返す進捗・状態スナップショット。
@@ -56,6 +57,14 @@ pub struct SupervisorStats {
     /// 最後のアクティビティから経過した時間 (インデックス管理ダイアログの "アイドル" 表示用)
     pub last_activity_ms_ago: Option<u64>,
     pub overflowed: bool,
+    /// 初期スキャンの所要時間 (初回のみ記録, 以降の手動再構築では更新しない)
+    pub initial_scan_duration_ms: Option<u64>,
+    /// 直近のフル再スキャン所要時間 (initial_scan 含む, 更新あり)
+    pub last_scan_duration_ms: Option<u64>,
+    /// 直近のスキャンで走査された候補ファイル総数
+    pub last_scan_total_scanned: usize,
+    /// 直近のスキャン診断統計 (read_dir 失敗など)
+    pub last_scan_diag: crate::search_walker::ScanDiag,
 }
 
 /// UI → Supervisor へのコマンド。
@@ -312,6 +321,12 @@ fn run_initial_scan(
     cancel: Arc<AtomicBool>,
     stats: &Mutex<SupervisorStats>,
 ) {
+    // 所要時間計測: walker + ingest を含むフル scan の時間を拾う
+    // (初期スキャンは supervisor 起動後 1 度のみ "initial"、以降の FullRescan /
+    //  watcher overflow は last_scan_duration_ms のみ更新する)。
+    let is_initial = !stats.lock().unwrap().initial_scan_done;
+    let t_start = Instant::now();
+
     // walker にも supervisor と同じ Arc<AtomicBool> を渡す (Codex 6 回目指摘 #4)。
     // 旧実装は `Arc::new(AtomicBool::new(cancel.load()))` でスナップショットを渡しており、
     // 長時間 walk 中に SupervisorHandle::drop() が cancel を立てても伝わらなかった。
@@ -333,7 +348,8 @@ fn run_initial_scan(
             return;
         }
     };
-    let scan_result_copy = ScanResultDigest::from(&scan);
+    let total_scanned = scan.total_scanned;
+    let diag = scan.diag;
     // ingest_worker 側は `&AtomicBool` を取るのでここで unwrap
     let ingest_stats = match session.apply(
         scan.to_ingest,
@@ -351,8 +367,26 @@ fn run_initial_scan(
             return;
         }
     };
-    let _ = scan_result_copy; // stats 拡張時に使う余地を残す
+    let dur_ms = t_start.elapsed().as_millis() as u64;
+    crate::logger::log(format!(
+        "indexer[{favorite_id}]: {} scan done in {dur_ms} ms \
+         (scanned={total_scanned}, read_dir_err={}, file_type_err={}, metadata_err={}, depth_hits={})",
+        if is_initial { "initial" } else { "rescan" },
+        diag.read_dir_errors,
+        diag.file_type_errors,
+        diag.metadata_errors,
+        diag.depth_limit_hits,
+    ));
     update_stats(stats, &ingest_stats);
+    {
+        let mut s = stats.lock().unwrap();
+        s.last_scan_duration_ms = Some(dur_ms);
+        s.last_scan_total_scanned = total_scanned;
+        s.last_scan_diag = diag;
+        if is_initial {
+            s.initial_scan_duration_ms = Some(dur_ms);
+        }
+    }
 }
 
 fn apply_single_change(
@@ -470,21 +504,6 @@ fn mark_activity(stats: &Mutex<SupervisorStats>) {
     lock.last_activity_ms_ago = Some(0);
 }
 
-/// 将来の拡張用ヘルパー (scan 結果のダイジェスト保持)。
-struct ScanResultDigest {
-    #[allow(dead_code)]
-    total_scanned: usize,
-    #[allow(dead_code)]
-    unchanged: usize,
-}
-impl From<&ScanResult> for ScanResultDigest {
-    fn from(r: &ScanResult) -> Self {
-        Self {
-            total_scanned: r.total_scanned,
-            unchanged: r.unchanged,
-        }
-    }
-}
 
 // -----------------------------------------------------------------------
 // tests

@@ -39,6 +39,10 @@ impl App {
             .indexer_manager
             .as_ref()
             .is_some_and(|m| m.is_reconciling());
+        let startup_diag = self
+            .indexer_manager
+            .as_ref()
+            .map(|m| m.startup_diag());
         let mut stats_list = self
             .indexer_manager
             .as_ref()
@@ -88,6 +92,55 @@ impl App {
                     ui.add_space(4.0);
                 }
 
+                // 起動時診断セクション (reconciliation のコストが分かる)
+                if let Some(diag) = startup_diag {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("🚀 起動時の整合性チェック:")
+                                    .strong()
+                                    .size(11.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{} ms", diag.reconciliation_ms))
+                                    .monospace()
+                                    .size(11.0),
+                            )
+                            .on_hover_text(
+                                "起動直後に走る reconciliation の所要時間。\n\
+                                 Tantivy writer 競合を避けるため同期実行。通常 < 100ms。",
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "pending 整理 {} / tombstone 消去 {}",
+                                    diag.pending_cleaned, diag.tombstone_purged
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(150)),
+                            )
+                            .on_hover_text(
+                                "前回異常終了などで status != ok で残った行を整理した件数。\n\
+                                 通常はどちらも 0 件。",
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "I/O 並列度: {}",
+                                    diag.io_permits
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(150)),
+                            )
+                            .on_hover_text(
+                                "環境設定「インデクサの速度プロファイル」で変更可。\n\
+                                 1=省電力 / 2=標準 / 4=高速",
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+
                 ui.label(
                     egui::RichText::new(
                         "お気に入り単位で自動インデックスの状態を確認・再構築できます。\n\
@@ -116,7 +169,7 @@ impl App {
                     .show(ui, |ui| {
                         egui::Grid::new("idx_mgr_grid")
                             .striped(true)
-                            .num_columns(6)
+                            .num_columns(7)
                             .spacing([10.0, 4.0])
                             .show(ui, |ui| {
                                 // ヘッダ
@@ -125,6 +178,12 @@ impl App {
                                 ui.label(egui::RichText::new("状態").strong())
                                     .on_hover_text(
                                         "初期スキャン完了 = ✅ / 未完了 = ⏳",
+                                    );
+                                ui.label(egui::RichText::new("スキャン").strong())
+                                    .on_hover_text(
+                                        "最新スキャンの所要時間 / 走査ファイル数。\n\
+                                         初期スキャンに加えて手動再構築・watcher overflow\n\
+                                         による全再走査の値も反映される。",
                                     );
                                 ui.label(egui::RichText::new("取込").strong())
                                     .on_hover_text(
@@ -163,6 +222,52 @@ impl App {
                                                 .color(egui::Color32::from_rgb(200, 170, 60)),
                                         );
                                     }
+                                    // スキャン時間 (直近): 走査数と所要時間、およびエラー診断
+                                    let scan_text = match v.stats.last_scan_duration_ms {
+                                        Some(ms) => format!(
+                                            "{} ms / {} 件",
+                                            ms, v.stats.last_scan_total_scanned
+                                        ),
+                                        None => "—".to_string(),
+                                    };
+                                    let diag = &v.stats.last_scan_diag;
+                                    let has_errors = diag.read_dir_errors > 0
+                                        || diag.file_type_errors > 0
+                                        || diag.metadata_errors > 0
+                                        || diag.depth_limit_hits > 0;
+                                    let scan_color = if has_errors {
+                                        egui::Color32::from_rgb(200, 120, 60)
+                                    } else {
+                                        egui::Color32::from_gray(160)
+                                    };
+                                    let mut hover = format!(
+                                        "直近スキャン: {} ms\n走査ファイル数: {}",
+                                        v.stats.last_scan_duration_ms.unwrap_or(0),
+                                        v.stats.last_scan_total_scanned,
+                                    );
+                                    if let Some(init_ms) = v.stats.initial_scan_duration_ms {
+                                        hover
+                                            .push_str(&format!("\n初期スキャン: {init_ms} ms"));
+                                    }
+                                    if has_errors {
+                                        hover.push_str(&format!(
+                                            "\n\nエラー診断:\n\
+                                             \u{3000}read_dir 失敗: {}\n\
+                                             \u{3000}file_type 失敗: {}\n\
+                                             \u{3000}metadata 失敗: {}\n\
+                                             \u{3000}深さ上限到達: {}",
+                                            diag.read_dir_errors,
+                                            diag.file_type_errors,
+                                            diag.metadata_errors,
+                                            diag.depth_limit_hits,
+                                        ));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(scan_text)
+                                            .size(11.0)
+                                            .color(scan_color),
+                                    )
+                                    .on_hover_text(hover);
                                     // 取込
                                     let ingest_text = if v.stats.ingested_failed > 0 {
                                         format!(
