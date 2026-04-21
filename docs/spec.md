@@ -30,7 +30,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 
 | メニュー | 項目 |
 |---------|------|
-| ファイル | フォルダを開く… (Ctrl+O) / メタデータ検索… (Ctrl+F) / 終了 |
+| ファイル | フォルダを開く… (Ctrl+O) / メタデータ検索… (Ctrl+F) / グローバルメタ検索… (Ctrl+G) / 終了 |
 | お気に入り | このフォルダを追加… / 編集 / 検索…(Ctrl+S) / インデックス作成 / キャッシュ作成 / [登録済みフォルダ一覧] |
 | 設定 | サムネイル列数 / 比率 / ソート順 / キャッシュ管理… / サムネイル画質… / 統計… / 回転情報をリセット… / 環境設定… |
 
@@ -213,7 +213,8 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | Ctrl + C | 選択画像をクリップボードにコピー |
 | Ctrl + X | 選択画像をクリップボードにカット |
 | Ctrl + V | クリップボードのファイルを現在のフォルダにペースト |
-| Ctrl + F | メタデータ検索バーを表示 |
+| Ctrl + F | ローカルメタデータ検索バーを表示 (現在表示中の一覧のみ) |
+| Ctrl + G | グローバルメタデータ検索バーを表示 (お気に入り全体、Tantivy 全文検索) |
 | Ctrl + O | フォルダを開くダイアログ（無効なパスはエラー表示） |
 | Ctrl + ↑ | フォルダツリーで前のフォルダへ |
 | Ctrl + ↓ | フォルダツリーで次のフォルダへ |
@@ -268,7 +269,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16） |
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
-| `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ（名前付き） |
+| `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
 | `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ |
 
 ### 8.2 キャッシュ設定
@@ -324,9 +325,9 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | `skip_duplicate_images` | bool | true | 同名で複数拡張子がある画像を優先度でフィルタ |
 | `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先） |
 
-#### 検索クエリ構文（Ctrl+F メタデータ検索 / Ctrl+S お気に入り検索 共通）
+#### 検索クエリ構文（Ctrl+F / Ctrl+G / Ctrl+S 共通）
 
-パースは `src/search_query.rs` の `parse()` / `matches_lower()`。
+パースは `src/search_query.rs` の `parse()` / `matches()`。
 
 | 書き方 | 意味 |
 |--------|------|
@@ -338,6 +339,27 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 - 大文字小文字は区別しない
 - 閉じクォート `"` がない場合は行末までを 1 トークンとして扱う（寛容パース）
 - `-` 単体や末尾にある `-` はノイズとして無視する（`jean-claude` のような語内 `-` は通常の文字として扱う）
+
+#### 最小クエリ長ポリシー (Ctrl+G のみ適用、v0.8.0)
+
+Tantivy bigram インデックスで偽陽性を抑えるため、Ctrl+G は以下の最小長を要求する:
+
+| クエリ種別 | 最小文字数 | 例 |
+|---|---|---|
+| 日本語 (CJK を 1 文字でも含む) | **2 文字** | `街並` OK / `街` NG |
+| 英数字のみ | **3 文字** | `sdx` OK / `sd` NG |
+
+判定は各 include トークン単位。また Ctrl+G では **NOT-only クエリは禁止**
+(`-bad` のような除外だけの検索は Tantivy で候補を絞り込めず全件走査になるため)。
+Ctrl+F (ローカル検索) はこれらの制約を受けない。
+
+#### 検索の経路と索引 (v0.8.0)
+
+| ショートカット | 対象 | 検索経路 | 備考 |
+|---|---|---|---|
+| Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF 名 | `search_index.db` (SQLite LIKE) | 既存実装を継続 |
+| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | `fts_meta.db` 直接 lookup (fast path) → 未登録 path はオンデマンド (PNG tEXt + EXIF + XMP) fallback | ZIP 内画像含む、PDF はメタ対象外 |
+| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → `fts_meta.db` で all_text_norm 一括取得 → `matches()` で phrase/NOT/AND 正確判定 (streaming) | ZIP 内画像含む、PDF は document info のみ |
 
 #### AI メタデータ検索の Negative Prompt 除外
 
@@ -446,9 +468,9 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] EXIF 表示パネル（rexif クレート、フィルタ設定付き）
 - [x] スライドショー（フルスクリーン、間隔設定可能、フォルダ内ループ）
 - [x] 非破壊画像回転（SQLite 保存、R/L キー + ボタン操作）
-- [x] メタデータキーワード検索（Ctrl+F、フォルダ内 PNG プロンプト + ファイル名 + ZIP 内 PNG メタデータ）
+- [x] メタデータキーワード検索（Ctrl+F、フォルダ内 PNG プロンプト + ファイル名 + ZIP 内 PNG メタデータ。v0.8.0 で `fts_meta.db` fast path を追加）
 - [x] お気に入り検索（Ctrl+S、お気に入り配下のフォルダ/ZIP/PDF 名横断検索、SQLite インデックス）
-- [x] 検索クエリ構文: スペース区切り AND / `-word` NOT / `"..."` フレーズ（Ctrl+F と Ctrl+S 共通、`src/search_query.rs`）
+- [x] 検索クエリ構文: スペース区切り AND / `-word` NOT / `"..."` フレーズ（Ctrl+F / Ctrl+G / Ctrl+S 共通、`src/search_query.rs`）
 - [x] AI メタデータ検索は Negative Prompt を自動除外（A1111 / ComfyUI / Midjourney を認識した場合）
 - [x] 右クリックコンテキストメニュー（パスコピー・画像コピー・カット・フォルダを開く・回転・削除）
 - [x] フルスクリーン右クリック長押しコンテキストメニュー（パスコピー・フォルダを開く・アプリケーションで開く）
@@ -472,6 +494,27 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] モザイクグリッド（M キー、長辺 100 等分の格子線）
 - [x] ヒストグラム・SV マップのズーム連動（表示範囲のみ集計）
 - [x] ウルトラワイドディスプレイ対応（パネル幅の自動調整）
+
+### Phase 5（全文検索拡充 / v0.8.0）✅ 完了
+
+設計ドキュメント: [docs/search-expansion-design.md](search-expansion-design.md)
+
+- [x] **Ctrl+G グローバルメタ検索** — お気に入り全体を Tantivy + bigram で横断検索
+- [x] Tantivy 0.26 + NgramTokenizer(2,2) + LowerCaser
+- [x] 二段整合性プロトコル (`fts_meta.db` status=pending → Tantivy commit → mark_ok)
+- [x] Searcher snapshot 固定 + ページング取得 (`TopDocs::with_limit(500).and_offset()`)
+- [x] post-filter で phrase / NOT / AND を正確判定 (bigram だけでは position=0 で不正確なため)
+- [x] HARD_MAX=10,000 で打ち切り (streaming で逐次表示、最初のページは ~5ms)
+- [x] Ctrl+G drill-down view (SearchContainer クリックでコンテナ内ヒット一覧に遷移、BS/← で戻る)
+- [x] **Ctrl+F を fts_meta.db 直接 lookup 経路に差し替え** (fast path + on-demand fallback)
+- [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
+- [x] お気に入り編集 / 追加ダイアログに 3 つのチェックボックス + 一括 ON/OFF
+- [x] FsWatcher (notify-rs ReadDirectoryChangesW) + 500ms debounce
+- [x] Walker (3-way diff) + IngestSession (二段コミット) + IndexerSupervisor (統括)
+- [x] 起動時 reconciliation (status != ok の残留行を整理)
+- [x] `GlobalIoSemaphore` で UI 優先度制御 (Low/Normal/High)
+- [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み
+- [x] 最小クエリ長ポリシー (CJK 2 文字 / ASCII 3 文字) + NOT-only 拒否 (Ctrl+G)
 
 ---
 
