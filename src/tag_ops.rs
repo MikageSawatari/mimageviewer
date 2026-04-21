@@ -1,16 +1,15 @@
 //! タグ付与/削除操作のファサード (docs/tag-feature.md §5)。
 //!
 //! メニュー・ツールバーからの「タグ X をトグル」「すべてクリア」操作の
-//! エントリーポイント。実際の XMP 書き込みは Phase C で `xmp_writer` +
-//! `tag_write_worker` に委譲する。
-//!
-//! v1.0 (Phase B) 時点では UI だけ先行実装し、実際の書き込みは未実装 (stub)。
-//! 有効化されるとステータスバーに「書き込み機能は未実装」メッセージが表示される。
+//! エントリーポイント。XMP 書き込みは `xmp_writer` + `tag_write_worker` に委譲する。
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::app::App;
 use crate::grid_item::GridItem;
+use crate::tag_write_worker::{TagWriteHandle, TagWriteJob};
+use crate::xmp_writer::TagOp;
 
 impl App {
     /// 現在「タグ対象」にできる選択中ファイルのパスを返す。
@@ -35,30 +34,101 @@ impl App {
     }
 
     /// メニュー/ツールバーから「タグ `name` をトグル」が押されたときのハンドラ。
-    /// Phase C で実装予定 (XMP 書き込み worker 経由)。
+    /// 選択中ファイルのタグ状態から Add/Remove を決定し、worker に投入する。
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
         let paths = self.tag_target_paths();
         if paths.is_empty() {
             return;
         }
-        // Phase C 未実装: トースト通知のみ
-        self.show_feedback_toast(format!(
-            "タグ付与は未実装です (対象 {} 件、#{})",
-            paths.len(),
-            name
-        ));
+        let tag_with_hash = format!("#{}", name);
+        let current_tags = self.read_current_tags_for_paths(&paths);
+        let op = crate::tag_write_worker::decide_toggle_op(
+            &tag_with_hash,
+            &paths,
+            &current_tags,
+        );
+        let verb = matches!(&op, TagOp::Add(_)).then_some("付与").unwrap_or("削除");
+        self.ensure_tag_write_handle();
+        let (fav_map_id, fav_map_root) = self.resolve_favorite_map_for_paths(&paths);
+        if let Some(h) = self.tag_write_handle.as_ref() {
+            for p in &paths {
+                let job = TagWriteJob {
+                    path: p.clone(),
+                    op: op.clone(),
+                    favorite_id: fav_map_id.get(p).copied(),
+                    favorite_root: fav_map_root.get(p).cloned(),
+                };
+                h.submit(job);
+            }
+        }
+        self.show_feedback_toast(format!("{}件にタグ {} ({})", paths.len(), tag_with_hash, verb));
     }
 
-    /// 「すべてクリア」が押されたときのハンドラ (Phase C で実装)。
+    /// 「すべてクリア」が押されたときのハンドラ。
+    /// 選択中ファイルから `#` で始まるタグ (mIV 付与タグ) を全削除する。
     pub(crate) fn request_tag_clear_for_selection(&mut self) {
         let paths = self.tag_target_paths();
         if paths.is_empty() {
             return;
         }
-        self.show_feedback_toast(format!(
-            "タグクリアは未実装です (対象 {} 件)",
-            paths.len()
-        ));
+        self.ensure_tag_write_handle();
+        let (fav_map_id, fav_map_root) = self.resolve_favorite_map_for_paths(&paths);
+        if let Some(h) = self.tag_write_handle.as_ref() {
+            for p in &paths {
+                let job = TagWriteJob {
+                    path: p.clone(),
+                    op: TagOp::ClearMiv,
+                    favorite_id: fav_map_id.get(p).copied(),
+                    favorite_root: fav_map_root.get(p).cloned(),
+                };
+                h.submit(job);
+            }
+        }
+        self.show_feedback_toast(format!("{}件から mIV タグをクリア", paths.len()));
+    }
+
+    /// 初回要求時に worker を起動する。
+    fn ensure_tag_write_handle(&mut self) {
+        if self.tag_write_handle.is_some() {
+            return;
+        }
+        let Some(mgr) = self.indexer_manager.as_ref() else {
+            return;
+        };
+        let meta = mgr.clone_fts_meta();
+        let fts = mgr.clone_fts_index();
+        self.tag_write_handle = Some(TagWriteHandle::spawn(meta, fts));
+    }
+
+    /// 各パスのタグ列を `xmp_reader::read_dc_subject` で読み出してスペース区切りに
+    /// 組み立てる。トグル判定に使うので高速である必要はないが、I/O は発生する。
+    fn read_current_tags_for_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> HashMap<PathBuf, String> {
+        let mut map = HashMap::new();
+        for p in paths {
+            let tags = crate::xmp_reader::read_dc_subject(p);
+            map.insert(p.clone(), tags.join(" "));
+        }
+        map
+    }
+
+    /// 各パスが所属するお気に入りの (id, root) を解決する (検索インデックス更新用)。
+    /// 所属が分からないものは map に入れない (worker 側で None として扱う)。
+    fn resolve_favorite_map_for_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> (HashMap<PathBuf, uuid::Uuid>, HashMap<PathBuf, PathBuf>) {
+        let mut id_map = HashMap::new();
+        let mut root_map = HashMap::new();
+        for p in paths {
+            if let Some(fav) = find_favorite_for_path(&self.settings.favorites, p) {
+                id_map.insert(p.clone(), fav.0);
+                root_map.insert(p.clone(), fav.1);
+            }
+        }
+        (id_map, root_map)
     }
 
     /// 現在選択中のグリッドアイテムから、通常ファイルパスだけ取り出す。
@@ -80,6 +150,70 @@ impl App {
         }
         out
     }
+}
+
+impl App {
+    /// 毎フレーム呼ぶ: tag_write_worker の結果を取り出してエラー件数をトーストする。
+    pub(crate) fn poll_tag_write_results(&mut self) {
+        let mut errors: Vec<(PathBuf, String)> = Vec::new();
+        let mut done_count: usize = 0;
+        let mut just_completed = false;
+        if let Some(h) = self.tag_write_handle.as_ref() {
+            while let Some(res) = h.try_recv_result() {
+                done_count += 1;
+                if let Err(e) = res.result {
+                    errors.push((res.path, e));
+                }
+            }
+            // 完了: busy → idle に変わった瞬間を検出して完了トースト
+            if !h.is_busy() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                just_completed = true;
+            }
+        }
+        if !errors.is_empty() {
+            // 最大 3 件まで表示
+            let preview = errors
+                .iter()
+                .take(3)
+                .map(|(p, e)| {
+                    format!(
+                        "{}: {}",
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?"),
+                        e
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            self.show_feedback_toast(format!(
+                "タグ書き込み失敗 {} 件: {}",
+                errors.len(),
+                preview
+            ));
+        } else if done_count > 0 && just_completed {
+            self.show_feedback_toast(format!("タグ書き込み完了"));
+        }
+        if just_completed {
+            if let Some(h) = self.tag_write_handle.as_ref() {
+                h.reset_counters_if_idle();
+            }
+        }
+    }
+}
+
+/// 指定 path を含むお気に入りを探す (パスが子孫の場合も一致扱い)。
+/// 複数一致する場合は最初の one を返す。
+fn find_favorite_for_path(
+    favorites: &[crate::settings::FavoriteEntry],
+    path: &Path,
+) -> Option<(uuid::Uuid, PathBuf)> {
+    for fav in favorites {
+        if path.starts_with(&fav.path) {
+            return Some((fav.id, fav.path.clone()));
+        }
+    }
+    None
 }
 
 /// パスの拡張子が Phase C タグ書き込み対応形式か。

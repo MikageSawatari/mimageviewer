@@ -486,6 +486,17 @@ ZIP/PDF と同じく無効化 (グレーアウト)。v1.1 以降で `little_exif
 
 ### Phase D — HEIC 対応 (`little_exif` 調査後に判断)
 
+### Phase D — Ctrl+G 検索でのタグピッカー
+
+Ctrl+G 検索ボックスの右側にタグプルダウンを配置し、登録済みタグから
+選択するだけで検索ボックスに `#タグ名` が挿入される UI。
+
+- Global search UI (`src/global_search_ui.rs`) に `egui::ComboBox` または
+  `Menu` 形式のピッカー追加
+- タグをクリックしたら検索クエリテキストに ` #タグ名` を追記 (末尾)
+- 既に同じタグがクエリ内にあれば何もしない (冪等)
+- 既存タグが 0 件の場合はピッカーを無効化 (グレーアウト)
+
 ### Phase E (将来) — 将来拡張
 - `lr:hierarchicalSubject` 書き出し互換オプション
 - `T` キー / 数字キーのショートカット

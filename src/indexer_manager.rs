@@ -382,6 +382,11 @@ impl IndexerManager {
         Arc::clone(&self.meta_db)
     }
 
+    /// `Arc<FtsIndex>` を clone して返す (タグ書き込み worker 用)。
+    pub fn clone_fts_index(&self) -> Arc<FtsIndex> {
+        Arc::clone(&self.fts)
+    }
+
     /// 起動時 reconciliation が進行中か (UI インジケータ表示用)。
     /// 現状は同期実行で即 false に戻るが、将来 async 化したときに値が変わる余地を残す。
     pub fn is_reconciling(&self) -> bool {

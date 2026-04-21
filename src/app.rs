@@ -973,6 +973,8 @@ pub struct App {
     pub(crate) show_tag_editor: bool,
     /// タグ編集ダイアログ中で編集中のタグ一覧 (キャンセルで破棄するため Settings から分離)
     pub(crate) tag_editor_draft: Vec<crate::settings::TagDef>,
+    /// タグ書き込み worker (初回要求時に遅延初期化)。
+    pub(crate) tag_write_handle: Option<crate::tag_write_worker::TagWriteHandle>,
 
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
@@ -1553,6 +1555,7 @@ impl Default for App {
             show_favorites_editor: false,
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
+            tag_write_handle: None,
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -9020,6 +9023,9 @@ impl eframe::App for App {
 
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
+
+        // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
+        self.poll_tag_write_results();
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);

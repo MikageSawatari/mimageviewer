@@ -501,6 +501,12 @@ pub fn read_dc_subject_from_bytes(bytes: &[u8]) -> Vec<String> {
     parse_dc_subject(&xmp)
 }
 
+/// 生の XMP RDF/XML バイト列から dc:subject の要素を抽出 (コンテナ非依存版)。
+/// xmp_writer などからパケット直接の編集に使う。
+pub fn parse_dc_subject_xml(xml: &[u8]) -> Vec<String> {
+    parse_dc_subject(xml)
+}
+
 /// RDF/XML の `<dc:subject><rdf:Bag><rdf:li>値</rdf:li>...</rdf:Bag></dc:subject>` から
 /// 値を抽出する。名前空間で厳密判定 (URI = purl.org/dc/elements/1.1/)。
 ///
