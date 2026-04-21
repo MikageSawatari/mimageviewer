@@ -199,7 +199,22 @@ struct PendingEntry {
 
 /// 1 件の notify::Event を pending map に吸収する。
 fn absorb_event(event: &Event, pending: &mut HashMap<PathBuf, PendingEntry>) {
+    use notify::event::{ModifyKind, RenameMode};
     let kind = match event.kind {
+        // **Windows rename の正確な分解** (docs/search-test-plan.md rename バグ):
+        // `ReadDirectoryChangesW` は rename を
+        //   1. Modify(Name(From)) 旧パス
+        //   2. Modify(Name(To))   新パス
+        //   3. (or)  Modify(Name(Both)) で両パスを 1 イベントにまとめる場合あり
+        // として届ける。旧パスを Upsert で扱うと「存在しないファイル」扱いで
+        // silently no-op → 旧パスが fts_meta / Tantivy に残り続けるバグがあった。
+        // From は Remove、To / Both は Upsert に割り当てる。
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => ChangeKind::Remove,
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => ChangeKind::Upsert,
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => ChangeKind::Upsert,
+        // RenameMode::Any / Other はプラットフォーム依存で情報不足。Upsert 扱いにし、
+        // supervisor 側のフォールバック (build_candidate_from_path 失敗 → Remove) で
+        // 救う (indexer_supervisor.rs の apply_single_change::Upsert 分岐参照)。
         EventKind::Create(_) | EventKind::Modify(_) => ChangeKind::Upsert,
         EventKind::Remove(_) => ChangeKind::Remove,
         EventKind::Access(_) => return, // 読み取りアクセスは無視

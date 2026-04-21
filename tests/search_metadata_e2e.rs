@@ -193,11 +193,13 @@ fn watcher_picks_up_deletion() {
 /// 旧パスの fts_meta 行が残ったままになる。
 ///
 /// このテストは **意図的な回帰ガード**: rename 時に旧パスが消える挙動を期待値として
-/// 書いてある。絶対に通したい挙動だが現行実装で落ちるため `#[ignore]` を付けている。
-/// `search_watcher` で `ModifyKind::Name(RenameMode::From)` を `Remove` に変換するか、
-/// `apply_single_change::Upsert` で「candidate 作れない → Remove 扱いにフォールバック」
-/// するかのどちらかで修正できる。
-#[ignore = "rename 旧パスの消去が未実装 (本テストが発見した回帰、修正後 unignore)"]
+/// 書いてある。2026-04 に二段構えで修正:
+///
+/// 1. `search_watcher::absorb_event` で `ModifyKind::Name(RenameMode::From)` を
+///    `ChangeKind::Remove` にマップ (主経路)。
+/// 2. `indexer_supervisor::apply_single_change::Upsert` で `build_candidate_from_path`
+///    が `None` を返したら `Remove` にフォールバック (保険、`RenameMode::Any` など
+///    From が取りこぼされたプラットフォーム挙動をカバー)。
 #[test]
 fn watcher_picks_up_rename() {
     let data = FixtureRoot::new();

@@ -514,7 +514,36 @@ fn apply_single_change(
         ChangeKind::Upsert => {
             // Walker と違って単一 path に対する apply → CandidateFile を直接組み立てる。
             // ファイル種別・mtime/size は現時点の FS から取得。
-            let Some(cand) = build_candidate_from_path(&path, key) else {
+            //
+            // **保険のフォールバック** (docs/search-test-plan.md rename バグ):
+            // candidate が作れない (= ファイルが存在しない) ケースは
+            //   - rename 元 (search_watcher が From を Remove にマップし損ねた場合)
+            //   - Upsert 直後に削除された race
+            //   - ファイル種別が対象外 (非画像/ZIP/PDF)
+            // のいずれか。前 2 者では旧エントリを残すと索引がゴミになる。
+            // 安全側に倒し、候補が作れなければ Remove 経路にフォールバックする。
+            // (種別外は DB に元から入らない想定なので delete 空振りになるだけ)。
+            let Some(cand) = build_candidate_from_path(&path, key.clone()) else {
+                let mut w = writer.lock().unwrap();
+                let ingest_stats = match session.apply(
+                    vec![],
+                    vec![key],
+                    &mut w,
+                    io_sem,
+                    IoPriority::Normal,
+                    cancel,
+                    Some(progress),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "indexer[{}]: upsert→remove fallback apply failed: {e}",
+                            session.favorite_id
+                        ));
+                        return;
+                    }
+                };
+                update_stats(stats, &ingest_stats);
                 return;
             };
             let mut w = writer.lock().unwrap();
