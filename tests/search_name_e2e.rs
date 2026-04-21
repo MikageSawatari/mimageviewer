@@ -491,11 +491,10 @@ fn full_scan_removes_offline_deleted_subtree() {
     // オフライン削除: /root/P をサブツリーごと消す (Q, a.zip, b.pdf, cover.png 全部)
     std::fs::remove_dir_all(&p).expect("rm -rf P");
 
-    // timestamp が同秒にならないよう少し待つ (updated_at の秒精度 cutoff 回避)。
-    // prune_stale_for_favorite の cutoff は「scan start 時刻」なので、
-    // Phase 1 の upsert 時刻と Phase 2 の scan start 時刻が同じ秒だと
-    // stale 行も「>= cutoff」扱いになって削除されないリスクがある。
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // 注: sleep は不要。`next_write_stamp` は process-wide atomic で厳密単調増加なので、
+    // Phase 1 の upsert stamp と Phase 2 の scan start stamp は必ず異なる
+    // (同じナノ秒に引いても atomic CAS で後者が strictly greater になる)。
+    // 旧秒精度 cutoff で必要だった sleep(1100ms) は不要 (Codex P2 回帰対策)。
 
     // Phase 2: 再スキャン (アプリ再起動相当)
     let s2 = run_bulk_name_index(root.path(), &db, &cancel, None);
@@ -573,8 +572,8 @@ fn prune_stale_does_not_touch_nested_sibling_favorite() {
     // オフライン削除: A 配下の P サブツリーだけを削除 (B 配下の /photo/fav は触らない)
     std::fs::remove_dir_all(&p).expect("rm -rf P");
 
-    // 秒境界を確実に跨ぐ
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // `next_write_stamp` が process-wide で単調増加なので sleep 不要
+    // (旧秒精度 cutoff 時代の sleep(1100ms) は廃止)。
 
     // Phase 2: A のみ再スキャン (B は前回の行を保持したまま)
     run_bulk_name_index(&photo, &db, &cancel, None);
@@ -593,5 +592,49 @@ fn prune_stale_does_not_touch_nested_sibling_favorite() {
     assert!(
         !name_index_search(&db, "x.zip", &roots_b).is_empty(),
         "B scope: A の prune で B の行が巻き込まれた (nested favorite 巻き込みバグ)"
+    );
+}
+
+/// Codex P2 回帰 (2026-04): 秒精度 cutoff では sleep なしの back-to-back スキャンで
+/// stale 行が prune されないバグがあった。`next_write_stamp` へ切り替えたので、
+/// **sleep 一切なし** で連続スキャンしても stale サブツリーが完全に消えることを固定する。
+///
+/// 旧実装下でこのテストを走らせると、Phase 1 の upsert と Phase 2 の scan start が
+/// 同じ秒に入って cutoff 衝突し、`a.zip` などが残留して失敗する。
+/// 新実装は AtomicI64 ベースの単調 stamp なので、同じナノ秒精度の SystemTime が
+/// 返ってきても `max(prev+1, now_ns)` で strictly greater な値を返す。
+#[test]
+fn back_to_back_full_scans_prune_stale_without_sleep() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    let p = root.mkdir("P");
+    let q = root.mkdir("P/Q");
+    write_empty_zip(&q.join("a.zip"));
+    write_png_plain(&q.join("cover.png"));
+
+    let db = Arc::new(
+        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
+    );
+    let cancel = AtomicBool::new(false);
+    let roots = vec![root.path().to_path_buf()];
+
+    // Phase 1
+    run_bulk_name_index(root.path(), &db, &cancel, None);
+    assert!(!name_index_search(&db, "a.zip", &roots).is_empty());
+
+    // 削除してそのまま (sleep なし)
+    std::fs::remove_dir_all(&p).expect("rm -rf P");
+
+    // Phase 2: 連続で走らせる
+    run_bulk_name_index(root.path(), &db, &cancel, None);
+
+    // 削除済み a.zip が即座に消えていること
+    assert!(
+        name_index_search(&db, "a.zip", &roots).is_empty(),
+        "back-to-back scan でも stale 行は prune されるべき (旧実装の秒境界バグ回帰)"
+    );
+    assert!(
+        name_index_search(&db, "Q", &roots).is_empty(),
+        "back-to-back scan で Q フォルダ行も prune されるべき"
     );
 }

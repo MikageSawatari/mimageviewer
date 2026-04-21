@@ -44,8 +44,11 @@ pub fn run_bulk_name_index(
         p.set(format!("スキャン開始: {}", fav_path.display()));
     }
 
-    // post-scan prune の cutoff。`<` で比較するので同秒 upsert 行は保持される。
-    let scan_start_secs = crate::search_index_db::chrono_now_secs();
+    // post-scan prune の cutoff。`next_write_stamp` はプロセス全域で厳密単調増加 (AtomicI64)
+    // なので、直後に走る upsert の stamp は常に `> scan_start_stamp`。
+    // `<` 比較で「未観測 stale 行 / 今回 scan が触った新しい行」を race-free に分離できる。
+    // (旧実装は秒精度で、同秒に連続スキャンが入ると stale 行が残留するバグがあった)
+    let scan_start_stamp = crate::search_index_db::next_write_stamp();
 
     // Pass 1: サブフォルダ列挙
     let mut found: Vec<PathBuf> = Vec::new();
@@ -129,7 +132,7 @@ pub fn run_bulk_name_index(
 
     // stale 行を一掃 (partial state の場合は不完全な観測で誤削除するのでスキップ)。
     if !summary.cancelled {
-        match db.prune_stale_for_favorite(fav_path, scan_start_secs) {
+        match db.prune_stale_for_favorite(fav_path, scan_start_stamp) {
             Ok(0) => {}
             Ok(n) => crate::logger::log(format!(
                 "name_bulk_indexer: pruned {n} stale rows under {}",

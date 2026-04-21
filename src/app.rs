@@ -10209,19 +10209,23 @@ mod tests {
 // 対象にする。検索バー同時表示バグ (2026-04 ユーザー報告) の回帰防止が主目的。
 // =======================================================================
 
+/// Phase C 共通 setup。`data_dir::TEST_OVERRIDE` (プロセス全域のグローバル状態) を
+/// 使うテストはすべてここの `PHASE_C_LOCK` と `setup_app()` を経由する。
+///
+/// 旧実装は 3 つの test モジュールがそれぞれ独自の `PHASE_C_LOCK` を持っていて、
+/// 別モジュール同士で並列実行されると data_dir override が干渉するリスクがあった
+/// (Codex P3 指摘、2026-04)。親モジュールの 1 本に統合して直列化を保証する。
 #[cfg(test)]
-mod phase_c_key_tests {
-    use super::*;
+mod phase_c_support {
+    use super::{App, AppTestConfig};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Phase C テストは `data_dir::TEST_OVERRIDE` (プロセス全体のグローバル状態) を
-    /// 共有するため、並列実行すると data_dir が干渉する。このロックで同時 1 テストに絞る。
-    static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
 
     /// テスト終了時に必ず `data_dir::set_test_override(None)` を呼ぶ RAII ガード。
     /// panic 経路でも確実にオーバーライドを解除して後続テストに影響させない。
-    struct OverrideGuard;
+    pub(super) struct OverrideGuard;
     impl Drop for OverrideGuard {
         fn drop(&mut self) {
             crate::data_dir::set_test_override(None);
@@ -10232,7 +10236,12 @@ mod phase_c_key_tests {
     /// TempDir / OverrideGuard / App は declared order と逆順で drop されるので、
     /// App (supervisor join 含む) → OverrideGuard (data_dir clear) → TempDir (削除)
     /// の正しい順序で片付く。
-    fn setup_app() -> (App, OverrideGuard, TempDir, std::sync::MutexGuard<'static, ()>) {
+    pub(super) fn setup_app() -> (
+        App,
+        OverrideGuard,
+        TempDir,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let lock = PHASE_C_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -10246,6 +10255,12 @@ mod phase_c_key_tests {
         let app = App::new_for_test(config);
         (app, guard, tmp, lock)
     }
+}
+
+#[cfg(test)]
+mod phase_c_key_tests {
+    use super::*;
+    use super::phase_c_support::setup_app;
 
     /// ベースライン: 新規 App はどの検索バーも開いていないこと。
     #[test]
@@ -10386,35 +10401,9 @@ mod phase_c_key_tests {
 
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
-    use super::*;
+    use super::phase_c_support::setup_app;
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
-    use std::sync::Mutex;
-    use tempfile::TempDir;
-
-    static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
-
-    struct OverrideGuard;
-    impl Drop for OverrideGuard {
-        fn drop(&mut self) {
-            crate::data_dir::set_test_override(None);
-        }
-    }
-
-    fn setup_app() -> (App, OverrideGuard, TempDir, std::sync::MutexGuard<'static, ()>) {
-        let lock = PHASE_C_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tmp = TempDir::new().expect("tempdir");
-        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
-        let guard = OverrideGuard;
-        let config = AppTestConfig {
-            data_dir: tmp.path().to_path_buf(),
-            settings: None,
-        };
-        let app = App::new_for_test(config);
-        (app, guard, tmp, lock)
-    }
 
     /// Ctrl+G 絞り込みビューで folder_path に drill-in したあと、その配下の PDF を
     /// 開くと、drill_back_one_level が「PDF → folder_path (ヒット一覧) → Aggregated」
@@ -10532,34 +10521,8 @@ mod phase_c_drill_nav_tests {
 
 #[cfg(test)]
 mod phase_c_drill_address_tests {
-    use super::*;
+    use super::phase_c_support::setup_app;
     use crate::global_search::GlobalHit;
-    use std::sync::Mutex;
-    use tempfile::TempDir;
-
-    static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
-
-    struct OverrideGuard;
-    impl Drop for OverrideGuard {
-        fn drop(&mut self) {
-            crate::data_dir::set_test_override(None);
-        }
-    }
-
-    fn setup_app() -> (App, OverrideGuard, TempDir, std::sync::MutexGuard<'static, ()>) {
-        let lock = PHASE_C_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tmp = TempDir::new().expect("tempdir");
-        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
-        let guard = OverrideGuard;
-        let config = AppTestConfig {
-            data_dir: tmp.path().to_path_buf(),
-            settings: None,
-        };
-        let app = App::new_for_test(config);
-        (app, guard, tmp, lock)
-    }
 
     /// Ctrl+G drill-in → PDF を開いた時点で address がブレッドクラム表示
     /// (`🌐 全検索: "query" > container > filename.pdf`) になること。

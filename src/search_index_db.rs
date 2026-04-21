@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use rusqlite::{Connection, params};
 
@@ -143,7 +144,7 @@ impl SearchIndexDb {
             params![fav_norm, prefix],
         )?;
 
-        let now = chrono_now_secs();
+        let now = next_write_stamp();
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO entries \
@@ -174,9 +175,11 @@ impl SearchIndexDb {
     ///
     /// フルバルクスキャン完了後に呼ぶ。`upsert_children` は親フォルダ直下の行しか
     /// DELETE しないため、アプリ停止中に親フォルダごと消えたサブツリーの孫行は
-    /// upsert の経路で掃除できない。cutoff = scan 開始時刻にすれば、scan 中に
-    /// 観測した行は `updated_at >= cutoff`、未観測の stale 行は `< cutoff` で
-    /// 分離できる。
+    /// upsert の経路で掃除できない。cutoff = scan 開始時に取った
+    /// `next_write_stamp()` にすれば、scan 中の upsert は **strictly greater** な
+    /// stamp を取るので `updated_at >= cutoff`、未観測の stale 行は `< cutoff` で
+    /// 分離できる。`next_write_stamp` は process-wide atomic で単調増加なので、
+    /// 同秒で連続スキャンしても cutoff が衝突しない (Codex P2 回帰対策)。
     ///
     /// `favorite_root = ?` スコープなので nested favorites の他 favorite の行は
     /// 巻き込まない。戻り値: 削除行数 (診断用)。
@@ -443,19 +446,81 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         crate::logger::log("search_index_db: migration complete");
     }
+
+    // 前回プロセスが書き込んだ最大 stamp で WRITE_STAMP floor を引き上げる。
+    // 壁時計が後退していても `next_write_stamp` が逆行しないことを保証する。
+    let max_stamp: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(updated_at), 0) FROM entries",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if max_stamp > 0 {
+        bump_write_stamp_floor(max_stamp);
+    }
+
     Ok(())
 }
 
-/// UNIX epoch 秒精度の現在時刻を `i64` で返す。
+// -----------------------------------------------------------------------
+// 単調増加 write stamp (scan cutoff と updated_at の両方に使う)
+// -----------------------------------------------------------------------
+
+/// `entries.updated_at` と `prune_stale_for_favorite` の cutoff に書き込むための
+/// プロセス全域で **厳密に単調増加** な i64 スタンプ。
 ///
-/// `upsert_children` が書き込む `updated_at` と、`prune_stale_for_favorite` の
-/// cutoff を **同じ関数** で生成するための共有ヘルパ。
-/// `run_bulk_name_index` からも呼ばれる (`pub(crate)`)。
-pub(crate) fn chrono_now_secs() -> i64 {
-    std::time::SystemTime::now()
+/// 秒精度 timestamp だと、連続スキャン (scan A の upsert → すぐ scan B の start)
+/// が同じ秒に入った瞬間 stale 行の `updated_at == cutoff` となり prune されず
+/// 残留するバグがあった (Codex P2 指摘)。AtomicI64 + `max(prev+1, now_ns)` で
+/// 毎呼び出し一意な値を返す設計に切り替えて、同秒の連続スキャンでも衝突しない。
+///
+/// 意味的には「ナノ秒エポック」に近いが、単調性を担保するため atomic floor で
+/// `max(prev+1, now_ns)` を返す (壁時計が後退しても counter は戻らない)。
+/// 値のスケールそのものは外から観測しないので `SystemTime::now` の単位には依存しない。
+static WRITE_STAMP: AtomicI64 = AtomicI64::new(0);
+
+/// 新しい write stamp を発行する。
+/// - 戻り値は、このプロセスでの過去の `next_write_stamp` 呼び出しすべてより厳密に大きい。
+/// - シード値は `SystemTime::now().as_nanos()`。再起動後も壁時計の単調性が保たれる限り
+///   前回プロセスが書き込んだ最大値より大きくなる (DB open 時に floor を bump するので
+///   壁時計の後退にも耐える)。
+pub(crate) fn next_write_stamp() -> i64 {
+    let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let mut prev = WRITE_STAMP.load(Ordering::Relaxed);
+    loop {
+        let next = std::cmp::max(prev.saturating_add(1), now_ns);
+        match WRITE_STAMP.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(v) => prev = v,
+        }
+    }
+}
+
+/// WRITE_STAMP の floor を `floor` 以上に引き上げる。
+/// DB open 時に `MAX(updated_at)` を渡して、前回プロセスの書き込み後に
+/// 壁時計が後退していても単調性が保たれるようにする。
+fn bump_write_stamp_floor(floor: i64) {
+    let mut prev = WRITE_STAMP.load(Ordering::Relaxed);
+    while prev < floor {
+        match WRITE_STAMP.compare_exchange_weak(
+            prev,
+            floor,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(v) => prev = v,
+        }
+    }
 }
 
 /// SQL LIKE のワイルドカード (`%` `_`) と ESCAPE 文字 (`\`) をエスケープする。

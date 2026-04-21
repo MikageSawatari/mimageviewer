@@ -96,8 +96,11 @@ eframe::Frame モックを伴うフルスタック (update() ループ経由) �
    supervisor スレッドの Drop 順序: App → OverrideGuard → TempDir で file handle を先に
    閉じて Windows の使用中削除エラーを回避する。
 
-3. **`PHASE_C_LOCK` + `OverrideGuard`** (`src/app.rs::phase_c_key_tests`) —
+3. **`PHASE_C_LOCK` + `OverrideGuard`** (`src/app.rs::phase_c_support`) —
    テスト間の data_dir 干渉を防ぐ serialization + panic-safe override clear。
+   Phase C の全 test モジュール (`phase_c_key_tests` / `phase_c_drill_nav_tests` /
+   `phase_c_drill_address_tests`) が **同じ** `PHASE_C_LOCK` を共有するので、
+   別モジュール同士の並列実行でも data_dir override が干渉しない。
 
 #### 完了したテスト (8 本、`src/app.rs::phase_c_key_tests`)
 
