@@ -176,6 +176,16 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     ScannedDir { folders, all_media }
 }
 
+/// 名前索引バルク 1 件分のアクティブ情報 (`App::name_bulk_handles` の値)。
+///
+/// `progress` は UI の状態セル ("⏳ バルク中 (X/Y)") で読み出される。
+/// `cancel` を true にするとスレッドは次の folder boundary で abort する。
+pub(crate) struct NameBulkEntry {
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub progress: crate::indexer_progress::ProgressReporter,
+    pub handle: Option<std::thread::JoinHandle<crate::name_bulk_indexer::BulkSummary>>,
+}
+
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
 ///
 /// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
@@ -975,6 +985,17 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 
+    /// 名前索引バルクのアクティブ handle (favorite_id → handle)。
+    ///
+    /// **Codex P2 (2026-04)**: 旧実装は `spawn_bulk` の JoinHandle を捨てていた
+    /// ため、OFF 即時反映時に in-flight bulk を止められず、clear_for_favorite の
+    /// 直後に upsert_children で索引が復活する race があった。
+    /// ここで cancel token / progress reporter を保持し、OFF や削除時に即座に
+    /// キャンセルできるようにする。
+    /// 完了後 (handle.is_finished() が true) の entry はフレームごとに reap する。
+    pub(crate) name_bulk_handles:
+        std::collections::HashMap<uuid::Uuid, crate::app::NameBulkEntry>,
+
     // ── Ctrl+G グローバルメタ検索 UI 状態 (docs §10.3) ──────────────
     pub(crate) global_search: crate::global_search_ui::GlobalSearchState,
 
@@ -1528,6 +1549,7 @@ impl Default for App {
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
             indexer_manager,
+            name_bulk_handles: std::collections::HashMap::new(),
             global_search: crate::global_search_ui::GlobalSearchState::default(),
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
@@ -2095,9 +2117,26 @@ impl App {
     /// 名前索引フラグ (`auto_index_structure`) の OFF→ON / ON→OFF 遷移を即時反映する。
     /// 呼び出し側はすでに `settings.favorites[*].auto_index_structure` を更新した後に呼ぶ。
     ///
-    /// - false → true: 未索引ならバックグラウンドバルクを起動 (冪等)
-    /// - true → false: 該当 favorite の名前索引を `search_index_db` から削除
-    pub(crate) fn apply_favorite_name_index_change(&self, fav_path: &std::path::Path, new_on: bool) {
+    /// - false → true: 未索引ならバックグラウンドバルクを起動 (冪等)。cancel token と
+    ///   progress reporter を `name_bulk_handles` に登録して UI / 後続の OFF 操作で
+    ///   参照できるようにする。
+    /// - true → false: 走行中バルクがあればキャンセル、その後 `search_index_db` を
+    ///   クリア。**順序重要**: cancel を先に立てないと、in-flight upsert が clear 後に
+    ///   走って索引を復活させる race が発生する (Codex P2)。
+    pub(crate) fn apply_favorite_name_index_change(
+        &mut self,
+        fav_id: uuid::Uuid,
+        fav_path: &std::path::Path,
+        new_on: bool,
+    ) {
+        // 既存バルクがあれば必ずキャンセル (OFF 遷移だけでなく ON→ON でも念のため)
+        if let Some(entry) = self.name_bulk_handles.remove(&fav_id) {
+            entry.cancel.store(true, Ordering::Relaxed);
+            entry.progress.clear();
+            // handle.join() はここで待たない (UI スレッドをブロックしないため)。
+            // cancel を立てた後は thread が folder boundary で abort する。
+        }
+
         let Some(db) = self.search_index_db.as_ref() else {
             return;
         };
@@ -2116,16 +2155,48 @@ impl App {
             }
             let db_clone = Arc::clone(db);
             let cancel = Arc::new(AtomicBool::new(false));
+            let progress = crate::indexer_progress::ProgressReporter::new();
             crate::logger::log(format!(
                 "favorites: starting name bulk for {}",
                 fav_path.display()
             ));
-            let _ = crate::name_bulk_indexer::spawn_bulk(fav_path.to_path_buf(), db_clone, cancel);
+            let handle = crate::name_bulk_indexer::spawn_bulk(
+                fav_path.to_path_buf(),
+                db_clone,
+                Arc::clone(&cancel),
+                Some(progress.clone()),
+            );
+            self.name_bulk_handles.insert(
+                fav_id,
+                NameBulkEntry {
+                    cancel,
+                    progress,
+                    handle: Some(handle),
+                },
+            );
         } else if let Err(e) = db.clear_for_favorite(fav_path) {
             crate::logger::log(format!(
                 "favorites: clear name index for {} failed: {e}",
                 fav_path.display()
             ));
+        }
+    }
+
+    /// 完了した name bulk handle を reap する (毎フレーム呼ぶ)。
+    /// これをしないと UI の「⏳ バルク中」表示が完了後も残り続ける。
+    pub(crate) fn reap_finished_name_bulks(&mut self) {
+        let finished: Vec<uuid::Uuid> = self
+            .name_bulk_handles
+            .iter()
+            .filter(|(_, entry)| entry.handle.as_ref().is_none_or(|h| h.is_finished()))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in finished {
+            if let Some(mut entry) = self.name_bulk_handles.remove(&id) {
+                if let Some(h) = entry.handle.take() {
+                    let _ = h.join();
+                }
+            }
         }
     }
 
@@ -8623,6 +8694,10 @@ impl eframe::App for App {
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
         self.flush_idle_sidecars();
+
+        // 完了した名前索引バルクの handle を reap (UI の「⏳ バルク中」表示を
+        // 完了後に消すため)。毎フレーム呼ぶがほぼ no-op。
+        self.reap_finished_name_bulks();
 
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);

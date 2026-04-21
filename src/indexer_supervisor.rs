@@ -70,6 +70,10 @@ pub struct SupervisorStats {
     /// walker / ingest_worker が ProgressReporter 経由で書き込み、snapshot 時に
     /// 読み出される。scan 区間外は None。
     pub current_activity: Option<String>,
+    /// アクティブスキャン中 (walker + ingest を含むフル scan 実行中) か。
+    /// true の間は UI が「⏳ スキャン中」を表示する。false かつ `initial_scan_done=true`
+    /// なら「✅ 監視中」(notify-rs イベント待ち)。
+    pub in_full_scan: bool,
 }
 
 /// UI → Supervisor へのコマンド。
@@ -375,6 +379,9 @@ fn run_initial_scan(
     let scan_kind = if is_initial { "initial" } else { "rescan" };
     let t_start = Instant::now();
 
+    // UI 向けに「アクティブスキャン中」フラグを立てる (snapshot 時に ⏳ 表示)
+    stats.lock().unwrap().in_full_scan = true;
+
     crate::logger::log(format!(
         "indexer[{favorite_id}]: {scan_kind} scan starting (walker phase)"
     ));
@@ -412,6 +419,11 @@ fn run_initial_scan(
 
     // ingest フェーズでのみ共有 writer を lock する。walker は lock 不要なので、
     // 複数お気に入りの walk は並列で走る。ingest だけ直列化される。
+    // UI 透明性: lock 待機中は progress を「取込待ち」に更新して、ユーザーから見て
+    // 「動いていない?」と誤解されないようにする。
+    progress.set(format!(
+        "取込待ち (他のインデクサが writer を使用中)... 候補 {ingest_n} 件"
+    ));
     crate::logger::log(format!(
         "indexer[{favorite_id}]: acquiring writer for ingest..."
     ));
@@ -458,6 +470,7 @@ fn run_initial_scan(
         if is_initial {
             s.initial_scan_duration_ms = Some(dur_ms);
         }
+        s.in_full_scan = false;
     }
 }
 

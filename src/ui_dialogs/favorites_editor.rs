@@ -33,7 +33,7 @@ impl App {
         let mut close_requested = false;
         // このフレームで反映した差分を集めて、ループ後にまとめて apply する
         // (ループ中に self を再帰的に &mut 借りる回避)。
-        let mut name_index_toggles: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let mut name_index_toggles: Vec<(uuid::Uuid, std::path::PathBuf, bool)> = Vec::new();
         let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
@@ -145,32 +145,40 @@ impl App {
                         .show(ui, |ui| {
                             egui::Grid::new("fav_edit_grid")
                                 .striped(true)
-                                .num_columns(6)
+                                .num_columns(5)
                                 .spacing([8.0, 4.0])
                                 .show(ui, |ui| {
-                                    // ── ヘッダ ──
+                                    // ── ヘッダ (6→5 列に圧縮、状態は各索引列にインライン) ──
                                     ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
-                                    ui.label(egui::RichText::new("名前索引").strong())
+                                    ui.label(egui::RichText::new("名前索引 (Ctrl+S)").strong())
                                         .on_hover_text(
-                                            "フォルダ / ZIP / PDF / 画像のファイル名を Ctrl+S で検索",
+                                            "フォルダ / ZIP / PDF / 画像のファイル名を検索\n\
+                                             ✅ = 索引あり / ⏳ = バルク作成中",
                                         );
-                                    ui.label(egui::RichText::new("メタデータ索引").strong())
-                                        .on_hover_text(
-                                            "AI プロンプト / EXIF / XMP を Ctrl+F / Ctrl+G で検索",
-                                        );
-                                    ui.label(egui::RichText::new("状態").strong()).on_hover_text(
-                                        "メタ索引の初期スキャン状態\n\
-                                         ✅ = 完了 / ⏳ = スキャン中",
+                                    ui.label(
+                                        egui::RichText::new("メタデータ索引 (Ctrl+F / Ctrl+G)")
+                                            .strong(),
+                                    )
+                                    .on_hover_text(
+                                        "AI プロンプト / EXIF / XMP を検索\n\
+                                         ✅ 監視中 = 初期スキャン完了 + notify-rs で更新追従\n\
+                                         ⏳ スキャン中 = アクティブスキャン実行中",
                                     );
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
+
+                                    // 名前索引の bulk が実行中 (= supervisor ではなく NameBulkEntry が
+                                    // 残っている) 状態を fav_id で引けるようにセット化する。
+                                    // 進捗テキストはダイアログ下部の「バックグラウンドインデクサ」
+                                    // セクションで流す。
+                                    let name_active_ids: std::collections::HashSet<uuid::Uuid> =
+                                        self.name_bulk_handles.keys().copied().collect();
 
                                     // ── 各行 ──
                                     for i in 0..n {
                                         let fav_id = self.settings.favorites[i].id;
                                         let fav_path = self.settings.favorites[i].path.clone();
-                                        let meta_on = self.settings.favorites[i].auto_index_metadata;
 
                                         // 表示名 (編集可能) — 変更を検出したら即 save
                                         let name_resp = ui.add_sized(
@@ -192,31 +200,53 @@ impl App {
                                         )
                                         .on_hover_text(&path_str);
 
-                                        // 2 種のフル索引化フラグ (サムネは手動バルクのみ)
-                                        let struct_resp = ui.checkbox(
-                                            &mut self.settings.favorites[i].auto_index_structure,
-                                            "",
-                                        );
-                                        if struct_resp.changed() {
-                                            let new_val =
+                                        // 名前索引: チェック + 状態インライン
+                                        ui.horizontal(|ui| {
+                                            let struct_resp = ui.checkbox(
+                                                &mut self.settings.favorites[i]
+                                                    .auto_index_structure,
+                                                "",
+                                            );
+                                            if struct_resp.changed() {
+                                                let new_val =
+                                                    self.settings.favorites[i].auto_index_structure;
+                                                name_index_toggles.push((
+                                                    fav_id,
+                                                    fav_path.clone(),
+                                                    new_val,
+                                                ));
+                                                any_setting_dirty = true;
+                                            }
+                                            let name_on =
                                                 self.settings.favorites[i].auto_index_structure;
-                                            name_index_toggles.push((fav_path.clone(), new_val));
-                                            any_setting_dirty = true;
-                                        }
-                                        let meta_resp = ui.checkbox(
-                                            &mut self.settings.favorites[i].auto_index_metadata,
-                                            "",
-                                        );
-                                        if meta_resp.changed() {
-                                            let new_val =
-                                                self.settings.favorites[i].auto_index_metadata;
-                                            meta_index_toggles.push((fav_id, new_val));
-                                            any_setting_dirty = true;
-                                        }
+                                            draw_name_state_inline(
+                                                ui,
+                                                name_on,
+                                                name_active_ids.contains(&fav_id),
+                                            );
+                                        });
 
-                                        // メタ索引の状態 (supervisor がいれば ✅/⏳、いなければ —)
-                                        let stats = stats_by_id.get(&fav_id);
-                                        draw_state_cell(ui, meta_on, stats);
+                                        // メタデータ索引: チェック + 状態インライン
+                                        ui.horizontal(|ui| {
+                                            let meta_resp = ui.checkbox(
+                                                &mut self.settings.favorites[i]
+                                                    .auto_index_metadata,
+                                                "",
+                                            );
+                                            if meta_resp.changed() {
+                                                let new_val =
+                                                    self.settings.favorites[i].auto_index_metadata;
+                                                meta_index_toggles.push((fav_id, new_val));
+                                                any_setting_dirty = true;
+                                            }
+                                            let meta_on =
+                                                self.settings.favorites[i].auto_index_metadata;
+                                            draw_meta_state_inline(
+                                                ui,
+                                                meta_on,
+                                                stats_by_id.get(&fav_id),
+                                            );
+                                        });
 
                                         // 操作 (↑ ↓ 削除)
                                         ui.horizontal(|ui| {
@@ -253,7 +283,7 @@ impl App {
                             for f in &mut self.settings.favorites {
                                 if !f.auto_index_structure {
                                     f.auto_index_structure = true;
-                                    name_index_toggles.push((f.path.clone(), true));
+                                    name_index_toggles.push((f.id, f.path.clone(), true));
                                     any_setting_dirty = true;
                                 }
                             }
@@ -262,7 +292,7 @@ impl App {
                             for f in &mut self.settings.favorites {
                                 if f.auto_index_structure {
                                     f.auto_index_structure = false;
-                                    name_index_toggles.push((f.path.clone(), false));
+                                    name_index_toggles.push((f.id, f.path.clone(), false));
                                     any_setting_dirty = true;
                                 }
                             }
@@ -304,21 +334,25 @@ impl App {
                     });
 
                     // ── バックグラウンドインデクサのライブ進捗 ──
-                    // 初期スキャン中 / ingest 中の supervisor の "今何してる" を
-                    // 1 行ずつ列挙する。完了済み or アイドル supervisor は出さない。
-                    // スキャン完了の瞬間に progress.clear() されるので、何も出ない=
-                    // 全インデクサがアイドルという意味。
-                    let active: Vec<(String, String)> = self
-                        .settings
-                        .favorites
-                        .iter()
-                        .filter_map(|fav| {
-                            stats_by_id
-                                .get(&fav.id)
-                                .and_then(|s| s.current_activity.as_ref())
-                                .map(|msg| (fav.name.clone(), msg.clone()))
-                        })
-                        .collect();
+                    // メタ索引 supervisor (walker/ingest) と名前索引バルクの両方を
+                    // まとめて列挙する。完了済み or アイドルは出さない。
+                    // 完了の瞬間に progress.clear() されるので、何も出ない=全アイドル。
+                    let mut active: Vec<(String, String)> = Vec::new();
+                    for fav in &self.settings.favorites {
+                        // メタ index (supervisor 経由)
+                        if let Some(msg) = stats_by_id
+                            .get(&fav.id)
+                            .and_then(|s| s.current_activity.as_ref())
+                        {
+                            active.push((format!("{} (メタ)", fav.name), msg.clone()));
+                        }
+                        // 名前 index (name_bulk_handles 経由)
+                        if let Some(entry) = self.name_bulk_handles.get(&fav.id) {
+                            if let Some(msg) = entry.progress.snapshot() {
+                                active.push((format!("{} (名前)", fav.name), msg));
+                            }
+                        }
+                    }
                     if !active.is_empty() {
                         ui.add_space(6.0);
                         ui.separator();
@@ -372,7 +406,7 @@ impl App {
             // (フラグが OFF なら副作用なしなので害はない。ON→削除でも正しく掃除される。)
             let removed = self.settings.favorites.remove(i);
             if removed.auto_index_structure {
-                name_index_toggles.push((removed.path.clone(), false));
+                name_index_toggles.push((removed.id, removed.path.clone(), false));
             }
             if removed.auto_index_metadata {
                 meta_index_toggles.push((removed.id, false));
@@ -382,8 +416,8 @@ impl App {
 
         // ── フラグ変更の副作用をまとめて実行 ──
         // 名前索引: true→false は DB 即クリア、false→true は bulk 起動 (冪等)
-        for (path, new_on) in &name_index_toggles {
-            self.apply_favorite_name_index_change(path, *new_on);
+        for (fav_id, path, new_on) in &name_index_toggles {
+            self.apply_favorite_name_index_change(*fav_id, path, *new_on);
         }
         // メタ索引: 副作用は内部で sync_with_favorites を呼ぶので、複数変更があれば
         // 最後に 1 回呼ばれる形でよい。ただし OFF→ON で supervisor を spawn する
@@ -422,32 +456,76 @@ impl App {
     }
 }
 
-// ── セル描画ヘルパー (メタ索引の supervisor 統計) ─────────────────────────────
+// ── チェックボックス右側の状態インライン表示ヘルパー ──────────────────────
 
-fn draw_state_cell(ui: &mut egui::Ui, meta_on: bool, stats: Option<&SupervisorStats>) {
-    match (meta_on, stats) {
-        (true, Some(s)) => {
-            if s.initial_scan_done {
-                ui.label(
-                    egui::RichText::new("✅ 完了")
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(100, 170, 100)),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new("⏳ スキャン中")
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(200, 170, 60)),
-                );
-            }
-        }
-        _ => {
-            ui.label(
-                egui::RichText::new("—")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(120)),
-            );
-        }
+/// 名前索引列: バルク実行中なら ⏳、フラグ ON なら ✅、OFF なら —
+fn draw_name_state_inline(ui: &mut egui::Ui, on: bool, bulk_active: bool) {
+    if !on {
+        ui.label(
+            egui::RichText::new("—")
+                .size(11.0)
+                .color(egui::Color32::from_gray(120)),
+        );
+        return;
+    }
+    if bulk_active {
+        ui.label(
+            egui::RichText::new("⏳ バルク中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(200, 170, 60)),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new("✅ 索引あり")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(100, 170, 100)),
+        );
+    }
+}
+
+/// メタデータ索引列: supervisor 状態を 3 分岐で表示
+///
+/// - OFF: —
+/// - ON + `in_full_scan=true`: ⏳ スキャン中 (walker + ingest 実行中)
+/// - ON + `initial_scan_done=true`, `in_full_scan=false`: ✅ 監視中
+///   (notify-rs watcher が FS 変更を待機、scan 完了後アイドル状態)
+/// - ON + `initial_scan_done=false`, `in_full_scan=false`: ⏳ 準備中
+///   (supervisor が起動したばかりで scan がまだ始まっていない)
+fn draw_meta_state_inline(ui: &mut egui::Ui, on: bool, stats: Option<&SupervisorStats>) {
+    if !on {
+        ui.label(
+            egui::RichText::new("—")
+                .size(11.0)
+                .color(egui::Color32::from_gray(120)),
+        );
+        return;
+    }
+    let Some(s) = stats else {
+        ui.label(
+            egui::RichText::new("⏳ 起動中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(200, 170, 60)),
+        );
+        return;
+    };
+    if s.in_full_scan {
+        ui.label(
+            egui::RichText::new("⏳ スキャン中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(200, 170, 60)),
+        );
+    } else if s.initial_scan_done {
+        ui.label(
+            egui::RichText::new("✅ 監視中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(100, 170, 100)),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new("⏳ 準備中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(200, 170, 60)),
+        );
     }
 }
 

@@ -111,40 +111,25 @@ impl App {
                 let added = self.settings.add_favorite(name, target);
                 if added {
                     // 追加した最後のエントリに自動インデックスフラグを反映
-                    let (newly_on_structure, fav_path) =
+                    let (newly_on_structure, fav_id, fav_path) =
                         if let Some(last) = self.settings.favorites.last_mut() {
                             last.auto_index_structure = self.fav_add_auto_index_structure;
                             last.auto_index_metadata = self.fav_add_auto_index_metadata;
                             last.auto_index_thumbs = self.fav_add_auto_index_thumbs;
-                            (last.auto_index_structure, last.path.clone())
+                            (last.auto_index_structure, last.id, last.path.clone())
                         } else {
-                            (false, std::path::PathBuf::new())
+                            (false, uuid::Uuid::nil(), std::path::PathBuf::new())
                         };
                     self.settings.save();
                     // メタ索引: auto_index_metadata=true なら Supervisor を起動する
                     if let Some(mgr) = self.indexer_manager.as_mut() {
                         mgr.sync_with_favorites(&self.settings.favorites);
                     }
-                    // 名前索引: 新規追加 + structure=true かつ未索引なら bulk を起動。
-                    // 「お気に入り > 編集」ダイアログから ON にした場合と同じ動線
-                    // (apply_favorite_index_bulk_start) に揃える。
+                    // 名前索引: 新規追加 + structure=true なら bulk を起動。
+                    // apply_favorite_name_index_change に一本化して、cancel/progress
+                    // 管理 (name_bulk_handles) も揃える。
                     if newly_on_structure {
-                        if let Some(db) = self.search_index_db.clone() {
-                            let already_indexed =
-                                db.has_any_for_favorite(&fav_path).unwrap_or(false);
-                            if !already_indexed {
-                                let cancel = std::sync::Arc::new(
-                                    std::sync::atomic::AtomicBool::new(false),
-                                );
-                                crate::logger::log(format!(
-                                    "fav_add: starting name bulk for {}",
-                                    fav_path.display()
-                                ));
-                                let _ = crate::name_bulk_indexer::spawn_bulk(
-                                    fav_path, db, cancel,
-                                );
-                            }
-                        }
+                        self.apply_favorite_name_index_change(fav_id, &fav_path, true);
                     }
                 }
                 // cache_creator_checked は favorites と同じ長さを保つ

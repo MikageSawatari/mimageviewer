@@ -154,14 +154,20 @@ impl IndexerManager {
         // === 起動時 reconciliation を先に同期実行 ===
         // supervisor が走る前に status != ok の残留行を整理することで、
         // Tantivy writer の競合も DB 上の race もなくなる。
+        // 共有 writer を lock して reconciliation に渡す (Codex P1, 2026-04)。
+        // 以前は `fts.writer()` を独自に呼んでおり、IndexerManager の共有 writer と
+        // LockBusy で衝突していた。
         let t_recon = std::time::Instant::now();
-        let report = match run_reconciliation(&meta_db, &fts, favorites) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::logger::log(format!(
-                    "IndexerManager: reconciliation failed (continuing anyway): {e}"
-                ));
-                ReconciliationReport::default()
+        let report = {
+            let mut w = writer.lock().expect("writer mutex poisoned");
+            match run_reconciliation(&meta_db, &fts, &mut w, favorites) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "IndexerManager: reconciliation failed (continuing anyway): {e}"
+                    ));
+                    ReconciliationReport::default()
+                }
             }
         };
         let reconciliation_ms = t_recon.elapsed().as_millis() as u64;
@@ -227,12 +233,20 @@ impl IndexerManager {
             .filter(|id| !current_on_ids.contains(id) || path_changed.contains(id))
             .copied()
             .collect();
+        // **Codex P1 回帰 (2026-04)**: 共有 writer 下では 1 体ずつ drop すると
+        // writer.lock() 待機中の supervisor が join 無限待ちになる可能性がある。
+        // IndexerManager::drop と同じ signal_stop → drain パターンを使う。
+        for id in &to_stop {
+            if let Some(handle) = self.supervisors.get(id) {
+                crate::logger::log(format!(
+                    "IndexerManager: signaling supervisor {id} to stop (removed / off / path changed)"
+                ));
+                handle.signal_stop();
+            }
+        }
         for id in to_stop {
             if let Some(handle) = self.supervisors.remove(&id) {
-                // handle drop = cancel + thread join
-                crate::logger::log(format!(
-                    "IndexerManager: stopping supervisor {id} (removed / off / path changed)"
-                ));
+                crate::logger::log(format!("IndexerManager: joining supervisor {id}"));
                 drop(handle);
             }
         }
@@ -447,7 +461,11 @@ fn spawn_reconciliation(
     std::thread::Builder::new()
         .name("fts-reconciliation".to_string())
         .spawn(move || {
-            let result = run_reconciliation(&meta_db, &fts, &favorites);
+            let writer_result = fts.writer();
+            let result = match writer_result {
+                Ok(mut w) => run_reconciliation(&meta_db, &fts, &mut w, &favorites),
+                Err(e) => Err(format!("fts writer init: {e}")),
+            };
             if let Err(e) = result {
                 crate::logger::log(format!("reconciliation: failed: {e}"));
             }
@@ -456,13 +474,16 @@ fn spawn_reconciliation(
         .ok();
 }
 
+/// **Codex P1 回帰 (2026-04)**: 共有 writer 化 (f21ac27) 以降は、呼び出し側 (IndexerManager)
+/// が既に `fts.writer()` を 1 本取得しているため、reconciliation が独自に `fts.writer()` を
+/// 呼ぶと LockBusy で失敗する。共有 writer を `&mut IndexWriter` として受け取る形に統一した。
 fn run_reconciliation(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,
+    writer: &mut tantivy::IndexWriter,
     favorites: &[FavoriteEntry],
 ) -> Result<ReconciliationReport, String> {
     let mut report = ReconciliationReport::default();
-    let mut writer = fts.writer().map_err(|e| format!("fts writer init: {e}"))?;
     let fields = fts.fields();
 
     for fav in favorites {
@@ -479,7 +500,7 @@ fn run_reconciliation(
                     // Tantivy には新しい doc が入っているかもしれない → 念のため delete。
                     // 次回 supervisor の初期スキャンで walker が "DB になし" として
                     // 拾って再 ingest する。
-                    crate::fts_index::delete_doc(&writer, fields, &path);
+                    crate::fts_index::delete_doc(writer, fields, &path);
                     // DB 側も row を消す (walker の 3-way diff で to_ingest に入るように)
                     // ここは物理 DELETE が必要。purge_tombstone は status=3 限定なので使えない。
                     if let Err(e) = delete_row_forcing(meta_db, &path) {
@@ -491,7 +512,7 @@ fn run_reconciliation(
                 }
                 FileStatus::Tombstone => {
                     // Tantivy 側にまだ残っている可能性あるので delete して purge
-                    crate::fts_index::delete_doc(&writer, fields, &path);
+                    crate::fts_index::delete_doc(writer, fields, &path);
                     if let Err(e) = meta_db.purge_tombstone(&[path.clone()]) {
                         crate::logger::log(format!(
                             "reconciliation: purge_tombstone {path} failed: {e}"
@@ -585,8 +606,10 @@ mod tests {
             w.commit().unwrap();
         }
 
-        // reconciliation 実行 (自前で writer を取るので前段 writer は drop 済み必須)
-        let r = run_reconciliation(&meta, &fts, &[fav.clone()]).unwrap();
+        // reconciliation 実行 (共有 writer 化後は呼び出し側が writer を用意する)
+        let mut rw = fts.writer().unwrap();
+        let r = run_reconciliation(&meta, &fts, &mut rw, &[fav.clone()]).unwrap();
+        drop(rw);
         assert_eq!(r.pending_cleaned, 1);
 
         // pending 行は削除され、次回 walker で再 ingest される予定
@@ -616,7 +639,9 @@ mod tests {
         meta.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
         meta.mark_tombstone(&["c:/a/1.jpg".to_string()]).unwrap();
 
-        let r = run_reconciliation(&meta, &fts, &[fav.clone()]).unwrap();
+        let mut rw = fts.writer().unwrap();
+        let r = run_reconciliation(&meta, &fts, &mut rw, &[fav.clone()]).unwrap();
+        drop(rw);
         assert_eq!(r.tombstone_purged, 1);
         assert!(meta.get("c:/a/1.jpg").unwrap().is_none());
     }
@@ -634,7 +659,9 @@ mod tests {
         meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t")
             .unwrap();
 
-        let r = run_reconciliation(&meta, &fts, &[fav]).unwrap();
+        let mut rw = fts.writer().unwrap();
+        let r = run_reconciliation(&meta, &fts, &mut rw, &[fav]).unwrap();
+        drop(rw);
         assert_eq!(
             r.pending_cleaned, 0,
             "OFF の favorite は reconciliation 対象外"

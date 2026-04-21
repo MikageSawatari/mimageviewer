@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
+use crate::indexer_progress::ProgressReporter;
 use crate::search_index_db::{IndexEntry, IndexKind, SearchIndexDb};
 
 /// バルクスキャン 1 回分の進捗と結果サマリ (将来 UI 表示するなら拡張)。
@@ -35,23 +36,41 @@ pub fn run_bulk_name_index(
     fav_path: &std::path::Path,
     db: &SearchIndexDb,
     cancel: &AtomicBool,
+    progress: Option<&ProgressReporter>,
 ) -> BulkSummary {
     let mut summary = BulkSummary::default();
 
-    // Pass 1: サブフォルダ列挙 (進捗は現状 UI に出さないので no-op callback)
+    if let Some(p) = progress {
+        p.set(format!("スキャン開始: {}", fav_path.display()));
+    }
+
+    // Pass 1: サブフォルダ列挙
     let mut found: Vec<PathBuf> = Vec::new();
-    walk_dirs_recursive_with_progress(fav_path, &mut found, cancel, &mut |_| {});
+    walk_dirs_recursive_with_progress(fav_path, &mut found, cancel, &mut |cur| {
+        if let Some(p) = progress {
+            p.set(format!("フォルダ列挙: {}", cur.display()));
+        }
+    });
     if cancel.load(Ordering::Relaxed) {
         summary.cancelled = true;
         return summary;
     }
     summary.folders_visited = found.len();
+    let total_folders = found.len();
 
     // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile を集めて upsert
-    for folder in &found {
+    for (i, folder) in found.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
+        }
+        if let Some(p) = progress {
+            p.set(format!(
+                "取込: {} ({}/{})",
+                folder.display(),
+                i + 1,
+                total_folders
+            ));
         }
         let mut children: Vec<IndexEntry> = Vec::new();
         let Ok(entries) = std::fs::read_dir(folder) else {
@@ -83,6 +102,13 @@ pub fn run_bulk_name_index(
         }
         if children.is_empty() {
             continue;
+        }
+        // **Codex P2 race 対策**: upsert_children 直前にも cancel を確認する。
+        // これで「UI が OFF に切り替えた → clear_for_favorite が走る → 直前の
+        // in-flight upsert が race で書き戻す」窓を最小化する。
+        if cancel.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            break;
         }
         summary.entries_written += children.len();
         if let Err(e) = db.upsert_children(fav_path, folder, &children) {
@@ -125,10 +151,11 @@ pub fn spawn_bulk(
     fav_path: PathBuf,
     db: Arc<SearchIndexDb>,
     cancel: Arc<AtomicBool>,
+    progress: Option<ProgressReporter>,
 ) -> std::thread::JoinHandle<BulkSummary> {
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        let summary = run_bulk_name_index(&fav_path, &db, &cancel);
+        let summary = run_bulk_name_index(&fav_path, &db, &cancel, progress.as_ref());
         crate::logger::log(format!(
             "name_bulk_indexer: {} done in {} ms (folders={}, entries={}, cancelled={})",
             fav_path.display(),
@@ -137,6 +164,9 @@ pub fn spawn_bulk(
             summary.entries_written,
             summary.cancelled,
         ));
+        if let Some(p) = progress {
+            p.clear();
+        }
         summary
     })
 }
@@ -166,7 +196,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        let summary = run_bulk_name_index(&root, &db, &cancel);
+        let summary = run_bulk_name_index(&root, &db, &cancel, None);
 
         // folders_visited = root + sub
         assert_eq!(summary.folders_visited, 2);
@@ -189,7 +219,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(true); // 最初から立てておく
-        let summary = run_bulk_name_index(&root, &db, &cancel);
+        let summary = run_bulk_name_index(&root, &db, &cancel, None);
         assert!(summary.cancelled);
     }
 }
