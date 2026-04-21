@@ -239,6 +239,13 @@ impl crate::app::App {
                         GridItem::ZipSeparator { .. } => {
                             close = true;
                         }
+                        GridItem::SearchContainer { path, .. } => {
+                            // Ctrl+G 結果コンテナ: フォルダ扱いで最小限の操作を出す
+                            if ui.button("パスをコピー").clicked() {
+                                ctx.copy_text(path.to_string_lossy().to_string());
+                                close = true;
+                            }
+                        }
                         GridItem::PdfPage { pdf_path, page_num, .. } => {
                             let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
                             if ui.button("パスをコピー").clicked() {
@@ -387,6 +394,17 @@ impl crate::app::App {
                         close = true;
                     }
                     GridItem::ConvertibleArchive { path, .. } => {
+                        if ui.button("パスをコピー").clicked() {
+                            ctx.copy_text(path.to_string_lossy().to_string());
+                            close = true;
+                        }
+                        if ui.button("フォルダを開く").clicked() {
+                            open_folder_in_explorer(path);
+                            close = true;
+                        }
+                    }
+                    GridItem::SearchContainer { path, .. } => {
+                        // Ctrl+G 結果ビューのコンテナ (v0.8.0): コピー系のみ最低限
                         if ui.button("パスをコピー").clicked() {
                             ctx.copy_text(path.to_string_lossy().to_string());
                             close = true;

@@ -44,6 +44,27 @@ pub enum GridItem {
         /// 列挙時は None、フルスクリーンレンダリング完了時に確定。
         content_type: Option<crate::pdf_loader::PdfPageContentType>,
     },
+    /// Ctrl+G グローバルメタ検索結果の集約コンテナ (v0.8.0)。
+    /// トップレベル結果ビューで、ヒットを含む親フォルダ or ZIP を 1 セルで表現する。
+    /// クリックでそのコンテナに入ると、drill-down ビューに遷移して階層を維持した
+    /// まま絞り込み表示になる (docs/search-expansion-design.md §10.3)。
+    SearchContainer {
+        /// 親フォルダ or ZIP ファイルの絶対パス
+        path: PathBuf,
+        /// コンテナ種別
+        kind: SearchContainerKind,
+        /// ヒット件数 (バッジ表示用)
+        hit_count: usize,
+    },
+}
+
+/// `GridItem::SearchContainer` のコンテナ種別 (v0.8.0)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchContainerKind {
+    /// 通常フォルダ
+    Folder,
+    /// ZIP ファイル
+    Zip,
 }
 
 impl GridItem {
@@ -78,6 +99,9 @@ impl GridItem {
             GridItem::PdfPage { page_num, .. } => {
                 Cow::Owned(format!("Page {}", page_num + 1))
             }
+            GridItem::SearchContainer { path, .. } => {
+                Cow::Borrowed(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+            }
         }
     }
 
@@ -111,6 +135,13 @@ impl GridItem {
             GridItem::PdfPage { pdf_path, page_num, .. } => pdf_page_perf_key(pdf_path, *page_num),
             GridItem::ConvertibleArchive { path, format } => {
                 format!("archive::{}::{}", format.label(), path.display())
+            }
+            GridItem::SearchContainer { path, kind, .. } => {
+                let prefix = match kind {
+                    SearchContainerKind::Folder => "searchdir",
+                    SearchContainerKind::Zip => "searchzip",
+                };
+                format!("{prefix}::{}", path.display())
             }
         }
     }

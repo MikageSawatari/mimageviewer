@@ -798,6 +798,11 @@ impl App {
                         self.request_archive_convert(pf, fmt);
                     }
                 }
+                Some(GridItem::SearchContainer { path, .. }) => {
+                    // Ctrl+G 結果ビューのコンテナ: ダブルクリックで親フォルダに入る
+                    // (drill-down UX の最小版。本格 drill-down は後続 commit で実装)
+                    nav = Some(path.clone());
+                }
                 None => {}
             }
         }

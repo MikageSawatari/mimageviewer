@@ -319,7 +319,11 @@ fn run_metadata_search(
             | GridItem::ZipFile(_)
             | GridItem::PdfFile(_)
             | GridItem::ConvertibleArchive { .. }
-            | GridItem::ZipSeparator { .. } => {
+            | GridItem::ZipSeparator { .. }
+            | GridItem::SearchContainer { .. } => {
+                // SearchContainer は Ctrl+G 結果ビューに表示されるが、現在の UI では
+                // Ctrl+F (この関数) と共存させない前提 (docs §10.3 "他 UI との共存")。
+                // 万が一同時に存在したらテキスト一致で filter だけ掛ける (= 常に通す)。
                 matches.insert(idx);
             }
             GridItem::Image(_) | GridItem::Video(_) => {
@@ -1539,6 +1543,22 @@ impl App {
     /// 指定 idx の GridItem から perf 相関キーを生成する (範囲外なら None)。
     pub(crate) fn perf_item_key(&self, idx: usize) -> Option<String> {
         self.items.get(idx).map(|g| g.perf_key())
+    }
+
+    /// items と thumbnails を常にセットで push するヘルパー (docs §10.4.2)。
+    ///
+    /// 既存コードは `items.len() == thumbnails.len()` を前提にしている箇所が多く
+    /// (virtual scrolling のセル描画、load_request 組み立て等)、Ctrl+G の streaming で
+    /// items を途中拡張するときはこのヘルパー経由で両者の不変条件を保つこと。
+    ///
+    /// 戻り値は追加された item の idx。
+    // Ctrl+G UI 実装 (後続コミット) で使用。現状は API 先行追加。
+    #[allow(dead_code)]
+    pub(crate) fn push_grid_item_pending(&mut self, item: GridItem) -> usize {
+        let idx = self.items.len();
+        self.items.push(item);
+        self.thumbnails.push(ThumbnailState::Pending);
+        idx
     }
 
     /// パフォーマンス計装用の input_seq を +1 してユーザー入力イベントを記録する。
@@ -4229,6 +4249,11 @@ impl App {
                                 return None;
                             }
                             self.request_archive_convert(pf, fmt);
+                        }
+                        Some(GridItem::SearchContainer { path, .. }) => {
+                            // Ctrl+G 結果ビューのコンテナを Enter → 通常フォルダ遷移と同じ挙動。
+                            // (v1 では drill-down は別途実装予定、最小限は通常ナビで代用)
+                            return Some(path.clone());
                         }
                         None => {}
                     }
@@ -8781,6 +8806,54 @@ pub(crate) fn draw_cell(
                 "📁  作品の区切り",
                 egui::FontId::proportional(small),
                 sep_small,
+            );
+        }
+        GridItem::SearchContainer { path, kind, hit_count } => {
+            // Ctrl+G 結果のコンテナセル: フォルダ/ZIP アイコン風表示 + ヒット件数バッジ
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("(?)");
+            let (icon, label_color) = match kind {
+                crate::grid_item::SearchContainerKind::Folder => ("📁", if dark {
+                    egui::Color32::from_gray(220)
+                } else {
+                    egui::Color32::from_gray(60)
+                }),
+                crate::grid_item::SearchContainerKind::Zip => ("📦", if dark {
+                    egui::Color32::from_rgb(220, 200, 150)
+                } else {
+                    egui::Color32::from_rgb(130, 90, 30)
+                }),
+            };
+            let size_icon = (inner.height() * 0.3).clamp(24.0, 72.0);
+            painter.text(
+                inner.center() - egui::vec2(0.0, size_icon * 0.3),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(size_icon),
+                label_color,
+            );
+            // 名前
+            let name_size = (inner.height() * 0.08).clamp(11.0, 16.0);
+            painter.text(
+                inner.center() + egui::vec2(0.0, size_icon * 0.3),
+                egui::Align2::CENTER_CENTER,
+                truncate_name(name, 28),
+                egui::FontId::proportional(name_size),
+                label_color,
+            );
+            // ヒット件数バッジ (右下)
+            let badge_text = format!("{} 枚", hit_count);
+            let badge_size = (inner.height() * 0.07).clamp(10.0, 14.0);
+            let badge_color = if dark {
+                egui::Color32::from_rgb(240, 200, 100)
+            } else {
+                egui::Color32::from_rgb(180, 80, 0)
+            };
+            painter.text(
+                egui::pos2(inner.max.x - 6.0, inner.max.y - 6.0),
+                egui::Align2::RIGHT_BOTTOM,
+                &badge_text,
+                egui::FontId::proportional(badge_size),
+                badge_color,
             );
         }
     }
