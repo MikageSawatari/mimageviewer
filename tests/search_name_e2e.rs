@@ -441,3 +441,174 @@ fn name_search_classifies_folder_zip_and_pdf() {
         "pdf の kind が PdfFile でない: {hits:?}"
     );
 }
+
+/// Codex P2 (2026-04) 回帰: 「アプリ停止中にフォルダごと削除されたサブツリーの
+/// stale row が残る」バグ。
+///
+/// ## シナリオ
+///
+/// 1. `/root/P/Q` (フォルダ) + `/root/P/Q/a.zip` + `/root/P/Q/b.pdf` + `/root/other.zip`
+///    を作り初期スキャン → すべて索引化される
+/// 2. **アプリ停止中を模して** `/root/P` を **サブツリーごと** 削除
+///    (`P`, `P/Q`, `P/Q/a.zip`, `P/Q/b.pdf` が全部消える)
+/// 3. 再度 `run_bulk_name_index` を走らせる (= アプリ再起動時のフルスキャン)
+/// 4. **期待**:
+///    - `/root/other.zip` はヒットする
+///    - `/root/P` / `/root/P/Q` / `Q/a.zip` / `Q/b.pdf` はどれもヒットしない
+///
+/// 旧実装の問題: `run_bulk_name_index` は walk で観測できたフォルダだけを
+/// upsert_children の対象にする。`/root/P` 以下が全部消えると walk がそのフォルダを
+/// そもそも踏まないため、過去に書き込まれていた行が残り続ける。
+/// upsert_children の DELETE は直下のみスコープなので、`/root` の upsert をしても
+/// 孫以下は触らない。結果として Ctrl+S で存在しない Q / a.zip / b.pdf がヒットする。
+#[test]
+fn full_scan_removes_offline_deleted_subtree() {
+    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
+    use mimageviewer::search_index_db::SearchIndexDb;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // /root/P/Q 配下の構造 + /root/other.zip
+    let p = root.mkdir("P");
+    let q = root.mkdir("P/Q");
+    write_empty_zip(&q.join("a.zip"));
+    std::fs::write(q.join("b.pdf"), b"fake").expect("write pdf");
+    write_png_plain(&q.join("cover.png")); // Q を folder エントリにするため
+    write_empty_zip(&root.path().join("other.zip"));
+
+    let db = Arc::new(
+        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
+    );
+    let cancel = AtomicBool::new(false);
+    let roots = vec![root.path().to_path_buf()];
+
+    // Phase 1: 初期スキャン
+    let s1 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    assert!(!s1.cancelled);
+    assert!(
+        !name_index_search(&db, "Q", &roots).is_empty(),
+        "phase1: Q が索引に入ってない"
+    );
+    assert!(
+        !name_index_search(&db, "a.zip", &roots).is_empty(),
+        "phase1: Q/a.zip が入ってない"
+    );
+    assert!(
+        !name_index_search(&db, "other.zip", &roots).is_empty(),
+        "phase1: other.zip が入ってない"
+    );
+
+    // オフライン削除: /root/P をサブツリーごと消す (Q, a.zip, b.pdf, cover.png 全部)
+    std::fs::remove_dir_all(&p).expect("rm -rf P");
+
+    // timestamp が同秒にならないよう少し待つ (updated_at の秒精度 cutoff 回避)。
+    // prune_stale_for_favorite の cutoff は「scan start 時刻」なので、
+    // Phase 1 の upsert 時刻と Phase 2 の scan start 時刻が同じ秒だと
+    // stale 行も「>= cutoff」扱いになって削除されないリスクがある。
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Phase 2: 再スキャン (アプリ再起動相当)
+    let s2 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    assert!(!s2.cancelled);
+
+    // 削除済みサブツリーが全部消えていること
+    let q_hits = name_index_search(&db, "Q", &roots);
+    assert!(
+        q_hits.is_empty(),
+        "phase2: Q (サブツリー削除) が stale row として残っている: {q_hits:?}"
+    );
+    let a_hits = name_index_search(&db, "a.zip", &roots);
+    assert!(
+        a_hits.is_empty(),
+        "phase2: Q/a.zip が stale row として残っている: {a_hits:?}"
+    );
+    let b_hits = name_index_search(&db, "b.pdf", &roots);
+    assert!(
+        b_hits.is_empty(),
+        "phase2: Q/b.pdf が stale row として残っている: {b_hits:?}"
+    );
+
+    // 削除してない /root/other.zip は残っている
+    assert!(
+        !name_index_search(&db, "other.zip", &roots).is_empty(),
+        "phase2: other.zip が誤って消された (prune が過剰)"
+    );
+}
+
+/// ユーザー質問 (2026-04): `c:\home\photo` と `c:\home\photo\fav` のように
+/// お気に入りが **入れ子** になった構成で、prune_stale_for_favorite が
+/// 他の favorite のエントリを巻き込まないこと。
+///
+/// 具体的には:
+/// - 両 favorite のバルクを順番に走らせる
+/// - アプリ停止中に片方 (親 favorite) のサブツリーだけを削除
+/// - 再スキャン: 親の stale 行は消え、子 favorite の行は残る
+///
+/// 複合 PK `(favorite_root, path)` + prune の `WHERE favorite_root = ?` スコープで
+/// 保証される設計不変量を回帰テストとして固定する。
+#[test]
+fn prune_stale_does_not_touch_nested_sibling_favorite() {
+    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
+    use mimageviewer::search_index_db::SearchIndexDb;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // /root/photo/ = fav A (親)
+    // /root/photo/fav/ = fav B (子, ネスト)
+    // /root/photo/P/Q/a.zip ← A 配下でのみ見える
+    // /root/photo/fav/x.zip ← B 配下 (と A 配下の両方で見える)
+    let photo = root.mkdir("photo");
+    let p = root.mkdir("photo/P");
+    let q = root.mkdir("photo/P/Q");
+    write_empty_zip(&q.join("a.zip"));
+    write_png_plain(&q.join("cover.png"));
+    let fav_sub = root.mkdir("photo/fav");
+    write_empty_zip(&fav_sub.join("x.zip"));
+
+    let db = Arc::new(
+        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
+    );
+    let cancel = AtomicBool::new(false);
+
+    // Phase 1: 両 favorite でバルク
+    run_bulk_name_index(&photo, &db, &cancel, None); // A = /photo
+    run_bulk_name_index(&fav_sub, &db, &cancel, None); // B = /photo/fav
+
+    let roots_a = vec![photo.clone()];
+    let roots_b = vec![fav_sub.clone()];
+
+    // A スコープで a.zip と x.zip が見える
+    assert!(!name_index_search(&db, "a.zip", &roots_a).is_empty());
+    assert!(!name_index_search(&db, "x.zip", &roots_a).is_empty());
+    // B スコープで x.zip が見える
+    assert!(!name_index_search(&db, "x.zip", &roots_b).is_empty());
+
+    // オフライン削除: A 配下の P サブツリーだけを削除 (B 配下の /photo/fav は触らない)
+    std::fs::remove_dir_all(&p).expect("rm -rf P");
+
+    // 秒境界を確実に跨ぐ
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Phase 2: A のみ再スキャン (B は前回の行を保持したまま)
+    run_bulk_name_index(&photo, &db, &cancel, None);
+
+    // A スコープ: a.zip が消えた、x.zip は残る
+    assert!(
+        name_index_search(&db, "a.zip", &roots_a).is_empty(),
+        "A scope: 削除済み a.zip が残っている (prune 漏れ)"
+    );
+    assert!(
+        !name_index_search(&db, "x.zip", &roots_a).is_empty(),
+        "A scope: x.zip が誤って消された"
+    );
+
+    // B スコープ: x.zip は残る (B の行は A の prune で触られない)
+    assert!(
+        !name_index_search(&db, "x.zip", &roots_b).is_empty(),
+        "B scope: A の prune で B の行が巻き込まれた (nested favorite 巻き込みバグ)"
+    );
+}

@@ -44,6 +44,18 @@ pub fn run_bulk_name_index(
         p.set(format!("スキャン開始: {}", fav_path.display()));
     }
 
+    // Codex P2 (2026-04) 回帰ガード: scan 開始時刻を「観測された行」と
+    // 「stale 行」を切り分ける cutoff として記録しておく。scan が触った行は
+    // upsert_children 内で updated_at = now に更新されるので、この cutoff
+    // より古い updated_at の行は「今回の scan で観測されなかった」= ディスクから
+    // 消えている、と判定できる。scan 完了後に prune_stale_for_favorite で一掃する。
+    //
+    // 注意: chrono_now_secs() は秒精度なので、scan が 1 秒未満で終わる小さい
+    // favorite では upsert_children が cutoff と同じ秒を書き込む。
+    // 削除条件が `updated_at < cutoff` (<=ではなく<) なので、同秒の upsert 行は
+    // 保持される (safe)。
+    let scan_start_secs = chrono_now_secs_name_bulk();
+
     // Pass 1: サブフォルダ列挙
     let mut found: Vec<PathBuf> = Vec::new();
     walk_dirs_recursive_with_progress(fav_path, &mut found, cancel, &mut |cur| {
@@ -124,7 +136,38 @@ pub fn run_bulk_name_index(
         }
     }
 
+    // Codex P2 (2026-04): scan 完了後に stale 行を一括削除する。
+    // cancel された場合は partial state なので prune を走らせない (不完全な観測で
+    // 消すと大量の「実在するのに削除扱い」行が出てしまう)。
+    if !summary.cancelled {
+        match db.prune_stale_for_favorite(fav_path, scan_start_secs) {
+            Ok(n) if n > 0 => {
+                crate::logger::log(format!(
+                    "name_bulk_indexer: pruned {n} stale rows under {}",
+                    fav_path.display()
+                ));
+            }
+            Ok(_) => {} // 通常 (無削除)
+            Err(e) => {
+                crate::logger::log(format!(
+                    "name_bulk_indexer: prune_stale_for_favorite failed for {}: {e}",
+                    fav_path.display()
+                ));
+            }
+        }
+    }
+
     summary
+}
+
+/// 内部ユーティリティ: scan 開始時刻を秒精度で取得する。
+/// `search_index_db::upsert_children` が書き込む `updated_at` と同じ関数経路で
+/// 生成し、`prune_stale_for_favorite` の cutoff と突き合わせる。
+fn chrono_now_secs_name_bulk() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// DirEntry を名前索引の `IndexKind` に分類する共通ヘルパ。

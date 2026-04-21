@@ -170,6 +170,40 @@ impl SearchIndexDb {
         tx.commit()
     }
 
+    /// フルスキャン完了後に「今回の scan で観測されなかった (stale)」行を一掃する。
+    ///
+    /// ## 目的
+    ///
+    /// `upsert_children` は親フォルダ **直下** の既存行だけを DELETE するため、
+    /// アプリ停止中に `/root/P` がサブツリーごと消されたケースでは、walk が
+    /// `/root/P` を踏まず upsert も走らないため、深い子孫 (e.g. `/root/P/Q/a.zip`)
+    /// の行が永久に残り続ける (Codex 2026-04 P2 指摘)。
+    ///
+    /// 回避策: scan 開始時刻 (= `chrono_now_secs()`) を cutoff として記録し、
+    /// scan 中に upsert_children が触った行は `updated_at >= cutoff` になる。
+    /// scan 完了後に `updated_at < cutoff` の行を一括 DELETE すれば、観測されなかった
+    /// (= FS 上から消えた) 行だけが残らず掃除される。
+    ///
+    /// nested favorites でも安全: `favorite_root = ?` で対象を絞っているので、
+    /// 親 favorite の prune が子 favorite の行を巻き込まない。
+    ///
+    /// 戻り値: 削除された行数 (診断用)。
+    pub fn prune_stale_for_favorite(
+        &self,
+        favorite_root: &Path,
+        updated_at_cutoff: i64,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let fav_norm = normalize_path(favorite_root);
+        let affected = conn.execute(
+            "DELETE FROM entries \
+             WHERE favorite_root = ?1 \
+             AND updated_at < ?2",
+            params![fav_norm, updated_at_cutoff],
+        )?;
+        Ok(affected)
+    }
+
     /// インデックス作成時に、お気に入り配下のエントリを全削除する。
     pub fn clear_for_favorite(&self, favorite_root: &Path) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
