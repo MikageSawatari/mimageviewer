@@ -176,21 +176,6 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     ScannedDir { folders, all_media }
 }
 
-/// 「お気に入り」ダイアログ OK 時に検出する索引化フラグの遷移。
-///
-/// - `newly_on_structure`: 名前索引 false→true (bulk を起動して埋める)
-/// - `newly_off_structure`: 名前索引 true→false (search_index_db から即削除)
-/// - `newly_off_metadata`: メタ索引 true→false (fts_meta を tombstone 化)
-///
-/// metadata false→true は `sync_with_favorites` で supervisor が起動して初期
-/// スキャンを走らせるため、ここでは追跡しない。
-#[derive(Default)]
-pub(crate) struct FavoriteIndexTransitions {
-    pub newly_on_structure: Vec<(uuid::Uuid, PathBuf)>,
-    pub newly_off_structure: Vec<(uuid::Uuid, PathBuf)>,
-    pub newly_off_metadata: Vec<(uuid::Uuid, PathBuf)>,
-}
-
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
 ///
 /// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
@@ -972,11 +957,6 @@ pub struct App {
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
-    /// ダイアログを開いた時点の favorite の索引フラグスナップショット
-    /// (favorite_id → (auto_index_structure, auto_index_metadata))。
-    /// OK 時に差分検出して、true→false の遷移で索引データをクリーンアップする。
-    pub(crate) favorites_pre_edit_snapshot:
-        Option<std::collections::HashMap<uuid::Uuid, (bool, bool)>>,
 
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
@@ -1541,7 +1521,6 @@ impl Default for App {
             fs_early_dims: std::collections::HashMap::new(),
             items_generation: 0,
             show_favorites_editor: false,
-            favorites_pre_edit_snapshot: None,
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -2113,78 +2092,59 @@ impl App {
         }
     }
 
-    /// 「お気に入り」ダイアログの pre-edit snapshot と現在値を突き合わせて、
-    /// 索引化フラグの遷移を分類する。snapshot が無い (ダイアログを開いていない)
-    /// ときは空の結果。
-    pub(crate) fn compute_favorite_index_transitions(&self) -> FavoriteIndexTransitions {
-        let mut t = FavoriteIndexTransitions::default();
-        let Some(pre) = self.favorites_pre_edit_snapshot.as_ref() else {
-            return t;
-        };
-        for fav in &self.settings.favorites {
-            let (old_structure, old_metadata) = pre.get(&fav.id).copied().unwrap_or((false, false));
-            if !old_structure && fav.auto_index_structure {
-                t.newly_on_structure.push((fav.id, fav.path.clone()));
-            }
-            if old_structure && !fav.auto_index_structure {
-                t.newly_off_structure.push((fav.id, fav.path.clone()));
-            }
-            if old_metadata && !fav.auto_index_metadata {
-                t.newly_off_metadata.push((fav.id, fav.path.clone()));
-            }
-        }
-        t
-    }
-
-    /// true→false 遷移の索引データを削除する (`sync_with_favorites` より前に呼ぶ)。
-    /// 名前索引は `search_index_db` の直接削除、メタ索引は fts_meta 行を tombstone 化
-    /// (Tantivy doc 削除は次回起動時 reconciliation が処理)。
-    pub(crate) fn apply_favorite_index_cleanup(&self, t: &FavoriteIndexTransitions) {
-        for (_, path) in &t.newly_off_structure {
-            if let Some(db) = self.search_index_db.as_ref() {
-                if let Err(e) = db.clear_for_favorite(path) {
-                    crate::logger::log(format!(
-                        "favorites: clear name index for {} failed: {e}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        if let Some(mgr) = self.indexer_manager.as_ref() {
-            for (id, _) in &t.newly_off_metadata {
-                mgr.purge_favorite_metadata(*id);
-            }
-        }
-        // favorites_pre_edit_snapshot は OK 完了のシグナル。次回 open 時に再取得する。
-    }
-
-    /// false→true 遷移について、未索引の favorite のバックグラウンドバルクを起動する。
-    /// 冪等性: 既に search_index_db にエントリがあるものはスキップ。
-    pub(crate) fn apply_favorite_index_bulk_start(&mut self, t: &FavoriteIndexTransitions) {
-        let Some(db) = self.search_index_db.clone() else {
+    /// 名前索引フラグ (`auto_index_structure`) の OFF→ON / ON→OFF 遷移を即時反映する。
+    /// 呼び出し側はすでに `settings.favorites[*].auto_index_structure` を更新した後に呼ぶ。
+    ///
+    /// - false → true: 未索引ならバックグラウンドバルクを起動 (冪等)
+    /// - true → false: 該当 favorite の名前索引を `search_index_db` から削除
+    pub(crate) fn apply_favorite_name_index_change(&self, fav_path: &std::path::Path, new_on: bool) {
+        let Some(db) = self.search_index_db.as_ref() else {
             return;
         };
-        for (_, fav_path) in &t.newly_on_structure {
+        if new_on {
+            // 冪等: 既にエントリがあるならバルクは走らせない
             match db.has_any_for_favorite(fav_path) {
-                Ok(true) => continue,
+                Ok(true) => return,
                 Ok(false) => {}
                 Err(e) => {
                     crate::logger::log(format!(
                         "favorites: has_any_for_favorite({}) failed: {e}",
                         fav_path.display()
                     ));
-                    continue;
+                    return;
                 }
             }
-            let db_clone = Arc::clone(&db);
+            let db_clone = Arc::clone(db);
             let cancel = Arc::new(AtomicBool::new(false));
             crate::logger::log(format!(
                 "favorites: starting name bulk for {}",
                 fav_path.display()
             ));
-            let _ = crate::name_bulk_indexer::spawn_bulk(fav_path.clone(), db_clone, cancel);
+            let _ = crate::name_bulk_indexer::spawn_bulk(fav_path.to_path_buf(), db_clone, cancel);
+        } else if let Err(e) = db.clear_for_favorite(fav_path) {
+            crate::logger::log(format!(
+                "favorites: clear name index for {} failed: {e}",
+                fav_path.display()
+            ));
         }
-        self.favorites_pre_edit_snapshot = None;
+    }
+
+    /// メタデータ索引フラグ (`auto_index_metadata`) の OFF→ON / ON→OFF 遷移を即時反映する。
+    /// 呼び出し側はすでに `settings.favorites[*].auto_index_metadata` を更新した後に呼ぶ。
+    ///
+    /// - false → true: 呼び出し側で `sync_with_favorites` を呼べば supervisor が spawn される
+    /// - true → false: 当 favorite の fts_meta 行を tombstone 化 → `sync_with_favorites` で
+    ///   supervisor を停止
+    pub(crate) fn apply_favorite_meta_index_change(&mut self, fav_id: uuid::Uuid, new_on: bool) {
+        if !new_on {
+            if let Some(mgr) = self.indexer_manager.as_ref() {
+                mgr.purge_favorite_metadata(fav_id);
+            }
+        }
+        // spawn/stop は sync_with_favorites 側
+        if let Some(mgr) = self.indexer_manager.as_mut() {
+            mgr.sync_with_favorites(&self.settings.favorites);
+        }
     }
 
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
@@ -4493,18 +4453,11 @@ impl App {
         let ctrl_up = ctrl_held && up;
         let ctrl_down = ctrl_held && down;
 
-        // Codex round-9 Nice-to-have: ← キーでも drill-back できるように
-        // (BS と同じ挙動、docs §10.3)。通常のグリッド左移動より先に判定する。
-        // Ctrl+← はフォルダナビに使われるので除外 (ctrl_held なら通常処理へ)
-        if left && !ctrl_held && self.global_search.active {
-            if matches!(
-                self.global_search.view,
-                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-            ) {
-                self.drill_back_to_aggregated();
-                return None;
-            }
-        }
+        // Ctrl+G の DrilledInto で drill-back する手段は BS (↓で始まる通常ハンドラ)
+        // と検索バーの ← ボタンに限定する。
+        // 旧実装: ← キーでも drill-back させていたが、グリッドのカーソル左移動を
+        // 奪ってしまい「上右下は動くのに左だけ親階層へ戻る」という現象になっていた
+        // (ユーザー報告 2026-04)。カーソル移動を優先する設計に戻す。
 
         let vi = &self.visible_indices;
         let vi_len = vi.len();

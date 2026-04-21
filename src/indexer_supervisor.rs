@@ -127,10 +127,33 @@ impl SupervisorHandle {
         // drop で停止するので、ここでは明示 move させるだけ
         drop(self);
     }
+
+    /// cancel シグナルだけ送り、thread join は待たない。
+    ///
+    /// **IndexerManager 終了時のデッドロック回避**: 複数 supervisor が共有
+    /// `Arc<Mutex<IndexWriter>>` を使うようになった後、以下のシナリオで join が
+    /// 無限に待つ:
+    ///
+    /// - A: writer を握って apply 中 (cancel_A は未設定)
+    /// - B: writer.lock() で待機中 (cancel_B はまだ未設定 or 設定済みだが
+    ///      lock が cancel を見ない)
+    /// - drop(B) が先に実行されると: cancel_B=true, しかし B は lock 待ち
+    ///   なので反応できず、A が完走するまで join(B) も待つ = 数分 hang
+    ///
+    /// 対策: `IndexerManager::drop` で全 supervisor に対して先に
+    /// `signal_stop()` を呼び、全員の cancel を立てる。こうすれば A は自分の
+    /// apply 中のループで cancel を検出して即 exit し、B は lock を取得した
+    /// 瞬間に apply 内で cancel を検出して即 exit する。
+    pub fn signal_stop(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.send(SupervisorCommand::Stop);
+    }
 }
 
 impl Drop for SupervisorHandle {
     fn drop(&mut self) {
+        // signal_stop() と同じ効果。idempotent なので二重呼びしてもよい
+        // (IndexerManager::drop が先に一括 signal_stop してから drop を回すため)。
         self.cancel.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(SupervisorCommand::Stop);
         if let Some(t) = self.thread.take() {

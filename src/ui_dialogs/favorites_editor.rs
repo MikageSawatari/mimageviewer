@@ -27,8 +27,15 @@ impl App {
             return;
         }
         let mut open = true;
-        let mut apply = false;
-        let mut cancel = false;
+        // 即時反映設計: OK/Cancel を廃止し、編集はその場で反映する。
+        // チェックボックス / 表示名 / 並べ替え / 削除 / 一括操作 いずれも変更を
+        // 検出したフレームで settings.save() と必要な index 側の副作用を走らせる。
+        let mut close_requested = false;
+        // このフレームで反映した差分を集めて、ループ後にまとめて apply する
+        // (ループ中に self を再帰的に &mut 借りる回避)。
+        let mut name_index_toggles: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
+        let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
         let mut open_cache_creator = false;
@@ -162,21 +169,22 @@ impl App {
                                     // ── 各行 ──
                                     for i in 0..n {
                                         let fav_id = self.settings.favorites[i].id;
+                                        let fav_path = self.settings.favorites[i].path.clone();
                                         let meta_on = self.settings.favorites[i].auto_index_metadata;
 
-                                        // 表示名 (編集可能)
-                                        let _ = ui.add_sized(
+                                        // 表示名 (編集可能) — 変更を検出したら即 save
+                                        let name_resp = ui.add_sized(
                                             [100.0, 20.0],
                                             egui::TextEdit::singleline(
                                                 &mut self.settings.favorites[i].name,
                                             ),
                                         );
+                                        if name_resp.changed() {
+                                            any_setting_dirty = true;
+                                        }
 
                                         // パス (読み取り専用)
-                                        let path_str = self.settings.favorites[i]
-                                            .path
-                                            .to_string_lossy()
-                                            .to_string();
+                                        let path_str = fav_path.to_string_lossy().to_string();
                                         ui.label(
                                             egui::RichText::new(truncate_name(&path_str, 40))
                                                 .monospace()
@@ -185,14 +193,26 @@ impl App {
                                         .on_hover_text(&path_str);
 
                                         // 2 種のフル索引化フラグ (サムネは手動バルクのみ)
-                                        ui.checkbox(
+                                        let struct_resp = ui.checkbox(
                                             &mut self.settings.favorites[i].auto_index_structure,
                                             "",
                                         );
-                                        ui.checkbox(
+                                        if struct_resp.changed() {
+                                            let new_val =
+                                                self.settings.favorites[i].auto_index_structure;
+                                            name_index_toggles.push((fav_path.clone(), new_val));
+                                            any_setting_dirty = true;
+                                        }
+                                        let meta_resp = ui.checkbox(
                                             &mut self.settings.favorites[i].auto_index_metadata,
                                             "",
                                         );
+                                        if meta_resp.changed() {
+                                            let new_val =
+                                                self.settings.favorites[i].auto_index_metadata;
+                                            meta_index_toggles.push((fav_id, new_val));
+                                            any_setting_dirty = true;
+                                        }
 
                                         // メタ索引の状態 (supervisor がいれば ✅/⏳、いなければ —)
                                         let stats = stats_by_id.get(&fav_id);
@@ -224,27 +244,45 @@ impl App {
                         });
 
                     // ── 一括操作 (チェックボックスの一括 ON/OFF のみ) ──
+                    // 変化した favorite だけ toggle リストに積んで、ループ後にまとめて
+                    // 副作用 (supervisor sync / name bulk 起動 / cleanup) を走らせる。
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("一括操作:").weak());
                         if ui.button("名前 全ON").clicked() {
                             for f in &mut self.settings.favorites {
-                                f.auto_index_structure = true;
+                                if !f.auto_index_structure {
+                                    f.auto_index_structure = true;
+                                    name_index_toggles.push((f.path.clone(), true));
+                                    any_setting_dirty = true;
+                                }
                             }
                         }
                         if ui.button("名前 全OFF").clicked() {
                             for f in &mut self.settings.favorites {
-                                f.auto_index_structure = false;
+                                if f.auto_index_structure {
+                                    f.auto_index_structure = false;
+                                    name_index_toggles.push((f.path.clone(), false));
+                                    any_setting_dirty = true;
+                                }
                             }
                         }
                         if ui.button("メタ 全ON").clicked() {
                             for f in &mut self.settings.favorites {
-                                f.auto_index_metadata = true;
+                                if !f.auto_index_metadata {
+                                    f.auto_index_metadata = true;
+                                    meta_index_toggles.push((f.id, true));
+                                    any_setting_dirty = true;
+                                }
                             }
                         }
                         if ui.button("メタ 全OFF").clicked() {
                             for f in &mut self.settings.favorites {
-                                f.auto_index_metadata = false;
+                                if f.auto_index_metadata {
+                                    f.auto_index_metadata = false;
+                                    meta_index_toggles.push((f.id, false));
+                                    any_setting_dirty = true;
+                                }
                             }
                         }
                     });
@@ -309,44 +347,58 @@ impl App {
                 }
 
                 if escape_pressed {
-                    cancel = true;
+                    close_requested = true;
                 }
 
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("  OK  ").clicked() {
-                        apply = true;
-                    }
-                    if ui.button("キャンセル").clicked() {
-                        cancel = true;
+                    if ui.button("閉じる").clicked() {
+                        close_requested = true;
                     }
                 });
             });
 
+        // ── スワップ / 削除 / フラグ変更を反映 ──
+        // 並び替えは副作用なし (UI 順の入れ替えだけ)。削除は supervisor drop と
+        // 索引データのクリーンアップが必要。
         if let Some((a, b)) = swap {
             self.settings.favorites.swap(a, b);
+            any_setting_dirty = true;
         }
         if let Some(i) = remove {
-            self.settings.favorites.remove(i);
+            // 削除対象の favorite の索引データもクリーンアップする。
+            // (フラグが OFF なら副作用なしなので害はない。ON→削除でも正しく掃除される。)
+            let removed = self.settings.favorites.remove(i);
+            if removed.auto_index_structure {
+                name_index_toggles.push((removed.path.clone(), false));
+            }
+            if removed.auto_index_metadata {
+                meta_index_toggles.push((removed.id, false));
+            }
+            any_setting_dirty = true;
         }
 
-        if apply {
+        // ── フラグ変更の副作用をまとめて実行 ──
+        // 名前索引: true→false は DB 即クリア、false→true は bulk 起動 (冪等)
+        for (path, new_on) in &name_index_toggles {
+            self.apply_favorite_name_index_change(path, *new_on);
+        }
+        // メタ索引: 副作用は内部で sync_with_favorites を呼ぶので、複数変更があれば
+        // 最後に 1 回呼ばれる形でよい。ただし OFF→ON で supervisor を spawn する
+        // タイミングは 1 回で十分なので最後の 1 つだけ反映してもよいが、素直に
+        // ループしてもコストは少ない (sync はほぼ idempotent)。
+        for (fav_id, new_on) in &meta_index_toggles {
+            self.apply_favorite_meta_index_change(*fav_id, *new_on);
+        }
+
+        // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
+        if any_setting_dirty {
             self.settings.save();
-            // 編集前後のフラグ差分から「false→true で bulk 起動」「true→false で索引削除」を決める。
-            // snapshot に無い favorite は新規追加なので、fav_add 側で起動済み (TODO: fav_add 側でまだ bulk 呼ばれていない)。
-            let transitions = self.compute_favorite_index_transitions();
-            self.apply_favorite_index_cleanup(&transitions);
-            // インデクサに反映: ON/OFF 切り替えで Supervisor を spawn/stop する。
-            if let Some(mgr) = self.indexer_manager.as_mut() {
-                mgr.sync_with_favorites(&self.settings.favorites);
-            }
-            self.apply_favorite_index_bulk_start(&transitions);
-            self.show_favorites_editor = false;
-        } else if cancel || !open {
-            self.settings = crate::settings::Settings::load();
-            self.favorites_pre_edit_snapshot = None;
+        }
+
+        if close_requested || !open {
             self.show_favorites_editor = false;
         }
 

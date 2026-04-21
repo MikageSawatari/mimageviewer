@@ -372,13 +372,26 @@ impl IndexerManager {
 
 impl Drop for IndexerManager {
     fn drop(&mut self) {
-        // 全 supervisor を drop。handle.drop() は cancel + thread join を行う。
-        // 多数 favorite で時間がかかる可能性があるが、App 終了時のみなので許容。
+        // STEP 1: 全 supervisor に同時に cancel シグナルを送る。
+        //
+        // **重要**: 共有 Arc<Mutex<IndexWriter>> の下では、writer.lock() 待機中の
+        // supervisor は自分の cancel を観測できない。1 つずつ drop すると、lock を
+        // 取れていない supervisor が先に drop された場合に、他の supervisor が
+        // writer を長時間保持していると join が無限に待つ。
+        // 先に全員の cancel を立てておけば、各 supervisor が apply 内の for ループで
+        // cancel を検出して早期 exit し、writer もすぐに解放される。
+        for (id, handle) in &self.supervisors {
+            crate::logger::log(format!("IndexerManager: signaling supervisor {id} to stop"));
+            handle.signal_stop();
+        }
+
+        // STEP 2: drain + drop (drop は thread join を含む)
         for (id, handle) in self.supervisors.drain() {
-            crate::logger::log(format!("IndexerManager: stopping supervisor {id}"));
+            crate::logger::log(format!("IndexerManager: joining supervisor {id}"));
             drop(handle);
         }
-        // 全 supervisor が止まった後に共有 writer を 1 回 commit する。
+
+        // STEP 3: 全 supervisor が止まった後に共有 writer を 1 回 commit する。
         // supervisor 側の apply 中に flush/commit は既に済んでいるはずだが、最後の
         // 未 flush バッチをここで落としきる (旧実装は supervisor 個々の drop で commit
         // していたが、共有 writer では 1 回だけでよい)。
