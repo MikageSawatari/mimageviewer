@@ -298,6 +298,13 @@ impl IndexerManager {
     pub fn clone_fts_meta(&self) -> Arc<FtsMetaDb> {
         Arc::clone(&self.meta_db)
     }
+
+    /// 起動時 reconciliation が進行中か (UI インジケータ表示用)。
+    /// 現状は同期実行で即 false に戻るが、将来 async 化したときに値が変わる余地を残す。
+    pub fn is_reconciling(&self) -> bool {
+        self.reconciliation_in_progress
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Drop for IndexerManager {

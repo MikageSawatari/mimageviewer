@@ -270,6 +270,10 @@ impl CachePolicy {
             Self::Always => "Always（常に生成）",
         }
     }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Off, Self::Auto, Self::Always]
+    }
 }
 
 // -----------------------------------------------------------------------

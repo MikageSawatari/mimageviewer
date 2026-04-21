@@ -19,8 +19,6 @@
 //! 各 SupervisorStatsView は軽量な Mutex ロックで取得するため、毎フレーム呼んでも
 //! 問題ない (Codex round-8 で確認済み)。
 
-#![allow(unused_imports)]
-
 use eframe::egui;
 
 use crate::app::App;
@@ -40,12 +38,12 @@ impl App {
         let reconciliation_in_progress = self
             .indexer_manager
             .as_ref()
-            .map(|m| m.reconciliation_in_progress.load(std::sync::atomic::Ordering::SeqCst))
-            .unwrap_or(false);
-        let mut stats_list = match self.indexer_manager.as_ref() {
-            Some(mgr) => mgr.all_stats(),
-            None => Vec::new(),
-        };
+            .is_some_and(|m| m.is_reconciling());
+        let mut stats_list = self
+            .indexer_manager
+            .as_ref()
+            .map(|mgr| mgr.all_stats())
+            .unwrap_or_default();
         // お気に入りの表示順 (settings.favorites の順) に合わせる
         let id_order: std::collections::HashMap<uuid::Uuid, usize> = self
             .settings
@@ -143,13 +141,14 @@ impl App {
                                     ui.label(
                                         egui::RichText::new(&v.favorite_name).monospace(),
                                     );
-                                    let path_str = v.favorite_path.to_string_lossy().to_string();
+                                    // Cow<str> を保持して、UTF-8 パスの場合に String 追加アロケを避ける
+                                    let path_str = v.favorite_path.to_string_lossy();
                                     ui.label(
                                         egui::RichText::new(truncate_name(&path_str, 50))
                                             .monospace()
                                             .weak(),
                                     )
-                                    .on_hover_text(&path_str);
+                                    .on_hover_text(path_str.as_ref());
                                     // 状態
                                     if v.stats.initial_scan_done {
                                         ui.label(
@@ -231,20 +230,15 @@ impl App {
                 );
             });
 
-        if escape_pressed || close_requested {
-            self.show_index_manager = false;
-        } else if !open {
+        if escape_pressed || close_requested || !open {
             self.show_index_manager = false;
         }
 
-        // 再構築リクエストを実行 (lock は各 supervisor の短時間のみ)
-        if let Some(id) = request_rescan_for {
-            if let Some(mgr) = self.indexer_manager.as_ref() {
+        if let Some(mgr) = self.indexer_manager.as_ref() {
+            if let Some(id) = request_rescan_for {
                 mgr.request_full_rescan(id);
             }
-        }
-        if request_rescan_all {
-            if let Some(mgr) = self.indexer_manager.as_ref() {
+            if request_rescan_all {
                 for v in &stats_list {
                     mgr.request_full_rescan(v.favorite_id);
                 }
