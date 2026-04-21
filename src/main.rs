@@ -11,6 +11,7 @@ pub mod data_dir;
 pub mod dwm_transitions;
 pub mod folder_tree;
 pub mod fs_animation;
+pub mod fts_index;
 pub mod fts_meta;
 pub mod gpu_info;
 pub mod io_semaphore;
