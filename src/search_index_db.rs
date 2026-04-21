@@ -108,6 +108,11 @@ impl SearchIndexDb {
     /// 親フォルダ配下の指定アイテムを一括 upsert する。
     /// 親フォルダ直下の既存エントリのうち、`children` に含まれないものは削除する
     /// (差分反映)。
+    ///
+    /// **Codex P2 #2 対応 (2026-04)**: DELETE / INSERT 両方とも `favorite_root` で
+    /// スコープを絞る。複合 PK `(favorite_root, path)` へ移行したため、nested favorites
+    /// (親 / 子が同じ実体を指す) で互いに行を上書きしない設計に揃える。
+    /// (tests/search_name_e2e.rs::nested_favorites_both_scopes_find_shared_path)
     pub fn upsert_children(
         &self,
         favorite_root: &Path,
@@ -126,15 +131,18 @@ impl SearchIndexDb {
         } else {
             format!("{}/", parent_norm)
         };
+        let fav_norm = normalize_path(favorite_root);
         // 直下判定: path LIKE 'prefix%' かつ substr(path, len(prefix)+1) に '/' を含まない
+        // かつ **favorite_root が一致する** 行のみ対象 (nested favorites で他 fav の
+        // 行を巻き込まないように)。
         tx.execute(
             "DELETE FROM entries \
-             WHERE path LIKE ?1 || '%' \
-             AND instr(substr(path, length(?1) + 1), '/') = 0",
-            params![prefix],
+             WHERE favorite_root = ?1 \
+             AND path LIKE ?2 || '%' \
+             AND instr(substr(path, length(?2) + 1), '/') = 0",
+            params![fav_norm, prefix],
         )?;
 
-        let fav_norm = normalize_path(favorite_root);
         let now = chrono_now_secs();
         {
             let mut stmt = tx.prepare(
@@ -318,22 +326,25 @@ impl SearchIndexDb {
 // -----------------------------------------------------------------------
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // 新規 DB 用: 複合 PRIMARY KEY `(favorite_root, path)` で作る。
+    // 同じ実体 path が複数 favorite に所属する (nested favorites) ケースを表現できる。
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS entries (
-             path                  TEXT PRIMARY KEY,
+             path                  TEXT NOT NULL,
              display_path          TEXT NOT NULL,
              name                  TEXT NOT NULL,
              display_name          TEXT NOT NULL,
              kind                  INTEGER NOT NULL,
              favorite_root         TEXT NOT NULL,
              mtime                 INTEGER NOT NULL DEFAULT 0,
-             updated_at            INTEGER NOT NULL DEFAULT 0
+             updated_at            INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (favorite_root, path)
          );
          CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
          CREATE INDEX IF NOT EXISTS idx_entries_fav  ON entries(favorite_root);",
     )?;
 
-    // Migration (2026-04): コミット 7883750 で `favorite_root_display` カラムを
+    // Migration 1 (2026-04): コミット 7883750 で `favorite_root_display` カラムを
     // 削除したが、旧バージョンで作られた既存 DB には `NOT NULL` 制約付きで残存して
     // いる。新しい INSERT 文には載っていないため、upsert_children で
     // `NOT NULL constraint failed: entries.favorite_root_display` が発生する。
@@ -348,6 +359,54 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         crate::logger::log(
             "search_index_db: migrated — dropped obsolete favorite_root_display column",
         );
+    }
+
+    // Migration 2 (2026-04 Codex P2 #2): PRIMARY KEY を `path` 単独から
+    // `(favorite_root, path)` 複合に移行する。単独 PK では nested favorites で
+    // 同じ path を別 favorite が上書きしてしまい、片方の検索スコープから欠落する
+    // バグがあった (tests/search_name_e2e.rs::nested_favorites_both_scopes_find_shared_path)。
+    //
+    // SQLite は PRIMARY KEY を直接変更できないため、空の場合は recreate、データがある
+    // 場合は entries_new を作って ingest → swap する。
+    let old_pk_is_path_only: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info('entries')")?;
+        let mut rows = stmt.query([])?;
+        let mut pk_cols: Vec<(i64, String)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            let pk: i64 = row.get(5)?;
+            if pk > 0 {
+                pk_cols.push((pk, name));
+            }
+        }
+        pk_cols.len() == 1 && pk_cols[0].1 == "path"
+    };
+    if old_pk_is_path_only {
+        crate::logger::log(
+            "search_index_db: migrating PRIMARY KEY (path) → (favorite_root, path)",
+        );
+        conn.execute_batch(
+            "CREATE TABLE entries_new (
+                 path                  TEXT NOT NULL,
+                 display_path          TEXT NOT NULL,
+                 name                  TEXT NOT NULL,
+                 display_name          TEXT NOT NULL,
+                 kind                  INTEGER NOT NULL,
+                 favorite_root         TEXT NOT NULL,
+                 mtime                 INTEGER NOT NULL DEFAULT 0,
+                 updated_at            INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (favorite_root, path)
+             );
+             INSERT OR IGNORE INTO entries_new \
+                 (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at) \
+                 SELECT path, display_path, name, display_name, kind, favorite_root, mtime, updated_at \
+                 FROM entries;
+             DROP TABLE entries;
+             ALTER TABLE entries_new RENAME TO entries;
+             CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
+             CREATE INDEX IF NOT EXISTS idx_entries_fav  ON entries(favorite_root);",
+        )?;
+        crate::logger::log("search_index_db: migration complete");
     }
     Ok(())
 }

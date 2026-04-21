@@ -245,3 +245,199 @@ fn query_supports_exclude_token() {
     assert_eq!(hits.len(), 1, "animal で cat でないのは dog のみ (got {hits:?})");
     assert!(hits[0].display_name.contains("dog"));
 }
+
+// -----------------------------------------------------------------------
+// Codex P2 回帰ガード
+// -----------------------------------------------------------------------
+
+/// Codex P2 #1 回帰テスト: 「空フォルダ化」で古い索引が残るバグ。
+///
+/// ## シナリオ
+///
+/// 1. `/root/P/Q (フォルダ)`, `/root/P/a.zip`, `/root/P/b.pdf` を作り初期スキャン
+///    → Q / a.zip / b.pdf が索引に入る
+/// 2. **アプリ停止中を模して** 3 つすべてディスクから削除 (`/root/P` は空フォルダに)
+/// 3. 同じ DB で再度 `run_bulk_name_index` を走らせる (= アプリ再起動時のフルスキャン)
+/// 4. 検索: Q / a.zip / b.pdf がどれもヒットしないこと
+///
+/// 旧実装は `if children.is_empty() { continue; }` で upsert_children の DELETE すら
+/// スキップしていたため、空になった親フォルダの下の古い行が残ったまま。
+#[test]
+fn full_scan_removes_stale_entries_from_became_empty_folder() {
+    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
+    use mimageviewer::search_index_db::SearchIndexDb;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // /root/P/ に Q フォルダ + a.zip + b.pdf
+    let p = root.mkdir("P");
+    let q = root.mkdir("P/Q");
+    write_empty_zip(&p.join("a.zip"));
+    std::fs::write(p.join("b.pdf"), b"fake pdf").expect("write pdf");
+    // 索引化対象になるよう Q の中に画像を置く (folder 扱い用)
+    write_png_plain(&q.join("cover.png"));
+
+    let db = Arc::new(
+        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
+    );
+    let cancel = AtomicBool::new(false);
+
+    // Phase 1: 初期スキャン
+    let summary1 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    assert!(!summary1.cancelled);
+
+    let roots = vec![root.path().to_path_buf()];
+    assert!(
+        !name_index_search(&db, "Q", &roots).is_empty(),
+        "phase1: Q がヒットしない"
+    );
+    assert!(
+        !name_index_search(&db, "a.zip", &roots).is_empty(),
+        "phase1: a.zip がヒットしない"
+    );
+    assert!(
+        !name_index_search(&db, "b.pdf", &roots).is_empty(),
+        "phase1: b.pdf がヒットしない"
+    );
+
+    // オフライン削除: /root/P/Q, a.zip, b.pdf をすべて消す → /root/P は空フォルダに
+    std::fs::remove_dir_all(p.join("Q")).expect("rm Q");
+    std::fs::remove_file(p.join("a.zip")).expect("rm a.zip");
+    std::fs::remove_file(p.join("b.pdf")).expect("rm b.pdf");
+
+    // Phase 2: 再スキャン (アプリ再起動相当)
+    let summary2 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    assert!(!summary2.cancelled);
+
+    // 古い行が消えていること
+    let q_hits = name_index_search(&db, "Q", &roots);
+    assert!(
+        q_hits.is_empty(),
+        "phase2: Q が削除後も索引に残っている (stale entries): {q_hits:?}"
+    );
+    let a_hits = name_index_search(&db, "a.zip", &roots);
+    assert!(
+        a_hits.is_empty(),
+        "phase2: a.zip が削除後も索引に残っている: {a_hits:?}"
+    );
+    let b_hits = name_index_search(&db, "b.pdf", &roots);
+    assert!(
+        b_hits.is_empty(),
+        "phase2: b.pdf が削除後も索引に残っている: {b_hits:?}"
+    );
+}
+
+/// Codex P2 #2 回帰テスト: nested favorites で共有パスが一方にしか載らないバグ。
+///
+/// ## シナリオ
+///
+/// 1. お気に入り A = `/root` (親)
+/// 2. お気に入り B = `/root/photo` (子, A の配下にネスト)
+/// 3. `/root/photo/a.zip` を作る (両方のスコープに入る実体)
+/// 4. 両 favorite のバルクを走らせる
+/// 5. A スコープで `a.zip` 検索 → ヒットする
+/// 6. B スコープで `a.zip` 検索 → ヒットする
+///
+/// 旧実装は PRIMARY KEY(path) なので後に書いた favorite_root で行が上書きされ、
+/// 先に走った方の favorite_root 視点からは entries.favorite_root IN (...) フィルタを
+/// すり抜けて **検索ヒットが 0 件になる**。
+#[test]
+fn nested_favorites_both_scopes_find_shared_path() {
+    use mimageviewer::name_bulk_indexer::run_bulk_name_index;
+    use mimageviewer::search_index_db::SearchIndexDb;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // 共有パス: /root/photo/a.zip
+    let photo = root.mkdir("photo");
+    write_empty_zip(&photo.join("a.zip"));
+    // sub/ 側にも画像を置いて folder エントリとして認識されるように
+    let sub = root.mkdir("photo/sub");
+    write_png_plain(&sub.join("thumb.png"));
+
+    let db = Arc::new(
+        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
+    );
+    let cancel = AtomicBool::new(false);
+
+    // お気に入り A (親) と B (子) を順番にバルク
+    run_bulk_name_index(root.path(), &db, &cancel, None); // A = /root
+    run_bulk_name_index(&photo, &db, &cancel, None); //       B = /root/photo
+
+    // A スコープで a.zip 検索 → 見つかるべき
+    let hits_a = name_index_search(&db, "a.zip", &[root.path().to_path_buf()]);
+    assert!(
+        hits_a.iter().any(|e| e.display_name == "a.zip"),
+        "A (/root) スコープで a.zip が見つからない (nested favorite が上書きした?): {hits_a:?}"
+    );
+
+    // B スコープで a.zip 検索 → 見つかるべき
+    let hits_b = name_index_search(&db, "a.zip", &[photo.clone()]);
+    assert!(
+        hits_b.iter().any(|e| e.display_name == "a.zip"),
+        "B (/root/photo) スコープで a.zip が見つからない: {hits_b:?}"
+    );
+
+    // sub フォルダも同様に両方から見えること
+    let sub_a = name_index_search(&db, "sub", &[root.path().to_path_buf()]);
+    assert!(
+        sub_a.iter().any(|e| e.display_name == "sub"),
+        "A スコープで sub フォルダが見つからない: {sub_a:?}"
+    );
+    let sub_b = name_index_search(&db, "sub", &[photo.clone()]);
+    assert!(
+        sub_b.iter().any(|e| e.display_name == "sub"),
+        "B スコープで sub フォルダが見つからない: {sub_b:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// 表示種別の分類 (Ctrl+S 検索結果が Folder / ZipFile / PdfFile を正しく返す)
+// -----------------------------------------------------------------------
+
+/// Ctrl+S 検索結果で Folder / ZipFile / PdfFile の 3 種別が期待通りの `IndexKind` で
+/// 返ってくること (UI 側のアイコン / ダブルクリック挙動の分岐に影響するため)。
+///
+/// 2026-04 ユーザー要望: Ctrl+S の検索結果表示で各種別の動作確認テストが欲しい。
+#[test]
+fn name_search_classifies_folder_zip_and_pdf() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // 名前索引対象の 3 種別を 1 つずつ配置 (画像ファイル (png/jpg) は名前索引対象外)
+    mkdir_with_image(&root, "mixed_folder_xuq8");
+    write_empty_zip(&root.path().join("mixed_archive_xuq8.zip"));
+    std::fs::write(root.path().join("mixed_document_xuq8.pdf"), b"fake").expect("write pdf");
+
+    let fav = make_favorite("A", root.path());
+    let (db, handle) = start_name_index_at(data.path(), &fav);
+    wait_name_scan_done(&handle);
+
+    let roots = vec![fav.path.clone()];
+    let hits = name_index_search(&db, "mixed", &roots);
+    assert_eq!(hits.len(), 3, "3 種別が全ヒット: {hits:?}");
+
+    // 名前で辿れるように HashMap に詰める
+    let by_name: std::collections::HashMap<&str, IndexKind> = hits
+        .iter()
+        .map(|e| (e.display_name.as_str(), e.kind))
+        .collect();
+    assert_eq!(
+        by_name.get("mixed_folder_xuq8").copied(),
+        Some(IndexKind::Folder),
+        "folder の kind が Folder でない: {hits:?}"
+    );
+    assert_eq!(
+        by_name.get("mixed_archive_xuq8.zip").copied(),
+        Some(IndexKind::ZipFile),
+        "zip の kind が ZipFile でない: {hits:?}"
+    );
+    assert_eq!(
+        by_name.get("mixed_document_xuq8.pdf").copied(),
+        Some(IndexKind::PdfFile),
+        "pdf の kind が PdfFile でない: {hits:?}"
+    );
+}

@@ -100,9 +100,14 @@ pub fn run_bulk_name_index(
                 mtime: 0,
             });
         }
-        if children.is_empty() {
-            continue;
-        }
+        // **Codex P2 #1 回帰修正 (2026-04)**: `children.is_empty()` でも continue せず、
+        // `upsert_children` を呼び出す。旧実装はここで skip していたため、アプリ停止中に
+        // 子フォルダ/ZIP/PDF がすべて削除されて「空になった親フォルダ」では、
+        // upsert_children の DELETE が走らず古い行が残り続けるバグがあった。
+        // (tests/search_name_e2e.rs::full_scan_removes_stale_entries_from_became_empty_folder)
+        // upsert_children は DELETE → INSERT の順なので、children が空のときは
+        // DELETE だけが走って「この親配下の子エントリを全消去」する正しい挙動になる。
+        //
         // **Codex P2 race 対策**: upsert_children 直前にも cancel を確認する。
         // これで「UI が OFF に切り替えた → clear_for_favorite が走る → 直前の
         // in-flight upsert が race で書き戻す」窓を最小化する。

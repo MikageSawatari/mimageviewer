@@ -1341,4 +1341,182 @@ mod tests {
         assert_eq!(paths[1], ("Image", PathBuf::from("C:/root/a.jpg")));
         assert_eq!(paths[2], ("Image", PathBuf::from("C:/root/b.jpg")));
     }
+
+    // -------------------------------------------------------------------
+    // ユーザー要望テスト (2026-04): Ctrl+G 検索結果の表示 / 階層ドリル / Ctrl+↑↓
+    // -------------------------------------------------------------------
+
+    /// Ctrl+G drill-in 直下に PDF / ZIP / 画像 のヒットが混在したとき、
+    /// `build_drilled_items` が拡張子で正しく `GridItem::{PdfFile, ZipFile, Image}`
+    /// に分類すること。
+    ///
+    /// 2026-04 ユーザー報告: ScanSnap (PDF だらけのフォルダ) で drill-in すると
+    /// 全サムネ「画像フォーマット判定不可」で失敗していた。その回帰ガード。
+    #[test]
+    fn build_drilled_items_classifies_pdf_zip_and_image_by_extension() {
+        let mut state = GlobalSearchState::default();
+        for p in [
+            "C:/mix/a.pdf",
+            "C:/mix/b.zip",
+            "C:/mix/c.png",
+            "C:/mix/d.jpg",
+        ] {
+            state.accumulate_hit(&GlobalHit {
+                path: p.into(),
+                score: 1.0,
+            });
+        }
+        let (items, _) = build_drilled_items(&state, Path::new("C:/mix"), false);
+        // 期待: 名前昇順で a.pdf → b.zip → c.png → d.jpg
+        let kinds: Vec<&'static str> = items
+            .iter()
+            .map(|it| match it {
+                GridItem::PdfFile(_) => "PdfFile",
+                GridItem::ZipFile(_) => "ZipFile",
+                GridItem::Image(_) => "Image",
+                GridItem::Folder(_) => "Folder",
+                _ => "Other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["PdfFile", "ZipFile", "Image", "Image"]);
+    }
+
+    /// 多階層のフォルダ構造の一部だけがヒットしたとき、drill-in でヒットを含む
+    /// **直接の子フォルダ** のみ (ヒットなしの兄弟 / 枝は枝刈り) が表示されること。
+    ///
+    /// 構造:
+    /// ```
+    /// /root/
+    ///   year2024/
+    ///     jan/  matches/  X.png     ← hit
+    ///     feb/            Y.png     ← no hit (pruned)
+    ///   year2023/
+    ///     jan/            Z.png     ← no hit (pruned)
+    /// ```
+    /// ヒットは `/root/year2024/jan/matches/X.png` の 1 件のみ。
+    /// - `/root` でドリル → `year2024` (1 件持ち) だけが並ぶ (year2023 は枝刈り)
+    /// - `/root/year2024` でドリル → `jan` だけが並ぶ (feb は枝刈り)
+    /// - `/root/year2024/jan` でドリル → `matches` フォルダだけが並ぶ
+    #[test]
+    fn build_drilled_items_prunes_branches_with_no_hits() {
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/year2024/jan/matches/X.png".into(),
+            score: 1.0,
+        });
+        // 上記以外にもヒットを入れておく (別枝が干渉しないことを確認)
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/year2024/jan/matches/Y.png".into(),
+            score: 1.0,
+        });
+
+        // Level 1: /root でドリル → year2024 のみ
+        let (l1, _) = build_drilled_items(&state, Path::new("C:/root"), false);
+        assert_eq!(l1.len(), 1, "level1 item count");
+        assert!(matches!(&l1[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024")));
+
+        // Level 2: /root/year2024 → jan のみ (feb は枝刈り)
+        let (l2, _) = build_drilled_items(&state, Path::new("C:/root/year2024"), false);
+        assert_eq!(l2.len(), 1, "level2 item count");
+        assert!(
+            matches!(&l2[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan"))
+        );
+
+        // Level 3: /root/year2024/jan → matches のみ
+        let (l3, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false);
+        assert_eq!(l3.len(), 1, "level3 item count");
+        assert!(
+            matches!(&l3[0],
+                GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan/matches"))
+        );
+
+        // Level 4: /root/year2024/jan/matches → 画像 2 件が直下に並ぶ
+        let (l4, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan/matches"), false);
+        assert_eq!(l4.len(), 2, "level4 item count");
+        for it in &l4 {
+            assert!(matches!(it, GridItem::Image(_)));
+        }
+    }
+
+    /// ZIP コンテナへ drill-in したときは、その ZIP のエントリだけがフラットに
+    /// 並ぶこと (他の ZIP や通常フォルダのヒットは含まれない)。
+    ///
+    /// 注意: Tantivy 側で hit.path は `normalize_path` 済み (小文字化 + '/')
+    /// なのでテスト入力も同じ形で用意する。`build_drilled_zip_items` は
+    /// `normalize_path(zip_path)` と hit の zip 部分を文字列比較する。
+    #[test]
+    fn build_drilled_zip_items_shows_only_entries_of_target_zip() {
+        let mut state = GlobalSearchState::default();
+        for p in [
+            "c:/archives/target.zip!folder/pic1.jpg",
+            "c:/archives/target.zip!folder/pic2.jpg",
+            "c:/archives/other.zip!x.jpg", // 別 ZIP
+            "c:/loose/z.jpg",               // 通常ファイル
+        ] {
+            state.accumulate_hit(&GlobalHit {
+                path: p.into(),
+                score: 1.0,
+            });
+        }
+        let (items, _) =
+            build_drilled_items(&state, Path::new("C:/archives/target.zip"), /*is_zip=*/ true);
+        assert_eq!(items.len(), 2, "target.zip のエントリ数");
+        for it in &items {
+            assert!(matches!(it, GridItem::ZipImage { .. }));
+            if let GridItem::ZipImage { zip_path, .. } = it {
+                assert_eq!(zip_path, &PathBuf::from("C:/archives/target.zip"));
+            }
+        }
+    }
+
+    /// Ctrl+↑↓ のフラット ナビリストが、Folder / ZIP / PDF (= SearchContainer として
+    /// 立つもの) を混在で並べ、ヒット件数降順 + 名前昇順でソートすること。
+    ///
+    /// 2026-04 ユーザー要望: Ctrl+↑↓ で folder と ZIP の混在移動を確認したい。
+    #[test]
+    fn build_cross_container_nav_list_mixes_folder_and_zip_across_containers() {
+        let mut state = GlobalSearchState::default();
+        // C:/folder_a に 1 件 (少)
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/folder_a/img.jpg".into(),
+            score: 1.0,
+        });
+        // C:/folder_b に 3 件 (多)
+        for n in 0..3 {
+            state.accumulate_hit(&GlobalHit {
+                path: format!("C:/folder_b/p{n}.jpg"),
+                score: 1.0,
+            });
+        }
+        // C:/book.zip に 2 件 (中)
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/book.zip!e1.jpg".into(),
+            score: 1.0,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/book.zip!e2.jpg".into(),
+            score: 1.0,
+        });
+
+        let nav = build_cross_container_nav_list(&state);
+        // ソート: 件数降順 (3 → 2 → 1)
+        assert!(nav.len() >= 3, "nav entries count: {}", nav.len());
+        // 先頭は C:/folder_b (3 件) → folder
+        assert_eq!(nav[0].container_root, PathBuf::from("C:/folder_b"));
+        assert!(!nav[0].is_zip);
+        // 次は C:/book.zip (2 件) → ZIP
+        let book_idx = nav
+            .iter()
+            .position(|e| e.container_root == PathBuf::from("C:/book.zip"))
+            .expect("book.zip must be in nav list");
+        assert!(nav[book_idx].is_zip);
+        // C:/folder_a (1 件) → folder
+        let a_idx = nav
+            .iter()
+            .position(|e| e.container_root == PathBuf::from("C:/folder_a"))
+            .expect("folder_a must be in nav list");
+        assert!(!nav[a_idx].is_zip);
+        // 件数多い方が先に並ぶ (folder_b < book.zip < folder_a の順で見つかる)
+        assert!(book_idx < a_idx);
+    }
 }
