@@ -7,4 +7,5 @@ bench_thumbs.tsv
 /vendor/pdfium
 /vendor/models
 /vendor/susie-worker
+/vendor/ort
 /testdata/

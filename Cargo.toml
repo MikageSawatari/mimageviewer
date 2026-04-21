@@ -53,7 +53,7 @@ turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
 base64 = "0.22"
-ort = { version = "2.0.0-rc.12", features = ["directml", "ndarray"] }
+ort = { version = "2.0.0-rc.12", features = ["directml", "load-dynamic"] }
 ndarray = "0.17"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。

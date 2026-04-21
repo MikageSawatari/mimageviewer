@@ -87,19 +87,8 @@ fn ensure_dll_extracted() -> Result<&'static PathBuf, String> {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| format!("data_dir create failed: {e}"))?;
             let dll_path = dir.join("pdfium.dll");
-            let needs_extract = match std::fs::metadata(&dll_path) {
-                Ok(meta) => meta.len() != PDFIUM_DLL_BYTES.len() as u64,
-                Err(_) => true,
-            };
-            if needs_extract {
-                std::fs::write(&dll_path, PDFIUM_DLL_BYTES)
-                    .map_err(|e| format!("pdfium.dll extract failed: {e}"))?;
-                crate::logger::log(format!(
-                    "pdfium.dll extracted to {} ({} bytes)",
-                    dll_path.display(),
-                    PDFIUM_DLL_BYTES.len()
-                ));
-            }
+            crate::data_dir::extract_embedded_file(&dll_path, PDFIUM_DLL_BYTES, "pdfium.dll")
+                .map_err(|e| format!("pdfium.dll extract failed: {e}"))?;
             Ok(dll_path)
         })
         .as_ref()

@@ -2,14 +2,54 @@
 //!
 //! DirectML EP を使い、GPU アクセラレーションで推論する。
 //! セッションは ModelKind ごとに遅延作成・キャッシュする。
+//!
+//! `onnxruntime.dll` と `onnxruntime_providers_shared.dll` は exe に
+//! `include_bytes!` で埋め込まれており、初回 AiRuntime 作成時に
+//! `%APPDATA%/mimageviewer/` へ展開される (PDFium と同じパターン)。
+//! これにより VC++ 再頒布可能パッケージを利用者に要求しない。
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use ort::session::Session;
 
 use super::{AiError, ModelKind};
+
+static ORT_DLL_BYTES: &[u8] = include_bytes!("../../vendor/ort/onnxruntime.dll");
+static ORT_PROVIDERS_SHARED_BYTES: &[u8] =
+    include_bytes!("../../vendor/ort/onnxruntime_providers_shared.dll");
+
+static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn ensure_ort_initialized() -> Result<(), AiError> {
+    let result = ORT_INIT.get_or_init(|| -> Result<(), String> {
+        let dir = crate::data_dir::get();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("data_dir create failed: {e}"))?;
+
+        let dll_path = dir.join("onnxruntime.dll");
+        let providers_path = dir.join("onnxruntime_providers_shared.dll");
+
+        crate::data_dir::extract_embedded_file(&dll_path, ORT_DLL_BYTES, "onnxruntime.dll")
+            .map_err(|e| format!("onnxruntime.dll extract: {e}"))?;
+        crate::data_dir::extract_embedded_file(
+            &providers_path,
+            ORT_PROVIDERS_SHARED_BYTES,
+            "onnxruntime_providers_shared.dll",
+        )
+        .map_err(|e| format!("onnxruntime_providers_shared.dll extract: {e}"))?;
+
+        ort::init_from(&dll_path)
+            .map_err(|e| format!("ort::init_from: {e}"))?
+            .commit();
+        Ok(())
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(AiError::Ort(e.clone())),
+    }
+}
 
 /// ONNX Runtime ラッパー。
 /// アプリ全体で 1 つだけ作成し、`Arc<AiRuntime>` で共有する。
@@ -21,7 +61,11 @@ pub struct AiRuntime {
 
 impl AiRuntime {
     /// 新しい AiRuntime を作成する。
+    ///
+    /// 内部で `ort::init_from` を呼んで onnxruntime.dll を
+    /// `%APPDATA%/mimageviewer/` に展開・ロードする (OnceLock で 1 回のみ実行)。
     pub fn new() -> Result<Self, AiError> {
+        ensure_ort_initialized()?;
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
         })
