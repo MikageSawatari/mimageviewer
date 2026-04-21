@@ -459,6 +459,83 @@ pub fn open_url(url: &str) {
 }
 
 // -----------------------------------------------------------------------
+// Ctrl+G 結果コンテナ: 階層パス表示
+// -----------------------------------------------------------------------
+
+/// パス文字列を階層コンポーネントに分解する。
+///
+/// `/` と `\` の両方を区切りとして扱い、空要素 (連続セパレータ、先頭 / 末尾の `/`) は
+/// 除去する。ドライブ文字 (`c:`) も 1 コンポーネントとしてそのまま返す。
+///
+/// Ctrl+G 検索結果コンテナセル (`GridItem::SearchContainer`) の階層表示で使う。
+pub fn split_path_components(path_str: &str) -> Vec<&str> {
+    path_str
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 階層パスのテキストレイアウトをサムネイルセルに収める。
+///
+/// 戦略 (ユーザー要望 2026-04 「はみ出す場合は末端優先 or 縮小」):
+/// 1. `max_font` から `min_font` まで 1pt 刻みで shrink して全コンポーネントが
+///    入る font を探す (width / height 両方を満たす必要あり)
+/// 2. `min_font` でも収まらない場合: 先頭 (ルート側) コンポーネントを 1 個ずつ削り、
+///    先頭行に `…` プレースホルダを置いて「省略されている」ことを示す
+/// 3. 末端 1 行すら入らない場合 (想定外): 末端 1 行を返してはみ出しを許容する
+///
+/// 戻り値の `Galley` は描画位置を呼び出し側が決めてから `painter.galley(pos, ..)`
+/// で描く。
+pub fn layout_path_hierarchy(
+    painter: &egui::Painter,
+    components: &[&str],
+    color: egui::Color32,
+    max_w: f32,
+    max_h: f32,
+    max_font: f32,
+    min_font: f32,
+) -> std::sync::Arc<egui::Galley> {
+    if components.is_empty() {
+        return painter.layout_no_wrap(
+            String::new(),
+            egui::FontId::proportional(min_font),
+            color,
+        );
+    }
+    // Phase 1: 全コンポーネントで font size を max→min へ試す
+    let full = components.join("\n");
+    let mut font = max_font;
+    while font >= min_font {
+        let galley =
+            painter.layout_no_wrap(full.clone(), egui::FontId::proportional(font), color);
+        if galley.size().x <= max_w && galley.size().y <= max_h {
+            return galley;
+        }
+        font -= 1.0;
+    }
+    // Phase 2: min_font で先頭から削る (末端優先、先頭行は ellipsis)
+    for start in 1..components.len() {
+        let mut lines: Vec<&str> = Vec::with_capacity(components.len() - start + 1);
+        lines.push("…");
+        lines.extend_from_slice(&components[start..]);
+        let galley = painter.layout_no_wrap(
+            lines.join("\n"),
+            egui::FontId::proportional(min_font),
+            color,
+        );
+        if galley.size().x <= max_w && galley.size().y <= max_h {
+            return galley;
+        }
+    }
+    // Phase 3: 末端 1 行のみ (はみ出しを受け入れる)
+    painter.layout_no_wrap(
+        components.last().copied().unwrap_or("").to_string(),
+        egui::FontId::proportional(min_font),
+        color,
+    )
+}
+
+// -----------------------------------------------------------------------
 // テスト
 // -----------------------------------------------------------------------
 
@@ -566,5 +643,43 @@ mod tests {
         let a = natural_sort_key("apple");
         let b = natural_sort_key("banana");
         assert!(a < b);
+    }
+
+    #[test]
+    fn split_path_components_windows_forward_slash() {
+        assert_eq!(
+            split_path_components("c:/home/photo/2025-01-01"),
+            vec!["c:", "home", "photo", "2025-01-01"]
+        );
+    }
+
+    #[test]
+    fn split_path_components_mixed_separators() {
+        assert_eq!(
+            split_path_components(r"c:\home/photo\2025-01-01"),
+            vec!["c:", "home", "photo", "2025-01-01"]
+        );
+    }
+
+    #[test]
+    fn split_path_components_strips_empty_segments() {
+        // 末尾スラッシュ / 連続スラッシュ由来の空要素は落とす
+        assert_eq!(split_path_components("c:/home/"), vec!["c:", "home"]);
+        assert_eq!(
+            split_path_components("c://home///photo"),
+            vec!["c:", "home", "photo"]
+        );
+    }
+
+    #[test]
+    fn split_path_components_empty() {
+        assert_eq!(split_path_components(""), Vec::<&str>::new());
+        assert_eq!(split_path_components("/"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn split_path_components_drive_only() {
+        assert_eq!(split_path_components("c:"), vec!["c:"]);
+        assert_eq!(split_path_components("c:/"), vec!["c:"]);
     }
 }

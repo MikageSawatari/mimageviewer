@@ -9855,8 +9855,9 @@ pub(crate) fn draw_cell(
             kind,
             hit_count,
         } => {
-            // Ctrl+G 結果のコンテナセル: フォルダ/ZIP アイコン風表示 + ヒット件数バッジ
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("(?)");
+            // Ctrl+G 結果のコンテナセル:
+            // 日付フォルダ (`2025-01-01` 等) 単独表示だと区別できない問題への対応として、
+            // パスを階層ごとに改行した多行表示にする (ユーザー要望 2026-04)。
             let (icon, label_color) = match kind {
                 crate::grid_item::SearchContainerKind::Folder => (
                     "📁",
@@ -9875,26 +9876,43 @@ pub(crate) fn draw_cell(
                     },
                 ),
             };
-            let size_icon = (inner.height() * 0.3).clamp(24.0, 72.0);
+            // 上部に小さめのアイコン (階層テキスト領域を広く確保するため、従来の 0.3 を 0.18 に)
+            let icon_size = (inner.height() * 0.18).clamp(22.0, 56.0);
             painter.text(
-                inner.center() - egui::vec2(0.0, size_icon * 0.3),
+                egui::pos2(inner.center().x, inner.min.y + icon_size * 0.75),
                 egui::Align2::CENTER_CENTER,
                 icon,
-                egui::FontId::proportional(size_icon),
+                egui::FontId::proportional(icon_size),
                 label_color,
             );
-            // 名前
-            let name_size = (inner.height() * 0.08).clamp(11.0, 16.0);
-            painter.text(
-                inner.center() + egui::vec2(0.0, size_icon * 0.3),
-                egui::Align2::CENTER_CENTER,
-                truncate_name(name, 28),
-                egui::FontId::proportional(name_size),
+            // 階層テキスト領域: アイコン下 〜 右下バッジの上
+            let badge_font = (inner.height() * 0.07).clamp(10.0, 14.0);
+            let text_top = inner.min.y + icon_size * 1.35;
+            let text_bottom = inner.max.y - badge_font * 2.2;
+            let text_area_h = (text_bottom - text_top).max(0.0);
+            let text_area_w = (inner.width() - 8.0).max(0.0);
+            let path_str = path.to_string_lossy();
+            let components = crate::ui_helpers::split_path_components(&path_str);
+            let max_font = (inner.height() * 0.075).clamp(11.0, 15.0);
+            let min_font = 8.0f32.min(max_font);
+            let galley = crate::ui_helpers::layout_path_hierarchy(
+                painter,
+                &components,
                 label_color,
+                text_area_w,
+                text_area_h,
+                max_font,
+                min_font,
             );
+            // 領域内中央に配置 (水平も垂直も中央寄せ)
+            let gs = galley.size();
+            let pos = egui::pos2(
+                inner.center().x - gs.x * 0.5,
+                text_top + ((text_area_h - gs.y).max(0.0)) * 0.5,
+            );
+            painter.galley(pos, galley, label_color);
             // ヒット件数バッジ (右下)
             let badge_text = format!("{} 枚", hit_count);
-            let badge_size = (inner.height() * 0.07).clamp(10.0, 14.0);
             let badge_color = if dark {
                 egui::Color32::from_rgb(240, 200, 100)
             } else {
@@ -9904,7 +9922,7 @@ pub(crate) fn draw_cell(
                 egui::pos2(inner.max.x - 6.0, inner.max.y - 6.0),
                 egui::Align2::RIGHT_BOTTOM,
                 &badge_text,
-                egui::FontId::proportional(badge_size),
+                egui::FontId::proportional(badge_font),
                 badge_color,
             );
         }
