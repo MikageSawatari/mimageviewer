@@ -147,12 +147,17 @@ pub(crate) enum FsBoundaryHint {
     /// Ctrl+↑↓ で画像のある次 (forward=true) / 前 (forward=false) のフォルダが
     /// skip_limit 以内に見つからなかった。
     NoImageFolder { forward: bool, at: std::time::Instant },
+    /// Ctrl+G 絞り込みビューで、これ以上進める検索結果が無い
+    /// (forward=true: 末端, forward=false: 先頭)。
+    SearchEnd { forward: bool, at: std::time::Instant },
 }
 
 impl FsBoundaryHint {
     pub(crate) fn started_at(&self) -> std::time::Instant {
         match self {
-            FsBoundaryHint::Edge { at, .. } | FsBoundaryHint::NoImageFolder { at, .. } => *at,
+            FsBoundaryHint::Edge { at, .. }
+            | FsBoundaryHint::NoImageFolder { at, .. }
+            | FsBoundaryHint::SearchEnd { at, .. } => *at,
         }
     }
 }
@@ -3498,6 +3503,7 @@ impl App {
         let duration = match hint {
             FsBoundaryHint::Edge { .. } => BOUNDARY_HINT_DURATION,
             FsBoundaryHint::NoImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
+            FsBoundaryHint::SearchEnd { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
         };
         let elapsed = start_time.elapsed().as_secs_f32();
         if elapsed > duration {
@@ -3532,6 +3538,20 @@ impl App {
                 vec![
                     "[Esc] でサムネイル一覧に戻り",
                     "[Ctrl]+[↑] で空フォルダを越えて移動できます",
+                ],
+            ),
+            FsBoundaryHint::SearchEnd { forward: true, .. } => (
+                "最後の検索結果です",
+                vec![
+                    "[Esc] で検索を閉じると",
+                    "通常のフォルダ移動に戻ります",
+                ],
+            ),
+            FsBoundaryHint::SearchEnd { forward: false, .. } => (
+                "最初の検索結果です",
+                vec![
+                    "[Esc] で検索を閉じると",
+                    "通常のフォルダ移動に戻ります",
                 ],
             ),
         };

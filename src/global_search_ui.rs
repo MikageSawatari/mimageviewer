@@ -777,6 +777,12 @@ impl App {
                     self.global_search.view = before_view;
                     self.rebuild_items_from_global_search();
                 }
+                // 「最後/最初の検索結果です」ヒントを中央に表示
+                self.fs_boundary_hint =
+                    Some(crate::ui_fullscreen::FsBoundaryHint::SearchEnd {
+                        forward,
+                        at: std::time::Instant::now(),
+                    });
                 return;
             }
             // rebuild_items_from_global_search 済みなので visible_indices を見て
@@ -1016,6 +1022,11 @@ impl App {
             self.global_search.truncated = false;
             self.global_search.total_valid = 0;
             self.global_search.total_scanned = 0;
+            // query == last_executed でも debounce → spawn を必ず再走させる。
+            // そうしないと、Enter 2 連打で旧検索が cancel されたあと
+            // poll_global_search_debounce が「クエリが変わっていない」と判定して
+            // 新 spawn を skip し、結果 0 件のまま固着する。
+            self.global_search.last_executed.clear();
             self.rebuild_items_from_global_search();
         }
     }
