@@ -30,6 +30,7 @@ pub mod search_index_db;
 pub mod search_norm;
 pub mod search_query;
 pub mod search_walker;
+pub mod search_watcher;
 pub mod settings;
 pub mod sidecar;
 pub mod spread_db;
