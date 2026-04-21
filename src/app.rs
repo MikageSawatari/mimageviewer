@@ -9219,6 +9219,11 @@ impl eframe::App for App {
                 if self.favsearch.active {
                     self.favsearch.nav_stack.push(p.clone());
                 }
+                // Ctrl+G 絞り込みビュー中に container (PDF/ZIP/サブフォルダ) を開いたら
+                // current_path を進めておく。BS で「PDF ページ → ヒット一覧 →
+                // Aggregated」の 2 段階で戻れるようにする修正 (2026-04 ユーザー報告)。
+                // Aggregated / inactive では no-op。
+                self.advance_drilled_current_path(&p);
                 self.load_folder(p);
                 // 他 nav 源が勝った: 累積をクリアして連打バーストを中断する
                 // (start_loading_items が folder_nav_pending と累積をリセット済みだが、
@@ -10351,5 +10356,156 @@ mod phase_c_key_tests {
         check_invariant(&app, "after open S (should close G)");
         app.open_local_metadata_search();
         check_invariant(&app, "after open F (should close S)");
+    }
+}
+
+// =======================================================================
+// Phase C (App-level) - Ctrl+G drill ナビゲーション状態機械テスト
+//
+// 2026-04 ユーザー報告バグ:
+//   「Ctrl+G → 検索 → 結果のフォルダを開く → フォルダの中の PDF 一覧 →
+//    PDF をクリック → ページ一覧 → BS で戻ると、PDF 一覧まで戻るはずが
+//    検索結果 (Aggregated) まで 1 段多く戻ってしまう」
+//
+// 原因: PDF/ZIP を開いても `global_search.view.DrilledInto.current_path` が
+// 更新されず、drill_back_one_level が「current_path == container_root」を
+// 根拠に drill_back_to_aggregated を直接呼ぶ。
+//
+// 修正: container (PDF/ZIP/Folder) を開く時点で current_path をその path に
+// 進めておく。BS 時は drill_back_one_level が親へ戻す動作になり、
+// PDF 一覧に正しく復帰する。
+// =======================================================================
+
+#[cfg(test)]
+mod phase_c_drill_nav_tests {
+    use super::*;
+    use crate::global_search::GlobalHit;
+    use crate::global_search_ui::GlobalSearchView;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
+
+    struct OverrideGuard;
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            crate::data_dir::set_test_override(None);
+        }
+    }
+
+    fn setup_app() -> (App, OverrideGuard, TempDir, std::sync::MutexGuard<'static, ()>) {
+        let lock = PHASE_C_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().expect("tempdir");
+        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
+        let guard = OverrideGuard;
+        let config = AppTestConfig {
+            data_dir: tmp.path().to_path_buf(),
+            settings: None,
+        };
+        let app = App::new_for_test(config);
+        (app, guard, tmp, lock)
+    }
+
+    /// Ctrl+G 絞り込みビューで folder_path に drill-in したあと、その配下の PDF を
+    /// 開くと、drill_back_one_level が「PDF → folder_path (ヒット一覧) → Aggregated」
+    /// の 2 段階 BS で辿れる状態になること。
+    ///
+    /// 修正前: PDF を開いても current_path=folder_path のままなので、
+    /// drill_back_one_level が即 drill_back_to_aggregated を呼び、ヒット一覧を
+    /// スキップして検索結果に戻ってしまう。
+    #[test]
+    fn bs_after_opening_pdf_in_drilled_returns_to_folder_not_aggregated() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder_path = std::path::PathBuf::from("C:/fav/scansnap");
+        let pdf_path = folder_path.join("doc.pdf");
+
+        // Aggregated 状態でヒットだけ用意する (実検索は行わない、
+        // build_drilled_items が current_path でフィルタするため)
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: format!("{}/doc.pdf", folder_path.display()).to_lowercase(),
+            score: 1.0,
+        });
+        // コンテナへ drill-in (SearchContainer を Enter 相当)
+        app.drill_into_container(folder_path.clone(), false);
+        assert!(matches!(
+            app.global_search.view,
+            GlobalSearchView::DrilledInto { ref current_path, .. }
+                if current_path == &folder_path
+        ));
+
+        // PDF を開く操作を模擬: 新ヘルパ `advance_drilled_current_path` が current_path を
+        // pdf_path に更新する (修正前は何もしない = 下の 1 段目 BS で Aggregated に飛ぶ)
+        app.advance_drilled_current_path(&pdf_path);
+
+        // 1 段目 BS: PDF ページ → drilled folder view (ヒット一覧)
+        app.drill_back_one_level();
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, .. } => {
+                assert_eq!(
+                    current_path, &folder_path,
+                    "1段目 BS で drilled folder view に戻るべき (current_path=folder)"
+                );
+            }
+            GlobalSearchView::Aggregated => {
+                panic!("BUG: BS が PDF 一覧をスキップして Aggregated に飛んだ");
+            }
+        }
+
+        // 2 段目 BS: drilled folder view → Aggregated
+        app.drill_back_one_level();
+        assert!(
+            matches!(app.global_search.view, GlobalSearchView::Aggregated),
+            "2段目 BS で Aggregated に戻るべき"
+        );
+    }
+
+    /// ZIP 版: PDF と同じ状態機械で動くこと (GridItem::ZipFile の click も同じ
+    /// advance_drilled_current_path 経路を通る想定)。
+    #[test]
+    fn bs_after_opening_zip_in_drilled_returns_to_folder_not_aggregated() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder_path = std::path::PathBuf::from("C:/fav/archives");
+        let zip_path = folder_path.join("album.zip");
+
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: format!("{}/album.zip", folder_path.display()).to_lowercase(),
+            score: 1.0,
+        });
+        app.drill_into_container(folder_path.clone(), false);
+        app.advance_drilled_current_path(&zip_path);
+
+        app.drill_back_one_level();
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, .. } => {
+                assert_eq!(current_path, &folder_path);
+            }
+            _ => panic!("BUG: BS が ZIP 一覧をスキップして Aggregated に飛んだ"),
+        }
+
+        app.drill_back_one_level();
+        assert!(matches!(
+            app.global_search.view,
+            GlobalSearchView::Aggregated
+        ));
+    }
+
+    /// Ctrl+G が非アクティブな状態で advance_drilled_current_path を呼んでも
+    /// view に影響しないこと (no-op)。
+    #[test]
+    fn advance_drilled_is_noop_when_not_in_drilled_view() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        assert!(matches!(
+            app.global_search.view,
+            GlobalSearchView::Aggregated
+        ));
+        app.advance_drilled_current_path(std::path::Path::new("C:/anything.pdf"));
+        assert!(
+            matches!(app.global_search.view, GlobalSearchView::Aggregated),
+            "Aggregated 時の advance は no-op であるべき"
+        );
     }
 }

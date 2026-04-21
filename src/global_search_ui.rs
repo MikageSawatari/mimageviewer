@@ -135,7 +135,7 @@ impl GlobalSearchState {
     }
 
     /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
-    fn accumulate_hit(&mut self, hit: &GlobalHit) {
+    pub(crate) fn accumulate_hit(&mut self, hit: &GlobalHit) {
         let (container_path, kind) = parent_container(&hit.path);
         let entry = self
             .containers
@@ -718,6 +718,43 @@ impl App {
                 is_zip,
             };
             self.rebuild_items_from_global_search();
+        }
+    }
+
+    /// Ctrl+G 絞り込みビューで PDF / ZIP / (通常の load_folder 経路に載るサブフォルダ) を
+    /// 開いた時点で、`current_path` をその path に進めるためのヘルパ。
+    ///
+    /// 2026-04 ユーザー報告バグ: 「Ctrl+G → folder drill → PDF を開く → BS で戻ると
+    /// PDF 一覧をスキップして Aggregated に飛んでしまう」の修正。
+    ///
+    /// 仕組み: `drill_back_one_level` は
+    /// - `current_path == container_root` なら Aggregated に戻る
+    /// - そうでなければ `current_path.parent()` に戻る
+    /// という状態機械。PDF を開いた時点で `current_path=pdf_path` に進めておけば、
+    /// BS で `parent(pdf_path)=folder_path` に戻り、folder の drilled view
+    /// (ヒット一覧) が再描画される。2 段目 BS で Aggregated に戻る。
+    ///
+    /// `drill_into_subfolder` と違って `rebuild_items_from_global_search` は
+    /// **呼ばない**。呼び出し側の `load_pdf_as_folder` / `load_zip_as_folder` /
+    /// `load_folder` が items を PDF ページ / ZIP エントリ / フォルダ内容で埋める
+    /// ため、ここで drilled view の items に書き戻すと PDF ページ表示が潰れる。
+    ///
+    /// `global_search.active` が false、または `view == Aggregated` のときは no-op。
+    pub(crate) fn advance_drilled_current_path(&mut self, p: &Path) {
+        if !self.global_search.active {
+            return;
+        }
+        if let GlobalSearchView::DrilledInto {
+            container_root,
+            is_zip,
+            ..
+        } = self.global_search.view.clone()
+        {
+            self.global_search.view = GlobalSearchView::DrilledInto {
+                container_root,
+                current_path: p.to_path_buf(),
+                is_zip,
+            };
         }
     }
 
