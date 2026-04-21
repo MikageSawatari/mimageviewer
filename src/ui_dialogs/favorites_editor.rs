@@ -56,6 +56,15 @@ impl App {
             .into_iter()
             .map(|v| (v.favorite_id, v.stats))
             .collect();
+        // 名前索引側の stats も同様に集める (名前索引 supervisor は App 直下管理)
+        let name_stats_by_id: std::collections::HashMap<
+            uuid::Uuid,
+            crate::name_index_supervisor::NameIndexStats,
+        > = self
+            .name_index_supervisors
+            .iter()
+            .map(|(id, h)| (*id, h.snapshot_stats()))
+            .collect();
 
         let scroll_max_h = (ctx.content_rect().height() - 260.0).min(640.0).max(120.0);
         egui::Window::new("お気に入り")
@@ -128,7 +137,8 @@ impl App {
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "お気に入り配下を索引化して Ctrl+S / Ctrl+G で検索できます。\n\
+                            "お気に入りは以下を索引化して、名前検索 (Ctrl+S) ・\n\
+                             メタデータ検索 (Ctrl+G) できます。\n\
                              チェックを入れた項目はこの場で 1 回全走査し、以降は\n\
                              notify-rs と起動時スキャンで自動更新します。",
                         )
@@ -168,12 +178,8 @@ impl App {
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
 
-                                    // 名前索引の bulk が実行中 (= supervisor ではなく NameBulkEntry が
-                                    // 残っている) 状態を fav_id で引けるようにセット化する。
-                                    // 進捗テキストはダイアログ下部の「バックグラウンドインデクサ」
-                                    // セクションで流す。
-                                    let name_active_ids: std::collections::HashSet<uuid::Uuid> =
-                                        self.name_bulk_handles.keys().copied().collect();
+                                    // 名前索引 supervisor の進捗テキストはダイアログ下部の
+                                    // 「バックグラウンドインデクサ」セクションで表示する。
 
                                     // ── 各行 ──
                                     for i in 0..n {
@@ -222,7 +228,7 @@ impl App {
                                             draw_name_state_inline(
                                                 ui,
                                                 name_on,
-                                                name_active_ids.contains(&fav_id),
+                                                name_stats_by_id.get(&fav_id),
                                             );
                                         });
 
@@ -339,18 +345,19 @@ impl App {
                     // 完了の瞬間に progress.clear() されるので、何も出ない=全アイドル。
                     let mut active: Vec<(String, String)> = Vec::new();
                     for fav in &self.settings.favorites {
-                        // メタ index (supervisor 経由)
+                        // メタ index (indexer_manager supervisor 経由)
                         if let Some(msg) = stats_by_id
                             .get(&fav.id)
                             .and_then(|s| s.current_activity.as_ref())
                         {
                             active.push((format!("{} (メタ)", fav.name), msg.clone()));
                         }
-                        // 名前 index (name_bulk_handles 経由)
-                        if let Some(entry) = self.name_bulk_handles.get(&fav.id) {
-                            if let Some(msg) = entry.progress.snapshot() {
-                                active.push((format!("{} (名前)", fav.name), msg));
-                            }
+                        // 名前 index (name_index_supervisors 経由)
+                        if let Some(msg) = name_stats_by_id
+                            .get(&fav.id)
+                            .and_then(|s| s.current_activity.as_ref())
+                        {
+                            active.push((format!("{} (名前)", fav.name), msg.clone()));
                         }
                     }
                     if !active.is_empty() {
@@ -458,8 +465,18 @@ impl App {
 
 // ── チェックボックス右側の状態インライン表示ヘルパー ──────────────────────
 
-/// 名前索引列: バルク実行中なら ⏳、フラグ ON なら ✅、OFF なら —
-fn draw_name_state_inline(ui: &mut egui::Ui, on: bool, bulk_active: bool) {
+/// 名前索引列: メタ索引と同じ 3 分岐で表示する
+/// (両方とも notify-rs 監視を張って差分追従する構造になったため)。
+///
+/// - OFF: —
+/// - ON + `in_full_scan=true`: ⏳ スキャン中
+/// - ON + `initial_scan_done=true`, `in_full_scan=false`: ✅ 監視中
+/// - ON + supervisor 未登録 / `initial_scan_done=false`: ⏳ 起動中
+fn draw_name_state_inline(
+    ui: &mut egui::Ui,
+    on: bool,
+    stats: Option<&crate::name_index_supervisor::NameIndexStats>,
+) {
     if !on {
         ui.label(
             egui::RichText::new("—")
@@ -468,17 +485,31 @@ fn draw_name_state_inline(ui: &mut egui::Ui, on: bool, bulk_active: bool) {
         );
         return;
     }
-    if bulk_active {
+    let Some(s) = stats else {
         ui.label(
-            egui::RichText::new("⏳ バルク中")
+            egui::RichText::new("⏳ 起動中")
                 .size(11.0)
                 .color(egui::Color32::from_rgb(200, 170, 60)),
         );
-    } else {
+        return;
+    };
+    if s.in_full_scan {
         ui.label(
-            egui::RichText::new("✅ 索引あり")
+            egui::RichText::new("⏳ スキャン中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(200, 170, 60)),
+        );
+    } else if s.initial_scan_done {
+        ui.label(
+            egui::RichText::new("✅ 監視中")
                 .size(11.0)
                 .color(egui::Color32::from_rgb(100, 170, 100)),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new("⏳ 準備中")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(200, 170, 60)),
         );
     }
 }

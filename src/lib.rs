@@ -21,6 +21,7 @@ pub mod indexer_progress;
 pub mod indexer_supervisor;
 pub mod ingest_text;
 pub mod ingest_worker;
+pub mod name_index_supervisor;
 pub mod io_semaphore;
 pub mod logger;
 pub mod mask_db;

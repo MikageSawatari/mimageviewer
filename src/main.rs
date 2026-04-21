@@ -29,6 +29,7 @@ pub mod logger;
 pub mod mask_db;
 pub mod monitor;
 pub mod name_bulk_indexer;
+pub mod name_index_supervisor;
 pub mod open_with;
 pub mod os_theme;
 pub mod path_key;
@@ -252,6 +253,10 @@ fn main() -> eframe::Result {
             let mut app = app::App::default();
             emit_startup("app_default", Some(t));
             app.applied_ui_theme = Some(resolved);
+            // name index supervisor を起動時に spawn (auto_index_structure=true なお気に入り)。
+            // IndexerManager::sync_with_favorites がメタ側の対応処理を既に走らせているが、
+            // 名前索引は IndexerManager 外の管理なのでここで別途 spawn する。
+            app.spawn_initial_name_index_supervisors();
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
