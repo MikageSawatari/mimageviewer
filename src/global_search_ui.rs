@@ -319,6 +319,16 @@ fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
     child == ancestor || child.starts_with(ancestor)
 }
 
+/// フルスクリーンで開ける画像系アイテムか。Ctrl+↑↓ の飛び先判定に使う。
+fn is_fullscreen_target(item: Option<&GridItem>) -> bool {
+    matches!(
+        item,
+        Some(GridItem::Image(_))
+            | Some(GridItem::ZipImage { .. })
+            | Some(GridItem::PdfPage { .. })
+    )
+}
+
 /// Ctrl+↑↓ 用のナビゲーションエントリ。コンテナ境界を跨ぐフラットリストで使う。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NavEntry {
@@ -433,6 +443,7 @@ impl App {
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
     ) {
+        use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
         // 旧タスク停止: インデックスが付け替わるので in-flight は意味を失う
         if let Some(pending) = self.search_pending.take() {
@@ -458,13 +469,39 @@ impl App {
         self.xmp_cache.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();
+        // ── フルスクリーン向け idx キャッシュもリセット ──
+        // Ctrl+G 絞り込みビュー遷移をフルスクリーンを開いたまま行うと、
+        // fs_cache / fs_pending / ai_upscale_cache が古い items の idx のまま残り、
+        // open_fullscreen(new_idx) がキャッシュヒットして前コンテナの画像を表示する
+        // バグになる。idx ベースのキャッシュ全般を強制無効化する。
+        for (cancel, _, _) in self.fs_pending.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.fs_pending.clear();
+        self.fs_early_dims.clear();
+        self.fs_cache.clear();
+        self.fs_upload_backlog.clear();
+        for (cancel, _) in self.ai_upscale_pending.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_upscale_pending.clear();
+        self.ai_upscale_cache.clear();
+        self.ai_upscale_failed.clear();
+        self.ai_classify_cache.clear();
+        self.erase_base_cache.clear();
+        // 補正・マスクも idx ベースなのでリセット
+        self.adjustment_cache.clear();
+        self.adjustment_page_params.clear();
+        self.mask_pages.clear();
+        self.thumb_pixels.clear();
+        self.thumb_adjust_tex.clear();
+        self.rotation_cache.clear();
         // Codex P2-1: Ctrl+F フィルタの残留を解除
         self.search_filter = None;
         self.search_query.clear();
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
-        self.scroll_hint
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.scroll_hint.store(0, Ordering::Relaxed);
         self.rebuild_visible_indices();
     }
 
@@ -725,50 +762,46 @@ impl App {
     /// 移動し、その先頭 (forward) または末尾 (backward) の画像アイテムを
     /// そのままフルスクリーンで開く。fs ツリー DFS (start_folder_nav) は検索
     /// コンテナの外に出てしまうので、Ctrl+G 中はこちらのルートを使う。
+    ///
+    /// 移動先に直接のヒット画像が 1 枚も無い (サブフォルダ配下にしかない) ケースは
+    /// スキップしてさらに次の候補に進む。画像が見つかるまで前後方向に進み、
+    /// フラットリスト全体に画像が無ければ元の位置に戻して何もしない。
     pub(crate) fn global_search_ctrl_nav_fullscreen(&mut self, forward: bool) {
         let before_view = self.global_search.view.clone();
-        self.global_search_ctrl_nav(forward);
-        if self.global_search.view == before_view {
-            // 末端 / 先端で動かなかった → そのまま (フルスクリーン維持)
-            return;
+        loop {
+            let prev_view = self.global_search.view.clone();
+            self.global_search_ctrl_nav(forward);
+            if self.global_search.view == prev_view {
+                // これ以上進めない → 元の view に戻す (fs_cache を綺麗に戻すため再 rebuild)
+                if self.global_search.view != before_view {
+                    self.global_search.view = before_view;
+                    self.rebuild_items_from_global_search();
+                }
+                return;
+            }
+            // rebuild_items_from_global_search 済みなので visible_indices を見て
+            // 画像アイテムがあるか判定する。無ければ次の候補へ。
+            let image_idx = if forward {
+                self.visible_indices
+                    .iter()
+                    .copied()
+                    .find(|&i| is_fullscreen_target(self.items.get(i)))
+            } else {
+                self.visible_indices
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|&i| is_fullscreen_target(self.items.get(i)))
+            };
+            if let Some(idx) = image_idx {
+                self.open_fullscreen(idx);
+                self.selected = Some(idx);
+                self.scroll_to_selected = true;
+                self.update_last_selected_image();
+                return;
+            }
+            // 画像が無い (Folder 枝しかない) 候補はスキップしてさらに次へ
         }
-        // rebuild_items_from_global_search 済みなので、visible_indices の中から
-        // forward=true なら最初、false なら最後の画像系アイテムを拾って開く。
-        let image_idx = if forward {
-            self.visible_indices
-                .iter()
-                .copied()
-                .find(|&i| {
-                    matches!(
-                        self.items.get(i),
-                        Some(crate::grid_item::GridItem::Image(_))
-                            | Some(crate::grid_item::GridItem::ZipImage { .. })
-                            | Some(crate::grid_item::GridItem::PdfPage { .. })
-                    )
-                })
-        } else {
-            self.visible_indices
-                .iter()
-                .copied()
-                .rev()
-                .find(|&i| {
-                    matches!(
-                        self.items.get(i),
-                        Some(crate::grid_item::GridItem::Image(_))
-                            | Some(crate::grid_item::GridItem::ZipImage { .. })
-                            | Some(crate::grid_item::GridItem::PdfPage { .. })
-                    )
-                })
-        };
-        if let Some(idx) = image_idx {
-            self.open_fullscreen(idx);
-            self.selected = Some(idx);
-            self.scroll_to_selected = true;
-            self.update_last_selected_image();
-        }
-        // 画像アイテムが無かった (ヒットがサブフォルダ配下だけ) 場合はフルスクリーン
-        // 維持のまま、グリッドの見た目だけ更新済み。ユーザーが Esc で戻ったときに
-        // 正しい drill-in 状態が見える。
     }
 
     /// Ctrl+↑↓: 絞り込みビューでヒットを含むフォルダを DFS 順で前後に移動する。
