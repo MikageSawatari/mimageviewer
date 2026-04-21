@@ -535,19 +535,6 @@ pub struct Settings {
     /// 変更は次回起動時に反映 (IndexerManager::new で読まれる)。
     #[serde(default)]
     pub indexer_speed_profile: IndexerSpeedProfile,
-    /// v0.8.0: 名前索引 (Ctrl+S 検索用) の閲覧時自動追記を有効にするか。
-    /// - true (default): お気に入り配下のフォルダを閲覧するたび、その直下の
-    ///   フォルダ/ZIP/PDF 名を search_index.db に追記する (軽い I/O)。
-    /// - false: 閲覧時自動追記を止める。お気に入り編集で「名前」フル索引化 ON の
-    ///   favorite については全走査と watcher が引き続き動く。
-    #[serde(default = "default_true")]
-    pub auto_index_name_on_browse: bool,
-    /// v0.8.0: メタ索引 (Ctrl+F / Ctrl+G 検索用) の閲覧時自動生成を有効にするか。
-    /// - true: 閲覧したフォルダの画像メタを背景で索引化する (将来実装予定, v0.8.x)
-    /// - false (default): 閲覧時は何もしない。お気に入り編集で「メタ」フル索引化
-    ///   ON の favorite のみ supervisor が監視する (現在の挙動)。
-    #[serde(default)]
-    pub auto_index_meta_on_browse: bool,
     /// 一括キャッシュ作成: PDF 内の全ページをキャッシュ対象にする
     #[serde(default)]
     pub batch_cache_pdf_contents: bool,
@@ -828,8 +815,6 @@ impl Default for Settings {
             batch_cache_pdf_contents: false,
             search_index_checks: Vec::new(),
             indexer_speed_profile: IndexerSpeedProfile::default(),
-            auto_index_name_on_browse: true,
-            auto_index_meta_on_browse: false,
             thumb_prev_pages: default_thumb_prev_pages(),
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),

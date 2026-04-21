@@ -892,6 +892,11 @@ pub struct App {
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
+    /// ダイアログを開いた時点の favorite の索引フラグスナップショット
+    /// (favorite_id → (auto_index_structure, auto_index_metadata))。
+    /// OK 時に差分検出して、true→false の遷移で索引データをクリーンアップする。
+    pub(crate) favorites_pre_edit_snapshot:
+        Option<std::collections::HashMap<uuid::Uuid, (bool, bool)>>,
 
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
@@ -1442,6 +1447,7 @@ impl Default for App {
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
             show_favorites_editor: false,
+            favorites_pre_edit_snapshot: None,
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -1979,18 +1985,9 @@ impl App {
             })
             .collect();
 
-        // お気に入り配下の場合、現在フォルダ直下を検索インデックスに upsert (軽量)
-        let ai_t0 = std::time::Instant::now();
-        self.auto_index_current_folder(&path, &items);
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "lf_auto_index",
-                None,
-                lf_seq,
-                &[("ms", serde_json::Value::from(ai_t0.elapsed().as_secs_f64() * 1000.0))],
-            );
-        }
+        // v0.8.0 Phase 2c: 訪問時自動索引化は廃止。お気に入り編集で
+        // 「名前」フル索引化 ON にした favorite のみ name_bulk_indexer 経由で全走査する
+        // (検索結果が閲覧履歴に左右されないようにするため)。
 
         let items_len = items.len();
         self.start_loading_items(path, items, image_metas, existing_keys, video_items);
@@ -2013,11 +2010,11 @@ impl App {
 
     /// `path` がいずれかのお気に入り配下であれば、`items` の Folder/ZipFile/PdfFile を
     /// 検索インデックス DB に upsert する (ブラウズ時の軽量更新)。
+    #[allow(dead_code)] // v0.8.0 Phase 2c 以降は未使用 (訪問時自動索引化は廃止)。
+    // 「お気に入り編集 > 名前 索引化 ON」で全走査 + watcher 経由で維持する方式に移行したため、
+    // 閲覧に追従した追記は行わない (検索結果の予測可能性のため, docs/search-expansion-design.md 更新)。
+    // 将来 watcher 実装を待つ間の移行期には呼び出し元を復活させる余地を残すために残置。
     fn auto_index_current_folder(&mut self, path: &std::path::Path, items: &[GridItem]) {
-        // グローバル設定でオフにされていたら何もしない (v0.8.0 Phase 2)
-        if !self.settings.auto_index_name_on_browse {
-            return;
-        }
         let Some(db) = self.search_index_db.clone() else { return };
         let Some(fav_root) = self.find_favorite_root(path) else { return };
         // 同じフォルダへの往復ナビ時に SQLite 書き込みを回避する
@@ -2944,7 +2941,7 @@ impl App {
 
     /// condvar.wait() 中の全ワーカーを起床させる。
     /// cancel_token を true にした直後に呼び、ワーカーが即座にキャンセルを検知できるようにする。
-    fn wake_all_workers(&self) {
+    pub(crate) fn wake_all_workers(&self) {
         if let Some(ref q) = self.reload_queue {
             let (_, ref cvar) = **q;
             cvar.notify_all();

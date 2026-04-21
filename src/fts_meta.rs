@@ -171,6 +171,21 @@ impl FtsMetaDb {
         Ok(())
     }
 
+    /// お気に入り配下の全行を tombstone にする (favorite の「メタ」チェックを OFF にした時)。
+    ///
+    /// 返り値は tombstone に変えた行数。実際の Tantivy 削除は次回起動時の
+    /// reconciliation が処理する (status=3 の行は tombstone_purged 経由で delete_doc される)。
+    /// Ctrl+F / Ctrl+G の post-filter は `lookup_all_text_norm` で status=0 のみ見るので、
+    /// この場で tombstone にしておけば検索結果から即座に消える。
+    pub fn mark_tombstone_all_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE files SET status = 3 WHERE favorite_id = ?1",
+            params![favorite_id.to_string()],
+        )?;
+        Ok(changed)
+    }
+
     /// 削除開始: status → tombstone (§5.6.2 ステップ 1)。
     /// post-filter 時の除外対象になる。Tantivy delete 後に `purge_tombstone` で完全削除。
     pub fn mark_tombstone(&self, paths: &[String]) -> rusqlite::Result<()> {

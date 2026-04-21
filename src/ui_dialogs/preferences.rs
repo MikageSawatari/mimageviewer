@@ -793,39 +793,6 @@ fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
         }
     }
 
-    ui.add_space(14.0);
-    ui.separator();
-    ui.add_space(6.0);
-
-    // ── 閲覧時の自動索引追記 ──
-    ui.label(egui::RichText::new("閲覧時の自動索引追記").strong());
-    ui.add_space(4.0);
-    ui.label(
-        "お気に入り配下のフォルダを閲覧した時、軽い索引追記を自動で走らせるか。\n\
-         「名前索引」は直下のフォルダ/ZIP/PDF 名のみ (I/O < 1KB/フォルダ、常時 ON 推奨)。",
-    );
-    ui.add_space(4.0);
-    ui.checkbox(
-        &mut s.auto_index_name_on_browse,
-        "名前索引: 閲覧時に軽い追記を自動で走らせる (Ctrl+S 検索用)",
-    );
-    ui.add_space(2.0);
-    ui.add_enabled_ui(false, |ui| {
-        ui.checkbox(
-            &mut s.auto_index_meta_on_browse,
-            "メタ索引: 閲覧時のメタ追記 (v0.8.x で実装予定)",
-        );
-    });
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(
-            "※ お気に入りごとの「フル索引化 + notify-rs 監視」とは別設定です。\n  \
-             フル索引化のチェックはそれぞれ「お気に入り > 編集」ダイアログから。",
-        )
-        .weak()
-        .size(11.0),
-    );
-
     ui.add_space(10.0);
     ui.separator();
     ui.add_space(6.0);
@@ -834,7 +801,9 @@ fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "※ 速度プロファイルの変更は次回起動時に反映されます。\n\
              ※ PDF ワーカー / サムネイル読み込みとも I/O を共有するため、\n  \
              High にするとインデックス中に通常操作がもたつく可能性があります。\n\
-             ※ 未使用で放置してもアクティブなインデクサが無ければ I/O は消費しません。",
+             ※ 未使用で放置してもアクティブなインデクサが無ければ I/O は消費しません。\n\
+             ※ 索引化の対象はお気に入りごとに選べます (「お気に入り > 編集」ダイアログ)。\n  \
+             閲覧追従の自動索引化は v0.8.0 で廃止しました。",
         )
         .weak()
         .size(11.0),

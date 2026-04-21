@@ -335,6 +335,33 @@ impl IndexerManager {
     pub fn startup_diag(&self) -> StartupDiag {
         self.startup_diag
     }
+
+    /// お気に入りの「メタ索引」チェックを OFF にした時のクリーンアップ。
+    ///
+    /// そのお気に入りの全 fts_meta 行を tombstone にマークする。検索結果からは
+    /// 即座に消える (post-filter の status=0 ゲート経由)。Tantivy 側の doc 削除は
+    /// 次回起動時の reconciliation が処理する (`run_reconciliation` が tombstone を
+    /// 検出して `delete_doc` + `purge_tombstone` を走らせる)。
+    ///
+    /// 呼び出し順序: **必ず `sync_with_favorites` より前に呼ぶ** こと。先に supervisor
+    /// を drop すると writer が別スレッドに移ってしまうので、こちらの SQL UPDATE 中に
+    /// supervisor 側 ingest が走って race になる可能性がある (実害は限定的だが綺麗でない)。
+    pub fn purge_favorite_metadata(&self, favorite_id: Uuid) -> usize {
+        match self.meta_db.mark_tombstone_all_for_favorite(favorite_id) {
+            Ok(n) => {
+                crate::logger::log(format!(
+                    "IndexerManager: purge_favorite_metadata({favorite_id}) tombstoned {n} rows"
+                ));
+                n
+            }
+            Err(e) => {
+                crate::logger::log(format!(
+                    "IndexerManager: purge_favorite_metadata({favorite_id}) failed: {e}"
+                ));
+                0
+            }
+        }
+    }
 }
 
 impl Drop for IndexerManager {

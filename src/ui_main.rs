@@ -80,6 +80,19 @@ impl App {
                     // 編集
                     if ui.button("編集").clicked() {
                         self.show_favorites_editor = true;
+                        // OK 時の差分検出用に pre-edit の索引フラグを覚えておく
+                        self.favorites_pre_edit_snapshot = Some(
+                            self.settings
+                                .favorites
+                                .iter()
+                                .map(|f| {
+                                    (
+                                        f.id,
+                                        (f.auto_index_structure, f.auto_index_metadata),
+                                    )
+                                })
+                                .collect(),
+                        );
                         ui.close();
                     }
 
