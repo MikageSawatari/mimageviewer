@@ -721,6 +721,56 @@ impl App {
         }
     }
 
+    /// フルスクリーン中の Ctrl+↑↓: 絞り込みビューの next/prev フォルダに跨って
+    /// 移動し、その先頭 (forward) または末尾 (backward) の画像アイテムを
+    /// そのままフルスクリーンで開く。fs ツリー DFS (start_folder_nav) は検索
+    /// コンテナの外に出てしまうので、Ctrl+G 中はこちらのルートを使う。
+    pub(crate) fn global_search_ctrl_nav_fullscreen(&mut self, forward: bool) {
+        let before_view = self.global_search.view.clone();
+        self.global_search_ctrl_nav(forward);
+        if self.global_search.view == before_view {
+            // 末端 / 先端で動かなかった → そのまま (フルスクリーン維持)
+            return;
+        }
+        // rebuild_items_from_global_search 済みなので、visible_indices の中から
+        // forward=true なら最初、false なら最後の画像系アイテムを拾って開く。
+        let image_idx = if forward {
+            self.visible_indices
+                .iter()
+                .copied()
+                .find(|&i| {
+                    matches!(
+                        self.items.get(i),
+                        Some(crate::grid_item::GridItem::Image(_))
+                            | Some(crate::grid_item::GridItem::ZipImage { .. })
+                            | Some(crate::grid_item::GridItem::PdfPage { .. })
+                    )
+                })
+        } else {
+            self.visible_indices
+                .iter()
+                .copied()
+                .rev()
+                .find(|&i| {
+                    matches!(
+                        self.items.get(i),
+                        Some(crate::grid_item::GridItem::Image(_))
+                            | Some(crate::grid_item::GridItem::ZipImage { .. })
+                            | Some(crate::grid_item::GridItem::PdfPage { .. })
+                    )
+                })
+        };
+        if let Some(idx) = image_idx {
+            self.open_fullscreen(idx);
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+            self.update_last_selected_image();
+        }
+        // 画像アイテムが無かった (ヒットがサブフォルダ配下だけ) 場合はフルスクリーン
+        // 維持のまま、グリッドの見た目だけ更新済み。ユーザーが Esc で戻ったときに
+        // 正しい drill-in 状態が見える。
+    }
+
     /// Ctrl+↑↓: 絞り込みビューでヒットを含むフォルダを DFS 順で前後に移動する。
     /// - forward=true: 次のフォルダ
     /// - forward=false: 前のフォルダ

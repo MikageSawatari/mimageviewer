@@ -1801,8 +1801,18 @@ impl App {
         // 実際の close_fullscreen / load_folder / open_fullscreen は
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
-            if let Some(cur) = self.current_folder.clone() {
-                let forward = delta > 0;
+            let forward = delta > 0;
+            // Ctrl+G 絞り込みビュー中はファイルシステム DFS ではなく検索結果の
+            // NavEntry リスト上を移動する。fs ツリーを跨ぐと「検索結果の外」に
+            // 出てしまうので、検索解除まで Ctrl+G スコープに閉じ込める。
+            if self.global_search.active
+                && matches!(
+                    self.global_search.view,
+                    crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+                )
+            {
+                self.global_search_ctrl_nav_fullscreen(forward);
+            } else if let Some(cur) = self.current_folder.clone() {
                 self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
             }
         } else if !close_fs {

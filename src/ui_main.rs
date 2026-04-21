@@ -998,6 +998,17 @@ impl App {
                                 {
                                     nav = Some(n);
                                 }
+                                // handle_cell_interaction 内で同期的に items が差し替わる
+                                // 経路がある (SearchContainer ダブルクリック →
+                                // drill_into_container、Ctrl+G 絞り込み中の Folder
+                                // ダブルクリック → drill_into_subfolder)。以降の
+                                // self.items[idx] / self.thumbnails[idx] は stale idx で
+                                // out-of-bounds panic するので、境界を再チェックして
+                                // 残りの列/行を抜ける (panic.log の ui_main.rs:1026
+                                // "len is 0 but index is 102" を回避)。
+                                if idx >= self.items.len() || idx >= self.thumbnails.len() {
+                                    break;
+                                }
 
                                 let rot = self.get_rotation(idx);
                                 let has_page_override = self.adjustment_page_params.contains_key(&idx);
