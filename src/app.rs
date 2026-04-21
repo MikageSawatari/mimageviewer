@@ -814,6 +814,9 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 
+    // ── Ctrl+G グローバルメタ検索 UI 状態 (docs §10.3) ──────────────
+    pub(crate) global_search: crate::global_search_ui::GlobalSearchState,
+
     // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
     pub(crate) show_open_folder_dialog: bool,
     pub(crate) open_folder_input: String,
@@ -1348,6 +1351,7 @@ impl Default for App {
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
             indexer_manager,
+            global_search: crate::global_search_ui::GlobalSearchState::default(),
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
             open_folder_error: None,
@@ -7944,6 +7948,9 @@ impl eframe::App for App {
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();
+        // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
+        self.poll_global_search_debounce();
+        self.poll_global_search_events(ctx);
         // 非同期 pending が走っている間は次フレームも poll させる (egui アイドル寝防止)
         if self.search_pending.is_some()
             || self.favsearch_pending.is_some()
@@ -8100,10 +8107,32 @@ impl eframe::App for App {
             && !self.any_dialog_open()
             && !self.search_has_focus
             && !self.favsearch.has_focus
+            && !self.global_search.has_focus
         {
             let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
             if ctrl_s {
+                // Ctrl+G が開いていたら閉じる (排他、docs §10.3)
+                if self.global_search.active {
+                    self.close_global_search();
+                }
                 self.open_favsearch();
+            }
+        }
+
+        // ── Ctrl+G: グローバルメタ検索バー表示 (docs §10.3) ──────────
+        if !self.address_has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+        {
+            let ctrl_g = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::G));
+            if ctrl_g {
+                // Ctrl+S が開いていたら閉じてから Ctrl+G に切り替え (排他)
+                if self.favsearch.active {
+                    self.close_favsearch();
+                }
+                self.toggle_global_search();
             }
         }
 
@@ -8155,6 +8184,9 @@ impl eframe::App for App {
 
         // ── お気に入り検索バー (ツールバー直下の 2 行目相当) ─────────
         self.render_favsearch_bar(ctx);
+
+        // ── Ctrl+G グローバルメタ検索バー (docs §10.3) ────────────────
+        self.render_global_search_bar(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
