@@ -269,7 +269,21 @@ pub(crate) fn build_drilled_items(
         image_metas.push(placeholder);
     }
     for f in &direct_files {
-        items.push(GridItem::Image(f.clone()));
+        // 拡張子で GridItem の種類を分岐する。旧実装は無条件に
+        // `GridItem::Image` を入れていたため、ScanSnap のような PDF だらけの
+        // favorite に drill-in すると全サムネが「画像フォーマット判定不可」で
+        // 失敗する現象があった (2026-04 ユーザー報告)。
+        let ext = f
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let item = match ext.as_str() {
+            "pdf" => GridItem::PdfFile(f.clone()),
+            "zip" => GridItem::ZipFile(f.clone()),
+            _ => GridItem::Image(f.clone()),
+        };
+        items.push(item);
         image_metas.push(placeholder);
     }
 
@@ -502,6 +516,8 @@ impl App {
         if self.global_search.active {
             return;
         }
+        // 他の検索バー (Ctrl+F / Ctrl+S) が開いていれば閉じる (相互排他)
+        self.close_other_search_bars(crate::app::SearchMode::Global);
         self.global_search.active = true;
         self.global_search.focus_request = true;
         self.global_search.saved_folder = self.current_folder.clone();

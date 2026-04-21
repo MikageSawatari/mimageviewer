@@ -39,12 +39,8 @@ impl App {
                         ui.close();
                     }
                     if ui.button("メタデータ検索 (Ctrl+F)").clicked() {
-                        // Ctrl+G と相互排他: 起動中なら閉じる (Codex round-8 Must-fix #3)
-                        if self.global_search.active {
-                            self.close_global_search();
-                        }
-                        self.show_search_bar = true;
-                        self.search_focus_request = true;
+                        // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
+                        self.open_local_metadata_search();
                         ui.close();
                     }
                     ui.separator();
@@ -88,10 +84,7 @@ impl App {
 
                     // メタデータ検索 (Ctrl+G)
                     if ui.button("メタデータ検索 (Ctrl+G)").clicked() {
-                        // Ctrl+F と相互排他
-                        if self.show_search_bar {
-                            self.show_search_bar = false;
-                        }
+                        // 相互排他は toggle_global_search 内で
                         self.toggle_global_search();
                         ui.close();
                     }

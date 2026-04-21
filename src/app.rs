@@ -176,6 +176,17 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     ScannedDir { folders, all_media }
 }
 
+/// 3 種の検索モード。相互排他制御 (`close_other_search_bars`) 用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchMode {
+    /// Ctrl+F: ローカルフォルダのメタデータ検索
+    LocalMeta,
+    /// Ctrl+S: お気に入り配下の名前検索
+    Favsearch,
+    /// Ctrl+G: お気に入り全体のメタデータ検索
+    Global,
+}
+
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
 ///
 /// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
@@ -2220,7 +2231,9 @@ impl App {
     }
 
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
+    /// 他の検索バー (Ctrl+F / Ctrl+G) が開いていれば閉じて相互排他を保つ。
     pub(crate) fn open_favsearch(&mut self) {
+        self.close_other_search_bars(SearchMode::Favsearch);
         self.favsearch.active = true;
         self.favsearch.focus_request = true;
         self.favsearch.nav_stack.clear();
@@ -2228,6 +2241,34 @@ impl App {
         // 検索モードに入る際、現在のフォルダを保存して戻れるようにする
         if self.favsearch.saved_folder.is_none() {
             self.favsearch.saved_folder = self.current_folder.clone();
+        }
+    }
+
+    /// Ctrl+F のローカルメタデータ検索バーを開く。
+    /// 他の検索バーが開いていれば閉じる (相互排他)。
+    pub(crate) fn open_local_metadata_search(&mut self) {
+        self.close_other_search_bars(SearchMode::LocalMeta);
+        self.show_search_bar = true;
+        self.search_focus_request = true;
+    }
+
+    /// 指定した検索モード以外の検索バー 3 種をすべて閉じる。
+    /// Ctrl+F / Ctrl+S / Ctrl+G はユーザー操作がややこしくなるため同時には 1 つだけ
+    /// アクティブにする方針 (2026-04 ユーザー指摘)。
+    pub(crate) fn close_other_search_bars(&mut self, keep: SearchMode) {
+        if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_has_focus = false;
+            self.cancel_search_pending();
+            self.rebuild_visible_indices();
+        }
+        if !matches!(keep, SearchMode::Favsearch) && self.favsearch.active {
+            self.close_favsearch();
+        }
+        if !matches!(keep, SearchMode::Global) && self.global_search.active {
+            self.close_global_search();
         }
     }
 
@@ -8951,13 +8992,12 @@ impl eframe::App for App {
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
             && !self.favsearch.has_focus
-            && !self.global_search.active
             && !self.global_search.has_focus
         {
             let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
             if ctrl_f {
-                self.show_search_bar = true;
-                self.search_focus_request = true;
+                // 他の検索バーが開いていれば閉じて Ctrl+F に切り替え (相互排他)
+                self.open_local_metadata_search();
             }
         }
 
@@ -8989,10 +9029,7 @@ impl eframe::App for App {
         {
             let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
             if ctrl_s {
-                // Ctrl+G が開いていたら閉じる (排他、docs §10.3)
-                if self.global_search.active {
-                    self.close_global_search();
-                }
+                // 他の検索バーを閉じるのは open_favsearch 内で行う (相互排他)
                 self.open_favsearch();
             }
         }
@@ -9006,10 +9043,7 @@ impl eframe::App for App {
         {
             let ctrl_g = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::G));
             if ctrl_g {
-                // Ctrl+S が開いていたら閉じてから Ctrl+G に切り替え (排他)
-                if self.favsearch.active {
-                    self.close_favsearch();
-                }
+                // 相互排他は toggle_global_search → open_global_search 内で行う
                 self.toggle_global_search();
             }
         }

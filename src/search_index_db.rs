@@ -318,7 +318,25 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);
          CREATE INDEX IF NOT EXISTS idx_entries_fav  ON entries(favorite_root);",
-    )
+    )?;
+
+    // Migration (2026-04): コミット 7883750 で `favorite_root_display` カラムを
+    // 削除したが、旧バージョンで作られた既存 DB には `NOT NULL` 制約付きで残存して
+    // いる。新しい INSERT 文には載っていないため、upsert_children で
+    // `NOT NULL constraint failed: entries.favorite_root_display` が発生する。
+    // SQLite 3.35+ の `ALTER TABLE DROP COLUMN` で落とす (rusqlite bundled は新しい)。
+    let has_obsolete_col: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = 'favorite_root_display'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_obsolete_col > 0 {
+        conn.execute("ALTER TABLE entries DROP COLUMN favorite_root_display", [])?;
+        crate::logger::log(
+            "search_index_db: migrated — dropped obsolete favorite_root_display column",
+        );
+    }
+    Ok(())
 }
 
 fn chrono_now_secs() -> i64 {
