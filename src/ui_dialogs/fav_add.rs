@@ -114,6 +114,11 @@ impl App {
                         last.auto_index_thumbs = self.fav_add_auto_index_thumbs;
                     }
                     self.settings.save();
+                    // インデクサに反映 (auto_index_metadata=true で追加された場合は
+                    // Supervisor を起動する)
+                    if let Some(mgr) = self.indexer_manager.as_mut() {
+                        mgr.sync_with_favorites(&self.settings.favorites);
+                    }
                 }
                 // cache_creator_checked は favorites と同じ長さを保つ
                 self.cc.checked

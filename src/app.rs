@@ -804,6 +804,12 @@ pub struct App {
     pub(crate) fav_add_auto_index_metadata: bool,
     pub(crate) fav_add_auto_index_thumbs: bool,
 
+    // ── 全文検索インデクサ (Ctrl+G グローバルメタ検索用) ────────────
+    // auto_index_metadata=true のお気に入り毎に Supervisor を持ち、
+    // Tantivy + fts_meta.db の二段整合性で運用する。
+    // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
+    pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
+
     // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
     pub(crate) show_open_folder_dialog: bool,
     pub(crate) open_folder_input: String,
@@ -1280,6 +1286,10 @@ impl Default for App {
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings.ai_upscale_model_override.as_deref()
             .and_then(crate::ai::ModelKind::from_str);
+        // 全文検索インデクサを起動。DB/index オープンに失敗した場合 (ディスク容量不足等)
+        // は None となり、Ctrl+G 機能は無効だが他の機能は継続動作する。
+        let indexer_manager =
+            crate::indexer_manager::IndexerManager::new(&settings.favorites);
         Self {
             address: String::new(),
             current_folder: None,
@@ -1333,6 +1343,7 @@ impl Default for App {
             fav_add_auto_index_structure: false,
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
+            indexer_manager,
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
             open_folder_error: None,

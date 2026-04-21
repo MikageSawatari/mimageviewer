@@ -201,6 +201,12 @@ impl App {
 
         if apply {
             self.settings.save();
+            // インデクサに反映 (v0.8.0): ON/OFF 切り替えで Supervisor を spawn/stop する。
+            // Supervisor drop は thread join を伴うが、OK 押下は「ユーザが待ってもよい」
+            // タイミングなので UI ブロックは許容。
+            if let Some(mgr) = self.indexer_manager.as_mut() {
+                mgr.sync_with_favorites(&self.settings.favorites);
+            }
             self.show_favorites_editor = false;
         } else if cancel || !open {
             // キャンセル: 設定を再読み込みして変更を破棄
