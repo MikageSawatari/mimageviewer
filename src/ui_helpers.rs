@@ -543,12 +543,85 @@ fn layout_path_hierarchy(
         }
     }
     // Phase 3: 末端 1 行のみ (components は上で非空を確認済み)
+    // 末端名自体が長い PDF/ZIP 名のとき、min_font no-wrap だとセル幅を超えて
+    // 隣セル / バッジに重なるので、頭側を `…` で省略して max_size.x に収める。
     let tail = *components.last().expect("components is non-empty above");
-    painter.layout_no_wrap(
-        tail.to_string(),
+    layout_path_tail_elided(
+        painter,
+        tail,
         egui::FontId::proportional(min_font),
         color,
+        max_size.x,
     )
+}
+
+// -----------------------------------------------------------------------
+// 1 行パス表示 (末端優先でヘッド側に … を付けて縮める)
+// -----------------------------------------------------------------------
+
+/// `text` を 1 行でレイアウトし、`max_width` を超える場合は先頭側を 1 文字ずつ削って
+/// `…` プレフィクスを付ける。ファイル名 (末端) を優先して残す用途 (フルスクリーン
+/// 読込中インジケータでどのファイルを読み込んでいるか見せるとき等)。
+pub fn layout_path_tail_elided(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let full = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+    if full.size().x <= max_width {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // `…<tail>` が収まる drop 数を二分探索 (線形だと長いパスで layout_no_wrap が O(n) 呼ばれる)。
+    let (mut lo, mut hi) = (1usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let candidate: String = std::iter::once('…').chain(chars[mid..].iter().copied()).collect();
+        let galley = painter.layout_no_wrap(candidate, font.clone(), color);
+        if galley.size().x <= max_width {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    if lo >= chars.len() {
+        return painter.layout_no_wrap("…".to_string(), font, color);
+    }
+    let candidate: String = std::iter::once('…').chain(chars[lo..].iter().copied()).collect();
+    painter.layout_no_wrap(candidate, font, color)
+}
+
+/// 中央に水平整列した 1 行ラベルを `rect` 内に描画する。はみ出す場合は頭側を `…` で削る。
+/// 用途はフルスクリーン読込中プレースホルダ直下のファイルパス表示。
+/// `text` が空なら何もしない。
+///
+/// - `anchor_y`: テキストベースの基準 y 座標 (このラインを top にしてラベルを置く)
+/// - `h_padding`: rect 左右端から確保する水平マージン
+pub fn draw_centered_elided_label(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    font_size: f32,
+    color: egui::Color32,
+    anchor_y: f32,
+    h_padding: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let max_w = (rect.width() - h_padding * 2.0).max(40.0);
+    let galley = layout_path_tail_elided(
+        painter,
+        text,
+        egui::FontId::proportional(font_size),
+        color,
+        max_w,
+    );
+    let gs = galley.size();
+    let pos = egui::pos2(rect.center().x - gs.x * 0.5, anchor_y);
+    painter.galley(pos, galley, color);
 }
 
 // -----------------------------------------------------------------------

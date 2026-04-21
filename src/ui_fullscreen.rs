@@ -580,7 +580,7 @@ impl App {
                                         ui, image_rect,
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),
                                         state.is_video, state.fs_load_failed, fs_rotation, zp,
-                                        free_rot, &bg_style,
+                                        free_rot, &bg_style, &state.location_display,
                                     );
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
@@ -829,6 +829,36 @@ impl App {
         }
     }
 
+    /// 上部ホバーバー・読込中プレースホルダ共通で使う、`idx` 位置の表示用パス文字列。
+    /// 通常は `<folder>\<filename>`、ZIP/PDF 内は `<archive> > <entry>` / `<pdf> > Page N`。
+    fn location_display_for(&self, idx: usize) -> String {
+        let item = self.items.get(idx);
+        let filename = item.map(|i| i.name().to_string()).unwrap_or_default();
+        let base_folder = self
+            .effective_folder()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        compute_location_display(item, &base_folder, &filename)
+    }
+
+    /// 見開きの各ページ用: 読込中ブランチが走りそうなときだけパスを計算する。
+    /// steady state (fs_cache or thumbnail hit) では空文字列を返し、呼び出し先の
+    /// `draw_centered_elided_label` は空なら描画をスキップする。
+    fn location_display_for_loading(&self, idx: usize) -> String {
+        let has_display_tex = matches!(
+            self.fs_cache.get(&idx),
+            Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. })
+        ) || matches!(
+            self.thumbnails.get(idx),
+            Some(ThumbnailState::Loaded { .. })
+        );
+        if has_display_tex {
+            String::new()
+        } else {
+            self.location_display_for(idx)
+        }
+    }
+
     /// フルスクリーン描画に必要な状態を事前計算する。
     fn prepare_fullscreen_state(&self, _ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
@@ -885,17 +915,7 @@ impl App {
             _ => None,
         };
 
-        let filename = self
-            .items
-            .get(fs_idx)
-            .map(|item| item.name().to_string())
-            .unwrap_or_default();
-        let base_folder = self
-            .effective_folder()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let location_display =
-            compute_location_display(self.items.get(fs_idx), &base_folder, &filename);
+        let location_display = self.location_display_for(fs_idx);
         // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
         // AI テクスチャが選ばれている場合でも、元画像のサイズを使う。
         // GPU 上限超過で worker が clamp した画像は `source_dims` に原寸が入っており、
@@ -2091,6 +2111,9 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
         free_rotation_rad: f32,
         bg_style: &FsBgStyle<'_>,
+        // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
+        // 空ならラベル描画をスキップ。
+        location_display: &str,
     ) {
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
@@ -2152,7 +2175,8 @@ impl App {
                 egui::Color32::from_gray(180),
             );
         } else {
-            ui.painter().text(
+            let painter = ui.painter();
+            painter.text(
                 full_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 if is_video {
@@ -2162,6 +2186,15 @@ impl App {
                 },
                 egui::FontId::proportional(24.0),
                 egui::Color32::from_gray(180),
+            );
+            crate::ui_helpers::draw_centered_elided_label(
+                painter,
+                full_rect,
+                location_display,
+                14.0,
+                egui::Color32::from_gray(170),
+                full_rect.center().y + 22.0,
+                20.0,
             );
         }
     }
@@ -2421,6 +2454,10 @@ impl App {
         let zoom_pan = self.fs_zoom_pan();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
+        // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
+        // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
+        let left_location = self.location_display_for_loading(left_idx);
+        let right_location = self.location_display_for_loading(right_idx);
         // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
         // fs_bg_style は &mut self を要求するため先に解決してから以降は shared borrow に切り替える。
         // 透過画像が見開きの片方だけの場合もあるので両ページに同じ bg を適用する。
@@ -2501,6 +2538,7 @@ impl App {
                 &self.fs_cache,
                 &self.thumbnails,
                 &bg_style,
+                &left_location,
             );
             Self::draw_fs_spread_page(
                 &painter,
@@ -2510,6 +2548,7 @@ impl App {
                 &self.fs_cache,
                 &self.thumbnails,
                 &bg_style,
+                &right_location,
             );
 
             // ルーペが参照するレイアウトを記録 (両ページのサイズが既知のときのみ信頼できる)
@@ -2547,6 +2586,7 @@ impl App {
                 &self.fs_cache,
                 &self.thumbnails,
                 &bg_style,
+                &left_location,
             );
             Self::draw_fs_spread_page(
                 &painter,
@@ -2556,6 +2596,7 @@ impl App {
                 &self.fs_cache,
                 &self.thumbnails,
                 &bg_style,
+                &right_location,
             );
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
@@ -2596,6 +2637,8 @@ impl App {
 
     /// 見開きモードの1ページ分を指定領域に描画。
     /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
+    /// `location_display` は draw_fs_image と同じで、空なら読込中ラベル描画をスキップ。
+    #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         painter: &egui::Painter,
         rect: egui::Rect,
@@ -2604,6 +2647,7 @@ impl App {
         fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
         thumbnails: &[ThumbnailState],
         bg_style: &FsBgStyle<'_>,
+        location_display: &str,
     ) {
         // テクスチャ取得（フルサイズ or サムネイル）
         let tex = match fs_cache.get(&idx) {
@@ -2644,13 +2688,21 @@ impl App {
                 crate::app::draw_rotated_image(painter, handle.id(), img_rect, rotation);
             }
         } else {
-            // 読込中
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "読込中...",
                 egui::FontId::proportional(18.0),
                 egui::Color32::from_gray(150),
+            );
+            crate::ui_helpers::draw_centered_elided_label(
+                painter,
+                rect,
+                location_display,
+                12.0,
+                egui::Color32::from_gray(150),
+                rect.center().y + 18.0,
+                12.0,
             );
         }
     }
