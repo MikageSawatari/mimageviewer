@@ -621,7 +621,7 @@ mod tests {
         let fav = mk_fav("A", &fav_root, true);
 
         // pending 行を手動で作る (crash 残留シミュ)
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "txt")
+        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "txt", "")
             .unwrap();
         // Tantivy にも入れておく (writer は scope 内で drop して lockfile を解放する)
         {
@@ -638,6 +638,7 @@ mod tests {
                     file_size: 1,
                     name: "1.jpg".into(),
                     all_text: "txt".into(),
+                    tags: String::new(),
                 },
             )
             .unwrap();
@@ -672,7 +673,7 @@ mod tests {
         let fav = mk_fav("A", &fav_root, true);
 
         // tombstone 行を作る
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t")
+        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t", "")
             .unwrap();
         meta.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
         meta.mark_tombstone(&["c:/a/1.jpg".to_string()]).unwrap();
@@ -694,7 +695,7 @@ mod tests {
         // metadata フラグ OFF
         let fav = mk_fav("A", &fav_root, false);
 
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t")
+        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t", "")
             .unwrap();
 
         let mut rw = fts.writer().unwrap();

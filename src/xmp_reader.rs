@@ -474,6 +474,95 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// dc:subject 読み取り (タグ機能 — docs/tag-feature.md §6.4)
+// ---------------------------------------------------------------------------
+
+/// ファイルの XMP `dc:subject` Bag 要素を読み取る。
+/// `#` で始まるもの・つかないもの問わず全て返す。呼び出し側が必要に応じて
+/// `#` 接頭辞でフィルタする。
+pub fn read_dc_subject(path: &Path) -> Vec<String> {
+    if !extension_might_have_xmp(path) {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    read_dc_subject_from_bytes(&bytes)
+}
+
+/// バイト列版。
+pub fn read_dc_subject_from_bytes(bytes: &[u8]) -> Vec<String> {
+    if !has_xmp_capable_magic(bytes) {
+        return Vec::new();
+    }
+    let Some(xmp) = extract_xmp_packet(bytes) else {
+        return Vec::new();
+    };
+    parse_dc_subject(&xmp)
+}
+
+/// RDF/XML の `<dc:subject><rdf:Bag><rdf:li>値</rdf:li>...</rdf:Bag></dc:subject>` から
+/// 値を抽出する。名前空間で厳密判定 (URI = purl.org/dc/elements/1.1/)。
+///
+/// Bag 以外の記法 (Seq/Alt) や属性形式は仕様上 dc:subject では使われないが、
+/// 念のため parseType="Resource" やネストされた rdf:li も拾う寛容実装にする。
+fn parse_dc_subject(xml: &[u8]) -> Vec<String> {
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    // dc:subject 要素の内部にいるか
+    let mut depth_in_dc_subject: i32 = 0;
+    // 現在 rdf:li の内部にいてテキストを収集中か
+    let mut in_li = false;
+    let mut current_value = String::new();
+
+    loop {
+        let ev = match reader.read_resolved_event_into(&mut buf) {
+            Ok((ns, e)) => (ns, e),
+            Err(_) => break,
+        };
+        match ev {
+            (ns, Event::Start(e)) => {
+                let local = e.local_name().as_ref().to_vec();
+                let is_dc_subject = local == b"subject"
+                    && matches!(&ns, quick_xml::name::ResolveResult::Bound(b) if b.as_ref() == DC_NAMESPACE);
+                if is_dc_subject {
+                    depth_in_dc_subject += 1;
+                } else if depth_in_dc_subject > 0 && local == b"li" {
+                    in_li = true;
+                    current_value.clear();
+                }
+            }
+            (_, Event::Text(t)) => {
+                if in_li {
+                    if let Ok(s) = t.decode() {
+                        current_value.push_str(s.as_ref());
+                    }
+                }
+            }
+            (_, Event::End(e)) => {
+                let local = e.local_name().as_ref().to_vec();
+                if local == b"li" && in_li {
+                    let v = current_value.trim().to_string();
+                    if !v.is_empty() {
+                        tags.push(v);
+                    }
+                    in_li = false;
+                    current_value.clear();
+                } else if local == b"subject" && depth_in_dc_subject > 0 {
+                    depth_in_dc_subject -= 1;
+                }
+            }
+            (_, Event::Eof) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    tags
+}
+
+// ---------------------------------------------------------------------------
 // URL 検証 (未信頼メタデータなので必ずチェック)
 // ---------------------------------------------------------------------------
 
@@ -725,5 +814,89 @@ mod tests {
         let path = dir.path().join("late.mp4");
         std::fs::write(&path, &bytes).expect("write tempfile");
         assert!(read_tweet_info(&path).is_none());
+    }
+
+    // ---- dc:subject 読み取り ----
+
+    #[test]
+    fn parse_dc_subject_standard_bag() {
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:dc='http://purl.org/dc/elements/1.1/'>
+              <dc:subject>
+                <rdf:Bag>
+                  <rdf:li>#原神</rdf:li>
+                  <rdf:li>#風景</rdf:li>
+                  <rdf:li>既存タグ</rdf:li>
+                </rdf:Bag>
+              </dc:subject>
+            </rdf:Description>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        let tags = parse_dc_subject(xml.as_bytes());
+        assert_eq!(tags, vec!["#原神", "#風景", "既存タグ"]);
+    }
+
+    #[test]
+    fn parse_dc_subject_empty_when_absent() {
+        let tags = parse_dc_subject(SAMPLE_XMP_STR.as_bytes());
+        // SAMPLE_XMP_STR は dc:subject を持たない (dc:description と dc:creator のみ)
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn parse_dc_subject_ignores_empty_li() {
+        let xml = br#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:dc='http://purl.org/dc/elements/1.1/'>
+              <dc:subject>
+                <rdf:Bag>
+                  <rdf:li></rdf:li>
+                  <rdf:li>valid</rdf:li>
+                  <rdf:li>   </rdf:li>
+                </rdf:Bag>
+              </dc:subject>
+            </rdf:Description>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        let tags = parse_dc_subject(xml);
+        assert_eq!(tags, vec!["valid"]);
+    }
+
+    #[test]
+    fn read_dc_subject_from_jpeg_roundtrip() {
+        let xml = r#"<?xml version='1.0'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about=''
+      xmlns:dc='http://purl.org/dc/elements/1.1/'>
+      <dc:subject>
+        <rdf:Bag>
+          <rdf:li>#nature</rdf:li>
+          <rdf:li>#landscape</rdf:li>
+        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        // JPEG APP1 セグメントを手動で構築
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload: Vec<u8> = xmp_id
+            .iter()
+            .chain(xml.as_bytes())
+            .copied()
+            .collect();
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&[0xFF, 0xD8]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        let seg_len = (payload.len() + 2) as u16;
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
+
+        let tags = read_dc_subject_from_bytes(&out);
+        assert_eq!(tags, vec!["#nature", "#landscape"]);
     }
 }

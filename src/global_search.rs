@@ -25,7 +25,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::Sender;
 use uuid::Uuid;
 
-use crate::fts_index::{self, FtsIndex};
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::schema::IndexRecordOption;
+use tantivy::Term;
+
+use crate::fts_index::{self, Fields, FtsIndex};
 use crate::fts_meta::FtsMetaDb;
 use crate::search_query::{self, Token};
 
@@ -116,30 +120,33 @@ pub fn run(
         return;
     }
 
-    // 4. 正の include トークン群を token 単位で bigram 化 (Codex 6 回目指摘 #1)
-    let include_tokens: Vec<&str> = tokens
+    // 4. トークンをタグ/通常に分離し、それぞれ query を組み立てる。
+    //    タグトークンは Tantivy の tags フィールドに対する TermQuery、
+    //    通常トークンは all_text に対する bigram AND query。
+    let (tag_tokens, keyword_tokens): (Vec<&Token>, Vec<&Token>) =
+        tokens.iter().partition(|t| t.is_tag);
+
+    let include_keywords: Vec<&str> = keyword_tokens
         .iter()
         .filter(|t| t.include)
         .map(|t| t.needle.as_str())
         .collect();
-    if include_tokens.is_empty() {
-        // validate_query で NOT-only は弾かれるはずだが念のため
-        let _ = tx.send(SearchStreamEvent::Done {
-            truncated: false,
-            reason: DoneReason::RejectedQuery(RejectReason::NotOnly),
-        });
-        return;
-    }
 
-    let Some(query) =
-        fts_index::build_bigram_and_query(fts.fields(), &include_tokens, Some(favorite_ids))
-    else {
-        // bigram が作れない (どこかのトークンが 1 文字等) → early return
-        let _ = tx.send(SearchStreamEvent::Done {
-            truncated: false,
-            reason: DoneReason::RejectedQuery(RejectReason::TooShort),
-        });
-        return;
+    let query = build_combined_query(
+        fts.fields(),
+        &include_keywords,
+        &tag_tokens,
+        favorite_ids,
+    );
+    let query = match query {
+        Some(q) => q,
+        None => {
+            let _ = tx.send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::RejectedQuery(RejectReason::TooShort),
+            });
+            return;
+        }
     };
 
     // 4. Searcher snapshot 固定 (§9.1 ステップ 4)
@@ -248,14 +255,66 @@ fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason
     if !tokens.iter().any(|t| t.include) {
         return Err(RejectReason::NotOnly);
     }
-    // 各 include トークンが §4.3 の最小長 (CJK: 2 / ASCII: 3) を満たすか確認。
-    // 1 つでも短ければ TooShort (AND 条件なので短い方が最低基準になる)。
-    for t in tokens.iter().filter(|t| t.include) {
+    // タグトークンは最小長チェックの対象外 (exact match なので 1 文字でも OK)。
+    // 通常キーワードの include トークンのみ §4.3 の最小長 (CJK: 2 / ASCII: 3) を確認。
+    for t in tokens.iter().filter(|t| t.include && !t.is_tag) {
         if !has_sufficient_length(&t.needle) {
             return Err(RejectReason::TooShort);
         }
     }
     Ok(())
+}
+
+/// タグ tokens と keyword tokens を合わせた BooleanQuery を作る。
+/// - include keyword: bigram AND (既存)
+/// - include tag: tags フィールドの TermQuery (Must)
+/// - exclude tag: tags フィールドの TermQuery (MustNot)
+/// - favorite scope: favorite_ids の OR (既存)
+///
+/// keyword も tag も空なら None (Tantivy を叩かない方が速い)。
+fn build_combined_query(
+    fields: &Fields,
+    include_keywords: &[&str],
+    tag_tokens: &[&Token],
+    favorite_ids: &[Uuid],
+) -> Option<BooleanQuery> {
+    if favorite_ids.is_empty() {
+        return None;
+    }
+
+    let mut subs: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+    if !include_keywords.is_empty() {
+        // 既存の bigram query を Must として埋め込む (favorite filter は後で足すので None を渡す)
+        let Some(kw_q) = fts_index::build_bigram_and_query(fields, include_keywords, None) else {
+            return None;
+        };
+        subs.push((Occur::Must, Box::new(kw_q)));
+    }
+
+    for t in tag_tokens {
+        let term = Term::from_field_text(fields.tags, &t.needle.to_lowercase());
+        let tq = TermQuery::new(term, IndexRecordOption::Basic);
+        let occur = if t.include { Occur::Must } else { Occur::MustNot };
+        subs.push((occur, Box::new(tq)));
+    }
+
+    if subs.is_empty() {
+        return None;
+    }
+
+    // favorite_id scope を Must で追加
+    let mut fav_subs: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(favorite_ids.len());
+    for id in favorite_ids {
+        let term = Term::from_field_text(fields.favorite_id, &id.to_string());
+        fav_subs.push((
+            Occur::Should,
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+        ));
+    }
+    subs.push((Occur::Must, Box::new(BooleanQuery::from(fav_subs))));
+
+    Some(BooleanQuery::from(subs))
 }
 
 /// §4.3 最小クエリ長ポリシー。
@@ -334,7 +393,7 @@ mod tests {
     fn ingest(meta: &FtsMetaDb, fts: &FtsIndex, fav: Uuid, path_str: &str, text: &str) {
         let key = normalize_path(&PathBuf::from(path_str));
         let all_text_norm = crate::search_norm::normalize_for_match(text);
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text_norm)
+        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text_norm, "")
             .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
@@ -349,6 +408,7 @@ mod tests {
                 file_size: 0,
                 name: path_str.rsplit('/').next().unwrap_or(path_str).to_string(),
                 all_text: all_text_norm,
+                tags: String::new(),
             },
         )
         .unwrap();
@@ -586,7 +646,7 @@ mod tests {
         let fav = Uuid::new_v4();
         let key = normalize_path(&PathBuf::from("c:/a.jpg"));
         let all_text = crate::search_norm::normalize_for_match("夕焼け");
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text)
+        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text, "")
             .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
@@ -601,6 +661,7 @@ mod tests {
                 file_size: 0,
                 name: "a.jpg".to_string(),
                 all_text,
+                tags: String::new(),
             },
         )
         .unwrap();

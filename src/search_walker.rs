@@ -393,7 +393,7 @@ mod tests {
         let key = normalize_path(&abs);
 
         // DB に同じ mtime/size で登録済み
-        db.mark_pending(&key, fav, &root, mtime, size, "text")
+        db.mark_pending(&key, fav, &root, mtime, size, "text", "")
             .unwrap();
         db.mark_ok(&[key.clone()]).unwrap();
 
@@ -414,7 +414,7 @@ mod tests {
         let abs = root.join("a.jpg");
         let key = normalize_path(&abs);
         // DB に "古い" mtime で登録
-        db.mark_pending(&key, fav, &root, 1, 1, "").unwrap();
+        db.mark_pending(&key, fav, &root, 1, 1, "", "").unwrap();
         db.mark_ok(&[key.clone()]).unwrap();
 
         let r = scan_sync(fav, &root, &db);
@@ -431,7 +431,7 @@ mod tests {
         make_file(&root, "survivor.jpg", b"s");
 
         let dead_key = normalize_path(&root.join("gone.jpg"));
-        db.mark_pending(&dead_key, fav, &root, 1, 1, "").unwrap();
+        db.mark_pending(&dead_key, fav, &root, 1, 1, "", "").unwrap();
         db.mark_ok(&[dead_key.clone()]).unwrap();
         let surv_key = normalize_path(&root.join("survivor.jpg"));
         let surv_meta = root.join("survivor.jpg").metadata().unwrap();
@@ -447,6 +447,7 @@ mod tests {
             &root,
             surv_mtime,
             surv_meta.len() as i64,
+            "",
             "",
         )
         .unwrap();
@@ -498,7 +499,7 @@ mod tests {
         fs::create_dir_all(&root_a).unwrap();
         let key_b = normalize_path(&tmp.path().join("B/other.jpg"));
         // fav_b 所属の行を追加
-        db.mark_pending(&key_b, fav_b, &tmp.path().join("B"), 1, 1, "")
+        db.mark_pending(&key_b, fav_b, &tmp.path().join("B"), 1, 1, "", "")
             .unwrap();
         db.mark_ok(&[key_b]).unwrap();
 

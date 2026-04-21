@@ -26,6 +26,46 @@ use std::path::Path;
 
 use crate::search_norm::normalize_for_match;
 
+/// XMP `dc:subject` から抽出したタグをスペース区切りで連結した文字列を返す。
+/// タグが無い / 読み取り失敗なら空文字列。
+///
+/// - `#` で始まるタグ: mIV で付与されたタグ扱い
+/// - `#` で始まらないタグ: 他ソフトで付与されたタグ (そのまま保存、検索では非使用)
+///
+/// 返す値はそのまま fts_meta.db の `tags` 列に UPSERT される。
+/// 大文字小文字は保持 (検索時に正規化)。
+pub fn extract_tags_for_file(path: &Path) -> String {
+    let tags = crate::xmp_reader::read_dc_subject(path);
+    build_tags_column(&tags)
+}
+
+/// バイト列版 (ZIP 内画像など)。
+pub fn extract_tags_from_bytes(bytes: &[u8]) -> String {
+    let tags = crate::xmp_reader::read_dc_subject_from_bytes(bytes);
+    build_tags_column(&tags)
+}
+
+fn build_tags_column(tags: &[String]) -> String {
+    // タグ内に空白や制御文字が混じると DB カラムの分割が崩れるので
+    // 空白類は全部 `_` に置換する。タグ名の仕様で禁止予定なので実運用で
+    // ほぼ発生しない防御ロジック。
+    let mut out = String::new();
+    for t in tags {
+        let cleaned: String = t
+            .chars()
+            .map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c })
+            .collect();
+        if cleaned.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&cleaned);
+    }
+    out
+}
+
 /// 1 ファイルから検索対象テキストを作る。
 /// 抽出に失敗した部分はスキップし、ファイル名は必ず含める (空文字列は返さない)。
 pub fn build_all_text_for_file(path: &Path) -> String {

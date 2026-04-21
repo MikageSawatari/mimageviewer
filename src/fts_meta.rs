@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::search_index_db::normalize_path;
 
 /// スキーマ変更時に bump することで、次回起動時に全再インデックスをトリガする定数。
-pub const INDEX_VERSION: i64 = 1;
+/// v2: tags 列追加 (docs/tag-feature.md)
+pub const INDEX_VERSION: i64 = 2;
 
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +38,9 @@ pub struct FileMeta {
     pub status: FileStatus,
     /// post-filter で使う正規化済み全文。`search_norm::normalize_for_match` 済み。
     pub all_text_norm: String,
+    /// XMP `dc:subject` から抽出したタグ列。スペース区切り、`#` 接頭辞込みで保存。
+    /// 例: "#原神 #風景 既存タグ" 。`#` の有無で mIV 付与/他ソフト由来を区別する。
+    pub tags: String,
 }
 
 /// ingest と delete の二段整合性プロトコル用 (§5.6)。
@@ -94,8 +98,11 @@ impl FtsMetaDb {
         })
     }
 
-    /// status=pending で UPSERT。既存 row の generation を増やし、all_text_norm を更新する。
+    /// status=pending で UPSERT。既存 row の generation を増やし、all_text_norm / tags を更新する。
     /// Tantivy への add_document 前に呼ばれる (§5.6.1 ステップ 1)。
+    ///
+    /// `tags` は XMP dc:subject から抽出したタグ列 (スペース区切り、`#` 接頭辞込み)。
+    /// タグ取得に失敗・非対応形式の場合は空文字列を渡す。
     pub fn mark_pending(
         &self,
         path: &str,
@@ -104,6 +111,7 @@ impl FtsMetaDb {
         mtime: i64,
         file_size: i64,
         all_text_norm: &str,
+        tags: &str,
     ) -> rusqlite::Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = now_epoch();
@@ -111,8 +119,8 @@ impl FtsMetaDb {
         conn.execute(
             "INSERT INTO files (
                 path, favorite_id, favorite_root, mtime, file_size,
-                indexed_at, index_version, index_generation, status, all_text_norm
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
+                indexed_at, index_version, index_generation, status, all_text_norm, tags
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10)
              ON CONFLICT(path) DO UPDATE SET
                 favorite_id = excluded.favorite_id,
                 favorite_root = excluded.favorite_root,
@@ -122,7 +130,8 @@ impl FtsMetaDb {
                 index_version = excluded.index_version,
                 index_generation = files.index_generation + 1,
                 status = 1,
-                all_text_norm = excluded.all_text_norm",
+                all_text_norm = excluded.all_text_norm,
+                tags = excluded.tags",
             params![
                 path,
                 favorite_id.to_string(),
@@ -133,6 +142,7 @@ impl FtsMetaDb {
                 INDEX_VERSION,
                 FileStatus::Pending as i64,
                 all_text_norm,
+                tags,
             ],
         )?;
         let gen_val: i64 = conn.query_row(
@@ -141,6 +151,43 @@ impl FtsMetaDb {
             |r| r.get(0),
         )?;
         Ok(gen_val)
+    }
+
+    /// post-filter 用: 指定 path 群のタグ列を一括取得。
+    /// status=Ok のみ返す (`lookup_all_text_norm` と同じポリシー)。
+    pub fn lookup_tags(&self, paths: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = (0..paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT path, tags FROM files \
+             WHERE path IN ({}) AND status = 0",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::with_capacity(paths.len());
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 単一 path のタグ更新 (タグ書き込み worker が呼ぶ高速経路。v1.0 では未使用)。
+    #[allow(dead_code)]
+    pub fn set_tags(&self, path: &str, tags: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE files SET tags = ?1 WHERE path = ?2",
+            params![tags, path],
+        )?;
+        Ok(())
     }
 
     /// Tantivy commit 後に呼ぶ。status=pending → ok に遷移 (§5.6.1 ステップ 4)。
@@ -321,7 +368,7 @@ impl FtsMetaDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT path, favorite_id, favorite_root, mtime, file_size,
-                    indexed_at, index_version, index_generation, status, all_text_norm
+                    indexed_at, index_version, index_generation, status, all_text_norm, tags
              FROM files WHERE status != 0",
         )?;
         let rows = stmt.query_map([], row_to_filemeta)?;
@@ -337,7 +384,7 @@ impl FtsMetaDb {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT path, favorite_id, favorite_root, mtime, file_size,
-                    indexed_at, index_version, index_generation, status, all_text_norm
+                    indexed_at, index_version, index_generation, status, all_text_norm, tags
              FROM files WHERE path = ?1",
             params![path],
             row_to_filemeta,
@@ -391,6 +438,7 @@ fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         index_generation: row.get(7)?,
         status: FileStatus::from_i64(status_i),
         all_text_norm: row.get(9)?,
+        tags: row.get(10)?,
     })
 }
 
@@ -406,12 +454,22 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             index_version     INTEGER NOT NULL,
             index_generation  INTEGER NOT NULL,
             status            INTEGER NOT NULL,
-            all_text_norm     TEXT NOT NULL DEFAULT ''
+            all_text_norm     TEXT NOT NULL DEFAULT '',
+            tags              TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS idx_files_fav       ON files(favorite_id);
          CREATE INDEX IF NOT EXISTS idx_files_fav_mtime ON files(favorite_id, mtime);
          CREATE INDEX IF NOT EXISTS idx_files_status    ON files(status) WHERE status != 0;",
     )?;
+    // v1 → v2 マイグレーション: tags 列を後付けで追加。
+    // 既に存在していれば ALTER TABLE がエラーになるので握りつぶす。
+    let has_tags = conn
+        .prepare("SELECT tags FROM files LIMIT 0")
+        .map(|_| true)
+        .unwrap_or(false);
+    if !has_tags {
+        conn.execute("ALTER TABLE files ADD COLUMN tags TEXT NOT NULL DEFAULT ''", [])?;
+    }
     Ok(())
 }
 
@@ -472,7 +530,7 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/photos");
         let gen1 = db
-            .mark_pending("c:/photos/a.jpg", fav, &root, 100, 2048, "text a")
+            .mark_pending("c:/photos/a.jpg", fav, &root, 100, 2048, "text a", "")
             .unwrap();
         assert_eq!(gen1, 1, "初回 ingest の generation は 1");
 
@@ -490,7 +548,7 @@ mod tests {
 
         // 同じ path で再 ingest → generation += 1
         let gen2 = db
-            .mark_pending("c:/photos/a.jpg", fav, &root, 200, 2100, "text a updated")
+            .mark_pending("c:/photos/a.jpg", fav, &root, 200, 2100, "text a updated", "")
             .unwrap();
         assert_eq!(gen2, 2);
         let got = db.get("c:/photos/a.jpg").unwrap().unwrap();
@@ -503,9 +561,9 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/1.jpg", fav, &root, 1, 10, "one")
+        db.mark_pending("c:/p/1.jpg", fav, &root, 1, 10, "one", "")
             .unwrap();
-        db.mark_pending("c:/p/2.jpg", fav, &root, 2, 20, "two")
+        db.mark_pending("c:/p/2.jpg", fav, &root, 2, 20, "two", "")
             .unwrap();
         db.mark_ok(&["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()])
             .unwrap();
@@ -538,11 +596,11 @@ mod tests {
         let fav_b = Uuid::new_v4();
         let root_a = PathBuf::from("C:/a");
         let root_b = PathBuf::from("C:/b");
-        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, 1, 1, "")
+        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, 1, 1, "", "")
             .unwrap();
-        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, 2, 2, "")
+        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, 2, 2, "", "")
             .unwrap();
-        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, 3, 3, "")
+        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, 3, 3, "", "")
             .unwrap();
 
         // 全部 pending のまま → list_favorite_files には出てこない
@@ -570,9 +628,9 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/a.jpg", fav, &root, 1, 1, "alpha")
+        db.mark_pending("c:/p/a.jpg", fav, &root, 1, 1, "alpha", "")
             .unwrap();
-        db.mark_pending("c:/p/b.jpg", fav, &root, 2, 2, "beta")
+        db.mark_pending("c:/p/b.jpg", fav, &root, 2, 2, "beta", "")
             .unwrap();
 
         // 両方 pending → lookup は空
@@ -602,9 +660,9 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/x");
-        db.mark_pending("c:/x/1.jpg", fav, &root, 1, 1, "").unwrap();
-        db.mark_pending("c:/x/2.jpg", fav, &root, 2, 2, "").unwrap();
-        db.mark_pending("c:/x/3.jpg", fav, &root, 3, 3, "").unwrap();
+        db.mark_pending("c:/x/1.jpg", fav, &root, 1, 1, "", "").unwrap();
+        db.mark_pending("c:/x/2.jpg", fav, &root, 2, 2, "", "").unwrap();
+        db.mark_pending("c:/x/3.jpg", fav, &root, 3, 3, "", "").unwrap();
 
         db.mark_ok(&["c:/x/1.jpg".to_string()]).unwrap();
         db.mark_failed("c:/x/2.jpg").unwrap();
@@ -623,7 +681,7 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/y");
         for i in 0..5 {
-            db.mark_pending(&format!("c:/y/{}.jpg", i), fav, &root, i, 1, "")
+            db.mark_pending(&format!("c:/y/{}.jpg", i), fav, &root, i, 1, "", "")
                 .unwrap();
         }
         db.mark_ok(&["c:/y/0.jpg".to_string(), "c:/y/1.jpg".to_string()])
@@ -646,9 +704,9 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/z");
-        db.mark_pending("c:/z/a.jpg", fav, &root, 1, 1, "alpha")
+        db.mark_pending("c:/z/a.jpg", fav, &root, 1, 1, "alpha", "")
             .unwrap();
-        db.mark_pending("c:/z/b.jpg", fav, &root, 2, 2, "beta")
+        db.mark_pending("c:/z/b.jpg", fav, &root, 2, 2, "beta", "")
             .unwrap();
         db.mark_ok(&["c:/z/a.jpg".to_string(), "c:/z/b.jpg".to_string()])
             .unwrap();

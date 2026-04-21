@@ -238,8 +238,9 @@ impl<'a> IngestSession<'a> {
     }
 
     fn ingest_image(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
-        // 1. メタ抽出 (all_text_norm を作る)
+        // 1. メタ抽出 (all_text_norm + tags を作る)
         let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
+        let tags = crate::ingest_text::extract_tags_for_file(&cand.abs_path);
 
         // 2. fts_meta に pending で書き込む (generation も +1)
         self.meta_db
@@ -250,6 +251,7 @@ impl<'a> IngestSession<'a> {
                 cand.mtime,
                 cand.file_size,
                 &all_text,
+                &tags,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
 
@@ -269,6 +271,7 @@ impl<'a> IngestSession<'a> {
             file_size: cand.file_size,
             name,
             all_text,
+            tags,
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -305,7 +308,7 @@ impl<'a> IngestSession<'a> {
         }
         let all_text = crate::search_norm::normalize_for_match(&combined);
 
-        // 3. fts_meta に pending で書き込む
+        // 3. fts_meta に pending で書き込む (PDF はタグ非対応なので空文字)
         self.meta_db
             .mark_pending(
                 &cand.key,
@@ -314,6 +317,7 @@ impl<'a> IngestSession<'a> {
                 cand.mtime,
                 cand.file_size,
                 &all_text,
+                "",
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
 
@@ -327,6 +331,7 @@ impl<'a> IngestSession<'a> {
             file_size: cand.file_size,
             name,
             all_text,
+            tags: String::new(),
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -352,6 +357,7 @@ impl<'a> IngestSession<'a> {
                 cand.mtime,
                 cand.file_size,
                 &all_text,
+                "",
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
 
@@ -368,6 +374,7 @@ impl<'a> IngestSession<'a> {
             file_size: cand.file_size,
             name,
             all_text,
+            tags: String::new(),
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -667,7 +674,7 @@ mod tests {
         let cand = make_image_file(tmp.path(), "crash.jpg");
         let key = cand.key.clone();
         let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
-        meta.mark_pending(&key, fav, &root, cand.mtime, cand.file_size, &all_text)
+        meta.mark_pending(&key, fav, &root, cand.mtime, cand.file_size, &all_text, "")
             .unwrap();
         let mut writer = fts.writer().unwrap();
         fts_index::upsert_doc(
@@ -682,6 +689,7 @@ mod tests {
                 file_size: cand.file_size,
                 name: "crash.jpg".to_string(),
                 all_text,
+                tags: String::new(),
             },
         )
         .unwrap();

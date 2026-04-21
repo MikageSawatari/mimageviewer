@@ -106,6 +106,47 @@ impl App {
                     }
                 });
 
+                // タグメニュー (docs/tag-feature.md §4.2)
+                ui.menu_button("タグ", |ui| {
+                    if ui.button("タグを編集…").clicked() {
+                        self.open_tag_editor();
+                        ui.close();
+                    }
+                    ui.separator();
+                    let selection_count = self.tag_target_path_count();
+                    let has_target = selection_count > 0;
+                    if ui
+                        .add_enabled(
+                            has_target,
+                            egui::Button::new(format!(
+                                "選択中のファイルから mIV タグをクリア ({selection_count})"
+                            )),
+                        )
+                        .on_hover_text(
+                            "`#` で始まる dc:subject 要素のみ削除します。\n\
+                             他ソフトで付けたタグ (#なし) は触りません。",
+                        )
+                        .clicked()
+                    {
+                        self.request_tag_clear_for_selection();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if self.settings.tags.is_empty() {
+                        ui.label(egui::RichText::new("（タグが未登録）").weak());
+                    } else {
+                        let tags_snapshot = self.settings.tags.clone();
+                        for tag in &tags_snapshot {
+                            let label = format!("#{}", tag.name);
+                            let btn = egui::Button::new(label);
+                            if ui.add_enabled(has_target, btn).clicked() {
+                                self.request_tag_toggle_for_selection(&tag.name);
+                                ui.close();
+                            }
+                        }
+                    }
+                });
+
                 ui.menu_button("設定", |ui| {
                     ui.menu_button("サムネイル列数", |ui| {
                         for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
@@ -307,6 +348,7 @@ impl App {
         let mut toolbar_sort_changed = false;
         let mut toolbar_parent_nav = false;
         let mut toolbar_rating_changed = false;
+        let mut toolbar_tag_click: Option<String> = None;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -426,6 +468,29 @@ impl App {
                             }
                         }
                     }
+                    first_section = false;
+                }
+
+                // タグセクション (docs/tag-feature.md §4.3)
+                if self.settings.show_toolbar_tags && !self.settings.tags.is_empty() {
+                    if !first_section {
+                        ui.separator();
+                    }
+                    ui.label("タグ:");
+                    let has_target = self.tag_target_path_count() > 0;
+                    let tags_snapshot: Vec<_> = self
+                        .settings
+                        .tags
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect();
+                    for name in tags_snapshot {
+                        let label = format!("#{name}");
+                        let resp = ui.add_enabled(has_target, egui::Button::new(label));
+                        if resp.clicked() {
+                            toolbar_tag_click = Some(name);
+                        }
+                    }
                 }
             });
             ui.add_space(2.0);
@@ -462,6 +527,11 @@ impl App {
                     self.selected = None;
                 }
             }
+        }
+
+        // ツールバーのタグ項目クリック
+        if let Some(name) = toolbar_tag_click {
+            self.request_tag_toggle_for_selection(&name);
         }
 
         toolbar_fav_nav

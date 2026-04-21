@@ -969,6 +969,11 @@ pub struct App {
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
 
+    // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
+    pub(crate) show_tag_editor: bool,
+    /// タグ編集ダイアログ中で編集中のタグ一覧 (キャンセルで破棄するため Settings から分離)
+    pub(crate) tag_editor_draft: Vec<crate::settings::TagDef>,
+
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
     pub(crate) fav_add_name_input: String,
@@ -1546,6 +1551,8 @@ impl Default for App {
             fs_early_dims: std::collections::HashMap::new(),
             items_generation: 0,
             show_favorites_editor: false,
+            show_tag_editor: false,
+            tag_editor_draft: Vec::new(),
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -1900,6 +1907,7 @@ impl App {
     pub(crate) fn any_dialog_open(&self) -> bool {
         self.show_stats_dialog
             || self.show_favorites_editor
+            || self.show_tag_editor
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_preferences
@@ -9015,6 +9023,7 @@ impl eframe::App for App {
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
+        self.show_tag_editor_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_cache_manager_dialog(ctx);

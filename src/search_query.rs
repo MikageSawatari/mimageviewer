@@ -17,6 +17,11 @@ pub struct Token {
     pub include: bool,
     /// 小文字化された照合対象文字列。空になるトークンは parse で捨てる。
     pub needle: String,
+    /// true の場合は「タグ検索トークン」。`#タグ名` プレフィックスで入力された場合に立つ。
+    /// needle には `#` 込みで入る (例: "#原神")。
+    /// タグ検索トークンは all_text_norm に対する substring 検索ではなく、
+    /// fts_meta.db の tags カラム (スペース区切り) に対する**完全一致**で判定される。
+    pub is_tag: bool,
 }
 
 /// クエリ文字列を正負トークン列に分解する。空白のみ、または `-` 単体は無視する。
@@ -66,17 +71,53 @@ pub fn parse(query: &str) -> Vec<Token> {
             }
         }
 
-        let needle = buf.trim().to_lowercase();
-        if !needle.is_empty() {
-            tokens.push(Token { include, needle });
+        let raw = buf.trim();
+        // `#タグ名` プレフィックス判定: 先頭 `#` で、`#` 以降に 1 文字以上あるもの。
+        // `#` 単体や `##...` は通常キーワード扱いにする (ユーザの意図が曖昧なため)。
+        let is_tag = raw.starts_with('#') && raw.chars().count() >= 2 && !raw.starts_with("##");
+        let needle = raw.to_lowercase();
+        if !needle.is_empty() && needle != "-" {
+            tokens.push(Token {
+                include,
+                needle,
+                is_tag,
+            });
         }
     }
     tokens
 }
 
+/// タグトークンと通常トークンを分割するヘルパ。
+pub fn split_tokens<'a>(tokens: &'a [Token]) -> (Vec<&'a Token>, Vec<&'a Token>) {
+    let (tags, keywords): (Vec<&Token>, Vec<&Token>) =
+        tokens.iter().partition(|t| t.is_tag);
+    (tags, keywords)
+}
+
+/// 指定 doc のタグ列 (スペース区切り、すべて小文字化前提) がタグトークンに一致するか判定。
+/// - include タグトークン: tags に完全一致する要素があれば合致
+/// - exclude タグトークン: tags に完全一致する要素があれば不一致
+pub fn matches_tags(tag_tokens: &[&Token], tags_space_sep: &str) -> bool {
+    if tag_tokens.is_empty() {
+        return true;
+    }
+    let hay: Vec<&str> = tags_space_sep.split_whitespace().collect();
+    for t in tag_tokens {
+        let hit = hay.iter().any(|h| h.eq_ignore_ascii_case(&t.needle));
+        if t.include && !hit {
+            return false;
+        }
+        if !t.include && hit {
+            return false;
+        }
+    }
+    true
+}
+
 /// `hay` がトークン列にマッチするか判定する (内部で小文字化)。
 /// - include トークン: hay に含まれなければ不一致
 /// - exclude トークン: hay に含まれれば不一致
+/// - タグトークン (`is_tag`): ここでは無視される (`matches_tags` で別途判定すべし)
 /// - トークン列が空: 常に一致 (フィルタなしの扱い)
 pub fn matches(tokens: &[Token], hay: &str) -> bool {
     if tokens.is_empty() {
@@ -84,6 +125,9 @@ pub fn matches(tokens: &[Token], hay: &str) -> bool {
     }
     let hay_lower = hay.to_lowercase();
     for t in tokens {
+        if t.is_tag {
+            continue; // タグは matches_tags 側で判定する
+        }
         if t.include {
             if !hay_lower.contains(&t.needle) {
                 return false;
@@ -152,12 +196,28 @@ mod tests {
         Token {
             include: true,
             needle: s.to_string(),
+            is_tag: false,
         }
     }
     fn exc(s: &str) -> Token {
         Token {
             include: false,
             needle: s.to_string(),
+            is_tag: false,
+        }
+    }
+    fn tag(s: &str) -> Token {
+        Token {
+            include: true,
+            needle: s.to_string(),
+            is_tag: true,
+        }
+    }
+    fn not_tag(s: &str) -> Token {
+        Token {
+            include: false,
+            needle: s.to_string(),
+            is_tag: true,
         }
     }
 
@@ -311,5 +371,78 @@ mod tests {
             decide_partial(&t, "text with bad here"),
             PartialResult::Decided(false),
         );
+    }
+
+    // ---- タグ構文 (docs/tag-feature.md) ----
+
+    #[test]
+    fn parse_tag_prefix() {
+        let tokens = parse("#原神");
+        assert_eq!(tokens, vec![tag("#原神")]);
+    }
+
+    #[test]
+    fn parse_tag_with_keyword() {
+        let tokens = parse("#原神 写真");
+        assert_eq!(tokens, vec![tag("#原神"), inc("写真")]);
+    }
+
+    #[test]
+    fn parse_tag_exclude() {
+        let tokens = parse("-#原神");
+        assert_eq!(tokens, vec![not_tag("#原神")]);
+    }
+
+    #[test]
+    fn parse_hash_alone_is_keyword() {
+        // 単独 `#` はキーワード扱い (プレフィックスとして使えない)
+        let tokens = parse("#");
+        assert_eq!(tokens, vec![inc("#")]);
+    }
+
+    #[test]
+    fn parse_double_hash_is_keyword() {
+        // `##foo` は曖昧なのでキーワード扱い
+        let tokens = parse("##foo");
+        assert_eq!(tokens, vec![inc("##foo")]);
+    }
+
+    #[test]
+    fn matches_tags_include_hit() {
+        let tokens = parse("#原神");
+        let (tags, _) = split_tokens(&tokens);
+        assert!(matches_tags(&tags, "#原神 #風景"));
+    }
+
+    #[test]
+    fn matches_tags_include_miss() {
+        let tokens = parse("#ドール");
+        let (tags, _) = split_tokens(&tokens);
+        assert!(!matches_tags(&tags, "#原神 #風景"));
+    }
+
+    #[test]
+    fn matches_tags_exclude() {
+        let tokens = parse("-#原神");
+        let (tags, _) = split_tokens(&tokens);
+        assert!(!matches_tags(&tags, "#原神 #風景"));
+        assert!(matches_tags(&tags, "#ドール"));
+    }
+
+    #[test]
+    fn matches_tags_and_logic() {
+        let tokens = parse("#原神 #風景");
+        let (tags, _) = split_tokens(&tokens);
+        assert!(matches_tags(&tags, "#原神 #風景 #その他"));
+        assert!(!matches_tags(&tags, "#原神"));
+        assert!(!matches_tags(&tags, "#風景"));
+    }
+
+    #[test]
+    fn matches_tags_substring_does_not_match() {
+        // オプション A: タグは substring でなく完全一致でのみヒット
+        let tokens = parse("#原");
+        let (tags, _) = split_tokens(&tokens);
+        assert!(!matches_tags(&tags, "#原神"));
     }
 }

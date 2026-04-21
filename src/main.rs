@@ -51,6 +51,7 @@ pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;
 pub mod sys_memory;
+mod tag_ops;
 pub mod thumb_loader;
 mod ui_adjustment_panel;
 mod ui_analysis_panel;

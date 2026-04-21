@@ -39,7 +39,7 @@ use tantivy::schema::{
     Value,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer};
-use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term, doc};
+use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term};
 use uuid::Uuid;
 
 const BIGRAM_TOKENIZER_NAME: &str = "mimv_bigram";
@@ -61,6 +61,9 @@ pub struct IndexDoc {
     pub name: String,
     /// `search_norm::normalize_for_match` 適用済みのテキスト
     pub all_text: String,
+    /// スペース区切りのタグ列 (`#` 接頭辞込み、大文字小文字保持)。
+    /// Ctrl+G の `#tag` プレフィックス検索で使う (exact match)。
+    pub tags: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +90,9 @@ pub struct Fields {
     pub file_size: Field,
     pub name: Field,
     pub all_text: Field,
+    /// タグ列 (`tags` フィールド)。STRING 型で exact term 検索。
+    /// 1 ドキュメントに複数 `add_text` 可能 (同じフィールドに複数値)。
+    pub tags: Field,
 }
 
 impl Fields {
@@ -102,6 +108,7 @@ impl Fields {
             file_size: schema.get_field("file_size").expect("schema: file_size"),
             name: schema.get_field("name").expect("schema: name"),
             all_text: schema.get_field("all_text").expect("schema: all_text"),
+            tags: schema.get_field("tags").expect("schema: tags"),
         }
     }
 }
@@ -121,10 +128,35 @@ impl FtsIndex {
     }
 
     /// 任意ディレクトリで開く (テスト用)。
+    ///
+    /// 既存の on-disk index が新スキーマ (tags フィールド等) を持たない場合は
+    /// ディレクトリを削除して作り直す。上位 (supervisor) が `fts_meta` の
+    /// `INDEX_VERSION` bump と合わせて全 ingest をやり直す前提。
     pub fn open_at(dir: &Path) -> tantivy::Result<Self> {
         std::fs::create_dir_all(dir).ok();
         let schema = build_schema();
-        let index = if Index::exists(&tantivy::directory::MmapDirectory::open(dir)?)? {
+        let mmap = tantivy::directory::MmapDirectory::open(dir)?;
+        let mut need_rebuild = false;
+        if Index::exists(&mmap)? {
+            // 既存 schema に tags が無ければ旧バージョン → 再構築
+            let existing = Index::open_in_dir(dir)?;
+            if existing.schema().get_field("tags").is_err() {
+                need_rebuild = true;
+            }
+        }
+        if need_rebuild {
+            // .managed.json 等含めて消去 → create_in_dir で再生成
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    let _ = std::fs::remove_file(&p);
+                } else if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+        let mmap = tantivy::directory::MmapDirectory::open(dir)?;
+        let index = if Index::exists(&mmap)? {
             Index::open_in_dir(dir)?
         } else {
             Index::create_in_dir(dir, schema.clone())?
@@ -171,17 +203,31 @@ impl FtsIndex {
 pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantivy::Result<()> {
     // 既存 doc を delete してから add (Tantivy の更新は delete + reinsert が基本)
     writer.delete_term(Term::from_field_text(fields.path, &d.path));
-    writer.add_document(doc!(
-        fields.path        => d.path.as_str(),
-        fields.container   => d.container.as_str(),
-        fields.zip_entry   => d.zip_entry.as_str(),
-        fields.favorite_id => d.favorite_id.to_string().as_str(),
-        fields.mtime       => d.mtime,
-        fields.file_size   => d.file_size,
-        fields.name        => d.name.as_str(),
-        fields.all_text    => d.all_text.as_str(),
-    ))?;
+    // tags は空白分割で 1 要素ずつ tags フィールドへ追加 (STRING は複数値可)。
+    // 同じ Doc に同じタグが 2 回入っても Tantivy は重複を気にしない。
+    let mut doc = TantivyDocument::default();
+    doc.add_text(fields.path, d.path.as_str());
+    doc.add_text(fields.container, d.container.as_str());
+    doc.add_text(fields.zip_entry, d.zip_entry.as_str());
+    doc.add_text(fields.favorite_id, d.favorite_id.to_string().as_str());
+    doc.add_i64(fields.mtime, d.mtime);
+    doc.add_i64(fields.file_size, d.file_size);
+    doc.add_text(fields.name, d.name.as_str());
+    doc.add_text(fields.all_text, d.all_text.as_str());
+    for t in d.tags.split_whitespace() {
+        if !t.is_empty() {
+            // タグは小文字化して保存 (検索時も小文字で照合)。
+            doc.add_text(fields.tags, t.to_lowercase());
+        }
+    }
+    writer.add_document(doc)?;
     Ok(())
+}
+
+/// `#タグ名` (小文字化済み) に一致する doc を検索する TermQuery を作る。
+pub fn build_tag_term_query(fields: &Fields, tag_with_hash: &str) -> TermQuery {
+    let term = Term::from_field_text(fields.tags, &tag_with_hash.to_lowercase());
+    TermQuery::new(term, IndexRecordOption::Basic)
 }
 
 /// 指定 path の doc を Tantivy から削除 (§5.6.2)。
@@ -313,6 +359,9 @@ fn build_schema() -> Schema {
     );
     b.add_text_field("name", text_opts.clone());
     b.add_text_field("all_text", text_opts);
+    // タグフィールド: STRING で exact term 検索 (bigram なし)。
+    // STORED なしで転置索引のみ持たせる (候補選別用)。
+    b.add_text_field("tags", STRING);
     b.build()
 }
 
@@ -350,7 +399,51 @@ mod tests {
             file_size: 1024,
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
             all_text: text.to_string(),
+            tags: String::new(),
         }
+    }
+
+    fn sample_doc_with_tags(path: &str, fav: Uuid, text: &str, tags: &str) -> IndexDoc {
+        IndexDoc {
+            path: path.to_string(),
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: fav,
+            mtime: 100,
+            file_size: 1024,
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            all_text: text.to_string(),
+            tags: tags.to_string(),
+        }
+    }
+
+    #[test]
+    fn tag_term_query_matches_exact_tag() {
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_tags("c:/a.jpg", fav, "写真", "#原神 #風景"),
+        )
+        .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_tags("c:/b.jpg", fav, "写真", "#ドール"),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        // tag term query を BooleanQuery でラップして search_page に渡す
+        let tq = build_tag_term_query(idx.fields(), "#原神");
+        let q = BooleanQuery::from(vec![(Occur::Must, Box::new(tq) as Box<dyn Query>)]);
+        let searcher = idx.searcher();
+        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "c:/a.jpg");
     }
 
     #[test]
