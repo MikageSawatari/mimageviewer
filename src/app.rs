@@ -398,6 +398,8 @@ fn run_metadata_search(
             }
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        // 最初は PNG tEXt だけ読む (cheap hay)。EXIF / XMP は NeedsMore の時だけ lazy 読み。
+        // EXIF を fallback にも含める方針 (Codex round-8 Should-fix #1) はその branch で実施。
         let meta_text = if is_image && is_png_path(path) {
             crate::png_metadata::build_searchable_from_path(path)
         } else {
@@ -423,7 +425,22 @@ fn run_metadata_search(
                     xmp_additions.push((key.clone(), xmp.clone()));
                     xmp
                 };
-                let hay = hay_of(&meta_text, &name, xmp_opt.as_ref());
+                // Codex round-8 Should-fix #1: fast path (fts_meta.all_text_norm) と互換に
+                // するため、fallback でも EXIF を検索対象に含める。EXIF 読みはファイル I/O
+                // なので NeedsMore の時だけ遅延実行する。
+                let mut extended_meta = meta_text.clone();
+                if is_image {
+                    if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
+                        let exif_part = exif_hay(&exif);
+                        if !exif_part.is_empty() {
+                            if !extended_meta.is_empty() {
+                                extended_meta.push('\n');
+                            }
+                            extended_meta.push_str(&exif_part);
+                        }
+                    }
+                }
+                let hay = hay_of(&extended_meta, &name, xmp_opt.as_ref());
                 if crate::search_query::matches(tokens, &hay) {
                     matches.insert(idx);
                 }
@@ -468,6 +485,11 @@ fn run_metadata_search(
 
 /// メタデータ文字列とファイル名を改行で繋いだ検索対象文字列を構築する。
 /// mXD が埋めた XMP tweet 情報 (本文・投稿者) があれば末尾に追記する。
+///
+/// **Codex round-8 Should-fix #1 対応**: fts_meta.db fast path (ingest_text::build_all_text_for_file)
+/// と互換な検索対象を作るため、呼び出し側で EXIF もここに含めて渡す設計に変更した。
+/// 詳細: `hay_of` 自体は meta_text をそのまま連結するだけなので、呼び出し側が
+/// EXIF を meta_text に含めるか別の追加引数で渡すかの分担になる。ここでは前者を採用。
 fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetInfo>) -> String {
     let mut out = if meta_text.is_empty() {
         name.to_string()
@@ -486,6 +508,25 @@ fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetI
         {
             out.push('\n');
             out.push_str(field);
+        }
+    }
+    out
+}
+
+/// EXIF 全タグ値を 1 つの文字列に連結 (空白区切り)。
+///
+/// fts_meta.db の all_text_norm (ingest_text::append_exif 経由で生成) と互換にするため、
+/// Ctrl+F fallback 経路でも同じ形で EXIF を検索対象に含める (Codex round-8 Should-fix #1)。
+fn exif_hay(info: &crate::exif_reader::ExifInfo) -> String {
+    let mut out = String::new();
+    for (_group, tags) in &info.sections {
+        for (_name, value) in tags {
+            if !value.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(value);
+            }
         }
     }
     out
@@ -8123,10 +8164,17 @@ impl eframe::App for App {
         let address_nav = self.render_address_bar(ctx);
 
         // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
+        // Ctrl+G (グローバルメタ検索) と相互排他 (docs §10.3):
+        //   - Ctrl+G active 中は Ctrl+F を無効化する (Codex round-8 Must-fix #3)
+        //     理由: 結果ビューに SearchContainer が並ぶ状態で Ctrl+F を使うと、
+        //     run_metadata_search が SearchContainer を常に一致扱いするためフィルタ不能になる
+        //   - Ctrl+G 側の TextEdit にフォーカスがあるときも拾わない
         if !self.address_has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
             && !self.favsearch.has_focus
+            && !self.global_search.active
+            && !self.global_search.has_focus
         {
             let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
             if ctrl_f {

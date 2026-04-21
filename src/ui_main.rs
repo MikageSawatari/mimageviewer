@@ -42,6 +42,10 @@ impl App {
                         ui.close();
                     }
                     if ui.button("メタデータ検索… (Ctrl+F)").clicked() {
+                        // Ctrl+G と相互排他: 起動中なら閉じる (Codex round-8 Must-fix #3)
+                        if self.global_search.active {
+                            self.close_global_search();
+                        }
                         self.show_search_bar = true;
                         self.search_focus_request = true;
                         ui.close();

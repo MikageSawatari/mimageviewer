@@ -54,9 +54,22 @@ use crate::settings::FavoriteEntry;
 const IO_PERMITS: usize = 2;
 
 /// 検索ハンドル。UI 側が `try_recv` で stream を受け取る。
+///
+/// **Drop 挙動** (Codex round-8 Should-fix #2): `Drop` 実装で cancel フラグを立てる。
+/// これで呼び出し側が handle を単に drop するだけでワーカーが次のチェックポイントで
+/// 自己終了する。明示的に `handle.cancel.store(true)` を呼ぶ必要はない。
 pub struct SearchHandle {
     pub cancel: Arc<AtomicBool>,
     pub rx: Receiver<SearchStreamEvent>,
+}
+
+impl Drop for SearchHandle {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // ワーカースレッドは自分で finish する。ここで join しない
+        // (Ctrl+G の UI フレーム内で drop されるので、長時間ブロックしない契約)。
+    }
 }
 
 /// IndexerManager のコア。App が保有する。
@@ -74,10 +87,17 @@ pub struct IndexerManager {
 }
 
 impl IndexerManager {
-    /// DB/index を開き、auto_index_metadata=true のお気に入りに Supervisor を spawn する。
+    /// DB/index を開き、起動時 reconciliation → auto_index_metadata=true のお気に入りに
+    /// Supervisor を spawn する。
     ///
     /// DB 初期化に失敗したら None (App 側は fts 機能なしで動作継続する)。
-    /// 起動時 reconciliation は **バックグラウンドスレッド** で遅延実行 — UI を止めない。
+    ///
+    /// **Codex round-8 Must-fix #1 反映**: 起動時 reconciliation は
+    /// supervisors spawn の **前** に同期実行する。旧実装はバックグラウンド化していたが、
+    /// reconciliation の IndexWriter ロック中に supervisor の writer 初期化が失敗し、
+    /// supervisor thread が即 return する race があった。
+    /// reconciliation は通常クラッシュ残留の僅かな行だけを処理するので、
+    /// アプリ起動の許容範囲内 (通常 100ms 以下) で終わる。
     pub fn new(favorites: &[FavoriteEntry]) -> Option<Self> {
         let meta_db = match FtsMetaDb::open() {
             Ok(db) => Arc::new(db),
@@ -94,17 +114,20 @@ impl IndexerManager {
             }
         };
         let io_sem = Arc::new(GlobalIoSemaphore::new(IO_PERMITS));
-        let reconciliation_flag = Arc::new(AtomicBool::new(true));
 
-        // 起動時 reconciliation: status != ok の行を整理 (別スレッド)。
-        // 対象お気に入りを渡してバックグラウンド処理。完了後に `reconciliation_in_progress`
-        // を false に戻す。
-        spawn_reconciliation(
-            Arc::clone(&meta_db),
-            Arc::clone(&fts),
-            favorites.to_vec(),
-            Arc::clone(&reconciliation_flag),
-        );
+        // === 起動時 reconciliation を先に同期実行 ===
+        // supervisor が走る前に status != ok の残留行を整理することで、
+        // Tantivy writer の競合も DB 上の race もなくなる。
+        let t_recon = std::time::Instant::now();
+        if let Err(e) = run_reconciliation(&meta_db, &fts, favorites) {
+            crate::logger::log(format!(
+                "IndexerManager: reconciliation failed (continuing anyway): {e}"
+            ));
+        }
+        crate::logger::log(format!(
+            "IndexerManager: reconciliation completed in {} ms",
+            t_recon.elapsed().as_millis()
+        ));
 
         let mut mgr = IndexerManager {
             meta_db,
@@ -112,9 +135,9 @@ impl IndexerManager {
             io_sem,
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
-            reconciliation_in_progress: reconciliation_flag,
+            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
         };
-        // 最初の supervisor 群を起動
+        // reconciliation 完了後に supervisor 群を起動 (writer 競合なし)
         mgr.sync_with_favorites(favorites);
         Some(mgr)
     }
@@ -122,20 +145,34 @@ impl IndexerManager {
     /// 現在のお気に入り一覧と supervisors を同期。
     /// - 新規 `auto_index_metadata = true` → spawn
     /// - 既存で OFF に切り替わった / 削除された → drop
-    /// - 既存で ON のまま → 維持
+    /// - 既存で ON のまま **かつ path 不変** → 維持
+    /// - 既存で ON のまま **かつ path 変更** → drop + respawn (Codex round-8 Must-fix #2)
     ///
     /// **UI スレッドから呼ぶ時の注意**: Supervisor の drop は内部で thread join を伴うため、
     /// 多数の stop が発生する場面 (例: 全 OFF) ではブロックする可能性がある。
     /// 環境設定ダイアログの OK 押下時のような、ユーザが待ってもよいタイミングで呼ぶこと。
     pub fn sync_with_favorites(&mut self, favorites: &[FavoriteEntry]) {
+        // path 変更の検出は favorite_info 更新 **前** に行う (旧 path と比較するため)
+        let path_changed: std::collections::HashSet<Uuid> = favorites
+            .iter()
+            .filter_map(|f| {
+                let old_path = self.favorite_info.get(&f.id).map(|(_, p)| p.clone())?;
+                if old_path != f.path {
+                    Some(f.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // favorite_info を最新化
         self.favorite_info.clear();
         for f in favorites {
             self.favorite_info.insert(f.id, (f.name.clone(), f.path.clone()));
         }
 
-        // 削除 / OFF 化されたものを特定
-        let current_ids: std::collections::HashSet<Uuid> = favorites
+        // 削除 / OFF 化 / **path 変更** されたものを drop 対象に含める
+        let current_on_ids: std::collections::HashSet<Uuid> = favorites
             .iter()
             .filter(|f| f.auto_index_metadata)
             .map(|f| f.id)
@@ -143,17 +180,20 @@ impl IndexerManager {
         let to_stop: Vec<Uuid> = self
             .supervisors
             .keys()
-            .filter(|id| !current_ids.contains(id))
+            .filter(|id| !current_on_ids.contains(id) || path_changed.contains(id))
             .copied()
             .collect();
         for id in to_stop {
             if let Some(handle) = self.supervisors.remove(&id) {
                 // handle drop = cancel + thread join
+                crate::logger::log(format!(
+                    "IndexerManager: stopping supervisor {id} (removed / off / path changed)"
+                ));
                 drop(handle);
             }
         }
 
-        // 新規 ON を spawn
+        // 新規 ON を spawn (path 変更で drop したものも新 path で respawn される)
         for f in favorites {
             if !f.auto_index_metadata {
                 continue;
@@ -289,6 +329,13 @@ pub struct SupervisorStatsView {
 ///   - Pending → Tantivy delete_doc + DB row 削除 (次回 walker scan で再 ingest)
 ///   - Failed → 同じ (再試行)
 ///   - Tombstone → Tantivy delete_doc + purge_tombstone
+/// 起動時 reconciliation を別スレッドで走らせる (v1 ではテスト専用)。
+///
+/// 本番経路では `IndexerManager::new` が `run_reconciliation` を同期実行する
+/// (Codex round-8 Must-fix #1 対応)。この関数は AtomicBool 通知付き非同期版で、
+/// 将来的な「実行中 reconciliation」UI 表示や定期再 reconciliation で使う余地を残すため
+/// test-only としてのみ残している。
+#[cfg(test)]
 fn spawn_reconciliation(
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
@@ -534,6 +581,57 @@ mod tests {
         // 何らかの SearchStreamEvent が返ることを確認
         let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         drop(ev);
+    }
+
+    #[test]
+    fn sync_respawns_on_path_change() {
+        // Codex round-8 Must-fix #2 回帰:
+        // 同じ UUID で path だけ変わった場合、watcher/walker が古い root を見続けないよう
+        // drop + respawn されること (sync_with_favorites 直接の挙動を検証するため、
+        // full IndexerManager::new ではなく手動で field を整える)
+        let tmp = TempDir::new().unwrap();
+        let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
+        let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
+        let io_sem = Arc::new(GlobalIoSemaphore::new(2));
+
+        let root_old = tmp.path().join("old");
+        let root_new = tmp.path().join("new");
+        std::fs::create_dir_all(&root_old).unwrap();
+        std::fs::create_dir_all(&root_new).unwrap();
+
+        let mut mgr = IndexerManager {
+            meta_db: Arc::clone(&meta),
+            fts: Arc::clone(&fts),
+            io_sem: Arc::clone(&io_sem),
+            supervisors: HashMap::new(),
+            favorite_info: HashMap::new(),
+            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
+        };
+
+        let mut fav = mk_fav("A", &root_old, true);
+        // 初回 spawn
+        mgr.sync_with_favorites(&[fav.clone()]);
+        let handle1_thread_id = mgr
+            .supervisors
+            .get(&fav.id)
+            .map(|h| h.favorite_id)
+            .expect("handle inserted");
+
+        // path 変更 (id は同じ)
+        fav.path = root_new.clone();
+        mgr.sync_with_favorites(&[fav.clone()]);
+        // supervisors にはちゃんと入ったまま (新 path で respawn されたはず)
+        assert!(mgr.supervisors.contains_key(&fav.id));
+        // favorite_info の path が新パスになっている
+        assert_eq!(mgr.favorite_info.get(&fav.id).unwrap().1, root_new);
+        // favorite_id は変わっていない
+        assert_eq!(
+            mgr.supervisors.get(&fav.id).unwrap().favorite_id,
+            handle1_thread_id
+        );
+
+        // 明示 drop で clean shutdown
+        drop(mgr);
     }
 
     #[test]
