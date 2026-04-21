@@ -184,9 +184,21 @@ AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1
      ColorImage は `texture_backlog` に積まれてアップロード待ち、というケースで
      即 `requested.remove` すると `Pending && !requested.contains` → 次フレーム再エンキュー
      の無限ループになる。対策として `pending_finalize: HashSet<usize>` を追加し、
-     finalized 受信時に thumbnails[i] が **まだ Loaded でなければ** idx を
-     pending_finalize へ積む。アップロード完了 (新規 or backlog から) で Loaded 化した
-     瞬間に `pending_finalize.remove(&i)` が true を返せばその場で `requested.remove` する。
+     finalized 受信時に thumbnails[i] が **Pending のとき** は idx を pending_finalize
+     へ積む。アップロード完了 (新規 or backlog から) で Loaded 化した瞬間に
+     `pending_finalize.remove(&i)` が true を返せばその場で `requested.remove` する。
+
+     **さらに finalized-vs-evict レース (v0.7.3)**: 第 1 シグナル到着後にユーザーが
+     スクロールして keep_range から外れると、`update_keep_range_and_requests` が
+     Loaded → Evicted に落とす (この時点では `requested` は意図的に残す = cache-save 完了
+     待ち)。その直後に第 2 シグナルが届くと、旧実装は state=Evicted でも pending_finalize
+     に積んでしまい、pending_finalize は Loaded 遷移時にしか掃除されないため、
+     `requested[i]` が永久に居座る。スクロールで戻ってきても再エンキューループの
+     `if requested.contains_key { continue; }` に弾かれてサムネが Evicted のまま固着する。
+     対策として finalize ハンドラを 3 分岐に分け、**Evicted / Failed のときは
+     `requested.remove + pending_finalize.remove` で即時掃除**する (ワーカーは第 2 シグナル
+     送信済みなので「処理中の idx を抜くな」の規約には違反しない)。ログ `[poll] finalize
+     on Evicted idx=N → cleanup requested` で発動を可視化する。
      `canceled` / 失敗 / `load_folder` リセット時にも pending_finalize をクリア
 - **STALE チェックはワーカーパイプラインの 3 箇所**:
   - `spawn_worker` が pop 直後 (app.rs): キャッシュ lookup すら不要な明白な範囲外

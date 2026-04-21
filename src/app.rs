@@ -968,6 +968,11 @@ pub struct App {
     pub(crate) vis_first_logged: bool,
     /// 安定後、可視範囲内の全サムネイルが Loaded 化したことをログ済みか。
     pub(crate) vis_all_logged: bool,
+    /// 「サムネイル読み込み中が動かない」固着バグ診断用。
+    /// 一定間隔で `requested` に残っているエントリのうち、keep_range 内にいて
+    /// かつ state が Loaded でないものを検出してログに出す。Loaded なら
+    /// from_cache=false の finalize 待ちなので問題なし。
+    pub(crate) last_stuck_scan_at: std::time::Instant,
     /// 検索バーにフォーカスを当てるフラグ（1フレームだけ true）
     pub(crate) search_focus_request: bool,
     /// 検索バーの TextEdit がフォーカスを持っているか（毎フレーム更新）
@@ -1390,6 +1395,7 @@ impl Default for App {
             vis_settle_at: None,
             vis_first_logged: false,
             vis_all_logged: false,
+            last_stuck_scan_at: std::time::Instant::now(),
             search_focus_request: false,
             search_has_focus: false,
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
@@ -3199,11 +3205,18 @@ impl App {
             // finalized = true: 第 2 シグナル (decode 成功 + cache save 完了)。
             // **`thumbnails[i]` の状態は変更しない**。
             //
-            // requested.remove は **Loaded 化が完了している場合のみ** 実行する。
-            // 第1シグナルが texture_backlog でアップロード待ちのときに requested を
-            // 抜くと、次フレームに Pending && !requested.contains で再エンキュー →
-            // 同じ画像を何度も decode する無限ループになるため、そのケースは
-            // `pending_finalize` に idx を積んでアップロード完了時に remove する。
+            // 状態別の処理:
+            //   - Loaded: 正常完了 → requested.remove。
+            //   - Pending: 第1シグナルが texture_backlog でアップロード待ち中。
+            //     requested をここで抜くと次フレームに Pending && !requested.contains
+            //     で再エンキュー → 同じ画像を何度も decode する無限ループになる。
+            //     `pending_finalize` に idx を積み、アップロード完了時 (Loaded 遷移時)
+            //     にまとめて requested を抜く。
+            //   - Evicted / Failed: 第1シグナルは既に処理されており (Loaded 経由で
+            //     Evicted になった or ワーカーが失敗を返した)、ワーカーもこのシグナルで
+            //     終了。ここで requested を抜いておかないと、再スクロールで戻った時に
+            //     `update_keep_range_and_requests` の `requested.contains_key` ガードで
+            //     再エンキューが無限にブロックされ、サムネが Evicted のまま固着する。
             //
             // `requested` に無い idx への finalized は、第1シグナルが keep 範囲外で
             // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
@@ -3213,10 +3226,27 @@ impl App {
                     received += 1;
                     continue;
                 }
-                if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
-                    self.requested.remove(&i);
-                } else {
-                    self.pending_finalize.insert(i);
+                match self.thumbnails[i] {
+                    ThumbnailState::Loaded { .. } => {
+                        self.requested.remove(&i);
+                    }
+                    ThumbnailState::Pending => {
+                        self.pending_finalize.insert(i);
+                    }
+                    ThumbnailState::Evicted | ThumbnailState::Failed => {
+                        // 固着防止: Evicted/Failed で finalize が来たら再エンキュー
+                        // 可能な状態に戻す。
+                        let state_name = match self.thumbnails[i] {
+                            ThumbnailState::Evicted => "Evicted",
+                            ThumbnailState::Failed => "Failed",
+                            _ => unreachable!(),
+                        };
+                        self.requested.remove(&i);
+                        self.pending_finalize.remove(&i);
+                        crate::logger::log(format!(
+                            "  [poll] finalize on {state_name} idx={i} → cleanup requested (was stuck candidate)"
+                        ));
+                    }
                 }
                 received += 1;
                 continue;
@@ -3683,6 +3713,43 @@ impl App {
         self.update_progress_peaks();
         let t6 = frame_t0.elapsed();
 
+        // (5) 固着診断 (5 秒に 1 回): keep_range 内で state が Pending/Evicted
+        //     なのに `requested` に居座っているエントリを検出する。
+        //     正常時は Pending/Evicted なら再エンキューされて Loaded に進むはず。
+        //     この状態が続くと、サムネが「読み込み中」のまま永遠に戻らない。
+        if self.last_stuck_scan_at.elapsed().as_secs() >= 5 {
+            self.last_stuck_scan_at = std::time::Instant::now();
+            let mut stuck: Vec<(usize, &'static str)> = Vec::new();
+            for (&idx, _) in &self.requested {
+                if idx < keep_start || idx >= keep_end {
+                    continue;
+                }
+                let label = match self.thumbnails.get(idx) {
+                    Some(ThumbnailState::Pending) => Some("Pending"),
+                    Some(ThumbnailState::Evicted) => Some("Evicted"),
+                    Some(ThumbnailState::Failed) => Some("Failed"),
+                    _ => None,
+                };
+                if let Some(l) = label {
+                    stuck.push((idx, l));
+                }
+            }
+            if !stuck.is_empty() {
+                stuck.sort_by_key(|(i, _)| *i);
+                let pf = self.pending_finalize.len();
+                let bl = self.texture_backlog.len();
+                crate::logger::log(format!(
+                    "  [stuck] {} entries in requested but not Loaded (keep=[{}..{}) pending_finalize={} backlog={}): {:?}",
+                    stuck.len(),
+                    keep_start,
+                    keep_end,
+                    pf,
+                    bl,
+                    stuck.iter().take(20).collect::<Vec<_>>(),
+                ));
+            }
+        }
+
         if (t6 - t1).as_millis() > 5 {
             crate::logger::log(format!(
                 "    [keep detail] evict={:.1}ms scan={:.1}ms lock+push={:.1}ms idle={:.1}ms peaks={:.1}ms",
@@ -3773,14 +3840,26 @@ impl App {
                 Some(ThumbnailState::Loaded {
                     from_cache,
                     rendered_at_px,
+                    source_dims,
                     ..
                 }) => {
                     // 1. キャッシュ由来 (品質アップグレード)
-                    // 2. 現在のセルに対して解像度不足 (rendered < current * 0.8)
+                    // 2. 現在のセルに対して解像度不足 (rendered < target * 0.8)
                     //    u32 オーバーフロー対策で u64 で比較
+                    //
+                    // target は `min(source_long_edge, current_display_px)`:
+                    // 元画像が display_px より小さい場合、どれだけ再デコードしても
+                    // 物理的に display_px まで拡大できない (fast_resize は upscale
+                    // しない)。source で頭打ちにしないと永久に「解像度不足」判定が
+                    // 続き、アイドル時に同じセルを毎サイクル re-enqueue する無限
+                    // ループ (進捗バーが高速に左右を往復する原因) になる。
+                    let source_long_edge = source_dims.map(|(w, h)| w.max(h));
+                    let target_px = source_long_edge
+                        .map(|src| src.min(current_display_px))
+                        .unwrap_or(current_display_px);
                     *from_cache
                         || (*rendered_at_px as u64) * 5
-                            < (current_display_px as u64) * 4
+                            < (target_px as u64) * 4
                 }
                 _ => false,
             };
