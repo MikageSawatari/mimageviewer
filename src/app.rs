@@ -890,6 +890,12 @@ pub struct App {
     /// `(idx, FsLoadResult, load_seq)` — FIFO 順で消化する。
     pub(crate) fs_upload_backlog: Vec<(usize, FsLoadResult, u64)>,
 
+    /// items が差し替わるたびにインクリメントする世代カウンタ (Codex P2 対応)。
+    /// `LoadRequest::items_gen` → worker → `ThumbMsg::items_gen` を経由して poll_thumbnails
+    /// まで透過され、世代が一致しないメッセージは破棄される。
+    /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
+    pub(crate) items_generation: u64,
+
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
     /// ダイアログを開いた時点の favorite の索引フラグスナップショット
@@ -1446,6 +1452,7 @@ impl Default for App {
             fs_pending: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
+            items_generation: 0,
             show_favorites_editor: false,
             favorites_pre_edit_snapshot: None,
             show_fav_add_dialog: false,
@@ -2636,6 +2643,8 @@ impl App {
         self.thumbnails = (0..self.items.len())
             .map(|_| ThumbnailState::Pending)
             .collect();
+        // 世代をインクリメント (Codex P2 対応): 旧ワーカー結果の混入を防ぐ
+        self.items_generation = self.items_generation.wrapping_add(1);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -3064,6 +3073,7 @@ impl App {
                             canceled: true,
                             finalized: false,
                             input_seq: req.input_seq,
+                            items_gen: req.items_gen,
                         });
                         continue;
                     }
@@ -3332,7 +3342,8 @@ impl App {
                 }
                 // 動画 Shell API はアップグレード経路を持たないので from_cache = false。
                 // ピクセル寸法は取得できない。動画ロードは LoadRequest を経由しないため
-                // input_seq は 0 (未設定)。
+                // input_seq は 0 (未設定)。items_gen も 0 (この経路は初期ロード以外では
+                // 走らない想定、かつ ThumbMsg 受信時 items_gen == 0 は常に受理される)。
                 let _ = tx.send(crate::thumb_loader::ThumbMsg {
                     idx,
                     image: ci,
@@ -3341,6 +3352,7 @@ impl App {
                     canceled: false,
                     finalized: false,
                     input_seq: 0,
+                    items_gen: 0,
                 });
             }
             crate::logger::log(format!(
@@ -3377,7 +3389,15 @@ impl App {
                 canceled,
                 finalized,
                 input_seq: req_input_seq,
+                items_gen: msg_items_gen,
             } = msg;
+            // Codex P2 対応: 世代が一致しないメッセージ (旧 items 由来) は破棄する。
+            // msg_items_gen == 0 は未設定 (動画スレッド等の特別経路) なので常に受理。
+            if msg_items_gen != 0 && msg_items_gen != self.items_generation {
+                // 旧 worker の結果: thumbnails[i] は新 items の画像なので触らない。
+                // requested からも引かない (このメッセージは新 items と無関係)。
+                continue;
+            }
             if i >= self.thumbnails.len() {
                 self.requested.remove(&i);
                 continue;
@@ -3566,6 +3586,7 @@ impl App {
                             canceled: false,
                             finalized: false,
                             input_seq: req_input_seq,
+                            items_gen: msg_items_gen,
                         });
                     } else {
                         // 範囲外: ColorImage を drop し Evicted にしておく。
@@ -3800,6 +3821,7 @@ impl App {
             };
             req.priority = i >= visible_raw_start && i < visible_raw_end;
             req.input_seq = self.input_seq;
+            req.items_gen = self.items_generation;
             // ZipFile / PdfFile / Folder → heavy_io_queue、それ以外 → reload_queue
             let is_heavy = matches!(
                 self.items.get(i),
@@ -8556,12 +8578,14 @@ fn make_load_request(
             skip_cache, priority: false, zip_entry: None, pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
             input_seq: 0,
+            items_gen: 0,
         }),
         GridItem::ZipImage { zip_path, entry_name } => Some(LoadRequest {
             idx, path: zip_path.clone(), mtime, file_size,
             skip_cache, priority: false, zip_entry: Some(entry_name.clone()), pdf_page: None, pdf_password: None,
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
             input_seq: 0,
+            items_gen: 0,
         }),
         GridItem::PdfPage { pdf_path, page_num, .. } => Some(LoadRequest {
             idx, path: pdf_path.clone(), mtime, file_size,
@@ -8569,6 +8593,7 @@ fn make_load_request(
             pdf_password: pdf_password.map(String::from),
             cache_key_override: None, folder_thumb_sort: None, folder_thumb_depth: 0,
             input_seq: 0,
+            items_gen: 0,
         }),
         GridItem::ZipFile(p) => {
             // フォルダ一覧用: ZIP の最初の画像エントリをサムネイルとして取得。
@@ -8581,6 +8606,7 @@ fn make_load_request(
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
                 folder_thumb_sort: None, folder_thumb_depth: 0,
                 input_seq: 0,
+                items_gen: 0,
             })
         }
         GridItem::PdfFile(p) => {
@@ -8593,6 +8619,7 @@ fn make_load_request(
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
                 folder_thumb_sort: None, folder_thumb_depth: 0,
                 input_seq: 0,
+                items_gen: 0,
             })
         }
         GridItem::Folder(p) => {
@@ -8604,6 +8631,7 @@ fn make_load_request(
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
                 folder_thumb_sort, folder_thumb_depth,
                 input_seq: 0,
+                items_gen: 0,
             })
         }
         _ => None,

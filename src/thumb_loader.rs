@@ -79,6 +79,11 @@ pub struct ThumbMsg {
     /// エンキュー時の `LoadRequest::input_seq` を透過する。perf ログで enqueue /
     /// decode / ready を相関付けるのに使う。計装無効時や未設定時は 0。
     pub input_seq: u64,
+    /// エンキュー時の `LoadRequest::items_gen` を透過する (Codex P2 対応)。
+    /// UI 側は自分の `items_generation` と一致しないメッセージを破棄する。
+    /// これにより Ctrl+G 等で items を差し替えた後に、旧 items に対するワーカーの
+    /// 結果が新 items に適用されてサムネが化ける race を防ぐ。
+    pub items_gen: u64,
 }
 
 /// 段階 B: サムネイル読み込み要求。
@@ -115,6 +120,10 @@ pub struct LoadRequest {
     /// パフォーマンス計装用: エンキュー時の input_seq (相関キー)。
     /// 0 は未設定を意味する。`--perf-log` 無効時は使われない。
     pub input_seq: u64,
+    /// items 世代番号 (Codex P2 対応): items が差し替わるたびにインクリメントされる
+    /// `App::items_generation` の値。ワーカーはこれを ThumbMsg にエコーバックし、
+    /// UI 側は自分の現在値と一致しないメッセージを破棄する。
+    pub items_gen: u64,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -541,6 +550,7 @@ pub fn process_load_request(
                 canceled: false,
                 finalized: false,
                 input_seq: req.input_seq,
+                items_gen: req.items_gen,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
             crate::logger::log(format!(
@@ -601,6 +611,7 @@ pub fn process_load_request(
                 canceled: false,
                 finalized: false,
                 input_seq: req.input_seq,
+                items_gen: req.items_gen,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
@@ -647,6 +658,7 @@ pub fn process_load_request(
                     canceled: false,
                     finalized: false,
                     input_seq: req.input_seq,
+                    items_gen: req.items_gen,
                 });
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -690,6 +702,7 @@ pub fn process_load_request(
                 canceled: true,
                 finalized: false,
                 input_seq: req.input_seq,
+                items_gen: req.items_gen,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
@@ -728,6 +741,7 @@ pub fn process_load_request(
                 canceled: true,
                 finalized: false,
                 input_seq: req.input_seq,
+                items_gen: req.items_gen,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
@@ -749,6 +763,7 @@ pub fn process_load_request(
         cancel,
         req.priority,
         req.input_seq,
+        req.items_gen,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -861,6 +876,8 @@ pub fn load_one_cached(
     // エンキュー元の `LoadRequest::input_seq`。perf 相関用に ThumbMsg にそのまま載せる。
     // 0 は未設定 (計装無効時)。
     input_seq: u64,
+    // エンキュー元の `LoadRequest::items_gen`。世代不一致検出用 (Codex P2)。
+    items_gen: u64,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと��
@@ -994,6 +1011,7 @@ pub fn load_one_cached(
                 canceled: false,
                 finalized: false,
                 input_seq,
+                items_gen,
             });
             gen_done.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = stats.lock() {
@@ -1034,6 +1052,7 @@ pub fn load_one_cached(
         canceled: false,
         finalized: false,
         input_seq,
+        items_gen,
     });
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマット・デコーダ経路を記録
@@ -1108,6 +1127,7 @@ pub fn load_one_cached(
         canceled: false,
         finalized: true,
         input_seq,
+        items_gen,
     });
 }
 

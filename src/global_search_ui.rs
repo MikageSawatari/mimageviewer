@@ -260,15 +260,19 @@ pub(crate) fn build_drilled_items(
     let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
 
+    // Codex P2 対応: 大量ヒット (最大 HARD_MAX=10000) で path_metadata を同期呼びすると
+    // ネットワークドライブなどで UI が固まるため、mtime/file_size はダミー (0, 0) に落とす。
+    // thumb_loader のキャッシュキーはパスを含むので衝突は発生しない。mtime ベースの
+    // invalidate は効かないが、検索結果は一時的なビューなので許容される。
+    // 将来は GlobalHit に Tantivy STORED mtime/file_size を持たせて置き換える予定 (v0.8.x)。
+    let placeholder = Some((0_i64, 0_i64));
     for (sub_path, _hits) in &sub_vec {
-        // Folder セルは通常 make_load_request でフォルダ内代表画像を拾うので、
-        // image_metas はフォルダ自身の mtime を入れておけば cache キーが安定する。
         items.push(GridItem::Folder(sub_path.clone()));
-        image_metas.push(path_metadata(sub_path));
+        image_metas.push(placeholder);
     }
     for f in &direct_files {
         items.push(GridItem::Image(f.clone()));
-        image_metas.push(path_metadata(f));
+        image_metas.push(placeholder);
     }
 
     (items, image_metas)
@@ -280,7 +284,8 @@ fn build_drilled_zip_items(
     zip_path: &Path,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let zip_key = crate::search_index_db::normalize_path(zip_path);
-    let zip_meta = path_metadata(zip_path);
+    // Codex P2 対応: sync I/O 除去 (フォルダ版と同じ理由)。
+    let placeholder = Some((0_i64, 0_i64));
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
     for h in &state.all_hits {
@@ -294,24 +299,9 @@ fn build_drilled_zip_items(
             zip_path: zip_path.to_path_buf(),
             entry_name: entry.to_string(),
         });
-        // ZIP エントリの mtime/size は zip_loader が必要時に解決するので、
-        // ここでは外側 ZIP ファイルの mtime を共有値として入れておく (cache キー安定)。
-        image_metas.push(zip_meta);
+        image_metas.push(placeholder);
     }
     (items, image_metas)
-}
-
-/// ファイルの mtime + file_size を取得する (失敗時 None)。
-fn path_metadata(p: &Path) -> Option<(i64, i64)> {
-    let md = std::fs::metadata(p).ok()?;
-    let mtime = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let size = md.len() as i64;
-    Some((mtime, size))
 }
 
 /// `child` が `ancestor` と等しいか配下にあれば true。
@@ -457,6 +447,8 @@ impl App {
         self.thumbnails = (0..self.items.len())
             .map(|_| crate::grid_item::ThumbnailState::Pending)
             .collect();
+        // 世代をインクリメント (Codex P2 対応): 旧ワーカー結果の混入を防ぐ
+        self.items_generation = self.items_generation.wrapping_add(1);
         self.selected = None;
         self.checked.clear();
         self.requested.clear();
