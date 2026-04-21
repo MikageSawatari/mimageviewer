@@ -44,7 +44,8 @@ dual-window approach.
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (3 プロセス並列レンダリング)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
-- **AI upscaling**: `ort` crate (ONNX Runtime v2 + DirectML EP)。Real-ESRGAN / waifu2x ONNX モデルでタイル分割 4x アップスケール
+- **AI upscaling**: `ort` crate (ONNX Runtime v2 + DirectML EP、`load-dynamic` モード)。Real-ESRGAN / waifu2x ONNX モデルでタイル分割 4x アップスケール
+- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
 - **AI image classification**: deepghs/anime_classification MobileNetV3 (ONNX) + ヒューリスティクス。イラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
   （見開きページ中央欠落補完は精度不足で削除済み。タグ `v0.6.0-with-spread-inpaint` 参照）
@@ -124,6 +125,7 @@ mimageviewer/
 │       └── bench_thumbs.rs  # サムネイル生成ベンチマーク
 ├── scripts/
 │   ├── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
+│   ├── setup-ort.sh         # ONNX Runtime DirectML DLL ダウンロードスクリプト
 │   └── setup-susie-worker.sh # Susie 32bit ワーカーのビルド＆配置スクリプト
 ├── vendor/
 │   ├── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
@@ -132,6 +134,9 @@ mimageviewer/
 │   │   └── *.onnx           # include_bytes! で exe に埋め込まれる。
 │   │                        # 新規開発環境では %APPDATA%\mimageviewer\models\
 │   │                        # (インストール済み環境が展開したもの) からコピーする
+│   ├── ort/                 # ONNX Runtime DirectML DLL（.gitignore、setup-ort.sh で取得）
+│   │   ├── onnxruntime.dll  # include_bytes! で exe に埋め込まれる
+│   │   └── onnxruntime_providers_shared.dll
 │   └── susie-worker/        # 32bit Susie ワーカー exe（.gitignore、setup-susie-worker.sh で生成）
 │       └── mimageviewer-susie32.exe  # include_bytes! で exe に埋め込まれ、
 │                                     # 初回起動時に APPDATA へ自動展開
@@ -369,6 +374,42 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 2. 新しいバージョンがある場合は `bash scripts/setup-pdfium.sh` で更新
 3. 更新後は PDF の表示が正常か動作確認してからリリース
 
+## ONNX Runtime 管理
+
+AI 機能 (アップスケール・ノイズ除去・画像分類・消しゴム) は ONNX Runtime + DirectML EP を
+使用する。`ort` クレートの `load-dynamic` 機能で、メイン exe は静的リンクせず、起動時に
+`%APPDATA%\mimageviewer\onnxruntime.dll` を動的ロードする。DLL は PDFium と同様
+`include_bytes!` で exe に埋め込み、初回 `AiRuntime::new()` で APPDATA へ展開する。
+
+この方式の利点:
+- Visual C++ 再頒布可能パッケージへの依存が不要になる (VCRUNTIME140.dll 等が消える)
+- 利用者は単体 exe 版・インストーラ版どちらでも追加セットアップ不要
+
+### セットアップ
+
+```bash
+bash scripts/setup-ort.sh           # 既定バージョン (1.24.2) をダウンロード
+bash scripts/setup-ort.sh 1.24.5    # バージョン指定
+```
+
+- **ソース**: NuGet `Microsoft.ML.OnnxRuntime.DirectML` (Microsoft 公式ビルド)
+- **CDN**: `https://globalcdn.nuget.org/packages/microsoft.ml.onnxruntime.directml.<VERSION>.nupkg`
+- **現在のバージョン**: `vendor/ort/VERSION` を参照
+
+### バージョン互換性
+
+`ort` クレートの C API バージョンと一致する ONNX Runtime DLL を使う必要がある。
+`ort-sys` の `build/download/dist.txt` に `ms@X.Y.Z` というタグが入っており、これが
+対応する ONNX Runtime バージョン。ort クレートをアップデートしたら、このバージョンを
+確認して `setup-ort.sh` のデフォルトバージョン (`VERSION` 変数) を揃えること。
+
+- ort 2.0.0-rc.12 ↔ onnxruntime 1.24.2
+
+### DirectML.dll について
+
+Windows 10 1903 (2019年5月) 以降は `DirectML.dll` が OS に標準同梱されているので、
+個別に配布する必要はない。`onnxruntime.dll` は System32 の DirectML.dll を自動検出する。
+
 ## Susie 32bit ワーカー管理
 
 Susie 画像プラグイン (`.spi`, 32bit DLL) は 64bit メインプロセスから直接ロードできないため、
@@ -419,10 +460,23 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 ## Distribution
 
 - **mikage.to**: インストーラ (.exe) + exe 単体の両方を提供
-- **窓の杜・Vector**: インストーラ (.exe) のみで申請
+- **窓の杜**: インストーラ (.exe) を zip にまとめて申請
+- **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
+  readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
 - **ビルド**: `cargo build --release` → `ISCC.exe installer\mimageviewer.iss`
 - **出力**: `installer/Output/mImageViewer_setup.exe`
+- **Vector 申請用 zip**: `mImageViewer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
+  `installer/readme.txt` を同梱する。readme の内容 (動作環境・連絡先・インストール手順・
+  取り扱い種別) は Vector のファイル掲載基準 (https://www.vector.co.jp/for_authors/upload/standard.html)
+  を満たしていること。
+- **CRT 静的リンク**: `.cargo/config.toml` でメイン exe (x86_64) と Susie ワーカー (i686)
+  の両方に `+crt-static` を有効にしている。これにより `VCRUNTIME140.dll` / `MSVCP140.dll`
+  など Visual C++ 再頒布可能パッケージへの依存を排除している。
+  - メイン exe は `ort` クレートの `load-dynamic` 機能と組み合わせて成立している
+    (静的リンク版 `onnxruntime.lib` は動的 CRT 前提でビルドされており、crt-static と
+    両立しない)。どちらも触らないこと。
+  - **解除すると Vector の「要ソフト」欄指摘が再発する**。
 - **設定保存先**: `%APPDATA%\mimageviewer`（インストーラ版・単体版共通）
 
 ## コード修正時のドキュメント同時更新
@@ -443,16 +497,29 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 
 ## リリース手順チェックリスト
 
-リリース時は以下を漏れなく更新すること:
+リリース時は以下を漏れなく更新・作成すること:
 
 1. `Cargo.toml` — バージョン番号
 2. `installer/mimageviewer.iss` — `MyAppVersion`
-3. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記
-4. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
-5. `README.md` — 更新履歴セクションに新バージョンの変更点を追加
-6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
-8. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
+3. `installer/readme.txt` — 先頭の版表記・更新履歴リンク (Vector 同梱用)
+4. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記
+5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
+6. `README.md` — 更新履歴セクションに新バージョンの変更点を追加
+7. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
+8. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
+9. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
+10. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
+11. `cargo build --release` → `ISCC.exe installer\mimageviewer.iss` でインストーラを生成
+12. 配布成果物を 3 種類用意する:
+    - `mimageviewer.exe` (ポータブル版、mikage.to のみ)
+    - `mImageViewer_setup.exe` (インストーラ版、mikage.to・窓の杜・Vector 共通)
+    - `mImageViewer_v<VERSION>.zip` (Vector 申請用。`mImageViewer_setup.exe` +
+      `installer/readme.txt` を同梱)
+13. 依存 DLL の回帰チェック — リリース exe に対して `dumpbin /dependents` を走らせ、
+    `VCRUNTIME140.dll` / `MSVCP140.dll` が現れていないことを確認する。もし現れていたら:
+    - メイン exe: `ort` クレート機能から `load-dynamic` が抜けていないか確認
+    - Susie ワーカー: `.cargo/config.toml` の `i686-pc-windows-msvc` 向け
+      `+crt-static` 設定が残っているか確認
 
 ## Git Workflow
 
