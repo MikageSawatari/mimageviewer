@@ -755,6 +755,11 @@ impl App {
                 current_path: p.to_path_buf(),
                 is_zip,
             };
+            // 新しい current_path をブレッドクラムに反映。load_pdf_as_folder 等が
+            // 後で self.address を raw パスで上書きするが、そこでも再度
+            // `update_global_search_address` を呼んで元に戻す構造にしているので
+            // 最終的にこのブレッドクラムが表示される。
+            self.update_global_search_address();
         }
     }
 

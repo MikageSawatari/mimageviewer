@@ -2700,6 +2700,10 @@ impl App {
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
         self.address = pdf_path.to_string_lossy().to_string();
+        // Ctrl+G 絞り込みビュー中なら生の PDF パスを「🌐 全検索: "query" > scansnap >
+        // ファイル名.pdf」のブレッドクラム形式で上書きし直す (2026-04 ユーザー報告)。
+        // no-op: Ctrl+G 非アクティブ / Aggregated 時は何もしない。
+        self.update_global_search_address();
     }
 
     /// PDF ページ列挙の非同期応答をポーリングする。
@@ -2878,6 +2882,10 @@ impl App {
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
         self.address = source_path.to_string_lossy().to_string();
+        // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
+        // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
+        // no-op: Ctrl+G 非アクティブ / Aggregated 時は何もしない。
+        self.update_global_search_address();
         // 通常ロードでは変換済みアーカイブ override を解除 (呼び出し元が後で再設定する)。
         self.archive_source_override = None;
         self.selected = None;
@@ -10506,6 +10514,155 @@ mod phase_c_drill_nav_tests {
         assert!(
             matches!(app.global_search.view, GlobalSearchView::Aggregated),
             "Aggregated 時の advance は no-op であるべき"
+        );
+    }
+}
+
+// =======================================================================
+// Phase C - Ctrl+G drill view アドレスバー表示テスト (2026-04 報告)
+//
+// 期待: "🌐 全検索: \"グルグル\" > scansnap > 衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"
+// バグ: PDF を開くと raw パス "d:/oldpc_backup/data2/scansnap/衛藤..._ipad.pdf"
+// が address に書かれて、ブレッドクラムが失われる。
+//
+// 修正: `load_pdf_as_folder` (sync 経路) / `start_loading_items` (async 経路) /
+// `advance_drilled_current_path` の 3 箇所で、self.address 設定の直後に
+// `update_global_search_address()` を呼び直して breadcrumb を再適用する。
+// =======================================================================
+
+#[cfg(test)]
+mod phase_c_drill_address_tests {
+    use super::*;
+    use crate::global_search::GlobalHit;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
+
+    struct OverrideGuard;
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            crate::data_dir::set_test_override(None);
+        }
+    }
+
+    fn setup_app() -> (App, OverrideGuard, TempDir, std::sync::MutexGuard<'static, ()>) {
+        let lock = PHASE_C_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().expect("tempdir");
+        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
+        let guard = OverrideGuard;
+        let config = AppTestConfig {
+            data_dir: tmp.path().to_path_buf(),
+            settings: None,
+        };
+        let app = App::new_for_test(config);
+        (app, guard, tmp, lock)
+    }
+
+    /// Ctrl+G drill-in → PDF を開いた時点で address がブレッドクラム表示
+    /// (`🌐 全検索: "query" > container > filename.pdf`) になること。
+    /// 旧実装は raw PDF パス (`d:/.../...pdf`) が入っていた (2026-04 バグ)。
+    #[test]
+    fn address_shows_breadcrumb_after_opening_pdf_in_drilled() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder_path = std::path::PathBuf::from("d:/oldpc_backup/data2/scansnap");
+        let pdf_path = folder_path.join("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf");
+
+        app.global_search.active = true;
+        app.global_search.last_executed = "グルグル".to_string();
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: format!(
+                "{}/衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf",
+                folder_path.display()
+            )
+            .to_lowercase(),
+            score: 1.0,
+        });
+        app.drill_into_container(folder_path.clone(), false);
+        // drill 直後は container_root のみの breadcrumb
+        assert!(
+            app.address.contains("scansnap"),
+            "drill 直後: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("グルグル"),
+            "drill 直後のクエリ: {}",
+            app.address
+        );
+
+        // PDF を開く: advance_drilled_current_path + load_pdf_as_folder の
+        // 同期 address 書き込みパスを模擬する
+        app.advance_drilled_current_path(&pdf_path);
+        // 「load_pdf_as_folder 内部で一旦 address = pdf_path を書く」の再現
+        app.address = pdf_path.to_string_lossy().to_string();
+        // 修正: 直後に update_global_search_address() が走って breadcrumb に戻す
+        app.update_global_search_address();
+
+        // 期待: raw path ではなく breadcrumb
+        assert!(
+            !app.address.starts_with("d:/"),
+            "raw PDF path が address に残っている (修正前のバグ): {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("🌐 全検索"),
+            "breadcrumb prefix 欠落: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("グルグル"),
+            "クエリ欠落: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("scansnap"),
+            "container_root 欠落: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"),
+            "PDF ファイル名欠落: {}",
+            app.address
+        );
+    }
+
+    /// Ctrl+G が非アクティブなときは `update_global_search_address` が no-op で
+    /// address を書き換えないこと (本番経路で raw path が壊れない回帰ガード)。
+    #[test]
+    fn update_address_is_noop_when_ctrl_g_inactive() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.address = "C:/some/folder".to_string();
+        app.update_global_search_address();
+        assert_eq!(
+            app.address, "C:/some/folder",
+            "Ctrl+G 非アクティブ時に address を書き換えてはならない"
+        );
+    }
+
+    /// Aggregated 状態 → breadcrumb は N 件表示で、raw パスには戻らないこと。
+    #[test]
+    fn aggregated_address_shows_hit_count_not_raw_path() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        app.global_search.last_executed = "グルグル".to_string();
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "d:/scansnap/a.pdf".to_string(),
+            score: 1.0,
+        });
+        // Aggregated のまま update_global_search_address
+        app.update_global_search_address();
+        assert!(
+            app.address.contains("🌐 全検索"),
+            "Aggregated でも prefix は付く: {}",
+            app.address
+        );
+        assert!(
+            !app.address.starts_with("d:/"),
+            "Aggregated 中は raw path が入ってはならない: {}",
+            app.address
         );
     }
 }
