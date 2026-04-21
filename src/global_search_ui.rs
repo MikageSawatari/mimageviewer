@@ -330,7 +330,12 @@ impl App {
                 Some(t) => t.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS),
             };
             if should_resort || self.global_search.done {
-                self.rebuild_items_from_global_search();
+                // DrilledInto の間は実フォルダが load_folder 済みなので Aggregated view の
+                // items を上書きしない。containers / all_hits への accumulate だけ継続し、
+                // drill_back_to_aggregated で呼び出されたときに反映する。
+                if matches!(self.global_search.view, GlobalSearchView::Aggregated) {
+                    self.rebuild_items_from_global_search();
+                }
                 self.global_search.last_sort_at = Some(Instant::now());
             }
         }
@@ -340,89 +345,89 @@ impl App {
         }
     }
 
-    /// 現在の view モードに応じて App::items を再構築する。
-    /// 既存 items は全て捨てて置き換える。
+    /// Aggregated view の items を SearchContainer セルで組み直す。
+    ///
+    /// DrilledInto state では呼ばれない (drill-in は `load_folder` で実物のフォルダを
+    /// 開く方式に変更済み, docs §10.3)。
+    ///
+    /// `start_loading_items` 経由で搬入するのは以下の理由:
+    /// - image_metas が items と同じ長さで詰まる (push_grid_item_pending 単体では同期しない)
+    /// - requested / checked / search_filter / metadata_cache 等を一括クリア (Codex P2 指摘)
+    /// - visible_indices 再計算 + prewarm_rating_cache も起動時と同じ契約で走る
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
-        self.items.clear();
-        self.thumbnails.clear();
-        self.selected = None;
+        // Aggregated 以外で呼ばれるのは想定外 (DrilledInto 中は実フォルダ load 済みなので
+        // rebuild する対象はない)。呼び出し元はすべて view=Aggregated を確定させてから呼ぶ。
+        debug_assert!(matches!(
+            self.global_search.view,
+            GlobalSearchView::Aggregated
+        ));
 
-        match self.global_search.view.clone() {
-            GlobalSearchView::Aggregated => {
-                let containers = sorted_containers(&self.global_search.containers);
-                for c in containers {
-                    self.push_grid_item_pending(GridItem::SearchContainer {
-                        path: c.path,
-                        kind: c.kind,
-                        hit_count: c.hit_count,
-                    });
-                }
-            }
-            GlobalSearchView::DrilledInto { container, is_zip } => {
-                // container 配下のヒットを Image or ZipImage として展開。
-                // self.global_search.all_hits は unmutable borrow、self.push_grid_item_pending
-                // は mutable なので、先に filter した path 群を Vec<String> として確定させる。
-                let container_key = crate::search_index_db::normalize_path(&container);
-                let hit_paths: Vec<String> = self
-                    .global_search
-                    .all_hits
-                    .iter()
-                    .filter_map(|h| {
-                        if is_zip {
-                            h.path
-                                .split_once('!')
-                                .filter(|(zip, _)| *zip == container_key)
-                                .map(|_| h.path.clone())
-                        } else if PathBuf::from(&h.path)
-                            .parent()
-                            .map(|p| {
-                                crate::search_index_db::normalize_path(p) == container_key
-                            })
-                            .unwrap_or(false)
-                        {
-                            Some(h.path.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+        let containers = sorted_containers(&self.global_search.containers);
+        let items: Vec<GridItem> = containers
+            .iter()
+            .map(|c| GridItem::SearchContainer {
+                path: c.path.clone(),
+                kind: c.kind,
+                hit_count: c.hit_count,
+            })
+            .collect();
+        // SearchContainer はサムネイル不要 (make_load_request で None) なので
+        // image_metas は None の並びでよい。ただし長さは items と一致させる。
+        let image_metas: Vec<Option<(i64, i64)>> = vec![None; items.len()];
 
-                for hit_path in hit_paths {
-                    let grid_item = if is_zip {
-                        // "<zippath>!<entry>" から entry を抽出
-                        if let Some((_, entry)) = hit_path.split_once('!') {
-                            GridItem::ZipImage {
-                                zip_path: container.clone(),
-                                entry_name: entry.to_string(),
-                            }
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        GridItem::Image(PathBuf::from(&hit_path))
-                    };
-                    self.push_grid_item_pending(grid_item);
-                }
-            }
-        }
-        // items を差し替えたら visible_indices も再計算する。怠ると、前に表示していた
-        // フォルダのインデックス値 (新 items 外) が残って、グリッド描画で items[idx] が
-        // panic する (panic.log で ui_main.rs:1013 の out-of-bounds として観測)。
-        self.rebuild_visible_indices();
-        // scroll を先頭に戻す
-        self.scroll_offset_y = 0.0;
+        let synthetic = crate::app::search_results_synthetic_path();
+        // Ctrl+G 結果リストは catalog 管理対象外なので existing_keys は空で OK。
+        self.start_loading_items(
+            synthetic,
+            items,
+            image_metas,
+            std::collections::HashSet::new(),
+            Vec::new(),
+        );
+        self.update_global_search_address();
     }
 
-    /// drill-down view に切り替える (SearchContainer クリック時)。
+    /// SearchContainer をダブルクリックしたときの遷移。実際のフォルダ / ZIP を開いて
+    /// 通常のグリッド操作にそのまま乗せる (Ctrl+S の検索結果クリックと同じ UX)。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
-        self.global_search.view = GlobalSearchView::DrilledInto { container, is_zip };
-        self.rebuild_items_from_global_search();
+        self.global_search.view = GlobalSearchView::DrilledInto {
+            container: container.clone(),
+            is_zip,
+        };
+        if is_zip {
+            self.load_zip_as_folder(container);
+        } else {
+            self.load_folder(container);
+        }
     }
 
     /// Aggregated view に戻る (drill-down 状態から)。
     pub(crate) fn drill_back_to_aggregated(&mut self) {
         self.global_search.view = GlobalSearchView::Aggregated;
         self.rebuild_items_from_global_search();
+    }
+
+    /// Ctrl+G アドレスバー表示を現在の view に合わせて更新する。
+    /// - Aggregated: `🌐 全検索: "query" (N 件)`
+    /// - DrilledInto: 既に load_folder が普通のパスをセット済みなので何もしない
+    pub(crate) fn update_global_search_address(&mut self) {
+        if !self.global_search.active {
+            return;
+        }
+        if !matches!(self.global_search.view, GlobalSearchView::Aggregated) {
+            return;
+        }
+        let query = if self.global_search.last_executed.is_empty() {
+            self.global_search.query.clone()
+        } else {
+            self.global_search.last_executed.clone()
+        };
+        let n = self.global_search.containers.len();
+        if query.is_empty() {
+            self.address = "🌐 全検索".to_string();
+        } else {
+            self.address = format!("🌐 全検索: \"{query}\"  ({n} 件)");
+        }
     }
 
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
