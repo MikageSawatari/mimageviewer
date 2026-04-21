@@ -2014,6 +2014,10 @@ impl App {
     /// `path` がいずれかのお気に入り配下であれば、`items` の Folder/ZipFile/PdfFile を
     /// 検索インデックス DB に upsert する (ブラウズ時の軽量更新)。
     fn auto_index_current_folder(&mut self, path: &std::path::Path, items: &[GridItem]) {
+        // グローバル設定でオフにされていたら何もしない (v0.8.0 Phase 2)
+        if !self.settings.auto_index_name_on_browse {
+            return;
+        }
         let Some(db) = self.search_index_db.clone() else { return };
         let Some(fav_root) = self.find_favorite_root(path) else { return };
         // 同じフォルダへの往復ナビ時に SQLite 書き込みを回避する
