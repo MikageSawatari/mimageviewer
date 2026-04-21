@@ -13,6 +13,7 @@ pub mod fast_resize;
 pub mod folder_tree;
 pub mod fts_index;
 pub mod fts_meta;
+pub mod global_search;
 pub mod ingest_text;
 pub mod ingest_worker;
 pub mod io_semaphore;
