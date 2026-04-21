@@ -199,14 +199,14 @@ fn supervisor_loop(
         ));
     }
 
-    // 2. 初期スキャン実行
+    // 2. 初期スキャン実行 (cancel は Arc のまま渡す — walker 途中で shutdown 可能に)
     run_initial_scan(
         favorite_id,
         &favorite_root,
         &session,
         &mut writer,
         &io_sem,
-        &cancel,
+        Arc::clone(&cancel),
         &stats,
     );
     mark_activity(&stats);
@@ -228,7 +228,7 @@ fn supervisor_loop(
                             &session,
                             &mut writer,
                             &io_sem,
-                            &cancel,
+                            Arc::clone(&cancel),
                             &stats,
                         );
                         mark_activity(&stats);
@@ -255,7 +255,7 @@ fn supervisor_loop(
                                 &session,
                                 &mut writer,
                                 &io_sem,
-                                &cancel,
+                                Arc::clone(&cancel),
                                 &stats,
                             );
                             mark_activity(&stats);
@@ -291,14 +291,17 @@ fn run_initial_scan(
     session: &IngestSession,
     writer: &mut tantivy::IndexWriter,
     io_sem: &GlobalIoSemaphore,
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     stats: &Mutex<SupervisorStats>,
 ) {
+    // walker にも supervisor と同じ Arc<AtomicBool> を渡す (Codex 6 回目指摘 #4)。
+    // 旧実装は `Arc::new(AtomicBool::new(cancel.load()))` でスナップショットを渡しており、
+    // 長時間 walk 中に SupervisorHandle::drop() が cancel を立てても伝わらなかった。
     let scan = match search_walker::scan(
         ScanParams {
             favorite_id,
             root: favorite_root.to_path_buf(),
-            cancel: Arc::new(AtomicBool::new(cancel.load(Ordering::Relaxed))),
+            cancel: Arc::clone(&cancel),
         },
         session.meta_db,
         io_sem,
@@ -313,13 +316,14 @@ fn run_initial_scan(
         }
     };
     let scan_result_copy = ScanResultDigest::from(&scan);
+    // ingest_worker 側は `&AtomicBool` を取るのでここで unwrap
     let ingest_stats = match session.apply(
         scan.to_ingest,
         scan.to_delete,
         writer,
         io_sem,
         IoPriority::Low,
-        cancel,
+        &cancel,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -552,6 +556,41 @@ mod tests {
         );
         // ただ drop するだけで join しないと test が終わらないことを確認
         drop(handle);
+    }
+
+    #[test]
+    fn drop_during_long_scan_cancels_cleanly() {
+        // Codex 6 回目指摘 #4 回帰: 長時間の初期スキャン中でも drop で cancel が伝わる
+        let (tmp, meta, fts, sem) = setup();
+        let fav_root = tmp.path().join("long");
+        fs::create_dir_all(&fav_root).unwrap();
+        // スキャン時間を稼ぐため多めに画像を作る (数百件あれば supervisor スレッドが
+        // 初期スキャン中に drop される確率が高くなる)
+        for i in 0..500 {
+            write_image(&fav_root, &format!("img_{:04}.jpg", i));
+        }
+        let fav_id = Uuid::new_v4();
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: fav_id,
+                favorite_root: fav_root,
+                enable_metadata_index: true,
+            },
+            meta,
+            fts,
+            sem,
+        );
+        // 初期スキャンが走り始めた直後 (stats が populate されるより前に)
+        // drop して cancel がちゃんと伝わることを確認。
+        // ここで thread が "完了" しないと drop の join が 2 秒以上かかるため、test 自体がタイムアウト。
+        let t0 = Instant::now();
+        drop(handle);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drop で cancel が伝わらず join がタイムアウトした: {:?}",
+            elapsed
+        );
     }
 
     #[test]

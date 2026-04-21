@@ -114,6 +114,8 @@ impl<'a> IngestSession<'a> {
         let mut last_flush = Instant::now();
 
         // === 1. 削除フェーズ ===
+        // stats.deleted は **実際に tombstone 化 + Tantivy delete を push したもの** のみカウント
+        // (Codex 6 回目指摘 nice-to-have #1)。mark_tombstone 失敗や cancel で処理されなかった分は数えない。
         for path in &to_delete {
             if cancel.load(Ordering::Relaxed) {
                 stats.cancelled = true;
@@ -128,6 +130,7 @@ impl<'a> IngestSession<'a> {
             }
             fts_index::delete_doc(writer, fields, path);
             tombstone_paths.push(path.clone());
+            stats.deleted += 1;
 
             if self.should_flush(&tombstone_paths, &pending_paths, last_flush) {
                 self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
@@ -136,9 +139,8 @@ impl<'a> IngestSession<'a> {
         }
 
         if stats.cancelled {
-            // 残っている分を commit
+            // 残っている分を commit (stats.deleted は既に実処理カウント済み)
             self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
-            stats.deleted = to_delete.len();
             return Ok(stats);
         }
 
@@ -196,9 +198,8 @@ impl<'a> IngestSession<'a> {
             }
         }
 
-        // 残りを flush
+        // 残りを flush (stats.deleted は削除フェーズで実処理カウント済み)
         self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
-        stats.deleted = to_delete.len();
         Ok(stats)
     }
 
@@ -407,7 +408,7 @@ mod tests {
 
         // Tantivy 側で検索できる
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), "夕焼け", Some(&[fav])).unwrap();
+        let q = fts_index::build_bigram_and_query(fts.fields(), &["夕焼け"], Some(&[fav])).unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -448,7 +449,7 @@ mod tests {
 
         // Tantivy 側からも消えている
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), "a.jpg", Some(&[fav])).unwrap();
+        let q = fts_index::build_bigram_and_query(fts.fields(), &["a.jpg"], Some(&[fav])).unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 0);
@@ -519,6 +520,59 @@ mod tests {
     }
 
     #[test]
+    fn pending_residue_detected_by_reconciliation_hook() {
+        // Codex 6 回目テスト推奨: Tantivy commit 後 mark_ok が失敗 (または呼ばれず
+        // クラッシュ) した場合の残留状態。list_not_ok_paths で pending を回収できること。
+        let (tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let root = tmp.path().to_path_buf();
+
+        // mark_pending のみを手動で呼び、Tantivy upsert + commit も行うが
+        // mark_ok は意図的に呼ばない (クラッシュシミュレーション)
+        let cand = make_image_file(tmp.path(), "crash.jpg");
+        let key = cand.key.clone();
+        let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
+        meta.mark_pending(&key, fav, &root, cand.mtime, cand.file_size, &all_text).unwrap();
+        let mut writer = fts.writer().unwrap();
+        fts_index::upsert_doc(
+            &writer,
+            fts.fields(),
+            &crate::fts_index::IndexDoc {
+                path: key.clone(),
+                container: crate::fts_index::Container::Fs,
+                zip_entry: String::new(),
+                favorite_id: fav,
+                mtime: cand.mtime,
+                file_size: cand.file_size,
+                name: "crash.jpg".to_string(),
+                all_text,
+            },
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        // !!! mark_ok を呼ばずに "クラッシュ" — pending のまま残留
+
+        // 状態: fts_meta は pending、Tantivy は ok 済み (新テキスト)
+        let row = meta.get(&key).unwrap().unwrap();
+        assert_eq!(row.status, FileStatus::Pending);
+
+        // Ctrl+G 検索では pending は結果に現れない (lookup_all_text_norm が status=0 のみ返す)
+        fts.reload_reader().unwrap();
+        let q = fts_index::build_bigram_and_query(fts.fields(), &["crash.jpg"], Some(&[fav])).unwrap();
+        let searcher = fts.searcher();
+        let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
+        assert_eq!(hits.len(), 1, "Tantivy には残っている");
+        let lookup = meta.lookup_all_text_norm(&[key.clone()]).unwrap();
+        assert!(lookup.is_empty(), "post-filter では pending は除外 → 検索結果に出ない");
+
+        // reconciliation hook で検出できる (次回起動時の再 ingest 対象)
+        let not_ok = meta.list_not_ok_paths(fav).unwrap();
+        assert_eq!(not_ok.len(), 1);
+        assert_eq!(not_ok[0].0, key);
+        assert_eq!(not_ok[0].1, FileStatus::Pending);
+    }
+
+    #[test]
     fn batch_flush_threshold_is_respected() {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
@@ -538,7 +592,7 @@ mod tests {
         assert_eq!(stats.ingested_ok, 130);
         // 全 ok になっている
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), "b000", Some(&[fav])).unwrap();
+        let q = fts_index::build_bigram_and_query(fts.fields(), &["b000"], Some(&[fav])).unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert!(!hits.is_empty());

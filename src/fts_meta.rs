@@ -209,7 +209,14 @@ impl FtsMetaDb {
     }
 
     /// post-filter 用: 指定 path 群の all_text_norm を一括取得 (§9.1 ステップ 5)。
-    /// tombstone は含まない (検索結果から除外するため)。
+    ///
+    /// **`status = 0 (Ok)` のみを返す** (Codex 6 回目指摘 #5)。
+    /// pending / failed / tombstone は除外:
+    ///   - pending: ingest 進行中で all_text_norm が新しいが Tantivy 側は古い snapshot →
+    ///     二段整合性を保つため検索結果から外す
+    ///   - failed: メタ抽出失敗で all_text_norm が不完全な可能性
+    ///   - tombstone: 削除済み (Tantivy 側は commit 待ち)
+    ///
     /// 戻り値は入力 path 順不同の `Vec<(path, all_text_norm)>`。
     pub fn lookup_all_text_norm(
         &self,
@@ -222,7 +229,7 @@ impl FtsMetaDb {
         let placeholders = (0..paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT path, all_text_norm FROM files \
-             WHERE path IN ({}) AND status != 3",
+             WHERE path IN ({}) AND status = 0",
             placeholders
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -238,7 +245,16 @@ impl FtsMetaDb {
         Ok(out)
     }
 
-    /// 起動時差分走査 (§7.4) で使用。favorite_id スコープ内の (path, mtime, file_size) を返す。
+    /// 起動時差分走査 (§7.4) で使用。favorite_id スコープ内の **status=Ok のファイルのみ**
+    /// (path, mtime, file_size) を返す (Codex 6 回目指摘 #6)。
+    ///
+    /// pending / failed / tombstone を "既存" として扱わないので、
+    /// クラッシュで残った pending はこの結果に入らず、差分 diff が
+    /// 「FS にあるけど DB に無い」と判定して再 ingest に回す。
+    /// tombstone も除外するので、削除保留の path が "まだある" 扱いにはならない。
+    ///
+    /// Supervisor 起動前に `reconcile_not_ok_paths()` を呼ぶことで、
+    /// status != 0 の path 一覧を取り別途再 ingest キューに乗せられる (§5.6.3)。
     pub fn list_favorite_files(
         &self,
         favorite_id: Uuid,
@@ -246,7 +262,7 @@ impl FtsMetaDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT path, mtime, file_size FROM files \
-             WHERE favorite_id = ?1 AND status != 3",
+             WHERE favorite_id = ?1 AND status = 0",
         )?;
         let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
             Ok((
@@ -258,6 +274,32 @@ impl FtsMetaDb {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 起動時 reconciliation 用 (§5.6.3, Codex 6 回目指摘 #6):
+    /// 指定お気に入りスコープで status != Ok の path 一覧を返す。
+    /// 呼び出し側は:
+    ///   - pending / failed: 再 ingest キューへ
+    ///   - tombstone: Tantivy delete 再実行 → purge
+    /// で復旧する。
+    pub fn list_not_ok_paths(
+        &self,
+        favorite_id: Uuid,
+    ) -> rusqlite::Result<Vec<(String, FileStatus)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, status FROM files \
+             WHERE favorite_id = ?1 AND status != 0",
+        )?;
+        let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (p, s) = row?;
+            out.push((p, FileStatus::from_i64(s)));
         }
         Ok(out)
     }
@@ -478,7 +520,8 @@ mod tests {
     }
 
     #[test]
-    fn list_favorite_files_scoped() {
+    fn list_favorite_files_returns_only_ok() {
+        // Codex 6 回目指摘 #6: list_favorite_files は status=Ok のみ返す
         let (_tmp, db) = tmp_db();
         let fav_a = Uuid::new_v4();
         let fav_b = Uuid::new_v4();
@@ -488,10 +531,54 @@ mod tests {
         db.mark_pending("c:/a/2.jpg", fav_a, &root_a, 2, 2, "").unwrap();
         db.mark_pending("c:/b/1.jpg", fav_b, &root_b, 3, 3, "").unwrap();
 
+        // 全部 pending のまま → list_favorite_files には出てこない
+        assert!(db.list_favorite_files(fav_a).unwrap().is_empty());
+        assert!(db.list_favorite_files(fav_b).unwrap().is_empty());
+
+        // ok に遷移したもののみ返る
+        db.mark_ok(&["c:/a/1.jpg".to_string(), "c:/a/2.jpg".to_string()])
+            .unwrap();
         let a = db.list_favorite_files(fav_a).unwrap();
         assert_eq!(a.len(), 2);
-        let b = db.list_favorite_files(fav_b).unwrap();
-        assert_eq!(b.len(), 1);
+        // fav_b は pending のままなので空
+        assert!(db.list_favorite_files(fav_b).unwrap().is_empty());
+
+        // fav_b の pending は list_not_ok_paths で拾える (reconciliation hook)
+        let not_ok = db.list_not_ok_paths(fav_b).unwrap();
+        assert_eq!(not_ok.len(), 1);
+        assert_eq!(not_ok[0].0, "c:/b/1.jpg");
+        assert_eq!(not_ok[0].1, FileStatus::Pending);
+    }
+
+    #[test]
+    fn lookup_all_text_norm_returns_only_ok() {
+        // Codex 6 回目指摘 #5: lookup_all_text_norm は status=Ok のみ返す
+        let (_tmp, db) = tmp_db();
+        let fav = Uuid::new_v4();
+        let root = PathBuf::from("C:/p");
+        db.mark_pending("c:/p/a.jpg", fav, &root, 1, 1, "alpha").unwrap();
+        db.mark_pending("c:/p/b.jpg", fav, &root, 2, 2, "beta").unwrap();
+
+        // 両方 pending → lookup は空
+        let rows = db
+            .lookup_all_text_norm(&["c:/p/a.jpg".to_string(), "c:/p/b.jpg".to_string()])
+            .unwrap();
+        assert!(rows.is_empty(), "pending は post-filter に含めない");
+
+        // ok に遷移 → 返る
+        db.mark_ok(&["c:/p/a.jpg".to_string()]).unwrap();
+        let rows = db
+            .lookup_all_text_norm(&["c:/p/a.jpg".to_string(), "c:/p/b.jpg".to_string()])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "c:/p/a.jpg");
+
+        // failed に遷移 → 除外
+        db.mark_failed("c:/p/a.jpg").unwrap();
+        let rows = db
+            .lookup_all_text_norm(&["c:/p/a.jpg".to_string()])
+            .unwrap();
+        assert!(rows.is_empty(), "failed も post-filter から除外");
     }
 
     #[test]

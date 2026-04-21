@@ -62,6 +62,22 @@ pub struct ScanResult {
     pub unchanged: usize,
     /// 走査中に encountered した候補ファイル総数 (stats 用)
     pub total_scanned: usize,
+    /// 診断統計 (Codex 6 回目 nice-to-have #2): インデックス管理ダイアログの
+    /// トラブルシューティング表示で使える
+    pub diag: ScanDiag,
+}
+
+/// walker の診断統計。read_dir / file_type / metadata 失敗の件数を持つ。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanDiag {
+    /// std::fs::read_dir が失敗した回数 (典型例: アクセス拒否フォルダ)
+    pub read_dir_errors: usize,
+    /// DirEntry::file_type() が失敗した回数 (稀)
+    pub file_type_errors: usize,
+    /// DirEntry::metadata() が失敗した回数 (削除競合等)
+    pub metadata_errors: usize,
+    /// 最大深度 (MAX_DEPTH) に到達して打ち切ったディレクトリ数
+    pub depth_limit_hits: usize,
 }
 
 /// 走査開始パラメータ。
@@ -101,7 +117,8 @@ pub fn scan(
 
     // 1. FS を walk して候補を集める
     let mut fs_map = std::collections::HashMap::<String, CandidateFile>::new();
-    walk_dir_recursive(&root, io_sem, priority, &cancel, &mut fs_map, 0)?;
+    let mut diag = ScanDiag::default();
+    walk_dir_recursive(&root, io_sem, priority, &cancel, &mut fs_map, &mut diag, 0)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -118,6 +135,7 @@ pub fn scan(
     // 3. 3-way diff
     let mut result = ScanResult::default();
     result.total_scanned = fs_map.len();
+    result.diag = diag;
 
     for (key, cand) in &fs_map {
         match db_map.get(key) {
@@ -150,6 +168,7 @@ fn walk_dir_recursive(
     priority: IoPriority,
     cancel: &AtomicBool,
     out: &mut std::collections::HashMap<String, CandidateFile>,
+    diag: &mut ScanDiag,
     depth: u32,
 ) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
@@ -158,13 +177,17 @@ fn walk_dir_recursive(
     // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
     const MAX_DEPTH: u32 = 40;
     if depth > MAX_DEPTH {
+        diag.depth_limit_hits += 1;
         return Ok(());
     }
 
     let _permit = io_sem.acquire(priority);
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
-        Err(_) => return Ok(()), // アクセス不可はスキップ (典型例: System Volume Information)
+        Err(_) => {
+            diag.read_dir_errors += 1;
+            return Ok(());
+        }
     };
     // read_dir 中は permit を握ったまま全エントリを舐める
     let entries: Vec<_> = rd.flatten().collect();
@@ -178,7 +201,10 @@ fn walk_dir_recursive(
         // ★ file_type() は entry がキャッシュしているので syscall なし
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
-            Err(_) => continue,
+            Err(_) => {
+                diag.file_type_errors += 1;
+                continue;
+            }
         };
         let path = entry.path();
 
@@ -212,7 +238,10 @@ fn walk_dir_recursive(
 
         let metadata = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                diag.metadata_errors += 1;
+                continue;
+            }
         };
         let mtime = metadata
             .modified()
@@ -240,7 +269,7 @@ fn walk_dir_recursive(
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        walk_dir_recursive(&sub, io_sem, priority, cancel, out, depth + 1)?;
+        walk_dir_recursive(&sub, io_sem, priority, cancel, out, diag, depth + 1)?;
     }
     Ok(())
 }
@@ -445,6 +474,33 @@ mod tests {
         // fav_a の scan 結果に fav_b は出てこない
         let r = scan_sync(fav_a, &root_a, &db);
         assert!(r.to_delete.is_empty(), "別 favorite の deleted は検出しない");
+    }
+
+    #[test]
+    fn diag_counters_increment_on_bad_dir() {
+        // Codex 6 回目 nice-to-have #2: 診断 stats を出して原因調査を助ける
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        // 存在しないパスを root にする (read_dir がエラーを返すはず)
+        let root = tmp.path().join("does_not_exist");
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let r = scan(
+            ScanParams {
+                favorite_id: fav,
+                root,
+                cancel,
+            },
+            &db,
+            &sem,
+            IoPriority::Normal,
+        )
+        .unwrap();
+        assert_eq!(r.total_scanned, 0);
+        assert_eq!(
+            r.diag.read_dir_errors, 1,
+            "存在しないルートは read_dir エラーとしてカウントされるはず"
+        );
     }
 
     #[test]

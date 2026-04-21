@@ -109,10 +109,24 @@ pub fn run(
         return;
     }
 
-    // 3. Tantivy 候補絞り込み用のクエリ文字列を作る (正の include トークンだけ)
-    let positive_text = build_positive_query(&tokens);
-    if positive_text.is_empty() {
-        // 正のトークンなし = NOT-only (validate_query で弾かれるはずだが念のため)
+    // 3. 対象 favorite が 0 件なら空結果で即完了 (Codex 6 回目指摘 #3)
+    // 旧実装は None を fts_index に渡して "favorite filter なし = 全件検索" となる事故があった。
+    if favorite_ids.is_empty() {
+        let _ = tx.send(SearchStreamEvent::Done {
+            truncated: false,
+            reason: DoneReason::Complete,
+        });
+        return;
+    }
+
+    // 4. 正の include トークン群を token 単位で bigram 化 (Codex 6 回目指摘 #1)
+    let include_tokens: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.include)
+        .map(|t| t.needle.as_str())
+        .collect();
+    if include_tokens.is_empty() {
+        // validate_query で NOT-only は弾かれるはずだが念のため
         let _ = tx.send(SearchStreamEvent::Done {
             truncated: false,
             reason: DoneReason::RejectedQuery(RejectReason::NotOnly),
@@ -120,17 +134,12 @@ pub fn run(
         return;
     }
 
-    // favorite_ids 空は仕様上あり得ないが、fts_index 側で None を返すのでそこでも弾かれる
     let Some(query) = fts_index::build_bigram_and_query(
         fts.fields(),
-        &positive_text,
-        if favorite_ids.is_empty() {
-            None
-        } else {
-            Some(favorite_ids)
-        },
+        &include_tokens,
+        Some(favorite_ids),
     ) else {
-        // bigram が作れない (1 文字等) → early return
+        // bigram が作れない (どこかのトークンが 1 文字等) → early return
         let _ = tx.send(SearchStreamEvent::Done {
             truncated: false,
             reason: DoneReason::RejectedQuery(RejectReason::TooShort),
@@ -239,6 +248,10 @@ pub fn run(
 // -----------------------------------------------------------------------
 
 /// 最小長ポリシー + NOT-only 拒否の判定 (§9.1 ステップ 2-3)。
+/// 最小長は **各 include トークン単位** で確認する (Codex 6 回目指摘 #2)。
+///
+/// 旧実装は `join(" ")` した連結文字列の長さで判定していたため、`a b c` や
+/// `夕 海` のような短すぎるトークン群が合計長で通過してしまう問題があった。
 fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason> {
     if query_text.trim().is_empty() || tokens.is_empty() {
         return Err(RejectReason::Empty);
@@ -247,25 +260,14 @@ fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason
     if !tokens.iter().any(|t| t.include) {
         return Err(RejectReason::NotOnly);
     }
-    // 最小長チェック (include トークン 1 つでも有効な長さがあれば OK)
-    // v1 は "CJK を 1 文字でも含めば 2 文字以上 OK / ASCII のみなら 3 文字以上" ポリシー。
-    // ここではクエリ全体の include トークンを連結した「正の text」で判定する。
-    let positive_text = build_positive_query(tokens);
-    if !has_sufficient_length(&positive_text) {
-        return Err(RejectReason::TooShort);
-    }
-    Ok(())
-}
-
-/// 正のトークンをスペース結合 (Tantivy 候補絞り込みで bigram 化する入力)
-fn build_positive_query(tokens: &[Token]) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for t in tokens {
-        if t.include {
-            parts.push(&t.needle);
+    // 各 include トークンが §4.3 の最小長 (CJK: 2 / ASCII: 3) を満たすか確認。
+    // 1 つでも短ければ TooShort (AND 条件なので短い方が最低基準になる)。
+    for t in tokens.iter().filter(|t| t.include) {
+        if !has_sufficient_length(&t.needle) {
+            return Err(RejectReason::TooShort);
         }
     }
-    parts.join(" ")
+    Ok(())
 }
 
 /// §4.3 最小クエリ長ポリシー。
@@ -548,6 +550,59 @@ mod tests {
             }
         }
         assert_eq!(reason, Some(DoneReason::Cancelled));
+    }
+
+    #[test]
+    fn multi_include_tokens_hit_even_if_text_order_differs() {
+        // Codex 6 回目指摘 #1 回帰: トークン間の距離・順序が違う doc もヒット
+        let (_tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け、海辺、夏の思い出");
+        ingest(&meta, &fts, fav, "c:/b.jpg", "海辺の朝 夕焼けは見られず");
+        ingest(&meta, &fts, fav, "c:/c.jpg", "夕焼けだけ");
+
+        let (hits, reason, _) = collect_events("夕焼け 海辺", &[fav], &fts, &meta);
+        assert_eq!(reason, DoneReason::Complete);
+        let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"c:/a.jpg"), "句読点を挟んで含む doc もヒット");
+        assert!(paths.contains(&"c:/b.jpg"), "逆順で含む doc もヒット");
+        assert!(!paths.contains(&"c:/c.jpg"), "片方のみは除外");
+    }
+
+    #[test]
+    fn short_token_in_multi_token_query_rejected() {
+        // Codex 6 回目指摘 #2 回帰: トークン単位の min-length。
+        // "夕 海" は "夕焼け 海辺" と合計 4 文字だが、各トークンが 1 文字なので TooShort。
+        let (_tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け 海辺");
+        let (hits, reason, _) = collect_events("夕 海", &[fav], &fts, &meta);
+        assert!(hits.is_empty());
+        assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+    }
+
+    #[test]
+    fn ascii_multi_short_tokens_rejected() {
+        // 英字 2 文字トークンの複数組 (`sd ai`) は各 token が ASCII 3 未満なので TooShort。
+        let (_tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        ingest(&meta, &fts, fav, "c:/a.jpg", "sd ai photo");
+        let (hits, reason, _) = collect_events("sd ai", &[fav], &fts, &meta);
+        assert!(hits.is_empty());
+        assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+    }
+
+    #[test]
+    fn empty_favorite_ids_returns_complete_not_all_favorites() {
+        // Codex 6 回目指摘 #3 回帰: favorite_ids 空 → 全件検索事故にならず即完了
+        let (_tmp, meta, fts) = setup();
+        let fav_a = Uuid::new_v4();
+        ingest(&meta, &fts, fav_a, "c:/a.jpg", "夕焼け");
+
+        // 対象 favorite が 0 件 → 空結果 + Complete で返る
+        let (hits, reason, _) = collect_events("夕焼け", &[], &fts, &meta);
+        assert!(hits.is_empty(), "favorite_ids 空なら結果は空");
+        assert_eq!(reason, DoneReason::Complete);
     }
 
     #[test]

@@ -102,13 +102,18 @@ impl FsWatcher {
 
 impl Drop for FsWatcher {
     fn drop(&mut self) {
+        // 停止シグナル: debounce_loop が次の recv_timeout (最長 DEBOUNCE_MS/2 = 250ms) で
+        // stop_flag をチェックし、break して終了する。
+        // 実装は通常の join で、タイムアウト付き join はしていない (Codex 6 回目指摘 #7):
+        //   - 通常ケース: debounce_loop が 250ms 以内に stop_flag を見て終わる → 即 join
+        //   - notify 側の Sender が drop される経路: raw_rx が Disconnected → break
+        // 多数 favorite を UI スレッドから一斉 drop すると ~250ms × N の累積になる可能性あり。
+        // App 統合時は Supervisor drop を UI スレッド外 (別スレッド) に寄せる方針で設計すること。
         self.stop_flag.store(true, Ordering::SeqCst);
-        // join は spurious wake を避けるため最大 1 秒で諦める
         if let Some(h) = self.thread_handle.take() {
-            // _watcher を先に drop した後の処理は debounce_loop 側で try_recv の
-            // Disconnected を見て終了する。ここでは短い timeout で join する。
             let _ = h.join();
         }
+        // _watcher は self が drop されたときに自動で drop される (DropGuard 同様)
     }
 }
 

@@ -191,43 +191,65 @@ pub fn delete_doc(writer: &IndexWriter, fields: &Fields, path: &str) {
     writer.delete_term(Term::from_field_text(fields.path, path));
 }
 
-/// クエリ文字列を bigram に分解して AND の BooleanQuery を作る (§4.3)。
+/// 複数 include トークンを「トークン単位の bigram AND」の AND として BooleanQuery を作る (§4.3)。
 ///
-/// 戻り値が `None` の場合は「クエリから bigram が取れなかった」= 1 文字以下か空。
-/// 呼び出し側は早期 return して「2 文字以上入力してください」を UI に表示する。
+/// ## トークン単位にする理由 (Codex 6 回目指摘 #1)
+///
+/// 旧実装は `include_tokens.join(" ")` を 1 本化してから bigram 化していたが、
+/// 連結で生じる境界の bigram (例: `け ` や ` 海`) まで AND 必須になり、検索漏れの原因になる。
+/// 例: `夕焼け 海辺` 連結 → bigram `夕焼`,`焼け`,`け `,` 海`,`海辺`
+/// → 元テキストに `夕焼け、海辺` のように句読点を挟んで両語を含む doc がヒットしない。
+///
+/// 正しくは **各トークンを独立に bigram 化してトークン内部で AND、トークン間を AND** にする。
+/// これなら各トークンの内部 bigram 列さえ揃えば doc の並び順に関係なくヒットする。
+///
+/// ## 戻り値 `None` の条件
+///
+/// - `include_tokens` が空 (呼び出し側で早期 return)
+/// - 任意のトークンが bigram を生成できない (1 文字等 — 最小長は呼び出し側で判定する契約)
+/// - `favorite_ids = Some(&[])` (対象 favorite ゼロ = 絶対ヒットしない)
 pub fn build_bigram_and_query(
     fields: &Fields,
-    query_text: &str,
+    include_tokens: &[&str],
     favorite_ids: Option<&[Uuid]>,
 ) -> Option<BooleanQuery> {
-    // 正規化は共通関数経由 (§5.2 Codex 2回目 #3)
-    let lowered = crate::search_norm::normalize_for_match(query_text);
-
-    let mut tokenizer = NgramTokenizer::new(2, 2, false).ok()?;
-    let mut stream: Box<dyn TokenStream> = Box::new(tokenizer.token_stream(&lowered));
-    let mut bigrams: Vec<String> = Vec::new();
-    stream.process(&mut |t: &Token| bigrams.push(t.text.clone()));
-    bigrams.sort();
-    bigrams.dedup();
-    if bigrams.is_empty() {
+    if include_tokens.is_empty() {
         return None;
     }
+    // 空 favorite_ids は「絶対ヒットしない」として早期 return (Codex 6 回目指摘 #3)
+    if let Some(ids) = favorite_ids {
+        if ids.is_empty() {
+            return None;
+        }
+    }
 
-    let mut subs: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(bigrams.len() + 1);
-    for bg in bigrams {
-        let term = Term::from_field_text(fields.all_text, &bg);
-        subs.push((
-            Occur::Must,
-            Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
-        ));
+    // 各 include トークンを個別に bigram 化し、トークン毎に AND の BooleanQuery を作る
+    let mut token_queries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(include_tokens.len() + 1);
+    for tok in include_tokens {
+        let lowered = crate::search_norm::normalize_for_match(tok);
+        let mut tokenizer = NgramTokenizer::new(2, 2, false).ok()?;
+        let mut stream: Box<dyn TokenStream> = Box::new(tokenizer.token_stream(&lowered));
+        let mut bigrams: Vec<String> = Vec::new();
+        stream.process(&mut |t: &Token| bigrams.push(t.text.clone()));
+        bigrams.sort();
+        bigrams.dedup();
+        if bigrams.is_empty() {
+            // このトークンは bigram 生成不可 (1 文字等) → クエリ組み立て失敗
+            return None;
+        }
+        let mut bigram_subs: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(bigrams.len());
+        for bg in bigrams {
+            let term = Term::from_field_text(fields.all_text, &bg);
+            bigram_subs.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+            ));
+        }
+        token_queries.push((Occur::Must, Box::new(BooleanQuery::from(bigram_subs))));
     }
 
     // favorite_id スコープ filter (複数 favorite の OR を更に Must として追加)
     if let Some(ids) = favorite_ids {
-        if ids.is_empty() {
-            // 対象 favorite がゼロなら絶対マッチしない = 空結果
-            return None;
-        }
         let mut fav_subs: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(ids.len());
         for id in ids {
             let term = Term::from_field_text(fields.favorite_id, &id.to_string());
@@ -236,10 +258,10 @@ pub fn build_bigram_and_query(
                 Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
             ));
         }
-        subs.push((Occur::Must, Box::new(BooleanQuery::from(fav_subs))));
+        token_queries.push((Occur::Must, Box::new(BooleanQuery::from(fav_subs))));
     }
 
-    Some(BooleanQuery::from(subs))
+    Some(BooleanQuery::from(token_queries))
 }
 
 /// 1 ページ分の検索結果を取得 (§9.1 ステップ 5)。
@@ -354,7 +376,7 @@ mod tests {
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
-        let q = build_bigram_and_query(idx.fields(), "夕焼け", None).unwrap();
+        let q = build_bigram_and_query(idx.fields(), &["夕焼け"], None).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -371,7 +393,7 @@ mod tests {
         idx.reload_reader().unwrap();
 
         // 最初は "cat" でヒット
-        let q = build_bigram_and_query(idx.fields(), "cat", None).unwrap();
+        let q = build_bigram_and_query(idx.fields(), &["cat"], None).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -381,8 +403,8 @@ mod tests {
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
-        let q_cat = build_bigram_and_query(idx.fields(), "cat", None).unwrap();
-        let q_dog = build_bigram_and_query(idx.fields(), "dog", None).unwrap();
+        let q_cat = build_bigram_and_query(idx.fields(), &["cat"], None).unwrap();
+        let q_dog = build_bigram_and_query(idx.fields(), &["dog"], None).unwrap();
         let searcher = idx.searcher();
         let cat_hits = search_page(&searcher, idx.fields(), &q_cat, 0, 10).unwrap();
         let dog_hits = search_page(&searcher, idx.fields(), &q_dog, 0, 10).unwrap();
@@ -404,7 +426,7 @@ mod tests {
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
-        let q = build_bigram_and_query(idx.fields(), "alpha", None).unwrap();
+        let q = build_bigram_and_query(idx.fields(), &["alpha"], None).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 0);
@@ -431,12 +453,12 @@ mod tests {
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
-        let q_all = build_bigram_and_query(idx.fields(), "夕焼け", None).unwrap();
+        let q_all = build_bigram_and_query(idx.fields(), &["夕焼け"], None).unwrap();
         let searcher = idx.searcher();
         let all_hits = search_page(&searcher, idx.fields(), &q_all, 0, 10).unwrap();
         assert_eq!(all_hits.len(), 2);
 
-        let q_a = build_bigram_and_query(idx.fields(), "夕焼け", Some(&[fav_a])).unwrap();
+        let q_a = build_bigram_and_query(idx.fields(), &["夕焼け"], Some(&[fav_a])).unwrap();
         let a_hits = search_page(&searcher, idx.fields(), &q_a, 0, 10).unwrap();
         assert_eq!(a_hits.len(), 1);
         assert_eq!(a_hits[0].0, "c:/a.jpg");
@@ -446,15 +468,65 @@ mod tests {
     fn single_char_query_returns_none() {
         let (_tmp, idx) = new_index();
         // 1 文字では bigram が作れない → None
-        let q = build_bigram_and_query(idx.fields(), "の", None);
+        let q = build_bigram_and_query(idx.fields(), &["の"], None);
         assert!(q.is_none());
     }
 
     #[test]
     fn empty_favorite_ids_returns_none() {
         let (_tmp, idx) = new_index();
-        let q = build_bigram_and_query(idx.fields(), "hello", Some(&[]));
+        let q = build_bigram_and_query(idx.fields(), &["hello"], Some(&[]));
         assert!(q.is_none(), "空 favorite_ids は絶対にマッチしない");
+    }
+
+    #[test]
+    fn empty_tokens_returns_none() {
+        let (_tmp, idx) = new_index();
+        let q = build_bigram_and_query(idx.fields(), &[], None);
+        assert!(q.is_none(), "include トークン 0 個は None");
+    }
+
+    #[test]
+    fn multi_token_finds_doc_with_distant_token_positions() {
+        // Codex 6 回目指摘 #1 回帰テスト:
+        // 複数 include トークンを個別に bigram 化するので、元テキストでトークン間の
+        // 文字位置が離れていても両方が含まれればヒットする。
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        // "夕焼け" と "海辺" の間に他の文字 (句読点) を挟む
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav, "夕焼け、海辺、そして人々"),
+        )
+        .unwrap();
+        // 両方含むが隣接していない
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/b.jpg", fav, "海辺 写真 夕焼け"),
+        )
+        .unwrap();
+        // 片方だけ
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/c.jpg", fav, "夕焼けのみ"),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        // 旧実装 (join スペース 1 本化) だと "け " や " 海" の bigram 必須で
+        // a も b も漏れる。新実装は各トークン独立にするので両方ヒットする。
+        let q = build_bigram_and_query(idx.fields(), &["夕焼け", "海辺"], None).unwrap();
+        let searcher = idx.searcher();
+        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
+        let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"c:/a.jpg"), "句読点挟み doc がヒットするはず");
+        assert!(paths.contains(&"c:/b.jpg"), "逆順 doc もヒットするはず");
+        assert!(!paths.contains(&"c:/c.jpg"), "片方だけは除外");
     }
 
     #[test]
@@ -478,7 +550,7 @@ mod tests {
         // "夕焼 海辺" (2文字以上のクエリを AND する想定だが bigram ベースなので
         // "夕焼 海辺" というスペース区切りの AND は上位レイヤーのジョブ。
         // ここでは連続する bigram を AND したときの挙動だけ確認)
-        let q = build_bigram_and_query(idx.fields(), "夕焼け", None).unwrap();
+        let q = build_bigram_and_query(idx.fields(), &["夕焼け"], None).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
@@ -507,7 +579,7 @@ mod tests {
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
-        let q = build_bigram_and_query(idx.fields(), "夕焼け", None).unwrap();
+        let q = build_bigram_and_query(idx.fields(), &["夕焼け"], None).unwrap();
         let searcher = idx.searcher();
         let page0 = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let page1 = search_page(&searcher, idx.fields(), &q, 10, 10).unwrap();
