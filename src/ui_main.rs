@@ -89,38 +89,8 @@ impl App {
                         ui.close();
                     }
 
-                    // インデックス作成
-                    if ui.button("インデックス作成").clicked() {
-                        self.ic.checked = self
-                            .settings
-                            .favorites
-                            .iter()
-                            .map(|fav| {
-                                self.settings
-                                    .search_index_checks
-                                    .iter()
-                                    .any(|p| p == &fav.path)
-                            })
-                            .collect();
-                        self.ic.reset_for_open();
-                        self.ic.show = true;
-                        ui.close();
-                    }
-
-                    // キャッシュ作成
-                    if ui.button("キャッシュ作成").clicked() {
-                        self.cc.checked =
-                            vec![false; self.settings.favorites.len()];
-                        self.cc.running = false;
-                        self.cc.result = None;
-                        self.cc.total.store(0, Ordering::Relaxed);
-                        self.cc.done.store(0, Ordering::Relaxed);
-                        self.cc.cache_size.store(0, Ordering::Relaxed);
-                        self.cc.finished.store(false, Ordering::Relaxed);
-                        *self.cc.current.lock().unwrap() = String::new();
-                        self.cc.show = true;
-                        ui.close();
-                    }
+                    // 名前索引 / サムネの一括作成は「お気に入り > 編集」ダイアログの
+                    // 下部ボタンから起動する (v0.8.0 で単独メニュー項目を廃止)。
 
                     // 区切り線
                     ui.separator();

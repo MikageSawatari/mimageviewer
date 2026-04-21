@@ -28,6 +28,8 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut request_rescan_for: Option<uuid::Uuid> = None;
         let mut request_rescan_all = false;
+        let mut open_index_creator = false;
+        let mut open_cache_creator = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
@@ -118,11 +120,14 @@ impl App {
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "お気に入りごとに自動処理の ON/OFF を選べます。\n\
-                             ・名前索引 — フォルダ/ZIP/PDF 名の検索 (Ctrl+S)\n\
-                             ・メタ索引 — AI プロンプト / mXDownloader メタなど画像メタ全文検索 \
-                             (Ctrl+F / Ctrl+G)\n\
-                             ・サムネイル — グリッド表示用のサムネイル画像を事前生成してキャッシュ",
+                            "お気に入り配下をフル索引化するかを選べます。\n\
+                             ・名前索引 — フォルダ / ZIP / PDF 名を Ctrl+S で検索\n\
+                             ・メタ索引 — AI プロンプト / EXIF / XMP など画像メタを Ctrl+F / Ctrl+G で検索\n\
+                             チェックを入れた項目はこの場で 1 回全走査し、以降は notify-rs と\n\
+                             起動時スキャンで自動更新します。未チェックでも、閲覧したフォルダは\n\
+                             軽い索引追記 (名前) が走ります。\n\
+                             サムネイルは I/O が重い (GB 規模) ため自動化から外し、\n\
+                             下部の「🖼 サムネを一括作成」ボタンで手動起動してください。",
                         )
                         .weak()
                         .size(11.0),
@@ -137,25 +142,21 @@ impl App {
                         .show(ui, |ui| {
                             egui::Grid::new("fav_edit_grid")
                                 .striped(true)
-                                .num_columns(10)
+                                .num_columns(9)
                                 .spacing([8.0, 4.0])
                                 .show(ui, |ui| {
                                     // ── ヘッダ ──
                                     ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
                                     ui.label(egui::RichText::new("名前").strong()).on_hover_text(
-                                        "名前索引 — フォルダ/ZIP/PDF 名を Ctrl+S 検索で\n\
-                                         引けるようにする (自動で増減を追跡)",
+                                        "名前索引を全走査で作る + 以降自動更新する。\n\
+                                         OFF でも閲覧したフォルダは軽く追記される (Ctrl+S 用)。",
                                     );
                                     ui.label(egui::RichText::new("メタ").strong()).on_hover_text(
-                                        "メタ索引 — 画像の AI プロンプト / EXIF / XMP /\n\
-                                         mXDownloader メタを Ctrl+F / Ctrl+G で全文検索できるようにする",
+                                        "メタ索引を全走査で作る + 以降自動更新する。\n\
+                                         画像メタ全文検索 (Ctrl+F / Ctrl+G) で使う。\n\
+                                         OFF でも閲覧フォルダの軽い追記が将来入る予定 (v0.8.x)。",
                                     );
-                                    ui.label(egui::RichText::new("サムネ").strong())
-                                        .on_hover_text(
-                                            "サムネイルを事前生成してキャッシュする\n\
-                                             (グリッド表示を高速化)",
-                                        );
                                     ui.label(egui::RichText::new("状態").strong()).on_hover_text(
                                         "メタ索引の初期スキャン状態\n\
                                          ✅ = 完了 / ⏳ = スキャン中",
@@ -199,17 +200,13 @@ impl App {
                                         )
                                         .on_hover_text(&path_str);
 
-                                        // 3 種のフラグ
+                                        // 2 種のフル索引化フラグ (サムネは手動バルクのみ)
                                         ui.checkbox(
                                             &mut self.settings.favorites[i].auto_index_structure,
                                             "",
                                         );
                                         ui.checkbox(
                                             &mut self.settings.favorites[i].auto_index_metadata,
-                                            "",
-                                        );
-                                        ui.checkbox(
-                                            &mut self.settings.favorites[i].auto_index_thumbs,
                                             "",
                                         );
 
@@ -283,17 +280,11 @@ impl App {
                                 f.auto_index_metadata = false;
                             }
                         }
-                        if ui.button("サムネ 全ON").clicked() {
-                            for f in &mut self.settings.favorites {
-                                f.auto_index_thumbs = true;
-                            }
-                        }
-                        if ui.button("サムネ 全OFF").clicked() {
-                            for f in &mut self.settings.favorites {
-                                f.auto_index_thumbs = false;
-                            }
-                        }
-                        ui.separator();
+                    });
+
+                    // ── バルク一括実行ボタン群 (旧メニュー統合) ──
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
                         if ui
                             .button("🔄 メタ索引をすべて再構築")
                             .on_hover_text(
@@ -302,6 +293,27 @@ impl App {
                             .clicked()
                         {
                             request_rescan_all = true;
+                        }
+                        if ui
+                            .button("📂 名前索引を一括作成…")
+                            .on_hover_text(
+                                "名前索引ダイアログを開きます。お気に入り配下全体を一括\n\
+                                 スキャンして Ctrl+S 検索用の索引を構築します。",
+                            )
+                            .clicked()
+                        {
+                            open_index_creator = true;
+                        }
+                        if ui
+                            .button("🖼 サムネを一括作成…")
+                            .on_hover_text(
+                                "サムネイル一括作成ダイアログを開きます。お気に入り配下\n\
+                                 全画像のサムネを先回り生成してキャッシュに保存します\n\
+                                 (I/O 量が大きいため手動実行のみ)。",
+                            )
+                            .clicked()
+                        {
+                            open_cache_creator = true;
                         }
                     });
                 }
@@ -355,6 +367,37 @@ impl App {
             // キャンセル: 設定を再読み込みして変更を破棄
             self.settings = crate::settings::Settings::load();
             self.show_favorites_editor = false;
+        }
+
+        // バルク実行ダイアログを起動 (「お気に入り」ダイアログと同じフレームで連続
+        // 操作可能にするため、閉じる/閉じない は問わず後段で呼ぶ)。
+        if open_index_creator {
+            self.ic.checked = self
+                .settings
+                .favorites
+                .iter()
+                .map(|fav| {
+                    self.settings
+                        .search_index_checks
+                        .iter()
+                        .any(|p| p == &fav.path)
+                })
+                .collect();
+            self.ic.reset_for_open();
+            self.ic.show = true;
+        }
+        if open_cache_creator {
+            self.cc.checked = vec![false; self.settings.favorites.len()];
+            self.cc.running = false;
+            self.cc.result = None;
+            self.cc.total.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.cc.done.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.cc.cache_size
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.cc.finished
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            *self.cc.current.lock().unwrap() = String::new();
+            self.cc.show = true;
         }
     }
 }

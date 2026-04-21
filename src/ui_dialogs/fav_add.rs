@@ -64,22 +64,25 @@ impl App {
 
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new("自動インデックス (あとで編集可能):")
-                            .weak(),
+                        egui::RichText::new(
+                            "フル索引化 (あとで編集可能):\n\
+                             チェックしたものは、このお気に入り配下を今すぐ一括スキャンし\n\
+                             以降は notify-rs と起動時スキャンで自動更新します。\n\
+                             未チェックでも閲覧したフォルダは軽い索引追記が走ります。",
+                        )
+                        .weak(),
                     );
                     ui.add_space(2.0);
                     ui.checkbox(
                         &mut self.fav_add_auto_index_structure,
-                        "フォルダ名 / ZIP・PDF 名で検索できるようにする (Ctrl+S)",
+                        "名前索引 (フォルダ/ZIP/PDF 名 — Ctrl+S 検索用)",
                     );
                     ui.checkbox(
                         &mut self.fav_add_auto_index_metadata,
-                        "メタデータ (EXIF / XMP / PNG tEXt) を検索できるようにする (Ctrl+F/G)",
+                        "メタ索引 (EXIF / XMP / PNG tEXt — Ctrl+F/G 検索用)",
                     );
-                    ui.checkbox(
-                        &mut self.fav_add_auto_index_thumbs,
-                        "サムネイルを事前キャッシュする",
-                    );
+                    // サムネイルは I/O が重い (GB 規模) ため自動化から外し、手動バルクのみ
+                    // (「お気に入り」ダイアログからサムネ一括作成ボタンで起動)
                 } else {
                     ui.label("追加対象のフォルダが不明です。");
                 }
