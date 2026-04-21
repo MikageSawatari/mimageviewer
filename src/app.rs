@@ -299,6 +299,7 @@ fn run_metadata_search(
     tokens: &[crate::search_query::Token],
     items: &[GridItem],
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -308,6 +309,31 @@ fn run_metadata_search(
         std::collections::HashMap::new();
     let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
         std::collections::HashMap::new();
+
+    // fts_meta.db 直接ルックアップ (§9.2): 表示中 Image の path を正規化して一括 SELECT
+    // fts_meta.db に ok 状態で存在するファイルは all_text_norm が使える = Pass 2 の
+    // ファイル I/O (EXIF/XMP/PNG 読み取り) を丸ごと省略できる。
+    // (未登録 path / indexing 進行中 path は Pass 2 のオンデマンド経路に落ちる)
+    let preloaded_texts: std::collections::HashMap<String, String> = if let Some(db) = fts_meta {
+        let keys: Vec<String> = items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::Image(p) => {
+                    Some(crate::search_index_db::normalize_path(p))
+                }
+                _ => None,
+            })
+            .collect();
+        match db.lookup_all_text_norm(&keys) {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(e) => {
+                crate::logger::log(format!("Ctrl+F: fts_meta lookup failed: {e}"));
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Pass 1: 構造アイテム + ZIP/PDF 系 (cheap な分類のみ、I/O なし)
     for (idx, item) in items.iter().enumerate() {
@@ -360,6 +386,17 @@ fn run_metadata_search(
             GridItem::Video(p) => (p, false),
             _ => continue,
         };
+        // §9.2 fts_meta.db 直接ルックアップが効く場合は Pass 2 I/O を完全に省略する
+        if is_image {
+            let key = crate::search_index_db::normalize_path(path);
+            if let Some(preloaded) = preloaded_texts.get(&key) {
+                // all_text_norm には既にファイル名・EXIF・XMP・PNG tEXt が全部含まれている
+                if crate::search_query::matches(tokens, preloaded) {
+                    matches.insert(idx);
+                }
+                continue;
+            }
+        }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
         let meta_text = if is_image && is_png_path(path) {
             crate::png_metadata::build_searchable_from_path(path)
@@ -5273,6 +5310,15 @@ impl App {
         // 専用で、スレッドは自分が読み取った分は `xmp_additions` で UI に返す。
         let items_snapshot = self.items.clone();
         let xmp_snapshot = self.xmp_cache.clone();
+        // v0.8.0: fts_meta.db のハンドルを worker に渡して Pass 2 I/O を省略する
+        // (docs §9.2 Ctrl+F Tantivy 非経由方式 — 表示中 path 集合で絞り込み)
+        // IndexerManager が有効なら FtsMetaDb の Arc を clone して worker に渡す。
+        // worker 側は表示中 item の path 集合でバルク lookup_all_text_norm を呼び、
+        // ヒットした分は Pass 2 I/O を省略して all_text_norm で直接マッチ判定する。
+        let fts_meta_clone: Option<std::sync::Arc<crate::fts_meta::FtsMetaDb>> = self
+            .indexer_manager
+            .as_ref()
+            .map(|mgr| mgr.clone_fts_meta());
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -5282,7 +5328,13 @@ impl App {
         std::thread::Builder::new()
             .name("metadata-search".to_string())
             .spawn(move || {
-                let result = run_metadata_search(&tokens, &items_snapshot, &xmp_snapshot, &cancel_w);
+                let result = run_metadata_search(
+                    &tokens,
+                    &items_snapshot,
+                    &xmp_snapshot,
+                    fts_meta_clone.as_ref(),
+                    &cancel_w,
+                );
                 let _ = tx.send(result);
             })
             .ok();

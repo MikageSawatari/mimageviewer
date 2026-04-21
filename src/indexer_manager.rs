@@ -243,6 +243,12 @@ impl IndexerManager {
     pub fn supervisor_count(&self) -> usize {
         self.supervisors.len()
     }
+
+    /// `Arc<FtsMetaDb>` を clone して返す (Ctrl+F 用 §9.2)。
+    /// worker thread 側で `lookup_all_text_norm` を呼びたいときに使う。
+    pub fn clone_fts_meta(&self) -> Arc<FtsMetaDb> {
+        Arc::clone(&self.meta_db)
+    }
 }
 
 impl Drop for IndexerManager {
