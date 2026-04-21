@@ -37,6 +37,7 @@
 | [plan-v0.7.0.md](plan-v0.7.0.md) | v0.7.0 実装計画 + 完了ステータス + リリース直前チェックリスト |
 | [search-expansion-design.md](search-expansion-design.md) | 検索機能拡充 (Ctrl+G グローバルメタ検索 + 自動インデックス) の設計ドキュメント (v0.8.0 予定) |
 | [search-bench-results.md](search-bench-results.md) | Tantivy + bigram プロトタイプ計測結果 (§15.1.1) |
+| [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 + rename バグ記録 |
 
 ---
 

@@ -92,6 +92,19 @@ impl SearchIndexDb {
         })
     }
 
+    /// 任意パスに開く (統合テスト用)。`data_dir` に依存せずディスク永続の DB を作れる。
+    pub fn open_at(db_path: &Path) -> rusqlite::Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        init_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// 親フォルダ配下の指定アイテムを一括 upsert する。
     /// 親フォルダ直下の既存エントリのうち、`children` に含まれないものは削除する
     /// (差分反映)。

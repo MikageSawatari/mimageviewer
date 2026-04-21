@@ -136,6 +136,44 @@ impl IndexerManager {
                 return None;
             }
         };
+        Self::new_with_stores(meta_db, fts, favorites, speed)
+    }
+
+    /// テスト用コンストラクタ: `data_dir` 配下に `fts_meta.db` / `fts_index/` を作って初期化する。
+    ///
+    /// 本番の `new()` と同じ reconciliation → supervisor spawn のパスをたどるので、
+    /// 統合テストで notify-rs 監視や spawn_search の end-to-end を検証できる。
+    /// `data_dir` は呼び出し側が tempdir を用意する想定。
+    pub fn new_at(
+        data_dir: &std::path::Path,
+        favorites: &[FavoriteEntry],
+        speed: crate::settings::IndexerSpeedProfile,
+    ) -> Option<Self> {
+        std::fs::create_dir_all(data_dir).ok();
+        let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
+            Ok(db) => Arc::new(db),
+            Err(e) => {
+                crate::logger::log(format!("IndexerManager(test): FtsMetaDb open failed: {e}"));
+                return None;
+            }
+        };
+        let fts = match FtsIndex::open_at(&data_dir.join("fts_index")) {
+            Ok(idx) => Arc::new(idx),
+            Err(e) => {
+                crate::logger::log(format!("IndexerManager(test): FtsIndex open failed: {e}"));
+                return None;
+            }
+        };
+        Self::new_with_stores(meta_db, fts, favorites, speed)
+    }
+
+    /// `new` / `new_at` 共通の本体。stores を受け取って reconciliation + supervisor spawn を行う。
+    fn new_with_stores(
+        meta_db: Arc<FtsMetaDb>,
+        fts: Arc<FtsIndex>,
+        favorites: &[FavoriteEntry],
+        speed: crate::settings::IndexerSpeedProfile,
+    ) -> Option<Self> {
         // IndexWriter は 1 本だけ作って全 supervisor で共有する (Tantivy 制約)
         let writer = match fts.writer() {
             Ok(w) => Arc::new(std::sync::Mutex::new(w)),
