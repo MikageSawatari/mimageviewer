@@ -898,6 +898,9 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 
+    /// v0.8.0: 「インデックス管理」ダイアログの表示フラグ
+    pub(crate) show_index_manager: bool,
+
     // ── Ctrl+G グローバルメタ検索 UI 状態 (docs §10.3) ──────────────
     pub(crate) global_search: crate::global_search_ui::GlobalSearchState,
 
@@ -1435,6 +1438,7 @@ impl Default for App {
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
             indexer_manager,
+            show_index_manager: false,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
@@ -8181,6 +8185,7 @@ impl eframe::App for App {
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
         self.show_index_creator_dialog(ctx);
+        self.show_index_manager_dialog(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
