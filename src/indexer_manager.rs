@@ -76,6 +76,11 @@ impl Drop for SearchHandle {
 pub struct IndexerManager {
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
+    /// **全 supervisor で共有する** Tantivy IndexWriter。
+    /// Tantivy は 1 Index につき IndexWriter を 1 本しか許さないので、
+    /// 複数のお気に入りの supervisor が各自 `fts.writer()` を呼ぶと
+    /// 2 つ目以降が LockBusy で落ちる (旧実装のバグ、2026-04 修正)。
+    writer: Arc<std::sync::Mutex<tantivy::IndexWriter>>,
     io_sem: Arc<GlobalIoSemaphore>,
     /// お気に入り UUID → Supervisor ハンドル
     supervisors: HashMap<Uuid, SupervisorHandle>,
@@ -131,6 +136,14 @@ impl IndexerManager {
                 return None;
             }
         };
+        // IndexWriter は 1 本だけ作って全 supervisor で共有する (Tantivy 制約)
+        let writer = match fts.writer() {
+            Ok(w) => Arc::new(std::sync::Mutex::new(w)),
+            Err(e) => {
+                crate::logger::log(format!("IndexerManager: writer init failed: {e}"));
+                return None;
+            }
+        };
         let permits = speed.io_permits().max(1); // 0 は GlobalIoSemaphore で panic するので防御
         crate::logger::log(format!(
             "IndexerManager: speed profile = {:?} → io_permits = {permits}",
@@ -159,6 +172,7 @@ impl IndexerManager {
         let mut mgr = IndexerManager {
             meta_db,
             fts,
+            writer,
             io_sem,
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
@@ -239,6 +253,7 @@ impl IndexerManager {
                 },
                 Arc::clone(&self.meta_db),
                 Arc::clone(&self.fts),
+                Arc::clone(&self.writer),
                 Arc::clone(&self.io_sem),
             );
             self.supervisors.insert(f.id, handle);
@@ -362,6 +377,15 @@ impl Drop for IndexerManager {
         for (id, handle) in self.supervisors.drain() {
             crate::logger::log(format!("IndexerManager: stopping supervisor {id}"));
             drop(handle);
+        }
+        // 全 supervisor が止まった後に共有 writer を 1 回 commit する。
+        // supervisor 側の apply 中に flush/commit は既に済んでいるはずだが、最後の
+        // 未 flush バッチをここで落としきる (旧実装は supervisor 個々の drop で commit
+        // していたが、共有 writer では 1 回だけでよい)。
+        if let Ok(mut w) = self.writer.lock() {
+            if let Err(e) = w.commit() {
+                crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
+            }
         }
     }
 }
@@ -646,9 +670,11 @@ mod tests {
         std::fs::create_dir_all(&root_old).unwrap();
         std::fs::create_dir_all(&root_new).unwrap();
 
+        let writer = Arc::new(std::sync::Mutex::new(fts.writer().unwrap()));
         let mut mgr = IndexerManager {
             meta_db: Arc::clone(&meta),
             fts: Arc::clone(&fts),
+            writer,
             io_sem: Arc::clone(&io_sem),
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),

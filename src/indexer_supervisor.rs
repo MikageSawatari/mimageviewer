@@ -152,10 +152,15 @@ pub struct SupervisorParams {
 ///
 /// - `meta_db` と `fts` はどちらも内部で Mutex または同期機構を持つのでスレッド跨ぎで使える
 /// - `io_sem` は全 Supervisor 共通で 1 つ
+/// - `writer` は **全 supervisor で共有** する `Arc<Mutex<IndexWriter>>`。
+///   Tantivy は 1 Index につき IndexWriter を 1 本しか持てないので、複数のお気に入りの
+///   supervisor が各自 `fts.writer()` を呼ぶと 2 つ目以降が LockBusy で落ちる
+///   (旧実装のバグ)。IndexerManager が 1 本だけ作って全員で借りる。
 pub fn spawn(
     params: SupervisorParams,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
+    writer: Arc<Mutex<tantivy::IndexWriter>>,
     io_sem: Arc<GlobalIoSemaphore>,
 ) -> SupervisorHandle {
     assert!(
@@ -175,6 +180,11 @@ pub fn spawn(
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
 
+    crate::logger::log(format!(
+        "indexer[{fav_id}]: supervisor starting for {}",
+        root.display()
+    ));
+
     let thread = std::thread::Builder::new()
         .name(format!("indexer-{}", fav_id.as_simple()))
         .spawn(move || {
@@ -183,6 +193,7 @@ pub fn spawn(
                 root,
                 meta_db,
                 fts,
+                writer,
                 io_sem,
                 cancel_cl,
                 stats_cl,
@@ -211,6 +222,7 @@ fn supervisor_loop(
     favorite_root: PathBuf,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
+    writer: Arc<Mutex<tantivy::IndexWriter>>,
     io_sem: Arc<GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
@@ -220,15 +232,6 @@ fn supervisor_loop(
     change_rx: Receiver<DebouncedChange>,
 ) {
     let session = IngestSession::new(favorite_id, favorite_root.clone(), &meta_db, &fts);
-
-    // Tantivy writer は Supervisor の生存期間中 1 本を使い続ける (Tantivy 推奨)
-    let mut writer = match fts.writer() {
-        Ok(w) => w,
-        Err(e) => {
-            crate::logger::log(format!("indexer[{favorite_id}]: writer init failed: {e}"));
-            return;
-        }
-    };
 
     // 1. Watcher 起動 (drop で停止)。失敗しても初期スキャンは動かす。
     let watcher = FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()).ok();
@@ -243,7 +246,7 @@ fn supervisor_loop(
         favorite_id,
         &favorite_root,
         &session,
-        &mut writer,
+        &writer,
         &io_sem,
         Arc::clone(&cancel),
         &stats,
@@ -268,7 +271,7 @@ fn supervisor_loop(
                             favorite_id,
                             &favorite_root,
                             &session,
-                            &mut writer,
+                            &writer,
                             &io_sem,
                             Arc::clone(&cancel),
                             &stats,
@@ -297,7 +300,7 @@ fn supervisor_loop(
                                 favorite_id,
                                 &favorite_root,
                                 &session,
-                                &mut writer,
+                                &writer,
                                 &io_sem,
                                 Arc::clone(&cancel),
                                 &stats,
@@ -309,7 +312,7 @@ fn supervisor_loop(
                         }
                         apply_single_change(
                             &session,
-                            &mut writer,
+                            &writer,
                             &io_sem,
                             &cancel,
                             &stats,
@@ -326,11 +329,9 @@ fn supervisor_loop(
         }
     }
 
-    // 終了時に念のため commit (最後のバッチが残っていた場合)
-    if let Err(e) = writer.commit() {
-        crate::logger::log(format!("indexer[{favorite_id}]: final commit failed: {e}"));
-    }
+    // 終了時 commit は IndexerManager::drop 側で 1 回やる (共有 writer のため)。
     drop(watcher); // 明示的に FsWatcher を drop
+    crate::logger::log(format!("indexer[{favorite_id}]: supervisor exiting"));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -338,7 +339,7 @@ fn run_initial_scan(
     favorite_id: Uuid,
     favorite_root: &std::path::Path,
     session: &IngestSession,
-    writer: &mut tantivy::IndexWriter,
+    writer: &Mutex<tantivy::IndexWriter>,
     io_sem: &GlobalIoSemaphore,
     cancel: Arc<AtomicBool>,
     stats: &Mutex<SupervisorStats>,
@@ -348,11 +349,17 @@ fn run_initial_scan(
     // (初期スキャンは supervisor 起動後 1 度のみ "initial"、以降の FullRescan /
     //  watcher overflow は last_scan_duration_ms のみ更新する)。
     let is_initial = !stats.lock().unwrap().initial_scan_done;
+    let scan_kind = if is_initial { "initial" } else { "rescan" };
     let t_start = Instant::now();
+
+    crate::logger::log(format!(
+        "indexer[{favorite_id}]: {scan_kind} scan starting (walker phase)"
+    ));
 
     // walker にも supervisor と同じ Arc<AtomicBool> を渡す (Codex 6 回目指摘 #4)。
     // 旧実装は `Arc::new(AtomicBool::new(cancel.load()))` でスナップショットを渡しており、
     // 長時間 walk 中に SupervisorHandle::drop() が cancel を立てても伝わらなかった。
+    let t_walk = Instant::now();
     let scan = match search_walker::scan(
         ScanParams {
             favorite_id,
@@ -370,29 +377,50 @@ fn run_initial_scan(
             return;
         }
     };
+    let walk_ms = t_walk.elapsed().as_millis() as u64;
     let total_scanned = scan.total_scanned;
     let diag = scan.diag;
-    // ingest_worker 側は `&AtomicBool` を取るのでここで unwrap
-    let ingest_stats = match session.apply(
-        scan.to_ingest,
-        scan.to_delete,
-        writer,
-        io_sem,
-        IoPriority::Low,
-        &cancel,
-        Some(progress),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            crate::logger::log(format!("indexer[{favorite_id}]: ingest apply failed: {e}"));
-            return;
+    let ingest_n = scan.to_ingest.len();
+    let delete_n = scan.to_delete.len();
+    crate::logger::log(format!(
+        "indexer[{favorite_id}]: walker done in {walk_ms} ms \
+         (scanned={total_scanned}, to_ingest={ingest_n}, to_delete={delete_n})"
+    ));
+
+    // ingest フェーズでのみ共有 writer を lock する。walker は lock 不要なので、
+    // 複数お気に入りの walk は並列で走る。ingest だけ直列化される。
+    crate::logger::log(format!(
+        "indexer[{favorite_id}]: acquiring writer for ingest..."
+    ));
+    let t_ingest = Instant::now();
+    let ingest_stats = {
+        let mut w = writer.lock().unwrap();
+        match session.apply(
+            scan.to_ingest,
+            scan.to_delete,
+            &mut w,
+            io_sem,
+            IoPriority::Low,
+            &cancel,
+            Some(progress),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::logger::log(format!("indexer[{favorite_id}]: ingest apply failed: {e}"));
+                return;
+            }
         }
     };
+    let ingest_ms = t_ingest.elapsed().as_millis() as u64;
     let dur_ms = t_start.elapsed().as_millis() as u64;
     crate::logger::log(format!(
-        "indexer[{favorite_id}]: {} scan done in {dur_ms} ms \
-         (scanned={total_scanned}, read_dir_err={}, file_type_err={}, metadata_err={}, depth_hits={})",
-        if is_initial { "initial" } else { "rescan" },
+        "indexer[{favorite_id}]: {scan_kind} scan done in {dur_ms} ms \
+         (walker={walk_ms}ms, ingest={ingest_ms}ms, scanned={total_scanned}, \
+          ingest_ok={}, ingest_failed={}, deleted={}, \
+          read_dir_err={}, file_type_err={}, metadata_err={}, depth_hits={})",
+        ingest_stats.ingested_ok,
+        ingest_stats.ingested_failed,
+        ingest_stats.deleted,
         diag.read_dir_errors,
         diag.file_type_errors,
         diag.metadata_errors,
@@ -413,7 +441,7 @@ fn run_initial_scan(
 #[allow(clippy::too_many_arguments)]
 fn apply_single_change(
     session: &IngestSession,
-    writer: &mut tantivy::IndexWriter,
+    writer: &Mutex<tantivy::IndexWriter>,
     io_sem: &GlobalIoSemaphore,
     cancel: &AtomicBool,
     stats: &Mutex<SupervisorStats>,
@@ -426,10 +454,11 @@ fn apply_single_change(
 
     match kind {
         ChangeKind::Remove => {
+            let mut w = writer.lock().unwrap();
             let ingest_stats = match session.apply(
                 vec![],
                 vec![key],
-                writer,
+                &mut w,
                 io_sem,
                 IoPriority::Normal,
                 cancel,
@@ -452,10 +481,11 @@ fn apply_single_change(
             let Some(cand) = build_candidate_from_path(&path, key) else {
                 return;
             };
+            let mut w = writer.lock().unwrap();
             let ingest_stats = match session.apply(
                 vec![cand],
                 vec![],
-                writer,
+                &mut w,
                 io_sem,
                 IoPriority::Normal,
                 cancel,
@@ -544,13 +574,15 @@ mod tests {
         TempDir,
         Arc<FtsMetaDb>,
         Arc<FtsIndex>,
+        Arc<Mutex<tantivy::IndexWriter>>,
         Arc<GlobalIoSemaphore>,
     ) {
         let tmp = TempDir::new().unwrap();
         let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
         let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
+        let writer = Arc::new(Mutex::new(fts.writer().unwrap()));
         let sem = Arc::new(GlobalIoSemaphore::new(2));
-        (tmp, meta, fts, sem)
+        (tmp, meta, fts, writer, sem)
     }
 
     fn write_image(dir: &Path, name: &str) {
@@ -561,7 +593,7 @@ mod tests {
     /// watcher の E2E 動作は通常環境依存なので、stats を polling で待つ。
     #[test]
     fn initial_scan_populates_stats() {
-        let (tmp, meta, fts, sem) = setup();
+        let (tmp, meta, fts, writer, sem) = setup();
         let fav_root = tmp.path().join("photos");
         fs::create_dir_all(&fav_root).unwrap();
         write_image(&fav_root, "a.jpg");
@@ -577,6 +609,7 @@ mod tests {
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
+            Arc::clone(&writer),
             Arc::clone(&sem),
         );
 
@@ -607,7 +640,7 @@ mod tests {
 
     #[test]
     fn drop_handle_stops_cleanly() {
-        let (tmp, meta, fts, sem) = setup();
+        let (tmp, meta, fts, writer, sem) = setup();
         let fav_root = tmp.path().join("p");
         fs::create_dir_all(&fav_root).unwrap();
         let handle = spawn(
@@ -618,6 +651,7 @@ mod tests {
             },
             meta,
             fts,
+            writer,
             sem,
         );
         // ただ drop するだけで join しないと test が終わらないことを確認
@@ -627,7 +661,7 @@ mod tests {
     #[test]
     fn drop_during_long_scan_cancels_cleanly() {
         // Codex 6 回目指摘 #4 回帰: 長時間の初期スキャン中でも drop で cancel が伝わる
-        let (tmp, meta, fts, sem) = setup();
+        let (tmp, meta, fts, writer, sem) = setup();
         let fav_root = tmp.path().join("long");
         fs::create_dir_all(&fav_root).unwrap();
         // スキャン時間を稼ぐため多めに画像を作る (数百件あれば supervisor スレッドが
@@ -644,6 +678,7 @@ mod tests {
             },
             meta,
             fts,
+            writer,
             sem,
         );
         // 初期スキャンが走り始めた直後 (stats が populate されるより前に)
@@ -659,9 +694,74 @@ mod tests {
         );
     }
 
+    /// 回帰テスト: 2 つのお気に入りに対応する supervisor を同時に走らせた場合、
+    /// 共有 IndexWriter 経由で両方とも初期スキャンを完了できること。
+    ///
+    /// 2026-04 バグ: 共有 writer 化前は 2 つ目の supervisor が
+    /// `fts.writer()` を呼んだ瞬間に LockBusy で return し、UI では永遠に
+    /// ⏳ スキャン中 の表示になっていた。共有 writer 化でこの経路を塞いだ。
+    #[test]
+    fn two_supervisors_share_writer_and_both_finish() {
+        let (tmp, meta, fts, writer, sem) = setup();
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        write_image(&root_a, "a1.jpg");
+        write_image(&root_a, "a2.jpg");
+        write_image(&root_b, "b1.jpg");
+        write_image(&root_b, "b2.jpg");
+
+        let fav_a = Uuid::new_v4();
+        let fav_b = Uuid::new_v4();
+        let handle_a = spawn(
+            SupervisorParams {
+                favorite_id: fav_a,
+                favorite_root: root_a,
+                enable_metadata_index: true,
+            },
+            Arc::clone(&meta),
+            Arc::clone(&fts),
+            Arc::clone(&writer),
+            Arc::clone(&sem),
+        );
+        let handle_b = spawn(
+            SupervisorParams {
+                favorite_id: fav_b,
+                favorite_root: root_b,
+                enable_metadata_index: true,
+            },
+            Arc::clone(&meta),
+            Arc::clone(&fts),
+            Arc::clone(&writer),
+            Arc::clone(&sem),
+        );
+
+        // 両方が initial_scan_done になることを 5 秒以内に確認
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let done_a = handle_a.snapshot_stats().initial_scan_done;
+            let done_b = handle_b.snapshot_stats().initial_scan_done;
+            if done_a && done_b {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "2 supervisor の initial scan が両方完了しない (a={done_a}, b={done_b})"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(handle_a.snapshot_stats().ingested_ok >= 2);
+        assert!(handle_b.snapshot_stats().ingested_ok >= 2);
+
+        drop(handle_a);
+        drop(handle_b);
+    }
+
     #[test]
     fn full_rescan_command_triggers_additional_work() {
-        let (tmp, meta, fts, sem) = setup();
+        let (tmp, meta, fts, writer, sem) = setup();
         let fav_root = tmp.path().join("r");
         fs::create_dir_all(&fav_root).unwrap();
         write_image(&fav_root, "x.jpg");
@@ -675,6 +775,7 @@ mod tests {
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
+            Arc::clone(&writer),
             Arc::clone(&sem),
         );
 
