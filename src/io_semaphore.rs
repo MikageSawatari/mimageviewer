@@ -1,0 +1,262 @@
+//! `GlobalIoSemaphore` — ワーカー横断の I/O 同時実行制御。
+//!
+//! docs/search-expansion-design.md §7.5 + §15.1.6 に準拠。
+//!
+//! 目的: UI スレッドのスクロール・入力応答がバックグラウンド I/O 競合で阻害されないよう、
+//! ディスク同時アクセス数に上限を設ける。PDF ワーカー / サムネイルワーカー / 全文インデクサ
+//! のような複数サブシステムが同じ I/O リソースを奪い合うのを調停する。
+//!
+//! ## 優先度
+//!
+//! - `High`: ユーザが今見ているフォルダ / ページ (UI 経路)
+//! - `Normal`: PDF 背景レンダリング、通常サムネロード
+//! - `Low`: インデクサ (Ctrl+G 用の全文メタスキャン)
+//!
+//! 高優先度の待ち行列が空になるまで、低優先度は新規取得できない (飢餓 vs. 公平性の妥協点)。
+//! 既に permit を握っている worker は優先度に関係なく継続できる。
+//!
+//! ## 実装方針
+//!
+//! `Mutex + Condvar` パターン。`try_lock + sleep` は禁止 (CLAUDE.md §並行処理 参照)。
+//! permit の drop で自動的に release し、`notify_all` で起床させる。
+//! Condvar は spurious wakeup 耐性のため `while` ループで条件を再確認する。
+
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IoPriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+}
+
+struct SemState {
+    available: usize,
+    total: usize,
+    /// 各優先度の待機数 (対応する `IoPriority` をキーに、0..=2)
+    waiting: [usize; 3],
+}
+
+impl SemState {
+    /// 指定優先度が今 permit を取得してよいか?
+    /// - available > 0
+    /// - かつ自分より高い優先度の待機者がいない (または自分が最高優先度)
+    fn can_acquire(&self, pri: IoPriority) -> bool {
+        if self.available == 0 {
+            return false;
+        }
+        // 自分より高い優先度の waiter がいるなら、その人に譲る
+        for higher in (pri as usize + 1)..3 {
+            if self.waiting[higher] > 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub struct GlobalIoSemaphore {
+    inner: Arc<(Mutex<SemState>, Condvar)>,
+}
+
+impl GlobalIoSemaphore {
+    /// 最大 `total` 個の I/O 同時実行を許可するセマフォを作る。
+    pub fn new(total: usize) -> Self {
+        assert!(total >= 1, "total permits must be >= 1");
+        Self {
+            inner: Arc::new((
+                Mutex::new(SemState {
+                    available: total,
+                    total,
+                    waiting: [0, 0, 0],
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    /// Blocking acquire。permit が取れるまで待ち、`IoPermit` を返す (Drop で自動 release)。
+    pub fn acquire(&self, priority: IoPriority) -> IoPermit {
+        let (mu, cv) = &*self.inner;
+        let mut st = mu.lock().unwrap();
+        st.waiting[priority as usize] += 1;
+        // spurious wakeup 耐性のため while ループで再確認
+        while !st.can_acquire(priority) {
+            st = cv.wait(st).unwrap();
+        }
+        st.waiting[priority as usize] -= 1;
+        st.available -= 1;
+        IoPermit {
+            sem: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Non-blocking acquire。permit が取れないなら即 None を返す。
+    /// キャンセル済み・best-effort タスク向け (CLAUDE.md でも try_lock 自体は OK)。
+    pub fn try_acquire(&self, priority: IoPriority) -> Option<IoPermit> {
+        let (mu, _cv) = &*self.inner;
+        let mut st = mu.lock().unwrap();
+        if !st.can_acquire(priority) {
+            return None;
+        }
+        st.available -= 1;
+        Some(IoPermit {
+            sem: Arc::clone(&self.inner),
+        })
+    }
+
+    /// 現在の available / total を返す (メトリクス用)。
+    pub fn stats(&self) -> (usize, usize) {
+        let (mu, _cv) = &*self.inner;
+        let st = mu.lock().unwrap();
+        (st.available, st.total)
+    }
+}
+
+/// RAII permit。Drop で available を元に戻し、Condvar で待機者を起床させる。
+pub struct IoPermit {
+    sem: Arc<(Mutex<SemState>, Condvar)>,
+}
+
+impl Drop for IoPermit {
+    fn drop(&mut self) {
+        let (mu, cv) = &*self.sem;
+        let mut st = mu.lock().unwrap();
+        st.available += 1;
+        debug_assert!(
+            st.available <= st.total,
+            "IoPermit: available exceeded total (double-release?)"
+        );
+        // 待機者に通知。優先度別に最適化した notify にしたいが、Condvar はキー別 wait を
+        // 持たないので notify_all で全員起床させ、`can_acquire` で二次判定させる。
+        // 待機数が少ない前提なので thundering herd は問題にならない。
+        cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn acquire_decrements_available() {
+        let sem = GlobalIoSemaphore::new(3);
+        let (a, t) = sem.stats();
+        assert_eq!((a, t), (3, 3));
+        let _p = sem.acquire(IoPriority::Normal);
+        let (a, _) = sem.stats();
+        assert_eq!(a, 2);
+    }
+
+    #[test]
+    fn drop_releases_permit() {
+        let sem = GlobalIoSemaphore::new(1);
+        {
+            let _p = sem.acquire(IoPriority::Normal);
+            assert_eq!(sem.stats().0, 0);
+        }
+        assert_eq!(sem.stats().0, 1);
+    }
+
+    #[test]
+    fn try_acquire_fails_when_empty() {
+        let sem = GlobalIoSemaphore::new(1);
+        let _p = sem.acquire(IoPriority::Normal);
+        assert!(sem.try_acquire(IoPriority::Normal).is_none());
+    }
+
+    #[test]
+    fn try_acquire_low_blocked_when_high_waiting() {
+        // permit=1、high 待機者 1 人 → low は try_acquire で取れない
+        let sem = Arc::new(GlobalIoSemaphore::new(1));
+        let _holder = sem.acquire(IoPriority::Normal); // 先に 1 つ掴む
+
+        // high 優先で acquire する別スレッドを起動 (待機状態に入るのを待つ)
+        let sem_h = Arc::clone(&sem);
+        let high_started = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&high_started);
+        let handle = std::thread::spawn(move || {
+            h.store(1, Ordering::SeqCst);
+            let _p = sem_h.acquire(IoPriority::High);
+        });
+        // high が waiting[High] をインクリメントするまで軽く待つ (CI 耐性)
+        while high_started.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Low 優先で try_acquire: high 待機者がいるので取れない
+        assert!(sem.try_acquire(IoPriority::Low).is_none());
+
+        // holder を解放
+        drop(_holder);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn high_priority_acquires_before_low_waiting_longer() {
+        // permit=1、Low が先に 1 つ掴む → Low がさらに 1 人待機 + High が 1 人待機 →
+        // holder を release したとき High が先に取得すること
+        let sem = Arc::new(GlobalIoSemaphore::new(1));
+        let holder = sem.acquire(IoPriority::Normal);
+
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let sem_low = Arc::clone(&sem);
+        let order_low = Arc::clone(&order);
+        let low_handle = std::thread::spawn(move || {
+            let _p = sem_low.acquire(IoPriority::Low);
+            order_low.lock().unwrap().push("low");
+            std::thread::sleep(Duration::from_millis(10));
+        });
+
+        // Low が待機状態に入るのを少し待ってから High を投入
+        std::thread::sleep(Duration::from_millis(20));
+
+        let sem_high = Arc::clone(&sem);
+        let order_high = Arc::clone(&order);
+        let high_handle = std::thread::spawn(move || {
+            let _p = sem_high.acquire(IoPriority::High);
+            order_high.lock().unwrap().push("high");
+            std::thread::sleep(Duration::from_millis(10));
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        drop(holder); // release
+
+        high_handle.join().unwrap();
+        low_handle.join().unwrap();
+
+        let ord = order.lock().unwrap();
+        assert_eq!(ord.as_slice(), &["high", "low"], "High が Low より先に取得するはず");
+    }
+
+    #[test]
+    fn waiters_eventually_all_acquire() {
+        let sem = Arc::new(GlobalIoSemaphore::new(2));
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let sem = Arc::clone(&sem);
+            let done = Arc::clone(&done);
+            let pri = if i % 3 == 0 {
+                IoPriority::High
+            } else if i % 3 == 1 {
+                IoPriority::Normal
+            } else {
+                IoPriority::Low
+            };
+            handles.push(std::thread::spawn(move || {
+                let _p = sem.acquire(pri);
+                std::thread::sleep(Duration::from_millis(5));
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        assert_eq!(done.load(Ordering::SeqCst), 8);
+        // 最終的に available が 2 に戻っていること
+        assert_eq!(sem.stats().0, 2);
+    }
+}

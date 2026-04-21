@@ -1,0 +1,474 @@
+//! 起動時差分走査 (docs/search-expansion-design.md §7.4)。
+//!
+//! お気に入りルートを再帰的に walk し、現在の FS 状態と `fts_meta.db` の
+//! 登録状態を 3-way diff して「ingest すべき path」「削除すべき path」を返す。
+//!
+//! ## 重要な制約 (CLAUDE.md §UI スレッド同期 I/O)
+//!
+//! - `entry.file_type()` を使う (`Path::is_dir()` / `is_file()` は `GetFileAttributes` syscall を
+//!   per-entry で呼ぶため数百ファイルで 500-1000ms ブロックになる)
+//! - UI スレッドから呼ばない。専用スレッドで実行する
+//! - `GlobalIoSemaphore` で read_dir の同時実行を制御する (§7.5)
+//! - キャンセルトークンで中断可能 (大量のお気に入り走査中に終了されても OK)
+//!
+//! ## 本モジュールのスコープ (§16 step 6)
+//!
+//! - FS walker + 3-way diff の計算のみ
+//! - ZIP 内エントリの列挙や、メタ抽出・Tantivy commit は **このモジュールの責務外**
+//!   (Ingest Worker = §16 step 9 に切り出す)
+//! - ZIP ファイルは「1 ZIP = 1 ingest 候補」として扱い、内容が変わったかは mtime/size で判定する
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use uuid::Uuid;
+
+use crate::folder_tree;
+use crate::fts_meta::FtsMetaDb;
+use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
+use crate::search_index_db::normalize_path;
+
+/// 1 候補ファイル (通常画像 / ZIP / PDF)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateFile {
+    /// 絶対パス (表示・I/O 用)
+    pub abs_path: PathBuf,
+    /// 正規化済み DB キー (`normalize_path` 済み)
+    pub key: String,
+    pub kind: CandidateKind,
+    pub mtime: i64,
+    pub file_size: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// ネイティブ対応画像 (Susie プラグイン拡張含む)
+    Image,
+    /// ZIP アーカイブ (中身は Ingest Worker が後で展開)
+    Zip,
+    /// PDF (v1 は document info のみ ingest、本文は対象外)
+    Pdf,
+}
+
+/// 3-way diff 結果。
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    /// FS にあり DB に無い、または mtime/size が変化したもの → ingest キュー対象
+    pub to_ingest: Vec<CandidateFile>,
+    /// DB にあり FS にないもの → tombstone (削除) 対象
+    pub to_delete: Vec<String>,
+    /// 差分なしの件数 (進捗表示用)
+    pub unchanged: usize,
+    /// 走査中に encountered した候補ファイル総数 (stats 用)
+    pub total_scanned: usize,
+}
+
+/// 走査開始パラメータ。
+pub struct ScanParams {
+    pub favorite_id: Uuid,
+    pub root: PathBuf,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// 進捗通知 (UI への stream)。Walker は I/O-bound なので頻繁に通知しすぎないこと。
+pub enum WalkerEvent {
+    /// 定期的な進捗
+    Progress { scanned: usize, current_dir: Option<PathBuf> },
+    /// 完了
+    Done(ScanResult),
+    /// エラー (フォルダが消えた等)
+    Error(String),
+}
+
+/// お気に入りルートを走査して 3-way diff を計算する。
+///
+/// `io_sem` は read_dir 呼び出しの順番制御用。複数お気に入りを並列走査する場合は
+/// 同じセマフォを共有することでグローバル I/O 同時実行数を制御できる。
+///
+/// 呼び出し側は典型的に別スレッドで実行し、結果を mpsc で受け取る。
+pub fn scan(
+    params: ScanParams,
+    db: &FtsMetaDb,
+    io_sem: &GlobalIoSemaphore,
+    priority: IoPriority,
+) -> Result<ScanResult, String> {
+    let ScanParams {
+        favorite_id,
+        root,
+        cancel,
+    } = params;
+
+    // 1. FS を walk して候補を集める
+    let mut fs_map = std::collections::HashMap::<String, CandidateFile>::new();
+    walk_dir_recursive(&root, io_sem, priority, &cancel, &mut fs_map, 0)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+
+    // 2. DB 側の登録一覧を取得
+    let db_entries = db
+        .list_favorite_files(favorite_id)
+        .map_err(|e| format!("fts_meta list failed: {e}"))?;
+    let db_map: std::collections::HashMap<String, (i64, i64)> = db_entries
+        .into_iter()
+        .map(|(p, m, s)| (p, (m, s)))
+        .collect();
+
+    // 3. 3-way diff
+    let mut result = ScanResult::default();
+    result.total_scanned = fs_map.len();
+
+    for (key, cand) in &fs_map {
+        match db_map.get(key) {
+            None => {
+                // FS only → 新規 ingest
+                result.to_ingest.push(cand.clone());
+            }
+            Some(&(db_mtime, db_size)) => {
+                if db_mtime == cand.mtime && db_size == cand.file_size {
+                    result.unchanged += 1;
+                } else {
+                    // 変化あり → 再 ingest
+                    result.to_ingest.push(cand.clone());
+                }
+            }
+        }
+    }
+    for key in db_map.keys() {
+        if !fs_map.contains_key(key) {
+            result.to_delete.push(key.clone());
+        }
+    }
+
+    Ok(result)
+}
+
+fn walk_dir_recursive(
+    dir: &Path,
+    io_sem: &GlobalIoSemaphore,
+    priority: IoPriority,
+    cancel: &AtomicBool,
+    out: &mut std::collections::HashMap<String, CandidateFile>,
+    depth: u32,
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
+    const MAX_DEPTH: u32 = 40;
+    if depth > MAX_DEPTH {
+        return Ok(());
+    }
+
+    let _permit = io_sem.acquire(priority);
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return Ok(()), // アクセス不可はスキップ (典型例: System Volume Information)
+    };
+    // read_dir 中は permit を握ったまま全エントリを舐める
+    let entries: Vec<_> = rd.flatten().collect();
+    drop(_permit); // read_dir 完了後は permit を返し、子 walk 時に再取得
+
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // ★ file_type() は entry がキャッシュしているので syscall なし
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+
+        if folder_tree::is_apple_double(&path) {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            subdirs.push(path);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue; // symlink, device 等はスキップ
+        }
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let kind = if ext == "zip" {
+            CandidateKind::Zip
+        } else if ext == "pdf" {
+            CandidateKind::Pdf
+        } else if folder_tree::is_recognized_image_ext(&ext) {
+            CandidateKind::Image
+        } else {
+            continue;
+        };
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let file_size = metadata.len() as i64;
+
+        let key = normalize_path(&path);
+        out.insert(
+            key.clone(),
+            CandidateFile {
+                abs_path: path,
+                key,
+                kind,
+                mtime,
+                file_size,
+            },
+        );
+    }
+
+    // 子ディレクトリを再帰 (permit は再帰先で取り直す)
+    for sub in subdirs {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        walk_dir_recursive(&sub, io_sem, priority, cancel, out, depth + 1)?;
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// tests
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_file(dir: &Path, name: &str, content: &[u8]) {
+        fs::write(dir.join(name), content).unwrap();
+    }
+
+    fn tmp_db() -> (TempDir, FtsMetaDb) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+        (dir, db)
+    }
+
+    fn scan_sync(
+        fav_id: Uuid,
+        root: &Path,
+        db: &FtsMetaDb,
+    ) -> ScanResult {
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        scan(
+            ScanParams {
+                favorite_id: fav_id,
+                root: root.to_path_buf(),
+                cancel,
+            },
+            db,
+            &sem,
+            IoPriority::Normal,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_fs_empty_db_returns_zero() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("photos");
+        fs::create_dir_all(&root).unwrap();
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 0);
+        assert!(r.to_ingest.is_empty());
+        assert!(r.to_delete.is_empty());
+    }
+
+    #[test]
+    fn new_files_go_to_ingest() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("p");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "a.jpg", b"xx");
+        make_file(&root, "b.png", b"yy");
+        make_file(&root, "ignore.txt", b"zz");
+        make_file(&root, "archive.zip", b"PK");
+        make_file(&root, "doc.pdf", b"%PDF");
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 4, "jpg+png+zip+pdf の 4 つ");
+        assert_eq!(r.to_ingest.len(), 4);
+        assert_eq!(r.unchanged, 0);
+        assert!(r.to_delete.is_empty());
+
+        let kinds: Vec<_> = r.to_ingest.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&CandidateKind::Image));
+        assert!(kinds.contains(&CandidateKind::Zip));
+        assert!(kinds.contains(&CandidateKind::Pdf));
+    }
+
+    #[test]
+    fn unchanged_files_not_re_ingested() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("u");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "a.jpg", b"hello");
+        let abs = root.join("a.jpg");
+        let metadata = abs.metadata().unwrap();
+        let mtime = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let size = metadata.len() as i64;
+        let key = normalize_path(&abs);
+
+        // DB に同じ mtime/size で登録済み
+        db.mark_pending(&key, fav, &root, mtime, size, "text").unwrap();
+        db.mark_ok(&[key.clone()]).unwrap();
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 1);
+        assert_eq!(r.unchanged, 1);
+        assert!(r.to_ingest.is_empty());
+        assert!(r.to_delete.is_empty());
+    }
+
+    #[test]
+    fn modified_files_go_to_re_ingest() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("m");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "a.jpg", b"x");
+        let abs = root.join("a.jpg");
+        let key = normalize_path(&abs);
+        // DB に "古い" mtime で登録
+        db.mark_pending(&key, fav, &root, 1, 1, "").unwrap();
+        db.mark_ok(&[key.clone()]).unwrap();
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.unchanged, 0);
+        assert_eq!(r.to_ingest.len(), 1, "mtime/size が変わったので再 ingest");
+    }
+
+    #[test]
+    fn deleted_files_go_to_delete() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("d");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "survivor.jpg", b"s");
+
+        let dead_key = normalize_path(&root.join("gone.jpg"));
+        db.mark_pending(&dead_key, fav, &root, 1, 1, "").unwrap();
+        db.mark_ok(&[dead_key.clone()]).unwrap();
+        let surv_key = normalize_path(&root.join("survivor.jpg"));
+        let surv_meta = root.join("survivor.jpg").metadata().unwrap();
+        let surv_mtime = surv_meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.mark_pending(&surv_key, fav, &root, surv_mtime, surv_meta.len() as i64, "")
+            .unwrap();
+        db.mark_ok(&[surv_key.clone()]).unwrap();
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 1);
+        assert_eq!(r.unchanged, 1);
+        assert_eq!(r.to_delete, vec![dead_key]);
+    }
+
+    #[test]
+    fn recursive_subdir_is_scanned() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("r");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        make_file(&root, "top.jpg", b"1");
+        make_file(&root.join("sub"), "nested.jpg", b"2");
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 2);
+        assert_eq!(r.to_ingest.len(), 2);
+    }
+
+    #[test]
+    fn apple_double_files_are_ignored() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("a");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "photo.jpg", b"ok");
+        make_file(&root, "._photo.jpg", b"metadata");
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 1);
+        assert_eq!(r.to_ingest.len(), 1);
+        assert!(r.to_ingest[0].abs_path.ends_with("photo.jpg"));
+    }
+
+    #[test]
+    fn scope_respects_favorite_id() {
+        // 別 favorite 配下の登録は本 scan の diff 対象にならない
+        let fav_a = Uuid::new_v4();
+        let fav_b = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root_a = tmp.path().join("A");
+        fs::create_dir_all(&root_a).unwrap();
+        let key_b = normalize_path(&tmp.path().join("B/other.jpg"));
+        // fav_b 所属の行を追加
+        db.mark_pending(&key_b, fav_b, &tmp.path().join("B"), 1, 1, "")
+            .unwrap();
+        db.mark_ok(&[key_b]).unwrap();
+
+        // fav_a の scan 結果に fav_b は出てこない
+        let r = scan_sync(fav_a, &root_a, &db);
+        assert!(r.to_delete.is_empty(), "別 favorite の deleted は検出しない");
+    }
+
+    #[test]
+    fn cancel_stops_walk() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("c");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..50 {
+            make_file(&root, &format!("f{}.jpg", i), b"x");
+        }
+        let cancel = Arc::new(AtomicBool::new(true)); // 最初から cancel
+        let sem = GlobalIoSemaphore::new(2);
+        let r = scan(
+            ScanParams {
+                favorite_id: fav,
+                root: root.clone(),
+                cancel,
+            },
+            &db,
+            &sem,
+            IoPriority::Normal,
+        );
+        // cancel 中は Err("cancelled") または 早期に空の ScanResult が返る
+        assert!(r.is_err() || r.unwrap().total_scanned < 50);
+    }
+}
