@@ -601,10 +601,13 @@ pub fn process_load_request(
         .cache_key_override
         .as_deref()
         .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER));
-    let is_zip_thumb = !is_folder_thumb
-        && req.zip_entry.is_none()
-        && req.cache_key_override.is_some()
-        && req.pdf_page.is_none();
+    // 「override がある && zip_entry も pdf_page も None」だけだと、将来追加された
+    // 別用途の override キー (例: searchrep:) まで ZIP thumb と誤分類してしまう
+    // (Codex P1 対応)。**明示的に zipthumb: プレフィックスを見る**。
+    let is_zip_thumb = req
+        .cache_key_override
+        .as_deref()
+        .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP));
     let needs_heavy_io = is_folder_thumb || is_zip_thumb;
 
     // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
