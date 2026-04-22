@@ -76,11 +76,13 @@ impl Drop for SearchHandle {
 pub struct IndexerManager {
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
-    /// **全 supervisor で共有する** Tantivy IndexWriter。
-    /// Tantivy は 1 Index につき IndexWriter を 1 本しか許さないので、
-    /// 複数のお気に入りの supervisor が各自 `fts.writer()` を呼ぶと
-    /// 2 つ目以降が LockBusy で落ちる (旧実装のバグ、2026-04 修正)。
-    writer: Arc<std::sync::Mutex<tantivy::IndexWriter>>,
+    /// **全 supervisor + tag worker で共有する** Tantivy IndexWriter のディスパッチャー。
+    /// Tantivy は 1 Index につき IndexWriter を 1 本しか許さないため、所有権を専用スレッドに
+    /// 集約し、優先度付きキュー (Interactive > Background) でジョブを直列処理する
+    /// (`fts_writer_dispatcher` 参照)。旧設計の `Arc<Mutex<IndexWriter>>` 直接共有は
+    /// indexer の長時間 lock 保持で interactive 操作 (タグ書き込み) が starve する問題があったため
+    /// 廃止 (2026-04 commit 14037af + ユーザー報告)。
+    writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
     /// お気に入り UUID → Supervisor ハンドル
     supervisors: HashMap<Uuid, SupervisorHandle>,
@@ -174,9 +176,10 @@ impl IndexerManager {
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
     ) -> Option<Self> {
-        // IndexWriter は 1 本だけ作って全 supervisor で共有する (Tantivy 制約)
-        let writer = match fts.writer() {
-            Ok(w) => Arc::new(std::sync::Mutex::new(w)),
+        // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
+        // dispatcher が常駐スレッドで処理するので、reconciliation も submit ベースで行う。
+        let raw_writer = match fts.writer() {
+            Ok(w) => w,
             Err(e) => {
                 crate::logger::log(format!("IndexerManager: writer init failed: {e}"));
                 return None;
@@ -189,23 +192,20 @@ impl IndexerManager {
         ));
         let io_sem = Arc::new(GlobalIoSemaphore::new(permits));
 
+        let writer =
+            crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
+
         // === 起動時 reconciliation を先に同期実行 ===
-        // supervisor が走る前に status != ok の残留行を整理することで、
-        // Tantivy writer の競合も DB 上の race もなくなる。
-        // 共有 writer を lock して reconciliation に渡す (Codex P1, 2026-04)。
-        // 以前は `fts.writer()` を独自に呼んでおり、IndexerManager の共有 writer と
-        // LockBusy で衝突していた。
+        // supervisor が走る前に status != ok の残留行を整理する。dispatcher 経由で
+        // Interactive 優先度で submit する (起動直後で他ジョブはほぼ無い)。
         let t_recon = std::time::Instant::now();
-        let report = {
-            let mut w = writer.lock().expect("writer mutex poisoned");
-            match run_reconciliation(&meta_db, &fts, &mut w, favorites) {
-                Ok(r) => r,
-                Err(e) => {
-                    crate::logger::log(format!(
-                        "IndexerManager: reconciliation failed (continuing anyway): {e}"
-                    ));
-                    ReconciliationReport::default()
-                }
+        let report = match run_reconciliation_via_dispatcher(&meta_db, &fts, &writer, favorites) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::logger::log(format!(
+                    "IndexerManager: reconciliation failed (continuing anyway): {e}"
+                ));
+                ReconciliationReport::default()
             }
         };
         let reconciliation_ms = t_recon.elapsed().as_millis() as u64;
@@ -409,7 +409,7 @@ impl IndexerManager {
     /// 共有 IndexWriter の Arc を clone して返す (タグ書き込み worker 用)。
     /// Tantivy は 1 Index につき writer 1 本しか許さないので、worker が独自に
     /// `fts.writer()` を呼ぶと LockBusy で失敗する。必ずこれを使って lock() する。
-    pub fn clone_shared_writer(&self) -> Arc<std::sync::Mutex<tantivy::IndexWriter>> {
+    pub fn clone_shared_writer(&self) -> Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher> {
         Arc::clone(&self.writer)
     }
 
@@ -475,14 +475,14 @@ impl Drop for IndexerManager {
         }
 
         // STEP 3: 全 supervisor が止まった後に共有 writer を 1 回 commit する。
-        // supervisor 側の apply 中に flush/commit は既に済んでいるはずだが、最後の
-        // 未 flush バッチをここで落としきる (旧実装は supervisor 個々の drop で commit
-        // していたが、共有 writer では 1 回だけでよい)。
-        if let Ok(mut w) = self.writer.lock() {
-            if let Err(e) = w.commit() {
-                crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
-            }
+        // dispatcher の Background 優先度で submit (Interactive キューが空なので即実行)。
+        if let Err(e) = self
+            .writer
+            .commit(false, crate::fts_writer_dispatcher::WriterPriority::Background)
+        {
+            crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
         }
+        // dispatcher 自身は Arc::strong_count が 0 になった時点で Drop → スレッド join される。
     }
 }
 
@@ -543,9 +543,61 @@ fn spawn_reconciliation(
         .ok();
 }
 
-/// **Codex P1 回帰 (2026-04)**: 共有 writer 化 (f21ac27) 以降は、呼び出し側 (IndexerManager)
-/// が既に `fts.writer()` を 1 本取得しているため、reconciliation が独自に `fts.writer()` を
-/// 呼ぶと LockBusy で失敗する。共有 writer を `&mut IndexWriter` として受け取る形に統一した。
+/// dispatcher 経由 reconciliation。delete + commit を 1 つの Batch で送る。
+/// 起動直後で他ジョブはほぼ無いので Background 優先度でも即座に処理される。
+fn run_reconciliation_via_dispatcher(
+    meta_db: &FtsMetaDb,
+    fts: &FtsIndex,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
+    favorites: &[FavoriteEntry],
+) -> Result<ReconciliationReport, String> {
+    use crate::fts_writer_dispatcher::WriterPriority;
+    let mut report = ReconciliationReport::default();
+    let mut deletes: Vec<String> = Vec::new();
+    for fav in favorites {
+        if !fav.auto_index_metadata {
+            continue;
+        }
+        let not_ok = meta_db
+            .list_not_ok_paths(fav.id)
+            .map_err(|e| format!("list_not_ok_paths: {e}"))?;
+        for (path, status) in not_ok {
+            match status {
+                FileStatus::Ok => continue,
+                FileStatus::Pending | FileStatus::Failed => {
+                    deletes.push(path.clone());
+                    if let Err(e) = delete_row_forcing(meta_db, &path) {
+                        crate::logger::log(format!(
+                            "reconciliation: delete row for {path} failed: {e}"
+                        ));
+                    }
+                    report.pending_cleaned += 1;
+                }
+                FileStatus::Tombstone => {
+                    deletes.push(path.clone());
+                    if let Err(e) = meta_db.purge_tombstone(&[path.clone()]) {
+                        crate::logger::log(format!(
+                            "reconciliation: purge_tombstone {path} failed: {e}"
+                        ));
+                    }
+                    report.tombstone_purged += 1;
+                }
+            }
+        }
+    }
+    let _ = fts; // 使わないがログ context として保持しておく
+    writer
+        .batch(vec![], deletes, true, true, WriterPriority::Background)
+        .map_err(|e| format!("reconciliation batch: {e}"))?;
+    crate::logger::log(format!(
+        "reconciliation done: pending/failed cleaned = {}, tombstone purged = {}",
+        report.pending_cleaned, report.tombstone_purged
+    ));
+    Ok(report)
+}
+
+/// 旧版: 直接 `IndexWriter` を受け取る reconciliation。テストや旧コール経路で使う。
+#[allow(dead_code)]
 fn run_reconciliation(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,
@@ -831,7 +883,10 @@ mod tests {
         std::fs::create_dir_all(&root_old).unwrap();
         std::fs::create_dir_all(&root_new).unwrap();
 
-        let writer = Arc::new(std::sync::Mutex::new(fts.writer().unwrap()));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            Arc::clone(&fts),
+        );
         let mut mgr = IndexerManager {
             meta_db: Arc::clone(&meta),
             fts: Arc::clone(&fts),

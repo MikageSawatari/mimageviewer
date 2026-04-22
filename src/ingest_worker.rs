@@ -34,10 +34,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tantivy::IndexWriter;
 use uuid::Uuid;
 
-use crate::fts_index::{self, Container, FtsIndex, IndexDoc, IndexKind};
+#[cfg(test)]
+use crate::fts_index;
+use crate::fts_index::{Container, FtsIndex, IndexDoc, IndexKind};
 use crate::fts_meta::FtsMetaDb;
 use crate::indexer_progress::ProgressReporter;
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
@@ -92,46 +93,69 @@ impl<'a> IngestSession<'a> {
 
     /// Walker の結果を適用する。
     ///
-    /// - `to_ingest` の各候補について、メタ抽出 → fts_meta.mark_pending → Tantivy upsert_doc
-    /// - `to_delete` の各 path について、fts_meta.mark_tombstone → Tantivy delete_doc
-    /// - バッチ境界 (BATCH_FLUSH_COUNT 件 or BATCH_FLUSH_INTERVAL) で
-    ///   writer.commit() → fts_meta.mark_ok / purge_tombstone
-    ///
-    /// **重要 (writer lock 飢餓対策)**: writer は `Arc<Mutex<IndexWriter>>` 由来の Mutex 参照。
-    /// 大規模 ingest で 1 回掴みっぱなしにすると、interactive な writer 利用者
-    /// (`tag_write_worker` のタグ付与など) が分単位で starve する。flush 境界で必ず
-    /// guard を drop → 短時間 sleep → 再取得して、待機中の他 lock 利用者に取り合いの
-    /// 機会を与える ([docs/async-architecture.md §5.5](../docs/async-architecture.md))。
+    /// - `to_ingest` の各候補について、メタ抽出 → fts_meta.mark_pending → upsert (sub-batch 蓄積)
+    /// - `to_delete` の各 path について、fts_meta.mark_tombstone → delete (sub-batch 蓄積)
+    /// - sub-batch が `BATCH_FLUSH_COUNT` に達するか `BATCH_FLUSH_INTERVAL` 経過したら
+    ///   `dispatcher.batch(upserts, deletes, commit_after=true)` で submit する
+    /// - 各 sub-batch の境界で dispatcher が Interactive キュー (タグ書き込み等) を先に拾うため、
+    ///   indexer の長時間 ingest 中もタグ操作は ~1 sub-batch (1〜2s) 以内に応答できる。
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         to_ingest: Vec<CandidateFile>,
         to_delete: Vec<String>,
-        writer_mtx: &std::sync::Mutex<IndexWriter>,
+        writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
         io_sem: &GlobalIoSemaphore,
         priority: IoPriority,
         cancel: &AtomicBool,
         progress: Option<&ProgressReporter>,
     ) -> tantivy::Result<IngestStats> {
-        let mut stats = IngestStats::default();
-        let fields = self.fts.fields();
+        use crate::fts_writer_dispatcher::WriterPriority;
 
-        // pending 中のパス (commit 後に mark_ok 対象になる)
-        let mut pending_paths: Vec<String> = Vec::new();
-        // tombstone 中のパス (commit 後に purge する)
-        let mut tombstone_paths: Vec<String> = Vec::new();
+        let mut stats = IngestStats::default();
+        // Sub-batch アキュムレータ — 閾値到達でまとめて dispatcher に submit。
+        let mut batch_upserts: Vec<IndexDoc> = Vec::with_capacity(BATCH_FLUSH_COUNT);
+        let mut batch_deletes: Vec<String> = Vec::new();
+        let mut pending_paths: Vec<String> = Vec::new(); // commit 後に mark_ok
+        let mut tombstone_paths: Vec<String> = Vec::new(); // commit 後に purge
         let mut last_flush = Instant::now();
         let ingest_total = to_ingest.len();
         let delete_total = to_delete.len();
 
-        // writer は Option で持ち、flush 後に take() で drop → 再取得で他 lock 利用者に
-        // 機会を与える。`acquire_writer` ヘルパで lazy 取得する。
-        let mut writer: Option<std::sync::MutexGuard<'_, IndexWriter>> =
-            Some(writer_mtx.lock().unwrap());
+        // sub-batch を dispatcher に投げて mark_ok / purge_tombstone まで完了させるヘルパ。
+        let flush_batch = |batch_upserts: &mut Vec<IndexDoc>,
+                               batch_deletes: &mut Vec<String>,
+                               pending_paths: &mut Vec<String>,
+                               tombstone_paths: &mut Vec<String>|
+         -> tantivy::Result<()> {
+            if batch_upserts.is_empty() && batch_deletes.is_empty() {
+                return Ok(());
+            }
+            let upserts = std::mem::take(batch_upserts);
+            let deletes = std::mem::take(batch_deletes);
+            writer.batch(
+                upserts,
+                deletes,
+                true, // commit_after
+                false, // reload_after_commit (Ctrl+G 時に OnCommitWithDelay で自動 reload)
+                WriterPriority::Background,
+            )?;
+            if !pending_paths.is_empty() {
+                if let Err(e) = self.meta_db.mark_ok(pending_paths) {
+                    crate::logger::log(format!("ingest: mark_ok failed: {e}"));
+                }
+                pending_paths.clear();
+            }
+            if !tombstone_paths.is_empty() {
+                if let Err(e) = self.meta_db.purge_tombstone(tombstone_paths) {
+                    crate::logger::log(format!("ingest: purge_tombstone failed: {e}"));
+                }
+                tombstone_paths.clear();
+            }
+            Ok(())
+        };
 
         // === 1. 削除フェーズ ===
-        // stats.deleted は **実際に tombstone 化 + Tantivy delete を push したもの** のみカウント
-        // (Codex 6 回目指摘 nice-to-have #1)。mark_tombstone 失敗や cancel で処理されなかった分は数えない。
         for (i, path) in to_delete.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 stats.cancelled = true;
@@ -140,33 +164,29 @@ impl<'a> IngestSession<'a> {
             if let Some(p) = progress {
                 p.set(format!("削除: {} ({}/{})", path, i + 1, delete_total));
             }
-            // fts_meta: tombstone 化
             if let Err(e) = self.meta_db.mark_tombstone(&[path.clone()]) {
                 crate::logger::log(format!("ingest: mark_tombstone failed for {path}: {e}"));
                 continue;
             }
-            let w = writer
-                .as_deref_mut()
-                .expect("writer guard alive between flushes");
-            fts_index::delete_doc(w, fields, path);
+            batch_deletes.push(path.clone());
             tombstone_paths.push(path.clone());
             stats.deleted += 1;
 
-            if self.should_flush(&tombstone_paths, &pending_paths, last_flush) {
-                self.flush(
-                    writer.as_deref_mut().unwrap(),
+            if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
+                flush_batch(
+                    &mut batch_upserts,
+                    &mut batch_deletes,
                     &mut pending_paths,
                     &mut tombstone_paths,
                 )?;
-                yield_writer_lock(&mut writer, writer_mtx);
                 last_flush = Instant::now();
             }
         }
 
         if stats.cancelled {
-            // 残っている分を commit (stats.deleted は既に実処理カウント済み)
-            self.flush(
-                writer.as_deref_mut().unwrap(),
+            flush_batch(
+                &mut batch_upserts,
+                &mut batch_deletes,
                 &mut pending_paths,
                 &mut tombstone_paths,
             )?;
@@ -187,99 +207,67 @@ impl<'a> IngestSession<'a> {
                     .unwrap_or_else(|| cand.abs_path.display().to_string());
                 p.set(format!("取込: {} ({}/{})", name, i + 1, ingest_total));
             }
-
-            // Ingest 対象の種類で分岐。v1 スコープ: Image のみ詳細メタ抽出、
-            // Zip / Pdf はファイル名のみ取り込み (ZIP 内は §7.7、PDF info は step 17)。
-            let w = writer
-                .as_deref()
-                .expect("writer guard alive between flushes");
-            match cand.kind {
-                CandidateKind::Image => {
-                    // I/O 同時実行制御
-                    let _permit = io_sem.acquire(priority);
-                    match self.ingest_image(&cand, w) {
-                        Ok(()) => {
-                            pending_paths.push(cand.key.clone());
-                            stats.ingested_ok += 1;
-                        }
-                        Err(e) => {
-                            crate::logger::log(format!(
-                                "ingest: image {:?} failed: {e}",
-                                cand.abs_path
-                            ));
-                            let _ = self.meta_db.mark_failed(&cand.key);
-                            stats.ingested_failed += 1;
-                        }
-                    }
+            // メタ抽出と IndexDoc ビルドはここで実行 (writer に touch しない)。dispatcher 側は
+            // upsert_doc を呼ぶだけなので、重い IO はこの thread で並列化されたまま。
+            let _permit = io_sem.acquire(priority);
+            let built = match cand.kind {
+                CandidateKind::Image => self.build_doc_for_image(&cand),
+                CandidateKind::Zip => self.build_doc_for_name_only(&cand),
+                CandidateKind::Pdf => self.build_doc_for_pdf(&cand),
+            };
+            drop(_permit);
+            match built {
+                Ok(doc) => {
+                    batch_upserts.push(doc);
+                    pending_paths.push(cand.key.clone());
+                    stats.ingested_ok += 1;
                 }
-                CandidateKind::Zip => {
-                    // v1: ZIP はファイル名のみ ingest (ZIP 内展開は v1.x で対応)
-                    let _permit = io_sem.acquire(priority);
-                    match self.ingest_name_only(&cand, w) {
-                        Ok(()) => {
-                            pending_paths.push(cand.key.clone());
-                            stats.ingested_ok += 1;
-                        }
-                        Err(e) => {
-                            crate::logger::log(format!(
-                                "ingest: container {:?} failed: {e}",
-                                cand.abs_path
-                            ));
-                            let _ = self.meta_db.mark_failed(&cand.key);
-                            stats.ingested_failed += 1;
-                        }
-                    }
-                }
-                CandidateKind::Pdf => {
-                    // §16 step 17: PDF は document info (Title/Author/Subject/Keywords) を
-                    // 取り込む。PDFium ワーカー (別プロセス) を使うのでメイン process の
-                    // pdfium スレッド制約を気にしなくてよい。
-                    let _permit = io_sem.acquire(priority);
-                    match self.ingest_pdf(&cand, w) {
-                        Ok(()) => {
-                            pending_paths.push(cand.key.clone());
-                            stats.ingested_ok += 1;
-                        }
-                        Err(e) => {
-                            crate::logger::log(format!(
-                                "ingest: pdf {:?} failed: {e}",
-                                cand.abs_path
-                            ));
-                            let _ = self.meta_db.mark_failed(&cand.key);
-                            stats.ingested_failed += 1;
-                        }
-                    }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "ingest: {:?} build failed: {e}",
+                        cand.abs_path
+                    ));
+                    let _ = self.meta_db.mark_failed(&cand.key);
+                    stats.ingested_failed += 1;
                 }
             }
 
-            if self.should_flush(&tombstone_paths, &pending_paths, last_flush) {
-                self.flush(
-                    writer.as_deref_mut().unwrap(),
+            if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
+                flush_batch(
+                    &mut batch_upserts,
+                    &mut batch_deletes,
                     &mut pending_paths,
                     &mut tombstone_paths,
                 )?;
-                yield_writer_lock(&mut writer, writer_mtx);
                 last_flush = Instant::now();
             }
         }
 
-        // 残りを flush (stats.deleted は削除フェーズで実処理カウント済み)
-        self.flush(
-            writer.as_deref_mut().unwrap(),
+        // 残りを flush
+        flush_batch(
+            &mut batch_upserts,
+            &mut batch_deletes,
             &mut pending_paths,
             &mut tombstone_paths,
         )?;
         Ok(stats)
     }
 
-    fn ingest_image(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
-        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
-        self.commit_doc(writer, cand, Container::Fs, IndexKind::Image, norms)
+    /// sub-batch 投入閾値判定 (旧 should_flush と同じセマンティクス、引数は件数のみ)。
+    fn batch_should_flush(&self, upsert_count: usize, delete_count: usize, last_flush: Instant) -> bool {
+        let total = upsert_count + delete_count;
+        total >= BATCH_FLUSH_COUNT || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
     }
 
-    /// PDF を ingest (§16 step 17)。ファイル名 + PDFium document info を検索対象にする。
-    /// パスワード保護 PDF や破損 PDF は name_only にフォールバック。
-    fn ingest_pdf(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
+    /// 画像ファイルから IndexDoc を組み立てる (mark_pending も同時に行う)。
+    /// 旧 `ingest_image` を「writer に touch しない build フェーズ」として再構成したもの。
+    fn build_doc_for_image(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
+        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
+        self.build_doc(cand, Container::Fs, IndexKind::Image, norms)
+    }
+
+    /// PDF から IndexDoc を組み立てる (§16 step 17)。
+    fn build_doc_for_pdf(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let name = cand
             .abs_path
             .file_name()
@@ -290,18 +278,18 @@ impl<'a> IngestSession<'a> {
             Ok(info) => info.as_search_text(),
             Err(e) => {
                 crate::logger::log(format!(
-                    "ingest_pdf: get_document_info failed (falling back to name-only): {e}"
+                    "build_doc_for_pdf: get_document_info failed (falling back to name-only): {e}"
                 ));
                 String::new()
             }
         };
         let norms = crate::ingest_text::build_per_source_for_pdf(&name, &info_text);
         // PDF は container="fs" 扱い (v1)
-        self.commit_doc(writer, cand, Container::Fs, IndexKind::Pdf, norms)
+        self.build_doc(cand, Container::Fs, IndexKind::Pdf, norms)
     }
 
     /// ZIP / PDF の最小 ingest (ファイル名 + 基本メタのみ)。
-    fn ingest_name_only(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
+    fn build_doc_for_name_only(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let name = cand
             .abs_path
             .file_name()
@@ -312,23 +300,20 @@ impl<'a> IngestSession<'a> {
         let (container, kind) = match cand.kind {
             CandidateKind::Zip => (Container::Zip, IndexKind::Zip),
             CandidateKind::Pdf => (Container::Fs, IndexKind::Pdf),
-            // Image/Video が ここに来るのは本来通らないルートだが、
-            // classifier を通さず name_only にフォールバックした診断目的のパス。
             _ => (Container::Fs, IndexKind::Image),
         };
-        self.commit_doc(writer, cand, container, kind, norms)
+        self.build_doc(cand, container, kind, norms)
     }
 
-    /// mark_pending → IndexDoc 生成 → upsert_doc を 1 箇所に集約 (§19 simplify pass)。
-    /// `norms` は move で受けて IndexDoc に埋め込むため、per-file で 5 x clone が発生しない。
-    fn commit_doc(
+    /// mark_pending + IndexDoc ビルドを 1 箇所に集約 (旧 `commit_doc` の writer 抜き版)。
+    /// `norms` は move で受けて IndexDoc に埋め込む — per-file で複製は発生しない。
+    fn build_doc(
         &self,
-        writer: &IndexWriter,
         cand: &CandidateFile,
         container: Container,
         kind: IndexKind,
         norms: crate::ingest_text::PerSourceText,
-    ) -> Result<(), String> {
+    ) -> Result<IndexDoc, String> {
         self.meta_db
             .mark_pending(
                 &cand.key,
@@ -340,7 +325,7 @@ impl<'a> IngestSession<'a> {
                 &norms,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
-        let doc = IndexDoc {
+        Ok(IndexDoc {
             path: cand.key.clone(),
             container,
             zip_entry: String::new(),
@@ -349,58 +334,8 @@ impl<'a> IngestSession<'a> {
             mtime: cand.mtime,
             file_size: cand.file_size,
             norms,
-        };
-        fts_index::upsert_doc(writer, self.fts.fields(), &doc)
-            .map_err(|e| format!("upsert_doc: {e}"))?;
-        Ok(())
+        })
     }
-
-    fn should_flush(&self, tombstone: &[String], pending: &[String], last_flush: Instant) -> bool {
-        let total = tombstone.len() + pending.len();
-        total >= BATCH_FLUSH_COUNT || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
-    }
-
-    /// Tantivy commit → fts_meta を ok / purge に遷移 (§5.6.1 step 3-4 + §5.6.2 step 4)。
-    fn flush(
-        &self,
-        writer: &mut IndexWriter,
-        pending_paths: &mut Vec<String>,
-        tombstone_paths: &mut Vec<String>,
-    ) -> tantivy::Result<()> {
-        if pending_paths.is_empty() && tombstone_paths.is_empty() {
-            return Ok(());
-        }
-        writer.commit()?;
-        // reader の reload は Ctrl+G クエリ時に `OnCommitWithDelay` で自動で行われる
-        if !pending_paths.is_empty() {
-            if let Err(e) = self.meta_db.mark_ok(pending_paths) {
-                crate::logger::log(format!("ingest: mark_ok failed: {e}"));
-            }
-            pending_paths.clear();
-        }
-        if !tombstone_paths.is_empty() {
-            if let Err(e) = self.meta_db.purge_tombstone(tombstone_paths) {
-                crate::logger::log(format!("ingest: purge_tombstone failed: {e}"));
-            }
-            tombstone_paths.clear();
-        }
-        Ok(())
-    }
-}
-
-/// バッチ flush 直後、tantivy writer の guard を一旦 drop して、待機中の他 lock 利用者
-/// (interactive な `tag_write_worker` など) に取り合いの機会を与える。短い sleep を挟むのは
-/// std::sync::Mutex がプラットフォームによって unfair で、drop 直後に同スレッドが
-/// 再取得してしまうケースを防ぐため (Windows では特に顕著)。再取得して `writer` を埋め直す。
-fn yield_writer_lock<'a>(
-    writer: &mut Option<std::sync::MutexGuard<'a, IndexWriter>>,
-    writer_mtx: &'a std::sync::Mutex<IndexWriter>,
-) {
-    *writer = None; // drop the guard → release the mutex
-    // ~5ms あれば tag_write_worker の 1 ファイル分 (read + write_xmp + upsert) が
-    // 滑り込める。50 batch x 5ms = 250ms の追加 overhead は initial scan 数十秒に対し誤差。
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    *writer = Some(writer_mtx.lock().unwrap());
 }
 
 // -----------------------------------------------------------------------
@@ -416,10 +351,10 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, FtsMetaDb, FtsIndex) {
+    fn setup() -> (TempDir, FtsMetaDb, std::sync::Arc<FtsIndex>) {
         let tmp = TempDir::new().unwrap();
         let meta = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
-        let fts = FtsIndex::open_at(&tmp.path().join("fts_index")).unwrap();
+        let fts = std::sync::Arc::new(FtsIndex::open_at(&tmp.path().join("fts_index")).unwrap());
         (tmp, meta, fts)
     }
 
@@ -446,7 +381,7 @@ mod tests {
     fn ingest_empty_queues_is_noop() {
         let (_tmp, meta, fts) = setup();
         let session = IngestSession::new(Uuid::new_v4(), PathBuf::from("C:/x"), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
         let stats = session
@@ -470,7 +405,7 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = tmp.path().to_path_buf();
         let session = IngestSession::new(fav, root.clone(), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -519,7 +454,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -577,7 +512,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -607,7 +542,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(true); // 最初から cancel
 
@@ -632,7 +567,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -691,13 +626,14 @@ mod tests {
             &norms,
         )
         .unwrap();
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
-        {
-            let mut w = writer.lock().unwrap();
-            fts_index::upsert_doc(
-                &w,
-                fts.fields(),
-                &crate::fts_index::IndexDoc {
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
+        // dispatcher 経由で upsert + commit (旧コードは writer.lock() で直接触っていた)
+        writer
+            .upsert(
+                crate::fts_index::IndexDoc {
                     path: key.clone(),
                     container: crate::fts_index::Container::Fs,
                     zip_entry: String::new(),
@@ -707,10 +643,12 @@ mod tests {
                     file_size: cand.file_size,
                     norms: norms.clone(),
                 },
+                crate::fts_writer_dispatcher::WriterPriority::Background,
             )
             .unwrap();
-            w.commit().unwrap();
-        }
+        writer
+            .commit(false, crate::fts_writer_dispatcher::WriterPriority::Background)
+            .unwrap();
         // !!! mark_ok を呼ばずに "クラッシュ" — pending のまま残留
 
         // 状態: fts_meta は pending、Tantivy は ok 済み (新テキスト)
@@ -752,7 +690,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 

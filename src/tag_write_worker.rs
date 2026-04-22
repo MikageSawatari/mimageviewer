@@ -13,15 +13,15 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use tantivy::IndexWriter;
 use uuid::Uuid;
 
-use crate::fts_index::{self, Container, FtsIndex, IndexDoc};
+use crate::fts_index::{Container, FtsIndex, IndexDoc};
 use crate::fts_meta::FtsMetaDb;
+use crate::fts_writer_dispatcher::{FtsWriterDispatcher, WriterPriority};
 use crate::xmp_writer::{TagOp, WriteError};
 
 /// バッチ commit の閾値 (件数と時間の OR)。ingest_worker の BATCH_FLUSH_COUNT=100 / 5s
@@ -85,12 +85,13 @@ pub struct TagWriteHandle {
 }
 
 impl TagWriteHandle {
-    /// worker スレッドを起動する。`shared_writer` は必ず `IndexerManager::clone_shared_writer()`
-    /// 由来のものを渡すこと。独自 writer を作ると Tantivy が LockBusy で落ちる。
+    /// worker スレッドを起動する。`writer` は `IndexerManager::clone_shared_writer()` 由来の
+    /// `FtsWriterDispatcher` を渡す。タグ書き込みは `WriterPriority::Interactive` で submit され、
+    /// 並行する indexer の Background batch より先に処理される。
     pub fn spawn(
         meta: Arc<FtsMetaDb>,
         fts: Arc<FtsIndex>,
-        shared_writer: Arc<Mutex<IndexWriter>>,
+        writer: Arc<FtsWriterDispatcher>,
     ) -> Self {
         let (job_tx, job_rx) = unbounded::<TagWriteJob>();
         let (result_tx, result_rx) = unbounded::<TagWriteResult>();
@@ -112,7 +113,7 @@ impl TagWriteHandle {
                     &result_tx,
                     meta,
                     fts,
-                    shared_writer,
+                    writer,
                     &w_done,
                     &w_failures,
                     &w_pending,
@@ -171,15 +172,14 @@ fn run_worker(
     result_tx: &Sender<TagWriteResult>,
     meta: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
-    shared_writer: Arc<Mutex<IndexWriter>>,
+    writer: Arc<FtsWriterDispatcher>,
     done: &Arc<AtomicUsize>,
     failures: &Arc<AtomicUsize>,
     pending_in_writer: &Arc<AtomicUsize>,
     shutdown: &Arc<AtomicBool>,
 ) {
-    // バッチ commit 用の pending カウンタ。ingest_worker と同じ「N 件溜まったら
-    // commit / idle で M ms 経ったら commit / 終了時に必ず flush」パターン。
-    // これをやらないと N ファイル一括トグルで N 回 fsync が発生する。
+    // バッチ commit 用の pending カウンタ。N 件溜まったら commit / idle で M ms 経ったら
+    // commit / 終了時に必ず flush。これをやらないと N ファイル一括トグルで N 回 fsync。
     // `pending_in_writer` は UI 側の `is_busy()` と同期した外部ミラー。
     let mut last_flush = Instant::now();
 
@@ -193,7 +193,7 @@ fn run_worker(
                 if pending_in_writer.load(Ordering::Relaxed) > 0
                     && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL
                 {
-                    flush_commit(&shared_writer, &fts, pending_in_writer);
+                    flush_commit(&writer, &fts, pending_in_writer);
                     last_flush = Instant::now();
                 }
                 continue;
@@ -201,7 +201,7 @@ fn run_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        let (res, dirtied) = process_job(&job, &meta, &fts, &shared_writer);
+        let (res, dirtied) = process_job(&job, &meta, &writer);
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -209,14 +209,11 @@ fn run_worker(
             pending_in_writer.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Flush 判断は結果通知 + done 更新より **先** に行う。そうしないと UI 側の
-        // `is_busy()` が total == done を観測して完了 toast を出した直後に、commit 前の
-        // Ctrl+G が走って新タグを見つけられないバグが発生する (pending_in_writer も busy に
-        // 含めているので最悪でも race window は 1 atomic op 分)。
-        // 単発トグルを即反映させるため、キューが空なら閾値未満でも flush する。
+        // Flush 判断は結果通知 + done 更新より **先** に行う (race window 抑制)。
+        // 単発トグルを即反映させるため、キューが空なら閾値未満でも flush。
         let pending_now = pending_in_writer.load(Ordering::Relaxed);
         if pending_now >= BATCH_FLUSH_COUNT || (pending_now > 0 && job_rx.is_empty()) {
-            flush_commit(&shared_writer, &fts, pending_in_writer);
+            flush_commit(&writer, &fts, pending_in_writer);
             last_flush = Instant::now();
         }
 
@@ -226,63 +223,43 @@ fn run_worker(
             result: res.map_err(|e| e.to_string()),
         });
     }
-    // 終了時に残ピンを flush。忘れると最後のジョブが検索に反映されない。
-    flush_commit(&shared_writer, &fts, pending_in_writer);
+    // 終了時に残ピンを flush。
+    flush_commit(&writer, &fts, pending_in_writer);
 }
 
-/// Tantivy writer を commit + reader reload する。pending が 0 なら no-op。
-/// commit 失敗時は reader reload を走らせない (stale 読みを防ぐ)。
+/// dispatcher 経由で commit + reader reload を依頼する。pending が 0 なら no-op。
+/// dispatcher は Interactive 優先度のジョブを Background より先に処理するので、
+/// indexer の長時間 batch 中でも 1 sub-batch (1〜2 秒) 以内に応答が返る。
 fn flush_commit(
-    shared_writer: &Mutex<IndexWriter>,
+    writer: &FtsWriterDispatcher,
     fts: &FtsIndex,
     pending_in_writer: &AtomicUsize,
 ) {
     if pending_in_writer.load(Ordering::Relaxed) == 0 {
         return;
     }
-    // 取得待ち時間も計測 — 索引ワーカーに lock を取られているとここで詰まる。
-    // 1 秒以上待ったら警告を出す (CLAUDE.md 並行処理ガイダンス)。
-    let lock_t0 = std::time::Instant::now();
-    let lock_result = shared_writer.lock();
-    let lock_wait_ms = lock_t0.elapsed().as_millis();
-    if lock_wait_ms > 1000 {
+    let t0 = std::time::Instant::now();
+    let res = writer.commit(true /* reload */, WriterPriority::Interactive);
+    let wait_ms = t0.elapsed().as_millis();
+    if wait_ms > 1000 {
         crate::logger::log(format!(
-            "[TAG] worker: writer lock acquired after {lock_wait_ms} ms wait \
-             (indexer scan likely held it — see ingest_worker yield_writer_lock)"
+            "[TAG] worker: dispatcher commit took {wait_ms} ms (background ingest in flight?)"
         ));
     }
-    let committed = match lock_result {
-        Ok(mut w) => match w.commit() {
-            Ok(_) => true,
-            Err(e) => {
-                crate::logger::log(format!("tag_write_worker: commit: {e}"));
-                false
-            }
-        },
-        Err(_) => {
-            crate::logger::log(
-                "tag_write_worker: shared writer mutex poisoned — skipping commit".to_string(),
-            );
-            false
-        }
-    };
-    // Reset after commit attempt. 成功しなかった場合も pending は 0 に戻す (次回ジョブで
-    // dirty 判定がやり直され、いずれ別の commit 機会で再試行される)。
-    pending_in_writer.store(0, Ordering::Relaxed);
-    if committed {
-        if let Err(e) = fts.reload_reader() {
-            crate::logger::log(format!("tag_write_worker: reload_reader: {e}"));
-        }
+    if let Err(e) = res {
+        crate::logger::log(format!("tag_write_worker: commit failed: {e}"));
     }
+    let _ = fts; // reload は dispatcher が行う
+    // Reset after commit attempt. 失敗時も pending は 0 に戻して次回 commit を待つ。
+    pending_in_writer.store(0, Ordering::Relaxed);
 }
 
-/// ジョブを 1 件処理する。戻り値の `bool` は「Tantivy writer バッファを dirty にしたか」で、
+/// ジョブを 1 件処理する。戻り値の `bool` は「dispatcher に upsert を投げたか」で、
 /// 呼び出し側 (`run_worker`) がバッチ commit の pending カウンタに使う。
 fn process_job(
     job: &TagWriteJob,
     meta: &FtsMetaDb,
-    fts: &FtsIndex,
-    shared_writer: &Mutex<IndexWriter>,
+    writer: &FtsWriterDispatcher,
 ) -> (Result<TagAction, WriteError>, bool) {
     let path_disp = job.path.display();
     // Toggle は worker 側で現在タグを読んで Add/Remove に解決する。
@@ -328,7 +305,7 @@ fn process_job(
 
     // 検索インデックス即時更新 (favorite_id がわかる時だけ)。
     let dirtied = match job.favorite_id {
-        Some(fav_id) => upsert_tags_in_writer(&job.path, fav_id, &new_tags, meta, fts, shared_writer),
+        Some(fav_id) => upsert_tags_via_dispatcher(&job.path, fav_id, &new_tags, meta, writer),
         None => {
             crate::logger::log(format!(
                 "[TAG] worker: skip fts_meta upsert (no favorite_id) | {path_disp}"
@@ -339,26 +316,23 @@ fn process_job(
     (Ok(action), dirtied)
 }
 
-/// `fts_meta.tags_norm` を更新し、Tantivy writer にタグ差分のみの upsert を投入する。
-/// commit / reload は呼び出し側がバッチ境界で行う (1 ジョブ 1 fsync を避けるため)。
+/// `fts_meta.tags_norm` を更新し、dispatcher 経由で Tantivy にタグ差分の upsert を依頼。
+/// commit は呼び出し側がバッチ境界で行う (1 ジョブ 1 fsync を避けるため)。
 ///
-/// 戻り値 `true`: writer に upsert を push した (呼び出し側は flush の pending に計上)。
+/// 戻り値 `true`: dispatcher に upsert を投げた (呼び出し側は flush の pending に計上)。
 /// 戻り値 `false`: 変更なし / fts_meta 書き込み失敗 / 行が無い など、writer に触っていない。
-fn upsert_tags_in_writer(
+fn upsert_tags_via_dispatcher(
     path: &std::path::Path,
     fav_id: Uuid,
     new_tags: &str,
     meta: &FtsMetaDb,
-    fts: &FtsIndex,
-    shared_writer: &Mutex<IndexWriter>,
+    writer: &FtsWriterDispatcher,
 ) -> bool {
     let key = crate::search_index_db::normalize_path(path);
     let Ok(Some(row)) = meta.get(&key) else {
         // 行が無い (未インデックス favorite など) → notify-rs 経由の再 ingest に任せる
         return false;
     };
-    // Dirty guard: new_tags が既存 tags_norm と同じなら Tantivy を触らない (no-op commit 回避)。
-    // ClearMiv を #タグ無しの行に当てたケースや、Toggle で結果が元に戻るケースを省く。
     if row.norms.tags == new_tags {
         return false;
     }
@@ -377,26 +351,18 @@ fn upsert_tags_in_writer(
         file_size: row.file_size,
         norms,
     };
-    let lock_t0 = std::time::Instant::now();
-    let lock_result = shared_writer.lock();
-    let lock_wait_ms = lock_t0.elapsed().as_millis();
-    if lock_wait_ms > 1000 {
+    let t0 = std::time::Instant::now();
+    let res = writer.upsert(doc, WriterPriority::Interactive);
+    let wait_ms = t0.elapsed().as_millis();
+    if wait_ms > 1000 {
         crate::logger::log(format!(
-            "[TAG] worker: writer lock for upsert acquired after {lock_wait_ms} ms wait"
+            "[TAG] worker: dispatcher upsert took {wait_ms} ms"
         ));
     }
-    match lock_result {
-        Ok(mut w) => match fts_index::upsert_doc(&mut *w, fts.fields(), &doc) {
-            Ok(_) => true,
-            Err(e) => {
-                crate::logger::log(format!("tag_write_worker: upsert_doc: {e}"));
-                false
-            }
-        },
-        Err(_) => {
-            crate::logger::log(
-                "tag_write_worker: writer mutex poisoned — skipping upsert".to_string(),
-            );
+    match res {
+        Ok(()) => true,
+        Err(e) => {
+            crate::logger::log(format!("tag_write_worker: upsert_doc: {e}"));
             false
         }
     }

@@ -15,6 +15,7 @@ pub mod folder_tree;
 pub mod fs_animation;
 pub mod fts_index;
 pub mod fts_meta;
+pub mod fts_writer_dispatcher;
 pub mod global_search;
 mod global_search_ui;
 pub mod gpu_info;

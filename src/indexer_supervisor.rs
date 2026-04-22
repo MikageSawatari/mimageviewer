@@ -187,7 +187,7 @@ pub fn spawn(
     params: SupervisorParams,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
-    writer: Arc<Mutex<tantivy::IndexWriter>>,
+    writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
 ) -> SupervisorHandle {
     assert!(
@@ -249,7 +249,7 @@ fn supervisor_loop(
     favorite_root: PathBuf,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
-    writer: Arc<Mutex<tantivy::IndexWriter>>,
+    writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
@@ -366,7 +366,7 @@ fn run_initial_scan(
     favorite_id: Uuid,
     favorite_root: &std::path::Path,
     session: &IngestSession,
-    writer: &Mutex<tantivy::IndexWriter>,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
     io_sem: &GlobalIoSemaphore,
     cancel: Arc<AtomicBool>,
     stats: &Mutex<SupervisorStats>,
@@ -478,7 +478,7 @@ fn run_initial_scan(
 #[allow(clippy::too_many_arguments)]
 fn apply_single_change(
     session: &IngestSession,
-    writer: &Mutex<tantivy::IndexWriter>,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
     io_sem: &GlobalIoSemaphore,
     cancel: &AtomicBool,
     stats: &Mutex<SupervisorStats>,
@@ -637,13 +637,15 @@ mod tests {
         TempDir,
         Arc<FtsMetaDb>,
         Arc<FtsIndex>,
-        Arc<Mutex<tantivy::IndexWriter>>,
+        Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
         Arc<GlobalIoSemaphore>,
     ) {
         let tmp = TempDir::new().unwrap();
         let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
         let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
-        let writer = Arc::new(Mutex::new(fts.writer().unwrap()));
+        let raw_writer = fts.writer().unwrap();
+        let writer =
+            crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
         let sem = Arc::new(GlobalIoSemaphore::new(2));
         (tmp, meta, fts, writer, sem)
     }
