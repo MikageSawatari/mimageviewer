@@ -225,13 +225,23 @@ fn update_search_index(
         file_size: row.file_size,
         norms,
     };
-    // 共有 writer を短時間だけロック。commit は ingest_worker の flush サイクルで
-    // 行われるか、次回 ingest が走った時点で反映される。notify-rs が mtime 変化を
-    // 検知して ingest_worker がフォローアップするので、commit 漏れの実害はない。
+    // 共有 writer を短時間だけロック。Codex P2 #2: タグ書き込み後の Ctrl+G 反映を即時化する
+    // ため、ここで **commit + reader reload** まで行う。旧実装は ingest_worker の flush を
+    // 当てにしていたが、notify-rs の watcher が missed / off / アプリ終了のケースで次の
+    // commit まで新タグが Ctrl+G に反映されず、ユーザ契約「書き込み直後に検索で見える」が崩れていた。
     if let Ok(mut w) = shared_writer.lock() {
         if let Err(e) = fts_index::upsert_doc(&mut *w, fts.fields(), &doc) {
             crate::logger::log(format!("tag_write_worker: upsert_doc: {e}"));
+            return;
         }
+        if let Err(e) = w.commit() {
+            crate::logger::log(format!("tag_write_worker: commit: {e}"));
+            return;
+        }
+    }
+    // commit は writer ロック外で reader reload する (他 writer をブロックしないため)。
+    if let Err(e) = fts.reload_reader() {
+        crate::logger::log(format!("tag_write_worker: reload_reader: {e}"));
     }
 }
 

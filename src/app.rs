@@ -464,9 +464,12 @@ fn run_metadata_search(
     let use_png = target.includes(crate::fts_index::SourceKind::PngPrompt);
     let use_exif = target.includes(crate::fts_index::SourceKind::Exif);
     let use_xmp = target.includes(crate::fts_index::SourceKind::XmpTweet);
-    // 画像 / Video 用の fallback 経路は name/png/exif/xmp のいずれかが対象でないと
+    let use_tags = target.includes(crate::fts_index::SourceKind::Tags);
+    // 画像 / Video 用の fallback 経路は name/png/exif/xmp/tags のいずれかが対象でないと
     // 計算結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
-    let fallback_contributes = use_name || use_png || use_exif || use_xmp;
+    // Codex P2 #1 対応: use_tags を条件に含める (target=Tags でも未インデックス画像を
+    // dc:subject 直読みでマッチさせる)。
+    let fallback_contributes = use_name || use_png || use_exif || use_xmp || use_tags;
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -542,6 +545,18 @@ fn run_metadata_search(
                             }
                             extended_meta.push_str(&exif_part);
                         }
+                    }
+                }
+                // Codex P2 #1: target が Tags を含む場合、未インデックスの画像でも
+                // dc:subject を直読みして hay に載せる (Ctrl+F で tag 絞り込みを機能させる)。
+                if is_image && use_tags {
+                    let tags_text =
+                        crate::ingest_text::build_tags_column(&crate::xmp_reader::read_dc_subject(path));
+                    if !tags_text.is_empty() {
+                        if !extended_meta.is_empty() {
+                            extended_meta.push('\n');
+                        }
+                        extended_meta.push_str(&tags_text);
                     }
                 }
                 let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());

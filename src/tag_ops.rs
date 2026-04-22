@@ -42,15 +42,21 @@ impl App {
             return;
         }
         self.ensure_tag_write_handle();
+        // Codex P2 #3: indexer_manager が None でタグ書き込みが無効化されている場合は、
+        // ジョブを投入したフリだけして黙って落とすのではなくエラートーストを出す。
+        let Some(h) = self.tag_write_handle.as_ref() else {
+            self.show_feedback_toast(
+                "タグ書き込みが初期化されていません (検索インデックスの起動失敗が原因)".to_string(),
+            );
+            return;
+        };
         let favs = self.settings.favorites.clone();
-        if let Some(h) = self.tag_write_handle.as_ref() {
-            for p in &paths {
-                h.submit(TagWriteJob {
-                    path: p.clone(),
-                    kind: TagJobKind::Toggle(name.to_string()),
-                    favorite_id: find_favorite_id(&favs, p),
-                });
-            }
+        for p in &paths {
+            h.submit(TagWriteJob {
+                path: p.clone(),
+                kind: TagJobKind::Toggle(name.to_string()),
+                favorite_id: find_favorite_id(&favs, p),
+            });
         }
         self.show_feedback_toast(format!("{} 件にタグ #{} をトグル", paths.len(), name));
     }
@@ -61,15 +67,19 @@ impl App {
             return;
         }
         self.ensure_tag_write_handle();
+        let Some(h) = self.tag_write_handle.as_ref() else {
+            self.show_feedback_toast(
+                "タグ書き込みが初期化されていません (検索インデックスの起動失敗が原因)".to_string(),
+            );
+            return;
+        };
         let favs = self.settings.favorites.clone();
-        if let Some(h) = self.tag_write_handle.as_ref() {
-            for p in &paths {
-                h.submit(TagWriteJob {
-                    path: p.clone(),
-                    kind: TagJobKind::ClearMiv,
-                    favorite_id: find_favorite_id(&favs, p),
-                });
-            }
+        for p in &paths {
+            h.submit(TagWriteJob {
+                path: p.clone(),
+                kind: TagJobKind::ClearMiv,
+                favorite_id: find_favorite_id(&favs, p),
+            });
         }
         self.show_feedback_toast(format!("{} 件から mIV タグをクリア", paths.len()));
     }

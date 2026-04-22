@@ -167,7 +167,12 @@ impl App {
             // バリデーション:
             // - 空行は破棄
             // - `#` を含むものは先頭 `#` だけ剥がす (ユーザが `#` を付けて入力した救済)
-            // - 重複は先着優先で後の重複を破棄
+            // - Codex P2 #4: 空白/制御文字を `_` に canonicalize する。`ingest_text::build_tags_column`
+            //   と同じ変換を保存時にも適用することで、「UI ラベル `foo bar` → ピッカーが `#foo bar` を
+            //   クエリ欄に挿入するが、索引では `#foo_bar` として保存されてマッチしない」という
+            //   ズレを防ぐ。ユーザには「空白が `_` に置換されました」警告は出さないが、
+            //   入力欄の表示が変わるので意図が明確になる。
+            // - 重複は先着優先で後の重複を破棄 (canonicalize 後のキーで判定)
             let mut seen = std::collections::HashSet::new();
             let mut cleaned: Vec<TagDef> = Vec::new();
             for t in self.tag_editor_draft.drain(..) {
@@ -175,6 +180,17 @@ impl App {
                 while name.starts_with('#') {
                     name.remove(0);
                 }
+                // 空白/制御文字を `_` に (ingest_text::build_tags_column と同じ正規化)
+                name = name
+                    .chars()
+                    .map(|c| {
+                        if c.is_whitespace() || c.is_control() {
+                            '_'
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
                 if name.is_empty() {
                     continue;
                 }

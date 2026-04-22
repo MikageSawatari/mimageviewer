@@ -1297,4 +1297,51 @@ mod tests {
         assert!(paths.contains("c:/a.zip"));
         assert!(paths.contains("c:/b.pdf"));
     }
+
+    /// §19 + tag 統合: target=Only([Tags]) で tags フィールドだけを対象に検索できる。
+    /// sample_doc_with_tags ヘルパの回帰テストも兼ねる (Codex P3 #1 対応)。
+    #[test]
+    fn target_only_tags_matches_only_tags_field() {
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_tags("c:/a.jpg", fav, "#原神 #風景"),
+        )
+        .unwrap();
+        // name フィールドに "原神" を入れた doc は target=Tags では引っかからない
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_sources(
+                "c:/b.jpg",
+                fav,
+                IndexKind::Image,
+                "原神.jpg",
+                "",
+                "",
+                "",
+            ),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        let searcher = idx.searcher();
+        let q = build_bigram_and_query(
+            idx.fields(),
+            &["原神"],
+            &QueryFilters {
+                target: SearchTarget::Only(vec![SourceKind::Tags]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
+        let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(hits.len(), 1, "Tags target は tags フィールドのみ対象");
+        assert_eq!(paths[0], "c:/a.jpg");
+    }
 }
