@@ -1204,15 +1204,12 @@ pub struct App {
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
     /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。タグ書き込み
-    /// worker の完了時にエントリを invalidate (削除) し、次回描画で再取得する。
+    /// worker の完了時には、成功した path について worker が返した新タグ列で
+    /// エントリを上書きする (`poll_tag_write_results`)。フォルダ切替時のみ全クリアする。
     pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
     /// tag toast 用: 直近の Toggle 操作で UI が使っていたタグ名 (`#ドール` 等)。
     /// worker 完了時に「N 件に #ドール を付与 / 削除」として表示するのに使う。
     pub(crate) tag_toast_label: Option<String>,
-    /// tags_cache の最終更新時刻 (tag write が完了したタイミング)。
-    /// 現在は未参照だが、将来 grid 側で「最近書いたタグの視覚フラッシュ」等に使える。
-    #[allow(dead_code)]
-    pub(crate) tags_cache_last_change: Option<std::time::Instant>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -1718,7 +1715,6 @@ impl Default for App {
             xmp_cache: std::collections::HashMap::new(),
             tags_cache: std::collections::HashMap::new(),
             tag_toast_label: None,
-            tags_cache_last_change: None,
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -6326,11 +6322,8 @@ impl App {
         // 従来どおり XMP から直読みできるようにする。
         for (db_key, cache_key) in keys {
             if let Some(tags_str) = row_map.get(&db_key) {
-                let tags: Vec<String> = tags_str
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
-                self.tags_cache.insert(cache_key, tags);
+                self.tags_cache
+                    .insert(cache_key, crate::ingest_text::parse_tags_column(tags_str));
             }
         }
     }

@@ -167,8 +167,8 @@ const TAG_WRITE_UNAVAILABLE_MSG: &str =
 
 impl App {
     /// 毎フレーム呼ぶ: tag_write_worker の結果をドレインしてトーストする。
-    /// 完了バッチが揃った瞬間に 1 回だけ tags_cache を invalidate する
-    /// (成功 1 件ごとに全消去すると無駄なので末端でまとめる)。
+    /// 成功した各 path については worker が書いた dc:subject をそのまま `tags_cache` に
+    /// 反映する — fts_meta に行があろうと無かろうと grid バッジが即時更新される。
     pub(crate) fn poll_tag_write_results(&mut self) {
         let mut errors: Vec<(PathBuf, String)> = Vec::new();
         let mut added = 0usize;
@@ -176,38 +176,54 @@ impl App {
         let mut cleared = 0usize;
         let mut noop = 0usize;
         let mut just_completed = false;
+        // worker が返してきた (path, 書き込み後タグ列) を後でまとめて tags_cache に反映する。
+        // fts_meta に行が無い favorite (未インデックス) でも、ここで直接書き戻せば
+        // 次フレームの `cell_tag_list` が正しい値を拾えるため add/remove 対称になる。
+        let mut cache_updates: Vec<(PathBuf, Vec<String>)> = Vec::new();
         if let Some(h) = self.tag_write_handle.as_ref() {
             while let Some(res) = h.try_recv_result() {
                 let path_disp = res.path.display().to_string();
-                match &res.result {
-                    Ok(TagAction::Added) => {
-                        added += 1;
-                        crate::logger::log(format!("[TAG]   ✓ added → {path_disp}"));
-                    }
-                    Ok(TagAction::Removed) => {
-                        removed += 1;
-                        crate::logger::log(format!("[TAG]   ✓ removed → {path_disp}"));
-                    }
-                    Ok(TagAction::Cleared) => {
-                        cleared += 1;
-                        crate::logger::log(format!("[TAG]   ✓ cleared mIV tags → {path_disp}"));
-                    }
-                    Ok(TagAction::NoOp) => {
-                        noop += 1;
-                        crate::logger::log(format!("[TAG]   = no-op (already in target state) → {path_disp}"));
+                match res.result {
+                    Ok(action) => {
+                        match action {
+                            TagAction::Added => {
+                                added += 1;
+                                crate::logger::log(format!("[TAG]   ✓ added → {path_disp}"));
+                            }
+                            TagAction::Removed => {
+                                removed += 1;
+                                crate::logger::log(format!("[TAG]   ✓ removed → {path_disp}"));
+                            }
+                            TagAction::Cleared => {
+                                cleared += 1;
+                                crate::logger::log(format!(
+                                    "[TAG]   ✓ cleared mIV tags → {path_disp}"
+                                ));
+                            }
+                            TagAction::NoOp => {
+                                noop += 1;
+                                crate::logger::log(format!(
+                                    "[TAG]   = no-op (already in target state) → {path_disp}"
+                                ));
+                            }
+                        }
+                        cache_updates.push((res.path, res.tags_after));
                     }
                     Err(e) => {
-                        errors.push((res.path.clone(), e.clone()));
                         crate::logger::log(format!("[TAG]   ✗ FAILED: {e} → {path_disp}"));
+                        errors.push((res.path, e));
                     }
                 }
-                // 1 件でも結果を受けたら次フレームで tag badge が更新されるよう
-                // grid 側のキャッシュも invalidate する (fullscreen は下の tags_cache)。
-                self.tags_cache_last_change = Some(std::time::Instant::now());
             }
             if !h.is_busy() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 just_completed = true;
             }
+        }
+        // 成功分は即座に tags_cache へ反映 (just_completed を待たず)。
+        // これで bulk トグルの途中フレームでも、処理済みのセルからバッジが更新されていく。
+        for (path, tags) in cache_updates {
+            let key = crate::adjustment_db::normalize_path(&path);
+            self.tags_cache.insert(key, tags);
         }
         if just_completed {
             crate::logger::log(format!(
@@ -240,10 +256,6 @@ impl App {
             self.show_feedback_toast(msg);
         }
         if just_completed {
-            self.tags_cache.clear();
-            // fts_meta から最新のタグを一括再取得する (worker が set_tags で更新済み)。
-            // これで grid バッジも即座に新状態を反映する。
-            self.prewarm_grid_tags();
             if let Some(h) = self.tag_write_handle.as_ref() {
                 h.reset_counters_if_idle();
             }

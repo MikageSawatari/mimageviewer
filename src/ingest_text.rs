@@ -122,6 +122,13 @@ pub fn build_tags_column(tags: &[String]) -> String {
     out
 }
 
+/// `build_tags_column` の逆: スペース区切りのタグ列 (fts_meta.tags_norm 形式) を
+/// `Vec<String>` に戻す。prewarm_grid_tags / tag_write_worker で UI キャッシュに
+/// 載せる時に使う。空白要素は捨てる。
+pub fn parse_tags_column(s: &str) -> Vec<String> {
+    s.split_whitespace().map(|t| t.to_string()).collect()
+}
+
 /// 1 ファイル分のソース別検索テキストをディスクから構築する。
 /// 抽出に失敗した部分は空文字列。ファイル名は必ず含める。
 pub fn build_per_source_for_file(path: &Path) -> PerSourceText {

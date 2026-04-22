@@ -69,6 +69,10 @@ pub enum TagAction {
 pub struct TagWriteResult {
     pub path: PathBuf,
     pub result: Result<TagAction, String>,
+    /// 書き込み後の dc:subject 一覧 (成功時のみ意味あり、失敗時は空)。
+    /// UI 側はこれを `tags_cache` に直接書き戻すことで、fts_meta に行が無い
+    /// (未インデックス favorite 等) ファイルでもグリッドバッジが即時反映される。
+    pub tags_after: Vec<String>,
 }
 
 pub struct TagWriteHandle {
@@ -202,7 +206,7 @@ fn run_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        let (res, dirtied) = process_job(&job, &meta, &writer);
+        let (res, dirtied, tags_after) = process_job(&job, &meta, &writer);
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -222,6 +226,7 @@ fn run_worker(
         let _ = result_tx.send(TagWriteResult {
             path: job.path.clone(),
             result: res.map_err(|e| e.to_string()),
+            tags_after,
         });
     }
     // 終了時に残ピンを flush。
@@ -255,13 +260,16 @@ fn flush_commit(
     pending_in_writer.store(0, Ordering::Relaxed);
 }
 
-/// ジョブを 1 件処理する。戻り値の `bool` は「dispatcher に upsert を投げたか」で、
-/// 呼び出し側 (`run_worker`) がバッチ commit の pending カウンタに使う。
+/// ジョブを 1 件処理する。戻り値は:
+/// - `Result<TagAction, WriteError>`: UI 側トースト用の結果ラベル
+/// - `bool` dirtied: dispatcher に upsert を投げたか (呼び出し側がバッチ commit の pending に使う)
+/// - `Vec<String>` tags_after: 書き込み後の dc:subject 一覧 (エラー時は空)。UI が
+///   `tags_cache` に直接書き戻して、fts_meta 行の有無に依存せず grid バッジを更新するのに使う。
 fn process_job(
     job: &TagWriteJob,
     meta: &FtsMetaDb,
     writer: &FtsWriterDispatcher,
-) -> (Result<TagAction, WriteError>, bool) {
+) -> (Result<TagAction, WriteError>, bool, Vec<String>) {
     let path_disp = job.path.display();
     // Toggle は worker 側で現在タグを読んで Add/Remove に解決する。
     // これで UI スレッドからの同期 I/O を不要にできる。
@@ -297,12 +305,13 @@ fn process_job(
             crate::logger::log(format!(
                 "[TAG] worker: apply_tag_op FAILED ({e}) | {path_disp}"
             ));
-            return (Err(e), false);
+            return (Err(e), false, Vec::new());
         }
     };
     crate::logger::log(format!(
         "[TAG] worker: write OK, new tags column = {new_tags:?} | {path_disp}"
     ));
+    let tags_after = crate::ingest_text::parse_tags_column(&new_tags);
 
     // 検索インデックス即時更新 (favorite_id がわかる時だけ)。
     let dirtied = match job.favorite_id {
@@ -314,7 +323,7 @@ fn process_job(
             false
         }
     };
-    (Ok(action), dirtied)
+    (Ok(action), dirtied, tags_after)
 }
 
 /// `fts_meta.tags_norm` を更新し、dispatcher 経由で Tantivy にタグ差分の upsert を依頼。
