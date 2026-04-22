@@ -90,15 +90,27 @@ impl PerSourceText {
     }
 }
 
+/// 1 タグ要素を「空白区切り列に載せられる」安全な形に正規化する。
+/// 空白 / 制御文字は `_` に置換。索引側 (`build_tags_column`) と UI 側 (タグ定義ダイアログ)
+/// の両方で呼んで、保存表記と検索時表記を一致させる唯一の経路にする。
+pub fn canonicalize_tag_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// XMP `dc:subject` 由来のタグ列を fts_meta / Tantivy 向けのスペース区切り文字列にする。
-/// タグ内の空白/制御文字は `_` に置換する (検索側と一致させるための唯一の経路)。
+/// 各要素は `canonicalize_tag_name` を通す。
 pub fn build_tags_column(tags: &[String]) -> String {
     let mut out = String::new();
     for t in tags {
-        let cleaned: String = t
-            .chars()
-            .map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c })
-            .collect();
+        let cleaned = canonicalize_tag_name(t);
         if cleaned.is_empty() {
             continue;
         }
@@ -347,5 +359,22 @@ mod tests {
         assert_eq!(pst.get(SourceKind::PngPrompt), "p");
         assert_eq!(pst.get(SourceKind::PdfMeta), "m");
         assert_eq!(pst.get(SourceKind::Tags), "t");
+    }
+
+    #[test]
+    fn canonicalize_tag_name_replaces_whitespace_and_control() {
+        // UI の tag_editor と索引の build_tags_column は同じ変換を通すことで、
+        // タグピッカーが挿入した `#タグ名` が索引中の表記と完全一致する。
+        assert_eq!(canonicalize_tag_name("foo bar"), "foo_bar");
+        assert_eq!(canonicalize_tag_name("tab\there"), "tab_here");
+        assert_eq!(canonicalize_tag_name("line\nbreak"), "line_break");
+        assert_eq!(canonicalize_tag_name("plain"), "plain");
+        assert_eq!(canonicalize_tag_name("日本語"), "日本語");
+    }
+
+    #[test]
+    fn build_tags_column_uses_canonicalize() {
+        let input = vec!["#原神".to_string(), "foo bar".to_string()];
+        assert_eq!(build_tags_column(&input), "#原神 foo_bar");
     }
 }

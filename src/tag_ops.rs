@@ -37,51 +37,52 @@ impl App {
     }
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
-        let paths = self.tag_target_paths();
-        if paths.is_empty() {
-            return;
-        }
-        self.ensure_tag_write_handle();
-        // Codex P2 #3: indexer_manager が None でタグ書き込みが無効化されている場合は、
-        // ジョブを投入したフリだけして黙って落とすのではなくエラートーストを出す。
-        let Some(h) = self.tag_write_handle.as_ref() else {
-            self.show_feedback_toast(
-                "タグ書き込みが初期化されていません (検索インデックスの起動失敗が原因)".to_string(),
-            );
-            return;
+        let name_owned = name.to_string();
+        let success_msg = {
+            let count = self.tag_target_paths().len();
+            format!("{} 件にタグ #{} をトグル", count, name)
         };
-        let favs = self.settings.favorites.clone();
-        for p in &paths {
-            h.submit(TagWriteJob {
-                path: p.clone(),
-                kind: TagJobKind::Toggle(name.to_string()),
-                favorite_id: find_favorite_id(&favs, p),
-            });
-        }
-        self.show_feedback_toast(format!("{} 件にタグ #{} をトグル", paths.len(), name));
+        self.submit_tag_jobs(
+            move |_| TagJobKind::Toggle(name_owned.clone()),
+            success_msg,
+        );
     }
 
     pub(crate) fn request_tag_clear_for_selection(&mut self) {
+        let success_msg = {
+            let count = self.tag_target_paths().len();
+            format!("{} 件から mIV タグをクリア", count)
+        };
+        self.submit_tag_jobs(|_| TagJobKind::ClearMiv, success_msg);
+    }
+
+    /// タグ書き込みジョブ投入の共通経路。
+    /// - 対象 path が 0 件 → 黙って何もしない (通常は UI でボタンがグレーアウトしている)
+    /// - `tag_write_handle` 初期化失敗 → エラートーストを出して失敗を明示
+    /// - 正常 → 各 path で `kind_for` を呼んでジョブを作成し、成功トーストを出す
+    fn submit_tag_jobs(
+        &mut self,
+        kind_for: impl Fn(&PathBuf) -> TagJobKind,
+        success_msg: String,
+    ) {
         let paths = self.tag_target_paths();
         if paths.is_empty() {
             return;
         }
         self.ensure_tag_write_handle();
         let Some(h) = self.tag_write_handle.as_ref() else {
-            self.show_feedback_toast(
-                "タグ書き込みが初期化されていません (検索インデックスの起動失敗が原因)".to_string(),
-            );
+            self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return;
         };
         let favs = self.settings.favorites.clone();
         for p in &paths {
             h.submit(TagWriteJob {
                 path: p.clone(),
-                kind: TagJobKind::ClearMiv,
+                kind: kind_for(p),
                 favorite_id: find_favorite_id(&favs, p),
             });
         }
-        self.show_feedback_toast(format!("{} 件から mIV タグをクリア", paths.len()));
+        self.show_feedback_toast(success_msg);
     }
 
     fn ensure_tag_write_handle(&mut self) {
@@ -89,6 +90,10 @@ impl App {
             return;
         }
         let Some(mgr) = self.indexer_manager.as_ref() else {
+            crate::logger::log(
+                "tag_ops: indexer_manager が未初期化のためタグ書き込み worker を起動できない"
+                    .to_string(),
+            );
             return;
         };
         self.tag_write_handle = Some(TagWriteHandle::spawn(
@@ -98,6 +103,11 @@ impl App {
         ));
     }
 }
+
+/// タグ書き込みが無効化されている時のユーザー向けエラー文言。
+/// `submit_tag_jobs` の None 経路でトースト表示する。
+const TAG_WRITE_UNAVAILABLE_MSG: &str =
+    "タグ書き込みが初期化されていません (検索インデックスの起動失敗が原因)";
 
 impl App {
     /// 毎フレーム呼ぶ: tag_write_worker の結果をドレインしてトーストする。

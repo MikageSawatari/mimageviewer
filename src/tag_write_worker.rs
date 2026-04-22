@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use tantivy::IndexWriter;
@@ -22,6 +23,12 @@ use uuid::Uuid;
 use crate::fts_index::{self, Container, FtsIndex, IndexDoc};
 use crate::fts_meta::FtsMetaDb;
 use crate::xmp_writer::{TagOp, WriteError};
+
+/// バッチ commit の閾値 (件数と時間の OR)。ingest_worker の BATCH_FLUSH_COUNT=100 / 5s
+/// よりは小さめ — タグ書き込みは UI 操作から来るので Ctrl+G への反映レイテンシを
+/// 500ms 以内に抑えたい。かつ 100 ファイル一括トグルで commit 1 回に畳まれる。
+const BATCH_FLUSH_COUNT: usize = 32;
+const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// UI が worker に渡す操作。XMP ファイル読み出しを伴う Toggle は worker 側で
 /// Add/Remove に解決するので、UI スレッドは同期 I/O を一切行わなくて済む。
@@ -142,35 +149,87 @@ fn run_worker(
     failures: &Arc<AtomicUsize>,
     shutdown: &Arc<AtomicBool>,
 ) {
+    // バッチ commit 用の pending カウンタ。ingest_worker と同じ「N 件溜まったら
+    // commit / idle で M 秒経ったら commit / 終了時に必ず flush」パターン。
+    // これをやらないと N ファイル一括トグルで N 回 fsync が発生する。
+    let mut pending: usize = 0;
+    let mut last_flush = Instant::now();
+
     loop {
         if shutdown.load(Ordering::Relaxed) && job_rx.is_empty() {
             break;
         }
-        let job = match job_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        let job = match job_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(j) => j,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if pending > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL {
+                    flush_commit(&shared_writer, &fts, &mut pending);
+                    last_flush = Instant::now();
+                }
+                continue;
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        let res = process_job(&job, &meta, &fts, &shared_writer);
+        let (res, dirtied) = process_job(&job, &meta, &fts, &shared_writer);
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
         done.fetch_add(1, Ordering::Relaxed);
+        if dirtied {
+            pending += 1;
+        }
+        if pending >= BATCH_FLUSH_COUNT {
+            flush_commit(&shared_writer, &fts, &mut pending);
+            last_flush = Instant::now();
+        }
 
         let _ = result_tx.send(TagWriteResult {
             path: job.path.clone(),
             result: res.map_err(|e| e.to_string()),
         });
     }
+    // 終了時に残ピンを flush。忘れると最後のジョブが検索に反映されない。
+    flush_commit(&shared_writer, &fts, &mut pending);
 }
 
+/// Tantivy writer を commit + reader reload する。pending が 0 なら no-op。
+/// Quality fix: commit 失敗時は reader reload を走らせない (stale 読みを防ぐ)。
+fn flush_commit(shared_writer: &Mutex<IndexWriter>, fts: &FtsIndex, pending: &mut usize) {
+    if *pending == 0 {
+        return;
+    }
+    let committed = match shared_writer.lock() {
+        Ok(mut w) => match w.commit() {
+            Ok(_) => true,
+            Err(e) => {
+                crate::logger::log(format!("tag_write_worker: commit: {e}"));
+                false
+            }
+        },
+        Err(_) => {
+            crate::logger::log(
+                "tag_write_worker: shared writer mutex poisoned — skipping commit".to_string(),
+            );
+            false
+        }
+    };
+    *pending = 0;
+    if committed {
+        if let Err(e) = fts.reload_reader() {
+            crate::logger::log(format!("tag_write_worker: reload_reader: {e}"));
+        }
+    }
+}
+
+/// ジョブを 1 件処理する。戻り値の `bool` は「Tantivy writer バッファを dirty にしたか」で、
+/// 呼び出し側 (`run_worker`) がバッチ commit の pending カウンタに使う。
 fn process_job(
     job: &TagWriteJob,
     meta: &FtsMetaDb,
     fts: &FtsIndex,
     shared_writer: &Mutex<IndexWriter>,
-) -> Result<String, WriteError> {
+) -> (Result<String, WriteError>, bool) {
     // Toggle は worker 側で現在タグを読んで Add/Remove に解決する。
     // これで UI スレッドからの同期 I/O を不要にできる。
     let op = match &job.kind {
@@ -186,33 +245,45 @@ fn process_job(
         TagJobKind::ClearMiv => TagOp::ClearMiv,
     };
 
-    let new_tags = crate::xmp_writer::apply_tag_op(&job.path, &op)?;
+    let new_tags = match crate::xmp_writer::apply_tag_op(&job.path, &op) {
+        Ok(s) => s,
+        Err(e) => return (Err(e), false),
+    };
 
     // 検索インデックス即時更新 (favorite_id がわかる時だけ)。
-    // 失敗しても書き込み自体は成功扱いとし、notify-rs 経由の再 ingest に任せる。
-    if let Some(fav_id) = job.favorite_id {
-        update_search_index(&job.path, fav_id, &new_tags, meta, fts, shared_writer);
-    }
-    Ok(new_tags)
+    let dirtied = match job.favorite_id {
+        Some(fav_id) => upsert_tags_in_writer(&job.path, fav_id, &new_tags, meta, fts, shared_writer),
+        None => false,
+    };
+    (Ok(new_tags), dirtied)
 }
 
-/// fts_meta.tags 更新 + Tantivy の tags フィールドを共有 writer 経由で upsert。
-fn update_search_index(
+/// `fts_meta.tags_norm` を更新し、Tantivy writer にタグ差分のみの upsert を投入する。
+/// commit / reload は呼び出し側がバッチ境界で行う (1 ジョブ 1 fsync を避けるため)。
+///
+/// 戻り値 `true`: writer に upsert を push した (呼び出し側は flush の pending に計上)。
+/// 戻り値 `false`: 変更なし / fts_meta 書き込み失敗 / 行が無い など、writer に触っていない。
+fn upsert_tags_in_writer(
     path: &std::path::Path,
     fav_id: Uuid,
     new_tags: &str,
     meta: &FtsMetaDb,
     fts: &FtsIndex,
     shared_writer: &Mutex<IndexWriter>,
-) {
+) -> bool {
     let key = crate::search_index_db::normalize_path(path);
-    if meta.set_tags(&key, new_tags).is_err() {
-        return;
-    }
     let Ok(Some(row)) = meta.get(&key) else {
-        return;
+        // 行が無い (未インデックス favorite など) → notify-rs 経由の再 ingest に任せる
+        return false;
     };
-    // row.norms を base にして tags 列だけ更新 (他の per-source テキストは保持)。
+    // Dirty guard: new_tags が既存 tags_norm と同じなら Tantivy を触らない (no-op commit 回避)。
+    // ClearMiv を #タグ無しの行に当てたケースや、Toggle で結果が元に戻るケースを省く。
+    if row.norms.tags == new_tags {
+        return false;
+    }
+    if meta.set_tags(&key, new_tags).is_err() {
+        return false;
+    }
     let mut norms = row.norms.clone();
     norms.tags = new_tags.to_string();
     let doc = IndexDoc {
@@ -225,23 +296,20 @@ fn update_search_index(
         file_size: row.file_size,
         norms,
     };
-    // 共有 writer を短時間だけロック。Codex P2 #2: タグ書き込み後の Ctrl+G 反映を即時化する
-    // ため、ここで **commit + reader reload** まで行う。旧実装は ingest_worker の flush を
-    // 当てにしていたが、notify-rs の watcher が missed / off / アプリ終了のケースで次の
-    // commit まで新タグが Ctrl+G に反映されず、ユーザ契約「書き込み直後に検索で見える」が崩れていた。
-    if let Ok(mut w) = shared_writer.lock() {
-        if let Err(e) = fts_index::upsert_doc(&mut *w, fts.fields(), &doc) {
-            crate::logger::log(format!("tag_write_worker: upsert_doc: {e}"));
-            return;
+    match shared_writer.lock() {
+        Ok(mut w) => match fts_index::upsert_doc(&mut *w, fts.fields(), &doc) {
+            Ok(_) => true,
+            Err(e) => {
+                crate::logger::log(format!("tag_write_worker: upsert_doc: {e}"));
+                false
+            }
+        },
+        Err(_) => {
+            crate::logger::log(
+                "tag_write_worker: writer mutex poisoned — skipping upsert".to_string(),
+            );
+            false
         }
-        if let Err(e) = w.commit() {
-            crate::logger::log(format!("tag_write_worker: commit: {e}"));
-            return;
-        }
-    }
-    // commit は writer ロック外で reader reload する (他 writer をブロックしないため)。
-    if let Err(e) = fts.reload_reader() {
-        crate::logger::log(format!("tag_write_worker: reload_reader: {e}"));
     }
 }
 

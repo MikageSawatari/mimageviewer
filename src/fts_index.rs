@@ -1298,8 +1298,8 @@ mod tests {
         assert!(paths.contains("c:/b.pdf"));
     }
 
-    /// §19 + tag 統合: target=Only([Tags]) で tags フィールドだけを対象に検索できる。
-    /// sample_doc_with_tags ヘルパの回帰テストも兼ねる (Codex P3 #1 対応)。
+    /// target=Only([Tags]) で tags フィールドだけを対象に検索できることを確認する。
+    /// name フィールドに同じトークンがあっても引っかからないこと。
     #[test]
     fn target_only_tags_matches_only_tags_field() {
         let (_tmp, idx) = new_index();
