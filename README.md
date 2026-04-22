@@ -22,7 +22,7 @@ Windows 向け高速サムネイルビューワー
 - 見開き表示（左→右 / 右→左、表紙単独表示対応）
 - 画像分析モード（カラーピッカー、ヒストグラム、色差強調、グレースケール等）
 - AI アップスケール（Real-ESRGAN / Real-CUGAN / NMKD-Siax、DirectML）— 透過 PNG のアルファ保持
-- AI JPEG ノイズ除去（RealPLKSR / OmniSR）
+- AI JPEG ノイズ除去
 - AI 画像修復（消しゴムツール、MI-GAN）— 非破壊マスク保存、タイル処理
 - 画像分類（風景・人物・ドキュメント等の自動判定）
 - 画像補正（明るさ・コントラスト・色調）＋フォルダ/ZIP/PDF 単位の 4 プリセット
@@ -124,7 +124,7 @@ Windows 向け高速サムネイルビューワー
 
 ### v0.6.0
 - AI アップスケール（Real-ESRGAN / Real-CUGAN / NMKD-Siax、DirectML）
-- AI JPEG ノイズ除去（RealPLKSR / OmniSR）
+- AI JPEG ノイズ除去
 - AI 画像修復（MI-GAN、DirectML）：消しゴムツールでの範囲指定消去、タイル処理、非破壊マスク保存
 - 消しゴムツールの拡張：直線・傾斜線・貼り付けスロット・Select ツール、グリッドから F7/F8 で一括適用、マスク済みサムネに「消」バッジ
 - 画像補正機能（明るさ・コントラスト・色調）＋フォルダ/ZIP/PDF 単位の 4 プリセット
