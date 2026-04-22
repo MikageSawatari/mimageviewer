@@ -24,7 +24,7 @@
 //! - UI 側が `pending = None` にすれば job_tx も drop され、worker は自然終了する。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -33,11 +33,15 @@ use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
 
 /// バックグラウンド XMP プリフェッチのハンドル。`job_tx` は UI が新規ジョブを push する
 /// ための送信端。`rx` は worker が XMP 読みの結果を返す経路 (`App::poll_tag_prewarm_results`
-/// が drain する)。
+/// が drain する)。`in_flight` は push 済みだが UI が drain していないジョブ数。
 pub(crate) struct TagPrewarmPending {
     cancel: Arc<AtomicBool>,
     job_tx: CbSender<PrewarmJob>,
     pub rx: mpsc::Receiver<TagPrewarmResult>,
+    /// 「push されたが UI がまだ drain していない」ジョブ数。worker が空でも
+    /// 常に `Some(pending)` になった現設計で、idle 時に `request_repaint` を
+    /// 無限に呼び続けないための busy シグナル源。push で +1、`on_result_drained` で -1。
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl TagPrewarmPending {
@@ -48,7 +52,19 @@ impl TagPrewarmPending {
     /// ジョブを 1 件キューに追加する。worker が順に処理する。
     /// 重複チェックは UI 側 (`tag_prewarm_queued` HashSet) で済ませる想定。
     pub(crate) fn push_job(&self, path: PathBuf, cache_key: String) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _ = self.job_tx.send(PrewarmJob { path, cache_key });
+    }
+
+    /// UI が 1 件 drain した後に呼ぶ。`is_busy` を下げる。
+    pub(crate) fn on_result_drained(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// push 済みで UI がまだ drain していないジョブが残っているか。
+    /// `App::update` の repaint ゲートで使い、idle (0) 時は repaint 要求を出さない。
+    pub(crate) fn is_busy(&self) -> bool {
+        self.in_flight.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -69,6 +85,7 @@ pub(crate) struct TagPrewarmResult {
 pub(crate) fn spawn() -> TagPrewarmPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_w = Arc::clone(&cancel);
+    let in_flight = Arc::new(AtomicUsize::new(0));
     let (job_tx, job_rx) = unbounded::<PrewarmJob>();
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -79,6 +96,7 @@ pub(crate) fn spawn() -> TagPrewarmPending {
         cancel,
         job_tx,
         rx: result_rx,
+        in_flight,
     }
 }
 
@@ -144,6 +162,36 @@ mod tests {
                 Err(mpsc::TryRecvError::Disconnected) => panic!("channel closed without result"),
             }
         }
+    }
+
+    /// idle 時 (push していない) は `is_busy()` が false を返し、push すると true、
+    /// drain 後に再び false に戻ること。`App::update` の repaint ゲート用シグナル。
+    #[test]
+    fn is_busy_reflects_in_flight() {
+        let pending = spawn();
+        assert!(!pending.is_busy(), "初期状態は idle");
+
+        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), "ka".to_string());
+        assert!(pending.is_busy(), "push 直後は busy");
+
+        // worker が送ってくるのを受け取り、on_result_drained で in_flight を戻す
+        let start = Instant::now();
+        loop {
+            match pending.rx.try_recv() {
+                Ok(_) => {
+                    pending.on_result_drained();
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() > Duration::from_secs(2) {
+                        panic!("worker did not send within 2s");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => panic!("disconnected"),
+            }
+        }
+        assert!(!pending.is_busy(), "drain 後は idle");
     }
 
     /// cancel を立てれば worker は次ループで break し、drop 後に受信は終わる。

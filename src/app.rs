@@ -6403,8 +6403,8 @@ impl App {
     /// `tag_prewarm` ワーカーからの XMP プリフェッチ結果を UI スレッドで回収する。
     /// 既に `tags_cache` にエントリがある path (タグ書き込み worker が先に入れた新鮮な
     /// 状態 / 同フォルダ内で既に読み終えた path) は上書きしない。
-    /// 毎フレーム `App::update` から呼ぶ。未完了分が残っていれば `update` 側で
-    /// `request_repaint()` してアイドル寝させない。
+    /// 毎フレーム `App::update` から呼ぶ。`on_result_drained` で in_flight を減らし、
+    /// 残ジョブがあれば呼び出し側が `request_repaint()` する。
     pub(crate) fn poll_tag_prewarm_results(&mut self) {
         let Some(pending) = self.tag_prewarm_pending.as_ref() else {
             return;
@@ -6414,6 +6414,7 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(res) => {
                     self.tags_cache.entry(res.cache_key).or_insert(res.tags);
+                    pending.on_result_drained();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -9193,11 +9194,16 @@ impl eframe::App for App {
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
         self.poll_global_search_debounce();
         self.poll_global_search_events(ctx);
-        // 非同期 pending が走っている間は次フレームも poll させる (egui アイドル寝防止)
+        // 非同期 pending が走っている間は次フレームも poll させる (egui アイドル寝防止)。
+        // tag_prewarm_pending は常駐 handle になったので `is_some()` ではなく
+        // 実ジョブ残数 (is_busy) を見る。アイドル時の無限 repaint を避けるため。
         if self.search_pending.is_some()
             || self.favsearch_pending.is_some()
             || self.metadata_pending.is_some()
-            || self.tag_prewarm_pending.is_some()
+            || self
+                .tag_prewarm_pending
+                .as_ref()
+                .is_some_and(|p| p.is_busy())
         {
             ctx.request_repaint();
         }
