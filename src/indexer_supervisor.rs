@@ -428,22 +428,23 @@ fn run_initial_scan(
         "indexer[{favorite_id}]: acquiring writer for ingest..."
     ));
     let t_ingest = Instant::now();
-    let ingest_stats = {
-        let mut w = writer.lock().unwrap();
-        match session.apply(
-            scan.to_ingest,
-            scan.to_delete,
-            &mut w,
-            io_sem,
-            IoPriority::Low,
-            &cancel,
-            Some(progress),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::logger::log(format!("indexer[{favorite_id}]: ingest apply failed: {e}"));
-                return;
-            }
+    // session.apply は writer Mutex を内部で flush 境界ごとに lock/unlock し、待機中の
+    // 他 lock 利用者 (タグ書き込み worker など) に取り合いの機会を与える (CLAUDE.md
+    // 並行処理ガイダンス + docs/async-architecture.md §5.5)。supervisor 側は Mutex 参照を
+    // そのまま渡すだけ。
+    let ingest_stats = match session.apply(
+        scan.to_ingest,
+        scan.to_delete,
+        writer,
+        io_sem,
+        IoPriority::Low,
+        &cancel,
+        Some(progress),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::logger::log(format!("indexer[{favorite_id}]: ingest apply failed: {e}"));
+            return;
         }
     };
     let ingest_ms = t_ingest.elapsed().as_millis() as u64;
@@ -490,11 +491,10 @@ fn apply_single_change(
 
     match kind {
         ChangeKind::Remove => {
-            let mut w = writer.lock().unwrap();
             let ingest_stats = match session.apply(
                 vec![],
                 vec![key],
-                &mut w,
+                writer,
                 io_sem,
                 IoPriority::Normal,
                 cancel,
@@ -524,11 +524,10 @@ fn apply_single_change(
             // 安全側に倒し、候補が作れなければ Remove 経路にフォールバックする。
             // (種別外は DB に元から入らない想定なので delete 空振りになるだけ)。
             let Some(cand) = build_candidate_from_path(&path, key.clone()) else {
-                let mut w = writer.lock().unwrap();
                 let ingest_stats = match session.apply(
                     vec![],
                     vec![key],
-                    &mut w,
+                    writer,
                     io_sem,
                     IoPriority::Normal,
                     cancel,
@@ -546,11 +545,10 @@ fn apply_single_change(
                 update_stats(stats, &ingest_stats);
                 return;
             };
-            let mut w = writer.lock().unwrap();
             let ingest_stats = match session.apply(
                 vec![cand],
                 vec![],
-                &mut w,
+                writer,
                 io_sem,
                 IoPriority::Normal,
                 cancel,

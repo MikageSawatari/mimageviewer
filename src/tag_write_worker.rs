@@ -240,7 +240,18 @@ fn flush_commit(
     if pending_in_writer.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let committed = match shared_writer.lock() {
+    // 取得待ち時間も計測 — 索引ワーカーに lock を取られているとここで詰まる。
+    // 1 秒以上待ったら警告を出す (CLAUDE.md 並行処理ガイダンス)。
+    let lock_t0 = std::time::Instant::now();
+    let lock_result = shared_writer.lock();
+    let lock_wait_ms = lock_t0.elapsed().as_millis();
+    if lock_wait_ms > 1000 {
+        crate::logger::log(format!(
+            "[TAG] worker: writer lock acquired after {lock_wait_ms} ms wait \
+             (indexer scan likely held it — see ingest_worker yield_writer_lock)"
+        ));
+    }
+    let committed = match lock_result {
         Ok(mut w) => match w.commit() {
             Ok(_) => true,
             Err(e) => {
@@ -366,7 +377,15 @@ fn upsert_tags_in_writer(
         file_size: row.file_size,
         norms,
     };
-    match shared_writer.lock() {
+    let lock_t0 = std::time::Instant::now();
+    let lock_result = shared_writer.lock();
+    let lock_wait_ms = lock_t0.elapsed().as_millis();
+    if lock_wait_ms > 1000 {
+        crate::logger::log(format!(
+            "[TAG] worker: writer lock for upsert acquired after {lock_wait_ms} ms wait"
+        ));
+    }
+    match lock_result {
         Ok(mut w) => match fts_index::upsert_doc(&mut *w, fts.fields(), &doc) {
             Ok(_) => true,
             Err(e) => {

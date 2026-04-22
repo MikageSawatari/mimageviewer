@@ -96,12 +96,18 @@ impl<'a> IngestSession<'a> {
     /// - `to_delete` の各 path について、fts_meta.mark_tombstone → Tantivy delete_doc
     /// - バッチ境界 (BATCH_FLUSH_COUNT 件 or BATCH_FLUSH_INTERVAL) で
     ///   writer.commit() → fts_meta.mark_ok / purge_tombstone
+    ///
+    /// **重要 (writer lock 飢餓対策)**: writer は `Arc<Mutex<IndexWriter>>` 由来の Mutex 参照。
+    /// 大規模 ingest で 1 回掴みっぱなしにすると、interactive な writer 利用者
+    /// (`tag_write_worker` のタグ付与など) が分単位で starve する。flush 境界で必ず
+    /// guard を drop → 短時間 sleep → 再取得して、待機中の他 lock 利用者に取り合いの
+    /// 機会を与える ([docs/async-architecture.md §5.5](../docs/async-architecture.md))。
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         to_ingest: Vec<CandidateFile>,
         to_delete: Vec<String>,
-        writer: &mut IndexWriter,
+        writer_mtx: &std::sync::Mutex<IndexWriter>,
         io_sem: &GlobalIoSemaphore,
         priority: IoPriority,
         cancel: &AtomicBool,
@@ -117,6 +123,11 @@ impl<'a> IngestSession<'a> {
         let mut last_flush = Instant::now();
         let ingest_total = to_ingest.len();
         let delete_total = to_delete.len();
+
+        // writer は Option で持ち、flush 後に take() で drop → 再取得で他 lock 利用者に
+        // 機会を与える。`acquire_writer` ヘルパで lazy 取得する。
+        let mut writer: Option<std::sync::MutexGuard<'_, IndexWriter>> =
+            Some(writer_mtx.lock().unwrap());
 
         // === 1. 削除フェーズ ===
         // stats.deleted は **実際に tombstone 化 + Tantivy delete を push したもの** のみカウント
@@ -134,19 +145,31 @@ impl<'a> IngestSession<'a> {
                 crate::logger::log(format!("ingest: mark_tombstone failed for {path}: {e}"));
                 continue;
             }
-            fts_index::delete_doc(writer, fields, path);
+            let w = writer
+                .as_deref_mut()
+                .expect("writer guard alive between flushes");
+            fts_index::delete_doc(w, fields, path);
             tombstone_paths.push(path.clone());
             stats.deleted += 1;
 
             if self.should_flush(&tombstone_paths, &pending_paths, last_flush) {
-                self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
+                self.flush(
+                    writer.as_deref_mut().unwrap(),
+                    &mut pending_paths,
+                    &mut tombstone_paths,
+                )?;
+                yield_writer_lock(&mut writer, writer_mtx);
                 last_flush = Instant::now();
             }
         }
 
         if stats.cancelled {
             // 残っている分を commit (stats.deleted は既に実処理カウント済み)
-            self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
+            self.flush(
+                writer.as_deref_mut().unwrap(),
+                &mut pending_paths,
+                &mut tombstone_paths,
+            )?;
             return Ok(stats);
         }
 
@@ -167,11 +190,14 @@ impl<'a> IngestSession<'a> {
 
             // Ingest 対象の種類で分岐。v1 スコープ: Image のみ詳細メタ抽出、
             // Zip / Pdf はファイル名のみ取り込み (ZIP 内は §7.7、PDF info は step 17)。
+            let w = writer
+                .as_deref()
+                .expect("writer guard alive between flushes");
             match cand.kind {
                 CandidateKind::Image => {
                     // I/O 同時実行制御
                     let _permit = io_sem.acquire(priority);
-                    match self.ingest_image(&cand, writer) {
+                    match self.ingest_image(&cand, w) {
                         Ok(()) => {
                             pending_paths.push(cand.key.clone());
                             stats.ingested_ok += 1;
@@ -189,7 +215,7 @@ impl<'a> IngestSession<'a> {
                 CandidateKind::Zip => {
                     // v1: ZIP はファイル名のみ ingest (ZIP 内展開は v1.x で対応)
                     let _permit = io_sem.acquire(priority);
-                    match self.ingest_name_only(&cand, writer) {
+                    match self.ingest_name_only(&cand, w) {
                         Ok(()) => {
                             pending_paths.push(cand.key.clone());
                             stats.ingested_ok += 1;
@@ -209,7 +235,7 @@ impl<'a> IngestSession<'a> {
                     // 取り込む。PDFium ワーカー (別プロセス) を使うのでメイン process の
                     // pdfium スレッド制約を気にしなくてよい。
                     let _permit = io_sem.acquire(priority);
-                    match self.ingest_pdf(&cand, writer) {
+                    match self.ingest_pdf(&cand, w) {
                         Ok(()) => {
                             pending_paths.push(cand.key.clone());
                             stats.ingested_ok += 1;
@@ -227,13 +253,22 @@ impl<'a> IngestSession<'a> {
             }
 
             if self.should_flush(&tombstone_paths, &pending_paths, last_flush) {
-                self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
+                self.flush(
+                    writer.as_deref_mut().unwrap(),
+                    &mut pending_paths,
+                    &mut tombstone_paths,
+                )?;
+                yield_writer_lock(&mut writer, writer_mtx);
                 last_flush = Instant::now();
             }
         }
 
         // 残りを flush (stats.deleted は削除フェーズで実処理カウント済み)
-        self.flush(writer, &mut pending_paths, &mut tombstone_paths)?;
+        self.flush(
+            writer.as_deref_mut().unwrap(),
+            &mut pending_paths,
+            &mut tombstone_paths,
+        )?;
         Ok(stats)
     }
 
@@ -353,6 +388,21 @@ impl<'a> IngestSession<'a> {
     }
 }
 
+/// バッチ flush 直後、tantivy writer の guard を一旦 drop して、待機中の他 lock 利用者
+/// (interactive な `tag_write_worker` など) に取り合いの機会を与える。短い sleep を挟むのは
+/// std::sync::Mutex がプラットフォームによって unfair で、drop 直後に同スレッドが
+/// 再取得してしまうケースを防ぐため (Windows では特に顕著)。再取得して `writer` を埋め直す。
+fn yield_writer_lock<'a>(
+    writer: &mut Option<std::sync::MutexGuard<'a, IndexWriter>>,
+    writer_mtx: &'a std::sync::Mutex<IndexWriter>,
+) {
+    *writer = None; // drop the guard → release the mutex
+    // ~5ms あれば tag_write_worker の 1 ファイル分 (read + write_xmp + upsert) が
+    // 滑り込める。50 batch x 5ms = 250ms の追加 overhead は initial scan 数十秒に対し誤差。
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    *writer = Some(writer_mtx.lock().unwrap());
+}
+
 // -----------------------------------------------------------------------
 // tests
 // -----------------------------------------------------------------------
@@ -396,14 +446,14 @@ mod tests {
     fn ingest_empty_queues_is_noop() {
         let (_tmp, meta, fts) = setup();
         let session = IngestSession::new(Uuid::new_v4(), PathBuf::from("C:/x"), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
         let stats = session
             .apply(
                 vec![],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -420,7 +470,7 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = tmp.path().to_path_buf();
         let session = IngestSession::new(fav, root.clone(), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -430,7 +480,7 @@ mod tests {
             .apply(
                 vec![cand],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -469,7 +519,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -479,7 +529,7 @@ mod tests {
             .apply(
                 vec![cand],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -494,7 +544,7 @@ mod tests {
             .apply(
                 vec![],
                 vec![key.clone()],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -527,7 +577,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -538,7 +588,7 @@ mod tests {
             .apply(
                 vec![cand],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -557,7 +607,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(true); // 最初から cancel
 
@@ -566,7 +616,7 @@ mod tests {
             .apply(
                 vec![cand],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -582,7 +632,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -592,7 +642,7 @@ mod tests {
             .apply(
                 vec![cand.clone()],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -607,7 +657,7 @@ mod tests {
             .apply(
                 vec![cand],
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
@@ -641,23 +691,26 @@ mod tests {
             &norms,
         )
         .unwrap();
-        let mut writer = fts.writer().unwrap();
-        fts_index::upsert_doc(
-            &writer,
-            fts.fields(),
-            &crate::fts_index::IndexDoc {
-                path: key.clone(),
-                container: crate::fts_index::Container::Fs,
-                zip_entry: String::new(),
-                favorite_id: fav,
-                kind: IndexKind::Image,
-                mtime: cand.mtime,
-                file_size: cand.file_size,
-                norms: norms.clone(),
-            },
-        )
-        .unwrap();
-        writer.commit().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
+        {
+            let mut w = writer.lock().unwrap();
+            fts_index::upsert_doc(
+                &w,
+                fts.fields(),
+                &crate::fts_index::IndexDoc {
+                    path: key.clone(),
+                    container: crate::fts_index::Container::Fs,
+                    zip_entry: String::new(),
+                    favorite_id: fav,
+                    kind: IndexKind::Image,
+                    mtime: cand.mtime,
+                    file_size: cand.file_size,
+                    norms: norms.clone(),
+                },
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
         // !!! mark_ok を呼ばずに "クラッシュ" — pending のまま残留
 
         // 状態: fts_meta は pending、Tantivy は ok 済み (新テキスト)
@@ -699,7 +752,7 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let mut writer = fts.writer().unwrap();
+        let writer = std::sync::Mutex::new(fts.writer().unwrap());
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -712,7 +765,7 @@ mod tests {
             .apply(
                 cands,
                 vec![],
-                &mut writer,
+                &writer,
                 &sem,
                 IoPriority::Low,
                 &cancel,
