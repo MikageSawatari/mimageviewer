@@ -1252,9 +1252,14 @@ pub struct App {
     /// `fts_meta` 未登録ファイル (非インデックス favorite 等) でも grid バッジが表示される
     /// よう、`prewarm_grid_tags` が spawn する。フォルダ切替時に cancel される。
     pub(crate) tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
-    /// `tag_prewarm_pending` に既に push 済みの cache_key 集合 (二重 push 防止)。
-    /// フォルダ切替で `prewarm_grid_tags` が clear する。
-    pub(crate) tag_prewarm_queued: std::collections::HashSet<String>,
+    /// `tag_prewarm_pending` で処理済み / キャッシュ済みの item idx 集合 (二重 push 防止)。
+    /// idx キーで持つことで hot-path の `adjustment_db::normalize_path` 呼び出しを
+    /// 未処理 idx に対してのみ発生させる。フォルダ切替で `prewarm_grid_tags` が clear する。
+    pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
+    /// 直近 `enqueue_visible_tag_prewarms` を走らせた `keep_range`。アイドル時に
+    /// 毎フレーム同じ範囲を走査し続ける無駄を避けるための change-detection guard。
+    /// フォルダ切替で `prewarm_grid_tags` が reset する。
+    pub(crate) last_enqueued_keep_range: (usize, usize),
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -1737,6 +1742,7 @@ impl Default for App {
             metadata_pending: None,
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
+            last_enqueued_keep_range: (0, 0),
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -6312,6 +6318,7 @@ impl App {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
+        self.last_enqueued_keep_range = (0, 0);
 
         // fts_meta 一括取得 — 存在する分は同期で即キャッシュに載せる (非可視も含む)。
         // SQLite の IN 句は数千件でも 10-30ms 程度なので UI を止めない。
@@ -6351,10 +6358,8 @@ impl App {
 
     /// 毎フレーム呼ぶ: 現在の `keep_range` (可視範囲 + prev/next ページ) に含まれる
     /// Image アイテムのうち、`tags_cache` にまだ無いものを `tag_prewarm` worker に push する。
-    /// `tag_prewarm_queued` で二重 push を防ぐ。
-    ///
-    /// これにより非インデックスフォルダを開いても初期に全 XMP を舐めず、ユーザーが
-    /// スクロールで見ている範囲だけを段階的に読み込む (P2 回避)。
+    /// `tag_prewarm_queued` (idx セット) で二重 push を防ぎ、`last_enqueued_keep_range` で
+    /// スクロールが無いアイドルフレームを早期終了する。
     pub(crate) fn enqueue_visible_tag_prewarms(&mut self) {
         let Some(pending) = self.tag_prewarm_pending.as_ref() else {
             return;
@@ -6364,20 +6369,33 @@ impl App {
         if start >= end {
             return;
         }
+        // keep_range が前フレームから変わっていなければ走査不要。
+        // スクロールや visible_indices 変化で range が動いた時だけ再走する。
+        if self.last_enqueued_keep_range == (start, end) {
+            return;
+        }
+        self.last_enqueued_keep_range = (start, end);
         for idx in start..end {
+            // idx ベースで dedup: 処理済み idx は cache_key 文字列を組み立てずスキップ。
+            if self.tag_prewarm_queued.contains(&idx) {
+                continue;
+            }
             let Some(GridItem::Image(p)) = self.items.get(idx) else {
+                // 非 Image (Folder/Zip/Pdf/Video) もキャッシュ対象外。idx を記録して再走回避。
+                self.tag_prewarm_queued.insert(idx);
                 continue;
             };
             if !crate::xmp_writer::is_writable_format(p) {
+                self.tag_prewarm_queued.insert(idx);
                 continue;
             }
             let cache_key = crate::adjustment_db::normalize_path(p);
+            // fts_meta / 書き込み worker で既に埋まっていれば push 不要だが idx は処理済み扱い。
             if self.tags_cache.contains_key(&cache_key) {
-                continue; // 既に fts_meta / 書き込み worker / 前回プリフェッチで取得済み
+                self.tag_prewarm_queued.insert(idx);
+                continue;
             }
-            if !self.tag_prewarm_queued.insert(cache_key.clone()) {
-                continue; // 既に push 済み (worker で処理中 or 未処理)
-            }
+            self.tag_prewarm_queued.insert(idx);
             pending.push_job(p.clone(), cache_key);
         }
     }

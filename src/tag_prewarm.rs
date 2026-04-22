@@ -10,13 +10,12 @@
 //! `entry().or_insert()` で行うので、タグ書き込み worker が先に載せた最新状態を
 //! stale XMP で踏まないようになっている (書き込み worker → cache 先着 → 背景 XMP 後着)。
 //!
-//! # インクリメンタル投入 (v0.8: P2 対応)
+//! # インクリメンタル投入
 //!
-//! 以前はフォルダ展開時に全 Image を一括で `spawn(requests)` に渡していたが、
-//! 数千枚フォルダで XMP 全読みが発生して thumbnail I/O を圧迫する問題があった。
-//! 現在は `spawn()` で空キューの worker を起動し、UI が毎フレーム
+//! `spawn()` は空キューで worker を起動し、UI が毎フレーム
 //! `App::enqueue_visible_tag_prewarms` から `keep_range` (可視範囲 + prev/next ページ)
-//! 分だけを `push_job` でキューに積む。スクロールに追従して必要な分だけ読む。
+//! 分だけを `push_job` でキューに積む。スクロールに追従して必要な分だけ読むため、
+//! 大規模フォルダで全 XMP を舐める暴走を避ける。
 //!
 //! # キャンセル
 //!
@@ -33,9 +32,10 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
 
 /// バックグラウンド XMP プリフェッチのハンドル。`job_tx` は UI が新規ジョブを push する
-/// ための送信端。`result_rx` は worker が XMP 読みの結果を返す経路。
+/// ための送信端。`rx` は worker が XMP 読みの結果を返す経路 (`App::poll_tag_prewarm_results`
+/// が drain する)。
 pub(crate) struct TagPrewarmPending {
-    pub cancel: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     job_tx: CbSender<PrewarmJob>,
     pub rx: mpsc::Receiver<TagPrewarmResult>,
 }
