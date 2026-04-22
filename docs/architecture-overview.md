@@ -98,8 +98,6 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `adjustment_db.rs` | フォルダ別プリセット・ページ別プリセットの SQLite 永続化 |
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
-| `search_index_db.rs` | お気に入り配下のフォルダ/ZIP/PDF 名索引 (検索インデックス) |
-| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / NOT / `"..."` フレーズ)。Ctrl+F / Ctrl+S で共用 |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮) |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
 | `ai/` | ONNX Runtime (DirectML) によるアップスケール / デノイズ / Inpainting / 画像種別分類 |
@@ -117,6 +115,33 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_erase.rs` | 消しゴムモード (Lasso/縦線/横線/ブラシ → MI-GAN で inpaint) |
 | `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
+
+### 検索 / インデクサ / タグ
+
+**全体像は [search-architecture.md](search-architecture.md) を参照**。
+
+| モジュール | 役割 |
+| --- | --- |
+| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。3 モード共通 |
+| `search_norm.rs` | `normalize_for_match` — ingest / クエリ / post-filter で共有する唯一の正規化関数 (lowercase) |
+| `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF 名) |
+| `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |
+| `fts_meta.rs` | `fts_meta.db` (SQLite) ラッパ。ファイル状態 + ソース別 normalized 全文 (post-filter 用) |
+| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / tags) のビルダー |
+| `ingest_worker.rs` | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 (二段整合性プロトコル) |
+| `indexer_manager.rs` | 全お気に入りの `SupervisorHandle` 統括。Ctrl+G ワーカー spawn、App drop 時の停止 |
+| `indexer_supervisor.rs` | メタ索引 supervisor (1 お気に入り 1 本)。初期スキャン + FsWatcher + ingest |
+| `indexer_progress.rs` | Supervisor → UI への進捗 `ProgressReporter` |
+| `search_walker.rs` | 起動時の再帰 walk + 3-way diff (FS と fts_meta.db の突き合わせ) |
+| `search_watcher.rs` | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce + rename 正規化 |
+| `name_index_supervisor.rs` | Ctrl+S 用 名前索引 supervisor (初期バルク + notify-rs 追従) |
+| `name_bulk_indexer.rs` | Ctrl+S 初期バルクスキャンの本体 |
+| `global_search.rs` | Ctrl+G streaming クエリワーカー (Searcher snapshot 固定 + ページング post-filter) |
+| `global_search_ui.rs` | Ctrl+G 検索バー + drill-down ビュー + Aggregated / DrilledInto 集約 |
+| `io_semaphore.rs` | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 (Low/Normal/High) |
+| `tag_ops.rs` | `#タグ` 要素の Bag 操作ヘルパ (add / remove / clear-hash-prefixed) |
+| `tag_write_worker.rs` | UI → XMP 書き込み worker。書込み成功後に共有 `IndexWriter` 経由で即時 Tantivy 反映 |
+| `xmp_writer.rs` | 既存メタを保持したままの `dc:subject` atomic 書換 (JPEG / PNG / WebP) |
 
 ### その他
 
@@ -165,11 +190,13 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 | ファイル | 内容 | 書き込むモジュール |
 | --- | --- | --- |
-| `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り | `settings.rs` |
+| `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`) | `settings.rs` |
 | `catalog.db` | サムネイル WebP キャッシュ (BLOB) + メタデータ | `catalog.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録) | `rating_db.rs` |
-| `search_index.db` | お気に入り配下のフォルダ/ZIP/PDF 名索引 | `search_index_db.rs` |
+| `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF 名索引 | `search_index_db.rs` |
+| `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み | `fts_index.rs` → `ingest_worker.rs` / `tag_write_worker.rs` |
+| `fts_meta.db` | ファイル管理状態 + ソース別 normalized 全文 (post-filter 用) | `fts_meta.rs` |
 | `adjustment.db` | フォルダ別プリセット 4 種 + ページ別プリセット割当 | `adjustment_db.rs` |
 | `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel) | `mask_db.rs` |
 | `spread.db` | フォルダ別見開きモード | `spread_db.rs` |
@@ -207,6 +234,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー構成の一覧 |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像パスと分岐する箇所のチェックリスト** |
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。無効化ルールの早見表 |
+| [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグ関連を触るとき。**Ctrl+S/F/G の経路とインデクサパイプラインの全体像** |
 | [spec.md](spec.md) | 機能仕様・設定項目の正式な定義 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の詳細設計 |
 | [thumbnail-memory-redesign.md](thumbnail-memory-redesign.md) | サムネイルメモリ管理の背景経緯 |

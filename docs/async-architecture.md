@@ -19,6 +19,13 @@
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
+| メタ索引 supervisor (Ctrl+F/G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
+| メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + fts_meta 状態遷移 |
+| メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
+| メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
+| 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
+| Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング + `fts_meta.db` post-filter + streaming 送信 |
+| タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Clear を serial に XMP 書込 → `fts_meta.set_tags` → 共有 writer で Tantivy upsert → 32 件 or 500ms でバッチ commit |
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
 
@@ -36,6 +43,9 @@
 | `visible_end_shared` | `Arc<AtomicUsize>` | UI | サムネワーカー | 可視範囲の終端 (exclusive)。先読み forward 側の距離計算に使用 |
 | `display_px_shared` | `Arc<AtomicU32>` | UI (設定変更) | サムネワーカー | 生成時の目標ピクセル数 |
 | `cache_gen_done` | `Arc<AtomicUsize>` | キャッシュ生成 rayon | UI | 進捗カウンタ |
+| `SupervisorHandle.cancel` | `Arc<AtomicBool>` | UI (お気に入り OFF, App drop) | メタ / 名前索引 supervisor | supervisor 全体の停止シグナル |
+| `GlobalSearchHandle.cancel` | `Arc<AtomicBool>` | UI (クエリ変更, バー閉じ, folder 遷移, Handle drop) | Ctrl+G クエリワーカー | Tantivy ページングループの中断 |
+| `tag_write_worker.cancel` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループ + commit の中断 |
 
 **ルール**: アトミックは単発の値伝搬にのみ使う。リスト/辞書の共有は `Arc<Mutex<...>>` か mpsc。
 
@@ -48,6 +58,10 @@
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | `(pages, password_needed)` |
 | PDF ワーカー stdin/stdout | UI プロセス ↔ PDF ワーカープロセス | 長さプレフィクス付きバイナリプロトコル (Enumerate / Render / Shutdown) |
+| Ctrl+G `SearchStreamEvent` | Ctrl+G ワーカー → UI | `Batch { hits, scanned_candidates, valid_hits }` / `Done { truncated, reason }` / `Error`。毎フレーム `try_recv` を MAX_EVENTS_PER_FRAME=8 までループ消費 |
+| `DebouncedChange` (notify-rs) | FsWatcher → supervisor | 500ms ウィンドウで集約した変更イベント (`favorite_id`, `path`, `ChangeKind`) |
+| `SupervisorCommand` | UI (`IndexerManager`) → supervisor | 一時停止 / 再開 / フル再スキャン要求 |
+| `IndexerManager.writer` | 全書き込み経路で共有 | `Arc<Mutex<IndexWriter>>` — Tantivy は Index あたり writer 1 本制約。ingest worker と tag_write_worker が Mutex 越しに直列化する |
 
 ### 2.3 ワーカーキュー
 
@@ -63,6 +77,26 @@
 で、同距離では forward (次ページ方向) が先。これは `fs_cache` 先読み / AI アップスケール先読み /
 サムネイルグリッドワーカーの全てで統一されており、`+1, -1, +2, -2, ...` の順 (forward 先) となる
 (共通ヘルパ: `interleaved_prefetch_targets`)。
+
+### 2.4 GlobalIoSemaphore (I/O 横断調停)
+
+`src/io_semaphore.rs`。PDF ワーカー (3 プロセス) / サムネイル背景ジョブ /
+インデクサ (walker + ingest) が同時に HDD をシークすると UI スクロールがつまる。
+これを防ぐため、**全ワーカー横断で同時 I/O 数を優先度付きで制限する**。
+
+| 優先度 | 用途 |
+| --- | --- |
+| `High` | UI が今見ているフォルダ / ページ (UI 経路、PDF critical) |
+| `Normal` | PDF 背景レンダ、通常サムネイル |
+| `Low` | インデクサ (メタ / 名前、速度プロファイルで 1 / 2 / 4 permit) |
+
+実装は `Mutex + Condvar` で自前 (`try_lock + sleep` 禁止、§5.5 参照)。permit の
+drop で自動 release + `notify_all` で起床。spurious wakeup 耐性のため条件は
+`while` ループで再確認。
+
+**飢餓ポリシー (明示)**: High が連続投入される間 Low は無制限に待つ。これは
+UI 応答性最優先という方針の意図的な選択。アイドル 数秒で High キューが空き、
+Low が進む。不足する場面は「AC 電源時のみインデックス」等の別機構で制御する。
 
 ---
 
@@ -216,6 +250,20 @@ cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未�
 (ZIP 取り出し・PDFium レンダ等) を二重に走らせる。第 2 シグナルで cache save 完了後に
 初めて `requested` を抜くことで、cache save 中の再エンキューは `requested.contains_key=true`
 で弾かれる。
+
+### 3.4.1 検索系のキャンセル規約
+
+| ワーカー | 発火元 | シグナル |
+| --- | --- | --- |
+| Ctrl+G クエリワーカー (`global_search::run`) | クエリ変更 / フィルタ変更 / バー閉じ / folder 遷移 / `GlobalSearchHandle` drop | `Arc<AtomicBool>` を Tantivy ページングループ頭と post-filter ループ頭で check |
+| IndexerSupervisor (メタ / 名前) | `IndexerManager::sync_with_favorites` で OFF 化、App drop | `SupervisorHandle::stop()` → cancel + FsWatcher drop + thread join (最大 ~250ms) |
+| walker / ingest (supervisor 内部) | supervisor cancel | 各ループ checkpoint で `Ordering::Relaxed` read。大ファイル走査中も数百 ms 以内に抜ける |
+| tag_write_worker | App drop | `None` 送信 + cancel フラグ。commit 後のループ先頭で check |
+
+**Tantivy writer 共有ルール**: `IndexerManager.writer: Arc<Mutex<IndexWriter>>` を
+ingest worker と tag_write_worker が共有する。独自に `fts.writer()` を呼ぶと
+`LockBusy` で **全 upsert が無効化される**。新しい書き込み経路を足すなら必ず
+共有 writer を使う。
 
 ### 3.5 新ワーカー追加時のテンプレ
 

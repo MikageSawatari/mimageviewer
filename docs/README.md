@@ -14,6 +14,7 @@
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
+| [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
 
 ## 仕様・機能
 
@@ -35,9 +36,9 @@
 | [bench-scroll-report.md](bench-scroll-report.md) | スクロール性能ベンチマーク結果 |
 | [perf-investigation-handoff.md](perf-investigation-handoff.md) | パフォーマンス調査の進行中メモ (AI アップスケール優先度 / スクロール中の重複エンキュー抑制) |
 | [plan-v0.7.0.md](plan-v0.7.0.md) | v0.7.0 実装計画 + 完了ステータス + リリース直前チェックリスト |
-| [search-expansion-design.md](search-expansion-design.md) | 検索機能拡充 (Ctrl+G グローバルメタ検索 + 自動インデックス) の設計ドキュメント (v0.8.0 予定) |
-| [search-bench-results.md](search-bench-results.md) | Tantivy + bigram プロトタイプ計測結果 (§15.1.1) |
-| [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 + rename バグ記録 |
+| [search-expansion-design.md](search-expansion-design.md) | 検索システムの仕様選択理由と詳細設計 (Tantivy スキーマ・二段整合性・ZIP ingest 負荷制御・UI drill-down・streaming プロトコル) |
+| [search-bench-results.md](search-bench-results.md) | Tantivy + bigram プロトタイプ計測結果 (50 万件規模まで) |
+| [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 |
 | [tag-feature.md](tag-feature.md) | ハッシュタグ型タグ機能 (`dc:subject` に `#タグ` 書き込み + Ctrl+G 連携) の設計ドキュメント |
 
 ---
