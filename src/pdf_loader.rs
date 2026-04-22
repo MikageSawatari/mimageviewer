@@ -1689,18 +1689,71 @@ pub fn render_page_async(
     (cancel, rx)
 }
 
+/// UI ナビゲーション経路の PDF ページ列挙。
+///
+/// **2026-04 設計** (Codex P2 レビュー反映):
+///
+/// Ctrl+↑↓ で PDF を高速連打したときの grid 更新頻度を上げるため、以下の 3 点を組み合わせる:
+///
+/// 1. **multi-process pool を使う** (3 並列、in-process worker は 1 並列)
+///    - `enumerate_pages_async` は以前 in-process single-thread の `WORKER` に投げていた
+///    - pool が利用可能なら `pool.execute(.., Critical)` に寄せる (並列度 3 倍)
+///    - pool 不在のフォールバックは従来通り in-process worker + epoch skip
+///
+/// 2. **cancel token をジョブに添える**
+///    - 旧 `pdf_enumerate_pending` を drop するだけでは pool の IPC/PDFium 実行は
+///      キャンセルされず、古いジョブが PDFium 時間を消費してキューが詰まる
+///    - cancel を渡せば pool dispatcher が pop 時に IPC 前に捨てる
+///    - 呼び出し側 (App) は旧 cancel を `store(true)` してから新しい要求を出す
+///
+/// 3. **`JobPriority::Critical` で submit**
+///    - ナビ enumerate はサムネ生成等の Normal ジョブを押しのけて先に処理される
+///    - 連打中にキャッシュ作成の enumerate (Normal) が詰まっていても UI ナビは遅延しない
+///
+/// 戻り値は `(cancel, rx)` のタプル。呼び出し側は cancel を保管し、次の nav の前に
+/// `cancel.store(true, Ordering::Relaxed)` すると in-flight job が pool dispatcher 段階で
+/// 捨てられる (IPC + PDFium 実行時間をスキップ)。
+///
+/// In-process fallback は `LATEST_ENUMERATE_EPOCH` と組み合わせて stale skip する
+/// (pool 不在の環境でも連打黒画面の抑止を維持)。
 pub fn enumerate_pages_async(
     pdf_path: &Path,
     password: Option<&str>,
-) -> mpsc::Receiver<std::io::Result<Vec<PdfPageEntry>>> {
+) -> (Arc<AtomicBool>, mpsc::Receiver<std::io::Result<Vec<PdfPageEntry>>>) {
+    let cancel = Arc::new(AtomicBool::new(false));
     if crate::perf::is_enabled() {
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
         crate::perf::event("pdf", "enumerate_send", Some(&perf_key), 0, &[]);
     }
-    // バグ修正 (2026-04): Ctrl+↑↓ 連打で PDF が連続した場合、古い enumerate 要求が
-    // キューに溜まって最新のものが処理されるまで最大 10 秒超の黒画面になる。
-    // epoch を採番して worker に渡し、worker は pick up 時点で最新 epoch 未満なら即 skip する。
-    // UI ナビゲーション経路なので `Some(epoch)` で渡す (同期経路の `enumerate_pages` は None)。
+
+    let pool = get_pool();
+    if pool.worker_count > 0 {
+        // 別スレッドで pool.execute を呼ぶ (pool.execute は内部で reply_rx を待つため
+        // ブロッキング; UI は即 rx を受け取って pending に入れたい)。
+        // thread 寿命は「dispatcher が job を pop して cancel 検出で早期 reply」
+        // までなので、通常 0〜数 ms。連打で 30/sec spawn しても問題ない。
+        let (tx, rx) = mpsc::channel();
+        let req = encode_enumerate_request(pdf_path, password);
+        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+        let cancel_w = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("pdf-enumerate-nav".into())
+            .spawn(move || {
+                let resp = pool.execute(
+                    &req,
+                    Some(&cancel_w),
+                    JobPriority::Critical,
+                    Some(perf_key),
+                );
+                let result = resp.and_then(|bytes| PdfWorkerPool::parse_enumerate_response(&bytes));
+                let _ = tx.send(result);
+            })
+            .ok();
+        return (cancel, rx);
+    }
+
+    // Pool 不在: in-process worker + epoch skip の旧経路。
+    // (テスト環境など PDF ワーカーが起動できない場合のフォールバック)
     let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
@@ -1709,7 +1762,7 @@ pub fn enumerate_pages_async(
         reply: tx,
         epoch: Some(epoch),
     });
-    rx
+    (cancel, rx)
 }
 
 pub fn check_password_async(pdf_path: &Path) -> mpsc::Receiver<PdfAccessStatus> {

@@ -1438,10 +1438,16 @@ pub struct App {
     /// PDF レンダリング完了時に content_type を受け取るチャネル
     pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
     pub(crate) pdf_content_type_rx: mpsc::Receiver<(usize, crate::pdf_loader::PdfPageContentType)>,
-    /// ページ列挙の非同期応答待ち: (pdf_path, password, receiver)
+    /// ページ列挙の非同期応答待ち: (pdf_path, password, cancel, receiver)。
+    ///
+    /// `cancel` は旧要求を pool dispatcher 段階で早期 skip させるためのトークン。
+    /// 新しい `load_pdf_as_folder` が入ったとき、前の pending の cancel を `true` に
+    /// してから置き換えると、pool は in-flight の古い enumerate ジョブを IPC/PDFium
+    /// 実行する前に捨てる (Codex P2 レビュー対応, 2026-04)。
     pub(crate) pdf_enumerate_pending: Option<(
         PathBuf,
         Option<String>,
+        Arc<AtomicBool>,
         mpsc::Receiver<std::io::Result<Vec<crate::pdf_loader::PdfPageEntry>>>,
     )>,
     /// Ctrl+↑↓ フォルダナビで非同期 PDF に着地したときに保存する方向フラグ。
@@ -2855,6 +2861,14 @@ impl App {
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
 
+        // ── 旧 enumerate ジョブを cancel (2026-04 Codex P2 対応) ──
+        // 旧 pending を drop するだけでは pool 側の in-flight ジョブは PDFium を走らせ
+        // 切るまで止まらず、連打時にキューが詰まる。新しい要求を出す前に旧 cancel を
+        // 立てれば、pool dispatcher は pop 時に IPC 前で捨てる。
+        if let Some((_, _, old_cancel, _)) = self.pdf_enumerate_pending.take() {
+            old_cancel.store(true, Ordering::Relaxed);
+        }
+
         // ── パスワード確認 ──
         let password: Option<String> = self
             .pdf_passwords
@@ -2866,8 +2880,11 @@ impl App {
         // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
 
         // ── 非同期でページ列挙をリクエスト ──
-        let rx = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
-        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, rx));
+        // pool が利用可能なら Critical priority で multi-process 並列実行される。
+        // 返ってくる cancel トークンを pending に保存して、次の nav で `store(true)` する。
+        let (cancel, rx) =
+            crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
+        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, cancel, rx));
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
         self.address = pdf_path.to_string_lossy().to_string();
@@ -2880,9 +2897,18 @@ impl App {
     /// PDF ページ列挙の非同期応答をポーリングする。
     /// 毎フレーム `update()` から呼び出す。
     pub(crate) fn poll_pdf_enumerate(&mut self) {
-        let Some((ref pdf_path, _, ref rx)) = self.pdf_enumerate_pending else {
+        let Some((ref pdf_path, _, ref cancel, ref rx)) = self.pdf_enumerate_pending else {
             return;
         };
+
+        // Generation guard (Codex P2 レビュー): cancel が立っている pending の結果は破棄。
+        // 通常は load_pdf_as_folder で旧 pending を `take()` してから新規に差し替えるので
+        // ここに来ることは稀だが、cancel を立てたあと何らかの事情で pending を再使用した
+        // ケース (将来の修正で) でも古い結果を適用しないための念押し。
+        if cancel.load(Ordering::Relaxed) {
+            self.pdf_enumerate_pending = None;
+            return;
+        }
 
         let result = match rx.try_recv() {
             Ok(r) => r,
@@ -2904,7 +2930,19 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _) = self.pdf_enumerate_pending.take().unwrap();
+        let (pdf_path, password, _cancel, _) = self.pdf_enumerate_pending.take().unwrap();
+
+        // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
+        // (pool dispatcher が cancel を見て IPC 前に Err で返してくるパス)
+        if let Err(ref e) = result {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                crate::logger::log(format!(
+                    "  pdf enumerate: cancelled result dropped for {}",
+                    pdf_path.display()
+                ));
+                return;
+            }
+        }
 
         match result {
             Ok(pages) => {
