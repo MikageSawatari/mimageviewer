@@ -374,7 +374,7 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 | ショートカット | 対象 | 検索経路 | 備考 |
 |---|---|---|---|
 | Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF 名 | `search_index.db` (SQLite LIKE) | 既存実装を継続 |
-| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | `fts_meta.db` 直接 lookup (fast path) → 未登録 path はオンデマンド (PNG tEXt + EXIF + XMP) fallback | ZIP 展開中は ZIP 内エントリ画像も対象、PDF はメタ対象外 |
+| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | `fts_meta.db` 直接 lookup (fast path) → 未登録 path はオンデマンド (PNG tEXt + EXIF + XMP) fallback | ZIP 展開中は ZIP 内エントリ画像も対象。PDF は `fts_meta` 登録済みなら PDF メタ情報 (タイトル/著者/件名/キーワード) で絞り込み、未登録 PDF はナビ用途として常に残す |
 | Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → `fts_meta.db` で all_text_norm 一括取得 → `matches()` で phrase/NOT/AND 正確判定 (streaming) | v0.8.0 は **通常ファイル (画像) + ZIP ファイル名 + PDF document info** が対象。ZIP 内エントリのメタ展開は v0.8.x 以降に予定 |
 
 #### AI メタデータ検索の Negative Prompt 除外

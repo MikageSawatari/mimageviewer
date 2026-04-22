@@ -268,9 +268,11 @@ fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason
     if !tokens.iter().any(|t| t.include) {
         return Err(RejectReason::NotOnly);
     }
-    // タグトークンは最小長チェックの対象外 (exact match なので 1 文字でも OK)。
+    // タグトークンは最小長チェックの対象外 — `#a` のような 1 文字タグ名でも
+    // bigram (`#a` 自体) が 1 つだけ生成されて Tantivy で引け、post-filter も
+    // substring 一致で通る。`#` プレフィックス込みなので最低 2 文字は確保される。
     // 通常キーワードの include トークンのみ §4.3 の最小長 (CJK: 2 / ASCII: 3) を確認。
-    for t in tokens.iter().filter(|t| t.include) {
+    for t in tokens.iter().filter(|t| t.include && !t.is_tag) {
         if !has_sufficient_length(&t.needle) {
             return Err(RejectReason::TooShort);
         }
@@ -607,6 +609,61 @@ mod tests {
         let (hits, reason, _) = collect_events("sd ai", &[fav], &fts, &meta);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+    }
+
+    #[test]
+    fn short_tag_token_passes_min_length() {
+        // 1 文字タグ名 `#a` (合計 2 文字) は通常の ASCII 3 文字制約から免除される。
+        // ドキュメント (search.html §4) と整合させるため、tag トークンは常に通す。
+        let (_tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        // tags フィールドにだけ `#a` を入れる
+        let key = normalize_path(&PathBuf::from("c:/tag.jpg"));
+        let norms = PerSourceText {
+            name: crate::search_norm::normalize_for_match("tag.jpg"),
+            tags: "#a".to_string(),
+            ..PerSourceText::default()
+        };
+        meta.mark_pending(
+            &key,
+            fav,
+            &PathBuf::from("C:/"),
+            crate::fts_index::IndexKind::Image,
+            0,
+            0,
+            &norms,
+        )
+        .unwrap();
+        {
+            let mut w = fts.writer().unwrap();
+            crate::fts_index::upsert_doc(
+                &w,
+                fts.fields(),
+                &crate::fts_index::IndexDoc {
+                    path: key.clone(),
+                    container: crate::fts_index::Container::Fs,
+                    zip_entry: String::new(),
+                    favorite_id: fav,
+                    kind: crate::fts_index::IndexKind::Image,
+                    mtime: 0,
+                    file_size: 0,
+                    norms,
+                },
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        meta.mark_ok(&[key]).unwrap();
+        fts.reload_reader().unwrap();
+
+        // Codex P2 回帰: 旧実装は #a を ASCII 2 文字として TooShort 拒否していた
+        let (hits, reason, _) = collect_events("#a", &[fav], &fts, &meta);
+        assert_ne!(
+            reason,
+            DoneReason::RejectedQuery(RejectReason::TooShort),
+            "短いタグ名は最小長で弾かないこと"
+        );
+        assert_eq!(hits.len(), 1, "短い tag でもヒットすること");
     }
 
     #[test]
