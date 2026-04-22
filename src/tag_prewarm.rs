@@ -10,27 +10,33 @@
 //! `entry().or_insert()` で行うので、タグ書き込み worker が先に載せた最新状態を
 //! stale XMP で踏まないようになっている (書き込み worker → cache 先着 → 背景 XMP 後着)。
 //!
+//! # インクリメンタル投入 (v0.8: P2 対応)
+//!
+//! 以前はフォルダ展開時に全 Image を一括で `spawn(requests)` に渡していたが、
+//! 数千枚フォルダで XMP 全読みが発生して thumbnail I/O を圧迫する問題があった。
+//! 現在は `spawn()` で空キューの worker を起動し、UI が毎フレーム
+//! `App::enqueue_visible_tag_prewarms` から `keep_range` (可視範囲 + prev/next ページ)
+//! 分だけを `push_job` でキューに積む。スクロールに追従して必要な分だけ読む。
+//!
 //! # キャンセル
 //!
-//! - フォルダ切替や新しい `prewarm_grid_tags` 呼び出しで旧 pending は `cancel` される
-//!   (ループ内で毎回チェックし、送信前にも再チェック)。
-//! - UI 側が `pending = None` にすれば receiver が落ちて `tx.send` が Err になり、
-//!   スレッドは次の送信で自然終了する。
-//!
-//! # 順序
-//!
-//! `App::prewarm_grid_tags` は可視範囲を先頭に並べて渡すため、ユーザーに見えている
-//! バッジから順に埋まる。スクロール中に一部タグ未表示になっていても、
-//! 数フレーム後には反映される。
+//! - フォルダ切替で旧 pending が `take()` されて `cancel()` + drop される
+//!   (AtomicBool セット + job_tx 閉鎖 → worker が break)。
+//! - UI 側が `pending = None` にすれば job_tx も drop され、worker は自然終了する。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Duration;
 
-/// バックグラウンド XMP プリフェッチの状態。
+use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
+
+/// バックグラウンド XMP プリフェッチのハンドル。`job_tx` は UI が新規ジョブを push する
+/// ための送信端。`result_rx` は worker が XMP 読みの結果を返す経路。
 pub(crate) struct TagPrewarmPending {
     pub cancel: Arc<AtomicBool>,
+    job_tx: CbSender<PrewarmJob>,
     pub rx: mpsc::Receiver<TagPrewarmResult>,
 }
 
@@ -38,6 +44,17 @@ impl TagPrewarmPending {
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// ジョブを 1 件キューに追加する。worker が順に処理する。
+    /// 重複チェックは UI 側 (`tag_prewarm_queued` HashSet) で済ませる想定。
+    pub(crate) fn push_job(&self, path: PathBuf, cache_key: String) {
+        let _ = self.job_tx.send(PrewarmJob { path, cache_key });
+    }
+}
+
+struct PrewarmJob {
+    path: PathBuf,
+    cache_key: String,
 }
 
 /// 1 ファイル分のプリフェッチ結果。`cache_key` は `adjustment_db::normalize_path(path)` 相当
@@ -47,31 +64,56 @@ pub(crate) struct TagPrewarmResult {
     pub tags: Vec<String>,
 }
 
-/// worker を起動する。`requests` の各要素は `(読み取り対象パス, cache_key)` で、UI 側が
-/// `fts_meta` 未ヒットだった Image アイテムだけを並べて渡す (可視範囲を先頭にして
-/// ユーザーに近いファイルから処理する)。
-pub(crate) fn spawn(requests: Vec<(PathBuf, String)>) -> TagPrewarmPending {
+/// worker スレッドを起動する。フォルダ切替時に 1 回呼ぶ。
+/// ジョブは後から `push_job` で逐次投入する (初期キューは空)。
+pub(crate) fn spawn() -> TagPrewarmPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_w = Arc::clone(&cancel);
-    let (tx, rx) = mpsc::channel();
+    let (job_tx, job_rx) = unbounded::<PrewarmJob>();
+    let (result_tx, result_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("tag-prewarm".into())
-        .spawn(move || {
-            for (path, cache_key) in requests {
-                if cancel_w.load(Ordering::Relaxed) {
+        .spawn(move || run_worker(&job_rx, &result_tx, &cancel_w))
+        .ok();
+    TagPrewarmPending {
+        cancel,
+        job_tx,
+        rx: result_rx,
+    }
+}
+
+fn run_worker(
+    job_rx: &CbReceiver<PrewarmJob>,
+    result_tx: &mpsc::Sender<TagPrewarmResult>,
+    cancel: &AtomicBool,
+) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match job_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(job) => {
+                if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let tags = crate::xmp_reader::read_dc_subject(&path);
-                if cancel_w.load(Ordering::Relaxed) {
+                let tags = crate::xmp_reader::read_dc_subject(&job.path);
+                if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                if tx.send(TagPrewarmResult { cache_key, tags }).is_err() {
-                    break; // UI 側が pending を drop した → receiver 閉鎖
+                if result_tx
+                    .send(TagPrewarmResult {
+                        cache_key: job.cache_key,
+                        tags,
+                    })
+                    .is_err()
+                {
+                    break; // UI 側が rx を drop した
                 }
             }
-        })
-        .ok();
-    TagPrewarmPending { cancel, rx }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -79,12 +121,12 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// 存在しないパスを渡しても worker は空タグで結果を返し、エラーにならないこと。
+    /// 存在しないパスを push しても worker は空タグで結果を返し、エラーにならないこと。
     /// (read_dc_subject は read 失敗で Vec::new() を返す設計)
     #[test]
     fn returns_empty_tags_for_nonexistent_path() {
-        let requests = vec![(PathBuf::from("Z:/does/not/exist.jpg"), "key1".to_string())];
-        let pending = spawn(requests);
+        let pending = spawn();
+        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), "key1".to_string());
         let start = Instant::now();
         loop {
             match pending.rx.try_recv() {
@@ -104,17 +146,18 @@ mod tests {
         }
     }
 
-    /// cancel を立てれば worker は次ループで break し、受信できる結果が打ち切られる。
+    /// cancel を立てれば worker は次ループで break し、drop 後に受信は終わる。
     #[test]
     fn cancel_stops_worker_loop() {
-        let requests: Vec<(PathBuf, String)> = (0..1000)
-            .map(|i| (PathBuf::from(format!("Z:/nope/{i}.jpg")), format!("k{i}")))
-            .collect();
-        let pending = spawn(requests);
+        let pending = spawn();
+        for i in 0..1000 {
+            pending.push_job(
+                PathBuf::from(format!("Z:/nope/{i}.jpg")),
+                format!("k{i}"),
+            );
+        }
         pending.cancel();
-        // drop 後に worker がすぐ break することを確認 (send が receiver 閉鎖で Err)。
         drop(pending);
-        // 同スレッドで sleep しても検証にならない — worker は detach 済みなので
-        // ここではパニックしなければ OK とする (cancel set + rx drop の両方が break 条件)。
+        // パニックせず到達すれば OK (worker は cancel set + rx/job drop で break する)。
     }
 }
