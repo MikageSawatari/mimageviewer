@@ -1118,6 +1118,10 @@ pub struct App {
     /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
     pub(crate) xmp_cache:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
+    /// メタデータパネルのタグボタン状態表示で使用。タグ書き込み worker の完了時に
+    /// エントリを invalidate (削除) し、次回描画で再取得する。
+    pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -1617,6 +1621,7 @@ impl Default for App {
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
+            tags_cache: std::collections::HashMap::new(),
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -2931,6 +2936,7 @@ impl App {
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
+        self.tags_cache.clear();
         self.checked.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();

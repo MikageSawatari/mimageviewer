@@ -158,17 +158,23 @@ impl App {
         let mut errors: Vec<(PathBuf, String)> = Vec::new();
         let mut done_count: usize = 0;
         let mut just_completed = false;
+        let mut success_paths: Vec<PathBuf> = Vec::new();
         if let Some(h) = self.tag_write_handle.as_ref() {
             while let Some(res) = h.try_recv_result() {
                 done_count += 1;
-                if let Err(e) = res.result {
-                    errors.push((res.path, e));
+                match res.result {
+                    Ok(_) => success_paths.push(res.path),
+                    Err(e) => errors.push((res.path, e)),
                 }
             }
             // 完了: busy → idle に変わった瞬間を検出して完了トースト
             if !h.is_busy() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 just_completed = true;
             }
+        }
+        // 成功分のタグキャッシュを invalidate → 次回メタデータパネル描画で再取得
+        for p in &success_paths {
+            self.invalidate_tags_cache_for_path(p);
         }
         if !errors.is_empty() {
             // 最大 3 件まで表示
