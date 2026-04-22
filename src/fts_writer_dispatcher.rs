@@ -43,27 +43,22 @@ pub enum WriterPriority {
 
 /// dispatcher が処理する 1 ジョブ。完了通知は `reply` 経由で同期的に返す。
 ///
-/// `Batch` で複数操作を 1 ジョブにまとめると、dispatcher 内で連続実行される (中断されない)。
-/// 大規模 ingest は `Batch` を sub-batch サイズ (100 件程度) で submit してください — そうすれば
-/// 各 sub-batch の境界で Interactive ジョブが割り込めます。
-pub enum WriterJob {
-    /// 1 件の upsert + 同期応答
+/// `Batch` で複数操作を 1 ジョブにまとめると dispatcher 内で連続実行される (中断されない)。
+/// 大規模 ingest は `Batch` を sub-batch サイズ (~100 件) で submit すること — そうすれば
+/// 各 sub-batch の境界で Interactive ジョブが割り込める。
+enum WriterJob {
     Upsert {
         doc: IndexDoc,
         reply: mpsc::Sender<tantivy::Result<()>>,
     },
-    /// 1 件の delete + 同期応答 (失敗しないので reply は単純な ack)
     Delete {
         path: String,
         reply: mpsc::Sender<()>,
     },
-    /// commit + (オプションで) reader reload + 同期応答
     Commit {
         reload: bool,
         reply: mpsc::Sender<tantivy::Result<()>>,
     },
-    /// 複数操作を atomic に一連で実行する (sub-batch 用)。
-    /// `commit_after = true` のときは末尾で commit + reload も行う。
     Batch {
         upserts: Vec<IndexDoc>,
         deletes: Vec<String>,
@@ -79,52 +74,42 @@ struct Queue {
     background: VecDeque<WriterJob>,
 }
 
+/// ログ prefix (検索しやすさのため固定文字列を一箇所に)。
+const LOG_PREFIX: &str = "[fts-dispatcher]";
+
 /// 単一ディスパッチャースレッド + 優先度キュー構造。`start` で起動し、Drop で停止する。
-/// 利用者は `submit_*` ヘルパ経由で同期的に処理を依頼する。
+/// 利用者は `upsert` / `delete` / `commit` / `batch` ヘルパ経由で同期的に処理を依頼する。
 pub struct FtsWriterDispatcher {
     queue: Arc<(Mutex<Queue>, Condvar)>,
-    /// `fts` は dispatcher 起動時に渡される (起動後は dispatcher スレッド内で `Arc<FtsIndex>` を
-    /// 直接持って reload を行う)。利用者が `clone_fts()` で参照したい場合の保険として保持する。
-    #[allow(dead_code)]
-    fts: Arc<FtsIndex>,
     shutdown: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl FtsWriterDispatcher {
     /// dispatcher を起動する。`writer` の所有権を dispatcher スレッドに渡す。
-    /// `fts` は commit 後の reader reload で使う。
+    /// `fts` は commit 後の reader reload で使う (dispatcher スレッド内に move される)。
     pub fn start(writer: IndexWriter, fts: Arc<FtsIndex>) -> Arc<Self> {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let q_clone = Arc::clone(&queue);
-        let fts_clone = Arc::clone(&fts);
         let sd_clone = Arc::clone(&shutdown);
         let thread = std::thread::Builder::new()
             .name("fts-writer-dispatcher".into())
-            .spawn(move || run_dispatcher(q_clone, writer, fts_clone, sd_clone))
+            .spawn(move || run_dispatcher(q_clone, writer, fts, sd_clone))
             .expect("fts-writer-dispatcher spawn");
         Arc::new(Self {
             queue,
-            fts,
             shutdown,
             thread: Mutex::new(Some(thread)),
         })
     }
 
-    /// 1 件 upsert を依頼して完了を待つ。エラーは Tantivy の Result を伝搬。
+    /// 1 件 upsert を依頼して完了を待つ。
     pub fn upsert(&self, doc: IndexDoc, priority: WriterPriority) -> tantivy::Result<()> {
-        let (tx, rx) = mpsc::channel();
-        self.submit(WriterJob::Upsert { doc, reply: tx }, priority);
-        match rx.recv() {
-            Ok(r) => r,
-            Err(_) => Err(tantivy::TantivyError::SystemError(
-                "fts-writer-dispatcher: reply channel closed".into(),
-            )),
-        }
+        self.submit_with_reply(priority, |reply| WriterJob::Upsert { doc, reply })
     }
 
-    /// 1 件 delete を依頼して完了を待つ。
+    /// 1 件 delete を依頼して完了を待つ (delete は失敗しないので Result 不要)。
     pub fn delete(&self, path: String, priority: WriterPriority) {
         let (tx, rx) = mpsc::channel();
         self.submit(WriterJob::Delete { path, reply: tx }, priority);
@@ -133,20 +118,7 @@ impl FtsWriterDispatcher {
 
     /// commit を依頼して完了を待つ。`reload=true` なら成功時に reader reload も行う。
     pub fn commit(&self, reload: bool, priority: WriterPriority) -> tantivy::Result<()> {
-        let (tx, rx) = mpsc::channel();
-        self.submit(
-            WriterJob::Commit {
-                reload,
-                reply: tx,
-            },
-            priority,
-        );
-        match rx.recv() {
-            Ok(r) => r,
-            Err(_) => Err(tantivy::TantivyError::SystemError(
-                "fts-writer-dispatcher: reply channel closed".into(),
-            )),
-        }
+        self.submit_with_reply(priority, |reply| WriterJob::Commit { reload, reply })
     }
 
     /// upsert / delete を一括で送る (sub-batch)。`commit_after=true` で末尾 commit。
@@ -159,23 +131,28 @@ impl FtsWriterDispatcher {
         reload_after_commit: bool,
         priority: WriterPriority,
     ) -> tantivy::Result<()> {
+        self.submit_with_reply(priority, |reply| WriterJob::Batch {
+            upserts,
+            deletes,
+            commit_after,
+            reload_after_commit,
+            reply,
+        })
+    }
+
+    /// `tantivy::Result` を返す系ジョブ (Upsert / Commit / Batch) の共通実装。
+    /// channel 切断は同じ SystemError にマップする。
+    fn submit_with_reply<F>(&self, priority: WriterPriority, build: F) -> tantivy::Result<()>
+    where
+        F: FnOnce(mpsc::Sender<tantivy::Result<()>>) -> WriterJob,
+    {
         let (tx, rx) = mpsc::channel();
-        self.submit(
-            WriterJob::Batch {
-                upserts,
-                deletes,
-                commit_after,
-                reload_after_commit,
-                reply: tx,
-            },
-            priority,
-        );
-        match rx.recv() {
-            Ok(r) => r,
-            Err(_) => Err(tantivy::TantivyError::SystemError(
-                "fts-writer-dispatcher: reply channel closed".into(),
-            )),
-        }
+        self.submit(build(tx), priority);
+        rx.recv().unwrap_or_else(|_| {
+            Err(tantivy::TantivyError::SystemError(
+                format!("{LOG_PREFIX} reply channel closed"),
+            ))
+        })
     }
 
     fn submit(&self, job: WriterJob, priority: WriterPriority) {
@@ -216,7 +193,7 @@ fn run_dispatcher(
     fts: Arc<FtsIndex>,
     shutdown: Arc<AtomicBool>,
 ) {
-    crate::logger::log("[fts-dispatcher] started".to_string());
+    crate::logger::log(format!("{LOG_PREFIX} started"));
     loop {
         let job = {
             let (mtx, cv) = &*queue;
@@ -226,7 +203,7 @@ fn run_dispatcher(
                     && q.interactive.is_empty()
                     && q.background.is_empty()
                 {
-                    crate::logger::log("[fts-dispatcher] shutdown clean".to_string());
+                    crate::logger::log(format!("{LOG_PREFIX} shutdown clean"));
                     return;
                 }
                 if let Some(j) = q.interactive.pop_front() {
@@ -256,7 +233,7 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
             let r = writer.commit();
             if r.is_ok() && reload {
                 if let Err(e) = fts.reload_reader() {
-                    crate::logger::log(format!("[fts-dispatcher] reload_reader: {e}"));
+                    crate::logger::log(format!("{LOG_PREFIX} reload_reader: {e}"));
                 }
             }
             let _ = reply.send(r.map(|_| ()));
@@ -292,7 +269,7 @@ fn process_batch(
         writer.commit()?;
         if reload_after_commit {
             if let Err(e) = fts.reload_reader() {
-                crate::logger::log(format!("[fts-dispatcher] reload_reader after batch: {e}"));
+                crate::logger::log(format!("{LOG_PREFIX} reload_reader after batch: {e}"));
             }
         }
     }

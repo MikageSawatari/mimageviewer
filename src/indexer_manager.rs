@@ -596,8 +596,9 @@ fn run_reconciliation_via_dispatcher(
     Ok(report)
 }
 
-/// 旧版: 直接 `IndexWriter` を受け取る reconciliation。テストや旧コール経路で使う。
-#[allow(dead_code)]
+/// 旧版: 直接 `IndexWriter` を受け取る reconciliation。dispatcher 化後はテスト
+/// (`spawn_reconciliation` + 単体テスト 3 件) でのみ使う。
+#[cfg(test)]
 fn run_reconciliation(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,
