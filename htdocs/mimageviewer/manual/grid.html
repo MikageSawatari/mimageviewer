@@ -118,7 +118,11 @@
       <li><strong>チェック（複数選択）：</strong><kbd>Ctrl</kbd>+クリック、または <kbd>Space</kbd> キーでチェックを ON/OFF。<kbd>Shift</kbd>+矢印キーで範囲チェック。</li>
     </ul>
     <p>チェックされたアイテムがある場合、ファイル操作（コピー・削除など）はチェック済みのすべてに適用されます。</p>
-    <p>複数アイテムをチェック中に右クリックすると、コンテキストメニューから「選択解除」で一括解除できます。</p>
+    <ul>
+      <li><kbd>Ctrl</kbd>+<kbd>A</kbd>: 表示中のすべてのアイテムをチェック</li>
+      <li><kbd>Ctrl</kbd>+<kbd>D</kbd>: チェックをすべて解除（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> でも可）</li>
+      <li>複数アイテムをチェック中に右クリック → コンテキストメニューの「選択解除 (Ctrl+D)」でも解除できます</li>
+    </ul>
 
     <h3>右クリックメニュー</h3>
     <p>サムネイルを右クリックするとコンテキストメニューが表示されます。</p>
@@ -189,7 +193,7 @@
     <div class="box info">
       <span class="box-icon">💡</span>
       <div class="box-body">
-        <strong>OR 検索 (v0.7.2+):</strong>
+        <strong>OR 検索:</strong>
         検索バー右端の <code>□OR</code> チェックを入れると、語をいずれか 1 つでも含めばヒット扱いになります
         (除外 <code>-word</code> は常に AND)。例: <code>klee #klee</code> でキーワード・タグどちらか片方で
         「klee」を含む画像を拾えます。

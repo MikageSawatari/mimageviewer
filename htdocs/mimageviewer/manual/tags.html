@@ -46,15 +46,14 @@
     <h1 class="page-title">タグ機能</h1>
     <p class="page-desc">
       画像に「#原神」「#風景」のような独自タグを付けて分類できる機能です。タグは XMP
-      <code>dc:subject</code> に書き込まれるので、Windows エクスプローラー・Lightroom・
-      Adobe Bridge 等の他ソフトとも互換性があります。
+      <code>dc:subject</code> に書き込まれるので、Adobe Lightroom・Bridge・ExifTool
+      など写真管理ソフトでも読み取れます。
     </p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        タグ機能は対応形式 (JPEG / PNG / WebP) の<strong>ファイル本体に XMP メタデータを書き込み</strong>ます。
-        書き込みはアトミック (一時ファイル → rename) なので途中で電源が落ちてもファイルは壊れませんが、
+        タグ機能は対応形式 (JPEG / PNG / WebP) の<strong>ファイル本体にメタデータを書き込み</strong>ます。
         初めて使うときは必ず<a href="#precautions">注意事項</a>を確認してください。
       </div>
     </div>
@@ -132,7 +131,7 @@
     <p>右側の情報パネル最上段に「タグ」セクションが出ます。付与済みのタグは
     <strong><code>#タグ名</code> が緑色</strong>で表示されます。クリックでトグル (付与 ⇔ 削除)。</p>
 
-    <h3>グリッドのタグバッジ (v0.7.2+)</h3>
+    <h3>グリッドのタグバッジ</h3>
     <p>サムネイル左上 (補正バッジ <code>補</code> / 消しゴムバッジ <code>消</code> の右隣) に、
     付与済みのタグが <code>#原神 #風景</code> のように緑色バッジで表示されます。幅に収まらない
     場合は末尾が <code>…</code> で省略されます。</p>
@@ -166,12 +165,17 @@
     <p>タグは XMP <code>dc:subject</code> 要素 (RDF Bag) として書き込みます。これは写真・DAM
     ソフトで広く採用されている標準フォーマットです:</p>
     <ul>
-      <li><strong>Windows エクスプローラー</strong>: ファイルプロパティの「タグ」欄に表示されます。</li>
-      <li><strong>Adobe Lightroom / Bridge</strong>: キーワードとして認識されます。</li>
-      <li><strong>ExifTool</strong>: <code>-XMP-dc:Subject</code> で読み取り可能。</li>
+      <li><strong>Adobe Lightroom / Bridge</strong>: キーワードとして認識されます (全形式)。</li>
+      <li><strong>ExifTool</strong>: <code>-XMP-dc:Subject</code> で読み取り可能 (全形式)。</li>
+      <li><strong>Windows エクスプローラー</strong>: JPEG の「タグ」欄には表示されます。
+          PNG / WebP は Explorer 側の仕様上、XMP タグが表示されません
+          (Lightroom 等では表示されます)。</li>
     </ul>
     <p>他ソフトで既に <code>dc:subject</code> にタグが入っていても、mImageViewer は
     <strong>既存要素を保持</strong>したまま <code>#タグ名</code> だけを追加します。</p>
+    <p>なお、JPEG のタグが Windows エクスプローラーに出てこない場合は、エクスプローラーの
+    キャッシュが古いままになっていることがあります。フォルダを開き直すか F5 で更新すると
+    反映されます。</p>
 
     <h2 id="precautions">7. 注意事項</h2>
 
@@ -179,9 +183,8 @@
       <span class="box-icon">⚠️</span>
       <div class="box-body">
         <strong>ファイル本体を書き換えます:</strong>
-        タグ付与はファイル内の XMP パケットを書き換える操作です。万一書き込みに失敗した場合に備えて、
-        重要なファイルはあらかじめバックアップを取っておくことをおすすめします。アトミック rename で
-        中途半端な書き込みは発生しませんが、書き込み前の mtime は変化します。
+        タグ付与はファイルのメタデータを書き換える操作です。万一書き込みに失敗した場合に備えて、
+        重要なファイルはあらかじめバックアップを取っておくことをおすすめします。
       </div>
     </div>
 
@@ -194,7 +197,7 @@
         <tr><td>JPEG (.jpg / .jpeg)</td><td>◯</td><td>◯</td></tr>
         <tr><td>PNG</td><td>◯</td><td>◯</td></tr>
         <tr><td>WebP</td><td>◯</td><td>◯</td></tr>
-        <tr><td>HEIC / HEIF</td><td>◯</td><td>✗ (v1.0 非対応)</td></tr>
+        <tr><td>HEIC / HEIF</td><td>◯</td><td>✗</td></tr>
         <tr><td>TIFF / GIF / BMP / JXL / AVIF / RAW</td><td>条件付</td><td>✗</td></tr>
         <tr><td>ZIP 内の画像</td><td>◯</td><td>✗</td></tr>
         <tr><td>PDF / 動画</td><td>✗</td><td>✗</td></tr>
