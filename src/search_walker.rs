@@ -108,6 +108,8 @@ pub enum WalkerEvent {
 ///
 /// `io_sem` は read_dir 呼び出しの順番制御用。複数お気に入りを並列走査する場合は
 /// 同じセマフォを共有することでグローバル I/O 同時実行数を制御できる。
+/// `activity_gate` を渡すと、walker が各ディレクトリの `read_dir` 前にユーザー操作を待つ
+/// (2026-04 F: **Codex P2 対応**、walker phase も操作中停止の対象にする)。
 ///
 /// 呼び出し側は典型的に別スレッドで実行し、結果を mpsc で受け取る。
 pub fn scan(
@@ -115,6 +117,7 @@ pub fn scan(
     db: &FtsMetaDb,
     io_sem: &GlobalIoSemaphore,
     priority: IoPriority,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
 ) -> Result<ScanResult, String> {
     let ScanParams {
         favorite_id,
@@ -130,6 +133,7 @@ pub fn scan(
         &root,
         io_sem,
         priority,
+        activity_gate,
         &cancel,
         progress.as_ref(),
         &mut fs_map,
@@ -184,6 +188,7 @@ fn walk_dir_recursive(
     dir: &Path,
     io_sem: &GlobalIoSemaphore,
     priority: IoPriority,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &AtomicBool,
     progress: Option<&ProgressReporter>,
     out: &mut std::collections::HashMap<String, CandidateFile>,
@@ -198,6 +203,16 @@ fn walk_dir_recursive(
     if depth > MAX_DEPTH {
         diag.depth_limit_hits += 1;
         return Ok(());
+    }
+
+    // **Codex P2 対応 (2026-04)**: read_dir の前で ActivityGate を待つ。
+    // 1 ディレクトリ読みは通常 <10ms だが、HDD/NAS で数百ディレクトリ連続すると
+    // 操作中のサムネ I/O と競合する。ここで待てばユーザー操作中は walk が停止する。
+    if let Some(gate) = activity_gate {
+        gate.wait_until_idle(cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
     }
 
     // このディレクトリに入る時点で UI に通知 (1 ディレクトリ 1 回なので mutex 競合は軽微)
@@ -294,7 +309,15 @@ fn walk_dir_recursive(
             return Ok(());
         }
         walk_dir_recursive(
-            &sub, io_sem, priority, cancel, progress, out, diag, depth + 1,
+            &sub,
+            io_sem,
+            priority,
+            activity_gate,
+            cancel,
+            progress,
+            out,
+            diag,
+            depth + 1,
         )?;
     }
     Ok(())
@@ -347,6 +370,7 @@ mod tests {
             db,
             &sem,
             IoPriority::Normal,
+            None,
         )
         .unwrap()
     }
@@ -553,6 +577,7 @@ mod tests {
             &db,
             &sem,
             IoPriority::Normal,
+            None,
         )
         .unwrap();
         assert_eq!(r.total_scanned, 0);
@@ -583,6 +608,7 @@ mod tests {
             &db,
             &sem,
             IoPriority::Normal,
+            None,
         );
         // cancel 中は Err("cancelled") または 早期に空の ScanResult が返る
         assert!(r.is_err() || r.unwrap().total_scanned < 50);

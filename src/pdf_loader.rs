@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 /// PDF レンダ要求の優先度。
@@ -1204,6 +1204,9 @@ enum WorkerRequest {
         path: PathBuf,
         password: Option<String>,
         reply: mpsc::Sender<std::io::Result<Vec<PdfPageEntry>>>,
+        /// `LATEST_ENUMERATE_EPOCH` から採番した世代番号。ワーカーがピックアップ時に
+        /// 最新値と比較し、より新しい要求が既に来ていれば skip する。
+        epoch: u64,
     },
     CheckPassword {
         path: PathBuf,
@@ -1231,6 +1234,16 @@ struct PdfWorker {
 }
 
 static WORKER: OnceLock<PdfWorker> = OnceLock::new();
+
+/// Enumerate エポック。`enumerate_pages_async` が呼ばれるたびに +1 され、
+/// 要求に現在値を添付する。ワーカーが要求をピックアップした時点で `LATEST_ENUMERATE_EPOCH`
+/// より古いなら、ユーザーは既に別の PDF へ移動済みなので skip して次を処理する。
+///
+/// **バグ修正 (2026-04)**: Ctrl+↑↓ で PDF を連打すると enumerate 要求がキューに積まれ、
+/// ワーカー (pdfium はスレッドセーフ不可で 1 スレッド) が古い要求を律儀に処理し続けて
+/// 最新の PDF が開くまで 10 秒超の黒画面になる事故が発生していた。
+/// epoch 比較で stale 要求を即捨てれば、ユーザー視点では実質「最新の 1 件だけ」処理される。
+static LATEST_ENUMERATE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn get_worker() -> &'static PdfWorker {
     WORKER.get_or_init(|| PdfWorker::start())
@@ -1302,7 +1315,22 @@ impl PdfWorker {
                 path,
                 password,
                 reply,
+                epoch,
             } => {
+                // Stale な enumerate 要求は即捨てる。ユーザーが Ctrl+↑↓ 連打で複数 PDF を
+                // 通過した場合、古い要求を律儀に処理する必要はない (結果は誰も待っていない)。
+                let latest = LATEST_ENUMERATE_EPOCH.load(Ordering::SeqCst);
+                if epoch < latest {
+                    crate::logger::log(format!(
+                        "pdf-worker: skipping stale enumerate (epoch {epoch} < latest {latest}) for {}",
+                        path.display()
+                    ));
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "enumerate request superseded by newer navigation",
+                    )));
+                    return;
+                }
                 let _ = reply.send(core_enumerate(pdfium, &path, password.as_deref()));
             }
             WorkerRequest::CheckPassword { path, reply } => {
@@ -1506,10 +1534,12 @@ pub fn enumerate_pages(
     }
     // フォールバック: in-process ワーカー
     let (tx, rx) = mpsc::channel();
+    let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
         path: pdf_path.to_path_buf(),
         password: password.map(String::from),
         reply: tx,
+        epoch,
     });
     rx.recv()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
@@ -1655,11 +1685,16 @@ pub fn enumerate_pages_async(
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
         crate::perf::event("pdf", "enumerate_send", Some(&perf_key), 0, &[]);
     }
+    // バグ修正 (2026-04): Ctrl+↑↓ 連打で PDF が連続した場合、古い enumerate 要求が
+    // キューに溜まって最新のものが処理されるまで最大 10 秒超の黒画面になる。
+    // epoch を採番して worker に渡し、worker は pick up 時点で最新 epoch 未満なら即 skip する。
+    let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
         path: pdf_path.to_path_buf(),
         password: password.map(String::from),
         reply: tx,
+        epoch,
     });
     rx
 }

@@ -55,8 +55,14 @@ pub fn run_bulk_name_index(
     let scan_start_stamp = crate::search_index_db::next_write_stamp();
 
     // Pass 1: サブフォルダ列挙
+    // **Codex P2 対応 (2026-04)**: `on_visit` は各フォルダの `read_dir` 前に呼ばれるので、
+    // ここで ActivityGate を待てば再帰中でもユーザー操作中は列挙が停止する。
+    // (フォルダ単位の粒度なので、大きい favorite でもフォルダ 1 つ処理したら次で止まる)
     let mut found: Vec<PathBuf> = Vec::new();
     walk_dirs_recursive_with_progress(fav_path, &mut found, cancel, &mut |cur| {
+        if let Some(gate) = activity_gate {
+            gate.wait_until_idle(cancel);
+        }
         if let Some(p) = progress {
             let display = cur.strip_prefix(fav_path).unwrap_or(cur).display();
             p.set(format!("フォルダ列挙 {}", display));

@@ -405,6 +405,7 @@ fn run_initial_scan(
         session.meta_db,
         io_sem,
         IoPriority::Low,
+        session.activity_gate,
     ) {
         Ok(r) => r,
         Err(e) => {

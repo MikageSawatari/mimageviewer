@@ -7845,13 +7845,34 @@ impl App {
         }
 
         // Step 3: Slow-path (初回 / 外部変更された場合のみ)
-        // メモリにロード (既存なら再利用)
-        if !self.sidecars.contains_key(sidecar_folder) {
-            self.sidecars.insert(
-                sidecar_folder.to_path_buf(),
-                crate::sidecar::SidecarFile::load(sidecar_folder),
-            );
+        //
+        // **Codex P1 修正**: mtime が一致しないということは、ディスク上のサイドカーが
+        // 外部変更されている可能性がある。この場合、`self.sidecars` 内のメモリキャッシュは
+        // stale なので、使い続けてはいけない (古い内容を DB に書き戻し、新 mtime を記録すると
+        // 以降 fast-path で永久にスキップされて外部更新が反映されないというデータ取込漏れ
+        // バグになる)。
+        //
+        // 例外として、メモリキャッシュが `is_dirty()` (= アプリ内で未保存の編集がある)
+        // 場合は再ロードで edits を破壊してしまうので、slow-path を抜けて何もせず帰る。
+        // ここで `sidecar_sync_upsert` もスキップするので、次回ナビゲート時 (通常は
+        // `flush_idle_sidecars` で dirty が解消された後) に改めて判定される。
+        let cached_dirty = self
+            .sidecars
+            .get(sidecar_folder)
+            .map(|s| s.is_dirty())
+            .unwrap_or(false);
+        if cached_dirty {
+            crate::logger::log(format!(
+                "sidecar: slow-path hit but in-memory cache is dirty — skip reload (sync record not updated): {}",
+                sidecar_folder.display()
+            ));
+            return;
         }
+        // キャッシュを無効化して強制再ロード (外部変更されたサイドカーの新内容を取り込む)
+        self.sidecars.insert(
+            sidecar_folder.to_path_buf(),
+            crate::sidecar::SidecarFile::load(sidecar_folder),
+        );
         let Some(sidecar) = self.sidecars.get(sidecar_folder) else {
             return;
         };
