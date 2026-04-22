@@ -1128,6 +1128,13 @@ pub struct App {
     /// フルスクリーン用コンテキストメニューの表示座標
     pub(crate) fs_context_menu_pos: egui::Pos2,
 
+    // ── フルスクリーン 中ボタンドラッグズーム (v0.8.1) ─────────
+    /// 中ボタン (ホイール押し込み) ドラッグ中の状態。None ならドラッグしていない。
+    /// ドラッグ開始時に (pivot, start_zoom, start_pan, rect_center, is_analysis) を
+    /// スナップショットし、押している間は start 値からの差分でズームを計算する
+    /// (累積誤差防止 + pivot 位置が安定)。マウスを右手だけで拡大縮小する用途。
+    pub(crate) fs_middle_zoom_drag: Option<crate::ui_fullscreen::MiddleZoomDrag>,
+
     // ── 削除確認ダイアログ ───────────────────────────────────────
     pub(crate) show_delete_confirm: bool,
     /// 削除対象のファイルパスリスト
@@ -1698,6 +1705,7 @@ impl Default for App {
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
             fs_secondary_press_start: None,
+            fs_middle_zoom_drag: None,
             fs_context_menu_idx: None,
             fs_context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
@@ -7202,6 +7210,7 @@ impl App {
         self.fs_focus_regained_at = None;
         self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
+        self.fs_middle_zoom_drag = None;
         self.fs_context_menu_idx = None;
         self.reset_erase_mode();
         self.erase_base_cache.clear();

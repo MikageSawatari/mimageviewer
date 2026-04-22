@@ -20,6 +20,14 @@ const METADATA_PANEL_WIDTH: f32 = 380.0;
 const TOP_BAR_HEIGHT: f32 = 44.0;
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
+
+/// 中ボタンドラッグズーム: 縦 N px で倍率 2 倍/半分になる感度 (v0.8.1)。
+/// 100 px で 2 倍 (= 上へ 200 px で 4 倍)。ホイール 1 ノッチ ≈ 10% と比べて粗めだが、
+/// 縦フル (1080 px) ストロークすれば 2^10 ≈ 1000 倍まで届くので十分。
+const MIDDLE_DRAG_UNIT_PX: f32 = 100.0;
+/// 中ボタン押下から「ドラッグ開始」とみなす最小移動量。
+/// この距離以下ならズームは触らない (クリックのみとの区別 / 暴発防止)。
+const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 /// ズーム倍率の下限
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
@@ -225,6 +233,99 @@ impl App {
         }
     }
 
+    /// 中ボタンドラッグズームを処理する。
+    ///
+    /// ホイール押し込み + 上下ドラッグで fs_zoom / analysis_zoom を連続的に変える。
+    /// 分析モード中は analysis_zoom/pan、それ以外は fs_zoom/pan を書き換える
+    /// (どちらに書き込むかはドラッグ開始時点の `analysis_mode` で決まる)。
+    /// 戻り値は「このフレームで中ボタンがアクティブに使われていた」か。true なら
+    /// 呼び出し側はこの後の左クリック/右クリックの解釈をスキップしてよい。
+    fn handle_middle_drag_zoom(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
+        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
+            (
+                i.pointer.button_down(egui::PointerButton::Middle),
+                i.pointer.button_pressed(egui::PointerButton::Middle),
+                i.pointer.button_released(egui::PointerButton::Middle),
+                i.pointer.interact_pos(),
+            )
+        });
+
+        // 押下開始フレーム: 現在のズーム/パン/ピボットをスナップショット。
+        // 同フレームで既にドラッグ中なら無視 (重複開始を防ぐ)。
+        if is_pressed && self.fs_middle_zoom_drag.is_none() {
+            if let Some(pos) = current_pos {
+                // 分析モードでは画像エリアが右パネル分左にずれるので中心が違う
+                let rect_center = if self.analysis_mode {
+                    analysis_image_rect(full_rect).center()
+                } else {
+                    full_rect.center()
+                };
+                let (start_zoom, start_pan) = if self.analysis_mode {
+                    (self.analysis_zoom, self.analysis_pan)
+                } else {
+                    (self.fs_zoom, self.fs_pan)
+                };
+                self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
+                    pivot: pos,
+                    start_zoom,
+                    start_pan,
+                    rect_center,
+                    is_analysis: self.analysis_mode,
+                });
+            }
+        }
+
+        // ドラッグ中: 押しっぱなしの間、毎フレーム pivot からの差分で新しいズームを計算。
+        if is_down {
+            if let (Some(drag), Some(pos)) = (self.fs_middle_zoom_drag.clone(), current_pos) {
+                let dy = pos.y - drag.pivot.y;
+                if dy.abs() < MIDDLE_DRAG_THRESHOLD_PX {
+                    // しきい値以下: ズーム変更なし (クリック暴発防止)
+                    return true;
+                }
+                // 上方向 (dy < 0) で拡大、下方向で縮小
+                let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
+                let new_zoom = (drag.start_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+                // pivot 位置が画面上で動かないように pan を補正
+                // (apply_wheel_zoom と同じロジックだが、差分ではなく start 値基準で計算)
+                let ratio = new_zoom / drag.start_zoom;
+                let cx = drag.pivot.x - (drag.rect_center.x + drag.start_pan.x);
+                let cy = drag.pivot.y - (drag.rect_center.y + drag.start_pan.y);
+                let new_pan = egui::vec2(
+                    drag.start_pan.x + cx * (1.0 - ratio),
+                    drag.start_pan.y + cy * (1.0 - ratio),
+                );
+                // 書き戻し先はドラッグ開始時の is_analysis で固定
+                // (途中でモードが切り替わっても書き先がブレないように)
+                if drag.is_analysis {
+                    self.analysis_zoom = new_zoom;
+                    self.analysis_pan = new_pan;
+                } else {
+                    self.fs_zoom = new_zoom;
+                    self.fs_pan = new_pan;
+                }
+                return true;
+            }
+        }
+
+        // リリース: PDF のときだけ新倍率で再レンダリング要求 (ドラッグ中は発行しない)。
+        if is_released {
+            if let Some(drag) = self.fs_middle_zoom_drag.take() {
+                let final_zoom = if drag.is_analysis {
+                    self.analysis_zoom
+                } else {
+                    self.fs_zoom
+                };
+                if (final_zoom - drag.start_zoom).abs() > f32::EPSILON {
+                    self.maybe_rerender_pdf(final_zoom);
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// ホイールによるマウス位置固定ズームを適用する。ズームが変化したら true を返す。
     fn apply_wheel_zoom(
         zoom: &mut f32,
@@ -255,6 +356,23 @@ impl App {
             }
         }
     }
+}
+
+/// 中ボタンドラッグズームのスナップショット状態 (v0.8.1)。
+/// ドラッグ開始フレームで固定し、以降はここからの差分でズームを計算する。
+#[derive(Clone)]
+pub(crate) struct MiddleZoomDrag {
+    /// ドラッグ開始時のカーソル位置 (このピボットが画面上で動かないように pan を補正)
+    pub pivot: egui::Pos2,
+    /// 開始時の zoom (fs_zoom または analysis_zoom のいずれか)
+    pub start_zoom: f32,
+    /// 開始時の pan
+    pub start_pan: egui::Vec2,
+    /// ピボット計算に使う画像エリアの中心 (通常モードは full_rect.center()、
+    /// 分析モードは analysis_image_rect.center())
+    pub rect_center: egui::Pos2,
+    /// ドラッグ開始時に分析モードだったか (途中でモード切替されても書き戻し先を固定)
+    pub is_analysis: bool,
 }
 
 /// 分析モード時の画像表示領域（パネル分を右側に確保した残り）を返す。
@@ -1668,6 +1786,15 @@ impl App {
             {
                 self.adjustment_mode = false;
             }
+        }
+
+        // ── 中ボタン (ホイール押し込み) ドラッグでズーム ──
+        // キーボードを使わず右手のマウスだけで拡大縮小したい用途向け。
+        // 分析モード中でも同じ操作感で動かす (書き戻し先はドラッグ開始時の mode で固定)。
+        // パネル上で「開始」された中ボタンは無視して下流に流すが、既にドラッグが
+        // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
+        if !cursor_in_panel || self.fs_middle_zoom_drag.is_some() {
+            self.handle_middle_drag_zoom(ctx, full_rect);
         }
 
         let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
