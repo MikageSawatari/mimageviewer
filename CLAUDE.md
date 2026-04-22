@@ -523,6 +523,46 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
     - Susie ワーカー: `.cargo/config.toml` の `i686-pc-windows-msvc` 向け
       `+crt-static` 設定が残っているか確認
 
+## Codex CLI レビュー
+
+ユーザーから「Codex にレビューしてもらって」「Codex レビューを取って」等と指示された場合は、
+**ユーザーに手作業で中継してもらわず、`codex` CLI を直接叩いて結果を取り込む**。
+
+### 基本コマンド
+
+read-only サンドボックス (ファイル書き換え・ネットワーク・パッケージ操作は禁止) で実行する。
+
+| 目的 | コマンド |
+|---|---|
+| 直前のコミット (`HEAD~1` との差分) をレビュー | `codex exec --sandbox read-only "Review the changes since HEAD~1. Use git diff HEAD~1 and inspect relevant files. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first, ordered by severity."` |
+| ブランチ全体 (`main` からの分岐) をレビュー | `codex exec --sandbox read-only "Review this branch against main. Use git merge-base main HEAD and git diff from that base. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first."` |
+| 未コミットの作業変更だけレビュー | `codex exec --sandbox read-only "Review the uncommitted changes in this repo. Use git diff and git diff --cached. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first."` |
+
+### 差分範囲の決め方
+
+基準となるコミットは「**前回 Codex にレビューしてもらった地点より後**」にする。具体的には:
+
+- セッション内で前回 `codex exec` を走らせたなら、そのときレビューした最新コミットハッシュを覚えておき、
+  `codex exec --sandbox read-only "Review the changes since <HASH>. Use git diff <HASH>..."` を使う。
+- セッション内で Codex に出したのが初めてなら、**今セッションで Claude が作った最初のコミットの親** (= 作業を始める前の HEAD) を基準にすると、今回の作業分をまとめて見てもらえる。
+- 分からない場合はユーザーに「基準コミットはどこにしますか?」と聞く。推測で `HEAD~1` を決め打ちしない
+  (直近 1 コミット以外にもレビュー対象があるケースが多い)。
+
+### 結果の扱い
+
+Codex の出力は `[P1]` / `[P2]` / `[P3]` のような severity 付きで返る。指摘 1 件ごとに:
+
+1. 内容を読み、該当コード (`file:line`) を Read で確認する
+2. 真の bug か false positive か判断し、ユーザーに要旨を報告する
+3. 修正を入れる場合は同じコミットメッセージに `Codex P<N> 対応` を書いておく (レビュー履歴の紐付け用)
+4. false positive と判断した場合は、**理由を添えて** ユーザーに伝える (ユーザーが最終判断できるように)
+
+### 起動できないとき
+
+`codex` コマンドが PATH にない / Codex CLI が入っていない場合は、ユーザーに環境確認を依頼する。
+勝手に従来の「ユーザーに Codex 実行を依頼してレビュー結果をペーストしてもらう」フローに戻さない
+(ユーザーの手間が増えるだけなので明示的に確認する)。
+
 ## Git Workflow
 
 - **コミット指示はローカルコミットのみ**。「コミットして」と言われた場合は `git commit` までで止める。
