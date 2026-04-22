@@ -32,6 +32,7 @@
         <a href="analysis.html">画像分析モード</a>
         <a href="erase.html">消しゴムモード</a>
         <a href="tags.html">タグ機能</a>
+        <a href="search.html">検索機能</a>
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="settings.html" class="active">設定リファレンス</a>
         <a href="formats.html">対応フォーマット</a>
@@ -167,13 +168,20 @@
       </div>
     </div>
 
-    <h2 id="search-index">お気に入り検索インデックス（お気に入り → インデックス作成）</h2>
-    <p>お気に入り配下のフォルダ・ZIP・PDF 名を SQLite データベースに記録し、<kbd>Ctrl</kbd>+<kbd>S</kbd> の「お気に入り検索」で横断検索できるようにします。</p>
+    <h2 id="search-index">検索インデックス（お気に入り → 編集）</h2>
+    <p>お気に入りごとに「名前索引」「メタ索引」の ON/OFF チェックを個別に設定できます
+    (お気に入り → 編集 で開くダイアログ内)。<strong>どちらも既定は OFF</strong>で、ON に
+    切り替えた時点で配下を再帰的に走査してインデックスを作成します。以降は notify-rs 監視で
+    自動追従されます。</p>
     <ul>
-      <li>ブラウズ中も、お気に入り配下に入ったフォルダの直下アイテムは自動的にインデックスに追加されます。</li>
-      <li>「インデックス作成」ダイアログで対象のお気に入りにチェックを入れると、配下を再帰的に走査してインデックスを一括再構築します。チェック状態は次回以降も保存されます。</li>
-      <li>インデックス DB は <code>%APPDATA%\mimageviewer\search_index.db</code> に保存されます。</li>
+      <li><strong>名前索引</strong> — <kbd>Ctrl</kbd>+<kbd>S</kbd> の対象。
+          フォルダ / ZIP / PDF の名前を記録。DB: <code>%APPDATA%\mimageviewer\search_index.db</code></li>
+      <li><strong>メタ索引</strong> — <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> 高速パス /
+          グリッドのタグバッジで使用。画像の全文メタデータ (ファイル名・EXIF・XMP・AI プロンプト・
+          PDF メタ・タグ) を記録。DB: <code>%APPDATA%\mimageviewer\fts_meta.db</code> +
+          <code>%APPDATA%\mimageviewer\fts_index\</code></li>
     </ul>
+    <p>詳細は<a href="search.html#search-index">検索機能 §8</a>を参照してください。</p>
 
     <h2>ツールバーのカスタマイズ（環境設定 → 表示 → ツールバー）</h2>
     <p>環境設定の「表示 → ツールバー」から、ツールバーに表示するセクションと個別項目を変更できます。</p>

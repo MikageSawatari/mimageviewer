@@ -397,17 +397,17 @@ fn draw_tag_panel(
     });
     ui.add_space(4.0);
 
-    // ボタンを折り返し配置
+    // ボタンを折り返し配置。付与中は `#タグ名` を緑色で、未付与は通常色で表示する
+    // (丸ドット等の装飾は付けない: ラベルの色とボタン背景で状態を伝える)。
     ui.horizontal_wrapped(|ui| {
         for def in defined_tags {
             let with_hash = format!("#{}", def.name);
             let is_on = current_tags.iter().any(|t| *t == with_hash);
-            let label = if is_on {
-                egui::RichText::new(format!("● #{}", def.name))
-                    .color(egui::Color32::from_rgb(180, 255, 180))
+            let label = egui::RichText::new(&with_hash).color(if is_on {
+                egui::Color32::from_rgb(180, 255, 180)
             } else {
-                egui::RichText::new(format!("  #{}", def.name)).color(TEXT_COLOR)
-            };
+                TEXT_COLOR
+            });
             let btn = egui::Button::new(label)
                 .fill(if is_on {
                     egui::Color32::from_rgba_unmultiplied(60, 120, 70, 200)

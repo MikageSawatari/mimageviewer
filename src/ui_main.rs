@@ -642,6 +642,12 @@ impl App {
                     }
                 }
 
+                if crate::ui_helpers::or_mode_checkbox(ui, &mut self.search_or_mode)
+                    && !self.search_query.trim().is_empty()
+                {
+                    self.execute_search();
+                }
+
                 // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
                 if !self.any_dialog_open() && escape_pressed {
                     self.show_search_bar = false;
@@ -764,6 +770,11 @@ impl App {
                         // last_executed と現 query が一致していても再実行するよう last_executed を空に倒す。
                         self.favsearch.last_executed.clear();
                     }
+                }
+
+                if crate::ui_helpers::or_mode_checkbox(ui, &mut self.favsearch.or_mode) {
+                    query_changed = true;
+                    self.favsearch.last_executed.clear();
                 }
 
                 if self.favsearch_pending.is_some() {
@@ -1071,6 +1082,7 @@ impl App {
                                 } else {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
+                                let tags = self.cell_tag_list(idx).to_vec();
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
@@ -1083,6 +1095,7 @@ impl App {
                                     &self.thumbnails[idx],
                                     rot,
                                     adjusted_tex,
+                                    &tags,
                                 );
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)

@@ -441,12 +441,14 @@ fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
         return Ok(out);
     }
 
-    // 追加 (rdf:Description 閉じタグ直前)。xmp 名前空間宣言は実運用でほぼ全ての
-    // XMP ライタが Description 属性に載せているので、ここで xmlns:xmp を追加する
-    // ロジックは省略している。
+    // 追加 (rdf:Description 閉じタグ直前)。xmlns:xmp が document のどこにも宣言されて
+    // いない XMP (ExifTool が最小構成で書いたファイル等 — mxd 経由で出てくる) に
+    // prefix 付き要素を挿入すると XML が不正になる。要素側で xmlns:xmp を宣言して
+    // しまえば、既存の Description 属性がどうであれ常に valid な XML になる。
     if let Some(close_pos) = find_subseq(xmp, b"</rdf:Description>") {
         let insert = format!(
-            "<xmp:MetadataDate>{now}</xmp:MetadataDate>\n    "
+            r#"<xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">{now}</xmp:MetadataDate>
+    "#
         );
         let mut out = Vec::with_capacity(xmp.len() + insert.len() + 4);
         out.extend_from_slice(&xmp[..close_pos]);
@@ -1041,6 +1043,47 @@ mod tests {
         assert!(!s.contains("#風景"));
         assert!(tags.contains("Photographer"));
         assert!(!tags.contains('#'));
+    }
+
+    #[test]
+    fn metadata_date_declares_xmp_namespace_on_insertion() {
+        // mxd は xmlns:xmp を rdf:Description に載せない XMP を書き出す。そこに我々が
+        // <xmp:MetadataDate> を追記しても、要素側で xmlns:xmp を宣言するので
+        // 結果の XML は quick-xml (NsReader) で正常に解釈できる。
+        let xmp = r#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+ <rdf:Description rdf:about=''
+  xmlns:dc='http://purl.org/dc/elements/1.1/'>
+  <dc:creator><rdf:Seq><rdf:li>X</rdf:li></rdf:Seq></dc:creator>
+ </rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"#;
+        let (out, _) = edit_xmp_packet(xmp.as_bytes(), &TagOp::Add("#ドール".to_string())).unwrap();
+        let s = String::from_utf8(out.clone()).unwrap();
+        // xmp:MetadataDate 要素に xmlns:xmp が載っていることを確認
+        assert!(
+            s.contains(r#"<xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">"#),
+            "insertion must self-declare xmlns:xmp. got: {s}"
+        );
+        // 書き出し後の XMP が我々の reader で dc:subject を取り出せる
+        let tags = crate::xmp_reader::read_dc_subject_from_bytes(&wrap_bytes_as_jpeg(&out));
+        assert_eq!(tags, vec!["#ドール"]);
+    }
+
+    /// XMP パケットを最小 JPEG でくるむ (read_dc_subject_from_bytes はコンテナ必須)。
+    fn wrap_bytes_as_jpeg(xmp: &[u8]) -> Vec<u8> {
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload: Vec<u8> = xmp_id.iter().chain(xmp.iter()).copied().collect();
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&[0xFF, 0xD8]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        let seg_len = (payload.len() + 2) as u16;
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
+        out
     }
 
     #[test]

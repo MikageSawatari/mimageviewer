@@ -40,6 +40,8 @@ pub struct GlobalSearchFilters {
     pub kind: Option<IndexKind>,
     /// 検索対象ソース。既定は All (= 全ソース OR)。
     pub target: SearchTarget,
+    /// OR 検索モード (docs §20)。true で include トークンを OR 結合 (NOT は AND のまま)。
+    pub or_mode: bool,
 }
 
 impl Default for GlobalSearchFilters {
@@ -48,6 +50,7 @@ impl Default for GlobalSearchFilters {
             favorite: None,
             kind: None,
             target: SearchTarget::All,
+            or_mode: false,
         }
     }
 }
@@ -704,6 +707,7 @@ impl App {
         let scope = crate::global_search::SearchScope {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
+            mode: self.global_search.filters.or_mode.into(),
         };
 
         let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope);
@@ -1229,6 +1233,13 @@ impl App {
                         self.global_search.filters.target = next.to_target();
                         filter_changed = true;
                     }
+                }
+
+                if crate::ui_helpers::or_mode_checkbox(
+                    ui,
+                    &mut self.global_search.filters.or_mode,
+                ) {
+                    filter_changed = true;
                 }
 
                 // 進捗/結果バッジ

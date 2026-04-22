@@ -336,10 +336,25 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | `-A` | A を含まない (NOT) |
 | `"A B"` | スペース込みのフレーズ完全一致 |
 | `-"A B"` | フレーズを含まない (NOT + フレーズ) |
+| `#タグ名` | タグ検索（`#` 込みで一致） |
 
 - 大文字小文字は区別しない
 - 閉じクォート `"` がない場合は行末までを 1 トークンとして扱う（寛容パース）
 - `-` 単体や末尾にある `-` はノイズとして無視する（`jean-claude` のような語内 `-` は通常の文字として扱う）
+
+#### OR 検索モード (v0.7.2+、設計 [search-expansion-design.md §20](search-expansion-design.md))
+
+各検索バー右端の **`□OR`** チェックを入れると include トークンを OR 結合する (既定は AND)。
+**NOT (`-word`) は常に AND** のまま (チェック有無に関わらず除外は効く)。
+
+| クエリ | AND モード (既定) | OR モード |
+|---|---|---|
+| `klee paimon` | 両方を含むものだけ | いずれかを含むもの |
+| `klee #klee` | キーワード "klee" と タグ "#klee" の両方 | キーワードかタグのいずれかで "klee" を含むもの |
+| `klee #klee -sleep -nsfw` | `klee AND #klee AND NOT sleep AND NOT nsfw` | `(klee OR #klee) AND NOT sleep AND NOT nsfw` |
+
+状態は session-local (ウィンドウを閉じるとリセット)。Ctrl+S / Ctrl+F / Ctrl+G それぞれ独立に
+保持される。
 
 #### 最小クエリ長ポリシー (Ctrl+G のみ適用、v0.8.0)
 

@@ -222,8 +222,12 @@ pub fn name_index_search(
     query: &str,
     favorite_roots: &[PathBuf],
 ) -> Vec<mimageviewer::search_index_db::IndexEntry> {
-    db.search(query, favorite_roots)
-        .expect("search_index_db::search")
+    db.search(
+        query,
+        favorite_roots,
+        mimageviewer::search_query::MatchMode::And,
+    )
+    .expect("search_index_db::search")
 }
 
 /// 名前索引の検索結果が predicate を満たすまで polling。

@@ -10,6 +10,33 @@
 //! - 閉じクォートが無い場合はそのまま末尾までを 1 トークンとして扱う (寛容パース)
 //!
 //! トークンは `needle` を小文字化して保持する。照合は `matches` に生の hay を渡せば内部で小文字化される。
+//!
+//! ## 結合モード (`MatchMode`)
+//!
+//! 検索 UI の「□OR」チェックで切り替える (docs/search-expansion-design.md §20)。
+//! - `MatchMode::And` (既定): include トークンを **すべて** 含むものがマッチ
+//! - `MatchMode::Or`: include トークンを **1 つ以上** 含むものがマッチ
+//!
+//! **NOT トークンは常に AND** (OR モードでも同じ)。
+//! 例: `klee #klee -sleep -nsfw` を OR モードで評価すると
+//! `(klee OR #klee) AND (NOT sleep) AND (NOT nsfw)` と解釈される。
+
+/// include トークン群の結合方法。NOT トークンは常に AND なのでこの enum に依らない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchMode {
+    /// 既定。include トークンを AND で結合する。
+    #[default]
+    And,
+    /// include トークンを OR で結合する (NOT は AND のまま)。
+    Or,
+}
+
+impl From<bool> for MatchMode {
+    /// UI チェックボックスの `or_mode: bool` → `MatchMode` 変換。`true` で `Or`。
+    fn from(or_mode: bool) -> Self {
+        if or_mode { MatchMode::Or } else { MatchMode::And }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
@@ -87,7 +114,7 @@ pub fn parse(query: &str) -> Vec<Token> {
     tokens
 }
 
-/// `hay` がトークン列にマッチするか判定する (内部で小文字化)。
+/// `hay` がトークン列にマッチするか判定する (内部で小文字化、AND モード既定)。
 /// - include トークン: hay に含まれなければ不一致
 /// - exclude トークン: hay に含まれれば不一致
 /// - トークン列が空: 常に一致 (フィルタなしの扱い)
@@ -96,20 +123,47 @@ pub fn parse(query: &str) -> Vec<Token> {
 /// (`#原神` を探しに行く)。tags フィールドは bigram tokenize されて per-source テキストに
 /// 結合されるため、post-filter でも自然に一致する。
 pub fn matches(tokens: &[Token], hay: &str) -> bool {
+    matches_with_mode(tokens, hay, MatchMode::And)
+}
+
+/// `matches` の結合モード指定版 (docs §20)。
+/// - `MatchMode::And`: include は全部含む必要あり
+/// - `MatchMode::Or`: include は 1 つでも含めば OK (exclude は常に AND)
+///
+/// include が 0 個 + exclude のみ + OR モードの場合、「exclude を含まない」だけで一致扱い
+/// にする (AND モードと同じ振る舞い、NOT-only は UI 側で拒否される)。
+pub fn matches_with_mode(tokens: &[Token], hay: &str, mode: MatchMode) -> bool {
     if tokens.is_empty() {
         return true;
     }
     let hay_lower = hay.to_lowercase();
+    let mut any_include = false;
+    let mut include_hit = false;
     for t in tokens {
         if t.include {
-            if !hay_lower.contains(&t.needle) {
-                return false;
+            any_include = true;
+            let hit = hay_lower.contains(&t.needle);
+            match mode {
+                MatchMode::And => {
+                    if !hit {
+                        return false;
+                    }
+                }
+                MatchMode::Or => {
+                    if hit {
+                        include_hit = true;
+                    }
+                }
             }
         } else if hay_lower.contains(&t.needle) {
             return false;
         }
     }
-    true
+    match mode {
+        MatchMode::And => true,
+        // OR モード: include が 1 つもなければ「フィルタなし + exclude 通過」 = true
+        MatchMode::Or => !any_include || include_hit,
+    }
 }
 
 /// `decide_partial` の戻り値。追加情報 (XMP 等) を取得する必要があるかを示す。
@@ -122,27 +176,42 @@ pub enum PartialResult {
     NeedsMore,
 }
 
+/// hay_so_far だけで確定判定できるかを返す (AND モード既定、後方互換)。
+pub fn decide_partial(tokens: &[Token], hay_so_far: &str) -> PartialResult {
+    decide_partial_with_mode(tokens, hay_so_far, MatchMode::And)
+}
+
 /// hay_so_far だけで確定判定できるかを返す。Ctrl+F メタデータ検索で、
 /// 高コストな XMP 読み込みを「避けられる時は避ける」ための事前判定に使う。
 ///
 /// 戻り値は以下 3 種類:
-/// - `Decided(false)`: `exclude` トークンが hay_so_far に**含まれている** 。
-///   追加情報に関わらず不一致確定なので XMP を読む必要なし。
-/// - `Decided(true)`: 全 `include` トークンが hay_so_far に含まれ、かつ `exclude`
-///   トークンが**1 つも無い** (クエリに `-X` が無い)。追加情報が増えても
-///   結果は変わらないので XMP を読む必要なし。
-/// - `NeedsMore`: 上記以外 — include が欠けているか、exclude が存在して未確認。
-///   追加情報で結果が覆り得るので、追加情報を読んでから `matches` で再判定する。
-pub fn decide_partial(tokens: &[Token], hay_so_far: &str) -> PartialResult {
+/// - `Decided(false)`: exclude トークンが hay_so_far に**含まれている** 。
+///   追加情報に関わらず不一致確定なので XMP を読む必要なし (AND/OR 共通)。
+/// - `Decided(true)`:
+///   - AND: 全 include が hay_so_far にあり、exclude が 1 つも存在しない。
+///   - OR: 少なくとも 1 つの include が hay_so_far にあり、exclude が 1 つも存在しない。
+/// - `NeedsMore`: 追加情報で結果が覆り得る。
+///   - AND: include が欠けている、または exclude が存在して未確認。
+///   - OR: include が 1 つもヒットしていない (追加情報で見つかるかも)、または exclude 未確認。
+pub fn decide_partial_with_mode(
+    tokens: &[Token],
+    hay_so_far: &str,
+    mode: MatchMode,
+) -> PartialResult {
     if tokens.is_empty() {
         return PartialResult::Decided(true);
     }
     let hay_lower = hay_so_far.to_lowercase();
+    let mut has_include = false;
     let mut any_include_missing = false;
+    let mut include_hit = false;
     let mut has_exclude = false;
     for t in tokens {
         if t.include {
-            if !hay_lower.contains(&t.needle) {
+            has_include = true;
+            if hay_lower.contains(&t.needle) {
+                include_hit = true;
+            } else {
                 any_include_missing = true;
             }
         } else {
@@ -152,12 +221,27 @@ pub fn decide_partial(tokens: &[Token], hay_so_far: &str) -> PartialResult {
             }
         }
     }
-    if any_include_missing || has_exclude {
-        // include が足りない場合は追加情報で補える可能性あり。
-        // exclude が存在する場合は追加情報にも含まれていないかを確認する必要あり。
-        PartialResult::NeedsMore
-    } else {
-        PartialResult::Decided(true)
+    match mode {
+        MatchMode::And => {
+            if any_include_missing || has_exclude {
+                PartialResult::NeedsMore
+            } else {
+                PartialResult::Decided(true)
+            }
+        }
+        MatchMode::Or => {
+            // OR: include が 1 つでも見つかれば、あとは exclude 次第。
+            // exclude が無ければ Decided(true)、あれば追加情報で混入を確認する必要あり。
+            if has_include && !include_hit {
+                // どの include もまだ見つからない → 追加情報に含まれているかも。
+                return PartialResult::NeedsMore;
+            }
+            if has_exclude {
+                PartialResult::NeedsMore
+            } else {
+                PartialResult::Decided(true)
+            }
+        }
     }
 }
 
@@ -388,5 +472,105 @@ mod tests {
         let tokens = parse("##foo");
         assert_eq!(tokens.len(), 1);
         assert!(!tokens[0].is_tag);
+    }
+
+    // ---- OR モード (docs §20) ----
+
+    #[test]
+    fn or_mode_matches_any_include() {
+        // OR: いずれかの include が含まれれば一致
+        let t = parse("klee #klee");
+        assert!(matches_with_mode(&t, "this is klee art", MatchMode::Or));
+        assert!(matches_with_mode(&t, "#klee is here", MatchMode::Or));
+        assert!(!matches_with_mode(&t, "unrelated text", MatchMode::Or));
+    }
+
+    #[test]
+    fn or_mode_with_excludes_still_and() {
+        // OR: include は OR でも、exclude は AND (常に除外)
+        let t = parse("klee #klee -sleep -nsfw");
+        assert!(matches_with_mode(&t, "klee portrait", MatchMode::Or));
+        assert!(!matches_with_mode(
+            &t,
+            "klee is sleep",
+            MatchMode::Or
+        ));
+        assert!(!matches_with_mode(
+            &t,
+            "#klee nsfw",
+            MatchMode::Or
+        ));
+    }
+
+    #[test]
+    fn or_mode_none_match_fails() {
+        // OR: include が 1 つも含まれなければ不一致
+        let t = parse("foo bar");
+        assert!(!matches_with_mode(&t, "neither token present", MatchMode::Or));
+    }
+
+    #[test]
+    fn or_mode_single_include_ok() {
+        // OR でも include が 1 個なら AND と挙動が同じ
+        let t = parse("klee");
+        assert!(matches_with_mode(&t, "this is klee", MatchMode::Or));
+        assert!(!matches_with_mode(&t, "unrelated", MatchMode::Or));
+    }
+
+    #[test]
+    fn or_mode_only_excludes_matches_any() {
+        // OR で exclude only (UI では NOT-only を弾く前提) は AND と同じく
+        // exclude を含まないものに一致する。
+        let t = parse("-bad");
+        assert!(matches_with_mode(&t, "anything", MatchMode::Or));
+        assert!(!matches_with_mode(&t, "has bad", MatchMode::Or));
+    }
+
+    #[test]
+    fn matches_default_is_and() {
+        // 既定のショートハンド `matches` は AND 挙動
+        let t = parse("foo bar");
+        assert!(matches(&t, "foo and bar"));
+        assert!(!matches(&t, "only foo"));
+    }
+
+    #[test]
+    fn decide_partial_or_mode_any_include_hit() {
+        // OR: hay_so_far に include が 1 つでもあれば Decided(true) (exclude 無し)
+        let t = parse("foo bar");
+        assert_eq!(
+            decide_partial_with_mode(&t, "only foo here", MatchMode::Or),
+            PartialResult::Decided(true)
+        );
+    }
+
+    #[test]
+    fn decide_partial_or_mode_no_include_yet() {
+        // OR: include が 1 つも見つかっていない → 追加情報で見つかるかも
+        let t = parse("foo bar");
+        assert_eq!(
+            decide_partial_with_mode(&t, "unrelated", MatchMode::Or),
+            PartialResult::NeedsMore
+        );
+    }
+
+    #[test]
+    fn decide_partial_or_mode_exclude_hit_short_circuit() {
+        // OR でも exclude が hay にあれば Decided(false)
+        let t = parse("foo bar -bad");
+        assert_eq!(
+            decide_partial_with_mode(&t, "foo here but bad", MatchMode::Or),
+            PartialResult::Decided(false)
+        );
+    }
+
+    #[test]
+    fn decide_partial_or_mode_include_hit_but_exclude_unchecked() {
+        // OR: include 見つけた、exclude は hay に未存在 → 追加情報に exclude がないか要確認
+        let t = parse("foo -bad");
+        assert_eq!(
+            decide_partial_with_mode(&t, "foo is here", MatchMode::Or),
+            PartialResult::NeedsMore
+        );
     }
 }

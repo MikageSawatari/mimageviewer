@@ -32,6 +32,7 @@
         <a href="analysis.html">画像分析モード</a>
         <a href="erase.html">消しゴムモード</a>
         <a href="tags.html">タグ機能</a>
+        <a href="search.html">検索機能</a>
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="settings.html">設定リファレンス</a>
         <a href="formats.html">対応フォーマット</a>
@@ -167,8 +168,8 @@
     <p>選択またはチェックしたファイルを <kbd>Delete</kbd> キーで削除できます。削除前に確認ダイアログが表示されます。
     削除されたファイルはごみ箱に移動します（完全削除ではありません）。</p>
 
-    <h2 id="メタデータ検索">メタデータ検索 (Ctrl+F / Ctrl+G)</h2>
-    <p>3 種類の検索モードを用意しています。場面に合わせて使い分けます:</p>
+    <h2 id="メタデータ検索">メタデータ検索 (Ctrl+F / Ctrl+G / Ctrl+S)</h2>
+    <p>3 種類の検索モードを用途に合わせて使い分けます:</p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -182,92 +183,16 @@
       </table>
     </div>
 
-    <h3>Ctrl+F: ローカル検索</h3>
-    <p><kbd>Ctrl</kbd>+<kbd>F</kbd> で画面上部に検索バーが表示されます。
-    現在表示中のファイルだけを対象に、ファイル名や AI プロンプトなどのメタデータをキーワード検索し、
-    マッチした画像だけを絞り込み表示します。
-    mXD でダウンロードした画像・動画については XMP 埋め込みのツイート本文や投稿者名（アカウント名・表示名）も、
-    PDF ファイルについてはタイトル / 著者 / Subject / キーワードも対象です。
-    ZIP アーカイブを開いた状態では ZIP 内の PNG メタデータも検索されます。</p>
-    <ul>
-      <li><kbd>Enter</kbd> で検索を実行（入力中もリアルタイムに絞り込まれます）</li>
-      <li><kbd>Esc</kbd> または「×」ボタンで検索バーを閉じる</li>
-    </ul>
-
-    <h3>Ctrl+G: グローバル全文検索</h3>
-    <p><kbd>Ctrl</kbd>+<kbd>G</kbd> でお気に入り全体を横断検索します。Tantivy による
-    bigram 全文索引を使うため、10 万件規模でも高速に応答します。</p>
-    <ul>
-      <li>結果はヒットを含む<strong>フォルダ / ZIP / PDF 単位で集約表示</strong>されます（コンテナセル）。
-          クリックすると中に入って階層ビューで該当ファイルを確認できます。</li>
-      <li>コンテナ内では<strong>ヒット枝だけを残した枝刈りビュー</strong>になり、
-          <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> で DFS 順に結果を前後移動できます。</li>
-      <li><kbd>BS</kbd>（Backspace）でコンテナから出て集約ビューに戻ります。</li>
-      <li>Ctrl+G が動作するためには、事前にお気に入りダイアログで「メタ索引」を ON にして
-          インデックスを作成しておく必要があります（<a href="#お気に入り">お気に入りのインデックス管理</a>）。</li>
-    </ul>
-
-    <h3>絞り込みドロップダウン</h3>
-    <p>Ctrl+G の検索バー右側には以下のドロップダウンがあります（Ctrl+F は「検索対象」のみ）。</p>
-
-    <h4>お気に入り（Ctrl+G）</h4>
-    <p>「すべて」または特定の 1 つのお気に入りに絞り込み。複数フォルダをまたいだ検索で
-    対象を狭めたいときに使います。「メタ索引」が ON のお気に入りのみ候補に出ます。</p>
-
-    <h4>タイプ（Ctrl+G）</h4>
-    <p>「すべて / フォルダ / 画像 / ZIP ファイル / PDF ファイル」。たとえば PDF だけを
-    タイトルで検索したい、フォルダ名だけを一覧したい、といった絞り込みに使います。</p>
-
-    <h4>検索対象（Ctrl+F / Ctrl+G 共通）</h4>
-    <p>どのメタデータソースから検索するかを選びます。「すべて」だと以下 6 ソースの OR:</p>
-    <ul>
-      <li><strong>ファイル名</strong>: ファイル名 / ZIP エントリ名</li>
-      <li><strong>EXIF</strong>: カメラ情報・撮影日時・GPS など</li>
-      <li><strong>mXD ツイート情報</strong>: XMP 埋め込みの投稿者 ID / 投稿者名 / ツイート本文</li>
-      <li><strong>AI プロンプト (PNG)</strong>: PNG tEXt/iTXt に埋め込まれた AUTOMATIC1111 / ComfyUI プロンプト</li>
-      <li><strong>PDF メタ情報</strong>: PDFium で抽出した Title / Author / Subject / Keywords</li>
-      <li><strong>タグ</strong>: XMP dc:subject のタグ（<a href="tags.html">タグ機能</a>で付けたもの + 他ソフト由来）</li>
-    </ul>
-    <p>例:「特定の投稿者のツイートだけ探したい」ときは「mXD ツイート情報」、
-    「PDF のタイトルで探したい」ときは「PDF メタ情報」、を選ぶと無関係なヒットが減ります。</p>
-
-    <h4>タグピッカー（Ctrl+G）</h4>
-    <p>登録済みタグから選択するとクエリ欄に <code>#タグ名</code> が挿入されます。タグ名の
-    スペルを覚えていなくても OK。詳しくは<a href="tags.html">タグ機能</a>を参照。</p>
-
-    <h3 id="検索クエリ構文">検索クエリ構文</h3>
-    <p>スペース区切りの複数キーワードを組み合わせられます。大文字小文字は区別しません。</p>
-    <table>
-      <thead>
-        <tr><th>書き方</th><th>意味</th><th>例</th></tr>
-      </thead>
-      <tbody>
-        <tr><td><code>A B</code></td><td>A と B の<strong>両方</strong>を含む (AND)</td><td><code>sunset mountain</code></td></tr>
-        <tr><td><code>-A</code></td><td>A を<strong>含まない</strong> (NOT)</td><td><code>landscape -night</code></td></tr>
-        <tr><td><code>"A B"</code></td><td>スペース込みのフレーズ完全一致</td><td><code>"blue sky"</code></td></tr>
-        <tr><td><code>-"A B"</code></td><td>フレーズを含まない</td><td><code>-"low quality"</code></td></tr>
-        <tr><td><code>#タグ名</code></td><td>タグ検索（<code>#</code> 込みで一致）</td><td><code>#原神 #風景</code></td></tr>
-      </tbody>
-    </table>
+    <p>3 モードの詳細、検索クエリ構文 (AND / OR / NOT / フレーズ / タグ)、絞り込みドロップダウン、
+    インデックスの作り方は<a href="search.html">検索機能ページ</a>にまとめています。</p>
 
     <div class="box info">
-      <span class="box-icon">ℹ️</span>
+      <span class="box-icon">💡</span>
       <div class="box-body">
-        <strong>最小クエリ長（Ctrl+G のみ）:</strong>
-        Ctrl+G は bigram 索引の精度のため、CJK は 2 文字以上、ASCII / 数字は 3 文字以上が必要です。
-        また NOT だけのクエリ（<code>-bad</code> のような除外のみ）は拒否されます。
-        Ctrl+F には制約ありません。
-      </div>
-    </div>
-
-    <div class="box info">
-      <span class="box-icon">ℹ️</span>
-      <div class="box-body">
-        <strong>Negative Prompt の扱い:</strong>
-        AI 画像 (AUTOMATIC1111 / Forge / ComfyUI / Midjourney) のメタデータが識別できた場合、
-        Negative Prompt は検索対象から自動的に<strong>除外</strong>されます。
-        これにより、たとえば <code>blurry</code> を含む画像を探すときに、
-        正プロンプトではなくネガティブ側に <code>blurry</code> が入っている画像が誤ヒットするのを防げます。
+        <strong>OR 検索 (v0.7.2+):</strong>
+        検索バー右端の <code>□OR</code> チェックを入れると、語をいずれか 1 つでも含めばヒット扱いになります
+        (除外 <code>-word</code> は常に AND)。例: <code>klee #klee</code> でキーワード・タグどちらか片方で
+        「klee」を含む画像を拾えます。
       </div>
     </div>
 
@@ -329,17 +254,19 @@
     </ul>
 
     <h3>お気に入りダイアログ: インデックス管理</h3>
-    <p>お気に入りダイアログには各お気に入りごとに 3 つの ON/OFF チェックがあります。有効化すると、
-    バックグラウンドでファイル監視（notify-rs）とインデックス作成が自動実行されます。</p>
+    <p>お気に入りダイアログ (メニュー「お気に入り」→「編集」) には各お気に入りごとに
+    「名前索引」「メタ索引」の ON/OFF チェックボックスがあります。<strong>どちらも既定は OFF</strong>で、
+    ON に切り替えると即座に配下を再帰的に走査してインデックスを作成します。以降は
+    notify-rs による自動監視でファイルの追加・削除・変更が追従されます。</p>
     <ul>
       <li><strong>名前索引</strong>: フォルダ / ZIP / PDF の<strong>名前</strong>のインデックス（Ctrl+S の対象）。
           軽量（SQLite）で容量コストも小さい。</li>
-      <li><strong>メタ索引</strong>: 画像の<strong>メタデータ全文</strong>（ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + タグ）のインデックス（Ctrl+G / Ctrl+F の高速化対象）。
+      <li><strong>メタ索引</strong>: 画像の<strong>メタデータ全文</strong>（ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + タグ）のインデックス（Ctrl+G / Ctrl+F の高速化対象 + グリッドのタグバッジ）。
           Tantivy 全文索引を使用。10 万件規模でも高速だがディスク容量を使う。</li>
-      <li><strong>サムネイルキャッシュ</strong>: サムネイルを事前生成してディスクにキャッシュ。初回表示を高速化。</li>
     </ul>
-    <p>ダイアログ内のステータス表示で「スキャン中」「今 xxx ファイル目」等の進捗がリアルタイムで見えます。
-    タイトルバーにも索引更新中はインジケーターが出ます。</p>
+    <p>進捗はお気に入りダイアログ内の各行 (<code>⏳ 起動中</code> / <code>⏳ スキャン中</code> / <code>✅</code>)
+    とウィンドウタイトルバーのサフィックス <code>(インデックス更新中)</code> で確認できます。
+    詳細は<a href="search.html#search-index">検索機能 §8</a>を参照。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
@@ -350,14 +277,16 @@
     </div>
 
     <h3 id="お気に入り検索">お気に入り検索 (Ctrl+S)</h3>
-    <p>お気に入り登録したフォルダ配下で、一度参照したことのあるフォルダ・ZIP・PDF 名を横断検索できます。すべてを検索したい場合は、インデックス作成を実行してインデックスを作成してください。</p>
+    <p>名前索引 ON のお気に入り配下で、フォルダ・ZIP・PDF 名を横断検索できます。</p>
     <ul>
-      <li>メニュー「お気に入り」→「検索… (Ctrl+S)」で画面上部に検索バーが表示されます。</li>
+      <li>メニュー「お気に入り」→「名前で検索 (Ctrl+S)」で画面上部に検索バーが表示されます。</li>
       <li>テキストを入力すると、お気に入り全体から部分一致 (大文字小文字無視) でヒットしたフォルダ・ZIP・PDF がサムネイル一覧に表示されます。</li>
-      <li>検索クエリ構文 (AND / <code>-</code> 除外 / <code>"…"</code> フレーズ) はメタデータ検索と<a href="#メタデータ検索">同じ</a>です。</li>
+      <li>検索クエリ構文 (AND / <code>-</code> 除外 / <code>"…"</code> フレーズ) は<a href="search.html#query-syntax">メタデータ検索と共通</a>です。</li>
       <li>結果をクリック/ダブルクリックすると通常どおりそのフォルダ・アーカイブを開きます。</li>
       <li>× ボタンまたは Esc で検索を閉じ、元のフォルダに戻ります。</li>
-      <li><strong>インデックス作成:</strong> お気に入り配下をブラウズしていると自動的に索引が更新されますが、まとめて再構築したい場合はメニュー「お気に入り」→「インデックス作成」でチェックしたフォルダを一括走査できます。チェック状態は次回以降も保存されます。</li>
+      <li><strong>名前索引が OFF の場合は検索結果が出ません。</strong>
+          お気に入りダイアログで名前索引のチェックを ON にしてください
+          (詳細は<a href="search.html#search-index">検索機能 §8</a>)。</li>
     </ul>
 
     <h2>サムネイルキャッシュ</h2>

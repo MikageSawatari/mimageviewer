@@ -50,10 +50,24 @@ pub struct TagWriteJob {
     pub favorite_id: Option<Uuid>,
 }
 
+/// `Toggle` / `ClearMiv` が実際に何をしたかを UI に返すためのラベル。
+/// 完了トーストで「付与 / 削除」の実際値を見せるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagAction {
+    /// Toggle: タグを追加した (Add 経路に解決された)。
+    Added,
+    /// Toggle: タグを削除した (Remove 経路に解決された)。
+    Removed,
+    /// ClearMiv: `#` 始まりの要素をまとめて削除した (1 件以上の削除が発生)。
+    Cleared,
+    /// 実質変化なし (clear した時に元々空だったケース等)。
+    NoOp,
+}
+
 #[derive(Debug, Clone)]
 pub struct TagWriteResult {
     pub path: PathBuf,
-    pub result: Result<String, String>,
+    pub result: Result<TagAction, String>,
 }
 
 pub struct TagWriteHandle {
@@ -258,21 +272,28 @@ fn process_job(
     meta: &FtsMetaDb,
     fts: &FtsIndex,
     shared_writer: &Mutex<IndexWriter>,
-) -> (Result<String, WriteError>, bool) {
+) -> (Result<TagAction, WriteError>, bool) {
     // Toggle は worker 側で現在タグを読んで Add/Remove に解決する。
     // これで UI スレッドからの同期 I/O を不要にできる。
-    let op = match &job.kind {
+    // UI 側トースト用に、どちらに解決されたかを `TagAction` で返す。
+    let (op, action, had_hash_tags) = match &job.kind {
         TagJobKind::Toggle(name) => {
             let current = crate::xmp_reader::read_dc_subject(&job.path);
             let with_hash = format!("#{name}");
-            if current.iter().any(|t| *t == with_hash) {
-                TagOp::Remove(with_hash)
+            let already_has = current.iter().any(|t| *t == with_hash);
+            if already_has {
+                (TagOp::Remove(with_hash), TagAction::Removed, true)
             } else {
-                TagOp::Add(with_hash)
+                (TagOp::Add(with_hash), TagAction::Added, true)
             }
         }
-        TagJobKind::ClearMiv => TagOp::ClearMiv,
+        TagJobKind::ClearMiv => {
+            let current = crate::xmp_reader::read_dc_subject(&job.path);
+            let had = current.iter().any(|t| t.starts_with('#'));
+            (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp }, had)
+        }
     };
+    let _ = had_hash_tags; // 将来、UI 側で more granular な集計に使う余地あり
 
     let new_tags = match crate::xmp_writer::apply_tag_op(&job.path, &op) {
         Ok(s) => s,
@@ -284,7 +305,7 @@ fn process_job(
         Some(fav_id) => upsert_tags_in_writer(&job.path, fav_id, &new_tags, meta, fts, shared_writer),
         None => false,
     };
-    (Ok(new_tags), dirtied)
+    (Ok(action), dirtied)
 }
 
 /// `fts_meta.tags_norm` を更新し、Tantivy writer にタグ差分のみの upsert を投入する。

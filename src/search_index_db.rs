@@ -236,40 +236,52 @@ impl SearchIndexDb {
     }
 
     /// 部分一致検索 (大文字小文字無視)。結果は表示名で昇順ソート済み。
-    /// `favorite_roots` が空の場合は全件対象。
+    /// `favorite_roots` が空の場合は全件対象。`mode` で include トークン結合を AND/OR 切替。
     ///
     /// クエリ構文は `search_query::parse` を参照。トークンごとに
-    /// `name LIKE ?` / `name NOT LIKE ?` を AND で重ねる。`%` `_` `\` は
-    /// ESCAPE 節でリテラル扱いにする。
+    /// `name LIKE ?` / `name NOT LIKE ?` を生成し、include は `mode` で結合、
+    /// NOT は常に AND で追加する (docs §20)。`%` `_` `\` は ESCAPE 節でリテラル扱い。
     pub fn search(
         &self,
         query: &str,
         favorite_roots: &[PathBuf],
+        mode: crate::search_query::MatchMode,
     ) -> rusqlite::Result<Vec<IndexEntry>> {
         let tokens = crate::search_query::parse(query);
 
         let conn = self.conn.lock().unwrap();
 
-        // トークンごとに LIKE / NOT LIKE を 1 プレースホルダずつ積む。
-        // トークンに `%` `_` `\` が含まれてもリテラル照合になるよう ESCAPE 節を付ける。
-        let mut where_clauses: Vec<&str> = Vec::new();
-        let mut bind_strings: Vec<String> = Vec::new();
-
+        // include と exclude を分離する: include は `mode` に従って結合、exclude は常に AND。
+        let mut include_clauses: Vec<&str> = Vec::new();
+        let mut exclude_clauses: Vec<&str> = Vec::new();
+        let mut include_binds: Vec<String> = Vec::new();
+        let mut exclude_binds: Vec<String> = Vec::new();
         for t in &tokens {
-            bind_strings.push(format!("%{}%", escape_like(&t.needle)));
-            where_clauses.push(if t.include {
-                "name LIKE ? ESCAPE '\\'"
+            if t.include {
+                include_binds.push(format!("%{}%", escape_like(&t.needle)));
+                include_clauses.push("name LIKE ? ESCAPE '\\'");
             } else {
-                "name NOT LIKE ? ESCAPE '\\'"
-            });
+                exclude_binds.push(format!("%{}%", escape_like(&t.needle)));
+                exclude_clauses.push("name NOT LIKE ? ESCAPE '\\'");
+            }
+        }
+
+        let mut where_clauses: Vec<String> = Vec::new();
+        if !include_clauses.is_empty() {
+            let joiner = match mode {
+                crate::search_query::MatchMode::And => " AND ",
+                crate::search_query::MatchMode::Or => " OR ",
+            };
+            where_clauses.push(format!("({})", include_clauses.join(joiner)));
+        }
+        for c in &exclude_clauses {
+            where_clauses.push((*c).to_string());
         }
 
         let fav_norm_strs: Vec<String> = favorite_roots.iter().map(|p| normalize_path(p)).collect();
-        let fav_in_clause;
         if !fav_norm_strs.is_empty() {
             let placeholders = vec!["?"; fav_norm_strs.len()].join(",");
-            fav_in_clause = format!("favorite_root IN ({placeholders})");
-            where_clauses.push(&fav_in_clause);
+            where_clauses.push(format!("favorite_root IN ({placeholders})"));
         }
 
         let where_sql = if where_clauses.is_empty() {
@@ -288,9 +300,12 @@ impl SearchIndexDb {
 
         let mut stmt = conn.prepare(&sql)?;
 
-        // バインドを順に積む: トークン用 LIKE パターン → お気に入り正規化パス
+        // バインドを WHERE 節と同じ順序で積む: include (まとめて) → exclude (1 個ずつ) → お気に入り。
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
-        for s in &bind_strings {
+        for s in &include_binds {
+            params_vec.push(s as &dyn rusqlite::ToSql);
+        }
+        for s in &exclude_binds {
             params_vec.push(s as &dyn rusqlite::ToSql);
         }
         for s in &fav_norm_strs {
@@ -613,16 +628,16 @@ mod tests {
         db.upsert_children(&fav, &parent, &children).unwrap();
         assert_eq!(db.total_count().unwrap(), 3);
 
-        let results = db.search("alp", &[]).unwrap();
+        let results = db.search("alp", &[], crate::search_query::MatchMode::And).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].display_name, "alpha");
 
-        let results = db.search(".zip", &[]).unwrap();
+        let results = db.search(".zip", &[], crate::search_query::MatchMode::And).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, IndexKind::ZipFile);
 
         // 大文字小文字無視
-        let results = db.search("BETA", &[]).unwrap();
+        let results = db.search("BETA", &[], crate::search_query::MatchMode::And).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -660,7 +675,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let all = db.search("", &[]).unwrap();
+        let all = db.search("", &[], crate::search_query::MatchMode::And).unwrap();
         assert_eq!(all.len(), 3);
         let names: Vec<&str> = all.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"x"));
@@ -682,7 +697,7 @@ mod tests {
 
         db.clear_for_favorite(&fav1).unwrap();
         assert_eq!(db.total_count().unwrap(), 1);
-        let results = db.search("", &[]).unwrap();
+        let results = db.search("", &[], crate::search_query::MatchMode::And).unwrap();
         assert_eq!(results[0].display_name, "b");
     }
 
@@ -703,7 +718,9 @@ mod tests {
             &[entry(r"C:\Fav2\match", "match", IndexKind::Folder)],
         )
         .unwrap();
-        let results = db.search("match", &[fav1.clone()]).unwrap();
+        let results = db
+            .search("match", &[fav1.clone()], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from(r"C:\Fav1\match"));
     }
@@ -724,13 +741,26 @@ mod tests {
         .unwrap();
 
         // AND: 両方含むもの
-        let r = db.search("alpha beta", &[]).unwrap();
+        let r = db
+            .search("alpha beta", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].display_name, "alpha_beta");
 
         // 片方しかないと落ちる
-        let r = db.search("alpha epsilon", &[]).unwrap();
+        let r = db
+            .search("alpha epsilon", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(r.len(), 0);
+
+        // OR モードなら片方だけでも拾える
+        let r = db
+            .search("alpha epsilon", &[], crate::search_query::MatchMode::Or)
+            .unwrap();
+        let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
+        assert!(names.contains(&"alpha_beta"));
+        assert!(names.contains(&"alpha_gamma"));
+        assert!(!names.contains(&"delta"));
     }
 
     #[test]
@@ -748,11 +778,41 @@ mod tests {
         )
         .unwrap();
 
-        let r = db.search("image -bad", &[]).unwrap();
+        let r = db
+            .search("image -bad", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"good_image"));
         assert!(!names.contains(&"bad_image"));
         assert!(!names.contains(&"other"));
+    }
+
+    #[test]
+    fn search_or_mode_with_excludes() {
+        // docs §20: OR でも NOT は AND 扱い
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\klee", "klee", IndexKind::Folder),
+                entry(r"C:\Fav\klee_sleep", "klee_sleep", IndexKind::Folder),
+                entry(r"C:\Fav\nsfw_art", "nsfw_art", IndexKind::Folder),
+                entry(r"C:\Fav\other", "other", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
+
+        // "klee nsfw -sleep" OR → (klee OR nsfw) AND (NOT sleep)
+        let r = db
+            .search("klee nsfw -sleep", &[], crate::search_query::MatchMode::Or)
+            .unwrap();
+        let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
+        assert!(names.contains(&"klee"));
+        assert!(names.contains(&"nsfw_art"));
+        assert!(!names.contains(&"klee_sleep"), "sleep を含むのは常に除外");
+        assert!(!names.contains(&"other"), "include にマッチしない doc は除外");
     }
 
     #[test]
@@ -769,7 +829,9 @@ mod tests {
         )
         .unwrap();
 
-        let r = db.search(r#""hello world""#, &[]).unwrap();
+        let r = db
+            .search(r#""hello world""#, &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].display_name, "hello world");
     }
@@ -790,7 +852,9 @@ mod tests {
         .unwrap();
 
         // `_` はワイルドカードではなくリテラルの underscore として扱う
-        let r = db.search("100_", &[]).unwrap();
+        let r = db
+            .search("100_", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
         assert_eq!(names, vec!["100_percent"]);
     }

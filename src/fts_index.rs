@@ -170,6 +170,8 @@ pub struct QueryFilters<'a> {
     pub kinds: Option<&'a [IndexKind]>,
     /// 検索対象ソース (ソースを跨いだ OR)。既定は `All` (= 5 ソース全部)。
     pub target: SearchTarget,
+    /// include トークン結合モード (docs §20)。既定は AND。
+    pub mode: crate::search_query::MatchMode,
 }
 
 /// Tantivy ドキュメント 1 件を構築するための入力。
@@ -419,8 +421,15 @@ pub fn build_bigram_and_query(
     let target_sources = filters.target.sources();
     debug_assert!(!target_sources.is_empty());
 
-    let mut token_queries: Vec<(Occur, Box<dyn Query>)> =
-        Vec::with_capacity(include_tokens.len() + 3);
+    // OR モード (docs §20): include トークンを Should で束ねて別 BooleanQuery を作り、
+    // その全体を Must として token_queries に積む。AND モードは従来どおり各 token を
+    // 直接 Must にする。favorite_id / kind フィルタは必ず Must で後から AND 結合する。
+    let token_occur = match filters.mode {
+        crate::search_query::MatchMode::And => Occur::Must,
+        crate::search_query::MatchMode::Or => Occur::Should,
+    };
+    let mut per_token_queries: Vec<(Occur, Box<dyn Query>)> =
+        Vec::with_capacity(include_tokens.len());
     for tok in include_tokens {
         let lowered = crate::search_norm::normalize_for_match(tok);
         let mut tokenizer = NgramTokenizer::new(2, 2, false).ok()?;
@@ -449,8 +458,26 @@ pub fn build_bigram_and_query(
             }
             field_disjuncts.push((Occur::Should, Box::new(BooleanQuery::from(bigram_ands))));
         }
-        token_queries.push((Occur::Must, Box::new(BooleanQuery::from(field_disjuncts))));
+        per_token_queries.push((token_occur, Box::new(BooleanQuery::from(field_disjuncts))));
     }
+
+    // AND モードは per_token_queries を直接 top-level に並べて Must 結合。
+    // OR モードは Should 群を 1 つの BooleanQuery で包んで Must として積む (= 少なくとも 1 件一致)。
+    // ただし token が 1 個なら OR/AND どちらも実効意味が同じなので、余計な入れ子を避ける。
+    let mut token_queries: Vec<(Occur, Box<dyn Query>)> =
+        if matches!(filters.mode, crate::search_query::MatchMode::Or)
+            && per_token_queries.len() > 1
+        {
+            let any = BooleanQuery::from(per_token_queries);
+            vec![(Occur::Must, Box::new(any))]
+        } else {
+            // 1 token の場合は occur を Must に正規化 (per_token_queries には Should が入っていることがある)
+            per_token_queries
+                .into_iter()
+                .map(|(_, q)| (Occur::Must, q))
+                .collect()
+        };
+    token_queries.reserve(3);
 
     // favorite_id スコープ filter (複数 favorite の OR を更に Must として追加)
     if let Some(ids) = filters.favorite_ids {
@@ -1343,5 +1370,111 @@ mod tests {
         let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 1, "Tags target は tags フィールドのみ対象");
         assert_eq!(paths[0], "c:/a.jpg");
+    }
+
+    // ---- OR モード (docs §20) ----
+
+    #[test]
+    fn or_mode_matches_any_include_token() {
+        use crate::search_query::MatchMode;
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "夕焼け")).unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav, "海辺")).unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/c.jpg", fav, "unrelated"),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        // OR で "夕焼け" OR "海辺" → a, b の両方ヒット
+        let q = build_bigram_and_query(
+            idx.fields(),
+            &["夕焼け", "海辺"],
+            &QueryFilters {
+                mode: MatchMode::Or,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let searcher = idx.searcher();
+        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
+        let paths: std::collections::HashSet<_> =
+            hits.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains("c:/a.jpg"));
+        assert!(paths.contains("c:/b.jpg"));
+        assert!(!paths.contains("c:/c.jpg"), "どちらも含まない doc は除外");
+    }
+
+    #[test]
+    fn or_mode_single_token_behaves_like_and() {
+        // include 1 個なら OR/AND 結果は常に同じ (短絡最適化の回帰防止)。
+        use crate::search_query::MatchMode;
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "夕焼け 海辺")).unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav, "朝日")).unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        let searcher = idx.searcher();
+        let q_and = build_bigram_and_query(idx.fields(), &["夕焼け"], &QueryFilters::default()).unwrap();
+        let q_or = build_bigram_and_query(
+            idx.fields(),
+            &["夕焼け"],
+            &QueryFilters {
+                mode: MatchMode::Or,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let and_hits: Vec<_> = search_page(&searcher, idx.fields(), &q_and, 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let or_hits: Vec<_> = search_page(&searcher, idx.fields(), &q_or, 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(and_hits, or_hits, "1 token では AND/OR ヒット集合が一致");
+        assert_eq!(and_hits, vec!["c:/a.jpg".to_string()]);
+    }
+
+    #[test]
+    fn or_mode_respects_favorite_and_kind_filters() {
+        // OR モードでも favorite / kind の AND フィルタは有効
+        use crate::search_query::MatchMode;
+        let (_tmp, idx) = new_index();
+        let fav_a = Uuid::new_v4();
+        let fav_b = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav_a, "夕焼け")).unwrap();
+        upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav_b, "海辺")).unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        // "夕焼け" OR "海辺" だが favorite=fav_a に絞る → a のみ
+        let favs = [fav_a];
+        let q = build_bigram_and_query(
+            idx.fields(),
+            &["夕焼け", "海辺"],
+            &QueryFilters {
+                mode: MatchMode::Or,
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let searcher = idx.searcher();
+        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "c:/a.jpg");
     }
 }

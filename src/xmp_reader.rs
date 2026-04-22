@@ -865,6 +865,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_dc_subject_tolerates_undeclared_xmp_prefix_after_subject() {
+        // mxd が書き出す XMP は最初の rdf:Description に xmlns:dc しか載せない。
+        // そこに我々が `<xmp:MetadataDate>` を追記すると、xmlns:xmp が未宣言のまま
+        // 未定義プレフィックスを使う不正 XML になる。このケースでも dc:subject が
+        // 先に出現していれば tag を取り出せることを保証する。
+        let xmp = r#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+ <rdf:Description rdf:about=''
+  xmlns:dc='http://purl.org/dc/elements/1.1/'>
+    <dc:subject>
+      <rdf:Bag>
+        <rdf:li>#ドール</rdf:li>
+      </rdf:Bag>
+    </dc:subject>
+    <xmp:MetadataDate>2026-04-22T04:04:58+00:00</xmp:MetadataDate>
+    </rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"#;
+        let tags = parse_dc_subject(xmp.as_bytes());
+        assert_eq!(
+            tags,
+            vec!["#ドール"],
+            "xmlns:xmp 未宣言でも dc:subject は読める"
+        );
+    }
+
+    #[test]
     fn read_dc_subject_from_jpeg_roundtrip() {
         let xml = r#"<?xml version='1.0'?>
 <x:xmpmeta xmlns:x='adobe:ns:meta/'>

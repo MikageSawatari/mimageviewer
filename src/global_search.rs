@@ -88,6 +88,8 @@ pub struct SearchScope {
     pub kinds: Option<Vec<IndexKind>>,
     /// 検索対象ドロップダウン "EXIF / XMP / ..."。既定は `All`。
     pub target: SearchTarget,
+    /// include トークン結合モード (docs §20)。既定は AND。
+    pub mode: crate::search_query::MatchMode,
 }
 
 /// 検索ワーカーのエントリーポイント。別スレッドで実行する想定。
@@ -148,6 +150,7 @@ pub fn run(
         favorite_ids: Some(favorite_ids),
         kinds: scope.kinds.as_deref(),
         target: scope.target.clone(),
+        mode: scope.mode,
     };
     let Some(query) =
         fts_index::build_bigram_and_query(fts.fields(), &include_tokens, &filters)
@@ -214,7 +217,7 @@ pub fn run(
                 Some(t) => t,
                 None => continue, // tombstone / race condition で取れない場合はスキップ
             };
-            if search_query::matches(&tokens, text) {
+            if search_query::matches_with_mode(&tokens, text, scope.mode) {
                 batch.push(GlobalHit { path, score });
                 valid += 1;
                 if valid >= HARD_MAX {

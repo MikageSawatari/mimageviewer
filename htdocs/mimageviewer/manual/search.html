@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>検索機能 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>検索機能</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="search.html" class="active">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">検索機能</h1>
+    <p class="page-desc">
+      mImageViewer には 3 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>) があります。
+      対象範囲と検索できる情報が違うので、使い分けると目的の画像やフォルダに素早く辿り着けます。
+    </p>
+
+    <h2 id="overview">1. 3 つの検索モードの使い分け</h2>
+
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr>
+            <th>ショートカット</th>
+            <th>検索対象</th>
+            <th>検索できる情報</th>
+            <th>典型的な用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><kbd>Ctrl</kbd>+<kbd>S</kbd></td>
+            <td>お気に入り配下の<strong>フォルダ / ZIP / PDF 名</strong></td>
+            <td>名前のみ</td>
+            <td>「あのフォルダ、どこに置いたっけ?」を名前で呼び出す</td>
+          </tr>
+          <tr>
+            <td><kbd>Ctrl</kbd>+<kbd>F</kbd></td>
+            <td><strong>今表示中のフォルダ</strong>内の画像・PDF</td>
+            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / タグ</td>
+            <td>開いているフォルダを絞り込む (Lightroom のフィルタに近い)</td>
+          </tr>
+          <tr>
+            <td><kbd>Ctrl</kbd>+<kbd>G</kbd></td>
+            <td><strong>お気に入り全体</strong>の画像・PDF</td>
+            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / タグ</td>
+            <td>お気に入り横断で 1 枚の画像を掘り出す</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        <strong>どれを使えばいい?</strong>
+        <ul>
+          <li>名前だけ覚えている → <kbd>Ctrl</kbd>+<kbd>S</kbd></li>
+          <li>開いているフォルダの中で探したい → <kbd>Ctrl</kbd>+<kbd>F</kbd></li>
+          <li>お気に入り全体から画像 1 枚を見つけたい → <kbd>Ctrl</kbd>+<kbd>G</kbd></li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 id="ctrl-s">2. Ctrl+S: お気に入り名前検索</h2>
+    <p>お気に入りに登録したルート配下の<strong>フォルダ / ZIP / PDF の名前</strong>を部分一致で
+    引き当てます。過去に訪れたフォルダを名前で呼び出すのに向いています。</p>
+
+    <ol>
+      <li>メニュー「お気に入り」→「名前で検索 (<kbd>Ctrl</kbd>+<kbd>S</kbd>)」で画面上部に検索バーが出ます。</li>
+      <li>キーワードを入力すると即座に部分一致で絞り込まれます (大小区別なし)。</li>
+      <li>結果は名前昇順で最大 5000 件まで表示されます。</li>
+      <li>× ボタンまたは <kbd>Esc</kbd> で閉じ、元のフォルダに戻ります。</li>
+    </ol>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>事前に名前索引を ON にしてください:</strong>
+        Ctrl+S の対象は<a href="#search-index">名前索引</a>に登録されたエントリだけです。
+        名前索引は<strong>既定で OFF</strong>なので、お気に入りダイアログで「名前索引」の
+        チェックを ON にする必要があります (ON にするとその場で再帰的に走査し、以後は自動追従)。
+      </div>
+    </div>
+
+    <h3>絞り込みフィルタ</h3>
+    <ul>
+      <li><strong>お気に入り</strong>: 「すべて」または単一のお気に入り配下に絞り込み。</li>
+      <li><strong>OR 検索</strong>: <a href="#or-mode">後述</a>の OR モードに切り替え。</li>
+    </ul>
+
+    <h2 id="ctrl-f">3. Ctrl+F: ローカル検索 (メタデータ検索)</h2>
+    <p><kbd>Ctrl</kbd>+<kbd>F</kbd> で<strong>今表示しているフォルダ</strong>の中身を絞り込みます。
+    ファイル名に加え、EXIF・XMP・PNG の AI プロンプト・PDF メタデータ・タグまで検索対象に含められます。
+    Lightroom の「フィルタ」バーに近い使い勝手です。</p>
+
+    <ol>
+      <li>メニュー「ファイル」→「メタデータ検索 (<kbd>Ctrl</kbd>+<kbd>F</kbd>)」で画面上部に検索バーが出ます。</li>
+      <li>キーワードを入力して <kbd>Enter</kbd> で確定 (入力中も逐次絞り込みされます)。</li>
+      <li>「検索対象」ドロップダウンでどのメタデータを見るかを変更できます (<a href="#target">後述</a>)。</li>
+      <li>× ボタンまたは <kbd>Esc</kbd> で閉じます。</li>
+    </ol>
+
+    <h3>表示中の ZIP についても検索します</h3>
+    <p>ZIP を開いた状態で Ctrl+F を使うと、ZIP 内の PNG メタデータも同じルールで検索されます。
+    PDF の場合はタイトル・著者などのドキュメントメタデータが対象です。</p>
+
+    <h3>Ctrl+F はインデックス不要で動きます</h3>
+    <p>表示中のアイテムを対象に、その場で EXIF / XMP / PNG テキスト等を読んで判定します。
+    さらに<a href="#search-index">メタ索引</a>を ON にしたお気に入り配下のファイルでは高速パスが
+    効き、EXIF / XMP をディスクから読み直さず索引から引くので数千件のフォルダでも即時です。</p>
+
+    <h2 id="ctrl-g">4. Ctrl+G: グローバル全文検索</h2>
+    <p>メニュー「お気に入り」→「メタデータ検索 (<kbd>Ctrl</kbd>+<kbd>G</kbd>)」でお気に入り全体を
+    横断検索します。数万件規模でも Tantivy (bigram 索引) による全文検索で即座にヒット件数と候補が
+    表示されます。</p>
+
+    <ol>
+      <li>任意のタイミングで <kbd>Ctrl</kbd>+<kbd>G</kbd> を押すと画面上部に検索バーが出ます。</li>
+      <li>キーワードを入力すると 300ms のデバウンス後に自動実行されます。</li>
+      <li>結果はヒット件数が多いフォルダ順に「コンテナ」として表示。クリックで中を覗けます。</li>
+      <li>× ボタンまたは <kbd>Esc</kbd> で閉じて元のフォルダに戻ります。</li>
+    </ol>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>事前にメタ索引を ON にしてください:</strong>
+        Ctrl+G はお気に入りダイアログ (お気に入り → 編集) で「メタ索引」を ON にした
+        お気に入り配下だけを対象にします。<strong>メタ索引は既定で OFF</strong>のため、
+        ON にしない限り Ctrl+G でヒットは出ません。
+      </div>
+    </div>
+
+    <h3>最小クエリ長の制限</h3>
+    <p>Ctrl+G は bigram 索引の精度のため、以下の最小長を要求します:</p>
+    <ul>
+      <li>CJK (日本語・中国語・韓国語): <strong>2 文字以上</strong></li>
+      <li>ASCII / 数字: <strong>3 文字以上</strong></li>
+      <li>タグトークン (<code>#タグ名</code>) はこの制約の対象外 (完全一致のため)</li>
+    </ul>
+    <p>Ctrl+F と Ctrl+S にはこの制約はありません (直接文字列一致のため短いトークンでも動きます)。</p>
+
+    <h2 id="query-syntax">5. 検索クエリ構文 (3 モード共通)</h2>
+
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr><th>書き方</th><th>意味</th><th>例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>word1 word2</code></td><td>AND: すべて含む</td><td><code>夕焼け 海辺</code></td></tr>
+          <tr><td><code>-word</code></td><td>NOT: 含まない (除外は常に AND)</td><td><code>夕焼け -曇り</code></td></tr>
+          <tr><td><code>"word1 word2"</code></td><td>フレーズ: 連続する文字列</td><td><code>"golden hour"</code></td></tr>
+          <tr><td><code>-"word1 word2"</code></td><td>フレーズの NOT</td><td><code>-"low quality"</code></td></tr>
+          <tr><td><code>#タグ名</code></td><td>タグ検索 (<code>#</code> 込みで一致)</td><td><code>#原神 #風景</code></td></tr>
+          <tr><td><code>-#タグ名</code></td><td>タグの除外</td><td><code>#風景 -#夜景</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">🔤</span>
+      <div class="box-body">
+        <strong>大文字小文字の扱い:</strong>
+        クエリは自動で小文字化されて比較されます (<code>SunSet</code> == <code>sunset</code>)。
+      </div>
+    </div>
+
+    <h3 id="or-mode">OR 検索モード</h3>
+    <p>検索バー右端の <code>□OR</code> チェックを入れると、<strong>AND</strong> ではなく <strong>OR</strong> で
+    include トークンを結合します。ただし <code>-word</code> の除外は常に AND で効きます。</p>
+
+    <table>
+      <thead>
+        <tr><th>クエリ</th><th>AND モード (既定)</th><th>OR モード (チェック時)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>klee paimon</code></td>
+          <td>両方の語を含むものだけ</td>
+          <td>いずれかの語を含むもの</td>
+        </tr>
+        <tr>
+          <td><code>klee #klee</code></td>
+          <td>(キーワード "klee" と タグ "#klee") を両方含む</td>
+          <td>キーワードかタグのいずれかで "klee" を含む</td>
+        </tr>
+        <tr>
+          <td><code>klee #klee -sleep -nsfw</code></td>
+          <td>"klee" と "#klee" を両方含み、"sleep" も "nsfw" も含まない</td>
+          <td>"klee" か "#klee" のいずれかを含み、"sleep" も "nsfw" も含まない</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="box info">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        <strong>いつ OR モードを使う?</strong>
+        同じ対象を別表記で呼ぶ場合 (例: キーワード <code>klee</code> と タグ <code>#klee</code> の両方を見たい、
+        <code>sunset</code> と <code>夕焼け</code> をまとめて拾いたい、など) に便利です。
+        OR にしても除外語は AND なので、<code>klee #klee -nsfw</code> で安全に広く拾えます。
+      </div>
+    </div>
+
+    <h2 id="filters">6. 絞り込みドロップダウン</h2>
+    <p>検索バー右側のドロップダウンで、検索範囲をさらに狭めることができます。
+    どのバーがどのドロップダウンを持つかは下表のとおり:</p>
+
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr><th>ドロップダウン</th><th>Ctrl+S</th><th>Ctrl+F</th><th>Ctrl+G</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>お気に入り</td><td>◯</td><td>—</td><td>◯</td></tr>
+          <tr><td>タイプ (フォルダ/画像/ZIP/PDF)</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>検索対象 (EXIF/XMP/…)</td><td>—</td><td>◯</td><td>◯</td></tr>
+          <tr><td>タグピッカー</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>OR 検索チェック</td><td>◯</td><td>◯</td><td>◯</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>お気に入り (Ctrl+S / Ctrl+G)</h3>
+    <p>「すべて」または特定の 1 つのお気に入りに絞ります。複数のお気に入りをまたぐ検索で、
+    対象を狭めたいときに使います。Ctrl+S では名前索引 ON のお気に入り、Ctrl+G ではメタ索引 ON
+    のお気に入りだけが候補に出ます。</p>
+
+    <h3>タイプ (Ctrl+G 専用)</h3>
+    <p><strong>フォルダ / 画像 / ZIP ファイル / PDF ファイル</strong>から 1 つを選んで絞り込みます。
+    「PDF のタイトルだけで検索したい」「フォルダ名だけ見たい」といった用途に使います。</p>
+
+    <h3 id="target">検索対象 (Ctrl+F / Ctrl+G 共通)</h3>
+    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 6 ソースの OR:</p>
+    <ul>
+      <li><strong>ファイル名</strong>: ファイル名 (拡張子込み)</li>
+      <li><strong>EXIF</strong>: カメラ本体の撮影情報 (メーカー・モデル・レンズ・絞り etc.)</li>
+      <li><strong>mXD ツイート情報</strong>: <a href="https://github.com/mikage-toolbox/mxd">mXD</a>
+          が保存した XMP ツイート本文・投稿者・URL</li>
+      <li><strong>AI プロンプト (PNG)</strong>: Stable Diffusion などが PNG tEXt に埋め込んだプロンプト
+          (Negative Prompt は自動で除外)</li>
+      <li><strong>PDF メタ情報</strong>: PDF のタイトル / 著者 / 件名 / キーワード</li>
+      <li><strong>タグ</strong>: mImageViewer の<a href="tags.html">タグ機能</a>で付けた <code>#タグ名</code></li>
+    </ul>
+    <p>単一ソースに絞ると、そのソース以外の情報はノイズとして弾かれます。例えば
+    「EXIF のレンズ名だけで探したい」「AI プロンプトに EXIF が混ざって困る」といった場面で使います。</p>
+
+    <h3>タグピッカー (Ctrl+G 専用)</h3>
+    <p>検索バー右の「タグ」ドロップダウンから登録済みタグを選ぶと、クエリ欄に <code>#タグ名</code> が
+    自動で追記されます。タグ名の正確な表記を覚えていなくても使えます (<a href="tags.html">タグ機能</a>参照)。</p>
+
+    <h2 id="results">7. 結果の読み方</h2>
+
+    <h3>Ctrl+F の結果表示</h3>
+    <ul>
+      <li>マッチしたアイテムだけがグリッドに残り、ヒット件数が検索バー右に出ます。</li>
+      <li>通常のサムネイル操作 (Space / Enter でフルスクリーン等) はそのまま使えます。</li>
+      <li>Esc / × で元のフォルダ全表示に戻ります。</li>
+    </ul>
+
+    <h3>Ctrl+G の結果表示</h3>
+    <ul>
+      <li>ヒットした画像は「コンテナ」(直上のフォルダまたは ZIP) ごとに集約されます。</li>
+      <li>ヒット件数が多いコンテナから順に並びます。</li>
+      <li>コンテナをダブルクリックで中を覗くと、当該フォルダ配下のヒットだけを樹形で表示します
+          (ヒットを含まない枝は自動で刈られます)。</li>
+      <li><kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> でコンテナを跨いで前後のヒット画像へ移動できます。</li>
+      <li>大量ヒット時は 10000 件で打ち切られます (検索バーに「絞り込みキーワードを追加してください」と出ます)。</li>
+    </ul>
+
+    <h2 id="search-index">8. 検索インデックスの作成と保守</h2>
+    <p>mImageViewer は 2 種類のインデックスを持ちます。どちらも<strong>既定では OFF</strong>で、
+    お気に入りダイアログで個別に ON にする必要があります。</p>
+
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr><th>インデックス</th><th>格納するもの</th><th>使われる検索</th><th>既定</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>名前索引</strong></td>
+            <td>フォルダ / ZIP / PDF の名前 (SQLite)</td>
+            <td>Ctrl+S</td>
+            <td>OFF</td>
+          </tr>
+          <tr>
+            <td><strong>メタ索引</strong></td>
+            <td>画像の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + タグ (Tantivy)</td>
+            <td>Ctrl+G / Ctrl+F 高速パス / グリッドのタグバッジ</td>
+            <td>OFF</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>ON にする手順</h3>
+    <ol>
+      <li>メニュー「お気に入り」→「編集」でお気に入りダイアログを開く。</li>
+      <li>お気に入りごとに並んだ「名前索引」「メタ索引」のチェックボックスを ON にする
+          (追加直後の既定は両方 OFF)。</li>
+      <li>ON にしたお気に入りは、その場で配下を再帰的に走査してインデックスを作成します。
+          以降は notify-rs による自動監視でファイル追加/削除/変更を追従します。</li>
+    </ol>
+
+    <h3>進捗の確認</h3>
+    <p>初期スキャン中は次の場所で進捗を確認できます:</p>
+    <ul>
+      <li><strong>ウィンドウタイトルバー</strong>: <code>(インデックス更新中)</code> がサフィックスに出ます
+          (名前索引・メタ索引のどちらかがスキャン実行中なら表示)。</li>
+      <li><strong>お気に入りダイアログ</strong>: 各お気に入り行にインライン状態
+          (<code>⏳ 起動中</code> / <code>⏳ スキャン中</code> / <code>✅</code> 等) が出ます。</li>
+    </ul>
+    <p>大容量お気に入り (数万枚) で初回は数分〜数十分かかる場合があります。スキャン中に
+    mImageViewer を終了しても、次回起動時に続きから再開されます。</p>
+
+    <h3>インデックスの再構築</h3>
+    <p>正常運用では notify-rs 監視で自動同期されるため、手動再構築は通常不要です。
+    それでもインデックスが壊れた / 怪しいと感じる場合:</p>
+    <ul>
+      <li><strong>チェックボックス OFF → ON</strong>: お気に入りダイアログでチェックを一度 OFF にして
+          ON に戻すと、配下を再度フル走査します (該当お気に入りだけ)。</li>
+      <li><strong>インデックスファイル削除 → 再起動</strong>: 以下のファイル / フォルダを削除して
+          mImageViewer を再起動すると、ON にしている全お気に入りが初期スキャンからやり直します。
+          <ul>
+            <li>名前索引: <code>%APPDATA%\mimageviewer\search_index.db</code></li>
+            <li>メタ索引: <code>%APPDATA%\mimageviewer\fts_meta.db</code> および
+                <code>%APPDATA%\mimageviewer\fts_index\</code> フォルダ</li>
+          </ul>
+      </li>
+    </ul>
+
+    <h2 id="shortcuts">9. 関連ショートカット</h2>
+
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>お気に入り名前検索を開く / 閉じる</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>現在フォルダのメタデータ検索を開く / 閉じる</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>お気に入り全体のグローバル検索を開く / 閉じる</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>検索を実行 (テキスト欄にフォーカス中)</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>検索バーを閉じる</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd></td><td>Ctrl+G の結果内で前後のヒットへ移動</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        IME 変換中の <kbd>Enter</kbd> (変換確定) や <kbd>Esc</kbd> (変換キャンセル) は検索バーが奪わないようになっています。
+        日本語をそのまま入力して変換確定するだけで検索できます。
+      </div>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+</body>
+</html>

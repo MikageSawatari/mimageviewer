@@ -355,6 +355,7 @@ fn run_metadata_search(
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
     target: &crate::fts_index::SearchTarget,
+    mode: crate::search_query::MatchMode,
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -420,7 +421,7 @@ fn run_metadata_search(
                 let key = crate::search_index_db::normalize_path(path);
                 match preloaded_texts.get(&key) {
                     Some(preloaded) => {
-                        if crate::search_query::matches(tokens, preloaded) {
+                        if crate::search_query::matches_with_mode(tokens, preloaded, mode) {
                             matches.insert(idx);
                         }
                     }
@@ -443,13 +444,13 @@ fn run_metadata_search(
                         .push((idx, entry_name.clone()));
                 } else {
                     let name = crate::zip_loader::entry_basename(entry_name);
-                    if crate::search_query::matches(tokens, name) {
+                    if crate::search_query::matches_with_mode(tokens, name, mode) {
                         matches.insert(idx);
                     }
                 }
             }
             GridItem::PdfPage { .. } => {
-                if crate::search_query::matches(tokens, &item.name()) {
+                if crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }
             }
@@ -486,7 +487,7 @@ fn run_metadata_search(
             let key = crate::search_index_db::normalize_path(path);
             if let Some(preloaded) = preloaded_texts.get(&key) {
                 // preloaded は target で既に列選択済み (lookup_norms_for_target)
-                if crate::search_query::matches(tokens, preloaded) {
+                if crate::search_query::matches_with_mode(tokens, preloaded, mode) {
                     matches.insert(idx);
                 }
                 continue;
@@ -511,7 +512,7 @@ fn run_metadata_search(
         };
         let name_for_hay = if use_name { name.as_str() } else { "" };
         let hay_no_xmp = hay_of(&meta_text, name_for_hay, None);
-        match crate::search_query::decide_partial(tokens, &hay_no_xmp) {
+        match crate::search_query::decide_partial_with_mode(tokens, &hay_no_xmp, mode) {
             crate::search_query::PartialResult::Decided(true) => {
                 matches.insert(idx);
             }
@@ -559,7 +560,7 @@ fn run_metadata_search(
                     }
                 }
                 let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());
-                if crate::search_query::matches(tokens, &hay) {
+                if crate::search_query::matches_with_mode(tokens, &hay, mode) {
                     matches.insert(idx);
                 }
             }
@@ -621,9 +622,10 @@ fn run_metadata_search(
                 };
                 let entry_name_str = crate::zip_loader::entry_basename(&entry_name);
                 let name_for_hay = if use_name { entry_name_str } else { "" };
-                if crate::search_query::matches(
+                if crate::search_query::matches_with_mode(
                     tokens,
                     &hay_of(&meta_text, name_for_hay, xmp.as_ref()),
+                    mode,
                 ) {
                     matches.insert(idx);
                 }
@@ -881,6 +883,8 @@ pub(crate) struct FavSearchState {
     pub results_paths: Vec<PathBuf>,
     /// お気に入り絞り込み (None = すべて、Some(id) = 単一 favorite に限定) — §19.7 準拠。
     pub favorite_filter: Option<uuid::Uuid>,
+    /// OR 検索モード (docs §20)。`true` なら include トークンを OR 結合 (NOT は常に AND)。
+    pub or_mode: bool,
 }
 
 impl FavSearchState {
@@ -1199,9 +1203,16 @@ pub struct App {
     pub(crate) xmp_cache:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
-    /// メタデータパネルのタグボタン状態表示で使用。タグ書き込み worker の完了時に
-    /// エントリを invalidate (削除) し、次回描画で再取得する。
+    /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。タグ書き込み
+    /// worker の完了時にエントリを invalidate (削除) し、次回描画で再取得する。
     pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
+    /// tag toast 用: 直近の Toggle 操作で UI が使っていたタグ名 (`#ドール` 等)。
+    /// worker 完了時に「N 件に #ドール を付与 / 削除」として表示するのに使う。
+    pub(crate) tag_toast_label: Option<String>,
+    /// tags_cache の最終更新時刻 (tag write が完了したタイミング)。
+    /// 現在は未参照だが、将来 grid 側で「最近書いたタグの視覚フラッシュ」等に使える。
+    #[allow(dead_code)]
+    pub(crate) tags_cache_last_change: Option<std::time::Instant>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -1271,6 +1282,8 @@ pub struct App {
     pub(crate) search_has_focus: bool,
     /// Ctrl+F の「検索対象」ドロップダウン選択 (§19.7)。既定は全ソース OR。
     pub(crate) search_target: crate::fts_index::SearchTarget,
+    /// Ctrl+F の OR 検索モード (docs §20)。`true` で include トークンを OR 結合 (NOT は AND)。
+    pub(crate) search_or_mode: bool,
 
     // ── 回転 DB ──────────────────────────────────────────────────
     /// 回転情報 DB (全体で 1 ファイル)
@@ -1704,6 +1717,8 @@ impl Default for App {
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
             tags_cache: std::collections::HashMap::new(),
+            tag_toast_label: None,
+            tags_cache_last_change: None,
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -1725,6 +1740,7 @@ impl Default for App {
             search_focus_request: false,
             search_has_focus: false,
             search_target: crate::fts_index::SearchTarget::All,
+            search_or_mode: false,
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
             rotation_cache: std::collections::HashMap::new(),
             rating_db: crate::rating_db::RatingDb::open().ok(),
@@ -2612,13 +2628,14 @@ impl App {
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
 
+        let mode: crate::search_query::MatchMode = self.favsearch.or_mode.into();
         std::thread::Builder::new()
             .name("favsearch-db".to_string())
             .spawn(move || {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = db.search(&query, &fav_roots);
+                let result = db.search(&query, &fav_roots, mode);
                 // キャンセル後の送信は無意味なので捨てる (UI 側 pending も None に戻っている)
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
@@ -3069,6 +3086,8 @@ impl App {
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
         let prewarm_t0 = std::time::Instant::now();
         self.prewarm_rating_cache();
+        // タグバッジ用も同様に fts_meta から一括 prewarm (indexed favorite のみ)。
+        self.prewarm_grid_tags();
         self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -6088,6 +6107,7 @@ impl App {
             .as_ref()
             .map(|mgr| mgr.clone_fts_meta());
         let target = self.search_target.clone();
+        let mode: crate::search_query::MatchMode = self.search_or_mode.into();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -6103,6 +6123,7 @@ impl App {
                     &xmp_snapshot,
                     fts_meta_clone.as_ref(),
                     &target,
+                    mode,
                     &cancel_w,
                 );
                 let _ = tx.send(result);
@@ -6264,6 +6285,64 @@ impl App {
             let stars = map.get(&key).copied().unwrap_or(0);
             self.rating_cache.insert(idx, stars);
         }
+    }
+
+    /// グリッドのタグバッジ表示用に fts_meta.db からタグ列を一括取得してキャッシュに載せる。
+    /// `auto_index_metadata=true` のお気に入り配下でのみデータが引ける。
+    /// 非インデックスのファイルは grid バッジを出さない — ファイル単位で同期 XMP 読み込みを
+    /// すると HDD で数百 ms 止まるため。ユーザーが grid でもバッジを見たい場合は
+    /// お気に入りのメタ索引を ON にする運用を想定。
+    ///
+    /// **重要**: `tags_cache` は `ui_metadata_panel::get_current_tags_cached` とも共有で、
+    /// 値が `Some(Vec)` ならキャッシュヒットとして扱われ XMP 直読みをスキップする。
+    /// 未インデックスのエントリに空 Vec を入れるとフルスクリーンで正しく XMP が読まれず
+    /// タグが空表示になるため、fts_meta に行が無い path はキャッシュに入れない。
+    pub(crate) fn prewarm_grid_tags(&mut self) {
+        let Some(mgr) = self.indexer_manager.as_ref() else {
+            return;
+        };
+        let meta = mgr.clone_fts_meta();
+        // Image アイテムの path を収集。ZipImage / PdfPage は書き込み非対応なので除外。
+        let mut keys: Vec<(String, String)> = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            if let GridItem::Image(p) = item {
+                if crate::xmp_writer::is_writable_format(p) {
+                    let key = crate::search_index_db::normalize_path(p);
+                    let cache_key = crate::adjustment_db::normalize_path(p);
+                    keys.push((key, cache_key));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return;
+        }
+        let db_keys: Vec<String> = keys.iter().map(|(k, _)| k.clone()).collect();
+        let Ok(rows) = meta.lookup_tags(&db_keys) else {
+            return;
+        };
+        let row_map: std::collections::HashMap<String, String> = rows.into_iter().collect();
+        // fts_meta に行がある path だけ cache に入れる (行があれば、空文字列 = タグ無しも
+        // 信頼できる情報として cache 可)。未登録 path は cache に入れないで、フルスクリーンが
+        // 従来どおり XMP から直読みできるようにする。
+        for (db_key, cache_key) in keys {
+            if let Some(tags_str) = row_map.get(&db_key) {
+                let tags: Vec<String> = tags_str
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+                self.tags_cache.insert(cache_key, tags);
+            }
+        }
+    }
+
+    /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
+    /// キャッシュに載っていない = fts_meta 未登録 → 空を返す (バッジ非表示)。
+    pub(crate) fn cell_tag_list(&self, idx: usize) -> &[String] {
+        let Some(GridItem::Image(p)) = self.items.get(idx) else {
+            return &[];
+        };
+        let key = crate::adjustment_db::normalize_path(p);
+        self.tags_cache.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
@@ -9780,6 +9859,8 @@ pub(crate) fn draw_cell(
     // Some(tex) なら `ThumbnailState::Loaded.tex` の代わりにこちらを描画する
     // (色調補正済みサムネイルテクスチャ)。None または Loaded 以外なら生サムネ。
     adjusted_tex: Option<&egui::TextureHandle>,
+    // 画像セルに表示する XMP dc:subject 由来のタグ (`#原神` 等)。空なら非表示。
+    tags: &[String],
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -10137,6 +10218,61 @@ pub(crate) fn draw_cell(
             egui::Color32::from_rgb(255, 215, 50),
         );
     }
+
+    // タグバッジ (右下、半透明背景 + 緑色)。# 始まりのタグを 1 バッジにまとめて
+    // `#原神 #風景` のように連結表示する。長いときは末尾を `…` で省略。
+    if !tags.is_empty() {
+        draw_tag_badges(painter, rect, tags);
+    }
+}
+
+/// サムネイルセル右下にタグ (`#xxx #yyy`) をまとめて描画する。幅がセルに収まらない
+/// 場合は末尾を省略。空配列の呼び出しは `draw_cell` 側で弾かれている前提。
+fn draw_tag_badges(painter: &egui::Painter, rect: egui::Rect, tags: &[String]) {
+    let font = egui::FontId::proportional(11.0);
+    let text_h = 15.0;
+    let max_w = rect.width() - 10.0;
+    // `#` 始まり (mIV 付与) を優先、続いて他ソフト由来の裸タグを並べる。
+    let hash_first: Vec<&String> = tags
+        .iter()
+        .filter(|t| t.starts_with('#'))
+        .chain(tags.iter().filter(|t| !t.starts_with('#')))
+        .collect();
+    let mut combined = String::new();
+    for t in &hash_first {
+        if !combined.is_empty() {
+            combined.push(' ');
+        }
+        combined.push_str(t);
+    }
+    // 幅に収まらなければ文字単位で削る + 末尾 ellipsis。
+    // 簡易 measure: egui の painter.layout はアロケートが重いので、文字ごと平均幅で近似する。
+    let avg_char_w = 7.0;
+    let max_chars = ((max_w / avg_char_w) as usize).max(4);
+    if combined.chars().count() > max_chars {
+        combined = combined.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…";
+    }
+    if combined.is_empty() {
+        return;
+    }
+    // 幅を再計算 (ellipsis 込みの概算)
+    let approx_w = combined.chars().count() as f32 * avg_char_w + 8.0;
+    let bg_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.max.x - approx_w - 3.0, rect.max.y - text_h - 3.0),
+        egui::vec2(approx_w, text_h),
+    );
+    painter.rect_filled(
+        bg_rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(0, 40, 20, 170),
+    );
+    painter.text(
+        bg_rect.left_center() + egui::vec2(4.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        combined,
+        font,
+        egui::Color32::from_rgb(180, 255, 180),
+    );
 }
 
 /// サムネイル画質プレビュー用: 実グリッドと同じ `cell_w × cell_h` のセルを描画する。

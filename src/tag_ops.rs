@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::app::App;
 use crate::grid_item::GridItem;
-use crate::tag_write_worker::{TagJobKind, TagWriteHandle, TagWriteJob};
+use crate::tag_write_worker::{TagAction, TagJobKind, TagWriteHandle, TagWriteJob};
 
 impl App {
     pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
@@ -38,33 +38,30 @@ impl App {
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
         let name_owned = name.to_string();
-        let success_msg = {
-            let count = self.tag_target_paths().len();
-            format!("{} 件にタグ #{} をトグル", count, name)
-        };
-        self.submit_tag_jobs(
-            move |_| TagJobKind::Toggle(name_owned.clone()),
-            success_msg,
-        );
+        // Toggle は worker 側で XMP を読んで Add/Remove に解決する。
+        // 結果 (付与されたか / 削除されたか) は `poll_tag_write_results` が完了時に
+        // まとめてトースト表示するため、ここでは事前トーストを出さない。
+        self.tag_toast_label = Some(format!("#{name_owned}"));
+        self.submit_tag_jobs(move |_| TagJobKind::Toggle(name_owned.clone()));
     }
 
     pub(crate) fn request_tag_clear_for_selection(&mut self) {
-        let success_msg = {
-            let count = self.tag_target_paths().len();
-            format!("{} 件から mIV タグをクリア", count)
-        };
-        self.submit_tag_jobs(|_| TagJobKind::ClearMiv, success_msg);
+        self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
+        let paths = self.tag_target_paths();
+        let count = paths.len();
+        if count == 0 {
+            return;
+        }
+        self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
+        self.submit_tag_jobs(|_| TagJobKind::ClearMiv);
     }
 
     /// タグ書き込みジョブ投入の共通経路。
     /// - 対象 path が 0 件 → 黙って何もしない (通常は UI でボタンがグレーアウトしている)
     /// - `tag_write_handle` 初期化失敗 → エラートーストを出して失敗を明示
-    /// - 正常 → 各 path で `kind_for` を呼んでジョブを作成し、成功トーストを出す
-    fn submit_tag_jobs(
-        &mut self,
-        kind_for: impl Fn(&PathBuf) -> TagJobKind,
-        success_msg: String,
-    ) {
+    /// - 正常 → 各 path で `kind_for` を呼んでジョブを作成する (完了トーストは
+    ///   `poll_tag_write_results` が集計結果で出す)
+    fn submit_tag_jobs(&mut self, kind_for: impl Fn(&PathBuf) -> TagJobKind) {
         let paths = self.tag_target_paths();
         if paths.is_empty() {
             return;
@@ -82,7 +79,6 @@ impl App {
                 favorite_id: find_favorite_id(&favs, p),
             });
         }
-        self.show_feedback_toast(success_msg);
     }
 
     fn ensure_tag_write_handle(&mut self) {
@@ -115,14 +111,23 @@ impl App {
     /// (成功 1 件ごとに全消去すると無駄なので末端でまとめる)。
     pub(crate) fn poll_tag_write_results(&mut self) {
         let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        let mut success_count: usize = 0;
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let mut cleared = 0usize;
+        let mut noop = 0usize;
         let mut just_completed = false;
         if let Some(h) = self.tag_write_handle.as_ref() {
             while let Some(res) = h.try_recv_result() {
                 match res.result {
-                    Ok(_) => success_count += 1,
+                    Ok(TagAction::Added) => added += 1,
+                    Ok(TagAction::Removed) => removed += 1,
+                    Ok(TagAction::Cleared) => cleared += 1,
+                    Ok(TagAction::NoOp) => noop += 1,
                     Err(e) => errors.push((res.path, e)),
                 }
+                // 1 件でも結果を受けたら次フレームで tag badge が更新されるよう
+                // grid 側のキャッシュも invalidate する (fullscreen は下の tags_cache)。
+                self.tags_cache_last_change = Some(std::time::Instant::now());
             }
             if !h.is_busy() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 just_completed = true;
@@ -146,15 +151,41 @@ impl App {
                 errors.len(),
                 preview
             ));
-        } else if success_count > 0 && just_completed {
-            self.show_feedback_toast("タグ書き込み完了".to_string());
+        } else if just_completed && (added + removed + cleared + noop) > 0 {
+            let label = self.tag_toast_label.take();
+            let msg = format_completion_toast(label.as_deref(), added, removed, cleared, noop);
+            self.show_feedback_toast(msg);
         }
         if just_completed {
             self.tags_cache.clear();
+            // fts_meta から最新のタグを一括再取得する (worker が set_tags で更新済み)。
+            // これで grid バッジも即座に新状態を反映する。
+            self.prewarm_grid_tags();
             if let Some(h) = self.tag_write_handle.as_ref() {
                 h.reset_counters_if_idle();
             }
         }
+    }
+}
+
+/// 完了トーストの文言を組み立てる。Toggle で付与/削除が混在するケース (複数選択で
+/// 既に付与済のものと未付与のものが混ざる) にも耐える形式で出す。
+fn format_completion_toast(
+    tag_label: Option<&str>,
+    added: usize,
+    removed: usize,
+    cleared: usize,
+    noop: usize,
+) -> String {
+    if cleared > 0 || (noop > 0 && added == 0 && removed == 0) {
+        let total_clear = cleared + noop;
+        return format!("{total_clear} 件から mIV タグをクリア");
+    }
+    let tag = tag_label.unwrap_or("タグ");
+    match (added, removed) {
+        (a, 0) if a > 0 => format!("{a} 件に {tag} を付与"),
+        (0, r) if r > 0 => format!("{r} 件から {tag} を削除"),
+        (a, r) => format!("{tag}: {a} 件付与 / {r} 件削除"),
     }
 }
 
@@ -174,6 +205,48 @@ fn find_favorite_id(
 
 #[cfg(test)]
 mod tests {
+    use super::format_completion_toast;
+
+    #[test]
+    fn toast_single_add() {
+        assert_eq!(
+            format_completion_toast(Some("#ドール"), 1, 0, 0, 0),
+            "1 件に #ドール を付与"
+        );
+    }
+
+    #[test]
+    fn toast_single_remove() {
+        assert_eq!(
+            format_completion_toast(Some("#ドール"), 0, 1, 0, 0),
+            "1 件から #ドール を削除"
+        );
+    }
+
+    #[test]
+    fn toast_mixed_add_remove() {
+        assert_eq!(
+            format_completion_toast(Some("#tag"), 2, 3, 0, 0),
+            "#tag: 2 件付与 / 3 件削除"
+        );
+    }
+
+    #[test]
+    fn toast_clear_miv() {
+        assert_eq!(
+            format_completion_toast(None, 0, 0, 5, 0),
+            "5 件から mIV タグをクリア"
+        );
+    }
+
+    #[test]
+    fn toast_clear_miv_with_noop() {
+        assert_eq!(
+            format_completion_toast(None, 0, 0, 3, 2),
+            "5 件から mIV タグをクリア"
+        );
+    }
+
     #[test]
     fn recognizes_jpeg_png_webp() {
         assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
