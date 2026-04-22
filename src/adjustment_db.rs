@@ -35,14 +35,33 @@ impl AdjustmentDb {
         // `fs::metadata(sidecar)` で取った mtime と突き合わせ、一致するなら
         // `read_to_string` + parse + import をまるごとスキップするための fast-path。
         // フォルダ移動・外部ツールでサイドカーを更新したケースだけ slow-path に落ちる。
+        // 未リリース機能なので旧 `presets` / `page_presets` は無条件に捨てる。
         conn.execute_batch(
             "DROP TABLE IF EXISTS presets;
              DROP TABLE IF EXISTS page_presets;
              CREATE TABLE IF NOT EXISTS page_params (
                 page_path TEXT PRIMARY KEY,
                 params_json TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS sidecar_sync (
+             );",
+        )?;
+
+        // sidecar_sync は「旧スキーマ (`synced_at INTEGER NOT NULL` あり) のとき
+        // **だけ** 捨てて作り直す」。毎回 DROP すると再起動ごとに mtime キャッシュが
+        // 吹っ飛び、各フォルダ初回訪問でサイドカー import が再実行されてしまう
+        // (Codex P3)。旧 schema 判定は PRAGMA table_info で列の有無を見る。
+        let has_legacy_synced_at = {
+            let mut stmt = conn.prepare("PRAGMA table_info(sidecar_sync)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(Result::ok)
+                .collect();
+            cols.iter().any(|c| c == "synced_at")
+        };
+        if has_legacy_synced_at {
+            conn.execute_batch("DROP TABLE IF EXISTS sidecar_sync;")?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sidecar_sync (
                 folder_key    TEXT PRIMARY KEY,
                 sidecar_mtime INTEGER NOT NULL
              );",

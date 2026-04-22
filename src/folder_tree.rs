@@ -281,9 +281,18 @@ pub fn walk_dirs_recursive_with_progress(
         return;
     }
     on_visit(path);
+    // on_visit 内で ActivityGate 等の待機が入るケースがある。待機中に cancel が
+    // 立った場合、ここで弾かないと「停止要求後にもう 1 フォルダ分だけ read_dir
+    // が走る」挙動になる (Codex P3)。
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
     out.push(path.to_path_buf());
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
             let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
             if is_dir {

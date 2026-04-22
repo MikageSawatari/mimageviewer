@@ -9516,20 +9516,34 @@ impl eframe::App for App {
         }
 
         // ── Ctrl+A: 表示中の全アイテムをチェック ─────────────────────
-        // address/search にフォーカスがあるときはテキスト選択を優先する
+        // Ctrl+D / Ctrl+Shift+A: 選択解除 (右クリックメニュー「選択解除」と同等)。
+        // Ctrl+D を primary、Ctrl+Shift+A を alias として両方受け付ける。メニュー側の
+        // ヘルプ表記は Ctrl+D に統一 (3 キー同時押しより 2 キーの方が提示しやすい)。
+        // address/search にフォーカスがあるときはテキスト選択を優先する。
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
-            let ctrl_a = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A));
+            let (ctrl_a, deselect) = ctx.input(|i| {
+                let ctrl = i.modifiers.ctrl;
+                let shift = i.modifiers.shift;
+                let a = i.key_pressed(egui::Key::A);
+                let d = i.key_pressed(egui::Key::D);
+                // Ctrl+Shift+A は Ctrl+A と同一フレームに見えるので、shift 付きなら
+                // Ctrl+A ではなく deselect 側にだけ立てる (全選択の暴発を防ぐ)。
+                (ctrl && !shift && a, ctrl && (d || (shift && a)))
+            });
             if ctrl_a {
                 for &idx in &self.visible_indices {
                     if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
                         self.checked.insert(idx);
                     }
                 }
+            }
+            if deselect {
+                self.checked.clear();
             }
         }
 
@@ -9856,6 +9870,19 @@ fn make_load_request(
                 cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
                 folder_thumb_sort,
                 folder_thumb_depth,
+                ..base
+            })
+        }
+        GridItem::SearchContainer {
+            representative: Some(rep),
+            ..
+        } => {
+            // 代表サムネ: 画像 1 枚ぶんのキャッシュキー (ZIP エントリなら zip_path+entry)
+            // をそのまま使う。通常のフォルダ/ZIP 閲覧時と同じキャッシュを共有するので
+            // 既にサムネ済みなら即出る。
+            Some(LoadRequest {
+                path: rep.path.clone(),
+                zip_entry: rep.zip_entry.clone(),
                 ..base
             })
         }
@@ -10314,9 +10341,8 @@ pub(crate) fn draw_cell(
             path,
             kind,
             hit_count,
+            representative,
         } => {
-            // 日付フォルダ (`2025-01-01` 等) の単独表示では区別できないので、
-            // パスを階層ごとに改行した多行表示にする。
             let (icon, label_color) = match kind {
                 crate::grid_item::SearchContainerKind::Folder => (
                     "📁",
@@ -10335,43 +10361,117 @@ pub(crate) fn draw_cell(
                     },
                 ),
             };
-            let icon_size = (inner.height() * 0.18).clamp(22.0, 56.0);
-            painter.text(
-                egui::pos2(inner.center().x, inner.min.y + icon_size * 0.75),
-                egui::Align2::CENTER_CENTER,
-                icon,
-                egui::FontId::proportional(icon_size),
-                label_color,
-            );
-            let badge_font = (inner.height() * 0.07).clamp(10.0, 14.0);
-            let text_rect = egui::Rect::from_min_max(
-                egui::pos2(inner.min.x + 4.0, inner.min.y + icon_size * 1.35),
-                egui::pos2(inner.max.x - 4.0, inner.max.y - badge_font * 2.2),
-            );
-            let path_str = path.to_string_lossy();
-            let components = crate::ui_helpers::split_path_components(&path_str);
-            let max_font = (inner.height() * 0.075).clamp(11.0, 15.0);
-            crate::ui_helpers::draw_path_hierarchy(
-                painter,
-                text_rect,
-                &components,
-                label_color,
-                max_font,
-                8.0,
-            );
-            let badge_text = format!("{} 枚", hit_count);
-            let badge_color = if dark {
-                egui::Color32::from_rgb(240, 200, 100)
+
+            // 代表サムネがあって GPU テクスチャがロード済みなら、セル上部にサムネ、
+            // 下部に少し背景色の付いたボックスで「フォルダ階層 + ヒット件数」を出す。
+            // 未ロード / 代表サムネなしのときは従来どおりアイコン + 階層パスで埋める
+            // (サムネが読み込まれるまでの placeholder)。
+            let thumb_loaded = representative.is_some()
+                && matches!(thumb, ThumbnailState::Loaded { .. });
+
+            if thumb_loaded {
+                let thumb_h = inner.height() * 0.62;
+                let thumb_rect = egui::Rect::from_min_max(
+                    inner.min,
+                    egui::pos2(inner.max.x, inner.min.y + thumb_h),
+                );
+                if let ThumbnailState::Loaded { tex, .. } = thumb {
+                    // 代表サムネは色調補正対象外 (adjusted_tex は常に None)
+                    draw_thumb_texture(painter, thumb_rect, tex, rotation);
+                }
+                // 種別アイコン (小) を左上隅に重ねて Folder/ZIP を示す
+                let badge_size = (thumb_rect.height() * 0.22).clamp(14.0, 28.0);
+                painter.text(
+                    egui::pos2(thumb_rect.min.x + 4.0, thumb_rect.min.y + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    icon,
+                    egui::FontId::proportional(badge_size),
+                    label_color,
+                );
+
+                // 下部の「少し背景色を付けたボックス」: ユーザー要望どおりフォルダ名を
+                // サムネから切り離して読みやすくする。
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.min.x, thumb_rect.max.y + 2.0),
+                    inner.max,
+                );
+                let label_bg = if dark {
+                    egui::Color32::from_rgb(38, 42, 50)
+                } else {
+                    egui::Color32::from_rgb(240, 240, 246)
+                };
+                painter.rect_filled(label_rect, 3.0, label_bg);
+
+                let badge_font = (label_rect.height() * 0.19).clamp(10.0, 14.0);
+                let text_rect = egui::Rect::from_min_max(
+                    egui::pos2(label_rect.min.x + 4.0, label_rect.min.y + 2.0),
+                    egui::pos2(label_rect.max.x - 4.0, label_rect.max.y - badge_font * 1.3),
+                );
+                let path_str = path.to_string_lossy();
+                let components = crate::ui_helpers::split_path_components(&path_str);
+                let max_font = (label_rect.height() * 0.24).clamp(10.0, 13.0);
+                crate::ui_helpers::draw_path_hierarchy(
+                    painter,
+                    text_rect,
+                    &components,
+                    label_color,
+                    max_font,
+                    5.0,
+                );
+                let badge_text = format!("{} 枚", hit_count);
+                let badge_color = if dark {
+                    egui::Color32::from_rgb(240, 200, 100)
+                } else {
+                    egui::Color32::from_rgb(180, 80, 0)
+                };
+                painter.text(
+                    egui::pos2(label_rect.max.x - 6.0, label_rect.max.y - 4.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    &badge_text,
+                    egui::FontId::proportional(badge_font),
+                    badge_color,
+                );
             } else {
-                egui::Color32::from_rgb(180, 80, 0)
-            };
-            painter.text(
-                egui::pos2(inner.max.x - 6.0, inner.max.y - 6.0),
-                egui::Align2::RIGHT_BOTTOM,
-                &badge_text,
-                egui::FontId::proportional(badge_font),
-                badge_color,
-            );
+                // 代表サムネなし or 未ロード: 従来どおりアイコン + 階層パス + バッジ
+                // (日付フォルダ `2025-01-01` 等を単独で識別できるよう階層を多行表示)
+                let icon_size = (inner.height() * 0.18).clamp(22.0, 56.0);
+                painter.text(
+                    egui::pos2(inner.center().x, inner.min.y + icon_size * 0.75),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(icon_size),
+                    label_color,
+                );
+                let badge_font = (inner.height() * 0.07).clamp(10.0, 14.0);
+                let text_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.min.x + 4.0, inner.min.y + icon_size * 1.35),
+                    egui::pos2(inner.max.x - 4.0, inner.max.y - badge_font * 2.2),
+                );
+                let path_str = path.to_string_lossy();
+                let components = crate::ui_helpers::split_path_components(&path_str);
+                let max_font = (inner.height() * 0.075).clamp(11.0, 15.0);
+                crate::ui_helpers::draw_path_hierarchy(
+                    painter,
+                    text_rect,
+                    &components,
+                    label_color,
+                    max_font,
+                    8.0,
+                );
+                let badge_text = format!("{} 枚", hit_count);
+                let badge_color = if dark {
+                    egui::Color32::from_rgb(240, 200, 100)
+                } else {
+                    egui::Color32::from_rgb(180, 80, 0)
+                };
+                painter.text(
+                    egui::pos2(inner.max.x - 6.0, inner.max.y - 6.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    &badge_text,
+                    egui::FontId::proportional(badge_font),
+                    badge_color,
+                );
+            }
         }
     }
 

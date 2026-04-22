@@ -55,6 +55,9 @@ pub enum GridItem {
         kind: SearchContainerKind,
         /// ヒット件数 (バッジ表示用)
         hit_count: usize,
+        /// 代表サムネ対象 (Option B、v0.8.1)。ヒット内の画像 1 枚を選び、コンテナ
+        /// アイコンの代わりにサムネイルとして描画する。None ならアイコン表示のみ。
+        representative: Option<ContainerRepresentative>,
     },
 }
 
@@ -65,6 +68,16 @@ pub enum SearchContainerKind {
     Folder,
     /// ZIP ファイル
     Zip,
+}
+
+/// `SearchContainer` の代表サムネ (v0.8.1)。
+/// Ctrl+G アグリゲートビューで、コンテナ内のヒットから 1 枚をサムネ表示するための参照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerRepresentative {
+    /// 画像ファイルの絶対パス。ZIP エントリの場合は ZIP ファイル本体のパス。
+    pub path: PathBuf,
+    /// ZIP 内エントリ名。通常ファイルなら None。
+    pub zip_entry: Option<String>,
 }
 
 impl GridItem {

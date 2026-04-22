@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::app::App;
 use crate::fts_index::{IndexKind, SearchTarget, SourceKind};
 use crate::global_search::{DoneReason, GlobalHit, SearchStreamEvent};
-use crate::grid_item::{GridItem, SearchContainerKind};
+use crate::grid_item::{ContainerRepresentative, GridItem, SearchContainerKind};
 use crate::indexer_manager::SearchHandle;
 
 // -----------------------------------------------------------------------
@@ -75,7 +75,7 @@ pub enum TargetChoice {
 impl TargetChoice {
     pub fn label(self) -> &'static str {
         match self {
-            TargetChoice::All => "すべて",
+            TargetChoice::All => "すべての対象",
             TargetChoice::Only(SourceKind::Filename) => "ファイル名",
             TargetChoice::Only(SourceKind::Exif) => "EXIF",
             TargetChoice::Only(SourceKind::XmpTweet) => "mXD ツイート情報",
@@ -185,6 +185,8 @@ pub struct GlobalSearchState {
     pub saved_folder: Option<PathBuf>,
     /// 絞り込みフィルタ (§19.7)。変更時は自動的に検索を再実行する。
     pub filters: GlobalSearchFilters,
+    /// アグリゲートビューのコンテナソート順 (v0.8.1)。既定は HitCount。
+    pub sort_mode: ContainerSortMode,
 }
 
 impl Default for GlobalSearchState {
@@ -208,6 +210,7 @@ impl Default for GlobalSearchState {
             reject_message: None,
             saved_folder: None,
             filters: GlobalSearchFilters::default(),
+            sort_mode: ContainerSortMode::HitCount,
         }
     }
 }
@@ -218,7 +221,46 @@ pub struct ContainerHit {
     pub path: PathBuf,
     pub kind: SearchContainerKind,
     pub hit_count: usize,
+    /// 代表サムネ候補 (v0.8.1): ヒットのうち最初にサムネ表示可能だった 1 件。
+    /// 画像拡張子ヒットがまったくない (= PDF メタ / フォルダ名ヒットだけ) コンテナは None のまま。
+    pub representative: Option<ContainerRepresentative>,
+    /// コンテナ (フォルダ / ZIP ファイル) の最終更新時刻 (UNIX 秒)。
+    /// Newer/Older ソートで参照されるときに遅延取得される (fs::metadata 同期呼び出し)。
+    /// HitCount / Name ソートでは使わないので埋まらない。
+    pub mtime: Option<i64>,
 }
+
+/// Ctrl+G 結果ビューの並び順 (v0.8.1)。
+/// 既定は HitCount (件数の多いコンテナから先に見せる)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerSortMode {
+    /// ヒット件数降順 → パス昇順 (既定)
+    HitCount,
+    /// パス昇順
+    Name,
+    /// mtime 降順 (新しい順)
+    Newer,
+    /// mtime 昇順 (古い順)
+    Older,
+}
+
+impl ContainerSortMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ContainerSortMode::HitCount => "件数",
+            ContainerSortMode::Name => "ファイル名",
+            ContainerSortMode::Newer => "新しい",
+            ContainerSortMode::Older => "古い",
+        }
+    }
+}
+
+pub const SORT_MODES: &[ContainerSortMode] = &[
+    ContainerSortMode::HitCount,
+    ContainerSortMode::Name,
+    ContainerSortMode::Newer,
+    ContainerSortMode::Older,
+];
 
 impl GlobalSearchState {
     /// 新規検索を開始する (既存 pending があれば cancel してから)。
@@ -238,6 +280,7 @@ impl GlobalSearchState {
     /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
     pub(crate) fn accumulate_hit(&mut self, hit: &GlobalHit) {
         let (container_path, kind) = parent_container(&hit.path);
+        let representative = image_representative_from_hit(&hit.path);
         let entry = self
             .containers
             .entry(container_path.clone())
@@ -245,11 +288,43 @@ impl GlobalSearchState {
                 path: container_path,
                 kind,
                 hit_count: 0,
+                representative: None,
+                mtime: None,
             });
         entry.hit_count += 1;
+        // サムネ対象のヒットがまだ確定していなければ、今回の候補で埋める (先着優先)。
+        if entry.representative.is_none() {
+            entry.representative = representative;
+        }
         // drill-down 用に生のヒットも保持 (path で後でフィルタする)
         self.all_hits.push(hit.clone());
     }
+}
+
+/// GlobalHit のパスから「サムネ表示できる画像」としての代表情報を抽出する。
+/// サムネイル可能でない (拡張子が画像でない / PDF メタ・フォルダ名ヒット) なら None。
+fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentative> {
+    // `zippath!entry` 形式なら ZIP エントリとして分割。
+    let (file_part, entry): (&str, Option<String>) = if let Some(idx) = hit_path.find('!') {
+        let (zip_part, rest) = hit_path.split_at(idx);
+        // split_at は `!` を rest 側に残すので先頭 1 byte 切り落とす
+        (zip_part, Some(rest[1..].to_string()))
+    } else {
+        (hit_path, None)
+    };
+    // ZIP エントリなら entry 側、通常ファイルなら file_part から拡張子を取る
+    let name_for_ext = entry.as_deref().unwrap_or(file_part);
+    let ext = Path::new(name_for_ext)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)?;
+    if !crate::folder_tree::is_recognized_image_ext(&ext) {
+        return None;
+    }
+    Some(ContainerRepresentative {
+        path: PathBuf::from(file_part),
+        zip_entry: entry,
+    })
 }
 
 /// ヒット path から親コンテナを決定する (docs §10.4.2)。
@@ -268,15 +343,64 @@ fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
     }
 }
 
-/// ContainerHit を hit_count 降順 / 名前昇順 でソートした Vec を返す。
+/// ContainerHit を hit_count 降順 / 名前昇順 でソートした Vec を返す (既定)。
 pub fn sorted_containers(containers: &HashMap<PathBuf, ContainerHit>) -> Vec<ContainerHit> {
+    sort_containers_with_mode(containers, ContainerSortMode::HitCount)
+}
+
+/// 指定したモードで ContainerHit をソートして返す。
+/// Newer/Older 時は `mtime` フィールドを使うので、呼び出し側は
+/// [`ensure_container_mtime_populated`] で事前に埋めておくこと。
+pub fn sort_containers_with_mode(
+    containers: &HashMap<PathBuf, ContainerHit>,
+    mode: ContainerSortMode,
+) -> Vec<ContainerHit> {
     let mut v: Vec<ContainerHit> = containers.values().cloned().collect();
-    v.sort_by(|a, b| {
-        b.hit_count
-            .cmp(&a.hit_count)
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    match mode {
+        ContainerSortMode::HitCount => v.sort_by(|a, b| {
+            b.hit_count
+                .cmp(&a.hit_count)
+                .then_with(|| a.path.cmp(&b.path))
+        }),
+        ContainerSortMode::Name => v.sort_by(|a, b| a.path.cmp(&b.path)),
+        ContainerSortMode::Newer => v.sort_by(|a, b| {
+            // mtime 不明 (None) は「最古」扱いで末尾に送る
+            let ka = a.mtime.unwrap_or(i64::MIN);
+            let kb = b.mtime.unwrap_or(i64::MIN);
+            kb.cmp(&ka).then_with(|| a.path.cmp(&b.path))
+        }),
+        ContainerSortMode::Older => v.sort_by(|a, b| {
+            let ka = a.mtime.unwrap_or(i64::MAX);
+            let kb = b.mtime.unwrap_or(i64::MAX);
+            ka.cmp(&kb).then_with(|| a.path.cmp(&b.path))
+        }),
+    }
     v
+}
+
+/// Newer/Older ソートのために、mtime 未取得のコンテナだけ fs::metadata を呼んで埋める。
+/// HitCount/Name モードでは何もしない。
+///
+/// 取得は同期 I/O だが、N コンテナぶんの 1 回きり (以降はキャッシュ) で、
+/// ユーザーがソート切替した瞬間にしか走らない。HDD では数百 ms になり得るので、
+/// モード変更時のレスポンスが気になったら別スレッド化を検討する (v0.8.x 課題)。
+pub fn ensure_container_mtime_populated(state: &mut GlobalSearchState) {
+    if !matches!(
+        state.sort_mode,
+        ContainerSortMode::Newer | ContainerSortMode::Older
+    ) {
+        return;
+    }
+    for c in state.containers.values_mut() {
+        if c.mtime.is_some() {
+            continue;
+        }
+        c.mtime = std::fs::metadata(&c.path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -285,20 +409,23 @@ pub fn sorted_containers(containers: &HashMap<PathBuf, ContainerHit>) -> Vec<Con
 
 /// Aggregated view の items + image_metas を組み立てる。
 pub(crate) fn build_aggregated_items(
-    state: &GlobalSearchState,
+    state: &mut GlobalSearchState,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
-    let containers = sorted_containers(&state.containers);
+    // Newer/Older ソートのとき mtime を遅延取得 (初回のみ fs::metadata 同期呼び出し)。
+    ensure_container_mtime_populated(state);
+    let containers = sort_containers_with_mode(&state.containers, state.sort_mode);
     let items: Vec<GridItem> = containers
         .iter()
         .map(|c| GridItem::SearchContainer {
             path: c.path.clone(),
             kind: c.kind,
             hit_count: c.hit_count,
+            representative: c.representative.clone(),
         })
         .collect();
-    // SearchContainer はサムネイル不要 (make_load_request で None) だが、image_metas は
-    // items と同じ長さに揃えておく (Option<(0,0)>) ことで thumb_loader 側の
-    // image_metas.get(i).flatten() が panic ではなく「enqueue skip」になる。
+    // 代表サムネを持つコンテナは make_load_request が LoadRequest を返すので、
+    // image_metas も items と同じ長さで None 埋めしておく (thumb_loader 側で mtime/size
+    // が必要な場合は UI 世代更新時に fs::metadata で遅延取得される)。
     let image_metas: Vec<Option<(i64, i64)>> = vec![None; items.len()];
     (items, image_metas)
 }
@@ -452,7 +579,9 @@ pub(crate) struct NavEntry {
 /// 出現を残す**。これで「A → A/sub → B」という自然な (親 → 子 → 兄弟) DFS 順に
 /// なり、重複エントリを跨いだ不要な行ったり来たりを防げる。
 pub(crate) fn build_cross_container_nav_list(state: &GlobalSearchState) -> Vec<NavEntry> {
-    let containers = sorted_containers(&state.containers);
+    // ナビ順は表示順と揃える。mtime は `build_aggregated_items` が必ず事前に populate
+    // しているので、ここでは mut を要求せず既存の mtime キャッシュを参照するだけ。
+    let containers = sort_containers_with_mode(&state.containers, state.sort_mode);
     let mut raw: Vec<NavEntry> = Vec::new();
     for c in &containers {
         match c.kind {
@@ -798,7 +927,7 @@ impl App {
     /// search_filter / checked を整合させるだけに留める。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
         let (items, image_metas) = match self.global_search.view.clone() {
-            GlobalSearchView::Aggregated => build_aggregated_items(&self.global_search),
+            GlobalSearchView::Aggregated => build_aggregated_items(&mut self.global_search),
             GlobalSearchView::DrilledInto {
                 ref current_path,
                 is_zip,
@@ -1080,6 +1209,7 @@ impl App {
         let mut close_requested = false;
         let mut query_changed = false;
         let mut filter_changed = false;
+        let mut sort_changed = false;
 
         let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
@@ -1105,7 +1235,11 @@ impl App {
                 });
             }
             ui.horizontal(|ui| {
-                ui.label("検索:");
+                ui.label("検索:").on_hover_text(
+                    "Ctrl+G はお気に入りの「メタ情報索引」を使って検索します。\n\
+                     メタ情報索引が作成されていないお気に入りは対象になりません。\n\
+                     お気に入り編集で「メタ情報を索引化する」を有効にしてください。",
+                );
                 let response = ui.add_sized(
                     [320.0, 20.0],
                     egui::TextEdit::singleline(&mut self.global_search.query)
@@ -1166,7 +1300,7 @@ impl App {
                     let current = self.global_search.filters.favorite;
                     let label_for = |opt: Option<Uuid>| -> String {
                         match opt {
-                            None => "すべて".to_string(),
+                            None => "すべてのお気に入り".to_string(),
                             Some(id) => self
                                 .settings
                                 .favorite_by_id(id)
@@ -1177,9 +1311,9 @@ impl App {
                     let mut next = current;
                     egui::ComboBox::from_id_salt("global_search_fav")
                         .selected_text(label_for(current))
-                        .width(140.0)
+                        .width(160.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut next, None, "すべて");
+                            ui.selectable_value(&mut next, None, "すべてのお気に入り");
                             for fav in &self.settings.favorites {
                                 if !fav.auto_index_metadata {
                                     continue;
@@ -1198,14 +1332,14 @@ impl App {
                     let current = self.global_search.filters.kind;
                     let label_for = |opt: Option<IndexKind>| -> &'static str {
                         match opt {
-                            None => "すべて",
+                            None => "すべての種類",
                             Some(k) => kind_label(k),
                         }
                     };
                     let mut next = current;
                     egui::ComboBox::from_id_salt("global_search_kind")
                         .selected_text(label_for(current))
-                        .width(120.0)
+                        .width(140.0)
                         .show_ui(ui, |ui| {
                             for &choice in KIND_CHOICES {
                                 ui.selectable_value(&mut next, choice, label_for(choice));
@@ -1276,6 +1410,37 @@ impl App {
                     };
                     ui.label(egui::RichText::new(text).size(11.0).color(color));
                 }
+
+                // ── ソート切替 (Aggregated ビューのみ) ──
+                // 件数バッジの右側で「ソート: <現在のモード>」のドロップダウンを出す。
+                // DrilledInto 中は Aggregated のソートが影響しないので隠す。
+                if matches!(self.global_search.view, GlobalSearchView::Aggregated)
+                    && !self.global_search.containers.is_empty()
+                {
+                    ui.separator();
+                    ui.label(egui::RichText::new("ソート:").size(11.0).weak());
+                    let current = self.global_search.sort_mode;
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("global_search_sort")
+                        .selected_text(current.label())
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for &mode in SORT_MODES {
+                                ui.selectable_value(&mut next, mode, mode.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "新しい/古い: コンテナの更新日時順 (初回選択時に\n\
+                             fs::metadata を一括取得するので HDD では一瞬固まります)",
+                        );
+                    if next != current {
+                        self.global_search.sort_mode = next;
+                        // アグリゲート view を即時再ソート (mtime 未取得なら
+                        // build_aggregated_items 側で populate される)
+                        sort_changed = true;
+                    }
+                }
             });
             ui.add_space(2.0);
         });
@@ -1318,6 +1483,10 @@ impl App {
             // poll_global_search_debounce が「クエリが変わっていない」と判定して
             // 新 spawn を skip し、結果 0 件のまま固着する。
             self.global_search.last_executed.clear();
+            self.rebuild_items_from_global_search();
+        }
+        if sort_changed {
+            // ソート変更はクエリ再実行不要 — items を並べ替えるだけ。
             self.rebuild_items_from_global_search();
         }
     }
@@ -1413,6 +1582,7 @@ mod tests {
                 path: "c:/low".into(),
                 kind: SearchContainerKind::Folder,
                 hit_count: 2,
+                representative: None,
             },
         );
         map.insert(
@@ -1421,6 +1591,7 @@ mod tests {
                 path: "c:/high".into(),
                 kind: SearchContainerKind::Folder,
                 hit_count: 10,
+                representative: None,
             },
         );
         map.insert(
@@ -1429,6 +1600,7 @@ mod tests {
                 path: "c:/mid".into(),
                 kind: SearchContainerKind::Folder,
                 hit_count: 5,
+                representative: None,
             },
         );
         let v = sorted_containers(&map);

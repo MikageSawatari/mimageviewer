@@ -122,7 +122,7 @@ impl crate::app::App {
                     }
 
                     ui.separator();
-                    if ui.button("選択解除").clicked() {
+                    if ui.button("選択解除 (Ctrl+D)").clicked() {
                         self.checked.clear();
                         close = true;
                     }
