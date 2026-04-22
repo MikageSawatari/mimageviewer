@@ -420,24 +420,60 @@ fn find_rdf_description_self_close(xmp: &[u8]) -> Result<Option<(usize, usize)>,
 
 /// XMP Spec Part 1 §8.4 準拠: 編集時に xmp:MetadataDate を現在時刻に更新する。
 /// 存在しなければ rdf:Description の閉じタグ直前に追加。
+///
+/// 既存 element の検出は `<xmp:MetadataDate` (閉じ `>` を含めない) で前方一致する。
+/// 我々が挿入する形式は `<xmp:MetadataDate xmlns:xmp="...">` で属性付きなので、`<xmp:MetadataDate>`
+/// 完全一致だと既存をヒットさせられず毎回追記してしまう (mxd ファイルで `MetadataDate` が
+/// 雪だるま式に増える regression を生む) — ここを開きタグ内の任意属性に耐えるよう緩める。
+///
+/// 過去の bug で複数の `<xmp:MetadataDate>` が累積したファイルに対しては、最初の 1 つを
+/// 更新したあと残りを削除して 1 個だけにする (XMP Spec 上 1 つの schema property は 1 値が原則)。
 fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
     let now = current_iso8601_utc();
-    let needle_start = b"<xmp:MetadataDate>";
+    let needle_open_prefix = b"<xmp:MetadataDate";
     let needle_end = b"</xmp:MetadataDate>";
 
-    if let Some(s) = find_subseq(xmp, needle_start) {
-        // 既存を置換
-        let content_start = s + needle_start.len();
+    if let Some(open_start) = find_subseq(xmp, needle_open_prefix) {
+        // 開きタグの `>` を見つけてコンテンツ開始位置を決定する
+        let after_prefix = open_start + needle_open_prefix.len();
+        let Some(rel_close) = xmp[after_prefix..].iter().position(|&b| b == b'>') else {
+            return Err(WriteError::MalformedContainer(
+                "xmp:MetadataDate 開きタグ未閉".into(),
+            ));
+        };
+        let content_start = after_prefix + rel_close + 1;
+        // 自己閉じ `<xmp:MetadataDate ... />` の場合は内容置換ではなく element 全体を
+        // タイムスタンプ付きの通常 element に差し替える (実運用ではほぼ無いが防御)。
+        let is_self_closing = rel_close > 0 && xmp[after_prefix + rel_close - 1] == b'/';
+        if is_self_closing {
+            let replacement = format!(
+                r#"<xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">{now}</xmp:MetadataDate>"#
+            );
+            let mut out = Vec::with_capacity(xmp.len() + replacement.len());
+            out.extend_from_slice(&xmp[..open_start]);
+            out.extend_from_slice(replacement.as_bytes());
+            out.extend_from_slice(&xmp[content_start..]);
+            return Ok(out);
+        }
         let Some(e) = find_subseq(&xmp[content_start..], needle_end) else {
             return Err(WriteError::MalformedContainer(
                 "xmp:MetadataDate 閉じタグ未発見".into(),
             ));
         };
         let content_end = content_start + e;
+        let elem_end = content_end + needle_end.len();
         let mut out = Vec::with_capacity(xmp.len() + now.len());
         out.extend_from_slice(&xmp[..content_start]);
         out.extend_from_slice(now.as_bytes());
-        out.extend_from_slice(&xmp[content_end..]);
+        // 末尾以降に残っている重複 MetadataDate 要素 (過去 bug の累積) を削除する。
+        // 開始タグ単位で走査 → 閉じタグまでをまるごとスキップ。隣接する空白行も巻き添えで
+        // 落として体裁を保つ。
+        let tail = &xmp[content_end..];
+        out.extend_from_slice(&tail[..needle_end.len()]); // </xmp:MetadataDate>
+        let after_first_elem = &tail[needle_end.len()..];
+        let cleaned_tail = strip_trailing_metadata_dates(after_first_elem);
+        out.extend_from_slice(&cleaned_tail);
+        let _ = elem_end; // (used implicitly via lengths above)
         return Ok(out);
     }
 
@@ -461,6 +497,52 @@ fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
     // rdf:Description すら無いパケットは想定外 (直前の replace_or_insert_dc_subject で
     // エラーを返しているはず)
     Ok(xmp.to_vec())
+}
+
+/// `bytes` の先頭から続く `<xmp:MetadataDate ...>...</xmp:MetadataDate>` (前後に空白
+/// /改行を含む) を全部削ってから残りを返す。連続して並んでいる重複 MetadataDate を
+/// 1 つだけ残す目的で `update_metadata_date` から呼ばれる。
+///
+/// 「先頭から続く」のは、最初の MetadataDate 要素を残した直後から走査するため。
+/// 異種の要素 (例: `<xtw:...>`) に当たったら走査を打ち切る — 関係ない位置にある
+/// MetadataDate (別 rdf:Description 内など) は触らない。
+fn strip_trailing_metadata_dates(bytes: &[u8]) -> Vec<u8> {
+    let needle_open = b"<xmp:MetadataDate";
+    let needle_close = b"</xmp:MetadataDate>";
+    let mut pos = 0;
+    loop {
+        // 先頭の空白/改行をスキップ
+        let ws_end = bytes[pos..]
+            .iter()
+            .position(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .map(|p| pos + p)
+            .unwrap_or(bytes.len());
+        if !bytes[ws_end..].starts_with(needle_open) {
+            // 直後が MetadataDate 開始タグでなければここで止める。
+            // (空白/改行は元の体裁を保つため残す)
+            break;
+        }
+        // 開きタグの閉じ `>` を探す
+        let after_prefix = ws_end + needle_open.len();
+        let Some(rel) = bytes[after_prefix..].iter().position(|&b| b == b'>') else {
+            break;
+        };
+        let after_open = after_prefix + rel + 1;
+        // self-close なら element はそこまで
+        let elem_end = if rel > 0 && bytes[after_prefix + rel - 1] == b'/' {
+            after_open
+        } else {
+            // </xmp:MetadataDate> を探す
+            let Some(rel_close) = find_subseq(&bytes[after_open..], needle_close) else {
+                break;
+            };
+            after_open + rel_close + needle_close.len()
+        };
+        pos = elem_end;
+    }
+    let mut out = Vec::with_capacity(bytes.len() - pos);
+    out.extend_from_slice(&bytes[pos..]);
+    out
 }
 
 fn current_iso8601_utc() -> String {
@@ -1043,6 +1125,79 @@ mod tests {
         assert!(!s.contains("#風景"));
         assert!(tags.contains("Photographer"));
         assert!(!tags.contains('#'));
+    }
+
+    #[test]
+    fn metadata_date_cleans_up_accumulated_duplicates() {
+        // 過去 bug の犠牲ファイル: <xmp:MetadataDate> が 6 個累積している。
+        // 1 回 edit_xmp_packet を通したら 1 個だけに整理されること。
+        let xmp = r#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+ <rdf:Description rdf:about=''
+  xmlns:dc='http://purl.org/dc/elements/1.1/'>
+    <dc:subject><rdf:Bag><rdf:li>#x</rdf:li></rdf:Bag></dc:subject>
+    <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-04-22T05:00:16+00:00</xmp:MetadataDate>
+      <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-04-22T05:04:15+00:00</xmp:MetadataDate>
+      <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-04-22T05:04:15+00:00</xmp:MetadataDate>
+      <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-04-22T05:04:15+00:00</xmp:MetadataDate>
+      <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-04-22T05:04:15+00:00</xmp:MetadataDate>
+      <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-04-22T05:08:18+00:00</xmp:MetadataDate>
+    </rdf:Description>
+ <rdf:Description rdf:about=''
+  xmlns:xtw='https://example/'>
+    <xtw:Marker>preserved</xtw:Marker>
+ </rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"#;
+        let (out, _) = edit_xmp_packet(xmp.as_bytes(), &TagOp::Add("#y".to_string())).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let count = s.matches("<xmp:MetadataDate").count();
+        assert_eq!(count, 1, "重複 MetadataDate が 1 個に整理されること: {s}");
+        // 隣接していない他要素 (xtw:Marker) は壊さない
+        assert!(s.contains("<xtw:Marker>preserved</xtw:Marker>"));
+    }
+
+    #[test]
+    fn metadata_date_replaces_existing_with_attributes_no_duplication() {
+        // Codex/User regression: 我々が挿入する <xmp:MetadataDate xmlns:xmp="..."> を、
+        // 次回の更新時に正しく「既存」と認識して置換すること (毎回追記すると mxd ファイルで
+        // MetadataDate が雪だるま式に増える)。
+        let xmp = r#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+ <rdf:Description rdf:about=''
+  xmlns:dc='http://purl.org/dc/elements/1.1/'>
+    <dc:subject><rdf:Bag><rdf:li>#existing</rdf:li></rdf:Bag></dc:subject>
+    <xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">2026-01-01T00:00:00+00:00</xmp:MetadataDate>
+ </rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"#;
+        // 1 回目: タグ追加 (既存 MetadataDate の差し替えのみ起きるはず)
+        let (out, _) = edit_xmp_packet(xmp.as_bytes(), &TagOp::Add("#new".to_string())).unwrap();
+        let s = String::from_utf8(out.clone()).unwrap();
+        let count = s.matches("<xmp:MetadataDate").count();
+        assert_eq!(
+            count, 1,
+            "1 回目の write 後、MetadataDate は 1 個に保たれること: {s}"
+        );
+
+        // 2 回目: タグ削除 (再度 MetadataDate を更新)
+        let (out2, _) = edit_xmp_packet(&out, &TagOp::Remove("#new".to_string())).unwrap();
+        let s2 = String::from_utf8(out2.clone()).unwrap();
+        let count2 = s2.matches("<xmp:MetadataDate").count();
+        assert_eq!(
+            count2, 1,
+            "2 回目の write 後も MetadataDate は 1 個 (累積しない): {s2}"
+        );
+
+        // 3 回目: 再度追加。トグル繰り返しで累積しないこと
+        let (out3, _) = edit_xmp_packet(&out2, &TagOp::Add("#new".to_string())).unwrap();
+        let s3 = String::from_utf8(out3).unwrap();
+        let count3 = s3.matches("<xmp:MetadataDate").count();
+        assert_eq!(count3, 1, "3 回目: {s3}");
     }
 
     #[test]

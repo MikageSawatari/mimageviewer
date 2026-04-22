@@ -10161,7 +10161,8 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // 左上バッジ: 補 (ページ個別補正) と 消 (消しゴムマスク) を横並びで表示
+    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → タグバッジ。
+    // 横並びで、収まらなければ末尾省略。
     {
         let badge_w = 18.0;
         let badge_h = 16.0;
@@ -10191,6 +10192,13 @@ pub(crate) fn draw_cell(
                 egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
             );
+            x += badge_w + 2.0;
+        }
+        if !tags.is_empty() {
+            // 残り幅 (右端 - 現在 x - 余白) に収まるだけ並べる。チェックマーク領域 (右上 24px)
+            // と被らないように max_x を絞る。
+            let max_x = rect.max.x - 28.0;
+            draw_tag_badges(painter, egui::pos2(x, y), max_x, tags);
         }
     }
 
@@ -10219,60 +10227,72 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // タグバッジ (右下、半透明背景 + 緑色)。# 始まりのタグを 1 バッジにまとめて
-    // `#原神 #風景` のように連結表示する。長いときは末尾を `…` で省略。
-    if !tags.is_empty() {
-        draw_tag_badges(painter, rect, tags);
-    }
 }
 
-/// サムネイルセル右下にタグ (`#xxx #yyy`) をまとめて描画する。幅がセルに収まらない
-/// 場合は末尾を省略。空配列の呼び出しは `draw_cell` 側で弾かれている前提。
-fn draw_tag_badges(painter: &egui::Painter, rect: egui::Rect, tags: &[String]) {
+/// サムネイル左上 (補/消 バッジの右隣) にタグ (`#xxx #yyy`) を 1 つの緑バッジで描画する。
+/// 幅は `painter.layout_no_wrap` で実測するので CJK / 絵文字でも正確に収まる。
+/// `start.x` 以降、`max_x` まで使えるので、`max_x - start.x` を超える分は文字単位で削って
+/// 末尾を `…` にする。空配列の呼び出しは `draw_cell` 側で弾かれている前提。
+fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags: &[String]) {
     let font = egui::FontId::proportional(11.0);
-    let text_h = 15.0;
-    let max_w = rect.width() - 10.0;
+    let badge_h = 16.0;
+    let pad_x = 5.0;
+    let max_text_w = (max_x - start.x - pad_x * 2.0).max(0.0);
+    if max_text_w < 8.0 {
+        return; // 領域不足 → 表示諦め
+    }
     // `#` 始まり (mIV 付与) を優先、続いて他ソフト由来の裸タグを並べる。
-    let hash_first: Vec<&String> = tags
-        .iter()
-        .filter(|t| t.starts_with('#'))
-        .chain(tags.iter().filter(|t| !t.starts_with('#')))
-        .collect();
     let mut combined = String::new();
-    for t in &hash_first {
+    for t in tags.iter().filter(|t| t.starts_with('#')) {
         if !combined.is_empty() {
             combined.push(' ');
         }
         combined.push_str(t);
     }
-    // 幅に収まらなければ文字単位で削る + 末尾 ellipsis。
-    // 簡易 measure: egui の painter.layout はアロケートが重いので、文字ごと平均幅で近似する。
-    let avg_char_w = 7.0;
-    let max_chars = ((max_w / avg_char_w) as usize).max(4);
-    if combined.chars().count() > max_chars {
-        combined = combined.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…";
+    for t in tags.iter().filter(|t| !t.starts_with('#')) {
+        if !combined.is_empty() {
+            combined.push(' ');
+        }
+        combined.push_str(t);
     }
     if combined.is_empty() {
         return;
     }
-    // 幅を再計算 (ellipsis 込みの概算)
-    let approx_w = combined.chars().count() as f32 * avg_char_w + 8.0;
-    let bg_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.max.x - approx_w - 3.0, rect.max.y - text_h - 3.0),
-        egui::vec2(approx_w, text_h),
-    );
+
+    // 実測ベースで省略する。CJK は 1 文字 ≒ 11px、ASCII は ≒ 6px と幅が大きく違うので、
+    // 平均幅近似は使えない (`avg_char_w` で計算すると CJK が枠外にはみ出す)。
+    let text_color = egui::Color32::from_rgb(180, 255, 180);
+    let mut galley =
+        painter.layout_no_wrap(combined.clone(), font.clone(), text_color);
+    if galley.size().x > max_text_w {
+        // 末尾から 1 文字ずつ削って `…` 付きで再 layout。最低 1 文字 + `…` は残す。
+        let chars: Vec<char> = combined.chars().collect();
+        for take in (1..chars.len()).rev() {
+            let candidate: String = chars[..take].iter().collect::<String>() + "…";
+            let g = painter.layout_no_wrap(candidate, font.clone(), text_color);
+            if g.size().x <= max_text_w {
+                galley = g;
+                break;
+            }
+        }
+        // それでも入らなければ `…` だけにする (極端に狭いセル)
+        if galley.size().x > max_text_w {
+            galley = painter.layout_no_wrap("…".to_string(), font.clone(), text_color);
+            if galley.size().x > max_text_w {
+                return;
+            }
+        }
+    }
+
+    let bg_w = galley.size().x + pad_x * 2.0;
+    let bg_rect = egui::Rect::from_min_size(start, egui::vec2(bg_w, badge_h));
     painter.rect_filled(
         bg_rect,
         3.0,
         egui::Color32::from_rgba_unmultiplied(0, 40, 20, 170),
     );
-    painter.text(
-        bg_rect.left_center() + egui::vec2(4.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        combined,
-        font,
-        egui::Color32::from_rgb(180, 255, 180),
-    );
+    let text_pos = bg_rect.left_top() + egui::vec2(pad_x, (badge_h - galley.size().y) * 0.5);
+    painter.galley(text_pos, galley, text_color);
 }
 
 /// サムネイル画質プレビュー用: 実グリッドと同じ `cell_w × cell_h` のセルを描画する。

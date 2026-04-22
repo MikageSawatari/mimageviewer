@@ -11,22 +11,38 @@ use crate::grid_item::GridItem;
 use crate::tag_write_worker::{TagAction, TagJobKind, TagWriteHandle, TagWriteJob};
 
 impl App {
+    /// タグ書き込みの対象ファイル列。優先順位は:
+    ///   1. checked (グリッドで Space / Shift+矢印 / Ctrl+クリックで複数チェック) があればそれら
+    ///   2. なければ selected (単一選択中のセル)
+    ///   3. それも無ければ fullscreen_idx (フルスクリーン中のページ)
+    /// いずれも `Image` かつ書き込み対応形式 (JPEG/PNG/WebP) のものだけ。
+    /// `ratable_targets` と同じ優先順位で、グリッドのチェック操作と整合する。
     pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = Vec::new();
-        if let Some(idx) = self.selected {
-            if let Some(GridItem::Image(p)) = self.items.get(idx) {
+        let push_writable_image = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem]| {
+            if let Some(GridItem::Image(p)) = items.get(idx) {
                 if crate::xmp_writer::is_writable_format(p) {
                     out.push(p.clone());
                 }
             }
+        };
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        if !self.checked.is_empty() {
+            // 安定順 (idx 昇順) でチェック済みを並べる。順序が決まっていれば worker の
+            // ジョブ投入順 = ユーザーが見るトースト集計順とも一致する。
+            let mut indices: Vec<usize> = self.checked.iter().copied().collect();
+            indices.sort_unstable();
+            for idx in indices {
+                push_writable_image(&mut out, idx, &self.items);
+            }
+            return out;
+        }
+        if let Some(idx) = self.selected {
+            push_writable_image(&mut out, idx, &self.items);
         }
         if out.is_empty() {
             if let Some(idx) = self.fullscreen_idx {
-                if let Some(GridItem::Image(p)) = self.items.get(idx) {
-                    if crate::xmp_writer::is_writable_format(p) {
-                        out.push(p.clone());
-                    }
-                }
+                push_writable_image(&mut out, idx, &self.items);
             }
         }
         out
