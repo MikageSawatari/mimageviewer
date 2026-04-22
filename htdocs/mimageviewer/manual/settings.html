@@ -67,7 +67,7 @@
     </div>
 
     <h2 id="cache">サムネイルキャッシュ</h2>
-    <p>サムネイルを SQLite データベースに WebP 形式でキャッシュします。
+    <p>サムネイルをキャッシュに保存します。
     同じフォルダを再度開いた際の読み込みが大幅に高速化されます。</p>
 
     <h3>キャッシュ生成設定（環境設定 → キャッシュ）</h3>
@@ -171,8 +171,8 @@
     <h2 id="search-index">検索インデックス（お気に入り → 編集）</h2>
     <p>お気に入りごとに「名前索引」「メタ索引」の ON/OFF チェックを個別に設定できます
     (お気に入り → 編集 で開くダイアログ内)。<strong>どちらも既定は OFF</strong>で、ON に
-    切り替えた時点で配下を再帰的に走査してインデックスを作成します。以降は notify-rs 監視で
-    自動追従されます。</p>
+    切り替えた時点で配下を再帰的に走査してインデックスを作成します。以降は自動監視で
+    追従されます。</p>
     <ul>
       <li><strong>名前索引</strong> — <kbd>Ctrl</kbd>+<kbd>S</kbd> の対象。
           フォルダ / ZIP / PDF の名前を記録。DB: <code>%APPDATA%\mimageviewer\search_index.db</code></li>
@@ -452,10 +452,10 @@
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td><td>フォルダ単位（A）</td></tr>
           <tr><td>変換済みアーカイブキャッシュ</td><td><code>%APPDATA%\mimageviewer\archive_cache\</code>（変換済み ZIP）+ <code>archive_cache.db</code>（マッピング）</td><td>ファイル単位（A）</td></tr>
           <tr><td>Susie プラグイン</td><td><code>%APPDATA%\mimageviewer\susie_plugins\</code>（<code>.spi</code> ファイル配置場所）</td><td>—</td></tr>
-          <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・panic ログ）</td><td>—</td></tr>
+          <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・エラーログ）</td><td>—</td></tr>
           <tr><td>AI モデル</td><td><code>%APPDATA%\mimageviewer\models\</code></td><td>—</td></tr>
-          <tr><td>PDFium DLL</td><td><code>%APPDATA%\mimageviewer\pdfium.dll</code></td><td>—</td></tr>
-          <tr><td>ONNX Runtime DLL</td><td><code>%APPDATA%\mimageviewer\onnxruntime.dll</code><br><code>%APPDATA%\mimageviewer\onnxruntime_providers_shared.dll</code>（本体に埋め込み済み。初回 AI 機能利用時に自動展開）</td><td>—</td></tr>
+          <tr><td>PDF 表示エンジン DLL</td><td><code>%APPDATA%\mimageviewer\pdfium.dll</code></td><td>—</td></tr>
+          <tr><td>AI 機能用 DLL</td><td><code>%APPDATA%\mimageviewer\onnxruntime.dll</code><br><code>%APPDATA%\mimageviewer\onnxruntime_providers_shared.dll</code>（本体に埋め込み済み。初回 AI 機能利用時に自動展開）</td><td>—</td></tr>
           <tr><td>Susie ワーカー EXE</td><td><code>%APPDATA%\mimageviewer\mimageviewer-susie32.exe</code>（32bit バイナリ、本体に埋め込み済み。初回起動時に自動展開）</td><td>—</td></tr>
           <tr><td>補正・マスクのバックアップ<br>（環境設定で ON の場合のみ）</td>
               <td>各フォルダ直下に <code>mimageviewer.dat</code>（Hidden + System 属性の JSON）</td>
