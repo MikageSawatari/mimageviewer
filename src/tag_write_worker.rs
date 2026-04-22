@@ -62,6 +62,10 @@ pub struct TagWriteHandle {
     pub total: Arc<AtomicUsize>,
     pub done: Arc<AtomicUsize>,
     pub failures: Arc<AtomicUsize>,
+    /// Tantivy writer バッファに upsert 済みだが、まだ commit されていない dirty ジョブ数。
+    /// `is_busy()` で「XMP 書き込みは終わったが検索索引にはまだ反映されていない」
+    /// 状態を UI に伝えるのに使う (完了 toast が commit より先に出る race を塞ぐ)。
+    pub pending_in_writer: Arc<AtomicUsize>,
     _thread: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -79,10 +83,12 @@ impl TagWriteHandle {
         let total = Arc::new(AtomicUsize::new(0));
         let done = Arc::new(AtomicUsize::new(0));
         let failures = Arc::new(AtomicUsize::new(0));
+        let pending_in_writer = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let w_done = done.clone();
         let w_failures = failures.clone();
+        let w_pending = pending_in_writer.clone();
         let w_shutdown = shutdown.clone();
         let handle = std::thread::Builder::new()
             .name("tag-write-worker".into())
@@ -95,6 +101,7 @@ impl TagWriteHandle {
                     shared_writer,
                     &w_done,
                     &w_failures,
+                    &w_pending,
                     &w_shutdown,
                 );
             })
@@ -106,6 +113,7 @@ impl TagWriteHandle {
             total,
             done,
             failures,
+            pending_in_writer,
             _thread: Some(handle),
             shutdown,
         }
@@ -120,8 +128,12 @@ impl TagWriteHandle {
         self.result_rx.try_recv().ok()
     }
 
+    /// XMP 書き込みと Tantivy commit の両方が完了するまで busy を維持する。
+    /// `done == total` だけでは commit 前に完了 toast が出て、その直後の Ctrl+G で
+    /// 新タグが見えない race が発生するため、`pending_in_writer > 0` も busy 扱いにする。
     pub fn is_busy(&self) -> bool {
         self.total.load(Ordering::Relaxed) != self.done.load(Ordering::Relaxed)
+            || self.pending_in_writer.load(Ordering::Relaxed) > 0
     }
 
     pub fn reset_counters_if_idle(&self) {
@@ -139,6 +151,7 @@ impl Drop for TagWriteHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     job_rx: &Receiver<TagWriteJob>,
     result_tx: &Sender<TagWriteResult>,
@@ -147,12 +160,13 @@ fn run_worker(
     shared_writer: Arc<Mutex<IndexWriter>>,
     done: &Arc<AtomicUsize>,
     failures: &Arc<AtomicUsize>,
+    pending_in_writer: &Arc<AtomicUsize>,
     shutdown: &Arc<AtomicBool>,
 ) {
     // バッチ commit 用の pending カウンタ。ingest_worker と同じ「N 件溜まったら
-    // commit / idle で M 秒経ったら commit / 終了時に必ず flush」パターン。
+    // commit / idle で M ms 経ったら commit / 終了時に必ず flush」パターン。
     // これをやらないと N ファイル一括トグルで N 回 fsync が発生する。
-    let mut pending: usize = 0;
+    // `pending_in_writer` は UI 側の `is_busy()` と同期した外部ミラー。
     let mut last_flush = Instant::now();
 
     loop {
@@ -162,8 +176,10 @@ fn run_worker(
         let job = match job_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(j) => j,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if pending > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL {
-                    flush_commit(&shared_writer, &fts, &mut pending);
+                if pending_in_writer.load(Ordering::Relaxed) > 0
+                    && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL
+                {
+                    flush_commit(&shared_writer, &fts, pending_in_writer);
                     last_flush = Instant::now();
                 }
                 continue;
@@ -175,28 +191,39 @@ fn run_worker(
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
-        done.fetch_add(1, Ordering::Relaxed);
         if dirtied {
-            pending += 1;
+            pending_in_writer.fetch_add(1, Ordering::Relaxed);
         }
-        if pending >= BATCH_FLUSH_COUNT {
-            flush_commit(&shared_writer, &fts, &mut pending);
+
+        // Flush 判断は結果通知 + done 更新より **先** に行う。そうしないと UI 側の
+        // `is_busy()` が total == done を観測して完了 toast を出した直後に、commit 前の
+        // Ctrl+G が走って新タグを見つけられないバグが発生する (pending_in_writer も busy に
+        // 含めているので最悪でも race window は 1 atomic op 分)。
+        // 単発トグルを即反映させるため、キューが空なら閾値未満でも flush する。
+        let pending_now = pending_in_writer.load(Ordering::Relaxed);
+        if pending_now >= BATCH_FLUSH_COUNT || (pending_now > 0 && job_rx.is_empty()) {
+            flush_commit(&shared_writer, &fts, pending_in_writer);
             last_flush = Instant::now();
         }
 
+        done.fetch_add(1, Ordering::Relaxed);
         let _ = result_tx.send(TagWriteResult {
             path: job.path.clone(),
             result: res.map_err(|e| e.to_string()),
         });
     }
     // 終了時に残ピンを flush。忘れると最後のジョブが検索に反映されない。
-    flush_commit(&shared_writer, &fts, &mut pending);
+    flush_commit(&shared_writer, &fts, pending_in_writer);
 }
 
 /// Tantivy writer を commit + reader reload する。pending が 0 なら no-op。
-/// Quality fix: commit 失敗時は reader reload を走らせない (stale 読みを防ぐ)。
-fn flush_commit(shared_writer: &Mutex<IndexWriter>, fts: &FtsIndex, pending: &mut usize) {
-    if *pending == 0 {
+/// commit 失敗時は reader reload を走らせない (stale 読みを防ぐ)。
+fn flush_commit(
+    shared_writer: &Mutex<IndexWriter>,
+    fts: &FtsIndex,
+    pending_in_writer: &AtomicUsize,
+) {
+    if pending_in_writer.load(Ordering::Relaxed) == 0 {
         return;
     }
     let committed = match shared_writer.lock() {
@@ -214,7 +241,9 @@ fn flush_commit(shared_writer: &Mutex<IndexWriter>, fts: &FtsIndex, pending: &mu
             false
         }
     };
-    *pending = 0;
+    // Reset after commit attempt. 成功しなかった場合も pending は 0 に戻す (次回ジョブで
+    // dirty 判定がやり直され、いずれ別の commit 機会で再試行される)。
+    pending_in_writer.store(0, Ordering::Relaxed);
     if committed {
         if let Err(e) = fts.reload_reader() {
             crate::logger::log(format!("tag_write_worker: reload_reader: {e}"));
@@ -327,5 +356,39 @@ mod tests {
         let j2 = TagJobKind::ClearMiv;
         assert!(matches!(j1.clone(), TagJobKind::Toggle(_)));
         assert!(matches!(j2.clone(), TagJobKind::ClearMiv));
+    }
+
+    /// `is_busy()` は `pending_in_writer > 0` も busy 扱いにする。
+    /// これで「XMP 書き込みは done カウントに反映されたが commit 前」の窓で
+    /// UI が完了 toast を出してしまう race を塞ぐ。
+    #[test]
+    fn is_busy_reflects_pending_in_writer() {
+        let total = Arc::new(AtomicUsize::new(1));
+        let done = Arc::new(AtomicUsize::new(1));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let pending_in_writer = Arc::new(AtomicUsize::new(1));
+        let (_job_tx, _job_rx) = unbounded::<TagWriteJob>();
+        let (_result_tx, result_rx) = unbounded::<TagWriteResult>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // 実スレッドを使わずに、handle だけ組み立てて is_busy の論理を検証する。
+        // (Arc を流用、worker スレッド無しなので _thread は None)
+        let handle = TagWriteHandle {
+            job_tx: _job_tx,
+            result_rx,
+            total,
+            done,
+            failures,
+            pending_in_writer: pending_in_writer.clone(),
+            _thread: None,
+            shutdown,
+        };
+
+        // total == done でも、pending_in_writer > 0 なら busy。
+        assert!(handle.is_busy(), "commit 前は busy を維持する");
+
+        // commit 後 (pending_in_writer = 0) に busy が下がる。
+        pending_in_writer.store(0, Ordering::Relaxed);
+        assert!(!handle.is_busy(), "commit 後は busy=false");
     }
 }
