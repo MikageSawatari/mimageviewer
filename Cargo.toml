@@ -3,7 +3,7 @@ members = ["crates/susie-worker", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 
 [target.'cfg(windows)'.dependencies]

@@ -457,6 +457,51 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 同時にコミットすること。詳細な設計方針・新規テスト追加手順は
 [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) を参照。
 
+## タグ書き込みの互換性検証 (ExifTool)
+
+mIV は JPEG / PNG / WebP のタグを XMP `dc:subject` にだけ書く (IPTC Keywords は書かない)。
+そのため **Windows エクスプローラーの「タグ」欄には表示されない** (Explorer は IPTC Keywords を
+優先して読むため)。`docs/tag-feature.md` および `htdocs/mimageviewer/manual/tags.html` の互換性
+記述はこの前提を反映している。
+
+Lightroom / Bridge / digiKam / XnView MP 等の XMP 対応ソフトとは互換があるが、開発環境で
+Adobe 製品を持っていなくても **ExifTool でラウンドトリップ検証できる**:
+
+```powershell
+# UTF-8 対応のためコンソールを切り替え (CP932 のままだと日本語タグが化ける)
+chcp 65001
+# または
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+exiftool -XMP-dc:Subject -IPTC:Keywords "path\to\tagged.jpg"
+# 期待される出力:
+#   Subject: #原神, #風景       ← mIV で付与したタグ (XMP 側)
+#   Keywords:                    ← 空 (IPTC は書いていない前提)
+```
+
+ExifTool (exiftool.org) は業界標準の XMP 解釈リファレンス実装。ここで期待どおり出れば
+Lightroom / Bridge / digiKam / XnView MP でも同じタグが見える。
+
+### 文字化け対処
+
+PowerShell で日本語タグが `繝励Μ繧ｭ繝･繧｢` のような mojibake になるのはコンソール出力
+エンコーディングが CP932 のまま UTF-8 バイト列を解釈しているだけで、**ファイル内容自体は
+正しい UTF-8**。`chcp 65001` か `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`
+で解消。確実に機械可読にしたいなら JSON で取り出す:
+
+```powershell
+exiftool -j -XMP:Subject "path\to\tagged.jpg" | ConvertFrom-Json
+```
+
+JSON は仕様上 UTF-8 固定なのでコンソール設定に依存しない。
+
+### 将来的な IPTC 併記 (dual-write) 検討メモ
+
+Windows エクスプローラー互換も取りたいときは、APP13 Photoshop Image Resource Block 中の
+IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バイナリ構築は工数大
+(200-400 行 + 相互作用テスト)。現状は優先度低、マニュアル側でエクスプローラー非対応を
+明記して回避。
+
 ## Distribution
 
 - **mikage.to**: インストーラ (.exe) + exe 単体の両方を提供
