@@ -1203,9 +1203,12 @@ pub struct App {
     pub(crate) xmp_cache:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
-    /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。タグ書き込み
-    /// worker の完了時には、成功した path について worker が返した新タグ列で
-    /// エントリを上書きする (`poll_tag_write_results`)。フォルダ切替時のみ全クリアする。
+    /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。
+    /// 充填経路は 3 つ:
+    ///  1. `prewarm_grid_tags` が fts_meta から一括 (同期、フォルダ切替時)
+    ///  2. `tag_prewarm` ワーカーが XMP から背景読み (非インデックスファイル)
+    ///  3. `poll_tag_write_results` が worker の tags_after で上書き (書き込み完了時)
+    /// フォルダ切替時のみ全クリアし、prewarm → 背景プリフェッチで埋め直す。
     pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
     /// tag toast 用: 直近の Toggle 操作で UI が使っていたタグ名 (`#ドール` 等)。
     /// worker 完了時に「N 件に #ドール を付与 / 削除」として表示するのに使う。
@@ -1245,6 +1248,10 @@ pub struct App {
     /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
     /// 100ms 級にブロックしていた問題を解消する。
     pub(crate) metadata_pending: Option<MetadataLoadPending>,
+    /// グリッド表示用 XMP タグのバックグラウンドプリフェッチ (docs/tag-feature.md)。
+    /// `fts_meta` 未登録ファイル (非インデックス favorite 等) でも grid バッジが表示される
+    /// よう、`prewarm_grid_tags` が spawn する。フォルダ切替時に cancel される。
+    pub(crate) tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -1725,6 +1732,7 @@ impl Default for App {
             search_pending: None,
             favsearch_pending: None,
             metadata_pending: None,
+            tag_prewarm_pending: None,
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -6283,47 +6291,96 @@ impl App {
         }
     }
 
-    /// グリッドのタグバッジ表示用に fts_meta.db からタグ列を一括取得してキャッシュに載せる。
-    /// `auto_index_metadata=true` のお気に入り配下でのみデータが引ける。
-    /// 非インデックスのファイルは grid バッジを出さない — ファイル単位で同期 XMP 読み込みを
-    /// すると HDD で数百 ms 止まるため。ユーザーが grid でもバッジを見たい場合は
-    /// お気に入りのメタ索引を ON にする運用を想定。
+    /// グリッドのタグバッジ表示用に 2 段階でキャッシュを埋める。
+    ///
+    /// 1. **fts_meta.db から一括取得** (同期・高速): `auto_index_metadata=true` な
+    ///    お気に入り配下のファイルが対象。1 件の SQLite `IN (...)` で取れる。
+    /// 2. **残りの path は背景で XMP 直読み** ([`crate::tag_prewarm`]):
+    ///    非インデックスのお気に入り / 非お気に入り配下のファイルでも、HDD を止めずに
+    ///    タグバッジが表示される。結果は `poll_tag_prewarm_results` が `entry().or_insert()`
+    ///    で反映するため、タグ書き込み worker が先に入れた最新状態を stale XMP で
+    ///    上書きしない。
     ///
     /// **重要**: `tags_cache` は `ui_metadata_panel::get_current_tags_cached` とも共有で、
     /// 値が `Some(Vec)` ならキャッシュヒットとして扱われ XMP 直読みをスキップする。
-    /// 未インデックスのエントリに空 Vec を入れるとフルスクリーンで正しく XMP が読まれず
-    /// タグが空表示になるため、fts_meta に行が無い path はキャッシュに入れない。
+    /// 背景プリフェッチが完了した後は grid / fullscreen どちらもキャッシュヒットになる。
     pub(crate) fn prewarm_grid_tags(&mut self) {
-        let Some(mgr) = self.indexer_manager.as_ref() else {
-            return;
-        };
-        let meta = mgr.clone_fts_meta();
+        // 旧プリフェッチ (別フォルダの残り) は cancel: 以降の send は receiver 側で
+        // drain されない & or_insert なので安全だが、無駄な I/O を止めておく。
+        if let Some(pending) = self.tag_prewarm_pending.take() {
+            pending.cancel();
+        }
+
         // Image アイテムの path を収集。ZipImage / PdfPage は書き込み非対応なので除外。
-        let mut keys: Vec<(String, String)> = Vec::with_capacity(self.items.len());
-        for item in &self.items {
-            if let GridItem::Image(p) = item {
+        // 可視範囲 (visible_indices) を先頭に並べるとユーザーの目に見えるバッジから
+        // 順に埋まる。
+        let mut keys: Vec<(String, String, std::path::PathBuf)> =
+            Vec::with_capacity(self.items.len());
+        let visible: std::collections::HashSet<usize> =
+            self.visible_indices.iter().copied().collect();
+        let mut ordered_indices: Vec<usize> = (0..self.items.len()).collect();
+        ordered_indices.sort_by_key(|idx| if visible.contains(idx) { 0 } else { 1 });
+        for idx in ordered_indices {
+            if let Some(GridItem::Image(p)) = self.items.get(idx) {
                 if crate::xmp_writer::is_writable_format(p) {
                     let key = crate::search_index_db::normalize_path(p);
                     let cache_key = crate::adjustment_db::normalize_path(p);
-                    keys.push((key, cache_key));
+                    keys.push((key, cache_key, p.clone()));
                 }
             }
         }
         if keys.is_empty() {
             return;
         }
-        let db_keys: Vec<String> = keys.iter().map(|(k, _)| k.clone()).collect();
-        let Ok(rows) = meta.lookup_tags(&db_keys) else {
-            return;
-        };
-        let row_map: std::collections::HashMap<String, String> = rows.into_iter().collect();
-        // fts_meta に行がある path だけ cache に入れる (行があれば、空文字列 = タグ無しも
-        // 信頼できる情報として cache 可)。未登録 path は cache に入れないで、フルスクリーンが
-        // 従来どおり XMP から直読みできるようにする。
-        for (db_key, cache_key) in keys {
+
+        // 1) fts_meta 一括取得 — 存在する分は同期で即キャッシュに載せる
+        let row_map: std::collections::HashMap<String, String> =
+            if let Some(mgr) = self.indexer_manager.as_ref() {
+                let meta = mgr.clone_fts_meta();
+                let db_keys: Vec<String> = keys.iter().map(|(k, _, _)| k.clone()).collect();
+                meta.lookup_tags(&db_keys)
+                    .map(|rows| rows.into_iter().collect())
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        // 2) fts_meta に行がある path は同期で cache へ。残りは背景ワーカー行きに積む。
+        let mut disk_requests: Vec<(std::path::PathBuf, String)> = Vec::new();
+        for (db_key, cache_key, path) in keys {
             if let Some(tags_str) = row_map.get(&db_key) {
                 self.tags_cache
                     .insert(cache_key, crate::ingest_text::parse_tags_column(tags_str));
+            } else {
+                disk_requests.push((path, cache_key));
+            }
+        }
+
+        if !disk_requests.is_empty() {
+            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn(disk_requests));
+        }
+    }
+
+    /// `tag_prewarm` ワーカーからの XMP プリフェッチ結果を UI スレッドで回収する。
+    /// 既に `tags_cache` にエントリがある path (タグ書き込み worker が先に入れた新鮮な
+    /// 状態 / 同フォルダ内で既に読み終えた path) は上書きしない。
+    /// 毎フレーム `App::update` から呼ぶ。未完了分が残っていれば `update` 側で
+    /// `request_repaint()` してアイドル寝させない。
+    pub(crate) fn poll_tag_prewarm_results(&mut self) {
+        let Some(pending) = self.tag_prewarm_pending.as_ref() else {
+            return;
+        };
+        // このフレームで届いた分だけ drain (or_insert 挙動は stale XMP 防御)。
+        loop {
+            match pending.rx.try_recv() {
+                Ok(res) => {
+                    self.tags_cache.entry(res.cache_key).or_insert(res.tags);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.tag_prewarm_pending = None;
+                    break;
+                }
             }
         }
     }
@@ -9089,6 +9146,7 @@ impl eframe::App for App {
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();
+        self.poll_tag_prewarm_results();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
         self.poll_global_search_debounce();
         self.poll_global_search_events(ctx);
@@ -9096,6 +9154,7 @@ impl eframe::App for App {
         if self.search_pending.is_some()
             || self.favsearch_pending.is_some()
             || self.metadata_pending.is_some()
+            || self.tag_prewarm_pending.is_some()
         {
             ctx.request_repaint();
         }

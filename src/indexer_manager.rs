@@ -408,9 +408,10 @@ impl IndexerManager {
         Arc::clone(&self.fts)
     }
 
-    /// 共有 IndexWriter の Arc を clone して返す (タグ書き込み worker 用)。
-    /// Tantivy は 1 Index につき writer 1 本しか許さないので、worker が独自に
-    /// `fts.writer()` を呼ぶと LockBusy で失敗する。必ずこれを使って lock() する。
+    /// 共有 IndexWriter をラップした `FtsWriterDispatcher` の Arc を clone して返す
+    /// (タグ書き込み worker 用)。Tantivy は 1 Index につき writer 1 本しか許さないので、
+    /// worker が独自に `fts.writer()` を呼ぶと LockBusy で失敗する。
+    /// 必ずこの dispatcher 経由で `upsert` / `commit` を submit する (priority 指定可能)。
     pub fn clone_shared_writer(&self) -> Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher> {
         Arc::clone(&self.writer)
     }
