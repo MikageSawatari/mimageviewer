@@ -301,8 +301,10 @@ impl GlobalSearchState {
     }
 }
 
-/// GlobalHit のパスから「サムネ表示できる画像」としての代表情報を抽出する。
-/// サムネイル可能でない (拡張子が画像でない / PDF メタ・フォルダ名ヒット) なら None。
+/// GlobalHit のパスから「サムネ表示できる代表」の情報を抽出する。
+///
+/// 画像ファイル / ZIP 内画像 / PDF ファイルのいずれかならサムネイル化できるため
+/// 代表として採用する。それ以外 (未対応拡張子 / フォルダ名ヒットのみ) は None。
 fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentative> {
     let (file_part, entry) = match hit_path.split_once('!') {
         Some((zip, ent)) => (zip, Some(ent.to_string())),
@@ -314,12 +316,22 @@ fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentati
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)?;
+    // PDF は 1 ページ目をサムネに。ScanSnap 等 PDF だらけのフォルダでも
+    // コンテナに画像アイコンだけでなく中身プレビューが出るようになる。
+    if ext == "pdf" {
+        return Some(ContainerRepresentative {
+            path: PathBuf::from(file_part),
+            zip_entry: None,
+            pdf_page: Some(0),
+        });
+    }
     if !crate::folder_tree::is_recognized_image_ext(&ext) {
         return None;
     }
     Some(ContainerRepresentative {
         path: PathBuf::from(file_part),
         zip_entry: entry,
+        pdf_page: None,
     })
 }
 

@@ -9893,18 +9893,21 @@ fn make_load_request(
             // 代表サムネのキャッシュキー (Codex P1 対応):
             // - filename 単体を使うと別コンテナの同名画像 (例: 複数フォルダの `cover.jpg`)
             //   で衝突し、placeholder mtime=0 の entry で先に書かれた thumb を読んでしまう。
-            // - `{CACHE_KEY_SEARCH_REP}{full_path}[::{zip_entry}]` をキーにしてユニーク化。
+            // - `{CACHE_KEY_SEARCH_REP}{full_path}[::{zip_entry|#page}]` をキーにしてユニーク化。
             //   通常閲覧のキャッシュ (filename 単体キー) とは別空間なので互いを壊さない。
             let path_str = rep.path.to_string_lossy();
-            let key = match &rep.zip_entry {
-                Some(entry) => {
-                    format!("{}{}::{}", CACHE_KEY_SEARCH_REP, path_str, entry)
+            let key = match (&rep.zip_entry, rep.pdf_page) {
+                (Some(entry), _) => format!("{}{}::{}", CACHE_KEY_SEARCH_REP, path_str, entry),
+                (None, Some(page)) => {
+                    format!("{}{}#p{}", CACHE_KEY_SEARCH_REP, path_str, page)
                 }
-                None => format!("{}{}", CACHE_KEY_SEARCH_REP, path_str),
+                (None, None) => format!("{}{}", CACHE_KEY_SEARCH_REP, path_str),
             };
             Some(LoadRequest {
                 path: rep.path.clone(),
                 zip_entry: rep.zip_entry.clone(),
+                pdf_page: rep.pdf_page,
+                pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(key),
                 ..base
             })
