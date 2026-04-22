@@ -910,6 +910,11 @@ impl Settings {
         crate::data_dir::get().join("settings.json")
     }
 
+    /// UUID でお気に入りを引く。UI ドロップダウン等で `Option<Uuid>` を表示するときに使う。
+    pub fn favorite_by_id(&self, id: uuid::Uuid) -> Option<&FavoriteEntry> {
+        self.favorites.iter().find(|f| f.id == id)
+    }
+
     pub fn load() -> Self {
         let path = Self::settings_path();
         let data = match std::fs::read_to_string(&path) {

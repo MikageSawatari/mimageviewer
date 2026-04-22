@@ -238,40 +238,8 @@ impl<'a> IngestSession<'a> {
     }
 
     fn ingest_image(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
-        // 1. メタ抽出 (ソース別 PerSourceText を作る §19.5)
         let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
-
-        // 2. fts_meta に pending で書き込む (generation も +1)
-        self.meta_db
-            .mark_pending(
-                &cand.key,
-                self.favorite_id,
-                &self.favorite_root,
-                IndexKind::Image,
-                cand.mtime,
-                cand.file_size,
-                &norms,
-            )
-            .map_err(|e| format!("mark_pending: {e}"))?;
-
-        // 3. Tantivy にバッファリング
-        let doc = IndexDoc {
-            path: cand.key.clone(),
-            container: Container::Fs,
-            zip_entry: String::new(),
-            favorite_id: self.favorite_id,
-            kind: IndexKind::Image,
-            mtime: cand.mtime,
-            file_size: cand.file_size,
-            name: norms.name.clone(),
-            exif_text: norms.exif.clone(),
-            xmp_tweet_text: norms.xmp_tweet.clone(),
-            png_prompt_text: norms.png_prompt.clone(),
-            pdf_meta_text: norms.pdf_meta.clone(),
-        };
-        fts_index::upsert_doc(writer, self.fts.fields(), &doc)
-            .map_err(|e| format!("upsert_doc: {e}"))?;
-        Ok(())
+        self.commit_doc(writer, cand, Container::Fs, IndexKind::Image, norms)
     }
 
     /// PDF を ingest (§16 step 17)。ファイル名 + PDFium document info を検索対象にする。
@@ -283,8 +251,6 @@ impl<'a> IngestSession<'a> {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-
-        // 1. PDFium document info を worker プロセス経由で取得
         let info_text = match crate::pdf_loader::get_document_info(&cand.abs_path, None) {
             Ok(info) => info.as_search_text(),
             Err(e) => {
@@ -294,41 +260,9 @@ impl<'a> IngestSession<'a> {
                 String::new()
             }
         };
-
-        // 2. PerSourceText を構築 (PdfMeta のみ。他ソースは空)
         let norms = crate::ingest_text::build_per_source_for_pdf(&name, &info_text);
-
-        // 3. fts_meta に pending で書き込む
-        self.meta_db
-            .mark_pending(
-                &cand.key,
-                self.favorite_id,
-                &self.favorite_root,
-                IndexKind::Pdf,
-                cand.mtime,
-                cand.file_size,
-                &norms,
-            )
-            .map_err(|e| format!("mark_pending: {e}"))?;
-
-        // 4. Tantivy にバッファリング
-        let doc = IndexDoc {
-            path: cand.key.clone(),
-            container: Container::Fs, // PDF はコンテナ種別として Fs 扱い (v1)
-            zip_entry: String::new(),
-            favorite_id: self.favorite_id,
-            kind: IndexKind::Pdf,
-            mtime: cand.mtime,
-            file_size: cand.file_size,
-            name: norms.name.clone(),
-            exif_text: norms.exif.clone(),
-            xmp_tweet_text: norms.xmp_tweet.clone(),
-            png_prompt_text: norms.png_prompt.clone(),
-            pdf_meta_text: norms.pdf_meta.clone(),
-        };
-        fts_index::upsert_doc(writer, self.fts.fields(), &doc)
-            .map_err(|e| format!("upsert_doc: {e}"))?;
-        Ok(())
+        // PDF は container="fs" 扱い (v1)
+        self.commit_doc(writer, cand, Container::Fs, IndexKind::Pdf, norms)
     }
 
     /// ZIP / PDF の最小 ingest (ファイル名 + 基本メタのみ)。
@@ -340,12 +274,26 @@ impl<'a> IngestSession<'a> {
             .unwrap_or("")
             .to_string();
         let norms = crate::ingest_text::build_per_source_name_only(&name);
-        let kind = match cand.kind {
-            CandidateKind::Zip => IndexKind::Zip,
-            CandidateKind::Pdf => IndexKind::Pdf,
-            _ => IndexKind::Image, // Image でファイル扱い (予期しないケース)
+        let (container, kind) = match cand.kind {
+            CandidateKind::Zip => (Container::Zip, IndexKind::Zip),
+            CandidateKind::Pdf => (Container::Fs, IndexKind::Pdf),
+            // Image/Video が ここに来るのは本来通らないルートだが、
+            // classifier を通さず name_only にフォールバックした診断目的のパス。
+            _ => (Container::Fs, IndexKind::Image),
         };
+        self.commit_doc(writer, cand, container, kind, norms)
+    }
 
+    /// mark_pending → IndexDoc 生成 → upsert_doc を 1 箇所に集約 (§19 simplify pass)。
+    /// `norms` は move で受けて IndexDoc に埋め込むため、per-file で 5 x clone が発生しない。
+    fn commit_doc(
+        &self,
+        writer: &IndexWriter,
+        cand: &CandidateFile,
+        container: Container,
+        kind: IndexKind,
+        norms: crate::ingest_text::PerSourceText,
+    ) -> Result<(), String> {
         self.meta_db
             .mark_pending(
                 &cand.key,
@@ -357,24 +305,15 @@ impl<'a> IngestSession<'a> {
                 &norms,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
-
         let doc = IndexDoc {
             path: cand.key.clone(),
-            container: match cand.kind {
-                CandidateKind::Zip => Container::Zip,
-                CandidateKind::Pdf => Container::Fs, // v1: PDF は container="fs" で
-                _ => Container::Fs,
-            },
+            container,
             zip_entry: String::new(),
             favorite_id: self.favorite_id,
             kind,
             mtime: cand.mtime,
             file_size: cand.file_size,
-            name: norms.name.clone(),
-            exif_text: norms.exif.clone(),
-            xmp_tweet_text: norms.xmp_tweet.clone(),
-            png_prompt_text: norms.png_prompt.clone(),
-            pdf_meta_text: norms.pdf_meta.clone(),
+            norms,
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -714,11 +653,7 @@ mod tests {
                 kind: IndexKind::Image,
                 mtime: cand.mtime,
                 file_size: cand.file_size,
-                name: norms.name.clone(),
-                exif_text: norms.exif.clone(),
-                xmp_tweet_text: norms.xmp_tweet.clone(),
-                png_prompt_text: norms.png_prompt.clone(),
-                pdf_meta_text: norms.pdf_meta.clone(),
+                norms: norms.clone(),
             },
         )
         .unwrap();

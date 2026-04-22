@@ -91,15 +91,23 @@ impl Default for SearchTarget {
 
 impl SearchTarget {
     /// 対象ソースのスライス。`All` のときは `SourceKind::ALL` を返す。
-    fn sources(&self) -> &[SourceKind] {
+    pub fn sources(&self) -> &[SourceKind] {
         match self {
             SearchTarget::All => SourceKind::ALL,
             SearchTarget::Only(v) => v.as_slice(),
         }
     }
 
-    /// 有効な対象が 1 件もない (空 Only) なら true。
-    pub fn is_empty(&self) -> bool {
+    /// `source` がこの target に含まれるか。
+    pub fn includes(&self, source: SourceKind) -> bool {
+        match self {
+            SearchTarget::All => true,
+            SearchTarget::Only(v) => v.contains(&source),
+        }
+    }
+
+    /// 有効な対象が 1 件もない (空 Only) — クエリを組んでも絶対にヒットしない。
+    pub fn matches_nothing(&self) -> bool {
         matches!(self, SearchTarget::Only(v) if v.is_empty())
     }
 }
@@ -122,6 +130,32 @@ impl IndexKind {
             IndexKind::Pdf => "pdf",
         }
     }
+
+    /// SQLite に保存する整数表現 (fts_meta.db の kind 列)。
+    pub fn to_i64(self) -> i64 {
+        match self {
+            IndexKind::Folder => 0,
+            IndexKind::Image => 1,
+            IndexKind::Zip => 2,
+            IndexKind::Pdf => 3,
+        }
+    }
+
+    /// `to_i64` の逆変換。不正値は診断ログ後 `Image` にフォールバックする。
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            0 => IndexKind::Folder,
+            1 => IndexKind::Image,
+            2 => IndexKind::Zip,
+            3 => IndexKind::Pdf,
+            other => {
+                crate::logger::log(format!(
+                    "fts_index: unexpected IndexKind discriminant {other} — falling back to Image"
+                ));
+                IndexKind::Image
+            }
+        }
+    }
 }
 
 /// 検索時に `build_bigram_and_query` に渡す絞り込みフィルタ群 (§19.6)。
@@ -136,6 +170,9 @@ pub struct QueryFilters<'a> {
 }
 
 /// Tantivy ドキュメント 1 件を構築するための入力。
+///
+/// ソース別テキストは [`crate::ingest_text::PerSourceText`] にまとめて保持する。
+/// 呼び出し側が 5 フィールドを個別に clone して渡す必要を無くすため (§19)。
 #[derive(Debug, Clone)]
 pub struct IndexDoc {
     /// 正規化済みキー (fts_meta.db と同じ path)
@@ -147,12 +184,8 @@ pub struct IndexDoc {
     pub kind: IndexKind,
     pub mtime: i64,
     pub file_size: i64,
-    /// `search_norm::normalize_for_match` 適用済み。以下同様。
-    pub name: String,
-    pub exif_text: String,
-    pub xmp_tweet_text: String,
-    pub png_prompt_text: String,
-    pub pdf_meta_text: String,
+    /// ソース別 `normalize_for_match` 適用済みテキスト。
+    pub norms: crate::ingest_text::PerSourceText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,21 +277,28 @@ impl FtsIndex {
     /// と合わせて「v2 起動時は自動でフル再インデックス」のマイグレーションを実現する。
     pub fn open_at(dir: &Path) -> tantivy::Result<Self> {
         std::fs::create_dir_all(dir).ok();
-        let schema = build_schema();
+        // 既存インデックスがあれば 1 回だけ open して schema を確認し、そのまま使い回す。
+        // 旧スキーマだったら drop して wipe + create に切り替える。
         let mmap_dir = tantivy::directory::MmapDirectory::open(dir)?;
-        let exists = Index::exists(&mmap_dir)?;
-        drop(mmap_dir); // 削除前に MmapDirectory ハンドルを release
-        if exists && index_is_stale(dir)? {
-            crate::logger::log(format!(
-                "fts_index: detected old schema at {} — wiping dir for rebuild",
-                dir.display()
-            ));
-            wipe_index_dir(dir)?;
-        }
-        let index = if Index::exists(&tantivy::directory::MmapDirectory::open(dir)?)? {
-            Index::open_in_dir(dir)?
+        let existing = if Index::exists(&mmap_dir)? {
+            Some(Index::open_in_dir(dir)?)
         } else {
-            Index::create_in_dir(dir, schema.clone())?
+            None
+        };
+        drop(mmap_dir);
+
+        let index = match existing {
+            Some(idx) if schema_is_stale(&idx.schema()) => {
+                drop(idx);
+                crate::logger::log(format!(
+                    "fts_index: detected old schema at {} — wiping dir for rebuild",
+                    dir.display()
+                ));
+                wipe_index_dir(dir)?;
+                Index::create_in_dir(dir, build_schema())?
+            }
+            Some(idx) => idx,
+            None => Index::create_in_dir(dir, build_schema())?,
         };
         register_tokenizer(&index);
         let reader = index
@@ -310,11 +350,11 @@ pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantiv
         fields.kind            => d.kind.as_str(),
         fields.mtime           => d.mtime,
         fields.file_size       => d.file_size,
-        fields.name            => d.name.as_str(),
-        fields.exif_text       => d.exif_text.as_str(),
-        fields.xmp_tweet_text  => d.xmp_tweet_text.as_str(),
-        fields.png_prompt_text => d.png_prompt_text.as_str(),
-        fields.pdf_meta_text   => d.pdf_meta_text.as_str(),
+        fields.name            => d.norms.name.as_str(),
+        fields.exif_text       => d.norms.exif.as_str(),
+        fields.xmp_tweet_text  => d.norms.xmp_tweet.as_str(),
+        fields.png_prompt_text => d.norms.png_prompt.as_str(),
+        fields.pdf_meta_text   => d.norms.pdf_meta.as_str(),
     ))?;
     Ok(())
 }
@@ -365,7 +405,7 @@ pub fn build_bigram_and_query(
             return None;
         }
     }
-    if filters.target.is_empty() {
+    if filters.target.matches_nothing() {
         return None;
     }
 
@@ -469,24 +509,16 @@ pub fn search_page(
 // 内部: スキーマ構築とトークナイザ登録
 // -----------------------------------------------------------------------
 
-/// 既存の index ディレクトリに旧スキーマが保存されているかを判定する (§19.8)。
-///
-/// 判定: `Index::open_in_dir` で schema を取り、`exif_text` フィールドが無ければ旧版。
-/// `all_text` フィールドが残っていても旧版。
-fn index_is_stale(dir: &Path) -> tantivy::Result<bool> {
-    // 旧 index を open してみる。open 自体が失敗 (破損等) したら stale 扱いで wipe する。
-    let index = match Index::open_in_dir(dir) {
-        Ok(idx) => idx,
-        Err(_) => return Ok(true),
-    };
-    let schema = index.schema();
+/// 既存の Tantivy schema が v2 (§19) のフィールド集合と一致するか判定する。
+/// 判定: 新フィールド 5 本が揃っていて、旧 `all_text` が残っていないこと。
+fn schema_is_stale(schema: &Schema) -> bool {
     let has_new = schema.get_field("exif_text").is_ok()
         && schema.get_field("xmp_tweet_text").is_ok()
         && schema.get_field("png_prompt_text").is_ok()
         && schema.get_field("pdf_meta_text").is_ok()
         && schema.get_field("kind").is_ok();
     let has_legacy_all_text = schema.get_field("all_text").is_ok();
-    Ok(!has_new || has_legacy_all_text)
+    !has_new || has_legacy_all_text
 }
 
 /// ディレクトリ配下のファイルを全削除してから、ディレクトリ自体も再作成する。
@@ -567,11 +599,10 @@ mod tests {
             kind: IndexKind::Image,
             mtime: 100,
             file_size: 1024,
-            name: format!("{base} {text}"),
-            exif_text: String::new(),
-            xmp_tweet_text: String::new(),
-            png_prompt_text: String::new(),
-            pdf_meta_text: String::new(),
+            norms: crate::ingest_text::PerSourceText {
+                name: format!("{base} {text}"),
+                ..Default::default()
+            },
         }
     }
 
@@ -593,11 +624,13 @@ mod tests {
             kind,
             mtime: 100,
             file_size: 1024,
-            name: name.to_string(),
-            exif_text: exif.to_string(),
-            xmp_tweet_text: xmp_tweet.to_string(),
-            png_prompt_text: png_prompt.to_string(),
-            pdf_meta_text: String::new(),
+            norms: crate::ingest_text::PerSourceText {
+                name: name.to_string(),
+                exif: exif.to_string(),
+                xmp_tweet: xmp_tweet.to_string(),
+                png_prompt: png_prompt.to_string(),
+                pdf_meta: String::new(),
+            },
         }
     }
 
@@ -948,8 +981,10 @@ mod tests {
             let old_index = Index::create_in_dir(&path, old_schema).unwrap();
             register_tokenizer(&old_index);
         }
-        // この時点で index_is_stale が true を返すはず
-        assert!(index_is_stale(&path).unwrap());
+        // この時点で schema_is_stale が true を返すはず
+        let old_idx = Index::open_in_dir(&path).unwrap();
+        assert!(schema_is_stale(&old_idx.schema()));
+        drop(old_idx);
 
         // open_at が wipe → 新スキーマで作り直す
         let idx = FtsIndex::open_at(&path).unwrap();

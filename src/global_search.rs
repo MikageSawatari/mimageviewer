@@ -188,7 +188,7 @@ pub fn run(
         }
         scanned += page.len();
 
-        // 5b. 対応する正規化テキスト (target で結合済み) を一括取得 (§19.4)
+        // 5b. target で結合済みの正規化テキストを一括取得 (§19.4)
         let paths_only: Vec<String> = page.iter().map(|(p, _)| p.clone()).collect();
         let norm_map: std::collections::HashMap<String, String> =
             match meta_db.lookup_norms_for_target(&paths_only, &scope.target) {
@@ -351,16 +351,14 @@ mod tests {
     /// 既存テストは `SearchTarget::All` 前提なので、これで従来挙動と互換になる。
     fn ingest(meta: &FtsMetaDb, fts: &FtsIndex, fav: Uuid, path_str: &str, text: &str) {
         let key = normalize_path(&PathBuf::from(path_str));
-        let normalized = crate::search_norm::normalize_for_match(text);
-        let base_name = path_str.rsplit('/').next().unwrap_or(path_str).to_string();
-        // name に「ファイル名 + 検索テキスト」を入れる (テスト互換のため)
+        let base_name = path_str.rsplit('/').next().unwrap_or(path_str);
         let combined_name = format!(
             "{} {}",
-            crate::search_norm::normalize_for_match(&base_name),
-            normalized,
+            crate::search_norm::normalize_for_match(base_name),
+            crate::search_norm::normalize_for_match(text),
         );
         let norms = PerSourceText {
-            name: combined_name.clone(),
+            name: combined_name,
             ..PerSourceText::default()
         };
         meta.mark_pending(
@@ -385,11 +383,7 @@ mod tests {
                 kind: IndexKind::Image,
                 mtime: 0,
                 file_size: 0,
-                name: combined_name,
-                exif_text: String::new(),
-                xmp_tweet_text: String::new(),
-                png_prompt_text: String::new(),
-                pdf_meta_text: String::new(),
+                norms,
             },
         )
         .unwrap();
@@ -628,9 +622,8 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let key = normalize_path(&PathBuf::from("c:/a.jpg"));
-        let all_text = crate::search_norm::normalize_for_match("夕焼け");
         let norms = PerSourceText {
-            name: all_text.clone(),
+            name: crate::search_norm::normalize_for_match("夕焼け"),
             ..PerSourceText::default()
         };
         meta.mark_pending(
@@ -655,11 +648,7 @@ mod tests {
                 kind: IndexKind::Image,
                 mtime: 0,
                 file_size: 0,
-                name: all_text,
-                exif_text: String::new(),
-                xmp_tweet_text: String::new(),
-                png_prompt_text: String::new(),
-                pdf_meta_text: String::new(),
+                norms,
             },
         )
         .unwrap();

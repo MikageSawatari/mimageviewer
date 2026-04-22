@@ -672,11 +672,10 @@ mod tests {
                     kind: IndexKind::Image,
                     mtime: 1,
                     file_size: 1,
-                    name: "1.jpg txt".into(),
-                    exif_text: String::new(),
-                    xmp_tweet_text: String::new(),
-                    png_prompt_text: String::new(),
-                    pdf_meta_text: String::new(),
+                    norms: crate::ingest_text::PerSourceText {
+                        name: "1.jpg txt".into(),
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap();

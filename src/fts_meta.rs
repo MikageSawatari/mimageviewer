@@ -17,31 +17,13 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::fts_index::{IndexKind, SearchTarget, SourceKind};
+use crate::fts_index::{IndexKind, SearchTarget};
 use crate::ingest_text::PerSourceText;
 use crate::search_index_db::normalize_path;
 
 /// スキーマ変更時に bump することで、次回起動時に全再インデックスをトリガする定数。
 /// v2 (§19): all_text_norm を per-source 5 カラムに分割 + kind カラム追加。
 pub const INDEX_VERSION: i64 = 2;
-
-fn kind_to_i64(kind: IndexKind) -> i64 {
-    match kind {
-        IndexKind::Folder => 0,
-        IndexKind::Image => 1,
-        IndexKind::Zip => 2,
-        IndexKind::Pdf => 3,
-    }
-}
-
-fn kind_from_i64(v: i64) -> IndexKind {
-    match v {
-        0 => IndexKind::Folder,
-        2 => IndexKind::Zip,
-        3 => IndexKind::Pdf,
-        _ => IndexKind::Image, // 1 / 不正値は Image にフォールバック
-    }
-}
 
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,12 +46,8 @@ pub struct FileMeta {
 impl FileMeta {
     /// post-filter 用: 選択された検索対象をスペース区切りで結合した文字列を返す。
     pub fn combined_for_target(&self, target: &SearchTarget) -> String {
-        let sources: &[SourceKind] = match target {
-            SearchTarget::All => SourceKind::ALL,
-            SearchTarget::Only(v) => v.as_slice(),
-        };
         let mut out = String::new();
-        for &src in sources {
+        for &src in target.sources() {
             let s = self.norms.get(src);
             if s.is_empty() {
                 continue;
@@ -132,9 +110,8 @@ impl FtsMetaDb {
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;",
         )?;
-        // §19.8: 旧スキーマ (INDEX_VERSION=1 / all_text_norm カラム) を検出したら files を破棄する。
-        // 新スキーマで CREATE TABLE IF NOT EXISTS → 空から再インデックスに入る。
-        // 同時に呼び出し側 (IndexerManager) が fts_index/ を wipe することで Tantivy 側も再構築される。
+        // §19.8 自動マイグレーション: 旧スキーマを検出したら files を drop して再作成する。
+        // (Tantivy 側は FtsIndex::open_at が並列で wipe する)
         if needs_rebuild(&conn)? {
             crate::logger::log(
                 "fts_meta: detected old schema (INDEX_VERSION < 2) — dropping `files` table for rebuild",
@@ -186,7 +163,7 @@ impl FtsMetaDb {
                 path,
                 favorite_id.to_string(),
                 favorite_root.to_string_lossy().into_owned(),
-                kind_to_i64(kind),
+                kind.to_i64(),
                 mtime,
                 file_size,
                 now,
@@ -314,26 +291,19 @@ impl FtsMetaDb {
         let mut stmt = conn.prepare(&sql)?;
         let params_vec: Vec<&dyn rusqlite::ToSql> =
             paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let sources: &[SourceKind] = match target {
-            SearchTarget::All => SourceKind::ALL,
-            SearchTarget::Only(v) => v.as_slice(),
-        };
+        let sources = target.sources();
         let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
             let path: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let exif: String = row.get(2)?;
-            let xmp: String = row.get(3)?;
-            let png: String = row.get(4)?;
-            let pdf: String = row.get(5)?;
+            let norms = PerSourceText {
+                name: row.get(1)?,
+                exif: row.get(2)?,
+                xmp_tweet: row.get(3)?,
+                png_prompt: row.get(4)?,
+                pdf_meta: row.get(5)?,
+            };
             let mut out = String::new();
             for &src in sources {
-                let s = match src {
-                    SourceKind::Filename => &name,
-                    SourceKind::Exif => &exif,
-                    SourceKind::XmpTweet => &xmp,
-                    SourceKind::PngPrompt => &png,
-                    SourceKind::PdfMeta => &pdf,
-                };
+                let s = norms.get(src);
                 if s.is_empty() {
                     continue;
                 }
@@ -457,22 +427,21 @@ impl FtsMetaDb {
     }
 }
 
-const FILEMETA_SELECT_COLUMNS: &str =
-    "path, favorite_id, favorite_root, kind, mtime, file_size, \
-     indexed_at, index_version, index_generation, status, \
-     name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm";
+// `row_to_filemeta` が受け取るカラム順。2 つの SELECT で使い回す。
+// concat! は literal しか受けないので、列リスト部分をマクロで共有する。
+macro_rules! filemeta_select_cols {
+    () => {
+        "path, favorite_id, favorite_root, kind, mtime, file_size, \
+         indexed_at, index_version, index_generation, status, \
+         name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm"
+    };
+}
 
 const FILEMETA_SELECT_SQL_NOT_OK: &str =
-    "SELECT path, favorite_id, favorite_root, kind, mtime, file_size, \
-            indexed_at, index_version, index_generation, status, \
-            name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm \
-     FROM files WHERE status != 0";
+    concat!("SELECT ", filemeta_select_cols!(), " FROM files WHERE status != 0");
 
 const FILEMETA_SELECT_SQL_BY_PATH: &str =
-    "SELECT path, favorite_id, favorite_root, kind, mtime, file_size, \
-            indexed_at, index_version, index_generation, status, \
-            name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm \
-     FROM files WHERE path = ?1";
+    concat!("SELECT ", filemeta_select_cols!(), " FROM files WHERE path = ?1");
 
 fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let uuid_str: String = row.get(1)?;
@@ -486,7 +455,7 @@ fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         path: row.get(0)?,
         favorite_id,
         favorite_root: PathBuf::from(favorite_root),
-        kind: kind_from_i64(kind_i),
+        kind: IndexKind::from_i64(kind_i),
         mtime: row.get(4)?,
         file_size: row.get(5)?,
         indexed_at: row.get(6)?,
@@ -502,10 +471,6 @@ fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         },
     })
 }
-
-// 参照先エラー防止用: 使用しないが、定数の死コード警告を抑制する。
-#[allow(dead_code)]
-const _ASSERT_FILEMETA_COLS_USED: &str = FILEMETA_SELECT_COLUMNS;
 
 /// 既存の `files` テーブルが旧スキーマ (INDEX_VERSION=1 時代) かを判定する (§19.8)。
 ///
@@ -615,6 +580,7 @@ impl StatusCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fts_index::SourceKind;
     use std::path::PathBuf;
     use tempfile::TempDir;
 

@@ -263,15 +263,6 @@ fn stem_lower(path: &std::path::Path) -> String {
 }
 
 /// ファイルパスが PNG 拡張子か (大文字小文字無視)。
-/// 現在の target が指定ソースを含むかを判定 (§19.6)。
-/// `All` は常に true、`Only(v)` は v.contains(&source)。
-fn target_includes(target: &crate::fts_index::SearchTarget, source: crate::fts_index::SourceKind) -> bool {
-    match target {
-        crate::fts_index::SearchTarget::All => true,
-        crate::fts_index::SearchTarget::Only(v) => v.contains(&source),
-    }
-}
-
 fn is_png_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -450,10 +441,13 @@ fn run_metadata_search(
     //
     // §19 target フィルタ対応: target が全ソース (All) なら従来挙動。単一ソース選択時は
     // そのソース由来の文字列だけで hay を作り、非対象ソースの I/O もスキップする。
-    let use_name = target_includes(target, crate::fts_index::SourceKind::Filename);
-    let use_png = target_includes(target, crate::fts_index::SourceKind::PngPrompt);
-    let use_exif = target_includes(target, crate::fts_index::SourceKind::Exif);
-    let use_xmp = target_includes(target, crate::fts_index::SourceKind::XmpTweet);
+    let use_name = target.includes(crate::fts_index::SourceKind::Filename);
+    let use_png = target.includes(crate::fts_index::SourceKind::PngPrompt);
+    let use_exif = target.includes(crate::fts_index::SourceKind::Exif);
+    let use_xmp = target.includes(crate::fts_index::SourceKind::XmpTweet);
+    // 画像 / Video 用の fallback 経路は name/png/exif/xmp のいずれかが対象でないと
+    // 計算結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
+    let fallback_contributes = use_name || use_png || use_exif || use_xmp;
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -476,6 +470,12 @@ fn run_metadata_search(
                 }
                 continue;
             }
+        }
+        // fts_meta fast path で決まらなかった場合の fallback 経路。target が画像系ソース
+        // (Filename/PngPrompt/Exif/XmpTweet) を一つも含まないなら、fallback hay は常に
+        // 空になり matches は必ず false → file I/O もバイト走査も全て無駄。
+        if !fallback_contributes {
+            continue;
         }
         let name = path
             .file_name()
@@ -534,50 +534,66 @@ fn run_metadata_search(
     }
 
     // Pass 3: ZIP 内 PNG — ZIP を 1 回開いてまとめて処理 (ファイル I/O)
-    // Pass 2 と同じく target フィルタを尊重する。
-    for (zip_path, entries) in zip_png_groups {
-        if cancel.load(Ordering::Relaxed) {
-            return SearchThreadResult::Done {
-                matches,
-                xmp_additions,
-            };
-        }
-        let mut direct_archive = crate::zip_loader::open_archive(&zip_path).ok();
-        for (idx, entry_name) in entries {
+    // target が Filename/PngPrompt/XmpTweet を一つも含まない場合は hay が確定で空になり
+    // ヒット不可なので、ZIP を開く前に全スキップする。
+    let zip_entry_needs_bytes = use_png || use_xmp;
+    if fallback_contributes {
+        for (zip_path, entries) in zip_png_groups {
             if cancel.load(Ordering::Relaxed) {
                 return SearchThreadResult::Done {
                     matches,
                     xmp_additions,
                 };
             }
-            let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
-            let bytes_result = if is_nested {
-                crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-            } else if let Some(archive) = direct_archive.as_mut() {
-                crate::zip_loader::read_entry_from_archive(archive, &entry_name)
+            // バイト読み取りが不要 (name だけで判定) なら archive は開かない。
+            let mut direct_archive = if zip_entry_needs_bytes {
+                crate::zip_loader::open_archive(&zip_path).ok()
             } else {
-                crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+                None
             };
-            let (meta_text, xmp) = match bytes_result {
-                Ok(bytes) => {
-                    let png = if use_png {
-                        crate::png_metadata::build_searchable_from_bytes(&bytes)
-                    } else {
-                        String::new()
+            for (idx, entry_name) in entries {
+                if cancel.load(Ordering::Relaxed) {
+                    return SearchThreadResult::Done {
+                        matches,
+                        xmp_additions,
                     };
-                    let xmp = if use_xmp {
-                        crate::xmp_reader::read_tweet_info_from_bytes(&bytes)
-                    } else {
-                        None
-                    };
-                    (png, xmp)
                 }
-                Err(_) => (String::new(), None),
-            };
-            let entry_name_str = crate::zip_loader::entry_basename(&entry_name);
-            let name_for_hay = if use_name { entry_name_str } else { "" };
-            if crate::search_query::matches(tokens, &hay_of(&meta_text, name_for_hay, xmp.as_ref())) {
-                matches.insert(idx);
+                let (meta_text, xmp) = if zip_entry_needs_bytes {
+                    let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
+                    let bytes_result = if is_nested {
+                        crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+                    } else if let Some(archive) = direct_archive.as_mut() {
+                        crate::zip_loader::read_entry_from_archive(archive, &entry_name)
+                    } else {
+                        crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
+                    };
+                    match bytes_result {
+                        Ok(bytes) => {
+                            let png = if use_png {
+                                crate::png_metadata::build_searchable_from_bytes(&bytes)
+                            } else {
+                                String::new()
+                            };
+                            let xmp = if use_xmp {
+                                crate::xmp_reader::read_tweet_info_from_bytes(&bytes)
+                            } else {
+                                None
+                            };
+                            (png, xmp)
+                        }
+                        Err(_) => (String::new(), None),
+                    }
+                } else {
+                    (String::new(), None)
+                };
+                let entry_name_str = crate::zip_loader::entry_basename(&entry_name);
+                let name_for_hay = if use_name { entry_name_str } else { "" };
+                if crate::search_query::matches(
+                    tokens,
+                    &hay_of(&meta_text, name_for_hay, xmp.as_ref()),
+                ) {
+                    matches.insert(idx);
+                }
             }
         }
     }
@@ -2518,27 +2534,18 @@ impl App {
             return;
         };
         // §19.7: favorite_filter で単一お気に入りに絞り込む。選択が外れていたら全登録に戻す。
-        let fav_roots: Vec<PathBuf> = match self.favsearch.favorite_filter {
-            Some(id) => self
-                .settings
-                .favorites
-                .iter()
-                .find(|f| f.id == id)
-                .map(|f| vec![f.path.clone()])
-                .unwrap_or_else(|| {
-                    self.settings
-                        .favorites
-                        .iter()
-                        .map(|f| f.path.clone())
-                        .collect()
-                }),
-            None => self
-                .settings
-                .favorites
-                .iter()
-                .map(|f| f.path.clone())
-                .collect(),
-        };
+        let fav_roots: Vec<PathBuf> = self
+            .favsearch
+            .favorite_filter
+            .and_then(|id| self.settings.favorite_by_id(id))
+            .map(|f| vec![f.path.clone()])
+            .unwrap_or_else(|| {
+                self.settings
+                    .favorites
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .collect()
+            });
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);

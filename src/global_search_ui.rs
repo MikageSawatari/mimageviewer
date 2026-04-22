@@ -679,7 +679,8 @@ impl App {
         };
 
         // auto_index_metadata=true のお気に入り UUID を集める。
-        // ドロップダウンで単一 favorite を選んでいればそれだけに絞る。
+        // ドロップダウンで単一 favorite を選択中、かつその favorite がまだ対象セットに
+        // いるなら単一に絞る。外れていたら全対象にフォールバック。
         let all_favs: Vec<uuid::Uuid> = self
             .settings
             .favorites
@@ -687,14 +688,13 @@ impl App {
             .filter(|f| f.auto_index_metadata)
             .map(|f| f.id)
             .collect();
-        let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
-            Some(id) if all_favs.contains(&id) => vec![id],
-            Some(_) => {
-                // 選択中 favorite が auto_index_metadata=false になった → すべてにフォールバック
-                all_favs.clone()
-            }
-            None => all_favs,
-        };
+        let favs: Vec<uuid::Uuid> = self
+            .global_search
+            .filters
+            .favorite
+            .filter(|id| all_favs.contains(id))
+            .map(|id| vec![id])
+            .unwrap_or(all_favs);
 
         let scope = crate::global_search::SearchScope {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
@@ -1126,9 +1126,7 @@ impl App {
                             None => "すべて".to_string(),
                             Some(id) => self
                                 .settings
-                                .favorites
-                                .iter()
-                                .find(|f| f.id == id)
+                                .favorite_by_id(id)
                                 .map(|f| f.name.clone())
                                 .unwrap_or_else(|| "(削除済)".to_string()),
                         }

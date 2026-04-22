@@ -669,9 +669,7 @@ impl App {
                             None => "すべて".to_string(),
                             Some(id) => self
                                 .settings
-                                .favorites
-                                .iter()
-                                .find(|f| f.id == id)
+                                .favorite_by_id(id)
                                 .map(|f| f.name.clone())
                                 .unwrap_or_else(|| "(削除済)".to_string()),
                         }
