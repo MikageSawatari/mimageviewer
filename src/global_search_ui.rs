@@ -670,6 +670,23 @@ impl App {
         self.global_search.reset_for_new_query();
         self.global_search.last_executed = self.global_search.query.clone();
 
+        // Codex P2 #3: indexer_manager の有無とは独立に filter の健全化を先に行う。
+        // 選択中の favorite が削除された / auto_index_metadata を外された場合、UI ラベルと
+        // 検索スコープが食い違う (ラベル = 名前表示、スコープ = 全対象) のを避けるため
+        // フィルタ側を None に倒して UI も「すべて」に戻す。
+        let all_favs: Vec<uuid::Uuid> = self
+            .settings
+            .favorites
+            .iter()
+            .filter(|f| f.auto_index_metadata)
+            .map(|f| f.id)
+            .collect();
+        if let Some(id) = self.global_search.filters.favorite {
+            if !all_favs.contains(&id) {
+                self.global_search.filters.favorite = None;
+            }
+        }
+
         let Some(mgr) = self.indexer_manager.as_ref() else {
             self.global_search.reject_message =
                 Some("全文検索インデクサが利用できません".to_string());
@@ -678,24 +695,10 @@ impl App {
             return;
         };
 
-        // auto_index_metadata=true のお気に入り UUID を集める。
-        // ドロップダウンで単一 favorite を選択中、かつその favorite がまだ対象セットに
-        // いるなら単一に絞る。外れていたら全対象にフォールバック。
-        let all_favs: Vec<uuid::Uuid> = self
-            .settings
-            .favorites
-            .iter()
-            .filter(|f| f.auto_index_metadata)
-            .map(|f| f.id)
-            .collect();
-        let favs: Vec<uuid::Uuid> = self
-            .global_search
-            .filters
-            .favorite
-            .filter(|id| all_favs.contains(id))
-            .map(|id| vec![id])
-            .unwrap_or(all_favs);
-
+        let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
+            Some(id) => vec![id],
+            None => all_favs,
+        };
         let scope = crate::global_search::SearchScope {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),

@@ -367,15 +367,18 @@ fn run_metadata_search(
     let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
         std::collections::HashMap::new();
 
-    // fts_meta.db 直接ルックアップ (§9.2): 表示中 Image の path を正規化して一括 SELECT
-    // fts_meta.db に ok 状態で存在するファイルは all_text_norm が使える = Pass 2 の
+    // fts_meta.db 直接ルックアップ (§9.2): 表示中 Image / PdfFile の path を正規化して一括 SELECT
+    // fts_meta.db に ok 状態で存在するファイルは per-source norms が使える = Pass 2 の
     // ファイル I/O (EXIF/XMP/PNG 読み取り) を丸ごと省略できる。
-    // (未登録 path / indexing 進行中 path は Pass 2 のオンデマンド経路に落ちる)
+    // PDF は Codex P2 #1 対応: target=PdfMeta で PDF タイトル等を絞り込むため、
+    // Pass 1 の無条件 insert ではなく fts_meta の pdf_meta_norm に対して照合する。
     let preloaded_texts: std::collections::HashMap<String, String> = if let Some(db) = fts_meta {
         let keys: Vec<String> = items
             .iter()
             .filter_map(|it| match it {
-                GridItem::Image(p) => Some(crate::search_index_db::normalize_path(p)),
+                GridItem::Image(p) | GridItem::PdfFile(p) => {
+                    Some(crate::search_index_db::normalize_path(p))
+                }
                 _ => None,
             })
             .collect();
@@ -401,7 +404,6 @@ fn run_metadata_search(
         match item {
             GridItem::Folder(_)
             | GridItem::ZipFile(_)
-            | GridItem::PdfFile(_)
             | GridItem::ConvertibleArchive { .. }
             | GridItem::ZipSeparator { .. }
             | GridItem::SearchContainer { .. } => {
@@ -409,6 +411,23 @@ fn run_metadata_search(
                 // Ctrl+F (この関数) と共存させない前提 (docs §10.3 "他 UI との共存")。
                 // 万が一同時に存在したらテキスト一致で filter だけ掛ける (= 常に通す)。
                 matches.insert(idx);
+            }
+            GridItem::PdfFile(path) => {
+                // Codex P2 #1: PDF は fts_meta に pdf_meta_norm を持っているので、
+                // target=PdfMeta 時に実際の PDF タイトル等で絞り込める。
+                // 未インデックスの PDF (preloaded_texts に無い) は「テキスト判定不能」として
+                // 従来どおり常に残す (ナビ用途を壊さない)。
+                let key = crate::search_index_db::normalize_path(path);
+                match preloaded_texts.get(&key) {
+                    Some(preloaded) => {
+                        if crate::search_query::matches(tokens, preloaded) {
+                            matches.insert(idx);
+                        }
+                    }
+                    None => {
+                        matches.insert(idx);
+                    }
+                }
             }
             GridItem::Image(_) | GridItem::Video(_) => {
                 // Pass 2 で処理
@@ -2533,19 +2552,31 @@ impl App {
         let Some(db) = self.search_index_db.clone() else {
             return;
         };
-        // §19.7: favorite_filter で単一お気に入りに絞り込む。選択が外れていたら全登録に戻す。
-        let fav_roots: Vec<PathBuf> = self
-            .favsearch
-            .favorite_filter
-            .and_then(|id| self.settings.favorite_by_id(id))
-            .map(|f| vec![f.path.clone()])
-            .unwrap_or_else(|| {
-                self.settings
-                    .favorites
-                    .iter()
-                    .map(|f| f.path.clone())
-                    .collect()
-            });
+        // §19.7: favorite_filter で単一お気に入りに絞り込む。
+        // Codex P2 #3: 選択中 favorite が auto_index_structure=false になった / 削除された場合、
+        // UI との食い違いを防ぐため filter を None に倒して UI も「すべて」に戻す。
+        if let Some(id) = self.favsearch.favorite_filter {
+            let still_valid = self
+                .settings
+                .favorite_by_id(id)
+                .is_some_and(|f| f.auto_index_structure);
+            if !still_valid {
+                self.favsearch.favorite_filter = None;
+            }
+        }
+        let fav_roots: Vec<PathBuf> = match self.favsearch.favorite_filter {
+            Some(id) => self
+                .settings
+                .favorite_by_id(id)
+                .map(|f| vec![f.path.clone()])
+                .unwrap_or_default(),
+            None => self
+                .settings
+                .favorites
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -9102,12 +9133,14 @@ impl eframe::App for App {
         //   - Ctrl+G active 中は Ctrl+F を無効化する (Codex round-8 Must-fix #3)
         //     理由: 結果ビューに SearchContainer が並ぶ状態で Ctrl+F を使うと、
         //     run_metadata_search が SearchContainer を常に一致扱いするためフィルタ不能になる
-        //   - Ctrl+G 側の TextEdit にフォーカスがあるときも拾わない
+        //   - Codex P2 #2: `has_focus` だけだと Ctrl+G active でグリッドにフォーカスが
+        //     落ちた状態で Ctrl+F が通ってしまう → `active` も条件に入れる
         if !self.address_has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
+            && !self.global_search.active
         {
             let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
             if ctrl_f {
@@ -10403,6 +10436,40 @@ mod phase_c_key_tests {
         assert!(app.global_search.active);
         assert!(!app.show_search_bar, "Ctrl+G should close Ctrl+F");
         assert!(!app.favsearch.active);
+    }
+
+    /// Codex P2 #3: 選択中の Ctrl+S お気に入りフィルタが設定から消えたら、
+    /// `execute_favsearch` が UI と整合を取るために filter を None にクリアする。
+    #[test]
+    fn favsearch_clears_stale_favorite_filter() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 存在しない UUID を filter に立てて search を走らせる
+        let bogus = uuid::Uuid::new_v4();
+        app.favsearch.favorite_filter = Some(bogus);
+        app.favsearch.query = "x".to_string();
+        app.execute_favsearch();
+        assert_eq!(
+            app.favsearch.favorite_filter, None,
+            "無効 filter は None に戻さないと UI ラベルと検索スコープが食い違う"
+        );
+    }
+
+    /// Codex P2 #3 (Ctrl+G 側): 選択中の Ctrl+G お気に入りフィルタが対象セットに
+    /// いなくなったら、`spawn_global_search` が filter を None にクリアする。
+    #[test]
+    fn global_search_clears_stale_favorite_filter() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let bogus = uuid::Uuid::new_v4();
+        app.global_search.active = true;
+        app.global_search.filters.favorite = Some(bogus);
+        app.global_search.query = "x".to_string();
+        // spawn_global_search は indexer_manager が None のときに reject_message を出して早期 return するが、
+        // その前に filter の健全化は行う (コードは filter 正規化 → manager 存在確認 → spawn の順)。
+        app.spawn_global_search();
+        assert_eq!(
+            app.global_search.filters.favorite, None,
+            "無効 filter は None に戻さないと UI ラベルと検索スコープが食い違う"
+        );
     }
 
     /// どの順番で 3 検索モードを切り替えても、同時に 2 つ以上が active にならないこと。
