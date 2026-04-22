@@ -3021,6 +3021,28 @@ impl App {
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
     ) {
+        // ── 旧 PDF enumerate pending を無効化 (Codex P2, 2026-04) ──
+        // `load_pdf_as_folder` は自身で旧 pending を cancel するが、通常フォルダ /
+        // ZIP / 検索結果など PDF 以外への遷移経路では cancel されないままになっていた。
+        // その結果、遅れて届いた PDF 結果を `poll_pdf_enumerate` が適用して「C フォルダ
+        // に居るはずなのに 古い PDF B の仮想フォルダに戻る」事故が起きうる。
+        //
+        // ここで source_path と pending の pdf_path を比較し、不一致なら cancel + clear。
+        // `poll_pdf_enumerate` から呼ばれる経路では take() 済みなので None で no-op。
+        // `load_pdf_as_folder` → `load_pdf_as_folder` の連打では、呼び出し側で旧 pending を
+        // take + cancel してから新しい pending を差し込むので、この時点で pending は
+        // 新しい方 (source_path と一致) のみが残っている想定。
+        if let Some((pending_path, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
+            if pending_path != &source_path {
+                if let Some((_, _, cancel, _)) = self.pdf_enumerate_pending.take() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                // 「PDF 開こうとしたけど別 PDF or 別経路に移った」→ deferred fullscreen
+                // 復帰意図もクリアする (古い PDF の forward に再入してしまわないように)。
+                self.fs_nav_after_pdf_enumerate = None;
+            }
+        }
+
         // perf: start_loading_items 全体 + 内訳 (sidecar_flush / close_fullscreen /
         // state_reset / prewarm_rating / adjustment_db / mask_db / catalog_open /
         // catalog_load_all / catalog_delete_missing / spawn_workers / settings_save)。
