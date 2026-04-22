@@ -1438,18 +1438,12 @@ pub struct App {
     /// PDF レンダリング完了時に content_type を受け取るチャネル
     pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
     pub(crate) pdf_content_type_rx: mpsc::Receiver<(usize, crate::pdf_loader::PdfPageContentType)>,
-    /// ページ列挙の非同期応答待ち: (pdf_path, password, cancel, receiver)。
+    /// ページ列挙の非同期応答待ち: (pdf_path, password, handle)。
     ///
-    /// `cancel` は旧要求を pool dispatcher 段階で早期 skip させるためのトークン。
-    /// 新しい `load_pdf_as_folder` が入ったとき、前の pending の cancel を `true` に
-    /// してから置き換えると、pool は in-flight の古い enumerate ジョブを IPC/PDFium
-    /// 実行する前に捨てる (Codex P2 レビュー対応, 2026-04)。
-    pub(crate) pdf_enumerate_pending: Option<(
-        PathBuf,
-        Option<String>,
-        Arc<AtomicBool>,
-        mpsc::Receiver<std::io::Result<Vec<crate::pdf_loader::PdfPageEntry>>>,
-    )>,
+    /// `handle` を drop (新しい pending への置き換え含む) すると `PdfEnumerateHandle::Drop`
+    /// が自動的に cancel を立て、pool dispatcher が pop 時に IPC 前で古いジョブを捨てる。
+    pub(crate) pdf_enumerate_pending:
+        Option<(PathBuf, Option<String>, crate::pdf_loader::PdfEnumerateHandle)>,
     /// Ctrl+↑↓ フォルダナビで非同期 PDF に着地したときに保存する方向フラグ。
     /// `poll_pdf_enumerate` が items を埋めたあとで fullscreen を開き直すために使う。
     /// `Some(forward)`: DFS 方向 (true=前方/下巻方向, false=後方/上巻方向)。
@@ -1621,10 +1615,11 @@ impl Default for App {
             .ai_upscale_model_override
             .as_deref()
             .and_then(crate::ai::ModelKind::from_str);
-        // 操作中はバックグラウンドインデクサを一時停止するためのゲート (2026-04 F)。
-        // 1000ms 操作がなければ indexer が再開する。IndexerManager / name_index_supervisor
-        // の両方に `Arc` で共有される。
-        let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(1000));
+        // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
+        // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
+        let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
+            crate::activity_gate::DEFAULT_QUIET_MS,
+        ));
 
         // 全文検索インデクサを起動。DB/index オープンに失敗した場合 (ディスク容量不足等)
         // は None となり、Ctrl+G 機能は無効だが他の機能は継続動作する。
@@ -2330,14 +2325,20 @@ impl App {
     ) {
         // 既存 supervisor があれば drop (OFF 遷移だけでなく ON→ON でも念のため:
         // path 変更等で spawn し直すシナリオ)。
-        // **非同期 join** (2026-04 B): `drop(handle)` は `thread.join()` を待つため、
-        // bulk scan が進行中だと UI が 数百 ms ブロックする。signal_stop で cancel は立てて、
-        // 実際の join はバックグラウンドスレッドに逃がす。
+        // `drop(handle)` は `thread.join()` を待つため、bulk scan 進行中は UI が
+        // 数百 ms ブロックする。signal_stop で cancel は立ててから、実際の join は
+        // バックグラウンドスレッドに逃がす。spawn 失敗時は closure が現スレッドで drop
+        // されるので同期 join にフォールバックする (UI ブロックするが整合性は保たれる)。
         if let Some(handle) = self.name_index_supervisors.remove(&fav_id) {
             handle.signal_stop();
-            let _ = std::thread::Builder::new()
+            if let Err(e) = std::thread::Builder::new()
                 .name(format!("name-index-joiner-{}", fav_id.as_simple()))
-                .spawn(move || drop(handle));
+                .spawn(move || drop(handle))
+            {
+                crate::logger::log(format!(
+                    "name-index-joiner spawn failed, sync join instead: {e}"
+                ));
+            }
         }
 
         let Some(db) = self.search_index_db.as_ref() else {
@@ -2861,13 +2862,9 @@ impl App {
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
 
-        // ── 旧 enumerate ジョブを cancel (2026-04 Codex P2 対応) ──
-        // 旧 pending を drop するだけでは pool 側の in-flight ジョブは PDFium を走らせ
-        // 切るまで止まらず、連打時にキューが詰まる。新しい要求を出す前に旧 cancel を
-        // 立てれば、pool dispatcher は pop 時に IPC 前で捨てる。
-        if let Some((_, _, old_cancel, _)) = self.pdf_enumerate_pending.take() {
-            old_cancel.store(true, Ordering::Relaxed);
-        }
+        // 旧 pending を drop すると `PdfEnumerateHandle::Drop` が cancel を立て、
+        // pool dispatcher は pop 時に IPC 前で古いジョブを捨てる。
+        self.pdf_enumerate_pending = None;
 
         // ── パスワード確認 ──
         let password: Option<String> = self
@@ -2880,11 +2877,8 @@ impl App {
         // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
 
         // ── 非同期でページ列挙をリクエスト ──
-        // pool が利用可能なら Critical priority で multi-process 並列実行される。
-        // 返ってくる cancel トークンを pending に保存して、次の nav で `store(true)` する。
-        let (cancel, rx) =
-            crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
-        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, cancel, rx));
+        let handle = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
+        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle));
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
         self.address = pdf_path.to_string_lossy().to_string();
@@ -2897,20 +2891,20 @@ impl App {
     /// PDF ページ列挙の非同期応答をポーリングする。
     /// 毎フレーム `update()` から呼び出す。
     pub(crate) fn poll_pdf_enumerate(&mut self) {
-        let Some((ref pdf_path, _, ref cancel, ref rx)) = self.pdf_enumerate_pending else {
+        let Some((ref pdf_path, _, ref handle)) = self.pdf_enumerate_pending else {
             return;
         };
 
-        // Generation guard (Codex P2 レビュー): cancel が立っている pending の結果は破棄。
-        // 通常は load_pdf_as_folder で旧 pending を `take()` してから新規に差し替えるので
-        // ここに来ることは稀だが、cancel を立てたあと何らかの事情で pending を再使用した
-        // ケース (将来の修正で) でも古い結果を適用しないための念押し。
-        if cancel.load(Ordering::Relaxed) {
+        // Generation guard: cancel が立っている pending の結果は破棄する。
+        // load_pdf_as_folder は旧 pending を置き換える (= Drop で cancel) ため通常は
+        // ここに None で到達するが、将来 pending を cancel 後に再利用する経路が
+        // 追加されても古い結果を適用しないための念押し。
+        if handle.cancel.load(Ordering::Relaxed) {
             self.pdf_enumerate_pending = None;
             return;
         }
 
-        let result = match rx.try_recv() {
+        let result = match handle.rx.try_recv() {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return, // まだ結果が来ていない
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -2930,7 +2924,7 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _cancel, _) = self.pdf_enumerate_pending.take().unwrap();
+        let (pdf_path, password, _handle) = self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
         // (pool dispatcher が cancel を見て IPC 前に Err で返してくるパス)
@@ -3021,24 +3015,13 @@ impl App {
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
     ) {
-        // ── 旧 PDF enumerate pending を無効化 (Codex P2, 2026-04) ──
-        // `load_pdf_as_folder` は自身で旧 pending を cancel するが、通常フォルダ /
-        // ZIP / 検索結果など PDF 以外への遷移経路では cancel されないままになっていた。
-        // その結果、遅れて届いた PDF 結果を `poll_pdf_enumerate` が適用して「C フォルダ
-        // に居るはずなのに 古い PDF B の仮想フォルダに戻る」事故が起きうる。
-        //
-        // ここで source_path と pending の pdf_path を比較し、不一致なら cancel + clear。
-        // `poll_pdf_enumerate` から呼ばれる経路では take() 済みなので None で no-op。
-        // `load_pdf_as_folder` → `load_pdf_as_folder` の連打では、呼び出し側で旧 pending を
-        // take + cancel してから新しい pending を差し込むので、この時点で pending は
-        // 新しい方 (source_path と一致) のみが残っている想定。
-        if let Some((pending_path, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
+        // 通常フォルダ / ZIP / 検索結果など PDF 以外への遷移では、残存する PDF
+        // enumerate pending を無効化する。放置すると遅れて届いた結果を
+        // `poll_pdf_enumerate` が適用して現在表示を古い PDF 仮想フォルダに戻す。
+        // pending.Drop で自動 cancel されるので take するだけでよい。
+        if let Some((pending_path, _, _)) = self.pdf_enumerate_pending.as_ref() {
             if pending_path != &source_path {
-                if let Some((_, _, cancel, _)) = self.pdf_enumerate_pending.take() {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-                // 「PDF 開こうとしたけど別 PDF or 別経路に移った」→ deferred fullscreen
-                // 復帰意図もクリアする (古い PDF の forward に再入してしまわないように)。
+                self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
             }
         }
@@ -9274,25 +9257,22 @@ impl eframe::App for App {
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
 
-        // 2026-04 F: 入力があればバックグラウンドインデクサを一時停止させる。
-        // マウス移動 (PointerMoved) は除外し、意味のあるインタラクションだけを拾う。
-        // - キー入力 (keys_down 非空 / Key イベント / Text 入力)
-        // - ポインタボタン押下 / 解放
-        // - スクロール
+        // 入力があればバックグラウンドインデクサを一時停止させる。
+        // `keys_down` は「今押されている」セットなので、Ctrl や Shift を指で押しっぱなしに
+        // したまま読んでいると毎フレーム true になり、indexer が永久に再開できなくなる
+        // (ユーザー報告される前に /simplify で発見、2026-04)。代わりに「今フレームで
+        // 発生したイベント」だけを見る。マウス移動・フォーカス変化・Ime 等は除外。
         let has_activity = ctx.input(|i| {
-            !i.keys_down.is_empty()
-                || i.pointer.any_pressed()
-                || i.pointer.any_released()
-                || i.raw_scroll_delta.length_sq() > 0.0
-                || i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Text(_)
-                            | egui::Event::Key { .. }
-                            | egui::Event::MouseWheel { .. }
-                            | egui::Event::PointerButton { .. }
-                    )
-                })
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::MouseWheel { .. }
+                        | egui::Event::Touch { .. }
+                )
+            })
         });
         if has_activity {
             self.activity_gate.bump();

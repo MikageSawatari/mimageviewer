@@ -195,9 +195,6 @@ fn walk_dir_recursive(
     diag: &mut ScanDiag,
     depth: u32,
 ) -> Result<(), String> {
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(());
-    }
     // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
     const MAX_DEPTH: u32 = 40;
     if depth > MAX_DEPTH {
@@ -205,14 +202,11 @@ fn walk_dir_recursive(
         return Ok(());
     }
 
-    // **Codex P2 対応 (2026-04)**: read_dir の前で ActivityGate を待つ。
-    // 1 ディレクトリ読みは通常 <10ms だが、HDD/NAS で数百ディレクトリ連続すると
-    // 操作中のサムネ I/O と競合する。ここで待てばユーザー操作中は walk が停止する。
-    if let Some(gate) = activity_gate {
-        gate.wait_until_idle(cancel);
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+    // read_dir 1 回は通常 <10ms だが HDD/NAS で数百ディレクトリ連続すると操作中の
+    // サムネ I/O と競合する。ディレクトリ単位で ActivityGate を待てば操作中は walk
+    // が停止する。cancel check も兼ねる。
+    if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
+        return Ok(());
     }
 
     // このディレクトリに入る時点で UI に通知 (1 ディレクトリ 1 回なので mutex 競合は軽微)

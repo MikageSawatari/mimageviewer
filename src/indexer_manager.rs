@@ -306,7 +306,7 @@ impl IndexerManager {
             crate::logger::log(format!(
                 "IndexerManager: spawning joiner thread for {n} supervisor(s)"
             ));
-            let _ = std::thread::Builder::new()
+            if let Err(e) = std::thread::Builder::new()
                 .name("indexer-joiner".into())
                 .spawn(move || {
                     for handle in handles_to_join {
@@ -316,7 +316,14 @@ impl IndexerManager {
                             "IndexerManager(joiner): supervisor {id} joined"
                         ));
                     }
-                });
+                })
+            {
+                // spawn 失敗時は closure が現スレッドで drop される = 同期 join になる。
+                // UI がブロックするが整合性は保たれる (稀なリソース枯渇時のフェイルセーフ)。
+                crate::logger::log(format!(
+                    "IndexerManager: joiner spawn failed, sync join instead: {e}"
+                ));
+            }
         }
 
         // 新規 ON を spawn (path 変更で drop したものも新 path で respawn される)

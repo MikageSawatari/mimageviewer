@@ -31,7 +31,7 @@
 //! - PDFium document info の取り込みは §16 step 17 (別モジュール)
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -168,18 +168,10 @@ impl<'a> IngestSession<'a> {
 
         // === 1. 削除フェーズ ===
         for (i, path) in to_delete.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
+            // UI 操作中なら ActivityGate 経由で待機。cancel が立てば即抜ける。
+            if crate::activity_gate::wait_and_check_cancel(self.activity_gate, cancel) {
                 stats.cancelled = true;
                 break;
-            }
-            // UI 操作中はここで待機 (2026-04 F)。操作から quiet 期間が過ぎるまで
-            // sleep する。cancel が立てば即抜ける。
-            if let Some(gate) = self.activity_gate {
-                gate.wait_until_idle(cancel);
-                if cancel.load(Ordering::Relaxed) {
-                    stats.cancelled = true;
-                    break;
-                }
             }
             if let Some(p) = progress {
                 // カウントを先頭に置くとダイアログで truncate されても残る。
@@ -218,17 +210,10 @@ impl<'a> IngestSession<'a> {
 
         // === 2. Ingest フェーズ ===
         for (i, cand) in to_ingest.into_iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
+            // XMP 読み 1 件分だけ進めて次で再チェック (gate + cancel 両対応)。
+            if crate::activity_gate::wait_and_check_cancel(self.activity_gate, cancel) {
                 stats.cancelled = true;
                 break;
-            }
-            // UI 操作中はここで待機 (2026-04 F)。XMP 読み 1 件分だけ進めて次で再チェック。
-            if let Some(gate) = self.activity_gate {
-                gate.wait_until_idle(cancel);
-                if cancel.load(Ordering::Relaxed) {
-                    stats.cancelled = true;
-                    break;
-                }
             }
             if let Some(p) = progress {
                 // ファイル名だけだと同名別フォルダが判別できないので、favorite 相対パスで

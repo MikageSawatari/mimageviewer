@@ -31,7 +31,7 @@ impl AdjustmentDb {
         // 未リリース機能なのでマイグレーションは行わず旧テーブルを破棄する。
         //
         // `sidecar_sync`: サイドカー (mimageviewer.dat) を最後に import した時の
-        // ファイル mtime を folder_key ごとに記録する (2026-04)。フォルダ切替の度に
+        // ファイル mtime を folder_key ごとに記録する。フォルダ切替の度に
         // `fs::metadata(sidecar)` で取った mtime と突き合わせ、一致するなら
         // `read_to_string` + parse + import をまるごとスキップするための fast-path。
         // フォルダ移動・外部ツールでサイドカーを更新したケースだけ slow-path に落ちる。
@@ -44,8 +44,7 @@ impl AdjustmentDb {
              );
              CREATE TABLE IF NOT EXISTS sidecar_sync (
                 folder_key    TEXT PRIMARY KEY,
-                sidecar_mtime INTEGER NOT NULL,
-                synced_at     INTEGER NOT NULL
+                sidecar_mtime INTEGER NOT NULL
              );",
         )?;
         Ok(Self { conn })
@@ -146,14 +145,10 @@ impl AdjustmentDb {
         folder_key: &str,
         sidecar_mtime: i64,
     ) -> Result<(), rusqlite::Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO sidecar_sync (folder_key, sidecar_mtime, synced_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2, synced_at = ?3",
-            rusqlite::params![folder_key, sidecar_mtime, now],
+            "INSERT INTO sidecar_sync (folder_key, sidecar_mtime) VALUES (?1, ?2)
+             ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2",
+            rusqlite::params![folder_key, sidecar_mtime],
         )?;
         Ok(())
     }

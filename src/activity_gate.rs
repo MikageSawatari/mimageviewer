@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// デフォルトの「最終操作からこの ms 以上無操作なら indexer が再開してよい」閾値。
+/// HDD で Ctrl+↑↓ 連打の体感と indexer 進捗のバランスをとった実測値。
+pub const DEFAULT_QUIET_MS: u64 = 1000;
+
 /// プロセス開始時刻。`now_ms()` の基準点として lazily 初期化する。
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
@@ -97,6 +101,21 @@ impl ActivityGate {
         }
         now_ms().saturating_sub(last) >= self.quiet_threshold_ms
     }
+}
+
+/// ワーカーの unit-of-work 境界で呼ぶ定型ヘルパ。
+///
+/// `gate` が `Some` なら `wait_until_idle(cancel)` で待機したあと、`cancel` フラグを
+/// 再確認する。戻り値が `true` のとき呼び出し側は「キャンセルされた」として
+/// ループを抜ける。gate が None なら `cancel` だけを見る。
+///
+/// 複数のワーカー (ingest / search_walker / name_bulk_indexer) で同じ idiom を
+/// 書き分けていたのを統合する。
+pub fn wait_and_check_cancel(gate: Option<&ActivityGate>, cancel: &AtomicBool) -> bool {
+    if let Some(g) = gate {
+        g.wait_until_idle(cancel);
+    }
+    cancel.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

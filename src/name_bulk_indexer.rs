@@ -54,10 +54,9 @@ pub fn run_bulk_name_index(
     // (旧実装は秒精度で、同秒に連続スキャンが入ると stale 行が残留するバグがあった)
     let scan_start_stamp = crate::search_index_db::next_write_stamp();
 
-    // Pass 1: サブフォルダ列挙
-    // **Codex P2 対応 (2026-04)**: `on_visit` は各フォルダの `read_dir` 前に呼ばれるので、
-    // ここで ActivityGate を待てば再帰中でもユーザー操作中は列挙が停止する。
-    // (フォルダ単位の粒度なので、大きい favorite でもフォルダ 1 つ処理したら次で止まる)
+    // Pass 1: サブフォルダ列挙。`on_visit` は各フォルダの `read_dir` 前に呼ばれるので、
+    // ここで ActivityGate を待てば再帰中でもユーザー操作中はフォルダ単位で列挙が停止する。
+    // (cancel 伝播は `walk_dirs_recursive_with_progress` 側の責務なので wait のみ)
     let mut found: Vec<PathBuf> = Vec::new();
     walk_dirs_recursive_with_progress(fav_path, &mut found, cancel, &mut |cur| {
         if let Some(gate) = activity_gate {
@@ -77,17 +76,10 @@ pub fn run_bulk_name_index(
 
     // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile を集めて upsert
     for (i, folder) in found.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        // フォルダ 1 つ分を処理してから次でまた判定 (gate + cancel 両対応)。
+        if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
             summary.cancelled = true;
             break;
-        }
-        // UI 操作中はここで待機 (2026-04 F)。フォルダ 1 つ分を処理してから次でまた判定。
-        if let Some(gate) = activity_gate {
-            gate.wait_until_idle(cancel);
-            if cancel.load(Ordering::Relaxed) {
-                summary.cancelled = true;
-                break;
-            }
         }
         if let Some(p) = progress {
             // カウントを先頭に / フォルダは favorite 相対でフルパスが切れにくいようにする。
