@@ -24,7 +24,8 @@ use std::path::Path;
 use crate::fts_index::SourceKind;
 use crate::search_norm::normalize_for_match;
 
-/// 1 ファイル分のソース別検索テキスト (§19.5)。各フィールドは `normalize_for_match` 適用済み。
+/// 1 ファイル分のソース別検索テキスト (§19.5 + タグ統合)。各フィールドは `normalize_for_match` 適用済み
+/// (tags は元の表記を保ったスペース区切り `#` 込み文字列を格納)。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PerSourceText {
     pub name: String,
@@ -32,6 +33,9 @@ pub struct PerSourceText {
     pub xmp_tweet: String,
     pub png_prompt: String,
     pub pdf_meta: String,
+    /// XMP `dc:subject` 由来のタグ列 (スペース区切り、`#` 込み / 既存タグは `#` なし)。
+    /// Tantivy 側は bigram tokenize、fts_meta 側は同文字列を保存。
+    pub tags: String,
 }
 
 impl PerSourceText {
@@ -42,6 +46,7 @@ impl PerSourceText {
             SourceKind::XmpTweet => &self.xmp_tweet,
             SourceKind::PngPrompt => &self.png_prompt,
             SourceKind::PdfMeta => &self.pdf_meta,
+            SourceKind::Tags => &self.tags,
         }
     }
 
@@ -54,7 +59,8 @@ impl PerSourceText {
                 + self.xmp_tweet.len()
                 + self.png_prompt.len()
                 + self.pdf_meta.len()
-                + 5,
+                + self.tags.len()
+                + 6,
         );
         for s in [
             &self.name,
@@ -62,6 +68,7 @@ impl PerSourceText {
             &self.xmp_tweet,
             &self.png_prompt,
             &self.pdf_meta,
+            &self.tags,
         ] {
             if !s.is_empty() {
                 if !out.is_empty() {
@@ -79,7 +86,28 @@ impl PerSourceText {
             && self.xmp_tweet.is_empty()
             && self.png_prompt.is_empty()
             && self.pdf_meta.is_empty()
+            && self.tags.is_empty()
     }
+}
+
+/// XMP `dc:subject` 由来のタグ列を fts_meta / Tantivy 向けのスペース区切り文字列にする。
+/// タグ内の空白/制御文字は `_` に置換する (検索側と一致させるための唯一の経路)。
+pub fn build_tags_column(tags: &[String]) -> String {
+    let mut out = String::new();
+    for t in tags {
+        let cleaned: String = t
+            .chars()
+            .map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c })
+            .collect();
+        if cleaned.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&cleaned);
+    }
+    out
 }
 
 /// 1 ファイル分のソース別検索テキストをディスクから構築する。
@@ -116,6 +144,10 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         out.png_prompt = normalize_for_match(&png_text);
     }
 
+    // 5. XMP dc:subject タグ (tag 機能)
+    let dc_tags = crate::xmp_reader::read_dc_subject(path);
+    out.tags = build_tags_column(&dc_tags);
+
     out
 }
 
@@ -142,6 +174,8 @@ pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourc
     if !png_text.is_empty() {
         out.png_prompt = normalize_for_match(&png_text);
     }
+    let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(bytes);
+    out.tags = build_tags_column(&dc_tags);
 
     out
 }
@@ -159,6 +193,7 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
         } else {
             normalize_for_match(info_text)
         },
+        tags: String::new(),
     }
 }
 
@@ -290,9 +325,10 @@ mod tests {
             xmp_tweet: "".into(),
             png_prompt: "prompt text".into(),
             pdf_meta: "".into(),
+            tags: "#原神".into(),
         };
         let c = pst.combined();
-        assert_eq!(c, "photo.jpg canon 5d prompt text");
+        assert_eq!(c, "photo.jpg canon 5d prompt text #原神");
     }
 
     #[test]
@@ -303,11 +339,13 @@ mod tests {
             xmp_tweet: "x".into(),
             png_prompt: "p".into(),
             pdf_meta: "m".into(),
+            tags: "t".into(),
         };
         assert_eq!(pst.get(SourceKind::Filename), "n");
         assert_eq!(pst.get(SourceKind::Exif), "e");
         assert_eq!(pst.get(SourceKind::XmpTweet), "x");
         assert_eq!(pst.get(SourceKind::PngPrompt), "p");
         assert_eq!(pst.get(SourceKind::PdfMeta), "m");
+        assert_eq!(pst.get(SourceKind::Tags), "t");
     }
 }

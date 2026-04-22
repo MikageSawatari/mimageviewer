@@ -191,6 +191,18 @@ impl App {
         let exif_info = self.get_current_exif();
         let tweet_info = self.get_current_tweet_info();
 
+        // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
+        let taggable_path = self.current_taggable_image_path();
+        let current_tags: Vec<String> = if taggable_path.is_some() {
+            self.get_current_tags_cached()
+        } else {
+            Vec::new()
+        };
+        let defined_tags = self.settings.tags.clone();
+
+        // タグボタンクリックを closure 内で検出し、後段で request_tag_toggle を走らせる
+        let mut clicked_tag: Option<String> = None;
+
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
         child_ui.set_clip_rect(content_rect);
@@ -200,7 +212,24 @@ impl App {
             .show(&mut child_ui, |ui| {
                 ui.set_width(inner_rect.width());
 
-                // X ツイート情報 (mXD 由来) — 最上段に出す
+                // ── タグパネル (最上段) ──
+                // 登録タグを ON/OFF ボタンで並べる。対応形式外のファイルはグレーアウト。
+                if !defined_tags.is_empty() {
+                    draw_tag_panel(
+                        ui,
+                        &defined_tags,
+                        &current_tags,
+                        taggable_path.is_some(),
+                        &mut clicked_tag,
+                    );
+                    if tweet_info.is_some() || ai_metadata.is_some() || exif_info.is_some() {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                }
+
+                // X ツイート情報 (mXD 由来)
                 if let Some(ref t) = tweet_info {
                     draw_tweet_panel(ui, ctx, t);
                     if ai_metadata.is_some() || exif_info.is_some() {
@@ -240,10 +269,19 @@ impl App {
                 }
 
                 // 何もない場合
-                if ai_metadata.is_none() && exif_info.is_none() && tweet_info.is_none() {
+                if ai_metadata.is_none()
+                    && exif_info.is_none()
+                    && tweet_info.is_none()
+                    && defined_tags.is_empty()
+                {
                     draw_no_metadata(ui);
                 }
             });
+
+        // タグボタンクリックの後処理 (closure 外で self を可変借用する)
+        if let Some(tag_name) = clicked_tag {
+            self.request_tag_toggle_for_selection(&tag_name);
+        }
 
         true
     }
@@ -268,6 +306,48 @@ impl App {
         let key = self.metadata_cache_key(idx)?;
         self.xmp_cache.get(&key).cloned().flatten()
     }
+
+    /// 現在のフルスクリーン画像のタグ一覧 (XMP dc:subject) を取得する。
+    /// キャッシュにあればそれを返し、なければ同期的に読み込んでキャッシュする。
+    /// 対応形式外 (ZIP 内画像 / PDF ページ / HEIC 等) は空 Vec を返す。
+    pub(crate) fn get_current_tags_cached(&mut self) -> Vec<String> {
+        let Some(idx) = self.fullscreen_idx else {
+            return Vec::new();
+        };
+        let Some(key) = self.metadata_cache_key(idx) else {
+            return Vec::new();
+        };
+        if let Some(cached) = self.tags_cache.get(&key) {
+            return cached.clone();
+        }
+        // タグ対象外 (ZIP/PDF/フォルダ等) は空 Vec をキャッシュして終わり
+        let Some(path) = self.current_taggable_image_path() else {
+            self.tags_cache.insert(key, Vec::new());
+            return Vec::new();
+        };
+        let tags = crate::xmp_reader::read_dc_subject(&path);
+        self.tags_cache.insert(key, tags.clone());
+        tags
+    }
+
+    /// 現在のフルスクリーン画像がタグ付与対象 (通常画像 JPEG/PNG/WebP) なら Path を返す。
+    /// ZIP 内・PDF ページ・フォルダなどは None。
+    fn current_taggable_image_path(&self) -> Option<std::path::PathBuf> {
+        use crate::grid_item::GridItem;
+        let idx = self.fullscreen_idx?;
+        if let Some(GridItem::Image(p)) = self.items.get(idx) {
+            // 拡張子判定は tag_ops と同じ基準
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())?;
+            if matches!(ext.as_str(), "jpg" | "jpeg" | "jfif" | "png" | "webp") {
+                return Some(p.clone());
+            }
+        }
+        None
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +360,80 @@ const DIM_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 const JSON_COLOR: egui::Color32 = egui::Color32::from_rgb(190, 200, 210);
 const SECTION_FONT: f32 = 14.0;
 const BODY_FONT: f32 = 13.0;
+
+/// タグパネル描画 (docs/tag-feature.md §4.4)。
+///
+/// 登録タグを ON/OFF ボタンで横並び表示。各ボタンの外観:
+/// - ON (現在のファイルに付与済み): 緑背景 + 強調
+/// - OFF: 通常
+/// - 対応形式外: グレーアウト (クリック不可)
+///
+/// クリック時は `clicked_tag` に `TagDef.name` を書き込む (closure 外でトグル実行)。
+fn draw_tag_panel(
+    ui: &mut egui::Ui,
+    defined_tags: &[crate::settings::TagDef],
+    current_tags: &[String],
+    is_taggable: bool,
+    clicked_tag: &mut Option<String>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("タグ")
+                .color(egui::Color32::WHITE)
+                .size(14.0)
+                .strong(),
+        );
+        if !is_taggable {
+            ui.label(
+                egui::RichText::new("(対応形式外)")
+                    .size(10.0)
+                    .color(DIM_COLOR),
+            )
+            .on_hover_text(
+                "このファイルはタグ書き込みに対応していません。\n\
+                 JPEG / PNG / WebP のみ対応しています。",
+            );
+        }
+    });
+    ui.add_space(4.0);
+
+    // ボタンを折り返し配置
+    ui.horizontal_wrapped(|ui| {
+        for def in defined_tags {
+            let with_hash = format!("#{}", def.name);
+            let is_on = current_tags.iter().any(|t| *t == with_hash);
+            let label = if is_on {
+                egui::RichText::new(format!("● #{}", def.name))
+                    .color(egui::Color32::from_rgb(180, 255, 180))
+            } else {
+                egui::RichText::new(format!("  #{}", def.name)).color(TEXT_COLOR)
+            };
+            let btn = egui::Button::new(label)
+                .fill(if is_on {
+                    egui::Color32::from_rgba_unmultiplied(60, 120, 70, 200)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(50, 50, 60, 180)
+                })
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    if is_on {
+                        egui::Color32::from_rgb(120, 200, 120)
+                    } else {
+                        egui::Color32::from_gray(80)
+                    },
+                ));
+            let resp = ui.add_enabled(is_taggable, btn);
+            let resp = resp.on_hover_text(if is_on {
+                format!("クリックで `{with_hash}` を削除")
+            } else {
+                format!("クリックで `{with_hash}` を付与")
+            });
+            if resp.clicked() {
+                *clicked_tag = Some(def.name.clone());
+            }
+        }
+    });
+}
 
 fn draw_a1111_panel(ui: &mut egui::Ui, ctx: &egui::Context, meta: &A1111Metadata) {
     // ヘッダー

@@ -127,14 +127,16 @@ pub fn run(
         return;
     }
 
-    // 4. 正の include トークン群を token 単位で bigram 化 (Codex 6 回目指摘 #1)
+    // 4. 正の include トークンを集めて bigram クエリを組む。
+    //    タグはソース別フィールド `tags` として master の per-source OR に自然に組み込まれる
+    //    (target=All なら tags 含む 6 ソース OR, target=Only([Tags]) ならタグフィールドのみ)。
     let include_tokens: Vec<&str> = tokens
         .iter()
         .filter(|t| t.include)
         .map(|t| t.needle.as_str())
         .collect();
     if include_tokens.is_empty() {
-        // validate_query で NOT-only は弾かれるはずだが念のため
+        // validate_query で NOT-only は弾かれるはず
         let _ = tx.send(SearchStreamEvent::Done {
             truncated: false,
             reason: DoneReason::RejectedQuery(RejectReason::NotOnly),
@@ -263,8 +265,8 @@ fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason
     if !tokens.iter().any(|t| t.include) {
         return Err(RejectReason::NotOnly);
     }
-    // 各 include トークンが §4.3 の最小長 (CJK: 2 / ASCII: 3) を満たすか確認。
-    // 1 つでも短ければ TooShort (AND 条件なので短い方が最低基準になる)。
+    // タグトークンは最小長チェックの対象外 (exact match なので 1 文字でも OK)。
+    // 通常キーワードの include トークンのみ §4.3 の最小長 (CJK: 2 / ASCII: 3) を確認。
     for t in tokens.iter().filter(|t| t.include) {
         if !has_sufficient_length(&t.needle) {
             return Err(RejectReason::TooShort);

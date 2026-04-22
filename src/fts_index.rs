@@ -55,8 +55,9 @@ const WRITER_HEAP_MB: usize = 64;
 /// 検索時のページサイズ (Codex 3 回目 #6 worst case 計測で確定)
 pub const PAGE_SIZE: usize = 500;
 
-/// 検索対象となるメタソース種別 (§19.2)。
+/// 検索対象となるメタソース種別 (§19.2 + tag 機能統合)。
 /// `name` は独立フィールドだが、検索 UX 上「ファイル名で検索」も同じ target として扱えるよう enum に含める。
+/// `Tags` は XMP dc:subject 由来のタグ (`#原神` 等) 専用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     Filename,
@@ -64,6 +65,7 @@ pub enum SourceKind {
     XmpTweet,
     PngPrompt,
     PdfMeta,
+    Tags,
 }
 
 impl SourceKind {
@@ -73,6 +75,7 @@ impl SourceKind {
         SourceKind::XmpTweet,
         SourceKind::PngPrompt,
         SourceKind::PdfMeta,
+        SourceKind::Tags,
     ];
 }
 
@@ -171,8 +174,8 @@ pub struct QueryFilters<'a> {
 
 /// Tantivy ドキュメント 1 件を構築するための入力。
 ///
-/// ソース別テキストは [`crate::ingest_text::PerSourceText`] にまとめて保持する。
-/// 呼び出し側が 5 フィールドを個別に clone して渡す必要を無くすため (§19)。
+/// ソース別テキスト (ファイル名・EXIF・XMP・PNG プロンプト・PDF メタ・タグ) は
+/// [`crate::ingest_text::PerSourceText`] にまとめて保持する。
 #[derive(Debug, Clone)]
 pub struct IndexDoc {
     /// 正規化済みキー (fts_meta.db と同じ path)
@@ -216,6 +219,7 @@ pub struct Fields {
     pub xmp_tweet_text: Field,
     pub png_prompt_text: Field,
     pub pdf_meta_text: Field,
+    pub tags: Field,
 }
 
 impl Fields {
@@ -241,6 +245,7 @@ impl Fields {
             pdf_meta_text: schema
                 .get_field("pdf_meta_text")
                 .expect("schema: pdf_meta_text"),
+            tags: schema.get_field("tags").expect("schema: tags"),
         }
     }
 
@@ -252,6 +257,7 @@ impl Fields {
             SourceKind::XmpTweet => self.xmp_tweet_text,
             SourceKind::PngPrompt => self.png_prompt_text,
             SourceKind::PdfMeta => self.pdf_meta_text,
+            SourceKind::Tags => self.tags,
         }
     }
 }
@@ -272,9 +278,9 @@ impl FtsIndex {
 
     /// 任意ディレクトリで開く (テスト用)。
     ///
-    /// §19.8: 既存ディレクトリに旧スキーマ (`all_text` フィールド有 / `exif_text` フィールド無)
-    /// が残っていたらディレクトリごと破棄して新規作成する。fts_meta.db 側の `needs_rebuild`
-    /// と合わせて「v2 起動時は自動でフル再インデックス」のマイグレーションを実現する。
+    /// §19.8 + tag 統合: 既存ディレクトリに旧スキーマ (per-source フィールド or tags
+    /// フィールドのどちらかが無い) が残っていたらディレクトリごと破棄して新規作成する。
+    /// fts_meta.db 側の `needs_rebuild` と合わせて「起動時は自動でフル再インデックス」を実現する。
     pub fn open_at(dir: &Path) -> tantivy::Result<Self> {
         std::fs::create_dir_all(dir).ok();
         // 既存インデックスがあれば 1 回だけ open して schema を確認し、そのまま使い回す。
@@ -355,6 +361,7 @@ pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantiv
         fields.xmp_tweet_text  => d.norms.xmp_tweet.as_str(),
         fields.png_prompt_text => d.norms.png_prompt.as_str(),
         fields.pdf_meta_text   => d.norms.pdf_meta.as_str(),
+        fields.tags            => d.norms.tags.as_str(),
     ))?;
     Ok(())
 }
@@ -509,14 +516,15 @@ pub fn search_page(
 // 内部: スキーマ構築とトークナイザ登録
 // -----------------------------------------------------------------------
 
-/// 既存の Tantivy schema が v2 (§19) のフィールド集合と一致するか判定する。
-/// 判定: 新フィールド 5 本が揃っていて、旧 `all_text` が残っていないこと。
+/// 既存の Tantivy schema が最新 (per-source + tags) のフィールド集合と一致するか判定する。
+/// 判定: 新フィールド 6 本が揃っていて、旧 `all_text` が残っていないこと。
 fn schema_is_stale(schema: &Schema) -> bool {
     let has_new = schema.get_field("exif_text").is_ok()
         && schema.get_field("xmp_tweet_text").is_ok()
         && schema.get_field("png_prompt_text").is_ok()
         && schema.get_field("pdf_meta_text").is_ok()
-        && schema.get_field("kind").is_ok();
+        && schema.get_field("kind").is_ok()
+        && schema.get_field("tags").is_ok();
     let has_legacy_all_text = schema.get_field("all_text").is_ok();
     !has_new || has_legacy_all_text
 }
@@ -559,7 +567,10 @@ fn build_schema() -> Schema {
     b.add_text_field("exif_text", text_opts.clone());
     b.add_text_field("xmp_tweet_text", text_opts.clone());
     b.add_text_field("png_prompt_text", text_opts.clone());
-    b.add_text_field("pdf_meta_text", text_opts);
+    b.add_text_field("pdf_meta_text", text_opts.clone());
+    // タグフィールドも bigram tokenize — `原神` キーワード検索で `#原神` タグにヒット、
+    // `#原神` 入力でもヒットする (A-1 設計)。target=Tags ドロップダウンで絞り込み可。
+    b.add_text_field("tags", text_opts);
     b.build()
 }
 
@@ -630,6 +641,24 @@ mod tests {
                 xmp_tweet: xmp_tweet.to_string(),
                 png_prompt: png_prompt.to_string(),
                 pdf_meta: String::new(),
+                tags: String::new(),
+            },
+        }
+    }
+
+    /// テスト用 doc (tags フィールドのみ書き込む版)。
+    fn sample_doc_with_tags(path: &str, fav: Uuid, tags: &str) -> IndexDoc {
+        IndexDoc {
+            path: path.to_string(),
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: fav,
+            kind: IndexKind::Image,
+            mtime: 100,
+            file_size: 1024,
+            norms: crate::ingest_text::PerSourceText {
+                tags: tags.to_string(),
+                ..Default::default()
             },
         }
     }

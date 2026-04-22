@@ -51,6 +51,8 @@ pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;
 pub mod sys_memory;
+mod tag_ops;
+pub mod tag_write_worker;
 pub mod thumb_loader;
 mod ui_adjustment_panel;
 mod ui_analysis_panel;
@@ -64,6 +66,7 @@ pub mod ui_susie_diagnostic;
 pub mod video_thumb;
 pub mod wic_decoder;
 pub mod xmp_reader;
+pub mod xmp_writer;
 pub mod zip_loader;
 
 use std::sync::Arc;

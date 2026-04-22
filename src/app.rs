@@ -1035,6 +1035,13 @@ pub struct App {
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
 
+    // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
+    pub(crate) show_tag_editor: bool,
+    /// タグ編集ダイアログ中で編集中のタグ一覧 (キャンセルで破棄するため Settings から分離)
+    pub(crate) tag_editor_draft: Vec<crate::settings::TagDef>,
+    /// タグ書き込み worker (初回要求時に遅延初期化)。
+    pub(crate) tag_write_handle: Option<crate::tag_write_worker::TagWriteHandle>,
+
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
     pub(crate) fav_add_name_input: String,
@@ -1177,6 +1184,10 @@ pub struct App {
     /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
     pub(crate) xmp_cache:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
+    /// メタデータパネルのタグボタン状態表示で使用。タグ書き込み worker の完了時に
+    /// エントリを invalidate (削除) し、次回描画で再取得する。
+    pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -1614,6 +1625,9 @@ impl Default for App {
             fs_early_dims: std::collections::HashMap::new(),
             items_generation: 0,
             show_favorites_editor: false,
+            show_tag_editor: false,
+            tag_editor_draft: Vec::new(),
+            tag_write_handle: None,
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -1675,6 +1689,7 @@ impl Default for App {
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
+            tags_cache: std::collections::HashMap::new(),
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -1969,6 +1984,7 @@ impl App {
     pub(crate) fn any_dialog_open(&self) -> bool {
         self.show_stats_dialog
             || self.show_favorites_editor
+            || self.show_tag_editor
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_preferences
@@ -3008,6 +3024,7 @@ impl App {
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
+        self.tags_cache.clear();
         self.checked.clear();
         self.rotation_cache.clear();
         self.rating_cache.clear();
@@ -9103,8 +9120,12 @@ impl eframe::App for App {
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
 
+        // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
+        self.poll_tag_write_results();
+
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
+        self.show_tag_editor_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_cache_manager_dialog(ctx);

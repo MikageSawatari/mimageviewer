@@ -401,6 +401,18 @@ impl IndexerManager {
         Arc::clone(&self.meta_db)
     }
 
+    /// `Arc<FtsIndex>` を clone して返す (タグ書き込み worker 用)。
+    pub fn clone_fts_index(&self) -> Arc<FtsIndex> {
+        Arc::clone(&self.fts)
+    }
+
+    /// 共有 IndexWriter の Arc を clone して返す (タグ書き込み worker 用)。
+    /// Tantivy は 1 Index につき writer 1 本しか許さないので、worker が独自に
+    /// `fts.writer()` を呼ぶと LockBusy で失敗する。必ずこれを使って lock() する。
+    pub fn clone_shared_writer(&self) -> Arc<std::sync::Mutex<tantivy::IndexWriter>> {
+        Arc::clone(&self.writer)
+    }
+
     /// 起動時 reconciliation が進行中か (UI インジケータ表示用)。
     /// 現状は同期実行で即 false に戻るが、将来 async 化したときに値が変わる余地を残す。
     pub fn is_reconciling(&self) -> bool {

@@ -20,5 +20,6 @@ mod pdf_password;
 pub(crate) mod preferences;
 mod rotation_reset;
 mod stats_dialog;
+mod tag_editor;
 mod thumb_quality;
 mod thumb_quality_fullscreen;

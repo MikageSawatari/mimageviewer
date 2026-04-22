@@ -22,8 +22,8 @@ use crate::ingest_text::PerSourceText;
 use crate::search_index_db::normalize_path;
 
 /// スキーマ変更時に bump することで、次回起動時に全再インデックスをトリガする定数。
-/// v2 (§19): all_text_norm を per-source 5 カラムに分割 + kind カラム追加。
-pub const INDEX_VERSION: i64 = 2;
+/// v3 (§19 + tag 統合): per-source 5 カラム + kind + tags_norm の 16 列スキーマ。
+pub const INDEX_VERSION: i64 = 3;
 
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +39,7 @@ pub struct FileMeta {
     pub index_version: i64,
     pub index_generation: i64,
     pub status: FileStatus,
-    /// `search_norm::normalize_for_match` 適用済み。以下同様。
+    /// `search_norm::normalize_for_match` 適用済み per-source テキスト + tags。
     pub norms: PerSourceText,
 }
 
@@ -125,7 +125,7 @@ impl FtsMetaDb {
     }
 
     /// status=pending で UPSERT。既存 row の generation を増やし、ソース別正規化テキストを更新する。
-    /// Tantivy への add_document 前に呼ばれる (§5.6.1 ステップ 1 / §19.4)。
+    /// Tantivy への add_document 前に呼ばれる (§5.6.1 ステップ 1 / §19.4 / tag 統合)。
     pub fn mark_pending(
         &self,
         path: &str,
@@ -142,8 +142,8 @@ impl FtsMetaDb {
             "INSERT INTO files (
                 path, favorite_id, favorite_root, kind, mtime, file_size,
                 indexed_at, index_version, index_generation, status,
-                name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14)
+                name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm, tags_norm
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(path) DO UPDATE SET
                 favorite_id = excluded.favorite_id,
                 favorite_root = excluded.favorite_root,
@@ -158,7 +158,8 @@ impl FtsMetaDb {
                 exif_norm = excluded.exif_norm,
                 xmp_tweet_norm = excluded.xmp_tweet_norm,
                 png_prompt_norm = excluded.png_prompt_norm,
-                pdf_meta_norm = excluded.pdf_meta_norm",
+                pdf_meta_norm = excluded.pdf_meta_norm,
+                tags_norm = excluded.tags_norm",
             params![
                 path,
                 favorite_id.to_string(),
@@ -174,6 +175,7 @@ impl FtsMetaDb {
                 norms.xmp_tweet,
                 norms.png_prompt,
                 norms.pdf_meta,
+                norms.tags,
             ],
         )?;
         let gen_val: i64 = conn.query_row(
@@ -182,6 +184,43 @@ impl FtsMetaDb {
             |r| r.get(0),
         )?;
         Ok(gen_val)
+    }
+
+    /// post-filter 用: 指定 path 群のタグ列を一括取得。
+    /// status=Ok のみ返す (`lookup_norms_for_target` と同じポリシー)。
+    /// タグ書き込み worker が ingest 待たずに fts_meta を直接更新するときにも使う。
+    pub fn lookup_tags(&self, paths: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = (0..paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT path, tags_norm FROM files \
+             WHERE path IN ({}) AND status = 0",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::with_capacity(paths.len());
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 単一 path のタグ更新 (タグ書き込み worker が呼ぶ高速経路)。
+    pub fn set_tags(&self, path: &str, tags: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE files SET tags_norm = ?1 WHERE path = ?2",
+            params![tags, path],
+        )?;
+        Ok(())
     }
 
     /// Tantivy commit 後に呼ぶ。status=pending → ok に遷移 (§5.6.1 ステップ 4)。
@@ -284,7 +323,7 @@ impl FtsMetaDb {
         let placeholders = (0..paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         // 全列を SELECT して Rust 側で結合する (target による動的 SQL の複雑さを避ける)。
         let sql = format!(
-            "SELECT path, name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm \
+            "SELECT path, name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm, tags_norm \
              FROM files WHERE path IN ({}) AND status = 0",
             placeholders
         );
@@ -300,6 +339,7 @@ impl FtsMetaDb {
                 xmp_tweet: row.get(3)?,
                 png_prompt: row.get(4)?,
                 pdf_meta: row.get(5)?,
+                tags: row.get(6)?,
             };
             let mut out = String::new();
             for &src in sources {
@@ -433,7 +473,7 @@ macro_rules! filemeta_select_cols {
     () => {
         "path, favorite_id, favorite_root, kind, mtime, file_size, \
          indexed_at, index_version, index_generation, status, \
-         name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm"
+         name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm, tags_norm"
     };
 }
 
@@ -468,6 +508,7 @@ fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
             xmp_tweet: row.get(12)?,
             png_prompt: row.get(13)?,
             pdf_meta: row.get(14)?,
+            tags: row.get(15)?,
         },
     })
 }
@@ -492,25 +533,26 @@ fn needs_rebuild(conn: &Connection) -> rusqlite::Result<bool> {
     if !has_table {
         return Ok(false);
     }
-    // 旧カラム検出
+    // 旧カラム検出: name_norm が欠ける / tags_norm が欠ける / all_text_norm が残っている場合は rebuild
     let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
     let mut has_all_text_norm = false;
     let mut has_name_norm = false;
+    let mut has_tags_norm = false;
     let rows = stmt.query_map([], |row| {
         let name: String = row.get(1)?;
         Ok(name)
     })?;
     for r in rows {
         let name = r?;
-        if name == "all_text_norm" {
-            has_all_text_norm = true;
-        }
-        if name == "name_norm" {
-            has_name_norm = true;
+        match name.as_str() {
+            "all_text_norm" => has_all_text_norm = true,
+            "name_norm" => has_name_norm = true,
+            "tags_norm" => has_tags_norm = true,
+            _ => {}
         }
     }
     drop(stmt);
-    if has_all_text_norm || !has_name_norm {
+    if has_all_text_norm || !has_name_norm || !has_tags_norm {
         return Ok(true);
     }
     // index_version が古い行が残っている (過去にこの DB で別バージョンを使っていた等)
@@ -537,7 +579,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             exif_norm         TEXT NOT NULL DEFAULT '',
             xmp_tweet_norm    TEXT NOT NULL DEFAULT '',
             png_prompt_norm   TEXT NOT NULL DEFAULT '',
-            pdf_meta_norm     TEXT NOT NULL DEFAULT ''
+            pdf_meta_norm     TEXT NOT NULL DEFAULT '',
+            tags_norm         TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS idx_files_fav       ON files(favorite_id);
          CREATE INDEX IF NOT EXISTS idx_files_fav_mtime ON files(favorite_id, mtime);
@@ -810,6 +853,7 @@ mod tests {
             xmp_tweet: "tweet body".into(),
             png_prompt: "".into(),
             pdf_meta: "".into(),
+            tags: "".into(),
         };
         db.mark_pending(
             "c:/p/a.jpg",

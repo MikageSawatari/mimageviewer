@@ -133,6 +133,38 @@ impl FavoriteEntry {
 }
 
 // -----------------------------------------------------------------------
+// TagDef (docs/tag-feature.md)
+// -----------------------------------------------------------------------
+
+/// ユーザ定義のタグ 1 エントリ。
+///
+/// `name` は `#` を除いた表示名 (例: "原神")。付与時に `#` が自動で付加されて
+/// XMP dc:subject に "#原神" として書き込まれる。
+///
+/// `id` は順序変更・改名時の安定識別子。ツールバー/メニューのキー、
+/// 将来の統計情報等で使用。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TagDef {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    pub name: String,
+}
+
+impl TagDef {
+    pub fn new(name: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name,
+        }
+    }
+
+    /// `#name` 形式 (検索・保存時の形式)。
+    pub fn with_hash(&self) -> String {
+        format!("#{}", self.name)
+    }
+}
+
+// -----------------------------------------------------------------------
 // サムネイルアスペクト比
 // -----------------------------------------------------------------------
 
@@ -566,10 +598,18 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
 
+    // ── タグ機能 (docs/tag-feature.md) ──────────────────────────
+    /// ユーザ定義のタグ一覧 (メニュー / ツールバー に表示される順)。
+    #[serde(default)]
+    pub tags: Vec<TagDef>,
+
     // ── ツールバー表示設定 ──────────────────────────────────
     /// ツールバーに「お気に入り」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_favorites: bool,
+    /// ツールバーに「タグ」セクションを表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_tags: bool,
     /// アドレスバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
@@ -878,7 +918,9 @@ impl Default for Settings {
             slideshow_interval_secs: default_slideshow_interval(),
             default_spread_mode: SpreadMode::default(),
             ui_theme: UiTheme::default(),
+            tags: Vec::new(),
             show_toolbar_favorites: true,
+            show_toolbar_tags: true,
             show_toolbar_folder: true,
             show_toolbar_parent_button: true,
             show_toolbar_rating: true,
