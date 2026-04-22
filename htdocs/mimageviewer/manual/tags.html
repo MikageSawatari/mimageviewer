@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>タグ機能 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>タグ機能</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="tags.html" class="active">タグ機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">タグ機能</h1>
+    <p class="page-desc">
+      画像に「#原神」「#風景」のような独自タグを付けて分類できる機能です。タグは XMP
+      <code>dc:subject</code> に書き込まれるので、Windows エクスプローラー・Lightroom・
+      Adobe Bridge 等の他ソフトとも互換性があります。
+    </p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        タグ機能は対応形式 (JPEG / PNG / WebP) の<strong>ファイル本体に XMP メタデータを書き込み</strong>ます。
+        書き込みはアトミック (一時ファイル → rename) なので途中で電源が落ちてもファイルは壊れませんが、
+        初めて使うときは必ず<a href="#precautions">注意事項</a>を確認してください。
+      </div>
+    </div>
+
+    <h2 id="register">1. タグを登録する</h2>
+    <p>使うタグは事前にアプリに登録しておきます:</p>
+    <ol>
+      <li>メニュー「タグ」→「タグを編集…」でタグ編集ダイアログを開きます。</li>
+      <li>初回のみ「タグを付与するとファイル内容を書き換えます」警告が表示されます。
+          内容を確認したら「了解しました」にチェックを入れて OK。</li>
+      <li>タグ名を入力 (例: <code>原神</code>、<code>ドール</code>、<code>風景</code>)。
+          先頭の <code>#</code> は不要です (自動で付きます)。</li>
+      <li>OK で保存。メニューとツールバーの「タグ:」セクションに並びます。</li>
+    </ol>
+
+    <h3>タグ名のルール</h3>
+    <ul>
+      <li>使用可能文字: <code>#</code> を除く任意の Unicode 文字 (日本語可、絵文字も可)。</li>
+      <li>先頭 <code>#</code> は自動付与されるので入力不要。</li>
+      <li>長さは 1〜64 文字。</li>
+      <li>大文字小文字は定義時の表記を保存、検索時は区別しません。</li>
+      <li>同名タグは 1 つまで (ダイアログでエラー表示)。</li>
+    </ul>
+
+    <h2 id="apply">2. タグを付ける・外す</h2>
+
+    <h3>単一選択の場合 (トグル)</h3>
+    <ol>
+      <li>グリッドで対象の画像を 1 つ選択。</li>
+      <li>メニュー「タグ」→ タグ名をクリック、またはツールバーのタグボタンをクリック。</li>
+      <li>未付与なら付与、付与済みなら削除されます (トグル)。</li>
+    </ol>
+
+    <h3>複数選択の場合</h3>
+    <p>Space / Shift+矢印 / Ctrl+クリックで複数チェックしてからタグボタンを押すと:</p>
+    <ul>
+      <li>全てに付与済み → 全てから削除</li>
+      <li>一部のみ / 未付与 → 全てに付与</li>
+    </ul>
+    <p>書き込み中は左下のステータスラインに「タグ付与中 5/12」のように進捗が出ます。</p>
+
+    <h3>タグをすべてクリア</h3>
+    <p>メニュー「タグ」→「選択中のファイルから mIV タグをクリア (N)」で、<code>#</code> で
+    始まる <code>dc:subject</code> 要素をまとめて削除します。</p>
+    <ul>
+      <li><code>#</code> が付かない既存タグ (他ソフトで付けたタグ) は一切触りません。</li>
+      <li>逆に、<strong>他ソフトが <code>#</code> で始まるタグを付けていた場合は巻き込んで削除される</strong>
+          ことに注意してください (通常は問題ありません)。</li>
+    </ul>
+
+    <h2 id="search">3. タグで検索する</h2>
+
+    <h3>Ctrl+G (グローバル検索)</h3>
+    <p>お気に入り全体からタグで画像を探すときは <kbd>Ctrl</kbd>+<kbd>G</kbd>:</p>
+    <ul>
+      <li>検索バーに <code>#原神</code> と入力すると該当画像が絞り込まれます。</li>
+      <li>検索バー右の「タグ」ドロップダウンから登録済みタグを選ぶと、クエリ欄に
+          <code>#タグ名</code> が挿入されます (タグ名を覚えていなくても OK)。</li>
+      <li>複数タグは AND: <code>#原神 #風景</code></li>
+      <li>除外: <code>-#原神</code></li>
+      <li>「検索対象」ドロップダウンで「タグ」を選ぶと、タグフィールドだけを対象に絞り込みます
+          (EXIF や AI プロンプトを混ぜたくないとき)。</li>
+    </ul>
+
+    <h3>Ctrl+F (ローカル検索)</h3>
+    <p>現在表示中のフォルダ内だけで探すときは <kbd>Ctrl</kbd>+<kbd>F</kbd>。同様に
+    <code>#タグ名</code> で絞り込み、「検索対象」ドロップダウンで「タグ」を選べばタグ専用モード。</p>
+
+    <h2 id="display">4. タグの表示</h2>
+    <p>フルスクリーンの<strong>メタデータパネル</strong> (右側の情報パネル) に「タグ」セクションが
+    表示されます:</p>
+    <ul>
+      <li><code>#</code> で始まるタグは「mIV で付与」として表示。</li>
+      <li><code>#</code> なしの既存タグ (他ソフト由来) は別色で表示。</li>
+    </ul>
+
+    <h2 id="toolbar">5. ツールバーのタグセクション</h2>
+    <p>ツールバーに登録済みタグをボタンで並べると、ワンクリックでトグルできます。</p>
+    <ul>
+      <li>設定 → 環境設定 → 「ツールバー」で「タグ: xxx yyy…」セクションの表示/非表示を切替。</li>
+      <li>選択中の画像にすべて付与されていればボタンがハイライトされます。</li>
+    </ul>
+
+    <h2 id="compatibility">6. 他ソフトとの互換性</h2>
+    <p>タグは XMP <code>dc:subject</code> 要素 (RDF Bag) として書き込みます。これは写真・DAM
+    ソフトで広く採用されている標準フォーマットです:</p>
+    <ul>
+      <li><strong>Windows エクスプローラー</strong>: ファイルプロパティの「タグ」欄に表示されます。</li>
+      <li><strong>Adobe Lightroom / Bridge</strong>: キーワードとして認識されます。</li>
+      <li><strong>ExifTool</strong>: <code>-XMP-dc:Subject</code> で読み取り可能。</li>
+    </ul>
+    <p>他ソフトで既に <code>dc:subject</code> にタグが入っていても、mImageViewer は
+    <strong>既存要素を保持</strong>したまま <code>#タグ名</code> だけを追加します。</p>
+
+    <h2 id="precautions">7. 注意事項</h2>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>ファイル本体を書き換えます:</strong>
+        タグ付与はファイル内の XMP パケットを書き換える操作です。万一書き込みに失敗した場合に備えて、
+        重要なファイルはあらかじめバックアップを取っておくことをおすすめします。アトミック rename で
+        中途半端な書き込みは発生しませんが、書き込み前の mtime は変化します。
+      </div>
+    </div>
+
+    <h3>対応フォーマット</h3>
+    <table>
+      <thead>
+        <tr><th>形式</th><th>タグの読み取り</th><th>タグの書き込み</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>JPEG (.jpg / .jpeg)</td><td>◯</td><td>◯</td></tr>
+        <tr><td>PNG</td><td>◯</td><td>◯</td></tr>
+        <tr><td>WebP</td><td>◯</td><td>◯</td></tr>
+        <tr><td>HEIC / HEIF</td><td>◯</td><td>✗ (v1.0 非対応)</td></tr>
+        <tr><td>TIFF / GIF / BMP / JXL / AVIF / RAW</td><td>条件付</td><td>✗</td></tr>
+        <tr><td>ZIP 内の画像</td><td>◯</td><td>✗</td></tr>
+        <tr><td>PDF / 動画</td><td>✗</td><td>✗</td></tr>
+      </tbody>
+    </table>
+    <p>書き込み非対応の形式は、メニュー / ツールバーのタグボタンが<strong>グレーアウト</strong>して
+    選択できません。</p>
+
+    <h3>読み取り専用ファイル</h3>
+    <p>ファイル属性が「読み取り専用」になっているとタグ書き込みに失敗します。エラーが記録されるだけで
+    他のファイルへの処理は継続されます。</p>
+
+    <h3>大量ファイルへの一括処理</h3>
+    <p>数百枚以上のファイルへ一括でタグ付与する場合、処理には時間がかかります。ステータスラインの
+    進捗表示で確認できます。完了するまでウィンドウを閉じないでください (残りは破棄されます)。</p>
+
+    <h2 id="search-index">8. 検索インデックスとの関係</h2>
+    <p>タグをファイルに書き込んだ直後、検索インデックスも自動で更新されるので次の Ctrl+G/Ctrl+F で
+    すぐに反映されます。</p>
+    <p>お気に入りの「メタ索引」が OFF になっているフォルダのファイルにもタグは書き込めますが、
+    検索で即座にヒットさせるには
+    <a href="grid.html#お気に入り">お気に入りダイアログ</a>でメタ索引を ON にしてください。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>他ソフトで付けたタグも検索できます:</strong>
+        メタ索引を作ると、<code>dc:subject</code> 内の <code>#</code> 始まりのタグを自動で取り込むので、
+        Windows エクスプローラー・Lightroom 等でつけたタグも Ctrl+G で横断検索できるようになります。
+      </div>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+</body>
+</html>

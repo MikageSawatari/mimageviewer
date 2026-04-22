@@ -30,8 +30,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 
 | メニュー | 項目 |
 |---------|------|
-| ファイル | フォルダを開く… (Ctrl+O) / メタデータ検索… (Ctrl+F) / グローバルメタ検索… (Ctrl+G) / 終了 |
-| お気に入り | このフォルダを追加… / 編集 / 検索…(Ctrl+S) / インデックス作成 / キャッシュ作成 / **インデックス管理… (v0.8.0)** / [登録済みフォルダ一覧] |
+| ファイル | フォルダを開く… (Ctrl+O) / メタデータ検索… (Ctrl+F) / 終了 |
+| お気に入り | このフォルダを追加… / 編集 / 名前で検索 (Ctrl+S) / メタデータ検索 (Ctrl+G) / [登録済みフォルダ一覧] |
+| タグ | タグを編集… / 選択中のファイルから mIV タグをクリア / [登録済みタグ一覧] |
 | 設定 | サムネイル列数 / 比率 / ソート順 / キャッシュ管理… / サムネイル画質… / 統計… / 回転情報をリセット… / 環境設定… |
 
 ### 2.2 アドレスバー
@@ -515,6 +516,24 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] `GlobalIoSemaphore` で UI 優先度制御 (Low/Normal/High)
 - [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み
 - [x] 最小クエリ長ポリシー (CJK 2 文字 / ASCII 3 文字) + NOT-only 拒否 (Ctrl+G)
+- [x] **検索絞り込みフィルタ** (§19 per-source 分割): Tantivy / fts_meta.db を ソース別フィールド
+      (name / exif_text / xmp_tweet_text / png_prompt_text / pdf_meta_text / tags) に分割。
+      Ctrl+G/Ctrl+F の「検索対象」ドロップダウンで EXIF だけ / AI プロンプトだけ / タグだけ … 等の絞り込み可能。
+      Ctrl+G にはさらに「お気に入り」「タイプ」フィルタと登録済みタグのピッカーを追加。
+
+### Phase 5.5 (タグ機能 / v0.8.0) ✅ 完了
+
+設計ドキュメント: [docs/tag-feature.md](tag-feature.md)
+
+- [x] XMP `dc:subject` への独自タグ (`#タグ名`) 書き込み (JPEG / PNG / WebP 対応、アトミック rename)
+- [x] 他ソフト由来タグ (`#` なし) と既存プロパティ (`xtw:*` 等の Extended XMP 含む) を保持
+- [x] メニュー「タグ」: タグ定義編集 / 選択中ファイルから mIV タグをクリア / 登録タグのワンクリックトグル
+- [x] ツールバーのタグセクション (トグル式、選択中に全付与されていればハイライト)
+- [x] メタデータパネル (フルスクリーン) にタグセクション (`#` 始まりと他ソフト由来を別色で表示)
+- [x] `dc:subject` 読み取りを ingest に統合 → Ctrl+G/Ctrl+F で横断検索可能
+- [x] Ctrl+G 検索バーにタグピッカー (登録済みタグからクリックで `#タグ名` をクエリに挿入)
+- [x] 書き込み worker + 進捗インジケーター (左下ステータスライン) + 書き込み完了時の検索インデックス即時反映
+- [x] `Settings.tags: Vec<TagDef>` (UUID + name) で永続化、`tag_write_warning_acknowledged` で初回警告抑制
 
 ---
 
