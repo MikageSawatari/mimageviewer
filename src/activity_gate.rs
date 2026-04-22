@@ -1,0 +1,170 @@
+//! `ActivityGate` — ユーザー操作中はバックグラウンドインデクサを一時停止する。
+//!
+//! ## 背景 (2026-04)
+//!
+//! Ctrl+↑↓ でフォルダを連続移動するとサムネ decode が HDD に集中し、同じ HDD で
+//! メタインデクサ (XMP 読み込み) / 名前インデクサ (read_dir) が動いているとディスク
+//! シークが衝突して decode が 10 秒スケールまで膨らむ問題があった。
+//! `docs/ui-responsiveness.md` の指針に沿って、**操作している間は indexer を止める**
+//! のが最も単純かつ効果的な解。
+//!
+//! ## 契約
+//!
+//! - `bump()`: UI スレッドが入力 (キー / クリック / スクロール) 毎に呼ぶ。
+//! - `wait_until_idle(cancel)`: ワーカーが各 unit of work (ファイル 1 本 / フォルダ 1 つ)
+//!   の前に呼ぶ。最後の `bump()` から `quiet_threshold_ms` 経過するまでブロック。
+//! - `cancel` が立つと即 return する (キャンセル時にここで詰まらないため)。
+//!
+//! ## 実装
+//!
+//! 単一の `AtomicU64` に「最終操作時刻 (ms, プロセス起動からの経過)」を格納。
+//! 読み出しは Relaxed で OK — 多少古い値が見えても、次の wait ループで訂正される
+//! (単調増加なので「寝すぎる」ことはあっても「起きなすぎる」ことはない)。
+//!
+//! `SystemTime` ではなく `Instant` ベースの単調時刻を使う (DST / 時刻合わせの影響回避)。
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// プロセス開始時刻。`now_ms()` の基準点として lazily 初期化する。
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn epoch() -> Instant {
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64
+}
+
+/// 「操作中は indexer を止める」ためのゲート。`Arc` で共有する。
+pub struct ActivityGate {
+    last_activity_ms: AtomicU64,
+    quiet_threshold_ms: u64,
+}
+
+impl ActivityGate {
+    /// `quiet_threshold_ms` ミリ秒操作がないときだけ通過するゲートを作る。
+    ///
+    /// 起動直後は「最後の操作が遠い過去」として扱う (= ワーカーは起動直後から動ける)。
+    /// `u64::MAX` をセンチネルとして「まだ一度も bump されていない」を表し、
+    /// `wait_until_idle` はこの状態を即 return で抜ける。`bump()` 後は `now_ms()` を
+    /// 通常どおり格納するので、センチネルと衝突することはない。
+    pub fn new(quiet_threshold_ms: u64) -> Self {
+        let _ = epoch(); // 起動時に fix しておく
+        Self {
+            last_activity_ms: AtomicU64::new(u64::MAX),
+            quiet_threshold_ms,
+        }
+    }
+
+    /// UI スレッドから入力イベントで呼ぶ。
+    /// 呼び出しコストは atomic store 1 回。毎フレーム条件付きで呼んで問題なし。
+    pub fn bump(&self) {
+        self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// `quiet_threshold_ms` が経過するまでブロックする。
+    /// cancel が立ったら即 return。
+    ///
+    /// 寝る時間は「残り必要時間」を計算してから `min(remain, 200)` ms ずつ。
+    /// 200ms でキャップするのは、cancel が立ったときに最大 200ms で抜けるため。
+    pub fn wait_until_idle(&self, cancel: &AtomicBool) {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let last = self.last_activity_ms.load(Ordering::Relaxed);
+            if last == u64::MAX {
+                return; // 未 bump (起動から何も操作がない) → idle 扱い
+            }
+            let now = now_ms();
+            let elapsed = now.saturating_sub(last);
+            if elapsed >= self.quiet_threshold_ms {
+                return;
+            }
+            let remain = self.quiet_threshold_ms - elapsed;
+            std::thread::sleep(Duration::from_millis(remain.min(200)));
+        }
+    }
+
+    /// 現在 idle (= `quiet_threshold_ms` 以上操作なし) かどうか。テスト / 計装用。
+    pub fn is_idle(&self) -> bool {
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        if last == u64::MAX {
+            return true;
+        }
+        now_ms().saturating_sub(last) >= self.quiet_threshold_ms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
+    #[test]
+    fn wait_returns_immediately_when_idle() {
+        let gate = ActivityGate::new(100);
+        // bump せず放置 → 最初から idle
+        let cancel = AtomicBool::new(false);
+        let t0 = Instant::now();
+        gate.wait_until_idle(&cancel);
+        assert!(t0.elapsed().as_millis() < 50, "idle 時は即 return");
+    }
+
+    #[test]
+    fn wait_blocks_until_quiet_threshold() {
+        let gate = ActivityGate::new(150);
+        gate.bump();
+        let cancel = AtomicBool::new(false);
+        let t0 = Instant::now();
+        gate.wait_until_idle(&cancel);
+        let elapsed = t0.elapsed().as_millis();
+        assert!(
+            (100..500).contains(&(elapsed as u64)),
+            "threshold (150ms) 付近で起きる: got {elapsed}ms"
+        );
+    }
+
+    #[test]
+    fn bump_extends_wait() {
+        let gate = Arc::new(ActivityGate::new(200));
+        gate.bump();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let g = Arc::clone(&gate);
+        let c = Arc::clone(&cancel);
+        let h = thread::spawn(move || g.wait_until_idle(&c));
+        // 100ms 後に再 bump → wait がさらに 200ms 延びる
+        thread::sleep(Duration::from_millis(100));
+        gate.bump();
+        let t0 = Instant::now();
+        h.join().unwrap();
+        let after_rebump = t0.elapsed().as_millis();
+        assert!(
+            after_rebump >= 150,
+            "再 bump で延長されるはず: got {after_rebump}ms"
+        );
+    }
+
+    #[test]
+    fn cancel_wakes_wait() {
+        let gate = Arc::new(ActivityGate::new(10_000)); // 10 秒 — 通常は寝きらない
+        gate.bump();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let g = Arc::clone(&gate);
+        let c = Arc::clone(&cancel);
+        let h = thread::spawn(move || g.wait_until_idle(&c));
+        thread::sleep(Duration::from_millis(50));
+        cancel.store(true, Ordering::Relaxed);
+        let t0 = Instant::now();
+        h.join().unwrap();
+        assert!(
+            t0.elapsed().as_millis() < 500,
+            "cancel 後は 500ms 以内に抜ける"
+        );
+    }
+}

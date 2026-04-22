@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;

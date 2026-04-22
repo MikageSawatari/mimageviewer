@@ -62,7 +62,8 @@ pub struct IngestStats {
 ///
 /// 呼び出し側 (Indexer Supervisor) は以下の流れで使う:
 /// ```ignore
-/// let session = IngestSession::new(fav_id, fav_root, &meta_db, &index);
+/// let session = IngestSession::new(fav_id, fav_root, &meta_db, &index)
+///     .with_activity_gate(&activity_gate);
 /// let writer = index.writer()?;
 /// let stats = session.apply(scan_result, &writer, &io_sem, &cancel)?;
 /// // writer drop で最終 commit
@@ -74,6 +75,9 @@ pub struct IngestSession<'a> {
     pub favorite_root: PathBuf,
     pub meta_db: &'a FtsMetaDb,
     pub fts: &'a FtsIndex,
+    /// UI 操作中は ingest を一時停止するためのゲート (2026-04)。
+    /// `None` なら停止しない (単体テスト用)。
+    pub activity_gate: Option<&'a crate::activity_gate::ActivityGate>,
 }
 
 impl<'a> IngestSession<'a> {
@@ -88,7 +92,14 @@ impl<'a> IngestSession<'a> {
             favorite_root,
             meta_db,
             fts,
+            activity_gate: None,
         }
+    }
+
+    /// ActivityGate を設定する。ingest の各ファイル処理前にこのゲートで待つ。
+    pub fn with_activity_gate(mut self, gate: &'a crate::activity_gate::ActivityGate) -> Self {
+        self.activity_gate = Some(gate);
+        self
     }
 
     /// Walker の結果を適用する。
@@ -161,8 +172,20 @@ impl<'a> IngestSession<'a> {
                 stats.cancelled = true;
                 break;
             }
+            // UI 操作中はここで待機 (2026-04 F)。操作から quiet 期間が過ぎるまで
+            // sleep する。cancel が立てば即抜ける。
+            if let Some(gate) = self.activity_gate {
+                gate.wait_until_idle(cancel);
+                if cancel.load(Ordering::Relaxed) {
+                    stats.cancelled = true;
+                    break;
+                }
+            }
             if let Some(p) = progress {
-                p.set(format!("削除: {} ({}/{})", path, i + 1, delete_total));
+                // カウントを先頭に置くとダイアログで truncate されても残る。
+                // パスは絶対パスそのままにする (delete 経路は favorite 相対に直すと
+                // tombstone されたキーと紐付けにくいので)。
+                p.set(format!("削除 ({}/{}) {}", i + 1, delete_total, path));
             }
             if let Err(e) = self.meta_db.mark_tombstone(&[path.clone()]) {
                 crate::logger::log(format!("ingest: mark_tombstone failed for {path}: {e}"));
@@ -199,13 +222,24 @@ impl<'a> IngestSession<'a> {
                 stats.cancelled = true;
                 break;
             }
+            // UI 操作中はここで待機 (2026-04 F)。XMP 読み 1 件分だけ進めて次で再チェック。
+            if let Some(gate) = self.activity_gate {
+                gate.wait_until_idle(cancel);
+                if cancel.load(Ordering::Relaxed) {
+                    stats.cancelled = true;
+                    break;
+                }
+            }
             if let Some(p) = progress {
-                let name = cand
+                // ファイル名だけだと同名別フォルダが判別できないので、favorite 相対パスで
+                // フォルダごと見せる。カウントは先頭に置き、truncate されても残るようにする。
+                let display = cand
                     .abs_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| cand.abs_path.display().to_string());
-                p.set(format!("取込: {} ({}/{})", name, i + 1, ingest_total));
+                    .strip_prefix(&self.favorite_root)
+                    .unwrap_or(&cand.abs_path)
+                    .display()
+                    .to_string();
+                p.set(format!("取込 ({}/{}) {}", i + 1, ingest_total, display));
             }
             // メタ抽出と IndexDoc ビルドはここで実行 (writer に touch しない)。dispatcher 側は
             // upsert_doc を呼ぶだけなので、重い IO はこの thread で並列化されたまま。

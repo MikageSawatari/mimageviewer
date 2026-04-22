@@ -190,6 +190,7 @@ pub fn spawn(
     fts: Arc<FtsIndex>,
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
+    activity_gate: Arc<crate::activity_gate::ActivityGate>,
 ) -> SupervisorHandle {
     assert!(
         params.enable_metadata_index,
@@ -223,6 +224,7 @@ pub fn spawn(
                 fts,
                 writer,
                 io_sem,
+                activity_gate,
                 cancel_cl,
                 stats_cl,
                 progress_cl,
@@ -252,6 +254,7 @@ fn supervisor_loop(
     fts: Arc<FtsIndex>,
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
+    activity_gate: Arc<crate::activity_gate::ActivityGate>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<SupervisorStats>>,
     progress: ProgressReporter,
@@ -259,7 +262,8 @@ fn supervisor_loop(
     change_tx: Sender<DebouncedChange>,
     change_rx: Receiver<DebouncedChange>,
 ) {
-    let session = IngestSession::new(favorite_id, favorite_root.clone(), &meta_db, &fts);
+    let session = IngestSession::new(favorite_id, favorite_root.clone(), &meta_db, &fts)
+        .with_activity_gate(&activity_gate);
 
     // 1. Watcher 起動 (drop で停止)。失敗しても初期スキャンは動かす。
     let watcher = FsWatcher::start(favorite_id, &favorite_root, change_tx.clone()).ok();
@@ -640,6 +644,7 @@ mod tests {
         Arc<FtsIndex>,
         Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
         Arc<GlobalIoSemaphore>,
+        Arc<crate::activity_gate::ActivityGate>,
     ) {
         let tmp = TempDir::new().unwrap();
         let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
@@ -648,7 +653,9 @@ mod tests {
         let writer =
             crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
         let sem = Arc::new(GlobalIoSemaphore::new(2));
-        (tmp, meta, fts, writer, sem)
+        // テストでは idle 閾値 0ms にして wait_until_idle を即抜けさせる
+        let gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
+        (tmp, meta, fts, writer, sem, gate)
     }
 
     fn write_image(dir: &Path, name: &str) {
@@ -659,7 +666,7 @@ mod tests {
     /// watcher の E2E 動作は通常環境依存なので、stats を polling で待つ。
     #[test]
     fn initial_scan_populates_stats() {
-        let (tmp, meta, fts, writer, sem) = setup();
+        let (tmp, meta, fts, writer, sem, gate) = setup();
         let fav_root = tmp.path().join("photos");
         fs::create_dir_all(&fav_root).unwrap();
         write_image(&fav_root, "a.jpg");
@@ -677,6 +684,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
+        Arc::clone(&gate),
         );
 
         // 初期スキャン完了を最長 5 秒待つ
@@ -706,7 +714,7 @@ mod tests {
 
     #[test]
     fn drop_handle_stops_cleanly() {
-        let (tmp, meta, fts, writer, sem) = setup();
+        let (tmp, meta, fts, writer, sem, gate) = setup();
         let fav_root = tmp.path().join("p");
         fs::create_dir_all(&fav_root).unwrap();
         let handle = spawn(
@@ -719,6 +727,7 @@ mod tests {
             fts,
             writer,
             sem,
+            gate,
         );
         // ただ drop するだけで join しないと test が終わらないことを確認
         drop(handle);
@@ -727,7 +736,7 @@ mod tests {
     #[test]
     fn drop_during_long_scan_cancels_cleanly() {
         // Codex 6 回目指摘 #4 回帰: 長時間の初期スキャン中でも drop で cancel が伝わる
-        let (tmp, meta, fts, writer, sem) = setup();
+        let (tmp, meta, fts, writer, sem, gate) = setup();
         let fav_root = tmp.path().join("long");
         fs::create_dir_all(&fav_root).unwrap();
         // スキャン時間を稼ぐため多めに画像を作る (数百件あれば supervisor スレッドが
@@ -746,6 +755,7 @@ mod tests {
             fts,
             writer,
             sem,
+            gate,
         );
         // 初期スキャンが走り始めた直後 (stats が populate されるより前に)
         // drop して cancel がちゃんと伝わることを確認。
@@ -768,7 +778,7 @@ mod tests {
     /// ⏳ スキャン中 の表示になっていた。共有 writer 化でこの経路を塞いだ。
     #[test]
     fn two_supervisors_share_writer_and_both_finish() {
-        let (tmp, meta, fts, writer, sem) = setup();
+        let (tmp, meta, fts, writer, sem, gate) = setup();
         let root_a = tmp.path().join("a");
         let root_b = tmp.path().join("b");
         fs::create_dir_all(&root_a).unwrap();
@@ -790,6 +800,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
+        Arc::clone(&gate),
         );
         let handle_b = spawn(
             SupervisorParams {
@@ -801,6 +812,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
+        Arc::clone(&gate),
         );
 
         // 両方が initial_scan_done になることを 5 秒以内に確認
@@ -827,7 +839,7 @@ mod tests {
 
     #[test]
     fn full_rescan_command_triggers_additional_work() {
-        let (tmp, meta, fts, writer, sem) = setup();
+        let (tmp, meta, fts, writer, sem, gate) = setup();
         let fav_root = tmp.path().join("r");
         fs::create_dir_all(&fav_root).unwrap();
         write_image(&fav_root, "x.jpg");
@@ -843,6 +855,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
+        Arc::clone(&gate),
         );
 
         // 初期スキャン待ち

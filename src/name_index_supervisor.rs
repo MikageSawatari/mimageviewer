@@ -99,10 +99,14 @@ impl Drop for NameIndexSupervisorHandle {
 }
 
 /// 1 お気に入り分の name index supervisor を起動する。
+///
+/// `activity_gate` が `Some` のとき、bulk scan は UI 操作中に自動で待機する (2026-04 F)。
+/// テスト・レガシー経路で指定不要なら `None` を渡す。
 pub fn spawn(
     favorite_id: Uuid,
     favorite_root: PathBuf,
     db: Arc<SearchIndexDb>,
+    activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
 ) -> NameIndexSupervisorHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(NameIndexStats::default()));
@@ -127,6 +131,7 @@ pub fn spawn(
                 favorite_id,
                 root_cl,
                 db,
+                activity_gate,
                 cancel_cl,
                 stats_cl,
                 progress_cl,
@@ -152,6 +157,7 @@ fn supervisor_loop(
     favorite_id: Uuid,
     favorite_root: PathBuf,
     db: Arc<SearchIndexDb>,
+    activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<NameIndexStats>>,
     progress: ProgressReporter,
@@ -169,7 +175,15 @@ fn supervisor_loop(
     }
 
     // 2. 初期バルク
-    run_full_scan(favorite_id, &favorite_root, &db, &cancel, &stats, &progress);
+    run_full_scan(
+        favorite_id,
+        &favorite_root,
+        &db,
+        activity_gate.as_deref(),
+        &cancel,
+        &stats,
+        &progress,
+    );
 
     // 3. watcher イベント + cmd を select で受信するループ
     loop {
@@ -181,7 +195,15 @@ fn supervisor_loop(
                 match msg {
                     Ok(NameIndexCommand::Stop) => break,
                     Ok(NameIndexCommand::FullRescan) => {
-                        run_full_scan(favorite_id, &favorite_root, &db, &cancel, &stats, &progress);
+                        run_full_scan(
+                            favorite_id,
+                            &favorite_root,
+                            &db,
+                            activity_gate.as_deref(),
+                            &cancel,
+                            &stats,
+                            &progress,
+                        );
                     }
                     Err(_) => break,
                 }
@@ -195,7 +217,15 @@ fn supervisor_loop(
                             crate::logger::log(format!(
                                 "name_index[{favorite_id}]: watcher overflow, running full rescan"
                             ));
-                            run_full_scan(favorite_id, &favorite_root, &db, &cancel, &stats, &progress);
+                            run_full_scan(
+                                favorite_id,
+                                &favorite_root,
+                                &db,
+                                activity_gate.as_deref(),
+                                &cancel,
+                                &stats,
+                                &progress,
+                            );
                             continue;
                         }
                         apply_single_change(&favorite_root, &db, &path, kind, &progress, &stats);
@@ -211,10 +241,12 @@ fn supervisor_loop(
 }
 
 /// 初期 bulk / 手動再構築 / overflow で呼ばれる「フル scan」経路。
+#[allow(clippy::too_many_arguments)]
 fn run_full_scan(
     favorite_id: Uuid,
     favorite_root: &Path,
     db: &SearchIndexDb,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &AtomicBool,
     stats: &Mutex<NameIndexStats>,
     progress: &ProgressReporter,
@@ -228,7 +260,7 @@ fn run_full_scan(
         if is_initial { "initial" } else { "rescan" }
     ));
 
-    let summary = run_bulk_name_index(favorite_root, db, cancel, Some(progress));
+    let summary = run_bulk_name_index(favorite_root, db, activity_gate, cancel, Some(progress));
 
     let dur_ms = t0.elapsed().as_millis() as u64;
     crate::logger::log(format!(
@@ -327,7 +359,7 @@ mod tests {
 
         let db = Arc::new(SearchIndexDb::open_in_memory().unwrap());
         let fav_id = Uuid::new_v4();
-        let handle = spawn(fav_id, root.clone(), Arc::clone(&db));
+        let handle = spawn(fav_id, root.clone(), Arc::clone(&db), None);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -349,7 +381,7 @@ mod tests {
         let root = tmp.path().join("fav");
         fs::create_dir_all(&root).unwrap();
         let db = Arc::new(SearchIndexDb::open_in_memory().unwrap());
-        let handle = spawn(Uuid::new_v4(), root, db);
+        let handle = spawn(Uuid::new_v4(), root, db, None);
         // drop で無限待ちしないこと
         let t0 = Instant::now();
         drop(handle);

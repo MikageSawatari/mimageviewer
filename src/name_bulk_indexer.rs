@@ -32,9 +32,13 @@ pub struct BulkSummary {
 ///
 /// 既存エントリとの衝突は `upsert_children` が同フォルダ配下を入れ替える挙動なので
 /// 冪等に動作する (途中キャンセル後に再実行しても破綻しない)。
+///
+/// `activity_gate` を渡すと、各フォルダの処理前に UI 操作が静穏になるまで待機する
+/// (2026-04 F: 操作中は bulk スキャンを一時停止)。
 pub fn run_bulk_name_index(
     fav_path: &std::path::Path,
     db: &SearchIndexDb,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &AtomicBool,
     progress: Option<&ProgressReporter>,
 ) -> BulkSummary {
@@ -54,7 +58,8 @@ pub fn run_bulk_name_index(
     let mut found: Vec<PathBuf> = Vec::new();
     walk_dirs_recursive_with_progress(fav_path, &mut found, cancel, &mut |cur| {
         if let Some(p) = progress {
-            p.set(format!("フォルダ列挙: {}", cur.display()));
+            let display = cur.strip_prefix(fav_path).unwrap_or(cur).display();
+            p.set(format!("フォルダ列挙 {}", display));
         }
     });
     if cancel.load(Ordering::Relaxed) {
@@ -70,13 +75,18 @@ pub fn run_bulk_name_index(
             summary.cancelled = true;
             break;
         }
+        // UI 操作中はここで待機 (2026-04 F)。フォルダ 1 つ分を処理してから次でまた判定。
+        if let Some(gate) = activity_gate {
+            gate.wait_until_idle(cancel);
+            if cancel.load(Ordering::Relaxed) {
+                summary.cancelled = true;
+                break;
+            }
+        }
         if let Some(p) = progress {
-            p.set(format!(
-                "取込: {} ({}/{})",
-                folder.display(),
-                i + 1,
-                total_folders
-            ));
+            // カウントを先頭に / フォルダは favorite 相対でフルパスが切れにくいようにする。
+            let display = folder.strip_prefix(fav_path).unwrap_or(folder).display();
+            p.set(format!("取込 ({}/{}) {}", i + 1, total_folders, display));
         }
         let mut children: Vec<IndexEntry> = Vec::new();
         let Ok(entries) = std::fs::read_dir(folder) else {
@@ -181,7 +191,7 @@ pub fn spawn_bulk(
 ) -> std::thread::JoinHandle<BulkSummary> {
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        let summary = run_bulk_name_index(&fav_path, &db, &cancel, progress.as_ref());
+        let summary = run_bulk_name_index(&fav_path, &db, None, &cancel, progress.as_ref());
         crate::logger::log(format!(
             "name_bulk_indexer: {} done in {} ms (folders={}, entries={}, cancelled={})",
             fav_path.display(),
@@ -222,7 +232,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        let summary = run_bulk_name_index(&root, &db, &cancel, None);
+        let summary = run_bulk_name_index(&root, &db, None, &cancel, None);
 
         // folders_visited = root + sub
         assert_eq!(summary.folders_visited, 2);
@@ -245,7 +255,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(true); // 最初から立てておく
-        let summary = run_bulk_name_index(&root, &db, &cancel, None);
+        let summary = run_bulk_name_index(&root, &db, None, &cancel, None);
         assert!(summary.cancelled);
     }
 }

@@ -313,13 +313,13 @@ impl CachePolicy {
 /// バックグラウンドインデクサの速度プロファイル。
 /// I/O 同時実行数 (GlobalIoSemaphore の permits) を決定する。
 ///
-/// - `Low`: HDD / NAS / バッテリー向け。1 permit で UI 操作を最優先
-/// - `Medium`: HDD + SSD 混成。2 permits (デフォルト)
+/// - `Low`: HDD / NAS / バッテリー向け。1 permit で UI 操作を最優先 (**デフォルト**, 2026-04 変更)
+/// - `Medium`: HDD + SSD 混成。2 permits
 /// - `High`: NVMe SSD。4 permits で初回インデックスを高速化
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum IndexerSpeedProfile {
-    Low,
     #[default]
+    Low,
     Medium,
     High,
 }
@@ -336,8 +336,8 @@ impl IndexerSpeedProfile {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Low => "Low (1 permit, UI 優先)",
-            Self::Medium => "Medium (2 permits, 既定)",
+            Self::Low => "Low (1 permit, UI 優先, 既定)",
+            Self::Medium => "Medium (2 permits)",
             Self::High => "High (4 permits, NVMe 向け)",
         }
     }
@@ -1251,8 +1251,10 @@ mod tests {
     }
 
     #[test]
-    fn indexer_speed_profile_default_is_medium() {
-        assert_eq!(IndexerSpeedProfile::default(), IndexerSpeedProfile::Medium);
+    fn indexer_speed_profile_default_is_low() {
+        // HDD 環境で UI 応答性を優先するため、既定は 1 permit (Low)。
+        // SSD/NVMe 向けに Medium/High を選べる。
+        assert_eq!(IndexerSpeedProfile::default(), IndexerSpeedProfile::Low);
     }
 
     #[test]

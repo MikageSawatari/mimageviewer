@@ -29,12 +29,23 @@ impl AdjustmentDb {
         }
         let conn = rusqlite::Connection::open(path)?;
         // 未リリース機能なのでマイグレーションは行わず旧テーブルを破棄する。
+        //
+        // `sidecar_sync`: サイドカー (mimageviewer.dat) を最後に import した時の
+        // ファイル mtime を folder_key ごとに記録する (2026-04)。フォルダ切替の度に
+        // `fs::metadata(sidecar)` で取った mtime と突き合わせ、一致するなら
+        // `read_to_string` + parse + import をまるごとスキップするための fast-path。
+        // フォルダ移動・外部ツールでサイドカーを更新したケースだけ slow-path に落ちる。
         conn.execute_batch(
             "DROP TABLE IF EXISTS presets;
              DROP TABLE IF EXISTS page_presets;
              CREATE TABLE IF NOT EXISTS page_params (
                 page_path TEXT PRIMARY KEY,
                 params_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS sidecar_sync (
+                folder_key    TEXT PRIMARY KEY,
+                sidecar_mtime INTEGER NOT NULL,
+                synced_at     INTEGER NOT NULL
              );",
         )?;
         Ok(Self { conn })
@@ -114,6 +125,43 @@ impl AdjustmentDb {
         }
         drop(stmt);
         tx.commit()?;
+        Ok(())
+    }
+
+    // ── サイドカー同期状態 (fast-path 用) ─────────────────────────────
+
+    /// このフォルダについて最後に import したサイドカーの mtime (UNIX 秒) を返す。
+    /// 未登録なら None。
+    pub fn sidecar_sync_get(&self, folder_key: &str) -> Option<i64> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT sidecar_mtime FROM sidecar_sync WHERE folder_key = ?1")
+            .ok()?;
+        stmt.query_row([folder_key], |row| row.get::<_, i64>(0)).ok()
+    }
+
+    /// サイドカー同期状態を upsert。import 成功時に最新 mtime を残す。
+    pub fn sidecar_sync_upsert(
+        &self,
+        folder_key: &str,
+        sidecar_mtime: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO sidecar_sync (folder_key, sidecar_mtime, synced_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = ?2, synced_at = ?3",
+            rusqlite::params![folder_key, sidecar_mtime, now],
+        )?;
+        Ok(())
+    }
+
+    /// サイドカー同期状態を削除 (サイドカーが削除されたフォルダに追従する用)。
+    pub fn sidecar_sync_clear(&self, folder_key: &str) -> Result<(), rusqlite::Error> {
+        self.conn
+            .execute("DELETE FROM sidecar_sync WHERE folder_key = ?1", [folder_key])?;
         Ok(())
     }
 

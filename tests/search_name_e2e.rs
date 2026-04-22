@@ -202,11 +202,13 @@ fn two_supervisors_complete_in_parallel() {
         fav_a.id,
         fav_a.path.clone(),
         std::sync::Arc::clone(&db),
+        None,
     );
     let handle_b = mimageviewer::name_index_supervisor::spawn(
         fav_b.id,
         fav_b.path.clone(),
         std::sync::Arc::clone(&db),
+        None,
     );
 
     wait_name_scan_done(&handle_a);
@@ -283,7 +285,7 @@ fn full_scan_removes_stale_entries_from_became_empty_folder() {
     let cancel = AtomicBool::new(false);
 
     // Phase 1: 初期スキャン
-    let summary1 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    let summary1 = run_bulk_name_index(root.path(), &db, None, &cancel, None);
     assert!(!summary1.cancelled);
 
     let roots = vec![root.path().to_path_buf()];
@@ -306,7 +308,7 @@ fn full_scan_removes_stale_entries_from_became_empty_folder() {
     std::fs::remove_file(p.join("b.pdf")).expect("rm b.pdf");
 
     // Phase 2: 再スキャン (アプリ再起動相当)
-    let summary2 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    let summary2 = run_bulk_name_index(root.path(), &db, None, &cancel, None);
     assert!(!summary2.cancelled);
 
     // 古い行が消えていること
@@ -358,8 +360,8 @@ fn nested_favorites_both_scopes_find_shared_path() {
     let cancel = AtomicBool::new(false);
 
     // お気に入り A (親) と B (子) を順番にバルク
-    run_bulk_name_index(root.path(), &db, &cancel, None); // A = /root
-    run_bulk_name_index(&photo, &db, &cancel, None); //       B = /root/photo
+    run_bulk_name_index(root.path(), &db, None, &cancel, None); // A = /root
+    run_bulk_name_index(&photo, &db, None, &cancel, None); //       B = /root/photo
 
     // A スコープで a.zip 検索 → 見つかるべき
     let hits_a = name_index_search(&db, "a.zip", &[root.path().to_path_buf()]);
@@ -473,7 +475,7 @@ fn full_scan_removes_offline_deleted_subtree() {
     let roots = vec![root.path().to_path_buf()];
 
     // Phase 1: 初期スキャン
-    let s1 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    let s1 = run_bulk_name_index(root.path(), &db, None, &cancel, None);
     assert!(!s1.cancelled);
     assert!(
         !name_index_search(&db, "Q", &roots).is_empty(),
@@ -497,7 +499,7 @@ fn full_scan_removes_offline_deleted_subtree() {
     // 旧秒精度 cutoff で必要だった sleep(1100ms) は不要 (Codex P2 回帰対策)。
 
     // Phase 2: 再スキャン (アプリ再起動相当)
-    let s2 = run_bulk_name_index(root.path(), &db, &cancel, None);
+    let s2 = run_bulk_name_index(root.path(), &db, None, &cancel, None);
     assert!(!s2.cancelled);
 
     // 削除済みサブツリーが全部消えていること
@@ -557,8 +559,8 @@ fn prune_stale_does_not_touch_nested_sibling_favorite() {
     let cancel = AtomicBool::new(false);
 
     // Phase 1: 両 favorite でバルク
-    run_bulk_name_index(&photo, &db, &cancel, None); // A = /photo
-    run_bulk_name_index(&fav_sub, &db, &cancel, None); // B = /photo/fav
+    run_bulk_name_index(&photo, &db, None, &cancel, None); // A = /photo
+    run_bulk_name_index(&fav_sub, &db, None, &cancel, None); // B = /photo/fav
 
     let roots_a = vec![photo.clone()];
     let roots_b = vec![fav_sub.clone()];
@@ -576,7 +578,7 @@ fn prune_stale_does_not_touch_nested_sibling_favorite() {
     // (旧秒精度 cutoff 時代の sleep(1100ms) は廃止)。
 
     // Phase 2: A のみ再スキャン (B は前回の行を保持したまま)
-    run_bulk_name_index(&photo, &db, &cancel, None);
+    run_bulk_name_index(&photo, &db, None, &cancel, None);
 
     // A スコープ: a.zip が消えた、x.zip は残る
     assert!(
@@ -619,14 +621,14 @@ fn back_to_back_full_scans_prune_stale_without_sleep() {
     let roots = vec![root.path().to_path_buf()];
 
     // Phase 1
-    run_bulk_name_index(root.path(), &db, &cancel, None);
+    run_bulk_name_index(root.path(), &db, None, &cancel, None);
     assert!(!name_index_search(&db, "a.zip", &roots).is_empty());
 
     // 削除してそのまま (sleep なし)
     std::fs::remove_dir_all(&p).expect("rm -rf P");
 
     // Phase 2: 連続で走らせる
-    run_bulk_name_index(root.path(), &db, &cancel, None);
+    run_bulk_name_index(root.path(), &db, None, &cancel, None);
 
     // 削除済み a.zip が即座に消えていること
     assert!(

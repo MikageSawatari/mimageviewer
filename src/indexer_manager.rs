@@ -44,6 +44,7 @@ use std::sync::atomic::AtomicBool;
 use crossbeam_channel::{Receiver, Sender};
 use uuid::Uuid;
 
+use crate::activity_gate::ActivityGate;
 use crate::fts_index::FtsIndex;
 use crate::fts_meta::{FileStatus, FtsMetaDb};
 use crate::global_search::SearchStreamEvent;
@@ -84,6 +85,9 @@ pub struct IndexerManager {
     /// 廃止 (2026-04 commit 14037af + ユーザー報告)。
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
     io_sem: Arc<GlobalIoSemaphore>,
+    /// UI 入力があると `bump` され、ingest ワーカーが unit of work の前にこれで待つ。
+    /// `App::update` が ActivityGate を所有し、IndexerManager は `Arc` を受け取って保管する。
+    activity_gate: Arc<ActivityGate>,
     /// お気に入り UUID → Supervisor ハンドル
     supervisors: HashMap<Uuid, SupervisorHandle>,
     /// 有効化されていないお気に入りでも、お気に入り UUID → (name, path) を記憶しておく
@@ -123,6 +127,7 @@ impl IndexerManager {
     pub fn new(
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
+        activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         let meta_db = match FtsMetaDb::open() {
             Ok(db) => Arc::new(db),
@@ -138,7 +143,7 @@ impl IndexerManager {
                 return None;
             }
         };
-        Self::new_with_stores(meta_db, fts, favorites, speed)
+        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate)
     }
 
     /// テスト用コンストラクタ: `data_dir` 配下に `fts_meta.db` / `fts_index/` を作って初期化する。
@@ -150,6 +155,7 @@ impl IndexerManager {
         data_dir: &std::path::Path,
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
+        activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         std::fs::create_dir_all(data_dir).ok();
         let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
@@ -166,7 +172,7 @@ impl IndexerManager {
                 return None;
             }
         };
-        Self::new_with_stores(meta_db, fts, favorites, speed)
+        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate)
     }
 
     /// `new` / `new_at` 共通の本体。stores を受け取って reconciliation + supervisor spawn を行う。
@@ -175,6 +181,7 @@ impl IndexerManager {
         fts: Arc<FtsIndex>,
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
+        activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
         // dispatcher が常駐スレッドで処理するので、reconciliation も submit ベースで行う。
@@ -218,6 +225,7 @@ impl IndexerManager {
             fts,
             writer,
             io_sem,
+            activity_gate,
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
@@ -284,11 +292,31 @@ impl IndexerManager {
                 handle.signal_stop();
             }
         }
-        for id in to_stop {
-            if let Some(handle) = self.supervisors.remove(&id) {
-                crate::logger::log(format!("IndexerManager: joining supervisor {id}"));
-                drop(handle);
-            }
+        // **非同期 join** (2026-04 B): 各 supervisor の drop は `thread.join()` を待つため、
+        // ingest の sub-batch (commit に数百 ms かかる) を抱えた supervisor を join すると
+        // UI スレッドが丸ごとブロックする (計測で 1162ms のヒッチを観測)。
+        // 既に上の `signal_stop()` で全員の cancel は立てているので、drop (= join) 自体は
+        // バックグラウンドスレッドに逃がして UI は即 return させる。
+        let handles_to_join: Vec<SupervisorHandle> = to_stop
+            .into_iter()
+            .filter_map(|id| self.supervisors.remove(&id))
+            .collect();
+        if !handles_to_join.is_empty() {
+            let n = handles_to_join.len();
+            crate::logger::log(format!(
+                "IndexerManager: spawning joiner thread for {n} supervisor(s)"
+            ));
+            let _ = std::thread::Builder::new()
+                .name("indexer-joiner".into())
+                .spawn(move || {
+                    for handle in handles_to_join {
+                        let id = handle.favorite_id;
+                        drop(handle);
+                        crate::logger::log(format!(
+                            "IndexerManager(joiner): supervisor {id} joined"
+                        ));
+                    }
+                });
         }
 
         // 新規 ON を spawn (path 変更で drop したものも新 path で respawn される)
@@ -309,6 +337,7 @@ impl IndexerManager {
                 Arc::clone(&self.fts),
                 Arc::clone(&self.writer),
                 Arc::clone(&self.io_sem),
+                Arc::clone(&self.activity_gate),
             );
             self.supervisors.insert(f.id, handle);
         }
@@ -895,6 +924,7 @@ mod tests {
             fts: Arc::clone(&fts),
             writer,
             io_sem: Arc::clone(&io_sem),
+            activity_gate: Arc::new(ActivityGate::new(1000)),
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),

@@ -1,6 +1,7 @@
 //! mimageviewer ライブラリクレート。
 //! 統合テストやベンチマーク bin から公開モジュールにアクセスするためのエントリポイント。
 
+pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;

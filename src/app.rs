@@ -1091,6 +1091,11 @@ pub struct App {
         crate::name_index_supervisor::NameIndexSupervisorHandle,
     >,
 
+    /// 操作中はバックグラウンドインデクサを一時停止するためのゲート (2026-04 F)。
+    /// `App::update` の入力検知で `bump()` され、indexer 側が `wait_until_idle()` で待機。
+    /// `Arc` で `IndexerManager` / `name_index_supervisor` と共有される。
+    pub(crate) activity_gate: Arc<crate::activity_gate::ActivityGate>,
+
     // ── Ctrl+G グローバルメタ検索 UI 状態 (docs §10.3) ──────────────
     pub(crate) global_search: crate::global_search_ui::GlobalSearchState,
 
@@ -1610,11 +1615,17 @@ impl Default for App {
             .ai_upscale_model_override
             .as_deref()
             .and_then(crate::ai::ModelKind::from_str);
+        // 操作中はバックグラウンドインデクサを一時停止するためのゲート (2026-04 F)。
+        // 1000ms 操作がなければ indexer が再開する。IndexerManager / name_index_supervisor
+        // の両方に `Arc` で共有される。
+        let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(1000));
+
         // 全文検索インデクサを起動。DB/index オープンに失敗した場合 (ディスク容量不足等)
         // は None となり、Ctrl+G 機能は無効だが他の機能は継続動作する。
         let indexer_manager = crate::indexer_manager::IndexerManager::new(
             &settings.favorites,
             settings.indexer_speed_profile,
+            Arc::clone(&activity_gate),
         );
         Self {
             address: String::new(),
@@ -1675,6 +1686,7 @@ impl Default for App {
             fav_add_auto_index_thumbs: false,
             indexer_manager,
             name_index_supervisors: std::collections::HashMap::new(),
+            activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
@@ -2311,10 +2323,15 @@ impl App {
         new_on: bool,
     ) {
         // 既存 supervisor があれば drop (OFF 遷移だけでなく ON→ON でも念のため:
-        // path 変更等で spawn し直すシナリオ)
+        // path 変更等で spawn し直すシナリオ)。
+        // **非同期 join** (2026-04 B): `drop(handle)` は `thread.join()` を待つため、
+        // bulk scan が進行中だと UI が 数百 ms ブロックする。signal_stop で cancel は立てて、
+        // 実際の join はバックグラウンドスレッドに逃がす。
         if let Some(handle) = self.name_index_supervisors.remove(&fav_id) {
             handle.signal_stop();
-            drop(handle); // thread join を待つ (cancel 後 folder boundary で即抜ける)
+            let _ = std::thread::Builder::new()
+                .name(format!("name-index-joiner-{}", fav_id.as_simple()))
+                .spawn(move || drop(handle));
         }
 
         let Some(db) = self.search_index_db.as_ref() else {
@@ -2329,6 +2346,7 @@ impl App {
                 fav_id,
                 fav_path.to_path_buf(),
                 Arc::clone(db),
+                Some(Arc::clone(&self.activity_gate)),
             );
             self.name_index_supervisors.insert(fav_id, handle);
         } else if let Err(e) = db.clear_for_favorite(fav_path) {
@@ -2358,8 +2376,12 @@ impl App {
                 "startup: spawning name index supervisor for {}",
                 fav.path.display()
             ));
-            let handle =
-                crate::name_index_supervisor::spawn(fav.id, fav.path.clone(), Arc::clone(&db));
+            let handle = crate::name_index_supervisor::spawn(
+                fav.id,
+                fav.path.clone(),
+                Arc::clone(&db),
+                Some(Arc::clone(&self.activity_gate)),
+            );
             self.name_index_supervisors.insert(fav.id, handle);
         }
     }
@@ -7780,7 +7802,49 @@ impl App {
     /// フォルダ丸ごと移動で中央 DB のパスキーが無効化された場合の復旧経路。
     /// サイドカー自体はメモリに残し、以降の書き込みミラーに使う。
     /// 実際のインポートロジックは [`crate::sidecar::import_to_dbs`] に委譲。
+    ///
+    /// ## Fast-path (2026-04): サイドカー mtime ガード
+    ///
+    /// 通常 DB 側が authoritative で、サイドカー側が新しいのはフォルダ移動・
+    /// リネーム直後のレアケース。全フォルダ切替で `read_to_string` + parse +
+    /// import を走らせると HDD 競合で 100-500ms のヒッチになる (perf-log で
+    /// `sli_sidecar_import max=456ms` を観測)。そこで:
+    ///
+    /// 1. `fs::metadata(sidecar)` で mtime を取得 (1 syscall、通常 <1ms)
+    /// 2. `adjustment_db.sidecar_sync` に記録した前回 import 時の mtime と比較
+    /// 3. 一致するなら読まずに return (common case)
+    /// 4. 不一致 / 未登録 / ファイル削除 のときだけ既存の slow-path に入る
     fn import_sidecar_to_dbs(&mut self, sidecar_folder: &std::path::Path) {
+        let sidecar_path = sidecar_folder.join(crate::sidecar::SIDECAR_FILENAME);
+        let folder_key = crate::adjustment_db::normalize_path(sidecar_folder);
+
+        // Step 1: サイドカーの fs 状態を確認
+        let fs_mtime: Option<i64> = match std::fs::metadata(&sidecar_path) {
+            Ok(m) => m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // サイドカー無し: 以前に import 済みの記録があれば消して整合させる
+                // (サイドカーが外部削除されたフォルダに追従)
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.sidecar_sync_clear(&folder_key);
+                }
+                return;
+            }
+            Err(_) => return,
+        };
+
+        // Step 2: DB 側に記録された mtime と比較
+        if let (Some(db), Some(fs_mt)) = (&self.adjustment_db, fs_mtime) {
+            if db.sidecar_sync_get(&folder_key) == Some(fs_mt) {
+                // 前回 import と同じ mtime → 読む必要なし (common case)
+                return;
+            }
+        }
+
+        // Step 3: Slow-path (初回 / 外部変更された場合のみ)
         // メモリにロード (既存なら再利用)
         if !self.sidecars.contains_key(sidecar_folder) {
             self.sidecars.insert(
@@ -7791,23 +7855,25 @@ impl App {
         let Some(sidecar) = self.sidecars.get(sidecar_folder) else {
             return;
         };
-        if sidecar.items().is_empty() {
-            return;
+        // 空サイドカーでも mtime は記録して次回以降スキップできるようにする
+        if !sidecar.items().is_empty() {
+            let stats = crate::sidecar::import_to_dbs(
+                sidecar_folder,
+                sidecar,
+                self.adjustment_db.as_ref(),
+                self.mask_db.as_ref(),
+            );
+            if stats.imported_adjust > 0 || stats.imported_mask > 0 {
+                crate::logger::log(format!(
+                    "sidecar: imported {} adjust + {} mask entries from {}",
+                    stats.imported_adjust,
+                    stats.imported_mask,
+                    sidecar_folder.display()
+                ));
+            }
         }
-
-        let stats = crate::sidecar::import_to_dbs(
-            sidecar_folder,
-            sidecar,
-            self.adjustment_db.as_ref(),
-            self.mask_db.as_ref(),
-        );
-        if stats.imported_adjust > 0 || stats.imported_mask > 0 {
-            crate::logger::log(format!(
-                "sidecar: imported {} adjust + {} mask entries from {}",
-                stats.imported_adjust,
-                stats.imported_mask,
-                sidecar_folder.display()
-            ));
+        if let (Some(db), Some(fs_mt)) = (&self.adjustment_db, fs_mtime) {
+            let _ = db.sidecar_sync_upsert(&folder_key, fs_mt);
         }
     }
 
@@ -9126,6 +9192,30 @@ impl eframe::App for App {
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
+
+        // 2026-04 F: 入力があればバックグラウンドインデクサを一時停止させる。
+        // マウス移動 (PointerMoved) は除外し、意味のあるインタラクションだけを拾う。
+        // - キー入力 (keys_down 非空 / Key イベント / Text 入力)
+        // - ポインタボタン押下 / 解放
+        // - スクロール
+        let has_activity = ctx.input(|i| {
+            !i.keys_down.is_empty()
+                || i.pointer.any_pressed()
+                || i.pointer.any_released()
+                || i.raw_scroll_delta.length_sq() > 0.0
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Text(_)
+                            | egui::Event::Key { .. }
+                            | egui::Event::MouseWheel { .. }
+                            | egui::Event::PointerButton { .. }
+                    )
+                })
+        });
+        if has_activity {
+            self.activity_gate.bump();
+        }
 
         // UI テーマを適用 (変化したときだけ set_visuals を呼ぶ)。
         // `UiTheme::System` 選択時は設定値が変わらなくても Windows の Light/Dark
