@@ -586,6 +586,17 @@ IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バ
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
 6. `README.md` — 更新履歴セクションに新バージョンの変更点を追加
 7. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
+   - マニュアル左サイドバーのリンク一覧が全 14 ページで揃っているか
+     `htdocs/mimageviewer/manual/` 配下で一括確認:
+     ```bash
+     cd htdocs/mimageviewer/manual && for f in *.html; do
+       echo "=== $f ==="
+       sed -n '/sidebar-section/,/<\/nav>/p' "$f" \
+         | grep -E 'href="[a-z-]+\.html"' | wc -l
+     done
+     ```
+     14 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     新規ページを追加した際は 14 ページ全部のサイドバーを更新すること。
 8. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
 9. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 10. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
