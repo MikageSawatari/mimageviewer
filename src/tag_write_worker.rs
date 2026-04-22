@@ -273,37 +273,57 @@ fn process_job(
     fts: &FtsIndex,
     shared_writer: &Mutex<IndexWriter>,
 ) -> (Result<TagAction, WriteError>, bool) {
+    let path_disp = job.path.display();
     // Toggle は worker 側で現在タグを読んで Add/Remove に解決する。
     // これで UI スレッドからの同期 I/O を不要にできる。
     // UI 側トースト用に、どちらに解決されたかを `TagAction` で返す。
-    let (op, action, had_hash_tags) = match &job.kind {
+    let (op, action) = match &job.kind {
         TagJobKind::Toggle(name) => {
             let current = crate::xmp_reader::read_dc_subject(&job.path);
             let with_hash = format!("#{name}");
             let already_has = current.iter().any(|t| *t == with_hash);
+            crate::logger::log(format!(
+                "[TAG] worker: read dc:subject → {current:?} (looking for {with_hash:?}) → {} | {path_disp}",
+                if already_has { "REMOVE" } else { "ADD" }
+            ));
             if already_has {
-                (TagOp::Remove(with_hash), TagAction::Removed, true)
+                (TagOp::Remove(with_hash), TagAction::Removed)
             } else {
-                (TagOp::Add(with_hash), TagAction::Added, true)
+                (TagOp::Add(with_hash), TagAction::Added)
             }
         }
         TagJobKind::ClearMiv => {
             let current = crate::xmp_reader::read_dc_subject(&job.path);
             let had = current.iter().any(|t| t.starts_with('#'));
-            (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp }, had)
+            crate::logger::log(format!(
+                "[TAG] worker: ClearMiv read dc:subject → {current:?} (had #-tags={had}) | {path_disp}"
+            ));
+            (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp })
         }
     };
-    let _ = had_hash_tags; // 将来、UI 側で more granular な集計に使う余地あり
 
     let new_tags = match crate::xmp_writer::apply_tag_op(&job.path, &op) {
         Ok(s) => s,
-        Err(e) => return (Err(e), false),
+        Err(e) => {
+            crate::logger::log(format!(
+                "[TAG] worker: apply_tag_op FAILED ({e}) | {path_disp}"
+            ));
+            return (Err(e), false);
+        }
     };
+    crate::logger::log(format!(
+        "[TAG] worker: write OK, new tags column = {new_tags:?} | {path_disp}"
+    ));
 
     // 検索インデックス即時更新 (favorite_id がわかる時だけ)。
     let dirtied = match job.favorite_id {
         Some(fav_id) => upsert_tags_in_writer(&job.path, fav_id, &new_tags, meta, fts, shared_writer),
-        None => false,
+        None => {
+            crate::logger::log(format!(
+                "[TAG] worker: skip fts_meta upsert (no favorite_id) | {path_disp}"
+            ));
+            false
+        }
     };
     (Ok(action), dirtied)
 }
