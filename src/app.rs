@@ -9542,7 +9542,9 @@ impl eframe::App for App {
                 let d = i.key_pressed(egui::Key::D);
                 // Ctrl+Shift+A は Ctrl+A と同一フレームに見えるので、shift 付きなら
                 // Ctrl+A ではなく deselect 側にだけ立てる (全選択の暴発を防ぐ)。
-                (ctrl && !shift && a, ctrl && (d || (shift && a)))
+                let select_all = ctrl && !shift && a;
+                let deselect = ctrl && (d || (shift && a));
+                (select_all, deselect)
             });
             if ctrl_a {
                 for &idx in &self.visible_indices {

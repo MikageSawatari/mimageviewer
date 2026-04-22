@@ -247,10 +247,10 @@ pub enum ContainerSortMode {
 impl ContainerSortMode {
     pub fn label(self) -> &'static str {
         match self {
-            ContainerSortMode::HitCount => "件数",
-            ContainerSortMode::Name => "ファイル名",
-            ContainerSortMode::Newer => "新しい",
-            ContainerSortMode::Older => "古い",
+            ContainerSortMode::HitCount => "件数順",
+            ContainerSortMode::Name => "名前順",
+            ContainerSortMode::Newer => "新しい順",
+            ContainerSortMode::Older => "古い順",
         }
     }
 }
@@ -304,13 +304,9 @@ impl GlobalSearchState {
 /// GlobalHit のパスから「サムネ表示できる画像」としての代表情報を抽出する。
 /// サムネイル可能でない (拡張子が画像でない / PDF メタ・フォルダ名ヒット) なら None。
 fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentative> {
-    // `zippath!entry` 形式なら ZIP エントリとして分割。
-    let (file_part, entry): (&str, Option<String>) = if let Some(idx) = hit_path.find('!') {
-        let (zip_part, rest) = hit_path.split_at(idx);
-        // split_at は `!` を rest 側に残すので先頭 1 byte 切り落とす
-        (zip_part, Some(rest[1..].to_string()))
-    } else {
-        (hit_path, None)
+    let (file_part, entry) = match hit_path.split_once('!') {
+        Some((zip, ent)) => (zip, Some(ent.to_string())),
+        None => (hit_path, None),
     };
     // ZIP エントリなら entry 側、通常ファイルなら file_part から拡張子を取る
     let name_for_ext = entry.as_deref().unwrap_or(file_part);
@@ -331,8 +327,7 @@ fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentati
 /// - ZIP エントリ (`<zippath>!<entry>` 形式) → ZIP ファイルパス
 /// - 通常ファイル → 親フォルダパス
 fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
-    if let Some(idx) = hit_path.find('!') {
-        let (zip_part, _entry) = hit_path.split_at(idx);
+    if let Some((zip_part, _entry)) = hit_path.split_once('!') {
         return (PathBuf::from(zip_part), SearchContainerKind::Zip);
     }
     let p = PathBuf::from(hit_path);
@@ -397,9 +392,7 @@ pub fn ensure_container_mtime_populated(state: &mut GlobalSearchState) {
         }
         c.mtime = std::fs::metadata(&c.path)
             .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
+            .map(|m| crate::ui_helpers::mtime_secs(&m));
     }
 }
 

@@ -286,14 +286,15 @@ impl App {
                 // 上方向 (dy < 0) で拡大、下方向で縮小
                 let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
                 let new_zoom = (drag.start_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-                // pivot 位置が画面上で動かないように pan を補正
-                // (apply_wheel_zoom と同じロジックだが、差分ではなく start 値基準で計算)
-                let ratio = new_zoom / drag.start_zoom;
-                let cx = drag.pivot.x - (drag.rect_center.x + drag.start_pan.x);
-                let cy = drag.pivot.y - (drag.rect_center.y + drag.start_pan.y);
-                let new_pan = egui::vec2(
-                    drag.start_pan.x + cx * (1.0 - ratio),
-                    drag.start_pan.y + cy * (1.0 - ratio),
+                // pivot 位置が画面上で動かないように pan を補正。ホイールズームと違い
+                // 差分累積ではなく毎回 start 値基準で計算することで、dy が元に戻れば
+                // pan も完全に元へ戻る (累積誤差が発生しない)。
+                let new_pan = zoom_preserve_pivot(
+                    drag.pivot,
+                    drag.rect_center,
+                    drag.start_pan,
+                    drag.start_zoom,
+                    new_zoom,
                 );
                 // 書き戻し先はドラッグ開始時の is_analysis で固定
                 // (途中でモードが切り替わっても書き先がブレないように)
@@ -338,12 +339,7 @@ impl App {
         let old_zoom = *zoom;
         *zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         if let Some(mouse) = mouse {
-            let center = rect_center + *pan;
-            let cx = mouse.x - center.x;
-            let cy = mouse.y - center.y;
-            let ratio = *zoom / old_zoom;
-            pan.x += cx * (1.0 - ratio);
-            pan.y += cy * (1.0 - ratio);
+            *pan = zoom_preserve_pivot(mouse, rect_center, *pan, old_zoom, *zoom);
         }
         *zoom != old_zoom
     }
@@ -356,6 +352,27 @@ impl App {
             }
         }
     }
+}
+
+/// ピボット点 (`mouse`) が画面上で動かないように、zoom 変化に合わせて pan を補正した
+/// 新しい pan を返す。`apply_wheel_zoom` と `handle_middle_drag_zoom` が共用する。
+///
+/// 式: new_pan = base_pan + (mouse - (rect_center + base_pan)) * (1 - new_zoom / base_zoom)
+fn zoom_preserve_pivot(
+    mouse: egui::Pos2,
+    rect_center: egui::Pos2,
+    base_pan: egui::Vec2,
+    base_zoom: f32,
+    new_zoom: f32,
+) -> egui::Vec2 {
+    let center = rect_center + base_pan;
+    let cx = mouse.x - center.x;
+    let cy = mouse.y - center.y;
+    let ratio = new_zoom / base_zoom;
+    egui::vec2(
+        base_pan.x + cx * (1.0 - ratio),
+        base_pan.y + cy * (1.0 - ratio),
+    )
 }
 
 /// 中ボタンドラッグズームのスナップショット状態 (v0.8.1)。
