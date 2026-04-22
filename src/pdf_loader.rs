@@ -1204,9 +1204,12 @@ enum WorkerRequest {
         path: PathBuf,
         password: Option<String>,
         reply: mpsc::Sender<std::io::Result<Vec<PdfPageEntry>>>,
-        /// `LATEST_ENUMERATE_EPOCH` から採番した世代番号。ワーカーがピックアップ時に
-        /// 最新値と比較し、より新しい要求が既に来ていれば skip する。
-        epoch: u64,
+        /// UI ナビゲーション経路 (`enumerate_pages_async`) のみ `Some(epoch)` を添え、
+        /// ワーカーが pickup 時に最新 epoch と比較して stale なら skip する。
+        /// バックグラウンド (キャッシュ作成等の `enumerate_pages` 同期経路) は `None` で、
+        /// 常に実行する (Codex P2 対策: UI nav の epoch とバックグラウンドが干渉して
+        /// アクティブな UI の PDF が Interrupted で落ちるのを防ぐ)。
+        epoch: Option<u64>,
     },
     CheckPassword {
         path: PathBuf,
@@ -1318,18 +1321,26 @@ impl PdfWorker {
                 epoch,
             } => {
                 // Stale な enumerate 要求は即捨てる。ユーザーが Ctrl+↑↓ 連打で複数 PDF を
-                // 通過した場合、古い要求を律儀に処理する必要はない (結果は誰も待っていない)。
-                let latest = LATEST_ENUMERATE_EPOCH.load(Ordering::SeqCst);
-                if epoch < latest {
-                    crate::logger::log(format!(
-                        "pdf-worker: skipping stale enumerate (epoch {epoch} < latest {latest}) for {}",
-                        path.display()
-                    ));
-                    let _ = reply.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "enumerate request superseded by newer navigation",
-                    )));
-                    return;
+                // 通過した場合、古い要求を律儀に処理する必要はない。
+                //
+                // Codex P2 対策: epoch は UI ナビゲーション経路
+                // (`enumerate_pages_async`) のみ `Some(_)` で渡される。バックグラウンド
+                // のキャッシュ作成等で呼ばれる同期 `enumerate_pages()` は `None` を渡すので
+                // skip 判定の対象外。`is_stale = epoch.is_some_and(|e| e < latest)` とすること
+                // で、nav 側が後から来て epoch を進めても background 要求は影響を受けない。
+                if let Some(e) = epoch {
+                    let latest = LATEST_ENUMERATE_EPOCH.load(Ordering::SeqCst);
+                    if e < latest {
+                        crate::logger::log(format!(
+                            "pdf-worker: skipping stale enumerate (epoch {e} < latest {latest}) for {}",
+                            path.display()
+                        ));
+                        let _ = reply.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "enumerate request superseded by newer navigation",
+                        )));
+                        return;
+                    }
                 }
                 let _ = reply.send(core_enumerate(pdfium, &path, password.as_deref()));
             }
@@ -1532,14 +1543,15 @@ pub fn enumerate_pages(
         let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key))?;
         return PdfWorkerPool::parse_enumerate_response(&resp);
     }
-    // フォールバック: in-process ワーカー
+    // フォールバック: in-process ワーカー。
+    // 同期経路 (キャッシュ作成等) なので epoch は None を渡す (Codex P2: UI nav の
+    // epoch 進行でキャッシュ作成中の enumerate が Interrupted で落ちるのを防ぐ)。
     let (tx, rx) = mpsc::channel();
-    let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
         path: pdf_path.to_path_buf(),
         password: password.map(String::from),
         reply: tx,
-        epoch,
+        epoch: None,
     });
     rx.recv()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
@@ -1688,13 +1700,14 @@ pub fn enumerate_pages_async(
     // バグ修正 (2026-04): Ctrl+↑↓ 連打で PDF が連続した場合、古い enumerate 要求が
     // キューに溜まって最新のものが処理されるまで最大 10 秒超の黒画面になる。
     // epoch を採番して worker に渡し、worker は pick up 時点で最新 epoch 未満なら即 skip する。
+    // UI ナビゲーション経路なので `Some(epoch)` で渡す (同期経路の `enumerate_pages` は None)。
     let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
         path: pdf_path.to_path_buf(),
         password: password.map(String::from),
         reply: tx,
-        epoch,
+        epoch: Some(epoch),
     });
     rx
 }
