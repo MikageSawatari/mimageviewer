@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::Sender;
 use uuid::Uuid;
 
-use crate::fts_index::{self, FtsIndex};
+use crate::fts_index::{self, FtsIndex, IndexKind, QueryFilters, SearchTarget};
 use crate::fts_meta::FtsMetaDb;
 use crate::search_query::{self, Token};
 
@@ -81,14 +81,25 @@ pub struct GlobalHit {
     pub score: f32,
 }
 
+/// Ctrl+G 検索ワーカーに渡すフィルタ (§19 ドロップダウン UI と対応)。
+#[derive(Debug, Clone, Default)]
+pub struct SearchScope {
+    /// タイプドロップダウン "フォルダ / ZIP / PDF / 画像"。空 `Vec` は呼び出し側で弾くこと。
+    pub kinds: Option<Vec<IndexKind>>,
+    /// 検索対象ドロップダウン "EXIF / XMP / ..."。既定は `All`。
+    pub target: SearchTarget,
+}
+
 /// 検索ワーカーのエントリーポイント。別スレッドで実行する想定。
 ///
 /// - `favorite_ids`: 検索対象のお気に入り UUID (Ctrl+G は `auto_index_metadata=true` の全部)
+/// - `scope`: タイプ / 検索対象フィルタ (§19)。初期値は `SearchScope::default()` で全開放
 /// - `cancel`: ユーザ操作や新しい入力で true にされたら速やかに中断する
 /// - `tx`: UI へ events を送るチャネル
 pub fn run(
     query_text: &str,
     favorite_ids: &[Uuid],
+    scope: &SearchScope,
     fts: &FtsIndex,
     meta_db: &FtsMetaDb,
     cancel: &AtomicBool,
@@ -131,8 +142,13 @@ pub fn run(
         return;
     }
 
+    let filters = QueryFilters {
+        favorite_ids: Some(favorite_ids),
+        kinds: scope.kinds.as_deref(),
+        target: scope.target.clone(),
+    };
     let Some(query) =
-        fts_index::build_bigram_and_query(fts.fields(), &include_tokens, Some(favorite_ids))
+        fts_index::build_bigram_and_query(fts.fields(), &include_tokens, &filters)
     else {
         // bigram が作れない (どこかのトークンが 1 文字等) → early return
         let _ = tx.send(SearchStreamEvent::Done {
@@ -172,17 +188,16 @@ pub fn run(
         }
         scanned += page.len();
 
-        // 5b. 対応する all_text_norm を一括取得
+        // 5b. 対応する正規化テキスト (target で結合済み) を一括取得 (§19.4)
         let paths_only: Vec<String> = page.iter().map(|(p, _)| p.clone()).collect();
-        let norm_map = match meta_db.lookup_all_text_norm(&paths_only) {
-            Ok(rows) => rows
-                .into_iter()
-                .collect::<std::collections::HashMap<_, _>>(),
-            Err(e) => {
-                let _ = tx.send(SearchStreamEvent::Error(format!("fts_meta lookup: {e}")));
-                return;
-            }
-        };
+        let norm_map: std::collections::HashMap<String, String> =
+            match meta_db.lookup_norms_for_target(&paths_only, &scope.target) {
+                Ok(rows) => rows.into_iter().collect(),
+                Err(e) => {
+                    let _ = tx.send(SearchStreamEvent::Error(format!("fts_meta lookup: {e}")));
+                    return;
+                }
+            };
 
         // 5c. post-filter
         let mut batch = Vec::new();
@@ -319,6 +334,7 @@ pub fn hit_to_pathbuf(hit: &GlobalHit) -> PathBuf {
 mod tests {
     use super::*;
     use crate::fts_index::{Container, IndexDoc, upsert_doc};
+    use crate::ingest_text::PerSourceText;
     use crate::search_index_db::normalize_path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
@@ -331,11 +347,32 @@ mod tests {
         (tmp, meta, fts)
     }
 
+    /// `text` を **`name` フィールド + 全対象ソースに入る combined norm** で ingest する。
+    /// 既存テストは `SearchTarget::All` 前提なので、これで従来挙動と互換になる。
     fn ingest(meta: &FtsMetaDb, fts: &FtsIndex, fav: Uuid, path_str: &str, text: &str) {
         let key = normalize_path(&PathBuf::from(path_str));
-        let all_text_norm = crate::search_norm::normalize_for_match(text);
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text_norm)
-            .unwrap();
+        let normalized = crate::search_norm::normalize_for_match(text);
+        let base_name = path_str.rsplit('/').next().unwrap_or(path_str).to_string();
+        // name に「ファイル名 + 検索テキスト」を入れる (テスト互換のため)
+        let combined_name = format!(
+            "{} {}",
+            crate::search_norm::normalize_for_match(&base_name),
+            normalized,
+        );
+        let norms = PerSourceText {
+            name: combined_name.clone(),
+            ..PerSourceText::default()
+        };
+        meta.mark_pending(
+            &key,
+            fav,
+            &PathBuf::from("C:/"),
+            IndexKind::Image,
+            0,
+            0,
+            &norms,
+        )
+        .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
             &w,
@@ -345,10 +382,14 @@ mod tests {
                 container: Container::Fs,
                 zip_entry: String::new(),
                 favorite_id: fav,
+                kind: IndexKind::Image,
                 mtime: 0,
                 file_size: 0,
-                name: path_str.rsplit('/').next().unwrap_or(path_str).to_string(),
-                all_text: all_text_norm,
+                name: combined_name,
+                exif_text: String::new(),
+                xmp_tweet_text: String::new(),
+                png_prompt_text: String::new(),
+                pdf_meta_text: String::new(),
             },
         )
         .unwrap();
@@ -365,7 +406,8 @@ mod tests {
     ) -> (Vec<GlobalHit>, DoneReason, bool) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(false);
-        run(query, favs, fts, meta, &cancel, &tx);
+        let scope = SearchScope::default();
+        run(query, favs, &scope, fts, meta, &cancel, &tx);
         drop(tx);
         let mut all_hits = Vec::new();
         let mut reason = DoneReason::Complete;
@@ -513,7 +555,8 @@ mod tests {
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(true);
-        run("夕焼け", &[fav], &fts, &meta, &cancel, &tx);
+        let scope = SearchScope::default();
+        run("夕焼け", &[fav], &scope, &fts, &meta, &cancel, &tx);
         drop(tx);
         let mut reason = None;
         while let Ok(ev) = rx.recv() {
@@ -586,8 +629,20 @@ mod tests {
         let fav = Uuid::new_v4();
         let key = normalize_path(&PathBuf::from("c:/a.jpg"));
         let all_text = crate::search_norm::normalize_for_match("夕焼け");
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), 0, 0, &all_text)
-            .unwrap();
+        let norms = PerSourceText {
+            name: all_text.clone(),
+            ..PerSourceText::default()
+        };
+        meta.mark_pending(
+            &key,
+            fav,
+            &PathBuf::from("C:/"),
+            IndexKind::Image,
+            0,
+            0,
+            &norms,
+        )
+        .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
             &w,
@@ -597,10 +652,14 @@ mod tests {
                 container: Container::Fs,
                 zip_entry: String::new(),
                 favorite_id: fav,
+                kind: IndexKind::Image,
                 mtime: 0,
                 file_size: 0,
-                name: "a.jpg".to_string(),
-                all_text,
+                name: all_text,
+                exif_text: String::new(),
+                xmp_tweet_text: String::new(),
+                png_prompt_text: String::new(),
+                pdf_meta_text: String::new(),
             },
         )
         .unwrap();
@@ -612,7 +671,7 @@ mod tests {
         meta.mark_tombstone(&[key]).unwrap();
 
         let (hits, _, _) = collect_events("夕焼け", &[fav], &fts, &meta);
-        // post-filter で tombstone は除外される (lookup_all_text_norm が status=3 を弾くため)
+        // post-filter で tombstone は除外される (lookup_norms_for_target が status=3 を弾くため)
         assert!(hits.is_empty(), "tombstone は結果に出ない");
     }
 }

@@ -553,6 +553,25 @@ impl App {
                     self.rebuild_visible_indices();
                 }
 
+                // ── 検索対象ドロップダウン (§19.7) ──
+                let current = crate::global_search_ui::TargetChoice::from_target(&self.search_target);
+                let mut next = current;
+                egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                    .selected_text(current.label())
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for &choice in crate::global_search_ui::TARGET_CHOICES {
+                            ui.selectable_value(&mut next, choice, choice.label());
+                        }
+                    });
+                if next != current {
+                    self.search_target = next.to_target();
+                    // クエリが空でなければ即再検索
+                    if !self.search_query.trim().is_empty() {
+                        self.execute_search();
+                    }
+                }
+
                 // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
                 if !self.any_dialog_open() && escape_pressed {
                     self.show_search_bar = false;
@@ -639,6 +658,44 @@ impl App {
 
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
                     close_requested = true;
+                }
+
+                // ── お気に入り絞り込みドロップダウン (§19.7) ──
+                // `auto_index_structure=true` のお気に入りのみ候補に出す (名前索引の対象と一致)。
+                {
+                    let current = self.favsearch.favorite_filter;
+                    let label_for = |opt: Option<uuid::Uuid>| -> String {
+                        match opt {
+                            None => "すべて".to_string(),
+                            Some(id) => self
+                                .settings
+                                .favorites
+                                .iter()
+                                .find(|f| f.id == id)
+                                .map(|f| f.name.clone())
+                                .unwrap_or_else(|| "(削除済)".to_string()),
+                        }
+                    };
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("favsearch_fav")
+                        .selected_text(label_for(current))
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut next, None, "すべて");
+                            for fav in &self.settings.favorites {
+                                if !fav.auto_index_structure {
+                                    continue;
+                                }
+                                ui.selectable_value(&mut next, Some(fav.id), &fav.name);
+                            }
+                        });
+                    if next != current {
+                        self.favsearch.favorite_filter = next;
+                        // ドロップダウン変更は即再実行。クエリが空なら execute_favsearch が早期 return する。
+                        query_changed = true;
+                        // last_executed と現 query が一致していても再実行するよう last_executed を空に倒す。
+                        self.favsearch.last_executed.clear();
+                    }
                 }
 
                 if self.favsearch_pending.is_some() {

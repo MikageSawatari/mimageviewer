@@ -1,84 +1,173 @@
-//! メタ抽出 → `all_text_norm` 構築 (docs/search-expansion-design.md §9.1 Ingest Worker)。
+//! メタ抽出 → ソース別テキスト構築 (docs/search-expansion-design.md §19.5 Ingest Worker)。
 //!
-//! 画像 1 ファイルに対して
-//!   - ファイル名 (拡張子を含む)
-//!   - EXIF (カメラ / レンズ / 撮影日時 / GPS など)
-//!   - XMP (X/Twitter 由来の mXD メタ)
-//!   - PNG tEXt/iTXt (A1111 / ComfyUI AI プロンプト)
-//! を抽出し、`search_norm::normalize_for_match` を掛けた単一の `all_text_norm` 文字列を作る。
+//! 画像 1 ファイルに対して以下のソースを個別にビルドする:
+//!   - ファイル名 (拡張子を含む) → `SourceKind::Filename`
+//!   - EXIF (カメラ / レンズ / 撮影日時 / GPS など) → `SourceKind::Exif`
+//!   - XMP (X/Twitter 由来の mXD メタ) → `SourceKind::XmpTweet`
+//!   - PNG tEXt/iTXt (A1111 / ComfyUI AI プロンプト) → `SourceKind::PngPrompt`
+//!   - PDFium document info (PDF のみ) → `SourceKind::PdfMeta`
 //!
 //! ## 設計方針
 //!
-//! - **既存の `build_searchable_*` と `read_exif` / `read_tweet_info` を再利用**。
-//!   抽出ロジックは重複実装しない。
-//! - **空セクションを落とす**: メタが無いフォーマット (BMP 等) でも panic しないよう
-//!   `Option` で受ける。
-//! - **区切り文字は半角スペース 1 個**: bigram インデックスでは区切り位置の前後にまたがる
-//!   bigram は実害なし (AND ヒットの合体文字列でも同じ挙動)。
-//! - **最終段で `normalize_for_match`**: 小文字化は連結後に 1 回だけ。
+//! - **既存の `build_searchable_*` / `read_exif` / `read_tweet_info` を再利用**。抽出ロジックは重複実装しない。
+//! - **空セクションは空文字列**: メタが無いフォーマット (BMP 等) でも panic しないよう `Option` で受ける。
+//! - **正規化は各フィールドで独立に適用**: `search_norm::normalize_for_match` を各 String に 1 回ずつ。
+//!   Tantivy bigram ingest / SQLite post-filter / クエリ側で同じ正規化関数を共有するルールを保つ。
 //!
 //! ## スコープ
 //!
-//! 本モジュールは **通常ファイル (FS 上の画像)** を対象にする。
-//! ZIP 内エントリは §7.7 の ZIP 専用 ingest コンテキストで別途扱う (v1 後半)。
+//! 本モジュールは **通常ファイル (FS 上の画像)** と PDF メタを対象にする。
+//! ZIP 内エントリ (v1.x) は §7.7 の ZIP 専用 ingest コンテキストで別途扱う。
 
 use std::path::Path;
 
+use crate::fts_index::SourceKind;
 use crate::search_norm::normalize_for_match;
 
-/// 1 ファイルから検索対象テキストを作る。
-/// 抽出に失敗した部分はスキップし、ファイル名は必ず含める (空文字列は返さない)。
-pub fn build_all_text_for_file(path: &Path) -> String {
-    let mut buf = String::with_capacity(256);
+/// 1 ファイル分のソース別検索テキスト (§19.5)。各フィールドは `normalize_for_match` 適用済み。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PerSourceText {
+    pub name: String,
+    pub exif: String,
+    pub xmp_tweet: String,
+    pub png_prompt: String,
+    pub pdf_meta: String,
+}
+
+impl PerSourceText {
+    pub fn get(&self, source: SourceKind) -> &str {
+        match source {
+            SourceKind::Filename => &self.name,
+            SourceKind::Exif => &self.exif,
+            SourceKind::XmpTweet => &self.xmp_tweet,
+            SourceKind::PngPrompt => &self.png_prompt,
+            SourceKind::PdfMeta => &self.pdf_meta,
+        }
+    }
+
+    /// 全ソース結合 (旧 `all_text` 互換、特に post-filter の "すべて" 検索で使う)。
+    /// 区切りはスペース 1 個。既に個別正規化済みなので再適用はしない。
+    pub fn combined(&self) -> String {
+        let mut out = String::with_capacity(
+            self.name.len()
+                + self.exif.len()
+                + self.xmp_tweet.len()
+                + self.png_prompt.len()
+                + self.pdf_meta.len()
+                + 5,
+        );
+        for s in [
+            &self.name,
+            &self.exif,
+            &self.xmp_tweet,
+            &self.png_prompt,
+            &self.pdf_meta,
+        ] {
+            if !s.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+        }
+        out
+    }
+
+    pub fn is_empty_all(&self) -> bool {
+        self.name.is_empty()
+            && self.exif.is_empty()
+            && self.xmp_tweet.is_empty()
+            && self.png_prompt.is_empty()
+            && self.pdf_meta.is_empty()
+    }
+}
+
+/// 1 ファイル分のソース別検索テキストをディスクから構築する。
+/// 抽出に失敗した部分は空文字列。ファイル名は必ず含める。
+pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
+    let mut out = PerSourceText::default();
 
     // 1. ファイル名
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        buf.push_str(name);
-        buf.push(' ');
+        out.name = normalize_for_match(name);
     }
 
-    // 2. EXIF (rexif)。hidden_tags は検索用途では空 (全部取る)。
+    // 2. EXIF
     if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
+        let mut buf = String::with_capacity(128);
         append_exif(&mut buf, &exif);
+        if !buf.trim().is_empty() {
+            out.exif = normalize_for_match(&buf);
+        }
     }
 
     // 3. XMP (mXD Twitter メタ)
     if let Some(xmp) = crate::xmp_reader::read_tweet_info(path) {
+        let mut buf = String::with_capacity(128);
         append_xmp(&mut buf, &xmp);
+        if !buf.trim().is_empty() {
+            out.xmp_tweet = normalize_for_match(&buf);
+        }
     }
 
     // 4. PNG AI プロンプト (tEXt/iTXt/zTXt)
     let png_text = crate::png_metadata::build_searchable_from_path(path);
     if !png_text.is_empty() {
-        buf.push_str(&png_text);
-        buf.push(' ');
+        out.png_prompt = normalize_for_match(&png_text);
     }
 
-    // 5. 最終段で正規化 (§5.2 の設計: ingest / query / post-filter で唯一の正規化関数)
-    normalize_for_match(&buf)
+    out
 }
 
-/// バイト列 (ZIP 内エントリ用。v1.x で使用予定)。
-///
-/// EXIF / XMP / PNG のバイト版 API を組み合わせる。ファイル名は呼び出し側から渡す。
-pub fn build_all_text_from_bytes(display_name: &str, bytes: &[u8]) -> String {
-    let mut buf = String::with_capacity(256);
-    buf.push_str(display_name);
-    buf.push(' ');
+/// バイト列から構築 (ZIP 内エントリ用。v1.x で使用予定)。
+pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourceText {
+    let mut out = PerSourceText::default();
+    out.name = normalize_for_match(display_name);
 
     if let Some(exif) = crate::exif_reader::read_exif_from_bytes(bytes, &[]) {
+        let mut buf = String::with_capacity(128);
         append_exif(&mut buf, &exif);
+        if !buf.trim().is_empty() {
+            out.exif = normalize_for_match(&buf);
+        }
     }
     if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(bytes) {
+        let mut buf = String::with_capacity(128);
         append_xmp(&mut buf, &xmp);
+        if !buf.trim().is_empty() {
+            out.xmp_tweet = normalize_for_match(&buf);
+        }
     }
     let png_text = crate::png_metadata::build_searchable_from_bytes(bytes);
     if !png_text.is_empty() {
-        buf.push_str(&png_text);
-        buf.push(' ');
+        out.png_prompt = normalize_for_match(&png_text);
     }
 
-    normalize_for_match(&buf)
+    out
+}
+
+/// PDF 用の構築。`name` は呼び出し側がパスから取り、`info_text` は PDFium document info の
+/// 既正規化前テキスト (Title / Author / Subject / Keywords 連結) を渡す。
+pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourceText {
+    PerSourceText {
+        name: normalize_for_match(display_name),
+        exif: String::new(),
+        xmp_tweet: String::new(),
+        png_prompt: String::new(),
+        pdf_meta: if info_text.is_empty() {
+            String::new()
+        } else {
+            normalize_for_match(info_text)
+        },
+    }
+}
+
+/// ファイル名のみ (ZIP など、メタを展開しないフォールバック) の最小版。
+pub fn build_per_source_name_only(display_name: &str) -> PerSourceText {
+    PerSourceText {
+        name: normalize_for_match(display_name),
+        ..PerSourceText::default()
+    }
 }
 
 fn append_exif(out: &mut String, info: &crate::exif_reader::ExifInfo) {
@@ -96,8 +185,7 @@ fn append_exif(out: &mut String, info: &crate::exif_reader::ExifInfo) {
 }
 
 fn append_xmp(out: &mut String, info: &crate::xmp_reader::XmpTweetInfo) {
-    // 検索で当たると価値のある情報を抜き出して連結。
-    // 全部 Option<String> なので空なら飛ばす。
+    // 検索で当たると価値のある情報を抜き出して連結。全部 Option<String> なので空なら飛ばす。
     let fields: [&Option<String>; 9] = [
         &info.tweet_id,
         &info.author_screen_name,
@@ -121,8 +209,6 @@ fn append_xmp(out: &mut String, info: &crate::xmp_reader::XmpTweetInfo) {
 
 #[cfg(test)]
 mod tests {
-    // PNG tEXt 経路の E2E 動作は既存の `png_metadata::tests` でカバー済み。
-    // ここでは ingest_text の連結・正規化ロジックのみを検証する。
     use super::*;
     use std::fs;
     use tempfile::TempDir;
@@ -132,29 +218,34 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("夕焼け_IMG_1234.jpg");
         fs::write(&path, b"not a real image").unwrap();
-        let text = build_all_text_for_file(&path);
-        assert!(text.contains("夕焼け_img_1234.jpg"), "text was: {text}");
+        let pst = build_per_source_for_file(&path);
+        assert!(pst.name.contains("夕焼け_img_1234.jpg"), "name={}", pst.name);
+        // 他フィールドは空
+        assert!(pst.exif.is_empty());
+        assert!(pst.xmp_tweet.is_empty());
+        assert!(pst.png_prompt.is_empty());
     }
 
     #[test]
-    fn is_lowercased() {
+    fn name_is_lowercased() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("CAMERA_PHOTO.JPG");
         fs::write(&path, b"").unwrap();
-        let text = build_all_text_for_file(&path);
-        // 大文字は残らない
-        assert!(!text.contains("CAMERA"));
-        assert!(text.contains("camera_photo.jpg"));
+        let pst = build_per_source_for_file(&path);
+        assert!(!pst.name.contains("CAMERA"));
+        assert!(pst.name.contains("camera_photo.jpg"));
     }
 
     #[test]
     fn non_image_file_returns_only_name() {
-        // EXIF / XMP / PNG 抽出が失敗しても panic しない。ファイル名は必ず返る。
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("note.txt");
         fs::write(&path, b"plain text").unwrap();
-        let text = build_all_text_for_file(&path);
-        assert!(text.trim() == "note.txt");
+        let pst = build_per_source_for_file(&path);
+        assert_eq!(pst.name.trim(), "note.txt");
+        assert!(pst.exif.is_empty());
+        assert!(pst.xmp_tweet.is_empty());
+        assert!(pst.png_prompt.is_empty());
     }
 
     #[test]
@@ -162,23 +253,61 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("empty.jpg");
         fs::write(&path, b"").unwrap();
-        let text = build_all_text_for_file(&path);
-        assert!(text.contains("empty.jpg"));
+        let pst = build_per_source_for_file(&path);
+        assert!(pst.name.contains("empty.jpg"));
     }
 
     #[test]
     fn nonexistent_path_returns_only_name() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("ghost.jpg");
-        // 存在しないファイルでも、file_name は Path から取れるので name は入る
-        let text = build_all_text_for_file(&path);
-        assert!(text.contains("ghost.jpg"));
+        let pst = build_per_source_for_file(&path);
+        assert!(pst.name.contains("ghost.jpg"));
     }
 
     #[test]
     fn build_from_bytes_works() {
-        let text = build_all_text_from_bytes("photo.jpg", b"no real metadata");
-        // ファイル名は必ず入る
-        assert!(text.contains("photo.jpg"));
+        let pst = build_per_source_from_bytes("photo.jpg", b"no real metadata");
+        assert!(pst.name.contains("photo.jpg"));
+    }
+
+    #[test]
+    fn pdf_helper_sets_pdf_meta_only() {
+        let pst = build_per_source_for_pdf("book.pdf", "Title: Example / Author: Alice");
+        assert!(pst.name.contains("book.pdf"));
+        assert!(pst.pdf_meta.contains("example"));
+        assert!(pst.pdf_meta.contains("alice"));
+        assert!(pst.exif.is_empty());
+        assert!(pst.xmp_tweet.is_empty());
+        assert!(pst.png_prompt.is_empty());
+    }
+
+    #[test]
+    fn combined_joins_non_empty_fields() {
+        let pst = PerSourceText {
+            name: "photo.jpg".into(),
+            exif: "canon 5d".into(),
+            xmp_tweet: "".into(),
+            png_prompt: "prompt text".into(),
+            pdf_meta: "".into(),
+        };
+        let c = pst.combined();
+        assert_eq!(c, "photo.jpg canon 5d prompt text");
+    }
+
+    #[test]
+    fn get_returns_correct_field() {
+        let pst = PerSourceText {
+            name: "n".into(),
+            exif: "e".into(),
+            xmp_tweet: "x".into(),
+            png_prompt: "p".into(),
+            pdf_meta: "m".into(),
+        };
+        assert_eq!(pst.get(SourceKind::Filename), "n");
+        assert_eq!(pst.get(SourceKind::Exif), "e");
+        assert_eq!(pst.get(SourceKind::XmpTweet), "x");
+        assert_eq!(pst.get(SourceKind::PngPrompt), "p");
+        assert_eq!(pst.get(SourceKind::PdfMeta), "m");
     }
 }

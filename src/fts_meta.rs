@@ -1,10 +1,10 @@
 //! `fts_meta.db` — 全文メタ検索のファイル単位メタ管理 + post-filter 用原文保存。
 //!
-//! docs/search-expansion-design.md §5.3, §5.6 に準拠する。
+//! docs/search-expansion-design.md §5.3, §5.6, §19.4 に準拠する。
 //!
 //! Tantivy インデックス (`fts_index/`) とは別 DB で、以下を担う:
 //! - お気に入り単位の登録ファイル追跡 (差分検出の基準)
-//! - `all_text_norm` の保存 (Ctrl+G post-filter での一括取得)
+//! - ソース別正規化テキストの保存 (Ctrl+G post-filter で target に応じた結合を行う)
 //! - `status=pending / ok / failed / tombstone` の二段整合性状態
 //! - ingest 世代カウンタ (`index_generation`) — 将来のスナップショット用
 //!
@@ -17,10 +17,31 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+use crate::fts_index::{IndexKind, SearchTarget, SourceKind};
+use crate::ingest_text::PerSourceText;
 use crate::search_index_db::normalize_path;
 
 /// スキーマ変更時に bump することで、次回起動時に全再インデックスをトリガする定数。
-pub const INDEX_VERSION: i64 = 1;
+/// v2 (§19): all_text_norm を per-source 5 カラムに分割 + kind カラム追加。
+pub const INDEX_VERSION: i64 = 2;
+
+fn kind_to_i64(kind: IndexKind) -> i64 {
+    match kind {
+        IndexKind::Folder => 0,
+        IndexKind::Image => 1,
+        IndexKind::Zip => 2,
+        IndexKind::Pdf => 3,
+    }
+}
+
+fn kind_from_i64(v: i64) -> IndexKind {
+    match v {
+        0 => IndexKind::Folder,
+        2 => IndexKind::Zip,
+        3 => IndexKind::Pdf,
+        _ => IndexKind::Image, // 1 / 不正値は Image にフォールバック
+    }
+}
 
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,14 +50,37 @@ pub struct FileMeta {
     pub path: String,
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,
+    pub kind: IndexKind,
     pub mtime: i64,
     pub file_size: i64,
     pub indexed_at: i64,
     pub index_version: i64,
     pub index_generation: i64,
     pub status: FileStatus,
-    /// post-filter で使う正規化済み全文。`search_norm::normalize_for_match` 済み。
-    pub all_text_norm: String,
+    /// `search_norm::normalize_for_match` 適用済み。以下同様。
+    pub norms: PerSourceText,
+}
+
+impl FileMeta {
+    /// post-filter 用: 選択された検索対象をスペース区切りで結合した文字列を返す。
+    pub fn combined_for_target(&self, target: &SearchTarget) -> String {
+        let sources: &[SourceKind] = match target {
+            SearchTarget::All => SourceKind::ALL,
+            SearchTarget::Only(v) => v.as_slice(),
+        };
+        let mut out = String::new();
+        for &src in sources {
+            let s = self.norms.get(src);
+            if s.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(s);
+        }
+        out
+    }
 }
 
 /// ingest と delete の二段整合性プロトコル用 (§5.6)。
@@ -88,51 +132,71 @@ impl FtsMetaDb {
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;",
         )?;
+        // §19.8: 旧スキーマ (INDEX_VERSION=1 / all_text_norm カラム) を検出したら files を破棄する。
+        // 新スキーマで CREATE TABLE IF NOT EXISTS → 空から再インデックスに入る。
+        // 同時に呼び出し側 (IndexerManager) が fts_index/ を wipe することで Tantivy 側も再構築される。
+        if needs_rebuild(&conn)? {
+            crate::logger::log(
+                "fts_meta: detected old schema (INDEX_VERSION < 2) — dropping `files` table for rebuild",
+            );
+            conn.execute_batch("DROP TABLE IF EXISTS files;")?;
+        }
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// status=pending で UPSERT。既存 row の generation を増やし、all_text_norm を更新する。
-    /// Tantivy への add_document 前に呼ばれる (§5.6.1 ステップ 1)。
+    /// status=pending で UPSERT。既存 row の generation を増やし、ソース別正規化テキストを更新する。
+    /// Tantivy への add_document 前に呼ばれる (§5.6.1 ステップ 1 / §19.4)。
     pub fn mark_pending(
         &self,
         path: &str,
         favorite_id: Uuid,
         favorite_root: &Path,
+        kind: IndexKind,
         mtime: i64,
         file_size: i64,
-        all_text_norm: &str,
+        norms: &PerSourceText,
     ) -> rusqlite::Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = now_epoch();
-        // generation は UPSERT 時に +1 する (旧 row があるなら)。CTE で現行値 +1 を計算。
         conn.execute(
             "INSERT INTO files (
-                path, favorite_id, favorite_root, mtime, file_size,
-                indexed_at, index_version, index_generation, status, all_text_norm
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
+                path, favorite_id, favorite_root, kind, mtime, file_size,
+                indexed_at, index_version, index_generation, status,
+                name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(path) DO UPDATE SET
                 favorite_id = excluded.favorite_id,
                 favorite_root = excluded.favorite_root,
+                kind = excluded.kind,
                 mtime = excluded.mtime,
                 file_size = excluded.file_size,
                 indexed_at = excluded.indexed_at,
                 index_version = excluded.index_version,
                 index_generation = files.index_generation + 1,
                 status = 1,
-                all_text_norm = excluded.all_text_norm",
+                name_norm = excluded.name_norm,
+                exif_norm = excluded.exif_norm,
+                xmp_tweet_norm = excluded.xmp_tweet_norm,
+                png_prompt_norm = excluded.png_prompt_norm,
+                pdf_meta_norm = excluded.pdf_meta_norm",
             params![
                 path,
                 favorite_id.to_string(),
                 favorite_root.to_string_lossy().into_owned(),
+                kind_to_i64(kind),
                 mtime,
                 file_size,
                 now,
                 INDEX_VERSION,
                 FileStatus::Pending as i64,
-                all_text_norm,
+                norms.name,
+                norms.exif,
+                norms.xmp_tweet,
+                norms.png_prompt,
+                norms.pdf_meta,
             ],
         )?;
         let gen_val: i64 = conn.query_row(
@@ -220,35 +284,65 @@ impl FtsMetaDb {
         Ok(deleted)
     }
 
-    /// post-filter 用: 指定 path 群の all_text_norm を一括取得 (§9.1 ステップ 5)。
+    /// post-filter 用: 指定 path 群の「対象ソースを結合した正規化テキスト」を一括取得する (§19.4)。
     ///
     /// **`status = 0 (Ok)` のみを返す** (Codex 6 回目指摘 #5)。
     /// pending / failed / tombstone は除外:
-    ///   - pending: ingest 進行中で all_text_norm が新しいが Tantivy 側は古い snapshot →
+    ///   - pending: ingest 進行中でテキストが新しいが Tantivy 側は古い snapshot →
     ///     二段整合性を保つため検索結果から外す
-    ///   - failed: メタ抽出失敗で all_text_norm が不完全な可能性
+    ///   - failed: メタ抽出失敗で不完全な可能性
     ///   - tombstone: 削除済み (Tantivy 側は commit 待ち)
     ///
-    /// 戻り値は入力 path 順不同の `Vec<(path, all_text_norm)>`。
-    pub fn lookup_all_text_norm(
+    /// `target` で選択されたソース列だけを結合する。`SearchTarget::All` は 5 列全部。
+    /// 戻り値は入力 path 順不同の `Vec<(path, combined_norm_text)>`。
+    pub fn lookup_norms_for_target(
         &self,
         paths: &[String],
+        target: &SearchTarget,
     ) -> rusqlite::Result<Vec<(String, String)>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
         let placeholders = (0..paths.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        // 全列を SELECT して Rust 側で結合する (target による動的 SQL の複雑さを避ける)。
         let sql = format!(
-            "SELECT path, all_text_norm FROM files \
-             WHERE path IN ({}) AND status = 0",
+            "SELECT path, name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm \
+             FROM files WHERE path IN ({}) AND status = 0",
             placeholders
         );
         let mut stmt = conn.prepare(&sql)?;
         let params_vec: Vec<&dyn rusqlite::ToSql> =
             paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let sources: &[SourceKind] = match target {
+            SearchTarget::All => SourceKind::ALL,
+            SearchTarget::Only(v) => v.as_slice(),
+        };
         let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let path: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let exif: String = row.get(2)?;
+            let xmp: String = row.get(3)?;
+            let png: String = row.get(4)?;
+            let pdf: String = row.get(5)?;
+            let mut out = String::new();
+            for &src in sources {
+                let s = match src {
+                    SourceKind::Filename => &name,
+                    SourceKind::Exif => &exif,
+                    SourceKind::XmpTweet => &xmp,
+                    SourceKind::PngPrompt => &png,
+                    SourceKind::PdfMeta => &pdf,
+                };
+                if s.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+            Ok((path, out))
         })?;
         let mut out = Vec::with_capacity(paths.len());
         for row in rows {
@@ -319,11 +413,7 @@ impl FtsMetaDb {
     /// 起動時 reconciliation (§5.6.3) 用。status != 0 の行を全部取る。
     pub fn list_not_ok(&self) -> rusqlite::Result<Vec<FileMeta>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT path, favorite_id, favorite_root, mtime, file_size,
-                    indexed_at, index_version, index_generation, status, all_text_norm
-             FROM files WHERE status != 0",
-        )?;
+        let mut stmt = conn.prepare(FILEMETA_SELECT_SQL_NOT_OK)?;
         let rows = stmt.query_map([], row_to_filemeta)?;
         let mut out = Vec::new();
         for row in rows {
@@ -335,14 +425,8 @@ impl FtsMetaDb {
     /// テスト / デバッグ用: 単一 path の行を取得。
     pub fn get(&self, path: &str) -> rusqlite::Result<Option<FileMeta>> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT path, favorite_id, favorite_root, mtime, file_size,
-                    indexed_at, index_version, index_generation, status, all_text_norm
-             FROM files WHERE path = ?1",
-            params![path],
-            row_to_filemeta,
-        )
-        .optional()
+        conn.query_row(FILEMETA_SELECT_SQL_BY_PATH, params![path], row_to_filemeta)
+            .optional()
     }
 
     /// favorite_id でフィルタしつつ総数と status 別の件数を返す。
@@ -373,25 +457,102 @@ impl FtsMetaDb {
     }
 }
 
+const FILEMETA_SELECT_COLUMNS: &str =
+    "path, favorite_id, favorite_root, kind, mtime, file_size, \
+     indexed_at, index_version, index_generation, status, \
+     name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm";
+
+const FILEMETA_SELECT_SQL_NOT_OK: &str =
+    "SELECT path, favorite_id, favorite_root, kind, mtime, file_size, \
+            indexed_at, index_version, index_generation, status, \
+            name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm \
+     FROM files WHERE status != 0";
+
+const FILEMETA_SELECT_SQL_BY_PATH: &str =
+    "SELECT path, favorite_id, favorite_root, kind, mtime, file_size, \
+            indexed_at, index_version, index_generation, status, \
+            name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm \
+     FROM files WHERE path = ?1";
+
 fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let uuid_str: String = row.get(1)?;
     let favorite_id = Uuid::parse_str(&uuid_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let favorite_root: String = row.get(2)?;
-    let status_i: i64 = row.get(8)?;
+    let kind_i: i64 = row.get(3)?;
+    let status_i: i64 = row.get(9)?;
     Ok(FileMeta {
         path: row.get(0)?,
         favorite_id,
         favorite_root: PathBuf::from(favorite_root),
-        mtime: row.get(3)?,
-        file_size: row.get(4)?,
-        indexed_at: row.get(5)?,
-        index_version: row.get(6)?,
-        index_generation: row.get(7)?,
+        kind: kind_from_i64(kind_i),
+        mtime: row.get(4)?,
+        file_size: row.get(5)?,
+        indexed_at: row.get(6)?,
+        index_version: row.get(7)?,
+        index_generation: row.get(8)?,
         status: FileStatus::from_i64(status_i),
-        all_text_norm: row.get(9)?,
+        norms: PerSourceText {
+            name: row.get(10)?,
+            exif: row.get(11)?,
+            xmp_tweet: row.get(12)?,
+            png_prompt: row.get(13)?,
+            pdf_meta: row.get(14)?,
+        },
     })
+}
+
+// 参照先エラー防止用: 使用しないが、定数の死コード警告を抑制する。
+#[allow(dead_code)]
+const _ASSERT_FILEMETA_COLS_USED: &str = FILEMETA_SELECT_COLUMNS;
+
+/// 既存の `files` テーブルが旧スキーマ (INDEX_VERSION=1 時代) かを判定する (§19.8)。
+///
+/// 判定方針: `files` が存在し、かつ以下のいずれかに該当すれば旧版:
+/// - `all_text_norm` カラムが残っている (v1 → v2 移行前)
+/// - `index_version` 列の MIN 値が `INDEX_VERSION` より小さい (将来的な v2 → v3 移行用)
+///
+/// テーブルが存在しなければ `false` (新規作成なので rebuild 不要)。
+fn needs_rebuild(conn: &Connection) -> rusqlite::Result<bool> {
+    // files テーブル自体が無い新規 DB なら rebuild 不要
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !has_table {
+        return Ok(false);
+    }
+    // 旧カラム検出
+    let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
+    let mut has_all_text_norm = false;
+    let mut has_name_norm = false;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    for r in rows {
+        let name = r?;
+        if name == "all_text_norm" {
+            has_all_text_norm = true;
+        }
+        if name == "name_norm" {
+            has_name_norm = true;
+        }
+    }
+    drop(stmt);
+    if has_all_text_norm || !has_name_norm {
+        return Ok(true);
+    }
+    // index_version が古い行が残っている (過去にこの DB で別バージョンを使っていた等)
+    let min_ver: Option<i64> = conn
+        .query_row("SELECT MIN(index_version) FROM files", [], |row| row.get(0))
+        .optional()?;
+    Ok(matches!(min_ver, Some(v) if v < INDEX_VERSION))
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -400,16 +561,22 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             path              TEXT PRIMARY KEY,
             favorite_id       TEXT NOT NULL,
             favorite_root     TEXT NOT NULL,
+            kind              INTEGER NOT NULL DEFAULT 1,
             mtime             INTEGER NOT NULL,
             file_size         INTEGER NOT NULL,
             indexed_at        INTEGER NOT NULL,
             index_version     INTEGER NOT NULL,
             index_generation  INTEGER NOT NULL,
             status            INTEGER NOT NULL,
-            all_text_norm     TEXT NOT NULL DEFAULT ''
+            name_norm         TEXT NOT NULL DEFAULT '',
+            exif_norm         TEXT NOT NULL DEFAULT '',
+            xmp_tweet_norm    TEXT NOT NULL DEFAULT '',
+            png_prompt_norm   TEXT NOT NULL DEFAULT '',
+            pdf_meta_norm     TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS idx_files_fav       ON files(favorite_id);
          CREATE INDEX IF NOT EXISTS idx_files_fav_mtime ON files(favorite_id, mtime);
+         CREATE INDEX IF NOT EXISTS idx_files_fav_kind  ON files(favorite_id, kind);
          CREATE INDEX IF NOT EXISTS idx_files_status    ON files(status) WHERE status != 0;",
     )?;
     Ok(())
@@ -458,6 +625,13 @@ mod tests {
         (dir, db)
     }
 
+    fn norms_named(name: &str) -> PerSourceText {
+        PerSourceText {
+            name: name.to_string(),
+            ..PerSourceText::default()
+        }
+    }
+
     #[test]
     fn create_and_list_empty() {
         let (_tmp, db) = tmp_db();
@@ -471,15 +645,25 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/photos");
+        let n1 = norms_named("text a");
         let gen1 = db
-            .mark_pending("c:/photos/a.jpg", fav, &root, 100, 2048, "text a")
+            .mark_pending(
+                "c:/photos/a.jpg",
+                fav,
+                &root,
+                IndexKind::Image,
+                100,
+                2048,
+                &n1,
+            )
             .unwrap();
         assert_eq!(gen1, 1, "初回 ingest の generation は 1");
 
         // 状態: pending
         let got = db.get("c:/photos/a.jpg").unwrap().unwrap();
         assert_eq!(got.status, FileStatus::Pending);
-        assert_eq!(got.all_text_norm, "text a");
+        assert_eq!(got.norms.name, "text a");
+        assert_eq!(got.kind, IndexKind::Image);
         assert_eq!(got.index_generation, 1);
         assert_eq!(got.favorite_id, fav);
 
@@ -489,13 +673,22 @@ mod tests {
         assert_eq!(got.status, FileStatus::Ok);
 
         // 同じ path で再 ingest → generation += 1
+        let n2 = norms_named("text a updated");
         let gen2 = db
-            .mark_pending("c:/photos/a.jpg", fav, &root, 200, 2100, "text a updated")
+            .mark_pending(
+                "c:/photos/a.jpg",
+                fav,
+                &root,
+                IndexKind::Image,
+                200,
+                2100,
+                &n2,
+            )
             .unwrap();
         assert_eq!(gen2, 2);
         let got = db.get("c:/photos/a.jpg").unwrap().unwrap();
         assert_eq!(got.status, FileStatus::Pending);
-        assert_eq!(got.all_text_norm, "text a updated");
+        assert_eq!(got.norms.name, "text a updated");
     }
 
     #[test]
@@ -503,23 +696,45 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/1.jpg", fav, &root, 1, 10, "one")
-            .unwrap();
-        db.mark_pending("c:/p/2.jpg", fav, &root, 2, 20, "two")
-            .unwrap();
+        db.mark_pending(
+            "c:/p/1.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            1,
+            10,
+            &norms_named("one"),
+        )
+        .unwrap();
+        db.mark_pending(
+            "c:/p/2.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            2,
+            20,
+            &norms_named("two"),
+        )
+        .unwrap();
         db.mark_ok(&["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()])
             .unwrap();
 
         // lookup で両方返る
         let rows = db
-            .lookup_all_text_norm(&["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()])
+            .lookup_norms_for_target(
+                &["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()],
+                &SearchTarget::All,
+            )
             .unwrap();
         assert_eq!(rows.len(), 2);
 
         // tombstone 後は除外される
         db.mark_tombstone(&["c:/p/1.jpg".to_string()]).unwrap();
         let rows = db
-            .lookup_all_text_norm(&["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()])
+            .lookup_norms_for_target(
+                &["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()],
+                &SearchTarget::All,
+            )
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "c:/p/2.jpg");
@@ -532,17 +747,17 @@ mod tests {
 
     #[test]
     fn list_favorite_files_returns_only_ok() {
-        // Codex 6 回目指摘 #6: list_favorite_files は status=Ok のみ返す
         let (_tmp, db) = tmp_db();
         let fav_a = Uuid::new_v4();
         let fav_b = Uuid::new_v4();
         let root_a = PathBuf::from("C:/a");
         let root_b = PathBuf::from("C:/b");
-        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, 1, 1, "")
+        let empty = PerSourceText::default();
+        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, IndexKind::Image, 1, 1, &empty)
             .unwrap();
-        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, 2, 2, "")
+        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, IndexKind::Image, 2, 2, &empty)
             .unwrap();
-        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, 3, 3, "")
+        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 3, 3, &empty)
             .unwrap();
 
         // 全部 pending のまま → list_favorite_files には出てこない
@@ -554,10 +769,8 @@ mod tests {
             .unwrap();
         let a = db.list_favorite_files(fav_a).unwrap();
         assert_eq!(a.len(), 2);
-        // fav_b は pending のままなので空
         assert!(db.list_favorite_files(fav_b).unwrap().is_empty());
 
-        // fav_b の pending は list_not_ok_paths で拾える (reconciliation hook)
         let not_ok = db.list_not_ok_paths(fav_b).unwrap();
         assert_eq!(not_ok.len(), 1);
         assert_eq!(not_ok[0].0, "c:/b/1.jpg");
@@ -565,36 +778,109 @@ mod tests {
     }
 
     #[test]
-    fn lookup_all_text_norm_returns_only_ok() {
-        // Codex 6 回目指摘 #5: lookup_all_text_norm は status=Ok のみ返す
+    fn lookup_norms_for_target_returns_only_ok() {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/a.jpg", fav, &root, 1, 1, "alpha")
-            .unwrap();
-        db.mark_pending("c:/p/b.jpg", fav, &root, 2, 2, "beta")
-            .unwrap();
+        db.mark_pending(
+            "c:/p/a.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            1,
+            1,
+            &norms_named("alpha"),
+        )
+        .unwrap();
+        db.mark_pending(
+            "c:/p/b.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            2,
+            2,
+            &norms_named("beta"),
+        )
+        .unwrap();
 
         // 両方 pending → lookup は空
         let rows = db
-            .lookup_all_text_norm(&["c:/p/a.jpg".to_string(), "c:/p/b.jpg".to_string()])
+            .lookup_norms_for_target(
+                &["c:/p/a.jpg".to_string(), "c:/p/b.jpg".to_string()],
+                &SearchTarget::All,
+            )
             .unwrap();
         assert!(rows.is_empty(), "pending は post-filter に含めない");
 
         // ok に遷移 → 返る
         db.mark_ok(&["c:/p/a.jpg".to_string()]).unwrap();
         let rows = db
-            .lookup_all_text_norm(&["c:/p/a.jpg".to_string(), "c:/p/b.jpg".to_string()])
+            .lookup_norms_for_target(
+                &["c:/p/a.jpg".to_string(), "c:/p/b.jpg".to_string()],
+                &SearchTarget::All,
+            )
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "c:/p/a.jpg");
+        assert_eq!(rows[0].1, "alpha");
 
         // failed に遷移 → 除外
         db.mark_failed("c:/p/a.jpg").unwrap();
         let rows = db
-            .lookup_all_text_norm(&["c:/p/a.jpg".to_string()])
+            .lookup_norms_for_target(&["c:/p/a.jpg".to_string()], &SearchTarget::All)
             .unwrap();
         assert!(rows.is_empty(), "failed も post-filter から除外");
+    }
+
+    #[test]
+    fn lookup_norms_for_target_selects_requested_sources() {
+        // §19.6: Only(&[Exif]) では exif_norm 列のみが結合対象になる。
+        let (_tmp, db) = tmp_db();
+        let fav = Uuid::new_v4();
+        let root = PathBuf::from("C:/p");
+        let norms = PerSourceText {
+            name: "file.jpg".into(),
+            exif: "canon exif".into(),
+            xmp_tweet: "tweet body".into(),
+            png_prompt: "".into(),
+            pdf_meta: "".into(),
+        };
+        db.mark_pending(
+            "c:/p/a.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            1,
+            1,
+            &norms,
+        )
+        .unwrap();
+        db.mark_ok(&["c:/p/a.jpg".to_string()]).unwrap();
+
+        // Only(Exif) → "canon exif" のみ
+        let rows = db
+            .lookup_norms_for_target(
+                &["c:/p/a.jpg".to_string()],
+                &SearchTarget::Only(vec![SourceKind::Exif]),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "canon exif");
+
+        // Only(XmpTweet) → "tweet body" のみ
+        let rows = db
+            .lookup_norms_for_target(
+                &["c:/p/a.jpg".to_string()],
+                &SearchTarget::Only(vec![SourceKind::XmpTweet]),
+            )
+            .unwrap();
+        assert_eq!(rows[0].1, "tweet body");
+
+        // All → 全ソース結合 (空列はスキップ)
+        let rows = db
+            .lookup_norms_for_target(&["c:/p/a.jpg".to_string()], &SearchTarget::All)
+            .unwrap();
+        assert_eq!(rows[0].1, "file.jpg canon exif tweet body");
     }
 
     #[test]
@@ -602,13 +888,16 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/x");
-        db.mark_pending("c:/x/1.jpg", fav, &root, 1, 1, "").unwrap();
-        db.mark_pending("c:/x/2.jpg", fav, &root, 2, 2, "").unwrap();
-        db.mark_pending("c:/x/3.jpg", fav, &root, 3, 3, "").unwrap();
+        let empty = PerSourceText::default();
+        db.mark_pending("c:/x/1.jpg", fav, &root, IndexKind::Image, 1, 1, &empty)
+            .unwrap();
+        db.mark_pending("c:/x/2.jpg", fav, &root, IndexKind::Image, 2, 2, &empty)
+            .unwrap();
+        db.mark_pending("c:/x/3.jpg", fav, &root, IndexKind::Image, 3, 3, &empty)
+            .unwrap();
 
         db.mark_ok(&["c:/x/1.jpg".to_string()]).unwrap();
         db.mark_failed("c:/x/2.jpg").unwrap();
-        // 3 は pending のまま
 
         let not_ok = db.list_not_ok().unwrap();
         assert_eq!(not_ok.len(), 2);
@@ -622,15 +911,23 @@ mod tests {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/y");
+        let empty = PerSourceText::default();
         for i in 0..5 {
-            db.mark_pending(&format!("c:/y/{}.jpg", i), fav, &root, i, 1, "")
-                .unwrap();
+            db.mark_pending(
+                &format!("c:/y/{}.jpg", i),
+                fav,
+                &root,
+                IndexKind::Image,
+                i,
+                1,
+                &empty,
+            )
+            .unwrap();
         }
         db.mark_ok(&["c:/y/0.jpg".to_string(), "c:/y/1.jpg".to_string()])
             .unwrap();
         db.mark_failed("c:/y/2.jpg").unwrap();
         db.mark_tombstone(&["c:/y/3.jpg".to_string()]).unwrap();
-        // 4 は pending のまま
 
         let c = db.count_by_status(fav).unwrap();
         assert_eq!(c.ok, 2);
@@ -642,20 +939,102 @@ mod tests {
     }
 
     #[test]
+    fn opening_old_schema_db_drops_and_rebuilds() {
+        // §19.8 マイグレーション回帰: 旧 v1 スキーマの DB を開いたら自動で drop → recreate する。
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+
+        // 旧スキーマの files テーブルを手動で作る (all_text_norm カラム有、name_norm 無)
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY,
+                    favorite_id TEXT NOT NULL,
+                    favorite_root TEXT NOT NULL,
+                    mtime INTEGER NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    indexed_at INTEGER NOT NULL,
+                    index_version INTEGER NOT NULL,
+                    index_generation INTEGER NOT NULL,
+                    status INTEGER NOT NULL,
+                    all_text_norm TEXT NOT NULL DEFAULT ''
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, favorite_id, favorite_root, mtime, file_size,
+                 indexed_at, index_version, index_generation, status, all_text_norm)
+                 VALUES ('c:/old.jpg', ?1, 'C:/', 1, 1, 1, 1, 1, 0, 'legacy')",
+                params![Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+        }
+
+        // open_at が new schema で再構築する
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+
+        // 旧行は消えている
+        assert!(db.get("c:/old.jpg").unwrap().is_none(), "旧データは消えた");
+
+        // 新しい mark_pending が通る
+        let fav = Uuid::new_v4();
+        db.mark_pending(
+            "c:/new.jpg",
+            fav,
+            std::path::Path::new("C:/"),
+            IndexKind::Image,
+            1,
+            1,
+            &norms_named("new"),
+        )
+        .unwrap();
+        let row = db.get("c:/new.jpg").unwrap().unwrap();
+        assert_eq!(row.norms.name, "new");
+    }
+
+    #[test]
+    fn opening_fresh_db_does_not_trigger_rebuild() {
+        // 新規 DB (files テーブルすら無い) では rebuild パスに入らず、そのまま init_schema が走る。
+        let dir = TempDir::new().unwrap();
+        let db = FtsMetaDb::open_at(&dir.path().join("fresh.db")).unwrap();
+        assert!(db.list_not_ok().unwrap().is_empty());
+    }
+
+    #[test]
     fn lookup_returns_only_matching_paths() {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/z");
-        db.mark_pending("c:/z/a.jpg", fav, &root, 1, 1, "alpha")
-            .unwrap();
-        db.mark_pending("c:/z/b.jpg", fav, &root, 2, 2, "beta")
-            .unwrap();
+        db.mark_pending(
+            "c:/z/a.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            1,
+            1,
+            &norms_named("alpha"),
+        )
+        .unwrap();
+        db.mark_pending(
+            "c:/z/b.jpg",
+            fav,
+            &root,
+            IndexKind::Image,
+            2,
+            2,
+            &norms_named("beta"),
+        )
+        .unwrap();
         db.mark_ok(&["c:/z/a.jpg".to_string(), "c:/z/b.jpg".to_string()])
             .unwrap();
 
         // 存在しない path を含むクエリでも、存在するものだけ返る
         let rows = db
-            .lookup_all_text_norm(&["c:/z/a.jpg".to_string(), "c:/z/missing.jpg".to_string()])
+            .lookup_norms_for_target(
+                &["c:/z/a.jpg".to_string(), "c:/z/missing.jpg".to_string()],
+                &SearchTarget::All,
+            )
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "c:/z/a.jpg");

@@ -340,10 +340,16 @@ impl IndexerManager {
     /// Ctrl+G 検索を別スレッドで起動する。
     /// `favorite_ids` は `auto_index_metadata = true` な favorite の UUID (IndexerManager が
     /// 実際に supervisor を立てているものに限られる)。
+    /// `scope` はタイプ / 検索対象ドロップダウンの選択 (§19)。既定は全開放。
     ///
     /// 戻り値の `SearchHandle` を drop すると自動的に cancel が立つ (受信側の `rx` drop で
     /// 送信側が break することに依存)。明示的に cancel したい場合は `handle.cancel.store(true)`。
-    pub fn spawn_search(&self, query: String, favorite_ids: Vec<Uuid>) -> SearchHandle {
+    pub fn spawn_search(
+        &self,
+        query: String,
+        favorite_ids: Vec<Uuid>,
+        scope: crate::global_search::SearchScope,
+    ) -> SearchHandle {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx): (Sender<SearchStreamEvent>, Receiver<SearchStreamEvent>) =
             crossbeam_channel::unbounded();
@@ -354,20 +360,33 @@ impl IndexerManager {
         std::thread::Builder::new()
             .name("ctrl-g-search".to_string())
             .spawn(move || {
-                crate::global_search::run(&query, &favorite_ids, &fts, &meta_db, &cancel_cl, &tx);
+                crate::global_search::run(
+                    &query,
+                    &favorite_ids,
+                    &scope,
+                    &fts,
+                    &meta_db,
+                    &cancel_cl,
+                    &tx,
+                );
             })
             .ok();
 
         SearchHandle { cancel, rx }
     }
 
-    /// Ctrl+F (ローカルメタ検索) 用: 指定 path 群の all_text_norm を同期取得する。
+    /// Ctrl+F (ローカルメタ検索) 用: 指定 path 群のソース別正規化テキストを同期取得する (§19.4)。
     ///
     /// **UI スレッドから直接呼ばないこと** — App 側の worker 経由で呼ぶ契約。
-    /// 返るのは (path, all_text_norm) で、status != ok の path は含まれない。
-    pub fn lookup_local_texts(&self, paths: &[String]) -> Result<Vec<(String, String)>, String> {
+    /// 返るのは (path, combined_norm_for_target) で、status != ok の path は含まれない。
+    /// `target = SearchTarget::All` を渡せば 5 ソース結合 (旧 all_text_norm 互換)。
+    pub fn lookup_local_texts(
+        &self,
+        paths: &[String],
+        target: &crate::fts_index::SearchTarget,
+    ) -> Result<Vec<(String, String)>, String> {
         self.meta_db
-            .lookup_all_text_norm(paths)
+            .lookup_norms_for_target(paths, target)
             .map_err(|e| format!("{e}"))
     }
 
@@ -596,10 +615,18 @@ struct ReconciliationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fts_index::{Container, IndexDoc, upsert_doc};
+    use crate::fts_index::{Container, IndexDoc, IndexKind, QueryFilters, upsert_doc};
+    use crate::ingest_text::PerSourceText;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    fn txt_norms(name: &str) -> PerSourceText {
+        PerSourceText {
+            name: name.to_string(),
+            ..PerSourceText::default()
+        }
+    }
 
     fn mk_fav(name: &str, path: &std::path::Path, metadata: bool) -> FavoriteEntry {
         let mut fav = FavoriteEntry::new(name.to_string(), path.to_path_buf());
@@ -621,8 +648,16 @@ mod tests {
         let fav = mk_fav("A", &fav_root, true);
 
         // pending 行を手動で作る (crash 残留シミュ)
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "txt")
-            .unwrap();
+        meta.mark_pending(
+            "c:/a/1.jpg",
+            fav.id,
+            &fav_root,
+            IndexKind::Image,
+            1,
+            1,
+            &txt_norms("txt"),
+        )
+        .unwrap();
         // Tantivy にも入れておく (writer は scope 内で drop して lockfile を解放する)
         {
             let mut w = fts.writer().unwrap();
@@ -634,10 +669,14 @@ mod tests {
                     container: Container::Fs,
                     zip_entry: String::new(),
                     favorite_id: fav.id,
+                    kind: IndexKind::Image,
                     mtime: 1,
                     file_size: 1,
-                    name: "1.jpg".into(),
-                    all_text: "txt".into(),
+                    name: "1.jpg txt".into(),
+                    exif_text: String::new(),
+                    xmp_tweet_text: String::new(),
+                    png_prompt_text: String::new(),
+                    pdf_meta_text: String::new(),
                 },
             )
             .unwrap();
@@ -655,8 +694,16 @@ mod tests {
 
         // Tantivy 側も delete_doc + commit 済み
         fts.reload_reader().unwrap();
-        let q = crate::fts_index::build_bigram_and_query(fts.fields(), &["txt"], Some(&[fav.id]))
-            .unwrap();
+        let favs = [fav.id];
+        let q = crate::fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["txt"],
+            &QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let searcher = fts.searcher();
         let hits = crate::fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 0, "Tantivy からも削除されているはず");
@@ -672,8 +719,16 @@ mod tests {
         let fav = mk_fav("A", &fav_root, true);
 
         // tombstone 行を作る
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t")
-            .unwrap();
+        meta.mark_pending(
+            "c:/a/1.jpg",
+            fav.id,
+            &fav_root,
+            IndexKind::Image,
+            1,
+            1,
+            &txt_norms("t"),
+        )
+        .unwrap();
         meta.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
         meta.mark_tombstone(&["c:/a/1.jpg".to_string()]).unwrap();
 
@@ -694,8 +749,16 @@ mod tests {
         // metadata フラグ OFF
         let fav = mk_fav("A", &fav_root, false);
 
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, 1, 1, "t")
-            .unwrap();
+        meta.mark_pending(
+            "c:/a/1.jpg",
+            fav.id,
+            &fav_root,
+            IndexKind::Image,
+            1,
+            1,
+            &txt_norms("t"),
+        )
+        .unwrap();
 
         let mut rw = fts.writer().unwrap();
         let r = run_reconciliation(&meta, &fts, &mut rw, &[fav]).unwrap();
@@ -725,7 +788,16 @@ mod tests {
         let fts_cl = Arc::clone(&fts);
         let cancel_cl = Arc::clone(&cancel);
         std::thread::spawn(move || {
-            crate::global_search::run("dummy", &[fav_id], &fts_cl, &meta_cl, &cancel_cl, &tx);
+            let scope = crate::global_search::SearchScope::default();
+            crate::global_search::run(
+                "dummy",
+                &[fav_id],
+                &scope,
+                &fts_cl,
+                &meta_cl,
+                &cancel_cl,
+                &tx,
+            );
         });
         // 何らかの SearchStreamEvent が返ることを確認
         let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();

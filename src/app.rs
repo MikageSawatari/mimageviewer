@@ -263,6 +263,15 @@ fn stem_lower(path: &std::path::Path) -> String {
 }
 
 /// ファイルパスが PNG 拡張子か (大文字小文字無視)。
+/// 現在の target が指定ソースを含むかを判定 (§19.6)。
+/// `All` は常に true、`Only(v)` は v.contains(&source)。
+fn target_includes(target: &crate::fts_index::SearchTarget, source: crate::fts_index::SourceKind) -> bool {
+    match target {
+        crate::fts_index::SearchTarget::All => true,
+        crate::fts_index::SearchTarget::Only(v) => v.contains(&source),
+    }
+}
+
 fn is_png_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -354,6 +363,7 @@ fn run_metadata_search(
     items: &[GridItem],
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
+    target: &crate::fts_index::SearchTarget,
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -378,7 +388,7 @@ fn run_metadata_search(
                 _ => None,
             })
             .collect();
-        match db.lookup_all_text_norm(&keys) {
+        match db.lookup_norms_for_target(&keys, target) {
             Ok(rows) => rows.into_iter().collect(),
             Err(e) => {
                 crate::logger::log(format!("Ctrl+F: fts_meta lookup failed: {e}"));
@@ -437,6 +447,13 @@ fn run_metadata_search(
     }
 
     // Pass 2: Image/Video — cheap hay で決まらなければ XMP を lazy 読み取り (ファイル I/O)
+    //
+    // §19 target フィルタ対応: target が全ソース (All) なら従来挙動。単一ソース選択時は
+    // そのソース由来の文字列だけで hay を作り、非対象ソースの I/O もスキップする。
+    let use_name = target_includes(target, crate::fts_index::SourceKind::Filename);
+    let use_png = target_includes(target, crate::fts_index::SourceKind::PngPrompt);
+    let use_exif = target_includes(target, crate::fts_index::SourceKind::Exif);
+    let use_xmp = target_includes(target, crate::fts_index::SourceKind::XmpTweet);
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -453,7 +470,7 @@ fn run_metadata_search(
         if is_image {
             let key = crate::search_index_db::normalize_path(path);
             if let Some(preloaded) = preloaded_texts.get(&key) {
-                // all_text_norm には既にファイル名・EXIF・XMP・PNG tEXt が全部含まれている
+                // preloaded は target で既に列選択済み (lookup_norms_for_target)
                 if crate::search_query::matches(tokens, preloaded) {
                     matches.insert(idx);
                 }
@@ -466,13 +483,13 @@ fn run_metadata_search(
             .unwrap_or("")
             .to_string();
         // 最初は PNG tEXt だけ読む (cheap hay)。EXIF / XMP は NeedsMore の時だけ lazy 読み。
-        // EXIF を fallback にも含める方針 (Codex round-8 Should-fix #1) はその branch で実施。
-        let meta_text = if is_image && is_png_path(path) {
+        let meta_text = if is_image && use_png && is_png_path(path) {
             crate::png_metadata::build_searchable_from_path(path)
         } else {
             String::new()
         };
-        let hay_no_xmp = hay_of(&meta_text, &name, None);
+        let name_for_hay = if use_name { name.as_str() } else { "" };
+        let hay_no_xmp = hay_of(&meta_text, name_for_hay, None);
         match crate::search_query::decide_partial(tokens, &hay_no_xmp) {
             crate::search_query::PartialResult::Decided(true) => {
                 matches.insert(idx);
@@ -480,23 +497,24 @@ fn run_metadata_search(
             crate::search_query::PartialResult::Decided(false) => {}
             crate::search_query::PartialResult::NeedsMore => {
                 let key = crate::adjustment_db::normalize_path(path);
-                // スナップショット → ローカル追加分 → 今読む、の順でルックアップ。
-                // &Option<XmpTweetInfo> の借用ライフタイムを揃えるため clone を介す。
-                let xmp_opt = if let Some(cached) = xmp_snapshot.get(&key) {
-                    cached.clone()
-                } else if let Some(added) = additions_lookup.get(&key) {
-                    added.clone()
+                // XMP は target に含まれる場合のみ読む (I/O 節約)
+                let xmp_opt = if use_xmp {
+                    if let Some(cached) = xmp_snapshot.get(&key) {
+                        cached.clone()
+                    } else if let Some(added) = additions_lookup.get(&key) {
+                        added.clone()
+                    } else {
+                        let xmp = crate::xmp_reader::read_tweet_info(path);
+                        additions_lookup.insert(key.clone(), xmp.clone());
+                        xmp_additions.push((key.clone(), xmp.clone()));
+                        xmp
+                    }
                 } else {
-                    let xmp = crate::xmp_reader::read_tweet_info(path);
-                    additions_lookup.insert(key.clone(), xmp.clone());
-                    xmp_additions.push((key.clone(), xmp.clone()));
-                    xmp
+                    None
                 };
-                // Codex round-8 Should-fix #1: fast path (fts_meta.all_text_norm) と互換に
-                // するため、fallback でも EXIF を検索対象に含める。EXIF 読みはファイル I/O
-                // なので NeedsMore の時だけ遅延実行する。
+                // EXIF も同じく target に含まれる時だけ
                 let mut extended_meta = meta_text.clone();
-                if is_image {
+                if is_image && use_exif {
                     if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
                         let exif_part = exif_hay(&exif);
                         if !exif_part.is_empty() {
@@ -507,7 +525,7 @@ fn run_metadata_search(
                         }
                     }
                 }
-                let hay = hay_of(&extended_meta, &name, xmp_opt.as_ref());
+                let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());
                 if crate::search_query::matches(tokens, &hay) {
                     matches.insert(idx);
                 }
@@ -516,6 +534,7 @@ fn run_metadata_search(
     }
 
     // Pass 3: ZIP 内 PNG — ZIP を 1 回開いてまとめて処理 (ファイル I/O)
+    // Pass 2 と同じく target フィルタを尊重する。
     for (zip_path, entries) in zip_png_groups {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -540,14 +559,24 @@ fn run_metadata_search(
                 crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
             };
             let (meta_text, xmp) = match bytes_result {
-                Ok(bytes) => (
-                    crate::png_metadata::build_searchable_from_bytes(&bytes),
-                    crate::xmp_reader::read_tweet_info_from_bytes(&bytes),
-                ),
+                Ok(bytes) => {
+                    let png = if use_png {
+                        crate::png_metadata::build_searchable_from_bytes(&bytes)
+                    } else {
+                        String::new()
+                    };
+                    let xmp = if use_xmp {
+                        crate::xmp_reader::read_tweet_info_from_bytes(&bytes)
+                    } else {
+                        None
+                    };
+                    (png, xmp)
+                }
                 Err(_) => (String::new(), None),
             };
-            let name = crate::zip_loader::entry_basename(&entry_name);
-            if crate::search_query::matches(tokens, &hay_of(&meta_text, name, xmp.as_ref())) {
+            let entry_name_str = crate::zip_loader::entry_basename(&entry_name);
+            let name_for_hay = if use_name { entry_name_str } else { "" };
+            if crate::search_query::matches(tokens, &hay_of(&meta_text, name_for_hay, xmp.as_ref())) {
                 matches.insert(idx);
             }
         }
@@ -801,6 +830,8 @@ pub(crate) struct FavSearchState {
     /// 最後の検索結果に含まれていた対象パス (名前ソート順)。
     /// Ctrl+↑↓ で前後の検索結果アイテムへ移動するときに参照する。結果件数表示にも使う。
     pub results_paths: Vec<PathBuf>,
+    /// お気に入り絞り込み (None = すべて、Some(id) = 単一 favorite に限定) — §19.7 準拠。
+    pub favorite_filter: Option<uuid::Uuid>,
 }
 
 impl FavSearchState {
@@ -1178,6 +1209,8 @@ pub struct App {
     pub(crate) search_focus_request: bool,
     /// 検索バーの TextEdit がフォーカスを持っているか（毎フレーム更新）
     pub(crate) search_has_focus: bool,
+    /// Ctrl+F の「検索対象」ドロップダウン選択 (§19.7)。既定は全ソース OR。
+    pub(crate) search_target: crate::fts_index::SearchTarget,
 
     // ── 回転 DB ──────────────────────────────────────────────────
     /// 回転情報 DB (全体で 1 ファイル)
@@ -1627,6 +1660,7 @@ impl Default for App {
             last_stuck_scan_at: std::time::Instant::now(),
             search_focus_request: false,
             search_has_focus: false,
+            search_target: crate::fts_index::SearchTarget::All,
             rotation_db: crate::rotation_db::RotationDb::open().ok(),
             rotation_cache: std::collections::HashMap::new(),
             rating_db: crate::rating_db::RatingDb::open().ok(),
@@ -2483,12 +2517,28 @@ impl App {
         let Some(db) = self.search_index_db.clone() else {
             return;
         };
-        let fav_roots: Vec<PathBuf> = self
-            .settings
-            .favorites
-            .iter()
-            .map(|f| f.path.clone())
-            .collect();
+        // §19.7: favorite_filter で単一お気に入りに絞り込む。選択が外れていたら全登録に戻す。
+        let fav_roots: Vec<PathBuf> = match self.favsearch.favorite_filter {
+            Some(id) => self
+                .settings
+                .favorites
+                .iter()
+                .find(|f| f.id == id)
+                .map(|f| vec![f.path.clone()])
+                .unwrap_or_else(|| {
+                    self.settings
+                        .favorites
+                        .iter()
+                        .map(|f| f.path.clone())
+                        .collect()
+                }),
+            None => self
+                .settings
+                .favorites
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -5968,6 +6018,7 @@ impl App {
             .indexer_manager
             .as_ref()
             .map(|mgr| mgr.clone_fts_meta());
+        let target = self.search_target.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -5982,6 +6033,7 @@ impl App {
                     &items_snapshot,
                     &xmp_snapshot,
                     fts_meta_clone.as_ref(),
+                    &target,
                     &cancel_w,
                 );
                 let _ = tx.send(result);

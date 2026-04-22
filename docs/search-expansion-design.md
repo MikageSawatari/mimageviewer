@@ -1420,3 +1420,305 @@ Codex レビュー反映後の順序。`GlobalIoSemaphore` と二段整合性が
 - **Codex レビュー 5 回目完了 (2026-04-21)** — 累計 28 + 軽微 2 = 30 件の指摘を反映。§15.0 参照
 - §15.1.1 のプロトタイプ計測 (Tantivy offset worst-case 含む) に着手
 - 実装中はこのドキュメントを最新化し続ける。v0.8.0 リリース時に「確定版」として [docs/README.md](README.md) の索引に追加する (設計メモ欄)
+
+---
+
+## 19. 検索絞り込みフィルタ拡張 (all_text 分割) [2026-04-22 追加]
+
+### 19.1 目的
+
+Ctrl+G / Ctrl+F の検索バー右側に 3 つのドロップダウンを追加する:
+
+| フィルタ | 候補 | 既定 |
+| --- | --- | --- |
+| お気に入り | すべて / 登録済 favorite 名 (複数選択可) | すべて |
+| タイプ | すべて / フォルダ / ZIP ファイル / PDF ファイル / 画像 | すべて |
+| 検索対象 | すべて / ファイル名 / EXIF / AI プロンプト (PNG) / mXD ツイート / PDF メタ | すべて |
+
+**方針**: §5.2 で採用した「`all_text` 単一フィールド」方式は検索対象フィルタと両立できないので、
+未リリース (v0.8.0-alpha) の今のうちに **`all_text` を廃止してソース別フィールドに分割する**。
+リリース後の再インデックスコストを避けるため、スキーマ再設計は必ず初版リリース前に済ませる。
+
+### 19.2 データソース分類
+
+ingest 段で元テキストを **5 種** に分けて保持する:
+
+```rust
+// src/ingest_text.rs に追加
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceKind {
+    Filename,   // ファイル名 / ZIP エントリ名
+    Exif,       // EXIF (カメラ・レンズ・GPS・撮影日時…)
+    XmpTweet,   // XMP (mXD: tweet_id / author_* / description …)
+    PngPrompt,  // PNG tEXt / iTXt (A1111 / ComfyUI プロンプト)
+    PdfMeta,    // PDFium document info (Title / Author / Subject / Keywords)
+}
+```
+
+UI 上は必要に応じて「AI プロンプト」「mXD ツイート情報」等の日本語ラベルにマップする。
+PDF メタは PDF ファイル本体 (`container="fs"`, 拡張子 .pdf) にのみ現れる。
+ZIP は自身のファイル名 (`Filename`) のみ持つ。ZIP 内エントリ (v1.x) は画像と同じ扱い。
+
+### 19.3 Tantivy スキーマ変更 (fts_index)
+
+`all_text` フィールドを廃止し、5 つのテキストフィールドに分割する。
+
+```rust
+// src/fts_index.rs build_schema() の最終形
+b.add_text_field("path",        STRING | STORED);
+b.add_text_field("container",   STRING | STORED);
+b.add_text_field("zip_entry",   STRING | STORED);
+b.add_text_field("favorite_id", STRING | STORED);
+b.add_text_field("kind",        STRING | STORED);  // ★ 新規: "folder" / "image" / "zip" / "pdf"
+b.add_i64_field ("mtime",       INDEXED | STORED);
+b.add_i64_field ("file_size",   STORED);
+
+let bigram = TextOptions::default().set_indexing_options(
+    TextFieldIndexing::default()
+        .set_tokenizer(BIGRAM_TOKENIZER_NAME)
+        .set_index_option(IndexRecordOption::WithFreqs),
+);
+b.add_text_field("name",             bigram.clone());  // Filename ソースに対応
+b.add_text_field("exif_text",        bigram.clone());  // ★ 新規
+b.add_text_field("xmp_tweet_text",   bigram.clone());  // ★ 新規
+b.add_text_field("png_prompt_text",  bigram.clone());  // ★ 新規
+b.add_text_field("pdf_meta_text",    bigram);          // ★ 新規
+// ★ all_text は削除
+```
+
+- **「すべて」検索**: `Occur::Should` で `name / exif_text / xmp_tweet_text / png_prompt_text / pdf_meta_text` の OR を取る。
+  Tantivy は各フィールド独立に posting list を持つので OR-of-5 のコストは多くても稀語で数 ms、汎用語で数十 ms 程度 (§12.3 実測値を超えない)。
+- **「ソース限定」検索**: 選択されたフィールドのみに対して同じ bigram AND を組む。
+- **`kind` フィールド (タイプフィルタ用)**: `"folder"` / `"image"` / `"zip"` / `"pdf"` の exact term。
+  Ctrl+G の結果集計で `GridItem` variant にマップする材料にもなる。
+  既存の `container` は `"fs" / "zip"` で ZIP エントリ区別のために残す (用途が違う)。
+
+#### Fields struct の変更
+
+```rust
+pub struct Fields {
+    pub path: Field,
+    pub container: Field,
+    pub zip_entry: Field,
+    pub favorite_id: Field,
+    pub kind: Field,              // 新規
+    pub mtime: Field,
+    pub file_size: Field,
+    pub name: Field,
+    pub exif_text: Field,         // 新規
+    pub xmp_tweet_text: Field,    // 新規
+    pub png_prompt_text: Field,   // 新規
+    pub pdf_meta_text: Field,     // 新規
+    // all_text は削除
+}
+```
+
+`IndexDoc` も同様に分解:
+
+```rust
+pub struct IndexDoc {
+    pub path: String,
+    pub container: Container,
+    pub zip_entry: String,
+    pub favorite_id: Uuid,
+    pub kind: IndexKind,              // 新規: Folder / Image / Zip / Pdf
+    pub mtime: i64,
+    pub file_size: i64,
+    pub name: String,                 // 正規化済み
+    pub exif_text: String,            // 正規化済み (空なら空文字列)
+    pub xmp_tweet_text: String,
+    pub png_prompt_text: String,
+    pub pdf_meta_text: String,
+}
+```
+
+`IndexKind` は `search_index_db::IndexKind` (folder/zip/pdf) に `Image` を足して共有するのが望ましい。
+ただし他モジュールへの波及が大きければ `fts_index` 内の別 enum にしてもよい。
+
+### 19.4 fts_meta.db スキーマ変更
+
+post-filter (`search_query::matches`) はソース別に走らせる必要があるので、
+`all_text_norm` を 5 カラムに分割する:
+
+```sql
+CREATE TABLE files (
+    path TEXT PRIMARY KEY,
+    favorite_id TEXT NOT NULL,
+    favorite_root TEXT NOT NULL,
+    kind INTEGER NOT NULL,        -- ★ 新規: 0=folder, 1=image, 2=zip, 3=pdf
+    mtime INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    indexed_at INTEGER NOT NULL,
+    index_version INTEGER NOT NULL,
+    index_generation INTEGER NOT NULL,
+    status INTEGER NOT NULL,
+    name_norm TEXT NOT NULL DEFAULT '',            -- ★ 元 all_text_norm を分割
+    exif_norm TEXT NOT NULL DEFAULT '',            -- ★
+    xmp_tweet_norm TEXT NOT NULL DEFAULT '',       -- ★
+    png_prompt_norm TEXT NOT NULL DEFAULT '',      -- ★
+    pdf_meta_norm TEXT NOT NULL DEFAULT ''         -- ★
+);
+CREATE INDEX idx_files_fav       ON files(favorite_id);
+CREATE INDEX idx_files_fav_mtime ON files(favorite_id, mtime);
+CREATE INDEX idx_files_kind      ON files(favorite_id, kind);  -- タイプフィルタ集計用
+CREATE INDEX idx_files_status    ON files(status) WHERE status != 0;
+```
+
+- `INDEX_VERSION` を **1 → 2** に bump。起動時 reconciliation で旧スキーマ検出 → 全再インデックス。
+- `mark_pending` の引数を `all_text_norm: &str` から `norms: &PerSourceNorm` に変更。
+- post-filter lookup は `lookup_norms_for_targets(paths, targets: &[SourceKind]) -> HashMap<path, CombinedText>` のように
+  「選択されたソース列を SELECT して結合文字列を返す」 API に寄せる。`SearchTarget::All` は 5 列全部 SELECT。
+
+### 19.5 ingest_text 分割 (PerSourceText)
+
+`build_all_text_for_file` / `build_all_text_from_bytes` を 5 ソース個別ビルダーに再設計する:
+
+```rust
+// src/ingest_text.rs
+pub struct PerSourceText {
+    pub name: String,            // すでに正規化済み
+    pub exif: String,            // 空文字列なら抽出失敗 or そもそも無い
+    pub xmp_tweet: String,
+    pub png_prompt: String,
+    pub pdf_meta: String,        // PDF 以外では常に空
+}
+
+impl PerSourceText {
+    pub fn get(&self, kind: SourceKind) -> &str { ... }
+    pub fn is_empty_all(&self) -> bool { ... }
+}
+
+pub fn build_per_source_for_file(path: &Path) -> PerSourceText { ... }
+pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourceText { ... }
+pub fn build_per_source_for_pdf(path: &Path, info_text: &str) -> PerSourceText { ... }
+```
+
+- 各フィールドに **個別に `normalize_for_match` を適用済み** にする (post-filter と bigram ingest の両方で使えるように)。
+- `append_exif` / `append_xmp` の内部ロジックは変更不要。出力先を個別 `String` に切り替えるだけ。
+- `Filename` ソースは `path.file_name()` を lowercase した文字列をそのまま入れる。
+
+### 19.6 クエリ API 拡張 (SearchTarget)
+
+`build_bigram_and_query` の引数を拡張する:
+
+```rust
+/// Ctrl+G / Ctrl+F の検索対象フィルタ (§19.2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchTarget {
+    All,                        // name + exif + xmp_tweet + png_prompt + pdf_meta の OR
+    Only(Vec<SourceKind>),      // 指定ソースのみの OR
+}
+
+/// 既存 kind / favorite フィルタも同じ関数で対応する。
+#[derive(Debug, Clone, Default)]
+pub struct QueryFilters<'a> {
+    pub favorite_ids: Option<&'a [Uuid]>,
+    pub kinds: Option<&'a [IndexKind]>,    // None = all kinds
+    pub target: SearchTarget,              // Default::default() = All
+}
+
+pub fn build_bigram_and_query(
+    fields: &Fields,
+    include_tokens: &[&str],
+    filters: &QueryFilters,
+) -> Option<BooleanQuery>;
+```
+
+既存呼び出し側 (`global_search.rs` / `ingest_worker.rs` / `indexer_manager.rs` / テスト群) は
+`QueryFilters { favorite_ids: Some(ids), ..Default::default() }` で書き直す。
+
+**組み立てロジック (include_tokens を field ごとに bigram AND → field 間 OR → 全体 AND)**:
+
+```
+for each token:
+    for each target field F in target.fields():
+        per_field_and = AND of TermQuery(F, bigram)  for bigram in ngram(token)
+    token_query = OR of per_field_and     // どれか 1 フィールドにトークンが入っていれば OK
+must_queries.push(token_query)
+// favorite_id filter: Must(OR of Term(fav_id, id))
+// kind filter:        Must(OR of Term(kind, "folder"|"image"|...))
+return AND of must_queries
+```
+
+**post-filter も同じ target を渡す**: `search_query::matches` は引数 `&str` を `target` で選ばれた結合テキストで受ける。
+`SearchTarget::All` → 5 ソースを連結した文字列 (区切りスペース)。これで `夕焼け` が EXIF 撮影地に、`camera` がファイル名にあるケースも AND 判定が通る。
+
+### 19.7 UI 変更 (§8 補足) [2026-04-22 実装済み]
+
+#### Ctrl+G (全検索バー)
+
+```
+[検索: クエリ入力      ] [×] [お気に入り ▼] [タイプ ▼] [検索対象 ▼] | 進捗/結果
+```
+
+- `GlobalSearchFilters { favorite: Option<Uuid>, kind: Option<IndexKind>, target: SearchTarget }` を `GlobalSearchState` に保持
+- ドロップダウンは **single-select**: 「すべて」または 1 つを選ぶ (multi-select は UI 複雑化回避のため v1.x 以降)
+- 変更時は debounce なしで即再検索 (クエリが空なら skip)
+- **お気に入り**: `auto_index_metadata=true` なお気に入りのみ候補に出る
+- **タイプ**: `IndexKind::{Folder, Image, Zip, Pdf}`
+- **検索対象**: `TargetChoice::{All, Only(Filename|Exif|XmpTweet|PngPrompt|PdfMeta)}`
+
+#### Ctrl+F (現在フォルダ検索バー)
+
+```
+[検索: クエリ入力      ] [×] [検索対象 ▼] | 進捗/結果
+```
+
+- お気に入り / タイプフィルタは Ctrl+F スコープでは意味が薄いため **検索対象のみ** を出す
+- state は `App.search_target: SearchTarget` (既定 `All`)
+- 変更時は即再検索 (クエリが空なら skip)
+- fast path (`fts_meta.db.lookup_norms_for_target`) は target を尊重
+- fallback path (未インデックス path) も target に応じて EXIF/XMP/PNG の読み取りを skip する (I/O 節約)
+
+#### 実装箇所
+
+- UI コンポーネント: `src/global_search_ui.rs` (`TargetChoice`, `TARGET_CHOICES`, `KIND_CHOICES`, `kind_label`)
+- Ctrl+G バー描画: `render_global_search_bar` (`filter_changed` で即再実行)
+- Ctrl+G spawn: `spawn_global_search` (`SearchScope { kinds, target }` を組み立てて `spawn_search` に渡す)
+- Ctrl+F バー描画: `ui_main.rs::render_search_bar` (検索対象 ComboBox)
+- Ctrl+F 実行: `run_metadata_search(tokens, items, xmp, fts_meta, target, cancel)` + `target_includes` ヘルパ
+
+### 19.8 マイグレーション [2026-04-22 実装済み]
+
+**未リリースなので最小コスト**で実装:
+
+1. `INDEX_VERSION = 2` (fts_meta.db) に bump。
+2. **`FtsMetaDb::open_at`**: `needs_rebuild(conn)` で旧スキーマ (all_text_norm 列有 / name_norm 列無) を検出 → `DROP TABLE files` → 新スキーマで再作成。`index_version` が古い行を持つ DB も同様に drop。
+3. **`FtsIndex::open_at`**: `index_is_stale(dir)` で旧スキーマ (exif_text 等が無い / all_text 残存) を検出 → `remove_dir_all` → 新スキーマで `Index::create_in_dir`。
+4. ユーザーが実際にやるべきこと: **何もしなくて良い**。次回起動時に自動で v1 → v2 マイグレーションが走り、バックグラウンドで全再インデックスが始まる。
+5. 再インデックス所要時間は §12.2 の見積もりどおり (10 万ファイル SSD で 15-30 分)。UI はブロックされない。
+6. `FavoriteEntry.auto_index_metadata=true` のお気に入りだけが対象。
+
+#### マイグレーション失敗時の挙動
+
+- `needs_rebuild` の判定はベストエフォート。SQLite 読み取りが失敗したら新規 DB として扱う (`needs_rebuild` が Err を返したら open_at も Err で上位の `IndexerManager::new` が None を返す → Ctrl+G 不可だが他機能は動く)。
+- `wipe_index_dir` は Windows で `Access Denied` になる可能性があるが、後続の `Index::create_in_dir` が残骸を上書きするためログだけ残して続行する。
+
+### 19.9 テスト方針
+
+- `fts_index::tests` の全サンプルで `IndexDoc` を新構造に更新。`all_text` を参照するアサーションはソース別に分解。
+- `ingest_text::tests` に **ソース分離の検証** を追加:
+  - EXIF 情報を含む JPEG の `PerSourceText.exif` が非空、`.xmp_tweet` が空であること
+  - PNG tEXt を持つファイルの `.png_prompt` が非空であること
+  - XMP (mXD) を持つファイルの `.xmp_tweet` に author_screen_name が含まれること
+- `global_search::tests` に target フィルタの E2E:
+  - 同じトークンが EXIF と XMP 両方に存在するファイルを作り、`SearchTarget::Only(&[XmpTweet])` で XMP ソースのファイルのみがヒットすることを確認
+- `fts_meta::tests`: 5 ソース分の upsert + lookup round-trip
+- UI スナップショット: 3 ドロップダウン配置後の `tests/snapshots/` 更新
+
+### 19.10 実装順序
+
+§16 の既存タスク 1-21 をベースに、以下を挿入 / 差し替える:
+
+1. **§19 スキーマ分割先行** (未リリース前に完了必須):
+   1. `fts_index` の schema / `IndexDoc` / `Fields` / `build_bigram_and_query` 更新 + 既存テスト修正
+   2. `fts_meta.db` スキーマ更新 + `INDEX_VERSION` bump + `mark_pending` / `lookup_*` API 変更
+   3. `ingest_text::PerSourceText` 導入 + 既存 `build_all_text_*` を thin wrapper 化して段階削除
+   4. `ingest_worker` / `indexer_manager` の呼び出しを新 API へ
+2. **既存 §16 のフィルタ関連タスク**:
+   - 12 (Ctrl+G UI 下準備) に「3 ドロップダウンの state + UI」を追加
+   - 14 (Ctrl+G UI) に target/favorite/kind フィルタの実配線
+   - 15 (Ctrl+F) でも同じ state を読む
+
+工数目安 (§19 分): **4-5 日** (スキーマ変更 + ingest 分割 + クエリ拡張 + 既存テスト修正)。UI ドロップダウン配線は別途 1-2 日。
+この設計を先行マージしてから既存 §16 ステップ 12 以降を進める。

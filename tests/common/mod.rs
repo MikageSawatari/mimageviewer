@@ -347,7 +347,11 @@ pub fn collect_search_hits(
     query: &str,
     favorite_ids: &[Uuid],
 ) -> Vec<GlobalHit> {
-    let handle = mgr.spawn_search(query.to_string(), favorite_ids.to_vec());
+    let handle = mgr.spawn_search(
+        query.to_string(),
+        favorite_ids.to_vec(),
+        mimageviewer::global_search::SearchScope::default(),
+    );
     drain_rx(&handle.rx, &handle.cancel)
 }
 
@@ -410,7 +414,11 @@ pub fn run_search_expecting_done(
     query: &str,
     favorite_ids: &[Uuid],
 ) -> SearchStreamEvent {
-    let handle = mgr.spawn_search(query.to_string(), favorite_ids.to_vec());
+    let handle = mgr.spawn_search(
+        query.to_string(),
+        favorite_ids.to_vec(),
+        mimageviewer::global_search::SearchScope::default(),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());

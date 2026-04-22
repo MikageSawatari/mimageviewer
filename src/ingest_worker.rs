@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use tantivy::IndexWriter;
 use uuid::Uuid;
 
-use crate::fts_index::{self, Container, FtsIndex, IndexDoc};
+use crate::fts_index::{self, Container, FtsIndex, IndexDoc, IndexKind};
 use crate::fts_meta::FtsMetaDb;
 use crate::indexer_progress::ProgressReporter;
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
@@ -238,8 +238,8 @@ impl<'a> IngestSession<'a> {
     }
 
     fn ingest_image(&self, cand: &CandidateFile, writer: &IndexWriter) -> Result<(), String> {
-        // 1. メタ抽出 (all_text_norm を作る)
-        let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
+        // 1. メタ抽出 (ソース別 PerSourceText を作る §19.5)
+        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
 
         // 2. fts_meta に pending で書き込む (generation も +1)
         self.meta_db
@@ -247,28 +247,27 @@ impl<'a> IngestSession<'a> {
                 &cand.key,
                 self.favorite_id,
                 &self.favorite_root,
+                IndexKind::Image,
                 cand.mtime,
                 cand.file_size,
-                &all_text,
+                &norms,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
 
         // 3. Tantivy にバッファリング
-        let name = cand
-            .abs_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
         let doc = IndexDoc {
             path: cand.key.clone(),
             container: Container::Fs,
             zip_entry: String::new(),
             favorite_id: self.favorite_id,
+            kind: IndexKind::Image,
             mtime: cand.mtime,
             file_size: cand.file_size,
-            name,
-            all_text,
+            name: norms.name.clone(),
+            exif_text: norms.exif.clone(),
+            xmp_tweet_text: norms.xmp_tweet.clone(),
+            png_prompt_text: norms.png_prompt.clone(),
+            pdf_meta_text: norms.pdf_meta.clone(),
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -286,7 +285,6 @@ impl<'a> IngestSession<'a> {
             .to_string();
 
         // 1. PDFium document info を worker プロセス経由で取得
-        //    パスワード未指定で失敗したらパスワード保護 PDF → name_only fallback
         let info_text = match crate::pdf_loader::get_document_info(&cand.abs_path, None) {
             Ok(info) => info.as_search_text(),
             Err(e) => {
@@ -297,13 +295,8 @@ impl<'a> IngestSession<'a> {
             }
         };
 
-        // 2. ファイル名 + document info を結合して all_text を作る
-        let mut combined = name.clone();
-        if !info_text.is_empty() {
-            combined.push(' ');
-            combined.push_str(&info_text);
-        }
-        let all_text = crate::search_norm::normalize_for_match(&combined);
+        // 2. PerSourceText を構築 (PdfMeta のみ。他ソースは空)
+        let norms = crate::ingest_text::build_per_source_for_pdf(&name, &info_text);
 
         // 3. fts_meta に pending で書き込む
         self.meta_db
@@ -311,9 +304,10 @@ impl<'a> IngestSession<'a> {
                 &cand.key,
                 self.favorite_id,
                 &self.favorite_root,
+                IndexKind::Pdf,
                 cand.mtime,
                 cand.file_size,
-                &all_text,
+                &norms,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
 
@@ -323,10 +317,14 @@ impl<'a> IngestSession<'a> {
             container: Container::Fs, // PDF はコンテナ種別として Fs 扱い (v1)
             zip_entry: String::new(),
             favorite_id: self.favorite_id,
+            kind: IndexKind::Pdf,
             mtime: cand.mtime,
             file_size: cand.file_size,
-            name,
-            all_text,
+            name: norms.name.clone(),
+            exif_text: norms.exif.clone(),
+            xmp_tweet_text: norms.xmp_tweet.clone(),
+            png_prompt_text: norms.png_prompt.clone(),
+            pdf_meta_text: norms.pdf_meta.clone(),
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -341,17 +339,22 @@ impl<'a> IngestSession<'a> {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        // all_text はファイル名を lowercase したもの (最小)
-        let all_text = crate::search_norm::normalize_for_match(&name);
+        let norms = crate::ingest_text::build_per_source_name_only(&name);
+        let kind = match cand.kind {
+            CandidateKind::Zip => IndexKind::Zip,
+            CandidateKind::Pdf => IndexKind::Pdf,
+            _ => IndexKind::Image, // Image でファイル扱い (予期しないケース)
+        };
 
         self.meta_db
             .mark_pending(
                 &cand.key,
                 self.favorite_id,
                 &self.favorite_root,
+                kind,
                 cand.mtime,
                 cand.file_size,
-                &all_text,
+                &norms,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
 
@@ -364,10 +367,14 @@ impl<'a> IngestSession<'a> {
             },
             zip_entry: String::new(),
             favorite_id: self.favorite_id,
+            kind,
             mtime: cand.mtime,
             file_size: cand.file_size,
-            name,
-            all_text,
+            name: norms.name.clone(),
+            exif_text: norms.exif.clone(),
+            xmp_tweet_text: norms.xmp_tweet.clone(),
+            png_prompt_text: norms.png_prompt.clone(),
+            pdf_meta_text: norms.pdf_meta.clone(),
         };
         fts_index::upsert_doc(writer, self.fts.fields(), &doc)
             .map_err(|e| format!("upsert_doc: {e}"))?;
@@ -502,7 +509,16 @@ mod tests {
 
         // Tantivy 側で検索できる
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), &["夕焼け"], Some(&[fav])).unwrap();
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["夕焼け"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -552,7 +568,16 @@ mod tests {
 
         // Tantivy 側からも消えている
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), &["a.jpg"], Some(&[fav])).unwrap();
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["a.jpg"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 0);
@@ -584,8 +609,8 @@ mod tests {
         assert_eq!(stats.ingested_ok, 1);
         let row = meta.get(&key).unwrap().unwrap();
         assert_eq!(row.status, FileStatus::Ok);
-        // ZIP ファイル名が検索対象に入っている
-        assert!(row.all_text_norm.contains("album.zip"));
+        // ZIP ファイル名が検索対象に入っている (name_norm に格納される)
+        assert!(row.norms.name.contains("album.zip"));
     }
 
     #[test]
@@ -666,9 +691,17 @@ mod tests {
         // mark_ok は意図的に呼ばない (クラッシュシミュレーション)
         let cand = make_image_file(tmp.path(), "crash.jpg");
         let key = cand.key.clone();
-        let all_text = crate::ingest_text::build_all_text_for_file(&cand.abs_path);
-        meta.mark_pending(&key, fav, &root, cand.mtime, cand.file_size, &all_text)
-            .unwrap();
+        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
+        meta.mark_pending(
+            &key,
+            fav,
+            &root,
+            IndexKind::Image,
+            cand.mtime,
+            cand.file_size,
+            &norms,
+        )
+        .unwrap();
         let mut writer = fts.writer().unwrap();
         fts_index::upsert_doc(
             &writer,
@@ -678,10 +711,14 @@ mod tests {
                 container: crate::fts_index::Container::Fs,
                 zip_entry: String::new(),
                 favorite_id: fav,
+                kind: IndexKind::Image,
                 mtime: cand.mtime,
                 file_size: cand.file_size,
-                name: "crash.jpg".to_string(),
-                all_text,
+                name: norms.name.clone(),
+                exif_text: norms.exif.clone(),
+                xmp_tweet_text: norms.xmp_tweet.clone(),
+                png_prompt_text: norms.png_prompt.clone(),
+                pdf_meta_text: norms.pdf_meta.clone(),
             },
         )
         .unwrap();
@@ -692,14 +729,24 @@ mod tests {
         let row = meta.get(&key).unwrap().unwrap();
         assert_eq!(row.status, FileStatus::Pending);
 
-        // Ctrl+G 検索では pending は結果に現れない (lookup_all_text_norm が status=0 のみ返す)
+        // Ctrl+G 検索では pending は結果に現れない (lookup_norms_for_target が status=0 のみ返す)
         fts.reload_reader().unwrap();
-        let q =
-            fts_index::build_bigram_and_query(fts.fields(), &["crash.jpg"], Some(&[fav])).unwrap();
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["crash.jpg"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1, "Tantivy には残っている");
-        let lookup = meta.lookup_all_text_norm(&[key.clone()]).unwrap();
+        let lookup = meta
+            .lookup_norms_for_target(&[key.clone()], &crate::fts_index::SearchTarget::All)
+            .unwrap();
         assert!(
             lookup.is_empty(),
             "post-filter では pending は除外 → 検索結果に出ない"
@@ -740,7 +787,16 @@ mod tests {
         assert_eq!(stats.ingested_ok, 130);
         // 全 ok になっている
         fts.reload_reader().unwrap();
-        let q = fts_index::build_bigram_and_query(fts.fields(), &["b000"], Some(&[fav])).unwrap();
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["b000"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert!(!hits.is_empty());

@@ -176,6 +176,19 @@
       <li><kbd>Esc</kbd> または「×」ボタンで検索バーを閉じる</li>
     </ul>
 
+    <h3>検索対象の絞り込み</h3>
+    <p>検索バーの右側にある「検索対象」ドロップダウンで、どのメタデータソースから検索するかを選べます。
+    デフォルトは「すべて」で、以下のソースから OR で検索します:</p>
+    <ul>
+      <li><strong>ファイル名</strong>: ファイル名 / ZIP エントリ名</li>
+      <li><strong>EXIF</strong>: カメラ情報・撮影日時・GPS など</li>
+      <li><strong>mXD ツイート情報</strong>: XMP 埋め込みの投稿者 ID / 投稿者名 / ツイート本文</li>
+      <li><strong>AI プロンプト (PNG)</strong>: PNG tEXt/iTXt に埋め込まれた AUTOMATIC1111 / ComfyUI プロンプト</li>
+      <li><strong>PDF メタ情報</strong>: PDFium で抽出した Title / Author / Subject / Keywords</li>
+    </ul>
+    <p>例: 「特定の投稿者のツイートだけ探したい」ときは「mXD ツイート情報」を選ぶと、
+    同名ファイルがあっても無関係にヒットしなくなります。</p>
+
     <h3>検索クエリ構文</h3>
     <p>スペース区切りの複数キーワードを組み合わせられます。大文字小文字は区別しません。</p>
     <table>

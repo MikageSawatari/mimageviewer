@@ -18,10 +18,103 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use uuid::Uuid;
+
 use crate::app::App;
+use crate::fts_index::{IndexKind, SearchTarget, SourceKind};
 use crate::global_search::{DoneReason, GlobalHit, SearchStreamEvent};
 use crate::grid_item::{GridItem, SearchContainerKind};
 use crate::indexer_manager::SearchHandle;
+
+// -----------------------------------------------------------------------
+// 検索フィルタ (§19.7 ドロップダウン対応)
+// -----------------------------------------------------------------------
+
+/// Ctrl+G の 3 ドロップダウン (お気に入り / タイプ / 検索対象) を保持する (§19.2)。
+/// 変更時は `reset_for_new_query` と同じ経路で検索を再実行する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalSearchFilters {
+    /// None = 登録済み全お気に入りを対象。Some(id) なら単一 favorite に限定。
+    pub favorite: Option<Uuid>,
+    /// None = 全タイプ (folder/image/zip/pdf)。Some(k) で単一種別に限定。
+    pub kind: Option<IndexKind>,
+    /// 検索対象ソース。既定は All (= 全ソース OR)。
+    pub target: SearchTarget,
+}
+
+impl Default for GlobalSearchFilters {
+    fn default() -> Self {
+        Self {
+            favorite: None,
+            kind: None,
+            target: SearchTarget::All,
+        }
+    }
+}
+
+/// ドロップダウン表示用ラベル (UI のみで使う)。
+pub fn kind_label(k: IndexKind) -> &'static str {
+    match k {
+        IndexKind::Folder => "フォルダ",
+        IndexKind::Image => "画像",
+        IndexKind::Zip => "ZIP ファイル",
+        IndexKind::Pdf => "PDF ファイル",
+    }
+}
+
+/// 「検索対象」ドロップダウンに出すソース選択肢 (単一 source / All)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetChoice {
+    All,
+    Only(SourceKind),
+}
+
+impl TargetChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            TargetChoice::All => "すべて",
+            TargetChoice::Only(SourceKind::Filename) => "ファイル名",
+            TargetChoice::Only(SourceKind::Exif) => "EXIF",
+            TargetChoice::Only(SourceKind::XmpTweet) => "mXD ツイート情報",
+            TargetChoice::Only(SourceKind::PngPrompt) => "AI プロンプト (PNG)",
+            TargetChoice::Only(SourceKind::PdfMeta) => "PDF メタ情報",
+        }
+    }
+
+    pub fn to_target(self) -> SearchTarget {
+        match self {
+            TargetChoice::All => SearchTarget::All,
+            TargetChoice::Only(s) => SearchTarget::Only(vec![s]),
+        }
+    }
+
+    pub fn from_target(t: &SearchTarget) -> Self {
+        match t {
+            SearchTarget::All => TargetChoice::All,
+            SearchTarget::Only(v) if v.len() == 1 => TargetChoice::Only(v[0]),
+            // 複数選択は v1 UI ではサポートしない (内部表現としては可能)。All にフォールバック。
+            SearchTarget::Only(_) => TargetChoice::All,
+        }
+    }
+}
+
+/// ドロップダウン列挙用。順序はラベル辞書ではなく UI 上の表示順 (ユーザーがよく使う順)。
+pub const TARGET_CHOICES: &[TargetChoice] = &[
+    TargetChoice::All,
+    TargetChoice::Only(SourceKind::Filename),
+    TargetChoice::Only(SourceKind::Exif),
+    TargetChoice::Only(SourceKind::XmpTweet),
+    TargetChoice::Only(SourceKind::PngPrompt),
+    TargetChoice::Only(SourceKind::PdfMeta),
+];
+
+pub const KIND_CHOICES: &[Option<IndexKind>] = &[
+    None,
+    Some(IndexKind::Folder),
+    Some(IndexKind::Image),
+    Some(IndexKind::Zip),
+    Some(IndexKind::Pdf),
+];
 
 /// クエリ入力後、検索実行までの debounce 間隔 (既存 Ctrl+F と揃える)。
 const DEBOUNCE_MS: u64 = 300;
@@ -85,6 +178,8 @@ pub struct GlobalSearchState {
     pub reject_message: Option<String>,
     /// Ctrl+G 以前の current_folder (戻り先として保存)
     pub saved_folder: Option<PathBuf>,
+    /// 絞り込みフィルタ (§19.7)。変更時は自動的に検索を再実行する。
+    pub filters: GlobalSearchFilters,
 }
 
 impl Default for GlobalSearchState {
@@ -107,6 +202,7 @@ impl Default for GlobalSearchState {
             truncated: false,
             reject_message: None,
             saved_folder: None,
+            filters: GlobalSearchFilters::default(),
         }
     }
 }
@@ -582,16 +678,30 @@ impl App {
             return;
         };
 
-        // auto_index_metadata=true のお気に入り UUID を集める
-        let favs: Vec<uuid::Uuid> = self
+        // auto_index_metadata=true のお気に入り UUID を集める。
+        // ドロップダウンで単一 favorite を選んでいればそれだけに絞る。
+        let all_favs: Vec<uuid::Uuid> = self
             .settings
             .favorites
             .iter()
             .filter(|f| f.auto_index_metadata)
             .map(|f| f.id)
             .collect();
+        let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
+            Some(id) if all_favs.contains(&id) => vec![id],
+            Some(_) => {
+                // 選択中 favorite が auto_index_metadata=false になった → すべてにフォールバック
+                all_favs.clone()
+            }
+            None => all_favs,
+        };
 
-        let handle = mgr.spawn_search(self.global_search.query.clone(), favs);
+        let scope = crate::global_search::SearchScope {
+            kinds: self.global_search.filters.kind.map(|k| vec![k]),
+            target: self.global_search.filters.target.clone(),
+        };
+
+        let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope);
         self.global_search.pending = Some(handle);
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
@@ -960,6 +1070,7 @@ impl App {
 
         let mut close_requested = false;
         let mut query_changed = false;
+        let mut filter_changed = false;
 
         let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
@@ -1004,6 +1115,83 @@ impl App {
                 }
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
                     close_requested = true;
+                }
+
+                // ── 絞り込みドロップダウン (§19.7) ──
+                // お気に入り (auto_index_metadata=true のもののみ候補にする)
+                {
+                    let current = self.global_search.filters.favorite;
+                    let label_for = |opt: Option<Uuid>| -> String {
+                        match opt {
+                            None => "すべて".to_string(),
+                            Some(id) => self
+                                .settings
+                                .favorites
+                                .iter()
+                                .find(|f| f.id == id)
+                                .map(|f| f.name.clone())
+                                .unwrap_or_else(|| "(削除済)".to_string()),
+                        }
+                    };
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("global_search_fav")
+                        .selected_text(label_for(current))
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut next, None, "すべて");
+                            for fav in &self.settings.favorites {
+                                if !fav.auto_index_metadata {
+                                    continue;
+                                }
+                                ui.selectable_value(&mut next, Some(fav.id), &fav.name);
+                            }
+                        });
+                    if next != current {
+                        self.global_search.filters.favorite = next;
+                        filter_changed = true;
+                    }
+                }
+
+                // タイプ
+                {
+                    let current = self.global_search.filters.kind;
+                    let label_for = |opt: Option<IndexKind>| -> &'static str {
+                        match opt {
+                            None => "すべて",
+                            Some(k) => kind_label(k),
+                        }
+                    };
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("global_search_kind")
+                        .selected_text(label_for(current))
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for &choice in KIND_CHOICES {
+                                ui.selectable_value(&mut next, choice, label_for(choice));
+                            }
+                        });
+                    if next != current {
+                        self.global_search.filters.kind = next;
+                        filter_changed = true;
+                    }
+                }
+
+                // 検索対象
+                {
+                    let current = TargetChoice::from_target(&self.global_search.filters.target);
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("global_search_target")
+                        .selected_text(current.label())
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for &choice in TARGET_CHOICES {
+                                ui.selectable_value(&mut next, choice, choice.label());
+                            }
+                        });
+                    if next != current {
+                        self.global_search.filters.target = next.to_target();
+                        filter_changed = true;
+                    }
                 }
 
                 // 進捗/結果バッジ
@@ -1054,6 +1242,14 @@ impl App {
         if drill_back {
             // ボタン押下は「1 段上げる」で統一 (BS と同じ UX)。
             self.drill_back_one_level();
+        }
+        if filter_changed {
+            // ドロップダウン変更は debounce せず即座に再実行する
+            // (ユーザーの操作は明示的なので待つ必要がない)
+            if !self.global_search.query.trim().is_empty() {
+                self.global_search.last_executed.clear(); // 強制再実行
+                self.spawn_global_search();
+            }
         }
         if query_changed {
             self.global_search.last_change_at = Some(Instant::now());
