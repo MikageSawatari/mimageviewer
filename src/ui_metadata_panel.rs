@@ -348,16 +348,6 @@ impl App {
         None
     }
 
-    /// タグ書き込み worker の完了通知でキャッシュを invalidate する。
-    /// poll_tag_write_results から呼ばれる。
-    pub(crate) fn invalidate_tags_cache_for_path(&mut self, path: &std::path::Path) {
-        // metadata_cache_key はパスから直接作れないので、全エントリから
-        // path が一致するもの (末尾の file_name 相当) を削除するよりは、
-        // 単純に全クリアにする (タグ操作は低頻度 + パネル表示時のみ再取得)。
-        // ファイル数が多くて再読込が重くなったら個別 invalidate に切り替える。
-        let _ = path;
-        self.tags_cache.clear();
-    }
 }
 
 // ---------------------------------------------------------------------------

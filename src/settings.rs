@@ -602,10 +602,6 @@ pub struct Settings {
     /// ユーザ定義のタグ一覧 (メニュー / ツールバー に表示される順)。
     #[serde(default)]
     pub tags: Vec<TagDef>,
-    /// タグ編集ダイアログの「次回から警告を表示しない」チェックの状態。
-    /// 初回 ON 時に true になり、以降タグ編集ダイアログで書き換え警告を省略する。
-    #[serde(default)]
-    pub tag_write_warning_acknowledged: bool,
 
     // ── ツールバー表示設定 ──────────────────────────────────
     /// ツールバーに「お気に入り」セクションを表示する
@@ -923,7 +919,6 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             ui_theme: UiTheme::default(),
             tags: Vec::new(),
-            tag_write_warning_acknowledged: false,
             show_toolbar_favorites: true,
             show_toolbar_tags: true,
             show_toolbar_folder: true,

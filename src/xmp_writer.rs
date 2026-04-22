@@ -3,12 +3,11 @@
 //! # 対応形式
 //!
 //! - **JPEG** (APP1 `http://ns.adobe.com/xap/1.0/\0`)
-//!   Extended XMP は **バイト列のまま保持** し、Standard XMP のみ書き換える
-//!   (§5.4 選択肢 A)。`xmpNote:HasExtendedXMP` は消さない。
+//!   Extended XMP は **バイト列のまま保持** し、Standard XMP のみ書き換える。
+//!   `xmpNote:HasExtendedXMP` は消さない (消すと Extended XMP が孤児化して
+//!   mXDownloader が埋め込んだツイート本文が失われる)。
 //! - **PNG** (iTXt `XML:com.adobe.xmp` チャンク、CRC 再計算付き)
 //! - **WebP** (RIFF `XMP ` チャンク。単純 WebP は VP8X 拡張コンテナに昇格)
-//!
-//! HEIC / TIFF / その他は v1.0 未対応。
 //!
 //! # 書き込み戦略 (最小差分編集)
 //!
@@ -17,14 +16,10 @@
 //!    - 見つかれば新 Bag で丸ごと置換
 //!    - 無ければ `<rdf:Description>` の閉じタグ直前に element 形式で挿入
 //!    - `rdf:Description` 自己閉じタグは開始+終了形式に展開してから挿入
-//! 3. `xmp:MetadataDate` を ISO-8601 現在時刻で更新 (存在しなければ追加)
+//! 3. `xmp:MetadataDate` を ISO-8601 現在時刻で更新 (Lightroom 同期のため、
+//!    XMP Spec Part 1 §8.4)
 //! 4. 形式別にファイルへ再埋め込み
 //! 5. 一時ファイル → rename でアトミック置換
-//!
-//! # アトミック書き込み
-//!
-//! 同一ディレクトリに `.{uuid}.miv-tmp` を作り、Windows `ReplaceFile` (= `std::fs::rename`)
-//! でアトミックに置換する。クラッシュ時は元ファイル無傷、tmp は orphaned として残る。
 
 use std::io::Write;
 use std::path::Path;
@@ -46,7 +41,8 @@ pub enum WriteError {
     Io(std::io::Error),
     /// XMP パース / シリアライズエラー
     Xmp(String),
-    /// Standard XMP 書き込み後サイズが 64KB を超えた (Extended XMP 再分割は v1.0 未対応)
+    /// Standard XMP 書き込み後サイズが 64KB を超えた。
+    /// Standard → Extended 再分割は未実装。
     StandardXmpTooLarge { required: usize },
     /// 読み取り専用ファイル
     ReadOnly,
@@ -100,6 +96,13 @@ fn detect_format(path: &Path) -> Option<Format> {
         "webp" => Some(Format::WebP),
         _ => None,
     }
+}
+
+/// パスの拡張子がタグ書き込み対応形式か判定。
+/// 現状 JPEG / PNG / WebP のみ。UI の grayout 判定と worker の処理判定の
+/// 単一ソースにする。
+pub fn is_writable_format(path: &Path) -> bool {
+    detect_format(path).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +195,7 @@ pub fn edit_xmp_packet(xmp: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), Writ
     };
 
     // 1. 既存 dc:subject のタグ一覧を読む (裸の XMP パケットなのでマジックバイト判定なし)
-    let mut current = xmp_reader::parse_dc_subject_xml(&original);
+    let mut current = xmp_reader::parse_dc_subject(&original);
 
     // 2. 操作を適用
     let changed = apply_op_to_list(&mut current, op);
@@ -208,7 +211,7 @@ pub fn edit_xmp_packet(xmp: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), Writ
         updated
     };
 
-    let tag_str = tags_to_space_separated(&current);
+    let tag_str = crate::ingest_text::build_tags_column(&current);
     Ok((with_date, tag_str))
 }
 
@@ -234,22 +237,6 @@ fn apply_op_to_list(list: &mut Vec<String>, op: &TagOp) -> bool {
             list.len() != before
         }
     }
-}
-
-fn tags_to_space_separated(tags: &[String]) -> String {
-    let mut out = String::new();
-    for t in tags {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        // 空白や制御文字は検索系と整合性を取るため `_` に置換。
-        let safe: String = t
-            .chars()
-            .map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c })
-            .collect();
-        out.push_str(&safe);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -307,27 +294,16 @@ fn replace_or_insert_dc_subject(
 
 fn build_dc_subject_element(tags: &[String]) -> String {
     if tags.is_empty() {
-        // 空でも要素自体は置いておく (次回編集の足がかり)。
-        // 完全に落とす場合は呼び出し側で range 削除してもよいが、
-        // 他ツールが dc:subject が常に存在することを期待する実装もあるため保持。
+        // 空でも要素自体は置いておく (他ツールが dc:subject の存在を期待するため)
         return r#"<dc:subject><rdf:Bag/></dc:subject>"#.to_string();
     }
     let mut out = String::from("<dc:subject>\n      <rdf:Bag>\n");
     for t in tags {
-        // XML エスケープ (& < > は必ず置換)
-        let escaped = xml_escape(t);
+        let escaped = quick_xml::escape::escape(t);
         out.push_str(&format!("        <rdf:li>{escaped}</rdf:li>\n"));
     }
     out.push_str("      </rdf:Bag>\n    </dc:subject>");
     out
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// `<dc:subject>` 開始タグの直前位置と `</dc:subject>` の直後位置を返す。
@@ -406,12 +382,7 @@ fn is_dc_subject(ns: &quick_xml::name::ResolveResult<'_>, local: &[u8]) -> bool 
     matches!(ns, quick_xml::name::ResolveResult::Bound(n) if n.as_ref() == DC_NS)
 }
 
-fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    hay.windows(needle.len()).position(|w| w == needle)
-}
+use crate::xmp_reader::find_subsequence as find_subseq;
 
 /// `<rdf:Description>` の閉じタグ `</rdf:Description>` の開始位置を返す。
 /// 最初に出現するものを採用 (XMP は通常 1 つだけ)。
@@ -470,10 +441,9 @@ fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
         return Ok(out);
     }
 
-    // 追加 (rdf:Description 閉じタグ直前)。xmp 名前空間は MINIMAL_XMP_TEMPLATE で既に宣言済み、
-    // 既存パケットに無い場合は xmlns:xmp 属性も合わせて埋める必要があるが、実運用では
-    // ほぼすべての XMP ライタが xmp 名前空間を Description 属性に載せているので省略。
-    // (省略が問題になったら v1.1 で追加)
+    // 追加 (rdf:Description 閉じタグ直前)。xmp 名前空間宣言は実運用でほぼ全ての
+    // XMP ライタが Description 属性に載せているので、ここで xmlns:xmp を追加する
+    // ロジックは省略している。
     if let Some(close_pos) = find_subseq(xmp, b"</rdf:Description>") {
         let insert = format!(
             "<xmp:MetadataDate>{now}</xmp:MetadataDate>\n    "
@@ -497,8 +467,6 @@ fn current_iso8601_utc() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // 簡易 UTC フォーマッタ (chrono 依存を避ける)。
-    // 精度は秒まで、オフセットは +00:00 (UTC)。
     let days = secs / 86_400;
     let rem = secs % 86_400;
     let hour = rem / 3_600;
@@ -750,7 +718,7 @@ fn apply_tag_op_png(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), Write
                     if compression_flag == 0 {
                         existing_xmp = Some((pos, crc_end, text.to_vec()));
                     }
-                    // 圧縮版は v1.0 未対応 → 無視して新規追加パスに回す
+                    // 圧縮 iTXt は未対応 → 無視して新規追加パスに回す
                 }
             }
         }
@@ -833,20 +801,22 @@ fn build_png_itxt_xmp(xmp_text: &[u8]) -> Vec<u8> {
 
 /// PNG 仕様の CRC-32 (多項式 0xEDB88320、初期値 0xFFFFFFFF、出力反転あり)。
 fn png_crc32(data: &[u8]) -> u32 {
-    // テーブル生成は 1 回のみ (static で持つのが理想だが、呼び出し頻度は低いので
-    // 毎回計算でも許容)。将来ホットパスなら OnceLock でキャッシュする。
-    let mut table = [0u32; 256];
-    for (i, slot) in table.iter_mut().enumerate() {
-        let mut c = i as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 {
-                0xEDB88320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
         }
-        *slot = c;
-    }
+        t
+    });
     let mut crc: u32 = 0xFFFFFFFF;
     for &b in data {
         crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);

@@ -264,7 +264,8 @@ fn extract_xmp_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(scan[start..start + rel_end + end_needle.len()].to_vec())
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+/// バイト列中で needle の最初の出現位置を返す。needle が空 or hay より長ければ None。
+pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
@@ -501,18 +502,10 @@ pub fn read_dc_subject_from_bytes(bytes: &[u8]) -> Vec<String> {
     parse_dc_subject(&xmp)
 }
 
-/// 生の XMP RDF/XML バイト列から dc:subject の要素を抽出 (コンテナ非依存版)。
-/// xmp_writer などからパケット直接の編集に使う。
-pub fn parse_dc_subject_xml(xml: &[u8]) -> Vec<String> {
-    parse_dc_subject(xml)
-}
-
-/// RDF/XML の `<dc:subject><rdf:Bag><rdf:li>値</rdf:li>...</rdf:Bag></dc:subject>` から
-/// 値を抽出する。名前空間で厳密判定 (URI = purl.org/dc/elements/1.1/)。
-///
-/// Bag 以外の記法 (Seq/Alt) や属性形式は仕様上 dc:subject では使われないが、
-/// 念のため parseType="Resource" やネストされた rdf:li も拾う寛容実装にする。
-fn parse_dc_subject(xml: &[u8]) -> Vec<String> {
+/// 生の XMP RDF/XML バイト列から `<dc:subject><rdf:Bag><rdf:li>値</rdf:li>...</rdf:Bag></dc:subject>`
+/// の要素を抽出する (コンテナ非依存版、xmp_writer がパケット直接編集で使う)。
+/// 名前空間で厳密判定 (URI = purl.org/dc/elements/1.1/)。
+pub(crate) fn parse_dc_subject(xml: &[u8]) -> Vec<String> {
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();

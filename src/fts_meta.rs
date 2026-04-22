@@ -179,8 +179,7 @@ impl FtsMetaDb {
         Ok(out)
     }
 
-    /// 単一 path のタグ更新 (タグ書き込み worker が呼ぶ高速経路。v1.0 では未使用)。
-    #[allow(dead_code)]
+    /// 単一 path のタグ更新 (タグ書き込み worker が呼ぶ高速経路)。
     pub fn set_tags(&self, path: &str, tags: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

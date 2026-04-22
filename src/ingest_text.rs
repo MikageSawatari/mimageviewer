@@ -45,10 +45,10 @@ pub fn extract_tags_from_bytes(bytes: &[u8]) -> String {
     build_tags_column(&tags)
 }
 
-fn build_tags_column(tags: &[String]) -> String {
-    // タグ内に空白や制御文字が混じると DB カラムの分割が崩れるので
-    // 空白類は全部 `_` に置換する。タグ名の仕様で禁止予定なので実運用で
-    // ほぼ発生しない防御ロジック。
+/// dc:subject Bag 要素列 → fts_meta.tags 列に入る形式 (空白区切り)。
+/// タグ内の空白/制御文字は `_` に置換する。xmp_writer が書き込み後に返す
+/// tags 文字列と同じロジックでなければ検索側とズレるので、1 箇所に集約している。
+pub fn build_tags_column(tags: &[String]) -> String {
     let mut out = String::new();
     for t in tags {
         let cleaned: String = t
