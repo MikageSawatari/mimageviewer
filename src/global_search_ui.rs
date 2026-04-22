@@ -925,6 +925,12 @@ impl App {
     /// thumbnails / visible_indices と、Codex P2-1/P2-2 で指摘された
     /// search_filter / checked を整合させるだけに留める。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
+        // Codex P3 対応: DrilledInto ビューで done=true rebuild を迎えたとき、
+        // `build_drilled_items` は `ensure_container_mtime_populated` を呼ばないため
+        // mtime が埋まらないまま残る。結果、その状態で `build_cross_container_nav_list`
+        // (Ctrl+↑↓ で呼ばれる) が Newer/Older ソートを mtime=None で走らせてしまう。
+        // view に関わらず rebuild の入口で populate しておく (done 未達なら関数内で no-op)。
+        ensure_container_mtime_populated(&mut self.global_search);
         let (items, image_metas) = match self.global_search.view.clone() {
             GlobalSearchView::Aggregated => build_aggregated_items(&mut self.global_search),
             GlobalSearchView::DrilledInto {

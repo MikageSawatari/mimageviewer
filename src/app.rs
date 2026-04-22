@@ -252,7 +252,9 @@ use crate::folder_tree::{
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
-pub(crate) use crate::thumb_loader::{CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_ZIP};
+pub(crate) use crate::thumb_loader::{
+    CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP,
+};
 
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
 fn stem_lower(path: &std::path::Path) -> String {
@@ -9888,12 +9890,22 @@ fn make_load_request(
             representative: Some(rep),
             ..
         } => {
-            // 代表サムネ: 画像 1 枚ぶんのキャッシュキー (ZIP エントリなら zip_path+entry)
-            // をそのまま使う。通常のフォルダ/ZIP 閲覧時と同じキャッシュを共有するので
-            // 既にサムネ済みなら即出る。
+            // 代表サムネのキャッシュキー (Codex P1 対応):
+            // - filename 単体を使うと別コンテナの同名画像 (例: 複数フォルダの `cover.jpg`)
+            //   で衝突し、placeholder mtime=0 の entry で先に書かれた thumb を読んでしまう。
+            // - `{CACHE_KEY_SEARCH_REP}{full_path}[::{zip_entry}]` をキーにしてユニーク化。
+            //   通常閲覧のキャッシュ (filename 単体キー) とは別空間なので互いを壊さない。
+            let path_str = rep.path.to_string_lossy();
+            let key = match &rep.zip_entry {
+                Some(entry) => {
+                    format!("{}{}::{}", CACHE_KEY_SEARCH_REP, path_str, entry)
+                }
+                None => format!("{}{}", CACHE_KEY_SEARCH_REP, path_str),
+            };
             Some(LoadRequest {
                 path: rep.path.clone(),
                 zip_entry: rep.zip_entry.clone(),
+                cache_key_override: Some(key),
                 ..base
             })
         }

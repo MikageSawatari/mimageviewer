@@ -46,6 +46,11 @@ pub const CACHE_KEY_ZIP: &str = "zipthumb:";
 pub const CACHE_KEY_PDF: &str = "pdfthumb:";
 /// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
 pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
+/// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
+/// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
+/// placeholder mtime=0 で相手の thumb を読み込んでしまうため、**コンテナ path 丸ごと**
+/// をキーに含める。通常フォルダ閲覧とは別空間なので互いを上書きしない。
+pub const CACHE_KEY_SEARCH_REP: &str = "searchrep:";
 
 // -----------------------------------------------------------------------
 // 共通型
