@@ -338,11 +338,6 @@ fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
     }
 }
 
-/// ContainerHit を hit_count 降順 / 名前昇順 でソートした Vec を返す (既定)。
-pub fn sorted_containers(containers: &HashMap<PathBuf, ContainerHit>) -> Vec<ContainerHit> {
-    sort_containers_with_mode(containers, ContainerSortMode::HitCount)
-}
-
 /// 指定したモードで ContainerHit をソートして返す。
 /// Newer/Older 時は `mtime` フィールドを使うので、呼び出し側は
 /// [`ensure_container_mtime_populated`] で事前に埋めておくこと。
@@ -376,14 +371,20 @@ pub fn sort_containers_with_mode(
 /// Newer/Older ソートのために、mtime 未取得のコンテナだけ fs::metadata を呼んで埋める。
 /// HitCount/Name モードでは何もしない。
 ///
-/// 取得は同期 I/O だが、N コンテナぶんの 1 回きり (以降はキャッシュ) で、
-/// ユーザーがソート切替した瞬間にしか走らない。HDD では数百 ms になり得るので、
-/// モード変更時のレスポンスが気になったら別スレッド化を検討する (v0.8.x 課題)。
+/// **ストリーミング中 (`state.done == false`) はスキップする** (Codex P3 対応):
+/// 検索結果が逐次 append されるたびに本関数が呼ばれるため、そのタイミングで毎回
+/// 新コンテナ全部に fs::metadata を掛けると HDD / ネットワーク / 大量お気に入り環境
+/// で UI がカクつく。ストリーム完了時 (done=true → rebuild) に 1 回まとめて取得し、
+/// 以降はキャッシュが効くので `sort_mode` 切替は即時反映になる。ストリーミング中の
+/// Newer/Older ソートは mtime 不明のため path 順で並ぶが、done 後に正しい順序へ snap する。
 pub fn ensure_container_mtime_populated(state: &mut GlobalSearchState) {
     if !matches!(
         state.sort_mode,
         ContainerSortMode::Newer | ContainerSortMode::Older
     ) {
+        return;
+    }
+    if !state.done {
         return;
     }
     for c in state.containers.values_mut() {
@@ -416,10 +417,15 @@ pub(crate) fn build_aggregated_items(
             representative: c.representative.clone(),
         })
         .collect();
-    // 代表サムネを持つコンテナは make_load_request が LoadRequest を返すので、
-    // image_metas も items と同じ長さで None 埋めしておく (thumb_loader 側で mtime/size
-    // が必要な場合は UI 世代更新時に fs::metadata で遅延取得される)。
-    let image_metas: Vec<Option<(i64, i64)>> = vec![None; items.len()];
+    // 代表サムネを出すコンテナの場合、thumb_loader は `image_metas[i]` が Some で
+    // ないと enqueue 前に skip してしまう (`app.rs` の keep_start..keep_end ループ)。
+    // build_drilled_items と同じ方針で placeholder `(0, 0)` を使う:
+    // キャッシュキーはパスを含むので衝突せず、mtime ベースの invalidate が効かない
+    // 副作用は一時ビューのため許容 (通常フォルダ閲覧で新しいサムネに差し替わる)。
+    // representative が None のコンテナは make_load_request が None を返すので
+    // placeholder があっても何も起きない。
+    let placeholder = Some((0_i64, 0_i64));
+    let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; items.len()];
     (items, image_metas)
 }
 
@@ -1576,6 +1582,7 @@ mod tests {
                 kind: SearchContainerKind::Folder,
                 hit_count: 2,
                 representative: None,
+                mtime: None,
             },
         );
         map.insert(
@@ -1585,6 +1592,7 @@ mod tests {
                 kind: SearchContainerKind::Folder,
                 hit_count: 10,
                 representative: None,
+                mtime: None,
             },
         );
         map.insert(
@@ -1594,9 +1602,10 @@ mod tests {
                 kind: SearchContainerKind::Folder,
                 hit_count: 5,
                 representative: None,
+                mtime: None,
             },
         );
-        let v = sorted_containers(&map);
+        let v = sort_containers_with_mode(&map, ContainerSortMode::HitCount);
         assert_eq!(v[0].path, PathBuf::from("c:/high"));
         assert_eq!(v[1].path, PathBuf::from("c:/mid"));
         assert_eq!(v[2].path, PathBuf::from("c:/low"));
