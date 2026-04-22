@@ -134,20 +134,21 @@ impl SupervisorHandle {
 
     /// cancel シグナルだけ送り、thread join は待たない。
     ///
-    /// **IndexerManager 終了時のデッドロック回避**: 複数 supervisor が共有
-    /// `Arc<Mutex<IndexWriter>>` を使うようになった後、以下のシナリオで join が
-    /// 無限に待つ:
+    /// **IndexerManager 終了時のデッドロック回避**: dispatcher 化 (commit 30338a3) 以降は
+    /// supervisor が直接 writer lock を握ることはなく、各 sub-batch を
+    /// `dispatcher.batch(.., Background)` で submit して `rx.recv()` で完了待ちする
+    /// 構造になった。それでも次のシナリオで join が長引く可能性がある:
     ///
-    /// - A: writer を握って apply 中 (cancel_A は未設定)
-    /// - B: writer.lock() で待機中 (cancel_B はまだ未設定 or 設定済みだが
-    ///      lock が cancel を見ない)
-    /// - drop(B) が先に実行されると: cancel_B=true, しかし B は lock 待ち
-    ///   なので反応できず、A が完走するまで join(B) も待つ = 数分 hang
+    /// - A: dispatcher.batch の `recv()` でブロック中 (Background sub-batch 処理待ち)
+    /// - dispatcher: A の sub-batch を処理中 (commit に数百 ms 〜 数秒)
+    /// - drop(A) が先に走ると: cancel_A=true でも A は recv ブロック中なので反応できず、
+    ///   sub-batch が終わるまで A の thread が止まらない (= sub-batch 1 個分の hang)
     ///
-    /// 対策: `IndexerManager::drop` で全 supervisor に対して先に
-    /// `signal_stop()` を呼び、全員の cancel を立てる。こうすれば A は自分の
-    /// apply 中のループで cancel を検出して即 exit し、B は lock を取得した
-    /// 瞬間に apply 内で cancel を検出して即 exit する。
+    /// 対策: `IndexerManager::drop` で全 supervisor に対して先に `signal_stop()` を
+    /// 呼び、全員の cancel を立てる。各 supervisor は次の `apply()` ループ先頭で
+    /// cancel を検出して新規 sub-batch の submit を止め、現在実行中の 1 個だけ
+    /// 待ってから exit する。同時に、dispatcher の Drop は shutdown フラグ + condvar
+    /// notify で起動中の sub-batch 完了直後にスレッドを終了させる。
     pub fn signal_stop(&self) {
         self.cancel.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(SupervisorCommand::Stop);
@@ -179,10 +180,10 @@ pub struct SupervisorParams {
 ///
 /// - `meta_db` と `fts` はどちらも内部で Mutex または同期機構を持つのでスレッド跨ぎで使える
 /// - `io_sem` は全 Supervisor 共通で 1 つ
-/// - `writer` は **全 supervisor で共有** する `Arc<Mutex<IndexWriter>>`。
-///   Tantivy は 1 Index につき IndexWriter を 1 本しか持てないので、複数のお気に入りの
-///   supervisor が各自 `fts.writer()` を呼ぶと 2 つ目以降が LockBusy で落ちる
-///   (旧実装のバグ)。IndexerManager が 1 本だけ作って全員で借りる。
+/// - `writer` は **全 supervisor + tag worker で共有** する `Arc<FtsWriterDispatcher>`。
+///   Tantivy は 1 Index につき IndexWriter 1 本制約なので、所有権を専用 dispatcher
+///   スレッドに集約し、各利用者は `WriterPriority` 付きでジョブを submit する
+///   (interactive な tag worker が長時間 background ingest に starve しないように)。
 pub fn spawn(
     params: SupervisorParams,
     meta_db: Arc<FtsMetaDb>,

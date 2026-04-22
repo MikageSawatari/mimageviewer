@@ -271,9 +271,11 @@ impl IndexerManager {
             .filter(|id| !current_on_ids.contains(id) || path_changed.contains(id))
             .copied()
             .collect();
-        // **Codex P1 回帰 (2026-04)**: 共有 writer 下では 1 体ずつ drop すると
-        // writer.lock() 待機中の supervisor が join 無限待ちになる可能性がある。
-        // IndexerManager::drop と同じ signal_stop → drain パターンを使う。
+        // dispatcher 化後 (commit 30338a3) も signal_stop → drain パターンを維持する:
+        // 1 体ずつ drop すると、その supervisor が `dispatcher.batch().recv()` でブロック中の
+        // sub-batch が完了するまで join できない (= sub-batch 1 個分の hang)。先に全員に
+        // cancel を立てておけば、現在の sub-batch が終わった時点で各 supervisor が
+        // 次のループ先頭で cancel を検出し、即 exit できる。
         for id in &to_stop {
             if let Some(handle) = self.supervisors.get(id) {
                 crate::logger::log(format!(
@@ -457,12 +459,11 @@ impl Drop for IndexerManager {
     fn drop(&mut self) {
         // STEP 1: 全 supervisor に同時に cancel シグナルを送る。
         //
-        // **重要**: 共有 Arc<Mutex<IndexWriter>> の下では、writer.lock() 待機中の
-        // supervisor は自分の cancel を観測できない。1 つずつ drop すると、lock を
-        // 取れていない supervisor が先に drop された場合に、他の supervisor が
-        // writer を長時間保持していると join が無限に待つ。
-        // 先に全員の cancel を立てておけば、各 supervisor が apply 内の for ループで
-        // cancel を検出して早期 exit し、writer もすぐに解放される。
+        // **重要**: dispatcher 化後 (commit 30338a3) も同じ「全員に先に cancel → 順次 join」
+        // パターンを維持する。各 supervisor は `dispatcher.batch().recv()` で sub-batch 完了
+        // 待ちにブロックすることがあり、1 体ずつ drop すると現在処理中の sub-batch が
+        // 終わるまで止まれない。先に全員の cancel を立てておけば、現 sub-batch 完了直後の
+        // ループ先頭で cancel を検出して即 exit する。
         for (id, handle) in &self.supervisors {
             crate::logger::log(format!("IndexerManager: signaling supervisor {id} to stop"));
             handle.signal_stop();

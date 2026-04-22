@@ -7,9 +7,10 @@
 //!
 //! # Tantivy writer 共有
 //!
-//! Tantivy は 1 Index につき IndexWriter を 1 本しか許さないため、
-//! `IndexerManager` が保有する `Arc<Mutex<IndexWriter>>` を共有して使う。
-//! worker が独自に `fts.writer()` を呼ぶと LockBusy で全 upsert が無効化される。
+//! Tantivy は 1 Index につき IndexWriter を 1 本しか許さないため、`IndexerManager` が
+//! 保有する `Arc<FtsWriterDispatcher>` を共有して使う。タグ書き込みは
+//! `WriterPriority::Interactive` で submit され、background ingest の sub-batch
+//! 境界で必ず割り込めるので、起動直後の大規模スキャン中でも応答性が保たれる。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
