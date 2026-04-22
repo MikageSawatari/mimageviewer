@@ -165,17 +165,24 @@
     <p>タグは XMP <code>dc:subject</code> として書き込みます。これは写真管理ソフトで
     広く採用されている標準フォーマットです:</p>
     <ul>
-      <li><strong>Adobe Lightroom / Bridge</strong>: キーワードとして認識されます (全形式)。</li>
-      <li><strong>ExifTool</strong>: <code>-XMP-dc:Subject</code> で読み取り可能 (全形式)。</li>
-      <li><strong>Windows エクスプローラー</strong>: JPEG の「タグ」欄には表示されます。
-          PNG / WebP は Explorer 側の仕様上、XMP タグが表示されません
-          (Lightroom 等では表示されます)。</li>
+      <li><strong>Adobe Lightroom / Bridge</strong>: キーワードとして認識されます。</li>
+      <li><strong>ExifTool</strong>: <code>-XMP-dc:Subject</code> で読み取り可能。</li>
+      <li><strong>digiKam</strong> (無料・オープンソース) / <strong>XnView MP</strong>
+          (個人利用無料) など XMP に対応した画像管理ソフトでも読み取れます。</li>
     </ul>
     <p>他ソフトで既に <code>dc:subject</code> にタグが入っていても、mImageViewer は
     <strong>既存要素を保持</strong>したまま <code>#タグ名</code> だけを追加します。</p>
-    <p>なお、JPEG のタグが Windows エクスプローラーに出てこない場合は、エクスプローラーの
-    キャッシュが古いままになっていることがあります。フォルダを開き直すか F5 で更新すると
-    反映されます。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>Windows エクスプローラーの「タグ」欄について:</strong>
+        Windows エクスプローラーのプロパティ画面は XMP ではなく IPTC Keywords を優先して
+        読むため、mImageViewer で付けたタグは<strong>エクスプローラー側には表示されません</strong>。
+        写真管理ソフト (Lightroom / Bridge / digiKam / XnView MP) や ExifTool では
+        問題なく読み取れます。
+      </div>
+    </div>
 
     <h2 id="precautions">7. 注意事項</h2>
 
@@ -227,7 +234,7 @@
       <div class="box-body">
         <strong>他ソフトで付けたタグも検索できます:</strong>
         メタ索引を作ると、<code>dc:subject</code> 内の <code>#</code> 始まりのタグを自動で取り込むので、
-        Windows エクスプローラー・Lightroom 等でつけたタグも Ctrl+G で横断検索できるようになります。
+        Lightroom 等でつけたタグも Ctrl+G で横断検索できるようになります。
       </div>
     </div>
   </main>
