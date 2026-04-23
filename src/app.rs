@@ -1641,9 +1641,14 @@ pub struct App {
     /// show 時に take して `SetWindowPlacement` する。トレイスレッドから Win32 を直接
     /// 叩けるようにすることで、復帰時の黒フラッシュ / サイズジャンプを防ぐ。
     pub(crate) placement_slot: Option<crate::tray::PlacementSlot>,
-    /// 2 重起動検出時に既存インスタンスを前面に出すためのリスナースレッドハンドル。
-    /// 最初のフレームで HWND が取れたタイミングで spawn し、Drop で join する。
+    /// 2 重起動検出時に既存インスタンスを前面に出す + インストーラからのクリーン終了
+    /// 要求を拾うためのリスナースレッドハンドル。最初のフレームで HWND が取れた
+    /// タイミングで spawn し、Drop で join する。
     pub(crate) activation_listener: Option<crate::single_instance::ActivationListener>,
+    /// インストーラ (Inno Setup) が shutdown event を発火したときに listener スレッドが
+    /// `true` を書き込む。`maybe_intercept_close` がこれを見てトレイ非表示でも確実に
+    /// 終了するようにする。tray Quit と同じ扱い。
+    pub(crate) shutdown_requested: Arc<AtomicBool>,
 }
 
 impl Default for App {
@@ -1931,6 +1936,7 @@ impl Default for App {
             main_hwnd: None,
             placement_slot: None,
             activation_listener: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -9425,6 +9431,7 @@ impl eframe::App for App {
                             hwnd_raw,
                             ctx.clone(),
                             slot,
+                            self.shutdown_requested.clone(),
                         );
                 }
             }

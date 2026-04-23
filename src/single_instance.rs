@@ -45,6 +45,13 @@ pub struct SingleInstanceGuard {
 #[cfg(windows)]
 static ACTIVATE_EVENT_RAW: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 
+/// Inno Setup インストーラから呼ばれ、既存インスタンスにクリーン終了を要求するための
+/// shutdown event の生 HANDLE。トレイ常駐中でも、インストーラが `SetEvent` すれば
+/// アプリは tray "終了" と同じ on_exit 経由で抜けるので、ユーザが手動でトレイを
+/// 操作しなくても次ステップに進めるようになる。
+#[cfg(windows)]
+static SHUTDOWN_EVENT_RAW: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
 /// インストーラの `AppMutex` と一致させる mutex 名。
 ///
 /// - `Global\` プレフィックス: ターミナルサービス (リモートデスクトップ) 配下でも
@@ -77,14 +84,16 @@ impl SingleInstanceGuard {
                     }
                 };
 
-            // 1 個目のインスタンスは activate event も即座に作成する。
+            // 1 個目のインスタンスは activate / shutdown event も即座に作成する。
             // 2 個目起動は mutex check → `signal_activate_existing` で `OpenEventW`
             // するので、event の存在が mutex の存在と同期している必要がある。
+            // インストーラ (`SignalAppShutdown` from Inno Setup) も同様に shutdown event を
+            // `OpenEventW` するので、こちらも同時に作る。
             if is_first {
-                let event_name: Vec<u16> =
+                let activate_wide: Vec<u16> =
                     ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
                 // auto-reset (`bManualReset=false`) + 初期 non-signaled
-                match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) }
+                match unsafe { CreateEventW(None, false, false, PCWSTR(activate_wide.as_ptr())) }
                 {
                     Ok(h) => {
                         let _ = ACTIVATE_EVENT_RAW.set(h.0 as isize);
@@ -92,6 +101,19 @@ impl SingleInstanceGuard {
                     Err(e) => {
                         crate::logger::log(format!(
                             "single_instance: CreateEventW(activate) failed: {e:?}"
+                        ));
+                    }
+                }
+                let shutdown_wide: Vec<u16> =
+                    SHUTDOWN_EVENT_NAME.encode_utf16().chain([0]).collect();
+                match unsafe { CreateEventW(None, false, false, PCWSTR(shutdown_wide.as_ptr())) }
+                {
+                    Ok(h) => {
+                        let _ = SHUTDOWN_EVENT_RAW.set(h.0 as isize);
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "single_instance: CreateEventW(shutdown) failed: {e:?}"
                         ));
                     }
                 }
@@ -136,6 +158,12 @@ impl Drop for SingleInstanceGuard {
 /// することで、シグナルが届いた瞬間に自動で non-signaled に戻る → 連続再トリガ可能。
 pub const ACTIVATE_EVENT_NAME: &str = "Global\\mImageViewerActivate_v1";
 
+/// インストーラ (Inno Setup `[Code]` / `SignalAppShutdown`) が、既存の mIV インスタンスに
+/// クリーン終了を要求するための Named Event 名。トレイ常駐中のインスタンスでも
+/// この event を拾うと `on_exit` 経由で DB 書き出し + 設定保存してから抜けるので、
+/// 「インストール時にトレイの "終了" を手動で押す」手順が要らなくなる。
+pub const SHUTDOWN_EVENT_NAME: &str = "Global\\mImageViewerShutdown_v1";
+
 /// 既存インスタンスに「ウィンドウを復帰させろ」と通知する。Windows 専用。
 /// 2 重起動検出時に呼び、既存プロセスが応答してから自プロセスを終了する想定。
 pub fn signal_activate_existing() -> bool {
@@ -179,28 +207,39 @@ pub struct ActivationListener {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// メインプロセス側のアクティベーションリスナーを起動する。
-/// 2 重起動を試みた別プロセスが `signal_activate_existing()` でイベントを発火したら、
-/// waiter スレッドが placement_slot (あれば) を復元 + `ShowWindow` + `SetForegroundWindow`
-/// で復帰させる。
+/// メインプロセス側のシングルインスタンスリスナーを起動する。3 種のイベントを待機:
+/// - **activate**: 2 重起動を試みた別プロセスが `signal_activate_existing()` を呼んだら、
+///   `placement_slot` (あれば) を復元 + `ShowWindow` + `SetForegroundWindow` で前面に戻す
+/// - **shutdown**: インストーラ (`SignalAppShutdown`) が発火したら、`shutdown_requested`
+///   を立てて WM_CLOSE を投げ、tray 右クリック「終了」と同じクリーン終了経路に合流
+///   (トレイ常駐で非表示なら DWM cloak を併用してフラッシュを抑える)
+/// - **stop**: Drop 時にハンドルを解放してスレッドを畳む内部用
 ///
 /// - `placement_slot`: トレイ hide 時に保存された `WINDOWPLACEMENT`。ある場合は
 ///   `SetWindowPlacement` で DPI 丸めを回避しつつ元のサイズ・位置で復元する。
+/// - `shutdown_requested`: shutdown event を受けたときに `true` を書き込む共有フラグ。
+///   `App::maybe_intercept_close` が見て「このクローズは本当に終了」と判断する。
 ///
-/// activate event は `SingleInstanceGuard::acquire` が `ACTIVATE_EVENT_RAW` OnceLock に
-/// 既に登録しているのでここで作成は不要。
+/// activate / shutdown event は `SingleInstanceGuard::acquire` が OnceLock に既に登録
+/// しているのでここで作成は不要。
 pub fn spawn_activation_listener(
     hwnd_raw: isize,
     egui_ctx: eframe::egui::Context,
     placement_slot: crate::tray::PlacementSlot,
+    shutdown_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<ActivationListener> {
     #[cfg(windows)]
     {
+        use std::sync::atomic::Ordering;
         use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
         use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
         use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
-        use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, SW_SHOW,
+            SW_SHOWNOACTIVATE, WM_CLOSE,
+        };
 
         let Some(&activate_event_raw) = ACTIVATE_EVENT_RAW.get() else {
             crate::logger::log(
@@ -208,6 +247,9 @@ pub fn spawn_activation_listener(
             );
             return None;
         };
+        // shutdown event は None でも activate listener 自体は動かせるように扱う
+        // (古い DLL / まれに CreateEvent 失敗した場合のフォールバック)。
+        let shutdown_event_raw = SHUTDOWN_EVENT_RAW.get().copied().unwrap_or(0);
         let stop_event: HANDLE = match unsafe {
             CreateEventW(None, true, false, PCWSTR::null())
         } {
@@ -220,12 +262,14 @@ pub fn spawn_activation_listener(
             }
         };
 
-        struct HandlePair {
+        struct HandleSet {
             activate: isize,
+            shutdown: isize,
             stop: isize,
         }
-        let handles = HandlePair {
+        let handles = HandleSet {
             activate: activate_event_raw,
+            shutdown: shutdown_event_raw,
             stop: stop_event.0 as isize,
         };
 
@@ -234,18 +278,25 @@ pub fn spawn_activation_listener(
             .spawn(move || {
                 let activate = HANDLE(handles.activate as *mut _);
                 let stop = HANDLE(handles.stop as *mut _);
-                let wait_handles = [activate, stop];
+                // shutdown が作成失敗していた場合は、stop イベントを代わりに並べて
+                // 「発火しない 2 番目」として扱う。インデックスは activate / shutdown / stop
+                // で固定しておき、見やすさを保つ。
+                let shutdown = if handles.shutdown != 0 {
+                    HANDLE(handles.shutdown as *mut _)
+                } else {
+                    stop
+                };
+                let wait_handles = [activate, shutdown, stop];
                 loop {
                     let r =
                         unsafe { WaitForMultipleObjects(&wait_handles, false, INFINITE) };
+                    let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
                     if r == WAIT_OBJECT_0 {
                         crate::logger::log(
                             "single_instance: activate event signaled — restoring window",
                         );
                         // placement_slot に hide 時の WINDOWPLACEMENT があれば先に復元し、
                         // DPI 丸めによるサイズ / 位置のズレを回避する (トレイ Open と同じ挙動)。
-                        let hwnd =
-                            windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
                         let used_placement = {
                             let mut slot = placement_slot.lock().unwrap();
                             if let Some(p) = slot.take() {
@@ -262,7 +313,28 @@ pub fn spawn_activation_listener(
                             let _ = SetForegroundWindow(hwnd);
                         }
                         egui_ctx.request_repaint();
-                    } else if r.0 == WAIT_OBJECT_0.0 + 1 {
+                    } else if r.0 == WAIT_OBJECT_0.0 + 1 && handles.shutdown != 0 {
+                        crate::logger::log(
+                            "single_instance: shutdown event signaled — requesting clean exit",
+                        );
+                        shutdown_requested.store(true, Ordering::SeqCst);
+                        // トレイ常駐で非表示なら DWM cloak してから ShowWindow → WM_CLOSE。
+                        // (tray Quit と同じ経路で、終了時のウィンドウ一瞬復帰を抑制する)
+                        unsafe {
+                            if !IsWindowVisible(hwnd).as_bool() {
+                                let cloak_true: i32 = 1;
+                                let _ = DwmSetWindowAttribute(
+                                    hwnd,
+                                    DWMWA_CLOAK,
+                                    &cloak_true as *const _ as *const _,
+                                    std::mem::size_of::<i32>() as u32,
+                                );
+                                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                            }
+                            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                        egui_ctx.request_repaint();
+                    } else if r.0 == WAIT_OBJECT_0.0 + 2 {
                         break;
                     } else if r == WAIT_FAILED {
                         crate::logger::log("single_instance: WaitForMultipleObjects failed");
@@ -273,6 +345,9 @@ pub fn spawn_activation_listener(
                 }
                 unsafe {
                     let _ = CloseHandle(activate);
+                    if handles.shutdown != 0 {
+                        let _ = CloseHandle(HANDLE(handles.shutdown as *mut _));
+                    }
                 }
                 crate::logger::log("single_instance: listener thread exiting");
             })
@@ -285,7 +360,7 @@ pub fn spawn_activation_listener(
     }
     #[cfg(not(windows))]
     {
-        let _ = (hwnd_raw, egui_ctx);
+        let _ = (hwnd_raw, egui_ctx, shutdown_requested);
         None
     }
 }

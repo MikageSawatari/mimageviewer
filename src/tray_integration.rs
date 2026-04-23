@@ -70,12 +70,15 @@ impl App {
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
-        // トレイメニュー「終了」経由の強制終了要求は常に通す。
+        // トレイメニュー「終了」 / インストーラからの shutdown 要求は常に通す。
         let tray_wants_quit = self
             .tray_controller
             .as_ref()
             .is_some_and(|tc| tc.is_quit_requested());
-        if tray_wants_quit {
+        let installer_wants_quit = self
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if tray_wants_quit || installer_wants_quit {
             return false;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
