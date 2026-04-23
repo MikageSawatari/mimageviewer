@@ -143,9 +143,15 @@ ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバ�
 新しい永続ストレージを追加する時は、`rotation_db.rs` と `adjustment_db.rs` の
 `normalize_path` / page_key 生成に揃えること。**キー規則がズレると ZIP/PDF の回転や補正が保存されない**。
 
-`rating_db.rs` は `App::page_path_key` が返すキー (`adjustment_db::normalize_path` と同形式、
-ZipImage は `::`、PdfPage は `::page_N` 区切り) をそのまま DB パスとして使う。
-新規 DB を追加する際は同じ関数を使うと 3 バリアントへの対応が同時に揃う。
+`rating_db.rs` はページ単位 (画像 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP / PDF
+本体) の両方を同じテーブルに格納する。キーは `App::rating_path_key` 経由:
+- ページ単位は `App::page_path_key` と同じ (`adjustment_db::normalize_path` 形式、ZipImage は
+  `::entry`、PdfPage は `::page_N` 区切り)
+- コンテナは `normalize_path(path)` のみで、`::` セパレータが付かない。
+  この構造により「ZIP ファイルへのコンテナ★」と「その ZIP 内エントリへのページ★」が同じ
+  DB 内で衝突せずに共存できる。
+新規ページ単位 DB を追加する際は `page_path_key` を使い、コンテナ単位は
+`normalize_path(path)` を直接使う。
 
 ### 3.4 「先頭 1 枚」の取得
 

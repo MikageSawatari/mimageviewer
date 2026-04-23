@@ -547,22 +547,53 @@ impl App {
         }
 
         let enter_pressed = self.dialog_enter_pressed(ctx);
+        // 現在表示中フォルダ / ZIP / PDF のコンテナレーティングを取得。
+        // 0 のときは非表示、1〜5 のときは★バッジをアドレス欄の右端に表示する。
+        let folder_rating = self.current_folder_rating();
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<PathBuf> {
                 ui.add_space(3.0);
                 let mut result = None;
                 ui.horizontal(|ui| {
                     ui.label("フォルダ:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.address).desired_width(f32::INFINITY),
+                    // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
+                    // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
+                    // TextEdit は available width いっぱいに広がる。
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if folder_rating >= 1 && folder_rating <= 5 {
+                                let stars = "★".repeat(folder_rating as usize);
+                                ui.label(
+                                    egui::RichText::new(format!("📁{stars}"))
+                                        .color(egui::Color32::from_rgb(130, 170, 220))
+                                        .strong(),
+                                )
+                                .on_hover_text(
+                                    "このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]",
+                                );
+                                ui.add_space(4.0);
+                            }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.address)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    self.address_has_focus = resp.has_focus();
+                                    if resp.lost_focus() && enter_pressed {
+                                        let p = PathBuf::from(&self.address);
+                                        if let Some(resolved) =
+                                            crate::folder_tree::resolve_openable_path(&p)
+                                        {
+                                            result = Some(resolved);
+                                        }
+                                    }
+                                },
+                            );
+                        },
                     );
-                    self.address_has_focus = resp.has_focus();
-                    if resp.lost_focus() && enter_pressed {
-                        let p = PathBuf::from(&self.address);
-                        if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
-                            result = Some(resolved);
-                        }
-                    }
                 });
                 ui.add_space(3.0);
                 result

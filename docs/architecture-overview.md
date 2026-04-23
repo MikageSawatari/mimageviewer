@@ -193,7 +193,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`) | `settings.rs` |
 | `catalog.db` | サムネイル WebP キャッシュ (BLOB) + メタデータ | `catalog.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
-| `rating.db` | レーティング (★1〜5、0 は未登録) | `rating_db.rs` |
+| `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF 名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み | `fts_index.rs` → `ingest_worker.rs` / `tag_write_worker.rs` |
 | `fts_meta.db` | ファイル管理状態 + ソース別 normalized 全文 (post-filter 用) | `fts_meta.rs` |

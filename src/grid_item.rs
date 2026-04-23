@@ -89,14 +89,31 @@ impl GridItem {
     /// - ZipImage: ZIP 内エントリのベース名
     /// - ZipSeparator: ディレクトリ表示名
     /// - PdfPage: "Page N" (1-indexed)
-    /// レーティング (★)・補正プリセット等、ページ単位の永続データを持てるアイテムか。
+    /// 補正プリセット / 消しゴムマスク / タグなど、ページ単位の永続データを持てるアイテムか。
     /// 通常画像 / ZIP 内画像 / PDF ページが対象。フォルダ・動画・ZIP/PDF ファイル本体・
     /// セパレータは対象外。
+    ///
+    /// レーティング (★) はページ単位に加えてコンテナ (フォルダ / ZIP / PDF 本体) も対象に
+    /// する方針 (一覧画面で★絞り込みするため)。レーティング用途の判定には
+    /// [`Self::accepts_rating`] を使うこと。
     pub fn is_ratable(&self) -> bool {
         matches!(
             self,
             Self::Image(_) | Self::ZipImage { .. } | Self::PdfPage { .. }
         )
+    }
+
+    /// コンテナ (フォルダ / ZIP ファイル / PDF ファイル) 自体へのレーティング対象か。
+    /// 一覧画面でコンテナを★絞り込みできるようにするための判定。
+    pub fn is_container_ratable(&self) -> bool {
+        matches!(self, Self::Folder(_) | Self::ZipFile(_) | Self::PdfFile(_))
+    }
+
+    /// レーティング★を付与できるアイテムかの総合判定。
+    /// ページ単位 (画像 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP / PDF) の
+    /// 両方を含む。補正プリセット等のページ専用データとは別物なので区別すること。
+    pub fn accepts_rating(&self) -> bool {
+        self.is_ratable() || self.is_container_ratable()
     }
 
     pub fn name(&self) -> Cow<'_, str> {
