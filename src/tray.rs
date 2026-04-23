@@ -260,8 +260,8 @@ fn run_tray_thread(
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, PostMessageW, SetForegroundWindow, ShowWindow,
-        TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WM_CLOSE,
+        DispatchMessageW, GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW,
+        SetForegroundWindow, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WM_QUIT,
     };
 
     // HWND (`*mut c_void`) は Send/Sync ではないので、クロージャでキャプチャするときは
@@ -379,16 +379,35 @@ fn run_tray_thread(
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
                 let hwnd = make_hwnd(hwnd_raw);
-                // 直接 WM_CLOSE を post するだけ (SW_SHOW しない)。
-                // hidden 状態でも WM_CLOSE は winit の WindowProc に届き、
-                // CloseRequested を発火して eframe が maybe_intercept_close に到達する。
-                // SW_SHOW を挟むと終了直前にウィンドウが一瞬光って不自然。
+                // WM_QUIT をメインスレッドに直接 post する。
+                //
+                // 以前は `PostMessageW(WM_CLOSE)` を使っていたが、winit がその close を
+                // 処理するために hidden なウィンドウを一瞬可視化する副作用があり、
+                // 終了直前にウィンドウが光って不自然だった。
+                //
+                // WM_QUIT は WndProc を経由せず、winit のイベントループの
+                // `GetMessage`/`PeekMessage` 段階で検出されてそのままループ終了に
+                // つながる。可視化が挟まらないので静かに終わる。
+                // eframe の on_exit もこのルートで呼ばれる (hide_to_tray で既に
+                // settings.save() + sidecar flush 済みなのでどちらでも安全)。
                 unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    let main_tid = GetWindowThreadProcessId(hwnd, None);
+                    if main_tid != 0 {
+                        let _ = PostThreadMessageW(
+                            main_tid,
+                            WM_QUIT,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    } else {
+                        crate::logger::log(
+                            "tray: GetWindowThreadProcessId returned 0 (cannot quit cleanly)",
+                        );
+                    }
                 }
                 let _ = event_tx.send(TrayEvent::QuitRequested);
                 ctx.request_repaint();
-                crate::logger::log("tray: Quit → quit_flag + PostMessage(WM_CLOSE)");
+                crate::logger::log("tray: Quit → quit_flag + PostThreadMessage(WM_QUIT)");
             }
         }));
     }

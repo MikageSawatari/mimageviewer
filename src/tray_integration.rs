@@ -138,6 +138,8 @@ impl App {
         self.release_gpu_resources();
         // 終了時と同じく、dirty なサイドカー・設定をこのタイミングで flush する
         // (電源断・クラッシュ時に失わないため)。inner_size が不明なら前回保存値を維持。
+        // トレイメニューの「終了」は WM_QUIT 経路で on_exit を呼ばずに終わる可能性があるため、
+        // hide のタイミングで確実に全 flush しておくことでデータロスを防ぐ。
         if let Some(rect) = self.last_outer_rect {
             self.settings.window_pos = Some([rect.min.x, rect.min.y]);
         }
@@ -145,6 +147,7 @@ impl App {
             self.settings.window_size = Some(size);
         }
         self.settings.save();
+        self.flush_all_sidecars();
 
         // トレイの表示を更新
         self.update_tray_tooltip();
@@ -152,11 +155,13 @@ impl App {
     }
 
     /// タスクトレイから復帰した後の **App 側事後処理**。
-    ///
-    /// Win32 `SetWindowPlacement` / `ShowWindow` / `SetForegroundWindow` +
-    /// `ActivityGate` / `io_sem` 解除は既にトレイスレッド側で完了済み。ここは
-    /// window_visible フラグの更新 + ログ + ツールチップ更新のみ。
+    /// トレイスレッドの OpenRequested 経路と、外部 ShowWindow 検出経路の両方から呼ばれる。
     fn sync_after_restore(&mut self) {
+        self.sync_after_restore_internal();
+    }
+
+    /// `update` から直接呼べる版。borrow チェッカ回避で `&mut self` のみ要求。
+    pub(crate) fn sync_after_restore_internal(&mut self) {
         if self.window_visible {
             return;
         }

@@ -9285,6 +9285,30 @@ impl eframe::App for App {
             }
         }
 
+        // 実際の Win32 可視状態と App の `window_visible` を毎フレーム同期する。
+        // トレイスレッドや 2 重起動アクティベーションリスナーが `ShowWindow` を直接呼ぶ
+        // 経路があるので、こちらは flag を追従させる責務を持つ。不一致が残ると
+        // `hide_to_tray` の early-return で [×] が効かなくなる等の不具合につながる。
+        #[cfg(windows)]
+        if let Some(hwnd_raw) = self.main_hwnd {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+            let is_visible_now =
+                unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
+            if is_visible_now && !self.window_visible {
+                // 外部経路 (アクティベーションリスナー等) でウィンドウが可視化された。
+                // tray スレッドの OpenRequested イベントを経由しなかったので、
+                // 同等の事後処理をここで実行する。
+                crate::logger::log(
+                    "tray: detected external ShowWindow — running sync_after_restore",
+                );
+                self.sync_after_restore_internal();
+            } else if !is_visible_now && self.window_visible {
+                // 外部経路で hide された (通常は tray の hide_to_tray 経由)。
+                self.window_visible = false;
+            }
+        }
+
         // タスクトレイ: 設定変更を反映 + メニューイベントをポーリング + 閉じるボタンの
         // 乗っ取り判定。ここは毎フレーム先頭で処理する (close_requested を取りこぼさないため)。
         self.sync_tray_with_settings(ctx);
