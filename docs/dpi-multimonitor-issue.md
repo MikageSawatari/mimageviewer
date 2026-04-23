@@ -86,6 +86,10 @@ ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
 
 #### 案 D: eframe の最新版にアップデート
 - eframe 0.33 に更新済み。問題が継続するか要再確認
+- 2026-04: eframe 0.34.1 へのアップデートを試みたが、wgpu 29 の依存グラフで
+  `gpu-allocator 0.28` が `windows 0.61` を引く一方 `wgpu-hal 29` は内部で
+  `windows 0.62` を期待しており、`ID3D12Heap` 型の衝突で ビルド不能だった。
+  `gpu-allocator 0.29` または `wgpu 30` 待ち。上流の修正が出たら再チャレンジ。
 
 #### 案 E: ウィンドウを最大化して使う
 - ユーザー側の回避策として、最大化状態では `Win+Shift+Arrow` の位置ずれが出にくい可能性
