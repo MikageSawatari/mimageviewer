@@ -385,20 +385,34 @@ fn run_tray_thread(
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
                 let hwnd = make_hwnd(hwnd_raw);
-                // 常に eframe の通常 close 経路を通って on_exit / Drop を走らせる
-                // (インデクサ / tag writer / Tantivy writer 等の graceful shutdown のため)。
-                // 非表示状態の場合は winit が WM_CLOSE を処理するため一瞬可視化されるので、
-                // 先に `SW_SHOWNOACTIVATE` (フォーカス奪わず・アニメーション最小) で可視化しておく。
-                // クリーンな終了を優先し、一瞬の表示は許容する。
+                // 常に eframe の通常 close 経路を通って on_exit / Drop を走らせる。
+                // 非表示状態では winit が hidden window に対して `update` を回さないため
+                // close_requested が処理されない。そこで以下の手順で「winit は可視と見るが
+                // 画面には出ない」状態に持っていく:
+                //   1. DWM の DWMWA_CLOAK を有効化 → コンポジットされないので画面に出ない
+                //   2. ShowWindow(SW_SHOWNOACTIVATE) → Win32 的に可視に (winit が update を回す)
+                //   3. PostMessage(WM_CLOSE) → 通常の close フロー
+                // 結果として黒フラッシュ / 復元アニメーションを完全に抑制しつつ、インデクサや
+                // tag writer 等の graceful shutdown を保証できる。
                 unsafe {
+                    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
                     if !IsWindowVisible(hwnd).as_bool() {
+                        // BOOL は 4 バイト整数 (TRUE=1)。DWM 側は *const c_void で受ける
+                        // のでサイズを厳密に指定するだけでよい (型は BOOL 相当)。
+                        let cloak_true: i32 = 1;
+                        let _ = DwmSetWindowAttribute(
+                            hwnd,
+                            DWMWA_CLOAK,
+                            &cloak_true as *const _ as *const _,
+                            std::mem::size_of::<i32>() as u32,
+                        );
                         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     }
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
                 let _ = event_tx.try_send(TrayEvent::QuitRequested);
                 ctx.request_repaint();
-                crate::logger::log("tray: Quit → WM_CLOSE (clean shutdown)");
+                crate::logger::log("tray: Quit → DWM cloak + SW_SHOWNOACTIVATE + WM_CLOSE");
             }
         }));
     }
