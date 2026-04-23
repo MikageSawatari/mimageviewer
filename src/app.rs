@@ -4993,19 +4993,50 @@ impl App {
 
             // F1-F5: レーティング 1〜5 を適用 / F6: レーティング解除
             // (チェック済みアイテムがあれば一括、なければ選択にのみ)
+            // Shift+F1-F5 / F6: 現在一覧表示中のフォルダ / ZIP / PDF 本体に評価を付与。
+            // matches_logically 対策で Shift 版を先に consume する (NONE は Shift 入りも拾う)。
             {
-                let rating_key = ctx.input(|i| {
-                    if i.key_pressed(egui::Key::F1) {
+                let shift_rating_key = ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F1) {
                         Some(1u8)
-                    } else if i.key_pressed(egui::Key::F2) {
+                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F2) {
                         Some(2)
-                    } else if i.key_pressed(egui::Key::F3) {
+                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3) {
                         Some(3)
-                    } else if i.key_pressed(egui::Key::F4) {
+                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4) {
                         Some(4)
-                    } else if i.key_pressed(egui::Key::F5) {
+                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
                         Some(5)
-                    } else if i.key_pressed(egui::Key::F6) {
+                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6) {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(stars) = shift_rating_key {
+                    if self.set_current_folder_rating(stars) {
+                        if stars == 0 {
+                            self.show_feedback_toast("[フォルダ★解除]".to_string());
+                        } else {
+                            self.show_feedback_toast(format!(
+                                "[フォルダ{}]",
+                                "★".repeat(stars as usize)
+                            ));
+                        }
+                    }
+                }
+                let rating_key = ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::F1) {
+                        Some(1u8)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
+                        Some(2)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
+                        Some(3)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
+                        Some(4)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
+                        Some(5)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F6) {
                         Some(0)
                     } else {
                         None
@@ -6167,8 +6198,9 @@ impl App {
     }
 
     /// `search_filter` とレーティングフィルタに基づいて `visible_indices` を再計算する。
-    /// 両者は AND 結合。レーティングフィルタはレーティング対象 (Image/ZipImage/PdfPage) にのみ適用され、
-    /// フォルダ / ZIP / PDF / 動画 / セパレータなどは常に通す。
+    /// 両者は AND 結合。レーティングフィルタはレーティング対象に適用される:
+    /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
+    /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
         let search_filter = self.search_filter.clone();
         let rating_filter = self.settings.rating_filter;
@@ -6184,8 +6216,8 @@ impl App {
                 }
             }
             if rating_filter_active {
-                let ratable = matches!(self.items.get(i), Some(it) if it.is_ratable());
-                if ratable {
+                let accepts = matches!(self.items.get(i), Some(it) if it.accepts_rating());
+                if accepts {
                     let stars = self.get_rating(i) as usize;
                     if stars > 5 || !rating_filter[stars] {
                         continue;
@@ -6352,19 +6384,36 @@ impl App {
 
     // ── レーティング ───────────────────────────────────────────────
 
+    /// レーティング DB キーを返す。
+    /// ページ単位 (画像 / ZIP 内画像 / PDF ページ) は `page_path_key` と同じ形式。
+    /// コンテナ (フォルダ / ZIP / PDF 本体) はそのパスを `normalize_path` したもの。
+    /// `::` セパレータの有無でページとコンテナを区別するので衝突しない。
+    pub(crate) fn rating_path_key(&self, idx: usize) -> Option<String> {
+        let item = self.items.get(idx)?;
+        match item {
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
+                self.page_path_key(idx)
+            }
+            GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                Some(crate::adjustment_db::normalize_path(p))
+            }
+            _ => None,
+        }
+    }
+
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
-    /// フォルダ / 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
+    /// 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
+    /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     /// 非対象アイテムはキャッシュを汚さないように insert しない。
     pub(crate) fn get_rating(&mut self, idx: usize) -> u8 {
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
-        let item = match self.items.get(idx) {
-            Some(it) if it.is_ratable() => it,
-            _ => return 0,
-        };
-        let _ = item;
-        let key = match self.page_path_key(idx) {
+        let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
+        if !accepts {
+            return 0;
+        }
+        let key = match self.rating_path_key(idx) {
             Some(k) => k,
             None => return 0,
         };
@@ -6375,13 +6424,14 @@ impl App {
 
     /// 指定 idx のレーティングを設定する (0..=5)。
     /// レーティング対象外アイテムの場合は何もしない。
+    /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) {
-        let ratable = matches!(self.items.get(idx), Some(it) if it.is_ratable());
-        if !ratable {
+        let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
+        if !accepts {
             return;
         }
         let stars = stars.min(5);
-        let key = match self.page_path_key(idx) {
+        let key = match self.rating_path_key(idx) {
             Some(k) => k,
             None => return,
         };
@@ -6394,6 +6444,7 @@ impl App {
     /// フォルダ読み込み直後に rating_cache を一括プリウォームする。
     /// 単発の SELECT を N 回投げる代わりに `WHERE path IN (...)` を 1 回で済ませる。
     /// 結果に含まれないキーは 0 (未評価) としてキャッシュに入れ、以後の DB アクセスを抑制する。
+    /// ページ単位とコンテナの両方を対象とする。
     pub(crate) fn prewarm_rating_cache(&mut self) {
         let db = match self.rating_db.as_ref() {
             Some(db) => db,
@@ -6401,10 +6452,10 @@ impl App {
         };
         let mut idx_keys: Vec<(usize, String)> = Vec::with_capacity(self.items.len());
         for (idx, item) in self.items.iter().enumerate() {
-            if !item.is_ratable() {
+            if !item.accepts_rating() {
                 continue;
             }
-            if let Some(k) = self.page_path_key(idx) {
+            if let Some(k) = self.rating_path_key(idx) {
                 idx_keys.push((idx, k));
             }
         }
@@ -6414,6 +6465,61 @@ impl App {
             let stars = map.get(&key).copied().unwrap_or(0);
             self.rating_cache.insert(idx, stars);
         }
+    }
+
+    /// `current_folder` (現在一覧表示中のフォルダ / ZIP / PDF) のレーティングを取得する。
+    /// アドレスバー右端の★表示・Shift+F1〜F6 のトースト表示などで使う。
+    /// 検索結果ビューなど、実在しない合成パスに対しては 0 を返す。
+    pub(crate) fn current_folder_rating(&self) -> u8 {
+        let Some(folder) = self.current_folder.as_ref() else {
+            return 0;
+        };
+        if folder == &search_results_synthetic_path() {
+            return 0;
+        }
+        let key = crate::adjustment_db::normalize_path(folder);
+        self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
+    }
+
+    /// `current_folder` にレーティングを設定する (Shift+F1〜F6 用)。
+    /// 合成パス (検索結果ビュー等) はスキップして false を返す。
+    /// 成功時は rating_cache も同期し、visible_indices を rebuild する。
+    pub(crate) fn set_current_folder_rating(&mut self, stars: u8) -> bool {
+        let Some(folder) = self.current_folder.clone() else {
+            return false;
+        };
+        if folder == search_results_synthetic_path() {
+            return false;
+        }
+        let stars = stars.min(5);
+        let key = crate::adjustment_db::normalize_path(&folder);
+        if let Some(db) = self.rating_db.as_ref() {
+            let _ = db.set(&key, stars);
+        }
+        // items 内の同じコンテナパスを指す Folder/ZipFile/PdfFile があればキャッシュ更新。
+        // (1 階層上に戻ったときに cached な古い値を表示しないため。通常 current_folder は
+        // items に含まれないが、search container 絞り込みビュー中は含まれうる。)
+        let matching: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                let p = match it {
+                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
+                    _ => return None,
+                };
+                if crate::adjustment_db::normalize_path(p) == key {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for i in matching {
+            self.rating_cache.insert(i, stars);
+        }
+        self.rebuild_visible_indices();
+        true
     }
 
     /// グリッドのタグバッジ表示用キャッシュを埋める。フォルダ切替時に 1 回呼ぶ。
@@ -6552,9 +6658,30 @@ impl App {
 
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
     /// チェック済みがあればそれら、無ければカーソル位置 (selected)、それも無ければ空。
-    /// いずれの場合も `is_ratable` (Image / ZipImage / PdfPage) のみに絞り、
-    /// フォルダや ZIP/PDF ファイル本体を誤って対象にしない。
+    /// レーティング (F1〜F6) はコンテナ (Folder / ZipFile / PdfFile) も含む `accepts_rating`
+    /// で判定する。補正プリセット / マスクスロット (Ctrl+1〜0 / F7F8) はページ単位専用の
+    /// `ratable_page_targets` を使うこと。
     fn ratable_targets(&self) -> Vec<usize> {
+        if !self.checked.is_empty() {
+            self.checked
+                .iter()
+                .copied()
+                .filter(|&idx| self.items.get(idx).is_some_and(|it| it.accepts_rating()))
+                .collect()
+        } else if let Some(idx) = self.selected {
+            if self.items.get(idx).is_some_and(|it| it.accepts_rating()) {
+                vec![idx]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 補正プリセット / マスクスロット用のページ単位対象 (Image / ZipImage / PdfPage のみ)。
+    /// フォルダ・ZIP・PDF 本体は `is_ratable` を満たさないので自動的に除外される。
+    fn ratable_page_targets(&self) -> Vec<usize> {
         if !self.checked.is_empty() {
             self.checked
                 .iter()
@@ -6577,7 +6704,7 @@ impl App {
     /// が走る。ここでは DB + サイドカーにスロットの内容 (ビットマップ + ベクタ) を
     /// 書き込むだけで十分。
     pub(crate) fn apply_slot_to_selection(&mut self, slot: usize) {
-        let targets = self.ratable_targets();
+        let targets = self.ratable_page_targets();
 
         if targets.is_empty() {
             self.show_feedback_toast("[適用対象なし]".to_string());
@@ -8280,9 +8407,10 @@ impl App {
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
     }
 
-    /// 保存スロットをグリッド上の対象に適用する。対象決定は `ratable_targets` を参照。
+    /// 保存スロットをグリッド上の対象に適用する。対象はページ単位のみ
+    /// (`ratable_page_targets`; 補正プリセットはコンテナに適用できない)。
     pub(crate) fn apply_slot_to_grid_selection(&mut self, slot_idx: usize) {
-        let targets = self.ratable_targets();
+        let targets = self.ratable_page_targets();
         if targets.is_empty() {
             self.show_feedback_toast("[適用対象なし]".to_string());
             return;
@@ -8324,7 +8452,7 @@ impl App {
     /// Q / Ctrl+Backspace から呼ばれる。フルスクリーン側の単発版 (`clear_page_params`) と同じく
     /// AI 設定が変わる idx については AI キャッシュ / pending も落とす (clear_page_params 内で処理)。
     pub(crate) fn clear_page_params_for_selection(&mut self) {
-        let targets = self.ratable_targets();
+        let targets = self.ratable_page_targets();
         if targets.is_empty() {
             self.show_feedback_toast("[対象なし]".to_string());
             return;
@@ -10696,11 +10824,25 @@ pub(crate) fn draw_cell(
     }
 
     // レーティングバッジ（1-5 ★、左下に半透明の背景付きで表示）
+    // 画像系 (Image / ZipImage / PdfPage): 金色の ★
+    // コンテナ系 (Folder / ZipFile / PdfFile): 銀青色の ★ + 先頭に 📁 アイコンを付与して
+    //   「コンテナ自体への評価」であることを一目で区別できるようにする。
     if rating >= 1 && rating <= 5 {
-        let stars_text = "★".repeat(rating as usize);
+        let is_container = item.is_container_ratable();
+        let star_color = if is_container {
+            egui::Color32::from_rgb(180, 220, 255)
+        } else {
+            egui::Color32::from_rgb(255, 215, 50)
+        };
+        let text = if is_container {
+            format!("📁{}", "★".repeat(rating as usize))
+        } else {
+            "★".repeat(rating as usize)
+        };
         let font = egui::FontId::proportional(12.0);
-        // 背景矩形のサイズを見積もる
-        let text_w = 10.5 * rating as f32 + 6.0;
+        // 背景矩形のサイズを見積もる (コンテナは 📁 ぶん ~14px 広くする)
+        let prefix_w = if is_container { 14.0 } else { 0.0 };
+        let text_w = 10.5 * rating as f32 + 6.0 + prefix_w;
         let text_h = 16.0;
         let bg_rect = egui::Rect::from_min_size(
             egui::pos2(rect.min.x + 3.0, rect.max.y - text_h - 3.0),
@@ -10714,9 +10856,9 @@ pub(crate) fn draw_cell(
         painter.text(
             bg_rect.left_center() + egui::vec2(3.0, 0.0),
             egui::Align2::LEFT_CENTER,
-            stars_text,
+            text,
             font,
-            egui::Color32::from_rgb(255, 215, 50),
+            star_color,
         );
     }
 
