@@ -1345,52 +1345,17 @@ impl App {
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
         // matches_logically 対策で Shift 版を先に consume する (NONE だと Shift 入りも吸収される)。
         let container_rating_key: Option<u8> = ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F1) {
-                Some(1)
-            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F2) {
-                Some(2)
-            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3) {
-                Some(3)
-            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4) {
-                Some(4)
-            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
-                Some(5)
-            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6) {
-                Some(0)
-            } else {
-                None
-            }
+            crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT)
         });
-        if let Some(stars) = container_rating_key {
-            if self.set_current_folder_rating(stars) {
-                if stars == 0 {
-                    self.show_feedback_toast("[フォルダ★解除]".to_string());
-                } else {
-                    self.show_feedback_toast(format!(
-                        "[フォルダ{}]",
-                        "★".repeat(stars as usize)
-                    ));
-                }
-            }
+        if let Some(stars) = container_rating_key
+            && self.set_current_folder_rating(stars)
+        {
+            self.show_container_rating_toast(stars);
         }
 
         // F1-F5: レーティング 1〜5 / F6: レーティング解除
         let rating_key: Option<u8> = ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::F1) {
-                Some(1)
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
-                Some(2)
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
-                Some(3)
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
-                Some(4)
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
-                Some(5)
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F6) {
-                Some(0)
-            } else {
-                None
-            }
+            crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE)
         });
         if let Some(stars) = rating_key {
             self.set_rating(fs_idx, stars);

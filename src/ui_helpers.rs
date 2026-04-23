@@ -40,6 +40,35 @@ pub(crate) const PROGRESS_UPGRADE_COLOR: eframe::egui::Color32 =
     eframe::egui::Color32::from_rgb(100, 170, 240);
 
 // -----------------------------------------------------------------------
+// F1〜F6 のレーティングキー
+// -----------------------------------------------------------------------
+
+/// F1〜F5 / F6 をレーティング値 (1〜5 / 0=解除) に consume する共通処理。
+/// グリッドとフルスクリーン、ページ★ (NONE) とコンテナ★ (SHIFT) の 4 箇所で共有。
+///
+/// egui の `matches_logically` は `NONE` の key を `Shift+` 入りイベントでも拾ってしまう
+/// ので、呼び出し側は必ず SHIFT 版を NONE 版より先に呼ぶこと。
+pub fn consume_rating_fkey(
+    i: &mut eframe::egui::InputState,
+    mods: eframe::egui::Modifiers,
+) -> Option<u8> {
+    use eframe::egui::Key;
+    for (key, stars) in [
+        (Key::F1, 1u8),
+        (Key::F2, 2),
+        (Key::F3, 3),
+        (Key::F4, 4),
+        (Key::F5, 5),
+        (Key::F6, 0),
+    ] {
+        if i.consume_key(mods, key) {
+            return Some(stars);
+        }
+    }
+    None
+}
+
+// -----------------------------------------------------------------------
 // 検索バーの OR チェック (3 検索バー共通、docs §20)
 // -----------------------------------------------------------------------
 

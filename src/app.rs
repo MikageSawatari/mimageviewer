@@ -1327,6 +1327,11 @@ pub struct App {
     pub(crate) rating_db: Option<crate::rating_db::RatingDb>,
     /// 現在フォルダのアイテムごとのレーティングキャッシュ (idx → 0..=5)
     pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
+    /// `current_folder` (コンテナ) 自身のレーティングキャッシュ。アドレスバー描画で
+    /// 毎フレーム参照されるので SQLite を叩かない。`None` は未計算を意味する。
+    /// `load_folder` / `set_current_folder_rating` / `set_rating` (コンテナ変更時) で
+    /// `None` に戻して無効化する。
+    pub(crate) current_folder_rating_cache: Option<u8>,
 
     // ── 見開き表示 ──────────────────────────────────────────────
     /// 見開き DB (フォルダごとのモード永続化)
@@ -1810,6 +1815,7 @@ impl Default for App {
             rotation_cache: std::collections::HashMap::new(),
             rating_db: crate::rating_db::RatingDb::open().ok(),
             rating_cache: std::collections::HashMap::new(),
+            current_folder_rating_cache: None,
             spread_db: crate::spread_db::SpreadDb::open().ok(),
             spread_mode: crate::settings::SpreadMode::default(),
             spread_popup_open: false,
@@ -3139,6 +3145,7 @@ impl App {
 
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
+        self.current_folder_rating_cache = None;
         self.address = source_path.to_string_lossy().to_string();
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
@@ -4997,50 +5004,15 @@ impl App {
             // matches_logically 対策で Shift 版を先に consume する (NONE は Shift 入りも拾う)。
             {
                 let shift_rating_key = ctx.input_mut(|i| {
-                    if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F1) {
-                        Some(1u8)
-                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F2) {
-                        Some(2)
-                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3) {
-                        Some(3)
-                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F4) {
-                        Some(4)
-                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
-                        Some(5)
-                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F6) {
-                        Some(0)
-                    } else {
-                        None
-                    }
+                    crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT)
                 });
-                if let Some(stars) = shift_rating_key {
-                    if self.set_current_folder_rating(stars) {
-                        if stars == 0 {
-                            self.show_feedback_toast("[フォルダ★解除]".to_string());
-                        } else {
-                            self.show_feedback_toast(format!(
-                                "[フォルダ{}]",
-                                "★".repeat(stars as usize)
-                            ));
-                        }
-                    }
+                if let Some(stars) = shift_rating_key
+                    && self.set_current_folder_rating(stars)
+                {
+                    self.show_container_rating_toast(stars);
                 }
                 let rating_key = ctx.input_mut(|i| {
-                    if i.consume_key(egui::Modifiers::NONE, egui::Key::F1) {
-                        Some(1u8)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
-                        Some(2)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
-                        Some(3)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
-                        Some(4)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
-                        Some(5)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F6) {
-                        Some(0)
-                    } else {
-                        None
-                    }
+                    crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE)
                 });
                 if let Some(stars) = rating_key {
                     self.apply_rating_to_selection(stars);
@@ -6439,6 +6411,14 @@ impl App {
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set(&key, stars);
         }
+        // コンテナへの rating 変更は current_folder と同じパスを指す可能性があるので
+        // アドレスバーキャッシュを lazy 再計算させる。
+        if matches!(
+            self.items.get(idx),
+            Some(GridItem::Folder(_) | GridItem::ZipFile(_) | GridItem::PdfFile(_))
+        ) {
+            self.current_folder_rating_cache = None;
+        }
     }
 
     /// フォルダ読み込み直後に rating_cache を一括プリウォームする。
@@ -6468,17 +6448,33 @@ impl App {
     }
 
     /// `current_folder` (現在一覧表示中のフォルダ / ZIP / PDF) のレーティングを取得する。
-    /// アドレスバー右端の★表示・Shift+F1〜F6 のトースト表示などで使う。
+    /// アドレスバー右端の★表示で毎フレーム呼ばれるため、`current_folder_rating_cache`
+    /// でメモ化して SQLite クエリと path 正規化コストを回避する。
     /// 検索結果ビューなど、実在しない合成パスに対しては 0 を返す。
-    pub(crate) fn current_folder_rating(&self) -> u8 {
-        let Some(folder) = self.current_folder.as_ref() else {
-            return 0;
-        };
-        if folder == &search_results_synthetic_path() {
-            return 0;
+    pub(crate) fn current_folder_rating(&mut self) -> u8 {
+        if let Some(v) = self.current_folder_rating_cache {
+            return v;
         }
-        let key = crate::adjustment_db::normalize_path(folder);
-        self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
+        let value = match self.current_folder.as_ref() {
+            Some(folder) if folder != &search_results_synthetic_path() => {
+                let key = crate::adjustment_db::normalize_path(folder);
+                self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        self.current_folder_rating_cache = Some(value);
+        value
+    }
+
+    /// Shift+F1〜F6 成功時のトースト表示 (グリッド / フルスクリーン共通)。
+    /// `stars == 0` は解除、1〜5 は★の並び。
+    pub(crate) fn show_container_rating_toast(&mut self, stars: u8) {
+        let msg = if stars == 0 {
+            "[フォルダ★解除]".to_string()
+        } else {
+            format!("[フォルダ{}]", "★".repeat(stars as usize))
+        };
+        self.show_feedback_toast(msg);
     }
 
     /// `current_folder` にレーティングを設定する (Shift+F1〜F6 用)。
@@ -6496,6 +6492,7 @@ impl App {
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set(&key, stars);
         }
+        self.current_folder_rating_cache = Some(stars);
         // items 内の同じコンテナパスを指す Folder/ZipFile/PdfFile があればキャッシュ更新。
         // (1 階層上に戻ったときに cached な古い値を表示しないため。通常 current_folder は
         // items に含まれないが、search container 絞り込みビュー中は含まれうる。)
@@ -6658,45 +6655,31 @@ impl App {
 
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
     /// チェック済みがあればそれら、無ければカーソル位置 (selected)、それも無ければ空。
-    /// レーティング (F1〜F6) はコンテナ (Folder / ZipFile / PdfFile) も含む `accepts_rating`
-    /// で判定する。補正プリセット / マスクスロット (Ctrl+1〜0 / F7F8) はページ単位専用の
-    /// `ratable_page_targets` を使うこと。
-    fn ratable_targets(&self) -> Vec<usize> {
+    /// 述語で「受け入れる GridItem 種別」を切り替える:
+    /// - レーティング (F1〜F6) は `accepts_rating` (コンテナ含む)
+    /// - 補正プリセット / マスクスロット (Ctrl+1〜0 / F7F8) は `is_ratable` (ページ専用)
+    fn targets_matching(&self, pred: impl Fn(&GridItem) -> bool) -> Vec<usize> {
         if !self.checked.is_empty() {
             self.checked
                 .iter()
                 .copied()
-                .filter(|&idx| self.items.get(idx).is_some_and(|it| it.accepts_rating()))
+                .filter(|&idx| self.items.get(idx).is_some_and(&pred))
                 .collect()
-        } else if let Some(idx) = self.selected {
-            if self.items.get(idx).is_some_and(|it| it.accepts_rating()) {
-                vec![idx]
-            } else {
-                Vec::new()
-            }
+        } else if let Some(idx) = self.selected
+            && self.items.get(idx).is_some_and(&pred)
+        {
+            vec![idx]
         } else {
             Vec::new()
         }
     }
 
-    /// 補正プリセット / マスクスロット用のページ単位対象 (Image / ZipImage / PdfPage のみ)。
-    /// フォルダ・ZIP・PDF 本体は `is_ratable` を満たさないので自動的に除外される。
+    fn ratable_targets(&self) -> Vec<usize> {
+        self.targets_matching(GridItem::accepts_rating)
+    }
+
     fn ratable_page_targets(&self) -> Vec<usize> {
-        if !self.checked.is_empty() {
-            self.checked
-                .iter()
-                .copied()
-                .filter(|&idx| self.items.get(idx).is_some_and(|it| it.is_ratable()))
-                .collect()
-        } else if let Some(idx) = self.selected {
-            if self.items.get(idx).is_some_and(|it| it.is_ratable()) {
-                vec![idx]
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
+        self.targets_matching(GridItem::is_ratable)
     }
 
     /// グリッド画面から F7/F8 で呼ばれるマスクスロット一括適用。
