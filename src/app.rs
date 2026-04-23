@@ -1649,6 +1649,15 @@ pub struct App {
     /// `true` を書き込む。`maybe_intercept_close` がこれを見てトレイ非表示でも確実に
     /// 終了するようにする。tray Quit と同じ扱い。
     pub(crate) shutdown_requested: Arc<AtomicBool>,
+
+    // ── 外部更新の自動反映 ──────────────────────────────────────
+    /// `load_folder` 成功時に記録する current_folder (ディレクトリ実体のみ) の mtime。
+    /// トレイ復帰 / フォーカス復帰時に `std::fs::metadata` で新しい mtime を取り、値が
+    /// 変わっていたら再ロードする。ZIP / PDF / 検索合成パスには使わないので None のまま。
+    pub(crate) current_folder_last_mtime: Option<std::time::SystemTime>,
+    /// 前フレームの main viewport focus 状態。false → true 遷移で外部更新チェックを走らせる。
+    /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
+    pub(crate) last_main_focused: bool,
 }
 
 impl Default for App {
@@ -1937,6 +1946,8 @@ impl Default for App {
             placement_slot: None,
             activation_listener: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            current_folder_last_mtime: None,
+            last_main_focused: true,
         }
     }
 }
@@ -2124,6 +2135,79 @@ impl App {
     ///
     /// 用途: 環境設定 OK 押下時の同名ファイル設定変更・Susie 設定変更など、再読み込みは
     /// 必要だが元アーカイブの文脈を保ちたいケース。
+    /// トレイ復帰 / フォーカス復帰時に呼び、現在表示中のフォルダが外部 (ComfyUI 等) で
+    /// 変化していれば再ロードする。選択中アイテムはパスで追跡して復元し、再ロード後に
+    /// ビューポート外にはみ出していれば次フレームで可視範囲に収める。
+    ///
+    /// スキップ条件:
+    /// - `current_folder` が None
+    /// - Ctrl+G 検索中 (別ビューで動いている)
+    /// - ZIP / PDF / 検索合成パスなどディレクトリ実体でない (= `current_folder_last_mtime`
+    ///   が None のまま)
+    /// - mtime が保存値と同じ (= 外部更新なし)
+    ///
+    /// 再ロードは通常の `load_folder` なので、サムネ背景タスク / キャッシュ読みなどの
+    /// 既存ロジックに乗る。UI スレッドでの syscall は `metadata()` 1 回のみ。
+    pub(crate) fn check_external_folder_changes(&mut self) {
+        if self.global_search.active {
+            return;
+        }
+        let Some(folder) = self.current_folder.clone() else {
+            return;
+        };
+        let Some(prev_mtime) = self.current_folder_last_mtime else {
+            return;
+        };
+        let Ok(meta) = folder.metadata() else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        let Ok(new_mtime) = meta.modified() else {
+            return;
+        };
+        if new_mtime == prev_mtime {
+            return;
+        }
+        // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
+        let selected_path: Option<PathBuf> = self
+            .selected
+            .and_then(|idx| self.items.get(idx))
+            .and_then(|item| match item {
+                GridItem::Folder(p)
+                | GridItem::Image(p)
+                | GridItem::Video(p)
+                | GridItem::ZipFile(p)
+                | GridItem::PdfFile(p) => Some(p.clone()),
+                GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
+                _ => None,
+            });
+        crate::logger::log(format!(
+            "auto-refresh: folder mtime changed ({}), reloading",
+            folder.display()
+        ));
+        self.load_folder(folder);
+        // 再ロード後に選択パスを探し、見つかればそこにカーソルを戻してスクロール依頼。
+        // 見つからない (消えた) / そもそも未選択ならスクロール位置は触らない。
+        if let Some(path) = selected_path {
+            let new_idx = self
+                .items
+                .iter()
+                .position(|it| matches!(it,
+                    GridItem::Folder(p)
+                    | GridItem::Image(p)
+                    | GridItem::Video(p)
+                    | GridItem::ZipFile(p)
+                    | GridItem::PdfFile(p) if p == &path)
+                    || matches!(it, GridItem::ConvertibleArchive { path: p, .. } if p == &path));
+            if let Some(idx) = new_idx {
+                self.selected = Some(idx);
+                self.scroll_to_selected = true;
+            }
+        }
+    }
+
     pub(crate) fn reload_current_folder_preserving_override(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
             return;
@@ -3152,6 +3236,13 @@ impl App {
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
         self.current_folder_rating_cache = None;
+        // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
+        // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
+        self.current_folder_last_mtime = source_path
+            .metadata()
+            .ok()
+            .filter(|m| m.is_dir())
+            .and_then(|m| m.modified().ok());
         self.address = source_path.to_string_lossy().to_string();
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
@@ -9469,6 +9560,16 @@ impl eframe::App for App {
                 return;
             }
         }
+
+        // フォーカス復帰検出 (Alt+Tab で他アプリから mIV に戻った等) で、
+        // 外部 (ComfyUI 等) による current_folder のファイル追加を自動反映する。
+        // トレイ復帰は `sync_after_restore` 側で別経路で呼ぶので、tray_active に限らず
+        // 全ユーザで動かす。
+        let main_focused_now = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if main_focused_now && !self.last_main_focused && self.window_visible {
+            self.check_external_folder_changes();
+        }
+        self.last_main_focused = main_focused_now;
 
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。

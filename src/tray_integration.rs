@@ -159,6 +159,9 @@ impl App {
         }
         self.activity_gate.set_paused(false);
         self.update_tray_tooltip();
+        // 外部 (ComfyUI 等) がトレイ常駐中に current_folder へファイルを追加していたら
+        // 自動で反映する。stat 1 回の軽量チェックで、変化が無ければ no-op。
+        self.check_external_folder_changes();
         crate::logger::log("tray: App state synced after restore");
     }
 
