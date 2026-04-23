@@ -30,6 +30,10 @@ PrivilegesRequired=admin
 MinVersion=10.0
 ; インストール開始画面で readme.txt を表示する (Vector 申請要件の一部を兼ねる)。
 InfoBeforeFile=readme.txt
+; タスクトレイ常駐中の mImageViewer を自動検出して「閉じてください」ダイアログを出す。
+; アプリ側の `src/single_instance.rs::MUTEX_NAME` と完全一致させること。
+; 名前が食い違うと、アップデート時に常駐プロセスが DLL を掴んだまま上書きが失敗する。
+AppMutex=Global\mImageViewerInstance_v1
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"

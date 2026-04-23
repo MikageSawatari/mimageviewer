@@ -26,6 +26,7 @@
 | 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング + `fts_meta.db` post-filter + streaming 送信 |
 | タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Clear を serial に XMP 書込 → `fts_meta.set_tags` → 共有 writer で Tantivy upsert → 32 件 or 500ms でバッチ commit |
+| タスクトレイ (v0.9) | `std::thread` (常駐) | 1 (設定 ON 時のみ) | `mimv-tray` スレッド。`tray-icon` クレートで隠し HWND を作成 → `PeekMessageW` ポンプ (50ms 周期) + `TrayIconEvent` / `MenuEvent` の try_recv → `TrayEvent::Open / TogglePause / Quit` を UI に送信。`ActivityGate::set_paused` + `GlobalIoSemaphore::set_throttled` はメインスレッドで適用 |
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
 
@@ -46,6 +47,8 @@
 | `SupervisorHandle.cancel` | `Arc<AtomicBool>` | UI (お気に入り OFF, App drop) | メタ / 名前索引 supervisor | supervisor 全体の停止シグナル |
 | `GlobalSearchHandle.cancel` | `Arc<AtomicBool>` | UI (クエリ変更, バー閉じ, folder 遷移, Handle drop) | Ctrl+G クエリワーカー | Tantivy ページングループの中断 |
 | `tag_write_worker.cancel` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループ + commit の中断 |
+| `ActivityGate.paused` (v0.9) | `AtomicBool` | UI (トレイメニュー「一時停止」 / ウィンドウ hide) | `wait_until_idle` を呼ぶ全ワーカー (walker / ingest / name_bulk_indexer) | true の間 wait ループが解除 or cancel まで抜けない。cancel は貫通 (終了時の固まり防止) |
+| `GlobalIoSemaphore.throttled` (v0.9) | `Mutex` ガード | UI (ウィンドウ hide/show) | 全インデクサ worker | true の間、実効 permit=1 (in_use ≥ 1 なら新規 acquire 不可)。解除で `notify_all` |
 
 **ルール**: アトミックは単発の値伝搬にのみ使う。リスト/辞書の共有は `Arc<Mutex<...>>` か mpsc。
 
@@ -458,6 +461,40 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
 
 **いつ try_lock を使って良いか**: 非ブロッキングな best-effort 取得 (「取れたら使う、取れなければ
 今回は諦める」) のみ。`try_lock` の後に sleep して再試行する構造は避ける。
+
+---
+
+### 5.6 タスクトレイ常駐 + インデクサ throttle / pause (v0.9)
+
+「ビューワ特性上、使い終わったらアプリを閉じる」 → notify-rs が止まり、次回起動時に
+初回スキャンが必要になる問題への対策。ウィンドウの `[×]` でプロセス終了する代わりに
+タスクトレイへ格納し、notify-rs を継続走行させる。
+
+- **エントリポイント**: `src/tray.rs` (常駐スレッド) + `src/tray_integration.rs` (App メソッド)
+- **単一インスタンス保証**: `src/single_instance.rs` の `Global\mImageViewerInstance_v1`。
+  `installer/mimageviewer.iss` の `AppMutex` と一致させることで、インストーラが自動で
+  「閉じてください」ダイアログを出してくれる (常駐中に DLL 上書きが失敗するのを防ぐ)。
+- **ウィンドウ hide/show**: `App::maybe_intercept_close` が `viewport().close_requested()`
+  を検出して `ViewportCommand::CancelClose` + `Visible(false)` に差し替える。トレイ
+  メニュー「開く」やトレイアイコン左クリックで `Visible(true)` + `Focus`。
+- **インデクサ throttle**: `hide_to_tray` から `IndexerManager::set_io_throttled(true)`。
+  `GlobalIoSemaphore` の実効 permit を 1 に絞るため、ユーザーが選んだ速度プロファイル
+  (Low/Medium/High) に関係なく常駐中は 1 permit 相当になる。`show_from_tray` で解除。
+- **インデクサ pause (オプトイン)**: 設定 `pause_indexer_while_minimized = true` のときだけ、
+  `hide_to_tray` から `ActivityGate::set_paused(true)`。既存の `wait_until_idle` は
+  paused 中ループブロックし、`show_from_tray` で解除されると通常動作に戻る。
+  **cancel は paused を貫通** させる (アプリ終了時に supervisor スレッドが固まらないため)。
+- **GPU リソース解放**: `App::release_gpu_resources` が `thumbnails[*] = Evicted` や
+  `fs_cache.clear()` 等で `TextureHandle` を drop。ウィンドウ復帰後は通常ロード経路で再取得。
+
+設計上の注意:
+- notify-rs の crossbeam-channel (unbounded) は paused 中も受信し続けるので、溜まった
+  イベントは復帰時にスパイク的に処理される (OS 側の `ReadDirectoryChangesW` リングバッファ
+  overflow リスクは notify-rs が即ドレインするので増えない)。
+- throttle 有効化で既存 permit holder は revoke しない (drop まで維持)。hide 直後に 1 permit
+  分の処理が残るが、通常は数百 ms で収まる。
+- トレイ常駐中の `quit_requested` は `[×]` 乗っ取りロジックを貫通させるため、先に立ててから
+  `ViewportCommand::Close` を送る。
 
 ---
 

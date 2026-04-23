@@ -30,6 +30,8 @@ pub(crate) enum PreferencesPage {
     SusiePlugins,
     /// v0.8.0: 自動インデクサ速度プロファイル
     IndexerSpeed,
+    /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
+    TrayResidency,
 }
 
 impl PreferencesPage {
@@ -49,6 +51,7 @@ impl PreferencesPage {
             Self::SpreadMode => "見開き表示",
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "自動インデクサ速度",
+            Self::TrayResidency => "タスクトレイ常駐",
         }
     }
 }
@@ -115,6 +118,12 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "全文検索インデクサ",
         page: Some(PreferencesPage::IndexerSpeed),
+        children: &[],
+    },
+    // v0.9: タスクトレイ常駐
+    TreeCategory {
+        label: "タスクトレイ常駐",
+        page: Some(PreferencesPage::TrayResidency),
         children: &[],
     },
 ];
@@ -403,6 +412,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
+        PreferencesPage::TrayResidency => page_tray_residency(ui, state),
     }
 }
 
@@ -819,6 +829,63 @@ fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
              High にするとインデックス中に通常操作がもたつく可能性があります。\n\
              ※ 未使用で放置してもアクティブなインデクサが無ければ I/O は消費しません。\n\
              ※ 索引化の対象はお気に入りごとに選べます (「お気に入り > 編集」ダイアログ)。",
+        )
+        .weak()
+        .size(11.0),
+    );
+}
+
+/// v0.9: タスクトレイ常駐設定ページ。
+///
+/// お気に入りダイアログにも同じ項目があるが、環境設定側は「全体設定を探したとき
+/// にここでも見つかる」ことを意図した冗長配置。両者は `settings` の同じフィールドを
+/// 参照するので片方を変更すればもう片方も同期する。
+fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.label(
+        "閉じるボタンを押したときのアプリ終了挙動と、常駐中のインデックス処理を制御します。",
+    );
+    ui.add_space(10.0);
+
+    ui.label(egui::RichText::new("閉じるボタンの挙動").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.minimize_to_tray_on_close,
+        "アプリを閉じる代わりに、タスクトレイに常駐する",
+    )
+    .on_hover_text(
+        "OFF (既定): [×] でプロセス終了。次回起動時にインデックスが再スキャンされます。\n\
+         ON: [×] でウィンドウを隠してタスクトレイに常駐。notify-rs でファイル変更を\n\
+         追い続けるため、次回開いたときは最新のインデックスがそのまま使えます。\n\
+         終了はタスクトレイアイコンを右クリックして「終了」を選んでください。",
+    );
+    ui.add_space(12.0);
+
+    ui.add_enabled_ui(s.minimize_to_tray_on_close, |ui| {
+        ui.label(egui::RichText::new("常駐中のインデックス更新").strong());
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut s.pause_indexer_while_minimized,
+            "常駐中はインデックス更新を一時停止する",
+        )
+        .on_hover_text(
+            "OFF (既定): 常駐中もファイル監視と初回スキャンを続けます。\n\
+             ON: 常駐中は全て止め、ウィンドウを開いた瞬間に再開します (溜まっていた\n\
+             ファイル変更もそこで順次処理)。\n\n\
+             OFF でも常駐中は I/O 並列度が自動で 1 に絞られるので、ゲームや動画再生など\n\
+             他アプリの I/O 負荷が気になる場合でも普通は OFF のままで問題ありません。",
+        );
+    });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "※ タスクトレイ常駐はトレイアイコンからの「開く / 常駐時のスキャンを一時停止 / 終了」\n  \
+             メニューでも操作できます。\n\
+             ※ トレイアイコン左クリックでウィンドウが復帰します。",
         )
         .weak()
         .size(11.0),

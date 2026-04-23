@@ -102,6 +102,23 @@ ctx.send_viewport_cmd(egui::ViewportCommand::Close);         // 終了ボタン
 - 通常経路でも無害な no-op になるため、副作用なし。
 - Win+Shift+Arrow による位置ずれ（移動時のバグ）は別問題で、この対策では解消しない。
 
+#### 案 G: outer ではなく inner_size を保存する（採用済み, v0.9）
+- 旧挙動は `last_outer_rect` の `width()/height()` を `settings.window_size` に保存し、
+  次回起動時に `ViewportBuilder::with_inner_size(size)` で適用していた。タイトルバー +
+  ボーダー分だけ毎回サイズが縮む症状の原因だった。
+- 対策: `App::last_inner_size` を追加し、`track_window_rect` で `inner_rect` のサイズを
+  別途保存する。`on_exit` と `hide_to_tray` の両方で、これを `settings.window_size` に
+  書き戻す（`inner_size` が取れない稀なケースだけ outer にフォールバック）。
+
+#### 案 H: トレイ復帰時に WINDOWPLACEMENT で完全復元（採用済み, v0.9）
+- タスクトレイ常駐からの復帰時、`ShowWindow(SW_SHOW)` だけでは DPI 再計算が
+  走って微妙にサイズが変わる問題があった。
+- 対策: hide 直前に Win32 `GetWindowPlacement(hwnd, &mut wp)` で矩形を丸ごと保存し、
+  復帰直後に `SetWindowPlacement(hwnd, &wp)` で完全復元する。`SetWindowPlacement`
+  は eframe/winit を経由しないため DPI 丸めを完全にバイパスできる。
+- 実装: `src/tray_integration.rs` の `SavedWindowPlacement` / `capture_window_placement` /
+  `restore_window_placement`。`App::saved_placement` フィールドで hide → show 間を保持。
+
 ## ログ全文
 
 デバッグログ（`mimageviewer.log`）は `target/debug/` ディレクトリに生成される。

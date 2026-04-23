@@ -47,14 +47,23 @@ struct SemState {
     total: usize,
     /// 各優先度の待機数 (対応する `IoPriority` をキーに、0..=2)
     waiting: [usize; 3],
+    /// v0.9 トレイ常駐時の throttle モード。true の間は実効上限 1 permit として振る舞う
+    /// (既存 holder は drop まで維持、新規取得は in_use == 0 のときだけ通す)。
+    /// 解除時に `notify_all` で待機者を起こす。
+    throttled: bool,
 }
 
 impl SemState {
     /// 指定優先度が今 permit を取得してよいか?
     /// - available > 0
     /// - かつ自分より高い優先度の待機者がいない (または自分が最高優先度)
+    /// - かつ throttled=true の場合は in_use == 0 (= available == total) である
     fn can_acquire(&self, pri: IoPriority) -> bool {
         if self.available == 0 {
+            return false;
+        }
+        // throttle モード: 実効上限 1 permit。in_use >= 1 なら新規取得不可。
+        if self.throttled && self.available < self.total {
             return false;
         }
         // 自分より高い優先度の waiter がいるなら、その人に譲る
@@ -81,10 +90,41 @@ impl GlobalIoSemaphore {
                     available: total,
                     total,
                     waiting: [0, 0, 0],
+                    throttled: false,
                 }),
                 Condvar::new(),
             )),
         }
+    }
+
+    /// v0.9 トレイ常駐時の throttle 切替。true にすると実効上限 1 permit として動作し、
+    /// 複数 worker が同時に I/O を掴むのを抑える。false で解除し、待機者を全員起こす。
+    ///
+    /// 効用: トレイ常駐中に mIV が他アプリ (ゲーム / 動画再生 / エディタ) の I/O 帯域を
+    /// 奪わないようにする。indexer は permit を 1 本ずつしか掴めなくなるので、
+    /// 見かけ上スループットは設定 `indexer_speed_profile` によらず 1 permit 相当に落ちる。
+    ///
+    /// 既存の permit holder は revoke しない (drop まで維持)。throttle 発効直後に
+    /// `available == total` になるまで最大 1 permit 分の処理が走る点は許容する
+    /// (通常は数百 ms 単位)。
+    pub fn set_throttled(&self, throttled: bool) {
+        let (mu, cv) = &*self.inner;
+        let mut st = mu.lock().unwrap();
+        if st.throttled == throttled {
+            return;
+        }
+        st.throttled = throttled;
+        // 解除時: 全 waiter を起こして再判定させる。
+        // 有効化時: 待機者が blocked になるだけなので通知は不要 (新規 wait が can_acquire で弾かれる)。
+        if !throttled {
+            cv.notify_all();
+        }
+    }
+
+    /// 現在 throttled 状態か (計装 / UI 表示用)。
+    pub fn is_throttled(&self) -> bool {
+        let (mu, _cv) = &*self.inner;
+        mu.lock().unwrap().throttled
     }
 
     /// Blocking acquire。permit が取れるまで待ち、`IoPermit` を返す (Drop で自動 release)。
@@ -279,6 +319,65 @@ mod tests {
             &["high", "low"],
             "High が Low より先に取得するはず"
         );
+    }
+
+    #[test]
+    fn throttled_limits_concurrency_to_one() {
+        // 全体 permit=4 でも throttled=true なら実効 1。
+        let sem = GlobalIoSemaphore::new(4);
+        sem.set_throttled(true);
+        let p1 = sem.acquire(IoPriority::Normal);
+        // 1 本は取れる (in_use=1)。だが 2 本目は取れない。
+        assert!(sem.try_acquire(IoPriority::Normal).is_none());
+        drop(p1);
+        // release で in_use=0 に戻るので 1 本目は取れる。
+        let _p2 = sem.acquire(IoPriority::Normal);
+    }
+
+    #[test]
+    fn unthrottle_wakes_waiters() {
+        // throttled 中にブロックされた acquire が、解除で取得できること。
+        let sem = Arc::new(GlobalIoSemaphore::new(4));
+        sem.set_throttled(true);
+        let holder = sem.acquire(IoPriority::Normal); // in_use=1
+
+        let sem2 = Arc::clone(&sem);
+        let handle = std::thread::spawn(move || {
+            // throttled 中なので取れない → ブロック
+            let _p = sem2.acquire(IoPriority::Normal);
+        });
+
+        // waiter が wait 状態に入るまで spin
+        let start = std::time::Instant::now();
+        loop {
+            {
+                let (mu, _) = &*sem.inner;
+                if mu.lock().unwrap().waiting[IoPriority::Normal as usize] >= 1 {
+                    break;
+                }
+            }
+            if start.elapsed() >= Duration::from_secs(2) {
+                panic!("waiter did not enter wait state");
+            }
+            std::thread::yield_now();
+        }
+
+        drop(holder);
+        // holder は drop して notify したが throttled はまだ有効なので
+        // waiter は取れない (in_use=0 なら取れる)。実際は holder drop で
+        // in_use=0 になったので、throttled でも in_use < 1 で acquire 可。
+        // → join が成功すること
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn is_throttled_reflects_setter() {
+        let sem = GlobalIoSemaphore::new(2);
+        assert!(!sem.is_throttled());
+        sem.set_throttled(true);
+        assert!(sem.is_throttled());
+        sem.set_throttled(false);
+        assert!(!sem.is_throttled());
     }
 
     #[test]

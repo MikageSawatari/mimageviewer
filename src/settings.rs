@@ -741,6 +741,21 @@ pub struct Settings {
     /// プール数を 1 に固定し、問題プラグインの切り分けを可能にする。
     #[serde(default = "default_true")]
     pub susie_allow_parallel: bool,
+
+    // ── タスクトレイ常駐 (v0.9) ──────────────────────────────────
+    /// 閉じるボタン [×] でウィンドウを閉じる代わりにタスクトレイに常駐する。
+    /// notify-rs によるファイル監視を継続し、次回起動時の再スキャン負荷を回避する。
+    /// OFF (既定) では従来どおり閉じるボタンでプロセス終了。
+    #[serde(default)]
+    pub minimize_to_tray_on_close: bool,
+
+    /// タスクトレイに常駐している間 (= ウィンドウ非表示中) にバックグラウンドインデクサ
+    /// (初回スキャン + notify-rs 経由の ingest) を一時停止する。ウィンドウを開き直すと
+    /// 自動的に再開し、溜まっていた notify-rs イベントを順次処理する。
+    /// OFF (既定) でも、非表示中は `GlobalIoSemaphore` の並列度を自動で 1 に絞ることで
+    /// 他アプリへの I/O 負荷を抑える。
+    #[serde(default)]
+    pub pause_indexer_while_minimized: bool,
 }
 
 /// グリッド列数の最小値
@@ -943,6 +958,8 @@ impl Default for Settings {
             sidecar_backup_enabled: true,
             susie_enabled: true,
             susie_allow_parallel: true,
+            minimize_to_tray_on_close: false,
+            pause_indexer_while_minimized: false,
         }
     }
 }

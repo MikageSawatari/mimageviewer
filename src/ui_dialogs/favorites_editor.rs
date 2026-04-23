@@ -131,6 +131,59 @@ impl App {
                     ui.add_space(4.0);
                 }
 
+                // ── タスクトレイ常駐の導線 (v0.9) ──────────────
+                // 起動時スキャンの頁にこの案内を置いて、「スキャンが重い → トレイ常駐で
+                // 回避できる」という導線を自然に見せる。環境設定にも同じ項目があるが、
+                // 環境設定は項目数が多く発見しにくいため、ここに重複して置くのは意図的。
+                ui.group(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "💡 アプリケーションを終了すると、次回起動時に\n\
+                             インデックスの再スキャンが行われます。\n\
+                             終了する代わりにタスクトレイに常駐すると、\n\
+                             起動がスムーズになります。",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(180)),
+                    );
+                    let tray_before = self.settings.minimize_to_tray_on_close;
+                    if ui
+                        .checkbox(
+                            &mut self.settings.minimize_to_tray_on_close,
+                            "アプリを閉じる代わりに、タスクトレイに常駐する \
+                             (タスクトレイアイコンから終了できます)",
+                        )
+                        .changed()
+                    {
+                        any_setting_dirty = true;
+                        // チェックを入れた瞬間に案内ダイアログを出す (毎回表示)。
+                        if !tray_before && self.settings.minimize_to_tray_on_close {
+                            self.show_tray_enabled_notice = true;
+                        }
+                    }
+                    if self.settings.minimize_to_tray_on_close {
+                        ui.add_space(2.0);
+                        if ui
+                            .checkbox(
+                                &mut self.settings.pause_indexer_while_minimized,
+                                "常駐中はインデックス更新を一時停止する \
+                                 (他アプリの I/O 負荷を抑えたいときに)",
+                            )
+                            .on_hover_text(
+                                "ON にすると、ウィンドウを閉じてトレイに入った後は\n\
+                                 初回スキャンも notify-rs 経由の更新も行いません。\n\
+                                 ウィンドウを開くと自動で再開し、溜まっていた変更を\n\
+                                 順次処理します。OFF でも常駐中は I/O 並列度が\n\
+                                 自動で 1 に絞られるので、他アプリへの影響は抑えられます。",
+                            )
+                            .changed()
+                        {
+                            any_setting_dirty = true;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
                 if self.settings.favorites.is_empty() {
                     ui.label("お気に入りはまだ登録されていません。");
                     ui.add_space(4.0);

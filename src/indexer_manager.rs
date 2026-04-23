@@ -464,6 +464,17 @@ impl IndexerManager {
         self.startup_diag
     }
 
+    /// v0.9: トレイ常駐中に I/O 並列度を強制的に 1 permit 相当へ絞る / 解除する。
+    /// ウィンドウ非表示時に true、復帰時に false。
+    pub fn set_io_throttled(&self, throttled: bool) {
+        self.io_sem.set_throttled(throttled);
+    }
+
+    /// v0.9: `GlobalIoSemaphore` の Arc を取得する (トレイスレッドから直接 throttle 切替するため)。
+    pub fn io_sem(&self) -> Arc<GlobalIoSemaphore> {
+        Arc::clone(&self.io_sem)
+    }
+
     /// お気に入りの「メタ索引」チェックを OFF にした時のクリーンアップ。
     ///
     /// そのお気に入りの全 fts_meta 行を tombstone にマークする。検索結果からは

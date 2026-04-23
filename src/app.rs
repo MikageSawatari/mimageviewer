@@ -948,6 +948,11 @@ pub struct App {
 
     /// ウィンドウ状態保存用：最後に確認した outer_rect（最小化・最大化時は更新しない）
     pub(crate) last_outer_rect: Option<egui::Rect>,
+    /// ウィンドウ状態保存用：最後に確認した inner_size（クライアント領域）。
+    /// `ViewportCommand::InnerSize` / `ViewportBuilder::with_inner_size` の入力と
+    /// 直接整合する値。起動時の「outer を保存して inner として適用」によるタイトルバー
+    /// 分のサイズ縮小を防ぐために、これを settings.window_size に書き戻す。
+    pub(crate) last_inner_size: Option<[f32; 2]>,
     /// 現在のウィンドウの DPI スケール（論理→物理変換に使用）
     pub(crate) last_pixels_per_point: f32,
     /// 初回フレームで適用する inner_size（egui#4918 / winit#923 対策）。
@@ -979,7 +984,7 @@ pub struct App {
     pub(crate) keep_start_shared: Arc<AtomicUsize>,
     pub(crate) keep_end_shared: Arc<AtomicUsize>,
     /// poll_thumbnails で 1 フレームのテクスチャ生成上限を超えた分を次フレームに持ち越す
-    texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
+    pub(crate) texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
 
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
@@ -1612,6 +1617,30 @@ pub struct App {
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
     pub(crate) sidecars: std::collections::HashMap<std::path::PathBuf, crate::sidecar::SidecarFile>,
+
+    // ── タスクトレイ常駐 (v0.9) ──────────────────────────────────
+    /// タスクトレイコントローラ (専用スレッドで動作)。設定 ON のときだけ初期化される。
+    pub(crate) tray_controller: Option<crate::tray::TrayController>,
+    /// ウィンドウが現在可視か。[×] による hide で false、トレイ「開く」で true。
+    /// 遷移検出で throttle/pause の on/off を切り替える。
+    pub(crate) window_visible: bool,
+    /// メニュー「終了」 → 次フレームで実際の `ViewportCommand::Close` を送るフラグ。
+    pub(crate) tray_quit_requested: bool,
+    /// タスクトレイ常駐設定を ON にしたときに 1 回だけ表示する案内ダイアログ。
+    /// ユーザーが OK を押すと閉じる。
+    pub(crate) show_tray_enabled_notice: bool,
+    /// メインウィンドウの HWND (frame.window_handle から最初のフレームで取得)。
+    /// Win32 `ShowWindow` でトレイ退避 / 復帰するために必要。
+    /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
+    /// トレイメニューから復帰できなくなるため、Win32 直叩きに切り替えた。
+    pub(crate) main_hwnd: Option<isize>,
+    /// 共有プレースメントスロット。UI スレッドが hide 時にセット、トレイスレッドが
+    /// show 時に take して `SetWindowPlacement` する。トレイスレッドから Win32 を直接
+    /// 叩けるようにすることで、復帰時の黒フラッシュ / サイズジャンプを防ぐ。
+    pub(crate) placement_slot: Option<crate::tray::PlacementSlot>,
+    /// 2 重起動検出時に既存インスタンスを前面に出すためのリスナースレッドハンドル。
+    /// 最初のフレームで HWND が取れたタイミングで spawn し、Drop で join する。
+    pub(crate) activation_listener: Option<crate::single_instance::ActivationListener>,
 }
 
 impl Default for App {
@@ -1655,6 +1684,7 @@ impl Default for App {
             last_viewport_h: 600.0,
             scroll_to_selected: false,
             last_outer_rect: None,
+            last_inner_size: None,
             last_pixels_per_point: 1.0,
             pending_initial_size: None,
             cache_gen_total: 0,
@@ -1891,6 +1921,13 @@ impl Default for App {
             perf_last_flush: None,
             fs_painted_last: None,
             sidecars: std::collections::HashMap::new(),
+            tray_controller: None,
+            window_visible: true,
+            tray_quit_requested: false,
+            show_tray_enabled_notice: false,
+            main_hwnd: None,
+            placement_slot: None,
+            activation_listener: None,
         }
     }
 }
@@ -5719,6 +5756,12 @@ impl App {
                     self.last_outer_rect = Some(rect);
                 }
             }
+            // inner_rect が取れていればそのサイズも別途保持する。
+            // 保存/再適用の値として outer を使うとタイトルバー分だけ毎回小さくなるので、
+            // 再起動時の InnerSize 再適用と整合する inner のサイズを優先して保存する。
+            if let Some(ir) = inner_rect {
+                self.last_inner_size = Some([ir.width(), ir.height()]);
+            }
         }
     }
 
@@ -9219,7 +9262,39 @@ impl App {
 // -----------------------------------------------------------------------
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // メインウィンドウの HWND を最初のフレームで取得 (Win32 ShowWindow 用)。
+        // eframe::Frame::window_handle() は raw_window_handle::WindowHandle を返す。
+        // Windows では Win32WindowHandle の hwnd フィールドに HWND が入る。
+        #[cfg(windows)]
+        if self.main_hwnd.is_none() {
+            use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+            if let Ok(wh) = frame.window_handle() {
+                if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                    let hwnd_raw = h.hwnd.get();
+                    self.main_hwnd = Some(hwnd_raw);
+                    crate::logger::log(format!("tray: captured main HWND = {hwnd_raw:#x}"));
+                    // 2 重起動時に既存インスタンスを復帰させるリスナーを起動。
+                    // Named Event を wait するバックグラウンドスレッド。
+                    self.activation_listener =
+                        crate::single_instance::spawn_activation_listener(
+                            hwnd_raw,
+                            ctx.clone(),
+                        );
+                }
+            }
+        }
+
+        // タスクトレイ: 設定変更を反映 + メニューイベントをポーリング + 閉じるボタンの
+        // 乗っ取り判定。ここは毎フレーム先頭で処理する (close_requested を取りこぼさないため)。
+        self.sync_tray_with_settings(ctx);
+        self.poll_tray_events(ctx);
+        if self.maybe_intercept_close(ctx) {
+            // hide に差し替えたフレームはこれ以降の描画をスキップしてよい
+            // (ウィンドウは非表示になるので描画してもユーザーには見えない)。
+            return;
+        }
+
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
         self.flush_idle_sidecars();
@@ -9497,6 +9572,7 @@ impl eframe::App for App {
         self.show_delete_confirm_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
+        self.show_tray_enabled_notice_dialog(ctx);
         self.poll_pdf_enumerate();
 
         // ── ツールバー ───────────────────────────────────────────────
@@ -9759,10 +9835,16 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // 終了時にウィンドウ位置・サイズを保存
+        // 終了時にウィンドウ位置・サイズを保存。
+        // - サイズは `ViewportBuilder::with_inner_size` と整合する inner_size のみを書く
+        //   (不明なら **前回保存値を維持**。outer に fallback すると titlebar 分だけ
+        //    縮小する問題が再発するので fallback しない)
+        // - 位置は outer_rect から取る (with_position は outer 座標を受け取る)
         if let Some(rect) = self.last_outer_rect {
             self.settings.window_pos = Some([rect.min.x, rect.min.y]);
-            self.settings.window_size = Some([rect.width(), rect.height()]);
+        }
+        if let Some(size) = self.last_inner_size {
+            self.settings.window_size = Some(size);
         }
         self.settings.save();
         // dirty なサイドカーをディスクへ書き出す

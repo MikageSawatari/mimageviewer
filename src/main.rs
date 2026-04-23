@@ -49,6 +49,7 @@ pub mod search_walker;
 pub mod search_watcher;
 pub mod settings;
 pub mod sidecar;
+pub mod single_instance;
 pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;
@@ -57,6 +58,8 @@ mod tag_ops;
 mod tag_prewarm;
 pub mod tag_write_worker;
 pub mod thumb_loader;
+pub mod tray;
+mod tray_integration;
 mod ui_adjustment_panel;
 mod ui_analysis_panel;
 pub mod ui_dialogs;
@@ -109,6 +112,23 @@ fn main() -> eframe::Result {
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
     if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
         pdf_loader::run_worker_process();
+        std::process::exit(0);
+    }
+
+    // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
+    // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
+    // ダイアログ自動連携も兼ねる (`single_instance::MUTEX_NAME` 参照)。
+    // is_first_instance() == false のときは既にもう 1 つ mIV が動いているので
+    // 静かに exit する (トレイ常駐中でもここで落ちる = ユーザーはトレイアイコンから
+    // 復帰することで操作を再開できる)。
+    let _single_instance = single_instance::SingleInstanceGuard::acquire();
+    if !_single_instance.is_first_instance() {
+        // 2 重起動: 既存インスタンスの activate event を叩いてウィンドウを前面に出す。
+        // ユーザーが「もう一度 mIV を起動」した意図を既存インスタンスで復帰として解釈する。
+        let signaled = single_instance::signal_activate_existing();
+        eprintln!(
+            "mImageViewer is already running (activate signaled: {signaled}). Exiting second instance."
+        );
         std::process::exit(0);
     }
 

@@ -19,6 +19,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_Security",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dxgi",
@@ -69,6 +70,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # crossbeam-channel を有効にして、重い std::mpsc を避ける。
 notify = { version = "8", default-features = false, features = ["crossbeam-channel"] }
 crossbeam-channel = "0.5"
+# タスクトレイアイコン。Windows では Shell_NotifyIcon を内部で使用し、
+# メニュー処理用の隠しウィンドウを自動作成する。メインスレッド以外で
+# 動かすため、専用スレッドで `PeekMessageW` ポンプを回す実装にしている
+# (`src/tray.rs` 参照)。muda は tray-icon が再エクスポートしている。
+tray-icon = "0.20"
 
 [dev-dependencies]
 tempfile = "3"
