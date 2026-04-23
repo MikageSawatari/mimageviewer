@@ -6451,16 +6451,22 @@ impl App {
     /// アドレスバー右端の★表示で毎フレーム呼ばれるため、`current_folder_rating_cache`
     /// でメモ化して SQLite クエリと path 正規化コストを回避する。
     /// 検索結果ビューなど、実在しない合成パスに対しては 0 を返す。
+    /// Ctrl+G 検索中は `current_folder` が検索前のフォルダを指したままなので、
+    /// 直前に開いていた実フォルダの★が表示されないように 0 を返す。
     pub(crate) fn current_folder_rating(&mut self) -> u8 {
         if let Some(v) = self.current_folder_rating_cache {
             return v;
         }
-        let value = match self.current_folder.as_ref() {
-            Some(folder) if folder != &search_results_synthetic_path() => {
-                let key = crate::adjustment_db::normalize_path(folder);
-                self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
+        let value = if self.global_search.active {
+            0
+        } else {
+            match self.current_folder.as_ref() {
+                Some(folder) if folder != &search_results_synthetic_path() => {
+                    let key = crate::adjustment_db::normalize_path(folder);
+                    self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
+                }
+                _ => 0,
             }
-            _ => 0,
         };
         self.current_folder_rating_cache = Some(value);
         value
@@ -6479,8 +6485,13 @@ impl App {
 
     /// `current_folder` にレーティングを設定する (Shift+F1〜F6 用)。
     /// 合成パス (検索結果ビュー等) はスキップして false を返す。
+    /// Ctrl+G 検索中は `current_folder` が検索前のフォルダを指したままなので、
+    /// 直前に開いていた実フォルダを誤って書き換えないよう false を返す。
     /// 成功時は rating_cache も同期し、visible_indices を rebuild する。
     pub(crate) fn set_current_folder_rating(&mut self, stars: u8) -> bool {
+        if self.global_search.active {
+            return false;
+        }
         let Some(folder) = self.current_folder.clone() else {
             return false;
         };

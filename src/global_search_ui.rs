@@ -762,6 +762,9 @@ impl App {
         self.global_search.active = true;
         self.global_search.focus_request = true;
         self.global_search.saved_folder = self.current_folder.clone();
+        // Ctrl+G 中は current_folder_rating() が 0 を返す規約なので、
+        // 旧フォルダの★が残っているとアドレスバーにちらつく。
+        self.current_folder_rating_cache = None;
     }
 
     pub(crate) fn close_global_search(&mut self) {
@@ -772,6 +775,8 @@ impl App {
         self.global_search.pending = None;
         self.global_search.active = false;
         self.global_search.has_focus = false;
+        // Ctrl+G 中に 0 で埋めたキャッシュを破棄して、復帰先フォルダの実値を再計算させる。
+        self.current_folder_rating_cache = None;
         // Codex round-9 Should-fix #2: drill state / all_hits / done フラグも明示クリア。
         // 旧実装は containers だけクリアしていたため、DrilledInto のまま閉じて再度 Ctrl+G を
         // 開くと、検索前なのに戻るボタンや古い drill-down UI が残る可能性があった。
