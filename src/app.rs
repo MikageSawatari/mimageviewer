@@ -1330,6 +1330,11 @@ pub struct App {
     pub(crate) rating_db: Option<crate::rating_db::RatingDb>,
     /// 現在フォルダのアイテムごとのレーティングキャッシュ (idx → 0..=5)
     pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
+    /// ユーザが明示的に set_rating した path (normalize 済みキー) の記録。
+    /// tag_prewarm が古い XMP を背景で読み戻してきても、ここに入っている path は
+    /// ハイドレーション対象から外す (F6 で 0 にしたのに古い★が蘇る race の防止)。
+    /// フォルダ切替で load_folder がクリアする。
+    pub(crate) user_set_rating_keys: std::collections::HashSet<String>,
     /// `current_folder` (コンテナ) 自身のレーティングキャッシュ。アドレスバー描画で
     /// 毎フレーム参照されるので SQLite を叩かない。`None` は未計算を意味する。
     /// `load_folder` / `set_current_folder_rating` / `set_rating` (コンテナ変更時) で
@@ -1835,6 +1840,7 @@ impl Default for App {
             rotation_cache: std::collections::HashMap::new(),
             rating_db: crate::rating_db::RatingDb::open().ok(),
             rating_cache: std::collections::HashMap::new(),
+            user_set_rating_keys: std::collections::HashSet::new(),
             current_folder_rating_cache: None,
             spread_db: crate::spread_db::SpreadDb::open().ok(),
             spread_mode: crate::settings::SpreadMode::default(),
@@ -3242,6 +3248,8 @@ impl App {
         let assign_t0 = std::time::Instant::now();
         self.current_folder = Some(source_path.clone());
         self.current_folder_rating_cache = None;
+        // フォルダ切替でユーザ明示設定の記録もリセット (別フォルダでは無関係)
+        self.user_set_rating_keys.clear();
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
         self.current_folder_last_mtime = source_path
@@ -6511,6 +6519,9 @@ impl App {
             None => return,
         };
         self.rating_cache.insert(idx, stars);
+        // ユーザが明示的に値を書いた path として記録。tag_prewarm の古い XMP 読み戻しで
+        // 値を上書きされないように hydrate_ratings_from_xmp が参照する。
+        self.user_set_rating_keys.insert(key.clone());
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set(&key, stars);
         }
@@ -6867,10 +6878,14 @@ impl App {
         // DB の現在値を 1 クエリでまとめて引く
         let keys: Vec<String> = target.keys().cloned().collect();
         let current = db.get_many(&keys);
-        // DB が 0 (未登録) のエントリだけ実際にハイドレート対象にする
+        // DB が 0 (未登録) のエントリだけ実際にハイドレート対象にする。
+        // ただし user_set_rating_keys にある path はユーザが明示的に書いたので、
+        // 古い XMP 由来の値で上書きしない (F6 でクリア直後にレースで蘇るのを防止)。
         let mut to_write: Vec<(String, u8)> = Vec::new();
         for (key, stars) in &target {
-            if current.get(key).copied().unwrap_or(0) == 0 {
+            if current.get(key).copied().unwrap_or(0) == 0
+                && !self.user_set_rating_keys.contains(key)
+            {
                 to_write.push((key.clone(), *stars));
             }
         }

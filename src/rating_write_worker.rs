@@ -81,8 +81,11 @@ impl RatingWriteHandle {
 impl Drop for RatingWriteHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // job_tx を drop すれば worker の recv が Disconnected で break する。
-        // _thread は JoinHandle を保持しているのでこのまま自然に detach でも OK。
+        // on_exit → App::drop → この Drop の流れで、worker が在庫ジョブを drain
+        // し切るのを待つ。join しないと XMP 未書き出しのままプロセスが落ちる。
+        if let Some(thread) = self._thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -93,13 +96,16 @@ fn run_worker(
     failures: &AtomicUsize,
     shutdown: &AtomicBool,
 ) {
-    while !shutdown.load(Ordering::Relaxed) {
+    // Drop 時の shutdown=true だけで break するとキューに残ったジョブが捨てられ、
+    // DB には書いたのに XMP には書いていないファイルが出る。tag_write_worker と同じく
+    // 「shutdown かつキュー空」のときだけ break する drain-on-shutdown 方式にする。
+    loop {
+        if shutdown.load(Ordering::Relaxed) && job_rx.is_empty() {
+            break;
+        }
         let Ok(job) = job_rx.recv_timeout(std::time::Duration::from_millis(200)) else {
             continue;
         };
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
         let result = xmp_writer::apply_rating(&job.path, job.rating).map_err(|e| e.to_string());
         if result.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);

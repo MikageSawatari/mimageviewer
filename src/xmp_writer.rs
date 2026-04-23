@@ -23,12 +23,20 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 
 use quick_xml::events::Event;
 use quick_xml::reader::NsReader;
 
 use crate::xmp_reader;
 use crate::xmp_reader::find_subsequence;
+
+/// タグ / レーティングの XMP 書き込み全体にまたがる排他ロック。
+/// `apply_tag_op` (tag_write_worker スレッド) と `apply_rating` (rating_write_worker
+/// スレッド) が同じファイルに対して read-modify-write を並走させると、後勝ちで
+/// 相手の編集 (dc:subject / xmp:Rating) を上書き消去してしまうため、ここで直列化する。
+/// 1 ファイル I/O は msec オーダーで、ユーザ操作頻度では競合コストは無視できる。
+static XMP_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // エラー型
@@ -125,6 +133,7 @@ pub enum TagOp {
 ///
 /// 成功時は `Ok(new_tags)` で編集後のタグ列 (スペース区切り `#原神 #風景 既存`) を返す。
 pub fn apply_tag_op(path: &Path, op: &TagOp) -> Result<String, WriteError> {
+    let _lock = XMP_WRITE_LOCK.lock().unwrap();
     let format = detect_format(path).ok_or(WriteError::UnsupportedFormat)?;
 
     // 読み取り専用チェック (早期失敗)
@@ -152,6 +161,7 @@ pub fn apply_tag_op(path: &Path, op: &TagOp) -> Result<String, WriteError> {
 /// タグ操作と同じ read-modify-write 経路だが、更新する XMP プロパティが
 /// `xmp:Rating` である点だけが違う。dc:subject (タグ) は素通しで保持される。
 pub fn apply_rating(path: &Path, rating: Option<u8>) -> Result<(), WriteError> {
+    let _lock = XMP_WRITE_LOCK.lock().unwrap();
     let format = detect_format(path).ok_or(WriteError::UnsupportedFormat)?;
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.permissions().readonly() {

@@ -665,10 +665,10 @@ fn scan_attributes_for_rating(
 }
 
 fn parse_rating_value(s: &str) -> Option<u8> {
-    // Lightroom は "-1" (rejected) も使うが mIV は 0..=5 のみ扱う。
-    // 小数 ("3.5") にも一応対応して floor する。
+    // Lightroom は "-1" (rejected) も使うが mIV では 0 扱い。
+    // 小数 ("3.5") は floor で解釈する: 3.5 → 3, 0.9 → 0, 5.9 → 5。
     let v: f32 = s.trim().parse().ok()?;
-    if v < 0.5 {
+    if v < 1.0 {
         Some(0)
     } else {
         Some((v.floor() as i32).clamp(1, 5) as u8)
