@@ -5,6 +5,8 @@ members = ["crates/susie-worker", "tools/png2mag"]
 name = "mimageviewer"
 version = "0.8.0"
 edition = "2024"
+# let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
+rust-version = "1.88"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
