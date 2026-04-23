@@ -260,8 +260,8 @@ fn run_tray_thread(
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW,
-        SetForegroundWindow, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WM_QUIT,
+        DispatchMessageW, IsWindowVisible, PeekMessageW, PostMessageW, SetForegroundWindow,
+        ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WM_CLOSE,
     };
 
     // HWND (`*mut c_void`) は Send/Sync ではないので、クロージャでキャプチャするときは
@@ -379,35 +379,29 @@ fn run_tray_thread(
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
                 let hwnd = make_hwnd(hwnd_raw);
-                // WM_QUIT をメインスレッドに直接 post する。
-                //
-                // 以前は `PostMessageW(WM_CLOSE)` を使っていたが、winit がその close を
-                // 処理するために hidden なウィンドウを一瞬可視化する副作用があり、
-                // 終了直前にウィンドウが光って不自然だった。
-                //
-                // WM_QUIT は WndProc を経由せず、winit のイベントループの
-                // `GetMessage`/`PeekMessage` 段階で検出されてそのままループ終了に
-                // つながる。可視化が挟まらないので静かに終わる。
-                // eframe の on_exit もこのルートで呼ばれる (hide_to_tray で既に
-                // settings.save() + sidecar flush 済みなのでどちらでも安全)。
-                unsafe {
-                    let main_tid = GetWindowThreadProcessId(hwnd, None);
-                    if main_tid != 0 {
-                        let _ = PostThreadMessageW(
-                            main_tid,
-                            WM_QUIT,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    } else {
-                        crate::logger::log(
-                            "tray: GetWindowThreadProcessId returned 0 (cannot quit cleanly)",
-                        );
+                // ウィンドウの現在の可視状態によって終了経路を分岐する:
+                // - 可視: `WM_CLOSE` を post して eframe の通常の close フローに乗せる。
+                //   既に可視なのでフラッシュも無いし、`on_exit` が呼ばれて状態保存もされる。
+                // - 非表示 (トレイ常駐中): eframe は hidden な viewport に対して `update` を
+                //   呼ばず、`WM_CLOSE` を処理するために winit が window を一瞬可視化する副作用が
+                //   あった。`hide_to_tray` で既に settings.save() + sidecar flush 済みなので、
+                //   ここで `std::process::exit(0)` して即座に終了する方が安全かつ自然。
+                //   (`WM_QUIT` via `PostThreadMessageW` も試したが winit 0.30 のループで
+                //    検出されず終了しなかった)。
+                let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+                if visible {
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
+                    let _ = event_tx.send(TrayEvent::QuitRequested);
+                    ctx.request_repaint();
+                    crate::logger::log("tray: Quit (visible) → PostMessage(WM_CLOSE)");
+                } else {
+                    crate::logger::log("tray: Quit (hidden) → std::process::exit(0)");
+                    // tray icon の解除は Drop で自動的に走らないが、プロセス終了で
+                    // OS がハンドルを回収するので問題なし。
+                    std::process::exit(0);
                 }
-                let _ = event_tx.send(TrayEvent::QuitRequested);
-                ctx.request_repaint();
-                crate::logger::log("tray: Quit → quit_flag + PostThreadMessage(WM_QUIT)");
             }
         }));
     }
