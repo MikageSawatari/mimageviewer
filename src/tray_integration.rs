@@ -70,14 +70,12 @@ impl App {
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
-        // メニュー「終了」経由の強制終了要求は常に通す (tray_quit_requested フラグ、または
-        // トレイスレッドが直接立てた quit_flag のいずれかで判定)。
+        // トレイメニュー「終了」経由の強制終了要求は常に通す。
         let tray_wants_quit = self
             .tray_controller
             .as_ref()
             .is_some_and(|tc| tc.is_quit_requested());
-        if self.tray_quit_requested || tray_wants_quit {
-            self.tray_quit_requested = true; // 次回フレームでも通す
+        if tray_wants_quit {
             return false;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
@@ -87,7 +85,6 @@ impl App {
         if !self.settings.minimize_to_tray_on_close || self.tray_controller.is_none() {
             return false;
         }
-        // インターセプト: close をキャンセルしてウィンドウを Win32 レベルで非表示に。
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         self.hide_to_tray();
         true
@@ -136,18 +133,10 @@ impl App {
 
         // GPU リソース解放 (best-effort)
         self.release_gpu_resources();
-        // 終了時と同じく、dirty なサイドカー・設定をこのタイミングで flush する
-        // (電源断・クラッシュ時に失わないため)。inner_size が不明なら前回保存値を維持。
-        // トレイメニューの「終了」は WM_QUIT 経路で on_exit を呼ばずに終わる可能性があるため、
-        // hide のタイミングで確実に全 flush しておくことでデータロスを防ぐ。
-        if let Some(rect) = self.last_outer_rect {
-            self.settings.window_pos = Some([rect.min.x, rect.min.y]);
-        }
-        if let Some(size) = self.last_inner_size {
-            self.settings.window_size = Some(size);
-        }
-        self.settings.save();
-        self.flush_all_sidecars();
+        // 終了時と同じ永続化処理を hide のタイミングでも走らせる。
+        // トレイメニュー「終了」は hidden 状態では std::process::exit(0) で抜けるため
+        // on_exit が呼ばれない可能性があり、ここで確実に flush しておくことでデータロスを防ぐ。
+        self.persist_window_state_and_flush();
 
         // トレイの表示を更新
         self.update_tray_tooltip();
@@ -155,13 +144,9 @@ impl App {
     }
 
     /// タスクトレイから復帰した後の **App 側事後処理**。
-    /// トレイスレッドの OpenRequested 経路と、外部 ShowWindow 検出経路の両方から呼ばれる。
-    fn sync_after_restore(&mut self) {
-        self.sync_after_restore_internal();
-    }
-
-    /// `update` から直接呼べる版。borrow チェッカ回避で `&mut self` のみ要求。
-    pub(crate) fn sync_after_restore_internal(&mut self) {
+    /// トレイスレッドの OpenRequested 経路と、外部 ShowWindow 検出経路 (アクティベーション
+    /// リスナー等) の両方から呼ばれる。
+    pub(crate) fn sync_after_restore(&mut self) {
         if self.window_visible {
             return;
         }
@@ -258,10 +243,12 @@ impl App {
 
     /// タスクトレイのメニュー / クリックイベントを処理する。
     /// `App::update` から毎フレーム呼ぶ。
-    pub(crate) fn poll_tray_events(&mut self, ctx: &egui::Context) {
-        // borrow 分離: 一旦イベントを drain してから self のメソッドを呼ぶ。
-        // controller は `self` の一部なので、ループ内で `&mut self` を触りたいと
-        // immutable borrow と衝突する。
+    ///
+    /// トレイスレッド側が先に Win32 操作 (`ShowWindow` / `PostMessage(WM_CLOSE)` 等) と
+    /// 共有 Arc 経由の状態反転 (`activity_gate` / `io_sem`) を済ませているので、
+    /// ここでは App 側の状態同期と設定永続化だけ行う。
+    pub(crate) fn poll_tray_events(&mut self) {
+        // borrow 分離: 先にイベントを drain してから self のメソッドを呼ぶ。
         let events: Vec<TrayEvent> = {
             let Some(tc) = self.tray_controller.as_ref() else {
                 return;
@@ -275,23 +262,20 @@ impl App {
         for ev in events {
             match ev {
                 TrayEvent::OpenRequested => {
-                    // トレイスレッドが既に Win32 ShowWindow + SetForegroundWindow を実行済み。
-                    // App 側は状態同期だけ行う。
                     self.sync_after_restore();
                 }
                 TrayEvent::TogglePauseRequested => {
-                    // トレイスレッドが既に activity_gate を反転済み。
-                    // App 側は設定保存 + ツールチップ更新のみ。
                     let new_state = self.activity_gate.is_paused();
                     self.settings.pause_indexer_while_minimized = new_state;
                     self.settings.save();
                     self.update_tray_tooltip();
                 }
                 TrayEvent::QuitRequested => {
-                    // トレイスレッドが quit_flag + PostMessage(WM_CLOSE) を既に実行済み。
-                    // maybe_intercept_close が quit_flag を見て close を通すのでここは何もしない。
-                    self.tray_quit_requested = true;
-                    let _ = ctx; // ctx unused here (kept for signature uniformity)
+                    // 可視状態で Quit が押されたケース: トレイスレッドが既に
+                    // PostMessage(WM_CLOSE) 済み。`maybe_intercept_close` が
+                    // tc.is_quit_requested() を見て close を通すのでここは何もしない。
+                    // (hidden 状態のときはトレイスレッドが直接 std::process::exit(0)
+                    //  するので、そもそもこの event は届かない)
                 }
             }
         }

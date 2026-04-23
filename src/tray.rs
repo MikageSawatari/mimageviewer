@@ -379,15 +379,10 @@ fn run_tray_thread(
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
                 let hwnd = make_hwnd(hwnd_raw);
-                // ウィンドウの現在の可視状態によって終了経路を分岐する:
-                // - 可視: `WM_CLOSE` を post して eframe の通常の close フローに乗せる。
-                //   既に可視なのでフラッシュも無いし、`on_exit` が呼ばれて状態保存もされる。
-                // - 非表示 (トレイ常駐中): eframe は hidden な viewport に対して `update` を
-                //   呼ばず、`WM_CLOSE` を処理するために winit が window を一瞬可視化する副作用が
-                //   あった。`hide_to_tray` で既に settings.save() + sidecar flush 済みなので、
-                //   ここで `std::process::exit(0)` して即座に終了する方が安全かつ自然。
-                //   (`WM_QUIT` via `PostThreadMessageW` も試したが winit 0.30 のループで
-                //    検出されず終了しなかった)。
+                // 可視状態で分岐: 可視なら eframe の通常 close フローに乗せ、非表示なら
+                // そのまま `std::process::exit` で抜ける。非表示時に WM_CLOSE を送ると winit が
+                // close 処理のために window を一瞬可視化してしまうので、hide 中は永続化済みの
+                // 状態を頼りに直接終了する方が自然 (hide_to_tray で save + flush 済み)。
                 let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
                 if visible {
                     unsafe {
@@ -398,8 +393,6 @@ fn run_tray_thread(
                     crate::logger::log("tray: Quit (visible) → PostMessage(WM_CLOSE)");
                 } else {
                     crate::logger::log("tray: Quit (hidden) → std::process::exit(0)");
-                    // tray icon の解除は Drop で自動的に走らないが、プロセス終了で
-                    // OS がハンドルを回収するので問題なし。
                     std::process::exit(0);
                 }
             }

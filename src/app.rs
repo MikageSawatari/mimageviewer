@@ -1624,8 +1624,6 @@ pub struct App {
     /// ウィンドウが現在可視か。[×] による hide で false、トレイ「開く」で true。
     /// 遷移検出で throttle/pause の on/off を切り替える。
     pub(crate) window_visible: bool,
-    /// メニュー「終了」 → 次フレームで実際の `ViewportCommand::Close` を送るフラグ。
-    pub(crate) tray_quit_requested: bool,
     /// タスクトレイ常駐設定を ON にしたときに 1 回だけ表示する案内ダイアログ。
     /// ユーザーが OK を押すと閉じる。
     pub(crate) show_tray_enabled_notice: bool,
@@ -1923,7 +1921,6 @@ impl Default for App {
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,
             window_visible: true,
-            tray_quit_requested: false,
             show_tray_enabled_notice: false,
             main_hwnd: None,
             placement_slot: None,
@@ -7833,6 +7830,24 @@ impl App {
         }
     }
 
+    /// アプリ終了時・トレイ退避時の共通永続化処理:
+    /// ウィンドウ位置・サイズを settings に書き戻し、save + サイドカーを flush する。
+    ///
+    /// - サイズは `ViewportBuilder::with_inner_size` と整合する inner_size のみを書く
+    ///   (不明なら前回保存値を維持。outer に fallback すると titlebar 分だけ縮小する
+    ///    問題が再発するので fallback しない)。
+    /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
+    pub(crate) fn persist_window_state_and_flush(&mut self) {
+        if let Some(rect) = self.last_outer_rect {
+            self.settings.window_pos = Some([rect.min.x, rect.min.y]);
+        }
+        if let Some(size) = self.last_inner_size {
+            self.settings.window_size = Some(size);
+        }
+        self.settings.save();
+        self.flush_all_sidecars();
+    }
+
     /// マスクとベクタを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
     /// ビットマップが全 false かつベクタが空なら DB からもサイドカーからも削除する
     /// (mask_db.set の仕様と揃える)。サムネイルバッジ用の `mask_pages` もここで更新する。
@@ -9285,38 +9300,37 @@ impl eframe::App for App {
             }
         }
 
-        // 実際の Win32 可視状態と App の `window_visible` を毎フレーム同期する。
-        // トレイスレッドや 2 重起動アクティベーションリスナーが `ShowWindow` を直接呼ぶ
-        // 経路があるので、こちらは flag を追従させる責務を持つ。不一致が残ると
-        // `hide_to_tray` の early-return で [×] が効かなくなる等の不具合につながる。
-        #[cfg(windows)]
-        if let Some(hwnd_raw) = self.main_hwnd {
-            use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
-            let is_visible_now =
-                unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
-            if is_visible_now && !self.window_visible {
-                // 外部経路 (アクティベーションリスナー等) でウィンドウが可視化された。
-                // tray スレッドの OpenRequested イベントを経由しなかったので、
-                // 同等の事後処理をここで実行する。
-                crate::logger::log(
-                    "tray: detected external ShowWindow — running sync_after_restore",
-                );
-                self.sync_after_restore_internal();
-            } else if !is_visible_now && self.window_visible {
-                // 外部経路で hide された (通常は tray の hide_to_tray 経由)。
-                self.window_visible = false;
+        // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
+        // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を
+        // 走らせないで済むようここで一括 gate する。
+        let tray_active =
+            self.settings.minimize_to_tray_on_close || self.tray_controller.is_some();
+        if tray_active {
+            // 実際の Win32 可視状態と App の `window_visible` を毎フレーム同期する。
+            // トレイスレッドや 2 重起動アクティベーションリスナーが `ShowWindow` を直接呼ぶ
+            // 経路があるので、こちらは flag を追従させる責務を持つ。
+            #[cfg(windows)]
+            if let Some(hwnd_raw) = self.main_hwnd {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+                let is_visible_now =
+                    unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
+                if is_visible_now && !self.window_visible {
+                    crate::logger::log(
+                        "tray: detected external ShowWindow — running sync_after_restore",
+                    );
+                    self.sync_after_restore();
+                } else if !is_visible_now && self.window_visible {
+                    self.window_visible = false;
+                }
             }
-        }
 
-        // タスクトレイ: 設定変更を反映 + メニューイベントをポーリング + 閉じるボタンの
-        // 乗っ取り判定。ここは毎フレーム先頭で処理する (close_requested を取りこぼさないため)。
-        self.sync_tray_with_settings(ctx);
-        self.poll_tray_events(ctx);
-        if self.maybe_intercept_close(ctx) {
-            // hide に差し替えたフレームはこれ以降の描画をスキップしてよい
-            // (ウィンドウは非表示になるので描画してもユーザーには見えない)。
-            return;
+            // 設定変更反映 + メニューイベントをポーリング + 閉じるボタンの乗っ取り。
+            self.sync_tray_with_settings(ctx);
+            self.poll_tray_events();
+            if self.maybe_intercept_close(ctx) {
+                return;
+            }
         }
 
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
@@ -9859,20 +9873,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // 終了時にウィンドウ位置・サイズを保存。
-        // - サイズは `ViewportBuilder::with_inner_size` と整合する inner_size のみを書く
-        //   (不明なら **前回保存値を維持**。outer に fallback すると titlebar 分だけ
-        //    縮小する問題が再発するので fallback しない)
-        // - 位置は outer_rect から取る (with_position は outer 座標を受け取る)
-        if let Some(rect) = self.last_outer_rect {
-            self.settings.window_pos = Some([rect.min.x, rect.min.y]);
-        }
-        if let Some(size) = self.last_inner_size {
-            self.settings.window_size = Some(size);
-        }
-        self.settings.save();
-        // dirty なサイドカーをディスクへ書き出す
-        self.flush_all_sidecars();
+        self.persist_window_state_and_flush();
     }
 }
 
