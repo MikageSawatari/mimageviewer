@@ -67,22 +67,26 @@ pub fn capture_window_placement(hwnd_raw: isize) -> Option<SavedWindowPlacement>
         if GetWindowPlacement(HWND(hwnd_raw as *mut _), &mut wp).is_err() {
             return None;
         }
-        let bytes_src = std::slice::from_raw_parts(
+        // `[u8; N]` に書き写して Send+Sync な値として保持する (WINDOWPLACEMENT 自体は
+        // 内部に Point/Rect を持つだけで opaque ハンドル等は含まない)。
+        let mut out = [0u8; std::mem::size_of::<WINDOWPLACEMENT>()];
+        std::ptr::copy_nonoverlapping(
             (&wp as *const WINDOWPLACEMENT) as *const u8,
+            out.as_mut_ptr(),
             std::mem::size_of::<WINDOWPLACEMENT>(),
         );
-        let mut out = [0u8; std::mem::size_of::<WINDOWPLACEMENT>()];
-        out.copy_from_slice(bytes_src);
         Some(SavedWindowPlacement { bytes: out })
     }
 }
 
 #[cfg(windows)]
-fn restore_window_placement(hwnd_raw: isize, saved: &SavedWindowPlacement) {
+pub(crate) fn restore_window_placement(hwnd_raw: isize, saved: &SavedWindowPlacement) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowPlacement, WINDOWPLACEMENT};
     unsafe {
-        let wp = *(saved.bytes.as_ptr() as *const WINDOWPLACEMENT);
+        // `[u8; N]` は alignment=1 なので `*const WINDOWPLACEMENT` への dereference は UB。
+        // `read_unaligned` で安全に読む。
+        let wp = std::ptr::read_unaligned(saved.bytes.as_ptr() as *const WINDOWPLACEMENT);
         if let Err(e) = SetWindowPlacement(HWND(hwnd_raw as *mut _), &wp) {
             crate::logger::log(format!("tray: SetWindowPlacement failed: {e:?}"));
         }
@@ -261,7 +265,7 @@ fn run_tray_thread(
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, IsWindowVisible, PeekMessageW, PostMessageW, SetForegroundWindow,
-        ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WM_CLOSE,
+        ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
     };
 
     // HWND (`*mut c_void`) は Send/Sync ではないので、クロージャでキャプチャするときは
@@ -345,7 +349,9 @@ fn run_tray_thread(
                 sem.set_throttled(false);
             }
             activity_gate.set_paused(false);
-            let _ = event_tx.send(TrayEvent::OpenRequested);
+            // try_send: チャネルが埋まっていても(トレイ常駐中に update が drain できない等)
+            // ドロップしてよい。状態変更はクロージャ内で既に適用済み。
+            let _ = event_tx.try_send(TrayEvent::OpenRequested);
             ctx.request_repaint();
             crate::logger::log(format!(
                 "tray: Open → placement_restored={used_placement} + SetForegroundWindow"
@@ -371,7 +377,7 @@ fn run_tray_thread(
                 // muda が CheckMenuItem を既にトグル済み。こちらも activity_gate を反転。
                 let new_state = !activity_gate.is_paused();
                 activity_gate.set_paused(new_state);
-                let _ = event_tx.send(TrayEvent::TogglePauseRequested);
+                let _ = event_tx.try_send(TrayEvent::TogglePauseRequested);
                 ctx.request_repaint();
                 crate::logger::log(format!(
                     "tray: Pause toggled → activity_gate.paused = {new_state}"
@@ -379,22 +385,20 @@ fn run_tray_thread(
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
                 let hwnd = make_hwnd(hwnd_raw);
-                // 可視状態で分岐: 可視なら eframe の通常 close フローに乗せ、非表示なら
-                // そのまま `std::process::exit` で抜ける。非表示時に WM_CLOSE を送ると winit が
-                // close 処理のために window を一瞬可視化してしまうので、hide 中は永続化済みの
-                // 状態を頼りに直接終了する方が自然 (hide_to_tray で save + flush 済み)。
-                let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-                if visible {
-                    unsafe {
-                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                // 常に eframe の通常 close 経路を通って on_exit / Drop を走らせる
+                // (インデクサ / tag writer / Tantivy writer 等の graceful shutdown のため)。
+                // 非表示状態の場合は winit が WM_CLOSE を処理するため一瞬可視化されるので、
+                // 先に `SW_SHOWNOACTIVATE` (フォーカス奪わず・アニメーション最小) で可視化しておく。
+                // クリーンな終了を優先し、一瞬の表示は許容する。
+                unsafe {
+                    if !IsWindowVisible(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     }
-                    let _ = event_tx.send(TrayEvent::QuitRequested);
-                    ctx.request_repaint();
-                    crate::logger::log("tray: Quit (visible) → PostMessage(WM_CLOSE)");
-                } else {
-                    crate::logger::log("tray: Quit (hidden) → std::process::exit(0)");
-                    std::process::exit(0);
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
+                let _ = event_tx.try_send(TrayEvent::QuitRequested);
+                ctx.request_repaint();
+                crate::logger::log("tray: Quit → WM_CLOSE (clean shutdown)");
             }
         }));
     }
@@ -432,6 +436,10 @@ fn run_tray_thread(
         Ok(t) => t,
         Err(e) => {
             crate::logger::log(format!("tray: build failed: {e}"));
+            // set_event_handler で登録した global handler が生き残ったままになるので
+            // 明示的にクリアしてから return する (無効な HWND への send を避ける)。
+            MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
+            TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
             return;
         }
     };

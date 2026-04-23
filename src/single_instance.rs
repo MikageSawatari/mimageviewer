@@ -28,11 +28,22 @@
 //! 非 Windows では常に「1 個目」扱いにして機能を no-op 化する。
 
 /// プロセス終了まで保持される単一インスタンスガード。
+/// 1 個目のインスタンスは mutex + activate event の両方を取得し、2 個目以降は
+/// mutex 取得失敗で `is_first_instance() = false` となる。
 pub struct SingleInstanceGuard {
     #[cfg(windows)]
-    _handle: windows::Win32::Foundation::HANDLE,
+    _mutex: windows::Win32::Foundation::HANDLE,
     is_first: bool,
 }
+
+/// 1 個目のインスタンスが `SingleInstanceGuard::acquire` 内で作成した
+/// activate event の生 HANDLE 値を保持する process-wide スロット。
+/// `spawn_activation_listener` が読んで待機に使う。
+///
+/// mutex 取得と同じ `acquire` 内で作られるので、2 個目が `OpenEventW` に失敗する
+/// レース (「mutex は存在するが event はまだ」) が起きない。
+#[cfg(windows)]
+static ACTIVATE_EVENT_RAW: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 
 /// インストーラの `AppMutex` と一致させる mutex 名。
 ///
@@ -43,35 +54,52 @@ pub const MUTEX_NAME: &str = "Global\\mImageViewerInstance_v1";
 
 impl SingleInstanceGuard {
     /// `MUTEX_NAME` で Named Mutex を作成する。既存なら `is_first_instance() = false`。
+    /// 1 個目の場合は activate event も一緒に作成して後段の listener が使えるようにする。
     pub fn acquire() -> Self {
         #[cfg(windows)]
         {
             use windows::core::PCWSTR;
             use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-            use windows::Win32::System::Threading::CreateMutexW;
+            use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
 
-            let name_wide: Vec<u16> = MUTEX_NAME.encode_utf16().chain([0]).collect();
-            match unsafe { CreateMutexW(None, false, PCWSTR(name_wide.as_ptr())) } {
-                Ok(handle) => {
-                    // GetLastError が ERROR_ALREADY_EXISTS なら既存 mutex を開いたので 2 個目。
-                    let is_first = unsafe { GetLastError() } != ERROR_ALREADY_EXISTS;
-                    SingleInstanceGuard {
-                        _handle: handle,
-                        is_first,
+            let mutex_name: Vec<u16> = MUTEX_NAME.encode_utf16().chain([0]).collect();
+            let (mutex_handle, is_first) =
+                match unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) } {
+                    Ok(h) => {
+                        let is_first = unsafe { GetLastError() } != ERROR_ALREADY_EXISTS;
+                        (h, is_first)
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "single_instance: CreateMutexW failed: {e:?} — continuing as first"
+                        ));
+                        (windows::Win32::Foundation::HANDLE::default(), true)
+                    }
+                };
+
+            // 1 個目のインスタンスは activate event も即座に作成する。
+            // 2 個目起動は mutex check → `signal_activate_existing` で `OpenEventW`
+            // するので、event の存在が mutex の存在と同期している必要がある。
+            if is_first {
+                let event_name: Vec<u16> =
+                    ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
+                // auto-reset (`bManualReset=false`) + 初期 non-signaled
+                match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) }
+                {
+                    Ok(h) => {
+                        let _ = ACTIVATE_EVENT_RAW.set(h.0 as isize);
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "single_instance: CreateEventW(activate) failed: {e:?}"
+                        ));
                     }
                 }
-                Err(e) => {
-                    // 作成失敗は通常起きないが、起きたら「自分が 1 個目」扱いにして続行。
-                    // (GetLastError = ACCESS_DENIED などは Global\ prefix 制約だがここでは
-                    //  管理者権限不要の作成範囲なので基本起きない)
-                    crate::logger::log(format!(
-                        "single_instance: CreateMutexW failed: {e:?} — continuing as first"
-                    ));
-                    SingleInstanceGuard {
-                        _handle: windows::Win32::Foundation::HANDLE::default(),
-                        is_first: true,
-                    }
-                }
+            }
+
+            SingleInstanceGuard {
+                _mutex: mutex_handle,
+                is_first,
             }
         }
         #[cfg(not(windows))]
@@ -84,6 +112,21 @@ impl SingleInstanceGuard {
     /// false のときは既にもう 1 つ mImageViewer が動いている。
     pub fn is_first_instance(&self) -> bool {
         self.is_first
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::CloseHandle;
+            unsafe {
+                if !self._mutex.is_invalid() {
+                    let _ = CloseHandle(self._mutex);
+                }
+            }
+            // activate event は listener が CloseHandle するので触らない。
+        }
     }
 }
 
@@ -138,38 +181,34 @@ pub struct ActivationListener {
 
 /// メインプロセス側のアクティベーションリスナーを起動する。
 /// 2 重起動を試みた別プロセスが `signal_activate_existing()` でイベントを発火したら、
-/// waiter スレッドが `activate_window(hwnd)` を呼んでウィンドウを復帰させる。
+/// waiter スレッドが placement_slot (あれば) を復元 + `ShowWindow` + `SetForegroundWindow`
+/// で復帰させる。
 ///
-/// `egui_ctx` は活性化後に UI スレッドを起こすための clone。
+/// - `placement_slot`: トレイ hide 時に保存された `WINDOWPLACEMENT`。ある場合は
+///   `SetWindowPlacement` で DPI 丸めを回避しつつ元のサイズ・位置で復元する。
+///
+/// activate event は `SingleInstanceGuard::acquire` が `ACTIVATE_EVENT_RAW` OnceLock に
+/// 既に登録しているのでここで作成は不要。
 pub fn spawn_activation_listener(
     hwnd_raw: isize,
     egui_ctx: eframe::egui::Context,
+    placement_slot: crate::tray::PlacementSlot,
 ) -> Option<ActivationListener> {
     #[cfg(windows)]
     {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
-        use windows::Win32::System::Threading::{
-            CreateEventW, WaitForMultipleObjects, INFINITE,
-        };
+        use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
         use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
 
-        let name_wide: Vec<u16> = ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
-        let activate_event: HANDLE = match unsafe {
-            // bManualReset=false (auto-reset), bInitialState=false
-            CreateEventW(None, false, false, PCWSTR(name_wide.as_ptr()))
-        } {
-            Ok(h) => h,
-            Err(e) => {
-                crate::logger::log(format!(
-                    "single_instance: CreateEventW(activate) failed: {e:?}"
-                ));
-                return None;
-            }
+        let Some(&activate_event_raw) = ACTIVATE_EVENT_RAW.get() else {
+            crate::logger::log(
+                "single_instance: ACTIVATE_EVENT_RAW not set (guard did not create event) — skipping listener",
+            );
+            return None;
         };
         let stop_event: HANDLE = match unsafe {
-            // manual-reset=true で stop を立てたら以降ずっと signaled
             CreateEventW(None, true, false, PCWSTR::null())
         } {
             Ok(h) => h,
@@ -177,20 +216,16 @@ pub fn spawn_activation_listener(
                 crate::logger::log(format!(
                     "single_instance: CreateEventW(stop) failed: {e:?}"
                 ));
-                unsafe {
-                    let _ = CloseHandle(activate_event);
-                }
                 return None;
             }
         };
 
-        // スレッド間で HANDLE (isize 互換) を Send するための包み
         struct HandlePair {
             activate: isize,
             stop: isize,
         }
         let handles = HandlePair {
-            activate: activate_event.0 as isize,
+            activate: activate_event_raw,
             stop: stop_event.0 as isize,
         };
 
@@ -204,30 +239,40 @@ pub fn spawn_activation_listener(
                     let r =
                         unsafe { WaitForMultipleObjects(&wait_handles, false, INFINITE) };
                     if r == WAIT_OBJECT_0 {
-                        // activate: 既存インスタンスへの起動要求
                         crate::logger::log(
                             "single_instance: activate event signaled — restoring window",
                         );
+                        // placement_slot に hide 時の WINDOWPLACEMENT があれば先に復元し、
+                        // DPI 丸めによるサイズ / 位置のズレを回避する (トレイ Open と同じ挙動)。
+                        let hwnd =
+                            windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
+                        let used_placement = {
+                            let mut slot = placement_slot.lock().unwrap();
+                            if let Some(p) = slot.take() {
+                                crate::tray::restore_window_placement(hwnd_raw, &p);
+                                true
+                            } else {
+                                false
+                            }
+                        };
                         unsafe {
-                            let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
-                            let _ = ShowWindow(hwnd, SW_SHOW);
+                            if !used_placement {
+                                let _ = ShowWindow(hwnd, SW_SHOW);
+                            }
                             let _ = SetForegroundWindow(hwnd);
                         }
                         egui_ctx.request_repaint();
                     } else if r.0 == WAIT_OBJECT_0.0 + 1 {
-                        // stop: シャットダウン
                         break;
                     } else if r == WAIT_FAILED {
                         crate::logger::log("single_instance: WaitForMultipleObjects failed");
                         break;
                     } else {
-                        // その他 (WAIT_ABANDONED 等)、無視して続行
                         continue;
                     }
                 }
                 unsafe {
                     let _ = CloseHandle(activate);
-                    // stop は呼び出し側の Drop で閉じる。
                 }
                 crate::logger::log("single_instance: listener thread exiting");
             })

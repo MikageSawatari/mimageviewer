@@ -9289,12 +9289,20 @@ impl eframe::App for App {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
                     crate::logger::log(format!("tray: captured main HWND = {hwnd_raw:#x}"));
+                    // アクティベーションリスナーに placement_slot を共有するため、
+                    // ここでスロットを作成しておく (sync_tray_with_settings での遅延作成と
+                    // 競合しないよう、どちらも is_none チェック付き)。
+                    if self.placement_slot.is_none() {
+                        self.placement_slot = Some(crate::tray::new_placement_slot());
+                    }
+                    let slot = self.placement_slot.clone().unwrap();
                     // 2 重起動時に既存インスタンスを復帰させるリスナーを起動。
-                    // Named Event を wait するバックグラウンドスレッド。
+                    // placement_slot もトレイ Open と同じ経路で SetWindowPlacement するため共有。
                     self.activation_listener =
                         crate::single_instance::spawn_activation_listener(
                             hwnd_raw,
                             ctx.clone(),
+                            slot,
                         );
                 }
             }
