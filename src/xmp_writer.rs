@@ -28,6 +28,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::NsReader;
 
 use crate::xmp_reader;
+use crate::xmp_reader::find_subsequence;
 
 // ---------------------------------------------------------------------------
 // エラー型
@@ -321,43 +322,41 @@ fn strip_rating_attribute(xmp: &[u8]) -> Vec<u8> {
 }
 
 /// rdf:Description タグ中 (`<rdf:Description ...` の `<` から `>` の手前まで) の
-/// `xmp:Rating="..."` を削除した新バイト列を返す。変更があれば `removed = true`。
+/// `xmp:Rating="..."` / `xmp:Rating='...'` を削除した新バイト列を返す。
+/// 変更があれば `removed = true`。純粋にバイト操作で処理するので、rdf:about 属性等に
+/// 非 ASCII (UTF-8 の multibyte 文字) が入っていても破壊しない。
 fn remove_rating_attr(tag_slice: &[u8]) -> (Vec<u8>, bool) {
-    let s = String::from_utf8_lossy(tag_slice).to_string();
-    // 単純な文字列置換で xmp:Rating="..." / xmp:Rating='...' を削除。
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
+    let needle = b"xmp:Rating";
+    let mut out: Vec<u8> = Vec::with_capacity(tag_slice.len());
     let mut i = 0;
     let mut removed = false;
-    let needle = b"xmp:Rating";
-    while i < bytes.len() {
-        if bytes[i..].starts_with(needle) {
-            // 続けて = があるか確認
+    while i < tag_slice.len() {
+        if tag_slice[i..].starts_with(needle) {
             let after = i + needle.len();
-            let rest = &bytes[after..];
-            let ws_len = rest.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
-            if after + ws_len < bytes.len() && bytes[after + ws_len] == b'=' {
-                // 値のクォートを見つけて skip
+            let ws_len = tag_slice[after..]
+                .iter()
+                .take_while(|&&c| c == b' ' || c == b'\t')
+                .count();
+            if after + ws_len < tag_slice.len() && tag_slice[after + ws_len] == b'=' {
                 let quote_start = after + ws_len + 1;
-                let rest_q = &bytes[quote_start..];
-                let q_ws = rest_q.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
-                if quote_start + q_ws < bytes.len() {
-                    let quote = bytes[quote_start + q_ws];
+                let q_ws = tag_slice[quote_start..]
+                    .iter()
+                    .take_while(|&&c| c == b' ' || c == b'\t')
+                    .count();
+                if quote_start + q_ws < tag_slice.len() {
+                    let quote = tag_slice[quote_start + q_ws];
                     if quote == b'"' || quote == b'\'' {
                         let value_start = quote_start + q_ws + 1;
-                        if let Some(end_rel) = bytes[value_start..].iter().position(|&c| c == quote) {
+                        if let Some(end_rel) =
+                            tag_slice[value_start..].iter().position(|&c| c == quote)
+                        {
                             let end = value_start + end_rel + 1;
-                            // 属性の前にある空白も 1 つ削る (tag が "<rdf:Description " で
-                            // 始まっていて attr の前に余計な空白を残さないため)。
-                            while !out.is_empty() {
-                                let last = out.chars().last().unwrap();
-                                if last == ' ' || last == '\t' {
-                                    out.pop();
-                                } else {
-                                    break;
-                                }
+                            // 削除する属性の前にある空白を 1 つ吸収して、タグ開始との
+                            // 間に余計な空白を残さない。
+                            while let Some(&b' ' | &b'\t') = out.last() {
+                                out.pop();
                             }
-                            out.push(' ');
+                            out.push(b' ');
                             i = end;
                             removed = true;
                             continue;
@@ -366,10 +365,10 @@ fn remove_rating_attr(tag_slice: &[u8]) -> (Vec<u8>, bool) {
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(tag_slice[i]);
         i += 1;
     }
-    (out.into_bytes(), removed)
+    (out, removed)
 }
 
 /// 最初に見つかった `<rdf:Description` 開始タグの `>` 直前に `xmp:Rating="N"` を挿入する。
@@ -394,15 +393,6 @@ fn insert_rating_attribute(xmp: &[u8], rating: u8) -> Result<Vec<u8>, WriteError
     out.extend_from_slice(insertion.as_bytes());
     out.extend_from_slice(&xmp[close..]);
     Ok(out)
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
 }
 
 /// list に対して op を適用。変更があれば true を返す。
@@ -540,7 +530,7 @@ fn find_dc_subject_range(xmp: &[u8]) -> Result<Option<(usize, usize)>, WriteErro
     // プレフィックスが `dc` でない場合は名前空間判定を諦める (前述のとおり稀)。
     let open_needle = b"<dc:subject";
     let close_needle = b"</dc:subject>";
-    let Some(open_pos) = find_subseq(xmp, open_needle) else {
+    let Some(open_pos) = find_subsequence(xmp, open_needle) else {
         return Ok(None); // プレフィックス違いなのでスキップ
     };
     // `<dc:subject/>` (自己閉じ) の場合
@@ -557,7 +547,7 @@ fn find_dc_subject_range(xmp: &[u8]) -> Result<Option<(usize, usize)>, WriteErro
         return Ok(Some((open_pos, end_of_open + 1)));
     }
     // 閉じタグを探す (nest は dc:subject 内に dc:subject が無い前提で浅く)
-    let close_pos = find_subseq(&xmp[end_of_open..], close_needle)
+    let close_pos = find_subsequence(&xmp[end_of_open..], close_needle)
         .map(|p| p + end_of_open)
         .ok_or_else(|| {
             WriteError::MalformedContainer("dc:subject 閉じタグが見つからない".into())
@@ -572,12 +562,11 @@ fn is_dc_subject(ns: &quick_xml::name::ResolveResult<'_>, local: &[u8]) -> bool 
     matches!(ns, quick_xml::name::ResolveResult::Bound(n) if n.as_ref() == DC_NS)
 }
 
-use crate::xmp_reader::find_subsequence as find_subseq;
 
 /// `<rdf:Description>` の閉じタグ `</rdf:Description>` の開始位置を返す。
 /// 最初に出現するものを採用 (XMP は通常 1 つだけ)。
 fn find_rdf_description_close_pos(xmp: &[u8]) -> Result<Option<usize>, WriteError> {
-    Ok(find_subseq(xmp, b"</rdf:Description>"))
+    Ok(find_subsequence(xmp, b"</rdf:Description>"))
 }
 
 /// `<rdf:Description ... />` の自己閉じパターンを探す。
@@ -586,7 +575,7 @@ fn find_rdf_description_self_close(xmp: &[u8]) -> Result<Option<(usize, usize)>,
     // 単純実装: `<rdf:Description` で始まり、次の `>` までに `/` があり、
     // その `/` の直後が `>` のもの。属性の最後が `/>` の形。
     let open = b"<rdf:Description";
-    let Some(start) = find_subseq(xmp, open) else {
+    let Some(start) = find_subsequence(xmp, open) else {
         return Ok(None);
     };
     let from = start + open.len();
@@ -623,7 +612,7 @@ fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
     let needle_open_prefix = b"<xmp:MetadataDate";
     let needle_end = b"</xmp:MetadataDate>";
 
-    if let Some(open_start) = find_subseq(xmp, needle_open_prefix) {
+    if let Some(open_start) = find_subsequence(xmp, needle_open_prefix) {
         // 開きタグの `>` を見つけてコンテンツ開始位置を決定する
         let after_prefix = open_start + needle_open_prefix.len();
         let Some(rel_close) = xmp[after_prefix..].iter().position(|&b| b == b'>') else {
@@ -645,7 +634,7 @@ fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
             out.extend_from_slice(&xmp[content_start..]);
             return Ok(out);
         }
-        let Some(e) = find_subseq(&xmp[content_start..], needle_end) else {
+        let Some(e) = find_subsequence(&xmp[content_start..], needle_end) else {
             return Err(WriteError::MalformedContainer(
                 "xmp:MetadataDate 閉じタグ未発見".into(),
             ));
@@ -671,7 +660,7 @@ fn update_metadata_date(xmp: &[u8]) -> Result<Vec<u8>, WriteError> {
     // いない XMP (ExifTool が最小構成で書いたファイル等 — mxd 経由で出てくる) に
     // prefix 付き要素を挿入すると XML が不正になる。要素側で xmlns:xmp を宣言して
     // しまえば、既存の Description 属性がどうであれ常に valid な XML になる。
-    if let Some(close_pos) = find_subseq(xmp, b"</rdf:Description>") {
+    if let Some(close_pos) = find_subsequence(xmp, b"</rdf:Description>") {
         let insert = format!(
             r#"<xmp:MetadataDate xmlns:xmp="http://ns.adobe.com/xap/1.0/">{now}</xmp:MetadataDate>
     "#
@@ -723,7 +712,7 @@ fn strip_trailing_metadata_dates(bytes: &[u8]) -> Vec<u8> {
             after_open
         } else {
             // </xmp:MetadataDate> を探す
-            let Some(rel_close) = find_subseq(&bytes[after_open..], needle_close) else {
+            let Some(rel_close) = find_subsequence(&bytes[after_open..], needle_close) else {
                 break;
             };
             after_open + rel_close + needle_close.len()
@@ -1037,81 +1026,18 @@ fn find_png_xmp_itxt(bytes: &[u8]) -> Result<(Option<(usize, usize)>, Vec<u8>), 
 }
 
 fn apply_tag_op_png(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), WriteError> {
-    if !bytes.starts_with(PNG_SIG) {
-        return Err(WriteError::MalformedContainer("PNG signature なし".into()));
-    }
-    // 1. 既存 iTXt XMP チャンクを探す
-    let mut pos = PNG_SIG.len();
-    let mut existing_xmp: Option<(usize, usize, Vec<u8>)> = None; // (chunk_start, chunk_end, xmp_text)
-    while pos + 8 <= bytes.len() {
-        let length =
-            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-                as usize;
-        let chunk_type = &bytes[pos + 4..pos + 8];
-        let data_start = pos + 8;
-        let data_end = data_start.checked_add(length).ok_or_else(|| {
-            WriteError::MalformedContainer("PNG chunk length overflow".into())
-        })?;
-        let crc_end = data_end + 4;
-        if crc_end > bytes.len() {
-            return Err(WriteError::MalformedContainer(
-                "PNG chunk extends beyond file".into(),
-            ));
-        }
-        if chunk_type == b"iTXt" {
-            let chunk = &bytes[data_start..data_end];
-            // iTXt: keyword\0 compression_flag compression_method language_tag\0 translated_keyword\0 text
-            if let Some(kw_end) = chunk.iter().position(|&b| b == 0) {
-                let kw = &chunk[..kw_end];
-                if kw == PNG_XMP_KEYWORD && chunk.len() >= kw_end + 3 {
-                    let compression_flag = chunk[kw_end + 1];
-                    // compression_method = chunk[kw_end + 2]
-                    let rest = &chunk[kw_end + 3..];
-                    let lang_end = rest
-                        .iter()
-                        .position(|&b| b == 0)
-                        .ok_or_else(|| WriteError::MalformedContainer("iTXt lang".into()))?;
-                    let after_lang = &rest[lang_end + 1..];
-                    let trans_end = after_lang
-                        .iter()
-                        .position(|&b| b == 0)
-                        .ok_or_else(|| WriteError::MalformedContainer("iTXt trans".into()))?;
-                    let text = &after_lang[trans_end + 1..];
-                    if compression_flag == 0 {
-                        existing_xmp = Some((pos, crc_end, text.to_vec()));
-                    }
-                    // 圧縮 iTXt は未対応 → 無視して新規追加パスに回す
-                }
-            }
-        }
-        if chunk_type == b"IEND" {
-            break;
-        }
-        pos = crc_end;
-    }
-
-    // 2. XMP を編集
-    let (new_xmp, new_tags) = if let Some((_, _, ref old)) = existing_xmp {
-        edit_xmp_packet(old, op)?
-    } else {
-        edit_xmp_packet(&[], op)?
-    };
-
-    // 3. 新 iTXt チャンクを構築
+    let (existing_xmp_range, old_xmp) = find_png_xmp_itxt(bytes)?;
+    let (new_xmp, new_tags) = edit_xmp_packet(&old_xmp, op)?;
     let new_chunk = build_png_itxt_xmp(&new_xmp);
-
-    // 4. PNG を再構築
-    let out = if let Some((start, end, _)) = existing_xmp {
+    let out = if let Some((start, end)) = existing_xmp_range {
         let mut out = Vec::with_capacity(bytes.len() + new_chunk.len());
         out.extend_from_slice(&bytes[..start]);
         out.extend_from_slice(&new_chunk);
         out.extend_from_slice(&bytes[end..]);
         out
     } else {
-        // IHDR の直後 (= PNG_SIG + IHDR チャンク) に挿入
-        let after_ihdr = find_first_chunk_end(bytes, b"IHDR").ok_or_else(|| {
-            WriteError::MalformedContainer("PNG IHDR not found".into())
-        })?;
+        let after_ihdr = find_first_chunk_end(bytes, b"IHDR")
+            .ok_or_else(|| WriteError::MalformedContainer("PNG IHDR not found".into()))?;
         let mut out = Vec::with_capacity(bytes.len() + new_chunk.len());
         out.extend_from_slice(&bytes[..after_ihdr]);
         out.extend_from_slice(&new_chunk);
@@ -1194,28 +1120,7 @@ fn png_crc32(data: &[u8]) -> u32 {
 fn apply_rating_op_webp(bytes: &[u8], rating: Option<u8>) -> Result<Vec<u8>, WriteError> {
     let (mut chunks, existing_xmp) = parse_webp_chunks(bytes)?;
     let new_xmp = edit_xmp_packet_rating(existing_xmp.as_deref().unwrap_or(&[]), rating)?;
-    let has_vp8x = chunks.iter().any(|(fc, _)| fc == "VP8X");
-    if !has_vp8x {
-        let (w, h) = extract_webp_canvas_size(&chunks)
-            .ok_or_else(|| WriteError::MalformedContainer("WebP 画像サイズが取得できない".into()))?;
-        let mut vp8x = vec![0u8; 10];
-        vp8x[0] = 0b0000_0100;
-        let w1 = w - 1;
-        let h1 = h - 1;
-        vp8x[4] = (w1 & 0xFF) as u8;
-        vp8x[5] = ((w1 >> 8) & 0xFF) as u8;
-        vp8x[6] = ((w1 >> 16) & 0xFF) as u8;
-        vp8x[7] = (h1 & 0xFF) as u8;
-        vp8x[8] = ((h1 >> 8) & 0xFF) as u8;
-        vp8x[9] = ((h1 >> 16) & 0xFF) as u8;
-        chunks.insert(0, ("VP8X".to_string(), vp8x));
-    } else {
-        for (fc, data) in chunks.iter_mut() {
-            if fc == "VP8X" && !data.is_empty() {
-                data[0] |= 0b0000_0100;
-            }
-        }
-    }
+    ensure_vp8x_with_xmp_flag(&mut chunks)?;
     chunks.push(("XMP ".to_string(), new_xmp));
     Ok(rebuild_webp_riff(&chunks))
 }
@@ -1277,61 +1182,27 @@ fn rebuild_webp_riff(chunks: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn apply_tag_op_webp(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), WriteError> {
-    // RIFF 構造:
-    // "RIFF" [file_size u32 LE] "WEBP" <chunks>
-    // 各 chunk: [fourcc 4bytes] [size u32 LE] [data] [pad byte if size odd]
-    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return Err(WriteError::MalformedContainer(
-            "WebP RIFF ヘッダ不正".into(),
-        ));
-    }
+    let (mut chunks, existing_xmp) = parse_webp_chunks(bytes)?;
+    let (new_xmp, new_tags) = edit_xmp_packet(existing_xmp.as_deref().unwrap_or(&[]), op)?;
+    ensure_vp8x_with_xmp_flag(&mut chunks)?;
+    chunks.push(("XMP ".to_string(), new_xmp));
+    Ok((rebuild_webp_riff(&chunks), new_tags))
+}
 
-    // 1. chunk 列を読む
-    let mut pos = 12;
-    let mut chunks: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut existing_xmp: Option<Vec<u8>> = None;
-    while pos + 8 <= bytes.len() {
-        let fourcc = std::str::from_utf8(&bytes[pos..pos + 4])
-            .map_err(|_| WriteError::MalformedContainer("WebP fourcc not utf8".into()))?
-            .to_string();
-        let size = u32::from_le_bytes([
-            bytes[pos + 4],
-            bytes[pos + 5],
-            bytes[pos + 6],
-            bytes[pos + 7],
-        ]) as usize;
-        let data_start = pos + 8;
-        let data_end = data_start + size;
-        if data_end > bytes.len() {
-            return Err(WriteError::MalformedContainer(
-                "WebP chunk extends beyond file".into(),
-            ));
-        }
-        let data = bytes[data_start..data_end].to_vec();
-        if fourcc == "XMP " {
-            existing_xmp = Some(data);
-        } else {
-            chunks.push((fourcc, data));
-        }
-        // チャンクは偶数境界でパディング (1 byte)
-        let padded = data_end + (size & 1);
-        pos = padded;
-    }
-
-    // 2. XMP を編集
-    let (new_xmp, new_tags) =
-        edit_xmp_packet(existing_xmp.as_deref().unwrap_or(&[]), op)?;
-
-    // 3. VP8X 拡張チャンクの有無を確認 (拡張メタを持つには VP8X が必須)
-    // 単純 WebP (VP8/VP8L のみ) の場合は VP8X に昇格が必要。
+/// VP8X 拡張チャンクの有無を確認し、無ければ挿入し、あれば XMP フラグ (bit2) を立てる。
+/// 拡張メタデータ (XMP / Exif) を持つ WebP には VP8X が必須。
+fn ensure_vp8x_with_xmp_flag(chunks: &mut Vec<(String, Vec<u8>)>) -> Result<(), WriteError> {
     let has_vp8x = chunks.iter().any(|(fc, _)| fc == "VP8X");
-    let mut final_chunks: Vec<(String, Vec<u8>)> = Vec::new();
-    if !has_vp8x {
-        // VP8 / VP8L から幅・高さを取得
-        let (w, h) = extract_webp_canvas_size(&chunks).ok_or_else(|| {
+    if has_vp8x {
+        for (fc, data) in chunks.iter_mut() {
+            if fc == "VP8X" && !data.is_empty() {
+                data[0] |= 0b0000_0100;
+            }
+        }
+    } else {
+        let (w, h) = extract_webp_canvas_size(chunks).ok_or_else(|| {
             WriteError::MalformedContainer("WebP 画像サイズが取得できない".into())
         })?;
-        // VP8X: flags(1) + reserved(3) + canvas_w-1(3 LE) + canvas_h-1(3 LE) = 10 bytes
         let mut vp8x = vec![0u8; 10];
         vp8x[0] = 0b0000_0100; // bit2 = XMP metadata present
         let w1 = w - 1;
@@ -1342,46 +1213,9 @@ fn apply_tag_op_webp(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), Writ
         vp8x[7] = (h1 & 0xFF) as u8;
         vp8x[8] = ((h1 >> 8) & 0xFF) as u8;
         vp8x[9] = ((h1 >> 16) & 0xFF) as u8;
-        final_chunks.push(("VP8X".to_string(), vp8x));
-        for c in chunks {
-            final_chunks.push(c);
-        }
-    } else {
-        // 既存 VP8X の XMP フラグを立てる
-        for (fc, data) in chunks {
-            if fc == "VP8X" {
-                let mut d = data;
-                if !d.is_empty() {
-                    d[0] |= 0b0000_0100;
-                }
-                final_chunks.push((fc, d));
-            } else {
-                final_chunks.push((fc, data));
-            }
-        }
+        chunks.insert(0, ("VP8X".to_string(), vp8x));
     }
-
-    // XMP チャンクを末尾に追加
-    final_chunks.push(("XMP ".to_string(), new_xmp));
-
-    // 4. RIFF 再構築
-    let mut body: Vec<u8> = Vec::new();
-    body.extend_from_slice(b"WEBP");
-    for (fourcc, data) in &final_chunks {
-        body.extend_from_slice(fourcc.as_bytes());
-        let sz = data.len() as u32;
-        body.extend_from_slice(&sz.to_le_bytes());
-        body.extend_from_slice(data);
-        if data.len() & 1 == 1 {
-            body.push(0);
-        }
-    }
-    let mut out = Vec::with_capacity(8 + body.len());
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
-
-    Ok((out, new_tags))
+    Ok(())
 }
 
 fn extract_webp_canvas_size(chunks: &[(String, Vec<u8>)]) -> Option<(u32, u32)> {
@@ -1657,9 +1491,9 @@ mod tests {
         let (out, tags) = apply_tag_op_webp(&webp, &TagOp::Add("#web".to_string())).unwrap();
         assert!(out.starts_with(b"RIFF"));
         assert_eq!(&out[8..12], b"WEBP");
-        assert!(find_subseq(&out, b"XMP ").is_some(), "XMP chunk present");
-        assert!(find_subseq(&out, b"VP8X").is_some(), "VP8X added");
-        assert!(find_subseq(&out, b"<rdf:li>#web</rdf:li>").is_some());
+        assert!(find_subsequence(&out, b"XMP ").is_some(), "XMP chunk present");
+        assert!(find_subsequence(&out, b"VP8X").is_some(), "VP8X added");
+        assert!(find_subsequence(&out, b"<rdf:li>#web</rdf:li>").is_some());
         assert!(tags.contains("#web"));
         // RIFF サイズが実ファイルサイズ - 8 と一致
         let riff_size = u32::from_le_bytes([out[4], out[5], out[6], out[7]]) as usize;
@@ -1695,13 +1529,13 @@ mod tests {
         let png = minimal_png_1x1();
         let (out, tags) = apply_tag_op_png(&png, &TagOp::Add("#test".to_string())).unwrap();
         // 読み戻し確認: out の中に iTXt チャンクと dc:subject がある
-        assert!(find_subseq(&out, b"iTXt").is_some());
-        assert!(find_subseq(&out, b"<rdf:li>#test</rdf:li>").is_some());
+        assert!(find_subsequence(&out, b"iTXt").is_some());
+        assert!(find_subsequence(&out, b"<rdf:li>#test</rdf:li>").is_some());
         assert!(tags.contains("#test"));
         // PNG 署名が先頭に残っている
         assert!(out.starts_with(PNG_SIG));
         // IEND が末尾にある
-        assert!(find_subseq(&out, b"IEND").is_some());
+        assert!(find_subsequence(&out, b"IEND").is_some());
     }
 
     #[test]
@@ -1709,7 +1543,7 @@ mod tests {
         let jpg = minimal_jpeg();
         let (out, tags) = apply_tag_op_jpeg(&jpg, &TagOp::Add("#hello".to_string())).unwrap();
         assert!(out.starts_with(&[0xFF, 0xD8])); // SOI
-        assert!(find_subseq(&out, b"<rdf:li>#hello</rdf:li>").is_some());
+        assert!(find_subsequence(&out, b"<rdf:li>#hello</rdf:li>").is_some());
         assert!(tags.contains("#hello"));
     }
 

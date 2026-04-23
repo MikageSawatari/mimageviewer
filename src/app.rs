@@ -1648,9 +1648,11 @@ pub struct App {
     /// 要求を拾うためのリスナースレッドハンドル。最初のフレームで HWND が取れた
     /// タイミングで spawn し、Drop で join する。
     pub(crate) activation_listener: Option<crate::single_instance::ActivationListener>,
-    /// インストーラ (Inno Setup) が shutdown event を発火したときに listener スレッドが
-    /// `true` を書き込む。`maybe_intercept_close` がこれを見てトレイ非表示でも確実に
-    /// 終了するようにする。tray Quit と同じ扱い。
+    /// 明示的な終了要求フラグ (`[×]` による close intercept を通過させる)。
+    /// set する経路:
+    /// - インストーラ (Inno Setup) が Named Event で発火 → activation_listener thread
+    /// - メニュー「ファイル → 終了」
+    /// いずれもトレイ常駐設定に関係なく、必ず on_exit → プロセス終了まで進める。
     pub(crate) shutdown_requested: Arc<AtomicBool>,
 
     // ── 外部更新の自動反映 ──────────────────────────────────────
@@ -6845,27 +6847,52 @@ impl App {
 
     /// tag_prewarm から回収した XMP 由来 rating を rating_db + rating_cache に反映する。
     /// DB に非ゼロ値がある idx はスキップ (mIV 側で付けた値を XMP で踏まない)。
+    ///
+    /// 実装: normalize_path を 1 回だけ走らせ、items の逆引き HashMap を 1 回構築、
+    /// `db.get_many` でバッチ SELECT、何も変化しなければ `rebuild_visible_indices` は
+    /// 呼ばない (大フォルダで UI スレッドに来たときの per-frame 再構築コスト回避)。
     fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<(PathBuf, u8)>) {
         let Some(db) = self.rating_db.as_ref() else {
             return;
         };
+        if hydrations.is_empty() {
+            return;
+        }
+        // key → XMP 由来★ の最終マップ (path の重複 push があっても 1 エントリに縮む)
+        let mut target: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::with_capacity(hydrations.len());
         for (path, stars) in hydrations {
-            let key = crate::adjustment_db::normalize_path(&path);
-            // DB 現在値を確認: 0 のときだけ上書き
-            if db.get(&key) != 0 {
-                continue;
+            target.insert(crate::adjustment_db::normalize_path(&path), stars);
+        }
+        // DB の現在値を 1 クエリでまとめて引く
+        let keys: Vec<String> = target.keys().cloned().collect();
+        let current = db.get_many(&keys);
+        // DB が 0 (未登録) のエントリだけ実際にハイドレート対象にする
+        let mut to_write: Vec<(String, u8)> = Vec::new();
+        for (key, stars) in &target {
+            if current.get(key).copied().unwrap_or(0) == 0 {
+                to_write.push((key.clone(), *stars));
             }
-            let _ = db.set(&key, stars);
-            // items 内の該当 idx を見つけて rating_cache も更新 (なければスキップ)。
-            for (idx, item) in self.items.iter().enumerate() {
-                if let GridItem::Image(p) = item {
-                    if crate::adjustment_db::normalize_path(p) == key {
-                        self.rating_cache.insert(idx, stars);
-                    }
+        }
+        if to_write.is_empty() {
+            return;
+        }
+        let write_keys: std::collections::HashSet<&String> =
+            to_write.iter().map(|(k, _)| k).collect();
+        // items の逆引き: path → idx (Image だけ)
+        for (idx, item) in self.items.iter().enumerate() {
+            if let GridItem::Image(p) = item {
+                let k = crate::adjustment_db::normalize_path(p);
+                if write_keys.contains(&k) {
+                    let stars = target[&k];
+                    self.rating_cache.insert(idx, stars);
                 }
             }
         }
-        // フィルタに影響する可能性があるので visible_indices 再構築
+        for (key, stars) in &to_write {
+            let _ = db.set(key, *stars);
+        }
+        // 実際に rating_cache が更新されたのでフィルタ影響あり
         self.rebuild_visible_indices();
     }
 

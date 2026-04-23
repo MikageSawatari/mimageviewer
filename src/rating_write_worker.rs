@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::xmp_writer::{self, WriteError};
+use crate::xmp_writer;
 
 #[derive(Debug, Clone)]
 pub struct RatingWriteJob {
@@ -100,10 +100,7 @@ fn run_worker(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let result = match xmp_writer::apply_rating(&job.path, job.rating) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(format_write_error(&e)),
-        };
+        let result = xmp_writer::apply_rating(&job.path, job.rating).map_err(|e| e.to_string());
         if result.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -115,11 +112,3 @@ fn run_worker(
     }
 }
 
-fn format_write_error(e: &WriteError) -> String {
-    match e {
-        WriteError::UnsupportedFormat => "未対応の形式".to_string(),
-        WriteError::ReadOnly => "ファイルが読み取り専用".to_string(),
-        WriteError::Io(err) => format!("I/O エラー: {err}"),
-        _ => format!("{e:?}"),
-    }
-}

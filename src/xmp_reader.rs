@@ -129,7 +129,7 @@ pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
 }
 
 /// XMP が入り得るコンテナのマジックバイトか判定。
-fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
+pub(crate) fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
     if bytes.starts_with(&[0xFF, 0xD8]) {
         return true; // JPEG
     }
@@ -152,7 +152,7 @@ fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// ファイル形式を自動判別して XMP パケット (x:xmpmeta を含む XML バイト列) を返す。
-fn extract_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn extract_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.starts_with(&[0xFF, 0xD8]) {
         // JPEG
         if let Some(xmp) = extract_xmp_from_jpeg(bytes) {

@@ -111,14 +111,21 @@ pub(crate) fn spawn() -> TagPrewarmPending {
 }
 
 /// ファイルを 1 回だけ read して、XMP パケットから dc:subject と xmp:Rating の
-/// 両方を抜き出す。`read_dc_subject` と同じ冒頭のマジックバイト判定・拡張子チェックを
-/// 踏襲する (XMP を持たないファイル形式なら即座に `(Vec::new(), None)`)。
+/// 両方を抜き出す。`read_dc_subject` と同じ冒頭のマジックバイト判定を踏襲する。
+/// XMP パケット抽出も 1 回で済ませる (各 `read_*_from_bytes` を個別に呼ぶと
+/// JPEG APP1 / PNG iTXt 走査が 2 回走り、10 MB JPEG などで CPU が倍になる)。
 fn read_xmp_tags_and_rating(path: &std::path::Path) -> (Vec<String>, Option<u8>) {
     let Ok(bytes) = std::fs::read(path) else {
         return (Vec::new(), None);
     };
-    let tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
-    let rating = crate::xmp_reader::read_xmp_rating_from_bytes(&bytes);
+    if !crate::xmp_reader::has_xmp_capable_magic(&bytes) {
+        return (Vec::new(), None);
+    }
+    let Some(xmp) = crate::xmp_reader::extract_xmp_packet(&bytes) else {
+        return (Vec::new(), None);
+    };
+    let tags = crate::xmp_reader::parse_dc_subject(&xmp);
+    let rating = crate::xmp_reader::parse_xmp_rating(&xmp);
     (tags, rating)
 }
 
