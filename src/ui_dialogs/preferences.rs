@@ -32,6 +32,8 @@ pub(crate) enum PreferencesPage {
     IndexerSpeed,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
     TrayResidency,
+    /// v0.8.1: レーティング XMP 書き込み設定
+    Rating,
 }
 
 impl PreferencesPage {
@@ -52,6 +54,7 @@ impl PreferencesPage {
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "自動インデクサ速度",
             Self::TrayResidency => "タスクトレイ常駐",
+            Self::Rating => "レーティング",
         }
     }
 }
@@ -124,6 +127,12 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "タスクトレイ常駐",
         page: Some(PreferencesPage::TrayResidency),
+        children: &[],
+    },
+    // v0.8.1: レーティングの XMP 書き込み (opt-in)
+    TreeCategory {
+        label: "レーティング",
+        page: Some(PreferencesPage::Rating),
         children: &[],
     },
 ];
@@ -413,6 +422,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
+        PreferencesPage::Rating => page_rating(ui, state),
     }
 }
 
@@ -886,6 +896,54 @@ fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "※ タスクトレイ常駐はトレイアイコンからの「開く / 常駐時のスキャンを一時停止 / 終了」\n  \
              メニューでも操作できます。\n\
              ※ トレイアイコン左クリックでウィンドウが復帰します。",
+        )
+        .weak()
+        .size(11.0),
+    );
+}
+
+/// レーティング ★ の XMP 書き込み設定ページ。opt-in。
+/// ファイル書き換えを伴う機能なので、タグ設定と同じく UI で明示的に ON にしないと動かない。
+fn page_rating(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.label(
+        "F1〜F5 で付与する★をファイル内の XMP `xmp:Rating` にも書き込むか設定します。\n\
+         ファイル移動後もレーティングを保持したい場合に有効にしてください。",
+    );
+    ui.add_space(10.0);
+
+    ui.checkbox(
+        &mut s.write_rating_to_xmp,
+        "レーティングを XMP にも書き込む",
+    )
+    .on_hover_text(
+        "OFF (既定): レーティングはアプリ内データベースだけに保存。ファイルは非破壊。\n\
+         ファイルを別フォルダに移動すると★は失われます (アプリはパスで管理するため)。\n\
+         ON: ★ を付けるたびにファイル内の XMP `xmp:Rating` も更新します。\n\
+         Lightroom / Windows エクスプローラー「評価」列など、XMP 対応ソフトで同じ★が見えます。",
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    ui.label(egui::RichText::new("有効化した場合の注意").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "・対応形式は JPEG / PNG / WebP のみです。\n  \
+         それ以外 (RAW / HEIC / AVIF / TIFF / ZIP 内画像 / PDF ページ等) は従来通り\n  \
+         アプリ内データベースだけに保存されるため、別フォルダへ移動すると★は失われます。\n\
+         ・★ を付け外しするたびにファイル本体が書き換わり、更新日時が新しくなります。\n\
+         ・フォルダやコンテナ (ZIP / PDF) 本体の Shift+F1〜F6 による★は、\n  \
+         書き込み先が無いため常にアプリ内データベースのみです (この設定と無関係)。",
+    );
+
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new(
+            "※ 書き込みに失敗した場合 (読み取り専用・排他ロック等) は画面右下にトーストで通知します。\n\
+             その場合も★自体はアプリ内データベースには反映済みです。",
         )
         .weak()
         .size(11.0),

@@ -1066,6 +1066,9 @@ pub struct App {
     pub(crate) tag_editor_draft: Vec<crate::settings::TagDef>,
     /// タグ書き込み worker (初回要求時に遅延初期化)。
     pub(crate) tag_write_handle: Option<crate::tag_write_worker::TagWriteHandle>,
+    /// レーティング XMP 書き込み worker。設定 ON のとき遅延初期化される。
+    /// 書き込み失敗を poll して失敗トーストを出すために保持。
+    pub(crate) rating_write_handle: Option<crate::rating_write_worker::RatingWriteHandle>,
 
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
@@ -1735,6 +1738,7 @@ impl Default for App {
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
             tag_write_handle: None,
+            rating_write_handle: None,
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -6516,6 +6520,76 @@ impl App {
         ) {
             self.current_folder_rating_cache = None;
         }
+        // 設定 ON + Image (JPEG/PNG/WebP) のときだけ XMP にも書き込む。
+        // コンテナや ZIP 内画像・PDF ページには書き込み先がないので DB 止まり。
+        if self.settings.write_rating_to_xmp {
+            let writable_path: Option<PathBuf> = match self.items.get(idx) {
+                Some(GridItem::Image(p)) if crate::xmp_writer::is_writable_format(p) => {
+                    Some(p.clone())
+                }
+                _ => None,
+            };
+            if let Some(path) = writable_path {
+                self.ensure_rating_write_handle();
+                if let Some(h) = self.rating_write_handle.as_ref() {
+                    h.submit(crate::rating_write_worker::RatingWriteJob {
+                        path,
+                        rating: if stars == 0 { None } else { Some(stars) },
+                    });
+                }
+            }
+        }
+    }
+
+    /// レーティング XMP 書き込み worker を必要なら起動する (遅延初期化)。
+    fn ensure_rating_write_handle(&mut self) {
+        if self.rating_write_handle.is_none() {
+            self.rating_write_handle = Some(crate::rating_write_worker::RatingWriteHandle::spawn());
+        }
+    }
+
+    /// rating worker の結果を回収し、失敗があればトースト表示する。
+    /// タグ書き込み ([`poll_tag_write_results`]) と同じポリシー。
+    pub(crate) fn poll_rating_write_results(&mut self) {
+        let mut errors: Vec<(PathBuf, String)> = Vec::new();
+        if let Some(h) = self.rating_write_handle.as_ref() {
+            while let Some(res) = h.try_recv_result() {
+                match res.result {
+                    Ok(()) => {
+                        crate::logger::log(format!(
+                            "[RATING] ✓ XMP written → {}",
+                            res.path.display()
+                        ));
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "[RATING] ✗ XMP write failed: {e} → {}",
+                            res.path.display()
+                        ));
+                        errors.push((res.path, e));
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            let preview = errors
+                .iter()
+                .take(3)
+                .map(|(p, e)| {
+                    format!(
+                        "{}: {}",
+                        p.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        e
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            self.show_feedback_toast(format!(
+                "レーティング書き込み失敗 {} 件: {}",
+                errors.len(),
+                preview
+            ));
+        }
     }
 
     /// フォルダ読み込み直後に rating_cache を一括プリウォームする。
@@ -6722,7 +6796,11 @@ impl App {
                 continue;
             }
             self.tag_prewarm_queued.insert(idx);
-            pending.push_job(p.clone(), cache_key);
+            // 設定 ON かつ DB で rating 未登録 (= 0) のときだけ XMP から rating も読んで
+            // ハイドレートする。既に DB に値がある場合は XMP 読みを節約。
+            let read_rating = self.settings.write_rating_to_xmp
+                && self.rating_cache.get(&idx).copied().unwrap_or(0) == 0;
+            pending.push_job(p.clone(), cache_key, read_rating);
         }
     }
 
@@ -6736,9 +6814,17 @@ impl App {
             return;
         };
         // このフレームで届いた分だけ drain (or_insert 挙動は stale XMP 防御)。
+        let mut rating_hydrations: Vec<(PathBuf, u8)> = Vec::new();
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
+                    // XMP から rating > 0 が読めたらハイドレート候補に積む
+                    // (DB を UI スレッドで触らないように後段でまとめて書く)。
+                    if let Some(stars) = res.rating {
+                        if stars > 0 {
+                            rating_hydrations.push((res.path.clone(), stars));
+                        }
+                    }
                     self.tags_cache.entry(res.cache_key).or_insert(res.tags);
                     pending.on_result_drained();
                 }
@@ -6749,6 +6835,38 @@ impl App {
                 }
             }
         }
+        // DB + rating_cache に反映。既に DB に非ゼロ値があれば (= ユーザーが mIV で
+        // 付けた値) 上書きしない (旧ファイル移動先 → 新フォルダで XMP ハイドレートを
+        // 期待するのは DB が 0 = 未登録のときだけ)。
+        if !rating_hydrations.is_empty() {
+            self.hydrate_ratings_from_xmp(rating_hydrations);
+        }
+    }
+
+    /// tag_prewarm から回収した XMP 由来 rating を rating_db + rating_cache に反映する。
+    /// DB に非ゼロ値がある idx はスキップ (mIV 側で付けた値を XMP で踏まない)。
+    fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<(PathBuf, u8)>) {
+        let Some(db) = self.rating_db.as_ref() else {
+            return;
+        };
+        for (path, stars) in hydrations {
+            let key = crate::adjustment_db::normalize_path(&path);
+            // DB 現在値を確認: 0 のときだけ上書き
+            if db.get(&key) != 0 {
+                continue;
+            }
+            let _ = db.set(&key, stars);
+            // items 内の該当 idx を見つけて rating_cache も更新 (なければスキップ)。
+            for (idx, item) in self.items.iter().enumerate() {
+                if let GridItem::Image(p) = item {
+                    if crate::adjustment_db::normalize_path(p) == key {
+                        self.rating_cache.insert(idx, stars);
+                    }
+                }
+            }
+        }
+        // フィルタに影響する可能性があるので visible_indices 再構築
+        self.rebuild_visible_indices();
     }
 
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
@@ -9829,6 +9947,7 @@ impl eframe::App for App {
 
         // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
         self.poll_tag_write_results();
+        self.poll_rating_write_results();
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);

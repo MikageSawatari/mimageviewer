@@ -57,6 +57,7 @@ impl XmpTweetInfo {
 const XTW_NAMESPACE: &[u8] = b"https://mXDownloader.app/ns/x-twitter/1.0/";
 /// dc の名前空間 URI。
 const DC_NAMESPACE: &[u8] = b"http://purl.org/dc/elements/1.1/";
+const XMP_NAMESPACE: &[u8] = b"http://ns.adobe.com/xap/1.0/";
 
 // ---------------------------------------------------------------------------
 // 公開 API
@@ -562,6 +563,119 @@ pub(crate) fn parse_dc_subject(xml: &[u8]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// xmp:Rating 読み取り (レーティング機能 — XMP spec: xmp:Rating 0..5)
+// ---------------------------------------------------------------------------
+
+/// ファイルの XMP `xmp:Rating` を読み取る。0 / 未設定で `None` を返す。
+/// 1..=5 の範囲外は clamp。
+pub fn read_xmp_rating(path: &Path) -> Option<u8> {
+    if !extension_might_have_xmp(path) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    read_xmp_rating_from_bytes(&bytes)
+}
+
+/// バイト列版。
+pub fn read_xmp_rating_from_bytes(bytes: &[u8]) -> Option<u8> {
+    if !has_xmp_capable_magic(bytes) {
+        return None;
+    }
+    let xmp = extract_xmp_packet(bytes)?;
+    parse_xmp_rating(&xmp)
+}
+
+/// 生の XMP RDF/XML から `xmp:Rating` を取る。
+/// 属性形式 (`<rdf:Description xmp:Rating="4"/>`) と要素形式
+/// (`<xmp:Rating>4</xmp:Rating>`) の両方を拾う (Lightroom は属性、古い書き出しは要素)。
+pub(crate) fn parse_xmp_rating(xml: &[u8]) -> Option<u8> {
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_rating = false;
+    let mut current_value = String::new();
+    let mut found: Option<u8> = None;
+
+    loop {
+        let ev = match reader.read_resolved_event_into(&mut buf) {
+            Ok((ns, e)) => (ns, e),
+            Err(_) => break,
+        };
+        match ev {
+            (ns, Event::Start(e)) => {
+                scan_attributes_for_rating(&e, &mut found);
+                let local = e.local_name().as_ref().to_vec();
+                let is_rating_elem = local == b"Rating"
+                    && matches!(&ns, quick_xml::name::ResolveResult::Bound(b) if b.as_ref() == XMP_NAMESPACE);
+                if is_rating_elem {
+                    in_rating = true;
+                    current_value.clear();
+                }
+            }
+            (_ns, Event::Empty(e)) => {
+                // self-closing: 属性形式のみチェック (`<rdf:Description xmp:Rating="4"/>`)
+                scan_attributes_for_rating(&e, &mut found);
+            }
+            (_, Event::Text(t)) => {
+                if in_rating {
+                    if let Ok(s) = t.decode() {
+                        current_value.push_str(s.as_ref());
+                    }
+                }
+            }
+            (_, Event::End(e)) => {
+                let local = e.local_name().as_ref().to_vec();
+                if local == b"Rating" && in_rating {
+                    if let Some(n) = parse_rating_value(current_value.trim()) {
+                        found = Some(n);
+                    }
+                    in_rating = false;
+                    current_value.clear();
+                }
+            }
+            (_, Event::Eof) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    found
+}
+
+fn scan_attributes_for_rating(
+    e: &quick_xml::events::BytesStart<'_>,
+    found: &mut Option<u8>,
+) {
+    for attr in e.attributes().flatten() {
+        let key = attr.key.as_ref();
+        // prefix:local を分解。rdf:Description 上の xmp:Rating= 属性を拾う。
+        let prefix_is_xmp = key
+            .split(|&c| c == b':')
+            .next()
+            .map(|p| p == b"xmp")
+            .unwrap_or(false);
+        let local = key.rsplit(|&c| c == b':').next().unwrap_or(key);
+        if local == b"Rating" && (prefix_is_xmp || !key.contains(&b':')) {
+            if let Ok(v) = attr.unescape_value() {
+                if let Some(n) = parse_rating_value(v.as_ref()) {
+                    *found = Some(n);
+                }
+            }
+        }
+    }
+}
+
+fn parse_rating_value(s: &str) -> Option<u8> {
+    // Lightroom は "-1" (rejected) も使うが mIV は 0..=5 のみ扱う。
+    // 小数 ("3.5") にも一応対応して floor する。
+    let v: f32 = s.trim().parse().ok()?;
+    if v < 0.5 {
+        Some(0)
+    } else {
+        Some((v.floor() as i32).clamp(1, 5) as u8)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // URL 検証 (未信頼メタデータなので必ずチェック)
 // ---------------------------------------------------------------------------
 
@@ -926,5 +1040,51 @@ mod tests {
 
         let tags = read_dc_subject_from_bytes(&out);
         assert_eq!(tags, vec!["#nature", "#landscape"]);
+    }
+
+    // ---- xmp:Rating 読み取り ----
+
+    #[test]
+    fn parse_rating_attribute_form() {
+        // Lightroom が書く属性形式
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:xmp='http://ns.adobe.com/xap/1.0/'
+              xmp:Rating='4'/>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        assert_eq!(parse_xmp_rating(xml.as_bytes()), Some(4));
+    }
+
+    #[test]
+    fn parse_rating_element_form() {
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:xmp='http://ns.adobe.com/xap/1.0/'>
+              <xmp:Rating>5</xmp:Rating>
+            </rdf:Description>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        assert_eq!(parse_xmp_rating(xml.as_bytes()), Some(5));
+    }
+
+    #[test]
+    fn parse_rating_absent() {
+        assert_eq!(parse_xmp_rating(SAMPLE_XMP_STR.as_bytes()), None);
+    }
+
+    #[test]
+    fn parse_rating_negative_rejected_to_zero() {
+        // Lightroom の "rejected" (-1) は mIV では 0 扱い
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:xmp='http://ns.adobe.com/xap/1.0/'
+              xmp:Rating='-1'/>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        assert_eq!(parse_xmp_rating(xml.as_bytes()), Some(0));
     }
 }

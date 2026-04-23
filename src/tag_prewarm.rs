@@ -51,9 +51,15 @@ impl TagPrewarmPending {
 
     /// ジョブを 1 件キューに追加する。worker が順に処理する。
     /// 重複チェックは UI 側 (`tag_prewarm_queued` HashSet) で済ませる想定。
-    pub(crate) fn push_job(&self, path: PathBuf, cache_key: String) {
+    /// `read_rating = true` のとき、worker は同じ XMP パケットから xmp:Rating も抽出して
+    /// `TagPrewarmResult::rating` に載せて返す。
+    pub(crate) fn push_job(&self, path: PathBuf, cache_key: String, read_rating: bool) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _ = self.job_tx.send(PrewarmJob { path, cache_key });
+        let _ = self.job_tx.send(PrewarmJob {
+            path,
+            cache_key,
+            read_rating,
+        });
     }
 
     /// UI が 1 件 drain した後に呼ぶ。`is_busy` を下げる。
@@ -71,13 +77,17 @@ impl TagPrewarmPending {
 struct PrewarmJob {
     path: PathBuf,
     cache_key: String,
+    read_rating: bool,
 }
 
 /// 1 ファイル分のプリフェッチ結果。`cache_key` は `adjustment_db::normalize_path(path)` 相当
 /// (UI 側 `tags_cache` のキー形式に揃える)。
+/// `rating` は設定 ON かつ XMP に xmp:Rating が存在した場合のみ `Some` になる。
 pub(crate) struct TagPrewarmResult {
     pub cache_key: String,
+    pub path: PathBuf,
     pub tags: Vec<String>,
+    pub rating: Option<u8>,
 }
 
 /// worker スレッドを起動する。フォルダ切替時に 1 回呼ぶ。
@@ -100,6 +110,18 @@ pub(crate) fn spawn() -> TagPrewarmPending {
     }
 }
 
+/// ファイルを 1 回だけ read して、XMP パケットから dc:subject と xmp:Rating の
+/// 両方を抜き出す。`read_dc_subject` と同じ冒頭のマジックバイト判定・拡張子チェックを
+/// 踏襲する (XMP を持たないファイル形式なら即座に `(Vec::new(), None)`)。
+fn read_xmp_tags_and_rating(path: &std::path::Path) -> (Vec<String>, Option<u8>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (Vec::new(), None);
+    };
+    let tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
+    let rating = crate::xmp_reader::read_xmp_rating_from_bytes(&bytes);
+    (tags, rating)
+}
+
 fn run_worker(
     job_rx: &CbReceiver<PrewarmJob>,
     result_tx: &mpsc::Sender<TagPrewarmResult>,
@@ -114,14 +136,22 @@ fn run_worker(
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let tags = crate::xmp_reader::read_dc_subject(&job.path);
+                // 設定 ON のときはファイルを 1 回だけ open して dc:subject と xmp:Rating を
+                // 同じ XMP パケットから抜く。I/O コストは従来のタグ読み 1 回と変わらない。
+                let (tags, rating) = if job.read_rating {
+                    read_xmp_tags_and_rating(&job.path)
+                } else {
+                    (crate::xmp_reader::read_dc_subject(&job.path), None)
+                };
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 if result_tx
                     .send(TagPrewarmResult {
                         cache_key: job.cache_key,
+                        path: job.path,
                         tags,
+                        rating,
                     })
                     .is_err()
                 {
@@ -144,7 +174,7 @@ mod tests {
     #[test]
     fn returns_empty_tags_for_nonexistent_path() {
         let pending = spawn();
-        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), "key1".to_string());
+        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), "key1".to_string(), false);
         let start = Instant::now();
         loop {
             match pending.rx.try_recv() {
@@ -171,7 +201,7 @@ mod tests {
         let pending = spawn();
         assert!(!pending.is_busy(), "初期状態は idle");
 
-        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), "ka".to_string());
+        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), "ka".to_string(), false);
         assert!(pending.is_busy(), "push 直後は busy");
 
         // worker が送ってくるのを受け取り、on_result_drained で in_flight を戻す
@@ -202,6 +232,7 @@ mod tests {
             pending.push_job(
                 PathBuf::from(format!("Z:/nope/{i}.jpg")),
                 format!("k{i}"),
+                false,
             );
         }
         pending.cancel();

@@ -145,6 +145,28 @@ pub fn apply_tag_op(path: &Path, op: &TagOp) -> Result<String, WriteError> {
     Ok(new_tags)
 }
 
+/// 指定ファイルの `xmp:Rating` を設定する。`rating` が `None` / `Some(0)` なら削除。
+/// 対応形式は JPEG / PNG / WebP。読み取り専用は `ReadOnly` エラー。
+///
+/// タグ操作と同じ read-modify-write 経路だが、更新する XMP プロパティが
+/// `xmp:Rating` である点だけが違う。dc:subject (タグ) は素通しで保持される。
+pub fn apply_rating(path: &Path, rating: Option<u8>) -> Result<(), WriteError> {
+    let format = detect_format(path).ok_or(WriteError::UnsupportedFormat)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.permissions().readonly() {
+            return Err(WriteError::ReadOnly);
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    let new_bytes = match format {
+        Format::Jpeg => apply_rating_op_jpeg(&bytes, rating)?,
+        Format::Png => apply_rating_op_png(&bytes, rating)?,
+        Format::WebP => apply_rating_op_webp(&bytes, rating)?,
+    };
+    write_atomically(path, &new_bytes)?;
+    Ok(())
+}
+
 /// 同一ディレクトリに tmp ファイルを作って rename でアトミックに置換。
 fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     let dir = target.parent().unwrap_or(Path::new("."));
@@ -213,6 +235,174 @@ pub fn edit_xmp_packet(xmp: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), Writ
 
     let tag_str = crate::ingest_text::build_tags_column(&current);
     Ok((with_date, tag_str))
+}
+
+/// 既存 XMP パケット (バイト列) に対して xmp:Rating を設定/削除し、新パケットを返す。
+/// `rating == None` or `Some(0)`: `xmp:Rating` を削除 (属性形式 / 要素形式の両方)。
+/// `Some(1..=5)`: `xmp:Rating="N"` 属性として設定 (Lightroom / Adobe 標準形)。
+/// タグ (dc:subject) は触らず、他の既存プロパティもすべて保持。
+pub fn edit_xmp_packet_rating(xmp: &[u8], rating: Option<u8>) -> Result<Vec<u8>, WriteError> {
+    let original = if xmp.is_empty() {
+        MINIMAL_XMP_TEMPLATE.as_bytes().to_vec()
+    } else {
+        xmp.to_vec()
+    };
+    let normalized = rating.and_then(|r| if r == 0 { None } else { Some(r.min(5)) });
+    // 1. 既存値と比較して no-op なら早期 return (MetadataDate 更新も避ける)
+    let current = xmp_reader::parse_xmp_rating(&original);
+    if current == normalized {
+        return Ok(original);
+    }
+    // 2. xmp:Rating を設定 / 削除
+    let updated = write_xmp_rating(&original, normalized)?;
+    // 3. MetadataDate 更新
+    update_metadata_date(&updated)
+}
+
+/// XMP パケット内の xmp:Rating を属性 / 要素形式のどちらにもある場合はすべて削除してから、
+/// `Some(n)` なら rdf:Description に属性として追加する。
+fn write_xmp_rating(xmp: &[u8], rating: Option<u8>) -> Result<Vec<u8>, WriteError> {
+    // Step 1: 要素形式 `<xmp:Rating>...</xmp:Rating>` を削除
+    let mut bytes = strip_rating_element(xmp);
+    // Step 2: 属性形式 `xmp:Rating="..."` を rdf:Description から削除
+    bytes = strip_rating_attribute(&bytes);
+    // Step 3: Some なら rdf:Description 開始タグに属性として追加
+    if let Some(n) = rating {
+        bytes = insert_rating_attribute(&bytes, n)?;
+    }
+    Ok(bytes)
+}
+
+/// `<xmp:Rating>N</xmp:Rating>` を丸ごと削除する (要素形式対応)。
+/// プレフィックスが `xmp:` 以外になっているケースは稀なので拾わない。
+fn strip_rating_element(xmp: &[u8]) -> Vec<u8> {
+    let needle_start = b"<xmp:Rating";
+    let needle_end = b"</xmp:Rating>";
+    let mut out = xmp.to_vec();
+    loop {
+        let Some(s) = find_subsequence(&out, needle_start) else {
+            break;
+        };
+        // 属性形式のみ (`<xmp:Rating="4"/>` のような self-closing は element ではない)
+        // を誤って消さないために、対応する `</xmp:Rating>` があるときのみ削除。
+        if let Some(e_rel) = find_subsequence(&out[s..], needle_end) {
+            let end = s + e_rel + needle_end.len();
+            out.drain(s..end);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// rdf:Description 開始タグ上の `xmp:Rating="..."` 属性 (および xmlns 以外の prefix 違い)
+/// を削除する。rdf:Description が複数ある場合はすべてに対して処理する。
+fn strip_rating_attribute(xmp: &[u8]) -> Vec<u8> {
+    let mut out = xmp.to_vec();
+    let tag_start = b"<rdf:Description";
+    let mut search_from = 0;
+    while let Some(rel) = find_subsequence(&out[search_from..], tag_start) {
+        let open = search_from + rel;
+        let Some(close_rel) = out[open..].iter().position(|&b| b == b'>') else {
+            break;
+        };
+        let close = open + close_rel;
+        // rdf:Description 開始タグの属性範囲 [open+tag_start.len()..close]
+        let (new_attrs, removed) = remove_rating_attr(&out[open..close]);
+        if removed {
+            out.splice(open..close, new_attrs);
+            // out.len が変わる可能性があるので search_from は open から再開
+            search_from = open;
+        } else {
+            search_from = close;
+        }
+    }
+    out
+}
+
+/// rdf:Description タグ中 (`<rdf:Description ...` の `<` から `>` の手前まで) の
+/// `xmp:Rating="..."` を削除した新バイト列を返す。変更があれば `removed = true`。
+fn remove_rating_attr(tag_slice: &[u8]) -> (Vec<u8>, bool) {
+    let s = String::from_utf8_lossy(tag_slice).to_string();
+    // 単純な文字列置換で xmp:Rating="..." / xmp:Rating='...' を削除。
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut removed = false;
+    let needle = b"xmp:Rating";
+    while i < bytes.len() {
+        if bytes[i..].starts_with(needle) {
+            // 続けて = があるか確認
+            let after = i + needle.len();
+            let rest = &bytes[after..];
+            let ws_len = rest.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
+            if after + ws_len < bytes.len() && bytes[after + ws_len] == b'=' {
+                // 値のクォートを見つけて skip
+                let quote_start = after + ws_len + 1;
+                let rest_q = &bytes[quote_start..];
+                let q_ws = rest_q.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
+                if quote_start + q_ws < bytes.len() {
+                    let quote = bytes[quote_start + q_ws];
+                    if quote == b'"' || quote == b'\'' {
+                        let value_start = quote_start + q_ws + 1;
+                        if let Some(end_rel) = bytes[value_start..].iter().position(|&c| c == quote) {
+                            let end = value_start + end_rel + 1;
+                            // 属性の前にある空白も 1 つ削る (tag が "<rdf:Description " で
+                            // 始まっていて attr の前に余計な空白を残さないため)。
+                            while !out.is_empty() {
+                                let last = out.chars().last().unwrap();
+                                if last == ' ' || last == '\t' {
+                                    out.pop();
+                                } else {
+                                    break;
+                                }
+                            }
+                            out.push(' ');
+                            i = end;
+                            removed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    (out.into_bytes(), removed)
+}
+
+/// 最初に見つかった `<rdf:Description` 開始タグの `>` 直前に `xmp:Rating="N"` を挿入する。
+fn insert_rating_attribute(xmp: &[u8], rating: u8) -> Result<Vec<u8>, WriteError> {
+    let Some(open) = find_subsequence(xmp, b"<rdf:Description") else {
+        return Err(WriteError::Xmp(
+            "XMP パケットに <rdf:Description> が見つからない".to_string(),
+        ));
+    };
+    // `<rdf:Description` から次の `>` または `/>` を探す。
+    let Some(close_rel) = xmp[open..].iter().position(|&b| b == b'>') else {
+        return Err(WriteError::Xmp("rdf:Description の閉じが不明".into()));
+    };
+    let mut close = open + close_rel;
+    // self-closing `/>` なら `/` の位置を挿入点とする。
+    if close > 0 && xmp[close - 1] == b'/' {
+        close -= 1;
+    }
+    let insertion = format!(" xmp:Rating=\"{}\"", rating.min(5));
+    let mut out = Vec::with_capacity(xmp.len() + insertion.len());
+    out.extend_from_slice(&xmp[..close]);
+    out.extend_from_slice(insertion.as_bytes());
+    out.extend_from_slice(&xmp[close..]);
+    Ok(out)
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
 }
 
 /// list に対して op を適用。変更があれば true を返す。
@@ -609,6 +799,22 @@ fn apply_tag_op_jpeg(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), Writ
     Ok((out, new_tags))
 }
 
+/// `apply_tag_op_jpeg` と同じ構造だが、XMP パケット編集を rating 用に差し替えた版。
+fn apply_rating_op_jpeg(bytes: &[u8], rating: Option<u8>) -> Result<Vec<u8>, WriteError> {
+    let parsed = parse_jpeg_segments(bytes)?;
+    let std_xmp = parsed
+        .standard_xmp_payload
+        .as_deref()
+        .unwrap_or(&[] as &[u8]);
+    let new_xmp = edit_xmp_packet_rating(std_xmp, rating)?;
+    if new_xmp.len() > JPEG_STANDARD_XMP_MAX {
+        return Err(WriteError::StandardXmpTooLarge {
+            required: new_xmp.len(),
+        });
+    }
+    rebuild_jpeg(bytes, &parsed, &new_xmp)
+}
+
 /// JPEG セグメント解析結果。
 struct JpegParsed {
     /// SOI 直後から最初の非 APP セグメント (通常 SOF) 手前までの各セグメント
@@ -757,6 +963,78 @@ fn write_standard_xmp_app1(out: &mut Vec<u8>, xmp: &[u8]) -> Result<(), WriteErr
 
 const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
 const PNG_XMP_KEYWORD: &[u8] = b"XML:com.adobe.xmp";
+
+/// `apply_tag_op_png` と同じ iTXt 探索 + 再構築を行うが、XMP 編集だけ rating 用。
+fn apply_rating_op_png(bytes: &[u8], rating: Option<u8>) -> Result<Vec<u8>, WriteError> {
+    let (existing_xmp_range, old_xmp) = find_png_xmp_itxt(bytes)?;
+    let new_xmp = edit_xmp_packet_rating(&old_xmp, rating)?;
+    let new_chunk = build_png_itxt_xmp(&new_xmp);
+    let out = if let Some((start, end)) = existing_xmp_range {
+        let mut out = Vec::with_capacity(bytes.len() + new_chunk.len());
+        out.extend_from_slice(&bytes[..start]);
+        out.extend_from_slice(&new_chunk);
+        out.extend_from_slice(&bytes[end..]);
+        out
+    } else {
+        let after_ihdr = find_first_chunk_end(bytes, b"IHDR")
+            .ok_or_else(|| WriteError::MalformedContainer("PNG IHDR not found".into()))?;
+        let mut out = Vec::with_capacity(bytes.len() + new_chunk.len());
+        out.extend_from_slice(&bytes[..after_ihdr]);
+        out.extend_from_slice(&new_chunk);
+        out.extend_from_slice(&bytes[after_ihdr..]);
+        out
+    };
+    Ok(out)
+}
+
+/// PNG iTXt (XML:com.adobe.xmp) チャンクを走査して、存在すれば chunk 範囲と
+/// デコード済み XMP テキストを返す。チャンク圧縮は未対応。
+fn find_png_xmp_itxt(bytes: &[u8]) -> Result<(Option<(usize, usize)>, Vec<u8>), WriteError> {
+    if !bytes.starts_with(PNG_SIG) {
+        return Err(WriteError::MalformedContainer("PNG signature なし".into()));
+    }
+    let mut pos = PNG_SIG.len();
+    while pos + 8 <= bytes.len() {
+        let length =
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
+        let chunk_type = &bytes[pos + 4..pos + 8];
+        let data_start = pos + 8;
+        let data_end = data_start
+            .checked_add(length)
+            .ok_or_else(|| WriteError::MalformedContainer("PNG chunk length overflow".into()))?;
+        let crc_end = data_end + 4;
+        if crc_end > bytes.len() {
+            return Err(WriteError::MalformedContainer(
+                "PNG chunk extends beyond file".into(),
+            ));
+        }
+        if chunk_type == b"iTXt" {
+            let chunk = &bytes[data_start..data_end];
+            if let Some(kw_end) = chunk.iter().position(|&b| b == 0) {
+                let kw = &chunk[..kw_end];
+                if kw == PNG_XMP_KEYWORD && chunk.len() >= kw_end + 3 {
+                    let compression_flag = chunk[kw_end + 1];
+                    let rest = &chunk[kw_end + 3..];
+                    if let Some(lang_end) = rest.iter().position(|&b| b == 0) {
+                        let after_lang = &rest[lang_end + 1..];
+                        if let Some(trans_end) = after_lang.iter().position(|&b| b == 0) {
+                            let text = &after_lang[trans_end + 1..];
+                            if compression_flag == 0 {
+                                return Ok((Some((pos, crc_end)), text.to_vec()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if chunk_type == b"IEND" {
+            break;
+        }
+        pos = crc_end;
+    }
+    Ok((None, Vec::new()))
+}
 
 fn apply_tag_op_png(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), WriteError> {
     if !bytes.starts_with(PNG_SIG) {
@@ -911,6 +1189,92 @@ fn png_crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 // WebP 書き込み
 // ---------------------------------------------------------------------------
+
+/// `apply_tag_op_webp` と同じ RIFF 解析 + VP8X フラグ付与 + 再構築だが、XMP 編集は rating 用。
+fn apply_rating_op_webp(bytes: &[u8], rating: Option<u8>) -> Result<Vec<u8>, WriteError> {
+    let (mut chunks, existing_xmp) = parse_webp_chunks(bytes)?;
+    let new_xmp = edit_xmp_packet_rating(existing_xmp.as_deref().unwrap_or(&[]), rating)?;
+    let has_vp8x = chunks.iter().any(|(fc, _)| fc == "VP8X");
+    if !has_vp8x {
+        let (w, h) = extract_webp_canvas_size(&chunks)
+            .ok_or_else(|| WriteError::MalformedContainer("WebP 画像サイズが取得できない".into()))?;
+        let mut vp8x = vec![0u8; 10];
+        vp8x[0] = 0b0000_0100;
+        let w1 = w - 1;
+        let h1 = h - 1;
+        vp8x[4] = (w1 & 0xFF) as u8;
+        vp8x[5] = ((w1 >> 8) & 0xFF) as u8;
+        vp8x[6] = ((w1 >> 16) & 0xFF) as u8;
+        vp8x[7] = (h1 & 0xFF) as u8;
+        vp8x[8] = ((h1 >> 8) & 0xFF) as u8;
+        vp8x[9] = ((h1 >> 16) & 0xFF) as u8;
+        chunks.insert(0, ("VP8X".to_string(), vp8x));
+    } else {
+        for (fc, data) in chunks.iter_mut() {
+            if fc == "VP8X" && !data.is_empty() {
+                data[0] |= 0b0000_0100;
+            }
+        }
+    }
+    chunks.push(("XMP ".to_string(), new_xmp));
+    Ok(rebuild_webp_riff(&chunks))
+}
+
+/// WebP RIFF を解析して (非 XMP チャンク列, 既存 XMP payload) を返す。
+/// 新規 rating/tag 書き込みで共有する軽量パーサ。
+fn parse_webp_chunks(
+    bytes: &[u8],
+) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>), WriteError> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return Err(WriteError::MalformedContainer("WebP RIFF ヘッダ不正".into()));
+    }
+    let mut pos = 12;
+    let mut chunks: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut existing_xmp: Option<Vec<u8>> = None;
+    while pos + 8 <= bytes.len() {
+        let fourcc = std::str::from_utf8(&bytes[pos..pos + 4])
+            .map_err(|_| WriteError::MalformedContainer("WebP fourcc not utf8".into()))?
+            .to_string();
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let data_start = pos + 8;
+        let data_end = data_start + size;
+        if data_end > bytes.len() {
+            return Err(WriteError::MalformedContainer("WebP chunk extends beyond file".into()));
+        }
+        let data = bytes[data_start..data_end].to_vec();
+        if fourcc == "XMP " {
+            existing_xmp = Some(data);
+        } else {
+            chunks.push((fourcc, data));
+        }
+        pos = data_end + (size & 1);
+    }
+    Ok((chunks, existing_xmp))
+}
+
+fn rebuild_webp_riff(chunks: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(b"WEBP");
+    for (fourcc, data) in chunks {
+        body.extend_from_slice(fourcc.as_bytes());
+        let sz = data.len() as u32;
+        body.extend_from_slice(&sz.to_le_bytes());
+        body.extend_from_slice(data);
+        if data.len() & 1 == 1 {
+            body.push(0);
+        }
+    }
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
 
 fn apply_tag_op_webp(bytes: &[u8], op: &TagOp) -> Result<(Vec<u8>, String), WriteError> {
     // RIFF 構造:
@@ -1481,5 +1845,54 @@ mod tests {
             pos = seg_end;
         }
         out
+    }
+
+    // ---- xmp:Rating 書き込み ----
+
+    #[test]
+    fn edit_rating_writes_attribute_on_empty_packet() {
+        let (out, _) = edit_xmp_packet(&[], &TagOp::Add("#x".into())).expect("seed");
+        let updated = edit_xmp_packet_rating(&out, Some(4)).expect("write rating");
+        let s = std::str::from_utf8(&updated).unwrap();
+        assert!(s.contains("xmp:Rating=\"4\""));
+        assert_eq!(crate::xmp_reader::parse_xmp_rating(&updated), Some(4));
+        // タグは保持
+        assert_eq!(crate::xmp_reader::parse_dc_subject(&updated), vec!["#x"]);
+    }
+
+    #[test]
+    fn edit_rating_overwrites_existing() {
+        let packet = edit_xmp_packet_rating(&[], Some(3)).expect("initial");
+        let updated = edit_xmp_packet_rating(&packet, Some(5)).expect("update");
+        assert_eq!(crate::xmp_reader::parse_xmp_rating(&updated), Some(5));
+        // 同じ属性が重複していない
+        let count = std::str::from_utf8(&updated)
+            .unwrap()
+            .matches("xmp:Rating=")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn edit_rating_none_removes_attribute() {
+        let packet = edit_xmp_packet_rating(&[], Some(3)).expect("initial");
+        let cleared = edit_xmp_packet_rating(&packet, None).expect("clear");
+        assert_eq!(crate::xmp_reader::parse_xmp_rating(&cleared), None);
+        assert!(!std::str::from_utf8(&cleared).unwrap().contains("xmp:Rating="));
+    }
+
+    #[test]
+    fn edit_rating_zero_is_same_as_none() {
+        let packet = edit_xmp_packet_rating(&[], Some(4)).expect("initial");
+        let cleared = edit_xmp_packet_rating(&packet, Some(0)).expect("clear via 0");
+        assert_eq!(crate::xmp_reader::parse_xmp_rating(&cleared), None);
+    }
+
+    #[test]
+    fn edit_rating_noop_when_unchanged() {
+        let packet = edit_xmp_packet_rating(&[], Some(3)).expect("initial");
+        // 同じ値で再実行 → MetadataDate すら更新しない (早期 return で同一バイト列)
+        let updated = edit_xmp_packet_rating(&packet, Some(3)).expect("noop");
+        assert_eq!(packet, updated);
     }
 }

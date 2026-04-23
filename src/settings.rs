@@ -756,6 +756,14 @@ pub struct Settings {
     /// 他アプリへの I/O 負荷を抑える。
     #[serde(default)]
     pub pause_indexer_while_minimized: bool,
+
+    /// レーティング (★) を XMP `xmp:Rating` としてファイル本体にも書き込むか。
+    /// ON (opt-in) にすると F1〜F6 でファイル移動後もレーティングが保持され、Lightroom /
+    /// Windows エクスプローラーの「評価」カラムとも互換性がある。代わりにファイル本体が
+    /// 書き換わる (更新日時が変わる)。対応形式は JPEG / PNG / WebP のみ。
+    /// デフォルト OFF — 「通常は非破壊」というアプリの基本方針に沿わせる。
+    #[serde(default)]
+    pub write_rating_to_xmp: bool,
 }
 
 /// グリッド列数の最小値
@@ -960,6 +968,7 @@ impl Default for Settings {
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
             pause_indexer_while_minimized: false,
+            write_rating_to_xmp: false,
         }
     }
 }

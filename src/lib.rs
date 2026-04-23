@@ -46,6 +46,7 @@ pub mod sidecar;
 pub mod stats;
 pub mod susie_loader;
 pub mod sys_memory;
+pub mod rating_write_worker;
 pub mod tag_write_worker;
 pub mod thumb_loader;
 pub mod ui_helpers;
