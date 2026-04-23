@@ -45,6 +45,10 @@ impl App {
                     }
                     ui.separator();
                     if ui.button("終了").clicked() {
+                        // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、
+                        // `shutdown_requested` を立てて `maybe_intercept_close` を通す。
+                        self.shutdown_requested
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
