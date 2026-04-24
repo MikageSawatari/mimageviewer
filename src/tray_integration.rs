@@ -47,14 +47,10 @@ impl App {
                             "tray: controller start returned None (non-Windows or spawn failed)",
                         );
                     } else {
-                        // checkmark は設定値 (pause_indexer_while_minimized) を反映する。
-                        // 以前は activity_gate.is_paused() を使っていたが、ウィンドウ表示中は
-                        // 必ず false で、ダイアログの設定チェックボックスと表示がズレていた。
-                        // ユーザーの自然なメンタルモデル「常駐時に一時停止するか」の設定値を
-                        // 直接出すのが正。
-                        if let Some(tc) = &self.tray_controller {
-                            tc.set_paused_check(self.settings.pause_indexer_while_minimized);
-                        }
+                        // checkmark は設定値 (pause_indexer_while_minimized) を反映する
+                        // (activity_gate.is_paused() はウィンドウ表示中は常に false で、
+                        // ダイアログのチェックボックスとズレるため)。
+                        self.sync_tray_pause_check();
                         self.update_tray_tooltip();
                     }
                 }
@@ -212,6 +208,33 @@ impl App {
         tc.set_tooltip(tooltip);
     }
 
+    /// 「常駐時のスキャンを一時停止」のトレイ checkmark を設定値で同期する。
+    /// ダイアログ (お気に入り編集 / 環境設定) からの設定変更時、およびトレイ起動時に呼ぶ。
+    pub(crate) fn sync_tray_pause_check(&self) {
+        if let Some(tc) = &self.tray_controller {
+            tc.set_paused_check(self.settings.pause_indexer_while_minimized);
+        }
+    }
+
+    /// トレイ pause checkmark の atomic 状態を読み、設定値と differ なら設定を更新する。
+    /// `TogglePauseRequested` イベントが bounded channel overflow で drop されたケースの
+    /// safety net (Codex P3)。events drain 後に必ず呼ぶ。
+    fn reconcile_pause_state(&mut self) {
+        let Some(tc) = &self.tray_controller else {
+            return;
+        };
+        let atomic = tc.pause_checked_snapshot();
+        if atomic != self.settings.pause_indexer_while_minimized {
+            self.settings.pause_indexer_while_minimized = atomic;
+            self.settings.save();
+            if self.window_visible {
+                // ウィンドウ表示中は「実行状態は止めない」の不変を保つ。設定は次回 minimize で効く。
+                self.activity_gate.set_paused(false);
+            }
+            self.update_tray_tooltip();
+        }
+    }
+
     /// 「タスクトレイに常駐」にチェックを入れた瞬間に表示する案内ダイアログ。
     /// ユーザーが OK を押すと閉じる。`App::update` から毎フレーム呼ぶ。
     pub(crate) fn show_tray_enabled_notice_dialog(&mut self, ctx: &egui::Context) {
@@ -274,17 +297,10 @@ impl App {
                 TrayEvent::OpenRequested => {
                     self.sync_after_restore();
                 }
-                TrayEvent::TogglePauseRequested { new_checked } => {
-                    // トレイ checkmark = 設定 `pause_indexer_while_minimized` の新値
-                    // (muda が auto-toggle 済み、activity_gate もトレイスレッドが反映済み)。
-                    // ここでは設定を保存し、ウィンドウが表示中ならランタイム activity_gate は
-                    // 「ウィンドウ表示中は止めない」の不変に戻す (設定は次回 minimize で効く)。
-                    self.settings.pause_indexer_while_minimized = new_checked;
-                    self.settings.save();
-                    if self.window_visible {
-                        self.activity_gate.set_paused(false);
-                    }
-                    self.update_tray_tooltip();
+                TrayEvent::TogglePauseRequested { .. } => {
+                    // 設定反映・保存・tooltip 更新は下の reconcile で一括処理する
+                    // (bounded channel overflow でこのイベントが drop されても、atomic
+                    //  snapshot 経由で同じ状態に収束する)。
                 }
                 TrayEvent::QuitRequested => {
                     // 可視状態で Quit が押されたケース: トレイスレッドが既に
@@ -295,5 +311,7 @@ impl App {
                 }
             }
         }
+        // イベント drop を考慮し、必ず atomic から最新状態を reconcile する (Codex P3)。
+        self.reconcile_pause_state();
     }
 }

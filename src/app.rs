@@ -1157,9 +1157,9 @@ pub struct App {
     pub(crate) show_favorites_editor: bool,
     /// インデックスサイズ表示用のキャッシュ。ダイアログ open 時に計算し、
     /// close で None に戻す。毎フレーム `std::fs::metadata` + `read_dir` を
-    /// 叩かないようにする (Codex P3)。
-    /// `(name_index_db, fts_meta_db, fts_index_dir)` bytes。
-    pub(crate) favorites_index_size_cache: Option<(u64, u64, u64)>,
+    /// 叩かないようにするため。
+    pub(crate) favorites_index_size_cache:
+        Option<crate::ui_dialogs::favorites_editor::IndexDiskSizes>,
 
     // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
     pub(crate) show_tag_editor: bool,

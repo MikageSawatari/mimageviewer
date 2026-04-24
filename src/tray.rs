@@ -131,6 +131,11 @@ pub struct TrayController {
     /// トレイ「終了」が押されたら true。`App::maybe_intercept_close` が読み、
     /// true なら close インターセプトをスキップして通常終了経路に抜ける。
     quit_flag: Arc<AtomicBool>,
+    /// CheckMenuItem (pause) の現在状態。トレイスレッドがユーザークリックで反転し、
+    /// `SetPausedCheck` コマンドでも同期される (= 常に表示中の checkmark と一致)。
+    /// App 側は `TogglePauseRequested` イベントの取りこぼし対策としてこれを reconcile
+    /// ソースに使う (bounded(16) で drop されても設定が stale にならない)。
+    pause_checked: Arc<AtomicBool>,
 }
 
 impl TrayController {
@@ -159,6 +164,8 @@ impl TrayController {
         let shutdown_th = Arc::clone(&shutdown);
         let quit_flag = Arc::new(AtomicBool::new(false));
         let quit_flag_th = Arc::clone(&quit_flag);
+        let pause_checked = Arc::new(AtomicBool::new(false));
+        let pause_checked_th = Arc::clone(&pause_checked);
 
         let thread = std::thread::Builder::new()
             .name("mimv-tray".into())
@@ -176,6 +183,7 @@ impl TrayController {
                     io_sem,
                     quit_flag_th,
                     placement_slot,
+                    pause_checked_th,
                 );
             })
             .ok()?;
@@ -186,6 +194,7 @@ impl TrayController {
             shutdown,
             thread: Some(thread),
             quit_flag,
+            pause_checked,
         })
     }
 
@@ -201,6 +210,13 @@ impl TrayController {
         _: PlacementSlot,
     ) -> Option<Self> {
         None
+    }
+
+    /// トレイメニュー pause の現在 checkmark を読む (Codex P3 の reconcile 用)。
+    /// `TogglePauseRequested` イベントが bounded channel overflow でドロップされても、
+    /// App はこれを見て `settings.pause_indexer_while_minimized` に反映できる。
+    pub fn pause_checked_snapshot(&self) -> bool {
+        self.pause_checked.load(Ordering::Relaxed)
     }
 
     /// ノンブロッキングでイベントを受信。無ければ None。毎フレーム呼ぶ想定。
@@ -263,6 +279,7 @@ fn run_tray_thread(
     io_sem: Option<Arc<GlobalIoSemaphore>>,
     quit_flag: Arc<AtomicBool>,
     placement_slot: PlacementSlot,
+    pause_checked: Arc<AtomicBool>,
 ) {
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -308,12 +325,9 @@ fn run_tray_thread(
     let quit_id: MenuId = item_quit.id().clone();
 
     // CheckMenuItem (Rc<...> を含み !Send) は MenuEvent 用の 'static + Send closure に
-    // 持ち込めないので、checkmark の現状態を Send+Sync な AtomicBool で並行追跡する。
-    // muda が auto-toggle する前後で整合が取れていれば OK:
-    //   - 初期化時と SetPausedCheck コマンド受信時: 同じ bool を book.ストア + item_pause.set_checked
-    //   - pause クリック時: book.fetch_xor(true) で反転、結果を TogglePauseRequested の
-    //     new_checked に載せる
-    let pause_checked = Arc::new(AtomicBool::new(false));
+    // 持ち込めないので、checkmark の現状態を Send+Sync な AtomicBool (TrayController から
+    // 共有) で並行追跡する。App 側はこれを snapshot して設定値と reconcile できる
+    // (bounded channel overflow で TogglePauseRequested が drop された場合の保険)。
 
     // --- Win32 アクションをクロージャ化してイベントハンドラから呼ぶ ---
     // HWND は Send/Sync ではないので、`main_hwnd: isize` をキャプチャして呼び出し時に
@@ -389,10 +403,13 @@ fn run_tray_thread(
             } else if ev.id == pause_id {
                 // muda が CheckMenuItem を既にトグル済み。item_pause は !Send なので
                 // 直接参照できないが、AtomicBool で反転を追跡する (SetPausedCheck
-                // コマンドとも同期される)。新値を権威として App に送る。
-                let new_checked = !pause_checked.load(Ordering::Relaxed);
-                pause_checked.store(new_checked, Ordering::Relaxed);
+                // コマンドとも同期される)。`fetch_xor` で原子的に反転し、反転前の値の
+                // 否定が新値。これで高速連打や SetPausedCheck との競合でも状態が drift
+                // しない。
+                let prev = pause_checked.fetch_xor(true, Ordering::Relaxed);
+                let new_checked = !prev;
                 activity_gate.set_paused(new_checked);
+                // try_send ドロップに備え、App は `pause_checked_snapshot` で reconcile する。
                 let _ = event_tx.try_send(TrayEvent::TogglePauseRequested { new_checked });
                 ctx.request_repaint();
                 crate::logger::log(format!(

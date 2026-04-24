@@ -322,9 +322,7 @@ impl App {
                 // 「常駐中はインデックス更新を一時停止する」が変わったらトレイの checkmark も
                 // 同期する (お気に入り編集ダイアログと同じチェックボックス項目への二重経路)。
                 if old_pause_minimized != self.settings.pause_indexer_while_minimized {
-                    if let Some(tc) = &self.tray_controller {
-                        tc.set_paused_check(self.settings.pause_indexer_while_minimized);
-                    }
+                    self.sync_tray_pause_check();
                 }
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み

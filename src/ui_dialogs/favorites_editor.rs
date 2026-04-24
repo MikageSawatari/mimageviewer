@@ -29,13 +29,14 @@ use crate::ui_helpers::{format_bytes, truncate_name};
 ///
 /// すべて `stat()` ベースなので数ミリ秒で完了する。ダイアログを開くたびに再計算して
 /// 最新値を出す (ingest で増えるので)。存在しないファイル / ディレクトリは 0 扱い。
-struct IndexDiskSizes {
-    name_index_db: u64,
-    fts_meta_db: u64,
-    fts_index_dir: u64,
+#[derive(Copy, Clone)]
+pub(crate) struct IndexDiskSizes {
+    pub(crate) name_index_db: u64,
+    pub(crate) fts_meta_db: u64,
+    pub(crate) fts_index_dir: u64,
 }
 
-fn compute_index_disk_sizes() -> IndexDiskSizes {
+pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
     let data_dir = crate::data_dir::get();
     let file_size = |p: &std::path::Path| -> u64 {
         std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
@@ -93,6 +94,8 @@ impl App {
         let mut open_cache_creator = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        // save 後にトレイ checkmark を同期するかの判定材料。
+        let old_pause_minimized = self.settings.pause_indexer_while_minimized;
 
         // 事前にインデクサ情報を取り出し (borrow 競合回避)
         let startup_diag = self.indexer_manager.as_ref().map(|m| m.startup_diag());
@@ -168,15 +171,10 @@ impl App {
                         });
 
                         // インデックスのディスク使用量。ダイアログ open 時に 1 回計算してキャッシュ
-                        // (毎フレーム stat + read_dir を叩かないため。Codex P3 指摘)。
-                        // ダイアログ close 時に None に戻す。
-                        let sizes = self
+                        // (毎フレーム stat + read_dir を叩かないため)。close 時に破棄。
+                        let sizes = *self
                             .favorites_index_size_cache
-                            .get_or_insert_with(|| {
-                                let s = compute_index_disk_sizes();
-                                (s.name_index_db, s.fts_meta_db, s.fts_index_dir)
-                            });
-                        let (name_size, fts_meta_size, fts_index_size) = *sizes;
+                            .get_or_insert_with(compute_index_disk_sizes);
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("💾 インデックスサイズ:")
@@ -186,7 +184,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "名前索引 {}",
-                                    format_bytes(name_size)
+                                    format_bytes(sizes.name_index_db)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -199,8 +197,8 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "メタ索引 {} + {}",
-                                    format_bytes(fts_meta_size),
-                                    format_bytes(fts_index_size)
+                                    format_bytes(sizes.fts_meta_db),
+                                    format_bytes(sizes.fts_index_dir)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -579,17 +577,15 @@ impl App {
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
         if any_setting_dirty {
             self.settings.save();
-            // pause_indexer_while_minimized が変わったかもしれないので、トレイメニューの
-            // checkmark を設定値に合わせて同期する。他の項目 (名前・並び替え等) でも
-            // 毎回 push するが、`SetPausedCheck` は idempotent で cost も低いので許容。
-            if let Some(tc) = &self.tray_controller {
-                tc.set_paused_check(self.settings.pause_indexer_while_minimized);
+            // 「常駐中はインデックス更新を一時停止する」が変わっていたら、トレイメニューの
+            // checkmark も同期する (環境設定ダイアログの同項目と同じ経路)。
+            if old_pause_minimized != self.settings.pause_indexer_while_minimized {
+                self.sync_tray_pause_check();
             }
         }
 
         if close_requested || !open {
             self.show_favorites_editor = false;
-            // 次回 open 時に最新のディスク使用量で再計算するためキャッシュを破棄。
             self.favorites_index_size_cache = None;
         }
 
