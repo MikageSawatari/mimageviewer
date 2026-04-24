@@ -9,6 +9,7 @@ pub mod archive_cache;
 pub mod archive_converter;
 pub mod catalog;
 pub mod data_dir;
+pub mod delete_worker;
 pub mod exif_reader;
 pub mod fast_resize;
 pub mod folder_rating_counter;

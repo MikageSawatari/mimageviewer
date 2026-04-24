@@ -1311,6 +1311,10 @@ pub struct App {
     /// idx キーで持つことで hot-path の `adjustment_db::normalize_path` 呼び出しを
     /// 未処理 idx に対してのみ発生させる。フォルダ切替で `prewarm_grid_tags` が clear する。
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
+    /// バックグラウンドで実行中のゴミ箱移動 (docs/async-architecture.md §5.2.1)。
+    /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
+    /// 更新、完了時に成功した path を items から一括 remove する。
+    pub(crate) delete_pending: Option<crate::delete_worker::DeletePending>,
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -1871,6 +1875,7 @@ impl Default for App {
             metadata_pending: None,
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
+            delete_pending: None,
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -3718,7 +3723,7 @@ impl App {
 
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
     ///
-    /// 呼び出し元: `remove_item_session` (削除による idx シフト) と
+    /// 呼び出し元: `remove_items_batch` (削除完了時の idx シフト) と
     /// `replace_search_view_items` (Ctrl+G 結果差し替え)。事前条件として
     /// 呼び出し側で `items_generation` の bump 済みであること (そうしないと
     /// 旧ワーカーの `ThumbMsg` が新 items の同じ idx に着地してサムネが化ける)。
@@ -3798,71 +3803,60 @@ impl App {
         }
     }
 
-    /// 削除確定後に `idx` を items から取り除き、idx シフトで無効化されるキャッシュを破棄する。
+    /// 複数 idx をまとめて items から取り除く共通ルーチン。
     ///
-    /// `items_generation` を bump するので、進行中ワーカーの `ThumbMsg` は
-    /// `poll_thumbnails` の世代不一致チェックで破棄される。削除 idx より後の
-    /// 残存 idx はすべてシフトするため、idx-keyed キャッシュは部分 shift せず
-    /// `invalidate_idx_state_and_queues` で一括クリアする。
-    pub(crate) fn remove_item_session(&mut self, idx: usize) {
-        if idx >= self.items.len() {
+    /// `sorted_desc_idxs` は降順ソート済み・重複なしの idx 配列を期待する。
+    /// 大量削除 (★1 画像数千件一括削除など) で 1 件ずつ処理すると
+    /// `adjustment_page_params` の再構築が O(N·M) になってしまうため、
+    /// `partition_point` を使った O(K log K) の idx shift で一括処理する。
+    ///
+    /// 事前条件: `sorted_desc_idxs` は降順・重複なし・すべて `self.items.len()` 未満。
+    pub(crate) fn remove_items_batch(&mut self, sorted_desc_idxs: &[usize]) {
+        if sorted_desc_idxs.is_empty() {
             return;
         }
 
-        self.items.remove(idx);
-        if idx < self.thumbnails.len() {
-            self.thumbnails.remove(idx);
-        }
-        if idx < self.image_metas.len() {
-            self.image_metas.remove(idx);
+        // 物理 shift: 降順なので items.remove(i) の再 shift は発生しない。
+        for &i in sorted_desc_idxs {
+            if i < self.items.len() {
+                self.items.remove(i);
+            }
+            if i < self.thumbnails.len() {
+                self.thumbnails.remove(i);
+            }
+            if i < self.image_metas.len() {
+                self.image_metas.remove(i);
+            }
         }
         self.items_generation = self.items_generation.wrapping_add(1);
 
-        // search_filter の idx シフト (削除された idx は drop)
+        // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
+        // 削除 idx 集合は降順入力だが、partition_point には昇順が要るので一度昇順化する。
+        let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
+        sorted_asc.sort_unstable();
+        let removed_set: std::collections::HashSet<usize> = sorted_asc.iter().copied().collect();
+        let shift = |old: usize| -> Option<usize> {
+            if removed_set.contains(&old) {
+                return None;
+            }
+            // old より小さい削除済み idx の数 = shift 幅
+            let count_before = sorted_asc.partition_point(|&x| x < old);
+            Some(old - count_before)
+        };
+
         if let Some(ref mut filter) = self.search_filter {
-            let new_filter: std::collections::HashSet<usize> = filter
-                .iter()
-                .filter_map(|&i| {
-                    if i < idx {
-                        Some(i)
-                    } else if i > idx {
-                        Some(i - 1)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let new_filter: std::collections::HashSet<usize> =
+                filter.iter().filter_map(|&i| shift(i)).collect();
             *filter = new_filter;
         }
 
-        // adjustment_page_params / mask_pages は DB ロード済みのユーザ設定なので
-        // clear ではなく idx shift で残存ページの分を保持する。
-        // 削除 idx に一致する分だけドロップし、それより大きい idx は -1。
+        // adjustment_page_params / mask_pages は DB 復元済みのユーザ設定なので
+        // clear せず idx shift で残存ページの分を保持する。
         self.adjustment_page_params = std::mem::take(&mut self.adjustment_page_params)
             .into_iter()
-            .filter_map(|(i, v)| {
-                if i < idx {
-                    Some((i, v))
-                } else if i > idx {
-                    Some((i - 1, v))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
             .collect();
-        self.mask_pages = self
-            .mask_pages
-            .iter()
-            .filter_map(|&i| {
-                if i < idx {
-                    Some(i)
-                } else if i > idx {
-                    Some(i - 1)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
 
         self.invalidate_idx_state_and_queues();
 
@@ -3876,6 +3870,124 @@ impl App {
         }
 
         self.rebuild_visible_indices();
+    }
+
+    /// 削除ワーカーを spawn し、`delete_pending` に保持する。
+    /// 既に実行中の場合は何もしない (UI 側でダイアログ表示中はボタン無効化する前提)。
+    pub(crate) fn start_delete_files(&mut self, paths: Vec<std::path::PathBuf>) {
+        if paths.is_empty() || self.delete_pending.is_some() {
+            return;
+        }
+        let snapshot_gen = self.items_generation;
+        self.delete_pending = Some(crate::delete_worker::spawn(paths, snapshot_gen));
+    }
+
+    /// 毎フレーム `delete_pending` の進捗メッセージを受信する。
+    ///
+    /// 進捗バッチを受けるたびに `succeeded` / `failed` / `processed` を更新し、
+    /// `DeleteMsg::Done` 受信で items への反映 (成功 path を現在の items から引き直して
+    /// `remove_items_batch`) + `prewarm_grid_tags` 再起動 + ダイアログクローズを行う。
+    ///
+    /// 完了時に `items_generation` が開始時と変わっていれば items への反映をスキップする
+    /// (フォルダ切替などで items が入れ替わった場合、ゴミ箱移動済みの path を現在の items
+    /// から引こうとしても自然に空振るが、早期 return で無駄処理を省く)。
+    pub(crate) fn poll_delete_pending(&mut self) {
+        let Some(pending) = self.delete_pending.as_mut() else {
+            return;
+        };
+        let mut done = false;
+        let mut canceled = false;
+        loop {
+            match pending.rx.try_recv() {
+                Ok(crate::delete_worker::DeleteMsg::Batch { succeeded, failed }) => {
+                    pending.processed += succeeded.len() + failed.len();
+                    pending.succeeded.extend(succeeded);
+                    pending.failed.extend(failed);
+                }
+                Ok(crate::delete_worker::DeleteMsg::Done { canceled: c }) => {
+                    done = true;
+                    canceled = c;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        // 進捗表示のため `delete_pending` がある間は毎フレーム repaint を要求する。
+        // 実際の請求は呼び出し側 (App::update) で行うか、ここで request_repaint するか。
+        // ここでは repaint 側に寄せず、呼び出し側がチェックする形とする。
+
+        if !done {
+            return;
+        }
+
+        let pending = self.delete_pending.take().expect("guarded above");
+        let succeeded = pending.succeeded;
+        let failed_count = pending.failed.len();
+        let snapshot_gen = pending.items_generation;
+
+        crate::logger::log(format!(
+            "[delete] done: canceled={canceled} succeeded={} failed={failed_count}",
+            succeeded.len(),
+        ));
+
+        if failed_count > 0 {
+            // 失敗は警告表示 (トースト風)。詳細は logger に出しておく。
+            let first = pending.failed.first().map(|(p, m)| format!("{}: {m}", p.display()));
+            crate::logger::log(format!(
+                "[delete] first failed = {}",
+                first.unwrap_or_default()
+            ));
+            self.show_feedback_toast(format!("{} 件の削除に失敗しました", failed_count));
+        }
+
+        if succeeded.is_empty() {
+            return;
+        }
+
+        // 世代防御: items が入れ替わっていたら path 解決は空振りするはずだが、
+        // 早期 return で明示的に無駄処理を避ける。
+        if snapshot_gen != self.items_generation {
+            crate::logger::log(
+                "[delete] items_generation changed during delete; skipping grid reflect"
+                    .to_string(),
+            );
+            return;
+        }
+
+        // 成功 path を現在の items から引き直して idx 配列を作る。
+        // ZipImage/PdfPage など path を持たない変種はスキップ (ゴミ箱移動対象外のはず)。
+        let success_set: std::collections::HashSet<&std::path::Path> =
+            succeeded.iter().map(|p| p.as_path()).collect();
+        let mut idxs: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                crate::grid_item::GridItem::Image(p)
+                | crate::grid_item::GridItem::Video(p)
+                | crate::grid_item::GridItem::ZipFile(p)
+                | crate::grid_item::GridItem::PdfFile(p) => {
+                    if success_set.contains(p.as_path()) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        if idxs.is_empty() {
+            return;
+        }
+        self.remove_items_batch(&idxs);
+        // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
+        // 削除反映後に 1 回だけ再 spawn してバッジ表示を復活させる。
+        self.prewarm_grid_tags();
     }
 
     /// condvar.wait() 中の全ワーカーを起床させる。
@@ -10545,6 +10657,7 @@ impl eframe::App for App {
         self.poll_favsearch();
         self.poll_metadata_load();
         self.poll_tag_prewarm_results();
+        self.poll_delete_pending();
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
@@ -10692,6 +10805,7 @@ impl eframe::App for App {
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
+        self.show_delete_progress_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
         self.show_tray_enabled_notice_dialog(ctx);

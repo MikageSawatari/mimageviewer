@@ -364,8 +364,12 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
 - **フォルダ切替**: `start_loading_items` → `install_new_items`
 - **Ctrl+G 結果差し替え**: `replace_search_view_items` → `install_new_items` +
   `invalidate_idx_state_and_queues` + path-keyed cache clear
-- **削除**: `remove_item_session` → (physical shift) + `items_generation` bump +
-  `invalidate_idx_state_and_queues`
+- **削除**: `start_delete_files` (ゴミ箱移動を別 thread で実行) → 完了時に
+  `poll_delete_pending` が path から現在の idx を引き直して `remove_items_batch` を
+  呼ぶ。`remove_items_batch` は降順 idx 配列を受け取り、items/thumbnails/image_metas の
+  物理 shift + `items_generation` bump + `adjustment_page_params` / `mask_pages` /
+  `search_filter` の O(K log K) idx shift + `invalidate_idx_state_and_queues` を行う。
+  キャンセルは次バッチ境界 (50 件単位)。
 
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 

@@ -603,6 +603,7 @@ impl crate::app::App {
         };
 
         let mut open = true;
+        let mut do_start_delete = false;
         egui::Window::new("削除の確認")
             .open(&mut open)
             .collapsible(false)
@@ -612,29 +613,7 @@ impl crate::app::App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("削除").clicked() {
-                        // 降順で削除（インデックスずれ防止）
-                        let mut targets = std::mem::take(&mut self.delete_targets);
-                        targets.sort_by(|a, b| b.0.cmp(&a.0));
-                        let any_removed = targets
-                            .iter()
-                            .filter(|(idx, path)| {
-                                if move_to_recycle_bin(path) {
-                                    self.remove_item_session(*idx);
-                                    true
-                                } else {
-                                    false
-                                }
-                            })
-                            .count()
-                            > 0;
-                        // remove_item_session は tag_prewarm worker を cancel するだけで
-                        // 再 spawn しない (複数ファイル削除でループごとに spawn しないため)。
-                        // 一括削除が終わったここで 1 回だけ再 spawn してタグ badges を復活させる。
-                        if any_removed {
-                            self.prewarm_grid_tags();
-                        }
-                        self.show_delete_confirm = false;
-                        self.delete_targets.clear();
+                        do_start_delete = true;
                     }
                     if ui.button("キャンセル").clicked() {
                         self.show_delete_confirm = false;
@@ -646,6 +625,70 @@ impl crate::app::App {
         if !open {
             self.show_delete_confirm = false;
             self.delete_targets.clear();
+        }
+
+        if do_start_delete {
+            // 削除確認は閉じ、path だけを worker に渡す (idx は完了時に再解決)。
+            let paths: Vec<std::path::PathBuf> = self
+                .delete_targets
+                .iter()
+                .map(|(_, p)| p.clone())
+                .collect();
+            self.show_delete_confirm = false;
+            self.delete_targets.clear();
+            self.start_delete_files(paths);
+        }
+    }
+
+    /// 削除進捗ダイアログ。`delete_pending` がある間だけ表示される。
+    ///
+    /// キャンセルボタンは次バッチ境界で worker を停止させる。実行中の
+    /// `SHFileOperationW` は中断できないので、押してから現行バッチ (50 件) が終わるまで
+    /// 少しだけ遅延する。ラベル文言もその前提で「次のバッチから停止」と書く。
+    pub(crate) fn show_delete_progress_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.delete_pending.as_ref() else {
+            return;
+        };
+        // worker 動作中は毎フレーム再描画して進捗が止まって見えないようにする。
+        ctx.request_repaint();
+
+        let total = pending.total;
+        let processed = pending.processed;
+        let succeeded = pending.succeeded.len();
+        let failed = pending.failed.len();
+        let canceling = pending.cancel.load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut cancel_requested = false;
+        egui::Window::new("削除中")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("削除中 {processed} / {total}"));
+                if failed > 0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 80),
+                        format!("(失敗 {failed} 件)"),
+                    );
+                } else {
+                    ui.label(format!("成功 {succeeded} 件"));
+                }
+                let ratio = if total > 0 {
+                    processed as f32 / total as f32
+                } else {
+                    0.0
+                };
+                ui.add(egui::ProgressBar::new(ratio).show_percentage());
+                ui.add_space(4.0);
+                if canceling {
+                    ui.label("キャンセル待機中…(現在のバッチが終わるまで)");
+                } else if ui.button("キャンセル").clicked() {
+                    cancel_requested = true;
+                }
+            });
+        if cancel_requested {
+            if let Some(p) = self.delete_pending.as_ref() {
+                p.cancel();
+            }
         }
     }
 
@@ -680,41 +723,7 @@ impl crate::app::App {
 // ---------------------------------------------------------------------------
 // OS 操作ヘルパー
 // ---------------------------------------------------------------------------
-
-/// ファイルを Windows ゴミ箱に移動する。
-fn move_to_recycle_bin(path: &std::path::Path) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::Win32::UI::Shell::{
-            FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, SHFILEOPSTRUCTW,
-            SHFileOperationW,
-        };
-
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .chain(std::iter::once(0))
-            .collect();
-
-        let flags = (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0) as u16;
-        let mut op = SHFILEOPSTRUCTW {
-            wFunc: FO_DELETE,
-            pFrom: windows::core::PCWSTR(wide.as_ptr()),
-            fFlags: flags,
-            ..Default::default()
-        };
-
-        let result = unsafe { SHFileOperationW(&mut op) };
-        result == 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        false
-    }
-}
+// ゴミ箱移動は `src/delete_worker.rs` に集約 (バックグラウンド実行 + バッチ)。
 
 /// ファイルをクリップボードにコピー (エクスプローラのコピーと同等)。
 pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
