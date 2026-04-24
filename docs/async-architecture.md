@@ -369,7 +369,7 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
   呼ぶ。`remove_items_batch` は降順 idx 配列を受け取り、items/thumbnails/image_metas の
   物理 shift + `items_generation` bump + `adjustment_page_params` / `mask_pages` /
   `search_filter` の O(K log K) idx shift + `invalidate_idx_state_and_queues` を行う。
-  キャンセルは次バッチ境界 (50 件単位)。
+  キャンセルは各ファイルの `SHFileOperationW` 呼び出し前に判定 (1 件あたり 10-20ms)。
 
 新しい差し替え経路を増やすときは、必ず以下を揃える:
 

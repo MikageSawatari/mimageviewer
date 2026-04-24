@@ -642,9 +642,10 @@ impl crate::app::App {
 
     /// 削除進捗ダイアログ。`delete_pending` がある間だけ表示される。
     ///
-    /// キャンセルボタンは次バッチ境界で worker を停止させる。実行中の
-    /// `SHFileOperationW` は中断できないので、押してから現行バッチ (50 件) が終わるまで
-    /// 少しだけ遅延する。ラベル文言もその前提で「次のバッチから停止」と書く。
+    /// `egui::Modal` を使い、背景のグリッド / メニュー / ショートカット入力を
+    /// 遮断する。スクロール自体は egui 側で吸われるが、背景描画の更新は
+    /// `check_external_folder_changes` などを `delete_pending` でガードしているので
+    /// 進まない (削除の競合状態を避けるため)。
     pub(crate) fn show_delete_progress_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.delete_pending.as_ref() else {
             return;
@@ -653,38 +654,38 @@ impl crate::app::App {
         ctx.request_repaint();
 
         let total = pending.total;
-        let processed = pending.processed;
+        let processed = pending.processed();
         let succeeded = pending.succeeded.len();
         let failed = pending.failed.len();
         let canceling = pending.cancel.load(std::sync::atomic::Ordering::Relaxed);
 
         let mut cancel_requested = false;
-        egui::Window::new("削除中")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!("削除中 {processed} / {total}"));
-                if failed > 0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 80),
-                        format!("(失敗 {failed} 件)"),
-                    );
-                } else {
-                    ui.label(format!("成功 {succeeded} 件"));
-                }
-                let ratio = if total > 0 {
-                    processed as f32 / total as f32
-                } else {
-                    0.0
-                };
-                ui.add(egui::ProgressBar::new(ratio).show_percentage());
-                ui.add_space(4.0);
-                if canceling {
-                    ui.label("キャンセル待機中…(現在のバッチが終わるまで)");
-                } else if ui.button("キャンセル").clicked() {
-                    cancel_requested = true;
-                }
-            });
+        egui::Modal::new(egui::Id::new("delete_progress_modal")).show(ctx, |ui| {
+            ui.set_min_width(280.0);
+            ui.heading("削除中");
+            ui.add_space(4.0);
+            ui.label(format!("{processed} / {total}"));
+            if failed > 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    format!("(失敗 {failed} 件)"),
+                );
+            } else {
+                ui.label(format!("成功 {succeeded} 件"));
+            }
+            let ratio = if total > 0 {
+                processed as f32 / total as f32
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(ratio).show_percentage());
+            ui.add_space(6.0);
+            if canceling {
+                ui.label("キャンセル中…");
+            } else if ui.button("キャンセル").clicked() {
+                cancel_requested = true;
+            }
+        });
         if cancel_requested {
             if let Some(p) = self.delete_pending.as_ref() {
                 p.cancel();

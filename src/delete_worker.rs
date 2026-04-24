@@ -2,30 +2,24 @@
 //!
 //! ## 設計
 //!
-//! - 同期版は UI スレッドで `SHFileOperationW` を呼んでいたため、★1 画像を数千件
-//!   一括削除するケース (AI 画像整理ワークフロー) で UI が数秒〜数十秒フリーズしていた。
-//! - 本モジュールは別スレッドで削除を実行し、結果を `DeleteMsg` として
-//!   `mpsc::Receiver` 経由で UI に返す。
-//! - **バッチ戦略**: `SHFileOperationW` は NULL 区切りの複数パスを 1 コールで
-//!   処理できるので、通常は 50 件まとめて 1 コールする (syscall コストを抑える)。
-//!   バッチが失敗した場合だけ、そのバッチ内のファイルを 1 件ずつ個別に再試行して
-//!   「一部は成功したが他は失敗」のケースを正確に把握する。
-//! - **キャンセル粒度**: バッチ境界。実行中の `SHFileOperationW` は OS 側で
-//!   中断できないので、キャンセルボタンは「次バッチ以降を止める」意味。UI 側でも
-//!   その前提で文言を出す。
-//! - **世代防御**: UI 側は開始時の `items_generation` をスナップショットして、
-//!   完了時に現在値と比較する。不一致ならゴミ箱移動済みの結果を現在の items には
-//!   適用しない (path 解決が自然に空振りする + 過剰な idx shift を防ぐ)。
+//! 別スレッドで `SHFileOperationW` をファイル単位で呼び、結果を `DeleteMsg` として
+//! `mpsc::Receiver` 経由で UI に返す。
+//!
+//! - **1 ファイルずつ実行**: `SHFileOperationW` の複数パス一括呼び出しは一部のパス
+//!   条件下で `result == 0` を返しつつ実際には削除しない症状が再現したため採用せず
+//!   (2026-04 の v0.8.1 検証で判明)。perf 差は syscall overhead のみで 10-20ms/file。
+//! - **バッチ = UI 進捗粒度**: 10 件ごとに `DeleteMsg::Batch` を送り進捗更新する
+//!   (100-200ms おき)。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-/// `SHFileOperationW` に 1 回で渡すパス数。失敗時はバッチ内を 1 件ずつ再試行するので、
-/// 大きすぎると失敗時のフォールバックコストが増える。50 は実測ベースではなく
-/// 「1 バッチ 50〜100ms 目安、キャンセル応答性も確保」のバランス。
-const BATCH_SIZE: usize = 50;
+/// 1 メッセージにまとめる処理件数。UI 進捗更新の粒度。
+/// 小さいほど進捗がなめらかに動くが mpsc オーバーヘッドが増える。10 は
+/// 「進捗 100-200ms おきに更新 / メッセージ数 ~100」の折衷。
+const BATCH_SIZE: usize = 10;
 
 /// ワーカーから UI への進捗通知。
 #[derive(Debug)]
@@ -50,20 +44,21 @@ pub struct DeletePending {
     pub succeeded: Vec<PathBuf>,
     /// これまでに失敗したパスとエラーメッセージ (トースト / ログ通知用)。
     pub failed: Vec<(PathBuf, String)>,
-    /// これまでに処理された件数 (成功 + 失敗)。分子。
-    pub processed: usize,
-    /// 開始時点の `items_generation` スナップショット。完了適用時の世代防御に使う。
-    pub items_generation: u64,
 }
 
 impl DeletePending {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// 処理済み件数 (成功 + 失敗)。進捗バーの分子。
+    pub fn processed(&self) -> usize {
+        self.succeeded.len() + self.failed.len()
+    }
 }
 
 /// 削除ワーカーを spawn する。`paths` のファイルをゴミ箱に移動し、進捗を返す。
-pub fn spawn(paths: Vec<PathBuf>, items_generation: u64) -> DeletePending {
+pub fn spawn(paths: Vec<PathBuf>) -> DeletePending {
     let total = paths.len();
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -82,8 +77,6 @@ pub fn spawn(paths: Vec<PathBuf>, items_generation: u64) -> DeletePending {
         total,
         succeeded: Vec::new(),
         failed: Vec::new(),
-        processed: 0,
-        items_generation,
     }
 }
 
@@ -94,12 +87,23 @@ fn run_worker(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Del
             return;
         }
 
-        let (succeeded, failed) = delete_batch(chunk);
-        if tx
-            .send(DeleteMsg::Batch { succeeded, failed })
-            .is_err()
-        {
-            // UI 側の receiver が drop された (アプリ終了などの異常経路)。黙って終了。
+        let mut succeeded = Vec::with_capacity(chunk.len());
+        let mut failed = Vec::new();
+        for p in chunk {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(DeleteMsg::Batch { succeeded, failed });
+                let _ = tx.send(DeleteMsg::Done { canceled: true });
+                return;
+            }
+            match recycle_one(p) {
+                Ok(()) => succeeded.push(p.clone()),
+                Err(msg) => {
+                    crate::logger::log(format!("[delete] failed: {}: {msg}", p.display()));
+                    failed.push((p.clone(), msg));
+                }
+            }
+        }
+        if tx.send(DeleteMsg::Batch { succeeded, failed }).is_err() {
             return;
         }
     }
@@ -108,76 +112,9 @@ fn run_worker(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Del
     });
 }
 
-/// 1 バッチを削除する。まず一括コールを試し、失敗したら 1 件ずつ再試行する。
-fn delete_batch(chunk: &[PathBuf]) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
-    match recycle_many(chunk) {
-        Ok(()) => (chunk.to_vec(), Vec::new()),
-        Err(_) => {
-            // バッチ失敗: 1 件ずつ実行して成功/失敗を精密に判定する。
-            // SHFileOperationW は一部成功でも全体を失敗として返すことがあるので、
-            // ここで個別確認しないと「一部は既にゴミ箱に入っているのに items に残る」
-            // 不整合が起きる。
-            let mut succeeded = Vec::new();
-            let mut failed = Vec::new();
-            for p in chunk {
-                match recycle_one(p) {
-                    Ok(()) => succeeded.push(p.clone()),
-                    Err(msg) => failed.push((p.clone(), msg)),
-                }
-            }
-            (succeeded, failed)
-        }
-    }
-}
-
-/// 複数パスを 1 回の `SHFileOperationW` でまとめて削除する。
+/// 単一パスを `SHFileOperationW` で削除する。
 #[cfg(windows)]
-fn recycle_many(paths: &[PathBuf]) -> Result<(), String> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
-        SHFileOperationW,
-    };
-
-    // NULL 区切りで連結し、末尾は二重 NULL で終端。
-    let mut wide: Vec<u16> = Vec::new();
-    for p in paths {
-        wide.extend(p.as_os_str().encode_wide());
-        wide.push(0);
-    }
-    wide.push(0);
-
-    // FOF_NOERRORUI: エラーダイアログを表示しない (バックグラウンドなので UI を出させない)
-    let flags =
-        (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0) as u16;
-    let mut op = SHFILEOPSTRUCTW {
-        wFunc: FO_DELETE,
-        pFrom: windows::core::PCWSTR(wide.as_ptr()),
-        fFlags: flags,
-        ..Default::default()
-    };
-    let result = unsafe { SHFileOperationW(&mut op) };
-    if result == 0 && op.fAnyOperationsAborted.as_bool() == false {
-        Ok(())
-    } else {
-        Err(format!(
-            "SHFileOperationW failed: code={result} aborted={}",
-            op.fAnyOperationsAborted.as_bool()
-        ))
-    }
-}
-
-#[cfg(not(windows))]
-fn recycle_many(_paths: &[PathBuf]) -> Result<(), String> {
-    Err("recycle bin not supported on this platform".into())
-}
-
-/// 単一パスを `SHFileOperationW` で削除する (バッチ失敗時のフォールバック)。
-#[cfg(windows)]
-fn recycle_one(path: &PathBuf) -> Result<(), String> {
+fn recycle_one(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::{
         FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
@@ -199,7 +136,7 @@ fn recycle_one(path: &PathBuf) -> Result<(), String> {
         ..Default::default()
     };
     let result = unsafe { SHFileOperationW(&mut op) };
-    if result == 0 && op.fAnyOperationsAborted.as_bool() == false {
+    if result == 0 && !op.fAnyOperationsAborted.as_bool() {
         Ok(())
     } else {
         Err(format!("SHFileOperationW failed: code={result}"))
@@ -207,6 +144,6 @@ fn recycle_one(path: &PathBuf) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn recycle_one(_path: &PathBuf) -> Result<(), String> {
+fn recycle_one(_path: &std::path::Path) -> Result<(), String> {
     Err("recycle bin not supported on this platform".into())
 }

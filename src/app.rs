@@ -2187,6 +2187,7 @@ impl App {
             || self.show_pdf_password_dialog
             || self.slot_save_dialog.is_some()
             || self.context_menu_idx.is_some()
+            || self.delete_pending.is_some()
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
@@ -2219,6 +2220,14 @@ impl App {
     /// 既存ロジックに乗る。UI スレッドでの syscall は `metadata()` 1 回のみ。
     pub(crate) fn check_external_folder_changes(&mut self) {
         if self.global_search.active {
+            return;
+        }
+        // 削除進行中はフォーカス復帰による自動再読み込みを抑止する。削除自身が
+        // フォルダ mtime を更新するので素通しすると load_folder が走り、items が
+        // 差し替わって poll_delete_pending が generation 不一致で結果適用をスキップ、
+        // 加えて未完了ファイルに対するサムネ/AI 先読みが発生して「読み込み失敗」が
+        // 出る。削除完了ダイアログが閉じてから次のフレームで再検知される。
+        if self.delete_pending.is_some() {
             return;
         }
         let Some(folder) = self.current_folder.clone() else {
@@ -3832,16 +3841,16 @@ impl App {
 
         // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
         // 削除 idx 集合は降順入力だが、partition_point には昇順が要るので一度昇順化する。
+        // 削除済み判定も partition_point の位置で `sorted_asc[p] == old` を見れば済み、
+        // HashSet<usize> を別途作る必要はない。
         let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
         sorted_asc.sort_unstable();
-        let removed_set: std::collections::HashSet<usize> = sorted_asc.iter().copied().collect();
         let shift = |old: usize| -> Option<usize> {
-            if removed_set.contains(&old) {
+            let p = sorted_asc.partition_point(|&x| x < old);
+            if sorted_asc.get(p) == Some(&old) {
                 return None;
             }
-            // old より小さい削除済み idx の数 = shift 幅
-            let count_before = sorted_asc.partition_point(|&x| x < old);
-            Some(old - count_before)
+            Some(old - p)
         };
 
         if let Some(ref mut filter) = self.search_filter {
@@ -3857,6 +3866,10 @@ impl App {
             .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
             .collect();
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
+
+        // selected も idx shift する。削除対象だったら None にして、後続の clamp で
+        // 末尾フォールバックする (ユーザーが選択中のものが削除されたケース)。
+        self.selected = self.selected.and_then(shift);
 
         self.invalidate_idx_state_and_queues();
 
@@ -3878,8 +3891,17 @@ impl App {
         if paths.is_empty() || self.delete_pending.is_some() {
             return;
         }
-        let snapshot_gen = self.items_generation;
-        self.delete_pending = Some(crate::delete_worker::spawn(paths, snapshot_gen));
+        // 削除中に items を差し替える恐れのある in-flight pending を停止。poll_delete_pending
+        // は path で現 items に引き直すので世代一致は厳密には不要だが、余計な再描画・
+        // キャッシュ無効化を避けるため事前に静かにしておく。
+        if let Some(p) = self.search_pending.take() {
+            p.cancel();
+        }
+        if let Some(p) = self.favsearch_pending.take() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.global_search.pending = None;
+        self.delete_pending = Some(crate::delete_worker::spawn(paths));
     }
 
     /// 毎フレーム `delete_pending` の進捗メッセージを受信する。
@@ -3900,7 +3922,6 @@ impl App {
         loop {
             match pending.rx.try_recv() {
                 Ok(crate::delete_worker::DeleteMsg::Batch { succeeded, failed }) => {
-                    pending.processed += succeeded.len() + failed.len();
                     pending.succeeded.extend(succeeded);
                     pending.failed.extend(failed);
                 }
@@ -3916,9 +3937,6 @@ impl App {
                 }
             }
         }
-        // 進捗表示のため `delete_pending` がある間は毎フレーム repaint を要求する。
-        // 実際の請求は呼び出し側 (App::update) で行うか、ここで request_repaint するか。
-        // ここでは repaint 側に寄せず、呼び出し側がチェックする形とする。
 
         if !done {
             return;
@@ -3927,7 +3945,6 @@ impl App {
         let pending = self.delete_pending.take().expect("guarded above");
         let succeeded = pending.succeeded;
         let failed_count = pending.failed.len();
-        let snapshot_gen = pending.items_generation;
 
         crate::logger::log(format!(
             "[delete] done: canceled={canceled} succeeded={} failed={failed_count}",
@@ -3935,7 +3952,6 @@ impl App {
         ));
 
         if failed_count > 0 {
-            // 失敗は警告表示 (トースト風)。詳細は logger に出しておく。
             let first = pending.failed.first().map(|(p, m)| format!("{}: {m}", p.display()));
             crate::logger::log(format!(
                 "[delete] first failed = {}",
@@ -3948,18 +3964,10 @@ impl App {
             return;
         }
 
-        // 世代防御: items が入れ替わっていたら path 解決は空振りするはずだが、
-        // 早期 return で明示的に無駄処理を避ける。
-        if snapshot_gen != self.items_generation {
-            crate::logger::log(
-                "[delete] items_generation changed during delete; skipping grid reflect"
-                    .to_string(),
-            );
-            return;
-        }
-
         // 成功 path を現在の items から引き直して idx 配列を作る。
-        // ZipImage/PdfPage など path を持たない変種はスキップ (ゴミ箱移動対象外のはず)。
+        // items が途中で入れ替わっても (Ctrl+G 結果差し替え等) 現 items に残っている分だけ
+        // 引き当てられる。items_generation の一致チェックは不要 (空振り最適化のためだけの
+        // 早期 return を入れると、Ctrl+G 結果に削除済み path が含まれていたとき反映漏れになる)。
         let success_set: std::collections::HashSet<&std::path::Path> =
             succeeded.iter().map(|p| p.as_path()).collect();
         let mut idxs: Vec<usize> = self
@@ -3985,8 +3993,6 @@ impl App {
             return;
         }
         self.remove_items_batch(&idxs);
-        // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
-        // 削除反映後に 1 回だけ再 spawn してバッジ表示を復活させる。
         self.prewarm_grid_tags();
     }
 
@@ -4700,6 +4706,13 @@ impl App {
     /// 毎フレーム呼ぶ想定。現在のスクロール位置から keep_range を算出し、
     /// 範囲外の Loaded を Evicted 化し、範囲内の Pending/Evicted を reload_queue に push する。
     fn update_keep_range_and_requests(&mut self, frame_t0: std::time::Instant) {
+        // 削除進行中は prefetch / eviction 調整も一時停止する。items にはまだ削除対象の
+        // path が残っており、worker が keep_range 内の idx を enqueue するとサムネ再デコードが
+        // 走って「Failed」表示が出る (ゴミ箱移動済みなので File::open が失敗する)。
+        // Modal で入力は止まっているので keep_range は基本動かず、再 enqueue は発生しない想定。
+        if self.delete_pending.is_some() {
+            return;
+        }
         let total = self.items.len();
         if total == 0 {
             // keep_set と worker atomic boundary も同時にクリアしないと、
@@ -7360,6 +7373,11 @@ impl App {
     /// アイドルフレームを早期終了していたが、フィルタ変更で bbox 不変 × 内部構成変化 の
     /// ケースを取り逃す不具合があり廃止した)。
     pub(crate) fn enqueue_visible_tag_prewarms(&mut self) {
+        // 削除進行中は新規 XMP プリウォームを停止。削除予定パスを worker が読もうとすると
+        // File::open が失敗して無駄なキャッシュ汚染や redundant log になる。
+        if self.delete_pending.is_some() {
+            return;
+        }
         let Some(pending) = self.tag_prewarm_pending.as_ref() else {
             return;
         };
