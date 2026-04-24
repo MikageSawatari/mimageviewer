@@ -281,6 +281,8 @@ fn main() -> eframe::Result {
             let mut app = app::App::default();
             emit_startup("app_default", Some(t));
             app.applied_ui_theme = Some(resolved);
+            // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
+            app.hydrate_adjustment_favorite_params();
             // name index supervisor を起動時に spawn (auto_index_structure=true なお気に入り)。
             // IndexerManager::sync_with_favorites がメタ側の対応処理を既に走らせているが、
             // 名前索引は IndexerManager 外の管理なのでここで別途 spawn する。

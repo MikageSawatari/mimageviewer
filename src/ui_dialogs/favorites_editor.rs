@@ -471,6 +471,10 @@ impl App {
             if removed.auto_index_metadata {
                 meta_index_toggles.push((removed.id, false));
             }
+            // 補正のお気に入り標準も即時に掃除する (次回起動時の prune_favorite_params
+            // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
+            // 効いたまま、という不整合を避ける。
+            self.clear_favorite_default(removed.id);
             any_setting_dirty = true;
         }
 

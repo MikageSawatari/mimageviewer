@@ -653,16 +653,29 @@ impl App {
             egui::Color32::WHITE,
         );
 
-        // ── スコープ表示: 標準設定 / 個別設定 ──
+        // ── スコープ表示: 個別 / お気に入り標準 / 標準 ──
         let has_override = self.adjustment_page_params.contains_key(&fs_idx);
+        let fav_default_active = !has_override
+            && self
+                .current_favorite_id_for_idx(fs_idx)
+                .map(|id| self.adjustment_favorite_params.contains_key(&id))
+                .unwrap_or(false);
         let scope_y = panel_rect.min.y + HEADER_H + 4.0;
         let scope_text = if has_override {
-            "個別設定を適用中"
+            "個別設定を適用中".to_string()
+        } else if fav_default_active {
+            let name = self
+                .current_favorite_for_fullscreen()
+                .map(|f| crate::ui_helpers::truncate_name(&f.name, 10))
+                .unwrap_or_default();
+            format!("お気に入り「{}」の標準を適用中", name)
         } else {
-            "標準設定を適用中"
+            "標準設定を適用中".to_string()
         };
         let scope_color = if has_override {
             egui::Color32::from_rgb(220, 180, 80)
+        } else if fav_default_active {
+            egui::Color32::from_rgb(120, 180, 220)
         } else {
             egui::Color32::from_gray(180)
         };
@@ -674,9 +687,9 @@ impl App {
             scope_color,
         );
 
-        // ── アクションボタン (2x2 グリッド) ──
+        // ── アクションボタン (5 行: wide × 4 + 2 カラム × 1) ──
         let buttons_y = scope_y + 20.0;
-        let buttons_h = 28.0 * 2.0 + 4.0; // 2 行分 + 行間マージン
+        let buttons_h = 28.0 * 5.0 + 4.0 * 4.0; // 5 行分 + 行間マージン 4 つ
         let buttons_rect = egui::Rect::from_min_size(
             egui::pos2(panel_rect.min.x + 8.0, buttons_y),
             egui::vec2(panel_rect.width() - 16.0, buttons_h),
@@ -684,27 +697,64 @@ impl App {
         let mut actions_child = child.new_child(egui::UiBuilder::new().max_rect(buttons_rect));
         let mut apply_all_clicked = false;
         let mut clear_all_clicked = false;
+        let mut set_as_favorite_clicked = false;
+        let mut clear_favorite_clicked = false;
         let mut set_as_global_clicked = false;
         let mut clear_page_clicked = false;
+        // 現在フルスクリーン中のページを含むお気に入り (なければ None)
+        let fav_info = self
+            .current_favorite_for_fullscreen()
+            .map(|f| (f.id, f.name.clone()));
+        let fav_display_name = fav_info
+            .as_ref()
+            .map(|(_, n)| crate::ui_helpers::truncate_name(n, 10))
+            .unwrap_or_else(|| "このお気に入り".to_string());
+        let has_favorite_default = fav_info
+            .as_ref()
+            .map(|(id, _)| self.adjustment_favorite_params.contains_key(id))
+            .unwrap_or(false);
+        let under_favorite = fav_info.is_some();
         actions_child.vertical(|ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .small_button("全画像に適用")
-                    .on_hover_text("このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む")
-                    .clicked()
-                {
-                    apply_all_clicked = true;
-                }
-                if ui
-                    .small_button("全画像から削除")
-                    .on_hover_text(
-                        "このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す",
-                    )
-                    .clicked()
-                {
-                    clear_all_clicked = true;
-                }
+            let wide = egui::vec2(panel_rect.width() - 20.0, 24.0);
+            if ui
+                .add(egui::Button::new("このフォルダの全画像に適用").min_size(wide))
+                .on_hover_text("このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む")
+                .clicked()
+            {
+                apply_all_clicked = true;
+            }
+            if ui
+                .add(egui::Button::new("このフォルダの全画像から解除").min_size(wide))
+                .on_hover_text("このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す")
+                .clicked()
+            {
+                clear_all_clicked = true;
+            }
+            // お気に入り行 (名前入り)
+            let set_fav_label = format!("このお気に入り「{}」の標準にする", fav_display_name);
+            let clear_fav_label = format!("このお気に入り「{}」の標準を解除", fav_display_name);
+            let set_fav_resp = ui.add_enabled(
+                under_favorite,
+                egui::Button::new(set_fav_label).min_size(wide),
+            );
+            if set_fav_resp.clicked() {
+                set_as_favorite_clicked = true;
+            }
+            set_fav_resp.on_hover_text(if under_favorite {
+                "このお気に入り配下のページで効く標準設定を、現在のパラメータで上書きする"
+            } else {
+                "お気に入り登録されたフォルダ配下にいるときのみ使用できます"
             });
+            let clear_fav_resp = ui.add_enabled(
+                under_favorite && has_favorite_default,
+                egui::Button::new(clear_fav_label).min_size(wide),
+            );
+            if clear_fav_resp.clicked() {
+                clear_favorite_clicked = true;
+            }
+            clear_fav_resp.on_hover_text(
+                "このお気に入りの標準設定を削除し、アプリ全体の標準設定にフォールバックする",
+            );
             ui.horizontal(|ui| {
                 if ui
                     .small_button("標準にする")
@@ -855,6 +905,25 @@ impl App {
         if clear_all_clicked {
             self.clear_all_page_params();
             self.show_feedback_toast("全画像の個別設定を削除".to_string());
+        }
+        if set_as_favorite_clicked {
+            if let Some((fav_id, fav_name)) = fav_info.clone() {
+                let params = self.effective_params(fs_idx).clone();
+                self.set_favorite_default(fav_id, params);
+                self.show_feedback_toast(format!(
+                    "お気に入り「{}」の標準を更新",
+                    crate::ui_helpers::truncate_name(&fav_name, 10)
+                ));
+            }
+        }
+        if clear_favorite_clicked {
+            if let Some((fav_id, fav_name)) = fav_info.clone() {
+                self.clear_favorite_default(fav_id);
+                self.show_feedback_toast(format!(
+                    "お気に入り「{}」の標準を解除",
+                    crate::ui_helpers::truncate_name(&fav_name, 10)
+                ));
+            }
         }
         if set_as_global_clicked {
             let params = self.effective_params(fs_idx).clone();

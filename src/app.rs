@@ -1532,9 +1532,15 @@ pub struct App {
     /// 補正パネル表示フラグ (左パネルホバーで表示)
     pub(crate) adjustment_mode: bool,
     /// ページ個別の補正パラメータ: item_idx → AdjustParams
-    /// ここに登録されていないページはグローバル (settings.global_preset) が適用される。
+    /// ここに登録されていないページは「お気に入り標準 → グローバル (settings.global_preset)」
+    /// の順でフォールバックする。解決は [`App::effective_params`] に集約。
     pub(crate) adjustment_page_params:
         std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
+    /// 起動時に `adjustment_db.load_all_favorite_params()` から復元。
+    /// 解決は [`App::effective_params`] 参照。
+    pub(crate) adjustment_favorite_params:
+        std::collections::HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
@@ -1925,6 +1931,7 @@ impl Default for App {
             // 画像補正
             adjustment_mode: false,
             adjustment_page_params: std::collections::HashMap::new(),
+            adjustment_favorite_params: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             adjustment_cache: std::collections::HashMap::new(),
             thumb_pixels: std::collections::HashMap::new(),
@@ -2765,7 +2772,7 @@ impl App {
         // 現在地 = スタックの末尾 (深い場所)
         let current = self.favsearch.nav_stack.last().cloned().unwrap();
         // 包含するお気に入り根を探し、その直下からの相対パスを元のケースで組み立てる
-        let segments: Vec<String> = match self.find_favorite_root(&current) {
+        let segments: Vec<String> = match self.find_nearest_favorite(&current).map(|f| f.path.clone()) {
             Some(root) => {
                 let root_name = root
                     .file_name()
@@ -2916,14 +2923,27 @@ impl App {
         self.update_favsearch_address();
     }
 
-    /// `path` を包含するお気に入りのパスを返す (なければ None)。
-    fn find_favorite_root(&self, path: &std::path::Path) -> Option<PathBuf> {
+    /// `path` を包含する最も近いお気に入り (パスが最長一致するもの) を返す。
+    /// ZIP/PDF を開いている最中に呼ぶと ZIP/PDF 本体のパスで判定されるので、
+    /// 仮想フォルダ内ページにもお気に入り標準が適用される。
+    /// 入れ子 (例: `C:\pics` と `C:\pics\AI` が両方登録済み) のときは深い方を優先。
+    pub(crate) fn find_nearest_favorite(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<&crate::settings::FavoriteEntry> {
+        let mut best: Option<&crate::settings::FavoriteEntry> = None;
+        let mut best_len = 0usize;
         for fav in &self.settings.favorites {
-            if crate::search_index_db::is_under(path, &fav.path) {
-                return Some(fav.path.clone());
+            if !crate::search_index_db::is_under(path, &fav.path) {
+                continue;
+            }
+            let len = fav.path.as_os_str().len();
+            if best.is_none() || len > best_len {
+                best = Some(fav);
+                best_len = len;
             }
         }
-        None
+        best
     }
 
     /// タスク 3: ZIP ファイルを仮想フォルダとして開く。
@@ -8628,24 +8648,108 @@ impl App {
         self.fs_feedback_toast = Some((text, std::time::Instant::now()));
     }
 
-    /// 指定ページの有効パラメータへの参照を返す (ページ個別 > グローバルのフォールバック)。
+    /// 指定ページの有効パラメータへの参照を返す。
+    ///
+    /// 解決順:
+    /// 1. `adjustment_page_params[idx]` (ページ個別)
+    /// 2. `adjustment_favorite_params[nearest_fav_id]` (お気に入り単位の標準)
+    /// 3. `settings.global_preset` (全体の標準)
+    ///
     /// 所有権が必要な呼び出し側は `.clone()` する。毎フレーム呼ばれるので無用なクローンを避ける。
     pub(crate) fn effective_params(&self, idx: usize) -> &crate::adjustment::AdjustParams {
-        self.adjustment_page_params
-            .get(&idx)
+        if let Some(p) = self.adjustment_page_params.get(&idx) {
+            return p;
+        }
+        if let Some(p) = self.favorite_default_for_idx(idx) {
+            return p;
+        }
+        &self.settings.global_preset
+    }
+
+    /// 指定 idx のコンテキストにおける「ページ個別を除いた有効パラメータ」。
+    /// 個別設定の冗長判定 (個別を保存する意味があるか) に使う。
+    /// お気に入り配下なら favorite 標準、そうでなければ global。
+    pub(crate) fn effective_default_for_idx(
+        &self,
+        idx: usize,
+    ) -> &crate::adjustment::AdjustParams {
+        self.favorite_default_for_idx(idx)
             .unwrap_or(&self.settings.global_preset)
+    }
+
+    /// 指定 idx が属するお気に入り (最も近い祖先) の標準パラメータへの参照を返す。
+    /// ZIP/PDF ページは ZIP/PDF 本体のパスでお気に入り判定される。
+    fn favorite_default_for_idx(&self, idx: usize) -> Option<&crate::adjustment::AdjustParams> {
+        let fav_id = self.current_favorite_id_for_idx(idx)?;
+        self.adjustment_favorite_params.get(&fav_id)
+    }
+
+    /// 指定 idx が属するお気に入り (最も近い祖先) の id を返す。
+    pub(crate) fn current_favorite_id_for_idx(&self, idx: usize) -> Option<uuid::Uuid> {
+        let item = self.items.get(idx)?;
+        let container_path: std::path::PathBuf = match item {
+            GridItem::Image(p) => p.parent()?.to_path_buf(),
+            GridItem::Video(p) => p.parent()?.to_path_buf(),
+            GridItem::ZipImage { zip_path, .. } => zip_path.clone(),
+            GridItem::PdfPage { pdf_path, .. } => pdf_path.clone(),
+            _ => return None,
+        };
+        self.find_nearest_favorite(&container_path).map(|f| f.id)
+    }
+
+    /// 現在フルスクリーン表示中のページが属するお気に入り (最も近い祖先)。
+    /// UI パネル表示用 (名前の切り出しのために `FavoriteEntry` 丸ごと返す)。
+    pub(crate) fn current_favorite_for_fullscreen(
+        &self,
+    ) -> Option<&crate::settings::FavoriteEntry> {
+        let idx = self.fullscreen_idx?;
+        let fav_id = self.current_favorite_id_for_idx(idx)?;
+        self.settings.favorite_by_id(fav_id)
+    }
+
+    /// U/N/P 補正ショートカットで書き換える対象のスコープを決定する。
+    /// 個別設定 → お気に入り標準 → global の順で最初に存在する層を選ぶ。
+    pub(crate) fn resolve_adjust_scope(
+        &self,
+        fs_idx: usize,
+    ) -> crate::ui_fullscreen::AdjustScope {
+        use crate::ui_fullscreen::AdjustScope;
+        if self.adjustment_page_params.contains_key(&fs_idx) {
+            return AdjustScope::PageOverride;
+        }
+        if let Some(fav_id) = self.current_favorite_id_for_idx(fs_idx) {
+            if self.adjustment_favorite_params.contains_key(&fav_id) {
+                return AdjustScope::FavoriteDefault(fav_id);
+            }
+        }
+        AdjustScope::Global
+    }
+
+    /// `resolve_adjust_scope` で決めたスコープに向けて `params` を書き込む。
+    pub(crate) fn write_params_for_scope(
+        &mut self,
+        fs_idx: usize,
+        scope: crate::ui_fullscreen::AdjustScope,
+        params: crate::adjustment::AdjustParams,
+    ) {
+        use crate::ui_fullscreen::AdjustScope;
+        match scope {
+            AdjustScope::PageOverride => self.set_page_params(fs_idx, params),
+            AdjustScope::FavoriteDefault(id) => self.set_favorite_default(id, params),
+            AdjustScope::Global => self.copy_params_to_global(params),
+        }
     }
 
     /// 指定ページに個別パラメータを書込む (DB にも保存)。
     ///
-    /// `params` がグローバルプリセットと完全一致するなら個別設定として保存しない
-    /// (= フォールバックでグローバルが使われる)。
+    /// `params` が「そのページで効く標準」(= お気に入り標準 or global_preset) と
+    /// 完全一致するなら個別設定として保存しない (= フォールバックで標準が使われる)。
     /// 旧来は `is_removable()` (= identity かつ AI 未使用) で削除判定していたが、
     /// グローバルが AI ON の状態で個別に「AI OFF」を設定したいケースを取りこぼしたため、
-    /// グローバルとの等価比較に変更した。
+    /// 標準との等価比較に変更した。お気に入り標準もこれで同じ扱いになる。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
-        let matches_global = params == self.settings.global_preset;
-        if matches_global {
+        let matches_default = params == *self.effective_default_for_idx(idx);
+        if matches_default {
             self.adjustment_page_params.remove(&idx);
             if let Some(key) = self.page_path_key(idx) {
                 if let Some(db) = &self.adjustment_db {
@@ -8732,22 +8836,27 @@ impl App {
     }
 
     /// 現在の一覧 (フォルダ/ZIP/PDF) の全画像ページに同じパラメータを適用する。
-    /// `params` がグローバルと等価なら個別設定は削除され、全画像が標準設定に戻る。
+    /// `params` がこの一覧の「ページ個別を除いた有効標準」(お気に入り標準 or global_preset) と
+    /// 等価なら個別設定は削除され、全画像がその標準に戻る。
     /// 書換の前後で AI 設定 (upscale/denoise) が変わったページは ai_upscale_cache /
     /// failed / pending もクリアして、次フレームで再実行されるようにする。
     pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
         let (indices, keys) = self.collect_image_page_keys();
         let sidecar_coords = self.collect_image_sidecar_coords();
-        // 書換後の effective params は全画像ページで `params` になる
-        // (matches_global 時は個別削除 → global フォールバック = params、それ以外は params を直接保存)。
+        // 書換後の effective params は全画像ページで `params` になる。
         // 書換前に AI 設定が異なるページを拾っておく。
         let ai_changed_indices: Vec<usize> = indices
             .iter()
             .copied()
             .filter(|idx| !self.effective_params(*idx).ai_settings_eq(&params))
             .collect();
-        let matches_global = params == self.settings.global_preset;
-        if matches_global {
+        // 一覧内の画像は同じコンテナに属する = 同じ「お気に入り or global」標準を共有する。
+        // 先頭 idx の標準で代表させて matches_default を判定する。
+        let matches_default = indices
+            .first()
+            .map(|&idx| params == *self.effective_default_for_idx(idx))
+            .unwrap_or_else(|| params == self.settings.global_preset);
+        if matches_default {
             for idx in &indices {
                 self.adjustment_page_params.remove(idx);
             }
@@ -8777,15 +8886,19 @@ impl App {
     }
 
     /// 現在の一覧の全画像ページから個別設定を削除する (= 全画像を標準設定に戻す)。
-    /// 個別解除で AI 設定が global に戻って変わるページは AI キャッシュもクリアする。
+    /// ここでいう「標準」はこの一覧のコンテナに対応するお気に入り標準 or global_preset。
+    /// 個別解除で AI 設定が標準に戻って変わるページは AI キャッシュもクリアする。
     pub(crate) fn clear_all_page_params(&mut self) {
         let (indices, keys) = self.collect_image_page_keys();
         let sidecar_coords = self.collect_image_sidecar_coords();
-        let global = self.settings.global_preset.clone();
+        let default_params = indices
+            .first()
+            .map(|&idx| self.effective_default_for_idx(idx).clone())
+            .unwrap_or_else(|| self.settings.global_preset.clone());
         let ai_changed_indices: Vec<usize> = indices
             .iter()
             .copied()
-            .filter(|idx| !self.effective_params(*idx).ai_settings_eq(&global))
+            .filter(|idx| !self.effective_params(*idx).ai_settings_eq(&default_params))
             .collect();
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
@@ -8802,31 +8915,138 @@ impl App {
         self.clear_ai_caches_for_indices(&ai_changed_indices);
     }
 
+    /// 指定述語にマッチする画像ページ (Image / ZipImage / PdfPage) で個別設定を持たない
+    /// idx を集める。`copy_params_to_global` / `set_favorite_default` /
+    /// `clear_favorite_default` が「標準設定側を書き換えたときに AI 再実行が必要なページ」を
+    /// 拾うために使う共通ヘルパー。
+    fn image_idx_inheriting_default<F>(&self, favorite_pred: F) -> Vec<usize>
+    where
+        F: Fn(&Self, usize) -> bool,
+    {
+        (0..self.items.len())
+            .filter(|idx| {
+                matches!(
+                    self.items.get(*idx),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::PdfPage { .. })
+                ) && !self.adjustment_page_params.contains_key(idx)
+                    && favorite_pred(self, *idx)
+            })
+            .collect()
+    }
+
     /// 指定パラメータを settings.global_preset にコピーして保存する。
     /// global の AI 設定が変わった場合、個別設定を持たない (= global を継承している)
     /// 画像ページの AI キャッシュもクリアして、新 global での再実行を促す。
     pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
         let ai_changed = !self.settings.global_preset.ai_settings_eq(&params);
         let ai_changed_indices: Vec<usize> = if ai_changed {
-            (0..self.items.len())
-                .filter(|idx| {
-                    matches!(
-                        self.items.get(*idx),
-                        Some(GridItem::Image(_))
-                            | Some(GridItem::ZipImage { .. })
-                            | Some(GridItem::PdfPage { .. })
-                    ) && !self.adjustment_page_params.contains_key(idx)
-                })
-                .collect()
+            // global を継承しているページ (個別 / お気に入り標準のどちらもない) だけ影響
+            self.image_idx_inheriting_default(|app, idx| {
+                app.favorite_default_for_idx(idx).is_none()
+            })
         } else {
             Vec::new()
         };
         self.settings.global_preset = params;
         self.settings.save();
-        // グローバルが変わると、ページ個別を持たないページの表示が変わる。
-        // サムネ側も override 有無を判別するより全クリア → visible 優先で再生成が単純。
         self.clear_all_color_caches();
         self.clear_ai_caches_for_indices(&ai_changed_indices);
+    }
+
+    /// お気に入り単位の標準設定を変更する共通パス。
+    /// `new_value = Some(params)` で設定、`None` で削除。
+    fn apply_favorite_change(
+        &mut self,
+        favorite_id: uuid::Uuid,
+        new_value: Option<crate::adjustment::AdjustParams>,
+    ) {
+        let old = self.adjustment_favorite_params.get(&favorite_id).cloned();
+        let new_effective = new_value
+            .clone()
+            .unwrap_or_else(|| self.settings.global_preset.clone());
+        let old_effective = old.unwrap_or_else(|| self.settings.global_preset.clone());
+        let ai_changed = !old_effective.ai_settings_eq(&new_effective);
+        let ai_changed_indices: Vec<usize> = if ai_changed {
+            // このお気に入り傘下かつ個別設定なしのページのみ AI 影響あり
+            self.image_idx_inheriting_default(|app, idx| {
+                app.current_favorite_id_for_idx(idx) == Some(favorite_id)
+            })
+        } else {
+            Vec::new()
+        };
+        match &new_value {
+            Some(p) => {
+                self.adjustment_favorite_params.insert(favorite_id, p.clone());
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.set_favorite_params(favorite_id, p);
+                }
+            }
+            None => {
+                self.adjustment_favorite_params.remove(&favorite_id);
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.remove_favorite_params(favorite_id);
+                }
+            }
+        }
+        // 標準が動いた後、このお気に入り傘下で個別設定が新標準と一致するページは冗長。
+        // set_page_params と同じ不変条件 (個別 == effective_default なら個別削除) を
+        // 維持する。これをやらないと「このお気に入りの標準にする」押下後もページが
+        // PageOverride スコープに残り、スコープ表示や U/N/P ショートカットの挙動が
+        // 想定外になる (Codex P2 指摘)。
+        let redundant: Vec<usize> = (0..self.items.len())
+            .filter(|idx| {
+                self.adjustment_page_params
+                    .get(idx)
+                    .is_some_and(|p| p == &new_effective)
+                    && self.current_favorite_id_for_idx(*idx) == Some(favorite_id)
+            })
+            .collect();
+        for idx in redundant {
+            self.adjustment_page_params.remove(&idx);
+            if let Some(key) = self.page_path_key(idx) {
+                if let Some(db) = &self.adjustment_db {
+                    let _ = db.remove_page_params(&key);
+                }
+            }
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
+        }
+        self.clear_all_color_caches();
+        self.clear_ai_caches_for_indices(&ai_changed_indices);
+    }
+
+    /// 指定パラメータをお気に入りの標準設定として保存する。
+    /// そのお気に入り配下で、個別設定を持たないページの表示が新しい標準に切り替わる。
+    pub(crate) fn set_favorite_default(
+        &mut self,
+        favorite_id: uuid::Uuid,
+        params: crate::adjustment::AdjustParams,
+    ) {
+        self.apply_favorite_change(favorite_id, Some(params));
+    }
+
+    /// お気に入りの標準設定を解除する (= そのお気に入りでは global_preset にフォールバック)。
+    pub(crate) fn clear_favorite_default(&mut self, favorite_id: uuid::Uuid) {
+        self.apply_favorite_change(favorite_id, None);
+    }
+
+    /// 起動時に `adjustment_db` からお気に入り標準を全件ロードし、
+    /// `settings.favorites` に存在しない orphan 行を掃除する。
+    /// main.rs の `App::default()` 直後で 1 回呼ばれる。
+    pub(crate) fn hydrate_adjustment_favorite_params(&mut self) {
+        let Some(db) = &self.adjustment_db else {
+            return;
+        };
+        self.adjustment_favorite_params = db.load_all_favorite_params();
+        let keep: std::collections::HashSet<uuid::Uuid> =
+            self.settings.favorites.iter().map(|f| f.id).collect();
+        if let Ok(removed) = db.prune_favorite_params(&keep) {
+            if removed > 0 {
+                self.adjustment_favorite_params
+                    .retain(|id, _| keep.contains(id));
+            }
+        }
     }
 
     /// 保存スロット slot_idx のパラメータを現在のフルスクリーンページに適用する。
@@ -8979,9 +9199,13 @@ impl App {
         // AI 完了時に poll_ai_upscale が adjustment_cache を無効化し、AI 結果で再生成する。
         // これがないと AI 完了まで「補正前の fs_cache」がそのまま表示され、
         // 完了瞬間に補正適用で濃度が跳ねて見えてしまう。
-        // 短絡: 個別設定なし かつ グローバルが identity なら何もしない
+        // 短絡: 個別設定なし かつ グローバルが identity かつ お気に入り標準なし なら何もしない。
+        // 順序はコスト昇順: HashMap 参照 → global_preset 構造体参照 → favorite 解決 (path 正規化)。
+        // `favorite_default_for_idx` は path 正規化+ `find_nearest_favorite` のループで
+        // 一番重いので、`&&` の短絡で前段の cheap 条件が外れたときにスキップされるようにする。
         if !self.adjustment_page_params.contains_key(&idx)
             && self.settings.global_preset.is_identity()
+            && self.favorite_default_for_idx(idx).is_none()
         {
             return;
         }
@@ -12071,6 +12295,188 @@ mod phase_c_drill_address_tests {
             !app.address.starts_with("d:/"),
             "Aggregated 中は raw path が入ってはならない: {}",
             app.address
+        );
+    }
+}
+
+/// 補正パラメータのお気に入り単位標準 (v0.8.1) に関する回帰テスト。
+///
+/// 3 層カスケード (個別 → お気に入り → global)、入れ子時の nearest-favorite 優先、
+/// `resolve_adjust_scope` によるスコープ判定、`set_favorite_default` で冗長な個別設定が
+/// 自動的に解除されること (Codex P2) を担保する。
+#[cfg(test)]
+mod favorite_adjustment_defaults_tests {
+    use super::*;
+    use super::phase_c_support::setup_app;
+    use crate::adjustment::AdjustParams;
+    use crate::settings::FavoriteEntry;
+    use crate::ui_fullscreen::AdjustScope;
+    use std::path::PathBuf;
+
+    /// テスト用: 画像 1 枚だけを items に詰めて idx 0 を返す。
+    fn push_image(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
+    fn params_with_brightness(v: f32) -> AdjustParams {
+        let mut p = AdjustParams::default();
+        p.brightness = v;
+        p
+    }
+
+    /// effective_params は「個別 → お気に入り → global」の順で解決する。
+    #[test]
+    fn cascade_individual_beats_favorite_beats_global() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("test".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 初期状態: global
+        app.settings.global_preset = params_with_brightness(5.0);
+        assert_eq!(app.effective_params(idx).brightness, 5.0);
+
+        // お気に入り標準を入れる → 優先
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(20.0));
+        assert_eq!(app.effective_params(idx).brightness, 20.0);
+
+        // 個別設定を入れる → 最優先
+        app.adjustment_page_params.insert(idx, params_with_brightness(50.0));
+        assert_eq!(app.effective_params(idx).brightness, 50.0);
+
+        // 個別解除 → お気に入り、お気に入り解除 → global に戻る
+        app.adjustment_page_params.remove(&idx);
+        assert_eq!(app.effective_params(idx).brightness, 20.0);
+        app.adjustment_favorite_params.remove(&fav_id);
+        assert_eq!(app.effective_params(idx).brightness, 5.0);
+    }
+
+    /// 入れ子お気に入りでは最も近い祖先 (パス最長) が優先される。
+    #[test]
+    fn nested_favorite_picks_nearest_ancestor() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
+        let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/ai"));
+        let inner_id = inner.id;
+        app.settings.favorites.push(outer);
+        app.settings.favorites.push(inner);
+
+        let idx = push_image(&mut app, "C:/pics/ai/gen.jpg");
+        let nearest = app.current_favorite_id_for_idx(idx);
+        assert_eq!(
+            nearest,
+            Some(inner_id),
+            "深い方のお気に入りが優先されるべき"
+        );
+    }
+
+    /// resolve_adjust_scope は個別 > favorite > global の順に層を報告する。
+    #[test]
+    fn resolve_adjust_scope_picks_effective_layer() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(10.0));
+        assert!(
+            matches!(app.resolve_adjust_scope(idx), AdjustScope::FavoriteDefault(id) if id == fav_id)
+        );
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(30.0));
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+    }
+
+    /// set_favorite_default 直後に、ちょうど同じ値の個別設定を持っていたページは
+    /// 冗長なので自動的に解除され、スコープは FavoriteDefault になる (Codex P2 回帰)。
+    #[test]
+    fn set_favorite_default_collapses_redundant_page_override() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 個別に brightness=25 を設定 (= これから新しい favorite 標準にしたい値)
+        let custom = params_with_brightness(25.0);
+        app.adjustment_page_params.insert(idx, custom.clone());
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+
+        // 「このお気に入りの標準にする」と同じ操作
+        app.set_favorite_default(fav_id, custom);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "新 favorite 標準と一致する個別は解除されるべき"
+        );
+        assert!(
+            matches!(
+                app.resolve_adjust_scope(idx),
+                AdjustScope::FavoriteDefault(id) if id == fav_id
+            ),
+            "scope は FavoriteDefault に正規化されるべき"
+        );
+    }
+
+    /// clear_favorite_default でそのお気に入り配下の、global と同値な個別もまとめて解除される。
+    #[test]
+    fn clear_favorite_default_collapses_overrides_matching_global() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // favorite 標準 = 20, global = 5, 個別 = 5 (= global)
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(20.0));
+        app.adjustment_page_params.insert(idx, params_with_brightness(5.0));
+
+        // favorite 未設定のとき effective_default は global なので、個別は当初から冗長
+        // (ただし UI 経路では set_page_params が弾くのでここでは手動 insert)。
+        // favorite 解除後は「global が新しい default」に戻り、同値の個別は冗長になる。
+        app.clear_favorite_default(fav_id);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "clear 後、新 default (global) と一致する個別は解除されるべき"
+        );
+    }
+
+    /// set_page_params は新 3 層カスケード用の「effective_default_for_idx」との等価比較で
+    /// 冗長判定を行う。お気に入り標準と一致する params を渡しても個別は作られない。
+    #[test]
+    fn set_page_params_drops_individual_when_matching_favorite_default() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        let fav_default = params_with_brightness(15.0);
+        app.adjustment_favorite_params.insert(fav_id, fav_default.clone());
+
+        // 個別を入れてから、favorite と同値を書く → 削除される
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(99.0));
+        app.set_page_params(idx, fav_default);
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "favorite 標準と等価な個別は保存しないべき"
         );
     }
 }

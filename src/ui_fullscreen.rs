@@ -49,13 +49,25 @@ const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
 const CHECKER_TILE_PX: f32 = 16.0;
 
-/// 補正ショートカット (U/P/N) のトースト表示でスコープを示すラベル。
-#[inline]
-fn scope_label(has_page_override: bool) -> &'static str {
-    if has_page_override {
-        "個別"
-    } else {
-        "標準"
+/// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
+/// 解決 (`App::resolve_adjust_scope`) と書き込み (`App::write_params_for_scope`) は
+/// App 側にメソッドとして実装され、ここには enum 定義とラベルだけ置く。
+#[derive(Clone, Copy)]
+pub(crate) enum AdjustScope {
+    PageOverride,
+    FavoriteDefault(uuid::Uuid),
+    Global,
+}
+
+impl AdjustScope {
+    /// トースト表示用ラベル。
+    #[inline]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AdjustScope::PageOverride => "個別",
+            AdjustScope::FavoriteDefault(_) => "お気に入り",
+            AdjustScope::Global => "標準",
+        }
     }
 }
 
@@ -1467,9 +1479,9 @@ impl App {
         }
 
         // U キー: AI アップスケールモデルをサイクル
-        // 現在ページに個別設定があれば個別を書き換え、無ければ標準設定 (global_preset) を書き換える。
+        // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         if key_u || key_u_shift || key_u_alt {
-            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+            let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let items = crate::adjustment::upscale_menu_items();
             let cur = items
@@ -1490,43 +1502,33 @@ impl App {
             };
             let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
-            let scope = scope_label(has_page_override);
-            self.show_feedback_toast(format!("[U:{}アップスケール {}]", scope, label));
-            if has_page_override {
-                self.set_page_params(fs_idx, params);
-            } else {
-                self.copy_params_to_global(params);
-            }
+            self.show_feedback_toast(format!("[U:{}アップスケール {}]", scope.label(), label));
+            self.write_params_for_scope(fs_idx, scope, params);
             self.clear_all_adjustment_and_ai_caches(fs_idx);
         }
 
         // N キー: AI デノイズをトグル
-        // 現在ページに個別設定があれば個別を書き換え、無ければ標準設定 (global_preset) を書き換える。
+        // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         if key_n {
-            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+            let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
-            let scope = scope_label(has_page_override);
             if params.denoise_model.is_some() {
                 params.denoise_model = None;
-                self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope));
+                self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope.label()));
             } else {
                 params.denoise_model =
                     Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
-                self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope));
+                self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope.label()));
             }
-            if has_page_override {
-                self.set_page_params(fs_idx, params);
-            } else {
-                self.copy_params_to_global(params);
-            }
+            self.write_params_for_scope(fs_idx, scope, params);
             self.clear_all_adjustment_and_ai_caches(fs_idx);
         }
 
         // P / Shift+P / Alt+P: ポストフィルタの次/前/なしへ切替。
-        // 現在ページに個別設定があれば個別を書き換え、無ければ標準 (global_preset) を書き換える。
-        // AI 再実行は発生させないため clear_adjustment_caches のみ使う。
+        // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
+        // AI 再実行は発生させないため色調キャッシュのみクリア。
         if key_p || key_p_shift || key_p_alt {
-            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+            let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let all = crate::adjustment::PostFilter::ALL;
             let cur = all
@@ -1543,14 +1545,16 @@ impl App {
             };
             let next = all[next_idx];
             params.post_filter = next;
-            let scope = scope_label(has_page_override);
-            self.show_feedback_toast(format!("[P: {} / {}]", scope, next.display_label()));
-            if has_page_override {
-                self.set_page_params(fs_idx, params);
-                self.clear_adjustment_caches(fs_idx);
-            } else {
-                // copy_params_to_global は adjustment_cache を全クリアする
-                self.copy_params_to_global(params);
+            self.show_feedback_toast(format!(
+                "[P: {} / {}]",
+                scope.label(),
+                next.display_label()
+            ));
+            self.write_params_for_scope(fs_idx, scope, params);
+            match scope {
+                AdjustScope::PageOverride => self.clear_adjustment_caches(fs_idx),
+                // set_favorite_default / copy_params_to_global は内部で clear_all_color_caches 済み
+                AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
             }
         }
 

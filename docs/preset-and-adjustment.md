@@ -5,14 +5,15 @@
 
 ---
 
-## 1. スコープ (v0.6.0 で簡素化)
+## 1. スコープ (v0.8.1 で 3 層化)
 
-補正パラメータは **2 スコープ + 10 スロット** で構成される:
+補正パラメータは **3 スコープ + 10 スロット** で構成される:
 
 ```
 スコープ              保存先
 ────────────────────────────────────────────────
 グローバル            settings.json の global_preset
+お気に入り標準        adjustment.db の favorite_params テーブル (favorite_id TEXT PK)
 ページ個別            adjustment.db の page_params テーブル
 
 保存スロット 0〜9     settings.json の preset_slots  (独立)
@@ -23,16 +24,34 @@
 旧テーブル `presets` / `page_presets` を `DROP TABLE IF EXISTS` で破棄し、
 新しい `page_params(page_path TEXT PK, params_json TEXT)` を作成する。
 
+v0.8.1 で「お気に入り単位の標準 (favorite_params)」を追加した。フォルダ単位より粗く・
+グローバルより細かい中間層で、用途別 (スキャン画像 / AI 生成 / カメラ写真 / Twitter DL など)
+に既定を切り替えたい要件に応える。
+
 ### 1.1 有効パラメータの決定
 
-表示時のページ `idx` の有効パラメータは:
+表示時のページ `idx` の有効パラメータは 3 層のカスケードで決まる:
 
 ```
-effective = adjustment_page_params.get(idx) ?? settings.global_preset
+effective =
+    adjustment_page_params.get(idx)
+      ?? adjustment_favorite_params.get(nearest_favorite_id_of(container(idx)))
+      ?? settings.global_preset
 ```
+
+解決は `App::effective_params(idx)` に集約される。お気に入り層のルックアップには
+`App::current_favorite_id_for_idx(idx)` → `App::find_nearest_favorite(container_path)`
+を使う。**最も近い祖先** (パス最長一致) を選ぶため、ネスト登録されたお気に入り
+(例: `G:\pics` と `G:\pics\AI` が両方登録されている) のときは `G:\pics\AI` が優先される。
+
+ZIP/PDF を開いている最中は `container(idx)` が ZIP/PDF 本体のパスになるため、
+「AI 生成画像」お気に入り配下の ZIP 内ページにもそのお気に入り標準が自動適用される。
 
 `adjustment_page_params: HashMap<usize, AdjustParams>` はフォルダ/ZIP/PDF ロード時に
 `AdjustmentDb::load_page_params(prefix)` で一括読込される。
+`adjustment_favorite_params: HashMap<Uuid, AdjustParams>` は **起動時に 1 回**
+(`App::hydrate_adjustment_favorite_params`) 全件ロードされ、
+`settings.favorites` に存在しない orphan 行は `prune_favorite_params` で掃除される。
 
 ### 1.2 自動個別化
 
@@ -40,25 +59,34 @@ effective = adjustment_page_params.get(idx) ?? settings.global_preset
 `AdjustParams` が「現在のページ個別パラメータ」として書き込まれる
 (`App::set_page_params(idx, params)`)。スコープ切替という明示操作は存在しない。
 
-`set_page_params` は **「個別パラメータがグローバルプリセットと完全一致」** したときだけ
-個別レコードを削除する (フォールバックでグローバルが使われるため保存不要)。
+`set_page_params` は **「個別パラメータが `effective_default_for_idx(idx)` (= お気に入り標準
+があればそれ、なければグローバル) と完全一致」** したときだけ個別レコードを削除する
+(フォールバックでその標準が使われるため保存不要)。v0.8.1 以前はグローバル
+との等価比較だったが、お気に入り標準が登場したのでそこに切り替えた。
+
 旧バージョンは `is_removable()` (= identity かつ AI 未使用) で削除判定していたが、
 **「グローバルが AI ON、特定ページだけ AI OFF」のような上書き** を保存した直後に
 個別が消えてしまい、ユーザの意図 (デノイズ OFF など) が反映されない不具合があった。
-グローバルとの等価比較に変更した時点で、DB 側 (`AdjustmentDb::set_page_params`) の
-`is_removable` 判定も廃止し、呼び出し側 (`App::set_page_params`) で
-削除/保存の振り分けを行う構造になった。
+同じ原理で、「お気に入り標準が AI ON、特定ページだけ AI OFF」も `effective_default_for_idx`
+との等価比較によって保存される。DB 側 (`AdjustmentDb::set_page_params`) の
+`is_removable` 判定は廃止済みで、呼び出し側 (`App::set_page_params`) で
+削除/保存の振り分けを行う構造になっている。
 
 ### 1.3 アクションボタン
 
-補正パネルに 3 つのボタンがある:
+補正パネルに 6 つのボタンがある (v0.8.1):
 
 | ボタン | 動作 |
 | --- | --- |
-| 全画像に適用 | 現在のパラメータを、現フォルダ/ZIP/PDF の全画像ページに一括書込 (`apply_params_to_all_pages`)。色調のみの一斉調整に使う |
-| 全画像から削除 | 現フォルダ/ZIP/PDF の全画像ページから個別設定を削除 (`clear_all_page_params`)。「全画像に適用」の取り消し |
-| 標準にする | 現在のパラメータを `settings.global_preset` にコピー (`copy_params_to_global`)。全フォルダ共通の既定値を更新する |
-| 個別設定を解除 | 現ページの個別レコードを削除 (`clear_page_params`)。標準設定に戻す。フルスクリーンは `Q` / `Ctrl+Backspace`、グリッドも `Q` / `Ctrl+Backspace` でチェック済み (なければ選択 1 件) に一括適用可能 (`clear_page_params_for_selection`) |
+| このフォルダの全画像に適用 | 現在のパラメータを、現フォルダ/ZIP/PDF の全画像ページに一括書込 (`apply_params_to_all_pages`)。`matches_default` 判定はその一覧の先頭 idx の `effective_default_for_idx` で代表する (一覧内は同じコンテナに属するため同じ標準を共有する) |
+| このフォルダの全画像から解除 | 現フォルダ/ZIP/PDF の全画像ページから個別設定を削除 (`clear_all_page_params`)。個別を解除するとお気に入り標準 or グローバルにフォールバック |
+| このお気に入り「{name}」の標準にする | 現在のパラメータをそのお気に入りの標準として保存 (`set_favorite_default`)。お気に入り登録フォルダ配下にいないとき disabled |
+| このお気に入り「{name}」の標準を解除 | そのお気に入りの標準を削除 (`clear_favorite_default`)。以後そのお気に入りはグローバルにフォールバック。未登録のとき disabled |
+| 標準にする | 現在のパラメータを `settings.global_preset` にコピー (`copy_params_to_global`) |
+| 個別設定を解除 [Q] | 現ページの個別レコードを削除 (`clear_page_params`)。フォールバックで「お気に入り標準 → グローバル」の順にマッチしたものが効く。フルスクリーン・グリッドとも `Q` / `Ctrl+Backspace`、グリッドはチェック済み (なければ選択 1 件) に一括適用可能 (`clear_page_params_for_selection`) |
+
+ボタンラベル内の `{name}` は `ui_helpers::truncate_name(name, 10)` で 10 文字に切り詰める。
+スコープ表示 (ヘッダー直下) も同様に 3 種類: `個別設定を適用中` / `お気に入り「{name}」の標準を適用中` / `標準設定を適用中`。
 
 ### 1.4 保存スロット
 
@@ -307,14 +335,19 @@ fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
 再実行されない」という不具合になる (実際、`ui_fullscreen.rs` から
 `Ctrl+Backspace` で解除した直後に上記不具合が発生していた)。
 
-同じ考え方を bulk / global 系にも横展開している:
+同じ考え方を bulk / global / favorite 系にも横展開している:
 - `apply_params_to_all_pages(params)`: 書換前の各 idx の effective params と
   `params` を `ai_settings_eq` で比較し、一致しない idx だけ AI キャッシュを落とす。
-- `clear_all_page_params()`: 個別削除後の effective params は global_preset になるため、
-  書換前の effective params と global を比較して差がある idx だけ落とす。
+- `clear_all_page_params()`: 個別削除後の effective params は `effective_default_for_idx`
+  (お気に入り標準 or global_preset) になるため、書換前の effective params とその標準を
+  比較して差がある idx だけ落とす。
 - `copy_params_to_global(params)`: 旧 global と新 `params` を比較し、AI 設定が
-  変わった場合のみ「override を持たない (= global 継承) 画像ページ」を対象に落とす。
-  override を持つページは effective params が変わらないので触らない。
+  変わった場合のみ「個別 / お気に入り標準のどちらも持たない (= global 継承) 画像ページ」を
+  対象に落とす。個別やお気に入り標準を持つページは effective params が変わらないので触らない。
+- `set_favorite_default(fav_id, params)`: 旧そのお気に入り標準 (無ければ global) と新 `params`
+  を比較し、AI 設定が変わった場合のみ「そのお気に入り傘下かつ個別を持たないページ」を対象に落とす。
+- `clear_favorite_default(fav_id)`: 削除後は global にフォールバックするため、旧そのお気に入り
+  標準と global を比較して差がある場合、同じ対象範囲で落とす。
 
 ---
 

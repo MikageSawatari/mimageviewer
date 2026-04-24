@@ -4,8 +4,10 @@
 //! 旧 (v0.6.0 開発版) の `presets` テーブル / preset_idx 方式は廃止。
 //! 表示時の有効パラメータは `page_params.get(page) ?? settings.global_preset`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use uuid::Uuid;
 
 use crate::adjustment::AdjustParams;
 
@@ -64,6 +66,16 @@ impl AdjustmentDb {
             "CREATE TABLE IF NOT EXISTS sidecar_sync (
                 folder_key    TEXT PRIMARY KEY,
                 sidecar_mtime INTEGER NOT NULL
+             );",
+        )?;
+
+        // お気に入り単位の標準パラメータ。
+        // 削除済みお気に入りの行は残っても解決で `find_nearest_favorite` が None を返すため
+        // 無害。起動時に `prune_favorite_params` で掃除する。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS favorite_params (
+                favorite_id TEXT PRIMARY KEY,
+                params_json TEXT NOT NULL
              );",
         )?;
         Ok(Self { conn })
@@ -179,6 +191,85 @@ impl AdjustmentDb {
         Ok(())
     }
 
+    // ── お気に入り単位の標準パラメータ ─────────────────────────────
+
+    /// 全お気に入りの標準パラメータを読み込む (起動時に 1 回)。
+    pub fn load_all_favorite_params(&self) -> HashMap<Uuid, AdjustParams> {
+        let mut map = HashMap::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT favorite_id, params_json FROM favorite_params")
+        else {
+            return map;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let json: String = row.get(1)?;
+            Ok((id, json))
+        }) else {
+            return map;
+        };
+        for row in rows.flatten() {
+            if let (Ok(id), Ok(params)) = (
+                Uuid::parse_str(&row.0),
+                serde_json::from_str::<AdjustParams>(&row.1),
+            ) {
+                map.insert(id, params);
+            }
+        }
+        map
+    }
+
+    /// お気に入りの標準パラメータを書き込む。
+    pub fn set_favorite_params(
+        &self,
+        favorite_id: Uuid,
+        params: &AdjustParams,
+    ) -> Result<(), rusqlite::Error> {
+        let json = serde_json::to_string(params).unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO favorite_params (favorite_id, params_json) VALUES (?1, ?2)
+             ON CONFLICT(favorite_id) DO UPDATE SET params_json = ?2",
+            rusqlite::params![favorite_id.to_string(), json],
+        )?;
+        Ok(())
+    }
+
+    /// お気に入りの標準パラメータを削除する。
+    pub fn remove_favorite_params(&self, favorite_id: Uuid) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM favorite_params WHERE favorite_id = ?1",
+            [favorite_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// `keep` に含まれない favorite_id の行を削除する (起動時 orphan cleanup)。
+    /// お気に入りが削除された後もロジック上は無害だが、DB が肥大化しないよう定期的に掃除する。
+    pub fn prune_favorite_params(&self, keep: &HashSet<Uuid>) -> Result<usize, rusqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT favorite_id FROM favorite_params")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+        let mut removed = 0usize;
+        for id_str in rows {
+            let remove = match Uuid::parse_str(&id_str) {
+                Ok(id) => !keep.contains(&id),
+                Err(_) => true, // 破損した ID は掃除する
+            };
+            if remove {
+                self.conn.execute(
+                    "DELETE FROM favorite_params WHERE favorite_id = ?1",
+                    [&id_str],
+                )?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// コンテナ配下の全ページ個別パラメータを一括読込する。
     /// `prefix` はコンテナパスの正規化文字列。
     pub fn load_page_params(&self, prefix: &str) -> HashMap<String, AdjustParams> {
@@ -247,5 +338,45 @@ mod tests {
         // 明示削除すれば消える
         db.remove_page_params(page).unwrap();
         assert!(db.get_page_params(page).is_none());
+    }
+
+    #[test]
+    fn db_favorite_params_roundtrip_and_prune() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mimageviewer_fav_params_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let db = AdjustmentDb::open_at(&tmp).unwrap();
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut pa = AdjustParams::default();
+        pa.brightness = 10.0;
+        let mut pb = AdjustParams::default();
+        pb.saturation = 20.0;
+
+        db.set_favorite_params(a, &pa).unwrap();
+        db.set_favorite_params(b, &pb).unwrap();
+        let loaded = db.load_all_favorite_params();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(&a).unwrap().brightness, 10.0);
+        assert_eq!(loaded.get(&b).unwrap().saturation, 20.0);
+
+        // b だけ残す → a は prune 対象
+        let mut keep = HashSet::new();
+        keep.insert(b);
+        let removed = db.prune_favorite_params(&keep).unwrap();
+        assert_eq!(removed, 1);
+        let loaded = db.load_all_favorite_params();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key(&b));
+        assert!(!loaded.contains_key(&a));
+
+        // 明示削除
+        db.remove_favorite_params(b).unwrap();
+        assert!(db.load_all_favorite_params().is_empty());
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
