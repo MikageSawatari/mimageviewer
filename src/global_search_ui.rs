@@ -695,47 +695,21 @@ impl App {
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel();
         }
+        // items_generation bump + thumbnails 初期化を一箇所に集約。
+        // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
+        // 世代不一致チェックで破棄される。
         self.install_new_items(items, image_metas);
         self.selected = None;
-        self.checked.clear();
-        self.requested.clear();
-        self.pending_finalize.clear();
-        self.keep_range = (0, 0);
-        // 旧 items 参照の値は意味を失うので metadata / exif / xmp / rotation / rating
-        // のキャッシュもリセットする (idx ベース)。
+        // idx ベース状態 + キュー排水 (requested / pending_finalize / texture_backlog /
+        // keep_* / rotation / rating / adjustment / thumb_pixels / ai_* / fs_* /
+        // reload_queue / heavy_io_queue) を一括破棄。
+        self.invalidate_idx_state_and_queues();
+        // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
-        self.rotation_cache.clear();
-        self.rating_cache.clear();
-        // ── フルスクリーン向け idx キャッシュもリセット ──
-        // Ctrl+G 絞り込みビュー遷移をフルスクリーンを開いたまま行うと、
-        // fs_cache / fs_pending / ai_upscale_cache が古い items の idx のまま残り、
-        // open_fullscreen(new_idx) がキャッシュヒットして前コンテナの画像を表示する
-        // バグになる。idx ベースのキャッシュ全般を強制無効化する。
-        for (cancel, _, _) in self.fs_pending.values() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        self.fs_pending.clear();
-        self.fs_early_dims.clear();
-        self.fs_cache.clear();
-        self.fs_upload_backlog.clear();
-        for (cancel, _) in self.ai_upscale_pending.values() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        self.ai_upscale_pending.clear();
-        self.ai_upscale_cache.clear();
-        self.ai_upscale_failed.clear();
-        self.ai_classify_cache.clear();
-        self.erase_base_cache.clear();
-        // 補正・マスクも idx ベースなのでリセット
-        self.adjustment_cache.clear();
-        self.adjustment_page_params.clear();
-        self.mask_pages.clear();
-        self.thumb_pixels.clear();
-        self.thumb_adjust_tex.clear();
-        self.rotation_cache.clear();
-        // Codex P2-1: Ctrl+F フィルタの残留を解除
+        self.tags_cache.clear();
+        // Ctrl+F フィルタの残留を解除 (Ctrl+G と共存させない)
         self.search_filter = None;
         self.search_query.clear();
         self.scroll_offset_y = 0.0;

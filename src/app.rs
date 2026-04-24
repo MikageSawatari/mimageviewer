@@ -3716,6 +3716,130 @@ impl App {
         self.items_generation = self.items_generation.wrapping_add(1);
     }
 
+    /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
+    ///
+    /// 呼び出し元: `remove_item_session` (削除による idx シフト) と
+    /// `replace_search_view_items` (Ctrl+G 結果差し替え)。事前条件として
+    /// 呼び出し側で `items_generation` の bump 済みであること (そうしないと
+    /// 旧ワーカーの `ThumbMsg` が新 items の同じ idx に着地してサムネが化ける)。
+    ///
+    /// クリーンアップ内容:
+    /// - requested / pending_finalize / texture_backlog / fs_upload_backlog: idx を含む
+    ///   キューイング状態
+    /// - keep_range / keep_set / keep_start_shared / keep_end_shared: ワーカーの
+    ///   in_range 判定境界。新しい update_keep_range_and_requests が次フレームで
+    ///   正しい値を入れ直すまで保守的に 0 にしておく
+    /// - idx-keyed HashMap 群 (rotation / rating / adjustment / thumb_pixels / ai_* / fs_*)
+    /// - in-flight pending (fs_pending / ai_upscale_pending) のキャンセル
+    /// - reload_queue / heavy_io_queue の排水: 旧 idx 向け重い I/O (ZIP/PDF/Folder 代表画)
+    ///   が worker スロットを占有し続けるのを防ぐ。次フレームの
+    ///   `update_keep_range_and_requests` が新 items に対応した request を再投入する
+    ///
+    /// items / thumbnails / image_metas / search_filter / selected / checked /
+    /// scroll_offset_y / visible_indices / path-keyed キャッシュは呼び出し元の責務。
+    pub(crate) fn invalidate_idx_state_and_queues(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.requested.clear();
+        self.pending_finalize.clear();
+        self.texture_backlog.clear();
+        self.checked.clear();
+        self.keep_range = (0, 0);
+        self.keep_set.clear();
+        self.keep_start_shared.store(0, Ordering::Relaxed);
+        self.keep_end_shared.store(0, Ordering::Relaxed);
+
+        // idx-keyed caches (HashMap<usize, ...>)
+        self.rotation_cache.clear();
+        self.rating_cache.clear();
+        self.adjustment_cache.clear();
+        self.adjustment_page_params.clear();
+        self.mask_pages.clear();
+        self.thumb_pixels.clear();
+        self.thumb_adjust_tex.clear();
+        self.ai_upscale_cache.clear();
+        self.ai_upscale_failed.clear();
+        self.ai_classify_cache.clear();
+        self.erase_base_cache.clear();
+        self.fs_early_dims.clear();
+        self.fs_cache.clear();
+        self.fs_upload_backlog.clear();
+
+        // in-flight pending (idx-keyed) をキャンセル
+        for (cancel, _, _) in self.fs_pending.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.fs_pending.clear();
+        for (cancel, _) in self.ai_upscale_pending.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_upscale_pending.clear();
+
+        // キューに残った旧 idx リクエストを排水。items_gen 差異で最終的には破棄されるが、
+        // worker が pop した直後は decode を走らせ始めてしまうので、明示的に捨てる。
+        if let Some(ref q) = self.reload_queue {
+            if let Ok(mut guard) = q.0.lock() {
+                guard.clear();
+            }
+        }
+        if let Some(ref q) = self.heavy_io_queue {
+            if let Ok(mut guard) = q.0.lock() {
+                guard.clear();
+            }
+        }
+    }
+
+    /// 削除確定後に `idx` を items から取り除き、idx シフトで無効化されるキャッシュを破棄する。
+    ///
+    /// `items_generation` を bump するので、進行中ワーカーの `ThumbMsg` は
+    /// `poll_thumbnails` の世代不一致チェックで破棄される。削除 idx より後の
+    /// 残存 idx はすべてシフトするため、idx-keyed キャッシュは部分 shift せず
+    /// `invalidate_idx_state_and_queues` で一括クリアする。
+    pub(crate) fn remove_item_session(&mut self, idx: usize) {
+        if idx >= self.items.len() {
+            return;
+        }
+
+        self.items.remove(idx);
+        if idx < self.thumbnails.len() {
+            self.thumbnails.remove(idx);
+        }
+        if idx < self.image_metas.len() {
+            self.image_metas.remove(idx);
+        }
+        self.items_generation = self.items_generation.wrapping_add(1);
+
+        // search_filter の idx シフト (削除された idx は drop)
+        if let Some(ref mut filter) = self.search_filter {
+            let new_filter: std::collections::HashSet<usize> = filter
+                .iter()
+                .filter_map(|&i| {
+                    if i < idx {
+                        Some(i)
+                    } else if i > idx {
+                        Some(i - 1)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            *filter = new_filter;
+        }
+
+        self.invalidate_idx_state_and_queues();
+
+        let n = self.items.len();
+        if n == 0 {
+            self.selected = None;
+        } else if let Some(sel) = self.selected {
+            if sel >= n {
+                self.selected = Some(n - 1);
+            }
+        }
+
+        self.rebuild_visible_indices();
+    }
+
     /// condvar.wait() 中の全ワーカーを起床させる。
     /// cancel_token を true にした直後に呼び、ワーカーが即座にキャンセルを検知できるようにする。
     pub(crate) fn wake_all_workers(&self) {

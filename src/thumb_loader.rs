@@ -830,10 +830,17 @@ fn resolve_folder_thumb_image(
     let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
 
     for entry in entries.flatten() {
+        // entry.file_type() は FindFirstFile/FindNextFile の戻り値キャッシュを再利用するので
+        // per-entry GetFileAttributes syscall が走らない (docs/ui-responsiveness.md §4)。
+        // この関数は heavy I/O worker で動くが、大量フォルダで代表画像解決が詰まると
+        // 可視サムネ処理が連鎖遅延するので file_type ベースにしておく。
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
         let p = entry.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             subdirs.push(p);
-        } else if p.is_file() {
+        } else if ft.is_file() {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
                     let mtime = entry

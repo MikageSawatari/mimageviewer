@@ -617,10 +617,11 @@ impl crate::app::App {
                         targets.sort_by(|a, b| b.0.cmp(&a.0));
                         for (idx, path) in &targets {
                             if move_to_recycle_bin(path) {
-                                self.remove_item_after_delete(*idx);
+                                self.remove_item_session(*idx);
                             }
                         }
-                        self.checked.clear();
+                        // remove_item_session 内で checked はクリアされるが、
+                        // 最後に見落としがないよう明示的に閉じる。
                         self.show_delete_confirm = false;
                         self.delete_targets.clear();
                     }
@@ -663,40 +664,6 @@ impl crate::app::App {
         }
     }
 
-    /// 削除後にアイテムリストから除去し、選択を調整する。
-    fn remove_item_after_delete(&mut self, idx: usize) {
-        if idx < self.items.len() {
-            self.items.remove(idx);
-            self.thumbnails.remove(idx);
-            if idx < self.image_metas.len() {
-                self.image_metas.remove(idx);
-            }
-            // search_filter 内のインデックスを調整
-            if let Some(ref mut filter) = self.search_filter {
-                let mut new_filter: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
-                for &i in filter.iter() {
-                    if i < idx {
-                        new_filter.insert(i);
-                    } else if i > idx {
-                        new_filter.insert(i - 1);
-                    }
-                    // i == idx は削除されたので含めない
-                }
-                *filter = new_filter;
-            }
-            let n = self.items.len();
-            if n == 0 {
-                self.selected = None;
-            } else if let Some(sel) = self.selected {
-                if sel >= n {
-                    self.selected = Some(n - 1);
-                }
-            }
-            self.rebuild_visible_indices();
-            self.requested.clear();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

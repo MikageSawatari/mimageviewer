@@ -353,6 +353,36 @@ mImageViewer は 2 つのリストを使い分ける:
 `ai_upscale_cache` を残す。両方同時に消すと AI の再実行 (数秒) が発生してユーザーを待たせる。
 詳細は [preset-and-adjustment.md](preset-and-adjustment.md) の無効化ルール表。
 
+### 5.2.1 items 差し替え / 削除時の世代 bump 忘れ
+
+`items` / `thumbnails` / `image_metas` を書き換える全経路で `items_generation` の
+bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行中ワーカーが旧 idx 向けに
+生成した `ThumbMsg` が新 items の同じ idx に着地して**サムネが化ける**。
+
+現在の経路と使うヘルパー:
+
+- **フォルダ切替**: `start_loading_items` → `install_new_items`
+- **Ctrl+G 結果差し替え**: `replace_search_view_items` → `install_new_items` +
+  `invalidate_idx_state_and_queues` + path-keyed cache clear
+- **削除**: `remove_item_session` → (physical shift) + `items_generation` bump +
+  `invalidate_idx_state_and_queues`
+
+新しい差し替え経路を増やすときは、必ず以下を揃える:
+
+1. `items_generation` を必ず bump (install_new_items 経由か直接 +1)
+2. `invalidate_idx_state_and_queues()` を呼ぶ — requested / pending_finalize /
+   texture_backlog / checked / keep_range / keep_set / keep_*_shared / idx-keyed
+   HashMap 群 / in-flight pending (fs_pending / ai_upscale_pending) / reload_queue /
+   heavy_io_queue を一括で片付ける
+3. path-keyed キャッシュ (metadata_cache / exif_cache / xmp_cache / tags_cache) も
+   items が総入れ替わりする経路ではリセット (部分削除ならリセット不要)
+4. `items.remove` / `items.push` を直接書かない — 必ずヘルパー経由に通す。
+   レビューでは `rg 'self\.items\.(remove|push|clear)'` で直接触っていないか確認する
+
+この設計が崩れると 2026-04 に発生した「削除後に別 item のサムネが表示される」
+「Ctrl+G 直後に重い ZIP/PDF decode が worker を占有して新結果のサムネが来ない」
+といった再発しやすいバグが戻ってくる。
+
 ### 5.3 UI スレッドで重処理
 
 `App::update` 内で CPU 重めの処理をすると fps が落ちる。
