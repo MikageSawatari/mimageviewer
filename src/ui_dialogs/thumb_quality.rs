@@ -59,10 +59,15 @@ impl App {
                 .show(ctx, |ui| {
                     if self.tq.sample.is_none() {
                         ui.set_min_width(360.0);
-                        ui.label("画像を1枚選択してからもう一度お試しください。");
+                        if self.tq.load_pending.is_some() {
+                            ui.label("サンプル画像を読み込み中…");
+                        } else {
+                            ui.label("画像を1枚選択してからもう一度お試しください。");
+                        }
                         ui.add_space(8.0);
                         if ui.button("  閉じる  ").clicked() {
                             self.tq.show = false;
+                            self.tq.load_pending = None;
                         }
                         return;
                     }

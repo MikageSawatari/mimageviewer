@@ -804,6 +804,14 @@ pub(crate) enum EraseVectorDrag {
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
 // -----------------------------------------------------------------------
 
+/// サムネイル画質 A/B ダイアログの初期サンプル decode を worker 化するための pending。
+/// ダイアログは即座に「読み込み中」表示で開き、decode 完了後にサンプル + A/B プレビューを
+/// 構築する (docs/ui-responsiveness.md §4)。
+pub(crate) struct ThumbQualityLoadPending {
+    pub path: PathBuf,
+    pub rx: mpsc::Receiver<Option<(image::DynamicImage, u64)>>,
+}
+
 #[derive(Default)]
 pub(crate) struct ThumbQualityState {
     pub show: bool,
@@ -813,6 +821,8 @@ pub(crate) struct ThumbQualityState {
     pub sample_path: Option<PathBuf>,
     /// サンプル画像の元ファイルサイズ (bytes)
     pub sample_original_size: u64,
+    /// サンプル decode 進行中の pending (ダイアログ開く時に spawn)
+    pub load_pending: Option<ThumbQualityLoadPending>,
     /// パネル A: サイズ (long side px)
     pub a_size: u32,
     /// パネル A: 品質 (1–100)
@@ -1185,6 +1195,10 @@ pub struct App {
 
     // ── ペースト後のフォルダ再読み込みフラグ ──────────────────────
     pub(crate) pending_reload: bool,
+    /// 実行中のペースト worker 完了待ち。完了するごとに `pending_reload` を立てる。
+    /// PowerShell 経由の paste が完了する前に reload しても無駄走査になるため、
+    /// 完了通知を待ってから再読込する (docs/ui-responsiveness.md §4)。
+    pub(crate) paste_pending: Vec<std::sync::mpsc::Receiver<()>>,
     /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
     pub(crate) select_after_load: Option<String>,
 
@@ -1830,6 +1844,7 @@ impl Default for App {
             show_delete_confirm: false,
             delete_targets: Vec::new(),
             pending_reload: false,
+            paste_pending: Vec::new(),
             select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
             show_rotation_reset_confirm: false,
@@ -4024,6 +4039,23 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// PowerShell ペースト worker の完了を拾い、完了ごとに `pending_reload` を立てる。
+    /// worker はデタッチ実行なので受信チャネル Disconnected == 完了とみなす (send か drop いずれも).
+    pub(crate) fn poll_paste_pending(&mut self) {
+        if self.paste_pending.is_empty() {
+            return;
+        }
+        let before = self.paste_pending.len();
+        self.paste_pending.retain(|rx| match rx.try_recv() {
+            Ok(()) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        });
+        if self.paste_pending.len() < before {
+            self.pending_reload = true;
         }
     }
 
@@ -6464,8 +6496,9 @@ impl App {
 
         if ctrl_v {
             if let Some(ref folder) = self.current_folder.clone() {
-                crate::ui_dialogs::context_menu::paste_files_from_clipboard(folder);
-                self.pending_reload = true;
+                let rx =
+                    crate::ui_dialogs::context_menu::paste_files_from_clipboard(folder);
+                self.paste_pending.push(rx);
             }
         }
     }
@@ -10090,7 +10123,7 @@ impl App {
     // -------------------------------------------------------------------
     // サムネイル画質設定ダイアログ (A/B 比較)
     // -------------------------------------------------------------------
-    pub(crate) fn open_thumb_quality_dialog(&mut self, ctx: &egui::Context) {
+    pub(crate) fn open_thumb_quality_dialog(&mut self, _ctx: &egui::Context) {
         // 既存状態をリセット
         self.tq.sample = None;
         self.tq.sample_path = None;
@@ -10099,6 +10132,14 @@ impl App {
         self.tq.b_texture = None;
         self.tq.a_bytes = 0;
         self.tq.b_bytes = 0;
+        self.tq.load_pending = None;
+
+        // A/B スライダー初期値はダイアログを開いた瞬間に確定しておく
+        // (decode 待ち中にユーザがスライダーを触っても同期的に反映できるように)
+        self.tq.a_size = self.settings.thumb_px;
+        self.tq.a_quality = self.settings.thumb_quality;
+        self.tq.b_size = self.settings.thumb_px;
+        self.tq.b_quality = (self.settings.thumb_quality as u32 + 10).min(95) as u8;
 
         // 最後に選択した画像を取得
         let Some(path) = self.last_selected_image_path.clone() else {
@@ -10107,28 +10148,56 @@ impl App {
             return;
         };
 
-        // サンプル画像をデコード
-        let img = match image::open(&path) {
-            Ok(i) => i,
-            Err(_) => {
-                self.tq.show = true;
+        // decode を worker に回す。20MP 超や巨大 RAW の image::open + metadata は UI を
+        // 数百ms〜秒単位止めるため同期実行しない。ダイアログは即座に「読み込み中」で開く。
+        let (tx, rx) = mpsc::channel();
+        let path_for_worker = path.clone();
+        std::thread::Builder::new()
+            .name("thumb-quality-sample-decode".into())
+            .spawn(move || {
+                let result = image::open(&path_for_worker).ok().map(|img| {
+                    let orig = std::fs::metadata(&path_for_worker)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    (img, orig)
+                });
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.tq.load_pending = Some(ThumbQualityLoadPending { path, rx });
+        self.tq.show = true;
+    }
+
+    /// worker からの decode 結果を拾い、サンプル確定時に A/B プレビューを初期生成する。
+    pub(crate) fn poll_thumb_quality_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.tq.load_pending.as_ref() else {
+            return;
+        };
+        let msg = match pending.rx.try_recv() {
+            Ok(m) => m,
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.tq.show {
+                    // decode 待ちの間はプログレス表示更新のために再描画要求
+                    ctx.request_repaint();
+                }
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.tq.load_pending = None;
                 return;
             }
         };
-        let orig_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let path = pending.path.clone();
+        self.tq.load_pending = None;
+        let Some((img, orig_size)) = msg else {
+            // decode 失敗 — 空状態のまま残す
+            return;
+        };
         self.tq.sample = Some(img);
         self.tq.sample_path = Some(path);
         self.tq.sample_original_size = orig_size;
-
-        // 現在の設定で A を初期化、B はちょっと違う組み合わせ
-        self.tq.a_size = self.settings.thumb_px;
-        self.tq.a_quality = self.settings.thumb_quality;
-        self.tq.b_size = self.settings.thumb_px;
-        self.tq.b_quality = (self.settings.thumb_quality as u32 + 10).min(95) as u8;
-
         self.reencode_tq_panel(ctx, true);
         self.reencode_tq_panel(ctx, false);
-        self.tq.show = true;
     }
 
     pub(crate) fn reencode_tq_panel(&mut self, ctx: &egui::Context, is_a: bool) {
@@ -10171,6 +10240,7 @@ impl App {
         self.tq.a_texture = None;
         self.tq.b_texture = None;
         self.tq.fullscreen = false;
+        self.tq.load_pending = None;
     }
 
     // -------------------------------------------------------------------
@@ -10207,10 +10277,10 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         self.cc.cancel = Arc::clone(&cancel);
 
-        // 初期キャッシュ容量を取得（ベースライン）
-        let cache_dir = crate::catalog::default_cache_dir();
-        let (_, baseline) = crate::catalog::cache_stats(&cache_dir);
-        self.cc.cache_size.store(baseline, Ordering::Relaxed);
+        // ベースラインは worker 側で取得する。`cache_stats` は read_dir + metadata の全走査で
+        // キャッシュフォルダが大きいと UI スレッドで数百 ms ブロックしうるため、開始ボタン直後は
+        // 0 のまま返して worker 内で書き換える (docs/ui-responsiveness.md §4 チェックリスト)。
+        self.cc.cache_size.store(0, Ordering::Relaxed);
 
         // atomic クローン
         let counting = Arc::clone(&self.cc.counting);
@@ -10226,6 +10296,11 @@ impl App {
         let batch_pdf = self.settings.batch_cache_pdf_contents;
 
         std::thread::spawn(move || {
+            // baseline: worker 冒頭で取得 (UI スレッドブロッキング回避)
+            let cache_dir = crate::catalog::default_cache_dir();
+            let (_, baseline) = crate::catalog::cache_stats(&cache_dir);
+            size_atomic.store(baseline, Ordering::Relaxed);
+
             // Pass 1: カウント
             let mut all_folders: Vec<PathBuf> = Vec::new();
             for (_, path) in &targets {
@@ -10824,6 +10899,10 @@ impl eframe::App for App {
         self.poll_metadata_load();
         self.poll_tag_prewarm_results();
         self.poll_delete_pending();
+        self.poll_paste_pending();
+        if !self.paste_pending.is_empty() {
+            ctx.request_repaint();
+        }
         self.poll_cache_maint_pending();
         self.poll_archive_cache_maint_pending();
         self.ensure_folder_rating_counter();
@@ -10966,6 +11045,7 @@ impl eframe::App for App {
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
+        self.poll_thumb_quality_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);

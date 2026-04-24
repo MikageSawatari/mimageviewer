@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use crate::grid_item::GridItem;
 
@@ -115,8 +116,8 @@ impl crate::app::App {
                     // ペースト
                     if ui.button("ペースト (Ctrl+V)").clicked() {
                         if let Some(ref folder) = self.current_folder {
-                            paste_files_from_clipboard(folder);
-                            self.pending_reload = true;
+                            let rx = paste_files_from_clipboard(folder);
+                            self.paste_pending.push(rx);
                         }
                         close = true;
                     }
@@ -185,8 +186,8 @@ impl crate::app::App {
                             ui.separator();
                             if ui.button("ペースト (Ctrl+V)").clicked() {
                                 if let Some(ref folder) = self.current_folder {
-                                    paste_files_from_clipboard(folder);
-                                    self.pending_reload = true;
+                                    let rx = paste_files_from_clipboard(folder);
+                                    self.paste_pending.push(rx);
                                 }
                                 close = true;
                             }
@@ -215,8 +216,8 @@ impl crate::app::App {
                             ui.separator();
                             if ui.button("ペースト (Ctrl+V)").clicked() {
                                 if let Some(ref folder) = self.current_folder {
-                                    paste_files_from_clipboard(folder);
-                                    self.pending_reload = true;
+                                    let rx = paste_files_from_clipboard(folder);
+                                    self.paste_pending.push(rx);
                                 }
                                 close = true;
                             }
@@ -236,11 +237,7 @@ impl crate::app::App {
                                 close = true;
                             }
                             if ui.button("画像をクリップボードにコピー").clicked() {
-                                if let Ok(bytes) =
-                                    crate::zip_loader::read_entry_bytes(zip_path, entry_name)
-                                {
-                                    copy_image_bytes_to_clipboard(&bytes);
-                                }
+                                copy_zip_image_to_clipboard(zip_path, entry_name);
                                 close = true;
                             }
                         }
@@ -387,11 +384,7 @@ impl crate::app::App {
                             close = true;
                         }
                         if ui.button("画像をクリップボードにコピー").clicked() {
-                            if let Ok(bytes) =
-                                crate::zip_loader::read_entry_bytes(zip_path, entry_name)
-                            {
-                                copy_image_bytes_to_clipboard(&bytes);
-                            }
+                            copy_zip_image_to_clipboard(zip_path, entry_name);
                             close = true;
                         }
                     }
@@ -744,7 +737,7 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
              @({arr}) | ForEach-Object {{ $col.Add($_) | Out-Null }}\n\
              [System.Windows.Forms.Clipboard]::SetFileDropList($col)\n"
         );
-        run_ps_script(&script);
+        run_ps_script_async(script, None);
     }
     #[cfg(not(windows))]
     {
@@ -775,7 +768,7 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
              $data.SetData('Preferred DropEffect', $ms)\n\
              [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)\n"
         );
-        run_ps_script(&script);
+        run_ps_script_async(script, None);
     }
     #[cfg(not(windows))]
     {
@@ -786,30 +779,53 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
 /// 画像ファイルの内容をクリップボードにコピーする (Windows)。
 /// 画像ファイルをデコードしてクリップボードにコピーする。
 /// image クレートで非対応の形式は WIC にフォールバック。
+///
+/// decode + DIB 構築は worker スレッドで行う。20MP 超や巨大 RAW では
+/// 数百ms〜秒単位かかるため、UI スレッドから同期実行すると右クリック操作で固まる。
+/// 完了順序は保証しないが (ユーザーが連打する想定はない)、最後に成功したコピーが
+/// クリップボードに残る — 通常の Windows アプリと同じ挙動。
 fn copy_image_to_clipboard(path: &std::path::Path) {
-    let img = match image::open(path) {
-        Ok(i) => i,
-        Err(_) => {
-            #[cfg(windows)]
-            if let Some(i) = crate::wic_decoder::decode_to_dynamic_image(path) {
-                i
-            } else {
-                return;
-            }
-            #[cfg(not(windows))]
-            return;
-        }
-    };
-    set_image_to_clipboard(&img);
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("clipboard-image-copy".into())
+        .spawn(move || {
+            let img = match image::open(&path) {
+                Ok(i) => i,
+                Err(_) => {
+                    #[cfg(windows)]
+                    {
+                        match crate::wic_decoder::decode_to_dynamic_image(&path) {
+                            Some(i) => i,
+                            None => return,
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    return;
+                }
+            };
+            set_image_to_clipboard(&img);
+        })
+        .ok();
 }
 
 /// バイト列から画像をデコードしてクリップボードにコピー (ZIP 内画像用)。
-fn copy_image_bytes_to_clipboard(bytes: &[u8]) {
-    let img = match image::load_from_memory(bytes) {
-        Ok(i) => i,
-        Err(_) => return,
-    };
-    set_image_to_clipboard(&img);
+/// ZIP エントリ読み出し + decode + DIB 構築はまとめて worker に回す。
+/// 巨大 ZIP の read_entry_bytes も I/O 待ちで UI を止めるため、そちらも含めてここで吸収する。
+fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
+    let zip_path = zip_path.to_path_buf();
+    let entry_name = entry_name.to_string();
+    std::thread::Builder::new()
+        .name("clipboard-zip-image-copy".into())
+        .spawn(move || {
+            let Ok(bytes) = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) else {
+                return;
+            };
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                return;
+            };
+            set_image_to_clipboard(&img);
+        })
+        .ok();
 }
 
 /// DynamicImage をクリップボードに CF_DIB として設定する。
@@ -879,7 +895,12 @@ fn set_image_to_clipboard(img: &image::DynamicImage) {
 }
 
 /// クリップボードにあるファイルを指定フォルダにペースト（コピーまたは移動）する。
-pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) {
+///
+/// PowerShell 起動 + Shell clipboard I/O が数百ms〜秒級になることがあるため、worker で走らせる。
+/// 戻り値は「ペースト完了」を 1 回通知する `mpsc::Receiver`。App は pending に積み、
+/// 完了したらフォルダを再読込する (docs/ui-responsiveness.md §4)。
+pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
     {
         let dest = dest_folder.to_string_lossy().replace('\'', "''");
@@ -904,58 +925,61 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) {
              }}\n\
              if ($isMove) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
         );
-        let tmp = std::env::temp_dir().join("miv_paste.ps1");
-        if std::fs::write(&tmp, &script).is_ok() {
-            let mut cmd = std::process::Command::new("powershell");
-            cmd.args([
-                "-NoProfile",
-                "-STA",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                &tmp.to_string_lossy(),
-            ]);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000);
-            }
-            let _ = cmd.status();
-            let _ = std::fs::remove_file(&tmp);
-        }
+        run_ps_script_async(script, Some(tx));
     }
     #[cfg(not(windows))]
     {
         let _ = dest_folder;
+        let _ = tx; // drop — receiver will get Disconnected
     }
+    rx
 }
 
-/// PowerShell スクリプトを一時ファイル経由で実行する共通ヘルパー。
+/// PowerShell スクリプトを一時ファイル経由で worker スレッドで実行する共通ヘルパー。
 /// -STA (クリップボード API 必須) / -ExecutionPolicy Bypass / CREATE_NO_WINDOW で実行。
 /// スクリプトは UTF-8 BOM 付きで書き出す（日本語パス対応）。
+///
+/// 一時ファイル名は呼び出しごとにユニーク化して並行操作の衝突を避ける。
+/// 完了を知りたい呼び出し元は `on_done` に `mpsc::Sender<()>` を渡す (paste 用)。
+/// clipboard copy/cut はファイア & フォーゲットなので None を渡す。
 #[cfg(windows)]
-fn run_ps_script(script: &str) {
-    let tmp = std::env::temp_dir().join("miv_ps_cmd.ps1");
-    // UTF-8 BOM (0xEF 0xBB 0xBF) + スクリプト本文
-    let mut content = vec![0xEF, 0xBB, 0xBF];
-    content.extend_from_slice(script.as_bytes());
-    if std::fs::write(&tmp, &content).is_ok() {
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.args([
-            "-NoProfile",
-            "-STA",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &tmp.to_string_lossy(),
-        ]);
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
-        let _ = cmd.status();
-        let _ = std::fs::remove_file(&tmp);
-    }
+fn run_ps_script_async(script: String, on_done: Option<mpsc::Sender<()>>) {
+    // process id + atomic counter で temp ファイル衝突を回避。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!(
+        "miv_ps_{}_{}.ps1",
+        std::process::id(),
+        seq
+    ));
+    std::thread::Builder::new()
+        .name("powershell-clipboard-exec".into())
+        .spawn(move || {
+            // UTF-8 BOM (0xEF 0xBB 0xBF) + スクリプト本文
+            let mut content = vec![0xEF, 0xBB, 0xBF];
+            content.extend_from_slice(script.as_bytes());
+            if std::fs::write(&tmp, &content).is_ok() {
+                let mut cmd = std::process::Command::new("powershell");
+                cmd.args([
+                    "-NoProfile",
+                    "-STA",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    &tmp.to_string_lossy(),
+                ]);
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
+                let _ = cmd.status();
+                let _ = std::fs::remove_file(&tmp);
+            }
+            if let Some(tx) = on_done {
+                let _ = tx.send(());
+            }
+        })
+        .ok();
 }
 
 /// ファイルの親フォルダをエクスプローラで開き、ファイルを選択する。

@@ -123,30 +123,37 @@ impl ArchiveCacheDb {
     /// - 変換済み ZIP ファイルがディスク上に存在する
     ///
     /// いずれかが満たせない場合は `None` を返し、無効エントリは DB から掃除する。
+    ///
+    /// DB mutex の保持区間は (1) SELECT と (2) UPDATE/DELETE の 2 回だけに切り、
+    /// `remove_file` / `exists()` は lock 外で実行する。UI スレッドの fullscreen / サムネ経由で
+    /// 頻繁に呼ばれる経路なので、1 エントリの FS syscall のたびに他の DB 操作が詰まらない
+    /// ようにするのが狙い。
     pub fn lookup(&self, src_path: &Path, src_mtime: i64, src_size: i64) -> Option<PathBuf> {
         let key = crate::path_key::normalize(src_path);
-        let conn = self.conn.lock().ok()?;
-        let row: Option<(i64, i64, String)> = conn
-            .query_row(
+        // Phase 1: SELECT (短時間 lock)
+        let row: Option<(i64, i64, String)> = {
+            let conn = self.conn.lock().ok()?;
+            conn.query_row(
                 "SELECT src_mtime, src_size, cached_zip_path FROM converted_archives \
                  WHERE src_path_key = ?1",
                 params![&key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .ok();
+            .ok()
+        };
         let (m, s, cached) = row?;
-        if m != src_mtime || s != src_size {
-            // 元ファイルが変わったので無効。行 + キャッシュ ZIP を掃除する。
-            let _ = std::fs::remove_file(&cached);
-            let _ = conn.execute(
-                "DELETE FROM converted_archives WHERE src_path_key = ?1",
-                params![&key],
-            );
-            return None;
-        }
+
+        // Phase 2: FS I/O (lock 外)
+        let mismatch = m != src_mtime || s != src_size;
         let zip_path = PathBuf::from(&cached);
-        if !zip_path.exists() {
-            // ディスク上から消えていたら行も消す。
+        let zip_exists = !mismatch && zip_path.exists();
+        if mismatch {
+            let _ = std::fs::remove_file(&cached);
+        }
+
+        // Phase 3: UPDATE / DELETE (短時間 lock)
+        let conn = self.conn.lock().ok()?;
+        if mismatch || !zip_exists {
             let _ = conn.execute(
                 "DELETE FROM converted_archives WHERE src_path_key = ?1",
                 params![&key],
