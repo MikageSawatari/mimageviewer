@@ -1743,7 +1743,7 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         let req = encode_enumerate_request(pdf_path, password);
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
         let cancel_w = Arc::clone(&cancel);
-        if let Err(e) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("pdf-enumerate-nav".into())
             .spawn(move || {
                 let resp = pool.execute(
@@ -1754,11 +1754,20 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
                 );
                 let result = resp.and_then(|bytes| PdfWorkerPool::parse_enumerate_response(&bytes));
                 let _ = tx.send(result);
-            })
-        {
-            crate::logger::log(format!("pdf-enumerate-nav: spawn failed: {e}"));
+            }) {
+            Ok(_) => return PdfEnumerateHandle { cancel, rx },
+            Err(e) => {
+                // リソース不足等で Builder::spawn が失敗すると、tx が閉じ込められた
+                // closure もろとも drop されて rx が即 Disconnected になる → App 側で
+                // 「空 PDF」にフォールバックしてしまう。代わりに in-process worker 経路へ
+                // 落として、ユーザには正常な enumerate か explicit なエラーを返す。
+                crate::logger::log(format!(
+                    "pdf-enumerate-nav: spawn failed ({e}), falling back to in-process worker"
+                ));
+                drop(rx); // 旧 rx は使わない
+                // fall through to in-process path below
+            }
         }
-        return PdfEnumerateHandle { cancel, rx };
     }
 
     // Pool 不在: in-process worker + epoch skip の旧経路。
