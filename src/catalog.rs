@@ -286,10 +286,15 @@ fn collect_db_paths(cache_dir: &Path, cb: &mut impl FnMut(&Path, std::fs::Metada
         return;
     };
     for entry in top.flatten() {
-        let sub = entry.path();
-        if !sub.is_dir() {
+        // per-entry GetFileAttributes syscall を避けるため file_type を 1 回取る
+        // (docs/ui-responsiveness.md §4)。キャッシュ全走査は数千フォルダ規模になるので効く。
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
             continue;
         }
+        let sub = entry.path();
         let Ok(sub_entries) = std::fs::read_dir(&sub) else {
             continue;
         };

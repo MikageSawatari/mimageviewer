@@ -317,8 +317,16 @@ impl App {
                     ui.separator();
                     if ui.button("サムネイルキャッシュ管理").clicked() {
                         let cache_dir = crate::catalog::default_cache_dir();
-                        self.cache_manager_stats = Some(crate::catalog::cache_stats(&cache_dir));
+                        // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
+                        // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
+                        self.cache_manager_stats = None;
                         self.cache_manager_result = None;
+                        if self.cache_maint_pending.is_none() {
+                            self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
+                                crate::cache_maintenance::CacheMaintTask::Stats,
+                                cache_dir,
+                            ));
+                        }
                         self.show_cache_manager = true;
                         ui.close();
                     }

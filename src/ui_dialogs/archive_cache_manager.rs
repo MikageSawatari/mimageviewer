@@ -19,12 +19,11 @@ use crate::ui_helpers::{format_bytes, truncate_name};
 
 impl App {
     /// 変換済みアーカイブキャッシュ管理ダイアログを開くためのフラグ初期化。
-    /// メニューから呼ぶこと。
+    /// メニューから呼ぶこと。ロードはワーカーに回し、ダイアログは空の状態で開く。
     pub(crate) fn open_archive_cache_manager(&mut self) {
-        self.archive_cache_rows = None;
-        self.archive_cache_selection.clear();
         self.archive_cache_manager_result = None;
         self.show_archive_cache_manager = true;
+        self.reload_archive_cache_rows();
     }
 
     pub(crate) fn show_archive_cache_manager_dialog(&mut self, ctx: &egui::Context) {
@@ -70,21 +69,16 @@ impl App {
                 ui.separator();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("  削除する  ").clicked() {
-                        if let Some(db) = self.archive_cache_db.as_ref() {
-                            match db.clear_all() {
-                                Ok(n) => {
-                                    self.archive_cache_manager_result =
-                                        Some(format!("{} 件のキャッシュを削除しました。", n));
-                                }
-                                Err(e) => {
-                                    self.archive_cache_manager_result =
-                                        Some(format!("削除失敗: {e}"));
-                                }
-                            }
+                    let busy = self.archive_cache_maint_pending.is_some();
+                    let del_btn = egui::Button::new("  削除する  ");
+                    if ui.add_enabled(!busy, del_btn).clicked() {
+                        if let Some(db) = self.archive_cache_db.clone() {
+                            self.archive_cache_maint_pending =
+                                Some(crate::cache_maintenance::spawn_archive(
+                                    crate::cache_maintenance::ArchiveMaintTask::DeleteAll,
+                                    db,
+                                ));
                         }
-                        self.archive_cache_rows = None;
-                        self.archive_cache_selection.clear();
                         self.archive_cache_confirm_delete_all = false;
                     }
                     if ui.button("  キャンセル  ").clicked() || escape_pressed {
@@ -102,28 +96,8 @@ impl App {
 // 本体描画
 // ──────────────────────────────────────────────────────────────────────
 
-fn ensure_rows_loaded(app: &mut App) {
-    if app.archive_cache_rows.is_some() {
-        return;
-    }
-    let rows = app
-        .archive_cache_db
-        .as_ref()
-        .and_then(|db| db.list_all().ok())
-        .unwrap_or_default();
-    app.archive_cache_rows = Some(rows);
-    app.archive_cache_selection.clear();
-}
-
-fn invalidate_rows(app: &mut App) {
-    app.archive_cache_rows = None;
-    app.archive_cache_selection.clear();
-}
-
 fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     ui.set_min_width(600.0);
-
-    ensure_rows_loaded(app);
 
     let Some(db) = app.archive_cache_db.clone() else {
         ui.label(
@@ -133,7 +107,11 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
 
-    let total_bytes = db.total_size().unwrap_or(0);
+    let busy = app.archive_cache_maint_pending.is_some();
+    if busy {
+        // worker 完了まで毎フレーム再描画して結果反映を受け取る。
+        ui.ctx().request_repaint();
+    }
     let row_count = app
         .archive_cache_rows
         .as_ref()
@@ -144,18 +122,23 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
         .as_ref()
         .map(|v| v.iter().filter(|e| !e.src_exists).count())
         .unwrap_or(0);
+    let total_bytes = app.archive_cache_total_bytes;
 
     ui.horizontal(|ui| {
-        ui.label(format!(
-            "{} 件 / 合計 {}",
-            row_count,
-            format_bytes(total_bytes)
-        ));
-        if missing_count > 0 {
-            ui.label(
-                egui::RichText::new(format!("（元ファイル消失: {}）", missing_count))
-                    .color(egui::Color32::from_rgb(180, 60, 60)),
-            );
+        if app.archive_cache_rows.is_none() {
+            ui.label("読み込み中…");
+        } else {
+            ui.label(format!(
+                "{} 件 / 合計 {}",
+                row_count,
+                format_bytes(total_bytes)
+            ));
+            if missing_count > 0 {
+                ui.label(
+                    egui::RichText::new(format!("(元ファイル消失: {})", missing_count))
+                        .color(egui::Color32::from_rgb(180, 60, 60)),
+                );
+            }
         }
     });
 
@@ -165,36 +148,36 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
-                selected_count > 0,
+                !busy && selected_count > 0,
                 egui::Button::new(format!("選択を削除 ({})", selected_count)),
             )
             .clicked()
         {
-            delete_selected(app, db.as_ref());
+            spawn_delete_selected(app, db.clone());
         }
         if ui
             .add_enabled(
-                missing_count > 0,
+                !busy && missing_count > 0,
                 egui::Button::new(format!("元ファイル消失を削除 ({})", missing_count)),
             )
             .clicked()
         {
-            if let Ok(n) = db.delete_missing_originals() {
-                app.archive_cache_manager_result = Some(format!(
-                    "{} 件のキャッシュ (元ファイル消失) を削除しました。",
-                    n
-                ));
-            }
-            invalidate_rows(app);
+            app.archive_cache_maint_pending = Some(crate::cache_maintenance::spawn_archive(
+                crate::cache_maintenance::ArchiveMaintTask::DeleteMissing,
+                db.clone(),
+            ));
         }
         if ui
-            .add_enabled(row_count > 0, egui::Button::new("すべて削除"))
+            .add_enabled(!busy && row_count > 0, egui::Button::new("すべて削除"))
             .clicked()
         {
             app.archive_cache_confirm_delete_all = true;
         }
-        if ui.button("再読込").clicked() {
-            invalidate_rows(app);
+        if ui
+            .add_enabled(!busy, egui::Button::new("再読込"))
+            .clicked()
+        {
+            app.reload_archive_cache_rows();
         }
     });
 
@@ -202,7 +185,9 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(4.0);
 
-    if row_count == 0 {
+    if app.archive_cache_rows.is_none() {
+        // 初回ロード中は placeholder。
+    } else if row_count == 0 {
         ui.label(
             egui::RichText::new("変換済みのアーカイブはありません。")
                 .italics()
@@ -212,7 +197,10 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
         draw_entry_list(app, ui);
     }
 
-    if let Some(ref msg) = app.archive_cache_manager_result {
+    if busy {
+        ui.add_space(8.0);
+        ui.label("処理中…");
+    } else if let Some(ref msg) = app.archive_cache_manager_result {
         ui.add_space(8.0);
         ui.label(msg.as_str());
     }
@@ -269,24 +257,23 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-fn delete_selected(app: &mut App, db: &crate::archive_cache::ArchiveCacheDb) {
+fn spawn_delete_selected(
+    app: &mut App,
+    db: std::sync::Arc<crate::archive_cache::ArchiveCacheDb>,
+) {
     let Some(rows) = app.archive_cache_rows.as_ref() else {
         return;
     };
-    let to_delete: Vec<PathBuf> = app
+    let src_paths: Vec<PathBuf> = app
         .archive_cache_selection
         .iter()
         .filter_map(|idx| rows.get(*idx).map(|e| e.src_path.clone()))
         .collect();
-    let mut removed = 0;
-    for p in &to_delete {
-        if db.delete_entry(p).is_ok() {
-            removed += 1;
-        }
+    if src_paths.is_empty() {
+        return;
     }
-    if removed > 0 {
-        app.archive_cache_manager_result =
-            Some(format!("{} 件のキャッシュを削除しました。", removed));
-    }
-    invalidate_rows(app);
+    app.archive_cache_maint_pending = Some(crate::cache_maintenance::spawn_archive(
+        crate::cache_maintenance::ArchiveMaintTask::DeleteSelected { src_paths },
+        db,
+    ));
 }

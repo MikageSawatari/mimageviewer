@@ -1204,6 +1204,11 @@ pub struct App {
     pub(crate) cache_manager_result: Option<String>,
     /// 「すべてのキャッシュを削除」の確認ステップ
     pub(crate) cache_manager_confirm_delete_all: bool,
+    /// 集計 / 削除のバックグラウンド実行ハンドル。保持中はダイアログのボタンを無効化する。
+    pub(crate) cache_maint_pending: Option<crate::cache_maintenance::CacheMaintPending>,
+    /// 変換済みアーカイブキャッシュ管理ダイアログのロード / 削除ワーカーのハンドル。
+    pub(crate) archive_cache_maint_pending:
+        Option<crate::cache_maintenance::ArchiveMaintPending>,
 
     // ── 変換済みアーカイブキャッシュ (v0.7.0) ───────────────────
     /// 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
@@ -1221,6 +1226,8 @@ pub struct App {
     pub(crate) show_archive_cache_manager: bool,
     /// 開いたとき / 削除操作後にリフレッシュされる一覧キャッシュ。
     pub(crate) archive_cache_rows: Option<Vec<crate::archive_cache::ArchiveCacheEntry>>,
+    /// LoadRows ワーカーがまとめて返す合計バイト数 (UI で再集計しない)。
+    pub(crate) archive_cache_total_bytes: u64,
     /// チェックボックス選択状態。行 index が key。
     pub(crate) archive_cache_selection: std::collections::HashSet<usize>,
     /// 削除操作後のメッセージ
@@ -1831,6 +1838,8 @@ impl Default for App {
             cache_manager_stats: None,
             cache_manager_result: None,
             cache_manager_confirm_delete_all: false,
+            cache_maint_pending: None,
+            archive_cache_maint_pending: None,
             archive_cache_db: crate::archive_cache::ArchiveCacheDb::open()
                 .map_err(|e| crate::logger::log(format!("archive_cache_db open failed: {e}")))
                 .ok()
@@ -1839,6 +1848,7 @@ impl Default for App {
             archive_source_override: None,
             show_archive_cache_manager: false,
             archive_cache_rows: None,
+            archive_cache_total_bytes: 0,
             archive_cache_selection: std::collections::HashSet::new(),
             archive_cache_manager_result: None,
             archive_cache_confirm_delete_all: false,
@@ -4015,6 +4025,114 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 変換済みアーカイブキャッシュ管理ダイアログのワーカー完了を拾う。
+    /// Rows 結果はダイアログ表示用、Deleted* 結果はメッセージ反映 + 再ロード spawn。
+    pub(crate) fn poll_archive_cache_maint_pending(&mut self) {
+        let Some(pending) = self.archive_cache_maint_pending.as_ref() else {
+            return;
+        };
+        let msg = match pending.rx.try_recv() {
+            Ok(m) => m,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.archive_cache_maint_pending = None;
+                return;
+            }
+        };
+        self.archive_cache_maint_pending = None;
+        match msg {
+            crate::cache_maintenance::ArchiveMaintResult::Rows {
+                entries,
+                total_bytes,
+            } => {
+                self.archive_cache_rows = Some(entries);
+                self.archive_cache_total_bytes = total_bytes;
+                self.archive_cache_selection.clear();
+            }
+            crate::cache_maintenance::ArchiveMaintResult::DeletedSelected { removed } => {
+                if removed > 0 {
+                    self.archive_cache_manager_result =
+                        Some(format!("{} 件のキャッシュを削除しました。", removed));
+                }
+                self.reload_archive_cache_rows();
+            }
+            crate::cache_maintenance::ArchiveMaintResult::DeletedMissing { removed } => {
+                self.archive_cache_manager_result = Some(format!(
+                    "{} 件のキャッシュ (元ファイル消失) を削除しました。",
+                    removed
+                ));
+                self.reload_archive_cache_rows();
+            }
+            crate::cache_maintenance::ArchiveMaintResult::DeletedAll { removed } => {
+                self.archive_cache_manager_result =
+                    Some(format!("{} 件のキャッシュを削除しました。", removed));
+                self.reload_archive_cache_rows();
+            }
+            crate::cache_maintenance::ArchiveMaintResult::Error(e) => {
+                self.archive_cache_manager_result = Some(format!("操作に失敗しました: {e}"));
+            }
+        }
+    }
+
+    /// archive_cache_rows を再ロードするワーカーを spawn する (既存ハンドルがあれば上書き)。
+    pub(crate) fn reload_archive_cache_rows(&mut self) {
+        let Some(db) = self.archive_cache_db.clone() else {
+            return;
+        };
+        self.archive_cache_rows = None;
+        self.archive_cache_selection.clear();
+        self.archive_cache_maint_pending = Some(crate::cache_maintenance::spawn_archive(
+            crate::cache_maintenance::ArchiveMaintTask::LoadRows,
+            db,
+        ));
+    }
+
+    /// サムネイルキャッシュ管理ダイアログの集計 / 削除ワーカーの完了を拾う。
+    /// 受信したら stats / result を反映してハンドルを drop。
+    pub(crate) fn poll_cache_maint_pending(&mut self) {
+        let Some(pending) = self.cache_maint_pending.as_ref() else {
+            return;
+        };
+        let msg = match pending.rx.try_recv() {
+            Ok(m) => m,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.cache_maint_pending = None;
+                return;
+            }
+        };
+        match msg {
+            crate::cache_maintenance::CacheMaintResult::Stats { folders, bytes } => {
+                self.cache_manager_stats = Some((folders, bytes));
+            }
+            crate::cache_maintenance::CacheMaintResult::DeleteOldDone {
+                deleted,
+                new_stats,
+            } => {
+                self.cache_manager_stats = Some(new_stats);
+                self.cache_manager_result =
+                    Some(format!("{} 件のキャッシュを削除しました。", deleted));
+            }
+            crate::cache_maintenance::CacheMaintResult::DeleteAllDone => {
+                self.cache_manager_stats = Some((0, 0));
+                self.cache_manager_result = Some("すべてのキャッシュを削除しました。".to_string());
+            }
+            crate::cache_maintenance::CacheMaintResult::DeleteFolderDone {
+                existed,
+                folder_name,
+                new_stats,
+            } => {
+                self.cache_manager_stats = Some(new_stats);
+                self.cache_manager_result = Some(if existed {
+                    format!("「{folder_name}」のキャッシュを削除しました。")
+                } else {
+                    "現在のフォルダにはキャッシュがありません。".to_string()
+                });
+            }
+        }
+        self.cache_maint_pending = None;
     }
 
     /// condvar.wait() 中の全ワーカーを起床させる。
@@ -10706,6 +10824,8 @@ impl eframe::App for App {
         self.poll_metadata_load();
         self.poll_tag_prewarm_results();
         self.poll_delete_pending();
+        self.poll_cache_maint_pending();
+        self.poll_archive_cache_maint_pending();
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
