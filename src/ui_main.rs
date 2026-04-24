@@ -564,6 +564,23 @@ impl App {
                             toolbar_rating_changed = true;
                         }
                     }
+                    // ★フィルタ一時解除中バッジ。コンテナ自身の★で開いた結果として
+                    // 今は filter が全 ON になっているが、親に戻ると復元される状態を示す。
+                    // クリックで即復元 (= 手動で BS を押さなくても anchor 外判定にできる)。
+                    if self.rating_filter_suppressed_at.is_some() {
+                        let resp = ui
+                            .small_button(
+                                egui::RichText::new("★一時解除中")
+                                    .color(egui::Color32::from_rgb(200, 140, 40)),
+                            )
+                            .on_hover_text("コンテナ自身の★で開いたため一時解除中です。\n親へ戻るか、このバッジをクリックで復元。");
+                        if resp.clicked() {
+                            if let Some((_, saved)) = self.rating_filter_suppressed_at.take() {
+                                self.settings.rating_filter = saved;
+                                toolbar_rating_changed = true;
+                            }
+                        }
+                    }
                     first_section = false;
                 }
                 if show_favs {
@@ -641,6 +658,9 @@ impl App {
         // selected が filter から外れた場合の処理は `rebuild_visible_indices` が
         // 直近の visible idx にリダイレクト (旧コードは None にクリアしていた)。
         if toolbar_rating_changed {
+            // ユーザーによる明示的な filter 操作 → suppression anchor を破棄する
+            // (ユーザー意思を尊重して、BS しても以前の filter は復元しない)。
+            self.drop_rating_filter_suppression_on_user_edit();
             self.settings.save();
             self.rebuild_visible_indices();
         }
@@ -1033,10 +1053,16 @@ impl App {
                     {
                         self.drill_into_subfolder(p.clone());
                     } else {
-                        nav = Some(p.clone())
+                        let p = p.clone();
+                        self.maybe_suppress_rating_filter_for_opened_container(idx);
+                        nav = Some(p);
                     }
                 }
-                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => nav = Some(p.clone()),
+                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                    let p = p.clone();
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    nav = Some(p);
+                }
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::ZipSeparator { .. })
@@ -1051,6 +1077,7 @@ impl App {
                 Some(GridItem::ConvertibleArchive { path, format }) => {
                     let pf = path.clone();
                     let fmt = *format;
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
                     if let Some(cached) = self.try_archive_cache_lookup(&pf) {
                         self.open_archive_via_cache(pf, cached);
                     } else {

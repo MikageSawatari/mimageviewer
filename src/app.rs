@@ -1413,6 +1413,23 @@ pub struct App {
     /// `None` に戻して無効化する。
     pub(crate) current_folder_rating_cache: Option<u8>,
 
+    /// ★フィルタの一時解除: 自分の★を持つコンテナ (Folder / ZIP / PDF) を開いた時、
+    /// 中身には個別★が付いていないために全項目が非表示になる "空表示" 事故を防ぐ。
+    ///
+    /// 発動: 開くアクションで [`maybe_suppress_rating_filter_for_opened_container`] が
+    /// コンテナ自身の★が現在フィルタを通ることを確認したときのみ。
+    /// scope: anchor (= 開いた container の path) の subtree 内にいる間だけ解除。
+    /// 復元: `load_folder` 系で `effective_folder()` が anchor scope 外に出たら実行する
+    /// ([`maybe_restore_rating_filter_if_out_of_scope`])。
+    /// 破棄: ユーザーが手動で filter を変更した時 (意図的操作を尊重して復元せず捨てる)。
+    ///
+    /// `settings.rating_filter` は suppression 中は in-memory 上 `[true; 6]` (全 ON) に
+    /// 書き換えるが **`settings.save()` を呼ばない**。永続化は元のフィルタ値のまま残る
+    /// ので、アプリ再起動時はユーザーの saved filter に戻る。
+    ///
+    /// (anchor_path, 保存した旧フィルタ)
+    pub(crate) rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
+
     /// 再帰レーティングフィルタ: 現フォルダ直下のコンテナごとの子孫★件数バッファ。
     /// key は `adjustment_db::normalize_path` で正規化したパス。
     pub(crate) folder_rating_counts:
@@ -1939,6 +1956,7 @@ impl Default for App {
             rotation_cache: std::collections::HashMap::new(),
             rating_db: crate::rating_db::RatingDb::open().ok(),
             rating_cache: std::collections::HashMap::new(),
+            rating_filter_suppressed_at: None,
             user_set_rating_keys: std::collections::HashSet::new(),
             current_folder_rating_cache: None,
             folder_rating_counts: std::collections::HashMap::new(),
@@ -3399,6 +3417,13 @@ impl App {
         // フォルダ切替でユーザ明示設定の記録もリセット (別フォルダでは無関係)
         self.user_set_rating_keys.clear();
         self.reset_folder_rating_counts();
+        // ★フィルタ suppression scope の判定: anchor の subtree 外に出たら復元する。
+        // 判定は current_folder 反映直後に行うため、`effective_folder()` が最新値を返す。
+        // archive_source_override は呼び出し元で再設定されるまで None なので、
+        // 7z/LZH キャッシュ閲覧中の判定はここでは current_folder=cache_zip 基準になる。
+        // `archive_convert` 経由のケースでは後段で override が設定され、次回 load_folder
+        // 時にもう一度評価されるため最終的に一致する。
+        self.maybe_restore_rating_filter_if_out_of_scope();
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
         self.current_folder_last_mtime = source_path
@@ -5794,9 +5819,15 @@ impl App {
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
-                        Some(GridItem::Folder(p)) => return Some(p.clone()),
+                        Some(GridItem::Folder(p)) => {
+                            let p = p.clone();
+                            self.maybe_suppress_rating_filter_for_opened_container(idx);
+                            return Some(p);
+                        }
                         Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
-                            return Some(p.clone());
+                            let p = p.clone();
+                            self.maybe_suppress_rating_filter_for_opened_container(idx);
+                            return Some(p);
                         }
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
@@ -5812,6 +5843,7 @@ impl App {
                         Some(GridItem::ConvertibleArchive { path, format }) => {
                             let pf = path.clone();
                             let fmt = *format;
+                            self.maybe_suppress_rating_filter_for_opened_container(idx);
                             if let Some(cached) = self.try_archive_cache_lookup(&pf) {
                                 self.open_archive_via_cache(pf, cached);
                                 return None;
@@ -7275,6 +7307,73 @@ impl App {
     /// フィルタが全 ON の状態は「フィルタ未使用」として worker を動かさない。
     pub(crate) fn rating_filter_active(&self) -> bool {
         !self.settings.rating_filter.iter().all(|&b| b)
+    }
+
+    /// 「自身に★が付いたコンテナ (Folder / ZIP / PDF) を開く」操作時に呼ぶ。
+    /// コンテナ自身の★が現在フィルタを通るなら、フィルタを一時解除して anchor を記録する。
+    ///
+    /// これにより `★5 の ZIP を絞り込みで見つけて開く → 中身が未評価で全部消える`
+    /// 事故を防ぐ。階層ナビ用のフォルダ (自身★なし) では発動しないので、
+    /// `★5 を保って深く掘る` ワークフローは壊れない。
+    ///
+    /// 既に suppression 中ならネストさせず no-op (単一階層だけで十分)。
+    pub(crate) fn maybe_suppress_rating_filter_for_opened_container(&mut self, idx: usize) {
+        if self.rating_filter_suppressed_at.is_some() {
+            return;
+        }
+        if !self.rating_filter_active() {
+            return;
+        }
+        let item = match self.items.get(idx) {
+            Some(it) => it,
+            None => return,
+        };
+        let anchor = match item {
+            GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p.clone(),
+            GridItem::ConvertibleArchive { path, .. } => path.clone(),
+            _ => return,
+        };
+        let stars = self.get_rating(idx);
+        if !(1..=5).contains(&stars) {
+            return;
+        }
+        if !self.settings.rating_filter[stars as usize] {
+            // 自身の★が現在フィルタに通っていない場合は、そもそも親ビューで見えなかった
+            // はず (= ユーザーが address bar や Ctrl+↑↓ で直接辿り着いた)。意図した操作と
+            // 見なしてフィルタは保持する。
+            return;
+        }
+        let saved = self.settings.rating_filter;
+        self.rating_filter_suppressed_at = Some((anchor, saved));
+        self.settings.rating_filter = [true; 6];
+        // settings.save() は呼ばない (in-memory のみ、永続化は saved のまま維持)。
+        self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".to_string());
+    }
+
+    /// `load_folder` の最後に呼ぶ: suppression anchor の subtree から外に出ていれば
+    /// 保存したフィルタを復元する。subtree の内側にいれば no-op。
+    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self) {
+        let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() else {
+            return;
+        };
+        let Some(current) = self.effective_folder() else {
+            // 現在フォルダが取れない状態 (起動直後など) は触らない
+            return;
+        };
+        let still_inside = current == *anchor || current.starts_with(anchor);
+        if still_inside {
+            return;
+        }
+        if let Some((_, saved)) = self.rating_filter_suppressed_at.take() {
+            self.settings.rating_filter = saved;
+            // 復元も save() は呼ばない (そもそも in-memory 改変を元に戻すだけ)。
+        }
+    }
+
+    /// ユーザーが手動でフィルタを変更した時に呼ぶ: suppression anchor を破棄する。
+    /// 復元はせず (現在のフィルタはユーザー自身の操作なのでそれが正)、anchor だけ消す。
+    pub(crate) fn drop_rating_filter_suppression_on_user_edit(&mut self) {
+        self.rating_filter_suppressed_at = None;
     }
 
     /// 毎フレーム呼ぶ: フィルタ ON かつ現フォルダ未スキャンなら worker 起動、
@@ -12604,6 +12703,40 @@ mod tests {
         let img = GridItem::Image(PathBuf::from("/a.jpg"));
         assert!(!passes_rating_filter(&folder, 99, &[true; 6]));
         assert!(!passes_rating_filter(&img, 99, &[true; 6]));
+    }
+
+    /// ★フィルタ suppression の scope 判定 (anchor の subtree 内外)。
+    /// 実装は `current == anchor || current.starts_with(anchor)` の単純比較なので、
+    /// Path::starts_with の component 単位一致を信頼してテストする。
+    #[test]
+    fn rating_filter_suppression_scope_folder_anchor() {
+        use std::path::Path;
+        let anchor = PathBuf::from("/books/book-a");
+        // anchor 自身: inside
+        assert!(Path::new("/books/book-a").starts_with(&anchor));
+        // subfolder: inside
+        assert!(Path::new("/books/book-a/chapter1").starts_with(&anchor));
+        assert!(Path::new("/books/book-a/chapter1/sub").starts_with(&anchor));
+        // parent: outside
+        assert!(!Path::new("/books").starts_with(&anchor));
+        // sibling: outside
+        assert!(!Path::new("/books/book-b").starts_with(&anchor));
+        // name prefix match でも component 単位では外れる (starts_with の仕様)
+        assert!(!Path::new("/books/book-a-extra").starts_with(&anchor));
+    }
+
+    #[test]
+    fn rating_filter_suppression_scope_zip_pdf_anchor() {
+        use std::path::Path;
+        // ZIP / PDF は current_folder がファイルパスそのもの。
+        let zip = PathBuf::from("/books/vol1.zip");
+        assert!(Path::new("/books/vol1.zip").starts_with(&zip));
+        assert!(!Path::new("/books").starts_with(&zip)); // BS で親へ → outside
+        assert!(!Path::new("/books/vol2.zip").starts_with(&zip)); // sibling → outside
+
+        let pdf = PathBuf::from("/books/manual.pdf");
+        assert!(Path::new("/books/manual.pdf").starts_with(&pdf));
+        assert!(!Path::new("/books").starts_with(&pdf));
     }
 
     /// 同名フォルダがある ZIP/PDF/ConvertibleArchive (7z/LZH) は
