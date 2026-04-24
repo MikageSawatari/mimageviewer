@@ -167,8 +167,16 @@ impl App {
                             );
                         });
 
-                        // インデックスのディスク使用量。ダイアログを開くたびに再計算 (stat のみ、< 数 ms)。
-                        let sizes = compute_index_disk_sizes();
+                        // インデックスのディスク使用量。ダイアログ open 時に 1 回計算してキャッシュ
+                        // (毎フレーム stat + read_dir を叩かないため。Codex P3 指摘)。
+                        // ダイアログ close 時に None に戻す。
+                        let sizes = self
+                            .favorites_index_size_cache
+                            .get_or_insert_with(|| {
+                                let s = compute_index_disk_sizes();
+                                (s.name_index_db, s.fts_meta_db, s.fts_index_dir)
+                            });
+                        let (name_size, fts_meta_size, fts_index_size) = *sizes;
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("💾 インデックスサイズ:")
@@ -178,7 +186,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "名前索引 {}",
-                                    format_bytes(sizes.name_index_db)
+                                    format_bytes(name_size)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -191,8 +199,8 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "メタ索引 {} + {}",
-                                    format_bytes(sizes.fts_meta_db),
-                                    format_bytes(sizes.fts_index_dir)
+                                    format_bytes(fts_meta_size),
+                                    format_bytes(fts_index_size)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -571,10 +579,18 @@ impl App {
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
         if any_setting_dirty {
             self.settings.save();
+            // pause_indexer_while_minimized が変わったかもしれないので、トレイメニューの
+            // checkmark を設定値に合わせて同期する。他の項目 (名前・並び替え等) でも
+            // 毎回 push するが、`SetPausedCheck` は idempotent で cost も低いので許容。
+            if let Some(tc) = &self.tray_controller {
+                tc.set_paused_check(self.settings.pause_indexer_while_minimized);
+            }
         }
 
         if close_requested || !open {
             self.show_favorites_editor = false;
+            // 次回 open 時に最新のディスク使用量で再計算するためキャッシュを破棄。
+            self.favorites_index_size_cache = None;
         }
 
         // サムネ一括作成ダイアログを起動 (「お気に入り」ダイアログと同じフレームで連続

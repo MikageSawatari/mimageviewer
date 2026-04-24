@@ -99,9 +99,13 @@ pub enum TrayEvent {
     /// 左クリック or メニュー「開く」。ShowWindow はトレイスレッドが既に実行済み。
     /// App は window_visible フラグ更新 + throttle 解除ログ + ツールチップ更新のみ。
     OpenRequested,
-    /// 一時停止トグル。ActivityGate はトレイスレッドが既に反転済み。
-    /// App は設定保存 + ツールチップ更新のみ。
-    TogglePauseRequested,
+    /// 一時停止トグル (muda の CheckMenuItem が自動トグルした新状態を同梱)。
+    /// `pause_indexer_while_minimized` 設定とトレイ checkmark は App 側で反映する。
+    /// activity_gate はトレイスレッドが既に反転済みだが、「ウィンドウ表示中は強制 false」等
+    /// の統合判断は App 側で行うため、ここでは hint に留める。
+    TogglePauseRequested {
+        new_checked: bool,
+    },
     /// メニュー「終了」。quit_flag は既に true、WM_CLOSE も post 済み。
     /// App は close 経路でそのまま抜けるだけ。
     QuitRequested,
@@ -303,6 +307,14 @@ fn run_tray_thread(
     let pause_id: MenuId = item_pause.id().clone();
     let quit_id: MenuId = item_quit.id().clone();
 
+    // CheckMenuItem (Rc<...> を含み !Send) は MenuEvent 用の 'static + Send closure に
+    // 持ち込めないので、checkmark の現状態を Send+Sync な AtomicBool で並行追跡する。
+    // muda が auto-toggle する前後で整合が取れていれば OK:
+    //   - 初期化時と SetPausedCheck コマンド受信時: 同じ bool を book.ストア + item_pause.set_checked
+    //   - pause クリック時: book.fetch_xor(true) で反転、結果を TogglePauseRequested の
+    //     new_checked に載せる
+    let pause_checked = Arc::new(AtomicBool::new(false));
+
     // --- Win32 アクションをクロージャ化してイベントハンドラから呼ぶ ---
     // HWND は Send/Sync ではないので、`main_hwnd: isize` をキャプチャして呼び出し時に
     // `make_hwnd` で再構成する。Arc<...> は Send+Sync なのでそのままキャプチャして良い。
@@ -369,18 +381,22 @@ fn run_tray_thread(
         let open_id = open_id.clone();
         let pause_id = pause_id.clone();
         let quit_id = quit_id.clone();
+        let pause_checked = Arc::clone(&pause_checked);
         MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
             crate::logger::log(format!("tray: MenuEvent id={:?}", ev.id));
             if ev.id == open_id {
                 do_show_window();
             } else if ev.id == pause_id {
-                // muda が CheckMenuItem を既にトグル済み。こちらも activity_gate を反転。
-                let new_state = !activity_gate.is_paused();
-                activity_gate.set_paused(new_state);
-                let _ = event_tx.try_send(TrayEvent::TogglePauseRequested);
+                // muda が CheckMenuItem を既にトグル済み。item_pause は !Send なので
+                // 直接参照できないが、AtomicBool で反転を追跡する (SetPausedCheck
+                // コマンドとも同期される)。新値を権威として App に送る。
+                let new_checked = !pause_checked.load(Ordering::Relaxed);
+                pause_checked.store(new_checked, Ordering::Relaxed);
+                activity_gate.set_paused(new_checked);
+                let _ = event_tx.try_send(TrayEvent::TogglePauseRequested { new_checked });
                 ctx.request_repaint();
                 crate::logger::log(format!(
-                    "tray: Pause toggled → activity_gate.paused = {new_state}"
+                    "tray: Pause toggled → new_checked = {new_checked}"
                 ));
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
@@ -480,6 +496,7 @@ fn run_tray_thread(
             match cmd {
                 TrayCommand::SetPausedCheck(p) => {
                     item_pause.set_checked(p);
+                    pause_checked.store(p, Ordering::Relaxed);
                 }
                 TrayCommand::SetTooltip(t) => {
                     if let Err(e) = tray.set_tooltip(Some(t)) {

@@ -47,9 +47,13 @@ impl App {
                             "tray: controller start returned None (non-Windows or spawn failed)",
                         );
                     } else {
-                        let paused = self.activity_gate.is_paused();
+                        // checkmark は設定値 (pause_indexer_while_minimized) を反映する。
+                        // 以前は activity_gate.is_paused() を使っていたが、ウィンドウ表示中は
+                        // 必ず false で、ダイアログの設定チェックボックスと表示がズレていた。
+                        // ユーザーの自然なメンタルモデル「常駐時に一時停止するか」の設定値を
+                        // 直接出すのが正。
                         if let Some(tc) = &self.tray_controller {
-                            tc.set_paused_check(paused);
+                            tc.set_paused_check(self.settings.pause_indexer_while_minimized);
                         }
                         self.update_tray_tooltip();
                     }
@@ -270,10 +274,16 @@ impl App {
                 TrayEvent::OpenRequested => {
                     self.sync_after_restore();
                 }
-                TrayEvent::TogglePauseRequested => {
-                    let new_state = self.activity_gate.is_paused();
-                    self.settings.pause_indexer_while_minimized = new_state;
+                TrayEvent::TogglePauseRequested { new_checked } => {
+                    // トレイ checkmark = 設定 `pause_indexer_while_minimized` の新値
+                    // (muda が auto-toggle 済み、activity_gate もトレイスレッドが反映済み)。
+                    // ここでは設定を保存し、ウィンドウが表示中ならランタイム activity_gate は
+                    // 「ウィンドウ表示中は止めない」の不変に戻す (設定は次回 minimize で効く)。
+                    self.settings.pause_indexer_while_minimized = new_checked;
                     self.settings.save();
+                    if self.window_visible {
+                        self.activity_gate.set_paused(false);
+                    }
                     self.update_tray_tooltip();
                 }
                 TrayEvent::QuitRequested => {
