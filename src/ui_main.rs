@@ -564,9 +564,8 @@ impl App {
                             toolbar_rating_changed = true;
                         }
                     }
-                    // ★フィルタ一時解除中バッジ。コンテナ自身の★で開いた結果として
-                    // 今は filter が全 ON になっているが、親に戻ると復元される状態を示す。
-                    // クリックで即復元 (= 手動で BS を押さなくても anchor 外判定にできる)。
+                    // ★フィルタ一時解除中: コンテナ自身の★で開いた結果として filter が
+                    // 全 ON に書き換わっている状態を示すバッジ。クリックで即復元。
                     if self.rating_filter_suppressed_at.is_some() {
                         let resp = ui
                             .small_button(
@@ -574,11 +573,8 @@ impl App {
                                     .color(egui::Color32::from_rgb(200, 140, 40)),
                             )
                             .on_hover_text("コンテナ自身の★で開いたため一時解除中です。\n親へ戻るか、このバッジをクリックで復元。");
-                        if resp.clicked() {
-                            if let Some((_, saved)) = self.rating_filter_suppressed_at.take() {
-                                self.settings.rating_filter = saved;
-                                toolbar_rating_changed = true;
-                            }
+                        if resp.clicked() && self.restore_rating_filter_suppression() {
+                            toolbar_rating_changed = true;
                         }
                     }
                     first_section = false;
@@ -1059,6 +1055,7 @@ impl App {
                     }
                 }
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                    // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
                     let p = p.clone();
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     nav = Some(p);

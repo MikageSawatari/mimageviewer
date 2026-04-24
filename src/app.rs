@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -276,6 +276,23 @@ fn passes_rating_filter(
     } else {
         true
     }
+}
+
+/// `current` が `anchor` 配下 (= 同一 or 子孫) かを case-insensitive に判定する。
+/// Windows の case-insensitive FS 対応 (`C:\Photos` と `c:\photos` を同一扱い)。
+/// ドライブ文字は保持するので、cross-drive の偶然一致を起こさない
+/// (例: `C:\books\vol1.zip` と `D:\books\vol1.zip` は別扱い)。
+///
+/// component-boundary も守る (`/books/book-a` と `/books/book-a-extra` を別扱い)。
+fn path_in_subtree_ci(current: &std::path::Path, anchor: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| p.to_string_lossy().to_lowercase().replace('\\', "/");
+    let cur = norm(current);
+    let anc = norm(anchor);
+    if cur == anc {
+        return true;
+    }
+    cur.strip_prefix(&anc)
+        .is_some_and(|tail| tail.starts_with('/'))
 }
 
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
@@ -5819,12 +5836,9 @@ impl App {
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
-                        Some(GridItem::Folder(p)) => {
-                            let p = p.clone();
-                            self.maybe_suppress_rating_filter_for_opened_container(idx);
-                            return Some(p);
-                        }
-                        Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                        Some(GridItem::Folder(p))
+                        | Some(GridItem::ZipFile(p))
+                        | Some(GridItem::PdfFile(p)) => {
                             let p = p.clone();
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             return Some(p);
@@ -7324,22 +7338,26 @@ impl App {
         if !self.rating_filter_active() {
             return;
         }
-        let item = match self.items.get(idx) {
-            Some(it) => it,
-            None => return,
-        };
-        let anchor = match item {
-            GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p.clone(),
-            GridItem::ConvertibleArchive { path, .. } => path.clone(),
-            _ => return,
+        // item borrow は get_rating (mut) と競合するので先に path を取り出してから release する。
+        let Some(anchor) = self
+            .items
+            .get(idx)
+            .and_then(|it| it.container_path())
+            .map(Path::to_path_buf)
+        else {
+            return;
         };
         let stars = self.get_rating(idx);
         if !(1..=5).contains(&stars) {
             return;
         }
-        if !self.settings.rating_filter[stars as usize] {
-            // 自身の★が現在フィルタに通っていない場合は、そもそも親ビューで見えなかった
-            // はず (= ユーザーが address bar や Ctrl+↑↓ で直接辿り着いた)。意図した操作と
+        // bucket の index safety + `accepts_rating` 判定を passes_rating_filter に委譲。
+        // ConvertibleArchive (7z/LZH) は accepts_rating=false で get_rating が必ず 0 を
+        // 返すため、上の 1..=5 check で先に弾かれる (このブランチには到達しない)。
+        let item = &self.items[idx];
+        if !passes_rating_filter(item, stars, &self.settings.rating_filter) {
+            // 自身の★が現在フィルタに通っていない = 親ビューで見えなかったはず
+            // (= ユーザーが address bar や Ctrl+↑↓ で直接辿り着いた)。意図した操作と
             // 見なしてフィルタは保持する。
             return;
         }
@@ -7360,13 +7378,25 @@ impl App {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
         };
-        let still_inside = current == *anchor || current.starts_with(anchor);
-        if still_inside {
+        if path_in_subtree_ci(&current, anchor) {
             return;
         }
+        self.restore_rating_filter_suppression();
+    }
+
+    /// suppression anchor を取り出し、保存されていたフィルタを復元する。
+    /// suppression 中でなければ `false` を返す (呼び出し側が no-op を検出できる)。
+    ///
+    /// `maybe_restore_rating_filter_if_out_of_scope` (scope 外自動復元) と
+    /// toolbar の「★一時解除中」バッジクリック (即時復元) の両方から使う。
+    pub(crate) fn restore_rating_filter_suppression(&mut self) -> bool {
         if let Some((_, saved)) = self.rating_filter_suppressed_at.take() {
             self.settings.rating_filter = saved;
-            // 復元も save() は呼ばない (そもそも in-memory 改変を元に戻すだけ)。
+            // save() は呼ばない: suppression 中の書き換えも in-memory のみだったため、
+            // 復元は単に元の saved 値に戻すだけで永続化する必要がない。
+            true
+        } else {
+            false
         }
     }
 
@@ -12705,38 +12735,71 @@ mod tests {
         assert!(!passes_rating_filter(&img, 99, &[true; 6]));
     }
 
-    /// ★フィルタ suppression の scope 判定 (anchor の subtree 内外)。
-    /// 実装は `current == anchor || current.starts_with(anchor)` の単純比較なので、
-    /// Path::starts_with の component 単位一致を信頼してテストする。
+    /// ★フィルタ suppression の scope 判定: folder anchor。
+    /// case-insensitive + component-boundary + cross-drive を `path_in_subtree_ci` で担保する。
     #[test]
     fn rating_filter_suppression_scope_folder_anchor() {
         use std::path::Path;
         let anchor = PathBuf::from("/books/book-a");
-        // anchor 自身: inside
-        assert!(Path::new("/books/book-a").starts_with(&anchor));
-        // subfolder: inside
-        assert!(Path::new("/books/book-a/chapter1").starts_with(&anchor));
-        assert!(Path::new("/books/book-a/chapter1/sub").starts_with(&anchor));
-        // parent: outside
-        assert!(!Path::new("/books").starts_with(&anchor));
-        // sibling: outside
-        assert!(!Path::new("/books/book-b").starts_with(&anchor));
-        // name prefix match でも component 単位では外れる (starts_with の仕様)
-        assert!(!Path::new("/books/book-a-extra").starts_with(&anchor));
+        // 同一 / 子孫
+        assert!(path_in_subtree_ci(Path::new("/books/book-a"), &anchor));
+        assert!(path_in_subtree_ci(
+            Path::new("/books/book-a/chapter1"),
+            &anchor
+        ));
+        assert!(path_in_subtree_ci(
+            Path::new("/books/book-a/chapter1/sub"),
+            &anchor
+        ));
+        // 親 / sibling は外
+        assert!(!path_in_subtree_ci(Path::new("/books"), &anchor));
+        assert!(!path_in_subtree_ci(Path::new("/books/book-b"), &anchor));
+        // name prefix match (`book-a-extra`) は component 境界を守って外れる
+        assert!(!path_in_subtree_ci(
+            Path::new("/books/book-a-extra"),
+            &anchor
+        ));
     }
 
     #[test]
     fn rating_filter_suppression_scope_zip_pdf_anchor() {
         use std::path::Path;
-        // ZIP / PDF は current_folder がファイルパスそのもの。
         let zip = PathBuf::from("/books/vol1.zip");
-        assert!(Path::new("/books/vol1.zip").starts_with(&zip));
-        assert!(!Path::new("/books").starts_with(&zip)); // BS で親へ → outside
-        assert!(!Path::new("/books/vol2.zip").starts_with(&zip)); // sibling → outside
+        assert!(path_in_subtree_ci(Path::new("/books/vol1.zip"), &zip));
+        assert!(!path_in_subtree_ci(Path::new("/books"), &zip)); // BS で親へ → outside
+        assert!(!path_in_subtree_ci(Path::new("/books/vol2.zip"), &zip)); // sibling
 
         let pdf = PathBuf::from("/books/manual.pdf");
-        assert!(Path::new("/books/manual.pdf").starts_with(&pdf));
-        assert!(!Path::new("/books").starts_with(&pdf));
+        assert!(path_in_subtree_ci(Path::new("/books/manual.pdf"), &pdf));
+        assert!(!path_in_subtree_ci(Path::new("/books"), &pdf));
+    }
+
+    /// Windows の case-insensitive FS: ドライブ文字や階層名の casing 違いを同一視する。
+    /// これが効かないと、address bar 入力や Explorer D&D で casing が変わった瞬間に
+    /// suppression scope から脱落してフィルタが復元されてしまう (ユーザー視点では
+    /// 「なぜか filter が急に戻った」= 旧バグ)。
+    #[test]
+    fn path_in_subtree_ci_is_case_insensitive() {
+        use std::path::Path;
+        let anchor = PathBuf::from(r"C:\Books\Vol1.zip");
+        assert!(path_in_subtree_ci(Path::new(r"c:\books\vol1.zip"), &anchor));
+        assert!(path_in_subtree_ci(Path::new(r"C:\BOOKS\VOL1.ZIP"), &anchor));
+        // 区切り文字の違いも吸収する
+        assert!(path_in_subtree_ci(Path::new("C:/Books/Vol1.zip"), &anchor));
+    }
+
+    /// cross-drive 偶然一致を起こさない (C:/foo と D:/foo は別扱い)。
+    /// path_key::normalize がドライブ文字を剥がすのに対し、こちらは保持することで
+    /// 別ドライブの同名コンテナを誤って同一 scope と判定しない。
+    #[test]
+    fn path_in_subtree_ci_keeps_drive_letter_distinct() {
+        use std::path::Path;
+        let anchor = PathBuf::from(r"C:\books\vol1.zip");
+        assert!(!path_in_subtree_ci(Path::new(r"D:\books\vol1.zip"), &anchor));
+        assert!(!path_in_subtree_ci(
+            Path::new(r"D:\books\vol1.zip\page001.jpg"),
+            &anchor
+        ));
     }
 
     /// 同名フォルダがある ZIP/PDF/ConvertibleArchive (7z/LZH) は

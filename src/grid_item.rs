@@ -109,6 +109,17 @@ impl GridItem {
         matches!(self, Self::Folder(_) | Self::ZipFile(_) | Self::PdfFile(_))
     }
 
+    /// コンテナ系アイテム (Folder / ZipFile / PdfFile / ConvertibleArchive) のパスを返す。
+    /// 画像・ページ系や Video / Separator / SearchContainer は対象外で `None`。
+    /// 「開く」アクションのナビゲーション先抽出などで使う。
+    pub fn container_path(&self) -> Option<&Path> {
+        match self {
+            Self::Folder(p) | Self::ZipFile(p) | Self::PdfFile(p) => Some(p),
+            Self::ConvertibleArchive { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     /// レーティング★を付与できるアイテムかの総合判定。
     /// ページ単位 (画像 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP / PDF) の
     /// 両方を含む。補正プリセット等のページ専用データとは別物なので区別すること。
