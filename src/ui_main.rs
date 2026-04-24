@@ -107,11 +107,11 @@ fn rating_solo_with_unrated_menu_label(idx: usize) -> String {
 
 fn rating_tooltip(idx: usize) -> String {
     if idx == 0 {
-        "未評価を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: すべて表示 [F6 で解除]"
+        "未評価を表示 [F6 で解除]\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: すべて表示"
             .to_string()
     } else {
         format!(
-            "★{idx} を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} とフォルダ [F{idx} で付与]"
+            "★{idx} を表示 [F{idx} で付与]\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} とフォルダ"
         )
     }
 }
@@ -1362,10 +1362,14 @@ impl App {
                             }
                         }
 
-                        // グリッドの空白部分で右クリック → フォルダメニュー
-                        // Sense::click() だと左クリックも消費するので、
-                        // ポインタ位置を直接チェックする
-                        let bg_right_clicked = ctx.input(|i| i.pointer.secondary_clicked());
+                        // グリッドの空白部分で右クリック → フォルダメニュー。
+                        // Sense::click() だと左クリックも消費するので、ポインタ位置を
+                        // 直接チェックする。`ctx.input` はグローバルなので、ツールバーの
+                        // ★フィルタボタン等への右クリックまで拾ってグリッドの右クリック
+                        // メニューが同時に開いてしまう不具合があった。`ui_contains_pointer`
+                        // で CentralPanel 範囲内に限定する。
+                        let bg_right_clicked = ui.ui_contains_pointer()
+                            && ctx.input(|i| i.pointer.secondary_clicked());
                         if bg_right_clicked && self.context_menu_idx.is_none() {
                             if self.current_folder.is_some() {
                                 self.context_menu_idx = Some(usize::MAX);
