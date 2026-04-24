@@ -701,9 +701,14 @@ impl App {
         self.install_new_items(items, image_metas);
         self.selected = None;
         // idx ベース状態 + キュー排水 (requested / pending_finalize / texture_backlog /
-        // keep_* / rotation / rating / adjustment / thumb_pixels / ai_* / fs_* /
-        // reload_queue / heavy_io_queue) を一括破棄。
+        // keep_* / rotation / rating / adjustment_cache / thumb_pixels / ai_* / fs_* /
+        // reload_queue / heavy_io_queue / tag_prewarm_*) を一括破棄。
         self.invalidate_idx_state_and_queues();
+        // 補正・マスクも idx ベース。Ctrl+G は items が総入れ替わりするので
+        // 旧フォルダの個別設定は意味を失うため clear する。
+        // (削除経路では呼び出し元が idx shift で保持する)
+        self.adjustment_page_params.clear();
+        self.mask_pages.clear();
         // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();
         self.exif_cache.clear();
@@ -716,6 +721,9 @@ impl App {
         self.scroll_to_selected = false;
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.rebuild_visible_indices();
+        // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
+        // 検索結果向けに再起動 + fts_meta から tags_cache を再プリウォーム。
+        self.prewarm_grid_tags();
     }
 
     /// Ctrl+G を押したときのエントリ (open or close toggle)。

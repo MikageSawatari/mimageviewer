@@ -3750,11 +3750,12 @@ impl App {
         self.keep_end_shared.store(0, Ordering::Relaxed);
 
         // idx-keyed caches (HashMap<usize, ...>)
+        // 注: `adjustment_page_params` / `mask_pages` は DB ロード済みの「ユーザーが付けた」
+        // idx-keyed 状態なので、ここでは触らない。削除経路では呼び出し元が idx shift し、
+        // 差し替え経路 (Ctrl+G) では呼び出し元が明示的に clear する。
         self.rotation_cache.clear();
         self.rating_cache.clear();
         self.adjustment_cache.clear();
-        self.adjustment_page_params.clear();
-        self.mask_pages.clear();
         self.thumb_pixels.clear();
         self.thumb_adjust_tex.clear();
         self.ai_upscale_cache.clear();
@@ -3774,6 +3775,14 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         self.ai_upscale_pending.clear();
+
+        // タグプリウォーム: idx-keyed な queued 集合 + worker handle。worker は旧 idx の
+        // 画像パスを参照し続けるので、items 差し替え・削除のどちらでも取り消す。
+        // 再 spawn は呼び出し元 (replace_search_view_items / 削除まとめ後) の責務。
+        if let Some(pending) = self.tag_prewarm_pending.take() {
+            pending.cancel();
+        }
+        self.tag_prewarm_queued.clear();
 
         // キューに残った旧 idx リクエストを排水。items_gen 差異で最終的には破棄されるが、
         // worker が pop した直後は decode を走らせ始めてしまうので、明示的に捨てる。
@@ -3825,6 +3834,35 @@ impl App {
                 .collect();
             *filter = new_filter;
         }
+
+        // adjustment_page_params / mask_pages は DB ロード済みのユーザ設定なので
+        // clear ではなく idx shift で残存ページの分を保持する。
+        // 削除 idx に一致する分だけドロップし、それより大きい idx は -1。
+        self.adjustment_page_params = std::mem::take(&mut self.adjustment_page_params)
+            .into_iter()
+            .filter_map(|(i, v)| {
+                if i < idx {
+                    Some((i, v))
+                } else if i > idx {
+                    Some((i - 1, v))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.mask_pages = self
+            .mask_pages
+            .iter()
+            .filter_map(|&i| {
+                if i < idx {
+                    Some(i)
+                } else if i > idx {
+                    Some(i - 1)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         self.invalidate_idx_state_and_queues();
 

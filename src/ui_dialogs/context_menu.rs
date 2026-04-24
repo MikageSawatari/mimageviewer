@@ -615,13 +615,24 @@ impl crate::app::App {
                         // 降順で削除（インデックスずれ防止）
                         let mut targets = std::mem::take(&mut self.delete_targets);
                         targets.sort_by(|a, b| b.0.cmp(&a.0));
-                        for (idx, path) in &targets {
-                            if move_to_recycle_bin(path) {
-                                self.remove_item_session(*idx);
-                            }
+                        let any_removed = targets
+                            .iter()
+                            .filter(|(idx, path)| {
+                                if move_to_recycle_bin(path) {
+                                    self.remove_item_session(*idx);
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .count()
+                            > 0;
+                        // remove_item_session は tag_prewarm worker を cancel するだけで
+                        // 再 spawn しない (複数ファイル削除でループごとに spawn しないため)。
+                        // 一括削除が終わったここで 1 回だけ再 spawn してタグ badges を復活させる。
+                        if any_removed {
+                            self.prewarm_grid_tags();
                         }
-                        // remove_item_session 内で checked はクリアされるが、
-                        // 最後に見落としがないよう明示的に閉じる。
                         self.show_delete_confirm = false;
                         self.delete_targets.clear();
                     }
