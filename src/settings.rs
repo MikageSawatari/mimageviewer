@@ -898,7 +898,7 @@ fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
 fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
-fn default_rating_filter() -> [bool; 6] {
+pub fn default_rating_filter() -> [bool; 6] {
     [true; 6]
 }
 

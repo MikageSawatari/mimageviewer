@@ -16,6 +16,134 @@ use crate::ui_helpers::{
     PROGRESS_BG_COLOR, PROGRESS_LABEL_COLOR, PROGRESS_NORMAL_COLOR, PROGRESS_UPGRADE_COLOR,
 };
 
+// ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
+//
+// 通常クリック: そのバケットをトグル
+// Ctrl+クリック: solo (そのバケットだけ ON)。同 solo 状態で再クリック → 全 ON (DAW 流)
+// Shift+クリック: threshold (そのバケット以上 ON)。同状態で再クリック → 全 ON
+// 右クリック: コンテキストメニューから同 3 操作 (こちらは toggle せず常に「set」)
+
+#[derive(Clone, Copy)]
+enum RatingFilterOp {
+    Toggle,
+    Solo,
+    Threshold,
+    AllOn,
+}
+
+fn is_rating_solo(rf: &[bool; 6], idx: usize) -> bool {
+    (0..6).all(|i| rf[i] == (i == idx))
+}
+
+fn is_rating_threshold(rf: &[bool; 6], idx: usize) -> bool {
+    (0..idx).all(|i| !rf[i]) && (idx..6).all(|i| rf[i])
+}
+
+fn apply_rating_filter_op(rf: &mut [bool; 6], op: RatingFilterOp, idx: usize) {
+    match op {
+        RatingFilterOp::Toggle => rf[idx] = !rf[idx],
+        RatingFilterOp::Solo => {
+            for i in 0..6 {
+                rf[i] = i == idx;
+            }
+        }
+        RatingFilterOp::Threshold => {
+            for i in 0..6 {
+                rf[i] = i >= idx;
+            }
+        }
+        RatingFilterOp::AllOn => {
+            *rf = crate::settings::default_rating_filter();
+        }
+    }
+}
+
+fn rating_button_label(idx: usize) -> String {
+    if idx == 0 {
+        "なし".to_string()
+    } else {
+        "★".repeat(idx)
+    }
+}
+
+fn rating_solo_menu_label(idx: usize) -> String {
+    if idx == 0 {
+        "未評価のみ表示 (Ctrl+クリック)".to_string()
+    } else {
+        format!("★{} のみ表示 (Ctrl+クリック)", idx)
+    }
+}
+
+fn rating_threshold_menu_label(idx: usize) -> String {
+    if idx == 0 {
+        "すべて表示 (Shift+クリック)".to_string()
+    } else {
+        format!("★{} 以上を表示 (Shift+クリック)", idx)
+    }
+}
+
+fn rating_tooltip(idx: usize) -> String {
+    if idx == 0 {
+        "未評価を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: すべて表示 [F6 で解除]"
+            .to_string()
+    } else {
+        format!(
+            "★{idx} を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上 [F{idx} で付与]"
+        )
+    }
+}
+
+/// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
+fn draw_rating_filter_button(ui: &mut egui::Ui, rf: &mut [bool; 6], idx: usize) -> bool {
+    let sel = rf[idx];
+    let resp = ui
+        .selectable_label(sel, rating_button_label(idx))
+        .on_hover_text(rating_tooltip(idx));
+    let mut changed = false;
+    if resp.clicked() {
+        let mods = ui.input(|i| i.modifiers);
+        // Windows 専用ビルドなので mods.command は ctrl と同値 (egui 内で alias)。
+        // 既存コード (src/ui_main.rs:992 の Ctrl+クリック選択等) と合わせて ctrl のみを見る。
+        let op = if mods.ctrl {
+            if is_rating_solo(rf, idx) {
+                RatingFilterOp::AllOn
+            } else {
+                RatingFilterOp::Solo
+            }
+        } else if mods.shift {
+            if is_rating_threshold(rf, idx) {
+                RatingFilterOp::AllOn
+            } else {
+                RatingFilterOp::Threshold
+            }
+        } else {
+            RatingFilterOp::Toggle
+        };
+        apply_rating_filter_op(rf, op, idx);
+        changed = true;
+    }
+    // 右クリックメニューは常に「set」(toggle せず) なので op を直接渡す。
+    resp.context_menu(|ui| {
+        if ui.button(rating_solo_menu_label(idx)).clicked() {
+            apply_rating_filter_op(rf, RatingFilterOp::Solo, idx);
+            changed = true;
+            ui.close();
+        }
+        if ui.button(rating_threshold_menu_label(idx)).clicked() {
+            apply_rating_filter_op(rf, RatingFilterOp::Threshold, idx);
+            changed = true;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("すべて表示").clicked() {
+            apply_rating_filter_op(rf, RatingFilterOp::AllOn, idx);
+            changed = true;
+            ui.close();
+        }
+    });
+    changed
+}
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -422,29 +550,9 @@ impl App {
                         ui.separator();
                     }
                     ui.label("★:");
-                    // 「なし」バケット (index 0): ☆ 記号で表現
-                    {
-                        let sel = self.settings.rating_filter[0];
-                        if ui
-                            .selectable_label(sel, "なし")
-                            .on_hover_text("未評価を表示 [F6 で解除]")
-                            .clicked()
+                    for idx in 0..6 {
+                        if draw_rating_filter_button(ui, &mut self.settings.rating_filter, idx)
                         {
-                            self.settings.rating_filter[0] = !sel;
-                            toolbar_rating_changed = true;
-                        }
-                    }
-                    // ★1〜★5
-                    for stars in 1u8..=5 {
-                        let idx = stars as usize;
-                        let sel = self.settings.rating_filter[idx];
-                        let label = "★".repeat(stars as usize);
-                        if ui
-                            .selectable_label(sel, label)
-                            .on_hover_text(format!("★{} を表示 [F{} で付与]", stars, stars))
-                            .clicked()
-                        {
-                            self.settings.rating_filter[idx] = !sel;
                             toolbar_rating_changed = true;
                         }
                     }
@@ -1263,5 +1371,110 @@ impl App {
                         );
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod rating_filter_op_tests {
+    use super::*;
+
+    #[test]
+    fn is_solo_detects_single_on_bucket() {
+        let mut rf = [false; 6];
+        rf[3] = true;
+        assert!(is_rating_solo(&rf, 3));
+        assert!(!is_rating_solo(&rf, 2));
+        // 全 ON は solo ではない
+        assert!(!is_rating_solo(&[true; 6], 3));
+        // 全 OFF も solo ではない
+        assert!(!is_rating_solo(&[false; 6], 3));
+    }
+
+    #[test]
+    fn is_threshold_detects_idx_and_above() {
+        let rf = [false, false, false, true, true, true];
+        assert!(is_rating_threshold(&rf, 3));
+        assert!(!is_rating_threshold(&rf, 2));
+        assert!(!is_rating_threshold(&rf, 4));
+        // idx=0 のとき threshold は全 ON と等価
+        assert!(is_rating_threshold(&[true; 6], 0));
+        assert!(!is_rating_threshold(&[false; 6], 0));
+    }
+
+    #[test]
+    fn apply_toggle_flips_single_bucket() {
+        let mut rf = [true; 6];
+        apply_rating_filter_op(&mut rf, RatingFilterOp::Toggle, 2);
+        assert_eq!(rf, [true, true, false, true, true, true]);
+        apply_rating_filter_op(&mut rf, RatingFilterOp::Toggle, 2);
+        assert_eq!(rf, [true; 6]);
+    }
+
+    #[test]
+    fn apply_solo_sets_only_target_on() {
+        let mut rf = [true; 6];
+        apply_rating_filter_op(&mut rf, RatingFilterOp::Solo, 3);
+        assert_eq!(rf, [false, false, false, true, false, false]);
+    }
+
+    #[test]
+    fn apply_threshold_sets_idx_and_above() {
+        let mut rf = [false; 6];
+        apply_rating_filter_op(&mut rf, RatingFilterOp::Threshold, 3);
+        assert_eq!(rf, [false, false, false, true, true, true]);
+        // idx=0 は全 ON と等価
+        apply_rating_filter_op(&mut rf, RatingFilterOp::Threshold, 0);
+        assert_eq!(rf, [true; 6]);
+    }
+
+    #[test]
+    fn apply_all_on_matches_default() {
+        let mut rf = [false; 6];
+        apply_rating_filter_op(&mut rf, RatingFilterOp::AllOn, 0);
+        assert_eq!(rf, crate::settings::default_rating_filter());
+    }
+
+    /// click logic のモデル: Ctrl+click は solo ↔ 全 ON を往復する。
+    #[test]
+    fn ctrl_click_model_solo_and_restore() {
+        let mut rf = [true; 6];
+        // 既に全 ON で Ctrl+★3 → solo 状態に
+        let op = if is_rating_solo(&rf, 3) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::Solo
+        };
+        apply_rating_filter_op(&mut rf, op, 3);
+        assert!(is_rating_solo(&rf, 3));
+        // 同じボタンを Ctrl+クリック再度 → 全 ON
+        let op = if is_rating_solo(&rf, 3) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::Solo
+        };
+        apply_rating_filter_op(&mut rf, op, 3);
+        assert_eq!(rf, crate::settings::default_rating_filter());
+    }
+
+    /// Shift+click は threshold ↔ 全 ON を往復する。
+    #[test]
+    fn shift_click_model_threshold_and_restore() {
+        let mut rf = [true; 6];
+        // 全 ON で Shift+★3 → threshold (idx>=3 のみ ON)
+        let op = if is_rating_threshold(&rf, 3) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::Threshold
+        };
+        apply_rating_filter_op(&mut rf, op, 3);
+        assert_eq!(rf, [false, false, false, true, true, true]);
+        // 同ボタン再度 → 全 ON
+        let op = if is_rating_threshold(&rf, 3) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::Threshold
+        };
+        apply_rating_filter_op(&mut rf, op, 3);
+        assert_eq!(rf, crate::settings::default_rating_filter());
     }
 }
