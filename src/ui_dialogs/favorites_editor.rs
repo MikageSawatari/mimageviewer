@@ -477,8 +477,13 @@ impl App {
 
                     // ── バックグラウンドインデクサのライブ進捗 ──
                     // メタ索引 supervisor (walker/ingest) と名前索引バルクの両方を
-                    // まとめて列挙する。完了済み or アイドルは出さない。
-                    // 完了の瞬間に progress.clear() されるので、何も出ない=全アイドル。
+                    // まとめて列挙する。完了済み or アイドルは current_activity が None
+                    // なので空欄になる (= 全アイドル)。
+                    //
+                    // 表示領域は固定高さの ScrollArea にしてある。これは notify-rs が
+                    // 別プロセスのファイルコピー等を細かく拾うと、行が一瞬出ては消える
+                    // 振動でダイアログ全体の高さが揺れていたため (2026-04 ユーザー指摘)。
+                    // 行数によらず常に同じ高さを確保し、内側だけスクロールする。
                     let mut active: Vec<(String, String)> = Vec::new();
                     for fav in &self.settings.favorites {
                         // メタ index (indexer_manager supervisor 経由)
@@ -496,31 +501,49 @@ impl App {
                             active.push((format!("{} (名前)", fav.name), msg.clone()));
                         }
                     }
-                    if !active.is_empty() {
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new("🔄 バックグラウンドインデクサ")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(200, 170, 60)),
-                        );
-                        for (name, msg) in &active {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  {}: {}",
-                                    name,
-                                    truncate_name(msg, 100)
-                                ))
-                                .size(11.0)
-                                .monospace()
-                                .color(egui::Color32::from_gray(150)),
-                            )
-                            .on_hover_text(format!("{name}: {msg}"));
-                        }
-                        // ライブ更新: 100ms ごとに再描画を要求して進捗を流す
-                        ctx.request_repaint_after(Duration::from_millis(100));
-                    }
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("🔄 バックグラウンドインデクサ")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(200, 170, 60)),
+                    );
+                    // 4 行ぶんの高さを常に確保。実行中アイテムが多ければスクロール。
+                    const ROW_H: f32 = 16.0;
+                    const VISIBLE_ROWS: f32 = 4.0;
+                    egui::ScrollArea::vertical()
+                        .id_salt("fav_edit_indexer_progress")
+                        .max_height(ROW_H * VISIBLE_ROWS)
+                        .min_scrolled_height(ROW_H * VISIBLE_ROWS)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_height(ROW_H * VISIBLE_ROWS);
+                            if active.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("  (アイドル)")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_gray(110)),
+                                );
+                            } else {
+                                for (name, msg) in &active {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "  {}: {}",
+                                            name,
+                                            truncate_name(msg, 100)
+                                        ))
+                                        .size(11.0)
+                                        .monospace()
+                                        .color(egui::Color32::from_gray(150)),
+                                    )
+                                    .on_hover_text(format!("{name}: {msg}"));
+                                }
+                            }
+                        });
+                    // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
+                    // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
 
                 if escape_pressed {
