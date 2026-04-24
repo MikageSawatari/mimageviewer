@@ -3867,12 +3867,16 @@ impl App {
             .collect();
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
 
-        // selected も idx shift する。削除対象だった場合は old idx を保持しておき、
-        // 後続の `sel >= n` clamp で「繰り上がった次 item / 末尾」に詰められる挙動を利用する。
-        // 例: [a,b,c,d,e] で 2 (c) を削除 → shift(2)=None だが 2 を残すと
-        //     新 len=4 で sel<4 なので新 idx 2 (= e の位置。繰り上がった d) に落ちる。
-        // こうするとキーボードで ★1 を連続削除するワークフローでカーソルが失われない。
-        self.selected = self.selected.map(|sel| shift(sel).unwrap_or(sel));
+        // selected の詰め動作: `sel - count(removed idx < sel)` は残存 / 削除どちらの
+        // ケースでも「old idx の位置に収まる新 idx」(= 繰り上がった次 item) を返す。
+        //   - sel が残存: new_idx = sel - p (shift と同じ)
+        //   - sel が削除対象: そのスロットは次の surviving item が詰まるので同じく sel - p
+        // 末尾を削除したケース (sel - p が新 len を超える) は後続の `sel >= n` clamp で
+        // n-1 にフォールバックする。
+        // 例: [a,b,c,d,e,f] で selected=3(d), 削除=[1,3] → p=1, new_sel = 3-1 = 2 = e。
+        self.selected = self
+            .selected
+            .map(|sel| sel - sorted_asc.partition_point(|&x| x < sel));
 
         self.invalidate_idx_state_and_queues();
 
