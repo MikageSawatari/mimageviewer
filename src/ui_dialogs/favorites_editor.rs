@@ -19,7 +19,59 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::indexer_supervisor::SupervisorStats;
-use crate::ui_helpers::truncate_name;
+use crate::ui_helpers::{format_bytes, truncate_name};
+
+/// 全文検索インデックスの on-disk サイズ (bytes) を集計する。
+///
+/// - `name_index_db`: お気に入り単位の名前索引 (SQLite)
+/// - `fts_meta_db`: メタ索引の per-source テキスト (SQLite、本体が 2GB 級になりうる)
+/// - `fts_index_dir`: Tantivy インデックス (segment ファイル群の合計)
+///
+/// すべて `stat()` ベースなので数ミリ秒で完了する。ダイアログを開くたびに再計算して
+/// 最新値を出す (ingest で増えるので)。存在しないファイル / ディレクトリは 0 扱い。
+struct IndexDiskSizes {
+    name_index_db: u64,
+    fts_meta_db: u64,
+    fts_index_dir: u64,
+}
+
+fn compute_index_disk_sizes() -> IndexDiskSizes {
+    let data_dir = crate::data_dir::get();
+    let file_size = |p: &std::path::Path| -> u64 {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    };
+    let dir_size = |p: &std::path::Path| -> u64 {
+        let Ok(entries) = std::fs::read_dir(p) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
+    };
+    // SQLite は WAL / SHM も DB 本体のサイズに含める (実際のディスク使用量)
+    let sqlite_size = |p: &std::path::Path| -> u64 {
+        let mut total = file_size(p);
+        let wal = p.with_extension(format!(
+            "{}-wal",
+            p.extension().and_then(|e| e.to_str()).unwrap_or("db")
+        ));
+        let shm = p.with_extension(format!(
+            "{}-shm",
+            p.extension().and_then(|e| e.to_str()).unwrap_or("db")
+        ));
+        total += file_size(&wal);
+        total += file_size(&shm);
+        total
+    };
+    IndexDiskSizes {
+        name_index_db: sqlite_size(&data_dir.join("search_index.db")),
+        fts_meta_db: sqlite_size(&data_dir.join("fts_meta.db")),
+        fts_index_dir: dir_size(&data_dir.join("fts_index")),
+    }
+}
 
 impl App {
     pub(crate) fn show_favorites_editor_dialog(&mut self, ctx: &egui::Context) {
@@ -105,19 +157,6 @@ impl App {
                             );
                             ui.separator();
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "pending 整理 {} / tombstone 消去 {}",
-                                    diag.pending_cleaned, diag.tombstone_purged
-                                ))
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
-                            )
-                            .on_hover_text(
-                                "前回異常終了などで status != ok で残った行を整理した件数。\n\
-                                 通常はどちらも 0 件。",
-                            );
-                            ui.separator();
-                            ui.label(
                                 egui::RichText::new(format!("I/O 並列度: {}", diag.io_permits))
                                     .size(11.0)
                                     .color(egui::Color32::from_gray(150)),
@@ -125,6 +164,44 @@ impl App {
                             .on_hover_text(
                                 "環境設定「インデクサの速度プロファイル」で変更可。\n\
                                  1=省電力 / 2=標準 / 4=高速",
+                            );
+                        });
+
+                        // インデックスのディスク使用量。ダイアログを開くたびに再計算 (stat のみ、< 数 ms)。
+                        let sizes = compute_index_disk_sizes();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("💾 インデックスサイズ:")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(150)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "名前索引 {}",
+                                    format_bytes(sizes.name_index_db)
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(150)),
+                            )
+                            .on_hover_text(
+                                "search_index.db (名前索引) のディスク使用量 (WAL/SHM 込み)。\n\
+                                 お気に入りごとの ファイル / フォルダ名インデックス。",
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "メタ索引 {} + {}",
+                                    format_bytes(sizes.fts_meta_db),
+                                    format_bytes(sizes.fts_index_dir)
+                                ))
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(150)),
+                            )
+                            .on_hover_text(
+                                "メタ索引のディスク使用量 (WAL/SHM 込み)。\n\
+                                 ・fts_meta.db: 正規化済みの検索対象テキスト (EXIF / XMP /\n\
+                                   PNG AI プロンプト / タグ) を格納。大量画像で数 GB になる\n\
+                                 ・fts_index/: Tantivy 全文検索インデックス (バイグラム索引)",
                             );
                         });
                     });
