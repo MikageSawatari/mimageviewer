@@ -338,8 +338,20 @@ impl App {
                 ArchiveConvertMsg::ConvertDone(Ok((_summary, cached_zip, _cached_size))) => {
                     // DB への record は worker 側で convert_lock を握ったまま済ませている
                     // (docs/async-architecture.md: maintenance と convert の直列化)。
-                    // UI はナビゲーションだけ行う。
-                    state.pending_nav = Some(cached_zip);
+                    // ただし convert worker が `ConvertDone` を送信してから guard を drop する
+                    // までの間に、待機していた clear_all / delete_entry が動き出して、
+                    // 今 record したばかりのエントリごと消す余地がある (convert_lock は
+                    // 「変換と保守が同時に走らない」を保証するが、「変換完了 → 保守開始 →
+                    // 保守完了 → UI 受信」の順序は許容される)。
+                    // ここで navigation 直前に存在確認し、削除済みなら再変換を促す。
+                    if cached_zip.exists() {
+                        state.pending_nav = Some(cached_zip);
+                    } else {
+                        state.phase = ArchiveConvertPhase::Error {
+                            message: "変換直後にキャッシュが削除されました。再度お試しください。"
+                                .to_string(),
+                        };
+                    }
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled)) => {
                     // ユーザーキャンセルならダイアログを即閉じる
