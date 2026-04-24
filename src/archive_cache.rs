@@ -98,6 +98,20 @@ pub struct ArchiveCacheEntry {
 /// 内部 `Connection` は `Mutex` で保護される。
 pub struct ArchiveCacheDb {
     conn: Mutex<Connection>,
+    /// 変換 (`reserve_cache_zip_path` → 実際のファイル write → `record`) と
+    /// 保守 (`delete_entry` / `clear_all`) を直列化するための独立 lock。
+    ///
+    /// `converted_at` は秒精度なので、snapshot 直後の再変換と DB 行を区別できず、
+    /// `cached_zip_path` も src に対して決定的なので並行 worker が同じパスを再利用する。
+    /// これらを避けるため:
+    /// - 変換 worker は [`Self::begin_convert`] で guard を取り、write + record 完了まで保持する。
+    /// - `delete_entry` / `clear_all` は内部でこの lock を取ってから snapshot + FS 削除 +
+    ///   DB DELETE を行う。
+    ///
+    /// 保守中は新しい変換が待たされるが、ユーザーが明示的に全削除 / 個別削除を
+    /// 指示したタイミングでしか起きないので許容する。変換中に保守が待たされる
+    /// ケースは通常秒オーダーで収束する。
+    convert_lock: Mutex<()>,
 }
 
 impl ArchiveCacheDb {
@@ -112,7 +126,17 @@ impl ArchiveCacheDb {
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            convert_lock: Mutex::new(()),
         })
+    }
+
+    /// 変換 worker は write + record を始める前にこの guard を取り、完了まで保持する。
+    /// maintenance (`delete_entry` / `clear_all`) は同じ lock を取るため、変換中は待つ。
+    /// 呼び出し側で poisoned 時は内側を取り出す — key は「記録欠落」ではなく「直列化」。
+    pub fn begin_convert(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.convert_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// 有効なキャッシュがあれば ZIP パスを返し、`last_access_at` を更新する。
@@ -286,34 +310,30 @@ impl ArchiveCacheDb {
     /// こうしないと 1 エントリの remove_file + 親ディレクトリ掃除を保持中に UI スレッドの
     /// lookup / total_size が待たされる。
     ///
-    /// SELECT から DELETE までの間に `record()` が同じ src を INSERT OR REPLACE して
-    /// 新しい `converted_at` で上書きする可能性があるため、WHERE に snapshot した
-    /// `converted_at` も含めて stale match だけを消す。新エントリは残す。
+    /// 並行変換 worker との race は [`Self::convert_lock`] で排他化する。秒精度の
+    /// `converted_at` では snapshot 直後の再変換を区別できず、`cached_zip_path` は src に
+    /// 対して決定的なので path も共有する — mtime ヒューリスティックでは防ぎきれないため、
+    /// convert_lock で直列化して変換中は保守を待たせる。
     pub fn delete_entry(&self, src_path: &Path) -> rusqlite::Result<()> {
+        let _convert_guard = self.begin_convert();
         let key = crate::path_key::normalize(src_path);
-        let row: Option<(String, i64)> = {
+        let row: Option<String> = {
             let conn = self.conn.lock().unwrap();
             conn.query_row(
-                "SELECT cached_zip_path, converted_at FROM converted_archives \
-                 WHERE src_path_key = ?1",
+                "SELECT cached_zip_path FROM converted_archives WHERE src_path_key = ?1",
                 params![&key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .ok()
         };
-        let Some((cached, converted_at)) = row else {
+        let Some(cached) = row else {
             return Ok(());
         };
-        // cached_zip_path は src に対して決定的なので、snapshot 〜 FS remove の間に
-        // 並行変換 worker が同じ path を再利用して書いている可能性がある。
-        // file mtime が snapshot_converted_at より新しければ remove を skip して
-        // 変換中の成果物を守る。DB 側は WHERE converted_at=? で stale 行のみ DELETE。
-        remove_cache_file_if_not_newer(Path::new(&cached), converted_at);
+        remove_cache_file_and_dirs(Path::new(&cached));
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM converted_archives \
-             WHERE src_path_key = ?1 AND converted_at = ?2",
-            params![&key, converted_at],
+            "DELETE FROM converted_archives WHERE src_path_key = ?1",
+            params![&key],
         )?;
         Ok(())
     }
@@ -342,42 +362,33 @@ impl ArchiveCacheDb {
     /// 以前は `remove_dir_all(cache_root)` + 無条件 `DELETE FROM converted_archives` で
     /// 丸ごと掃除していたが、タイミング次第で並行変換完了の成果物を吹き飛ばす競合があった。
     pub fn clear_all(&self) -> rusqlite::Result<usize> {
-        let snapshot: Vec<(String, String, i64)> = {
+        // 変換 worker と排他化。begin_convert 保持中は新規 convert/record がブロックされる。
+        // 全削除ワーカー自体が UI とは別スレッドなので、UI のレスポンスは影響しない。
+        let _convert_guard = self.begin_convert();
+
+        let snapshot: Vec<(String, String)> = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT src_path_key, cached_zip_path, converted_at FROM converted_archives",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT src_path_key, cached_zip_path FROM converted_archives")?;
             stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
             .flatten()
             .collect()
         };
-        // lock 外で個別のファイル + 空の親ディレクトリだけを削除。
-        // cached_zip_path は src に対して決定的なので、snapshot 後に同じ path へ並行 worker が
-        // 新しい ZIP を書き直す可能性がある。file mtime が snapshot converted_at より顕著に
-        // 新しければ remove_cache_file_if_not_newer が skip し、変換中の成果物を残す。
-        // parent dir は既に remove_dir で空でなければ黙って失敗する (新 ZIP と同居中は残る)。
-        for (_, p, converted_at) in &snapshot {
-            remove_cache_file_if_not_newer(Path::new(p), *converted_at);
+        // convert_lock 保持中は並行 record() が走らないので、snapshot 〜 FS 削除 〜 DB DELETE の
+        // 範囲内で「別 worker が同じパスを書き戻す」race は発生しない。
+        for (_, p) in &snapshot {
+            remove_cache_file_and_dirs(Path::new(p));
         }
-        // snapshot 対象の (key, converted_at) のみを DELETE。snapshot 後に `record()` が
-        // INSERT OR REPLACE で書き込んだ新エントリは converted_at が異なるので WHERE が
-        // マッチせず、新エントリは残る。トランザクションで N-statement オーバーヘッドを回避。
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted = 0usize;
         {
-            let mut stmt = tx.prepare(
-                "DELETE FROM converted_archives \
-                 WHERE src_path_key = ?1 AND converted_at = ?2",
-            )?;
-            for (key, _, converted_at) in &snapshot {
-                deleted += stmt.execute(params![key, converted_at])?;
+            let mut stmt =
+                tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
+            for (key, _) in &snapshot {
+                deleted += stmt.execute(params![key])?;
             }
         }
         tx.commit()?;
@@ -468,29 +479,6 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
     }
 }
 
-/// `zip_path` の mtime が `snapshot_converted_at` より顕著に新しければ削除をスキップする。
-/// maintenance が snapshot を取った後に別の変換 worker が同じ path に新しい ZIP を
-/// 書き込んだ (= cached_zip_path は src 由来で決定的なので同じ場所を共有する) ケースで、
-/// 変換中の成果物を誤って消さないための保険。秒精度の converted_at 同士を比較するので、
-/// FS rounding / レイテンシ由来の微妙な差は 5 秒のマージンで吸収する。
-/// 5 秒より大きく新しい場合は「別 worker が最近書いた」ので触らない。
-/// ファイルを開けない (mtime 不明) 場合は通常通り削除 (= 失敗したら無視)。
-fn remove_cache_file_if_not_newer(zip_path: &Path, snapshot_converted_at: i64) {
-    const SKEW_TOLERANCE_SECS: i64 = 5;
-    if let Ok(meta) = std::fs::metadata(zip_path) {
-        if let Ok(modified) = meta.modified() {
-            let file_secs = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(i64::MAX);
-            if file_secs > snapshot_converted_at.saturating_add(SKEW_TOLERANCE_SECS) {
-                // 新しすぎる — 変換 worker が同じ path を占有中。触らない。
-                return;
-            }
-        }
-    }
-    remove_cache_file_and_dirs(zip_path);
-}
 
 #[cfg(test)]
 mod tests {

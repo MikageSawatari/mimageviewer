@@ -335,23 +335,10 @@ impl App {
                         message: format!("スキャン失敗: {e}"),
                     };
                 }
-                ArchiveConvertMsg::ConvertDone(Ok((summary, cached_zip, cached_size))) => {
-                    // キャッシュ DB に記録
-                    if let Some(db) = self.archive_cache_db.as_ref() {
-                        if let Ok(meta) = std::fs::metadata(&state.src_path) {
-                            let src_mtime = crate::ui_helpers::mtime_secs(&meta);
-                            let src_size = meta.len() as i64;
-                            let _ = db.record(
-                                &state.src_path,
-                                src_mtime,
-                                src_size,
-                                state.format,
-                                &cached_zip,
-                                cached_size,
-                                summary.image_count,
-                            );
-                        }
-                    }
+                ArchiveConvertMsg::ConvertDone(Ok((_summary, cached_zip, _cached_size))) => {
+                    // DB への record は worker 側で convert_lock を握ったまま済ませている
+                    // (docs/async-architecture.md: maintenance と convert の直列化)。
+                    // UI はナビゲーションだけ行う。
                     state.pending_nav = Some(cached_zip);
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled)) => {
@@ -396,7 +383,13 @@ impl App {
         let format = state.format;
         let cancel_worker = cancel.clone();
         let progress_worker = progress.clone();
+        let db_worker = Arc::clone(&db);
         thread::spawn(move || {
+            // 変換と保守 (clear_all / delete_entry) を直列化する。guard は worker thread
+            // スコープを抜けるまで保持され、その間は maintenance がブロックされる。
+            // MutexGuard は !Send なのでここで取り、同 thread 内の record() まで持ち越す。
+            let _convert_guard = db_worker.begin_convert();
+
             let cb = |p: ConvertProgress| {
                 progress_worker
                     .files_done
@@ -411,12 +404,28 @@ impl App {
             let result = convert_to_zip(&src, &dst, format, &cancel_worker, Some(&cb));
             let msg = match result {
                 Ok(summary) => {
-                    let cached_size = std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
+                    let cached_size =
+                        std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
+                    // ここで record。convert_guard 保持中なので maintenance と排他。
+                    if let Ok(meta) = std::fs::metadata(&src) {
+                        let src_mtime = crate::ui_helpers::mtime_secs(&meta);
+                        let src_size = meta.len() as i64;
+                        let _ = db_worker.record(
+                            &src,
+                            src_mtime,
+                            src_size,
+                            format,
+                            &dst,
+                            cached_size,
+                            summary.image_count,
+                        );
+                    }
                     ArchiveConvertMsg::ConvertDone(Ok((summary, dst, cached_size)))
                 }
                 Err(e) => ArchiveConvertMsg::ConvertDone(Err(e)),
             };
             let _ = tx.send(msg);
+            // _convert_guard ここで drop。
         });
         state.phase = ArchiveConvertPhase::Converting { progress, cancel };
         state.rx = rx;
