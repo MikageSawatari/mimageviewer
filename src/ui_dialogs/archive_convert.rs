@@ -138,16 +138,28 @@ impl App {
             .as_mut()
             .and_then(|s| s.pending_nav.take())
         {
-            // 元 (7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
-            // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
-            let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
-            self.archive_convert = None;
-            self.load_folder(nav);
-            if let Some(src) = src {
-                self.address = src.to_string_lossy().to_string();
-                self.archive_source_override = Some(src);
+            // ConvertDone 受信時に `exists()` は通過しているが、pending_nav 消費までの
+            // 短い間隔で並行 maintenance (clear_all/delete_entry) が先に削除する順序レースが
+            // 残るため、navigate 直前にもう一度確認する。消えていたらエラー表示に戻す。
+            if !nav.exists() {
+                if let Some(s) = self.archive_convert.as_mut() {
+                    s.phase = ArchiveConvertPhase::Error {
+                        message: "変換直後にキャッシュが削除されました。再度お試しください。"
+                            .to_string(),
+                    };
+                }
+            } else {
+                // 元 (7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
+                // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
+                let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
+                self.archive_convert = None;
+                self.load_folder(nav);
+                if let Some(src) = src {
+                    self.address = src.to_string_lossy().to_string();
+                    self.archive_source_override = Some(src);
+                }
+                return;
             }
-            return;
         }
 
         let Some(state) = self.archive_convert.as_ref() else {
@@ -436,8 +448,12 @@ impl App {
                 }
                 Err(e) => ArchiveConvertMsg::ConvertDone(Err(e)),
             };
+            // guard を先に drop する: 待機中の maintenance を走らせてから `ConvertDone` を
+            // 送るため、UI 側の `exists()` チェックは「maintenance 完了後」の状態を見ることに
+            // なる。guard 保持のまま send してしまうと、UI が先に `exists()` を評価して
+            // pending_nav を立て、その後で maintenance が走って同 ZIP を削除する race が残る。
+            drop(_convert_guard);
             let _ = tx.send(msg);
-            // _convert_guard ここで drop。
         });
         state.phase = ArchiveConvertPhase::Converting { progress, cancel };
         state.rx = rx;
