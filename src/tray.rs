@@ -226,7 +226,16 @@ impl TrayController {
 
     /// 「一時停止」メニュー項目のチェック状態を更新。
     /// App 側から設定ページなど経由で paused が変化したときの同期用。
+    ///
+    /// 共有 atomic を**即時**更新してから command を送る点に注意 (Codex P2)。
+    /// `cmd_tx` は bounded channel + tray thread の 50ms ポーリングで遅延があるため、
+    /// command 処理前に `poll_tray_events` の `reconcile_pause_state` が走ると、
+    /// 古い atomic 値で `settings.pause_indexer_while_minimized` を巻き戻す race が
+    /// 起きる。atomic を先に書き換えれば次フレームの reconcile は no-op になり、
+    /// tray thread 側の `item_pause.set_checked` だけ遅延適用される (見た目だけ
+    /// 数十ミリ秒遅れる) 形に収まる。同 atomic への二重 store は冪等。
     pub fn set_paused_check(&self, paused: bool) {
+        self.pause_checked.store(paused, Ordering::Relaxed);
         let _ = self.cmd_tx.send(TrayCommand::SetPausedCheck(paused));
     }
 
