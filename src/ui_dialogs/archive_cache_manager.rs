@@ -78,8 +78,10 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let busy = self.archive_cache_maint_pending.is_some();
+                    // 変換進行中は削除ボタンを無効化 (本体ダイアログと同じ不変条件)
+                    let convert_in_flight = self.archive_convert.is_some();
                     let del_btn = egui::Button::new("  削除する  ");
-                    if ui.add_enabled(!busy, del_btn).clicked() {
+                    if ui.add_enabled(!busy && !convert_in_flight, del_btn).clicked() {
                         if let Some(db) = self.archive_cache_db.clone() {
                             self.archive_cache_maint_pending =
                                 Some(crate::cache_maintenance::spawn_archive(
@@ -116,6 +118,10 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     };
 
     let busy = app.archive_cache_maint_pending.is_some();
+    // 変換進行中は delete 系操作をブロックする。convert_lock は record と maintenance を
+    // 排他するが、ConvertDone 送信 ↔ UI 受信 ↔ pending_nav 消費の順序レースまでは閉じないため、
+    // UI 層で delete 系の起動自体を止めるのが確実。LoadRows (再読込) は削除しないので許可。
+    let convert_in_flight = app.archive_convert.is_some();
     if busy {
         // worker 完了まで毎フレーム再描画して結果反映を受け取る。
         ui.ctx().request_repaint();
@@ -153,10 +159,11 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(6.0);
 
     let selected_count = app.archive_cache_selection.len();
+    let delete_allowed = !busy && !convert_in_flight;
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
-                !busy && selected_count > 0,
+                delete_allowed && selected_count > 0,
                 egui::Button::new(format!("選択を削除 ({})", selected_count)),
             )
             .clicked()
@@ -165,7 +172,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
         }
         if ui
             .add_enabled(
-                !busy && missing_count > 0,
+                delete_allowed && missing_count > 0,
                 egui::Button::new(format!("元ファイル消失を削除 ({})", missing_count)),
             )
             .clicked()
@@ -176,7 +183,7 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
             ));
         }
         if ui
-            .add_enabled(!busy && row_count > 0, egui::Button::new("すべて削除"))
+            .add_enabled(delete_allowed && row_count > 0, egui::Button::new("すべて削除"))
             .clicked()
         {
             app.archive_cache_confirm_delete_all = true;
@@ -188,6 +195,14 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
             app.reload_archive_cache_rows();
         }
     });
+    if convert_in_flight {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("(変換中は削除操作を無効化しています)")
+                .small()
+                .weak(),
+        );
+    }
 
     ui.add_space(6.0);
     ui.separator();
