@@ -301,12 +301,26 @@ impl GlobalSearchState {
     }
 }
 
+/// ZIP 内エントリを示すヒットパス (`<zippath>!<entry>`) かを判定する。
+/// `!` は Windows のファイル名に含められる有効文字 (Eagle 等が生成するファイル名に含まれる)
+/// のため、単純な `contains('!')` では ZIP 判定として不十分。file_part 側が `.zip` で
+/// 終わる場合のみ ZIP エントリ扱いにする。
+fn split_zip_hit_path(hit_path: &str) -> Option<(&str, &str)> {
+    hit_path
+        .split_once('!')
+        .filter(|(file_part, _)| file_part.to_ascii_lowercase().ends_with(".zip"))
+}
+
+fn is_zip_hit_path(hit_path: &str) -> bool {
+    split_zip_hit_path(hit_path).is_some()
+}
+
 /// GlobalHit のパスから「サムネ表示できる代表」の情報を抽出する。
 ///
 /// 画像ファイル / ZIP 内画像 / PDF ファイルのいずれかならサムネイル化できるため
 /// 代表として採用する。それ以外 (未対応拡張子 / フォルダ名ヒットのみ) は None。
 fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentative> {
-    let (file_part, entry) = match hit_path.split_once('!') {
+    let (file_part, entry) = match split_zip_hit_path(hit_path) {
         Some((zip, ent)) => (zip, Some(ent.to_string())),
         None => (hit_path, None),
     };
@@ -339,7 +353,7 @@ fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentati
 /// - ZIP エントリ (`<zippath>!<entry>` 形式) → ZIP ファイルパス
 /// - 通常ファイル → 親フォルダパス
 fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
-    if let Some((zip_part, _entry)) = hit_path.split_once('!') {
+    if let Some((zip_part, _entry)) = split_zip_hit_path(hit_path) {
         return (PathBuf::from(zip_part), SearchContainerKind::Zip);
     }
     let p = PathBuf::from(hit_path);
@@ -465,7 +479,7 @@ pub(crate) fn build_drilled_items(
     let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
 
     for h in &state.all_hits {
-        if h.path.contains('!') {
+        if is_zip_hit_path(&h.path) {
             continue; // ZIP ヒットはスキップ
         }
         let hp = PathBuf::from(&h.path);
@@ -540,7 +554,7 @@ fn build_drilled_zip_items(
     let mut items: Vec<GridItem> = Vec::new();
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
     for h in &state.all_hits {
-        let Some((zip_part, entry)) = h.path.split_once('!') else {
+        let Some((zip_part, entry)) = split_zip_hit_path(&h.path) else {
             continue;
         };
         if zip_part != zip_key {
@@ -639,7 +653,7 @@ pub(crate) fn collect_hit_folders_dfs(
     let mut folders: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     folders.insert(container_root.to_path_buf());
     for h in all_hits {
-        if h.path.contains('!') {
+        if is_zip_hit_path(&h.path) {
             continue; // ZIP ヒットはスキップ (container_root が ZIP のときは未対応)
         }
         let hp = PathBuf::from(&h.path);
@@ -1559,6 +1573,37 @@ mod tests {
         let (p, k) = parent_container("c:/photos/sunset/IMG.jpg");
         assert_eq!(p, PathBuf::from("c:/photos/sunset"));
         assert_eq!(k, SearchContainerKind::Folder);
+    }
+
+    /// 回帰: ファイル名にリテラル `!` を含む通常ファイル (Eagle が生成する
+    /// `20230416_181414-1024x1536-!fav_loli_A-....png` のような名前) を ZIP エントリと
+    /// 誤判定しない。以前は `split_once('!')` で file_part=`...1536-`、entry=`fav_loli_A-...png`
+    /// になり、存在しないフォルダにドリルダウンして「読込失敗」になっていた。
+    #[test]
+    fn parent_container_handles_bang_in_filename() {
+        let (p, k) = parent_container(
+            "g:/photos/20230418_推し/20230416_181414-1024x1536-!fav_loli_A-8.png",
+        );
+        assert_eq!(p, PathBuf::from("g:/photos/20230418_推し"));
+        assert_eq!(k, SearchContainerKind::Folder);
+    }
+
+    #[test]
+    fn split_zip_hit_path_only_splits_on_zip_ext() {
+        // .zip → split する
+        assert_eq!(
+            split_zip_hit_path("c:/a/book.zip!entry.jpg"),
+            Some(("c:/a/book.zip", "entry.jpg"))
+        );
+        // 大文字 .ZIP でも OK
+        assert_eq!(
+            split_zip_hit_path("c:/a/book.ZIP!entry.jpg"),
+            Some(("c:/a/book.ZIP", "entry.jpg"))
+        );
+        // .zip 以外は split しない (ファイル名中の `!`)
+        assert_eq!(split_zip_hit_path("c:/a/img-!name.png"), None);
+        // `!` なしもなし
+        assert_eq!(split_zip_hit_path("c:/a/img.png"), None);
     }
 
     #[test]
