@@ -2789,21 +2789,6 @@ impl App {
         if self.favsearch.saved_folder.is_none() {
             self.favsearch.saved_folder = self.current_folder.clone();
         }
-        // 名前索引フラグの反映確認用 (Ctrl+S 押下時の snapshot)。
-        let total = self.settings.favorites.len();
-        let on_names: Vec<&str> = self
-            .settings
-            .favorites
-            .iter()
-            .filter(|f| f.auto_index_structure)
-            .map(|f| f.name.as_str())
-            .collect();
-        crate::logger::log(format!(
-            "favsearch: open_favsearch. structure-on = {}/{} names = {:?}",
-            on_names.len(),
-            total,
-            on_names,
-        ));
     }
 
     /// Ctrl+F のローカルメタデータ検索バーを開く。

@@ -358,15 +358,6 @@ impl App {
                                                     new_val,
                                                 ));
                                                 any_setting_dirty = true;
-                                                crate::logger::log(format!(
-                                                    "fav-edit: name index toggled fav_id={} \
-                                                     name=\"{}\" new={} (in-memory \
-                                                     auto_index_structure now = {})",
-                                                    fav_id.as_simple(),
-                                                    self.settings.favorites[i].name,
-                                                    new_val,
-                                                    self.settings.favorites[i].auto_index_structure,
-                                                ));
                                             }
                                             let name_on =
                                                 self.settings.favorites[i].auto_index_structure;
@@ -609,15 +600,6 @@ impl App {
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
         if any_setting_dirty {
             self.settings.save();
-            crate::logger::log(format!(
-                "fav-edit: settings saved. structure-on count = {}/{}",
-                self.settings
-                    .favorites
-                    .iter()
-                    .filter(|f| f.auto_index_structure)
-                    .count(),
-                self.settings.favorites.len(),
-            ));
             // 「常駐中はインデックス更新を一時停止する」が変わっていたら、トレイメニューの
             // checkmark も同期する (環境設定ダイアログの同項目と同じ経路)。
             if old_pause_minimized != self.settings.pause_indexer_while_minimized {
