@@ -186,14 +186,14 @@ Tantivy / fts_meta の双方で列を分ける。
 
 - 通常ファイル: 1 画像 = 1 doc
 - ZIP 内画像: 1 エントリ = 1 doc (`container="zip"`, `zip_entry` に相対パス、
-  `path` は `<zippath>!<entry>` 形式)
+  `path` は `<zippath>\u{1F}<entry>` 形式、separator は `search_norm::ZIP_ENTRY_SEP`)
 - PDF: ファイル本体 1 つ = 1 doc (本文は対象外、§5 参照)
 
 ### 3.3 fts_meta.db
 
 ```sql
 CREATE TABLE files (
-    path TEXT PRIMARY KEY,            -- 正規化済み (ZIP 内は "<zippath>!<entry>")
+    path TEXT PRIMARY KEY,            -- 正規化済み (ZIP 内は "<zippath>\u{1F}<entry>", search_norm::ZIP_ENTRY_SEP)
     favorite_id TEXT NOT NULL,        -- FavoriteEntry.id (UUID)
     favorite_root TEXT NOT NULL,      -- 表示・集計用の原文パス
     kind INTEGER NOT NULL,            -- 0=folder, 1=image, 2=zip, 3=pdf
@@ -672,7 +672,8 @@ bigram 候補絞り込みは不要。むしろ「グローバル候補を走査�
 1. 現在表示中の `App::items` から画像 / ZipImage 系の path 集合を抽出
    (`Vec<PathBuf>`, 順序保持)
    - **重要**: この path は fts_meta.db に登録された正規化形式
-     (lowercase + `/` + `<zippath>!<entry>`) に**必ず揃える**。生データのまま
+     (lowercase + `/` + `<zippath>\u{1F}<entry>`、separator は
+     `search_norm::ZIP_ENTRY_SEP`) に**必ず揃える**。生データのまま
      IN 句に入れると大小文字 / 区切りで空振りする
 2. `fts_meta.db` から一括 SELECT: target で列を絞って `WHERE path IN (?,?,...)`
 3. 取得した (path, text) に `search_query::matches(ast, text)` 評価

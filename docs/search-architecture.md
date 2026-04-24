@@ -109,8 +109,10 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F fast path の全経路で `normalize_path`
-(= lowercase + `/` 区切り + ZIP 内エントリは `<zippath>!<entry>`) を通す。
+(= lowercase + `/` 区切り + ZIP 内エントリは `<zippath>\u{1F}<entry>`、
+separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 新しい lookup 経路を追加するときも同じ正規化を通すこと。
+`!` を separator に戻してはいけない (通常ファイル名と衝突する。INDEX_VERSION=4 で廃止)。
 
 ---
 
@@ -207,7 +209,8 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 ### 4.6 ZIP 対応のスコープ
 
 - ZIP ファイル自体: ファイル名として index される
-- ZIP 内画像: ingest の対象 (fts_meta.db の path は `<zippath>!<entry>` 正規化)
+- ZIP 内画像: ingest の対象 (fts_meta.db の path は `<zippath>\u{1F}<entry>` 正規化、
+  `search_norm::ZIP_ENTRY_SEP`)
 - ネスト ZIP: 外側 ZIP を 1 回だけ開いて全エントリを連続 ingest。内側 ZIP の
   バイト列キャッシュは ingest 用 context では 1 レベルに制限 (RAM 暴走防止)
 - ZIP ファイル自体の mtime 変化 = 全エントリ再 ingest (ZIP 内 mtime は個別取得
