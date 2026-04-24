@@ -1371,6 +1371,8 @@ impl App {
         });
         if let Some(stars) = rating_key {
             self.set_rating(fs_idx, stars);
+            // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
+            self.rebuild_visible_indices();
             if stars == 0 {
                 self.show_feedback_toast("[★解除]".to_string());
             } else {

@@ -437,12 +437,30 @@ pub fn adjacent_navigable_idx(
             )
         })
         .collect();
-    let pos = nav_indices.iter().position(|&i| i == current)?;
-    let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
-    if new_pos == pos {
-        None
+    if nav_indices.is_empty() {
+        return None;
+    }
+    // current がフィルタで外されている (例: フルスクリーンで F1-F6 により
+    // レーティング変更後) 場合は、items 順で方向側の最寄りを返す。
+    // nav_indices は visible_indices (昇順) の部分列なのでこちらも昇順。
+    // `partition_point` で insert 位置を求めれば prev/next を O(log n) で取れる。
+    let insert_pos = nav_indices.partition_point(|&i| i < current);
+    let current_in_list = nav_indices.get(insert_pos).is_some_and(|&i| i == current);
+    if current_in_list {
+        let pos = insert_pos;
+        let new_pos =
+            (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
+        if new_pos == pos {
+            None
+        } else {
+            Some(nav_indices[new_pos])
+        }
+    } else if delta > 0 {
+        nav_indices.get(insert_pos).copied()
+    } else if delta < 0 {
+        insert_pos.checked_sub(1).map(|p| nav_indices[p])
     } else {
-        Some(nav_indices[new_pos])
+        None
     }
 }
 
@@ -812,5 +830,54 @@ mod tests {
     fn split_path_components_drive_only() {
         assert_eq!(split_path_components("c:"), vec!["c:"]);
         assert_eq!(split_path_components("c:/"), vec!["c:"]);
+    }
+
+    // ── adjacent_navigable_idx ──
+    fn img_items(n: usize) -> Vec<GridItem> {
+        (0..n)
+            .map(|i| GridItem::Image(std::path::PathBuf::from(format!("/a/{}.jpg", i))))
+            .collect()
+    }
+
+    #[test]
+    fn adjacent_navigable_idx_current_in_list_moves_normally() {
+        let items = img_items(5);
+        let vi = vec![0, 1, 2, 3, 4];
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 2, 1), Some(3));
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 2, -1), Some(1));
+        // 境界: 末尾から +1 / 先頭から -1 は None
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 4, 1), None);
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 0, -1), None);
+    }
+
+    /// current が visible_indices から外れている (フィルタで除外された) ときは
+    /// items 順で方向側の最寄り visible idx を返す。
+    #[test]
+    fn adjacent_navigable_idx_current_not_in_list_finds_direction_neighbor() {
+        let items = img_items(5);
+        // idx=2 だけフィルタで除外された状態
+        let vi = vec![0, 1, 3, 4];
+        // current=2 で +1 → 2 より大きい最小 = 3
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 2, 1), Some(3));
+        // current=2 で -1 → 2 より小さい最大 = 1
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 2, -1), Some(1));
+    }
+
+    #[test]
+    fn adjacent_navigable_idx_current_not_in_list_boundary_none() {
+        let items = img_items(5);
+        let vi = vec![1, 2, 3];
+        // current=4 (末尾より後) で +1 → 無し
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 4, 1), None);
+        // current=0 (先頭より前) で -1 → 無し
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 0, -1), None);
+    }
+
+    #[test]
+    fn adjacent_navigable_idx_empty_list_returns_none() {
+        let items = img_items(3);
+        let vi: Vec<usize> = Vec::new();
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 1, 1), None);
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 1, -1), None);
     }
 }

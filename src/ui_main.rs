@@ -629,16 +629,12 @@ impl App {
             }
         }
 
-        // レーティングフィルタ変更: 設定を保存して visible_indices を再計算
+        // レーティングフィルタ変更: 設定を保存して visible_indices を再計算。
+        // selected が filter から外れた場合の処理は `rebuild_visible_indices` が
+        // 直近の visible idx にリダイレクト (旧コードは None にクリアしていた)。
         if toolbar_rating_changed {
             self.settings.save();
             self.rebuild_visible_indices();
-            // 選択が見えなくなった場合は解除
-            if let Some(sel) = self.selected {
-                if !self.visible_indices.contains(&sel) {
-                    self.selected = None;
-                }
-            }
         }
 
         // ツールバーのタグ項目クリック
@@ -991,7 +987,19 @@ impl App {
                     }
                 }
             } else if ctrl {
-                // Ctrl+クリック: チェック ON/OFF トグル + 選択移動
+                // Ctrl+クリック: チェック ON/OFF トグル + 選択移動。
+                // 初回 Ctrl+クリック (checked が空) のときは直前のカーソル位置も checked に
+                // 入れる (エクスプローラ流「A 通常クリック → B Ctrl+クリックで A+B が選択」)。
+                if self.checked.is_empty() {
+                    if let Some(prev_sel) = self.selected {
+                        if prev_sel != idx
+                            && self.idx_visible(prev_sel)
+                            && self.items.get(prev_sel).is_some_and(|it| it.is_checkable())
+                        {
+                            self.checked.insert(prev_sel);
+                        }
+                    }
+                }
                 if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
                     if self.checked.contains(&idx) {
                         self.checked.remove(&idx);

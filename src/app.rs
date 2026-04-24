@@ -3616,6 +3616,10 @@ impl App {
             if sel.is_some() {
                 self.scroll_to_selected = true;
             }
+            // 前回保存時は可視だった sel が、現在のフィルタ状態では非可視かもしれない。
+            // `rebuild_visible_indices` 時点では selected が None だったので redirect が
+            // 走っておらず、ここで再度 redirect して WYSIWYG 不変条件を保つ (Codex P2)。
+            self.redirect_selected_to_visible();
         } else if let Some(name) = self.select_after_load.take() {
             // 履歴がない場合のフォールバック: 指定名のアイテムを探して選択
             let name_lower = name.to_lowercase();
@@ -6352,6 +6356,41 @@ impl App {
         }
         self.visible_indices = result;
         self.cached_nav_indices = None;
+        // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
+        // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
+        // 「F1 で非表示にした後、矢印キーで一覧先頭に飛ぶ」挙動も解消される。
+        if !self.checked.is_empty() {
+            let vi = &self.visible_indices;
+            self.checked.retain(|idx| vi.binary_search(idx).is_ok());
+        }
+        self.redirect_selected_to_visible();
+    }
+
+    /// `visible_indices` に含まれる (= フィルタ後の一覧に出ている) かを返す。
+    /// `visible_indices` は items 順 (昇順) なので binary_search で O(log n)。
+    pub(crate) fn idx_visible(&self, idx: usize) -> bool {
+        self.visible_indices.binary_search(&idx).is_ok()
+    }
+
+    /// `self.selected` が visible_indices から外れていたら、items 順で直近の
+    /// visible idx にリダイレクトする (手前優先、無ければ次)。
+    /// `rebuild_visible_indices` の末尾と、`load_folder` の履歴から selected を
+    /// 復元した直後で呼ぶ (Codex P2: 履歴復元で stale な hidden idx が入り得るため)。
+    pub(crate) fn redirect_selected_to_visible(&mut self) {
+        let Some(sel) = self.selected else {
+            return;
+        };
+        let vi = &self.visible_indices;
+        if vi.binary_search(&sel).is_ok() {
+            return;
+        }
+        let pos = vi.partition_point(|&i| i < sel);
+        let prev = pos.checked_sub(1).map(|p| vi[p]);
+        let next = vi.get(pos).copied();
+        self.selected = prev.or(next);
+        if self.selected.is_some() {
+            self.scroll_to_selected = true;
+        }
     }
 
     /// メタデータキーワード検索を実行する。
@@ -7137,14 +7176,19 @@ impl App {
     /// 述語で「受け入れる GridItem 種別」を切り替える:
     /// - レーティング (F1〜F6) は `accepts_rating` (コンテナ含む)
     /// - 補正プリセット / マスクスロット (Ctrl+1〜0 / F7F8) は `is_ratable` (ページ専用)
+    ///
+    /// `rebuild_visible_indices` が `checked` / `selected` を可視範囲内に保つ不変条件を
+    /// 維持しているが、`load_folder` の履歴復元で `selected` を後から差し戻すケース等で
+    /// 一時的に非可視な idx を指す可能性があるので、ここでも `idx_visible` で防御する。
     fn targets_matching(&self, pred: impl Fn(&GridItem) -> bool) -> Vec<usize> {
         if !self.checked.is_empty() {
             self.checked
                 .iter()
                 .copied()
-                .filter(|&idx| self.items.get(idx).is_some_and(&pred))
+                .filter(|&idx| self.idx_visible(idx) && self.items.get(idx).is_some_and(&pred))
                 .collect()
         } else if let Some(idx) = self.selected
+            && self.idx_visible(idx)
             && self.items.get(idx).is_some_and(&pred)
         {
             vec![idx]
