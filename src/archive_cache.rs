@@ -199,40 +199,47 @@ impl ArchiveCacheDb {
     }
 
     /// 全エントリを `ArchiveCacheEntry` のリストとして返す (最終アクセス降順)。
+    ///
+    /// DB 読み出しだけ mutex 保持し、各 src_path の `exists()` チェック (per-row FS syscall)
+    /// は lock を落としてから実行する。件数が多いと数十〜数百 ms かかるので、その間に UI が
+    /// 別の DB 操作で mutex 待ちにならないようにする。
     pub fn list_all(&self) -> rusqlite::Result<Vec<ArchiveCacheEntry>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT src_path, src_mtime, src_size, format, \
-                    cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count \
-             FROM converted_archives \
-             ORDER BY last_access_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, i64>(8)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows.flatten() {
-            let (
-                src_str,
-                src_mtime,
-                src_size,
-                format_str,
-                cached_str,
-                cached_zip_size,
-                converted_at,
-                last_access_at,
-                image_count,
-            ) = row;
+        let raw: Vec<(String, i64, i64, String, String, i64, i64, i64, i64)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT src_path, src_mtime, src_size, format, \
+                        cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count \
+                 FROM converted_archives \
+                 ORDER BY last_access_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+        let mut out = Vec::with_capacity(raw.len());
+        for (
+            src_str,
+            src_mtime,
+            src_size,
+            format_str,
+            cached_str,
+            cached_zip_size,
+            converted_at,
+            last_access_at,
+            image_count,
+        ) in raw
+        {
             let src_path = PathBuf::from(&src_str);
             let cached_zip_path = PathBuf::from(&cached_str);
             let Some(format) = format_from_db(&format_str) else {
@@ -256,19 +263,25 @@ impl ArchiveCacheDb {
     }
 
     /// 指定した元ファイルに対応するキャッシュを削除する (DB 行 + ZIP ファイル + 親ディレクトリ)。
+    ///
+    /// DB mutex は lookup と DELETE の短時間だけ保持し、ファイル削除は lock 外で実行する。
+    /// こうしないと 1 エントリの remove_file + 親ディレクトリ掃除を保持中に UI スレッドの
+    /// lookup / total_size が待たされる。
     pub fn delete_entry(&self, src_path: &Path) -> rusqlite::Result<()> {
         let key = crate::path_key::normalize(src_path);
-        let conn = self.conn.lock().unwrap();
-        let cached: Option<String> = conn
-            .query_row(
+        let cached: Option<String> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
                 "SELECT cached_zip_path FROM converted_archives WHERE src_path_key = ?1",
                 params![&key],
                 |r| r.get(0),
             )
-            .ok();
+            .ok()
+        };
         if let Some(ref p) = cached {
             remove_cache_file_and_dirs(Path::new(p));
         }
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM converted_archives WHERE src_path_key = ?1",
             params![&key],
@@ -291,9 +304,14 @@ impl ArchiveCacheDb {
 
     /// 全てのエントリを削除し、キャッシュディレクトリをまるごと掃除する。
     /// 戻り値は削除したエントリ数。
+    ///
+    /// DB mutex は「パス一覧の読み出し」「DELETE 実行」の 2 回だけ保持し、間の
+    /// ファイル削除 (N 件の remove_file + remove_dir_all) は lock 外で走らせる。
+    /// キャッシュが GB 級あるとファイル削除だけで数秒かかるので、その間に UI スレッドの
+    /// lookup / total_size / 変換開始が mutex 待ちにならないようにする。
     pub fn clear_all(&self) -> rusqlite::Result<usize> {
-        let conn = self.conn.lock().unwrap();
         let cached_paths: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare("SELECT cached_zip_path FROM converted_archives")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .flatten()
@@ -302,12 +320,13 @@ impl ArchiveCacheDb {
         for p in &cached_paths {
             remove_cache_file_and_dirs(Path::new(p));
         }
-        let n = conn.execute("DELETE FROM converted_archives", [])?;
-        // ついでにキャッシュルートの空サブディレクトリも掃除しておく
+        // キャッシュルートの空サブディレクトリも掃除 (時間かかりうる、lock 外で)
         let root = cache_root();
         if root.is_dir() {
             let _ = std::fs::remove_dir_all(&root);
         }
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM converted_archives", [])?;
         Ok(n)
     }
 

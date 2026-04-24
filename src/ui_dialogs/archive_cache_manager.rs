@@ -20,10 +20,18 @@ use crate::ui_helpers::{format_bytes, truncate_name};
 impl App {
     /// 変換済みアーカイブキャッシュ管理ダイアログを開くためのフラグ初期化。
     /// メニューから呼ぶこと。ロードはワーカーに回し、ダイアログは空の状態で開く。
+    ///
+    /// すでに worker 実行中 (例: 削除 pending) の場合は reload を spawn し直さない。
+    /// 上書きすると走行中 worker の完了メッセージを受け取れなくなり、削除後の再ロードや
+    /// 完了トーストが失われる。worker は完了時に自分で適切な状態 (LoadRows なら rows 更新、
+    /// Delete* なら poll 側で reload 再 spawn) に遷移するので、open の責務はダイアログを
+    /// 見えるようにするだけでよい。
     pub(crate) fn open_archive_cache_manager(&mut self) {
         self.archive_cache_manager_result = None;
         self.show_archive_cache_manager = true;
-        self.reload_archive_cache_rows();
+        if self.archive_cache_maint_pending.is_none() {
+            self.reload_archive_cache_rows();
+        }
     }
 
     pub(crate) fn show_archive_cache_manager_dialog(&mut self, ctx: &egui::Context) {
