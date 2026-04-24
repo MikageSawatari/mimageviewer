@@ -152,18 +152,29 @@ impl ArchiveCacheDb {
         }
 
         // Phase 3: UPDATE / DELETE (短時間 lock)
+        //
+        // Phase 1 の SELECT から Phase 3 の DELETE までの間に、`record()` が同じ src に対して
+        // INSERT OR REPLACE で新しい変換結果を書き込む可能性がある (ユーザが並行で同じ
+        // アーカイブを開いて変換し直したケース)。単純に `src_path_key = ?` で DELETE すると
+        // その新エントリまで巻き込んでしまうので、WHERE に Phase 1 で読んだ `src_mtime` +
+        // `src_size` を含めて「自分が見た時点の古い行」にだけ DELETE がヒットするようにする。
+        // 同じ条件で UPDATE もしておき、valid だったエントリを別のワーカーが同時に差し替えて
+        // いた場合はこちらの last_access_at 更新を素通しにする (新エントリの last_access_at を
+        // 古く上書きしてしまうのを避ける)。
         let conn = self.conn.lock().ok()?;
         if mismatch || !zip_exists {
             let _ = conn.execute(
-                "DELETE FROM converted_archives WHERE src_path_key = ?1",
-                params![&key],
+                "DELETE FROM converted_archives \
+                 WHERE src_path_key = ?1 AND src_mtime = ?2 AND src_size = ?3",
+                params![&key, m, s],
             );
             return None;
         }
         let now = now_secs();
         let _ = conn.execute(
-            "UPDATE converted_archives SET last_access_at = ?1 WHERE src_path_key = ?2",
-            params![now, &key],
+            "UPDATE converted_archives SET last_access_at = ?1 \
+             WHERE src_path_key = ?2 AND src_mtime = ?3 AND src_size = ?4",
+            params![now, &key, m, s],
         );
         Some(zip_path)
     }
@@ -274,24 +285,31 @@ impl ArchiveCacheDb {
     /// DB mutex は lookup と DELETE の短時間だけ保持し、ファイル削除は lock 外で実行する。
     /// こうしないと 1 エントリの remove_file + 親ディレクトリ掃除を保持中に UI スレッドの
     /// lookup / total_size が待たされる。
+    ///
+    /// SELECT から DELETE までの間に `record()` が同じ src を INSERT OR REPLACE して
+    /// 新しい `converted_at` で上書きする可能性があるため、WHERE に snapshot した
+    /// `converted_at` も含めて stale match だけを消す。新エントリは残す。
     pub fn delete_entry(&self, src_path: &Path) -> rusqlite::Result<()> {
         let key = crate::path_key::normalize(src_path);
-        let cached: Option<String> = {
+        let row: Option<(String, i64)> = {
             let conn = self.conn.lock().unwrap();
             conn.query_row(
-                "SELECT cached_zip_path FROM converted_archives WHERE src_path_key = ?1",
+                "SELECT cached_zip_path, converted_at FROM converted_archives \
+                 WHERE src_path_key = ?1",
                 params![&key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok()
         };
-        if let Some(ref p) = cached {
-            remove_cache_file_and_dirs(Path::new(p));
-        }
+        let Some((cached, converted_at)) = row else {
+            return Ok(());
+        };
+        remove_cache_file_and_dirs(Path::new(&cached));
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM converted_archives WHERE src_path_key = ?1",
-            params![&key],
+            "DELETE FROM converted_archives \
+             WHERE src_path_key = ?1 AND converted_at = ?2",
+            params![&key, converted_at],
         )?;
         Ok(())
     }
@@ -320,12 +338,17 @@ impl ArchiveCacheDb {
     /// 以前は `remove_dir_all(cache_root)` + 無条件 `DELETE FROM converted_archives` で
     /// 丸ごと掃除していたが、タイミング次第で並行変換完了の成果物を吹き飛ばす競合があった。
     pub fn clear_all(&self) -> rusqlite::Result<usize> {
-        let snapshot: Vec<(String, String)> = {
+        let snapshot: Vec<(String, String, i64)> = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT src_path_key, cached_zip_path FROM converted_archives")?;
+            let mut stmt = conn.prepare(
+                "SELECT src_path_key, cached_zip_path, converted_at FROM converted_archives",
+            )?;
             stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })?
             .flatten()
             .collect()
@@ -333,19 +356,22 @@ impl ArchiveCacheDb {
         // lock 外で個別のファイル + 空の親ディレクトリだけを削除。
         // remove_cache_file_and_dirs は parent.remove_dir で空でなければ黙って失敗するので、
         // snapshot 後に新しく作られた ZIP と同居していても新 ZIP は残る。
-        for (_, p) in &snapshot {
+        for (_, p, _) in &snapshot {
             remove_cache_file_and_dirs(Path::new(p));
         }
-        // snapshot 対象の key だけを DELETE。トランザクションで束ねて N-statement オーバー
-        // ヘッドを回避 (数千件あると 1 件ずつでは秒級になりうる)。
+        // snapshot 対象の (key, converted_at) のみを DELETE。snapshot 後に `record()` が
+        // INSERT OR REPLACE で書き込んだ新エントリは converted_at が異なるので WHERE が
+        // マッチせず、新エントリは残る。トランザクションで N-statement オーバーヘッドを回避。
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted = 0usize;
         {
-            let mut stmt =
-                tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
-            for (key, _) in &snapshot {
-                deleted += stmt.execute(params![key])?;
+            let mut stmt = tx.prepare(
+                "DELETE FROM converted_archives \
+                 WHERE src_path_key = ?1 AND converted_at = ?2",
+            )?;
+            for (key, _, converted_at) in &snapshot {
+                deleted += stmt.execute(params![key, converted_at])?;
             }
         }
         tx.commit()?;

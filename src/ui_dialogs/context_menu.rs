@@ -719,6 +719,23 @@ impl crate::app::App {
 // ---------------------------------------------------------------------------
 // ゴミ箱移動は `src/delete_worker.rs` に集約 (バックグラウンド実行 + バッチ)。
 
+/// クリップボード書き込みジョブの最新世代番号。発行時点で seq を取り、worker が
+/// 実際にクリップボードに書く直前にこの値と比較、古ければ書き込みをスキップする。
+/// これで「遅いコピー A の後に速いコピー B をクリック」ケースで A が B を
+/// 上書きするのを防ぐ (画像 decode / PowerShell 起動いずれも対象)。
+static CLIPBOARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 次世代の seq を発行する。発行値が最新 (= CLIPBOARD_SEQ の現在値) かをチェックするには
+/// `CLIPBOARD_SEQ.load()` と比較する。
+fn bump_clipboard_seq() -> u64 {
+    CLIPBOARD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// `my_seq` がまだ最新なら true。古ければ false — 書き込みをスキップすべき合図。
+fn clipboard_seq_is_latest(my_seq: u64) -> bool {
+    CLIPBOARD_SEQ.load(std::sync::atomic::Ordering::Relaxed) == my_seq
+}
+
 /// ファイルをクリップボードにコピー (エクスプローラのコピーと同等)。
 pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
     #[cfg(windows)]
@@ -726,6 +743,7 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
         if paths.is_empty() {
             return;
         }
+        let my_seq = bump_clipboard_seq();
         let paths_str: Vec<String> = paths
             .iter()
             .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
@@ -737,7 +755,7 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
              @({arr}) | ForEach-Object {{ $col.Add($_) | Out-Null }}\n\
              [System.Windows.Forms.Clipboard]::SetFileDropList($col)\n"
         );
-        run_ps_script_async(script, None);
+        run_ps_script_async_seq(script, None, my_seq);
     }
     #[cfg(not(windows))]
     {
@@ -752,6 +770,7 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
         if paths.is_empty() {
             return;
         }
+        let my_seq = bump_clipboard_seq();
         let paths_str: Vec<String> = paths
             .iter()
             .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
@@ -768,7 +787,7 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
              $data.SetData('Preferred DropEffect', $ms)\n\
              [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)\n"
         );
-        run_ps_script_async(script, None);
+        run_ps_script_async_seq(script, None, my_seq);
     }
     #[cfg(not(windows))]
     {
@@ -782,10 +801,11 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
 ///
 /// decode + DIB 構築は worker スレッドで行う。20MP 超や巨大 RAW では
 /// 数百ms〜秒単位かかるため、UI スレッドから同期実行すると右クリック操作で固まる。
-/// 完了順序は保証しないが (ユーザーが連打する想定はない)、最後に成功したコピーが
-/// クリップボードに残る — 通常の Windows アプリと同じ挙動。
+/// 発行時に `CLIPBOARD_SEQ` を bump し、set 直前に最新 seq と比較、自分が古ければ
+/// set をスキップする — 遅い A が速い B を追い越して上書きするのを防ぐ。
 fn copy_image_to_clipboard(path: &std::path::Path) {
     let path = path.to_path_buf();
+    let my_seq = bump_clipboard_seq();
     std::thread::Builder::new()
         .name("clipboard-image-copy".into())
         .spawn(move || {
@@ -803,6 +823,9 @@ fn copy_image_to_clipboard(path: &std::path::Path) {
                     return;
                 }
             };
+            if !clipboard_seq_is_latest(my_seq) {
+                return;
+            }
             set_image_to_clipboard(&img);
         })
         .ok();
@@ -814,6 +837,7 @@ fn copy_image_to_clipboard(path: &std::path::Path) {
 fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
     let zip_path = zip_path.to_path_buf();
     let entry_name = entry_name.to_string();
+    let my_seq = bump_clipboard_seq();
     std::thread::Builder::new()
         .name("clipboard-zip-image-copy".into())
         .spawn(move || {
@@ -823,6 +847,9 @@ fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
             let Ok(img) = image::load_from_memory(&bytes) else {
                 return;
             };
+            if !clipboard_seq_is_latest(my_seq) {
+                return;
+            }
             set_image_to_clipboard(&img);
         })
         .ok();
@@ -942,8 +969,26 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
 /// 一時ファイル名は呼び出しごとにユニーク化して並行操作の衝突を避ける。
 /// 完了を知りたい呼び出し元は `on_done` に `mpsc::Sender<()>` を渡す (paste 用)。
 /// clipboard copy/cut はファイア & フォーゲットなので None を渡す。
+///
+/// paste 用 (クリップボードの書き込みではなく読み出し → FS 操作) には生 API の方を呼ぶ。
 #[cfg(windows)]
 fn run_ps_script_async(script: String, on_done: Option<mpsc::Sender<()>>) {
+    run_ps_script_inner(script, on_done, None);
+}
+
+/// clipboard copy/cut (PowerShell で書き込み) 用。seq が古ければ PowerShell 起動を
+/// スキップする。
+#[cfg(windows)]
+fn run_ps_script_async_seq(script: String, on_done: Option<mpsc::Sender<()>>, my_seq: u64) {
+    run_ps_script_inner(script, on_done, Some(my_seq));
+}
+
+#[cfg(windows)]
+fn run_ps_script_inner(
+    script: String,
+    on_done: Option<mpsc::Sender<()>>,
+    clipboard_seq: Option<u64>,
+) {
     // process id + atomic counter で temp ファイル衝突を回避。
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -955,6 +1000,15 @@ fn run_ps_script_async(script: String, on_done: Option<mpsc::Sender<()>>) {
     std::thread::Builder::new()
         .name("powershell-clipboard-exec".into())
         .spawn(move || {
+            // clipboard 書き込み系は worker 起動後に stale 判定 → 起動コストごとスキップ。
+            if let Some(my_seq) = clipboard_seq {
+                if !clipboard_seq_is_latest(my_seq) {
+                    if let Some(tx) = on_done {
+                        let _ = tx.send(());
+                    }
+                    return;
+                }
+            }
             // UTF-8 BOM (0xEF 0xBB 0xBF) + スクリプト本文
             let mut content = vec![0xEF, 0xBB, 0xBF];
             content.extend_from_slice(script.as_bytes());

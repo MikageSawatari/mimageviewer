@@ -812,11 +812,25 @@ pub(crate) struct ThumbQualityLoadPending {
     pub rx: mpsc::Receiver<Option<(image::DynamicImage, u64)>>,
 }
 
+/// A/B プレビューの WebP 再エンコード + ColorImage 変換を worker 化するための pending。
+/// スライダー操作で連発された場合、前回 pending は `cancel` を立てて無駄走査を止め、
+/// 最新だけ texture に反映する。
+pub(crate) struct TqEncodePending {
+    pub cancel: Arc<AtomicBool>,
+    pub rx: mpsc::Receiver<Option<TqEncodeResult>>,
+}
+
+pub(crate) struct TqEncodeResult {
+    pub bytes: usize,
+    pub color_image: egui::ColorImage,
+}
+
 #[derive(Default)]
 pub(crate) struct ThumbQualityState {
     pub show: bool,
-    /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)
-    pub sample: Option<image::DynamicImage>,
+    /// サンプル画像 (デコード済み、ダイアログを閉じるまで保持)。`Arc` で worker 共有し、
+    /// clone コストを O(1) にする。20MP 級の DynamicImage を worker 都度コピーするのは高価。
+    pub sample: Option<Arc<image::DynamicImage>>,
     /// サンプル画像のパス表示用
     pub sample_path: Option<PathBuf>,
     /// サンプル画像の元ファイルサイズ (bytes)
@@ -831,6 +845,8 @@ pub(crate) struct ThumbQualityState {
     pub a_texture: Option<egui::TextureHandle>,
     /// パネル A: エンコード後のバイト数
     pub a_bytes: usize,
+    /// パネル A: encode worker pending (スライダー変更中に次々立ち上げ、古いのは cancel)
+    pub a_encode_pending: Option<TqEncodePending>,
     /// パネル B: サイズ
     pub b_size: u32,
     /// パネル B: 品質
@@ -839,6 +855,8 @@ pub(crate) struct ThumbQualityState {
     pub b_texture: Option<egui::TextureHandle>,
     /// パネル B: エンコード後のバイト数
     pub b_bytes: usize,
+    /// パネル B: encode worker pending
+    pub b_encode_pending: Option<TqEncodePending>,
     /// true = A/B 比較の全画面オーバーレイ表示中
     pub fullscreen: bool,
     /// 全画面 A/B 比較時の縦線位置（0.0=すべて B、1.0=すべて A、中央は 0.5）
@@ -10193,15 +10211,19 @@ impl App {
             // decode 失敗 — 空状態のまま残す
             return;
         };
-        self.tq.sample = Some(img);
+        self.tq.sample = Some(Arc::new(img));
         self.tq.sample_path = Some(path);
         self.tq.sample_original_size = orig_size;
-        self.reencode_tq_panel(ctx, true);
-        self.reencode_tq_panel(ctx, false);
+        self.reencode_tq_panel(true);
+        self.reencode_tq_panel(false);
     }
 
-    pub(crate) fn reencode_tq_panel(&mut self, ctx: &egui::Context, is_a: bool) {
-        let Some(img) = self.tq.sample.as_ref() else {
+    /// A/B プレビューの再エンコードを worker に依頼する。
+    /// `encode_thumb_webp` + resize + webp + `decode_thumb_to_color_image` は 20MP 級で
+    /// 合計 100-300ms かかる。スライダー操作で連射される場合、前回 pending は cancel して
+    /// 最新だけ texture に反映する。
+    pub(crate) fn reencode_tq_panel(&mut self, is_a: bool) {
+        let Some(sample) = self.tq.sample.clone() else {
             return;
         };
         let (size, quality) = if is_a {
@@ -10209,27 +10231,107 @@ impl App {
         } else {
             (self.tq.b_size, self.tq.b_quality)
         };
-        let (bytes, tex) = match crate::catalog::encode_thumb_webp(img, size, quality as f32) {
-            Some((data, _w, _h)) => {
-                let byte_len = data.len();
-                let color_image = crate::catalog::decode_thumb_to_color_image(&data);
-                let tex = color_image.map(|ci| {
-                    ctx.load_texture(
-                        format!("tq_preview_{}", if is_a { "a" } else { "b" }),
-                        ci,
-                        egui::TextureOptions::LINEAR,
-                    )
-                });
-                (byte_len, tex)
-            }
-            None => (0, None),
-        };
-        if is_a {
-            self.tq.a_bytes = bytes;
-            self.tq.a_texture = tex;
+
+        // 前回の encode pending は cancel。まだ走っていれば send 前に早期 return してくれる。
+        if let Some(prev) = if is_a {
+            self.tq.a_encode_pending.as_ref()
         } else {
-            self.tq.b_bytes = bytes;
-            self.tq.b_texture = tex;
+            self.tq.b_encode_pending.as_ref()
+        } {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let cancel_worker = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("thumb-quality-encode".into())
+            .spawn(move || {
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                let encoded = crate::catalog::encode_thumb_webp(&sample, size, quality as f32);
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = encoded.and_then(|(data, _w, _h)| {
+                    let bytes = data.len();
+                    crate::catalog::decode_thumb_to_color_image(&data)
+                        .map(|color_image| TqEncodeResult { bytes, color_image })
+                });
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = tx.send(result);
+            })
+            .ok();
+
+        let pending = TqEncodePending { cancel, rx };
+        if is_a {
+            self.tq.a_encode_pending = Some(pending);
+        } else {
+            self.tq.b_encode_pending = Some(pending);
+        }
+    }
+
+    /// A/B encode worker の完了を拾う。`load_texture` だけ UI スレッドで実行する。
+    /// 未完了の pending が残っている間は再描画要求する。
+    pub(crate) fn poll_tq_encode_pending(&mut self, ctx: &egui::Context) {
+        // A 側
+        let mut a_repaint_needed = false;
+        if let Some(pending) = self.tq.a_encode_pending.as_ref() {
+            match pending.rx.try_recv() {
+                Ok(Some(result)) => {
+                    let tex = ctx.load_texture(
+                        "tq_preview_a",
+                        result.color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.tq.a_bytes = result.bytes;
+                    self.tq.a_texture = Some(tex);
+                    self.tq.a_encode_pending = None;
+                }
+                Ok(None) => {
+                    // encode 失敗。旧テクスチャは残す (0 にリセットだけ)。
+                    self.tq.a_bytes = 0;
+                    self.tq.a_encode_pending = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    a_repaint_needed = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tq.a_encode_pending = None;
+                }
+            }
+        }
+        // B 側
+        let mut b_repaint_needed = false;
+        if let Some(pending) = self.tq.b_encode_pending.as_ref() {
+            match pending.rx.try_recv() {
+                Ok(Some(result)) => {
+                    let tex = ctx.load_texture(
+                        "tq_preview_b",
+                        result.color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.tq.b_bytes = result.bytes;
+                    self.tq.b_texture = Some(tex);
+                    self.tq.b_encode_pending = None;
+                }
+                Ok(None) => {
+                    self.tq.b_bytes = 0;
+                    self.tq.b_encode_pending = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    b_repaint_needed = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tq.b_encode_pending = None;
+                }
+            }
+        }
+        if a_repaint_needed || b_repaint_needed {
+            ctx.request_repaint();
         }
     }
 
@@ -10241,6 +10343,15 @@ impl App {
         self.tq.b_texture = None;
         self.tq.fullscreen = false;
         self.tq.load_pending = None;
+        // encode worker 停止要求。pending 構造体が drop されると tx も落ちるので追加送信は無視される。
+        if let Some(p) = self.tq.a_encode_pending.as_ref() {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(p) = self.tq.b_encode_pending.as_ref() {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+        self.tq.a_encode_pending = None;
+        self.tq.b_encode_pending = None;
     }
 
     // -------------------------------------------------------------------
@@ -11046,6 +11157,7 @@ impl eframe::App for App {
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
         self.poll_thumb_quality_pending(ctx);
+        self.poll_tq_encode_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);

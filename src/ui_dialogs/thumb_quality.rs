@@ -217,10 +217,10 @@ impl App {
                 });
 
             if reencode_a {
-                self.reencode_tq_panel(ctx, true);
+                self.reencode_tq_panel(true);
             }
             if reencode_b {
-                self.reencode_tq_panel(ctx, false);
+                self.reencode_tq_panel(false);
             }
             if open_fs_a || open_fs_b {
                 self.tq.fullscreen = true;
