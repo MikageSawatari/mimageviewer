@@ -302,32 +302,47 @@ impl ArchiveCacheDb {
         Ok(removed)
     }
 
-    /// 全てのエントリを削除し、キャッシュディレクトリをまるごと掃除する。
+    /// snapshot 時点で DB に登録されていたエントリを削除する。
     /// 戻り値は削除したエントリ数。
     ///
-    /// DB mutex は「パス一覧の読み出し」「DELETE 実行」の 2 回だけ保持し、間の
-    /// ファイル削除 (N 件の remove_file + remove_dir_all) は lock 外で走らせる。
-    /// キャッシュが GB 級あるとファイル削除だけで数秒かかるので、その間に UI スレッドの
-    /// lookup / total_size / 変換開始が mutex 待ちにならないようにする。
+    /// 並行して走っている変換ワーカーが `record()` した新 entry を巻き込まないよう、
+    /// 最初に取った (src_path_key, cached_zip_path) のスナップショットだけを対象にする。
+    /// FS I/O (個別 `remove_file` + 空になった親ディレクトリの `remove_dir`) は lock 外、
+    /// DELETE は snapshot 対象の key を 1 件ずつ DELETE するため、snapshot 後に
+    /// 追加された新エントリは DB にもファイルにも残る。
+    /// 以前は `remove_dir_all(cache_root)` + 無条件 `DELETE FROM converted_archives` で
+    /// 丸ごと掃除していたが、タイミング次第で並行変換完了の成果物を吹き飛ばす競合があった。
     pub fn clear_all(&self) -> rusqlite::Result<usize> {
-        let cached_paths: Vec<String> = {
+        let snapshot: Vec<(String, String)> = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT cached_zip_path FROM converted_archives")?;
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .flatten()
-                .collect()
+            let mut stmt = conn
+                .prepare("SELECT src_path_key, cached_zip_path FROM converted_archives")?;
+            stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .flatten()
+            .collect()
         };
-        for p in &cached_paths {
+        // lock 外で個別のファイル + 空の親ディレクトリだけを削除。
+        // remove_cache_file_and_dirs は parent.remove_dir で空でなければ黙って失敗するので、
+        // snapshot 後に新しく作られた ZIP と同居していても新 ZIP は残る。
+        for (_, p) in &snapshot {
             remove_cache_file_and_dirs(Path::new(p));
         }
-        // キャッシュルートの空サブディレクトリも掃除 (時間かかりうる、lock 外で)
-        let root = cache_root();
-        if root.is_dir() {
-            let _ = std::fs::remove_dir_all(&root);
+        // snapshot 対象の key だけを DELETE。トランザクションで束ねて N-statement オーバー
+        // ヘッドを回避 (数千件あると 1 件ずつでは秒級になりうる)。
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted = 0usize;
+        {
+            let mut stmt =
+                tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
+            for (key, _) in &snapshot {
+                deleted += stmt.execute(params![key])?;
+            }
         }
-        let conn = self.conn.lock().unwrap();
-        let n = conn.execute("DELETE FROM converted_archives", [])?;
-        Ok(n)
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// 合計キャッシュ容量 (バイト) を返す。
