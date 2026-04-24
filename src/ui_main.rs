@@ -27,10 +27,16 @@ use crate::ui_helpers::{
 enum RatingFilterOp {
     Toggle,
     Solo,
-    /// ★N のみ + 未評価 (= フォルダ等のコンテナも含める)。
+    /// ★N + 未評価: `rating_filter[0]` と `rating_filter[idx]` だけを ON にする。
+    ///
     /// ★5 を Ctrl+クリックするとフォルダまで消えてナビゲーションできなくなる問題への対処。
-    /// 「★N の画像をフォルダツリーで探す」ワークフロー向け。idx=0 では意味をなさないので
-    /// `apply_rating_filter_op` は idx>=1 前提 (idx=0 なら Solo と同値)。
+    /// 「★N の画像をフォルダツリーで探す」ワークフロー向け。ただし `rating_filter` は
+    /// コンテナ (Folder/ZIP/PDF) と画像系 (Image/ZipImage/PdfPage) の両方に同じバケットを
+    /// 適用するため、副次的に **未評価の通常画像** も表示される (UI 上は意図した挙動として
+    /// ラベルを「★N と未評価」としている)。「フォルダだけを残す」ためには
+    /// `[bool; 6]` では表現できず kind-aware な別モードが必要で、v0.8.2 以降の検討事項。
+    /// idx=0 では意味をなさないので `apply_rating_filter_op` は idx>=1 前提
+    /// (idx=0 なら Solo と同値)。
     SoloWithUnrated,
     Threshold,
     AllOn,
@@ -100,9 +106,12 @@ fn rating_threshold_menu_label(idx: usize) -> String {
     }
 }
 
-/// 「★N とフォルダ」(= ★N + なし) メニュー用ラベル。idx>=1 のみ有効。
+/// 「★N と未評価」(= ★N + なし) メニュー用ラベル。idx>=1 のみ有効。
+/// 「フォルダだけ」ではなく `rating_filter[0]` バケットに入るもの全部 (未評価画像 /
+/// 未評価 ZIP 内画像 / 未評価 PDF ページ + フォルダ / ZIP / PDF) が対象なので、
+/// 文言は「未評価」に寄せて誤解を避ける。
 fn rating_solo_with_unrated_menu_label(idx: usize) -> String {
-    format!("★{} とフォルダ (Ctrl+Shift+クリック)", idx)
+    format!("★{} と未評価 (Ctrl+Shift+クリック)", idx)
 }
 
 fn rating_tooltip(idx: usize) -> String {
@@ -111,7 +120,7 @@ fn rating_tooltip(idx: usize) -> String {
             .to_string()
     } else {
         format!(
-            "★{idx} を表示 [F{idx} で付与]\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} とフォルダ"
+            "★{idx} を表示 [F{idx} で付与]\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} と未評価"
         )
     }
 }
@@ -129,7 +138,8 @@ fn draw_rating_filter_button(ui: &mut egui::Ui, rf: &mut [bool; 6], idx: usize) 
         // 既存コード (src/ui_main.rs:992 の Ctrl+クリック選択等) と合わせて ctrl のみを見る。
         // 優先順位: Ctrl+Shift > Ctrl > Shift > 通常。
         let op = if mods.ctrl && mods.shift && idx >= 1 {
-            // ★N のみ + フォルダ (なし)。idx=0 では意味を成さないので除外 (下の Ctrl 単独に落ちる)。
+            // ★N + 未評価 (= `rating_filter[0]` も ON)。idx=0 では意味を成さないので
+            // 除外 (下の Ctrl 単独に落ちる)。
             if is_rating_solo_with_unrated(rf, idx) {
                 RatingFilterOp::AllOn
             } else {
@@ -1526,7 +1536,8 @@ mod rating_filter_op_tests {
     }
 
     /// Ctrl+Shift+★N の挙動: ★N と「なし」だけ ON、残りはすべて OFF。
-    /// フォルダ (=未評価コンテナ) を保ちながら ★N 画像を探す用途向け。
+    /// 未評価コンテナ (= フォルダ / 未評価 ZIP / 未評価 PDF) と未評価画像の両方が残るので
+    /// ★N 画像をフォルダツリーから探す用途向け。
     #[test]
     fn apply_solo_with_unrated_keeps_none_bucket_on() {
         let mut rf = [true; 6];
