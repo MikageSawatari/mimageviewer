@@ -27,6 +27,11 @@ use crate::ui_helpers::{
 enum RatingFilterOp {
     Toggle,
     Solo,
+    /// ★N のみ + 未評価 (= フォルダ等のコンテナも含める)。
+    /// ★5 を Ctrl+クリックするとフォルダまで消えてナビゲーションできなくなる問題への対処。
+    /// 「★N の画像をフォルダツリーで探す」ワークフロー向け。idx=0 では意味をなさないので
+    /// `apply_rating_filter_op` は idx>=1 前提 (idx=0 なら Solo と同値)。
+    SoloWithUnrated,
     Threshold,
     AllOn,
 }
@@ -39,12 +44,25 @@ fn is_rating_threshold(rf: &[bool; 6], idx: usize) -> bool {
     (0..idx).all(|i| !rf[i]) && (idx..6).all(|i| rf[i])
 }
 
+/// 現在フィルタが「★N + 未評価」状態か (idx>=1 前提)。
+fn is_rating_solo_with_unrated(rf: &[bool; 6], idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+    rf[0] && rf[idx] && (1..6).all(|i| i == idx || !rf[i])
+}
+
 fn apply_rating_filter_op(rf: &mut [bool; 6], op: RatingFilterOp, idx: usize) {
     match op {
         RatingFilterOp::Toggle => rf[idx] = !rf[idx],
         RatingFilterOp::Solo => {
             for i in 0..6 {
                 rf[i] = i == idx;
+            }
+        }
+        RatingFilterOp::SoloWithUnrated => {
+            for i in 0..6 {
+                rf[i] = i == 0 || i == idx;
             }
         }
         RatingFilterOp::Threshold => {
@@ -82,13 +100,18 @@ fn rating_threshold_menu_label(idx: usize) -> String {
     }
 }
 
+/// 「★N とフォルダ」(= ★N + なし) メニュー用ラベル。idx>=1 のみ有効。
+fn rating_solo_with_unrated_menu_label(idx: usize) -> String {
+    format!("★{} とフォルダ (Ctrl+Shift+クリック)", idx)
+}
+
 fn rating_tooltip(idx: usize) -> String {
     if idx == 0 {
         "未評価を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: すべて表示 [F6 で解除]"
             .to_string()
     } else {
         format!(
-            "★{idx} を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上 [F{idx} で付与]"
+            "★{idx} を表示\n通常クリック: 切り替え\nCtrl+クリック: これのみ\nShift+クリック: ★{idx} 以上\nCtrl+Shift+クリック: ★{idx} とフォルダ [F{idx} で付与]"
         )
     }
 }
@@ -104,7 +127,15 @@ fn draw_rating_filter_button(ui: &mut egui::Ui, rf: &mut [bool; 6], idx: usize) 
         let mods = ui.input(|i| i.modifiers);
         // Windows 専用ビルドなので mods.command は ctrl と同値 (egui 内で alias)。
         // 既存コード (src/ui_main.rs:992 の Ctrl+クリック選択等) と合わせて ctrl のみを見る。
-        let op = if mods.ctrl {
+        // 優先順位: Ctrl+Shift > Ctrl > Shift > 通常。
+        let op = if mods.ctrl && mods.shift && idx >= 1 {
+            // ★N のみ + フォルダ (なし)。idx=0 では意味を成さないので除外 (下の Ctrl 単独に落ちる)。
+            if is_rating_solo_with_unrated(rf, idx) {
+                RatingFilterOp::AllOn
+            } else {
+                RatingFilterOp::SoloWithUnrated
+            }
+        } else if mods.ctrl {
             if is_rating_solo(rf, idx) {
                 RatingFilterOp::AllOn
             } else {
@@ -131,6 +162,15 @@ fn draw_rating_filter_button(ui: &mut egui::Ui, rf: &mut [bool; 6], idx: usize) 
         }
         if ui.button(rating_threshold_menu_label(idx)).clicked() {
             apply_rating_filter_op(rf, RatingFilterOp::Threshold, idx);
+            changed = true;
+            ui.close();
+        }
+        if idx >= 1
+            && ui
+                .button(rating_solo_with_unrated_menu_label(idx))
+                .clicked()
+        {
+            apply_rating_filter_op(rf, RatingFilterOp::SoloWithUnrated, idx);
             changed = true;
             ui.close();
         }
@@ -1478,6 +1518,54 @@ mod rating_filter_op_tests {
     fn apply_all_on_matches_default() {
         let mut rf = [false; 6];
         apply_rating_filter_op(&mut rf, RatingFilterOp::AllOn, 0);
+        assert_eq!(rf, crate::settings::default_rating_filter());
+    }
+
+    /// Ctrl+Shift+★N の挙動: ★N と「なし」だけ ON、残りはすべて OFF。
+    /// フォルダ (=未評価コンテナ) を保ちながら ★N 画像を探す用途向け。
+    #[test]
+    fn apply_solo_with_unrated_keeps_none_bucket_on() {
+        let mut rf = [true; 6];
+        apply_rating_filter_op(&mut rf, RatingFilterOp::SoloWithUnrated, 5);
+        assert_eq!(rf, [true, false, false, false, false, true]);
+    }
+
+    /// `is_rating_solo_with_unrated` は Ctrl+Shift 状態の検出用。
+    /// トグル 2 回目の Ctrl+Shift クリックで AllOn に戻るための述語。
+    #[test]
+    fn is_solo_with_unrated_detects_none_plus_target() {
+        let rf = [true, false, false, false, false, true];
+        assert!(is_rating_solo_with_unrated(&rf, 5));
+        assert!(!is_rating_solo_with_unrated(&rf, 4));
+        // idx=0 は定義外 (常に false)
+        assert!(!is_rating_solo_with_unrated(&rf, 0));
+        // なし が OFF なら false
+        let rf_no_none = [false, false, false, false, false, true];
+        assert!(!is_rating_solo_with_unrated(&rf_no_none, 5));
+        // 2 星バケツ以上 ON も false
+        let rf_two_stars = [true, false, false, true, false, true];
+        assert!(!is_rating_solo_with_unrated(&rf_two_stars, 5));
+    }
+
+    /// Ctrl+Shift+クリック は solo_with_unrated ↔ 全 ON を往復する。
+    #[test]
+    fn ctrl_shift_click_model_toggles_with_unrated() {
+        let mut rf = [true; 6];
+        // 初回 Ctrl+Shift+★5 → ★5 + なし だけ
+        let op = if is_rating_solo_with_unrated(&rf, 5) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::SoloWithUnrated
+        };
+        apply_rating_filter_op(&mut rf, op, 5);
+        assert!(is_rating_solo_with_unrated(&rf, 5));
+        // 同じボタンを Ctrl+Shift+クリック再度 → 全 ON
+        let op = if is_rating_solo_with_unrated(&rf, 5) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::SoloWithUnrated
+        };
+        apply_rating_filter_op(&mut rf, op, 5);
         assert_eq!(rf, crate::settings::default_rating_filter());
     }
 
