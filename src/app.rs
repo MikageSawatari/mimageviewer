@@ -3867,9 +3867,12 @@ impl App {
             .collect();
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
 
-        // selected も idx shift する。削除対象だったら None にして、後続の clamp で
-        // 末尾フォールバックする (ユーザーが選択中のものが削除されたケース)。
-        self.selected = self.selected.and_then(shift);
+        // selected も idx shift する。削除対象だった場合は old idx を保持しておき、
+        // 後続の `sel >= n` clamp で「繰り上がった次 item / 末尾」に詰められる挙動を利用する。
+        // 例: [a,b,c,d,e] で 2 (c) を削除 → shift(2)=None だが 2 を残すと
+        //     新 len=4 で sel<4 なので新 idx 2 (= e の位置。繰り上がった d) に落ちる。
+        // こうするとキーボードで ★1 を連続削除するワークフローでカーソルが失われない。
+        self.selected = self.selected.map(|sel| shift(sel).unwrap_or(sel));
 
         self.invalidate_idx_state_and_queues();
 
@@ -3994,6 +3997,20 @@ impl App {
         }
         self.remove_items_batch(&idxs);
         self.prewarm_grid_tags();
+
+        // 削除自身がフォルダ mtime を更新しているので、`current_folder_last_mtime` を
+        // 新しい値に進めて `check_external_folder_changes` の自動再読込をスキップさせる。
+        // これを怠ると次フレームで削除済み path を grid から抜いたのとほぼ同じ結果を
+        // `load_folder()` で再計算することになり、数千件削除直後に UI が再度ブロックする。
+        if let Some(folder) = self.current_folder.clone() {
+            if let Ok(meta) = folder.metadata() {
+                if meta.is_dir() {
+                    if let Ok(new_mtime) = meta.modified() {
+                        self.current_folder_last_mtime = Some(new_mtime);
+                    }
+                }
+            }
+        }
     }
 
     /// condvar.wait() 中の全ワーカーを起床させる。
@@ -10136,8 +10153,17 @@ impl App {
                 let mut pdf_files: Vec<(PathBuf, i64, i64)> = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(folder) {
                     for entry in entries.flatten() {
+                        // entry.file_type() は FindFirstFile/FindNextFile の戻りを再利用するので
+                        // per-entry GetFileAttributes syscall を避けられる
+                        // (docs/ui-responsiveness.md §4)。キャッシュ作成の大量フォルダ走査で効く。
+                        let Ok(ft) = entry.file_type() else {
+                            continue;
+                        };
+                        if !ft.is_file() {
+                            continue;
+                        }
                         let p = entry.path();
-                        if !p.is_file() || is_apple_double(&p) {
+                        if is_apple_double(&p) {
                             continue;
                         }
                         let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
