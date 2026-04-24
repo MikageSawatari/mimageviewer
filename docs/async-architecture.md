@@ -290,17 +290,50 @@ std::thread::spawn(move || {
 
 ## 4. GPU テクスチャ予算
 
-### 4.1 keep_range ベースの退去
+### 4.1 keep_set ベースの退去 (display list vs filesystem list)
 
-- 可視範囲 + prev/next ページ分のみ GPU に保持
-- 範囲外に出た瞬間に `TextureHandle` を drop
-- `egui_ctx.load_texture` でアップロードするコマ数を MAX_TEXTURES_PER_FRAME=8 に制限 (フレームレート維持)
+mImageViewer は 2 つのリストを使い分ける:
+
+| 変数 | 役割 |
+| --- | --- |
+| `App::items: Vec<GridItem>` | **filesystem list** (ソース)。raw idx はフォルダセッション中 stable。 |
+| `App::visible_indices: Vec<usize>` | **display list**。`items` への参照を ★フィルタ / 検索フィルタ通過後だけに絞ったもの。 |
+
+**prefetch / eviction / retain 系のループは必ず display list (の部分列) を使う**。
+`items` の raw idx 連続範囲 (`keep_start..keep_end`) を直接回してはいけない。
+`visible_indices` が疎になっているとき (例: 1300 フォルダ中★5 のみ 3 件可視) に、
+連続範囲を回すと非可視の 1000 件近くを prefetch キューに流し込んでしまう。
+
+具体像:
+
+- **`App::keep_range: (usize, usize)`** — `keep_set` の bounding box。worker 側で
+  atomic に読める `keep_start_shared` / `keep_end_shared` の値を供給する。
+  疎な keep_set に対しては「広め」の判定になるので、worker が稀に非可視 idx を
+  掴んでしまうが、main thread 側で enqueue しなければほぼ発生しない。
+- **`App::keep_set: HashSet<usize>`** — 実際に prefetch / 保持したい idx 集合。
+  `visible_indices[vis_keep_start..vis_keep_end]` から毎フレーム構築する。
+  enqueue / eviction / retain / idle upgrade / tag prewarm / 補正テクスチャの
+  バックグラウンド処理はすべてこの `keep_set.contains(&i)` で判定する。
+
+新しく「可視範囲の画像に対する背景処理」を追加する場合:
+
+1. 反復対象は `self.keep_set.iter()` (必要なら `sorted` に clone してから)。
+2. `keep_start..keep_end` の range ループは絶対に書かない。
+3. `rebuild_visible_indices()` は `keep_set` を直接触らない。次フレームの
+   `update_keep_range_and_requests` が再計算する (フィルタ変更で疎になっても
+   1 フレーム遅れで自然に収束する)。
+
+### 4.2 通常ロードの流れ
+
+- 可視範囲 + prev/next ページ分のみ GPU に保持 (`keep_set` の範囲)
+- 範囲外に出た瞬間に `TextureHandle` を drop (eviction)
+- `egui_ctx.load_texture` でアップロードするコマ数を MAX_TEXTURES_PER_FRAME=8 に制限
 - 超過分は `texture_backlog` に積んで次フレーム以降に処理
 
-### 4.2 VRAM キャップ
+### 4.3 VRAM キャップ
 
 - `gpu_info.rs` で取得した VRAM 量から動的にテクスチャ上限バイト数を決定
-- 超過しそうなら keep_range を両端から狭める (古い側から evict)
+- 超過しそうなら visible slice (display list 上の区間) を両端から狭める (古い側から evict)
 
 新しいテクスチャキャッシュ (例: 将来の補正 LUT プレビュー) を追加する時は、
 この退去ロジックにも登録すること。

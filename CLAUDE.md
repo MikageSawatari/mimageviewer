@@ -648,11 +648,46 @@ Codex の出力は `[P1]` / `[P2]` / `[P3]` のような severity 付きで返�
 3. 修正を入れる場合は同じコミットメッセージに `Codex P<N> 対応` を書いておく (レビュー履歴の紐付け用)
 4. false positive と判断した場合は、**理由を添えて** ユーザーに伝える (ユーザーが最終判断できるように)
 
+### 出力の取りこぼしに注意 (`tail -N` を使わない)
+
+`codex exec ... 2>&1 | tail -80` のような **末尾固定行数の切り取りはレビュー指摘を失う**。
+Codex は探索ステップ (grep / ファイル参照等) を流してから最後に `P1/P2/P3` サマリを
+出すので、探索ログが長いと重要な指摘が tail の外に流れ出す可能性がある。
+
+代わりに**全出力を一時ファイルに保存してから結論ブロックだけ抽出する**:
+
+```bash
+codex exec --sandbox read-only "…" > /tmp/codex-out.txt 2>&1
+# 最終結論 (最後の "codex" 行以降) を抽出
+awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
+```
+
+または `less /tmp/codex-out.txt` で目視確認する。短いタスクなら `tail -200` 程度に
+とること (目安: Codex 探索が 5 分超なら十分)。
+
 ### 起動できないとき
 
 `codex` コマンドが PATH にない / Codex CLI が入っていない場合は、ユーザーに環境確認を依頼する。
 勝手に従来の「ユーザーに Codex 実行を依頼してレビュー結果をペーストしてもらう」フローに戻さない
 (ユーザーの手間が増えるだけなので明示的に確認する)。
+
+### モデル指定について
+
+利用モデルは `~/.codex/config.toml` の `model` フィールドに書いてあり、`codex exec` は
+そこで指定されたモデルで動く (対話モードで表示される `model: <name>` と同じ)。
+以下のケースで失敗することがある:
+
+- **CLI が古い**: 新モデル (例: `gpt-5.5`) は CLI 更新が必要。対話起動時に
+  `Update available! X.Y.Z -> A.B.C` が出ていたら `npm install -g @openai/codex` で更新。
+  対話モードでは動くのに `codex exec` で「model doesn't exist」が出る場合、
+  まさにこの状態。
+- **アカウントの制限**: ChatGPT アカウントでは `gpt-5` / `o3` 等の生モデル ID は
+  使えず、Codex 向けに用意された ID (`gpt-5.5` / `gpt-5.4` 等) のみ。
+- **config のタイポ**: 利用可能なモデル一覧は `~/.codex/models_cache.json` の
+  `models[].slug` で確認できる。
+
+`-c model="<name>"` で 1 回限りの override も可能。デフォルト設定を書き換える前に
+ユーザーに相談すること (config はユーザーの個人設定で、勝手に変えない)。
 
 ## Git Workflow
 

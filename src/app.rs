@@ -256,6 +256,28 @@ pub(crate) use crate::thumb_loader::{
     CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP,
 };
 
+/// レーティングフィルタを 1 アイテムに適用し、可視かを返す。
+///
+/// レーティング対象 (コンテナ + 画像系) は全 6 バケット (★なし + ★1〜5) で判定し、
+/// 非レーティング対象 (Video / Separator / ConvertibleArchive 等) は常に可視。
+/// 「★5 のみ表示」操作で未評価フォルダが残らないよう、コンテナもページ系と
+/// 同じ厳密フィルタに揃えた (★なしフォルダに入りたいときは「なし」を ON に戻す)。
+///
+/// 前提: 呼び出し側で `rating_filter` が全 ON でないことを確認済み
+/// (全 ON なら全アイテム可視なのでそもそも呼ばない)。
+fn passes_rating_filter(
+    item: &GridItem,
+    stars: u8,
+    rating_filter: &[bool; 6],
+) -> bool {
+    if item.accepts_rating() {
+        let s = stars as usize;
+        s <= 5 && rating_filter[s]
+    } else {
+        true
+    }
+}
+
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
 fn stem_lower(path: &std::path::Path) -> String {
     path.file_stem()
@@ -977,10 +999,21 @@ pub struct App {
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
     pub(crate) requested: std::collections::HashMap<usize, bool>,
-    /// 現在の keep range [start, end)。update_keep_range で毎フレーム更新
+    /// 現在の keep range を `[min, max+1)` でくくった bounding box。
+    /// worker 側の atomic キャンセル判定 (`keep_start_shared`/`keep_end_shared`) 用。
+    /// enqueue / eviction / retain / idle upgrade は `keep_set` の方を使うこと
+    /// (docs/async-architecture.md「display list vs filesystem list」参照)。
     pub(crate) keep_range: (usize, usize),
+    /// prefetch / eviction / retain 等が実際に対象にする idx 集合。
+    /// `visible_indices[vis_keep_start..vis_keep_end]` から毎フレーム構築される。
+    /// ★フィルタや Ctrl+F で疎になった `visible_indices` でも、非可視 idx が
+    /// 先読みキューに流入しないよう、raw range ではなく set 判定に統一する。
+    pub(crate) keep_set: std::collections::HashSet<usize>,
     /// ワーカー共有用: keep_range の start/end をアトミックに公開。
     /// ワーカーは pick 後にこの範囲を確認し、範囲外のリクエストをスキップする。
+    /// (set そのものを共有するのは実装負荷が大きいため bounding box で近似する。
+    /// set から外れた idx が worker に渡るケースは enqueue で既に弾いているので
+    /// 実害はごくわずか。)
     pub(crate) keep_start_shared: Arc<AtomicUsize>,
     pub(crate) keep_end_shared: Arc<AtomicUsize>,
     /// poll_thumbnails で 1 フレームのテクスチャ生成上限を超えた分を次フレームに持ち越す
@@ -1278,10 +1311,6 @@ pub struct App {
     /// idx キーで持つことで hot-path の `adjustment_db::normalize_path` 呼び出しを
     /// 未処理 idx に対してのみ発生させる。フォルダ切替で `prewarm_grid_tags` が clear する。
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
-    /// 直近 `enqueue_visible_tag_prewarms` を走らせた `keep_range`。アイドル時に
-    /// 毎フレーム同じ範囲を走査し続ける無駄を避けるための change-detection guard。
-    /// フォルダ切替で `prewarm_grid_tags` が reset する。
-    pub(crate) last_enqueued_keep_range: (usize, usize),
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
@@ -1739,6 +1768,7 @@ impl Default for App {
             heavy_io_queue: None,
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
+            keep_set: std::collections::HashSet::new(),
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             texture_backlog: Vec::new(),
@@ -1841,7 +1871,6 @@ impl Default for App {
             metadata_pending: None,
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
-            last_enqueued_keep_range: (0, 0),
             search_filter: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
@@ -3330,6 +3359,7 @@ impl App {
         self.pending_finalize.clear();
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
+        self.keep_set.clear();
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
@@ -4167,7 +4197,7 @@ impl App {
                 continue;
             }
 
-            let in_keep_range = i >= keep_start && i < keep_end;
+            let in_keep_range = self.keep_set.contains(&i);
 
             // finalized = true: 第 2 シグナル (decode 成功 + cache save 完了)。
             // **`thumbnails[i]` の状態は変更しない**。
@@ -4398,7 +4428,13 @@ impl App {
     fn update_keep_range_and_requests(&mut self, frame_t0: std::time::Instant) {
         let total = self.items.len();
         if total == 0 {
+            // keep_set と worker atomic boundary も同時にクリアしないと、
+            // 空フォルダへの再読み込み直後に前フォルダの bbox が worker に残り続け、
+            // 古い enqueue 済みリクエストが in-range 判定で処理されてしまう。
             self.keep_range = (0, 0);
+            self.keep_set.clear();
+            self.keep_start_shared.store(0, Ordering::Relaxed);
+            self.keep_end_shared.store(0, Ordering::Relaxed);
             return;
         }
 
@@ -4418,37 +4454,30 @@ impl App {
 
         let rows_per_page = (viewport_h / cell_h).ceil() as usize;
         let items_per_page = (rows_per_page * cols).max(1);
-        // visible_indices 上の位置で keep_range を計算し、raw index に変換する。
-        // これにより検索フィルタ中でも正しいサムネイルがロードされる。
+        // 設計: prefetch / eviction 対象は「display list = visible_indices の一部」を
+        // そのまま使い、raw idx の連続範囲には**絶対に潰さない**。
+        // `visible_indices` が★フィルタや Ctrl+F で疎になったとき、raw range で扱うと
+        // 非可視 idx を大量 (フォルダ 1300 件中 3 件表示 → 991 件の非可視) に enqueue
+        // してしまう。詳細は docs/async-architecture.md「display list vs filesystem list」。
         let vis_count = self.visible_indices.len();
-        let vis_first = (self.scroll_offset_y / cell_h) as usize * cols;
+        // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
+        // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
+        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
+        let vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
 
         let prev_pages = self.settings.thumb_prev_pages as usize;
         let next_pages = self.settings.thumb_next_pages as usize;
 
         let vis_keep_start = vis_first.saturating_sub(prev_pages * items_per_page);
-        let vis_keep_end = vis_first
+        let mut vis_keep_end = vis_first
             .saturating_add((1 + next_pages) * items_per_page)
             .min(vis_count);
 
-        // visible_indices 経由で raw index の範囲を求める
-        let mut keep_start = self
-            .visible_indices
-            .get(vis_keep_start)
-            .copied()
-            .unwrap_or(0);
-        let mut keep_end = self
-            .visible_indices
-            .get(vis_keep_end.saturating_sub(1))
-            .copied()
-            .map(|i| i + 1)
-            .unwrap_or(total)
-            .min(total);
-
         // ── 段階 D: VRAM 安全ネット ──────────────────────────────────
         // display_px から 1 枚あたりの推定バイト数を算出し、cap を超えそうなら
-        // keep_range を vis_first 中心に縮小する (前方 2/3 優先、後方 1/3)
-        // 上限は "プライマリ GPU VRAM × 設定 %" (0 で無制限)
+        // visible slice を vis_first 中心に縮小する (前方 2/3 優先、後方 1/3)。
+        // 上限は "プライマリ GPU VRAM × 設定 %" (0 で無制限)。
+        let mut vis_keep_start_capped = vis_keep_start;
         let cap_percent = self.settings.thumb_vram_cap_percent;
         if cap_percent > 0 {
             let est_per_thumb: u64 = (current_display_px as u64)
@@ -4457,13 +4486,12 @@ impl App {
             let cap_bytes = crate::gpu_info::vram_cap_from_percent(cap_percent);
             if est_per_thumb > 0 {
                 let max_items = (cap_bytes / est_per_thumb).max(1) as usize;
-                let desired = keep_end.saturating_sub(keep_start);
+                let desired = vis_keep_end.saturating_sub(vis_keep_start);
                 if max_items < desired {
-                    // 上限超過: keep_range を縮小
                     let half_back = max_items / 3;
                     let half_forward = max_items - half_back;
-                    let new_start = vis_first.saturating_sub(half_back);
-                    let new_end = vis_first.saturating_add(half_forward).min(total);
+                    vis_keep_start_capped = vis_first.saturating_sub(half_back);
+                    vis_keep_end = vis_first.saturating_add(half_forward).min(vis_count);
                     crate::logger::log(format!(
                         "  VRAM cap hit: desired={desired} max_items={max_items} \
                          (display_px={current_display_px} est/thumb={} MB cap={} MB @ {}%)",
@@ -4471,12 +4499,27 @@ impl App {
                         cap_bytes / (1024 * 1024),
                         cap_percent,
                     ));
-                    keep_start = new_start;
-                    keep_end = new_end;
                 }
             }
         }
 
+        // keep_set: prefetch / eviction / retain / idle upgrade がこれを使う。
+        let keep_slice = self
+            .visible_indices
+            .get(vis_keep_start_capped..vis_keep_end)
+            .unwrap_or(&[]);
+        self.keep_set.clear();
+        self.keep_set.extend(keep_slice.iter().copied());
+
+        // keep_range: keep_set の bounding box。worker atomic キャンセル判定で使われる。
+        // `visible_indices` は `rebuild_visible_indices` が `for i in 0..n { push(i) }` で
+        // 構築するため昇順。その部分列である `keep_slice` も昇順なので、min/max は
+        // 端の要素を直接参照すれば O(1)。将来 display list をソート以外の順で構築する
+        // 改修が入るときはこの前提ごと再考すること。
+        let (keep_start, keep_end) = match (keep_slice.first(), keep_slice.last()) {
+            (Some(&mn), Some(&mx)) => (mn, (mx + 1).min(total)),
+            _ => (0, 0),
+        };
         self.keep_range = (keep_start, keep_end);
         self.keep_start_shared.store(keep_start, Ordering::Relaxed);
         self.keep_end_shared.store(keep_end, Ordering::Relaxed);
@@ -4494,7 +4537,7 @@ impl App {
         //       - 正常完了: poll_thumbnails が remove
         let t1 = frame_t0.elapsed();
         for i in 0..total {
-            if i >= keep_start && i < keep_end {
+            if self.keep_set.contains(&i) {
                 continue;
             }
             if matches!(self.items.get(i), Some(GridItem::Video(_))) {
@@ -4503,7 +4546,7 @@ impl App {
             if matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
                 self.thumbnails[i] = ThumbnailState::Evicted;
             }
-            // サムネ補正用ピクセル/テクスチャも keep_range 外では破棄する。
+            // サムネ補正用ピクセル/テクスチャも keep_set 外では破棄する。
             // 動画は上で skip 済みなのでここには来ない。
             self.thumb_pixels.remove(&i);
             self.thumb_adjust_tex.remove(&i);
@@ -4556,9 +4599,19 @@ impl App {
                 visible_raw_end,
                 visible_raw_end - visible_raw_start,
             ));
-            // 安定した瞬間に既に全 Loaded ならその場で all_loaded ログ
-            let all_loaded_now = (visible_raw_start..visible_raw_end)
-                .all(|j| matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. })));
+            // 安定した瞬間に既に全 Loaded ならその場で all_loaded ログ。
+            // 可視セルは visible_indices[vis_visible_start..vis_visible_end] なので
+            // そちらを直接走査する (raw range で走ると疎な visible_indices では
+            // フィルタで隠れた idx を含んでしまい、all_loaded_now が永久に false になる)。
+            let all_loaded_now = self
+                .visible_indices
+                .get(vis_visible_start..vis_visible_end)
+                .map(|slice| {
+                    slice.iter().all(|&j| {
+                        matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. }))
+                    })
+                })
+                .unwrap_or(false);
             if all_loaded_now {
                 crate::logger::log(
                     "[vis] all_loaded 0ms after settle (already cached)".to_string(),
@@ -4568,10 +4621,12 @@ impl App {
             }
         }
 
-        // 通常リクエストと重い I/O リクエストを分けて収集
+        // 通常リクエストと重い I/O リクエストを分けて収集。
+        // 反復対象は raw range ではなく keep_set (display list の部分列)。
+        // これで ★フィルタ / Ctrl+F で疎になっても非可視 idx が流入しない。
         let mut new_regular: Vec<LoadRequest> = Vec::new();
         let mut new_heavy: Vec<LoadRequest> = Vec::new();
-        for i in keep_start..keep_end {
+        for i in self.keep_set_sorted() {
             if self.requested.contains_key(&i) {
                 continue;
             }
@@ -4642,13 +4697,16 @@ impl App {
         {
             let (ref mtx, ref cvar) = *queue_arc;
             let mut q = mtx.lock().unwrap();
-            // 範囲外に出たキューエントリは取消扱い。pop 前なのでワーカーが
+            // 範囲外 (keep_set から外れた) キューエントリは取消扱い。pop 前なので worker が
             // 始めてすらいない → requested からも抜いて良い (再入範囲なら次フレームで
-            // 再エンキューされる)。
+            // 再エンキューされる)。keep_set と requested は App の別フィールドなので
+            // 事前に分離して disjoint field borrow にする (closure 内で両方必要)。
+            let keep_set = &self.keep_set;
+            let requested = &mut self.requested;
             q.retain(|r| {
-                let keep = r.idx >= keep_start && r.idx < keep_end;
+                let keep = keep_set.contains(&r.idx);
                 if !keep {
-                    self.requested.remove(&r.idx);
+                    requested.remove(&r.idx);
                 }
                 keep
             });
@@ -4657,7 +4715,7 @@ impl App {
             }
             let _q_before = q.len();
             for r in new_regular {
-                self.requested.insert(r.idx, false);
+                requested.insert(r.idx, false);
                 q.push(r);
             }
             drop(q);
@@ -4670,10 +4728,12 @@ impl App {
         if let Some(hq) = self.heavy_io_queue.clone() {
             let (ref mtx, ref cvar) = *hq;
             let mut q = mtx.lock().unwrap();
+            let keep_set = &self.keep_set;
+            let requested = &mut self.requested;
             q.retain(|r| {
-                let keep = r.idx >= keep_start && r.idx < keep_end;
+                let keep = keep_set.contains(&r.idx);
                 if !keep {
-                    self.requested.remove(&r.idx);
+                    requested.remove(&r.idx);
                 }
                 keep
             });
@@ -4681,7 +4741,7 @@ impl App {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
             }
             for r in new_heavy {
-                self.requested.insert(r.idx, false);
+                requested.insert(r.idx, false);
                 q.push(r);
             }
             drop(q);
@@ -4697,15 +4757,15 @@ impl App {
         }
         let t4 = frame_t0.elapsed();
 
-        // (3) 段階 E: アイドル時の画質アップグレード
-        self.enqueue_idle_upgrades(keep_start, keep_end);
+        // (3) 段階 E: アイドル時の画質アップグレード (対象は `self.keep_set`)
+        self.enqueue_idle_upgrades();
         let t5 = frame_t0.elapsed();
 
         // (4) 進捗ピーク値の更新 (プログレスバー表示用)
         self.update_progress_peaks();
         let t6 = frame_t0.elapsed();
 
-        // (5) 固着診断 (5 秒に 1 回): keep_range 内で state が Pending/Evicted
+        // (5) 固着診断 (5 秒に 1 回): keep_set 内で state が Pending/Evicted
         //     なのに `requested` に居座っているエントリを検出する。
         //     正常時は Pending/Evicted なら再エンキューされて Loaded に進むはず。
         //     この状態が続くと、サムネが「読み込み中」のまま永遠に戻らない。
@@ -4713,7 +4773,7 @@ impl App {
             self.last_stuck_scan_at = std::time::Instant::now();
             let mut stuck: Vec<(usize, &'static str)> = Vec::new();
             for (&idx, _) in &self.requested {
-                if idx < keep_start || idx >= keep_end {
+                if !self.keep_set.contains(&idx) {
                     continue;
                 }
                 let label = match self.thumbnails.get(idx) {
@@ -4766,10 +4826,10 @@ impl App {
     /// 2. `Loaded { rendered_at_px < current_display_px * 0.8 }` —
     ///    列数変更などで現在のセルサイズより 20% 以上小さい解像度で生成されている
     ///
-    /// `keep_range` 内の該当セルを最大 `BATCH` 件ずつ、`skip_cache = true` の
+    /// `keep_set` 内の該当セルを最大 `BATCH` 件ずつ、`skip_cache = true` の
     /// LoadRequest として push する。スクロール優先度付きの worker が visible
     /// 側から先に処理する。
-    fn enqueue_idle_upgrades(&mut self, keep_start: usize, keep_end: usize) {
+    fn enqueue_idle_upgrades(&mut self) {
         const SCROLL_IDLE_SECS: f64 = 0.5;
         /// ユーザー入力から何秒アイドル経過したらアップグレードを許可するか。
         /// スクロール以外のキー操作やフルスクリーン遷移の直後も PDF ワーカーを
@@ -4826,9 +4886,9 @@ impl App {
         //    - 通常ロードが必要なら requested ガードで先送り
         //    - フォルダ切替は cancel_token で全停止
         //    なので大量 push しても害は無い (古い結果は poll_thumbnails で
-        //    keep_range 外なら自動破棄される)。
+        //    keep_set 外なら自動破棄される)。
         let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
-        for i in keep_start..keep_end {
+        for i in self.keep_set_sorted() {
             let needs_upgrade = match self.thumbnails.get(i) {
                 Some(ThumbnailState::Loaded {
                     from_cache,
@@ -4909,12 +4969,12 @@ impl App {
     /// 全件を正確に反映している。queue を別途カウントすると二重計上になるため
     /// `requested` のみを集計する。
     fn count_pending(&self) -> (usize, usize) {
-        let (keep_start, keep_end) = self.keep_range;
         let (mut in_normal, mut in_upgrade) = (0usize, 0usize);
         for (&idx, &is_upgrade) in &self.requested {
-            // keep_range 外のリクエストは「処理中だがスクロールで不要になった」もの。
-            // 進捗バーに含めない (ワーカー完了時に除去される)。
-            if idx < keep_start || idx >= keep_end {
+            // keep_set 外 (非可視 + 先読み範囲外) のリクエストは「処理中だがスクロール
+            // またはフィルタ変更で不要になった」もの。進捗バーに含めない
+            // (ワーカー完了時に除去される)。
+            if !self.keep_set.contains(&idx) {
                 continue;
             }
             if is_upgrade {
@@ -6340,15 +6400,10 @@ impl App {
                 }
             }
             if rating_filter_active {
-                // コンテナ (フォルダ / ZIP / PDF 本体) は filter ON でも常に表示する。
-                // 右下の「子孫★件数」バッジが「0 件でもフォルダは消さない」前提で
-                // 設計されており、コンテナ自身の★で隠してしまうとフォルダに入れない。
+                let stars = self.get_rating(i);
                 if let Some(item) = self.items.get(i) {
-                    if !item.is_container_ratable() && item.accepts_rating() {
-                        let stars = self.get_rating(i) as usize;
-                        if stars > 5 || !rating_filter[stars] {
-                            continue;
-                        }
+                    if !passes_rating_filter(item, stars, &rating_filter) {
+                        continue;
                     }
                 }
             }
@@ -6368,8 +6423,18 @@ impl App {
 
     /// `visible_indices` に含まれる (= フィルタ後の一覧に出ている) かを返す。
     /// `visible_indices` は items 順 (昇順) なので binary_search で O(log n)。
+    /// より狭い「prefetch 対象」判定が欲しい場合は [`Self::keep_set`] を直接参照する。
     pub(crate) fn idx_visible(&self, idx: usize) -> bool {
         self.visible_indices.binary_search(&idx).is_ok()
+    }
+
+    /// `keep_set` の内容を idx 昇順の Vec で返す。enqueue ログの順序安定や
+    /// idle upgrade / tag prewarm / 補正テクスチャなど「先頭から順に処理したい」
+    /// 背景処理用。worker 側は priority + distance で並べ直すので機能影響はない。
+    fn keep_set_sorted(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.keep_set.iter().copied().collect();
+        v.sort_unstable();
+        v
     }
 
     /// `self.selected` が visible_indices から外れていたら、items 順で直近の
@@ -6977,7 +7042,6 @@ impl App {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
-        self.last_enqueued_keep_range = (0, 0);
 
         // fts_meta 一括取得 — 存在する分は同期で即キャッシュに載せる (非可視も含む)。
         // SQLite の IN 句は数千件でも 10-30ms 程度なので UI を止めない。
@@ -7015,26 +7079,23 @@ impl App {
         self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
     }
 
-    /// 毎フレーム呼ぶ: 現在の `keep_range` (可視範囲 + prev/next ページ) に含まれる
-    /// Image アイテムのうち、`tags_cache` にまだ無いものを `tag_prewarm` worker に push する。
-    /// `tag_prewarm_queued` (idx セット) で二重 push を防ぎ、`last_enqueued_keep_range` で
-    /// スクロールが無いアイドルフレームを早期終了する。
+    /// 毎フレーム呼ぶ: 現在の `keep_set` (可視範囲 + prev/next ページの display list 部分列) に
+    /// 含まれる Image アイテムのうち、`tags_cache` にまだ無いものを `tag_prewarm` worker に push する。
+    /// `tag_prewarm_queued` (idx セット) で二重 push を防ぐので、毎フレームの走査は
+    /// ~175 件 × HashSet lookup で十分軽い (過去は keep_range bounding box 比較で
+    /// アイドルフレームを早期終了していたが、フィルタ変更で bbox 不変 × 内部構成変化 の
+    /// ケースを取り逃す不具合があり廃止した)。
     pub(crate) fn enqueue_visible_tag_prewarms(&mut self) {
         let Some(pending) = self.tag_prewarm_pending.as_ref() else {
             return;
         };
-        let (start, end) = self.keep_range;
-        let end = end.min(self.items.len());
-        if start >= end {
+        if self.keep_set.is_empty() {
             return;
         }
-        // keep_range が前フレームから変わっていなければ走査不要。
-        // スクロールや visible_indices 変化で range が動いた時だけ再走する。
-        if self.last_enqueued_keep_range == (start, end) {
-            return;
-        }
-        self.last_enqueued_keep_range = (start, end);
-        for idx in start..end {
+        for idx in self.keep_set_sorted() {
+            if idx >= self.items.len() {
+                continue;
+            }
             // idx ベースで dedup: 処理済み idx は cache_key 文字列を組み立てずスキップ。
             if self.tag_prewarm_queued.contains(&idx) {
                 continue;
@@ -9323,7 +9384,7 @@ impl App {
         self.thumb_adjust_tex.insert(idx, handle);
     }
 
-    /// keep_range 内の「ピクセルは持っているが補正テクスチャがまだ無い」idx を
+    /// keep_set 内の「ピクセルは持っているが補正テクスチャがまだ無い」idx を
     /// 最大 `budget` 件処理する。可視範囲は ui_main 側で同期適用済みなので、
     /// ここでは主に先読み範囲 (可視外) の補正を背後で埋めるのに使う。
     /// スライダードラッグ中は 1 件も処理しない (リリース時にまとめて再生成)。
@@ -9331,9 +9392,8 @@ impl App {
         if self.adjustment_dragging {
             return;
         }
-        let (start, end) = self.keep_range;
         let mut processed = 0usize;
-        for idx in start..end {
+        for idx in self.keep_set_sorted() {
             if processed >= budget {
                 break;
             }
@@ -11786,6 +11846,103 @@ mod tests {
     use super::*;
     use crate::archive_converter::ArchiveFormat;
     use std::path::PathBuf;
+
+    // ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
+
+    #[test]
+    fn rating_filter_container_uses_all_6_buckets() {
+        let folder = GridItem::Folder(PathBuf::from("/a"));
+        // ★なし OFF → 未評価フォルダも隠れる (「★5 のみ表示」が実際に効くために必要)
+        let mut f = [true; 6];
+        f[0] = false;
+        assert!(!passes_rating_filter(&folder, 0, &f));
+        // ★3 フォルダ、★3 ON なら可視
+        assert!(passes_rating_filter(&folder, 3, &[true; 6]));
+        // ★3 フォルダ、★3 OFF なら非可視
+        let mut f = [true; 6];
+        f[3] = false;
+        assert!(!passes_rating_filter(&folder, 3, &f));
+    }
+
+    #[test]
+    fn rating_filter_zip_pdf_containers_behave_like_folder() {
+        let zip = GridItem::ZipFile(PathBuf::from("/a.zip"));
+        let pdf = GridItem::PdfFile(PathBuf::from("/a.pdf"));
+        let mut f = [true; 6];
+        f[0] = false;
+        assert!(!passes_rating_filter(&zip, 0, &f));
+        assert!(!passes_rating_filter(&pdf, 0, &f));
+        let mut f = [true; 6];
+        f[4] = false;
+        assert!(!passes_rating_filter(&zip, 4, &f));
+        assert!(!passes_rating_filter(&pdf, 4, &f));
+    }
+
+    #[test]
+    fn rating_filter_image_page_uses_all_6_buckets() {
+        let img = GridItem::Image(PathBuf::from("/a.jpg"));
+        let mut f = [true; 6];
+        f[0] = false;
+        assert!(!passes_rating_filter(&img, 0, &f));
+        let f = [true; 6];
+        assert!(passes_rating_filter(&img, 2, &f));
+        let mut f = [true; 6];
+        f[2] = false;
+        assert!(!passes_rating_filter(&img, 2, &f));
+    }
+
+    #[test]
+    fn rating_filter_zip_image_and_pdf_page_behave_like_image() {
+        // ページ系の残り 2 種 (ZipImage / PdfPage) が Image と同じ 6 バケット判定で
+        // 動いていることを担保 (コンテナと対称)。
+        let zip_img = GridItem::ZipImage {
+            zip_path: PathBuf::from("/a.zip"),
+            entry_name: "x.jpg".to_string(),
+        };
+        let pdf_page = GridItem::PdfPage {
+            pdf_path: PathBuf::from("/a.pdf"),
+            page_num: 1,
+            content_type: None,
+        };
+        let mut f = [true; 6];
+        f[0] = false;
+        assert!(!passes_rating_filter(&zip_img, 0, &f));
+        assert!(!passes_rating_filter(&pdf_page, 0, &f));
+        let mut f = [true; 6];
+        f[3] = false;
+        assert!(!passes_rating_filter(&zip_img, 3, &f));
+        assert!(!passes_rating_filter(&pdf_page, 3, &f));
+    }
+
+    #[test]
+    fn rating_filter_star5_only_hides_unrated_containers() {
+        // ユーザが明示的に「★5 だけ見たい」(★5 のみ ON、他全部 OFF) を選んだとき、
+        // 未評価のフォルダも確実に非表示になること (本修正の主目的)
+        let folder = GridItem::Folder(PathBuf::from("/a"));
+        let img = GridItem::Image(PathBuf::from("/b.jpg"));
+        let mut f = [false; 6];
+        f[5] = true;
+        assert!(!passes_rating_filter(&folder, 0, &f));
+        assert!(!passes_rating_filter(&img, 0, &f));
+        assert!(passes_rating_filter(&folder, 5, &f));
+        assert!(passes_rating_filter(&img, 5, &f));
+    }
+
+    #[test]
+    fn rating_filter_video_and_non_ratable_always_visible() {
+        // Video はレーティング対象外 (accepts_rating=false) → 常に可視
+        let vid = GridItem::Video(PathBuf::from("/a.mp4"));
+        assert!(passes_rating_filter(&vid, 0, &[false; 6]));
+    }
+
+    #[test]
+    fn rating_filter_defensive_against_corrupt_stars() {
+        // 想定外の stars>5 はインデックス越境を避けるため非可視にする (防御)
+        let folder = GridItem::Folder(PathBuf::from("/a"));
+        let img = GridItem::Image(PathBuf::from("/a.jpg"));
+        assert!(!passes_rating_filter(&folder, 99, &[true; 6]));
+        assert!(!passes_rating_filter(&img, 99, &[true; 6]));
+    }
 
     /// 同名フォルダがある ZIP/PDF/ConvertibleArchive (7z/LZH) は
     /// `filter_virtual_folder_duplicates` でスキップされる。
