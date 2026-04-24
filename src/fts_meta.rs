@@ -125,9 +125,9 @@ impl FtsMetaDb {
             needs_rebuild(&conn)?
         };
         if rebuild_needed {
-            crate::logger::log(
-                "fts_meta: detected old schema (INDEX_VERSION < 2) — dropping `files` table for rebuild",
-            );
+            crate::logger::log(format!(
+                "fts_meta: detected old schema (index_version < {INDEX_VERSION}) — dropping `files` table for rebuild"
+            ));
             conn.execute_batch("DROP TABLE IF EXISTS files;")?;
         }
         init_schema(&conn)?;

@@ -34,7 +34,6 @@ pub(crate) struct FolderNavThreadResult {
     scanned: Option<ScannedDir>,
 }
 
-/// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 /// ZIP 中央ディレクトリ列挙の非同期ハンドル。ネスト ZIP が多いと `enumerate_image_entries`
 /// が数秒かかるため worker に逃がす。Drop で `cancel` を立てるので、新しい load_folder が
 /// 来たら自動で破棄される (worker は cancel を見て早期 return する)。
@@ -53,6 +52,7 @@ impl Drop for ZipEnumeratePending {
     }
 }
 
+/// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
     cancel: Arc<AtomicBool>,
@@ -3148,7 +3148,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let path_w = zip_path.clone();
         let cancel_w = Arc::clone(&cancel);
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("zip-enumerate".into())
             .spawn(move || {
                 if cancel_w.load(Ordering::Relaxed) {
@@ -3157,8 +3157,21 @@ impl App {
                 let result = crate::zip_loader::enumerate_image_entries(&path_w)
                     .map_err(|e| e.to_string());
                 let _ = tx.send(result);
-            })
-            .expect("zip-enumerate thread spawn");
+            });
+
+        if let Err(e) = spawn_result {
+            // リソース枯渇等でスレッド spawn に失敗した場合は panic せず、UI スレッドで
+            // 同期的に enumerate してそのまま start_loading_items に流す
+            // (PDF 側と揃えた fallback)。UI は多少詰まるが「アプリが落ちる」よりは遥かにマシ。
+            crate::logger::log(format!(
+                "zip-enumerate: spawn failed ({e}), falling back to synchronous enumerate"
+            ));
+            drop(rx);
+            let result = crate::zip_loader::enumerate_image_entries(&zip_path)
+                .map_err(|e| e.to_string());
+            self.finalize_zip_enumerate(zip_path, self.settings.sort_order, result);
+            return;
+        }
 
         self.zip_enumerate_pending = Some(ZipEnumeratePending {
             zip_path,
@@ -3199,7 +3212,17 @@ impl App {
         let zip_path = pending.zip_path.clone();
         let sort = pending.sort_order;
         self.zip_enumerate_pending = None;
+        self.finalize_zip_enumerate(zip_path, sort, result);
+    }
 
+    /// enumerate 結果 → group/sort → `start_loading_items`。
+    /// async (poll_zip_enumerate) と sync fallback (spawn 失敗時) の両方から呼ぶ。
+    fn finalize_zip_enumerate(
+        &mut self,
+        zip_path: PathBuf,
+        sort: crate::settings::SortOrder,
+        result: Result<Vec<crate::zip_loader::ZipImageEntry>, String>,
+    ) {
         let entries = match result {
             Ok(e) => e,
             Err(e) => {

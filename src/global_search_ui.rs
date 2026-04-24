@@ -305,10 +305,26 @@ impl GlobalSearchState {
 /// `!` は Windows のファイル名に含められる有効文字 (Eagle 等が生成するファイル名に含まれる)
 /// のため、単純な `contains('!')` では ZIP 判定として不十分。file_part 側が `.zip` で
 /// 終わる場合のみ ZIP エントリ扱いにする。
+///
+/// hot-path (数千ヒット × 複数 iterator) で呼ばれるので、`to_ascii_lowercase()` での
+/// String アロケーションは避けて末尾 4 バイトの ASCII 大小無視比較で判定する。
 fn split_zip_hit_path(hit_path: &str) -> Option<(&str, &str)> {
     hit_path
         .split_once('!')
-        .filter(|(file_part, _)| file_part.to_ascii_lowercase().ends_with(".zip"))
+        .filter(|(file_part, _)| ends_with_zip_ci(file_part))
+}
+
+/// ASCII 大小無視で末尾が `.zip` か判定する (アロケーションなし)。
+fn ends_with_zip_ci(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return false;
+    }
+    let tail = &bytes[bytes.len() - 4..];
+    tail[0] == b'.'
+        && tail[1].eq_ignore_ascii_case(&b'z')
+        && tail[2].eq_ignore_ascii_case(&b'i')
+        && tail[3].eq_ignore_ascii_case(&b'p')
 }
 
 fn is_zip_hit_path(hit_path: &str) -> bool {
