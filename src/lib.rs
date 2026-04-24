@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod data_dir;
 pub mod exif_reader;
 pub mod fast_resize;
+pub mod folder_rating_counter;
 pub mod folder_tree;
 pub mod fts_index;
 pub mod fts_meta;

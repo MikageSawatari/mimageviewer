@@ -1341,6 +1341,18 @@ pub struct App {
     /// `None` に戻して無効化する。
     pub(crate) current_folder_rating_cache: Option<u8>,
 
+    /// 再帰レーティングフィルタ: 現フォルダ直下のコンテナごとの子孫★件数バッファ。
+    /// key は `adjustment_db::normalize_path` で正規化したパス。
+    pub(crate) folder_rating_counts:
+        std::collections::HashMap<String, crate::folder_rating_counter::StarCounts>,
+    pub(crate) folder_rating_counts_loaded: bool,
+    pub(crate) folder_rating_counter_handle:
+        Option<crate::folder_rating_counter::FolderRatingCounterHandle>,
+    /// worker を起動したときの `current_folder` 正規化キー。`ensure_folder_rating_counter`
+    /// が同フォルダで再 spawn しないための change-detection に使う (handle を見ると
+    /// worker 終了直後に再 spawn ループになる既知バグを避けるため handle ではなくこれ)。
+    pub(crate) folder_rating_counts_folder_key: Option<String>,
+
     // ── 見開き表示 ──────────────────────────────────────────────
     /// 見開き DB (フォルダごとのモード永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
@@ -1842,6 +1854,10 @@ impl Default for App {
             rating_cache: std::collections::HashMap::new(),
             user_set_rating_keys: std::collections::HashSet::new(),
             current_folder_rating_cache: None,
+            folder_rating_counts: std::collections::HashMap::new(),
+            folder_rating_counts_loaded: false,
+            folder_rating_counter_handle: None,
+            folder_rating_counts_folder_key: None,
             spread_db: crate::spread_db::SpreadDb::open().ok(),
             spread_mode: crate::settings::SpreadMode::default(),
             spread_popup_open: false,
@@ -3250,6 +3266,7 @@ impl App {
         self.current_folder_rating_cache = None;
         // フォルダ切替でユーザ明示設定の記録もリセット (別フォルダでは無関係)
         self.user_set_rating_keys.clear();
+        self.reset_folder_rating_counts();
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
         self.current_folder_last_mtime = source_path
@@ -6299,11 +6316,15 @@ impl App {
                 }
             }
             if rating_filter_active {
-                let accepts = matches!(self.items.get(i), Some(it) if it.accepts_rating());
-                if accepts {
-                    let stars = self.get_rating(i) as usize;
-                    if stars > 5 || !rating_filter[stars] {
-                        continue;
+                // コンテナ (フォルダ / ZIP / PDF 本体) は filter ON でも常に表示する。
+                // 右下の「子孫★件数」バッジが「0 件でもフォルダは消さない」前提で
+                // 設計されており、コンテナ自身の★で隠してしまうとフォルダに入れない。
+                if let Some(item) = self.items.get(i) {
+                    if !item.is_container_ratable() && item.accepts_rating() {
+                        let stars = self.get_rating(i) as usize;
+                        if stars > 5 || !rating_filter[stars] {
+                            continue;
+                        }
                     }
                 }
             }
@@ -6518,12 +6539,18 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        // prewarm で全 item が cache に載っている前提。未取得なら 0 扱いで OK。
+        let old_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
         self.rating_cache.insert(idx, stars);
         // ユーザが明示的に値を書いた path として記録。tag_prewarm の古い XMP 読み戻しで
         // 値を上書きされないように hydrate_ratings_from_xmp が参照する。
         self.user_set_rating_keys.insert(key.clone());
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set(&key, stars);
+        }
+        // コンテナ自身の★は子孫集計と別軸なので is_ratable (ページ単位) のみ伝搬する。
+        if matches!(self.items.get(idx), Some(it) if it.is_ratable()) {
+            self.apply_rating_delta_to_folder_counts(&key, old_stars, stars);
         }
         // コンテナへの rating 変更は current_folder と同じパスを指す可能性があるので
         // アドレスバーキャッシュを lazy 再計算させる。
@@ -6602,6 +6629,166 @@ impl App {
                 errors.len(),
                 preview
             ));
+        }
+    }
+
+    // ── 再帰レーティングフィルタ (子孫★集計) ─────────────────────
+
+    /// `folder_rating_counts` を空にし、worker を cancel する。フォルダ切替時に呼ぶ。
+    pub(crate) fn reset_folder_rating_counts(&mut self) {
+        self.folder_rating_counts.clear();
+        self.folder_rating_counts_loaded = false;
+        self.folder_rating_counts_folder_key = None;
+        if let Some(h) = self.folder_rating_counter_handle.take() {
+            h.cancel();
+        }
+    }
+
+    /// レーティングフィルタが有効か (バケットが 1 つでも OFF なら true)。
+    /// フィルタが全 ON の状態は「フィルタ未使用」として worker を動かさない。
+    pub(crate) fn rating_filter_active(&self) -> bool {
+        !self.settings.rating_filter.iter().all(|&b| b)
+    }
+
+    /// 毎フレーム呼ぶ: フィルタ ON かつ現フォルダ未スキャンなら worker 起動、
+    /// フィルタ OFF ならバッファを片付ける。Ctrl+G 検索結果ビュー / rating_db 無し /
+    /// current_folder 無しは no-op。
+    ///
+    /// change-detection は `folder_rating_counts_folder_key` のみを見る。handle の有無を
+    /// 条件に入れると worker 終了直後 (handle=None) に再 spawn するループで点滅する。
+    pub(crate) fn ensure_folder_rating_counter(&mut self) {
+        if !self.rating_filter_active() {
+            if self.folder_rating_counter_handle.is_some()
+                || !self.folder_rating_counts.is_empty()
+                || self.folder_rating_counts_folder_key.is_some()
+            {
+                self.reset_folder_rating_counts();
+            }
+            return;
+        }
+
+        let Some(current) = self.current_folder.clone() else {
+            return;
+        };
+        if current == search_results_synthetic_path() || self.global_search.active {
+            return;
+        }
+        if self.rating_db.is_none() {
+            return;
+        }
+        let folder_key = crate::adjustment_db::normalize_path(&current);
+        if self.folder_rating_counts_folder_key.as_deref() == Some(&folder_key) {
+            return;
+        }
+        if let Some(h) = self.folder_rating_counter_handle.take() {
+            h.cancel();
+        }
+        self.folder_rating_counts.clear();
+        self.folder_rating_counts_loaded = false;
+        let db_path = crate::data_dir::get().join("rating.db");
+        self.folder_rating_counter_handle = Some(
+            crate::folder_rating_counter::spawn_for_folder(db_path, folder_key.clone()),
+        );
+        self.folder_rating_counts_folder_key = Some(folder_key);
+    }
+
+    /// worker からの部分結果を取り込む。毎フレーム呼ぶ。
+    /// 再描画は update ループ末尾の repaint ゲートが担当する。
+    ///
+    /// 100k+ 件の DB でキューに batch が溜まっていると `try_recv` 連続 drain が UI
+    /// フレーム hitch になるため、1 フレームで最大 `MAX_BATCHES_PER_FRAME` 件までに
+    /// 制限する (残りは次フレーム)。
+    pub(crate) fn poll_folder_rating_counts(&mut self) {
+        const MAX_BATCHES_PER_FRAME: usize = 8;
+        let Some(h) = self.folder_rating_counter_handle.as_ref() else {
+            return;
+        };
+        for _ in 0..MAX_BATCHES_PER_FRAME {
+            match h.rx.try_recv() {
+                Ok(batch) => {
+                    for (key, counts) in batch.entries {
+                        let e = self
+                            .folder_rating_counts
+                            .entry(key)
+                            .or_insert([0u32; 5]);
+                        for i in 0..5 {
+                            e[i] = e[i].saturating_add(counts[i]);
+                        }
+                    }
+                    if batch.finished {
+                        self.folder_rating_counts_loaded = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.folder_rating_counts_loaded = true;
+                    self.folder_rating_counter_handle = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 指定 idx (Folder / ZipFile / PdfFile) のフィルタ一致件数と per-star 内訳を返す。
+    /// worker 未起動 / キー無し / フィルタ対象外 / 合計 0 件 は `None`。
+    /// `per_star` はマスク前の全★別件数で、tooltip 内訳表示に使う。
+    pub(crate) fn folder_rating_match(&self, idx: usize) -> Option<(u32, [u32; 5])> {
+        let path = match self.items.get(idx)? {
+            GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
+            _ => return None,
+        };
+        let key = crate::adjustment_db::normalize_path(path);
+        let per_star = *self.folder_rating_counts.get(&key)?;
+        let rf = &self.settings.rating_filter;
+        // rating_filter[i+1] が ★(i+1) に対応。rf[0] は未評価フィルタなので無視。
+        let total: u32 = (0..5)
+            .filter(|i| *rf.get(i + 1).unwrap_or(&true))
+            .map(|i| per_star[i])
+            .sum();
+        // 0 件はバッジ表示しない (「0→N」遷移で UI が揺れないように)。
+        if total == 0 {
+            return None;
+        }
+        Some((total, per_star))
+    }
+
+    /// rating が変わったとき、子孫集計に反映する。
+    ///
+    /// スキャン完了後 (`loaded=true`) なら old→new の delta で直下コンテナに増減を加える。
+    /// スキャン進行中は、worker の batch と bump の加算順序で二重計上・取りこぼしが起きる
+    /// (Codex レビュー P1) ので、局所 bump は諦めて worker を restart する。
+    fn apply_rating_delta_to_folder_counts(&mut self, key: &str, old_stars: u8, new_stars: u8) {
+        if old_stars == new_stars {
+            return;
+        }
+        if self.folder_rating_counts_folder_key.is_none() {
+            return;
+        }
+        if !self.folder_rating_counts_loaded {
+            // スキャン中は restart で確実に最新値を反映させる。handle を落として
+            // folder_key もクリアすることで次フレームの ensure_folder_rating_counter が
+            // まっさらに spawn しなおす。
+            self.reset_folder_rating_counts();
+            return;
+        }
+        let folder_key = self.folder_rating_counts_folder_key.clone().unwrap();
+        let prefix = format!("{folder_key}/");
+        let Some(agg_key) =
+            crate::folder_rating_counter::aggregation_key_for(key, &prefix).map(|s| s.to_string())
+        else {
+            return;
+        };
+        let entry = self
+            .folder_rating_counts
+            .entry(agg_key)
+            .or_insert([0u32; 5]);
+        if (1..=5).contains(&old_stars) {
+            let i = (old_stars - 1) as usize;
+            entry[i] = entry[i].saturating_sub(1);
+        }
+        if (1..=5).contains(&new_stars) {
+            let i = (new_stars - 1) as usize;
+            entry[i] = entry[i].saturating_add(1);
         }
     }
 
@@ -6906,6 +7093,10 @@ impl App {
         }
         for (key, stars) in &to_write {
             let _ = db.set(key, *stars);
+        }
+        // 子孫★集計バッジにも反映 (to_write は DB が 0 だった path のみ = old_stars=0)。
+        for (key, stars) in &to_write {
+            self.apply_rating_delta_to_folder_counts(key, 0, *stars);
         }
         // 実際に rating_cache が更新されたのでフィルタ影響あり
         self.rebuild_visible_indices();
@@ -9864,6 +10055,8 @@ impl eframe::App for App {
         self.poll_favsearch();
         self.poll_metadata_load();
         self.poll_tag_prewarm_results();
+        self.ensure_folder_rating_counter();
+        self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
         self.poll_global_search_debounce();
         self.poll_global_search_events(ctx);
@@ -9877,6 +10070,8 @@ impl eframe::App for App {
                 .tag_prewarm_pending
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
+            || (self.folder_rating_counter_handle.is_some()
+                && !self.folder_rating_counts_loaded)
         {
             ctx.request_repaint();
         }
@@ -10672,6 +10867,8 @@ pub(crate) fn draw_cell(
     adjusted_tex: Option<&egui::TextureHandle>,
     // 画像セルに表示する XMP dc:subject 由来のタグ (`#原神` 等)。空なら非表示。
     tags: &[String],
+    // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
+    filter_match_count: Option<u32>,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -11125,6 +11322,34 @@ pub(crate) fn draw_cell(
         );
     }
 
+    if let Some(count) = filter_match_count {
+        if item.is_container_ratable() && count > 0 {
+            draw_filter_match_badge(painter, rect, count);
+        }
+    }
+
+}
+
+/// 右下オレンジ角丸バッジ。コンテナ★バッジが左下なので衝突しない配置。
+fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count: u32) {
+    let text = if count >= 1000 {
+        "999+".to_string()
+    } else {
+        count.to_string()
+    };
+    let font = egui::FontId::proportional(11.0);
+    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+    let pad_x = 5.0;
+    let pad_y = 2.0;
+    let bg_w = galley.size().x + pad_x * 2.0;
+    let bg_h = galley.size().y + pad_y * 2.0;
+    let bg_rect = egui::Rect::from_min_size(
+        egui::pos2(cell_rect.max.x - bg_w - 3.0, cell_rect.max.y - bg_h - 3.0),
+        egui::vec2(bg_w, bg_h),
+    );
+    painter.rect_filled(bg_rect, 3.0, egui::Color32::from_rgb(0xE6, 0x7E, 0x22));
+    let text_pos = bg_rect.left_top() + egui::vec2(pad_x, pad_y);
+    painter.galley(text_pos, galley, egui::Color32::WHITE);
 }
 
 /// サムネイル左上 (補/消 バッジの右隣) にタグ (`#xxx #yyy`) を 1 つの緑バッジで描画する。

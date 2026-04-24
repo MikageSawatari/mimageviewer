@@ -1118,6 +1118,8 @@ impl App {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
                                 let tags = self.cell_tag_list(idx).to_vec();
+                                let filter_match = self.folder_rating_match(idx);
+                                let filter_match_count = filter_match.map(|(c, _)| c);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
@@ -1131,7 +1133,32 @@ impl App {
                                     rot,
                                     adjusted_tex,
                                     &tags,
+                                    filter_match_count,
                                 );
+                                // 小さい右下バッジに限らずセル全体をホバー領域にして
+                                // ★内訳 tooltip を出す。
+                                if let Some((_total, per_star)) = filter_match {
+                                    let hover_id = egui::Id::new(("folder_rating_badge", idx));
+                                    let resp = ui
+                                        .interact(cell_rect, hover_id, egui::Sense::hover());
+                                    if resp.hovered() {
+                                        resp.on_hover_ui_at_pointer(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label("マッチする子孫ファイル");
+                                                for s in (1..=5usize).rev() {
+                                                    let c = per_star[s - 1];
+                                                    if c > 0 {
+                                                        ui.label(format!(
+                                                            "{} : {} 件",
+                                                            "★".repeat(s),
+                                                            c
+                                                        ));
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    }
+                                }
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
                                 if self.selected == Some(idx) {

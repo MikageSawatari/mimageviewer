@@ -188,13 +188,7 @@ impl AdjustmentDb {
         ) else {
             return map;
         };
-        // LIKE 特殊文字 (%, _, [) をエスケープ
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-            .replace('[', "\\[");
-        let pattern = format!("{escaped}%");
+        let pattern = format!("{}%", escape_like_pattern(prefix));
         let Ok(rows) = stmt.query_map([&pattern], |row| {
             let path: String = row.get(0)?;
             let json: String = row.get(1)?;
@@ -214,6 +208,16 @@ impl AdjustmentDb {
 /// パスを正規化 (小文字化 + バックスラッシュ→スラッシュ)。
 pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_lowercase().replace('\\', "/")
+}
+
+/// SQL `LIKE` の特殊文字 (`\`, `%`, `_`, `[`) を `\` でエスケープする。
+/// 呼び出し側は `ESCAPE '\'` 指定の prepared statement で使う。
+/// 末尾の `%` は呼び出し側で付与する想定 (prefix 一致なのか完全一致なのかは用途依存)。
+pub fn escape_like_pattern(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('[', "\\[")
 }
 
 #[cfg(test)]
