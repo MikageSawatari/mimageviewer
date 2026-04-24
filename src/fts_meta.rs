@@ -112,13 +112,31 @@ impl FtsMetaDb {
         )?;
         // §19.8 自動マイグレーション: 旧スキーマを検出したら files を drop して再作成する。
         // (Tantivy 側は FtsIndex::open_at が並列で wipe する)
-        if needs_rebuild(&conn)? {
+        //
+        // Codex startup 計装で fts_meta.db (~2GB) に対する `SELECT MIN(index_version)` が
+        // cold cache で 10 秒超フルスキャンしていた。PRAGMA user_version でスキーマ最新
+        // フラグを持ち、一致していればスキャンを完全に回避する。
+        // - user_version == INDEX_VERSION: 最新 → rebuild 不要、MIN スキャンなし
+        // - それ以外: 旧来の needs_rebuild() ロジックを実行 (初回起動 / 旧 DB)
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let rebuild_needed = if user_version == INDEX_VERSION {
+            false
+        } else {
+            needs_rebuild(&conn)?
+        };
+        if rebuild_needed {
             crate::logger::log(
                 "fts_meta: detected old schema (INDEX_VERSION < 2) — dropping `files` table for rebuild",
             );
             conn.execute_batch("DROP TABLE IF EXISTS files;")?;
         }
         init_schema(&conn)?;
+        // スキーマ最新を user_version に記録。次回起動時の MIN スキャンを回避する。
+        // `PRAGMA user_version = N` はパラメータバインド不可なので format! で組み立てる
+        // (INDEX_VERSION は const なので SQL injection リスクはない)。
+        if user_version != INDEX_VERSION {
+            conn.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -555,10 +573,13 @@ fn needs_rebuild(conn: &Connection) -> rusqlite::Result<bool> {
     if has_all_text_norm || !has_name_norm || !has_tags_norm {
         return Ok(true);
     }
-    // index_version が古い行が残っている (過去にこの DB で別バージョンを使っていた等)
+    // index_version が古い行が残っている (過去にこの DB で別バージョンを使っていた等)。
+    // MIN は空テーブルなら NULL 行を返すため Option<i64> で受ける
+    // (`.optional()` は `QueryReturnedNoRows` 用で、MIN の NULL 行はこれに当たらない)。
     let min_ver: Option<i64> = conn
-        .query_row("SELECT MIN(index_version) FROM files", [], |row| row.get(0))
-        .optional()?;
+        .query_row("SELECT MIN(index_version) FROM files", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
     Ok(matches!(min_ver, Some(v) if v < INDEX_VERSION))
 }
 
@@ -647,6 +668,48 @@ mod tests {
         let id = Uuid::new_v4();
         assert!(db.list_favorite_files(id).unwrap().is_empty());
         assert!(db.list_not_ok().unwrap().is_empty());
+    }
+
+    /// 新規 DB 作成後に `PRAGMA user_version` が `INDEX_VERSION` と一致すること。
+    /// これにより次回 open 時は needs_rebuild の MIN スキャンがスキップされる (起動高速化)。
+    #[test]
+    fn open_sets_user_version_to_index_version() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        {
+            let _db = FtsMetaDb::open_at(&db_path).unwrap();
+        } // close
+        // 直接 SQLite を開いて user_version を読む
+        let conn = Connection::open(&db_path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, INDEX_VERSION);
+    }
+
+    /// user_version が古ければ MIN スキャン経路が走り、rebuild 判定が機能すること。
+    #[test]
+    fn legacy_db_without_user_version_triggers_check() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        // 既存スキーマの DB を用意して user_version を古くしておく
+        {
+            let _db = FtsMetaDb::open_at(&db_path).unwrap();
+        }
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+        }
+        // もう一度 open → user_version が古いので check 経路を通るが、
+        // 実スキーマは最新なので rebuild はされず、最終的に user_version は INDEX_VERSION に戻る
+        {
+            let _db = FtsMetaDb::open_at(&db_path).unwrap();
+        }
+        let conn = Connection::open(&db_path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, INDEX_VERSION);
     }
 
     #[test]

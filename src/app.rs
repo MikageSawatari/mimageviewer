@@ -35,6 +35,24 @@ pub(crate) struct FolderNavThreadResult {
 }
 
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
+/// ZIP 中央ディレクトリ列挙の非同期ハンドル。ネスト ZIP が多いと `enumerate_image_entries`
+/// が数秒かかるため worker に逃がす。Drop で `cancel` を立てるので、新しい load_folder が
+/// 来たら自動で破棄される (worker は cancel を見て早期 return する)。
+pub(crate) struct ZipEnumeratePending {
+    pub zip_path: PathBuf,
+    pub cancel: Arc<AtomicBool>,
+    pub rx: mpsc::Receiver<Result<Vec<crate::zip_loader::ZipImageEntry>, String>>,
+    /// 結果受信後のグルーピング/ソートで使う。起動時の `settings.sort_order` をキャプチャ
+    /// (worker 実行中にユーザーが設定を変えても、このロード分は開始時の値で処理する)。
+    pub sort_order: crate::settings::SortOrder,
+}
+
+impl Drop for ZipEnumeratePending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
     cancel: Arc<AtomicBool>,
@@ -1583,6 +1601,17 @@ pub struct App {
     /// `poll_pdf_enumerate` の成功経路で消費される (path 一致時のみ save)。
     pub(crate) pdf_password_pending_save: Option<(PathBuf, String)>,
 
+    // ── ZIP 非同期ロード ────────────────────────────────────────
+    /// ZIP (特にネスト ZIP) の中央ディレクトリ列挙を UI スレッドから外すための pending。
+    /// `load_zip_as_folder` が worker を spawn して即 return し、`poll_zip_enumerate` が
+    /// 結果を受け取って `start_loading_items` に流す。
+    ///
+    /// pending 中は `current_folder = zip_path` / `items.is_empty() = true` となり、
+    /// grid は「読み込み中…」を表示する。BS / Ctrl+↑↓ はこのタイミングで発火しても
+    /// `load_folder` に入って pending を Drop するだけなので、worker は cancel を見て
+    /// harmless に抜ける (Drop の自動 cancel と同じ構造)。
+    pub(crate) zip_enumerate_pending: Option<ZipEnumeratePending>,
+
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
     pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
@@ -2028,6 +2057,7 @@ impl Default for App {
             pdf_content_type_tx: pdf_ct_tx,
             pdf_content_type_rx: pdf_ct_rx,
             pdf_enumerate_pending: None,
+            zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
             cached_handlers: None,
             cached_nav_indices: None,
@@ -3072,27 +3102,108 @@ impl App {
         best
     }
 
-    /// タスク 3: ZIP ファイルを仮想フォルダとして開く。
+    /// タスク 3: ZIP ファイルを仮想フォルダとして開く (非同期)。
     ///
-    /// 内部の画像エントリを列挙し、サブディレクトリごとにグループ化してから
-    /// 各グループに `ZipSeparator` を先頭に挿入する。グループ間はディレクトリ名順、
-    /// グループ内は現在の sort_order でソートされる。
+    /// ネスト ZIP の中央ディレクトリ列挙は数秒かかるため worker に逃がす。
+    /// UI 側は即座に「読み込み中…」を表示し、BS / Ctrl+↑↓ で中断可能。
+    /// 結果は `poll_zip_enumerate` が受け取り `start_loading_items` を呼ぶ。
     pub fn load_zip_as_folder(&mut self, zip_path: PathBuf) {
         crate::logger::log(format!(
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
         ));
 
-        // 別の外側 ZIP に切り替える場合、古いネスト ZIP バイト列キャッシュを破棄する。
-        // 同じ ZIP を開き直す場合も一度クリアして、壊れたエントリが居残らないようにする。
+        // 旧 ZIP / PDF pending を Drop (cancel 自動伝搬)。
+        self.zip_enumerate_pending = None;
+        self.pdf_enumerate_pending = None;
+
+        // 旧サムネイルワーカーを即キャンセル (pending 完了後に start_loading_items でも
+        // 再度 cancel されるが、先に止めておくことで worker キューの渋滞を防ぐ)。
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
+
+        // ネスト ZIP キャッシュのクリアは **UI スレッドで** 行う。worker 内で行うと、
+        // 複数 ZIP を連打したときに旧 worker の遅れた clear が新 worker の populate を
+        // 上書き消去するレースが起きる。ここで同期実行すれば load_zip_as_folder 呼び出し
+        // の直列順で確実にクリアされる (clear 自体は軽量: NESTED_CACHE.clear())。
         crate::zip_loader::clear_nested_cache();
 
-        // ── ZIP エントリ列挙 ──
-        let entries = match crate::zip_loader::enumerate_image_entries(&zip_path) {
+        // UI 即応: items をクリアして grid が「読み込み中…」を出せる状態にし、
+        // address / current_folder を zip_path にして breadcrumb と BS (parent) を正しく動かす。
+        // catalog / sidecar / worker spawn などの重い設定は poll_zip_enumerate の
+        // start_loading_items で行う (二重にやらない)。
+        self.items.clear();
+        self.thumbnails.clear();
+        self.image_metas.clear();
+        self.visible_indices.clear();
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        self.current_folder = Some(zip_path.clone());
+        self.current_folder_rating_cache = None;
+        self.address = zip_path.to_string_lossy().to_string();
+        self.update_global_search_address();
+
+        // worker spawn
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let path_w = zip_path.clone();
+        let cancel_w = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("zip-enumerate".into())
+            .spawn(move || {
+                if cancel_w.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = crate::zip_loader::enumerate_image_entries(&path_w)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            })
+            .expect("zip-enumerate thread spawn");
+
+        self.zip_enumerate_pending = Some(ZipEnumeratePending {
+            zip_path,
+            cancel,
+            rx,
+            sort_order: self.settings.sort_order,
+        });
+    }
+
+    /// `zip_enumerate_pending` の結果を毎フレーム polling する。
+    /// 完了時に group/sort + items 構築を行い `start_loading_items` に流す。
+    pub(crate) fn poll_zip_enumerate(&mut self) {
+        let Some(pending) = self.zip_enumerate_pending.as_ref() else {
+            return;
+        };
+        // 新しい load_folder 等で cancel が立った (実質 Drop 直前) 場合は結果を適用しない
+        if pending.cancel.load(Ordering::Relaxed) {
+            self.zip_enumerate_pending = None;
+            return;
+        }
+        let result = match pending.rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                crate::logger::log("zip enumerate: worker disconnected");
+                let zip_path = pending.zip_path.clone();
+                self.zip_enumerate_pending = None;
+                self.start_loading_items(
+                    zip_path,
+                    Vec::new(),
+                    Vec::new(),
+                    std::collections::HashSet::new(),
+                    Vec::new(),
+                );
+                return;
+            }
+        };
+        let zip_path = pending.zip_path.clone();
+        let sort = pending.sort_order;
+        self.zip_enumerate_pending = None;
+
+        let entries = match result {
             Ok(e) => e,
             Err(e) => {
                 crate::logger::log(format!("  zip enumerate failed: {e}"));
-                // 空状態で表示だけ更新
                 self.start_loading_items(
                     zip_path,
                     Vec::new(),
@@ -3105,17 +3216,14 @@ impl App {
         };
         crate::logger::log(format!("  zip: {} image entries", entries.len()));
 
-        // ── サブディレクトリごとにグループ化 ──
+        // サブディレクトリごとにグルーピング + 各グループ内ソート (純粋 in-memory)
         let mut groups: std::collections::BTreeMap<String, Vec<crate::zip_loader::ZipImageEntry>> =
             std::collections::BTreeMap::new();
         for e in entries {
             let dir = crate::zip_loader::entry_dir(&e.entry_name).to_string();
             groups.entry(dir).or_default().push(e);
         }
-
-        // 各グループ内を sort_order に従ってソート
-        let sort = self.settings.sort_order;
-        for (_, list) in groups.iter_mut() {
+        for list in groups.values_mut() {
             list.sort_by(|a, b| {
                 let an = crate::zip_loader::entry_basename(&a.entry_name);
                 let bn = crate::zip_loader::entry_basename(&b.entry_name);
@@ -3123,14 +3231,10 @@ impl App {
             });
         }
 
-        // ── items / image_metas を構築 ──
-        // 複数グループがあれば各グループ先頭にセパレータを挿入する。
-        // 単一グループ (ルート直下のみ) ならセパレータは不要。
         let insert_separators = groups.len() > 1;
         let mut items: Vec<GridItem> = Vec::new();
         let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
         let mut existing_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         for (dir, list) in groups {
             if insert_separators {
                 let display = if dir.is_empty() {
@@ -3153,7 +3257,6 @@ impl App {
             }
         }
 
-        // ZIP には動画は含まれない (Shell API がファイルパスを要求するため)
         self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new());
     }
 
@@ -3358,6 +3461,14 @@ impl App {
             if pending_path != &source_path {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
+            }
+        }
+        // ZIP も同様: 別パスへの遷移 (BS で親フォルダ、Ctrl+↑↓ で兄弟フォルダ等) が起きたら、
+        // 途中結果で上書き戻されないよう pending を捨てる (Drop で worker cancel)。
+        // 同じ zip_path への `start_loading_items` は poll_zip_enumerate 自身が呼ぶので残す。
+        if let Some(pending) = self.zip_enumerate_pending.as_ref() {
+            if pending.zip_path != source_path {
+                self.zip_enumerate_pending = None;
             }
         }
 
@@ -11325,6 +11436,11 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
         self.poll_pdf_enumerate();
+        self.poll_zip_enumerate();
+        if self.zip_enumerate_pending.is_some() {
+            // 結果到着までフレーム駆動で待つ (worker 完了通知は poll で拾う)
+            ctx.request_repaint();
+        }
 
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);

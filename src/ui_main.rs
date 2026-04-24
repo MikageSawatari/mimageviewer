@@ -1111,7 +1111,14 @@ impl App {
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
                 if self.items.is_empty() {
-                    let msg = if self.current_folder.is_some() {
+                    // ZIP / PDF 非同期列挙中は「読み込み中…」にして待ち状態を明示する。
+                    // BS や Ctrl+↑↓ はこの間でも受理され、load_folder 側で pending が
+                    // Drop されて worker が cancel する。
+                    let loading = self.zip_enumerate_pending.is_some()
+                        || self.pdf_enumerate_pending.is_some();
+                    let msg = if loading {
+                        "読み込み中…"
+                    } else if self.current_folder.is_some() {
                         "表示するファイルがありません"
                     } else {
                         "フォルダを入力して Enter キーを押してください"
