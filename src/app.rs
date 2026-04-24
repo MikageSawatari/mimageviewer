@@ -1622,9 +1622,13 @@ pub struct App {
     /// が自動的に cancel を立て、pool dispatcher が pop 時に IPC 前で古いジョブを捨てる。
     pub(crate) pdf_enumerate_pending:
         Option<(PathBuf, Option<String>, crate::pdf_loader::PdfEnumerateHandle)>,
-    /// Ctrl+↑↓ フォルダナビで非同期 PDF に着地したときに保存する方向フラグ。
-    /// `poll_pdf_enumerate` が items を埋めたあとで fullscreen を開き直すために使う。
+    /// Ctrl+↑↓ フォルダナビで非同期 PDF / ZIP に着地したときに保存する方向フラグ。
+    /// `poll_pdf_enumerate` / `poll_zip_enumerate` が items を埋めたあとで fullscreen を
+    /// 開き直すために使う (poll 側でフラグを take して先頭/末尾画像を open_fullscreen する)。
     /// `Some(forward)`: DFS 方向 (true=前方/下巻方向, false=後方/上巻方向)。
+    ///
+    /// PDF と ZIP の pending は同時に立つことがない (load_pdf / load_zip が互いにクリア
+    /// するため) ので、単一フィールドで両方を賄える。
     pub(crate) fs_nav_after_pdf_enumerate: Option<bool>,
 
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
@@ -3114,8 +3118,11 @@ impl App {
         ));
 
         // 旧 ZIP / PDF pending を Drop (cancel 自動伝搬)。
+        // fs_nav_after_pdf_enumerate も一緒に捨てないと、後続の別 PDF で古い方向で
+        // fullscreen が勝手に開いてしまう (Codex P2)。
         self.zip_enumerate_pending = None;
         self.pdf_enumerate_pending = None;
+        self.fs_nav_after_pdf_enumerate = None;
 
         // 旧サムネイルワーカーを即キャンセル (pending 完了後に start_loading_items でも
         // 再度 cancel されるが、先に止めておくことで worker キューの渋滞を防ぐ)。
@@ -3281,6 +3288,17 @@ impl App {
         }
 
         self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new());
+
+        // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
+        // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
+        if let Some(forward) = self.fs_nav_after_pdf_enumerate.take() {
+            if let Some(new_idx) = self.find_fullscreen_nav_target(forward) {
+                self.open_fullscreen(new_idx);
+                self.selected = Some(new_idx);
+                self.scroll_to_selected = true;
+                self.update_last_selected_image();
+            }
+        }
     }
 
     /// PDF ファイルを仮想フォルダとして開く (非同期)。
@@ -3304,7 +3322,9 @@ impl App {
 
         // 旧 pending を drop すると `PdfEnumerateHandle::Drop` が cancel を立て、
         // pool dispatcher は pop 時に IPC 前で古いジョブを捨てる。
+        // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
         self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
 
         // ── パスワード確認 ──
         let password: Option<String> = self
@@ -6414,19 +6434,21 @@ impl App {
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                 self.close_fullscreen();
                 self.load_folder_with_scan(path, scanned);
-                // PDF は enumerate_pages_async が非同期なので、load_folder 直後は items が空。
-                // 結果は poll_pdf_enumerate が受信するので、そこで fullscreen を開き直す。
-                // find_fullscreen_nav_target も内部で load_folder を呼んで PDF に自動進入する
-                // ことがあるため、その前後の両方でチェックする。
-                if self.pdf_enumerate_pending.is_some() {
+                // PDF / ZIP は enumerate_*_async が非同期なので、load_folder 直後は
+                // items が空のことがある。結果は poll_*_enumerate が受信するので、
+                // そこで fullscreen を開き直す。find_fullscreen_nav_target も内部で
+                // load_folder を呼んで PDF/ZIP に自動進入することがあるため、その前後の
+                // 両方でチェックする (Codex P1: ZIP 非同期化で ZIP への Ctrl+↑↓ fullscreen
+                // 継続が壊れていたのを修正)。
+                if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
-                    emit_end(apply_t0, apply_seq, apply_mode_tag, "pdf_enumerate_defer");
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, "enumerate_defer");
                     return;
                 }
                 let target_idx = self.find_fullscreen_nav_target(result.forward);
-                if self.pdf_enumerate_pending.is_some() {
+                if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
-                    emit_end(apply_t0, apply_seq, apply_mode_tag, "pdf_enumerate_defer");
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, "enumerate_defer");
                     return;
                 }
                 if let Some(new_idx) = target_idx {

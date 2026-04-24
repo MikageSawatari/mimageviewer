@@ -302,29 +302,39 @@ impl GlobalSearchState {
 }
 
 /// ZIP 内エントリを示すヒットパス (`<zippath>!<entry>`) かを判定する。
-/// `!` は Windows のファイル名に含められる有効文字 (Eagle 等が生成するファイル名に含まれる)
-/// のため、単純な `contains('!')` では ZIP 判定として不十分。file_part 側が `.zip` で
-/// 終わる場合のみ ZIP エントリ扱いにする。
+/// `!` は Windows のファイル名に含められる有効文字 (Eagle 等が生成するファイル名に含まれる
+/// ほか、ユーザーのフォルダ名・ZIP ファイル名にも入り得る)。
+/// したがって single `!` での split や、`split_once('!')` の left 側の拡張子チェックだけでは
+/// 不十分 — 親ディレクトリや ZIP 名に `!` があると誤判定する (Codex P2):
+///   `c:/a!/book.zip!entry.jpg` / `c:/book!.zip!entry.jpg` / `book.zip!sub!dir/x.jpg`
+/// パス全体をスキャンして **最初の `.zip!` 境界** で分割することで、上記ケースも
+/// 正しく処理する (zip 名・親 dir の `!` は許容、entry 内の `!` も許容)。
 ///
-/// hot-path (数千ヒット × 複数 iterator) で呼ばれるので、`to_ascii_lowercase()` での
-/// String アロケーションは避けて末尾 4 バイトの ASCII 大小無視比較で判定する。
+/// hot-path (数千ヒット × 複数 iterator) で呼ばれるので、
+/// アロケーションなしで ASCII 大小無視スキャンする。
 fn split_zip_hit_path(hit_path: &str) -> Option<(&str, &str)> {
-    hit_path
-        .split_once('!')
-        .filter(|(file_part, _)| ends_with_zip_ci(file_part))
-}
-
-/// ASCII 大小無視で末尾が `.zip` か判定する (アロケーションなし)。
-fn ends_with_zip_ci(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 4 {
-        return false;
+    let bytes = hit_path.as_bytes();
+    if bytes.len() < 5 {
+        return None;
     }
-    let tail = &bytes[bytes.len() - 4..];
-    tail[0] == b'.'
-        && tail[1].eq_ignore_ascii_case(&b'z')
-        && tail[2].eq_ignore_ascii_case(&b'i')
-        && tail[3].eq_ignore_ascii_case(&b'p')
+    // `.zip!` (大小無視) を左端から探す。見つけた位置の直後で分割。
+    // entry 内に `.zip!` が現れるケースは事実上ない (ZIP 内エントリ名に `!` は許されるが
+    // ZIP は通常ネストしない前提) ため、最初の境界で決め打つ。
+    let n = bytes.len() - 4; // i+4 まで参照するため
+    for i in 0..n {
+        if bytes[i] == b'.'
+            && bytes[i + 1].eq_ignore_ascii_case(&b'z')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'i')
+            && bytes[i + 3].eq_ignore_ascii_case(&b'p')
+            && bytes[i + 4] == b'!'
+        {
+            // i..=i+3 が `.zip`、i+4 が `!`
+            let file_part = &hit_path[..i + 4];
+            let entry = &hit_path[i + 5..];
+            return Some((file_part, entry));
+        }
+    }
+    None
 }
 
 fn is_zip_hit_path(hit_path: &str) -> bool {
@@ -1620,6 +1630,28 @@ mod tests {
         assert_eq!(split_zip_hit_path("c:/a/img-!name.png"), None);
         // `!` なしもなし
         assert_eq!(split_zip_hit_path("c:/a/img.png"), None);
+    }
+
+    /// Codex P2 指摘: 親ディレクトリや ZIP ファイル名に `!` を含むパスでも正しく分割する。
+    /// 最初の `.zip!` 境界でだけ split するので、`!` の位置に関わらず file_part 側は
+    /// 必ず `.zip` で終わる。
+    #[test]
+    fn split_zip_hit_path_tolerates_bang_before_zip() {
+        // 親ディレクトリに `!`
+        assert_eq!(
+            split_zip_hit_path("c:/a!/book.zip!entry.jpg"),
+            Some(("c:/a!/book.zip", "entry.jpg"))
+        );
+        // ZIP ファイル名自体に `!`
+        assert_eq!(
+            split_zip_hit_path("c:/a/book!.zip!entry.jpg"),
+            Some(("c:/a/book!.zip", "entry.jpg"))
+        );
+        // entry 内の `!` は維持 (次以降の `.zip!` も追わない前提)
+        assert_eq!(
+            split_zip_hit_path("c:/a/book.zip!sub!dir/img.jpg"),
+            Some(("c:/a/book.zip", "sub!dir/img.jpg"))
+        );
     }
 
     #[test]
