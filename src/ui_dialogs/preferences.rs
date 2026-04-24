@@ -300,7 +300,7 @@ impl App {
             });
 
         if apply {
-            if let Some(state) = self.pref_state.take() {
+            if let Some(mut state) = self.pref_state.take() {
                 let old_dup = (
                     self.settings.skip_zip_if_folder_exists,
                     self.settings.skip_image_if_video_exists,
@@ -315,6 +315,16 @@ impl App {
                 );
 
                 let old_pause_minimized = self.settings.pause_indexer_while_minimized;
+
+                // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
+                // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
+                // 開いたアプリ履歴等) や runtime (ツールバー選択 / ウィンドウ移動 / レーティング
+                // フィルタ) が変えたフィールドは state.settings 側に反映されないため、そのまま
+                // self.settings = state.settings を実行するとそれらの変更が消える。
+                // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
+                // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
+                // Settings に追加した場合はここにも追記が必要。
+                state.settings.overwrite_non_preferences_from(&mut self.settings);
 
                 self.settings = state.settings;
                 self.settings.save();

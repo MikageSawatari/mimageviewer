@@ -1029,6 +1029,53 @@ impl Settings {
         }
     }
 
+    /// 環境設定ダイアログが**編集しない**フィールドを `src` から取り込む (move)。
+    ///
+    /// 環境設定ダイアログの「OK」押下は内部的に `self.settings = state.settings;` で
+    /// 全体差し替えするが、state.settings は開いた時点のスナップショットなので、
+    /// 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット等) や
+    /// runtime (ツールバー選択 / ウィンドウ移動) で変化した値は消えてしまう。
+    ///
+    /// このメソッドは「環境設定 UI が触らないフィールド」を列挙し、差し替え直前に
+    /// 最新値を state へ移すために使う。**新規に「環境設定 UI から触らないフィールド」を
+    /// Settings に追加した場合は、ここにも追記が必要**。逆に「環境設定 UI から触る
+    /// フィールド」が増えても、このメソッドには触らなくて良い。
+    ///
+    /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
+    /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
+    pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        // ── グリッド / ツールバー runtime 状態 ──
+        self.grid_cols = src.grid_cols;
+        self.thumb_aspect = src.thumb_aspect;
+        self.sort_order = src.sort_order;
+        self.rating_filter = src.rating_filter;
+        // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
+        self.thumb_px = src.thumb_px;
+        self.thumb_quality = src.thumb_quality;
+        // ── キャッシュ系 (環境設定に出ていない項目) ──
+        self.cache_videos_always = src.cache_videos_always;
+        self.batch_cache_zip_contents = src.batch_cache_zip_contents;
+        self.batch_cache_pdf_contents = src.batch_cache_pdf_contents;
+        // ── ウィンドウ / ナビゲーション状態 ──
+        self.last_folder = src.last_folder.take();
+        self.window_pos = src.window_pos;
+        self.window_size = src.window_size;
+        // ── お気に入り / タグ (専用ダイアログで編集) ──
+        self.favorites = std::mem::take(&mut src.favorites);
+        self.tags = std::mem::take(&mut src.tags);
+        // ── 検索インデックス関連 ──
+        self.search_index_checks = std::mem::take(&mut src.search_index_checks);
+        // ── 「アプリケーションで開く」履歴 ──
+        self.recent_open_with_apps = std::mem::take(&mut src.recent_open_with_apps);
+        self.custom_open_with_apps = std::mem::take(&mut src.custom_open_with_apps);
+        // ── AI アップスケール runtime 選択 ──
+        self.ai_upscale_enabled = src.ai_upscale_enabled;
+        self.ai_upscale_model_override = src.ai_upscale_model_override.take();
+        // ── 補正プリセット (フルスクリーン `P` / スロットダイアログで編集) ──
+        self.global_preset = std::mem::take(&mut src.global_preset);
+        self.preset_slots = std::mem::take(&mut src.preset_slots);
+    }
+
     pub fn save(&self) {
         let path = Self::settings_path();
         if let Some(parent) = path.parent() {
