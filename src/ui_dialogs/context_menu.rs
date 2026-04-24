@@ -725,6 +725,14 @@ impl crate::app::App {
 /// 上書きするのを防ぐ (画像 decode / PowerShell 起動いずれも対象)。
 static CLIPBOARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// クリップボード書き込み (OpenClipboard/SetClipboardData と PowerShell copy/cut) を
+/// 直列化するミューテックス。seq チェックは必ずこの lock 内で実行し、
+/// 「チェック通過 → 実際の書き込み」の間に別の writer が割り込まないようにする。
+/// 画像 clipboard の DIB 構築 / PowerShell プロセス実行 (`cmd.status()`) もこの lock の
+/// 配下で行う — 古い writer が遅れて clipboard を上書きする race を閉じる。
+/// paste (clipboard 読み出し + FS 操作) はここには入らない (書き込み競合しないため)。
+static CLIPBOARD_WRITE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 次世代の seq を発行する。発行値が最新 (= CLIPBOARD_SEQ の現在値) かをチェックするには
 /// `CLIPBOARD_SEQ.load()` と比較する。
 fn bump_clipboard_seq() -> u64 {
@@ -823,10 +831,13 @@ fn copy_image_to_clipboard(path: &std::path::Path) {
                     return;
                 }
             };
+            // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
+            // 正式な stale 判定は `set_image_to_clipboard` 内部で
+            // `CLIPBOARD_WRITE_MUTEX` を握った状態で行われる。
             if !clipboard_seq_is_latest(my_seq) {
                 return;
             }
-            set_image_to_clipboard(&img);
+            set_image_to_clipboard(&img, my_seq);
         })
         .ok();
 }
@@ -847,16 +858,27 @@ fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
             let Ok(img) = image::load_from_memory(&bytes) else {
                 return;
             };
+            // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は
+            // `set_image_to_clipboard` 側の mutex 内で行う。
             if !clipboard_seq_is_latest(my_seq) {
                 return;
             }
-            set_image_to_clipboard(&img);
+            set_image_to_clipboard(&img, my_seq);
         })
         .ok();
 }
 
 /// DynamicImage をクリップボードに CF_DIB として設定する。
-fn set_image_to_clipboard(img: &image::DynamicImage) {
+///
+/// `my_seq` は発行時に取得した世代番号。`CLIPBOARD_WRITE_MUTEX` を保持した状態で
+/// seq が最新であることを再チェックし、古ければ何もしない。これにより
+/// 「decode/DIB 構築に時間がかかっている間に別のコピー B が先に完了して clipboard を
+/// 更新 → 古い A が後から B を上書きする」race を回避する。
+///
+/// 重い `to_rgba8` + ピクセル並べ替えは lock 外のローカルバッファで完結させ、
+/// mutex を握るのは OS クリップボード API 呼び出し区間に絞って他の writer を
+/// 不要に待たせない。
+fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
     let rgba = img.to_rgba8();
     let width = rgba.width();
     let height = rgba.height();
@@ -877,6 +899,34 @@ fn set_image_to_clipboard(img: &image::DynamicImage) {
         let header_size: u32 = 40;
         let total_size = header_size as usize + pixel_size as usize;
 
+        // 重い DIB 構築は lock 外でローカルバッファに済ませる。
+        let mut buf = vec![0u8; total_size];
+        buf[0..4].copy_from_slice(&header_size.to_le_bytes());
+        buf[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+        buf[8..12].copy_from_slice(&(height as i32).to_le_bytes());
+        buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+        buf[14..16].copy_from_slice(&24u16.to_le_bytes());
+        let pixels = &rgba;
+        for y in 0..height {
+            let src_row = (height - 1 - y) as usize;
+            let dst_offset = header_size as usize + (y * row_size) as usize;
+            for x in 0..width {
+                let src_idx = (src_row * width as usize + x as usize) * 4;
+                let dst_idx = dst_offset + (x * 3) as usize;
+                buf[dst_idx] = pixels.as_raw()[src_idx + 2];
+                buf[dst_idx + 1] = pixels.as_raw()[src_idx + 1];
+                buf[dst_idx + 2] = pixels.as_raw()[src_idx];
+            }
+        }
+
+        // 実際のクリップボード書き込みは直列化 + seq 再確認。
+        let Ok(_lock) = CLIPBOARD_WRITE_MUTEX.lock() else {
+            return;
+        };
+        if !clipboard_seq_is_latest(my_seq) {
+            return;
+        }
+
         unsafe {
             let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), total_size);
             let Ok(hmem) = hmem else { return };
@@ -884,28 +934,7 @@ fn set_image_to_clipboard(img: &image::DynamicImage) {
             if ptr.is_null() {
                 return;
             }
-
-            let buf = std::slice::from_raw_parts_mut(ptr as *mut u8, total_size);
-
-            buf[0..4].copy_from_slice(&header_size.to_le_bytes());
-            buf[4..8].copy_from_slice(&(width as i32).to_le_bytes());
-            buf[8..12].copy_from_slice(&(height as i32).to_le_bytes());
-            buf[12..14].copy_from_slice(&1u16.to_le_bytes());
-            buf[14..16].copy_from_slice(&24u16.to_le_bytes());
-
-            let pixels = &rgba;
-            for y in 0..height {
-                let src_row = (height - 1 - y) as usize;
-                let dst_offset = header_size as usize + (y * row_size) as usize;
-                for x in 0..width {
-                    let src_idx = (src_row * width as usize + x as usize) * 4;
-                    let dst_idx = dst_offset + (x * 3) as usize;
-                    buf[dst_idx] = pixels.as_raw()[src_idx + 2];
-                    buf[dst_idx + 1] = pixels.as_raw()[src_idx + 1];
-                    buf[dst_idx + 2] = pixels.as_raw()[src_idx];
-                }
-            }
-
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, total_size);
             let _ = GlobalUnlock(hmem);
 
             if OpenClipboard(None).is_ok() {
@@ -917,7 +946,7 @@ fn set_image_to_clipboard(img: &image::DynamicImage) {
     }
     #[cfg(not(windows))]
     {
-        let _ = (width, height);
+        let _ = (width, height, my_seq);
     }
 }
 
@@ -1000,7 +1029,22 @@ fn run_ps_script_inner(
     std::thread::Builder::new()
         .name("powershell-clipboard-exec".into())
         .spawn(move || {
-            // clipboard 書き込み系は worker 起動後に stale 判定 → 起動コストごとスキップ。
+            // clipboard 書き込み系 (copy/cut) は `CLIPBOARD_WRITE_MUTEX` を握ったうえで
+            // seq 再確認 → PowerShell 実行まで lock 内で直列化する。PowerShell プロセス内で
+            // 実際の SetClipboardData が走るため、`cmd.status()` が返るまで lock を離さない
+            // ことで「A の PS 起動後に B が割り込んで先に clipboard を書き、そのあと A が
+            // 遅れて上書きする」race を閉じる。
+            // paste (clipboard 読み出し + FS 操作) は clipboard_seq=None で呼ばれるので
+            // lock を取らない — 書き込み系を不要にブロックしない。
+            let _clipboard_lock = if clipboard_seq.is_some() {
+                Some(
+                    CLIPBOARD_WRITE_MUTEX
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                )
+            } else {
+                None
+            };
             if let Some(my_seq) = clipboard_seq {
                 if !clipboard_seq_is_latest(my_seq) {
                     if let Some(tx) = on_done {
@@ -1029,6 +1073,7 @@ fn run_ps_script_inner(
                 let _ = cmd.status();
                 let _ = std::fs::remove_file(&tmp);
             }
+            // ここで `_clipboard_lock` が drop されロック解放。
             if let Some(tx) = on_done {
                 let _ = tx.send(());
             }

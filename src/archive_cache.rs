@@ -304,7 +304,11 @@ impl ArchiveCacheDb {
         let Some((cached, converted_at)) = row else {
             return Ok(());
         };
-        remove_cache_file_and_dirs(Path::new(&cached));
+        // cached_zip_path は src に対して決定的なので、snapshot 〜 FS remove の間に
+        // 並行変換 worker が同じ path を再利用して書いている可能性がある。
+        // file mtime が snapshot_converted_at より新しければ remove を skip して
+        // 変換中の成果物を守る。DB 側は WHERE converted_at=? で stale 行のみ DELETE。
+        remove_cache_file_if_not_newer(Path::new(&cached), converted_at);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM converted_archives \
@@ -354,10 +358,12 @@ impl ArchiveCacheDb {
             .collect()
         };
         // lock 外で個別のファイル + 空の親ディレクトリだけを削除。
-        // remove_cache_file_and_dirs は parent.remove_dir で空でなければ黙って失敗するので、
-        // snapshot 後に新しく作られた ZIP と同居していても新 ZIP は残る。
-        for (_, p, _) in &snapshot {
-            remove_cache_file_and_dirs(Path::new(p));
+        // cached_zip_path は src に対して決定的なので、snapshot 後に同じ path へ並行 worker が
+        // 新しい ZIP を書き直す可能性がある。file mtime が snapshot converted_at より顕著に
+        // 新しければ remove_cache_file_if_not_newer が skip し、変換中の成果物を残す。
+        // parent dir は既に remove_dir で空でなければ黙って失敗する (新 ZIP と同居中は残る)。
+        for (_, p, converted_at) in &snapshot {
+            remove_cache_file_if_not_newer(Path::new(p), *converted_at);
         }
         // snapshot 対象の (key, converted_at) のみを DELETE。snapshot 後に `record()` が
         // INSERT OR REPLACE で書き込んだ新エントリは converted_at が異なるので WHERE が
@@ -460,6 +466,30 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
             }
         }
     }
+}
+
+/// `zip_path` の mtime が `snapshot_converted_at` より顕著に新しければ削除をスキップする。
+/// maintenance が snapshot を取った後に別の変換 worker が同じ path に新しい ZIP を
+/// 書き込んだ (= cached_zip_path は src 由来で決定的なので同じ場所を共有する) ケースで、
+/// 変換中の成果物を誤って消さないための保険。秒精度の converted_at 同士を比較するので、
+/// FS rounding / レイテンシ由来の微妙な差は 5 秒のマージンで吸収する。
+/// 5 秒より大きく新しい場合は「別 worker が最近書いた」ので触らない。
+/// ファイルを開けない (mtime 不明) 場合は通常通り削除 (= 失敗したら無視)。
+fn remove_cache_file_if_not_newer(zip_path: &Path, snapshot_converted_at: i64) {
+    const SKEW_TOLERANCE_SECS: i64 = 5;
+    if let Ok(meta) = std::fs::metadata(zip_path) {
+        if let Ok(modified) = meta.modified() {
+            let file_secs = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(i64::MAX);
+            if file_secs > snapshot_converted_at.saturating_add(SKEW_TOLERANCE_SECS) {
+                // 新しすぎる — 変換 worker が同じ path を占有中。触らない。
+                return;
+            }
+        }
+    }
+    remove_cache_file_and_dirs(zip_path);
 }
 
 #[cfg(test)]
