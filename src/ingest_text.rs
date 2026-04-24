@@ -139,7 +139,7 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         out.name = normalize_for_match(name);
     }
 
-    // 2. EXIF
+    // 2. EXIF (rexif が自前で開く。内部パーサーが IFD を読むだけなので全読みしない想定)
     if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
         let mut buf = String::with_capacity(128);
         append_exif(&mut buf, &exif);
@@ -148,26 +148,59 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         }
     }
 
-    // 3. XMP (mXD Twitter メタ)
-    if let Some(xmp) = crate::xmp_reader::read_tweet_info(path) {
-        let mut buf = String::with_capacity(128);
-        append_xmp(&mut buf, &xmp);
-        if !buf.trim().is_empty() {
-            out.xmp_tweet = normalize_for_match(&buf);
+    // 3. XMP / PNG / dc:subject は同じファイル実体を 3 回読む path-based 版を使うと
+    //    AI 生成 PNG (10-30MB) で 3x 倍のディスク読み取りになり、インデクサが
+    //    350MB/秒級でディスクを占有してしまう (Codex perf 報告)。
+    //    ここで一度だけ読んで bytes 版に渡すことで I/O を 3 分の 1 に減らす。
+    if let Some(bytes) = read_metadata_bytes(path) {
+        // 3a. XMP (mXD Twitter メタ)
+        if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(&bytes) {
+            let mut buf = String::with_capacity(128);
+            append_xmp(&mut buf, &xmp);
+            if !buf.trim().is_empty() {
+                out.xmp_tweet = normalize_for_match(&buf);
+            }
         }
+        // 3b. PNG AI プロンプト (tEXt/iTXt/zTXt)
+        let png_text = crate::png_metadata::build_searchable_from_bytes(&bytes);
+        if !png_text.is_empty() {
+            out.png_prompt = normalize_for_match(&png_text);
+        }
+        // 3c. XMP dc:subject タグ (tag 機能)
+        let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
+        out.tags = build_tags_column(&dc_tags);
     }
-
-    // 4. PNG AI プロンプト (tEXt/iTXt/zTXt)
-    let png_text = crate::png_metadata::build_searchable_from_path(path);
-    if !png_text.is_empty() {
-        out.png_prompt = normalize_for_match(&png_text);
-    }
-
-    // 5. XMP dc:subject タグ (tag 機能)
-    let dc_tags = crate::xmp_reader::read_dc_subject(path);
-    out.tags = build_tags_column(&dc_tags);
 
     out
+}
+
+/// メタ抽出共通のファイル読み込み (XMP / PNG / dc:subject で共有)。
+///
+/// JPEG / PNG は通常 ≤50MB なので全読み。TIFF / MP4 等の大コンテナは先頭 512KB のみ読む
+/// (`xmp_reader::read_tweet_info` の旧ロジックと同じ方針)。それ以外の拡張子は
+/// metadata 検索対象外として `None`。
+///
+/// 戻り値の `Vec<u8>` は同一ファイルに対して XMP / PNG / dc:subject の 3 パーサーで共有される。
+fn read_metadata_bytes(path: &Path) -> Option<Vec<u8>> {
+    const METADATA_SCAN_LIMIT: u64 = 512 * 1024;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)?;
+    match ext.as_str() {
+        // 小画像: 全読み (末尾に XMP セグメントが置かれるケースを拾うため)
+        "jpg" | "jpeg" | "jfif" | "png" => std::fs::read(path).ok(),
+        // 大容量コンテナ: 先頭 512KB だけ読む
+        "tif" | "tiff" | "mp4" | "mov" | "m4v" => {
+            use std::io::Read;
+            let f = std::fs::File::open(path).ok()?;
+            let mut buf = Vec::with_capacity(64 * 1024);
+            f.take(METADATA_SCAN_LIMIT).read_to_end(&mut buf).ok()?;
+            Some(buf)
+        }
+        // BMP / GIF / WebP / HEIC / RAW: XMP/PNG チャンクを持たない想定なので読まない
+        _ => None,
+    }
 }
 
 /// バイト列から構築 (ZIP 内エントリ用。v1.x で使用予定)。
