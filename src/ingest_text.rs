@@ -176,13 +176,26 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
 
 /// メタ抽出共通のファイル読み込み (XMP / PNG / dc:subject で共有)。
 ///
-/// JPEG / PNG は通常 ≤50MB なので全読み。TIFF / MP4 等の大コンテナは先頭 512KB のみ読む
-/// (`xmp_reader::read_tweet_info` の旧ロジックと同じ方針)。それ以外の拡張子は
-/// metadata 検索対象外として `None`。
+/// JPEG / PNG は通常 ≤50MB なので全読み。TIFF / MP4 等の大コンテナは先頭 2MB のみ読む
+/// (`xmp_reader::read_tweet_info` が旧来 512KB に絞っていたのを 2MB に拡張)。
+/// それ以外の拡張子は metadata 検索対象外として `None`。
 ///
 /// 戻り値の `Vec<u8>` は同一ファイルに対して XMP / PNG / dc:subject の 3 パーサーで共有される。
+///
+/// ## TIFF/MP4 の上限について (Codex P3 指摘対応)
+///
+/// 旧 `read_dc_subject(path)` は TIFF/MP4 でもフルファイル読みしていたため、たとえば
+/// 4GB の MP4 から dc:subject を拾う経路は I/O 的に致命的だった。本関数で上限を設ける
+/// ことで同じ TIFF/MP4 をインデックス中に通常操作が重くならないようにする。
+///
+/// ExifTool / mXD など一般的な XMP writer は uuid atom / IFD0 の先頭付近に packet を
+/// 置くので 512KB で実用上十分だったが、MP4 では XMP packet を末尾 (moov atom の後)
+/// に置く encoder も存在する。`moov` が先頭にくる fast-start 形式なら 2MB 内に XMP も
+/// 収まる想定。2MB を超える場所に XMP が置かれている超大容量動画では dc:subject が
+/// インデックスに載らない可能性があるが、これは許容 (検索対象外でもファイル自体の
+/// 閲覧・再生・ファイル名検索には影響しない)。
 fn read_metadata_bytes(path: &Path) -> Option<Vec<u8>> {
-    const METADATA_SCAN_LIMIT: u64 = 512 * 1024;
+    const METADATA_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -190,7 +203,7 @@ fn read_metadata_bytes(path: &Path) -> Option<Vec<u8>> {
     match ext.as_str() {
         // 小画像: 全読み (末尾に XMP セグメントが置かれるケースを拾うため)
         "jpg" | "jpeg" | "jfif" | "png" => std::fs::read(path).ok(),
-        // 大容量コンテナ: 先頭 512KB だけ読む
+        // 大容量コンテナ: 先頭 2MB だけ読む (上記コメント参照)
         "tif" | "tiff" | "mp4" | "mov" | "m4v" => {
             use std::io::Read;
             let f = std::fs::File::open(path).ok()?;

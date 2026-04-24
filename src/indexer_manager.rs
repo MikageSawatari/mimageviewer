@@ -112,6 +112,55 @@ pub struct StartupDiag {
     pub io_permits: usize,
 }
 
+/// `FtsMetaDb` と `FtsIndex` を `data_dir` 配下で開く。
+///
+/// fts_meta が INDEX_VERSION bump / 旧スキーマを検出して `files` テーブルを drop した場合、
+/// Tantivy 側も一緒に wipe しないと旧 key 形式 (例: `!` separator) で書かれた orphan doc が
+/// 残り続ける (post-filter で弾かれるが容量を食う、かつ将来リカバリ経路が増えたら顕在化し得る)。
+/// このため fts_meta open → `rebuilt_on_open` チェック → 必要なら `fts_index` 削除 → fts open
+/// の順で実行する。
+///
+/// 本番 `new()` とテスト用 `new_at()` の両方から呼ぶ (Codex P3 指摘: 旧コードでは
+/// `new_at` が wipe を再現していなかったため、version bump の挙動を統合テストで検証できず
+/// 本番と乖離していた)。
+fn open_stores_with_rebuild_sync(
+    data_dir: &std::path::Path,
+    log_tag: &str,
+) -> Option<(Arc<FtsMetaDb>, Arc<FtsIndex>)> {
+    let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            crate::logger::log(format!("{log_tag}: FtsMetaDb open failed: {e}"));
+            return None;
+        }
+    };
+    let fts_dir = data_dir.join("fts_index");
+    if meta_db.rebuilt_on_open() {
+        crate::logger::log(format!(
+            "{log_tag}: fts_meta rebuilt → wiping Tantivy index dir {}",
+            fts_dir.display()
+        ));
+        if let Err(e) = std::fs::remove_dir_all(&fts_dir) {
+            // Not-found は想定内。他は warn してそのまま続行 (次の open で
+            // schema_is_stale 経路で再 wipe されることを期待)。
+            if e.kind() != std::io::ErrorKind::NotFound {
+                crate::logger::log(format!(
+                    "{log_tag}: wipe fts_index failed: {e} (continuing)"
+                ));
+            }
+        }
+    }
+    let meta_db = Arc::new(meta_db);
+    let fts = match FtsIndex::open_at(&fts_dir) {
+        Ok(idx) => Arc::new(idx),
+        Err(e) => {
+            crate::logger::log(format!("{log_tag}: FtsIndex open failed: {e}"));
+            return None;
+        }
+    };
+    Some((meta_db, fts))
+}
+
 impl IndexerManager {
     /// DB/index を開き、起動時 reconciliation → auto_index_metadata=true のお気に入りに
     /// Supervisor を spawn する。
@@ -129,40 +178,10 @@ impl IndexerManager {
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
-        let meta_db = match FtsMetaDb::open() {
-            Ok(db) => db,
-            Err(e) => {
-                crate::logger::log(format!("IndexerManager: FtsMetaDb open failed: {e}"));
-                return None;
-            }
-        };
-        // fts_meta が index_version bump / 旧スキーマを検出して files を drop した場合、
-        // Tantivy 側も一緒に wipe しないと旧 separator (`!`) で書かれた orphan doc が
-        // 残り続ける (post-filter で弾かれるが容量を食う)。FtsIndex::open_default の前に
-        // ディレクトリを削除することで、新スキーマで一から作り直される。
-        if meta_db.rebuilt_on_open() {
-            let fts_dir = crate::data_dir::get().join("fts_index");
-            crate::logger::log(format!(
-                "IndexerManager: fts_meta rebuilt → wiping Tantivy index dir {}",
-                fts_dir.display()
-            ));
-            if let Err(e) = std::fs::remove_dir_all(&fts_dir) {
-                // Not-found は問題なし。他は warn してそのまま続行 (次の open 時に
-                // schema_is_stale で再 wipe されることを期待)。
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    crate::logger::log(format!(
-                        "IndexerManager: wipe fts_index failed: {e} (continuing)"
-                    ));
-                }
-            }
-        }
-        let meta_db = Arc::new(meta_db);
-        let fts = match FtsIndex::open_default() {
-            Ok(idx) => Arc::new(idx),
-            Err(e) => {
-                crate::logger::log(format!("IndexerManager: FtsIndex open failed: {e}"));
-                return None;
-            }
+        let data_dir = crate::data_dir::get();
+        let (meta_db, fts) = match open_stores_with_rebuild_sync(&data_dir, "IndexerManager") {
+            Some(stores) => stores,
+            None => return None,
         };
         Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate)
     }
@@ -179,19 +198,9 @@ impl IndexerManager {
         activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         std::fs::create_dir_all(data_dir).ok();
-        let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
-            Ok(db) => Arc::new(db),
-            Err(e) => {
-                crate::logger::log(format!("IndexerManager(test): FtsMetaDb open failed: {e}"));
-                return None;
-            }
-        };
-        let fts = match FtsIndex::open_at(&data_dir.join("fts_index")) {
-            Ok(idx) => Arc::new(idx),
-            Err(e) => {
-                crate::logger::log(format!("IndexerManager(test): FtsIndex open failed: {e}"));
-                return None;
-            }
+        let (meta_db, fts) = match open_stores_with_rebuild_sync(data_dir, "IndexerManager(test)") {
+            Some(stores) => stores,
+            None => return None,
         };
         Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate)
     }

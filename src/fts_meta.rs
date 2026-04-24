@@ -35,7 +35,8 @@ pub const INDEX_VERSION: i64 = 4;
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileMeta {
-    /// 正規化済みパス (lowercase + `/`、ドライブレター保持、ZIP 内は `<zip>!<entry>`)
+    /// 正規化済みパス (lowercase + `/`、ドライブレター保持、ZIP 内は
+    /// `<zip>\u{1F}<entry>` 形式。separator は [`crate::search_norm::ZIP_ENTRY_SEP`])。
     pub path: String,
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,

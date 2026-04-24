@@ -350,7 +350,8 @@ fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentati
 }
 
 /// ヒット path から親コンテナを決定する (docs §10.4.2)。
-/// - ZIP エントリ (`<zippath>!<entry>` 形式) → ZIP ファイルパス
+/// - ZIP エントリ (`<zippath>\u{1F}<entry>` 形式、[`crate::search_norm::ZIP_ENTRY_SEP`])
+///   → ZIP ファイルパス
 /// - 通常ファイル → 親フォルダパス
 fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
     if let Some((zip_part, _entry)) = split_zip_hit_path(hit_path) {
