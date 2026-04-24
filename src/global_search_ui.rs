@@ -1017,6 +1017,9 @@ impl App {
 
     /// Aggregated view に戻る (drill-down 状態から)。
     pub(crate) fn drill_back_to_aggregated(&mut self) {
+        // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
+        // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
+        self.restore_rating_filter_suppression();
         self.global_search.view = GlobalSearchView::Aggregated;
         self.rebuild_items_from_global_search();
     }
@@ -1037,6 +1040,10 @@ impl App {
                 let parent_pb = parent.to_path_buf();
                 // container_root 外へは出さない (出るなら Aggregated に戻る)
                 if parent_pb.starts_with(&container_root) {
+                    // 上の階層へ移動するだけでも、★コンテナを開いていた場合は
+                    // 「本から外へ」出る方向なので suppression 復元を試みる
+                    // (Codex High 指摘: load_folder を経由しない経路で leak するのを防ぐ)。
+                    self.restore_rating_filter_suppression();
                     self.global_search.view = GlobalSearchView::DrilledInto {
                         container_root,
                         current_path: parent_pb,
