@@ -130,12 +130,33 @@ impl IndexerManager {
         activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         let meta_db = match FtsMetaDb::open() {
-            Ok(db) => Arc::new(db),
+            Ok(db) => db,
             Err(e) => {
                 crate::logger::log(format!("IndexerManager: FtsMetaDb open failed: {e}"));
                 return None;
             }
         };
+        // fts_meta が index_version bump / 旧スキーマを検出して files を drop した場合、
+        // Tantivy 側も一緒に wipe しないと旧 separator (`!`) で書かれた orphan doc が
+        // 残り続ける (post-filter で弾かれるが容量を食う)。FtsIndex::open_default の前に
+        // ディレクトリを削除することで、新スキーマで一から作り直される。
+        if meta_db.rebuilt_on_open() {
+            let fts_dir = crate::data_dir::get().join("fts_index");
+            crate::logger::log(format!(
+                "IndexerManager: fts_meta rebuilt → wiping Tantivy index dir {}",
+                fts_dir.display()
+            ));
+            if let Err(e) = std::fs::remove_dir_all(&fts_dir) {
+                // Not-found は問題なし。他は warn してそのまま続行 (次の open 時に
+                // schema_is_stale で再 wipe されることを期待)。
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    crate::logger::log(format!(
+                        "IndexerManager: wipe fts_index failed: {e} (continuing)"
+                    ));
+                }
+            }
+        }
+        let meta_db = Arc::new(meta_db);
         let fts = match FtsIndex::open_default() {
             Ok(idx) => Arc::new(idx),
             Err(e) => {

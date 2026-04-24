@@ -301,40 +301,14 @@ impl GlobalSearchState {
     }
 }
 
-/// ZIP 内エントリを示すヒットパス (`<zippath>!<entry>`) かを判定する。
-/// `!` は Windows のファイル名に含められる有効文字 (Eagle 等が生成するファイル名に含まれる
-/// ほか、ユーザーのフォルダ名・ZIP ファイル名にも入り得る)。
-/// したがって single `!` での split や、`split_once('!')` の left 側の拡張子チェックだけでは
-/// 不十分 — 親ディレクトリや ZIP 名に `!` があると誤判定する (Codex P2):
-///   `c:/a!/book.zip!entry.jpg` / `c:/book!.zip!entry.jpg` / `book.zip!sub!dir/x.jpg`
-/// パス全体をスキャンして **最初の `.zip!` 境界** で分割することで、上記ケースも
-/// 正しく処理する (zip 名・親 dir の `!` は許容、entry 内の `!` も許容)。
-///
-/// hot-path (数千ヒット × 複数 iterator) で呼ばれるので、
-/// アロケーションなしで ASCII 大小無視スキャンする。
+/// ZIP 内エントリを示すヒットパス (`<zippath>\x1F<entry>`) かを判定する。
+/// セパレータ文字は `search_norm::ZIP_ENTRY_SEP` (ASCII Unit Separator U+001F)。
+/// この文字は通常のファイル名に含められないため、通常パスとの曖昧さは発生しない
+/// (Codex P2 対応)。旧実装は `!` 区切りで、ファイル名に `!` を含むケース
+/// (Eagle 生成ファイル / 親ディレクトリ / ZIP 名自体に `!`) と衝突していた。
+/// INDEX_VERSION bump で旧データは自動再構築される。
 fn split_zip_hit_path(hit_path: &str) -> Option<(&str, &str)> {
-    let bytes = hit_path.as_bytes();
-    if bytes.len() < 5 {
-        return None;
-    }
-    // `.zip!` (大小無視) を左端から探す。見つけた位置の直後で分割。
-    // entry 内に `.zip!` が現れるケースは事実上ない (ZIP 内エントリ名に `!` は許されるが
-    // ZIP は通常ネストしない前提) ため、最初の境界で決め打つ。
-    let n = bytes.len() - 4; // i+4 まで参照するため
-    for i in 0..n {
-        if bytes[i] == b'.'
-            && bytes[i + 1].eq_ignore_ascii_case(&b'z')
-            && bytes[i + 2].eq_ignore_ascii_case(&b'i')
-            && bytes[i + 3].eq_ignore_ascii_case(&b'p')
-            && bytes[i + 4] == b'!'
-        {
-            // i..=i+3 が `.zip`、i+4 が `!`
-            let file_part = &hit_path[..i + 4];
-            let entry = &hit_path[i + 5..];
-            return Some((file_part, entry));
-        }
-    }
-    None
+    hit_path.split_once(crate::search_norm::ZIP_ENTRY_SEP)
 }
 
 fn is_zip_hit_path(hit_path: &str) -> bool {
@@ -1587,9 +1561,15 @@ fn append_tag_to_query(query: &mut String, tag_name: &str) {
 mod tests {
     use super::*;
 
+    const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    fn zip_hit(zip: &str, entry: &str) -> String {
+        format!("{zip}{SEP}{entry}")
+    }
+
     #[test]
     fn parent_container_parses_zip_entries() {
-        let (p, k) = parent_container("c:/photos/album.zip!subdir/img.jpg");
+        let (p, k) = parent_container(&zip_hit("c:/photos/album.zip", "subdir/img.jpg"));
         assert_eq!(p, PathBuf::from("c:/photos/album.zip"));
         assert_eq!(k, SearchContainerKind::Zip);
     }
@@ -1602,9 +1582,8 @@ mod tests {
     }
 
     /// 回帰: ファイル名にリテラル `!` を含む通常ファイル (Eagle が生成する
-    /// `20230416_181414-1024x1536-!fav_loli_A-....png` のような名前) を ZIP エントリと
-    /// 誤判定しない。以前は `split_once('!')` で file_part=`...1536-`、entry=`fav_loli_A-...png`
-    /// になり、存在しないフォルダにドリルダウンして「読込失敗」になっていた。
+    /// `...-!fav_loli_A-....png` のような名前) を ZIP エントリと誤判定しない。
+    /// 新 separator (U+001F) は通常ファイル名に現れないので `!` は関与しない。
     #[test]
     fn parent_container_handles_bang_in_filename() {
         let (p, k) = parent_container(
@@ -1614,44 +1593,27 @@ mod tests {
         assert_eq!(k, SearchContainerKind::Folder);
     }
 
+    /// Codex P2 指摘 (解消): 親ディレクトリや ZIP 名に `!` を含むパスでも、
+    /// separator が U+001F になったので単純な split_once で正しく分割される。
+    /// 旧実装の `.zip!` 境界スキャンは不要になった。
     #[test]
-    fn split_zip_hit_path_only_splits_on_zip_ext() {
-        // .zip → split する
+    fn split_zip_hit_path_tolerates_bang_in_any_component() {
+        // 親 dir / ZIP 名 / entry 内のどこに `!` があっても影響しない
         assert_eq!(
-            split_zip_hit_path("c:/a/book.zip!entry.jpg"),
-            Some(("c:/a/book.zip", "entry.jpg"))
-        );
-        // 大文字 .ZIP でも OK
-        assert_eq!(
-            split_zip_hit_path("c:/a/book.ZIP!entry.jpg"),
-            Some(("c:/a/book.ZIP", "entry.jpg"))
-        );
-        // .zip 以外は split しない (ファイル名中の `!`)
-        assert_eq!(split_zip_hit_path("c:/a/img-!name.png"), None);
-        // `!` なしもなし
-        assert_eq!(split_zip_hit_path("c:/a/img.png"), None);
-    }
-
-    /// Codex P2 指摘: 親ディレクトリや ZIP ファイル名に `!` を含むパスでも正しく分割する。
-    /// 最初の `.zip!` 境界でだけ split するので、`!` の位置に関わらず file_part 側は
-    /// 必ず `.zip` で終わる。
-    #[test]
-    fn split_zip_hit_path_tolerates_bang_before_zip() {
-        // 親ディレクトリに `!`
-        assert_eq!(
-            split_zip_hit_path("c:/a!/book.zip!entry.jpg"),
+            split_zip_hit_path(&zip_hit("c:/a!/book.zip", "entry.jpg")),
             Some(("c:/a!/book.zip", "entry.jpg"))
         );
-        // ZIP ファイル名自体に `!`
         assert_eq!(
-            split_zip_hit_path("c:/a/book!.zip!entry.jpg"),
+            split_zip_hit_path(&zip_hit("c:/a/book!.zip", "entry.jpg")),
             Some(("c:/a/book!.zip", "entry.jpg"))
         );
-        // entry 内の `!` は維持 (次以降の `.zip!` も追わない前提)
         assert_eq!(
-            split_zip_hit_path("c:/a/book.zip!sub!dir/img.jpg"),
+            split_zip_hit_path(&zip_hit("c:/a/book.zip", "sub!dir/img.jpg")),
             Some(("c:/a/book.zip", "sub!dir/img.jpg"))
         );
+        // `!` 入り通常ファイル名は separator を含まないので ZIP 扱いされない
+        assert_eq!(split_zip_hit_path("c:/a/book.zip!cover.jpg"), None);
+        assert_eq!(split_zip_hit_path("c:/a/img-!name.png"), None);
     }
 
     #[test]

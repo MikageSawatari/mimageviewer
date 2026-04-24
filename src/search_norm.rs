@@ -17,11 +17,20 @@ pub fn normalize_for_match(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// ZIP 内エントリの fts_meta 上のキー表現 `<zip_path>!<entry>`。
+/// ZIP 内エントリの fts_meta 上のキー表現 `<zip_path>\x1F<entry>`。
 /// path_key 正規化済みの `zip_path` と元エントリパス (slash 統一・lowercase 済み) を受け取る。
+///
+/// セパレータは ASCII Unit Separator (U+001F)。Windows / POSIX のいずれでも通常ファイル名
+/// 文字として許容されない (Windows は制御文字 0x00–0x1F をすべて禁止、POSIX でも
+/// ユーザーは普通使わない) ため、`<zip>SEP<entry>` と通常パス `c:/a/book.zip!cover.jpg`
+/// が衝突するあいまいさを構造的に排除できる (Codex P2 対応)。旧実装は `!` 区切りで、
+/// ファイル名に `!` を含む Eagle 生成ファイル等と曖昧だった。INDEX_VERSION bump で
+/// 旧データは自動再構築される。
+pub const ZIP_ENTRY_SEP: char = '\u{1F}';
+
 pub fn zip_entry_key(normalized_zip_path: &str, entry_name: &str) -> String {
     let entry_norm = entry_name.to_lowercase().replace('\\', "/");
-    format!("{}!{}", normalized_zip_path, entry_norm)
+    format!("{normalized_zip_path}{ZIP_ENTRY_SEP}{entry_norm}")
 }
 
 #[cfg(test)]
@@ -62,7 +71,7 @@ mod tests {
     fn zip_entry_key_combines() {
         assert_eq!(
             zip_entry_key("c:/photos/archive.zip", "folder/img.jpg"),
-            "c:/photos/archive.zip!folder/img.jpg"
+            format!("c:/photos/archive.zip{ZIP_ENTRY_SEP}folder/img.jpg")
         );
     }
 
@@ -70,7 +79,18 @@ mod tests {
     fn zip_entry_key_lowers_entry() {
         assert_eq!(
             zip_entry_key("c:/a.zip", "SubDir\\Img.JPG"),
-            "c:/a.zip!subdir/img.jpg"
+            format!("c:/a.zip{ZIP_ENTRY_SEP}subdir/img.jpg")
         );
+    }
+
+    /// 新 separator (U+001F) は Windows / POSIX の通常ファイル名に出現し得ないので、
+    /// 通常パス `c:/a/book.zip!cover.jpg` (ファイル名に `!` 含む) と衝突しない。
+    #[test]
+    fn zip_entry_key_is_not_ambiguous_with_bang_filename() {
+        let zip_key = zip_entry_key("c:/a/book.zip", "cover.jpg");
+        let bang_filename = "c:/a/book.zip!cover.jpg";
+        assert_ne!(zip_key, bang_filename);
+        assert!(zip_key.contains(ZIP_ENTRY_SEP));
+        assert!(!bang_filename.contains(ZIP_ENTRY_SEP));
     }
 }

@@ -23,7 +23,14 @@ use crate::search_index_db::normalize_path;
 
 /// スキーマ変更時に bump することで、次回起動時に全再インデックスをトリガする定数。
 /// v3 (§19 + tag 統合): per-source 5 カラム + kind + tags_norm の 16 列スキーマ。
-pub const INDEX_VERSION: i64 = 3;
+/// 全文検索インデックスのスキーマ / キー形式のバージョン。
+///
+/// ## bump 履歴
+/// - 2: 多ソーステキスト (exif / xmp / png_prompt / pdf_meta に分割)
+/// - 3: tags (XMP dc:subject) フィールド追加
+/// - 4: ZIP 内エントリのキー separator を `!` から U+001F に変更
+///      (ファイル名中の `!` と曖昧衝突する P2 脆弱性を解消、Codex 指摘)
+pub const INDEX_VERSION: i64 = 4;
 
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +97,10 @@ impl FileStatus {
 /// fts_meta.db への接続。
 pub struct FtsMetaDb {
     conn: Mutex<Connection>,
+    /// この open で `files` テーブルが drop → 再作成された (スキーマ古い / INDEX_VERSION 不一致)。
+    /// `true` なら Tantivy 側インデックスも wipe すべき (古い separator / 古い key 形式で
+    /// 作られた Tantivy docs を残すと orphan として残留するため)。
+    rebuilt_on_open: bool,
 }
 
 impl FtsMetaDb {
@@ -139,7 +150,15 @@ impl FtsMetaDb {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            rebuilt_on_open: rebuild_needed,
         })
+    }
+
+    /// 直近の `open_at` で `files` テーブルが再作成されたか。
+    /// IndexerManager はこのフラグを見て Tantivy index dir を wipe する
+    /// (旧 key 形式の orphan doc が残らないようにするため)。
+    pub fn rebuilt_on_open(&self) -> bool {
+        self.rebuilt_on_open
     }
 
     /// status=pending で UPSERT。既存 row の generation を増やし、ソース別正規化テキストを更新する。
