@@ -280,6 +280,58 @@ python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベン
 
 ---
 
+## 7a. 既知の同期 I/O 残課題 (v0.8.2 以降で worker 化)
+
+v0.8.1 で Codex レビューが指摘したが、通常運用での体感影響が小さいため当面据え置いている
+同期 I/O 経路。環境 (ネットワーク/外付け/AV heavy) によっては体感停止を起こすため、
+まとまったリファクタ時に worker 化する。
+
+- **archive cache hit 判定** — [src/ui_dialogs/archive_convert.rs `try_archive_cache_lookup`](../src/ui_dialogs/archive_convert.rs)
+  - `std::fs::metadata(src)` + `ArchiveCacheDb::lookup()` (SQLite SELECT + cache ZIP の
+    `exists()`、stale 時は `remove_file()`) を UI スレッドで実行。
+  - 発火点は `ConvertibleArchive` (7z/LZH) を Enter / ダブルクリックする瞬間のみで、
+    通常閲覧・サムネイル処理のホットパスではない。ローカルでは 1ms 以下。
+  - 直すなら `ArchiveConvertPhase::CheckingCache` を追加して worker で lookup、結果で
+    cache 即開 / 変換確認へ分岐する形が素直。
+- **sidecar flush / import** — [src/app.rs `flush_idle_sidecars`, `flush_all_sidecars`](../src/app.rs) および `SidecarFile::load()` import 経路
+  - `flush_idle_sidecars` は通常 update から、`flush_all_sidecars` はフォルダ切替から呼ばれ、
+    いずれも `write` / `rename` / `remove_file` を UI スレッドで直接実行する。
+  - sidecar backup が有効 + 保存先がネットワーク/外付け + mask/adjust を大量に持つ JSON
+    では閲覧中・フォルダ切替時に数百 ms 停止した観測あり (コメント参照)。
+  - sidecar は optional backup で adjustment DB が authoritative なので現状は許容範囲だが、
+    v0.8.2 で snapshot → worker flush + import pending 化する。
+  - フォルダ切替経路 (`start_loading_items` → `flush_all_sidecars`) を worker 化するときは、
+    次フォルダの `load_folder` が旧 sidecar の flush 完了を待つ ack パスが要る点に注意。
+
+どちらも Codex P3 (confidence 0.76-0.78)。§4 チェックリスト違反なので新しい同期 I/O を
+足すときの悪例として参照してよい。
+
+### 全検索 (Ctrl+G) の大量件数時スパイク
+
+上記 2 件が「UI スレッドでの同期 I/O」なのに対し、こちらは「UI スレッドでの O(N) 計算」。
+100 件程度では見えないが、横断お気に入り + 大量ヒットで顕在化する。
+
+- **container mtime populate (Newer/Older ソート確定時)** — [src/global_search_ui.rs `ensure_container_mtime_populated`](../src/global_search_ui.rs)
+  - ストリーミング中はスキップ済み (Codex 既往対応) だが、`done` になった時の 1 回だけ
+    全コンテナに `std::fs::metadata()` を同期実行する。HDD / ネットワーク + 数百コンテナ
+    だと 100-500ms ブロックする。
+  - 直すなら (a) 検索 index の stored field に mtime を持たせて metadata 呼び出し自体を
+    無くす、または (b) populate を worker 化して「取得中は path 順で暫定表示 → 完了時に
+    再ソート」にする。(a) は index schema 変更が要るので重い。
+- **cross-container nav list 構築** — [src/global_search_ui.rs `build_cross_container_nav_list`, `collect_hit_folders_dfs`](../src/global_search_ui.rs)
+  - `collect_hit_folders_dfs` が全ヒットを走査するので、container 数 C × hit 数 H × depth。
+    しかも fullscreen Ctrl+→/← は画像が見つかるまで `global_search_ctrl_nav` をループ
+    する ([src/global_search_ui.rs `global_search_ctrl_nav_fullscreen`](../src/global_search_ui.rs))
+    ため、Folder 枝ばかりの候補を跨いで進むたびに nav list を再構築する。
+  - 直すなら `GlobalSearchState` に `nav_list_cache: Option<Vec<NavEntry>>` を持たせ、
+    `containers` / `all_hits` / `sort_mode` / `done` が変わったら invalidate。あるいは
+    `all_hits` を container_root ごとに前処理して単一 pass で全 nav list を作る。
+
+どちらも Codex P3 (confidence 0.82-0.86)。v0.8.1 の即ブロッカーではないが「大量件数でも
+UI を止めない」方針の未達項目として残す。
+
+---
+
 ## 8. 関連コード (landmark)
 
 | 役割 | 場所 |

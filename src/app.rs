@@ -1544,6 +1544,10 @@ pub struct App {
     pub(crate) pdf_password_pending_path: Option<PathBuf>,
     /// 現在開いている PDF のパスワード (セッション中キャッシュ)
     pub(crate) pdf_current_password: Option<String>,
+    /// 非同期 enumerate 成功時に DPAPI 保存するための一時記録 (path, password)。
+    /// パスワードダイアログで「保存する」を ON にして OK した時にセットされ、
+    /// `poll_pdf_enumerate` の成功経路で消費される (path 一致時のみ save)。
+    pub(crate) pdf_password_pending_save: Option<(PathBuf, String)>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
@@ -1984,6 +1988,7 @@ impl Default for App {
             pdf_password_save: false,
             pdf_password_error: None,
             pdf_password_pending_path: None,
+            pdf_password_pending_save: None,
             pdf_current_password: None,
             pdf_content_type_tx: pdf_ct_tx,
             pdf_content_type_rx: pdf_ct_rx,
@@ -3217,6 +3222,16 @@ impl App {
                 crate::logger::log(format!("  pdf: {} pages", pages.len()));
                 self.pdf_current_password = password;
 
+                // パスワードダイアログで「保存する」を ON にして OK した場合、
+                // enumerate 成功時点で DPAPI に保存する (ダイアログでの sync 検証を
+                // やめた代替経路)。パスが一致しないのは別 PDF が割り込んだケースなので保存しない。
+                if let Some((save_path, pw)) = self.pdf_password_pending_save.take() {
+                    if save_path == pdf_path {
+                        self.pdf_passwords.set(&save_path, &pw);
+                        self.pdf_passwords.save();
+                    }
+                }
+
                 let mut items: Vec<GridItem> = Vec::new();
                 let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
                 let mut existing_keys: std::collections::HashSet<String> =
@@ -3249,18 +3264,29 @@ impl App {
                 let err_msg = format!("{e}");
                 // パスワードエラーかどうかを判定 (エラーメッセージに "Password" が含まれる)
                 if err_msg.contains("Password") || err_msg.contains("password") {
-                    if password.is_none() {
-                        // パスワードが必要 → ダイアログ表示。
-                        // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
-                        // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
-                        self.fs_nav_after_pdf_enumerate = None;
-                        self.pdf_password_pending_path = Some(pdf_path);
-                        self.show_pdf_password_dialog = true;
-                        self.pdf_password_input.clear();
-                        self.pdf_password_error = None;
-                        self.pdf_password_save = false;
-                        return;
+                    // 誤ったパスワードを DPAPI/セッションキャッシュに保存していた場合は破棄し、
+                    // ユーザーに再入力してもらう。DPAPI も破棄しないと、次の load_pdf_as_folder が
+                    // また stale を拾って無限ループになる。
+                    self.pdf_password_pending_save = None;
+                    if password.is_some() {
+                        self.pdf_current_password = None;
+                        self.pdf_passwords.remove(&pdf_path);
+                        self.pdf_passwords.save();
                     }
+                    // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
+                    // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
+                    self.fs_nav_after_pdf_enumerate = None;
+                    self.pdf_password_pending_path = Some(pdf_path);
+                    self.show_pdf_password_dialog = true;
+                    self.pdf_password_input.clear();
+                    // password が渡されていた = 入力済みのパスワードが誤っていた
+                    self.pdf_password_error = if password.is_some() {
+                        Some("パスワードが正しくありません".to_string())
+                    } else {
+                        None
+                    };
+                    self.pdf_password_save = false;
+                    return;
                 }
                 // その他の失敗: deferred 意図をクリアしてグリッド表示にフォールバック
                 self.fs_nav_after_pdf_enumerate = None;

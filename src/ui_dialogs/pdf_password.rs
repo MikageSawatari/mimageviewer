@@ -98,27 +98,21 @@ impl crate::app::App {
             let password = self.pdf_password_input.trim().to_string();
             if !password.is_empty() {
                 if let Some(pending_path) = self.pdf_password_pending_path.take() {
-                    // パスワードが正しいか検証
-                    match crate::pdf_loader::enumerate_pages(&pending_path, Some(&password)) {
-                        Ok(_) => {
-                            // 成功 → パスワード保存 & PDF を開く
-                            if self.pdf_password_save {
-                                self.pdf_passwords.set(&pending_path, &password);
-                                self.pdf_passwords.save();
-                            }
-                            self.pdf_current_password = Some(password);
-                            self.show_pdf_password_dialog = false;
-                            self.pdf_password_input.clear();
-                            self.pdf_password_error = None;
-                            self.load_pdf_as_folder(pending_path);
-                        }
-                        Err(_) => {
-                            // 失敗 → エラー表示してダイアログを維持
-                            self.pdf_password_error =
-                                Some("パスワードが正しくありません".to_string());
-                            self.pdf_password_pending_path = Some(pending_path);
-                        }
-                    }
+                    // パスワード検証は非同期 enumerate に任せる。ここで sync enumerate すると
+                    // UI が止まり、しかも直後の load_pdf_as_folder が同じ PDF をもう一度
+                    // 非同期 enumerate するため二重走行になる。
+                    // 成功時に DPAPI 保存したい場合は pending_save に退避し、
+                    // poll_pdf_enumerate の成功経路でパスが一致した時に save する。
+                    self.pdf_current_password = Some(password.clone());
+                    self.pdf_password_pending_save = if self.pdf_password_save {
+                        Some((pending_path.clone(), password))
+                    } else {
+                        None
+                    };
+                    self.show_pdf_password_dialog = false;
+                    self.pdf_password_input.clear();
+                    self.pdf_password_error = None;
+                    self.load_pdf_as_folder(pending_path);
                 }
             }
         } else if cancel || !open {
@@ -126,6 +120,7 @@ impl crate::app::App {
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
             self.pdf_password_pending_path = None;
+            self.pdf_password_pending_save = None;
         }
     }
 }
