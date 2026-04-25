@@ -1171,6 +1171,11 @@ pub struct App {
     /// 叩かないようにするため。
     pub(crate) favorites_index_size_cache:
         Option<crate::ui_dialogs::favorites_editor::IndexDiskSizes>,
+    /// お気に入りごとの索引件数 (名前 / メタ) のキャッシュ。
+    /// `Instant` は最終取得時刻で、ダイアログ表示中はバックグラウンド更新を反映するため
+    /// 一定間隔 (1.5s) で再計算する。close で None。
+    pub(crate) favorites_index_count_cache:
+        Option<(std::time::Instant, crate::ui_dialogs::favorites_editor::IndexFileCounts)>,
 
     // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
     pub(crate) show_tag_editor: bool,
@@ -1989,6 +1994,7 @@ impl Default for App {
             items_generation: 0,
             show_favorites_editor: false,
             favorites_index_size_cache: None,
+            favorites_index_count_cache: None,
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
             tag_write_handle: None,

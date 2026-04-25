@@ -19,7 +19,7 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::indexer_supervisor::SupervisorStats;
-use crate::ui_helpers::{format_bytes, truncate_name};
+use crate::ui_helpers::{format_bytes, format_count, truncate_name};
 
 /// 全文検索インデックスの on-disk サイズ (bytes) を集計する。
 ///
@@ -34,6 +34,22 @@ pub(crate) struct IndexDiskSizes {
     pub(crate) name_index_db: u64,
     pub(crate) fts_meta_db: u64,
     pub(crate) fts_index_dir: u64,
+}
+
+/// お気に入りごとの索引件数 (名前索引 / メタ索引) のスナップショット。
+///
+/// ダイアログ open 時に 1 回だけ計算してキャッシュする。毎フレーム数十回の
+/// `COUNT(*)` を走らせないため。close 時に破棄。
+///
+/// - `name_counts[fav_id]`: search_index.db の当 favorite_root 配下のエントリ数
+/// - `meta_counts[fav_id]`: fts_meta.db の当 favorite_id × status=Ok の件数
+/// - `name_total` / `meta_total`: 上記の合計 (索引サイズ表示用の総件数)
+#[derive(Default, Clone)]
+pub(crate) struct IndexFileCounts {
+    pub(crate) name_counts: std::collections::HashMap<uuid::Uuid, u64>,
+    pub(crate) meta_counts: std::collections::HashMap<uuid::Uuid, u64>,
+    pub(crate) name_total: u64,
+    pub(crate) meta_total: u64,
 }
 
 pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
@@ -99,6 +115,42 @@ impl App {
 
         // 事前にインデクサ情報を取り出し (borrow 競合回避)
         let startup_diag = self.indexer_manager.as_ref().map(|m| m.startup_diag());
+        // 件数キャッシュ。バックグラウンドインデクサが裏で行を増減させるので、
+        // ダイアログ表示中は 1.5s ごとに再計算して更新を反映する。
+        // 1 ファイルあたりの COUNT(*) は数 ms だが、お気に入り数 × 2 (名前/メタ) で
+        // 100-200ms かかりうるので毎フレームは避ける。
+        const COUNT_REFRESH: std::time::Duration = std::time::Duration::from_millis(1500);
+        let needs_refresh = self
+            .favorites_index_count_cache
+            .as_ref()
+            .map(|(t, _)| t.elapsed() >= COUNT_REFRESH)
+            .unwrap_or(true);
+        if needs_refresh {
+            let mut c = crate::ui_dialogs::favorites_editor::IndexFileCounts::default();
+            let name_db = self.search_index_db.as_ref().cloned();
+            let meta_db = self.indexer_manager.as_ref().map(|m| m.clone_fts_meta());
+            for fav in &self.settings.favorites {
+                let n = name_db
+                    .as_ref()
+                    .and_then(|db| db.count_for_favorite(&fav.path).ok())
+                    .unwrap_or(0);
+                let m = meta_db
+                    .as_ref()
+                    .and_then(|db| db.count_by_status(fav.id).ok())
+                    .map(|s| s.ok as u64)
+                    .unwrap_or(0);
+                c.name_counts.insert(fav.id, n);
+                c.meta_counts.insert(fav.id, m);
+                c.name_total += n;
+                c.meta_total += m;
+            }
+            self.favorites_index_count_cache = Some((std::time::Instant::now(), c));
+        }
+        let counts = self
+            .favorites_index_count_cache
+            .as_ref()
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
         let reconciling = self
             .indexer_manager
             .as_ref()
@@ -183,22 +235,24 @@ impl App {
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "名前索引 {}",
-                                    format_bytes(sizes.name_index_db)
+                                    "名前索引 {} ({}件)",
+                                    format_bytes(sizes.name_index_db),
+                                    format_count(counts.name_total)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
                             )
                             .on_hover_text(
-                                "search_index.db (名前索引) のディスク使用量 (WAL/SHM 込み)。\n\
+                                "search_index.db (名前索引) のディスク使用量 (WAL/SHM 込み) と総件数。\n\
                                  お気に入りごとの ファイル / フォルダ名インデックス。",
                             );
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "メタ索引 {} + {}",
+                                    "メタ索引 {} + {} ({}件)",
                                     format_bytes(sizes.fts_meta_db),
-                                    format_bytes(sizes.fts_index_dir)
+                                    format_bytes(sizes.fts_index_dir),
+                                    format_count(counts.meta_total)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -365,6 +419,7 @@ impl App {
                                                 ui,
                                                 name_on,
                                                 name_stats_by_id.get(&fav_id),
+                                                counts.name_counts.get(&fav_id).copied().unwrap_or(0),
                                             );
                                         });
 
@@ -387,6 +442,7 @@ impl App {
                                                 ui,
                                                 meta_on,
                                                 stats_by_id.get(&fav_id),
+                                                counts.meta_counts.get(&fav_id).copied().unwrap_or(0),
                                             );
                                         });
 
@@ -610,6 +666,7 @@ impl App {
         if close_requested || !open {
             self.show_favorites_editor = false;
             self.favorites_index_size_cache = None;
+            self.favorites_index_count_cache = None;
         }
 
         // サムネ一括作成ダイアログを起動 (「お気に入り」ダイアログと同じフレームで連続
@@ -645,6 +702,7 @@ fn draw_name_state_inline(
     ui: &mut egui::Ui,
     on: bool,
     stats: Option<&crate::name_index_supervisor::NameIndexStats>,
+    file_count: u64,
 ) {
     if !on {
         ui.label(
@@ -655,32 +713,47 @@ fn draw_name_state_inline(
         return;
     }
     let Some(s) = stats else {
-        ui.label(
-            egui::RichText::new("⏳ 起動中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(200, 170, 60)),
+        draw_state_with_count(
+            ui,
+            "⏳ 起動中",
+            egui::Color32::from_rgb(200, 170, 60),
+            file_count,
         );
         return;
     };
     if s.in_full_scan {
-        ui.label(
-            egui::RichText::new("⏳ スキャン中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(200, 170, 60)),
+        draw_state_with_count(
+            ui,
+            "⏳ スキャン中",
+            egui::Color32::from_rgb(200, 170, 60),
+            file_count,
         );
     } else if s.initial_scan_done {
-        ui.label(
-            egui::RichText::new("✅ 監視中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(100, 170, 100)),
+        draw_state_with_count(
+            ui,
+            "✅ 監視中",
+            egui::Color32::from_rgb(100, 170, 100),
+            file_count,
         );
     } else {
-        ui.label(
-            egui::RichText::new("⏳ 準備中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(200, 170, 60)),
+        draw_state_with_count(
+            ui,
+            "⏳ 準備中",
+            egui::Color32::from_rgb(200, 170, 60),
+            file_count,
         );
     }
+}
+
+/// 状態テキスト + (件数) を 1 行で描画。件数が 0 のときは件数を省略する
+/// (起動直後やスキャン未着手のときに「(0件)」と出ると目立つので)。
+fn draw_state_with_count(ui: &mut egui::Ui, label: &str, color: egui::Color32, file_count: u64) {
+    let text = if file_count == 0 {
+        label.to_string()
+    } else {
+        format!("{label} ({}件)", format_count(file_count))
+    };
+    ui.label(egui::RichText::new(text).size(11.0).color(color));
 }
 
 /// メタデータ索引列: supervisor 状態を 3 分岐で表示
@@ -691,7 +764,12 @@ fn draw_name_state_inline(
 ///   (notify-rs watcher が FS 変更を待機、scan 完了後アイドル状態)
 /// - ON + `initial_scan_done=false`, `in_full_scan=false`: ⏳ 準備中
 ///   (supervisor が起動したばかりで scan がまだ始まっていない)
-fn draw_meta_state_inline(ui: &mut egui::Ui, on: bool, stats: Option<&SupervisorStats>) {
+fn draw_meta_state_inline(
+    ui: &mut egui::Ui,
+    on: bool,
+    stats: Option<&SupervisorStats>,
+    file_count: u64,
+) {
     if !on {
         ui.label(
             egui::RichText::new("—")
@@ -701,30 +779,34 @@ fn draw_meta_state_inline(ui: &mut egui::Ui, on: bool, stats: Option<&Supervisor
         return;
     }
     let Some(s) = stats else {
-        ui.label(
-            egui::RichText::new("⏳ 起動中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(200, 170, 60)),
+        draw_state_with_count(
+            ui,
+            "⏳ 起動中",
+            egui::Color32::from_rgb(200, 170, 60),
+            file_count,
         );
         return;
     };
     if s.in_full_scan {
-        ui.label(
-            egui::RichText::new("⏳ スキャン中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(200, 170, 60)),
+        draw_state_with_count(
+            ui,
+            "⏳ スキャン中",
+            egui::Color32::from_rgb(200, 170, 60),
+            file_count,
         );
     } else if s.initial_scan_done {
-        ui.label(
-            egui::RichText::new("✅ 監視中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(100, 170, 100)),
+        draw_state_with_count(
+            ui,
+            "✅ 監視中",
+            egui::Color32::from_rgb(100, 170, 100),
+            file_count,
         );
     } else {
-        ui.label(
-            egui::RichText::new("⏳ 準備中")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(200, 170, 60)),
+        draw_state_with_count(
+            ui,
+            "⏳ 準備中",
+            egui::Color32::from_rgb(200, 170, 60),
+            file_count,
         );
     }
 }
