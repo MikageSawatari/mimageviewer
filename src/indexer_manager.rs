@@ -123,10 +123,21 @@ pub struct StartupDiag {
 /// 本番 `new()` とテスト用 `new_at()` の両方から呼ぶ (Codex P3 指摘: 旧コードでは
 /// `new_at` が wipe を再現していなかったため、version bump の挙動を統合テストで検証できず
 /// 本番と乖離していた)。
+/// 起動進捗 (UI 側のオーバーレイに表示する短文) を更新するためのフック。
+///
+/// `IndexerManager::new` / `new_with_progress` 内部で各 sub-step の前に呼ばれる。
+/// `None` を渡せば従来の挙動。`Some` の場合は文字列を Mutex に書き込む。
+pub type StartupProgressHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 fn open_stores_with_rebuild_sync(
     data_dir: &std::path::Path,
     log_tag: &str,
+    progress: Option<&StartupProgressHook>,
 ) -> Option<(Arc<FtsMetaDb>, Arc<FtsIndex>)> {
+    if let Some(p) = progress {
+        p("メタ索引データベースを開いています…");
+    }
+    let t_meta = std::time::Instant::now();
     let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
         Ok(db) => db,
         Err(e) => {
@@ -134,12 +145,17 @@ fn open_stores_with_rebuild_sync(
             return None;
         }
     };
+    crate::perf::emit_ms("startup", "fts_meta_open", 0, t_meta);
     let fts_dir = data_dir.join("fts_index");
     if meta_db.rebuilt_on_open() {
+        if let Some(p) = progress {
+            p("古いインデックスを削除しています…");
+        }
         crate::logger::log(format!(
             "{log_tag}: fts_meta rebuilt → wiping Tantivy index dir {}",
             fts_dir.display()
         ));
+        let t_wipe = std::time::Instant::now();
         if let Err(e) = std::fs::remove_dir_all(&fts_dir) {
             // Not-found は想定内。他は warn してそのまま続行 (次の open で
             // schema_is_stale 経路で再 wipe されることを期待)。
@@ -149,8 +165,13 @@ fn open_stores_with_rebuild_sync(
                 ));
             }
         }
+        crate::perf::emit_ms("startup", "fts_index_wipe", 0, t_wipe);
     }
     let meta_db = Arc::new(meta_db);
+    if let Some(p) = progress {
+        p("全文検索インデックスを開いています…");
+    }
+    let t_fts = std::time::Instant::now();
     let fts = match FtsIndex::open_at(&fts_dir) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
@@ -158,6 +179,7 @@ fn open_stores_with_rebuild_sync(
             return None;
         }
     };
+    crate::perf::emit_ms("startup", "fts_index_open", 0, t_fts);
     Some((meta_db, fts))
 }
 
@@ -178,12 +200,27 @@ impl IndexerManager {
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
+        Self::new_with_progress(favorites, speed, activity_gate, None)
+    }
+
+    /// 起動オーバーレイ用に各 sub-step のメッセージを `progress` に書き込みながら
+    /// `new` と同じ初期化を行う。バックグラウンドスレッドから呼び出す想定。
+    pub fn new_with_progress(
+        favorites: &[FavoriteEntry],
+        speed: crate::settings::IndexerSpeedProfile,
+        activity_gate: Arc<ActivityGate>,
+        progress: Option<StartupProgressHook>,
+    ) -> Option<Self> {
         let data_dir = crate::data_dir::get();
-        let (meta_db, fts) = match open_stores_with_rebuild_sync(&data_dir, "IndexerManager") {
+        let (meta_db, fts) = match open_stores_with_rebuild_sync(
+            &data_dir,
+            "IndexerManager",
+            progress.as_ref(),
+        ) {
             Some(stores) => stores,
             None => return None,
         };
-        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate)
+        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate, progress)
     }
 
     /// テスト用コンストラクタ: `data_dir` 配下に `fts_meta.db` / `fts_index/` を作って初期化する。
@@ -198,11 +235,15 @@ impl IndexerManager {
         activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         std::fs::create_dir_all(data_dir).ok();
-        let (meta_db, fts) = match open_stores_with_rebuild_sync(data_dir, "IndexerManager(test)") {
+        let (meta_db, fts) = match open_stores_with_rebuild_sync(
+            data_dir,
+            "IndexerManager(test)",
+            None,
+        ) {
             Some(stores) => stores,
             None => return None,
         };
-        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate)
+        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate, None)
     }
 
     /// `new` / `new_at` 共通の本体。stores を受け取って reconciliation + supervisor spawn を行う。
@@ -212,9 +253,14 @@ impl IndexerManager {
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
+        progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
         // dispatcher が常駐スレッドで処理するので、reconciliation も submit ベースで行う。
+        if let Some(p) = progress.as_ref() {
+            p("インデックスライターを初期化中…");
+        }
+        let t_writer = std::time::Instant::now();
         let raw_writer = match fts.writer() {
             Ok(w) => w,
             Err(e) => {
@@ -222,6 +268,7 @@ impl IndexerManager {
                 return None;
             }
         };
+        crate::perf::emit_ms("startup", "fts_writer_init", 0, t_writer);
         let permits = speed.io_permits().max(1); // 0 は GlobalIoSemaphore で panic するので防御
         crate::logger::log(format!(
             "IndexerManager: speed profile = {:?} → io_permits = {permits}",
@@ -235,6 +282,9 @@ impl IndexerManager {
         // === 起動時 reconciliation を先に同期実行 ===
         // supervisor が走る前に status != ok の残留行を整理する。dispatcher 経由で
         // Interactive 優先度で submit する (起動直後で他ジョブはほぼ無い)。
+        if let Some(p) = progress.as_ref() {
+            p("メタ索引を整理中…");
+        }
         let t_recon = std::time::Instant::now();
         let report = match run_reconciliation_via_dispatcher(&meta_db, &fts, &writer, favorites) {
             Ok(r) => r,
@@ -246,6 +296,7 @@ impl IndexerManager {
             }
         };
         let reconciliation_ms = t_recon.elapsed().as_millis() as u64;
+        crate::perf::emit_ms("startup", "fts_reconciliation", 0, t_recon);
         crate::logger::log(format!(
             "IndexerManager: reconciliation completed in {reconciliation_ms} ms"
         ));
@@ -267,6 +318,9 @@ impl IndexerManager {
             },
         };
         // reconciliation 完了後に supervisor 群を起動 (writer 競合なし)
+        if let Some(p) = progress.as_ref() {
+            p("お気に入りの監視を起動中…");
+        }
         mgr.sync_with_favorites(favorites);
         Some(mgr)
     }
@@ -624,6 +678,12 @@ fn spawn_reconciliation(
 
 /// dispatcher 経由 reconciliation。delete + commit を 1 つの Batch で送る。
 /// 起動直後で他ジョブはほぼ無いので Background 優先度でも即座に処理される。
+///
+/// **クエリ最適化** (2026-04): お気に入りごとに `list_not_ok_paths` を回すと
+/// SQLite が `idx_files_fav_kind` を選んでお気に入り配下の全行 (実測 65 万行で
+/// 1.1 秒) を post-filter する。代わりに `list_not_ok_paths_for_favorites` で
+/// 1 クエリ化すると部分インデックス `idx_files_status` (status != 0 の行のみ)
+/// が効いて 17ms 程度に収まる。
 fn run_reconciliation_via_dispatcher(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,
@@ -633,34 +693,34 @@ fn run_reconciliation_via_dispatcher(
     use crate::fts_writer_dispatcher::WriterPriority;
     let mut report = ReconciliationReport::default();
     let mut deletes: Vec<String> = Vec::new();
-    for fav in favorites {
-        if !fav.auto_index_metadata {
-            continue;
-        }
-        let not_ok = meta_db
-            .list_not_ok_paths(fav.id)
-            .map_err(|e| format!("list_not_ok_paths: {e}"))?;
-        for (path, status) in not_ok {
-            match status {
-                FileStatus::Ok => continue,
-                FileStatus::Pending | FileStatus::Failed => {
-                    deletes.push(path.clone());
-                    if let Err(e) = delete_row_forcing(meta_db, &path) {
-                        crate::logger::log(format!(
-                            "reconciliation: delete row for {path} failed: {e}"
-                        ));
-                    }
-                    report.pending_cleaned += 1;
+    let target_favs: Vec<Uuid> = favorites
+        .iter()
+        .filter(|f| f.auto_index_metadata)
+        .map(|f| f.id)
+        .collect();
+    let not_ok = meta_db
+        .list_not_ok_paths_for_favorites(&target_favs)
+        .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
+    for (path, _fav_id, status) in not_ok {
+        match status {
+            FileStatus::Ok => continue,
+            FileStatus::Pending | FileStatus::Failed => {
+                deletes.push(path.clone());
+                if let Err(e) = delete_row_forcing(meta_db, &path) {
+                    crate::logger::log(format!(
+                        "reconciliation: delete row for {path} failed: {e}"
+                    ));
                 }
-                FileStatus::Tombstone => {
-                    deletes.push(path.clone());
-                    if let Err(e) = meta_db.purge_tombstone(&[path.clone()]) {
-                        crate::logger::log(format!(
-                            "reconciliation: purge_tombstone {path} failed: {e}"
-                        ));
-                    }
-                    report.tombstone_purged += 1;
+                report.pending_cleaned += 1;
+            }
+            FileStatus::Tombstone => {
+                deletes.push(path.clone());
+                if let Err(e) = meta_db.purge_tombstone(&[path.clone()]) {
+                    crate::logger::log(format!(
+                        "reconciliation: purge_tombstone {path} failed: {e}"
+                    ));
                 }
+                report.tombstone_purged += 1;
             }
         }
     }

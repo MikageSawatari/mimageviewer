@@ -52,6 +52,23 @@ impl Drop for ZipEnumeratePending {
     }
 }
 
+/// 起動フェーズ。`Loading` の間は中央に「起動中…」オーバーレイを描画し、
+/// × ボタン以外の入力を全て消費する。重い初期化 (Tantivy reconciliation 等) が
+/// 完了したら `Ready` に遷移して通常 update に入る。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupPhase {
+    Loading,
+    Ready,
+}
+
+/// バックグラウンドで走らせる `IndexerManager::new` の receiver。
+/// 完了したら `Option<IndexerManager>` を 1 回だけ送る。
+pub(crate) struct StartupInitPending {
+    pub(crate) rx: mpsc::Receiver<Option<crate::indexer_manager::IndexerManager>>,
+    /// 起動を開始した時刻 (perf 計測用)
+    pub(crate) started_at: std::time::Instant,
+}
+
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
@@ -1854,13 +1871,25 @@ pub struct App {
     /// 前フレームの main viewport focus 状態。false → true 遷移で外部更新チェックを走らせる。
     /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
     pub(crate) last_main_focused: bool,
+
+    // ── 起動オーバーレイ ─────────────────────────────────────────
+    /// 起動フェーズ。`Loading` の間は中央オーバーレイを描画して通常 update を block する。
+    pub(crate) startup_phase: StartupPhase,
+    /// オーバーレイに表示する短いステータス文字列。バックグラウンド init スレッドが
+    /// 各 sub-step の前に書き換える。
+    pub(crate) startup_progress: Arc<Mutex<String>>,
+    /// 走行中の起動 init スレッドの receiver。`update` 内で try_recv して
+    /// 完了次第 `indexer_manager` に注入し `Ready` に遷移する。
+    pub(crate) startup_init: Option<StartupInitPending>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
+        let t_settings = std::time::Instant::now();
         let settings = crate::settings::Settings::load();
+        crate::perf::emit_ms("startup", "settings_load_app", 0, t_settings);
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings
             .ai_upscale_model_override
@@ -1872,13 +1901,53 @@ impl Default for App {
             crate::activity_gate::DEFAULT_QUIET_MS,
         ));
 
-        // 全文検索インデクサを起動。DB/index オープンに失敗した場合 (ディスク容量不足等)
-        // は None となり、Ctrl+G 機能は無効だが他の機能は継続動作する。
-        let indexer_manager = crate::indexer_manager::IndexerManager::new(
-            &settings.favorites,
-            settings.indexer_speed_profile,
-            Arc::clone(&activity_gate),
-        );
+        // 全文検索インデクサ (Tantivy) は起動の最大ボトルネック (実測 1 秒級) なので、
+        // ここでは起動せず None で出発する。`App::update` の最初のフレームで
+        // バックグラウンドスレッドに `IndexerManager::new_with_progress` を spawn し、
+        // 進行中はオーバーレイを表示する。完了したら `indexer_manager` に注入する。
+        let indexer_manager: Option<crate::indexer_manager::IndexerManager> = None;
+
+        // === 各 SQLite DB の open を計測 ===
+        // 起動 UI スレッドで同期実行されるので、cold open が支配的なら
+        // ここで個別の所要時間が判明する。--perf-log 無効時は no-op。
+        let t = std::time::Instant::now();
+        let archive_cache_db = crate::archive_cache::ArchiveCacheDb::open()
+            .map_err(|e| crate::logger::log(format!("archive_cache_db open failed: {e}")))
+            .ok()
+            .map(Arc::new);
+        crate::perf::emit_ms("startup", "db_open_archive_cache", 0, t);
+
+        let t = std::time::Instant::now();
+        let search_index_db = crate::search_index_db::SearchIndexDb::open()
+            .map_err(|e| crate::logger::log(format!("search_index_db open failed: {e}")))
+            .ok()
+            .map(Arc::new);
+        crate::perf::emit_ms("startup", "db_open_search_index", 0, t);
+
+        let t = std::time::Instant::now();
+        let rotation_db = crate::rotation_db::RotationDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
+
+        let t = std::time::Instant::now();
+        let rating_db = crate::rating_db::RatingDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_rating", 0, t);
+
+        let t = std::time::Instant::now();
+        let spread_db = crate::spread_db::SpreadDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_spread", 0, t);
+
+        let t = std::time::Instant::now();
+        let pdf_passwords = crate::pdf_passwords::PdfPasswordStore::load();
+        crate::perf::emit_ms("startup", "pdf_passwords_load", 0, t);
+
+        let t = std::time::Instant::now();
+        let adjustment_db = crate::adjustment_db::AdjustmentDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_adjustment", 0, t);
+
+        let t = std::time::Instant::now();
+        let mask_db = crate::mask_db::MaskDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_mask", 0, t);
+
         Self {
             address: String::new(),
             current_folder: None,
@@ -1970,10 +2039,7 @@ impl Default for App {
             cache_manager_confirm_delete_all: false,
             cache_maint_pending: None,
             archive_cache_maint_pending: None,
-            archive_cache_db: crate::archive_cache::ArchiveCacheDb::open()
-                .map_err(|e| crate::logger::log(format!("archive_cache_db open failed: {e}")))
-                .ok()
-                .map(Arc::new),
+            archive_cache_db,
             archive_convert: None,
             archive_source_override: None,
             show_archive_cache_manager: false,
@@ -1992,10 +2058,7 @@ impl Default for App {
                 ..Default::default()
             },
             cc: CacheCreatorState::default(),
-            search_index_db: crate::search_index_db::SearchIndexDb::open()
-                .map_err(|e| crate::logger::log(format!("search_index_db open failed: {e}")))
-                .ok()
-                .map(Arc::new),
+            search_index_db,
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
             metadata_cache: std::collections::HashMap::new(),
@@ -2028,9 +2091,9 @@ impl Default for App {
             search_has_focus: false,
             search_target: crate::fts_index::SearchTarget::All,
             search_or_mode: false,
-            rotation_db: crate::rotation_db::RotationDb::open().ok(),
+            rotation_db,
             rotation_cache: std::collections::HashMap::new(),
-            rating_db: crate::rating_db::RatingDb::open().ok(),
+            rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
             user_set_rating_keys: std::collections::HashSet::new(),
@@ -2039,7 +2102,7 @@ impl Default for App {
             folder_rating_counts_loaded: false,
             folder_rating_counter_handle: None,
             folder_rating_counts_folder_key: None,
-            spread_db: crate::spread_db::SpreadDb::open().ok(),
+            spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             spread_popup_open: false,
             slideshow_playing: false,
@@ -2076,7 +2139,7 @@ impl Default for App {
             analysis_sv_cache: None,
             initialized: false,
             applied_ui_theme: None,
-            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
+            pdf_passwords,
             show_pdf_password_dialog: false,
             pdf_password_input: String::new(),
             pdf_password_save: false,
@@ -2115,7 +2178,7 @@ impl Default for App {
             thumb_adjust_tex: std::collections::HashMap::new(),
             thumb_adjust_was_dragging: false,
             adjustment_dragging: false,
-            adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
+            adjustment_db,
             adjustment_sharpened: std::collections::HashSet::new(),
             slot_save_dialog: None,
             ime_composing: false,
@@ -2139,7 +2202,7 @@ impl Default for App {
             erase_shift_drag: None,
             erase_paint_mode: true,
             erase_base_cache: std::collections::HashMap::new(),
-            mask_db: crate::mask_db::MaskDb::open().ok(),
+            mask_db,
             erase_undo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
@@ -2162,6 +2225,11 @@ impl Default for App {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             current_folder_last_mtime: None,
             last_main_focused: true,
+
+            // 起動オーバーレイ: IndexerManager::new がバックグラウンドで完了するまで Loading
+            startup_phase: StartupPhase::Loading,
+            startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
+            startup_init: None,
         }
     }
 }
@@ -2735,6 +2803,162 @@ impl App {
     /// spawn する。`indexer_manager.sync_with_favorites` のメタ側の挙動に対応する。
     /// 呼び出しは `App` 構築後 (settings が load 済みで search_index_db が開いている状態) に
     /// 1 回だけ。
+    /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
+    /// 1 度しか走らせない。`startup_init.is_some()` ならスキップ。
+    pub(crate) fn kick_off_startup_init(&mut self) {
+        if self.startup_init.is_some() {
+            return;
+        }
+        let favorites = self.settings.favorites.clone();
+        let speed = self.settings.indexer_speed_profile;
+        let activity_gate = Arc::clone(&self.activity_gate);
+        let progress = Arc::clone(&self.startup_progress);
+        let (tx, rx) = mpsc::channel();
+        let started_at = std::time::Instant::now();
+        let progress_for_thread = Arc::clone(&progress);
+        let spawn_result = std::thread::Builder::new()
+            .name("startup-init".to_string())
+            .spawn(move || {
+                let hook: crate::indexer_manager::StartupProgressHook =
+                    Arc::new(move |s: &str| {
+                        if let Ok(mut p) = progress_for_thread.lock() {
+                            *p = s.to_string();
+                        }
+                    });
+                let t = std::time::Instant::now();
+                let mgr = crate::indexer_manager::IndexerManager::new_with_progress(
+                    &favorites,
+                    speed,
+                    activity_gate,
+                    Some(hook),
+                );
+                crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
+                let _ = tx.send(mgr);
+            });
+        if let Err(e) = spawn_result {
+            crate::logger::log(format!("startup-init spawn failed: {e} — running synchronously"));
+            // フォールバック: スレッド起動に失敗したら同期で実行する。
+            // (CI 環境などスレッド数制限の極端なケース向けの保険)
+            let hook: crate::indexer_manager::StartupProgressHook = {
+                let progress = Arc::clone(&progress);
+                Arc::new(move |s: &str| {
+                    if let Ok(mut p) = progress.lock() {
+                        *p = s.to_string();
+                    }
+                })
+            };
+            self.indexer_manager = crate::indexer_manager::IndexerManager::new_with_progress(
+                &self.settings.favorites,
+                self.settings.indexer_speed_profile,
+                Arc::clone(&self.activity_gate),
+                Some(hook),
+            );
+            self.startup_phase = StartupPhase::Ready;
+            return;
+        }
+        self.startup_init = Some(StartupInitPending { rx, started_at });
+    }
+
+    /// 起動 init の完了を確認する。完了していれば `indexer_manager` に注入し
+    /// `startup_phase = Ready` に遷移する。
+    pub(crate) fn poll_startup_init(&mut self) {
+        let Some(pending) = &self.startup_init else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(mgr) => {
+                let elapsed_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
+                crate::logger::log(format!(
+                    "startup: IndexerManager init completed in {elapsed_ms:.0} ms"
+                ));
+                self.indexer_manager = mgr;
+                self.startup_phase = StartupPhase::Ready;
+                self.startup_init = None;
+                if let Ok(mut p) = self.startup_progress.lock() {
+                    *p = "起動完了".to_string();
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // まだ進行中
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // bg スレッドが panic した等で送信側が落ちた。Ready にして
+                // 検索機能なしで継続。
+                crate::logger::log("startup: init thread disconnected unexpectedly");
+                self.indexer_manager = None;
+                self.startup_phase = StartupPhase::Ready;
+                self.startup_init = None;
+            }
+        }
+    }
+
+    /// 起動オーバーレイを描画する (Loading 中のみ呼び出す)。中央に
+    /// 「起動中…」とサブテキスト (現在のステップ) + スピナーを表示する。
+    pub(crate) fn render_startup_overlay(&self, ctx: &egui::Context) {
+        let progress_text = self
+            .startup_progress
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| "起動中…".to_string());
+        // 背景全面に半透明の幕を引いてから中央に文字を出す。
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(ctx.style().visuals.panel_fill))
+            .show(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::ZERO,
+                    ctx.style().visuals.panel_fill,
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::centered_and_justified(
+                            egui::Direction::TopDown,
+                        )),
+                    |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(rect.height() * 0.3);
+                            ui.spinner();
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("起動中…")
+                                    .size(20.0)
+                                    .strong(),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(progress_text)
+                                    .size(14.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
+                    },
+                );
+            });
+    }
+
+    /// 起動中の入力イベントを消費する (× ボタン以外)。Loading 終了後に
+    /// 残ったキー入力が再生されてしまうのを防ぐため、events を空にする。
+    /// `ViewportEvent::Close` だけは eframe 側で別経路を通るので影響しない。
+    pub(crate) fn consume_input_during_startup(&self, ctx: &egui::Context) {
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                // window 関連 (フォーカス・サイズ変更等) は通したい。Key/Mouse/Text のみ捨てる。
+                !matches!(
+                    e,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::PointerMoved(_)
+                        | egui::Event::MouseWheel { .. }
+                        | egui::Event::Touch { .. }
+                        | egui::Event::Ime(_)
+                )
+            });
+        });
+    }
+
     pub(crate) fn spawn_initial_name_index_supervisors(&mut self) {
         let Some(db) = self.search_index_db.as_ref().cloned() else {
             return;
@@ -11310,6 +11534,27 @@ impl eframe::App for App {
                 crate::perf::flush();
                 self.perf_last_flush = Some(now);
             }
+        }
+
+        // ===== 起動オーバーレイ =====
+        // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
+        // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
+        // 入力イベントを破棄する。完了したら Ready に遷移して通常 update に進む。
+        if self.startup_phase != StartupPhase::Ready {
+            // 1 度だけ bg スレッドを起動 (this frame or earlier)
+            self.kick_off_startup_init();
+            // bg スレッドの完了を確認
+            self.poll_startup_init();
+            if self.startup_phase != StartupPhase::Ready {
+                // まだ Loading: オーバーレイ描画 + 入力ガード + 次フレーム要求 + 早期 return
+                self.render_startup_overlay(ctx);
+                self.consume_input_during_startup(ctx);
+                ctx.request_repaint();
+                return;
+            }
+            // Ready に遷移したフレーム: 残った入力イベント (誤入力) を一掃してから
+            // 通常 update に進む。
+            self.consume_input_during_startup(ctx);
         }
 
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。

@@ -458,6 +458,61 @@ impl FtsMetaDb {
         Ok(out)
     }
 
+    /// 起動時 reconciliation 用の最適化版: 指定お気に入り集合内で status != Ok の
+    /// (path, favorite_id, status) を 1 クエリで返す。
+    ///
+    /// `list_not_ok_paths` をお気に入りごとにループすると `idx_files_fav_kind`
+    /// が選ばれて status フィルタが post-filter 化し、お気に入り配下の **全行**
+    /// (mIV では 65 万行で実測 1.1 秒) を読む羽目になる。これは部分インデックス
+    /// `idx_files_status` (status != 0 の行だけを保持) を使えば 17ms で済む。
+    /// `favorite_id IN (...)` で SQLite が自動的に部分インデックスを優先するため、
+    /// 1 クエリにまとめて呼ぶ形にする。
+    ///
+    /// `favorite_ids` が空なら空配列を返す (status != 0 行が他お気に入りに残って
+    /// いても、auto_index_metadata=true でない限り触らない既存の reconciliation 規約に従う)。
+    pub fn list_not_ok_paths_for_favorites(
+        &self,
+        favorite_ids: &[Uuid],
+    ) -> rusqlite::Result<Vec<(String, Uuid, FileStatus)>> {
+        if favorite_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        // SQLite には rusqlite で配列バインドが無いので placeholders を生成する。
+        // お気に入り数は実用上 20 個未満なので長さは問題にならない。
+        let placeholders: String = (0..favorite_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT path, favorite_id, status FROM files \
+             WHERE status != 0 AND favorite_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<String> = favorite_ids.iter().map(|id| id.to_string()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (p, fav_str, s) = row?;
+            // favorite_id は uuid として保存されているはずだが、parse 失敗は skip して頑健に。
+            let Ok(fav) = Uuid::parse_str(&fav_str) else {
+                continue;
+            };
+            out.push((p, fav, FileStatus::from_i64(s)));
+        }
+        Ok(out)
+    }
+
     /// 起動時 reconciliation (§5.6.3) 用。status != 0 の行を全部取る。
     pub fn list_not_ok(&self) -> rusqlite::Result<Vec<FileMeta>> {
         let conn = self.conn.lock().unwrap();
@@ -997,6 +1052,59 @@ mod tests {
         let statuses: Vec<_> = not_ok.iter().map(|m| m.status).collect();
         assert!(statuses.contains(&FileStatus::Pending));
         assert!(statuses.contains(&FileStatus::Failed));
+    }
+
+    #[test]
+    fn list_not_ok_paths_for_favorites_filters_by_fav_and_status() {
+        let (_tmp, db) = tmp_db();
+        let fav_a = Uuid::new_v4();
+        let fav_b = Uuid::new_v4();
+        let fav_c = Uuid::new_v4();
+        let root_a = PathBuf::from("C:/a");
+        let root_b = PathBuf::from("C:/b");
+        let root_c = PathBuf::from("C:/c");
+        let empty = PerSourceText::default();
+
+        // fav_a: ok 1, pending 1, failed 1, tombstone 1
+        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, IndexKind::Image, 1, 1, &empty)
+            .unwrap();
+        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, IndexKind::Image, 2, 2, &empty)
+            .unwrap();
+        db.mark_pending("c:/a/3.jpg", fav_a, &root_a, IndexKind::Image, 3, 3, &empty)
+            .unwrap();
+        db.mark_pending("c:/a/4.jpg", fav_a, &root_a, IndexKind::Image, 4, 4, &empty)
+            .unwrap();
+        db.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
+        db.mark_failed("c:/a/3.jpg").unwrap();
+        db.mark_tombstone(&["c:/a/4.jpg".to_string()]).unwrap();
+
+        // fav_b: pending 1 (含めるべき)
+        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1, &empty)
+            .unwrap();
+
+        // fav_c: pending 1 (除外したい — リストに渡さない)
+        db.mark_pending("c:/c/1.jpg", fav_c, &root_c, IndexKind::Image, 1, 1, &empty)
+            .unwrap();
+
+        let rows = db
+            .list_not_ok_paths_for_favorites(&[fav_a, fav_b])
+            .unwrap();
+        // fav_a の pending(2) + failed(3) + tombstone(4) + fav_b の pending(1) = 4 件
+        assert_eq!(rows.len(), 4);
+
+        // fav_c の行が混入していないこと
+        for (path, fav, _) in &rows {
+            assert!(*fav == fav_a || *fav == fav_b, "unexpected fav for {path}");
+        }
+
+        // 空入力は空返し
+        let empty_in: Vec<Uuid> = Vec::new();
+        let empty_out = db.list_not_ok_paths_for_favorites(&empty_in).unwrap();
+        assert!(empty_out.is_empty());
+
+        // status=ok の行は含まれない
+        let paths: Vec<_> = rows.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert!(!paths.contains(&"c:/a/1.jpg"));
     }
 
     #[test]

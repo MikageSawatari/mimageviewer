@@ -286,11 +286,15 @@ fn main() -> eframe::Result {
             emit_startup("app_default", Some(t));
             app.applied_ui_theme = Some(resolved);
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
+            let t = Instant::now();
             app.hydrate_adjustment_favorite_params();
+            emit_startup("hydrate_adj_favs", Some(t));
             // name index supervisor を起動時に spawn (auto_index_structure=true なお気に入り)。
             // IndexerManager::sync_with_favorites がメタ側の対応処理を既に走らせているが、
             // 名前索引は IndexerManager 外の管理なのでここで別途 spawn する。
+            let t = Instant::now();
             app.spawn_initial_name_index_supervisors();
+            emit_startup("spawn_name_idx_sup", Some(t));
             // DPI 確定後の初回フレームで意図したサイズを再適用する
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
