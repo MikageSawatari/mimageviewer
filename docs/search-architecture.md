@@ -83,7 +83,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | モジュール | 役割 |
 | --- | --- |
 | [fts_index.rs](../src/fts_index.rs) | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page` |
-| [fts_meta.rs](../src/fts_meta.rs) | `fts_meta.db` (SQLite) ラッパ。ファイル状態 + ソース別 normalized 全文 |
+| [fts_meta.rs](../src/fts_meta.rs) | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 |
 | [search_index_db.rs](../src/search_index_db.rs) | Ctrl+S 用 `search_index.db` (フォルダ / ZIP / PDF 名のみ) |
 
 ### 2.4 タグ機能
@@ -134,7 +134,7 @@ IndexerSupervisor (スレッド 1 本):
          FS にあり DB になし → ingest queue
          DB にあり FS になし → delete queue
          両方あり mtime/size 差 → 再 ingest queue
-  3. IngestSession::run   …… 二段整合性プロトコル (§4.2) で反映
+  3. IngestSession::run   …… Tantivy First 書き込み順序 (§4.2) で反映
   4. 以降 watcher イベント (DebouncedChange) を受け取り小刻みに 3 と同じ処理
   5. App drop で cancel + FsWatcher drop + thread join
 
@@ -323,9 +323,10 @@ UI (global_search_ui::render_global_search_bar)
     2. FtsIndex::searcher() で Searcher snapshot を固定 (ページング中の
        重複・抜け防止: commit が走っても snapshot は古い seg を見続ける)
     3. TopDocs::with_limit(PAGE_SIZE=500).and_offset(offset) をループ:
-       a. Tantivy 候補 path を取得
-       b. fts_meta.db から SELECT で norms を IN 句一括取得 (target で列絞り)
-       c. search_query::matches_with_mode で post-filter
+       a. Tantivy 候補 (path, addr, score) を取得
+       b. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
+          (target で取り出すフィールドを切り替え)
+       c. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
        d. Batch 送信 (path と hit 情報を streaming)
        e. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
        f. 候補使い切りで Complete、cancel で Cancelled
@@ -366,11 +367,13 @@ Tantivy に渡すと position=0 由来で誤判定するため **post-filter 側
 | DB | 担当 | 分離の根拠 |
 | --- | --- | --- |
 | `search_index.db` | Ctrl+S (フォルダ/ZIP/PDF 名) | 既存の手動 index 生成と互換。粒度が荒く SQLite LIKE で十分。書き込み先が SQLite 単独なので 複数 supervisor が真並列で動ける |
-| `fts_index/` (Tantivy) | bigram 候補絞り込み | Lucene 系 segment 構造。ファイル単位の "変更検出" を効率的に問い合わせるのが苦手 |
-| `fts_meta.db` (SQLite) | ファイル管理状態 + ソース別正規化全文 (post-filter 用) | 差分検出 (walker) の高速 IN 句 lookup と、Tantivy に「どの doc が最新か」の真実の源を持たせる |
+| `fts_index/` (Tantivy) | bigram 候補絞り込み + 検索原文 (`*_text` STORED) | Lucene 系 segment 構造。bigram 索引 + post-filter 用原文を集約することでクエリ経路から SQLite を外している |
+| `fts_meta.db` (SQLite) | ファイル管理メタ (path / mtime / size / status=Ok\|Failed / index_generation) | 差分検出 (walker) の高速 IN 句 lookup、Tantivy に「どの doc が最新か」の真実の源、起動時 reconciliation で Failed 行を再 ingest 候補に集める |
 
-「Tantivy に全部持たせる」案を採らないのは、segment 肥大 / compaction 負荷を抑えたいのと、
-起動時 reconciliation で status 列を SQL で拾う方が楽だから。
+検索原文を Tantivy に集約しているのは、Ctrl+G の post-filter ループから SQLite SELECT を
+外して Mutex contention を消すため (INDEX_VERSION=6)。`fts_meta.db` を完全廃止しないのは、
+ファイル単位の差分検出 (walker の 3-way diff) と起動時 reconciliation で SQL の集合演算を
+使えると実装が単純になるから。
 
 ### 6.3 なぜ Tantivy First 書き込み順序 (§4.2) か
 

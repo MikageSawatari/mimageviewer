@@ -4,7 +4,7 @@
 //!
 //! 1. 起動時に初期スキャン (Walker による 3-way diff) を実行
 //! 2. FS watcher (notify-rs) を起動し、debounce 済みの変更イベントを受信
-//! 3. 変更イベントを ingest_worker に流して二段整合性プロトコルで反映
+//! 3. 変更イベントを ingest_worker に流して Tantivy First 書き込み順序で反映
 //! 4. キャンセル・一時停止の受信
 //! 5. 進捗統計の報告 (UI からの問い合わせ)
 //!
