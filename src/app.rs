@@ -228,6 +228,39 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     ScannedDir { folders, all_media }
 }
 
+/// `ScannedDir` の内容シグネチャ (path + mtime + size + 種別) を u64 ハッシュ化する。
+/// フォーカス復帰時の差分判定用。`read_dir` の返却順は NTFS で保証されないので
+/// 並び順非依存にするため path で明示的にソートしてからハッシュする。
+/// プロセス内比較専用 (DefaultHasher は Rust バージョン間で安定でないため永続化しない)。
+pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(&std::ffi::OsStr, i64, i64, &'static str)> =
+        Vec::with_capacity(scan.folders.len() + scan.all_media.len());
+    for (item, meta) in &scan.folders {
+        let (path, kind) = match item {
+            GridItem::Folder(p) => (p.as_os_str(), "folder"),
+            GridItem::ZipFile(p) => (p.as_os_str(), "zip"),
+            GridItem::PdfFile(p) => (p.as_os_str(), "pdf"),
+            GridItem::ConvertibleArchive { path, .. } => (path.as_os_str(), "archive"),
+            _ => continue,
+        };
+        let (mtime, size) = meta.unwrap_or((0, 0));
+        entries.push((path, mtime, size, kind));
+    }
+    for (p, is_video, mtime, size) in &scan.all_media {
+        let kind = if *is_video { "video" } else { "image" };
+        entries.push((p.as_os_str(), *mtime, *size, kind));
+    }
+    entries.sort();
+    let mut hasher = DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    for e in &entries {
+        e.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// 3 種の検索モード。相互排他制御 (`close_other_search_bars`) 用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchMode {
@@ -1920,6 +1953,10 @@ pub struct App {
     /// トレイ復帰 / フォーカス復帰時に `std::fs::metadata` で新しい mtime を取り、値が
     /// 変わっていたら再ロードする。ZIP / PDF / 検索合成パスには使わないので None のまま。
     pub(crate) current_folder_last_mtime: Option<std::time::SystemTime>,
+    /// 直近ロードしたフォルダ内容のシグネチャ (path + mtime + size のハッシュ)。
+    /// mtime 変化を検知して再走査した結果が同一なら、items 差し替えをスキップして
+    /// 画面ちらつきを防ぐ。`current_folder_last_mtime` と同じくディレクトリ実体のみ。
+    pub(crate) current_folder_signature: Option<u64>,
     /// 前フレームの main viewport focus 状態。false → true 遷移で外部更新チェックを走らせる。
     /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
     pub(crate) last_main_focused: bool,
@@ -2293,6 +2330,7 @@ impl Default for App {
             activation_listener: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             current_folder_last_mtime: None,
+            current_folder_signature: None,
             last_main_focused: true,
 
             startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
@@ -2499,9 +2537,11 @@ impl App {
     /// - ZIP / PDF / 検索合成パスなどディレクトリ実体でない (= `current_folder_last_mtime`
     ///   が None のまま)
     /// - mtime が保存値と同じ (= 外部更新なし)
+    /// - mtime は変わったが、再走査した内容シグネチャ (path+mtime+size) が一致する
+    ///   (Windows Search / ウイルススキャン等が触っただけ → ちらつき抑止)
     ///
-    /// 再ロードは通常の `load_folder` なので、サムネ背景タスク / キャッシュ読みなどの
-    /// 既存ロジックに乗る。UI スレッドでの syscall は `metadata()` 1 回のみ。
+    /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
+    /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
     pub(crate) fn check_external_folder_changes(&mut self) {
         if self.global_search.active {
             return;
@@ -2532,6 +2572,15 @@ impl App {
         if new_mtime == prev_mtime {
             return;
         }
+        // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
+        // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
+        // ウイルススキャン等が触っただけで mtime が更新されるケースを救済する。
+        let scan = scan_directory(&folder);
+        let new_sig = signature_from_scan(&scan);
+        if self.current_folder_signature == Some(new_sig) {
+            self.current_folder_last_mtime = Some(new_mtime);
+            return;
+        }
         // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
         let selected_path: Option<PathBuf> = self
             .selected
@@ -2546,10 +2595,11 @@ impl App {
                 _ => None,
             });
         crate::logger::log(format!(
-            "auto-refresh: folder mtime changed ({}), reloading",
+            "auto-refresh: folder content changed ({}), reloading",
             folder.display()
         ));
-        self.load_folder(folder);
+        // 既に走らせた scan を pre_scan として渡し、UI スレッドで再 read_dir しない。
+        self.load_folder_with_scan(folder, Some(scan));
         // 再ロード後に選択パスを探し、見つかればそこにカーソルを戻してスクロール依頼。
         // 見つからない (消えた) / そもそも未選択ならスクロール位置は触らない。
         if let Some(path) = selected_path {
@@ -2683,6 +2733,9 @@ impl App {
         // 無ければ UI スレッドで scan_directory を呼ぶ (従来挙動)。
         let scan_t0 = std::time::Instant::now();
         let scan = pre_scan.unwrap_or_else(|| scan_directory(&path));
+        // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
+        // `start_loading_items` に引数として渡す。
+        let folder_signature = signature_from_scan(&scan);
         let (mut folders, mut folder_metas): (Vec<GridItem>, Vec<Option<(i64, i64)>>) =
             scan.folders.into_iter().unzip();
         let mut all_media = scan.all_media;
@@ -2793,7 +2846,14 @@ impl App {
         // name_bulk_indexer 経由で全走査する (検索結果が閲覧履歴に依らないように)。
 
         let items_len = items.len();
-        self.start_loading_items(path, items, image_metas, existing_keys, video_items);
+        self.start_loading_items(
+            path,
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            Some(folder_signature),
+        );
 
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -3539,7 +3599,7 @@ impl App {
                 _ => None,
             })
             .collect();
-        self.start_loading_items(synthetic, items, image_metas, existing_keys, Vec::new());
+        self.start_loading_items(synthetic, items, image_metas, existing_keys, Vec::new(), None);
         self.update_favsearch_address();
     }
 
@@ -3672,6 +3732,7 @@ impl App {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     Vec::new(),
+                    None,
                 );
                 return;
             }
@@ -3700,6 +3761,7 @@ impl App {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     Vec::new(),
+                    None,
                 );
                 return;
             }
@@ -3747,7 +3809,7 @@ impl App {
             }
         }
 
-        self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new());
+        self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new(), None);
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
@@ -3839,6 +3901,7 @@ impl App {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     Vec::new(),
+                    None,
                 );
                 return;
             }
@@ -3889,7 +3952,7 @@ impl App {
                     image_metas.push(Some((page.mtime, page.file_size as i64)));
                 }
 
-                self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new());
+                self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new(), None);
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
                 if let Some(forward) = self.fs_nav_after_pdf_enumerate.take() {
@@ -3938,6 +4001,7 @@ impl App {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     Vec::new(),
+                    None,
                 );
             }
         }
@@ -3955,6 +4019,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
+        folder_signature: Option<u64>,
     ) {
         // 通常フォルダ / ZIP / 検索結果など PDF 以外への遷移では、残存する PDF
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
@@ -4062,6 +4127,14 @@ impl App {
             .ok()
             .filter(|m| m.is_dir())
             .and_then(|m| m.modified().ok());
+        // mtime が None の経路 (ZIP / PDF / 検索結果) ではシグネチャも持たない:
+        // フォーカス復帰の差分判定は `current_folder_last_mtime` の有無でゲートされるため
+        // 副次的にシグネチャ比較も無効化される。
+        self.current_folder_signature = self
+            .current_folder_last_mtime
+            .is_some()
+            .then_some(folder_signature)
+            .flatten();
         self.address = source_path.to_string_lossy().to_string();
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
