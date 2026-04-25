@@ -12114,6 +12114,29 @@ impl eframe::App for App {
 
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);
+        // ツールバーお気に入りクリックは「指定フォルダへ飛ぶ」操作なので、検索系
+        // (Ctrl+F フォルダ内ファイル名フィルタ / Ctrl+S お気に入り横断検索 /
+        //  Ctrl+G 全文検索) が立っていれば全部抜けてからナビゲートする。
+        // close_*() の saved_folder 復帰で旧フォルダへ無駄にロードが走らないよう、
+        // 先に saved_folder を捨てておく。
+        if toolbar_fav_nav.is_some() {
+            if self.global_search.active {
+                self.global_search.saved_folder = None;
+                self.close_global_search();
+            }
+            if self.favsearch.active {
+                self.favsearch.saved_folder = None;
+                self.close_favsearch();
+            }
+            if self.show_search_bar {
+                self.show_search_bar = false;
+                self.search_query.clear();
+                self.search_filter = None;
+                self.search_has_focus = false;
+                self.cancel_search_pending();
+                self.rebuild_visible_indices();
+            }
+        }
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
