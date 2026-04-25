@@ -76,8 +76,17 @@ impl App {
             self.fullscreen_idx,
             self.checked.len(),
         ));
-        // tags_cache は grid 表示で既に warm 済みなので追加 I/O は発生しない。
         let paths = self.tag_target_paths();
+        if paths.is_empty() {
+            return;
+        }
+        // worker handle を **capture より前に** 確保する (Codex P2 #2)。
+        // 失敗するなら tags_cache 楽観更新も Undo push もせず早期 return — そうしないと
+        // 「実ファイルは変わっていないのに UI バッジと Undo stack だけ進んだ」状態になる。
+        if !self.precheck_tag_write_available("toggle") {
+            return;
+        }
+        // tags_cache は grid 表示で既に warm 済みなので追加 I/O は発生しない。
         let with_hash = format!("#{name_owned}");
         let summary = format!("#{name_owned} のトグル");
         self.capture_tag_undo(&paths, summary, |before| {
@@ -108,6 +117,10 @@ impl App {
         crate::logger::log(format!(
             "[TAG] clear requested for {count} file(s) (mIV tags only)"
         ));
+        // worker handle 不在なら capture もせず早期 return (Codex P2 #2)。
+        if !self.precheck_tag_write_available("clear") {
+            return;
+        }
         // ClearMiv 後の dc:subject は `#` 始まり要素を除いたものになる。
         let summary = format!("{count} 件の mIV タグをクリア");
         self.capture_tag_undo(&paths, summary, |before| {
@@ -119,6 +132,21 @@ impl App {
         });
         self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
         self.submit_tag_jobs(&paths, "clear", |_| TagJobKind::ClearMiv);
+    }
+
+    /// `tag_write_handle` を遅延初期化し、利用可能か確認する。
+    /// 利用不可ならエラートーストを表示して `false` を返す。
+    /// 呼び出し側は `false` のとき capture / submit を一切スキップすること。
+    fn precheck_tag_write_available(&mut self, op_label: &str) -> bool {
+        self.ensure_tag_write_handle();
+        if self.tag_write_handle.is_none() {
+            crate::logger::log(format!(
+                "[TAG] '{op_label}' aborted: tag_write_handle unavailable (no indexer_manager)"
+            ));
+            self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
+            return false;
+        }
+        true
     }
 
     /// タグ書き込みジョブ投入の共通経路。

@@ -6217,7 +6217,15 @@ impl App {
                         .position(|k| i.consume_key(egui::Modifiers::CTRL, *k))
                 });
                 if let Some(slot) = preset_slot {
-                    self.apply_slot_to_grid_selection(slot);
+                    // capture_adjust_full でラップして、N ページの一括書き換えを
+                    // 1 つの UndoEntry にまとめて Ctrl+Z で全部戻せるようにする (Codex P2)。
+                    self.capture_adjust_full(
+                        format!(
+                            "スロット{}を一括適用",
+                            crate::adjustment::slot_key_label(slot)
+                        ),
+                        |app| app.apply_slot_to_grid_selection(slot),
+                    );
                 }
             }
 
@@ -6230,7 +6238,10 @@ impl App {
                         || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
                 });
                 if clear_key {
-                    self.clear_page_params_for_selection();
+                    self.capture_adjust_full(
+                        "個別設定を一括解除".to_string(),
+                        |app| app.clear_page_params_for_selection(),
+                    );
                 }
             }
 
@@ -14174,6 +14185,78 @@ mod favorite_adjustment_defaults_tests {
             app.meta_undo.undo_len(),
             undo_len_before,
             "no-op は積まれない"
+        );
+    }
+
+    /// Codex P2 #1 回帰: グリッド Ctrl+1〜0 のスロット一括適用 (`apply_slot_to_grid_selection`)
+    /// が `capture_adjust_full` でラップされ、N 枚の個別設定が 1 回の Ctrl+Z で全て戻る。
+    #[test]
+    fn grid_slot_apply_is_undoable() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+        // ratable_page_targets は visible_indices で絞るのでテストで埋めておく
+        app.visible_indices = vec![idx_a, idx_b];
+        // 2 枚チェック (= 一括対象)
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+        // スロット 0 に brightness=42 を保存
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "test".into(),
+            params: params_with_brightness(42.0),
+        });
+
+        app.capture_adjust_full("slot apply".into(), |a| {
+            a.apply_slot_to_grid_selection(0);
+        });
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_a).unwrap().brightness,
+            42.0
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_b).unwrap().brightness,
+            42.0
+        );
+
+        // Ctrl+Z で両方戻る
+        app.apply_meta_undo();
+        assert!(!app.adjustment_page_params.contains_key(&idx_a));
+        assert!(!app.adjustment_page_params.contains_key(&idx_b));
+    }
+
+    /// Codex P2 #1 回帰: グリッド Q / Ctrl+Backspace の一括解除
+    /// (`clear_page_params_for_selection`) が capture_adjust_full でラップされ、
+    /// N 枚の個別設定が 1 回の Ctrl+Z で全て復元される。
+    #[test]
+    fn grid_clear_selection_is_undoable() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+        app.visible_indices = vec![idx_a, idx_b];
+        // 既存の個別設定
+        app.adjustment_page_params
+            .insert(idx_a, params_with_brightness(15.0));
+        app.adjustment_page_params
+            .insert(idx_b, params_with_brightness(35.0));
+        // 2 枚チェック
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+
+        app.capture_adjust_full("clear sel".into(), |a| {
+            a.clear_page_params_for_selection();
+        });
+        assert!(!app.adjustment_page_params.contains_key(&idx_a));
+        assert!(!app.adjustment_page_params.contains_key(&idx_b));
+
+        // Ctrl+Z で両方の個別設定が復元
+        app.apply_meta_undo();
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_a).unwrap().brightness,
+            15.0
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_b).unwrap().brightness,
+            35.0
         );
     }
 }
