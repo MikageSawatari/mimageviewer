@@ -8188,6 +8188,13 @@ impl App {
     /// `rf[0]` (なし) はフォルダ自身の表示可否 (`rebuild_visible_indices`) 側でしか
     /// 使わない — 通常表示と検索結果で見た目が揃うようにするため。
     pub(crate) fn folder_rating_match(&self, idx: usize) -> Option<(u32, [u32; 5])> {
+        // フィルタ全 ON (= 非アクティブ) のときはバッジを出さない。通常フォルダは
+        // ensure_folder_rating_counter がそもそも worker を起動せずカウントが空なので
+        // 自然に None になる。検索結果 drilled view は search_drilled_folder_counts を
+        // 常に保持しているため、ここで明示的に揃える必要がある。
+        if !self.rating_filter_active() {
+            return None;
+        }
         let path = match self.items.get(idx)? {
             GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
             _ => return None,
