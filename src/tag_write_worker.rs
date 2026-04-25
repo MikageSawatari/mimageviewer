@@ -212,7 +212,7 @@ fn run_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        let (res, dirtied, tags_after) = process_job(&job, &meta, &writer);
+        let (res, dirtied, tags_after) = process_job(&job, &meta, &fts, &writer);
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -274,6 +274,7 @@ fn flush_commit(
 fn process_job(
     job: &TagWriteJob,
     meta: &FtsMetaDb,
+    fts: &FtsIndex,
     writer: &FtsWriterDispatcher,
 ) -> (Result<TagAction, WriteError>, bool, Vec<String>) {
     let path_disp = job.path.display();
@@ -332,10 +333,10 @@ fn process_job(
 
     // 検索インデックス即時更新 (favorite_id がわかる時だけ)。
     let dirtied = match job.favorite_id {
-        Some(fav_id) => upsert_tags_via_dispatcher(&job.path, fav_id, &new_tags, meta, writer),
+        Some(fav_id) => upsert_tags_via_dispatcher(&job.path, fav_id, &new_tags, meta, fts, writer),
         None => {
             crate::logger::log(format!(
-                "[TAG] worker: skip fts_meta upsert (no favorite_id) | {path_disp}"
+                "[TAG] worker: skip fts upsert (no favorite_id) | {path_disp}"
             ));
             false
         }
@@ -343,30 +344,40 @@ fn process_job(
     (Ok(action), dirtied, tags_after)
 }
 
-/// `fts_meta.tags_norm` を更新し、dispatcher 経由で Tantivy にタグ差分の upsert を依頼。
-/// commit は呼び出し側がバッチ境界で行う (1 ジョブ 1 fsync を避けるため)。
+/// 既存の Tantivy doc から他ソースのテキストを引き継ぎつつ、`tags` フィールドだけ
+/// 差し替えて upsert を依頼する。INDEX_VERSION=5 以降は fts_meta.db に norms が
+/// 無くなったため、原文の取り出しは Tantivy 側 (STORED) から行う。
 ///
 /// 戻り値 `true`: dispatcher に upsert を投げた (呼び出し側は flush の pending に計上)。
-/// 戻り値 `false`: 変更なし / fts_meta 書き込み失敗 / 行が無い など、writer に触っていない。
+/// 戻り値 `false`: 変更なし / 該当 doc が Tantivy に未投入 (pending) など、writer に触っていない。
 fn upsert_tags_via_dispatcher(
     path: &std::path::Path,
     fav_id: Uuid,
     new_tags: &str,
     meta: &FtsMetaDb,
+    fts: &FtsIndex,
     writer: &FtsWriterDispatcher,
 ) -> bool {
     let key = crate::search_index_db::normalize_path(path);
+    // 管理メタ (kind / mtime / file_size) は fts_meta.db から引く。
+    // 行が無い (未インデックス favorite など) なら notify-rs 経由の再 ingest に任せる。
     let Ok(Some(row)) = meta.get(&key) else {
-        // 行が無い (未インデックス favorite など) → notify-rs 経由の再 ingest に任せる
         return false;
     };
-    if row.norms.tags == new_tags {
+    // 既存 Tantivy doc から他ソース原文を引き継ぐ。doc が無い (= まだ pending) なら
+    // 通常 ingest に任せて何もしない。
+    let searcher = fts.searcher();
+    let addr = match crate::fts_index::find_doc_by_path(&searcher, fts.fields(), &key) {
+        Ok(Some(a)) => a,
+        _ => return false,
+    };
+    let mut norms = match crate::fts_index::doc_per_source_text(&searcher, fts.fields(), addr) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if norms.tags == new_tags {
         return false;
     }
-    if meta.set_tags(&key, new_tags).is_err() {
-        return false;
-    }
-    let mut norms = row.norms.clone();
     norms.tags = new_tags.to_string();
     let doc = IndexDoc {
         path: key,

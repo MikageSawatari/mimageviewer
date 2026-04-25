@@ -438,46 +438,24 @@ fn run_metadata_search(
     tokens: &[crate::search_query::Token],
     items: &[GridItem],
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
-    fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
+    _fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
     target: &crate::fts_index::SearchTarget,
     mode: crate::search_query::MatchMode,
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
+    // INDEX_VERSION=5 以降は fts_meta.db に原文 (`*_norm`) が無いので、Ctrl+F の
+    // 高速 fast path は廃止し、すべて on-demand (PNG / EXIF / XMP / dc:subject 直読み)
+    // で判定する。表示中の数十〜数千件しか相手にしないので体感への影響は小さい。
+    // PDF メタの target=PdfMeta 絞り込みは off になり、未インデックス画像と同じく
+    // 「常に表示」扱いになる (お気に入りに入っていない PDF を Ctrl+F する動線に合わせる)。
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)> = Vec::new();
-    // スレッド内の追加分を重複読み取りなしで引くためのローカル HashMap。
     let mut additions_lookup: std::collections::HashMap<
         String,
         Option<crate::xmp_reader::XmpTweetInfo>,
     > = std::collections::HashMap::new();
     let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
         std::collections::HashMap::new();
-
-    // fts_meta.db 直接ルックアップ (§9.2): 表示中 Image / PdfFile の path を正規化して一括 SELECT
-    // fts_meta.db に ok 状態で存在するファイルは per-source norms が使える = Pass 2 の
-    // ファイル I/O (EXIF/XMP/PNG 読み取り) を丸ごと省略できる。
-    // PDF は Codex P2 #1 対応: target=PdfMeta で PDF タイトル等を絞り込むため、
-    // Pass 1 の無条件 insert ではなく fts_meta の pdf_meta_norm に対して照合する。
-    let preloaded_texts: std::collections::HashMap<String, String> = if let Some(db) = fts_meta {
-        let keys: Vec<String> = items
-            .iter()
-            .filter_map(|it| match it {
-                GridItem::Image(p) | GridItem::PdfFile(p) => {
-                    Some(crate::search_index_db::normalize_path(p))
-                }
-                _ => None,
-            })
-            .collect();
-        match db.lookup_norms_for_target(&keys, target) {
-            Ok(rows) => rows.into_iter().collect(),
-            Err(e) => {
-                crate::logger::log(format!("Ctrl+F: fts_meta lookup failed: {e}"));
-                std::collections::HashMap::new()
-            }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
 
     // Pass 1: 構造アイテム + ZIP/PDF 系 (cheap な分類のみ、I/O なし)
     for (idx, item) in items.iter().enumerate() {
@@ -492,28 +470,10 @@ fn run_metadata_search(
             | GridItem::ZipFile(_)
             | GridItem::ConvertibleArchive { .. }
             | GridItem::ZipSeparator { .. }
-            | GridItem::SearchContainer { .. } => {
-                // SearchContainer は Ctrl+G 結果ビューに表示されるが、現在の UI では
-                // Ctrl+F (この関数) と共存させない前提 (docs §10.3 "他 UI との共存")。
-                // 万が一同時に存在したらテキスト一致で filter だけ掛ける (= 常に通す)。
+            | GridItem::SearchContainer { .. }
+            | GridItem::PdfFile(_) => {
+                // PDF は fast path 廃止に伴い、ナビ用途を壊さないために常に残す。
                 matches.insert(idx);
-            }
-            GridItem::PdfFile(path) => {
-                // Codex P2 #1: PDF は fts_meta に pdf_meta_norm を持っているので、
-                // target=PdfMeta 時に実際の PDF タイトル等で絞り込める。
-                // 未インデックスの PDF (preloaded_texts に無い) は「テキスト判定不能」として
-                // 従来どおり常に残す (ナビ用途を壊さない)。
-                let key = crate::search_index_db::normalize_path(path);
-                match preloaded_texts.get(&key) {
-                    Some(preloaded) => {
-                        if crate::search_query::matches_with_mode(tokens, preloaded, mode) {
-                            matches.insert(idx);
-                        }
-                    }
-                    None => {
-                        matches.insert(idx);
-                    }
-                }
             }
             GridItem::Image(_) | GridItem::Video(_) => {
                 // Pass 2 で処理
@@ -567,18 +527,9 @@ fn run_metadata_search(
             GridItem::Video(p) => (p, false),
             _ => continue,
         };
-        // §9.2 fts_meta.db 直接ルックアップが効く場合は Pass 2 I/O を完全に省略する
-        if is_image {
-            let key = crate::search_index_db::normalize_path(path);
-            if let Some(preloaded) = preloaded_texts.get(&key) {
-                // preloaded は target で既に列選択済み (lookup_norms_for_target)
-                if crate::search_query::matches_with_mode(tokens, preloaded, mode) {
-                    matches.insert(idx);
-                }
-                continue;
-            }
-        }
-        // fts_meta fast path で決まらなかった場合の fallback 経路。target が画像系ソース
+        // INDEX_VERSION=5 で fts_meta fast path は廃止 (原文は Tantivy 側 STORED)。
+        // Ctrl+F は表示中の数十〜数千件しか触らないので、毎回 on-demand 経路に回す。
+        // target が画像系ソース
         // (Filename/PngPrompt/Exif/XmpTweet) を一つも含まないなら、fallback hay は常に
         // 空になり matches は必ず false → file I/O もバイト走査も全て無駄。
         if !fallback_contributes {
@@ -8118,36 +8069,9 @@ impl App {
         }
         self.tag_prewarm_queued.clear();
 
-        // fts_meta 一括取得 — 存在する分は同期で即キャッシュに載せる (非可視も含む)。
-        // SQLite の IN 句は数千件でも 10-30ms 程度なので UI を止めない。
-        if let Some(mgr) = self.indexer_manager.as_ref() {
-            let meta = mgr.clone_fts_meta();
-            let mut pairs: Vec<(String, String)> = Vec::with_capacity(self.items.len());
-            for item in &self.items {
-                if let GridItem::Image(p) = item {
-                    if crate::xmp_writer::is_writable_format(p) {
-                        let db_key = crate::search_index_db::normalize_path(p);
-                        let cache_key = crate::adjustment_db::normalize_path(p);
-                        pairs.push((db_key, cache_key));
-                    }
-                }
-            }
-            if !pairs.is_empty() {
-                let db_keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
-                if let Ok(rows) = meta.lookup_tags(&db_keys) {
-                    let row_map: std::collections::HashMap<String, String> =
-                        rows.into_iter().collect();
-                    for (db_key, cache_key) in pairs {
-                        if let Some(tags_str) = row_map.get(&db_key) {
-                            self.tags_cache.insert(
-                                cache_key,
-                                crate::ingest_text::parse_tags_column(tags_str),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // INDEX_VERSION=5 でタグ原文の SQLite 一括取得は廃止。tag_prewarm worker が
+        // XMP dc:subject を 1 ファイルずつバックグラウンドで読み、`keep_range` 分を
+        // 順次 `tags_cache` に載せる。グリッドのタグバッジは worker 完了後に出る。
 
         // worker は常に起動 (非インデックスファイルが 1 枚でもあれば必要になるし、
         // 空ループで 200ms ごとに timeout する程度なので常駐コストは無視できる)。

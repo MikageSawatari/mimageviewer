@@ -490,21 +490,6 @@ impl IndexerManager {
         SearchHandle { cancel, rx }
     }
 
-    /// Ctrl+F (ローカルメタ検索) 用: 指定 path 群のソース別正規化テキストを同期取得する (§19.4)。
-    ///
-    /// **UI スレッドから直接呼ばないこと** — App 側の worker 経由で呼ぶ契約。
-    /// 返るのは (path, combined_norm_for_target) で、status != ok の path は含まれない。
-    /// `target = SearchTarget::All` を渡せば 5 ソース結合 (旧 all_text_norm 互換)。
-    pub fn lookup_local_texts(
-        &self,
-        paths: &[String],
-        target: &crate::fts_index::SearchTarget,
-    ) -> Result<Vec<(String, String)>, String> {
-        self.meta_db
-            .lookup_norms_for_target(paths, target)
-            .map_err(|e| format!("{e}"))
-    }
-
     /// favorite 数を返す (stats UI 用)。
     pub fn supervisor_count(&self) -> usize {
         self.supervisors.len()
@@ -845,16 +830,8 @@ mod tests {
         let fav = mk_fav("A", &fav_root, true);
 
         // pending 行を手動で作る (crash 残留シミュ)
-        meta.mark_pending(
-            "c:/a/1.jpg",
-            fav.id,
-            &fav_root,
-            IndexKind::Image,
-            1,
-            1,
-            &txt_norms("txt"),
-        )
-        .unwrap();
+        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
+            .unwrap();
         // Tantivy にも入れておく (writer は scope 内で drop して lockfile を解放する)
         {
             let mut w = fts.writer().unwrap();
@@ -915,16 +892,8 @@ mod tests {
         let fav = mk_fav("A", &fav_root, true);
 
         // tombstone 行を作る
-        meta.mark_pending(
-            "c:/a/1.jpg",
-            fav.id,
-            &fav_root,
-            IndexKind::Image,
-            1,
-            1,
-            &txt_norms("t"),
-        )
-        .unwrap();
+        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
+            .unwrap();
         meta.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
         meta.mark_tombstone(&["c:/a/1.jpg".to_string()]).unwrap();
 
@@ -945,16 +914,8 @@ mod tests {
         // metadata フラグ OFF
         let fav = mk_fav("A", &fav_root, false);
 
-        meta.mark_pending(
-            "c:/a/1.jpg",
-            fav.id,
-            &fav_root,
-            IndexKind::Image,
-            1,
-            1,
-            &txt_norms("t"),
-        )
-        .unwrap();
+        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
+            .unwrap();
 
         let mut rw = fts.writer().unwrap();
         let r = run_reconciliation(&meta, &fts, &mut rw, &[fav]).unwrap();

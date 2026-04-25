@@ -341,7 +341,6 @@ impl<'a> IngestSession<'a> {
                 kind,
                 cand.mtime,
                 cand.file_size,
-                &norms,
             )
             .map_err(|e| format!("mark_pending: {e}"))?;
         Ok(IndexDoc {
@@ -552,8 +551,21 @@ mod tests {
         assert_eq!(stats.ingested_ok, 1);
         let row = meta.get(&key).unwrap().unwrap();
         assert_eq!(row.status, FileStatus::Ok);
-        // ZIP ファイル名が検索対象に入っている (name_norm に格納される)
-        assert!(row.norms.name.contains("album.zip"));
+        // ZIP ファイル名が Tantivy 側 (`name` STORED) でヒットすること
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["album"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fts.reload_reader().unwrap();
+        let searcher = fts.searcher();
+        let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
+        assert!(!hits.is_empty(), "Tantivy 側でヒットする");
     }
 
     #[test]
@@ -642,14 +654,12 @@ mod tests {
             IndexKind::Image,
             cand.mtime,
             cand.file_size,
-            &norms,
         )
         .unwrap();
         let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
             fts.writer().unwrap(),
             std::sync::Arc::clone(&fts),
         );
-        // dispatcher 経由で upsert + commit (旧コードは writer.lock() で直接触っていた)
         writer
             .upsert(
                 crate::fts_index::IndexDoc {
@@ -670,11 +680,11 @@ mod tests {
             .unwrap();
         // !!! mark_ok を呼ばずに "クラッシュ" — pending のまま残留
 
-        // 状態: fts_meta は pending、Tantivy は ok 済み (新テキスト)
         let row = meta.get(&key).unwrap().unwrap();
         assert_eq!(row.status, FileStatus::Pending);
 
-        // Ctrl+G 検索では pending は結果に現れない (lookup_norms_for_target が status=0 のみ返す)
+        // Tantivy 側には commit 済 doc が残っている (post-filter で status=Pending を弾くのは
+        // 検索ワーカー側 `global_search.rs` の責務)。
         fts.reload_reader().unwrap();
         let favs = [fav];
         let q = fts_index::build_bigram_and_query(
@@ -689,13 +699,6 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1, "Tantivy には残っている");
-        let lookup = meta
-            .lookup_norms_for_target(&[key.clone()], &crate::fts_index::SearchTarget::All)
-            .unwrap();
-        assert!(
-            lookup.is_empty(),
-            "post-filter では pending は除外 → 検索結果に出ない"
-        );
 
         // reconciliation hook で検出できる (次回起動時の再 ingest 対象)
         let not_ok = meta.list_not_ok_paths(fav).unwrap();

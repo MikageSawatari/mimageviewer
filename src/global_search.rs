@@ -193,31 +193,44 @@ pub fn run(
         }
         scanned += page.len();
 
-        // 5b. target で結合済みの正規化テキストを一括取得 (§19.4)
-        let paths_only: Vec<String> = page.iter().map(|(p, _)| p.clone()).collect();
-        let norm_map: std::collections::HashMap<String, String> =
-            match meta_db.lookup_norms_for_target(&paths_only, &scope.target) {
-                Ok(rows) => rows.into_iter().collect(),
-                Err(e) => {
-                    let _ = tx.send(SearchStreamEvent::Error(format!("fts_meta lookup: {e}")));
-                    return;
-                }
-            };
+        // 5b. post-filter
+        // INDEX_VERSION=5 以降、原文は Tantivy 側の `*_text` フィールドに STORED 保存
+        // されているので、`searcher.doc(addr)` から直接取り出す。fts_meta.db への
+        // IN 句 SELECT は不要になった。
+        // ただし Tantivy には status=Pending / Tombstone の doc も commit 済で残り得る
+        // ので、status=Ok 以外を弾くために fts_meta.db を 1 回参照する (path PK lookup)。
+        let paths_only: Vec<String> = page.iter().map(|(p, _, _)| p.clone()).collect();
+        let ok_set: std::collections::HashSet<String> = match meta_db
+            .filter_paths_status_ok(&paths_only)
+        {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) => {
+                let _ = tx.send(SearchStreamEvent::Error(format!("fts_meta filter: {e}")));
+                return;
+            }
+        };
 
-        // 5c. post-filter
         let mut batch = Vec::new();
         let mut inner_truncated = false;
         let mut inner_cancelled = false;
-        for (path, score) in page {
+        for (path, addr, score) in page {
             if cancel.load(Ordering::Relaxed) {
                 inner_cancelled = true;
                 break;
             }
-            let text = match norm_map.get(&path) {
-                Some(t) => t,
-                None => continue, // tombstone / race condition で取れない場合はスキップ
+            if !ok_set.contains(&path) {
+                continue; // Pending / Failed / Tombstone は除外
+            }
+            let text = match fts_index::doc_text_for_target(
+                &searcher,
+                fts.fields(),
+                addr,
+                &scope.target,
+            ) {
+                Ok(t) => t,
+                Err(_) => continue,
             };
-            if search_query::matches_with_mode(&tokens, text, scope.mode) {
+            if search_query::matches_with_mode(&tokens, &text, scope.mode) {
                 batch.push(GlobalHit { path, score });
                 valid += 1;
                 if valid >= HARD_MAX {
@@ -368,16 +381,8 @@ mod tests {
             name: combined_name,
             ..PerSourceText::default()
         };
-        meta.mark_pending(
-            &key,
-            fav,
-            &PathBuf::from("C:/"),
-            IndexKind::Image,
-            0,
-            0,
-            &norms,
-        )
-        .unwrap();
+        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
+            .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
             &w,
@@ -631,7 +636,6 @@ mod tests {
             crate::fts_index::IndexKind::Image,
             0,
             0,
-            &norms,
         )
         .unwrap();
         {
@@ -688,16 +692,8 @@ mod tests {
             name: crate::search_norm::normalize_for_match("夕焼け"),
             ..PerSourceText::default()
         };
-        meta.mark_pending(
-            &key,
-            fav,
-            &PathBuf::from("C:/"),
-            IndexKind::Image,
-            0,
-            0,
-            &norms,
-        )
-        .unwrap();
+        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
+            .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
             &w,

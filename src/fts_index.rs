@@ -510,8 +510,9 @@ pub fn build_bigram_and_query(
 
 /// 1 ページ分の検索結果を取得 (§9.1 ステップ 5)。
 ///
-/// 戻り値は (path, score) のリスト。呼び出し側は path で `fts_meta.lookup_all_text_norm` を
-/// 引き、post-filter の正確判定を行う。
+/// 戻り値は (path, DocAddress, score) のリスト。`DocAddress` は post-filter で
+/// `searcher.doc(addr)` を呼んで STORED 原文を取り出すために返している
+/// (INDEX_VERSION=5 で fts_meta.db の `*_norm` 列を撤去した移行に伴う変更)。
 ///
 /// ★ 同じ `searcher` をループ内で使い回すこと (snapshot 固定)。
 pub fn search_page(
@@ -520,7 +521,7 @@ pub fn search_page(
     query: &BooleanQuery,
     offset: usize,
     limit: usize,
-) -> tantivy::Result<Vec<(String, Score)>> {
+) -> tantivy::Result<Vec<(String, DocAddress, Score)>> {
     let top_docs: Vec<(Score, DocAddress)> = searcher.search(
         query,
         &TopDocs::with_limit(limit)
@@ -532,7 +533,78 @@ pub fn search_page(
         let doc: TantivyDocument = searcher.doc(addr)?;
         if let Some(v) = doc.get_first(fields.path) {
             if let Some(p) = v.as_str() {
-                out.push((p.to_string(), score));
+                out.push((p.to_string(), addr, score));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `path` で Tantivy doc を 1 件引いてその `DocAddress` を返す。
+/// タグ書き込み worker が「既存 doc に tags だけ差し替えて upsert する」ために使う。
+/// ヒットしなければ None (まだ ingest が未完了 / pending → 通常経路に任せる)。
+pub fn find_doc_by_path(
+    searcher: &tantivy::Searcher,
+    fields: &Fields,
+    path: &str,
+) -> tantivy::Result<Option<DocAddress>> {
+    let term = Term::from_field_text(fields.path, path);
+    let q = TermQuery::new(term, IndexRecordOption::Basic);
+    let top: Vec<(Score, DocAddress)> =
+        searcher.search(&q, &TopDocs::with_limit(1).order_by_score())?;
+    Ok(top.into_iter().next().map(|(_, addr)| addr))
+}
+
+/// 指定 doc の STORED `*_text` 6 ソース全部を `PerSourceText` に詰めて返す。
+/// `tag_write_worker` が「他ソースの text を保ったまま tags だけ差し替えて upsert」
+/// するのに使う (INDEX_VERSION=5 以降は fts_meta.db に norms が無いため)。
+pub fn doc_per_source_text(
+    searcher: &tantivy::Searcher,
+    fields: &Fields,
+    addr: DocAddress,
+) -> tantivy::Result<crate::ingest_text::PerSourceText> {
+    let doc: TantivyDocument = searcher.doc(addr)?;
+    let read = |f: Field| -> String {
+        doc.get_first(f)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    };
+    Ok(crate::ingest_text::PerSourceText {
+        name: read(fields.name),
+        exif: read(fields.exif_text),
+        xmp_tweet: read(fields.xmp_tweet_text),
+        png_prompt: read(fields.png_prompt_text),
+        pdf_meta: read(fields.pdf_meta_text),
+        tags: read(fields.tags),
+    })
+}
+
+/// STORED フィールドから target に対応するテキストをスペース連結で取り出す
+/// (post-filter 用)。INDEX_VERSION=5 以降は fts_meta.db ではなくここで原文を取る。
+///
+/// 各 SourceKind に対応する `*_text` フィールドは ingest 時に
+/// `normalize_for_match` 適用済みで保存されているので、呼び出し側はそのまま
+/// `search_query::matches_with_mode` に渡せる。
+pub fn doc_text_for_target(
+    searcher: &tantivy::Searcher,
+    fields: &Fields,
+    addr: DocAddress,
+    target: &SearchTarget,
+) -> tantivy::Result<String> {
+    let doc: TantivyDocument = searcher.doc(addr)?;
+    let mut out = String::new();
+    for &src in target.sources() {
+        let f = fields.text_field_for(src);
+        if let Some(v) = doc.get_first(f) {
+            if let Some(s) = v.as_str() {
+                if s.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(s);
             }
         }
     }
@@ -585,11 +657,16 @@ fn build_schema() -> Schema {
     b.add_text_field("kind", STRING | STORED);
     b.add_i64_field("mtime", INDEXED | STORED);
     b.add_i64_field("file_size", STORED);
-    let text_opts = TextOptions::default().set_indexing_options(
-        TextFieldIndexing::default()
-            .set_tokenizer(BIGRAM_TOKENIZER_NAME)
-            .set_index_option(IndexRecordOption::WithFreqs),
-    );
+    // INDEX_VERSION=5 (Tantivy STORED 化): 各 *_text フィールドに STORED を付け、
+    // post-filter 用の正規化済み原文を Tantivy 側に集約する。
+    // これに伴い fts_meta.db の *_norm 列は撤去された。
+    let text_opts = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(BIGRAM_TOKENIZER_NAME)
+                .set_index_option(IndexRecordOption::WithFreqs),
+        )
+        .set_stored();
     b.add_text_field("name", text_opts.clone());
     b.add_text_field("exif_text", text_opts.clone());
     b.add_text_field("xmp_tweet_text", text_opts.clone());
@@ -925,7 +1002,7 @@ mod tests {
         let q = q_all(idx.fields(), &["夕焼け", "海辺"]).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
+        let paths: Vec<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(
             paths.contains(&"c:/a.jpg"),
             "句読点挟み doc がヒットするはず"
@@ -961,7 +1038,7 @@ mod tests {
         let q = q_all(idx.fields(), &["夕焼け"]).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
+        let paths: Vec<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(paths.contains(&"c:/a.jpg"));
         assert!(paths.contains(&"c:/c.jpg"));
         assert!(
@@ -999,7 +1076,7 @@ mod tests {
             .iter()
             .chain(page1.iter())
             .chain(page2.iter())
-            .map(|(p, _)| p.clone())
+            .map(|(p, _, _)| p.clone())
             .collect();
         assert_eq!(all_paths.len(), 30);
     }
@@ -1130,7 +1207,7 @@ mod tests {
         )
         .unwrap();
         let exif_hits = search_page(&searcher, idx.fields(), &q_exif, 0, 10).unwrap();
-        let exif_paths: Vec<_> = exif_hits.iter().map(|(p, _)| p.as_str()).collect();
+        let exif_paths: Vec<_> = exif_hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(exif_hits.len(), 1, "EXIF target は 1 件");
         assert_eq!(exif_paths[0], "c:/a.jpg");
 
@@ -1145,7 +1222,7 @@ mod tests {
         )
         .unwrap();
         let xmp_hits = search_page(&searcher, idx.fields(), &q_xmp, 0, 10).unwrap();
-        let xmp_paths: Vec<_> = xmp_hits.iter().map(|(p, _)| p.as_str()).collect();
+        let xmp_paths: Vec<_> = xmp_hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(xmp_hits.len(), 1);
         assert_eq!(xmp_paths[0], "c:/b.jpg");
 
@@ -1160,7 +1237,7 @@ mod tests {
         )
         .unwrap();
         let name_hits = search_page(&searcher, idx.fields(), &q_name, 0, 10).unwrap();
-        let name_paths: Vec<_> = name_hits.iter().map(|(p, _)| p.as_str()).collect();
+        let name_paths: Vec<_> = name_hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(name_hits.len(), 1);
         assert_eq!(name_paths[0], "c:/c.jpg");
     }
@@ -1228,7 +1305,7 @@ mod tests {
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let paths: std::collections::HashSet<_> =
-            hits.iter().map(|(p, _)| p.as_str()).collect();
+            hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 2, "EXIF + XMP の OR で a,b だけヒット");
         assert!(paths.contains("c:/a.jpg"));
         assert!(paths.contains("c:/b.jpg"));
@@ -1319,7 +1396,7 @@ mod tests {
         .unwrap();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let paths: std::collections::HashSet<_> =
-            hits.iter().map(|(p, _)| p.as_str()).collect();
+            hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 2);
         assert!(paths.contains("c:/a.zip"));
         assert!(paths.contains("c:/b.pdf"));
@@ -1367,7 +1444,7 @@ mod tests {
         )
         .unwrap();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: Vec<_> = hits.iter().map(|(p, _)| p.as_str()).collect();
+        let paths: Vec<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 1, "Tags target は tags フィールドのみ対象");
         assert_eq!(paths[0], "c:/a.jpg");
     }
@@ -1404,7 +1481,7 @@ mod tests {
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let paths: std::collections::HashSet<_> =
-            hits.iter().map(|(p, _)| p.as_str()).collect();
+            hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(paths.contains("c:/a.jpg"));
         assert!(paths.contains("c:/b.jpg"));
         assert!(!paths.contains("c:/c.jpg"), "どちらも含まない doc は除外");
@@ -1436,12 +1513,12 @@ mod tests {
         let and_hits: Vec<_> = search_page(&searcher, idx.fields(), &q_and, 0, 10)
             .unwrap()
             .into_iter()
-            .map(|(p, _)| p)
+            .map(|(p, _, _)| p)
             .collect();
         let or_hits: Vec<_> = search_page(&searcher, idx.fields(), &q_or, 0, 10)
             .unwrap()
             .into_iter()
-            .map(|(p, _)| p)
+            .map(|(p, _, _)| p)
             .collect();
         assert_eq!(and_hits, or_hits, "1 token では AND/OR ヒット集合が一致");
         assert_eq!(and_hits, vec!["c:/a.jpg".to_string()]);
