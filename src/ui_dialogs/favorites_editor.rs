@@ -642,7 +642,26 @@ impl App {
                     // 全体 ETA: 並列実行されているので「残り時間 = max(各 remaining_secs)」、
                     // 「処理速度 = Σ(各 rate_per_sec)」。各 supervisor のサンプルがまだ
                     // 揃っていなければ remaining_secs=None なので除外。
-                    let total_eta_text = aggregate_total_eta(&all_etas);
+                    //
+                    // 毎フレーム計算するとレートが 100ms 単位で振動して見づらいので、
+                    // **表示文字列を 1 秒間隔でキャッシュ** して値の更新頻度を下げる。
+                    const ETA_DISPLAY_INTERVAL: std::time::Duration =
+                        std::time::Duration::from_secs(1);
+                    let eta_stale = self
+                        .favorites_total_eta_cache
+                        .as_ref()
+                        .map(|(t, _)| t.elapsed() >= ETA_DISPLAY_INTERVAL)
+                        .unwrap_or(true);
+                    if eta_stale {
+                        self.favorites_total_eta_cache = Some((
+                            std::time::Instant::now(),
+                            aggregate_total_eta(&all_etas),
+                        ));
+                    }
+                    let total_eta_text = self
+                        .favorites_total_eta_cache
+                        .as_ref()
+                        .and_then(|(_, s)| s.clone());
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(2.0);
@@ -770,6 +789,7 @@ impl App {
             // 走行中の worker は drop で rx を切るだけ。worker は send 後に
             // 自然終了するので join は不要 (重い処理は DB COUNT のみ)。
             self.favorites_index_refresh_rx = None;
+            self.favorites_total_eta_cache = None;
         }
 
         // サムネ一括作成ダイアログを起動 (「お気に入り」ダイアログと同じフレームで連続

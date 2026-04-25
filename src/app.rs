@@ -1192,6 +1192,11 @@ pub struct App {
             crate::ui_dialogs::favorites_editor::IndexDiskSizes,
         )>,
     >,
+    /// バックグラウンドインデクサの全体 ETA 表示用文字列キャッシュ。
+    /// レート計算は 100ms 単位で振動するので、表示は 1 秒間隔で更新する。
+    /// 内側の `Option<String>` が `None` のときは「ETA 算出不可 (= サンプル不足
+    /// または進行中なし)」。close 時に None に戻す。
+    pub(crate) favorites_total_eta_cache: Option<(std::time::Instant, Option<String>)>,
 
     // ── タグ編集ダイアログ (docs/tag-feature.md) ─────────────────
     pub(crate) show_tag_editor: bool,
@@ -2026,6 +2031,7 @@ impl Default for App {
             favorites_index_size_cache: None,
             favorites_index_count_cache: None,
             favorites_index_refresh_rx: None,
+            favorites_total_eta_cache: None,
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
             tag_write_handle: None,
