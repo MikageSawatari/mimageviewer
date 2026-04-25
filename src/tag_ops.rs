@@ -76,8 +76,6 @@ impl App {
             self.fullscreen_idx,
             self.checked.len(),
         ));
-        // Undo 用 snapshot: 各 path の現状 dc:subject (tags_cache) を before として記録し、
-        // after は worker と同じロジック (Toggle = Add or Remove) を tags_cache 値に適用して導出。
         // tags_cache は grid 表示で既に warm 済みなので追加 I/O は発生しない。
         let paths = self.tag_target_paths();
         let with_hash = format!("#{name_owned}");
@@ -92,7 +90,7 @@ impl App {
             }
         });
         let name_for_jobs = name_owned;
-        self.submit_tag_jobs("toggle", move |_| {
+        self.submit_tag_jobs(&paths, "toggle", move |_| {
             TagJobKind::Toggle(name_for_jobs.clone())
         });
     }
@@ -110,7 +108,7 @@ impl App {
         crate::logger::log(format!(
             "[TAG] clear requested for {count} file(s) (mIV tags only)"
         ));
-        // Undo 用: ClearMiv 後の dc:subject は `#` 始まり要素を除いたものになる。
+        // ClearMiv 後の dc:subject は `#` 始まり要素を除いたものになる。
         let summary = format!("{count} 件の mIV タグをクリア");
         self.capture_tag_undo(&paths, summary, |before| {
             before
@@ -120,16 +118,22 @@ impl App {
                 .collect()
         });
         self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
-        self.submit_tag_jobs("clear", |_| TagJobKind::ClearMiv);
+        self.submit_tag_jobs(&paths, "clear", |_| TagJobKind::ClearMiv);
     }
 
     /// タグ書き込みジョブ投入の共通経路。
-    /// - 対象 path が 0 件 → 黙って何もしない (通常は UI でボタンがグレーアウトしている)
+    /// - 呼び出し側が `tag_target_paths()` で算出した `paths` をそのまま渡すこと
+    ///   (Undo 用 snapshot と同じ列を使うため、関数内で再算出すると 2 度走査になる)。
+    /// - 対象 path が 0 件 → 黙って何もしない
     /// - `tag_write_handle` 初期化失敗 → エラートーストを出して失敗を明示
     /// - 正常 → 各 path で `kind_for` を呼んでジョブを作成する (完了トーストは
     ///   `poll_tag_write_results` が集計結果で出す)
-    fn submit_tag_jobs(&mut self, op_label: &str, kind_for: impl Fn(&PathBuf) -> TagJobKind) {
-        let paths = self.tag_target_paths();
+    fn submit_tag_jobs(
+        &mut self,
+        paths: &[PathBuf],
+        op_label: &str,
+        kind_for: impl Fn(&PathBuf) -> TagJobKind,
+    ) {
         if paths.is_empty() {
             crate::logger::log(format!(
                 "[TAG] submit '{op_label}' aborted: tag_target_paths is empty \
@@ -148,13 +152,12 @@ impl App {
             self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return;
         };
-        let favs = self.settings.favorites.clone();
         crate::logger::log(format!(
             "[TAG] submitting '{op_label}' for {} file(s):",
             paths.len()
         ));
-        for p in &paths {
-            let fav_id = find_favorite_id(&favs, p);
+        for p in paths {
+            let fav_id = find_favorite_id(&self.settings.favorites, p);
             crate::logger::log(format!(
                 "[TAG]   → {} (favorite_id={:?})",
                 p.display(),

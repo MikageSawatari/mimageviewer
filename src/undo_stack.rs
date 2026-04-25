@@ -30,7 +30,7 @@
 //!
 //! `tag_write_worker` は単一スレッド + FIFO キューで動くので、操作直後に「逆方向の状態
 //! 復元ジョブ」をそのまま積めば順序は保たれる (詳細は `tag_write_worker.rs` 冒頭)。
-//! 復元には [`TagJobKind::RestoreTags`] を使い、worker 側は与えられた一覧で
+//! 復元には [`crate::tag_write_worker::TagJobKind::SetTags`] を使い、worker 側は与えられた一覧で
 //! `dc:subject` を完全に置き換える。Toggle の逆ではなく明示的な置換にしているのは、
 //! Undo 待機中に外部ツールが XMP を書き換えた場合でも mIV が記録した「操作直前の状態」
 //! にきっちり戻せるようにするため。
@@ -111,10 +111,7 @@ impl UndoStack {
         if !entry.is_meaningful() {
             return;
         }
-        self.undo.push_back(entry);
-        while self.undo.len() > Self::CAPACITY {
-            self.undo.pop_front();
-        }
+        Self::push_capped(&mut self.undo, entry);
         self.redo.clear();
     }
 
@@ -132,18 +129,20 @@ impl UndoStack {
 
     /// Undo 実行直後にエントリを Redo スタックへ移す。
     pub fn push_redo(&mut self, entry: UndoEntry) {
-        self.redo.push_back(entry);
-        while self.redo.len() > Self::CAPACITY {
-            self.redo.pop_front();
-        }
+        Self::push_capped(&mut self.redo, entry);
     }
 
     /// Redo 実行直後にエントリを Undo スタックへ戻す (Redo を消費しない普通の push と
     /// 違って Redo クリアを伴わない)。
     pub fn push_undo_from_redo(&mut self, entry: UndoEntry) {
-        self.undo.push_back(entry);
-        while self.undo.len() > Self::CAPACITY {
-            self.undo.pop_front();
+        Self::push_capped(&mut self.undo, entry);
+    }
+
+    /// 容量上限を超えたら古い順 (front) に捨てる FIFO 切り詰め付き push。
+    fn push_capped(deque: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
+        deque.push_back(entry);
+        while deque.len() > Self::CAPACITY {
+            deque.pop_front();
         }
     }
 

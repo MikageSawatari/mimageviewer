@@ -17,7 +17,6 @@
 use std::path::PathBuf;
 
 use crate::app::App;
-use crate::grid_item::GridItem;
 use crate::tag_ops::find_favorite_id;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
 use crate::undo_stack::{RatingChange, TagChange, UndoEntry};
@@ -229,8 +228,8 @@ impl App {
 
 impl App {
     /// レーティング操作をスタックに積むためのスナップショットを作る。
-    /// `idx_to_target` は (idx, before, after) の列。`before == after` は呼び出し側で
-    /// 弾いていなくても [`push_rating_undo_entry`] が落としてくれる。
+    /// `records` は (idx, before, after) の列。`before == after` は呼び出し側で
+    /// 弾いていなくても [`Self::push_rating_undo_entry`] が落としてくれる。
     pub(crate) fn capture_rating_undo(
         &mut self,
         records: Vec<(usize, u8, u8)>,
@@ -238,20 +237,11 @@ impl App {
     ) {
         let mut changes = Vec::with_capacity(records.len());
         for (idx, before, after) in records {
-            let path_key = match self.rating_path_key(idx) {
-                Some(k) => k,
-                None => continue,
+            let Some(path_key) = self.rating_path_key(idx) else {
+                continue;
             };
-            let source_path = match self.items.get(idx) {
-                Some(
-                    GridItem::Image(p)
-                    | GridItem::Folder(p)
-                    | GridItem::ZipFile(p)
-                    | GridItem::PdfFile(p),
-                ) => p.clone(),
-                Some(GridItem::ZipImage { zip_path, .. }) => zip_path.clone(),
-                Some(GridItem::PdfPage { pdf_path, .. }) => pdf_path.clone(),
-                _ => continue,
+            let Some(source_path) = self.rating_source_path(idx) else {
+                continue;
             };
             changes.push(RatingChange {
                 path_key,

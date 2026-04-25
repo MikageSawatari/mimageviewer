@@ -1401,7 +1401,6 @@ impl App {
             self.apply_slot_in_viewing_mode(ctx, 2);
         }
 
-        // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: メタ操作 Undo/Redo (フルスクリーンでも有効)。
         // 消しゴムモード中は ui_erase が先に Ctrl+Z を吸収する。
         self.handle_meta_undo_keys(ctx);
 

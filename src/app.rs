@@ -6001,8 +6001,6 @@ impl App {
                 }
             }
 
-            // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: メタ操作 (レーティング/タグ) Undo/Redo。
-            // 共通実装は undo_ops::handle_meta_undo_keys。
             self.handle_meta_undo_keys(ctx);
 
             if enter {
@@ -7356,6 +7354,21 @@ impl App {
         }
     }
 
+    /// レーティング操作の対象となる物理パスを返す (XMP 書き込み先 / Undo の source_path 用)。
+    /// `rating_path_key` と同じアイテム範囲を扱うので、対応するアイテム種別を増減する
+    /// 場合は両方を一緒に更新すること。
+    pub(crate) fn rating_source_path(&self, idx: usize) -> Option<PathBuf> {
+        match self.items.get(idx)? {
+            GridItem::Image(p)
+            | GridItem::Folder(p)
+            | GridItem::ZipFile(p)
+            | GridItem::PdfFile(p) => Some(p.clone()),
+            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+            GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
+            _ => None,
+        }
+    }
+
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
     /// 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
@@ -8157,8 +8170,7 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        // Undo 用に「変更前 → 変更後」を 1 トランザクションでスナップショット。
-        // set_rating 内で rating_cache が書き換わるので、ここで before を確定させてから走らせる。
+        // set_rating 内で rating_cache が書き換わるので、Undo 用 before は事前に確定させる。
         let mut undo_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
         for &idx in &targets {
             let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
