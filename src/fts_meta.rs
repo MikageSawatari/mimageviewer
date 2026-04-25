@@ -36,6 +36,14 @@ use crate::search_index_db::normalize_path;
 ///      これにより SQLite サイズが大幅縮小し、WAL checkpoint の負荷が下がる。
 pub const INDEX_VERSION: i64 = 5;
 
+/// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
+/// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
+/// 後始末だけバンプしたいケースに対応する。
+///
+/// ## bump 履歴
+/// - 1: INDEX_VERSION=5 移行で `*_norm` 列を撤去した後の VACUUM (空きページ解放)
+const HOUSEKEEPING_VERSION: i32 = 1;
+
 /// 1 ファイル/ZIP エントリに対応する fts_meta.db の行。
 ///
 /// INDEX_VERSION=5 以降は post-filter 用の原文 (`PerSourceText`) は Tantivy 側に
@@ -135,6 +143,34 @@ impl FtsMetaDb {
         // (INDEX_VERSION は const なので SQL injection リスクはない)。
         if user_version != INDEX_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
+        }
+        // 後始末 (VACUUM) 1 回限り。`application_id` を marker として使う。
+        // - rebuild_needed=true (= 旧スキーマから DROP したばかり): 空きページが
+        //   2GB 級になっているので VACUUM で実ファイルを縮める。
+        // - rebuild_needed=false (= 既に v5 だが、過去に DROP COLUMN してから
+        //   一度も VACUUM していない既存環境): 同様に縮める。
+        // どちらでも application_id == HOUSEKEEPING_VERSION なら再実行しない。
+        let app_id: i32 = conn
+            .query_row("PRAGMA application_id", [], |r| r.get(0))
+            .unwrap_or(0);
+        if app_id != HOUSEKEEPING_VERSION {
+            let before = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+            crate::logger::log(format!(
+                "fts_meta: running one-shot VACUUM (housekeeping {HOUSEKEEPING_VERSION}, file size {before} bytes)"
+            ));
+            // VACUUM は重いので時間を測ってログに残す (数 GB で数分かかりうる)。
+            let t = std::time::Instant::now();
+            conn.execute_batch("VACUUM;")?;
+            let elapsed = t.elapsed();
+            let after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+            conn.execute_batch(&format!("PRAGMA application_id = {HOUSEKEEPING_VERSION};"))?;
+            crate::logger::log(format!(
+                "fts_meta: VACUUM done in {:?} ({} → {} bytes, reclaimed {} bytes)",
+                elapsed,
+                before,
+                after,
+                before.saturating_sub(after)
+            ));
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -669,6 +705,22 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, INDEX_VERSION);
+    }
+
+    /// 初回 open で `application_id` が `HOUSEKEEPING_VERSION` に設定され、
+    /// 2 回目以降の open では VACUUM がスキップされる。
+    #[test]
+    fn housekeeping_marker_set_after_first_open() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        {
+            let _db = FtsMetaDb::open_at(&db_path).unwrap();
+        }
+        let conn = Connection::open(&db_path).unwrap();
+        let app_id: i32 = conn
+            .query_row("PRAGMA application_id", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(app_id, HOUSEKEEPING_VERSION);
     }
 
     /// user_version が古ければ MIN スキャン経路が走り、rebuild 判定が機能すること。
