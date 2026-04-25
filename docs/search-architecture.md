@@ -104,8 +104,8 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF 名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
-| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json) | `fts_index.rs` → IngestSession / tag_write_worker | schema 変更は `index_is_stale` で検出し全消去 + 再構築 |
-| `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status, name_norm, exif_norm, xmp_tweet_norm, png_prompt_norm, pdf_meta_norm, tags_norm)` | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が全再構築を促す |
+| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession / tag_write_worker | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築 |
+| `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F fast path の全経路で `normalize_path`
@@ -224,13 +224,27 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
   規模で bigram 索引を肥大化させ、誤認識ノイズで偽ヒットが増える。opt-in で
   別 index (`pdf_fts_index/`) に分離する案は v1.x 以降に残す。
 
-### 4.8 タグ書き込みと即時反映
+### 4.8 タグ書き込みと即時反映 (INDEX_VERSION=5)
 
 [tag_write_worker.rs](../src/tag_write_worker.rs) は UI からの Toggle / Clear 要求を
-1 ファイルずつ serial に処理し、XMP atomic rewrite → `fts_meta.set_tags` →
-共有 `IndexWriter` で Tantivy upsert → 32 件 or 500ms でバッチ commit する。
+1 ファイルずつ serial に処理し、以下のフローで進める:
+
+1. XMP atomic rewrite (`xmp_writer::apply_tag_op`)
+2. `fts_meta.get(path)` で管理メタ (kind / mtime / size) を取得 + `status == Ok`
+   なら次へ (Pending 中は ingest に任せて skip — race 回避)
+3. `fts.reload_reader()` で最新 commit を含む snapshot を取り、`find_doc_by_path` +
+   `doc_per_source_text` で既存 STORED 値を読み取る
+4. `tags` フィールドだけ差し替えて `IndexDoc` を再構築し、共有 `IndexWriter` で
+   `WriterPriority::Interactive` upsert
+5. 32 件 or 500ms でバッチ commit (reload 同期付き)
+
 UI は commit 完了シグナルを受けたタイミングで toast を出す (commit より前に
 toast を出すと直後の Ctrl+G に新タグが出ない race がある)。
+
+INDEX_VERSION=5 で原文が Tantivy 側に集約された影響で、`tag_write_worker` は
+他ソース原文 (name / exif / xmp_tweet / png_prompt / pdf_meta) を **保持したまま**
+tags だけ差し替える必要がある。ここで stale snapshot を読むと ingest が直前に
+commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 の race ガードが必須。
 
 ---
 

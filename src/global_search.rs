@@ -1,16 +1,19 @@
-//! Ctrl+G グローバルメタ検索の streaming クエリワーカー。
+//! Ctrl+G グローバルメタ検索の streaming クエリワーカー (INDEX_VERSION=5)。
 //!
-//! docs/search-expansion-design.md §9.1 + §10.4 に準拠する。
+//! docs/search-architecture.md に準拠する。
 //!
 //! ## 動作
 //!
 //! 1. クエリ文字列を `search_query::parse` で AST (Token リスト) にする
 //! 2. 最小長ポリシー + NOT-only 禁止チェック (Ctrl+G 向け)
 //! 3. 正のトークンを集約し、bigram BooleanQuery を構築
-//! 4. **Searcher snapshot を固定** (§9.1 ステップ 4, Codex 3 回目指摘 #2)
+//! 4. **Searcher snapshot を固定** (ページング中に ingest が commit しても結果が
+//!    ズレないようにする)
 //! 5. `TopDocs::with_limit(PAGE_SIZE).and_offset(offset)` でページング取得
-//! 6. 各ページで `fts_meta.lookup_all_text_norm` で全文を一括取得
-//! 7. `search_query::matches` で phrase / NOT / AND を最終判定 (§4.3)
+//! 6. 各ページで `fts_meta.filter_paths_status_ok` で status=Ok の path だけに絞り、
+//!    `fts_index::doc_text_for_target` で同じ Tantivy snapshot から STORED 原文を取り出す
+//!    (INDEX_VERSION=5 で原文を fts_meta から Tantivy 側に集約済み)
+//! 7. `search_query::matches` で phrase / NOT / AND を最終判定
 //! 8. post-filter 通過した結果を `SearchStreamEvent::Batch` で streaming 送信
 //! 9. HARD_MAX 到達 / 候補使い切り / cancel のどれかで終了
 //!

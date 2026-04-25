@@ -495,8 +495,9 @@ impl IndexerManager {
         self.supervisors.len()
     }
 
-    /// `Arc<FtsMetaDb>` を clone して返す (Ctrl+F 用 §9.2)。
-    /// worker thread 側で `lookup_all_text_norm` を呼びたいときに使う。
+    /// `Arc<FtsMetaDb>` を clone して返す。
+    /// 検索 worker や tag worker が status 確認・管理メタ取得のために使う
+    /// (INDEX_VERSION=5 以降、原文は Tantivy 側にあるので fts_meta は管理メタ専用)。
     pub fn clone_fts_meta(&self) -> Arc<FtsMetaDb> {
         Arc::clone(&self.meta_db)
     }

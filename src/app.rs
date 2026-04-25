@@ -712,8 +712,8 @@ fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetI
 
 /// EXIF 全タグ値を 1 つの文字列に連結 (空白区切り)。
 ///
-/// fts_meta.db の all_text_norm (ingest_text::append_exif 経由で生成) と互換にするため、
-/// Ctrl+F fallback 経路でも同じ形で EXIF を検索対象に含める (Codex round-8 Should-fix #1)。
+/// Tantivy 側 `exif_text` STORED (ingest_text::append_exif 経由で生成) と同じ形に揃え、
+/// Ctrl+F の on-demand fallback 経路でも EXIF を検索対象に含める。
 fn exif_hay(info: &crate::exif_reader::ExifInfo) -> String {
     let mut out = String::new();
     for (_group, tags) in &info.sections {
@@ -7439,11 +7439,10 @@ impl App {
         // 専用で、スレッドは自分が読み取った分は `xmp_additions` で UI に返す。
         let items_snapshot = self.items.clone();
         let xmp_snapshot = self.xmp_cache.clone();
-        // v0.8.0: fts_meta.db のハンドルを worker に渡して Pass 2 I/O を省略する
-        // (docs §9.2 Ctrl+F Tantivy 非経由方式 — 表示中 path 集合で絞り込み)
-        // IndexerManager が有効なら FtsMetaDb の Arc を clone して worker に渡す。
-        // worker 側は表示中 item の path 集合でバルク lookup_all_text_norm を呼び、
-        // ヒットした分は Pass 2 I/O を省略して all_text_norm で直接マッチ判定する。
+        // INDEX_VERSION=5 で fts_meta から原文 (`*_norm`) が無くなったため、Ctrl+F は
+        // 表示中アイテムを on-demand 経路 (PNG / EXIF / XMP / dc:subject 直読み) で
+        // 判定する。`run_metadata_search` は引数として fts_meta を受け取るが現在は
+        // 未使用 (将来 Tantivy STORED への切替路の余地として残してある)。
         let fts_meta_clone: Option<std::sync::Arc<crate::fts_meta::FtsMetaDb>> = self
             .indexer_manager
             .as_ref()

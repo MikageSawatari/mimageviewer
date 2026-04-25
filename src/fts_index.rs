@@ -1,42 +1,50 @@
-//! Tantivy ベースの全文検索インデックス (docs/search-expansion-design.md §5.2)。
+//! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割
+//! ## 役割 (INDEX_VERSION=5)
 //!
 //! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像メタを転置索引化
 //! - `fts_meta.db` と二段整合性を組み、Ctrl+G の候補絞り込みに使う
-//! - post-filter 用の正規化済み原文 (`all_text_norm`) は **Tantivy に持たせない**。
-//!   §5.2 採用案どおり `fts_meta.db` に一元化 (Codex 2 回目指摘 #2)
+//! - **post-filter 用の正規化済み原文を STORED で保持する**。INDEX_VERSION=5 で
+//!   `fts_meta.db` の `*_norm` 列群 (合計数 GB 規模になりうる) を撤去し、bigram 索引と
+//!   原文の両方を Tantivy 側 (`*_text` フィールドの STORED) に集約した。`fts_meta.db` は
+//!   ファイル単位の管理メタ (status / mtime / size / generation) のみを持つ。
+//! - 検索 worker は `searcher.doc(addr)` で STORED 原文を取り出して post-filter に渡す
+//!   (`doc_text_for_target` ヘルパ参照)
 //!
-//! ## スキーマ (v2, §19 再設計)
+//! ## スキーマ (INDEX_VERSION=5)
 //!
 //! ```text
-//! path             STRING | STORED    完全一致キー、正規化済み
-//! container        STRING | STORED    "fs" / "zip"
-//! zip_entry        STRING | STORED    container="zip" のとき ZIP 内相対パス
-//! favorite_id      STRING | STORED    UUID (exact term filter 用)
-//! kind             STRING | STORED    "folder" / "image" / "zip" / "pdf" (タイプフィルタ用)
+//! path             STRING | STORED            完全一致キー、正規化済み
+//! container        STRING | STORED            "fs" / "zip"
+//! zip_entry        STRING | STORED            container="zip" のとき ZIP 内相対パス
+//! favorite_id      STRING | STORED            UUID (exact term filter 用)
+//! kind             STRING | STORED            "folder" / "image" / "zip" / "pdf"
 //! mtime            i64    INDEXED | STORED
 //! file_size        i64    STORED
-//! name             TEXT               ファイル名 / ZIP エントリ名 (bigram + lower_caser)
-//! exif_text        TEXT               EXIF (bigram + lower_caser)
-//! xmp_tweet_text   TEXT               XMP / mXD ツイート情報 (bigram + lower_caser)
-//! png_prompt_text  TEXT               PNG tEXt/iTXt AI プロンプト (bigram + lower_caser)
-//! pdf_meta_text    TEXT               PDFium document info (bigram + lower_caser)
+//! name             TEXT   bigram | STORED     ファイル名 / ZIP エントリ名
+//! exif_text        TEXT   bigram | STORED     EXIF
+//! xmp_tweet_text   TEXT   bigram | STORED     XMP / mXD ツイート情報
+//! png_prompt_text  TEXT   bigram | STORED     PNG tEXt/iTXt AI プロンプト
+//! pdf_meta_text    TEXT   bigram | STORED     PDFium document info
+//! tags             TEXT   bigram | STORED     XMP dc:subject (#プレフィックス付き)
 //! ```
 //!
-//! v1 まで単一の `all_text` に寄せていたメタを **ソース別フィールドに分割** したのは、
-//! 「検索対象フィルタ」(§19.2) で "EXIF のみ" / "XMP ツイートのみ" のような絞り込みを
-//! ネイティブに (post-filter 頼みでなく) 行うため。
+//! per-source に分けているのは、「検索対象フィルタ」 (`SearchTarget::Only`) で
+//! "EXIF のみ" / "XMP ツイートのみ" のような絞り込みを post-filter 頼みでなく
+//! ネイティブに行うため。タグも同じく `Only(Tags)` で絞り込み可。
 //!
 //! ## 検索の組み立て方
 //!
 //! クエリ文字列を `normalize_for_match` → bigram 分解 → 各 bigram を `TermQuery` にして
-//! AND の `BooleanQuery` を作る。phrase/NOT/AND の最終判定は post-filter で行う (§4.3)。
+//! AND の `BooleanQuery` を作る。phrase/NOT/AND の最終判定は post-filter で行う。
 //!
-//! ## Searcher snapshot 固定 (§9.1 ステップ 4, Codex 3 回目指摘 #2)
+//! ## Searcher snapshot 固定
 //!
 //! 検索ワーカーは `FtsIndex::searcher()` を 1 回だけ取得し、ページング中はそれを使い回す。
 //! これで ingest 側が commit して reader reload しても、検索中の snapshot はズレない。
+//! ただし ingest worker 側は commit 後に同期 reload を要求する (`reload_after_commit=true`)。
+//! これにより `mark_ok` 直後の検索は確実に新 snapshot を見える状態になっており、
+//! INDEX_VERSION=5 で原文を Tantivy 側に集約したことによる post-filter 偽陽性を回避する。
 
 use std::path::Path;
 

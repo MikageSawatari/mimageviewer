@@ -1,12 +1,16 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位メタ管理 + post-filter 用原文保存。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=5)。
 //!
-//! docs/search-expansion-design.md §5.3, §5.6, §19.4 に準拠する。
+//! docs/search-architecture.md に準拠する。
 //!
 //! Tantivy インデックス (`fts_index/`) とは別 DB で、以下を担う:
 //! - お気に入り単位の登録ファイル追跡 (差分検出の基準)
-//! - ソース別正規化テキストの保存 (Ctrl+G post-filter で target に応じた結合を行う)
 //! - `status=pending / ok / failed / tombstone` の二段整合性状態
 //! - ingest 世代カウンタ (`index_generation`) — 将来のスナップショット用
+//!
+//! **正規化済み原文 (`*_norm` 列) は持たない**。INDEX_VERSION=5 で各ソースの
+//! 原文は Tantivy 側 (`*_text` フィールドに STORED) に集約された。post-filter は
+//! `fts_index::doc_text_for_target` で Tantivy snapshot から原文を取り出す経路に
+//! 統一されている。
 //!
 //! **スレッド安全性**: `Mutex<Connection>` で包む (既存 catalog.rs と同じパターン)。
 //! 頻繁な UPSERT は Ingest Worker から呼ばれるため、ロックは短く保つ。
@@ -223,7 +227,7 @@ impl FtsMetaDb {
     ///
     /// 返り値は tombstone に変えた行数。実際の Tantivy 削除は次回起動時の
     /// reconciliation が処理する (status=3 の行は tombstone_purged 経由で delete_doc される)。
-    /// Ctrl+F / Ctrl+G の post-filter は `lookup_all_text_norm` で status=0 のみ見るので、
+    /// Ctrl+G の post-filter は `filter_paths_status_ok` で status=0 のみ通すので、
     /// この場で tombstone にしておけば検索結果から即座に消える。
     pub fn mark_tombstone_all_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();

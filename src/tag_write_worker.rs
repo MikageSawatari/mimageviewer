@@ -1,9 +1,11 @@
-//! タグ書き込みのバックグラウンド worker (docs/tag-feature.md §5.6)。
+//! タグ書き込みのバックグラウンド worker (docs/tag-feature.md §5.6, INDEX_VERSION=5)。
 //!
 //! UI からの「タグ X をトグル」「すべてクリア」要求を受け取り、1 ファイルずつ
 //! シリアルに `xmp_writer::apply_tag_op` を実行する。書き込み成功後は
-//! `fts_meta.set_tags` + 共有 Tantivy writer 経由で index を即時更新し、
-//! 次の Ctrl+G に反映させる。
+//! 既存の Tantivy doc を STORED から読み出して `tags` フィールドだけ差し替え、
+//! 共有 Tantivy writer 経由で index を即時更新する (INDEX_VERSION=5 で原文は
+//! 全部 Tantivy 側に集約されたので、ここで他ソース原文は変更しないことを保つ
+//! 必要がある — `upsert_tags_via_dispatcher` 参照)。
 //!
 //! # Tantivy writer 共有
 //!
