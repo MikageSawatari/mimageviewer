@@ -232,6 +232,11 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
 /// フォーカス復帰時の差分判定用。`read_dir` の返却順は NTFS で保証されないので
 /// 並び順非依存にするため path で明示的にソートしてからハッシュする。
 /// プロセス内比較専用 (DefaultHasher は Rust バージョン間で安定でないため永続化しない)。
+///
+/// 既知の制限: mtime は `mtime_secs` (秒精度) を使うので、同一秒内に同サイズで
+/// 上書きされた場合は差分検知できず再ロードがスキップされる。画像ファイルが
+/// 偶然同サイズで <1 秒以内に書き換わる現実的なシナリオは稀なため許容している。
+/// 必要なら `metadata.modified()` の SystemTime を秒+nanos で取り直す拡張が可能。
 pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -4807,6 +4812,9 @@ impl App {
         // 新しい値に進めて `check_external_folder_changes` の自動再読込をスキップさせる。
         // これを怠ると次フレームで削除済み path を grid から抜いたのとほぼ同じ結果を
         // `load_folder()` で再計算することになり、数千件削除直後に UI が再度ブロックする。
+        // また、stale な `current_folder_signature` (削除前の状態) が残ると後の
+        // 外部 mtime 変更時に「内容変化あり」と誤判定して reload が走るので無効化する。
+        // 次の reload でフル再走査されてシグネチャが新しく構築される。
         if let Some(folder) = self.current_folder.clone() {
             if let Ok(meta) = folder.metadata() {
                 if meta.is_dir() {
@@ -4816,6 +4824,7 @@ impl App {
                 }
             }
         }
+        self.current_folder_signature = None;
     }
 
     /// PowerShell ペースト worker の完了を拾い、完了ごとに `pending_reload` を立てる。
