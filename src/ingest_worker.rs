@@ -112,10 +112,8 @@ impl<'a> IngestSession<'a> {
     /// - 各 sub-batch の境界で dispatcher が Interactive キュー (タグ書き込み等) を先に拾うため、
     ///   indexer の長時間 ingest 中もタグ操作は ~1 sub-batch (1〜2s) 以内に応答できる。
     ///
-    /// INDEX_VERSION=6 以降、Pending / Tombstone 中継状態は廃止: SQLite には ingest 完了
-    /// 状態 (`status=Ok`) を直接書き、削除は commit 完了後に物理 DELETE する。Tantivy
-    /// commit と SQLite 書き込みの間にクラッシュした場合は起動時 reconciliation (3-way diff)
-    /// で復旧する。
+    /// Tantivy commit と SQLite 書き込みの間にクラッシュした場合は起動時 reconciliation
+    /// (3-way diff: FS / Tantivy / SQLite) で復旧する。
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
@@ -145,7 +143,15 @@ impl<'a> IngestSession<'a> {
             }
             let upserts = std::mem::take(batch_upserts);
             let deletes = std::mem::take(batch_deletes);
-            let deletes_for_sqlite = deletes.clone();
+            // SQLite 行を先に消してから Tantivy commit。逆順だと commit 直後で SQLite 行が
+            // 残ってしまう瞬間ができる。一方この順だと「Tantivy にだけ残る」短い窓ができるが、
+            // それは新方針で許容範囲とする。SQLite を後にすると 1 ファイル分の Vec<String> を
+            // clone しないと writer.batch の move と両立しない。
+            if !deletes.is_empty() {
+                if let Err(e) = self.meta_db.delete_paths(&deletes) {
+                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
+                }
+            }
             writer.batch(
                 upserts,
                 deletes,
@@ -153,11 +159,6 @@ impl<'a> IngestSession<'a> {
                 true,  // reload_after_commit
                 WriterPriority::Background,
             )?;
-            if !deletes_for_sqlite.is_empty() {
-                if let Err(e) = self.meta_db.delete_paths(&deletes_for_sqlite) {
-                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
-                }
-            }
             Ok(())
         };
 

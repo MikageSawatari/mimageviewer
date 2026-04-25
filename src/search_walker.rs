@@ -414,7 +414,6 @@ mod tests {
         // DB に同じ mtime/size で登録済み
         db.upsert_meta_ok(&key, fav, &root, IndexKind::Image, mtime, size)
             .unwrap();
-        let _ = key.clone();
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.total_scanned, 1);
@@ -435,7 +434,6 @@ mod tests {
         // DB に "古い" mtime で登録
         db.upsert_meta_ok(&key, fav, &root, IndexKind::Image, 1, 1)
             .unwrap();
-        let _ = key.clone();
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.unchanged, 0);
@@ -521,7 +519,6 @@ mod tests {
         // fav_b 所属の行を追加
         db.upsert_meta_ok(&key_b, fav_b, &tmp.path().join("B"), IndexKind::Image, 1, 1)
             .unwrap();
-        let _ = key_b;
 
         // fav_a の scan 結果に fav_b は出てこない
         let r = scan_sync(fav_a, &root_a, &db);

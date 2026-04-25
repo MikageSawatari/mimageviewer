@@ -34,14 +34,8 @@ use crate::search_index_db::normalize_path;
 /// - 4: ZIP 内エントリのキー separator を `!` から U+001F に変更
 /// - 5: post-filter 用の正規化済み原文を Tantivy 側 (`*_text` フィールドに STORED)
 ///      へ集約。fts_meta.db の `*_norm` 列を撤去 (本ファイルから DDL も削除)。
-///      これにより SQLite サイズが大幅縮小し、WAL checkpoint の負荷が下がる。
-/// - 6: 二段整合性プロトコル簡略化。`status=Pending` (ingest 進行中) と
-///      `status=Tombstone` (削除待ち) を廃止。新規書き込みは `Ok` か `Failed`
-///      のみ。検索 post-filter (`filter_paths_status_ok`) も廃止し、Tantivy
-///      検索結果をそのまま UI に出す。これにより 1 ファイル ingest あたりの
-///      SQLite write が 2 回 → 1 回に半減し、検索 worker の SQLite SELECT
-///      contention も解消。代償として、削除直後の短い窓で削除済みファイルが
-///      検索結果に出ることがあるが、サムネイル読み込み失敗で気付ける。
+/// - 6: status を Ok / Failed の 2 値に縮小。Pending / Tombstone を廃止し、検索
+///      post-filter の SQLite SELECT も削除。
 pub const INDEX_VERSION: i64 = 6;
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
@@ -72,17 +66,12 @@ pub struct FileMeta {
     pub status: FileStatus,
 }
 
-/// ingest 後のメタ管理用 (INDEX_VERSION=6 以降)。
-///
-/// INDEX_VERSION=5 までは Pending / Tombstone を持っていたが、二段整合性プロトコルを
-/// 簡略化したため新規書き込みは `Ok` か `Failed` のみ。`from_i64` は旧データの
-/// 読み出しに備えて全値を `Failed` に倒す (再 ingest 候補として処理される)。
+/// `from_i64` は不正値や旧 schema の Pending(1) / Tombstone(3) を `Failed` に倒す
+/// (= reconciliation 経路で再 ingest 候補にする)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
 pub enum FileStatus {
-    /// Tantivy にコミット済み、検索可能
     Ok = 0,
-    /// ingest 失敗 (次回再試行)
     Failed = 2,
 }
 
@@ -149,31 +138,27 @@ impl FtsMetaDb {
         // v5 → v6 データマイグレーション: status を Ok(0) と Failed(2) の 2 値に正規化。
         // - Pending(1): クラッシュ等で残留した「ingest 進行中」マーカー → Failed に倒し
         //   reconciliation で再 ingest 候補として処理させる。
-        // - Tombstone(3): 削除予定だった row → 物理 DELETE。残ったままだと検索結果に
-        //   出ない doc が SQLite に残り続け、reconciliation で何度も拾われる。
-        if user_version != 0 && user_version < INDEX_VERSION {
-            let pending_to_failed = conn.execute(
-                "UPDATE files SET status = 2 WHERE status = 1",
-                [],
-            )?;
-            let tombstones_deleted = conn.execute(
-                "DELETE FROM files WHERE status = 3",
-                [],
-            )?;
-            if pending_to_failed > 0 || tombstones_deleted > 0 {
-                crate::logger::log(format!(
-                    "fts_meta: v{user_version}→v{INDEX_VERSION} migration: \
-                     pending→failed={pending_to_failed} rows, \
-                     tombstones deleted={tombstones_deleted} rows"
-                ));
-            }
-        }
-
-        // スキーマ最新を user_version に記録。次回起動時の MIN スキャンを回避する。
-        // `PRAGMA user_version = N` はパラメータバインド不可なので format! で組み立てる
-        // (INDEX_VERSION は const なので SQL injection リスクはない)。
+        // - Tombstone(3): 削除予定だった row → 物理 DELETE。
+        // 1 トランザクションでまとめて適用し、user_version の bump も同じ tx に含める。
+        // 中断時は次回起動でやり直し (どちらも idempotent)。
         if user_version != INDEX_VERSION {
-            conn.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
+            let tx = conn.unchecked_transaction()?;
+            let pending_to_failed = if user_version != 0 && user_version < INDEX_VERSION {
+                let p = tx.execute("UPDATE files SET status = 2 WHERE status = 1", [])?;
+                let t = tx.execute("DELETE FROM files WHERE status = 3", [])?;
+                if p > 0 || t > 0 {
+                    crate::logger::log(format!(
+                        "fts_meta: v{user_version}→v{INDEX_VERSION} migration: \
+                         pending→failed={p} rows, tombstones deleted={t} rows"
+                    ));
+                }
+                Some(p)
+            } else {
+                None
+            };
+            tx.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
+            tx.commit()?;
+            let _ = pending_to_failed;
         }
         // 後始末 (VACUUM) 1 回限り。`application_id` を marker として使う。
         // - rebuild_needed=true (= 旧スキーマから DROP したばかり): 空きページが
@@ -228,11 +213,9 @@ impl FtsMetaDb {
         self.rebuilt_on_open
     }
 
-    /// status=Ok で UPSERT。既存 row の generation を増やす。
-    /// INDEX_VERSION=6 以降、ingest 進行中の Pending 状態は廃止し、
-    /// Tantivy commit と同じバッチで status=Ok を直接書く。Tantivy commit が
-    /// 何らかの理由で失敗した場合の検出は起動時 reconciliation の 3-way diff
-    /// (FS / Tantivy / SQLite) に任せる。
+    /// status=Ok で UPSERT。既存 row の generation を増やす。Tantivy commit と
+    /// 同じバッチで呼び、commit が失敗した場合の検出は起動時 reconciliation の
+    /// 3-way diff (FS / Tantivy / SQLite) に任せる。
     pub fn upsert_meta_ok(
         &self,
         path: &str,
@@ -282,7 +265,10 @@ impl FtsMetaDb {
     /// ingest 失敗を記録。次回再試行 (retry 抑制は上位レイヤーで管理)。
     pub fn mark_failed(&self, path: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE files SET status = 2 WHERE path = ?1", params![path])?;
+        conn.execute(
+            "UPDATE files SET status = ?1 WHERE path = ?2",
+            params![FileStatus::Failed as i64, path],
+        )?;
         Ok(())
     }
 
@@ -303,16 +289,30 @@ impl FtsMetaDb {
             return Ok(0);
         }
         let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        let mut deleted = 0;
-        {
-            let mut stmt = tx.prepare("DELETE FROM files WHERE path = ?1")?;
-            for p in paths {
-                deleted += stmt.execute(params![p])?;
-            }
-        }
-        tx.commit()?;
+        let placeholders = sql_in_placeholders(paths.len());
+        let sql = format!("DELETE FROM files WHERE path IN ({placeholders})");
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let deleted = conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
         Ok(deleted)
+    }
+
+    /// 指定 favorite_id 配下の全 path を返す (status 不問)。
+    /// `purge_favorite_metadata` で Tantivy 側にも delete_term を投げるための列挙用。
+    pub fn list_all_paths_for_favorite(
+        &self,
+        favorite_id: Uuid,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path FROM files WHERE favorite_id = ?1")?;
+        let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// 起動時差分走査 (§7.4) で使用。favorite_id スコープ内の **status=Ok のファイルのみ**

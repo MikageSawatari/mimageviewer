@@ -105,7 +105,7 @@ pub struct StartupDiag {
     /// reconciliation に要した時間 (ms)
     pub reconciliation_ms: u64,
     /// Tantivy から delete した残留 failed 行数
-    pub pending_cleaned: usize,
+    pub failed_cleaned: usize,
     /// スピードプロファイル (io_permits 数) — 診断時に見たいので保存
     pub io_permits: usize,
 }
@@ -303,7 +303,7 @@ impl IndexerManager {
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
             startup_diag: StartupDiag {
                 reconciliation_ms,
-                pending_cleaned: report.pending_cleaned,
+                failed_cleaned: report.failed_cleaned,
                 io_permits: permits,
             },
         };
@@ -534,16 +534,37 @@ impl IndexerManager {
     }
 
     /// お気に入りの「メタ索引」チェックを OFF にした時のクリーンアップ。
-    ///
-    /// そのお気に入りの全 fts_meta 行を物理削除する。検索結果からは即座に消えるが、
-    /// Tantivy 側の doc は次回起動時の reconciliation で「SQLite に無いが Tantivy に
-    /// 残っている孤児 doc」として検出 → delete される。短時間は Tantivy 側に残るので
-    /// Ctrl+G 検索結果に出てしまう可能性があるが、それは許容範囲とする。
+    /// SQLite 行と Tantivy doc 両方を確実に消す。reconciliation は status=Failed の
+    /// 行しか走査しないので、ここで Tantivy delete_term を出さないと孤児 doc が
+    /// 残り続けてしまう。
     ///
     /// 呼び出し順序: **必ず `sync_with_favorites` より前に呼ぶ** こと。先に supervisor
     /// を drop すると writer が別スレッドに移ってしまうので、こちらの SQL DELETE 中に
     /// supervisor 側 ingest が走って race になる可能性がある (実害は限定的だが綺麗でない)。
     pub fn purge_favorite_metadata(&self, favorite_id: Uuid) -> usize {
+        use crate::fts_writer_dispatcher::WriterPriority;
+        let paths = match self.meta_db.list_all_paths_for_favorite(favorite_id) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::logger::log(format!(
+                    "IndexerManager: purge_favorite_metadata({favorite_id}) list failed: {e}"
+                ));
+                return 0;
+            }
+        };
+        if !paths.is_empty() {
+            if let Err(e) = self.writer.batch(
+                vec![],
+                paths.clone(),
+                true,
+                true,
+                WriterPriority::Background,
+            ) {
+                crate::logger::log(format!(
+                    "IndexerManager: purge_favorite_metadata({favorite_id}) tantivy batch failed: {e}"
+                ));
+            }
+        }
         match self.meta_db.delete_all_for_favorite(favorite_id) {
             Ok(n) => {
                 crate::logger::log(format!(
@@ -553,7 +574,7 @@ impl IndexerManager {
             }
             Err(e) => {
                 crate::logger::log(format!(
-                    "IndexerManager: purge_favorite_metadata({favorite_id}) failed: {e}"
+                    "IndexerManager: purge_favorite_metadata({favorite_id}) sqlite failed: {e}"
                 ));
                 0
             }
@@ -652,17 +673,14 @@ fn spawn_reconciliation(
 
 /// dispatcher 経由 reconciliation。delete + commit を 1 つの Batch で送る。
 /// 起動直後で他ジョブはほぼ無いので Background 優先度でも即座に処理される。
+/// Failed 行は「前回 ingest が失敗した path」なので、Tantivy 側を念のため
+/// delete してから SQLite 行も物理削除する。次回 supervisor の walker が
+/// "DB になし" として検出して再 ingest 候補に拾う。
 ///
-/// INDEX_VERSION=6 以降、status は Ok / Failed の 2 値のみ。Failed 行は
-/// 「前回 ingest が失敗した path」なので、Tantivy 側を念のため delete してから
-/// SQLite 行も物理削除する。次回 supervisor の walker が "DB になし" として
-/// 検出して再 ingest 候補に拾う。
-///
-/// **クエリ最適化** (2026-04): お気に入りごとに `list_not_ok_paths` を回すと
-/// SQLite が `idx_files_fav_kind` を選んでお気に入り配下の全行 (実測 65 万行で
-/// 1.1 秒) を post-filter する。代わりに `list_not_ok_paths_for_favorites` で
-/// 1 クエリ化すると部分インデックス `idx_files_status` (status != 0 の行のみ)
-/// が効いて 17ms 程度に収まる。
+/// `list_not_ok_paths` をお気に入りごとに回すと `idx_files_fav_kind` で
+/// post-filter 化されてお気に入り配下の全行 (実測 65 万行で 1.1 秒) を読む。
+/// `list_not_ok_paths_for_favorites` の 1 クエリ化で部分インデックス
+/// `idx_files_status` (status != 0) が効き 17ms 程度に収まる。
 fn run_reconciliation_via_dispatcher(
     meta_db: &FtsMetaDb,
     fts: &FtsIndex,
@@ -684,7 +702,7 @@ fn run_reconciliation_via_dispatcher(
         if let Err(e) = meta_db.delete_paths(&deletes) {
             crate::logger::log(format!("reconciliation: delete_paths failed: {e}"));
         }
-        report.pending_cleaned = deletes.len();
+        report.failed_cleaned = deletes.len();
     }
     let _ = fts;
     writer
@@ -692,7 +710,7 @@ fn run_reconciliation_via_dispatcher(
         .map_err(|e| format!("reconciliation batch: {e}"))?;
     crate::logger::log(format!(
         "reconciliation done: failed cleaned = {}",
-        report.pending_cleaned
+        report.failed_cleaned
     ));
     Ok(report)
 }
@@ -723,20 +741,20 @@ fn run_reconciliation(
                     "reconciliation: delete_paths {path} failed: {e}"
                 ));
             }
-            report.pending_cleaned += 1;
+            report.failed_cleaned += 1;
         }
     }
     writer.commit().map_err(|e| format!("writer.commit: {e}"))?;
     crate::logger::log(format!(
         "reconciliation done: failed cleaned = {}",
-        report.pending_cleaned
+        report.failed_cleaned
     ));
     Ok(report)
 }
 
 #[derive(Default, Debug, Clone)]
 struct ReconciliationReport {
-    pending_cleaned: usize,
+    failed_cleaned: usize,
 }
 
 // -----------------------------------------------------------------------
@@ -807,7 +825,7 @@ mod tests {
         let mut rw = fts.writer().unwrap();
         let r = run_reconciliation(&meta, &fts, &mut rw, &[fav.clone()]).unwrap();
         drop(rw);
-        assert_eq!(r.pending_cleaned, 1);
+        assert_eq!(r.failed_cleaned, 1);
 
         assert!(meta.get("c:/a/1.jpg").unwrap().is_none());
 
@@ -844,7 +862,7 @@ mod tests {
         let r = run_reconciliation(&meta, &fts, &mut rw, &[fav]).unwrap();
         drop(rw);
         assert_eq!(
-            r.pending_cleaned, 0,
+            r.failed_cleaned, 0,
             "OFF の favorite は reconciliation 対象外"
         );
         assert!(meta.get("c:/a/1.jpg").unwrap().is_some());

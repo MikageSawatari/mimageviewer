@@ -1,4 +1,4 @@
-//! Ctrl+G グローバルメタ検索の streaming クエリワーカー (INDEX_VERSION=6)。
+//! Ctrl+G グローバルメタ検索の streaming クエリワーカー。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -11,13 +11,10 @@
 //!    ズレないようにする)
 //! 5. `TopDocs::with_limit(PAGE_SIZE).and_offset(offset)` でページング取得
 //! 6. 各ページで `fts_index::doc_text_for_target` で同じ Tantivy snapshot から
-//!    STORED 原文を取り出し、`search_query::matches` で phrase / NOT / AND を最終判定
+//!    STORED 原文を取り出し、`search_query::matches_with_mode` で phrase / NOT /
+//!    AND/OR を最終判定
 //! 7. post-filter 通過した結果を `SearchStreamEvent::Batch` で streaming 送信
 //! 8. HARD_MAX 到達 / 候補使い切り / cancel のどれかで終了
-//!
-//! INDEX_VERSION=6 から fts_meta.db への post-filter SELECT を廃止 (二段整合性
-//! プロトコル簡略化に伴う)。削除直後の短い窓で削除済みファイルが結果に出ることが
-//! あるが、サムネイル読み込み失敗で気付ける範囲。
 //!
 //! ## UI との接続
 //!
@@ -196,9 +193,9 @@ pub fn run(
         }
         scanned += page.len();
 
-        // 5b. post-filter (token matching のみ — INDEX_VERSION=6 で SQLite 参照は廃止)。
-        // 削除直後の短い窓 (Tantivy delete_term 投入 → 次回 commit) では削除済み path が
-        // 結果に混じることがあるが、サムネイル読み込み失敗で気付ける前提。
+        // 5b. post-filter (token matching のみ)。削除直後の短い窓では Tantivy delete_term
+        // 投入 → 次回 commit までの間、削除済み path が結果に混じる。サムネイル読み込み
+        // 失敗で気付ける前提で許容する。
         let mut batch = Vec::new();
         let mut inner_truncated = false;
         let mut inner_cancelled = false;
@@ -387,7 +384,6 @@ mod tests {
         )
         .unwrap();
         w.commit().unwrap();
-        let _ = key;
         fts.reload_reader().unwrap();
     }
 
@@ -643,7 +639,6 @@ mod tests {
             .unwrap();
             w.commit().unwrap();
         }
-        let _ = key;
         fts.reload_reader().unwrap();
 
         // Codex P2 回帰: 旧実装は #a を ASCII 2 文字として TooShort 拒否していた
