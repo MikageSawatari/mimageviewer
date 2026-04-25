@@ -813,6 +813,9 @@ impl App {
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
         self.install_new_items(items, image_metas);
+        // install_new_items は既定で false に倒すので、合成ビューであることを上書き。
+        // rating 変更時の rebuild_items_from_global_search 判定で参照される (Codex P2)。
+        self.items_are_global_search_view = true;
         self.selected = None;
         // idx ベース状態 + キュー排水 (requested / pending_finalize / texture_backlog /
         // keep_* / rotation / rating / adjustment_cache / thumb_pixels / ai_* / fs_* /
@@ -1238,10 +1241,11 @@ impl App {
                 let parent_pb = parent.to_path_buf();
                 // container_root 外へは出さない (出るなら Aggregated に戻る)
                 if parent_pb.starts_with(&container_root) {
-                    // 上の階層へ移動するだけでも、★コンテナを開いていた場合は
-                    // 「本から外へ」出る方向なので suppression 復元を試みる
-                    // (Codex High 指摘: load_folder を経由しない経路で leak するのを防ぐ)。
-                    self.restore_rating_filter_suppression();
+                    // suppression anchor (= 開いたコンテナ) の subtree 内に
+                    // 留まっているので、★一時解除を維持する (Codex P2)。
+                    // 「本の中で上の階層へ戻った」だけで未評価の中身が再非表示に
+                    // なると挙動が一貫しない。完全に外へ出る (= drill_back_to_aggregated)
+                    // 経路でだけ復元する。
                     // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
                     self.global_search.restore_select_path = Some(current_path.clone());
                     self.global_search.view = GlobalSearchView::DrilledInto {

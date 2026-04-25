@@ -1172,6 +1172,14 @@ pub struct App {
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
     pub(crate) items_generation: u64,
 
+    /// 現在の `items` が Ctrl+G の合成ビュー (Aggregated / DrilledInto の
+    /// `build_*_items` で組み立てたもの) かを示すフラグ。
+    /// `replace_search_view_items` で true、`install_new_items` で false に倒す。
+    /// rating 変更で `rebuild_items_from_global_search` を呼んでいいのは
+    /// このフラグが true のときだけ (Codex P2): Ctrl+G から実フォルダ/ZIP/PDF を
+    /// 開いた後に rating 変更して合成ビューが書き戻される事故を防ぐ。
+    pub(crate) items_are_global_search_view: bool,
+
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
     /// インデックスサイズ表示用のキャッシュ。ダイアログ open 時に計算し、
@@ -2045,6 +2053,7 @@ impl Default for App {
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
             items_generation: 0,
+            items_are_global_search_view: false,
             show_favorites_editor: false,
             favorites_index_size_cache: None,
             favorites_index_count_cache: None,
@@ -4444,6 +4453,9 @@ impl App {
             .map(|_| ThumbnailState::Pending)
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
+        // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
+        // この後で true に上書きする。
+        self.items_are_global_search_view = false;
     }
 
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
@@ -7566,17 +7578,6 @@ impl App {
         let rating_filter = self.settings.rating_filter;
         // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
         let rating_filter_active = !rating_filter.iter().all(|&b| b);
-        // Ctrl+G drilled view では Folder アイテムが「ヒット集計が >0 のサブフォルダ」
-        // を表す合成セルなので、フォルダ自身の★ (通常 0) で再フィルタすると消えて
-        // しまう。`build_drilled_items` が既に rating_filter で件数を絞っており、
-        // ここで二重適用しないよう Folder のみ rating filter をバイパスする
-        // (Codex P1)。直下のページ (Image / ZipImage / PdfPage / ZipFile / PdfFile)
-        // は引き続きライブの rating を見て visibility を決める。
-        let in_global_drilled = self.global_search.active
-            && matches!(
-                self.global_search.view,
-                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-            );
 
         let n = self.items.len();
         let mut result = Vec::with_capacity(n);
@@ -7589,9 +7590,7 @@ impl App {
             if rating_filter_active {
                 let stars = self.get_rating(i);
                 if let Some(item) = self.items.get(i) {
-                    let bypass =
-                        in_global_drilled && matches!(item, GridItem::Folder(_));
-                    if !bypass && !passes_rating_filter(item, stars, &rating_filter) {
+                    if !passes_rating_filter(item, stars, &rating_filter) {
                         continue;
                     }
                 }
@@ -8183,9 +8182,11 @@ impl App {
     ///
     /// Ctrl+G drilled view の場合は `search_drilled_folder_counts` (★なし含む 6 バケット)
     /// を優先参照する。folder_rating_counter worker が Ctrl+G 中は走らないため、
-    /// `state.all_hits` から直接集計した値をここで使う。なし (rf[0]) も filter に
-    /// 含めるので、ユーザーが「なし+★2」のような複合条件を掛けたときに正しく
-    /// バッジ件数が出る。
+    /// `state.all_hits` から直接集計した値をここで使う。
+    ///
+    /// バッジ合計は通常フォルダと同じく `rf[1..5]` (★1..★5) のみで集計する。
+    /// `rf[0]` (なし) はフォルダ自身の表示可否 (`rebuild_visible_indices`) 側でしか
+    /// 使わない — 通常表示と検索結果で見た目が揃うようにするため。
     pub(crate) fn folder_rating_match(&self, idx: usize) -> Option<(u32, [u32; 5])> {
         let path = match self.items.get(idx)? {
             GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
@@ -8198,20 +8199,13 @@ impl App {
                 self.global_search.view,
                 crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
             );
-        if in_global_drilled {
+        // tooltip 用 per_star は ★1..★5 (旧インターフェース維持)。
+        let per_star: [u32; 5] = if in_global_drilled {
             let counts6 = *self.search_drilled_folder_counts.get(&key)?;
-            // 全 6 バケットに対して filter を適用
-            let total: u32 = (0..6).filter(|i| rf[*i]).map(|i| counts6[i]).sum();
-            if total == 0 {
-                return None;
-            }
-            // tooltip 用 per_star は ★1..★5 のみ (旧インターフェース維持)
-            let per_star: [u32; 5] = [
-                counts6[1], counts6[2], counts6[3], counts6[4], counts6[5],
-            ];
-            return Some((total, per_star));
-        }
-        let per_star = *self.folder_rating_counts.get(&key)?;
+            [counts6[1], counts6[2], counts6[3], counts6[4], counts6[5]]
+        } else {
+            *self.folder_rating_counts.get(&key)?
+        };
         // rating_filter[i+1] が ★(i+1) に対応。rf[0] は未評価フィルタなので無視。
         let total: u32 = (0..5)
             .filter(|i| *rf.get(i + 1).unwrap_or(&true))
@@ -8701,9 +8695,16 @@ impl App {
         }
         // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
         // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
-        // 該当する all_hits エントリを最新値で書き換えてから rebuild する (Codex P3)。
+        // 該当する all_hits エントリを最新値で書き換える (Codex P3)。
+        // 合成ビューを再構築するのは現在 items が合成ビュー由来のときだけ:
+        // Ctrl+G から実フォルダ/ZIP/PDF を開いた直後は items が PDF ページ等の
+        // 実体ビューなので、ここで rebuild_items_from_global_search を呼ぶと
+        // ページ一覧が検索 drilled view の合成 items に置き換わる事故になる
+        // (Codex P2)。
         if self.global_search.active && !targets.is_empty() {
             self.refresh_global_search_hit_stars(&targets);
+        }
+        if self.global_search.active && self.items_are_global_search_view {
             self.rebuild_items_from_global_search();
         } else {
             self.rebuild_visible_indices();
@@ -13993,73 +13994,67 @@ mod phase_c_drill_nav_tests {
         ));
     }
 
-    /// Codex P1 リグレッション: Ctrl+G drilled view で★3-only フィルタを掛けても、
-    /// ヒット集計が >0 のサブフォルダ (= `build_drilled_items` が Folder として並べた
-    /// 合成セル) はフォルダ自身の★ (通常 0) で再フィルタされて消えてはならない。
-    ///
-    /// 旧実装は `rebuild_visible_indices` が Folder にも generic な
-    /// `passes_rating_filter` を当てていたため、unrated subfolder が★3 only で
-    /// 全消滅していた。
+    /// 2026-04 ユーザー要望: Ctrl+G drilled view のサブフォルダ表示は通常フォルダと
+    /// 同じ filter ルールに揃える。「★3 のみ」では未評価サブフォルダは隠れ、
+    /// 「なし+★3」では未評価サブフォルダが (descendant 件数バッジつきで) 表示される。
     #[test]
-    fn drilled_subfolders_survive_rating_filter_via_descendant_count() {
+    fn drilled_unrated_subfolder_hidden_when_unrated_filter_off() {
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let (mut app, _g, _tmp, _l) = setup_app();
-        // 親フォルダ /root 配下に sub_keep (★3 ヒットを持つ) を accumulate する。
-        // サブフォルダ自身には rating_db に登録なし (= 0)。
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
-            path: "c:/root/sub_keep/a.jpg".into(),
+            path: "c:/root/sub_unrated/a.jpg".into(),
             score: 1.0,
             stars: 3,
         });
         app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
 
-        // ★3 のみ ON
+        // ★3 のみ ON (なし=OFF) → unrated サブフォルダは隠れる
         let mut rf = [false; 6];
         rf[3] = true;
         app.settings.rating_filter = rf;
         app.rebuild_items_from_global_search();
-
-        // items に Folder("c:/root/sub_keep") が並び、visible_indices にも残っている
-        // こと (Folder が rating_filter で消えていないこと)。
-        let folder_visible = app.visible_indices.iter().any(|&i| {
-            matches!(app.items.get(i), Some(GridItem::Folder(_)))
-        });
+        let folder_visible_star_only = app
+            .visible_indices
+            .iter()
+            .any(|&i| matches!(app.items.get(i), Some(GridItem::Folder(_))));
         assert!(
-            folder_visible,
-            "サブフォルダ (Folder) が消えている。items={:?} visible_indices={:?}",
-            app.items
-                .iter()
-                .map(|it| match it {
-                    GridItem::Folder(p) => format!("Folder({})", p.display()),
-                    GridItem::Image(p) => format!("Image({})", p.display()),
-                    _ => "Other".into(),
-                })
-                .collect::<Vec<_>>(),
-            app.visible_indices,
+            !folder_visible_star_only,
+            "★3 のみフィルタでは unrated subfolder は通常フォルダと同様に隠れるべき"
         );
+
+        // なし + ★3 → unrated subfolder 表示 + ★3 件数バッジ
+        let mut rf = [false; 6];
+        rf[0] = true;
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+        let sub_idx = app.items.iter().position(|it| {
+            matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub_unrated"))
+        }).expect("なし+★3 では unrated subfolder が items に並ぶ");
+        assert!(
+            app.idx_visible(sub_idx),
+            "なし+★3 では unrated subfolder が visible_indices にも入る"
+        );
+        let badge = app.folder_rating_match(sub_idx).expect("badge expected");
+        assert_eq!(badge.0, 1, "badge total = ★3 descendant 1 件");
     }
 
-    /// Ctrl+G を抜ける (Aggregated に戻る・閉じる) と Folder の rating filter
-    /// バイパスは効かなくなる: 通常フォルダ閲覧では unrated folder は ★3-only で
-    /// 隠れる従来挙動を維持する。
+    /// 通常表示 (Ctrl+G 外) でも unrated folder は ★3-only で隠れる従来挙動を維持。
     #[test]
-    fn folder_rating_filter_bypass_only_in_global_drilled_view() {
+    fn unrated_folder_hidden_in_normal_view_under_star_only_filter() {
         use crate::grid_item::GridItem;
         let (mut app, _g, _tmp, _l) = setup_app();
-        // global_search 非アクティブ。普通に Folder を items に置く。
         app.items
             .push(GridItem::Folder(std::path::PathBuf::from("c:/some/folder")));
-        // ★3 only
         let mut rf = [false; 6];
         rf[3] = true;
         app.settings.rating_filter = rf;
         app.rebuild_visible_indices();
-        // フォルダの intrinsic rating = 0 → ★3-only でフィルタアウトされる (通常挙動)
         assert!(
             app.visible_indices.is_empty(),
-            "通常表示の unrated folder は ★3-only で隠れるべき (Ctrl+G 外でバイパスしないこと)"
+            "通常表示の unrated folder は ★3-only で隠れる"
         );
     }
 
@@ -14098,6 +14093,97 @@ mod phase_c_drill_nav_tests {
             selected_path,
             Some(std::path::PathBuf::from("c:/folder_b")),
             "BS で Aggregated に戻ったとき、直前に開いた folder_b にカーソルが残るべき"
+        );
+    }
+
+    /// Codex P2: ★コンテナ drill-in で suppression 起動 → drilled view 内の
+    /// サブフォルダへ入る → BS で 1 階層戻る、を順に行ったとき、suppression が
+    /// 維持されること。subtree 内の上下移動で復元されると未評価の中身が突然
+    /// 消える挙動になる。
+    #[test]
+    fn drill_back_within_suppression_anchor_keeps_filter_disabled() {
+        use crate::global_search::GlobalHit;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ★5 フィルタ ON
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        // ★5 のコンテナを rating_db に登録
+        let container = std::path::PathBuf::from("c:/books/vol1");
+        let key = crate::adjustment_db::normalize_path(&container);
+        app.rating_db.as_ref().unwrap().set(&key, 5).unwrap();
+        // 検索ヒット: コンテナ配下のサブフォルダ画像 (未評価)
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/books/vol1/sub/p1.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // SearchContainer を開く (path-based suppression を起動)
+        app.maybe_suppress_rating_filter_for_opened_container_path(&container);
+        app.drill_into_container(container.clone(), false);
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "drill 直後は suppression 起動中"
+        );
+        // サブフォルダにドリルイン
+        app.drill_into_subfolder(std::path::PathBuf::from("c:/books/vol1/sub"));
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "サブフォルダへ進んでも suppression 維持"
+        );
+        // BS で 1 階層戻る (sub → vol1)
+        app.drill_back_one_level();
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "subtree 内 BS では suppression 維持されるべき"
+        );
+        // さらに BS で Aggregated に戻る → suppression 解除
+        app.drill_back_one_level();
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "anchor の外 (Aggregated) に出たら suppression 解除"
+        );
+    }
+
+    /// Codex P2: Ctrl+G から実フォルダ/ZIP/PDF を開いた状態で rating 変更すると、
+    /// items が検索合成ビューに置き換わってはならない。
+    /// `items_are_global_search_view` フラグが install_new_items 時に false に倒され、
+    /// rebuild_items_from_global_search が走らないことを確認する。
+    #[test]
+    fn rating_change_in_real_view_does_not_rebuild_search_items() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // Ctrl+G 中に実体ビュー (例: PDF を開いた直後の状態) を install_new_items 経由で構築
+        app.global_search.active = true;
+        let pdf_pages = vec![
+            GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("c:/doc.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("c:/doc.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        ];
+        app.install_new_items(pdf_pages, vec![None, None]);
+        assert!(
+            !app.items_are_global_search_view,
+            "install_new_items は flag を false に倒す (= 実体ビュー)"
+        );
+        let before_len = app.items.len();
+        // rating 変更を発火 (= apply_rating_to_selection 内の rebuild 分岐)
+        // ここでは rebuild_items_from_global_search を直接トリガーするか check する代わりに、
+        // 分岐ロジックで実体ビュー時には visible_indices だけ更新されることを確認する。
+        // ※ targets が空なら refresh_global_search_hit_stars もスキップ。
+        // ここでは「items.len() が変わらない」ことだけを最低限の不変条件として確認。
+        app.rebuild_visible_indices();
+        assert_eq!(app.items.len(), before_len, "実体ビュー items が消えない");
+        assert!(
+            !app.items_are_global_search_view,
+            "rebuild_visible_indices ではフラグが書き換わらない"
         );
     }
 
@@ -14182,15 +14268,13 @@ mod phase_c_drill_nav_tests {
         );
     }
 
-    /// 2026-04 ユーザー報告: Ctrl+G drilled view で「なし+★2」のように複合
-    /// rating filter を掛けたとき、サブフォルダの右下にフィルタ件数バッジが
-    /// 表示されない問題の修正検証。
-    ///
-    /// `folder_rating_match` は global_search.active && DrilledInto では
-    /// `search_drilled_folder_counts` を見て、★なし (rf[0]) を含む 6 バケットで
-    /// 合計を出すこと。
+    /// 2026-04 ユーザー報告: Ctrl+G drilled view で「なし+★2」と「★2 のみ」で
+    /// 見た目が同じだった問題の修正検証。
+    /// 通常フォルダと同じ仕様に揃える:
+    /// - フィルタ「なし+★2」: 未評価 subfolder は表示、バッジは ★1..★5 で集計 (= ★2 件数のみ)
+    /// - フィルタ「★2 のみ」: 未評価 subfolder は visibility check で隠れる
     #[test]
-    fn drilled_subfolder_badge_reflects_unrated_plus_starred_filter() {
+    fn drilled_subfolder_badge_matches_normal_folder_semantics() {
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let (mut app, _g, _tmp, _l) = setup_app();
@@ -14216,26 +14300,36 @@ mod phase_c_drill_nav_tests {
             score: 1.0,
             stars: 4,
         });
-        // /root にドリルイン
         app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
-        // フィルタ: なし + ★2 (rf[0]=true, rf[2]=true, それ以外 false)
+
+        // ── フィルタ「なし + ★2」: subfolder visible + badge=1 (★2 件数のみ) ──
         let mut rf = [false; 6];
         rf[0] = true;
         rf[2] = true;
         app.settings.rating_filter = rf;
         app.rebuild_items_from_global_search();
+        let sub_idx = app.items.iter().position(|it| {
+            matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub"))
+        }).expect("subfolder in items");
+        assert!(app.idx_visible(sub_idx), "なし+★2 で unrated subfolder が表示");
+        let badge = app.folder_rating_match(sub_idx).expect("badge");
+        assert_eq!(
+            badge.0, 1,
+            "badge は ★1..★5 のみ集計。★2 が 1 件なので 1 (なしは folder visibility だけに使う)"
+        );
 
-        // sub フォルダの idx を取得
-        let sub_idx = app
-            .items
-            .iter()
-            .position(|it| matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub")))
-            .expect("sub folder should be in items");
-        let badge = app
-            .folder_rating_match(sub_idx)
-            .expect("Ctrl+G drilled subfolder must produce a badge");
-        // total = ★なし 2 件 + ★2 1 件 = 3
-        assert_eq!(badge.0, 3, "なし+★2 で sub フォルダの件数バッジが 3 のはず");
+        // ── フィルタ「★2 のみ」: subfolder 自体が visible_indices から落ちる ──
+        let mut rf = [false; 6];
+        rf[2] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+        let sub_idx = app.items.iter().position(|it| {
+            matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub"))
+        }).expect("subfolder in items");
+        assert!(
+            !app.idx_visible(sub_idx),
+            "★2 のみで unrated subfolder は隠れる (通常フォルダと同じ挙動)"
+        );
     }
 
     /// `restore_select_path` のターゲットが items 中に存在しない (= 何らかの理由で

@@ -775,10 +775,12 @@ impl App {
             // (ユーザー意思を尊重して、BS しても以前の filter は復元しない)。
             self.drop_rating_filter_suppression_on_user_edit();
             self.settings.save();
-            // Ctrl+G 中はサブフォルダバッジ件数が build_drilled_items 側で
-            // rating_filter を使って再計算されるので items 自体を作り直す
-            // (内部で rebuild_visible_indices も走り、直下ファイル側も反映される)。
-            if self.global_search.active {
+            // Ctrl+G 合成ビュー (drilled / aggregated) ではバッジ件数が
+            // build_drilled_items 側で rating_filter を使って再計算されるので
+            // items 自体を作り直す。実体ビュー (Ctrl+G から開いた PDF/ZIP/Folder)
+            // では合成 items に置き換えてしまわないよう visible_indices だけ
+            // 再計算する (Codex P2)。
+            if self.global_search.active && self.items_are_global_search_view {
                 self.rebuild_items_from_global_search();
             } else {
                 self.rebuild_visible_indices();
