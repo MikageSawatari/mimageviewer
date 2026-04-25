@@ -80,6 +80,14 @@ pub struct GlobalHit {
     pub path: String,
     /// Tantivy が吐いたスコア (UI でのソートや表示に使える)
     pub score: f32,
+    /// 0..=5。worker は常に 0 を入れ、UI 側 (`poll_global_search_events`) が
+    /// rating DB から bulk lookup して書き込む。drilled view のサブフォルダバッジ
+    /// 件数を rating_filter で絞り込むのに使う。
+    ///
+    /// **スナップショット**: ヒット受信時点の値で固定する。Ctrl+G セッション中に
+    /// ユーザーが同じ画像のレーティングを変えてもこのフィールドは更新されない
+    /// (バッジ件数が次のクエリ実行までは古いまま。実害は小さいので許容)。
+    pub stars: u8,
 }
 
 /// Ctrl+G 検索ワーカーに渡すフィルタ (§19 ドロップダウン UI と対応)。
@@ -214,7 +222,11 @@ pub fn run(
                 Err(_) => continue,
             };
             if search_query::matches_with_mode(&tokens, &text, scope.mode) {
-                batch.push(GlobalHit { path, score });
+                batch.push(GlobalHit {
+                    path,
+                    score,
+                    stars: 0,
+                });
                 valid += 1;
                 if valid >= HARD_MAX {
                     inner_truncated = true;

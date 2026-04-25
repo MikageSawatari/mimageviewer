@@ -301,6 +301,17 @@ pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
+/// ZIP/PDF コンテナ内のページ単位キーを構築する。
+///
+/// `<normalize(container_path)>::<lower(entry_or_page_label)>` という形は
+/// `App::page_path_key` (ZipImage / PdfPage 分岐) と `global_search_ui::hit_rating_key`
+/// の両方で同じ rating_db / adjustment_db キーを生み出す必要があるため、
+/// フォーマットドリフト (= 書き込み側と読み出し側でキーがずれて rating が消える)
+/// を防ぐ目的で 1 箇所に集約している。
+pub fn zip_entry_key(container_path: &Path, entry: &str) -> String {
+    format!("{}::{}", normalize_path(container_path), entry.to_lowercase())
+}
+
 /// SQL `LIKE` の特殊文字 (`\`, `%`, `_`, `[`) を `\` でエスケープする。
 /// 呼び出し側は `ESCAPE '\'` 指定の prepared statement で使う。
 /// 末尾の `%` は呼び出し側で付与する想定 (prefix 一致なのか完全一致なのかは用途依存)。

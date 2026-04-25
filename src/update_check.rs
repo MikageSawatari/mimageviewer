@@ -50,7 +50,12 @@ pub struct UpdateInfo {
 ///
 /// `current_version` は `env!("CARGO_PKG_VERSION")` の値 (例: `"0.8.1"`) を渡す。
 /// 内部で semver parse して比較する。
-pub fn spawn_check(current_version: &str) -> mpsc::Receiver<Result<UpdateInfo, String>> {
+///
+/// スレッド起動自体に失敗した場合は `Err` を返す。manual チェックの呼び出し側は
+/// その場でエラー UI を出せるようにするため、silent fail にしない。
+pub fn spawn_check(
+    current_version: &str,
+) -> Result<mpsc::Receiver<Result<UpdateInfo, String>>, String> {
     let (tx, rx) = mpsc::channel();
     let current = current_version.to_string();
     std::thread::Builder::new()
@@ -59,8 +64,8 @@ pub fn spawn_check(current_version: &str) -> mpsc::Receiver<Result<UpdateInfo, S
             let result = perform_check(&current);
             let _ = tx.send(result);
         })
-        .ok();
-    rx
+        .map_err(|e| format!("spawn update-check thread: {e}"))?;
+    Ok(rx)
 }
 
 fn perform_check(current_version: &str) -> Result<UpdateInfo, String> {
@@ -74,6 +79,19 @@ fn perform_check(current_version: &str) -> Result<UpdateInfo, String> {
         .call()
         .map_err(|e| format!("http: {e}"))?;
     let json: serde_json::Value = resp.into_json().map_err(|e| format!("json: {e}"))?;
+    parse_release_json(&current, &json)
+}
+
+/// GitHub Releases API のレスポンス JSON から `UpdateInfo` を作る純関数。
+/// ネットワーク I/O から切り離しているのは単体テスト容易性のため。
+///
+/// - `tag_name` 必須 (欠落で Err)。先頭 `v` は剥がして semver parse
+/// - `html_url` 欠落時はリリース一覧ページへフォールバック
+/// - `body` は 8KB で打ち切り (UTF-8 char 境界で安全に切る)
+fn parse_release_json(
+    current: &semver::Version,
+    json: &serde_json::Value,
+) -> Result<UpdateInfo, String> {
     let tag = json
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -108,7 +126,7 @@ fn perform_check(current_version: &str) -> Result<UpdateInfo, String> {
     let stripped = tag.strip_prefix('v').unwrap_or(&tag);
     let latest = semver::Version::parse(stripped)
         .map_err(|e| format!("tag '{tag}' parse: {e}"))?;
-    let is_newer = latest > current;
+    let is_newer = latest > *current;
     Ok(UpdateInfo {
         latest_tag: tag,
         latest_version: latest,
@@ -126,6 +144,7 @@ pub fn releases_page_url() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn current_version_parses() {
@@ -150,5 +169,117 @@ mod tests {
         let tag = "v1.2.3";
         let stripped = tag.strip_prefix('v').unwrap_or(tag);
         semver::Version::parse(stripped).unwrap();
+    }
+
+    fn cur(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn parse_v_prefix_newer() {
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({
+                "tag_name": "v0.8.2",
+                "html_url": "https://example.com/r/v0.8.2",
+                "body": "changelog",
+            }),
+        )
+        .unwrap();
+        assert_eq!(info.latest_tag, "v0.8.2");
+        assert_eq!(info.latest_version, cur("0.8.2"));
+        assert_eq!(info.release_url, "https://example.com/r/v0.8.2");
+        assert_eq!(info.body, "changelog");
+        assert!(info.is_newer);
+    }
+
+    #[test]
+    fn parse_no_v_prefix() {
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "0.8.2", "html_url": "x", "body": "" }),
+        )
+        .unwrap();
+        assert_eq!(info.latest_tag, "0.8.2");
+        assert!(info.is_newer);
+    }
+
+    #[test]
+    fn parse_same_version_not_newer() {
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "v0.8.1", "html_url": "x", "body": "" }),
+        )
+        .unwrap();
+        assert!(!info.is_newer);
+    }
+
+    #[test]
+    fn parse_older_version_not_newer() {
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "v0.7.9", "html_url": "x", "body": "" }),
+        )
+        .unwrap();
+        assert!(!info.is_newer);
+    }
+
+    #[test]
+    fn parse_missing_tag_name_errs() {
+        let err = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "html_url": "x", "body": "" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("tag_name"));
+    }
+
+    #[test]
+    fn parse_invalid_tag_errs() {
+        let err = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "not-a-version", "html_url": "x", "body": "" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("not-a-version"));
+    }
+
+    #[test]
+    fn parse_missing_html_url_falls_back() {
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "v0.8.2", "body": "" }),
+        )
+        .unwrap();
+        assert_eq!(info.release_url, RELEASES_PAGE_URL);
+    }
+
+    #[test]
+    fn parse_long_body_truncated_with_ellipsis() {
+        // 9KB の ASCII 本文を投げて 8KB + 省略マーカーに丸まることを確認
+        let long = "a".repeat(9 * 1024);
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "v0.8.2", "html_url": "x", "body": long }),
+        )
+        .unwrap();
+        assert!(info.body.len() < 9 * 1024);
+        assert!(info.body.ends_with("(以下省略、リリースページ参照)"));
+    }
+
+    #[test]
+    fn parse_long_body_utf8_safe_truncation() {
+        // 4 バイト UTF-8 (絵文字) を 8KB 境界に挟んでも panic しないこと
+        let mut s = String::new();
+        while s.len() < 9 * 1024 {
+            s.push_str("あ"); // 3 バイト UTF-8
+        }
+        let info = parse_release_json(
+            &cur("0.8.1"),
+            &json!({ "tag_name": "v0.8.2", "html_url": "x", "body": s }),
+        )
+        .unwrap();
+        // truncate せずに valid UTF-8 であること (str 化できれば OK)
+        assert!(info.body.is_char_boundary(info.body.len()));
     }
 }

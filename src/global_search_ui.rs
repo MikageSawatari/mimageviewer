@@ -187,6 +187,11 @@ pub struct GlobalSearchState {
     pub filters: GlobalSearchFilters,
     /// アグリゲートビューのコンテナソート順 (v0.8.1)。既定は HitCount。
     pub sort_mode: ContainerSortMode,
+    /// BS で戻ったとき直前に開いていたフォルダ/コンテナを再選択するためのヒント。
+    /// `App::select_after_load` と用途は近いが、あちらは `load_folder` 経由で
+    /// ファイル名 (String) で照合するのに対し、Ctrl+G drill-back は `load_folder`
+    /// を経由せず full path 同一性で復元する必要があるため別フィールド。
+    pub restore_select_path: Option<PathBuf>,
 }
 
 impl Default for GlobalSearchState {
@@ -211,6 +216,7 @@ impl Default for GlobalSearchState {
             saved_folder: None,
             filters: GlobalSearchFilters::default(),
             sort_mode: ContainerSortMode::HitCount,
+            restore_select_path: None,
         }
     }
 }
@@ -365,6 +371,81 @@ fn parent_container(hit_path: &str) -> (PathBuf, SearchContainerKind) {
     }
 }
 
+/// `GlobalHit.path` を `RatingDb` のキー (= `App::rating_path_key` 互換) に変換する。
+///
+/// - ZIP エントリ (`<zip>\x1F<entry>`) → `<normalize(zip)>::<lower(entry)>`
+///   (= `page_path_key` の ZipImage 形式)
+/// - 通常ファイル / PDF / フォルダ → `normalize(path)`
+///   (= `page_path_key` の Image 形式 / コンテナ rating_path_key と同じ)
+///
+/// PDF はファイル単位で索引されているのでコンテナ★を引く。
+/// ZIP 内画像はページ★を引く。
+pub(crate) fn hit_rating_key(hit_path: &str) -> String {
+    if let Some((zip_part, entry)) = split_zip_hit_path(hit_path) {
+        crate::adjustment_db::zip_entry_key(Path::new(zip_part), entry)
+    } else {
+        crate::adjustment_db::normalize_path(Path::new(hit_path))
+    }
+}
+
+/// 単一の★値が rating_filter を通るかを判定 (画像系・コンテナ系の共通ルール)。
+///
+/// `passes_rating_filter` (app.rs) と同じく `s <= 5 && rf[s]`。
+/// 検索ヒットは「★絞り込み対象」のみ (動画 / セパレータは検索ヒットに上らない) なので
+/// `accepts_rating()` 分岐は不要。
+pub(crate) fn rating_passes_for_stars(stars: u8, rf: &[bool; 6]) -> bool {
+    let s = stars as usize;
+    s <= 5 && rf[s]
+}
+
+/// Ctrl+G drilled view: `current_path` の直下サブフォルダごとに、配下ヒットの
+/// per-★ 件数 (★なし..★5、6 バケット) を集計する。`folder_rating_match` から
+/// 引かれて、フォルダ右下のフィルタ件数バッジに表示される。
+///
+/// rating_filter は適用しない (バッジ表示時に rating_filter を当てるため、ここでは
+/// 全 raw 件数を返す)。ZIP コンテナを drilled-in している (is_zip=true) ときは
+/// サブフォルダの概念がないので空マップを返す。
+fn compute_drilled_subfolder_counts(
+    state: &GlobalSearchState,
+    current_path: &Path,
+    is_zip: bool,
+) -> HashMap<String, [u32; 6]> {
+    if is_zip {
+        return HashMap::new();
+    }
+    let mut sub_counts: HashMap<PathBuf, [u32; 6]> = HashMap::new();
+    for h in &state.all_hits {
+        if is_zip_hit_path(&h.path) {
+            continue;
+        }
+        let hp = PathBuf::from(&h.path);
+        let Some(hp_parent) = hp.parent() else {
+            continue;
+        };
+        if !path_is_under_or_eq(hp_parent, current_path) {
+            continue;
+        }
+        // 直下のヒットはサブフォルダバッジに含めない (current_path 自身のバッジは出さない)
+        if hp_parent == current_path {
+            continue;
+        }
+        let rel = match hp_parent.strip_prefix(current_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Some(first) = rel.components().next() {
+            let child = current_path.join(first.as_os_str());
+            let bucket = h.stars.min(5) as usize;
+            sub_counts.entry(child).or_insert([0u32; 6])[bucket] += 1;
+        }
+    }
+    // App 側のキー形式 (= folder_rating_counts と同じ正規化文字列) に合わせる
+    sub_counts
+        .into_iter()
+        .map(|(p, c)| (crate::adjustment_db::normalize_path(&p), c))
+        .collect()
+}
+
 /// 指定したモードで ContainerHit をソートして返す。
 /// Newer/Older 時は `mtime` フィールドを使うので、呼び出し側は
 /// [`ensure_container_mtime_populated`] で事前に埋めておくこと。
@@ -470,18 +551,29 @@ pub(crate) fn build_drilled_items(
     state: &GlobalSearchState,
     current_path: &Path,
     is_zip: bool,
+    rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     if is_zip {
-        return build_drilled_zip_items(state, current_path);
+        return build_drilled_zip_items(state, current_path, rating_filter);
     }
     // ── 通常フォルダ配下の絞り込み ──
+    // rating_filter が全 ON なら絞り込みスキップ (高速 path)。
+    // App::rating_filter_active と同じ判定式を使う (固定 [bool; 6] へのアクセスなので
+    // 自動ベクトル化された ~1ns、ヘルパー化するメリットなし)。
+    let rf_active = !rating_filter.iter().all(|&b| b);
     let mut direct_files: Vec<PathBuf> = Vec::new();
-    // 直下子フォルダ → その配下のヒット件数
+    // 直下子フォルダ → その配下のヒット件数 (rating_filter 通過後)
     let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
 
     for h in &state.all_hits {
         if is_zip_hit_path(&h.path) {
             continue; // ZIP ヒットはスキップ
+        }
+        // rating_filter で弾く。直下ファイルもサブフォルダ件数も同じルールで絞る
+        // ことで、バッジ件数 (= ここで数える件数) と grid 表示 (= rebuild_visible_indices
+        // が同じ rating_filter で再フィルタする件数) が一致する。
+        if rf_active && !rating_passes_for_stars(h.stars, rating_filter) {
+            continue;
         }
         let hp = PathBuf::from(&h.path);
         let Some(hp_parent) = hp.parent() else {
@@ -548,17 +640,24 @@ pub(crate) fn build_drilled_items(
 fn build_drilled_zip_items(
     state: &GlobalSearchState,
     zip_path: &Path,
+    rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let zip_key = crate::search_index_db::normalize_path(zip_path);
+    let rf_active = !rating_filter.iter().all(|&b| b);
     // sync I/O 除去 (フォルダ版と同じ理由)。
     let placeholder = Some((0_i64, 0_i64));
-    let mut items: Vec<GridItem> = Vec::new();
-    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
+    // 上限 = 同じ ZIP の全ヒット。pre-allocate でリアロケを抑える。
+    let cap = state.all_hits.len();
+    let mut items: Vec<GridItem> = Vec::with_capacity(cap);
+    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(cap);
     for h in &state.all_hits {
         let Some((zip_part, entry)) = split_zip_hit_path(&h.path) else {
             continue;
         };
         if zip_part != zip_key {
+            continue;
+        }
+        if rf_active && !rating_passes_for_stars(h.stars, rating_filter) {
             continue;
         }
         items.push(GridItem::ZipImage {
@@ -787,6 +886,9 @@ impl App {
         self.global_search.truncated = false;
         self.global_search.total_valid = 0;
         self.global_search.total_scanned = 0;
+        // Ctrl+G 専用のサブフォルダ件数キャッシュも破棄する。folder_rating_match が
+        // 旧データを誤って返さないように、saved_folder への load_folder より先に消す。
+        self.search_drilled_folder_counts.clear();
         // 元のフォルダに戻る
         if let Some(folder) = self.global_search.saved_folder.take() {
             self.load_folder(folder);
@@ -874,10 +976,44 @@ impl App {
         while events_processed < MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(SearchStreamEvent::Batch {
-                    hits,
+                    mut hits,
                     scanned_candidates,
                     valid_hits,
                 }) => {
+                    // drilled view のサブフォルダバッジ件数を rating_filter で
+                    // 絞り込めるよう、batch ごとに rating DB を bulk lookup して
+                    // hit.stars に詰める。1 batch = PAGE_SIZE (=500) 件で IN 句
+                    // 1 発、warm SQLite で 1-3ms 程度。
+                    // perf::event で span を取り、cold sqlite で重くなったら
+                    // analyze_perf.py で検知できるようにしておく。
+                    let did_rating_lookup = if let Some(db) = self.rating_db.as_ref() {
+                        let perf_enabled = crate::perf::is_enabled();
+                        let t0 = std::time::Instant::now();
+                        let keys: Vec<String> =
+                            hits.iter().map(|h| hit_rating_key(&h.path)).collect();
+                        let map = db.get_many(&keys);
+                        for (h, k) in hits.iter_mut().zip(keys.iter()) {
+                            if let Some(&v) = map.get(k) {
+                                h.stars = v;
+                            }
+                        }
+                        if perf_enabled {
+                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            crate::perf::event(
+                                "search",
+                                "rating_bulk_lookup",
+                                None,
+                                0,
+                                &[
+                                    ("count", serde_json::Value::from(keys.len())),
+                                    ("ms", serde_json::Value::from(ms)),
+                                ],
+                            );
+                        }
+                        !keys.is_empty()
+                    } else {
+                        false
+                    };
                     for h in &hits {
                         self.global_search.accumulate_hit(h);
                     }
@@ -887,6 +1023,12 @@ impl App {
                         changed = true;
                     }
                     events_processed += 1;
+                    // UI スレッド予算を守るため、rating bulk lookup を含む batch は
+                    // 1 フレーム 1 件に制限する (Codex P2)。8 batch 同時着 → ~24ms
+                    // を回避し、次フレームに残りを回す (request_repaint 済み)。
+                    if did_rating_lookup {
+                        break;
+                    }
                 }
                 Ok(SearchStreamEvent::Done { truncated, reason }) => {
                     self.global_search.done = true;
@@ -945,15 +1087,49 @@ impl App {
         // (Ctrl+↑↓ で呼ばれる) が Newer/Older ソートを mtime=None で走らせてしまう。
         // view に関わらず rebuild の入口で populate しておく (done 未達なら関数内で no-op)。
         ensure_container_mtime_populated(&mut self.global_search);
+        let rating_filter = self.settings.rating_filter;
         let (items, image_metas) = match self.global_search.view.clone() {
-            GlobalSearchView::Aggregated => build_aggregated_items(&mut self.global_search),
+            GlobalSearchView::Aggregated => {
+                // Aggregated ではサブフォルダのバッジ計算なし。残骸を破棄する。
+                self.search_drilled_folder_counts.clear();
+                build_aggregated_items(&mut self.global_search)
+            }
             GlobalSearchView::DrilledInto {
                 ref current_path,
                 is_zip,
                 ..
-            } => build_drilled_items(&self.global_search, current_path, is_zip),
+            } => {
+                // サブフォルダごとの per-★ 件数を all_hits から集計し直す。
+                // build_drilled_items が rating_filter で表示アイテムを絞る一方、
+                // バッジ件数表示には raw 集計が必要 (なし含む 6 バケット)。
+                self.search_drilled_folder_counts =
+                    compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip);
+                build_drilled_items(&self.global_search, current_path, is_zip, &rating_filter)
+            }
         };
         self.replace_search_view_items(items, image_metas);
+        // BS 戻りのカーソル位置復帰。target が見つからない・非表示のときは
+        // 「先頭の表示中アイテム」にフォールバックする (selected=None のままだと
+        // 次の方向キーで idx 0 に飛んでしまうため)。
+        if let Some(target) = self.global_search.restore_select_path.take() {
+            let idx_opt = self.items.iter().position(|it| match it {
+                GridItem::SearchContainer { path, .. } => path == &target,
+                GridItem::Folder(p)
+                | GridItem::Image(p)
+                | GridItem::ZipFile(p)
+                | GridItem::PdfFile(p) => p == &target,
+                GridItem::ZipImage { zip_path, .. } => zip_path == &target,
+                GridItem::PdfPage { pdf_path, .. } => pdf_path == &target,
+                _ => false,
+            });
+            let resolved = idx_opt
+                .filter(|&idx| self.idx_visible(idx))
+                .or_else(|| self.visible_indices.first().copied());
+            if let Some(idx) = resolved {
+                self.selected = Some(idx);
+                self.scroll_to_selected = true;
+            }
+        }
         self.update_global_search_address();
     }
 
@@ -1035,6 +1211,13 @@ impl App {
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
+        // 戻った先 (Aggregated) で当該 SearchContainer にカーソルを再選択する。
+        if let GlobalSearchView::DrilledInto {
+            ref container_root, ..
+        } = self.global_search.view
+        {
+            self.global_search.restore_select_path = Some(container_root.clone());
+        }
         self.global_search.view = GlobalSearchView::Aggregated;
         self.rebuild_items_from_global_search();
     }
@@ -1059,6 +1242,8 @@ impl App {
                     // 「本から外へ」出る方向なので suppression 復元を試みる
                     // (Codex High 指摘: load_folder を経由しない経路で leak するのを防ぐ)。
                     self.restore_rating_filter_suppression();
+                    // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
+                    self.global_search.restore_select_path = Some(current_path.clone());
                     self.global_search.view = GlobalSearchView::DrilledInto {
                         container_root,
                         current_path: parent_pb,
@@ -1623,14 +1808,17 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/b/1.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/b/2.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/c/1.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         assert_eq!(state.containers.len(), 2);
         let b = state
@@ -1702,6 +1890,7 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.view = GlobalSearchView::DrilledInto {
             container_root: PathBuf::from("c:/a"),
@@ -1732,14 +1921,17 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/2.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/b/x.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         // containers は 2 つに集約されているが、all_hits は 3 つ保持
         assert_eq!(state.containers.len(), 2);
@@ -1752,14 +1944,17 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/album.zip!0001.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/album.zip!0002.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/photos/x.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         let zip = state
             .containers
@@ -1780,14 +1975,17 @@ mod tests {
             GlobalHit {
                 path: "C:/root/a.jpg".into(),
                 score: 1.0,
+                stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/b.jpg".into(),
                 score: 1.0,
+                stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/deeper/c.jpg".into(),
                 score: 1.0,
+                stars: 0,
             },
         ];
         let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
@@ -1807,6 +2005,7 @@ mod tests {
         let hits = vec![GlobalHit {
             path: "C:/root/yes/found.jpg".into(),
             score: 1.0,
+            stars: 0,
         }];
         let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
         // "no" サブフォルダはヒットを持たないので列挙されない
@@ -1831,6 +2030,7 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                stars: 0,
             });
         }
         let flat = build_cross_container_nav_list(&state);
@@ -1856,14 +2056,17 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "C:/book.zip!img1.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/book.zip!img2.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/folder/a.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         let flat = build_cross_container_nav_list(&state);
         // ヒット件数降順: book.zip (2) → folder (1)
@@ -1888,9 +2091,10 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                stars: 0,
             });
         }
-        let (items, metas) = build_drilled_items(&state, Path::new("C:/root"), false);
+        let (items, metas) = build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
         assert_eq!(items.len(), metas.len());
         // 期待: Folder("C:/root/sub") + Image("C:/root/a.jpg") + Image("C:/root/b.jpg")
         let paths: Vec<_> = items
@@ -1928,9 +2132,10 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                stars: 0,
             });
         }
-        let (items, _) = build_drilled_items(&state, Path::new("C:/mix"), false);
+        let (items, _) = build_drilled_items(&state, Path::new("C:/mix"), false, &[true; 6]);
         // 期待: 名前昇順で a.pdf → b.zip → c.png → d.jpg
         let kinds: Vec<&'static str> = items
             .iter()
@@ -1967,27 +2172,29 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/year2024/jan/matches/X.png".into(),
             score: 1.0,
+            stars: 0,
         });
         // 上記以外にもヒットを入れておく (別枝が干渉しないことを確認)
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/year2024/jan/matches/Y.png".into(),
             score: 1.0,
+            stars: 0,
         });
 
         // Level 1: /root でドリル → year2024 のみ
-        let (l1, _) = build_drilled_items(&state, Path::new("C:/root"), false);
+        let (l1, _) = build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
         assert_eq!(l1.len(), 1, "level1 item count");
         assert!(matches!(&l1[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024")));
 
         // Level 2: /root/year2024 → jan のみ (feb は枝刈り)
-        let (l2, _) = build_drilled_items(&state, Path::new("C:/root/year2024"), false);
+        let (l2, _) = build_drilled_items(&state, Path::new("C:/root/year2024"), false, &[true; 6]);
         assert_eq!(l2.len(), 1, "level2 item count");
         assert!(
             matches!(&l2[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan"))
         );
 
         // Level 3: /root/year2024/jan → matches のみ
-        let (l3, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false);
+        let (l3, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false, &[true; 6]);
         assert_eq!(l3.len(), 1, "level3 item count");
         assert!(
             matches!(&l3[0],
@@ -1995,7 +2202,7 @@ mod tests {
         );
 
         // Level 4: /root/year2024/jan/matches → 画像 2 件が直下に並ぶ
-        let (l4, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan/matches"), false);
+        let (l4, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan/matches"), false, &[true; 6]);
         assert_eq!(l4.len(), 2, "level4 item count");
         for it in &l4 {
             assert!(matches!(it, GridItem::Image(_)));
@@ -2020,10 +2227,11 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                stars: 0,
             });
         }
         let (items, _) =
-            build_drilled_items(&state, Path::new("C:/archives/target.zip"), /*is_zip=*/ true);
+            build_drilled_items(&state, Path::new("C:/archives/target.zip"), /*is_zip=*/ true, &[true; 6]);
         assert_eq!(items.len(), 2, "target.zip のエントリ数");
         for it in &items {
             assert!(matches!(it, GridItem::ZipImage { .. }));
@@ -2031,6 +2239,131 @@ mod tests {
                 assert_eq!(zip_path, &PathBuf::from("C:/archives/target.zip"));
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // rating_filter (★) を build_drilled_items に渡したときの絞り込み挙動。
+    // 2026-04 仕様: drilled view では★フィルタが「直下ファイル」と
+    // 「サブフォルダのバッジ件数」両方に効く (件数 0 のサブフォルダは枝刈り)。
+    // -------------------------------------------------------------------
+
+    /// rating_filter で直下ファイル + サブフォルダ件数の両方が絞り込まれる。
+    /// ★3 のみを有効にしたフィルタを渡すと:
+    /// - 直下ファイル: ★3 のみ残る
+    /// - サブフォルダバッジ: ★3 ヒット数のみカウント、0 件サブフォルダは枝刈り
+    #[test]
+    fn build_drilled_items_filters_direct_files_and_subfolder_counts_by_rating() {
+        let mut state = GlobalSearchState::default();
+        // 直下: ★3 1 枚 + ★1 1 枚 + ★なし 1 枚
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/keep.jpg".into(),
+            score: 1.0,
+            stars: 3,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/drop_low.jpg".into(),
+            score: 1.0,
+            stars: 1,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/drop_unrated.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // sub_keep: ★3 が 1 件含まれる → バッジ 1
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/sub_keep/a.jpg".into(),
+            score: 1.0,
+            stars: 3,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/sub_keep/b.jpg".into(),
+            score: 1.0,
+            stars: 1,
+        });
+        // sub_drop: ★3 ヒットなし → 枝刈り
+        state.accumulate_hit(&GlobalHit {
+            path: "C:/root/sub_drop/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+
+        // ★3 のみ ON
+        let mut rf = [false; 6];
+        rf[3] = true;
+
+        let (items, _) = build_drilled_items(&state, Path::new("C:/root"), false, &rf);
+        // 期待: Folder("sub_keep") + Image("keep.jpg") のみ
+        assert_eq!(items.len(), 2, "items 数");
+        assert!(
+            matches!(&items[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/sub_keep"))
+        );
+        assert!(matches!(&items[1], GridItem::Image(p) if p == &PathBuf::from("C:/root/keep.jpg")));
+    }
+
+    /// rating_filter が全 ON ([true; 6]) のときは何も絞らない (= 旧挙動と同じ)。
+    #[test]
+    fn build_drilled_items_no_rating_filter_is_passthrough() {
+        let mut state = GlobalSearchState::default();
+        for p in ["C:/root/a.jpg", "C:/root/b.jpg", "C:/root/sub/c.jpg"] {
+            state.accumulate_hit(&GlobalHit {
+                path: p.into(),
+                score: 1.0,
+                stars: 0,
+            });
+        }
+        let (items_all_on, _) =
+            build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        // sub フォルダ + 直下 2 件 = 3
+        assert_eq!(items_all_on.len(), 3);
+    }
+
+    /// ZIP drilled view も同様に rating_filter で entries を絞れる。
+    #[test]
+    fn build_drilled_zip_items_filters_by_rating() {
+        let sep = crate::search_norm::ZIP_ENTRY_SEP;
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: format!("c:/archives/target.zip{sep}keep.jpg"),
+            score: 1.0,
+            stars: 3,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: format!("c:/archives/target.zip{sep}drop.jpg"),
+            score: 1.0,
+            stars: 1,
+        });
+        let mut rf = [false; 6];
+        rf[3] = true;
+        let (items, _) = build_drilled_items(
+            &state,
+            Path::new("C:/archives/target.zip"),
+            /*is_zip=*/ true,
+            &rf,
+        );
+        assert_eq!(items.len(), 1);
+        if let GridItem::ZipImage { entry_name, .. } = &items[0] {
+            assert_eq!(entry_name, "keep.jpg");
+        } else {
+            panic!("expected ZipImage");
+        }
+    }
+
+    /// `hit_rating_key` がレーティング DB キー形式 (App::page_path_key 互換) に変換する。
+    #[test]
+    fn hit_rating_key_handles_zip_and_regular_paths() {
+        // 通常ファイル
+        let k = hit_rating_key("C:/photos/a.jpg");
+        assert_eq!(k, crate::adjustment_db::normalize_path(Path::new("C:/photos/a.jpg")));
+        // ZIP エントリ (\x1F セパレータ)
+        let zip_key = format!("c:/album.zip{}IMG.JPG", crate::search_norm::ZIP_ENTRY_SEP);
+        let k2 = hit_rating_key(&zip_key);
+        let expected = format!(
+            "{}::{}",
+            crate::adjustment_db::normalize_path(Path::new("c:/album.zip")),
+            "img.jpg"
+        );
+        assert_eq!(k2, expected);
     }
 
     /// Ctrl+↑↓ のフラット ナビリストが、Folder / ZIP / PDF (= SearchContainer として
@@ -2044,22 +2377,26 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "C:/folder_a/img.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         // C:/folder_b に 3 件 (多)
         for n in 0..3 {
             state.accumulate_hit(&GlobalHit {
                 path: format!("C:/folder_b/p{n}.jpg"),
                 score: 1.0,
+                stars: 0,
             });
         }
         // C:/book.zip に 2 件 (中)
         state.accumulate_hit(&GlobalHit {
             path: "C:/book.zip!e1.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/book.zip!e2.jpg".into(),
             score: 1.0,
+            stars: 0,
         });
 
         let nav = build_cross_container_nav_list(&state);

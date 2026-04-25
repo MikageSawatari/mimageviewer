@@ -653,13 +653,34 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    ui.label("★:");
-                    for idx in 0..6 {
-                        if draw_rating_filter_button(ui, &mut self.settings.rating_filter, idx)
-                        {
-                            toolbar_rating_changed = true;
-                        }
+                    // Ctrl+G の集約ビュー (= 検索結果のフォルダ一覧) では★フィルタを
+                    // 反映できない (ヒット件数と filter の二重集計が必要で実装コスト大)。
+                    // ドリルイン後は file list + サブフォルダ件数の両方に反映するので
+                    // enable に戻す。
+                    let aggregated_search = self.global_search.active
+                        && matches!(
+                            self.global_search.view,
+                            crate::global_search_ui::GlobalSearchView::Aggregated
+                        );
+                    // hover ヒントは disable 中の widget では拾われにくいので
+                    // (egui の sense)、有効な「★:」ラベル側に乗せる。
+                    let star_label = ui.label("★:");
+                    if aggregated_search {
+                        star_label.on_hover_text(
+                            "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
+                        );
                     }
+                    ui.add_enabled_ui(!aggregated_search, |ui| {
+                        for idx in 0..6 {
+                            if draw_rating_filter_button(
+                                ui,
+                                &mut self.settings.rating_filter,
+                                idx,
+                            ) {
+                                toolbar_rating_changed = true;
+                            }
+                        }
+                    });
                     // ★フィルタ一時解除中: コンテナ自身の★で開いた結果として filter が
                     // 全 ON に書き換わっている状態を示すバッジ。クリックで即復元。
                     if self.rating_filter_suppressed_at.is_some() {
@@ -754,7 +775,14 @@ impl App {
             // (ユーザー意思を尊重して、BS しても以前の filter は復元しない)。
             self.drop_rating_filter_suppression_on_user_edit();
             self.settings.save();
-            self.rebuild_visible_indices();
+            // Ctrl+G 中はサブフォルダバッジ件数が build_drilled_items 側で
+            // rating_filter を使って再計算されるので items 自体を作り直す
+            // (内部で rebuild_visible_indices も走り、直下ファイル側も反映される)。
+            if self.global_search.active {
+                self.rebuild_items_from_global_search();
+            } else {
+                self.rebuild_visible_indices();
+            }
         }
 
         // ツールバーのタグ項目クリック
@@ -1182,6 +1210,8 @@ impl App {
                     // (docs §10.3 [3] 絞り込みビュー)
                     let p = path.clone();
                     let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
+                    // ★コンテナを開いた時の中身空表示対策 (Codex P2)
+                    self.maybe_suppress_rating_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
                 }
                 None => {}

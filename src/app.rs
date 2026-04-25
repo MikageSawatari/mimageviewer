@@ -1520,6 +1520,14 @@ pub struct App {
     /// worker 終了直後に再 spawn ループになる既知バグを避けるため handle ではなくこれ)。
     pub(crate) folder_rating_counts_folder_key: Option<String>,
 
+    /// Ctrl+G drilled view 限定: サブフォルダ毎の per-★ ヒット件数 (★なし..★5、6 バケット)。
+    /// `rebuild_items_from_global_search` の DrilledInto 分岐で `state.all_hits` から
+    /// 直接集計する。folder_rating_counter (rating DB を SQL で集計する worker) は
+    /// global_search.active 中は走らないため、ここで Ctrl+G 専用の経路を持たせる。
+    /// 通常フォルダ閲覧時は空。 keys は `adjustment_db::normalize_path` 正規化済み。
+    /// `[u32; 6]` の index 0=★なし, 1..5=★1..★5。`folder_rating_match` がここを優先参照する。
+    pub(crate) search_drilled_folder_counts: std::collections::HashMap<String, [u32; 6]>,
+
     // ── 見開き表示 ──────────────────────────────────────────────
     /// 見開き DB (フォルダごとのモード永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
@@ -2145,6 +2153,7 @@ impl Default for App {
             folder_rating_counts_loaded: false,
             folder_rating_counter_handle: None,
             folder_rating_counts_folder_key: None,
+            search_drilled_folder_counts: std::collections::HashMap::new(),
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             spread_popup_open: false,
@@ -2963,8 +2972,20 @@ impl App {
             return;
         }
         self.update_check_last_spawn = Some(std::time::Instant::now());
-        let rx = crate::update_check::spawn_check(env!("CARGO_PKG_VERSION"));
-        self.update_check_pending = Some(UpdateCheckPending { rx, manual });
+        match crate::update_check::spawn_check(env!("CARGO_PKG_VERSION")) {
+            Ok(rx) => {
+                self.update_check_pending = Some(UpdateCheckPending { rx, manual });
+            }
+            Err(e) => {
+                // スレッド起動自体の失敗。auto なら silent fail (ログのみ)、
+                // manual ならユーザーが押した結果なのでエラーダイアログを出す。
+                crate::logger::log(format!("update_check: spawn failed: {e}"));
+                if manual {
+                    self.update_check_error = Some(e);
+                    self.show_update_dialog = true;
+                }
+            }
+        }
     }
 
     /// 起動完了後の初回 + 24 時間ごとの auto kick。`App::update` の毎フレーム冒頭で呼ばれる。
@@ -2996,7 +3017,18 @@ impl App {
             Ok(r) => Some(r),
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // worker が送信前に panic した等の異常終了。manual ならユーザー操作が
+                // 黙って終わらないようエラーダイアログを出す (auto は silent + log)。
+                let was_manual = pending.manual;
+                crate::logger::log(
+                    "update_check: worker channel disconnected before sending result",
+                );
                 self.update_check_pending = None;
+                if was_manual {
+                    self.update_check_error =
+                        Some("更新チェックの内部エラー (スレッド異常終了)".to_string());
+                    self.show_update_dialog = true;
+                }
                 return;
             }
         };
@@ -3005,6 +3037,15 @@ impl App {
             Ok(info) => {
                 let is_newer = info.is_newer;
                 let tag = info.latest_tag.clone();
+                // auto かつ更新確認 OFF の場合: spawn と結果到着の間で OFF に切り替わった
+                // ケース。バッジを出さない契約を守るため、結果は破棄する (manual は常に
+                // 結果を保持してダイアログで見せる)。
+                if !pending.manual && !self.settings.update_check_enabled {
+                    crate::logger::log(format!(
+                        "update_check: dropping auto result ({tag}); user disabled checks"
+                    ));
+                    return;
+                }
                 self.update_info = Some(info);
                 self.update_check_error = None;
                 if pending.manual {
@@ -3026,7 +3067,12 @@ impl App {
     }
 
     /// 通知バッジを表示すべきか (新バージョンあり、かつユーザーが skip していない)。
+    /// `update_check_enabled=false` の間は結果を持っていてもバッジは出さない (OFF=
+    /// 「通知も止める」と読める方が自然なため)。
     pub(crate) fn should_show_update_badge(&self) -> bool {
+        if !self.settings.update_check_enabled {
+            return false;
+        }
         let Some(ref info) = self.update_info else {
             return false;
         };
@@ -6441,6 +6487,9 @@ impl App {
                             // → drill-down view に切り替え (v1: 1 階層のみ, docs §10.3)
                             let p = path.clone();
                             let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
+                            // ★コンテナを開いた時、内部画像が未評価で空表示にならないよう
+                            // フィルタを一時解除する (Codex P2)。
+                            self.maybe_suppress_rating_filter_for_opened_container_path(&p);
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
@@ -7517,6 +7566,17 @@ impl App {
         let rating_filter = self.settings.rating_filter;
         // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
         let rating_filter_active = !rating_filter.iter().all(|&b| b);
+        // Ctrl+G drilled view では Folder アイテムが「ヒット集計が >0 のサブフォルダ」
+        // を表す合成セルなので、フォルダ自身の★ (通常 0) で再フィルタすると消えて
+        // しまう。`build_drilled_items` が既に rating_filter で件数を絞っており、
+        // ここで二重適用しないよう Folder のみ rating filter をバイパスする
+        // (Codex P1)。直下のページ (Image / ZipImage / PdfPage / ZipFile / PdfFile)
+        // は引き続きライブの rating を見て visibility を決める。
+        let in_global_drilled = self.global_search.active
+            && matches!(
+                self.global_search.view,
+                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+            );
 
         let n = self.items.len();
         let mut result = Vec::with_capacity(n);
@@ -7529,7 +7589,9 @@ impl App {
             if rating_filter_active {
                 let stars = self.get_rating(i);
                 if let Some(item) = self.items.get(i) {
-                    if !passes_rating_filter(item, stars, &rating_filter) {
+                    let bypass =
+                        in_global_drilled && matches!(item, GridItem::Folder(_));
+                    if !bypass && !passes_rating_filter(item, stars, &rating_filter) {
                         continue;
                     }
                 }
@@ -7915,6 +7977,44 @@ impl App {
         !self.settings.rating_filter.iter().all(|&b| b)
     }
 
+    /// `maybe_suppress_rating_filter_for_opened_container` の path 版。
+    /// Ctrl+G の `SearchContainer` を開く経路 (`drill_into_container`) は idx 経由の
+    /// `container_path()` / `get_rating()` で対応していない (SearchContainer は
+    /// page_path_key にも rating_path_key にも載っていない疑似アイテム)。
+    /// パスから直接 rating_db を引いて、コンテナ★がフィルタを通るなら一時解除する。
+    ///
+    /// 効果: ★5 を本に付けて★5 フィルタ ON のまま Ctrl+G 集約結果からそのフォルダを
+    /// 開いても、中の画像が未評価でも空にならない (Codex P2 対応)。
+    pub(crate) fn maybe_suppress_rating_filter_for_opened_container_path(
+        &mut self,
+        anchor: &Path,
+    ) {
+        if self.rating_filter_suppressed_at.is_some() {
+            return;
+        }
+        if !self.rating_filter_active() {
+            return;
+        }
+        let Some(db) = self.rating_db.as_ref() else {
+            return;
+        };
+        let key = crate::adjustment_db::normalize_path(anchor);
+        let stars = db.get(&key);
+        if !(1..=5).contains(&stars) {
+            return;
+        }
+        // Folder/ZipFile/PdfFile と同じく `s <= 5 && rf[s]` 規約。SearchContainer
+        // 自身は accepts_rating=false なので passes_rating_filter は使えず、ここで
+        // 直接判定する。
+        let s = stars as usize;
+        if s > 5 || !self.settings.rating_filter[s] {
+            return;
+        }
+        let saved = self.settings.rating_filter;
+        self.rating_filter_suppressed_at = Some((anchor.to_path_buf(), saved));
+        self.settings.rating_filter = [true; 6];
+    }
+
     /// 「自身に★が付いたコンテナ (Folder / ZIP / PDF) を開く」操作時に呼ぶ。
     /// コンテナ自身の★が現在フィルタを通るなら、フィルタを一時解除して anchor を記録する。
     ///
@@ -8080,14 +8180,38 @@ impl App {
     /// 指定 idx (Folder / ZipFile / PdfFile) のフィルタ一致件数と per-star 内訳を返す。
     /// worker 未起動 / キー無し / フィルタ対象外 / 合計 0 件 は `None`。
     /// `per_star` はマスク前の全★別件数で、tooltip 内訳表示に使う。
+    ///
+    /// Ctrl+G drilled view の場合は `search_drilled_folder_counts` (★なし含む 6 バケット)
+    /// を優先参照する。folder_rating_counter worker が Ctrl+G 中は走らないため、
+    /// `state.all_hits` から直接集計した値をここで使う。なし (rf[0]) も filter に
+    /// 含めるので、ユーザーが「なし+★2」のような複合条件を掛けたときに正しく
+    /// バッジ件数が出る。
     pub(crate) fn folder_rating_match(&self, idx: usize) -> Option<(u32, [u32; 5])> {
         let path = match self.items.get(idx)? {
             GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
             _ => return None,
         };
         let key = crate::adjustment_db::normalize_path(path);
-        let per_star = *self.folder_rating_counts.get(&key)?;
         let rf = &self.settings.rating_filter;
+        let in_global_drilled = self.global_search.active
+            && matches!(
+                self.global_search.view,
+                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+            );
+        if in_global_drilled {
+            let counts6 = *self.search_drilled_folder_counts.get(&key)?;
+            // 全 6 バケットに対して filter を適用
+            let total: u32 = (0..6).filter(|i| rf[*i]).map(|i| counts6[i]).sum();
+            if total == 0 {
+                return None;
+            }
+            // tooltip 用 per_star は ★1..★5 のみ (旧インターフェース維持)
+            let per_star: [u32; 5] = [
+                counts6[1], counts6[2], counts6[3], counts6[4], counts6[5],
+            ];
+            return Some((total, per_star));
+        }
+        let per_star = *self.folder_rating_counts.get(&key)?;
         // rating_filter[i+1] が ★(i+1) に対応。rf[0] は未評価フィルタなので無視。
         let total: u32 = (0..5)
             .filter(|i| *rf.get(i + 1).unwrap_or(&true))
@@ -8575,7 +8699,40 @@ impl App {
         } else {
             crate::logger::log(format!("[RATING] Set {stars} stars on idx {}", targets[0]));
         }
-        self.rebuild_visible_indices();
+        // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
+        // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
+        // 該当する all_hits エントリを最新値で書き換えてから rebuild する (Codex P3)。
+        if self.global_search.active && !targets.is_empty() {
+            self.refresh_global_search_hit_stars(&targets);
+            self.rebuild_items_from_global_search();
+        } else {
+            self.rebuild_visible_indices();
+        }
+    }
+
+    /// `set_rating` で書き換えた idx 群について、Ctrl+G の `all_hits` 中の対応する
+    /// hit エントリの `stars` を最新値で更新する。drilled view バッジ件数 / 枝刈り /
+    /// 直下ファイルフィルタが snapshot のまま古くならないようにする (Codex P3)。
+    fn refresh_global_search_hit_stars(&mut self, idxs: &[usize]) {
+        // 対象 idx → (rating_db キー, 新 stars) の対応を作る
+        let mut updates: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
+        for &idx in idxs {
+            let Some(key) = self.rating_path_key(idx) else {
+                continue;
+            };
+            let new_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
+            updates.insert(key, new_stars);
+        }
+        if updates.is_empty() {
+            return;
+        }
+        for h in self.global_search.all_hits.iter_mut() {
+            let hit_key = crate::global_search_ui::hit_rating_key(&h.path);
+            if let Some(&v) = updates.get(&hit_key) {
+                h.stars = v;
+            }
+        }
     }
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
@@ -9652,22 +9809,10 @@ impl App {
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
-            } => {
-                format!(
-                    "{}::{}",
-                    crate::adjustment_db::normalize_path(zip_path),
-                    entry_name.to_lowercase()
-                )
-            }
+            } => crate::adjustment_db::zip_entry_key(zip_path, entry_name),
             GridItem::PdfPage {
                 pdf_path, page_num, ..
-            } => {
-                format!(
-                    "{}::page_{}",
-                    crate::adjustment_db::normalize_path(pdf_path),
-                    page_num
-                )
-            }
+            } => crate::adjustment_db::zip_entry_key(pdf_path, &format!("page_{page_num}")),
             _ => return None,
         };
         Some(key)
@@ -13780,6 +13925,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: format!("{}/doc.pdf", folder_path.display()).to_lowercase(),
             score: 1.0,
+            stars: 0,
         });
         // コンテナへ drill-in (SearchContainer を Enter 相当)
         app.drill_into_container(folder_path.clone(), false);
@@ -13827,6 +13973,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: format!("{}/album.zip", folder_path.display()).to_lowercase(),
             score: 1.0,
+            stars: 0,
         });
         app.drill_into_container(folder_path.clone(), false);
         app.advance_drilled_current_path(&zip_path);
@@ -13844,6 +13991,313 @@ mod phase_c_drill_nav_tests {
             app.global_search.view,
             GlobalSearchView::Aggregated
         ));
+    }
+
+    /// Codex P1 リグレッション: Ctrl+G drilled view で★3-only フィルタを掛けても、
+    /// ヒット集計が >0 のサブフォルダ (= `build_drilled_items` が Folder として並べた
+    /// 合成セル) はフォルダ自身の★ (通常 0) で再フィルタされて消えてはならない。
+    ///
+    /// 旧実装は `rebuild_visible_indices` が Folder にも generic な
+    /// `passes_rating_filter` を当てていたため、unrated subfolder が★3 only で
+    /// 全消滅していた。
+    #[test]
+    fn drilled_subfolders_survive_rating_filter_via_descendant_count() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 親フォルダ /root 配下に sub_keep (★3 ヒットを持つ) を accumulate する。
+        // サブフォルダ自身には rating_db に登録なし (= 0)。
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub_keep/a.jpg".into(),
+            score: 1.0,
+            stars: 3,
+        });
+        app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
+
+        // ★3 のみ ON
+        let mut rf = [false; 6];
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+
+        // items に Folder("c:/root/sub_keep") が並び、visible_indices にも残っている
+        // こと (Folder が rating_filter で消えていないこと)。
+        let folder_visible = app.visible_indices.iter().any(|&i| {
+            matches!(app.items.get(i), Some(GridItem::Folder(_)))
+        });
+        assert!(
+            folder_visible,
+            "サブフォルダ (Folder) が消えている。items={:?} visible_indices={:?}",
+            app.items
+                .iter()
+                .map(|it| match it {
+                    GridItem::Folder(p) => format!("Folder({})", p.display()),
+                    GridItem::Image(p) => format!("Image({})", p.display()),
+                    _ => "Other".into(),
+                })
+                .collect::<Vec<_>>(),
+            app.visible_indices,
+        );
+    }
+
+    /// Ctrl+G を抜ける (Aggregated に戻る・閉じる) と Folder の rating filter
+    /// バイパスは効かなくなる: 通常フォルダ閲覧では unrated folder は ★3-only で
+    /// 隠れる従来挙動を維持する。
+    #[test]
+    fn folder_rating_filter_bypass_only_in_global_drilled_view() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // global_search 非アクティブ。普通に Folder を items に置く。
+        app.items
+            .push(GridItem::Folder(std::path::PathBuf::from("c:/some/folder")));
+        // ★3 only
+        let mut rf = [false; 6];
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
+        // フォルダの intrinsic rating = 0 → ★3-only でフィルタアウトされる (通常挙動)
+        assert!(
+            app.visible_indices.is_empty(),
+            "通常表示の unrated folder は ★3-only で隠れるべき (Ctrl+G 外でバイパスしないこと)"
+        );
+    }
+
+    /// 2026-04 ユーザー報告: Ctrl+G で検索 → SearchContainer に drill-in →
+    /// BS で Aggregated に戻ったとき、開いていたコンテナのセルにカーソルが
+    /// 復帰してほしい (旧実装は selected=None で先頭に飛んでいた)。
+    #[test]
+    fn bs_back_to_aggregated_restores_cursor_on_previous_container() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 2 つの SearchContainer を accumulate (folder_b の方を開く想定)
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/folder_a/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/folder_b/y.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // 初回 rebuild (Aggregated)
+        app.rebuild_items_from_global_search();
+        // folder_b に drill-in
+        app.drill_into_container(std::path::PathBuf::from("c:/folder_b"), false);
+        // BS で Aggregated に戻る
+        app.drill_back_one_level();
+        // 戻った先で folder_b の SearchContainer が selected であること
+        let selected_path = app.selected.and_then(|i| app.items.get(i)).map(|it| match it {
+            GridItem::SearchContainer { path, .. } => path.clone(),
+            _ => std::path::PathBuf::new(),
+        });
+        assert_eq!(
+            selected_path,
+            Some(std::path::PathBuf::from("c:/folder_b")),
+            "BS で Aggregated に戻ったとき、直前に開いた folder_b にカーソルが残るべき"
+        );
+    }
+
+    /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
+    /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
+    /// drilled view が空にならない。
+    #[test]
+    fn search_container_drill_in_suppresses_rating_filter_when_container_starred() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ★5 フィルタ ON
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        // rating_db に ★5 でコンテナ (フォルダ) を登録
+        let folder = std::path::PathBuf::from("c:/books/vol1");
+        let key = crate::adjustment_db::normalize_path(&folder);
+        if let Some(db) = app.rating_db.as_ref() {
+            db.set(&key, 5).expect("set rating");
+        }
+        // ★コンテナを「開く」前は suppression なし
+        assert!(app.rating_filter_suppressed_at.is_none());
+        // 開く
+        app.maybe_suppress_rating_filter_for_opened_container_path(&folder);
+        // suppression 起動 + filter は全 ON に
+        assert_eq!(
+            app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p.clone()),
+            Some(folder),
+            "★5 コンテナを開いたら suppression anchor が設定される"
+        );
+        assert_eq!(
+            app.settings.rating_filter, [true; 6],
+            "suppression 起動中は filter が全 ON"
+        );
+    }
+
+    /// Codex P2 スコープ外: コンテナ★が現フィルタを通らない場合は suppression しない。
+    #[test]
+    fn search_container_drill_in_does_not_suppress_when_rating_does_not_match() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ★5 フィルタ ON
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        // ★3 コンテナ (★5 フィルタを通らない)
+        let folder = std::path::PathBuf::from("c:/notes/draft");
+        let key = crate::adjustment_db::normalize_path(&folder);
+        if let Some(db) = app.rating_db.as_ref() {
+            db.set(&key, 3).expect("set rating");
+        }
+        app.maybe_suppress_rating_filter_for_opened_container_path(&folder);
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "コンテナ★がフィルタ外なら suppression しない"
+        );
+    }
+
+    /// Codex P3: Ctrl+G 中にレーティング変更すると、`all_hits.stars` が更新され、
+    /// drilled view のバッジ件数が新しい値に追従すること。
+    #[test]
+    fn rating_change_updates_global_search_hit_stars_snapshot() {
+        use crate::global_search::GlobalHit;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // 単一画像を accumulate (★3 で受信)
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/a.jpg".into(),
+            score: 1.0,
+            stars: 3,
+        });
+        // items に直接置く (drill_into_container は load_folder を呼ばないテスト用簡易セットアップ)
+        app.items.push(crate::grid_item::GridItem::Image(
+            std::path::PathBuf::from("c:/root/sub/a.jpg"),
+        ));
+        // rating を 1 に変更
+        app.set_rating(0, 1);
+        let idxs = vec![0_usize];
+        app.refresh_global_search_hit_stars(&idxs);
+        // all_hits.stars が更新されているはず
+        assert_eq!(
+            app.global_search.all_hits[0].stars, 1,
+            "rating 変更後、all_hits.stars が 1 に追従するはず"
+        );
+    }
+
+    /// 2026-04 ユーザー報告: Ctrl+G drilled view で「なし+★2」のように複合
+    /// rating filter を掛けたとき、サブフォルダの右下にフィルタ件数バッジが
+    /// 表示されない問題の修正検証。
+    ///
+    /// `folder_rating_match` は global_search.active && DrilledInto では
+    /// `search_drilled_folder_counts` を見て、★なし (rf[0]) を含む 6 バケットで
+    /// 合計を出すこと。
+    #[test]
+    fn drilled_subfolder_badge_reflects_unrated_plus_starred_filter() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // /root/sub に: ★なし 2 件、★2 が 1 件、★4 が 1 件 を accumulate
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/b.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/c.jpg".into(),
+            score: 1.0,
+            stars: 2,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/d.jpg".into(),
+            score: 1.0,
+            stars: 4,
+        });
+        // /root にドリルイン
+        app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
+        // フィルタ: なし + ★2 (rf[0]=true, rf[2]=true, それ以外 false)
+        let mut rf = [false; 6];
+        rf[0] = true;
+        rf[2] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+
+        // sub フォルダの idx を取得
+        let sub_idx = app
+            .items
+            .iter()
+            .position(|it| matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub")))
+            .expect("sub folder should be in items");
+        let badge = app
+            .folder_rating_match(sub_idx)
+            .expect("Ctrl+G drilled subfolder must produce a badge");
+        // total = ★なし 2 件 + ★2 1 件 = 3
+        assert_eq!(badge.0, 3, "なし+★2 で sub フォルダの件数バッジが 3 のはず");
+    }
+
+    /// `restore_select_path` のターゲットが items 中に存在しない (= 何らかの理由で
+    /// 消えた) 場合は selected=None のまま放置せず、先頭の visible item に
+    /// フォールバックする。次の方向キーで idx 0 に飛ぶ事故を防ぐため。
+    #[test]
+    fn bs_back_falls_back_to_first_visible_when_target_missing() {
+        use crate::global_search::GlobalHit;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/folder_a/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // 存在しないパスを restore target に設定して rebuild
+        app.global_search.restore_select_path =
+            Some(std::path::PathBuf::from("c:/nonexistent/folder"));
+        app.rebuild_items_from_global_search();
+        // フォールバック: 先頭の visible item が選択されているはず
+        assert_eq!(
+            app.selected,
+            app.visible_indices.first().copied(),
+            "target 不在のときは先頭の visible item に落ちるべき"
+        );
+        assert!(app.selected.is_some(), "items が空でない限り selected は Some");
+    }
+
+    /// drilled view 内で deeper subfolder に drill-in → BS で 1 階層戻ったとき、
+    /// 直前に居た subfolder の Folder セルにカーソルが復帰すること。
+    #[test]
+    fn bs_back_within_drilled_restores_cursor_on_previous_subfolder() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // /root/sub1/x.jpg と /root/sub2/y.jpg のヒットを accumulate
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub1/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub2/y.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // /root に drill-in
+        app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
+        // /root/sub2 にさらに drill-in
+        app.drill_into_subfolder(std::path::PathBuf::from("c:/root/sub2"));
+        // BS で /root に戻る
+        app.drill_back_one_level();
+        let selected_path = app.selected.and_then(|i| app.items.get(i)).map(|it| match it {
+            GridItem::Folder(p) => p.clone(),
+            _ => std::path::PathBuf::new(),
+        });
+        assert_eq!(
+            selected_path,
+            Some(std::path::PathBuf::from("c:/root/sub2")),
+            "drilled view で BS したとき、直前のサブフォルダ (sub2) にカーソルが残るべき"
+        );
     }
 
     /// Ctrl+G が非アクティブな状態で advance_drilled_current_path を呼んでも
@@ -13898,6 +14352,7 @@ mod phase_c_drill_address_tests {
             )
             .to_lowercase(),
             score: 1.0,
+            stars: 0,
         });
         app.drill_into_container(folder_path.clone(), false);
         // drill 直後は container_root のみの breadcrumb
@@ -13970,6 +14425,7 @@ mod phase_c_drill_address_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "d:/scansnap/a.pdf".to_string(),
             score: 1.0,
+            stars: 0,
         });
         // Aggregated のまま update_global_search_address
         app.update_global_search_address();
