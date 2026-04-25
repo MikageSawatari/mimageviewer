@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(
             hits.len(),
             1,
-            "ingest 完了直後 (mark_ok 後) の searcher は新 doc を見えるべき"
+            "ingest 完了直後 (commit + reader reload 後) の searcher は新 doc を見えるべき"
         );
     }
 

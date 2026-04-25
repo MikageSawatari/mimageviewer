@@ -449,9 +449,9 @@ impl FtsMetaDb {
     /// 全 favorite の `status=Ok` 件数を 1 クエリで返す (UI 表示の一括集計用)。
     ///
     /// 個別 `count_ok_for_favorite` を N 回呼ぶと毎回 connection mutex を取り
-    /// background writer (ingest_worker / mark_ok) と競合するため、まとめて 1 回で
-    /// 取得する。返却値は `favorite_id` (UUID parse 後) → 件数。Ok 件数 0 の
-    /// favorite は含まれない。
+    /// background writer (ingest_worker の `upsert_meta_ok` / `delete_paths`) と
+    /// 競合するため、まとめて 1 回で取得する。返却値は `favorite_id` (UUID parse 後)
+    /// → 件数。Ok 件数 0 の favorite は含まれない。
     pub fn count_ok_grouped_by_favorite(&self) -> rusqlite::Result<HashMap<Uuid, u64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

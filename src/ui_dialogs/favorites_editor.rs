@@ -150,8 +150,8 @@ impl App {
         // インデックスサイズ + 件数キャッシュ。
         //
         // Codex 指摘 (2026-04): UI スレッドで `COUNT(*)` を N 回叩くと、毎回
-        // SQLite connection mutex を取って ingest_worker / mark_ok / bulk indexer の
-        // writer が短時間待たされる。対策:
+        // SQLite connection mutex を取って ingest_worker (`upsert_meta_ok` /
+        // `delete_paths`) や bulk indexer の writer が短時間待たされる。対策:
         //  1. 個別 COUNT を `GROUP BY favorite_id/favorite_root` の単一クエリに集約
         //     (DB lock 取得回数を 2N → 2 に削減)
         //  2. UI スレッドではなく worker thread で実行 (`favorites_index_refresh_rx`)
