@@ -125,7 +125,7 @@ pub struct StartupDiag {
 /// 本番と乖離していた)。
 /// 起動進捗 (UI 側のオーバーレイに表示する短文) を更新するためのフック。
 ///
-/// `IndexerManager::new` / `new_with_progress` 内部で各 sub-step の前に呼ばれる。
+/// `IndexerManager::new` 内部で各 sub-step の前に呼ばれる。
 /// `None` を渡せば従来の挙動。`Some` の場合は文字列を Mutex に書き込む。
 pub type StartupProgressHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -195,17 +195,10 @@ impl IndexerManager {
     /// supervisor thread が即 return する race があった。
     /// reconciliation は通常クラッシュ残留の僅かな行だけを処理するので、
     /// アプリ起動の許容範囲内 (通常 100ms 以下) で終わる。
+    /// `progress` を渡すと各 sub-step (FtsMetaDb open / FtsIndex open / writer init /
+    /// reconciliation / supervisor spawn) の前に短い進捗文字列が書き込まれる。
+    /// 起動オーバーレイで状態を見せたい場合に渡す。`None` なら従来通り無音。
     pub fn new(
-        favorites: &[FavoriteEntry],
-        speed: crate::settings::IndexerSpeedProfile,
-        activity_gate: Arc<ActivityGate>,
-    ) -> Option<Self> {
-        Self::new_with_progress(favorites, speed, activity_gate, None)
-    }
-
-    /// 起動オーバーレイ用に各 sub-step のメッセージを `progress` に書き込みながら
-    /// `new` と同じ初期化を行う。バックグラウンドスレッドから呼び出す想定。
-    pub fn new_with_progress(
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,

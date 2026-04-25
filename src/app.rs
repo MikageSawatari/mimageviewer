@@ -52,21 +52,30 @@ impl Drop for ZipEnumeratePending {
     }
 }
 
-/// 起動フェーズ。`Loading` の間は中央に「起動中…」オーバーレイを描画し、
-/// × ボタン以外の入力を全て消費する。重い初期化 (Tantivy reconciliation 等) が
-/// 完了したら `Ready` に遷移して通常 update に入る。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StartupPhase {
-    Loading,
-    Ready,
+/// バックグラウンドで走らせる `IndexerManager::new` の状態。
+/// 起動フェーズ判定は `App::startup_init.is_some()` で行う (Loading の間だけ Some)。
+pub(crate) struct StartupInitPending {
+    rx: mpsc::Receiver<Option<crate::indexer_manager::IndexerManager>>,
+    started_at: std::time::Instant,
 }
 
-/// バックグラウンドで走らせる `IndexerManager::new` の receiver。
-/// 完了したら `Option<IndexerManager>` を 1 回だけ送る。
-pub(crate) struct StartupInitPending {
-    pub(crate) rx: mpsc::Receiver<Option<crate::indexer_manager::IndexerManager>>,
-    /// 起動を開始した時刻 (perf 計測用)
-    pub(crate) started_at: std::time::Instant,
+impl StartupInitPending {
+    fn try_recv(&self) -> Result<Option<crate::indexer_manager::IndexerManager>, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+    fn elapsed_ms(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+/// 起動オーバーレイ用の `StartupProgressHook` を作る共通ヘルパー。
+/// `IndexerManager::new` が各 sub-step の前に呼び、Mutex 内の文字列を更新する。
+fn make_progress_hook(progress: Arc<Mutex<String>>) -> crate::indexer_manager::StartupProgressHook {
+    Arc::new(move |s: &str| {
+        if let Ok(mut p) = progress.lock() {
+            *p = s.to_string();
+        }
+    })
 }
 
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
@@ -1873,23 +1882,23 @@ pub struct App {
     pub(crate) last_main_focused: bool,
 
     // ── 起動オーバーレイ ─────────────────────────────────────────
-    /// 起動フェーズ。`Loading` の間は中央オーバーレイを描画して通常 update を block する。
-    pub(crate) startup_phase: StartupPhase,
     /// オーバーレイに表示する短いステータス文字列。バックグラウンド init スレッドが
     /// 各 sub-step の前に書き換える。
     pub(crate) startup_progress: Arc<Mutex<String>>,
-    /// 走行中の起動 init スレッドの receiver。`update` 内で try_recv して
-    /// 完了次第 `indexer_manager` に注入し `Ready` に遷移する。
+    /// 走行中の起動 init スレッドの状態。`update` 内で try_recv して
+    /// 完了次第 `indexer_manager` に注入する。
     pub(crate) startup_init: Option<StartupInitPending>,
+    /// 起動 init が一度走り切ったか (成功・失敗問わず)。
+    /// `indexer_manager.is_none()` だけだと「init 失敗で永続 None」と
+    /// 「未起動」を区別できないので別フラグで持つ。
+    pub(crate) startup_done: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
-        let t_settings = std::time::Instant::now();
         let settings = crate::settings::Settings::load();
-        crate::perf::emit_ms("startup", "settings_load_app", 0, t_settings);
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings
             .ai_upscale_model_override
@@ -1902,9 +1911,8 @@ impl Default for App {
         ));
 
         // 全文検索インデクサ (Tantivy) は起動の最大ボトルネック (実測 1 秒級) なので、
-        // ここでは起動せず None で出発する。`App::update` の最初のフレームで
-        // バックグラウンドスレッドに `IndexerManager::new_with_progress` を spawn し、
-        // 進行中はオーバーレイを表示する。完了したら `indexer_manager` に注入する。
+        // `App::update` の最初のフレームで `kick_off_startup_init` がバックグラウンド
+        // スレッドに spawn する。それまでは None で、検索系 UI は無効として描画される。
         let indexer_manager: Option<crate::indexer_manager::IndexerManager> = None;
 
         // === 各 SQLite DB の open を計測 ===
@@ -2226,10 +2234,9 @@ impl Default for App {
             current_folder_last_mtime: None,
             last_main_focused: true,
 
-            // 起動オーバーレイ: IndexerManager::new がバックグラウンドで完了するまで Loading
-            startup_phase: StartupPhase::Loading,
             startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
             startup_init: None,
+            startup_done: false,
         }
     }
 }
@@ -2799,14 +2806,10 @@ impl App {
         }
     }
 
-    /// 起動時に `auto_index_structure = true` のお気に入りごとに name index supervisor を
-    /// spawn する。`indexer_manager.sync_with_favorites` のメタ側の挙動に対応する。
-    /// 呼び出しは `App` 構築後 (settings が load 済みで search_index_db が開いている状態) に
-    /// 1 回だけ。
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
-    /// 1 度しか走らせない。`startup_init.is_some()` ならスキップ。
+    /// 1 度しか走らせない。
     pub(crate) fn kick_off_startup_init(&mut self) {
-        if self.startup_init.is_some() {
+        if self.startup_init.is_some() || self.startup_done {
             return;
         }
         let favorites = self.settings.favorites.clone();
@@ -2815,85 +2818,69 @@ impl App {
         let progress = Arc::clone(&self.startup_progress);
         let (tx, rx) = mpsc::channel();
         let started_at = std::time::Instant::now();
-        let progress_for_thread = Arc::clone(&progress);
+        let hook = make_progress_hook(Arc::clone(&progress));
         let spawn_result = std::thread::Builder::new()
             .name("startup-init".to_string())
-            .spawn(move || {
-                let hook: crate::indexer_manager::StartupProgressHook =
-                    Arc::new(move |s: &str| {
-                        if let Ok(mut p) = progress_for_thread.lock() {
-                            *p = s.to_string();
-                        }
-                    });
-                let t = std::time::Instant::now();
-                let mgr = crate::indexer_manager::IndexerManager::new_with_progress(
-                    &favorites,
-                    speed,
-                    activity_gate,
-                    Some(hook),
-                );
-                crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
-                let _ = tx.send(mgr);
+            .spawn({
+                let hook = Arc::clone(&hook);
+                move || {
+                    let t = std::time::Instant::now();
+                    let mgr = crate::indexer_manager::IndexerManager::new(
+                        &favorites,
+                        speed,
+                        activity_gate,
+                        Some(hook),
+                    );
+                    crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
+                    let _ = tx.send(mgr);
+                }
             });
         if let Err(e) = spawn_result {
+            // フォールバック: スレッド起動に失敗したら同期で実行する
+            // (スレッド数制限の極端な環境向け保険)。
             crate::logger::log(format!("startup-init spawn failed: {e} — running synchronously"));
-            // フォールバック: スレッド起動に失敗したら同期で実行する。
-            // (CI 環境などスレッド数制限の極端なケース向けの保険)
-            let hook: crate::indexer_manager::StartupProgressHook = {
-                let progress = Arc::clone(&progress);
-                Arc::new(move |s: &str| {
-                    if let Ok(mut p) = progress.lock() {
-                        *p = s.to_string();
-                    }
-                })
-            };
-            self.indexer_manager = crate::indexer_manager::IndexerManager::new_with_progress(
+            self.indexer_manager = crate::indexer_manager::IndexerManager::new(
                 &self.settings.favorites,
                 self.settings.indexer_speed_profile,
                 Arc::clone(&self.activity_gate),
                 Some(hook),
             );
-            self.startup_phase = StartupPhase::Ready;
+            self.startup_done = true;
             return;
         }
         self.startup_init = Some(StartupInitPending { rx, started_at });
     }
 
     /// 起動 init の完了を確認する。完了していれば `indexer_manager` に注入し
-    /// `startup_phase = Ready` に遷移する。
+    /// `startup_init = None`、`startup_done = true` に遷移する。
     pub(crate) fn poll_startup_init(&mut self) {
         let Some(pending) = &self.startup_init else {
             return;
         };
-        match pending.rx.try_recv() {
+        match pending.try_recv() {
             Ok(mgr) => {
-                let elapsed_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
                 crate::logger::log(format!(
-                    "startup: IndexerManager init completed in {elapsed_ms:.0} ms"
+                    "startup: IndexerManager init completed in {:.0} ms",
+                    pending.elapsed_ms()
                 ));
                 self.indexer_manager = mgr;
-                self.startup_phase = StartupPhase::Ready;
                 self.startup_init = None;
+                self.startup_done = true;
                 if let Ok(mut p) = self.startup_progress.lock() {
                     *p = "起動完了".to_string();
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {
-                // まだ進行中
-            }
+            Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
-                // bg スレッドが panic した等で送信側が落ちた。Ready にして
-                // 検索機能なしで継続。
+                // bg スレッドが panic 等で落ちた: 検索機能なしで継続させる。
                 crate::logger::log("startup: init thread disconnected unexpectedly");
                 self.indexer_manager = None;
-                self.startup_phase = StartupPhase::Ready;
                 self.startup_init = None;
+                self.startup_done = true;
             }
         }
     }
 
-    /// 起動オーバーレイを描画する (Loading 中のみ呼び出す)。中央に
-    /// 「起動中…」とサブテキスト (現在のステップ) + スピナーを表示する。
     pub(crate) fn render_startup_overlay(&self, ctx: &egui::Context) {
         let progress_text = self
             .startup_progress
@@ -2959,6 +2946,10 @@ impl App {
         });
     }
 
+    /// 起動時に `auto_index_structure = true` のお気に入りごとに name index supervisor を
+    /// spawn する。`indexer_manager.sync_with_favorites` のメタ側の挙動に対応する。
+    /// 呼び出しは `App` 構築後 (settings が load 済みで search_index_db が開いている状態) に
+    /// 1 回だけ。
     pub(crate) fn spawn_initial_name_index_supervisors(&mut self) {
         let Some(db) = self.search_index_db.as_ref().cloned() else {
             return;
@@ -11539,21 +11530,18 @@ impl eframe::App for App {
         // ===== 起動オーバーレイ =====
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
-        // 入力イベントを破棄する。完了したら Ready に遷移して通常 update に進む。
-        if self.startup_phase != StartupPhase::Ready {
-            // 1 度だけ bg スレッドを起動 (this frame or earlier)
+        // 入力イベントを破棄する。完了したら通常 update に進む。
+        if !self.startup_done {
             self.kick_off_startup_init();
-            // bg スレッドの完了を確認
             self.poll_startup_init();
-            if self.startup_phase != StartupPhase::Ready {
-                // まだ Loading: オーバーレイ描画 + 入力ガード + 次フレーム要求 + 早期 return
+            if self.startup_init.is_some() {
                 self.render_startup_overlay(ctx);
                 self.consume_input_during_startup(ctx);
                 ctx.request_repaint();
                 return;
             }
-            // Ready に遷移したフレーム: 残った入力イベント (誤入力) を一掃してから
-            // 通常 update に進む。
+            // Ready に遷移したフレーム: Loading 中に積もった入力イベントが
+            // 誤発火しないよう一掃してから通常 update に進む。
             self.consume_input_during_startup(ctx);
         }
 
