@@ -8201,7 +8201,12 @@ impl App {
         };
         let key = crate::adjustment_db::normalize_path(path);
         let rf = &self.settings.rating_filter;
+        // 合成 drilled view (検索結果一覧そのもの) のときだけ search_drilled_folder_counts
+        // を参照する。Ctrl+G 経由で実フォルダ/ZIP/PDF を開いた実体ビューでは
+        // items_are_global_search_view=false になっており、items は実体側の中身なので
+        // 検索ヒット由来のキャッシュを引くと別フォルダの件数を流用してしまう。
         let in_global_drilled = self.global_search.active
+            && self.items_are_global_search_view
             && matches!(
                 self.global_search.view,
                 crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
