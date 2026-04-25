@@ -388,8 +388,20 @@ fn run_initial_scan(
     let scan_kind = if is_initial { "initial" } else { "rescan" };
     let t_start = Instant::now();
 
-    // UI 向けに「アクティブスキャン中」フラグを立てる (snapshot 時に ⏳ 表示)
+    // UI 向けに「アクティブスキャン中」フラグを立てる (snapshot 時に ⏳ 表示)。
+    // walker / ingest の早期 return 経路でも確実に false に戻すため RAII ガードで管理。
+    // 旧実装は walker scan エラー / ingest apply エラーで return すると in_full_scan=true
+    // のまま放置され、UI に「⏳ スキャン中」が居残るバグがあった。
     stats.lock().unwrap().in_full_scan = true;
+    struct InFullScanGuard<'a>(&'a Mutex<SupervisorStats>);
+    impl Drop for InFullScanGuard<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut s) = self.0.lock() {
+                s.in_full_scan = false;
+            }
+        }
+    }
+    let _scan_guard = InFullScanGuard(stats);
 
     crate::logger::log(format!(
         "indexer[{favorite_id}]: {scan_kind} scan starting (walker phase)"
@@ -481,7 +493,7 @@ fn run_initial_scan(
         if is_initial {
             s.initial_scan_duration_ms = Some(dur_ms);
         }
-        s.in_full_scan = false;
+        // in_full_scan のクリアは関数末尾の InFullScanGuard::drop で行う。
     }
 }
 
