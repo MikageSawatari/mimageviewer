@@ -205,6 +205,24 @@ impl App {
             let undo = i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
             (undo, redo)
         });
+        // タグ書き込み worker が in-flight の間に Undo/Redo を通すと、未確定のタグ
+        // 操作が `pending_tag_undos` に居座ったまま直前の別操作を pop してしまい、
+        // worker 結果が遅れて到着するとスタック順がユーザー操作順と入れ替わる。
+        // 完了 (= pending 空 + worker idle) まで待つ。consume はしているのでキーは
+        // ここで握り潰し、ユーザーが再度押してもらう運用 (非常に短いウィンドウ)。
+        if undo || redo {
+            let tag_busy = self
+                .tag_write_handle
+                .as_ref()
+                .is_some_and(|h| h.is_busy())
+                || !self.pending_tag_undos.is_empty();
+            if tag_busy {
+                crate::logger::log(
+                    "[UNDO] suppressed: tag-write worker in flight (pending tag op not yet finalized)",
+                );
+                return;
+            }
+        }
         if undo {
             self.apply_meta_undo();
         }

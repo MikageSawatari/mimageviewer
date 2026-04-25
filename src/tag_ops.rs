@@ -299,6 +299,11 @@ impl App {
                         if res.tx_id != 0 {
                             pending_updates.push(PendingUpdate::Failure { tx_id: res.tx_id });
                         }
+                        // 楽観更新済みの tags_cache を実 disk 状態 (= worker が読み取った
+                        // tags_before) に巻き戻す。XMP 書き込みは失敗しているのでファイル側は
+                        // 不変だが、グリッドのバッジは予測値で更新済みのため放置すると stale
+                        // 表示になる (Codex P3 指摘)。
+                        cache_updates.push((res.path.clone(), res.tags_before));
                         errors.push((res.path, e));
                     }
                 }
