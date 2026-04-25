@@ -1830,6 +1830,10 @@ pub struct App {
     pub(crate) erase_selected_vector: Option<usize>,
     /// ベクタオブジェクト編集のドラッグ状態。
     pub(crate) erase_vector_drag: Option<EraseVectorDrag>,
+    /// バックグラウンド実行中の MI-GAN inpaint。`Some` の間は重複投入せず、
+    /// 完了 (もしくは新規投入) で `take()` する。UI スレッドが MI-GAN 推論
+    /// (300-500ms) で固まらないようにするための非同期化エントリ。
+    pub(crate) erase_inpaint_pending: Option<crate::ui_erase::EraseInpaintPending>,
 
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
@@ -2245,6 +2249,7 @@ impl Default for App {
             erase_vectors: Vec::new(),
             erase_selected_vector: None,
             erase_vector_drag: None,
+            erase_inpaint_pending: None,
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
@@ -11748,6 +11753,7 @@ impl eframe::App for App {
 
         self.poll_prefetch(ctx);
         self.poll_ai_upscale(ctx);
+        self.poll_erase_inpaint(ctx);
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();

@@ -6,12 +6,31 @@
 //! マスクは SQLite (mask_db) に永続化される。
 
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use crate::app::{App, EraseSnapshot, EraseTool, EraseVectorDrag, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
 use crate::mask_db::{LineKind, LineObject};
 use crate::ui_fullscreen::FsKeyAction;
+
+/// 進行中の MI-GAN inpaint 推論。`App.erase_inpaint_pending` で保持され、
+/// 推論完了 (もしくは新規投入で前ジョブをキャンセル) するまで生存する。
+/// 推論本体は worker thread で走り、結果は `rx` 経由で UI スレッドへ届ける。
+pub(crate) struct EraseInpaintPending {
+    /// 結果を反映する fs_cache のキー (= フルスクリーン idx)。
+    pub idx: usize,
+    /// worker からの結果受信。`Ok(image)` で完了、`Err(_)` でキャンセル/失敗。
+    pub rx: mpsc::Receiver<egui::ColorImage>,
+    /// 投入時にセット、worker は毎タイル前に load してキャンセル監視。
+    /// 新規ジョブ投入で前ジョブを `store(true)` にして worker に終了を促す。
+    pub cancel: Arc<AtomicBool>,
+    /// 投入時刻 (ログ用)。
+    pub started_at: std::time::Instant,
+    /// 呼び出し経路識別子 (ログ用)。
+    pub log_prefix: &'static str,
+}
 
 /// ベクタオブジェクトの端点ヒット判定半径 (画像ピクセル)。
 const ENDPOINT_HIT_RADIUS: f32 = 12.0;
@@ -1779,9 +1798,10 @@ impl App {
         crate::logger::log(format!(
             "erase: inpaint start, masked pixels={masked_count}"
         ));
-        self.run_inpaint_and_cache(ctx, fs_idx, &original, &composite, w, h, "exec");
+        // 推論本体は worker thread。完了反映は `poll_erase_inpaint` で別フレームに行う。
+        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec");
         self.reset_erase_mode();
-        crate::logger::log("erase: inpaint complete".to_string());
+        self.show_feedback_toast("[補完中…]".to_string());
     }
 
     /// 画像ロード完了後に保存済みマスクがあれば自動で inpaint を適用する。
@@ -1826,7 +1846,7 @@ impl App {
             self.erase_base_cache.insert(idx, Arc::clone(&pixels));
         }
 
-        self.run_inpaint_and_cache(ctx, idx, &pixels, &composite, w, h, "auto-apply");
+        self.run_inpaint_and_cache(ctx, idx, pixels, composite, w, h, "auto-apply");
     }
 
     /// フルスクリーン表示中 (消しゴムモード外) で F7/F8 から呼ばれる。
@@ -1887,33 +1907,90 @@ impl App {
             "erase: apply_slot_in_viewing_mode slot={slot} idx={fs_idx}"
         ));
 
-        self.run_inpaint_and_cache(ctx, fs_idx, &original, &composite, w, h, "viewing-mode");
+        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "viewing-mode");
         self.show_feedback_toast(format!("[スロット{slot}適用]"));
     }
 
-    /// MI-GAN (失敗時は拡散フォールバック) で inpaint を走らせ、結果を `fs_cache` に
-    /// 差し込んで上位レイヤ (AI upscale / 補正) のキャッシュを無効化する共通経路。
+    /// MI-GAN (失敗時は拡散フォールバック) で inpaint を走らせ、結果は worker thread から
+    /// `App.erase_inpaint_pending` 経由で UI スレッドに届く。完了反映は `poll_erase_inpaint`。
     /// E キーの確定・保存済みマスクの自動適用・F7/F8 の 3 つから呼ばれる。
     /// `log_prefix` はログ行を区別するための識別子。
+    ///
+    /// 旧実装は UI スレッド同期で 350-460ms ブロックしていた (MI-GAN タイル推論
+    /// 14×~18ms + composite + texture upload)。マスク編集中はサイクルごとに発生
+    /// するため、操作が引っかかる元になっていた。
     fn run_inpaint_and_cache(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-        original: &egui::ColorImage,
-        composite: &[bool],
+        original: Arc<egui::ColorImage>,
+        composite: Vec<bool>,
         w: usize,
         h: usize,
-        log_prefix: &str,
+        log_prefix: &'static str,
     ) {
         self.ensure_ai_runtime();
-        let result = self
-            .try_migan_inpaint(original, composite, w, h)
-            .unwrap_or_else(|e| {
-                crate::logger::log(format!(
-                    "[erase] {log_prefix} MI-GAN failed: {e}, falling back to diffusion"
-                ));
-                inpaint_diffuse(original, composite, w, h)
-            });
+        let runtime = self.ai_runtime.clone();
+        let manager = self.ai_model_manager.clone();
+
+        // 進行中のジョブがあればキャンセルしてから新しいジョブを投入する。
+        // (連打や別ページからの apply_slot_in_viewing_mode 等で重なるケース)
+        if let Some(prev) = self.erase_inpaint_pending.take() {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel::<egui::ColorImage>();
+        let ctx_clone = ctx.clone();
+
+        std::thread::Builder::new()
+            .name("erase-inpaint".to_string())
+            .spawn(move || {
+                let result =
+                    run_inpaint_pure(runtime.as_ref(), &manager, &original, &composite, w, h, &cancel_for_thread, log_prefix);
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = tx.send(result);
+                ctx_clone.request_repaint();
+            })
+            .expect("spawn erase-inpaint worker");
+
+        self.erase_inpaint_pending = Some(EraseInpaintPending {
+            idx,
+            rx,
+            cancel,
+            started_at: std::time::Instant::now(),
+            log_prefix,
+        });
+    }
+
+    /// `App::update` 先頭から毎フレーム呼ばれ、worker から結果が届いていれば
+    /// fs_cache を差し替える。テクスチャアップロードは UI スレッドで行うが、
+    /// それ自体は数 ms で済むので問題ない。
+    pub(crate) fn poll_erase_inpaint(&mut self, ctx: &egui::Context) {
+        let pending = match self.erase_inpaint_pending.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => {
+                // worker 完了まで定期 wake-up (50ms) を入れておく。worker 側でも
+                // 完了時に request_repaint しているが、念のため取りこぼし対策。
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // worker がキャンセルされたか panic した。state だけ片付ける。
+                self.erase_inpaint_pending = None;
+                return;
+            }
+        };
+        let pending = self.erase_inpaint_pending.take().unwrap();
+        let elapsed = pending.started_at.elapsed();
+        let idx = pending.idx;
         let tex = ctx.load_texture(
             format!("fs_inpainted_{idx}"),
             result.clone(),
@@ -1930,6 +2007,11 @@ impl App {
             },
         );
         self.invalidate_derived_fs_caches(idx);
+        crate::logger::log(format!(
+            "erase: inpaint complete ({} ms, prefix={})",
+            elapsed.as_millis(),
+            pending.log_prefix
+        ));
     }
 
     /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正) の
@@ -1954,30 +2036,54 @@ impl App {
         })
     }
 
-    fn try_migan_inpaint(
-        &mut self,
-        original: &egui::ColorImage,
-        mask: &[bool],
-        w: usize,
-        h: usize,
-    ) -> Result<egui::ColorImage, crate::ai::AiError> {
-        let runtime = self
-            .ai_runtime
-            .clone()
-            .ok_or_else(|| crate::ai::AiError::Ort("AI runtime not available".to_string()))?;
-        let manager = self.ai_model_manager.clone();
+}
 
+/// worker thread で走る inpaint 本体。`AiRuntime` が利用可能なら MI-GAN、
+/// 失敗 / runtime 不在なら拡散 fallback。`&mut self` を取らないことで
+/// UI スレッドに戻らずに完結できる。
+fn run_inpaint_pure(
+    runtime: Option<&Arc<crate::ai::runtime::AiRuntime>>,
+    manager: &Arc<crate::ai::model_manager::ModelManager>,
+    original: &egui::ColorImage,
+    composite: &[bool],
+    w: usize,
+    h: usize,
+    cancel: &Arc<AtomicBool>,
+    log_prefix: &str,
+) -> egui::ColorImage {
+    if let Some(rt) = runtime {
         let kind = crate::ai::ModelKind::InpaintMiGan;
-        let model_path = manager
-            .model_path(kind)
-            .ok_or_else(|| crate::ai::AiError::ModelNotFound(kind))?;
-        if !runtime.is_loaded(kind) {
-            runtime.load_model(kind, &model_path)?;
+        match manager.model_path(kind) {
+            Some(model_path) => {
+                if !rt.is_loaded(kind) {
+                    if let Err(e) = rt.load_model(kind, &model_path) {
+                        crate::logger::log(format!(
+                            "[erase] {log_prefix} MI-GAN load failed: {e}, falling back to diffusion"
+                        ));
+                        return inpaint_diffuse(original, composite, w, h);
+                    }
+                }
+                match inpaint_migan(rt, original, composite, w, h, cancel) {
+                    Ok(r) => return r,
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "[erase] {log_prefix} MI-GAN failed: {e}, falling back to diffusion"
+                        ));
+                    }
+                }
+            }
+            None => {
+                crate::logger::log(format!(
+                    "[erase] {log_prefix} MI-GAN model not found, falling back to diffusion"
+                ));
+            }
         }
-
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        inpaint_migan(&runtime, original, mask, w, h, &cancel)
+    } else {
+        crate::logger::log(format!(
+            "[erase] {log_prefix} AI runtime not available, falling back to diffusion"
+        ));
     }
+    inpaint_diffuse(original, composite, w, h)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
