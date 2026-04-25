@@ -290,8 +290,7 @@ impl<'a> IngestSession<'a> {
         total >= BATCH_FLUSH_COUNT || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
     }
 
-    /// 画像ファイルから IndexDoc を組み立てる (mark_pending も同時に行う)。
-    /// 旧 `ingest_image` を「writer に touch しない build フェーズ」として再構成したもの。
+    /// 画像ファイルから IndexDoc を組み立てる。SQLite には触れない build phase。
     fn build_doc_for_image(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
         self.build_doc(cand, Container::Fs, IndexKind::Image, norms)

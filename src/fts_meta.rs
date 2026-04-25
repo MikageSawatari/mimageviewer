@@ -325,15 +325,11 @@ impl FtsMetaDb {
     }
 
     /// 起動時差分走査 (§7.4) で使用。favorite_id スコープ内の **status=Ok のファイルのみ**
-    /// (path, mtime, file_size) を返す (Codex 6 回目指摘 #6)。
+    /// (path, mtime, file_size) を返す。
     ///
-    /// pending / failed / tombstone を "既存" として扱わないので、
-    /// クラッシュで残った pending はこの結果に入らず、差分 diff が
-    /// 「FS にあるけど DB に無い」と判定して再 ingest に回す。
-    /// tombstone も除外するので、削除保留の path が "まだある" 扱いにはならない。
-    ///
-    /// Supervisor 起動前に `reconcile_not_ok_paths()` を呼ぶことで、
-    /// status != 0 の path 一覧を取り別途再 ingest キューに乗せられる (§5.6.3)。
+    /// Failed (= 前回 ingest 失敗 / legacy migration から降格された行) は除外する。
+    /// 結果として walker の 3-way diff が「FS にあるけど DB に無い」と判定して再
+    /// ingest に回し、Tantivy First の流れで status=Ok 直書きされる。
     pub fn list_favorite_files(
         &self,
         favorite_id: Uuid,
@@ -357,12 +353,10 @@ impl FtsMetaDb {
         Ok(out)
     }
 
-    /// 起動時 reconciliation 用 (§5.6.3, Codex 6 回目指摘 #6):
-    /// 指定お気に入りスコープで status != Ok の path 一覧を返す。
-    /// 呼び出し側は:
-    ///   - pending / failed: 再 ingest キューへ
-    ///   - tombstone: Tantivy delete 再実行 → purge
-    /// で復旧する。
+    /// 起動時 reconciliation 用: 指定お気に入りスコープで status=Failed の path 一覧を返す。
+    /// 呼び出し側は Tantivy delete + SQLite delete_paths で行を片付け、walker が次回
+    /// 「FS あり + DB 無し」として再 ingest 候補に拾う。
+    /// (legacy v5 DB の Pending/Tombstone は migration で Failed に降格されてここに入る)
     pub fn list_not_ok_paths(
         &self,
         favorite_id: Uuid,

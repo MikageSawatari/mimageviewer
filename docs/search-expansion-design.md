@@ -7,6 +7,18 @@
 [search-architecture.md](search-architecture.md) を参照。本書は「なぜこの設計か」
 「スキーマのフィールド単位の根拠」「UI の詳細仕様」に絞る。
 
+> **⚠ INDEX_VERSION=5 までの旧設計を含む** — 以下の節は v5 で本文 norms を SQLite に
+> 持っていた頃の設計判断。v6 (現行) では:
+> - 本文は Tantivy 側 (`*_text` STORED フィールド) に集約済み
+> - `fts_meta.db.files.{name_norm,...,tags_norm}` 列は廃止
+> - `status` は `Ok` / `Failed` の 2 値のみ (Pending / Tombstone は廃止)
+> - Ctrl+G post-filter の `fts_meta` SELECT も廃止 (Tantivy First 順序)
+> - 書き込み手順は [search-architecture.md §4.2](search-architecture.md) を参照
+>
+> 本書の §3.5 (`*_norm` 列) / §3.6 (二段整合性プロトコル, Pending/Tombstone) /
+> §3.7 タグ即時反映周辺の記述は v5 当時の根拠資料として残しているもので、現行
+> 実装の正としては扱わないこと。
+
 ---
 
 ## 1. 目的とスコープ

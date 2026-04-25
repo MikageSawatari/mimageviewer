@@ -144,37 +144,59 @@ tag_write_worker も同じ writer を共有するため、タグ書き込みと�
 commit は干渉しない。
 ```
 
-### 4.2 二段整合性プロトコル (Upsert)
+### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
 
-`fts_meta.db` (SQLite) と Tantivy index は別ストレージ。片方だけ更新されて
-クラッシュしても再起動時に復元できるよう、以下の順序で書く:
+`fts_meta.db` (SQLite) と Tantivy index は別ストレージ。INDEX_VERSION=6 から
+**Tantivy First** に統一: Tantivy commit が成功したフレームでのみ SQLite を
+更新する。SQLite の `status` は `Ok` / `Failed` の 2 値だけで、Pending / Tombstone
+の中継状態は廃止した。検索 post-filter (`fts_meta` への SQLite SELECT) も廃止。
+
+#### Upsert (ingest)
 
 ```
-(1) fts_meta.db UPSERT status=pending, index_generation += 1, norms を書く
-    (SQLite 単独 tx。ここが失敗したら何もコミットしない)
+(1) IndexDoc を構築 (メタ抽出 + norms 生成、SQLite には触れない)
 (2) Tantivy writer に delete(path) + add_document を push (バッファに積む)
-(3) バッチ境界 (100 件 or 5 秒) で IndexWriter::commit()
-    (commit 成功まで古い segment が見える)
-(4) fts_meta.db UPDATE status=ok, indexed_at=now
-    (ここで失敗しても pending のまま残す → 次回起動時に再 ingest)
+(3) バッチ境界 (100 件 or 5 秒) で IndexWriter::commit() + reader reload
+(4) commit 成功後に fts_meta.db UPSERT status=Ok, index_generation += 1
+    (ここで失敗してもログだけ。次回起動の walker 3-way diff で再 ingest される)
 ```
 
-Delete はほぼ対称 (`status=tombstone` → Tantivy delete + commit → 物理 DELETE)。
-tombstone 中は Ctrl+G の post-filter で明示除外する。
+#### Delete
+
+```
+(1) Tantivy writer に delete_term(path) を push
+(2) バッチ境界で commit + reader reload
+(3) commit 成功後に fts_meta.db DELETE
+    (失敗時は SQLite に行残る → 次回 walker が「FS なし + DB あり」で再 delete)
+```
+
+#### クラッシュからの復旧
+
+| クラッシュ位置 | Tantivy | SQLite | 復旧経路 |
+|---|---|---|---|
+| (1) 前 / (2) 前 | 古い | 古い | walker は何も拾わない |
+| (3) commit 中 | 古い or 新 | 古い | walker が「FS あり + DB 古い」→ 再 ingest |
+| (3) と (4) の間 | 新 | 古い | walker が「FS あり + DB 古い」→ 再 ingest (Tantivy 上書き) |
+| (4) 後 | 新 | 新 | OK |
+
+中間状態 (Tantivy だけ新) で検索結果が一瞬古い text を返し得るが、削除直後の
+削除済みファイルが結果に出るのと同じ "短い窓" として許容する (実害はサムネイル
+読み込み失敗で気付ける)。
 
 ### 4.3 起動時 reconciliation
 
-`IndexerManager::new` が supervisor spawn 前に同期実行する (クラッシュ残留の
-整理):
+`IndexerManager::new` が supervisor spawn 前に同期実行する:
 
-- `status=pending` の残留行 → 再 ingest キューへ
-- `status=tombstone` の残留行 → Tantivy 削除再投入 → 物理 DELETE
-- `status=failed` の行 → 再 ingest キューへ (最大 3 回まで)
+- `status=Failed` の行 → Tantivy delete_term + SQLite delete_paths
+  (legacy v5 DB から migrate された Pending/Tombstone もここに集約される)
 - `index_version` 不一致 or `fts_index/` schema 不一致 → 全再構築
 
 通常は数十〜数百行程度で 100ms 以下。大量なら supervisor 起動は待たされるが、
 writer 競合防止のため同期実行する方が安全 (非同期化すると supervisor と
 reconcile が `IndexWriter` を奪い合って失敗する)。
+
+VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
+idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
 
 ### 4.4 名前索引 (Ctrl+S 用)
 
