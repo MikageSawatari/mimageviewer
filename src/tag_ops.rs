@@ -87,6 +87,17 @@ impl App {
             return;
         }
         // tags_cache は grid 表示で既に warm 済みなので追加 I/O は発生しない。
+        //
+        // **既知制約 (Codex P3, 後続課題)**: capture_tag_undo は worker 投入前に
+        // tags_cache から before/after を予測する。worker の Toggle は実ファイルの
+        // dc:subject を読み直して Add/Remove を決めるため、cache が stale (= 外部
+        // ツールが XMP を書き換え済み) のときや、個別ファイルの XMP 書き込みが失敗
+        // した場合に、Undo entry と実ディスク状態がずれ得る。Ctrl+Z 後にユーザが
+        // 「変化なし」と感じるが、実ディスクは触っていないので破壊性はない。
+        //
+        // 完全な解決には worker が `tags_before` (書き込み直前の disk 状態) を結果に
+        // 載せ、poll_tag_write_results が成功分だけ Undo entry を事後確定する仕組みが
+        // 要る (worker protocol 拡張 + pending undo buffer の追加)。
         let with_hash = format!("#{name_owned}");
         let summary = format!("#{name_owned} のトグル");
         self.capture_tag_undo(&paths, summary, |before| {
