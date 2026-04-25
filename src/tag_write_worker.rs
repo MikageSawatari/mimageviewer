@@ -368,8 +368,15 @@ fn upsert_tags_via_dispatcher(
     let Ok(Some(row)) = meta.get(&key) else {
         return false;
     };
-    // 既存 Tantivy doc から他ソース原文を引き継ぐ。doc が無い (= まだ pending) なら
-    // 通常 ingest に任せて何もしない。
+    // 進行中の ingest (status != Ok) は触らない (Codex P2 指摘):
+    // Pending の間に tag-only upsert を入れると、ingest がまだ commit していない最新原文を
+    // 旧 STORED 値で潰してしまう race を起こす。次回の ingest commit に任せる。
+    if row.status != crate::fts_meta::FileStatus::Ok {
+        return false;
+    }
+    // ingest worker の commit 直後でも reader 反映には遅延があり得るので、
+    // 既存 doc を読む前に明示 reload して最新 commit を含む snapshot を取る。
+    let _ = fts.reload_reader();
     let searcher = fts.searcher();
     let addr = match crate::fts_index::find_doc_by_path(&searcher, fts.fields(), &key) {
         Ok(Some(a)) => a,

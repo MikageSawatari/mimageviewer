@@ -144,11 +144,20 @@ impl<'a> IngestSession<'a> {
             }
             let upserts = std::mem::take(batch_upserts);
             let deletes = std::mem::take(batch_deletes);
+            // INDEX_VERSION=5 で post-filter 用原文を Tantivy STORED に移したため、
+            // reload を待たずに `mark_ok` すると以下の race が発生する:
+            //   T1: commit (reader 未 reload)
+            //   T2: mark_ok (fts_meta 上 status=Ok)
+            //   T3: 検索 worker が `fts.searcher()` で旧 reader snapshot を取る
+            //   T4: status=Ok を確認後、旧 STORED から古い原文で post-filter →
+            //       「もう存在しない古いテキスト」が偽陽性ヒット
+            // 同期 reload (`reload_after_commit=true`) を要求して、reader が
+            // 確実に新 commit を見える状態になってから mark_ok する。
             writer.batch(
                 upserts,
                 deletes,
-                true, // commit_after
-                false, // reload_after_commit (Ctrl+G 時に OnCommitWithDelay で自動 reload)
+                true,  // commit_after
+                true,  // reload_after_commit
                 WriterPriority::Background,
             )?;
             if !pending_paths.is_empty() {
@@ -566,6 +575,59 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert!(!hits.is_empty(), "Tantivy 側でヒットする");
+    }
+
+    /// Codex P1 回帰: ingest commit 後 `mark_ok` する前に reader が確実に
+    /// reload 済みであること。post-filter は同じ Tantivy snapshot から STORED 原文を
+    /// 引くので、`status=Ok` を見たあとに古い snapshot を読まされると偽陽性になる。
+    /// `IngestSession::apply` 完了直後に reader が最新を見えていれば OK。
+    #[test]
+    fn mark_ok_implies_reader_sees_latest_commit() {
+        let (tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = AtomicBool::new(false);
+
+        let cand = make_image_file(tmp.path(), "raceguard.jpg");
+        let key = cand.key.clone();
+        let stats = session
+            .apply(
+                vec![cand],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 1);
+        // status=Ok になっていることを fts_meta 側で確認
+        let row = meta.get(&key).unwrap().unwrap();
+        assert_eq!(row.status, FileStatus::Ok);
+        // 明示 reload を呼ばずに searcher を取る → reader は既に新 commit を見えているはず
+        let searcher = fts.searcher();
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["raceguard"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "ingest 完了直後 (mark_ok 後) の searcher は新 doc を見えるべき"
+        );
     }
 
     #[test]

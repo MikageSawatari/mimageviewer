@@ -43,8 +43,8 @@ use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
-    Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
-    Value,
+    Field, FieldType, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing,
+    TextOptions, Value,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer};
 use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Score, TantivyDocument, Term, doc};
@@ -615,8 +615,14 @@ pub fn doc_text_for_target(
 // 内部: スキーマ構築とトークナイザ登録
 // -----------------------------------------------------------------------
 
-/// 既存の Tantivy schema が最新 (per-source + tags) のフィールド集合と一致するか判定する。
-/// 判定: 新フィールド 6 本が揃っていて、旧 `all_text` が残っていないこと。
+/// 既存の Tantivy schema が最新と一致するか判定する。
+/// 判定: 新フィールド 6 本 (`name`/`exif_text`/`xmp_tweet_text`/`png_prompt_text`/
+/// `pdf_meta_text`/`tags`) が揃っていて、旧 `all_text` が残っておらず、
+/// **かつ INDEX_VERSION=5 で要求される STORED 属性が付いていること**。
+///
+/// STORED チェックを忘れると、v4 (per-source field 名は同じ・STORED なし) を
+/// 再利用してしまい、新 ingest した doc も STORED されず post-filter が空文字列で
+/// 動いて検索ヒットがゼロに見える事故が起きる (Codex P2 指摘)。
 fn schema_is_stale(schema: &Schema) -> bool {
     let has_new = schema.get_field("exif_text").is_ok()
         && schema.get_field("xmp_tweet_text").is_ok()
@@ -624,8 +630,31 @@ fn schema_is_stale(schema: &Schema) -> bool {
         && schema.get_field("pdf_meta_text").is_ok()
         && schema.get_field("kind").is_ok()
         && schema.get_field("tags").is_ok();
-    let has_legacy_all_text = schema.get_field("all_text").is_ok();
-    !has_new || has_legacy_all_text
+    if !has_new {
+        return true;
+    }
+    if schema.get_field("all_text").is_ok() {
+        return true;
+    }
+    // text 系 6 フィールドはすべて STORED 必須 (INDEX_VERSION=5)
+    for name in [
+        "name",
+        "exif_text",
+        "xmp_tweet_text",
+        "png_prompt_text",
+        "pdf_meta_text",
+        "tags",
+    ] {
+        let Ok(field) = schema.get_field(name) else {
+            return true;
+        };
+        let entry = schema.get_field_entry(field);
+        match entry.field_type() {
+            FieldType::Str(opts) if opts.is_stored() => {}
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// ディレクトリ配下のファイルを全削除してから、ディレクトリ自体も再作成する。
@@ -1134,6 +1163,56 @@ mod tests {
         // 新規ディレクトリでは wipe パスを通らず、普通に create される。
         let dir = TempDir::new().unwrap();
         let _idx = FtsIndex::open_at(dir.path()).unwrap();
+    }
+
+    /// Codex P2 回帰: v4 schema (per-source field 名は同じ・STORED 無し) で作られた
+    /// インデックスを開いたとき、`schema_is_stale` が true を返して wipe される。
+    /// STORED チェックを忘れると v4 を再利用してしまい、新 ingest した doc も STORED
+    /// されず post-filter が空文字列で動いて検索ヒットがゼロに見える事故が起きる。
+    #[test]
+    fn opening_v4_schema_without_stored_text_is_detected_as_stale() {
+        use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("idx");
+        std::fs::create_dir_all(&path).unwrap();
+
+        // v4 スキーマ: フィールド名は v5 と同じだが TEXT は STORED なし
+        {
+            let mut b = Schema::builder();
+            b.add_text_field("path", STRING | STORED);
+            b.add_text_field("container", STRING | STORED);
+            b.add_text_field("zip_entry", STRING | STORED);
+            b.add_text_field("favorite_id", STRING | STORED);
+            b.add_text_field("kind", STRING | STORED);
+            b.add_i64_field("mtime", INDEXED | STORED);
+            b.add_i64_field("file_size", STORED);
+            let bigram = TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(BIGRAM_TOKENIZER_NAME)
+                    .set_index_option(IndexRecordOption::WithFreqs),
+            );
+            b.add_text_field("name", bigram.clone());
+            b.add_text_field("exif_text", bigram.clone());
+            b.add_text_field("xmp_tweet_text", bigram.clone());
+            b.add_text_field("png_prompt_text", bigram.clone());
+            b.add_text_field("pdf_meta_text", bigram.clone());
+            b.add_text_field("tags", bigram); // STORED 未指定
+            let v4_schema = b.build();
+            let v4_index = Index::create_in_dir(&path, v4_schema).unwrap();
+            register_tokenizer(&v4_index);
+        }
+        let v4_idx = Index::open_in_dir(&path).unwrap();
+        assert!(
+            schema_is_stale(&v4_idx.schema()),
+            "STORED 無しの v4 schema は stale 扱いになるべき"
+        );
+        drop(v4_idx);
+
+        // FtsIndex::open_at が wipe → 新 schema で再作成し、STORED 付き
+        let idx = FtsIndex::open_at(&path).unwrap();
+        let s = idx.index().schema();
+        // 再作成後の schema は STORED 付きなので stale ではない
+        assert!(!schema_is_stale(&s));
     }
 
     #[test]
