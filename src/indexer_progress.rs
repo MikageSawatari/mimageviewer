@@ -24,12 +24,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 直近サンプルの保持期間。これより古いサンプルは ETA 計算で破棄する。
-const ETA_WINDOW: Duration = Duration::from_secs(10);
+/// 短かすぎると 1 アイテム重い/軽いの差で ETA が大きく振動して読みづらくなる。
+/// 60 秒 = 1 分は「ファイル種別の偏り」を平均化しつつ、状況変化への追従も
+/// それなりに保てるバランス点。
+const ETA_WINDOW: Duration = Duration::from_secs(60);
 
 /// サンプル件数のハード上限。`set_count` が時刻が進まない状況で連打されたとき
 /// (テストや単一 Instant の精度限界) の暴走を防ぐ防御。通常は ETA_WINDOW で
 /// 自然に間引かれるためここまで届かない。
-const ETA_SAMPLES_MAX: usize = 1024;
+const ETA_SAMPLES_MAX: usize = 4096;
 
 /// 進捗カウントの ETA スナップショット。
 #[derive(Clone, Copy, Debug)]
