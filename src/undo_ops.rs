@@ -122,14 +122,18 @@ impl App {
     /// グリッドとフルスクリーンの両ハンドラ共通: Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z を消費して
     /// Undo/Redo を実行する。ダイアログ抑止や IME 抑止は呼び出し元 (`handle_keyboard` /
     /// フルスクリーン入力) が既に弾いてからここに来る前提。
+    ///
+    /// **consume 順序の注意**: egui の `consume_key` は `matches_logically` でマッチ
+    /// するため、`Modifiers::CTRL` 指定でも Shift が併用された Ctrl+Shift+Z を吸って
+    /// しまう。先に Ctrl+Shift+Z (Redo) → 次に Ctrl+Y (Redo) → 最後に Ctrl+Z (Undo)
+    /// の順で consume することで、Ctrl+Shift+Z が Undo 側に流れない。
     pub(crate) fn handle_meta_undo_keys(&mut self, ctx: &egui::Context) {
         let (undo, redo) = ctx.input_mut(|i| {
+            let redo = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ) || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
             let undo = i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
-            let redo = i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
-                || i.consume_key(
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    egui::Key::Z,
-                );
             (undo, redo)
         });
         if undo {
