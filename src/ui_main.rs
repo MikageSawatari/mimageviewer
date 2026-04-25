@@ -421,7 +421,7 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    let checking = self.update_check_rx.is_some();
+                    let checking = self.update_check_pending.is_some();
                     if ui
                         .add_enabled(
                             !checking,

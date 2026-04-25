@@ -68,6 +68,14 @@ impl StartupInitPending {
     }
 }
 
+/// 進行中の更新チェックワーカー。`rx` が結果を運び、`manual` は失敗時の UI 表示判定。
+/// `App::update_check_pending = None` で両方をまとめて落とせるため、リセットの整合性が
+/// 取りやすい (rx だけ落として manual を残すミスが起きない)。
+pub(crate) struct UpdateCheckPending {
+    pub(crate) rx: mpsc::Receiver<Result<crate::update_check::UpdateInfo, String>>,
+    pub(crate) manual: bool,
+}
+
 /// 起動オーバーレイ用の `StartupProgressHook` を作る共通ヘルパー。
 /// `IndexerManager::new` が各 sub-step の前に呼び、Mutex 内の文字列を更新する。
 fn make_progress_hook(progress: Arc<Mutex<String>>) -> crate::indexer_manager::StartupProgressHook {
@@ -1849,19 +1857,15 @@ pub struct App {
     pub(crate) show_tray_enabled_notice: bool,
 
     // ── バージョン更新通知 ────────────────────────────────────────
-    /// 起動時 / 定期チェックの結果待ち receiver。`take` 後は None に戻し、
-    /// `update_info` に結果を反映する。
-    pub(crate) update_check_rx:
-        Option<std::sync::mpsc::Receiver<Result<crate::update_check::UpdateInfo, String>>>,
+    /// in-flight な更新チェック (rx + manual モードフラグをまとめる)。`Some` の間は
+    /// 重複 spawn しない。`take()` で結果回収時に rx と manual を同時に外せる。
+    pub(crate) update_check_pending: Option<UpdateCheckPending>,
     /// 直近の正常な更新チェック結果。`is_newer=true` の間は通知バッジを表示する。
     pub(crate) update_info: Option<crate::update_check::UpdateInfo>,
     /// 最後にチェックを spawn した時刻。`UPDATE_CHECK_INTERVAL` 経過で再 spawn。
     pub(crate) update_check_last_spawn: Option<std::time::Instant>,
     /// 「新バージョンがあります」ダイアログを表示中か (バッジクリックで開く)。
     pub(crate) show_update_dialog: bool,
-    /// ユーザーが「今すぐ確認」を押した直後で、結果を必ず UI 表示するモード。
-    /// auto は失敗時 silent だが manual は失敗時にダイアログでエラーを出したい。
-    pub(crate) update_check_manual: bool,
     /// メインウィンドウの HWND (frame.window_handle から最初のフレームで取得)。
     /// Win32 `ShowWindow` でトレイ退避 / 復帰するために必要。
     /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
@@ -2241,11 +2245,10 @@ impl Default for App {
             tray_controller: None,
             window_visible: true,
             show_tray_enabled_notice: false,
-            update_check_rx: None,
+            update_check_pending: None,
             update_info: None,
             update_check_last_spawn: None,
             show_update_dialog: false,
-            update_check_manual: false,
             main_hwnd: None,
             placement_slot: None,
             activation_listener: None,
@@ -2909,16 +2912,15 @@ impl App {
     ///
     /// 既に spawn 中 (rx が残っている) なら多重起動を防ぐため no-op。
     pub(crate) fn kick_update_check(&mut self, manual: bool) {
-        if self.update_check_rx.is_some() {
+        if self.update_check_pending.is_some() {
             return;
         }
         if !manual && !self.settings.update_check_enabled {
             return;
         }
-        self.update_check_manual = manual;
         self.update_check_last_spawn = Some(std::time::Instant::now());
         let rx = crate::update_check::spawn_check(env!("CARGO_PKG_VERSION"));
-        self.update_check_rx = Some(rx);
+        self.update_check_pending = Some(UpdateCheckPending { rx, manual });
     }
 
     /// 起動完了後の初回 + 24 時間ごとの auto kick。`App::update` の毎フレーム冒頭で呼ばれる。
@@ -2939,44 +2941,39 @@ impl App {
         }
     }
 
-    /// `update_check_rx` を非ブロッキング poll する。結果が来ていれば `update_info` に
-    /// 反映し、manual のときは結果ダイアログを開く。auto かつ「新バージョンあり」の
-    /// ときはバッジで気付かせるだけ (ダイアログは開かない)。
+    /// `update_check_pending` を非ブロッキング poll する。結果が来ていれば
+    /// `update_info` に反映し、manual のときは結果ダイアログを開く。auto かつ
+    /// 「新バージョンあり」のときはバッジで気付かせるだけ (ダイアログは開かない)。
     pub(crate) fn poll_update_check(&mut self) {
-        let Some(rx) = self.update_check_rx.as_ref() else {
+        let Some(pending) = self.update_check_pending.as_ref() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(info)) => {
-                let manual = self.update_check_manual;
+        let result = match pending.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_check_pending = None;
+                return;
+            }
+        };
+        let pending = self.update_check_pending.take().unwrap();
+        match result.unwrap() {
+            Ok(info) => {
                 let is_newer = info.is_newer;
+                let tag = info.latest_tag.clone();
                 self.update_info = Some(info);
-                self.update_check_rx = None;
-                self.update_check_manual = false;
-                if manual {
+                if pending.manual {
                     self.show_update_dialog = true;
                 } else if is_newer {
-                    crate::logger::log(format!(
-                        "update_check: newer version found ({})",
-                        self.update_info.as_ref().unwrap().latest_tag
-                    ));
+                    crate::logger::log(format!("update_check: newer version found ({tag})"));
                 }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 crate::logger::log(format!("update_check: failed: {e}"));
-                let manual = self.update_check_manual;
-                self.update_check_rx = None;
-                self.update_check_manual = false;
-                if manual {
-                    // 失敗を UI で見せるため、update_info を None のまま open
+                if pending.manual {
                     self.update_info = None;
                     self.show_update_dialog = true;
                 }
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.update_check_rx = None;
-                self.update_check_manual = false;
             }
         }
     }

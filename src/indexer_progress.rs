@@ -26,6 +26,11 @@ use std::time::{Duration, Instant};
 /// 直近サンプルの保持期間。これより古いサンプルは ETA 計算で破棄する。
 const ETA_WINDOW: Duration = Duration::from_secs(10);
 
+/// サンプル件数のハード上限。`set_count` が時刻が進まない状況で連打されたとき
+/// (テストや単一 Instant の精度限界) の暴走を防ぐ防御。通常は ETA_WINDOW で
+/// 自然に間引かれるためここまで届かない。
+const ETA_SAMPLES_MAX: usize = 1024;
+
 /// 進捗カウントの ETA スナップショット。
 #[derive(Clone, Copy, Debug)]
 pub struct EtaSnapshot {
@@ -75,6 +80,9 @@ impl CountState {
             } else {
                 break;
             }
+        }
+        while self.samples.len() > ETA_SAMPLES_MAX {
+            self.samples.pop_front();
         }
     }
 
@@ -132,16 +140,25 @@ impl ProgressReporter {
     /// カウントをクリアする (= 進捗バー終了)。
     pub fn set_count(&self, current: u64, total: u64) {
         if let Ok(mut g) = self.inner.lock() {
-            if total == 0 {
-                g.count = None;
-                return;
-            }
-            match g.count.as_mut() {
-                Some(c) if c.total == total => c.update(current, total),
-                _ => {
-                    g.count = Some(CountState::new(current, total));
-                }
-            }
+            apply_count(&mut g, current, total);
+        }
+    }
+
+    /// メッセージとカウントを 1 lock で同時更新するホットパス向け版。
+    /// ingest ループのように毎件呼ばれる場所で `set` + `set_count` を別々に呼ぶと
+    /// Mutex を 2 回取るので、ここで 1 回にまとめる。
+    pub fn set_msg_and_count<S: Into<String>>(&self, msg: S, current: u64, total: u64) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.msg = Some(msg.into());
+            apply_count(&mut g, current, total);
+        }
+    }
+
+    /// 進捗カウントだけクリア (フェーズ完了時)。メッセージは触らない。
+    /// `set_count(0, 0)` の名前付きバージョン。
+    pub fn clear_count(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.count = None;
         }
     }
 
@@ -161,6 +178,19 @@ impl ProgressReporter {
     /// カウント情報からの ETA スナップショット。カウント未設定なら None。
     pub fn snapshot_eta(&self) -> Option<EtaSnapshot> {
         self.inner.lock().ok().and_then(|g| g.count.as_ref().map(|c| c.eta()))
+    }
+}
+
+fn apply_count(g: &mut Inner, current: u64, total: u64) {
+    if total == 0 {
+        g.count = None;
+        return;
+    }
+    match g.count.as_mut() {
+        Some(c) if c.total == total => c.update(current, total),
+        _ => {
+            g.count = Some(CountState::new(current, total));
+        }
     }
 }
 

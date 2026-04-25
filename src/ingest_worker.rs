@@ -186,8 +186,11 @@ impl<'a> IngestSession<'a> {
                 // カウントを先頭に置くとダイアログで truncate されても残る。
                 // パスは絶対パスそのままにする (delete 経路は favorite 相対に直すと
                 // tombstone されたキーと紐付けにくいので)。
-                p.set(format!("削除 ({}/{}) {}", i + 1, delete_total, path));
-                p.set_count((i + 1) as u64, delete_total as u64);
+                p.set_msg_and_count(
+                    format!("削除 ({}/{}) {}", i + 1, delete_total, path),
+                    (i + 1) as u64,
+                    delete_total as u64,
+                );
             }
             if let Err(e) = self.meta_db.mark_tombstone(&[path.clone()]) {
                 crate::logger::log(format!("ingest: mark_tombstone failed for {path}: {e}"));
@@ -234,8 +237,11 @@ impl<'a> IngestSession<'a> {
                     .unwrap_or(&cand.abs_path)
                     .display()
                     .to_string();
-                p.set(format!("取込 ({}/{}) {}", i + 1, ingest_total, display));
-                p.set_count((i + 1) as u64, ingest_total as u64);
+                p.set_msg_and_count(
+                    format!("取込 ({}/{}) {}", i + 1, ingest_total, display),
+                    (i + 1) as u64,
+                    ingest_total as u64,
+                );
             }
             // メタ抽出と IndexDoc ビルドはここで実行 (writer に touch しない)。dispatcher 側は
             // upsert_doc を呼ぶだけなので、重い IO はこの thread で並列化されたまま。
@@ -283,7 +289,7 @@ impl<'a> IngestSession<'a> {
         if let Some(p) = progress {
             // 取込/削除フェーズ完了 — ETA カウントをクリアして UI から残り時間を消す。
             // (notify-rs 待機中に「残り 00:00」が残らないようにする)
-            p.set_count(0, 0);
+            p.clear_count();
         }
         Ok(stats)
     }

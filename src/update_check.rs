@@ -84,11 +84,27 @@ fn perform_check(current_version: &str) -> Result<UpdateInfo, String> {
         .and_then(|v| v.as_str())
         .unwrap_or(RELEASES_PAGE_URL)
         .to_string();
+    // 大きい release notes (数十KB級) を全期間メモリに残さないよう先頭 8KB で打ち切る。
+    // ダイアログの ScrollArea でも全文を見せる用途ではなく、概要が分かれば十分。
+    const BODY_CAP: usize = 8 * 1024;
     let body = json
         .get("body")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| {
+            if s.len() <= BODY_CAP {
+                s.to_string()
+            } else {
+                // char 境界で切る (UTF-8 安全)
+                let mut end = BODY_CAP;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let mut t = s[..end].to_string();
+                t.push_str("\n…(以下省略、リリースページ参照)");
+                t
+            }
+        })
+        .unwrap_or_default();
     let stripped = tag.strip_prefix('v').unwrap_or(&tag);
     let latest = semver::Version::parse(stripped)
         .map_err(|e| format!("tag '{tag}' parse: {e}"))?;
