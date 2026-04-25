@@ -130,35 +130,58 @@ impl<'a> IngestSession<'a> {
         let mut stats = IngestStats::default();
         let mut batch_upserts: Vec<IndexDoc> = Vec::with_capacity(BATCH_FLUSH_COUNT);
         let mut batch_deletes: Vec<String> = Vec::new();
+        // ingest 候補のメタ情報。Tantivy commit が成功した後に upsert_meta_ok で
+        // SQLite に書く (Tantivy First 順序)。クラッシュ時は SQLite に行が無いので
+        // walker の 3-way diff で再 ingest 候補に拾われる。
+        let mut pending_ok_meta: Vec<(String, IndexKind, i64, i64)> = Vec::new();
         let mut last_flush = Instant::now();
         let ingest_total = to_ingest.len();
         let delete_total = to_delete.len();
 
-        // sub-batch を dispatcher に投げて Tantivy commit 後に SQLite 物理削除まで完了させるヘルパ。
+        // sub-batch を dispatcher に投げて Tantivy commit 後に SQLite を更新するヘルパ。
+        // ingest: Tantivy commit → SQLite upsert_meta_ok (status=Ok)
+        // delete: Tantivy commit → SQLite delete_paths
+        // どちらも Tantivy First で書き、commit が失敗 / クラッシュした場合は次回起動の
+        // walker / reconciliation で復旧する (Tantivy にあるが SQLite に無い doc も
+        // 「FS にあるけど DB に無い」 / 「FS に無いし DB に無い」のいずれかとして
+        // 検出可能)。
         let flush_batch = |batch_upserts: &mut Vec<IndexDoc>,
-                               batch_deletes: &mut Vec<String>|
+                               batch_deletes: &mut Vec<String>,
+                               pending_ok_meta: &mut Vec<(String, IndexKind, i64, i64)>|
          -> tantivy::Result<()> {
             if batch_upserts.is_empty() && batch_deletes.is_empty() {
                 return Ok(());
             }
             let upserts = std::mem::take(batch_upserts);
             let deletes = std::mem::take(batch_deletes);
-            // SQLite 行を先に消してから Tantivy commit。逆順だと commit 直後で SQLite 行が
-            // 残ってしまう瞬間ができる。一方この順だと「Tantivy にだけ残る」短い窓ができるが、
-            // それは新方針で許容範囲とする。SQLite を後にすると 1 ファイル分の Vec<String> を
-            // clone しないと writer.batch の move と両立しない。
-            if !deletes.is_empty() {
-                if let Err(e) = self.meta_db.delete_paths(&deletes) {
-                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
-                }
-            }
+            let deletes_for_sqlite = deletes.clone();
+            let ok_meta = std::mem::take(pending_ok_meta);
             writer.batch(
                 upserts,
                 deletes,
-                true,  // commit_after
-                true,  // reload_after_commit
+                true,
+                true,
                 WriterPriority::Background,
             )?;
+            // ここに来た時点で Tantivy commit + reader reload が完了している。
+            // SQLite 側を Tantivy に合わせて更新する。
+            for (key, kind, mtime, file_size) in &ok_meta {
+                if let Err(e) = self.meta_db.upsert_meta_ok(
+                    key,
+                    self.favorite_id,
+                    &self.favorite_root,
+                    *kind,
+                    *mtime,
+                    *file_size,
+                ) {
+                    crate::logger::log(format!("ingest: upsert_meta_ok({key}) failed: {e}"));
+                }
+            }
+            if !deletes_for_sqlite.is_empty() {
+                if let Err(e) = self.meta_db.delete_paths(&deletes_for_sqlite) {
+                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
+                }
+            }
             Ok(())
         };
 
@@ -180,13 +203,13 @@ impl<'a> IngestSession<'a> {
             stats.deleted += 1;
 
             if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
-                flush_batch(&mut batch_upserts, &mut batch_deletes)?;
+                flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
                 last_flush = Instant::now();
             }
         }
 
         if stats.cancelled {
-            flush_batch(&mut batch_upserts, &mut batch_deletes)?;
+            flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
             return Ok(stats);
         }
 
@@ -218,6 +241,12 @@ impl<'a> IngestSession<'a> {
             drop(_permit);
             match built {
                 Ok(doc) => {
+                    pending_ok_meta.push((
+                        cand.key.clone(),
+                        doc.kind,
+                        cand.mtime,
+                        cand.file_size,
+                    ));
                     batch_upserts.push(doc);
                     stats.ingested_ok += 1;
                 }
@@ -226,18 +255,21 @@ impl<'a> IngestSession<'a> {
                         "ingest: {:?} build failed: {e}",
                         cand.abs_path
                     ));
-                    let _ = self.meta_db.mark_failed(&cand.key);
+                    // build 失敗時は Tantivy 投入も SQLite 書き込みも行わない。
+                    // 次回起動の walker が「DB に無い」として再 ingest 候補に乗せる。
+                    // 同じファイルが毎回失敗する場合は毎回再試行されるが、abusive な
+                    // 失敗 (例: 壊れた画像) は実害が限定的なので retry 抑制は持たない。
                     stats.ingested_failed += 1;
                 }
             }
 
             if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
-                flush_batch(&mut batch_upserts, &mut batch_deletes)?;
+                flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
                 last_flush = Instant::now();
             }
         }
 
-        flush_batch(&mut batch_upserts, &mut batch_deletes)?;
+        flush_batch(&mut batch_upserts, &mut batch_deletes, &mut pending_ok_meta)?;
         if let Some(p) = progress {
             p.clear_count();
         }
@@ -296,7 +328,8 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, container, kind, norms)
     }
 
-    /// upsert_meta_ok + IndexDoc ビルドを 1 箇所に集約。
+    /// IndexDoc ビルド。SQLite には触れず Tantivy 投入用の構造体のみ返す。
+    /// SQLite 側の status=Ok 書き込みは `flush_batch` 内で Tantivy commit 成功後に行う。
     /// `norms` は move で受けて IndexDoc に埋め込む — per-file で複製は発生しない。
     fn build_doc(
         &self,
@@ -305,16 +338,6 @@ impl<'a> IngestSession<'a> {
         kind: IndexKind,
         norms: crate::ingest_text::PerSourceText,
     ) -> Result<IndexDoc, String> {
-        self.meta_db
-            .upsert_meta_ok(
-                &cand.key,
-                self.favorite_id,
-                &self.favorite_root,
-                kind,
-                cand.mtime,
-                cand.file_size,
-            )
-            .map_err(|e| format!("upsert_meta_ok: {e}"))?;
         Ok(IndexDoc {
             path: cand.key.clone(),
             container,

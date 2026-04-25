@@ -136,29 +136,27 @@ impl FtsMetaDb {
         init_schema(&conn)?;
 
         // v5 → v6 データマイグレーション: status を Ok(0) と Failed(2) の 2 値に正規化。
-        // - Pending(1): クラッシュ等で残留した「ingest 進行中」マーカー → Failed に倒し
-        //   reconciliation で再 ingest 候補として処理させる。
-        // - Tombstone(3): 削除予定だった row → 物理 DELETE。
-        // 1 トランザクションでまとめて適用し、user_version の bump も同じ tx に含める。
-        // 中断時は次回起動でやり直し (どちらも idempotent)。
+        // Pending(1) と Tombstone(3) はどちらも Failed に倒す。
+        // - Pending: クラッシュ等で「ingest 進行中」だったもの → 再 ingest 候補に。
+        // - Tombstone: 削除予定だったもの → reconciliation で Tantivy delete + 物理削除
+        //   される。物理 DELETE してしまうと Tantivy 側に対応 doc が残った場合に
+        //   検索結果に出続ける regression になるので、Failed 経由で reconciliation に
+        //   委ねる。
+        // 1 トランザクションでまとめ、user_version の bump も同じ tx に含める。
         if user_version != INDEX_VERSION {
             let tx = conn.unchecked_transaction()?;
-            let pending_to_failed = if user_version != 0 && user_version < INDEX_VERSION {
-                let p = tx.execute("UPDATE files SET status = 2 WHERE status = 1", [])?;
-                let t = tx.execute("DELETE FROM files WHERE status = 3", [])?;
-                if p > 0 || t > 0 {
+            if user_version != 0 && user_version < INDEX_VERSION {
+                let pending = tx.execute("UPDATE files SET status = 2 WHERE status = 1", [])?;
+                let tombstones = tx.execute("UPDATE files SET status = 2 WHERE status = 3", [])?;
+                if pending > 0 || tombstones > 0 {
                     crate::logger::log(format!(
                         "fts_meta: v{user_version}→v{INDEX_VERSION} migration: \
-                         pending→failed={p} rows, tombstones deleted={t} rows"
+                         pending→failed={pending} rows, tombstone→failed={tombstones} rows"
                     ));
                 }
-                Some(p)
-            } else {
-                None
-            };
+            }
             tx.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
             tx.commit()?;
-            let _ = pending_to_failed;
         }
         // 後始末 (VACUUM) 1 回限り。`application_id` を marker として使う。
         // - rebuild_needed=true (= 旧スキーマから DROP したばかり): 空きページが
@@ -966,13 +964,17 @@ mod tests {
         }
         let db = FtsMetaDb::open_at(&db_path).unwrap();
         assert!(db.get("c:/a/ok.jpg").unwrap().is_some());
-        assert!(db.get("c:/a/pending.jpg").unwrap().is_some(), "pending は failed として残る");
         assert_eq!(
             db.get("c:/a/pending.jpg").unwrap().unwrap().status,
-            FileStatus::Failed
+            FileStatus::Failed,
+            "pending は failed に降格"
         );
         assert!(db.get("c:/a/failed.jpg").unwrap().is_some());
-        assert!(db.get("c:/a/tomb.jpg").unwrap().is_none(), "tombstone は物理削除");
+        assert_eq!(
+            db.get("c:/a/tomb.jpg").unwrap().unwrap().status,
+            FileStatus::Failed,
+            "tombstone は failed に降格 (Tantivy delete を reconciliation に委ねる)"
+        );
     }
 
     #[test]
