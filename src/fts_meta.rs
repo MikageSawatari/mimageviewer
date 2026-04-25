@@ -35,7 +35,14 @@ use crate::search_index_db::normalize_path;
 /// - 5: post-filter 用の正規化済み原文を Tantivy 側 (`*_text` フィールドに STORED)
 ///      へ集約。fts_meta.db の `*_norm` 列を撤去 (本ファイルから DDL も削除)。
 ///      これにより SQLite サイズが大幅縮小し、WAL checkpoint の負荷が下がる。
-pub const INDEX_VERSION: i64 = 5;
+/// - 6: 二段整合性プロトコル簡略化。`status=Pending` (ingest 進行中) と
+///      `status=Tombstone` (削除待ち) を廃止。新規書き込みは `Ok` か `Failed`
+///      のみ。検索 post-filter (`filter_paths_status_ok`) も廃止し、Tantivy
+///      検索結果をそのまま UI に出す。これにより 1 ファイル ingest あたりの
+///      SQLite write が 2 回 → 1 回に半減し、検索 worker の SQLite SELECT
+///      contention も解消。代償として、削除直後の短い窓で削除済みファイルが
+///      検索結果に出ることがあるが、サムネイル読み込み失敗で気付ける。
+pub const INDEX_VERSION: i64 = 6;
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
@@ -65,28 +72,25 @@ pub struct FileMeta {
     pub status: FileStatus,
 }
 
-/// ingest と delete の二段整合性プロトコル用 (§5.6)。
+/// ingest 後のメタ管理用 (INDEX_VERSION=6 以降)。
+///
+/// INDEX_VERSION=5 までは Pending / Tombstone を持っていたが、二段整合性プロトコルを
+/// 簡略化したため新規書き込みは `Ok` か `Failed` のみ。`from_i64` は旧データの
+/// 読み出しに備えて全値を `Failed` に倒す (再 ingest 候補として処理される)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
 pub enum FileStatus {
     /// Tantivy にコミット済み、検索可能
     Ok = 0,
-    /// ingest 開始済み、Tantivy へのコミット待ち / 進行中
-    Pending = 1,
     /// ingest 失敗 (次回再試行)
     Failed = 2,
-    /// 削除予定 (Tantivy からの delete を待つ間、post-filter で除外)
-    Tombstone = 3,
 }
 
 impl FileStatus {
     fn from_i64(v: i64) -> Self {
         match v {
             0 => Self::Ok,
-            1 => Self::Pending,
-            2 => Self::Failed,
-            3 => Self::Tombstone,
-            _ => Self::Failed, // 不正値は failed 扱いで再試行
+            _ => Self::Failed,
         }
     }
 }
@@ -127,10 +131,12 @@ impl FtsMetaDb {
         // - user_version == INDEX_VERSION: 最新 → rebuild 不要、MIN スキャンなし
         // - それ以外: 旧来の needs_rebuild() ロジックを実行 (初回起動 / 旧 DB)
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let rebuild_needed = if user_version == INDEX_VERSION {
-            false
-        } else {
-            needs_rebuild(&conn)?
+        // v5 → v6 はスキーマ列構造が互換 (status を 4 値 → 2 値に運用変更しただけ) なので
+        // テーブル drop しない。それ以外の未知 version は needs_rebuild が判断する。
+        let rebuild_needed = match user_version {
+            INDEX_VERSION => false,
+            5 => false,
+            _ => needs_rebuild(&conn)?,
         };
         if rebuild_needed {
             crate::logger::log(format!(
@@ -139,6 +145,30 @@ impl FtsMetaDb {
             conn.execute_batch("DROP TABLE IF EXISTS files;")?;
         }
         init_schema(&conn)?;
+
+        // v5 → v6 データマイグレーション: status を Ok(0) と Failed(2) の 2 値に正規化。
+        // - Pending(1): クラッシュ等で残留した「ingest 進行中」マーカー → Failed に倒し
+        //   reconciliation で再 ingest 候補として処理させる。
+        // - Tombstone(3): 削除予定だった row → 物理 DELETE。残ったままだと検索結果に
+        //   出ない doc が SQLite に残り続け、reconciliation で何度も拾われる。
+        if user_version != 0 && user_version < INDEX_VERSION {
+            let pending_to_failed = conn.execute(
+                "UPDATE files SET status = 2 WHERE status = 1",
+                [],
+            )?;
+            let tombstones_deleted = conn.execute(
+                "DELETE FROM files WHERE status = 3",
+                [],
+            )?;
+            if pending_to_failed > 0 || tombstones_deleted > 0 {
+                crate::logger::log(format!(
+                    "fts_meta: v{user_version}→v{INDEX_VERSION} migration: \
+                     pending→failed={pending_to_failed} rows, \
+                     tombstones deleted={tombstones_deleted} rows"
+                ));
+            }
+        }
+
         // スキーマ最新を user_version に記録。次回起動時の MIN スキャンを回避する。
         // `PRAGMA user_version = N` はパラメータバインド不可なので format! で組み立てる
         // (INDEX_VERSION は const なので SQL injection リスクはない)。
@@ -198,10 +228,12 @@ impl FtsMetaDb {
         self.rebuilt_on_open
     }
 
-    /// status=pending で UPSERT。既存 row の generation を増やす (§5.6.1 ステップ 1)。
-    /// INDEX_VERSION=5 以降、原文 (`*_norm`) は Tantivy 側 (`*_text` STORED) で保持
-    /// するので、ここでは管理メタのみ書く。
-    pub fn mark_pending(
+    /// status=Ok で UPSERT。既存 row の generation を増やす。
+    /// INDEX_VERSION=6 以降、ingest 進行中の Pending 状態は廃止し、
+    /// Tantivy commit と同じバッチで status=Ok を直接書く。Tantivy commit が
+    /// 何らかの理由で失敗した場合の検出は起動時 reconciliation の 3-way diff
+    /// (FS / Tantivy / SQLite) に任せる。
+    pub fn upsert_meta_ok(
         &self,
         path: &str,
         favorite_id: Uuid,
@@ -226,7 +258,7 @@ impl FtsMetaDb {
                 indexed_at = excluded.indexed_at,
                 index_version = excluded.index_version,
                 index_generation = files.index_generation + 1,
-                status = 1",
+                status = 0",
             params![
                 path,
                 favorite_id.to_string(),
@@ -236,7 +268,7 @@ impl FtsMetaDb {
                 file_size,
                 now,
                 INDEX_VERSION,
-                FileStatus::Pending as i64,
+                FileStatus::Ok as i64,
             ],
         )?;
         let gen_val: i64 = conn.query_row(
@@ -247,24 +279,6 @@ impl FtsMetaDb {
         Ok(gen_val)
     }
 
-    /// Tantivy commit 後に呼ぶ。status=pending → ok に遷移 (§5.6.1 ステップ 4)。
-    pub fn mark_ok(&self, paths: &[String]) -> rusqlite::Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt =
-                tx.prepare("UPDATE files SET status = 0 WHERE path = ?1 AND status = 1")?;
-            for p in paths {
-                stmt.execute(params![p])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// ingest 失敗を記録。次回再試行 (retry 抑制は上位レイヤーで管理)。
     pub fn mark_failed(&self, path: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -272,42 +286,19 @@ impl FtsMetaDb {
         Ok(())
     }
 
-    /// お気に入り配下の全行を tombstone にする (favorite の「メタ」チェックを OFF にした時)。
-    ///
-    /// 返り値は tombstone に変えた行数。実際の Tantivy 削除は次回起動時の
-    /// reconciliation が処理する (status=3 の行は tombstone_purged 経由で delete_doc される)。
-    /// Ctrl+G の post-filter は `filter_paths_status_ok` で status=0 のみ通すので、
-    /// この場で tombstone にしておけば検索結果から即座に消える。
-    pub fn mark_tombstone_all_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<usize> {
+    /// お気に入り配下の全行を物理削除する (favorite の「メタ」チェックを OFF にした時)。
+    /// 返り値は削除した行数。Tantivy 側の delete は呼び出し側の責務。
+    pub fn delete_all_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let changed = conn.execute(
-            "UPDATE files SET status = 3 WHERE favorite_id = ?1",
+        let deleted = conn.execute(
+            "DELETE FROM files WHERE favorite_id = ?1",
             params![favorite_id.to_string()],
         )?;
-        Ok(changed)
+        Ok(deleted)
     }
 
-    /// 削除開始: status → tombstone (§5.6.2 ステップ 1)。
-    /// post-filter 時の除外対象になる。Tantivy delete 後に `purge_tombstone` で完全削除。
-    pub fn mark_tombstone(&self, paths: &[String]) -> rusqlite::Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare("UPDATE files SET status = 3 WHERE path = ?1")?;
-            for p in paths {
-                stmt.execute(params![p])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Tantivy からの delete が commit された後に呼ぶ (§5.6.2 ステップ 4)。
-    /// tombstone 状態の行を物理削除する。
-    pub fn purge_tombstone(&self, paths: &[String]) -> rusqlite::Result<usize> {
+    /// 指定 path 群の行を物理削除する。Tantivy 側 delete 完了後の cleanup として呼ぶ。
+    pub fn delete_paths(&self, paths: &[String]) -> rusqlite::Result<usize> {
         if paths.is_empty() {
             return Ok(0);
         }
@@ -315,42 +306,13 @@ impl FtsMetaDb {
         let tx = conn.unchecked_transaction()?;
         let mut deleted = 0;
         {
-            let mut stmt = tx.prepare("DELETE FROM files WHERE path = ?1 AND status = 3")?;
+            let mut stmt = tx.prepare("DELETE FROM files WHERE path = ?1")?;
             for p in paths {
                 deleted += stmt.execute(params![p])?;
             }
         }
         tx.commit()?;
         Ok(deleted)
-    }
-
-    /// post-filter 用: 指定 path 群のうち `status=Ok` の path だけを返す (§5.6)。
-    ///
-    /// INDEX_VERSION=5 で原文を Tantivy 側に移したため、ここでは「Tantivy の検索
-    /// snapshot に commit 済だが、二段整合性プロトコル上で `status=Pending`
-    /// (ingest 進行中) / `Tombstone` (削除待ち) になっている doc」を弾くだけが目的。
-    /// 部分インデックス `idx_files_status` は status != 0 を保持するので、
-    /// この経路の `status = 0` フィルタは IN 句の path PK lookup でほぼ完結する。
-    pub fn filter_paths_status_ok(&self, paths: &[String]) -> rusqlite::Result<Vec<String>> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock().unwrap();
-        let placeholders = sql_in_placeholders(paths.len());
-        let sql = format!(
-            "SELECT path FROM files WHERE status = 0 AND path IN ({placeholders})"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let params_vec: Vec<&dyn rusqlite::ToSql> =
-            paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-            row.get::<_, String>(0)
-        })?;
-        let mut out = Vec::with_capacity(paths.len());
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
     }
 
     /// 起動時差分走査 (§7.4) で使用。favorite_id スコープ内の **status=Ok のファイルのみ**
@@ -535,9 +497,7 @@ impl FtsMetaDb {
             let (s, c) = row?;
             match FileStatus::from_i64(s) {
                 FileStatus::Ok => counts.ok = c as usize,
-                FileStatus::Pending => counts.pending = c as usize,
                 FileStatus::Failed => counts.failed = c as usize,
-                FileStatus::Tombstone => counts.tombstone = c as usize,
             }
         }
         Ok(counts)
@@ -687,14 +647,12 @@ fn now_epoch() -> i64 {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct StatusCounts {
     pub ok: usize,
-    pub pending: usize,
     pub failed: usize,
-    pub tombstone: usize,
 }
 
 impl StatusCounts {
     pub fn total(self) -> usize {
-        self.ok + self.pending + self.failed + self.tombstone
+        self.ok + self.failed
     }
     /// インデックスされた有効件数 (検索結果に含まれうる)
     pub fn indexed(self) -> usize {
@@ -786,109 +744,96 @@ mod tests {
     }
 
     #[test]
-    fn pending_then_ok_roundtrip() {
+    fn upsert_meta_ok_writes_status_ok() {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/photos");
         let gen1 = db
-            .mark_pending("c:/photos/a.jpg", fav, &root, IndexKind::Image, 100, 2048)
+            .upsert_meta_ok("c:/photos/a.jpg", fav, &root, IndexKind::Image, 100, 2048)
             .unwrap();
         assert_eq!(gen1, 1, "初回 ingest の generation は 1");
 
         let got = db.get("c:/photos/a.jpg").unwrap().unwrap();
-        assert_eq!(got.status, FileStatus::Pending);
+        assert_eq!(got.status, FileStatus::Ok);
         assert_eq!(got.kind, IndexKind::Image);
         assert_eq!(got.index_generation, 1);
         assert_eq!(got.favorite_id, fav);
 
-        db.mark_ok(&["c:/photos/a.jpg".to_string()]).unwrap();
+        let gen2 = db
+            .upsert_meta_ok("c:/photos/a.jpg", fav, &root, IndexKind::Image, 200, 2100)
+            .unwrap();
+        assert_eq!(gen2, 2, "再 ingest で generation が増える");
         let got = db.get("c:/photos/a.jpg").unwrap().unwrap();
         assert_eq!(got.status, FileStatus::Ok);
-
-        // 同じ path で再 ingest → generation += 1
-        let gen2 = db
-            .mark_pending("c:/photos/a.jpg", fav, &root, IndexKind::Image, 200, 2100)
-            .unwrap();
-        assert_eq!(gen2, 2);
-        let got = db.get("c:/photos/a.jpg").unwrap().unwrap();
-        assert_eq!(got.status, FileStatus::Pending);
     }
 
     #[test]
-    fn tombstone_then_purge_cycle() {
+    fn delete_paths_physically_removes_rows() {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/p");
-        db.mark_pending("c:/p/1.jpg", fav, &root, IndexKind::Image, 1, 10)
+        db.upsert_meta_ok("c:/p/1.jpg", fav, &root, IndexKind::Image, 1, 10)
             .unwrap();
-        db.mark_pending("c:/p/2.jpg", fav, &root, IndexKind::Image, 2, 20)
-            .unwrap();
-        db.mark_ok(&["c:/p/1.jpg".to_string(), "c:/p/2.jpg".to_string()])
+        db.upsert_meta_ok("c:/p/2.jpg", fav, &root, IndexKind::Image, 2, 20)
             .unwrap();
 
-        // tombstone にすると list_favorite_files (status=Ok のみ) から消える
-        db.mark_tombstone(&["c:/p/1.jpg".to_string()]).unwrap();
-        let ok_rows = db.list_favorite_files(fav).unwrap();
-        assert_eq!(ok_rows.len(), 1);
-        assert_eq!(ok_rows[0].0, "c:/p/2.jpg");
-
-        // purge で物理削除
-        let deleted = db.purge_tombstone(&["c:/p/1.jpg".to_string()]).unwrap();
+        let deleted = db.delete_paths(&["c:/p/1.jpg".to_string()]).unwrap();
         assert_eq!(deleted, 1);
         assert!(db.get("c:/p/1.jpg").unwrap().is_none());
+        assert!(db.get("c:/p/2.jpg").unwrap().is_some());
     }
 
     #[test]
-    fn list_favorite_files_returns_only_ok() {
+    fn delete_all_for_favorite_clears_rows() {
         let (_tmp, db) = tmp_db();
         let fav_a = Uuid::new_v4();
         let fav_b = Uuid::new_v4();
         let root_a = PathBuf::from("C:/a");
         let root_b = PathBuf::from("C:/b");
-        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, IndexKind::Image, 1, 1)
+        db.upsert_meta_ok("c:/a/1.jpg", fav_a, &root_a, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, IndexKind::Image, 2, 2)
+        db.upsert_meta_ok("c:/a/2.jpg", fav_a, &root_a, IndexKind::Image, 2, 2)
             .unwrap();
-        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 3, 3)
+        db.upsert_meta_ok("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 3, 3)
             .unwrap();
 
-        // 全部 pending のまま → list_favorite_files には出てこない
+        let removed = db.delete_all_for_favorite(fav_a).unwrap();
+        assert_eq!(removed, 2);
         assert!(db.list_favorite_files(fav_a).unwrap().is_empty());
-        assert!(db.list_favorite_files(fav_b).unwrap().is_empty());
-
-        // ok に遷移したもののみ返る
-        db.mark_ok(&["c:/a/1.jpg".to_string(), "c:/a/2.jpg".to_string()])
-            .unwrap();
-        let a = db.list_favorite_files(fav_a).unwrap();
-        assert_eq!(a.len(), 2);
-        assert!(db.list_favorite_files(fav_b).unwrap().is_empty());
-
-        let not_ok = db.list_not_ok_paths(fav_b).unwrap();
-        assert_eq!(not_ok.len(), 1);
-        assert_eq!(not_ok[0].0, "c:/b/1.jpg");
-        assert_eq!(not_ok[0].1, FileStatus::Pending);
+        assert_eq!(db.list_favorite_files(fav_b).unwrap().len(), 1);
     }
 
     #[test]
-    fn list_not_ok_returns_pending_and_failed() {
+    fn list_favorite_files_returns_only_ok() {
+        let (_tmp, db) = tmp_db();
+        let fav = Uuid::new_v4();
+        let root = PathBuf::from("C:/a");
+        db.upsert_meta_ok("c:/a/1.jpg", fav, &root, IndexKind::Image, 1, 1)
+            .unwrap();
+        db.upsert_meta_ok("c:/a/2.jpg", fav, &root, IndexKind::Image, 2, 2)
+            .unwrap();
+        db.mark_failed("c:/a/2.jpg").unwrap();
+
+        let ok = db.list_favorite_files(fav).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].0, "c:/a/1.jpg");
+    }
+
+    #[test]
+    fn list_not_ok_returns_only_failed() {
         let (_tmp, db) = tmp_db();
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/x");
-        db.mark_pending("c:/x/1.jpg", fav, &root, IndexKind::Image, 1, 1)
+        db.upsert_meta_ok("c:/x/1.jpg", fav, &root, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_pending("c:/x/2.jpg", fav, &root, IndexKind::Image, 2, 2)
+        db.upsert_meta_ok("c:/x/2.jpg", fav, &root, IndexKind::Image, 2, 2)
             .unwrap();
-        db.mark_pending("c:/x/3.jpg", fav, &root, IndexKind::Image, 3, 3)
-            .unwrap();
-
-        db.mark_ok(&["c:/x/1.jpg".to_string()]).unwrap();
         db.mark_failed("c:/x/2.jpg").unwrap();
 
         let not_ok = db.list_not_ok().unwrap();
-        assert_eq!(not_ok.len(), 2);
-        let statuses: Vec<_> = not_ok.iter().map(|m| m.status).collect();
-        assert!(statuses.contains(&FileStatus::Pending));
-        assert!(statuses.contains(&FileStatus::Failed));
+        assert_eq!(not_ok.len(), 1);
+        assert_eq!(not_ok[0].status, FileStatus::Failed);
+        assert_eq!(not_ok[0].path, "c:/x/2.jpg");
     }
 
     #[test]
@@ -898,9 +843,8 @@ mod tests {
         let fav_b = Uuid::new_v4();
         let root_a = PathBuf::from("C:/a");
         let root_b = PathBuf::from("C:/b");
-        // fav_a: 2 ok, 1 pending, 1 failed
-        for i in 1..=4 {
-            db.mark_pending(
+        for i in 1..=3 {
+            db.upsert_meta_ok(
                 &format!("c:/a/{i}.jpg"),
                 fav_a,
                 &root_a,
@@ -910,17 +854,13 @@ mod tests {
             )
             .unwrap();
         }
-        db.mark_ok(&["c:/a/1.jpg".to_string(), "c:/a/2.jpg".to_string()])
-            .unwrap();
         db.mark_failed("c:/a/3.jpg").unwrap();
-        // fav_b: 1 ok
-        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1)
+        db.upsert_meta_ok("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_ok(&["c:/b/1.jpg".to_string()]).unwrap();
-        // fav 無し (= 全 pending) → グループに現れないこと
         let fav_c = Uuid::new_v4();
-        db.mark_pending("c:/c/1.jpg", fav_c, &PathBuf::from("C:/c"), IndexKind::Image, 1, 1)
+        db.upsert_meta_ok("c:/c/1.jpg", fav_c, &PathBuf::from("C:/c"), IndexKind::Image, 1, 1)
             .unwrap();
+        db.mark_failed("c:/c/1.jpg").unwrap();
 
         let counts = db.count_ok_grouped_by_favorite().unwrap();
         assert_eq!(counts.get(&fav_a), Some(&2));
@@ -938,29 +878,22 @@ mod tests {
         let root_b = PathBuf::from("C:/b");
         let root_c = PathBuf::from("C:/c");
 
-        // fav_a: ok 1, pending 1, failed 1, tombstone 1
-        db.mark_pending("c:/a/1.jpg", fav_a, &root_a, IndexKind::Image, 1, 1)
+        db.upsert_meta_ok("c:/a/1.jpg", fav_a, &root_a, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_pending("c:/a/2.jpg", fav_a, &root_a, IndexKind::Image, 2, 2)
+        db.upsert_meta_ok("c:/a/2.jpg", fav_a, &root_a, IndexKind::Image, 2, 2)
             .unwrap();
-        db.mark_pending("c:/a/3.jpg", fav_a, &root_a, IndexKind::Image, 3, 3)
+        db.mark_failed("c:/a/2.jpg").unwrap();
+        db.upsert_meta_ok("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_pending("c:/a/4.jpg", fav_a, &root_a, IndexKind::Image, 4, 4)
+        db.mark_failed("c:/b/1.jpg").unwrap();
+        db.upsert_meta_ok("c:/c/1.jpg", fav_c, &root_c, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
-        db.mark_failed("c:/a/3.jpg").unwrap();
-        db.mark_tombstone(&["c:/a/4.jpg".to_string()]).unwrap();
-
-        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1)
-            .unwrap();
-        db.mark_pending("c:/c/1.jpg", fav_c, &root_c, IndexKind::Image, 1, 1)
-            .unwrap();
+        db.mark_failed("c:/c/1.jpg").unwrap();
 
         let rows = db
             .list_not_ok_paths_for_favorites(&[fav_a, fav_b])
             .unwrap();
-        assert_eq!(rows.len(), 4);
-
+        assert_eq!(rows.len(), 2);
         for (path, fav, _) in &rows {
             assert!(*fav == fav_a || *fav == fav_b, "unexpected fav for {path}");
         }
@@ -979,21 +912,67 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/y");
         for i in 0..5 {
-            db.mark_pending(&format!("c:/y/{}.jpg", i), fav, &root, IndexKind::Image, i, 1)
+            db.upsert_meta_ok(&format!("c:/y/{}.jpg", i), fav, &root, IndexKind::Image, i, 1)
                 .unwrap();
         }
-        db.mark_ok(&["c:/y/0.jpg".to_string(), "c:/y/1.jpg".to_string()])
-            .unwrap();
         db.mark_failed("c:/y/2.jpg").unwrap();
-        db.mark_tombstone(&["c:/y/3.jpg".to_string()]).unwrap();
+        db.mark_failed("c:/y/3.jpg").unwrap();
 
         let c = db.count_by_status(fav).unwrap();
-        assert_eq!(c.ok, 2);
-        assert_eq!(c.pending, 1);
-        assert_eq!(c.failed, 1);
-        assert_eq!(c.tombstone, 1);
+        assert_eq!(c.ok, 3);
+        assert_eq!(c.failed, 2);
         assert_eq!(c.total(), 5);
-        assert_eq!(c.indexed(), 2);
+        assert_eq!(c.indexed(), 3);
+    }
+
+    #[test]
+    fn migration_v5_to_v6_collapses_pending_and_drops_tombstones() {
+        // 旧 v5 スキーマで status=Pending(1) と Tombstone(3) を含むデータを作り、
+        // INDEX_VERSION=6 で開き直したときに pending→failed, tombstone→DELETE される。
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            // v5 スキーマ (= 現スキーマと列構造同じ)。手動で作って status を旧値で入れる。
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path              TEXT PRIMARY KEY,
+                    favorite_id       TEXT NOT NULL,
+                    favorite_root     TEXT NOT NULL,
+                    kind              INTEGER NOT NULL,
+                    mtime             INTEGER NOT NULL,
+                    file_size         INTEGER NOT NULL,
+                    indexed_at        INTEGER NOT NULL,
+                    index_version     INTEGER NOT NULL,
+                    index_generation  INTEGER NOT NULL,
+                    status            INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+            let fav = Uuid::new_v4().to_string();
+            for (path, status) in [
+                ("c:/a/ok.jpg", 0),
+                ("c:/a/pending.jpg", 1),
+                ("c:/a/failed.jpg", 2),
+                ("c:/a/tomb.jpg", 3),
+            ] {
+                conn.execute(
+                    "INSERT INTO files VALUES (?1, ?2, 'C:/a', 1, 0, 0, 0, 5, 1, ?3)",
+                    params![path, fav, status],
+                )
+                .unwrap();
+            }
+        }
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+        assert!(db.get("c:/a/ok.jpg").unwrap().is_some());
+        assert!(db.get("c:/a/pending.jpg").unwrap().is_some(), "pending は failed として残る");
+        assert_eq!(
+            db.get("c:/a/pending.jpg").unwrap().unwrap().status,
+            FileStatus::Failed
+        );
+        assert!(db.get("c:/a/failed.jpg").unwrap().is_some());
+        assert!(db.get("c:/a/tomb.jpg").unwrap().is_none(), "tombstone は物理削除");
     }
 
     #[test]
@@ -1032,9 +1011,9 @@ mod tests {
         let db = FtsMetaDb::open_at(&db_path).unwrap();
         assert!(db.get("c:/old.jpg").unwrap().is_none(), "旧データは消えた");
 
-        // 新しい mark_pending が通る (norms 引数なし)
+        // 新しい upsert_meta_ok が通る
         let fav = Uuid::new_v4();
-        db.mark_pending(
+        db.upsert_meta_ok(
             "c:/new.jpg",
             fav,
             std::path::Path::new("C:/"),
@@ -1045,7 +1024,7 @@ mod tests {
         .unwrap();
         let row = db.get("c:/new.jpg").unwrap().unwrap();
         assert_eq!(row.path, "c:/new.jpg");
-        assert_eq!(row.status, FileStatus::Pending);
+        assert_eq!(row.status, FileStatus::Ok);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Ctrl+G グローバルメタ検索の streaming クエリワーカー (INDEX_VERSION=5)。
+//! Ctrl+G グローバルメタ検索の streaming クエリワーカー (INDEX_VERSION=6)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -10,12 +10,14 @@
 //! 4. **Searcher snapshot を固定** (ページング中に ingest が commit しても結果が
 //!    ズレないようにする)
 //! 5. `TopDocs::with_limit(PAGE_SIZE).and_offset(offset)` でページング取得
-//! 6. 各ページで `fts_meta.filter_paths_status_ok` で status=Ok の path だけに絞り、
-//!    `fts_index::doc_text_for_target` で同じ Tantivy snapshot から STORED 原文を取り出す
-//!    (INDEX_VERSION=5 で原文を fts_meta から Tantivy 側に集約済み)
-//! 7. `search_query::matches` で phrase / NOT / AND を最終判定
-//! 8. post-filter 通過した結果を `SearchStreamEvent::Batch` で streaming 送信
-//! 9. HARD_MAX 到達 / 候補使い切り / cancel のどれかで終了
+//! 6. 各ページで `fts_index::doc_text_for_target` で同じ Tantivy snapshot から
+//!    STORED 原文を取り出し、`search_query::matches` で phrase / NOT / AND を最終判定
+//! 7. post-filter 通過した結果を `SearchStreamEvent::Batch` で streaming 送信
+//! 8. HARD_MAX 到達 / 候補使い切り / cancel のどれかで終了
+//!
+//! INDEX_VERSION=6 から fts_meta.db への post-filter SELECT を廃止 (二段整合性
+//! プロトコル簡略化に伴う)。削除直後の短い窓で削除済みファイルが結果に出ることが
+//! あるが、サムネイル読み込み失敗で気付ける範囲。
 //!
 //! ## UI との接続
 //!
@@ -29,7 +31,6 @@ use crossbeam_channel::Sender;
 use uuid::Uuid;
 
 use crate::fts_index::{self, FtsIndex, IndexKind, QueryFilters, SearchTarget};
-use crate::fts_meta::FtsMetaDb;
 use crate::search_query::{self, Token};
 
 /// §9.1 ステップ 4 確定方針 (プロトタイプ計測で PASS、§15.1.9)
@@ -106,7 +107,6 @@ pub fn run(
     favorite_ids: &[Uuid],
     scope: &SearchScope,
     fts: &FtsIndex,
-    meta_db: &FtsMetaDb,
     cancel: &AtomicBool,
     tx: &Sender<SearchStreamEvent>,
 ) {
@@ -196,23 +196,9 @@ pub fn run(
         }
         scanned += page.len();
 
-        // 5b. post-filter
-        // INDEX_VERSION=5 以降、原文は Tantivy 側の `*_text` フィールドに STORED 保存
-        // されているので、`searcher.doc(addr)` から直接取り出す。fts_meta.db への
-        // IN 句 SELECT は不要になった。
-        // ただし Tantivy には status=Pending / Tombstone の doc も commit 済で残り得る
-        // ので、status=Ok 以外を弾くために fts_meta.db を 1 回参照する (path PK lookup)。
-        let paths_only: Vec<String> = page.iter().map(|(p, _, _)| p.clone()).collect();
-        let ok_set: std::collections::HashSet<String> = match meta_db
-            .filter_paths_status_ok(&paths_only)
-        {
-            Ok(v) => v.into_iter().collect(),
-            Err(e) => {
-                let _ = tx.send(SearchStreamEvent::Error(format!("fts_meta filter: {e}")));
-                return;
-            }
-        };
-
+        // 5b. post-filter (token matching のみ — INDEX_VERSION=6 で SQLite 参照は廃止)。
+        // 削除直後の短い窓 (Tantivy delete_term 投入 → 次回 commit) では削除済み path が
+        // 結果に混じることがあるが、サムネイル読み込み失敗で気付ける前提。
         let mut batch = Vec::new();
         let mut inner_truncated = false;
         let mut inner_cancelled = false;
@@ -220,9 +206,6 @@ pub fn run(
             if cancel.load(Ordering::Relaxed) {
                 inner_cancelled = true;
                 break;
-            }
-            if !ok_set.contains(&path) {
-                continue; // Pending / Failed / Tombstone は除外
             }
             let text = match fts_index::doc_text_for_target(
                 &searcher,
@@ -357,6 +340,7 @@ pub fn hit_to_pathbuf(hit: &GlobalHit) -> PathBuf {
 mod tests {
     use super::*;
     use crate::fts_index::{Container, IndexDoc, upsert_doc};
+    use crate::fts_meta::FtsMetaDb;
     use crate::ingest_text::PerSourceText;
     use crate::search_index_db::normalize_path;
     use std::path::PathBuf;
@@ -384,7 +368,7 @@ mod tests {
             name: combined_name,
             ..PerSourceText::default()
         };
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
+        meta.upsert_meta_ok(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
             .unwrap();
         let mut w = fts.writer().unwrap();
         upsert_doc(
@@ -403,7 +387,7 @@ mod tests {
         )
         .unwrap();
         w.commit().unwrap();
-        meta.mark_ok(&[key]).unwrap();
+        let _ = key;
         fts.reload_reader().unwrap();
     }
 
@@ -411,12 +395,11 @@ mod tests {
         query: &str,
         favs: &[Uuid],
         fts: &FtsIndex,
-        meta: &FtsMetaDb,
     ) -> (Vec<GlobalHit>, DoneReason, bool) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(false);
         let scope = SearchScope::default();
-        run(query, favs, &scope, fts, meta, &cancel, &tx);
+        run(query, favs, &scope, fts, &cancel, &tx);
         drop(tx);
         let mut all_hits = Vec::new();
         let mut reason = DoneReason::Complete;
@@ -442,7 +425,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け");
-        let (hits, reason, _) = collect_events("", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("", &[fav], &fts);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::Empty));
     }
@@ -452,7 +435,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け");
-        let (hits, reason, _) = collect_events("夕", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕", &[fav], &fts);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
     }
@@ -462,7 +445,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け 海辺");
-        let (hits, reason, _) = collect_events("夕焼", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕焼", &[fav], &fts);
         assert_eq!(reason, DoneReason::Complete);
         assert_eq!(hits.len(), 1);
     }
@@ -472,7 +455,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "sd photo");
-        let (hits, reason, _) = collect_events("sd", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("sd", &[fav], &fts);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
     }
@@ -482,7 +465,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "stable diffusion photo");
-        let (hits, reason, _) = collect_events("sdx", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("sdx", &[fav], &fts);
         // "sdx" はヒットしないが TooShort では弾かれない
         assert_eq!(reason, DoneReason::Complete);
         assert_eq!(hits.len(), 0);
@@ -493,7 +476,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け");
-        let (hits, reason, _) = collect_events("-夕焼け", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("-夕焼け", &[fav], &fts);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::NotOnly));
     }
@@ -506,7 +489,7 @@ mod tests {
         ingest(&meta, &fts, fav, "c:/b.jpg", "夕焼け 山頂");
         ingest(&meta, &fts, fav, "c:/c.jpg", "海辺 砂浜");
 
-        let (hits, reason, _) = collect_events("夕焼け 海辺", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕焼け 海辺", &[fav], &fts);
         assert_eq!(reason, DoneReason::Complete);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "c:/a.jpg");
@@ -520,7 +503,7 @@ mod tests {
         ingest(&meta, &fts, fav, "c:/b.jpg", "夕焼け 山頂");
 
         // "夕焼け -山頂" → a のみ
-        let (hits, reason, _) = collect_events("夕焼け -山頂", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕焼け -山頂", &[fav], &fts);
         assert_eq!(reason, DoneReason::Complete);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "c:/a.jpg");
@@ -534,7 +517,7 @@ mod tests {
         // post-filter (search_query::matches) で最終判定される。
         ingest(&meta, &fts, fav, "c:/a.jpg", "hello world");
         ingest(&meta, &fts, fav, "c:/b.jpg", "world hello"); // 別順序
-        let (hits, _, _) = collect_events(r#""hello world""#, &[fav], &fts, &meta);
+        let (hits, _, _) = collect_events(r#""hello world""#, &[fav], &fts);
         // post-filter が phrase を正確に見るので a のみ
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "c:/a.jpg");
@@ -549,7 +532,7 @@ mod tests {
         ingest(&meta, &fts, fav_b, "c:/b.jpg", "夕焼け");
 
         // fav_a のみをスコープにする
-        let (hits, _, _) = collect_events("夕焼け", &[fav_a], &fts, &meta);
+        let (hits, _, _) = collect_events("夕焼け", &[fav_a], &fts);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "c:/a.jpg");
     }
@@ -565,7 +548,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(true);
         let scope = SearchScope::default();
-        run("夕焼け", &[fav], &scope, &fts, &meta, &cancel, &tx);
+        run("夕焼け", &[fav], &scope, &fts, &cancel, &tx);
         drop(tx);
         let mut reason = None;
         while let Ok(ev) = rx.recv() {
@@ -585,7 +568,7 @@ mod tests {
         ingest(&meta, &fts, fav, "c:/b.jpg", "海辺の朝 夕焼けは見られず");
         ingest(&meta, &fts, fav, "c:/c.jpg", "夕焼けだけ");
 
-        let (hits, reason, _) = collect_events("夕焼け 海辺", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕焼け 海辺", &[fav], &fts);
         assert_eq!(reason, DoneReason::Complete);
         let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
         assert!(
@@ -603,7 +586,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け 海辺");
-        let (hits, reason, _) = collect_events("夕 海", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕 海", &[fav], &fts);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
     }
@@ -614,7 +597,7 @@ mod tests {
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "sd ai photo");
-        let (hits, reason, _) = collect_events("sd ai", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("sd ai", &[fav], &fts);
         assert!(hits.is_empty());
         assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
     }
@@ -632,7 +615,7 @@ mod tests {
             tags: "#a".to_string(),
             ..PerSourceText::default()
         };
-        meta.mark_pending(
+        meta.upsert_meta_ok(
             &key,
             fav,
             &PathBuf::from("C:/"),
@@ -660,11 +643,11 @@ mod tests {
             .unwrap();
             w.commit().unwrap();
         }
-        meta.mark_ok(&[key]).unwrap();
+        let _ = key;
         fts.reload_reader().unwrap();
 
         // Codex P2 回帰: 旧実装は #a を ASCII 2 文字として TooShort 拒否していた
-        let (hits, reason, _) = collect_events("#a", &[fav], &fts, &meta);
+        let (hits, reason, _) = collect_events("#a", &[fav], &fts);
         assert_ne!(
             reason,
             DoneReason::RejectedQuery(RejectReason::TooShort),
@@ -681,13 +664,15 @@ mod tests {
         ingest(&meta, &fts, fav_a, "c:/a.jpg", "夕焼け");
 
         // 対象 favorite が 0 件 → 空結果 + Complete で返る
-        let (hits, reason, _) = collect_events("夕焼け", &[], &fts, &meta);
+        let (hits, reason, _) = collect_events("夕焼け", &[], &fts);
         assert!(hits.is_empty(), "favorite_ids 空なら結果は空");
         assert_eq!(reason, DoneReason::Complete);
     }
 
     #[test]
-    fn tombstone_hits_not_returned() {
+    fn deleted_path_no_longer_returned_after_delete_term() {
+        // INDEX_VERSION=6: SQLite 側の status フィルタは廃止。Tantivy delete_term + commit
+        // 後の reload で結果から消えることを確認する (削除直後の短い窓は許容範囲)。
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let key = normalize_path(&PathBuf::from("c:/a.jpg"));
@@ -695,33 +680,39 @@ mod tests {
             name: crate::search_norm::normalize_for_match("夕焼け"),
             ..PerSourceText::default()
         };
-        meta.mark_pending(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
+        meta.upsert_meta_ok(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
             .unwrap();
-        let mut w = fts.writer().unwrap();
-        upsert_doc(
-            &w,
-            fts.fields(),
-            &IndexDoc {
-                path: key.clone(),
-                container: Container::Fs,
-                zip_entry: String::new(),
-                favorite_id: fav,
-                kind: IndexKind::Image,
-                mtime: 0,
-                file_size: 0,
-                norms,
-            },
-        )
-        .unwrap();
-        w.commit().unwrap();
-        meta.mark_ok(&[key.clone()]).unwrap();
+        {
+            let mut w = fts.writer().unwrap();
+            upsert_doc(
+                &w,
+                fts.fields(),
+                &IndexDoc {
+                    path: key.clone(),
+                    container: Container::Fs,
+                    zip_entry: String::new(),
+                    favorite_id: fav,
+                    kind: IndexKind::Image,
+                    mtime: 0,
+                    file_size: 0,
+                    norms,
+                },
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
         fts.reload_reader().unwrap();
 
-        // tombstone 化する (Tantivy からはまだ消えていない = 検索すると候補には上がる)
-        meta.mark_tombstone(&[key]).unwrap();
+        // Tantivy delete_term + commit + reader reload
+        {
+            let mut w = fts.writer().unwrap();
+            crate::fts_index::delete_doc(&w, fts.fields(), &key);
+            w.commit().unwrap();
+        }
+        meta.delete_paths(&[key]).unwrap();
+        fts.reload_reader().unwrap();
 
-        let (hits, _, _) = collect_events("夕焼け", &[fav], &fts, &meta);
-        // post-filter で tombstone は除外される (lookup_norms_for_target が status=3 を弾くため)
-        assert!(hits.is_empty(), "tombstone は結果に出ない");
+        let (hits, _, _) = collect_events("夕焼け", &[fav], &fts);
+        assert!(hits.is_empty(), "delete + commit 後は結果から消える");
     }
 }

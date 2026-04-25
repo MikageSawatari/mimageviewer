@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::activity_gate::ActivityGate;
 use crate::fts_index::FtsIndex;
-use crate::fts_meta::{FileStatus, FtsMetaDb};
+use crate::fts_meta::FtsMetaDb;
 use crate::global_search::SearchStreamEvent;
 use crate::indexer_supervisor::{self, SupervisorHandle, SupervisorParams, SupervisorStats};
 use crate::io_semaphore::GlobalIoSemaphore;
@@ -104,10 +104,8 @@ pub struct IndexerManager {
 pub struct StartupDiag {
     /// reconciliation に要した時間 (ms)
     pub reconciliation_ms: u64,
-    /// Tantivy から delete した残留 pending/failed 行数
+    /// Tantivy から delete した残留 failed 行数
     pub pending_cleaned: usize,
-    /// 削除マーク済みだった行の物理削除数
-    pub tombstone_purged: usize,
     /// スピードプロファイル (io_permits 数) — 診断時に見たいので保存
     pub io_permits: usize,
 }
@@ -306,7 +304,6 @@ impl IndexerManager {
             startup_diag: StartupDiag {
                 reconciliation_ms,
                 pending_cleaned: report.pending_cleaned,
-                tombstone_purged: report.tombstone_purged,
                 io_permits: permits,
             },
         };
@@ -468,7 +465,6 @@ impl IndexerManager {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx): (Sender<SearchStreamEvent>, Receiver<SearchStreamEvent>) =
             crossbeam_channel::unbounded();
-        let meta_db = Arc::clone(&self.meta_db);
         let fts = Arc::clone(&self.fts);
         let cancel_cl = Arc::clone(&cancel);
 
@@ -480,7 +476,6 @@ impl IndexerManager {
                     &favorite_ids,
                     &scope,
                     &fts,
-                    &meta_db,
                     &cancel_cl,
                     &tx,
                 );
@@ -540,19 +535,19 @@ impl IndexerManager {
 
     /// お気に入りの「メタ索引」チェックを OFF にした時のクリーンアップ。
     ///
-    /// そのお気に入りの全 fts_meta 行を tombstone にマークする。検索結果からは
-    /// 即座に消える (post-filter の status=0 ゲート経由)。Tantivy 側の doc 削除は
-    /// 次回起動時の reconciliation が処理する (`run_reconciliation` が tombstone を
-    /// 検出して `delete_doc` + `purge_tombstone` を走らせる)。
+    /// そのお気に入りの全 fts_meta 行を物理削除する。検索結果からは即座に消えるが、
+    /// Tantivy 側の doc は次回起動時の reconciliation で「SQLite に無いが Tantivy に
+    /// 残っている孤児 doc」として検出 → delete される。短時間は Tantivy 側に残るので
+    /// Ctrl+G 検索結果に出てしまう可能性があるが、それは許容範囲とする。
     ///
     /// 呼び出し順序: **必ず `sync_with_favorites` より前に呼ぶ** こと。先に supervisor
-    /// を drop すると writer が別スレッドに移ってしまうので、こちらの SQL UPDATE 中に
+    /// を drop すると writer が別スレッドに移ってしまうので、こちらの SQL DELETE 中に
     /// supervisor 側 ingest が走って race になる可能性がある (実害は限定的だが綺麗でない)。
     pub fn purge_favorite_metadata(&self, favorite_id: Uuid) -> usize {
-        match self.meta_db.mark_tombstone_all_for_favorite(favorite_id) {
+        match self.meta_db.delete_all_for_favorite(favorite_id) {
             Ok(n) => {
                 crate::logger::log(format!(
-                    "IndexerManager: purge_favorite_metadata({favorite_id}) tombstoned {n} rows"
+                    "IndexerManager: purge_favorite_metadata({favorite_id}) deleted {n} rows"
                 ));
                 n
             }
@@ -658,6 +653,11 @@ fn spawn_reconciliation(
 /// dispatcher 経由 reconciliation。delete + commit を 1 つの Batch で送る。
 /// 起動直後で他ジョブはほぼ無いので Background 優先度でも即座に処理される。
 ///
+/// INDEX_VERSION=6 以降、status は Ok / Failed の 2 値のみ。Failed 行は
+/// 「前回 ingest が失敗した path」なので、Tantivy 側を念のため delete してから
+/// SQLite 行も物理削除する。次回 supervisor の walker が "DB になし" として
+/// 検出して再 ingest 候補に拾う。
+///
 /// **クエリ最適化** (2026-04): お気に入りごとに `list_not_ok_paths` を回すと
 /// SQLite が `idx_files_fav_kind` を選んでお気に入り配下の全行 (実測 65 万行で
 /// 1.1 秒) を post-filter する。代わりに `list_not_ok_paths_for_favorites` で
@@ -671,7 +671,6 @@ fn run_reconciliation_via_dispatcher(
 ) -> Result<ReconciliationReport, String> {
     use crate::fts_writer_dispatcher::WriterPriority;
     let mut report = ReconciliationReport::default();
-    let mut deletes: Vec<String> = Vec::new();
     let target_favs: Vec<Uuid> = favorites
         .iter()
         .filter(|f| f.auto_index_metadata)
@@ -680,36 +679,20 @@ fn run_reconciliation_via_dispatcher(
     let not_ok = meta_db
         .list_not_ok_paths_for_favorites(&target_favs)
         .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
-    for (path, _fav_id, status) in not_ok {
-        match status {
-            FileStatus::Ok => continue,
-            FileStatus::Pending | FileStatus::Failed => {
-                deletes.push(path.clone());
-                if let Err(e) = delete_row_forcing(meta_db, &path) {
-                    crate::logger::log(format!(
-                        "reconciliation: delete row for {path} failed: {e}"
-                    ));
-                }
-                report.pending_cleaned += 1;
-            }
-            FileStatus::Tombstone => {
-                deletes.push(path.clone());
-                if let Err(e) = meta_db.purge_tombstone(&[path.clone()]) {
-                    crate::logger::log(format!(
-                        "reconciliation: purge_tombstone {path} failed: {e}"
-                    ));
-                }
-                report.tombstone_purged += 1;
-            }
+    let deletes: Vec<String> = not_ok.iter().map(|(p, _, _)| p.clone()).collect();
+    if !deletes.is_empty() {
+        if let Err(e) = meta_db.delete_paths(&deletes) {
+            crate::logger::log(format!("reconciliation: delete_paths failed: {e}"));
         }
+        report.pending_cleaned = deletes.len();
     }
-    let _ = fts; // 使わないがログ context として保持しておく
+    let _ = fts;
     writer
         .batch(vec![], deletes, true, true, WriterPriority::Background)
         .map_err(|e| format!("reconciliation batch: {e}"))?;
     crate::logger::log(format!(
-        "reconciliation done: pending/failed cleaned = {}, tombstone purged = {}",
-        report.pending_cleaned, report.tombstone_purged
+        "reconciliation done: failed cleaned = {}",
+        report.pending_cleaned
     ));
     Ok(report)
 }
@@ -728,67 +711,32 @@ fn run_reconciliation(
 
     for fav in favorites {
         if !fav.auto_index_metadata {
-            continue; // 未使用 favorite は触らない
+            continue;
         }
         let not_ok = meta_db
             .list_not_ok_paths(fav.id)
             .map_err(|e| format!("list_not_ok_paths: {e}"))?;
-        for (path, status) in not_ok {
-            match status {
-                FileStatus::Ok => continue,
-                FileStatus::Pending | FileStatus::Failed => {
-                    // Tantivy には新しい doc が入っているかもしれない → 念のため delete。
-                    // 次回 supervisor の初期スキャンで walker が "DB になし" として
-                    // 拾って再 ingest する。
-                    crate::fts_index::delete_doc(writer, fields, &path);
-                    // DB 側も row を消す (walker の 3-way diff で to_ingest に入るように)
-                    // ここは物理 DELETE が必要。purge_tombstone は status=3 限定なので使えない。
-                    if let Err(e) = delete_row_forcing(meta_db, &path) {
-                        crate::logger::log(format!(
-                            "reconciliation: delete row for {path} failed: {e}"
-                        ));
-                    }
-                    report.pending_cleaned += 1;
-                }
-                FileStatus::Tombstone => {
-                    // Tantivy 側にまだ残っている可能性あるので delete して purge
-                    crate::fts_index::delete_doc(writer, fields, &path);
-                    if let Err(e) = meta_db.purge_tombstone(&[path.clone()]) {
-                        crate::logger::log(format!(
-                            "reconciliation: purge_tombstone {path} failed: {e}"
-                        ));
-                    }
-                    report.tombstone_purged += 1;
-                }
+        for (path, _status) in not_ok {
+            crate::fts_index::delete_doc(writer, fields, &path);
+            if let Err(e) = meta_db.delete_paths(&[path.clone()]) {
+                crate::logger::log(format!(
+                    "reconciliation: delete_paths {path} failed: {e}"
+                ));
             }
+            report.pending_cleaned += 1;
         }
     }
-    // 1 回だけ commit
     writer.commit().map_err(|e| format!("writer.commit: {e}"))?;
     crate::logger::log(format!(
-        "reconciliation done: pending/failed cleaned = {}, tombstone purged = {}",
-        report.pending_cleaned, report.tombstone_purged
+        "reconciliation done: failed cleaned = {}",
+        report.pending_cleaned
     ));
     Ok(report)
-}
-
-/// fts_meta.db から path を物理削除する (status 不問)。
-///
-/// `FtsMetaDb` の公開 API には "status に関わらず物理削除" のメソッドが無いので、
-/// ここで直接 SQL を叩く。将来 `FtsMetaDb::purge_path` として生やしても良い。
-fn delete_row_forcing(meta_db: &FtsMetaDb, path: &str) -> rusqlite::Result<()> {
-    // tombstone 以外の status のときも DELETE したいので、既存の purge_tombstone の
-    // `status = 3` 条件を回避する専用処理。
-    // ※ FtsMetaDb の API を汚さないため、ここで一段階 status=3 に落としてから purge する。
-    meta_db.mark_tombstone(&[path.to_string()])?;
-    meta_db.purge_tombstone(&[path.to_string()])?;
-    Ok(())
 }
 
 #[derive(Default, Debug, Clone)]
 struct ReconciliationReport {
     pending_cleaned: usize,
-    tombstone_purged: usize,
 }
 
 // -----------------------------------------------------------------------
@@ -821,7 +769,7 @@ mod tests {
     // 依存するので、ここでは reconciliation 関数を直接テストする。
 
     #[test]
-    fn reconciliation_cleans_pending_rows() {
+    fn reconciliation_cleans_failed_rows() {
         let tmp = TempDir::new().unwrap();
         let meta = FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap();
         let fts = FtsIndex::open_at(&tmp.path().join("fts")).unwrap();
@@ -830,10 +778,9 @@ mod tests {
 
         let fav = mk_fav("A", &fav_root, true);
 
-        // pending 行を手動で作る (crash 残留シミュ)
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
+        meta.upsert_meta_ok("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
             .unwrap();
-        // Tantivy にも入れておく (writer は scope 内で drop して lockfile を解放する)
+        meta.mark_failed("c:/a/1.jpg").unwrap();
         {
             let mut w = fts.writer().unwrap();
             upsert_doc(
@@ -857,16 +804,13 @@ mod tests {
             w.commit().unwrap();
         }
 
-        // reconciliation 実行 (共有 writer 化後は呼び出し側が writer を用意する)
         let mut rw = fts.writer().unwrap();
         let r = run_reconciliation(&meta, &fts, &mut rw, &[fav.clone()]).unwrap();
         drop(rw);
         assert_eq!(r.pending_cleaned, 1);
 
-        // pending 行は削除され、次回 walker で再 ingest される予定
         assert!(meta.get("c:/a/1.jpg").unwrap().is_none());
 
-        // Tantivy 側も delete_doc + commit 済み
         fts.reload_reader().unwrap();
         let favs = [fav.id];
         let q = crate::fts_index::build_bigram_and_query(
@@ -884,39 +828,17 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_purges_tombstone() {
-        let tmp = TempDir::new().unwrap();
-        let meta = FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap();
-        let fts = FtsIndex::open_at(&tmp.path().join("fts")).unwrap();
-        let fav_root = tmp.path().join("a");
-        std::fs::create_dir_all(&fav_root).unwrap();
-        let fav = mk_fav("A", &fav_root, true);
-
-        // tombstone 行を作る
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
-            .unwrap();
-        meta.mark_ok(&["c:/a/1.jpg".to_string()]).unwrap();
-        meta.mark_tombstone(&["c:/a/1.jpg".to_string()]).unwrap();
-
-        let mut rw = fts.writer().unwrap();
-        let r = run_reconciliation(&meta, &fts, &mut rw, &[fav.clone()]).unwrap();
-        drop(rw);
-        assert_eq!(r.tombstone_purged, 1);
-        assert!(meta.get("c:/a/1.jpg").unwrap().is_none());
-    }
-
-    #[test]
     fn reconciliation_skips_favorites_without_metadata_flag() {
         let tmp = TempDir::new().unwrap();
         let meta = FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap();
         let fts = FtsIndex::open_at(&tmp.path().join("fts")).unwrap();
         let fav_root = tmp.path().join("a");
         std::fs::create_dir_all(&fav_root).unwrap();
-        // metadata フラグ OFF
         let fav = mk_fav("A", &fav_root, false);
 
-        meta.mark_pending("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
+        meta.upsert_meta_ok("c:/a/1.jpg", fav.id, &fav_root, IndexKind::Image, 1, 1)
             .unwrap();
+        meta.mark_failed("c:/a/1.jpg").unwrap();
 
         let mut rw = fts.writer().unwrap();
         let r = run_reconciliation(&meta, &fts, &mut rw, &[fav]).unwrap();
@@ -925,7 +847,6 @@ mod tests {
             r.pending_cleaned, 0,
             "OFF の favorite は reconciliation 対象外"
         );
-        // 行はそのまま残っているはず
         assert!(meta.get("c:/a/1.jpg").unwrap().is_some());
     }
 
@@ -939,10 +860,9 @@ mod tests {
         let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
         let fav_id = Uuid::new_v4();
 
-        // favorite 0 件で検索 → Complete
+        let _ = meta;
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
-        let meta_cl = Arc::clone(&meta);
         let fts_cl = Arc::clone(&fts);
         let cancel_cl = Arc::clone(&cancel);
         std::thread::spawn(move || {
@@ -952,7 +872,6 @@ mod tests {
                 &[fav_id],
                 &scope,
                 &fts_cl,
-                &meta_cl,
                 &cancel_cl,
                 &tx,
             );

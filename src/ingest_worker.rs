@@ -104,12 +104,18 @@ impl<'a> IngestSession<'a> {
 
     /// Walker の結果を適用する。
     ///
-    /// - `to_ingest` の各候補について、メタ抽出 → fts_meta.mark_pending → upsert (sub-batch 蓄積)
-    /// - `to_delete` の各 path について、fts_meta.mark_tombstone → delete (sub-batch 蓄積)
+    /// - `to_ingest` の各候補について、メタ抽出 → fts_meta.upsert_meta_ok → upsert (sub-batch 蓄積)
+    /// - `to_delete` の各 path について、Tantivy delete を sub-batch 蓄積し、commit 後に
+    ///   `fts_meta.delete_paths` で SQLite から物理削除
     /// - sub-batch が `BATCH_FLUSH_COUNT` に達するか `BATCH_FLUSH_INTERVAL` 経過したら
     ///   `dispatcher.batch(upserts, deletes, commit_after=true)` で submit する
     /// - 各 sub-batch の境界で dispatcher が Interactive キュー (タグ書き込み等) を先に拾うため、
     ///   indexer の長時間 ingest 中もタグ操作は ~1 sub-batch (1〜2s) 以内に応答できる。
+    ///
+    /// INDEX_VERSION=6 以降、Pending / Tombstone 中継状態は廃止: SQLite には ingest 完了
+    /// 状態 (`status=Ok`) を直接書き、削除は commit 完了後に物理 DELETE する。Tantivy
+    /// commit と SQLite 書き込みの間にクラッシュした場合は起動時 reconciliation (3-way diff)
+    /// で復旧する。
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
@@ -124,35 +130,22 @@ impl<'a> IngestSession<'a> {
         use crate::fts_writer_dispatcher::WriterPriority;
 
         let mut stats = IngestStats::default();
-        // Sub-batch アキュムレータ — 閾値到達でまとめて dispatcher に submit。
         let mut batch_upserts: Vec<IndexDoc> = Vec::with_capacity(BATCH_FLUSH_COUNT);
         let mut batch_deletes: Vec<String> = Vec::new();
-        let mut pending_paths: Vec<String> = Vec::new(); // commit 後に mark_ok
-        let mut tombstone_paths: Vec<String> = Vec::new(); // commit 後に purge
         let mut last_flush = Instant::now();
         let ingest_total = to_ingest.len();
         let delete_total = to_delete.len();
 
-        // sub-batch を dispatcher に投げて mark_ok / purge_tombstone まで完了させるヘルパ。
+        // sub-batch を dispatcher に投げて Tantivy commit 後に SQLite 物理削除まで完了させるヘルパ。
         let flush_batch = |batch_upserts: &mut Vec<IndexDoc>,
-                               batch_deletes: &mut Vec<String>,
-                               pending_paths: &mut Vec<String>,
-                               tombstone_paths: &mut Vec<String>|
+                               batch_deletes: &mut Vec<String>|
          -> tantivy::Result<()> {
             if batch_upserts.is_empty() && batch_deletes.is_empty() {
                 return Ok(());
             }
             let upserts = std::mem::take(batch_upserts);
             let deletes = std::mem::take(batch_deletes);
-            // INDEX_VERSION=5 で post-filter 用原文を Tantivy STORED に移したため、
-            // reload を待たずに `mark_ok` すると以下の race が発生する:
-            //   T1: commit (reader 未 reload)
-            //   T2: mark_ok (fts_meta 上 status=Ok)
-            //   T3: 検索 worker が `fts.searcher()` で旧 reader snapshot を取る
-            //   T4: status=Ok を確認後、旧 STORED から古い原文で post-filter →
-            //       「もう存在しない古いテキスト」が偽陽性ヒット
-            // 同期 reload (`reload_after_commit=true`) を要求して、reader が
-            // 確実に新 commit を見える状態になってから mark_ok する。
+            let deletes_for_sqlite = deletes.clone();
             writer.batch(
                 upserts,
                 deletes,
@@ -160,17 +153,10 @@ impl<'a> IngestSession<'a> {
                 true,  // reload_after_commit
                 WriterPriority::Background,
             )?;
-            if !pending_paths.is_empty() {
-                if let Err(e) = self.meta_db.mark_ok(pending_paths) {
-                    crate::logger::log(format!("ingest: mark_ok failed: {e}"));
+            if !deletes_for_sqlite.is_empty() {
+                if let Err(e) = self.meta_db.delete_paths(&deletes_for_sqlite) {
+                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
                 }
-                pending_paths.clear();
-            }
-            if !tombstone_paths.is_empty() {
-                if let Err(e) = self.meta_db.purge_tombstone(tombstone_paths) {
-                    crate::logger::log(format!("ingest: purge_tombstone failed: {e}"));
-                }
-                tombstone_paths.clear();
             }
             Ok(())
         };
@@ -183,54 +169,33 @@ impl<'a> IngestSession<'a> {
                 break;
             }
             if let Some(p) = progress {
-                // カウントを先頭に置くとダイアログで truncate されても残る。
-                // パスは絶対パスそのままにする (delete 経路は favorite 相対に直すと
-                // tombstone されたキーと紐付けにくいので)。
                 p.set_msg_and_count(
                     format!("削除 ({}/{}) {}", i + 1, delete_total, path),
                     (i + 1) as u64,
                     delete_total as u64,
                 );
             }
-            if let Err(e) = self.meta_db.mark_tombstone(&[path.clone()]) {
-                crate::logger::log(format!("ingest: mark_tombstone failed for {path}: {e}"));
-                continue;
-            }
             batch_deletes.push(path.clone());
-            tombstone_paths.push(path.clone());
             stats.deleted += 1;
 
             if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
-                flush_batch(
-                    &mut batch_upserts,
-                    &mut batch_deletes,
-                    &mut pending_paths,
-                    &mut tombstone_paths,
-                )?;
+                flush_batch(&mut batch_upserts, &mut batch_deletes)?;
                 last_flush = Instant::now();
             }
         }
 
         if stats.cancelled {
-            flush_batch(
-                &mut batch_upserts,
-                &mut batch_deletes,
-                &mut pending_paths,
-                &mut tombstone_paths,
-            )?;
+            flush_batch(&mut batch_upserts, &mut batch_deletes)?;
             return Ok(stats);
         }
 
         // === 2. Ingest フェーズ ===
         for (i, cand) in to_ingest.into_iter().enumerate() {
-            // XMP 読み 1 件分だけ進めて次で再チェック (gate + cancel 両対応)。
             if crate::activity_gate::wait_and_check_cancel(self.activity_gate, cancel) {
                 stats.cancelled = true;
                 break;
             }
             if let Some(p) = progress {
-                // ファイル名だけだと同名別フォルダが判別できないので、favorite 相対パスで
-                // フォルダごと見せる。カウントは先頭に置き、truncate されても残るようにする。
                 let display = cand
                     .abs_path
                     .strip_prefix(&self.favorite_root)
@@ -243,8 +208,6 @@ impl<'a> IngestSession<'a> {
                     ingest_total as u64,
                 );
             }
-            // メタ抽出と IndexDoc ビルドはここで実行 (writer に touch しない)。dispatcher 側は
-            // upsert_doc を呼ぶだけなので、重い IO はこの thread で並列化されたまま。
             let _permit = io_sem.acquire(priority);
             let built = match cand.kind {
                 CandidateKind::Image => self.build_doc_for_image(&cand),
@@ -255,7 +218,6 @@ impl<'a> IngestSession<'a> {
             match built {
                 Ok(doc) => {
                     batch_upserts.push(doc);
-                    pending_paths.push(cand.key.clone());
                     stats.ingested_ok += 1;
                 }
                 Err(e) => {
@@ -269,26 +231,13 @@ impl<'a> IngestSession<'a> {
             }
 
             if self.batch_should_flush(batch_upserts.len(), batch_deletes.len(), last_flush) {
-                flush_batch(
-                    &mut batch_upserts,
-                    &mut batch_deletes,
-                    &mut pending_paths,
-                    &mut tombstone_paths,
-                )?;
+                flush_batch(&mut batch_upserts, &mut batch_deletes)?;
                 last_flush = Instant::now();
             }
         }
 
-        // 残りを flush
-        flush_batch(
-            &mut batch_upserts,
-            &mut batch_deletes,
-            &mut pending_paths,
-            &mut tombstone_paths,
-        )?;
+        flush_batch(&mut batch_upserts, &mut batch_deletes)?;
         if let Some(p) = progress {
-            // 取込/削除フェーズ完了 — ETA カウントをクリアして UI から残り時間を消す。
-            // (notify-rs 待機中に「残り 00:00」が残らないようにする)
             p.clear_count();
         }
         Ok(stats)
@@ -346,7 +295,7 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, container, kind, norms)
     }
 
-    /// mark_pending + IndexDoc ビルドを 1 箇所に集約 (旧 `commit_doc` の writer 抜き版)。
+    /// upsert_meta_ok + IndexDoc ビルドを 1 箇所に集約。
     /// `norms` は move で受けて IndexDoc に埋め込む — per-file で複製は発生しない。
     fn build_doc(
         &self,
@@ -356,7 +305,7 @@ impl<'a> IngestSession<'a> {
         norms: crate::ingest_text::PerSourceText,
     ) -> Result<IndexDoc, String> {
         self.meta_db
-            .mark_pending(
+            .upsert_meta_ok(
                 &cand.key,
                 self.favorite_id,
                 &self.favorite_root,
@@ -364,7 +313,7 @@ impl<'a> IngestSession<'a> {
                 cand.mtime,
                 cand.file_size,
             )
-            .map_err(|e| format!("mark_pending: {e}"))?;
+            .map_err(|e| format!("upsert_meta_ok: {e}"))?;
         Ok(IndexDoc {
             path: cand.key.clone(),
             container,
@@ -490,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_marks_tombstone_then_purges() {
+    fn delete_purges_immediately() {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
@@ -590,12 +539,12 @@ mod tests {
         assert!(!hits.is_empty(), "Tantivy 側でヒットする");
     }
 
-    /// Codex P1 回帰: ingest commit 後 `mark_ok` する前に reader が確実に
-    /// reload 済みであること。post-filter は同じ Tantivy snapshot から STORED 原文を
-    /// 引くので、`status=Ok` を見たあとに古い snapshot を読まされると偽陽性になる。
-    /// `IngestSession::apply` 完了直後に reader が最新を見えていれば OK。
+    /// Codex P1 回帰: ingest commit 後に reader が確実に reload 済みであること。
+    /// post-filter は同じ Tantivy snapshot から STORED 原文を引くので、commit 後に
+    /// 古い snapshot を読まされると偽陽性になる。`IngestSession::apply` 完了直後に
+    /// reader が最新を見えていれば OK。
     #[test]
-    fn mark_ok_implies_reader_sees_latest_commit() {
+    fn ingest_commit_implies_reader_sees_latest_commit() {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
@@ -710,76 +659,27 @@ mod tests {
     }
 
     #[test]
-    fn pending_residue_detected_by_reconciliation_hook() {
-        // Codex 6 回目テスト推奨: Tantivy commit 後 mark_ok が失敗 (または呼ばれず
-        // クラッシュ) した場合の残留状態。list_not_ok_paths で pending を回収できること。
-        let (tmp, meta, fts) = setup();
+    fn failed_residue_detected_by_reconciliation_hook() {
+        // ingest 中に build_doc が失敗 (= mark_failed が呼ばれる) ケース。
+        // list_not_ok_paths で Failed を回収できることを確認する。
+        let (_tmp, meta, _fts) = setup();
         let fav = Uuid::new_v4();
-        let root = tmp.path().to_path_buf();
-
-        // mark_pending のみを手動で呼び、Tantivy upsert + commit も行うが
-        // mark_ok は意図的に呼ばない (クラッシュシミュレーション)
-        let cand = make_image_file(tmp.path(), "crash.jpg");
-        let key = cand.key.clone();
-        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
-        meta.mark_pending(
+        let key = "c:/never/exists.jpg".to_string();
+        meta.upsert_meta_ok(
             &key,
             fav,
-            &root,
+            std::path::Path::new("C:/"),
             IndexKind::Image,
-            cand.mtime,
-            cand.file_size,
+            0,
+            0,
         )
         .unwrap();
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
-            fts.writer().unwrap(),
-            std::sync::Arc::clone(&fts),
-        );
-        writer
-            .upsert(
-                crate::fts_index::IndexDoc {
-                    path: key.clone(),
-                    container: crate::fts_index::Container::Fs,
-                    zip_entry: String::new(),
-                    favorite_id: fav,
-                    kind: IndexKind::Image,
-                    mtime: cand.mtime,
-                    file_size: cand.file_size,
-                    norms: norms.clone(),
-                },
-                crate::fts_writer_dispatcher::WriterPriority::Background,
-            )
-            .unwrap();
-        writer
-            .commit(false, crate::fts_writer_dispatcher::WriterPriority::Background)
-            .unwrap();
-        // !!! mark_ok を呼ばずに "クラッシュ" — pending のまま残留
+        meta.mark_failed(&key).unwrap();
 
-        let row = meta.get(&key).unwrap().unwrap();
-        assert_eq!(row.status, FileStatus::Pending);
-
-        // Tantivy 側には commit 済 doc が残っている (post-filter で status=Pending を弾くのは
-        // 検索ワーカー側 `global_search.rs` の責務)。
-        fts.reload_reader().unwrap();
-        let favs = [fav];
-        let q = fts_index::build_bigram_and_query(
-            fts.fields(),
-            &["crash.jpg"],
-            &crate::fts_index::QueryFilters {
-                favorite_ids: Some(&favs),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let searcher = fts.searcher();
-        let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
-        assert_eq!(hits.len(), 1, "Tantivy には残っている");
-
-        // reconciliation hook で検出できる (次回起動時の再 ingest 対象)
         let not_ok = meta.list_not_ok_paths(fav).unwrap();
         assert_eq!(not_ok.len(), 1);
         assert_eq!(not_ok[0].0, key);
-        assert_eq!(not_ok[0].1, FileStatus::Pending);
+        assert_eq!(not_ok[0].1, FileStatus::Failed);
     }
 
     #[test]

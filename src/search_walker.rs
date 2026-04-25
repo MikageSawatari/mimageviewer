@@ -412,9 +412,9 @@ mod tests {
         let key = normalize_path(&abs);
 
         // DB に同じ mtime/size で登録済み
-        db.mark_pending(&key, fav, &root, IndexKind::Image, mtime, size)
+        db.upsert_meta_ok(&key, fav, &root, IndexKind::Image, mtime, size)
             .unwrap();
-        db.mark_ok(&[key.clone()]).unwrap();
+        let _ = key.clone();
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.total_scanned, 1);
@@ -433,9 +433,9 @@ mod tests {
         let abs = root.join("a.jpg");
         let key = normalize_path(&abs);
         // DB に "古い" mtime で登録
-        db.mark_pending(&key, fav, &root, IndexKind::Image, 1, 1)
+        db.upsert_meta_ok(&key, fav, &root, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_ok(&[key.clone()]).unwrap();
+        let _ = key.clone();
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.unchanged, 0);
@@ -451,9 +451,9 @@ mod tests {
         make_file(&root, "survivor.jpg", b"s");
 
         let dead_key = normalize_path(&root.join("gone.jpg"));
-        db.mark_pending(&dead_key, fav, &root, IndexKind::Image, 1, 1)
+        db.upsert_meta_ok(&dead_key, fav, &root, IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_ok(&[dead_key.clone()]).unwrap();
+        let _ = dead_key.clone();
         let surv_key = normalize_path(&root.join("survivor.jpg"));
         let surv_meta = root.join("survivor.jpg").metadata().unwrap();
         let surv_mtime = surv_meta
@@ -462,7 +462,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        db.mark_pending(
+        db.upsert_meta_ok(
             &surv_key,
             fav,
             &root,
@@ -471,7 +471,7 @@ mod tests {
             surv_meta.len() as i64,
         )
         .unwrap();
-        db.mark_ok(&[surv_key.clone()]).unwrap();
+        let _ = surv_key.clone();
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.total_scanned, 1);
@@ -519,9 +519,9 @@ mod tests {
         fs::create_dir_all(&root_a).unwrap();
         let key_b = normalize_path(&tmp.path().join("B/other.jpg"));
         // fav_b 所属の行を追加
-        db.mark_pending(&key_b, fav_b, &tmp.path().join("B"), IndexKind::Image, 1, 1)
+        db.upsert_meta_ok(&key_b, fav_b, &tmp.path().join("B"), IndexKind::Image, 1, 1)
             .unwrap();
-        db.mark_ok(&[key_b]).unwrap();
+        let _ = key_b;
 
         // fav_a の scan 結果に fav_b は出てこない
         let r = scan_sync(fav_a, &root_a, &db);
