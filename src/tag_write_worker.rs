@@ -53,6 +53,10 @@ pub struct TagWriteJob {
     /// 検索インデックス更新用の favorite_id。None なら Tantivy upsert をスキップ
     /// (次回 notify-rs re-ingest で反映)。
     pub favorite_id: Option<Uuid>,
+    /// Undo entry を最終確定するための取引 ID。同じ user 操作 (1 トグル / 1 クリア) で
+    /// 投入された全ジョブは同じ tx_id を共有し、UI 側の `pending_tag_undos` で
+    /// 集計される。0 なら Undo 確定不要 (例: Undo/Redo 由来の SetTags ジョブ自体)。
+    pub tx_id: u64,
 }
 
 /// `Toggle` / `ClearMiv` / `SetTags` が実際に何をしたかを UI に返すためのラベル。
@@ -75,10 +79,19 @@ pub enum TagAction {
 pub struct TagWriteResult {
     pub path: PathBuf,
     pub result: Result<TagAction, String>,
+    /// 書き込み**直前**の dc:subject 一覧 (worker が実ファイルから読み出した値)。
+    /// Undo entry の `before` を確定させるために使う — UI 側の予測 (= tags_cache)
+    /// が外部ツールの XMP 書き換えで stale になっていた場合でも、ここに入る値が
+    /// 真の disk 状態なので Undo は正しく逆操作を組み立てられる。
+    /// 失敗時 (XMP read 自体は成功して write が失敗するケース) も含めて、worker が
+    /// op を解決するために読み取った値をそのまま入れる。read 自体が失敗した場合は空。
+    pub tags_before: Vec<String>,
     /// 書き込み後の dc:subject 一覧 (成功時のみ意味あり、失敗時は空)。
     /// UI 側はこれを `tags_cache` に直接書き戻すことで、fts_meta に行が無い
     /// (未インデックス favorite 等) ファイルでもグリッドバッジが即時反映される。
     pub tags_after: Vec<String>,
+    /// 投入時のトランザクション ID をエコーバック。`TagWriteJob::tx_id` 参照。
+    pub tx_id: u64,
 }
 
 pub struct TagWriteHandle {
@@ -212,7 +225,7 @@ fn run_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        let (res, dirtied, tags_after) = process_job(&job, &meta, &fts, &writer);
+        let (res, dirtied, tags_before, tags_after) = process_job(&job, &meta, &fts, &writer);
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -232,7 +245,9 @@ fn run_worker(
         let _ = result_tx.send(TagWriteResult {
             path: job.path.clone(),
             result: res.map_err(|e| e.to_string()),
+            tags_before,
             tags_after,
+            tx_id: job.tx_id,
         });
     }
     // 終了時に残ピンを flush。
@@ -269,6 +284,7 @@ fn flush_commit(
 /// ジョブを 1 件処理する。戻り値は:
 /// - `Result<TagAction, WriteError>`: UI 側トースト用の結果ラベル
 /// - `bool` dirtied: dispatcher に upsert を投げたか (呼び出し側がバッチ commit の pending に使う)
+/// - `Vec<String>` tags_before: write **直前** の dc:subject (Undo entry の `before` に使う)
 /// - `Vec<String>` tags_after: 書き込み後の dc:subject 一覧 (エラー時は空)。UI が
 ///   `tags_cache` に直接書き戻して、fts_meta 行の有無に依存せず grid バッジを更新するのに使う。
 fn process_job(
@@ -276,18 +292,20 @@ fn process_job(
     meta: &FtsMetaDb,
     fts: &FtsIndex,
     writer: &FtsWriterDispatcher,
-) -> (Result<TagAction, WriteError>, bool, Vec<String>) {
+) -> (Result<TagAction, WriteError>, bool, Vec<String>, Vec<String>) {
     let path_disp = job.path.display();
-    // Toggle は worker 側で現在タグを読んで Add/Remove に解決する。
-    // これで UI スレッドからの同期 I/O を不要にできる。
-    // UI 側トースト用に、どちらに解決されたかを `TagAction` で返す。
+    // Toggle / ClearMiv / SetTags のいずれも、worker 内でまず実ファイルから dc:subject を
+    // 読み出す。この値が Undo entry の `before` (= write 直前の真の disk 状態) になる。
+    // UI 側 (`tags_cache`) の予測値とは独立に確定するので、外部ツールの XMP 書き換えで
+    // cache が stale な場合でも Undo は正しく逆操作を組み立てられる。
+    let tags_before = crate::xmp_reader::read_dc_subject(&job.path);
+
     let (op, action) = match &job.kind {
         TagJobKind::Toggle(name) => {
-            let current = crate::xmp_reader::read_dc_subject(&job.path);
             let with_hash = format!("#{name}");
-            let already_has = current.iter().any(|t| *t == with_hash);
+            let already_has = tags_before.iter().any(|t| *t == with_hash);
             crate::logger::log(format!(
-                "[TAG] worker: read dc:subject → {current:?} (looking for {with_hash:?}) → {} | {path_disp}",
+                "[TAG] worker: read dc:subject → {tags_before:?} (looking for {with_hash:?}) → {} | {path_disp}",
                 if already_has { "REMOVE" } else { "ADD" }
             ));
             if already_has {
@@ -297,21 +315,19 @@ fn process_job(
             }
         }
         TagJobKind::ClearMiv => {
-            let current = crate::xmp_reader::read_dc_subject(&job.path);
-            let had = current.iter().any(|t| t.starts_with('#'));
+            let had = tags_before.iter().any(|t| t.starts_with('#'));
             crate::logger::log(format!(
-                "[TAG] worker: ClearMiv read dc:subject → {current:?} (had #-tags={had}) | {path_disp}"
+                "[TAG] worker: ClearMiv read dc:subject → {tags_before:?} (had #-tags={had}) | {path_disp}"
             ));
             (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp })
         }
         TagJobKind::SetTags(target) => {
-            // Codex P3: SetTags は Undo/Redo 経路でしか使わないので、disk が既に target に
+            // SetTags は Undo/Redo 経路でしか使わないので、disk が既に target に
             // 一致していても (変化ゼロでも) `Restored` を返す。`NoOp` を返すと
             // tag_ops の `format_completion_toast` で「mIV タグをクリア」誤表示になるため。
-            let current = crate::xmp_reader::read_dc_subject(&job.path);
-            let changed = current != *target;
+            let changed = tags_before != *target;
             crate::logger::log(format!(
-                "[TAG] worker: SetTags current={current:?} target={target:?} (changed={changed}) | {path_disp}"
+                "[TAG] worker: SetTags current={tags_before:?} target={target:?} (changed={changed}) | {path_disp}"
             ));
             (TagOp::Set(target.clone()), TagAction::Restored)
         }
@@ -323,7 +339,7 @@ fn process_job(
             crate::logger::log(format!(
                 "[TAG] worker: apply_tag_op FAILED ({e}) | {path_disp}"
             ));
-            return (Err(e), false, Vec::new());
+            return (Err(e), false, tags_before, Vec::new());
         }
     };
     crate::logger::log(format!(
@@ -341,7 +357,7 @@ fn process_job(
             false
         }
     };
-    (Ok(action), dirtied, tags_after)
+    (Ok(action), dirtied, tags_before, tags_after)
 }
 
 /// 既存の Tantivy doc から他ソースのテキストを引き継ぎつつ、`tags` フィールドだけ

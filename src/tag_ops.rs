@@ -80,27 +80,16 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        // worker handle を **capture より前に** 確保する (Codex P2 #2)。
-        // 失敗するなら tags_cache 楽観更新も Undo push もせず早期 return — そうしないと
-        // 「実ファイルは変わっていないのに UI バッジと Undo stack だけ進んだ」状態になる。
         if !self.precheck_tag_write_available("toggle") {
             return;
         }
-        // tags_cache は grid 表示で既に warm 済みなので追加 I/O は発生しない。
-        //
-        // **既知制約 (Codex P3, 後続課題)**: capture_tag_undo は worker 投入前に
-        // tags_cache から before/after を予測する。worker の Toggle は実ファイルの
-        // dc:subject を読み直して Add/Remove を決めるため、cache が stale (= 外部
-        // ツールが XMP を書き換え済み) のときや、個別ファイルの XMP 書き込みが失敗
-        // した場合に、Undo entry と実ディスク状態がずれ得る。Ctrl+Z 後にユーザが
-        // 「変化なし」と感じるが、実ディスクは触っていないので破壊性はない。
-        //
-        // 完全な解決には worker が `tags_before` (書き込み直前の disk 状態) を結果に
-        // 載せ、poll_tag_write_results が成功分だけ Undo entry を事後確定する仕組みが
-        // 要る (worker protocol 拡張 + pending undo buffer の追加)。
+        // 楽観的 UI 更新: tags_cache を「予想した after」に書き換えてグリッドバッジを
+        // 即時反映する。**Undo entry はここでは積まない** — worker 結果が
+        // 「実 disk の before/after」を持って戻った時点で `poll_tag_write_results` が
+        // pending_tag_undos から組み立てて確定する (Codex P3 完全対応)。
         let with_hash = format!("#{name_owned}");
         let summary = format!("#{name_owned} のトグル");
-        self.capture_tag_undo(&paths, summary, |before| {
+        self.optimistic_update_tags_cache(&paths, |before| {
             if before.iter().any(|t| t == &with_hash) {
                 before.iter().filter(|t| *t != &with_hash).cloned().collect()
             } else {
@@ -109,8 +98,10 @@ impl App {
                 after
             }
         });
+        let tx_id = self.next_tag_tx_id();
+        self.register_pending_tag_op(tx_id, summary, paths.len());
         let name_for_jobs = name_owned;
-        self.submit_tag_jobs(&paths, "toggle", move |_| {
+        self.submit_tag_jobs(&paths, "toggle", tx_id, move |_| {
             TagJobKind::Toggle(name_for_jobs.clone())
         });
     }
@@ -128,13 +119,12 @@ impl App {
         crate::logger::log(format!(
             "[TAG] clear requested for {count} file(s) (mIV tags only)"
         ));
-        // worker handle 不在なら capture もせず早期 return (Codex P2 #2)。
         if !self.precheck_tag_write_available("clear") {
             return;
         }
-        // ClearMiv 後の dc:subject は `#` 始まり要素を除いたものになる。
+        // 楽観的 UI 更新: ClearMiv 後の dc:subject は `#` 始まり要素を除いたもの。
         let summary = format!("{count} 件の mIV タグをクリア");
-        self.capture_tag_undo(&paths, summary, |before| {
+        self.optimistic_update_tags_cache(&paths, |before| {
             before
                 .iter()
                 .filter(|t| !t.starts_with('#'))
@@ -142,7 +132,9 @@ impl App {
                 .collect()
         });
         self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
-        self.submit_tag_jobs(&paths, "clear", |_| TagJobKind::ClearMiv);
+        let tx_id = self.next_tag_tx_id();
+        self.register_pending_tag_op(tx_id, summary, paths.len());
+        self.submit_tag_jobs(&paths, "clear", tx_id, |_| TagJobKind::ClearMiv);
     }
 
     /// `tag_write_handle` を遅延初期化し、利用可能か確認する。
@@ -161,8 +153,9 @@ impl App {
     }
 
     /// タグ書き込みジョブ投入の共通経路。
-    /// - 呼び出し側が `tag_target_paths()` で算出した `paths` をそのまま渡すこと
-    ///   (Undo 用 snapshot と同じ列を使うため、関数内で再算出すると 2 度走査になる)。
+    /// - 呼び出し側が `tag_target_paths()` で算出した `paths` をそのまま渡す。
+    /// - `tx_id` は `register_pending_tag_op` で発行したトランザクション ID
+    ///   (worker 結果から `pending_tag_undos` を引くためのキー)。Undo 確定不要なら 0。
     /// - 対象 path が 0 件 → 黙って何もしない
     /// - `tag_write_handle` 初期化失敗 → エラートーストを出して失敗を明示
     /// - 正常 → 各 path で `kind_for` を呼んでジョブを作成する (完了トーストは
@@ -171,6 +164,7 @@ impl App {
         &mut self,
         paths: &[PathBuf],
         op_label: &str,
+        tx_id: u64,
         kind_for: impl Fn(&PathBuf) -> TagJobKind,
     ) {
         if paths.is_empty() {
@@ -192,7 +186,7 @@ impl App {
             return;
         };
         crate::logger::log(format!(
-            "[TAG] submitting '{op_label}' for {} file(s):",
+            "[TAG] submitting '{op_label}' (tx={tx_id}) for {} file(s):",
             paths.len()
         ));
         for p in paths {
@@ -206,6 +200,7 @@ impl App {
                 path: p.clone(),
                 kind: kind_for(p),
                 favorite_id: fav_id,
+                tx_id,
             });
         }
     }
@@ -250,6 +245,9 @@ impl App {
         // fts_meta に行が無い favorite (未インデックス) でも、ここで直接書き戻せば
         // 次フレームの `cell_tag_list` が正しい値を拾えるため add/remove 対称になる。
         let mut cache_updates: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        // pending_tag_undos に積み上げる: (tx_id, TagChange or failure marker)。
+        // tx_id == 0 は「Undo 確定不要」(Undo/Redo 由来の SetTags 等) なのでスキップ。
+        let mut pending_updates: Vec<PendingUpdate> = Vec::new();
         if let Some(h) = self.tag_write_handle.as_ref() {
             while let Some(res) = h.try_recv_result() {
                 let path_disp = res.path.display().to_string();
@@ -283,10 +281,24 @@ impl App {
                                 ));
                             }
                         }
+                        if res.tx_id != 0 {
+                            // 実 disk の before/after を確定情報として pending に積む。
+                            pending_updates.push(PendingUpdate::Success {
+                                tx_id: res.tx_id,
+                                change: crate::undo_stack::TagChange {
+                                    path: res.path.clone(),
+                                    before: res.tags_before,
+                                    after: res.tags_after.clone(),
+                                },
+                            });
+                        }
                         cache_updates.push((res.path, res.tags_after));
                     }
                     Err(e) => {
                         crate::logger::log(format!("[TAG]   ✗ FAILED: {e} → {path_disp}"));
+                        if res.tx_id != 0 {
+                            pending_updates.push(PendingUpdate::Failure { tx_id: res.tx_id });
+                        }
                         errors.push((res.path, e));
                     }
                 }
@@ -301,6 +313,9 @@ impl App {
             let key = crate::adjustment_db::normalize_path(&path);
             self.tags_cache.insert(key, tags);
         }
+        // pending_tag_undos に worker 結果を集計し、完了したトランザクションは
+        // UndoEntry::Tag を組み立てて meta_undo に push する。
+        self.finalize_pending_tag_undos(pending_updates);
         if just_completed {
             crate::logger::log(format!(
                 "[TAG] batch complete: added={added} removed={removed} cleared={cleared} \
@@ -341,6 +356,88 @@ impl App {
         if just_completed {
             if let Some(h) = self.tag_write_handle.as_ref() {
                 h.reset_counters_if_idle();
+            }
+        }
+    }
+}
+
+/// `poll_tag_write_results` 内で worker 1 件分の結果を `pending_tag_undos` に
+/// どう反映するかを表す中間型。借用衝突を避けるため、ハンドルの drain 中はここに
+/// 積み上げて drain 後に `finalize_pending_tag_undos` でまとめて適用する。
+enum PendingUpdate {
+    /// 成功: Undo entry の `accumulated` に worker の真の before/after を追加する。
+    Success {
+        tx_id: u64,
+        change: crate::undo_stack::TagChange,
+    },
+    /// 失敗: そのジョブを Undo 対象外にする (failures カウントだけ進める)。
+    /// 実ディスクは変わっていないので Undo entry に含めるとずれる。
+    Failure { tx_id: u64 },
+}
+
+impl App {
+    /// テストヘルパー: worker 結果を模擬して `finalize_pending_tag_undos` を駆動する。
+    /// 実 worker / handle / channel を持ち込まずに「pending 集計 → meta_undo push」の
+    /// パスだけ単体で検証できる。本番コードからは呼ばない。
+    #[cfg(test)]
+    pub(crate) fn test_finalize_tag_success(
+        &mut self,
+        tx_id: u64,
+        change: crate::undo_stack::TagChange,
+    ) {
+        self.finalize_pending_tag_undos(vec![PendingUpdate::Success { tx_id, change }]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_finalize_tag_failure(&mut self, tx_id: u64) {
+        self.finalize_pending_tag_undos(vec![PendingUpdate::Failure { tx_id }]);
+    }
+
+    /// `poll_tag_write_results` から呼ばれる finalize 補助。
+    /// 1) `updates` を `pending_tag_undos` に accumulate する。
+    /// 2) `accumulated.len() + failures == expected_total` に達したエントリを `meta_undo`
+    ///    に push する (空なら破棄)。
+    fn finalize_pending_tag_undos(&mut self, updates: Vec<PendingUpdate>) {
+        for u in updates {
+            match u {
+                PendingUpdate::Success { tx_id, change } => {
+                    if let Some(p) = self.pending_tag_undos.get_mut(&tx_id) {
+                        p.accumulated.push(change);
+                    } else {
+                        // pending が消えている = clear_meta_undo 等で boundary を跨いだ
+                        // 操作の結果が今頃届いた。Undo entry として復活させない。
+                        crate::logger::log(format!(
+                            "[TAG] poll: dropped result for tx_id={tx_id} (no pending entry)"
+                        ));
+                    }
+                }
+                PendingUpdate::Failure { tx_id } => {
+                    if let Some(p) = self.pending_tag_undos.get_mut(&tx_id) {
+                        p.failures += 1;
+                    }
+                }
+            }
+        }
+        // 完了した tx_id を集めて remove → push (借用衝突回避のため 2 段階)。
+        let completed: Vec<u64> = self
+            .pending_tag_undos
+            .iter()
+            .filter_map(|(tx, p)| {
+                (p.accumulated.len() + p.failures >= p.expected_total).then_some(*tx)
+            })
+            .collect();
+        for tx in completed {
+            if let Some(p) = self.pending_tag_undos.remove(&tx) {
+                let crate::app::PendingTagUndo {
+                    summary,
+                    accumulated,
+                    ..
+                } = p;
+                if accumulated.is_empty() {
+                    // 全件失敗 or worker 結果が来なかった: Undo entry なし
+                    continue;
+                }
+                self.push_tag_undo_entry(accumulated, summary);
             }
         }
     }

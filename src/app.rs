@@ -799,6 +799,29 @@ pub(crate) struct AdjustmentDragSession {
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
+/// タグ操作の保留 Undo entry を集計するためのバッファ。
+///
+/// 1 トランザクション (1 回の `request_tag_toggle_for_selection` / `_clear_for_selection`
+/// 呼出し) ごとに 1 個作られ、worker 結果が **実 disk の before/after** を伴って
+/// 帰ってくるたびに `accumulated` に積まれる。`expected_total` 件全部が完了した時点で
+/// `accumulated` から `UndoEntry::Tag` を組み立てて `meta_undo` に push する。
+///
+/// この遅延構築によって:
+/// - 外部ツールが XMP を書き換えて `tags_cache` が stale でも、Undo entry は worker が
+///   読んだ真の disk 状態を `before` に持つ → Ctrl+Z 連打で他タグを破壊しない。
+/// - 個別ファイルの XMP 書き込み失敗は `accumulated` に入らない (= Undo の対象外) ので、
+///   実ディスクと Undo stack が乖離しない。
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTagUndo {
+    pub summary: String,
+    /// 投入したジョブ数。`accumulated.len() + failures` がこの値に達したら確定する。
+    pub expected_total: usize,
+    /// 失敗したジョブ数 (UI トーストの集計とは別軸: ここでは Undo entry に含めない件数を数える)。
+    pub failures: usize,
+    /// worker 結果 1 件分。`(path, tags_before, tags_after)`。
+    pub accumulated: Vec<crate::undo_stack::TagChange>,
+}
+
 /// ベクタオブジェクト編集のドラッグ状態。
 /// `base` はドラッグ開始時の元オブジェクト、`origin` はそのときのカーソル画像座標。
 #[derive(Debug, Clone, Copy)]
@@ -1762,6 +1785,15 @@ pub struct App {
     /// ドラッグ中は DB 書き込みをスキップし in-memory のみ更新、ドラッグ終了時に
     /// 一括で `set_page_params` を呼んで永続化 + Undo エントリを 1 件積む。
     pub(crate) adjustment_drag_session: Option<AdjustmentDragSession>,
+    /// タグ操作の保留 Undo 集計バッファ。`request_tag_*_for_selection` が tx_id を発行し
+    /// `PendingTagUndo` を入れ、`poll_tag_write_results` が worker 結果 1 件ごとに
+    /// `TagChange` を accumulate する。完了時に「実 disk の before/after」で構築した
+    /// UndoEntry を `meta_undo` に push する。
+    /// これにより外部ツールで XMP が書き換わって tags_cache が stale でも、Undo entry は
+    /// worker が読んだ真の disk 状態を持つので Ctrl+Z 連打で他タグを破壊しない。
+    pub(crate) pending_tag_undos: std::collections::HashMap<u64, PendingTagUndo>,
+    /// 次に発行するタグ操作の tx_id。0 は「Undo 確定不要」を表す予約値なので 1 から始める。
+    pub(crate) next_tag_tx_id: u64,
     /// 直前の push_undo_snapshot 時刻。矢印/[/]キー連打時のスナップショット重複を抑制する
     /// (OS のキーリピートで毎フレーム full-bitmap clone が走るのを防ぐ)。
     pub(crate) erase_last_undo_at: Option<std::time::Instant>,
@@ -2164,6 +2196,8 @@ impl Default for App {
             erase_undo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
+            pending_tag_undos: std::collections::HashMap::new(),
+            next_tag_tx_id: 1,
             erase_last_undo_at: None,
             erase_vectors: Vec::new(),
             erase_selected_vector: None,
@@ -14145,6 +14179,182 @@ mod favorite_adjustment_defaults_tests {
         app.apply_meta_undo();
         assert!(!app.adjustment_page_params.contains_key(&idx_a));
         assert!(!app.adjustment_page_params.contains_key(&idx_b));
+    }
+
+    // ── タグ Undo: pending → finalize の検証 (Codex P3 完全対応) ──────────────
+
+    /// stale cache + Toggle で worker が逆方向 (Remove) に解決した場合、
+    /// 楽観 cache 更新は予測値だが、Undo entry は **worker が読んだ実 disk の
+    /// before/after** で作られる。これにより Ctrl+Z が真の逆操作になる。
+    #[test]
+    fn tag_undo_uses_worker_actual_disk_state_not_optimistic_prediction() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let path = PathBuf::from("C:/pics/a.jpg");
+
+        // 1) 操作開始: pending を register
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "#A のトグル".into(), 1);
+
+        // 2) 楽観 cache 更新 (UI 即時反映): cache=[] と仮定し、predicted after=[#A]
+        // (実際の試験では cache に何があってもよい — Undo の正しさには影響しない)
+
+        // 3) worker 結果到着: 実 disk は実は既に [#A] だった (= 外部ツールで付与済み)。
+        //    worker は Remove を選び、tags_after=[]. tags_before=[#A] を返す。
+        let actual_before = vec!["#A".to_string()];
+        let actual_after: Vec<String> = vec![];
+        app.test_finalize_tag_success(
+            tx,
+            crate::undo_stack::TagChange {
+                path: path.clone(),
+                before: actual_before.clone(),
+                after: actual_after.clone(),
+            },
+        );
+
+        // 4) meta_undo に **実 disk** の before/after で entry が積まれている
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        match app.meta_undo.peek_undo().unwrap() {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].before, actual_before);
+                assert_eq!(changes[0].after, actual_after);
+            }
+            _ => panic!("expected Tag entry"),
+        }
+
+        // 5) pending は finalize 後に消えている
+        assert!(app.pending_tag_undos.is_empty());
+    }
+
+    /// XMP 書き込みが失敗したジョブは Undo entry に含まれない (= 失敗パスを Ctrl+Z すると
+    /// 「実ディスクは変わっていないのに書き戻し命令が飛ぶ」事故を防ぐ)。
+    #[test]
+    fn tag_undo_skips_failed_writes() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let path_ok = PathBuf::from("C:/pics/ok.jpg");
+
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "#A のトグル".into(), 2);
+
+        // 1 件成功、1 件失敗
+        app.test_finalize_tag_success(
+            tx,
+            crate::undo_stack::TagChange {
+                path: path_ok,
+                before: vec![],
+                after: vec!["#A".into()],
+            },
+        );
+        app.test_finalize_tag_failure(tx);
+
+        // 完了 (1 success + 1 failure = 2 = expected_total)、Undo entry は成功 1 件分のみ
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        match app.meta_undo.peek_undo().unwrap() {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(changes.len(), 1, "失敗分は entry に含まれない");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// 全件失敗した場合は Undo entry が積まれない (空エントリの抑止)。
+    #[test]
+    fn tag_undo_all_failed_pushes_no_entry() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "all fail".into(), 2);
+
+        app.test_finalize_tag_failure(tx);
+        app.test_finalize_tag_failure(tx);
+
+        assert_eq!(app.meta_undo.undo_len(), 0, "全件失敗は entry なし");
+        assert!(app.pending_tag_undos.is_empty());
+    }
+
+    /// stale cache のシナリオ C 防止: 連続操作 + Ctrl+Z 連打で外部由来タグを
+    /// 破壊しないことを検証。worker 結果ベースで Undo entry が作られているので
+    /// Ctrl+Z は真の disk 状態に戻る (#A は保持される)。
+    #[test]
+    fn tag_undo_chain_does_not_destroy_external_tags() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let path = PathBuf::from("C:/pics/a.jpg");
+
+        // 操作 1: 外部で #A 付与済みの状態で mIV が #B トグル
+        // worker が読む disk: [#A] → 書く: [#A, #B]
+        let tx1 = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx1, "#B".into(), 1);
+        app.test_finalize_tag_success(
+            tx1,
+            crate::undo_stack::TagChange {
+                path: path.clone(),
+                before: vec!["#A".into()],
+                after: vec!["#A".into(), "#B".into()],
+            },
+        );
+
+        // 操作 2: #C トグル
+        // worker が読む disk: [#A, #B] → 書く: [#A, #B, #C]
+        let tx2 = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx2, "#C".into(), 1);
+        app.test_finalize_tag_success(
+            tx2,
+            crate::undo_stack::TagChange {
+                path: path.clone(),
+                before: vec!["#A".into(), "#B".into()],
+                after: vec!["#A".into(), "#B".into(), "#C".into()],
+            },
+        );
+
+        assert_eq!(app.meta_undo.undo_len(), 2);
+
+        // 直近 (op2) を Ctrl+Z: pop entry — before=[#A,#B] が正しい逆操作
+        let entry = app.meta_undo.pop_undo().unwrap();
+        match &entry {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(changes[0].before, vec!["#A", "#B"]);
+                assert_eq!(changes[0].after, vec!["#A", "#B", "#C"]);
+            }
+            _ => panic!(),
+        }
+
+        // 1 つ前 (op1) を Ctrl+Z: before=[#A] が正しい逆操作 — **空ではない**
+        // (旧実装ではここが [] になり、Ctrl+Z で #A まで消えてしまう破壊)
+        let entry = app.meta_undo.pop_undo().unwrap();
+        match &entry {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(
+                    changes[0].before,
+                    vec!["#A"],
+                    "Ctrl+Z は外部由来 #A を保持しなければならない (シナリオ C 防止)"
+                );
+                assert_eq!(changes[0].after, vec!["#A", "#B"]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// pending が消えている (= clear_meta_undo で boundary を跨いだ) tx_id の worker 結果は
+    /// 静かに drop し、Undo stack には影響しない。
+    #[test]
+    fn tag_undo_orphan_result_after_boundary_does_not_push() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "abandoned".into(), 1);
+
+        // boundary clear (フォルダ移動相当) で pending が破棄される
+        app.clear_meta_undo();
+        assert!(app.pending_tag_undos.is_empty());
+
+        // 後から worker 結果が届いても entry は積まれない
+        app.test_finalize_tag_success(
+            tx,
+            crate::undo_stack::TagChange {
+                path: PathBuf::from("C:/pics/a.jpg"),
+                before: vec![],
+                after: vec!["#A".into()],
+            },
+        );
+        assert_eq!(app.meta_undo.undo_len(), 0);
     }
 
     /// Codex P2 #1 回帰: グリッド Q / Ctrl+Backspace の一括解除

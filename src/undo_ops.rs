@@ -107,6 +107,17 @@ impl App {
                 }
             }
         }
+        // 進行中のタグ操作の保留 Undo entry を破棄する。worker 結果は引き続き来るが、
+        // poll_tag_write_results 側で「対応する pending が無い」ことを検出して
+        // tags_cache 更新だけ行い undo push をスキップする。boundary を跨いだ操作の
+        // 結果が古いコンテキストの Undo として残らないようにするのが目的。
+        if !self.pending_tag_undos.is_empty() {
+            crate::logger::log(format!(
+                "[UNDO] clear_meta_undo: drop {} pending_tag_undos",
+                self.pending_tag_undos.len()
+            ));
+            self.pending_tag_undos.clear();
+        }
     }
 
     // ── 適用 (Ctrl+Z / Ctrl+Y で呼ぶ) ────────────────────────────────
@@ -405,10 +416,13 @@ impl App {
         for c in changes {
             let target = if use_before { &c.before } else { &c.after };
             let fav_id = find_favorite_id(&self.settings.favorites, &c.path);
+            // tx_id=0 は「Undo entry を pending 経由で確定しない」signal。Undo/Redo の
+            // SetTags ジョブ自体は新しい undo entry を生まないので 0 で十分。
             h.submit(TagWriteJob {
                 path: c.path.clone(),
                 kind: TagJobKind::SetTags(target.clone()),
                 favorite_id: fav_id,
+                tx_id: 0,
             });
         }
         // tags_cache 楽観的更新は h の借用を解放してから実施 (`&mut self`/`&self` 衝突回避)。
@@ -487,36 +501,60 @@ impl App {
         );
     }
 
-    /// タグ操作の **直前** に呼ぶ。`paths` の各ファイルについて現在の dc:subject を
-    /// `tags_cache` から取得し、`after_for` で操作後の期待状態を計算してエントリを作る。
-    /// tags_cache に値が無い path はスキップ (= XMP 直読みは避ける、Undo より UI 応答性優先)。
+    /// タグ操作の **直前** に呼ぶ optimistic UI 更新。`paths` の各ファイルについて
+    /// 現在の `tags_cache` 値から「操作後の期待状態」を `after_for` で計算し、
+    /// **キャッシュだけ** 先に更新する (UI バッジを即時反映するため)。
     ///
-    /// **重要 (Codex P1 対応)**: 計算した `after` を `tags_cache` に**即時反映**する。
-    /// tag_write_worker は非同期なので、worker 完了前に次の操作 (例: 別タグのトグル) が
-    /// 走ると、後続の `capture_tag_undo` が古い `tags_cache` 値で `before` を捏造してしまい、
-    /// その Undo を実行すると先行操作分のタグまで剥がれる事故になる。`after` を先に
-    /// 書き戻しておけば、worker poll 完了時の上書きと等価な値になり race を消せる。
-    pub(crate) fn capture_tag_undo(
+    /// **Undo entry はここでは push しない** (Codex P3 完全対応)。Undo entry は
+    /// `register_pending_tag_op` + worker 結果集計を経由して、worker が読み出した
+    /// **実 disk 状態** を `before` に持つ形で `poll_tag_write_results` が確定させる。
+    /// これで stale cache + Ctrl+Z 連打で他タグを破壊するシナリオを排除する。
+    ///
+    /// tags_cache に値が無い path は楽観更新だけスキップ (worker 結果到着時の通常パスで
+    /// cache が初期化される)。
+    pub(crate) fn optimistic_update_tags_cache(
         &mut self,
         paths: &[PathBuf],
-        summary: String,
         mut after_for: impl FnMut(&[String]) -> Vec<String>,
     ) {
-        let mut changes = Vec::with_capacity(paths.len());
         for p in paths {
             let key = crate::adjustment_db::normalize_path(p);
             let Some(before) = self.tags_cache.get(&key).cloned() else {
-                continue; // キャッシュ未読み込みは Undo 対象外 (希少ケース)
+                continue;
             };
             let after = after_for(&before);
-            // 楽観的キャッシュ更新: 連続トグルでも次の capture が正しい before を見られるように。
-            self.tags_cache.insert(key, after.clone());
-            changes.push(TagChange {
-                path: p.clone(),
-                before,
-                after,
-            });
+            self.tags_cache.insert(key, after);
         }
-        self.push_tag_undo_entry(changes, summary);
+    }
+
+    /// 1 トランザクション分の `PendingTagUndo` を `pending_tag_undos` に登録する。
+    /// `tx_id` は呼び出し側が `App::next_tag_tx_id` から発行する。0 は予約値なので使えない。
+    pub(crate) fn register_pending_tag_op(
+        &mut self,
+        tx_id: u64,
+        summary: String,
+        expected_total: usize,
+    ) {
+        debug_assert!(tx_id != 0, "tx_id 0 は Undo 確定不要の予約値");
+        debug_assert!(
+            !self.pending_tag_undos.contains_key(&tx_id),
+            "tx_id 衝突 (next_tag_tx_id の単調増加が壊れている?)"
+        );
+        self.pending_tag_undos.insert(
+            tx_id,
+            crate::app::PendingTagUndo {
+                summary,
+                expected_total,
+                failures: 0,
+                accumulated: Vec::with_capacity(expected_total),
+            },
+        );
+    }
+
+    /// 新しいタグ操作の tx_id を発行する (1, 2, 3, ...)。
+    pub(crate) fn next_tag_tx_id(&mut self) -> u64 {
+        let id = self.next_tag_tx_id;
+        self.next_tag_tx_id = self.next_tag_tx_id.checked_add(1).unwrap_or(1);
+        id
     }
 }
