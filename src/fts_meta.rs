@@ -15,6 +15,7 @@
 //! **スレッド安全性**: `Mutex<Connection>` で包む (既存 catalog.rs と同じパターン)。
 //! 頻繁な UPSERT は Ingest Worker から呼ばれるため、ロックは短く保つ。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -466,6 +467,30 @@ impl FtsMetaDb {
         let conn = self.conn.lock().unwrap();
         conn.query_row(FILEMETA_SELECT_SQL_BY_PATH, params![path], row_to_filemeta)
             .optional()
+    }
+
+    /// 全 favorite の `status=Ok` 件数を 1 クエリで返す (UI 表示の一括集計用)。
+    ///
+    /// 個別 `count_ok_for_favorite` を N 回呼ぶと毎回 connection mutex を取り
+    /// background writer (ingest_worker / mark_ok) と競合するため、まとめて 1 回で
+    /// 取得する。返却値は `favorite_id` (UUID parse 後) → 件数。Ok 件数 0 の
+    /// favorite は含まれない。
+    pub fn count_ok_grouped_by_favorite(&self) -> rusqlite::Result<HashMap<Uuid, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT favorite_id, COUNT(*) FROM files WHERE status = 0 GROUP BY favorite_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out: HashMap<Uuid, u64> = HashMap::new();
+        for r in rows {
+            let (uuid_str, c) = r?;
+            if let Ok(id) = Uuid::parse_str(&uuid_str) {
+                out.insert(id, c as u64);
+            }
+        }
+        Ok(out)
     }
 
     /// favorite 配下の `status=Ok` 件数だけ高速に返す。

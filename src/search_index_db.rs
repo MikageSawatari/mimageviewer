@@ -337,6 +337,28 @@ impl SearchIndexDb {
         })
     }
 
+    /// 全 favorite のエントリ数を 1 クエリで返す (UI 表示の一括集計用)。
+    ///
+    /// 個別 `count_for_favorite` を N 回呼ぶと毎回 connection mutex を取り
+    /// background writer (bulk indexer / supervisor) と競合するため、まとめて取得する。
+    /// 返却 key は `normalize_path(favorite_root)` 後の文字列 (= DB に格納されている形)。
+    pub fn count_grouped_by_favorite_root(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT favorite_root, COUNT(*) FROM entries GROUP BY favorite_root")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for r in rows {
+            let (k, c) = r?;
+            out.insert(k, c as u64);
+        }
+        Ok(out)
+    }
+
     /// 指定お気に入り配下のエントリ数を返す (UI 表示用)。
     pub fn count_for_favorite(&self, favorite_root: &Path) -> rusqlite::Result<u64> {
         let conn = self.conn.lock().unwrap();

@@ -53,6 +53,37 @@ pub(crate) struct IndexFileCounts {
     pub(crate) meta_total: u64,
 }
 
+/// 全 favorite 分の件数を集計する。
+///
+/// **DB lock 1 回ずつで済む形** で取得する (`GROUP BY` 一括クエリ)。worker thread から
+/// 呼ばれることを想定しており、UI スレッドで実行すると ingest と競合する。
+///
+/// クエリ自体は `LIKE` 等を使わず PK / 部分インデックスを単純スキャンするので、
+/// 657k 行クラスでも数十 ms オーダーで完了する。
+pub(crate) fn collect_counts(
+    name_db: Option<&crate::search_index_db::SearchIndexDb>,
+    meta_db: Option<&crate::fts_meta::FtsMetaDb>,
+    favorites: &[(uuid::Uuid, std::path::PathBuf)],
+) -> IndexFileCounts {
+    let mut out = IndexFileCounts::default();
+    let name_map = name_db
+        .and_then(|db| db.count_grouped_by_favorite_root().ok())
+        .unwrap_or_default();
+    let meta_map = meta_db
+        .and_then(|db| db.count_ok_grouped_by_favorite().ok())
+        .unwrap_or_default();
+    for (fav_id, fav_path) in favorites {
+        let key = crate::search_index_db::normalize_path(fav_path);
+        let n = name_map.get(&key).copied().unwrap_or(0);
+        let m = meta_map.get(fav_id).copied().unwrap_or(0);
+        out.name_counts.insert(*fav_id, n);
+        out.meta_counts.insert(*fav_id, m);
+        out.name_total += n;
+        out.meta_total += m;
+    }
+    out
+}
+
 pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
     let data_dir = crate::data_dir::get();
     let file_size = |p: &std::path::Path| -> u64 {
@@ -116,36 +147,59 @@ impl App {
 
         // 事前にインデクサ情報を取り出し (borrow 競合回避)
         let startup_diag = self.indexer_manager.as_ref().map(|m| m.startup_diag());
-        // インデックスサイズ + 件数キャッシュ。バックグラウンドインデクサが裏で行を
-        // 増減させるので、ダイアログ表示中は 1.5s ごとに再計算する。COUNT(*) は
-        // お気に入り数 × 2 (名前/メタ) で 100-200ms かかりうるので毎フレームは避ける。
-        const REFRESH: std::time::Duration = std::time::Duration::from_millis(1500);
+        // インデックスサイズ + 件数キャッシュ。
+        //
+        // Codex 指摘 (2026-04): UI スレッドで `COUNT(*)` を N 回叩くと、毎回
+        // SQLite connection mutex を取って ingest_worker / mark_ok / bulk indexer の
+        // writer が短時間待たされる。対策:
+        //  1. 個別 COUNT を `GROUP BY favorite_id/favorite_root` の単一クエリに集約
+        //     (DB lock 取得回数を 2N → 2 に削減)
+        //  2. UI スレッドではなく worker thread で実行 (`favorites_index_refresh_rx`)
+        //  3. 間隔を 5s に緩和 (リアルタイム性は不要、バッジで分かれば良い)
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+        // 直前の worker 結果が来ていれば回収する。
+        if let Some(rx) = self.favorites_index_refresh_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((counts, sizes)) => {
+                    self.favorites_index_count_cache =
+                        Some((std::time::Instant::now(), counts));
+                    self.favorites_index_size_cache = Some(sizes);
+                    self.favorites_index_refresh_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.favorites_index_refresh_rx = None;
+                }
+            }
+        }
+        // 必要なら worker をスポーン (in-flight 中は重複起動しない)。
         let counts_stale = self
             .favorites_index_count_cache
             .as_ref()
             .map(|(t, _)| t.elapsed() >= REFRESH)
             .unwrap_or(true);
-        if counts_stale {
-            let mut c = IndexFileCounts::default();
-            let name_db = self.search_index_db.as_ref();
+        if counts_stale && self.favorites_index_refresh_rx.is_none() {
+            let name_db = self.search_index_db.as_ref().cloned();
             let meta_db = self.indexer_manager.as_ref().map(|m| m.clone_fts_meta());
-            for fav in &self.settings.favorites {
-                let n = name_db
-                    .and_then(|db| db.count_for_favorite(&fav.path).ok())
-                    .unwrap_or(0);
-                let m = meta_db
-                    .as_ref()
-                    .and_then(|db| db.count_ok_for_favorite(fav.id).ok())
-                    .unwrap_or(0);
-                c.name_counts.insert(fav.id, n);
-                c.meta_counts.insert(fav.id, m);
-                c.name_total += n;
-                c.meta_total += m;
-            }
-            self.favorites_index_count_cache = Some((std::time::Instant::now(), c));
-            // サイズも同じ間隔で更新 (stat ベースでさらに軽い)。
-            self.favorites_index_size_cache = Some(compute_index_disk_sizes());
+            let fav_ids: Vec<(uuid::Uuid, std::path::PathBuf)> = self
+                .settings
+                .favorites
+                .iter()
+                .map(|f| (f.id, f.path.clone()))
+                .collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("fav-index-counts".into())
+                .spawn(move || {
+                    let counts = collect_counts(name_db.as_deref(), meta_db.as_deref(), &fav_ids);
+                    let sizes = compute_index_disk_sizes();
+                    let _ = tx.send((counts, sizes));
+                })
+                .ok();
+            self.favorites_index_refresh_rx = Some(rx);
         }
+        // 初回はキャッシュがまだ無いので、ブロックせずに空表示で進める
+        // (worker が完了したら次フレームで反映される)。
         // ↓ 以降は `egui::Window::show` クロージャで `self.settings.favorites` を
         // 借用するので、キャッシュからは Copy 値だけ抜いて閉じこもらない形にする。
         let (name_total, meta_total) = self
@@ -689,6 +743,9 @@ impl App {
             self.show_favorites_editor = false;
             self.favorites_index_size_cache = None;
             self.favorites_index_count_cache = None;
+            // 走行中の worker は drop で rx を切るだけ。worker は send 後に
+            // 自然終了するので join は不要 (重い処理は DB COUNT のみ)。
+            self.favorites_index_refresh_rx = None;
         }
 
         // サムネ一括作成ダイアログを起動 (「お気に入り」ダイアログと同じフレームで連続
