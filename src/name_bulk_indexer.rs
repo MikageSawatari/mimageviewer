@@ -85,6 +85,7 @@ pub fn run_bulk_name_index(
             // カウントを先頭に / フォルダは favorite 相対でフルパスが切れにくいようにする。
             let display = folder.strip_prefix(fav_path).unwrap_or(folder).display();
             p.set(format!("取込 ({}/{}) {}", i + 1, total_folders, display));
+            p.set_count((i + 1) as u64, total_folders as u64);
         }
         let mut children: Vec<IndexEntry> = Vec::new();
         let Ok(entries) = std::fs::read_dir(folder) else {
@@ -136,6 +137,11 @@ pub fn run_bulk_name_index(
                 folder.display()
             ));
         }
+    }
+
+    if let Some(p) = progress {
+        // バルク取込完了 — ETA カウントをクリアして UI から残り時間を消す。
+        p.set_count(0, 0);
     }
 
     // stale 行を一掃 (partial state の場合は不完全な観測で誤削除するのでスキップ)。

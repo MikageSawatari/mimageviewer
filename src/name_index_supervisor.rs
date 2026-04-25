@@ -56,6 +56,8 @@ pub struct NameIndexStats {
     pub updates_applied: usize,
     /// 最新の `progress` 情報 (snapshot 時に合成される)
     pub current_activity: Option<String>,
+    /// 現在のカウントベース進捗 (バルク取込中のみ)。
+    pub eta: Option<crate::indexer_progress::EtaSnapshot>,
 }
 
 pub enum NameIndexCommand {
@@ -77,6 +79,7 @@ impl NameIndexSupervisorHandle {
     pub fn snapshot_stats(&self) -> NameIndexStats {
         let mut s = self.stats.lock().unwrap().clone();
         s.current_activity = self.progress.snapshot();
+        s.eta = self.progress.snapshot_eta();
         s
     }
 

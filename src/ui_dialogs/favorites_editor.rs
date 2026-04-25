@@ -616,21 +616,23 @@ impl App {
                     // 別プロセスのファイルコピー等を細かく拾うと、行が一瞬出ては消える
                     // 振動でダイアログ全体の高さが揺れていたため (2026-04 ユーザー指摘)。
                     // 行数によらず常に同じ高さを確保し、内側だけスクロールする。
-                    let mut active: Vec<(String, String)> = Vec::new();
+                    // (label, message, eta_text) の 3 タプル。eta_text は Some なら
+                    // 「残り 12:34」のような短い表記で行末に追記する。
+                    let mut active: Vec<(String, String, Option<String>)> = Vec::new();
                     for fav in &self.settings.favorites {
                         // メタ index (indexer_manager supervisor 経由)
-                        if let Some(msg) = stats_by_id
-                            .get(&fav.id)
-                            .and_then(|s| s.current_activity.as_ref())
-                        {
-                            active.push((format!("{} (メタ)", fav.name), msg.clone()));
+                        if let Some(s) = stats_by_id.get(&fav.id) {
+                            if let Some(msg) = s.current_activity.as_ref() {
+                                let eta = s.eta.and_then(format_eta_inline);
+                                active.push((format!("{} (メタ)", fav.name), msg.clone(), eta));
+                            }
                         }
                         // 名前 index (name_index_supervisors 経由)
-                        if let Some(msg) = name_stats_by_id
-                            .get(&fav.id)
-                            .and_then(|s| s.current_activity.as_ref())
-                        {
-                            active.push((format!("{} (名前)", fav.name), msg.clone()));
+                        if let Some(s) = name_stats_by_id.get(&fav.id) {
+                            if let Some(msg) = s.current_activity.as_ref() {
+                                let eta = s.eta.and_then(format_eta_inline);
+                                active.push((format!("{} (名前)", fav.name), msg.clone(), eta));
+                            }
                         }
                     }
                     ui.add_space(6.0);
@@ -658,18 +660,23 @@ impl App {
                                         .color(egui::Color32::from_gray(110)),
                                 );
                             } else {
-                                for (name, msg) in &active {
+                                for (name, msg, eta) in &active {
+                                    let suffix = eta
+                                        .as_ref()
+                                        .map(|e| format!("  [{e}]"))
+                                        .unwrap_or_default();
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "  {}: {}",
+                                            "  {}: {}{}",
                                             name,
-                                            truncate_name(msg, 100)
+                                            truncate_name(msg, 100),
+                                            suffix,
                                         ))
                                         .size(11.0)
                                         .monospace()
                                         .color(egui::Color32::from_gray(150)),
                                     )
-                                    .on_hover_text(format!("{name}: {msg}"));
+                                    .on_hover_text(format!("{name}: {msg}{suffix}"));
                                 }
                             }
                         });
@@ -766,6 +773,14 @@ impl App {
             self.cc.show = true;
         }
     }
+}
+
+/// `EtaSnapshot` を「残り mm:ss」または「残り hh:mm:ss」+ レート併記の文字列に
+/// する。レートが 0 (= サンプル不足) なら None で suffix を出さない。
+fn format_eta_inline(eta: crate::indexer_progress::EtaSnapshot) -> Option<String> {
+    let secs = eta.remaining_secs?;
+    let hms = crate::indexer_progress::format_eta_hms(secs);
+    Some(format!("残り {hms} ({:.0}件/秒)", eta.rate_per_sec))
 }
 
 // ── チェックボックス右側の状態インライン表示ヘルパー ──────────────────────

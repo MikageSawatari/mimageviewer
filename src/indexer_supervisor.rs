@@ -70,6 +70,9 @@ pub struct SupervisorStats {
     /// walker / ingest_worker が ProgressReporter 経由で書き込み、snapshot 時に
     /// 読み出される。scan 区間外は None。
     pub current_activity: Option<String>,
+    /// 現在のカウントベース進捗 (削除フェーズ / 取込フェーズで更新)。`None` の間は
+    /// 削除/取込 が走っていない (= 起動直後の探索フェーズ等)。
+    pub eta: Option<crate::indexer_progress::EtaSnapshot>,
     /// アクティブスキャン中 (walker + ingest を含むフル scan 実行中) か。
     /// true の間は UI が「⏳ スキャン中」を表示する。false かつ `initial_scan_done=true`
     /// なら「✅ 監視中」(notify-rs イベント待ち)。
@@ -100,6 +103,7 @@ impl SupervisorHandle {
     pub fn snapshot_stats(&self) -> SupervisorStats {
         let mut s = self.stats.lock().unwrap().clone();
         s.current_activity = self.progress.snapshot();
+        s.eta = self.progress.snapshot_eta();
         s
     }
 
