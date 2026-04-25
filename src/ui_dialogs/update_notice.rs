@@ -86,11 +86,10 @@ impl App {
                             .max_height(200.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(&info.body)
-                                        .size(12.0)
-                                        .color(egui::Color32::from_gray(190)),
-                                );
+                                // 本文は読みやすさ優先で色オプションを外し、テーマの
+                                // 既定テキスト色 (Light/Dark どちらでも十分なコントラスト)
+                                // に従わせる。
+                                ui.label(egui::RichText::new(&info.body).size(12.0));
                             });
                     }
                     ui.add_space(8.0);

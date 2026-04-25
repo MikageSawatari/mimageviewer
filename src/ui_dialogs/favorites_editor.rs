@@ -347,9 +347,9 @@ impl App {
                 ui.group(|ui| {
                     ui.label(
                         egui::RichText::new(
-                            "💡 アプリケーションを終了すると、次回起動時に\n\
-                             インデックスの再スキャンが行われます。\n\
-                             終了する代わりにタスクトレイに常駐すると、\n\
+                            "💡 アプリケーションを終了すると、次回起動時に\
+                             インデックスの再スキャンが行われます。\
+                             終了する代わりにタスクトレイに常駐すると、\
                              起動がスムーズになります。",
                         )
                         .size(11.0)
@@ -399,9 +399,9 @@ impl App {
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "お気に入りは以下を索引化して、名前検索 (Ctrl+S) ・\n\
-                             メタデータ検索 (Ctrl+G) できます。\n\
-                             チェックを入れた項目はこの場で 1 回全走査し、以降は\n\
+                            "お気に入りは以下を索引化して、名前検索 (Ctrl+S) ・\
+                             メタデータ検索 (Ctrl+G) できます。\
+                             チェックを入れた項目はこの場で 1 回全走査し、以降は\
                              ファイルの変更監視と起動時スキャンで自動更新します。",
                         )
                         .weak()
@@ -616,33 +616,55 @@ impl App {
                     // 別プロセスのファイルコピー等を細かく拾うと、行が一瞬出ては消える
                     // 振動でダイアログ全体の高さが揺れていたため (2026-04 ユーザー指摘)。
                     // 行数によらず常に同じ高さを確保し、内側だけスクロールする。
-                    // (label, message, eta_text) の 3 タプル。eta_text は Some なら
-                    // 「残り 12:34」のような短い表記で行末に追記する。
-                    let mut active: Vec<(String, String, Option<String>)> = Vec::new();
+                    // 個別の (label, message) と、進行中の全 EtaSnapshot を集める。
+                    // ETA は集約して全体の残り時間として 1 つだけ表示する (個別 ETA は
+                    // パス truncate に巻き込まれて見にくいため、ユーザー指摘で外した)。
+                    let mut active: Vec<(String, String)> = Vec::new();
+                    let mut all_etas: Vec<crate::indexer_progress::EtaSnapshot> = Vec::new();
                     for fav in &self.settings.favorites {
-                        // メタ index (indexer_manager supervisor 経由)
                         if let Some(s) = stats_by_id.get(&fav.id) {
                             if let Some(msg) = s.current_activity.as_ref() {
-                                let eta = s.eta.and_then(format_eta_inline);
-                                active.push((format!("{} (メタ)", fav.name), msg.clone(), eta));
+                                active.push((format!("{} (メタ)", fav.name), msg.clone()));
+                            }
+                            if let Some(eta) = s.eta {
+                                all_etas.push(eta);
                             }
                         }
-                        // 名前 index (name_index_supervisors 経由)
                         if let Some(s) = name_stats_by_id.get(&fav.id) {
                             if let Some(msg) = s.current_activity.as_ref() {
-                                let eta = s.eta.and_then(format_eta_inline);
-                                active.push((format!("{} (名前)", fav.name), msg.clone(), eta));
+                                active.push((format!("{} (名前)", fav.name), msg.clone()));
+                            }
+                            if let Some(eta) = s.eta {
+                                all_etas.push(eta);
                             }
                         }
                     }
+                    // 全体 ETA: 並列実行されているので「残り時間 = max(各 remaining_secs)」、
+                    // 「処理速度 = Σ(各 rate_per_sec)」。各 supervisor のサンプルがまだ
+                    // 揃っていなければ remaining_secs=None なので除外。
+                    let total_eta_text = aggregate_total_eta(&all_etas);
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new("🔄 バックグラウンドインデクサ")
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 170, 60)),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("🔄 バックグラウンドインデクサ")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(200, 170, 60)),
+                        );
+                        if let Some(t) = total_eta_text {
+                            ui.label(
+                                egui::RichText::new(format!("  {t}"))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(200, 170, 60)),
+                            )
+                            .on_hover_text(
+                                "進行中インデクサ全体の残り時間と処理速度。\n\
+                                 残り時間は最も時間がかかる索引のもの (並列実行)、\n\
+                                 速度は全索引の合計。",
+                            );
+                        }
+                    });
                     // 4 行ぶんの高さを常に確保。実行中アイテムが多ければスクロール。
                     const ROW_H: f32 = 16.0;
                     const VISIBLE_ROWS: f32 = 4.0;
@@ -660,23 +682,18 @@ impl App {
                                         .color(egui::Color32::from_gray(110)),
                                 );
                             } else {
-                                for (name, msg, eta) in &active {
-                                    let suffix = eta
-                                        .as_ref()
-                                        .map(|e| format!("  [{e}]"))
-                                        .unwrap_or_default();
+                                for (name, msg) in &active {
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "  {}: {}{}",
+                                            "  {}: {}",
                                             name,
                                             truncate_name(msg, 100),
-                                            suffix,
                                         ))
                                         .size(11.0)
                                         .monospace()
                                         .color(egui::Color32::from_gray(150)),
                                     )
-                                    .on_hover_text(format!("{name}: {msg}{suffix}"));
+                                    .on_hover_text(format!("{name}: {msg}"));
                                 }
                             }
                         });
@@ -775,12 +792,19 @@ impl App {
     }
 }
 
-/// `EtaSnapshot` を「残り mm:ss」または「残り hh:mm:ss」+ レート併記の文字列に
-/// する。レートが 0 (= サンプル不足) なら None で suffix を出さない。
-fn format_eta_inline(eta: crate::indexer_progress::EtaSnapshot) -> Option<String> {
-    let secs = eta.remaining_secs?;
-    let hms = crate::indexer_progress::format_eta_hms(secs);
-    Some(format!("残り {hms} ({:.0}件/秒)", eta.rate_per_sec))
+/// 全 supervisor の `EtaSnapshot` を統合し、「残り XX:XX (NN件/秒)」表記を返す。
+///
+/// 各索引は **並列に** 走るので:
+/// - 残り時間 = `max(各 remaining_secs)` (一番遅いやつが律速)
+/// - 処理速度 = `Σ(各 rate_per_sec)` (合計スループット)
+///
+/// `remaining_secs` がまだ算出できていない (= サンプル不足) ものは除外する。
+/// 全部除外で空集合になったら None。
+fn aggregate_total_eta(etas: &[crate::indexer_progress::EtaSnapshot]) -> Option<String> {
+    let max_remaining = etas.iter().filter_map(|e| e.remaining_secs).max()?;
+    let total_rate: f64 = etas.iter().map(|e| e.rate_per_sec).sum();
+    let hms = crate::indexer_progress::format_eta_hms(max_remaining);
+    Some(format!("[残り {hms} ({:.0}件/秒)]", total_rate))
 }
 
 // ── チェックボックス右側の状態インライン表示ヘルパー ──────────────────────
