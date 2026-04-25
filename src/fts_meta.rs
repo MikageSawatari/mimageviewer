@@ -283,10 +283,7 @@ impl FtsMetaDb {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders: String = (0..paths.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = sql_in_placeholders(paths.len());
         let sql = format!(
             "SELECT path FROM files WHERE status = 0 AND path IN ({placeholders})"
         );
@@ -382,12 +379,7 @@ impl FtsMetaDb {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
-        // SQLite には rusqlite で配列バインドが無いので placeholders を生成する。
-        // お気に入り数は実用上 20 個未満なので長さは問題にならない。
-        let placeholders: String = (0..favorite_ids.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = sql_in_placeholders(favorite_ids.len());
         let sql = format!(
             "SELECT path, favorite_id, status FROM files \
              WHERE status != 0 AND favorite_id IN ({placeholders})"
@@ -579,6 +571,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_files_status    ON files(status) WHERE status != 0;",
     )?;
     Ok(())
+}
+
+/// `IN (?1,?2,…?N)` 用の placeholder 文字列を生成する。
+/// rusqlite には配列バインドが無いので各 IN 句で個別に組み立てる必要がある。
+/// お気に入り / path 一括取得など小さい N (< 数百) 専用。
+fn sql_in_placeholders(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn now_epoch() -> i64 {

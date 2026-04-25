@@ -443,11 +443,10 @@ fn run_metadata_search(
     mode: crate::search_query::MatchMode,
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
-    // INDEX_VERSION=5 以降は fts_meta.db に原文 (`*_norm`) が無いので、Ctrl+F の
-    // 高速 fast path は廃止し、すべて on-demand (PNG / EXIF / XMP / dc:subject 直読み)
-    // で判定する。表示中の数十〜数千件しか相手にしないので体感への影響は小さい。
-    // PDF メタの target=PdfMeta 絞り込みは off になり、未インデックス画像と同じく
-    // 「常に表示」扱いになる (お気に入りに入っていない PDF を Ctrl+F する動線に合わせる)。
+    // INDEX_VERSION=5 で fts_meta.db に原文が無くなったため、Ctrl+F は fast path を
+    // 持たず常に on-demand (PNG/EXIF/XMP/dc:subject 直読み) で判定する。表示中の
+    // 数十〜数千件しか触らないので体感影響は小さい。PDF の target=PdfMeta 絞り込みは
+    // off になり、お気に入り未登録の PDF を Ctrl+F する動線に合わせて「常に表示」扱い。
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)> = Vec::new();
     let mut additions_lookup: std::collections::HashMap<

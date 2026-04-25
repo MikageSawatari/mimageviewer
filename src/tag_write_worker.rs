@@ -348,6 +348,10 @@ fn process_job(
 /// 差し替えて upsert を依頼する。INDEX_VERSION=5 以降は fts_meta.db に norms が
 /// 無くなったため、原文の取り出しは Tantivy 側 (STORED) から行う。
 ///
+/// **two-store 依存**: 管理メタ (kind/mtime/file_size) は fts_meta.db、原文は Tantivy
+/// と分かれているので両方を引く。どちらかが欠けるケース (= ingest 進行中で Tantivy
+/// commit 前) は通常 ingest に任せて何もしない (early return)。
+///
 /// 戻り値 `true`: dispatcher に upsert を投げた (呼び出し側は flush の pending に計上)。
 /// 戻り値 `false`: 変更なし / 該当 doc が Tantivy に未投入 (pending) など、writer に触っていない。
 fn upsert_tags_via_dispatcher(
