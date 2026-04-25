@@ -32,7 +32,7 @@ const ETA_WINDOW: Duration = Duration::from_secs(60);
 /// サンプル件数のハード上限。`set_count` が時刻が進まない状況で連打されたとき
 /// (テストや単一 Instant の精度限界) の暴走を防ぐ防御。通常は ETA_WINDOW で
 /// 自然に間引かれるためここまで届かない。
-const ETA_SAMPLES_MAX: usize = 4096;
+const ETA_SAMPLES_MAX: usize = 1024;
 
 /// 進捗カウントの ETA スナップショット。
 #[derive(Clone, Copy, Debug)]

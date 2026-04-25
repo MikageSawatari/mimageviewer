@@ -168,7 +168,7 @@ impl App {
         self.erase_vectors.clear();
         self.erase_selected_vector = None;
         self.erase_vector_drag = None;
-        self.erase_pan_drag_start = None;
+        self.fs_pan_drag_start = None;
     }
 
     // ── Undo / Slot ────────────────────────────────────────────────
@@ -841,17 +841,17 @@ impl App {
         if space_held && !drawing_in_progress {
             if primary_pressed {
                 if let Some(pos) = pointer_pos {
-                    self.erase_pan_drag_start = Some((pos, self.fs_pan));
+                    self.fs_pan_drag_start = Some((pos, self.fs_pan));
                 }
             } else if primary_down {
-                if let Some((start_pos, start_pan)) = self.erase_pan_drag_start {
+                if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
                     if let Some(pos) = pointer_pos {
                         self.fs_pan = start_pan + (pos - start_pos);
                     }
                 }
             }
             if primary_released {
-                self.erase_pan_drag_start = None;
+                self.fs_pan_drag_start = None;
             }
             ctx.set_cursor_icon(if primary_down {
                 egui::CursorIcon::Grabbing
@@ -861,8 +861,8 @@ impl App {
             return;
         }
         // Space 離した瞬間の取りこぼし対策: 描画パスへ戻る前に pan drag を片付ける。
-        if !space_held && self.erase_pan_drag_start.is_some() {
-            self.erase_pan_drag_start = None;
+        if !space_held && self.fs_pan_drag_start.is_some() {
+            self.fs_pan_drag_start = None;
         }
 
         // 修飾キーは Ctrl で統一: [/] キーは Shift+ が論理キー {/} に化ける制約があり
@@ -1836,7 +1836,6 @@ impl App {
         crate::logger::log(format!(
             "erase: inpaint start, masked pixels={masked_count}"
         ));
-        // 推論本体は worker thread。完了反映は `poll_erase_inpaint` で別フレームに行う。
         self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec");
         self.reset_erase_mode();
         self.show_feedback_toast("[補完中…]".to_string());
@@ -1953,10 +1952,6 @@ impl App {
     /// `App.erase_inpaint_pending` 経由で UI スレッドに届く。完了反映は `poll_erase_inpaint`。
     /// E キーの確定・保存済みマスクの自動適用・F7/F8 の 3 つから呼ばれる。
     /// `log_prefix` はログ行を区別するための識別子。
-    ///
-    /// 旧実装は UI スレッド同期で 350-460ms ブロックしていた (MI-GAN タイル推論
-    /// 14×~18ms + composite + texture upload)。マスク編集中はサイクルごとに発生
-    /// するため、操作が引っかかる元になっていた。
     fn run_inpaint_and_cache(
         &mut self,
         ctx: &egui::Context,
@@ -2005,8 +2000,7 @@ impl App {
     }
 
     /// `App::update` 先頭から毎フレーム呼ばれ、worker から結果が届いていれば
-    /// fs_cache を差し替える。テクスチャアップロードは UI スレッドで行うが、
-    /// それ自体は数 ms で済むので問題ない。
+    /// fs_cache を差し替える。完了通知は worker 側の `ctx.request_repaint()` に任せる。
     pub(crate) fn poll_erase_inpaint(&mut self, ctx: &egui::Context) {
         let pending = match self.erase_inpaint_pending.as_ref() {
             Some(p) => p,
@@ -2014,14 +2008,9 @@ impl App {
         };
         let result = match pending.rx.try_recv() {
             Ok(r) => r,
-            Err(mpsc::TryRecvError::Empty) => {
-                // worker 完了まで定期 wake-up (50ms) を入れておく。worker 側でも
-                // 完了時に request_repaint しているが、念のため取りこぼし対策。
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
-                return;
-            }
+            Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                // worker がキャンセルされたか panic した。state だけ片付ける。
+                // worker がキャンセルされたか panic した。
                 self.erase_inpaint_pending = None;
                 return;
             }
@@ -2029,9 +2018,12 @@ impl App {
         let pending = self.erase_inpaint_pending.take().unwrap();
         let elapsed = pending.started_at.elapsed();
         let idx = pending.idx;
+        // pixels と texture で同じ ColorImage を共有することで、UI スレッド上の
+        // 100MB 級 memcpy (4K 画像 RGBA) を回避する。
+        let pixels = Arc::new(result);
         let tex = ctx.load_texture(
             format!("fs_inpainted_{idx}"),
-            result.clone(),
+            egui::ImageData::Color(Arc::clone(&pixels)),
             egui::TextureOptions::LINEAR,
         );
         let prev_source_dims = self.fs_cache_source_dims(idx);
@@ -2039,7 +2031,7 @@ impl App {
             idx,
             FsCacheEntry::Static {
                 tex,
-                pixels: Arc::new(result),
+                pixels,
                 source_dims: prev_source_dims,
                 load_seq: self.input_seq,
             },
