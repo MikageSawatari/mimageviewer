@@ -67,6 +67,9 @@ impl App {
         };
         let [w, h] = pixels.size;
         self.erase_mode = true;
+        // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
+        // 消しゴム中は erase_undo_stack が Ctrl+Z を担当する。
+        self.clear_meta_undo();
         // post-filter (CRT / 減色など) を編集中だけ一時バイパス。マスクは元画像ベースで
         // 塗るため、減色プリセットのドット表示が混ざると精密な境界操作が難しくなる。
         if !self.post_filter_bypassed {
@@ -115,7 +118,13 @@ impl App {
     /// 消しゴムモードをリセットする。
     pub(crate) fn reset_erase_mode(&mut self) {
         let restore_idx = self.fullscreen_idx;
+        let was_erase_mode = self.erase_mode;
         self.erase_mode = false;
+        // 消しゴム → 通常表示への遷移境界でもメタ Undo をクリアする。
+        // (enter_erase_mode と対称、行き来したときに残骸が残らない)
+        if was_erase_mode {
+            self.clear_meta_undo();
+        }
         // post-filter バイパスを解除し、該当ページの adjustment_cache をクリアして
         // post-filter 適用状態で再生成させる。分析モード中に誤って reset されても
         // analysis_mode が true なら post_filter_bypassed は分析モード側で保持される想定。

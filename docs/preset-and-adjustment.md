@@ -509,6 +509,99 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
 
 ---
 
+## 8.X 画像補正の Undo / Redo (v0.8.1)
+
+`Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) でフルスクリーン中の画像補正操作を取り消せる。
+履歴は [`crate::undo_stack::UndoStack`](../src/undo_stack.rs) に積まれ、
+レーティング・タグの Undo と同じスタックを共有する (型は `UndoEntry::Adjustment`)。
+
+### 取り消し対象
+
+- 左パネルの全スライダー / ラジオ / コンボボックス / リセット↩ボタン (= `set_page_params` 経由のページ個別更新)
+- アクションボタン: 「お気に入り標準にする / 解除」「標準にする」「個別設定を解除」
+  (= `set_favorite_default` / `clear_favorite_default` / `copy_params_to_global` /
+  `clear_page_params` 経由)
+- ホットキー: U / Shift+U / Alt+U (アップスケール循環)、N (デノイズトグル)、
+  P / Shift+P / Alt+P (ポストフィルタ循環)、Q / Ctrl+Backspace (個別解除)
+- 保存スロット適用: Ctrl+1〜9 / Ctrl+0、左パネルのスロットボタン
+
+### スコープ表現 ([`AdjustUndoScope`](../src/undo_stack.rs))
+
+```rust
+enum AdjustUndoScope {
+    Page(usize),       // adjustment_page_params[idx]
+    Favorite(Uuid),    // adjustment_favorite_params[uuid]
+    Global,            // settings.global_preset
+}
+
+struct AdjustmentChange {
+    scope: AdjustUndoScope,
+    before: Option<AdjustParams>,  // None = エントリ無し (Page / Favorite のみ)
+    after: Option<AdjustParams>,
+}
+```
+
+`Global` スコープは常に `Some` (`settings.global_preset` は Optional ではない)。
+`Page` / `Favorite` の `None` は「そのスコープにエントリが存在しない =
+下層 (Favorite default / Global) にフォールバック」を表す。
+
+### 適用ロジック (`apply_adjustment_change_to_app`)
+
+スコープごとに既存の書き込み API を再利用するだけ — `set_page_params` /
+`clear_page_params` / `set_favorite_default` / `clear_favorite_default` /
+`copy_params_to_global`。これらは DB 更新・サイドカー更新・キャッシュ無効化を
+すべて内部で行うので、Undo 用に副作用を再実装する必要はない。
+
+### スライダードラッグの取り扱い (drag-release granularity)
+
+旧実装はスライダードラッグ中に毎フレーム `set_page_params` を呼んでいたため、
+60 frames/sec の DB UPSERT + サイドカー XMP 書き込み + キャッシュクリアが発生して
+いた。Undo 機能と一緒に以下のように改修:
+
+- `App::adjustment_drag_session: Option<AdjustmentDragSession>` を追加
+- 状態遷移:
+  - drag 開始フレーム (`prev_dragging=false && curr_dragging=true`):
+    `before = adjustment_page_params.get(&fs_idx).cloned()` をスナップショットして
+    session を立てる。
+  - drag 中 (`is_dragging=true`): `adjustment_page_params[fs_idx] = edit_params`
+    だけ更新 (DB / サイドカー書き込みなし)。色調キャッシュは毎フレームクリアして
+    リアルタイムプレビューは維持。
+  - drag 終了フレーム (`prev_dragging=true && curr_dragging=false`): session を
+    `take()` し、`set_page_params` を **1 回だけ** 呼んで永続化 + Undo エントリを 1 件
+    プッシュ。
+- 非ドラッグ変更 (ラジオ / コンボ / リセット↩ボタン) は drag セッション無視で
+  即時 `set_page_params` + Undo プッシュ (1 操作 = 1 エントリ)。
+
+これにより、CRT エミュレーションのような細かい調整も「1 つ前に戻す」が直感的に
+効く + DB 負荷も大幅減 (60 writes/sec → 1 write/release)。
+
+### 履歴クリア境界
+
+`App::clear_meta_undo` で undo / redo 両方を破棄。呼び出し箇所:
+
+- `load_folder` (フォルダ移動)
+- `open_fullscreen` (グリッド → フルスクリーン、フルスクリーン中の画像移動)
+- `close_fullscreen` (フルスクリーン → グリッド)
+- `enter_erase_mode` / `reset_erase_mode` (消しゴムモード遷移)
+
+消しゴムモード中は `erase_undo_stack` (バイトマップスナップショット) が
+`Ctrl+Z` を担当するため、行き来の境界で履歴をクリアして文脈を分離する。
+
+`clear_meta_undo` は `adjustment_drag_session` も `None` にリセットするので、
+ドラッグ中に境界を跨いでも進行中セッションが残骸として残らない。
+
+### 副作用に乗る点
+
+- `set_page_params` の **「ページ個別が effective_default と一致するなら個別を削除」**
+  正規化は Undo 経路でも有効。`before` に `Some(p)` で記録された値を再適用しても、
+  もし `p` が現在の effective_default と一致するなら個別エントリは作られず削除される。
+  この振る舞いは normal 操作と同じなので一貫性がある。
+- `set_favorite_default` / `clear_favorite_default` は内部で「冗長になった個別を削除」
+  処理を行う (Codex P2 対応)。Undo で巻き戻したときも同じロジックが走るので、
+  状態は always 正しい不変条件を保つ。
+
+---
+
 ## 9. フォルダ側サイドカーバックアップ
 
 ページ個別補正 (`adjustment.db`) と消しゴムマスク (`mask.db`) は、中央 DB だけだと

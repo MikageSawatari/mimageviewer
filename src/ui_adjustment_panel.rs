@@ -824,7 +824,23 @@ impl App {
             })
             .inner;
 
+        // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
+        let was_dragging = self.adjustment_dragging;
         self.adjustment_dragging = is_dragging;
+        let drag_just_started = is_dragging && !was_dragging;
+        if drag_just_started {
+            self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
+                fs_idx,
+                before: self.adjustment_page_params.get(&fs_idx).cloned(),
+            });
+        }
+        // セッションが存在するが fs_idx がズレている (= ページ移動した) 場合は破棄。
+        // 通常は open_fullscreen での clear_meta_undo が落とすが念のため。
+        if let Some(s) = &self.adjustment_drag_session {
+            if s.fs_idx != fs_idx {
+                self.adjustment_drag_session = None;
+            }
+        }
 
         // ── 保存スロット ──
         let slots_rect = egui::Rect::from_min_max(
@@ -886,13 +902,58 @@ impl App {
         }
 
         // ── スライダー変更を反映 (自動的にページ個別化) ──
+        // ドラッグ中は **in-memory のみ** 更新し DB / sidecar 書き込みをスキップする
+        // (60 frames/sec の DB UPSERT を避ける)。ドラッグ終了時に session で 1 回だけ
+        // 永続化 + Undo エントリを積む経路 (下部の `drag_just_ended` ブロック) に流す。
+        // ラジオ・コンボボックス・リセット↩ ボタンなどの非ドラッグ変更は即時通常パス。
         if changed {
             let ai_changed = !original.ai_settings_eq(&edit_params);
-            self.set_page_params(fs_idx, edit_params.clone());
+            if is_dragging {
+                self.adjustment_page_params.insert(fs_idx, edit_params.clone());
+            } else {
+                let before = self
+                    .adjustment_drag_session
+                    .take()
+                    .map(|s| s.before)
+                    .unwrap_or_else(|| self.adjustment_page_params.get(&fs_idx).cloned());
+                self.set_page_params(fs_idx, edit_params.clone());
+                let after = self.adjustment_page_params.get(&fs_idx).cloned();
+                self.capture_adjustment_undo(
+                    crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                    before,
+                    after,
+                    "ページ個別の補正".to_string(),
+                );
+            }
             if ai_changed {
                 self.clear_all_adjustment_and_ai_caches(fs_idx);
             } else {
                 self.clear_adjustment_caches(fs_idx);
+            }
+        }
+
+        // ドラッグ終了 (release) フレーム: changed が立たないことが多いので別経路で確定。
+        let drag_just_ended = !is_dragging && was_dragging;
+        if drag_just_ended {
+            if let Some(session) = self.adjustment_drag_session.take() {
+                let in_memory = self.adjustment_page_params.get(&fs_idx).cloned();
+                if session.before != in_memory {
+                    // in-memory に書いた最終値を `set_page_params` で永続化
+                    // (matches_default の正規化もここで走る)
+                    if let Some(p) = in_memory.clone() {
+                        self.set_page_params(fs_idx, p);
+                    } else {
+                        // ありえない (before != in_memory なのに in_memory が None) が念のため
+                        self.clear_page_params(fs_idx);
+                    }
+                    let after = self.adjustment_page_params.get(&fs_idx).cloned();
+                    self.capture_adjustment_undo(
+                        crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                        session.before,
+                        after,
+                        "ページ個別の補正".to_string(),
+                    );
+                }
             }
         }
 
@@ -909,29 +970,41 @@ impl App {
         if set_as_favorite_clicked {
             if let Some((fav_id, fav_name)) = fav_info.clone() {
                 let params = self.effective_params(fs_idx).clone();
-                self.set_favorite_default(fav_id, params);
-                self.show_feedback_toast(format!(
-                    "お気に入り「{}」の標準を更新",
-                    crate::ui_helpers::truncate_name(&fav_name, 10)
-                ));
+                let truncated = crate::ui_helpers::truncate_name(&fav_name, 10);
+                self.capture_adjust_around(
+                    crate::undo_stack::AdjustUndoScope::Favorite(fav_id),
+                    format!("お気に入り「{}」の標準", truncated),
+                    |app| app.set_favorite_default(fav_id, params),
+                );
+                self.show_feedback_toast(format!("お気に入り「{}」の標準を更新", truncated));
             }
         }
         if clear_favorite_clicked {
             if let Some((fav_id, fav_name)) = fav_info.clone() {
-                self.clear_favorite_default(fav_id);
-                self.show_feedback_toast(format!(
-                    "お気に入り「{}」の標準を解除",
-                    crate::ui_helpers::truncate_name(&fav_name, 10)
-                ));
+                let truncated = crate::ui_helpers::truncate_name(&fav_name, 10);
+                self.capture_adjust_around(
+                    crate::undo_stack::AdjustUndoScope::Favorite(fav_id),
+                    format!("お気に入り「{}」の標準を解除", truncated),
+                    |app| app.clear_favorite_default(fav_id),
+                );
+                self.show_feedback_toast(format!("お気に入り「{}」の標準を解除", truncated));
             }
         }
         if set_as_global_clicked {
             let params = self.effective_params(fs_idx).clone();
-            self.copy_params_to_global(params);
+            self.capture_adjust_around(
+                crate::undo_stack::AdjustUndoScope::Global,
+                "標準設定の更新".to_string(),
+                |app| app.copy_params_to_global(params),
+            );
             self.show_feedback_toast("標準設定を更新".to_string());
         }
         if clear_page_clicked {
-            self.clear_page_params(fs_idx);
+            self.capture_adjust_around(
+                crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                "個別設定の解除".to_string(),
+                |app| app.clear_page_params(fs_idx),
+            );
             self.show_feedback_toast("個別設定を解除".to_string());
         }
 
@@ -945,7 +1018,14 @@ impl App {
             self.slot_save_dialog = Some((slot_idx, default_name));
         }
         if let Some(slot_idx) = load_from_slot {
-            self.apply_slot_to_current_page(slot_idx);
+            self.capture_adjust_around(
+                crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                format!(
+                    "スロット{}を適用",
+                    crate::adjustment::slot_key_label(slot_idx)
+                ),
+                |app| app.apply_slot_to_current_page(slot_idx),
+            );
         }
     }
 

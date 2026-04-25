@@ -69,6 +69,17 @@ impl AdjustScope {
             AdjustScope::Global => "標準",
         }
     }
+
+    /// Undo 用スコープ表現に変換する。`PageOverride` のときの fs_idx は呼び出し元から
+    /// 渡してもらう (この enum は idx を保持していないため)。
+    #[inline]
+    pub(crate) fn to_undo_scope(self, fs_idx: usize) -> crate::undo_stack::AdjustUndoScope {
+        match self {
+            AdjustScope::PageOverride => crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+            AdjustScope::FavoriteDefault(id) => crate::undo_stack::AdjustUndoScope::Favorite(id),
+            AdjustScope::Global => crate::undo_stack::AdjustUndoScope::Global,
+        }
+    }
 }
 
 /// 見開き描画時に書き出されるページ矩形レイアウト。
@@ -1508,7 +1519,6 @@ impl App {
                 })
                 .unwrap_or(0);
             let next = if key_u_alt {
-                // Alt+U: 「なし」へリセット (items[0] が None 相当)
                 0
             } else if key_u_shift {
                 (cur + items.len() - 1) % items.len()
@@ -1518,12 +1528,17 @@ impl App {
             let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
             self.show_feedback_toast(format!("[U:{}アップスケール {}]", scope.label(), label));
-            self.write_params_for_scope(fs_idx, scope, params);
-            self.clear_all_adjustment_and_ai_caches(fs_idx);
+            self.capture_adjust_around(
+                scope.to_undo_scope(fs_idx),
+                format!("AI アップスケール: {label}"),
+                |app| {
+                    app.write_params_for_scope(fs_idx, scope, params);
+                    app.clear_all_adjustment_and_ai_caches(fs_idx);
+                },
+            );
         }
 
         // N キー: AI デノイズをトグル
-        // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         if key_n {
             let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
@@ -1535,12 +1550,17 @@ impl App {
                     Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
                 self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope.label()));
             }
-            self.write_params_for_scope(fs_idx, scope, params);
-            self.clear_all_adjustment_and_ai_caches(fs_idx);
+            self.capture_adjust_around(
+                scope.to_undo_scope(fs_idx),
+                "AI デノイズの切替".to_string(),
+                |app| {
+                    app.write_params_for_scope(fs_idx, scope, params);
+                    app.clear_all_adjustment_and_ai_caches(fs_idx);
+                },
+            );
         }
 
         // P / Shift+P / Alt+P: ポストフィルタの次/前/なしへ切替。
-        // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         // AI 再実行は発生させないため色調キャッシュのみクリア。
         if key_p || key_p_shift || key_p_alt {
             let scope = self.resolve_adjust_scope(fs_idx);
@@ -1551,7 +1571,6 @@ impl App {
                 .position(|f| *f == params.post_filter)
                 .unwrap_or(0);
             let next_idx = if key_p_alt {
-                // Alt+P: 「標準 (None)」へリセット (all[0] = PostFilter::None)
                 0
             } else if key_p_shift {
                 (cur + all.len() - 1) % all.len()
@@ -1565,25 +1584,41 @@ impl App {
                 scope.label(),
                 next.display_label()
             ));
-            self.write_params_for_scope(fs_idx, scope, params);
-            match scope {
-                AdjustScope::PageOverride => self.clear_adjustment_caches(fs_idx),
-                // set_favorite_default / copy_params_to_global は内部で clear_all_color_caches 済み
-                AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
-            }
+            self.capture_adjust_around(
+                scope.to_undo_scope(fs_idx),
+                format!("ポストフィルタ: {}", next.display_label()),
+                |app| {
+                    app.write_params_for_scope(fs_idx, scope, params);
+                    match scope {
+                        AdjustScope::PageOverride => app.clear_adjustment_caches(fs_idx),
+                        AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
+                    }
+                },
+            );
         }
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
         for (slot_idx, &pressed) in slot_keys.iter().enumerate() {
             if pressed {
-                self.apply_slot_to_current_page(slot_idx);
+                self.capture_adjust_around(
+                    crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                    format!(
+                        "スロット{}を適用",
+                        crate::adjustment::slot_key_label(slot_idx)
+                    ),
+                    |app| app.apply_slot_to_current_page(slot_idx),
+                );
             }
         }
 
         // Ctrl+Backspace: 個別設定があれば解除、なければフィードバックのみ
         if clear_page_key {
             if self.adjustment_page_params.contains_key(&fs_idx) {
-                self.clear_page_params(fs_idx);
+                self.capture_adjust_around(
+                    crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                    "個別設定の解除".to_string(),
+                    |app| app.clear_page_params(fs_idx),
+                );
                 self.show_feedback_toast("[個別設定を解除]".to_string());
             } else {
                 self.show_feedback_toast("[個別設定なし]".to_string());

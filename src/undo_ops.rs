@@ -16,10 +16,13 @@
 
 use std::path::PathBuf;
 
+use crate::adjustment::AdjustParams;
 use crate::app::App;
 use crate::tag_ops::find_favorite_id;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
-use crate::undo_stack::{RatingChange, TagChange, UndoEntry};
+use crate::undo_stack::{
+    AdjustUndoScope, AdjustmentChange, RatingChange, TagChange, UndoEntry,
+};
 
 impl App {
     // ── 積み込み (操作直後に呼ぶ) ────────────────────────────────────
@@ -57,6 +60,26 @@ impl App {
         });
     }
 
+    /// 1 回の画像補正操作 (スライダー drag-release / U・N・P / Q / Ctrl+1-9 / パネルの
+    /// アクションボタン) を Undo スタックに積む。
+    pub(crate) fn push_adjustment_undo_entry(
+        &mut self,
+        changes: Vec<AdjustmentChange>,
+        summary: String,
+    ) {
+        let filtered: Vec<AdjustmentChange> = changes
+            .into_iter()
+            .filter(|c| c.before != c.after)
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        self.meta_undo.push(UndoEntry::Adjustment {
+            changes: filtered,
+            summary,
+        });
+    }
+
     /// Undo/Redo スタック両方を破棄。フォルダ移動・フルスクリーン遷移・フルスクリーン
     /// 中の画像移動など「コンテキストが切り替わる境界」で呼ぶ。
     pub(crate) fn clear_meta_undo(&mut self) {
@@ -67,6 +90,22 @@ impl App {
                 self.meta_undo.redo_len(),
             ));
             self.meta_undo.clear();
+        }
+        // ドラッグ中に境界を跨いだ場合 (フォルダ移動・フルスクリーン遷移・消しゴム遷移)、
+        // 進行中のセッションを安全に終了させる。
+        //
+        // ドラッグ中は DB / sidecar 書き込みをスキップしているため、在の `adjustment_page_params`
+        // (in-memory) はドラッグ最後の値を持つが永続化されていない可能性がある。ここで
+        // session.fs_idx の現在値を `set_page_params` で 1 回だけ書き出して、ユーザーが
+        // 「ドラッグ中に画面が切り替わってしまっても操作は失われない」挙動を保証する。
+        // Undo エントリは積まない (= boundary を跨ぐ操作は redo 不可) — Undo スタック自体を
+        // クリアする処理の最中なので一貫性が取れる。
+        if let Some(session) = self.adjustment_drag_session.take() {
+            if let Some(p) = self.adjustment_page_params.get(&session.fs_idx).cloned() {
+                if Some(&p) != session.before.as_ref() {
+                    self.set_page_params(session.fs_idx, p);
+                }
+            }
         }
     }
 
@@ -90,6 +129,11 @@ impl App {
             UndoEntry::Tag { changes, .. } => {
                 self.submit_tag_restore_jobs(changes, /* use_before */ true);
             }
+            UndoEntry::Adjustment { changes, .. } => {
+                for c in changes {
+                    self.apply_adjustment_change_to_app(c, /* use_before */ true);
+                }
+            }
         }
         self.show_feedback_toast(format!("元に戻す: {summary}"));
         self.meta_undo.push_redo(entry);
@@ -112,6 +156,11 @@ impl App {
             }
             UndoEntry::Tag { changes, .. } => {
                 self.submit_tag_restore_jobs(changes, /* use_before */ false);
+            }
+            UndoEntry::Adjustment { changes, .. } => {
+                for c in changes {
+                    self.apply_adjustment_change_to_app(c, /* use_before */ false);
+                }
             }
         }
         self.show_feedback_toast(format!("やり直し: {summary}"));
@@ -196,6 +245,85 @@ impl App {
         for idx in matching {
             self.set_rating(idx, target);
         }
+    }
+
+    /// 画像補正 Undo/Redo の 1 件適用。スコープに応じて対応する書き込みパス
+    /// (`set_page_params` / `clear_page_params` / `set_favorite_default` /
+    /// `clear_favorite_default` / `copy_params_to_global`) に流す — これらは
+    /// すべて DB / settings / キャッシュクリアの副作用を含むので、Undo 用に
+    /// 別経路を組まずに既存の書き込み API を再利用する。
+    fn apply_adjustment_change_to_app(&mut self, c: &AdjustmentChange, use_before: bool) {
+        let target = if use_before { &c.before } else { &c.after };
+        match &c.scope {
+            AdjustUndoScope::Page(idx) => match target {
+                Some(p) => self.set_page_params(*idx, p.clone()),
+                None => {
+                    // 個別エントリを消す経路。`clear_page_params` は AI キャッシュも
+                    // 適切に落としてくれる。エントリが既に無ければ no-op。
+                    if self.adjustment_page_params.contains_key(idx) {
+                        self.clear_page_params(*idx);
+                    }
+                }
+            },
+            AdjustUndoScope::Favorite(id) => match target {
+                Some(p) => self.set_favorite_default(*id, p.clone()),
+                None => self.clear_favorite_default(*id),
+            },
+            AdjustUndoScope::Global => {
+                // Global は常に値を持つので、Some 前提。万一 None ならデフォルトに戻す。
+                let p = target.clone().unwrap_or_default();
+                self.copy_params_to_global(p);
+            }
+        }
+    }
+
+    /// 画像補正操作の **直前 → 直後** のスナップショットから Undo エントリを作って積む。
+    /// スコープごとに「現在の値」(Option<AdjustParams>) を取得するヘルパーを提供して、
+    /// パネル / U・N・P / Ctrl+1-9 などすべての書き込み経路でこれを使う。
+    pub(crate) fn current_adjust_value(&self, scope: &AdjustUndoScope) -> Option<AdjustParams> {
+        match scope {
+            AdjustUndoScope::Page(idx) => self.adjustment_page_params.get(idx).cloned(),
+            AdjustUndoScope::Favorite(id) => self.adjustment_favorite_params.get(id).cloned(),
+            AdjustUndoScope::Global => Some(self.settings.global_preset.clone()),
+        }
+    }
+
+    /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
+    /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
+    pub(crate) fn capture_adjustment_undo(
+        &mut self,
+        scope: AdjustUndoScope,
+        before: Option<AdjustParams>,
+        after: Option<AdjustParams>,
+        summary: String,
+    ) {
+        self.push_adjustment_undo_entry(
+            vec![AdjustmentChange {
+                scope,
+                before,
+                after,
+            }],
+            summary,
+        );
+    }
+
+    /// 補正書き込み操作の **直前 → 直後** を自動キャプチャするラッパー。
+    /// クロージャ内で `set_page_params` / `set_favorite_default` / `clear_*` などを
+    /// 呼ぶと、その前後の `current_adjust_value(scope)` を読み取って Undo エントリを
+    /// 積む。同じパターンが U・N・P / Q / Ctrl+1-9 / アクションボタン群で 8 箇所
+    /// 繰り返されていたのを 1 行に集約するためのヘルパー。
+    pub(crate) fn capture_adjust_around<F>(
+        &mut self,
+        scope: AdjustUndoScope,
+        summary: String,
+        write_op: F,
+    ) where
+        F: FnOnce(&mut App),
+    {
+        let before = self.current_adjust_value(&scope);
+        write_op(self);
+        let after = self.current_adjust_value(&scope);
+        self.capture_adjustment_undo(scope, before, after, summary);
     }
 
     /// タグ Undo/Redo の worker 投入。`use_before=true` なら各 path の `before` を

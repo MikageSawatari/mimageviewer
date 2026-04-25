@@ -811,6 +811,18 @@ pub(crate) struct EraseSnapshot {
     pub vectors: Vec<crate::mask_db::LineObject>,
 }
 
+/// 画像補正パネルのスライダードラッグ中に保持するスナップショット。
+///
+/// ドラッグ中は毎フレーム DB に書かず in-memory のみ更新し、ドラッグ終了時に
+/// `before` (= ドラッグ開始時の page_params エントリ) と現在の値を比較して
+/// Undo エントリを 1 件積む + 通常の `set_page_params` で DB 永続化する。
+/// これにより 60 frames/sec の DB UPSERT を 1 回に削減する。
+#[derive(Debug, Clone)]
+pub(crate) struct AdjustmentDragSession {
+    pub fs_idx: usize,
+    pub before: Option<crate::adjustment::AdjustParams>,
+}
+
 /// ベクタオブジェクト編集のドラッグ状態。
 /// `base` はドラッグ開始時の元オブジェクト、`origin` はそのときのカーソル画像座標。
 #[derive(Debug, Clone, Copy)]
@@ -1766,9 +1778,14 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
-    /// メタ操作 (レーティング / タグ) の Undo/Redo スタック。フォルダ移動・
-    /// フルスクリーン遷移・フルスクリーン中のページ移動でクリアされる。
+    /// メタ操作 (レーティング / タグ / 画像補正) の Undo/Redo スタック。フォルダ移動・
+    /// フルスクリーン遷移・フルスクリーン中のページ移動・消しゴムモード遷移でクリアされる。
     pub(crate) meta_undo: crate::undo_stack::UndoStack,
+    /// 画像補正パネルのスライダードラッグセッション。`Some` のときはドラッグ中で、
+    /// 中身は「ドラッグ開始時の `adjustment_page_params[fs_idx]`」のスナップショット。
+    /// ドラッグ中は DB 書き込みをスキップし in-memory のみ更新、ドラッグ終了時に
+    /// 一括で `set_page_params` を呼んで永続化 + Undo エントリを 1 件積む。
+    pub(crate) adjustment_drag_session: Option<AdjustmentDragSession>,
     /// 直前の push_undo_snapshot 時刻。矢印/[/]キー連打時のスナップショット重複を抑制する
     /// (OS のキーリピートで毎フレーム full-bitmap clone が走るのを防ぐ)。
     pub(crate) erase_last_undo_at: Option<std::time::Instant>,
@@ -2125,6 +2142,7 @@ impl Default for App {
             mask_db: crate::mask_db::MaskDb::open().ok(),
             erase_undo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
+            adjustment_drag_session: None,
             erase_last_undo_at: None,
             erase_vectors: Vec::new(),
             erase_selected_vector: None,

@@ -38,6 +38,36 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use crate::adjustment::AdjustParams;
+
+/// 画像補正の Undo がどの層に積まれたかを示す。
+/// 書き戻しは `App::apply_adjustment_change_to_app` がスコープごとに分岐する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdjustUndoScope {
+    /// ページ個別設定 (`adjustment_page_params[fs_idx]`)。`fs_idx` は capture 時点の
+    /// フルスクリーン idx。フルスクリーン中の画像移動・終了で undo_stack ごとクリア
+    /// されるので idx の陳腐化は起きない前提。
+    Page(usize),
+    /// お気に入り標準 (`adjustment_favorite_params[uuid]`)。
+    Favorite(uuid::Uuid),
+    /// アプリ全体標準 (`settings.global_preset`)。
+    Global,
+}
+
+/// 画像補正 1 件の変更記録。
+///
+/// `before` / `after` は `Option<AdjustParams>`:
+/// - `None`: そのスコープに**エントリが無い**状態 (個別/お気に入り標準は省略可能)
+/// - `Some(p)`: そのスコープに `p` が記録されている状態
+///
+/// `Global` スコープは常に `Some` (settings.global_preset は Optional ではない)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdjustmentChange {
+    pub scope: AdjustUndoScope,
+    pub before: Option<AdjustParams>,
+    pub after: Option<AdjustParams>,
+}
+
 /// レーティング 1 件の変更記録。`path_key` は `adjustment_db::normalize_path` 正規化済み。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatingChange {
@@ -72,12 +102,18 @@ pub enum UndoEntry {
         changes: Vec<TagChange>,
         summary: String,
     },
+    Adjustment {
+        changes: Vec<AdjustmentChange>,
+        summary: String,
+    },
 }
 
 impl UndoEntry {
     pub fn summary(&self) -> &str {
         match self {
-            UndoEntry::Rating { summary, .. } | UndoEntry::Tag { summary, .. } => summary,
+            UndoEntry::Rating { summary, .. }
+            | UndoEntry::Tag { summary, .. }
+            | UndoEntry::Adjustment { summary, .. } => summary,
         }
     }
 
@@ -86,6 +122,7 @@ impl UndoEntry {
         match self {
             UndoEntry::Rating { changes, .. } => !changes.is_empty(),
             UndoEntry::Tag { changes, .. } => !changes.is_empty(),
+            UndoEntry::Adjustment { changes, .. } => !changes.is_empty(),
         }
     }
 }
@@ -193,6 +230,13 @@ mod tests {
         }
     }
 
+    fn adjust_entry(scope: AdjustUndoScope, before: Option<AdjustParams>, after: Option<AdjustParams>) -> UndoEntry {
+        UndoEntry::Adjustment {
+            changes: vec![AdjustmentChange { scope, before, after }],
+            summary: "adj".into(),
+        }
+    }
+
     fn tag_entry(path: &str, before: Vec<&str>, after: Vec<&str>) -> UndoEntry {
         UndoEntry::Tag {
             changes: vec![TagChange {
@@ -290,7 +334,43 @@ mod tests {
             changes: vec![],
             summary: "noop".into(),
         });
+        s.push(UndoEntry::Adjustment {
+            changes: vec![],
+            summary: "noop".into(),
+        });
         assert!(!s.can_undo());
+    }
+
+    #[test]
+    fn adjustment_entry_round_trip() {
+        let mut s = UndoStack::new();
+        let before = AdjustParams::default();
+        let mut after = AdjustParams::default();
+        after.brightness = 25.0;
+        s.push(adjust_entry(
+            AdjustUndoScope::Page(7),
+            None,
+            Some(after.clone()),
+        ));
+        s.push(adjust_entry(
+            AdjustUndoScope::Global,
+            Some(before.clone()),
+            Some(after.clone()),
+        ));
+        assert_eq!(s.undo_len(), 2);
+
+        // pop → push_redo
+        let e = s.pop_undo().unwrap();
+        match &e {
+            UndoEntry::Adjustment { changes, .. } => {
+                assert!(matches!(changes[0].scope, AdjustUndoScope::Global));
+                assert_eq!(changes[0].before.as_ref().unwrap().brightness, 0.0);
+                assert_eq!(changes[0].after.as_ref().unwrap().brightness, 25.0);
+            }
+            _ => panic!("expected adjustment"),
+        }
+        s.push_redo(e);
+        assert_eq!(s.redo_len(), 1);
     }
 
     #[test]
