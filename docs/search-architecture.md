@@ -372,14 +372,15 @@ Tantivy に渡すと position=0 由来で誤判定するため **post-filter 側
 「Tantivy に全部持たせる」案を採らないのは、segment 肥大 / compaction 負荷を抑えたいのと、
 起動時 reconciliation で status 列を SQL で拾う方が楽だから。
 
-### 6.3 なぜ 2 段整合性プロトコル (§4.2) か
+### 6.3 なぜ Tantivy First 書き込み順序 (§4.2) か
 
 fts_meta.db と Tantivy の書き込みは別ストレージなので、片方だけ成功してクラッシュ
 すると検索結果に古い doc が残る or 正しい doc が出ないケースが発生する。
-`status=pending → Tantivy commit → status=ok` の順で書き、中断は pending 残留として
-次回起動時に再処理する設計で復元性を確保している。Tantivy commit は fsync を伴い
-高コストなので、100 件 / 5 秒のバッチ境界で commit し、その境界に fts_meta 側の
-status 遷移を合わせる。
+INDEX_VERSION=6 は **Tantivy commit 成功フレームでのみ SQLite を更新する**
+(Tantivy First) ことで、SQLite=Ok かつ Tantivy 未反映という状態を作らない。
+中断は walker の 3-way diff (FS / Tantivy / SQLite) で「FS あり + DB なし」
+として再 ingest される。Tantivy commit は fsync を伴い高コストなので、
+100 件 / 5 秒のバッチ境界で commit し、その境界で SQLite を upsert / delete する。
 
 ### 6.4 なぜ Searcher snapshot を固定するか
 
@@ -398,8 +399,9 @@ filter 変更で再クエリされれば反映されるので実用上問題な�
 fts_meta.db の `favorite_id` に使うことで、表示名変更は index 保持のまま通せる。
 
 root path 変更 (別ディレクトリへの付替え) は別扱い: 旧 path の全 doc を
-tombstone → 新 path を再スキャンする (一括 path 更新はパス正規化 / ZIP 境界の
-事故が多いので採らない)。お気に入り編集ダイアログで path 変更時に確認を出す。
+Tantivy delete + SQLite delete してから新 path を再スキャンする (一括 path
+更新はパス正規化 / ZIP 境界の事故が多いので採らない)。お気に入り編集
+ダイアログで path 変更時に確認を出す。
 
 ### 6.6 なぜ名前索引とメタ索引を別 Supervisor にするか
 
@@ -526,8 +528,10 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
    で全 upsert が無効化される。
 3. **Supervisor の drop 順序**: App drop 時は supervisor → FsWatcher → tempdir
    の順で閉じる。Windows で「使用中のファイルを削除できない」エラーを避ける。
-4. **二段整合性を崩さない**: ingest の順序 (pending → Tantivy commit → ok) は
-   順番入替・削減しない。failure はキャッシュせず次回起動時に補修する前提。
+4. **Tantivy First の書き込み順序を崩さない**: ingest の順序 (IndexDoc 構築 →
+   Tantivy batch commit → SQLite upsert_meta_ok / delete_paths) は順番入替・
+   削減しない。failure はキャッシュせず次回起動時の walker 3-way diff で補修
+   する前提。
 5. **新しい SourceKind / IndexKind を追加するなら**: `fts_index::Fields` /
    `IndexDoc` / `fts_meta::files` テーブル / `PerSourceText` / UI の
    `TargetChoice` / `KIND_CHOICES` / `search_page` のすべてに反映する。

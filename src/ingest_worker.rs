@@ -507,7 +507,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stats.deleted, 1);
-        // 物理削除されている (tombstone → purge が flush で走った)
+        // Tantivy commit 後に SQLite delete_paths が flush で走り、物理削除されている
         assert!(meta.get(&key).unwrap().is_none());
 
         // Tantivy 側からも消えている
