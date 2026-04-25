@@ -421,11 +421,57 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
+                    let checking = self.update_check_rx.is_some();
+                    if ui
+                        .add_enabled(
+                            !checking,
+                            egui::Button::new(if checking {
+                                "更新を確認中…"
+                            } else {
+                                "更新を確認…"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.kick_update_check(true);
+                        ui.close();
+                    }
                     if ui.button("バージョン情報").clicked() {
                         self.show_about_dialog = true;
                         ui.close();
                     }
                 });
+
+                // メニュー項目の右側に新バージョン通知バッジを表示する。
+                // 押すと更新ダイアログを開き、リリースページへの誘導 / skip 操作を行える。
+                if self.should_show_update_badge() {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let tag = self
+                                .update_info
+                                .as_ref()
+                                .map(|i| i.latest_tag.clone())
+                                .unwrap_or_default();
+                            let resp = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("🔔 新バージョン {tag}"))
+                                            .color(egui::Color32::from_rgb(100, 170, 100))
+                                            .size(12.0),
+                                    )
+                                    .fill(egui::Color32::from_rgb(40, 70, 40)),
+                                )
+                                .on_hover_text(
+                                    "新しいバージョンがリリースされています。\n\
+                                     クリックで詳細を表示します。",
+                                );
+                            if resp.clicked() {
+                                self.show_update_dialog = true;
+                            }
+                        },
+                    );
+                }
             });
         });
 

@@ -764,6 +764,18 @@ pub struct Settings {
     /// デフォルト OFF — 「通常は非破壊」というアプリの基本方針に沿わせる。
     #[serde(default)]
     pub write_rating_to_xmp: bool,
+
+    // ── バージョン更新通知 ────────────────────────────────────────
+    /// 起動時 + 定期的に GitHub Releases API を叩いて新バージョンを確認するか。
+    /// 既定 ON (オフライン環境では silent fail するので副作用なし)。
+    #[serde(default = "default_true")]
+    pub update_check_enabled: bool,
+
+    /// ユーザーが「このバージョンの通知は表示しない」を選んだ tag (例: "v0.8.2")。
+    /// チェック結果がここと一致するなら通知バッジを出さない。
+    /// 新バージョンが更にリリースされて tag が変われば再度通知する。
+    #[serde(default)]
+    pub update_check_dismissed_version: Option<String>,
 }
 
 /// グリッド列数の最小値
@@ -969,6 +981,8 @@ impl Default for Settings {
             minimize_to_tray_on_close: false,
             pause_indexer_while_minimized: false,
             write_rating_to_xmp: false,
+            update_check_enabled: true,
+            update_check_dismissed_version: None,
         }
     }
 }

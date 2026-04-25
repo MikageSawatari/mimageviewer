@@ -77,6 +77,10 @@ crossbeam-channel = "0.5"
 # 動かすため、専用スレッドで `PeekMessageW` ポンプを回す実装にしている
 # (`src/tray.rs` 参照)。muda は tray-icon が再エクスポートしている。
 tray-icon = "0.20"
+# 起動時 / 定期的なバージョン更新確認 (GitHub Releases API)。
+# rustls-tls 指定で OpenSSL に依存しない (CRT 静的リンク方針との両立)。
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3"

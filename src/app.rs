@@ -1839,6 +1839,21 @@ pub struct App {
     /// タスクトレイ常駐設定を ON にしたときに 1 回だけ表示する案内ダイアログ。
     /// ユーザーが OK を押すと閉じる。
     pub(crate) show_tray_enabled_notice: bool,
+
+    // ── バージョン更新通知 ────────────────────────────────────────
+    /// 起動時 / 定期チェックの結果待ち receiver。`take` 後は None に戻し、
+    /// `update_info` に結果を反映する。
+    pub(crate) update_check_rx:
+        Option<std::sync::mpsc::Receiver<Result<crate::update_check::UpdateInfo, String>>>,
+    /// 直近の正常な更新チェック結果。`is_newer=true` の間は通知バッジを表示する。
+    pub(crate) update_info: Option<crate::update_check::UpdateInfo>,
+    /// 最後にチェックを spawn した時刻。`UPDATE_CHECK_INTERVAL` 経過で再 spawn。
+    pub(crate) update_check_last_spawn: Option<std::time::Instant>,
+    /// 「新バージョンがあります」ダイアログを表示中か (バッジクリックで開く)。
+    pub(crate) show_update_dialog: bool,
+    /// ユーザーが「今すぐ確認」を押した直後で、結果を必ず UI 表示するモード。
+    /// auto は失敗時 silent だが manual は失敗時にダイアログでエラーを出したい。
+    pub(crate) update_check_manual: bool,
     /// メインウィンドウの HWND (frame.window_handle から最初のフレームで取得)。
     /// Win32 `ShowWindow` でトレイ退避 / 復帰するために必要。
     /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
@@ -2217,6 +2232,11 @@ impl Default for App {
             tray_controller: None,
             window_visible: true,
             show_tray_enabled_notice: false,
+            update_check_rx: None,
+            update_info: None,
+            update_check_last_spawn: None,
+            show_update_dialog: false,
+            update_check_manual: false,
             main_hwnd: None,
             placement_slot: None,
             activation_listener: None,
@@ -2868,6 +2888,101 @@ impl App {
                 self.startup_init = None;
                 self.startup_done = true;
             }
+        }
+    }
+
+    /// auto / manual の更新チェックを spawn する。
+    ///
+    /// - `manual=true`: ユーザー操作 (環境設定の「今すぐ確認」)。`update_check_enabled`
+    ///   を無視して常に実行、結果ダイアログも常に開く
+    /// - `manual=false`: 起動 5 秒後 + 24 時間ごとの auto。`update_check_enabled=false`
+    ///   なら no-op、結果は新バージョン検知時のみバッジで通知
+    ///
+    /// 既に spawn 中 (rx が残っている) なら多重起動を防ぐため no-op。
+    pub(crate) fn kick_update_check(&mut self, manual: bool) {
+        if self.update_check_rx.is_some() {
+            return;
+        }
+        if !manual && !self.settings.update_check_enabled {
+            return;
+        }
+        self.update_check_manual = manual;
+        self.update_check_last_spawn = Some(std::time::Instant::now());
+        let rx = crate::update_check::spawn_check(env!("CARGO_PKG_VERSION"));
+        self.update_check_rx = Some(rx);
+    }
+
+    /// 起動完了後の初回 + 24 時間ごとの auto kick。`App::update` の毎フレーム冒頭で呼ばれる。
+    pub(crate) fn maybe_auto_update_check(&mut self) {
+        if !self.settings.update_check_enabled {
+            return;
+        }
+        if !self.startup_done {
+            return; // 起動中はネットワークを走らせない
+        }
+        const PERIODIC: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        let due = match self.update_check_last_spawn {
+            None => true, // 起動完了直後の初回
+            Some(t) => t.elapsed() >= PERIODIC,
+        };
+        if due {
+            self.kick_update_check(false);
+        }
+    }
+
+    /// `update_check_rx` を非ブロッキング poll する。結果が来ていれば `update_info` に
+    /// 反映し、manual のときは結果ダイアログを開く。auto かつ「新バージョンあり」の
+    /// ときはバッジで気付かせるだけ (ダイアログは開かない)。
+    pub(crate) fn poll_update_check(&mut self) {
+        let Some(rx) = self.update_check_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(info)) => {
+                let manual = self.update_check_manual;
+                let is_newer = info.is_newer;
+                self.update_info = Some(info);
+                self.update_check_rx = None;
+                self.update_check_manual = false;
+                if manual {
+                    self.show_update_dialog = true;
+                } else if is_newer {
+                    crate::logger::log(format!(
+                        "update_check: newer version found ({})",
+                        self.update_info.as_ref().unwrap().latest_tag
+                    ));
+                }
+            }
+            Ok(Err(e)) => {
+                crate::logger::log(format!("update_check: failed: {e}"));
+                let manual = self.update_check_manual;
+                self.update_check_rx = None;
+                self.update_check_manual = false;
+                if manual {
+                    // 失敗を UI で見せるため、update_info を None のまま open
+                    self.update_info = None;
+                    self.show_update_dialog = true;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_check_rx = None;
+                self.update_check_manual = false;
+            }
+        }
+    }
+
+    /// 通知バッジを表示すべきか (新バージョンあり、かつユーザーが skip していない)。
+    pub(crate) fn should_show_update_badge(&self) -> bool {
+        let Some(ref info) = self.update_info else {
+            return false;
+        };
+        if !info.is_newer {
+            return false;
+        }
+        match &self.settings.update_check_dismissed_version {
+            Some(d) => d != &info.latest_tag,
+            None => true,
         }
     }
 
@@ -11518,6 +11633,10 @@ impl eframe::App for App {
             self.consume_input_during_startup(ctx);
         }
 
+        // バージョン更新通知: 起動完了後の初回 + 24h 周期で auto kick。
+        self.maybe_auto_update_check();
+        self.poll_update_check();
+
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
@@ -11766,6 +11885,7 @@ impl eframe::App for App {
         self.show_delete_progress_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
+        self.show_update_dialog_window(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
         self.poll_pdf_enumerate();
         self.poll_zip_enumerate();

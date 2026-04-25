@@ -34,6 +34,8 @@ pub(crate) enum PreferencesPage {
     TrayResidency,
     /// v0.8.1: レーティング XMP 書き込み設定
     Rating,
+    /// 起動時 / 定期的なバージョン更新確認
+    UpdateCheck,
 }
 
 impl PreferencesPage {
@@ -55,6 +57,7 @@ impl PreferencesPage {
             Self::IndexerSpeed => "自動インデクサ速度",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
+            Self::UpdateCheck => "更新確認",
         }
     }
 }
@@ -133,6 +136,12 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "レーティング",
         page: Some(PreferencesPage::Rating),
+        children: &[],
+    },
+    // バージョン更新確認 (起動時 + 24h 周期)
+    TreeCategory {
+        label: "更新確認",
+        page: Some(PreferencesPage::UpdateCheck),
         children: &[],
     },
 ];
@@ -441,6 +450,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
+        PreferencesPage::UpdateCheck => page_update_check(ui, state),
     }
 }
 
@@ -966,6 +976,61 @@ fn page_rating(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .weak()
         .size(11.0),
     );
+}
+
+/// バージョン更新確認の設定ページ。
+/// ON で起動時 + 24 時間ごとに GitHub Releases API を叩いて新バージョンを確認する。
+fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.label(
+        "起動時と 24 時間ごとに新しいバージョンが公開されていないか確認します。\n\
+         新バージョンを検出するとメニューバーに通知バッジが表示されます。",
+    );
+    ui.add_space(10.0);
+
+    ui.checkbox(&mut s.update_check_enabled, "新バージョンを自動的に確認する")
+        .on_hover_text(
+            "ON (既定): 起動時と 24 時間ごとに GitHub のリリースページに問い合わせ。\n\
+             OFF: 自動確認を行いません。ヘルプメニューの「更新を確認…」で手動確認は可能。",
+        );
+
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "通信先: api.github.com (HTTPS、未認証)。\n\
+             失敗 (オフライン等) は通知せず黙って終了します。\n\
+             問い合わせ内容はバージョン情報のみで、ユーザーデータは送信しません。",
+        )
+        .size(11.0)
+        .color(egui::Color32::from_gray(150)),
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    if let Some(ref skipped) = s.update_check_dismissed_version.clone() {
+        ui.label(format!(
+            "現在「{skipped}」の通知は非表示にしています。"
+        ));
+        if ui.button("通知を再度有効にする").clicked() {
+            s.update_check_dismissed_version = None;
+        }
+        ui.add_space(8.0);
+    }
+
+    ui.label(
+        egui::RichText::new(format!(
+            "現在のバージョン: v{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .size(12.0),
+    );
+    ui.add_space(4.0);
+    if ui.button("リリース履歴を開く").clicked() {
+        crate::ui_helpers::open_url(crate::update_check::releases_page_url());
+    }
 }
 
 fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

@@ -55,6 +55,7 @@ pub mod thumb_loader;
 pub mod undo_stack;
 pub mod ui_helpers;
 pub mod ui_susie_diagnostic;
+pub mod update_check;
 pub mod wic_decoder;
 pub mod xmp_reader;
 pub mod xmp_writer;

@@ -23,3 +23,4 @@ mod stats_dialog;
 mod tag_editor;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
+mod update_notice;
