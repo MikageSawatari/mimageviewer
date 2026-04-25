@@ -432,6 +432,22 @@ impl FtsMetaDb {
             .optional()
     }
 
+    /// favorite 配下の `status=Ok` 件数だけ高速に返す。
+    ///
+    /// `count_by_status` と違い 4 status 全部をスキャンせず、`idx_files_fav` で
+    /// favorite_id を絞ってから status=0 だけカウントする。
+    pub fn count_ok_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE favorite_id = ?1 AND status = 0",
+            params![favorite_id.to_string()],
+            |r| {
+                let v: i64 = r.get(0)?;
+                Ok(v as u64)
+            },
+        )
+    }
+
     /// favorite_id でフィルタしつつ総数と status 別の件数を返す。
     /// インデックス管理ダイアログの進捗表示 (§8.4) で使用。
     pub fn count_by_status(&self, favorite_id: Uuid) -> rusqlite::Result<StatusCounts> {

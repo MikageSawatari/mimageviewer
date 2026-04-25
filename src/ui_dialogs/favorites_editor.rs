@@ -24,12 +24,13 @@ use crate::ui_helpers::{format_bytes, format_count, truncate_name};
 /// 全文検索インデックスの on-disk サイズ (bytes) を集計する。
 ///
 /// - `name_index_db`: お気に入り単位の名前索引 (SQLite)
-/// - `fts_meta_db`: メタ索引の per-source テキスト (SQLite、本体が 2GB 級になりうる)
-/// - `fts_index_dir`: Tantivy インデックス (segment ファイル群の合計)
+/// - `fts_meta_db`: 管理メタ専用 DB (SQLite、status / mtime / size のみ)
+/// - `fts_index_dir`: Tantivy インデックス (segment ファイル群の合計、原文 STORED 含む)
 ///
-/// すべて `stat()` ベースなので数ミリ秒で完了する。ダイアログを開くたびに再計算して
-/// 最新値を出す (ingest で増えるので)。存在しないファイル / ディレクトリは 0 扱い。
-#[derive(Copy, Clone)]
+/// すべて `stat()` ベースなので数ミリ秒で完了する。ダイアログ表示中はファイル件数と
+/// 同じ 1.5s 間隔で更新される (ingest で増えるので)。存在しないファイル /
+/// ディレクトリは 0 扱い。
+#[derive(Copy, Clone, Default)]
 pub(crate) struct IndexDiskSizes {
     pub(crate) name_index_db: u64,
     pub(crate) fts_meta_db: u64,
@@ -115,29 +116,26 @@ impl App {
 
         // 事前にインデクサ情報を取り出し (borrow 競合回避)
         let startup_diag = self.indexer_manager.as_ref().map(|m| m.startup_diag());
-        // 件数キャッシュ。バックグラウンドインデクサが裏で行を増減させるので、
-        // ダイアログ表示中は 1.5s ごとに再計算して更新を反映する。
-        // 1 ファイルあたりの COUNT(*) は数 ms だが、お気に入り数 × 2 (名前/メタ) で
-        // 100-200ms かかりうるので毎フレームは避ける。
-        const COUNT_REFRESH: std::time::Duration = std::time::Duration::from_millis(1500);
-        let needs_refresh = self
+        // インデックスサイズ + 件数キャッシュ。バックグラウンドインデクサが裏で行を
+        // 増減させるので、ダイアログ表示中は 1.5s ごとに再計算する。COUNT(*) は
+        // お気に入り数 × 2 (名前/メタ) で 100-200ms かかりうるので毎フレームは避ける。
+        const REFRESH: std::time::Duration = std::time::Duration::from_millis(1500);
+        let counts_stale = self
             .favorites_index_count_cache
             .as_ref()
-            .map(|(t, _)| t.elapsed() >= COUNT_REFRESH)
+            .map(|(t, _)| t.elapsed() >= REFRESH)
             .unwrap_or(true);
-        if needs_refresh {
-            let mut c = crate::ui_dialogs::favorites_editor::IndexFileCounts::default();
-            let name_db = self.search_index_db.as_ref().cloned();
+        if counts_stale {
+            let mut c = IndexFileCounts::default();
+            let name_db = self.search_index_db.as_ref();
             let meta_db = self.indexer_manager.as_ref().map(|m| m.clone_fts_meta());
             for fav in &self.settings.favorites {
                 let n = name_db
-                    .as_ref()
                     .and_then(|db| db.count_for_favorite(&fav.path).ok())
                     .unwrap_or(0);
                 let m = meta_db
                     .as_ref()
-                    .and_then(|db| db.count_by_status(fav.id).ok())
-                    .map(|s| s.ok as u64)
+                    .and_then(|db| db.count_ok_for_favorite(fav.id).ok())
                     .unwrap_or(0);
                 c.name_counts.insert(fav.id, n);
                 c.meta_counts.insert(fav.id, m);
@@ -145,12 +143,32 @@ impl App {
                 c.meta_total += m;
             }
             self.favorites_index_count_cache = Some((std::time::Instant::now(), c));
+            // サイズも同じ間隔で更新 (stat ベースでさらに軽い)。
+            self.favorites_index_size_cache = Some(compute_index_disk_sizes());
         }
-        let counts = self
+        // ↓ 以降は `egui::Window::show` クロージャで `self.settings.favorites` を
+        // 借用するので、キャッシュからは Copy 値だけ抜いて閉じこもらない形にする。
+        let (name_total, meta_total) = self
             .favorites_index_count_cache
             .as_ref()
-            .map(|(_, c)| c.clone())
-            .unwrap_or_default();
+            .map(|(_, c)| (c.name_total, c.meta_total))
+            .unwrap_or((0, 0));
+        let row_counts: Vec<(u64, u64)> = {
+            let cache = self.favorites_index_count_cache.as_ref().map(|(_, c)| c);
+            self.settings
+                .favorites
+                .iter()
+                .map(|fav| {
+                    let n = cache
+                        .and_then(|c| c.name_counts.get(&fav.id).copied())
+                        .unwrap_or(0);
+                    let m = cache
+                        .and_then(|c| c.meta_counts.get(&fav.id).copied())
+                        .unwrap_or(0);
+                    (n, m)
+                })
+                .collect()
+        };
         let reconciling = self
             .indexer_manager
             .as_ref()
@@ -222,11 +240,11 @@ impl App {
                             );
                         });
 
-                        // インデックスのディスク使用量。ダイアログ open 時に 1 回計算してキャッシュ
-                        // (毎フレーム stat + read_dir を叩かないため)。close 時に破棄。
-                        let sizes = *self
+                        // インデックスのディスク使用量とファイル件数。直前の refresh 区間で
+                        // 計算済み (1.5s 間隔)。close 時に両方破棄。
+                        let sizes = self
                             .favorites_index_size_cache
-                            .get_or_insert_with(compute_index_disk_sizes);
+                            .unwrap_or_default();
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("💾 インデックスサイズ:")
@@ -237,7 +255,7 @@ impl App {
                                 egui::RichText::new(format!(
                                     "名前索引 {} ({}件)",
                                     format_bytes(sizes.name_index_db),
-                                    format_count(counts.name_total)
+                                    format_count(name_total)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -252,7 +270,7 @@ impl App {
                                     "メタ索引 {} + {} ({}件)",
                                     format_bytes(sizes.fts_meta_db),
                                     format_bytes(sizes.fts_index_dir),
-                                    format_count(counts.meta_total)
+                                    format_count(meta_total)
                                 ))
                                 .size(11.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -415,11 +433,13 @@ impl App {
                                             }
                                             let name_on =
                                                 self.settings.favorites[i].auto_index_structure;
-                                            draw_name_state_inline(
+                                            draw_state_inline(
                                                 ui,
                                                 name_on,
-                                                name_stats_by_id.get(&fav_id),
-                                                counts.name_counts.get(&fav_id).copied().unwrap_or(0),
+                                                name_stats_by_id
+                                                    .get(&fav_id)
+                                                    .map(|s| (s.in_full_scan, s.initial_scan_done)),
+                                                row_counts[i].0,
                                             );
                                         });
 
@@ -438,11 +458,13 @@ impl App {
                                             }
                                             let meta_on =
                                                 self.settings.favorites[i].auto_index_metadata;
-                                            draw_meta_state_inline(
+                                            draw_state_inline(
                                                 ui,
                                                 meta_on,
-                                                stats_by_id.get(&fav_id),
-                                                counts.meta_counts.get(&fav_id).copied().unwrap_or(0),
+                                                stats_by_id
+                                                    .get(&fav_id)
+                                                    .map(|s| (s.in_full_scan, s.initial_scan_done)),
+                                                row_counts[i].1,
                                             );
                                         });
 
@@ -691,17 +713,22 @@ impl App {
 
 // ── チェックボックス右側の状態インライン表示ヘルパー ──────────────────────
 
-/// 名前索引列: メタ索引と同じ 3 分岐で表示する
-/// (両方とも notify-rs 監視を張って差分追従する構造になったため)。
+/// 名前索引・メタ索引共通の状態表示。
 ///
-/// - OFF: —
-/// - ON + `in_full_scan=true`: ⏳ スキャン中
-/// - ON + `initial_scan_done=true`, `in_full_scan=false`: ✅ 監視中
-/// - ON + supervisor 未登録 / `initial_scan_done=false`: ⏳ 起動中
-fn draw_name_state_inline(
+/// `flags` は supervisor から得た `(in_full_scan, initial_scan_done)`。
+/// `None` = supervisor 未登録 (= 起動直後)。
+///
+/// - `on=false`: —
+/// - flags=None: ⏳ 起動中
+/// - in_full_scan: ⏳ スキャン中
+/// - initial_scan_done: ✅ 監視中
+/// - else: ⏳ 準備中 (supervisor 起動済みだが scan 未着手)
+///
+/// `file_count > 0` のときは末尾に `(123,456件)` を付ける。
+fn draw_state_inline(
     ui: &mut egui::Ui,
     on: bool,
-    stats: Option<&crate::name_index_supervisor::NameIndexStats>,
+    flags: Option<(bool, bool)>,
     file_count: u64,
 ) {
     if !on {
@@ -712,102 +739,19 @@ fn draw_name_state_inline(
         );
         return;
     }
-    let Some(s) = stats else {
-        draw_state_with_count(
-            ui,
-            "⏳ 起動中",
-            egui::Color32::from_rgb(200, 170, 60),
-            file_count,
-        );
-        return;
+    const YELLOW: egui::Color32 = egui::Color32::from_rgb(200, 170, 60);
+    const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 170, 100);
+    let (label, color) = match flags {
+        None => ("⏳ 起動中", YELLOW),
+        Some((true, _)) => ("⏳ スキャン中", YELLOW),
+        Some((false, true)) => ("✅ 監視中", GREEN),
+        Some((false, false)) => ("⏳ 準備中", YELLOW),
     };
-    if s.in_full_scan {
-        draw_state_with_count(
-            ui,
-            "⏳ スキャン中",
-            egui::Color32::from_rgb(200, 170, 60),
-            file_count,
-        );
-    } else if s.initial_scan_done {
-        draw_state_with_count(
-            ui,
-            "✅ 監視中",
-            egui::Color32::from_rgb(100, 170, 100),
-            file_count,
-        );
-    } else {
-        draw_state_with_count(
-            ui,
-            "⏳ 準備中",
-            egui::Color32::from_rgb(200, 170, 60),
-            file_count,
-        );
-    }
-}
-
-/// 状態テキスト + (件数) を 1 行で描画。件数が 0 のときは件数を省略する
-/// (起動直後やスキャン未着手のときに「(0件)」と出ると目立つので)。
-fn draw_state_with_count(ui: &mut egui::Ui, label: &str, color: egui::Color32, file_count: u64) {
     let text = if file_count == 0 {
         label.to_string()
     } else {
         format!("{label} ({}件)", format_count(file_count))
     };
     ui.label(egui::RichText::new(text).size(11.0).color(color));
-}
-
-/// メタデータ索引列: supervisor 状態を 3 分岐で表示
-///
-/// - OFF: —
-/// - ON + `in_full_scan=true`: ⏳ スキャン中 (walker + ingest 実行中)
-/// - ON + `initial_scan_done=true`, `in_full_scan=false`: ✅ 監視中
-///   (notify-rs watcher が FS 変更を待機、scan 完了後アイドル状態)
-/// - ON + `initial_scan_done=false`, `in_full_scan=false`: ⏳ 準備中
-///   (supervisor が起動したばかりで scan がまだ始まっていない)
-fn draw_meta_state_inline(
-    ui: &mut egui::Ui,
-    on: bool,
-    stats: Option<&SupervisorStats>,
-    file_count: u64,
-) {
-    if !on {
-        ui.label(
-            egui::RichText::new("—")
-                .size(11.0)
-                .color(egui::Color32::from_gray(120)),
-        );
-        return;
-    }
-    let Some(s) = stats else {
-        draw_state_with_count(
-            ui,
-            "⏳ 起動中",
-            egui::Color32::from_rgb(200, 170, 60),
-            file_count,
-        );
-        return;
-    };
-    if s.in_full_scan {
-        draw_state_with_count(
-            ui,
-            "⏳ スキャン中",
-            egui::Color32::from_rgb(200, 170, 60),
-            file_count,
-        );
-    } else if s.initial_scan_done {
-        draw_state_with_count(
-            ui,
-            "✅ 監視中",
-            egui::Color32::from_rgb(100, 170, 100),
-            file_count,
-        );
-    } else {
-        draw_state_with_count(
-            ui,
-            "⏳ 準備中",
-            egui::Color32::from_rgb(200, 170, 60),
-            file_count,
-        );
-    }
 }
 
