@@ -1918,6 +1918,11 @@ pub struct App {
     /// `indexer_manager.is_none()` だけだと「init 失敗で永続 None」と
     /// 「未起動」を区別できないので別フラグで持つ。
     pub(crate) startup_done: bool,
+    /// `fts_meta` の housekeeping (VACUUM) を起動完了後に走らせるための armed フラグ。
+    /// `startup_done` で true になり、全 supervisor が idle に達したフレームで
+    /// `spawn_housekeeping` を 1 回呼んで false に倒す (Codex 指摘: VACUUM が
+    /// supervisor の初回 scan と writer mutex を取り合うのを避ける)。
+    pub(crate) housekeeping_armed: bool,
 }
 
 impl Default for App {
@@ -2274,6 +2279,7 @@ impl Default for App {
             startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
             startup_init: None,
             startup_done: false,
+            housekeeping_armed: false,
         }
     }
 }
@@ -2884,10 +2890,8 @@ impl App {
                 Arc::clone(&self.activity_gate),
                 Some(hook),
             );
-            if let Some(mgr) = self.indexer_manager.as_ref() {
-                mgr.spawn_housekeeping(&crate::data_dir::get());
-            }
             self.startup_done = true;
+            self.housekeeping_armed = true;
             return;
         }
         self.startup_init = Some(StartupInitPending { rx, started_at });
@@ -2895,6 +2899,24 @@ impl App {
 
     /// 起動 init の完了を確認する。完了していれば `indexer_manager` に注入し
     /// `startup_init = None`、`startup_done = true` に遷移する。
+    /// `housekeeping_armed=true` の間、毎フレーム supervisor の idle 状態を見て、
+    /// 全 supervisor が初回 scan を完了して idle になったら一度だけ spawn する。
+    /// これにより VACUUM が初回 ingest と Mutex を取り合わないようにする。
+    pub(crate) fn poll_housekeeping_arm(&mut self) {
+        if !self.housekeeping_armed {
+            return;
+        }
+        let Some(mgr) = self.indexer_manager.as_ref() else {
+            // indexer 初期化失敗時はそもそも housekeeping も走らせない
+            self.housekeeping_armed = false;
+            return;
+        };
+        if mgr.all_supervisors_idle() {
+            mgr.spawn_housekeeping(&crate::data_dir::get());
+            self.housekeeping_armed = false;
+        }
+    }
+
     pub(crate) fn poll_startup_init(&mut self) {
         let Some(pending) = &self.startup_init else {
             return;
@@ -2908,11 +2930,9 @@ impl App {
                 self.indexer_manager = mgr;
                 self.startup_init = None;
                 self.startup_done = true;
+                self.housekeeping_armed = true;
                 if let Ok(mut p) = self.startup_progress.lock() {
                     *p = "起動完了".to_string();
-                }
-                if let Some(mgr) = self.indexer_manager.as_ref() {
-                    mgr.spawn_housekeeping(&crate::data_dir::get());
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -11651,6 +11671,7 @@ impl eframe::App for App {
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
+        self.poll_housekeeping_arm();
         if !self.startup_done {
             self.kick_off_startup_init();
             self.poll_startup_init();

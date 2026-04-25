@@ -2,11 +2,19 @@
 //!
 //! Walker が返した `to_ingest` / `to_delete` キューを受け取り、以下を行う:
 //!
-//! 1. **メタ抽出**: `ingest_text::build_all_text_for_file` で all_text_norm を作る
-//! 2. **fts_meta.db に pending マーク** (§5.6.1 step 1)
-//! 3. **Tantivy にバッファリング** (upsert_doc / delete_doc)
-//! 4. **バッチ境界で Tantivy commit** (§5.6.1 step 3)
-//! 5. **fts_meta.db を ok に遷移** (§5.6.1 step 4)
+//! 1. **メタ抽出 + IndexDoc 構築**: `ingest_text::build_per_source_*` を呼んで
+//!    `IndexDoc` を作る。SQLite には触れない。
+//! 2. **Tantivy にバッファリング**: `IndexDoc` を `batch_upserts` に積み、削除候補は
+//!    `batch_deletes` に積む。
+//! 3. **バッチ境界で Tantivy commit + reader reload** (`writer.batch(commit=true,
+//!    reload=true)`)
+//! 4. **commit 成功後に SQLite を更新**: 投入済みの `(path, kind, mtime, size)` を
+//!    `upsert_meta_ok` で `status=Ok` 直書き、削除済みの path を `delete_paths` で
+//!    物理削除。
+//!
+//! 順序不変条件: SQLite の書き込みは Tantivy commit が成功したフレームのみ実施する
+//! (Tantivy First)。途中でクラッシュした場合は次回起動時の reconciliation / walker
+//! 3-way diff (FS / Tantivy / SQLite) で復旧する。
 //!
 //! ## バッチサイズ
 //!

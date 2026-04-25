@@ -504,6 +504,17 @@ impl IndexerManager {
         self.supervisors.len()
     }
 
+    /// 全 supervisor が初期スキャンを完了しており、現在 full scan を実行していないか。
+    /// supervisor 数 0 (auto_index_metadata=true のお気に入りなし) でも true を返す。
+    /// `spawn_housekeeping` の起動タイミングを「初回 ingest が落ち着いてから」に揃える
+    /// ために使う (Codex 指摘)。
+    pub fn all_supervisors_idle(&self) -> bool {
+        self.supervisors.values().all(|h| {
+            let s = h.snapshot_stats();
+            s.initial_scan_done && !s.in_full_scan
+        })
+    }
+
     /// `Arc<FtsMetaDb>` を clone して返す。
     /// 検索 worker や tag worker が status 確認・管理メタ取得のために使う
     /// (INDEX_VERSION=5 以降、原文は Tantivy 側にあるので fts_meta は管理メタ専用)。
