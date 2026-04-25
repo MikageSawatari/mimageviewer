@@ -30,9 +30,12 @@ use std::time::{Duration, Instant};
 const ETA_WINDOW: Duration = Duration::from_secs(60);
 
 /// サンプル件数のハード上限。`set_count` が時刻が進まない状況で連打されたとき
-/// (テストや単一 Instant の精度限界) の暴走を防ぐ防御。通常は ETA_WINDOW で
-/// 自然に間引かれるためここまで届かない。
-const ETA_SAMPLES_MAX: usize = 1024;
+/// (テストや単一 Instant の精度限界) の暴走を防ぐ防御。
+/// ingest_worker は 1 ファイル処理ごとに 1 サンプル push するので、実測 155 件/秒
+/// の環境では 60 秒窓 = 9300 サンプル必要。1024 だとサンプル上限が先に効いて
+/// 実効窓が ~6.6 秒に縮み、ETA が振動する原因になる (実害確認済み)。
+/// 16384 なら 60 秒 × 273 件/秒まで余裕、16B/サンプル × 16384 ≈ 256 KB。
+const ETA_SAMPLES_MAX: usize = 16384;
 
 /// 進捗カウントの ETA スナップショット。
 #[derive(Clone, Copy, Debug)]
