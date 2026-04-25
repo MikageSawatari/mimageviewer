@@ -28,9 +28,9 @@
 //!
 //! ## キャンセル
 //!
-//! `Arc<AtomicBool>` でいつでも中断可能。未コミット分は破棄され、次回起動時の
-//! 差分走査で再度 `to_ingest` に入る (fts_meta.db の status=pending が残っている場合は
-//! reconciliation 処理で再試行される)。
+//! `Arc<AtomicBool>` でいつでも中断可能。Tantivy commit 前に中断された分は SQLite に
+//! 反映していないので、次回起動時の walker 3-way diff で「FS にあるが SQLite に無い」
+//! として再 `to_ingest` 候補に拾われる。
 //!
 //! ## v1 スコープ
 //!

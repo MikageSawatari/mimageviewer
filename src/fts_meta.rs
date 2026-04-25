@@ -1,16 +1,19 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=5)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=6)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
 //! Tantivy インデックス (`fts_index/`) とは別 DB で、以下を担う:
-//! - お気に入り単位の登録ファイル追跡 (差分検出の基準)
-//! - `status=pending / ok / failed / tombstone` の二段整合性状態
+//! - お気に入り単位の登録ファイル追跡 (差分検出の基準: path / mtime / size)
+//! - `status=Ok / Failed` の 2 値 (Ok=Tantivy commit 済み、Failed=ingest 失敗で再試行待ち)
 //! - ingest 世代カウンタ (`index_generation`) — 将来のスナップショット用
 //!
-//! **正規化済み原文 (`*_norm` 列) は持たない**。INDEX_VERSION=5 で各ソースの
-//! 原文は Tantivy 側 (`*_text` フィールドに STORED) に集約された。post-filter は
-//! `fts_index::doc_text_for_target` で Tantivy snapshot から原文を取り出す経路に
-//! 統一されている。
+//! **正規化済み原文 (`*_norm` 列) は持たない**。原文は Tantivy 側 (`*_text` フィールド
+//! に STORED) に集約されており、検索 post-filter は `fts_index::doc_text_for_target` で
+//! Tantivy snapshot から取り出す。
+//!
+//! **書き込み順序 (Tantivy First)**: ingest / delete どちらも Tantivy commit 成功後に
+//! SQLite を更新する。途中でクラッシュした場合は次回起動時の walker 3-way diff
+//! (FS / Tantivy / SQLite) または reconciliation で復旧する。
 //!
 //! **スレッド安全性**: `Mutex<Connection>` で包む (既存 catalog.rs と同じパターン)。
 //! 頻繁な UPSERT は Ingest Worker から呼ばれるため、ロックは短く保つ。
