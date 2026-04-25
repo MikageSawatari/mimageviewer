@@ -167,11 +167,18 @@ impl App {
             .collect();
 
         if matching.is_empty() {
-            // 現在のグリッドに無い (= 別ビュー由来の Undo 等)。永続化のみ実施。
+            // 現在のグリッドに無い (= 通常はコンテナレーティングの Undo: current_folder
+            // 自身は self.items に含まれないため、ここに来る)。永続化に加えて、現在表示中
+            // フォルダと一致する場合はアドレスバー側のキャッシュも同期する (Codex P2)。
             if let Some(db) = self.rating_db.as_ref() {
                 let _ = db.set(&c.path_key, target);
             }
             self.user_set_rating_keys.insert(c.path_key.clone());
+            if let Some(folder) = &self.current_folder {
+                if crate::adjustment_db::normalize_path(folder) == c.path_key {
+                    self.current_folder_rating_cache = Some(target);
+                }
+            }
             if self.settings.write_rating_to_xmp
                 && crate::xmp_writer::is_writable_format(&c.source_path)
             {
@@ -192,12 +199,14 @@ impl App {
     }
 
     /// タグ Undo/Redo の worker 投入。`use_before=true` なら各 path の `before` を
-    /// SetTags で復元、false なら `after` を再適用。tags_cache は worker 結果が返って
-    /// 来た時点で `poll_tag_write_results` 経由で更新されるので、ここでは触らない。
+    /// SetTags で復元、false なら `after` を再適用。
+    ///
+    /// `capture_tag_undo` と同じく `tags_cache` を即時反映する (Codex P1)。
+    /// 次の操作 (続けて Ctrl+Z や別トグル) が古いキャッシュを見ない。
     fn submit_tag_restore_jobs(&mut self, changes: &[TagChange], use_before: bool) {
         self.ensure_tag_write_handle();
         // 完了トーストのラベルは tag_ops の format_completion_toast で `restored` 件数を
-        // 専用文言に切り替えるので、ここではラベル不要。Undo 用に明示的にクリア。
+        // 専用文言に切り替えるので、ここではラベル不要。
         self.tag_toast_label = None;
         let Some(h) = self.tag_write_handle.as_ref() else {
             self.show_feedback_toast(
@@ -206,17 +215,19 @@ impl App {
             return;
         };
         for c in changes {
-            let target = if use_before {
-                c.before.clone()
-            } else {
-                c.after.clone()
-            };
+            let target = if use_before { &c.before } else { &c.after };
             let fav_id = find_favorite_id(&self.settings.favorites, &c.path);
             h.submit(TagWriteJob {
                 path: c.path.clone(),
-                kind: TagJobKind::SetTags(target),
+                kind: TagJobKind::SetTags(target.clone()),
                 favorite_id: fav_id,
             });
+        }
+        // tags_cache 楽観的更新は h の借用を解放してから実施 (`&mut self`/`&self` 衝突回避)。
+        for c in changes {
+            let target = if use_before { &c.before } else { &c.after };
+            let key = crate::adjustment_db::normalize_path(&c.path);
+            self.tags_cache.insert(key, target.clone());
         }
     }
 }
@@ -278,6 +289,12 @@ impl App {
     /// タグ操作の **直前** に呼ぶ。`paths` の各ファイルについて現在の dc:subject を
     /// `tags_cache` から取得し、`after_for` で操作後の期待状態を計算してエントリを作る。
     /// tags_cache に値が無い path はスキップ (= XMP 直読みは避ける、Undo より UI 応答性優先)。
+    ///
+    /// **重要 (Codex P1 対応)**: 計算した `after` を `tags_cache` に**即時反映**する。
+    /// tag_write_worker は非同期なので、worker 完了前に次の操作 (例: 別タグのトグル) が
+    /// 走ると、後続の `capture_tag_undo` が古い `tags_cache` 値で `before` を捏造してしまい、
+    /// その Undo を実行すると先行操作分のタグまで剥がれる事故になる。`after` を先に
+    /// 書き戻しておけば、worker poll 完了時の上書きと等価な値になり race を消せる。
     pub(crate) fn capture_tag_undo(
         &mut self,
         paths: &[PathBuf],
@@ -287,11 +304,12 @@ impl App {
         let mut changes = Vec::with_capacity(paths.len());
         for p in paths {
             let key = crate::adjustment_db::normalize_path(p);
-            let before = match self.tags_cache.get(&key).cloned() {
-                Some(v) => v,
-                None => continue, // キャッシュ未読み込みは Undo 対象外 (希少ケース)
+            let Some(before) = self.tags_cache.get(&key).cloned() else {
+                continue; // キャッシュ未読み込みは Undo 対象外 (希少ケース)
             };
             let after = after_for(&before);
+            // 楽観的キャッシュ更新: 連続トグルでも次の capture が正しい before を見られるように。
+            self.tags_cache.insert(key, after.clone());
             changes.push(TagChange {
                 path: p.clone(),
                 before,

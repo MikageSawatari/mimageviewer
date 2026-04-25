@@ -402,6 +402,18 @@ mod tests {
     }
 
     #[test]
+    fn toast_restore_with_noop_does_not_say_clear() {
+        // Codex P3 回帰: 部分的に NoOp が混じった Restore でも「元に戻した」を
+        // 専用文言として優先する (誤って「mIV タグをクリア」にならない)。
+        // 現状 worker は SetTags を必ず Restored 扱いにするため `noop=0` のはずだが、
+        // 将来 NoOp が混ざるロジックに変えても文言が壊れないように回帰テストを置く。
+        assert_eq!(
+            format_completion_toast(None, 0, 0, 0, 3, 2),
+            "3 件のタグを元に戻しました"
+        );
+    }
+
+    #[test]
     fn recognizes_jpeg_png_webp() {
         assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
             "a.jpg"

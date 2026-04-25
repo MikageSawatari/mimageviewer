@@ -304,15 +304,15 @@ fn process_job(
             (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp })
         }
         TagJobKind::SetTags(target) => {
+            // Codex P3: SetTags は Undo/Redo 経路でしか使わないので、disk が既に target に
+            // 一致していても (変化ゼロでも) `Restored` を返す。`NoOp` を返すと
+            // tag_ops の `format_completion_toast` で「mIV タグをクリア」誤表示になるため。
             let current = crate::xmp_reader::read_dc_subject(&job.path);
             let changed = current != *target;
             crate::logger::log(format!(
                 "[TAG] worker: SetTags current={current:?} target={target:?} (changed={changed}) | {path_disp}"
             ));
-            (
-                TagOp::Set(target.clone()),
-                if changed { TagAction::Restored } else { TagAction::NoOp },
-            )
+            (TagOp::Set(target.clone()), TagAction::Restored)
         }
     };
 
