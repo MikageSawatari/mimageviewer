@@ -542,7 +542,8 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 
 - [x] **Ctrl+G グローバルメタ検索** — お気に入り全体を Tantivy + bigram で横断検索
 - [x] Tantivy 0.26 + NgramTokenizer(2,2) + LowerCaser
-- [x] 二段整合性プロトコル (`fts_meta.db` status=pending → Tantivy commit → mark_ok)
+- [x] Tantivy First 書き込み順序 (Tantivy commit + reader reload 成功後に
+      `fts_meta.db` を `upsert_meta_ok` / `delete_paths` で更新, INDEX_VERSION=6)
 - [x] Searcher snapshot 固定 + ページング取得 (`TopDocs::with_limit(500).and_offset()`)
 - [x] post-filter で phrase / NOT / AND を正確判定 (bigram だけでは position=0 で不正確なため)
 - [x] HARD_MAX=10,000 で打ち切り (streaming で逐次表示、最初のページは ~5ms)
@@ -551,7 +552,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
 - [x] お気に入り編集 / 追加ダイアログに 3 つのチェックボックス + 一括 ON/OFF
 - [x] FsWatcher (notify-rs ReadDirectoryChangesW) + 500ms debounce
-- [x] Walker (3-way diff) + IngestSession (二段コミット) + IndexerSupervisor (統括)
+- [x] Walker (3-way diff) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
 - [x] 起動時 reconciliation (status != ok の残留行を整理)
 - [x] `GlobalIoSemaphore` で UI 優先度制御 (Low/Normal/High)
 - [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み
