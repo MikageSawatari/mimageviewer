@@ -112,11 +112,14 @@ impl<'a> IngestSession<'a> {
 
     /// Walker の結果を適用する。
     ///
-    /// - `to_ingest` の各候補について、メタ抽出 → fts_meta.upsert_meta_ok → upsert (sub-batch 蓄積)
-    /// - `to_delete` の各 path について、Tantivy delete を sub-batch 蓄積し、commit 後に
-    ///   `fts_meta.delete_paths` で SQLite から物理削除
+    /// - `to_ingest` の各候補について、メタ抽出 → IndexDoc を `batch_upserts` に蓄積、
+    ///   `(path, kind, mtime, size)` を `pending_ok_meta` に蓄積
+    /// - `to_delete` の各 path について、Tantivy delete を `batch_deletes` に蓄積
     /// - sub-batch が `BATCH_FLUSH_COUNT` に達するか `BATCH_FLUSH_INTERVAL` 経過したら
-    ///   `dispatcher.batch(upserts, deletes, commit_after=true)` で submit する
+    ///   `dispatcher.batch(upserts, deletes, commit_after=true)` で submit
+    /// - **Tantivy commit + reader reload が成功したフレームでのみ** `fts_meta` を更新:
+    ///   `pending_ok_meta` を `upsert_meta_ok` (status=Ok) で書き、`batch_deletes` を
+    ///   `delete_paths` で物理削除
     /// - 各 sub-batch の境界で dispatcher が Interactive キュー (タグ書き込み等) を先に拾うため、
     ///   indexer の長時間 ingest 中もタグ操作は ~1 sub-batch (1〜2s) 以内に応答できる。
     ///

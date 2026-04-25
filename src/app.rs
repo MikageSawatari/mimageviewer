@@ -1220,8 +1220,9 @@ pub struct App {
     pub(crate) fav_add_auto_index_thumbs: bool,
 
     // ── 全文検索インデクサ (Ctrl+G グローバルメタ検索用) ────────────
-    // auto_index_metadata=true のお気に入り毎に Supervisor を持ち、
-    // Tantivy + fts_meta.db の二段整合性で運用する。
+    // auto_index_metadata=true のお気に入り毎に Supervisor を持ち、Tantivy index
+    // + fts_meta 管理メタを Tantivy First 順序 (commit + reload 成功後に SQLite
+    // を同期更新) で運用する。
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 

@@ -1,17 +1,18 @@
 //! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割 (INDEX_VERSION=5)
+//! ## 役割 (INDEX_VERSION=6)
 //!
 //! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像メタを転置索引化
-//! - `fts_meta.db` と二段整合性を組み、Ctrl+G の候補絞り込みに使う
-//! - **post-filter 用の正規化済み原文を STORED で保持する**。INDEX_VERSION=5 で
-//!   `fts_meta.db` の `*_norm` 列群 (合計数 GB 規模になりうる) を撤去し、bigram 索引と
-//!   原文の両方を Tantivy 側 (`*_text` フィールドの STORED) に集約した。`fts_meta.db` は
-//!   ファイル単位の管理メタ (status / mtime / size / generation) のみを持つ。
-//! - 検索 worker は `searcher.doc(addr)` で STORED 原文を取り出して post-filter に渡す
-//!   (`doc_text_for_target` ヘルパ参照)
+//! - **検索原文 (post-filter 用) を STORED で保持する**。`*_text` フィールドが bigram
+//!   索引 + STORED 原文の両方を担い、`fts_meta.db` は管理メタ (path / mtime / size /
+//!   status=Ok|Failed / index_generation) のみを持つ
+//! - Ctrl+G 候補絞り込み + 検索 worker の post-filter (`doc_text_for_target` で
+//!   STORED 原文を引き、`search_query::matches_with_mode` で AND/OR/phrase/NOT 判定)
+//! - **書き込み順序**: ingest_worker / tag_write_worker は `IndexDoc` を Tantivy に
+//!   投入 → batch commit + reader reload に成功したフレームでのみ `fts_meta` を更新
+//!   する (Tantivy First)。詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
-//! ## スキーマ (INDEX_VERSION=5)
+//! ## スキーマ (INDEX_VERSION=6)
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み
@@ -43,8 +44,8 @@
 //! 検索ワーカーは `FtsIndex::searcher()` を 1 回だけ取得し、ページング中はそれを使い回す。
 //! これで ingest 側が commit して reader reload しても、検索中の snapshot はズレない。
 //! ただし ingest worker 側は commit 後に同期 reload を要求する (`reload_after_commit=true`)。
-//! これにより `mark_ok` 直後の検索は確実に新 snapshot を見える状態になっており、
-//! INDEX_VERSION=5 で原文を Tantivy 側に集約したことによる post-filter 偽陽性を回避する。
+//! これにより新規 ingest 完了直後の検索は確実に新 snapshot を見えており、STORED 原文
+//! の post-filter で偽陽性 (古い原文が新 doc にマッチ) が起きないようにしている。
 
 use std::path::Path;
 

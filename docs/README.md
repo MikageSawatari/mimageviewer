@@ -36,7 +36,7 @@
 | [bench-scroll-report.md](bench-scroll-report.md) | スクロール性能ベンチマーク結果 |
 | [perf-investigation-handoff.md](perf-investigation-handoff.md) | パフォーマンス調査の進行中メモ (AI アップスケール優先度 / スクロール中の重複エンキュー抑制) |
 | [plan-v0.7.0.md](plan-v0.7.0.md) | v0.7.0 実装計画 + 完了ステータス + リリース直前チェックリスト |
-| [search-expansion-design.md](search-expansion-design.md) | 検索システムの仕様選択理由と詳細設計 (Tantivy スキーマ・二段整合性・ZIP ingest 負荷制御・UI drill-down・streaming プロトコル) |
+| [search-expansion-design.md](search-expansion-design.md) | 検索システムの仕様選択理由と背景資料 (Tantivy スキーマ・ZIP ingest 負荷制御・UI drill-down・streaming プロトコル)。**v5 までの旧設計 (二段整合性 / SQLite 内 norms) を含む** — 現行 v6 設計は [search-architecture.md](search-architecture.md) §4.2 を参照 |
 | [search-bench-results.md](search-bench-results.md) | Tantivy + bigram プロトタイプ計測結果 (50 万件規模まで) |
 | [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 |
 | [tag-feature.md](tag-feature.md) | ハッシュタグ型タグ機能 (`dc:subject` に `#タグ` 書き込み + Ctrl+G 連携) の設計ドキュメント |
