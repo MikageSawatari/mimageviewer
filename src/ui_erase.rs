@@ -168,6 +168,7 @@ impl App {
         self.erase_vectors.clear();
         self.erase_selected_vector = None;
         self.erase_vector_drag = None;
+        self.erase_pan_drag_start = None;
     }
 
     // ── Undo / Slot ────────────────────────────────────────────────
@@ -819,6 +820,7 @@ impl App {
         let primary_released = ctx.input(|i| i.pointer.primary_released());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.erase_paint_mode;
+        let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
 
         // パネル上のクリックはツール操作に使わない
         let panel_rect = self.erase_panel_rect(full_rect);
@@ -826,6 +828,41 @@ impl App {
             if panel_rect.contains(pos) {
                 return;
             }
+        }
+
+        // ── Space+ドラッグ: 一時パン (Photoshop 流) ─────────────────
+        // 描画ドラッグ進行中は Space を無視し、現在の描画を最後まで完結させる。
+        // (途中で Space 検知 → パンに切替するとマスクが中途半端に確定するため)
+        let drawing_in_progress = self.erase_last_paint_pos.is_some()
+            || self.erase_line_start.is_some()
+            || self.erase_shift_drag.is_some()
+            || self.erase_vector_drag.is_some()
+            || !self.erase_lasso_points.is_empty();
+        if space_held && !drawing_in_progress {
+            if primary_pressed {
+                if let Some(pos) = pointer_pos {
+                    self.erase_pan_drag_start = Some((pos, self.fs_pan));
+                }
+            } else if primary_down {
+                if let Some((start_pos, start_pan)) = self.erase_pan_drag_start {
+                    if let Some(pos) = pointer_pos {
+                        self.fs_pan = start_pan + (pos - start_pos);
+                    }
+                }
+            }
+            if primary_released {
+                self.erase_pan_drag_start = None;
+            }
+            ctx.set_cursor_icon(if primary_down {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+            return;
+        }
+        // Space 離した瞬間の取りこぼし対策: 描画パスへ戻る前に pan drag を片付ける。
+        if !space_held && self.erase_pan_drag_start.is_some() {
+            self.erase_pan_drag_start = None;
         }
 
         // 修飾キーは Ctrl で統一: [/] キーは Shift+ が論理キー {/} に化ける制約があり
@@ -1751,6 +1788,7 @@ impl App {
                 // ── ヘルプテキスト ──
                 let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
                     矢印:シフト [/]:回転 (Ctrl:10倍)\n\
+                    Space+ドラッグ:パン操作\n\
                     Ctrl+ドラッグ: 筆/直線→太さ\n\
                     \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
                     選択ツール+クリック=選択  Del:削除";

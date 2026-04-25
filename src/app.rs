@@ -1834,6 +1834,10 @@ pub struct App {
     /// 完了 (もしくは新規投入) で `take()` する。UI スレッドが MI-GAN 推論
     /// (300-500ms) で固まらないようにするための非同期化エントリ。
     pub(crate) erase_inpaint_pending: Option<crate::ui_erase::EraseInpaintPending>,
+    /// 消しゴムモード中の Space+ドラッグパン状態。`Some(start_pos, start_pan)` で
+    /// ドラッグ追従、release で None。フルスクリーンの `fs_pan_drag_start` と区別する
+    /// (描画パスとパン経路の入口が別れているため、混同を避ける目的)。
+    pub(crate) erase_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
 
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
@@ -2250,6 +2254,7 @@ impl Default for App {
             erase_selected_vector: None,
             erase_vector_drag: None,
             erase_inpaint_pending: None,
+            erase_pan_drag_start: None,
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
