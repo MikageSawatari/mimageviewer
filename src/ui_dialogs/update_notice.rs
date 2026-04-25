@@ -20,6 +20,7 @@ impl App {
         let mut open_release_page = false;
         let mut dismiss_this_version = false;
         let info = self.update_info.clone();
+        let error = self.update_check_error.clone();
         egui::Window::new("バージョン情報")
             .open(&mut open)
             .collapsible(false)
@@ -29,6 +30,22 @@ impl App {
             .default_height(360.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+                // 直近 manual チェックがエラーなら最上部にバナーで表示。
+                // (既知の update_info は維持されるので、その下に通常表示が続く)
+                if let Some(ref e) = error {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ 更新確認に失敗しました: {e}"))
+                            .color(egui::Color32::from_rgb(220, 120, 120)),
+                    );
+                    ui.label(
+                        egui::RichText::new("ネットワーク接続を確認してください。")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(180)),
+                    );
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                }
                 if let Some(ref info) = info {
                     ui.heading(if info.is_newer {
                         "新しいバージョンがあります"
@@ -99,16 +116,14 @@ impl App {
                         }
                     });
                 } else {
-                    // チェック失敗 (manual で開いたケース)
+                    // 既知の update_info も無く、初回 manual チェックも失敗したケース。
+                    ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new("更新確認に失敗しました")
-                            .color(egui::Color32::from_rgb(220, 120, 120)),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new("ネットワーク接続を確認してください。")
-                            .size(12.0)
-                            .color(egui::Color32::from_gray(180)),
+                        egui::RichText::new(format!(
+                            "現在のバージョン: v{}",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(12.0),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -137,6 +152,8 @@ impl App {
         }
         if close || !open || escape_pressed {
             self.show_update_dialog = false;
+            // 一度見せたエラーは消す (次回の manual で再評価)。
+            self.update_check_error = None;
         }
     }
 }

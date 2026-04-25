@@ -186,11 +186,17 @@ fn apply_count(g: &mut Inner, current: u64, total: u64) {
         g.count = None;
         return;
     }
-    match g.count.as_mut() {
-        Some(c) if c.total == total => c.update(current, total),
-        _ => {
-            g.count = Some(CountState::new(current, total));
-        }
+    // phase 切替検出: total 変化 OR current の逆行 (= 新フェーズが小さい current で
+    // 始まる) の両方で sample buffer をリセット。delete (1..N) → ingest (1..N) で
+    // 同じ N でも、current が N → 1 に逆行するので新フェーズと判別できる (Codex P3)。
+    let need_reset = match g.count.as_ref() {
+        Some(c) => c.total != total || current < c.current,
+        None => true,
+    };
+    if need_reset {
+        g.count = Some(CountState::new(current, total));
+    } else if let Some(c) = g.count.as_mut() {
+        c.update(current, total);
     }
 }
 
@@ -260,6 +266,23 @@ mod tests {
         assert!(r.snapshot_eta().is_some());
         r.set_count(0, 0);
         assert!(r.snapshot_eta().is_none());
+    }
+
+    #[test]
+    fn count_current_decrease_resets_samples() {
+        // delete phase で N 件ぶん溜めて、ingest phase が同じ total で current=1 に
+        // 戻ると新 phase 扱いで sample buffer がリセットされる。
+        let r = ProgressReporter::new();
+        r.set_count(10, 100);
+        sleep(Duration::from_millis(20));
+        r.set_count(50, 100);
+        // ここまでで 2 サンプル溜まり ETA 算出可
+        assert!(r.snapshot_eta().unwrap().remaining_secs.is_some());
+        // ingest 開始 (同じ total, current 逆行) → reset
+        r.set_count(1, 100);
+        let eta = r.snapshot_eta().unwrap();
+        assert_eq!(eta.current, 1);
+        assert_eq!(eta.remaining_secs, None);
     }
 
     #[test]

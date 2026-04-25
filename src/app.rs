@@ -1862,6 +1862,9 @@ pub struct App {
     pub(crate) update_check_pending: Option<UpdateCheckPending>,
     /// 直近の正常な更新チェック結果。`is_newer=true` の間は通知バッジを表示する。
     pub(crate) update_info: Option<crate::update_check::UpdateInfo>,
+    /// 直近の manual チェックで失敗したエラーメッセージ (Some の間は失敗ダイアログを開く)。
+    /// 既知の `update_info` をクリアしないために別フィールドにしている (Codex P3)。
+    pub(crate) update_check_error: Option<String>,
     /// 最後にチェックを spawn した時刻。`UPDATE_CHECK_INTERVAL` 経過で再 spawn。
     pub(crate) update_check_last_spawn: Option<std::time::Instant>,
     /// 「新バージョンがあります」ダイアログを表示中か (バッジクリックで開く)。
@@ -2247,6 +2250,7 @@ impl Default for App {
             show_tray_enabled_notice: false,
             update_check_pending: None,
             update_info: None,
+            update_check_error: None,
             update_check_last_spawn: None,
             show_update_dialog: false,
             main_hwnd: None,
@@ -2962,6 +2966,7 @@ impl App {
                 let is_newer = info.is_newer;
                 let tag = info.latest_tag.clone();
                 self.update_info = Some(info);
+                self.update_check_error = None;
                 if pending.manual {
                     self.show_update_dialog = true;
                 } else if is_newer {
@@ -2971,7 +2976,9 @@ impl App {
             Err(e) => {
                 crate::logger::log(format!("update_check: failed: {e}"));
                 if pending.manual {
-                    self.update_info = None;
+                    // 既知の update_info はクリアしない (バッジを消さない)。
+                    // 失敗ダイアログでは update_check_error を見て分岐する。
+                    self.update_check_error = Some(e);
                     self.show_update_dialog = true;
                 }
             }
@@ -11642,6 +11649,11 @@ impl eframe::App for App {
         // バージョン更新通知: 起動完了後の初回 + 24h 周期で auto kick。
         self.maybe_auto_update_check();
         self.poll_update_check();
+        // worker の結果を取りこぼさないよう、pending 中はアイドルでも repaint を要求。
+        // 通常 update() はマウス操作等が無いと走らないため (Codex P2)。
+        if self.update_check_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
 
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。

@@ -160,18 +160,30 @@ impl FtsMetaDb {
                 "fts_meta: running one-shot VACUUM (housekeeping {HOUSEKEEPING_VERSION}, file size {before} bytes)"
             ));
             // VACUUM は重いので時間を測ってログに残す (数 GB で数分かかりうる)。
+            // 失敗 (ディスク不足 / 排他ロック等) は non-fatal: 索引初期化を破綻させない。
+            // marker (application_id) は成功時のみ書く → 次回起動でリトライされる。
             let t = std::time::Instant::now();
-            conn.execute_batch("VACUUM;")?;
-            let elapsed = t.elapsed();
-            let after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-            conn.execute_batch(&format!("PRAGMA application_id = {HOUSEKEEPING_VERSION};"))?;
-            crate::logger::log(format!(
-                "fts_meta: VACUUM done in {:?} ({} → {} bytes, reclaimed {} bytes)",
-                elapsed,
-                before,
-                after,
-                before.saturating_sub(after)
-            ));
+            match conn.execute_batch("VACUUM;") {
+                Ok(()) => {
+                    let elapsed = t.elapsed();
+                    let after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+                    conn.execute_batch(&format!(
+                        "PRAGMA application_id = {HOUSEKEEPING_VERSION};"
+                    ))?;
+                    crate::logger::log(format!(
+                        "fts_meta: VACUUM done in {:?} ({} → {} bytes, reclaimed {} bytes)",
+                        elapsed,
+                        before,
+                        after,
+                        before.saturating_sub(after)
+                    ));
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "fts_meta: VACUUM failed (non-fatal, will retry next launch): {e}"
+                    ));
+                }
+            }
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -877,6 +889,43 @@ mod tests {
         let statuses: Vec<_> = not_ok.iter().map(|m| m.status).collect();
         assert!(statuses.contains(&FileStatus::Pending));
         assert!(statuses.contains(&FileStatus::Failed));
+    }
+
+    #[test]
+    fn count_ok_grouped_by_favorite_returns_only_ok() {
+        let (_tmp, db) = tmp_db();
+        let fav_a = Uuid::new_v4();
+        let fav_b = Uuid::new_v4();
+        let root_a = PathBuf::from("C:/a");
+        let root_b = PathBuf::from("C:/b");
+        // fav_a: 2 ok, 1 pending, 1 failed
+        for i in 1..=4 {
+            db.mark_pending(
+                &format!("c:/a/{i}.jpg"),
+                fav_a,
+                &root_a,
+                IndexKind::Image,
+                i,
+                i,
+            )
+            .unwrap();
+        }
+        db.mark_ok(&["c:/a/1.jpg".to_string(), "c:/a/2.jpg".to_string()])
+            .unwrap();
+        db.mark_failed("c:/a/3.jpg").unwrap();
+        // fav_b: 1 ok
+        db.mark_pending("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1)
+            .unwrap();
+        db.mark_ok(&["c:/b/1.jpg".to_string()]).unwrap();
+        // fav 無し (= 全 pending) → グループに現れないこと
+        let fav_c = Uuid::new_v4();
+        db.mark_pending("c:/c/1.jpg", fav_c, &PathBuf::from("C:/c"), IndexKind::Image, 1, 1)
+            .unwrap();
+
+        let counts = db.count_ok_grouped_by_favorite().unwrap();
+        assert_eq!(counts.get(&fav_a), Some(&2));
+        assert_eq!(counts.get(&fav_b), Some(&1));
+        assert!(!counts.contains_key(&fav_c), "fav_c は ok 0 件なのでキー出ない");
     }
 
     #[test]

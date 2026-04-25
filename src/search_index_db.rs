@@ -638,6 +638,35 @@ mod tests {
     }
 
     #[test]
+    fn count_grouped_by_favorite_root_returns_per_fav_counts() {
+        let db = open_mem();
+        let fav_a = PathBuf::from(r"C:\FavA");
+        let fav_b = PathBuf::from(r"C:\FavB");
+        db.upsert_children(
+            &fav_a,
+            &PathBuf::from(r"C:\FavA"),
+            &[
+                entry(r"C:\FavA\one", "one", IndexKind::Folder),
+                entry(r"C:\FavA\two.zip", "two.zip", IndexKind::ZipFile),
+                entry(r"C:\FavA\three.pdf", "three.pdf", IndexKind::PdfFile),
+            ],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav_b,
+            &PathBuf::from(r"C:\FavB"),
+            &[entry(r"C:\FavB\only", "only", IndexKind::Folder)],
+        )
+        .unwrap();
+
+        let counts = db.count_grouped_by_favorite_root().unwrap();
+        let key_a = normalize_path(&fav_a);
+        let key_b = normalize_path(&fav_b);
+        assert_eq!(counts.get(&key_a), Some(&3));
+        assert_eq!(counts.get(&key_b), Some(&1));
+    }
+
+    #[test]
     fn upsert_and_search() {
         let db = open_mem();
         let fav = PathBuf::from(r"C:\Fav");
