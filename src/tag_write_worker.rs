@@ -40,6 +40,10 @@ pub enum TagJobKind {
     Toggle(String),
     /// `#` で始まる全 Bag 要素を削除。
     ClearMiv,
+    /// `dc:subject` を指定リストで完全置換する。Undo/Redo で「操作直前の状態」に
+    /// 戻すために使う。Toggle の逆操作だと外部ツールでの書き換え後にズレるが、
+    /// この置換ジョブなら mIV が記録した状態へ確実に戻せる。
+    SetTags(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +55,7 @@ pub struct TagWriteJob {
     pub favorite_id: Option<Uuid>,
 }
 
-/// `Toggle` / `ClearMiv` が実際に何をしたかを UI に返すためのラベル。
+/// `Toggle` / `ClearMiv` / `SetTags` が実際に何をしたかを UI に返すためのラベル。
 /// 完了トーストで「付与 / 削除」の実際値を見せるのに使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagAction {
@@ -61,6 +65,8 @@ pub enum TagAction {
     Removed,
     /// ClearMiv: `#` 始まりの要素をまとめて削除した (1 件以上の削除が発生)。
     Cleared,
+    /// SetTags: Undo/Redo による状態復元で `dc:subject` を置き換えた。
+    Restored,
     /// 実質変化なし (clear した時に元々空だったケース等)。
     NoOp,
 }
@@ -297,6 +303,17 @@ fn process_job(
             ));
             (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp })
         }
+        TagJobKind::SetTags(target) => {
+            let current = crate::xmp_reader::read_dc_subject(&job.path);
+            let changed = current != *target;
+            crate::logger::log(format!(
+                "[TAG] worker: SetTags current={current:?} target={target:?} (changed={changed}) | {path_disp}"
+            ));
+            (
+                TagOp::Set(target.clone()),
+                if changed { TagAction::Restored } else { TagAction::NoOp },
+            )
+        }
     };
 
     let new_tags = match crate::xmp_writer::apply_tag_op(&job.path, &op) {
@@ -390,8 +407,10 @@ mod tests {
     fn job_kinds_clone() {
         let j1 = TagJobKind::Toggle("tag".into());
         let j2 = TagJobKind::ClearMiv;
+        let j3 = TagJobKind::SetTags(vec!["#a".into(), "#b".into()]);
         assert!(matches!(j1.clone(), TagJobKind::Toggle(_)));
         assert!(matches!(j2.clone(), TagJobKind::ClearMiv));
+        assert!(matches!(j3.clone(), TagJobKind::SetTags(_)));
     }
 
     /// `is_busy()` は `pending_in_writer > 0` も busy 扱いにする。

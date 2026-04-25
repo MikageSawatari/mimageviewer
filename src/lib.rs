@@ -52,6 +52,7 @@ pub mod sys_memory;
 pub mod rating_write_worker;
 pub mod tag_write_worker;
 pub mod thumb_loader;
+pub mod undo_stack;
 pub mod ui_helpers;
 pub mod ui_susie_diagnostic;
 pub mod wic_decoder;

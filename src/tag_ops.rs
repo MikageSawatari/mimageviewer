@@ -76,7 +76,25 @@ impl App {
             self.fullscreen_idx,
             self.checked.len(),
         ));
-        self.submit_tag_jobs("toggle", move |_| TagJobKind::Toggle(name_owned.clone()));
+        // Undo 用 snapshot: 各 path の現状 dc:subject (tags_cache) を before として記録し、
+        // after は worker と同じロジック (Toggle = Add or Remove) を tags_cache 値に適用して導出。
+        // tags_cache は grid 表示で既に warm 済みなので追加 I/O は発生しない。
+        let paths = self.tag_target_paths();
+        let with_hash = format!("#{name_owned}");
+        let summary = format!("#{name_owned} のトグル");
+        self.capture_tag_undo(&paths, summary, |before| {
+            if before.iter().any(|t| t == &with_hash) {
+                before.iter().filter(|t| *t != &with_hash).cloned().collect()
+            } else {
+                let mut after = before.to_vec();
+                after.push(with_hash.clone());
+                after
+            }
+        });
+        let name_for_jobs = name_owned;
+        self.submit_tag_jobs("toggle", move |_| {
+            TagJobKind::Toggle(name_for_jobs.clone())
+        });
     }
 
     pub(crate) fn request_tag_clear_for_selection(&mut self) {
@@ -92,6 +110,15 @@ impl App {
         crate::logger::log(format!(
             "[TAG] clear requested for {count} file(s) (mIV tags only)"
         ));
+        // Undo 用: ClearMiv 後の dc:subject は `#` 始まり要素を除いたものになる。
+        let summary = format!("{count} 件の mIV タグをクリア");
+        self.capture_tag_undo(&paths, summary, |before| {
+            before
+                .iter()
+                .filter(|t| !t.starts_with('#'))
+                .cloned()
+                .collect()
+        });
         self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
         self.submit_tag_jobs("clear", |_| TagJobKind::ClearMiv);
     }
@@ -141,7 +168,7 @@ impl App {
         }
     }
 
-    fn ensure_tag_write_handle(&mut self) {
+    pub(crate) fn ensure_tag_write_handle(&mut self) {
         if self.tag_write_handle.is_some() {
             return;
         }
@@ -174,6 +201,7 @@ impl App {
         let mut added = 0usize;
         let mut removed = 0usize;
         let mut cleared = 0usize;
+        let mut restored = 0usize;
         let mut noop = 0usize;
         let mut just_completed = false;
         // worker が返してきた (path, 書き込み後タグ列) を後でまとめて tags_cache に反映する。
@@ -198,6 +226,12 @@ impl App {
                                 cleared += 1;
                                 crate::logger::log(format!(
                                     "[TAG]   ✓ cleared mIV tags → {path_disp}"
+                                ));
+                            }
+                            TagAction::Restored => {
+                                restored += 1;
+                                crate::logger::log(format!(
+                                    "[TAG]   ✓ restored dc:subject (undo/redo) → {path_disp}"
                                 ));
                             }
                             TagAction::NoOp => {
@@ -228,7 +262,7 @@ impl App {
         if just_completed {
             crate::logger::log(format!(
                 "[TAG] batch complete: added={added} removed={removed} cleared={cleared} \
-                 noop={noop} errors={}",
+                 restored={restored} noop={noop} errors={}",
                 errors.len()
             ));
         }
@@ -250,9 +284,16 @@ impl App {
                 errors.len(),
                 preview
             ));
-        } else if just_completed && (added + removed + cleared + noop) > 0 {
+        } else if just_completed && (added + removed + cleared + restored + noop) > 0 {
             let label = self.tag_toast_label.take();
-            let msg = format_completion_toast(label.as_deref(), added, removed, cleared, noop);
+            let msg = format_completion_toast(
+                label.as_deref(),
+                added,
+                removed,
+                cleared,
+                restored,
+                noop,
+            );
             self.show_feedback_toast(msg);
         }
         if just_completed {
@@ -265,13 +306,18 @@ impl App {
 
 /// 完了トーストの文言を組み立てる。Toggle で付与/削除が混在するケース (複数選択で
 /// 既に付与済のものと未付与のものが混ざる) にも耐える形式で出す。
+/// Undo/Redo 由来の SetTags (=`restored`) が混ざる場合は専用文言で出す。
 fn format_completion_toast(
     tag_label: Option<&str>,
     added: usize,
     removed: usize,
     cleared: usize,
+    restored: usize,
     noop: usize,
 ) -> String {
+    if restored > 0 {
+        return format!("{restored} 件のタグを元に戻しました");
+    }
     if cleared > 0 || (noop > 0 && added == 0 && removed == 0) {
         let total_clear = cleared + noop;
         return format!("{total_clear} 件から mIV タグをクリア");
@@ -286,7 +332,8 @@ fn format_completion_toast(
 
 /// 指定 path を含むお気に入りの id を返す (子孫も一致扱い)。
 /// Windows の大文字小文字非区別に対応するため `is_under` で正規化比較する。
-fn find_favorite_id(
+/// `undo_ops.rs` の Undo/Redo タグ復元ジョブからも使うため `pub(crate)`。
+pub(crate) fn find_favorite_id(
     favorites: &[crate::settings::FavoriteEntry],
     path: &Path,
 ) -> Option<uuid::Uuid> {
@@ -305,7 +352,7 @@ mod tests {
     #[test]
     fn toast_single_add() {
         assert_eq!(
-            format_completion_toast(Some("#ドール"), 1, 0, 0, 0),
+            format_completion_toast(Some("#ドール"), 1, 0, 0, 0, 0),
             "1 件に #ドール を付与"
         );
     }
@@ -313,7 +360,7 @@ mod tests {
     #[test]
     fn toast_single_remove() {
         assert_eq!(
-            format_completion_toast(Some("#ドール"), 0, 1, 0, 0),
+            format_completion_toast(Some("#ドール"), 0, 1, 0, 0, 0),
             "1 件から #ドール を削除"
         );
     }
@@ -321,7 +368,7 @@ mod tests {
     #[test]
     fn toast_mixed_add_remove() {
         assert_eq!(
-            format_completion_toast(Some("#tag"), 2, 3, 0, 0),
+            format_completion_toast(Some("#tag"), 2, 3, 0, 0, 0),
             "#tag: 2 件付与 / 3 件削除"
         );
     }
@@ -329,7 +376,7 @@ mod tests {
     #[test]
     fn toast_clear_miv() {
         assert_eq!(
-            format_completion_toast(None, 0, 0, 5, 0),
+            format_completion_toast(None, 0, 0, 5, 0, 0),
             "5 件から mIV タグをクリア"
         );
     }
@@ -337,8 +384,17 @@ mod tests {
     #[test]
     fn toast_clear_miv_with_noop() {
         assert_eq!(
-            format_completion_toast(None, 0, 0, 3, 2),
+            format_completion_toast(None, 0, 0, 3, 0, 2),
             "5 件から mIV タグをクリア"
+        );
+    }
+
+    #[test]
+    fn toast_restore_for_undo() {
+        // Undo/Redo の SetTags は専用文言。タグラベルや add/remove 件数より優先される。
+        assert_eq!(
+            format_completion_toast(None, 0, 0, 0, 4, 0),
+            "4 件のタグを元に戻しました"
         );
     }
 

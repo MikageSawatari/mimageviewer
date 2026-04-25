@@ -127,6 +127,9 @@ pub enum TagOp {
     Remove(String),
     /// `#` で始まる全要素を削除 (他タグは保持)。
     ClearMiv,
+    /// `dc:subject` を指定リストで完全置換する (既存要素は全て破棄)。
+    /// Undo/Redo で「操作直前の状態」に戻すために使う。
+    Set(Vec<String>),
 }
 
 /// 指定ファイルに対してタグ操作を適用する。アトミック書き込み + 既存メタ保持。
@@ -425,6 +428,15 @@ fn apply_op_to_list(list: &mut Vec<String>, op: &TagOp) -> bool {
             let before = list.len();
             list.retain(|t| !t.starts_with('#'));
             list.len() != before
+        }
+        TagOp::Set(new_tags) => {
+            if list.as_slice() == new_tags.as_slice() {
+                false
+            } else {
+                list.clear();
+                list.extend(new_tags.iter().cloned());
+                true
+            }
         }
     }
 }
@@ -1305,6 +1317,30 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("<rdf:li>Existing</rdf:li>"));
         assert!(!tags.contains("Existing"));
+    }
+
+    #[test]
+    fn set_tags_replaces_dc_subject_for_undo() {
+        // Undo/Redo の SetTags: dc:subject を完全置換する。既存要素は破棄。
+        let xmp = sample_xmp_with_subject();
+        let target = vec!["#風景".to_string(), "Author".to_string()];
+        let (out, tags) =
+            edit_xmp_packet(&xmp, &TagOp::Set(target.clone())).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("<rdf:li>Existing</rdf:li>"), "既存タグは消える: {s}");
+        assert!(s.contains("<rdf:li>#風景</rdf:li>"), "{s}");
+        assert!(s.contains("<rdf:li>Author</rdf:li>"), "{s}");
+        assert!(tags.contains("#風景"));
+        assert!(tags.contains("Author"));
+    }
+
+    #[test]
+    fn set_tags_to_empty_clears_all() {
+        let xmp = sample_xmp_with_subject();
+        let (out, tags) = edit_xmp_packet(&xmp, &TagOp::Set(vec![])).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("<rdf:li>"), "全タグが消える: {s}");
+        assert!(tags.is_empty(), "tags column 空: {tags:?}");
     }
 
     #[test]

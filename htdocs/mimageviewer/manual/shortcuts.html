@@ -116,6 +116,30 @@
       </table>
     </div>
 
+    <h3>Undo / Redo</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>直前のレーティング / タグ操作を取り消す（最大 50 回まで）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>取り消しをやり直す</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <ul>
+          <li>取り消し対象は <strong>レーティング（★1〜5、解除、コンテナ★）</strong> と
+          <strong>タグ（付与・削除・mIV タグの一括クリア）</strong> のみです。ファイル削除や移動は対象外です。</li>
+          <li>10 枚に <kbd>F3</kbd> で一括★3 → <kbd>Ctrl</kbd>+<kbd>Z</kbd> 1 回で 10 枚すべてが元に戻ります。</li>
+          <li>フォルダを移動した時、フルスクリーンに入った/出た時、フルスクリーン中に画像を切り替えた時には Undo 履歴がクリアされます（混乱防止のため、現在のページ単位で履歴を保持します）。</li>
+        </ul>
+      </div>
+    </div>
+
     <h3>画像補正</h3>
     <div class="table-wrap">
       <table>
@@ -205,6 +229,7 @@
           <tr><td><kbd>F6</kbd></td><td>レーティングを解除</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd></td><td>今見ている画像が入っているフォルダ / ZIP / PDF 本体にコンテナ★を付与</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>F6</kbd></td><td>コンテナ★を解除</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>レーティング / タグ操作を取り消す / やり直す（フルスクリーン中の画像切替で履歴はクリアされます）</td></tr>
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / マスクを確定して AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
           <tr><td><kbd>I</kbd> / <kbd>Tab</kbd></td><td>メタデータパネルの固定表示切り替え</td></tr>
           <tr><td><kbd>S</kbd></td><td>スライドショー 再生 / 停止</td></tr>

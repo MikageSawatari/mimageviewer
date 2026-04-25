@@ -1766,6 +1766,9 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
+    /// メタ操作 (レーティング / タグ) の Undo/Redo スタック。フォルダ移動・
+    /// フルスクリーン遷移・フルスクリーン中のページ移動でクリアされる。
+    pub(crate) meta_undo: crate::undo_stack::UndoStack,
     /// 直前の push_undo_snapshot 時刻。矢印/[/]キー連打時のスナップショット重複を抑制する
     /// (OS のキーリピートで毎フレーム full-bitmap clone が走るのを防ぐ)。
     pub(crate) erase_last_undo_at: Option<std::time::Instant>,
@@ -2121,6 +2124,7 @@ impl Default for App {
             erase_base_cache: std::collections::HashMap::new(),
             mask_db: crate::mask_db::MaskDb::open().ok(),
             erase_undo_stack: std::collections::VecDeque::new(),
+            meta_undo: crate::undo_stack::UndoStack::new(),
             erase_last_undo_at: None,
             erase_vectors: Vec::new(),
             erase_selected_vector: None,
@@ -2508,6 +2512,10 @@ impl App {
         }
 
         crate::logger::log(format!("=== load_folder: {} ===", path.display()));
+
+        // フォルダ移動でメタ操作の Undo/Redo スタックを破棄する (移動先で過去の
+        // レーティング操作を巻き戻すと UX が混乱するため)。
+        self.clear_meta_undo();
 
         // 外側の ZIP/PDF/フォルダを切り替えたので、ネスト ZIP バイト列キャッシュを破棄する。
         // これで古い外側アーカイブのバイト列が RAM に居残るのを防ぐ。
@@ -5993,6 +6001,10 @@ impl App {
                 }
             }
 
+            // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: メタ操作 (レーティング/タグ) Undo/Redo。
+            // 共通実装は undo_ops::handle_meta_undo_keys。
+            self.handle_meta_undo_keys(ctx);
+
             if enter {
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
@@ -6769,6 +6781,10 @@ impl App {
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
+        // フルスクリーン側ではページ単位 (= 1 ファイル/1 ページ) 操作中心になるため、
+        // グリッド側で積み上げた Undo は破棄する。フルスクリーン中の操作は新しい
+        // スタックで管理する (画像移動でさらにクリアされる)。
+        self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
         // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
         // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
@@ -7417,7 +7433,7 @@ impl App {
     }
 
     /// レーティング XMP 書き込み worker を必要なら起動する (遅延初期化)。
-    fn ensure_rating_write_handle(&mut self) {
+    pub(crate) fn ensure_rating_write_handle(&mut self) {
         if self.rating_write_handle.is_none() {
             self.rating_write_handle = Some(crate::rating_write_worker::RatingWriteHandle::spawn());
         }
@@ -7789,6 +7805,14 @@ impl App {
         }
         let stars = stars.min(5);
         let key = crate::adjustment_db::normalize_path(&folder);
+        // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
+        let before = self
+            .current_folder_rating_cache
+            .or_else(|| self.rating_db.as_ref().map(|db| db.get(&key)))
+            .unwrap_or(0);
+        if before != stars {
+            self.capture_container_rating_undo(before, stars);
+        }
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set(&key, stars);
         }
@@ -8133,6 +8157,25 @@ impl App {
         if targets.is_empty() {
             return;
         }
+        // Undo 用に「変更前 → 変更後」を 1 トランザクションでスナップショット。
+        // set_rating 内で rating_cache が書き換わるので、ここで before を確定させてから走らせる。
+        let mut undo_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
+        for &idx in &targets {
+            let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
+            undo_records.push((idx, before, stars));
+        }
+        let summary = if targets.len() > 1 {
+            if stars == 0 {
+                format!("★解除を {} 件に適用", targets.len())
+            } else {
+                format!("★{stars} を {} 件に付与", targets.len())
+            }
+        } else if stars == 0 {
+            "★解除".to_string()
+        } else {
+            format!("★{stars}")
+        };
+        self.capture_rating_undo(undo_records, summary);
         for &idx in &targets {
             self.set_rating(idx, stars);
         }
@@ -8738,6 +8781,8 @@ impl App {
         self.fullscreen_idx = None;
         // グリッドに戻るので Critical 予約を解除し、全 3 ワーカーを Normal に開放。
         crate::pdf_loader::set_critical_reservation(false);
+        // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
+        self.clear_meta_undo();
         self.slideshow_playing = false;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;

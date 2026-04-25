@@ -1370,6 +1370,16 @@ impl App {
             crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE)
         });
         if let Some(stars) = rating_key {
+            // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
+            let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
+            if before != stars {
+                let summary = if stars == 0 {
+                    "★解除".to_string()
+                } else {
+                    format!("★{stars}")
+                };
+                self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
+            }
             self.set_rating(fs_idx, stars);
             // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
             self.rebuild_visible_indices();
@@ -1390,6 +1400,10 @@ impl App {
         if key_f8 {
             self.apply_slot_in_viewing_mode(ctx, 2);
         }
+
+        // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: メタ操作 Undo/Redo (フルスクリーンでも有効)。
+        // 消しゴムモード中は ui_erase が先に Ctrl+Z を吸収する。
+        self.handle_meta_undo_keys(ctx);
 
         // 見開きモード切替 (1-5 キー)
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));

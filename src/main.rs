@@ -62,6 +62,8 @@ mod tag_prewarm;
 pub mod rating_write_worker;
 pub mod tag_write_worker;
 pub mod thumb_loader;
+mod undo_ops;
+pub mod undo_stack;
 pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;

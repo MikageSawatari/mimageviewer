@@ -120,6 +120,8 @@ mimageviewer/
 │   ├── gpu_info.rs          # GPU 情報取得（VRAM サイズ等）
 │   ├── monitor.rs           # モニター情報取得（DPI 等）
 │   ├── stats.rs             # 読み込み統計
+│   ├── undo_stack.rs        # メタ操作 (レーティング/タグ) Undo/Redo の純粋データ構造
+│   ├── undo_ops.rs          # 上記スタックを App に impl するファサード（apply_meta_undo/redo 等）
 │   ├── logger.rs            # パフォーマンス分析用ファイルロガー
 │   └── bin/
 │       └── bench_thumbs.rs  # サムネイル生成ベンチマーク
