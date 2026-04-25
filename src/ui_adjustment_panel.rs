@@ -958,21 +958,27 @@ impl App {
         }
 
         // ── アクションボタン処理 ──
+        // バルク系 (apply_all / clear_all) も capture_adjust_full で囲む — 数百ページの
+        // 個別設定を一括書き換えする操作だが、ヘルパーが 3 層全体の差分を取るので
+        // Vec<AdjustmentChange> として正しく記録される (Codex P2)。
         if apply_all_clicked {
             let params = self.effective_params(fs_idx).clone();
-            self.apply_params_to_all_pages(params);
+            self.capture_adjust_full("全画像に適用".to_string(), |app| {
+                app.apply_params_to_all_pages(params);
+            });
             self.show_feedback_toast("全画像に適用".to_string());
         }
         if clear_all_clicked {
-            self.clear_all_page_params();
+            self.capture_adjust_full("全画像の個別設定を削除".to_string(), |app| {
+                app.clear_all_page_params();
+            });
             self.show_feedback_toast("全画像の個別設定を削除".to_string());
         }
         if set_as_favorite_clicked {
             if let Some((fav_id, fav_name)) = fav_info.clone() {
                 let params = self.effective_params(fs_idx).clone();
                 let truncated = crate::ui_helpers::truncate_name(&fav_name, 10);
-                self.capture_adjust_around(
-                    crate::undo_stack::AdjustUndoScope::Favorite(fav_id),
+                self.capture_adjust_full(
                     format!("お気に入り「{}」の標準", truncated),
                     |app| app.set_favorite_default(fav_id, params),
                 );
@@ -982,8 +988,7 @@ impl App {
         if clear_favorite_clicked {
             if let Some((fav_id, fav_name)) = fav_info.clone() {
                 let truncated = crate::ui_helpers::truncate_name(&fav_name, 10);
-                self.capture_adjust_around(
-                    crate::undo_stack::AdjustUndoScope::Favorite(fav_id),
+                self.capture_adjust_full(
                     format!("お気に入り「{}」の標準を解除", truncated),
                     |app| app.clear_favorite_default(fav_id),
                 );
@@ -992,19 +997,15 @@ impl App {
         }
         if set_as_global_clicked {
             let params = self.effective_params(fs_idx).clone();
-            self.capture_adjust_around(
-                crate::undo_stack::AdjustUndoScope::Global,
-                "標準設定の更新".to_string(),
-                |app| app.copy_params_to_global(params),
-            );
+            self.capture_adjust_full("標準設定の更新".to_string(), |app| {
+                app.copy_params_to_global(params)
+            });
             self.show_feedback_toast("標準設定を更新".to_string());
         }
         if clear_page_clicked {
-            self.capture_adjust_around(
-                crate::undo_stack::AdjustUndoScope::Page(fs_idx),
-                "個別設定の解除".to_string(),
-                |app| app.clear_page_params(fs_idx),
-            );
+            self.capture_adjust_full("個別設定の解除".to_string(), |app| {
+                app.clear_page_params(fs_idx)
+            });
             self.show_feedback_toast("個別設定を解除".to_string());
         }
 
@@ -1018,8 +1019,7 @@ impl App {
             self.slot_save_dialog = Some((slot_idx, default_name));
         }
         if let Some(slot_idx) = load_from_slot {
-            self.capture_adjust_around(
-                crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+            self.capture_adjust_full(
                 format!(
                     "スロット{}を適用",
                     crate::adjustment::slot_key_label(slot_idx)

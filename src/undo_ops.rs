@@ -130,8 +130,13 @@ impl App {
                 self.submit_tag_restore_jobs(changes, /* use_before */ true);
             }
             UndoEntry::Adjustment { changes, .. } => {
-                for c in changes {
-                    self.apply_adjustment_change_to_app(c, /* use_before */ true);
+                // カスケード復元順序: Global → Favorite → Page
+                // (Page を先に書くと set_page_params の "matches default → prune" が
+                //  古い Favorite 標準で発火して entry が消える事故が起きる。Codex P1)
+                let mut order: Vec<usize> = (0..changes.len()).collect();
+                order.sort_by_key(|&i| adjust_scope_priority(&changes[i].scope));
+                for i in order {
+                    self.apply_adjustment_change_to_app(&changes[i], true);
                 }
             }
         }
@@ -158,8 +163,13 @@ impl App {
                 self.submit_tag_restore_jobs(changes, /* use_before */ false);
             }
             UndoEntry::Adjustment { changes, .. } => {
-                for c in changes {
-                    self.apply_adjustment_change_to_app(c, /* use_before */ false);
+                // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
+                let mut order: Vec<usize> = (0..changes.len()).collect();
+                order.sort_by_key(|&i| {
+                    std::cmp::Reverse(adjust_scope_priority(&changes[i].scope))
+                });
+                for i in order {
+                    self.apply_adjustment_change_to_app(&changes[i], false);
                 }
             }
         }
@@ -277,17 +287,6 @@ impl App {
         }
     }
 
-    /// 画像補正操作の **直前 → 直後** のスナップショットから Undo エントリを作って積む。
-    /// スコープごとに「現在の値」(Option<AdjustParams>) を取得するヘルパーを提供して、
-    /// パネル / U・N・P / Ctrl+1-9 などすべての書き込み経路でこれを使う。
-    pub(crate) fn current_adjust_value(&self, scope: &AdjustUndoScope) -> Option<AdjustParams> {
-        match scope {
-            AdjustUndoScope::Page(idx) => self.adjustment_page_params.get(idx).cloned(),
-            AdjustUndoScope::Favorite(id) => self.adjustment_favorite_params.get(id).cloned(),
-            AdjustUndoScope::Global => Some(self.settings.global_preset.clone()),
-        }
-    }
-
     /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
     /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
     pub(crate) fn capture_adjustment_undo(
@@ -307,23 +306,84 @@ impl App {
         );
     }
 
-    /// 補正書き込み操作の **直前 → 直後** を自動キャプチャするラッパー。
-    /// クロージャ内で `set_page_params` / `set_favorite_default` / `clear_*` などを
-    /// 呼ぶと、その前後の `current_adjust_value(scope)` を読み取って Undo エントリを
-    /// 積む。同じパターンが U・N・P / Q / Ctrl+1-9 / アクションボタン群で 8 箇所
-    /// 繰り返されていたのを 1 行に集約するためのヘルパー。
-    pub(crate) fn capture_adjust_around<F>(
-        &mut self,
-        scope: AdjustUndoScope,
-        summary: String,
-        write_op: F,
-    ) where
+    /// 補正書き込み操作の **直前 → 直後** で 3 層 (Page / Favorite / Global) すべての
+    /// スナップショットを取り、差分を 1 つの `UndoEntry::Adjustment` にまとめて積む。
+    ///
+    /// 単に `(scope, before, after)` を 1 件積むだけだと不足するケース:
+    /// - `set_favorite_default` は内部で「お気に入り標準と一致する個別ページを冗長判定で
+    ///   削除」する。Favorite スコープの 1 件だけ Undo に積むと、削除された個別ページが
+    ///   復元されない (Codex P1)。
+    /// - `apply_params_to_all_pages` / `clear_all_page_params` は多数のページを 1 操作で
+    ///   書き換える。スコープ 1 件では表現できない (Codex P2)。
+    ///
+    /// このヘルパーは write_op 前後の `adjustment_page_params` / `adjustment_favorite_params`
+    /// / `settings.global_preset` をそれぞれ比較し、変化したエントリすべてを
+    /// `AdjustmentChange` として記録する。
+    pub(crate) fn capture_adjust_full<F>(&mut self, summary: String, write_op: F)
+    where
         F: FnOnce(&mut App),
     {
-        let before = self.current_adjust_value(&scope);
+        let pages_before = self.adjustment_page_params.clone();
+        let favs_before = self.adjustment_favorite_params.clone();
+        let global_before = self.settings.global_preset.clone();
+
         write_op(self);
-        let after = self.current_adjust_value(&scope);
-        self.capture_adjustment_undo(scope, before, after, summary);
+
+        let mut changes: Vec<AdjustmentChange> = Vec::new();
+
+        // Page 差分: 旧側のキー全部走査 (削除と更新)
+        for (idx, before_p) in &pages_before {
+            let after_p = self.adjustment_page_params.get(idx);
+            if Some(before_p) != after_p {
+                changes.push(AdjustmentChange {
+                    scope: AdjustUndoScope::Page(*idx),
+                    before: Some(before_p.clone()),
+                    after: after_p.cloned(),
+                });
+            }
+        }
+        // 新規追加された Page (旧側に無かったキー)
+        for (idx, after_p) in &self.adjustment_page_params {
+            if !pages_before.contains_key(idx) {
+                changes.push(AdjustmentChange {
+                    scope: AdjustUndoScope::Page(*idx),
+                    before: None,
+                    after: Some(after_p.clone()),
+                });
+            }
+        }
+
+        // Favorite 差分
+        for (id, before_p) in &favs_before {
+            let after_p = self.adjustment_favorite_params.get(id);
+            if Some(before_p) != after_p {
+                changes.push(AdjustmentChange {
+                    scope: AdjustUndoScope::Favorite(*id),
+                    before: Some(before_p.clone()),
+                    after: after_p.cloned(),
+                });
+            }
+        }
+        for (id, after_p) in &self.adjustment_favorite_params {
+            if !favs_before.contains_key(id) {
+                changes.push(AdjustmentChange {
+                    scope: AdjustUndoScope::Favorite(*id),
+                    before: None,
+                    after: Some(after_p.clone()),
+                });
+            }
+        }
+
+        // Global 差分
+        if global_before != self.settings.global_preset {
+            changes.push(AdjustmentChange {
+                scope: AdjustUndoScope::Global,
+                before: Some(global_before),
+                after: Some(self.settings.global_preset.clone()),
+            });
+        }
+
+        self.push_adjustment_undo_entry(changes, summary);
     }
 
     /// タグ Undo/Redo の worker 投入。`use_before=true` なら各 path の `before` を
@@ -357,6 +417,19 @@ impl App {
             let key = crate::adjustment_db::normalize_path(&c.path);
             self.tags_cache.insert(key, target.clone());
         }
+    }
+}
+
+/// AdjustUndoScope のカスケード優先度。
+/// Undo (use_before) は **昇順** に適用 (Global=0 が最初、Page=2 が最後)。
+/// Redo (use_after) は **降順** に適用 (Page=2 が最初、Global=0 が最後)。
+/// これで `set_page_params` の冗長判定 (matches_default → prune) が
+/// 既に正しい上層状態の下で動く (Codex P1)。
+fn adjust_scope_priority(scope: &AdjustUndoScope) -> u8 {
+    match scope {
+        AdjustUndoScope::Global => 0,
+        AdjustUndoScope::Favorite(_) => 1,
+        AdjustUndoScope::Page(_) => 2,
     }
 }
 

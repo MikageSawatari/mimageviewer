@@ -13780,4 +13780,167 @@ mod favorite_adjustment_defaults_tests {
             "favorite 標準と等価な個別は保存しないべき"
         );
     }
+
+    // ── Undo/Redo for image adjustments ────────────────────────────────
+
+    /// ページ個別補正の Undo/Redo: 1 回スライダーを動かして Ctrl+Z で戻る、Ctrl+Y で戻し直し。
+    #[test]
+    fn page_adjustment_undo_redo_round_trip() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 初期: 個別なし
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+
+        // 個別設定 brightness=30 を書く (capture_adjust_full でラップ)
+        app.capture_adjust_full("test slider".into(), |a| {
+            a.set_page_params(idx, params_with_brightness(30.0));
+        });
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            30.0
+        );
+
+        // Undo: 個別が消える
+        app.apply_meta_undo();
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "Undo 後はエントリが消える"
+        );
+
+        // Redo: 個別が brightness=30 に戻る
+        app.apply_meta_redo();
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            30.0,
+            "Redo で再適用される"
+        );
+    }
+
+    /// Codex P1 回帰: お気に入り標準の更新で冗長な個別ページが pruning される。
+    /// Undo するとお気に入り標準は元に戻り、かつ削除された個別ページも復元される。
+    #[test]
+    fn favorite_default_undo_restores_pruned_page_overrides() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 個別 = 25 (favorite 未設定)
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(25.0));
+
+        // 「このお気に入りの標準にする」(= 個別と同値) を capture_adjust_full でラップ
+        let new_fav_default = params_with_brightness(25.0);
+        app.capture_adjust_full("set favorite".into(), |a| {
+            a.set_favorite_default(fav_id, new_fav_default);
+        });
+        // pruning が走り、個別は消える
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "set_favorite_default は冗長な個別を pruning する"
+        );
+        assert!(app.adjustment_favorite_params.contains_key(&fav_id));
+
+        // Undo: お気に入り標準が消え、個別 25 が復元される (Codex P1)
+        app.apply_meta_undo();
+        assert!(
+            !app.adjustment_favorite_params.contains_key(&fav_id),
+            "Undo でお気に入り標準が解除"
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            25.0,
+            "pruning された個別ページも復元されること (Codex P1)"
+        );
+
+        // Redo: 元の状態 (お気に入り標準 + 個別なし) に戻る
+        app.apply_meta_redo();
+        assert!(app.adjustment_favorite_params.contains_key(&fav_id));
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "Redo で再 pruning される"
+        );
+    }
+
+    /// Codex P2 回帰: バルク操作 (apply_to_all / clear_all) も Undo に積まれる。
+    #[test]
+    fn bulk_apply_clear_all_pages_pushes_undo_entry() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+
+        // a, b に個別設定を入れる
+        app.adjustment_page_params
+            .insert(idx_a, params_with_brightness(40.0));
+        app.adjustment_page_params
+            .insert(idx_b, params_with_brightness(60.0));
+
+        // 「全画像から解除」をラップして実行
+        app.capture_adjust_full("clear all".into(), |a| {
+            a.clear_all_page_params();
+        });
+        assert!(app.adjustment_page_params.is_empty(), "全画像が解除される");
+
+        // Undo: 個別設定が両方復元される
+        app.apply_meta_undo();
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_a).unwrap().brightness,
+            40.0,
+            "個別設定 a が復元"
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_b).unwrap().brightness,
+            60.0,
+            "個別設定 b が復元"
+        );
+
+        // Redo: 全画像が再び解除される
+        app.apply_meta_redo();
+        assert!(app.adjustment_page_params.is_empty(), "Redo で再 clear");
+    }
+
+    /// 新しい補正操作を行うと redo スタックがクリアされる (Ctrl+Z 後の操作で
+    /// ぶら下がっていた redo は無効化される)。
+    #[test]
+    fn new_adjustment_op_clears_redo_stack() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 操作 1: brightness=10
+        app.capture_adjust_full("op1".into(), |a| {
+            a.set_page_params(idx, params_with_brightness(10.0));
+        });
+        // Undo → redo に積まれる
+        app.apply_meta_undo();
+        assert!(app.meta_undo.can_redo());
+
+        // 操作 2: brightness=20 → redo がクリアされる
+        app.capture_adjust_full("op2".into(), |a| {
+            a.set_page_params(idx, params_with_brightness(20.0));
+        });
+        assert!(!app.meta_undo.can_redo(), "新しい操作で redo がクリアされる");
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            20.0
+        );
+    }
+
+    /// `is_meaningful` 抑止: 何も変化しない write_op は Undo に積まれない。
+    #[test]
+    fn no_op_write_does_not_push_undo() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let _idx = push_image(&mut app, "C:/pics/a.jpg");
+        let undo_len_before = app.meta_undo.undo_len();
+
+        // 何も変更しない write_op
+        app.capture_adjust_full("noop".into(), |_a| {});
+
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_len_before,
+            "no-op は積まれない"
+        );
+    }
 }
