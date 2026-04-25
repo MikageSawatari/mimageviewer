@@ -14197,12 +14197,16 @@ mod phase_c_drill_nav_tests {
         let mut rf = [false; 6];
         rf[5] = true;
         app.settings.rating_filter = rf;
-        // rating_db に ★5 でコンテナ (フォルダ) を登録
+        // rating_db に ★5 でコンテナ (フォルダ) を登録。
+        // setup_app は rating_db を必ず開ける前提。開けないなら test 環境がおかしい
+        // ので `expect` で即時 panic させて原因を読みやすくする (Codex P3)。
         let folder = std::path::PathBuf::from("c:/books/vol1");
         let key = crate::adjustment_db::normalize_path(&folder);
-        if let Some(db) = app.rating_db.as_ref() {
-            db.set(&key, 5).expect("set rating");
-        }
+        let db = app
+            .rating_db
+            .as_ref()
+            .expect("rating_db must be open in test (setup_app の data_dir override 失敗?)");
+        db.set(&key, 5).expect("set rating");
         // ★コンテナを「開く」前は suppression なし
         assert!(app.rating_filter_suppressed_at.is_none());
         // 開く
@@ -14230,9 +14234,11 @@ mod phase_c_drill_nav_tests {
         // ★3 コンテナ (★5 フィルタを通らない)
         let folder = std::path::PathBuf::from("c:/notes/draft");
         let key = crate::adjustment_db::normalize_path(&folder);
-        if let Some(db) = app.rating_db.as_ref() {
-            db.set(&key, 3).expect("set rating");
-        }
+        let db = app
+            .rating_db
+            .as_ref()
+            .expect("rating_db must be open in test");
+        db.set(&key, 3).expect("set rating");
         app.maybe_suppress_rating_filter_for_opened_container_path(&folder);
         assert!(
             app.rating_filter_suppressed_at.is_none(),
