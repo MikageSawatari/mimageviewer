@@ -315,6 +315,20 @@ impl IndexerManager {
         Some(mgr)
     }
 
+    /// 起動 overlay を閉じた後に呼ぶ。`fts_meta.db` の housekeeping (VACUUM) を
+    /// 別スレッドで走らせる。数 GB DB で数分かかりうるため起動経路から外している。
+    /// Mutex 取得で ingest と自動的に直列化される。
+    pub fn spawn_housekeeping(&self, data_dir: &std::path::Path) {
+        let meta = Arc::clone(&self.meta_db);
+        let db_path = data_dir.join("fts_meta.db");
+        std::thread::Builder::new()
+            .name("fts-housekeeping".to_string())
+            .spawn(move || {
+                meta.run_housekeeping_if_needed(&db_path);
+            })
+            .ok();
+    }
+
     /// 現在のお気に入り一覧と supervisors を同期。
     /// - 新規 `auto_index_metadata = true` → spawn
     /// - 既存で OFF に切り替わった / 削除された → drop
@@ -552,18 +566,24 @@ impl IndexerManager {
                 return 0;
             }
         };
-        if !paths.is_empty() {
-            if let Err(e) = self.writer.batch(
-                vec![],
-                paths.clone(),
-                true,
-                true,
-                WriterPriority::Background,
-            ) {
-                crate::logger::log(format!(
-                    "IndexerManager: purge_favorite_metadata({favorite_id}) tantivy batch failed: {e}"
-                ));
-            }
+        if paths.is_empty() {
+            return 0;
+        }
+        // Tantivy First: delete batch が失敗したら SQLite には触れない。
+        // 次回のメタ ON/OFF 切替や reconciliation で再試行できるよう、SQLite の
+        // 行を再試行の手がかりとして残しておく。
+        if let Err(e) = self.writer.batch(
+            vec![],
+            paths.clone(),
+            true,
+            true,
+            WriterPriority::Background,
+        ) {
+            crate::logger::log(format!(
+                "IndexerManager: purge_favorite_metadata({favorite_id}) tantivy batch failed: {e} \
+                 (SQLite rows preserved for retry)"
+            ));
+            return 0;
         }
         match self.meta_db.delete_all_for_favorite(favorite_id) {
             Ok(n) => {
@@ -698,16 +718,17 @@ fn run_reconciliation_via_dispatcher(
         .list_not_ok_paths_for_favorites(&target_favs)
         .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
     let deletes: Vec<String> = not_ok.iter().map(|(p, _, _)| p.clone()).collect();
+    let _ = fts;
     if !deletes.is_empty() {
-        if let Err(e) = meta_db.delete_paths(&deletes) {
+        let deletes_for_sqlite = deletes.clone();
+        writer
+            .batch(vec![], deletes, true, true, WriterPriority::Background)
+            .map_err(|e| format!("reconciliation batch: {e}"))?;
+        if let Err(e) = meta_db.delete_paths(&deletes_for_sqlite) {
             crate::logger::log(format!("reconciliation: delete_paths failed: {e}"));
         }
-        report.failed_cleaned = deletes.len();
+        report.failed_cleaned = deletes_for_sqlite.len();
     }
-    let _ = fts;
-    writer
-        .batch(vec![], deletes, true, true, WriterPriority::Background)
-        .map_err(|e| format!("reconciliation batch: {e}"))?;
     crate::logger::log(format!(
         "reconciliation done: failed cleaned = {}",
         report.failed_cleaned

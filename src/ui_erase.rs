@@ -21,6 +21,12 @@ use crate::ui_fullscreen::FsKeyAction;
 pub(crate) struct EraseInpaintPending {
     /// 結果を反映する fs_cache のキー (= フルスクリーン idx)。
     pub idx: usize,
+    /// 投入時の `App.items_generation`。`poll` 時に世代が進んでいれば結果は捨てる
+    /// (フォルダ移動 / 検索結果差し替えで idx の指す item が変わるため)。
+    pub items_generation: u64,
+    /// 投入時の `page_path_key(idx)`。世代が同じでも path が変わっていれば捨てる
+    /// (sort 変更等の rare ケース対策)。
+    pub path_key: Option<String>,
     /// worker からの結果受信。`Ok(image)` で完了、`Err(_)` でキャンセル/失敗。
     pub rx: mpsc::Receiver<egui::ColorImage>,
     /// 投入時にセット、worker は毎タイル前に load してキャンセル監視。
@@ -1990,8 +1996,12 @@ impl App {
             })
             .expect("spawn erase-inpaint worker");
 
+        let items_generation = self.items_generation;
+        let path_key = self.page_path_key(idx);
         self.erase_inpaint_pending = Some(EraseInpaintPending {
             idx,
+            items_generation,
+            path_key,
             rx,
             cancel,
             started_at: std::time::Instant::now(),
@@ -2010,7 +2020,6 @@ impl App {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                // worker がキャンセルされたか panic した。
                 self.erase_inpaint_pending = None;
                 return;
             }
@@ -2018,6 +2027,17 @@ impl App {
         let pending = self.erase_inpaint_pending.take().unwrap();
         let elapsed = pending.started_at.elapsed();
         let idx = pending.idx;
+        // 投入時と比べて items_generation / path_key が変わっていれば結果は捨てる
+        // (別 item に着地するのを防ぐ)。サムネイル世代問題と同型の防御。
+        if pending.items_generation != self.items_generation
+            || pending.path_key != self.page_path_key(idx)
+        {
+            crate::logger::log(format!(
+                "erase: inpaint result discarded (stale: gen {} → {}, prefix={})",
+                pending.items_generation, self.items_generation, pending.log_prefix
+            ));
+            return;
+        }
         // pixels と texture で同じ ColorImage を共有することで、UI スレッド上の
         // 100MB 級 memcpy (4K 画像 RGBA) を回避する。
         let pixels = Arc::new(result);

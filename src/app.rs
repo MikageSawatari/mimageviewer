@@ -2884,6 +2884,9 @@ impl App {
                 Arc::clone(&self.activity_gate),
                 Some(hook),
             );
+            if let Some(mgr) = self.indexer_manager.as_ref() {
+                mgr.spawn_housekeeping(&crate::data_dir::get());
+            }
             self.startup_done = true;
             return;
         }
@@ -2907,6 +2910,9 @@ impl App {
                 self.startup_done = true;
                 if let Ok(mut p) = self.startup_progress.lock() {
                     *p = "起動完了".to_string();
+                }
+                if let Some(mgr) = self.indexer_manager.as_ref() {
+                    mgr.spawn_housekeeping(&crate::data_dir::get());
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}

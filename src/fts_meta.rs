@@ -158,46 +158,8 @@ impl FtsMetaDb {
             tx.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
             tx.commit()?;
         }
-        // 後始末 (VACUUM) 1 回限り。`application_id` を marker として使う。
-        // - rebuild_needed=true (= 旧スキーマから DROP したばかり): 空きページが
-        //   2GB 級になっているので VACUUM で実ファイルを縮める。
-        // - rebuild_needed=false (= 既に v5 だが、過去に DROP COLUMN してから
-        //   一度も VACUUM していない既存環境): 同様に縮める。
-        // どちらでも application_id == HOUSEKEEPING_VERSION なら再実行しない。
-        let app_id: i32 = conn
-            .query_row("PRAGMA application_id", [], |r| r.get(0))
-            .unwrap_or(0);
-        if app_id != HOUSEKEEPING_VERSION {
-            let before = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-            crate::logger::log(format!(
-                "fts_meta: running one-shot VACUUM (housekeeping {HOUSEKEEPING_VERSION}, file size {before} bytes)"
-            ));
-            // VACUUM は重いので時間を測ってログに残す (数 GB で数分かかりうる)。
-            // 失敗 (ディスク不足 / 排他ロック等) は non-fatal: 索引初期化を破綻させない。
-            // marker (application_id) は成功時のみ書く → 次回起動でリトライされる。
-            let t = std::time::Instant::now();
-            match conn.execute_batch("VACUUM;") {
-                Ok(()) => {
-                    let elapsed = t.elapsed();
-                    let after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-                    conn.execute_batch(&format!(
-                        "PRAGMA application_id = {HOUSEKEEPING_VERSION};"
-                    ))?;
-                    crate::logger::log(format!(
-                        "fts_meta: VACUUM done in {:?} ({} → {} bytes, reclaimed {} bytes)",
-                        elapsed,
-                        before,
-                        after,
-                        before.saturating_sub(after)
-                    ));
-                }
-                Err(e) => {
-                    crate::logger::log(format!(
-                        "fts_meta: VACUUM failed (non-fatal, will retry next launch): {e}"
-                    ));
-                }
-            }
-        }
+        // 後始末 (VACUUM) は起動経路から外し、`maybe_run_housekeeping_async` で起動後に
+        // バックグラウンド実行する。数 GB で数分かかりうるので起動 overlay を止めない方針。
         Ok(Self {
             conn: Mutex::new(conn),
             rebuilt_on_open: rebuild_needed,
@@ -209,6 +171,52 @@ impl FtsMetaDb {
     /// (旧 key 形式の orphan doc が残らないようにするため)。
     pub fn rebuilt_on_open(&self) -> bool {
         self.rebuilt_on_open
+    }
+
+    /// 起動後に呼ぶ housekeeping。`application_id != HOUSEKEEPING_VERSION` の場合のみ
+    /// VACUUM を 1 回走らせる (数 GB で数分かかりうる)。失敗時は marker を書かないので
+    /// 次回起動で再試行される。Mutex を取って実行するので、ingest との同時実行は
+    /// 自動的に直列化される (write lock 取得待ち)。
+    pub fn run_housekeeping_if_needed(&self, db_path: &Path) {
+        let conn = self.conn.lock().unwrap();
+        let app_id: i32 = conn
+            .query_row("PRAGMA application_id", [], |r| r.get(0))
+            .unwrap_or(0);
+        if app_id == HOUSEKEEPING_VERSION {
+            return;
+        }
+        let before = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        crate::logger::log(format!(
+            "fts_meta: running housekeeping VACUUM (housekeeping {HOUSEKEEPING_VERSION}, \
+             file size {before} bytes)"
+        ));
+        let t = std::time::Instant::now();
+        match conn.execute_batch("VACUUM;") {
+            Ok(()) => {
+                let elapsed = t.elapsed();
+                let after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+                if let Err(e) = conn.execute_batch(&format!(
+                    "PRAGMA application_id = {HOUSEKEEPING_VERSION};"
+                )) {
+                    crate::logger::log(format!(
+                        "fts_meta: housekeeping marker bump failed (will retry): {e}"
+                    ));
+                    return;
+                }
+                crate::logger::log(format!(
+                    "fts_meta: VACUUM done in {:?} ({} → {} bytes, reclaimed {} bytes)",
+                    elapsed,
+                    before,
+                    after,
+                    before.saturating_sub(after)
+                ));
+            }
+            Err(e) => {
+                crate::logger::log(format!(
+                    "fts_meta: VACUUM failed (non-fatal, will retry next launch): {e}"
+                ));
+            }
+        }
     }
 
     /// status=Ok で UPSERT。既存 row の generation を増やす。Tantivy commit と
@@ -703,12 +711,21 @@ mod tests {
     /// 初回 open で `application_id` が `HOUSEKEEPING_VERSION` に設定され、
     /// 2 回目以降の open では VACUUM がスキップされる。
     #[test]
-    fn housekeeping_marker_set_after_first_open() {
+    fn housekeeping_marker_set_after_explicit_run() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts_meta.db");
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+        // 起動経路で自動実行されないことを確認
         {
-            let _db = FtsMetaDb::open_at(&db_path).unwrap();
+            let conn = Connection::open(&db_path).unwrap();
+            let app_id: i32 = conn
+                .query_row("PRAGMA application_id", [], |r| r.get(0))
+                .unwrap_or(0);
+            assert_eq!(app_id, 0, "open_at だけでは housekeeping は走らない");
         }
+        // 明示的に走らせると marker が立つ
+        db.run_housekeeping_if_needed(&db_path);
+        drop(db);
         let conn = Connection::open(&db_path).unwrap();
         let app_id: i32 = conn
             .query_row("PRAGMA application_id", [], |r| r.get(0))
