@@ -81,6 +81,31 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Single => None,
         };
         let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
+        // 元画像取得は state mutation より前にやる。ここで取れないと erase は始められず、
+        // 取れる前に spread_mode / fullscreen_idx を弄ると見開きが解除されたまま
+        // 編集も開始しない不整合状態になる (Codex P2 指摘)。
+        let pixels = if let Some(base) = self.erase_base_cache.get(&target_idx) {
+            Arc::clone(base)
+        } else {
+            let bg = self.effective_upscale_bg_mode();
+            let from_cache = self
+                .ai_upscale_cache
+                .get(&(target_idx, bg))
+                .or_else(|| self.fs_cache.get(&target_idx))
+                .and_then(|entry| match entry {
+                    FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
+                    _ => None,
+                });
+            match from_cache {
+                Some(p) => {
+                    // 初回: 元画像を base_cache に保存
+                    self.erase_base_cache.insert(target_idx, Arc::clone(&p));
+                    p
+                }
+                None => return,
+            }
+        };
+        // ピクセル取得成功 → ここから state mutation。
         if let Some(pair) = spread_pair {
             self.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
                 saved_mode: self.spread_mode,
@@ -89,28 +114,6 @@ impl App {
             self.set_single_page_view(target_idx);
         }
         let fs_idx = target_idx;
-        // 元画像を取得: erase_base_cache (inpaint前の元画像) を優先、なければキャッシュから
-        let pixels = if let Some(base) = self.erase_base_cache.get(&fs_idx) {
-            Arc::clone(base)
-        } else {
-            let bg = self.effective_upscale_bg_mode();
-            let from_cache = self
-                .ai_upscale_cache
-                .get(&(fs_idx, bg))
-                .or_else(|| self.fs_cache.get(&fs_idx))
-                .and_then(|entry| match entry {
-                    FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
-                    _ => None,
-                });
-            match from_cache {
-                Some(p) => {
-                    // 初回: 元画像を base_cache に保存
-                    self.erase_base_cache.insert(fs_idx, Arc::clone(&p));
-                    p
-                }
-                None => return,
-            }
-        };
         let [w, h] = pixels.size;
         self.erase_mode = true;
         // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
@@ -2117,9 +2120,10 @@ impl App {
         let runtime = self.ai_runtime.clone();
         let manager = self.ai_model_manager.clone();
 
-        // 進行中のジョブがあればキャンセルしてから新しいジョブを投入する。
-        // (連打や別ページからの apply_slot_in_viewing_mode 等で重なるケース)
-        if let Some(prev) = self.erase_inpaint_pending.take() {
+        // 同じ idx に対して進行中のジョブがあれば cancel (= 連打 / 同ページへの再 apply)。
+        // 別 idx のジョブはそのまま並走させる (見開き消しゴムで両ページの inpaint を
+        // 同時に処理するため)。
+        if let Some(prev) = self.erase_inpaint_pending.remove(&idx) {
             prev.cancel.store(true, Ordering::Relaxed);
         }
 
@@ -2143,33 +2147,52 @@ impl App {
 
         let items_generation = self.items_generation;
         let path_key = self.page_path_key(idx);
-        self.erase_inpaint_pending = Some(EraseInpaintPending {
+        self.erase_inpaint_pending.insert(
             idx,
-            items_generation,
-            path_key,
-            rx,
-            cancel,
-            started_at: std::time::Instant::now(),
-            log_prefix,
-        });
+            EraseInpaintPending {
+                idx,
+                items_generation,
+                path_key,
+                rx,
+                cancel,
+                started_at: std::time::Instant::now(),
+                log_prefix,
+            },
+        );
     }
 
     /// `App::update` 先頭から毎フレーム呼ばれ、worker から結果が届いていれば
     /// fs_cache を差し替える。完了通知は worker 側の `ctx.request_repaint()` に任せる。
+    /// idx 別 pending を全部走査し、ready なものから 1 件取り込む (見開き消しゴムで
+    /// 複数ページが同時並走するため)。texture アップロードの I/O 集中を避けるため
+    /// 1 フレーム最大 1 件、残りは次フレームで処理する。
     pub(crate) fn poll_erase_inpaint(&mut self, ctx: &egui::Context) {
-        let pending = match self.erase_inpaint_pending.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-        let result = match pending.rx.try_recv() {
-            Ok(r) => r,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.erase_inpaint_pending = None;
-                return;
+        // 各 pending を try_recv で peek。Ok ならその idx と結果を持って break、
+        // Disconnected なら worker が死んでいるので削除して次へ進む。Empty は次へ。
+        // (try_recv は &Receiver で借用するだけだが値を返すと所有権が移るので、
+        //  Some を返した時点でループを抜けて map から remove する。)
+        let mut completed: Option<(usize, egui::ColorImage)> = None;
+        let idxs: Vec<usize> = self.erase_inpaint_pending.keys().copied().collect();
+        for idx in idxs {
+            let Some(pending) = self.erase_inpaint_pending.get(&idx) else {
+                continue;
+            };
+            match pending.rx.try_recv() {
+                Ok(result) => {
+                    completed = Some((idx, result));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // ワーカーが panic 等で終了 — pending は破棄。
+                    self.erase_inpaint_pending.remove(&idx);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+        let Some((target_idx, result)) = completed else {
+            return;
         };
-        let pending = self.erase_inpaint_pending.take().unwrap();
+        let pending = self.erase_inpaint_pending.remove(&target_idx).unwrap();
         let elapsed = pending.started_at.elapsed();
         let idx = pending.idx;
         // 投入時と比べて items_generation / path_key が変わっていれば結果は捨てる

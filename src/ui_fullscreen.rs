@@ -740,17 +740,19 @@ impl App {
                         }
 
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
-                        // erase_mode 中は `enter_erase_mode` が spread_mode を Single に
-                        // 倒している不変条件があり、ここでの is_spread_double は常に false。
-                        // 不変が壊れた場合に気付けるよう debug_assert で検出する。
-                        if self.erase_mode {
-                            debug_assert!(
-                                !is_spread_double,
-                                "erase_mode invariant: spread_mode must be Single during erase"
-                            );
+                        // `is_spread_double` はキー入力ハンドラより前 (フレーム冒頭) で
+                        // 計算されるので、見開き中に [E] を押した最初のフレームだけは
+                        // `is_spread_double = true` のまま `erase_mode = true` になる
+                        // フレーム単位の遷移期間が存在する。この 1 フレームでは見開き
+                        // レンダ + 消しゴム overlay を併発させずスキップして、次フレームに
+                        // 単一ページ表示で消しゴムを描画する。
+                        if self.erase_mode && !is_spread_double {
                             let zp = self.fs_zoom_pan();
                             self.handle_erase_paint(ctx, image_rect, zp);
                             self.draw_erase_overlay(ui, ctx, image_rect, zp);
+                            ctx.request_repaint();
+                        } else if self.erase_mode {
+                            // 遷移フレームでも次フレームを必ず描画させる (request_repaint)
                             ctx.request_repaint();
                         }
 

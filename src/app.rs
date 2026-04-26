@@ -1895,10 +1895,13 @@ pub struct App {
     pub(crate) erase_selected_vector: Option<usize>,
     /// ベクタオブジェクト編集のドラッグ状態。
     pub(crate) erase_vector_drag: Option<EraseVectorDrag>,
-    /// バックグラウンド実行中の MI-GAN inpaint。`Some` の間は重複投入せず、
-    /// 完了 (もしくは新規投入) で `take()` する。UI スレッドが MI-GAN 推論
-    /// (300-500ms) で固まらないようにするための非同期化エントリ。
-    pub(crate) erase_inpaint_pending: Option<crate::ui_erase::EraseInpaintPending>,
+    /// バックグラウンド実行中の MI-GAN inpaint (idx 別)。
+    /// 見開き消しゴムで「左ページ apply → 右ページへ移動 → 右ページ apply」と続けたとき、
+    /// 旧実装は `Option` で 1 件しか持たず、右ページの投入が左ページのジョブを
+    /// `cancel.store(true)` してしまっていた。idx ごとに独立保持することで両方の
+    /// inpaint 結果を確実に受け取る。同じ idx への再投入時のみ前ジョブを cancel する。
+    /// UI スレッドが MI-GAN 推論 (300-500ms) で固まらないようにするための非同期化エントリ。
+    pub(crate) erase_inpaint_pending: std::collections::HashMap<usize, crate::ui_erase::EraseInpaintPending>,
     /// 見開きから消しゴムに入ったときの状態スナップショット。`Some` の間は終了時に
     /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を `pair.0` (左ページ) に
     /// 揃えて見開きを復元する。Single から入った場合・見開き中でも片側だけのページ
@@ -2332,7 +2335,7 @@ impl Default for App {
             erase_vectors: Vec::new(),
             erase_selected_vector: None,
             erase_vector_drag: None,
-            erase_inpaint_pending: None,
+            erase_inpaint_pending: std::collections::HashMap::new(),
             erase_spread_ctx: None,
             input_seq: 0,
             last_input_at: None,
@@ -15646,6 +15649,56 @@ mod favorite_adjustment_defaults_tests {
             app.fullscreen_idx,
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
+        );
+    }
+
+    /// Codex P1 (見開き消しゴム): `erase_inpaint_pending` が idx 別 HashMap になり、
+    /// 左ページ apply 直後に右ページに切り替えても左の inpaint がキャンセルされない
+    /// (旧実装は `Option` で 1 件しか持たず、新ジョブ投入が旧ジョブを cancel していた)。
+    /// 同じ idx への再投入だけは旧版どおり cancel する。
+    #[test]
+    fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
+        let make_pending = |idx: usize| {
+            let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+            crate::ui_erase::EraseInpaintPending {
+                idx,
+                items_generation: 0,
+                path_key: None,
+                rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+                started_at: std::time::Instant::now(),
+                log_prefix: "test",
+            }
+        };
+        let p0 = make_pending(0);
+        let cancel_p0 = p0.cancel.clone();
+        app.erase_inpaint_pending.insert(0, p0);
+        app.erase_inpaint_pending.insert(1, make_pending(1));
+        assert_eq!(app.erase_inpaint_pending.len(), 2, "両ページの pending が並走");
+
+        // 異なる idx (1) への再投入をシミュレート: idx=0 の pending はそのまま残るべき。
+        // (run_inpaint_and_cache の挙動を最小再現)
+        if let Some(prev) = app.erase_inpaint_pending.remove(&1) {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+        app.erase_inpaint_pending.insert(1, make_pending(1));
+        assert_eq!(app.erase_inpaint_pending.len(), 2);
+        assert!(
+            !cancel_p0.load(Ordering::Relaxed),
+            "他ページ (idx=0) の pending は cancel されない"
+        );
+
+        // 同じ idx (0) への再投入は旧 pending を cancel する。
+        if let Some(prev) = app.erase_inpaint_pending.remove(&0) {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+        assert!(
+            cancel_p0.load(Ordering::Relaxed),
+            "同 idx の再投入で旧 pending が cancel される"
         );
     }
 
