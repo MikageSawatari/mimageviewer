@@ -600,10 +600,13 @@ impl App {
 
         // Ctrl+↑↓ で PDF フォルダを挟む遷移中は fullscreen_idx が None のまま
         // PDF enumerate 完了を待つ。この間ビューポートを隠すとその下のグリッドが
-        // 見えてちらつくので、黒で塗った状態を維持する。
+        // 見えてちらつくので維持しつつ、ナビロックの holdover (= 直前ページの
+        // テクスチャ) があればそれを表示して「黒画面で待たされる」体感を緩和する。
         if self.fs_viewport_shown && self.fs_nav_after_pdf_enumerate.is_some() {
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
+            // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
+            let holdover = self.fs_holdover_tex.clone();
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
                 // 列挙が重い / ワーカー異常停止などで待ちが長くなったときに
                 // ユーザーが黒画面に閉じ込められないよう、Esc とウィンドウ
@@ -615,7 +618,31 @@ impl App {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                    .show(ctx, |_ui| {});
+                    .show(ctx, |ui| {
+                        if let Some(handle) = holdover.as_ref() {
+                            // 中央 contain フィット (= はみ出さないアスペクト維持)。
+                            let avail = ui.available_size();
+                            let tex_size = handle.size_vec2();
+                            if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
+                                let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
+                                let w = tex_size.x * scale;
+                                let h = tex_size.y * scale;
+                                let img_rect = egui::Rect::from_center_size(
+                                    ui.max_rect().center(),
+                                    egui::vec2(w, h),
+                                );
+                                ui.painter().image(
+                                    handle.id(),
+                                    img_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                    });
             });
             if cancel {
                 // 保留中の「列挙後にフルスクリーン復帰」意図を破棄。
