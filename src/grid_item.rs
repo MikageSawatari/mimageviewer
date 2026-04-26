@@ -84,18 +84,13 @@ pub struct ContainerRepresentative {
 }
 
 impl GridItem {
-    /// 表示用の名前を返す。
-    /// - 通常: ファイル名
-    /// - ZipImage: ZIP 内エントリのベース名
-    /// - ZipSeparator: ディレクトリ表示名
-    /// - PdfPage: "Page N" (1-indexed)
     /// 補正プリセット / 消しゴムマスク / タグなど、ページ単位の永続データを持てるアイテムか。
     /// 通常画像 / ZIP 内画像 / PDF ページが対象。フォルダ・動画・ZIP/PDF ファイル本体・
     /// セパレータは対象外。
     ///
-    /// レーティング判定に使うのは [`Self::accepts_rating`]。
-    /// (Video はレーティング対象だがピクセル補正対象ではないため `is_ratable` には含まない。)
-    pub fn is_ratable(&self) -> bool {
+    /// レーティング判定とは別軸 — レーティングは [`Self::accepts_rating`] を使う。
+    /// 動画はレーティング対象だがピクセル補正対象ではないので、ここには含めない。
+    pub fn has_page_data(&self) -> bool {
         matches!(
             self,
             Self::Image(_) | Self::ZipImage { .. } | Self::PdfPage { .. }
@@ -103,9 +98,9 @@ impl GridItem {
     }
 
     /// 単一ファイル単位でレーティング (★) を持てるアイテムか。
-    /// `is_ratable` (= ページ単位の補正/マスク/タグデータを持てるか) との違いは Video を
-    /// 含むこと: 動画は色調補正は受けないがレーティングは付与可能。フォルダ/ZIP/PDF 本体は
-    /// コンテナ扱いで [`Self::is_container_ratable`] 側。
+    /// [`Self::has_page_data`] との違いは Video を含むこと: 動画は色調補正は受けないが
+    /// レーティングは付与可能。フォルダ/ZIP/PDF 本体はコンテナ扱いで
+    /// [`Self::is_container_ratable`] 側。
     pub fn is_rating_leaf(&self) -> bool {
         matches!(
             self,
@@ -133,11 +128,16 @@ impl GridItem {
     /// レーティング★を付与できるアイテムかの総合判定。
     /// 単一ファイル (画像 / 動画 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP /
     /// PDF) の両方を含む。補正プリセット等のページ専用データとは別物なので区別すること
-    /// (補正用には [`Self::is_ratable`])。
+    /// (補正用には [`Self::has_page_data`])。
     pub fn accepts_rating(&self) -> bool {
         self.is_rating_leaf() || self.is_container_ratable()
     }
 
+    /// 表示用の名前を返す。
+    /// - 通常: ファイル名
+    /// - ZipImage: ZIP 内エントリのベース名
+    /// - ZipSeparator: ディレクトリ表示名
+    /// - PdfPage: "Page N" (1-indexed)
     pub fn name(&self) -> Cow<'_, str> {
         match self {
             GridItem::Folder(p)

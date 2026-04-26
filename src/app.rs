@@ -1050,9 +1050,9 @@ pub(crate) fn search_results_synthetic_path() -> PathBuf {
 /// フォルダ・ZipFile・PdfFile・ConvertibleArchive・Video・ZipSeparator の代表
 /// サムネは対象外で、`global_preset` を意図せず適用するとフォルダ表紙が変色する等の
 /// バグになる。「ページ単位データを持てるか」と概念的に一致するので
-/// [`GridItem::is_ratable`] を流用する。
+/// [`GridItem::has_page_data`] を流用する。
 pub(crate) fn is_thumb_adjust_target(item: Option<&GridItem>) -> bool {
-    item.is_some_and(|it| it.is_ratable())
+    item.is_some_and(|it| it.has_page_data())
 }
 
 // -----------------------------------------------------------------------
@@ -7914,6 +7914,9 @@ impl App {
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
                 self.page_path_key(idx)
             }
+            // Video は単一ファイルだがパス正規化はコンテナと同じ規則 (DB キーは
+            // フルパス normalize)。leaf vs container の分類は `is_rating_leaf` /
+            // `is_container_ratable` で行う。
             GridItem::Folder(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p)
@@ -8684,7 +8687,7 @@ impl App {
     /// チェック済みがあればそれら、無ければカーソル位置 (selected)、それも無ければ空。
     /// 述語で「受け入れる GridItem 種別」を切り替える:
     /// - レーティング (F1〜F6) は `accepts_rating` (コンテナ含む)
-    /// - 補正プリセット / マスクスロット (Ctrl+1〜0 / F7F8) は `is_ratable` (ページ専用)
+    /// - 補正プリセット / マスクスロット (Ctrl+1〜0 / F7F8) は `has_page_data` (ページ専用)
     ///
     /// `rebuild_visible_indices` が `checked` / `selected` を可視範囲内に保つ不変条件を
     /// 維持しているが、`load_folder` の履歴復元で `selected` を後から差し戻すケース等で
@@ -8711,7 +8714,7 @@ impl App {
     }
 
     fn ratable_page_targets(&self) -> Vec<usize> {
-        self.targets_matching(GridItem::is_ratable)
+        self.targets_matching(GridItem::has_page_data)
     }
 
     /// グリッド画面から F7/F8 で呼ばれるマスクスロット一括適用。
@@ -13638,9 +13641,8 @@ mod tests {
 
     #[test]
     fn rating_filter_applies_to_video_when_unrated_off() {
-        // Video もレーティング対象 (accepts_rating=true) なので「なし」フィルタ OFF で
-        // 未評価動画は隠れる。動画にもレーティングを付けられるようになったので、
-        // 通常画像と同じ扱いをする (2026-04 ユーザー報告)。
+        // Video もレーティング対象なので「なし」フィルタ OFF で未評価動画は隠れる。
+        // 通常画像と同じ扱い。
         let vid = GridItem::Video(PathBuf::from("/a.mp4"));
         // 全 OFF: ★0 (未評価) の動画は隠れる
         assert!(!passes_rating_filter(&vid, 0, &[false; 6]));
