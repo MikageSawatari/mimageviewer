@@ -52,6 +52,7 @@ foreach ($p in $candidates) {
 if ($toKill.Count -eq 0) {
     Write-Host "[build-release] no running mimageviewer process found"
 } else {
+    $anyStopFailed = $false
     foreach ($p in $toKill) {
         $pathLabel = '(path unknown)'
         if ($p.Path) { $pathLabel = $p.Path }
@@ -59,13 +60,25 @@ if ($toKill.Count -eq 0) {
         try {
             Stop-Process -Id $p.Id -Force -ErrorAction Stop
         } catch {
+            $anyStopFailed = $true
             Write-Warning ("[build-release] Stop-Process failed for PID={0}: {1}" -f $p.Id, $_)
         }
     }
-    # Backup with taskkill in case Stop-Process was denied. taskkill exits 128 on
-    # "no such image" so it is harmless when nothing matches.
-    & taskkill /IM mimageviewer.exe /F 2>$null | Out-Null
-    & taskkill /IM mimageviewer-susie32.exe /F 2>$null | Out-Null
+    # Run taskkill ONLY when Stop-Process failed (e.g. AccessDenied for an elevated
+    # process). taskkill writes "process not found" to stderr and exits 128 when
+    # nothing matches, and with $ErrorActionPreference='Stop' active that becomes
+    # a NativeCommandError that aborts the script before reaching cargo. Fence the
+    # block with a local EAP=Continue so that fallback path never aborts the build.
+    if ($anyStopFailed) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & taskkill /IM mimageviewer.exe /F 2>$null | Out-Null
+            & taskkill /IM mimageviewer-susie32.exe /F 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+    }
 }
 
 # Wait for the OS file handle to release. Stop-Process is synchronous but the
