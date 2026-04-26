@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::app::App;
 use crate::fts_index::{IndexKind, SearchTarget, SourceKind};
 use crate::global_search::{DoneReason, GlobalHit, SearchStreamEvent};
-use crate::grid_item::{ContainerRepresentative, GridItem, SearchContainerKind};
+use crate::grid_item::{ContainerRepresentative, GridItem, SearchContainerKind, ThumbnailState};
 use crate::indexer_manager::SearchHandle;
 
 // -----------------------------------------------------------------------
@@ -714,6 +714,60 @@ pub(crate) fn collect_hit_folders_dfs(
     folders.into_iter().collect()
 }
 
+/// `replace_search_view_items` でストリーミング rebuild 間にサムネを使い回すための
+/// 識別キー。GridItem の表示同一性 (= 同じテクスチャが使えるか) を表現する。
+/// Aggregated/SearchContainer は representative が変わると別物扱いにし、ZipImage /
+/// PdfPage は zip 本体パス + entry/page 番号で識別する。
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum ThumbReuseKey {
+    Folder(PathBuf),
+    Image(PathBuf),
+    Video(PathBuf),
+    ZipFile(PathBuf),
+    PdfFile(PathBuf),
+    Archive(PathBuf),
+    /// SearchContainer は representative も含めて識別。代表ヒットが変わったら
+    /// 別テクスチャを再生成させる (古い代表サムネを残さない)。
+    Container(PathBuf, SearchContainerKind, Option<ContainerRepresentative>),
+    ZipImage(PathBuf, String),
+    PdfPage(PathBuf, u32),
+}
+
+pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
+    match item {
+        GridItem::Folder(p) => Some(ThumbReuseKey::Folder(p.clone())),
+        GridItem::Image(p) => Some(ThumbReuseKey::Image(p.clone())),
+        GridItem::Video(p) => Some(ThumbReuseKey::Video(p.clone())),
+        GridItem::ZipFile(p) => Some(ThumbReuseKey::ZipFile(p.clone())),
+        GridItem::PdfFile(p) => Some(ThumbReuseKey::PdfFile(p.clone())),
+        GridItem::ConvertibleArchive { path, .. } => {
+            Some(ThumbReuseKey::Archive(path.clone()))
+        }
+        GridItem::SearchContainer {
+            path,
+            kind,
+            representative,
+            ..
+        } => Some(ThumbReuseKey::Container(
+            path.clone(),
+            *kind,
+            representative.clone(),
+        )),
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+            ..
+        } => Some(ThumbReuseKey::ZipImage(
+            zip_path.clone(),
+            entry_name.clone(),
+        )),
+        GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => Some(ThumbReuseKey::PdfPage(pdf_path.clone(), *page_num)),
+        GridItem::ZipSeparator { .. } => None,
+    }
+}
+
 // -----------------------------------------------------------------------
 // App 側との連携 (impl App 拡張)
 // -----------------------------------------------------------------------
@@ -748,6 +802,20 @@ impl App {
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel();
         }
+        // ストリーミング中に 1 秒毎の rebuild が来るので、同一パスの Loaded サムネを
+        // 使い回してテクスチャ再アップロードによる画面ちらつきを防ぐ。
+        // 旧 items + thumbnails から path-keyed map を作っておき、後で新位置に転送する。
+        let preserved: HashMap<ThumbReuseKey, ThumbnailState> = self
+            .items
+            .iter()
+            .zip(self.thumbnails.iter())
+            .filter_map(|(it, st)| match st {
+                ThumbnailState::Loaded { .. } => {
+                    thumb_reuse_key(it).map(|k| (k, st.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         // items_generation bump + thumbnails 初期化を一箇所に集約。
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
@@ -760,6 +828,17 @@ impl App {
         // keep_* / rotation / rating / adjustment_cache / thumb_pixels / ai_* / fs_* /
         // reload_queue / heavy_io_queue / tag_prewarm_*) を一括破棄。
         self.invalidate_idx_state_and_queues();
+        // 旧 thumbnails を新位置にマージ。Loaded のままなら upload backlog に乗らず、
+        // 同一フレームで前回のテクスチャがそのまま見え続けるのでちらつかない。
+        if !preserved.is_empty() {
+            for (i, item) in self.items.iter().enumerate() {
+                if let Some(key) = thumb_reuse_key(item) {
+                    if let Some(state) = preserved.get(&key) {
+                        self.thumbnails[i] = state.clone();
+                    }
+                }
+            }
+        }
         // 補正・マスクも idx ベース。Ctrl+G は items が総入れ替わりするので
         // 旧フォルダの個別設定は意味を失うため clear する。
         // (削除経路では呼び出し元が idx shift で保持する)
@@ -1006,7 +1085,13 @@ impl App {
                 Some(t) => t.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS),
             };
             if should_resort || self.global_search.done {
-                self.rebuild_items_from_global_search();
+                // Ctrl+G ヒット集約は accumulate_hit が更新済みだが、items 差し替えは
+                // 「現 items が検索結果ビュー」のときに限る。実フォルダ/ZIP/PDF を開いて
+                // いる間に rebuild を走らせると、ユーザーが見ているグリッドが検索結果に
+                // 上書きされて画面がちらつく (set_rating 経路と同じ条件、app.rs:8812 参照)。
+                if self.items_are_global_search_view {
+                    self.rebuild_items_from_global_search();
+                }
                 self.global_search.last_sort_at = Some(Instant::now());
             }
         }
@@ -2316,5 +2401,58 @@ mod tests {
     fn query_contains_case_insensitive() {
         assert!(query_contains_tag("#HELLO", "hello"));
         assert!(query_contains_tag("#hello", "HELLO"));
+    }
+
+    /// Ctrl+G ストリーミング rebuild でサムネを使い回せるよう、
+    /// `thumb_reuse_key` が path / variant ごとに決定的なキーを返すこと。
+    /// 同じ Image パスは同じキー、異なる variant は別キーになる。
+    #[test]
+    fn thumb_reuse_key_distinguishes_variants_and_paths() {
+        let img1 = GridItem::Image(PathBuf::from("c:/a.jpg"));
+        let img1_dup = GridItem::Image(PathBuf::from("c:/a.jpg"));
+        let img2 = GridItem::Image(PathBuf::from("c:/b.jpg"));
+        let folder1 = GridItem::Folder(PathBuf::from("c:/a.jpg")); // 同じパスでも variant 別
+        assert_eq!(thumb_reuse_key(&img1), thumb_reuse_key(&img1_dup));
+        assert_ne!(thumb_reuse_key(&img1), thumb_reuse_key(&img2));
+        assert_ne!(thumb_reuse_key(&img1), thumb_reuse_key(&folder1));
+        // ZipSeparator はサムネがないので key を返さない (None)
+        assert!(
+            thumb_reuse_key(&GridItem::ZipSeparator {
+                dir_display: "x".into(),
+            })
+            .is_none()
+        );
+    }
+
+    /// `SearchContainer` は representative が変わったら別キー扱い (代表サムネが
+    /// 切り替わったら使い回さず、新しい代表のサムネを生成し直す)。
+    #[test]
+    fn thumb_reuse_key_search_container_invalidates_on_representative_change() {
+        let path = PathBuf::from("c:/folder");
+        let rep1 = ContainerRepresentative {
+            path: PathBuf::from("c:/folder/a.jpg"),
+            zip_entry: None,
+            pdf_page: None,
+        };
+        let rep2 = ContainerRepresentative {
+            path: PathBuf::from("c:/folder/b.jpg"),
+            zip_entry: None,
+            pdf_page: None,
+        };
+        let make = |rep: Option<ContainerRepresentative>| GridItem::SearchContainer {
+            path: path.clone(),
+            kind: SearchContainerKind::Folder,
+            hit_count: 0,
+            representative: rep,
+        };
+        assert_eq!(
+            thumb_reuse_key(&make(Some(rep1.clone()))),
+            thumb_reuse_key(&make(Some(rep1.clone())))
+        );
+        assert_ne!(
+            thumb_reuse_key(&make(Some(rep1))),
+            thumb_reuse_key(&make(Some(rep2.clone())))
+        );
+        assert_ne!(thumb_reuse_key(&make(Some(rep2))), thumb_reuse_key(&make(None)));
     }
 }

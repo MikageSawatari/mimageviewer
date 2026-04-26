@@ -62,7 +62,7 @@ pub enum GridItem {
 }
 
 /// `GridItem::SearchContainer` のコンテナ種別 (v0.8.0)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SearchContainerKind {
     /// 通常フォルダ
     Folder,
@@ -72,7 +72,7 @@ pub enum SearchContainerKind {
 
 /// `SearchContainer` の代表サムネ (v0.8.1)。
 /// Ctrl+G アグリゲートビューで、コンテナ内のヒットから 1 件をサムネ表示するための参照。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ContainerRepresentative {
     /// 画像ファイル / PDF ファイルの絶対パス。ZIP エントリの場合は ZIP ファイル本体のパス。
     pub path: PathBuf,
@@ -215,6 +215,11 @@ pub fn pdf_page_cache_key(page_num: u32) -> String {
 }
 
 /// サムネイルセルの読み込み状態。
+///
+/// `Clone` を実装しているのは、Ctrl+G の検索結果ストリーミング rebuild で
+/// 同一パスのサムネを使い回してテクスチャ再アップロードによるちらつきを防ぐため。
+/// `egui::TextureHandle` は内部 Arc なのでクローンは refcount inc だけ。
+#[derive(Clone)]
 pub enum ThumbnailState {
     /// まだロードされていない
     Pending,
