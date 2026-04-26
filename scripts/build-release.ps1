@@ -1,19 +1,15 @@
-# mimageviewer release ビルドラッパー (PowerShell)
+# mimageviewer release build wrapper (PowerShell)
 #
-# トレイ常駐などで `mimageviewer.exe` が動いていると、cargo がリンク段階で
-# `target\release\mimageviewer.exe` を上書きできず LNK1104 (アクセスが拒否
-# されました) で失敗する。本スクリプトは:
-#   1. 実行中の mimageviewer.exe / mimageviewer-susie32.exe を探して停止
-#   2. ファイルハンドル解放を待つ
-#   3. `cargo build --release --bin mimageviewer` (引数は透過)
-# を順に実行する。
+# When mimageviewer.exe is running (e.g. tray-resident), cargo cannot overwrite
+# target\release\mimageviewer.exe at link time, failing with LNK1104.
+# This script:
+#   1. Stops mimageviewer-* processes started from this repo
+#   2. Polls for file-handle release (up to 10 seconds)
+#   3. Runs `cargo build --release --bin mimageviewer` (extra args are passed through)
 #
-# 使い方:
+# Usage:
 #   PS> scripts\build-release.ps1
-#   PS> scripts\build-release.ps1 --features foo  # 追加引数は cargo にパス
-#
-# ビルド完了後にユーザーが mIV を再起動するのは手作業 (タスクトレイ常駐を
-# 維持するかどうかはユーザーの意図に依存するため自動で再起動はしない)。
+#   PS> scripts\build-release.ps1 --features foo
 
 [CmdletBinding()]
 param(
@@ -23,40 +19,81 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# 停止対象の image name (cargo が触るのは release exe だが、susie32 も
-# 親プロセスとファイル系を共有することがあるので一緒に止める)。
-$Targets = @('mimageviewer', 'mimageviewer-susie32')
+$repoRoot = (Get-Location).Path
+$repoRootLower = $repoRoot.ToLower()
+$releaseExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer.exe'
 
-$KilledAny = $false
-foreach ($name in $Targets) {
-    $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
-    foreach ($p in $procs) {
-        Write-Host ("[build-release] stopping {0} (PID={1})" -f $p.ProcessName, $p.Id)
+# Match all "mimageviewer*" prefix processes (Get-Process -Name does not accept
+# wildcards, hence the Where-Object filter).
+$candidates = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'mimageviewer*' })
+
+$toKill = @()
+foreach ($p in $candidates) {
+    $path = $null
+    try { $path = $p.Path } catch { $path = $null }
+    $included = $false
+    if (-not $path) {
+        $included = $true
+    } else {
+        $pl = $path.ToLower()
+        if ($pl.StartsWith($repoRootLower)) {
+            $included = $true
+        } elseif ($p.Name -eq 'mimageviewer-susie32') {
+            # susie32 worker is extracted to APPDATA but spawned as a child of the
+            # repo-built mimageviewer.exe, so stop it together.
+            $included = $true
+        }
+    }
+    if ($included) {
+        $toKill += $p
+    }
+}
+
+if ($toKill.Count -eq 0) {
+    Write-Host "[build-release] no running mimageviewer process found"
+} else {
+    foreach ($p in $toKill) {
+        $pathLabel = '(path unknown)'
+        if ($p.Path) { $pathLabel = $p.Path }
+        Write-Host ("[build-release] stopping {0} (PID={1}) {2}" -f $p.ProcessName, $p.Id, $pathLabel)
         try {
             Stop-Process -Id $p.Id -Force -ErrorAction Stop
-            $KilledAny = $true
         } catch {
             Write-Warning ("[build-release] Stop-Process failed for PID={0}: {1}" -f $p.Id, $_)
         }
     }
+    # Backup with taskkill in case Stop-Process was denied. taskkill exits 128 on
+    # "no such image" so it is harmless when nothing matches.
+    & taskkill /IM mimageviewer.exe /F 2>$null | Out-Null
+    & taskkill /IM mimageviewer-susie32.exe /F 2>$null | Out-Null
 }
 
-if ($KilledAny) {
-    # OS のファイルハンドル解放は数百 ms 遅れることがあるのでポーリングする。
-    # Test-Path で書き込みロックは検知できないので、Open-FileWrite を試して捕まえる。
-    $exePath = Join-Path -Path (Get-Location) -ChildPath 'target\release\mimageviewer.exe'
-    if (Test-Path $exePath) {
-        $deadline = (Get-Date).AddSeconds(5)
-        while ((Get-Date) -lt $deadline) {
-            try {
-                # 書き込み排他で開いてみる: 成功したらロックは抜けている。
-                $fs = [System.IO.File]::Open($exePath, 'Open', 'ReadWrite', 'None')
-                $fs.Close()
-                break
-            } catch {
-                Start-Sleep -Milliseconds 100
-            }
+# Wait for the OS file handle to release. Stop-Process is synchronous but the
+# kernel handle table can lag for a few hundred ms. Poll by trying an exclusive
+# write open.
+if (Test-Path $releaseExe) {
+    $deadline = (Get-Date).AddSeconds(10)
+    $unlocked = $false
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $fs = [System.IO.File]::Open($releaseExe, 'Open', 'ReadWrite', 'None')
+            $fs.Close()
+            $unlocked = $true
+            break
+        } catch {
+            Start-Sleep -Milliseconds 200
         }
+    }
+    if (-not $unlocked) {
+        Write-Warning ("[build-release] {0} is still locked after 10s." -f $releaseExe)
+        $handleExe = Get-Command handle.exe -ErrorAction SilentlyContinue
+        if ($handleExe) {
+            Write-Warning "[build-release] handle.exe output:"
+            & handle.exe -nobanner $releaseExe 2>$null
+        } else {
+            Write-Warning "[build-release] install Sysinternals handle.exe to identify the locker."
+        }
+        Write-Warning "[build-release] proceeding to cargo build anyway; link may still fail."
     }
 }
 
