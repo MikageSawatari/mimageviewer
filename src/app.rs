@@ -14122,6 +14122,110 @@ mod phase_c_drill_nav_tests {
         ));
     }
 
+    /// 2026-04 ユーザー報告: Ctrl+G で 1 つめのコンテナに drill-in して Ctrl+↓ を
+    /// 押したとき、現コンテナ subtree を抜けたら**次コンテナの container_root** に
+    /// 跳ぶこと。旧実装は cross-container フラットリスト + dedup で、ネスト関係にある
+    /// コンテナで「次コンテナ深部」(例: `output > 2025-12-30-1`) に直接ワープしていた。
+    #[test]
+    fn ctrl_down_at_container_end_jumps_to_next_container_root() {
+        use crate::global_search_ui::GlobalSearchView;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+
+        // コンテナ A: 直接ヒット 2 件 (件数で先頭になる)。
+        // parent_container("c:/root/2025-11-30/a.jpg") = "c:/root/2025-11-30" → これがコンテナ root
+        // hit 親まで walk up すると "2025-11-30" のみ → DFS = [2025-11-30]
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/2025-11-30/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/2025-11-30/b.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // コンテナ B: deep ヒット 1 件。parent_container = "c:/root/output/2025-12-30-1"
+        // DFS = [2025-12-30-1] のみ (container_root より上は walk しない)
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/output/2025-12-30-1/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+
+        // A に drill-in。
+        let a_root = std::path::PathBuf::from("c:/root/2025-11-30");
+        app.drill_into_container(a_root.clone(), false);
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, container_root, .. } => {
+                assert_eq!(current_path, &a_root);
+                assert_eq!(container_root, &a_root);
+            }
+            _ => panic!("drill_into_container 後は DrilledInto"),
+        }
+
+        // Ctrl+↓: A の subtree は [a_root] のみ → 末端 → 次コンテナ B の container_root に跳ぶ。
+        // ここで「container_root と current_path が同じ」になることが重要 (= breadcrumb は
+        // `> 2025-12-30-1` だけになり、深部ワープ `> output > 2025-12-30-1` は起きない)。
+        app.global_search_ctrl_nav(true);
+        let b_root = std::path::PathBuf::from("c:/root/output/2025-12-30-1");
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, container_root, .. } => {
+                assert_eq!(container_root, &b_root, "次コンテナ root に跳ぶべき");
+                assert_eq!(
+                    current_path, &b_root,
+                    "current_path が container_root と一致 (= breadcrumb は root_name だけ)"
+                );
+            }
+            _ => panic!("Ctrl+↓ 後も DrilledInto"),
+        }
+    }
+
+    /// Ctrl+G drilled view で Ctrl+↓ がコンテナ subtree 内では DFS 順で潜ること。
+    /// (cross-container 跨ぎではない通常ケースの回帰ガード)
+    #[test]
+    fn ctrl_down_within_container_descends_dfs() {
+        use crate::global_search_ui::GlobalSearchView;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // コンテナ root に直接ヒット + サブフォルダにもヒット。
+        // parent_container 単位で見ると "root" と "root/sub" の 2 コンテナだが、
+        // Newer/Older ではなく HitCount ソートで root (件数 2) → root/sub (件数 1) の順。
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/x/root/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/x/root/b.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/x/root/sub/c.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+
+        // コンテナ root に drill-in。subtree DFS は [root, root/sub]。
+        let root = std::path::PathBuf::from("c:/x/root");
+        app.drill_into_container(root.clone(), false);
+
+        // Ctrl+↓: subtree 内 DFS の次 (root/sub)。container_root は root のまま。
+        app.global_search_ctrl_nav(true);
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, container_root, .. } => {
+                assert_eq!(container_root, &root, "container_root は不変");
+                assert_eq!(
+                    current_path,
+                    &std::path::PathBuf::from("c:/x/root/sub"),
+                    "subtree 内 DFS で sub に潜る"
+                );
+            }
+            _ => panic!("Ctrl+↓ 後も DrilledInto"),
+        }
+    }
+
     /// 2026-04 ユーザー要望: Ctrl+G drilled view のサブフォルダ表示は通常フォルダと
     /// 同じ filter ルールに揃える。「★3 のみ」では未評価サブフォルダは隠れ、
     /// 「なし+★3」では未評価サブフォルダが (descendant 件数バッジつきで) 表示される。

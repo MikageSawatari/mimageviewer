@@ -682,67 +682,6 @@ fn is_fullscreen_target(item: Option<&GridItem>) -> bool {
     )
 }
 
-/// Ctrl+↑↓ 用のナビゲーションエントリ。コンテナ境界を跨ぐフラットリストで使う。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NavEntry {
-    pub container_root: PathBuf,
-    pub path: PathBuf,
-    pub is_zip: bool,
-}
-
-/// 全コンテナを束ねた Ctrl+↑↓ ナビゲーションリストを作る。
-///
-/// - コンテナ順序は Aggregated view と同じ (ヒット件数降順 → 名前昇順)
-/// - 各 Folder コンテナは `collect_hit_folders_dfs` で DFS 展開 (親 → 子 → 兄弟)
-/// - ZIP コンテナは ZIP ルート 1 点のみ (v0.8.0 は内部 DFS 未対応, ZIP 内は
-///   ルートにいる扱いで次のコンテナに跳ぶ)
-///
-/// 集約ロジックは「ヒットの直上フォルダ」単位なので、`C:/A` と `C:/A/sub` が
-/// どちらも独立コンテナとして現れる場合がある (C:/A に直接ヒット + C:/A/sub にも
-/// ヒット)。その場合 DFS 展開すると `C:/A/sub` は `sub コンテナのルート` と
-/// `A コンテナの子` として二重に現れるので、**path 単位で dedup して最後の
-/// 出現を残す**。これで「A → A/sub → B」という自然な (親 → 子 → 兄弟) DFS 順に
-/// なり、重複エントリを跨いだ不要な行ったり来たりを防げる。
-pub(crate) fn build_cross_container_nav_list(state: &GlobalSearchState) -> Vec<NavEntry> {
-    // ナビ順は表示順と揃える。mtime は `build_aggregated_items` が必ず事前に populate
-    // しているので、ここでは mut を要求せず既存の mtime キャッシュを参照するだけ。
-    let containers = sort_containers_with_mode(&state.containers, state.sort_mode);
-    let mut raw: Vec<NavEntry> = Vec::new();
-    for c in &containers {
-        match c.kind {
-            SearchContainerKind::Folder => {
-                for p in collect_hit_folders_dfs(&state.all_hits, &c.path) {
-                    raw.push(NavEntry {
-                        container_root: c.path.clone(),
-                        path: p,
-                        is_zip: false,
-                    });
-                }
-            }
-            SearchContainerKind::Zip => {
-                raw.push(NavEntry {
-                    container_root: c.path.clone(),
-                    path: c.path.clone(),
-                    is_zip: true,
-                });
-            }
-        }
-    }
-    // path 単位で dedup。最後の出現を残すことで、ネスト構造では「親コンテナ内の
-    // 子」として列挙される entry を優先する (container_root の親側が保持される)。
-    // `seen_last_pos` を使って最後の出現位置を記録し、それ以外を除外する。
-    let mut last_pos: std::collections::HashMap<PathBuf, usize> =
-        std::collections::HashMap::with_capacity(raw.len());
-    for (i, e) in raw.iter().enumerate() {
-        last_pos.insert(e.path.clone(), i);
-    }
-    raw.into_iter()
-        .enumerate()
-        .filter(|(i, e)| last_pos.get(&e.path) == Some(i))
-        .map(|(_, e)| e)
-        .collect()
-}
-
 /// `container_root` 配下でヒットを含むフォルダを DFS 順で列挙する。
 /// 先頭は常に `container_root` 自身。
 pub(crate) fn collect_hit_folders_dfs(
@@ -1086,9 +1025,10 @@ impl App {
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
         // Codex P3 対応: DrilledInto ビューで done=true rebuild を迎えたとき、
         // `build_drilled_items` は `ensure_container_mtime_populated` を呼ばないため
-        // mtime が埋まらないまま残る。結果、その状態で `build_cross_container_nav_list`
-        // (Ctrl+↑↓ で呼ばれる) が Newer/Older ソートを mtime=None で走らせてしまう。
-        // view に関わらず rebuild の入口で populate しておく (done 未達なら関数内で no-op)。
+        // mtime が埋まらないまま残る。結果、その状態で `global_search_ctrl_nav`
+        // (Ctrl+↑↓) が `sort_containers_with_mode` を Newer/Older ソートを mtime=None
+        // で走らせてしまう。view に関わらず rebuild の入口で populate しておく
+        // (done 未達なら関数内で no-op)。
         ensure_container_mtime_populated(&mut self.global_search);
         let rating_filter = self.settings.rating_filter;
         let (items, image_metas) = match self.global_search.view.clone() {
@@ -1330,34 +1270,62 @@ impl App {
             } => (container_root, current_path),
             _ => return,
         };
-        // 全コンテナを走査して「(container_root, path, is_zip)」のフラットリストを作る。
-        // 表示順はアグリゲート view と同じ (ヒット件数降順 → 名前昇順)。
-        let flat = build_cross_container_nav_list(&self.global_search);
-        // 現在位置の突き合わせ: まず (container_root, path) の完全一致を試し、
-        // 無ければ path のみで一致させる。後者は、dedup で別 container_root の entry に
-        // 統合されたパス (例: `C:/A/sub` コンテナで drill-in したが、flat list では
-        // container_root=C:/A 側の entry が残っているケース) に到達するため。
-        let pos = flat
-            .iter()
-            .position(|e| e.container_root == container_root && e.path == current_path)
-            .or_else(|| flat.iter().position(|e| e.path == current_path));
-        let Some(pos) = pos else { return };
-        let next_pos = if forward {
-            if pos + 1 < flat.len() {
-                pos + 1
-            } else {
-                return;
-            }
-        } else if pos > 0 {
-            pos - 1
-        } else {
+
+        // 現コンテナを Aggregated と同じ並び順で求め、その中での位置を取る。
+        let containers = sort_containers_with_mode(
+            &self.global_search.containers,
+            self.global_search.sort_mode,
+        );
+        let Some(cur_idx) = containers.iter().position(|c| c.path == container_root) else {
             return;
         };
-        let next = &flat[next_pos];
+        let cur = &containers[cur_idx];
+
+        // 現コンテナ subtree の DFS リスト。container_root を起点として subtree 内に
+        // 閉じて列挙するので、親コンテナと subset コンテナがネストしていても
+        // 「2025-11-30 (container_root) → サブフォルダ → 次のコンテナ root」の順で素直に辿れる。
+        let dfs: Vec<PathBuf> = match cur.kind {
+            SearchContainerKind::Folder => {
+                collect_hit_folders_dfs(&self.global_search.all_hits, &container_root)
+            }
+            SearchContainerKind::Zip => vec![container_root.clone()],
+        };
+        let dfs_pos = dfs.iter().position(|p| p == &current_path);
+
+        // 1) 現コンテナ subtree 内での次/前を試す。
+        if let Some(i) = dfs_pos {
+            let within = if forward {
+                dfs.get(i + 1).cloned()
+            } else if i > 0 {
+                Some(dfs[i - 1].clone())
+            } else {
+                None
+            };
+            if let Some(next_path) = within {
+                self.global_search.view = GlobalSearchView::DrilledInto {
+                    container_root: container_root.clone(),
+                    current_path: next_path,
+                    is_zip: false,
+                };
+                self.rebuild_items_from_global_search();
+                return;
+            }
+        }
+
+        // 2) subtree を抜けた → 次/前のコンテナの container_root へジャンプ。
+        //    これにより `> output > 2025-12-30-1` のような次コンテナ深部への
+        //    ワープを避け、検索結果一覧の「次のヒット」へ素直に進む。
+        let next_container_idx = if forward {
+            cur_idx.checked_add(1).filter(|&i| i < containers.len())
+        } else {
+            cur_idx.checked_sub(1)
+        };
+        let Some(next_idx) = next_container_idx else { return };
+        let next = &containers[next_idx];
         self.global_search.view = GlobalSearchView::DrilledInto {
-            container_root: next.container_root.clone(),
+            container_root: next.path.clone(),
             current_path: next.path.clone(),
-            is_zip: next.is_zip,
+            is_zip: matches!(next.kind, SearchContainerKind::Zip),
         };
         self.rebuild_items_from_global_search();
     }
@@ -2019,68 +1987,6 @@ mod tests {
         );
     }
 
-    // build_cross_container_nav_list: 複数コンテナの DFS を順番通りに平坦化。
-    // Ctrl+↓ が container1 末端から container2 に跨る挙動の根拠。
-    #[test]
-    fn nav_list_crosses_container_boundary_dfs_order() {
-        let mut state = GlobalSearchState::default();
-        // container A (ヒット 3) → B (ヒット 1) の順。A は sub を持つ。
-        for p in [
-            "C:/A/a1.jpg",
-            "C:/A/sub/a2.jpg",
-            "C:/A/sub/a3.jpg",
-            "C:/B/b1.jpg",
-        ] {
-            state.accumulate_hit(&GlobalHit {
-                path: p.into(),
-                score: 1.0,
-                stars: 0,
-            });
-        }
-        let flat = build_cross_container_nav_list(&state);
-        let paths: Vec<_> = flat.iter().map(|e| e.path.clone()).collect();
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("C:/A"),
-                PathBuf::from("C:/A/sub"),
-                PathBuf::from("C:/B"),
-            ]
-        );
-        // container_root も正しく紐づいている (境界跨ぎ検証)
-        assert_eq!(flat[0].container_root, PathBuf::from("C:/A"));
-        assert_eq!(flat[1].container_root, PathBuf::from("C:/A"));
-        assert_eq!(flat[2].container_root, PathBuf::from("C:/B"));
-    }
-
-    // ZIP コンテナは内部展開せず 1 エントリで計上 (v0.8.0 方針)。
-    #[test]
-    fn nav_list_zip_containers_are_flat_entries() {
-        let mut state = GlobalSearchState::default();
-        state.accumulate_hit(&GlobalHit {
-            path: "C:/book.zip!img1.jpg".into(),
-            score: 1.0,
-            stars: 0,
-        });
-        state.accumulate_hit(&GlobalHit {
-            path: "C:/book.zip!img2.jpg".into(),
-            score: 1.0,
-            stars: 0,
-        });
-        state.accumulate_hit(&GlobalHit {
-            path: "C:/folder/a.jpg".into(),
-            score: 1.0,
-            stars: 0,
-        });
-        let flat = build_cross_container_nav_list(&state);
-        // ヒット件数降順: book.zip (2) → folder (1)
-        assert_eq!(flat.len(), 2);
-        assert_eq!(flat[0].path, PathBuf::from("C:/book.zip"));
-        assert!(flat[0].is_zip);
-        assert_eq!(flat[1].path, PathBuf::from("C:/folder"));
-        assert!(!flat[1].is_zip);
-    }
-
     // build_drilled_items: current_path に直接ヒット + ヒット持ちサブを Folder として
     // 並べる。current_path と異なる兄弟 (別 container) のヒットは無視される。
     #[test]
@@ -2368,61 +2274,6 @@ mod tests {
             "img.jpg"
         );
         assert_eq!(k2, expected);
-    }
-
-    /// Ctrl+↑↓ のフラット ナビリストが、Folder / ZIP / PDF (= SearchContainer として
-    /// 立つもの) を混在で並べ、ヒット件数降順 + 名前昇順でソートすること。
-    ///
-    /// 2026-04 ユーザー要望: Ctrl+↑↓ で folder と ZIP の混在移動を確認したい。
-    #[test]
-    fn build_cross_container_nav_list_mixes_folder_and_zip_across_containers() {
-        let mut state = GlobalSearchState::default();
-        // C:/folder_a に 1 件 (少)
-        state.accumulate_hit(&GlobalHit {
-            path: "C:/folder_a/img.jpg".into(),
-            score: 1.0,
-            stars: 0,
-        });
-        // C:/folder_b に 3 件 (多)
-        for n in 0..3 {
-            state.accumulate_hit(&GlobalHit {
-                path: format!("C:/folder_b/p{n}.jpg"),
-                score: 1.0,
-                stars: 0,
-            });
-        }
-        // C:/book.zip に 2 件 (中)
-        state.accumulate_hit(&GlobalHit {
-            path: "C:/book.zip!e1.jpg".into(),
-            score: 1.0,
-            stars: 0,
-        });
-        state.accumulate_hit(&GlobalHit {
-            path: "C:/book.zip!e2.jpg".into(),
-            score: 1.0,
-            stars: 0,
-        });
-
-        let nav = build_cross_container_nav_list(&state);
-        // ソート: 件数降順 (3 → 2 → 1)
-        assert!(nav.len() >= 3, "nav entries count: {}", nav.len());
-        // 先頭は C:/folder_b (3 件) → folder
-        assert_eq!(nav[0].container_root, PathBuf::from("C:/folder_b"));
-        assert!(!nav[0].is_zip);
-        // 次は C:/book.zip (2 件) → ZIP
-        let book_idx = nav
-            .iter()
-            .position(|e| e.container_root == PathBuf::from("C:/book.zip"))
-            .expect("book.zip must be in nav list");
-        assert!(nav[book_idx].is_zip);
-        // C:/folder_a (1 件) → folder
-        let a_idx = nav
-            .iter()
-            .position(|e| e.container_root == PathBuf::from("C:/folder_a"))
-            .expect("folder_a must be in nav list");
-        assert!(!nav[a_idx].is_zip);
-        // 件数多い方が先に並ぶ (folder_b < book.zip < folder_a の順で見つかる)
-        assert!(book_idx < a_idx);
     }
 
     // ---- タグピッカーヘルパー (Phase D) ----
