@@ -3427,16 +3427,10 @@ impl App {
             }
         }
         if let Some(top) = self.favsearch.nav_stack.last().cloned() {
-            // folder_history に古い選択が残っていると select_after_load より優先されるので、
-            // 戻り先のエントリをクリアして「直前にいたフォルダ/ファイル」を選ばせる。
-            self.folder_history.remove(&top);
             self.load_folder(top);
             self.update_favsearch_address();
         } else {
             // スタックが空になった = 検索結果リストに戻る。
-            // 合成パスの folder_history も消して select_after_load を活かす。
-            let synthetic = search_results_synthetic_path();
-            self.folder_history.remove(&synthetic);
             self.execute_favsearch();
         }
     }
@@ -4457,26 +4451,22 @@ impl App {
         }
 
         // ── 履歴復元 + last_folder 保存 ──
-        if let Some(&(scroll, sel)) = self.folder_history.get(&source_path) {
-            self.scroll_offset_y = scroll;
-            self.selected = sel;
-            if sel.is_some() {
-                self.scroll_to_selected = true;
-            }
-            // 前回保存時は可視だった sel が、現在のフィルタ状態では非可視かもしれない。
-            // `rebuild_visible_indices` 時点では selected が None だったので redirect が
-            // 走っておらず、ここで再度 redirect して WYSIWYG 不変条件を保つ (Codex P2)。
-            self.redirect_selected_to_visible();
-        } else if let Some(name) = self.select_after_load.take() {
-            // 履歴がない場合のフォールバック: 指定名のアイテムを探して選択
-            let name_lower = name.to_lowercase();
-            if let Some(idx) = self
-                .items
-                .iter()
-                .position(|item| item.name().to_lowercase() == name_lower)
-            {
-                self.selected = Some(idx);
-                self.scroll_to_selected = true;
+        // `select_after_load` (BS 戻り / 親フォルダボタン / `favsearch_back`) が指定されている
+        // ときは履歴より優先する: 深い階層から BS で戻ったとき、最初にフォルダへ入った位置
+        // ではなく「今いる位置」にカーソルを合わせるため。指定アイテムが items に見つから
+        // なかった場合 (削除等) のみ履歴へフォールバック。
+        let restored = self.try_select_after_load();
+        if !restored {
+            if let Some(&(scroll, sel)) = self.folder_history.get(&source_path) {
+                self.scroll_offset_y = scroll;
+                self.selected = sel;
+                if sel.is_some() {
+                    self.scroll_to_selected = true;
+                }
+                // 前回保存時は可視だった sel が、現在のフィルタ状態では非可視かもしれない。
+                // `rebuild_visible_indices` 時点では selected が None だったので redirect が
+                // 走っておらず、ここで再度 redirect して WYSIWYG 不変条件を保つ (Codex P2)。
+                self.redirect_selected_to_visible();
             }
         }
         // 検索結果用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
@@ -7705,6 +7695,27 @@ impl App {
         let mut v: Vec<usize> = self.keep_set.iter().copied().collect();
         v.sort_unstable();
         v
+    }
+
+    /// `select_after_load` のヒントで items 内をケース無視で検索し、見つかれば
+    /// selected を更新して true を返す。フィルタで隠れていれば直近の可視 idx に逃がす
+    /// (`redirect_selected_to_visible` と同じ WYSIWYG 不変条件)。
+    fn try_select_after_load(&mut self) -> bool {
+        let Some(name) = self.select_after_load.take() else {
+            return false;
+        };
+        let name_lower = name.to_lowercase();
+        let Some(idx) = self
+            .items
+            .iter()
+            .position(|item| item.name().to_lowercase() == name_lower)
+        else {
+            return false;
+        };
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.redirect_selected_to_visible();
+        true
     }
 
     /// `self.selected` が visible_indices から外れていたら、items 順で直近の
