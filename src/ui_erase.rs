@@ -73,27 +73,20 @@ impl App {
     /// 終了時に `reset_erase_mode` が元の spread_mode を復元する。ペアの右ページへは
     /// パネルの「右ページ」ボタンで `switch_erase_target_in_spread` 経由で切り替える。
     pub(crate) fn enter_erase_mode(&mut self, fs_idx: usize) {
-        // 見開きから入った場合は左ページへピボット。spread_mode を Single に倒し
-        // ペアと元モードを覚えておく。Single 起動 / 片側のみのページ (表紙・末尾奇数・
-        // 横長画像) からは pair=None でそのまま続行する。
-        let spread_pair = if self.spread_mode.is_spread() {
-            match self.resolve_spread_pair(fs_idx) {
-                crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
-                crate::ui_fullscreen::SpreadPair::Single => None,
-            }
-        } else {
-            None
+        // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
+        // (表紙・末尾奇数・横長画像) では `resolve_spread_pair` が Single を返すので
+        // ピボット処理はスキップされる。
+        let spread_pair = match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
+            crate::ui_fullscreen::SpreadPair::Single => None,
         };
-        // 編集対象ページ: ペアありなら左ページ、それ以外は呼び出し側の指定値そのまま。
         let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
         if let Some(pair) = spread_pair {
-            self.erase_saved_spread_mode = Some(self.spread_mode);
-            self.erase_spread_pair = Some(pair);
-            self.spread_mode = crate::settings::SpreadMode::Single;
-            self.fullscreen_idx = Some(target_idx);
-            // ズーム/パン位置は単一ページ表示用に初期化
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
+            self.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+                saved_mode: self.spread_mode,
+                pair,
+            });
+            self.set_single_page_view(target_idx);
         }
         let fs_idx = target_idx;
         // 元画像を取得: erase_base_cache (inpaint前の元画像) を優先、なければキャッシュから
@@ -207,14 +200,25 @@ impl App {
         // 見開きから入っていた場合は spread_mode と表示ページを復元する。
         // ページ位置は left_idx に揃える (resolve_spread_pair が同じペアを返すので
         // 元と同じ見開きが再構築される)。ズーム/パンはリセット。
-        if let Some(saved) = self.erase_saved_spread_mode.take() {
-            self.spread_mode = saved;
-            if let Some((left, _right)) = self.erase_spread_pair.take() {
-                self.fullscreen_idx = Some(left);
-            }
+        // ※ `set_single_page_view` を使わないのは spread_mode を Single に倒さない
+        //   ため (= 見開きへ復帰する経路)。
+        if let Some(ctx) = self.erase_spread_ctx.take() {
+            self.spread_mode = ctx.saved_mode;
+            self.fullscreen_idx = Some(ctx.pair.0);
             self.fs_zoom = 1.0;
             self.fs_pan = egui::Vec2::ZERO;
         }
+    }
+
+    /// 単一ページ表示用に状態を初期化する: spread_mode を Single に倒し、
+    /// `fullscreen_idx` を `idx` に固定し、ズーム/パンをリセット。
+    /// `enter_erase_mode` のピボット先と `switch_erase_target_in_spread` の
+    /// ページ切替先で同じシーケンスを使うので共通化している。
+    fn set_single_page_view(&mut self, idx: usize) {
+        self.spread_mode = crate::settings::SpreadMode::Single;
+        self.fullscreen_idx = Some(idx);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
     }
 
     /// 見開き消しゴム中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
@@ -226,30 +230,21 @@ impl App {
         ctx: &egui::Context,
         new_idx: usize,
     ) {
-        let saved_mode = self.erase_saved_spread_mode;
-        let pair = self.erase_spread_pair;
         // 同ページなら no-op
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
-        // 1. 現ページの編集を確定 (マスクが空なら即 reset、マスクありなら inpaint 投入)。
-        //    どちらにせよ reset_erase_mode が呼ばれて erase_saved_spread_mode は消える。
+        // 現ページの編集を確定。`apply_inpaint_only` は inpaint 投入だけ行い、
+        // `erase_spread_ctx` を含む消しゴム状態は壊さない (spread 切替を意識した版)。
+        // マスクが空なら inpaint も DB 書き込みも走らないので、空 toggle でも安全。
         if let Some(idx) = self.fullscreen_idx {
-            self.execute_erase_inpaint(ctx, idx);
+            self.apply_inpaint_only(ctx, idx);
         }
-        // 2. 切替後も spread 状態を維持するため再設定。reset_erase_mode が saved_mode を
-        //    spread_mode に書き戻しているので、ここで再度 Single に倒す。これをやらないと
-        //    enter_erase_mode 内のペア再判定が走って強制的に左ページへ戻されてしまう
-        //    (target_idx = pair.left で fullscreen_idx が上書きされる)。
-        self.erase_saved_spread_mode = saved_mode;
-        self.erase_spread_pair = pair;
-        self.spread_mode = crate::settings::SpreadMode::Single;
-        // 3. 新ページへ移動 + ズーム/パン初期化。
-        self.fullscreen_idx = Some(new_idx);
-        self.fs_zoom = 1.0;
-        self.fs_pan = egui::Vec2::ZERO;
-        // 4. 新ページで編集モード開始。spread_mode = Single なので enter 内のペア再判定は
-        //    スキップされ、erase_saved_spread_mode / erase_spread_pair はそのまま保たれる。
+        // 新ページへピボット。`erase_spread_ctx` は触らないので panel ボタンは
+        // そのまま左/右トグルとして使い続けられる。
+        self.set_single_page_view(new_idx);
+        // 新ページで編集モード開始。spread_mode = Single なので enter 内のペア再判定は
+        // スキップされ、`erase_spread_ctx` はそのまま保たれる。
         self.enter_erase_mode(new_idx);
     }
 
@@ -742,6 +737,12 @@ impl App {
         if w == 0 || h == 0 {
             return None;
         }
+        // 早期 return: ビットマップに 1 つも true が無く、ベクタも空ならクローン不要。
+        // 4K ページでは bitmap.clone() ≈ 33MB なので、見開き左/右トグル等で空マスク
+        // のまま `composite_mask` が呼ばれるケースで無駄なアロケーションを避ける。
+        if self.erase_vectors.is_empty() && !mask.iter().any(|&b| b) {
+            return Some(vec![false; w * h]);
+        }
         let mut out = mask.clone();
         crate::mask_db::rasterize_vectors_into(&mut out, &self.erase_vectors, w, h);
         Some(out)
@@ -881,7 +882,7 @@ impl App {
             0.0
         };
         // 見開きペアから入った場合は左/右切替ボタン + セパレータの分を追加 (32 + 8 = 40)。
-        let spread_extra = if self.erase_spread_pair.is_some() {
+        let spread_extra = if self.erase_spread_ctx.is_some() {
             40.0
         } else {
             0.0
@@ -1605,9 +1606,11 @@ impl App {
 
                 // ── 見開きペアの左/右切替ボタン (見開きから入った場合のみ) ──
                 // ボタン押下 = 現ページ編集を Apply → 反対ページへ移動 → 編集再開。
-                // 単一ページ (片側のみのページ) から入った場合は erase_spread_pair が
+                // 単一ページ (片側のみのページ) から入った場合は erase_spread_ctx が
                 // None なのでこのセクション全体が描画されない (= Single と同じ見た目)。
-                if let Some((left_idx, right_idx)) = self.erase_spread_pair {
+                if let Some((left_idx, right_idx)) =
+                    self.erase_spread_ctx.map(|c| c.pair)
+                {
                     let pages = [("左ページ", left_idx), ("右ページ", right_idx)];
                     let page_w = (pw - 4.0) / 2.0;
                     let mut switch_to: Option<usize> = None;
@@ -1948,39 +1951,45 @@ impl App {
 
     // ── Inpaint 実行 ──────────────────────────────────────────────
 
-    /// MI-GAN inpaint を実行。実行前にマスクを DB に保存する。
-    pub(crate) fn execute_erase_inpaint(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    /// マスク保存と MI-GAN inpaint 投入だけ行い、`reset_erase_mode` は呼ばない内部版。
+    /// 戻り値: 何かしら inpaint を投入したら true (保存された)、空マスクで何もしなければ false。
+    /// 返り値で「Apply できたか」が呼び出し側に伝わるので、`execute_erase_inpaint` でも
+    /// `switch_erase_target_in_spread` でも統一的に使える。
+    fn apply_inpaint_only(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
         let composite = match self.composite_mask() {
             Some(c) if c.iter().any(|&m| m) => c,
-            _ => {
-                self.reset_erase_mode();
-                return;
-            }
+            _ => return false,
         };
         let Some(bitmap) = self.erase_mask.clone() else {
-            self.reset_erase_mode();
-            return;
+            return false;
         };
-        let original = match self.erase_base_cache.get(&fs_idx) {
-            Some(p) => Arc::clone(p),
-            None => {
-                self.reset_erase_mode();
-                return;
-            }
+        let Some(original) = self
+            .erase_base_cache
+            .get(&fs_idx)
+            .map(Arc::clone)
+        else {
+            return false;
         };
         let [w, h] = self.erase_mask_size;
-
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_vectors.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
-
         let masked_count = composite.iter().filter(|&&m| m).count();
         crate::logger::log(format!(
             "erase: inpaint start, masked pixels={masked_count}"
         ));
         self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec");
+        true
+    }
+
+    /// MI-GAN inpaint を実行 ([E] 二回押し / Apply 経路)。
+    /// 投入後は `reset_erase_mode` を呼んで消しゴムモード自体を終了する。
+    /// 見開きから入っていた場合は reset 内で見開きが復元される。
+    pub(crate) fn execute_erase_inpaint(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.apply_inpaint_only(ctx, fs_idx) {
+            self.show_feedback_toast("[補完中…]".to_string());
+        }
         self.reset_erase_mode();
-        self.show_feedback_toast("[補完中…]".to_string());
     }
 
     /// 画像ロード完了後に保存済みマスクがあれば自動で inpaint を適用する。

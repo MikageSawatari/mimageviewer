@@ -833,6 +833,16 @@ pub(crate) struct EraseSnapshot {
     pub vectors: Vec<crate::mask_db::LineObject>,
 }
 
+/// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
+/// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
+/// 見開き表示) を復元するために保存する。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EraseSpreadCtx {
+    pub saved_mode: crate::settings::SpreadMode,
+    /// (left_idx, right_idx)。LTR / RTL のいずれでも「画面上の左/右」の意味で固定。
+    pub pair: (usize, usize),
+}
+
 /// 画像補正パネルのスライダードラッグ中に保持するスナップショット。
 ///
 /// ドラッグ中は毎フレーム DB に書かず in-memory のみ更新し、ドラッグ終了時に
@@ -1889,14 +1899,13 @@ pub struct App {
     /// 完了 (もしくは新規投入) で `take()` する。UI スレッドが MI-GAN 推論
     /// (300-500ms) で固まらないようにするための非同期化エントリ。
     pub(crate) erase_inpaint_pending: Option<crate::ui_erase::EraseInpaintPending>,
-    /// 見開きから消しゴムに入ったときの見開きモード保存。`Some` の間は終了時に
-    /// `spread_mode` をこの値に戻す。Single から入った場合は `None`。
-    pub(crate) erase_saved_spread_mode: Option<crate::settings::SpreadMode>,
-    /// 見開きから消しゴムに入ったときのペア (left_idx, right_idx)。
-    /// パネルの「左ページ」「右ページ」ボタンと、終了時のページ位置復元に使う。
-    /// 単一ページから入った場合 / 見開き中でも片側だけのページ (表紙・末尾奇数・
-    /// 横長画像) から入った場合は `None`。
-    pub(crate) erase_spread_pair: Option<(usize, usize)>,
+    /// 見開きから消しゴムに入ったときの状態スナップショット。`Some` の間は終了時に
+    /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を `pair.0` (左ページ) に
+    /// 揃えて見開きを復元する。Single から入った場合・見開き中でも片側だけのページ
+    /// (表紙・末尾奇数・横長画像) から入った場合は `None`。
+    /// 2 値を 1 構造体にまとめてあるのは「mode と pair は常に同時に set / take される」
+    /// という不変条件をフィールドの形で表現するため。
+    pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
 
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
@@ -2324,8 +2333,7 @@ impl Default for App {
             erase_selected_vector: None,
             erase_vector_drag: None,
             erase_inpaint_pending: None,
-            erase_saved_spread_mode: None,
-            erase_spread_pair: None,
+            erase_spread_ctx: None,
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
@@ -15591,8 +15599,10 @@ mod favorite_adjustment_defaults_tests {
         // 編集対象は左ページとする
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single; // 消しゴム中の状態
-        app.erase_saved_spread_mode = Some(SpreadMode::Ltr); // 元のモード
-        app.erase_spread_pair = Some((0, 1));
+        app.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
         app.fs_zoom = 2.0;
         app.fs_pan = egui::Vec2::new(50.0, 30.0);
         app.erase_mode = true;
@@ -15610,24 +15620,22 @@ mod favorite_adjustment_defaults_tests {
             "fullscreen_idx は左ページに戻る (resolve_spread_pair で同ペアが復元される)"
         );
         assert!(
-            app.erase_saved_spread_mode.is_none(),
-            "saved_spread_mode は消費される"
+            app.erase_spread_ctx.is_none(),
+            "spread_ctx は消費される"
         );
-        assert!(app.erase_spread_pair.is_none(), "pair も消費される");
         assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
         assert_eq!(app.fs_pan, egui::Vec2::ZERO, "パンはリセット");
         assert!(!app.erase_mode);
     }
 
-    /// 単一ページから入った場合 (= erase_saved_spread_mode が None) は spread_mode を
+    /// 単一ページから入った場合 (= erase_spread_ctx が None) は spread_mode を
     /// 触らずに reset すること。誤って Single に書き換えないことの回帰ガード。
     #[test]
     fn reset_erase_mode_leaves_spread_state_untouched_when_single_entry() {
         use crate::settings::SpreadMode;
         let (mut app, _g, _tmp, _l) = setup_app();
         app.spread_mode = SpreadMode::Single;
-        app.erase_saved_spread_mode = None;
-        app.erase_spread_pair = None;
+        app.erase_spread_ctx = None;
         app.erase_mode = true;
         app.fullscreen_idx = Some(7);
 
@@ -15639,6 +15647,52 @@ mod favorite_adjustment_defaults_tests {
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
         );
+    }
+
+    /// `switch_erase_target_in_spread`: 左→右ボタンで `fullscreen_idx` がペアの
+    /// もう一方に切り替わり、`erase_spread_ctx` は維持されること (= パネルボタンが
+    /// 引き続きトグルとして使える)。マスクが空の状態で呼んでも安全 (空 inpaint は
+    /// 早期 return、reset 経由で spread_ctx が消えても再保存される)。
+    #[test]
+    fn switch_erase_target_in_spread_moves_to_other_page_keeping_ctx() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single; // 消しゴム中
+        app.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+        app.erase_mode = true;
+        // erase_base_cache に dummy ピクセルを入れる必要は無い: マスクが空なので
+        // apply_inpaint_only は composite_mask の段階で false を返し、
+        // base_cache 参照は走らない。
+
+        let dummy_ctx = egui::Context::default();
+        app.switch_erase_target_in_spread(&dummy_ctx, 1);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(1),
+            "fullscreen_idx が右ページ idx=1 に切り替わる"
+        );
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Single,
+            "spread_mode は Single のまま (見開き表示には戻らない)"
+        );
+        let ctx = app.erase_spread_ctx.expect("spread_ctx は維持される");
+        assert_eq!(ctx.saved_mode, SpreadMode::Ltr);
+        assert_eq!(ctx.pair, (0, 1));
+        assert!(app.erase_mode, "erase_mode は維持される (= 編集継続)");
+        assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
     }
 
     /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は

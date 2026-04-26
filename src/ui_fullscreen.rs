@@ -740,9 +740,14 @@ impl App {
                         }
 
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
-                        // erase_mode 中は spread_mode が Single に倒されているので
-                        // is_spread_double は常に false。明示的なガードは不要。
+                        // erase_mode 中は `enter_erase_mode` が spread_mode を Single に
+                        // 倒している不変条件があり、ここでの is_spread_double は常に false。
+                        // 不変が壊れた場合に気付けるよう debug_assert で検出する。
                         if self.erase_mode {
+                            debug_assert!(
+                                !is_spread_double,
+                                "erase_mode invariant: spread_mode must be Single during erase"
+                            );
                             let zp = self.fs_zoom_pan();
                             self.handle_erase_paint(ctx, image_rect, zp);
                             self.draw_erase_overlay(ui, ctx, image_rect, zp);
