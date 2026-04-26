@@ -236,6 +236,74 @@ impl App {
         }
     }
 
+    /// `fs_idx` 用の「今画面に映っているテクスチャ」を Arc::clone で取り出す。
+    /// 優先順位: 補正済みキャッシュ → AI 処理済み → fs_cache (フルサイズ) → thumbnail。
+    /// Ctrl+↑↓ ナビ前に `fs_holdover_tex` を仕込むためのヘルパ。
+    pub(crate) fn current_fs_tex_for_holdover(
+        &self,
+        fs_idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&fs_idx) {
+            return Some(tex.clone());
+        }
+        let bg = self.effective_upscale_bg_mode();
+        if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(fs_idx, bg)) {
+            return Some(tex.clone());
+        }
+        match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => return Some(tex.clone()),
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => {
+                if let Some((h, _)) = frames.get(*current_frame) {
+                    return Some(h.clone());
+                }
+            }
+            _ => {}
+        }
+        match self.thumbnails.get(fs_idx) {
+            Some(crate::grid_item::ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+            _ => None,
+        }
+    }
+
+    /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込む。
+    /// ナビによる items 入れ替えで fs_cache が drop されても、ロック解除まで
+    /// この Arc を Render パスから参照することで画面が真っ白になるのを防ぐ。
+    pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
+        self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+    }
+
+    /// 毎フレーム呼び出され、`fs_nav_locked` の解除条件を満たしたら lock を解除する。
+    /// 解除条件: 現フルスクリーン idx に対して thumbnails が `Loaded` か
+    /// fs_cache に Static / Animated エントリが入った状態。サムネ以上の
+    /// 表示物が出揃ったので holdover に頼る必要が無くなる。
+    pub(crate) fn poll_fs_nav_lock(&mut self) {
+        if !self.fs_nav_locked {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            // フルスクリーンを抜けたら lock も holdover も意味が無い。
+            self.fs_nav_locked = false;
+            self.fs_holdover_tex = None;
+            return;
+        };
+        let has_full = matches!(
+            self.fs_cache.get(&idx),
+            Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. })
+        );
+        let has_thumb = matches!(
+            self.thumbnails.get(idx),
+            Some(crate::grid_item::ThumbnailState::Loaded { .. })
+        );
+        if has_full || has_thumb {
+            self.fs_nav_locked = false;
+            self.fs_holdover_tex = None;
+        }
+    }
+
     /// フルスクリーン通常モードのズーム/パンが有効なら返す。
     /// 閾値以下なら None (描画側で無変換パスに流れるよう明示するため)。
     pub(crate) fn fs_zoom_pan(&self) -> Option<(f32, egui::Vec2)> {
@@ -1070,7 +1138,18 @@ impl App {
         let thumb_tex = match self.thumbnails.get(fs_idx) {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
             _ => None,
-        };
+        }
+        .or_else(|| {
+            // ナビ ロック中で新ページのサムネ未準備のときは旧ページのテクスチャを
+            // 流用して「ファイル名だけが切り替わる」状態を回避する。サムネが
+            // Loaded になった瞬間 `poll_fs_nav_lock` がロックを解除し holdover が
+            // 解放される。
+            if self.fs_nav_locked {
+                self.fs_holdover_tex.clone()
+            } else {
+                None
+            }
+        });
 
         let location_display = self.location_display_for(fs_idx);
         // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
@@ -2128,19 +2207,32 @@ impl App {
         // 実際の close_fullscreen / load_folder / open_fullscreen は
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
-            let forward = delta > 0;
-            // Ctrl+G 絞り込みビュー中はファイルシステム DFS ではなく検索結果の
-            // NavEntry リスト上を移動する。fs ツリーを跨ぐと「検索結果の外」に
-            // 出てしまうので、検索解除まで Ctrl+G スコープに閉じ込める。
-            if self.global_search.active
-                && matches!(
-                    self.global_search.view,
-                    crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-                )
-            {
-                self.global_search_ctrl_nav_fullscreen(forward);
-            } else if let Some(cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
+            // 連打時のロック: 直前の Ctrl+↓ で開始したナビの新ページ表示が
+            // まだ準備できていない (= サムネ未ロード or fs_cache 未投入) 間は
+            // 入力を捨てて、画面が「ファイル名だけ次々切り替わる」状態を防ぐ。
+            // 待ちが解除されてから次のキーを押せば確実にサムネ以上が見える。
+            if self.fs_nav_locked {
+                // ignore — 次フレームで poll_fs_nav_lock が解除する
+            } else {
+                let forward = delta > 0;
+                // Ctrl+G 絞り込みビュー中はファイルシステム DFS ではなく検索結果の
+                // NavEntry リスト上を移動する。fs ツリーを跨ぐと「検索結果の外」に
+                // 出てしまうので、検索解除まで Ctrl+G スコープに閉じ込める。
+                if self.global_search.active
+                    && matches!(
+                        self.global_search.view,
+                        crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+                    )
+                {
+                    self.global_search_ctrl_nav_fullscreen(forward);
+                } else if let Some(cur) = self.current_folder.clone() {
+                    // ナビ発火前に「今出ているテクスチャ」を holdover に退避し、
+                    // items 入れ替えで fs_cache が drop されても画面が真っ白に
+                    // ならないようにする。`fs_nav_locked = true` で連打を抑止。
+                    self.capture_fs_nav_holdover(fs_idx);
+                    self.fs_nav_locked = true;
+                    self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
+                }
             }
         } else if !close_fs {
             if let Some(new_idx) = jump_to {

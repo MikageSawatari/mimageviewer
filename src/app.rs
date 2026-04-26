@@ -1911,6 +1911,19 @@ pub struct App {
     pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
 
     // ── カタログ LRU キャッシュ ───────────────────────────────────
+    /// フルスクリーン Ctrl+↑↓ ナビ中の「次のページがまだ表示できない」ガード。
+    /// `true` の間は新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
+    /// 新ページの thumbnails が `Loaded` または `fs_cache` に Static エントリが入った
+    /// 時点で false に戻す。これにより Ctrl+↓ 連打中に「ファイル名だけ次々切り替わる」
+    /// 状態を回避し、必ずサムネ以上を表示することを保証する。
+    pub(crate) fs_nav_locked: bool,
+    /// `fs_nav_locked` 中に「現在画面に映っていた」テクスチャを退避しておく場所。
+    /// items 入れ替え (start_loading_items の install_new_items) で fs_cache が
+    /// 全 drop されてしまうため、ナビ発火直前に Arc::clone してここに保持する。
+    /// `egui::TextureHandle` は内部 Arc なので clone は refcount inc だけ。
+    pub(crate) fs_holdover_tex: Option<egui::TextureHandle>,
+
+    // ── カタログ LRU キャッシュ ───────────────────────────────────
     /// folder_path → Arc<CatalogDb> の小さい LRU。
     /// `start_loading_items` は毎ステップで `CatalogDb::open` を呼んでおり、cold path で
     /// 150-260ms (perf-log p95=152ms / max=262ms 計測) の SQLite Connection 初期化が
@@ -2349,6 +2362,8 @@ impl Default for App {
             erase_vector_drag: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
             erase_spread_ctx: None,
+            fs_nav_locked: false,
+            fs_holdover_tex: None,
             catalog_cache: std::collections::HashMap::new(),
             catalog_cache_order: std::collections::VecDeque::new(),
             input_seq: 0,
@@ -9520,6 +9535,9 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        // フルスクリーンを抜けるので Ctrl+↑↓ ナビロックと holdover も解除。
+        self.fs_nav_locked = false;
+        self.fs_holdover_tex = None;
         // グリッドに戻るので Critical 予約を解除し、全 3 ワーカーを Normal に開放。
         crate::pdf_loader::set_critical_reservation(false);
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
@@ -12113,6 +12131,9 @@ impl eframe::App for App {
         let frame_t0 = std::time::Instant::now();
 
         self.poll_thumbnails(ctx);
+        // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
+        // 立った同フレームで holdover を捨てて新画面に切り替える)。
+        self.poll_fs_nav_lock();
         let t_poll = frame_t0.elapsed();
 
         self.update_keep_range_and_requests(frame_t0);
@@ -15703,6 +15724,58 @@ mod favorite_adjustment_defaults_tests {
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
         );
+    }
+
+    /// `poll_fs_nav_lock`: ロック中に新ページのサムネが Loaded になったら自動で
+    /// ロック解除 + holdover 解放 すること。Ctrl+↑↓ ナビ連打時の「ファイル名だけ
+    /// 切り替わる」状態を回避するための主要ガードの回帰テスト。
+    #[test]
+    fn poll_fs_nav_lock_releases_when_thumbnail_becomes_loaded() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // idx 0 が「ナビ後の新ページ」であるとする
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.fs_nav_locked = true;
+        // holdover はテストでは None でも poll の挙動は同じ
+        app.fs_holdover_tex = None;
+
+        // ① まだ Pending → ロックは解除されない。
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked, "Pending 中はロック維持");
+
+        // ② サムネが Loaded になった瞬間 → ロック解除 + holdover クリア。
+        //    Loaded には TextureHandle が必要なので、egui::Context::default の
+        //    TextureManager から空テクスチャを 1 枚取って使う。
+        let ctx = egui::Context::default();
+        let dummy_tex = ctx.load_texture(
+            "test_dummy",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[0] = ThumbnailState::Loaded {
+            tex: dummy_tex.clone(),
+            from_cache: false,
+            rendered_at_px: 64,
+            source_dims: None,
+        };
+        app.fs_holdover_tex = Some(dummy_tex.clone());
+        app.poll_fs_nav_lock();
+        assert!(!app.fs_nav_locked, "Loaded 後はロック解除");
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "Loaded 後は holdover も解放 (Arc refcount 減少)"
+        );
+
+        // ③ フルスクリーンを抜けたら (idx None) ロックは即解除。
+        app.fs_nav_locked = true;
+        app.fs_holdover_tex = Some(dummy_tex);
+        app.fullscreen_idx = None;
+        app.poll_fs_nav_lock();
+        assert!(!app.fs_nav_locked);
+        assert!(app.fs_holdover_tex.is_none());
     }
 
     /// `get_or_open_catalog` の LRU キャッシュ動作: 同じフォルダで 2 回呼ぶと
