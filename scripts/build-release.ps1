@@ -20,7 +20,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Get-Location).Path
-$repoRootLower = $repoRoot.ToLower()
+# Append a trailing separator for path-boundary scoping. Without this, sibling
+# directories like `C:\home\mimageviewer-old` would also match (StartsWith on
+# `C:\home\mimageviewer` is too permissive).
+$repoRootPrefix = $repoRoot.TrimEnd('\') + '\'
+$repoRootPrefixLower = $repoRootPrefix.ToLower()
 $releaseExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer.exe'
 
 # Match all "mimageviewer*" prefix processes (Get-Process -Name does not accept
@@ -32,11 +36,13 @@ foreach ($p in $candidates) {
     $path = $null
     try { $path = $p.Path } catch { $path = $null }
     $included = $false
+    $pathLabel = '(path unknown)'
     if (-not $path) {
         $included = $true
     } else {
+        $pathLabel = $path
         $pl = $path.ToLower()
-        if ($pl.StartsWith($repoRootLower)) {
+        if ($pl.StartsWith($repoRootPrefixLower)) {
             $included = $true
         } elseif ($p.Name -eq 'mimageviewer-susie32') {
             # susie32 worker is extracted to APPDATA but spawned as a child of the
@@ -45,36 +51,39 @@ foreach ($p in $candidates) {
         }
     }
     if ($included) {
-        $toKill += $p
+        # Bundle the candidate process with the path label captured *now* (inside the
+        # try/catch), so later code does not have to re-access $p.Path which can throw
+        # for elevated/protected processes (Codex P2).
+        $toKill += [pscustomobject]@{ Process = $p; PathLabel = $pathLabel }
     }
 }
 
 if ($toKill.Count -eq 0) {
     Write-Host "[build-release] no running mimageviewer process found"
 } else {
-    $anyStopFailed = $false
-    foreach ($p in $toKill) {
-        $pathLabel = '(path unknown)'
-        if ($p.Path) { $pathLabel = $p.Path }
-        Write-Host ("[build-release] stopping {0} (PID={1}) {2}" -f $p.ProcessName, $p.Id, $pathLabel)
+    $failedPids = @()
+    foreach ($entry in $toKill) {
+        $p = $entry.Process
+        Write-Host ("[build-release] stopping {0} (PID={1}) {2}" -f $p.ProcessName, $p.Id, $entry.PathLabel)
         try {
             Stop-Process -Id $p.Id -Force -ErrorAction Stop
         } catch {
-            $anyStopFailed = $true
+            $failedPids += $p.Id
             Write-Warning ("[build-release] Stop-Process failed for PID={0}: {1}" -f $p.Id, $_)
         }
     }
-    # Run taskkill ONLY when Stop-Process failed (e.g. AccessDenied for an elevated
-    # process). taskkill writes "process not found" to stderr and exits 128 when
-    # nothing matches, and with $ErrorActionPreference='Stop' active that becomes
-    # a NativeCommandError that aborts the script before reaching cargo. Fence the
-    # block with a local EAP=Continue so that fallback path never aborts the build.
-    if ($anyStopFailed) {
+    # Backup with taskkill /PID ... ONLY for the specific PIDs we already filtered to
+    # the repo. A global `taskkill /IM mimageviewer.exe /F` would kill installed/portable
+    # mIV instances unrelated to this build (Codex P2). taskkill writes to stderr and
+    # exits non-zero on miss, which under $ErrorActionPreference='Stop' becomes a
+    # NativeCommandError, so fence the block with a local EAP=Continue.
+    if ($failedPids.Count -gt 0) {
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            & taskkill /IM mimageviewer.exe /F 2>$null | Out-Null
-            & taskkill /IM mimageviewer-susie32.exe /F 2>$null | Out-Null
+            foreach ($id in $failedPids) {
+                & taskkill /PID $id /F 2>$null | Out-Null
+            }
         } finally {
             $ErrorActionPreference = $prevEAP
         }

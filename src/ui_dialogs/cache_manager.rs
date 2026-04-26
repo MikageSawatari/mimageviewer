@@ -95,6 +95,10 @@ impl App {
                         self.cache_manager_days
                     ));
                     if ui.add_enabled(!busy, old_btn).clicked() {
+                        // 開きっぱなしの SQLite Connection が握っている .db ファイルは
+                        // remove_file で消せず silent fail するので、削除前に LRU を畳む
+                        // (Codex P3)。
+                        self.evict_all_catalog_cache();
                         self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
                             crate::cache_maintenance::CacheMaintTask::DeleteOld {
                                 days: self.cache_manager_days as u64,
@@ -112,6 +116,8 @@ impl App {
                     let folder_btn = egui::Button::new("  現在のフォルダのキャッシュを削除  ");
                     if ui.add_enabled(has_folder && !busy, folder_btn).clicked() {
                         if let Some(folder) = self.current_folder.clone() {
+                            // 削除前に Connection を畳む (Codex P3): 同上。
+                            self.evict_all_catalog_cache();
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
                                 crate::cache_maintenance::CacheMaintTask::DeleteFolder {
                                     folder,
@@ -173,6 +179,8 @@ impl App {
                         let del_btn = egui::Button::new("  削除する  ");
                         if ui.add_enabled(!busy, del_btn).clicked() {
                             let cache_dir = crate::catalog::default_cache_dir();
+                            // 削除前に Connection を畳む (Codex P3): 同上。
+                            self.evict_all_catalog_cache();
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
                                 crate::cache_maintenance::CacheMaintTask::DeleteAll,
                                 cache_dir,

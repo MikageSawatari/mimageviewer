@@ -4058,6 +4058,16 @@ impl App {
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
+    /// `catalog_cache` の全エントリを drop し、SQLite Connection を閉じる。
+    /// キャッシュマネージャの「削除」操作 (DeleteOld / DeleteAll / DeleteFolder)
+    /// 呼び出し前に必須。Windows では Connection が握っている `.db` ファイルは
+    /// `remove_file` で削除できず silent fail するので、削除前に Connection を
+    /// 全部畳む必要がある (Codex P3)。LRU が小さいので評価コストは無視可能。
+    pub(crate) fn evict_all_catalog_cache(&mut self) {
+        self.catalog_cache.clear();
+        self.catalog_cache_order.clear();
+    }
+
     /// `catalog_cache` から `Arc<CatalogDb>` を取得し、無ければ open して挿入する。
     /// LRU 最大 16 件、超過時は FIFO で古いものから drop (= SQLite Connection close)。
     /// `start_loading_items` の毎ステップ open を吸収するためのキャッシュ。
@@ -7049,6 +7059,9 @@ impl App {
                             at: std::time::Instant::now(),
                         });
                     self.pending_folder_nav_steps = 0;
+                    // items_generation が進まないので poll_fs_nav_lock では解除されない
+                    // → 明示的に release して以降の Ctrl+↑↓ を効くようにする (Codex P1)。
+                    self.release_fs_nav_lock();
                 }
                 FolderNavMode::Grid => {}
             }
@@ -7064,6 +7077,8 @@ impl App {
                 at: std::time::Instant::now(),
             });
             self.pending_folder_nav_steps = 0;
+            // 同上: items_generation 不変のまま return するので明示 release (Codex P1)。
+            self.release_fs_nav_lock();
             emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
             return;
         }
@@ -7108,6 +7123,9 @@ impl App {
                     // fullscreen は close 済みなので、メインビューポートに
                     // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
+                    // 明示 release (Codex P1)。次の Ctrl+↑↓ がブロックされない。
+                    self.release_fs_nav_lock();
                 }
             }
             FolderNavMode::Favsearch { root } => {
@@ -9523,6 +9541,13 @@ impl App {
                 self.folder_nav_pending = None;
                 self.pending_folder_nav_steps = 0;
                 self.pending_folder_nav_mode = FolderNavMode::Grid;
+                // ユーザーが Esc 等で DFS 中にフルスクリーンを抜けた場合、items は
+                // 入れ替わらないので poll_fs_nav_lock では release されない。
+                // ここで明示的に lock / holdover を捨てる (Codex P1)。
+                // apply_folder_nav_result 内の close_fullscreen は事前に
+                // pending を take しているので folder_nav_pending=None でこの分岐に
+                // 入らず、内部 close→open 遷移のロックは保持される。
+                self.release_fs_nav_lock();
             }
         }
         self.fullscreen_idx = None;
@@ -15718,6 +15743,23 @@ mod favorite_adjustment_defaults_tests {
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
         );
+    }
+
+    /// Codex P1 (0.8.2 後半): `release_fs_nav_lock` が `fs_nav_locked_gen` /
+    /// `fs_holdover_tex` を確実に解除すること。境界・キャンセル経路で items_generation
+    /// が進まないまま return すると `poll_fs_nav_lock` では解除されないため、
+    /// その経路で本ヘルパが呼ばれることを別途確認する必要がある。
+    #[test]
+    fn release_fs_nav_lock_clears_both_fields() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.fs_nav_locked_gen = Some(42);
+        app.fs_holdover_tex = None; // None でも問題ない
+        app.release_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+        // 何度呼んでも safe (idempotent)
+        app.release_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
     }
 
     /// `find_fullscreen_nav_target`: 常にフォルダ先頭の画像系アイテムを返すこと。

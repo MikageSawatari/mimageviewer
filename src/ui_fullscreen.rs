@@ -295,6 +295,17 @@ impl App {
         self.fs_nav_locked_gen.is_some()
     }
 
+    /// nav ロックと holdover を強制解除する。`poll_fs_nav_lock` の通常解除条件
+    /// (items_generation 進行 + 新ページの tex 用意) に到達しないケース
+    /// (DFS が境界に当たって path=None / 画像フォルダに着地できず !hit_image_folder /
+    /// ユーザーが Esc でフルスクリーンを抜けて DFS をキャンセル) で明示的に呼ぶ。
+    /// これをやらないと `fs_nav_locked_gen` が永続化して以降の Ctrl+↑↓ がすべて
+    /// 無視される (Codex P1)。
+    pub(crate) fn release_fs_nav_lock(&mut self) {
+        self.fs_nav_locked_gen = None;
+        self.fs_holdover_tex = None;
+    }
+
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込み、`items_generation` を
     /// ロック取得時点で記録する。ナビによる items 入れ替えで fs_cache が drop されても、
     /// ロック解除まで holdover Arc を Render パスから参照することで画面が真っ白に
