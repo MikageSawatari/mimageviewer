@@ -2808,6 +2808,14 @@ impl App {
                 egui::vec2(scaled_rw, scaled_h),
             );
 
+            // ナビ ロック中は旧ページのテクスチャを左右両方の最終フォールバックとして
+            // 使い、「ファイル名のみ表示」状態を回避する。両ページに同じ holdover が
+            // 出るのは束の間 (poll_fs_nav_lock がサムネ Loaded で解除する) なので許容。
+            let holdover_for_locked = if self.fs_nav_locked {
+                self.fs_holdover_tex.as_ref()
+            } else {
+                None
+            };
             Self::draw_fs_spread_page(
                 &painter,
                 left_rect,
@@ -2817,6 +2825,7 @@ impl App {
                 &self.thumbnails,
                 &bg_style,
                 &left_location,
+                holdover_for_locked,
             );
             Self::draw_fs_spread_page(
                 &painter,
@@ -2827,6 +2836,7 @@ impl App {
                 &self.thumbnails,
                 &bg_style,
                 &right_location,
+                holdover_for_locked,
             );
 
             // ルーペが参照するレイアウトを記録 (両ページのサイズが既知のときのみ信頼できる)
@@ -2856,6 +2866,12 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
+            // フォールバック分岐でも nav ロック中の holdover を渡す (上のパス参照)。
+            let holdover_for_locked = if self.fs_nav_locked {
+                self.fs_holdover_tex.as_ref()
+            } else {
+                None
+            };
             Self::draw_fs_spread_page(
                 &painter,
                 left_rect,
@@ -2865,6 +2881,7 @@ impl App {
                 &self.thumbnails,
                 &bg_style,
                 &left_location,
+                holdover_for_locked,
             );
             Self::draw_fs_spread_page(
                 &painter,
@@ -2875,6 +2892,7 @@ impl App {
                 &self.thumbnails,
                 &bg_style,
                 &right_location,
+                holdover_for_locked,
             );
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
@@ -2926,8 +2944,9 @@ impl App {
         thumbnails: &[ThumbnailState],
         bg_style: &FsBgStyle<'_>,
         location_display: &str,
+        holdover_tex: Option<&egui::TextureHandle>,
     ) {
-        // テクスチャ取得（フルサイズ or サムネイル）
+        // テクスチャ取得（フルサイズ or サムネイル → ロック中なら最後に holdover）
         let tex = match fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
             Some(FsCacheEntry::Animated {
@@ -2941,7 +2960,7 @@ impl App {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
             _ => None,
         };
-        let display_tex = tex.as_ref().or(thumb_tex.as_ref());
+        let display_tex = tex.as_ref().or(thumb_tex.as_ref()).or(holdover_tex);
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();

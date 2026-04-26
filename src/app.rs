@@ -9535,9 +9535,12 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
-        // フルスクリーンを抜けるので Ctrl+↑↓ ナビロックと holdover も解除。
-        self.fs_nav_locked = false;
-        self.fs_holdover_tex = None;
+        // ※ ここで `fs_nav_locked` / `fs_holdover_tex` を即時クリアしてはいけない:
+        //   `apply_folder_nav_result` の Fullscreen 分岐は close_fullscreen → load_folder
+        //   → open_fullscreen と直列に呼ぶので、その途中で lock を捨てると新ページが
+        //   thumb_tex 未準備のまま「ファイル名のみ」表示になる。`poll_fs_nav_lock` 側で
+        //   フルスクリーンが本当に閉じた (= 次フレームに `fullscreen_idx` が None のまま)
+        //   ことを確認してから解除する。
         // グリッドに戻るので Critical 予約を解除し、全 3 ワーカーを Normal に開放。
         crate::pdf_loader::set_critical_reservation(false);
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
