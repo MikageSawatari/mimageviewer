@@ -1912,11 +1912,14 @@ pub struct App {
 
     // ── カタログ LRU キャッシュ ───────────────────────────────────
     /// フルスクリーン Ctrl+↑↓ ナビ中の「次のページがまだ表示できない」ガード。
-    /// `true` の間は新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
-    /// 新ページの thumbnails が `Loaded` または `fs_cache` に Static エントリが入った
-    /// 時点で false に戻す。これにより Ctrl+↓ 連打中に「ファイル名だけ次々切り替わる」
-    /// 状態を回避し、必ずサムネ以上を表示することを保証する。
-    pub(crate) fs_nav_locked: bool,
+    /// `Some(gen)` の間は新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に
+    /// 出し続ける。`gen` はロック発火時の `items_generation` のスナップショットで、
+    /// items が入れ替わる (= `install_new_items` で `items_generation` が進む) まで
+    /// ロックを解除しない。これをやらないとナビ発火直後 (まだ DFS 完了前で fs_idx も
+    /// 旧ページのまま) の `poll_fs_nav_lock` が「現ページはロード済」と判定して
+    /// ロックを即解除してしまい、後で実際に items が入れ替わった瞬間に holdover が
+    /// 失われて「ファイル名のみ表示」が一瞬出る不具合になる。
+    pub(crate) fs_nav_locked_gen: Option<u64>,
     /// `fs_nav_locked` 中に「現在画面に映っていた」テクスチャを退避しておく場所。
     /// items 入れ替え (start_loading_items の install_new_items) で fs_cache が
     /// 全 drop されてしまうため、ナビ発火直前に Arc::clone してここに保持する。
@@ -2362,7 +2365,7 @@ impl Default for App {
             erase_vector_drag: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
             erase_spread_ctx: None,
-            fs_nav_locked: false,
+            fs_nav_locked_gen: None,
             fs_holdover_tex: None,
             catalog_cache: std::collections::HashMap::new(),
             catalog_cache_order: std::collections::VecDeque::new(),
@@ -15729,55 +15732,64 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// `poll_fs_nav_lock`: ロック中に新ページのサムネが Loaded になったら自動で
-    /// ロック解除 + holdover 解放 すること。Ctrl+↑↓ ナビ連打時の「ファイル名だけ
-    /// 切り替わる」状態を回避するための主要ガードの回帰テスト。
+    /// `poll_fs_nav_lock`: items_generation が進んだあとに新ページのサムネが
+    /// Loaded になって初めてロック解除されること。`items_generation` チェックが
+    /// 無いと、ナビ発火直後 (まだ items 入れ替え前) で旧ページのサムネが Loaded だと
+    /// 誤って解除されて、後で実際に items が入れ替わった瞬間に「ファイル名のみ表示」が
+    /// 一瞬出てしまう不具合になる。その回帰テスト。
     #[test]
-    fn poll_fs_nav_lock_releases_when_thumbnail_becomes_loaded() {
+    fn poll_fs_nav_lock_waits_for_items_generation_bump() {
         use crate::grid_item::{GridItem, ThumbnailState};
         let (mut app, _g, _tmp, _l) = setup_app();
-        // idx 0 が「ナビ後の新ページ」であるとする
-        app.items
-            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
-        app.thumbnails.push(ThumbnailState::Pending);
-        app.fullscreen_idx = Some(0);
-        app.fs_nav_locked = true;
-        // holdover はテストでは None でも poll の挙動は同じ
-        app.fs_holdover_tex = None;
-
-        // ① まだ Pending → ロックは解除されない。
-        app.poll_fs_nav_lock();
-        assert!(app.fs_nav_locked, "Pending 中はロック維持");
-
-        // ② サムネが Loaded になった瞬間 → ロック解除 + holdover クリア。
-        //    Loaded には TextureHandle が必要なので、egui::Context::default の
-        //    TextureManager から空テクスチャを 1 枚取って使う。
         let ctx = egui::Context::default();
         let dummy_tex = ctx.load_texture(
             "test_dummy",
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[0] = ThumbnailState::Loaded {
+        // 初期: items_generation = 0、idx 0 が「現在表示中ページ」 (Loaded 済) として置く。
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Loaded {
             tex: dummy_tex.clone(),
             from_cache: false,
             rendered_at_px: 64,
             source_dims: None,
-        };
+        });
+        app.fullscreen_idx = Some(0);
+        // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
+        let lock_gen = app.items_generation;
+        app.fs_nav_locked_gen = Some(lock_gen);
         app.fs_holdover_tex = Some(dummy_tex.clone());
+
+        // ① items_generation が進んでいない (= まだナビが完了していない) →
+        //    現ページが Loaded でもロック解除されない (主要バグの回帰防止)。
         app.poll_fs_nav_lock();
-        assert!(!app.fs_nav_locked, "Loaded 後はロック解除");
         assert!(
-            app.fs_holdover_tex.is_none(),
-            "Loaded 後は holdover も解放 (Arc refcount 減少)"
+            app.fs_nav_locked_gen.is_some(),
+            "items_generation 据え置きならロック維持 (旧ページの Loaded で誤解除しない)"
         );
 
-        // ③ フルスクリーンを抜けたら (idx None) ロックは即解除。
-        app.fs_nav_locked = true;
-        app.fs_holdover_tex = Some(dummy_tex);
+        // ② items_generation を進めて再度 poll: 新ページのサムネ Loaded を見て解除。
+        app.items_generation += 1;
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none(), "gen 進行 + Loaded で解除");
+        assert!(app.fs_holdover_tex.is_none(), "holdover も解放");
+
+        // ③ フルスクリーン抜け (fs_idx None) でも、items_generation 進行が必要。
+        //    そうしないとナビ最中の close_fullscreen 経路で誤解除される。
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(dummy_tex.clone());
         app.fullscreen_idx = None;
         app.poll_fs_nav_lock();
-        assert!(!app.fs_nav_locked);
+        assert!(
+            app.fs_nav_locked_gen.is_some(),
+            "items_generation 据え置きなら fs_idx=None でも維持 (apply_folder_nav_result 内の close→open 遷移を許容)"
+        );
+        // items が進んでから抜け検知すれば解除される。
+        app.items_generation += 1;
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
         assert!(app.fs_holdover_tex.is_none());
     }
 

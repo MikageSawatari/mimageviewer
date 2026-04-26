@@ -269,24 +269,44 @@ impl App {
         }
     }
 
-    /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込む。
-    /// ナビによる items 入れ替えで fs_cache が drop されても、ロック解除まで
-    /// この Arc を Render パスから参照することで画面が真っ白になるのを防ぐ。
-    pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
-        self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+    /// `fs_nav_locked_gen.is_some()` の薄いラッパー。
+    /// 入力ハンドラ・描画パスから「現在 nav ロック中か」を簡潔に問い合わせるため。
+    pub(crate) fn fs_nav_is_locked(&self) -> bool {
+        self.fs_nav_locked_gen.is_some()
     }
 
-    /// 毎フレーム呼び出され、`fs_nav_locked` の解除条件を満たしたら lock を解除する。
-    /// 解除条件: 現フルスクリーン idx に対して thumbnails が `Loaded` か
-    /// fs_cache に Static / Animated エントリが入った状態。サムネ以上の
-    /// 表示物が出揃ったので holdover に頼る必要が無くなる。
+    /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込み、`items_generation` を
+    /// ロック取得時点で記録する。ナビによる items 入れ替えで fs_cache が drop されても、
+    /// ロック解除まで holdover Arc を Render パスから参照することで画面が真っ白に
+    /// なるのを防ぐ。`items_generation` のスナップショットは `poll_fs_nav_lock` の
+    /// 「items が入れ替わる前にロックを解除しない」判定に使う。
+    pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
+        self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+        self.fs_nav_locked_gen = Some(self.items_generation);
+    }
+
+    /// 毎フレーム呼び出され、ナビロックの解除条件を満たしたら lock を解除する。
+    /// 解除条件: ① items が入れ替わって `items_generation` が進んだ
+    /// (= `install_new_items` で新フォルダの items が導入された) かつ
+    /// ② 現フルスクリーン idx に対して thumbnails が `Loaded` か
+    /// fs_cache に Static / Animated エントリが入った状態。
+    /// 「items が進む前」(= 旧ページがロード済み判定で誤って解除される) のを
+    /// items_generation チェックで防ぐ。
     pub(crate) fn poll_fs_nav_lock(&mut self) {
-        if !self.fs_nav_locked {
+        let Some(locked_gen) = self.fs_nav_locked_gen else {
+            return;
+        };
+        // items_generation が進んでいない = まだ items 入れ替えが起きていないので
+        // 旧 fs_idx のテクスチャが残っているのは当然。ここで解除すると holdover が
+        // 失われて「ファイル名のみ表示」のフラッシュが出るので保留する。
+        if self.items_generation <= locked_gen {
             return;
         }
         let Some(idx) = self.fullscreen_idx else {
-            // フルスクリーンを抜けたら lock も holdover も意味が無い。
-            self.fs_nav_locked = false;
+            // ユーザーが Esc 等でフルスクリーンを抜けた場合のみここに来る
+            // (apply_folder_nav_result 内の close_fullscreen は同フレーム内で
+            //  open_fullscreen に続くので fs_idx は Some に戻る)。
+            self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
             return;
         };
@@ -299,7 +319,7 @@ impl App {
             Some(crate::grid_item::ThumbnailState::Loaded { .. })
         );
         if has_full || has_thumb {
-            self.fs_nav_locked = false;
+            self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
         }
     }
@@ -1144,7 +1164,7 @@ impl App {
             // 流用して「ファイル名だけが切り替わる」状態を回避する。サムネが
             // Loaded になった瞬間 `poll_fs_nav_lock` がロックを解除し holdover が
             // 解放される。
-            if self.fs_nav_locked {
+            if self.fs_nav_is_locked() {
                 self.fs_holdover_tex.clone()
             } else {
                 None
@@ -2211,7 +2231,7 @@ impl App {
             // まだ準備できていない (= サムネ未ロード or fs_cache 未投入) 間は
             // 入力を捨てて、画面が「ファイル名だけ次々切り替わる」状態を防ぐ。
             // 待ちが解除されてから次のキーを押せば確実にサムネ以上が見える。
-            if self.fs_nav_locked {
+            if self.fs_nav_is_locked() {
                 // ignore — 次フレームで poll_fs_nav_lock が解除する
             } else {
                 let forward = delta > 0;
@@ -2228,9 +2248,9 @@ impl App {
                 } else if let Some(cur) = self.current_folder.clone() {
                     // ナビ発火前に「今出ているテクスチャ」を holdover に退避し、
                     // items 入れ替えで fs_cache が drop されても画面が真っ白に
-                    // ならないようにする。`fs_nav_locked = true` で連打を抑止。
+                    // ならないようにする。`capture_fs_nav_holdover` がロック取得時の
+                    // items_generation も同時に記録する (= items 入れ替え前の早期解除を防ぐ)。
                     self.capture_fs_nav_holdover(fs_idx);
-                    self.fs_nav_locked = true;
                     self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
                 }
             }
@@ -2811,7 +2831,7 @@ impl App {
             // ナビ ロック中は旧ページのテクスチャを左右両方の最終フォールバックとして
             // 使い、「ファイル名のみ表示」状態を回避する。両ページに同じ holdover が
             // 出るのは束の間 (poll_fs_nav_lock がサムネ Loaded で解除する) なので許容。
-            let holdover_for_locked = if self.fs_nav_locked {
+            let holdover_for_locked = if self.fs_nav_is_locked() {
                 self.fs_holdover_tex.as_ref()
             } else {
                 None
@@ -2867,7 +2887,7 @@ impl App {
                 egui::vec2(half_w, image_rect.height()),
             );
             // フォールバック分岐でも nav ロック中の holdover を渡す (上のパス参照)。
-            let holdover_for_locked = if self.fs_nav_locked {
+            let holdover_for_locked = if self.fs_nav_is_locked() {
                 self.fs_holdover_tex.as_ref()
             } else {
                 None
