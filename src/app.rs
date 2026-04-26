@@ -855,9 +855,13 @@ pub(crate) struct VirtualFolderWriteback {
     /// 監視対象の items 内 idx (= 最初の PdfPage / ZipImage の idx)。
     pub target_idx: usize,
     /// このターゲットが有効な items 世代。`fire_*` で `App::items_generation` と
-    /// 一致しなければ無視 + クリア (Codex P2 対策)。`start_loading_items` でも
-    /// 仮想 writeback はクリアされるが、items_generation を直接書き換える経路が
-    /// 増えた場合の保険。
+    /// 一致しなければ無視 + クリア (Codex P2 対策)。
+    ///
+    /// `start_loading_items` でも仮想 writeback はクリアされるが、`replace_view_items`
+    /// (Ctrl+G 検索ビュー切替) や `remove_items_batch` (削除直後の idx 詰め) は
+    /// `items_generation` を直接 +1 するだけで `start_loading_items` を通らない。
+    /// この場で書き戻しが発火すると古い PDF/ZIP の親 catalog に書いてしまうので、
+    /// このフィールドが実質的な唯一のガードになる。
     pub items_gen: u64,
     /// 現フォルダの cache_map 参照。worker がここに WebP データを put 後、
     /// 本構造体経由で親 catalog にミラーする。
@@ -4207,15 +4211,23 @@ impl App {
             // バイト列が壊れていた (= save_thumb_bytes が false 返却) ケースでは
             // cache_map にも入れない — 入れるとサムネ表示時にデコード失敗で
             // `Failed` 状態に陥る (Codex P2)。
-            let saved = target_db
-                .save_thumb_bytes(
-                    &target_key,
-                    entry.mtime,
-                    entry.file_size,
-                    entry.source_dims,
-                    &entry.jpeg_data,
-                )
-                .unwrap_or(false);
+            // SQLite I/O エラーは Ok(false) と区別してログに残す (= 静かに丸めると
+            // disk full / lock 競合の調査が困難になるため)。
+            let saved = match target_db.save_thumb_bytes(
+                &target_key,
+                entry.mtime,
+                entry.file_size,
+                entry.source_dims,
+                &entry.jpeg_data,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "seed virtual folder: save_thumb_bytes failed for {target_key}: {e}"
+                    ));
+                    false
+                }
+            };
             if saved {
                 if let Ok(mut m) = cache_map.write() {
                     m.insert(target_key.clone(), entry);
@@ -4260,19 +4272,14 @@ impl App {
     /// `virtual_folder_writeback` の対象 idx が完成していたら親 catalog にミラー書き込みする。
     /// 一度発火したら writeback を None にして二重書き込みを防ぐ。
     ///
-    /// `current_items_gen` は呼び出し元の現在 items_generation。`wb.items_gen` と
-    /// 一致しない場合は古い writeback ターゲットなので発火せずクリア (Codex P2)。
-    fn fire_virtual_folder_writeback_if_ready(
-        &mut self,
-        finalized_idx: usize,
-        current_items_gen: u64,
-    ) {
+    /// 古い items 世代の writeback が残っていた (= `items_generation` 進行後) 場合は
+    /// idx 一致でも発火させずクリアのみする (Codex P2: 別フォルダの親 catalog への
+    /// 誤書き込み防止)。
+    fn fire_virtual_folder_writeback_if_ready(&mut self, finalized_idx: usize) {
         let Some(wb) = self.virtual_folder_writeback.as_ref() else {
             return;
         };
-        // 古い items の writeback が残っていたら、idx 一致でも発火させずに捨てる。
-        // start_loading_items でクリアされる経路があるが、念のための保険。
-        if wb.items_gen != current_items_gen {
+        if wb.items_gen != self.items_generation {
             self.virtual_folder_writeback = None;
             return;
         }
@@ -5821,9 +5828,7 @@ impl App {
                 // 仮想フォルダの先頭ページ完成を親 catalog にミラー (PDFium 再レンダ
                 // 防止のための writeback)。requested の cleanup より前にやることで、
                 // cache_map から WebP データが消える前に確実に読み出せる。
-                // items_generation は msg と一致していることがループ冒頭で検証済み
-                // (msg_items_gen != self.items_generation の continue ガード)。
-                self.fire_virtual_folder_writeback_if_ready(i, self.items_generation);
+                self.fire_virtual_folder_writeback_if_ready(i);
                 if !self.requested.contains_key(&i) {
                     received += 1;
                     continue;
@@ -16224,12 +16229,12 @@ mod favorite_adjustment_defaults_tests {
         });
 
         // 別 idx で発火しても何も起きない。
-        app.fire_virtual_folder_writeback_if_ready(2, cur_gen);
+        app.fire_virtual_folder_writeback_if_ready(2);
         assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
         assert!(app.virtual_folder_writeback.is_some());
 
         // target_idx で発火すると親 catalog にミラーされ、writeback がクリアされる。
-        app.fire_virtual_folder_writeback_if_ready(3, cur_gen);
+        app.fire_virtual_folder_writeback_if_ready(3);
         let entry = parent_db_arc
             .load_one(&parent_key)
             .unwrap()
@@ -16269,14 +16274,111 @@ mod favorite_adjustment_defaults_tests {
             parent_entry_mtime: 0,
             parent_entry_size: 0,
         });
-        // current_items_gen を別の値にして発火 → 親 catalog には何も書かれず writeback が
-        // None に戻る。
-        app.fire_virtual_folder_writeback_if_ready(0, 7);
+        // app.items_generation を進めて発火 → 親 catalog には何も書かれず writeback が
+        // None に戻る。`replace_view_items` / `remove_items_batch` 経由で
+        // items_generation だけが進む実機シナリオの再現。
+        app.items_generation = 7;
+        app.fire_virtual_folder_writeback_if_ready(0);
         assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
         assert!(
             app.virtual_folder_writeback.is_none(),
             "古い世代の writeback はクリアして次に持ち越さない"
         );
+    }
+
+    /// Codex P2: 同じ世代・対象 idx で発火しても `cache_map` が空なら親 catalog には
+    /// 何も書かず、writeback だけクリアする (= one-shot)。実機では from_cache 経路で
+    /// finalize シグナルが届かないため永続的に再発火しない、その場で諦める。
+    #[test]
+    fn fire_virtual_folder_writeback_clears_when_cache_map_empty() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent_empty");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db_arc =
+            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
+        // cache_map は空のまま (= worker が page_0000 を入れていない)。
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "empty.pdf");
+        let cur_gen = app.items_generation;
+        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
+            parent_catalog: Arc::clone(&parent_db_arc),
+            parent_key: parent_key.clone(),
+            target_key: crate::grid_item::pdf_page_cache_key(0),
+            target_idx: 0,
+            items_gen: cur_gen,
+            cache_map: Arc::clone(&cache_map),
+            parent_entry_mtime: 0,
+            parent_entry_size: 0,
+        });
+        app.fire_virtual_folder_writeback_if_ready(0);
+        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
+        assert!(
+            app.virtual_folder_writeback.is_none(),
+            "cache_map が空でも 1 度試したらクリアして次の finalize に持ち越さない"
+        );
+    }
+
+    /// Codex P2: 親 catalog のサムネが壊れていた場合、`save_thumb_bytes` が `Ok(false)`
+    /// を返し、seed 経路は `cache_map` に入れない。これがないと表示時にデコード失敗で
+    /// 永続的に Failed になる退行が起きる。
+    #[test]
+    fn seed_skips_cache_map_when_parent_thumb_undecodable() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent_corrupt");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let pdf_path = parent_dir.join("corrupt.pdf");
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap();
+        // 寸法が取れないバイト列 (適当な ASCII)。`decode_thumb_dims` が None を返す。
+        let bad_bytes: Vec<u8> = b"NOT-A-WEBP-OR-JPEG".to_vec();
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "corrupt.pdf");
+        // 直接 save() で壊れたバイトを置く (= 旧版や外部経路で壊れた行が残った状況を再現)。
+        parent_db
+            .save(&parent_key, 0, 0, 1, 1, None, &bad_bytes)
+            .unwrap();
+
+        let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+        app.setup_virtual_folder_seed_and_writeback(&pdf_path, &pdf_db, &cache_map);
+
+        // cache_map は空のまま (= 表示時に decode 失敗で Failed にならない)。
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        assert!(
+            !cache_map.read().unwrap().contains_key(&target_key),
+            "壊れたサムネは cache_map に入れない (= Failed 退行を防ぐ)"
+        );
+        // writeback ターゲットは設定される (= 後続 worker が完成させたら親 catalog に
+        // 書き戻して corrupt 行を上書きする経路は維持)。
+        assert!(app.virtual_folder_writeback.is_some());
+    }
+
+    /// `save_thumb_bytes` 単体: 寸法が取れないバイト列を渡したら `Ok(false)` を返し、
+    /// DB には何も書き込まない。
+    #[test]
+    fn save_thumb_bytes_returns_false_for_undecodable() {
+        let (_app, _g, tmp, _l) = setup_app();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let dir = tmp.path().join("save_thumb_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::catalog::CatalogDb::open(&cache_dir, &dir).unwrap();
+        let bad: Vec<u8> = b"DEADBEEF-NOT-AN-IMAGE".to_vec();
+        let saved = db
+            .save_thumb_bytes("k1", 1, 2, None, &bad)
+            .expect("Err なし、Ok(false) で skip 表現");
+        assert!(!saved, "壊れたバイト列は save 断念 → false");
+        assert!(db.load_one("k1").unwrap().is_none(), "DB にも何も書かない");
     }
 
     /// Codex P1 (0.8.2 後半): `release_fs_nav_lock` が `fs_nav_locked_gen` /
