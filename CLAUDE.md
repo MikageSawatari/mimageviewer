@@ -646,6 +646,13 @@ IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バ
 ### Phase 3: ビルド・配布成果物
 
 10. `cargo build --release` → `ISCC.exe installer\mimageviewer.iss` でインストーラを生成
+    - 開発機では mIV をタスクトレイに常駐させているケースが多い。常駐中の `mimageviewer.exe` は
+      `target\release\mimageviewer.exe` を握っているので、cargo がリンク段階で
+      LNK1104 (アクセスが拒否されました) になって失敗する。
+      その場合は `scripts\build-release.ps1` (PowerShell) もしくは
+      `bash scripts/build-release.sh` を使うと、実行中の `mimageviewer.exe` /
+      `mimageviewer-susie32.exe` を自動停止してからビルドできる。手動の
+      `Stop-Process` + `cargo build` を毎回打つ手間を省くだけのラッパー。
 11. 配布成果物を 3 種類用意する:
     - `mimageviewer.exe` (ポータブル版、mikage.to のみ)
     - `mImageViewer_setup.exe` (インストーラ版、mikage.to・窓の杜・Vector 共通)
