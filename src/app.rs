@@ -15261,4 +15261,57 @@ mod favorite_adjustment_defaults_tests {
             35.0
         );
     }
+
+    /// Codex P3 (2026-04): BS で深い階層から戻ったとき、`select_after_load` が
+    /// `folder_history` の古い選択より優先されること。Ctrl+↓ で進んだ先から
+    /// 戻ったとき「最初に入った位置」ではなく「今いる位置」にカーソルを合わせる
+    /// ための優先順位反転 (load_folder の選択復元) の回帰テスト。
+    #[test]
+    fn select_after_load_overrides_folder_history() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items.push(GridItem::Folder("c:/root/folderA".into()));
+        app.items.push(GridItem::Folder("c:/root/folderB".into()));
+        app.rebuild_visible_indices();
+
+        // 履歴: folderA (idx=0) を保存
+        let source = std::path::PathBuf::from("c:/root");
+        app.folder_history.insert(source.clone(), (123.0, Some(0)));
+        // ヒント: folderB を選びたい (BS で戻った直後の状態を模擬)
+        app.select_after_load = Some("folderB".to_string());
+
+        let restored = app.try_select_after_load();
+        assert!(restored, "ヒントが items に存在するなら true を返す");
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "folderB (idx=1) がヒントで選ばれるべき (履歴の folderA に負けない)"
+        );
+        assert!(
+            app.select_after_load.is_none(),
+            "ヒントは take() で消費される (次回 load に持ち越さない)"
+        );
+        assert!(app.scroll_to_selected, "選択行を可視化するスクロール要求が立つ");
+    }
+
+    /// Codex P3 (2026-04): ヒントの指す名前が items に無い場合 (削除等) は false を
+    /// 返し、`start_loading_items` 側の履歴フォールバック分岐に委ねる。
+    #[test]
+    fn try_select_after_load_returns_false_on_missing_name() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items.push(GridItem::Folder("c:/root/folderA".into()));
+        app.rebuild_visible_indices();
+        app.selected = None;
+
+        app.select_after_load = Some("ghost".to_string());
+        let restored = app.try_select_after_load();
+        assert!(!restored, "ヒストリにフォールバックさせるため false を返す");
+        assert_eq!(app.selected, None, "selected は変更されない");
+        assert!(
+            app.select_after_load.is_none(),
+            "見つからなかった場合でもヒントは消費する (持ち越さない)"
+        );
+    }
+
 }
