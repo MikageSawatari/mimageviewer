@@ -7135,8 +7135,13 @@ impl App {
     ///    最初 (backward 時は最後) の ZIP/PDF に入り、その中の画像系を返す。
     ///    これにより「ZIP/PDF しか入っていない中間フォルダ」でフルスクリーン表示が
     ///    切れず、マンガ/コミックの連続閲覧が続く。
-    fn find_fullscreen_nav_target(&mut self, forward: bool) -> Option<usize> {
-        let find_image = |app: &Self, fwd: bool| -> Option<usize> {
+    fn find_fullscreen_nav_target(&mut self, _forward: bool) -> Option<usize> {
+        // Ctrl+↑↓ は方向に関わらず常にフォルダ先頭の画像系アイテムへ着地する
+        // (= 一般的なビューワ慣習に合わせ、フォルダ識別性を優先)。後方ナビでも
+        // 先頭着地にすることで Ctrl+矢印の mental model が「フォルダにジャンプして
+        // 冒頭から見る」の 1 つに統一される。前ページ末尾を見たい場合は Ctrl+↑ で
+        // 戻った後 End キーで末尾に飛べる。
+        let find_image = |app: &Self| -> Option<usize> {
             let items = &app.items;
             let is_image_like = |i: usize| {
                 matches!(
@@ -7147,46 +7152,31 @@ impl App {
                         | Some(GridItem::PdfPage { .. })
                 )
             };
-            if fwd {
-                app.visible_indices
-                    .iter()
-                    .copied()
-                    .find(|&i| is_image_like(i))
-            } else {
-                app.visible_indices
-                    .iter()
-                    .copied()
-                    .rev()
-                    .find(|&i| is_image_like(i))
-            }
+            app.visible_indices
+                .iter()
+                .copied()
+                .find(|&i| is_image_like(i))
         };
 
-        if let Some(idx) = find_image(self, forward) {
+        if let Some(idx) = find_image(self) {
             return Some(idx);
         }
 
-        // 画像系が無い: ZIP/PDF ファイルを探して仮想フォルダに進入する
+        // 画像系が無い: 先頭の ZIP/PDF ファイルを仮想フォルダとして開いて中身を取り出す。
+        // ZIP/PDF の選び方も同様に「先頭」固定。
         let pick_virtual = |i: usize, items: &[GridItem]| -> Option<PathBuf> {
             match items.get(i) {
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => Some(p.clone()),
                 _ => None,
             }
         };
-        let virtual_path = if forward {
-            self.visible_indices
-                .iter()
-                .copied()
-                .find_map(|i| pick_virtual(i, &self.items))
-        } else {
-            self.visible_indices
-                .iter()
-                .copied()
-                .rev()
-                .find_map(|i| pick_virtual(i, &self.items))
-        };
-        let virtual_path = virtual_path?;
+        let virtual_path = self
+            .visible_indices
+            .iter()
+            .copied()
+            .find_map(|i| pick_virtual(i, &self.items))?;
         self.load_folder(virtual_path);
-        find_image(self, forward)
+        find_image(self)
     }
 
     /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
@@ -15729,6 +15719,40 @@ mod favorite_adjustment_defaults_tests {
             app.fullscreen_idx,
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
+        );
+    }
+
+    /// `find_fullscreen_nav_target`: 方向 (forward/backward) に関わらず常に
+    /// フォルダ先頭の画像系アイテムを返すこと。Ctrl+↑ でも前フォルダの最後ではなく
+    /// 最初の画像に着地させる仕様変更の回帰ガード。
+    #[test]
+    fn find_fullscreen_nav_target_always_returns_first_image() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 並び: Folder, Image_a, Image_b, Image_c (visible_indices は items 全部)
+        app.items.push(GridItem::Folder("c:/sub".into()));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/b.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/c.jpg")));
+        for _ in 0..app.items.len() {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.rebuild_visible_indices();
+        // forward = true: 先頭画像 idx=1 (= Image_a)
+        assert_eq!(
+            app.find_fullscreen_nav_target(true),
+            Some(1),
+            "forward でも先頭の画像系アイテム"
+        );
+        // forward = false: 旧仕様なら末尾 idx=3 (= Image_c) だが、新仕様では同じく
+        // 先頭 idx=1 を返す。
+        assert_eq!(
+            app.find_fullscreen_nav_target(false),
+            Some(1),
+            "backward でも先頭画像 (= 末尾 Image_c ではない)"
         );
     }
 
