@@ -36,11 +36,15 @@ pub struct CacheEntry {
     pub source_dims: Option<(u32, u32)>,
 }
 
-/// 保存済みサムネ (WebP) バイト列からヘッダのみで `(w, h)` を取り出す。
-/// フルデコードは走らない (`ImageReader::into_dimensions` は WebP の VP8/VP8L/VP8X
-/// チャンクヘッダだけを読む)。WebP として正しく解釈できなければ `None`。
+/// 保存済みサムネのバイト列からヘッダのみで `(w, h)` を取り出す。
+/// フォーマットは auto-detect (`with_guessed_format`)。これは旧バージョンが JPEG で
+/// 保存していたエントリ ([`decode_thumb_to_color_image`] が "WebP or old JPEG" の
+/// 両方を読んでいる) との互換性のため。フルデコードは走らない
+/// (`ImageReader::into_dimensions` はチャンクヘッダだけを読む)。
 pub fn decode_thumb_dims(data: &[u8]) -> Option<(u32, u32)> {
-    image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::WebP)
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
         .into_dimensions()
         .ok()
 }
@@ -168,11 +172,15 @@ impl CatalogDb {
         Ok(())
     }
 
-    /// WebP バイト列のヘッダから `(w, h)` だけを取り出して `save` する薄いラッパ。
-    /// `CacheEntry` には WebP 寸法フィールドが無いため、save 経由では `(w, h)` を呼び出し側で
+    /// サムネバイト列のヘッダから `(w, h)` だけを取り出して `save` する薄いラッパ。
+    /// `CacheEntry` には寸法フィールドが無いため、save 経由では `(w, h)` を呼び出し側で
     /// 用意する必要がある。仮想フォルダの seed / write-back のように「親 catalog から
-    /// WebP バイトをそのままミラーする」用途で繰り返し書きがちなので集約した。
-    /// ヘッダのみ解析 (`ImageReader::into_dimensions`) なのでフルデコードは走らない。
+    /// バイトをそのままミラーする」用途で繰り返し書きがちなので集約した。
+    /// ヘッダのみ解析なのでフルデコードは走らない。
+    ///
+    /// 戻り値の `bool` は「実際に保存できたか」。`false` は「寸法を取り出せず保存を断念
+    /// した」を意味する (= 壊れたバイト列)。呼び出し側はこれをもとに「cache_map にも
+    /// 入れない」ことで、サムネ表示時に `Failed` 状態に陥るのを防げる。
     pub fn save_thumb_bytes(
         &self,
         filename: &str,
@@ -180,13 +188,14 @@ impl CatalogDb {
         file_size: i64,
         source_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<bool> {
         let Some((w, h)) = decode_thumb_dims(jpeg_data) else {
-            // 寸法が取れない (= 壊れた WebP) なら保存を断念。SQLite スキーマ上
+            // 寸法が取れない (= 壊れたバイト列) なら保存を断念。SQLite スキーマ上
             // width/height は NOT NULL なので 0 を入れると整合性が壊れる。
-            return Ok(());
+            return Ok(false);
         };
-        self.save(filename, mtime, file_size, w, h, source_dims, jpeg_data)
+        self.save(filename, mtime, file_size, w, h, source_dims, jpeg_data)?;
+        Ok(true)
     }
 
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
