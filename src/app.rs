@@ -5682,11 +5682,9 @@ impl App {
             .store(current_display_px, Ordering::Relaxed);
 
         let cols = self.settings.grid_cols.max(1);
-        // ウィンドウ縮小直後で cell_h が極端に小さい場合 (1〜数 px)、`viewport_h / cell_h` が
-        // 数百〜数千行に膨れ、`items_per_page * (1 + prev/next pages)` が
-        // 数万 idx の keep_set を作る。下流の make_load_request / texture_backlog 蓄積で
-        // UI スレッドが 1 フレームに数百ミリ秒消費してフリーズに見える (2026-04 ユーザー報告)。
-        // render_grid 側も MIN_CELL_PX=32 で clamp しているので、ここでも同じ下限を適用する。
+        // 極端に小さい cell_h (1〜数 px) では `viewport_h / cell_h` が数千行に膨れて
+        // keep_set が数万 idx に達し、下流の make_load_request / texture_backlog で
+        // UI スレッドが固まる。render_grid 側の MIN_CELL_PX=32 と揃える。
         let cell_h = self.last_cell_h.max(32.0);
         let viewport_h = self.last_viewport_h.max(cell_h);
 
@@ -6607,9 +6605,8 @@ impl App {
                     return None;
                 }
                 // Aggregated 状態で BS: Ctrl+G を閉じて saved_folder へ戻る。
-                // 旧実装はそのまま FS 親遡行に流していたため、BS 連打で saved_folder の
-                // 親ディレクトリを次々ロードし続け、ドライブ root (G:\ など) の中身が
-                // 表示されてしまっていた (search bar は active のまま) ユーザー報告 (2026-04)。
+                // ここで catch しないと FS 親遡行に流れ、search bar が active のまま
+                // saved_folder の親 → ドライブ root の中身が表示される事故になる。
                 self.close_global_search();
                 return None;
             }

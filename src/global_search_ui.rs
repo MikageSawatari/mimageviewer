@@ -718,6 +718,11 @@ pub(crate) fn collect_hit_folders_dfs(
 /// 識別キー。GridItem の表示同一性 (= 同じテクスチャが使えるか) を表現する。
 /// Aggregated/SearchContainer は representative が変わると別物扱いにし、ZipImage /
 /// PdfPage は zip 本体パス + entry/page 番号で識別する。
+///
+/// `GridItem::perf_key()` (`grid_item.rs`) と似ているが意図が違う:
+/// - `perf_key` は perf ログ用の安定 ID で、SearchContainer の representative は無視する
+/// - こちらはテクスチャ再利用の判定なので、representative が切り替わったら別キー扱いにして
+///   再生成させる必要がある
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum ThumbReuseKey {
     Folder(PathBuf),
@@ -1114,10 +1119,10 @@ impl App {
                 Some(t) => t.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS),
             };
             if should_resort || self.global_search.done {
-                // Ctrl+G ヒット集約は accumulate_hit が更新済みだが、items 差し替えは
-                // 「現 items が検索結果ビュー」のときに限る。実フォルダ/ZIP/PDF を開いて
-                // いる間に rebuild を走らせると、ユーザーが見ているグリッドが検索結果に
-                // 上書きされて画面がちらつく (set_rating 経路と同じ条件、app.rs:8812 参照)。
+                // 集約状態 (containers / all_hits) は accumulate_hit が更新済み。items
+                // 差し替えは「今 items が検索結果ビュー」のときだけ走らせる。実フォルダ /
+                // ZIP / PDF を開いている間に rebuild すると、ユーザーが見ているグリッドが
+                // 検索結果で上書きされて画面がちらつく (rating 変更経路と同じ条件)。
                 if self.items_are_global_search_view {
                     self.rebuild_items_from_global_search();
                 }

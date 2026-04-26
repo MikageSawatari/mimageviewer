@@ -127,9 +127,12 @@ fn rating_tooltip(idx: usize) -> String {
 
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
-/// (旧実装は呼び出し側で `add_enabled_ui` でまとめていたが、`horizontal_wrapped` 内で
-///  scope を作ると残り幅で wrap が起きてレイアウトが崩れるため、フラグを各ボタンに
-///  直接渡す方式に変更した。)
+///
+/// `add_enabled_ui` で外側からまとめてしまうと、`horizontal_wrapped` 内では scope が
+/// 残り幅だけの狭い子 UI を作るのでレイアウトが崩れる。そのため enabled は呼び出し側
+/// から各ボタンに直接渡す。`context_menu` は egui 上、disabled でも開いてしまうので
+/// `if enabled` で明示ガードする (`resp.clicked()` 側は `add_enabled` が消費するので
+/// 二重ガードは belt-and-suspenders)。
 fn draw_rating_filter_button(
     ui: &mut egui::Ui,
     rf: &mut [bool; 6],
@@ -684,12 +687,10 @@ impl App {
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
                         );
                     }
-                    // ★ボタン群を `add_enabled_ui` でまとめると、その scope が現在の
-                    // cursor 位置から「残り幅」だけの狭い子 UI を作ってしまい、`horizontal_wrapped`
-                    // の wrap が子 UI 内で起きる → ★★ 以降が右端の縦帯に積まれて崩れる
-                    // (2026-04 別 PC ユーザー報告)。enabled 状態は各ボタン側で持たせ、
-                    // ボタン自体は親の horizontal_wrapped に直接乗せて、自然に次の row へ
-                    // wrap させる。
+                    // ★ボタン群を `add_enabled_ui` でまとめると、その scope が「残り幅」
+                    // だけの狭い子 UI を作るので `horizontal_wrapped` の wrap が子 UI 内で
+                    // 起きてしまい、★★ 以降が右端の縦帯に積まれて崩れる。enabled は各
+                    // ボタン側に渡し、親の wrap に直接乗せて次の row に流させる。
                     for idx in 0..6 {
                         if draw_rating_filter_button(
                             ui,
@@ -1291,17 +1292,12 @@ impl App {
 
                 let cols = self.settings.grid_cols.max(1);
                 let avail_w = ui.available_width();
-                // ウィンドウを極端に狭めたとき (avail_w が負 ~ 数 px) cell_w が 0 にフロアされて、
-                // cell_h も 1px 近辺になる。すると viewport_h / cell_h が 800 行レベルに跳ね上がり、
-                // 描画ループが 1 フレームに数千セル以上を処理しようとして UI が固まる
-                // (2026-04 ユーザー報告。`draw_folder_badge` の無限ループバグが本丸だったが、
-                // ここの暴発防止も予防として残す)。
-                //
-                // 二段ガード:
-                // (a) avail_w が ≤ 0 ならグリッド描画自体を skip する
-                //     (egui は window chrome が広いと負値を返すことがある)。
-                // (b) cell_w / cell_h に下限を入れて、可視行数の暴発を防ぐ。
-                //     下限未満の幅ではセルが横にはみ出すが、フリーズよりは遥かにまし。
+                // 極端に狭めると `cell_w` が 0 / `cell_h` が 1px 近傍になり、
+                // `viewport_h / cell_h` が数百〜数千行に膨れて 1 フレームで数千セルを
+                // 描画しようとして UI が固まる。下記の二段ガードで暴発を防ぐ:
+                // (a) avail_w ≤ 0 (window chrome が幅を食いきった) はグリッド描画 skip。
+                // (b) cell_w / cell_h に MIN_CELL_PX の下限。下限未満ではセルが横に
+                //     はみ出して右端が clip されるが、フリーズよりは遥かにまし。
                 if avail_w <= 0.0 {
                     return None;
                 }
