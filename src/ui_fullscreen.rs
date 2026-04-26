@@ -740,7 +740,9 @@ impl App {
                         }
 
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
-                        if self.erase_mode && !is_spread_double {
+                        // erase_mode 中は spread_mode が Single に倒されているので
+                        // is_spread_double は常に false。明示的なガードは不要。
+                        if self.erase_mode {
                             let zp = self.fs_zoom_pan();
                             self.handle_erase_paint(ctx, image_rect, zp);
                             self.draw_erase_overlay(ui, ctx, image_rect, zp);
@@ -1660,8 +1662,10 @@ impl App {
             self.show_feedback_toast(label.to_string());
         }
 
-        // E: 消しゴムモード切り替え（見開き・分析・補正中は無効）
-        if key_e && !is_spread_double && !self.analysis_mode && !self.adjustment_mode {
+        // E: 消しゴムモード切り替え (分析・補正中は無効)。
+        // 見開き中の起動は `enter_erase_mode` が一時的に Single に切り替えて
+        // 左ページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
+        if key_e && !self.analysis_mode && !self.adjustment_mode {
             if self.erase_mode {
                 // 2回目のE: inpaint実行
                 self.execute_erase_inpaint(ctx, fs_idx);

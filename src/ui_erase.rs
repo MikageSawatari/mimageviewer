@@ -67,7 +67,35 @@ impl App {
     // ── モード開始/終了 ─────────────────────────────────────────────
 
     /// 消しゴムモードに入る。DB にマスクがあればロードする。
+    ///
+    /// 見開きモード中に呼ばれた場合は spread_mode を一時的に Single へ落とし、
+    /// `fullscreen_idx` を見開きペアの左ページに固定する (消しゴムは単一ページ前提のため)。
+    /// 終了時に `reset_erase_mode` が元の spread_mode を復元する。ペアの右ページへは
+    /// パネルの「右ページ」ボタンで `switch_erase_target_in_spread` 経由で切り替える。
     pub(crate) fn enter_erase_mode(&mut self, fs_idx: usize) {
+        // 見開きから入った場合は左ページへピボット。spread_mode を Single に倒し
+        // ペアと元モードを覚えておく。Single 起動 / 片側のみのページ (表紙・末尾奇数・
+        // 横長画像) からは pair=None でそのまま続行する。
+        let spread_pair = if self.spread_mode.is_spread() {
+            match self.resolve_spread_pair(fs_idx) {
+                crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
+                crate::ui_fullscreen::SpreadPair::Single => None,
+            }
+        } else {
+            None
+        };
+        // 編集対象ページ: ペアありなら左ページ、それ以外は呼び出し側の指定値そのまま。
+        let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
+        if let Some(pair) = spread_pair {
+            self.erase_saved_spread_mode = Some(self.spread_mode);
+            self.erase_spread_pair = Some(pair);
+            self.spread_mode = crate::settings::SpreadMode::Single;
+            self.fullscreen_idx = Some(target_idx);
+            // ズーム/パン位置は単一ページ表示用に初期化
+            self.fs_zoom = 1.0;
+            self.fs_pan = egui::Vec2::ZERO;
+        }
+        let fs_idx = target_idx;
         // 元画像を取得: erase_base_cache (inpaint前の元画像) を優先、なければキャッシュから
         let pixels = if let Some(base) = self.erase_base_cache.get(&fs_idx) {
             Arc::clone(base)
@@ -175,6 +203,54 @@ impl App {
         self.erase_selected_vector = None;
         self.erase_vector_drag = None;
         self.fs_pan_drag_start = None;
+
+        // 見開きから入っていた場合は spread_mode と表示ページを復元する。
+        // ページ位置は left_idx に揃える (resolve_spread_pair が同じペアを返すので
+        // 元と同じ見開きが再構築される)。ズーム/パンはリセット。
+        if let Some(saved) = self.erase_saved_spread_mode.take() {
+            self.spread_mode = saved;
+            if let Some((left, _right)) = self.erase_spread_pair.take() {
+                self.fullscreen_idx = Some(left);
+            }
+            self.fs_zoom = 1.0;
+            self.fs_pan = egui::Vec2::ZERO;
+        }
+    }
+
+    /// 見開き消しゴム中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
+    /// 既存の編集をそのページの inpaint として保存・適用してから、もう一方のページに
+    /// 移動して新たに編集モードへ入る ([E] 適用 → 移動 → [E] 開始 と等価)。Undo は
+    /// ページごとに独立 (= 切替時にスタックは捨てる)、ズーム/パンは初期化する。
+    pub(crate) fn switch_erase_target_in_spread(
+        &mut self,
+        ctx: &egui::Context,
+        new_idx: usize,
+    ) {
+        let saved_mode = self.erase_saved_spread_mode;
+        let pair = self.erase_spread_pair;
+        // 同ページなら no-op
+        if self.fullscreen_idx == Some(new_idx) {
+            return;
+        }
+        // 1. 現ページの編集を確定 (マスクが空なら即 reset、マスクありなら inpaint 投入)。
+        //    どちらにせよ reset_erase_mode が呼ばれて erase_saved_spread_mode は消える。
+        if let Some(idx) = self.fullscreen_idx {
+            self.execute_erase_inpaint(ctx, idx);
+        }
+        // 2. 切替後も spread 状態を維持するため再設定。reset_erase_mode が saved_mode を
+        //    spread_mode に書き戻しているので、ここで再度 Single に倒す。これをやらないと
+        //    enter_erase_mode 内のペア再判定が走って強制的に左ページへ戻されてしまう
+        //    (target_idx = pair.left で fullscreen_idx が上書きされる)。
+        self.erase_saved_spread_mode = saved_mode;
+        self.erase_spread_pair = pair;
+        self.spread_mode = crate::settings::SpreadMode::Single;
+        // 3. 新ページへ移動 + ズーム/パン初期化。
+        self.fullscreen_idx = Some(new_idx);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+        // 4. 新ページで編集モード開始。spread_mode = Single なので enter 内のペア再判定は
+        //    スキップされ、erase_saved_spread_mode / erase_spread_pair はそのまま保たれる。
+        self.enter_erase_mode(new_idx);
     }
 
     // ── Undo / Slot ────────────────────────────────────────────────
@@ -804,7 +880,16 @@ impl App {
         } else {
             0.0
         };
-        egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, base_h + extra))
+        // 見開きペアから入った場合は左/右切替ボタン + セパレータの分を追加 (32 + 8 = 40)。
+        let spread_extra = if self.erase_spread_pair.is_some() {
+            40.0
+        } else {
+            0.0
+        };
+        egui::Rect::from_min_size(
+            panel_pos,
+            egui::vec2(PANEL_W, base_h + extra + spread_extra),
+        )
     }
 
     // ── 入力処理 ──────────────────────────────────────────────────
@@ -1517,6 +1602,57 @@ impl App {
                     egui::Color32::WHITE,
                 );
                 y += 24.0;
+
+                // ── 見開きペアの左/右切替ボタン (見開きから入った場合のみ) ──
+                // ボタン押下 = 現ページ編集を Apply → 反対ページへ移動 → 編集再開。
+                // 単一ページ (片側のみのページ) から入った場合は erase_spread_pair が
+                // None なのでこのセクション全体が描画されない (= Single と同じ見た目)。
+                if let Some((left_idx, right_idx)) = self.erase_spread_pair {
+                    let pages = [("左ページ", left_idx), ("右ページ", right_idx)];
+                    let page_w = (pw - 4.0) / 2.0;
+                    let mut switch_to: Option<usize> = None;
+                    for (i, &(label, target_idx)) in pages.iter().enumerate() {
+                        let btn_rect = egui::Rect::from_min_size(
+                            egui::pos2(x0 + i as f32 * (page_w + 4.0), y),
+                            egui::vec2(page_w, 24.0),
+                        );
+                        let is_active = self.fullscreen_idx == Some(target_idx);
+                        let bg = if is_active {
+                            egui::Color32::from_rgb(60, 120, 200)
+                        } else {
+                            egui::Color32::from_gray(50)
+                        };
+                        let resp = child.allocate_rect(btn_rect, egui::Sense::click());
+                        if resp.hovered() && !is_active {
+                            child
+                                .painter()
+                                .rect_filled(btn_rect, 3.0, egui::Color32::from_gray(70));
+                        } else {
+                            child.painter().rect_filled(btn_rect, 3.0, bg);
+                        }
+                        child.painter().text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                        if resp.clicked() && !is_active {
+                            switch_to = Some(target_idx);
+                        }
+                    }
+                    y += 32.0;
+                    // 区切り線
+                    child.painter().line_segment(
+                        [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                    );
+                    y += 8.0;
+                    // ループ後にディスパッチ (& mut self の二重借用を避けるため)。
+                    if let Some(target) = switch_to {
+                        self.switch_erase_target_in_spread(ctx, target);
+                    }
+                }
 
                 // ── 描画/消去 モード切り替え ──
                 let mode_labels = [("描画 [D]", true), ("消去 [F]", false)];

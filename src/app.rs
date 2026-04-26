@@ -1889,6 +1889,14 @@ pub struct App {
     /// 完了 (もしくは新規投入) で `take()` する。UI スレッドが MI-GAN 推論
     /// (300-500ms) で固まらないようにするための非同期化エントリ。
     pub(crate) erase_inpaint_pending: Option<crate::ui_erase::EraseInpaintPending>,
+    /// 見開きから消しゴムに入ったときの見開きモード保存。`Some` の間は終了時に
+    /// `spread_mode` をこの値に戻す。Single から入った場合は `None`。
+    pub(crate) erase_saved_spread_mode: Option<crate::settings::SpreadMode>,
+    /// 見開きから消しゴムに入ったときのペア (left_idx, right_idx)。
+    /// パネルの「左ページ」「右ページ」ボタンと、終了時のページ位置復元に使う。
+    /// 単一ページから入った場合 / 見開き中でも片側だけのページ (表紙・末尾奇数・
+    /// 横長画像) から入った場合は `None`。
+    pub(crate) erase_spread_pair: Option<(usize, usize)>,
 
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
@@ -2316,6 +2324,8 @@ impl Default for App {
             erase_selected_vector: None,
             erase_vector_drag: None,
             erase_inpaint_pending: None,
+            erase_saved_spread_mode: None,
+            erase_spread_pair: None,
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
@@ -15562,6 +15572,73 @@ mod favorite_adjustment_defaults_tests {
         app.set_rating(idx, 0);
         let db_value = app.rating_db.as_ref().unwrap().get(&key);
         assert_eq!(db_value, 0, "★0 で DB を上書きできる");
+    }
+
+    /// 見開きから消しゴムに入ったあと `reset_erase_mode` で元の見開き状態に戻ること。
+    /// (Apply [E] / Cancel [Esc] どちらの経路でも内部的に reset_erase_mode が呼ばれる。)
+    #[test]
+    fn reset_erase_mode_restores_saved_spread_state() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ペア: idx 0 (left), idx 1 (right) を仮想的に保存している状態を組み立てる。
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        // 編集対象は左ページとする
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single; // 消しゴム中の状態
+        app.erase_saved_spread_mode = Some(SpreadMode::Ltr); // 元のモード
+        app.erase_spread_pair = Some((0, 1));
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::Vec2::new(50.0, 30.0);
+        app.erase_mode = true;
+
+        app.reset_erase_mode();
+
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Ltr,
+            "reset 後に spread_mode が Ltr へ復元される"
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "fullscreen_idx は左ページに戻る (resolve_spread_pair で同ペアが復元される)"
+        );
+        assert!(
+            app.erase_saved_spread_mode.is_none(),
+            "saved_spread_mode は消費される"
+        );
+        assert!(app.erase_spread_pair.is_none(), "pair も消費される");
+        assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO, "パンはリセット");
+        assert!(!app.erase_mode);
+    }
+
+    /// 単一ページから入った場合 (= erase_saved_spread_mode が None) は spread_mode を
+    /// 触らずに reset すること。誤って Single に書き換えないことの回帰ガード。
+    #[test]
+    fn reset_erase_mode_leaves_spread_state_untouched_when_single_entry() {
+        use crate::settings::SpreadMode;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.spread_mode = SpreadMode::Single;
+        app.erase_saved_spread_mode = None;
+        app.erase_spread_pair = None;
+        app.erase_mode = true;
+        app.fullscreen_idx = Some(7);
+
+        app.reset_erase_mode();
+
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(7),
+            "Single 経由なら fullscreen_idx は弄らない"
+        );
     }
 
     /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は
