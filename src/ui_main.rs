@@ -1291,10 +1291,16 @@ impl App {
 
                 let cols = self.settings.grid_cols.max(1);
                 let avail_w = ui.available_width();
-                let cell_w = (avail_w / cols as f32).floor();
+                // ウィンドウを極端に狭めたとき (avail_w < cols) cell_w が 0 にフロアされ、
+                // cell_h も 1px 近辺になる。すると viewport_h / cell_h が 800 行レベルに跳ね上がり、
+                // 描画ループが 1 フレームに数千セル以上を処理しようとして UI が固まる
+                // (2026-04 ユーザー報告)。cell_w / cell_h に下限を入れて、可視行数の暴発を防ぐ。
+                // 下限を超えるサイズはセルが横にはみ出す形になるが、フリーズよりは遥かにまし。
+                const MIN_CELL_PX: f32 = 32.0;
+                let cell_w = (avail_w / cols as f32).floor().max(MIN_CELL_PX);
                 let cell_h = (cell_w * self.settings.thumb_aspect.height_ratio())
                     .round()
-                    .max(1.0);
+                    .max(MIN_CELL_PX);
 
                 // ウィンドウリサイズやアスペクト比変更でセルサイズが変わった場合スナップし直す
                 if (cell_w - self.last_cell_size).abs() > 0.5
