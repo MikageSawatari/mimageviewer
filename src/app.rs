@@ -843,6 +843,28 @@ pub(crate) struct EraseSpreadCtx {
     pub pair: (usize, usize),
 }
 
+/// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
+/// `start_loading_items` で仮想フォルダ用 catalog を開くタイミングで構築し、
+/// `poll_thumbnails` の finalize シグナル経路で発火する。
+pub(crate) struct VirtualFolderWriteback {
+    pub parent_catalog: Arc<crate::catalog::CatalogDb>,
+    /// 親 catalog 側の保存キー (例: `pdfthumb:foo.pdf` / `zipthumb:foo.zip`)。
+    pub parent_key: String,
+    /// 仮想 catalog 側の対応キー (= cache_map の lookup に使う、例: `page_0000`)。
+    pub target_key: String,
+    /// 監視対象の items 内 idx (= 最初の PdfPage / ZipImage の idx)。
+    pub target_idx: usize,
+    /// 現フォルダの cache_map 参照。worker がここに WebP データを put 後、
+    /// 本構造体経由で親 catalog にミラーする。
+    pub cache_map: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    >,
+    /// 親 catalog の `pdfthumb:` / `zipthumb:` 行に書き込む mtime / size。
+    /// PDF/ZIP **ファイル本体**の mtime / size を入れる (親 grid 表示時の値と一致)。
+    pub parent_entry_mtime: i64,
+    pub parent_entry_size: i64,
+}
+
 /// 画像補正パネルのスライダードラッグ中に保持するスナップショット。
 ///
 /// ドラッグ中は毎フレーム DB に書かず in-memory のみ更新し、ドラッグ終了時に
@@ -1926,6 +1948,23 @@ pub struct App {
     /// `egui::TextureHandle` は内部 Arc なので clone は refcount inc だけ。
     pub(crate) fs_holdover_tex: Option<egui::TextureHandle>,
 
+    /// 仮想フォルダ (PDF/ZIP) 進入時に「最初のページのサムネを完成させたら親 catalog
+    /// にも書き戻す」ための write-back ターゲット。`Some` のとき finalize シグナルが
+    /// `target_idx` で届いた時点で `cache_map` から WebP データを取り出して親 catalog
+    /// の `parent_key` (= `pdfthumb:foo.pdf` / `zipthumb:foo.zip`) に保存する。
+    /// 一度発火したら None に戻して二重書き込みを防ぐ。
+    /// items 入れ替え時 (`start_loading_items` 冒頭) に再初期化される。
+    pub(crate) virtual_folder_writeback: Option<VirtualFolderWriteback>,
+
+    /// PDFium ワーカープールの thrash 抑制用 grace period。
+    /// PDF/ZIP を仮想フォルダとして開いた直後の数十 ms はユーザーが Ctrl+↑↓ で
+    /// すぐ次のフォルダに移る確率が高く、prefetch (1 ページ目以外) を即時 enqueue
+    /// すると PDFium 側で in-flight cancel ができないため (= ページ単位レンダは
+    /// atomic で、dispatch 後はキャンセル不可)、無駄なレンダリングがプールを占有する。
+    /// `Some(deadline)` の間は prefetch 対象 (= 現ページ以外の PdfPage) の enqueue を
+    /// スキップして worker の暇をユーザーの確定操作のために空けておく。
+    pub(crate) pdf_prefetch_grace_until: Option<std::time::Instant>,
+
     // ── カタログ LRU キャッシュ ───────────────────────────────────
     /// folder_path → Arc<CatalogDb> の小さい LRU。`start_loading_items` の
     /// `CatalogDb::open` cold path が UI スレッドを止めるのを抑えるため、
@@ -2365,6 +2404,8 @@ impl Default for App {
             erase_spread_ctx: None,
             fs_nav_locked_gen: None,
             fs_holdover_tex: None,
+            virtual_folder_writeback: None,
+            pdf_prefetch_grace_until: None,
             catalog_cache: std::collections::HashMap::new(),
             catalog_cache_order: std::collections::VecDeque::new(),
             input_seq: 0,
@@ -4058,20 +4099,29 @@ impl App {
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
-    /// PDF / ZIP を仮想フォルダとして開いた直後、その仮想フォルダの最初のページの
-    /// サムネイルキャッシュを **親フォルダ catalog** から seed する。
+    /// PDF / ZIP を仮想フォルダとして開いた直後の seed + write-back ターゲット設定 +
+    /// PDFium prefetch grace 設定をまとめて行う。
     ///
-    /// 背景: 親フォルダのグリッド表示中に PdfFile/ZipFile のサムネは既に
-    /// 親 catalog の `pdfthumb:foo.pdf` / `zipthumb:foo.zip` キーに保存されている。
-    /// しかし PDF/ZIP を開いた時点では仮想 catalog (PDF/ZIP path で別 SQLite) は
-    /// 空なので、`page_0000` / 最初のエントリ name キーがミスし、PDFium / ZIP
-    /// 解凍で再レンダリングされる (PDF は 200-500ms)。
+    /// 背景:
+    /// - 親フォルダのグリッド表示中に PdfFile/ZipFile のサムネは
+    ///   親 catalog の `pdfthumb:foo.pdf` / `zipthumb:foo.zip` キーに保存される。
+    /// - 仮想 catalog (PDF/ZIP path で別 SQLite) は別で `page_0000` / 最初の
+    ///   エントリ name キーを使う。
+    /// - 二つの catalog は独立しているので、毎回同じ画像を 2 回生成していた
+    ///   (PDF は PDFium 経由 200-500ms)。
     ///
-    /// 親 catalog にあるサムネバイト列をそのまま仮想 catalog の対応キーへ書き込み、
-    /// `cache_map` にも挿入することで、ワーカー初回 lookup でヒットさせて再レンダリング
-    /// を回避する。一度書き込めば永続化されるので、以降の進入は親 catalog 経由でなくても
-    /// 仮想 catalog 単独で速い。
-    fn seed_virtual_folder_first_thumb_from_parent(
+    /// この関数は 3 つの方向で対策する:
+    /// 1. **seed**: 親 catalog にエントリがあれば仮想 catalog にコピー (= 再生成回避)。
+    ///    既に grid を経由していたケースは即時ヒット。
+    /// 2. **writeback ターゲット設定**: 仮想 catalog 側で worker が page_0000 を
+    ///    完成させた後、`poll_thumbnails` の finalize で親 catalog にもミラー書き込み。
+    ///    grid を経由しないルート (= Ctrl+↑↓ で直接 PDF を開く流れ) では、初回の
+    ///    PDFium レンダリングコストは取り戻せないが、2 回目以降の同じフォルダ進入で
+    ///    seed 経路がヒットするようになる。
+    /// 3. **prefetch grace**: PDF を開いた直後 100ms は prefetch を抑止して、
+    ///    Ctrl+↑↓ 連打の最中に PDFium プールが「破棄される予定の prefetch render」
+    ///    で詰まらないようにする。ユーザーがその場で停止したらそこから prefetch 開始。
+    fn setup_virtual_folder_seed_and_writeback(
         &mut self,
         source_path: &Path,
         target_db: &crate::catalog::CatalogDb,
@@ -4083,75 +4133,174 @@ impl App {
             .extension()
             .and_then(|e| e.to_str())
             .map(|s| s.to_ascii_lowercase());
-        let (parent_prefix, target_key) = match ext.as_deref() {
-            Some("pdf") => (
-                crate::thumb_loader::CACHE_KEY_PDF,
-                crate::grid_item::pdf_page_cache_key(0),
-            ),
-            Some("zip") => {
-                // ZIP は最初の ZipImage アイテムの entry_name がキー (full path within ZIP)。
-                let Some(entry_name) = self.items.iter().find_map(|it| match it {
-                    GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
-                    _ => None,
+        let (parent_prefix, target_key, target_idx, is_pdf) = match ext.as_deref() {
+            Some("pdf") => {
+                // 最初の PdfPage の idx (通常 0、ZipSeparator 等が入らない PDF では 0 確定)。
+                let Some(target_idx) = self.items.iter().position(|it| {
+                    matches!(it, GridItem::PdfPage { page_num: 0, .. })
                 }) else {
                     return;
                 };
-                (crate::thumb_loader::CACHE_KEY_ZIP, entry_name)
+                (
+                    crate::thumb_loader::CACHE_KEY_PDF,
+                    crate::grid_item::pdf_page_cache_key(0),
+                    target_idx,
+                    true,
+                )
+            }
+            Some("zip") => {
+                let Some((target_idx, entry_name)) =
+                    self.items.iter().enumerate().find_map(|(i, it)| match it {
+                        GridItem::ZipImage { entry_name, .. } => Some((i, entry_name.clone())),
+                        _ => None,
+                    })
+                else {
+                    return;
+                };
+                (
+                    crate::thumb_loader::CACHE_KEY_ZIP,
+                    entry_name,
+                    target_idx,
+                    false,
+                )
             }
             _ => return,
         };
-        // すでに仮想 catalog 側にあるなら何もしない (再 seed 不要)。
-        if cache_map
-            .read()
-            .map(|m| m.contains_key(&target_key))
-            .unwrap_or(false)
-        {
-            return;
+
+        // PDF/ZIP 開いた直後の prefetch 抑制 (= worker thrash 防止) を仕掛ける。
+        // PDF だけに適用 (ZIP は decode が軽いので大した負荷にならない)。
+        if is_pdf {
+            self.pdf_prefetch_grace_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(100),
+            );
         }
+
         let Some(parent) = source_path.parent() else {
             return;
         };
         let Some(fname) = source_path.file_name().and_then(|n| n.to_str()) else {
             return;
         };
-        let lookup_key = format!("{parent_prefix}{fname}");
+        let parent_key = format!("{parent_prefix}{fname}");
         let Some(parent_db) = self.get_or_open_catalog(parent) else {
             return;
         };
-        let Some(parent_entry) = parent_db.load_one(&lookup_key).ok().flatten() else {
+
+        // ── seed 経路 ──────────────────────────────────────────────
+        // 仮想 catalog 側に既にあれば何もしない (再 seed 不要)。
+        let already_in_virtual = cache_map
+            .read()
+            .map(|m| m.contains_key(&target_key))
+            .unwrap_or(false);
+        let parent_entry = if !already_in_virtual {
+            parent_db.load_one(&parent_key).ok().flatten()
+        } else {
+            None
+        };
+        if let Some(entry) = parent_entry.as_ref() {
+            // image::load_from_memory で WebP の寸法を取り出す (CacheEntry に
+            // width/height が無いため)。失敗したら seed のみスキップ (writeback は仕掛ける)。
+            if let Ok(img) = image::load_from_memory(&entry.jpeg_data) {
+                let (w, h) = (img.width(), img.height());
+                let _ = target_db.save(
+                    &target_key,
+                    entry.mtime,
+                    entry.file_size,
+                    w,
+                    h,
+                    entry.source_dims,
+                    &entry.jpeg_data,
+                );
+                if let Ok(mut m) = cache_map.write() {
+                    m.insert(
+                        target_key.clone(),
+                        crate::catalog::CacheEntry {
+                            mtime: entry.mtime,
+                            file_size: entry.file_size,
+                            jpeg_data: entry.jpeg_data.clone(),
+                            source_dims: entry.source_dims,
+                        },
+                    );
+                }
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "nav",
+                        "virtual_seed_hit",
+                        Some(&parent_key),
+                        0,
+                        &[],
+                    );
+                }
+            }
+        } else if !already_in_virtual && crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "virtual_seed_miss",
+                Some(&parent_key),
+                0,
+                &[],
+            );
+        }
+
+        // ── writeback ターゲット設定 ──────────────────────────────
+        // 親エントリの mtime / size を取得 (= PDF/ZIP ファイル本体のメタ)。
+        let (entry_mtime, entry_size) = match std::fs::metadata(source_path) {
+            Ok(m) => {
+                let mt = crate::ui_helpers::mtime_secs(&m);
+                let sz = m.len() as i64;
+                (mt, sz)
+            }
+            Err(_) => (0, 0),
+        };
+        self.virtual_folder_writeback = Some(VirtualFolderWriteback {
+            parent_catalog: parent_db,
+            parent_key,
+            target_key,
+            target_idx,
+            cache_map: Arc::clone(cache_map),
+            parent_entry_mtime: entry_mtime,
+            parent_entry_size: entry_size,
+        });
+    }
+
+    /// `poll_thumbnails` の finalize シグナル経路から呼ばれ、
+    /// `virtual_folder_writeback` の対象 idx が完成していたら親 catalog にミラー書き込みする。
+    /// 一度発火したら writeback を None にして二重書き込みを防ぐ。
+    fn fire_virtual_folder_writeback_if_ready(&mut self, finalized_idx: usize) {
+        let Some(wb) = self.virtual_folder_writeback.as_ref() else {
             return;
         };
-        // WebP の寸法は schema 上の width/height に渡す必要があるが、CacheEntry には
-        // 含まれていないので image クレートで decode して取り出す (decode はフルカラー
-        // 化までやるが thumb サイズなので数 ms)。失敗したら seed しない。
-        let Ok(img) = image::load_from_memory(&parent_entry.jpeg_data) else {
+        if finalized_idx != wb.target_idx {
+            return;
+        }
+        // cache_map から WebP データを取り出す (worker が直前に書き込んでいるはず)。
+        let Some(entry) = wb
+            .cache_map
+            .read()
+            .ok()
+            .and_then(|m| m.get(&wb.target_key).cloned())
+        else {
+            return;
+        };
+        // 寸法は decode で取得 (CacheEntry に width/height が含まれない)。
+        let Ok(img) = image::load_from_memory(&entry.jpeg_data) else {
             return;
         };
         let (w, h) = (img.width(), img.height());
-        // 仮想 catalog (DB) に書き込む。mtime / size は親 catalog 由来をそのまま使う:
-        // PDF page 0 のキャッシュは PDF ファイル本体の mtime/size で照合される
-        // (load_pdf_as_folder の image_metas[0] = (pdf.mtime, pdf.size) と一致)。
-        let _ = target_db.save(
-            &target_key,
-            parent_entry.mtime,
-            parent_entry.file_size,
+        let parent_key = wb.parent_key.clone();
+        let _ = wb.parent_catalog.save(
+            &parent_key,
+            wb.parent_entry_mtime,
+            wb.parent_entry_size,
             w,
             h,
-            parent_entry.source_dims,
-            &parent_entry.jpeg_data,
+            entry.source_dims,
+            &entry.jpeg_data,
         );
-        // cache_map にも入れて、ワーカーの次フレーム lookup でヒットさせる。
-        if let Ok(mut m) = cache_map.write() {
-            m.insert(
-                target_key,
-                crate::catalog::CacheEntry {
-                    mtime: parent_entry.mtime,
-                    file_size: parent_entry.file_size,
-                    jpeg_data: parent_entry.jpeg_data,
-                    source_dims: parent_entry.source_dims,
-                },
-            );
+        if crate::perf::is_enabled() {
+            crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
         }
+        self.virtual_folder_writeback = None;
     }
 
     /// `catalog_cache` の全エントリを drop し、SQLite Connection を閉じる。
@@ -4566,8 +4715,17 @@ impl App {
         // PDF / ZIP を仮想フォルダとして開いた場合、親フォルダ catalog の
         // pdfthumb: / zipthumb: 先頭サムネを仮想 catalog の page_0000 / 最初の
         // entry name キーに seed する (PDFium 再レンダリング 200-500ms を回避)。
+        // 同時に write-back ターゲットを設定して「仮想 catalog で完成した先頭サムネを
+        // 親 catalog にミラー保存」する経路も開く (次回親フォルダ表示時の grid サムネ
+        // 生成を省略するため)。
+        // `pdf_prefetch_grace_until` も初期化して、仮想フォルダ開いた直後の数十 ms は
+        // PDFium ワーカーを現ページ専用に空けておく (Ctrl+↑↓ 連打時の thrash 抑制)。
         if let Some(ref cat) = catalog_arc {
-            self.seed_virtual_folder_first_thumb_from_parent(&source_path, cat, &cache_map);
+            self.setup_virtual_folder_seed_and_writeback(
+                &source_path,
+                cat,
+                &cache_map,
+            );
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -5598,10 +5756,13 @@ impl App {
 
         // バックログ + チャネルから受信した結果を統合して処理する。
         // バックログを先に処理（既にデコード済みなので優先）。
+        // ループ内で `self` を mutably 借りる経路 (writeback 等) があるため、
+        // ここで Vec に collect してから iterate する (借用衝突回避)。
         let backlog = std::mem::take(&mut self.texture_backlog);
-        let drain = backlog
+        let drain: Vec<_> = backlog
             .into_iter()
-            .chain(std::iter::from_fn(|| self.rx.try_recv().ok()));
+            .chain(std::iter::from_fn(|| self.rx.try_recv().ok()))
+            .collect();
 
         for msg in drain {
             let crate::thumb_loader::ThumbMsg {
@@ -5648,6 +5809,10 @@ impl App {
             // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
             // 残り続けるので無視する。
             if finalized {
+                // 仮想フォルダの先頭ページ完成を親 catalog にミラー (PDFium 再レンダ
+                // 防止のための writeback)。requested の cleanup より前にやることで、
+                // cache_map から WebP データが消える前に確実に読み出せる。
+                self.fire_virtual_folder_writeback_if_ready(i);
                 if !self.requested.contains_key(&i) {
                     received += 1;
                     continue;
@@ -5854,7 +6019,11 @@ impl App {
     ///
     /// 毎フレーム呼ぶ想定。現在のスクロール位置から keep_range を算出し、
     /// 範囲外の Loaded を Evicted 化し、範囲内の Pending/Evicted を reload_queue に push する。
-    fn update_keep_range_and_requests(&mut self, frame_t0: std::time::Instant) {
+    fn update_keep_range_and_requests(
+        &mut self,
+        ctx: &egui::Context,
+        frame_t0: std::time::Instant,
+    ) {
         // 削除進行中は prefetch / eviction 調整も一時停止する。items にはまだ削除対象の
         // path が残っており、worker が keep_range 内の idx を enqueue するとサムネ再デコードが
         // 走って「Failed」表示が出る (ゴミ箱移動済みなので File::open が失敗する)。
@@ -6065,6 +6234,17 @@ impl App {
         // これで ★フィルタ / Ctrl+F で疎になっても非可視 idx が流入しない。
         let mut new_regular: Vec<LoadRequest> = Vec::new();
         let mut new_heavy: Vec<LoadRequest> = Vec::new();
+        // PDFium プールの thrash 抑制: PDF 仮想フォルダを開いた直後の grace 期間中は
+        // 「現在見えていない PdfPage」(= prefetch) の enqueue をスキップする。
+        // 一旦 dispatch すると PDFium は in-flight cancel できないので、ユーザーが
+        // 数十 ms 内に Ctrl+↑↓ で次のフォルダに行く場合に「破棄される予定の prefetch
+        // render が worker を 200-500ms 占有して、ユーザーが本当に見たいページの render を
+        // 後ろに押し出す」という事態を防ぐ。grace を過ぎたら通常通り enqueue する
+        // (request_repaint_after で grace 終了時に再実行されるよう確保する)。
+        let pdf_prefetch_blocked = self
+            .pdf_prefetch_grace_until
+            .is_some_and(|t| std::time::Instant::now() < t);
+        let mut deferred_pdf_prefetch = false;
         for i in self.keep_set_sorted() {
             if self.requested.contains_key(&i) {
                 continue;
@@ -6094,6 +6274,15 @@ impl App {
                 continue;
             };
             req.priority = i >= visible_raw_start && i < visible_raw_end;
+            // grace 中は PdfPage の prefetch (= 非 priority) のみスキップ。現在表示中の
+            // PdfPage (= priority=true) は通常通り enqueue する。
+            if pdf_prefetch_blocked
+                && !req.priority
+                && req.pdf_page.is_some()
+            {
+                deferred_pdf_prefetch = true;
+                continue;
+            }
             req.input_seq = self.input_seq;
             req.items_gen = self.items_generation;
             // ZipFile / PdfFile / Folder → heavy_io_queue、それ以外 → reload_queue
@@ -6250,6 +6439,20 @@ impl App {
                 (t5 - t4).as_secs_f64() * 1000.0,
                 (t6 - t5).as_secs_f64() * 1000.0,
             ));
+        }
+
+        // grace 中に prefetch を defer したなら、grace 終了時刻に repaint を要求して
+        // 自然な再 enqueue タイミングを確保する (= 次フレームでこの関数が再走しても
+        // 通常のスクロール repaint が来ない場合でも prefetch が再開される)。
+        if pdf_prefetch_blocked && deferred_pdf_prefetch {
+            if let Some(deadline) = self.pdf_prefetch_grace_until {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                ctx.request_repaint_after(remaining);
+            }
+        }
+        // grace 期限切れなら field をクリア (毎フレーム比較を省く)。
+        if !pdf_prefetch_blocked {
+            self.pdf_prefetch_grace_until = None;
         }
     }
 
@@ -12258,7 +12461,7 @@ impl eframe::App for App {
         self.poll_fs_nav_lock();
         let t_poll = frame_t0.elapsed();
 
-        self.update_keep_range_and_requests(frame_t0);
+        self.update_keep_range_and_requests(ctx, frame_t0);
         let t_keep = frame_t0.elapsed();
 
         // keep_range が確定した直後に可視範囲分のタグ prewarm を push。
@@ -15854,6 +16057,7 @@ mod favorite_adjustment_defaults_tests {
     /// が省略される。
     #[test]
     fn seed_virtual_folder_first_thumb_copies_pdf_thumb_from_parent() {
+        use crate::grid_item::GridItem;
         let (mut app, _g, tmp, _l) = setup_app();
         // 親フォルダと PDF パスを準備 (実ファイルは要らない、catalog DB のキーだけが
         // 関心事)。
@@ -15888,8 +16092,16 @@ mod favorite_adjustment_defaults_tests {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
-        // seed 実行。PDF として認識させるため source_path には pdf_path を渡す。
-        app.seed_virtual_folder_first_thumb_from_parent(&pdf_path, &pdf_db, &cache_map);
+        // PdfPage(page_num=0) を items に積む (= setup が target_idx を見つけられるように)。
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+
+        // seed + writeback ターゲット設定を実行。PDF として認識させるため source_path には
+        // pdf_path を渡す。
+        app.setup_virtual_folder_seed_and_writeback(&pdf_path, &pdf_db, &cache_map);
 
         // 仮想 catalog の DB と cache_map の両方に page_0000 が入っているはず。
         let target_key = crate::grid_item::pdf_page_cache_key(0);
@@ -15906,11 +16118,20 @@ mod favorite_adjustment_defaults_tests {
             in_map.contains_key(&target_key),
             "ワーカーが即時 hit するよう cache_map にも入る"
         );
+
+        // PDF prefetch grace が 100ms 以内で設定されていること (Ctrl+↑↓ 連打時の
+        // PDFium thrash 抑制)。
+        assert!(
+            app.pdf_prefetch_grace_until.is_some(),
+            "PDF を開いた瞬間に prefetch grace を仕掛ける"
+        );
     }
 
     /// 親フォルダ catalog にエントリが無い場合は seed しない (= no-op)。
+    /// ただし writeback ターゲットと grace は仕掛ける (将来の write-back 経路用)。
     #[test]
     fn seed_virtual_folder_first_thumb_no_parent_entry_is_noop() {
+        use crate::grid_item::GridItem;
         let (mut app, _g, tmp, _l) = setup_app();
         let parent_dir = tmp.path().join("parent2");
         std::fs::create_dir_all(&parent_dir).unwrap();
@@ -15921,11 +16142,93 @@ mod favorite_adjustment_defaults_tests {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
-        app.seed_virtual_folder_first_thumb_from_parent(&pdf_path, &pdf_db, &cache_map);
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+
+        app.setup_virtual_folder_seed_and_writeback(&pdf_path, &pdf_db, &cache_map);
 
         let target_key = crate::grid_item::pdf_page_cache_key(0);
         assert!(pdf_db.load_one(&target_key).unwrap().is_none());
         assert!(!cache_map.read().unwrap().contains_key(&target_key));
+        // writeback ターゲットは設定される (= 後続の worker 完成時に親 catalog にミラー)。
+        assert!(
+            app.virtual_folder_writeback.is_some(),
+            "親 catalog がミスでも writeback ターゲットは設定する"
+        );
+    }
+
+    /// 仮想 catalog で先頭ページが完成したとき、`fire_virtual_folder_writeback_if_ready`
+    /// が親 catalog の `pdfthumb:foo.pdf` 行に WebP データを書き戻すこと。
+    #[test]
+    fn fire_virtual_folder_writeback_mirrors_to_parent() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent3");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let _pdf_path = parent_dir.join("bar.pdf");
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db_arc =
+            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
+
+        // worker が page_0000 として cache_map に入れた WebP を準備。
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 128, 255, 255]));
+        let mut webp_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        cache_map.write().unwrap().insert(
+            target_key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: 999,
+                file_size: 4096,
+                jpeg_data: webp_bytes.clone(),
+                source_dims: Some((400, 400)),
+            },
+        );
+
+        let parent_key = format!(
+            "{}{}",
+            crate::thumb_loader::CACHE_KEY_PDF,
+            "bar.pdf"
+        );
+        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
+            parent_catalog: Arc::clone(&parent_db_arc),
+            parent_key: parent_key.clone(),
+            target_key: target_key.clone(),
+            target_idx: 3,
+            cache_map: Arc::clone(&cache_map),
+            parent_entry_mtime: 1234567,
+            parent_entry_size: 9999,
+        });
+
+        // 別 idx で発火しても何も起きない。
+        app.fire_virtual_folder_writeback_if_ready(2);
+        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
+        assert!(app.virtual_folder_writeback.is_some());
+
+        // target_idx で発火すると親 catalog にミラーされ、writeback がクリアされる。
+        app.fire_virtual_folder_writeback_if_ready(3);
+        let entry = parent_db_arc
+            .load_one(&parent_key)
+            .unwrap()
+            .expect("親 catalog にミラー保存される");
+        assert_eq!(entry.mtime, 1234567);
+        assert_eq!(entry.file_size, 9999);
+        assert_eq!(entry.source_dims, Some((400, 400)));
+        assert_eq!(entry.jpeg_data, webp_bytes);
+        assert!(
+            app.virtual_folder_writeback.is_none(),
+            "発火後は writeback を None に戻して二重書き込みを防ぐ"
+        );
     }
 
     /// Codex P1 (0.8.2 後半): `release_fs_nav_lock` が `fs_nav_locked_gen` /

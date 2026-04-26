@@ -26,6 +26,7 @@ pub fn db_path_for(cache_dir: &Path, folder_path: &Path) -> PathBuf {
 // キャッシュエントリ
 // -----------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct CacheEntry {
     pub mtime: i64,
     pub file_size: i64,
