@@ -236,21 +236,28 @@ impl App {
         }
     }
 
-    /// `fs_idx` 用の「今画面に映っているテクスチャ」を Arc::clone で取り出す。
-    /// 優先順位: 補正済みキャッシュ → AI 処理済み → fs_cache (フルサイズ) → thumbnail。
-    /// Ctrl+↑↓ ナビ前に `fs_holdover_tex` を仕込むためのヘルパ。
-    pub(crate) fn current_fs_tex_for_holdover(
+    /// `idx` に対する「現在表示できる最良のテクスチャ」を Arc::clone で取り出す。
+    /// 優先順: 補正済みキャッシュ → AI 処理済み → fs_cache (Static / Animated 現フレーム)
+    /// → サムネ (`include_thumb=true` のときのみ)。
+    ///
+    /// `prepare_fullscreen_state` の高解像度 tex 解決と `current_fs_tex_for_holdover`
+    /// が同じチェーンを 2 回書いていた重複を集約する。Render パスは AI 設定 OFF 時に
+    /// AI キャッシュを使わない gate を別途持っているので、フル一致ではなく一部
+    /// (補正・fs_cache) を共通化する位置付け。Holdover は AI gate を気にせず常にこの
+    /// チェーンを走らせる (短時間の lock 中は古い AI 表示でも黒画面より遥かにマシ)。
+    pub(crate) fn resolve_fs_display_tex(
         &self,
-        fs_idx: usize,
+        idx: usize,
+        include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
-        if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&fs_idx) {
+        if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&idx) {
             return Some(tex.clone());
         }
         let bg = self.effective_upscale_bg_mode();
-        if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(fs_idx, bg)) {
+        if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(idx, bg)) {
             return Some(tex.clone());
         }
-        match self.fs_cache.get(&fs_idx) {
+        match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => return Some(tex.clone()),
             Some(FsCacheEntry::Animated {
                 frames,
@@ -263,10 +270,23 @@ impl App {
             }
             _ => {}
         }
-        match self.thumbnails.get(fs_idx) {
-            Some(crate::grid_item::ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-            _ => None,
+        if include_thumb {
+            if let Some(crate::grid_item::ThumbnailState::Loaded { tex, .. }) =
+                self.thumbnails.get(idx)
+            {
+                return Some(tex.clone());
+            }
         }
+        None
+    }
+
+    /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
+    /// `resolve_fs_display_tex` を `include_thumb=true` で呼んで「最良の表示物」を取る。
+    pub(crate) fn current_fs_tex_for_holdover(
+        &self,
+        fs_idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.resolve_fs_display_tex(fs_idx, true)
     }
 
     /// `fs_nav_locked_gen.is_some()` の薄いラッパー。

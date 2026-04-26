@@ -1910,30 +1910,28 @@ pub struct App {
     /// という不変条件をフィールドの形で表現するため。
     pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
 
-    // ── カタログ LRU キャッシュ ───────────────────────────────────
-    /// フルスクリーン Ctrl+↑↓ ナビ中の「次のページがまだ表示できない」ガード。
-    /// `Some(gen)` の間は新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に
-    /// 出し続ける。`gen` はロック発火時の `items_generation` のスナップショットで、
-    /// items が入れ替わる (= `install_new_items` で `items_generation` が進む) まで
-    /// ロックを解除しない。これをやらないとナビ発火直後 (まだ DFS 完了前で fs_idx も
+    // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
+    /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
+    /// 新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
+    /// `gen` はロック発火時の `items_generation` のスナップショット。items が
+    /// 入れ替わる (= `install_new_items` で `items_generation` が進む) まで
+    /// ロックを解除しない。これをやらないとナビ発火直後 (DFS 完了前で fs_idx も
     /// 旧ページのまま) の `poll_fs_nav_lock` が「現ページはロード済」と判定して
-    /// ロックを即解除してしまい、後で実際に items が入れ替わった瞬間に holdover が
-    /// 失われて「ファイル名のみ表示」が一瞬出る不具合になる。
+    /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
+    /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// `fs_nav_locked` 中に「現在画面に映っていた」テクスチャを退避しておく場所。
-    /// items 入れ替え (start_loading_items の install_new_items) で fs_cache が
-    /// 全 drop されてしまうため、ナビ発火直前に Arc::clone してここに保持する。
+    /// ロック中に「現在画面に映っていた」テクスチャを退避しておく場所。
+    /// items 入れ替え (`install_new_items`) で fs_cache が全 drop されても、
+    /// ナビ発火直前に Arc::clone でここに保持しておけば描画パスから参照可能。
     /// `egui::TextureHandle` は内部 Arc なので clone は refcount inc だけ。
     pub(crate) fs_holdover_tex: Option<egui::TextureHandle>,
 
     // ── カタログ LRU キャッシュ ───────────────────────────────────
-    /// folder_path → Arc<CatalogDb> の小さい LRU。
-    /// `start_loading_items` は毎ステップで `CatalogDb::open` を呼んでおり、cold path で
-    /// 150-260ms (perf-log p95=152ms / max=262ms 計測) の SQLite Connection 初期化が
-    /// UI スレッドを止めて Ctrl+↓ 連打のもたつきの主因になっていた。直近 N 個の
-    /// `Arc<CatalogDb>` を保持して revisit 時に open をスキップする。OS-level の
-    /// file cache も connection を握っている間は warm に保たれる効果がある。
-    /// 容量超過時は FIFO で古いものから drop (= SQLite Connection close)。
+    /// folder_path → Arc<CatalogDb> の小さい LRU。`start_loading_items` の
+    /// `CatalogDb::open` cold path が UI スレッドを止めるのを抑えるため、
+    /// 直近 N 個の `Arc<CatalogDb>` を保持して revisit 時の open をスキップする。
+    /// connection を握っている間は OS-level の file cache も warm に保たれる
+    /// 副次効果がある。容量超過時は FIFO で古いものから drop (Connection close)。
     pub(crate) catalog_cache: std::collections::HashMap<PathBuf, Arc<crate::catalog::CatalogDb>>,
     /// `catalog_cache` 用 LRU 順 (古い順)。
     pub(crate) catalog_cache_order: std::collections::VecDeque<PathBuf>,
@@ -3865,8 +3863,8 @@ impl App {
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
-        if let Some(forward) = self.fs_nav_after_pdf_enumerate.take() {
-            if let Some(new_idx) = self.find_fullscreen_nav_target(forward) {
+        if let Some(_forward) = self.fs_nav_after_pdf_enumerate.take() {
+            if let Some(new_idx) = self.find_fullscreen_nav_target() {
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
@@ -4007,8 +4005,8 @@ impl App {
                 self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new(), None);
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
-                if let Some(forward) = self.fs_nav_after_pdf_enumerate.take() {
-                    if let Some(new_idx) = self.find_fullscreen_nav_target(forward) {
+                if let Some(_forward) = self.fs_nav_after_pdf_enumerate.take() {
+                    if let Some(new_idx) = self.find_fullscreen_nav_target() {
                         self.open_fullscreen(new_idx);
                         self.selected = Some(new_idx);
                         self.scroll_to_selected = true;
@@ -7093,7 +7091,7 @@ impl App {
                     emit_end(apply_t0, apply_seq, apply_mode_tag, "enumerate_defer");
                     return;
                 }
-                let target_idx = self.find_fullscreen_nav_target(result.forward);
+                let target_idx = self.find_fullscreen_nav_target();
                 if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
                     self.fs_nav_after_pdf_enumerate = Some(result.forward);
                     emit_end(apply_t0, apply_seq, apply_mode_tag, "enumerate_defer");
@@ -7135,7 +7133,7 @@ impl App {
     ///    最初 (backward 時は最後) の ZIP/PDF に入り、その中の画像系を返す。
     ///    これにより「ZIP/PDF しか入っていない中間フォルダ」でフルスクリーン表示が
     ///    切れず、マンガ/コミックの連続閲覧が続く。
-    fn find_fullscreen_nav_target(&mut self, _forward: bool) -> Option<usize> {
+    fn find_fullscreen_nav_target(&mut self) -> Option<usize> {
         // Ctrl+↑↓ は方向に関わらず常にフォルダ先頭の画像系アイテムへ着地する
         // (= 一般的なビューワ慣習に合わせ、フォルダ識別性を優先)。後方ナビでも
         // 先頭着地にすることで Ctrl+矢印の mental model が「フォルダにジャンプして
@@ -15722,11 +15720,11 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// `find_fullscreen_nav_target`: 方向 (forward/backward) に関わらず常に
-    /// フォルダ先頭の画像系アイテムを返すこと。Ctrl+↑ でも前フォルダの最後ではなく
-    /// 最初の画像に着地させる仕様変更の回帰ガード。
+    /// `find_fullscreen_nav_target`: 常にフォルダ先頭の画像系アイテムを返すこと。
+    /// Ctrl+↑ でも前フォルダの最後ではなく最初の画像に着地させる仕様変更の回帰ガード。
+    /// (旧 API の `forward: bool` 引数は仕様統一に伴って削除済み。)
     #[test]
-    fn find_fullscreen_nav_target_always_returns_first_image() {
+    fn find_fullscreen_nav_target_returns_first_image() {
         use crate::grid_item::GridItem;
         let (mut app, _g, _tmp, _l) = setup_app();
         // 並び: Folder, Image_a, Image_b, Image_c (visible_indices は items 全部)
@@ -15741,18 +15739,10 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.rebuild_visible_indices();
-        // forward = true: 先頭画像 idx=1 (= Image_a)
         assert_eq!(
-            app.find_fullscreen_nav_target(true),
+            app.find_fullscreen_nav_target(),
             Some(1),
-            "forward でも先頭の画像系アイテム"
-        );
-        // forward = false: 旧仕様なら末尾 idx=3 (= Image_c) だが、新仕様では同じく
-        // 先頭 idx=1 を返す。
-        assert_eq!(
-            app.find_fullscreen_nav_target(false),
-            Some(1),
-            "backward でも先頭画像 (= 末尾 Image_c ではない)"
+            "先頭の画像系アイテム idx=1 (Image_a) を返す (Folder idx=0 はスキップ)"
         );
     }
 
@@ -15819,8 +15809,8 @@ mod favorite_adjustment_defaults_tests {
 
     /// `get_or_open_catalog` の LRU キャッシュ動作: 同じフォルダで 2 回呼ぶと
     /// 同じ `Arc<CatalogDb>` (= 同じ Arc::ptr) が返ること、容量を超えると古いものから
-    /// 抜けること。Ctrl+↓ 連打時の `sli_catalog_open` が p95=152ms かかっていた
-    /// (perf-log 計測) のを抑える本キャッシュの回帰ガード。
+    /// 抜けること。Ctrl+↓ 連打時に毎ステップ `CatalogDb::open` を走らせないための
+    /// 本キャッシュの回帰ガード。
     #[test]
     fn catalog_cache_reuses_arc_for_same_folder_and_evicts_oldest() {
         let (mut app, _g, tmp, _l) = setup_app();
