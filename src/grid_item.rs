@@ -93,13 +93,23 @@ impl GridItem {
     /// 通常画像 / ZIP 内画像 / PDF ページが対象。フォルダ・動画・ZIP/PDF ファイル本体・
     /// セパレータは対象外。
     ///
-    /// レーティング (★) はページ単位に加えてコンテナ (フォルダ / ZIP / PDF 本体) も対象に
-    /// する方針 (一覧画面で★絞り込みするため)。レーティング用途の判定には
-    /// [`Self::accepts_rating`] を使うこと。
+    /// レーティング判定に使うのは [`Self::accepts_rating`]。
+    /// (Video はレーティング対象だがピクセル補正対象ではないため `is_ratable` には含まない。)
     pub fn is_ratable(&self) -> bool {
         matches!(
             self,
             Self::Image(_) | Self::ZipImage { .. } | Self::PdfPage { .. }
+        )
+    }
+
+    /// 単一ファイル単位でレーティング (★) を持てるアイテムか。
+    /// `is_ratable` (= ページ単位の補正/マスク/タグデータを持てるか) との違いは Video を
+    /// 含むこと: 動画は色調補正は受けないがレーティングは付与可能。フォルダ/ZIP/PDF 本体は
+    /// コンテナ扱いで [`Self::is_container_ratable`] 側。
+    pub fn is_rating_leaf(&self) -> bool {
+        matches!(
+            self,
+            Self::Image(_) | Self::Video(_) | Self::ZipImage { .. } | Self::PdfPage { .. }
         )
     }
 
@@ -121,10 +131,11 @@ impl GridItem {
     }
 
     /// レーティング★を付与できるアイテムかの総合判定。
-    /// ページ単位 (画像 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP / PDF) の
-    /// 両方を含む。補正プリセット等のページ専用データとは別物なので区別すること。
+    /// 単一ファイル (画像 / 動画 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP /
+    /// PDF) の両方を含む。補正プリセット等のページ専用データとは別物なので区別すること
+    /// (補正用には [`Self::is_ratable`])。
     pub fn accepts_rating(&self) -> bool {
-        self.is_ratable() || self.is_container_ratable()
+        self.is_rating_leaf() || self.is_container_ratable()
     }
 
     pub fn name(&self) -> Cow<'_, str> {

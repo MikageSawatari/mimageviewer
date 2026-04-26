@@ -7914,9 +7914,10 @@ impl App {
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
                 self.page_path_key(idx)
             }
-            GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
-                Some(crate::adjustment_db::normalize_path(p))
-            }
+            GridItem::Folder(p)
+            | GridItem::ZipFile(p)
+            | GridItem::PdfFile(p)
+            | GridItem::Video(p) => Some(crate::adjustment_db::normalize_path(p)),
             _ => None,
         }
     }
@@ -7927,6 +7928,7 @@ impl App {
     pub(crate) fn rating_source_path(&self, idx: usize) -> Option<PathBuf> {
         match self.items.get(idx)? {
             GridItem::Image(p)
+            | GridItem::Video(p)
             | GridItem::Folder(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => Some(p.clone()),
@@ -7979,8 +7981,9 @@ impl App {
         if let Some(db) = self.rating_db.as_ref() {
             let _ = db.set(&key, stars);
         }
-        // コンテナ自身の★は子孫集計と別軸なので is_ratable (ページ単位) のみ伝搬する。
-        if matches!(self.items.get(idx), Some(it) if it.is_ratable()) {
+        // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
+        // ZIP 内画像 / PDF ページ) のみ親フォルダの集計に伝搬する。
+        if matches!(self.items.get(idx), Some(it) if it.is_rating_leaf()) {
             self.apply_rating_delta_to_folder_counts(&key, old_stars, stars);
         }
         // コンテナへの rating 変更は current_folder と同じパスを指す可能性があるので
@@ -13634,10 +13637,31 @@ mod tests {
     }
 
     #[test]
-    fn rating_filter_video_and_non_ratable_always_visible() {
-        // Video はレーティング対象外 (accepts_rating=false) → 常に可視
+    fn rating_filter_applies_to_video_when_unrated_off() {
+        // Video もレーティング対象 (accepts_rating=true) なので「なし」フィルタ OFF で
+        // 未評価動画は隠れる。動画にもレーティングを付けられるようになったので、
+        // 通常画像と同じ扱いをする (2026-04 ユーザー報告)。
         let vid = GridItem::Video(PathBuf::from("/a.mp4"));
-        assert!(passes_rating_filter(&vid, 0, &[false; 6]));
+        // 全 OFF: ★0 (未評価) の動画は隠れる
+        assert!(!passes_rating_filter(&vid, 0, &[false; 6]));
+        // ★0 ON: ★0 の動画は通る
+        let mut rf = [false; 6];
+        rf[0] = true;
+        assert!(passes_rating_filter(&vid, 0, &rf));
+        // ★3 のみ ON: ★0 動画は通らない、★3 動画は通る
+        let mut rf = [false; 6];
+        rf[3] = true;
+        assert!(!passes_rating_filter(&vid, 0, &rf));
+        assert!(passes_rating_filter(&vid, 3, &rf));
+    }
+
+    #[test]
+    fn separator_is_not_rating_target() {
+        // ZipSeparator はレーティング対象外なのでフィルタ素通り (常に可視)。
+        let sep = GridItem::ZipSeparator {
+            dir_display: "x".into(),
+        };
+        assert!(passes_rating_filter(&sep, 0, &[false; 6]));
     }
 
     #[test]
