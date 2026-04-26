@@ -276,7 +276,13 @@ pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_
             egui::Color32::WHITE,
         );
         let badge_w = galley.size().x + pad_h * 2.0;
-        if badge_w <= max_badge_w || label.len() <= 2 {
+        // 終了条件は **文字数** で見る (byte 長を見ていた旧実装は "…" が UTF-8 3 バイトなので
+        // `"X…"` で `label.len()` が常に 4 となり、セルが極端に狭いと毎反復同じ `"X…"` を
+        // 作り続けて無限ループ → `painter.layout_no_wrap` 経由で `egui::Context::write` を
+        // 毎反復取得し UI が固まる。char count <= 2 (= "X…" 以下) なら収まり切らなくても
+        // そのまま描いて return する (2026-04 ユーザー報告 + dump 解析で確定)。
+        let chars_count = label.chars().count();
+        if badge_w <= max_badge_w || chars_count <= 2 {
             let badge_h = galley.size().y + pad_v * 2.0;
             let badge_rect = egui::Rect::from_min_size(
                 egui::pos2(cell_rect.min.x + 3.0, cell_rect.max.y - badge_h - 3.0),
@@ -290,7 +296,8 @@ pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_
             );
             return;
         }
-        // 文字を減らしてリトライ
+        // 文字を減らしてリトライ。chars_count > 2 を上で確認済みなので `keep < chars_count`
+        // が保証され、確実に進捗する (= 次反復で chars_count <= 2 か収まるかのいずれかに到達)。
         let chars: Vec<char> = label.chars().collect();
         let keep = chars.len().saturating_sub(2).max(1);
         label = chars[..keep].iter().collect::<String>() + "…";
