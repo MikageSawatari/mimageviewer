@@ -36,6 +36,15 @@ pub struct CacheEntry {
     pub source_dims: Option<(u32, u32)>,
 }
 
+/// 保存済みサムネ (WebP) バイト列からヘッダのみで `(w, h)` を取り出す。
+/// フルデコードは走らない (`ImageReader::into_dimensions` は WebP の VP8/VP8L/VP8X
+/// チャンクヘッダだけを読む)。WebP として正しく解釈できなければ `None`。
+pub fn decode_thumb_dims(data: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::WebP)
+        .into_dimensions()
+        .ok()
+}
+
 // -----------------------------------------------------------------------
 // CatalogDb
 // -----------------------------------------------------------------------
@@ -157,6 +166,27 @@ impl CatalogDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// WebP バイト列のヘッダから `(w, h)` だけを取り出して `save` する薄いラッパ。
+    /// `CacheEntry` には WebP 寸法フィールドが無いため、save 経由では `(w, h)` を呼び出し側で
+    /// 用意する必要がある。仮想フォルダの seed / write-back のように「親 catalog から
+    /// WebP バイトをそのままミラーする」用途で繰り返し書きがちなので集約した。
+    /// ヘッダのみ解析 (`ImageReader::into_dimensions`) なのでフルデコードは走らない。
+    pub fn save_thumb_bytes(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        source_dims: Option<(u32, u32)>,
+        jpeg_data: &[u8],
+    ) -> rusqlite::Result<()> {
+        let Some((w, h)) = decode_thumb_dims(jpeg_data) else {
+            // 寸法が取れない (= 壊れた WebP) なら保存を断念。SQLite スキーマ上
+            // width/height は NOT NULL なので 0 を入れると整合性が壊れる。
+            return Ok(());
+        };
+        self.save(filename, mtime, file_size, w, h, source_dims, jpeg_data)
     }
 
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。

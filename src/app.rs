@@ -4197,49 +4197,22 @@ impl App {
         } else {
             None
         };
-        if let Some(entry) = parent_entry.as_ref() {
-            // image::load_from_memory で WebP の寸法を取り出す (CacheEntry に
-            // width/height が無いため)。失敗したら seed のみスキップ (writeback は仕掛ける)。
-            if let Ok(img) = image::load_from_memory(&entry.jpeg_data) {
-                let (w, h) = (img.width(), img.height());
-                let _ = target_db.save(
-                    &target_key,
-                    entry.mtime,
-                    entry.file_size,
-                    w,
-                    h,
-                    entry.source_dims,
-                    &entry.jpeg_data,
-                );
-                if let Ok(mut m) = cache_map.write() {
-                    m.insert(
-                        target_key.clone(),
-                        crate::catalog::CacheEntry {
-                            mtime: entry.mtime,
-                            file_size: entry.file_size,
-                            jpeg_data: entry.jpeg_data.clone(),
-                            source_dims: entry.source_dims,
-                        },
-                    );
-                }
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "nav",
-                        "virtual_seed_hit",
-                        Some(&parent_key),
-                        0,
-                        &[],
-                    );
-                }
-            }
-        } else if !already_in_virtual && crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "virtual_seed_miss",
-                Some(&parent_key),
-                0,
-                &[],
+        if let Some(entry) = parent_entry {
+            // ヘッダのみで寸法を取り、target_db に書き込み + cache_map に挿入。
+            // 失敗 (壊れた WebP) なら seed のみスキップ — writeback は仕掛ける。
+            let _ = target_db.save_thumb_bytes(
+                &target_key,
+                entry.mtime,
+                entry.file_size,
+                entry.source_dims,
+                &entry.jpeg_data,
             );
+            if let Ok(mut m) = cache_map.write() {
+                m.insert(target_key.clone(), entry);
+            }
+            crate::perf::event("nav", "virtual_seed_hit", Some(&parent_key), 0, &[]);
+        } else if !already_in_virtual {
+            crate::perf::event("nav", "virtual_seed_miss", Some(&parent_key), 0, &[]);
         }
 
         // ── writeback ターゲット設定 ──────────────────────────────
@@ -4274,6 +4247,8 @@ impl App {
             return;
         }
         // cache_map から WebP データを取り出す (worker が直前に書き込んでいるはず)。
+        // RwLock の read guard を save() 越しに保持しないために clone する
+        // (save 中はファイル I/O で blocking、guard 保持は他スレッドの読み書きを止める)。
         let Some(entry) = wb
             .cache_map
             .read()
@@ -4282,24 +4257,15 @@ impl App {
         else {
             return;
         };
-        // 寸法は decode で取得 (CacheEntry に width/height が含まれない)。
-        let Ok(img) = image::load_from_memory(&entry.jpeg_data) else {
-            return;
-        };
-        let (w, h) = (img.width(), img.height());
         let parent_key = wb.parent_key.clone();
-        let _ = wb.parent_catalog.save(
+        let _ = wb.parent_catalog.save_thumb_bytes(
             &parent_key,
             wb.parent_entry_mtime,
             wb.parent_entry_size,
-            w,
-            h,
             entry.source_dims,
             &entry.jpeg_data,
         );
-        if crate::perf::is_enabled() {
-            crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
-        }
+        crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
         self.virtual_folder_writeback = None;
     }
 
@@ -6451,7 +6417,7 @@ impl App {
             }
         }
         // grace 期限切れなら field をクリア (毎フレーム比較を省く)。
-        if !pdf_prefetch_blocked {
+        if !pdf_prefetch_blocked && self.pdf_prefetch_grace_until.is_some() {
             self.pdf_prefetch_grace_until = None;
         }
     }
