@@ -15517,6 +15517,53 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// Codex P3 (動画レーティング対応): `rating_path_key` / `set_rating` / `get_rating`
+    /// の Video 経路がフィルタテストだけでなく永続化往復で機能することを確認する。
+    /// パス正規化キーが取れ、rating_db に書いた値がキャッシュ経由でなく DB ヒットでも
+    /// 同じ値で読み戻せることを assert する。
+    #[test]
+    fn video_rating_roundtrips_through_rating_db() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // Video アイテムを 1 件登録
+        app.items.push(GridItem::Video(std::path::PathBuf::from("C:/clips/movie.mp4")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let idx = app.items.len() - 1;
+
+        // rating_path_key が None でない (= rating_db キーを取れる)
+        let key = app
+            .rating_path_key(idx)
+            .expect("Video の rating_path_key は Some を返す");
+        assert!(
+            !key.is_empty(),
+            "正規化されたパスキーが空でない (= normalize_path 経由で生成される)"
+        );
+
+        // set_rating → rating_db に書き込みかつ rating_cache が更新される
+        app.set_rating(idx, 3);
+        assert_eq!(app.get_rating(idx), 3, "set 直後に get で同値が読める (cache hit)");
+        // DB にも入っているはず
+        let db_value = app
+            .rating_db
+            .as_ref()
+            .expect("rating_db must be open in test")
+            .get(&key);
+        assert_eq!(db_value, 3, "rating_db に書き込まれている");
+
+        // cache を捨てて DB から再取得 → 永続化を確認
+        app.rating_cache.clear();
+        assert_eq!(
+            app.get_rating(idx),
+            3,
+            "cache を捨てても DB から ★3 が読み戻る (永続化済み)"
+        );
+
+        // 0 への戻し (= 「★解除」) も DB に反映
+        app.set_rating(idx, 0);
+        let db_value = app.rating_db.as_ref().unwrap().get(&key);
+        assert_eq!(db_value, 0, "★0 で DB を上書きできる");
+    }
+
     /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は
     /// グリッドショートカットを抑止する。`global_search.has_focus` の追加が無いと
     /// Ctrl+G の検索入力欄で BS が `close_global_search` に流れて入力が破壊される。
