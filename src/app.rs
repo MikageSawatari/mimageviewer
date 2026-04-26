@@ -857,11 +857,12 @@ pub(crate) struct VirtualFolderWriteback {
     /// このターゲットが有効な items 世代。`fire_*` で `App::items_generation` と
     /// 一致しなければ無視 + クリア (Codex P2 対策)。
     ///
-    /// `start_loading_items` でも仮想 writeback はクリアされるが、`replace_view_items`
-    /// (Ctrl+G 検索ビュー切替) や `remove_items_batch` (削除直後の idx 詰め) は
-    /// `items_generation` を直接 +1 するだけで `start_loading_items` を通らない。
-    /// この場で書き戻しが発火すると古い PDF/ZIP の親 catalog に書いてしまうので、
-    /// このフィールドが実質的な唯一のガードになる。
+    /// `start_loading_items` でも仮想 writeback はクリアされるが、
+    /// `replace_search_view_items` (Ctrl+G 検索ビュー切替、`global_search_ui.rs`) や
+    /// `remove_items_batch` (削除直後の idx 詰め、`app.rs`) は `items_generation` を
+    /// 直接 +1 するだけで `start_loading_items` を通らない。この場で書き戻しが発火
+    /// すると古い PDF/ZIP の親 catalog に書いてしまうので、このフィールドが
+    /// 実質的な唯一のガードになる。
     pub items_gen: u64,
     /// 現フォルダの cache_map 参照。worker がここに WebP データを put 後、
     /// 本構造体経由で親 catalog にミラーする。
@@ -16275,7 +16276,7 @@ mod favorite_adjustment_defaults_tests {
             parent_entry_size: 0,
         });
         // app.items_generation を進めて発火 → 親 catalog には何も書かれず writeback が
-        // None に戻る。`replace_view_items` / `remove_items_batch` 経由で
+        // None に戻る。`replace_search_view_items` / `remove_items_batch` 経由で
         // items_generation だけが進む実機シナリオの再現。
         app.items_generation = 7;
         app.fire_virtual_folder_writeback_if_ready(0);
