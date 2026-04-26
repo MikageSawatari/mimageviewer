@@ -6601,6 +6601,12 @@ impl App {
                     self.drill_back_one_level();
                     return None;
                 }
+                // Aggregated 状態で BS: Ctrl+G を閉じて saved_folder へ戻る。
+                // 旧実装はそのまま FS 親遡行に流していたため、BS 連打で saved_folder の
+                // 親ディレクトリを次々ロードし続け、ドライブ root (G:\ など) の中身が
+                // 表示されてしまっていた (search bar は active のまま) ユーザー報告 (2026-04)。
+                self.close_global_search();
+                return None;
             }
             if in_favsearch {
                 self.favsearch_back();

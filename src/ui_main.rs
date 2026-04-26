@@ -126,13 +126,25 @@ fn rating_tooltip(idx: usize) -> String {
 }
 
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
-fn draw_rating_filter_button(ui: &mut egui::Ui, rf: &mut [bool; 6], idx: usize) -> bool {
+/// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
+/// (旧実装は呼び出し側で `add_enabled_ui` でまとめていたが、`horizontal_wrapped` 内で
+///  scope を作ると残り幅で wrap が起きてレイアウトが崩れるため、フラグを各ボタンに
+///  直接渡す方式に変更した。)
+fn draw_rating_filter_button(
+    ui: &mut egui::Ui,
+    rf: &mut [bool; 6],
+    idx: usize,
+    enabled: bool,
+) -> bool {
     let sel = rf[idx];
     let resp = ui
-        .selectable_label(sel, rating_button_label(idx))
+        .add_enabled(
+            enabled,
+            egui::Button::selectable(sel, rating_button_label(idx)),
+        )
         .on_hover_text(rating_tooltip(idx));
     let mut changed = false;
-    if resp.clicked() {
+    if enabled && resp.clicked() {
         let mods = ui.input(|i| i.modifiers);
         // Windows 専用ビルドなので mods.command は ctrl と同値 (egui 内で alias)。
         // 既存コード (src/ui_main.rs:992 の Ctrl+クリック選択等) と合わせて ctrl のみを見る。
@@ -164,33 +176,35 @@ fn draw_rating_filter_button(ui: &mut egui::Ui, rf: &mut [bool; 6], idx: usize) 
         changed = true;
     }
     // 右クリックメニューは常に「set」(toggle せず) なので op を直接渡す。
-    resp.context_menu(|ui| {
-        if ui.button(rating_solo_menu_label(idx)).clicked() {
-            apply_rating_filter_op(rf, RatingFilterOp::Solo, idx);
-            changed = true;
-            ui.close();
-        }
-        if ui.button(rating_threshold_menu_label(idx)).clicked() {
-            apply_rating_filter_op(rf, RatingFilterOp::Threshold, idx);
-            changed = true;
-            ui.close();
-        }
-        if idx >= 1
-            && ui
-                .button(rating_solo_with_unrated_menu_label(idx))
-                .clicked()
-        {
-            apply_rating_filter_op(rf, RatingFilterOp::SoloWithUnrated, idx);
-            changed = true;
-            ui.close();
-        }
-        ui.separator();
-        if ui.button("すべて表示").clicked() {
-            apply_rating_filter_op(rf, RatingFilterOp::AllOn, idx);
-            changed = true;
-            ui.close();
-        }
-    });
+    if enabled {
+        resp.context_menu(|ui| {
+            if ui.button(rating_solo_menu_label(idx)).clicked() {
+                apply_rating_filter_op(rf, RatingFilterOp::Solo, idx);
+                changed = true;
+                ui.close();
+            }
+            if ui.button(rating_threshold_menu_label(idx)).clicked() {
+                apply_rating_filter_op(rf, RatingFilterOp::Threshold, idx);
+                changed = true;
+                ui.close();
+            }
+            if idx >= 1
+                && ui
+                    .button(rating_solo_with_unrated_menu_label(idx))
+                    .clicked()
+            {
+                apply_rating_filter_op(rf, RatingFilterOp::SoloWithUnrated, idx);
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("すべて表示").clicked() {
+                apply_rating_filter_op(rf, RatingFilterOp::AllOn, idx);
+                changed = true;
+                ui.close();
+            }
+        });
+    }
     changed
 }
 
@@ -670,17 +684,22 @@ impl App {
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
                         );
                     }
-                    ui.add_enabled_ui(!aggregated_search, |ui| {
-                        for idx in 0..6 {
-                            if draw_rating_filter_button(
-                                ui,
-                                &mut self.settings.rating_filter,
-                                idx,
-                            ) {
-                                toolbar_rating_changed = true;
-                            }
+                    // ★ボタン群を `add_enabled_ui` でまとめると、その scope が現在の
+                    // cursor 位置から「残り幅」だけの狭い子 UI を作ってしまい、`horizontal_wrapped`
+                    // の wrap が子 UI 内で起きる → ★★ 以降が右端の縦帯に積まれて崩れる
+                    // (2026-04 別 PC ユーザー報告)。enabled 状態は各ボタン側で持たせ、
+                    // ボタン自体は親の horizontal_wrapped に直接乗せて、自然に次の row へ
+                    // wrap させる。
+                    for idx in 0..6 {
+                        if draw_rating_filter_button(
+                            ui,
+                            &mut self.settings.rating_filter,
+                            idx,
+                            !aggregated_search,
+                        ) {
+                            toolbar_rating_changed = true;
                         }
-                    });
+                    }
                     // ★フィルタ一時解除中: コンテナ自身の★で開いた結果として filter が
                     // 全 ON に書き換わっている状態を示すバッジ。クリックで即復元。
                     if self.rating_filter_suppressed_at.is_some() {
