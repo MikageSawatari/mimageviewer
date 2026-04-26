@@ -1910,6 +1910,18 @@ pub struct App {
     /// という不変条件をフィールドの形で表現するため。
     pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
 
+    // ── カタログ LRU キャッシュ ───────────────────────────────────
+    /// folder_path → Arc<CatalogDb> の小さい LRU。
+    /// `start_loading_items` は毎ステップで `CatalogDb::open` を呼んでおり、cold path で
+    /// 150-260ms (perf-log p95=152ms / max=262ms 計測) の SQLite Connection 初期化が
+    /// UI スレッドを止めて Ctrl+↓ 連打のもたつきの主因になっていた。直近 N 個の
+    /// `Arc<CatalogDb>` を保持して revisit 時に open をスキップする。OS-level の
+    /// file cache も connection を握っている間は warm に保たれる効果がある。
+    /// 容量超過時は FIFO で古いものから drop (= SQLite Connection close)。
+    pub(crate) catalog_cache: std::collections::HashMap<PathBuf, Arc<crate::catalog::CatalogDb>>,
+    /// `catalog_cache` 用 LRU 順 (古い順)。
+    pub(crate) catalog_cache_order: std::collections::VecDeque<PathBuf>,
+
     // ── パフォーマンス計装 (--perf-log 時のみ有効) ────────────────
     /// ユーザー入力単位で単調増加するシーケンス番号。キー・ホイール・選択変更
     /// などの入力イベントで +1 する。ワーカーに投げるタスクに copy して渡し、
@@ -2337,6 +2349,8 @@ impl Default for App {
             erase_vector_drag: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
             erase_spread_ctx: None,
+            catalog_cache: std::collections::HashMap::new(),
+            catalog_cache_order: std::collections::VecDeque::new(),
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
@@ -4028,6 +4042,50 @@ impl App {
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
+    /// `catalog_cache` から `Arc<CatalogDb>` を取得し、無ければ open して挿入する。
+    /// LRU 最大 16 件、超過時は FIFO で古いものから drop (= SQLite Connection close)。
+    /// `start_loading_items` の毎ステップ open を吸収するためのキャッシュ。
+    /// open 失敗時は cache に挿入せず None を返す (次回も open を再試行)。
+    pub(crate) fn get_or_open_catalog(
+        &mut self,
+        folder_path: &Path,
+    ) -> Option<Arc<crate::catalog::CatalogDb>> {
+        const MAX_CACHED: usize = 16;
+        // hit: LRU 末尾に移動して返す。
+        if self.catalog_cache.contains_key(folder_path) {
+            if let Some(pos) = self
+                .catalog_cache_order
+                .iter()
+                .position(|p| p == folder_path)
+            {
+                let key = self.catalog_cache_order.remove(pos).unwrap();
+                self.catalog_cache_order.push_back(key);
+            }
+            return self.catalog_cache.get(folder_path).cloned();
+        }
+        // miss: open + insert。失敗時は cache を汚さない。
+        let cache_dir = crate::catalog::default_cache_dir();
+        let catalog = match crate::catalog::CatalogDb::open(&cache_dir, folder_path) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                crate::logger::log(format!("  catalog open failed: {e}"));
+                return None;
+            }
+        };
+        // 容量超過なら最古を evict (Arc が外部で保持されていなければ Connection が close)。
+        while self.catalog_cache_order.len() >= MAX_CACHED {
+            if let Some(oldest) = self.catalog_cache_order.pop_front() {
+                self.catalog_cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        let key: PathBuf = folder_path.to_path_buf();
+        self.catalog_cache.insert(key.clone(), Arc::clone(&catalog));
+        self.catalog_cache_order.push_back(key);
+        Some(catalog)
+    }
+
     ///
     /// 与えられた `items` / `image_metas` を新しい状態として設定し、
     /// 旧タスクをキャンセル → カタログを開く → 永続ワーカー + 動画スレッドを起動 →
@@ -4357,12 +4415,7 @@ impl App {
 
         // ── カタログを開く + cache_map ロード + 削除掃除 ──
         let catalog_open_t0 = std::time::Instant::now();
-        let cache_dir = crate::catalog::default_cache_dir();
-        let catalog_arc: Option<Arc<crate::catalog::CatalogDb>> =
-            crate::catalog::CatalogDb::open(&cache_dir, &source_path)
-                .map_err(|e| crate::logger::log(format!("  catalog open failed: {e}")))
-                .ok()
-                .map(Arc::new);
+        let catalog_arc = self.get_or_open_catalog(&source_path);
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -15650,6 +15703,51 @@ mod favorite_adjustment_defaults_tests {
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
         );
+    }
+
+    /// `get_or_open_catalog` の LRU キャッシュ動作: 同じフォルダで 2 回呼ぶと
+    /// 同じ `Arc<CatalogDb>` (= 同じ Arc::ptr) が返ること、容量を超えると古いものから
+    /// 抜けること。Ctrl+↓ 連打時の `sli_catalog_open` が p95=152ms かかっていた
+    /// (perf-log 計測) のを抑える本キャッシュの回帰ガード。
+    #[test]
+    fn catalog_cache_reuses_arc_for_same_folder_and_evicts_oldest() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        // tmp 配下に 18 個 (LRU 上限 16 を 2 つ超える) のフォルダを作る。
+        let mut folders: Vec<std::path::PathBuf> = Vec::new();
+        for i in 0..18 {
+            let p = tmp.path().join(format!("cat_{i:02}"));
+            std::fs::create_dir_all(&p).unwrap();
+            folders.push(p);
+        }
+        // 最初の open: 新規挿入。
+        let arc0_first = app.get_or_open_catalog(&folders[0]).expect("open ok");
+        // 同じフォルダを再度 open: 同 Arc が返る (= キャッシュヒット)。
+        let arc0_again = app.get_or_open_catalog(&folders[0]).expect("hit");
+        assert!(
+            std::sync::Arc::ptr_eq(&arc0_first, &arc0_again),
+            "同フォルダの 2 回目は同じ Arc を返す"
+        );
+        assert_eq!(app.catalog_cache_order.len(), 1);
+        // 16 個目までは順に挿入。
+        for f in &folders[1..16] {
+            app.get_or_open_catalog(f);
+        }
+        assert_eq!(app.catalog_cache_order.len(), 16);
+        assert!(app.catalog_cache.contains_key(&folders[0]));
+        // 17 個目: folders[0] が evict される (LRU 順で古いから)。
+        // ただし「folders[0] を最後に hit」した直後ではない (上の hit は新規挿入の直後の
+        // 触り直しで再度末尾移動しているはず) なので、ここで先に folders[1] を hit させて
+        // folders[0] を本当に最古に位置づけ直す。
+        app.get_or_open_catalog(&folders[1]); // [1] を末尾へ
+        // この時点で LRU 順は [0, 2, 3, ..., 15, 1] (= 0 が最古)。
+        // 17 個目 folders[16] を入れると [0] が evict される。
+        app.get_or_open_catalog(&folders[16]);
+        assert_eq!(app.catalog_cache_order.len(), 16);
+        assert!(
+            !app.catalog_cache.contains_key(&folders[0]),
+            "LRU 上限超過で最古 (folders[0]) が evict される"
+        );
+        assert!(app.catalog_cache.contains_key(&folders[16]));
     }
 
     /// Codex P1 (見開き消しゴム): `erase_inpaint_pending` が idx 別 HashMap になり、

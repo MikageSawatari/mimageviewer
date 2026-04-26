@@ -289,6 +289,20 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 測定は `--perf-log` + `python scripts/analyze_perf.py <path> {startup,nav,hitches}` で。
 追加した同期処理の区間には perf::event を必ず差し込む (悪化を検知できるように)。
 
+**ユーザーが perf-log を取って解析を依頼してきた場合**は、まず以下の場所を確認する:
+
+```
+%APPDATA%\mimageviewer\logs\
+  ├ perf_events.jsonl       # 直近の perf-log (--perf-log の既定出力先)
+  ├ perf_*.jsonl            # 任意名で取った過去ログ
+  ├ mimageviewer.log        # 通常の logger 出力
+  └ panic.log               # クラッシュログ
+```
+
+(Windows の絶対パス: `C:\Users\<user>\AppData\Roaming\mimageviewer\logs\`)。
+ユーザーが「perf-log 取りました」とだけ伝えてきたらこのディレクトリの最新
+`perf_*.jsonl` をそのまま `analyze_perf.py` に食わせる。パスを毎回聞かない。
+
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
@@ -579,15 +593,36 @@ IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バ
 
 ## リリース手順チェックリスト
 
-リリース時は以下を漏れなく更新・作成すること:
+リリース時は以下を漏れなく更新・作成すること。
+
+### Phase 0: 変更履歴の準備とユーザーレビュー (必ず最初)
+
+更新履歴は `update_check.rs` 経由でアプリ内アップデート通知ダイアログにそのまま
+表示される (= GitHub Releases の `body` がユーザーに読まれる)。誤字・内部用語の
+混入・粗い表現があると公開後に取り返しが付かないので、以下の順で進める:
+
+0-a. **README.md の更新履歴セクション** にこのバージョンの新エントリを追加 (旧版と
+     同じ `### vX.Y.Z` ヘッダ + 箇条書きフォーマット)。書き方は CLAUDE.md
+     「マニュアル・製品ページの記述方針」に従う:
+     - 内部実装語 (Tantivy / SQLite / 並行処理用語) は使わない
+     - バージョン番号タグ (v0.8.2+ 等) は本文に書かない (見出しに 1 回だけ)
+     - 過去のユーザー報告日付 / コミットハッシュは書かない
+     - 「⚠️ 」プレフィックスは初回起動時に何かが起きる注意 (索引再構築等) に限定
+0-b. **ユーザーに README.md の更新履歴を見せて承認を得る**。OK が出るまで Phase 1 へ
+     進まない。
+0-c. (任意) GitHub Release 用 body は基本 README.md の該当セクションをそのまま
+     コピペで OK。手作業で別途書き直さない (= 表記ゆれを生まない)。
+
+### Phase 1: バージョン番号・関連ファイル更新
+
+承認を得た上で以下を更新:
 
 1. `Cargo.toml` — バージョン番号
 2. `installer/mimageviewer.iss` — `MyAppVersion`
 3. `installer/readme.txt` — 先頭の版表記・更新履歴リンク (Vector 同梱用)
 4. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
-6. `README.md` — 更新履歴セクションに新バージョンの変更点を追加
-7. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
+6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
    - マニュアル左サイドバーのリンク一覧が全 14 ページで揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
@@ -599,22 +634,37 @@ IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バ
      ```
      14 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      新規ページを追加した際は 14 ページ全部のサイドバーを更新すること。
-8. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
-9. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
-10. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
-    ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
-      不足していると `cargo build` が復旧手順付きで止まるようになっている。
-11. `cargo build --release` → `ISCC.exe installer\mimageviewer.iss` でインストーラを生成
-12. 配布成果物を 3 種類用意する:
+
+### Phase 2: 依存物の確認
+
+7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
+8. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
+9. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
+   ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
+     不足していると `cargo build` が復旧手順付きで止まるようになっている。
+
+### Phase 3: ビルド・配布成果物
+
+10. `cargo build --release` → `ISCC.exe installer\mimageviewer.iss` でインストーラを生成
+11. 配布成果物を 3 種類用意する:
     - `mimageviewer.exe` (ポータブル版、mikage.to のみ)
     - `mImageViewer_setup.exe` (インストーラ版、mikage.to・窓の杜・Vector 共通)
     - `mImageViewer_v<VERSION>.zip` (Vector 申請用。`mImageViewer_setup.exe` +
       `installer/readme.txt` を同梱)
-13. 依存 DLL の回帰チェック — リリース exe に対して `dumpbin /dependents` を走らせ、
+12. 依存 DLL の回帰チェック — リリース exe に対して `dumpbin /dependents` を走らせ、
     `VCRUNTIME140.dll` / `MSVCP140.dll` が現れていないことを確認する。もし現れていたら:
     - メイン exe: `ort` クレート機能から `load-dynamic` が抜けていないか確認
     - Susie ワーカー: `.cargo/config.toml` の `i686-pc-windows-msvc` 向け
       `+crt-static` 設定が残っているか確認
+
+### Phase 4: GitHub Release 公開
+
+13. ローカルで `git tag v<VERSION>` → `git push origin v<VERSION>` (GitHub `main` も同期)
+14. GitHub Releases UI で新リリースを作成。**body は README.md の該当 `### vX.Y.Z`
+    セクション本文をそのままコピペ** (この本文がアプリ内アップデート通知に表示される)。
+    成果物 (3 種類) を Assets として添付する。
+15. 公開後、別マシンから `mimageviewer.exe` を起動 → 起動時更新通知ダイアログで
+    body が想定どおりに表示されることを目視確認 (改行・見出し・リンクの崩れチェック)。
 
 ## Codex CLI レビュー
 
