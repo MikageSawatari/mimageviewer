@@ -14378,6 +14378,67 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    /// 2026-04 ユーザー報告: Ctrl+G ストリーミング中に rebuild が走って items に
+    /// アイテムが挿入されたとき、選択中のアイテムが別の物を指してしまっていた
+    /// (旧実装は `replace_search_view_items` で `selected = None`)。
+    /// 修正後: 内容キー (`thumb_reuse_key`) で旧選択を新 idx に再マップする。
+    /// `checked` set も同じ仕組みで追従する。
+    #[test]
+    fn streaming_rebuild_preserves_selected_and_checked_by_content_key() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let initial = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/c.jpg")),
+        ];
+        app.replace_search_view_items(initial, vec![None, None, None]);
+        // B (idx=1) を選択、A と C をチェック
+        app.selected = Some(1);
+        app.checked.insert(0);
+        app.checked.insert(2);
+
+        // ストリーミング rebuild: 先頭に X が追加されて A/B/C が後ろにシフト
+        let after = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/x.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/c.jpg")),
+        ];
+        app.replace_search_view_items(after, vec![None; 4]);
+
+        assert_eq!(
+            app.selected,
+            Some(2),
+            "選択は同じ B (内容キー) を指し続けるよう新 idx=2 に追従"
+        );
+        assert!(app.checked.contains(&1), "A の checked が新 idx=1 に追従");
+        assert!(app.checked.contains(&3), "C の checked が新 idx=3 に追従");
+        assert!(!app.checked.contains(&0), "X (新規) は checked ではない");
+        assert!(!app.checked.contains(&2), "B は selected のみ、checked ではない");
+    }
+
+    /// 旧選択アイテムが新 items から消えた場合は selected = None に戻し、
+    /// 先頭スクロールにフォールバックする (= 復元不能時の安全側挙動)。
+    #[test]
+    fn streaming_rebuild_clears_selected_when_item_disappears() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let initial = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+        ];
+        app.replace_search_view_items(initial, vec![None, None]);
+        app.selected = Some(1); // B を選択
+
+        // B が消えて A だけになる
+        let after = vec![GridItem::Image(std::path::PathBuf::from("c:/a.jpg"))];
+        app.replace_search_view_items(after, vec![None]);
+
+        assert_eq!(app.selected, None, "旧選択アイテムが消えたので None");
+        assert_eq!(app.scroll_offset_y, 0.0, "復元失敗時は先頭スクロール");
+    }
+
     /// Codex P2: Ctrl+G から実フォルダ/ZIP/PDF を開いた状態で rating 変更すると、
     /// items が検索合成ビューに置き換わってはならない。
     /// `items_are_global_search_view` フラグが install_new_items 時に false に倒され、

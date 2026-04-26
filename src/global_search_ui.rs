@@ -12,7 +12,7 @@
 //! - Drill-down view (1 階層降りた先の絞り込み表示) は本モジュールには含まず、
 //!   後続コミットで追加予定 (docs §10.3 の [3] 絞り込みビュー)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -816,6 +816,18 @@ impl App {
                 _ => None,
             })
             .collect();
+        // 選択中アイテム + チェック済みアイテムの「内容キー」をスナップショット。
+        // ストリーミング rebuild で items 並びが変わってもカーソル位置とチェック状態を
+        // 同じ内容のセルに追従させる (idx ベースだと別アイテムを指す事故になる)。
+        let selected_key = self
+            .selected
+            .and_then(|i| self.items.get(i))
+            .and_then(thumb_reuse_key);
+        let checked_keys: HashSet<ThumbReuseKey> = self
+            .checked
+            .iter()
+            .filter_map(|&i| self.items.get(i).and_then(thumb_reuse_key))
+            .collect();
         // items_generation bump + thumbnails 初期化を一箇所に集約。
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
@@ -823,22 +835,32 @@ impl App {
         // install_new_items は既定で false に倒すので、合成ビューであることを上書き。
         // rating 変更時の rebuild_items_from_global_search 判定で参照される (Codex P2)。
         self.items_are_global_search_view = true;
-        self.selected = None;
         // idx ベース状態 + キュー排水 (requested / pending_finalize / texture_backlog /
         // keep_* / rotation / rating / adjustment_cache / thumb_pixels / ai_* / fs_* /
         // reload_queue / heavy_io_queue / tag_prewarm_*) を一括破棄。
+        // (`self.checked` も中で clear される。下で content-key から復元)
         self.invalidate_idx_state_and_queues();
         // 旧 thumbnails を新位置にマージ。Loaded のままなら upload backlog に乗らず、
         // 同一フレームで前回のテクスチャがそのまま見え続けるのでちらつかない。
-        if !preserved.is_empty() {
+        // 同時に選択 / チェックも content-key で新 idx に再マップする。
+        let mut restored_selected: Option<usize> = None;
+        if !preserved.is_empty() || selected_key.is_some() || !checked_keys.is_empty() {
             for (i, item) in self.items.iter().enumerate() {
-                if let Some(key) = thumb_reuse_key(item) {
-                    if let Some(state) = preserved.get(&key) {
-                        self.thumbnails[i] = state.clone();
-                    }
+                let Some(key) = thumb_reuse_key(item) else {
+                    continue;
+                };
+                if let Some(state) = preserved.get(&key) {
+                    self.thumbnails[i] = state.clone();
+                }
+                if selected_key.as_ref() == Some(&key) {
+                    restored_selected = Some(i);
+                }
+                if checked_keys.contains(&key) {
+                    self.checked.insert(i);
                 }
             }
         }
+        self.selected = restored_selected;
         // 補正・マスクも idx ベース。Ctrl+G は items が総入れ替わりするので
         // 旧フォルダの個別設定は意味を失うため clear する。
         // (削除経路では呼び出し元が idx shift で保持する)
@@ -852,8 +874,15 @@ impl App {
         // Ctrl+F フィルタの残留を解除 (Ctrl+G と共存させない)
         self.search_filter = None;
         self.search_query.clear();
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
+        // 選択を復元できたときは scroll_to_selected を立てて view を追従させる。
+        // 復元できなかった (= 旧選択アイテムが消えた / 初回 install) ときは従来通り
+        // 先頭にスクロール。
+        if restored_selected.is_some() {
+            self.scroll_to_selected = true;
+        } else {
+            self.scroll_offset_y = 0.0;
+            self.scroll_to_selected = false;
+        }
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.rebuild_visible_indices();
         // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
