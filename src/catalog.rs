@@ -96,6 +96,39 @@ impl CatalogDb {
         Ok(map)
     }
 
+    /// 単一エントリのみ取り出す。`load_all` を呼ぶほどではないが特定 key だけ確認したい
+    /// 場合用 (例: 仮想フォルダ進入時の親 catalog からの seed lookup)。
+    pub fn load_one(&self, filename: &str) -> rusqlite::Result<Option<CacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mtime, file_size, thumb_data, source_width, source_height \
+             FROM thumbnails WHERE filename = ?1",
+        )?;
+        let mut iter = stmt.query_map(params![filename], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<u32>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+            ))
+        })?;
+        if let Some(item) = iter.next() {
+            let (mtime, file_size, jpeg_data, src_w, src_h) = item?;
+            let source_dims = match (src_w, src_h) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            };
+            return Ok(Some(CacheEntry {
+                mtime,
+                file_size,
+                jpeg_data,
+                source_dims,
+            }));
+        }
+        Ok(None)
+    }
+
     /// サムネイルを INSERT OR REPLACE で保存する。
     ///
     /// `width` / `height` はキャッシュされる WebP サムネイルの寸法、

@@ -4058,6 +4058,102 @@ impl App {
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
+    /// PDF / ZIP を仮想フォルダとして開いた直後、その仮想フォルダの最初のページの
+    /// サムネイルキャッシュを **親フォルダ catalog** から seed する。
+    ///
+    /// 背景: 親フォルダのグリッド表示中に PdfFile/ZipFile のサムネは既に
+    /// 親 catalog の `pdfthumb:foo.pdf` / `zipthumb:foo.zip` キーに保存されている。
+    /// しかし PDF/ZIP を開いた時点では仮想 catalog (PDF/ZIP path で別 SQLite) は
+    /// 空なので、`page_0000` / 最初のエントリ name キーがミスし、PDFium / ZIP
+    /// 解凍で再レンダリングされる (PDF は 200-500ms)。
+    ///
+    /// 親 catalog にあるサムネバイト列をそのまま仮想 catalog の対応キーへ書き込み、
+    /// `cache_map` にも挿入することで、ワーカー初回 lookup でヒットさせて再レンダリング
+    /// を回避する。一度書き込めば永続化されるので、以降の進入は親 catalog 経由でなくても
+    /// 仮想 catalog 単独で速い。
+    fn seed_virtual_folder_first_thumb_from_parent(
+        &mut self,
+        source_path: &Path,
+        target_db: &crate::catalog::CatalogDb,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+    ) {
+        let ext = source_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        let (parent_prefix, target_key) = match ext.as_deref() {
+            Some("pdf") => (
+                crate::thumb_loader::CACHE_KEY_PDF,
+                crate::grid_item::pdf_page_cache_key(0),
+            ),
+            Some("zip") => {
+                // ZIP は最初の ZipImage アイテムの entry_name がキー (full path within ZIP)。
+                let Some(entry_name) = self.items.iter().find_map(|it| match it {
+                    GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                (crate::thumb_loader::CACHE_KEY_ZIP, entry_name)
+            }
+            _ => return,
+        };
+        // すでに仮想 catalog 側にあるなら何もしない (再 seed 不要)。
+        if cache_map
+            .read()
+            .map(|m| m.contains_key(&target_key))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Some(parent) = source_path.parent() else {
+            return;
+        };
+        let Some(fname) = source_path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let lookup_key = format!("{parent_prefix}{fname}");
+        let Some(parent_db) = self.get_or_open_catalog(parent) else {
+            return;
+        };
+        let Some(parent_entry) = parent_db.load_one(&lookup_key).ok().flatten() else {
+            return;
+        };
+        // WebP の寸法は schema 上の width/height に渡す必要があるが、CacheEntry には
+        // 含まれていないので image クレートで decode して取り出す (decode はフルカラー
+        // 化までやるが thumb サイズなので数 ms)。失敗したら seed しない。
+        let Ok(img) = image::load_from_memory(&parent_entry.jpeg_data) else {
+            return;
+        };
+        let (w, h) = (img.width(), img.height());
+        // 仮想 catalog (DB) に書き込む。mtime / size は親 catalog 由来をそのまま使う:
+        // PDF page 0 のキャッシュは PDF ファイル本体の mtime/size で照合される
+        // (load_pdf_as_folder の image_metas[0] = (pdf.mtime, pdf.size) と一致)。
+        let _ = target_db.save(
+            &target_key,
+            parent_entry.mtime,
+            parent_entry.file_size,
+            w,
+            h,
+            parent_entry.source_dims,
+            &parent_entry.jpeg_data,
+        );
+        // cache_map にも入れて、ワーカーの次フレーム lookup でヒットさせる。
+        if let Ok(mut m) = cache_map.write() {
+            m.insert(
+                target_key,
+                crate::catalog::CacheEntry {
+                    mtime: parent_entry.mtime,
+                    file_size: parent_entry.file_size,
+                    jpeg_data: parent_entry.jpeg_data,
+                    source_dims: parent_entry.source_dims,
+                },
+            );
+        }
+    }
+
     /// `catalog_cache` の全エントリを drop し、SQLite Connection を閉じる。
     /// キャッシュマネージャの「削除」操作 (DeleteOld / DeleteAll / DeleteFolder)
     /// 呼び出し前に必須。Windows では Connection が握っている `.db` ファイルは
@@ -4466,6 +4562,13 @@ impl App {
         ));
         let catalog_entries = cache_map.read().unwrap().len();
         crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
+
+        // PDF / ZIP を仮想フォルダとして開いた場合、親フォルダ catalog の
+        // pdfthumb: / zipthumb: 先頭サムネを仮想 catalog の page_0000 / 最初の
+        // entry name キーに seed する (PDFium 再レンダリング 200-500ms を回避)。
+        if let Some(ref cat) = catalog_arc {
+            self.seed_virtual_folder_first_thumb_from_parent(&source_path, cat, &cache_map);
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -15743,6 +15846,86 @@ mod favorite_adjustment_defaults_tests {
             Some(7),
             "Single 経由なら fullscreen_idx は弄らない"
         );
+    }
+
+    /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
+    /// が PDF 自身の catalog に `page_0000` として seed されることを確認する回帰
+    /// テスト。これによって PDFium による初回 1 ページ目レンダリング (200-500ms)
+    /// が省略される。
+    #[test]
+    fn seed_virtual_folder_first_thumb_copies_pdf_thumb_from_parent() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        // 親フォルダと PDF パスを準備 (実ファイルは要らない、catalog DB のキーだけが
+        // 関心事)。
+        let parent_dir = tmp.path().join("parent");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let pdf_path = parent_dir.join("foo.pdf");
+
+        // 親 catalog に pdfthumb:foo.pdf を仕込む (4×4 の dummy WebP をでっち上げる)。
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap();
+        // 4x4 white WebP を image::ImageBuffer から生成。
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        let mut webp_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let parent_key = format!(
+            "{}{}",
+            crate::thumb_loader::CACHE_KEY_PDF,
+            "foo.pdf"
+        );
+        parent_db
+            .save(&parent_key, 12345, 67890, 4, 4, Some((100, 100)), &webp_bytes)
+            .unwrap();
+
+        // 仮想 catalog (PDF パスで別 SQLite) と空 cache_map を用意。
+        let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // seed 実行。PDF として認識させるため source_path には pdf_path を渡す。
+        app.seed_virtual_folder_first_thumb_from_parent(&pdf_path, &pdf_db, &cache_map);
+
+        // 仮想 catalog の DB と cache_map の両方に page_0000 が入っているはず。
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        let in_db = pdf_db.load_one(&target_key).unwrap();
+        assert!(in_db.is_some(), "PDF catalog DB に page_0000 が seed される");
+        let entry = in_db.unwrap();
+        assert_eq!(entry.mtime, 12345);
+        assert_eq!(entry.file_size, 67890);
+        assert_eq!(entry.source_dims, Some((100, 100)));
+        assert_eq!(entry.jpeg_data, webp_bytes);
+
+        let in_map = cache_map.read().unwrap();
+        assert!(
+            in_map.contains_key(&target_key),
+            "ワーカーが即時 hit するよう cache_map にも入る"
+        );
+    }
+
+    /// 親フォルダ catalog にエントリが無い場合は seed しない (= no-op)。
+    #[test]
+    fn seed_virtual_folder_first_thumb_no_parent_entry_is_noop() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent2");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let pdf_path = parent_dir.join("missing.pdf");
+        let cache_dir = crate::catalog::default_cache_dir();
+        let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.seed_virtual_folder_first_thumb_from_parent(&pdf_path, &pdf_db, &cache_map);
+
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        assert!(pdf_db.load_one(&target_key).unwrap().is_none());
+        assert!(!cache_map.read().unwrap().contains_key(&target_key));
     }
 
     /// Codex P1 (0.8.2 後半): `release_fs_nav_lock` が `fs_nav_locked_gen` /
