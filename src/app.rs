@@ -5682,7 +5682,12 @@ impl App {
             .store(current_display_px, Ordering::Relaxed);
 
         let cols = self.settings.grid_cols.max(1);
-        let cell_h = self.last_cell_h.max(1.0);
+        // ウィンドウ縮小直後で cell_h が極端に小さい場合 (1〜数 px)、`viewport_h / cell_h` が
+        // 数百〜数千行に膨れ、`items_per_page * (1 + prev/next pages)` が
+        // 数万 idx の keep_set を作る。下流の make_load_request / texture_backlog 蓄積で
+        // UI スレッドが 1 フレームに数百ミリ秒消費してフリーズに見える (2026-04 ユーザー報告)。
+        // render_grid 側も MIN_CELL_PX=32 で clamp しているので、ここでも同じ下限を適用する。
+        let cell_h = self.last_cell_h.max(32.0);
         let viewport_h = self.last_viewport_h.max(cell_h);
 
         let rows_per_page = (viewport_h / cell_h).ceil() as usize;

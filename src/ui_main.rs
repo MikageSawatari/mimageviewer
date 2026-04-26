@@ -1291,11 +1291,34 @@ impl App {
 
                 let cols = self.settings.grid_cols.max(1);
                 let avail_w = ui.available_width();
-                // ウィンドウを極端に狭めたとき (avail_w < cols) cell_w が 0 にフロアされ、
+                // 狭幅フリーズ調査ログ (2026-04): avail_w / cell サイズと visible_indices 件数を
+                // 毎フレーム出す。フリーズしたら最後の数行で「直前にどんな寸法だったか」が分かる。
+                // 原因が確定したら削除する。
+                if avail_w < 200.0 {
+                    crate::logger::log(format!(
+                        "[narrow-grid] avail_w={avail_w:.1} cols={cols} \
+                         vis_indices={} viewport_h={:.1} scroll_y={:.1}",
+                        self.visible_indices.len(),
+                        self.last_viewport_h,
+                        self.scroll_offset_y,
+                    ));
+                }
+                // ウィンドウを極端に狭めたとき (avail_w が負 ~ 数 px) cell_w が 0 にフロアされて、
                 // cell_h も 1px 近辺になる。すると viewport_h / cell_h が 800 行レベルに跳ね上がり、
                 // 描画ループが 1 フレームに数千セル以上を処理しようとして UI が固まる
-                // (2026-04 ユーザー報告)。cell_w / cell_h に下限を入れて、可視行数の暴発を防ぐ。
-                // 下限を超えるサイズはセルが横にはみ出す形になるが、フリーズよりは遥かにまし。
+                // (2026-04 ユーザー報告)。
+                //
+                // 二段ガード:
+                // (a) avail_w が極端に小さい (≤ 0) ならグリッド描画自体を skip する。
+                //     egui の available_width は window chrome が広いと負を返すこともある。
+                // (b) 描画する場合は cell_w / cell_h に下限を入れて、可視行数の暴発を防ぐ。
+                //     下限未満の幅ではセルが横にはみ出すが、フリーズよりは遥かにまし。
+                if avail_w <= 0.0 {
+                    crate::logger::log(format!(
+                        "[narrow-grid] skip render (avail_w={avail_w:.2})"
+                    ));
+                    return None;
+                }
                 const MIN_CELL_PX: f32 = 32.0;
                 let cell_w = (avail_w / cols as f32).floor().max(MIN_CELL_PX);
                 let cell_h = (cell_w * self.settings.thumb_aspect.height_ratio())
