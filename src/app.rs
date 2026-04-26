@@ -6262,22 +6262,19 @@ impl App {
             return None;
         }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
-        if self.fullscreen_idx.is_some()
-            || self.any_dialog_open()
-            || self.address_has_focus
-            || self.search_has_focus
-            || self.favsearch.has_focus
-        {
+        if self.shortcuts_blocked_by_text_input() {
             return None;
         }
 
         // IME 変換直後の Enter 漏れ対策:
-        // 検索バー / お気に入り検索バーが表示中で、かつ直近に IME イベントがあった場合、
-        // この `handle_keyboard` 呼び出しをスキップして Enter がグリッドの
+        // 検索バー / お気に入り検索バー / 全文検索バーが表示中で、かつ直近に IME イベントが
+        // あった場合、この `handle_keyboard` 呼び出しをスキップして Enter がグリッドの
         // フルスクリーン起動ショートカットに回らないようにする。
-        // (IME が Commit を吐いたフレームで TextEdit が一瞬 lost_focus → search_has_focus
+        // (IME が Commit を吐いたフレームで TextEdit が一瞬 lost_focus → *_has_focus
         //  が false になり、次フレームで Enter が grid 側に漏れるレースをガードする)。
-        if (self.show_search_bar || self.favsearch.active) && self.ime_input_active() {
+        if (self.show_search_bar || self.favsearch.active || self.global_search.active)
+            && self.ime_input_active()
+        {
             return None;
         }
 
@@ -7240,16 +7237,23 @@ impl App {
         }
     }
 
-    /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
-    fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
-        let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused
+    /// グリッドショートカット (`handle_keyboard` / `handle_clipboard_shortcuts`) を
+    /// テキスト入力フォーカス・ダイアログ・フルスクリーン中にブロックするための共通判定。
+    /// 検索バー (Ctrl+F / Ctrl+S / Ctrl+G) のいずれかにフォーカスがある状態で
+    /// BS / Enter / Ctrl+C 等が grid に漏れないようにするためのゲート。
+    pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
+        self.fullscreen_idx.is_some()
             || self.any_dialog_open()
             || self.address_has_focus
             || self.search_has_focus
             || self.favsearch.has_focus
-            || self.fullscreen_idx.is_some()
-        {
+            || self.global_search.has_focus
+    }
+
+    /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
+    fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
+        let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if !main_focused || self.shortcuts_blocked_by_text_input() {
             return;
         }
 
@@ -15485,6 +15489,34 @@ mod favorite_adjustment_defaults_tests {
             app.select_after_load.is_none(),
             "見つからなかった場合でもヒントは消費する (持ち越さない)"
         );
+    }
+
+    /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は
+    /// グリッドショートカットを抑止する。`global_search.has_focus` の追加が無いと
+    /// Ctrl+G の検索入力欄で BS が `close_global_search` に流れて入力が破壊される。
+    #[test]
+    fn shortcuts_are_blocked_while_search_text_input_has_focus() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 全フォーカスフラグが false の初期状態ではブロックされない。
+        assert!(!app.shortcuts_blocked_by_text_input());
+        // Ctrl+F バー
+        app.search_has_focus = true;
+        assert!(app.shortcuts_blocked_by_text_input());
+        app.search_has_focus = false;
+        // Ctrl+S バー
+        app.favsearch.has_focus = true;
+        assert!(app.shortcuts_blocked_by_text_input());
+        app.favsearch.has_focus = false;
+        // Ctrl+G バー (本コミットの修正対象)
+        app.global_search.has_focus = true;
+        assert!(
+            app.shortcuts_blocked_by_text_input(),
+            "Ctrl+G TextEdit フォーカス中も BS / Enter / Ctrl+C 等を grid に漏らさない"
+        );
+        app.global_search.has_focus = false;
+        // アドレスバー
+        app.address_has_focus = true;
+        assert!(app.shortcuts_blocked_by_text_input());
     }
 
 }
