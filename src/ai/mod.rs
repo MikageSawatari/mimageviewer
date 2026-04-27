@@ -12,9 +12,60 @@ pub mod classify;
 pub mod denoise;
 pub mod model_manager;
 pub mod runtime;
+pub mod tensorrt_pack;
 pub mod upscale;
 
 use std::fmt;
+
+/// AI 推論で使用する Execution Provider グループ。
+///
+/// `ort::init_from()` がプロセス内 1 回限りなので、バックエンド切り替えは
+/// アプリ再起動が必要。Settings に保存され、起動時に解決される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AiBackend {
+    /// DirectML EP (デフォルト、全 GPU 対応、Microsoft.ML.OnnxRuntime.DirectML)
+    DirectMl,
+    /// TensorRT + CUDA EP (NVIDIA GPU 専用、別途 pack ダウンロード必要)
+    TensorRt,
+    /// CPU 専用フォールバック (デバッグ用)
+    Cpu,
+}
+
+impl Default for AiBackend {
+    fn default() -> Self {
+        AiBackend::DirectMl
+    }
+}
+
+impl AiBackend {
+    /// 設定保存用の文字列表現。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AiBackend::DirectMl => "directml",
+            AiBackend::TensorRt => "tensorrt",
+            AiBackend::Cpu => "cpu",
+        }
+    }
+
+    /// 設定文字列からバックエンド種別を復元する。未知の値は None。
+    pub fn from_str(s: &str) -> Option<AiBackend> {
+        match s {
+            "directml" => Some(AiBackend::DirectMl),
+            "tensorrt" => Some(AiBackend::TensorRt),
+            "cpu" => Some(AiBackend::Cpu),
+            _ => None,
+        }
+    }
+
+    /// UI 表示用ラベル。
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            AiBackend::DirectMl => "DirectML (デフォルト)",
+            AiBackend::TensorRt => "TensorRT (NVIDIA 専用、高速)",
+            AiBackend::Cpu => "CPU (デバッグ用)",
+        }
+    }
+}
 
 /// AI 処理で発生しうるエラー。
 #[derive(Debug)]

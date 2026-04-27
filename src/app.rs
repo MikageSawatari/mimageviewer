@@ -9965,12 +9965,27 @@ impl App {
     }
 
     /// AI ランタイムとモデルマネージャを遅延初期化する。
+    /// バックエンドは Settings の `ai_backend` から解決する (None = DirectML)。
     pub(crate) fn ensure_ai_runtime(&mut self) {
         if self.ai_runtime.is_none() {
-            match crate::ai::runtime::AiRuntime::new() {
+            let backend = self
+                .settings
+                .ai_backend
+                .as_deref()
+                .and_then(crate::ai::AiBackend::from_str)
+                .unwrap_or_default();
+            let fp16 = self.settings.ai_tensorrt_fp16;
+            match crate::ai::runtime::AiRuntime::new_with_backend(backend, fp16) {
                 Ok(rt) => {
+                    let active = rt.active_backend();
+                    crate::logger::log(format!(
+                        "[AI] Runtime initialized (requested={:?}, effective={:?})",
+                        active.requested, active.effective
+                    ));
+                    if let Some(reason) = &active.fallback_reason {
+                        crate::logger::log(format!("[AI] フォールバック理由: {reason}"));
+                    }
                     self.ai_runtime = Some(std::sync::Arc::new(rt));
-                    crate::logger::log("[AI] Runtime initialized".to_string());
                 }
                 Err(e) => {
                     crate::logger::log(format!("[AI] Runtime init failed: {e}"));

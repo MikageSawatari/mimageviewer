@@ -3,6 +3,67 @@
 //! 主目的はプライマリ GPU の VRAM 容量を取得し、
 //! サムネイル VRAM 上限を % 指定で計算できるようにすること (段階 D)。
 
+/// GPU ベンダー識別。TensorRT 設定の gating に使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Other(u32),
+}
+
+impl GpuVendor {
+    /// PCI Vendor ID から判定する。
+    /// 0x10DE = NVIDIA, 0x1002 = AMD, 0x8086 = Intel
+    pub fn from_pci_id(vendor_id: u32) -> GpuVendor {
+        match vendor_id {
+            0x10DE => GpuVendor::Nvidia,
+            0x1002 => GpuVendor::Amd,
+            0x8086 => GpuVendor::Intel,
+            other => GpuVendor::Other(other),
+        }
+    }
+}
+
+/// DXGI でプライマリ adapter (ソフトウェアアダプタ以外) を列挙し、
+/// (VendorId, DedicatedVideoMemory) を返す共通ヘルパー。
+///
+/// VRAM 取得と vendor 判定で同じ列挙ロジックを共有する。
+#[cfg(windows)]
+fn enumerate_primary_adapter() -> Option<(u32, u64)> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
+    };
+
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        for i in 0u32..8 {
+            let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(i) {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            let desc = match adapter.GetDesc1() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            // ソフトウェアアダプタ (WARP 等) はスキップ
+            let flags = desc.Flags as i32;
+            if (flags & DXGI_ADAPTER_FLAG_SOFTWARE.0) != 0 {
+                continue;
+            }
+            if desc.DedicatedVideoMemory > 0 {
+                return Some((desc.VendorId, desc.DedicatedVideoMemory as u64));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn enumerate_primary_adapter() -> Option<(u32, u64)> {
+    None
+}
+
 /// プライマリ GPU の専用 VRAM 容量 (bytes) を返す。
 ///
 /// DXGI でアダプタを列挙し、ソフトウェアアダプタをスキップして
@@ -10,40 +71,17 @@
 ///
 /// 取得失敗時は `None`。呼び出し側は妥当なフォールバック (例: 4 GiB) を使うこと。
 pub fn query_primary_gpu_vram_bytes() -> Option<u64> {
-    #[cfg(windows)]
-    {
-        use windows::Win32::Graphics::Dxgi::{
-            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
-        };
+    enumerate_primary_adapter().map(|(_vendor, vram)| vram)
+}
 
-        unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-            for i in 0u32..8 {
-                let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(i) {
-                    Ok(a) => a,
-                    Err(_) => break,
-                };
-                let desc = match adapter.GetDesc1() {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                // ソフトウェアアダプタ (WARP 等) はスキップ
-                let flags = desc.Flags as i32;
-                if (flags & DXGI_ADAPTER_FLAG_SOFTWARE.0) != 0 {
-                    continue;
-                }
-                if desc.DedicatedVideoMemory > 0 {
-                    return Some(desc.DedicatedVideoMemory as u64);
-                }
-            }
-            None
-        }
-    }
+/// プライマリ GPU のベンダーを返す。TensorRT 設定の gating に使用。
+pub fn query_primary_gpu_vendor() -> Option<GpuVendor> {
+    enumerate_primary_adapter().map(|(vendor_id, _vram)| GpuVendor::from_pci_id(vendor_id))
+}
 
-    #[cfg(not(windows))]
-    {
-        None
-    }
+/// プライマリ GPU が NVIDIA かどうか。TensorRT 機能の有効化判定。
+pub fn is_nvidia_gpu() -> bool {
+    matches!(query_primary_gpu_vendor(), Some(GpuVendor::Nvidia))
 }
 
 /// VRAM 容量に対する % 指定から実バイト数を算出する。
