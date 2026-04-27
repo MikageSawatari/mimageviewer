@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mimageviewer::ai::upscale::UpscaleTimings;
-use mimageviewer::ai::{ModelKind, model_manager, runtime::AiRuntime, upscale};
+use mimageviewer::ai::{AiBackend, ModelKind, model_manager, runtime::AiRuntime, upscale};
 
 const DEFAULT_IMAGES: &[&str] = &[
     "testimage/うちのこ/ComfyUI_2_0003.png",
@@ -52,6 +52,11 @@ struct Args {
     /// 出力された ColorImage を PNG として保存するディレクトリ (画質目視比較用)。
     /// ファイル名: <image_stem>__<model>__tile<N>.png
     save_output: Option<PathBuf>,
+    /// AI バックエンド (DirectML / TensorRT / CPU)。
+    /// TensorRT は %APPDATA%/mimageviewer/tensorrt/ に pack が展開されている前提。
+    backend: AiBackend,
+    /// TensorRT FP16 推論を有効にする (デフォルト: true)。
+    tensorrt_fp16: bool,
 }
 
 fn parse_args() -> Args {
@@ -62,6 +67,8 @@ fn parse_args() -> Args {
     let mut warmup: usize = 1;
     let mut tile_sizes: Vec<u32> = Vec::new();
     let mut save_output: Option<PathBuf> = None;
+    let mut backend: AiBackend = AiBackend::DirectMl;
+    let mut tensorrt_fp16: bool = true;
 
     let mut i = 0;
     while i < raw.len() {
@@ -102,6 +109,18 @@ fn parse_args() -> Args {
                 i += 1;
                 save_output = Some(PathBuf::from(&raw[i]));
             }
+            "--backend" => {
+                i += 1;
+                backend = AiBackend::from_str(&raw[i]).unwrap_or_else(|| {
+                    panic!(
+                        "unknown backend: {} (expected: directml, tensorrt, cpu)",
+                        &raw[i]
+                    )
+                });
+            }
+            "--no-fp16" => {
+                tensorrt_fp16 = false;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -125,6 +144,8 @@ fn parse_args() -> Args {
         warmup,
         tile_sizes,
         save_output,
+        backend,
+        tensorrt_fp16,
     }
 }
 
@@ -141,6 +162,10 @@ fn print_help() {
     println!("                          model_tile_size). Fixed-size models may fail.");
     println!("  --save-output <DIR>     Save the last measured run's output PNG per");
     println!("                          (image, model, tile_size) for visual comparison.");
+    println!("  --backend <NAME>        AI backend: directml (default), tensorrt, cpu");
+    println!("                          tensorrt requires the pack to be installed at");
+    println!("                          %APPDATA%/mimageviewer/tensorrt/ (run scripts/setup-tensorrt-pack.ps1)");
+    println!("  --no-fp16               Disable TensorRT FP16 (only meaningful with --backend tensorrt)");
     println!("  --help, -h              Show this help\n");
     println!("Model names:");
     println!("  realesrgan_x4plus, realesrgan_anime6b, realesr_general_v3,");
@@ -148,6 +173,9 @@ fn print_help() {
 }
 
 fn main() {
+    // ロガー初期化 (DLL preload 等の診断ログを %APPDATA%/mimageviewer/logs/ に出す)
+    mimageviewer::logger::init();
+
     let args = parse_args();
 
     println!("bench_ai");
@@ -159,13 +187,37 @@ fn main() {
     for (label, _) in &args.models {
         println!("    - {}", label);
     }
-    println!("  warmup: {}", args.warmup);
-    println!("  runs:   {}", args.runs);
+    println!("  warmup:  {}", args.warmup);
+    println!("  runs:    {}", args.runs);
+    println!("  backend: {}", args.backend.as_str());
+    if args.backend == AiBackend::TensorRt {
+        println!("    fp16:  {}", args.tensorrt_fp16);
+    }
     println!();
 
     model_manager::ensure_models_extracted();
     let mm = model_manager::ModelManager::new();
-    let runtime = AiRuntime::new().expect("AiRuntime::new");
+    let runtime = AiRuntime::new_with_backend(args.backend, args.tensorrt_fp16)
+        .expect("AiRuntime::new_with_backend");
+    let active = runtime.active_backend();
+    println!(
+        "AiRuntime ready (requested={:?}, effective={:?}, dll={})",
+        active.requested,
+        active.effective,
+        active.dll_path.display()
+    );
+    if let Some(reason) = &active.fallback_reason {
+        println!("  fallback reason: {}", reason);
+    }
+    if active.requested == AiBackend::TensorRt && active.effective != AiBackend::TensorRt {
+        eprintln!(
+            "WARNING: --backend tensorrt was requested but the runtime fell back to {:?}.",
+            active.effective
+        );
+        eprintln!("  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/.");
+        eprintln!("  Run scripts/setup-tensorrt-pack.ps1 to install it, then retry.");
+    }
+    println!();
 
     // 先に全モデルをロード (セッション初期化コストを計測対象外にする)
     for (label, model) in &args.models {

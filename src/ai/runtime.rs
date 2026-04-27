@@ -19,6 +19,8 @@
 //! (`tensorrt_pack` モジュール参照)。pack 不在/破損時は DirectML に自動フォールバック。
 
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -33,6 +35,93 @@ static ORT_PROVIDERS_SHARED_BYTES: &[u8] =
 /// ort::init_from() の結果。プロセス内 1 回限りなので OnceLock で保持。
 /// バックエンド切り替え時は再起動が必要。
 static ORT_INIT: OnceLock<Result<ActiveBackend, String>> = OnceLock::new();
+
+/// 指定ディレクトリを Windows の DLL 検索パスの **先頭** に固定する。
+///
+/// `onnxruntime.dll` は CUDA/cuDNN/TensorRT EP DLL を内部 LoadLibraryW で
+/// 芋づる式にロードする。それらの依存先 (`cudart64_*.dll`, `nvinfer.dll` 等) は
+/// exe のあるディレクトリにないため、Windows のデフォルト DLL 検索パスでは
+/// 見つからない。
+///
+/// 対策の組み合わせ:
+///   1. `SetDllDirectoryW(dir)` — 全 LoadLibrary 呼び出しの最初に検索する
+///      ディレクトリを置く (AddDllDirectory より強力で、フラグなし LoadLibrary も
+///      対象になる)
+///   2. PATH 環境変数の先頭追加 — 子プロセスや一部 API 用の保険
+///   3. providers DLL の事前 LoadLibrary — フルパスで明示ロードしておけば
+///      ORT 内部の LoadLibrary は「既にロード済み」として名前解決成功する
+///
+/// OnceLock 内から呼ばれるので副作用 (env::set_var) は 1 プロセス 1 回のみ。
+fn prepend_dll_search_path(dir: &std::path::Path) {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::LibraryLoader::{LoadLibraryW, SetDllDirectoryW};
+
+        // (1) SetDllDirectoryW: 全 LoadLibrary 検索の先頭にこのディレクトリを置く
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if let Err(e) = SetDllDirectoryW(windows::core::PCWSTR(wide.as_ptr())) {
+            crate::logger::log(format!(
+                "[AI] SetDllDirectoryW({}) failed: {e:?}",
+                dir.display()
+            ));
+        }
+
+        // (3) 主要な providers DLL を事前にフルパスでロードしておく。
+        //     ORT 内部の LoadLibrary は "もう同名 DLL がロード済み" を見て
+        //     これらを参照できる。
+        let preload_targets = [
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_cuda.dll",
+            "onnxruntime_providers_tensorrt.dll",
+        ];
+        for name in &preload_targets {
+            let full = dir.join(name);
+            if !full.exists() {
+                continue;
+            }
+            let wide_full: Vec<u16> = full
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            match LoadLibraryW(windows::core::PCWSTR(wide_full.as_ptr())) {
+                Ok(_) => {
+                    crate::logger::log(format!("[AI] preloaded {}", full.display()));
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "[AI] preload {} failed: {e:?}",
+                        full.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // (2) PATH の先頭に追加
+    let dir_str = dir.to_string_lossy();
+    let new_path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut s = std::ffi::OsString::from(dir_str.as_ref());
+            s.push(";");
+            s.push(&existing);
+            s
+        }
+        None => std::ffi::OsString::from(dir_str.as_ref()),
+    };
+    // Safety: 単一スレッドから OnceLock 内 1 回のみ呼ばれる。
+    unsafe {
+        std::env::set_var("PATH", new_path);
+    }
+    crate::logger::log(format!(
+        "[AI] DLL 検索パスに追加 (SetDllDirectory + PATH + preload): {}",
+        dir.display()
+    ));
+}
 
 /// 解決済みバックエンド情報。
 /// `requested` はユーザーが選んだもの、`effective` は実際に init できたもの。
@@ -59,7 +148,15 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
         // TensorRt 要求時は pack 検証を試みる
         if requested == AiBackend::TensorRt {
             if super::tensorrt_pack::is_pack_installed() {
+                let pack_dir = super::tensorrt_pack::pack_dir();
                 let pack_dll = super::tensorrt_pack::pack_ort_dll_path();
+
+                // CUDA / cuDNN / TensorRT の依存 DLL は onnxruntime.dll が
+                // 内部から芋づる式にロードする。Windows のデフォルト DLL 検索パスは
+                // exe のあるディレクトリなので、TRT pack ディレクトリを明示的に
+                // 検索パスに追加する必要がある (PATH 先頭への prepend が一番確実)。
+                prepend_dll_search_path(&pack_dir);
+
                 match ort::init_from(&pack_dll) {
                     Ok(env_builder) => {
                         env_builder.commit();
@@ -267,9 +364,12 @@ impl AiRuntime {
         }
     }
 
-    /// TensorRT + CUDA EP を登録する。Phase 1 ではエンジンキャッシュ設定など
-    /// TRT 固有オプションは未配線で、ort クレートのデフォルト挙動に任せる。
-    /// Phase 2 で `with_engine_cache_*` / `with_fp16_*` 等を追加する。
+    /// TensorRT + CUDA EP を登録する。
+    /// - エンジンキャッシュは `%APPDATA%/mimageviewer/tensorrt-engines/<model_kind>/` に
+    ///   モデルごとに分ける (キャッシュ削除時にモデル単位で消せる)
+    /// - FP16 は Settings から制御 (デフォルト ON)
+    /// - max_workspace_size は VRAM の 30% (上限 4 GiB) を割り当て
+    /// - TRT EP が失敗した場合 CUDA EP がフォールバック、両方失敗で CPU
     fn register_tensorrt_eps(
         &self,
         builder: ort::session::builder::SessionBuilder,
@@ -283,10 +383,27 @@ impl AiRuntime {
                 e
             ));
         }
-        // Phase 2 で TensorRT EP の builder option (engine cache path, FP16 等) を
-        // 配線する。Phase 1 はデフォルトオプションだけで通す。
-        let _ = self.tensorrt_fp16; // Phase 2 で使用
-        let trt = ort::ep::TensorRT::default().build();
+
+        // Workspace は VRAM 容量の 30%、上限 4 GiB。
+        // サムネイル・通常デコード・補正と GPU メモリを共有するため取り過ぎない。
+        const WORKSPACE_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+        let workspace_bytes = (crate::gpu_info::vram_cap_from_percent(30) as usize)
+            .min(WORKSPACE_CAP_BYTES)
+            .max(512 * 1024 * 1024); // 最低 512 MiB
+
+        crate::logger::log(format!(
+            "[AI] TRT EP options: cache_path={}, fp16={}, workspace={} MiB",
+            cache_dir.display(),
+            self.tensorrt_fp16,
+            workspace_bytes / (1024 * 1024)
+        ));
+
+        let trt = ort::ep::TensorRT::default()
+            .with_engine_cache(true)
+            .with_engine_cache_path(cache_dir.to_string_lossy().to_string())
+            .with_fp16(self.tensorrt_fp16)
+            .with_max_workspace_size(workspace_bytes)
+            .build();
         let cuda = ort::ep::CUDA::default().build();
         match builder.with_execution_providers([trt, cuda]) {
             Ok(b) => b,
