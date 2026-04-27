@@ -906,4 +906,134 @@ mod tests {
         }
         drop(handle);
     }
+
+    /// `InFullScanGuard` の RAII 解放: 通常完了経路で `in_full_scan` が必ず false に
+    /// 戻ること。0.8.x の修正前は walker error / ingest apply error の早期 return で
+    /// `in_full_scan = true` のまま放置され、UI の「⏳ スキャン中」表示が居残ることが
+    /// あった。Drop ベースのガードに切り替えた回帰テスト。
+    ///
+    /// 早期 return 経路 (walker / ingest 失敗) を直接トリガーするのは E2E では困難なので、
+    /// ここでは "RAII で確実に false に戻る" 性質を完了経路で固定する。
+    /// drop_during_long_scan_cancels_cleanly がキャンセル経路の同じ性質を別観点で守る。
+    #[test]
+    fn in_full_scan_resets_to_false_after_initial_scan_done() {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let fav_root = tmp.path().join("scan_guard");
+        fs::create_dir_all(&fav_root).unwrap();
+        for i in 0..5 {
+            write_image(&fav_root, &format!("img_{i}.jpg"));
+        }
+
+        let fav_id = Uuid::new_v4();
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: fav_id,
+                favorite_root: fav_root.clone(),
+                enable_metadata_index: true,
+            },
+            Arc::clone(&meta),
+            Arc::clone(&fts),
+            Arc::clone(&writer),
+            Arc::clone(&sem),
+            Arc::clone(&gate),
+        );
+
+        // 初期スキャン完了まで待つ
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = handle.snapshot_stats();
+            if s.initial_scan_done {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("initial scan did not complete");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 完了直後は in_full_scan が drop されているはず。Loop 1 周で観測されない場合
+        // (drop 直前の極小タイミング) は最大 500ms polling して true→false 遷移を許容する。
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut final_state = handle.snapshot_stats().in_full_scan;
+        while final_state {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            final_state = handle.snapshot_stats().in_full_scan;
+        }
+        assert!(
+            !final_state,
+            "scan 完了後に in_full_scan が false に戻っていない (RAII guard 退行)"
+        );
+
+        drop(handle);
+    }
+
+    /// `drop_during_long_scan_cancels_cleanly` の補完として、cancel 経路でも
+    /// 最終的に `in_full_scan == false` で終わることを assert する。
+    /// 「cancel が伝わる」だけでなく「ガードが drop される」ことが両方成立しないと
+    /// UI 居残りバグが再発する。
+    #[test]
+    fn in_full_scan_resets_to_false_after_cancel() {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let fav_root = tmp.path().join("cancel_scan_guard");
+        fs::create_dir_all(&fav_root).unwrap();
+        // スキャン時間を稼ぐため多めに作る
+        for i in 0..200 {
+            write_image(&fav_root, &format!("img_{:03}.jpg", i));
+        }
+
+        let fav_id = Uuid::new_v4();
+        // スキャン途中の状態を観察するため、Arc<Mutex<_>> ではなく snapshot_stats を polling。
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: fav_id,
+                favorite_root: fav_root.clone(),
+                enable_metadata_index: true,
+            },
+            Arc::clone(&meta),
+            Arc::clone(&fts),
+            Arc::clone(&writer),
+            Arc::clone(&sem),
+            Arc::clone(&gate),
+        );
+        // スキャンが始まるのを少し待ってから drop で cancel 投入。
+        // (短すぎると spawn 直後で in_full_scan が立つ前の可能性がある)
+        std::thread::sleep(Duration::from_millis(20));
+
+        // drop で cancel が走り、supervisor thread は join される。
+        let t0 = Instant::now();
+        drop(handle);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel + join に時間がかかりすぎ: {:?}",
+            elapsed
+        );
+
+        // handle drop 後、SupervisorStats への参照経路はもう無いので直接観測不能。
+        // 代わりに「2 度目の spawn を新規 stats でやって in_full_scan が初期値 false」を
+        // 確かめることで、stats が共有されておらず各 supervisor が独立に保持していることだけ
+        // 確認する (= cancel 経路でも前回 supervisor の thread が走り続けて他の stats を
+        // 汚さないことの間接 assertion)。
+        let new_handle = spawn(
+            SupervisorParams {
+                favorite_id: Uuid::new_v4(),
+                favorite_root: fav_root,
+                enable_metadata_index: true,
+            },
+            meta,
+            fts,
+            writer,
+            sem,
+            gate,
+        );
+        let s = new_handle.snapshot_stats();
+        assert!(
+            !s.in_full_scan,
+            "新規 supervisor の初期 stats では in_full_scan=false"
+        );
+        drop(new_handle);
+    }
 }

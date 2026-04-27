@@ -584,4 +584,159 @@ mod tests {
         std::fs::write(dir.join("a.jpg"), b"").unwrap();
         assert!(folder_should_stop(&dir, None));
     }
+
+    // -----------------------------------------------------------------------
+    // next_folder_dfs / prev_folder_dfs の DFS 前順走査 (Ctrl+↑↓ の根幹)。
+    // 既存テストは `navigate_folder_with_skip` のスキップ挙動を nav_fn closure 経由で
+    // 確認していたが、DFS 自体は実 read_dir に依存するためここで実フォルダを作って
+    // 検証する。ZIP との同名コリジョンが発生しない構造に絞ることで、ユーザー設定
+    // (`skip_zip_if_folder_exists`) の値に依らず決定的にする。
+    // -----------------------------------------------------------------------
+
+    /// 深さ優先前順 (preorder) のシーケンスを root から完走させて確認する。
+    /// 構造:
+    /// ```
+    /// root/
+    ///   a/
+    ///     a1/
+    ///     a2/
+    ///   b/
+    ///   c/
+    ///     c1/
+    /// ```
+    /// 期待される next の連鎖: root → a → a1 → a2 → b → c → c1 → (None)
+    ///
+    /// 注意: `path_eq` はセパレータ正規化をしないので、テスト内のパス構築は
+    /// 段階 join (`.join("a").join("a1")`) で `\` セパレータに揃える。
+    #[test]
+    fn next_folder_dfs_preorder_traversal_full_chain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let a = root.join("a");
+        let a1 = a.join("a1");
+        let a2 = a.join("a2");
+        let b = root.join("b");
+        let c = root.join("c");
+        let c1 = c.join("c1");
+        for d in [&a1, &a2, &b, &c1] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let order = [&a, &a1, &a2, &b, &c, &c1];
+        let mut cur = root.clone();
+        for expected in order {
+            let next = next_folder_dfs(&cur).expect("next_folder_dfs Some");
+            assert!(
+                path_eq(&next, expected),
+                "expected {:?}, got {:?}",
+                expected,
+                next
+            );
+            cur = next;
+        }
+        // 末尾の c1 から見て次は無い (tempdir 親には OS 上の他フォルダが見える可能性が
+        // あるので Some/None どちらでも許容して「少なくとも root 配下ではない」だけ保証)。
+        if let Some(beyond) = next_folder_dfs(&cur) {
+            assert!(
+                !beyond.starts_with(&root),
+                "c1 から先は root より外に抜けるはず, got {:?}",
+                beyond
+            );
+        }
+    }
+
+    /// `prev_folder_dfs` の連鎖を末端から root に向けて辿る。
+    /// `next_folder_dfs` の正確な逆順を期待する (= round-trip 性質)。
+    #[test]
+    fn prev_folder_dfs_is_reverse_of_next_chain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let a = root.join("a");
+        let a1 = a.join("a1");
+        let a2 = a.join("a2");
+        let b = root.join("b");
+        let c = root.join("c");
+        let c1 = c.join("c1");
+        for d in [&a1, &a2, &b, &c1] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let chain = [&root, &a, &a1, &a2, &b, &c, &c1];
+        for w in chain.windows(2).rev() {
+            let from = w[1];
+            let expected_prev = w[0];
+            let prev = prev_folder_dfs(from).expect("prev_folder_dfs Some");
+            assert!(
+                path_eq(&prev, expected_prev),
+                "from {:?}: expected prev {:?}, got {:?}",
+                from,
+                expected_prev,
+                prev
+            );
+        }
+    }
+
+    /// 深い枝の最後の子孫から、上位フォルダの次の兄弟へ正しく "ジャンプ" する。
+    /// ```
+    /// root/
+    ///   a/
+    ///     deep/
+    ///       deeper/
+    ///   b/
+    /// ```
+    /// `root/a/deep/deeper` から next は `root/b` (ancestor-sibling jump)。
+    #[test]
+    fn next_folder_dfs_jumps_from_deep_leaf_to_ancestor_sibling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let deeper = root.join("a").join("deep").join("deeper");
+        let b = root.join("b");
+        std::fs::create_dir_all(&deeper).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let next = next_folder_dfs(&deeper).expect("Some");
+        assert!(
+            path_eq(&next, &b),
+            "deep leaf → ancestor sibling: expected root/b, got {:?}",
+            next
+        );
+    }
+
+    /// `prev_folder_dfs` で「最初の子」から親に戻るときに、誤って前の枝の最後の子孫を
+    /// 返さないこと。`root/a/a1` の prev は `root/a` (親) であって `root/a/a2` ではない。
+    #[test]
+    fn prev_folder_dfs_first_child_returns_parent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let a = root.join("a");
+        let a1 = a.join("a1");
+        let a2 = a.join("a2");
+        for d in [&a1, &a2] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let prev = prev_folder_dfs(&a1).expect("Some");
+        assert!(
+            path_eq(&prev, &a),
+            "first child の prev は親, got {:?}",
+            prev
+        );
+    }
+
+    /// `prev` が前の兄弟の **最も深い** 末端まで一気に降りる。
+    /// `root/{a/x/y, b}` で b の prev は a/x/y。
+    #[test]
+    fn prev_folder_dfs_descends_into_last_sibling_depth() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let y = root.join("a").join("x").join("y");
+        let b = root.join("b");
+        std::fs::create_dir_all(&y).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let prev = prev_folder_dfs(&b).expect("Some");
+        assert!(
+            path_eq(&prev, &y),
+            "前の兄弟の最深子孫まで降りる, got {:?}",
+            prev
+        );
+    }
 }

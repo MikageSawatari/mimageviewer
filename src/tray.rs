@@ -250,6 +250,36 @@ impl TrayController {
     }
 }
 
+#[cfg(test)]
+impl TrayController {
+    /// テスト専用: 実トレイスレッドを起動せずに、atomic + channel だけ持つコントローラを
+    /// 組み立てる。`set_paused_check` の atomic 即時更新セマンティクス検証用。
+    fn new_for_test() -> (Self, Receiver<TrayCommand>) {
+        let (event_tx, event_rx) = bounded::<TrayEvent>(16);
+        // event_tx は keep し、test は event_rx 側を保持しない (Drop 時に shutdown 送信のみ)。
+        // event_tx を drop すると receiver 側 disconnected で受信時にエラーになるため keep。
+        std::mem::forget(event_tx);
+        let (cmd_tx, cmd_rx) = bounded::<TrayCommand>(16);
+        Self::test_only_internal(event_rx, cmd_tx, cmd_rx)
+    }
+
+    fn test_only_internal(
+        event_rx: Receiver<TrayEvent>,
+        cmd_tx: Sender<TrayCommand>,
+        cmd_rx: Receiver<TrayCommand>,
+    ) -> (Self, Receiver<TrayCommand>) {
+        let ctrl = Self {
+            event_rx,
+            cmd_tx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            quit_flag: Arc::new(AtomicBool::new(false)),
+            pause_checked: Arc::new(AtomicBool::new(false)),
+        };
+        (ctrl, cmd_rx)
+    }
+}
+
 /// 埋め込みアイコン (`assets/icon.png`) を RGBA ピクセル列にデコードして返す。
 /// 失敗時 (画像ライブラリがデコードできない等) は `None`。
 pub fn load_embedded_icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
@@ -552,3 +582,61 @@ fn run_tray_thread(
     drop(tray);
     crate::logger::log("tray: controller thread exiting (shutdown flag)");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `set_paused_check` は **atomic を即時更新してから** command を送信すること。
+    /// 順序が逆転すると、command 送信〜tray スレッドの 50ms ポーリング待機の間に
+    /// `App::reconcile_pause_state` が古い atomic を読んで `settings` を巻き戻す
+    /// race が再発する (Codex P2 修正)。
+    ///
+    /// 本テストはコマンド送信先 receiver を test 側で保持し、`set_paused_check`
+    /// 直後に `pause_checked_snapshot()` が新しい値を返していることを assert する
+    /// (= atomic store が同期的に終わっている)。
+    #[test]
+    fn set_paused_check_updates_atomic_synchronously_before_send() {
+        let (ctrl, cmd_rx) = TrayController::new_for_test();
+        assert!(
+            !ctrl.pause_checked_snapshot(),
+            "初期は false"
+        );
+
+        ctrl.set_paused_check(true);
+        // 同スレッドからの load: store が return より前に実行されているはず。
+        assert!(
+            ctrl.pause_checked_snapshot(),
+            "set_paused_check return 直後に atomic は新しい値を反映していること"
+        );
+        // command も channel に積まれている (= 後段の tray thread が読み取り可能)。
+        match cmd_rx.try_recv() {
+            Ok(TrayCommand::SetPausedCheck(true)) => {}
+            other => panic!("SetPausedCheck(true) コマンドが届かない: {other:?}"),
+        }
+
+        // 反転も同様
+        ctrl.set_paused_check(false);
+        assert!(!ctrl.pause_checked_snapshot());
+        match cmd_rx.try_recv() {
+            Ok(TrayCommand::SetPausedCheck(false)) => {}
+            other => panic!("SetPausedCheck(false) が届かない: {other:?}"),
+        }
+    }
+
+    /// 同じ値で 2 回叩いても冪等 (atomic への二重 store は無害、command 2 通は届く)。
+    #[test]
+    fn set_paused_check_is_idempotent_for_same_value() {
+        let (ctrl, cmd_rx) = TrayController::new_for_test();
+        ctrl.set_paused_check(true);
+        ctrl.set_paused_check(true);
+        assert!(ctrl.pause_checked_snapshot());
+        // command channel には 2 個積まれている
+        let mut count = 0;
+        while cmd_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2, "同値でも command 2 通は積まれる");
+    }
+}
+

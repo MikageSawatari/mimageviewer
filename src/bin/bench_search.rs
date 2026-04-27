@@ -581,6 +581,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut num_docs = DEFAULT_NUM_DOCS;
     let mut keep = false;
+    let mut json_out: Option<std::path::PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -589,6 +590,12 @@ fn main() {
                 num_docs = args[i].parse().unwrap_or(DEFAULT_NUM_DOCS);
             }
             "--keep" => keep = true,
+            "--json" => {
+                i += 1;
+                if i < args.len() {
+                    json_out = Some(std::path::PathBuf::from(&args[i]));
+                }
+            }
             _ => eprintln!("unknown arg: {}", args[i]),
         }
         i += 1;
@@ -706,10 +713,17 @@ fn main() {
 
     println!();
     println!("{:<20} {:<40} {}", "label", "query", "expected");
+    let mut json_records: Vec<(String, f64, f64, usize)> = Vec::new();
     for q in &queries {
         println!("{:<20} {:<40} {}", q.label, q.text, q.expected);
         let r = run_paged_query(&index, all_text_field, path_field, q.text);
         println!("{}", summarize(&r));
+        json_records.push((
+            q.label.to_string(),
+            r.time_total.as_secs_f64() * 1000.0,
+            r.time_post_filter_total.as_secs_f64() * 1000.0,
+            r.valid_hits,
+        ));
     }
 
     // SQLite 一括 lookup コスト: Tantivy から返った 500 path を想定
@@ -762,5 +776,29 @@ fn main() {
         let _ = std::fs::remove_dir_all(&tmp_root);
         println!();
         println!("  (一時ファイルを削除しました。残す場合は --keep)");
+    }
+
+    // JSON 出力 (--json <path>): scripts/check_bench_regression.py が消費する。
+    // 1 行の JSON object: { "version": 1, "num_docs": N, "queries": { label: { total_ms, post_ms, hits } } }
+    if let Some(path) = json_out {
+        let mut buf = String::new();
+        buf.push_str(&format!(
+            "{{\"version\":1,\"num_docs\":{num_docs},\"queries\":{{",
+        ));
+        for (i, (label, total_ms, post_ms, hits)) in json_records.iter().enumerate() {
+            if i > 0 {
+                buf.push(',');
+            }
+            // label は ASCII (rare_jp 等) なのでそのまま埋める。
+            buf.push_str(&format!(
+                "\"{label}\":{{\"total_ms\":{total_ms:.3},\"post_ms\":{post_ms:.3},\"hits\":{hits}}}"
+            ));
+        }
+        buf.push_str("}}\n");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&path, buf).expect("JSON 書き出し失敗");
+        println!("\nJSON 出力: {}", path.display());
     }
 }

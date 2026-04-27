@@ -16655,4 +16655,65 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.shortcuts_blocked_by_text_input());
     }
 
+    /// `poll_delete_pending` が削除完了時に `current_folder_signature` を None に
+    /// 倒すことを検証 (= 後続の外部 mtime 変化で誤 reload しない)。
+    ///
+    /// 0.8.x で導入: 削除成功直後は items が UI 側で in-place に絞り込まれており、
+    /// stale な signature が残っていると `check_external_folder_changes` が
+    /// 「内容変化あり」と誤判定して数千件の items を再走査して UI が固まる。
+    #[test]
+    fn poll_delete_pending_clears_current_folder_signature() {
+        use crate::delete_worker::{DeleteMsg, DeletePending};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use std::sync::atomic::AtomicBool;
+
+        let (mut app, _g, tmp, _l) = setup_app();
+        let folder = tmp.path().join("delete_test_folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let target_path = folder.join("a.jpg");
+        std::fs::write(&target_path, b"dummy").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_signature = Some(0xDEAD_BEEF);
+        app.items.push(GridItem::Image(target_path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+
+        // 完了済み worker を疑似する: succeeded に target_path を入れて Done を即送る。
+        let (tx, rx) = std::sync::mpsc::channel::<DeleteMsg>();
+        tx.send(DeleteMsg::Batch {
+            succeeded: vec![target_path.clone()],
+            failed: vec![],
+        })
+        .unwrap();
+        tx.send(DeleteMsg::Done { canceled: false }).unwrap();
+        drop(tx);
+
+        app.delete_pending = Some(DeletePending {
+            cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            rx,
+            total: 1,
+            succeeded: vec![],
+            failed: vec![],
+        });
+
+        // 実 ファイルも消しておかないと metadata() が古いまま (実機では worker が消す)。
+        std::fs::remove_file(&target_path).unwrap();
+
+        app.poll_delete_pending();
+
+        assert!(
+            app.delete_pending.is_none(),
+            "Done 受信で delete_pending は take される"
+        );
+        assert!(
+            app.current_folder_signature.is_none(),
+            "削除完了で signature が None reset されること"
+        );
+        assert_eq!(
+            app.items.len(),
+            0,
+            "削除成功した path は items から抜かれる"
+        );
+    }
+
 }

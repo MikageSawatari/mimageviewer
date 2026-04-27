@@ -577,4 +577,109 @@ mod tests {
         assert!(!data.is_empty());
         assert!(w <= 4 && h <= 4);
     }
+
+    /// `collect_db_paths` が `cache_dir/<sub>/*.db` を網羅すること。
+    /// `cache_dir/file.db` (top-level) は subdir でないので **無視**、
+    /// 非 .db ファイル / 余計なフォルダの中の非 .db も無視。
+    /// docs/ui-responsiveness.md §4 (file_type 経由) との整合を機能面から保証する。
+    #[test]
+    fn collect_db_paths_enumerates_only_subdir_db_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // sub1: foo.db + readme.txt
+        let sub1 = cache_dir.join("sub1");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::write(sub1.join("foo.db"), b"x").unwrap();
+        std::fs::write(sub1.join("readme.txt"), b"x").unwrap();
+        // sub2: bar.db
+        let sub2 = cache_dir.join("sub2");
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::write(sub2.join("bar.db"), b"x").unwrap();
+        // top-level の loose db (subdir に居ない) は拾わない
+        std::fs::write(cache_dir.join("loose.db"), b"x").unwrap();
+        // 空サブフォルダは無害
+        std::fs::create_dir_all(cache_dir.join("empty_sub")).unwrap();
+
+        let mut found: Vec<String> = Vec::new();
+        super::collect_db_paths(&cache_dir, &mut |p, _meta| {
+            found.push(
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        });
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["bar.db".to_string(), "foo.db".to_string()],
+            "subdir 配下の .db のみ列挙、top-level loose.db は無視"
+        );
+    }
+
+    /// `collect_db_paths` は cache_dir 自体が存在しない場合に panic せず、
+    /// 単にコールバックを呼ばずに return する (`std::fs::read_dir` Err 時の規約)。
+    #[test]
+    fn collect_db_paths_handles_missing_cache_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let nonexistent = temp.path().join("does_not_exist");
+        let mut count = 0usize;
+        super::collect_db_paths(&nonexistent, &mut |_, _| count += 1);
+        assert_eq!(count, 0, "missing cache_dir なら空列挙");
+    }
+
+    /// 大量サブフォルダ (200 件) でも全 .db ファイルを取りこぼさず列挙する。
+    /// 実時間 assert は flaky になるので、件数だけ厳密に確認 (file_type 経路で
+    /// per-entry syscall が発生していないことの間接担保)。
+    #[test]
+    fn collect_db_paths_handles_many_subfolders() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        for i in 0..200 {
+            let sub = cache_dir.join(format!("s{i:03}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("a.db"), b"x").unwrap();
+        }
+        let mut count = 0usize;
+        super::collect_db_paths(&cache_dir, &mut |_, _| count += 1);
+        assert_eq!(count, 200, "200 件全部列挙");
+    }
+
+    /// 0.8.2 で `decode_thumb_dims` を WebP 固定から `with_guessed_format()` auto-detect
+    /// に変更した回帰ガード。ここで JPEG が読めなくなると、旧バージョンが JPEG で書いた
+    /// 親 catalog エントリから seed/writeback できなくなる (= 仮想フォルダの初回 thumb
+    /// が永続的に失われる)。
+    #[test]
+    fn decode_thumb_dims_reads_webp_jpeg_and_rejects_garbage() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 6, |x, y| {
+            image::Rgb([(x * 30) as u8, (y * 40) as u8, 200])
+        }));
+
+        // WebP (現行フォーマット): 寸法を返す
+        let (webp_bytes, _, _) = encode_thumb_webp(&img, 8, 75.0).expect("webp encode ok");
+        assert_eq!(decode_thumb_dims(&webp_bytes), Some((8, 6)));
+
+        // JPEG (旧バージョンが書いていた形式): 寸法を返す
+        let mut jpeg_bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut jpeg_bytes),
+            image::ImageFormat::Jpeg,
+        )
+        .expect("jpeg encode");
+        assert_eq!(decode_thumb_dims(&jpeg_bytes), Some((8, 6)));
+
+        // 破損データ: None。空バイト列・テキスト・WebP magic だけ・短縮 JPEG いずれも reject。
+        assert_eq!(decode_thumb_dims(&[]), None);
+        assert_eq!(decode_thumb_dims(b"NOT-AN-IMAGE-AT-ALL"), None);
+        // RIFF/WEBP magic の手前 12 バイトだけ (本体なし)
+        assert_eq!(
+            decode_thumb_dims(b"RIFF\x00\x00\x00\x00WEBP"),
+            None,
+            "header だけで本体なし → None"
+        );
+        // JPEG SOI のみ (SOF0 まで届かない)
+        assert_eq!(decode_thumb_dims(b"\xFF\xD8\xFF\xE0"), None);
+    }
 }

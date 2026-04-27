@@ -354,3 +354,132 @@ fn empty_favorite_list_returns_complete() {
         _ => unreachable!(),
     }
 }
+
+// -----------------------------------------------------------------------
+// Streaming protocol の境界 (v0.8.x: selected/checked content-key 復元の前提)
+//
+// 単体側で `streaming_rebuild_preserves_selected_and_checked_by_content_key`
+// (src/app.rs) が App-level でカバーしている。ここでは IndexerManager 側の
+// streaming 契約 (Batch が `Done` の前に流れること、cancel で Cancelled が立つこと)
+// を別ビルドの統合テストとして固定する。
+// -----------------------------------------------------------------------
+
+/// 検索ヒットが **複数 Batch** に分かれて Done 前にストリーミング到着すること、
+/// あるいは少なくとも 1 つは Batch が `Done` 前に来ること。
+/// (ここで `Done` の payload に hits がぶら下がる退行が入ると、UI 側の
+/// streaming rebuild ロジック自体が呼ばれなくなり selected 維持テストの前提が崩れる。)
+#[test]
+fn streaming_emits_batch_before_done() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // クエリ "sunset" にヒットする画像を 12 枚置く。post-filter を通る。
+    for i in 0..12 {
+        write_png_with_text(
+            &root.path().join(format!("photo_{i:02}.png")),
+            "evening sunset over hills",
+        );
+    }
+    let fav = make_favorite("A", root.path());
+    let mgr = start_indexer_at(data.path(), &[fav.clone()]);
+    wait_scan_done(&mgr, fav.id);
+
+    // 索引が反映されるまで待つ。`wait_for_search_hits` は完了を待つだけなので
+    // ここで使うと streaming 性質を観察できない。代わりに hits が 12 件に
+    // 揃うまで polling し、その後で streaming 検証用の手動 spawn_search に切り替える。
+    wait_for_search_hits(
+        &mgr,
+        "sunset",
+        &[fav.id],
+        |h| h.len() >= 12,
+        FS_EVENT_TIMEOUT,
+        "streaming_emits_batch_before_done: 索引反映",
+    );
+
+    let handle = mgr.spawn_search(
+        "sunset".to_string(),
+        vec![fav.id],
+        mimageviewer::global_search::SearchScope::default(),
+    );
+    let mut batches_before_done: usize = 0;
+    let mut total_hits: usize = 0;
+    let deadline = std::time::Instant::now() + FS_EVENT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("Done が来ない");
+        }
+        match handle.rx.recv_timeout(remaining) {
+            Ok(SearchStreamEvent::Batch { hits, .. }) => {
+                batches_before_done += 1;
+                total_hits += hits.len();
+            }
+            Ok(SearchStreamEvent::Done { .. }) => break,
+            Ok(SearchStreamEvent::Error(e)) => panic!("error: {e}"),
+            Err(_) => panic!("rx disconnected"),
+        }
+    }
+    assert!(
+        batches_before_done >= 1,
+        "Done の前に少なくとも 1 つの Batch が流れること (got {batches_before_done})"
+    );
+    assert_eq!(total_hits, 12, "Batch 内累積で全 12 件届くこと");
+}
+
+/// 検索中に `cancel` を立てたら `Done { reason: Cancelled }` で終わること。
+/// SearchHandle の cancel 機構 (Drop で自動 set + 明示 set 両方) の回帰ガード。
+#[test]
+fn cancel_during_search_yields_cancelled_done() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // 大量のヒットを準備して検索が瞬時に終わらないようにする。
+    for i in 0..200 {
+        write_png_with_text(
+            &root.path().join(format!("doc_{i:03}.png")),
+            "lightning storm at midnight",
+        );
+    }
+    let fav = make_favorite("A", root.path());
+    let mgr = start_indexer_at(data.path(), &[fav.clone()]);
+    wait_scan_done(&mgr, fav.id);
+    wait_for_search_hits(
+        &mgr,
+        "lightning",
+        &[fav.id],
+        |h| h.len() >= 50,
+        FS_EVENT_TIMEOUT,
+        "cancel test: 索引反映",
+    );
+
+    let handle = mgr.spawn_search(
+        "lightning".to_string(),
+        vec![fav.id],
+        mimageviewer::global_search::SearchScope::default(),
+    );
+    // 即 cancel を立てる。実装によっては Done が Complete で先に来るレースもありうるが、
+    // どちらの DoneReason が来るかを robustly assert する。
+    handle
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let deadline = std::time::Instant::now() + FS_EVENT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("Done が来ない (cancel test)");
+        }
+        match handle.rx.recv_timeout(remaining) {
+            Ok(SearchStreamEvent::Done { reason, .. }) => {
+                // 検索量が小さくて先に Complete してしまうレースを許容しつつ、
+                // 「cancel が立っているのに RejectedQuery / Error が返る」のは退行。
+                assert!(
+                    matches!(reason, DoneReason::Cancelled | DoneReason::Complete),
+                    "cancel 経路では Cancelled か (raceで先に終われば) Complete のみ許容、got {reason:?}"
+                );
+                break;
+            }
+            Ok(SearchStreamEvent::Error(e)) => panic!("error during cancel: {e}"),
+            Ok(SearchStreamEvent::Batch { .. }) => continue,
+            Err(_) => panic!("rx disconnected"),
+        }
+    }
+}

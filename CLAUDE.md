@@ -635,13 +635,32 @@ IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バ
      14 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      新規ページを追加した際は 14 ページ全部のサイドバーを更新すること。
 
-### Phase 2: 依存物の確認
+### Phase 2: 依存物の確認 + 性能回帰チェック
 
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
 8. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 9. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
    ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
      不足していると `cargo build` が復旧手順付きで止まるようになっている。
+
+9.5. **bench 回帰チェック** (検索周りに変更を入れたリリースで実施):
+   ```bash
+   cargo run --release --bin bench_search -- --docs 50000 --json /tmp/bench_new.json
+   python scripts/check_bench_regression.py vendor/bench_baseline.json /tmp/bench_new.json
+   ```
+   - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
+     `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
+   - 既存 baseline と比較して **+30% 超の劣化**で exit 1。原因を切り分けてから先に進む。
+     Tantivy 等の依存更新で正当な変動なら `--save` で baseline を更新する。
+
+9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
+   ```bash
+   bash scripts/perf_smoke.sh
+   ```
+   - `--perf-log` 付きで mImageViewer を起動 → 手動で起動・Ctrl+↓ 連打・Ctrl+G 検索を実行
+     → スクリプトが `analyze_perf.py hitches` で 16ms 超のフレーム間隔を集計。
+   - 「ヒッチ: 0 件」または既知の長時間 nav (PDF cold open ~700ms 等) のみなら OK。
+     nav イベント無しのヒッチは UI スレッド同期 I/O 退行の疑い (docs/ui-responsiveness.md §4)。
 
 ### Phase 3: ビルド・配布成果物
 
