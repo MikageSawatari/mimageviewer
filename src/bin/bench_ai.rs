@@ -24,6 +24,30 @@ use std::sync::atomic::AtomicBool;
 
 use mimageviewer::ai::upscale::UpscaleTimings;
 use mimageviewer::ai::{AiBackend, ModelKind, model_manager, runtime::AiRuntime, upscale};
+use serde_json::json;
+
+/// 1 (image, model, tile_size) 組み合わせ分の集約結果。後で JSON サマリに出す。
+#[derive(Debug, Clone)]
+struct BenchRecord {
+    image: String,
+    image_w: u32,
+    image_h: u32,
+    model: String,
+    tile_size: u32,
+    n_tiles: usize,
+    runs: usize,
+    /// 全ラン平均の wall total (ms)
+    wall_total_avg_ms: f64,
+    wall_total_min_ms: f64,
+    wall_total_max_ms: f64,
+    wall_total_stddev_ms: f64,
+    /// per-tile 平均の infer 時間 (ms)
+    infer_avg_ms: f64,
+    /// per-tile 平均の session_run (GPU 計算 + 転送) 時間 (ms)
+    session_run_avg_ms: f64,
+    /// per-tile 平均の blend 時間 (ms)
+    blend_avg_ms: f64,
+}
 
 const DEFAULT_IMAGES: &[&str] = &[
     "testimage/うちのこ/ComfyUI_2_0003.png",
@@ -57,6 +81,9 @@ struct Args {
     backend: AiBackend,
     /// TensorRT FP16 推論を有効にする (デフォルト: true)。
     tensorrt_fp16: bool,
+    /// JSON 形式のサマリ出力先 (--json /path/to/file.json)。
+    /// 後で複数バックエンド/モデルの結果を比較しやすくするため。
+    json_output: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -69,6 +96,7 @@ fn parse_args() -> Args {
     let mut save_output: Option<PathBuf> = None;
     let mut backend: AiBackend = AiBackend::DirectMl;
     let mut tensorrt_fp16: bool = true;
+    let mut json_output: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -121,6 +149,10 @@ fn parse_args() -> Args {
             "--no-fp16" => {
                 tensorrt_fp16 = false;
             }
+            "--json" => {
+                i += 1;
+                json_output = Some(PathBuf::from(&raw[i]));
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -146,6 +178,7 @@ fn parse_args() -> Args {
         save_output,
         backend,
         tensorrt_fp16,
+        json_output,
     }
 }
 
@@ -166,6 +199,8 @@ fn print_help() {
     println!("                          tensorrt requires the pack to be installed at");
     println!("                          %APPDATA%/mimageviewer/tensorrt/ (run scripts/setup-tensorrt-pack.ps1)");
     println!("  --no-fp16               Disable TensorRT FP16 (only meaningful with --backend tensorrt)");
+    println!("  --json <PATH>           Write a JSON summary of all (image,model,tile) results");
+    println!("                          for later cross-backend comparison");
     println!("  --help, -h              Show this help\n");
     println!("Model names:");
     println!("  realesrgan_x4plus, realesrgan_anime6b, realesr_general_v3,");
@@ -232,6 +267,9 @@ fn main() {
     println!();
 
     let cancel = Arc::new(AtomicBool::new(false));
+
+    // JSON 出力用に全レコードを集める
+    let mut records: Vec<BenchRecord> = Vec::new();
 
     for img_path in &args.images {
         let img = match image::open(img_path) {
@@ -323,19 +361,53 @@ fn main() {
                     Some(n) => format!("{} (override)", n),
                     None => String::from("default"),
                 };
-                print_model_summary(label, *model, &runs_timings, &ts_label);
+                let mut rec = print_model_summary(label, *model, &runs_timings, &ts_label);
+                rec.image = img_path.display().to_string();
+                records.push(rec);
                 println!();
             }
         }
     }
+
+    // JSON サマリ出力 (--json 指定時)
+    if let Some(path) = &args.json_output {
+        let summary = json!({
+            "backend": args.backend.as_str(),
+            "tensorrt_fp16": args.tensorrt_fp16,
+            "warmup": args.warmup,
+            "runs": args.runs,
+            "records": records.iter().map(|r| json!({
+                "image": r.image,
+                "image_w": r.image_w,
+                "image_h": r.image_h,
+                "model": r.model,
+                "tile_size": r.tile_size,
+                "n_tiles": r.n_tiles,
+                "runs": r.runs,
+                "wall_total_avg_ms": r.wall_total_avg_ms,
+                "wall_total_min_ms": r.wall_total_min_ms,
+                "wall_total_max_ms": r.wall_total_max_ms,
+                "wall_total_stddev_ms": r.wall_total_stddev_ms,
+                "infer_avg_ms": r.infer_avg_ms,
+                "session_run_avg_ms": r.session_run_avg_ms,
+                "blend_avg_ms": r.blend_avg_ms,
+            })).collect::<Vec<_>>(),
+        });
+        match std::fs::write(path, serde_json::to_string_pretty(&summary).unwrap()) {
+            Ok(()) => println!("JSON summary written: {}", path.display()),
+            Err(e) => eprintln!("Failed to write JSON summary {}: {}", path.display(), e),
+        }
+    }
 }
 
+/// `print_model_summary` で出力したサマリの主要数値を BenchRecord として返す。
+/// `image_*` と `model` は呼び出し側で詰める (ここでは UpscaleTimings からは取れない)。
 fn print_model_summary(
     label: &str,
     _model: ModelKind,
     runs: &[UpscaleTimings],
     tile_size_label: &str,
-) {
+) -> BenchRecord {
     let n_runs = runs.len();
     let sample = &runs[0];
     let n_tiles = sample.tiles.len();
@@ -484,6 +556,23 @@ fn print_model_summary(
         ci95,
         totals.len()
     );
+
+    BenchRecord {
+        image: String::new(),  // 呼び出し側で詰める
+        image_w: in_w,
+        image_h: in_h,
+        model: label.to_string(),
+        tile_size,
+        n_tiles,
+        runs: n_runs,
+        wall_total_avg_ms: mean,
+        wall_total_min_ms: min_t,
+        wall_total_max_ms: max_t,
+        wall_total_stddev_ms: stddev,
+        infer_avg_ms: avg_infer,
+        session_run_avg_ms: avg_srun,
+        blend_avg_ms: avg_blend,
+    }
 }
 
 /// egui::ColorImage を PNG として保存する (RGBA8)。
