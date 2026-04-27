@@ -44,15 +44,11 @@ enum RatingFilterOp {
 
 /// グリッドのセル寸法 (`cell_w`, `cell_h`) を計算する。
 ///
-/// - `avail_w <= 0` の場合は `None` (= グリッド描画 skip)。アドレスバー等の chrome が幅を
-///   食い切ったときに **避けるべき早期 return**。
-/// - 下限 `MIN_CELL_PX = 32` を強制。これより細い場合 `cell_w/cell_h ≥ 32` にクランプして、
-///   `viewport_h / cell_h` が数百〜数千行に暴発する UI フリーズを防ぐ。
-///
-/// 抽出した理由: 元は `App::draw_grid_items` 内の inline 計算だったが、
-/// 「狭幅 window でクランプが効くこと」を unit test で固定するために free function 化した。
-pub(crate) const MIN_CELL_PX: f32 = 32.0;
-pub(crate) fn compute_cell_size(
+/// `avail_w <= 0` (chrome が幅を食い切った) は `None` を返してグリッド描画を skip。
+/// `MIN_CELL_PX` 下限を強制しないと、`viewport_h / cell_h` が数百〜数千行に暴発して
+/// 1 フレームで数千セル描画して UI フリーズする (極端に窓を狭めた時の実害バグ)。
+const MIN_CELL_PX: f32 = 32.0;
+fn compute_cell_size(
     avail_w: f32,
     cols: usize,
     height_ratio: f32,
@@ -1755,16 +1751,12 @@ mod rating_filter_op_tests {
 mod compute_cell_size_tests {
     use super::*;
 
-    /// `avail_w ≤ 0` (アドレスバー等で chrome が幅を食い切った) は None。
-    /// 描画 skip の信号として上位に伝わる。
     #[test]
     fn returns_none_for_non_positive_width() {
         assert_eq!(compute_cell_size(0.0, 4, 1.0), None);
         assert_eq!(compute_cell_size(-10.0, 4, 1.0), None);
     }
 
-    /// 通常幅では avail_w / cols が cell_w (>= MIN_CELL_PX) になる。
-    /// height_ratio = 1.0 (正方形) なら cell_h == cell_w。
     #[test]
     fn computes_cell_size_for_normal_window() {
         let (w, h) = compute_cell_size(800.0, 4, 1.0).expect("Some");
@@ -1772,41 +1764,31 @@ mod compute_cell_size_tests {
         assert_eq!(h, 200.0);
     }
 
-    /// height_ratio (3:4 portrait 等) が cell_h に正しく反映される。
     #[test]
     fn applies_height_ratio_to_cell_h() {
         let (w, h) = compute_cell_size(800.0, 4, 1.5).expect("Some");
         assert_eq!(w, 200.0);
-        assert_eq!(h, 300.0); // 200 * 1.5
+        assert_eq!(h, 300.0);
     }
 
-    /// **回帰テスト** (本テストの主目的): 狭幅 window で cell_w が
-    /// MIN_CELL_PX (32px) を下回らないこと。クランプが無いと
-    /// `viewport_h / cell_h` が数千行に暴発して UI が固まる。
+    /// **回帰テスト** (主目的): 狭幅 window で cell_w が MIN_CELL_PX (32px) 未満になると、
+    /// `viewport_h / cell_h` が数千行に暴発して UI が固まるバグの再発検知。
     #[test]
     fn clamps_cell_w_to_min_when_window_too_narrow() {
-        // avail_w = 100, cols = 10 → naive 10px / cell。MIN_CELL_PX で 32 にクランプ。
         let (w, _) = compute_cell_size(100.0, 10, 1.0).expect("Some");
-        assert!(w >= MIN_CELL_PX, "cell_w を MIN_CELL_PX 未満にしてはいけない");
+        assert!(w >= MIN_CELL_PX);
         assert_eq!(w, MIN_CELL_PX);
     }
 
-    /// 同様: cell_h も MIN_CELL_PX 下限を守る。
-    /// height_ratio が極小 (0.1 等) でも cell_h は 32 以上。
     #[test]
     fn clamps_cell_h_to_min_when_aspect_ratio_extreme() {
         let (_, h) = compute_cell_size(800.0, 4, 0.05).expect("Some");
-        assert!(
-            h >= MIN_CELL_PX,
-            "extreme aspect でも cell_h は MIN_CELL_PX 以上"
-        );
         assert_eq!(h, MIN_CELL_PX);
     }
 
-    /// `cols = 0` は `cols.max(1)` で 1 に補正される (不正値防御)。
     #[test]
     fn cols_zero_falls_back_to_one() {
         let (w, _) = compute_cell_size(800.0, 0, 1.0).expect("Some");
-        assert_eq!(w, 800.0, "cols=0 は 1 と等価扱い");
+        assert_eq!(w, 800.0);
     }
 }

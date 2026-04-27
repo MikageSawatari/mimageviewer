@@ -779,26 +779,30 @@ fn main() {
     }
 
     // JSON 出力 (--json <path>): scripts/check_bench_regression.py が消費する。
-    // 1 行の JSON object: { "version": 1, "num_docs": N, "queries": { label: { total_ms, post_ms, hits } } }
+    // serde_json で書き出すことで、将来 label に非 ASCII / 引用符が入っても安全。
     if let Some(path) = json_out {
-        let mut buf = String::new();
-        buf.push_str(&format!(
-            "{{\"version\":1,\"num_docs\":{num_docs},\"queries\":{{",
-        ));
-        for (i, (label, total_ms, post_ms, hits)) in json_records.iter().enumerate() {
-            if i > 0 {
-                buf.push(',');
-            }
-            // label は ASCII (rare_jp 等) なのでそのまま埋める。
-            buf.push_str(&format!(
-                "\"{label}\":{{\"total_ms\":{total_ms:.3},\"post_ms\":{post_ms:.3},\"hits\":{hits}}}"
-            ));
+        let mut queries = serde_json::Map::new();
+        for (label, total_ms, post_ms, hits) in &json_records {
+            queries.insert(
+                label.clone(),
+                serde_json::json!({
+                    "total_ms": total_ms,
+                    "post_ms": post_ms,
+                    "hits": hits,
+                }),
+            );
         }
-        buf.push_str("}}\n");
+        let payload = serde_json::json!({
+            "version": 1,
+            "num_docs": num_docs,
+            "queries": queries,
+        });
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(&path, buf).expect("JSON 書き出し失敗");
+        let mut s = serde_json::to_string_pretty(&payload).expect("JSON 整形");
+        s.push('\n');
+        std::fs::write(&path, s).expect("JSON 書き出し失敗");
         println!("\nJSON 出力: {}", path.display());
     }
 }

@@ -254,20 +254,12 @@ impl TrayController {
 impl TrayController {
     /// テスト専用: 実トレイスレッドを起動せずに、atomic + channel だけ持つコントローラを
     /// 組み立てる。`set_paused_check` の atomic 即時更新セマンティクス検証用。
-    fn new_for_test() -> (Self, Receiver<TrayCommand>) {
+    /// 返り値の `Sender<TrayEvent>` は test 側で `_event_tx` として束縛しておくこと
+    /// (drop すると `event_rx` 側が disconnected になるが、テスト本体はチャネル受信を
+    /// しないので影響は無い。leak 回避目的で明示的に持つ)。
+    fn new_for_test() -> (Self, Receiver<TrayCommand>, Sender<TrayEvent>) {
         let (event_tx, event_rx) = bounded::<TrayEvent>(16);
-        // event_tx は keep し、test は event_rx 側を保持しない (Drop 時に shutdown 送信のみ)。
-        // event_tx を drop すると receiver 側 disconnected で受信時にエラーになるため keep。
-        std::mem::forget(event_tx);
         let (cmd_tx, cmd_rx) = bounded::<TrayCommand>(16);
-        Self::test_only_internal(event_rx, cmd_tx, cmd_rx)
-    }
-
-    fn test_only_internal(
-        event_rx: Receiver<TrayEvent>,
-        cmd_tx: Sender<TrayCommand>,
-        cmd_rx: Receiver<TrayCommand>,
-    ) -> (Self, Receiver<TrayCommand>) {
         let ctrl = Self {
             event_rx,
             cmd_tx,
@@ -276,7 +268,7 @@ impl TrayController {
             quit_flag: Arc::new(AtomicBool::new(false)),
             pause_checked: Arc::new(AtomicBool::new(false)),
         };
-        (ctrl, cmd_rx)
+        (ctrl, cmd_rx, event_tx)
     }
 }
 
@@ -597,7 +589,7 @@ mod tests {
     /// (= atomic store が同期的に終わっている)。
     #[test]
     fn set_paused_check_updates_atomic_synchronously_before_send() {
-        let (ctrl, cmd_rx) = TrayController::new_for_test();
+        let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
         assert!(
             !ctrl.pause_checked_snapshot(),
             "初期は false"
@@ -627,7 +619,7 @@ mod tests {
     /// 同じ値で 2 回叩いても冪等 (atomic への二重 store は無害、command 2 通は届く)。
     #[test]
     fn set_paused_check_is_idempotent_for_same_value() {
-        let (ctrl, cmd_rx) = TrayController::new_for_test();
+        let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
         ctrl.set_paused_check(true);
         ctrl.set_paused_check(true);
         assert!(ctrl.pause_checked_snapshot());

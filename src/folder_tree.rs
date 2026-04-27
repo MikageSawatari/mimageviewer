@@ -593,23 +593,13 @@ mod tests {
     // (`skip_zip_if_folder_exists`) の値に依らず決定的にする。
     // -----------------------------------------------------------------------
 
-    /// 深さ優先前順 (preorder) のシーケンスを root から完走させて確認する。
-    /// 構造:
+    /// 7 ノード DFS テスト用の共通フィクスチャ:
     /// ```
-    /// root/
-    ///   a/
-    ///     a1/
-    ///     a2/
-    ///   b/
-    ///   c/
-    ///     c1/
+    /// root/{a/{a1,a2}, b, c/{c1}}
     /// ```
-    /// 期待される next の連鎖: root → a → a1 → a2 → b → c → c1 → (None)
-    ///
-    /// 注意: `path_eq` はセパレータ正規化をしないので、テスト内のパス構築は
-    /// 段階 join (`.join("a").join("a1")`) で `\` セパレータに揃える。
-    #[test]
-    fn next_folder_dfs_preorder_traversal_full_chain() {
+    /// 段階 join (`.join("a").join("a1")`) で `\` セパレータに揃える
+    /// (`path_eq` はセパレータ正規化をしないため `.join("a/a1")` だと一致しない)。
+    fn build_seven_node_tree() -> (tempfile::TempDir, [PathBuf; 7]) {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let a = root.join("a");
@@ -621,8 +611,17 @@ mod tests {
         for d in [&a1, &a2, &b, &c1] {
             std::fs::create_dir_all(d).unwrap();
         }
+        (temp, [root, a, a1, a2, b, c, c1])
+    }
 
-        let order = [&a, &a1, &a2, &b, &c, &c1];
+    /// 深さ優先前順 (preorder) のシーケンスを root から完走させて確認する。
+    /// 期待される next の連鎖: root → a → a1 → a2 → b → c → c1 → (None)
+    #[test]
+    fn next_folder_dfs_preorder_traversal_full_chain() {
+        let (_temp, nodes) = build_seven_node_tree();
+        let [root, a, a1, a2, b, c, c1] = &nodes;
+
+        let order = [a, a1, a2, b, c, c1];
         let mut cur = root.clone();
         for expected in order {
             let next = next_folder_dfs(&cur).expect("next_folder_dfs Some");
@@ -638,7 +637,7 @@ mod tests {
         // あるので Some/None どちらでも許容して「少なくとも root 配下ではない」だけ保証)。
         if let Some(beyond) = next_folder_dfs(&cur) {
             assert!(
-                !beyond.starts_with(&root),
+                !beyond.starts_with(root),
                 "c1 から先は root より外に抜けるはず, got {:?}",
                 beyond
             );
@@ -649,19 +648,10 @@ mod tests {
     /// `next_folder_dfs` の正確な逆順を期待する (= round-trip 性質)。
     #[test]
     fn prev_folder_dfs_is_reverse_of_next_chain() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().join("root");
-        let a = root.join("a");
-        let a1 = a.join("a1");
-        let a2 = a.join("a2");
-        let b = root.join("b");
-        let c = root.join("c");
-        let c1 = c.join("c1");
-        for d in [&a1, &a2, &b, &c1] {
-            std::fs::create_dir_all(d).unwrap();
-        }
+        let (_temp, nodes) = build_seven_node_tree();
+        let [root, a, a1, a2, b, c, c1] = &nodes;
 
-        let chain = [&root, &a, &a1, &a2, &b, &c, &c1];
+        let chain = [root, a, a1, a2, b, c, c1];
         for w in chain.windows(2).rev() {
             let from = w[1];
             let expected_prev = w[0];

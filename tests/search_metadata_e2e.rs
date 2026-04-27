@@ -427,12 +427,14 @@ fn streaming_emits_batch_before_done() {
 
 /// 検索中に `cancel` を立てたら `Done { reason: Cancelled }` で終わること。
 /// SearchHandle の cancel 機構 (Drop で自動 set + 明示 set 両方) の回帰ガード。
+///
+/// note: 30 件で十分。200 件にしても cancel 検知タイミングは race なので
+/// `Cancelled | Complete` の OR で受けている。corpus を増やしても assert は強くならない。
 #[test]
 fn cancel_during_search_yields_cancelled_done() {
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
-    // 大量のヒットを準備して検索が瞬時に終わらないようにする。
-    for i in 0..200 {
+    for i in 0..30 {
         write_png_with_text(
             &root.path().join(format!("doc_{i:03}.png")),
             "lightning storm at midnight",
@@ -445,7 +447,7 @@ fn cancel_during_search_yields_cancelled_done() {
         &mgr,
         "lightning",
         &[fav.id],
-        |h| h.len() >= 50,
+        |h| h.len() >= 5,
         FS_EVENT_TIMEOUT,
         "cancel test: 索引反映",
     );
