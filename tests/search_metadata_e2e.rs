@@ -364,15 +364,19 @@ fn empty_favorite_list_returns_complete() {
 // を別ビルドの統合テストとして固定する。
 // -----------------------------------------------------------------------
 
-/// 検索ヒットが **複数 Batch** に分かれて Done 前にストリーミング到着すること、
-/// あるいは少なくとも 1 つは Batch が `Done` 前に来ること。
-/// (ここで `Done` の payload に hits がぶら下がる退行が入ると、UI 側の
-/// streaming rebuild ロジック自体が呼ばれなくなり selected 維持テストの前提が崩れる。)
+/// 検索ヒットが `Done` の **前に** Batch event として流れること (= UI 側の
+/// streaming rebuild ロジックが呼ばれる経路が生きている)。`Done` の payload に
+/// hits がぶら下がる退行が入ると、`accumulate_hit` / `replace_search_view_items`
+/// が一切走らず selected 維持テストの前提が崩れる。
+///
+/// 注意: corpus は 12 件 (PAGE_SIZE=500 未満) なので 1 Batch で完結する。
+/// **「複数 Batch でストリーミングする」**性質は本テストでは検証していない
+/// (HARD_MAX 以下のヒット数は 1 Batch にまとまる仕様)。multi-batch の paging を
+/// 守りたければ別途 docs ≥ PAGE_SIZE の重いテストを追加する必要がある。
 #[test]
-fn streaming_emits_batch_before_done() {
+fn search_hits_arrive_as_batch_event_before_done() {
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
-    // クエリ "sunset" にヒットする画像を 12 枚置く。post-filter を通る。
     for i in 0..12 {
         write_png_with_text(
             &root.path().join(format!("photo_{i:02}.png")),
@@ -383,16 +387,13 @@ fn streaming_emits_batch_before_done() {
     let mgr = start_indexer_at(data.path(), &[fav.clone()]);
     wait_scan_done(&mgr, fav.id);
 
-    // 索引が反映されるまで待つ。`wait_for_search_hits` は完了を待つだけなので
-    // ここで使うと streaming 性質を観察できない。代わりに hits が 12 件に
-    // 揃うまで polling し、その後で streaming 検証用の手動 spawn_search に切り替える。
     wait_for_search_hits(
         &mgr,
         "sunset",
         &[fav.id],
         |h| h.len() >= 12,
         FS_EVENT_TIMEOUT,
-        "streaming_emits_batch_before_done: 索引反映",
+        "search_hits_arrive_as_batch: 索引反映",
     );
 
     let handle = mgr.spawn_search(
@@ -420,18 +421,18 @@ fn streaming_emits_batch_before_done() {
     }
     assert!(
         batches_before_done >= 1,
-        "Done の前に少なくとも 1 つの Batch が流れること (got {batches_before_done})"
+        "Done の前に少なくとも 1 つの Batch event が流れること (got {batches_before_done})"
     );
-    assert_eq!(total_hits, 12, "Batch 内累積で全 12 件届くこと");
+    assert_eq!(total_hits, 12, "Batch 累積で全 12 件届くこと");
 }
 
-/// 検索中に `cancel` を立てたら `Done { reason: Cancelled }` で終わること。
-/// SearchHandle の cancel 機構 (Drop で自動 set + 明示 set 両方) の回帰ガード。
-///
-/// note: 30 件で十分。200 件にしても cancel 検知タイミングは race なので
-/// `Cancelled | Complete` の OR で受けている。corpus を増やしても assert は強くならない。
+/// 検索中に `cancel` を立てた後、有限時間で正常 (Error/disconnect ではなく) `Done` に
+/// 到達して terminate すること。Cancelled 状態の即時観測は race (Tantivy が先に
+/// Complete することがある) なので、ここでは "cancel 後も protocol が壊れない" だけを
+/// honest に検証する。SearchHandle の Drop 経路 / 明示 cancel 経路の両方で
+/// rx が必ず Done でクローズされる契約のガード。
 #[test]
-fn cancel_during_search_yields_cancelled_done() {
+fn cancel_after_spawn_terminates_with_done_event() {
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
     for i in 0..30 {
@@ -457,8 +458,6 @@ fn cancel_during_search_yields_cancelled_done() {
         vec![fav.id],
         mimageviewer::global_search::SearchScope::default(),
     );
-    // 即 cancel を立てる。実装によっては Done が Complete で先に来るレースもありうるが、
-    // どちらの DoneReason が来るかを robustly assert する。
     handle
         .cancel
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -471,17 +470,17 @@ fn cancel_during_search_yields_cancelled_done() {
         }
         match handle.rx.recv_timeout(remaining) {
             Ok(SearchStreamEvent::Done { reason, .. }) => {
-                // 検索量が小さくて先に Complete してしまうレースを許容しつつ、
-                // 「cancel が立っているのに RejectedQuery / Error が返る」のは退行。
+                // Cancelled / Complete どちらも protocol 上 valid。
+                // RejectedQuery が出たら退行 (cancel 立てただけでクエリ自体は valid)。
                 assert!(
-                    matches!(reason, DoneReason::Cancelled | DoneReason::Complete),
-                    "cancel 経路では Cancelled か (raceで先に終われば) Complete のみ許容、got {reason:?}"
+                    !matches!(reason, DoneReason::RejectedQuery(_)),
+                    "cancel した有効クエリで RejectedQuery が返る退行、got {reason:?}"
                 );
                 break;
             }
             Ok(SearchStreamEvent::Error(e)) => panic!("error during cancel: {e}"),
             Ok(SearchStreamEvent::Batch { .. }) => continue,
-            Err(_) => panic!("rx disconnected"),
+            Err(_) => panic!("rx disconnected before Done"),
         }
     }
 }

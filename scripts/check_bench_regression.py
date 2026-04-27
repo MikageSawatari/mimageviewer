@@ -73,14 +73,33 @@ def main() -> int:
     failures: list[str] = []
     warnings: list[str] = []
 
+    def numeric_total_ms(record: dict, label: str, side: str) -> float | None:
+        """`total_ms` が float として取れない (missing / 非数値 / NaN / Inf) ならエラー扱い。"""
+        if "total_ms" not in record:
+            failures.append(f"  {side}.{label}: total_ms フィールドが無い")
+            return None
+        try:
+            v = float(record["total_ms"])
+        except (TypeError, ValueError):
+            failures.append(f"  {side}.{label}: total_ms が数値ではない ({record['total_ms']!r})")
+            return None
+        # NaN / Inf は JSON 仕様上は無効、Python は読み込めるが比較で罠になる。
+        import math
+        if math.isnan(v) or math.isinf(v):
+            failures.append(f"  {side}.{label}: total_ms が NaN/Inf")
+            return None
+        return v
+
     for label, base_v in base_q.items():
         if label not in cur_q:
-            warnings.append(f"  - 新測定に存在しないクエリ: {label}")
+            failures.append(f"  - 新測定に存在しないクエリ: {label} (bench_search 出力が壊れている疑い)")
             continue
-        b = float(base_v.get("total_ms", 0.0))
-        c = float(cur_q[label].get("total_ms", 0.0))
+        b = numeric_total_ms(base_v, label, "baseline")
+        c = numeric_total_ms(cur_q[label], label, "current")
+        if b is None or c is None:
+            continue
         if b <= 0.0:
-            warnings.append(f"  - {label}: baseline=0ms (skip)")
+            warnings.append(f"  - {label}: baseline=0ms 以下 (skip)")
             continue
         delta_pct = (c - b) / b * 100.0
         marker = "OK"
@@ -88,7 +107,7 @@ def main() -> int:
             marker = "REGRESSION"
             failures.append(f"  {label}: baseline={b:.1f}ms current={c:.1f}ms (+{delta_pct:.1f}%)")
         elif delta_pct < -args.threshold:
-            marker = "FASTER"  # 速くなった分は通知のみ (baseline 更新候補)
+            marker = "FASTER"  # baseline 更新候補
         print(f"{marker:11s}  {label:20s}  baseline={b:7.2f}ms  current={c:7.2f}ms  ({delta_pct:+6.1f}%)")
 
     for label in cur_q:
@@ -101,7 +120,7 @@ def main() -> int:
             print(w)
 
     if failures:
-        print(f"\n=== 回帰 {len(failures)} 件 (閾値 +{args.threshold}%) ===")
+        print(f"\n=== 失敗 {len(failures)} 件 (閾値 +{args.threshold}% / 欠落/不正値含む) ===")
         for f in failures:
             print(f)
         return 1

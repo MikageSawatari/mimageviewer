@@ -969,7 +969,50 @@ mod tests {
         drop(handle);
     }
 
-    // NOTE: cancel 経路の `in_full_scan` 観測は SupervisorHandle drop 後に stats Arc
-    // の参照経路が無くなるため直接 assert できない。`drop_during_long_scan_cancels_cleanly`
-    // が join 完了を保証 (= RAII ガードが必ず drop される) ので、それで十分とみなす。
+    /// cancel 経路でも RAII guard が drop されて `in_full_scan` が false に戻ること。
+    /// `stats` Arc を handle drop の前に clone することで、handle 経由 API が無くても
+    /// 直接観測する (Codex P3 指摘: drop_during_long_scan_cancels_cleanly は join
+    /// 完了を保証するだけで in_full_scan の値は見ていなかった)。
+    #[test]
+    fn in_full_scan_resets_to_false_after_cancel() {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let fav_root = tmp.path().join("cancel_scan_guard");
+        fs::create_dir_all(&fav_root).unwrap();
+        for i in 0..50 {
+            write_image(&fav_root, &format!("img_{:03}.jpg", i));
+        }
+
+        let handle = spawn(
+            SupervisorParams {
+                favorite_id: Uuid::new_v4(),
+                favorite_root: fav_root,
+                enable_metadata_index: true,
+            },
+            meta,
+            fts,
+            writer,
+            sem,
+            gate,
+        );
+        // handle drop 後も観測できるよう stats Arc を事前に clone。
+        let stats_arc = Arc::clone(&handle.stats);
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let t0 = Instant::now();
+        drop(handle);
+        let join_elapsed = t0.elapsed();
+        assert!(
+            join_elapsed < Duration::from_secs(5),
+            "cancel + join に時間がかかりすぎ: {:?}",
+            join_elapsed
+        );
+
+        // join 完了 = supervisor thread 終了 = InFullScanGuard も drop 済み。
+        let in_full_scan = stats_arc.lock().unwrap().in_full_scan;
+        assert!(
+            !in_full_scan,
+            "cancel 経路でも RAII guard が drop されて in_full_scan=false に戻る"
+        );
+    }
 }
