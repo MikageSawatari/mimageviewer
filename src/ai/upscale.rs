@@ -24,21 +24,24 @@ const TILE_SIZE: u32 = 192;
 /// スクリーントーン等の規則的パターンで境界が目立たないよう、十分な幅を確保。
 const TILE_OVERLAP: u32 = 32;
 
-/// モデルごとの最適タイルサイズ (RTX 4090 + DirectML で実測、`bench_ai --tile-size` 参照)。
+/// モデルごとの最適タイルサイズ (RTX 4090 で実測、`bench_ai --tile-size` 参照)。
 ///
 /// - 固定入力サイズのモデルはそのサイズでしか動かない (例: RealPLKSR 256)。
 /// - それ以外のモデルは本来任意サイズで動くが、ONNX ランタイム/GPU の実行効率が
-///   特定サイズでピークになる。実測結果は概ね 192 が最適だったが、
-///   軽量モデルの `UpscaleRealEsrGeneralV3` のみ 512 の方が 18% 速い
-///   (タイル当たり GPU 処理が短くカーネル起動オーバーヘッドが支配的なため、
-///    大タイル化で起動回数を 1/8 に減らすと効果が大きい)。
-///   画質差は平均 0.06/255、p99.9 ≤ 2/255 で実質同等。
-fn model_tile_size(kind: ModelKind) -> u32 {
-    match kind {
-        // RealPLKSR は 256x256 固定入力
-        ModelKind::DenoiseRealplksr => 256,
+///   特定サイズでピークになる。
+/// - DirectML: per-call overhead が super-linear に増えるため 192 が最適 (軽量
+///   モデル UpscaleRealEsrGeneralV3 のみ 512 で 18% 高速)。
+/// - TensorRT: per-tile inference が sub-linear なので 256 が最適 (anime6b 大画像で
+///   tile 192 1719ms → tile 256 994ms = 1.73x 高速、bench_ai 計測値)。
+fn model_tile_size(kind: ModelKind, backend: super::AiBackend) -> u32 {
+    match (kind, backend) {
+        // RealPLKSR は 256x256 固定入力 (バックエンドに依らない)
+        (ModelKind::DenoiseRealplksr, _) => 256,
         // 軽量モデル: 大タイルで GPU カーネル起動オーバーヘッドを削減
-        ModelKind::UpscaleRealEsrGeneralV3 => 512,
+        (ModelKind::UpscaleRealEsrGeneralV3, _) => 512,
+        // TensorRT は大タイルが効く (per-tile overhead 削減 + GPU 飽和)
+        (_, super::AiBackend::TensorRt) => 256,
+        // DirectML / CPU は 192 (DirectML 256 はかえって遅い)
         _ => TILE_SIZE,
     }
 }
@@ -97,7 +100,7 @@ fn detect_scale_factor(runtime: &AiRuntime, model_kind: ModelKind) -> Result<u32
         return Ok(scale);
     }
 
-    let test_size = model_tile_size(model_kind) as usize;
+    let test_size = model_tile_size(model_kind, runtime.active_backend().effective) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
     let tensor =
         ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
@@ -161,7 +164,8 @@ pub fn upscale_with_timings(
     let out_w = in_w * scale;
     let out_h = in_h * scale;
 
-    let tile_size = tile_size_override.unwrap_or_else(|| model_tile_size(model_kind));
+    let tile_size = tile_size_override
+        .unwrap_or_else(|| model_tile_size(model_kind, runtime.active_backend().effective));
 
     crate::logger::log(format!(
         "[AI] Upscaling {}x{} → {}x{} ({}x) with {:?}, tile={}px overlap={}px",

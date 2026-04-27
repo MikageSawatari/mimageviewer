@@ -391,11 +391,18 @@ impl AiRuntime {
             .min(WORKSPACE_CAP_BYTES)
             .max(512 * 1024 * 1024); // 最低 512 MiB
 
+        // builder optimization level 5 (最高) で engine をビルドする。
+        // 初回コンパイル時間は default(3) より長くなるが、生成された engine は
+        // 最大 +10-20% 速い。エンジンはキャッシュされ 2 回目以降は瞬時ロードなので
+        // ビルド時間ペナルティは初回のみ。実測 anime6b で 994ms → 951ms (5% 改善)。
+        const TRT_BUILDER_OPT_LEVEL: u8 = 5;
+
         crate::logger::log(format!(
-            "[AI] TRT EP options: cache_path={}, fp16={}, workspace={} MiB",
+            "[AI] TRT EP options: cache_path={}, fp16={}, workspace={} MiB, builder_opt_level={}",
             cache_dir.display(),
             self.tensorrt_fp16,
-            workspace_bytes / (1024 * 1024)
+            workspace_bytes / (1024 * 1024),
+            TRT_BUILDER_OPT_LEVEL
         ));
 
         let trt = ort::ep::TensorRT::default()
@@ -403,6 +410,7 @@ impl AiRuntime {
             .with_engine_cache_path(cache_dir.to_string_lossy().to_string())
             .with_fp16(self.tensorrt_fp16)
             .with_max_workspace_size(workspace_bytes)
+            .with_builder_optimization_level(TRT_BUILDER_OPT_LEVEL)
             .build();
         let cuda = ort::ep::CUDA::default().build();
         match builder.with_execution_providers([trt, cuda]) {
