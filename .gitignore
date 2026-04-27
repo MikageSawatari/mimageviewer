@@ -13,3 +13,7 @@ bench_thumbs.tsv
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
 /.claude/
 /codex-review*.md
+# Benchmark output (scripts/bench-overnight.ps1)
+/bench_results/
+# TensorRT pack DL cache (scripts/setup-tensorrt-pack.ps1)
+/vendor/tensorrt-cache/
