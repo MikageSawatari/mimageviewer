@@ -2233,20 +2233,16 @@ impl App {
                         // 外部プレイヤーで開きたい場合は Shift+Enter。
                         // ただし下部 HUD バーの矩形内のクリックは play/pause / シーク /
                         // 音量等のウィジェット側で処理させたいので除外する。
-                        if fs_response.clicked() {
-                            let in_hud = fs_response
-                                .interact_pointer_pos()
-                                .map(|p| video_hud_rect(full_rect).contains(p))
-                                .unwrap_or(false);
-                            if !in_hud {
-                                if let Some(idx) = self.fullscreen_idx {
-                                    if let Some(FsCacheEntry::Video { player, .. }) =
-                                        self.fs_cache.get(&idx)
-                                    {
-                                        player.toggle_play();
-                                    }
-                                }
-                            }
+                        let in_hud = fs_response
+                            .interact_pointer_pos()
+                            .map(|p| video_hud_rect(full_rect).contains(p))
+                            .unwrap_or(false);
+                        if fs_response.clicked()
+                            && !in_hud
+                            && let Some(idx) = self.fullscreen_idx
+                            && let Some(p) = self.fs_video_player(idx)
+                        {
+                            p.toggle_play();
                         }
                     } else if fs_response.clicked() {
                         // ポップアップ表示中はクリックでのページ送りを抑制
@@ -3800,6 +3796,17 @@ fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     );
 }
 
+/// 動画 HUD のボタン (play/pause / mute) の hover ハイライト。
+/// hovered = true で薄い半透明白、false で透明。
+fn draw_hud_button_bg(painter: &egui::Painter, rect: egui::Rect, hovered: bool) {
+    let bg = if hovered {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 4.0, bg);
+}
+
 /// 動画 HUD のミュート/音量アイコン (台形 + 三角の波形 or 斜線)。
 /// `muted = true` のとき波形を描かず斜線で「×」を入れる。
 fn draw_speaker_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, muted: bool) {
@@ -4493,6 +4500,15 @@ impl App {
 // ===========================================================================
 
 impl App {
+    /// 現在 `fs_idx` のキャッシュエントリが動画なら `&VideoPlayer` を返す。
+    /// HUD 各ウィジェットの click handler / 上位の toggle_play で使う。
+    pub(crate) fn fs_video_player(&self, fs_idx: usize) -> Option<&crate::video::VideoPlayer> {
+        match self.fs_cache.get(&fs_idx)? {
+            FsCacheEntry::Video { player, .. } => Some(player),
+            _ => None,
+        }
+    }
+
     /// 動画再生時のキー入力を処理する。フルスクリーン中で `state.is_video` のときに
     /// 1 フレームに 1 回呼ぶ。
     pub(crate) fn handle_video_input(
@@ -4615,8 +4631,8 @@ impl App {
 
     /// 動画再生時のホバー HUD を描画する。下部 44px に play/pause / seek bar /
     /// mute / volume slider を配置し、それぞれ独立した `ui.interact` でクリック・
-    /// ドラッグを処理する。HUD 領域に当たるクリックは [`Self::video_hud_consumed_click`]
-    /// で `handle_fs_wheel_and_click` 側の toggle_play から除外する。
+    /// ドラッグを処理する。HUD 領域に当たるクリックは `video_hud_rect` 経由で
+    /// `handle_fs_wheel_and_click` 側の toggle_play から除外する。
     pub(crate) fn draw_video_hud(
         &mut self,
         ui: &mut egui::Ui,
@@ -4641,10 +4657,9 @@ impl App {
         // ── エラー表示 ──
         if let Some(err) = has_error {
             let painter = ui.painter();
-            let font = egui::FontId::proportional(20.0);
             let galley = painter.layout_no_wrap(
                 format!("動画を再生できません: {err}"),
-                font.clone(),
+                egui::FontId::proportional(20.0),
                 egui::Color32::from_rgb(255, 120, 120),
             );
             let pos = full_rect.center() - galley.size() / 2.0;
@@ -4661,10 +4676,9 @@ impl App {
         // ── まだ最初のフレームが届いていない: 中央にスピナー ──
         if !has_texture {
             let painter = ui.painter();
-            let font = egui::FontId::proportional(18.0);
             let galley = painter.layout_no_wrap(
                 "動画を準備中...".to_string(),
-                font,
+                egui::FontId::proportional(18.0),
                 egui::Color32::WHITE,
             );
             let pos = full_rect.center() - galley.size() / 2.0;
@@ -4679,7 +4693,8 @@ impl App {
 
         // ── 下部 HUD バー ──
         let hud_rect = video_hud_rect(full_rect);
-        ui.painter().rect_filled(
+        let painter = ui.painter().clone();
+        painter.rect_filled(
             hud_rect,
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
@@ -4689,8 +4704,10 @@ impl App {
         let pad = 8.0;
         let btn_size = 28.0;
         let cy = hud_rect.center().y;
+        let time_font = egui::FontId::proportional(14.0);
+        let label_font = egui::FontId::proportional(13.0);
 
-        // 1. 再生 / 一時停止ボタン
+        // ── 再生 / 一時停止 ボタン ──
         let play_rect = egui::Rect::from_min_size(
             egui::pos2(hud_rect.min.x + pad, cy - btn_size / 2.0),
             egui::vec2(btn_size, btn_size),
@@ -4700,59 +4717,47 @@ impl App {
             egui::Id::new(("video_play", fs_idx)),
             egui::Sense::click(),
         );
-        let play_hover = play_resp.hovered();
-        ui.painter().rect_filled(
-            play_rect,
-            4.0,
-            if play_hover {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
-            } else {
-                egui::Color32::TRANSPARENT
-            },
-        );
+        draw_hud_button_bg(&painter, play_rect, play_resp.hovered());
         if is_playing {
-            draw_pause_icon(ui.painter(), play_rect.center(), btn_size * 0.32);
+            draw_pause_icon(&painter, play_rect.center(), btn_size * 0.32);
         } else {
-            draw_play_triangle(ui.painter(), play_rect.center(), btn_size * 0.4);
+            draw_play_triangle(&painter, play_rect.center(), btn_size * 0.4);
         }
-        if play_resp.clicked() {
-            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.toggle_play();
-            }
+        if play_resp.clicked()
+            && let Some(p) = self.fs_video_player(fs_idx)
+        {
+            p.toggle_play();
         }
 
-        // 2. 時刻表示
+        // ── 時刻表示 ──
         let time_text = format!(
             "{} / {}",
             format_secs(position),
             format_secs(duration.max(position)),
         );
-        let time_font = egui::FontId::proportional(14.0);
-        let time_galley = ui.painter()
-            .layout_no_wrap(time_text, time_font, egui::Color32::WHITE);
+        let time_galley = painter.layout_no_wrap(time_text, time_font, egui::Color32::WHITE);
         let time_w = time_galley.size().x;
-        let time_pos = egui::pos2(play_rect.max.x + pad, cy - time_galley.size().y / 2.0);
-        ui.painter()
-            .galley(time_pos, time_galley, egui::Color32::WHITE);
+        let time_h = time_galley.size().y;
+        let time_pos = egui::pos2(play_rect.max.x + pad, cy - time_h / 2.0);
+        painter.galley(time_pos, time_galley, egui::Color32::WHITE);
 
-        // 6. 音量 % (右端)。
-        // 表示テキストの幅で右端アンカーを動かすと「100% → 99% → 100%」遷移で
-        // mute / slider / seek bar が震える。常に "100%" 分の幅を確保して固定する。
-        let vol_pct_font = egui::FontId::proportional(13.0);
-        let vol_pct_max_w = ui.painter()
-            .layout_no_wrap("100%".to_string(), vol_pct_font.clone(), egui::Color32::WHITE)
-            .size()
-            .x;
+        // ── 音量 % (右端、レイアウトのみ — テキストは最後に上に重ねて描く) ──
+        // 幅は常に "100%" 分を予約し、% 桁数変化で隣接ウィジェットが震えないようにする。
+        // VOL_PCT_MAX_W は 13pt の "100%" 実測幅 (~26-28px、日本語プロポーショナル
+        // フォント込みの幅変動を見越して余裕を取った値)。これより広い幅になっても
+        // 右側にはみ出すだけで隣接ウィジェットには影響しないが、これより狭いと
+        // 99% などで右にずれて見えるので保守的に大きめにする。
+        const VOL_PCT_MAX_W: f32 = 36.0;
         let vol_pct_text = format!("{:>3}%", (volume * 100.0).round() as i32);
-        let vol_pct_galley = ui.painter()
-            .layout_no_wrap(vol_pct_text, vol_pct_font, egui::Color32::WHITE);
-        let vol_pct_block_x = hud_rect.max.x - pad - vol_pct_max_w;
+        let vol_pct_galley =
+            painter.layout_no_wrap(vol_pct_text, label_font.clone(), egui::Color32::WHITE);
+        let vol_pct_block_x = hud_rect.max.x - pad - VOL_PCT_MAX_W;
         let vol_pct_pos = egui::pos2(
-            vol_pct_block_x + (vol_pct_max_w - vol_pct_galley.size().x), // 右寄せ
+            vol_pct_block_x + (VOL_PCT_MAX_W - vol_pct_galley.size().x), // 右寄せ
             cy - vol_pct_galley.size().y / 2.0,
         );
 
-        // 5. 音量スライダー (vol_pct ブロックの左、スライダーも上下にクリック判定を広げる)
+        // ── 音量スライダー rect (描画 / 入力は下) ──
         let vol_slider_w = 90.0;
         let vol_slider_rect = egui::Rect::from_min_max(
             egui::pos2(vol_pct_block_x - pad - vol_slider_w, cy - 4.0),
@@ -4760,15 +4765,15 @@ impl App {
         );
         let vol_hit_rect = vol_slider_rect.expand2(egui::vec2(0.0, 10.0));
 
-        // 4. ミュートアイコン (vol slider の左)
+        // ── ミュートアイコン rect (描画 / 入力は下) ──
         let mute_rect = egui::Rect::from_min_size(
             egui::pos2(vol_slider_rect.min.x - pad - btn_size, cy - btn_size / 2.0),
             egui::vec2(btn_size, btn_size),
         );
 
-        // 3. シークバー (time text 〜 mute icon の間)
-        // hit_rect: 視覚的なバーは細いが、クリック判定は HUD 全高に広げる。
-        // hover 時は target 位置に縦線を出してフィードバック、target 時刻を上に表示。
+        // ── シークバー (描画 + 入力) ──
+        // hit_rect は HUD 全高に広げてクリックしやすくする。視覚的なバーは細いまま。
+        // hover 時は target 位置に縦線 + 上に時刻ラベルを出す。
         let seek_x0 = time_pos.x + time_w + pad * 2.0;
         let seek_x1 = mute_rect.min.x - pad;
         if seek_x1 > seek_x0 + 20.0 {
@@ -4780,95 +4785,79 @@ impl App {
                 egui::pos2(seek_x0, hud_rect.min.y),
                 egui::pos2(seek_x1, hud_rect.max.y),
             );
-            ui.painter().rect_filled(bar_rect, 2.0, egui::Color32::from_gray(80));
+            painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(80));
             if duration > 0.0 {
                 let progress = (position / duration).clamp(0.0, 1.0) as f32;
                 let filled = egui::Rect::from_min_max(
                     bar_rect.min,
                     egui::pos2(bar_rect.min.x + bar_rect.width() * progress, bar_rect.max.y),
                 );
-                ui.painter()
-                    .rect_filled(filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
+                painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
             }
             let seek_resp = ui.interact(
                 hit_rect,
                 egui::Id::new(("video_seek", fs_idx)),
                 egui::Sense::click_and_drag(),
             );
-            // hover カーソルを「左右リサイズ」風にしてシーク可能であることを示す
             if seek_resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
-            // hover 中: 縦線 + ホバー位置の時刻ラベル
-            if seek_resp.hovered() && duration > 0.0 {
-                if let Some(p) = ui.ctx().input(|i| i.pointer.hover_pos()) {
-                    let x = p.x.clamp(bar_rect.min.x, bar_rect.max.x);
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(x, hud_rect.min.y + 4.0),
-                            egui::pos2(x, hud_rect.max.y - 4.0),
-                        ],
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 120)),
-                    );
-                    // 時刻ラベル (HUD 上端の少し上に黒背景 + 白文字で)
-                    let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0) as f64;
-                    let target = frac * duration;
-                    let label = format_secs(target);
-                    let font = egui::FontId::proportional(13.0);
-                    let galley = ui.painter()
-                        .layout_no_wrap(label, font, egui::Color32::WHITE);
-                    let label_size = galley.size();
-                    let label_pos = egui::pos2(
-                        (x - label_size.x / 2.0)
-                            .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - label_size.x - 2.0),
-                        hud_rect.min.y - label_size.y - 6.0,
-                    );
-                    let bg = egui::Rect::from_min_size(label_pos, label_size).expand(4.0);
-                    ui.painter().rect_filled(
-                        bg,
-                        3.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
-                    );
-                    ui.painter()
-                        .galley(label_pos, galley, egui::Color32::WHITE);
-                }
+            // hover プレビュー: 縦線 + 時刻ラベル
+            if seek_resp.hovered()
+                && duration > 0.0
+                && let Some(hp) = ui.ctx().input(|i| i.pointer.hover_pos())
+            {
+                let x = hp.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                painter.line_segment(
+                    [
+                        egui::pos2(x, hud_rect.min.y + 4.0),
+                        egui::pos2(x, hud_rect.max.y - 4.0),
+                    ],
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 120)),
+                );
+                let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0) as f64;
+                let label = format_secs(frac * duration);
+                let galley = painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
+                let label_size = galley.size();
+                let label_pos = egui::pos2(
+                    (x - label_size.x / 2.0)
+                        .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - label_size.x - 2.0),
+                    hud_rect.min.y - label_size.y - 6.0,
+                );
+                let bg = egui::Rect::from_min_size(label_pos, label_size).expand(4.0);
+                painter.rect_filled(
+                    bg,
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                );
+                painter.galley(label_pos, galley, egui::Color32::WHITE);
             }
-            if (seek_resp.clicked() || seek_resp.dragged()) && duration > 0.0 {
-                if let Some(pos) = seek_resp.interact_pointer_pos() {
-                    let frac = ((pos.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                    let target = frac as f64 * duration;
-                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                        player.seek(target);
-                    }
-                }
+            if (seek_resp.clicked() || seek_resp.dragged())
+                && duration > 0.0
+                && let Some(pp) = seek_resp.interact_pointer_pos()
+                && let Some(p) = self.fs_video_player(fs_idx)
+            {
+                let frac = ((pp.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                p.seek(frac as f64 * duration);
             }
         }
 
-        // 4. ミュートボタン描画 + 入力
+        // ── ミュートボタン (描画 + 入力) ──
         let mute_resp = ui.interact(
             mute_rect,
             egui::Id::new(("video_mute", fs_idx)),
             egui::Sense::click(),
         );
-        ui.painter().rect_filled(
-            mute_rect,
-            4.0,
-            if mute_resp.hovered() {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
-            } else {
-                egui::Color32::TRANSPARENT
-            },
-        );
-        draw_speaker_icon(ui.painter(), mute_rect.center(), btn_size * 0.55, muted);
-        if mute_resp.clicked() {
-            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.set_muted(!muted);
-            }
+        draw_hud_button_bg(&painter, mute_rect, mute_resp.hovered());
+        draw_speaker_icon(&painter, mute_rect.center(), btn_size * 0.55, muted);
+        if mute_resp.clicked()
+            && let Some(p) = self.fs_video_player(fs_idx)
+        {
+            p.set_muted(!muted);
         }
 
-        // 5. 音量スライダー描画 + 入力
-        ui.painter()
-            .rect_filled(vol_slider_rect, 2.0, egui::Color32::from_gray(80));
+        // ── 音量スライダー (描画 + 入力) ──
+        painter.rect_filled(vol_slider_rect, 2.0, egui::Color32::from_gray(80));
         let vol_filled = egui::Rect::from_min_max(
             vol_slider_rect.min,
             egui::pos2(
@@ -4876,8 +4865,7 @@ impl App {
                 vol_slider_rect.max.y,
             ),
         );
-        ui.painter()
-            .rect_filled(vol_filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
+        painter.rect_filled(vol_filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
         let vol_resp = ui.interact(
             vol_hit_rect,
             egui::Id::new(("video_vol", fs_idx)),
@@ -4886,20 +4874,19 @@ impl App {
         if vol_resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
-        if vol_resp.clicked() || vol_resp.dragged() {
-            if let Some(pos) = vol_resp.interact_pointer_pos() {
-                let frac = ((pos.x - vol_slider_rect.min.x) / vol_slider_rect.width())
-                    .clamp(0.0, 1.0) as f64;
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.set_volume(frac);
-                }
-                self.settings.video_volume = frac;
+        if (vol_resp.clicked() || vol_resp.dragged())
+            && let Some(pp) = vol_resp.interact_pointer_pos()
+        {
+            let frac = ((pp.x - vol_slider_rect.min.x) / vol_slider_rect.width())
+                .clamp(0.0, 1.0) as f64;
+            if let Some(p) = self.fs_video_player(fs_idx) {
+                p.set_volume(frac);
             }
+            self.settings.video_volume = frac;
         }
 
-        // 6. 音量 % テキスト (一番最後に描画 = 上に乗せる)
-        ui.painter()
-            .galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
+        // ── 音量 % テキスト (一番最後に描画 = 上に乗せる) ──
+        painter.galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
     }
 }
 
