@@ -96,7 +96,19 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- Pre-flight: tag must not already exist ---------------------------------
-$existing = gh release view $Tag --repo $Repo --json tagName 2>$null
+# `gh release view` exits 1 and writes "release not found" to stderr when the
+# release does not exist. In Windows PowerShell 5.1, redirecting a native
+# command's stderr (`2>$null`) wraps each line as a NativeCommandError, which
+# under `$ErrorActionPreference = 'Stop'` becomes a terminating error and
+# aborts the script. Wrap the call in try/catch so "not found" is treated as
+# the expected happy path for a fresh upload.
+$existing = $null
+try {
+    $existing = gh release view $Tag --repo $Repo --json tagName 2>$null
+}
+catch {
+    $existing = $null
+}
 if ($LASTEXITCODE -eq 0 -and $existing) {
     Write-Host ''
     Write-Warning "$Tag already exists. Aborting (would conflict)."
