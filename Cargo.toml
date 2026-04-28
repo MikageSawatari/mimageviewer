@@ -3,7 +3,7 @@ members = ["crates/susie-worker", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
@@ -18,6 +18,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Threading",
@@ -56,7 +57,7 @@ turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
 base64 = "0.22"
-ort = { version = "2.0.0-rc.12", features = ["directml", "load-dynamic"] }
+ort = { version = "2.0.0-rc.12", features = ["directml", "cuda", "tensorrt", "load-dynamic"] }
 ndarray = "0.17"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。

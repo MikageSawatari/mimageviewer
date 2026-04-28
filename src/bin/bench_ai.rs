@@ -23,7 +23,31 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use mimageviewer::ai::upscale::UpscaleTimings;
-use mimageviewer::ai::{ModelKind, model_manager, runtime::AiRuntime, upscale};
+use mimageviewer::ai::{AiBackend, ModelKind, model_manager, runtime::AiRuntime, upscale};
+use serde_json::json;
+
+/// 1 (image, model, tile_size) 組み合わせ分の集約結果。後で JSON サマリに出す。
+#[derive(Debug, Clone)]
+struct BenchRecord {
+    image: String,
+    image_w: u32,
+    image_h: u32,
+    model: String,
+    tile_size: u32,
+    n_tiles: usize,
+    runs: usize,
+    /// 全ラン平均の wall total (ms)
+    wall_total_avg_ms: f64,
+    wall_total_min_ms: f64,
+    wall_total_max_ms: f64,
+    wall_total_stddev_ms: f64,
+    /// per-tile 平均の infer 時間 (ms)
+    infer_avg_ms: f64,
+    /// per-tile 平均の session_run (GPU 計算 + 転送) 時間 (ms)
+    session_run_avg_ms: f64,
+    /// per-tile 平均の blend 時間 (ms)
+    blend_avg_ms: f64,
+}
 
 const DEFAULT_IMAGES: &[&str] = &[
     "testimage/うちのこ/ComfyUI_2_0003.png",
@@ -52,6 +76,15 @@ struct Args {
     /// 出力された ColorImage を PNG として保存するディレクトリ (画質目視比較用)。
     /// ファイル名: <image_stem>__<model>__tile<N>.png
     save_output: Option<PathBuf>,
+    /// AI バックエンド (DirectML / TensorRT / CPU)。
+    /// TensorRT は %APPDATA%/mimageviewer/tensorrt/ に pack が展開されている前提。
+    backend: AiBackend,
+    /// JSON 形式のサマリ出力先 (--json /path/to/file.json)。
+    /// 後で複数バックエンド/モデルの結果を比較しやすくするため。
+    json_output: Option<PathBuf>,
+    /// `--legacy-direct-trt`: Phase 2 の旧挙動 (main プロセスで直接 TRT ロード、
+    /// worker 不使用) で実行する。Phase 3 と Phase 2 のパフォーマンス比較用。
+    legacy_direct_trt: bool,
 }
 
 fn parse_args() -> Args {
@@ -62,6 +95,9 @@ fn parse_args() -> Args {
     let mut warmup: usize = 1;
     let mut tile_sizes: Vec<u32> = Vec::new();
     let mut save_output: Option<PathBuf> = None;
+    let mut backend: AiBackend = AiBackend::DirectMl;
+    let mut json_output: Option<PathBuf> = None;
+    let mut legacy_direct_trt: bool = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -102,6 +138,22 @@ fn parse_args() -> Args {
                 i += 1;
                 save_output = Some(PathBuf::from(&raw[i]));
             }
+            "--backend" => {
+                i += 1;
+                backend = AiBackend::from_str(&raw[i]).unwrap_or_else(|| {
+                    panic!(
+                        "unknown backend: {} (expected: directml, tensorrt, cpu)",
+                        &raw[i]
+                    )
+                });
+            }
+            "--json" => {
+                i += 1;
+                json_output = Some(PathBuf::from(&raw[i]));
+            }
+            "--legacy-direct-trt" => {
+                legacy_direct_trt = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -125,6 +177,9 @@ fn parse_args() -> Args {
         warmup,
         tile_sizes,
         save_output,
+        backend,
+        json_output,
+        legacy_direct_trt,
     }
 }
 
@@ -141,6 +196,11 @@ fn print_help() {
     println!("                          model_tile_size). Fixed-size models may fail.");
     println!("  --save-output <DIR>     Save the last measured run's output PNG per");
     println!("                          (image, model, tile_size) for visual comparison.");
+    println!("  --backend <NAME>        AI backend: directml (default), tensorrt, cpu");
+    println!("                          tensorrt requires the pack to be installed at");
+    println!("                          %APPDATA%/mimageviewer/tensorrt/ (run scripts/setup-tensorrt-pack.ps1)");
+    println!("  --json <PATH>           Write a JSON summary of all (image,model,tile) results");
+    println!("                          for later cross-backend comparison");
     println!("  --help, -h              Show this help\n");
     println!("Model names:");
     println!("  realesrgan_x4plus, realesrgan_anime6b, realesr_general_v3,");
@@ -148,6 +208,9 @@ fn print_help() {
 }
 
 fn main() {
+    // ロガー初期化 (DLL preload 等の診断ログを %APPDATA%/mimageviewer/logs/ に出す)
+    mimageviewer::logger::init();
+
     let args = parse_args();
 
     println!("bench_ai");
@@ -159,13 +222,78 @@ fn main() {
     for (label, _) in &args.models {
         println!("    - {}", label);
     }
-    println!("  warmup: {}", args.warmup);
-    println!("  runs:   {}", args.runs);
+    println!("  warmup:  {}", args.warmup);
+    println!("  runs:    {}", args.runs);
+    println!("  backend: {}", args.backend.as_str());
+    if args.backend == AiBackend::TensorRt {
+        println!("    fp16:  on (hardcoded、画質劣化は知覚不能、1.5-2x 高速化)");
+    }
     println!();
 
     model_manager::ensure_models_extracted();
     let mm = model_manager::ModelManager::new();
-    let runtime = AiRuntime::new().expect("AiRuntime::new");
+
+    // Phase 3 アーキテクチャ: メインは常に DirectML、TRT は別プロセスのワーカー。
+    // --legacy-direct-trt 時のみ、Phase 2 互換で main で直接 TRT を init する。
+    // (Phase 3 vs Phase 2 のパフォーマンス比較用)
+    let runtime = if args.legacy_direct_trt && args.backend == AiBackend::TensorRt {
+        println!("[legacy] AiRuntime::new_with_backend(TensorRt) — main で直接 TRT 初期化");
+        AiRuntime::new_with_backend(AiBackend::TensorRt)
+            .expect("AiRuntime::new_with_backend(TensorRt) [legacy]")
+    } else {
+        AiRuntime::new_with_backend(AiBackend::DirectMl)
+            .expect("AiRuntime::new_with_backend(DirectMl)")
+    };
+    let runtime = std::sync::Arc::new(runtime);
+
+    if args.backend == AiBackend::TensorRt && !args.legacy_direct_trt {
+        // bench_ai は別 bin なので current_exe() は bench_ai.exe を返す。
+        // ワーカーは mimageviewer.exe (--tensorrt-infer-worker subcommand を持つ
+        // バイナリ) でなければならないため、sibling の mimageviewer.exe を指す。
+        let bench_exe = std::env::current_exe().expect("current_exe");
+        let main_exe = bench_exe
+            .parent()
+            .map(|d| d.join("mimageviewer.exe"))
+            .expect("sibling path");
+        if !main_exe.exists() {
+            eprintln!(
+                "ERROR: ワーカー用 mimageviewer.exe が見つからない: {}",
+                main_exe.display()
+            );
+            eprintln!("  cargo build --release でメインバイナリも一緒にビルドしてから再実行してください。");
+            std::process::exit(1);
+        }
+        println!("Spawning TRT worker pool (sync, worker={})...", main_exe.display());
+        let t0 = std::time::Instant::now();
+        match mimageviewer::ai::trt_worker_pool::TrtWorkerPool::start_with_exe(&main_exe) {
+            Ok(pool) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                println!("  worker pool ready in {elapsed:.2} s");
+                runtime.attach_worker_pool(std::sync::Arc::new(pool));
+            }
+            Err(e) => {
+                eprintln!("ERROR: failed to start TRT worker pool: {e}");
+                eprintln!("  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/.");
+                eprintln!("  Run scripts/setup-tensorrt-pack.ps1 to install it, then retry.");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let active = runtime.active_backend();
+    println!(
+        "AiRuntime ready (main backend: requested={:?}, effective={:?}, dll={})",
+        active.requested,
+        active.effective,
+        active.dll_path.display()
+    );
+    if runtime.has_worker_pool() {
+        println!("  TRT worker pool: attached (Upscale/Denoise route to worker)");
+    }
+    if let Some(reason) = &active.fallback_reason {
+        println!("  fallback reason: {}", reason);
+    }
+    println!();
 
     // 先に全モデルをロード (セッション初期化コストを計測対象外にする)
     for (label, model) in &args.models {
@@ -180,6 +308,9 @@ fn main() {
     println!();
 
     let cancel = Arc::new(AtomicBool::new(false));
+
+    // JSON 出力用に全レコードを集める
+    let mut records: Vec<BenchRecord> = Vec::new();
 
     for img_path in &args.images {
         let img = match image::open(img_path) {
@@ -271,19 +402,53 @@ fn main() {
                     Some(n) => format!("{} (override)", n),
                     None => String::from("default"),
                 };
-                print_model_summary(label, *model, &runs_timings, &ts_label);
+                let mut rec = print_model_summary(label, *model, &runs_timings, &ts_label);
+                rec.image = img_path.display().to_string();
+                records.push(rec);
                 println!();
             }
         }
     }
+
+    // JSON サマリ出力 (--json 指定時)
+    if let Some(path) = &args.json_output {
+        let summary = json!({
+            "backend": args.backend.as_str(),
+            "tensorrt_fp16": args.backend == AiBackend::TensorRt,
+            "warmup": args.warmup,
+            "runs": args.runs,
+            "records": records.iter().map(|r| json!({
+                "image": r.image,
+                "image_w": r.image_w,
+                "image_h": r.image_h,
+                "model": r.model,
+                "tile_size": r.tile_size,
+                "n_tiles": r.n_tiles,
+                "runs": r.runs,
+                "wall_total_avg_ms": r.wall_total_avg_ms,
+                "wall_total_min_ms": r.wall_total_min_ms,
+                "wall_total_max_ms": r.wall_total_max_ms,
+                "wall_total_stddev_ms": r.wall_total_stddev_ms,
+                "infer_avg_ms": r.infer_avg_ms,
+                "session_run_avg_ms": r.session_run_avg_ms,
+                "blend_avg_ms": r.blend_avg_ms,
+            })).collect::<Vec<_>>(),
+        });
+        match std::fs::write(path, serde_json::to_string_pretty(&summary).unwrap()) {
+            Ok(()) => println!("JSON summary written: {}", path.display()),
+            Err(e) => eprintln!("Failed to write JSON summary {}: {}", path.display(), e),
+        }
+    }
 }
 
+/// `print_model_summary` で出力したサマリの主要数値を BenchRecord として返す。
+/// `image_*` と `model` は呼び出し側で詰める (ここでは UpscaleTimings からは取れない)。
 fn print_model_summary(
     label: &str,
     _model: ModelKind,
     runs: &[UpscaleTimings],
     tile_size_label: &str,
-) {
+) -> BenchRecord {
     let n_runs = runs.len();
     let sample = &runs[0];
     let n_tiles = sample.tiles.len();
@@ -432,6 +597,23 @@ fn print_model_summary(
         ci95,
         totals.len()
     );
+
+    BenchRecord {
+        image: String::new(),  // 呼び出し側で詰める
+        image_w: in_w,
+        image_h: in_h,
+        model: label.to_string(),
+        tile_size,
+        n_tiles,
+        runs: n_runs,
+        wall_total_avg_ms: mean,
+        wall_total_min_ms: min_t,
+        wall_total_max_ms: max_t,
+        wall_total_stddev_ms: stddev,
+        infer_avg_ms: avg_infer,
+        session_run_avg_ms: avg_srun,
+        blend_avg_ms: avg_blend,
+    }
 }
 
 /// egui::ColorImage を PNG として保存する (RGBA8)。

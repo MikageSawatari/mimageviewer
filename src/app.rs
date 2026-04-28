@@ -1858,6 +1858,26 @@ pub struct App {
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)。フルスクリーン / グリッド共通。
     /// 命名の `fs_` プレフィックスはフルスクリーン専用だった頃の名残。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
+    /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
+    /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
+    /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
+    /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
+    pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    /// セッション中に worker 死亡 → 自動再起動を試みた回数。
+    /// `MAX_TRT_AUTO_RESTART_ATTEMPTS` 回まで silent に再 spawn して、それを超えたら
+    /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
+    /// ためのガード)。
+    pub(crate) trt_auto_restart_attempts: u32,
+    /// 自動再起動が現在進行中か (= spawn_trt_worker_pool の background thread が
+    /// 起動中で、まだ attach も failure 通知もしていない状態)。
+    /// 並行する複数の AI 推論が同じ「死亡」イベントを観測したときに 2 重 spawn を
+    /// 防ぐためのガード (Codex P2 指摘)。spawn 完了 (attach 成功 or 失敗通知) で
+    /// false に戻す。
+    pub(crate) trt_restart_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// TRT pack のオンラインインストールダイアログの状態。
+    /// Some の間ダイアログが表示され、worker thread が動作している。
+    /// 閉じる (Drop) と worker は cancel される。
+    pub(crate) trt_install_state: Option<crate::ui_dialogs::trt_install::TrtInstallState>,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の画像でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -2382,6 +2402,10 @@ impl Default for App {
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
+            trt_worker_notice: None,
+            trt_auto_restart_attempts: 0,
+            trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trt_install_state: None,
             fs_boundary_hint: None,
 
             // 消しゴムモード
@@ -9964,19 +9988,164 @@ impl App {
         }
     }
 
+    /// AI バックエンド設定変更をホットリロードする (Phase 3、再起動不要)。
+    ///
+    /// 引数 `new_backend_str`: 新しい設定値 (`"directml"` / `"tensorrt"` / `"cpu"` / None)。
+    ///
+    /// 動作:
+    /// - TensorRT に変わった: TrtWorkerPool を spawn して runtime に attach
+    /// - TensorRT から DirectML に戻った: 既存の worker pool を detach (子プロセスは
+    ///   Drop で shutdown される)
+    /// - 同じ → 何もしない
+    pub(crate) fn apply_ai_backend_change(&mut self, new_backend_str: Option<&str>) {
+        let Some(runtime) = self.ai_runtime.as_ref() else {
+            crate::logger::log("[AI] runtime 未初期化のためバックエンド変更はスキップ".to_string());
+            return;
+        };
+        let want_trt = new_backend_str
+            .and_then(crate::ai::AiBackend::from_str)
+            == Some(crate::ai::AiBackend::TensorRt);
+        let has_trt = runtime.has_worker_pool();
+
+        match (want_trt, has_trt) {
+            (true, false) => {
+                crate::logger::log(
+                    "[AI] AI バックエンド変更: → TensorRT (worker pool 起動)".to_string(),
+                );
+                Self::spawn_trt_worker_pool(runtime);
+            }
+            (false, true) => {
+                crate::logger::log(
+                    "[AI] AI バックエンド変更: → DirectML (worker pool 停止)".to_string(),
+                );
+                runtime.detach_worker_pool();
+            }
+            _ => {
+                // 変更なし (TRT pack 未インストール等で TRT を選んでも spawn 失敗、
+                // または同じ設定値) — ログのみ
+                crate::logger::log(format!(
+                    "[AI] AI バックエンド変更: state 変化なし (want_trt={want_trt}, has_trt={has_trt})"
+                ));
+            }
+        }
+    }
+
     /// AI ランタイムとモデルマネージャを遅延初期化する。
+    ///
+    /// Phase 3 アーキテクチャ:
+    /// - メイン: 常に DirectML で AiRuntime を作る (`ai_backend` 設定値に依らない)
+    /// - 設定が TensorRt: 別プロセス TrtWorkerPool を起動して runtime に attach
+    ///   (失敗時は DirectML のみで動作、UI で通知)
     pub(crate) fn ensure_ai_runtime(&mut self) {
         if self.ai_runtime.is_none() {
-            match crate::ai::runtime::AiRuntime::new() {
+            // 常に DirectML で起動 (Phase 3)
+            match crate::ai::runtime::AiRuntime::new_with_backend(
+                crate::ai::AiBackend::DirectMl,
+            ) {
                 Ok(rt) => {
-                    self.ai_runtime = Some(std::sync::Arc::new(rt));
-                    crate::logger::log("[AI] Runtime initialized".to_string());
+                    let active = rt.active_backend();
+                    crate::logger::log(format!(
+                        "[AI] Runtime initialized (DirectML always in main, requested={:?}, effective={:?})",
+                        active.requested, active.effective
+                    ));
+                    let runtime_arc = std::sync::Arc::new(rt);
+
+                    // 設定が TRT のとき、子プロセスでワーカープールを起動して attach
+                    let want_trt = self
+                        .settings
+                        .ai_backend
+                        .as_deref()
+                        .and_then(crate::ai::AiBackend::from_str)
+                        == Some(crate::ai::AiBackend::TensorRt);
+                    if want_trt {
+                        Self::spawn_trt_worker_pool(&runtime_arc);
+                    }
+
+                    self.ai_runtime = Some(runtime_arc);
                 }
                 Err(e) => {
                     crate::logger::log(format!("[AI] Runtime init failed: {e}"));
                 }
             }
         }
+    }
+
+    /// TRT ワーカープールをバックグラウンドで起動して runtime に attach する。
+    ///
+    /// 起動には ORT init + DLL preload + ハンドシェイクで数秒かかるので、
+    /// メインスレッドで同期実行すると UI が固まる。`std::thread::spawn` で
+    /// 別スレッドに逃がし、起動完了したら attach する。
+    ///
+    /// 起動失敗時は AiRuntime は DirectML のままで動作続行し、ログにエラーを残す。
+    ///
+    /// **多重 spawn ガード**: `App.trt_restart_in_flight` を CAS で立てる。
+    /// 既に立っていたら早期 return (= 別の spawn が進行中)。worker 死亡時に
+    /// 並行する複数の AI 推論が同じ DiedDuringInfer を観測しても 1 回しか
+    /// 新 pool を起こさない (Codex P2 指摘)。
+    pub(crate) fn spawn_trt_worker_pool(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+    ) {
+        Self::spawn_trt_worker_pool_inner(runtime, /* guard = */ None);
+    }
+
+    /// `spawn_trt_worker_pool` の guard 付き版。worker 死亡時の自動再起動から
+    /// 呼ぶ際に使う (= 複数の死亡通知が並行して走る場合の多重 spawn を防ぐ)。
+    pub(crate) fn spawn_trt_worker_pool_guarded(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+        guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        Self::spawn_trt_worker_pool_inner(runtime, Some(guard));
+    }
+
+    fn spawn_trt_worker_pool_inner(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+        guard: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        // CAS: false → true。すでに in-flight なら true のままで、ここは false 戻り → skip。
+        if let Some(g) = guard.as_ref() {
+            if g.compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+            {
+                crate::logger::log(
+                    "[AI] TRT worker pool 起動はすでに進行中、新規 spawn を skip".to_string(),
+                );
+                return;
+            }
+        }
+        let runtime_for_thread = runtime.clone();
+        let guard_for_thread = guard;
+        std::thread::Builder::new()
+            .name("trt-worker-spawn".to_string())
+            .spawn(move || {
+                crate::logger::log(
+                    "[AI] TRT worker pool バックグラウンド起動を試行中...".to_string(),
+                );
+                match crate::ai::trt_worker_pool::TrtWorkerPool::start() {
+                    Ok(pool) => {
+                        runtime_for_thread.attach_worker_pool(std::sync::Arc::new(pool));
+                        crate::logger::log(
+                            "[AI] TRT worker pool 起動成功、attach 完了".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        // 起動失敗 (TRT pack 不在 / engine 不整合 / DLL ロード失敗 等)。
+                        // DirectML で動作続行するが、UI に通知して気付かせる
+                        // (Phase 3 Step 5)。ログだけだとユーザーが「なぜ TRT に
+                        // ならないか」を追えない。
+                        runtime_for_thread.report_worker_spawn_failed(e);
+                    }
+                }
+                // spawn 試行が完了 (success / failure 両方) → guard を解放。
+                if let Some(g) = guard_for_thread {
+                    g.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .ok();
     }
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
@@ -9997,9 +10166,24 @@ impl App {
         }
 
         for key in disconnected {
+            // cancel フラグが立っているなら「ユーザー操作によるキャンセル」であり、
+            // 真の失敗ではない。failed に登録すると次回以降の upscale が永久に
+            // 起動しなくなる (start_ai_upscale_pending が failed を見て早期 return)。
+            //
+            // 連続モデル切替で worker mutex キューが詰まっているとき、新しい
+            // 要求が前の要求を cancel → 前の thread がキューから取り出されて
+            // 1 タイル走った後に cancel 検知 → 結果送らず disconnect、というパターンで
+            // ここに来ると idx が誤って永久 failed になる (Apr 28 のユーザー報告)。
+            let was_cancelled = self
+                .ai_upscale_pending
+                .get(&key)
+                .map(|(cancel, _)| cancel.load(Ordering::Relaxed))
+                .unwrap_or(false);
             self.ai_upscale_pending.remove(&key);
-            // スレッドが結果を送らずに終了 = 失敗。リトライを防止する。
-            self.ai_upscale_failed.insert(key);
+            if !was_cancelled {
+                // 真の失敗 (panic / ORT エラー等) のみ failed に登録してリトライ防止
+                self.ai_upscale_failed.insert(key);
+            }
         }
 
         let repaint = !completed.is_empty();
@@ -10096,16 +10280,35 @@ impl App {
                     .copied()
                     .collect();
                 for k in to_cancel {
-                    if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
-                        cancel.store(true, Ordering::Relaxed);
-                        crate::logger::log(format!(
-                            "[AI] Cancelled prefetch {:?} to prioritize current {:?}",
-                            k, cur_key
-                        ));
+                    // **cancel フラグだけ立てて pending entry は残す**。worker は次の
+                    // tile boundary で cancel を見て Err(Cancelled) を返す (= channel
+                    // disconnect → poll_ai_upscale で silent remove)。
+                    // ただし最後の tile が完了直前ならそのまま Ok で返ることもあり、
+                    // その場合 tx.send で結果が rx に届く → cache に保存される。
+                    // (Apr 29: 高速スクロール時に最後の tile 完了直後で entry を remove
+                    // していたため Ok 結果が捨てられて、戻り再訪時にアップスケールが
+                    // 効かない問題があった)。
+                    if let Some((cancel, _)) = self.ai_upscale_pending.get(&k) {
+                        if !cancel.load(Ordering::Relaxed) {
+                            cancel.store(true, Ordering::Relaxed);
+                            crate::logger::log(format!(
+                                "[AI] Cancelled prefetch {:?} to prioritize current {:?}",
+                                k, cur_key
+                            ));
+                        }
                     }
                 }
             }
-            if !self.ai_upscale_pending.is_empty() {
+            // 「pending に何か残っている → 新規 spawn しない」のガード。
+            // ただしキャンセル済み entry は既に終わりに向かっているので新規 spawn の
+            // 妨げにしない (= 1〜数 ms のオーバーラップを許可)。これにより上の
+            // 「Cancelled prefetch」で entry を残したままでも新しい current_idx の
+            // upscale を即時開始できる。
+            let has_active_pending = self
+                .ai_upscale_pending
+                .values()
+                .any(|(cancel, _)| !cancel.load(Ordering::Relaxed));
+            if has_active_pending {
                 return;
             }
         }
@@ -10329,7 +10532,10 @@ impl App {
             .cloned()
             .collect();
         for k in to_cancel {
-            if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
+            // **cancel フラグだけ立てて pending entry は残す** (= worker が完了寸前
+            // なら Ok の結果が rx 経由で届いて cache に保存される)。entry 自体は
+            // poll_ai_upscale が channel disconnect を見たときに削除する。
+            if let Some((cancel, _)) = self.ai_upscale_pending.get(&k) {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
@@ -12644,6 +12850,12 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
+        // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
+        // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
+        self.poll_trt_worker_notice();
+        self.show_trt_worker_notice_dialog(ctx);
+        // TRT pack オンラインインストールダイアログ (環境設定から起動)。
+        self.show_trt_install_dialog(ctx);
         self.show_stats_dialog_window(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);

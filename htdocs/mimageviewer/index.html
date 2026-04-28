@@ -523,6 +523,12 @@
       元のファイルを書き換えずにマスクで補修でき、いつでも元の状態に戻せます。
     </p>
     <p>
+      標準は DirectML で全 DirectX 12 対応 GPU で動きますが、NVIDIA GeForce RTX 30 / 40 / 50 シリーズ
+      利用時は環境設定から <strong>TensorRT バックエンド</strong>に切り替えることで AI 処理を大幅に
+      高速化できます（アップスケール 1.4〜3.4 倍、ノイズ除去 約 4.5 倍）。専用ランタイム (約 2.2 GB) は
+      ボタン 1 つで自動ダウンロードされ、アプリの再起動なしですぐ有効になります。
+    </p>
+    <p>
       旧来の 32bit ビューワー「ViX」にインスパイアされ、現代の環境に合わせて Rust でゼロから実装しました。
     </p>
   </section>
@@ -816,7 +822,7 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v0.8.2</div>
+        <div class="version">mImageViewer v0.9.0</div>
         <div class="meta">Windows 10 / 11（64bit）</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">

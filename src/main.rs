@@ -122,6 +122,32 @@ fn main() -> eframe::Result {
         std::process::exit(0);
     }
 
+    // --tensorrt-build <model_kind> モード: TensorRT エンジンビルダーワーカー。
+    // 親プロセス (GUI) から子プロセスとして起動され、指定モデルを TRT EP で
+    // load_model することで engine cache を populate する。stdout に進捗 JSON。
+    if std::env::args().any(|a| a == ai::tensorrt_builder::TRT_BUILD_ARG) {
+        // data_dir 初期化が必要 (engine cache path や DLL extract で使う)
+        data_dir::init();
+        ai::tensorrt_builder::run_worker_process();
+    }
+
+    // --tensorrt-infer-worker モード: TensorRT 推論ワーカー (Phase 3)。
+    // 親プロセス (GUI、DirectML 動作) から子プロセスとして起動され、stdin で
+    // コマンドを受けて TRT セッションで推論を実行、共有メモリで結果を返す。
+    // ホットリロード時の再起動なしバックエンド切替を実現するための分離。
+    if ai::trt_worker_runtime::is_worker_invocation() {
+        data_dir::init();
+        ai::trt_worker_runtime::run_infer_worker();
+    }
+
+    // --trt-smoke-test モード: TRT ワーカープール起動の動作確認用 (開発者向け)。
+    // current_exe() が正しく mimageviewer.exe を返すため、本体に組み込んでいる。
+    if std::env::args().any(|a| a == "--trt-smoke-test") {
+        data_dir::init();
+        logger::init();
+        run_trt_smoke_test();
+    }
+
     // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
     // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
     // ダイアログ自動連携も兼ねる (`single_instance::MUTEX_NAME` 参照)。
@@ -307,6 +333,72 @@ fn main() -> eframe::Result {
 }
 
 /// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。
+/// `--trt-smoke-test` 用の開発者向け動作確認関数。
+/// TRT ワーカープールが spawn → ハンドシェイク → load_model → shutdown を
+/// 一通り実行できるかを確認する。完了で exit 0、失敗で exit 1。
+fn run_trt_smoke_test() -> ! {
+    println!("[smoke] TrtWorkerPool::start()");
+    let pool = match ai::trt_worker_pool::TrtWorkerPool::start() {
+        Ok(p) => {
+            println!("[smoke] start OK");
+            p
+        }
+        Err(e) => {
+            eprintln!("[smoke] start failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let test_kinds = [
+        ai::ModelKind::DenoiseRealplksr,
+        ai::ModelKind::UpscaleRealEsrganAnime6B,
+    ];
+    for kind in test_kinds {
+        println!("[smoke] LoadModel {:?}", kind);
+        match pool.load_model(kind) {
+            Ok(ms) => println!("[smoke] LoadModel {:?} OK in {ms} ms", kind),
+            Err(e) => {
+                eprintln!("[smoke] LoadModel {:?} failed: {e}", kind);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Step 2 検証: 実際に Infer を 1 回流して、入出力 shape と f32 値の
+    // 妥当性を確認する。
+    println!("[smoke] Infer (anime6b, 256x256 zero tile) ...");
+    let dummy_input = ndarray::Array4::<f32>::zeros((1, 3, 256, 256));
+    let t_infer = std::time::Instant::now();
+    match pool.infer(ai::ModelKind::UpscaleRealEsrganAnime6B, &dummy_input) {
+        Ok((shape, out)) => {
+            let elapsed = t_infer.elapsed().as_millis();
+            let expected_total = shape.iter().product::<i64>() as usize;
+            println!(
+                "[smoke] Infer OK in {elapsed} ms, output shape={shape:?}, len={} (expected {expected_total})",
+                out.len()
+            );
+            if out.len() != expected_total {
+                eprintln!("[smoke] FAIL: output len mismatch");
+                std::process::exit(1);
+            }
+            // ゼロ入力の anime6b 出力は数値的にゼロ近傍のはず。
+            // 値域 [0,1] (× 255 で 0-255 にスケール) で大きく外れていないかチェック。
+            let min = out.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!("[smoke]   output value range: [{min:.4}, {max:.4}]");
+        }
+        Err(e) => {
+            eprintln!("[smoke] Infer failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    println!("[smoke] shutdown (Drop)");
+    drop(pool);
+    println!("[smoke] all OK");
+    std::process::exit(0);
+}
+
 fn parse_window_size_arg() -> Option<[f32; 2]> {
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len().saturating_sub(1) {

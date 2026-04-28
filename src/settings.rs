@@ -714,6 +714,16 @@ pub struct Settings {
     #[serde(default = "default_ai_denoise_skip_px")]
     pub ai_denoise_skip_px: u32,
 
+    /// AI バックエンド (Execution Provider グループ)
+    /// None = DirectML (デフォルト)、"directml" / "tensorrt" / "cpu"
+    /// 値は AiBackend::as_str() の文字列。バックエンド切り替えはアプリ再起動が必要。
+    #[serde(default)]
+    pub ai_backend: Option<String>,
+
+    // 注: ai_tensorrt_fp16 フィールドは廃止。FP16 はランタイム側で常時 ON
+    // (画質劣化は知覚不能、1.5-2x 高速化のメリットが大きい)。古い settings.json に
+    // 残っているフィールドは serde の default で無視される。
+
     // ── グローバルプリセット ──────────────────────────────────────
     /// グローバルプリセット (0キー)。全フォルダ共通の補正設定。
     #[serde(default)]
@@ -973,6 +983,7 @@ impl Default for Settings {
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
             ai_upscale_skip_px: default_ai_upscale_skip_px(),
             ai_denoise_skip_px: default_ai_denoise_skip_px(),
+            ai_backend: None,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             sidecar_backup_enabled: true,

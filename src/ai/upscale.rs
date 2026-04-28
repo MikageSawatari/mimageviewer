@@ -24,21 +24,41 @@ const TILE_SIZE: u32 = 192;
 /// スクリーントーン等の規則的パターンで境界が目立たないよう、十分な幅を確保。
 const TILE_OVERLAP: u32 = 32;
 
-/// モデルごとの最適タイルサイズ (RTX 4090 + DirectML で実測、`bench_ai --tile-size` 参照)。
+/// `model_tile_size` に渡すべきバックエンド種別を解決する。
+///
+/// Phase 3 アーキテクチャではメイン runtime は常に DirectML だが、TRT
+/// ワーカーへルーティングされるモデルでは TRT 用 tile size (256) を使うべき。
+/// `active_backend().effective` だけ見ると DirectML になってしまい、TRT 用
+/// engine cache (256) が使えず再コンパイルが走るので、ここで dispatch を
+/// 反映する。
+fn effective_backend_for_tile(runtime: &AiRuntime, kind: ModelKind) -> super::AiBackend {
+    if runtime.should_route_to_worker(kind) {
+        super::AiBackend::TensorRt
+    } else {
+        runtime.active_backend().effective
+    }
+}
+
+/// モデルごとの最適タイルサイズ (RTX 4090 で実測、`bench_ai --tile-size` 参照)。
 ///
 /// - 固定入力サイズのモデルはそのサイズでしか動かない (例: RealPLKSR 256)。
 /// - それ以外のモデルは本来任意サイズで動くが、ONNX ランタイム/GPU の実行効率が
-///   特定サイズでピークになる。実測結果は概ね 192 が最適だったが、
-///   軽量モデルの `UpscaleRealEsrGeneralV3` のみ 512 の方が 18% 速い
-///   (タイル当たり GPU 処理が短くカーネル起動オーバーヘッドが支配的なため、
-///    大タイル化で起動回数を 1/8 に減らすと効果が大きい)。
-///   画質差は平均 0.06/255、p99.9 ≤ 2/255 で実質同等。
-fn model_tile_size(kind: ModelKind) -> u32 {
-    match kind {
-        // RealPLKSR は 256x256 固定入力
-        ModelKind::DenoiseRealplksr => 256,
+///   特定サイズでピークになる。
+/// - DirectML: per-call overhead が super-linear に増えるため 192 が最適 (軽量
+///   モデル UpscaleRealEsrGeneralV3 のみ 512 で 18% 高速)。
+/// - TensorRT: 256 が最適 (192/384/512 をスイープして比較。256 比 384 は +20-47%、
+///   512 は +11-44% 遅い)。原因は L2 キャッシュ飽和と TRT のカーネル最適化が
+///   power-of-2 単位 (256) でピークになる特性。per-pixel 時間で見ても 256 が
+///   最小なので、画像が大きくなっても 256 優位は維持される (4K/8K でも検証済み)。
+fn model_tile_size(kind: ModelKind, backend: super::AiBackend) -> u32 {
+    match (kind, backend) {
+        // RealPLKSR は 256x256 固定入力 (バックエンドに依らない)
+        (ModelKind::DenoiseRealplksr, _) => 256,
         // 軽量モデル: 大タイルで GPU カーネル起動オーバーヘッドを削減
-        ModelKind::UpscaleRealEsrGeneralV3 => 512,
+        (ModelKind::UpscaleRealEsrGeneralV3, _) => 512,
+        // TensorRT は大タイルが効く (per-tile overhead 削減 + GPU 飽和)
+        (_, super::AiBackend::TensorRt) => 256,
+        // DirectML / CPU は 192 (DirectML 256 はかえって遅い)
         _ => TILE_SIZE,
     }
 }
@@ -97,7 +117,7 @@ fn detect_scale_factor(runtime: &AiRuntime, model_kind: ModelKind) -> Result<u32
         return Ok(scale);
     }
 
-    let test_size = model_tile_size(model_kind) as usize;
+    let test_size = model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind)) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
     let tensor =
         ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
@@ -161,7 +181,8 @@ pub fn upscale_with_timings(
     let out_w = in_w * scale;
     let out_h = in_h * scale;
 
-    let tile_size = tile_size_override.unwrap_or_else(|| model_tile_size(model_kind));
+    let tile_size = tile_size_override
+        .unwrap_or_else(|| model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind)));
 
     crate::logger::log(format!(
         "[AI] Upscaling {}x{} → {}x{} ({}x) with {:?}, tile={}px overlap={}px",
@@ -298,11 +319,16 @@ pub fn upscale_with_timings(
                 }
 
                 let tile_t0 = std::time::Instant::now();
-                let tile_input = extract_tile(&rgb, tile);
+                // 不完全 tile (img < tile_size のケース) でも tile_size 固定 shape の
+                // テンソルを作る (= TRT engine の固定 shape プロファイルに合わせる)。
+                let tile_input = extract_tile(&rgb, tile, tile_size);
+                // 出力 crop 寸法: 実 tile サイズ × scale。pad 領域は捨てる。
+                let crop_w = (tile.w * scale) as usize;
+                let crop_h = (tile.h * scale) as usize;
                 let t_infer_begin = std::time::Instant::now();
                 let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
                 let (tile_out, breakdown) =
-                    match run_tile_inference(runtime, model_kind, tile_input) {
+                    match run_tile_inference(runtime, model_kind, tile_input, crop_w, crop_h) {
                         Ok(out) => out,
                         Err(e) => {
                             drop(tx);
@@ -467,11 +493,32 @@ fn compute_tiles(img_w: u32, img_h: u32, tile_size: u32, overlap: u32) -> Vec<Ti
     tiles
 }
 
-fn extract_tile(rgb: &image::RgbImage, tile: &TileRect) -> ndarray::Array4<f32> {
+/// `extract_tile` 第 3 引数: `tile_size` (= 物理 tile サイズ、tile.w/.h より大きいことがある)。
+/// 画像端の不完全 tile (= img_w/h < tile_size のとき発生) でも、テンソルは常に
+/// `tile_size × tile_size` の形状で生成し、不足領域はゼロ詰めする。
+///
+/// なぜ必要か (Apr 29 ユーザー報告):
+///   pre-built TRT engine は warmup shape (例: 512×512) で固定されている。
+///   640×480 画像を tile_size=512 で処理すると th=480 の不完全 tile が出来、
+///   shape (1,3,480,512) でセッション実行 → engine と不一致 → TRT が再 build を
+///   試みるが pack に builder_resource が無いため `TensorRT EP failed to create
+///   engine from network` エラー。常に shape を tile_size に揃えれば回避できる。
+///
+/// 出力テンソルの不要領域 (tile.w..tile_size の右端、tile.h..tile_size の下端) は
+/// 後段の `build_tile_output` で `tile.w * scale × tile.h * scale` に crop して
+/// 捨てるので、最終画像には混入しない。pad は zero (= 黒)。
+fn extract_tile(
+    rgb: &image::RgbImage,
+    tile: &TileRect,
+    tile_size: u32,
+) -> ndarray::Array4<f32> {
+    let canvas = tile_size as usize;
     let tw = tile.w as usize;
     let th = tile.h as usize;
-    let mut tensor = ndarray::Array4::<f32>::zeros((1, 3, th, tw));
+    debug_assert!(tw <= canvas && th <= canvas, "tile larger than tile_size");
+    let mut tensor = ndarray::Array4::<f32>::zeros((1, 3, canvas, canvas));
 
+    // 実データ領域 (左上 [0..th, 0..tw]) を埋める。残りは zeros のまま。
     for dy in 0..th {
         for dx in 0..tw {
             let px = rgb.get_pixel(tile.x + dx as u32, tile.y + dy as u32);
@@ -500,66 +547,123 @@ struct InferBreakdown {
     post_copy_ms: f64,
 }
 
+/// 出力 raw f32 (model 出力、値域 [0,1]) と shape から TileOutput を構築する。
+/// 戻り値は (TileOutput, post_copy_ms)。
+///
+/// NCHW 形式の input で、ch < 3 のときは残り channel を 0 のままにする。
+///
+/// `crop_w` / `crop_h` は出力テンソル (`raw`) を上から **crop_w × crop_h** に切り出す
+/// (= extract_tile が tile_size 固定で zero-pad した不要領域を捨てる)。
+/// 通常は `dims[3]` / `dims[2]` をそのまま使うが、入力を pad した場合は呼び出し側で
+/// `tile.w * scale` / `tile.h * scale` を渡す。
+fn build_tile_output(
+    raw: &[f32],
+    dims: &[i64],
+    crop_w: usize,
+    crop_h: usize,
+) -> Result<(TileOutput, f64), AiError> {
+    let (out_ch, actual_out_h, actual_out_w) = if dims.len() >= 4 {
+        (dims[1] as usize, dims[2] as usize, dims[3] as usize)
+    } else {
+        return Err(AiError::Ort(format!("Unexpected output shape: {dims:?}")));
+    };
+    if crop_w > actual_out_w || crop_h > actual_out_h {
+        return Err(AiError::Ort(format!(
+            "crop {}x{} larger than output {}x{}",
+            crop_w, crop_h, actual_out_w, actual_out_h
+        )));
+    }
+
+    // NCHW float → RGB float [0, 255] の平面配置で保存。
+    // 各 channel の左上 crop_w × crop_h を切り出す (= 残りはゼロ pad の garbage)。
+    let t_copy = std::time::Instant::now();
+    let ch = out_ch.min(3);
+    let in_plane_size = actual_out_h * actual_out_w;
+    let out_plane_size = crop_h * crop_w;
+    let mut data = vec![0.0f32; 3 * out_plane_size];
+    for c in 0..ch {
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let in_idx = c * in_plane_size + y * actual_out_w + x;
+                let out_idx = c * out_plane_size + y * crop_w + x;
+                let v = raw.get(in_idx).copied().unwrap_or(0.0);
+                data[out_idx] = (v * 255.0).clamp(0.0, 255.0);
+            }
+        }
+    }
+    let post_copy_ms = t_copy.elapsed().as_secs_f64() * 1000.0;
+
+    Ok((
+        TileOutput {
+            data,
+            width: crop_w as u32,
+            height: crop_h as u32,
+        },
+        post_copy_ms,
+    ))
+}
+
 /// 1 タイルの推論を実行する。
+///
+/// `should_route_to_worker(kind) == true` ならば TRT ワーカープロセスにルーティング、
+/// そうでなければ従来通り `with_session` でローカル DirectML 推論。
+/// どちらの経路でも (TileOutput, InferBreakdown) を返すので呼び出し側は同じ。
 fn run_tile_inference(
     runtime: &AiRuntime,
     model_kind: ModelKind,
     input: ndarray::Array4<f32>,
+    crop_w: usize,
+    crop_h: usize,
 ) -> Result<(TileOutput, InferBreakdown), AiError> {
-    let t0 = std::time::Instant::now();
-    let input_tensor =
-        ort::value::Tensor::from_array(input).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
-    let tensor_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    runtime.with_session(model_kind, |session| {
+    if runtime.should_route_to_worker(model_kind) {
+        // TRT ワーカー経路: tensor_build / extract / shm 転送はワーカー内で完結
         let t_run = std::time::Instant::now();
-        let outputs = session
-            .run(ort::inputs![input_tensor])
-            .map_err(|e| AiError::Ort(format!("run ({model_kind:?}): {e}")))?;
+        let (shape, raw) = runtime.infer_via_worker(model_kind, &input)?;
         let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
 
-        let t_extract = std::time::Instant::now();
-        let (shape, raw) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| AiError::Ort(format!("extract ({model_kind:?}): {e}")))?;
-        let tensor_extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
-
-        let dims: Vec<i64> = shape.iter().copied().collect();
-        let (out_ch, actual_out_h, actual_out_w) = if dims.len() >= 4 {
-            (dims[1] as usize, dims[2] as usize, dims[3] as usize)
-        } else {
-            return Err(AiError::Ort(format!("Unexpected output shape: {dims:?}")));
-        };
-
-        // NCHW float → RGB float [0, 255] の平面配置で保存。
-        // 入出力のインデックス構造は同一 (同じ c * plane_size + y * W + x) なので、
-        // 先頭 ch * plane_size 要素を単純スカラ変換するだけで済む。
-        // ch < 3 の場合は余りを 0 のままにする (vec! の初期値)。
-        let t_copy = std::time::Instant::now();
-        let ch = out_ch.min(3);
-        let plane_size = actual_out_h * actual_out_w;
-        let filled = ch * plane_size;
-        let mut data = vec![0.0f32; 3 * plane_size];
-        for i in 0..filled {
-            let v = raw.get(i).copied().unwrap_or(0.0);
-            data[i] = (v * 255.0).clamp(0.0, 255.0);
-        }
-        let post_copy_ms = t_copy.elapsed().as_secs_f64() * 1000.0;
-
+        let (output, post_copy_ms) = build_tile_output(&raw, &shape, crop_w, crop_h)?;
         Ok((
-            TileOutput {
-                data,
-                width: actual_out_w as u32,
-                height: actual_out_h as u32,
-            },
+            output,
             InferBreakdown {
-                tensor_build_ms,
-                session_run_ms,
-                tensor_extract_ms,
+                tensor_build_ms: 0.0, // ワーカー内部、計測されない
+                session_run_ms,       // ワーカー往復時間 (内部 GPU + IPC overhead)
+                tensor_extract_ms: 0.0, // ワーカー内部
                 post_copy_ms,
             },
         ))
-    })
+    } else {
+        // ローカル DirectML 経路 (既存)
+        let t0 = std::time::Instant::now();
+        let input_tensor = ort::value::Tensor::from_array(input)
+            .map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
+        let tensor_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        runtime.with_session(model_kind, |session| {
+            let t_run = std::time::Instant::now();
+            let outputs = session
+                .run(ort::inputs![input_tensor])
+                .map_err(|e| AiError::Ort(format!("run ({model_kind:?}): {e}")))?;
+            let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
+
+            let t_extract = std::time::Instant::now();
+            let (shape, raw) = outputs[0]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| AiError::Ort(format!("extract ({model_kind:?}): {e}")))?;
+            let tensor_extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
+
+            let dims: Vec<i64> = shape.iter().copied().collect();
+            let (output, post_copy_ms) = build_tile_output(raw, &dims, crop_w, crop_h)?;
+            Ok((
+                output,
+                InferBreakdown {
+                    tensor_build_ms,
+                    session_run_ms,
+                    tensor_extract_ms,
+                    post_copy_ms,
+                },
+            ))
+        })
+    }
 }
 
 /// タイル出力を重み付きで累積バッファに加算する（距離ベース線形ブレンド）。
