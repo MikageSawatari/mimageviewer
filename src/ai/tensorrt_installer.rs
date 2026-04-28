@@ -82,6 +82,12 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// 単一 read の timeout。CDN がストリーム途中で stall しても worker が無限待機しないように。
 const HTTP_READ_TIMEOUT_SECS: u64 = 60;
 
+/// 一過性 HTTP エラー (5xx / transport error) のリトライ間隔 (ミリ秒)。
+/// GitHub Releases CDN は時々 502 Bad Gateway を返すため、自動リトライで吸収する。
+/// 配列長 = 最大リトライ回数。0 ms 始まりにしないのは「すぐ再要求しても同じエラーで
+/// 帰ってくる」のが普通だから。
+const HTTP_RETRY_BACKOFFS_MS: &[u64] = &[1000, 3000, 7000, 15000];
+
 /// HTTP DL 時のチャンクサイズ (256 KiB)。
 /// 進捗更新の単位 + cancel チェックポイントを兼ねる。
 const DL_CHUNK_SIZE: usize = 256 * 1024;
@@ -444,70 +450,78 @@ fn download_and_verify(
         // 期待サイズより partial が大きい異常状態。捨てて 0 から。
         let _ = fs::remove_file(&partial);
     }
-    let resume_from = if partial.exists() {
-        resume_from
-    } else {
-        0
-    };
+    // resume_from は HTTP リトライループ内で `fs::metadata(&partial).len()` から
+    // 都度取り直すため、ここでは初期値計算のみ。partial が無ければ 0 開始。
+    let _initial_resume_from = if partial.exists() { resume_from } else { 0 };
 
-    // (3) HTTP DL with optional Range header.
+    // (3) HTTP DL with optional Range header (一過性エラー時はリトライ)。
     let url = format!("{}/{}", pack_base_url(), asset.name);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
         .timeout_read(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS))
         .build();
-    let mut req = agent.get(&url);
-    if resume_from > 0 {
-        req = req.set("Range", &format!("bytes={}-", resume_from));
-    }
-    let resp = req
-        .call()
-        .map_err(|e| format!("HTTP {}: {e}", asset.name))?;
 
-    // 206 (resume) でも 200 (full) でも reader を straight に書く。
-    // ただし 200 が返ってきたのに resume_from > 0 だと既存 partial の内容が残るので
-    // truncate してやり直す。
-    let server_full_response = resp.status() == 200;
-    let mut file = if resume_from > 0 && !server_full_response {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .open(&partial)
-            .map_err(|e| format!("open partial: {e}"))?;
-        f.seek(SeekFrom::End(0))
-            .map_err(|e| format!("seek partial: {e}"))?;
-        f
-    } else {
-        // 0 から書き直し。
-        fs::File::create(&partial).map_err(|e| format!("create partial: {e}"))?
-    };
-    let mut reader = resp.into_reader();
-    let mut buf = vec![0u8; DL_CHUNK_SIZE];
-    let mut bytes_done: u64 = if server_full_response { 0 } else { resume_from };
-    let mut last_progress = Instant::now();
-    loop {
-        check_cancel(cancel)?;
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("read chunk {}: {e}", asset.name))?;
-        if n == 0 {
-            break;
+    // ───── HTTP リトライループ ─────
+    // GitHub Releases CDN の 5xx / transport error を自動吸収するため、
+    // .call() と body 読み取りの両方を 1 つの試行とし、失敗時に sleep して再試行。
+    // 各 attempt の冒頭で「現在の partial size」から resume するので、
+    // ネットワーク途中切断でも積算される。
+    let mut last_err: Option<String> = None;
+    for (attempt, &backoff_ms) in std::iter::once(&0u64)
+        .chain(HTTP_RETRY_BACKOFFS_MS.iter())
+        .enumerate()
+    {
+        // 初回 (attempt=0) は backoff=0、2 回目以降は configured backoff を sleep
+        if backoff_ms > 0 {
+            crate::logger::log(format!(
+                "[trt-installer] {} 再試行 (attempt={}, prev error: {})",
+                asset.name,
+                attempt,
+                last_err.as_deref().unwrap_or("?")
+            ));
+            // cancel チェックしながら待つ (大きな backoff の途中でユーザー解約に応えるため)
+            let start = Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(backoff_ms) {
+                check_cancel(cancel)?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("write chunk {}: {e}", asset.name))?;
-        bytes_done += n as u64;
-        // 進捗は ~50ms 間隔で間引く (UI の repaint に十分な頻度、過剰送信を防ぐ)。
-        if last_progress.elapsed().as_millis() >= 50 {
-            let _ = tx.send(InstallProgress::FileProgress {
-                name: asset.name.clone(),
-                bytes_done,
-                bytes_total: asset.bytes,
-            });
-            last_progress = Instant::now();
+        // partial の現状サイズを再取得 (前回試行で部分書き込みがあれば加算される)
+        let resume_now = fs::metadata(&partial)
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or(0)
+            .min(asset.bytes);
+
+        match try_download_one(
+            &agent,
+            &url,
+            &partial,
+            asset,
+            resume_now,
+            cancel,
+            tx,
+        ) {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(DownloadAttemptError::Permanent(msg)) => {
+                return Err(format!("HTTP {}: {}", asset.name, msg));
+            }
+            Err(DownloadAttemptError::Retryable(msg)) => {
+                last_err = Some(msg);
+                // 次のループで sleep してリトライ
+                continue;
+            }
         }
     }
-    file.flush()
-        .map_err(|e| format!("flush partial: {e}"))?;
-    drop(file);
+    if let Some(msg) = last_err {
+        return Err(format!(
+            "HTTP {} (max retries exhausted): {}",
+            asset.name, msg
+        ));
+    }
 
     // (4) hash 検証。
     let _ = tx.send(InstallProgress::VerifyingFile {
@@ -535,6 +549,135 @@ fn download_and_verify(
         bytes_done: asset.bytes,
         bytes_total: asset.bytes,
     });
+    Ok(())
+}
+
+/// HTTP DL の 1 試行 (= リトライ単位) のエラー型。
+/// `Retryable` は呼び出し側で sleep + 再試行する、`Permanent` は即時 abort。
+enum DownloadAttemptError {
+    /// 5xx HTTP status / transport error / 部分書き込み中の I/O エラー等。
+    /// 一過性なので外側のリトライループで再試行する。
+    Retryable(String),
+    /// 4xx HTTP / disk full / 不正な URL 等。再試行しても同じエラーになるので即終了。
+    Permanent(String),
+}
+
+/// アセット 1 個の HTTP DL を 1 試行行う (retry なし、単発)。
+///
+/// `resume_from` から Range リクエストして body を `partial` ファイルに append する。
+/// 成功すれば `Ok(())`、失敗時はエラーが retry 可能か判定して `DownloadAttemptError`。
+/// progress イベントは tx 経由で UI に通知する。
+///
+/// 注意: SHA-256 検証はこの関数では行わない (= 呼び出し側 `download_and_verify` で
+/// 全リトライ完了後に 1 回だけ verify する)。
+fn try_download_one(
+    agent: &ureq::Agent,
+    url: &str,
+    partial: &Path,
+    asset: &AssetEntry,
+    resume_from: u64,
+    cancel: &Arc<AtomicBool>,
+    tx: &mpsc::Sender<InstallProgress>,
+) -> Result<(), DownloadAttemptError> {
+    let mut req = agent.get(url);
+    if resume_from > 0 {
+        req = req.set("Range", &format!("bytes={}-", resume_from));
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _resp)) => {
+            // 5xx は GitHub Releases CDN の一過性、4xx は permanent。
+            if (500..600).contains(&code) {
+                return Err(DownloadAttemptError::Retryable(format!(
+                    "HTTP {} status {}",
+                    asset.name, code
+                )));
+            }
+            return Err(DownloadAttemptError::Permanent(format!(
+                "HTTP {} status {}",
+                asset.name, code
+            )));
+        }
+        Err(ureq::Error::Transport(t)) => {
+            // ネットワーク到達不能、DNS 失敗、TLS handshake 失敗等。基本的に再試行可能。
+            return Err(DownloadAttemptError::Retryable(format!(
+                "transport error: {t}"
+            )));
+        }
+    };
+
+    // 206 (Partial Content) でも 200 (Full) でも body をそのまま append/truncate-write。
+    // 200 が返ってきたのに resume_from > 0 だと既存 partial の前半が古い内容のままなので
+    // truncate して 0 から書き直す。
+    let server_full_response = resp.status() == 200;
+    let mut file = if resume_from > 0 && !server_full_response {
+        let mut f = match fs::OpenOptions::new().write(true).open(partial) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(DownloadAttemptError::Permanent(format!(
+                    "open partial: {e}"
+                )));
+            }
+        };
+        if let Err(e) = f.seek(SeekFrom::End(0)) {
+            return Err(DownloadAttemptError::Permanent(format!(
+                "seek partial: {e}"
+            )));
+        }
+        f
+    } else {
+        match fs::File::create(partial) {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(DownloadAttemptError::Permanent(format!(
+                    "create partial: {e}"
+                )));
+            }
+        }
+    };
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; DL_CHUNK_SIZE];
+    let mut bytes_done: u64 = if server_full_response { 0 } else { resume_from };
+    let mut last_progress = Instant::now();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(DownloadAttemptError::Permanent(
+                "ユーザーによってキャンセルされました".to_string(),
+            ));
+        }
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // ストリーム途中の I/O エラーは一過性として扱い、リトライ。
+                // partial には既に書いた分が残るので、次回試行で resume_from が増える。
+                return Err(DownloadAttemptError::Retryable(format!(
+                    "read chunk: {e} (after {} bytes)",
+                    bytes_done
+                )));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if let Err(e) = file.write_all(&buf[..n]) {
+            // ディスクフルは Permanent、それ以外も書き込みは即時 abort して安全側
+            return Err(DownloadAttemptError::Permanent(format!(
+                "write chunk: {e}"
+            )));
+        }
+        bytes_done += n as u64;
+        if last_progress.elapsed().as_millis() >= 50 {
+            let _ = tx.send(InstallProgress::FileProgress {
+                name: asset.name.clone(),
+                bytes_done,
+                bytes_total: asset.bytes,
+            });
+            last_progress = Instant::now();
+        }
+    }
+    if let Err(e) = file.flush() {
+        return Err(DownloadAttemptError::Retryable(format!("flush: {e}")));
+    }
     Ok(())
 }
 
