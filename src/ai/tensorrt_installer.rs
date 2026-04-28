@@ -229,10 +229,25 @@ impl InstallHandle {
 
 impl Drop for InstallHandle {
     /// UI 側がハンドルを drop したらワーカも止める (孤児スレッド防止)。
+    ///
+    /// **non-blocking drop**: cancel フラグだけ立てて即時 return する。worker は
+    /// 数 100ms 以内に cancel を検知して自然終了するが、HTTP read や zip extract が
+    /// chunk 境界に達するまでは block するため、UI スレッドで join() するとダイアログ
+    /// クローズが数秒〜分単位で固まる (Codex P2.1 指摘)。
+    ///
+    /// 自然終了した worker thread は OS が回収する (孤児にはならない)。チャネルは
+    /// receiver 側 (rx) を drop すると sender 側でも send が Err になるので、
+    /// UI 側の rx drop で worker は自然な exit pathway に入る。
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
+        // 旧コード: join をここで待っていたため、ダイアログ閉じが block していた。
+        // 現在: spawn したスレッドは detach 状態 (= JoinHandle を drop) する。
+        // worker は cancel フラグを観測して自身の loop を抜け、resource を解放して
+        // 自然終了する。
         if let Some(h) = self.join.take() {
-            let _ = h.join();
+            // detach: thread continues running but we don't wait for it.
+            // 起動済み worker thread への参照を捨てる (= OS が後始末)。
+            std::mem::drop(h);
         }
     }
 }

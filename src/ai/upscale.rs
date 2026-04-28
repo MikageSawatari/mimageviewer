@@ -319,11 +319,16 @@ pub fn upscale_with_timings(
                 }
 
                 let tile_t0 = std::time::Instant::now();
-                let tile_input = extract_tile(&rgb, tile);
+                // 不完全 tile (img < tile_size のケース) でも tile_size 固定 shape の
+                // テンソルを作る (= TRT engine の固定 shape プロファイルに合わせる)。
+                let tile_input = extract_tile(&rgb, tile, tile_size);
+                // 出力 crop 寸法: 実 tile サイズ × scale。pad 領域は捨てる。
+                let crop_w = (tile.w * scale) as usize;
+                let crop_h = (tile.h * scale) as usize;
                 let t_infer_begin = std::time::Instant::now();
                 let extract_ms = t_infer_begin.duration_since(tile_t0).as_secs_f64() * 1000.0;
                 let (tile_out, breakdown) =
-                    match run_tile_inference(runtime, model_kind, tile_input) {
+                    match run_tile_inference(runtime, model_kind, tile_input, crop_w, crop_h) {
                         Ok(out) => out,
                         Err(e) => {
                             drop(tx);
@@ -488,11 +493,32 @@ fn compute_tiles(img_w: u32, img_h: u32, tile_size: u32, overlap: u32) -> Vec<Ti
     tiles
 }
 
-fn extract_tile(rgb: &image::RgbImage, tile: &TileRect) -> ndarray::Array4<f32> {
+/// `extract_tile` 第 3 引数: `tile_size` (= 物理 tile サイズ、tile.w/.h より大きいことがある)。
+/// 画像端の不完全 tile (= img_w/h < tile_size のとき発生) でも、テンソルは常に
+/// `tile_size × tile_size` の形状で生成し、不足領域はゼロ詰めする。
+///
+/// なぜ必要か (Apr 29 ユーザー報告):
+///   pre-built TRT engine は warmup shape (例: 512×512) で固定されている。
+///   640×480 画像を tile_size=512 で処理すると th=480 の不完全 tile が出来、
+///   shape (1,3,480,512) でセッション実行 → engine と不一致 → TRT が再 build を
+///   試みるが pack に builder_resource が無いため `TensorRT EP failed to create
+///   engine from network` エラー。常に shape を tile_size に揃えれば回避できる。
+///
+/// 出力テンソルの不要領域 (tile.w..tile_size の右端、tile.h..tile_size の下端) は
+/// 後段の `build_tile_output` で `tile.w * scale × tile.h * scale` に crop して
+/// 捨てるので、最終画像には混入しない。pad は zero (= 黒)。
+fn extract_tile(
+    rgb: &image::RgbImage,
+    tile: &TileRect,
+    tile_size: u32,
+) -> ndarray::Array4<f32> {
+    let canvas = tile_size as usize;
     let tw = tile.w as usize;
     let th = tile.h as usize;
-    let mut tensor = ndarray::Array4::<f32>::zeros((1, 3, th, tw));
+    debug_assert!(tw <= canvas && th <= canvas, "tile larger than tile_size");
+    let mut tensor = ndarray::Array4::<f32>::zeros((1, 3, canvas, canvas));
 
+    // 実データ領域 (左上 [0..th, 0..tw]) を埋める。残りは zeros のまま。
     for dy in 0..th {
         for dx in 0..tw {
             let px = rgb.get_pixel(tile.x + dx as u32, tile.y + dy as u32);
@@ -525,33 +551,53 @@ struct InferBreakdown {
 /// 戻り値は (TileOutput, post_copy_ms)。
 ///
 /// NCHW 形式の input で、ch < 3 のときは残り channel を 0 のままにする。
-fn build_tile_output(raw: &[f32], dims: &[i64]) -> Result<(TileOutput, f64), AiError> {
+///
+/// `crop_w` / `crop_h` は出力テンソル (`raw`) を上から **crop_w × crop_h** に切り出す
+/// (= extract_tile が tile_size 固定で zero-pad した不要領域を捨てる)。
+/// 通常は `dims[3]` / `dims[2]` をそのまま使うが、入力を pad した場合は呼び出し側で
+/// `tile.w * scale` / `tile.h * scale` を渡す。
+fn build_tile_output(
+    raw: &[f32],
+    dims: &[i64],
+    crop_w: usize,
+    crop_h: usize,
+) -> Result<(TileOutput, f64), AiError> {
     let (out_ch, actual_out_h, actual_out_w) = if dims.len() >= 4 {
         (dims[1] as usize, dims[2] as usize, dims[3] as usize)
     } else {
         return Err(AiError::Ort(format!("Unexpected output shape: {dims:?}")));
     };
+    if crop_w > actual_out_w || crop_h > actual_out_h {
+        return Err(AiError::Ort(format!(
+            "crop {}x{} larger than output {}x{}",
+            crop_w, crop_h, actual_out_w, actual_out_h
+        )));
+    }
 
     // NCHW float → RGB float [0, 255] の平面配置で保存。
-    // 入出力のインデックス構造は同一 (同じ c * plane_size + y * W + x) なので、
-    // 先頭 ch * plane_size 要素を単純スカラ変換するだけで済む。
-    // ch < 3 の場合は余りを 0 のままにする (vec! の初期値)。
+    // 各 channel の左上 crop_w × crop_h を切り出す (= 残りはゼロ pad の garbage)。
     let t_copy = std::time::Instant::now();
     let ch = out_ch.min(3);
-    let plane_size = actual_out_h * actual_out_w;
-    let filled = ch * plane_size;
-    let mut data = vec![0.0f32; 3 * plane_size];
-    for i in 0..filled {
-        let v = raw.get(i).copied().unwrap_or(0.0);
-        data[i] = (v * 255.0).clamp(0.0, 255.0);
+    let in_plane_size = actual_out_h * actual_out_w;
+    let out_plane_size = crop_h * crop_w;
+    let mut data = vec![0.0f32; 3 * out_plane_size];
+    for c in 0..ch {
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let in_idx = c * in_plane_size + y * actual_out_w + x;
+                let out_idx = c * out_plane_size + y * crop_w + x;
+                let v = raw.get(in_idx).copied().unwrap_or(0.0);
+                data[out_idx] = (v * 255.0).clamp(0.0, 255.0);
+            }
+        }
     }
     let post_copy_ms = t_copy.elapsed().as_secs_f64() * 1000.0;
 
     Ok((
         TileOutput {
             data,
-            width: actual_out_w as u32,
-            height: actual_out_h as u32,
+            width: crop_w as u32,
+            height: crop_h as u32,
         },
         post_copy_ms,
     ))
@@ -566,6 +612,8 @@ fn run_tile_inference(
     runtime: &AiRuntime,
     model_kind: ModelKind,
     input: ndarray::Array4<f32>,
+    crop_w: usize,
+    crop_h: usize,
 ) -> Result<(TileOutput, InferBreakdown), AiError> {
     if runtime.should_route_to_worker(model_kind) {
         // TRT ワーカー経路: tensor_build / extract / shm 転送はワーカー内で完結
@@ -573,7 +621,7 @@ fn run_tile_inference(
         let (shape, raw) = runtime.infer_via_worker(model_kind, &input)?;
         let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
 
-        let (output, post_copy_ms) = build_tile_output(&raw, &shape)?;
+        let (output, post_copy_ms) = build_tile_output(&raw, &shape, crop_w, crop_h)?;
         Ok((
             output,
             InferBreakdown {
@@ -604,7 +652,7 @@ fn run_tile_inference(
             let tensor_extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
 
             let dims: Vec<i64> = shape.iter().copied().collect();
-            let (output, post_copy_ms) = build_tile_output(raw, &dims)?;
+            let (output, post_copy_ms) = build_tile_output(raw, &dims, crop_w, crop_h)?;
             Ok((
                 output,
                 InferBreakdown {

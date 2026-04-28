@@ -577,8 +577,24 @@ fn write_and_hash_notices(dist_dir: &Path) -> std::io::Result<Vec<AssetEntry>> {
     Ok(out)
 }
 
+/// pack に同梱必須なモデル一覧 (= worker 経由で TRT 動作させたい全モデル)。
+/// `runtime.rs::should_route_to_worker` で TRT に route される 6 モデルと一致させる。
+/// build_engine_zip がこれら全モデルの engine を見つけられなかったら build を失敗
+/// させて出荷ミスを未然に防ぐ (Codex P2.4 指摘)。
+const REQUIRED_ENGINE_MODELS: &[&str] = &[
+    "realesrgan_x4plus",
+    "realesrgan_anime6b",
+    "realesr_general_v3",
+    "realcugan_4x",
+    "nmkd_siax_4x",
+    "denoise_realplksr",
+];
+
 /// 6 モデル分の engine cache を 1 つの zip にまとめる。
 /// 戻り値: 生成された zip ファイルのバイト数。
+///
+/// 全 `REQUIRED_ENGINE_MODELS` が揃っていることを検証し、欠けているモデルが
+/// あれば build を失敗させる (= 中途半端な pack を distribute しないためのガード)。
 fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
     let file = fs::File::create(dst_zip).map_err(|e| format!("create zip: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -589,6 +605,7 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
 
     let mut total_files: usize = 0;
     let mut total_bytes_in: u64 = 0;
+    let mut found_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     for model_entry in fs::read_dir(src_engines).map_err(|e| format!("read_dir engines: {e}"))? {
         let model_entry = model_entry.map_err(|e| format!("entry: {e}"))?;
         let model_dir = model_entry.path();
@@ -600,6 +617,8 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
         // 各モデルディレクトリの中身 (.engine + .profile) を zip に。
         // ファイル名は ORT TRT EP のハッシュ命名を保つ必要がある (deserialize 時の lookup
         // キーになる)。
+        let mut has_engine_file = false;
+        let mut has_profile_file = false;
         for f in fs::read_dir(&model_dir).map_err(|e| format!("read_dir model: {e}"))? {
             let f = f.map_err(|e| format!("file entry: {e}"))?;
             let p = f.path();
@@ -607,6 +626,11 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
                 continue;
             }
             let fname = p.file_name().unwrap().to_string_lossy().to_string();
+            if fname.ends_with(".engine") {
+                has_engine_file = true;
+            } else if fname.ends_with(".profile") {
+                has_profile_file = true;
+            }
             // zip 内パスは `<model_name>/<file>` で、runtime 展開時に
             // `tensorrt-engines/<model_name>/<file>` になる
             let zip_path = format!("{}/{}", model_name, fname);
@@ -625,8 +649,28 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
             }
             total_files += 1;
         }
+        if has_engine_file && has_profile_file {
+            found_models.insert(model_name);
+        }
     }
     zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+
+    // 必須モデルがすべて揃っているかチェック (= .engine + .profile 両方ある)
+    let missing: Vec<&str> = REQUIRED_ENGINE_MODELS
+        .iter()
+        .filter(|m| !found_models.contains(**m))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        // zip は既に書き終わっているので削除して errror.
+        let _ = fs::remove_file(dst_zip);
+        return Err(format!(
+            "engine pack に以下のモデルの engine/.profile が見つからない:\n  - {}\n\
+             先に `mimageviewer.exe --tensorrt-build <model_kind>` でこれらの engine を\n\
+             build してください。",
+            missing.join("\n  - ")
+        ));
+    }
 
     let zip_size = fs::metadata(dst_zip)
         .map(|m| m.len())
