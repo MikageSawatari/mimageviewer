@@ -54,7 +54,9 @@ impl App {
                     MAX_TRT_AUTO_RESTART_ATTEMPTS,
                     notice.detail
                 ));
-                Self::spawn_trt_worker_pool(rt);
+                // 多重 spawn ガード付き: 並行する複数 AI 推論が同じ死亡通知を
+                // 観測しても、1 個の spawn 試行しか走らない (Codex P2)。
+                Self::spawn_trt_worker_pool_guarded(rt, self.trt_restart_in_flight.clone());
             }
             _ => {
                 // 自動再起動できない (SpawnFailed か、retry 上限到達): バナーで通知。

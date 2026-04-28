@@ -1868,6 +1868,12 @@ pub struct App {
     /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
     /// ためのガード)。
     pub(crate) trt_auto_restart_attempts: u32,
+    /// 自動再起動が現在進行中か (= spawn_trt_worker_pool の background thread が
+    /// 起動中で、まだ attach も failure 通知もしていない状態)。
+    /// 並行する複数の AI 推論が同じ「死亡」イベントを観測したときに 2 重 spawn を
+    /// 防ぐためのガード (Codex P2 指摘)。spawn 完了 (attach 成功 or 失敗通知) で
+    /// false に戻す。
+    pub(crate) trt_restart_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// TRT pack のオンラインインストールダイアログの状態。
     /// Some の間ダイアログが表示され、worker thread が動作している。
     /// 閉じる (Drop) と worker は cancel される。
@@ -2398,6 +2404,7 @@ impl Default for App {
             fs_feedback_toast: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
+            trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             trt_install_state: None,
             fs_boundary_hint: None,
 
@@ -10070,10 +10077,48 @@ impl App {
     /// 別スレッドに逃がし、起動完了したら attach する。
     ///
     /// 起動失敗時は AiRuntime は DirectML のままで動作続行し、ログにエラーを残す。
+    ///
+    /// **多重 spawn ガード**: `App.trt_restart_in_flight` を CAS で立てる。
+    /// 既に立っていたら早期 return (= 別の spawn が進行中)。worker 死亡時に
+    /// 並行する複数の AI 推論が同じ DiedDuringInfer を観測しても 1 回しか
+    /// 新 pool を起こさない (Codex P2 指摘)。
     pub(crate) fn spawn_trt_worker_pool(
         runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
     ) {
+        Self::spawn_trt_worker_pool_inner(runtime, /* guard = */ None);
+    }
+
+    /// `spawn_trt_worker_pool` の guard 付き版。worker 死亡時の自動再起動から
+    /// 呼ぶ際に使う (= 複数の死亡通知が並行して走る場合の多重 spawn を防ぐ)。
+    pub(crate) fn spawn_trt_worker_pool_guarded(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+        guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        Self::spawn_trt_worker_pool_inner(runtime, Some(guard));
+    }
+
+    fn spawn_trt_worker_pool_inner(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+        guard: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        // CAS: false → true。すでに in-flight なら true のままで、ここは false 戻り → skip。
+        if let Some(g) = guard.as_ref() {
+            if g.compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+            {
+                crate::logger::log(
+                    "[AI] TRT worker pool 起動はすでに進行中、新規 spawn を skip".to_string(),
+                );
+                return;
+            }
+        }
         let runtime_for_thread = runtime.clone();
+        let guard_for_thread = guard;
         std::thread::Builder::new()
             .name("trt-worker-spawn".to_string())
             .spawn(move || {
@@ -10094,6 +10139,10 @@ impl App {
                         // ならないか」を追えない。
                         runtime_for_thread.report_worker_spawn_failed(e);
                     }
+                }
+                // spawn 試行が完了 (success / failure 両方) → guard を解放。
+                if let Some(g) = guard_for_thread {
+                    g.store(false, std::sync::atomic::Ordering::SeqCst);
                 }
             })
             .ok();
