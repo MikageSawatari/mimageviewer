@@ -228,16 +228,22 @@ impl WorkerHandle {
     }
 
     fn shutdown_and_wait(mut self) {
-        // Shutdown コマンドを送って Resp を待ってから wait。
-        // 失敗しても child を kill して回収。
-        let _ = self.send_cmd(&WorkerCmd::Shutdown);
+        // **アプリ終了時の高速 shutdown**: worker には保存すべき状態が無いので、
+        // graceful shutdown は行わず即座に kill する。これにより ORT / CUDA
+        // context の cleanup (~1 秒) を待たずに済む。kill は冪等なので worker が
+        // 既に exit していても問題ない。
+        //
+        // 旧実装は `WorkerCmd::Shutdown` を送って response を待って `child.wait()`
+        // していたが、ORT cleanup が遅いため UI 終了まで 1 秒近くもたついていた
+        // (Apr 29 ユーザー報告)。
+        let _ = self.child.kill();
         match self.child.wait() {
             Ok(status) => crate::logger::log(format!(
-                "[TRT-worker-pool] worker exited: {status:?}"
+                "[TRT-worker-pool] worker killed and reaped: {status:?}"
             )),
             Err(e) => crate::logger::log(format!("[TRT-worker-pool] wait failed: {e}")),
         }
-        // stderr / stdout drain thread は子 stdout/stderr が close した時点で
+        // stderr / stdout drain thread は子の stdout/stderr が close した時点で
         // 自然に EOF を受け取って終了する。join で完全終了を確認。
         if let Some(h) = self.stderr_join.take() {
             let _ = h.join();
