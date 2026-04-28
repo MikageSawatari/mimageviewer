@@ -10109,9 +10109,24 @@ impl App {
         }
 
         for key in disconnected {
+            // cancel フラグが立っているなら「ユーザー操作によるキャンセル」であり、
+            // 真の失敗ではない。failed に登録すると次回以降の upscale が永久に
+            // 起動しなくなる (start_ai_upscale_pending が failed を見て早期 return)。
+            //
+            // 連続モデル切替で worker mutex キューが詰まっているとき、新しい
+            // 要求が前の要求を cancel → 前の thread がキューから取り出されて
+            // 1 タイル走った後に cancel 検知 → 結果送らず disconnect、というパターンで
+            // ここに来ると idx が誤って永久 failed になる (Apr 28 のユーザー報告)。
+            let was_cancelled = self
+                .ai_upscale_pending
+                .get(&key)
+                .map(|(cancel, _)| cancel.load(Ordering::Relaxed))
+                .unwrap_or(false);
             self.ai_upscale_pending.remove(&key);
-            // スレッドが結果を送らずに終了 = 失敗。リトライを防止する。
-            self.ai_upscale_failed.insert(key);
+            if !was_cancelled {
+                // 真の失敗 (panic / ORT エラー等) のみ failed に登録してリトライ防止
+                self.ai_upscale_failed.insert(key);
+            }
         }
 
         let repaint = !completed.is_empty();
