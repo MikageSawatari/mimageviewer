@@ -31,8 +31,10 @@ const TILE_OVERLAP: u32 = 32;
 ///   特定サイズでピークになる。
 /// - DirectML: per-call overhead が super-linear に増えるため 192 が最適 (軽量
 ///   モデル UpscaleRealEsrGeneralV3 のみ 512 で 18% 高速)。
-/// - TensorRT: per-tile inference が sub-linear なので 256 が最適 (anime6b 大画像で
-///   tile 192 1719ms → tile 256 994ms = 1.73x 高速、bench_ai 計測値)。
+/// - TensorRT: 256 が最適 (192/384/512 をスイープして比較。256 比 384 は +20-47%、
+///   512 は +11-44% 遅い)。原因は L2 キャッシュ飽和と TRT のカーネル最適化が
+///   power-of-2 単位 (256) でピークになる特性。per-pixel 時間で見ても 256 が
+///   最小なので、画像が大きくなっても 256 優位は維持される (4K/8K でも検証済み)。
 fn model_tile_size(kind: ModelKind, backend: super::AiBackend) -> u32 {
     match (kind, backend) {
         // RealPLKSR は 256x256 固定入力 (バックエンドに依らない)
