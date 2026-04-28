@@ -304,6 +304,8 @@ impl TrtWorkerPool {
             ));
         }
 
+        // 出力 shm から直接 Vec<f32> にコピー (read_to_vec の Vec<u8> 中間生成を回避、
+        // 1 回の memcpy のみ)。
         let out_shm_guard = self
             .out_shm
             .lock()
@@ -311,14 +313,14 @@ impl TrtWorkerPool {
         let out_shm = out_shm_guard
             .as_ref()
             .ok_or_else(|| "out_shm が shutdown 済み".to_string())?;
-        let out_bytes = out_shm.read_to_vec(out_bytes_len);
-        drop(out_shm_guard);
-
-        // SAFETY: out_bytes は Vec<u8> で 8-byte 整列、中身は f32 の little-endian。
+        // SAFETY: out_shm は永続 mapped view、ページ整列。中身は worker が書いた
+        // f32 little-endian。as_slice の slice lifetime は unsafe ブロック内に
+        // 閉じて to_vec で即 owned 化、その後 guard を drop しても output は安全。
         let output: Vec<f32> = unsafe {
-            std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_count)
-        }
-        .to_vec();
+            let bytes = out_shm.as_slice(out_bytes_len);
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, out_count).to_vec()
+        };
+        drop(out_shm_guard);
 
         Ok((output_shape, output))
     }

@@ -221,24 +221,21 @@ fn handle_infer(
     }
 
     // 共有メモリは ShmCache で使い回す (毎回 open しない、起動時 1 回 + キャッシュ)。
-    // SharedMem は同名で複数回 open 可能だが、syscall コストを避けるため cache する。
     let in_shm = match ShmCache::get_or_open(&mut shm_cache.in_shm, input_shm, PERSIST_IN_SHM_SIZE_HINT.max(input_bytes)) {
         Ok(s) => s,
         Err(e) => return WorkerResp::err(format!("get_or_open input shm: {e}")),
     };
 
-    // 入力 bytes → Vec<f32> (shm 領域からコピー、Drop と独立に保持するため)
-    let input_data: Vec<f32> = {
-        let bytes = in_shm.read_to_vec(input_bytes);
-        let f32_count = input_bytes / 4;
-        // SAFETY: bytes は Vec<u8> で 8-byte aligned (Rust global allocator)、
-        // length は 4 の倍数。f32 (4-byte aligned) として解釈安全。
-        let f32_slice: &[f32] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, f32_count)
-        };
-        f32_slice.to_vec()
+    // 入力 shm から Vec<f32> に直接コピー (read_to_vec 経由の Vec<u8> 中間生成を回避、
+    // 1 回のメモリコピーで完結)。
+    let f32_count = input_bytes / 4;
+    let input_data: Vec<f32> = unsafe {
+        // SAFETY: in_shm は永続 mapped view、ページ整列されているので f32 alignment は OK。
+        // shm の中身は親が書いた little-endian f32。as_slice の slice lifetime は
+        // この unsafe ブロック内に閉じ、to_vec で即座に owned に変換するので安全。
+        let bytes = in_shm.as_slice(input_bytes);
+        std::slice::from_raw_parts(bytes.as_ptr() as *const f32, f32_count).to_vec()
     };
-    // ※ 出力 shm は推論後に書き込むので、まだ open しない (借用エラー回避)。
 
     // ndarray::Array4 構築
     let shape = (
@@ -256,9 +253,14 @@ fn handle_infer(
         Err(e) => return WorkerResp::err(format!("Tensor::from_array: {e}")),
     };
 
-    // 推論実行 (with_session 内で session.run + extract_tensor + bytes 書き込み)
+    // 推論実行: with_session 内で ORT 出力テンソルから shm へ直接書き込む。
+    // 中間 Vec<u8> を介さず、ORT 内部バッファ → shm の 1 回コピーで済ませる。
+    //
+    // shm_cache.out_shm は closure に &mut で渡す。runtime の sessions Mutex と
+    // shm_cache はメモリ上独立なので borrow checker は通る (Mutex 別、別アドレス)。
     let t0 = std::time::Instant::now();
-    let result = runtime.with_session(kind, |session| {
+    let out_shm_slot = &mut shm_cache.out_shm;
+    let result: Result<Vec<i64>, super::AiError> = runtime.with_session(kind, |session| {
         let outputs = session
             .run(ort::inputs![tensor])
             .map_err(|e| super::AiError::Ort(format!("session.run: {e}")))?;
@@ -277,38 +279,28 @@ fn handle_infer(
         }
         if raw.len() < total_count as usize {
             return Err(super::AiError::Ort(format!(
-                "output tensor returned shorter than expected: raw.len()={} expected={}",
+                "output tensor shorter than expected: {} < {}",
                 raw.len(),
                 total_count
             )));
         }
 
-        // raw (f32 slice) → bytes view → shm に直接コピー
-        // SAFETY: raw は ORT 内部のテンソルバッファへの参照、
-        // f32 アライメントが揃っている。len * 4 バイトの U8 view として読める。
+        // ORT テンソルバッファを bytes view として shm に直接書き込む。
+        // SAFETY: raw は ORT 内部のテンソルバッファ、f32 アライメント済み。
+        // total_count * 4 バイト分のうち raw.len() ≥ total_count なので範囲内。
         let raw_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                raw.as_ptr() as *const u8,
-                total_count as usize * std::mem::size_of::<f32>(),
-            )
+            std::slice::from_raw_parts(raw.as_ptr() as *const u8, total_bytes)
         };
-        Ok((output_shape, raw_bytes.to_vec()))
+        let out_shm = ShmCache::get_or_open(out_shm_slot, output_shm, output_capacity)
+            .map_err(|e| super::AiError::Ort(format!("get_or_open output shm: {e}")))?;
+        out_shm.write(raw_bytes);
+        Ok(output_shape)
     });
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
 
     match result {
-        Ok((shape, out_bytes)) => {
-            // 出力 shm を cache から取得 (なければ open)
-            let out_shm = match ShmCache::get_or_open(&mut shm_cache.out_shm, output_shm, output_capacity) {
-                Ok(s) => s,
-                Err(e) => {
-                    return WorkerResp::err(format!("get_or_open output shm: {e}"));
-                }
-            };
-            out_shm.write(&out_bytes);
-            WorkerResp::ok_infer(elapsed_ms, shape)
-        }
+        Ok(shape) => WorkerResp::ok_infer(elapsed_ms, shape),
         Err(e) => WorkerResp::err(format!("inference failed: {e}")),
     }
 }
