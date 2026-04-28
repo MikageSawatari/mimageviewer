@@ -12,6 +12,7 @@ pub mod classify;
 pub mod denoise;
 pub mod model_manager;
 pub mod runtime;
+pub mod tensorrt_builder;
 pub mod tensorrt_pack;
 pub mod upscale;
 

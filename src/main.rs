@@ -122,6 +122,15 @@ fn main() -> eframe::Result {
         std::process::exit(0);
     }
 
+    // --tensorrt-build <model_kind> モード: TensorRT エンジンビルダーワーカー。
+    // 親プロセス (GUI) から子プロセスとして起動され、指定モデルを TRT EP で
+    // load_model することで engine cache を populate する。stdout に進捗 JSON。
+    if std::env::args().any(|a| a == ai::tensorrt_builder::TRT_BUILD_ARG) {
+        // data_dir 初期化が必要 (engine cache path や DLL extract で使う)
+        data_dir::init();
+        ai::tensorrt_builder::run_worker_process();
+    }
+
     // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
     // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
     // ダイアログ自動連携も兼ねる (`single_instance::MUTEX_NAME` 参照)。
