@@ -332,8 +332,9 @@ impl App {
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            "「TensorRT を有効にする」が設定済みであれば、\n\
-                             アプリを再起動すると TensorRT で動作します。",
+                            "環境設定 → AI バックエンド → TensorRT を選択すると\n\
+                             即座に切り替わります (アプリの再起動は不要)。\n\
+                             すでに TensorRT を選択済みであればそのままご利用いただけます。",
                         );
                     }
                     TrtBuildPhase::Aborted { failed_kind, message } => {
