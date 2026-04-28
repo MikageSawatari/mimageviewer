@@ -80,17 +80,22 @@ pub(crate) struct TrtBuildState {
     pub current_idx: usize,
 }
 
-/// 全 8 ModelKind を返す (順序はビルドされる順)。
+/// TRT ワーカー経由で動かす ModelKind の一覧 (順序はビルドされる順)。
+///
+/// `runtime.rs::should_route_to_worker` で `true` を返すモデルだけを含む。
+/// `ClassifierMobileNet` と `InpaintMiGan` は Phase 3 アーキテクチャでは
+/// メインプロセスの DirectML で動作する設計なので、TRT engine を作っても
+/// runtime で一切使われない (Apr 28 のビルド hang 報告で判明)。
+///
+/// 同期: `runtime.rs::should_route_to_worker` を変更したらここも揃える。
 fn all_model_kinds() -> Vec<ModelKind> {
     vec![
-        ModelKind::ClassifierMobileNet,
         ModelKind::UpscaleRealEsrganX4Plus,
         ModelKind::UpscaleRealEsrganAnime6B,
         ModelKind::UpscaleRealEsrGeneralV3,
         ModelKind::UpscaleRealCugan4x,
         ModelKind::UpscaleNmkdSiax4x,
         ModelKind::DenoiseRealplksr,
-        ModelKind::InpaintMiGan,
     ]
 }
 

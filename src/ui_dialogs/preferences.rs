@@ -988,7 +988,7 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.add_space(2.0);
             ui.label(
                 "TensorRT は各モデルを GPU 専用にコンパイルしたエンジンを使います。\n\
-                 初回は全 8 モデルのビルドに 5〜15 分かかります (バックグラウンドで実行)。\n\
+                 初回は対象 6 モデルのビルドに 5〜15 分かかります (バックグラウンドで実行)。\n\
                  ビルド済みモデルはエンジンキャッシュに保存され、次回以降は瞬時にロードされます。",
             );
             ui.add_space(4.0);
