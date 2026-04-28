@@ -31,6 +31,11 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
 static FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
 
+/// 直近何世代分の perf log を残すか。`perf_events.jsonl` (現在) +
+/// `perf_events.1.jsonl` 〜 `perf_events.{N-1}.jsonl` (過去) で N ファイル。
+/// 同じ動画症状を複数回試したいときに、毎回手動で退避する手間を省くため。
+const MAX_GENERATIONS: usize = 5;
+
 /// 起動時に 1 回だけ呼ぶ。`enabled=false` なら何もしない。
 ///
 /// `start_override` に `Some(Instant)` を渡すと、それを `t=0` の基準にする。
@@ -46,6 +51,7 @@ pub fn init(enabled: bool, start_override: Option<Instant>) {
     let log_dir = crate::data_dir::logs_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("perf_events.jsonl");
+    rotate_logs(&log_dir);
     match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -67,6 +73,29 @@ pub fn init(enabled: bool, start_override: Option<Instant>) {
                 log_path.display()
             );
             crate::logger::log(format!("perf: init failed: {e}"));
+        }
+    }
+}
+
+/// `perf_events.jsonl` をローテーションする。current → `.1` → `.2` → ... と
+/// 番号をずらし、最古 (= `MAX_GENERATIONS - 1` 番) は削除する。`init()` から
+/// truncate-create する直前に呼ぶ。失敗は静かに無視 (perf-log は debug 用途)。
+fn rotate_logs(log_dir: &std::path::Path) {
+    let path_for = |n: usize| -> std::path::PathBuf {
+        if n == 0 {
+            log_dir.join("perf_events.jsonl")
+        } else {
+            log_dir.join(format!("perf_events.{n}.jsonl"))
+        }
+    };
+    // 最古を消し、上から順番に下にずらす。
+    let oldest = path_for(MAX_GENERATIONS - 1);
+    let _ = std::fs::remove_file(&oldest);
+    for n in (0..MAX_GENERATIONS - 1).rev() {
+        let from = path_for(n);
+        let to = path_for(n + 1);
+        if from.exists() {
+            let _ = std::fs::rename(&from, &to);
         }
     }
 }

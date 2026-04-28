@@ -59,6 +59,22 @@ pub struct AvClock {
     /// 「古い fill_output コールバックが、新たに発生した override を誤クリアする」
     /// race を排除する (Codex P1 指摘)。
     seek_override_serial: AtomicU64,
+    /// pump リングバッファの残量 (秒、f64 bits)。pump push / fill_output pop で更新。
+    audio_pump_buf_secs_bits: AtomicU64,
+    /// audio_tx に積まれているフレーム合計時間 (秒、f64 bits)。decoder の send 後 +,
+    /// pump の recv 後 -。`pump_buf + tx_queued` で総音声バッファ秒数になる。
+    audio_tx_queued_secs_bits: AtomicU64,
+    /// audio が「healthy」状態か。decoder が `notify_audio_active(true)` で開始、
+    /// audio 出力起動失敗 / 音声ストリーム不在のとき false。
+    /// false なら `now_secs()` はフォールバック wall clock を使う。
+    audio_active: AtomicBool,
+    /// フォールバック wall clock の基準 PTS (秒、f64 bits)。
+    fallback_pts_bits: AtomicU64,
+    /// 同 recorded_at_nanos (epoch から)。
+    fallback_recorded_at_nanos: AtomicI64,
+    /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
+    /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
+    eof_reached: AtomicBool,
     /// 音量 (0.0-1.0、f64 bits)。
     volume_bits: AtomicU64,
     /// ミュート。
@@ -73,6 +89,13 @@ const SEEK_NONE: u64 = u64::MAX;
 /// これを超えるズレは decoder 側の seek 失敗を疑う合図。
 pub(crate) const SEEK_TARGET_TOLERANCE_SECS: f64 = 0.75;
 
+/// 「フレーム pts <= now + DISPLAY_LEAD_TOLERANCE_SECS なら displayable」と
+/// 判定する許容差 (秒)。約 1 vsync 周期 (60Hz = 16.7ms) を許容することで、
+/// vsync 直後に来た「ほぼ now のフレーム」を確実に 1 tick で表示できる
+/// (= 60fps コンテンツが 30fps 表示に落ちる現象を回避)。
+/// AV 同期上は 16ms 程度の lead は知覚されない (audio-video sync 許容窓は ±50ms)。
+pub(crate) const DISPLAY_LEAD_TOLERANCE_SECS: f64 = 0.016;
+
 impl AvClock {
     pub fn new(initial_volume: f64) -> Self {
         Self {
@@ -84,42 +107,106 @@ impl AvClock {
             seek_serial: AtomicU64::new(0),
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
+            audio_pump_buf_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
+            audio_tx_queued_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
+            audio_active: AtomicBool::new(false),
+            fallback_pts_bits: AtomicU64::new(0.0_f64.to_bits()),
+            fallback_recorded_at_nanos: AtomicI64::new(0),
+            eof_reached: AtomicBool::new(false),
             volume_bits: AtomicU64::new(initial_volume.clamp(0.0, 1.0).to_bits()),
             muted: AtomicBool::new(false),
         }
     }
 
     /// 音声スレッドが「ちょうどこの PTS のサンプルを出力した」と報告する。
+    /// **audio_active 状態は変更しない** — silent な fill_output (= 真の音声無し) で
+    /// この関数が呼ばれた場合、勝手に audio master 化してしまうのを防ぐため
+    /// (Codex 指摘)。activate は `notify_audio_active` 経由で明示的に行う。
+    ///
+    /// ⚠️ 単調性ガード: 入力 pts が現在の `now_secs()` より小さい (= 過去) 場合、
+    /// 現在値で固定して **後退させない**。これは notify_seek_completed が wall
+    /// 推定で先行させた `now_secs` に対して、後追いで届いた実 audio pts が少しだけ
+    /// 過去に位置するケース (post-seek の最初の数フレーム) で UI が逆方向にジャンプ
+    /// しないようにする。
     pub fn set_audio_pts(&self, pts_secs: f64) {
         let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        // pts と recorded_at は本来「同時に書き換わる」べきだが、独立 atomic なので
-        // 厳密には torn read が起きうる。実際は now_secs() の誤差が 1 サンプル分
-        // (~20µs @ 48kHz) の範囲に収まるので無害。
-        self.audio_pts_bits.store(pts_secs.to_bits(), Ordering::Release);
+        let cur_now = self.now_secs();
+        let monotonic = pts_secs.max(cur_now);
+        self.audio_pts_bits.store(monotonic.to_bits(), Ordering::Release);
         self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
     }
 
+    /// 真の音声フレームが pump に到達した時に呼ぶ。これで `audio_active = true`
+    /// になり、`now_secs()` が audio master モードに切り替わる。
+    pub fn notify_audio_active(&self) {
+        self.audio_active.store(true, Ordering::Release);
+    }
+
+    /// EOF 時に再生位置を duration に進めたいが、audio_active 状態は変えたくない
+    /// ケース (audioless 動画でも duration まで進めて停止アニメを揃えるため)。
+    pub fn set_position_at_eof(&self, pts_secs: f64) {
+        let now_ns = self.epoch.elapsed().as_nanos() as i64;
+        self.audio_pts_bits.store(pts_secs.to_bits(), Ordering::Release);
+        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
+        self.fallback_pts_bits.store(pts_secs.to_bits(), Ordering::Release);
+        self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
+    }
+
+    /// 音声ストリームが無い / 出力起動失敗のときに呼ぶ。`now_secs()` は wall clock
+    /// fallback で進行する。
+    pub fn mark_audio_inactive(&self) {
+        self.audio_active.store(false, Ordering::Release);
+    }
+
+    pub fn is_audio_active(&self) -> bool {
+        self.audio_active.load(Ordering::Acquire)
+    }
+
     /// 現在の理想的な再生位置 (秒) を返す。
-    /// 一時停止中は audio_pts のスナップショットを返す (時間が進まない)。
-    /// シーク中 (override が設定されている間) は target を返し続ける。
+    /// - シーク中 (override 設定中) は target を返す
+    /// - audio_active = true なら audio_pts + 経過 (audio master)
+    /// - そうでなければ fallback_pts + 経過 (wall clock master)
+    /// 一時停止中はスナップショット (extrapolation 停止)。
     pub fn now_secs(&self) -> f64 {
-        // ── seek override が立っていれば最優先で target を返す ──
         let override_bits = self.seek_target_override_bits.load(Ordering::Acquire);
         if override_bits != SEEK_NONE {
             return f64::from_bits(override_bits);
         }
-        let pts = f64::from_bits(self.audio_pts_bits.load(Ordering::Acquire));
-        if !self.playing.load(Ordering::Acquire) {
+        let playing = self.playing.load(Ordering::Acquire);
+        if self.audio_active.load(Ordering::Acquire) {
+            let pts = f64::from_bits(self.audio_pts_bits.load(Ordering::Acquire));
+            if !playing {
+                return pts;
+            }
+            let recorded = self.audio_recorded_at_nanos.load(Ordering::Acquire);
+            if recorded == 0 {
+                return pts;
+            }
+            let now = self.epoch.elapsed().as_nanos() as i64;
+            return pts + (now - recorded).max(0) as f64 / 1_000_000_000.0;
+        }
+        // ── 音声無し / 出力失敗時は wall clock anchor で進行 ──
+        let pts = f64::from_bits(self.fallback_pts_bits.load(Ordering::Acquire));
+        if !playing {
             return pts;
         }
-        let recorded = self.audio_recorded_at_nanos.load(Ordering::Acquire);
+        let recorded = self.fallback_recorded_at_nanos.load(Ordering::Acquire);
         if recorded == 0 {
-            // まだ音声出力が始まっていない → 0 を返す (動画は冒頭で待機)
             return pts;
         }
         let now = self.epoch.elapsed().as_nanos() as i64;
-        let elapsed = (now - recorded).max(0) as f64 / 1_000_000_000.0;
-        pts + elapsed
+        pts + (now - recorded).max(0) as f64 / 1_000_000_000.0
+    }
+
+    /// decoder のペーシングが「自分が今の clock からどれだけ先行しているか」を
+    /// 判定するために使う。`now_secs()` をそのまま返す (audio master / fallback
+    /// wall のどちらかに対して 100ms 先までしか先行させない)。
+    ///
+    /// 注意: `displayed_video_pts + wall経過` を `max` で混ぜると、tick が表示
+    /// しない期間 (queue 全部 future) でも wall が進んで extrapolation が暴走し、
+    /// decoder が UI 進捗を過大評価 → pacing 止まる → drop に陥る。
+    pub fn video_pacing_now_secs(&self) -> f64 {
+        self.now_secs()
     }
 
     pub fn is_playing(&self) -> bool {
@@ -132,14 +219,22 @@ impl AvClock {
         if playing == self.playing.load(Ordering::Acquire) {
             return;
         }
+        let now_ns = self.epoch.elapsed().as_nanos() as i64;
         if playing {
-            // 再生再開: recorded_at を今に巻き戻す (PTS は据え置き)
-            let now_ns = self.epoch.elapsed().as_nanos() as i64;
+            // 再生再開: audio / fallback 両方の recorded_at を今に巻き戻す
             self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
+            // fallback も同時アンカー (audio が無いケースで now_secs が wall 進行する)
+            let cur_fallback = f64::from_bits(self.fallback_pts_bits.load(Ordering::Acquire));
+            // 一時停止前の fallback_pts はそのまま、recorded_at だけ更新
+            let _ = cur_fallback;
+            self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
         } else {
-            // 一時停止: PTS を「今の now_secs」で固定 (= 巻き戻し抑止)
+            // 一時停止: 現時刻スナップショットで固定 (どちらの master でも巻き戻し抑止)
             let frozen = self.now_secs();
-            self.audio_pts_bits.store(frozen.to_bits(), Ordering::Release);
+            if self.audio_active.load(Ordering::Acquire) {
+                self.audio_pts_bits.store(frozen.to_bits(), Ordering::Release);
+            }
+            self.fallback_pts_bits.store(frozen.to_bits(), Ordering::Release);
         }
         self.playing.store(playing, Ordering::Release);
     }
@@ -154,22 +249,40 @@ impl AvClock {
     ///   - `0` = 絶対 (シークバー直接クリック)。decoder は `..target_pts`
     pub fn request_seek(&self, target_secs: f64, direction: i8) {
         let clamped = target_secs.max(0.0);
-        // serial を先に進めて、override / request を同じ serial で揃える。
-        // (順序: seek_serial → override → seek_request の順。read 側は seek_request
-        // を Mutex で取るので、Mutex 解放までに override も serial も書き終わっている。)
+        // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
+        // decoder の EOF wait ループも peek_seek_request_pending で起床する。
+        self.eof_reached.store(false, Ordering::Release);
         let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
-        // override は新世代の serial で先に書き、now_secs() からは即座に target が見える。
         self.seek_override_serial
             .store(new_serial, Ordering::Release);
         self.seek_target_override_bits
             .store(clamped.to_bits(), Ordering::Release);
-        // request 本体は Mutex で整合的に書き、decoder に new_serial で渡す。
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
             target_secs: clamped,
             direction,
             serial: new_serial,
         });
+    }
+
+    /// 現在 seek の override が立っているか (= seek 完了待ち)。tick が EOF 検出を
+    /// 抑制するために使う。
+    pub fn is_seeking(&self) -> bool {
+        self.seek_target_override_bits.load(Ordering::Acquire) != SEEK_NONE
+    }
+
+    pub fn notify_eof_reached(&self) {
+        self.eof_reached.store(true, Ordering::Release);
+    }
+    pub fn clear_eof_reached(&self) {
+        self.eof_reached.store(false, Ordering::Release);
+    }
+    pub fn is_eof_reached(&self) -> bool {
+        self.eof_reached.load(Ordering::Acquire)
+    }
+    /// decoder の EOF wait が seek 要求を非破壊で確認するための peek。
+    pub fn peek_seek_request_pending(&self) -> bool {
+        self.seek_request.lock().unwrap().is_some()
     }
 
     /// デコーダ側で呼ぶ。pending なシーク要求があれば取り出す。
@@ -199,8 +312,29 @@ impl AvClock {
     /// fill_output 側 (post-seek 後最初の有効サンプル消費時) または UI tick 側
     /// (post-seek 後最初の動画フレーム到着時) で行う。
     pub fn notify_seek_completed(&self, new_pts: f64) {
+        let now_ns = self.epoch.elapsed().as_nanos() as i64;
         self.audio_pts_bits.store(new_pts.to_bits(), Ordering::Release);
-        self.audio_recorded_at_nanos.store(0, Ordering::Release);
+        // ⚠️ 旧コードは sentinel 0 を入れて `now_secs()` が target で凍結する設計
+        // だったが、cpal のハードウェアバッファ drain 待ち (~500ms) の間 fill_output
+        // が新世代 sample にたどり着かず set_audio_pts が呼ばれず、 結果 UI 表示が
+        // 0.5 秒近く凍結する現象が観測された。
+        //
+        // 解: recorded_at = 今 にしておき、now_secs を wall 推定で進める。
+        // 後追いで届く実 audio pts が現在値より小さくても `set_audio_pts` の単調性
+        // ガードで後退を防ぐ → AV sync は最大 ~500ms 一時的にズレるが、video の
+        // 凍結は無くなる。
+        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
+        // fallback wall clock も seek 位置に巻き戻す。
+        self.fallback_pts_bits.store(new_pts.to_bits(), Ordering::Release);
+        self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
+        // pre-seek の audio バッファ会計を 0 に。
+        // pump 側は serial discard で実物を捨てるが、会計値だけ残ると pacing が
+        // 「audio 十分」と誤認して decoder が sleep し、新世代 audio packet を
+        // 読まなくなる → clock 進行停止 → 表示停止 (post-seek hang)。
+        self.audio_pump_buf_secs_bits
+            .store(0.0_f64.to_bits(), Ordering::Release);
+        self.audio_tx_queued_secs_bits
+            .store(0.0_f64.to_bits(), Ordering::Release);
     }
 
     /// post-seek 後の有効フレーム / サンプルを最初に消費した時に呼ぶ。
@@ -232,6 +366,40 @@ impl AvClock {
             Ordering::Acquire,
         );
     }
+
+    /// pump 内ringbuffer 残量 (秒) を報告 (audio.rs から)。
+    pub fn set_audio_pump_buf_secs(&self, secs: f64) {
+        self.audio_pump_buf_secs_bits
+            .store(secs.to_bits(), Ordering::Release);
+    }
+
+    /// audio_tx に積まれているフレーム合計時間 (秒) の差分を加える。
+    /// decoder の send 直後に +duration、pump の recv 直後に -duration を呼ぶ。
+    pub fn add_audio_tx_queued_secs(&self, delta_secs: f64) {
+        // f64 の atomic 加算は CAS ループで実装。短時間の write 競合のみなのでコスト低。
+        let mut cur = self.audio_tx_queued_secs_bits.load(Ordering::Relaxed);
+        loop {
+            let new_val = (f64::from_bits(cur) + delta_secs).max(0.0);
+            match self.audio_tx_queued_secs_bits.compare_exchange_weak(
+                cur,
+                new_val.to_bits(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// 現在の総音声バッファ秒数 (= pump + audio_tx queued)。
+    /// decoder pacing が「audio が枯渇しそう (= 沈黙する) を回避すべきか」判定する。
+    pub fn total_audio_buffer_secs(&self) -> f64 {
+        let pump = f64::from_bits(self.audio_pump_buf_secs_bits.load(Ordering::Acquire));
+        let tx = f64::from_bits(self.audio_tx_queued_secs_bits.load(Ordering::Acquire));
+        pump + tx
+    }
+
 
     pub fn volume(&self) -> f64 {
         f64::from_bits(self.volume_bits.load(Ordering::Acquire))

@@ -2005,6 +2005,8 @@ pub struct App {
     /// hover 中の target_secs key が変わるたびに `set()` で in-place 更新する。
     /// (fs_idx, bucket_key, TextureHandle) — fs_idx 切替時に再作成。
     pub(crate) video_seek_thumb_tex: Option<(usize, i64, egui::TextureHandle)>,
+    /// 動画再生位置の自動保存タイマ (5 秒間隔)。
+    pub(crate) video_resume_last_save: Option<std::time::Instant>,
 
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
@@ -2429,6 +2431,7 @@ impl Default for App {
             perf_last_flush: None,
             fs_painted_last: None,
             video_seek_thumb_tex: None,
+            video_resume_last_save: None,
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,
             window_visible: true,
@@ -9299,6 +9302,26 @@ impl App {
         // 動画は専用パス: VideoPlayer を作って fs_cache に直接入れる。
         // 通常の画像デコードスレッドは起動しない。
         if let Some(GridItem::Video(vp)) = self.items.get(idx).cloned() {
+            // 1 動画につき 1 cpal stream に限定する。`contains_key(idx)` チェックの
+            // 外で実行することで、再 start_fs_load (= fullscreen 戻り遷移) でも
+            // 古い video エントリが残らないことを保証する (Codex 助言)。
+            let other_video_idxs: Vec<usize> = self
+                .fs_cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    if *k != idx && matches!(v, FsCacheEntry::Video { .. }) {
+                        Some(*k)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !other_video_idxs.is_empty() {
+                self.save_all_video_resume_positions();
+                for k in other_video_idxs {
+                    self.fs_cache.remove(&k);
+                }
+            }
             if !self.fs_cache.contains_key(&idx) {
                 let vol = if self.settings.video_start_muted {
                     0.0
@@ -9306,7 +9329,16 @@ impl App {
                     self.settings.video_volume
                 };
                 let autoplay = self.settings.video_autoplay;
-                let player = crate::video::VideoPlayer::open(vp, vol, autoplay);
+                // resume 位置の取得: 直近に保存した位置を渡して最初の info 受領後に
+                // 自動シークさせる。Windows の case-insensitive パスを揃えるため
+                // adjustment_db::normalize_path に合わせる。
+                let path_key = crate::adjustment_db::normalize_path(&vp);
+                let resume = self
+                    .settings
+                    .video_resume_positions
+                    .get(&path_key)
+                    .copied();
+                let player = crate::video::VideoPlayer::open(vp, vol, autoplay, resume);
                 if self.settings.video_start_muted {
                     player.set_muted(true);
                 }
@@ -9805,6 +9837,8 @@ impl App {
         let prefetch_targets: Vec<usize> =
             interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
 
+        // 退避前に動画の再生位置を保存 (退避された Video エントリは drop で消える)
+        self.save_all_video_resume_positions();
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
 
@@ -9869,6 +9903,8 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
+        self.save_all_video_resume_positions();
         // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
         // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
         // 実行される。ms を計測してブロックの所在を特定する。
@@ -11629,8 +11665,28 @@ impl App {
     /// 動画再生プレイヤーの tick。
     /// fs_cache 内の `FsCacheEntry::Video` ごとに [`crate::video::VideoPlayer::tick`] を呼ぶ。
     /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
+    pub(crate) fn save_all_video_resume_positions(&mut self) {
+        let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        for entry in self.fs_cache.values() {
+            if let FsCacheEntry::Video { player, .. } = entry {
+                let key = crate::adjustment_db::normalize_path(player.path());
+                updates.push((key, player.position(), player.duration()));
+            }
+        }
+        for (key, pos, dur) in updates {
+            save_video_resume_position(&mut self.settings.video_resume_positions, key, pos, dur);
+        }
+    }
+
     pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
         let mut next_repaint: Option<std::time::Duration> = None;
+        // 5 秒ごとに動画再生位置を settings に書き戻す (drop 漏れ救済)。
+        let now = std::time::Instant::now();
+        let do_save = self
+            .video_resume_last_save
+            .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
+            .unwrap_or(true);
+        let mut updates: Vec<(String, f64, f64)> = Vec::new();
         for entry in self.fs_cache.values_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 if let Some(d) = player.tick(ctx) {
@@ -11639,6 +11695,16 @@ impl App {
                         None => d,
                     });
                 }
+                if do_save {
+                    let path_key = crate::adjustment_db::normalize_path(player.path());
+                    updates.push((path_key, player.position(), player.duration()));
+                }
+            }
+        }
+        if do_save {
+            self.video_resume_last_save = Some(now);
+            for (key, pos, dur) in updates {
+                save_video_resume_position(&mut self.settings.video_resume_positions, key, pos, dur);
             }
         }
         if let Some(d) = next_repaint {
@@ -13864,7 +13930,32 @@ pub(crate) fn draw_cell(
 
 }
 
-/// 右下オレンジ角丸バッジ。コンテナ★バッジが左下なので衝突しない配置。
+/// resume 対象とみなす最小 position (秒)。これ未満は「最初から」扱い。
+pub(crate) const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 3.0;
+/// 動画末端からこの秒数以下に位置していたら完走扱いで削除する。
+pub(crate) const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
+
+/// 動画再生位置を `Settings::video_resume_positions` に保存する。
+/// - position が `VIDEO_RESUME_MIN_POSITION_SECS` 未満 → エントリ削除 (最初から)
+/// - 残り `VIDEO_RESUME_END_GUARD_SECS` 以下 → エントリ削除 (完走済み)
+/// - それ以外 → position を保存
+fn save_video_resume_position(
+    map: &mut std::collections::HashMap<String, f64>,
+    key: String,
+    position: f64,
+    duration: f64,
+) {
+    if position < VIDEO_RESUME_MIN_POSITION_SECS {
+        map.remove(&key);
+        return;
+    }
+    if duration > 0.0 && position >= duration - VIDEO_RESUME_END_GUARD_SECS {
+        map.remove(&key);
+        return;
+    }
+    map.insert(key, position);
+}
+
 fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count: u32) {
     let text = if count >= 1000 {
         "999+".to_string()

@@ -82,6 +82,16 @@ impl FsCacheEntry {
     }
 }
 
+impl Drop for FsCacheEntry {
+    fn drop(&mut self) {
+        // Video エントリは drop 前に明示 shutdown して cpal stream / pump を即停止。
+        // フィールド drop 順任せだと数百 ms 前動画の音声が hardware buffer から流れ続ける。
+        if let FsCacheEntry::Video { player, .. } = self {
+            player.shutdown();
+        }
+    }
+}
+
 /// 単一フレームを GPU テクスチャ上限 (`MAX_TEXTURE_DIM`) 以下に縮める。
 /// 上限内ならそのまま返す。巨大 animated GIF/APNG が `ctx.load_texture` で
 /// panic しないようにするための安全網。

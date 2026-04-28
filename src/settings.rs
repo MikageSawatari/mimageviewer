@@ -790,6 +790,11 @@ pub struct Settings {
     /// 起動時にミュートで開始するか (オフィス環境などでの保険)。
     #[serde(default)]
     pub video_start_muted: bool,
+    /// 動画ファイルごとの最終再生位置 (絶対パス → 秒)。
+    /// `VideoPlayer::open` 時に自動 resume、5 秒ごと + drop 時に保存。
+    /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
+    #[serde(default)]
+    pub video_resume_positions: std::collections::HashMap<String, f64>,
 }
 
 fn default_video_volume() -> f64 {
@@ -1005,6 +1010,7 @@ impl Default for Settings {
             video_autoplay: true,
             video_loop: false,
             video_start_muted: false,
+            video_resume_positions: std::collections::HashMap::new(),
         }
     }
 }

@@ -43,6 +43,8 @@ pub struct AudioFrame {
     pub samples: Vec<f32>,
     pub pts_secs: f64,
     pub seek_serial: u64,
+    /// このフレーム分の再生時間 (秒)。total audio buffer の差分加算に使う。
+    pub duration_secs: f64,
 }
 
 /// デコード開始時に分かる動画情報。UI の HUD で利用。
@@ -76,7 +78,11 @@ pub fn spawn(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
 ) -> DecodeHandles {
-    let (video_tx, video_rx) = bounded::<VideoFrame>(4);
+    // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
+    // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
+    // 維持し、vsync 1 周期で取り損ねた分を次周期に displayable な状態で
+    // 取れるようにする。bounded(4) では 60fps で常に Full → drop に陥る。
+    let (video_tx, video_rx) = bounded::<VideoFrame>(8);
     let (audio_tx, audio_rx) = bounded::<AudioFrame>(32);
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
 
@@ -145,6 +151,11 @@ fn run_decoder(
     let video_stream_idx = video_stream.index();
     let video_time_base = video_stream.time_base();
     let video_params = video_stream.parameters();
+    let video_avg_fps = {
+        let r = video_stream.avg_frame_rate();
+        let d = r.denominator();
+        if d == 0 { 0.0 } else { r.numerator() as f64 / d as f64 }
+    };
 
     let video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params) {
         Ok(c) => c,
@@ -238,27 +249,71 @@ fn run_decoder(
     };
 
     let has_audio = audio_setup.is_some();
+    if !has_audio {
+        // 音声無し動画: 最初から fallback wall clock を使う
+        clock.mark_audio_inactive();
+    }
 
     // ── 動画情報を通知 ──
     let duration_secs = duration_to_secs(input.duration());
+    let video_codec_name = video_decoder
+        .codec()
+        .map(|c| c.name().to_string())
+        .unwrap_or_else(|| "?".to_string());
     let info = VideoInfo {
         width: src_w,
         height: src_h,
         duration_secs,
-        video_codec: video_decoder
-            .codec()
-            .map(|c| c.name().to_string())
-            .unwrap_or_else(|| "?".to_string()),
+        video_codec: video_codec_name.clone(),
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         has_audio,
     };
     let _ = info_tx.send(Ok(info));
+
+    // perf: 動画特性を 1 行に記録 (解析時の最初の手がかり)。
+    if crate::perf::is_enabled() {
+        let pix_fmt = format!("{:?}", src_fmt);
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file_size = std::fs::metadata(&path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+        let (audio_codec, audio_rate, audio_ch) = audio_setup
+            .as_ref()
+            .map(|a| (a.codec_name.clone(), a.out_rate as i64, 2_i64))
+            .unwrap_or_else(|| ("none".to_string(), 0, 0));
+        crate::perf::event(
+            "video",
+            "open",
+            None,
+            0,
+            &[
+                ("file", serde_json::Value::from(file_name)),
+                ("file_size", serde_json::Value::from(file_size)),
+                ("width", serde_json::Value::from(src_w as i64)),
+                ("height", serde_json::Value::from(src_h as i64)),
+                ("dst_w", serde_json::Value::from(dst_w as i64)),
+                ("dst_h", serde_json::Value::from(dst_h as i64)),
+                ("pix_fmt", serde_json::Value::from(pix_fmt)),
+                ("video_codec", serde_json::Value::from(video_codec_name)),
+                ("avg_fps", serde_json::Value::from(video_avg_fps)),
+                ("duration_secs", serde_json::Value::from(duration_secs)),
+                ("audio_codec", serde_json::Value::from(audio_codec)),
+                ("audio_rate", serde_json::Value::from(audio_rate)),
+                ("audio_channels", serde_json::Value::from(audio_ch)),
+            ],
+        );
+    }
 
     // ── デコードループ ──
     let video_tb_num = video_time_base.numerator() as f64;
     let video_tb_den = video_time_base.denominator() as f64;
     let mut audio_setup = audio_setup;
     let mut current_seek_serial: u64 = 0;
+    // 直前に video_tx へ enqueue 成功したフレームの pts。pts ギャップ計測用。
+    let mut last_enqueued_pts: f64 = 0.0;
     // post-seek preroll: avformat_seek_file は target ぴったりではなく
     // **直前の keyframe** に戻ることが多い。そのまま再生すると seek 直前の
     // PTS (例: 10s) のフレームが届き、それで AvClock が更新されてシークバーが
@@ -320,6 +375,8 @@ fn run_decoder(
             if let Some(ref mut a) = audio_setup {
                 a.decoder.flush();
             }
+            // notify_seek_completed が pre-seek 音声会計のリセットも担う
+            // (post-seek hang 防止のため不可分)。
             clock.notify_seek_completed(target_secs);
         }
 
@@ -342,6 +399,7 @@ fn run_decoder(
                 break 'outer;
             }
             if stream.index() == video_stream_idx {
+                let send_t0 = std::time::Instant::now();
                 if let Err(e) = video_decoder.send_packet(&packet) {
                     crate::logger::log(format!("video send_packet: {e}"));
                     continue;
@@ -351,6 +409,7 @@ fn run_decoder(
                     if cancel.load(Ordering::Acquire) {
                         break 'outer;
                     }
+                    let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                     let pts = frame.pts().unwrap_or(0);
                     let pts_secs = (pts as f64) * video_tb_num / video_tb_den;
                     // post-seek preroll: target 前のフレームは描画しない
@@ -393,13 +452,61 @@ fn run_decoder(
                     // フレームを drop して音声経路を生かす (Codex 指摘)。これにより
                     // 動画 demux/decode が UI の消費に詰まったときも音声 demux/decode が
                     // 止まらず、音声 ringbuf の underrun = ブチブチノイズを防ぐ。
-                    use crossbeam_channel::TrySendError;
-                    match video_tx.try_send(frame_out) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            // UI 側が遅れている。動画フレームを 1 枚捨てて音声を生かす。
+                    let scale_ms = send_t0.elapsed().as_secs_f64() * 1000.0 - decode_ms;
+
+                    // ── デコーダのペーシング ──
+                    //
+                    // pts が `video_pacing_now_secs() + PACE_LEAD` 以上先行している間 sleep。
+                    // pacing 無しだと try_send Full でフレーム連続 drop → channel 内 pts が
+                    // 不連続になり UI 側で「数百 ms 凍結 → ジャンプ」のカクツキを生む。
+                    //
+                    // audio safety: audio_active かつ総音声バッファが AUDIO_SAFE_LO 以下なら
+                    // pacing skip して audio packet 読み込みを優先 (sleep で audio 枯渇させない)。
+                    const PACE_LEAD_SECS: f64 = 0.10;
+                    const AUDIO_SAFE_LO: f64 = 0.25;
+                    while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                        let ahead = pts_secs - clock.video_pacing_now_secs();
+                        if ahead <= PACE_LEAD_SECS {
+                            break;
                         }
-                        Err(TrySendError::Disconnected(_)) => break 'outer,
+                        if clock.is_audio_active()
+                            && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
+                        {
+                            // audio が枯渇しそう → pacing skip して decoder を進める
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+
+                    // perf: 直前に enqueue した pts との差を記録 (= channel に
+                    // 入っているフレームの pts ギャップが分かる、dropped_full だけでは
+                    // 「どれくらい飛んだか」が見えないため)。
+                    let pts_gap = pts_secs - last_enqueued_pts;
+                    use crossbeam_channel::TrySendError;
+                    let send_result = video_tx.try_send(frame_out);
+                    let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
+                    if !dropped_full && send_result.is_ok() {
+                        last_enqueued_pts = pts_secs;
+                    }
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "video",
+                            "decode",
+                            None,
+                            0,
+                            &[
+                                ("pts", serde_json::Value::from(pts_secs)),
+                                ("decode_ms", serde_json::Value::from(decode_ms.round() / 1.0)),
+                                ("scale_ms", serde_json::Value::from(scale_ms.round() / 1.0)),
+                                ("dropped_full", serde_json::Value::from(dropped_full)),
+                                ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
+                                ("audio_buf_secs", serde_json::Value::from(clock.total_audio_buffer_secs())),
+                                ("pace_now", serde_json::Value::from(clock.video_pacing_now_secs())),
+                            ],
+                        );
+                    }
+                    if let Err(TrySendError::Disconnected(_)) = send_result {
+                        break 'outer;
                     }
                 }
                 break; // 1 パケット消費したらループ先頭でシークチェック
@@ -487,12 +594,19 @@ fn run_decoder(
                             }
                         }
 
+                        // 1 stereo pair = 2 float (samples_per_sec stereo = a.out_rate * 2)
+                        let duration_secs = (samples.len() / 2) as f64 / a.out_rate as f64;
                         let frame_out = AudioFrame {
                             samples,
                             pts_secs,
                             seek_serial: current_seek_serial,
+                            duration_secs,
                         };
+                        // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
+                        // 競合しないよう順序を保つ。失敗時はロールバック (Codex 指摘)。
+                        clock.add_audio_tx_queued_secs(duration_secs);
                         if audio_tx.send(frame_out).is_err() {
+                            clock.add_audio_tx_queued_secs(-duration_secs);
                             break 'outer;
                         }
                     }
@@ -501,13 +615,31 @@ fn run_decoder(
             }
         }
         if !got_packet {
-            // EOF
-            break;
+            // EOF or demux stall。先に seek 要求をチェック (race で EOF flag 立てる
+            // 前に新シークが来ていれば即通常ループに戻る)。
+            if clock.peek_seek_request_pending() {
+                continue;
+            }
+            // EOF 確定。スレッドは終わらせず、cancel か新しい seek 要求が来るまで
+            // idle ループで待つ。これで末尾停止後の re-seek / replay が
+            // decoder 再生成なしで動作する。
+            clock.notify_eof_reached();
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    crate::logger::log(format!(
+                        "video decoder finished: {}",
+                        path.display()
+                    ));
+                    return;
+                }
+                if clock.peek_seek_request_pending() {
+                    clock.clear_eof_reached();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
-
-    crate::logger::log(format!("video decoder finished: {}", path.display()));
-    // 関数スコープを抜ける際に video_tx / audio_tx が drop され、UI 側に EOF が伝わる。
 }
 
 struct AudioSetup {

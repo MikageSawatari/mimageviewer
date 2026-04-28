@@ -19,24 +19,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
 
-/// 音声出力ストリーム。drop すると自動で停止する。
+/// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
+/// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする (Codex 指摘)。
 pub struct AudioOutput {
     /// cpal Stream は !Send。Option にして drop 時に明示的に落とす。
-    _stream: cpal::Stream,
+    stream: Option<cpal::Stream>,
     /// pump thread の停止フラグ。
     cancel: Arc<AtomicBool>,
+    /// pump スレッド起床用 (recv_timeout より速く抜けるため)。
+    shutdown_tx: Sender<()>,
+    /// pump スレッドハンドル。drop で join する。
+    pump: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
 }
 
 impl Drop for AudioOutput {
     fn drop(&mut self) {
+        // 1. pump 停止指示
         self.cancel.store(true, Ordering::Release);
-        // _stream は drop で停止
+        let _ = self.shutdown_tx.try_send(());
+        // 2. Stream を pause して直ちに新規 callback を停止 → drop で完全終了
+        if let Some(stream) = self.stream.take() {
+            use cpal::traits::StreamTrait;
+            let _ = stream.pause();
+            drop(stream);
+        }
+        // 3. pump を join (cancel + shutdown signal で 100ms 以内に終了)
+        if let Some(p) = self.pump.take() {
+            let _ = p.join();
+        }
     }
 }
 
@@ -104,17 +120,16 @@ pub fn start(
     }));
 
     let cancel = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
     // ── pump thread: audio_rx → buffer ──
-    // 注: AV クロックの set_audio_pts は cpal callback (fill_output) 側で行う。
-    //     pump thread は単にバッファに samples を積むだけなので clock は持たない。
     let pump_buffer = buffer.clone();
     let pump_cancel = cancel.clone();
     let pump_clock = clock.clone();
-    std::thread::Builder::new()
+    let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
-            run_pump(audio_rx, pump_buffer, pump_cancel, pump_clock);
+            run_pump(audio_rx, shutdown_rx, pump_buffer, pump_cancel, pump_clock);
         })
         .map_err(|e| format!("spawn audio-pump: {e}"))?;
 
@@ -137,14 +152,24 @@ pub fn start(
         .map_err(|e| format!("stream.play: {e}"))?;
 
     Ok(AudioOutput {
-        _stream: stream,
+        stream: Some(stream),
         cancel,
+        shutdown_tx,
+        pump: Some(pump_handle),
         sample_rate,
     })
 }
 
+/// `AudioBuffer.samples` の長さを秒に変換して clock に publish する。
+/// pump push / fill_output pop の両方から呼ばれる。
+fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
+    let secs = buf.samples.len() as f64 / buf.samples_per_sec;
+    clock.set_audio_pump_buf_secs(secs);
+}
+
 fn run_pump(
     rx: Receiver<AudioFrame>,
+    shutdown_rx: crossbeam_channel::Receiver<()>,
     buffer: Arc<Mutex<AudioBuffer>>,
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
@@ -159,12 +184,20 @@ fn run_pump(
         (b.sample_rate as usize * 2 * 3) / 2
     };
 
+    let mut activated = false;
     while !cancel.load(Ordering::Acquire) {
-        let frame = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(f) => f,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        // shutdown 通知が先に来たら即抜ける (drop 時のレイテンシ削減)。
+        // 通常時は audio_rx の recv_timeout で 100ms 周期に cancel 確認。
+        let frame = crossbeam_channel::select! {
+            recv(shutdown_rx) -> _ => return,
+            recv(rx) -> msg => match msg {
+                Ok(f) => f,
+                Err(_) => break, // disconnected
+            },
         };
+
+        // recv 直後に audio_tx queued 合計から減算 (decoder send 時 + に対応)
+        clock.add_audio_tx_queued_secs(-frame.duration_secs);
 
         // バッファ満杯なら一旦待つ。Condvar 化は将来の最適化。
         loop {
@@ -183,16 +216,22 @@ fn run_pump(
         if frame.seek_serial < buf.pump_seek_serial || frame.seek_serial < clock_serial {
             continue;
         }
+        // audio master 化は **stale 破棄を通過したフレーム** で実施 (Codex 指摘)。
+        if !activated {
+            clock.notify_audio_active();
+            activated = true;
+        }
         if frame.seek_serial > buf.pump_seek_serial {
             // 新しい seek 世代: バッファをクリアして PTS を再設定
             buf.samples.clear();
             buf.next_pts_secs = frame.pts_secs;
             buf.pump_seek_serial = frame.seek_serial;
-        }
-        if buf.samples.is_empty() {
+        } else if buf.samples.is_empty() && frame.pts_secs > buf.next_pts_secs {
+            // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)
             buf.next_pts_secs = frame.pts_secs;
         }
         buf.samples.extend(frame.samples.iter().copied());
+        publish_buffer_secs(&buf, &clock);
     }
     crate::logger::log("audio-pump terminated");
 }
@@ -207,6 +246,8 @@ fn fill_output(out: &mut [f32], buffer: &Arc<Mutex<AudioBuffer>>, clock: &Arc<Av
     if buf.pump_seek_serial < clock_serial {
         // 古い (pre-seek) サンプルを破棄。pump がすぐに新世代を埋めてくれる。
         buf.samples.clear();
+        // pacing が古い残量を読まないよう 0 を publish (Mutex 内、stale 上書き race 回避)。
+        publish_buffer_secs(&buf, clock);
         out.fill(0.0);
         return;
     }
@@ -245,6 +286,10 @@ fn fill_output(out: &mut [f32], buffer: &Arc<Mutex<AudioBuffer>>, clock: &Arc<Av
     buf.next_pts_secs += consumed_secs;
     let pts_now = buf.next_pts_secs;
     let pump_serial = buf.pump_seek_serial;
+    // publish は Mutex 内で行う。Mutex 外に出すと run_pump の push 後 publish が
+    // stale な fill_output 側 publish に上書きされる race がある (Codex 指摘)。
+    // overhead = 1 atomic store ≈ 1 ns 程度なので RT への影響は無視できる。
+    publish_buffer_secs(&buf, clock);
     drop(buf);
     if pump_serial >= clock.current_seek_serial() {
         clock.set_audio_pts(pts_now);
