@@ -226,12 +226,26 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
 
 /// ONNX Runtime ラッパー。
 /// アプリ全体で 1 つだけ作成し、`Arc<AiRuntime>` で共有する。
+///
+/// ## Phase 3 アーキテクチャ
+///
+/// メインプロセスは **常に DirectML** で初期化される (`backend.effective` は
+/// 常に `DirectMl` または `Cpu`)。TensorRT を使いたいときは `worker_pool` に
+/// `TrtWorkerPool` を attach し、TRT 対応モデルの推論を子プロセスにルーティング
+/// する。これにより:
+///
+/// - バックエンド切り替えで再起動が不要 (worker を attach/detach するだけ)
+/// - TRT で動かないモデル (MI-GAN, Classifier) は DirectML で動かせる
+/// - TRT クラッシュで GUI 全体が落ちない
 pub struct AiRuntime {
-    /// ModelKind → Session のキャッシュ。
+    /// ModelKind → Session のキャッシュ (DirectML ローカルセッション)。
     /// Session::run() は &mut self なので Mutex が必要。
     sessions: Mutex<HashMap<ModelKind, Session>>,
     /// 現プロセスで実際にロードされたバックエンド情報。
     backend: ActiveBackend,
+    /// TRT 推論ワーカープール。`None` なら全推論ローカル DirectML。
+    /// 設定で TRT 有効化時に attach され、無効化で detach される (ホットリロード)。
+    worker_pool: Mutex<Option<std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>>>,
 }
 
 impl AiRuntime {
@@ -258,6 +272,7 @@ impl AiRuntime {
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
             backend: active,
+            worker_pool: Mutex::new(None),
         })
     }
 
@@ -266,6 +281,93 @@ impl AiRuntime {
     #[allow(dead_code)]
     pub fn active_backend(&self) -> &ActiveBackend {
         &self.backend
+    }
+
+    /// TRT ワーカープールを attach する (Phase 3、ホットリロード対応)。
+    /// 既に attach されている場合は古いものを drop してから差し替える
+    /// (drop で worker プロセスが shutdown される)。
+    pub fn attach_worker_pool(
+        &self,
+        pool: std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>,
+    ) {
+        *self.worker_pool.lock().unwrap() = Some(pool);
+        crate::logger::log("[AI] TRT worker pool attached".to_string());
+    }
+
+    /// TRT ワーカープールを detach する (停止)。
+    #[allow(dead_code)]
+    pub fn detach_worker_pool(&self) {
+        let prev = self.worker_pool.lock().unwrap().take();
+        if let Some(pool) = prev {
+            // Arc 内 TrtWorkerPool は Drop で shutdown_and_wait される。
+            // ここでは Arc::strong_count をチェックして他で使われていなければ
+            // 即時 drop されるが、共有されていたら最後の Arc が drop されたとき
+            // にクリーンアップされる。
+            crate::logger::log(format!(
+                "[AI] TRT worker pool detached (other Arc refs: {})",
+                std::sync::Arc::strong_count(&pool) - 1
+            ));
+            drop(pool);
+        }
+    }
+
+    /// TRT ワーカープールが attach されているか。
+    #[allow(dead_code)]
+    pub fn has_worker_pool(&self) -> bool {
+        self.worker_pool.lock().unwrap().is_some()
+    }
+
+    /// 指定モデルが TRT ワーカーへルーティングされるかを判定する。
+    ///
+    /// 条件:
+    /// - worker pool が attach 済み
+    /// - そのモデルが TRT で動かしてうれしいタイプ
+    ///   - Upscale 系 (5 モデル): 1.4-3.4x 高速化
+    ///   - Denoise: 4.5x 高速化
+    ///   - MI-GAN: TRT エンジンビルドが 5+ 分かかるため、安定するまで DirectML
+    ///   - Classifier: TRT で engine 生成されない (CUDA EP fallback、効果なし)
+    pub fn should_route_to_worker(&self, kind: ModelKind) -> bool {
+        if !self.has_worker_pool() {
+            return false;
+        }
+        match kind {
+            ModelKind::InpaintMiGan => false,
+            ModelKind::ClassifierMobileNet => false,
+            ModelKind::UpscaleRealEsrganX4Plus
+            | ModelKind::UpscaleRealEsrganAnime6B
+            | ModelKind::UpscaleRealEsrGeneralV3
+            | ModelKind::UpscaleRealCugan4x
+            | ModelKind::UpscaleNmkdSiax4x
+            | ModelKind::DenoiseRealplksr => true,
+        }
+    }
+
+    /// TRT ワーカー経由で推論を実行する。
+    ///
+    /// 呼び出し前に `should_route_to_worker(kind) == true` でなければならない
+    /// (worker_pool が None だと panic ではなく Err を返す)。
+    /// 戻り値: `(出力 shape NCHW, 平坦化された Vec<f32>)`。
+    ///
+    /// ワーカー側は initial LoadModel を要求する仕様なので、ここで lazy load する
+    /// (1 度ロードしたモデルは worker 側で kept、再 LoadModel は idempotent)。
+    pub fn infer_via_worker(
+        &self,
+        kind: ModelKind,
+        input: &ndarray::Array4<f32>,
+    ) -> Result<(Vec<i64>, Vec<f32>), AiError> {
+        let pool_opt = self.worker_pool.lock().unwrap().clone();
+        let pool = pool_opt.ok_or_else(|| {
+            AiError::Ort("infer_via_worker: pool が attach されていない".to_string())
+        })?;
+        // ワーカー側で lazy load (idempotent)。failure は Err にフォワード。
+        if let Err(e) = pool.load_model(kind) {
+            return Err(AiError::Ort(format!(
+                "worker.load_model({kind:?}): {e}"
+            )));
+        }
+        pool.infer(kind, input).map_err(|e| {
+            AiError::Ort(format!("worker.infer({kind:?}): {e}"))
+        })
     }
 
     /// 指定モデルのセッションがロード済みか確認する。

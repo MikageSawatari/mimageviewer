@@ -10027,32 +10027,75 @@ impl App {
     }
 
     /// AI ランタイムとモデルマネージャを遅延初期化する。
-    /// バックエンドは Settings の `ai_backend` から解決する (None = DirectML)。
+    ///
+    /// Phase 3 アーキテクチャ:
+    /// - メイン: 常に DirectML で AiRuntime を作る (`ai_backend` 設定値に依らない)
+    /// - 設定が TensorRt: 別プロセス TrtWorkerPool を起動して runtime に attach
+    ///   (失敗時は DirectML のみで動作、UI で通知)
     pub(crate) fn ensure_ai_runtime(&mut self) {
         if self.ai_runtime.is_none() {
-            let backend = self
-                .settings
-                .ai_backend
-                .as_deref()
-                .and_then(crate::ai::AiBackend::from_str)
-                .unwrap_or_default();
-            match crate::ai::runtime::AiRuntime::new_with_backend(backend) {
+            // 常に DirectML で起動 (Phase 3)
+            match crate::ai::runtime::AiRuntime::new_with_backend(
+                crate::ai::AiBackend::DirectMl,
+            ) {
                 Ok(rt) => {
                     let active = rt.active_backend();
                     crate::logger::log(format!(
-                        "[AI] Runtime initialized (requested={:?}, effective={:?})",
+                        "[AI] Runtime initialized (DirectML always in main, requested={:?}, effective={:?})",
                         active.requested, active.effective
                     ));
-                    if let Some(reason) = &active.fallback_reason {
-                        crate::logger::log(format!("[AI] フォールバック理由: {reason}"));
+                    let runtime_arc = std::sync::Arc::new(rt);
+
+                    // 設定が TRT のとき、子プロセスでワーカープールを起動して attach
+                    let want_trt = self
+                        .settings
+                        .ai_backend
+                        .as_deref()
+                        .and_then(crate::ai::AiBackend::from_str)
+                        == Some(crate::ai::AiBackend::TensorRt);
+                    if want_trt {
+                        Self::spawn_trt_worker_pool(&runtime_arc);
                     }
-                    self.ai_runtime = Some(std::sync::Arc::new(rt));
+
+                    self.ai_runtime = Some(runtime_arc);
                 }
                 Err(e) => {
                     crate::logger::log(format!("[AI] Runtime init failed: {e}"));
                 }
             }
         }
+    }
+
+    /// TRT ワーカープールをバックグラウンドで起動して runtime に attach する。
+    ///
+    /// 起動には ORT init + DLL preload + ハンドシェイクで数秒かかるので、
+    /// メインスレッドで同期実行すると UI が固まる。`std::thread::spawn` で
+    /// 別スレッドに逃がし、起動完了したら attach する。
+    ///
+    /// 起動失敗時は AiRuntime は DirectML のままで動作続行し、ログにエラーを残す。
+    fn spawn_trt_worker_pool(runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>) {
+        let runtime_for_thread = runtime.clone();
+        std::thread::Builder::new()
+            .name("trt-worker-spawn".to_string())
+            .spawn(move || {
+                crate::logger::log(
+                    "[AI] TRT worker pool バックグラウンド起動を試行中...".to_string(),
+                );
+                match crate::ai::trt_worker_pool::TrtWorkerPool::start() {
+                    Ok(pool) => {
+                        runtime_for_thread.attach_worker_pool(std::sync::Arc::new(pool));
+                        crate::logger::log(
+                            "[AI] TRT worker pool 起動成功、attach 完了".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "[AI] TRT worker pool 起動失敗 (DirectML のみで動作): {e}"
+                        ));
+                    }
+                }
+            })
+            .ok();
     }
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。
