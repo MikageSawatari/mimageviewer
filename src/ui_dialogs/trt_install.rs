@@ -62,6 +62,11 @@ pub struct TrtInstallState {
     /// ので最後の FileProgress が来ない可能性があるため)。
     last_file_bytes_done: u64,
     last_file_name: String,
+    /// Done フェーズに遷移後、まだ TensorRT バックエンドの自動有効化を行って
+    /// いないなら true。`take_backend_activation` で 1 回だけ消費される。
+    /// (App 側がこれを見て settings.ai_backend = "tensorrt" を書き、worker pool を
+    /// 起動する)。
+    needs_backend_activation: bool,
 }
 
 impl TrtInstallState {
@@ -80,7 +85,17 @@ impl TrtInstallState {
             extract_total: 0,
             last_file_bytes_done: 0,
             last_file_name: String::new(),
+            needs_backend_activation: false,
         }
+    }
+
+    /// Done 遷移後に呼び、TensorRT バックエンドの自動有効化フラグを 1 回消費する。
+    /// True を返した場合、App 側で settings.ai_backend = "tensorrt" + save +
+    /// apply_ai_backend_change を実行すべき。
+    pub fn take_backend_activation(&mut self) -> bool {
+        let v = self.needs_backend_activation;
+        self.needs_backend_activation = false;
+        v
     }
 
     /// Confirm 画面で [開始] が押された時に呼ぶ。worker を spawn して Running へ。
@@ -172,6 +187,9 @@ impl TrtInstallState {
                 }
                 Some(InstallProgress::Done) => {
                     self.phase = TrtInstallPhase::Done;
+                    // App 側で 1 回だけ TensorRT 自動有効化を実行するためのフラグ。
+                    // Done 描画される最初のフレームで App が消費する。
+                    self.needs_backend_activation = true;
                     transitioned = true;
                     break;
                 }
@@ -196,6 +214,26 @@ impl TrtInstallState {
 }
 
 impl App {
+    /// install 完了直後に呼ばれ、TensorRT バックエンドを「保存 + ホットスイッチ」する。
+    ///
+    /// `apply_ai_backend_change` は worker pool の起動/停止を担当するメソッドで、
+    /// 環境設定ダイアログの Apply パスからも呼ばれる。設定値変更を伴うので
+    /// settings 永続化もここでやる。
+    ///
+    /// 起動失敗時は `apply_ai_backend_change` 内で `report_worker_spawn_failed`
+    /// が呼ばれ、UI バナー (trt_worker_notice) で通知される。
+    fn activate_tensorrt_after_install(&mut self) {
+        let prev = self.settings.ai_backend.clone();
+        self.settings.ai_backend = Some("tensorrt".to_string());
+        self.settings.save();
+        crate::logger::log(format!(
+            "[AI] install 完了後、ai_backend を自動切替: {:?} -> tensorrt",
+            prev
+        ));
+        // ホットスイッチ (= worker pool を起動)。再起動不要。
+        self.apply_ai_backend_change(Some("tensorrt"));
+    }
+
     /// インストールダイアログ本体。`update()` から毎フレーム呼ぶ。
     /// ダイアログを開いていない (= state が None) ときは即 return。
     pub(crate) fn show_trt_install_dialog(&mut self, ctx: &egui::Context) {
@@ -207,6 +245,13 @@ impl App {
         // Running なら 1 フレーム分の進捗を吸う。
         if state.phase == TrtInstallPhase::Running {
             state.pump_progress();
+        }
+
+        // Done に遷移したフレームで TensorRT を自動有効化 (= ホットスイッチ)。
+        // worker 分離アーキテクチャなのでアプリ再起動は不要。take_backend_activation
+        // は 1 回だけ true を返すので、Done 描画中の毎フレーム実行にはならない。
+        if matches!(state.phase, TrtInstallPhase::Done) && state.take_backend_activation() {
+            self.activate_tensorrt_after_install();
         }
 
         let mut close_dialog = false;
@@ -388,8 +433,15 @@ fn draw_done_phase(ui: &mut egui::Ui, close: &mut bool) {
     );
     ui.add_space(4.0);
     ui.label(
-        "次回 mImageViewer の起動時に TensorRT が自動的に有効になります。\n\
-         今すぐ反映するには、アプリを終了して再度起動してください。",
+        "TensorRT が有効になりました。アップスケール / デノイズはこれより \
+         TensorRT 経由で動作します (アプリ再起動は不要)。",
+    );
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "※ ワーカープロセスの起動でエラーが出た場合は画面右上に通知が出ます。",
+        )
+        .small(),
     );
     ui.separator();
     if ui.button("閉じる").clicked() {

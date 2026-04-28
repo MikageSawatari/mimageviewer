@@ -28,7 +28,23 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// SHM 名の seq 部分。プロセス内で start_with_exe が呼ばれるたびに 1 加算する。
+///
+/// 同一 PID で `miv_trt_in_<pid>_<seq>` が衝突するのを避けるため。原則として
+/// pool は 1 個しか attach されない (= 同時に 2 つ start することはない) が、
+/// 以下のケースで前回の SHM ハンドルが残っているとカーネルオブジェクトが残存し
+/// `CreateFileMappingW` が `ERROR_ALREADY_EXISTS` を返してしまうため:
+///
+/// - pool detach → drop が遅延して、次の start_with_exe との間で重なる
+/// - 子プロセス側が SHM を open した状態で main 側が drop しても、子側のハンドル
+///   保持中はカーネルオブジェクトが残る (= 子プロセスの shutdown 完了待ちが必要)
+/// - 何らかのバグで Drop パスをスキップした場合 (panic 経由など)
+///
+/// seq を毎回更新すれば、上記のような残骸 SHM があっても新規 start は成功する。
+/// SHM 名は `WorkerCmd::Infer` で子プロセスに毎回送るので、子側の互換性問題はない。
+static SHM_SEQ: AtomicU32 = AtomicU32::new(0);
 
 use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerResp};
 
@@ -183,9 +199,11 @@ impl TrtWorkerPool {
 
         // 永続共有メモリを pool 起動時に 1 回だけ確保。worker 側も最初の Infer で
         // open + cache する (毎回 open しない)。
+        // seq はプロセス内グローバルカウンタ。残骸 SHM 衝突を回避する目的。
         let pid = std::process::id();
-        let in_shm_name = shm_name("in", pid, 0);
-        let out_shm_name = shm_name("out", pid, 0);
+        let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let in_shm_name = shm_name("in", pid, seq);
+        let out_shm_name = shm_name("out", pid, seq);
         let in_shm = SharedMem::create(&in_shm_name, PERSIST_IN_SHM_SIZE)
             .map_err(|e| format!("create persistent in_shm: {e}"))?;
         let out_shm = SharedMem::create(&out_shm_name, PERSIST_OUT_SHM_SIZE)
