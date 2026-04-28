@@ -147,8 +147,15 @@ pub fn run_worker_process() -> ! {
         std::process::exit(1);
     }
 
-    // load_model() の中で session.commit_from_file() が呼ばれ、これが engine compile を
-    // 走らせる。所要時間: 初回 30 秒〜数分、エンジンキャッシュ HIT 時は数百 ms。
+    // load_model() の中で session.commit_from_file() が呼ばれる。動的形状モデル
+    // (Real-ESRGAN / NMKD-Siax / RealCUGAN / MI-GAN) では、ここでは TRT engine が
+    // **完全には** ビルドされない (ORT TRT EP は最初の session.run() まで shape 単位
+    // のコンパイルを遅延する)。
+    //
+    // そのため、load_model 直後に **runtime と同じ shape のダミー入力** で session.run
+    // を 1 回走らせて engine を強制的にコンパイル + cache に書かせる。これがないと
+    // 「全エンジンビルド」しても初回推論で 30〜60 秒の hang が出てユーザー体験が
+    // 致命的に悪い (Apr 28 の調査で発見)。
     emit(&TrtBuildEvent::Compiling {
         model_kind: kind_str.clone(),
     });
@@ -161,6 +168,30 @@ pub fn run_worker_process() -> ! {
         });
         std::process::exit(1);
     }
+
+    // ── warmup inference: runtime tile size でダミー session.run ──
+    // ここが本当の TRT engine compile (30〜60 秒) を走らせる箇所。
+    // load_model だけでは static shape モデル (DenoiseRealplksr 256×256) しか
+    // engine を作れず、動的 shape のアップスケール系は runtime 1 タイル目で
+    // 再コンパイルが走ってしまう。
+    let (n, c, h, w) = warmup_input_shape(kind);
+    let dummy = ndarray::Array4::<f32>::zeros((n, c, h, w));
+    let warmup_result = runtime.with_session(kind, |session| {
+        let tensor = ort::value::Tensor::from_array(dummy)
+            .map_err(|e| super::AiError::Ort(format!("warmup tensor: {e}")))?;
+        let _ = session
+            .run(ort::inputs![tensor])
+            .map_err(|e| super::AiError::Ort(format!("warmup session.run: {e}")))?;
+        Ok(())
+    });
+    if let Err(e) = warmup_result {
+        emit(&TrtBuildEvent::Error {
+            model_kind: kind_str.clone(),
+            message: format!("warmup inference failed: {e}"),
+        });
+        std::process::exit(1);
+    }
+
     let elapsed_ms = t0.elapsed().as_millis() as u64;
 
     let cache_dir = super::tensorrt_pack::engine_cache_dir().join(kind.as_str());
@@ -170,6 +201,31 @@ pub fn run_worker_process() -> ! {
         cache_path: cache_dir.display().to_string(),
     });
     std::process::exit(0);
+}
+
+/// 各 ModelKind に対する warmup 推論の入力テンソル shape (N, C, H, W)。
+///
+/// runtime で実際に呼ばれる shape と一致させる必要がある。一致していないと
+/// TRT engine が runtime 1 タイル目で再コンパイルされ、ユーザーが体感する
+/// 30〜60 秒の hang が発生する。
+///
+/// shape の出どころ:
+/// - `ClassifierMobileNet`: `ai/classify.rs::preprocess` の `SIZE = 384`
+/// - `DenoiseRealplksr`: 256×256 固定 (モデル仕様)
+/// - `InpaintMiGan`: `ui_erase.rs::MIGAN_SIZE = 512`、4 ch (RGB + mask)
+/// - `UpscaleRealEsrGeneralV3`: TRT tile = 512 (`upscale.rs::model_tile_size`)
+/// - その他アップスケール: TRT tile = 256
+fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
+    match kind {
+        ModelKind::ClassifierMobileNet => (1, 3, 384, 384),
+        ModelKind::DenoiseRealplksr => (1, 3, 256, 256),
+        ModelKind::InpaintMiGan => (1, 4, 512, 512),
+        ModelKind::UpscaleRealEsrGeneralV3 => (1, 3, 512, 512),
+        ModelKind::UpscaleRealEsrganX4Plus
+        | ModelKind::UpscaleRealEsrganAnime6B
+        | ModelKind::UpscaleRealCugan4x
+        | ModelKind::UpscaleNmkdSiax4x => (1, 3, 256, 256),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
