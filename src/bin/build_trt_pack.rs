@@ -43,6 +43,50 @@ use sha2::{Digest, Sha256};
 /// CUDA / cuDNN / TensorRT / ORT のいずれかを更新したら bump する。
 const PACK_VERSION: u32 = 1;
 
+/// Apr 28 multi-model trim test で「全 6 モデルが動く最小セット」から除外可能と
+/// 確定した DLL のリスト。Round 1+2 (anime6b 単独) では nmkd_siax_4x がカバーされず
+/// 過剰削減になっていたため、**全 6 モデル (Real-ESRGAN x4plus / anime6b / general_v3 /
+/// RealCUGAN-4x / NMKD-Siax-4x / RealPLKSR) で TRT 推論が成功することを実機検証**した
+/// 結果のみを列挙する。
+///
+/// 検証手順 (`/tmp/trim_dlls_logs/multi_result.txt`):
+/// 1. tensorrt/ から DLL を 1 個移動
+/// 2. `bench_ai --models <6 modules> --backend tensorrt --runs 1` を実行
+/// 3. 1 モデルでも load_model / session.run で失敗したら REQUIRED と判定して復元
+/// 4. 全モデル "wall total" 出力に到達したら REMOVABLE と確定
+///
+/// `nvinfer_builder_resource_*.dll` は別判定 (= ライセンス上必ず除外、prefix match)。
+///
+/// 最終 REQUIRED DLL (= mIV 配布物に含まれる) は 13 個、約 1.9 GB:
+///   cublasLt64_12, cudart64_12, cudnn_ops64_9, cufft64_11, nvJitLink_120_0,
+///   nvinfer_10, nvinfer_plugin_10, nvrtc-builtins64_129, nvrtc64_120_0,
+///   onnxruntime, onnxruntime_providers_cuda/shared/tensorrt
+const REMOVABLE_DLLS: &[&str] = &[
+    // 数学ライブラリ系 (cuBLAS / cuFFTW / cuRAND / cuSOLVER / cuSPARSE)
+    "cublas64_12.dll",
+    "cufftw64_11.dll",
+    "curand64_10.dll",
+    "cusolver64_11.dll",
+    "cusolverMg64_11.dll",
+    "cusparse64_12.dll",
+    // cuDNN (cudnn_ops64_9 だけ REQUIRED で残す)
+    "cudnn64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_engines_tensor_ir64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    // TensorRT 補助 runtime (lean / dispatch / vc_plugin) と ONNX parser (engine 既ビルド済みで不要)
+    "nvinfer_lean_10.dll",
+    "nvinfer_dispatch_10.dll",
+    "nvinfer_vc_plugin_10.dll",
+    "nvonnxparser_10.dll",
+    // NVRTC alt variant (Hopper 系で使う代替経路、画像ビューワーでは未使用)
+    "nvrtc64_120_0.alt.dll",
+];
+
 /// 既存 INSTALL_OK の中身 (setup-tensorrt-pack.ps1 が書いた版情報)。
 #[derive(Debug, Deserialize)]
 struct InstallOk {
@@ -163,7 +207,8 @@ fn main() {
     // ── common DLLs ──
     let mut common: Vec<AssetEntry> = Vec::new();
     let mut common_total_bytes: u64 = 0;
-    let mut excluded_count: usize = 0;
+    let mut excluded_builder_resource: usize = 0;
+    let mut excluded_multi_trim: usize = 0;
 
     let dll_entries: Vec<_> = fs::read_dir(&src_pack)
         .unwrap()
@@ -186,8 +231,18 @@ fn main() {
         // ライセンス調査結果 (docs/licensing-tensorrt.md): builder_resource は再配布
         // 許諾が明確でないため除外。AMPERE_PLUS engine を事前ビルドして同梱する方針。
         if name.starts_with("nvinfer_builder_resource_") {
-            excluded_count += 1;
+            excluded_builder_resource += 1;
             println!("  excluded (builder_resource): {}", name);
+            continue;
+        }
+
+        // Apr 28 multi-model trim test (docs/licensing-tensorrt.md §最終 DLL セット):
+        // 全 6 モデル (Real-ESRGAN/CUGAN/NMKD-Siax/RealPLKSR) で TRT 推論が成功する
+        // 最小 DLL セットを実機検証して以下の DLL を除外。
+        // ORT/TRT EP が startup probe で実際にロードしないものを実機テストで確定。
+        if REMOVABLE_DLLS.contains(&name.as_str()) {
+            excluded_multi_trim += 1;
+            println!("  excluded (multi-model trim): {}", name);
             continue;
         }
 
@@ -269,10 +324,13 @@ fn main() {
     println!("出力ディレクトリ: {}", dist_dir.display());
     println!("manifest:        {}", manifest_path.display());
     println!(
-        "common DLL: {} 個、合計 {:.2} GB (builder_resource を {} 個除外)",
+        "common DLL: {} 個、合計 {:.2} GB \
+         (builder_resource を {} 個 + multi-model trim で {} 個 = 計 {} 個を除外)",
         manifest.common.len(),
         common_total_bytes as f64 / 1_073_741_824.0,
-        excluded_count
+        excluded_builder_resource,
+        excluded_multi_trim,
+        excluded_builder_resource + excluded_multi_trim
     );
     println!(
         "engine pack [ampere_plus]: {:.1} MiB",

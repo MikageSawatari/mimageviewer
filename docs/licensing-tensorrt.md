@@ -10,6 +10,30 @@ CUDA Toolkit 12.9, cuDNN 9.21, TensorRT 10.16
 
 ---
 
+## 結論 (Apr 28 確定)
+
+調査結果と Codex/Agent の独立アセスメントを踏まえ、配布物を以下の構成にする:
+
+1. **`nvinfer_builder_resource_*.dll` (全 8 種、合計 ~2.3 GB) は配布しない**
+   - TensorRT SLA 上「runtime files .so/.dll」に該当するか曖昧 (= グレーゾーン)
+   - NVIDIA 自身が TensorRT 10.12 で別パッケージへ分離する流れ
+   - 代わりに **mikage 側で AMPERE_PLUS モードで事前 build した engine ファイル**を
+     配布し、ユーザー機での engine compile は廃止
+2. **runtime DLL のみを GitHub Releases に置く** (CUDA Runtime / Math libs / cuDNN /
+   TensorRT runtime / ONNX Runtime)。各 EULA で明確に再配布許諾されているもののみ
+3. **実機 multi-model trim で実際に必要な DLL に絞り込み**: ORT/TRT EP が startup probe で
+   読み込む DLL 以外は除外可能。Round 1+2 の単一モデルテストでは過剰削減 (nmkd_siax で
+   crash) が発生したため、全 6 モデルを成功させる最小セットを別途決定 (本書末尾 §最終 DLL
+   セット参照)
+
+性能面: AMPERE_PLUS モード使用による減速は wall time 平均 +5.4%、最大 +8.8% (RTX 4090
+実測 Apr 28)。DirectML 比では依然 1.8-4x 高速。
+
+対応 GPU: RTX 30 / 40 / 50 series (compute capability 8.0 以上)。RTX 20 (Turing, sm75) は
+DirectML フォールバックで対応。
+
+---
+
 ## 概要表
 
 | DLL | 由来 | ライセンス | 再配布可否 (無料アプリ + zip 経由) | 出典 URL |
@@ -359,13 +383,74 @@ of this software and associated documentation files (the "Software"), ...
 
 ### 次のアクション
 
-- [ ] 実機 (RTX 4090) で TensorRT 推論を回し、`cusolverMg64_11.dll` / `nvrtc64_120_0.alt.dll`
-      / `nvonnxparser_10.dll` / `nvinfer_builder_resource_*` の実際のロード状況を Process
-      Explorer 等で確認 → 不要なものを zip から除外
-- [ ] 事前 build engine を NVIDIA 側 (= mIV ビルドマシン) で生成して GitHub Releases に
-      同梱する方針 A の実装可否を検討 (RTX 50 用 engine をビルドできる環境が必要)
+- [x] **実機 multi-model trim test 完了 (Apr 28)**: 全 6 モデルで TRT 推論を回し、
+      ロードされない DLL を実機検証。詳細は §最終 DLL セット参照
+- [x] **事前 build engine を mIV 側 (RTX 4090) で AMPERE_PLUS モードで生成**: sm80+ 全 GPU で
+      動作。RTX 20 (sm75) は将来 RunPod T4 で別途 build 想定 (現状は DirectML フォールバック)
 - [ ] mIV 利用規約に「同梱のサードパーティコンポーネントの権利は各社に帰属し、抽出・別再配布・
       リバースエンジニアリング等は禁止」の条項を追記
 - [ ] `NOTICE-NVIDIA.txt` と `LICENSE-onnxruntime.txt` (+ `ThirdPartyNotices.txt` あれば
-      それも) を zip に同梱する仕組みを GitHub Actions の release ジョブに追加
-- [ ] 不確実点 1〜4 が実用上残るなら、リリース前に NVIDIA に英文メールで照会
+      それも) を zip に同梱する仕組みを `build_trt_pack.rs` に追加
+- [ ] 不確実点 1〜2 (cusolverMg / nvrtc.alt の variant 解釈) は **実機で REMOVABLE と確定**
+      → 配布物から除外済みのため懸念解消。残り 3 (nvonnxparser) も **engine 既ビルド済みで
+      不要 → 除外済み**
+
+---
+
+## 最終 DLL セット (Apr 28 multi-model trim test 結果)
+
+mikage 機 (RTX 4090, Windows 11) で全 6 モデル (Real-ESRGAN x4plus / anime6b /
+general_v3 / RealCUGAN-4x / NMKD-Siax-4x / RealPLKSR) の TRT 推論を `bench_ai` で
+1 個ずつ DLL を抜きながら回した結果、以下が確定:
+
+### REQUIRED (= 配布する DLL、13 個 ≈ 1.86 GB)
+
+| DLL | サイズ | 役割 |
+|---|---:|---|
+| `nvinfer_10.dll` | 395 MB | TensorRT runtime コア |
+| `nvinfer_plugin_10.dll` | 46 MB | TensorRT 標準プラグイン |
+| `cublasLt64_12.dll` | 638 MB | cuBLAS Lite (TRT が AMPERE_PLUS でも startup 時に probe) |
+| `cufft64_11.dll` | 274 MB | cuFFT (ORT CUDA EP の startup 時に probe) |
+| `cudnn_ops64_9.dll` | 101 MB | cuDNN ops (cuDNN の中で唯一必須) |
+| `cudart64_12.dll` | 0.6 MB | CUDA Runtime |
+| `nvJitLink_120_0.dll` | 83 MB | JIT リンカ (PTX → kernel) |
+| `nvrtc64_120_0.dll` | 86 MB | NVRTC (ランタイムコンパイラ) |
+| `nvrtc-builtins64_129.dll` | 7 MB | NVRTC built-in 関数 |
+| `onnxruntime.dll` | 14 MB | ONNX Runtime コア |
+| `onnxruntime_providers_shared.dll` | 22 KB | ORT provider 共通 |
+| `onnxruntime_providers_cuda.dll` | 263 MB | ORT CUDA EP |
+| `onnxruntime_providers_tensorrt.dll` | 0.8 MB | ORT TensorRT EP |
+
+### REMOVABLE (= 配布しない DLL、27 個 ≈ 4.8 GB)
+
+```
+builder_resource (8): nvinfer_builder_resource_{ptx,sm75,sm80,sm86,sm89,sm90,sm100,sm120}_10.dll
+                     ← ライセンス上の判断 (再配布許諾不明確)、事前 build engine で代替
+
+数学ライブラリ (6):  cublas64_12, cufftw64_11, curand64_10, cusolver64_11,
+                     cusolverMg64_11, cusparse64_12
+                     ← AMPERE_PLUS 経路の TRT/CUDA EP は cuFFT のみ probe、他は不要
+
+cuDNN (8):           cudnn64_9, cudnn_adv64_9, cudnn_cnn64_9, cudnn_engines_*64_9 (×3),
+                     cudnn_graph64_9, cudnn_heuristic64_9
+                     ← AMPERE_PLUS は cuDNN tactic 無効、cudnn_ops64 のみ ORT が要求
+
+TensorRT 補助 (3):   nvinfer_lean_10, nvinfer_dispatch_10, nvinfer_vc_plugin_10
+                     ← バージョン互換 lib、フル nvinfer_10 を持っていれば不要
+
+ONNX parser (1):     nvonnxparser_10
+                     ← ユーザー機で ONNX → engine 変換しないため不要
+
+NVRTC alt (1):       nvrtc64_120_0.alt.dll
+                     ← Hopper 系の代替経路、画像ビューワーでは不使用
+```
+
+### 検証手順 (CI に組み込む場合)
+
+1. mikage 機で `setup-tensorrt-pack.ps1` 実行 → `%APPDATA%/mimageviewer/tensorrt/` に
+   フル展開 (~6.7 GB)
+2. `mimageviewer.exe --tensorrt-build <kind>` で 6 モデル分の AMPERE_PLUS engine を build
+3. 上記 REMOVABLE 27 個を `tensorrt/` から退避
+4. `bench_ai --image <test> --models all-6 --backend tensorrt --runs 1` を実行 →
+   全 6 モデル "wall total" に到達することを確認
+5. 1 個でも失敗したら `build_trt_pack.rs::REMOVABLE_DLLS` から該当を外す
