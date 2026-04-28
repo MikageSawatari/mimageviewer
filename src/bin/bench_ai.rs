@@ -82,6 +82,9 @@ struct Args {
     /// JSON 形式のサマリ出力先 (--json /path/to/file.json)。
     /// 後で複数バックエンド/モデルの結果を比較しやすくするため。
     json_output: Option<PathBuf>,
+    /// `--legacy-direct-trt`: Phase 2 の旧挙動 (main プロセスで直接 TRT ロード、
+    /// worker 不使用) で実行する。Phase 3 と Phase 2 のパフォーマンス比較用。
+    legacy_direct_trt: bool,
 }
 
 fn parse_args() -> Args {
@@ -94,6 +97,7 @@ fn parse_args() -> Args {
     let mut save_output: Option<PathBuf> = None;
     let mut backend: AiBackend = AiBackend::DirectMl;
     let mut json_output: Option<PathBuf> = None;
+    let mut legacy_direct_trt: bool = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -147,6 +151,9 @@ fn parse_args() -> Args {
                 i += 1;
                 json_output = Some(PathBuf::from(&raw[i]));
             }
+            "--legacy-direct-trt" => {
+                legacy_direct_trt = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -172,6 +179,7 @@ fn parse_args() -> Args {
         save_output,
         backend,
         json_output,
+        legacy_direct_trt,
     }
 }
 
@@ -226,14 +234,19 @@ fn main() {
     let mm = model_manager::ModelManager::new();
 
     // Phase 3 アーキテクチャ: メインは常に DirectML、TRT は別プロセスのワーカー。
-    // --backend tensorrt が指定された場合は DirectML で AiRuntime を作ってから
-    // TrtWorkerPool::start() を同期実行して attach する。bench は worker
-    // 起動完了を待ってから推論に進むため (UI と違って非同期スポーンする必要がない)。
-    let runtime = AiRuntime::new_with_backend(AiBackend::DirectMl)
-        .expect("AiRuntime::new_with_backend(DirectMl)");
+    // --legacy-direct-trt 時のみ、Phase 2 互換で main で直接 TRT を init する。
+    // (Phase 3 vs Phase 2 のパフォーマンス比較用)
+    let runtime = if args.legacy_direct_trt && args.backend == AiBackend::TensorRt {
+        println!("[legacy] AiRuntime::new_with_backend(TensorRt) — main で直接 TRT 初期化");
+        AiRuntime::new_with_backend(AiBackend::TensorRt)
+            .expect("AiRuntime::new_with_backend(TensorRt) [legacy]")
+    } else {
+        AiRuntime::new_with_backend(AiBackend::DirectMl)
+            .expect("AiRuntime::new_with_backend(DirectMl)")
+    };
     let runtime = std::sync::Arc::new(runtime);
 
-    if args.backend == AiBackend::TensorRt {
+    if args.backend == AiBackend::TensorRt && !args.legacy_direct_trt {
         // bench_ai は別 bin なので current_exe() は bench_ai.exe を返す。
         // ワーカーは mimageviewer.exe (--tensorrt-infer-worker subcommand を持つ
         // バイナリ) でなければならないため、sibling の mimageviewer.exe を指す。

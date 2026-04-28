@@ -33,6 +33,29 @@ pub fn run_infer_worker() -> ! {
         std::process::id()
     ));
 
+    // Windows: プロセス優先度を HIGH に設定。子プロセスのデフォルトは NORMAL で、
+    // Phase 3 計測で worker session.run が main 比 +15 ms/tile かかる原因として
+    // 「CUDA scheduling や Win32 スケジューラ粒度の影響」を疑い、検証のため設定。
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
+        };
+        let h = GetCurrentProcess();
+        match SetPriorityClass(h, HIGH_PRIORITY_CLASS) {
+            Ok(_) => {
+                crate::logger::log(
+                    "[TRT-worker] process priority = HIGH に設定".to_string(),
+                );
+            }
+            Err(e) => {
+                crate::logger::log(format!(
+                    "[TRT-worker] SetPriorityClass(HIGH) 失敗: {e:?}"
+                ));
+            }
+        }
+    }
+
     // ORT を TensorRT バックエンドで初期化。pack 不在なら DirectML フォールバック
     // するが、その場合は親が DirectML 経路で直接動かすべきなので、ここで TRT
     // フォールバックが起きたらエラーを返してすぐ exit する。
@@ -256,16 +279,45 @@ fn handle_infer(
     // ── 計装 phase 3+4: session.run() (純粋) + extract + 出力 shm 書き込み ──
     // closure 内では session.run のみを別個に計測し、extract+write は外で計測する
     // ことで GPU 純粋時間と CPU 後処理時間を分離する。
+    //
+    // 環境変数 MIV_TRT_BENCH_LOOP を設定すると、同じ tensor で session.run を N 回
+    // 連続実行して時間を計測 (Phase 3 調査用、最後の output だけ shm に書く)。
+    // 結果は logger に出力。N >= 2 で「IPC 間隔が原因か process-level か」が
+    // 分かる: 1st と 2nd 以降の差が大きければ IPC 間隔起因 (= GPU sleep)、
+    // 全部同じなら process-level の何か (= ORT/CUDA の固定 cost)。
+    let bench_loop_n: usize = std::env::var("MIV_TRT_BENCH_LOOP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let t_total = std::time::Instant::now();
     let out_shm_slot = &mut shm_cache.out_shm;
     let mut session_run_ms_inner: f64 = 0.0;
     let result: Result<Vec<i64>, super::AiError> = runtime.with_session(kind, |session| {
-        // phase 3: pure session.run() 計測
+        // phase 3: pure session.run() 計測 (オプションで連続 N 回)
         let t_run = std::time::Instant::now();
+        let mut consec_times: Vec<f64> = Vec::with_capacity(bench_loop_n);
+        // 最初の N-1 回は出力をすぐ drop して計測のみ (借用衝突回避)
+        for _ in 0..bench_loop_n.saturating_sub(1) {
+            let t_one = std::time::Instant::now();
+            let _outputs = session
+                .run(ort::inputs![tensor.view()])
+                .map_err(|e| super::AiError::Ort(format!("session.run: {e}")))?;
+            consec_times.push(t_one.elapsed().as_secs_f64() * 1000.0);
+            // _outputs はこのスコープで drop
+        }
+        // 最後の 1 回 (loop_n=1 の場合は唯一の) — 出力を保持
+        let t_one = std::time::Instant::now();
         let outputs = session
-            .run(ort::inputs![tensor])
+            .run(ort::inputs![tensor.view()])
             .map_err(|e| super::AiError::Ort(format!("session.run: {e}")))?;
+        consec_times.push(t_one.elapsed().as_secs_f64() * 1000.0);
         session_run_ms_inner = t_run.elapsed().as_secs_f64() * 1000.0;
+        if bench_loop_n > 1 {
+            crate::logger::log(format!(
+                "[TRT-worker] consecutive session.run times (n={}): {:?}",
+                bench_loop_n, consec_times
+            ));
+        }
 
         // phase 4: extract + shm write
         let (shape, raw) = outputs[0]
