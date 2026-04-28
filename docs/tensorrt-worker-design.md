@@ -340,6 +340,45 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 
 両者は別々のサブコマンド、別々のライフサイクル。
 
+### ⚠️ warmup 推論が必須 (Apr 28 追記)
+
+`run_worker_process` は `runtime.load_model()` だけでなく **runtime と同じ
+shape のダミー入力で `session.run()` を 1 回**走らせる必要がある。
+
+**理由**: ORT TensorRT EP は動的形状モデル (Real-ESRGAN / NMKD-Siax /
+RealCUGAN / MI-GAN) では engine compile を最初の `session.run()` まで遅延
+する仕様。`load_model` だけでは engine cache に空ファイル / 不完全ファイル
+しか書かれず、runtime 1 タイル目で 30〜60 秒の hang が出る。
+
+実例 (Apr 28 のユーザー報告):
+
+- 「全エンジンビルド」で 8 モデル全て成功表示
+- TRT に切替えてフルスクリーンで上下キー操作
+- ログに `session_run=53389.690 ms` (= 53.4 秒) 等の異常値
+- フルスクリーン中はその時間で次画像へ移動 → cancel
+- アップスケール成功 6 / 失敗 413 の壊滅的な体験
+
+修正は `tensorrt_builder.rs::warmup_input_shape(kind)` で各 ModelKind の
+runtime shape を返し、`load_model` 直後にダミー `session.run()` する形で
+実装。shape 一覧:
+
+| ModelKind | warmup shape (NCHW) | 由来 |
+|---|---|---|
+| ClassifierMobileNet | 1×3×384×384 | `ai/classify.rs::SIZE` |
+| DenoiseRealplksr | 1×3×256×256 | モデル仕様 (固定) |
+| InpaintMiGan | 1×**4**×512×512 | `ui_erase.rs::MIGAN_SIZE`、4 ch (RGB+mask) |
+| UpscaleRealEsrGeneralV3 | 1×3×512×512 | TRT tile=512 |
+| その他 Upscale 4 種 | 1×3×256×256 | TRT tile=256 |
+
+これらは `upscale.rs::model_tile_size` / `classify.rs::preprocess` /
+`ui_erase.rs::inpaint_migan` の実 runtime shape と一致させてある。
+変更時は同期忘れに注意 (一致しないと再び 30〜60 秒 hang が再発する)。
+
+副作用: 「全エンジンビルド」の所要時間が `LoadModel × 8 ≈ 数秒` から
+`(LoadModel + warmup) × 8 ≈ 5〜15 分` に伸びる。これが本来想定していた
+コンパイル時間で、ユーザー向けマニュアルにも「初回 5〜15 分」と書いてある
+(短すぎたのが今までバグ)。
+
 ## Phase 3 パフォーマンス測定結果
 
 Phase 3 着手前に懸念していた「ワーカー化で per-tile IPC overhead が大きく出るのでは」
