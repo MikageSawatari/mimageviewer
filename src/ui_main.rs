@@ -10,7 +10,8 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::grid_item::{GridItem, ThumbnailState};
-use crate::ui_helpers::open_external_player;
+// open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
+// インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
 use crate::ui_helpers::{
     PROGRESS_BG_COLOR, PROGRESS_LABEL_COLOR, PROGRESS_NORMAL_COLOR, PROGRESS_UPGRADE_COLOR,
@@ -1209,13 +1210,13 @@ impl App {
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::ZipSeparator { .. })
-                | Some(GridItem::PdfPage { .. }) => {
+                | Some(GridItem::PdfPage { .. })
+                | Some(GridItem::Video(_)) => {
+                    // 動画も画像と同じくフルスクリーン化 → VideoPlayer がインライン再生する。
+                    // 外部プレイヤーで開きたい場合はフルスクリーン中の Shift+Enter または
+                    // 右クリックメニューから (近日対応予定)。
                     self.bump_input_seq_for_item("grid_double_click", idx);
                     self.open_fullscreen(idx);
-                }
-                Some(GridItem::Video(p)) => {
-                    let vp = p.clone();
-                    open_external_player(&vp);
                 }
                 Some(GridItem::ConvertibleArchive { path, format }) => {
                     let pf = path.clone();

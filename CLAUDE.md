@@ -41,6 +41,7 @@ dual-window approach.
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
+- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec/avformat/avutil/swscale/swresample` の 5 DLL を `include_bytes!` で exe に埋め込み、初回起動時に `%APPDATA%/mimageviewer/ffmpeg/` に展開して `SetDllDirectoryW` 経由で動的ロード。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (3 プロセス並列レンダリング)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
@@ -110,6 +111,12 @@ mimageviewer/
 │   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
+│   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
+│   │   ├── mod.rs           # VideoPlayer 公開 API (open / tick / seek / volume…)
+│   │   ├── ffmpeg_loader.rs # DLL を APPDATA に展開し SetDllDirectoryW で検索パス設定
+│   │   ├── decoder.rs       # 動画/音声デコード worker (avformat/avcodec/swscale/swresample)
+│   │   ├── audio.rs         # cpal (WASAPI) 経由の音声出力 + ring buffer
+│   │   └── clock.rs         # AV マスタークロック (音声 PTS 基準、シーク/一時停止/音量)
 │   ├── video_thumb.rs       # 動画サムネイル取得（Windows Shell API）
 │   ├── zip_loader.rs        # ZIP アーカイブ内画像列挙・読み込み（ZIP in ZIP フラット展開、画像判定は is_recognized_image_ext 経由）
 │   ├── archive_converter.rs # 7z/LZH → 無圧縮 ZIP 変換（sevenz-rust2 / delharc）（v0.7.0）
@@ -128,7 +135,8 @@ mimageviewer/
 ├── scripts/
 │   ├── setup-pdfium.sh      # PDFium DLL ダウンロードスクリプト
 │   ├── setup-ort.sh         # ONNX Runtime DirectML DLL ダウンロードスクリプト
-│   └── setup-susie-worker.sh # Susie 32bit ワーカーのビルド＆配置スクリプト
+│   ├── setup-susie-worker.sh # Susie 32bit ワーカーのビルド＆配置スクリプト
+│   └── setup-ffmpeg.sh      # FFmpeg LGPL shared build (BtbN) ダウンロードスクリプト
 ├── vendor/
 │   ├── pdfium/              # PDFium DLL（.gitignore、setup-pdfium.sh で取得）
 │   │   └── bin/pdfium.dll   # include_bytes! で exe に埋め込まれる
@@ -139,9 +147,14 @@ mimageviewer/
 │   ├── ort/                 # ONNX Runtime DirectML DLL（.gitignore、setup-ort.sh で取得）
 │   │   ├── onnxruntime.dll  # include_bytes! で exe に埋め込まれる
 │   │   └── onnxruntime_providers_shared.dll
-│   └── susie-worker/        # 32bit Susie ワーカー exe（.gitignore、setup-susie-worker.sh で生成）
-│       └── mimageviewer-susie32.exe  # include_bytes! で exe に埋め込まれ、
-│                                     # 初回起動時に APPDATA へ自動展開
+│   ├── susie-worker/        # 32bit Susie ワーカー exe（.gitignore、setup-susie-worker.sh で生成）
+│   │   └── mimageviewer-susie32.exe  # include_bytes! で exe に埋め込まれ、
+│   │                                 # 初回起動時に APPDATA へ自動展開
+│   └── ffmpeg/              # FFmpeg LGPL shared build (.gitignore、setup-ffmpeg.sh で取得)
+│       ├── bin/             # avcodec/avformat/avutil/swscale/swresample DLL
+│       ├── include/         # ffmpeg-the-third のビルド時参照 (FFMPEG_DIR)
+│       ├── lib/             # import library (.lib)
+│       └── LICENSE.txt      # LGPLv2.1 本文 (ソフトウェア情報に転載する)
 ├── Cargo.toml
 └── Cargo.lock
 ```
@@ -452,6 +465,164 @@ bash scripts/setup-susie-worker.sh
 - メイン exe のリリースビルド前には **必ず** 実行する。未実行だとコンパイル時に
   `include_bytes!` が失敗する。
 
+## FFmpeg LGPL DLL 管理
+
+動画インライン再生 (フルスクリーンで MP4 / MKV / MOV / AVI / WMV / MPG / MPEG /
+HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を vendor に置く。
+
+⚠️ **配布形態はランチャー方式**。`ffmpeg-the-third` は MSVC import library 経由で
+通常リンクされ、Windows ローダが exe ロード時 (= Rust コードが走るより前) に DLL を
+解決するため、PDFium / ONNX Runtime のような「include_bytes! → APPDATA 展開」方式は
+直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
+rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
+
+そこで **ランチャー + 本体の 2 段構成** で「単体 exe 配布」を実現している:
+
+```
+配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
+├── include_bytes! で内包:
+│   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
+│   ├── avcodec-61.dll
+│   ├── avformat-61.dll
+│   ├── avutil-59.dll
+│   ├── swscale-8.dll
+│   └── swresample-5.dll
+└── 起動時の動作:
+    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 6 ファイルを展開
+       (サイズ一致チェックでスキップ、不一致なら .tmp → atomic rename)
+    2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
+    3. ランチャー即終了 (GUI なので exit code を待たない)
+```
+
+ランチャーは **FFmpeg API を一切呼ばない** ので Windows ローダの DLL 解決問題に
+直撃しない。core を spawn する時点で展開済み DLL が同じディレクトリにあるので、
+Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される。
+
+**バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
+古い core が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
+(Codex レビュー助言)。古いバージョンの runtime ディレクトリはユーザーが手動で
+削除可能 (将来的にランチャー側で「最新 N 世代だけ残す」掃除処理を追加するかも)。
+
+**ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
+`scripts/build-release.{sh,ps1}` が 2 段階に分けて呼ぶ:
+1. `cargo build --release --bin mimageviewer-core` → 本体生成
+2. `cargo build --release --bin mimageviewer` → ランチャー生成 (本体を include_bytes!)
+
+`cargo build --release` を直接打つ場合は ① → ② の順で 2 回打つこと。
+ランチャー側 build.rs が `target/release/mimageviewer-core.exe` の存在をチェックし、
+無ければ復旧手順付きで止まる。
+
+**配布物**:
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (約 365MB、内包する core + DLL を含む)
+- インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
+- どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
+
+### セットアップ (メインビルド前に必須)
+
+```bash
+bash scripts/setup-ffmpeg.sh           # BtbN の n7.1 系 LGPL shared build を取得
+bash scripts/setup-ffmpeg.sh check     # 新版があるか確認のみ
+```
+
+- 取得元: [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)
+  の `ffmpeg-n7.1*-win64-lgpl-shared-7.1.zip`
+- 出力先:
+  - `vendor/ffmpeg/bin/{avcodec,avformat,avutil,swscale,swresample}-*.dll`
+    — `include_bytes!` で exe に埋め込み
+  - `vendor/ffmpeg/include/`, `vendor/ffmpeg/lib/`
+    — `ffmpeg-the-third` の build.rs が `FFMPEG_DIR` 経由で参照
+    (`.cargo/config.toml` に `FFMPEG_DIR=vendor/ffmpeg` を設定済み)
+  - `vendor/ffmpeg/LICENSE.txt` — LGPLv2.1 の本文
+- 前提: `gh` (GitHub CLI), `unzip`, `curl` が PATH にあること。
+  さらに `ffmpeg-sys-the-third` のビルドに **libclang (LLVM/Clang)** が必要。
+  Visual Studio Installer の「C++ Clang コンパイラ」コンポーネントを入れるか、
+  独立した [LLVM インストーラ](https://github.com/llvm/llvm-project/releases) を使う。
+- **環境変数 `LIBCLANG_PATH` を必ず永続登録すること** (一度だけでよい):
+  ```powershell
+  [Environment]::SetEnvironmentVariable(
+      "LIBCLANG_PATH",
+      "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\Llvm\x64\bin",
+      "User"
+  )
+  ```
+  パスは VS のエディションによって変わる: `Microsoft Visual Studio\<バージョン>\<エディション>\VC\Tools\Llvm\x64\bin\libclang.dll` を `find`/`Get-ChildItem -Recurse` で探して使う。
+  登録後は **PowerShell を開き直す** (現セッションだけ反映するなら `$env:LIBCLANG_PATH = "..."`)。
+  未設定だと `cargo build` が `Cannot find clang: 'clang.dll', 'libclang.dll'` で失敗する。
+
+### バージョンを上げる場合
+
+FFmpeg メジャーが上がると DLL のメジャー番号が変わる (例: 7.x の `avcodec-61.dll` →
+8.x の `avcodec-62.dll`)。以下を **3 箇所すべて** 揃えて変更する:
+
+- `scripts/setup-ffmpeg.sh` の `ASSET_GLOB` (例: `ffmpeg-n8.0*-win64-lgpl-shared-8.0.zip`)
+- `src/video/ffmpeg_loader.rs` の `include_bytes!` パスと `DLLS` 配列のファイル名
+- `build.rs` の `vendor/ffmpeg/bin/avcodec-XX.dll` 等のチェックパス
+- `build.rs` の `/DELAYLOAD:avcodec-XX.dll` 等のリンカフラグ (DLL 名一致が必須)
+
+### 動作確認
+
+リリースビルド成果物:
+```
+target/release/mimageviewer.exe          # 配布用 (ランチャー、~365MB)
+target/release/mimageviewer-core.exe     # 本体 (内包される実体、単体では起動不可)
+```
+
+`mimageviewer.exe` をダブルクリックすると:
+1. 初回のみ `%APPDATA%\mimageviewer\runtime\0.8.2\` に core + 5 DLL を展開
+2. core が spawn されて自身のウィンドウを開く
+3. 動画フォルダで動画をダブルクリック → フルスクリーンでインライン再生開始
+
+2 回目以降は展開済みなのでスキップ (サイズ一致チェック)、起動が速い。
+
+### 開発時に core を直接起動したいとき
+
+ランチャー経由ではなく `target/release/mimageviewer-core.exe` を直接実行したい場合
+(デバッガアタッチ等)、FFmpeg DLL を手動でコピーする:
+```powershell
+Copy-Item vendor/ffmpeg/bin/*.dll target/release/
+```
+core 側はその時点で同居 DLL を直接使う (APPDATA 展開はランチャー専属の責務)。
+
+### LGPL ライセンス対応 (リリース時に必須)
+
+mIV 自身は MIT、FFmpeg は LGPLv2.1。**動的リンク** (DLL を別ファイルとして配布し
+`LoadLibrary` する形式) なら互換。`include_bytes!` で exe に埋め込んでも、最終的に
+APPDATA の DLL ファイルとして展開されるので動的リンクとして扱える。
+
+リリース前に以下を確認・更新する:
+
+1. **ソフトウェア情報 (環境設定 → ヘルプ)** に LGPL 通知を追記
+   ```
+   This software uses libraries from the FFmpeg project (https://ffmpeg.org/)
+   under the LGPLv2.1.
+   FFmpeg version: <vendor/ffmpeg/VERSION の内容>
+   Source: https://mikage.to/mimageviewer/ffmpeg-<VERSION>-source.tar.xz
+   License: https://www.gnu.org/licenses/lgpl-2.1.html
+   ```
+2. **mikage.to に LGPL 対応ソース tarball を配置**: BtbN がビルドに使った FFmpeg の
+   ソース tarball ([ffmpeg.org の Old Releases](https://ffmpeg.org/releases/)) を
+   `htdocs/mimageviewer/ffmpeg-<VERSION>-source.tar.xz` として転載。
+3. **DLL ファイル名を改変しない**: `avcodec-61.dll` 等のオリジナル名のまま展開する。
+4. **`installer/readme.txt` (Vector 同梱用)** にも LGPL 注記を 1 行追加。
+5. **GPL build を絶対に使わない**: BtbN の `*-gpl-shared-*` や gyan.dev の
+   "release-essentials" を使うと mIV 全体が GPL 汚染される。`setup-ffmpeg.sh` は
+   `*-lgpl-shared-*` のみを取りに行くようになっている。
+
+### Codec 対応範囲
+
+LGPL build には以下が含まれる (主要なもののみ):
+
+| コーデック | 対応 | 出元 |
+| --- | --- | --- |
+| H.264 / AVC | ✓ | OpenH264 (Cisco) を内蔵 |
+| HEVC / H.265 | ✓ | LGPL 互換の libdav1d + 内蔵デコーダ |
+| AV1 | ✓ | libdav1d |
+| VP9 | ✓ | libvpx |
+| MPEG-2 / MPEG-4 / MJPEG / WMV / VC-1 | ✓ | FFmpeg 内蔵 |
+| AAC / MP3 / Opus / FLAC / Vorbis / AC-3 / DTS | ✓ | FFmpeg 内蔵 |
+
+x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコードしか使わないので無問題)。
+
 ### テスト
 
 統合テスト (`tests/susie_integration.rs`) は `MIV_SUSIE_WORKER` 環境変数で
@@ -640,8 +811,11 @@ IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バ
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
 8. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 9. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
-   ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
-     不足していると `cargo build` が復旧手順付きで止まるようになっている。
+10. FFmpeg LGPL shared build の更新確認（`bash scripts/setup-ffmpeg.sh check`、
+    バージョンを上げる場合は `vendor/ffmpeg/VERSION` と `src/video/ffmpeg_loader.rs` の
+    DLL 名が一致するか確認）。LGPL 通知の更新も忘れずに (本ファイル「FFmpeg LGPL DLL 管理」節)
+    ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
+      不足していると `cargo build` が復旧手順付きで止まるようになっている。
 
 ### Phase 3: ビルド・配布成果物
 
@@ -713,16 +887,33 @@ Codex の出力は `[P1]` / `[P2]` / `[P3]` のような severity 付きで返�
 Codex は探索ステップ (grep / ファイル参照等) を流してから最後に `P1/P2/P3` サマリを
 出すので、探索ログが長いと重要な指摘が tail の外に流れ出す可能性がある。
 
-代わりに**全出力を一時ファイルに保存してから結論ブロックだけ抽出する**:
+**推奨: `-o` で最終メッセージだけ抽出する** (codex 0.124 以降):
 
 ```bash
-codex exec --sandbox read-only "…" > /tmp/codex-out.txt 2>&1
+codex exec --sandbox read-only -o /tmp/codex-final.txt "…レビュー依頼…" \
+    < /dev/null > /tmp/codex-events.log 2>&1
+cat /tmp/codex-final.txt   # ここに P1/P2/P3 サマリだけが入る
+```
+
+`codex exec --output-last-message <FILE>` (短縮形 `-o <FILE>`) で**最終回答 (= P1/P2/P3
+サマリ) だけ**をファイルに直接書き出せる。awk で抽出するより確実。
+
+### 必須: stdin を `< /dev/null` で閉じる
+
+`codex exec` は stdin がパイプ判定されるとそれを `<stdin>` ブロックとして読みに行き、
+EOF まで待機する (`Reading additional input from stdin...` と表示されたまま固まる)。
+Claude Code の Bash tool 経由で起動するときは stdin が常に何かに繋がっているので、
+**必ず `< /dev/null` を付ける**。これを忘れると 5 分以上ハングして手で kill する羽目になる。
+
+### awk で結論抽出する旧フォーマット (`-o` が使えない古い codex 用)
+
+```bash
+codex exec --sandbox read-only "…" < /dev/null > /tmp/codex-out.txt 2>&1
 # 最終結論 (最後の "codex" 行以降) を抽出
 awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 ```
 
-または `less /tmp/codex-out.txt` で目視確認する。短いタスクなら `tail -200` 程度に
-とること (目安: Codex 探索が 5 分超なら十分)。
+短いタスクなら `tail -200` 程度にとること (目安: Codex 探索が 5 分超なら十分)。
 
 ### 起動できないとき
 

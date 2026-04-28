@@ -9,6 +9,8 @@ bench_thumbs.tsv
 /vendor/models
 /vendor/susie-worker
 /vendor/ort
+/vendor/ffmpeg
+/dev/
 /testdata/
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
 /.claude/

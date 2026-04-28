@@ -776,6 +776,24 @@ pub struct Settings {
     /// 新バージョンが更にリリースされて tag が変われば再度通知する。
     #[serde(default)]
     pub update_check_dismissed_version: Option<String>,
+
+    // ── 動画インライン再生 ────────────────────────────────────────
+    /// 動画再生時の既定音量 (0.0-1.0)。
+    #[serde(default = "default_video_volume")]
+    pub video_volume: f64,
+    /// フルスクリーン化時に自動再生を開始するか。OFF なら最初のフレームで停止表示。
+    #[serde(default = "default_true")]
+    pub video_autoplay: bool,
+    /// 終端到達時に先頭から再生を繰り返すか。
+    #[serde(default)]
+    pub video_loop: bool,
+    /// 起動時にミュートで開始するか (オフィス環境などでの保険)。
+    #[serde(default)]
+    pub video_start_muted: bool,
+}
+
+fn default_video_volume() -> f64 {
+    0.6
 }
 
 /// グリッド列数の最小値
@@ -983,6 +1001,10 @@ impl Default for Settings {
             write_rating_to_xmp: false,
             update_check_enabled: true,
             update_check_dismissed_version: None,
+            video_volume: default_video_volume(),
+            video_autoplay: true,
+            video_loop: false,
+            video_start_muted: false,
         }
     }
 }

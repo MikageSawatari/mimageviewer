@@ -43,13 +43,21 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
+; 配布する exe はランチャー (`mimageviewer.exe`) のみ。ランチャーは本体
+; `mimageviewer-core.exe` と FFmpeg LGPL DLL 5 ファイルを include_bytes! で
+; 内包しており、初回起動時に %APPDATA%\mimageviewer\runtime\<version>\ へ
+; 自動展開する。詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節。
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; readme.txt はインストール先にも配置する (Vector 申請要件に合わせ、
 ; インストーラ単体でもそのまま使える形を保つ)。
 Source: "readme.txt"; DestDir: "{app}"; Flags: ignoreversion
-; Susie 32bit ワーカーは本体 exe に include_bytes! で埋め込まれており、
-; 初回起動時に %APPDATA%\mimageviewer\mimageviewer-susie32.exe へ自動展開される。
-; そのため別ファイルとしては同梱しない。
+; Susie 32bit ワーカーは本体 exe (mimageviewer-core.exe) に include_bytes! で
+; 埋め込まれており、初回起動時に %APPDATA%\mimageviewer\mimageviewer-susie32.exe
+; へ自動展開される。そのため別ファイルとしては同梱しない。
+;
+; FFmpeg LGPL ライセンス本文は %APPDATA% に展開する核に同梱されるが、
+; ライセンス対応のためインストール先にも配置しておく (ユーザーが見つけやすいように)。
+Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

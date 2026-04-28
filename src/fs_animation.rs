@@ -60,15 +60,23 @@ pub enum FsCacheEntry {
     },
     /// デコード失敗。UI は「読込失敗」表示を出す。
     Failed,
+    /// 動画ファイル (MP4/MKV/MOV/AVI/WMV/MPG/MPEG)。
+    /// `VideoPlayer` がデコーダワーカー・音声出力・AV クロックを所有する。
+    /// drop 時にすべてのスレッドが停止する。テクスチャは VideoPlayer 内部で
+    /// in-place 更新されるので、Static のように外側で持たない。
+    Video {
+        player: Box<crate::video::VideoPlayer>,
+        load_seq: u64,
+    },
 }
 
 impl FsCacheEntry {
-    /// perf 相関用。Static / Animated なら load_seq、Failed は 0。
+    /// perf 相関用。Static / Animated / Video なら load_seq、Failed は 0。
     pub fn load_seq(&self) -> u64 {
         match self {
-            FsCacheEntry::Static { load_seq, .. } | FsCacheEntry::Animated { load_seq, .. } => {
-                *load_seq
-            }
+            FsCacheEntry::Static { load_seq, .. }
+            | FsCacheEntry::Animated { load_seq, .. }
+            | FsCacheEntry::Video { load_seq, .. } => *load_seq,
             FsCacheEntry::Failed => 0,
         }
     }

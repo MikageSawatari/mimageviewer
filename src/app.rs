@@ -782,7 +782,7 @@ use crate::thumb_loader::{
 };
 use crate::ui_helpers::{
     draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
-    open_external_player, truncate_name,
+    truncate_name,
 };
 
 /// 消しゴムモードのツール種別。
@@ -6971,13 +6971,12 @@ impl App {
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
-                        | Some(GridItem::PdfPage { .. }) => {
+                        | Some(GridItem::PdfPage { .. })
+                        | Some(GridItem::Video(_)) => {
+                            // 動画も画像と同じくフルスクリーン化 → インライン再生。
+                            // 外部プレイヤー起動はフルスクリーン中の Shift+Enter から。
                             self.bump_input_seq_for_item("grid_enter", idx);
                             self.open_fullscreen(idx);
-                        }
-                        Some(GridItem::Video(p)) => {
-                            let vp = p.clone();
-                            open_external_player(&vp);
                         }
                         Some(GridItem::ConvertibleArchive { path, format }) => {
                             let pf = path.clone();
@@ -7801,8 +7800,15 @@ impl App {
                 self.update_prefetch_window(idx);
             }
             Some(GridItem::Video(_)) => {
-                // 動画はサムネイル + 再生ボタンのみ。高解像度読み込み不要。
-                crate::logger::log(format!("  video idx={idx} → play button mode"));
+                // 動画はインライン再生 (フルスクリーン化と同時に VideoPlayer を起動)。
+                // start_fs_load の早期分岐で GridItem::Video を検出し、
+                // FsCacheEntry::Video を fs_cache に挿入する。
+                if self.fs_cache.contains_key(&idx) {
+                    crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
+                } else {
+                    crate::logger::log(format!("  video idx={idx} → start inline playback"));
+                    self.start_fs_load(idx);
+                }
             }
             Some(GridItem::ZipSeparator { dir_display }) => {
                 // セパレータはテキスト表示のみ (デコード不要)
@@ -9284,6 +9290,31 @@ impl App {
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
+        // 動画は専用パス: VideoPlayer を作って fs_cache に直接入れる。
+        // 通常の画像デコードスレッドは起動しない。
+        if let Some(GridItem::Video(vp)) = self.items.get(idx).cloned() {
+            if !self.fs_cache.contains_key(&idx) {
+                let vol = if self.settings.video_start_muted {
+                    0.0
+                } else {
+                    self.settings.video_volume
+                };
+                let autoplay = self.settings.video_autoplay;
+                let player = crate::video::VideoPlayer::open(vp, vol, autoplay);
+                if self.settings.video_start_muted {
+                    player.set_muted(true);
+                }
+                self.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: self.input_seq,
+                    },
+                );
+            }
+            return;
+        }
+
         let (path, zip_entry, pdf_page, pdf_password) = match self.items.get(idx) {
             Some(GridItem::Image(p)) => (p.clone(), None, None, None),
             Some(GridItem::ZipImage {
@@ -11589,6 +11620,26 @@ impl App {
         }
     }
 
+    /// 動画再生プレイヤーの tick。
+    /// fs_cache 内の `FsCacheEntry::Video` ごとに [`crate::video::VideoPlayer::tick`] を呼ぶ。
+    /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
+    pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
+        let mut next_repaint: Option<std::time::Duration> = None;
+        for entry in self.fs_cache.values_mut() {
+            if let FsCacheEntry::Video { player, .. } = entry {
+                if let Some(d) = player.tick(ctx) {
+                    next_repaint = Some(match next_repaint {
+                        Some(prev) => prev.min(d),
+                        None => d,
+                    });
+                }
+            }
+        }
+        if let Some(d) = next_repaint {
+            ctx.request_repaint_after(d);
+        }
+    }
+
     // -------------------------------------------------------------------
     // サムネイル画質設定ダイアログ (A/B 比較)
     // -------------------------------------------------------------------
@@ -12486,6 +12537,7 @@ impl eframe::App for App {
         self.enqueue_visible_tag_prewarms();
 
         self.poll_prefetch(ctx);
+        self.poll_video(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_erase_inpaint(ctx);
         self.poll_search();

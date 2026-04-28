@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/susie-worker", "tools/png2mag"]
+members = ["crates/susie-worker", "crates/launcher", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"
@@ -7,6 +7,14 @@ version = "0.8.2"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
+
+# 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
+# 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。
+# ランチャーは初回起動時に core と FFmpeg DLL を %APPDATA% に展開して core を spawn する
+# (詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節を参照)。
+[[bin]]
+name = "mimageviewer-core"
+path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -21,6 +29,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_Security",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
@@ -81,6 +90,15 @@ tray-icon = "0.20"
 # rustls-tls 指定で OpenSSL に依存しない (CRT 静的リンク方針との両立)。
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 semver = "1"
+# 動画インライン再生 (フルスクリーンで MP4/MKV/MOV/AVI/WMV/MPG/MPEG を再生)。
+# BtbN の FFmpeg LGPL shared build を vendor/ffmpeg/ に置き、FFMPEG_DIR で参照する
+# (.cargo/config.toml に env で指定済み)。DLL は include_bytes! で exe に埋め込み、
+# 初回起動時に %APPDATA%/mimageviewer/ffmpeg/ に展開して動的ロードする。
+# *-sys のビルドに libclang (LLVM/Clang) が必要。詳細は CLAUDE.md の
+# 「FFmpeg セットアップ」節を参照。
+ffmpeg-the-third = { version = "3", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+# 動画の音声出力 (Windows では WASAPI Shared モード)。
+cpal = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

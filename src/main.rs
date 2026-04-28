@@ -76,6 +76,7 @@ mod ui_main;
 mod ui_metadata_panel;
 pub mod ui_susie_diagnostic;
 pub mod update_check;
+pub mod video;
 pub mod video_thumb;
 pub mod wic_decoder;
 pub mod xmp_reader;
