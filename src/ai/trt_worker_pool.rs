@@ -40,11 +40,8 @@ struct WorkerHandle {
 
 impl WorkerHandle {
     /// 親プロセス側でワーカー子プロセスを起動し、ハンドシェイクを待つ。
-    fn spawn() -> Result<Self, String> {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("current_exe: {e}"))?;
-
-        let mut child = Command::new(&exe)
+    fn spawn(exe: &std::path::Path) -> Result<Self, String> {
+        let mut child = Command::new(exe)
             .arg(TRT_INFER_WORKER_ARG)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -130,10 +127,24 @@ pub struct TrtWorkerPool {
 }
 
 impl TrtWorkerPool {
-    /// プールを起動 (子プロセスを spawn してハンドシェイク完了まで待つ)。
+    /// プールを起動 (現在の exe をワーカーとして spawn)。
+    /// メインアプリ (mimageviewer.exe) から呼ぶ用途。
     pub fn start() -> Result<Self, String> {
-        crate::logger::log("[TRT-worker-pool] 起動中...".to_string());
-        let worker = WorkerHandle::spawn()?;
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("current_exe: {e}"))?;
+        Self::start_with_exe(&exe)
+    }
+
+    /// プールを起動 (任意の exe パスをワーカーとして spawn)。
+    /// `bench_ai` 等の別 bin から呼ぶときは、sibling の `mimageviewer.exe` を
+    /// 指定する用途。指定 exe には `--tensorrt-infer-worker` 引数が付くので
+    /// 当該サブコマンド処理を持つバイナリでなければならない。
+    pub fn start_with_exe(exe: &std::path::Path) -> Result<Self, String> {
+        crate::logger::log(format!(
+            "[TRT-worker-pool] 起動中... worker={}",
+            exe.display()
+        ));
+        let worker = WorkerHandle::spawn(exe)?;
         crate::logger::log("[TRT-worker-pool] 起動完了".to_string());
         Ok(Self {
             worker: Mutex::new(Some(worker)),
@@ -239,14 +250,15 @@ impl TrtWorkerPool {
             ));
         }
         let out_bytes = out_shm.read_to_vec(out_bytes_len);
-        // SAFETY: out_bytes は Vec<u8>、f32 として再解釈する場合 alignment が問題。
-        // Vec<u8> の allocator は u8 粒度なので f32 alignment (4 byte) は満たさない
-        // 可能性がある。安全側に倒して 4 バイトずつ from_le_bytes でデコードする。
-        let mut output: Vec<f32> = Vec::with_capacity(out_count);
-        for i in 0..out_count {
-            let b = &out_bytes[i * 4..(i + 1) * 4];
-            output.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        // SAFETY: out_bytes は Vec<u8> で 8-byte 整列されている (Rust の Global
+        // allocator は最低 8 バイト境界、f32 の 4 バイト alignment より厳しい)。
+        // 中身は worker が書いた x86_64 little-endian の f32 なので、ポインタを
+        // *const f32 にキャストして slice を作り、そこから to_vec で Vec<f32> に
+        // コピーするだけで OK。byte-by-byte from_le_bytes ループより 100x 以上速い。
+        let output: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_count)
         }
+        .to_vec();
 
         Ok((output_shape, output))
     }

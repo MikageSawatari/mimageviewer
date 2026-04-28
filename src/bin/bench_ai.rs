@@ -224,25 +224,61 @@ fn main() {
 
     model_manager::ensure_models_extracted();
     let mm = model_manager::ModelManager::new();
-    let runtime =
-        AiRuntime::new_with_backend(args.backend).expect("AiRuntime::new_with_backend");
+
+    // Phase 3 アーキテクチャ: メインは常に DirectML、TRT は別プロセスのワーカー。
+    // --backend tensorrt が指定された場合は DirectML で AiRuntime を作ってから
+    // TrtWorkerPool::start() を同期実行して attach する。bench は worker
+    // 起動完了を待ってから推論に進むため (UI と違って非同期スポーンする必要がない)。
+    let runtime = AiRuntime::new_with_backend(AiBackend::DirectMl)
+        .expect("AiRuntime::new_with_backend(DirectMl)");
+    let runtime = std::sync::Arc::new(runtime);
+
+    if args.backend == AiBackend::TensorRt {
+        // bench_ai は別 bin なので current_exe() は bench_ai.exe を返す。
+        // ワーカーは mimageviewer.exe (--tensorrt-infer-worker subcommand を持つ
+        // バイナリ) でなければならないため、sibling の mimageviewer.exe を指す。
+        let bench_exe = std::env::current_exe().expect("current_exe");
+        let main_exe = bench_exe
+            .parent()
+            .map(|d| d.join("mimageviewer.exe"))
+            .expect("sibling path");
+        if !main_exe.exists() {
+            eprintln!(
+                "ERROR: ワーカー用 mimageviewer.exe が見つからない: {}",
+                main_exe.display()
+            );
+            eprintln!("  cargo build --release でメインバイナリも一緒にビルドしてから再実行してください。");
+            std::process::exit(1);
+        }
+        println!("Spawning TRT worker pool (sync, worker={})...", main_exe.display());
+        let t0 = std::time::Instant::now();
+        match mimageviewer::ai::trt_worker_pool::TrtWorkerPool::start_with_exe(&main_exe) {
+            Ok(pool) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                println!("  worker pool ready in {elapsed:.2} s");
+                runtime.attach_worker_pool(std::sync::Arc::new(pool));
+            }
+            Err(e) => {
+                eprintln!("ERROR: failed to start TRT worker pool: {e}");
+                eprintln!("  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/.");
+                eprintln!("  Run scripts/setup-tensorrt-pack.ps1 to install it, then retry.");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let active = runtime.active_backend();
     println!(
-        "AiRuntime ready (requested={:?}, effective={:?}, dll={})",
+        "AiRuntime ready (main backend: requested={:?}, effective={:?}, dll={})",
         active.requested,
         active.effective,
         active.dll_path.display()
     );
+    if runtime.has_worker_pool() {
+        println!("  TRT worker pool: attached (Upscale/Denoise route to worker)");
+    }
     if let Some(reason) = &active.fallback_reason {
         println!("  fallback reason: {}", reason);
-    }
-    if active.requested == AiBackend::TensorRt && active.effective != AiBackend::TensorRt {
-        eprintln!(
-            "WARNING: --backend tensorrt was requested but the runtime fell back to {:?}.",
-            active.effective
-        );
-        eprintln!("  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/.");
-        eprintln!("  Run scripts/setup-tensorrt-pack.ps1 to install it, then retry.");
     }
     println!();
 
