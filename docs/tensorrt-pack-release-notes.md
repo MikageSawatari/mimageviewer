@@ -7,10 +7,11 @@ mIV の環境設定で「TensorRT」を選択し「TensorRT パックをダウ�
 
 - **ONNX Runtime 1.24.2** (GPU 版) - Microsoft, MIT License
 - **CUDA Runtime / Math / NVRTC / nvJitLink** (CUDA Toolkit 12.9 の必要最小 DLL)
-  - `cudart64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `nvJitLink_120_0.dll`,
-    `nvrtc64_120_0.dll`, `nvrtc-builtins64_129.dll`
-- **cuDNN 9.21** - `cudnn_ops64_9.dll` のみ
-- **TensorRT 10.16 runtime** - `nvinfer_10.dll` + `nvinfer_plugin_10.dll`
+  - `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`,
+    `nvJitLink_120_0.dll`, `nvrtc64_120_0.dll`, `nvrtc-builtins64_129.dll`
+- **cuDNN 9.21** - `cudnn64_9.dll`, `cudnn_graph64_9.dll`, `cudnn_ops64_9.dll`
+- **TensorRT 10.16 runtime** - `nvinfer_10.dll`, `nvinfer_plugin_10.dll`,
+  `nvonnxparser_10.dll`
 - **6 モデル分の事前ビルド済み engine** (`engines-ampere_plus.zip`)
   - Real-ESRGAN x4plus / anime6b / general_v3
   - Real-CUGAN 4x
@@ -23,7 +24,7 @@ mIV の環境設定で「TensorRT」を選択し「TensorRT パックをダウ�
 
 ## 容量・所要時間
 
-- 合計ダウンロード量: **約 1.97 GB**
+- 合計ダウンロード量: **約 2.16 GB**
 - 所要時間目安: 5〜15 分 (ネットワーク速度による)
 - 中断・再開対応 (HTTP Range)
 
@@ -51,5 +52,5 @@ mIV の環境設定で「TensorRT」を選択し「TensorRT パックをダウ�
 
 ```bash
 # manifest.json を読み取って各ファイルの sha256 を確認
-curl -fsSL https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v1/manifest.json | jq .
+curl -fsSL https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v2/manifest.json | jq .
 ```

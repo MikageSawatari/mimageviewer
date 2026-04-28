@@ -1,9 +1,9 @@
 # TensorRT 高速化パックの配布手順 (mikage 用 runbook)
 
-mImageViewer の TensorRT 機能を有効化するためのパック (~1.97 GB) を mikage 機で
+mImageViewer の TensorRT 機能を有効化するためのパック (~2.16 GB) を mikage 機で
 作って GitHub Releases に上げるまでの手順。`docs/licensing-tensorrt.md` で確定した
 ライセンス方針 (NVIDIA SDK SLA + supplements + ONNX Runtime MIT) と DLL 構成
-(REQUIRED 13 個 / REMOVABLE 27 個) に従う。
+(v2 trim test 確定: REQUIRED 17 個 / REMOVABLE 23 個) に従う。
 
 ## 前提
 
@@ -50,9 +50,15 @@ sm80+ 共通 (kAMPERE_PLUS) の engine になる。
 
 ## 3. DLL trim 検証 (定期、毎回ではない)
 
-CUDA / cuDNN / TRT のバージョンが上がったら REMOVABLE 一覧を再検証する。前回検証は
-Apr 28 の multi-model trim test (`docs/licensing-tensorrt.md §最終 DLL セット`)。
-`build_trt_pack.rs::REMOVABLE_DLLS` に変更があったら本書末尾の検証手順を実行する。
+CUDA / cuDNN / TRT のバージョンが上がったら REMOVABLE 一覧を再検証する。最新検証は
+Apr 29 の v2 trim test (`scripts/trim_dlls_v2.sh` を使用、`session_run min < 200ms`
+判定で TRT 経路保証)。`build_trt_pack.rs::REMOVABLE_DLLS` に変更があったら同
+スクリプトを再実行する。
+
+**重要**: v1 (Apr 28) では `bench_ai --runs 1` の wall total emit だけで判定して
+いて、ORT の silent CPU fallback を見逃した結果、配布後に worker crash が発覚。
+本書末尾の検証手順 / `scripts/trim_dlls_v2.sh` は **session_run < 200ms** 判定を
+含むため安全。再 trim 時は v2 系のスクリプトを必ず使うこと。
 
 ## 4. Pack 生成 (build_trt_pack)
 
@@ -63,12 +69,15 @@ cargo run --release --bin build_trt_pack
 出力:
 
 ```
-dist/trt-pack-v1/
+dist/trt-pack-v2/
   manifest.json                       # SHA-256 一覧 + バージョン情報
   NOTICE-NVIDIA.txt                   # 同梱必須 attribution
   LICENSE-onnxruntime.txt             # ONNX Runtime MIT 全文
-  cudart64_12.dll                     # 13 個の REQUIRED DLL (合計 1.86 GB)
+  cudart64_12.dll                     # 17 個の REQUIRED DLL (合計 2.05 GB)
+  cublas64_12.dll
   cublasLt64_12.dll
+  cudnn64_9.dll
+  cudnn_graph64_9.dll
   cudnn_ops64_9.dll
   cufft64_11.dll
   nvJitLink_120_0.dll
@@ -76,6 +85,7 @@ dist/trt-pack-v1/
   nvrtc-builtins64_129.dll
   nvinfer_10.dll
   nvinfer_plugin_10.dll
+  nvonnxparser_10.dll
   onnxruntime.dll
   onnxruntime_providers_shared.dll
   onnxruntime_providers_cuda.dll
@@ -83,7 +93,7 @@ dist/trt-pack-v1/
   engines-ampere_plus.zip             # 6 モデル分の事前 build engine zip (108 MiB)
 ```
 
-ユーザー DL 量の合計は約 1.97 GB。
+ユーザー DL 量の合計は約 2.16 GB。
 
 ## 5. ローカル HTTP サーバーでの E2E 動作検証
 
@@ -91,8 +101,8 @@ GitHub Releases にアップロードする前に、ローカルで実際の DL 
 全フローを通す。
 
 ```bash
-# (a) HTTP サーバー起動 (dist/trt-pack-v1/ をルートにする)
-cd dist/trt-pack-v1
+# (a) HTTP サーバー起動 (dist/trt-pack-v2/ をルートにする)
+cd dist/trt-pack-v2
 python -m http.server 8000
 # → http://127.0.0.1:8000/manifest.json で manifest が見える状態にする
 ```
@@ -119,7 +129,7 @@ mImageViewer 起動後:
 
 検証ポイント:
 - [ ] manifest fetch エラーが出ない
-- [ ] 全 16 ファイル (notices 2 + DLL 13 + engine zip 1) が DL される
+- [ ] 全 21 ファイル (manifest 1 + notices 2 + DLL 17 + engine zip 1) が DL される
 - [ ] SHA-256 検証が全部通る
 - [ ] engine zip が `tensorrt-engines/<kind>/<file>` に正しく展開される
 - [ ] `INSTALL_OK` が書かれる
@@ -140,7 +150,7 @@ Running フェーズ中に [キャンセル] を押す → 部分 DL ファイ�
 
 ### Hash mismatch の処理確認 (任意)
 
-`dist/trt-pack-v1/manifest.json` の中の `sha256` をわざと書き換えて HTTP サーバー
+`dist/trt-pack-v2/manifest.json` の中の `sha256` をわざと書き換えて HTTP サーバー
 を再起動 → インストール走らせる → Error フェーズで `SHA-256 が一致しません` の
 メッセージが出るか確認。
 
@@ -148,16 +158,16 @@ Running フェーズ中に [キャンセル] を押す → 部分 DL ファイ�
 
 ```bash
 # (a) タグを切る (git tag 名は manifest_format/PACK_VERSION と整合させる)
-TAG="trt-pack-v1"
+TAG="trt-pack-v2"
 git tag $TAG
 git push origin $TAG
 
 # (b) gh CLI でリリースを作成 + アセットを一括アップロード
 gh release create $TAG \
-  --title "TensorRT acceleration pack v1 (mImageViewer)" \
+  --title "TensorRT acceleration pack v2 (mImageViewer)" \
   --notes-file docs/tensorrt-pack-release-notes.md \
   --prerelease \
-  dist/trt-pack-v1/*
+  dist/trt-pack-v2/*
 ```
 
 `--prerelease` で `latest` リリースとして見えなくする (mIV 本体のリリースタグ
@@ -174,7 +184,7 @@ GitHub Releases は単一ファイルに 2 GiB 上限がある。本 pack の最
 ```bash
 # manifest が公開 URL から読めるか
 curl -fsS https://github.com/MikageSawatari/mimageviewer/releases/download/$TAG/manifest.json | jq .pack_version
-# → "1" が出れば OK
+# → "2" が出れば OK
 ```
 
 ## 7. 配布完了後の本番環境テスト
@@ -201,9 +211,14 @@ $env:MIV_TRT_PACK_BASE_URL = $null
 
 1. `setup-tensorrt-pack.ps1` 実行 → `%APPDATA%/mimageviewer/tensorrt/` を full に
 2. `mimageviewer.exe --tensorrt-build <kind>` で 6 モデル engine 全部 build
-3. `bench_ai` を 6 モデル全部で 1 個ずつ DLL を退避しながら回す:
-   ```bash
-   bash scripts/trim_dlls_multi.sh   # docs/licensing-tensorrt.md §検証手順 と同じ
-   ```
-4. 全モデルが "wall total" に到達した最小セットを `REMOVABLE_DLLS` に反映
-5. mIV 再ビルド → 本書 §4 〜 §6 を実施
+3. `cargo build --release --bin bench_ai` (= 最新ビルドで bench_ai を作る)
+4. `bash scripts/trim_dlls_v2.sh` を実行 (= v2 系、`session_run min < 200ms`
+   閾値で TRT 経路を保証する判定。`/tmp/trim_dlls_v2/result.txt` に結果)
+5. `result.txt` の REMOVABLE 一覧を `build_trt_pack.rs::REMOVABLE_DLLS` に反映。
+   provider DLL の hard import が変わっていたら `PROVIDER_DLL_IMPORTS` も更新
+   (= `dumpbin /dependents` で再確認)
+6. mIV 再ビルド → 本書 §4 〜 §6 を実施
+
+**注意**: v1 系のスクリプト (`trim_dlls.sh` / `trim_dlls_round2.sh` /
+`trim_dlls_multi.sh`) は session_run 閾値判定がなく、CPU silent fallback を
+見逃す可能性があるため使わない。trim_dlls_v2.sh のみを使うこと。

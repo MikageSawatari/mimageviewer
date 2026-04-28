@@ -401,21 +401,40 @@ of this software and associated documentation files (the "Software"), ...
 
 ---
 
-## 最終 DLL セット (Apr 28 multi-model trim test 結果)
+## 最終 DLL セット (Apr 29 v2 trim test 結果)
 
 mikage 機 (RTX 4090, Windows 11) で全 6 モデル (Real-ESRGAN x4plus / anime6b /
 general_v3 / RealCUGAN-4x / NMKD-Siax-4x / RealPLKSR) の TRT 推論を `bench_ai` で
-1 個ずつ DLL を抜きながら回した結果、以下が確定:
+1 個ずつ DLL を抜きながら回した結果、以下が確定。判定基準は **session_run min <
+200 ms** で TRT 経路 (CUDA EP は 200-500ms、CPU EP は 1500ms+ なので明確に区別可能)。
 
-### REQUIRED (= 配布する DLL、13 個 ≈ 1.86 GB)
+### v1 (Apr 28) からの変更
+
+v1 では `bench_ai --runs 1` の `wall total` 出力だけで判定していたため、ORT が
+silent に CPU EP fallback しても "成功" と判定する穴があった。実機 distribute 後
+にユーザー機で worker crash (STATUS_STACK_BUFFER_OVERRUN) が判明し、原因は以下
+4 個の DLL の hard import 不足と特定:
+
+- `cublas64_12.dll` (provider DLL の import)
+- `cudnn64_9.dll` (provider DLL の import)
+- `cudnn_graph64_9.dll` (cuDNN 内部 deserialize で必須)
+- `nvonnxparser_10.dll` (provider DLL の import)
+
+これら 4 個を REQUIRED に戻して v2 とした (= REQUIRED 13 → 17 個)。
+
+### REQUIRED (= 配布する DLL、17 個 ≈ 2.05 GB)
 
 | DLL | サイズ | 役割 |
 |---|---:|---|
 | `nvinfer_10.dll` | 395 MB | TensorRT runtime コア |
 | `nvinfer_plugin_10.dll` | 46 MB | TensorRT 標準プラグイン |
-| `cublasLt64_12.dll` | 638 MB | cuBLAS Lite (TRT が AMPERE_PLUS でも startup 時に probe) |
-| `cufft64_11.dll` | 274 MB | cuFFT (ORT CUDA EP の startup 時に probe) |
-| `cudnn_ops64_9.dll` | 101 MB | cuDNN ops (cuDNN の中で唯一必須) |
+| `nvonnxparser_10.dll` | 3.3 MB | ONNX → TRT パーサ (provider DLL の hard import) |
+| `cublas64_12.dll` | 102 MB | cuBLAS (provider DLL の hard import) |
+| `cublasLt64_12.dll` | 638 MB | cuBLAS Lite |
+| `cufft64_11.dll` | 274 MB | cuFFT |
+| `cudnn64_9.dll` | 0.3 MB | cuDNN umbrella (provider DLL の hard import) |
+| `cudnn_ops64_9.dll` | 101 MB | cuDNN ops |
+| `cudnn_graph64_9.dll` | 100 MB | cuDNN graph (engine deserialize で必須) |
 | `cudart64_12.dll` | 0.6 MB | CUDA Runtime |
 | `nvJitLink_120_0.dll` | 83 MB | JIT リンカ (PTX → kernel) |
 | `nvrtc64_120_0.dll` | 86 MB | NVRTC (ランタイムコンパイラ) |
@@ -425,36 +444,34 @@ general_v3 / RealCUGAN-4x / NMKD-Siax-4x / RealPLKSR) の TRT 推論を `bench_a
 | `onnxruntime_providers_cuda.dll` | 263 MB | ORT CUDA EP |
 | `onnxruntime_providers_tensorrt.dll` | 0.8 MB | ORT TensorRT EP |
 
-### REMOVABLE (= 配布しない DLL、27 個 ≈ 4.8 GB)
+### REMOVABLE (= 配布しない DLL、23 個 ≈ 4.6 GB)
 
 ```
 builder_resource (8): nvinfer_builder_resource_{ptx,sm75,sm80,sm86,sm89,sm90,sm100,sm120}_10.dll
                      ← ライセンス上の判断 (再配布許諾不明確)、事前 build engine で代替
 
-数学ライブラリ (6):  cublas64_12, cufftw64_11, curand64_10, cusolver64_11,
-                     cusolverMg64_11, cusparse64_12
+数学ライブラリ (5):  cufftw64_11, curand64_10, cusolver64_11, cusolverMg64_11, cusparse64_12
                      ← AMPERE_PLUS 経路の TRT/CUDA EP は cuFFT のみ probe、他は不要
 
-cuDNN (8):           cudnn64_9, cudnn_adv64_9, cudnn_cnn64_9, cudnn_engines_*64_9 (×3),
-                     cudnn_graph64_9, cudnn_heuristic64_9
-                     ← AMPERE_PLUS は cuDNN tactic 無効、cudnn_ops64 のみ ORT が要求
+cuDNN 補助 (6):       cudnn_adv64_9, cudnn_cnn64_9, cudnn_engines_*64_9 (×3),
+                     cudnn_heuristic64_9
+                     ← AMPERE_PLUS は cuDNN tactic 無効、ops + graph + umbrella のみ必須
 
 TensorRT 補助 (3):   nvinfer_lean_10, nvinfer_dispatch_10, nvinfer_vc_plugin_10
                      ← バージョン互換 lib、フル nvinfer_10 を持っていれば不要
-
-ONNX parser (1):     nvonnxparser_10
-                     ← ユーザー機で ONNX → engine 変換しないため不要
 
 NVRTC alt (1):       nvrtc64_120_0.alt.dll
                      ← Hopper 系の代替経路、画像ビューワーでは不使用
 ```
 
-### 検証手順 (CI に組み込む場合)
+### 検証手順 (mikage 機での再 trim 用)
 
 1. mikage 機で `setup-tensorrt-pack.ps1` 実行 → `%APPDATA%/mimageviewer/tensorrt/` に
    フル展開 (~6.7 GB)
 2. `mimageviewer.exe --tensorrt-build <kind>` で 6 モデル分の AMPERE_PLUS engine を build
-3. 上記 REMOVABLE 27 個を `tensorrt/` から退避
-4. `bench_ai --image <test> --models all-6 --backend tensorrt --runs 1` を実行 →
-   全 6 モデル "wall total" に到達することを確認
-5. 1 個でも失敗したら `build_trt_pack.rs::REMOVABLE_DLLS` から該当を外す
+3. `bash scripts/trim_dlls_v2.sh` を実行 (= v2 系、session_run min < 200ms 判定)。
+   詳細は `docs/tensorrt-pack-distribution.md §付録 DLL trim 再検証手順`
+4. `/tmp/trim_dlls_v2/result.txt` の REMOVABLE 一覧を `REMOVABLE_DLLS` に反映
+5. `dumpbin /dependents` で provider DLL (`onnxruntime_providers_{cuda,tensorrt}.dll`)
+   の hard import を確認 → `PROVIDER_DLL_IMPORTS` に列挙する
+   (= build_trt_pack 実行時の静的チェックで再発防止)

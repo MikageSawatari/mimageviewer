@@ -62,9 +62,9 @@ use super::tensorrt_pack;
 ///
 /// **テスト時の override**: 環境変数 `MIV_TRT_PACK_BASE_URL` を設定するとそちらが
 /// 優先される。ローカル HTTP サーバー (例: `python -m http.server 8000` を
-/// `dist/trt-pack-v1/` で起動 → URL=`http://127.0.0.1:8000`) で E2E 動作確認に使う。
+/// `dist/trt-pack-v2/` で起動 → URL=`http://127.0.0.1:8000`) で E2E 動作確認に使う。
 const DEFAULT_PACK_BASE_URL: &str =
-    "https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v1";
+    "https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v2";
 
 const PACK_BASE_URL_ENV: &str = "MIV_TRT_PACK_BASE_URL";
 
@@ -774,10 +774,10 @@ mod tests {
 
     #[test]
     fn manifest_parser_accepts_real_dist_manifest() {
-        // dist/trt-pack-v1/manifest.json (= 直近 build_trt_pack の出力) が
+        // dist/trt-pack-v2/manifest.json (= 直近 build_trt_pack の出力) が
         // 本コードの `Manifest` スキーマでパースできることを保証する。
         // ファイルが無ければ skip (CI 等 build 前は無いため)。
-        let path = std::path::Path::new("dist/trt-pack-v1/manifest.json");
+        let path = std::path::Path::new("dist/trt-pack-v2/manifest.json");
         if !path.exists() {
             eprintln!("[skip] {} not found, run build_trt_pack first", path.display());
             return;

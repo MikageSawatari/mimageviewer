@@ -9,7 +9,7 @@
 //! ## 出力 (`dist/trt-pack-v<N>/`)
 //!
 //! - `manifest.json` - 全アセットの SHA-256 + サイズ + 各種バージョン情報
-//! - `<dll>.dll` × ~13 - GitHub Releases にそのままアップロードする runtime DLL 群
+//! - `<dll>.dll` × ~17 - GitHub Releases にそのままアップロードする runtime DLL 群
 //! - `engines-ampere_plus.zip` - 6 モデル分の事前ビルド済み engine をまとめた zip
 //! - `NOTICE-NVIDIA.txt` - NVIDIA SDK SLA / 各 Supplement の attribution と利用条件抜粋
 //! - `LICENSE-onnxruntime.txt` - ONNX Runtime (Microsoft) の MIT ライセンス全文
@@ -43,14 +43,20 @@ use sha2::{Digest, Sha256};
 
 /// pack バージョン。`tensorrt_pack.rs::EXPECTED_TRT_PACK_VERSION` と揃える。
 /// CUDA / cuDNN / TensorRT / ORT のいずれかを更新したら bump する。
-const PACK_VERSION: u32 = 1;
+///
+/// - v1 (Apr 28): 初版。trim test 不十分で TRT EP load 失敗 → CPU fallback で
+///   公開直後に取り下げ
+/// - v2 (Apr 29): trim test を `session_run min < 200ms` 判定に強化して再決定。
+///   v1 で誤って REMOVABLE 判定していた 4 個 (cublas64_12, cudnn64_9,
+///   cudnn_graph64_9, nvonnxparser_10) を REQUIRED に戻した
+const PACK_VERSION: u32 = 2;
 
 /// `NOTICE-NVIDIA.txt` 文面。pack に同梱する NVIDIA コンポーネントの attribution と
 /// 利用条件 (= mIV 専用、抽出再配布禁止、リバースエンジニアリング禁止) を明記する。
 ///
 /// 出典:
 /// - docs/licensing-tensorrt.md §NOTICE-NVIDIA.txt 推奨文面 (Apr 28 確定)
-/// - 列挙する DLL は §最終 DLL セット の REQUIRED 13 個に合わせて整理
+/// - 列挙する DLL は §最終 DLL セット の REQUIRED 17 個に合わせて整理
 ///
 /// 注意: バージョン番号 (CUDA 12.9 / cuDNN 9.21 / TensorRT 10.16) を更新する場合は
 /// `setup-tensorrt-pack.ps1` 側の `$*_VERSION` と同期させる。
@@ -59,10 +65,11 @@ This product includes software components from NVIDIA Corporation, redistributed
 the NVIDIA Software License Agreement for NVIDIA Software Development Kits and its
 supplements. Use of these components is subject to those agreements.
 
-Components included (mImageViewer TensorRT acceleration pack v1):
+Components included (mImageViewer TensorRT acceleration pack v2):
 
   CUDA Runtime / Math / NVRTC / nvJitLink (CUDA Toolkit 12.9)
     cudart64_12.dll
+    cublas64_12.dll
     cublasLt64_12.dll
     cufft64_11.dll
     nvJitLink_120_0.dll
@@ -70,11 +77,14 @@ Components included (mImageViewer TensorRT acceleration pack v1):
     nvrtc-builtins64_129.dll
 
   cuDNN (NVIDIA cuDNN 9.21)
+    cudnn64_9.dll
+    cudnn_graph64_9.dll
     cudnn_ops64_9.dll
 
   TensorRT (NVIDIA TensorRT 10.16)
     nvinfer_10.dll
     nvinfer_plugin_10.dll
+    nvonnxparser_10.dll
 
   Pre-built TensorRT engines (kAMPERE_PLUS hardware-compatible mode, sm80+)
     engines-ampere_plus.zip
@@ -135,47 +145,96 @@ SOFTWARE.
 ";
 
 /// Apr 28 multi-model trim test で「全 6 モデルが動く最小セット」から除外可能と
-/// 確定した DLL のリスト。Round 1+2 (anime6b 単独) では nmkd_siax_4x がカバーされず
-/// 過剰削減になっていたため、**全 6 モデル (Real-ESRGAN x4plus / anime6b / general_v3 /
-/// RealCUGAN-4x / NMKD-Siax-4x / RealPLKSR) で TRT 推論が成功することを実機検証**した
-/// 結果のみを列挙する。
+/// 確定した DLL のリスト。**Apr 29 trim test v2** で全 6 モデル (Real-ESRGAN
+/// x4plus / anime6b / general_v3 / RealCUGAN-4x / NMKD-Siax-4x / RealPLKSR) で
+/// TRT EP が実際に動作することを実機検証した結果。
 ///
-/// 検証手順 (`/tmp/trim_dlls_logs/multi_result.txt`):
-/// 1. tensorrt/ から DLL を 1 個移動
-/// 2. `bench_ai --models <6 modules> --backend tensorrt --runs 1` を実行
-/// 3. 1 モデルでも load_model / session.run で失敗したら REQUIRED と判定して復元
-/// 4. 全モデル "wall total" 出力に到達したら REMOVABLE と確定
+/// ## v1 trim test の問題と v2 での修正
+///
+/// v1 (Apr 28) は `bench_ai --runs 1` の "wall total" 出力だけで成功判定していたが、
+/// ORT は **TRT EP load 失敗時に CUDA → CPU と silent fallback** するので、CPU で
+/// 完走しても "成功" に見える落とし穴があった。実機 distribution 後にユーザー機
+/// (RTX 4090) で worker crash (STATUS_STACK_BUFFER_OVERRUN) が判明し、原因は
+/// 4 個の DLL の hard import 不足 (= LoadLibrary 失敗の連鎖) と特定。
+///
+/// v2 では以下の検証強化:
+/// 1. `bench_ai --warmup 1 --runs 1` を全 6 モデルで実行
+/// 2. **全モデルで session_run min < 200 ms を確認** (TRT は 10-50ms、CUDA EP は
+///    200-500ms、CPU EP は 1500ms+。200ms 閾値で TRT 経路を保証)
+/// 3. crash (worker EOF) も明示的に検出
+///
+/// 検証スクリプト: `scripts/trim_dlls_v2.sh` (実行ログ: `/tmp/trim_dlls_v2/result.txt`)
 ///
 /// `nvinfer_builder_resource_*.dll` は別判定 (= ライセンス上必ず除外、prefix match)。
+/// ただし v2 trim test でも全 8 個が REMOVABLE と確認できているので、技術的にも
+/// 不要であることが裏付け済み。
 ///
-/// 最終 REQUIRED DLL (= mIV 配布物に含まれる) は 13 個、約 1.9 GB:
-///   cublasLt64_12, cudart64_12, cudnn_ops64_9, cufft64_11, nvJitLink_120_0,
-///   nvinfer_10, nvinfer_plugin_10, nvrtc-builtins64_129, nvrtc64_120_0,
-///   onnxruntime, onnxruntime_providers_cuda/shared/tensorrt
+/// 最終 REQUIRED DLL (= mIV 配布物に含まれる) は 17 個、約 2.05 GB:
+///   cublas64_12, cublasLt64_12, cudart64_12, cudnn64_9, cudnn_graph64_9,
+///   cudnn_ops64_9, cufft64_11, nvJitLink_120_0, nvinfer_10, nvinfer_plugin_10,
+///   nvonnxparser_10, nvrtc-builtins64_129, nvrtc64_120_0, onnxruntime,
+///   onnxruntime_providers_{shared,cuda,tensorrt}
 const REMOVABLE_DLLS: &[&str] = &[
-    // 数学ライブラリ系 (cuBLAS / cuFFTW / cuRAND / cuSOLVER / cuSPARSE)
-    "cublas64_12.dll",
+    // 数学ライブラリ系 (cuFFTW / cuRAND / cuSOLVER / cuSPARSE)
+    // 注意: cublas64_12 は v1 で REMOVABLE 判定したが provider DLL の hard import
+    // にあったため REQUIRED へ戻した (= ここから除外)
     "cufftw64_11.dll",
     "curand64_10.dll",
     "cusolver64_11.dll",
     "cusolverMg64_11.dll",
     "cusparse64_12.dll",
-    // cuDNN (cudnn_ops64_9 だけ REQUIRED で残す)
-    "cudnn64_9.dll",
+    // cuDNN 補助 (cudnn64_9, cudnn_ops64_9, cudnn_graph64_9 は REQUIRED で残す)
+    // 注意: cudnn64_9, cudnn_graph64_9 は v1 で REMOVABLE 判定したが trim_dlls_v2
+    // で REQUIRED と確定したため除外
     "cudnn_adv64_9.dll",
     "cudnn_cnn64_9.dll",
     "cudnn_engines_precompiled64_9.dll",
     "cudnn_engines_runtime_compiled64_9.dll",
     "cudnn_engines_tensor_ir64_9.dll",
-    "cudnn_graph64_9.dll",
     "cudnn_heuristic64_9.dll",
-    // TensorRT 補助 runtime (lean / dispatch / vc_plugin) と ONNX parser (engine 既ビルド済みで不要)
+    // TensorRT 補助 runtime (lean / dispatch / vc_plugin)
+    // 注意: nvonnxparser_10 は v1 で REMOVABLE 判定したが provider DLL の hard
+    // import にあったため REQUIRED へ戻した
     "nvinfer_lean_10.dll",
     "nvinfer_dispatch_10.dll",
     "nvinfer_vc_plugin_10.dll",
-    "nvonnxparser_10.dll",
     // NVRTC alt variant (Hopper 系で使う代替経路、画像ビューワーでは未使用)
     "nvrtc64_120_0.alt.dll",
+];
+
+/// `onnxruntime_providers_*.dll` の hard import 一覧 (`dumpbin /dependents` 由来)。
+/// pack 構築時の sanity check に使う: ここに列挙される DLL が REQUIRED に
+/// 含まれていなければ build を失敗させる (= v1 で起きた CPU fallback バグの
+/// 再発防止)。
+///
+/// 出典: `dumpbin /dependents <provider_dll>` の出力 (Apr 29 確認、
+/// CUDA Toolkit 12.9 / cuDNN 9.21 / TensorRT 10.16)。CUDA / cuDNN / TRT の
+/// メジャー版が変わったら再確認すること。
+///
+/// system DLL (KERNEL32, MSVCP140, api-ms-win-crt-*, dbghelp 等) は除外。
+const PROVIDER_DLL_IMPORTS: &[(&str, &[&str])] = &[
+    (
+        "onnxruntime_providers_tensorrt.dll",
+        &[
+            "cublas64_12.dll",
+            "nvinfer_10.dll",
+            "nvonnxparser_10.dll",
+            "onnxruntime_providers_shared.dll",
+            "cudart64_12.dll",
+            "cudnn64_9.dll",
+        ],
+    ),
+    (
+        "onnxruntime_providers_cuda.dll",
+        &[
+            "cublasLt64_12.dll",
+            "cublas64_12.dll",
+            "cufft64_11.dll",
+            "cudart64_12.dll",
+            "onnxruntime_providers_shared.dll",
+            "cudnn64_9.dll",
+        ],
+    ),
 ];
 
 /// 既存 INSTALL_OK の中身 (setup-tensorrt-pack.ps1 が書いた版情報)。
@@ -357,6 +416,24 @@ fn main() {
         common.push(asset);
     }
     common.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // ── 静的依存チェック: provider DLL の hard import が全て REQUIRED に含まれているか ──
+    // v1 でこれを怠ったため CPU fallback バグが起きた。再発防止のガード。
+    if let Err(missing) = check_provider_imports(&common) {
+        eprintln!(
+            "ERROR: 静的依存チェック失敗\n\n  以下の DLL は provider DLL の hard \
+             import に列挙されているが REQUIRED に含まれていない:"
+        );
+        for m in &missing {
+            eprintln!("    - {} (required by {})", m.dll, m.required_by);
+        }
+        eprintln!(
+            "\nREMOVABLE_DLLS から該当 DLL を除外するか、setup-tensorrt-pack.ps1 で\n\
+             該当 DLL が tensorrt/ に展開されているか確認してください。"
+        );
+        std::process::exit(1);
+    }
+    println!("[build_trt_pack] 静的依存チェック OK ({} provider DLL)", PROVIDER_DLL_IMPORTS.len());
 
     // ── engine pack (AMPERE_PLUS) ──
     // 6 モデルの engine cache (`<model>/<file>.engine` + `<file>.profile`) を 1 zip に。
@@ -567,6 +644,36 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
         }
     );
     Ok(zip_size)
+}
+
+/// `PROVIDER_DLL_IMPORTS` に列挙された hard import が全て `common` に含まれている
+/// ことを検証する。一つでも欠けていたら `Err(Vec<MissingImport>)` を返す。
+fn check_provider_imports(common: &[AssetEntry]) -> Result<(), Vec<MissingImport>> {
+    let names: std::collections::HashSet<&str> =
+        common.iter().map(|a| a.name.as_str()).collect();
+    let mut missing = Vec::new();
+    for (provider, imports) in PROVIDER_DLL_IMPORTS {
+        for imp in *imports {
+            if !names.contains(imp) {
+                missing.push(MissingImport {
+                    dll: imp.to_string(),
+                    required_by: provider.to_string(),
+                });
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
+/// `check_provider_imports` のエラー報告型。
+#[derive(Debug)]
+struct MissingImport {
+    dll: String,
+    required_by: String,
 }
 
 /// SHA-256 + サイズを計算してアセットエントリを作る。

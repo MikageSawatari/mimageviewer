@@ -18,8 +18,11 @@ use std::path::PathBuf;
 
 /// 対応 pack バージョン。pack 内 INSTALL_OK の version と一致する必要がある。
 /// CUDA / cuDNN / TensorRT / ort のいずれかが更新されたら bump する。
+///
+/// - v1 (Apr 28): 取り下げ済 (DLL trim 過剰で CPU fallback、worker crash 多発)
+/// - v2 (Apr 29): trim test を `session_run min < 200ms` 判定に強化、4 個 DLL を REQUIRED へ
 #[allow(dead_code)]
-pub const EXPECTED_TRT_PACK_VERSION: u32 = 1;
+pub const EXPECTED_TRT_PACK_VERSION: u32 = 2;
 
 /// pack 展開先ルートディレクトリ。
 /// `%APPDATA%/mimageviewer/tensorrt/`
