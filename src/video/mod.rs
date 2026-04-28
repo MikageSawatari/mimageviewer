@@ -333,19 +333,13 @@ impl VideoPlayer {
 
         let clock_serial = self.clock.current_seek_serial();
         let lead_tol = clock::DISPLAY_LEAD_TOLERANCE_SECS;
-        // seek 進行中フラグ。post-seek 第一フレームを「pts > now + lead_tol」だった
-        // ときも displayable と扱うために必要 (= 下記の force_display_seek)。
-        // **無音動画 + 開始時 resume** のときに、override target から数 ms 先の
-        // フレームが永久に表示されず override が clear されず clock が凍結する
-        // 不具合の根本対処 (jellyfish-10-mbps-hd-hevc.mkv で再現)。
         let seek_in_flight_for_display = self.clock.is_seeking();
-        // seek 開始時刻トラッキング (false→true で打刻、true→false で解除)。
-        // 末尾の repaint 計算で「シーク開始から何秒経ったか」を見て、長引いたら
-        // 16ms → 100ms に back off する (decoder 故障時の CPU 100% を抑制、Codex P2)。
-        match (seek_in_flight_for_display, self.seek_inflight_since.is_some()) {
-            (true, false) => self.seek_inflight_since = Some(std::time::Instant::now()),
-            (false, true) => self.seek_inflight_since = None,
-            _ => {}
+        // seek 開始時刻トラッキング: 末尾 repaint 計算で「2 秒以上長引いたら 100ms に
+        // back off」する (decoder 故障時に CPU 100% で polling し続ける事故防止)。
+        if seek_in_flight_for_display && self.seek_inflight_since.is_none() {
+            self.seek_inflight_since = Some(std::time::Instant::now());
+        } else if !seek_in_flight_for_display {
+            self.seek_inflight_since = None;
         }
 
         // seek_serial が前回 tick から変わっていれば、queue 全部一掃 (Codex 助言)。
@@ -377,25 +371,15 @@ impl VideoPlayer {
                 dropped_old_serial += 1;
                 continue;
             }
-            // post-seek 第一フレームは pts チェックを免除して強制表示。
-            // (override が立っている間は now が target で凍結するため、target +
-            // 数 ms にあるキーフレームを「未来」とみなして弾いてしまう。これにより
-            // 表示が走らず clear_seek_target_override も呼ばれず、永久ロック。)
-            //
-            // 安全弁 (Codex P3 助言):
-            //   - is_seeking() を再確認 (audio が間に override をクリアしていれば false)
-            //   - serial 一致を明示的にチェック
-            //   - **片側トレランス**: pts > target は無制限に許容 (dir=+1 forward seek で
-            //     keyframe が target+GOP に飛ぶケースを救う、jellyfish-55 で 1.7 秒先
-            //     にキーフレームがあって永久 freeze していた事例の対処)。
-            //     pts < target は SEEK_TARGET_TOLERANCE_SECS まで許容 (それ以下は
-            //     後方シーク失敗で元位置のフレームが届いたケース → 強制表示すると
-            //     シークバーがスナップバックするので拒否)。
+            // post-seek 第一フレームは override target で now が凍結するため
+            // pts チェックを免除して強制表示する (= UI が表示することで
+            // clear_seek_target_override が呼ばれ、override がやっと外れる)。
+            // is_seeking() を再確認 (audio が間に override をクリアした場合の stale 防止)。
             let force_display_seek = seek_in_flight_for_display
                 && latest_renderable.is_none()
                 && front.seek_serial == clock_serial
                 && self.clock.is_seeking()
-                && (front.pts_secs - now) >= -clock::SEEK_TARGET_TOLERANCE_SECS;
+                && clock::pts_clears_seek_override(front.pts_secs, now);
             if force_display_seek || front.pts_secs <= now + lead_tol {
                 let frame = self.future_frames.pop_front().unwrap();
                 if latest_renderable.is_some() {
@@ -453,32 +437,13 @@ impl VideoPlayer {
             // する (= 「← シークが効かない」現象の本質)。target 近傍チェックを
             // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
             let now_after = self.clock.now_secs();
-            // 片側トレランス (force_display_seek と同じロジック):
-            // pts > target は無制限許容 (forward seek で GOP 先のキーフレームに飛ぶケース)、
-            // pts < target は SEEK_TARGET_TOLERANCE_SECS だけ許容 (それ以下は backward
-            // seek 失敗で元位置に戻ったケース → 解除するとスナップバックするので保留)。
-            if (frame.pts_secs - now_after) >= -clock::SEEK_TARGET_TOLERANCE_SECS {
-                // **post-seek フリッカー対策** (Codex P2 二段階反映):
-                // override クリア後、now_secs() は audio_pts または fallback_pts
-                // + (今 - anchor の wall) を返す。anchor は notify_seek_completed が
-                // seek 処理時点で打ったままなので、UI tick が後から clear すると
-                // 一気に時間が進み直後の数フレームが pts ジャンプ表示 (= ちらつき)。
-                //
-                // 表示フレーム pts に anchor を巻き戻してから override をクリアする。
-                //
-                // - audio なし: fallback anchor を frame.pts_secs に再アンカー。
-                // - audio あり: set_audio_pts(frame.pts_secs) で audio anchor を
-                //   「最低でも今 = frame.pts_secs」に巻き戻す。set_audio_pts の
-                //   単調性ガード (max(pts, cur_now)) により実際は max(frame.pts_secs,
-                //   override target) になる。実用上 frame.pts_secs ≈ target なので
-                //   その値を anchor + 今 wall に置けて、続くフレームが滑らかに進む。
-                //   後追いで届く fill_output の set_audio_pts は同じ単調性ガードを
-                //   通るので過去値で巻き戻ることはない (なお UI と cpal callback の
-                //   race で UI 書き込みが ~1 audio callback 周期分新しい audio_pts を
-                //   一瞬上書きする可能性はあるが、次の fill_output で即時自然回復する)。
-                //   audio path だけに任せると、一時停止中シーク / pump_seek_serial が
-                //   遅れている / 末尾近傍で audio が来ない…等の場合に override が
-                //   永久に残る (Codex 指摘)。UI 側でも明示的に clear することで防ぐ。
+            if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
+                // post-seek フリッカー対策: override クリア前に anchor を「今 = frame.pts」
+                // に巻き戻す。これをしないと clear 直後に notify_seek_completed 時点の
+                // 古い anchor + 経過 wall でクロックが一気に進み、続くフレームが pts
+                // ジャンプ表示 (= ちらつき) になる。audio あり時は set_audio_pts の
+                // 単調性ガード経由で安全。audio path 任せにすると pause / 末尾近傍 etc.
+                // で override が永久残留するケースがあるので UI 側でも明示 clear する。
                 if self.clock.is_audio_active() {
                     self.clock.set_audio_pts(frame.pts_secs);
                 } else {
@@ -522,17 +487,14 @@ impl VideoPlayer {
             );
         }
 
-        // 再生中なら次フレームに合わせて再描画。
-        // seek 中も「短周期で channel を polling」しないとデコーダの post-seek 第一
-        // フレームが try_send で channel に積まれた後 UI が起こされず固まる
-        // (Codex 助言, jellyfish 動画で seek 後 8 秒以上 freeze する事例)。
+        // 再生中 / seek 中なら repaint 予約。
+        // seek 中も polling 必須: post-seek 第一フレームが channel に積まれても
+        // egui に repaint 要求が無いと UI が起きず channel が drain されない。
         if self.is_playing() || seek_in_flight_for_display {
-            // 上のループで未来フレームが見えていればその時刻、そうでなければ
-            // 30fps 想定で 33ms 後を目安にする
             let mut due = next_due.unwrap_or_else(|| std::time::Duration::from_millis(33));
             if seek_in_flight_for_display && displayed_pts.is_none() {
-                // seek 開始から 2 秒以内: 16ms (vsync) で frame 到着を即拾う。
-                // それ以降は decoder 故障の可能性あり → 100ms に back off。
+                // 2 秒以内は vsync 周期 (16ms) で polling、超えたら decoder 故障を
+                // 疑って 100ms に back off (CPU 100% 連発を抑制)。
                 let elapsed = self
                     .seek_inflight_since
                     .map(|t| t.elapsed())
@@ -542,9 +504,7 @@ impl VideoPlayer {
                 } else {
                     std::time::Duration::from_millis(16)
                 };
-                if poll < due {
-                    due = poll;
-                }
+                due = due.min(poll);
             }
             Some(due)
         } else {

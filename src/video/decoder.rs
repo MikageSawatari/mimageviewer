@@ -584,15 +584,10 @@ fn run_decoder(
                     const PACE_LEAD_SECS: f64 = 0.10;
                     const AUDIO_SAFE_LO: f64 = 0.25;
                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
-                        // **post-seek デッドロック対策**:
-                        // override が立っている間、pace_now は target で凍結する。
-                        // forward seek で post-seek 第一フレームが GOP 先 (例 4K HEVC で
-                        // 2.8 秒先) にあると、ahead > PACE_LEAD で永久に sleep する。
-                        // しかし UI tick はこのフレームを受け取って override を clear
-                        // しないと clock を進められない → デッドロック。
-                        // override 中は **pacing をスキップして即 send** する。
-                        // UI が表示し override を clear した直後から通常 pacing に戻る
-                        // (Codex P1 助言)。
+                        // override 中は pace_now が target で凍結する。pacing でブロック
+                        // すると UI が第一フレームを受け取れず override が clear されず
+                        // デッドロック (4K HEVC forward seek で keyframe が target+GOP
+                        // 先になると顕著)。clear されるまで pacing をスキップして送る。
                         if clock.is_seeking() {
                             break;
                         }

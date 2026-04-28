@@ -84,10 +84,21 @@ pub struct AvClock {
 const SEEK_NONE: u64 = u64::MAX;
 
 /// シーク完了判定の許容差 (秒)。
-/// frame.pts と現在の override target の差がこれ以内なら「target に到達した」
-/// とみなして override を解除する。典型的な keyframe 間隔 (0.5-2 秒) を見越した値。
-/// これを超えるズレは decoder 側の seek 失敗を疑う合図。
+/// 用法は呼び出し側で異なる:
+/// - video tick (`pts_clears_seek_override`): **片側**。pts > target は無制限許容
+///   (forward seek で keyframe が target+GOP 先に飛ぶ 4K HEVC 等のケース)、
+///   pts < target は本値だけ許容 (それより前は backward seek 失敗で元位置に戻った
+///   ケース → 解除するとシークバーがスナップバックするので保留)。
+/// - audio fill_output: **両側**。post-seek の最初のサンプルは ≈ target なので
+///   `(pts - target).abs() <= TOL` で判定 (audio には GOP overshoot が無い)。
 pub(crate) const SEEK_TARGET_TOLERANCE_SECS: f64 = 0.75;
+
+/// 表示しようとしているフレーム pts が override クリア / 強制表示の対象になるか。
+/// `force_display_seek` と override クリア両方で使う共通判定で、両者の規則を
+/// 1 箇所に集約してロジックの解離を防ぐ。
+pub(crate) fn pts_clears_seek_override(frame_pts: f64, now: f64) -> bool {
+    frame_pts - now >= -SEEK_TARGET_TOLERANCE_SECS
+}
 
 /// 「フレーム pts <= now + DISPLAY_LEAD_TOLERANCE_SECS なら displayable」と
 /// 判定する許容差 (秒)。約 1 vsync 周期 (60Hz = 16.7ms) を許容することで、
@@ -130,10 +141,8 @@ impl AvClock {
     /// しないようにする。
     pub fn set_audio_pts(&self, pts_secs: f64) {
         let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        let cur_now = self.now_secs();
-        let monotonic = pts_secs.max(cur_now);
-        self.audio_pts_bits.store(monotonic.to_bits(), Ordering::Release);
-        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
+        let monotonic = pts_secs.max(self.now_secs());
+        self.write_audio_anchor(monotonic, now_ns);
     }
 
     /// 真の音声フレームが pump に到達した時に呼ぶ。これで `audio_active = true`
@@ -142,14 +151,25 @@ impl AvClock {
         self.audio_active.store(true, Ordering::Release);
     }
 
+    /// fallback wall clock を `(pts, now_ns)` で書き直す内部ヘルパ。
+    /// `notify_seek_completed` / `set_position_at_eof` / `set_fallback_anchor` で共有。
+    fn write_fallback_anchor(&self, pts: f64, now_ns: i64) {
+        self.fallback_pts_bits.store(pts.to_bits(), Ordering::Release);
+        self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
+    }
+
+    /// audio anchor を `(pts, now_ns)` で書き直す内部ヘルパ。
+    fn write_audio_anchor(&self, pts: f64, now_ns: i64) {
+        self.audio_pts_bits.store(pts.to_bits(), Ordering::Release);
+        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
+    }
+
     /// EOF 時に再生位置を duration に進めたいが、audio_active 状態は変えたくない
     /// ケース (audioless 動画でも duration まで進めて停止アニメを揃えるため)。
     pub fn set_position_at_eof(&self, pts_secs: f64) {
         let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        self.audio_pts_bits.store(pts_secs.to_bits(), Ordering::Release);
-        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
-        self.fallback_pts_bits.store(pts_secs.to_bits(), Ordering::Release);
-        self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
+        self.write_audio_anchor(pts_secs, now_ns);
+        self.write_fallback_anchor(pts_secs, now_ns);
     }
 
     /// 音声ストリームが無い / 出力起動失敗のときに呼ぶ。`now_secs()` は wall clock
@@ -297,40 +317,23 @@ impl AvClock {
     }
 
     /// シーク完了通知。デコーダが seek 後の最初のフレームを送出した時点で呼ぶ。
-    /// クロックを seek 位置にリセットする。
-    ///
-    /// `audio_recorded_at_nanos` は **0 (sentinel)** にして「audio が追いつくまでは
-    /// elapsed を加算しない」状態にする。これがないと、notify_seek_completed の直後から
-    /// fill_output が post-seek フレームを実際に消費するまでの数 10ms の間、
-    /// `now_secs() = target + elapsed_since_notify` になってシークバーが target を
-    /// 超えて少し進み、その後 fill_output で `set_audio_pts(target + 5ms)` が呼ばれた
-    /// 瞬間に「target+5ms」に巻き戻って見える (ユーザー報告: 「シークしたが少し戻る」)。
-    /// 0 にしておけば `now_secs()` は target で凍結し、fill_output が初回更新するまで
-    /// 待つので、正しく target → target+5ms と単調増加する。
+    /// audio / fallback 両 anchor を `(target_pts, 今)` に書き直し、pre-seek の audio
+    /// バッファ会計を 0 にリセットする。`set_audio_pts` の単調性ガードが、後追いで届く
+    /// fill_output の値が一時的に過去にあっても巻き戻りを防ぐ。
     ///
     /// **注意**: この関数は `seek_target_override` をクリアしない。override クリアは
     /// fill_output 側 (post-seek 後最初の有効サンプル消費時) または UI tick 側
     /// (post-seek 後最初の動画フレーム到着時) で行う。
     pub fn notify_seek_completed(&self, new_pts: f64) {
         let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        self.audio_pts_bits.store(new_pts.to_bits(), Ordering::Release);
-        // ⚠️ 旧コードは sentinel 0 を入れて `now_secs()` が target で凍結する設計
-        // だったが、cpal のハードウェアバッファ drain 待ち (~500ms) の間 fill_output
-        // が新世代 sample にたどり着かず set_audio_pts が呼ばれず、 結果 UI 表示が
-        // 0.5 秒近く凍結する現象が観測された。
-        //
-        // 解: recorded_at = 今 にしておき、now_secs を wall 推定で進める。
-        // 後追いで届く実 audio pts が現在値より小さくても `set_audio_pts` の単調性
-        // ガードで後退を防ぐ → AV sync は最大 ~500ms 一時的にズレるが、video の
-        // 凍結は無くなる。
-        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
-        // fallback wall clock も seek 位置に巻き戻す。
-        self.fallback_pts_bits.store(new_pts.to_bits(), Ordering::Release);
-        self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
-        // pre-seek の audio バッファ会計を 0 に。
-        // pump 側は serial discard で実物を捨てるが、会計値だけ残ると pacing が
-        // 「audio 十分」と誤認して decoder が sleep し、新世代 audio packet を
-        // 読まなくなる → clock 進行停止 → 表示停止 (post-seek hang)。
+        // recorded_at = 今 にしておき、now_secs を wall 推定で進める。後追いで届く実
+        // audio pts が現在値より小さくても `set_audio_pts` の単調性ガードで後退を防ぐ。
+        // sentinel 0 を入れる旧設計は cpal の HW バッファ drain (~500ms) 中 video が
+        // 凍結する現象を起こしていた。
+        self.write_audio_anchor(new_pts, now_ns);
+        self.write_fallback_anchor(new_pts, now_ns);
+        // pre-seek の audio バッファ会計を 0 に (pacing が「audio 十分」と誤認して
+        // decoder が sleep し新世代 audio packet を読まなくなる post-seek hang を防止)。
         self.audio_pump_buf_secs_bits
             .store(0.0_f64.to_bits(), Ordering::Release);
         self.audio_tx_queued_secs_bits
@@ -367,20 +370,13 @@ impl AvClock {
         );
     }
 
-    /// fallback wall clock を `(pts, 今)` に再アンカーする。
-    /// 無音動画の post-seek 表示時 (UI tick) に呼ぶ:
-    /// `notify_seek_completed` は seek 処理時点の壁時計でアンカーするので、override が
-    /// 立ったまま UI tick まで時間が経っていると、override クリア直後に
-    /// `fallback_now = target + (UI_tick - seek_proc)` が一気に進んで pts ジャンプ
-    /// (見た目フリッカー) になる。**実際に表示したフレームの pts** で wall を
-    /// 「今」に巻き戻すと、以降は正しく `frame.pts + 経過` で進む。
-    /// audio 経路 (fill_output → set_audio_pts) は別ルートで anchor を更新するため
-    /// この関数は呼び不要。
+    /// fallback wall clock を `(pts, 今)` に再アンカー。
+    /// post-seek の override クリア前に呼ぶことで、`notify_seek_completed` 時点の
+    /// 古い anchor が clear 直後に時間ジャンプするのを防ぐ (= 見た目フリッカー)。
+    /// audio 経路は `set_audio_pts` で同等の役割を果たす。
     pub fn set_fallback_anchor(&self, pts: f64) {
         let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        self.fallback_pts_bits.store(pts.to_bits(), Ordering::Release);
-        self.fallback_recorded_at_nanos
-            .store(now_ns, Ordering::Release);
+        self.write_fallback_anchor(pts, now_ns);
     }
 
     /// pump 内ringbuffer 残量 (秒) を報告 (audio.rs から)。
