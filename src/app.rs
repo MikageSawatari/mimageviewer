@@ -11719,6 +11719,12 @@ impl App {
             .unwrap_or(true);
         let mut updates: Vec<(String, f64, f64)> = Vec::new();
         let loop_enabled = self.settings.video_loop;
+        // GPU video device の VSR opt-in 設定を最新値に同期する。Settings UI で
+        // ON/OFF した直後から次の Blt で反映される (= 動画再起動なしで効く)。
+        #[cfg(windows)]
+        if let Some(gpu_dev) = self.gpu_video_device.as_ref() {
+            gpu_dev.set_vsr_enabled(self.settings.video_rtx_vsr);
+        }
         for entry in self.fs_cache.values_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);

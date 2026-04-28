@@ -80,6 +80,14 @@ pub struct VideoInfo {
     pub video_codec: String,
     pub audio_codec: Option<String>,
     pub has_audio: bool,
+    /// HW デコードが実際に有効化されたか (sw / hw_d3d11va)。
+    pub hw_decode_active: bool,
+    /// GPU 経路 (D3D11 video processor blit) が利用可能か。
+    /// 第 1 フレーム到着時に確定。`false` の間は CPU readback 経路。
+    pub gpu_path_active: bool,
+    /// NVIDIA RTX VSR が opt-in されているか (= ドライバに拡張 GUID を流したか)。
+    /// 実際にドライバ側で有効化されているかは別問題 (コンパネ ON / RTX GPU 必須)。
+    pub vsr_optin: bool,
 }
 
 pub struct DecodeHandles {
@@ -348,6 +356,13 @@ fn run_decoder(
         .codec()
         .map(|c| c.name().to_string())
         .unwrap_or_else(|| "?".to_string());
+    #[cfg(windows)]
+    let (gpu_path_active, vsr_optin) = match gpu_video_device.as_ref() {
+        Some(d) => (true, d.vsr_active()),
+        None => (false, false),
+    };
+    #[cfg(not(windows))]
+    let (gpu_path_active, vsr_optin) = (false, false);
     let info = VideoInfo {
         width: src_w,
         height: src_h,
@@ -355,6 +370,9 @@ fn run_decoder(
         video_codec: video_codec_name.clone(),
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         has_audio,
+        hw_decode_active: hw_active_initially,
+        gpu_path_active,
+        vsr_optin,
     };
     let _ = info_tx.send(Ok(info));
 
@@ -1131,9 +1149,43 @@ fn try_gpu_blit_path(
             | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P016
     );
 
-    // GPU で NV12→RGBA 変換、出力は NT 共有テクスチャ。
+    // **VSR (NVIDIA RTX Video Super Resolution) を実際に発動させる条件**:
+    // 入力と出力のサイズが異なっている (= アップスケール) こと。同サイズだと
+    // 単なるカラーコンバートとなり、ドライバは VSR 処理を走らせない。
+    // ソースが 1440p 以下の場合は出力を 4K (3840x2160) のアスペクト維持
+    // クランプにする。それ以上の解像度はそのまま渡す (= アップスケール不要)。
+    let (final_w, final_h) = if gpu_dev.vsr_active() && dst_w <= 2560 && dst_h <= 1440 {
+        let in_aspect = dst_w as f32 / dst_h.max(1) as f32;
+        // 4K 横ベースで縦をアスペクト合わせ
+        let target_w = 3840u32;
+        let target_h = (target_w as f32 / in_aspect).round() as u32;
+        // 縦が 4K 上限超えるなら縦ベースに切替
+        if target_h > 2160 {
+            let target_h = 2160u32;
+            let target_w = (target_h as f32 * in_aspect).round() as u32;
+            (target_w, target_h)
+        } else {
+            (target_w, target_h)
+        }
+    } else {
+        (dst_w, dst_h)
+    };
+
+    // GPU で NV12→RGBA 変換 (VSR 有効時はアップスケール込み)、出力は NT 共有テクスチャ。
+    // active_w/active_h は AVFrame の論理寸法 (= 実画像領域)。FFmpeg HW frames は
+    // 16 アライン由来で texture 寸法が大きい場合があるので、ここで active 領域を渡す。
+    let active_w = frame.width();
+    let active_h = frame.height();
     let (_out_tex, shared_handle) = unsafe {
-        gpu_dev.blit_nv12_to_rgba(&texture, subresource, dst_w, dst_h, ten_bit)?
+        gpu_dev.blit_nv12_to_rgba(
+            &texture,
+            subresource,
+            active_w,
+            active_h,
+            final_w,
+            final_h,
+            ten_bit,
+        )?
     };
 
     // perf: 初回フレームは GPU 経路を明示
@@ -1161,16 +1213,16 @@ fn try_gpu_blit_path(
     }
 
     let d3d11_frame = crate::video::gpu_renderer::D3d11Frame {
-        width: dst_w,
-        height: dst_h,
+        width: final_w,
+        height: final_h,
         pts_secs,
         seek_serial: current_seek_serial,
         shared_handle,
         keyed_mutex_key: 1,
     };
     Ok(VideoFrame {
-        width: dst_w,
-        height: dst_h,
+        width: final_w,
+        height: final_h,
         data: VideoFrameData::Gpu(d3d11_frame),
         pts_secs,
         seek_serial: current_seek_serial,

@@ -1262,7 +1262,31 @@ impl App {
             }
         });
 
-        let location_display = self.location_display_for(fs_idx);
+        let mut location_display = self.location_display_for(fs_idx);
+        // 動画の場合は decode 経路 (HW/SW) と GPU パス / VSR 状態を末尾に追記。
+        // VSR の状態は decoder 起動時の固定値ではなく **現在の `gpu_video_device.vsr_active()`** を
+        // 参照することで、Settings UI で動的に切り替えた値が即時反映される。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if let Some(info) = player.info() {
+                let hw = if info.hw_decode_active { "HW" } else { "SW" };
+                let mut tags = vec![hw.to_string()];
+                #[cfg(windows)]
+                {
+                    if info.gpu_path_active {
+                        tags.push("GPU".into());
+                    }
+                    let vsr_active = self
+                        .gpu_video_device
+                        .as_ref()
+                        .map(|d| d.vsr_active())
+                        .unwrap_or(false);
+                    if vsr_active {
+                        tags.push("VSR".into());
+                    }
+                }
+                location_display = format!("{}  [{}]", location_display, tags.join("/"));
+            }
+        }
         // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
         // AI テクスチャが選ばれている場合でも、元画像のサイズを使う。
         // GPU 上限超過で worker が clamp した画像は `source_dims` に原寸が入っており、
@@ -4743,7 +4767,19 @@ impl App {
                     player.duration(),
                     player.volume(),
                     player.is_muted(),
-                    player.texture().is_some(),
+                    // CPU path: TextureHandle 有り、または GPU path: 共有 D3D11 フレーム有り、
+                    // のいずれかなら描画コンテンツが揃っているとみなす
+                    // (= "動画を準備中..." を抜けて通常表示に切り替える)。
+                    player.texture().is_some() || {
+                        #[cfg(windows)]
+                        {
+                            player.gpu_latest().is_some()
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            false
+                        }
+                    },
                     player.error().map(|s| s.to_string()),
                 ),
                 _ => return,

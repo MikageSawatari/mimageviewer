@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
@@ -129,10 +129,10 @@ pub struct GpuVideoDevice {
     video_context: ID3D11VideoContext,
     /// processor + enumerator のキャッシュ。同一 (in_size, out_size, format) なら使い回す。
     processor_cache: std::cell::RefCell<Option<ProcessorState>>,
-    /// VSR を opt-in するか (= 設定の `video_rtx_vsr`)。`VideoProcessorBlt` 直前に
-    /// `SetStreamExtension` で NVIDIA 拡張 GUID を流す。RTX 非搭載 / コンパネ OFF の
-    /// 場合は no-op (ドライバが拡張を無視する)。
-    vsr_enabled: bool,
+    /// VSR を opt-in するか (= 設定の `video_rtx_vsr`)。設定が動的に切り替わるため
+    /// `AtomicBool` で保持し、`set_vsr_enabled` を `&self` で呼べるようにする。
+    /// `VideoProcessorBlt` 直前に load して NVIDIA 拡張を流すか判定。
+    vsr_enabled: std::sync::atomic::AtomicBool,
     vsr_capability: VsrCapability,
 }
 
@@ -142,6 +142,8 @@ struct ProcessorState {
     in_w: u32,
     in_h: u32,
     in_format: DXGI_FORMAT,
+    out_w: u32,
+    out_h: u32,
     out_format: DXGI_FORMAT,
 }
 
@@ -199,7 +201,7 @@ impl GpuVideoDevice {
             video_device,
             video_context,
             processor_cache: std::cell::RefCell::new(None),
-            vsr_enabled,
+            vsr_enabled: std::sync::atomic::AtomicBool::new(vsr_enabled),
             vsr_capability,
         }))
     }
@@ -212,8 +214,19 @@ impl GpuVideoDevice {
         self.vsr_capability
     }
 
-    pub fn set_vsr_enabled(&mut self, enabled: bool) {
-        self.vsr_enabled = enabled;
+    /// 設定 UI から動的に呼ばれる。`&self` で呼べるよう atomic を使用。
+    pub fn set_vsr_enabled(&self, enabled: bool) {
+        self.vsr_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    /// VSR が opt-in されており、ドライバ側でも有効と判定されているか。
+    /// decoder が出力ターゲットサイズを決める際の参考にする (= VSR 有効時は
+    /// アップスケールターゲット解像度に出力する必要がある、入力 == 出力だと
+    /// アップスケール処理が走らないため)。
+    pub fn vsr_active(&self) -> bool {
+        self.vsr_enabled.load(std::sync::atomic::Ordering::Acquire)
+            && self.vsr_capability.is_available()
     }
 
     /// 入力 NV12 / P010 テクスチャを RGBA 共有テクスチャに blit する。
@@ -225,11 +238,17 @@ impl GpuVideoDevice {
         &self,
         input_texture: &ID3D11Texture2D,
         subresource: u32,
+        active_w: u32,
+        active_h: u32,
         out_w: u32,
         out_h: u32,
         ten_bit: bool,
     ) -> Result<(ID3D11Texture2D, HANDLE), GpuVideoError> {
-        // 1. 入力テクスチャの属性を読む
+        // 1. 入力テクスチャの属性を読む。
+        //    FFmpeg HW frames context の確保サイズは 16 ピクセルアライン (= coded_width/height)
+        //    で、AVFrame の `width()/height()` (active_w/active_h) より大きいことがある
+        //    (例: 1280x720 動画 → 1280x736 テクスチャ)。video processor 用 content_desc
+        //    にはテクスチャ寸法を渡し、実 active 領域は SourceRect で指定する。
         let in_desc = unsafe {
             let mut d = D3D11_TEXTURE2D_DESC::default();
             input_texture.GetDesc(&mut d);
@@ -249,7 +268,13 @@ impl GpuVideoDevice {
         let cache = self.processor_cache.borrow();
         let state = cache.as_ref().expect("ensured above");
 
-        // 3. 出力 RGBA テクスチャ (NT shared) を作成
+        // 3. 出力先を 2 段構成にする:
+        //    - 中間 RT テクスチャ (NT shared なし) → VideoProcessorBlt の宛先
+        //    - 共有 RGBA テクスチャ (NT shared + keyed mutex) → wgpu で読み取り
+        //    NVIDIA ドライバは NT_SHARED+KEYEDMUTEX 付きテクスチャを VideoProcessorBlt
+        //    の出力として拒否する (E_INVALIDARG)。これが「VSR が走らない」根本原因。
+        //    Blt 後に CopyResource で 共有テクスチャに転送して解決する。
+        let intermediate = self.create_intermediate_rt(out_w, out_h, out_format)?;
         let (out_tex, shared_handle) = self.create_shared_output(out_w, out_h, out_format)?;
 
         // 4. 入力 view を作成
@@ -276,7 +301,7 @@ impl GpuVideoDevice {
         }
         let in_view = in_view.ok_or_else(|| GpuVideoError::Blt("InputView null".into()))?;
 
-        // 5. 出力 view を作成
+        // 5. 出力 view を中間テクスチャに対して作る (NT shared 付きでない普通の RT)。
         let mut out_view: Option<ID3D11VideoProcessorOutputView> = None;
         let out_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -287,7 +312,7 @@ impl GpuVideoDevice {
         unsafe {
             self.video_device
                 .CreateVideoProcessorOutputView(
-                    &out_tex,
+                    &intermediate,
                     &state.enumerator,
                     &out_view_desc,
                     Some(&mut out_view),
@@ -296,8 +321,33 @@ impl GpuVideoDevice {
         }
         let out_view = out_view.ok_or_else(|| GpuVideoError::Blt("OutputView null".into()))?;
 
-        // 6. VSR opt-in (有効化されており、ドライバが対応する場合のみ)
-        if self.vsr_enabled && self.vsr_capability.is_available() {
+        // 6. SourceRect / DestRect を明示。FFmpeg の coded_width/height アライン由来で
+        //    テクスチャは active 領域より大きい場合があるため、active 領域を SourceRect
+        //    としてクロップ + 出力フル領域に拡大する。これを設定しないと processor は
+        //    full texture → full output で blit しようとして黒帯ピクセルもアップスケール
+        //    対象になり、また driver によっては寸法不一致で E_INVALIDARG を返す。
+        unsafe {
+            use windows::Win32::Foundation::RECT;
+            let src_rect = RECT {
+                left: 0,
+                top: 0,
+                right: active_w as i32,
+                bottom: active_h as i32,
+            };
+            let dst_rect = RECT {
+                left: 0,
+                top: 0,
+                right: out_w as i32,
+                bottom: out_h as i32,
+            };
+            self.video_context
+                .VideoProcessorSetStreamSourceRect(&state.processor, 0, true, Some(&src_rect));
+            self.video_context
+                .VideoProcessorSetStreamDestRect(&state.processor, 0, true, Some(&dst_rect));
+        }
+
+        // 7. VSR opt-in (有効化されており、ドライバが対応する場合のみ)
+        if self.vsr_active() {
             unsafe {
                 vsr::apply_nvidia_vsr_extension(&self.video_context, &state.processor);
             }
@@ -320,13 +370,25 @@ impl GpuVideoDevice {
         unsafe {
             self.video_context
                 .VideoProcessorBlt(&state.processor, &out_view, 0, &[stream])
-                .map_err(|e| GpuVideoError::Blt(format!("Blt: {e:?}")))?;
-            // Blt は immediate context のキューに記録するだけなので、Flush で
-            // GPU に submit してから caller に handle を渡す (= D3D12 側が
-            // OpenSharedHandle 後に sample しても未完成画素を読まない、Codex P2-2 反映)。
-            // 厳密な signaling は ID3D11Fence + ID3D12Fence の shared 共有で行うのが
-            // 望ましいが、producer-consumer channel が ~ms オーダで在庫を作るので
-            // 実用上 Flush だけで競合は起きない。
+                .map_err(|e| {
+                    crate::logger::log(format!(
+                        "Blt FAIL: in {}x{} {:?} array={} sub={} -> out {}x{} {:?}: err={e:?}",
+                        in_w,
+                        in_h,
+                        in_format,
+                        in_desc.ArraySize,
+                        subresource,
+                        out_w,
+                        out_h,
+                        out_format,
+                    ));
+                    GpuVideoError::Blt(format!("Blt: {e:?}"))
+                })?;
+            // Blt 完了後、中間テクスチャの内容を NT shared テクスチャにコピーする。
+            // NVIDIA driver は NT_SHARED+KEYEDMUTEX 付きテクスチャを VPP の宛先として
+            // 拒否するが、CopyResource なら問題なく転送できる。同 D3D11 device 内 GPU
+            // copy なので latency は ~0.1ms オーダ。
+            self.context.CopyResource(&out_tex, &intermediate);
             self.context.Flush();
         }
 
@@ -347,6 +409,8 @@ impl GpuVideoDevice {
             if s.in_w == in_w
                 && s.in_h == in_h
                 && s.in_format == in_format
+                && s.out_w == out_w
+                && s.out_h == out_h
                 && s.out_format == out_format
             {
                 return Ok(());
@@ -386,9 +450,45 @@ impl GpuVideoDevice {
             in_w,
             in_h,
             in_format,
+            out_w,
+            out_h,
             out_format,
         });
         Ok(())
+    }
+
+    /// 中間テクスチャ (= NT shared フラグなし、純粋に D3D11 内部の RT)。
+    /// VideoProcessorBlt の宛先用。NVIDIA ドライバは NT_SHARED+KEYEDMUTEX 付き
+    /// テクスチャを VPP 出力として拒否する (E_INVALIDARG) ため、まずこちらに blit
+    /// してから CopyResource で shared テクスチャに転送する。
+    fn create_intermediate_rt(
+        &self,
+        w: u32,
+        h: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<ID3D11Texture2D, GpuVideoError> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .map_err(|e| GpuVideoError::TextureCreate(format!("intermediate: {e:?}")))?;
+        }
+        tex.ok_or_else(|| GpuVideoError::TextureCreate("intermediate null".into()))
     }
 
     fn create_shared_output(
@@ -410,8 +510,14 @@ impl GpuVideoDevice {
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
-            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
-                | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32,
+            // KEYEDMUTEX は付けない: 真に正しく実装するなら AcquireSync/ReleaseSync の
+            // ペアを D3D11 側 (write) と D3D12 側 (read) 両方に入れる必要があるが、
+            // ID3D12Resource からは IDXGIKeyedMutex を取れないため D3D12 側で実装が
+            // 困難。代わりに D3D11 側 `Flush()` の暗黙バリア + D3D12 が描画する頃には
+            // 数フレーム経過していること (= producer-consumer chan のバッファリング)
+            // で実用上の競合を避ける。Codex P1 助言で本格化を検討する場合は
+            // `ID3D11Fence` + `D3D11_FENCE_FLAG_SHARED` ↔ `ID3D12Fence` を使う。
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
         };
         let mut tex: Option<ID3D11Texture2D> = None;
         unsafe {

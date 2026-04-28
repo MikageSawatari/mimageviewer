@@ -27,17 +27,24 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::core::{GUID, Interface};
 
-/// NVIDIA Video Processing extension GUID (RTX VSR opt-in).
-/// gpuopen 系ドキュメント / 公開実装で観測されている GUID。
-/// 値: `D43CE1B3-1F4B-48AC-BAEE-C3C253775E6F` (NVIDIA RTX VSR)。
+/// NVIDIA Video Processing extension GUID (RTX VSR opt-in)。OBS / mpv 等の
+/// 実装で観測されている `NVIDIA_PPE_INTERFACE_GUID`。
 const NVIDIA_VSR_EXT_GUID: GUID = GUID::from_u128(0xD43CE1B3_1F4B_48AC_BAEE_C3C253775E6F);
 
-/// VSR opt-in 時に StreamExtension に流すデータ (有効化フラグ + 品質ヒント)。
-/// 1 = enable、0 = disable。
+/// `NVIDIA_PPE_INTERFACE_DATA` (mpv / Firefox の D3D11 VPP 実装で確認されている
+/// データレイアウト)。version=1 / method=2 (Super Resolution) / enable=0|1 の 12 バイト。
+/// **重要**: `method` の正しい値は 2 (Super Resolution)。1 ではドライバが拡張要求を
+/// 受け入れない。
+/// - mpv: video/filter/vf_d3d11vpp.c で `{1, 2, 1}` を送信
+/// - Firefox: `nvExtensionMethodSuperResolution = 0x2`
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NvVsrExtensionData {
-    /// `1` = VSR を有効化。`0` = 無効化 (= 通常 scaler に戻す)。
+    /// 拡張プロトコルのバージョン。現状 `1` 固定。
+    version: u32,
+    /// 処理タイプ。`2` = Super Resolution。
+    method: u32,
+    /// `1` = 有効化、`0` = 無効化。
     enable: u32,
 }
 
@@ -101,7 +108,11 @@ pub unsafe fn apply_nvidia_vsr_extension(
     video_context: &ID3D11VideoContext,
     processor: &ID3D11VideoProcessor,
 ) {
-    let data = NvVsrExtensionData { enable: 1 };
+    let data = NvVsrExtensionData {
+        version: 1,
+        method: 2, // Super Resolution (Codex 助言で確認、mpv / Firefox と整合)
+        enable: 1,
+    };
     let data_ptr = &data as *const NvVsrExtensionData as *const std::ffi::c_void;
     let data_size = std::mem::size_of::<NvVsrExtensionData>() as u32;
     // VideoProcessorSetStreamExtension は HRESULT (i32) を直接返す。

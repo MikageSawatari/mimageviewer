@@ -470,8 +470,15 @@ impl VideoPlayer {
             if matches!(frame.data, decoder::VideoFrameData::Gpu(_)) {
                 let pts = frame.pts_secs;
                 let serial = frame.seek_serial;
+                let was_none = self.gpu_latest.is_none();
                 if let decoder::VideoFrameData::Gpu(d3d) = frame.data {
                     self.gpu_latest = Some(d3d);
+                }
+                if was_none {
+                    crate::logger::log(format!(
+                        "VideoPlayer::tick: GPU frame received and stored in gpu_latest \
+                         (pts={pts:.3}, serial={serial})"
+                    ));
                 }
                 if clock::pts_clears_seek_override(pts, self.clock.now_secs()) {
                     if self.clock.is_audio_active() {

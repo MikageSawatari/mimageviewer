@@ -1086,7 +1086,9 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         egui::RichText::new(
             "⚠️ NVIDIA コントロールパネルの「動画 → RTX Video Enhancement」が ON でないと\n\
-             効果は発生しません。本設定はアプリの opt-in のみで、コンパネ側がマスタースイッチです。",
+             効果は発生しません。本設定はアプリの opt-in のみで、コンパネ側がマスタースイッチです。\n\
+             ⚠️ リモートデスクトップ等で DX12 が利用できない環境では本機能は自動的に無効化されます\n\
+             (動画は CPU 経由で再生されます)。",
         )
         .size(11.0)
         .color(egui::Color32::from_gray(150)),
