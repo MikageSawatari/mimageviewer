@@ -30,7 +30,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - フルスクリーンロードスレッド (1 画像ごとに spawn)          │
 │   - PDF ワーカープロセス (--pdf-worker サブプロセス × 3)       │
 │   - Susie 32bit ワーカープロセス (mimageviewer-susie32.exe × N)│
-│   - AI 推論スレッド (ort + DirectML)                           │
+│   - TRT エンジンビルダー (--tensorrt-build サブプロセス、初回1回)│
+│   - AI 推論スレッド (ort + DirectML / TensorRT)                │
 │   - 動画サムネイルスレッド, フォルダナビゲーション, etc.       │
 └───────────────┬──────────────────────────────────────────────┘
                 │ デコード結果を mpsc で返す
@@ -100,7 +101,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮) |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
-| `ai/` | ONNX Runtime (DirectML) によるアップスケール / デノイズ / Inpainting / 画像種別分類 |
+| `ai/` | ONNX Runtime (DirectML or TensorRT) によるアップスケール / デノイズ / Inpainting / 画像種別分類。`AiBackend` で multi-EP 対応、TRT 用に `tensorrt_pack` (DLL pack 検出) と `tensorrt_builder` (子プロセスエンジンビルダー) を持つ |
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
 | `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
 | `xmp_reader.rs` | XMP 読み取り (quick-xml)。mXD (mxdownloader) が埋め込む `xtw:*` 名前空間を抽出し「X ツイート情報」パネルに表示 |

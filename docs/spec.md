@@ -463,6 +463,12 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 ### Phase 2（AI 機能）🔧 進行中
 
 - [x] AI アップスケール（ONNX Runtime + DirectML、Real-ESRGAN / Real-CUGAN / NMKD-Siax）
+- [x] **TensorRT バックエンド対応**（NVIDIA GPU 専用、設定で有効化、DirectML 比 1.4-3.4x 高速）
+  - `ai/runtime.rs` で multi-EP 対応、`AiBackend::DirectMl` / `TensorRt` / `Cpu` を切り替え
+  - 起動時バックエンドフォールバック: TRT pack 不在/破損なら DirectML に自動退避
+  - エンジンビルダー: `mimageviewer.exe --tensorrt-build <model>` 子プロセスで全 8 モデル順次コンパイル
+  - 環境設定 → パフォーマンス → AI バックエンド ページから操作 (バックエンド選択 / FP16 トグル / 全エンジンビルド / キャッシュ削除 / 再起動)
+  - tile size の backend-aware 切替: TRT は 256、DirectML は 192 (実測ベース)
 - [x] AI JPEG ノイズ除去（RealPLKSR ~28MB 高品質 / OmniSR ~5.5MB 軽量、ブロックノイズ+モスキートノイズ除去）
 - [x] 画像タイプ自動判別（MobileNetV3 + ヒューリスティクス → モデル自動選択）
 - [x] 非破壊 AI 修復（消しゴムモード、MI-GAN タイル分割 inpaint、5 ツール、マスク永続化）

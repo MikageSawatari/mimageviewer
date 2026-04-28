@@ -280,6 +280,37 @@
       </table>
     </div>
 
+    <h2 id="ai-backend">AI バックエンド（環境設定 → パフォーマンス → AI バックエンド）</h2>
+    <p>AI アップスケール・ノイズ除去・消しゴムツールの実行環境を選択します。
+    既定の DirectML はすべての DirectX 12 対応 GPU で動作します。
+    NVIDIA GPU 利用時は TensorRT に切り替えることで処理時間を大幅に短縮できます
+    （アップスケール 1.4〜3.4 倍、ノイズ除去 約 4.5 倍）。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>検出 GPU</td><td>プライマリ GPU のベンダー（NVIDIA / AMD / Intel）。NVIDIA 以外では TensorRT は無効化されます。</td></tr>
+          <tr><td>バックエンド</td><td>DirectML（既定）または TensorRT。切り替えはアプリの再起動後に反映されます。</td></tr>
+          <tr><td>FP16 推論</td><td>TensorRT で 16bit 浮動小数点を使う高速化（既定 ON）。画質はほぼ同等で 1.5〜2 倍高速。</td></tr>
+          <tr><td>全エンジンを今すぐビルド</td><td>TensorRT 用の最適化エンジンを各モデルについてコンパイルします。初回のみ全 8 モデルで合計 5〜15 分かかり、結果はキャッシュされて 2 回目以降は瞬時にロードされます。</td></tr>
+          <tr><td>エンジンキャッシュを削除</td><td>キャッシュをすべて削除します。GPU ドライバ更新後にエンジン読み込みエラーが出る場合に使用してください（次回 AI 機能利用時に自動再ビルドされます）。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>TensorRT 利用の前提</h3>
+    <ul>
+      <li>NVIDIA GeForce RTX 20 系（Turing）以降の GPU が必要です（CUDA Compute Capability 7.5+）。</li>
+      <li>初回利用時に TensorRT パック（NVIDIA / Microsoft 提供の DLL 群、約 6.8 GB）を <code>%APPDATA%\mimageviewer\tensorrt\</code> に展開する必要があります。
+        現バージョンでは添付スクリプト <code>scripts\setup-tensorrt-pack.ps1</code> を PowerShell で実行してください
+        （アプリ内ダウンロード機能は将来のバージョンで提供予定）。</li>
+      <li>エンジンキャッシュは GPU・ドライバ・TensorRT バージョンに固有です。GPU を交換した場合や、ドライバを大幅に更新した後にエラーが出る場合は「エンジンキャッシュを削除」してください。</li>
+      <li>パックが未インストールまたは破損していて TensorRT を初期化できなかった場合、自動的に DirectML にフォールバックして動作を継続します。</li>
+    </ul>
+
     <h2 id="ui-theme">UI テーマ（環境設定 → 表示 → UI テーマ）</h2>
     <p>アプリ全体の配色を切り替えます。</p>
     <div class="table-wrap">
@@ -496,7 +527,9 @@
           <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・エラーログ）</td><td>—</td></tr>
           <tr><td>AI モデル</td><td><code>%APPDATA%\mimageviewer\models\</code></td><td>—</td></tr>
           <tr><td>PDF 表示エンジン DLL</td><td><code>%APPDATA%\mimageviewer\pdfium.dll</code></td><td>—</td></tr>
-          <tr><td>AI 機能用 DLL</td><td><code>%APPDATA%\mimageviewer\onnxruntime.dll</code><br><code>%APPDATA%\mimageviewer\onnxruntime_providers_shared.dll</code>（本体に埋め込み済み。初回 AI 機能利用時に自動展開）</td><td>—</td></tr>
+          <tr><td>AI 機能用 DLL（DirectML）</td><td><code>%APPDATA%\mimageviewer\onnxruntime.dll</code><br><code>%APPDATA%\mimageviewer\onnxruntime_providers_shared.dll</code>（本体に埋め込み済み。初回 AI 機能利用時に自動展開）</td><td>—</td></tr>
+          <tr><td>TensorRT パック<br>（NVIDIA 利用時のみ）</td><td><code>%APPDATA%\mimageviewer\tensorrt\</code>（CUDA / cuDNN / TensorRT / OnnxRuntime GPU 版 DLL 群、約 6.8 GB。<code>scripts\setup-tensorrt-pack.ps1</code> で展開）</td><td>—</td></tr>
+          <tr><td>TensorRT エンジンキャッシュ<br>（NVIDIA 利用時のみ）</td><td><code>%APPDATA%\mimageviewer\tensorrt-engines\</code>（モデルごとにサブディレクトリ。初回 AI 機能利用時にコンパイル・保存される、合計 1〜2 GB）</td><td>—</td></tr>
           <tr><td>Susie ワーカー EXE</td><td><code>%APPDATA%\mimageviewer\mimageviewer-susie32.exe</code>（32bit バイナリ、本体に埋め込み済み。初回起動時に自動展開）</td><td>—</td></tr>
           <tr><td>補正・マスクのバックアップ<br>（環境設定で ON の場合のみ）</td>
               <td>各フォルダ直下に <code>mimageviewer.dat</code>（Hidden + System 属性の JSON）</td>
