@@ -131,6 +131,23 @@ fn main() -> eframe::Result {
         ai::tensorrt_builder::run_worker_process();
     }
 
+    // --tensorrt-infer-worker モード: TensorRT 推論ワーカー (Phase 3)。
+    // 親プロセス (GUI、DirectML 動作) から子プロセスとして起動され、stdin で
+    // コマンドを受けて TRT セッションで推論を実行、共有メモリで結果を返す。
+    // ホットリロード時の再起動なしバックエンド切替を実現するための分離。
+    if ai::trt_worker_runtime::is_worker_invocation() {
+        data_dir::init();
+        ai::trt_worker_runtime::run_infer_worker();
+    }
+
+    // --trt-smoke-test モード: TRT ワーカープール起動の動作確認用 (開発者向け)。
+    // current_exe() が正しく mimageviewer.exe を返すため、本体に組み込んでいる。
+    if std::env::args().any(|a| a == "--trt-smoke-test") {
+        data_dir::init();
+        logger::init();
+        run_trt_smoke_test();
+    }
+
     // シングルインスタンス検出 (Windows): Named Mutex で 2 重起動を排除する。
     // インストーラの AppMutex と名前を合わせることでアップデート時の「閉じてください」
     // ダイアログ自動連携も兼ねる (`single_instance::MUTEX_NAME` 参照)。
@@ -316,6 +333,43 @@ fn main() -> eframe::Result {
 }
 
 /// `--window-size WxH` 引数をパース（例: `--window-size 1400x860`）。
+/// `--trt-smoke-test` 用の開発者向け動作確認関数。
+/// TRT ワーカープールが spawn → ハンドシェイク → load_model → shutdown を
+/// 一通り実行できるかを確認する。完了で exit 0、失敗で exit 1。
+fn run_trt_smoke_test() -> ! {
+    println!("[smoke] TrtWorkerPool::start()");
+    let pool = match ai::trt_worker_pool::TrtWorkerPool::start() {
+        Ok(p) => {
+            println!("[smoke] start OK");
+            p
+        }
+        Err(e) => {
+            eprintln!("[smoke] start failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let test_kinds = [
+        ai::ModelKind::DenoiseRealplksr,
+        ai::ModelKind::UpscaleRealEsrganAnime6B,
+    ];
+    for kind in test_kinds {
+        println!("[smoke] LoadModel {:?}", kind);
+        match pool.load_model(kind) {
+            Ok(ms) => println!("[smoke] LoadModel {:?} OK in {ms} ms", kind),
+            Err(e) => {
+                eprintln!("[smoke] LoadModel {:?} failed: {e}", kind);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    println!("[smoke] shutdown (Drop)");
+    drop(pool);
+    println!("[smoke] all OK");
+    std::process::exit(0);
+}
+
 fn parse_window_size_arg() -> Option<[f32; 2]> {
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len().saturating_sub(1) {
