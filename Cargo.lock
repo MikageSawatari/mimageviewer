@@ -3372,6 +3372,7 @@ dependencies = [
  "delharc",
  "eframe",
  "egui",
+ "egui-wgpu",
  "egui_kittest",
  "fast_image_resize",
  "ffmpeg-the-third",

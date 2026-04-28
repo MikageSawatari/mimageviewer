@@ -1724,6 +1724,20 @@ pub struct App {
     /// `os_theme::resolve` の結果と比較して再適用する。
     pub(crate) applied_ui_theme: Option<crate::os_theme::ResolvedTheme>,
 
+    /// eframe の wgpu::Device / Queue / Adapter / target_format。動画 GPU レンダリング
+    /// で `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared
+    /// テクスチャを import するために必要。`main.rs` の creator closure で
+    /// `cc.wgpu_render_state` から渡される。`None` なら GPU 動画レンダリング無効。
+    #[cfg(windows)]
+    pub(crate) wgpu_render_state: Option<egui_wgpu::RenderState>,
+    /// 動画 GPU レンダリング用の共有 D3D11 デバイス。VideoPlayer ごとに生成すると
+    /// FFmpeg HW デコーダ + ID3D11VideoProcessor を別デバイスに作る重複コストが
+    /// 発生するため、App レベルで 1 つ確保して使い回す。`None` の場合は
+    /// 旧経路 (CPU readback + swscale) にフォールバック。
+    #[cfg(windows)]
+    pub(crate) gpu_video_device:
+        Option<std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>>,
+
     // ── PDF パスワード管理 ───────────────────────────────────────
     pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pub(crate) show_pdf_password_dialog: bool,
@@ -2344,6 +2358,10 @@ impl Default for App {
             analysis_sv_cache: None,
             initialized: false,
             applied_ui_theme: None,
+            #[cfg(windows)]
+            wgpu_render_state: None,
+            #[cfg(windows)]
+            gpu_video_device: None,
             pdf_passwords,
             show_pdf_password_dialog: false,
             pdf_password_input: String::new(),

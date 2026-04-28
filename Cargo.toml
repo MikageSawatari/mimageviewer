@@ -55,6 +55,7 @@ windows = { version = "0.61", features = [
 [dependencies]
 eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
+egui-wgpu = "0.33"
 # 動画 GPU レンダリングで wgpu API + dx12 hal 経由の D3D11→wgpu テクスチャ共有が
 # 必要なので、明示的に wgpu / wgpu-hal を依存させる (eframe[wgpu] が間接的に
 # 引いている版に揃える)。wgpu-hal 27 は windows 0.58 系の ID3D12Resource を要求

@@ -287,6 +287,31 @@ fn main() -> eframe::Result {
             let mut app = app::App::default();
             emit_startup("app_default", Some(t));
             app.applied_ui_theme = Some(resolved);
+
+            // 動画 GPU レンダリング用の wgpu::Device / Queue を保存。
+            // また同時に共有 D3D11 デバイスを初期化 (失敗してもアプリは起動継続、
+            // 動画は旧経路 = CPU readback + swscale にフォールバック)。
+            #[cfg(windows)]
+            {
+                if let Some(rs) = cc.wgpu_render_state.clone() {
+                    app.wgpu_render_state = Some(rs);
+                    match crate::video::gpu_renderer::GpuVideoDevice::new(
+                        app.settings.video_rtx_vsr,
+                    ) {
+                        Ok(dev) => {
+                            crate::logger::log(
+                                "GPU video device: created (D3D11 + video processor)".to_string(),
+                            );
+                            app.gpu_video_device = Some(dev);
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "GPU video device: failed (will fallback to CPU readback): {e}"
+                            ));
+                        }
+                    }
+                }
+            }
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
             let t = Instant::now();
             app.hydrate_adjustment_favorite_params();
