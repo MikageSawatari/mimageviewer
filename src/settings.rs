@@ -800,6 +800,11 @@ pub struct Settings {
     /// 有効化することを想定。
     #[serde(default)]
     pub video_hw_decode: bool,
+    /// NVIDIA RTX Video Super Resolution を opt-in するか (RTX 30/40/50 系のみ効果)。
+    /// 有効化しても NVIDIA コントロールパネル側 (動画 → RTX Video Enhancement) が
+    /// OFF だと無効化される (= 2 段階の AND ゲート)。既定 OFF。
+    #[serde(default)]
+    pub video_rtx_vsr: bool,
 }
 
 fn default_video_volume() -> f64 {
@@ -1017,6 +1022,7 @@ impl Default for Settings {
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
             video_hw_decode: false,
+            video_rtx_vsr: false,
         }
     }
 }

@@ -24,6 +24,8 @@ pub mod audio;
 pub mod clock;
 pub mod decoder;
 pub mod ffmpeg_loader;
+#[cfg(windows)]
+pub mod gpu_renderer;
 pub mod thumbnail;
 
 use std::path::PathBuf;
