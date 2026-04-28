@@ -367,6 +367,22 @@ impl AvClock {
         );
     }
 
+    /// fallback wall clock を `(pts, 今)` に再アンカーする。
+    /// 無音動画の post-seek 表示時 (UI tick) に呼ぶ:
+    /// `notify_seek_completed` は seek 処理時点の壁時計でアンカーするので、override が
+    /// 立ったまま UI tick まで時間が経っていると、override クリア直後に
+    /// `fallback_now = target + (UI_tick - seek_proc)` が一気に進んで pts ジャンプ
+    /// (見た目フリッカー) になる。**実際に表示したフレームの pts** で wall を
+    /// 「今」に巻き戻すと、以降は正しく `frame.pts + 経過` で進む。
+    /// audio 経路 (fill_output → set_audio_pts) は別ルートで anchor を更新するため
+    /// この関数は呼び不要。
+    pub fn set_fallback_anchor(&self, pts: f64) {
+        let now_ns = self.epoch.elapsed().as_nanos() as i64;
+        self.fallback_pts_bits.store(pts.to_bits(), Ordering::Release);
+        self.fallback_recorded_at_nanos
+            .store(now_ns, Ordering::Release);
+    }
+
     /// pump 内ringbuffer 残量 (秒) を報告 (audio.rs から)。
     pub fn set_audio_pump_buf_secs(&self, secs: f64) {
         self.audio_pump_buf_secs_bits

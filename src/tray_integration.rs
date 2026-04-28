@@ -170,9 +170,19 @@ impl App {
     /// ウィンドウ復帰後は通常のロード経路で再取得されるので、描画には影響なし
     /// (短時間の再ロードオーバーヘッドが発生する)。
     fn release_gpu_resources(&mut self) {
-        // グリッドサムネ: Loaded → Evicted で TextureHandle を drop
-        for state in &mut self.thumbnails {
+        // グリッドサムネ: Loaded → Evicted で TextureHandle を drop。
+        // **動画サムネは除外**: Windows Shell API 経由で取得しており、復帰後に
+        // 再 spawn する経路が無く、Evicted のまま暗灰 (gray=40) が固定表示されて
+        // しまう (= ユーザー報告「全動画が黒背景」)。動画サムネ 1 枚は 256x144 RGBA
+        // = ~144KB と小さく、フルスクリーン像 (~80MB) と比べて VRAM 影響は無視可能。
+        for (i, state) in self.thumbnails.iter_mut().enumerate() {
             if matches!(state, crate::grid_item::ThumbnailState::Loaded { .. }) {
+                if matches!(
+                    self.items.get(i),
+                    Some(crate::grid_item::GridItem::Video(_))
+                ) {
+                    continue;
+                }
                 *state = crate::grid_item::ThumbnailState::Evicted;
             }
         }
