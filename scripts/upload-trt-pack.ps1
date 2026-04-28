@@ -1,38 +1,41 @@
-# TensorRT 高速化パック (trt-pack-v1) を GitHub Releases に draft でアップロードする
-# スクリプト。docs/tensorrt-pack-distribution.md §6 と等価の操作を PowerShell に
-# 落としたもの。
+# Upload the TensorRT acceleration pack (trt-pack-v1) to GitHub Releases as a draft.
+# Equivalent to docs/tensorrt-pack-distribution.md section 6, expressed as PowerShell.
 #
-# 前提:
-#   - 事前に `cargo run --release --bin build_trt_pack` で
-#     dist\trt-pack-v1\ に 16 ファイルが生成されていること
-#   - gh CLI が PATH にあり、`gh auth status` で MikageSawatari にログイン済み
+# Prerequisites:
+#   - dist\trt-pack-v1\ must contain the 16 files produced by
+#     `cargo run --release --bin build_trt_pack`
+#   - gh CLI must be on PATH and authenticated as MikageSawatari
+#     (run `gh auth status` to check)
 #
-# 使い方 (リポジトリルートまたは worktree ルートで):
+# Usage (from worktree or repo root):
 #   powershell -ExecutionPolicy Bypass -File scripts\upload-trt-pack.ps1
 #
-# Draft で作るので公開はされない。アップロード完了後、内容確認の上で
-# Web UI から [Publish release] するか、以下を実行:
+# This script creates a DRAFT release. Nothing is published until you flip the
+# draft flag. Inspect the contents in the Web UI first, then publish via:
 #   gh release edit trt-pack-v1 --repo MikageSawatari/mimageviewer --draft=false --prerelease
 #
-# やり直したい場合 (draft なので安全に削除可):
+# To roll back (safe while still draft):
 #   gh release delete trt-pack-v1 --repo MikageSawatari/mimageviewer --yes --cleanup-tag
+#
+# IMPORTANT: this file is intentionally ASCII-only. Windows PowerShell 5.1 reads
+# .ps1 files as ANSI (CP932 in JP locale) unless they carry a UTF-8 BOM, so
+# embedding Japanese strings without a BOM produces mojibake and parse errors.
 
 $ErrorActionPreference = 'Stop'
 
-# スクリプト位置からリポジトリルートを推定
+# Resolve repo root from this script's location.
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RepoRoot = Split-Path -Parent $ScriptDir
 Set-Location $RepoRoot
 
-$Tag        = 'trt-pack-v1'
-$Repo       = 'MikageSawatari/mimageviewer'
-$Title      = 'TensorRT acceleration pack v1'
-$NotesFile  = 'docs\tensorrt-pack-release-notes.md'
-$DistDir    = 'dist\trt-pack-v1'
+$Tag       = 'trt-pack-v1'
+$Repo      = 'MikageSawatari/mimageviewer'
+$Title     = 'TensorRT acceleration pack v1'
+$NotesFile = 'docs\tensorrt-pack-release-notes.md'
+$DistDir   = 'dist\trt-pack-v1'
 
-# 16 個のアセット (順序: manifest → notices → DLL × 13 → engine zip)。
-# build_trt_pack.rs が出力する全ファイルを列挙。一覧は明示的に書いて
-# 「うっかり別ファイルが混ざる」事故を防止。
+# 16 assets, listed explicitly so an unrelated file in dist\ cannot leak in.
+# Order: manifest -> notices -> 13 DLLs -> engine zip.
 $Assets = @(
     'manifest.json',
     'NOTICE-NVIDIA.txt',
@@ -53,11 +56,11 @@ $Assets = @(
     'engines-ampere_plus.zip'
 )
 
-# 事前チェック: 全ファイルが存在しサイズ > 0 か
+# --- Pre-flight: every asset exists and is non-empty -----------------------
 Write-Host '============================================='
-Write-Host " Pre-flight: dist\trt-pack-v1\ 検証"
+Write-Host " Pre-flight: dist\trt-pack-v1\ verification"
 Write-Host '============================================='
-$totalBytes = 0
+$totalBytes = [int64]0
 foreach ($name in $Assets) {
     $path = Join-Path $DistDir $name
     if (-not (Test-Path $path)) {
@@ -73,42 +76,43 @@ foreach ($name in $Assets) {
     Write-Host ("  ok: {0,-40} {1,12:N0} bytes" -f $name, $size)
 }
 $totalGb = [Math]::Round($totalBytes / 1GB, 2)
-Write-Host ("`n total: {0:N0} bytes ({1} GB)" -f $totalBytes, $totalGb)
+Write-Host ''
+Write-Host ("  total: {0:N0} bytes ({1} GB)" -f $totalBytes, $totalGb)
 
-# notes ファイルの存在チェック
 if (-not (Test-Path $NotesFile)) {
     Write-Error "release notes file not found: $NotesFile"
     exit 1
 }
 
-# gh 認証チェック
+# --- Pre-flight: gh CLI auth ------------------------------------------------
 Write-Host ''
 Write-Host '============================================='
-Write-Host ' Pre-flight: gh CLI 認証'
+Write-Host ' Pre-flight: gh CLI auth'
 Write-Host '============================================='
 gh auth status
 if ($LASTEXITCODE -ne 0) {
-    Write-Error 'gh CLI が認証されていません。`gh auth login` を実行してください。'
+    Write-Error 'gh CLI is not authenticated. Run `gh auth login` first.'
     exit 1
 }
 
-# 既存タグ衝突チェック
+# --- Pre-flight: tag must not already exist ---------------------------------
 $existing = gh release view $Tag --repo $Repo --json tagName 2>$null
 if ($LASTEXITCODE -eq 0 -and $existing) {
     Write-Host ''
-    Write-Warning "$Tag は既に存在します。続行すると失敗します。"
-    Write-Warning "削除する場合: gh release delete $Tag --repo $Repo --yes --cleanup-tag"
+    Write-Warning "$Tag already exists. Aborting (would conflict)."
+    Write-Warning "If this is a stale draft from a previous attempt, remove it:"
+    Write-Warning "  gh release delete $Tag --repo $Repo --yes --cleanup-tag"
     exit 1
 }
 
-# アップロード実行
+# --- Upload -----------------------------------------------------------------
 Write-Host ''
 Write-Host '============================================='
 Write-Host " gh release create $Tag (draft)"
 Write-Host '============================================='
-Write-Host "アップロード中... ($totalGb GB、5〜15 分目安)"
+Write-Host "uploading... ($totalGb GB, expect 5-15 minutes)"
 
-# アセットパスのリスト (full path で渡す方が gh の取り違えがない)
+# Pass full paths to gh; safer than relying on relative interpretation.
 $AssetPaths = $Assets | ForEach-Object { Join-Path $DistDir $_ }
 
 & gh release create $Tag `
@@ -124,19 +128,19 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# 確認表示
+# --- Done -------------------------------------------------------------------
 Write-Host ''
 Write-Host '============================================='
-Write-Host ' 完了 (draft、まだ公開されていません)'
+Write-Host ' Done (DRAFT, not yet public)'
 Write-Host '============================================='
 gh release view $Tag --repo $Repo
 
 Write-Host ''
-Write-Host 'Web UI で内容を確認してから公開してください:'
+Write-Host 'Inspect the draft in the Web UI:'
 Write-Host "  https://github.com/$Repo/releases"
 Write-Host ''
-Write-Host '公開する場合 (CLI で):'
+Write-Host 'Publish (CLI):'
 Write-Host "  gh release edit $Tag --repo $Repo --draft=false --prerelease"
 Write-Host ''
-Write-Host 'やり直す場合:'
+Write-Host 'Roll back / start over:'
 Write-Host "  gh release delete $Tag --repo $Repo --yes --cleanup-tag"
