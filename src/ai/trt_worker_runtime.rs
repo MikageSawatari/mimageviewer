@@ -19,7 +19,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 
-use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerResp};
+use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerInferBreakdown, WorkerResp};
 use super::{AiBackend, ModelKind};
 
 /// 子プロセス側のエントリ。`main.rs` から `--tensorrt-infer-worker` 引数で
@@ -226,18 +226,17 @@ fn handle_infer(
         Err(e) => return WorkerResp::err(format!("get_or_open input shm: {e}")),
     };
 
-    // 入力 shm から Vec<f32> に直接コピー (read_to_vec 経由の Vec<u8> 中間生成を回避、
-    // 1 回のメモリコピーで完結)。
+    // ── 計装 phase 1: 入力 shm 読み込み (Vec<f32>) ──
+    let t_phase = std::time::Instant::now();
     let f32_count = input_bytes / 4;
     let input_data: Vec<f32> = unsafe {
-        // SAFETY: in_shm は永続 mapped view、ページ整列されているので f32 alignment は OK。
-        // shm の中身は親が書いた little-endian f32。as_slice の slice lifetime は
-        // この unsafe ブロック内に閉じ、to_vec で即座に owned に変換するので安全。
         let bytes = in_shm.as_slice(input_bytes);
         std::slice::from_raw_parts(bytes.as_ptr() as *const f32, f32_count).to_vec()
     };
+    let read_input_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
-    // ndarray::Array4 構築
+    // ── 計装 phase 2: ndarray::Array4 + ort::Tensor 構築 ──
+    let t_phase = std::time::Instant::now();
     let shape = (
         input_shape[0] as usize,
         input_shape[1] as usize,
@@ -252,18 +251,23 @@ fn handle_infer(
         Ok(t) => t,
         Err(e) => return WorkerResp::err(format!("Tensor::from_array: {e}")),
     };
+    let tensor_build_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
 
-    // 推論実行: with_session 内で ORT 出力テンソルから shm へ直接書き込む。
-    // 中間 Vec<u8> を介さず、ORT 内部バッファ → shm の 1 回コピーで済ませる。
-    //
-    // shm_cache.out_shm は closure に &mut で渡す。runtime の sessions Mutex と
-    // shm_cache はメモリ上独立なので borrow checker は通る (Mutex 別、別アドレス)。
-    let t0 = std::time::Instant::now();
+    // ── 計装 phase 3+4: session.run() (純粋) + extract + 出力 shm 書き込み ──
+    // closure 内では session.run のみを別個に計測し、extract+write は外で計測する
+    // ことで GPU 純粋時間と CPU 後処理時間を分離する。
+    let t_total = std::time::Instant::now();
     let out_shm_slot = &mut shm_cache.out_shm;
+    let mut session_run_ms_inner: f64 = 0.0;
     let result: Result<Vec<i64>, super::AiError> = runtime.with_session(kind, |session| {
+        // phase 3: pure session.run() 計測
+        let t_run = std::time::Instant::now();
         let outputs = session
             .run(ort::inputs![tensor])
             .map_err(|e| super::AiError::Ort(format!("session.run: {e}")))?;
+        session_run_ms_inner = t_run.elapsed().as_secs_f64() * 1000.0;
+
+        // phase 4: extract + shm write
         let (shape, raw) = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(|e| super::AiError::Ort(format!("extract_tensor: {e}")))?;
@@ -285,9 +289,6 @@ fn handle_infer(
             )));
         }
 
-        // ORT テンソルバッファを bytes view として shm に直接書き込む。
-        // SAFETY: raw は ORT 内部のテンソルバッファ、f32 アライメント済み。
-        // total_count * 4 バイト分のうち raw.len() ≥ total_count なので範囲内。
         let raw_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(raw.as_ptr() as *const u8, total_bytes)
         };
@@ -297,10 +298,21 @@ fn handle_infer(
         Ok(output_shape)
     });
 
-    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    let total_with_session_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+    // extract + shm write の時間 = with_session 全体 - 純粋 session_run 時間
+    let extract_and_write_ms = (total_with_session_ms - session_run_ms_inner).max(0.0);
 
     match result {
-        Ok(shape) => WorkerResp::ok_infer(elapsed_ms, shape),
+        Ok(shape) => {
+            let elapsed_ms = total_with_session_ms as u64;
+            let breakdown = WorkerInferBreakdown {
+                read_input_ms,
+                tensor_build_ms,
+                session_run_ms: session_run_ms_inner,
+                extract_and_write_ms,
+            };
+            WorkerResp::ok_infer(elapsed_ms, shape, breakdown)
+        }
         Err(e) => WorkerResp::err(format!("inference failed: {e}")),
     }
 }

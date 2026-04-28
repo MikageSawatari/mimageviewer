@@ -294,6 +294,18 @@ impl TrtWorkerPool {
             .output_shape
             .ok_or_else(|| "Resp.output_shape が None".to_string())?;
 
+        // 計装: ワーカー breakdown を logger に出す (bench でログから集計可能)
+        if let Some(b) = resp.breakdown.as_ref() {
+            crate::logger::log(format!(
+                "[TRT-pool] infer breakdown: read_input={:.3} tensor_build={:.3} session_run={:.3} extract_and_write={:.3} total={:.3} ms",
+                b.read_input_ms,
+                b.tensor_build_ms,
+                b.session_run_ms,
+                b.extract_and_write_ms,
+                b.read_input_ms + b.tensor_build_ms + b.session_run_ms + b.extract_and_write_ms
+            ));
+        }
+
         // 永続出力 shm から bytes 読み取り → Vec<f32>
         let out_count: usize = output_shape.iter().product::<i64>() as usize;
         let out_bytes_len = out_count * std::mem::size_of::<f32>();

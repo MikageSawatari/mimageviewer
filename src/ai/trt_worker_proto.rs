@@ -56,18 +56,37 @@ pub enum WorkerCmd {
     Shutdown,
 }
 
+/// Infer 推論の詳細タイミング内訳 (ワーカー内部視点、調査用)。
+///
+/// 各値は ms。worker → parent に Resp で返される。Phase 3 のオーバーヘッド
+/// 分析用、本番でも軽く出すコストなので常時付与する。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerInferBreakdown {
+    /// 入力共有メモリの read + Vec<f32> 構築
+    pub read_input_ms: f64,
+    /// ndarray::Array4 + ort::value::Tensor::from_array 構築
+    pub tensor_build_ms: f64,
+    /// session.run() 純粋時間 (= Direct TRT との比較対象)
+    pub session_run_ms: f64,
+    /// try_extract_tensor + 出力共有メモリへの write
+    pub extract_and_write_ms: f64,
+}
+
 /// 子 → 親 のレスポンス。stdout に行単位 JSON で書く。
 ///
 /// `ok: bool` で成功/失敗を表現する untagged 風 (`tag` 無し)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResp {
     pub ok: bool,
-    /// コマンド実行に要した時間 (ms)。Infer の場合は run() のみの時間。
+    /// コマンド実行に要した時間 (ms)。Infer の場合は内部処理全体 (with_session 含む)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
     /// `Infer` 成功時の出力テンソル shape (NCHW)。他のコマンドでは None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_shape: Option<Vec<i64>>,
+    /// `Infer` の詳細タイミング (調査用)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<WorkerInferBreakdown>,
     /// `ok=false` のときのエラーメッセージ。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -79,15 +98,21 @@ impl WorkerResp {
             ok: true,
             elapsed_ms: Some(elapsed_ms),
             output_shape: None,
+            breakdown: None,
             error: None,
         }
     }
 
-    pub fn ok_infer(elapsed_ms: u64, output_shape: Vec<i64>) -> Self {
+    pub fn ok_infer(
+        elapsed_ms: u64,
+        output_shape: Vec<i64>,
+        breakdown: WorkerInferBreakdown,
+    ) -> Self {
         Self {
             ok: true,
             elapsed_ms: Some(elapsed_ms),
             output_shape: Some(output_shape),
+            breakdown: Some(breakdown),
             error: None,
         }
     }
@@ -97,6 +122,7 @@ impl WorkerResp {
             ok: false,
             elapsed_ms: None,
             output_shape: None,
+            breakdown: None,
             error: Some(msg.into()),
         }
     }
