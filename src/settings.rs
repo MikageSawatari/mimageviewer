@@ -258,6 +258,10 @@ impl SortOrder {
     /// 2 つのメディア項目をこのソート順で比較する。
     /// `name_a`/`name_b` はファイル名（拡張子付き）、`mtime_a`/`mtime_b` は更新日時。
     /// `natural_key` は番号順ソート用のキー生成関数。
+    ///
+    /// 日付ソートで mtime が等しい場合はファイル名昇順で tiebreak する。`mtime_secs`
+    /// は秒精度なので、同一秒に作成・更新されたファイル群が `read_dir` 順 (FS 依存で
+    /// 不安定) に並ぶのを防ぐ。
     pub fn compare<K: Ord>(
         self,
         name_a: &str,
@@ -269,8 +273,12 @@ impl SortOrder {
         match self {
             Self::FileName => name_a.to_lowercase().cmp(&name_b.to_lowercase()),
             Self::Numeric => natural_key(name_a).cmp(&natural_key(name_b)),
-            Self::DateAsc => mtime_a.cmp(&mtime_b),
-            Self::DateDesc => mtime_b.cmp(&mtime_a),
+            Self::DateAsc => mtime_a
+                .cmp(&mtime_b)
+                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
+            Self::DateDesc => mtime_b
+                .cmp(&mtime_a)
+                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
         }
     }
 }
@@ -1427,6 +1435,23 @@ mod tests {
         assert_eq!(
             SortOrder::DateDesc.compare("a", 100, "b", 200, |s: &str| s.to_string()),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    /// 日付ソートで mtime が同じ場合はファイル名昇順で安定化する
+    /// (mtime_secs は秒精度なので同一秒の衝突は実際に起きる)。
+    #[test]
+    fn sort_order_compare_date_tiebreak_by_name() {
+        let key = |s: &str| s.to_string();
+        assert_eq!(
+            SortOrder::DateAsc.compare("Bbb", 100, "aaa", 100, key),
+            std::cmp::Ordering::Greater,
+            "DateAsc 同 mtime: 名前昇順で並ぶべき (Bbb > aaa)"
+        );
+        assert_eq!(
+            SortOrder::DateDesc.compare("Bbb", 100, "aaa", 100, key),
+            std::cmp::Ordering::Greater,
+            "DateDesc 同 mtime でも名前昇順 (= 新しいもの優先で揃え、同 mtime は名前順)"
         );
     }
 

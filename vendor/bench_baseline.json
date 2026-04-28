@@ -1,6 +1,0 @@
-{
-  "version": 1,
-  "num_docs": 50000,
-  "_comment": "プレースホルダ。リリース前に bench_search --docs 50000 --json で生成し、scripts/check_bench_regression.py --save で更新する。queries が空の状態では check_bench_regression.py がエラーで止まり、初回登録を促す。",
-  "queries": {}
-}
