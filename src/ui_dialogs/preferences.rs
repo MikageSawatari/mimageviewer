@@ -186,6 +186,10 @@ pub(crate) struct PreferencesState {
     pub trt_pack_size_mib: u64,
     /// TRT engine cache の総ディスク使用量 (MiB)
     pub trt_engine_cache_size_mib: u64,
+
+    /// 「全エンジンビルド」ボタンが押されたときに立てるフラグ。
+    /// Apply 直後に App 側で見て start_trt_build() を呼び、消す。
+    pub start_trt_build_requested: bool,
 }
 
 impl PreferencesState {
@@ -244,6 +248,7 @@ impl PreferencesState {
             trt_pack_installed,
             trt_pack_size_mib,
             trt_engine_cache_size_mib,
+            start_trt_build_requested: false,
         }
     }
 }
@@ -372,12 +377,24 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("  OK  ").clicked() {
                         apply = true;
+                        // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
                     if ui.button("キャンセル").clicked() {
                         cancel = true;
                     }
                 });
             });
+
+        // 「全エンジンビルド」フラグの即時処理 (OK/Cancel に関係なくこのフレームで起動する)
+        // フラグは pref_state 上に持ち、立っていればビルドを開始してフラグを倒す。
+        // ビルド開始はバックグラウンドスレッド + show_trt_build_dialog で進捗表示なので、
+        // 環境設定ウィンドウを閉じる必要はない。
+        if let Some(state) = self.pref_state.as_mut()
+            && state.start_trt_build_requested
+        {
+            state.start_trt_build_requested = false;
+            self.start_trt_build();
+        }
 
         if apply {
             if let Some(mut state) = self.pref_state.take() {
@@ -959,6 +976,27 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 &mut state.settings.ai_tensorrt_fp16,
                 "FP16 推論を有効にする (推奨、1.5-2x 高速、画質ほぼ同等)",
             );
+            ui.add_space(8.0);
+
+            // 全エンジン一括ビルドボタン
+            ui.label(egui::RichText::new("初回セットアップ").strong());
+            ui.add_space(2.0);
+            ui.label(
+                "TensorRT は各モデルを GPU 専用にコンパイルしたエンジンを使います。\n\
+                 初回は全 8 モデルのビルドに 5〜15 分かかります (バックグラウンドで実行)。\n\
+                 ビルド済みモデルはエンジンキャッシュに保存され、次回以降は瞬時にロードされます。",
+            );
+            ui.add_space(4.0);
+            if ui
+                .button("全エンジンを今すぐビルドする")
+                .on_hover_text(
+                    "閉じてから別ウィンドウで進捗を表示します。\
+                     未ビルドのモデルだけが時間かかります。",
+                )
+                .clicked()
+            {
+                state.start_trt_build_requested = true;
+            }
             ui.add_space(8.0);
 
             // エンジンキャッシュ管理

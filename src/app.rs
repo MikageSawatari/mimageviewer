@@ -1346,6 +1346,8 @@ pub struct App {
     pub(crate) show_preferences: bool,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
+    /// TensorRT エンジンビルド進捗ダイアログのステート (Some なら表示中)
+    pub(crate) trt_build_state: Option<crate::ui_dialogs::trt_build::TrtBuildState>,
 
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
@@ -2215,6 +2217,7 @@ impl Default for App {
             open_folder_error: None,
             show_preferences: false,
             pref_state: None,
+            trt_build_state: None,
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
@@ -12659,6 +12662,7 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_trt_build_dialog(ctx);
         self.show_stats_dialog_window(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
