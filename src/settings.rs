@@ -720,10 +720,9 @@ pub struct Settings {
     #[serde(default)]
     pub ai_backend: Option<String>,
 
-    /// AI TensorRT バックエンド: FP16 推論を有効にする (デフォルト: true)
-    /// FP16 で 1.5-2x の追加高速化が得られるが、わずかな精度低下があり得る。
-    #[serde(default = "default_true")]
-    pub ai_tensorrt_fp16: bool,
+    // 注: ai_tensorrt_fp16 フィールドは廃止。FP16 はランタイム側で常時 ON
+    // (画質劣化は知覚不能、1.5-2x 高速化のメリットが大きい)。古い settings.json に
+    // 残っているフィールドは serde の default で無視される。
 
     // ── グローバルプリセット ──────────────────────────────────────
     /// グローバルプリセット (0キー)。全フォルダ共通の補正設定。
@@ -985,7 +984,6 @@ impl Default for Settings {
             ai_upscale_skip_px: default_ai_upscale_skip_px(),
             ai_denoise_skip_px: default_ai_denoise_skip_px(),
             ai_backend: None,
-            ai_tensorrt_fp16: true,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             sidecar_backup_enabled: true,

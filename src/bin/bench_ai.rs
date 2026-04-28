@@ -79,8 +79,6 @@ struct Args {
     /// AI バックエンド (DirectML / TensorRT / CPU)。
     /// TensorRT は %APPDATA%/mimageviewer/tensorrt/ に pack が展開されている前提。
     backend: AiBackend,
-    /// TensorRT FP16 推論を有効にする (デフォルト: true)。
-    tensorrt_fp16: bool,
     /// JSON 形式のサマリ出力先 (--json /path/to/file.json)。
     /// 後で複数バックエンド/モデルの結果を比較しやすくするため。
     json_output: Option<PathBuf>,
@@ -95,7 +93,6 @@ fn parse_args() -> Args {
     let mut tile_sizes: Vec<u32> = Vec::new();
     let mut save_output: Option<PathBuf> = None;
     let mut backend: AiBackend = AiBackend::DirectMl;
-    let mut tensorrt_fp16: bool = true;
     let mut json_output: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -146,9 +143,6 @@ fn parse_args() -> Args {
                     )
                 });
             }
-            "--no-fp16" => {
-                tensorrt_fp16 = false;
-            }
             "--json" => {
                 i += 1;
                 json_output = Some(PathBuf::from(&raw[i]));
@@ -177,7 +171,6 @@ fn parse_args() -> Args {
         tile_sizes,
         save_output,
         backend,
-        tensorrt_fp16,
         json_output,
     }
 }
@@ -198,7 +191,6 @@ fn print_help() {
     println!("  --backend <NAME>        AI backend: directml (default), tensorrt, cpu");
     println!("                          tensorrt requires the pack to be installed at");
     println!("                          %APPDATA%/mimageviewer/tensorrt/ (run scripts/setup-tensorrt-pack.ps1)");
-    println!("  --no-fp16               Disable TensorRT FP16 (only meaningful with --backend tensorrt)");
     println!("  --json <PATH>           Write a JSON summary of all (image,model,tile) results");
     println!("                          for later cross-backend comparison");
     println!("  --help, -h              Show this help\n");
@@ -226,14 +218,14 @@ fn main() {
     println!("  runs:    {}", args.runs);
     println!("  backend: {}", args.backend.as_str());
     if args.backend == AiBackend::TensorRt {
-        println!("    fp16:  {}", args.tensorrt_fp16);
+        println!("    fp16:  on (hardcoded、画質劣化は知覚不能、1.5-2x 高速化)");
     }
     println!();
 
     model_manager::ensure_models_extracted();
     let mm = model_manager::ModelManager::new();
-    let runtime = AiRuntime::new_with_backend(args.backend, args.tensorrt_fp16)
-        .expect("AiRuntime::new_with_backend");
+    let runtime =
+        AiRuntime::new_with_backend(args.backend).expect("AiRuntime::new_with_backend");
     let active = runtime.active_backend();
     println!(
         "AiRuntime ready (requested={:?}, effective={:?}, dll={})",
@@ -373,7 +365,7 @@ fn main() {
     if let Some(path) = &args.json_output {
         let summary = json!({
             "backend": args.backend.as_str(),
-            "tensorrt_fp16": args.tensorrt_fp16,
+            "tensorrt_fp16": args.backend == AiBackend::TensorRt,
             "warmup": args.warmup,
             "runs": args.runs,
             "records": records.iter().map(|r| json!({

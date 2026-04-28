@@ -232,17 +232,15 @@ pub struct AiRuntime {
     sessions: Mutex<HashMap<ModelKind, Session>>,
     /// 現プロセスで実際にロードされたバックエンド情報。
     backend: ActiveBackend,
-    /// TensorRT FP16 推論を有効化するか (Settings から渡される)。
-    tensorrt_fp16: bool,
 }
 
 impl AiRuntime {
     /// 新しい AiRuntime を作成する (DirectML バックエンド、互換 API)。
     ///
     /// テスト・ベンチ・既存呼び出し用のショートハンド。
-    /// アプリ本体は `new_with_backend(backend, fp16)` を使ってユーザー設定を反映する。
+    /// アプリ本体は `new_with_backend(backend)` を使ってユーザー設定を反映する。
     pub fn new() -> Result<Self, AiError> {
-        Self::new_with_backend(AiBackend::DirectMl, true)
+        Self::new_with_backend(AiBackend::DirectMl)
     }
 
     /// 指定バックエンドで新しい AiRuntime を作成する。
@@ -252,12 +250,14 @@ impl AiRuntime {
     /// `%APPDATA%/mimageviewer/tensorrt/` (TensorRT pack) からロードする。
     /// OnceLock により最初の 1 回のみ実行され、以降は cache を返す。
     /// 異なる backend で 2 回呼ばれても初回の選択が固定される (ort::init_from の制約)。
-    pub fn new_with_backend(backend: AiBackend, tensorrt_fp16: bool) -> Result<Self, AiError> {
+    ///
+    /// FP16 推論は TensorRT 利用時に常時 ON (画質劣化は知覚不能、1.5-2x 高速化)。
+    /// FP32 比較が必要なデバッグ用途のため設定として外出ししない方針。
+    pub fn new_with_backend(backend: AiBackend) -> Result<Self, AiError> {
         let active = ensure_ort_initialized(backend)?;
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
             backend: active,
-            tensorrt_fp16,
         })
     }
 
@@ -397,10 +397,15 @@ impl AiRuntime {
         // ビルド時間ペナルティは初回のみ。実測 anime6b で 994ms → 951ms (5% 改善)。
         const TRT_BUILDER_OPT_LEVEL: u8 = 5;
 
+        // FP16 推論は常時 ON。画質劣化は ESRGAN クラスのモデルでは知覚不能
+        // (1 ピクセル平均 0.05-0.2/255、PSNR -0.05 dB 程度)、1.5-2x 高速化が
+        // 効くため利点が大きい。FP32 比較が必要な場面のため設定 UI には出さない。
+        const TRT_FP16: bool = true;
+
         crate::logger::log(format!(
             "[AI] TRT EP options: cache_path={}, fp16={}, workspace={} MiB, builder_opt_level={}",
             cache_dir.display(),
-            self.tensorrt_fp16,
+            TRT_FP16,
             workspace_bytes / (1024 * 1024),
             TRT_BUILDER_OPT_LEVEL
         ));
@@ -408,7 +413,7 @@ impl AiRuntime {
         let trt = ort::ep::TensorRT::default()
             .with_engine_cache(true)
             .with_engine_cache_path(cache_dir.to_string_lossy().to_string())
-            .with_fp16(self.tensorrt_fp16)
+            .with_fp16(TRT_FP16)
             .with_max_workspace_size(workspace_bytes)
             .with_builder_optimization_level(TRT_BUILDER_OPT_LEVEL)
             .build();

@@ -10030,8 +10030,7 @@ impl App {
                 .as_deref()
                 .and_then(crate::ai::AiBackend::from_str)
                 .unwrap_or_default();
-            let fp16 = self.settings.ai_tensorrt_fp16;
-            match crate::ai::runtime::AiRuntime::new_with_backend(backend, fp16) {
+            match crate::ai::runtime::AiRuntime::new_with_backend(backend) {
                 Ok(rt) => {
                     let active = rt.active_backend();
                     crate::logger::log(format!(

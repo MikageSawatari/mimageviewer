@@ -114,15 +114,18 @@ impl App {
                 }
                 let _ = tx.send(TrtBuildMsg::KindStart(i));
                 let tx_for_event = tx.clone();
-                let r = build_engine_for(kind, |ev| {
+                // build_engine_for に cancel フラグを渡す。これがキャンセル時に
+                // 子プロセスを kill するためのシグナル。
+                let r = build_engine_for(kind, cancel_for_worker.clone(), |ev| {
                     let _ = tx_for_event.send(TrtBuildMsg::KindEvent(i, ev.clone()));
                 });
                 let send_result = tx.send(TrtBuildMsg::KindDone(i, r.clone()));
                 if send_result.is_err() {
                     break;
                 }
-                if r.is_err() {
-                    break; // 失敗したら以降のモデルは打ち切り
+                // キャンセルされたか、エラーで打ち切り
+                if cancel_for_worker.load(Ordering::Relaxed) || r.is_err() {
+                    break;
                 }
             }
             let _ = tx.send(TrtBuildMsg::WorkerExited);

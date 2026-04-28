@@ -998,13 +998,6 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
             ui.add_space(8.0);
 
-            // FP16 トグル
-            ui.checkbox(
-                &mut state.settings.ai_tensorrt_fp16,
-                "FP16 推論を有効にする (推奨、1.5-2x 高速、画質ほぼ同等)",
-            );
-            ui.add_space(8.0);
-
             // 全エンジン一括ビルドボタン
             ui.label(egui::RichText::new("初回セットアップ").strong());
             ui.add_space(2.0);

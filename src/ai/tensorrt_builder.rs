@@ -24,6 +24,10 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -119,8 +123,7 @@ pub fn run_worker_process() -> ! {
 
     // AiRuntime を TensorRT バックエンドで初期化。
     // この呼び出し自体は速い (DLL extract & init_from のみ)。
-    let runtime = match super::runtime::AiRuntime::new_with_backend(super::AiBackend::TensorRt, true)
-    {
+    let runtime = match super::runtime::AiRuntime::new_with_backend(super::AiBackend::TensorRt) {
         Ok(rt) => rt,
         Err(e) => {
             emit(&TrtBuildEvent::Error {
@@ -175,10 +178,15 @@ pub fn run_worker_process() -> ! {
 
 /// 1 モデル分のエンジンビルドを子プロセスで実行する。
 ///
+/// `cancel` が外部から `true` に立てられると、子プロセスを kill して即座に
+/// 戻る (Err)。これがないと TRT のエンジンコンパイルがハングしたとき
+/// (MI-GAN のような複雑モデルで稀にある) に親が永久に止まってしまう。
+///
 /// `on_event` は stdout から読んだ各 JSON 行ごとに呼ばれる。
-/// 戻り値: ビルド成功で `Ok(elapsed_ms)`、失敗で `Err(message)`。
+/// 戻り値: ビルド成功で `Ok(elapsed_ms)`、失敗/キャンセルで `Err(message)`。
 pub fn build_engine_for(
     kind: ModelKind,
+    cancel: Arc<AtomicBool>,
     mut on_event: impl FnMut(&TrtBuildEvent),
 ) -> Result<u64, String> {
     let exe = std::env::current_exe()
@@ -191,14 +199,49 @@ pub fn build_engine_for(
         .spawn()
         .map_err(|e| format!("spawn child: {e}"))?;
 
+    // stdout / stderr を Child から先に取り出してから、Child 自体を Mutex に
+    // 入れる。こうすることで stdout 読みは独立したパイプハンドルで行え、
+    // ウォッチャースレッドが Child の kill だけを扱える。
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "child stdout missing".to_string())?;
-    let reader = BufReader::new(stdout);
+    let stderr = child.stderr.take();
+    let child_holder: Arc<Mutex<Option<std::process::Child>>> =
+        Arc::new(Mutex::new(Some(child)));
 
+    // ウォッチャースレッド: cancel フラグを 200ms 周期でポーリングし、
+    // 立っていたら子プロセスを kill する。kill されると stdout が EOF に
+    // なるので、メインスレッドの reader.lines() ループが抜ける。
+    // 子プロセスがメイン側で正常終了 (Mutex から取り出し済み) になったら
+    // ウォッチャーは何もせずに終わる。
+    let watcher_cancel = cancel.clone();
+    let watcher_holder = child_holder.clone();
+    let watcher_kind = kind;
+    let watcher = thread::spawn(move || {
+        loop {
+            // メイン側が child を取り出したら終了
+            if watcher_holder.lock().unwrap().is_none() {
+                return;
+            }
+            if watcher_cancel.load(Ordering::Relaxed) {
+                if let Some(mut c) = watcher_holder.lock().unwrap().take() {
+                    crate::logger::log(format!(
+                        "[TRT-builder] {watcher_kind:?}: cancel 検知 → 子プロセスを kill"
+                    ));
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+
+    let reader = BufReader::new(stdout);
     let mut last_done_ms: Option<u64> = None;
     let mut last_error: Option<String> = None;
+    let mut cancelled = false;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -229,18 +272,35 @@ pub fn build_engine_for(
         }
     }
 
-    // 子プロセス終了待ち + stderr 取得
-    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
-    let stderr_text = child
-        .stderr
-        .as_mut()
-        .map(|s| {
+    // ウォッチャーが先に kill 済みなら child は None。そうでなければ
+    // ここで取り出して wait する (正常終了経路)。
+    let status = match child_holder.lock().unwrap().take() {
+        Some(mut c) => match c.wait() {
+            Ok(s) => Some(s),
+            Err(e) => return Err(format!("wait: {e}")),
+        },
+        None => {
+            // ウォッチャーが kill した = キャンセル経路
+            cancelled = true;
+            None
+        }
+    };
+    // ウォッチャーの自然終了を待つ (Mutex が None になっているのですぐ抜ける)
+    let _ = watcher.join();
+
+    let stderr_text = stderr
+        .map(|mut s| {
             use std::io::Read;
             let mut buf = String::new();
             let _ = s.read_to_string(&mut buf);
             buf
         })
         .unwrap_or_default();
+
+    if cancelled {
+        return Err("ユーザーによりキャンセル".to_string());
+    }
+    let status = status.expect("status が None なのは cancelled の場合だけ");
 
     if !status.success() {
         let msg = match last_error {
@@ -258,16 +318,21 @@ pub fn build_engine_for(
 /// (数百 ms) ので、未ビルドのものだけが 30 秒〜数分かかる。
 ///
 /// `on_progress` は (current_index, total, current_kind, event) で呼ばれる。
+/// `cancel` はモデル境界 + 各モデル内 (build_engine_for) の両方で見る。
 #[allow(dead_code)] // Phase 2-full step 3 (UI ダイアログ) から呼ばれる
 pub fn build_all_engines(
     kinds: &[ModelKind],
+    cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(usize, usize, ModelKind, &TrtBuildEvent),
 ) -> Result<Vec<(ModelKind, u64)>, (ModelKind, String)> {
     let total = kinds.len();
     let mut results = Vec::with_capacity(total);
     for (i, &kind) in kinds.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err((kind, "ユーザーによりキャンセル".to_string()));
+        }
         let mut last_event_ms = 0u64;
-        let r = build_engine_for(kind, |ev| {
+        let r = build_engine_for(kind, cancel.clone(), |ev| {
             on_progress(i, total, kind, ev);
             if let TrtBuildEvent::Done { elapsed_ms, .. } = ev {
                 last_event_ms = *elapsed_ms;
