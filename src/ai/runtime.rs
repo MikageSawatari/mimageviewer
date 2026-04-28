@@ -246,6 +246,31 @@ pub struct AiRuntime {
     /// TRT 推論ワーカープール。`None` なら全推論ローカル DirectML。
     /// 設定で TRT 有効化時に attach され、無効化で detach される (ホットリロード)。
     worker_pool: Mutex<Option<std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>>>,
+    /// UI に表示する worker 関連の最新通知 (Phase 3 Step 5、クラッシュ通知など)。
+    /// `take_worker_notice()` で 1 回だけ取り出される。
+    /// 設定: 起動失敗 / 推論中の死亡 / 手動 detach はここに乗らず、log のみ。
+    worker_notice: Mutex<Option<WorkerNotice>>,
+}
+
+/// Phase 3 Step 5: TRT ワーカー関連の UI 通知。
+///
+/// `kind` で表示色 (赤/青) と動作 (再起動可能か) を分岐する。
+#[derive(Debug, Clone)]
+pub struct WorkerNotice {
+    /// 通知種別 (UI で文言/動作分岐用)。
+    pub kind: WorkerNoticeKind,
+    /// 詳細メッセージ (英語/日本語混在 OK、log にも出る)。
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerNoticeKind {
+    /// 起動を試みたが TRT pack 不在 / engine 不整合 / その他で起動失敗。
+    /// バックエンド設定は TensorRt のままだが、実体は DirectML で動作している。
+    SpawnFailed,
+    /// 起動後の推論中に子プロセスが死亡 (DLL クラッシュ等)。
+    /// 自動 detach 済みで、以降の推論は DirectML にフォールバックされる。
+    DiedDuringInfer,
 }
 
 impl AiRuntime {
@@ -273,6 +298,7 @@ impl AiRuntime {
             sessions: Mutex::new(HashMap::new()),
             backend: active,
             worker_pool: Mutex::new(None),
+            worker_notice: Mutex::new(None),
         })
     }
 
@@ -315,6 +341,40 @@ impl AiRuntime {
     #[allow(dead_code)]
     pub fn has_worker_pool(&self) -> bool {
         self.worker_pool.lock().unwrap().is_some()
+    }
+
+    /// UI 通知を 1 回だけ取り出す (consume)。
+    ///
+    /// アプリの update ループで毎フレーム呼び、`Some(notice)` が返ったら
+    /// バナー表示に転写する。読み出し済みの通知は次の `report_*` まで `None`。
+    pub fn take_worker_notice(&self) -> Option<WorkerNotice> {
+        self.worker_notice.lock().unwrap().take()
+    }
+
+    /// 起動失敗を UI 通知に登録する (Phase 3 Step 5)。
+    ///
+    /// `spawn_trt_worker_pool` 内で `TrtWorkerPool::start()` が Err を返したときに
+    /// 呼ぶ。pool は attach されないので detach は不要、log + UI 通知のみ。
+    pub fn report_worker_spawn_failed(&self, detail: String) {
+        crate::logger::log(format!("[AI] TRT worker spawn failed: {detail}"));
+        *self.worker_notice.lock().unwrap() = Some(WorkerNotice {
+            kind: WorkerNoticeKind::SpawnFailed,
+            detail,
+        });
+    }
+
+    /// 推論中の死亡を UI 通知に登録し、pool を detach する (Phase 3 Step 5)。
+    ///
+    /// 内部で `detach_worker_pool()` を呼ぶので、以降の `should_route_to_worker` は
+    /// 即 `false` を返し、推論は DirectML にフォールバックする。
+    fn report_worker_died(&self, detail: String) {
+        crate::logger::log(format!("[AI] TRT worker died during infer: {detail}"));
+        // 同 lock 内で detach すると detach 内部の logger も無問題 (Mutex は別)。
+        self.detach_worker_pool();
+        *self.worker_notice.lock().unwrap() = Some(WorkerNotice {
+            kind: WorkerNoticeKind::DiedDuringInfer,
+            detail,
+        });
     }
 
     /// 指定モデルが TRT ワーカーへルーティングされるかを判定する。
@@ -361,13 +421,24 @@ impl AiRuntime {
         })?;
         // ワーカー側で lazy load (idempotent)。failure は Err にフォワード。
         if let Err(e) = pool.load_model(kind) {
+            // load_model 内で I/O 失敗を検出していたら pool.is_dead() == true。
+            // その場合はここで報告 + detach して、以降の呼び出しは DirectML へ。
+            if pool.is_dead() {
+                self.report_worker_died(format!("load_model({kind:?}): {e}"));
+            }
             return Err(AiError::Ort(format!(
                 "worker.load_model({kind:?}): {e}"
             )));
         }
-        pool.infer(kind, input).map_err(|e| {
-            AiError::Ort(format!("worker.infer({kind:?}): {e}"))
-        })
+        match pool.infer(kind, input) {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                if pool.is_dead() {
+                    self.report_worker_died(format!("infer({kind:?}): {e}"));
+                }
+                Err(AiError::Ort(format!("worker.infer({kind:?}): {e}")))
+            }
+        }
     }
 
     /// 指定モデルのセッションがロード済みか確認する。

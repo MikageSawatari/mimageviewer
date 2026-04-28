@@ -1860,6 +1860,11 @@ pub struct App {
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)。フルスクリーン / グリッド共通。
     /// 命名の `fs_` プレフィックスはフルスクリーン専用だった頃の名残。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
+    /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
+    /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
+    /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
+    /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
+    pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の画像でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -2385,6 +2390,7 @@ impl Default for App {
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
+            trt_worker_notice: None,
             fs_boundary_hint: None,
 
             // 消しゴムモード
@@ -10056,7 +10062,9 @@ impl App {
     /// 別スレッドに逃がし、起動完了したら attach する。
     ///
     /// 起動失敗時は AiRuntime は DirectML のままで動作続行し、ログにエラーを残す。
-    fn spawn_trt_worker_pool(runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>) {
+    pub(crate) fn spawn_trt_worker_pool(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+    ) {
         let runtime_for_thread = runtime.clone();
         std::thread::Builder::new()
             .name("trt-worker-spawn".to_string())
@@ -10072,9 +10080,11 @@ impl App {
                         );
                     }
                     Err(e) => {
-                        crate::logger::log(format!(
-                            "[AI] TRT worker pool 起動失敗 (DirectML のみで動作): {e}"
-                        ));
+                        // 起動失敗 (TRT pack 不在 / engine 不整合 / DLL ロード失敗 等)。
+                        // DirectML で動作続行するが、UI に通知して気付かせる
+                        // (Phase 3 Step 5)。ログだけだとユーザーが「なぜ TRT に
+                        // ならないか」を追えない。
+                        runtime_for_thread.report_worker_spawn_failed(e);
                     }
                 }
             })
@@ -12747,6 +12757,12 @@ impl eframe::App for App {
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
         self.show_trt_build_dialog(ctx);
+        // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
+        // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
+        // 順序は trt_build_dialog より後 (バナーがビルド中は隠れる仕様のため、
+        // build_state の最新フレーム値を見る必要がある)。
+        self.poll_trt_worker_notice();
+        self.show_trt_worker_notice_dialog(ctx);
         self.show_stats_dialog_window(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);

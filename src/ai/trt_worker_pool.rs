@@ -28,6 +28,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerResp};
 
@@ -144,11 +145,16 @@ pub struct TrtWorkerPool {
     /// 共有メモリ名 (子に伝えるため)
     in_shm_name: String,
     out_shm_name: String,
+    /// 子プロセスが死んだ (I/O が EOF になった、kill された) ことを示すフラグ。
+    /// `true` になったら以降の `infer` / `load_model` は即 Err。`AiRuntime` 側で
+    /// このフラグを見て worker_pool を detach し、UI に通知する。
+    is_dead: AtomicBool,
 }
 
 #[cfg(not(windows))]
 pub struct TrtWorkerPool {
     worker: Mutex<Option<WorkerHandle>>,
+    is_dead: AtomicBool,
 }
 
 impl TrtWorkerPool {
@@ -198,6 +204,7 @@ impl TrtWorkerPool {
             out_shm: Mutex::new(Some(out_shm)),
             in_shm_name,
             out_shm_name,
+            is_dead: AtomicBool::new(false),
         })
     }
 
@@ -206,15 +213,53 @@ impl TrtWorkerPool {
         Err("TRT worker pool は Windows 専用".to_string())
     }
 
+    /// 子プロセスが死亡判定済みか。
+    pub fn is_dead(&self) -> bool {
+        self.is_dead.load(Ordering::Acquire)
+    }
+
+    /// 子プロセスが死亡したと判定する (内部用)。
+    /// 1 度立ったら戻らない (pool は使い捨て、再起動は新 pool を作って差し替える)。
+    fn mark_dead(&self) {
+        self.is_dead.store(true, Ordering::Release);
+    }
+
+    /// 内部 send_cmd 呼び出しのエラー文字列が「子プロセスが死んだ」ことを示すかを判定。
+    /// 該当パターン (`stdin write` / `stdout read` / EOF) なら mark_dead して true。
+    /// 該当しない (子の `ok=false` レスポンス等) なら false。
+    fn classify_io_error(&self, err: &str) {
+        // I/O が壊れているパターンは IPC 上の文字列 prefix で検出する
+        // (read_resp_line / send_cmd で使われるエラーメッセージと一致させる)
+        let killed = err.starts_with("stdin write")
+            || err.starts_with("stdin flush")
+            || err.starts_with("stdout read")
+            || err.contains("worker stdout が EOF");
+        if killed {
+            self.mark_dead();
+            crate::logger::log(format!(
+                "[TRT-worker-pool] worker 子プロセス死亡を検出: {err}"
+            ));
+        }
+    }
+
     /// 指定モデルをワーカー側でロードする (engine cache HIT で速い)。
     pub fn load_model(&self, kind: super::ModelKind) -> Result<u64, String> {
+        if self.is_dead() {
+            return Err("worker is dead (前段で死亡判定済み)".to_string());
+        }
         let mut guard = self.worker.lock().map_err(|_| "worker mutex poisoned".to_string())?;
         let Some(w) = guard.as_mut() else {
             return Err("worker is shut down".to_string());
         };
-        let resp = w.send_cmd(&WorkerCmd::LoadModel {
+        let resp = match w.send_cmd(&WorkerCmd::LoadModel {
             kind: kind.as_str().to_string(),
-        })?;
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                self.classify_io_error(&e);
+                return Err(e);
+            }
+        };
         if !resp.ok {
             return Err(resp.error.unwrap_or_else(|| "(error 不明)".to_string()));
         }
@@ -237,6 +282,9 @@ impl TrtWorkerPool {
         kind: super::ModelKind,
         input: &ndarray::Array4<f32>,
     ) -> Result<(Vec<i64>, Vec<f32>), String> {
+        if self.is_dead() {
+            return Err("worker is dead (前段で死亡判定済み)".to_string());
+        }
         let mut guard = self
             .worker
             .lock()
@@ -286,7 +334,13 @@ impl TrtWorkerPool {
             output_shm: self.out_shm_name.clone(),
             output_capacity: PERSIST_OUT_SHM_SIZE,
         };
-        let resp = w.send_cmd(&cmd)?;
+        let resp = match w.send_cmd(&cmd) {
+            Ok(r) => r,
+            Err(e) => {
+                self.classify_io_error(&e);
+                return Err(e);
+            }
+        };
         if !resp.ok {
             return Err(resp.error.unwrap_or_else(|| "(error 不明)".to_string()));
         }
@@ -343,7 +397,14 @@ impl TrtWorkerPool {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if let Some(w) = guard.take() {
+        if let Some(mut w) = guard.take() {
+            // is_dead 済みの場合、子プロセスは既に exit している (broken pipe を
+            // 親が観測している) のが普通。ただし「子が無限ループに陥って I/O だけ
+            // 詰まった」病理的ケースに備え、shutdown_and_wait の前に kill しておく
+            // (kill は冪等で、既に exit したプロセスへ呼んでも無害)。
+            if self.is_dead() {
+                let _ = w.child.kill();
+            }
             w.shutdown_and_wait();
         }
     }
