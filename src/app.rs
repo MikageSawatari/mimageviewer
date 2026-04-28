@@ -9967,62 +9967,45 @@ impl App {
         }
     }
 
-    /// アプリの再起動を要求する。
+    /// AI バックエンド設定変更をホットリロードする (Phase 3、再起動不要)。
     ///
-    /// 用途: AI バックエンド切替後に新しいバックエンドで動作開始するため
-    /// (`ort::init_from()` がプロセス内 1 回限りの制約のため)。
+    /// 引数 `new_backend_str`: 新しい設定値 (`"directml"` / `"tensorrt"` / `"cpu"` / None)。
     ///
-    /// 実装: 現プロセスをクリーン終了し、PowerShell 経由で 2 秒遅延後に同じ exe を
-    /// 起動する。遅延理由はシングルインスタンスミューテックスの解放を待つため
-    /// (新インスタンスが旧インスタンスのミューテックスを見て二重起動と誤判定するのを
-    /// 防ぐ)。
-    ///
-    /// PowerShell を使う理由: cmd /c のネスト引用符は壊れやすく、過去の実装で
-    /// パスが `\\` に変換されて起動失敗するバグが発生した。PowerShell の
-    /// シングルクォート文字列リテラルは内容を一切解釈しないので path に
-    /// バックスラッシュ・スペースが含まれていても安全。
-    pub(crate) fn request_app_restart(&mut self, ctx: &egui::Context) {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    /// 動作:
+    /// - TensorRT に変わった: TrtWorkerPool を spawn して runtime に attach
+    /// - TensorRT から DirectML に戻った: 既存の worker pool を detach (子プロセスは
+    ///   Drop で shutdown される)
+    /// - 同じ → 何もしない
+    pub(crate) fn apply_ai_backend_change(&mut self, new_backend_str: Option<&str>) {
+        let Some(runtime) = self.ai_runtime.as_ref() else {
+            crate::logger::log("[AI] runtime 未初期化のためバックエンド変更はスキップ".to_string());
+            return;
+        };
+        let want_trt = new_backend_str
+            .and_then(crate::ai::AiBackend::from_str)
+            == Some(crate::ai::AiBackend::TensorRt);
+        let has_trt = runtime.has_worker_pool();
 
-            let exe = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::logger::log(format!("[restart] current_exe 取得失敗: {e}"));
-                    return;
-                }
-            };
-            // PowerShell シングルクォート文字列内ではシングルクォート自身だけを
-            // '' でエスケープする。バックスラッシュは literal で扱われる。
-            let exe_str = exe.to_string_lossy().replace('\'', "''");
-            let ps_cmd = format!(
-                "Start-Sleep -Seconds 2; Start-Process -FilePath '{exe_str}'"
-            );
-            crate::logger::log(format!("[restart] PowerShell command: {ps_cmd}"));
-            match std::process::Command::new("powershell")
-                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn()
-            {
-                Ok(_) => {
-                    crate::logger::log(
-                        "[restart] 再起動コマンドを spawn、shutdown を開始".to_string(),
-                    );
-                    self.shutdown_requested
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                Err(e) => {
-                    crate::logger::log(format!("[restart] powershell spawn 失敗: {e}"));
-                }
+        match (want_trt, has_trt) {
+            (true, false) => {
+                crate::logger::log(
+                    "[AI] AI バックエンド変更: → TensorRT (worker pool 起動)".to_string(),
+                );
+                Self::spawn_trt_worker_pool(runtime);
             }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = ctx;
-            crate::logger::log("[restart] 非 Windows 環境では再起動未対応".to_string());
+            (false, true) => {
+                crate::logger::log(
+                    "[AI] AI バックエンド変更: → DirectML (worker pool 停止)".to_string(),
+                );
+                runtime.detach_worker_pool();
+            }
+            _ => {
+                // 変更なし (TRT pack 未インストール等で TRT を選んでも spawn 失敗、
+                // または同じ設定値) — ログのみ
+                crate::logger::log(format!(
+                    "[AI] AI バックエンド変更: state 変化なし (want_trt={want_trt}, has_trt={has_trt})"
+                ));
+            }
         }
     }
 

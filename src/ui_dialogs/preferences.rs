@@ -175,9 +175,9 @@ pub(crate) struct PreferencesState {
     // ── AI バックエンド ページ用のキャッシュ ────────────────────
     /// プライマリ GPU のベンダー (NVIDIA でなければ TRT は disabled に)
     pub gpu_vendor: Option<crate::gpu_info::GpuVendor>,
-    /// 現プロセスの AiRuntime が実際にロードしているバックエンド
-    /// (None = AI ランタイム未初期化、Settings 変更時に「再起動が必要」検知に使う)
-    pub current_runtime_backend: Option<crate::ai::AiBackend>,
+    /// TRT ワーカープールが現在 attach されているか (Phase 3、ホットリロード)。
+    /// `true` ならアップスケール/デノイズはワーカー経由 TRT で動いている。
+    pub trt_worker_active: bool,
     /// 起動時にフォールバックが起きた場合の理由 (UI バナー表示用)
     pub current_runtime_fallback_reason: Option<String>,
     /// TRT pack インストール済みか
@@ -190,10 +190,6 @@ pub(crate) struct PreferencesState {
     /// 「全エンジンビルド」ボタンが押されたときに立てるフラグ。
     /// Apply 直後に App 側で見て start_trt_build() を呼び、消す。
     pub start_trt_build_requested: bool,
-
-    /// 「今すぐ再起動」ボタンが押されたときに立てるフラグ。
-    /// 同フレームで App::request_app_restart() を呼んで消す。
-    pub restart_app_requested: bool,
 }
 
 impl PreferencesState {
@@ -220,12 +216,12 @@ impl PreferencesState {
 
         // AI バックエンドページ用の情報を 1 回だけ取得 (環境設定ダイアログを開いた時点)
         let gpu_vendor = crate::gpu_info::query_primary_gpu_vendor();
-        let (current_runtime_backend, current_runtime_fallback_reason) = match ai_runtime {
-            Some(rt) => {
-                let active = rt.active_backend();
-                (Some(active.effective), active.fallback_reason.clone())
-            }
-            None => (None, None),
+        let (current_runtime_fallback_reason, trt_worker_active) = match ai_runtime {
+            Some(rt) => (
+                rt.active_backend().fallback_reason.clone(),
+                rt.has_worker_pool(),
+            ),
+            None => (None, false),
         };
         let trt_pack_installed = crate::ai::tensorrt_pack::is_pack_installed();
         let trt_pack_size_mib = if trt_pack_installed {
@@ -247,13 +243,12 @@ impl PreferencesState {
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
             gpu_vendor,
-            current_runtime_backend,
+            trt_worker_active,
             current_runtime_fallback_reason,
             trt_pack_installed,
             trt_pack_size_mib,
             trt_engine_cache_size_mib,
             start_trt_build_requested: false,
-            restart_app_requested: false,
         }
     }
 }
@@ -401,17 +396,6 @@ impl App {
             self.start_trt_build();
         }
 
-        // 「今すぐ再起動」フラグの処理。
-        // 注意: ユーザーは OK を押す前に再起動できてしまうので、ボタン押下時点での
-        // 設定変更は保存されない可能性がある。これは UI ヒントで案内している
-        // ("OK を押してから再起動が安全")。実装簡略のため自動 Apply はしない。
-        if let Some(state) = self.pref_state.as_mut()
-            && state.restart_app_requested
-        {
-            state.restart_app_requested = false;
-            self.request_app_restart(ctx);
-        }
-
         if apply {
             if let Some(mut state) = self.pref_state.take() {
                 let old_dup = (
@@ -428,6 +412,10 @@ impl App {
                 );
 
                 let old_pause_minimized = self.settings.pause_indexer_while_minimized;
+
+                // AI バックエンド設定変更を検出してホットリロードトリガに使う
+                let old_ai_backend = self.settings.ai_backend.clone();
+                let new_ai_backend = state.settings.ai_backend.clone();
 
                 // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
                 // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
@@ -446,6 +434,11 @@ impl App {
                 // 同期する (お気に入り編集ダイアログと同じチェックボックス項目への二重経路)。
                 if old_pause_minimized != self.settings.pause_indexer_while_minimized {
                     self.sync_tray_pause_check();
+                }
+
+                // AI バックエンド変更のホットリロード処理 (Phase 3)
+                if old_ai_backend != new_ai_backend {
+                    self.apply_ai_backend_change(new_ai_backend.as_deref());
                 }
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み
@@ -872,9 +865,10 @@ fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 /// AI 推論バックエンド (DirectML / TensorRT) の選択ページ。
 ///
-/// バックエンドの実切替は ort::init_from() の制約上アプリ再起動が必要なので、
-/// このページでの設定変更は次回起動時に反映される。現プロセスでロード済みの
-/// バックエンドと選択値が異なる場合は「再起動が必要」バナーを表示する。
+/// Phase 3 アーキテクチャ:
+/// - メイン: 常に DirectML
+/// - TensorRT 有効化: 別プロセスのワーカーが起動して、Upscale/Denoise を担当
+/// - 切り替えはホットリロードでアプリ再起動不要
 fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::ai::AiBackend;
     use crate::gpu_info::GpuVendor;
@@ -935,35 +929,26 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
     ui.add_space(8.0);
 
-    // 「再起動が必要」インジケータ + 再起動ボタン
-    if let Some(running) = state.current_runtime_backend
-        && running != new_choice
-    {
-        ui.horizontal(|ui| {
+    // 現在の動作状態 (ホットリロード対応 = 再起動不要)
+    let current_label = if state.trt_worker_active {
+        "TensorRT (ワーカー稼働中)"
+    } else {
+        "DirectML"
+    };
+    let pending_change = match new_choice {
+        AiBackend::TensorRt => !state.trt_worker_active,
+        AiBackend::DirectMl | AiBackend::Cpu => state.trt_worker_active,
+    };
+    ui.horizontal(|ui| {
+        ui.label(format!("現在動作中: {current_label}"));
+        if pending_change {
             ui.colored_label(
-                egui::Color32::from_rgb(220, 160, 50),
-                format!(
-                    "ℹ バックエンド変更は再起動後に有効化 (現在: {})",
-                    match running {
-                        AiBackend::DirectMl => "DirectML",
-                        AiBackend::TensorRt => "TensorRT",
-                        AiBackend::Cpu => "CPU",
-                    }
-                ),
+                egui::Color32::from_rgb(120, 180, 220),
+                "(OK を押すと反映、再起動不要)",
             );
-            if ui
-                .button("今すぐ再起動")
-                .on_hover_text(
-                    "OK を押して設定を保存してから再起動するのが安全です。\n\
-                     再起動はアプリを終了して約 2 秒後に同じ exe を起動します。",
-                )
-                .clicked()
-            {
-                state.restart_app_requested = true;
-            }
-        });
-        ui.add_space(8.0);
-    }
+        }
+    });
+    ui.add_space(8.0);
 
     // TensorRT 詳細
     if new_choice == AiBackend::TensorRt {
