@@ -53,20 +53,50 @@ Log "  output:   $OutDir"
 # ---------------------------------------------------------------
 # Prerequisite checks
 # ---------------------------------------------------------------
-$TestImages = @(
-    'testimage/うちのこ/ComfyUI_2_0003.png',
-    'testimage/Sonic Melty _ TuneCore Japan_files/itc316342.png',
-    'testimage/CG002.jpg',
-    'testimage/mistblossom_claude_2_9_2026-04-24-005929_0.png'
-)
-foreach ($img in $TestImages) {
-    if (-not (Test-Path $img)) {
-        Log "ERROR: missing test image: $img"
-        Log "Aborting (cannot run benchmarks without all test images)."
+# Test images. Two are looked up dynamically because their parent directory
+# contains non-ASCII (Japanese) characters and embedding those in the .ps1
+# source breaks under Windows PowerShell 5.1's default CP932 decoding.
+# Get-ChildItem's filesystem operations use proper UTF-16 internally.
+$TestImages = @()
+
+function Find-TestImage {
+    param(
+        [string]$Filter,
+        [string]$SubdirHint = ''  # optional friendly description for error msg
+    )
+    $hits = @(Get-ChildItem -Path 'testimage' -Filter $Filter -Recurse -File -ErrorAction SilentlyContinue)
+    if ($hits.Count -eq 0) {
+        Log "ERROR: missing test image: testimage/$SubdirHint/$Filter (none found)"
+        return $null
+    }
+    if ($hits.Count -gt 1) {
+        Log "WARN: multiple matches for $Filter, using first: $($hits[0].FullName)"
+    }
+    return $hits[0].FullName
+}
+
+# Image 1: under testimage/<japanese-dir>/ComfyUI_2_0003.png
+$img1 = Find-TestImage -Filter 'ComfyUI_2_0003.png' -SubdirHint '<japanese>'
+if (-not $img1) { Log "Aborting."; exit 1 }
+$TestImages += $img1
+
+# Image 2: under testimage/Sonic Melty .../itc316342.png
+$img2 = Find-TestImage -Filter 'itc316342.png' -SubdirHint 'Sonic Melty'
+if (-not $img2) { Log "Aborting."; exit 1 }
+$TestImages += $img2
+
+# Image 3 and 4: ASCII paths, just verify presence
+$ImgsAscii = @('testimage/CG002.jpg', 'testimage/mistblossom_claude_2_9_2026-04-24-005929_0.png')
+foreach ($p in $ImgsAscii) {
+    if (-not (Test-Path $p)) {
+        Log "ERROR: missing test image: $p"
+        Log "Aborting."
         exit 1
     }
+    $TestImages += (Resolve-Path $p).Path
 }
-Log "Test images: all 4 present"
+Log "Test images: all 4 located"
+foreach ($p in $TestImages) { Log "  - $p" }
 
 $TrtSentinel = Join-Path $env:APPDATA 'mimageviewer\tensorrt\INSTALL_OK'
 if (-not (Test-Path $TrtSentinel)) {
