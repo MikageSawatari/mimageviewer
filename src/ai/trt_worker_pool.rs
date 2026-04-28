@@ -26,7 +26,7 @@
 //! ```
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -52,8 +52,26 @@ use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerResp};
 struct WorkerHandle {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// stdout 読み取りを行うスレッドからの response 行受信チャネル。
+    /// EOF 時は `Ok(None)`、I/O エラーは `Err(string)` を 1 回だけ送って閉じる。
+    stdout_rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    /// stderr ドレインスレッドの join handle。Drop 時に join される。
+    /// stderr を読み捨てない場合、子側がパイプ満杯で block する病理的ケースが
+    /// あるので必ず thread に逃がす (Codex P1 指摘)。
+    stderr_join: Option<std::thread::JoinHandle<()>>,
+    /// stdout 読み取りスレッドの join handle。
+    stdout_join: Option<std::thread::JoinHandle<()>>,
 }
+
+/// `read_resp_line` / `send_cmd` の最大待機時間。
+/// CUDA / TensorRT の初回 engine deserialize は数百 ms かかるが、5 秒で済むのが
+/// 普通。10 秒を超えるなら子が hang していると判断して kill する。
+const WORKER_RESP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 起動ハンドシェイクの最大待機時間。`AiRuntime::new_with_backend` 内で
+/// `ort::init_from` + provider DLL preload + TRT pack scan が走るため、
+/// 通常枠より長めの 30 秒。
+const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl WorkerHandle {
     /// 親プロセス側でワーカー子プロセスを起動し、ハンドシェイクを待つ。
@@ -74,26 +92,97 @@ impl WorkerHandle {
             .stdout
             .take()
             .ok_or_else(|| "child stdout missing".to_string())?;
-        let mut stdout = BufReader::new(stdout);
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "child stderr missing".to_string())?;
+
+        // stderr ドレインスレッド: 子の stderr を黙々と読み捨てる
+        // (= 子のパイプ満杯で write block するのを防ぐ)。CUDA / TensorRT /
+        // ORT は init / load 中に多量の警告 / 進捗を stderr に出すため必須。
+        let stderr_join = std::thread::Builder::new()
+            .name("trt-worker-stderr-drain".to_string())
+            .spawn(move || {
+                let mut reader = std::io::BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            // worker 由来 stderr は logger に流す (= デバッグ時に役立つ)。
+                            // logger は別ファイル open + Mutex 保護で thread-safe。
+                            crate::logger::log(format!(
+                                "[TRT-worker stderr] {}",
+                                line.trim_end()
+                            ));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|e| format!("spawn stderr drain thread: {e}"))?;
+
+        // stdout 読み取りスレッド: 行ごとに channel に push。
+        // 親が read_resp_line で recv_timeout して拾う。これにより
+        // read_line の無限 block を timeout 内に切り上げられる。
+        let (tx, stdout_rx) = std::sync::mpsc::channel();
+        let stdout_join = std::thread::Builder::new()
+            .name("trt-worker-stdout-reader".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => {
+                            // EOF: 子が exit。
+                            let _ = tx.send(Ok(String::new()));
+                            break;
+                        }
+                        Ok(_) => {
+                            if tx.send(Ok(line.clone())).is_err() {
+                                // 親が drop された
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("stdout read: {e}")));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("spawn stdout reader thread: {e}"))?;
+
+        let mut handle = WorkerHandle {
+            child,
+            stdin,
+            stdout_rx,
+            stderr_join: Some(stderr_join),
+            stdout_join: Some(stdout_join),
+        };
 
         // ハンドシェイク: 子の起動成功 / 失敗のレスポンスを 1 行読む。
         // pack 不在 + DirectML フォールバック等の場合は失敗で来る。
-        let resp = read_resp_line(&mut stdout)?;
+        let resp = handle
+            .recv_resp_with_timeout(WORKER_HANDSHAKE_TIMEOUT)
+            .map_err(|e| {
+                // ハンドシェイクが時間内に来ない / 失敗 → 子を kill して回収
+                let _ = handle.child.kill();
+                let _ = handle.child.wait();
+                format!("ワーカー起動 timeout / 通信失敗: {e}")
+            })?;
         if !resp.ok {
-            // 子は exit するはずなので wait しておく
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
             return Err(format!(
                 "ワーカー初期化失敗: {}",
                 resp.error.unwrap_or_else(|| "(理由不明)".to_string())
             ));
         }
 
-        Ok(WorkerHandle {
-            child,
-            stdin,
-            stdout,
-        })
+        Ok(handle)
     }
 
     fn send_cmd(&mut self, cmd: &WorkerCmd) -> Result<WorkerResp, String> {
@@ -103,7 +192,39 @@ impl WorkerHandle {
         self.stdin
             .flush()
             .map_err(|e| format!("stdin flush: {e}"))?;
-        read_resp_line(&mut self.stdout)
+        self.recv_resp_with_timeout(WORKER_RESP_TIMEOUT)
+    }
+
+    /// stdout から 1 つの response 行を timeout 付きで受信して JSON parse する。
+    /// timeout 切れ / EOF / 解析失敗は全て Err を返す。
+    /// 呼び出し側 (send_cmd / spawn) は Err を「子が応答不能」と解釈して
+    /// 必要なら子を kill する。
+    fn recv_resp_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<WorkerResp, String> {
+        let line = match self.stdout_rx.recv_timeout(timeout) {
+            Ok(Ok(line)) if line.is_empty() => {
+                return Err("worker stdout が EOF (子プロセスが予期せず終了した可能性)".to_string());
+            }
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => return Err(e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "worker 応答 timeout ({} 秒、子プロセスが hang した可能性)",
+                    timeout.as_secs()
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("worker stdout reader thread が終了している".to_string());
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Err("worker から空レスポンス".to_string());
+        }
+        serde_json::from_str::<WorkerResp>(trimmed)
+            .map_err(|e| format!("resp parse: {e} (raw: {line:?})"))
     }
 
     fn shutdown_and_wait(mut self) {
@@ -116,23 +237,30 @@ impl WorkerHandle {
             )),
             Err(e) => crate::logger::log(format!("[TRT-worker-pool] wait failed: {e}")),
         }
+        // stderr / stdout drain thread は子 stdout/stderr が close した時点で
+        // 自然に EOF を受け取って終了する。join で完全終了を確認。
+        if let Some(h) = self.stderr_join.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.stdout_join.take() {
+            let _ = h.join();
+        }
     }
 }
 
-fn read_resp_line(reader: &mut BufReader<ChildStdout>) -> Result<WorkerResp, String> {
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .map_err(|e| format!("stdout read: {e}"))?;
-    if n == 0 {
-        return Err("worker stdout が EOF (子プロセスが予期せず終了した可能性)".to_string());
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // shutdown_and_wait を経由しない drop (= キャンセル / panic 経由) でも
+        // 子と drain thread を回収する。
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(h) = self.stderr_join.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.stdout_join.take() {
+            let _ = h.join();
+        }
     }
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Err("worker から空レスポンス".to_string());
-    }
-    serde_json::from_str::<WorkerResp>(trimmed)
-        .map_err(|e| format!("resp parse: {e} (raw: {line:?})"))
 }
 
 /// 永続共有メモリのサイズ (各 tile で create/open し直さず使い回す)。

@@ -323,6 +323,10 @@ fn run_install(
     // ── DL ループ ──
     for (idx, asset) in all_files.iter().enumerate() {
         check_cancel(&cancel)?;
+        // SECURITY: manifest 由来の name を pack_dir.join() に渡す前に検証する。
+        // path separator や `..` を含む name は path traversal の恐れがあるので
+        // 即エラー (= 信頼できない manifest を黙って受け入れない)。Codex P2 指摘。
+        validate_safe_filename(&asset.name)?;
         let dst = pack_dir.join(&asset.name);
         let _ = tx.send(InstallProgress::StartingFile {
             name: asset.name.clone(),
@@ -336,6 +340,7 @@ fn run_install(
 
     // ── engine zip 展開 ──
     // engine_pack.files[0] は zip ファイル。中身を tensorrt-engines/<model>/<file> に展開。
+    // (engine_pack.files[0].name は all_files に含まれているので validate 済み)
     let engine_zip_path = pack_dir.join(&engine_pack.files[0].name);
     extract_engine_zip(&engine_zip_path, &cancel, &tx)?;
 
@@ -343,6 +348,44 @@ fn run_install(
     write_install_sentinel(&manifest, &engine_label)?;
 
     let _ = tx.send(InstallProgress::Done);
+    Ok(())
+}
+
+/// `manifest.common[].name` / `manifest.notices[].name` / `engine_pack.files[].name`
+/// を `pack_dir.join(name)` 経由で local path にする前に、name が
+/// **path separator / `..` を含まない単純なファイル名** であることを検証する。
+///
+/// SECURITY: 信頼できない (理屈上は壊れた / 改竄された) manifest が `..\..\Windows\system32\..`
+/// のような相対パスを送ってくると pack_dir 外に書き込まれてしまう。SHA-256 検証は
+/// 本検証の代わりにはならない (= 攻撃者が payload と SHA-256 を一緒に偽造可能)。
+///
+/// 受理する name の規則:
+/// - 空文字でない
+/// - `\\`, `/`, `:` を含まない (Windows / Unix 両方の separator)
+/// - `..` 単独でない / 含まない
+/// - 先頭が `.` でない (= dotfile / 隠しファイル避け、保守的)
+fn validate_safe_filename(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("manifest asset name が空です".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return Err(format!(
+            "manifest asset name に path separator が含まれます: {:?}",
+            name
+        ));
+    }
+    if name.contains("..") {
+        return Err(format!(
+            "manifest asset name に `..` が含まれます (path traversal): {:?}",
+            name
+        ));
+    }
+    if name.starts_with('.') {
+        return Err(format!(
+            "manifest asset name が `.` で始まります (拒否): {:?}",
+            name
+        ));
+    }
     Ok(())
 }
 
@@ -440,19 +483,42 @@ fn download_and_verify(
             .and_then(|s| s.to_str())
             .unwrap_or("")
     ));
-    let resume_from: u64 = fs::metadata(&partial)
-        .ok()
-        .map(|m| m.len())
-        .unwrap_or(0)
-        // 期待サイズ以上に膨らんでいたら不正、捨てる。
-        .min(asset.bytes);
-    if fs::metadata(&partial).is_ok() && resume_from < fs::metadata(&partial).unwrap().len() {
-        // 期待サイズより partial が大きい異常状態。捨てて 0 から。
-        let _ = fs::remove_file(&partial);
+    // (2a) partial が「すでに完全サイズ」なら HTTP を出さずに hash check して
+    // rename を試みる。Codex P2.3 指摘: 前回 DL 完了直後にクラッシュ等で
+    // rename を逃すと、次回 partial.len() == asset.bytes の状態で resume を
+    // 試みて Range: bytes=N- → 416 (server rejects Range >= file_size) になり
+    // permanent error 扱いになっていた。先に local 完全性チェックして救う。
+    if let Ok(meta) = fs::metadata(&partial) {
+        if meta.len() == asset.bytes {
+            let _ = tx.send(InstallProgress::VerifyingFile {
+                name: asset.name.clone(),
+            });
+            if let Ok(actual) = sha256_of_file(&partial, cancel) {
+                if actual.eq_ignore_ascii_case(&asset.sha256) {
+                    if dst.exists() {
+                        let _ = fs::remove_file(dst);
+                    }
+                    fs::rename(&partial, dst).map_err(|e| {
+                        format!("rename complete partial {}: {e}", asset.name)
+                    })?;
+                    let _ = tx.send(InstallProgress::FileProgress {
+                        name: asset.name.clone(),
+                        bytes_done: asset.bytes,
+                        bytes_total: asset.bytes,
+                    });
+                    return Ok(());
+                }
+                // hash mismatch → 完全サイズだが壊れている。捨てて DL やり直し。
+                let _ = fs::remove_file(&partial);
+            }
+            check_cancel(cancel)?;
+        } else if meta.len() > asset.bytes {
+            // 期待サイズより partial が大きい異常状態。捨てて 0 から。
+            let _ = fs::remove_file(&partial);
+        }
     }
     // resume_from は HTTP リトライループ内で `fs::metadata(&partial).len()` から
-    // 都度取り直すため、ここでは初期値計算のみ。partial が無ければ 0 開始。
-    let _initial_resume_from = if partial.exists() { resume_from } else { 0 };
+    // 都度取り直すため、ここでは初期値計算のみ。
 
     // (3) HTTP DL with optional Range header (一過性エラー時はリトライ)。
     let url = format!("{}/{}", pack_base_url(), asset.name);
@@ -947,5 +1013,30 @@ mod tests {
     fn hex_encode_basic() {
         assert_eq!(hex_encode(&[0x00, 0xff, 0xab]), "00ffab");
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn validate_safe_filename_accepts_normal() {
+        assert!(validate_safe_filename("cudart64_12.dll").is_ok());
+        assert!(validate_safe_filename("manifest.json").is_ok());
+        assert!(validate_safe_filename("engines-ampere_plus.zip").is_ok());
+        assert!(validate_safe_filename("NOTICE-NVIDIA.txt").is_ok());
+    }
+
+    #[test]
+    fn validate_safe_filename_rejects_path_traversal() {
+        assert!(validate_safe_filename("..").is_err());
+        assert!(validate_safe_filename("../foo.dll").is_err());
+        assert!(validate_safe_filename("..\\foo.dll").is_err());
+        assert!(validate_safe_filename("subdir/foo.dll").is_err());
+        assert!(validate_safe_filename("subdir\\foo.dll").is_err());
+        // Windows drive letter path
+        assert!(validate_safe_filename("C:foo.dll").is_err());
+        // dotfile
+        assert!(validate_safe_filename(".env").is_err());
+        // empty
+        assert!(validate_safe_filename("").is_err());
+        // contains `..` even without separator (defense in depth)
+        assert!(validate_safe_filename("foo..bar.dll").is_err());
     }
 }

@@ -26,8 +26,9 @@ use super::{AiBackend, ModelKind};
 /// 呼ばれたときに実行される。`!` (never) を返す = 関数内で `std::process::exit`。
 pub fn run_infer_worker() -> ! {
     // logger は親プロセスで初期化されているとは限らないので、子プロセス独自に
-    // init する。ログは %APPDATA%/mimageviewer/logs/mimageviewer.log に追記。
-    crate::logger::init();
+    // init する。**worker は専用ファイル `trt-worker.log` に append**
+    // (= 親の mimageviewer.log を truncate しない)。
+    crate::logger::init_for_worker("trt-worker");
     crate::logger::log(format!(
         "[TRT-worker] 起動 (pid={})",
         std::process::id()

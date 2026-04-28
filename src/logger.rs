@@ -9,17 +9,37 @@ use std::time::Instant;
 static START: OnceLock<Instant> = OnceLock::new();
 static FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
+/// メインプロセス用 logger 初期化。`mimageviewer.log` を truncate して書き始める。
 pub fn init() {
+    init_inner("mimageviewer.log", /* truncate = */ true);
+}
+
+/// ワーカープロセス用 logger 初期化。**メインの mimageviewer.log を truncate せず**、
+/// ワーカー専用ファイル `<worker_kind>.log` に append する。
+///
+/// 以前は worker も `init()` を呼んでいたため、parent が書いた直近の mimageviewer.log
+/// を truncate で消し飛ばしてしまい、起動失敗時のデバッグ情報が消えていた
+/// (Codex P3 指摘 / Apr 28-29 の trt_worker 死亡解析でも実害)。
+///
+/// `worker_kind` は識別用の短い名前 (例: "trt-worker", "pdf-worker")。複数のワーカーが
+/// 並走しても別ファイルに書き分けられる。
+pub fn init_for_worker(worker_kind: &str) {
+    init_inner(&format!("{worker_kind}.log"), /* truncate = */ false);
+}
+
+fn init_inner(file_name: &str, truncate: bool) {
     START.set(Instant::now()).ok();
     let log_dir = crate::data_dir::logs_dir();
     let _ = std::fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join("mimageviewer.log");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-    {
+    let log_path = log_dir.join(file_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if truncate {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    match opts.open(&log_path) {
         Ok(f) => {
             FILE.set(Mutex::new(f)).ok();
         }
