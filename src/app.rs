@@ -1863,6 +1863,11 @@ pub struct App {
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
     /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
     pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    /// セッション中に worker 死亡 → 自動再起動を試みた回数。
+    /// `MAX_TRT_AUTO_RESTART_ATTEMPTS` 回まで silent に再 spawn して、それを超えたら
+    /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
+    /// ためのガード)。
+    pub(crate) trt_auto_restart_attempts: u32,
     /// TRT pack のオンラインインストールダイアログの状態。
     /// Some の間ダイアログが表示され、worker thread が動作している。
     /// 閉じる (Drop) と worker は cancel される。
@@ -2392,6 +2397,7 @@ impl Default for App {
             ime_last_event_at: None,
             fs_feedback_toast: None,
             trt_worker_notice: None,
+            trt_auto_restart_attempts: 0,
             trt_install_state: None,
             fs_boundary_hint: None,
 

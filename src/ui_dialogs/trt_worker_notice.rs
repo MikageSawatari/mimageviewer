@@ -20,16 +20,53 @@ use eframe::egui;
 use crate::ai::runtime::{WorkerNotice, WorkerNoticeKind};
 use crate::app::App;
 
+/// セッション中の worker 自動再起動の上限。
+///
+/// この回数を超えて死亡が続いたら、自動再起動を諦めてバナーで通知する
+/// (= TRT pack の異常 / モデル特定の crash 等が疑われ、無限ループにしないため)。
+/// 1 回の死亡で 1 つ消費する。手動再起動 (バナーボタン) でカウンタを 0 にリセット。
+const MAX_TRT_AUTO_RESTART_ATTEMPTS: u32 = 3;
+
 impl App {
     /// `AiRuntime::take_worker_notice()` をポーリングし、新しい通知があれば
-    /// `App::trt_worker_notice` に転写する。バナー本体の描画は別メソッド。
+    /// 処理する。バナー本体の描画は別メソッド。
+    ///
+    /// **DiedDuringInfer の場合は自動再起動を試みる** (`MAX_TRT_AUTO_RESTART_ATTEMPTS`
+    /// 回まで silent)。それを超えたらバナーを出してユーザーに手動再起動を促す。
+    /// SpawnFailed (= 起動段階での失敗) は環境問題が濃厚なので即バナー表示。
     pub(crate) fn poll_trt_worker_notice(&mut self) {
         let Some(rt) = self.ai_runtime.as_ref() else {
             return;
         };
-        if let Some(notice) = rt.take_worker_notice() {
-            // 既存の通知が表示中ならそれを上書き (新しい状況のほうが重要)。
-            self.trt_worker_notice = Some(notice);
+        let Some(notice) = rt.take_worker_notice() else {
+            return;
+        };
+        match notice.kind {
+            crate::ai::runtime::WorkerNoticeKind::DiedDuringInfer
+                if self.trt_auto_restart_attempts < MAX_TRT_AUTO_RESTART_ATTEMPTS =>
+            {
+                // 自動再起動: pool は既に detach 済みなので、新しい pool を spawn する。
+                // バナーは出さない (silent recovery)。次回推論からは自動的に新 pool 経由。
+                self.trt_auto_restart_attempts += 1;
+                crate::logger::log(format!(
+                    "[AI] worker 死亡を検出、自動再起動 (#{} / {}): {}",
+                    self.trt_auto_restart_attempts,
+                    MAX_TRT_AUTO_RESTART_ATTEMPTS,
+                    notice.detail
+                ));
+                Self::spawn_trt_worker_pool(rt);
+            }
+            _ => {
+                // 自動再起動できない (SpawnFailed か、retry 上限到達): バナーで通知。
+                if matches!(notice.kind, crate::ai::runtime::WorkerNoticeKind::DiedDuringInfer) {
+                    crate::logger::log(format!(
+                        "[AI] worker 死亡を検出、自動再起動の上限 ({}) に到達。\
+                         バナーで手動再起動を促す: {}",
+                        MAX_TRT_AUTO_RESTART_ATTEMPTS, notice.detail
+                    ));
+                }
+                self.trt_worker_notice = Some(notice);
+            }
         }
     }
 
@@ -71,6 +108,10 @@ impl App {
             });
 
         if retry_clicked {
+            // ユーザーが明示的に再起動を選んだ → 自動再起動カウンタも 0 に戻す。
+            // (= ユーザー的には「リセット」操作なので、また 3 回 silent recovery が
+            // 利く状態に戻す)
+            self.trt_auto_restart_attempts = 0;
             // 通知を消してから再起動 (失敗したらまた通知される)
             self.trt_worker_notice = None;
             if let Some(rt) = self.ai_runtime.as_ref() {
