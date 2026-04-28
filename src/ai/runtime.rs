@@ -564,11 +564,17 @@ impl AiRuntime {
             .min(WORKSPACE_CAP_BYTES)
             .max(512 * 1024 * 1024); // 最低 512 MiB
 
-        // builder optimization level 5 (最高) で engine をビルドする。
-        // 初回コンパイル時間は default(3) より長くなるが、生成された engine は
-        // 最大 +10-20% 速い。エンジンはキャッシュされ 2 回目以降は瞬時ロードなので
-        // ビルド時間ペナルティは初回のみ。実測 anime6b で 994ms → 951ms (5% 改善)。
-        const TRT_BUILDER_OPT_LEVEL: u8 = 5;
+        // builder optimization level 3 (デフォルト) で engine をビルドする。
+        //
+        // 当初 5 (最高) を採用していたが、Apr 28 のユーザー実測で:
+        // - level 5: x4plus 1 個のコンパイルだけで 5 分超、全 6 モデルだと 30 分超
+        // - level 3: 同モデル 60〜90 秒、全 6 モデルで 6〜10 分 (見積もり通り)
+        // - 推論時間の差は anime6b 994ms → 951ms = 5% で、5+ 分のビルド待ちに
+        //   見合わない (level 5 の理論値は +10-20% だが実測はずっと小さい)。
+        //
+        // 一般のビューワー利用では「初回セットアップを早く終わらせる」ほうが
+        // 「runtime 推論が 5% 速い」より価値が高いと判断して 3 に固定。
+        const TRT_BUILDER_OPT_LEVEL: u8 = 3;
 
         // FP16 推論は常時 ON。画質劣化は ESRGAN クラスのモデルでは知覚不能
         // (1 ピクセル平均 0.05-0.2/255、PSNR -0.05 dB 程度)、1.5-2x 高速化が
