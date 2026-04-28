@@ -118,10 +118,35 @@ fn read_resp_line(reader: &mut BufReader<ChildStdout>) -> Result<WorkerResp, Str
         .map_err(|e| format!("resp parse: {e} (raw: {line:?})"))
 }
 
+/// 永続共有メモリのサイズ (各 tile で create/open し直さず使い回す)。
+/// アップスケール最大 (512x512 入力 × 4x スケール × 3 ch × f32) を考慮:
+///   入力: 512² × 3 × 4 = 3 MB
+///   出力: 2048² × 3 × 4 = 48 MB
+/// 余裕を持って 4 MB / 64 MB を確保する。
+const PERSIST_IN_SHM_SIZE: usize = 4 * 1024 * 1024;
+const PERSIST_OUT_SHM_SIZE: usize = 64 * 1024 * 1024;
+
 /// アプリ全体で 1 つだけ持つワーカープール。`Arc<TrtWorkerPool>` で共有。
 ///
 /// 現状は 1 ワーカー固定。複数並列化が必要になったら `Vec<WorkerHandle>` に
 /// 拡張する (まだ複数同時に走らせる必要はない、推論は per-tile で sequential)。
+///
+/// 共有メモリは pool 起動時に 1 回 create して以降使い回す。各 infer で
+/// create/open し直すよりも、syscall 数が大幅に減って per-tile IPC overhead が
+/// 半減する (実測 ~37 ms → ~20 ms 目標)。
+#[cfg(windows)]
+pub struct TrtWorkerPool {
+    worker: Mutex<Option<WorkerHandle>>,
+    /// 永続入力共有メモリ。pool 起動時に 1 回 create、Drop で破棄。
+    in_shm: Mutex<Option<super::trt_worker_shm::SharedMem>>,
+    /// 永続出力共有メモリ。同上。
+    out_shm: Mutex<Option<super::trt_worker_shm::SharedMem>>,
+    /// 共有メモリ名 (子に伝えるため)
+    in_shm_name: String,
+    out_shm_name: String,
+}
+
+#[cfg(not(windows))]
 pub struct TrtWorkerPool {
     worker: Mutex<Option<WorkerHandle>>,
 }
@@ -139,16 +164,46 @@ impl TrtWorkerPool {
     /// `bench_ai` 等の別 bin から呼ぶときは、sibling の `mimageviewer.exe` を
     /// 指定する用途。指定 exe には `--tensorrt-infer-worker` 引数が付くので
     /// 当該サブコマンド処理を持つバイナリでなければならない。
+    #[cfg(windows)]
     pub fn start_with_exe(exe: &std::path::Path) -> Result<Self, String> {
+        use super::trt_worker_proto::shm_name;
+        use super::trt_worker_shm::SharedMem;
+
         crate::logger::log(format!(
             "[TRT-worker-pool] 起動中... worker={}",
             exe.display()
         ));
         let worker = WorkerHandle::spawn(exe)?;
-        crate::logger::log("[TRT-worker-pool] 起動完了".to_string());
+
+        // 永続共有メモリを pool 起動時に 1 回だけ確保。worker 側も最初の Infer で
+        // open + cache する (毎回 open しない)。
+        let pid = std::process::id();
+        let in_shm_name = shm_name("in", pid, 0);
+        let out_shm_name = shm_name("out", pid, 0);
+        let in_shm = SharedMem::create(&in_shm_name, PERSIST_IN_SHM_SIZE)
+            .map_err(|e| format!("create persistent in_shm: {e}"))?;
+        let out_shm = SharedMem::create(&out_shm_name, PERSIST_OUT_SHM_SIZE)
+            .map_err(|e| format!("create persistent out_shm: {e}"))?;
+
+        crate::logger::log(format!(
+            "[TRT-worker-pool] 起動完了 (persistent shm: in={} ({} MiB), out={} ({} MiB))",
+            in_shm_name,
+            PERSIST_IN_SHM_SIZE / 1024 / 1024,
+            out_shm_name,
+            PERSIST_OUT_SHM_SIZE / 1024 / 1024,
+        ));
         Ok(Self {
             worker: Mutex::new(Some(worker)),
+            in_shm: Mutex::new(Some(in_shm)),
+            out_shm: Mutex::new(Some(out_shm)),
+            in_shm_name,
+            out_shm_name,
         })
+    }
+
+    #[cfg(not(windows))]
+    pub fn start_with_exe(_exe: &std::path::Path) -> Result<Self, String> {
+        Err("TRT worker pool は Windows 専用".to_string())
     }
 
     /// 指定モデルをワーカー側でロードする (engine cache HIT で速い)。
@@ -166,23 +221,22 @@ impl TrtWorkerPool {
         Ok(resp.elapsed_ms.unwrap_or(0))
     }
 
-    /// 指定モデルで推論を実行する。入力 NCHW Array4<f32> を共有メモリに書き、
-    /// ワーカーが推論し、結果を別の共有メモリから読み取って返す。
+    /// 指定モデルで推論を実行する。入力 NCHW Array4<f32> を永続共有メモリに書き、
+    /// ワーカーが推論し、結果を別の永続共有メモリから読み取って返す。
     ///
     /// 戻り値: `(出力 shape NCHW, 出力テンソル平坦化 Vec<f32>)`。
     /// 出力サイズ計算: NCHW 形状なので
     ///   output.len() == output_shape.iter().product::<i64>() as usize
     ///
     /// 並行呼び出しは Mutex で直列化される (現状ワーカー 1 個のみなので)。
+    /// 共有メモリは pool 起動時に 1 回 create して以降使い回す (per-tile IPC
+    /// overhead 削減)。
     #[cfg(windows)]
     pub fn infer(
         &self,
         kind: super::ModelKind,
         input: &ndarray::Array4<f32>,
     ) -> Result<(Vec<i64>, Vec<f32>), String> {
-        use super::trt_worker_proto::shm_name;
-        use super::trt_worker_shm::SharedMem;
-
         let mut guard = self
             .worker
             .lock()
@@ -191,30 +245,29 @@ impl TrtWorkerPool {
             return Err("worker is shut down".to_string());
         };
 
-        let pid = std::process::id();
-        // 共有メモリ名は (pid, seq) で一意化。今のところ seq は 0 固定 (1 度に
-        // 1 推論しか走らないため衝突なし)。
-        let in_name = shm_name("in", pid, 0);
-        let out_name = shm_name("out", pid, 0);
-
         let input_shape: Vec<i64> = input.shape().iter().map(|&d| d as i64).collect();
         let input_bytes = input.len() * std::mem::size_of::<f32>();
 
-        // 出力容量: 4x スケール + バッファ。最悪ケースでも収まるよう 16 倍 + 余裕。
-        // (256x256 入力 → 1024x1024 出力 = 16x、デノイズは 1x、MI-GAN は 1x)
-        let output_capacity = input_bytes.saturating_mul(16).saturating_add(64);
+        // サイズ check
+        if input_bytes > PERSIST_IN_SHM_SIZE {
+            return Err(format!(
+                "入力サイズ {input_bytes} が永続 shm 容量 {PERSIST_IN_SHM_SIZE} を超過"
+            ));
+        }
 
-        let mut in_shm = SharedMem::create(&in_name, input_bytes)
-            .map_err(|e| format!("create input shm: {e}"))?;
-        let out_shm = SharedMem::create(&out_name, output_capacity)
-            .map_err(|e| format!("create output shm: {e}"))?;
+        // 永続入力 shm に書き込み (毎回 create しない、起動時の 1 回のみ)
+        let mut in_shm_guard = self
+            .in_shm
+            .lock()
+            .map_err(|_| "in_shm mutex poisoned".to_string())?;
+        let in_shm = in_shm_guard
+            .as_mut()
+            .ok_or_else(|| "in_shm が shutdown 済み".to_string())?;
 
-        // 入力 f32 slice を bytes として shm に書き込む
         let input_slice = input
             .as_slice()
             .ok_or_else(|| "input array が contiguous ではない".to_string())?;
         // SAFETY: f32 slice → u8 slice は同一データの読み取り視点変更のみ。
-        // input_slice の lifetime は input の借用、in_shm.write はコピー。
         let input_bytes_view: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 input_slice.as_ptr() as *const u8,
@@ -222,15 +275,16 @@ impl TrtWorkerPool {
             )
         };
         in_shm.write(input_bytes_view);
+        drop(in_shm_guard); // 早めに解放 (worker 側の open ロックと干渉しないように)
 
         // コマンド送信 + レスポンス取得
         let cmd = WorkerCmd::Infer {
             kind: kind.as_str().to_string(),
-            input_shm: in_name.clone(),
+            input_shm: self.in_shm_name.clone(),
             input_bytes,
             input_shape,
-            output_shm: out_name.clone(),
-            output_capacity,
+            output_shm: self.out_shm_name.clone(),
+            output_capacity: PERSIST_OUT_SHM_SIZE,
         };
         let resp = w.send_cmd(&cmd)?;
         if !resp.ok {
@@ -240,21 +294,27 @@ impl TrtWorkerPool {
             .output_shape
             .ok_or_else(|| "Resp.output_shape が None".to_string())?;
 
-        // 出力 shm から bytes 読み取り → Vec<f32>
+        // 永続出力 shm から bytes 読み取り → Vec<f32>
         let out_count: usize = output_shape.iter().product::<i64>() as usize;
         let out_bytes_len = out_count * std::mem::size_of::<f32>();
-        if out_bytes_len > output_capacity {
+        if out_bytes_len > PERSIST_OUT_SHM_SIZE {
             return Err(format!(
-                "出力 shape {:?} → {out_bytes_len} bytes が capacity {output_capacity} 超過",
+                "出力 shape {:?} → {out_bytes_len} bytes が永続 shm 容量 {PERSIST_OUT_SHM_SIZE} を超過",
                 output_shape
             ));
         }
+
+        let out_shm_guard = self
+            .out_shm
+            .lock()
+            .map_err(|_| "out_shm mutex poisoned".to_string())?;
+        let out_shm = out_shm_guard
+            .as_ref()
+            .ok_or_else(|| "out_shm が shutdown 済み".to_string())?;
         let out_bytes = out_shm.read_to_vec(out_bytes_len);
-        // SAFETY: out_bytes は Vec<u8> で 8-byte 整列されている (Rust の Global
-        // allocator は最低 8 バイト境界、f32 の 4 バイト alignment より厳しい)。
-        // 中身は worker が書いた x86_64 little-endian の f32 なので、ポインタを
-        // *const f32 にキャストして slice を作り、そこから to_vec で Vec<f32> に
-        // コピーするだけで OK。byte-by-byte from_le_bytes ループより 100x 以上速い。
+        drop(out_shm_guard);
+
+        // SAFETY: out_bytes は Vec<u8> で 8-byte 整列、中身は f32 の little-endian。
         let output: Vec<f32> = unsafe {
             std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_count)
         }

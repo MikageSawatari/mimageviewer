@@ -65,6 +65,11 @@ pub fn run_infer_worker() -> ! {
 
     let mm = super::model_manager::ModelManager::new();
 
+    // 永続共有メモリのキャッシュ。Infer cmd で渡される shm 名が同じなら
+    // 開き直さない (親側も pool 起動時の 1 回だけ create するので名前は固定)。
+    #[cfg(windows)]
+    let mut shm_cache: ShmCache = ShmCache::new();
+
     let stdin = std::io::stdin();
     let stdin_lock = stdin.lock();
     let reader = BufReader::new(stdin_lock);
@@ -103,6 +108,18 @@ pub fn run_infer_worker() -> ! {
                 output_shm,
                 output_capacity,
             } => {
+                #[cfg(windows)]
+                let resp = handle_infer(
+                    &runtime,
+                    &kind,
+                    &input_shm,
+                    input_bytes,
+                    &input_shape,
+                    &output_shm,
+                    output_capacity,
+                    &mut shm_cache,
+                );
+                #[cfg(not(windows))]
                 let resp = handle_infer(
                     &runtime,
                     &kind,
@@ -126,11 +143,53 @@ pub fn run_infer_worker() -> ! {
     std::process::exit(0);
 }
 
+/// 共有メモリのキャッシュ (worker 側、永続 shm を使い回す)。
+/// 親が pool 起動時に create した shm を最初の Infer で open し、以降同じ名前で
+/// 来たら再 open しない。
+#[cfg(windows)]
+struct ShmCache {
+    in_shm: Option<(String, super::trt_worker_shm::SharedMem)>,
+    out_shm: Option<(String, super::trt_worker_shm::SharedMem)>,
+}
+
+#[cfg(windows)]
+impl ShmCache {
+    fn new() -> Self {
+        Self {
+            in_shm: None,
+            out_shm: None,
+        }
+    }
+
+    /// 名前 + サイズが既存キャッシュと一致したら既存 SharedMem を返す。
+    /// 一致しない (初回 or 名前変更) なら open + キャッシュ更新。
+    fn get_or_open<'a>(
+        slot: &'a mut Option<(String, super::trt_worker_shm::SharedMem)>,
+        name: &str,
+        size: usize,
+    ) -> Result<&'a mut super::trt_worker_shm::SharedMem, String> {
+        let needs_open = match slot.as_ref() {
+            Some((cached_name, cached_shm)) => {
+                cached_name != name || cached_shm.size() != size
+            }
+            None => true,
+        };
+        if needs_open {
+            let shm = super::trt_worker_shm::SharedMem::open(name, size)
+                .map_err(|e| format!("open '{name}' size={size}: {e}"))?;
+            *slot = Some((name.to_string(), shm));
+        }
+        Ok(&mut slot.as_mut().unwrap().1)
+    }
+}
+
 /// Infer コマンド処理: 共有メモリ経由で入力を受け、推論し、結果を共有メモリに書く。
 ///
 /// 入出力ともに NCHW float32。共有メモリは生バイト列として扱い、`unsafe`
 /// `std::slice::from_raw_parts` で f32 として解釈する (ページ整列されているので
 /// f32 alignment は満たされる)。
+///
+/// `shm_cache` で永続 shm を使い回す。同じ name + size で来た場合は再 open しない。
 #[cfg(windows)]
 fn handle_infer(
     runtime: &super::runtime::AiRuntime,
@@ -140,6 +199,7 @@ fn handle_infer(
     input_shape: &[i64],
     output_shm: &str,
     output_capacity: usize,
+    shm_cache: &mut ShmCache,
 ) -> WorkerResp {
     let Some(kind) = ModelKind::from_str(kind_str) else {
         return WorkerResp::err(format!("unknown model_kind: {kind_str}"));
@@ -160,29 +220,25 @@ fn handle_infer(
         ));
     }
 
-    // 共有メモリを open
-    let in_shm = match super::trt_worker_shm::SharedMem::open(input_shm, input_bytes) {
+    // 共有メモリは ShmCache で使い回す (毎回 open しない、起動時 1 回 + キャッシュ)。
+    // SharedMem は同名で複数回 open 可能だが、syscall コストを避けるため cache する。
+    let in_shm = match ShmCache::get_or_open(&mut shm_cache.in_shm, input_shm, PERSIST_IN_SHM_SIZE_HINT.max(input_bytes)) {
         Ok(s) => s,
-        Err(e) => return WorkerResp::err(format!("open input shm '{input_shm}': {e}")),
-    };
-    let mut out_shm = match super::trt_worker_shm::SharedMem::open(output_shm, output_capacity) {
-        Ok(s) => s,
-        Err(e) => return WorkerResp::err(format!("open output shm '{output_shm}': {e}")),
+        Err(e) => return WorkerResp::err(format!("get_or_open input shm: {e}")),
     };
 
     // 入力 bytes → Vec<f32> (shm 領域からコピー、Drop と独立に保持するため)
     let input_data: Vec<f32> = {
         let bytes = in_shm.read_to_vec(input_bytes);
         let f32_count = input_bytes / 4;
-        // SAFETY: bytes は Vec<u8> で 1-byte aligned、length は 4 の倍数。
-        // f32 として解釈しても alignment は OK (Vec の allocator はバイト粒度
-        // ではなく word 粒度以上で aligned される、x86_64 で 8 バイト)。
+        // SAFETY: bytes は Vec<u8> で 8-byte aligned (Rust global allocator)、
+        // length は 4 の倍数。f32 (4-byte aligned) として解釈安全。
         let f32_slice: &[f32] = unsafe {
             std::slice::from_raw_parts(bytes.as_ptr() as *const f32, f32_count)
         };
         f32_slice.to_vec()
     };
-    drop(in_shm); // 入力読み終わったので shm を release
+    // ※ 出力 shm は推論後に書き込むので、まだ open しない (借用エラー回避)。
 
     // ndarray::Array4 構築
     let shape = (
@@ -243,12 +299,24 @@ fn handle_infer(
 
     match result {
         Ok((shape, out_bytes)) => {
+            // 出力 shm を cache から取得 (なければ open)
+            let out_shm = match ShmCache::get_or_open(&mut shm_cache.out_shm, output_shm, output_capacity) {
+                Ok(s) => s,
+                Err(e) => {
+                    return WorkerResp::err(format!("get_or_open output shm: {e}"));
+                }
+            };
             out_shm.write(&out_bytes);
             WorkerResp::ok_infer(elapsed_ms, shape)
         }
         Err(e) => WorkerResp::err(format!("inference failed: {e}")),
     }
 }
+
+/// 永続入力 shm のヒントサイズ (親側 PERSIST_IN_SHM_SIZE と一致)。
+/// 子側はこれをデフォルトサイズとして使い、入力 bytes が大きければそちらを使う。
+#[cfg(windows)]
+const PERSIST_IN_SHM_SIZE_HINT: usize = 4 * 1024 * 1024;
 
 #[cfg(not(windows))]
 fn handle_infer(
