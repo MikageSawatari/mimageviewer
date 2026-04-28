@@ -1346,8 +1346,6 @@ pub struct App {
     pub(crate) show_preferences: bool,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
-    /// TensorRT エンジンビルド進捗ダイアログのステート (Some なら表示中)
-    pub(crate) trt_build_state: Option<crate::ui_dialogs::trt_build::TrtBuildState>,
 
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
@@ -2222,7 +2220,6 @@ impl Default for App {
             open_folder_error: None,
             show_preferences: false,
             pref_state: None,
-            trt_build_state: None,
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
@@ -12771,11 +12768,8 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
-        self.show_trt_build_dialog(ctx);
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
-        // 順序は trt_build_dialog より後 (バナーがビルド中は隠れる仕様のため、
-        // build_state の最新フレーム値を見る必要がある)。
         self.poll_trt_worker_notice();
         self.show_trt_worker_notice_dialog(ctx);
         self.show_stats_dialog_window(ctx);

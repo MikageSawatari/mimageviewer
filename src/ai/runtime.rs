@@ -581,10 +581,23 @@ impl AiRuntime {
         // 効くため利点が大きい。FP32 比較が必要な場面のため設定 UI には出さない。
         const TRT_FP16: bool = true;
 
+        // ハードウェア互換 (kAMPERE_PLUS) モードを常時 ON。
+        // ORT の `trt_engine_hw_compatible=1` を立てると、生成 engine が sm80+
+        // (Ampere/Ada/Hopper/Blackwell) 全 GPU で動作するようになる。これにより
+        // mikage 機で 1 度 build した engine を全 RTX 30/40/50 ユーザーへ配布できる
+        // (`nvinfer_builder_resource_*` を再配布せず済むため法的にクリーン)。
+        //
+        // 性能影響 (RTX 4090 実測 Apr 28):
+        //   - wall time 増分: 平均 +5.4%、最大 +8.8%
+        //   - session_run/tile: 平均 +8.8%、最大 +15.8% (anime6b)
+        //   - DirectML 比では依然 1.8-4x 高速で、ユーザー体感差はほぼなし
+        const TRT_HW_COMPAT: bool = true;
+
         crate::logger::log(format!(
-            "[AI] TRT EP options: cache_path={}, fp16={}, workspace={} MiB, builder_opt_level={}",
+            "[AI] TRT EP options: cache_path={}, fp16={}, hw_compat={}, workspace={} MiB, builder_opt_level={}",
             cache_dir.display(),
             TRT_FP16,
+            TRT_HW_COMPAT,
             workspace_bytes / (1024 * 1024),
             TRT_BUILDER_OPT_LEVEL
         ));
@@ -595,6 +608,7 @@ impl AiRuntime {
             .with_fp16(TRT_FP16)
             .with_max_workspace_size(workspace_bytes)
             .with_builder_optimization_level(TRT_BUILDER_OPT_LEVEL)
+            .with_engine_hw_compatible(TRT_HW_COMPAT)
             .build();
         let cuda = ort::ep::CUDA::default().build();
         match builder.with_execution_providers([trt, cuda]) {

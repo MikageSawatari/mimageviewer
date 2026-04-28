@@ -11,7 +11,6 @@ mod about;
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
 mod cache_creator;
-pub(crate) mod trt_build;
 pub(crate) mod trt_worker_notice;
 mod cache_manager;
 pub(crate) mod context_menu;

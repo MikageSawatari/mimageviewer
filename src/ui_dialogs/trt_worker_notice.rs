@@ -38,11 +38,6 @@ impl App {
         let Some(notice) = self.trt_worker_notice.clone() else {
             return;
         };
-        // ビルド進捗ダイアログ表示中は被るので隠す。完了/キャンセル後に
-        // 再表示される (バナーはフラグ自体を消さないため)。
-        if self.trt_build_state.is_some() {
-            return;
-        }
 
         let (title, body, can_retry) = notice_text(&notice);
 

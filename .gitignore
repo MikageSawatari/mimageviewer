@@ -17,3 +17,6 @@ bench_thumbs.tsv
 /bench_results/
 # TensorRT pack DL cache (scripts/setup-tensorrt-pack.ps1)
 /vendor/tensorrt-cache/
+
+# TRT pack 配布物 (build_trt_pack の出力、~3 GB)
+dist/trt-pack-*/

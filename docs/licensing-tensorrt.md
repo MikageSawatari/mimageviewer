@@ -1,0 +1,371 @@
+# TensorRT 関連ライブラリのライセンス確認
+
+mIV (mImageViewer) の TensorRT ベース AI アップスケール機能で **GitHub Releases から zip
+配布** することを想定し、各 DLL の再配布条項を整理したもの。最終的な法務判断は本ドキュメントの
+出典 URL と実際の EULA 原文 (リリースバージョン時点のもの) で行うこと。NVIDIA / Microsoft の
+ライセンス文書は更新されることがあるため、新バージョンに切り替える際は必ず再確認する。
+
+調査時点: 2026-04 / 対象バージョン: ONNX Runtime 1.24.2 (Microsoft.ML.OnnxRuntime.Gpu.Windows),
+CUDA Toolkit 12.9, cuDNN 9.21, TensorRT 10.16
+
+---
+
+## 概要表
+
+| DLL | 由来 | ライセンス | 再配布可否 (無料アプリ + zip 経由) | 出典 URL |
+|---|---|---|---|---|
+| onnxruntime.dll | Microsoft ONNX Runtime | MIT | OK (LICENSE 同梱必須) | [LICENSE](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) |
+| onnxruntime_providers_shared.dll | 同上 | MIT | OK | 同上 |
+| onnxruntime_providers_cuda.dll | 同上 | MIT | OK | 同上 |
+| onnxruntime_providers_tensorrt.dll | 同上 | MIT | OK | 同上 |
+| cudart64_12.dll | CUDA Toolkit 12.9 | NVIDIA SDK SLA + CUDA EULA | **OK** (Attachment A 明記) | [CUDA EULA](https://docs.nvidia.com/cuda/eula/index.html) |
+| cublas64_12.dll, cublasLt64_12.dll | 同上 | 同上 | **OK** (Attachment A 明記) | 同上 |
+| cufft64_11.dll, cufftw64_11.dll | 同上 | 同上 | **OK** (Attachment A 明記) | 同上 |
+| curand64_10.dll | 同上 | 同上 | **OK** (Attachment A 明記) | 同上 |
+| cusolver64_11.dll | 同上 | 同上 | **OK** (Attachment A 明記) | 同上 |
+| cusolverMg64_11.dll | 同上 | 同上 | **要確認** (cusolver の variant 解釈) | 同上 |
+| cusparse64_12.dll | 同上 | 同上 | **OK** (Attachment A 明記) | 同上 |
+| nvJitLink_120_0.dll | 同上 | 同上 | **OK** (Attachment A 明記、libnvJitLink) | 同上 |
+| nvrtc64_120_0.dll, nvrtc-builtins64_129.dll | 同上 | 同上 | **OK** (Attachment A 明記) | 同上 |
+| nvrtc64_120_0.alt.dll | 同上 | 同上 | **要確認** (nvrtc 同梱 alt ファイルの扱い) | 同上 |
+| cudnn64_9.dll, cudnn_*64_9.dll (全 8 種) | NVIDIA cuDNN 9.21 | NVIDIA SDK SLA + cuDNN Supplement | **OK** ("runtime files .so/.dll" として明記) | [cuDNN SLA](https://docs.nvidia.com/deeplearning/cudnn/sla/index.html) |
+| nvinfer_10.dll, nvinfer_lean_10.dll, nvinfer_dispatch_10.dll | NVIDIA TensorRT 10.16 | NVIDIA SDK SLA + TensorRT Supplement | **OK** (runtime DLL) | [TensorRT SLA](https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html) |
+| nvinfer_plugin_10.dll, nvinfer_vc_plugin_10.dll | 同上 | 同上 | **OK** (runtime DLL) | 同上 |
+| nvinfer_builder_resource_*_10.dll (sm75/80/86/89/90/100/120, ptx) | 同上 | 同上 | **要確認** (runtime files として明記なし。エンジンビルド用リソース) | 同上 |
+| nvonnxparser_10.dll | 同上 | 同上 | **要確認** (runtime files の解釈による) | 同上 |
+
+> **「OK」のついた DLL も、後述の "Distribution Requirements" 4 条件 (機能上の追加価値・
+> 自アプリからのみアクセス・配布条件の整合性・利用者保護) を満たす必要がある。**
+
+---
+
+## ONNX Runtime (Microsoft)
+
+対象 DLL: `onnxruntime.dll`, `onnxruntime_providers_shared.dll`,
+`onnxruntime_providers_cuda.dll`, `onnxruntime_providers_tensorrt.dll`
+(NuGet `Microsoft.ML.OnnxRuntime.Gpu.Windows` 1.24.2 から抽出)
+
+### 再配布の根拠
+
+ONNX Runtime は **MIT License**。商用 / 非商用を問わず、バイナリ含めた配布が許諾されている。
+「use, copy, modify, merge, publish, distribute, sublicense, and/or sell」を許可する典型的な
+MIT 条項。ライセンス上は zip 配布・GitHub Releases 配布に支障なし。
+
+### Attribution 要件
+
+MIT は「上記 copyright notice と permission notice を全コピーまたは substantial portion に
+含める」ことを唯一の条件としている。**NOTICE ファイル相当の何らかの形で LICENSE 全文を
+同梱する必要がある**。zip にバンドルする場合は `LICENSE-onnxruntime.txt` のような名前で
+ONNX Runtime の MIT 全文 (Microsoft の copyright 行付き) を入れる。
+
+### 関連 URL
+
+- ライセンス本体: https://github.com/microsoft/onnxruntime/blob/main/LICENSE
+- ONNX Runtime のサードパーティ NOTICES: https://github.com/microsoft/onnxruntime/blob/main/ThirdPartyNotices.txt
+  (bundled な依存ライブラリの notice も含めるべきかは要検討。NuGet package 内に同梱されている
+  `ThirdPartyNotices.txt` をそのまま zip に入れるのが安全)
+
+---
+
+## NVIDIA CUDA Runtime / Math Libraries
+
+対象 DLL: `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`,
+`cufftw64_11.dll`, `curand64_10.dll`, `cusolver64_11.dll`, `cusolverMg64_11.dll`,
+`cusparse64_12.dll`, `nvJitLink_120_0.dll`, `nvrtc64_120_0.dll`,
+`nvrtc64_120_0.alt.dll`, `nvrtc-builtins64_129.dll`
+
+### 再配布の根拠
+
+CUDA Toolkit EULA の **Section 2.6 "Attachment A — Redistributable Software"**
+(Section 番号は版によって変わる可能性あり) に再配布可能なファイルが列挙されている。
+バージョン番号やアーキテクチャ番号がファイル名に含まれた variant も対象に含むと明記:
+
+> "...including certain variations of these files that have version number or architecture
+> specific information embedded in the file name."
+
+これにより `cudart.dll` → `cudart64_12.dll`, `cublas.dll` → `cublas64_12.dll` 等は
+明示的に再配布対象。商用 / 非商用の区別は条項上ない (= 無料アプリでも有償アプリでも同一条件)。
+
+ただし **Section 1.1.2 "Distribution Requirements"** (4 つの条件) 全部を満たす必要がある:
+
+1. アプリは SDK 部分を超える "material additional functionality" を持つこと (mIV は画像
+   ビューワーとして AI アップスケール以外の本体機能を持つので OK)
+2. 配布物の SDK 部分にアクセスするのは自アプリのみであること (mIV プロセスからしか
+   呼ばれない構造で OK)
+3. 配布条件が本 Agreement と矛盾しないこと (再配布禁止 / リバースエンジニアリング禁止
+   等を mIV の利用規約に反映するか、最低限 NOTICE で利用者に伝える)
+4. 開発者ツールとして識別されているものは "internal use only" (今回対象の DLL は
+   開発者ツール扱いではないので問題なし)
+
+### 不確実な点
+
+- **`cusolverMg64_11.dll`**: cuSOLVER のマルチ GPU エクステンション。Attachment A は
+  "CUDA Linear Solver Library: cusolver.dll" と書かれているが、`cusolverMg` を variant とみなせるか
+  明確でない。**TensorRT 経路の推論で実際に必要かを先に確認**し、不要なら zip から落とす
+  方が安全。
+- **`nvrtc64_120_0.alt.dll`**: nvrtc の alternative 実装 (CUDA 12 で導入されたフォールバック
+  build。AVX 命令を持たない CPU 用のセカンダリ DLL)。Attachment A の "nvrtc.dll" の variant に
+  含まれると解釈するのが自然だが、ファイル名に `.alt` が入っているケースについて NVIDIA の
+  公式言及は見つからなかった。実用上 nvrtc 本体と一緒に配布する前提で出荷されているので
+  variant とみなして同梱しているが、最終確定前に NVIDIA にメールで確認すると確実
+  (nvidia-compute-license-questions@nvidia.com)。
+
+### Attribution 要件
+
+CUDA EULA Section 1.1.2 が明示的に求めているのは「sample source code の修正・派生物に対する
+NOTICE 記述」のみで、**バイナリ DLL 再配布に対しては attribution 文言の埋め込みを明示要求
+していない**。ただし業界慣行として NOTICE-NVIDIA.txt を同梱するのが一般的。Section 1.1.2 の
+"protection of NVIDIA's intellectual property rights" を満たすためにも、最低限「これらの
+DLL の copyright が NVIDIA に属する」旨の表記は入れる。
+
+### EULA 同梱・利用者同意
+
+- **end-user による click-through 同意は EULA 上明示要求されていない**。redistributor (= mIV
+  開発者) が EULA に同意していれば、利用者に CUDA EULA の click-through を見せる義務はない。
+- ただし「terms under which you distribute your application must be consistent with the terms
+  of this Agreement」という条項があるため、mIV のソフトウェア使用許諾 (利用規約) 内で
+  「同梱の NVIDIA コンポーネントは NVIDIA の権利物であり、リバースエンジニアリング・別アプリへの
+  抽出再配布等は禁止」程度の記述を入れておくのが推奨。
+
+### 関連 URL
+
+- CUDA Toolkit EULA: https://docs.nvidia.com/cuda/eula/index.html
+- Attachment A (Redistributable Software): 同 EULA 末尾
+
+---
+
+## NVIDIA cuDNN
+
+対象 DLL: `cudnn64_9.dll`, `cudnn_adv64_9.dll`, `cudnn_cnn64_9.dll`,
+`cudnn_engines_precompiled64_9.dll`, `cudnn_engines_runtime_compiled64_9.dll`,
+`cudnn_engines_tensor_ir64_9.dll`, `cudnn_graph64_9.dll`, `cudnn_heuristic64_9.dll`,
+`cudnn_ops64_9.dll`
+
+### 再配布の根拠
+
+cuDNN は単独の SLA を持つが、**「License Agreement for NVIDIA Software Development Kits」
+の Supplement (= 補遺)** として位置づけられている。SLA 内に明記:
+
+> "This supplement is an exhibit to the Agreement and is incorporated as an integral part
+> of the Agreement."
+
+つまり cuDNN を使う際は **本体 SDK SLA + cuDNN Supplement の両方** に拘束される。
+
+cuDNN Supplement Section 2 "Distribution" (Section 番号は版によって変わる) に明記:
+
+> "The following portions of the SDK are distributable under the Agreement: the runtime
+> files .so and .dll."
+
+`cudnn64_9.dll` 系は全て runtime DLL であり、**全 8 ファイル** がここでカバーされる
+(`cudnn_engines_*` も含めて、cuDNN 9.x 系では全部が `.dll` 形式の runtime コンポーネント)。
+本体 SDK SLA の Distribution Requirements (前述 4 条件) も同じく適用される。
+
+### Attribution 要件
+
+CUDA EULA と同様、バイナリ再配布時の attribution 文言は明示要求されていない。NOTICE への
+NVIDIA 著作権表記が業界慣行。
+
+### 関連 URL
+
+- cuDNN SLA: https://docs.nvidia.com/deeplearning/cudnn/sla/index.html
+- 質問先: nvidia-compute-license-questions@nvidia.com
+
+### 補足
+
+NVIDIA Developer フォーラムの公開議論でも、開発者が「アプリインストーラに CUDA / cuDNN
+DLL を同梱、Attachment A の DLL のみを使用」というアプローチを取り、特に問題視されていない事例が
+ある (https://forums.developer.nvidia.com/t/redistribution-of-cuda-and-cudnn/190143)。
+
+---
+
+## NVIDIA TensorRT
+
+対象 DLL: `nvinfer_10.dll`, `nvinfer_lean_10.dll`, `nvinfer_dispatch_10.dll`,
+`nvinfer_plugin_10.dll`, `nvinfer_vc_plugin_10.dll`,
+`nvinfer_builder_resource_ptx_10.dll`, `nvinfer_builder_resource_sm{75,80,86,89,90,100,120}_10.dll`,
+`nvonnxparser_10.dll`
+
+### 再配布の根拠
+
+TensorRT も cuDNN と同様、本体 SDK SLA の Supplement という構造。Section 8 に
+"TENSORRT SUPPLEMENT TO SOFTWARE LICENSE AGREEMENT FOR NVIDIA SOFTWARE DEVELOPMENT KITS"。
+Section 8.2 Distribution に明記:
+
+> "The following portions of the SDK are distributable under the Agreement: the runtime
+> files .so and .dll."
+
+Section 1.2 の Distribution Requirements (前述 4 条件) も同様に適用。
+
+### 各 DLL の解釈
+
+- **`nvinfer_10.dll` / `nvinfer_plugin_10.dll`**: 推論に必須の runtime DLL。明確に OK。
+- **`nvinfer_lean_10.dll` / `nvinfer_dispatch_10.dll`**: TensorRT 8.6+ で導入された
+  バージョン互換 runtime (lean = 削減版、dispatch = ロードを動的に切り替えるディスパッチャ)。
+  「runtime files .so and .dll」の typical な解釈に含まれる。OK。
+- **`nvinfer_vc_plugin_10.dll`**: Version-Compatible plugin。runtime 系。OK。
+- **`nvonnxparser_10.dll`**: ONNX → TensorRT エンジンに変換するパーサ。エンジンを
+  利用者環境でビルドする (= 起動時に ONNX を読み込んで build する) なら必要。
+  「runtime files」の解釈に含まれるかは EULA 文言だけからは断定できない。**要確認**。
+- **`nvinfer_builder_resource_*_10.dll`**: エンジン**ビルド** (TRT 内部の最適化・カーネル
+  選択) に必要なリソース。各 DLL が 1〜2GB と巨大。NVIDIA フォーラム
+  (https://forums.developer.nvidia.com/t/libnvinfer-builder-resource-libs/327373) で
+  staff 回答あり: これらは **エンジン構築時** に使われるリソース。事前ビルド済み engine
+  ファイルを配布して runtime はデシリアライズだけする運用なら不要。
+  TensorRT 10.12 以降は別パッケージに分離する流れ (NVIDIA 自身がランタイム配布から
+  切り離す方向)。
+  **runtime files .so/.dll に厳密に含まれるかは EULA 上不明確**。実用上は推論しか
+  しないなら同梱しないのが安全。
+
+### 推奨方針
+
+mIV では **エンジンを利用者環境でビルドする運用 (RTX 50 系で OEM 提供エンジンが
+存在しない / モデル更新を頻繁に行う等) かどうかで分岐**:
+
+- A. **事前ビルド engine 同梱方針**: ターゲット compute capability 別に NVIDIA 側で
+  ビルドした `.engine` ファイルを GitHub Releases に同梱し、runtime DLL のみ配布。
+  → `nvinfer_*` (lean/dispatch/plugin) と `nvonnxparser` (使うなら) のみで足り、
+  `nvinfer_builder_resource_*` は不要。zip サイズも 100MB 程度に収まる。
+- B. **利用者環境で ONNX → engine ビルド方針**: builder resource を含む全 DLL が必要。
+  zip サイズが GPU 世代別に数 GB ずつ増える。法的にもグレー。
+
+mIV は GitHub Releases の容量制約 (1 ファイル 2GB) もあるので **方針 A 推奨**。
+方針 B を採る場合は、最低限 `nvinfer_builder_resource_sm89_10.dll` (RTX 40)、
+`sm120_10.dll` (RTX 50) のみに絞り、それ以外は除外する。
+
+### Attribution 要件
+
+CUDA EULA / cuDNN SLA と同様、バイナリ再配布の文言要求は明示なし。
+NOTICE の NVIDIA 著作権表記が慣行。
+
+### 関連 URL
+
+- TensorRT SLA: https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html
+- builder resource 用途解説: https://forums.developer.nvidia.com/t/libnvinfer-builder-resource-libs/327373
+
+---
+
+## SUPPLEMENT 条項の優先関係
+
+| ライブラリ | 法的構造 |
+|---|---|
+| CUDA Toolkit | "License Agreement for NVIDIA SDKs" + CUDA-specific clauses (= CUDA EULA は SDK SLA に上乗せ、Attachment A はその一部) |
+| cuDNN | SDK SLA + cuDNN Supplement (Supplement が SDK SLA に追加要件・許諾を上書き) |
+| TensorRT | SDK SLA + TensorRT Supplement (同上) |
+
+3 つとも **共通 base = NVIDIA SDK SLA**。優先関係は「Supplement 内の specific 条項が SDK SLA の
+general 条項に勝る」という典型的な exhibit / supplement 構造。**両方の条件を同時に満たす必要
+がある** (どちらか片方だけ守ればよいという意味ではない)。
+
+実務上は SDK SLA 側の Distribution Requirements (Section 1.1.2 / 1.2) と、各 Supplement の
+Section 2 (Distribution) の **両方** をチェックリストにする:
+
+1. 自アプリに material additional functionality があるか? → ある (画像ビューワー)
+2. 配布 DLL が自アプリ専用にアクセス制御されているか? → 通常の DLL ロード経路で OK
+3. mIV の利用規約 / EULA が NVIDIA 側 EULA と矛盾していないか? → 要確認 (mIV の利用規約に
+   サードパーティ条項を入れる)
+4. 各 Supplement が許諾しているのは "runtime files .so/.dll" のみ → builder resource 系は
+   除外する (前述 A 方針)
+
+---
+
+## NOTICE-NVIDIA.txt 推奨文面
+
+zip ルートに以下のような `NOTICE-NVIDIA.txt` を同梱する。
+
+```
+This product includes software components from NVIDIA Corporation, redistributed under
+the NVIDIA Software License Agreement for NVIDIA Software Development Kits and its
+supplements. Use of these components is subject to those agreements.
+
+Components included:
+  CUDA Runtime / Math Libraries (CUDA Toolkit 12.9)
+    cudart64_12.dll, cublas64_12.dll, cublasLt64_12.dll,
+    cufft64_11.dll, cufftw64_11.dll, curand64_10.dll,
+    cusolver64_11.dll, cusolverMg64_11.dll, cusparse64_12.dll,
+    nvJitLink_120_0.dll, nvrtc64_120_0.dll, nvrtc64_120_0.alt.dll,
+    nvrtc-builtins64_129.dll
+  cuDNN (NVIDIA cuDNN 9.21)
+    cudnn64_9.dll, cudnn_adv64_9.dll, cudnn_cnn64_9.dll,
+    cudnn_engines_precompiled64_9.dll, cudnn_engines_runtime_compiled64_9.dll,
+    cudnn_engines_tensor_ir64_9.dll, cudnn_graph64_9.dll,
+    cudnn_heuristic64_9.dll, cudnn_ops64_9.dll
+  TensorRT (NVIDIA TensorRT 10.16)
+    nvinfer_10.dll, nvinfer_lean_10.dll, nvinfer_dispatch_10.dll,
+    nvinfer_plugin_10.dll, nvinfer_vc_plugin_10.dll,
+    nvonnxparser_10.dll
+    [if shipped] nvinfer_builder_resource_*_10.dll
+
+Copyright (c) NVIDIA Corporation. All rights reserved.
+
+Source license texts:
+  CUDA Toolkit EULA:   https://docs.nvidia.com/cuda/eula/index.html
+  cuDNN SLA:           https://docs.nvidia.com/deeplearning/cudnn/sla/index.html
+  TensorRT SLA:        https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html
+
+These components are redistributed for use with mImageViewer only. Reverse engineering,
+extraction, separate redistribution outside of mImageViewer, and use in violation of the
+NVIDIA license agreements above are prohibited.
+```
+
+加えて、ONNX Runtime の MIT ライセンス本文を `LICENSE-onnxruntime.txt` として同梱:
+
+```
+MIT License
+
+Copyright (c) Microsoft Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), ...
+[全文をそのまま貼る]
+```
+
+(全文は https://github.com/microsoft/onnxruntime/blob/main/LICENSE から取得)
+
+---
+
+## 残課題 / 不確実な事項
+
+以下は本調査では断定できなかった項目。**リリース前に NVIDIA
+(nvidia-compute-license-questions@nvidia.com) に問い合わせるか、社内 / 外部の法務確認を
+得ることを推奨**。
+
+1. **`cusolverMg64_11.dll` の variant 解釈**: Attachment A は "cusolver.dll" を列挙するが
+   "cusolverMg" は別ライブラリなのか variant なのか不明確。実用上 TensorRT 経路では不要な
+   ことが多いので、**先に実機テストで読み込まれるかを確認**してから判断するのが効率的。
+2. **`nvrtc64_120_0.alt.dll` の variant 解釈**: NVIDIA 公式が "alt" 命名規則の variant に
+   ついて言及した文書が見つからなかった。CUDA インストーラに同梱されているので variant と
+   みなして問題ないと思われるが、明示的な根拠は薄い。
+3. **`nvonnxparser_10.dll` の "runtime files" 該当性**: ONNX → engine 変換は通常 build 段階
+   だが、TensorRT は inference 時に runtime build を許す API もあるため runtime DLL と
+   解釈する余地あり。利用者環境で ONNX を直接読み込む実装ならばグレー。事前 build した
+   engine を読み込む実装なら同梱不要。
+4. **`nvinfer_builder_resource_*_10.dll` の再配布可否**: SLA 文面では "runtime files .so/.dll"
+   とのみあり、builder リソースが含まれるか曖昧。NVIDIA 自身が TensorRT 10.12 で別パッケージに
+   分離している流れから、**runtime ではない扱いの可能性が高い**。前述の方針 A (事前 build
+   engine 同梱) で回避するのが安全。
+5. **Microsoft.ML.OnnxRuntime.Gpu.Windows NuGet 内のサードパーティ通知**: NuGet パッケージに
+   `ThirdPartyNotices.txt` が同梱されている場合があり、その内容を mIV 配布物にも含める必要が
+   あるか要確認。基本的には ONNX Runtime 自身の MIT 通知 + NVIDIA 通知で足りるはずだが、
+   NuGet パッケージに記載されているものをそのまま尊重するのが堅実。
+6. **エンドユーザーへの click-through 不要の根拠**: EULA 文面上は "consistent with the terms
+   of this Agreement" であれば良いと読めるが、より厳密な運用 (mIV のインストーラに「同梱の
+   サードパーティライブラリの利用規約に同意します」というチェックボックスを入れる) を取る
+   案もある。Inno Setup のライセンス画面に NOTICE-NVIDIA.txt を表示するのが最も無難。
+7. **GitHub Releases ダウンロードゲートの是非**: NVIDIA Developer 登録なしで取得できる zip を
+   GitHub に公開することそのものは EULA 違反とは読めない (再配布許諾を得た開発者が自身の
+   配布チャネルで再配布する標準的な形態)。ただし **「NVIDIA から取得したかのように見える」配布
+   形態は禁止** (Section 2 で trademark / endorsement の偽装が禁止されているため、リリース
+   ノート・ファイル名で「NVIDIA Official Distribution」のような表記は避ける)。
+
+### 次のアクション
+
+- [ ] 実機 (RTX 4090) で TensorRT 推論を回し、`cusolverMg64_11.dll` / `nvrtc64_120_0.alt.dll`
+      / `nvonnxparser_10.dll` / `nvinfer_builder_resource_*` の実際のロード状況を Process
+      Explorer 等で確認 → 不要なものを zip から除外
+- [ ] 事前 build engine を NVIDIA 側 (= mIV ビルドマシン) で生成して GitHub Releases に
+      同梱する方針 A の実装可否を検討 (RTX 50 用 engine をビルドできる環境が必要)
+- [ ] mIV 利用規約に「同梱のサードパーティコンポーネントの権利は各社に帰属し、抽出・別再配布・
+      リバースエンジニアリング等は禁止」の条項を追記
+- [ ] `NOTICE-NVIDIA.txt` と `LICENSE-onnxruntime.txt` (+ `ThirdPartyNotices.txt` あれば
+      それも) を zip に同梱する仕組みを GitHub Actions の release ジョブに追加
+- [ ] 不確実点 1〜4 が実用上残るなら、リリース前に NVIDIA に英文メールで照会

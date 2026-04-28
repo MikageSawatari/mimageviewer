@@ -186,10 +186,6 @@ pub(crate) struct PreferencesState {
     pub trt_pack_size_mib: u64,
     /// TRT engine cache の総ディスク使用量 (MiB)
     pub trt_engine_cache_size_mib: u64,
-
-    /// 「全エンジンビルド」ボタンが押されたときに立てるフラグ。
-    /// Apply 直後に App 側で見て start_trt_build() を呼び、消す。
-    pub start_trt_build_requested: bool,
 }
 
 impl PreferencesState {
@@ -248,7 +244,6 @@ impl PreferencesState {
             trt_pack_installed,
             trt_pack_size_mib,
             trt_engine_cache_size_mib,
-            start_trt_build_requested: false,
         }
     }
 }
@@ -384,17 +379,6 @@ impl App {
                     }
                 });
             });
-
-        // 「全エンジンビルド」フラグの即時処理 (OK/Cancel に関係なくこのフレームで起動する)
-        // フラグは pref_state 上に持ち、立っていればビルドを開始してフラグを倒す。
-        // ビルド開始はバックグラウンドスレッド + show_trt_build_dialog で進捗表示なので、
-        // 環境設定ウィンドウを閉じる必要はない。
-        if let Some(state) = self.pref_state.as_mut()
-            && state.start_trt_build_requested
-        {
-            state.start_trt_build_requested = false;
-            self.start_trt_build();
-        }
 
         if apply {
             if let Some(mut state) = self.pref_state.take() {
@@ -983,36 +967,19 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
             ui.add_space(8.0);
 
-            // 全エンジン一括ビルドボタン
-            ui.label(egui::RichText::new("初回セットアップ").strong());
-            ui.add_space(2.0);
-            ui.label(
-                "TensorRT は各モデルを GPU 専用にコンパイルしたエンジンを使います。\n\
-                 初回は対象 6 モデルのビルドに 5〜15 分かかります (バックグラウンドで実行)。\n\
-                 ビルド済みモデルはエンジンキャッシュに保存され、次回以降は瞬時にロードされます。",
-            );
-            ui.add_space(4.0);
-            if ui
-                .button("全エンジンを今すぐビルドする")
-                .on_hover_text(
-                    "閉じてから別ウィンドウで進捗を表示します。\
-                     未ビルドのモデルだけが時間かかります。",
-                )
-                .clicked()
-            {
-                state.start_trt_build_requested = true;
-            }
-            ui.add_space(8.0);
-
             // エンジンキャッシュ管理
+            // 配布されたエンジンファイル (mikage 側で AMPERE_PLUS で事前ビルド済み、
+            // tensorrt-engines/<model>/<file>.engine として展開) と、ユーザー機固有の
+            // 再コンパイル結果 (将来エンジン互換が崩れた場合の残骸) が同居する。
+            // ドライバ更新後にデシリアライズエラーが出るなら削除して再 DL を促す。
             ui.label(format!(
                 "エンジンキャッシュ: {} MiB",
                 state.trt_engine_cache_size_mib
             ));
             ui.label(
                 egui::RichText::new(
-                    "(各モデルを初回 AI 機能利用時にコンパイルしたものをキャッシュ。\n\
-                     ドライバ更新後等にエラーが出る場合は削除して再ビルドしてください)",
+                    "(配布パックに含まれる事前ビルド済みエンジン。\n\
+                     ドライバ更新後等にエラーが出る場合は削除し、再 DL してください)",
                 )
                 .small(),
             );

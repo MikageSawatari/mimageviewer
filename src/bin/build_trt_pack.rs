@@ -1,0 +1,481 @@
+//! TensorRT 配布パックの GitHub Releases 用アセット作成ツール (Apr 28 改訂)。
+//!
+//! ## 入力
+//!
+//! - `%APPDATA%/mimageviewer/tensorrt/`: `setup-tensorrt-pack.ps1` で展開した DLL 群
+//! - `%APPDATA%/mimageviewer/tensorrt-engines/<model>/`: `mimageviewer.exe --tensorrt-build`
+//!   で生成した AMPERE_PLUS engine 群 (6 モデル分)
+//!
+//! ## 出力 (`dist/trt-pack-v<N>/`)
+//!
+//! - `manifest.json` - 全アセットの SHA-256 + サイズ + 各種バージョン情報
+//! - `<dll>.dll` × ~30 - GitHub Releases にそのままアップロードする runtime DLL 群
+//! - `engines-ampere_plus.zip` - 6 モデル分の事前ビルド済み engine をまとめた zip
+//!
+//! ## 設計判断 (Apr 28 ライセンス調査結果反映)
+//!
+//! - **`nvinfer_builder_resource_*.dll` は配布しない**: TensorRT SLA で再配布許諾が
+//!   明確でない (`runtime files` に該当しない可能性が高い) ため、エンジンを
+//!   mikage 側で事前 build して `.engine` ファイルとして配布する方針に切替。
+//!   ユーザー機での engine compile は行わない。
+//! - **`kAMPERE_PLUS` モード**: `runtime.rs` で `with_engine_hw_compatible(true)` を
+//!   ハードコードしているため、生成 engine は sm80+ (RTX 30/40/50) で動く。実測 perf
+//!   低下は wall time 平均 +5.4%、最大 +8.8%。Turing (sm75) は将来別 engine pack で対応。
+//! - **per-DLL 配信** (vs 1 個の zip): GitHub Releases の 2 GiB / file 上限に収まる、
+//!   resume が file 単位で素直、必要なら部分更新できる。
+//! - **engine だけ zip**: 6 モデル分の engine + profile (~12 ファイル) を 1 zip に
+//!   まとめる。ファイル単位で SHA-256 を取るより manifest シンプル + DL も 1 トランザクション。
+//!
+//! ## 使い方
+//! ```sh
+//! cargo run --release --bin build_trt_pack
+//! ```
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// pack バージョン。`tensorrt_pack.rs::EXPECTED_TRT_PACK_VERSION` と揃える。
+/// CUDA / cuDNN / TensorRT / ORT のいずれかを更新したら bump する。
+const PACK_VERSION: u32 = 1;
+
+/// 既存 INSTALL_OK の中身 (setup-tensorrt-pack.ps1 が書いた版情報)。
+#[derive(Debug, Deserialize)]
+struct InstallOk {
+    version: u32,
+    ort_gpu_version: String,
+    cuda_cudart_version: String,
+    cuda_cublas_version: String,
+    cudnn_version: String,
+    trt_version: String,
+    #[allow(dead_code)]
+    installed_at: String,
+}
+
+/// アセット 1 個のメタデータ。
+#[derive(Debug, Serialize)]
+struct AssetEntry {
+    /// ファイル名 (DLL 名そのまま、または engine zip ファイル名)。
+    name: String,
+    /// SHA-256 (hex 小文字、64 文字)。
+    sha256: String,
+    /// バイト数。
+    bytes: u64,
+}
+
+/// engine pack 1 セットのメタデータ。将来 sm75 (Turing) 用 pack を追加するので Vec で持つ。
+#[derive(Debug, Serialize)]
+struct EnginePack {
+    /// pack 内部識別子 (URL 安全、英小文字+数字+underscore)。
+    id: String,
+    /// 対応する最小 CUDA Compute Capability (× 10)。例: 80 = sm80+。
+    /// downloader が GPU SM を検出して、該当する最大値の pack を選ぶ。
+    compute_capability_min: u32,
+    /// UI / マニュアル表示用の人間可読ラベル。
+    human_label: String,
+    /// この pack を構成するファイル群 (通常 1 個の zip)。
+    files: Vec<AssetEntry>,
+}
+
+/// マニフェスト全体。
+#[derive(Debug, Serialize)]
+struct Manifest {
+    /// マニフェスト構造のバージョン。`Manifest` のフィールド構造を変えたら bump。
+    /// v2 (Apr 28 改訂): per_sm/optional/PTX を撤廃、engines bucket を導入。
+    manifest_format: u32,
+    /// pack バージョン (`PACK_VERSION`)。
+    pack_version: u32,
+    /// 各種ライブラリバージョン (UI 表示用 + ローカル INSTALL_OK 検証用)。
+    versions: BTreeMap<String, String>,
+    /// 全ユーザーが DL する DLL 群 (CUDA / cuDNN / TRT runtime / ORT)。
+    /// `nvinfer_builder_resource_*.dll` は含めない (ライセンス上の判断)。
+    common: Vec<AssetEntry>,
+    /// GPU 世代別の engine pack (zip)。downloader は SM に合わせて 1 個だけ DL。
+    engines: Vec<EnginePack>,
+    /// common DL 量の合計 (UI で進捗表示する際の分母)。
+    common_total_bytes: u64,
+    /// pack 作成時刻 (UTC ISO 8601)。
+    created_at: String,
+}
+
+fn main() {
+    let src_pack = data_dir().join("tensorrt");
+    let src_engines = data_dir().join("tensorrt-engines");
+    if !src_pack.is_dir() {
+        eprintln!(
+            "ERROR: source pack directory not found: {}\n\
+             先に scripts/setup-tensorrt-pack.ps1 を走らせて DLL を展開してください。",
+            src_pack.display()
+        );
+        std::process::exit(1);
+    }
+    if !src_engines.is_dir() {
+        eprintln!(
+            "ERROR: engines directory not found: {}\n\
+             先に各モデルを `mimageviewer.exe --tensorrt-build <kind>` で build してください。",
+            src_engines.display()
+        );
+        std::process::exit(1);
+    }
+
+    // INSTALL_OK 読み取り
+    let install_ok_path = src_pack.join("INSTALL_OK");
+    let install_ok_text = fs::read_to_string(&install_ok_path).unwrap_or_else(|e| {
+        eprintln!("ERROR: read {}: {}", install_ok_path.display(), e);
+        std::process::exit(1);
+    });
+    let install_ok_text = install_ok_text.trim_start_matches('\u{feff}'); // BOM 除去
+    let install_ok: InstallOk = serde_json::from_str(install_ok_text).unwrap_or_else(|e| {
+        eprintln!(
+            "ERROR: parse {}: {} (中身: {})",
+            install_ok_path.display(),
+            e,
+            install_ok_text
+        );
+        std::process::exit(1);
+    });
+    if install_ok.version != PACK_VERSION {
+        eprintln!(
+            "WARNING: INSTALL_OK.version ({}) != PACK_VERSION ({})。\
+             続行するが本コードと DLL のバージョン整合に注意。",
+            install_ok.version, PACK_VERSION
+        );
+    }
+
+    // 出力ディレクトリ準備
+    let dist_dir = PathBuf::from(format!("dist/trt-pack-v{}", PACK_VERSION));
+    if dist_dir.exists() {
+        println!(
+            "[build_trt_pack] 既存 {} を削除して作り直す",
+            dist_dir.display()
+        );
+        if let Err(e) = fs::remove_dir_all(&dist_dir) {
+            eprintln!("ERROR: remove_dir_all {}: {}", dist_dir.display(), e);
+            std::process::exit(1);
+        }
+    }
+    fs::create_dir_all(&dist_dir).unwrap();
+
+    // ── common DLLs ──
+    let mut common: Vec<AssetEntry> = Vec::new();
+    let mut common_total_bytes: u64 = 0;
+    let mut excluded_count: usize = 0;
+
+    let dll_entries: Vec<_> = fs::read_dir(&src_pack)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let p = e.path();
+            p.is_file() && p.extension().map(|x| x == "dll").unwrap_or(false)
+        })
+        .collect();
+    println!(
+        "[build_trt_pack] DLL 走査: {} 個を {} から",
+        dll_entries.len(),
+        src_pack.display()
+    );
+
+    for entry in dll_entries {
+        let path = entry.path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+
+        // ライセンス調査結果 (docs/licensing-tensorrt.md): builder_resource は再配布
+        // 許諾が明確でないため除外。AMPERE_PLUS engine を事前ビルドして同梱する方針。
+        if name.starts_with("nvinfer_builder_resource_") {
+            excluded_count += 1;
+            println!("  excluded (builder_resource): {}", name);
+            continue;
+        }
+
+        let asset = compute_asset(&path).unwrap_or_else(|e| {
+            eprintln!("ERROR: hash {}: {}", path.display(), e);
+            std::process::exit(1);
+        });
+        copy_to_dist(&path, &dist_dir);
+        common_total_bytes += asset.bytes;
+        println!(
+            "  common: {} ({:.1} MiB, sha256={}…)",
+            name,
+            asset.bytes as f64 / 1024.0 / 1024.0,
+            &asset.sha256[..12]
+        );
+        common.push(asset);
+    }
+    common.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // ── engine pack (AMPERE_PLUS) ──
+    // 6 モデルの engine cache (`<model>/<file>.engine` + `<file>.profile`) を 1 zip に。
+    // ファイル名は ORT TRT EP がモデルハッシュから導出するので変えてはいけない。
+    let engine_zip_name = "engines-ampere_plus.zip";
+    let engine_zip_path = dist_dir.join(engine_zip_name);
+    let zip_bytes = build_engine_zip(&src_engines, &engine_zip_path).unwrap_or_else(|e| {
+        eprintln!("ERROR: build engine zip: {e}");
+        std::process::exit(1);
+    });
+    let engine_zip_asset = compute_asset(&engine_zip_path).unwrap_or_else(|e| {
+        eprintln!("ERROR: hash engine zip: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "  engine pack [ampere_plus]: {} ({:.1} MiB, sha256={}…)",
+        engine_zip_asset.name,
+        engine_zip_asset.bytes as f64 / 1024.0 / 1024.0,
+        &engine_zip_asset.sha256[..12]
+    );
+
+    let engines = vec![EnginePack {
+        id: "ampere_plus".to_string(),
+        compute_capability_min: 80,
+        human_label: "RTX 30/40/50 series (compute capability 8.0+)".to_string(),
+        files: vec![engine_zip_asset],
+    }];
+    let engine_total_bytes: u64 = zip_bytes;
+
+    // ── manifest ──
+    let mut versions = BTreeMap::new();
+    versions.insert("ort_gpu".to_string(), install_ok.ort_gpu_version.clone());
+    versions.insert(
+        "cuda_cudart".to_string(),
+        install_ok.cuda_cudart_version.clone(),
+    );
+    versions.insert(
+        "cuda_cublas".to_string(),
+        install_ok.cuda_cublas_version.clone(),
+    );
+    versions.insert("cudnn".to_string(), install_ok.cudnn_version.clone());
+    versions.insert("trt".to_string(), install_ok.trt_version.clone());
+
+    let manifest = Manifest {
+        manifest_format: 2,
+        pack_version: PACK_VERSION,
+        versions,
+        common,
+        engines,
+        common_total_bytes,
+        created_at: utc_now_iso8601(),
+    };
+    let manifest_path = dist_dir.join("manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
+    fs::write(&manifest_path, &manifest_json).unwrap();
+
+    let total_user_dl = common_total_bytes + engine_total_bytes;
+
+    println!();
+    println!("==================== 完了 ====================");
+    println!("出力ディレクトリ: {}", dist_dir.display());
+    println!("manifest:        {}", manifest_path.display());
+    println!(
+        "common DLL: {} 個、合計 {:.2} GB (builder_resource を {} 個除外)",
+        manifest.common.len(),
+        common_total_bytes as f64 / 1_073_741_824.0,
+        excluded_count
+    );
+    println!(
+        "engine pack [ampere_plus]: {:.1} MiB",
+        engine_total_bytes as f64 / 1024.0 / 1024.0
+    );
+    println!(
+        "ユーザー DL 量 (sm80+ ユーザー): 約 {:.2} GB",
+        total_user_dl as f64 / 1_073_741_824.0
+    );
+    println!();
+    println!("次のステップ:");
+    println!("  1. dist/trt-pack-v{}/ 内のすべてのファイルを GitHub Releases にアップロード", PACK_VERSION);
+    println!("     (タグ名: trt-pack-v{} 推奨)", PACK_VERSION);
+    println!("  2. mIV の `tensorrt_pack` モジュールに manifest URL を埋め込む");
+    println!("  3. cargo build --release でビルド & 配布");
+}
+
+/// 6 モデル分の engine cache を 1 つの zip にまとめる。
+/// 戻り値: 生成された zip ファイルのバイト数。
+fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
+    let file = fs::File::create(dst_zip).map_err(|e| format!("create zip: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(3)) // 軽い圧縮 (engine は乱数に近いので Deflate でも 5% 程度)
+        .large_file(true); // zip64 対応 (4 GB 超ケースの保険、実際は数百 MB)
+
+    let mut total_files: usize = 0;
+    let mut total_bytes_in: u64 = 0;
+    for model_entry in fs::read_dir(src_engines).map_err(|e| format!("read_dir engines: {e}"))? {
+        let model_entry = model_entry.map_err(|e| format!("entry: {e}"))?;
+        let model_dir = model_entry.path();
+        if !model_dir.is_dir() {
+            continue;
+        }
+        let model_name = model_dir.file_name().unwrap().to_string_lossy().to_string();
+
+        // 各モデルディレクトリの中身 (.engine + .profile) を zip に。
+        // ファイル名は ORT TRT EP のハッシュ命名を保つ必要がある (deserialize 時の lookup
+        // キーになる)。
+        for f in fs::read_dir(&model_dir).map_err(|e| format!("read_dir model: {e}"))? {
+            let f = f.map_err(|e| format!("file entry: {e}"))?;
+            let p = f.path();
+            if !p.is_file() {
+                continue;
+            }
+            let fname = p.file_name().unwrap().to_string_lossy().to_string();
+            // zip 内パスは `<model_name>/<file>` で、runtime 展開時に
+            // `tensorrt-engines/<model_name>/<file>` になる
+            let zip_path = format!("{}/{}", model_name, fname);
+            zip.start_file(&zip_path, opts.clone())
+                .map_err(|e| format!("start_file {zip_path}: {e}"))?;
+            let mut src = fs::File::open(&p).map_err(|e| format!("open {}: {e}", p.display()))?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = src.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                zip.write_all(&buf[..n])
+                    .map_err(|e| format!("zip write: {e}"))?;
+                total_bytes_in += n as u64;
+            }
+            total_files += 1;
+        }
+    }
+    zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+
+    let zip_size = fs::metadata(dst_zip)
+        .map(|m| m.len())
+        .map_err(|e| format!("metadata: {e}"))?;
+
+    println!(
+        "[engine zip] {} ファイル、{:.1} MiB → {:.1} MiB ({:.0}% 圧縮)",
+        total_files,
+        total_bytes_in as f64 / 1024.0 / 1024.0,
+        zip_size as f64 / 1024.0 / 1024.0,
+        if total_bytes_in == 0 {
+            0.0
+        } else {
+            100.0 * (1.0 - zip_size as f64 / total_bytes_in as f64)
+        }
+    );
+    Ok(zip_size)
+}
+
+/// SHA-256 + サイズを計算してアセットエントリを作る。
+fn compute_asset(path: &Path) -> std::io::Result<AssetEntry> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut bytes: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        bytes += n as u64;
+    }
+    let hash = hasher.finalize();
+    Ok(AssetEntry {
+        name: path.file_name().unwrap().to_string_lossy().to_string(),
+        sha256: hex_encode(&hash),
+        bytes,
+    })
+}
+
+/// バイト列を hex 小文字に変換 (依存追加せず手書き)。
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// 入力 DLL を出力ディレクトリへハードリンク (失敗したらコピー)。
+/// ハードリンクが効けば 7 GB のコピーが瞬時に終わる。
+fn copy_to_dist(src: &Path, dist_dir: &Path) {
+    let dst = dist_dir.join(src.file_name().unwrap());
+    if fs::hard_link(src, &dst).is_err() {
+        // ボリューム跨ぎ等でハードリンク不可ならコピー
+        if let Err(e) = fs::copy(src, &dst) {
+            eprintln!("ERROR: copy {} → {}: {}", src.display(), dst.display(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn data_dir() -> PathBuf {
+    mimageviewer::data_dir::get()
+}
+
+/// 現在時刻を UTC ISO 8601 形式で返す (chrono 等の依存追加を避ける手書き実装)。
+fn utc_now_iso8601() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let secs = now.as_secs();
+    let (year, month, day, hour, min, sec) = unix_to_ymdhms(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, min, sec
+    )
+}
+
+/// Unix epoch 秒 → (年, 月, 日, 時, 分, 秒) UTC。グレゴリオ暦・うるう秒なし。
+fn unix_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let sec = (secs % 60) as u32;
+    secs /= 60;
+    let min = (secs % 60) as u32;
+    secs /= 60;
+    let hour = (secs % 24) as u32;
+    secs /= 24;
+    let mut days = secs;
+    let mut year: u32 = 1970;
+    loop {
+        let days_in_year: u64 = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let mdays: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut month: u32 = 1;
+    let mut day = days as u32 + 1;
+    for &dm in &mdays {
+        if day <= dm {
+            break;
+        }
+        day -= dm;
+        month += 1;
+    }
+    (year, month, day, hour, min, sec)
+}
+
+fn is_leap(y: u32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_encode_basic() {
+        assert_eq!(hex_encode(&[0x00, 0xff, 0xab]), "00ffab");
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn unix_to_ymdhms_known() {
+        // 2026-01-01T00:00:00Z = 1767225600 秒
+        let (y, m, d, h, mi, s) = unix_to_ymdhms(1767225600);
+        assert_eq!((y, m, d, h, mi, s), (2026, 1, 1, 0, 0, 0));
+    }
+}
