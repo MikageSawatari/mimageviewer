@@ -10280,16 +10280,35 @@ impl App {
                     .copied()
                     .collect();
                 for k in to_cancel {
-                    if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
-                        cancel.store(true, Ordering::Relaxed);
-                        crate::logger::log(format!(
-                            "[AI] Cancelled prefetch {:?} to prioritize current {:?}",
-                            k, cur_key
-                        ));
+                    // **cancel フラグだけ立てて pending entry は残す**。worker は次の
+                    // tile boundary で cancel を見て Err(Cancelled) を返す (= channel
+                    // disconnect → poll_ai_upscale で silent remove)。
+                    // ただし最後の tile が完了直前ならそのまま Ok で返ることもあり、
+                    // その場合 tx.send で結果が rx に届く → cache に保存される。
+                    // (Apr 29: 高速スクロール時に最後の tile 完了直後で entry を remove
+                    // していたため Ok 結果が捨てられて、戻り再訪時にアップスケールが
+                    // 効かない問題があった)。
+                    if let Some((cancel, _)) = self.ai_upscale_pending.get(&k) {
+                        if !cancel.load(Ordering::Relaxed) {
+                            cancel.store(true, Ordering::Relaxed);
+                            crate::logger::log(format!(
+                                "[AI] Cancelled prefetch {:?} to prioritize current {:?}",
+                                k, cur_key
+                            ));
+                        }
                     }
                 }
             }
-            if !self.ai_upscale_pending.is_empty() {
+            // 「pending に何か残っている → 新規 spawn しない」のガード。
+            // ただしキャンセル済み entry は既に終わりに向かっているので新規 spawn の
+            // 妨げにしない (= 1〜数 ms のオーバーラップを許可)。これにより上の
+            // 「Cancelled prefetch」で entry を残したままでも新しい current_idx の
+            // upscale を即時開始できる。
+            let has_active_pending = self
+                .ai_upscale_pending
+                .values()
+                .any(|(cancel, _)| !cancel.load(Ordering::Relaxed));
+            if has_active_pending {
                 return;
             }
         }
@@ -10513,7 +10532,10 @@ impl App {
             .cloned()
             .collect();
         for k in to_cancel {
-            if let Some((cancel, _)) = self.ai_upscale_pending.remove(&k) {
+            // **cancel フラグだけ立てて pending entry は残す** (= worker が完了寸前
+            // なら Ok の結果が rx 経由で届いて cache に保存される)。entry 自体は
+            // poll_ai_upscale が channel disconnect を見たときに削除する。
+            if let Some((cancel, _)) = self.ai_upscale_pending.get(&k) {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
