@@ -13523,17 +13523,40 @@ pub(crate) fn draw_cell(
                 egui::Stroke::new(2.0, sep_stroke),
                 egui::StrokeKind::Middle,
             );
-            // フォルダ名を大きめの太字で中央に
-            let font_size = (inner.height() * 0.14).clamp(14.0, 36.0);
-            painter.text(
-                inner.center(),
-                egui::Align2::CENTER_CENTER,
-                truncate_name(dir_display, 24),
-                egui::FontId::proportional(font_size),
+            // 下部 "📁 作品の区切り" 用の予約幅 (タイトル領域算出にも使うため先に確定)
+            let small = (inner.height() * 0.08).clamp(9.0, 16.0);
+            let bottom_reserve = small * 1.4 + 6.0;
+            // 階層フォルダは A/B ではなく `\n` 区切りで複数行に分け、Ctrl+G 検索結果と
+            // 同じ自動縮小ロジック (draw_path_hierarchy) でセル幅にフィットさせる。
+            const TOP_PAD: f32 = 6.0;
+            const SIDE_PAD: f32 = 6.0;
+            const MIN_TITLE_H: f32 = 14.0;
+            let title_top = inner.min.y + TOP_PAD;
+            let title_bottom_full = inner.max.y - bottom_reserve;
+            let title_bottom = if title_bottom_full - title_top >= MIN_TITLE_H {
+                title_bottom_full
+            } else if (inner.max.y - TOP_PAD) - title_top >= MIN_TITLE_H {
+                // 極小セルでは下部ラベル予約を諦める
+                inner.max.y - TOP_PAD
+            } else {
+                inner.max.y
+            };
+            let title_rect = egui::Rect::from_min_max(
+                egui::pos2(inner.min.x + SIDE_PAD, title_top),
+                egui::pos2(inner.max.x - SIDE_PAD, title_bottom),
+            );
+            let components = crate::ui_helpers::split_path_components(dir_display);
+            let max_font = (inner.height() * 0.14).clamp(14.0, 36.0);
+            let min_font = 10.0;
+            crate::ui_helpers::draw_path_hierarchy(
+                painter,
+                title_rect,
+                &components,
                 sep_title,
+                max_font,
+                min_font,
             );
             // 下部にフォルダアイコン的な記号
-            let small = (inner.height() * 0.08).clamp(9.0, 16.0);
             painter.text(
                 egui::pos2(inner.center().x, inner.max.y - 6.0),
                 egui::Align2::CENTER_BOTTOM,
