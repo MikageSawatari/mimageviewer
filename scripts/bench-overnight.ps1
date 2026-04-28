@@ -109,9 +109,13 @@ Log "TensorRT pack: ready"
 # ---------------------------------------------------------------
 # Build bench_ai
 # ---------------------------------------------------------------
+# Note: We invoke cargo through cmd /c so that stdout+stderr redirection
+# happens inside cmd. Doing the redirection in PowerShell ($cmd *> $file)
+# wraps each stderr line as a NativeCommandError and trips $ErrorActionPreference,
+# even when cargo exits 0. cmd-level > 2>&1 has none of those side effects.
 Log "Building bench_ai (release)..."
 $BuildLog = Join-Path $OutDir 'build.log'
-& cargo build --release --bin bench_ai *> $BuildLog
+& cmd /c "cargo build --release --bin bench_ai > `"$BuildLog`" 2>&1"
 if ($LASTEXITCODE -ne 0) {
     Log "ERROR: cargo build failed (exit $LASTEXITCODE)"
     Log "  see: $BuildLog"
@@ -137,17 +141,24 @@ function Run-Bench {
     Log "  log:  $logPath"
     $tStart = Get-Date
 
-    & cargo run --release --bin bench_ai -- `
-        --backend $Backend `
-        --models $models `
-        --warmup $Warmup `
-        --runs $Runs `
-        --image $TestImages[0] `
-        --image $TestImages[1] `
-        --image $TestImages[2] `
-        --image $TestImages[3] `
-        --json $jsonPath `
-        *> $logPath
+    # Build the cargo invocation as a single string for cmd /c.
+    # All paths must be quoted because some test images contain spaces
+    # (e.g. "Sonic Melty _ TuneCore Japan_files"). Cmd-level redirection
+    # avoids the PowerShell NativeCommandError wrapping issue.
+    $argParts = @(
+        'cargo run --release --bin bench_ai --',
+        "--backend $Backend",
+        "--models $models",
+        "--warmup $Warmup",
+        "--runs $Runs",
+        "--image `"$($TestImages[0])`"",
+        "--image `"$($TestImages[1])`"",
+        "--image `"$($TestImages[2])`"",
+        "--image `"$($TestImages[3])`"",
+        "--json `"$jsonPath`""
+    )
+    $cmdLine = ($argParts -join ' ') + " > `"$logPath`" 2>&1"
+    & cmd /c $cmdLine
 
     $rc = $LASTEXITCODE
     $elapsed = ((Get-Date) - $tStart).TotalSeconds
