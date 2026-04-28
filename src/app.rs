@@ -1863,6 +1863,10 @@ pub struct App {
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
     /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
     pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    /// TRT pack のオンラインインストールダイアログの状態。
+    /// Some の間ダイアログが表示され、worker thread が動作している。
+    /// 閉じる (Drop) と worker は cancel される。
+    pub(crate) trt_install_state: Option<crate::ui_dialogs::trt_install::TrtInstallState>,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の画像でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -2388,6 +2392,7 @@ impl Default for App {
             ime_last_event_at: None,
             fs_feedback_toast: None,
             trt_worker_notice: None,
+            trt_install_state: None,
             fs_boundary_hint: None,
 
             // 消しゴムモード
@@ -12772,6 +12777,8 @@ impl eframe::App for App {
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
         self.poll_trt_worker_notice();
         self.show_trt_worker_notice_dialog(ctx);
+        // TRT pack オンラインインストールダイアログ (環境設定から起動)。
+        self.show_trt_install_dialog(ctx);
         self.show_stats_dialog_window(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);

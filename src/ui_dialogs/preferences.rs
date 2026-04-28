@@ -186,6 +186,9 @@ pub(crate) struct PreferencesState {
     pub trt_pack_size_mib: u64,
     /// TRT engine cache の総ディスク使用量 (MiB)
     pub trt_engine_cache_size_mib: u64,
+    /// 「TensorRT パックをダウンロード」ボタンが押されたか。
+    /// 環境設定の Apply/Cancel 後に App 側で読み取って TRT install dialog を開く。
+    pub start_trt_install_requested: bool,
 }
 
 impl PreferencesState {
@@ -244,6 +247,7 @@ impl PreferencesState {
             trt_pack_installed,
             trt_pack_size_mib,
             trt_engine_cache_size_mib,
+            start_trt_install_requested: false,
         }
     }
 }
@@ -456,6 +460,21 @@ impl App {
         } else if cancel || !open {
             self.pref_state = None;
             self.show_preferences = false;
+        }
+
+        // 「TensorRT パックをダウンロード」ボタンが押されていたら、環境設定ダイアログを
+        // 閉じて TRT install dialog を開く (= ユーザーは設定変更を保存しなくてもインストール
+        // フローへ進める。完了後の TensorRT 有効化は再起動 + AiBackend 設定で行う想定)。
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.start_trt_install_requested {
+                ps.start_trt_install_requested = false;
+                self.pref_state = None;
+                self.show_preferences = false;
+                let target_sm = crate::gpu_info::query_primary_gpu_sm();
+                self.trt_install_state = Some(
+                    crate::ui_dialogs::trt_install::TrtInstallState::new(target_sm),
+                );
+            }
         }
     }
 }
@@ -949,16 +968,21 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
             ui.add_space(4.0);
             ui.label(
-                "現在は手動セットアップが必要です。PowerShell で以下を実行してください:\n\
-                 (約 6.8 GB の DLL が NVIDIA / Microsoft 公式 URL からダウンロードされます)",
+                "TensorRT 高速化パック (約 1.97 GB) を GitHub からダウンロードします。\n\
+                 完了後、次回起動時に TensorRT が自動で有効になります。",
             );
-            ui.add_space(4.0);
-            ui.code("scripts\\setup-tensorrt-pack.ps1");
             ui.add_space(8.0);
-            ui.label(
-                "セットアップ後にこの画面を再度開くとパック情報が表示されます。\n\
-                 (将来のバージョンではアプリ内ダウンロード機能を提供予定)",
-            );
+            if ui
+                .button("TensorRT パックをダウンロード")
+                .on_hover_text(
+                    "GitHub Releases から CUDA / cuDNN / TensorRT runtime と \
+                     事前ビルド済み AI エンジンをダウンロードします (約 1.97 GB)。\n\
+                     対応 GPU: RTX 30 / 40 / 50 シリーズ。",
+                )
+                .clicked()
+            {
+                state.start_trt_install_requested = true;
+            }
         } else {
             // pack インストール済み
             ui.colored_label(

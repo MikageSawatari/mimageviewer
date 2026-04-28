@@ -24,4 +24,5 @@ mod stats_dialog;
 mod tag_editor;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
+pub(crate) mod trt_install;
 mod update_notice;
