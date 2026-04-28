@@ -294,6 +294,9 @@ fn main() -> eframe::Result {
             #[cfg(windows)]
             {
                 if let Some(rs) = cc.wgpu_render_state.clone() {
+                    // egui_wgpu の callback_resources に動画描画用の wgpu パイプラインを
+                    // 起動時 1 度だけ登録 (= 各 paint で再利用される shared resource)。
+                    crate::video::gpu_renderer::init_video_pipeline(&rs);
                     app.wgpu_render_state = Some(rs);
                     match crate::video::gpu_renderer::GpuVideoDevice::new(
                         app.settings.video_rtx_vsr,

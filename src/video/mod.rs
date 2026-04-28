@@ -68,7 +68,32 @@ pub struct VideoPlayer {
     /// repaint を予約してデコーダ完成を polling 待ちする。長引いたら back off する。
     /// シーク完了 (override が 1 度クリア) で None に戻す。
     seek_inflight_since: Option<std::time::Instant>,
+    /// GPU 経路で最新表示フレームの **所有** (= D3d11Frame)。`ui_fullscreen` は
+    /// `gpu_latest_info()` 経由で view-only 情報 (handle, dims) を得る。
+    /// 次の GPU フレームが到着して置き換わるまで本フィールドが保持し、
+    /// 置換時に旧 D3d11Frame::Drop で HANDLE を CloseHandle する (= UI が同 handle を
+    /// 描画している期間は HANDLE が valid であることを保証、Codex P1 反映)。
+    #[cfg(windows)]
+    gpu_latest: Option<crate::video::gpu_renderer::D3d11Frame>,
 }
+
+/// `VideoPlayer::gpu_latest_info()` が返す view-only 情報。Copy なので
+/// `FsFrameState` などの構造体に値で持たせて safe。HANDLE の寿命は
+/// `VideoPlayer.gpu_latest` (= D3d11Frame) が保証する。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub struct GpuLatestFrame {
+    pub shared_handle: windows::Win32::Foundation::HANDLE,
+    pub width: u32,
+    pub height: u32,
+    pub ten_bit: bool,
+}
+
+// HANDLE は thread を渡って良い (D3d11Frame と同様の論理)。
+#[cfg(windows)]
+unsafe impl Send for GpuLatestFrame {}
+#[cfg(windows)]
+unsafe impl Sync for GpuLatestFrame {}
 
 /// `future_frames` キューの最大長。channel(8) と同じ値。
 /// 1080p RGBA で 8 * ~8MB = 64MB。decoder pacing とチャネル背圧で実質
@@ -110,6 +135,8 @@ impl VideoPlayer {
                 last_seen_seek_serial: 0,
                 loop_enabled: AtomicBool::new(false),
                 seek_inflight_since: None,
+                #[cfg(windows)]
+                gpu_latest: None,
             };
         }
 
@@ -171,6 +198,8 @@ impl VideoPlayer {
             last_seen_seek_serial: 0,
             loop_enabled: AtomicBool::new(false),
             seek_inflight_since: None,
+            #[cfg(windows)]
+            gpu_latest: None,
         }
     }
 
@@ -434,19 +463,32 @@ impl VideoPlayer {
         let mut upload_ms: f64 = 0.0;
         if let Some(frame) = latest_renderable {
             let pts_for_log = frame.pts_secs;
-            // GPU フレームの描画は別経路 (egui_wgpu::CallbackTrait) を後から実装する。
-            // 現状はまだ統合途中なので、CPU フレームのみ ColorImage 経路で表示する。
+            // GPU フレームは `gpu_latest` に **所有権ごと** 引き取り、UI は handle を
+            // view で参照する。これで前フレームの HANDLE が次フレーム到着まで保持され、
+            // 描画中に CloseHandle される race を防ぐ。
+            #[cfg(windows)]
+            if matches!(frame.data, decoder::VideoFrameData::Gpu(_)) {
+                let pts = frame.pts_secs;
+                let serial = frame.seek_serial;
+                if let decoder::VideoFrameData::Gpu(d3d) = frame.data {
+                    self.gpu_latest = Some(d3d);
+                }
+                if clock::pts_clears_seek_override(pts, self.clock.now_secs()) {
+                    if self.clock.is_audio_active() {
+                        self.clock.set_audio_pts(pts);
+                    } else {
+                        self.clock.set_fallback_anchor(pts);
+                    }
+                    self.clock.clear_seek_target_override(serial);
+                }
+                let _ = pts_for_log;
+                return next_due;
+            }
+
             let cpu_bytes = match &frame.data {
                 decoder::VideoFrameData::Cpu(b) => b.as_slice(),
                 #[cfg(windows)]
-                decoder::VideoFrameData::Gpu(_) => {
-                    // TODO: GPU 経路の描画統合まで一時的に skip
-                    crate::logger::log(
-                        "VideoPlayer::tick: GPU frame received but render path not wired yet"
-                            .to_string(),
-                    );
-                    return next_due;
-                }
+                decoder::VideoFrameData::Gpu(_) => unreachable!("handled above"),
             };
             let color = ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
@@ -535,6 +577,20 @@ impl VideoPlayer {
 
     pub fn texture(&self) -> Option<&TextureHandle> {
         self.texture.as_ref()
+    }
+
+    /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。
+    /// Some なら UI は `egui::PaintCallback` 経由で `VideoPaintCallback` を発行する。
+    /// HANDLE の寿命は本構造体内の `D3d11Frame` が保証する (= 次フレームに置換される
+    /// まで close されない)。
+    #[cfg(windows)]
+    pub fn gpu_latest(&self) -> Option<GpuLatestFrame> {
+        self.gpu_latest.as_ref().map(|d| GpuLatestFrame {
+            shared_handle: d.shared_handle,
+            width: d.width,
+            height: d.height,
+            ten_bit: false,
+        })
     }
 
     /// Drop 前に明示的に呼ぶと、AudioOutput の停止 (cpal Stream pause/drop +

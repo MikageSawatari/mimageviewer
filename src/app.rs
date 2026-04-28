@@ -9361,11 +9361,14 @@ impl App {
                     autoplay,
                     resume,
                     self.settings.video_hw_decode,
-                    // ⚠️ TODO: 現状は egui_wgpu Callback での GPU フレーム描画が
-                    // 未実装なので、ここに `self.gpu_video_device.clone()` を渡すと
-                    // 動画が表示されなくなる。レンダリング層完成後に有効化する。
+                    // GPU レンダリングが利用可能なら渡す。HW デコード OFF の場合や
+                    // GpuVideoDevice 作成失敗時は None で旧経路 (CPU readback)。
                     #[cfg(windows)]
-                    None,
+                    if self.settings.video_hw_decode {
+                        self.gpu_video_device.clone()
+                    } else {
+                        None
+                    },
                 );
                 if self.settings.video_start_muted {
                     player.set_muted(true);

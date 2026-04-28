@@ -623,6 +623,11 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
+    /// 動画 GPU レンダリングで描画する最新フレーム情報 (Windows のみ)。
+    /// `Some` のとき draw_fs_image は通常 texture 描画ではなく
+    /// `egui_wgpu::Callback` 経由で fullscreen quad を描画する。
+    #[cfg(windows)]
+    gpu_video_frame: Option<crate::video::GpuLatestFrame>,
 }
 
 /// フルスクリーンのキー入力結果。
@@ -891,6 +896,8 @@ impl App {
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),
                                         state.is_video, state.fs_load_failed, fs_rotation, zp,
                                         free_rot, &bg_style, &state.location_display,
+                                        #[cfg(windows)]
+                                        state.gpu_video_frame,
                                     );
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
@@ -1324,6 +1331,12 @@ impl App {
             _ => None,
         };
 
+        #[cfg(windows)]
+        let gpu_video_frame = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.gpu_latest(),
+            _ => None,
+        };
+
         FsFrameState {
             is_video,
             separator_text,
@@ -1337,6 +1350,8 @@ impl App {
             is_loading,
             fs_load_failed,
             pdf_content_type,
+            #[cfg(windows)]
+            gpu_video_frame,
         }
     }
 
@@ -2527,7 +2542,40 @@ impl App {
         // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
         // 空ならラベル描画をスキップ。
         location_display: &str,
+        #[cfg(windows)] gpu_video_frame: Option<crate::video::GpuLatestFrame>,
     ) {
+        // GPU 経路: D3D11 共有テクスチャを wgpu に import して fullscreen quad で描画。
+        #[cfg(windows)]
+        if let Some(g) = gpu_video_frame {
+            // アスペクト比維持で full_rect 内に収める。
+            let aspect = g.width as f32 / (g.height as f32).max(1.0);
+            let avail_aspect = full_rect.width() / full_rect.height().max(1.0);
+            let img_rect = if aspect > avail_aspect {
+                let h = full_rect.width() / aspect;
+                egui::Rect::from_center_size(
+                    full_rect.center(),
+                    egui::vec2(full_rect.width(), h),
+                )
+            } else {
+                let w = full_rect.height() * aspect;
+                egui::Rect::from_center_size(
+                    full_rect.center(),
+                    egui::vec2(w, full_rect.height()),
+                )
+            };
+            let cb = egui_wgpu::Callback::new_paint_callback(
+                img_rect,
+                crate::video::gpu_renderer::VideoPaintCallback::new(
+                    g.shared_handle,
+                    g.width,
+                    g.height,
+                    g.ten_bit,
+                ),
+            );
+            ui.painter().add(cb);
+            return;
+        }
+
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
