@@ -22,6 +22,8 @@ pub(crate) enum PreferencesPage {
     Parallelism,
     Prefetch,
     GpuMemory,
+    /// AI 推論バックエンド (DirectML / TensorRT) の選択と TRT pack 管理
+    AiBackend,
     Cache,
     Folder,
     DuplicateFiles,
@@ -48,6 +50,7 @@ impl PreferencesPage {
             Self::Parallelism => "並列読み込み",
             Self::Prefetch => "先読み",
             Self::GpuMemory => "GPUメモリ",
+            Self::AiBackend => "AI バックエンド",
             Self::Cache => "キャッシュ",
             Self::Folder => "フォルダ",
             Self::DuplicateFiles => "同名ファイル",
@@ -90,6 +93,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::Parallelism,
             PreferencesPage::Prefetch,
             PreferencesPage::GpuMemory,
+            PreferencesPage::AiBackend,
         ],
     },
     TreeCategory {
@@ -167,10 +171,28 @@ pub(crate) struct PreferencesState {
     // 初回に1度だけ取得するキャッシュ値
     pub auto_thread_count: usize,
     pub vram_mib: Option<u64>,
+
+    // ── AI バックエンド ページ用のキャッシュ ────────────────────
+    /// プライマリ GPU のベンダー (NVIDIA でなければ TRT は disabled に)
+    pub gpu_vendor: Option<crate::gpu_info::GpuVendor>,
+    /// 現プロセスの AiRuntime が実際にロードしているバックエンド
+    /// (None = AI ランタイム未初期化、Settings 変更時に「再起動が必要」検知に使う)
+    pub current_runtime_backend: Option<crate::ai::AiBackend>,
+    /// 起動時にフォールバックが起きた場合の理由 (UI バナー表示用)
+    pub current_runtime_fallback_reason: Option<String>,
+    /// TRT pack インストール済みか
+    pub trt_pack_installed: bool,
+    /// TRT pack の総ディスク使用量 (MiB)
+    pub trt_pack_size_mib: u64,
+    /// TRT engine cache の総ディスク使用量 (MiB)
+    pub trt_engine_cache_size_mib: u64,
 }
 
 impl PreferencesState {
-    fn from_settings(s: &Settings) -> Self {
+    pub(crate) fn from_settings(
+        s: &Settings,
+        ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
+    ) -> Self {
         let manual_threads = match &s.parallelism {
             Parallelism::Manual(n) => *n,
             Parallelism::Auto => s.parallelism.thread_count(),
@@ -187,6 +209,25 @@ impl PreferencesState {
                 expanded.insert(cat.label);
             }
         }
+
+        // AI バックエンドページ用の情報を 1 回だけ取得 (環境設定ダイアログを開いた時点)
+        let gpu_vendor = crate::gpu_info::query_primary_gpu_vendor();
+        let (current_runtime_backend, current_runtime_fallback_reason) = match ai_runtime {
+            Some(rt) => {
+                let active = rt.active_backend();
+                (Some(active.effective), active.fallback_reason.clone())
+            }
+            None => (None, None),
+        };
+        let trt_pack_installed = crate::ai::tensorrt_pack::is_pack_installed();
+        let trt_pack_size_mib = if trt_pack_installed {
+            dir_size_bytes(&crate::ai::tensorrt_pack::pack_dir()) / (1024 * 1024)
+        } else {
+            0
+        };
+        let trt_engine_cache_size_mib =
+            dir_size_bytes(&crate::ai::tensorrt_pack::engine_cache_dir()) / (1024 * 1024);
+
         Self {
             settings: s.clone(),
             selected: PreferencesPage::Thumbnail,
@@ -197,8 +238,35 @@ impl PreferencesState {
             exif_scroll_to_added: None,
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
+            gpu_vendor,
+            current_runtime_backend,
+            current_runtime_fallback_reason,
+            trt_pack_installed,
+            trt_pack_size_mib,
+            trt_engine_cache_size_mib,
         }
     }
+}
+
+/// 指定ディレクトリ配下のファイル合計サイズを返す。エラーや不在は 0。
+/// AI バックエンドページの "X MiB を解放" 表示等で使う。
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    fn walk(p: &std::path::Path) -> u64 {
+        let Ok(meta) = std::fs::metadata(p) else {
+            return 0;
+        };
+        if meta.is_file() {
+            return meta.len();
+        }
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                total = total.saturating_add(walk(&e.path()));
+            }
+        }
+        total
+    }
+    walk(dir)
 }
 
 // ── メインダイアログ ────────────────────────────────────────────
@@ -211,7 +279,10 @@ impl App {
 
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
-            self.pref_state = Some(PreferencesState::from_settings(&self.settings));
+            self.pref_state = Some(PreferencesState::from_settings(
+                &self.settings,
+                self.ai_runtime.as_deref(),
+            ));
         }
 
         let mut open = true;
@@ -441,6 +512,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Parallelism => page_parallelism(ui, state),
         PreferencesPage::Prefetch => page_prefetch(ui, state),
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),
+        PreferencesPage::AiBackend => page_ai_backend(ui, state),
         PreferencesPage::Cache => page_cache(ui, state),
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
@@ -763,6 +835,172 @@ fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
         )
     };
     ui.label(text);
+}
+
+/// AI 推論バックエンド (DirectML / TensorRT) の選択ページ。
+///
+/// バックエンドの実切替は ort::init_from() の制約上アプリ再起動が必要なので、
+/// このページでの設定変更は次回起動時に反映される。現プロセスでロード済みの
+/// バックエンドと選択値が異なる場合は「再起動が必要」バナーを表示する。
+fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::ai::AiBackend;
+    use crate::gpu_info::GpuVendor;
+
+    ui.label(egui::RichText::new("AI 推論バックエンド").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "AI アップスケール / ノイズ除去 / 消しゴム機能で使う実行環境を選択します。\n\
+         TensorRT は NVIDIA GPU 専用ですが、DirectML より大幅に高速 \
+         (アップスケール 1.4-3.4x、ノイズ除去 約 4.5x)。",
+    );
+    ui.add_space(8.0);
+
+    // 検出 GPU の表示
+    let vendor_label = match state.gpu_vendor {
+        Some(GpuVendor::Nvidia) => "NVIDIA (TensorRT 利用可能)",
+        Some(GpuVendor::Amd) => "AMD (DirectML のみ)",
+        Some(GpuVendor::Intel) => "Intel (DirectML のみ)",
+        Some(GpuVendor::Other(_)) => "その他 (DirectML のみ)",
+        None => "GPU 検出失敗 (DirectML のみ)",
+    };
+    ui.label(format!("検出 GPU: {vendor_label}"));
+    ui.add_space(8.0);
+
+    // 起動時にフォールバックが起きた場合のバナー
+    if let Some(reason) = &state.current_runtime_fallback_reason {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 50),
+            format!("⚠ {reason}"),
+        );
+        ui.add_space(8.0);
+    }
+
+    // バックエンド選択
+    let nvidia = matches!(state.gpu_vendor, Some(GpuVendor::Nvidia));
+    let current_choice = state
+        .settings
+        .ai_backend
+        .as_deref()
+        .and_then(AiBackend::from_str)
+        .unwrap_or_default();
+
+    ui.label("バックエンド:");
+    let mut new_choice = current_choice;
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut new_choice, AiBackend::DirectMl, "DirectML (デフォルト)");
+        let trt_resp =
+            ui.add_enabled(nvidia, egui::RadioButton::new(new_choice == AiBackend::TensorRt, "TensorRT"));
+        if trt_resp.clicked() && nvidia {
+            new_choice = AiBackend::TensorRt;
+        }
+        if !nvidia {
+            trt_resp.on_hover_text("NVIDIA GPU が検出されていません");
+        }
+    });
+    if new_choice != current_choice {
+        state.settings.ai_backend = Some(new_choice.as_str().to_string());
+    }
+    ui.add_space(8.0);
+
+    // 「再起動が必要」インジケータ
+    if let Some(running) = state.current_runtime_backend
+        && running != new_choice
+    {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 50),
+            format!(
+                "ℹ バックエンド変更を反映するにはアプリの再起動が必要です \
+                 (現プロセスは {} で動作中)",
+                match running {
+                    AiBackend::DirectMl => "DirectML",
+                    AiBackend::TensorRt => "TensorRT",
+                    AiBackend::Cpu => "CPU",
+                }
+            ),
+        );
+        ui.add_space(8.0);
+    }
+
+    // TensorRT 詳細
+    if new_choice == AiBackend::TensorRt {
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("TensorRT 設定").strong());
+        ui.add_space(4.0);
+
+        if !state.trt_pack_installed {
+            // pack 未インストール
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 100, 100),
+                "❌ TensorRT パックが未インストールです",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                "現在は手動セットアップが必要です。PowerShell で以下を実行してください:\n\
+                 (約 6.8 GB の DLL が NVIDIA / Microsoft 公式 URL からダウンロードされます)",
+            );
+            ui.add_space(4.0);
+            ui.code("scripts\\setup-tensorrt-pack.ps1");
+            ui.add_space(8.0);
+            ui.label(
+                "セットアップ後にこの画面を再度開くとパック情報が表示されます。\n\
+                 (将来のバージョンではアプリ内ダウンロード機能を提供予定)",
+            );
+        } else {
+            // pack インストール済み
+            ui.colored_label(
+                egui::Color32::from_rgb(100, 200, 100),
+                format!("✓ パック展開済み ({} MiB)", state.trt_pack_size_mib),
+            );
+            ui.add_space(8.0);
+
+            // FP16 トグル
+            ui.checkbox(
+                &mut state.settings.ai_tensorrt_fp16,
+                "FP16 推論を有効にする (推奨、1.5-2x 高速、画質ほぼ同等)",
+            );
+            ui.add_space(8.0);
+
+            // エンジンキャッシュ管理
+            ui.label(format!(
+                "エンジンキャッシュ: {} MiB",
+                state.trt_engine_cache_size_mib
+            ));
+            ui.label(
+                egui::RichText::new(
+                    "(各モデルを初回 AI 機能利用時にコンパイルしたものをキャッシュ。\n\
+                     ドライバ更新後等にエラーが出る場合は削除して再ビルドしてください)",
+                )
+                .small(),
+            );
+            ui.add_space(4.0);
+            if ui
+                .button("エンジンキャッシュを削除")
+                .clicked()
+            {
+                let dir = crate::ai::tensorrt_pack::engine_cache_dir();
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {
+                        state.trt_engine_cache_size_mib = 0;
+                        crate::logger::log(format!(
+                            "[AI] エンジンキャッシュを削除しました: {}",
+                            dir.display()
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        state.trt_engine_cache_size_mib = 0;
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "[AI] エンジンキャッシュ削除に失敗: {} ({})",
+                            dir.display(),
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
