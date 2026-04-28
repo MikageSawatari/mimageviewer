@@ -24,6 +24,7 @@ pub mod audio;
 pub mod clock;
 pub mod decoder;
 pub mod ffmpeg_loader;
+pub mod thumbnail;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoInfo};
+use thumbnail::{Thumbnail, ThumbnailWorker};
 
 pub struct VideoPlayer {
     path: PathBuf,
@@ -49,6 +51,8 @@ pub struct VideoPlayer {
     last_displayed_pts: f64,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
     error: Option<String>,
+    /// シーク先サムネ抽出ワーカー。Drop で停止する。
+    thumb_worker: Option<ThumbnailWorker>,
 }
 
 impl VideoPlayer {
@@ -70,6 +74,7 @@ impl VideoPlayer {
                 texture: None,
                 last_displayed_pts: 0.0,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
+                thumb_worker: None,
             };
         }
 
@@ -99,6 +104,9 @@ impl VideoPlayer {
 
         clock.set_playing(autoplay);
 
+        // シーク先サムネ抽出ワーカー (失敗してもメイン再生は続行)
+        let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));
+
         Self {
             path,
             clock,
@@ -113,7 +121,20 @@ impl VideoPlayer {
             texture: None,
             last_displayed_pts: 0.0,
             error: None,
+            thumb_worker,
         }
+    }
+
+    /// シークホバー位置のサムネを要求する。debounce はワーカー側 (drain) で実施。
+    pub fn request_seek_thumbnail(&self, target_secs: f64) {
+        if let Some(w) = &self.thumb_worker {
+            w.request(target_secs);
+        }
+    }
+
+    /// 直近キャッシュから target_secs に最も近いサムネを取り出す。
+    pub fn nearest_seek_thumbnail(&self, target_secs: f64) -> Option<Thumbnail> {
+        self.thumb_worker.as_ref().and_then(|w| w.nearest(target_secs))
     }
 
     pub fn path(&self) -> &PathBuf {

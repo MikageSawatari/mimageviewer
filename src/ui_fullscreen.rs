@@ -4500,6 +4500,53 @@ impl App {
 // ===========================================================================
 
 impl App {
+    /// シーク先サムネを GPU テクスチャに反映 (in-place set。bucket key 単位で更新)。
+    /// 戻り値は描画に使う `egui::TextureId`。
+    fn upload_seek_thumb_texture(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        thumb: &crate::video::thumbnail::Thumbnail,
+    ) -> egui::TextureId {
+        // bucket key: target_secs / 0.5s 単位の整数。同じ key なら upload skip。
+        let key = (thumb.target_secs / 0.5).round() as i64;
+        let need_recreate = match &self.video_seek_thumb_tex {
+            Some((idx, _, _)) if *idx != fs_idx => true,
+            None => true,
+            _ => false,
+        };
+        let need_set = match &self.video_seek_thumb_tex {
+            Some((_, k, _)) if *k == key && !need_recreate => false,
+            _ => true,
+        };
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [thumb.width as usize, thumb.height as usize],
+            &thumb.rgba,
+        );
+        if need_recreate {
+            let label = format!("video_seek_thumb:{fs_idx}");
+            let tex = ctx.load_texture(label, color, egui::TextureOptions::LINEAR);
+            let id = tex.id();
+            self.video_seek_thumb_tex = Some((fs_idx, key, tex));
+            id
+        } else {
+            if let Some((_, k, tex)) = self.video_seek_thumb_tex.as_mut() {
+                if need_set {
+                    tex.set(color, egui::TextureOptions::LINEAR);
+                    *k = key;
+                }
+                tex.id()
+            } else {
+                // 到達不可だが安全な fallback
+                let label = format!("video_seek_thumb:{fs_idx}");
+                let tex = ctx.load_texture(label, color, egui::TextureOptions::LINEAR);
+                let id = tex.id();
+                self.video_seek_thumb_tex = Some((fs_idx, key, tex));
+                id
+            }
+        }
+    }
+
     /// 現在 `fs_idx` のキャッシュエントリが動画なら `&VideoPlayer` を返す。
     /// HUD 各ウィジェットの click handler / 上位の toggle_play で使う。
     pub(crate) fn fs_video_player(&self, fs_idx: usize) -> Option<&crate::video::VideoPlayer> {
@@ -4802,7 +4849,7 @@ impl App {
             if seek_resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
-            // hover プレビュー: 縦線 + 時刻ラベル
+            // hover プレビュー: 縦線 + サムネ画像 + 時刻ラベル
             if seek_resp.hovered()
                 && duration > 0.0
                 && let Some(hp) = ui.ctx().input(|i| i.pointer.hover_pos())
@@ -4816,14 +4863,70 @@ impl App {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 120)),
                 );
                 let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0) as f64;
-                let label = format_secs(frac * duration);
-                let galley = painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
+                let target = frac * duration;
+
+                // サムネ要求 (毎フレーム呼んで OK、worker 側で drain + LRU)
+                if let Some(p) = self.fs_video_player(fs_idx) {
+                    p.request_seek_thumbnail(target);
+                }
+
+                // 直近キャッシュからサムネ取得 → GPU テクスチャに反映 → 描画
+                let thumb_opt = self.fs_video_player(fs_idx)
+                    .and_then(|p| p.nearest_seek_thumbnail(target));
+                let thumb_drawn = if let Some(thumb) = thumb_opt.as_ref() {
+                    let tex_id = self.upload_seek_thumb_texture(ui.ctx(), fs_idx, thumb);
+                    let thumb_w = thumb.width as f32;
+                    let thumb_h = thumb.height as f32;
+                    let thumb_x = (x - thumb_w / 2.0)
+                        .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - thumb_w - 2.0);
+                    let thumb_y = hud_rect.min.y - thumb_h - 8.0;
+                    let thumb_rect = egui::Rect::from_min_size(
+                        egui::pos2(thumb_x, thumb_y),
+                        egui::vec2(thumb_w, thumb_h),
+                    );
+                    // 黒背景 (枠 + うっすら内側 padding) + 画像 + 白枠
+                    painter.rect_filled(
+                        thumb_rect.expand(2.0),
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                    );
+                    painter.image(
+                        tex_id,
+                        thumb_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    painter.rect_stroke(
+                        thumb_rect,
+                        2.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                        egui::StrokeKind::Inside,
+                    );
+                    Some(thumb_rect)
+                } else {
+                    None
+                };
+
+                // 時刻ラベル: サムネがあればその下端、なければ HUD 上端の少し上
+                let label = format_secs(target);
+                let galley =
+                    painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
                 let label_size = galley.size();
-                let label_pos = egui::pos2(
-                    (x - label_size.x / 2.0)
-                        .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - label_size.x - 2.0),
-                    hud_rect.min.y - label_size.y - 6.0,
-                );
+                let label_pos = if let Some(thumb_rect) = thumb_drawn {
+                    egui::pos2(
+                        (x - label_size.x / 2.0).clamp(
+                            thumb_rect.min.x,
+                            thumb_rect.max.x - label_size.x,
+                        ),
+                        thumb_rect.max.y - label_size.y - 4.0,
+                    )
+                } else {
+                    egui::pos2(
+                        (x - label_size.x / 2.0)
+                            .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - label_size.x - 2.0),
+                        hud_rect.min.y - label_size.y - 6.0,
+                    )
+                };
                 let bg = egui::Rect::from_min_size(label_pos, label_size).expand(4.0);
                 painter.rect_filled(
                     bg,

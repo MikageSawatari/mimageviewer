@@ -2001,6 +2001,11 @@ pub struct App {
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
 
+    /// 動画シークホバー時のサムネ表示用テクスチャ。1 動画につき 1 つだけ持ち、
+    /// hover 中の target_secs key が変わるたびに `set()` で in-place 更新する。
+    /// (fs_idx, bucket_key, TextureHandle) — fs_idx 切替時に再作成。
+    pub(crate) video_seek_thumb_tex: Option<(usize, i64, egui::TextureHandle)>,
+
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
     pub(crate) sidecars: std::collections::HashMap<std::path::PathBuf, crate::sidecar::SidecarFile>,
@@ -2423,6 +2428,7 @@ impl Default for App {
             frame_counter: 0,
             perf_last_flush: None,
             fs_painted_last: None,
+            video_seek_thumb_tex: None,
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,
             window_visible: true,
