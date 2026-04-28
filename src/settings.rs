@@ -795,6 +795,11 @@ pub struct Settings {
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
+    /// ハードウェアデコードを利用するか (Windows D3D11VA)。失敗時は自動的に SW にフォールバック。
+    /// 初期は OFF (安定優先)。HEVC / 4K 動画の CPU 負荷を大きく下げるため、動作確認後に
+    /// 有効化することを想定。
+    #[serde(default)]
+    pub video_hw_decode: bool,
 }
 
 fn default_video_volume() -> f64 {
@@ -1011,6 +1016,7 @@ impl Default for Settings {
             video_loop: false,
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
+            video_hw_decode: false,
         }
     }
 }

@@ -9323,11 +9323,10 @@ impl App {
                 }
             }
             if !self.fs_cache.contains_key(&idx) {
-                let vol = if self.settings.video_start_muted {
-                    0.0
-                } else {
-                    self.settings.video_volume
-                };
+                // start_muted の場合も volume はそのままにし、Player 内 atomic で
+                // ミュートだけ切る (= 解除時に元の音量に戻る)。0.0 を渡してしまうと
+                // 「ミュート解除しても音が出ない」状態になり Codex に指摘された。
+                let vol = self.settings.video_volume;
                 let autoplay = self.settings.video_autoplay;
                 // resume 位置の取得: 直近に保存した位置を渡して最初の info 受領後に
                 // 自動シークさせる。Windows の case-insensitive パスを揃えるため
@@ -9338,7 +9337,13 @@ impl App {
                     .video_resume_positions
                     .get(&path_key)
                     .copied();
-                let player = crate::video::VideoPlayer::open(vp, vol, autoplay, resume);
+                let player = crate::video::VideoPlayer::open(
+                    vp,
+                    vol,
+                    autoplay,
+                    resume,
+                    self.settings.video_hw_decode,
+                );
                 if self.settings.video_start_muted {
                     player.set_muted(true);
                 }
@@ -11687,8 +11692,10 @@ impl App {
             .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
             .unwrap_or(true);
         let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        let loop_enabled = self.settings.video_loop;
         for entry in self.fs_cache.values_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
+                player.set_loop_enabled(loop_enabled);
                 if let Some(d) = player.tick(ctx) {
                     next_repaint = Some(match next_repaint {
                         Some(prev) => prev.min(d),

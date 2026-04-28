@@ -36,6 +36,8 @@ pub(crate) enum PreferencesPage {
     Rating,
     /// 起動時 / 定期的なバージョン更新確認
     UpdateCheck,
+    /// 動画再生 (HW デコード等)
+    Video,
 }
 
 impl PreferencesPage {
@@ -58,6 +60,7 @@ impl PreferencesPage {
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
             Self::UpdateCheck => "更新確認",
+            Self::Video => "動画再生",
         }
     }
 }
@@ -142,6 +145,12 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "更新確認",
         page: Some(PreferencesPage::UpdateCheck),
+        children: &[],
+    },
+    // 動画再生 (HW デコード等)
+    TreeCategory {
+        label: "動画再生",
+        page: Some(PreferencesPage::Video),
         children: &[],
     },
 ];
@@ -451,6 +460,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
         PreferencesPage::UpdateCheck => page_update_check(ui, state),
+        PreferencesPage::Video => page_video(ui, state),
     }
 }
 
@@ -1030,6 +1040,70 @@ fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     if ui.button("リリース履歴を開く").clicked() {
         crate::ui_helpers::open_url(crate::update_check::releases_page_url());
+    }
+}
+
+fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.label(
+        egui::RichText::new("ハードウェアデコード").strong(),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        "GPU の動画デコード機能 (Direct3D 11) を使って HEVC / 4K 動画の CPU 負荷を下げます。\n\
+         ドライバ非対応や初期化失敗の場合は自動的に CPU デコードに切り替わります。",
+    );
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut s.video_hw_decode,
+        "ハードウェアデコードを有効にする",
+    )
+    .on_hover_text(
+        "ON: 対応コーデックは GPU でデコード (失敗時は CPU に自動フォールバック)。\n\
+         OFF (既定): 常に CPU でデコード。\n\
+         切り替え後は次に開く動画から反映されます。",
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("再生").strong());
+    ui.add_space(4.0);
+    ui.checkbox(&mut s.video_autoplay, "フルスクリーン化と同時に自動再生")
+        .on_hover_text(
+            "OFF にすると最初のフレームで停止表示になり、Space で再生開始。",
+        );
+    ui.checkbox(&mut s.video_loop, "終端まで再生したら最初から繰り返す");
+    ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");
+
+    ui.add_space(8.0);
+    let mut vol_pct = (s.video_volume * 100.0).round() as i32;
+    if ui
+        .add(
+            egui::Slider::new(&mut vol_pct, 0..=100)
+                .text("既定音量 (%)")
+                .clamping(egui::SliderClamping::Always),
+        )
+        .changed()
+    {
+        s.video_volume = (vol_pct as f64 / 100.0).clamp(0.0, 1.0);
+    }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("再生位置の記憶").strong());
+    ui.add_space(4.0);
+    let count = s.video_resume_positions.len();
+    ui.label(format!(
+        "現在 {count} 件の動画について再生位置を記憶しています。\n\
+         3 秒以上再生・かつ末尾 5 秒以内に到達していない場合のみ保存されます。"
+    ));
+    if count > 0 && ui.button("すべての再生位置をクリア").clicked() {
+        s.video_resume_positions.clear();
     }
 }
 

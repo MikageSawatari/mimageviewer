@@ -72,11 +72,16 @@ pub struct DecodeHandles {
 ///
 /// `target_audio_sample_rate` は音声出力デバイスのサンプルレート (cpal 側で決定)。
 /// 通常 48000。
+///
+/// `hw_decode` が true なら D3D11VA HW デコードを試行する。コーデック非対応 / デバイス
+/// 初期化失敗 / get_format で SW 形式が返った場合は **黙って SW にフォールバック**
+/// する (perf log の `video.open.decode_path` で実際の経路を確認可能)。
 pub fn spawn(
     path: PathBuf,
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
+    hw_decode: bool,
 ) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
@@ -94,6 +99,7 @@ pub fn spawn(
                 clock,
                 cancel,
                 target_audio_sample_rate,
+                hw_decode,
                 video_tx,
                 audio_tx,
                 info_tx,
@@ -113,6 +119,7 @@ fn run_decoder(
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
+    hw_decode_requested: bool,
     video_tx: Sender<VideoFrame>,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
@@ -157,45 +164,80 @@ fn run_decoder(
         if d == 0 { 0.0 } else { r.numerator() as f64 / d as f64 }
     };
 
-    let video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params) {
+    let mut video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params) {
         Ok(c) => c,
         Err(e) => {
             let _ = info_tx.send(Err(format!("video codec context: {e}")));
             return;
         }
     };
+
+    // ── HW デコード初期化 (D3D11VA) ──
+    // 失敗時は黙って SW デコードに落ちる。`hw_device` を _hw_device で持って Drop 時に
+    // unref されるようにし、AVCodecContext は内部でさらに ref を取るので競合しない。
+    let codec_id = video_decoder_ctx.id();
+    let hw_setup_result: Option<HwDevice> = if hw_decode_requested {
+        try_init_d3d11va(codec_id, &mut video_decoder_ctx)
+    } else {
+        None
+    };
+    let hw_active_initially = hw_setup_result.is_some();
+    // hw_device 自身は AVCodecContext が内部で av_buffer_ref しているので、ここで保持
+    // し続ける必要は厳密には無い。ただし decoder open 失敗時 (= 我々が unref しない
+    // と即時リーク) を考えてスレッド終了まで保持する。
+    let _hw_device = hw_setup_result;
+
     let mut video_decoder = match video_decoder_ctx.decoder().video() {
         Ok(d) => d,
         Err(e) => {
-            let _ = info_tx.send(Err(format!("video decoder open: {e}")));
-            return;
+            // HW 有効で open 失敗 → SW で再試行
+            if hw_active_initially {
+                crate::logger::log(format!(
+                    "HW decoder open failed ({e}), retrying with SW"
+                ));
+                let retry_ctx = match ffmpeg::codec::context::Context::from_parameters(
+                    input.streams().best(MediaType::Video).unwrap().parameters(),
+                ) {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        let _ = info_tx.send(Err(format!("video codec context (retry): {e2}")));
+                        return;
+                    }
+                };
+                drop(_hw_device);
+                match retry_ctx.decoder().video() {
+                    Ok(d) => d,
+                    Err(e2) => {
+                        let _ = info_tx.send(Err(format!("video decoder open (SW retry): {e2}")));
+                        return;
+                    }
+                }
+            } else {
+                let _ = info_tx.send(Err(format!("video decoder open: {e}")));
+                return;
+            }
         }
     };
     let src_w = video_decoder.width();
     let src_h = video_decoder.height();
-    let src_fmt = video_decoder.format();
 
     // 出力サイズは GPU テクスチャ上限に合わせて縮める
     let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
     let (dst_w, dst_h) = clamp_dims(src_w, src_h, max_dim);
 
-    // BGRA で受け取り (egui::ColorImage は RGBA だが BGR↔RGB は UI 側でも吸収できる)。
-    // ここでは安定優先で RGBA に変換する。
-    let mut scaler = match ScaleContext::get(
-        src_fmt,
-        src_w,
-        src_h,
-        Pixel::RGBA,
-        dst_w,
-        dst_h,
-        ScaleFlags::BILINEAR,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = info_tx.send(Err(format!("sws_scale init: {e}")));
-            return;
-        }
-    };
+    // **scaler は lazy 構築**。
+    // HW デコード時は `frame.format()` が `AV_PIX_FMT_D3D11` で、av_hwframe_transfer_data
+    // で SW 取り出した結果は通常 NV12 (10-bit HEVC なら P010)。SW デコードでも `format()`
+    // は decoder の出力フォーマットに依存する (yuv420p / yuvj420p / 等)。最初の 1 フレームを
+    // 受け取った時点の **実際の入力フォーマット + 寸法** で初期化する。
+    // (key に width/height を含めるのは、HW のサーフェス内部寸法と display 寸法が
+    // 異なる場合や mid-stream で resolution change が起きた場合に
+    // ScaleContext::run が `InputChanged` で全 frame skip に陥るのを防ぐため。)
+    let mut scaler: Option<ScaleContext> = None;
+    let mut scaler_key: Option<(Pixel, u32, u32)> = None;
+    // 1 フレーム目で実際の format を perf に出力する (HW 期待で SW にフォールバックした
+    // ケースを `decode_path` から判別するため)。
+    let mut first_frame_logged = false;
 
     // ── 音声ストリーム選択 (任意) ──
     let audio_setup = match input.streams().best(MediaType::Audio) {
@@ -272,7 +314,8 @@ fn run_decoder(
 
     // perf: 動画特性を 1 行に記録 (解析時の最初の手がかり)。
     if crate::perf::is_enabled() {
-        let pix_fmt = format!("{:?}", src_fmt);
+        let pix_fmt = format!("{:?}", video_decoder.format());
+        let decode_path = if hw_active_initially { "hw_d3d11va" } else { "sw" };
         let file_name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -297,6 +340,7 @@ fn run_decoder(
                 ("dst_w", serde_json::Value::from(dst_w as i64)),
                 ("dst_h", serde_json::Value::from(dst_h as i64)),
                 ("pix_fmt", serde_json::Value::from(pix_fmt)),
+                ("decode_path", serde_json::Value::from(decode_path)),
                 ("video_codec", serde_json::Value::from(video_codec_name)),
                 ("avg_fps", serde_json::Value::from(video_avg_fps)),
                 ("duration_secs", serde_json::Value::from(duration_secs)),
@@ -421,11 +465,86 @@ fn run_decoder(
                             // 音声側はまだ trim 必要なので drop_before_secs はそのまま残す
                         }
                     }
+
+                    // HW デコードの場合、`frame.format()` は `AV_PIX_FMT_D3D11`。
+                    // av_hwframe_transfer_data で GPU → CPU メモリに NV12 (10-bit なら P010)
+                    // として落とし、その SW フレームを scaler に食わせる。
+                    // get_format で SW にフォールバックされていれば format() は SW pix_fmt
+                    // を返すのでこの分岐に入らない。
+                    let mut sw_owned: Option<Video> = None;
+                    let frame_for_scaler: &Video = {
+                        let fmt = frame.format();
+                        if matches!(fmt, Pixel::D3D11) {
+                            let mut sw = Video::empty();
+                            unsafe {
+                                use ffmpeg_the_third::ffi::av_hwframe_transfer_data;
+                                let ret = av_hwframe_transfer_data(
+                                    sw.as_mut_ptr(),
+                                    frame.as_ptr(),
+                                    0,
+                                );
+                                if ret < 0 {
+                                    crate::logger::log(format!(
+                                        "av_hwframe_transfer_data failed: {ret}"
+                                    ));
+                                    continue;
+                                }
+                            }
+                            sw_owned = Some(sw);
+                            sw_owned.as_ref().unwrap()
+                        } else {
+                            &frame
+                        }
+                    };
+
+                    // scaler の lazy 構築 / 入力 (フォーマット|寸法) 変化時の再構築。
+                    let cur_fmt = frame_for_scaler.format();
+                    let cur_w = frame_for_scaler.width();
+                    let cur_h = frame_for_scaler.height();
+                    let cur_key = (cur_fmt, cur_w, cur_h);
+                    if !first_frame_logged && crate::perf::is_enabled() {
+                        let actual_path = if matches!(frame.format(), Pixel::D3D11) {
+                            "hw_d3d11va"
+                        } else if hw_active_initially {
+                            "sw_fallback_after_hw_init"
+                        } else {
+                            "sw"
+                        };
+                        crate::perf::event(
+                            "video",
+                            "first_frame",
+                            None,
+                            0,
+                            &[
+                                ("decode_path", serde_json::Value::from(actual_path)),
+                                ("frame_pix_fmt", serde_json::Value::from(format!("{cur_fmt:?}"))),
+                                ("frame_w", serde_json::Value::from(cur_w as i64)),
+                                ("frame_h", serde_json::Value::from(cur_h as i64)),
+                            ],
+                        );
+                        first_frame_logged = true;
+                    }
+                    if scaler.is_none() || scaler_key != Some(cur_key) {
+                        match ScaleContext::get(
+                            cur_fmt, cur_w, cur_h, Pixel::RGBA, dst_w, dst_h, ScaleFlags::BILINEAR,
+                        ) {
+                            Ok(s) => {
+                                scaler = Some(s);
+                                scaler_key = Some(cur_key);
+                            }
+                            Err(e) => {
+                                crate::logger::log(format!("sws_scale init: {e}"));
+                                continue;
+                            }
+                        }
+                    }
+                    let scaler_ref = scaler.as_mut().expect("scaler initialized above");
                     let mut rgba = Video::empty();
-                    if let Err(e) = scaler.run(&frame, &mut rgba) {
+                    if let Err(e) = scaler_ref.run(frame_for_scaler, &mut rgba) {
                         crate::logger::log(format!("sws_scale: {e}"));
                         continue;
                     }
+                    drop(sw_owned);
                     // Plane 0 から bytes を取り出し (RGBA はパッキング 1 plane)
                     let stride = rgba.stride(0);
                     let needed_stride = (dst_w * 4) as usize;
@@ -650,6 +769,135 @@ struct AudioSetup {
     decoder: ffmpeg_the_third::decoder::Audio,
     resampler: ffmpeg_the_third::software::resampling::Context,
     codec_name: String,
+}
+
+/// `av_hwdevice_ctx_create` で確保した AVBufferRef を保持し、Drop で `av_buffer_unref`
+/// する RAII ラッパー。AVCodecContext は内部で別途 `av_buffer_ref` するので、ここで
+/// drop しても codec 側のライフタイムには影響しない (refcount 管理)。
+struct HwDevice {
+    buf_ref: *mut ffmpeg_the_third::ffi::AVBufferRef,
+}
+
+impl Drop for HwDevice {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg_the_third::ffi::av_buffer_unref(&mut self.buf_ref);
+        }
+    }
+}
+
+// HwDevice は単独で thread を渡らないが、`run_decoder` の所有スコープ内で持つだけ
+// なので Send/Sync は不要。明示的に impl しない。
+
+/// D3D11VA HW デコードを試みる。サポート確認 → デバイス作成 → AVCodecContext へ装着
+/// までを行い、成功時は `Some(HwDevice)` を返す。失敗 (codec 非対応 / device 作成失敗)
+/// 時は `None` を返し、SW で続行する。
+fn try_init_d3d11va(
+    codec_id: ffmpeg_the_third::codec::Id,
+    ctx: &mut ffmpeg_the_third::codec::context::Context,
+) -> Option<HwDevice> {
+    use ffmpeg_the_third::ffi::*;
+
+    unsafe {
+        // 1. デコーダコーデックを取得 (avcodec_find_decoder)
+        let codec = avcodec_find_decoder(codec_id.into());
+        if codec.is_null() {
+            crate::logger::log(format!(
+                "HW: avcodec_find_decoder({codec_id:?}) returned null"
+            ));
+            return None;
+        }
+
+        // 2. avcodec_get_hw_config で D3D11VA + HW_DEVICE_CTX をサポートするか確認
+        let mut supported = false;
+        for i in 0_i32.. {
+            let cfg = avcodec_get_hw_config(codec, i);
+            if cfg.is_null() {
+                break;
+            }
+            let cfg = &*cfg;
+            if cfg.device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA
+                && (cfg.methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0
+                && cfg.pix_fmt == AVPixelFormat::AV_PIX_FMT_D3D11
+            {
+                supported = true;
+                break;
+            }
+        }
+        if !supported {
+            crate::logger::log(format!(
+                "HW: codec {codec_id:?} does not support D3D11VA HW_DEVICE_CTX"
+            ));
+            return None;
+        }
+
+        // 3. HW デバイスコンテキスト作成 (D3D11VA、デフォルトアダプタ)
+        let mut buf_ref: *mut AVBufferRef = std::ptr::null_mut();
+        let ret = av_hwdevice_ctx_create(
+            &mut buf_ref,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if ret < 0 || buf_ref.is_null() {
+            crate::logger::log(format!(
+                "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
+            ));
+            return None;
+        }
+
+        // 4. AVCodecContext にぶら下げる + get_format コールバック
+        let avctx = ctx.as_mut_ptr();
+        // 既存の hw_device_ctx を上書きする前に av_buffer_unref しておく必要があるが、
+        // from_parameters 直後はゼロなのでそのまま代入。
+        let new_ref = av_buffer_ref(buf_ref);
+        if new_ref.is_null() {
+            // av_buffer_ref のメモリ確保失敗 (極めて稀)。元の buf_ref を解放して None。
+            let mut to_free = buf_ref;
+            av_buffer_unref(&mut to_free);
+            crate::logger::log("HW: av_buffer_ref returned null".to_string());
+            return None;
+        }
+        (*avctx).hw_device_ctx = new_ref;
+        (*avctx).get_format = Some(get_hw_format);
+
+        crate::logger::log(format!(
+            "HW: D3D11VA initialized for codec {codec_id:?}"
+        ));
+        Some(HwDevice { buf_ref })
+    }
+}
+
+/// `AVCodecContext.get_format` コールバック。D3D11 が候補にあれば選択、無ければ
+/// 先頭の SW フォーマットにフォールバックして libavcodec を SW デコードに退避させる。
+unsafe extern "C" fn get_hw_format(
+    _ctx: *mut ffmpeg_the_third::ffi::AVCodecContext,
+    fmt_list: *const ffmpeg_the_third::ffi::AVPixelFormat,
+) -> ffmpeg_the_third::ffi::AVPixelFormat {
+    use ffmpeg_the_third::ffi::AVPixelFormat;
+    if fmt_list.is_null() {
+        return AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+    unsafe {
+        let mut p = fmt_list;
+        let mut first = AVPixelFormat::AV_PIX_FMT_NONE;
+        let mut idx = 0;
+        while *p != AVPixelFormat::AV_PIX_FMT_NONE {
+            if idx == 0 {
+                first = *p;
+            }
+            if *p == AVPixelFormat::AV_PIX_FMT_D3D11 {
+                return AVPixelFormat::AV_PIX_FMT_D3D11;
+            }
+            p = p.add(1);
+            idx += 1;
+        }
+        crate::logger::log(format!(
+            "HW: get_format: D3D11 not in candidate list, falling back to {first:?}"
+        ));
+        first
+    }
 }
 
 fn clamp_dims(w: u32, h: u32, max_dim: u32) -> (u32, u32) {

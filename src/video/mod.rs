@@ -59,6 +59,9 @@ pub struct VideoPlayer {
     pending_resume_secs: Option<f64>,
     /// 直前 tick で観測した seek_serial。新世代に変わったら future_frames を一掃する。
     last_seen_seek_serial: u64,
+    /// EOF 到達時に先頭から再生し直すか (= 設定の video_loop)。App が
+    /// `set_loop_enabled` で更新する。
+    loop_enabled: AtomicBool,
 }
 
 /// `future_frames` キューの最大長。channel(8) と同じ値。
@@ -73,11 +76,13 @@ impl VideoPlayer {
     ///
     /// `initial_volume` は 0.0-1.0。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
+    /// `hw_decode` が true なら D3D11VA HW デコードを試行 (失敗時は SW にフォールバック)。
     pub fn open(
         path: PathBuf,
         initial_volume: f64,
         autoplay: bool,
         resume_secs: Option<f64>,
+        hw_decode: bool,
     ) -> Self {
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
@@ -94,6 +99,7 @@ impl VideoPlayer {
                 future_frames: std::collections::VecDeque::new(),
                 pending_resume_secs: None,
                 last_seen_seek_serial: 0,
+                loop_enabled: AtomicBool::new(false),
             };
         }
 
@@ -107,7 +113,13 @@ impl VideoPlayer {
         // デバイスが取れなければ 48kHz をフォールバック。
         let target_rate = audio::default_output_sample_rate().unwrap_or(48_000);
 
-        let decode = decoder::spawn(path.clone(), clock.clone(), cancel.clone(), target_rate);
+        let decode = decoder::spawn(
+            path.clone(),
+            clock.clone(),
+            cancel.clone(),
+            target_rate,
+            hw_decode,
+        );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
         // 音声を二重に消費するので、decoder の audio_rx を audio.start に渡す。
@@ -145,6 +157,7 @@ impl VideoPlayer {
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: resume_secs,
             last_seen_seek_serial: 0,
+            loop_enabled: AtomicBool::new(false),
         }
     }
 
@@ -251,6 +264,12 @@ impl VideoPlayer {
 
     pub fn set_muted(&self, m: bool) {
         self.clock.set_muted(m);
+    }
+
+    /// ループ再生 ON/OFF を更新。App は毎 poll_video で settings 値を反映する。
+    pub fn set_loop_enabled(&self, enabled: bool) {
+        self.loop_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
@@ -362,13 +381,22 @@ impl VideoPlayer {
             && !seek_in_flight
             && self.is_playing()
         {
-            // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
-            if let Some(info) = &self.info {
-                if info.duration_secs > 0.0 {
-                    self.clock.set_position_at_eof(info.duration_secs);
+            if self
+                .loop_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                // ループ再生 ON: 先頭にシークし続行 (= 設定の video_loop)。
+                self.clock.request_seek(0.0, 0);
+                self.clock.set_playing(true);
+            } else {
+                // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
+                if let Some(info) = &self.info {
+                    if info.duration_secs > 0.0 {
+                        self.clock.set_position_at_eof(info.duration_secs);
+                    }
                 }
+                self.clock.set_playing(false);
             }
-            self.clock.set_playing(false);
         }
 
         // 最新フレームをテクスチャに反映
