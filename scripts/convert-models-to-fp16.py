@@ -77,6 +77,34 @@ def is_already_fp16(model_path: Path) -> bool:
     return fp32_backup_path(model_path).exists()
 
 
+def find_problematic_node_names(model):
+    """FP16 化で問題になるノード名のリストを返す。
+
+    対象:
+    - Resize op の data 以外の入力 (roi, scales, sizes) を produce するノード。
+      Resize 自体は op_block_list で FP32 維持されるが、Constant 等の上流ノードが
+      FP16 化されると、ORT が「Resize に FP16 が入った」と判定して invalid model
+      エラーになるため、上流も明示的に FP32 維持する必要がある。
+    - 同様の問題が起きうる Range / Slice の int パラメータ系も念のため対象。
+    """
+    # まず、保護したいテンソル名 (Resize の roi/scales/sizes 入力等) を列挙
+    protected_tensors = set()
+    for node in model.graph.node:
+        if node.op_type == "Resize":
+            # Resize inputs: [0] X (data), [1] roi, [2] scales, [3] sizes
+            for i, input_name in enumerate(node.input):
+                if i > 0 and input_name:
+                    protected_tensors.add(input_name)
+
+    # 保護対象テンソルを produce するノード名を収集
+    producer_names = []
+    for node in model.graph.node:
+        for output in node.output:
+            if output in protected_tensors and node.name:
+                producer_names.append(node.name)
+    return producer_names
+
+
 def convert_one(model_path: Path) -> bool:
     """1 モデルを FP16 化する。成功で True、失敗で False。"""
     print(f"\n=== {model_path.name} ===")
@@ -98,16 +126,26 @@ def convert_one(model_path: Path) -> bool:
         print(f"  [ERROR] ロード失敗: {e}", file=sys.stderr)
         return False
 
+    # Resize 等の op の入力を produce するノードを node_block_list に入れる。
+    # これで FP16 化されない (FP32 のまま残る) ようになり、Resize が
+    # invalid model エラーになるのを防ぐ。
+    node_block_list = find_problematic_node_names(model)
+    if node_block_list:
+        print(f"  Resize 等の入力 producer を FP32 維持: {len(node_block_list)} ノード")
+
     print("  FP16 変換中...")
     try:
         # keep_io_types=True: 入出力テンソルの型は FP32 のまま、
         #   内部演算のみ FP16 化。Rust 側の f32 入出力コードを変更不要にするため。
         # disable_shape_infer=True: 一部の古い ONNX モデルで形状推論が失敗する
         #   ことがあるので無効化 (変換自体には不要)。
+        # node_block_list: Resize など FP16 で動かない op の入力 producer を
+        #   FP32 維持する (詳細は find_problematic_node_names のドックコメント参照)。
         fp16_model = convert_float_to_float16(
             model,
             keep_io_types=True,
             disable_shape_infer=True,
+            node_block_list=node_block_list if node_block_list else None,
         )
     except Exception as e:
         print(f"  [ERROR] 変換失敗: {e}", file=sys.stderr)
