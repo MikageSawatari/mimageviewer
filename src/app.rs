@@ -9972,9 +9972,15 @@ impl App {
     /// 用途: AI バックエンド切替後に新しいバックエンドで動作開始するため
     /// (`ort::init_from()` がプロセス内 1 回限りの制約のため)。
     ///
-    /// 実装: 現プロセスをクリーン終了し、cmd 経由で 2 秒遅延後に同じ exe を起動する。
-    /// 遅延理由はシングルインスタンスミューテックスの解放を待つため (新インスタンスが
-    /// 旧インスタンスのミューテックスを見て二重起動と誤判定するのを防ぐ)。
+    /// 実装: 現プロセスをクリーン終了し、PowerShell 経由で 2 秒遅延後に同じ exe を
+    /// 起動する。遅延理由はシングルインスタンスミューテックスの解放を待つため
+    /// (新インスタンスが旧インスタンスのミューテックスを見て二重起動と誤判定するのを
+    /// 防ぐ)。
+    ///
+    /// PowerShell を使う理由: cmd /c のネスト引用符は壊れやすく、過去の実装で
+    /// パスが `\\` に変換されて起動失敗するバグが発生した。PowerShell の
+    /// シングルクォート文字列リテラルは内容を一切解釈しないので path に
+    /// バックスラッシュ・スペースが含まれていても安全。
     pub(crate) fn request_app_restart(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         {
@@ -9988,15 +9994,15 @@ impl App {
                     return;
                 }
             };
-            let exe_str = exe.to_string_lossy().to_string();
-            // timeout で 2 秒待ってから start で新 exe を切り離して起動。
-            // start "" "..." の "" はウィンドウタイトル指定 (path がスペース付きのときに必要)。
-            let cmd_line = format!(
-                r#"timeout /t 2 /nobreak >nul && start "" "{}""#,
-                exe_str
+            // PowerShell シングルクォート文字列内ではシングルクォート自身だけを
+            // '' でエスケープする。バックスラッシュは literal で扱われる。
+            let exe_str = exe.to_string_lossy().replace('\'', "''");
+            let ps_cmd = format!(
+                "Start-Sleep -Seconds 2; Start-Process -FilePath '{exe_str}'"
             );
-            match std::process::Command::new("cmd")
-                .args(["/c", &cmd_line])
+            crate::logger::log(format!("[restart] PowerShell command: {ps_cmd}"));
+            match std::process::Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
             {
@@ -10009,7 +10015,7 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Err(e) => {
-                    crate::logger::log(format!("[restart] cmd spawn 失敗: {e}"));
+                    crate::logger::log(format!("[restart] powershell spawn 失敗: {e}"));
                 }
             }
         }
