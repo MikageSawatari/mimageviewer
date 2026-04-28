@@ -59,8 +59,23 @@ use super::tensorrt_pack;
 /// 構造:
 ///   `<base>/manifest.json` ← まず fetch
 ///   `<base>/<asset.name>`  ← manifest 内の各 AssetEntry を name 付きで DL
-const PACK_BASE_URL: &str =
+///
+/// **テスト時の override**: 環境変数 `MIV_TRT_PACK_BASE_URL` を設定するとそちらが
+/// 優先される。ローカル HTTP サーバー (例: `python -m http.server 8000` を
+/// `dist/trt-pack-v1/` で起動 → URL=`http://127.0.0.1:8000`) で E2E 動作確認に使う。
+const DEFAULT_PACK_BASE_URL: &str =
     "https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v1";
+
+const PACK_BASE_URL_ENV: &str = "MIV_TRT_PACK_BASE_URL";
+
+/// 実際に DL に使う base URL を返す。env var が立っていればそちら、なければ既定値。
+/// 末尾の `/` は呼び出し側が `format!("{}/{}", base, name)` で連結するので付けない。
+fn pack_base_url() -> String {
+    match std::env::var(PACK_BASE_URL_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
+        _ => DEFAULT_PACK_BASE_URL.to_string(),
+    }
+}
 
 /// HTTP timeout (秒)。GitHub Releases CDN の応答時間に余裕を持たせる。
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -328,7 +343,7 @@ fn run_install(
 /// `<base_url>/manifest.json` を fetch & parse する。
 fn fetch_manifest(cancel: &Arc<AtomicBool>) -> Result<Manifest, String> {
     check_cancel(cancel)?;
-    let url = format!("{}/manifest.json", PACK_BASE_URL);
+    let url = format!("{}/manifest.json", pack_base_url());
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
         .timeout_read(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS))
@@ -436,7 +451,7 @@ fn download_and_verify(
     };
 
     // (3) HTTP DL with optional Range header.
-    let url = format!("{}/{}", PACK_BASE_URL, asset.name);
+    let url = format!("{}/{}", pack_base_url(), asset.name);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
         .timeout_read(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS))
@@ -737,6 +752,52 @@ mod tests {
     #[test]
     fn pick_engine_pack_empty_errors() {
         assert!(pick_engine_pack(&[], Some(89)).is_err());
+    }
+
+    #[test]
+    fn pack_base_url_uses_env_when_set() {
+        // 重要: テスト同士の env var 競合を避けるため SAFETY: テストプロセスは
+        // シングルスレッド前提では無いが、本テスト 1 個だけが PACK_BASE_URL_ENV を
+        // 触る (= cargo test の他テストから参照されない) ので問題ない。
+        // SAFETY: read/write のみで、外部に副作用なし。
+        unsafe {
+            std::env::set_var(PACK_BASE_URL_ENV, "http://127.0.0.1:9999/");
+        }
+        // 末尾の `/` は剥がされる
+        assert_eq!(pack_base_url(), "http://127.0.0.1:9999");
+        unsafe {
+            std::env::remove_var(PACK_BASE_URL_ENV);
+        }
+        // 既定は GitHub Releases URL
+        assert_eq!(pack_base_url(), DEFAULT_PACK_BASE_URL);
+    }
+
+    #[test]
+    fn manifest_parser_accepts_real_dist_manifest() {
+        // dist/trt-pack-v1/manifest.json (= 直近 build_trt_pack の出力) が
+        // 本コードの `Manifest` スキーマでパースできることを保証する。
+        // ファイルが無ければ skip (CI 等 build 前は無いため)。
+        let path = std::path::Path::new("dist/trt-pack-v1/manifest.json");
+        if !path.exists() {
+            eprintln!("[skip] {} not found, run build_trt_pack first", path.display());
+            return;
+        }
+        let body = std::fs::read_to_string(path).expect("read manifest");
+        let m: Manifest = serde_json::from_str(&body).expect("parse manifest");
+        assert!(m.manifest_format >= 3, "manifest_format must be >=3");
+        assert_eq!(m.pack_version, tensorrt_pack::EXPECTED_TRT_PACK_VERSION);
+        assert!(!m.common.is_empty(), "common DLL list must not be empty");
+        assert!(!m.notices.is_empty(), "notices list must not be empty");
+        assert!(!m.engines.is_empty(), "engines list must not be empty");
+        // SHA-256 が hex 64 文字であることを確認
+        for asset in m.common.iter().chain(m.notices.iter()) {
+            assert_eq!(asset.sha256.len(), 64, "{} hash len", asset.name);
+            assert!(
+                asset.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{} hash not hex",
+                asset.name
+            );
+        }
     }
 
     #[test]
