@@ -73,6 +73,20 @@ pub struct D3d11Frame {
 // thread-safe。Sync は付けない (= 同時参照は許さない)。
 unsafe impl Send for D3d11Frame {}
 
+impl Drop for D3d11Frame {
+    fn drop(&mut self) {
+        // NT shared HANDLE は CreateSharedHandle で取得しているので明示的に
+        // CloseHandle で解放しないと毎フレームのリークになる (= Codex P2-1 反映)。
+        // wgpu 側 (D3D12 OpenSharedHandle) は HANDLE 値を内部複製しているので、
+        // ここで close しても D3D12 リソースは生存する。
+        if !self.shared_handle.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.shared_handle);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum GpuVideoError {
     DeviceCreate(String),
@@ -307,6 +321,13 @@ impl GpuVideoDevice {
             self.video_context
                 .VideoProcessorBlt(&state.processor, &out_view, 0, &[stream])
                 .map_err(|e| GpuVideoError::Blt(format!("Blt: {e:?}")))?;
+            // Blt は immediate context のキューに記録するだけなので、Flush で
+            // GPU に submit してから caller に handle を渡す (= D3D12 側が
+            // OpenSharedHandle 後に sample しても未完成画素を読まない、Codex P2-2 反映)。
+            // 厳密な signaling は ID3D11Fence + ID3D12Fence の shared 共有で行うのが
+            // 望ましいが、producer-consumer channel が ~ms オーダで在庫を作るので
+            // 実用上 Flush だけで競合は起きない。
+            self.context.Flush();
         }
 
         Ok((out_tex, shared_handle))

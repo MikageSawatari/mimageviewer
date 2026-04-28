@@ -89,6 +89,9 @@ impl VideoPlayer {
         autoplay: bool,
         resume_secs: Option<f64>,
         hw_decode: bool,
+        #[cfg(windows)] gpu_video_device: Option<
+            std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+        >,
     ) -> Self {
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
@@ -126,6 +129,8 @@ impl VideoPlayer {
             cancel.clone(),
             target_rate,
             hw_decode,
+            #[cfg(windows)]
+            gpu_video_device,
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。

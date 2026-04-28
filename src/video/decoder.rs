@@ -106,6 +106,9 @@ pub fn spawn(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
     hw_decode: bool,
+    #[cfg(windows)] gpu_video_device: Option<
+        std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
 ) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
@@ -124,6 +127,8 @@ pub fn spawn(
                 cancel,
                 target_audio_sample_rate,
                 hw_decode,
+                #[cfg(windows)]
+                gpu_video_device,
                 video_tx,
                 audio_tx,
                 info_tx,
@@ -144,6 +149,9 @@ fn run_decoder(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
     hw_decode_requested: bool,
+    #[cfg(windows)] gpu_video_device: Option<
+        std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
     video_tx: Sender<VideoFrame>,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
@@ -199,16 +207,30 @@ fn run_decoder(
     // ── HW デコード初期化 (D3D11VA) ──
     // 失敗時は黙って SW デコードに落ちる。`hw_device` を _hw_device で持って Drop 時に
     // unref されるようにし、AVCodecContext は内部でさらに ref を取るので競合しない。
+    //
+    // gpu_video_device が利用可能な場合は **mIV 側で作成した D3D11 デバイス** を
+    // FFmpeg に渡して共有する (= HW デコーダの NV12 出力と ID3D11VideoProcessor が
+    // 同じデバイス上で動き、CreateVideoProcessorInputView で受け渡せる)。
+    // gpu_video_device 不在 / 失敗時は従来通り FFmpeg が新デバイスを作成し、
+    // 出力は av_hwframe_transfer_data で CPU readback する旧経路。
     let codec_id = video_decoder_ctx.id();
     let hw_setup_result: Option<HwDevice> = if hw_decode_requested {
-        try_init_d3d11va(codec_id, &mut video_decoder_ctx)
+        #[cfg(windows)]
+        {
+            try_init_d3d11va(
+                codec_id,
+                &mut video_decoder_ctx,
+                gpu_video_device.as_ref(),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            try_init_d3d11va(codec_id, &mut video_decoder_ctx)
+        }
     } else {
         None
     };
     let hw_active_initially = hw_setup_result.is_some();
-    // hw_device 自身は AVCodecContext が内部で av_buffer_ref しているので、ここで保持
-    // し続ける必要は厳密には無い。ただし decoder open 失敗時 (= 我々が unref しない
-    // と即時リーク) を考えてスレッド終了まで保持する。
     let _hw_device = hw_setup_result;
 
     let mut video_decoder = match video_decoder_ctx.decoder().video() {
@@ -487,6 +509,42 @@ fn run_decoder(
                         } else {
                             // target に到達した → preroll guard 解除 (動画側のみ)
                             // 音声側はまだ trim 必要なので drop_before_secs はそのまま残す
+                        }
+                    }
+
+                    // ── GPU 経路 (HW デコード + 共有 D3D11 device) ──
+                    // frame.format() == AV_PIX_FMT_D3D11 かつ mIV 側で GpuVideoDevice が
+                    // 利用可能な場合、av_hwframe_transfer_data + swscale を **完全に
+                    // スキップ** して、ID3D11VideoProcessor で直接 NV12→RGBA blit する。
+                    // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
+                    #[cfg(windows)]
+                    if matches!(frame.format(), Pixel::D3D11) {
+                        if let Some(gpu_dev) = gpu_video_device.as_ref() {
+                            match try_gpu_blit_path(
+                                gpu_dev,
+                                &frame,
+                                dst_w,
+                                dst_h,
+                                pts_secs,
+                                current_seek_serial,
+                                &mut first_frame_logged,
+                                hw_active_initially,
+                            ) {
+                                Ok(gpu_frame_out) => {
+                                    use crossbeam_channel::TrySendError;
+                                    let send_result = video_tx.try_send(gpu_frame_out);
+                                    if let Err(TrySendError::Disconnected(_)) = send_result {
+                                        break 'outer;
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    crate::logger::log(format!(
+                                        "GPU blit path failed, fallback to CPU readback: {e}"
+                                    ));
+                                    // フォールスルーして既存の CPU 経路に進む。
+                                }
+                            }
                         }
                     }
 
@@ -823,9 +881,16 @@ impl Drop for HwDevice {
 /// D3D11VA HW デコードを試みる。サポート確認 → デバイス作成 → AVCodecContext へ装着
 /// までを行い、成功時は `Some(HwDevice)` を返す。失敗 (codec 非対応 / device 作成失敗)
 /// 時は `None` を返し、SW で続行する。
+///
+/// `gpu_video_device` が `Some` の場合は **そのデバイスを FFmpeg と共有** する
+/// (= mIV の VideoProcessor が同じデバイスで動作可能、CreateVideoProcessorInputView
+/// の前提)。`None` の場合は FFmpeg が独自デバイスを作る (旧経路)。
 fn try_init_d3d11va(
     codec_id: ffmpeg_the_third::codec::Id,
     ctx: &mut ffmpeg_the_third::codec::context::Context,
+    #[cfg(windows)] gpu_video_device: Option<
+        &std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
 ) -> Option<HwDevice> {
     use ffmpeg_the_third::ffi::*;
 
@@ -862,29 +927,79 @@ fn try_init_d3d11va(
             return None;
         }
 
-        // 3. HW デバイスコンテキスト作成 (D3D11VA、デフォルトアダプタ)
-        let mut buf_ref: *mut AVBufferRef = std::ptr::null_mut();
-        let ret = av_hwdevice_ctx_create(
-            &mut buf_ref,
-            AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            0,
-        );
-        if ret < 0 || buf_ref.is_null() {
-            crate::logger::log(format!(
-                "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
-            ));
-            return None;
-        }
+        // 3. HW デバイスコンテキスト作成。
+        //    gpu_video_device があれば mIV の D3D11 デバイスを共有、なければ FFmpeg
+        //    が新デバイスを作る (= 旧経路)。
+        #[cfg(windows)]
+        let buf_ref: *mut AVBufferRef = if let Some(gpu_dev) = gpu_video_device {
+            match crate::video::gpu_renderer::create_ffmpeg_hw_device_ctx(gpu_dev) {
+                Ok(b) => {
+                    crate::logger::log(format!(
+                        "HW: D3D11VA shared with GpuVideoDevice for codec {codec_id:?}"
+                    ));
+                    b
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "HW: shared D3D11 setup failed ({e}), falling back to ffmpeg-owned device"
+                    ));
+                    let mut buf: *mut AVBufferRef = std::ptr::null_mut();
+                    let ret = av_hwdevice_ctx_create(
+                        &mut buf,
+                        AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    if ret < 0 || buf.is_null() {
+                        crate::logger::log(format!(
+                            "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
+                        ));
+                        return None;
+                    }
+                    buf
+                }
+            }
+        } else {
+            let mut buf: *mut AVBufferRef = std::ptr::null_mut();
+            let ret = av_hwdevice_ctx_create(
+                &mut buf,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret < 0 || buf.is_null() {
+                crate::logger::log(format!(
+                    "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
+                ));
+                return None;
+            }
+            buf
+        };
+        #[cfg(not(windows))]
+        let buf_ref: *mut AVBufferRef = {
+            let mut buf: *mut AVBufferRef = std::ptr::null_mut();
+            let ret = av_hwdevice_ctx_create(
+                &mut buf,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret < 0 || buf.is_null() {
+                crate::logger::log(format!(
+                    "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
+                ));
+                return None;
+            }
+            buf
+        };
 
         // 4. AVCodecContext にぶら下げる + get_format コールバック
         let avctx = ctx.as_mut_ptr();
-        // 既存の hw_device_ctx を上書きする前に av_buffer_unref しておく必要があるが、
-        // from_parameters 直後はゼロなのでそのまま代入。
         let new_ref = av_buffer_ref(buf_ref);
         if new_ref.is_null() {
-            // av_buffer_ref のメモリ確保失敗 (極めて稀)。元の buf_ref を解放して None。
             let mut to_free = buf_ref;
             av_buffer_unref(&mut to_free);
             crate::logger::log("HW: av_buffer_ref returned null".to_string());
@@ -947,4 +1062,117 @@ fn duration_to_secs(dur: i64) -> f64 {
         return 0.0;
     }
     dur as f64 / 1_000_000.0
+}
+
+/// AV_PIX_FMT_D3D11 の AVFrame を mIV 側 D3D11 デバイス上で NV12→RGBA blit して
+/// `VideoFrame::Gpu(D3d11Frame)` を作る (CPU readback + swscale を完全に省略する経路)。
+///
+/// `AVFrame.data[0]` = `*mut ID3D11Texture2D`、`data[1]` = subresource index (intptr) が
+/// AV_PIX_FMT_D3D11 の規約 ([ffmpeg-sys-the-third bindings.rs] AV_PIX_FMT_D3D11 の
+/// rustdoc 参照)。これらをそのまま `GpuVideoDevice::blit_nv12_to_rgba` に渡す。
+///
+/// Drop 後の AVFrame は input texture を Release するので、blit 完了 (= GPU 命令が
+/// キューに積まれる) 後に AVFrame を解放するだけで安全 (D3D11 driver 内部で
+/// テクスチャの寿命管理がされる)。
+#[cfg(windows)]
+fn try_gpu_blit_path(
+    gpu_dev: &std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    frame: &ffmpeg_the_third::util::frame::Video,
+    dst_w: u32,
+    dst_h: u32,
+    pts_secs: f64,
+    current_seek_serial: u64,
+    first_frame_logged: &mut bool,
+    hw_active_initially: bool,
+) -> Result<VideoFrame, crate::video::gpu_renderer::GpuVideoError> {
+    use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+    use windows::core::Interface;
+
+    // SAFETY: AV_PIX_FMT_D3D11 の data[0] は ID3D11Texture2D* で、AVFrame の生存中有効。
+    // data[1] は intptr_t としての subresource index。
+    let (texture_raw, subresource) = unsafe {
+        let raw = frame.as_ptr();
+        let data0 = (*raw).data[0];
+        let data1 = (*raw).data[1] as usize;
+        (data0 as *mut std::ffi::c_void, data1 as u32)
+    };
+    if texture_raw.is_null() {
+        return Err(crate::video::gpu_renderer::GpuVideoError::Blt(
+            "AVFrame.data[0] is null".into(),
+        ));
+    }
+
+    // ID3D11Texture2D を `windows` 0.61 系の COM インタフェースとして包む (AddRef)。
+    // SAFETY: COM のキャスト規約に従い、IUnknown 互換 vtable を持つ raw ポインタを
+    // 安全な COM ハンドルに昇格させる。
+    let texture: ID3D11Texture2D = unsafe {
+        // from_raw_borrowed は Option<&Self> を返すが、追加 ref を取るために
+        // clone() してから .map(...).unwrap() で値化する。
+        let opt: Option<&ID3D11Texture2D> = ID3D11Texture2D::from_raw_borrowed(&texture_raw);
+        match opt {
+            Some(t) => t.clone(),
+            None => {
+                return Err(crate::video::gpu_renderer::GpuVideoError::Blt(
+                    "from_raw_borrowed null".into(),
+                ));
+            }
+        }
+    };
+
+    // 入力 D3D11 フォーマットから 10-bit を判定 (P010 / P016 → 10-bit、NV12 → 8-bit)。
+    let in_desc = unsafe {
+        let mut d = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut d);
+        d
+    };
+    let ten_bit = matches!(
+        in_desc.Format,
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010
+            | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P016
+    );
+
+    // GPU で NV12→RGBA 変換、出力は NT 共有テクスチャ。
+    let (_out_tex, shared_handle) = unsafe {
+        gpu_dev.blit_nv12_to_rgba(&texture, subresource, dst_w, dst_h, ten_bit)?
+    };
+
+    // perf: 初回フレームは GPU 経路を明示
+    if !*first_frame_logged && crate::perf::is_enabled() {
+        crate::perf::event(
+            "video",
+            "first_frame",
+            None,
+            0,
+            &[
+                ("decode_path", serde_json::Value::from("hw_d3d11va_gpu_blit")),
+                (
+                    "frame_pix_fmt",
+                    serde_json::Value::from(format!("{:?}", in_desc.Format)),
+                ),
+                ("frame_w", serde_json::Value::from(in_desc.Width as i64)),
+                ("frame_h", serde_json::Value::from(in_desc.Height as i64)),
+                (
+                    "hw_active",
+                    serde_json::Value::from(hw_active_initially),
+                ),
+            ],
+        );
+        *first_frame_logged = true;
+    }
+
+    let d3d11_frame = crate::video::gpu_renderer::D3d11Frame {
+        width: dst_w,
+        height: dst_h,
+        pts_secs,
+        seek_serial: current_seek_serial,
+        shared_handle,
+        keyed_mutex_key: 1,
+    };
+    Ok(VideoFrame {
+        width: dst_w,
+        height: dst_h,
+        data: VideoFrameData::Gpu(d3d11_frame),
+        pts_secs,
+        seek_serial: current_seek_serial,
+    })
 }
