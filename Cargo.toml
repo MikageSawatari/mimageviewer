@@ -3,7 +3,7 @@ members = ["crates/susie-worker", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
