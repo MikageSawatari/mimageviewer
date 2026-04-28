@@ -51,10 +51,13 @@
 #![cfg(windows)]
 
 mod d3d11_device;
+mod ffmpeg_d3d11;
 mod vsr;
 mod wgpu_import;
 
 pub use d3d11_device::{D3d11Frame, GpuVideoDevice, GpuVideoError};
+#[allow(unused_imports)]
+pub use ffmpeg_d3d11::create_ffmpeg_hw_device_ctx;
 pub use vsr::{VsrCapability, VsrControlPanelState, detect_vsr_capability};
 #[allow(unused_imports)]
 pub use wgpu_import::{ImportedTexture, import_shared_d3d11_texture};
