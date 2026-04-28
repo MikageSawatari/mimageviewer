@@ -190,6 +190,10 @@ pub(crate) struct PreferencesState {
     /// 「全エンジンビルド」ボタンが押されたときに立てるフラグ。
     /// Apply 直後に App 側で見て start_trt_build() を呼び、消す。
     pub start_trt_build_requested: bool,
+
+    /// 「今すぐ再起動」ボタンが押されたときに立てるフラグ。
+    /// 同フレームで App::request_app_restart() を呼んで消す。
+    pub restart_app_requested: bool,
 }
 
 impl PreferencesState {
@@ -249,6 +253,7 @@ impl PreferencesState {
             trt_pack_size_mib,
             trt_engine_cache_size_mib,
             start_trt_build_requested: false,
+            restart_app_requested: false,
         }
     }
 }
@@ -394,6 +399,17 @@ impl App {
         {
             state.start_trt_build_requested = false;
             self.start_trt_build();
+        }
+
+        // 「今すぐ再起動」フラグの処理。
+        // 注意: ユーザーは OK を押す前に再起動できてしまうので、ボタン押下時点での
+        // 設定変更は保存されない可能性がある。これは UI ヒントで案内している
+        // ("OK を押してから再起動が安全")。実装簡略のため自動 Apply はしない。
+        if let Some(state) = self.pref_state.as_mut()
+            && state.restart_app_requested
+        {
+            state.restart_app_requested = false;
+            self.request_app_restart(ctx);
         }
 
         if apply {
@@ -919,22 +935,33 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
     ui.add_space(8.0);
 
-    // 「再起動が必要」インジケータ
+    // 「再起動が必要」インジケータ + 再起動ボタン
     if let Some(running) = state.current_runtime_backend
         && running != new_choice
     {
-        ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 50),
-            format!(
-                "ℹ バックエンド変更を反映するにはアプリの再起動が必要です \
-                 (現プロセスは {} で動作中)",
-                match running {
-                    AiBackend::DirectMl => "DirectML",
-                    AiBackend::TensorRt => "TensorRT",
-                    AiBackend::Cpu => "CPU",
-                }
-            ),
-        );
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 50),
+                format!(
+                    "ℹ バックエンド変更は再起動後に有効化 (現在: {})",
+                    match running {
+                        AiBackend::DirectMl => "DirectML",
+                        AiBackend::TensorRt => "TensorRT",
+                        AiBackend::Cpu => "CPU",
+                    }
+                ),
+            );
+            if ui
+                .button("今すぐ再起動")
+                .on_hover_text(
+                    "OK を押して設定を保存してから再起動するのが安全です。\n\
+                     再起動はアプリを終了して約 2 秒後に同じ exe を起動します。",
+                )
+                .clicked()
+            {
+                state.restart_app_requested = true;
+            }
+        });
         ui.add_space(8.0);
     }
 

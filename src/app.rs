@@ -9967,6 +9967,59 @@ impl App {
         }
     }
 
+    /// アプリの再起動を要求する。
+    ///
+    /// 用途: AI バックエンド切替後に新しいバックエンドで動作開始するため
+    /// (`ort::init_from()` がプロセス内 1 回限りの制約のため)。
+    ///
+    /// 実装: 現プロセスをクリーン終了し、cmd 経由で 2 秒遅延後に同じ exe を起動する。
+    /// 遅延理由はシングルインスタンスミューテックスの解放を待つため (新インスタンスが
+    /// 旧インスタンスのミューテックスを見て二重起動と誤判定するのを防ぐ)。
+    pub(crate) fn request_app_restart(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::logger::log(format!("[restart] current_exe 取得失敗: {e}"));
+                    return;
+                }
+            };
+            let exe_str = exe.to_string_lossy().to_string();
+            // timeout で 2 秒待ってから start で新 exe を切り離して起動。
+            // start "" "..." の "" はウィンドウタイトル指定 (path がスペース付きのときに必要)。
+            let cmd_line = format!(
+                r#"timeout /t 2 /nobreak >nul && start "" "{}""#,
+                exe_str
+            );
+            match std::process::Command::new("cmd")
+                .args(["/c", &cmd_line])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+            {
+                Ok(_) => {
+                    crate::logger::log(
+                        "[restart] 再起動コマンドを spawn、shutdown を開始".to_string(),
+                    );
+                    self.shutdown_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(e) => {
+                    crate::logger::log(format!("[restart] cmd spawn 失敗: {e}"));
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
+            crate::logger::log("[restart] 非 Windows 環境では再起動未対応".to_string());
+        }
+    }
+
     /// AI ランタイムとモデルマネージャを遅延初期化する。
     /// バックエンドは Settings の `ai_backend` から解決する (None = DirectML)。
     pub(crate) fn ensure_ai_runtime(&mut self) {

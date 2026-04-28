@@ -217,7 +217,15 @@ impl App {
         // 描画
         let dialog_pos = ctx.content_rect().min + egui::vec2(80.0, 60.0);
         let mut should_close = false;
+        let mut request_restart = false;
         let phase_is_terminal = !matches!(state.phase, TrtBuildPhase::Building);
+        // 再起動ボタンを出すのは AllDone のときだけ (Aborted や Cancelled では出さない)
+        let allow_restart_now = matches!(state.phase, TrtBuildPhase::AllDone { .. })
+            && state
+                .kinds
+                .iter()
+                .zip(state.statuses.iter())
+                .all(|(_, s)| matches!(s, TrtModelStatus::Done(_)));
 
         egui::Window::new("TensorRT エンジンビルド")
             .default_pos(dialog_pos)
@@ -366,12 +374,31 @@ impl App {
                                     .to_string(),
                             );
                         }
-                    } else if ui.button("閉じる").clicked() {
-                        should_close = true;
+                    } else {
+                        // AllDone のときは「今すぐ再起動」を出す
+                        // (Settings.ai_backend が tensorrt なら次回起動から TRT で動作)
+                        if allow_restart_now
+                            && ui
+                                .button("今すぐ再起動")
+                                .on_hover_text(
+                                    "アプリを終了し、約 2 秒後に再起動します。\n\
+                                     設定で TensorRT を選択していれば、再起動後に\n\
+                                     TensorRT で動作します。",
+                                )
+                                .clicked()
+                        {
+                            request_restart = true;
+                        }
+                        if ui.button("閉じる").clicked() {
+                            should_close = true;
+                        }
                     }
                 });
             });
 
+        if request_restart {
+            self.request_app_restart(ctx);
+        }
         if should_close {
             self.trt_build_state = None;
         }
