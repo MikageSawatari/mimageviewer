@@ -222,13 +222,33 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 ユーザーが設定で DirectML に戻したとき:
 - 同様にシャットダウン → DirectML 経路に切り替え
 
-### クラッシュ検出
+### クラッシュ検出 (Step 5 実装済み)
 
 ワーカーが予期せず終了したら:
-- 親の `child.wait()` か pipe 切断で検知
-- `AiBackend::DirectMl` に自動退避 + UI バナーで通知 (「TensorRT がエラーで停止
-  しました。DirectML で動作中。」)
-- 自動再起動はしない (連続クラッシュを避ける)
+
+- `TrtWorkerPool::is_dead: AtomicBool` を `load_model` / `infer` 内の send_cmd
+  失敗で立てる。検出パターン:
+  - `stdin write: ...` (親→子書き込み broken pipe)
+  - `stdin flush: ...`
+  - `stdout read: ...`
+  - `worker stdout が EOF (子プロセスが予期せず終了した可能性)`
+- `ok=false` の正常レスポンス (例: shape mismatch) では `is_dead` を立てない
+  (送受信は成立しているので worker は生存)
+- `infer_via_worker` が `pool.is_dead()` を見て `AiRuntime::report_worker_died()`
+  を呼ぶ。中身: `detach_worker_pool()` (= worker_pool を None に) + UI 通知キュー
+  `worker_notice` に `WorkerNoticeKind::DiedDuringInfer` を積む
+- 以降の `should_route_to_worker` は worker_pool が None なので false → 推論は
+  自動的に DirectML へフォールバック
+- UI は毎フレーム `take_worker_notice()` で 1 回だけ通知を引き取り、右上に floating
+  banner (「TensorRT ワーカーが停止」)。「ワーカーを再起動」ボタンで
+  `spawn_trt_worker_pool` を再呼び出し可能 (連続失敗時はまた通知される)
+- 自動再起動はしない (連続クラッシュを避けるため、明示的なユーザー操作で復旧)
+- `TrtWorkerPool::shutdown` 時に `is_dead` なら念のため `child.kill()` してから
+  `child.wait()` (子が hang した病理的ケースの保険、kill は冪等)
+
+起動失敗 (pack 不在 / DLL ロード失敗 / 初期化エラー) も同じ通知機構で扱う:
+`spawn_trt_worker_pool` の Err 経路で `report_worker_spawn_failed()` を呼んで
+`WorkerNoticeKind::SpawnFailed` を積む (これまでは log のみだった)。
 
 ## 実装フェーズ
 
@@ -260,11 +280,18 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 - バックエンド選択 = hot-reload
 - ホットリロードのテスト
 
-### Step 5: クラッシュ耐性 + UI 通知 (約 1 日)
+### Step 5: クラッシュ耐性 + UI 通知 (実装済み)
 
-- ワーカー死亡検知
-- 自動 DirectML フォールバック
-- UI バナー通知
+- `TrtWorkerPool::is_dead` フラグ + `load_model` / `infer` 内の I/O 失敗パターン
+  自動判定 (`classify_io_error`)
+- `AiRuntime::report_worker_died` / `report_worker_spawn_failed` で UI 通知キュー
+  `worker_notice: Mutex<Option<WorkerNotice>>` に積む
+- `App::poll_trt_worker_notice` が毎フレーム `take_worker_notice()` を呼んで
+  `App::trt_worker_notice` に転写
+- `ui_dialogs/trt_worker_notice.rs` が右上に floating Window を出す:
+  - メッセージ + [ワーカーを再起動] [閉じる]
+  - 時間で消えない (ユーザー認知が必要)
+  - TRT エンジンビルダー進捗ダイアログ表示中は隠す
 
 ### Step 6: 統合テスト + ドキュメント (約 1-2 日)
 
