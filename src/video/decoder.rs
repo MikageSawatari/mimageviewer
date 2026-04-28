@@ -26,16 +26,40 @@ use crossbeam_channel::{Sender, bounded};
 
 use super::clock::AvClock;
 
-/// 1 動画フレーム (BGRA、tightly packed)。
+/// 1 動画フレーム。CPU readback (旧経路) と GPU 共有テクスチャ (新経路) の二択。
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    /// BGRA8 ピクセル列 (width * height * 4 バイト)。
-    pub bgra: Vec<u8>,
+    pub data: VideoFrameData,
     /// 提示時刻 (秒)。AvClock との比較に使う。
     pub pts_secs: f64,
     /// シーク世代。これが現行の AvClock seek_serial と異なれば UI は捨てる。
     pub seek_serial: u64,
+}
+
+/// 動画フレームのピクセルデータ。
+pub enum VideoFrameData {
+    /// CPU 上の RGBA8 (旧経路: SW デコード or HW + av_hwframe_transfer_data + swscale)。
+    /// `Vec<u8>` は `width * height * 4` バイト。
+    Cpu(Vec<u8>),
+    /// GPU 上の D3D11 NT 共有テクスチャ (新経路: HW + VideoProcessorBlt)。
+    /// UI は `import_shared_d3d11_texture` で wgpu::Texture に import して描画する。
+    /// テクスチャの寿命管理は `D3d11Frame` が `Drop` で `CloseHandle` する責務を持つ。
+    #[cfg(windows)]
+    Gpu(crate::video::gpu_renderer::D3d11Frame),
+}
+
+impl VideoFrameData {
+    /// 旧来の CPU bgra アクセス互換 (call sites の段階的移行用)。
+    /// GPU フレームでは `None` を返す。
+    #[allow(dead_code)]
+    pub fn cpu_bgra(&self) -> Option<&[u8]> {
+        match self {
+            Self::Cpu(b) => Some(b.as_slice()),
+            #[cfg(windows)]
+            Self::Gpu(_) => None,
+        }
+    }
 }
 
 /// 1 音声フレーム (interleaved stereo f32、48kHz)。
@@ -563,7 +587,7 @@ fn run_decoder(
                     let frame_out = VideoFrame {
                         width: dst_w,
                         height: dst_h,
-                        bgra,
+                        data: super::decoder::VideoFrameData::Cpu(bgra),
                         pts_secs,
                         seek_serial: current_seek_serial,
                     };

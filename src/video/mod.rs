@@ -429,9 +429,23 @@ impl VideoPlayer {
         let mut upload_ms: f64 = 0.0;
         if let Some(frame) = latest_renderable {
             let pts_for_log = frame.pts_secs;
+            // GPU フレームの描画は別経路 (egui_wgpu::CallbackTrait) を後から実装する。
+            // 現状はまだ統合途中なので、CPU フレームのみ ColorImage 経路で表示する。
+            let cpu_bytes = match &frame.data {
+                decoder::VideoFrameData::Cpu(b) => b.as_slice(),
+                #[cfg(windows)]
+                decoder::VideoFrameData::Gpu(_) => {
+                    // TODO: GPU 経路の描画統合まで一時的に skip
+                    crate::logger::log(
+                        "VideoPlayer::tick: GPU frame received but render path not wired yet"
+                            .to_string(),
+                    );
+                    return next_due;
+                }
+            };
             let color = ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
-                &frame.bgra,
+                cpu_bytes,
             );
             // override は frame.pts が override target 近傍のときだけ解除する。
             // backward seek が外れて pts ≈ 元位置のフレームが新世代 serial で来た

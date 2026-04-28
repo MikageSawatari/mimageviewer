@@ -51,6 +51,10 @@ use super::vsr::{self, VsrCapability};
 const OUTPUT_RING_SIZE: usize = 3;
 
 /// 1 フレームの GPU 出力。`KeyedMutex` で wgpu 側との読み書き排他。
+///
+/// SAFETY: `shared_handle` は NT HANDLE で `*mut c_void` 相当だが、本構造体は
+/// channel 越しにスレッドを跨いで運ぶ必要があるため `Send` を unsafe impl する。
+/// HANDLE 自体は OS 内部のテーブル参照なので、複数スレッドから順次使うことは安全。
 pub struct D3d11Frame {
     pub width: u32,
     pub height: u32,
@@ -64,6 +68,10 @@ pub struct D3d11Frame {
     /// keyed mutex の key。書き込み完了時 1、読み取り完了時 0 を release。
     pub keyed_mutex_key: u64,
 }
+
+// HANDLE は OS のリソース ID 相当 (= 単純な i64 値) で、所有権を移動する分には
+// thread-safe。Sync は付けない (= 同時参照は許さない)。
+unsafe impl Send for D3d11Frame {}
 
 #[derive(Debug)]
 pub enum GpuVideoError {
