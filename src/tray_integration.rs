@@ -170,9 +170,17 @@ impl App {
     /// ウィンドウ復帰後は通常のロード経路で再取得されるので、描画には影響なし
     /// (短時間の再ロードオーバーヘッドが発生する)。
     fn release_gpu_resources(&mut self) {
-        // グリッドサムネ: Loaded → Evicted で TextureHandle を drop
-        for state in &mut self.thumbnails {
+        // グリッドサムネ: Loaded → Evicted で TextureHandle を drop。
+        // 動画サムネは Windows Shell API 経由で復帰後の再 spawn 経路が無く、
+        // Evicted のまま暗灰背景が固定表示されてしまう (= 「全動画黒背景」報告) ので除外。
+        for (i, state) in self.thumbnails.iter_mut().enumerate() {
             if matches!(state, crate::grid_item::ThumbnailState::Loaded { .. }) {
+                if matches!(
+                    self.items.get(i),
+                    Some(crate::grid_item::GridItem::Video(_))
+                ) {
+                    continue;
+                }
                 *state = crate::grid_item::ThumbnailState::Evicted;
             }
         }

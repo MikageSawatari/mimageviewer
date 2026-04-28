@@ -782,7 +782,7 @@ use crate::thumb_loader::{
 };
 use crate::ui_helpers::{
     draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
-    open_external_player, truncate_name,
+    truncate_name,
 };
 
 /// 消しゴムモードのツール種別。
@@ -1724,6 +1724,20 @@ pub struct App {
     /// `os_theme::resolve` の結果と比較して再適用する。
     pub(crate) applied_ui_theme: Option<crate::os_theme::ResolvedTheme>,
 
+    /// eframe の wgpu::Device / Queue / Adapter / target_format。動画 GPU レンダリング
+    /// で `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared
+    /// テクスチャを import するために必要。`main.rs` の creator closure で
+    /// `cc.wgpu_render_state` から渡される。`None` なら GPU 動画レンダリング無効。
+    #[cfg(windows)]
+    pub(crate) wgpu_render_state: Option<egui_wgpu::RenderState>,
+    /// 動画 GPU レンダリング用の共有 D3D11 デバイス。VideoPlayer ごとに生成すると
+    /// FFmpeg HW デコーダ + ID3D11VideoProcessor を別デバイスに作る重複コストが
+    /// 発生するため、App レベルで 1 つ確保して使い回す。`None` の場合は
+    /// 旧経路 (CPU readback + swscale) にフォールバック。
+    #[cfg(windows)]
+    pub(crate) gpu_video_device:
+        Option<std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>>,
+
     // ── PDF パスワード管理 ───────────────────────────────────────
     pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pub(crate) show_pdf_password_dialog: bool,
@@ -2020,6 +2034,13 @@ pub struct App {
     /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
+
+    /// 動画シークホバー時のサムネ表示用テクスチャ。1 動画につき 1 つだけ持ち、
+    /// hover 中の target_secs key が変わるたびに `set()` で in-place 更新する。
+    /// (fs_idx, bucket_key, TextureHandle) — fs_idx 切替時に再作成。
+    pub(crate) video_seek_thumb_tex: Option<(usize, i64, egui::TextureHandle)>,
+    /// 動画再生位置の自動保存タイマ (5 秒間隔)。
+    pub(crate) video_resume_last_save: Option<std::time::Instant>,
 
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
@@ -2357,6 +2378,10 @@ impl Default for App {
             analysis_sv_cache: None,
             initialized: false,
             applied_ui_theme: None,
+            #[cfg(windows)]
+            wgpu_render_state: None,
+            #[cfg(windows)]
+            gpu_video_device: None,
             pdf_passwords,
             show_pdf_password_dialog: false,
             pdf_password_input: String::new(),
@@ -2447,6 +2472,8 @@ impl Default for App {
             frame_counter: 0,
             perf_last_flush: None,
             fs_painted_last: None,
+            video_seek_thumb_tex: None,
+            video_resume_last_save: None,
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,
             window_visible: true,
@@ -6995,13 +7022,12 @@ impl App {
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
-                        | Some(GridItem::PdfPage { .. }) => {
+                        | Some(GridItem::PdfPage { .. })
+                        | Some(GridItem::Video(_)) => {
+                            // 動画も画像と同じくフルスクリーン化 → インライン再生。
+                            // 外部プレイヤー起動はフルスクリーン中の Shift+Enter から。
                             self.bump_input_seq_for_item("grid_enter", idx);
                             self.open_fullscreen(idx);
-                        }
-                        Some(GridItem::Video(p)) => {
-                            let vp = p.clone();
-                            open_external_player(&vp);
                         }
                         Some(GridItem::ConvertibleArchive { path, format }) => {
                             let pf = path.clone();
@@ -7825,8 +7851,15 @@ impl App {
                 self.update_prefetch_window(idx);
             }
             Some(GridItem::Video(_)) => {
-                // 動画はサムネイル + 再生ボタンのみ。高解像度読み込み不要。
-                crate::logger::log(format!("  video idx={idx} → play button mode"));
+                // 動画はインライン再生 (フルスクリーン化と同時に VideoPlayer を起動)。
+                // start_fs_load の早期分岐で GridItem::Video を検出し、
+                // FsCacheEntry::Video を fs_cache に挿入する。
+                if self.fs_cache.contains_key(&idx) {
+                    crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
+                } else {
+                    crate::logger::log(format!("  video idx={idx} → start inline playback"));
+                    self.start_fs_load(idx);
+                }
             }
             Some(GridItem::ZipSeparator { dir_display }) => {
                 // セパレータはテキスト表示のみ (デコード不要)
@@ -9308,6 +9341,73 @@ impl App {
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
+        // 動画は専用パス: VideoPlayer を作って fs_cache に直接入れる。
+        // 通常の画像デコードスレッドは起動しない。
+        if let Some(GridItem::Video(vp)) = self.items.get(idx).cloned() {
+            // 1 動画につき 1 cpal stream に限定する。`contains_key(idx)` チェックの
+            // 外で実行することで、再 start_fs_load (= fullscreen 戻り遷移) でも
+            // 古い video エントリが残らないことを保証する (Codex 助言)。
+            let other_video_idxs: Vec<usize> = self
+                .fs_cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    if *k != idx && matches!(v, FsCacheEntry::Video { .. }) {
+                        Some(*k)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !other_video_idxs.is_empty() {
+                self.save_all_video_resume_positions();
+                for k in other_video_idxs {
+                    self.fs_cache.remove(&k);
+                }
+            }
+            if !self.fs_cache.contains_key(&idx) {
+                // start_muted の場合も volume はそのままにし、Player 内 atomic で
+                // ミュートだけ切る (= 解除時に元の音量に戻る)。0.0 を渡してしまうと
+                // 「ミュート解除しても音が出ない」状態になり Codex に指摘された。
+                let vol = self.settings.video_volume;
+                let autoplay = self.settings.video_autoplay;
+                // resume 位置の取得: 直近に保存した位置を渡して最初の info 受領後に
+                // 自動シークさせる。Windows の case-insensitive パスを揃えるため
+                // adjustment_db::normalize_path に合わせる。
+                let path_key = crate::adjustment_db::normalize_path(&vp);
+                let resume = self
+                    .settings
+                    .video_resume_positions
+                    .get(&path_key)
+                    .copied();
+                let player = crate::video::VideoPlayer::open(
+                    vp,
+                    vol,
+                    autoplay,
+                    resume,
+                    self.settings.video_hw_decode,
+                    // GPU レンダリングが利用可能なら渡す。HW デコード OFF の場合や
+                    // GpuVideoDevice 作成失敗時は None で旧経路 (CPU readback)。
+                    #[cfg(windows)]
+                    if self.settings.video_hw_decode {
+                        self.gpu_video_device.clone()
+                    } else {
+                        None
+                    },
+                );
+                if self.settings.video_start_muted {
+                    player.set_muted(true);
+                }
+                self.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: self.input_seq,
+                    },
+                );
+            }
+            return;
+        }
+
         let (path, zip_entry, pdf_page, pdf_password) = match self.items.get(idx) {
             Some(GridItem::Image(p)) => (p.clone(), None, None, None),
             Some(GridItem::ZipImage {
@@ -9792,6 +9892,8 @@ impl App {
         let prefetch_targets: Vec<usize> =
             interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
 
+        // 退避前に動画の再生位置を保存 (退避された Video エントリは drop で消える)
+        self.save_all_video_resume_positions();
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
 
@@ -9856,6 +9958,8 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
+        self.save_all_video_resume_positions();
         // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
         // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
         // 実行される。ms を計測してブロックの所在を特定する。
@@ -11795,6 +11899,64 @@ impl App {
         }
     }
 
+    /// 動画再生プレイヤーの tick。
+    /// fs_cache 内の `FsCacheEntry::Video` ごとに [`crate::video::VideoPlayer::tick`] を呼ぶ。
+    /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
+    pub(crate) fn save_all_video_resume_positions(&mut self) {
+        let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        for entry in self.fs_cache.values() {
+            if let FsCacheEntry::Video { player, .. } = entry {
+                let key = crate::adjustment_db::normalize_path(player.path());
+                updates.push((key, player.position(), player.duration()));
+            }
+        }
+        for (key, pos, dur) in updates {
+            save_video_resume_position(&mut self.settings.video_resume_positions, key, pos, dur);
+        }
+    }
+
+    pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
+        let mut next_repaint: Option<std::time::Duration> = None;
+        // 5 秒ごとに動画再生位置を settings に書き戻す (drop 漏れ救済)。
+        let now = std::time::Instant::now();
+        let do_save = self
+            .video_resume_last_save
+            .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
+            .unwrap_or(true);
+        let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        let loop_enabled = self.settings.video_loop;
+        // GPU video device の VSR opt-in 設定を最新値に同期する。Settings UI で
+        // ON/OFF した直後から次の Blt で反映される (= 動画再起動なしで効く)。
+        #[cfg(windows)]
+        if let Some(gpu_dev) = self.gpu_video_device.as_ref() {
+            gpu_dev.set_vsr_enabled(self.settings.video_rtx_vsr);
+        }
+        for entry in self.fs_cache.values_mut() {
+            if let FsCacheEntry::Video { player, .. } = entry {
+                player.set_loop_enabled(loop_enabled);
+                if let Some(d) = player.tick(ctx) {
+                    next_repaint = Some(match next_repaint {
+                        Some(prev) => prev.min(d),
+                        None => d,
+                    });
+                }
+                if do_save {
+                    let path_key = crate::adjustment_db::normalize_path(player.path());
+                    updates.push((path_key, player.position(), player.duration()));
+                }
+            }
+        }
+        if do_save {
+            self.video_resume_last_save = Some(now);
+            for (key, pos, dur) in updates {
+                save_video_resume_position(&mut self.settings.video_resume_positions, key, pos, dur);
+            }
+        }
+        if let Some(d) = next_repaint {
+            ctx.request_repaint_after(d);
+        }
+    }
+
     // -------------------------------------------------------------------
     // サムネイル画質設定ダイアログ (A/B 比較)
     // -------------------------------------------------------------------
@@ -12692,6 +12854,7 @@ impl eframe::App for App {
         self.enqueue_visible_tag_prewarms();
 
         self.poll_prefetch(ctx);
+        self.poll_video(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_erase_inpaint(ctx);
         self.poll_search();
@@ -14041,7 +14204,32 @@ pub(crate) fn draw_cell(
 
 }
 
-/// 右下オレンジ角丸バッジ。コンテナ★バッジが左下なので衝突しない配置。
+/// resume 対象とみなす最小 position (秒)。これ未満は「最初から」扱い。
+pub(crate) const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 3.0;
+/// 動画末端からこの秒数以下に位置していたら完走扱いで削除する。
+pub(crate) const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
+
+/// 動画再生位置を `Settings::video_resume_positions` に保存する。
+/// - position が `VIDEO_RESUME_MIN_POSITION_SECS` 未満 → エントリ削除 (最初から)
+/// - 残り `VIDEO_RESUME_END_GUARD_SECS` 以下 → エントリ削除 (完走済み)
+/// - それ以外 → position を保存
+fn save_video_resume_position(
+    map: &mut std::collections::HashMap<String, f64>,
+    key: String,
+    position: f64,
+    duration: f64,
+) {
+    if position < VIDEO_RESUME_MIN_POSITION_SECS {
+        map.remove(&key);
+        return;
+    }
+    if duration > 0.0 && position >= duration - VIDEO_RESUME_END_GUARD_SECS {
+        map.remove(&key);
+        return;
+    }
+    map.insert(key, position);
+}
+
 fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count: u32) {
     let text = if count >= 1000 {
         "999+".to_string()

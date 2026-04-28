@@ -268,6 +268,11 @@ impl App {
                     return Some(h.clone());
                 }
             }
+            Some(FsCacheEntry::Video { player, .. }) => {
+                if let Some(tex) = player.texture() {
+                    return Some(tex.clone());
+                }
+            }
             _ => {}
         }
         if include_thumb {
@@ -343,7 +348,9 @@ impl App {
         };
         let has_full = matches!(
             self.fs_cache.get(&idx),
-            Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. })
+            Some(FsCacheEntry::Static { .. })
+                | Some(FsCacheEntry::Animated { .. })
+                | Some(FsCacheEntry::Video { .. })
         );
         let has_thumb = matches!(
             self.thumbnails.get(idx),
@@ -572,6 +579,15 @@ fn is_landscape(
                     return s.x > s.y;
                 }
             }
+            FsCacheEntry::Video { player, .. } => {
+                if let Some(info) = player.info() {
+                    return info.width > info.height;
+                }
+                if let Some(tex) = player.texture() {
+                    let s = tex.size_vec2();
+                    return s.x > s.y;
+                }
+            }
             FsCacheEntry::Failed => {}
         }
     }
@@ -607,6 +623,11 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
+    /// 動画 GPU レンダリングで描画する最新フレーム情報 (Windows のみ)。
+    /// `Some` のとき draw_fs_image は通常 texture 描画ではなく
+    /// `egui_wgpu::Callback` 経由で fullscreen quad を描画する。
+    #[cfg(windows)]
+    gpu_video_frame: Option<crate::video::GpuLatestFrame>,
 }
 
 /// フルスクリーンのキー入力結果。
@@ -875,6 +896,8 @@ impl App {
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),
                                         state.is_video, state.fs_load_failed, fs_rotation, zp,
                                         free_rot, &bg_style, &state.location_display,
+                                        #[cfg(windows)]
+                                        state.gpu_video_frame,
                                     );
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
@@ -914,14 +937,11 @@ impl App {
                         // ── 透過背景インジケータ (B キー変更直後のみフェード表示) ──
                         self.draw_fs_transparent_bg_indicator(ui, full_rect);
 
-                        // ── 動画: 再生ボタン + Enter ──
+                        // ── 動画 HUD (下部の再生バー + 時刻 + 音量 + シークバー) ──
+                        // 入力ハンドリングは handle_image_keys の冒頭で先に呼ばれる
+                        // (handle_video_input)。ここでは描画のみ。
                         if state.is_video {
-                            draw_play_icon(ui.painter(), full_rect.center(), 56.0);
-                            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                if let Some(ref vp) = state.video_path {
-                                    open_external_player(vp);
-                                }
-                            }
+                            self.draw_video_hud(ui, ctx, full_rect, fs_idx);
                         }
 
                         // ── チェックマーク ──
@@ -978,6 +998,12 @@ impl App {
                             if close_analysis {
                                 self.reset_analysis_mode();
                             }
+                        } else if state.is_video {
+                            // 動画再生中は左 (adjustment) / 右 (metadata) の画像系パネルは
+                            // 出さない (内容が画像専用で、動画には無意味)。動画用の情報は
+                            // draw_video_hud (下部バー) と上部ホバーバーで提供する。
+                            // 将来的に動画専用の右パネル (コーデック詳細・チャプター等) を
+                            // 追加するならここに分岐する。
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
                             // 上部ホバーバーと重ならないよう、左パネルは上部バーの下から開始する。
@@ -1150,7 +1176,9 @@ impl App {
     fn location_display_for_loading(&self, idx: usize) -> String {
         let has_display_tex = matches!(
             self.fs_cache.get(&idx),
-            Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. })
+            Some(FsCacheEntry::Static { .. })
+                | Some(FsCacheEntry::Animated { .. })
+                | Some(FsCacheEntry::Video { .. })
         ) || matches!(
             self.thumbnails.get(idx),
             Some(ThumbnailState::Loaded { .. })
@@ -1177,7 +1205,11 @@ impl App {
         };
 
         let tex: Option<egui::TextureHandle> = if is_video {
-            None
+            // 動画: VideoPlayer が in-place 更新するテクスチャをそのまま使う
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => player.texture().cloned(),
+                _ => None,
+            }
         } else {
             // 補正済みキャッシュ（フル解像度）
             let adj_tex = match self.adjustment_cache.get(&fs_idx) {
@@ -1207,6 +1239,7 @@ impl App {
                         current_frame,
                         ..
                     }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+                    Some(FsCacheEntry::Video { player, .. }) => player.texture().cloned(),
                     Some(FsCacheEntry::Failed) | None => None,
                 })
         };
@@ -1229,7 +1262,31 @@ impl App {
             }
         });
 
-        let location_display = self.location_display_for(fs_idx);
+        let mut location_display = self.location_display_for(fs_idx);
+        // 動画の場合は decode 経路 (HW/SW) と GPU パス / VSR 状態を末尾に追記。
+        // VSR の状態は decoder 起動時の固定値ではなく **現在の `gpu_video_device.vsr_active()`** を
+        // 参照することで、Settings UI で動的に切り替えた値が即時反映される。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if let Some(info) = player.info() {
+                let hw = if info.hw_decode_active { "HW" } else { "SW" };
+                let mut tags = vec![hw.to_string()];
+                #[cfg(windows)]
+                {
+                    if info.gpu_path_active {
+                        tags.push("GPU".into());
+                    }
+                    let vsr_active = self
+                        .gpu_video_device
+                        .as_ref()
+                        .map(|d| d.vsr_active())
+                        .unwrap_or(false);
+                    if vsr_active {
+                        tags.push("VSR".into());
+                    }
+                }
+                location_display = format!("{}  [{}]", location_display, tags.join("/"));
+            }
+        }
         // image_dims は常に元画像のサイズを表示する（AI アップスケール後のサイズではない）。
         // AI テクスチャが選ばれている場合でも、元画像のサイズを使う。
         // GPU 上限超過で worker が clamp した画像は `source_dims` に原寸が入っており、
@@ -1259,6 +1316,13 @@ impl App {
                         (s.x as u32, s.y as u32)
                     });
                     (dims, false)
+                }
+                Some(FsCacheEntry::Video { player, .. }) => {
+                    if let Some(info) = player.info() {
+                        (Some((info.width, info.height)), false)
+                    } else {
+                        (None, false)
+                    }
                 }
                 _ => {
                     // まだ fs_cache が埋まっていない段階: ヘッダ解析済みなら原寸ヒントを使う。
@@ -1291,6 +1355,12 @@ impl App {
             _ => None,
         };
 
+        #[cfg(windows)]
+        let gpu_video_frame = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.gpu_latest(),
+            _ => None,
+        };
+
         FsFrameState {
             is_video,
             separator_text,
@@ -1304,6 +1374,8 @@ impl App {
             is_loading,
             fs_load_failed,
             pdf_content_type,
+            #[cfg(windows)]
+            gpu_video_frame,
         }
     }
 
@@ -1474,6 +1546,20 @@ impl App {
         // (矢印ナビ、R/L 回転、I メタデータ等) を無効化する。
         if self.erase_mode {
             return self.handle_erase_keys(ctx, fs_idx);
+        }
+
+        // 動画フルスクリーン中は専用キーマップ (Space=play/pause、←→=シーク、↑↓=音量、M=mute、L=loop)
+        // を画像系のキー処理より先に走らせて、Space などの画像系処理 (チェックトグル等) を回避する。
+        // handle_video_input は内部で is_video 判定 + 必要キーを consume するので、後段の
+        // consume_key は何も拾えない。
+        let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        if is_video_fs {
+            let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
+                Some(p.clone())
+            } else {
+                None
+            };
+            self.handle_video_input(ctx, fs_idx, video_path.as_deref());
         }
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
@@ -2182,10 +2268,20 @@ impl App {
                 let was_dragging = fs_response.dragged() && fs_response.drag_delta().length() > 3.0;
                 if !was_dragging {
                     if state.is_video {
-                        if fs_response.clicked() {
-                            if let Some(ref vp) = state.video_path {
-                                open_external_player(vp);
-                            }
+                        // 動画: クリックで再生/一時停止トグル (一般的な動画プレイヤー慣例)。
+                        // 外部プレイヤーで開きたい場合は Shift+Enter。
+                        // ただし下部 HUD バーの矩形内のクリックは play/pause / シーク /
+                        // 音量等のウィジェット側で処理させたいので除外する。
+                        let in_hud = fs_response
+                            .interact_pointer_pos()
+                            .map(|p| video_hud_rect(full_rect).contains(p))
+                            .unwrap_or(false);
+                        if fs_response.clicked()
+                            && !in_hud
+                            && let Some(idx) = self.fullscreen_idx
+                            && let Some(p) = self.fs_video_player(idx)
+                        {
+                            p.toggle_play();
                         }
                     } else if fs_response.clicked() {
                         // ポップアップ表示中はクリックでのページ送りを抑制
@@ -2470,7 +2566,40 @@ impl App {
         // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
         // 空ならラベル描画をスキップ。
         location_display: &str,
+        #[cfg(windows)] gpu_video_frame: Option<crate::video::GpuLatestFrame>,
     ) {
+        // GPU 経路: D3D11 共有テクスチャを wgpu に import して fullscreen quad で描画。
+        #[cfg(windows)]
+        if let Some(g) = gpu_video_frame {
+            // アスペクト比維持で full_rect 内に収める。
+            let aspect = g.width as f32 / (g.height as f32).max(1.0);
+            let avail_aspect = full_rect.width() / full_rect.height().max(1.0);
+            let img_rect = if aspect > avail_aspect {
+                let h = full_rect.width() / aspect;
+                egui::Rect::from_center_size(
+                    full_rect.center(),
+                    egui::vec2(full_rect.width(), h),
+                )
+            } else {
+                let w = full_rect.height() * aspect;
+                egui::Rect::from_center_size(
+                    full_rect.center(),
+                    egui::vec2(w, full_rect.height()),
+                )
+            };
+            let cb = egui_wgpu::Callback::new_paint_callback(
+                img_rect,
+                crate::video::gpu_renderer::VideoPaintCallback::new(
+                    g.shared_handle,
+                    g.width,
+                    g.height,
+                    g.ten_bit,
+                ),
+            );
+            ui.painter().add(cb);
+            return;
+        }
+
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
@@ -3739,6 +3868,69 @@ fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     );
 }
 
+/// 動画 HUD のボタン (play/pause / mute) の hover ハイライト。
+/// hovered = true で薄い半透明白、false で透明。
+fn draw_hud_button_bg(painter: &egui::Painter, rect: egui::Rect, hovered: bool) {
+    let bg = if hovered {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 4.0, bg);
+}
+
+/// 動画 HUD のミュート/音量アイコン (台形 + 三角の波形 or 斜線)。
+/// `muted = true` のとき波形を描かず斜線で「×」を入れる。
+fn draw_speaker_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, muted: bool) {
+    let stroke = egui::Stroke::new(r * 0.16, egui::Color32::WHITE);
+    // スピーカー本体: 左の小さい矩形 + 右の三角コーン
+    let body_w = r * 0.35;
+    let body_h = r * 0.5;
+    let body = egui::Rect::from_min_max(
+        egui::pos2(c.x - r * 0.6, c.y - body_h / 2.0),
+        egui::pos2(c.x - r * 0.6 + body_w, c.y + body_h / 2.0),
+    );
+    painter.rect_filled(body, 1.0, egui::Color32::WHITE);
+    // コーン (三角形)
+    let cone = vec![
+        egui::pos2(c.x - r * 0.6 + body_w, c.y - body_h / 2.0),
+        egui::pos2(c.x + r * 0.1, c.y - r * 0.7),
+        egui::pos2(c.x + r * 0.1, c.y + r * 0.7),
+        egui::pos2(c.x - r * 0.6 + body_w, c.y + body_h / 2.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        cone,
+        egui::Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
+    if muted {
+        // 斜線で × を表現
+        let red = egui::Stroke::new(r * 0.16, egui::Color32::from_rgb(240, 100, 100));
+        painter.line_segment(
+            [
+                egui::pos2(c.x + r * 0.25, c.y - r * 0.5),
+                egui::pos2(c.x + r * 0.85, c.y + r * 0.5),
+            ],
+            red,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x + r * 0.85, c.y - r * 0.5),
+                egui::pos2(c.x + r * 0.25, c.y + r * 0.5),
+            ],
+            red,
+        );
+    } else {
+        // 音波 (右側の弧) — 簡易的に 3 本の弧 or 短い直線で表現
+        let arc1 = egui::pos2(c.x + r * 0.35, c.y - r * 0.35);
+        let arc2 = egui::pos2(c.x + r * 0.35, c.y + r * 0.35);
+        painter.line_segment([arc1, arc2], stroke);
+        let arc3 = egui::pos2(c.x + r * 0.65, c.y - r * 0.55);
+        let arc4 = egui::pos2(c.x + r * 0.65, c.y + r * 0.55);
+        painter.line_segment([arc3, arc4], stroke);
+    }
+}
+
 /// 一時停止アイコン (2本の縦線) を描画する。
 fn draw_pause_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let bar_w = r * 0.3;
@@ -4372,6 +4564,539 @@ impl App {
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+}
+
+// ===========================================================================
+// 動画インライン再生用 UI ヘルパー
+// ===========================================================================
+
+impl App {
+    /// シーク先サムネを GPU テクスチャに反映 (in-place set。bucket key 単位で更新)。
+    /// 戻り値は描画に使う `egui::TextureId`。
+    fn upload_seek_thumb_texture(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        thumb: &crate::video::thumbnail::Thumbnail,
+    ) -> egui::TextureId {
+        // bucket key: target_secs / 0.5s 単位の整数。同じ key なら upload skip。
+        let key = (thumb.target_secs / 0.5).round() as i64;
+        let need_recreate = match &self.video_seek_thumb_tex {
+            Some((idx, _, _)) if *idx != fs_idx => true,
+            None => true,
+            _ => false,
+        };
+        let need_set = match &self.video_seek_thumb_tex {
+            Some((_, k, _)) if *k == key && !need_recreate => false,
+            _ => true,
+        };
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [thumb.width as usize, thumb.height as usize],
+            &thumb.rgba,
+        );
+        if need_recreate {
+            let label = format!("video_seek_thumb:{fs_idx}");
+            let tex = ctx.load_texture(label, color, egui::TextureOptions::LINEAR);
+            let id = tex.id();
+            self.video_seek_thumb_tex = Some((fs_idx, key, tex));
+            id
+        } else {
+            if let Some((_, k, tex)) = self.video_seek_thumb_tex.as_mut() {
+                if need_set {
+                    tex.set(color, egui::TextureOptions::LINEAR);
+                    *k = key;
+                }
+                tex.id()
+            } else {
+                // 到達不可だが安全な fallback
+                let label = format!("video_seek_thumb:{fs_idx}");
+                let tex = ctx.load_texture(label, color, egui::TextureOptions::LINEAR);
+                let id = tex.id();
+                self.video_seek_thumb_tex = Some((fs_idx, key, tex));
+                id
+            }
+        }
+    }
+
+    /// 現在 `fs_idx` のキャッシュエントリが動画なら `&VideoPlayer` を返す。
+    /// HUD 各ウィジェットの click handler / 上位の toggle_play で使う。
+    pub(crate) fn fs_video_player(&self, fs_idx: usize) -> Option<&crate::video::VideoPlayer> {
+        match self.fs_cache.get(&fs_idx)? {
+            FsCacheEntry::Video { player, .. } => Some(player),
+            _ => None,
+        }
+    }
+
+    /// 動画再生時のキー入力を処理する。フルスクリーン中で `state.is_video` のときに
+    /// 1 フレームに 1 回呼ぶ。
+    pub(crate) fn handle_video_input(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        video_path: Option<&std::path::Path>,
+    ) {
+        // IME 変換中はショートカットを発火させない
+        if self.ime_input_active() {
+            return;
+        }
+
+        // 画像系のキー処理に流れて Space=チェックトグル等の挙動が混ざるのを避けるため、
+        // ここで consume_key して入力イベントから除去する。Shift 修飾の有無も区別する。
+        // Shift+Enter: egui の `consume_key` の修飾子マッチが厳密過ぎるケース
+        // (Caps Lock + Shift など) を吸収するため、`modifiers.shift` を手動で見て
+        // Enter 単独 consume との両方を許容する。
+        let shift_held_now = ctx.input(|i| i.modifiers.shift);
+        let shift_enter = ctx.input_mut(|i| {
+            let direct = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
+            let fallback = shift_held_now
+                && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            direct || fallback
+        });
+        if shift_enter {
+            crate::logger::log("video Shift+Enter pressed → external player".to_string());
+        }
+        let space = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+        });
+        let shift_left = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
+        });
+        let shift_right = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight)
+        });
+        let left = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+        });
+        let right = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+        });
+        let shift_up = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+        });
+        let shift_down = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
+        });
+        let up = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+        });
+        let down = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+        });
+        let mute_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::M)
+        });
+        let loop_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::L)
+        });
+
+        if shift_enter {
+            if let Some(p) = video_path {
+                open_external_player(p);
+            }
+            return;
+        }
+
+        // 先に現在の音量だけ取り出す (player borrow を短く保つ)
+        let cur_volume = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.volume(),
+            _ => return,
+        };
+        let new_vol = if shift_up {
+            Some((cur_volume + 0.20).min(1.0))
+        } else if shift_down {
+            Some((cur_volume - 0.20).max(0.0))
+        } else if up {
+            Some((cur_volume + 0.05).min(1.0))
+        } else if down {
+            Some((cur_volume - 0.05).max(0.0))
+        } else {
+            None
+        };
+
+        // player に作用させる (借用はこの if-let のスコープ内で完結)
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if space {
+                player.toggle_play();
+            }
+            if left {
+                player.seek_relative(-5.0);
+            }
+            if right {
+                player.seek_relative(5.0);
+            }
+            if shift_left {
+                player.seek_relative(-30.0);
+            }
+            if shift_right {
+                player.seek_relative(30.0);
+            }
+            if let Some(v) = new_vol {
+                player.set_volume(v);
+            }
+            if mute_key {
+                player.set_muted(!player.is_muted());
+            }
+        }
+
+        // 設定への反映 (player 借用は終わっているので self.settings を書き換え可能)
+        if let Some(v) = new_vol {
+            self.settings.video_volume = v;
+        }
+        if loop_key {
+            self.settings.video_loop = !self.settings.video_loop;
+        }
+    }
+
+    /// 動画再生時のホバー HUD を描画する。下部 44px に play/pause / seek bar /
+    /// mute / volume slider を配置し、それぞれ独立した `ui.interact` でクリック・
+    /// ドラッグを処理する。HUD 領域に当たるクリックは `video_hud_rect` 経由で
+    /// `handle_fs_wheel_and_click` 側の toggle_play から除外する。
+    pub(crate) fn draw_video_hud(
+        &mut self,
+        ui: &mut egui::Ui,
+        _ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        let (is_playing, position, duration, volume, muted, has_texture, has_error) =
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => (
+                    player.is_playing(),
+                    player.position(),
+                    player.duration(),
+                    player.volume(),
+                    player.is_muted(),
+                    // CPU path: TextureHandle 有り、または GPU path: 共有 D3D11 フレーム有り、
+                    // のいずれかなら描画コンテンツが揃っているとみなす
+                    // (= "動画を準備中..." を抜けて通常表示に切り替える)。
+                    player.texture().is_some() || {
+                        #[cfg(windows)]
+                        {
+                            player.gpu_latest().is_some()
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            false
+                        }
+                    },
+                    player.error().map(|s| s.to_string()),
+                ),
+                _ => return,
+            };
+
+        // ── エラー表示 ──
+        if let Some(err) = has_error {
+            let painter = ui.painter();
+            let galley = painter.layout_no_wrap(
+                format!("動画を再生できません: {err}"),
+                egui::FontId::proportional(20.0),
+                egui::Color32::from_rgb(255, 120, 120),
+            );
+            let pos = full_rect.center() - galley.size() / 2.0;
+            let bg_rect = egui::Rect::from_min_size(pos, galley.size()).expand(12.0);
+            painter.rect_filled(
+                bg_rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+            );
+            painter.galley(pos, galley, egui::Color32::from_rgb(255, 120, 120));
+            return;
+        }
+
+        // ── まだ最初のフレームが届いていない: 中央にスピナー ──
+        if !has_texture {
+            let painter = ui.painter();
+            let galley = painter.layout_no_wrap(
+                "動画を準備中...".to_string(),
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+            let pos = full_rect.center() - galley.size() / 2.0;
+            painter.galley(pos, galley, egui::Color32::WHITE);
+            return;
+        }
+
+        // ── 一時停止中: 中央に再生アイコン ──
+        if !is_playing {
+            draw_play_icon(ui.painter(), full_rect.center(), 56.0);
+        }
+
+        // ── 下部 HUD バー ──
+        let hud_rect = video_hud_rect(full_rect);
+        let painter = ui.painter().clone();
+        painter.rect_filled(
+            hud_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+        );
+
+        // レイアウト計算 (左から): [play/pause][time][seek bar][mute][vol slider][vol %]
+        let pad = 8.0;
+        let btn_size = 28.0;
+        let cy = hud_rect.center().y;
+        let time_font = egui::FontId::proportional(14.0);
+        let label_font = egui::FontId::proportional(13.0);
+
+        // ── 再生 / 一時停止 ボタン ──
+        let play_rect = egui::Rect::from_min_size(
+            egui::pos2(hud_rect.min.x + pad, cy - btn_size / 2.0),
+            egui::vec2(btn_size, btn_size),
+        );
+        let play_resp = ui.interact(
+            play_rect,
+            egui::Id::new(("video_play", fs_idx)),
+            egui::Sense::click(),
+        );
+        draw_hud_button_bg(&painter, play_rect, play_resp.hovered());
+        if is_playing {
+            draw_pause_icon(&painter, play_rect.center(), btn_size * 0.32);
+        } else {
+            draw_play_triangle(&painter, play_rect.center(), btn_size * 0.4);
+        }
+        if play_resp.clicked()
+            && let Some(p) = self.fs_video_player(fs_idx)
+        {
+            p.toggle_play();
+        }
+
+        // ── 時刻表示 ──
+        let time_text = format!(
+            "{} / {}",
+            format_secs(position),
+            format_secs(duration.max(position)),
+        );
+        let time_galley = painter.layout_no_wrap(time_text, time_font, egui::Color32::WHITE);
+        let time_w = time_galley.size().x;
+        let time_h = time_galley.size().y;
+        let time_pos = egui::pos2(play_rect.max.x + pad, cy - time_h / 2.0);
+        painter.galley(time_pos, time_galley, egui::Color32::WHITE);
+
+        // ── 音量 % (右端、レイアウトのみ — テキストは最後に上に重ねて描く) ──
+        // 幅は常に "100%" 分を予約し、% 桁数変化で隣接ウィジェットが震えないようにする。
+        // VOL_PCT_MAX_W は 13pt の "100%" 実測幅 (~26-28px、日本語プロポーショナル
+        // フォント込みの幅変動を見越して余裕を取った値)。これより広い幅になっても
+        // 右側にはみ出すだけで隣接ウィジェットには影響しないが、これより狭いと
+        // 99% などで右にずれて見えるので保守的に大きめにする。
+        const VOL_PCT_MAX_W: f32 = 36.0;
+        let vol_pct_text = format!("{:>3}%", (volume * 100.0).round() as i32);
+        let vol_pct_galley =
+            painter.layout_no_wrap(vol_pct_text, label_font.clone(), egui::Color32::WHITE);
+        let vol_pct_block_x = hud_rect.max.x - pad - VOL_PCT_MAX_W;
+        let vol_pct_pos = egui::pos2(
+            vol_pct_block_x + (VOL_PCT_MAX_W - vol_pct_galley.size().x), // 右寄せ
+            cy - vol_pct_galley.size().y / 2.0,
+        );
+
+        // ── 音量スライダー rect (描画 / 入力は下) ──
+        let vol_slider_w = 90.0;
+        let vol_slider_rect = egui::Rect::from_min_max(
+            egui::pos2(vol_pct_block_x - pad - vol_slider_w, cy - 4.0),
+            egui::pos2(vol_pct_block_x - pad, cy + 4.0),
+        );
+        let vol_hit_rect = vol_slider_rect.expand2(egui::vec2(0.0, 10.0));
+
+        // ── ミュートアイコン rect (描画 / 入力は下) ──
+        let mute_rect = egui::Rect::from_min_size(
+            egui::pos2(vol_slider_rect.min.x - pad - btn_size, cy - btn_size / 2.0),
+            egui::vec2(btn_size, btn_size),
+        );
+
+        // ── シークバー (描画 + 入力) ──
+        // hit_rect は HUD 全高に広げてクリックしやすくする。視覚的なバーは細いまま。
+        // hover 時は target 位置に縦線 + 上に時刻ラベルを出す。
+        let seek_x0 = time_pos.x + time_w + pad * 2.0;
+        let seek_x1 = mute_rect.min.x - pad;
+        if seek_x1 > seek_x0 + 20.0 {
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(seek_x0, cy - 4.0),
+                egui::pos2(seek_x1, cy + 4.0),
+            );
+            let hit_rect = egui::Rect::from_min_max(
+                egui::pos2(seek_x0, hud_rect.min.y),
+                egui::pos2(seek_x1, hud_rect.max.y),
+            );
+            painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(80));
+            if duration > 0.0 {
+                let progress = (position / duration).clamp(0.0, 1.0) as f32;
+                let filled = egui::Rect::from_min_max(
+                    bar_rect.min,
+                    egui::pos2(bar_rect.min.x + bar_rect.width() * progress, bar_rect.max.y),
+                );
+                painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
+            }
+            let seek_resp = ui.interact(
+                hit_rect,
+                egui::Id::new(("video_seek", fs_idx)),
+                egui::Sense::click_and_drag(),
+            );
+            if seek_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            // hover プレビュー: 縦線 + サムネ画像 + 時刻ラベル
+            if seek_resp.hovered()
+                && duration > 0.0
+                && let Some(hp) = ui.ctx().input(|i| i.pointer.hover_pos())
+            {
+                let x = hp.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                painter.line_segment(
+                    [
+                        egui::pos2(x, hud_rect.min.y + 4.0),
+                        egui::pos2(x, hud_rect.max.y - 4.0),
+                    ],
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 120)),
+                );
+                let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0) as f64;
+                let target = frac * duration;
+
+                // サムネ要求 (毎フレーム呼んで OK、worker 側で drain + LRU)
+                if let Some(p) = self.fs_video_player(fs_idx) {
+                    p.request_seek_thumbnail(target);
+                }
+
+                // 直近キャッシュからサムネ取得 → GPU テクスチャに反映 → 描画
+                let thumb_opt = self.fs_video_player(fs_idx)
+                    .and_then(|p| p.nearest_seek_thumbnail(target));
+                let thumb_drawn = if let Some(thumb) = thumb_opt.as_ref() {
+                    let tex_id = self.upload_seek_thumb_texture(ui.ctx(), fs_idx, thumb);
+                    let thumb_w = thumb.width as f32;
+                    let thumb_h = thumb.height as f32;
+                    let thumb_x = (x - thumb_w / 2.0)
+                        .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - thumb_w - 2.0);
+                    let thumb_y = hud_rect.min.y - thumb_h - 8.0;
+                    let thumb_rect = egui::Rect::from_min_size(
+                        egui::pos2(thumb_x, thumb_y),
+                        egui::vec2(thumb_w, thumb_h),
+                    );
+                    // 黒背景 (枠 + うっすら内側 padding) + 画像 + 白枠
+                    painter.rect_filled(
+                        thumb_rect.expand(2.0),
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                    );
+                    painter.image(
+                        tex_id,
+                        thumb_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    painter.rect_stroke(
+                        thumb_rect,
+                        2.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                        egui::StrokeKind::Inside,
+                    );
+                    Some(thumb_rect)
+                } else {
+                    None
+                };
+
+                // 時刻ラベル: サムネがあればその下端、なければ HUD 上端の少し上
+                let label = format_secs(target);
+                let galley =
+                    painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
+                let label_size = galley.size();
+                let label_pos = if let Some(thumb_rect) = thumb_drawn {
+                    egui::pos2(
+                        (x - label_size.x / 2.0).clamp(
+                            thumb_rect.min.x,
+                            thumb_rect.max.x - label_size.x,
+                        ),
+                        thumb_rect.max.y - label_size.y - 4.0,
+                    )
+                } else {
+                    egui::pos2(
+                        (x - label_size.x / 2.0)
+                            .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - label_size.x - 2.0),
+                        hud_rect.min.y - label_size.y - 6.0,
+                    )
+                };
+                let bg = egui::Rect::from_min_size(label_pos, label_size).expand(4.0);
+                painter.rect_filled(
+                    bg,
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                );
+                painter.galley(label_pos, galley, egui::Color32::WHITE);
+            }
+            if (seek_resp.clicked() || seek_resp.dragged())
+                && duration > 0.0
+                && let Some(pp) = seek_resp.interact_pointer_pos()
+                && let Some(p) = self.fs_video_player(fs_idx)
+            {
+                let frac = ((pp.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                p.seek(frac as f64 * duration);
+            }
+        }
+
+        // ── ミュートボタン (描画 + 入力) ──
+        let mute_resp = ui.interact(
+            mute_rect,
+            egui::Id::new(("video_mute", fs_idx)),
+            egui::Sense::click(),
+        );
+        draw_hud_button_bg(&painter, mute_rect, mute_resp.hovered());
+        draw_speaker_icon(&painter, mute_rect.center(), btn_size * 0.55, muted);
+        if mute_resp.clicked()
+            && let Some(p) = self.fs_video_player(fs_idx)
+        {
+            p.set_muted(!muted);
+        }
+
+        // ── 音量スライダー (描画 + 入力) ──
+        painter.rect_filled(vol_slider_rect, 2.0, egui::Color32::from_gray(80));
+        let vol_filled = egui::Rect::from_min_max(
+            vol_slider_rect.min,
+            egui::pos2(
+                vol_slider_rect.min.x + vol_slider_rect.width() * volume.clamp(0.0, 1.0) as f32,
+                vol_slider_rect.max.y,
+            ),
+        );
+        painter.rect_filled(vol_filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
+        let vol_resp = ui.interact(
+            vol_hit_rect,
+            egui::Id::new(("video_vol", fs_idx)),
+            egui::Sense::click_and_drag(),
+        );
+        if vol_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if (vol_resp.clicked() || vol_resp.dragged())
+            && let Some(pp) = vol_resp.interact_pointer_pos()
+        {
+            let frac = ((pp.x - vol_slider_rect.min.x) / vol_slider_rect.width())
+                .clamp(0.0, 1.0) as f64;
+            if let Some(p) = self.fs_video_player(fs_idx) {
+                p.set_volume(frac);
+            }
+            self.settings.video_volume = frac;
+        }
+
+        // ── 音量 % テキスト (一番最後に描画 = 上に乗せる) ──
+        painter.galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
+    }
+}
+
+/// 動画 HUD の下部バー領域 (高さ 44px)。
+/// `handle_fs_wheel_and_click` でこの矩形内のクリックを toggle_play から除外するために
+/// 共通化している。
+pub(crate) fn video_hud_rect(full_rect: egui::Rect) -> egui::Rect {
+    let hud_h = 44.0;
+    egui::Rect::from_min_max(
+        egui::pos2(full_rect.min.x, full_rect.max.y - hud_h),
+        full_rect.max,
+    )
+}
+
+fn format_secs(s: f64) -> String {
+    let total = s.max(0.0).round() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let sec = total % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{sec:02}")
+    } else {
+        format!("{m:02}:{sec:02}")
     }
 }
 

@@ -31,5 +31,14 @@ if [ "$killed" = "1" ]; then
     sleep 0.5
 fi
 
-echo "[build-release] cargo build --release --bin mimageviewer $*"
-cargo build --release --bin mimageviewer "$@"
+# 2 段階ビルド (ランチャー方式):
+#   1. core (本体、FFmpeg DLL に静的依存) を `mimageviewer-core.exe` として生成
+#   2. launcher (FFmpeg 非依存、core + 5 DLL を include_bytes! で内包) を
+#      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
+#
+# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 2 回呼ぶ。
+echo "[build-release] (1/2) cargo build --release --bin mimageviewer-core $*"
+cargo build --release --bin mimageviewer-core "$@"
+
+echo "[build-release] (2/2) cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
+cargo build --release -p mimageviewer-launcher --bin mimageviewer "$@"

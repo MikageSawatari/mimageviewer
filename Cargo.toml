@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/susie-worker", "tools/png2mag"]
+members = ["crates/susie-worker", "crates/launcher", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"
@@ -8,7 +8,22 @@ edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
 
+# 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
+# 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。
+# ランチャーは初回起動時に core と FFmpeg DLL を %APPDATA% に展開して core を spawn する
+# (詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節を参照)。
+[[bin]]
+name = "mimageviewer-core"
+path = "src/main.rs"
+
 [target.'cfg(windows)'.dependencies]
+# wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
+# 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle
+# 経由で生成するときに使う (本体の windows 0.61 とは ID3D12Resource 型互換性なし)。
+windows_058 = { package = "windows", version = "0.58", features = [
+    "Win32_Graphics_Direct3D12",
+    "Win32_Foundation",
+] }
 windows = { version = "0.61", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -22,10 +37,15 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_Security",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Imaging",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -36,6 +56,13 @@ windows = { version = "0.61", features = [
 [dependencies]
 eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
+egui-wgpu = "0.33"
+# 動画 GPU レンダリングで wgpu API + dx12 hal 経由の D3D11→wgpu テクスチャ共有が
+# 必要なので、明示的に wgpu / wgpu-hal を依存させる (eframe[wgpu] が間接的に
+# 引いている版に揃える)。wgpu-hal 27 は windows 0.58 系の ID3D12Resource を要求
+# するため、そちらも `windows_058` 別名で導入する (本体側は windows 0.61)。
+wgpu = "27"
+wgpu-hal = { version = "27", features = ["dx12"] }
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 # SIMD (SSE4.1/AVX2) 実装のリサイズ。image crate の imageops::resize はスカラー実装で
 # 7K-9K クラスの画像で秒単位かかるため、clamp_dynamic_for_gpu とサムネイル生成で使用。
@@ -82,6 +109,15 @@ tray-icon = "0.20"
 # rustls-tls 指定で OpenSSL に依存しない (CRT 静的リンク方針との両立)。
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 semver = "1"
+# 動画インライン再生 (フルスクリーンで MP4/MKV/MOV/AVI/WMV/MPG/MPEG を再生)。
+# BtbN の FFmpeg LGPL shared build を vendor/ffmpeg/ に置き、FFMPEG_DIR で参照する
+# (.cargo/config.toml に env で指定済み)。DLL は include_bytes! で exe に埋め込み、
+# 初回起動時に %APPDATA%/mimageviewer/ffmpeg/ に展開して動的ロードする。
+# *-sys のビルドに libclang (LLVM/Clang) が必要。詳細は CLAUDE.md の
+# 「FFmpeg セットアップ」節を参照。
+ffmpeg-the-third = { version = "3", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+# 動画の音声出力 (Windows では WASAPI Shared モード)。
+cpal = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

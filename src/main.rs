@@ -76,6 +76,7 @@ mod ui_main;
 mod ui_metadata_panel;
 pub mod ui_susie_diagnostic;
 pub mod update_check;
+pub mod video;
 pub mod video_thumb;
 pub mod wic_decoder;
 pub mod xmp_reader;
@@ -281,8 +282,40 @@ fn main() -> eframe::Result {
         }
     }
 
+    // wgpu のバックエンドは **DX12 を優先 + Vulkan フォールバック**。
+    // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
+    // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
+    // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
+    // 動画 GPU 経路は実行時に `cc.wgpu_render_state.adapter.get_info().backend` を見て
+    // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
+    let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
+        create_new.instance_descriptor.backends =
+            wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        create_new.native_adapter_selector = Some(std::sync::Arc::new(
+            |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
+                if let Some(a) = adapters
+                    .iter()
+                    .find(|a| a.get_info().backend == wgpu::Backend::Dx12)
+                {
+                    return Ok(a.clone());
+                }
+                if let Some(a) = adapters
+                    .iter()
+                    .find(|a| a.get_info().backend == wgpu::Backend::Vulkan)
+                {
+                    return Ok(a.clone());
+                }
+                adapters
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "no wgpu adapter available".to_string())
+            },
+        ));
+    }
     let options = eframe::NativeOptions {
         viewport,
+        wgpu_options,
         ..Default::default()
     };
 
@@ -312,6 +345,48 @@ fn main() -> eframe::Result {
             let mut app = app::App::default();
             emit_startup("app_default", Some(t));
             app.applied_ui_theme = Some(resolved);
+
+            // 動画 GPU レンダリング用の wgpu::Device / Queue を保存。
+            // また同時に共有 D3D11 デバイスを初期化 (失敗してもアプリは起動継続、
+            // 動画は旧経路 = CPU readback + swscale にフォールバック)。
+            #[cfg(windows)]
+            {
+                if let Some(rs) = cc.wgpu_render_state.clone() {
+                    // 実際に選ばれた wgpu バックエンドを確認。動画 GPU 経路は
+                    // `wgpu_hal::api::Dx12` 経由で D3D11 NT shared texture を
+                    // import するので **DX12 でないと使えない**。Vulkan
+                    // (= リモートデスクトップ等の fallback) では GPU video device を
+                    // 作らず CPU readback + swscale 経路にフォールバックする。
+                    let backend = rs.adapter.get_info().backend;
+                    let is_dx12 = matches!(backend, wgpu::Backend::Dx12);
+                    crate::logger::log(format!(
+                        "wgpu backend selected: {backend:?} (gpu_video_pipeline={})",
+                        if is_dx12 { "available" } else { "disabled (non-DX12)" }
+                    ));
+                    if is_dx12 {
+                        // egui_wgpu の callback_resources に動画描画用の wgpu パイプラインを
+                        // 起動時 1 度だけ登録 (= 各 paint で再利用される shared resource)。
+                        crate::video::gpu_renderer::init_video_pipeline(&rs);
+                        match crate::video::gpu_renderer::GpuVideoDevice::new(
+                            app.settings.video_rtx_vsr,
+                        ) {
+                            Ok(dev) => {
+                                crate::logger::log(
+                                    "GPU video device: created (D3D11 + video processor)"
+                                        .to_string(),
+                                );
+                                app.gpu_video_device = Some(dev);
+                            }
+                            Err(e) => {
+                                crate::logger::log(format!(
+                                    "GPU video device: failed (will fallback to CPU readback): {e}"
+                                ));
+                            }
+                        }
+                    }
+                    app.wgpu_render_state = Some(rs);
+                }
+            }
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
             let t = Instant::now();
             app.hydrate_adjustment_favorite_params();

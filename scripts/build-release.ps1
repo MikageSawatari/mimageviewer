@@ -119,10 +119,21 @@ if (Test-Path $releaseExe) {
     }
 }
 
-$cargoCmd = @('build', '--release', '--bin', 'mimageviewer')
-if ($CargoArgs) {
-    $cargoCmd += $CargoArgs
-}
-Write-Host ("[build-release] cargo {0}" -f ($cargoCmd -join ' '))
-& cargo @cargoCmd
+# 2 段階ビルド (ランチャー方式):
+#   1. core (本体、FFmpeg DLL に静的依存) を `mimageviewer-core.exe` として生成
+#   2. launcher (FFmpeg 非依存、core + 5 DLL を include_bytes! で内包) を
+#      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
+#
+# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 2 回呼ぶ。
+
+$coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
+if ($CargoArgs) { $coreCmd += $CargoArgs }
+Write-Host ("[build-release] (1/2) cargo {0}" -f ($coreCmd -join ' '))
+& cargo @coreCmd
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
+if ($CargoArgs) { $launcherCmd += $CargoArgs }
+Write-Host ("[build-release] (2/2) cargo {0}" -f ($launcherCmd -join ' '))
+& cargo @launcherCmd
 exit $LASTEXITCODE

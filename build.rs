@@ -3,6 +3,24 @@ fn main() {
     // 代わって復旧手順付きの明確なメッセージを出す。
     check_vendor_files();
 
+    // FFmpeg DLL は `target/release/` には自動でコピーしない。
+    //
+    // 本体 (`mimageviewer-core.exe`) は配布物としては直接使われず、ランチャー
+    // (`crates/launcher/`、`mimageviewer.exe` を生成) が `include_bytes!` で
+    // core と FFmpeg DLL 5 つを内包し、起動時に `%APPDATA%\mimageviewer\runtime\<v>\`
+    // に展開して core を spawn する。
+    //
+    // 開発時に直接 `target/release/mimageviewer-core.exe` を実行したいときは、
+    // `vendor/ffmpeg/bin/*.dll` を手動で同じディレクトリにコピーすること。
+    // (もしくは PowerShell で:
+    //   `Copy-Item vendor/ffmpeg/bin/*.dll target/release/`)
+    //
+    // 経緯: 当初 `include_bytes!` → APPDATA 展開で本体に直接埋め込もうとしたが、
+    // `ffmpeg-the-third` は MSVC import library 経由なので Windows ローダが
+    // exe ロード時点 (Rust コードが走るより前) に DLL を解決する必要があり間に
+    // 合わない。`/DELAYLOAD` も rustc 経由の link.exe で Delay Import Directory が
+    // 空のまま生成される問題があり機能せず、最終的にランチャー方式に切り替えた。
+
     #[cfg(target_os = "windows")]
     {
         let mut res = winresource::WindowsResource::new();
@@ -25,8 +43,8 @@ fn main() {
 }
 
 /// `include_bytes!` で埋め込む vendor ファイル (PDFium / ONNX Runtime / Susie 32bit ワーカー /
-/// AI モデル) が揃っているかをビルド前にチェックし、欠落時は復旧用セットアップ手順を含む
-/// 明確なエラーメッセージで終了する。
+/// FFmpeg LGPL DLL / AI モデル) が揃っているかをビルド前にチェックし、欠落時は復旧用
+/// セットアップ手順を含む明確なエラーメッセージで終了する。
 fn check_vendor_files() {
     // (path, setup script / 取得方法)
     let required: &[(&str, &str)] = &[
@@ -42,6 +60,49 @@ fn check_vendor_files() {
         (
             "vendor/susie-worker/mimageviewer-susie32.exe",
             "bash scripts/setup-susie-worker.sh",
+        ),
+        // FFmpeg 7.x LGPL shared build (BtbN ffmpeg-n7.1*-win64-lgpl-shared)
+        // バージョンを上げる (8.x 等) と DLL のメジャー番号が変わるため、ここと
+        // src/video/ffmpeg_loader.rs の include_bytes! パスを揃えて更新すること。
+        (
+            "vendor/ffmpeg/bin/avcodec-61.dll",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/bin/avformat-61.dll",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/bin/avutil-59.dll",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/bin/swscale-8.dll",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/bin/swresample-5.dll",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/lib/avcodec.lib",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/lib/avformat.lib",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/lib/avutil.lib",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/lib/swscale.lib",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/lib/swresample.lib",
+            "bash scripts/setup-ffmpeg.sh",
         ),
         // AI モデルは配布スクリプトが無いので、既存インストール済み環境からコピーする旨を案内
         (

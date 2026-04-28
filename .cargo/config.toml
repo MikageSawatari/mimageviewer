@@ -3,3 +3,10 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# ffmpeg-the-third (ffmpeg-sys-the-third) が FFmpeg のヘッダ・import library を見つける
+# ためのルートディレクトリ。setup-ffmpeg.sh が vendor/ffmpeg/ に
+# include/ と lib/ と bin/ を配置する。
+# `relative = true` で manifest dir 起点に解決される。
+[env]
+FFMPEG_DIR = { value = "vendor/ffmpeg", relative = true }

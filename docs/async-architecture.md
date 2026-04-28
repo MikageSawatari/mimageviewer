@@ -17,6 +17,9 @@
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
 | AI 推論 | `std::thread` + mpsc | 1 (全モデル共通) | ort (DirectML) の upscale/denoise/inpaint |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
+| 動画デコード | `std::thread` (`video-decode`) | フルスクリーン中の動画 1 つにつき 1 本 | FFmpeg (`avformat_open_input` → `avcodec_send_packet` → `swscale` → bounded mpsc) で 1 動画分を直列に流す。`Arc<AtomicBool>` キャンセルで Drop 時停止 |
+| 動画音声 pump | `std::thread` (`audio-pump`) | 動画 1 つにつき 1 本 | デコーダから受けた音声フレームを `swresample` 後 ring buffer に押し込む。RT 出力は cpal の専用スレッドが担当 |
+| 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、`AvClock::set_audio_pts` でマスタークロックを更新 |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
 | メタ索引 supervisor (Ctrl+F/G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
