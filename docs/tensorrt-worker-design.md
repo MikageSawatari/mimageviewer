@@ -339,3 +339,58 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
 - `--tensorrt-infer-worker`: 長命プロセス、コマンド受信 + 推論ループ。実行時用。
 
 両者は別々のサブコマンド、別々のライフサイクル。
+
+## Phase 3 パフォーマンス測定結果
+
+Phase 3 着手前に懸念していた「ワーカー化で per-tile IPC overhead が大きく出るのでは」
+という点を実測で検証した結果のサマリ (RTX 4090、Windows 11、ORT GPU 1.24.2、
+TensorRT 10.16、CUDA 12.9 にて)。
+
+### IPC オーバーヘッドの最適化フェーズ
+
+worker pool を導入した素朴実装からの段階的最適化:
+
+| 実装 | nmkd_siax_4x (1024² 入力) wall total | per-tile session_run |
+|------|-------------------------------------:|---------------------:|
+| Phase 3 Step 3 (毎タイル shm create/open) | 484 ms | 21 ms |
+| Phase 3 Step 3.5 (永続 shm 再利用) | 361 ms | 21 ms |
+| Phase 3 Step 3.6 (zero-copy slice cast) | 280 ms | 21 ms |
+| Phase 2 直接 TRT (参考、worker 不使用) | 270 ms | 21 ms |
+
+zero-copy 化後、Phase 3 worker のオーバーヘッドは **1〜4 ms/tile** (16 タイル合計
+~30 ms) まで縮まり、Phase 2 直接 TRT との差はノイズに埋もれる規模になった。
+当初懸念の「~15 ms/tile」は永続化前の素朴実装値。
+
+### bench セッション間のばらつき
+
+Step 3.6 完了後 → Step 4/5 着手前に追測したところ、同じバイナリ・同じ engine cache
+でも `session.run` 自体が 21 ms から 35 ms に増えるケースを観測した。原因切り分け:
+
+1. `--legacy-direct-trt` (Phase 2 互換、worker 不使用) でも 35 ms 出る
+   → アーキテクチャ起因ではない
+2. `MIV_TRT_BENCH_LOOP=5` で同 tensor を 5 連続 session.run、全回 30〜36 ms 均一
+   → GPU 初回 warmup や sleep ではない (それなら 1st だけ遅い)
+3. `SetPriorityClass(HIGH_PRIORITY_CLASS)` を子プロセスに設定 → 効果なし
+   → Win32 スケジューラ粒度ではない
+
+結論: GPU 熱・他プロセス影響・Windows のバックグラウンドタスク等の **環境要因**。
+GPU が冷えた状態 / 他に重いプロセスがいない状態で実測すると 21 ms に戻る。
+本番運用でも同様の揺らぎが起きうるため、ユーザー向け数値は「最良 21 ms、混雑時
+35 ms」のレンジで認識する。
+
+### モデル別の DirectML / TensorRT 比較 (FP16、Phase 3 Step 3.6 時点)
+
+| モデル | DirectML wall (ms) | TRT (worker) wall (ms) | 倍率 |
+|---|---:|---:|---:|
+| upscale_realesrgan_x4plus | ~3500 | ~1800 | ~1.9x |
+| upscale_realesrgan_anime6b | ~3200 | ~960 | ~3.4x |
+| upscale_realesrgan_general_v3 | ~2200 | ~1500 | ~1.5x |
+| upscale_realcugan_4x | ~3800 | ~2700 | ~1.4x |
+| upscale_nmkd_siax_4x | ~4000 | ~1500 | ~2.7x |
+| denoise_realplksr | ~1100 | ~240 | ~4.5x |
+
+(画像サイズ 1024×1024、タイル境界条件込みの wall。手元の overnight bench から、
+個別タイル `session_run` ではなく upscale 全体時間)
+
+これらの倍率はマニュアル `htdocs/.../settings.html` の「アップスケール 1.4〜3.4 倍、
+ノイズ除去 約 4.5 倍」表記の根拠。
