@@ -389,11 +389,15 @@ of this software and associated documentation files (the "Software"), ...
       動作。RTX 20 (sm75) は将来 RunPod T4 で別途 build 想定 (現状は DirectML フォールバック)
 - [ ] mIV 利用規約に「同梱のサードパーティコンポーネントの権利は各社に帰属し、抽出・別再配布・
       リバースエンジニアリング等は禁止」の条項を追記
-- [ ] `NOTICE-NVIDIA.txt` と `LICENSE-onnxruntime.txt` (+ `ThirdPartyNotices.txt` あれば
-      それも) を zip に同梱する仕組みを `build_trt_pack.rs` に追加
-- [ ] 不確実点 1〜2 (cusolverMg / nvrtc.alt の variant 解釈) は **実機で REMOVABLE と確定**
-      → 配布物から除外済みのため懸念解消。残り 3 (nvonnxparser) も **engine 既ビルド済みで
-      不要 → 除外済み**
+- [x] **`NOTICE-NVIDIA.txt` と `LICENSE-onnxruntime.txt` の同梱を `build_trt_pack.rs` に追加
+      (Apr 28)**: const 文字列を埋め込み → `dist/trt-pack-v<N>/` に LF 固定で書き出し →
+      manifest の `notices: Vec<AssetEntry>` に SHA-256 付きで登録。downloader (Step 5) は
+      common DLL と同じ経路で `tensorrt/<name>` に配置・検証する想定。manifest_format=3 に bump。
+      ThirdPartyNotices.txt は ORT GPU NuGet に同梱されておらず、内容も MIT ライセンス本文と
+      重複するため別途同梱しない方針 (= MIT 本文だけで attribution 要件を満たす)
+- [x] **不確実点 1〜2 (cusolverMg / nvrtc.alt の variant 解釈) は実機で REMOVABLE と確定**
+      → 配布物から除外済みのため懸念解消。残り 3 (nvonnxparser) も engine 既ビルド済みで
+      不要 → 除外済み
 
 ---
 

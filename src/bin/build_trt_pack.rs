@@ -9,8 +9,10 @@
 //! ## 出力 (`dist/trt-pack-v<N>/`)
 //!
 //! - `manifest.json` - 全アセットの SHA-256 + サイズ + 各種バージョン情報
-//! - `<dll>.dll` × ~30 - GitHub Releases にそのままアップロードする runtime DLL 群
+//! - `<dll>.dll` × ~13 - GitHub Releases にそのままアップロードする runtime DLL 群
 //! - `engines-ampere_plus.zip` - 6 モデル分の事前ビルド済み engine をまとめた zip
+//! - `NOTICE-NVIDIA.txt` - NVIDIA SDK SLA / 各 Supplement の attribution と利用条件抜粋
+//! - `LICENSE-onnxruntime.txt` - ONNX Runtime (Microsoft) の MIT ライセンス全文
 //!
 //! ## 設計判断 (Apr 28 ライセンス調査結果反映)
 //!
@@ -42,6 +44,95 @@ use sha2::{Digest, Sha256};
 /// pack バージョン。`tensorrt_pack.rs::EXPECTED_TRT_PACK_VERSION` と揃える。
 /// CUDA / cuDNN / TensorRT / ORT のいずれかを更新したら bump する。
 const PACK_VERSION: u32 = 1;
+
+/// `NOTICE-NVIDIA.txt` 文面。pack に同梱する NVIDIA コンポーネントの attribution と
+/// 利用条件 (= mIV 専用、抽出再配布禁止、リバースエンジニアリング禁止) を明記する。
+///
+/// 出典:
+/// - docs/licensing-tensorrt.md §NOTICE-NVIDIA.txt 推奨文面 (Apr 28 確定)
+/// - 列挙する DLL は §最終 DLL セット の REQUIRED 13 個に合わせて整理
+///
+/// 注意: バージョン番号 (CUDA 12.9 / cuDNN 9.21 / TensorRT 10.16) を更新する場合は
+/// `setup-tensorrt-pack.ps1` 側の `$*_VERSION` と同期させる。
+const NOTICE_NVIDIA: &str = "\
+This product includes software components from NVIDIA Corporation, redistributed under
+the NVIDIA Software License Agreement for NVIDIA Software Development Kits and its
+supplements. Use of these components is subject to those agreements.
+
+Components included (mImageViewer TensorRT acceleration pack v1):
+
+  CUDA Runtime / Math / NVRTC / nvJitLink (CUDA Toolkit 12.9)
+    cudart64_12.dll
+    cublasLt64_12.dll
+    cufft64_11.dll
+    nvJitLink_120_0.dll
+    nvrtc64_120_0.dll
+    nvrtc-builtins64_129.dll
+
+  cuDNN (NVIDIA cuDNN 9.21)
+    cudnn_ops64_9.dll
+
+  TensorRT (NVIDIA TensorRT 10.16)
+    nvinfer_10.dll
+    nvinfer_plugin_10.dll
+
+  Pre-built TensorRT engines (kAMPERE_PLUS hardware-compatible mode, sm80+)
+    engines-ampere_plus.zip
+      Built with TensorRT 10.16 from publicly distributed ONNX models
+      (Real-ESRGAN, Real-CUGAN, NMKD-Siax, RealPLKSR). The .engine binaries
+      are derivative artifacts of the TensorRT builder; their distribution is
+      governed by the TensorRT supplement's runtime distribution clause.
+
+Copyright (c) NVIDIA Corporation. All rights reserved.
+
+Source license texts (please consult the latest revision at the URLs below):
+  CUDA Toolkit EULA:   https://docs.nvidia.com/cuda/eula/index.html
+  cuDNN SLA:           https://docs.nvidia.com/deeplearning/cudnn/sla/index.html
+  TensorRT SLA:        https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html
+
+These components are redistributed solely for use with mImageViewer
+(https://mikage.to/mimageviewer/). The following are prohibited:
+
+  - Reverse engineering, decompilation, or disassembly of the components,
+    except to the extent expressly permitted by applicable law.
+  - Extraction of the components for use outside of mImageViewer or for
+    redistribution as a standalone or repackaged NVIDIA SDK.
+  - Use of the components in violation of the NVIDIA license agreements
+    referenced above, including but not limited to the Distribution
+    Requirements of the NVIDIA Software License Agreement for SDKs.
+
+mImageViewer makes no claim of endorsement or affiliation with NVIDIA
+Corporation. \"NVIDIA\", \"CUDA\", \"cuDNN\", and \"TensorRT\" are trademarks of
+NVIDIA Corporation.
+";
+
+/// `LICENSE-onnxruntime.txt` 文面 (Microsoft ONNX Runtime MIT License 全文)。
+///
+/// 出典: https://github.com/microsoft/onnxruntime/blob/main/LICENSE
+/// (2024 年版を確認、本文は 2018 年から実質的な変更なし)
+const LICENSE_ONNXRUNTIME: &str = "\
+MIT License
+
+Copyright (c) Microsoft Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the \"Software\"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+";
 
 /// Apr 28 multi-model trim test で「全 6 モデルが動く最小セット」から除外可能と
 /// 確定した DLL のリスト。Round 1+2 (anime6b 単独) では nmkd_siax_4x がカバーされず
@@ -129,7 +220,8 @@ struct EnginePack {
 #[derive(Debug, Serialize)]
 struct Manifest {
     /// マニフェスト構造のバージョン。`Manifest` のフィールド構造を変えたら bump。
-    /// v2 (Apr 28 改訂): per_sm/optional/PTX を撤廃、engines bucket を導入。
+    /// - v2 (Apr 28): per_sm/optional/PTX を撤廃、engines bucket を導入
+    /// - v3 (Apr 28): NOTICE-NVIDIA.txt / LICENSE-onnxruntime.txt の同梱を追加
     manifest_format: u32,
     /// pack バージョン (`PACK_VERSION`)。
     pack_version: u32,
@@ -138,6 +230,10 @@ struct Manifest {
     /// 全ユーザーが DL する DLL 群 (CUDA / cuDNN / TRT runtime / ORT)。
     /// `nvinfer_builder_resource_*.dll` は含めない (ライセンス上の判断)。
     common: Vec<AssetEntry>,
+    /// 法的に同梱必須のテキストファイル (NOTICE-NVIDIA.txt, LICENSE-onnxruntime.txt)。
+    /// ハッシュ検証対象。downloader は common と同じ経路で DL し
+    /// `%APPDATA%/mimageviewer/tensorrt/` に配置する。
+    notices: Vec<AssetEntry>,
     /// GPU 世代別の engine pack (zip)。downloader は SM に合わせて 1 個だけ DL。
     engines: Vec<EnginePack>,
     /// common DL 量の合計 (UI で進捗表示する際の分母)。
@@ -290,6 +386,25 @@ fn main() {
     }];
     let engine_total_bytes: u64 = zip_bytes;
 
+    // ── notices (NOTICE-NVIDIA.txt, LICENSE-onnxruntime.txt) ──
+    // ライセンス文書は const 文字列を直接ファイルに書き出し、SHA-256 を取って
+    // manifest に登録する。downloader 側はこれを common DLL と同じ要領で
+    // %APPDATA%/mimageviewer/tensorrt/ に DL & 検証して配置する。
+    // 改行コードは LF で固定 (= const 文字列のまま) にして OS をまたいでもハッシュが
+    // 安定するようにする。
+    let notices = write_and_hash_notices(&dist_dir).unwrap_or_else(|e| {
+        eprintln!("ERROR: write notices: {e}");
+        std::process::exit(1);
+    });
+    for asset in &notices {
+        println!(
+            "  notice: {} ({} bytes, sha256={}…)",
+            asset.name,
+            asset.bytes,
+            &asset.sha256[..12]
+        );
+    }
+
     // ── manifest ──
     let mut versions = BTreeMap::new();
     versions.insert("ort_gpu".to_string(), install_ok.ort_gpu_version.clone());
@@ -305,10 +420,11 @@ fn main() {
     versions.insert("trt".to_string(), install_ok.trt_version.clone());
 
     let manifest = Manifest {
-        manifest_format: 2,
+        manifest_format: 3,
         pack_version: PACK_VERSION,
         versions,
         common,
+        notices,
         engines,
         common_total_bytes,
         created_at: utc_now_iso8601(),
@@ -336,6 +452,12 @@ fn main() {
         "engine pack [ampere_plus]: {:.1} MiB",
         engine_total_bytes as f64 / 1024.0 / 1024.0
     );
+    let notices_total_bytes: u64 = manifest.notices.iter().map(|a| a.bytes).sum();
+    println!(
+        "notices: {} ファイル、{} bytes (NOTICE-NVIDIA.txt + LICENSE-onnxruntime.txt)",
+        manifest.notices.len(),
+        notices_total_bytes
+    );
     println!(
         "ユーザー DL 量 (sm80+ ユーザー): 約 {:.2} GB",
         total_user_dl as f64 / 1_073_741_824.0
@@ -346,6 +468,36 @@ fn main() {
     println!("     (タグ名: trt-pack-v{} 推奨)", PACK_VERSION);
     println!("  2. mIV の `tensorrt_pack` モジュールに manifest URL を埋め込む");
     println!("  3. cargo build --release でビルド & 配布");
+}
+
+/// `NOTICE-NVIDIA.txt` と `LICENSE-onnxruntime.txt` を `dist_dir` に書き出して
+/// SHA-256 を計算する。改行コードは LF 固定 (= const 文字列そのまま) にして、
+/// OS や VCS の autocrlf 設定の影響でハッシュが揺れないようにする。
+///
+/// pack DL 経路でこの 2 つは common DLL と同じ位置 (`tensorrt/<name>`) に配置される
+/// 想定なので、ファイル名は manifest 通りそのまま使う。
+fn write_and_hash_notices(dist_dir: &Path) -> std::io::Result<Vec<AssetEntry>> {
+    let entries: &[(&str, &str)] = &[
+        ("NOTICE-NVIDIA.txt", NOTICE_NVIDIA),
+        ("LICENSE-onnxruntime.txt", LICENSE_ONNXRUNTIME),
+    ];
+    let mut out = Vec::with_capacity(entries.len());
+    for (name, body) in entries {
+        let path = dist_dir.join(name);
+        // バイナリモードで書き出して、Windows でも CRLF 変換が掛からないようにする。
+        let bytes = body.as_bytes();
+        fs::write(&path, bytes)?;
+        // ハッシュは const 文字列そのものから計算 (= ファイル内容と一致するはず)。
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = hasher.finalize();
+        out.push(AssetEntry {
+            name: (*name).to_string(),
+            sha256: hex_encode(&hash),
+            bytes: bytes.len() as u64,
+        });
+    }
+    Ok(out)
 }
 
 /// 6 モデル分の engine cache を 1 つの zip にまとめる。
