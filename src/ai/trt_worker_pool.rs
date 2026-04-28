@@ -155,6 +155,102 @@ impl TrtWorkerPool {
         Ok(resp.elapsed_ms.unwrap_or(0))
     }
 
+    /// 指定モデルで推論を実行する。入力 NCHW Array4<f32> を共有メモリに書き、
+    /// ワーカーが推論し、結果を別の共有メモリから読み取って返す。
+    ///
+    /// 戻り値: `(出力 shape NCHW, 出力テンソル平坦化 Vec<f32>)`。
+    /// 出力サイズ計算: NCHW 形状なので
+    ///   output.len() == output_shape.iter().product::<i64>() as usize
+    ///
+    /// 並行呼び出しは Mutex で直列化される (現状ワーカー 1 個のみなので)。
+    #[cfg(windows)]
+    pub fn infer(
+        &self,
+        kind: super::ModelKind,
+        input: &ndarray::Array4<f32>,
+    ) -> Result<(Vec<i64>, Vec<f32>), String> {
+        use super::trt_worker_proto::shm_name;
+        use super::trt_worker_shm::SharedMem;
+
+        let mut guard = self
+            .worker
+            .lock()
+            .map_err(|_| "worker mutex poisoned".to_string())?;
+        let Some(w) = guard.as_mut() else {
+            return Err("worker is shut down".to_string());
+        };
+
+        let pid = std::process::id();
+        // 共有メモリ名は (pid, seq) で一意化。今のところ seq は 0 固定 (1 度に
+        // 1 推論しか走らないため衝突なし)。
+        let in_name = shm_name("in", pid, 0);
+        let out_name = shm_name("out", pid, 0);
+
+        let input_shape: Vec<i64> = input.shape().iter().map(|&d| d as i64).collect();
+        let input_bytes = input.len() * std::mem::size_of::<f32>();
+
+        // 出力容量: 4x スケール + バッファ。最悪ケースでも収まるよう 16 倍 + 余裕。
+        // (256x256 入力 → 1024x1024 出力 = 16x、デノイズは 1x、MI-GAN は 1x)
+        let output_capacity = input_bytes.saturating_mul(16).saturating_add(64);
+
+        let mut in_shm = SharedMem::create(&in_name, input_bytes)
+            .map_err(|e| format!("create input shm: {e}"))?;
+        let out_shm = SharedMem::create(&out_name, output_capacity)
+            .map_err(|e| format!("create output shm: {e}"))?;
+
+        // 入力 f32 slice を bytes として shm に書き込む
+        let input_slice = input
+            .as_slice()
+            .ok_or_else(|| "input array が contiguous ではない".to_string())?;
+        // SAFETY: f32 slice → u8 slice は同一データの読み取り視点変更のみ。
+        // input_slice の lifetime は input の借用、in_shm.write はコピー。
+        let input_bytes_view: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                input_slice.as_ptr() as *const u8,
+                input_slice.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        in_shm.write(input_bytes_view);
+
+        // コマンド送信 + レスポンス取得
+        let cmd = WorkerCmd::Infer {
+            kind: kind.as_str().to_string(),
+            input_shm: in_name.clone(),
+            input_bytes,
+            input_shape,
+            output_shm: out_name.clone(),
+            output_capacity,
+        };
+        let resp = w.send_cmd(&cmd)?;
+        if !resp.ok {
+            return Err(resp.error.unwrap_or_else(|| "(error 不明)".to_string()));
+        }
+        let output_shape = resp
+            .output_shape
+            .ok_or_else(|| "Resp.output_shape が None".to_string())?;
+
+        // 出力 shm から bytes 読み取り → Vec<f32>
+        let out_count: usize = output_shape.iter().product::<i64>() as usize;
+        let out_bytes_len = out_count * std::mem::size_of::<f32>();
+        if out_bytes_len > output_capacity {
+            return Err(format!(
+                "出力 shape {:?} → {out_bytes_len} bytes が capacity {output_capacity} 超過",
+                output_shape
+            ));
+        }
+        let out_bytes = out_shm.read_to_vec(out_bytes_len);
+        // SAFETY: out_bytes は Vec<u8>、f32 として再解釈する場合 alignment が問題。
+        // Vec<u8> の allocator は u8 粒度なので f32 alignment (4 byte) は満たさない
+        // 可能性がある。安全側に倒して 4 バイトずつ from_le_bytes でデコードする。
+        let mut output: Vec<f32> = Vec::with_capacity(out_count);
+        for i in 0..out_count {
+            let b = &out_bytes[i * 4..(i + 1) * 4];
+            output.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+
+        Ok((output_shape, output))
+    }
+
     /// プールをシャットダウン。drop でも呼ばれる。
     pub fn shutdown(&self) {
         let mut guard = match self.worker.lock() {

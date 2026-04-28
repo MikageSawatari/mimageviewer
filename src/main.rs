@@ -364,6 +364,35 @@ fn run_trt_smoke_test() -> ! {
         }
     }
 
+    // Step 2 検証: 実際に Infer を 1 回流して、入出力 shape と f32 値の
+    // 妥当性を確認する。
+    println!("[smoke] Infer (anime6b, 256x256 zero tile) ...");
+    let dummy_input = ndarray::Array4::<f32>::zeros((1, 3, 256, 256));
+    let t_infer = std::time::Instant::now();
+    match pool.infer(ai::ModelKind::UpscaleRealEsrganAnime6B, &dummy_input) {
+        Ok((shape, out)) => {
+            let elapsed = t_infer.elapsed().as_millis();
+            let expected_total = shape.iter().product::<i64>() as usize;
+            println!(
+                "[smoke] Infer OK in {elapsed} ms, output shape={shape:?}, len={} (expected {expected_total})",
+                out.len()
+            );
+            if out.len() != expected_total {
+                eprintln!("[smoke] FAIL: output len mismatch");
+                std::process::exit(1);
+            }
+            // ゼロ入力の anime6b 出力は数値的にゼロ近傍のはず。
+            // 値域 [0,1] (× 255 で 0-255 にスケール) で大きく外れていないかチェック。
+            let min = out.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!("[smoke]   output value range: [{min:.4}, {max:.4}]");
+        }
+        Err(e) => {
+            eprintln!("[smoke] Infer failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
     println!("[smoke] shutdown (Drop)");
     drop(pool);
     println!("[smoke] all OK");

@@ -95,11 +95,24 @@ pub fn run_infer_worker() -> ! {
                 let resp = handle_load_model(&runtime, &mm, &kind);
                 emit_resp(&resp);
             }
-            WorkerCmd::Infer { kind, .. } => {
-                // Step 2 で実装。現時点ではエラーを返す。
-                emit_resp(&WorkerResp::err(format!(
-                    "infer は Step 2 で実装予定 (kind={kind})"
-                )));
+            WorkerCmd::Infer {
+                kind,
+                input_shm,
+                input_bytes,
+                input_shape,
+                output_shm,
+                output_capacity,
+            } => {
+                let resp = handle_infer(
+                    &runtime,
+                    &kind,
+                    &input_shm,
+                    input_bytes,
+                    &input_shape,
+                    &output_shm,
+                    output_capacity,
+                );
+                emit_resp(&resp);
             }
             WorkerCmd::Shutdown => {
                 emit_resp(&WorkerResp::ok_simple(0));
@@ -111,6 +124,143 @@ pub fn run_infer_worker() -> ! {
 
     // ここまで来たら明示的に exit 0
     std::process::exit(0);
+}
+
+/// Infer コマンド処理: 共有メモリ経由で入力を受け、推論し、結果を共有メモリに書く。
+///
+/// 入出力ともに NCHW float32。共有メモリは生バイト列として扱い、`unsafe`
+/// `std::slice::from_raw_parts` で f32 として解釈する (ページ整列されているので
+/// f32 alignment は満たされる)。
+#[cfg(windows)]
+fn handle_infer(
+    runtime: &super::runtime::AiRuntime,
+    kind_str: &str,
+    input_shm: &str,
+    input_bytes: usize,
+    input_shape: &[i64],
+    output_shm: &str,
+    output_capacity: usize,
+) -> WorkerResp {
+    let Some(kind) = ModelKind::from_str(kind_str) else {
+        return WorkerResp::err(format!("unknown model_kind: {kind_str}"));
+    };
+
+    // 形状チェック
+    if input_shape.len() != 4 {
+        return WorkerResp::err(format!(
+            "input_shape は 4 次元 NCHW でなければならない (got {} 次元)",
+            input_shape.len()
+        ));
+    }
+    let shape_count: i64 = input_shape.iter().product();
+    let expected_bytes = shape_count as usize * 4;
+    if expected_bytes != input_bytes {
+        return WorkerResp::err(format!(
+            "shape product * 4 ({expected_bytes}) != input_bytes ({input_bytes})"
+        ));
+    }
+
+    // 共有メモリを open
+    let in_shm = match super::trt_worker_shm::SharedMem::open(input_shm, input_bytes) {
+        Ok(s) => s,
+        Err(e) => return WorkerResp::err(format!("open input shm '{input_shm}': {e}")),
+    };
+    let mut out_shm = match super::trt_worker_shm::SharedMem::open(output_shm, output_capacity) {
+        Ok(s) => s,
+        Err(e) => return WorkerResp::err(format!("open output shm '{output_shm}': {e}")),
+    };
+
+    // 入力 bytes → Vec<f32> (shm 領域からコピー、Drop と独立に保持するため)
+    let input_data: Vec<f32> = {
+        let bytes = in_shm.read_to_vec(input_bytes);
+        let f32_count = input_bytes / 4;
+        // SAFETY: bytes は Vec<u8> で 1-byte aligned、length は 4 の倍数。
+        // f32 として解釈しても alignment は OK (Vec の allocator はバイト粒度
+        // ではなく word 粒度以上で aligned される、x86_64 で 8 バイト)。
+        let f32_slice: &[f32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, f32_count)
+        };
+        f32_slice.to_vec()
+    };
+    drop(in_shm); // 入力読み終わったので shm を release
+
+    // ndarray::Array4 構築
+    let shape = (
+        input_shape[0] as usize,
+        input_shape[1] as usize,
+        input_shape[2] as usize,
+        input_shape[3] as usize,
+    );
+    let array = match ndarray::Array4::from_shape_vec(shape, input_data) {
+        Ok(a) => a,
+        Err(e) => return WorkerResp::err(format!("ndarray reshape: {e}")),
+    };
+    let tensor = match ort::value::Tensor::from_array(array) {
+        Ok(t) => t,
+        Err(e) => return WorkerResp::err(format!("Tensor::from_array: {e}")),
+    };
+
+    // 推論実行 (with_session 内で session.run + extract_tensor + bytes 書き込み)
+    let t0 = std::time::Instant::now();
+    let result = runtime.with_session(kind, |session| {
+        let outputs = session
+            .run(ort::inputs![tensor])
+            .map_err(|e| super::AiError::Ort(format!("session.run: {e}")))?;
+        let (shape, raw) = outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| super::AiError::Ort(format!("extract_tensor: {e}")))?;
+
+        let output_shape: Vec<i64> = shape.iter().copied().collect();
+        let total_count: i64 = output_shape.iter().product();
+        let total_bytes = total_count as usize * 4;
+
+        if total_bytes > output_capacity {
+            return Err(super::AiError::Ort(format!(
+                "output too large: needed {total_bytes} bytes, shm capacity {output_capacity}"
+            )));
+        }
+        if raw.len() < total_count as usize {
+            return Err(super::AiError::Ort(format!(
+                "output tensor returned shorter than expected: raw.len()={} expected={}",
+                raw.len(),
+                total_count
+            )));
+        }
+
+        // raw (f32 slice) → bytes view → shm に直接コピー
+        // SAFETY: raw は ORT 内部のテンソルバッファへの参照、
+        // f32 アライメントが揃っている。len * 4 バイトの U8 view として読める。
+        let raw_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                raw.as_ptr() as *const u8,
+                total_count as usize * std::mem::size_of::<f32>(),
+            )
+        };
+        Ok((output_shape, raw_bytes.to_vec()))
+    });
+
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+
+    match result {
+        Ok((shape, out_bytes)) => {
+            out_shm.write(&out_bytes);
+            WorkerResp::ok_infer(elapsed_ms, shape)
+        }
+        Err(e) => WorkerResp::err(format!("inference failed: {e}")),
+    }
+}
+
+#[cfg(not(windows))]
+fn handle_infer(
+    _runtime: &super::runtime::AiRuntime,
+    _kind_str: &str,
+    _input_shm: &str,
+    _input_bytes: usize,
+    _input_shape: &[i64],
+    _output_shm: &str,
+    _output_capacity: usize,
+) -> WorkerResp {
+    WorkerResp::err("Infer は Windows 専用 (共有メモリ依存)".to_string())
 }
 
 fn handle_load_model(
