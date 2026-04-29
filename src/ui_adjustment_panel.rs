@@ -15,7 +15,8 @@
 use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
-use crate::app::App;
+use crate::app::{AdjustSpreadTarget, App};
+use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 36.0;
 const SECTION_FONT: f32 = 12.0;
@@ -628,9 +629,24 @@ impl App {
         image_dims: Option<(u32, u32)>,
     ) {
         // フルスクリーン対象のページ idx
-        let Some(fs_idx) = self.fullscreen_idx else {
+        let Some(fs_root_idx) = self.fullscreen_idx else {
             return;
         };
+
+        // 見開き Double 表示中は adjust_spread_target に応じて左/右ページを編集対象に。
+        // Single では fs_root_idx をそのまま使う。以降の `fs_idx` は編集対象 idx を指し、
+        // 補正値読み書きパスは単ページ経路と同一。
+        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) =
+            match self.resolve_spread_pair(fs_root_idx) {
+                SpreadPair::Double { left, right } => {
+                    let target = match self.adjust_spread_target {
+                        AdjustSpreadTarget::Left => left,
+                        AdjustSpreadTarget::Right => right,
+                    };
+                    (target, Some((left, right)))
+                }
+                SpreadPair::Single => (fs_root_idx, None),
+            };
 
         let painter = ui.painter_at(panel_rect);
         painter.rect_filled(
@@ -653,6 +669,47 @@ impl App {
             egui::Color32::WHITE,
         );
 
+        // ── 見開き L/R セレクタ + コピーボタン (Double のときだけ) ──
+        let selector_h = if spread_lr.is_some() { 30.0 } else { 0.0 };
+        if let Some((left, right)) = spread_lr {
+            let same = self.effective_params(left) == self.effective_params(right);
+            let selector_rect = egui::Rect::from_min_size(
+                egui::pos2(panel_rect.min.x + 6.0, panel_rect.min.y + HEADER_H + 4.0),
+                egui::vec2(panel_rect.width() - 12.0, 24.0),
+            );
+            let mut selector_child =
+                child.new_child(egui::UiBuilder::new().max_rect(selector_rect));
+            selector_child.horizontal(|ui| {
+                let is_left = self.adjust_spread_target == AdjustSpreadTarget::Left;
+                if ui.selectable_label(is_left, "左ページ").clicked() {
+                    self.adjust_spread_target = AdjustSpreadTarget::Left;
+                }
+                let copy_l = ui
+                    .add_enabled(!same, egui::Button::new("←").small())
+                    .on_hover_text(if same {
+                        "左右の補正値が同一です"
+                    } else {
+                        "右ページの設定を左ページへコピー"
+                    });
+                if copy_l.clicked() {
+                    self.copy_spread_adjust(right, left);
+                }
+                let copy_r = ui
+                    .add_enabled(!same, egui::Button::new("→").small())
+                    .on_hover_text(if same {
+                        "左右の補正値が同一です"
+                    } else {
+                        "左ページの設定を右ページへコピー"
+                    });
+                if copy_r.clicked() {
+                    self.copy_spread_adjust(left, right);
+                }
+                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                    self.adjust_spread_target = AdjustSpreadTarget::Right;
+                }
+            });
+        }
+
         // ── スコープ表示: 個別 / お気に入り標準 / 標準 ──
         let has_override = self.adjustment_page_params.contains_key(&fs_idx);
         let fav_default_active = !has_override
@@ -660,12 +717,13 @@ impl App {
                 .current_favorite_id_for_idx(fs_idx)
                 .map(|id| self.adjustment_favorite_params.contains_key(&id))
                 .unwrap_or(false);
-        let scope_y = panel_rect.min.y + HEADER_H + 4.0;
+        let scope_y = panel_rect.min.y + HEADER_H + 4.0 + selector_h;
         let scope_text = if has_override {
             "個別設定を適用中".to_string()
         } else if fav_default_active {
             let name = self
-                .current_favorite_for_fullscreen()
+                .current_favorite_id_for_idx(fs_idx)
+                .and_then(|id| self.settings.favorite_by_id(id))
                 .map(|f| crate::ui_helpers::truncate_name(&f.name, 10))
                 .unwrap_or_default();
             format!("お気に入り「{}」の標準を適用中", name)
@@ -701,9 +759,11 @@ impl App {
         let mut clear_favorite_clicked = false;
         let mut set_as_global_clicked = false;
         let mut clear_page_clicked = false;
-        // 現在フルスクリーン中のページを含むお気に入り (なければ None)
+        // 編集対象ページを含むお気に入り (なければ None)。
+        // 見開き L/R 切替で対象ページが変わったら、それに応じた favorite を引き直す。
         let fav_info = self
-            .current_favorite_for_fullscreen()
+            .current_favorite_id_for_idx(fs_idx)
+            .and_then(|id| self.settings.favorite_by_id(id))
             .map(|f| (f.id, f.name.clone()));
         let fav_display_name = fav_info
             .as_ref()
@@ -1016,7 +1076,9 @@ impl App {
                 .as_ref()
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
-            self.slot_save_dialog = Some((slot_idx, default_name));
+            // 保存対象の補正値はクリック時点で確定 (見開き L/R 切替やスライダー操作で揺れない)
+            let params = self.effective_params(fs_idx).clone();
+            self.slot_save_dialog = Some((slot_idx, default_name, params));
         }
         if let Some(slot_idx) = load_from_slot {
             self.capture_adjust_full(
@@ -1024,14 +1086,14 @@ impl App {
                     "スロット{}を適用",
                     crate::adjustment::slot_key_label(slot_idx)
                 ),
-                |app| app.apply_slot_to_current_page(slot_idx),
+                |app| app.apply_slot_to_idx(slot_idx, fs_idx),
             );
         }
     }
 
     /// スロット保存ダイアログを描画する。`slot_save_dialog` が Some の間だけ表示。
     pub(crate) fn draw_slot_save_dialog(&mut self, ctx: &egui::Context) {
-        let Some((slot_idx, mut name_input)) = self.slot_save_dialog.take() else {
+        let Some((slot_idx, mut name_input, params)) = self.slot_save_dialog.take() else {
             return;
         };
         let mut open = true;
@@ -1083,24 +1145,21 @@ impl App {
         }
 
         if confirmed && !name_input.trim().is_empty() {
-            if let Some(fs_idx) = self.fullscreen_idx {
-                let params = self.effective_params(fs_idx).clone();
-                self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
-                    name: name_input.trim().to_string(),
-                    params,
-                });
-                self.settings.save();
-                let key_label = crate::adjustment::slot_key_label(slot_idx);
-                self.show_feedback_toast(format!(
-                    "[スロット{}:{} に保存]",
-                    key_label,
-                    name_input.trim()
-                ));
-            }
+            self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
+                name: name_input.trim().to_string(),
+                params,
+            });
+            self.settings.save();
+            let key_label = crate::adjustment::slot_key_label(slot_idx);
+            self.show_feedback_toast(format!(
+                "[スロット{}:{} に保存]",
+                key_label,
+                name_input.trim()
+            ));
             return;
         }
 
         // まだ開いている → state を書き戻す
-        self.slot_save_dialog = Some((slot_idx, name_input));
+        self.slot_save_dialog = Some((slot_idx, name_input, params));
     }
 }

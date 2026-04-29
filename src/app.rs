@@ -843,6 +843,17 @@ pub(crate) struct EraseSpreadCtx {
     pub pair: (usize, usize),
 }
 
+/// 見開き表示中に補正パネルが編集対象とするページ (画面上の左/右で固定、
+/// LTR/RTL は問わない)。Single (単ページ / 表紙単独 / 横長単独) では参照されず、
+/// L/R セレクタも UI 上に出ない。`open_fullscreen` (= ページ送り、ペア切替、
+/// 初回フルスクリーン) と spread_mode 切替で `Left` にリセットされる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum AdjustSpreadTarget {
+    #[default]
+    Left,
+    Right,
+}
+
 /// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
 /// `start_loading_items` で仮想フォルダ用 catalog を開くタイミングで構築し、
 /// `poll_thumbnails` の finalize シグナル経路で発火する。
@@ -1827,6 +1838,9 @@ pub struct App {
     // ── 画像補正 ──────────────────────────────────────────────────
     /// 補正パネル表示フラグ (左パネルホバーで表示)
     pub(crate) adjustment_mode: bool,
+    /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
+    /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
+    pub(crate) adjust_spread_target: AdjustSpreadTarget,
     /// ページ個別の補正パラメータ: item_idx → AdjustParams
     /// ここに登録されていないページは「お気に入り標準 → グローバル (settings.global_preset)」
     /// の順でフォールバックする。解決は [`App::effective_params`] に集約。
@@ -1860,8 +1874,10 @@ pub struct App {
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
     /// シャープネス適用済みの idx 集合（再適用防止）
     pub(crate) adjustment_sharpened: std::collections::HashSet<usize>,
-    /// スロット保存ダイアログ: (slot_idx, 入力中の名前)
-    pub(crate) slot_save_dialog: Option<(usize, String)>,
+    /// スロット保存ダイアログ: (slot_idx, 入力中の名前, 保存対象の補正値)。
+    /// 補正値は開始時にキャプチャしておくことで、見開きの L/R 切替や
+    /// ダイアログ中にスライダーを動かしても保存内容がブレない。
+    pub(crate) slot_save_dialog: Option<(usize, String, crate::adjustment::AdjustParams)>,
     /// IME 変換中フラグ。Ime イベントで更新される持続状態。
     /// Enabled/Preedit(非空) で true、Preedit("")/Commit/Disabled で false。
     pub(crate) ime_composing: bool,
@@ -2413,6 +2429,7 @@ impl Default for App {
 
             // 画像補正
             adjustment_mode: false,
+            adjust_spread_target: AdjustSpreadTarget::Left,
             adjustment_page_params: std::collections::HashMap::new(),
             adjustment_favorite_params: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
@@ -7812,6 +7829,7 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
         // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
         crate::pdf_loader::set_critical_reservation(true);
@@ -11055,16 +11073,6 @@ impl App {
         self.find_nearest_favorite(&container_path).map(|f| f.id)
     }
 
-    /// 現在フルスクリーン表示中のページが属するお気に入り (最も近い祖先)。
-    /// UI パネル表示用 (名前の切り出しのために `FavoriteEntry` 丸ごと返す)。
-    pub(crate) fn current_favorite_for_fullscreen(
-        &self,
-    ) -> Option<&crate::settings::FavoriteEntry> {
-        let idx = self.fullscreen_idx?;
-        let fav_id = self.current_favorite_id_for_idx(idx)?;
-        self.settings.favorite_by_id(fav_id)
-    }
-
     /// U/N/P 補正ショートカットで書き換える対象のスコープを決定する。
     /// 個別設定 → お気に入り標準 → global の順で最初に存在する層を選ぶ。
     pub(crate) fn resolve_adjust_scope(
@@ -11124,6 +11132,11 @@ impl App {
             }
             self.with_sidecar_mut(idx, move |sc, rel| sc.set_adjust(rel, params));
         }
+        // 補正値が変わった可能性があるので色調キャッシュは常に落とす。
+        // Undo/Redo 経路 (apply_adjustment_change_to_app) もここを通って正しく invalidate される。
+        // AI キャッシュは ai_settings_eq 差分判定が必要なので呼び出し側に任せる。
+        self.adjustment_cache.remove(&idx);
+        self.thumb_adjust_tex.remove(&idx);
     }
 
     /// 指定ページの個別設定を解除する (DB からも削除)。
@@ -11407,24 +11420,44 @@ impl App {
         }
     }
 
-    /// 保存スロット slot_idx のパラメータを現在のフルスクリーンページに適用する。
-    /// キャッシュ無効化もここで実施。
-    pub(crate) fn apply_slot_to_current_page(&mut self, slot_idx: usize) {
-        let Some(fs_idx) = self.fullscreen_idx else {
-            return;
-        };
+    /// 保存スロット slot_idx のパラメータを `idx` のページに適用する。
+    /// 見開き L/R 切替を考慮するため、適用先 idx は呼び出し元が決定する。
+    pub(crate) fn apply_slot_to_idx(&mut self, slot_idx: usize, idx: usize) {
         let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
             return;
         };
-        let ai_changed = !self.effective_params(fs_idx).ai_settings_eq(&slot.params);
-        self.set_page_params(fs_idx, slot.params);
+        let ai_changed = !self.effective_params(idx).ai_settings_eq(&slot.params);
+        self.set_page_params(idx, slot.params);
         if ai_changed {
-            self.clear_all_adjustment_and_ai_caches(fs_idx);
+            self.clear_all_adjustment_and_ai_caches(idx);
         } else {
-            self.clear_adjustment_caches(fs_idx);
+            self.clear_adjustment_caches(idx);
         }
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
+    }
+
+    /// 現在のフルスクリーンページに保存スロットを適用する (Ctrl+0..9 等のショートカット用)。
+    /// 見開き Double のときは `adjust_spread_target` の選択 (左/右) を尊重する。
+    pub(crate) fn apply_slot_to_current_page(&mut self, slot_idx: usize) {
+        let Some(idx) = self.current_adjust_target_idx() else {
+            return;
+        };
+        self.apply_slot_to_idx(slot_idx, idx);
+    }
+
+    /// フルスクリーン補正パネルが現在編集対象としているページ idx を返す。
+    /// 単ページ表示なら `fullscreen_idx`、見開き Double なら `adjust_spread_target`
+    /// に応じた左/右ページの idx。フルスクリーンを開いていなければ None。
+    pub(crate) fn current_adjust_target_idx(&mut self) -> Option<usize> {
+        let fs_idx = self.fullscreen_idx?;
+        Some(match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => match self.adjust_spread_target {
+                AdjustSpreadTarget::Left => left,
+                AdjustSpreadTarget::Right => right,
+            },
+            crate::ui_fullscreen::SpreadPair::Single => fs_idx,
+        })
     }
 
     /// 保存スロットをグリッド上の対象に適用する。対象はページ単位のみ
@@ -11543,9 +11576,26 @@ impl App {
 
     /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
     /// 表示中の画像のみ処理し、先読み分はページ切替時に処理する。
-    pub(crate) fn maybe_apply_adjustment(&mut self, ctx: &egui::Context, idx: usize) {
-        // 表示中の画像でなければスキップ（先読み分は切替時に処理）
-        if self.fullscreen_idx != Some(idx) {
+    /// 見開き Double 表示中はペアの両方の idx について実行を許可する。
+    /// `spread_pair` は呼び出し側で計算済みのものを受け取って毎フレームの再計算を避ける。
+    pub(crate) fn maybe_apply_adjustment(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        spread_pair: crate::ui_fullscreen::SpreadPair,
+    ) {
+        // 表示中の画像 (= 見開き時はペアの片方も含む) でなければスキップ。
+        // 先読み分はページ切替時に処理。
+        let in_view = match self.fullscreen_idx {
+            Some(fs) if fs == idx => true,
+            Some(_) => matches!(
+                spread_pair,
+                crate::ui_fullscreen::SpreadPair::Double { left, right }
+                    if left == idx || right == idx
+            ),
+            None => false,
+        };
+        if !in_view {
             return;
         }
         // 既にキャッシュがあればスキップ
@@ -11699,6 +11749,26 @@ impl App {
         self.ai_upscale_failed.clear();
         for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 見開き表示で `src_idx` の有効な補正値を `dst_idx` にコピーし、Undo に積む。
+    /// コピー先がカスケード解決後のデフォルトと一致するなら page_params エントリは作られない。
+    pub(crate) fn copy_spread_adjust(&mut self, src_idx: usize, dst_idx: usize) {
+        if src_idx == dst_idx {
+            return;
+        }
+        let new_params = self.effective_params(src_idx).clone();
+        let ai_changed = !self.effective_params(dst_idx).ai_settings_eq(&new_params);
+
+        self.capture_adjust_full("見開き補正コピー".to_string(), |app| {
+            app.set_page_params(dst_idx, new_params);
+        });
+
+        if ai_changed {
+            self.clear_all_adjustment_and_ai_caches(dst_idx);
+        } else {
+            self.clear_adjustment_caches(dst_idx);
         }
     }
 
@@ -12934,8 +13004,14 @@ impl eframe::App for App {
             self.evict_ai_upscale_cache(fs_idx);
 
             // 画像補正の適用（アップスケール後に適用）
-            // adjustment_cache がないがパラメータがある場合、フル解像度で補正を適用
-            self.maybe_apply_adjustment(ctx, fs_idx);
+            // adjustment_cache がないがパラメータがある場合、フル解像度で補正を適用。
+            // 見開き Double 表示中は対のページについても補正適用を走らせる。
+            let spread_pair = self.resolve_spread_pair(fs_idx);
+            self.maybe_apply_adjustment(ctx, fs_idx, spread_pair);
+            if let crate::ui_fullscreen::SpreadPair::Double { left, right } = spread_pair {
+                let other = if left == fs_idx { right } else { left };
+                self.maybe_apply_adjustment(ctx, other, spread_pair);
+            }
             self.evict_adjustment_cache(fs_idx);
         }
 
@@ -17149,4 +17225,81 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // 見開き左右独立補正: copy_spread_adjust のテスト
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 左ページに +30 を設定 → 右ページにコピー → 右ページの effective が +30 になる。
+    #[test]
+    fn copy_spread_adjust_left_to_right() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.jpg");
+        let right = push_image(&mut app, "C:/pics/b.jpg");
+        app.set_page_params(left, params_with_brightness(30.0));
+
+        app.copy_spread_adjust(left, right);
+
+        assert!(
+            (app.effective_params(right).brightness - 30.0).abs() < f32::EPSILON,
+            "右ページの effective brightness が +30 にコピーされる"
+        );
+        assert!(
+            app.adjustment_page_params.contains_key(&right),
+            "右ページの page_params エントリが作成される"
+        );
+    }
+
+    /// コピー先がデフォルトと一致する値になる場合、page_params エントリは作られず
+    /// カスケード解決に任せる (DB が無駄に増えない)。
+    #[test]
+    fn copy_spread_adjust_clears_when_matches_default() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.jpg");
+        let right = push_image(&mut app, "C:/pics/b.jpg");
+        // 左はデフォルト (= global_preset = identity) のまま、右に +30 を設定。
+        app.set_page_params(right, params_with_brightness(30.0));
+        assert!(app.adjustment_page_params.contains_key(&right));
+
+        // 左 (= デフォルト) を右にコピー → 右の page_params は冗長なので削除される
+        app.copy_spread_adjust(left, right);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&right),
+            "コピー後、デフォルトと一致した page_params エントリは削除される"
+        );
+        assert!(
+            app.effective_params(right).brightness.abs() < f32::EPSILON,
+            "右ページの effective はカスケード経由でデフォルト値に戻る"
+        );
+    }
+
+    /// コピー操作は capture_adjust_full 経由で Undo に乗り、Ctrl+Z で元に戻る。
+    /// Redo (Ctrl+Y) で再度コピーされる。
+    #[test]
+    fn copy_spread_adjust_undo_redo() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.jpg");
+        let right = push_image(&mut app, "C:/pics/b.jpg");
+        app.set_page_params(left, params_with_brightness(30.0));
+        app.set_page_params(right, params_with_brightness(-10.0));
+        let right_before = app.effective_params(right).brightness;
+        assert!((right_before - (-10.0)).abs() < f32::EPSILON);
+
+        app.copy_spread_adjust(left, right);
+        assert!((app.effective_params(right).brightness - 30.0).abs() < f32::EPSILON);
+
+        // Undo: 右ページが元の -10 に戻る
+        app.apply_meta_undo();
+        assert!(
+            (app.effective_params(right).brightness - (-10.0)).abs() < f32::EPSILON,
+            "Undo で右ページの brightness が -10 に戻る"
+        );
+
+        // Redo: 再度コピーされる
+        app.apply_meta_redo();
+        assert!(
+            (app.effective_params(right).brightness - 30.0).abs() < f32::EPSILON,
+            "Redo で右ページの brightness が +30 に再適用される"
+        );
+    }
 }

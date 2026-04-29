@@ -100,6 +100,52 @@ ZIP/PDF を開いている最中は `container(idx)` が ZIP/PDF 本体のパス
 
 補正パネルの保存スロット欄 (`💾` ボタン) で現在のパラメータをスロットに保存できる。
 
+### 1.5 見開き表示中の左右独立補正 + コピー
+
+`adjustment.db` の `page_params` はもともと「画像 / ZIP エントリ / PDF ページ」単位で
+独立しているため、見開き Double 表示中の左右ページは別々の `AdjustParams` を持てる。
+補正パネルは見開き Double のときだけヘッダー直下に **L/R セレクタ + コピーボタン** を出し、
+編集対象の切替と片側→もう片側への転写を 1 パネルで完結させる。
+
+| 要素 | 仕様 |
+| --- | --- |
+| L/R セレクタ | 「左ページ」「右ページ」の 2 ボタン (selectable_label)。既定は **常に左ページ**。`open_fullscreen` (= ページ送り、ペア切替、初回フルスクリーン) と spread_mode 切替で `AdjustSpreadTarget::Left` にリセット。Single (単ページ / 表紙単独 / 横長単独) のときは表示しない |
+| L/R 基準 | **画面上の左右で固定** (LTR/RTL 不変)。消しゴム `EraseSpreadCtx` の慣習と統一 |
+| 編集対象解決 | パネル冒頭で `resolve_spread_pair(fs_root_idx)` を引き、Double のとき `adjust_spread_target` に応じて `target_idx = left or right`。以降のスライダー読み書き / 個別化 / Undo はすべて `target_idx` 経由 (= 単ページ経路と同一) |
+| コピーボタン | 「← コピー」(右→左) と「コピー →」(左→右) の対称配置。`App::copy_spread_adjust(src, dst)` を呼ぶ |
+| 同一判定 | `effective_params(left) == effective_params(right)` (実効値の `==`)。一致しているときは両コピーボタン disabled (= 「揃っている」状態が UI から自明) |
+
+#### コピー操作の中身
+
+`copy_spread_adjust(src, dst)` は `effective_params(src)` (3 層解決後) を `set_page_params(dst, ...)`
+で書く。`set_page_params` 内部の `matches_default` 比較で、dst の標準 (お気に入り標準 or
+グローバル) と一致するなら page_params エントリは作られず、カスケード解決に任せる挙動が
+自動で得られる (= DB エントリが無駄に増えない)。書き換えは `capture_adjust_full` で囲んで
+あるので Undo に乗る。AI 設定 (upscale_model / denoise_model) が変わるなら
+`clear_all_adjustment_and_ai_caches(dst)` で AI キャッシュも落として再アップスケールを誘発する。
+
+#### 見開き描画と補正適用の隠れた前提 (実装メモ)
+
+これまで `adjustment_active = self.adjustment_mode && !is_spread_double` でパネル全体が
+disabled だった頃は顕在化していなかった 2 点を併せて修正している:
+
+- `draw_fs_spread_page` のテクスチャ取得を `adjustment_cache → fs_cache → thumbnail → holdover`
+  の優先順に変更。これがないと見開きでスライダーを動かしても画面が変わらない (補正前
+  fs_cache がそのまま描かれる)。
+- `maybe_apply_adjustment` の早期 return ガードを「`fullscreen_idx` と一致 **または**
+  resolve_spread_pair で見開きペアの片方」に緩和。さらに呼び出し元 (フレーム末尾の補正適用
+  フェーズ) で右ページ idx についても追加で 1 回呼ぶ。これがないと見開きの右ページだけ
+  補正適用が走らない。
+
+#### 「両ページ同時編集」を入れない理由
+
+設計初期は「両ページ」モードを検討したが、左右が異なる状態で「両ページ」を選んだ瞬間に
+片方の補正値がもう片方で上書きされる破壊的操作が避けられず、デフォルト選択
+(同一なら両ページ / 異なれば左) のロジックも暗黙的になりやすい。代わりに
+「常に左ページから始まる + 揃えたいときはコピーボタン」という明示的 UI に絞った。
+両ページ同値の運用要望は **お気に入り標準 (favorite_params) で代替できる** ため、
+今回は意図的にスコープ外。
+
 ---
 
 ## 2. AdjustParams の中身
