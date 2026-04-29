@@ -90,9 +90,14 @@ pub fn default_output_sample_rate() -> Option<u32> {
 ///
 /// `audio_rx` がドロップされると pump スレッドは終了するが、cpal Stream は無音で
 /// 鳴り続ける (UI から AudioOutput を drop すれば停止)。
+///
+/// `engine_event_tx` (Phase 3d): 音声バッファが READY_THRESHOLD (= 500ms) に到達した
+/// 時に `AudioEvent::BufferReady` を 1 度だけ送出する。EngineActor が Buffering →
+/// Playing に遷移するためのトリガ。
 pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
     let device = host
@@ -126,10 +131,18 @@ pub fn start(
     let pump_buffer = buffer.clone();
     let pump_cancel = cancel.clone();
     let pump_clock = clock.clone();
+    let pump_engine_event_tx = engine_event_tx.clone();
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
-            run_pump(audio_rx, shutdown_rx, pump_buffer, pump_cancel, pump_clock);
+            run_pump(
+                audio_rx,
+                shutdown_rx,
+                pump_buffer,
+                pump_cancel,
+                pump_clock,
+                pump_engine_event_tx,
+            );
         })
         .map_err(|e| format!("spawn audio-pump: {e}"))?;
 
@@ -173,6 +186,7 @@ fn run_pump(
     buffer: Arc<Mutex<AudioBuffer>>,
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
 ) {
     // 厚さ ~1.5 秒のバッファを目安に流量制御する。
     // 0.5 秒だと cpal RT 周期と decoder 不安定さで underrun → ブチブチに。
@@ -184,7 +198,13 @@ fn run_pump(
         (b.sample_rate as usize * 2 * 3) / 2
     };
 
+    // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。
+    // 設計 v3 で 500ms に確定 (= 250ms low + hysteresis を期待した値)。
+    const READY_THRESHOLD_SECS: f64 = 0.5;
+
     let mut activated = false;
+    // 直近で BufferReady を emit した seek_serial。新 epoch では再 emit。
+    let mut buffer_ready_emitted_serial: Option<u64> = None;
     while !cancel.load(Ordering::Acquire) {
         // shutdown 通知が先に来たら即抜ける (drop 時のレイテンシ削減)。
         // 通常時は audio_rx の recv_timeout で 100ms 周期に cancel 確認。
@@ -226,12 +246,37 @@ fn run_pump(
             buf.samples.clear();
             buf.next_pts_secs = frame.pts_secs;
             buf.pump_seek_serial = frame.seek_serial;
+            // 新 seek 世代では BufferReady を **再 emit する** ため latch を解除。
+            buffer_ready_emitted_serial = None;
         } else if buf.samples.is_empty() && frame.pts_secs > buf.next_pts_secs {
             // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)
             buf.next_pts_secs = frame.pts_secs;
         }
         buf.samples.extend(frame.samples.iter().copied());
         publish_buffer_secs(&buf, &clock);
+
+        // ── BufferReady emit (Phase 3d) ──
+        // buffer 残量が READY_THRESHOLD に到達した時点で 1 度だけ EngineActor に
+        // 通知する (= Buffering → Playing 遷移トリガ)。同 seek_serial 内では 2 度
+        // 送らない (`buffer_ready_emitted_serial` で抑止)。次 seek 世代でリセット。
+        let buf_secs = buf.samples.len() as f64 / buf.samples_per_sec;
+        let cur_pts = buf.next_pts_secs;
+        let cur_serial = buf.pump_seek_serial;
+        drop(buf);
+        if buf_secs >= READY_THRESHOLD_SECS
+            && buffer_ready_emitted_serial != Some(cur_serial)
+        {
+            buffer_ready_emitted_serial = Some(cur_serial);
+            let _ = engine_event_tx.try_send(
+                crate::video::engine::EngineEvent::Audio(
+                    crate::video::engine::state::AudioEvent::BufferReady {
+                        epoch: cur_serial,
+                        pts: cur_pts,
+                        wall_now: std::time::Instant::now(),
+                    },
+                ),
+            );
+        }
     }
     crate::logger::log("audio-pump terminated");
 }

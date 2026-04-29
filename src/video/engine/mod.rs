@@ -11,3 +11,23 @@ pub mod actor;
 pub mod audio_bookkeeping;
 pub mod clock;
 pub mod state;
+
+/// decoder thread と audio thread が EngineActor に流す統合イベント。
+/// VideoPlayer::tick で channel から drain して `EngineActor::handle_*` に dispatch する。
+#[derive(Debug, Clone)]
+pub enum EngineEvent {
+    Decoder(state::DecoderEvent),
+    Audio(state::AudioEvent),
+}
+
+impl From<state::DecoderEvent> for EngineEvent {
+    fn from(ev: state::DecoderEvent) -> Self {
+        EngineEvent::Decoder(ev)
+    }
+}
+
+impl From<state::AudioEvent> for EngineEvent {
+    fn from(ev: state::AudioEvent) -> Self {
+        EngineEvent::Audio(ev)
+    }
+}

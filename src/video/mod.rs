@@ -39,9 +39,36 @@ use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoInfo};
 use thumbnail::{Thumbnail, ThumbnailWorker};
 
+use std::sync::Mutex;
+
+use engine::actor::{EngineActor, OpenOptions};
+use engine::EngineEvent;
+
 pub struct VideoPlayer {
     path: PathBuf,
     clock: Arc<AvClock>,
+    /// Phase 3b で導入された state machine actor。Phase 3c+ で decoder/audio events を
+    /// 流し込み、Phase 3d で AvClock の状態系メソッドを EngineActor 主導に置き換える。
+    /// Phase 3b 時点では `begin_loading()` を呼んだ状態で保持されるが、actor の state
+    /// 遷移は Phase 3c で配線完了後に有効化する (= 現在は AvClock が引き続き source of truth)。
+    #[allow(dead_code)]
+    engine: Arc<Mutex<EngineActor>>,
+    /// Phase 3c で追加。decoder/audio thread から push される events を tick で
+    /// drain して engine に dispatch する。capacity 64 (= burst tolerance、
+    /// drop 不可なので unbounded 寄りの bounded)。
+    engine_event_rx: crossbeam_channel::Receiver<EngineEvent>,
+    /// 同 channel の sender (decoder/audio に clone して渡す)。
+    /// VideoPlayer 自身が `tick` 内で UI thread からも push する経路を持つために保持。
+    #[allow(dead_code)]
+    engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+    /// `InfoReceived` を engine に 1 度だけ流すためのフラグ。tick で info_rx から
+    /// info を取り出した直後に発火し、以降は false で抑止する。
+    info_event_emitted: bool,
+    /// `FirstFrameReady` を engine に 1 度だけ流すためのフラグ (= 現 epoch 内)。
+    /// `notify_seek_completed` 経路 (= seek 後再 buffering) では engine 側で
+    /// epoch++ するので、tick 側では「engine.current_seek_epoch を読み取って
+    /// 自分の last_seen_epoch と比べる」方式で再発火する。
+    first_frame_event_last_epoch: Option<engine::state::SeekEpoch>,
     cancel: Arc<AtomicBool>,
     decode: DecodeHandles,
     /// 保持目的のフィールド (Drop で cpal Stream が停止する)。読み取りはしない。
@@ -130,9 +157,23 @@ impl VideoPlayer {
     ) -> Self {
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
+            // open 失敗時の dummy engine (Idle のまま)。実 decoder は起きないので、
+            // begin_loading は呼ばない (= Phase 3+ で resume 適用も走らない)。
+            let engine = Arc::new(Mutex::new(EngineActor::new(OpenOptions {
+                initial_volume,
+                autoplay,
+                resume_secs,
+                ..Default::default()
+            })));
+            let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(64);
             return Self {
                 path,
                 clock: Arc::new(AvClock::new(initial_volume)),
+                engine,
+                engine_event_tx,
+                engine_event_rx,
+                info_event_emitted: false,
+                first_frame_event_last_epoch: None,
                 cancel: Arc::new(AtomicBool::new(true)),
                 decode: dummy_decode_handles(),
                 audio: None,
@@ -150,8 +191,34 @@ impl VideoPlayer {
             };
         }
 
+        // engine event channel: decoder/audio thread が events を push、UI tick が
+        // drain して engine.handle_*_event に dispatch する。capacity 64 (= 60fps の
+        // ~1 秒分 + audio callback 数件のバッファ余地)。
+        let (engine_event_tx, engine_event_rx) =
+            crossbeam_channel::bounded::<EngineEvent>(64);
+
         let clock = Arc::new(AvClock::new(initial_volume));
         let cancel = Arc::new(AtomicBool::new(false));
+
+        // EngineActor 構築。Phase 3b 時点では `engine` は `tick`/`apply_command` から
+        // 触られておらず、AvClock が引き続き source of truth。Phase 3c 以降で
+        // decoder/audio events 経路を配線したときに actor の state 機械が活性化する。
+        let opts = OpenOptions {
+            initial_volume,
+            autoplay,
+            resume_secs,
+            loop_enabled: false, // VideoPlayer 側で個別管理 (Phase 3+ で統合予定)
+            hw_decode,
+        };
+        let engine = Arc::new(Mutex::new(EngineActor::new(opts)));
+        // begin_loading() を decoder::spawn の **前** に呼ぶ。これにより decoder
+        // thread が起動した瞬間から `engine_state_handle` を `Loading` で観察できる
+        // (= Idle を一瞬観察する race を排除、Codex Phase 3d P2 反映)。
+        let engine_state_handle = {
+            let mut g = engine.lock().unwrap();
+            g.begin_loading();
+            g.published_state_handle()
+        };
 
         // 音声出力デバイスのサンプルレートを先に取得し、デコーダーの swresample
         // 出力レートと cpal ストリームレートを **同じ値** に揃える。
@@ -168,13 +235,14 @@ impl VideoPlayer {
             hw_decode,
             #[cfg(windows)]
             gpu_video_device,
+            engine_state_handle,
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
         // 音声を二重に消費するので、decoder の audio_rx を audio.start に渡す。
         // ここで decode.audio_rx を取り出す必要があるので構造体を分解する。
         let DecodeHandles { video_rx, audio_rx, info_rx } = decode;
-        let audio = match audio::start(audio_rx, clock.clone()) {
+        let audio = match audio::start(audio_rx, clock.clone(), engine_event_tx.clone()) {
             Ok(a) => Some(a),
             Err(e) => {
                 crate::logger::log(format!("audio output failed: {e} (映像のみ再生)"));
@@ -192,6 +260,11 @@ impl VideoPlayer {
         Self {
             path,
             clock,
+            engine,
+            engine_event_tx,
+            engine_event_rx,
+            info_event_emitted: false,
+            first_frame_event_last_epoch: None,
             cancel,
             decode: DecodeHandles {
                 video_rx,
@@ -211,6 +284,38 @@ impl VideoPlayer {
             #[cfg(windows)]
             gpu_latest: None,
         }
+    }
+
+    /// Phase 3c: engine event channel から events を drain して engine actor に
+    /// dispatch する。tick の冒頭で呼ぶ。
+    /// 1 tick 内で全 events を処理する (= UI 60fps なら遅くても 16ms 内に decoder/
+    /// audio events が actor に届く)。channel が full のときは decoder/audio 側で
+    /// drop されるが、Phase 3c では非クリティカル events のみ流すので問題ない。
+    fn drain_engine_events(&mut self) {
+        let mut engine = self.engine.lock().unwrap();
+        while let Ok(ev) = self.engine_event_rx.try_recv() {
+            match ev {
+                EngineEvent::Decoder(d) => engine.handle_decoder_event(d),
+                EngineEvent::Audio(a) => engine.handle_audio_event(a),
+            }
+        }
+    }
+
+    /// Phase 3c: 表示済み frame の `FirstFrameReady` を engine に流す。
+    /// 同 epoch 内では 1 度だけ発火する。新世代 (= seek 後) では再発火する。
+    /// engine.current_seek_epoch を読み取って自分の last 値と比較。
+    fn emit_first_frame_event(&mut self, pts: f64) {
+        let cur_epoch = self.engine.lock().unwrap().current_seek_epoch();
+        if self.first_frame_event_last_epoch == Some(cur_epoch) {
+            return;
+        }
+        self.first_frame_event_last_epoch = Some(cur_epoch);
+        let _ = self.engine_event_tx.try_send(EngineEvent::Decoder(
+            engine::state::DecoderEvent::FirstFrameReady {
+                epoch: cur_epoch,
+                pts,
+            },
+        ));
     }
 
     /// シークホバー位置のサムネを要求する。debounce はワーカー側 (drain) で実施。
@@ -247,6 +352,8 @@ impl VideoPlayer {
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
             self.clock.request_seek(0.0, 0);
             self.clock.set_playing(true);
+            // engine 側にも seek を伝えて epoch を同期させる (Codex Phase 3d P2 反映)
+            self.engine.lock().unwrap().handle_seek_request(0.0);
             return;
         }
         self.clock.set_playing(!self.clock.is_playing());
@@ -266,6 +373,9 @@ impl VideoPlayer {
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
+        // engine の seek_epoch も進めて、AvClock seek_serial と同期させる
+        // (Codex Phase 3d P2 反映: BufferReady/FirstFrameReady の epoch 不整合解消)。
+        self.engine.lock().unwrap().handle_seek_request(clamped);
     }
 
     /// 相対シーク。`delta_secs > 0` なら前方 (`target..` のキーフレーム = preroll なし)、
@@ -280,6 +390,7 @@ impl VideoPlayer {
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
+        self.engine.lock().unwrap().handle_seek_request(target);
     }
 
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
@@ -327,11 +438,44 @@ impl VideoPlayer {
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
     /// 戻り値は次回再描画推奨時刻 (秒) — `ctx.request_repaint_after` に渡す目安。
     pub fn tick(&mut self, ctx: &egui::Context) -> Option<std::time::Duration> {
+        // Phase 3c: engine_event channel の drain を **tick の冒頭** で行う。
+        // decoder/audio thread から push された events を engine.handle_*_event に
+        // dispatch する。EngineActor は state machine のみ更新し、AvClock の挙動には
+        // まだ影響しない (= Phase 3d までは AvClock が引き続き source of truth)。
+        self.drain_engine_events();
+
         // info を取り込む
         if self.info.is_none() {
             if let Ok(result) = self.decode.info_rx.try_recv() {
                 match result {
                     Ok(info) => {
+                        // Phase 3c: engine にも InfoReceived event を流す。
+                        // resume_secs は **AvClock 経由の旧経路** で処理し続け、
+                        // engine 側でも resume_secs を OpenOptions で受領済みなので
+                        // engine の InfoReceived ハンドラ内で並行処理される。
+                        // (= 二重で seek が走らないよう、Phase 3d で旧経路を撤去する。)
+                        if !self.info_event_emitted {
+                            // Codex Phase 3d P1 反映: audio output 起動に失敗した場合
+                            // (`self.audio.is_none()`) は has_audio=false で engine に
+                            // 通知する。さもなくば engine が BufferReady を永久に待ち
+                            // Buffering で固まる (= audio が決して再生されないため
+                            // audio.rs から BufferReady が出ない)。
+                            let has_audio_effective =
+                                info.has_audio && self.audio.is_some();
+                            let _ = self.engine_event_tx.try_send(EngineEvent::Decoder(
+                                engine::state::DecoderEvent::InfoReceived {
+                                    epoch: self
+                                        .engine
+                                        .lock()
+                                        .unwrap()
+                                        .current_seek_epoch(),
+                                    duration_secs: info.duration_secs,
+                                    has_audio: has_audio_effective,
+                                },
+                            ));
+                            self.info_event_emitted = true;
+                        }
+
                         // resume 指定があれば最初の info 到着時に 1 度だけ実行。
                         // 末尾近く (残り 5 秒以下) なら 0 から再生 (= 完走済みと見なす)。
                         // 保存側 (`save_video_resume_position`) と同じ閾値で gate する。
@@ -343,6 +487,15 @@ impl VideoPlayer {
                                 && !near_end
                             {
                                 self.clock.request_seek(resume, 0);
+                                // engine の epoch も同時に進めて AvClock と同期
+                                // (Codex Phase 3d P2 反映: pre-info user seek 経路で
+                                // ズレるリスクは pending_resume_secs.take() の他に
+                                // 経路がないので、ここで二重 seek を許容しても重複
+                                // epoch++ 1 回分の副作用のみで害はない)
+                                self.engine
+                                    .lock()
+                                    .unwrap()
+                                    .handle_seek_request(resume);
                             }
                         }
                         self.info = Some(info);
@@ -457,6 +610,9 @@ impl VideoPlayer {
                 // ループ再生 ON: 先頭にシークし続行 (= 設定の video_loop)。
                 self.clock.request_seek(0.0, 0);
                 self.clock.set_playing(true);
+                // engine 側の epoch も同期 (= AvClock seek_serial と engine
+                // current_seek_epoch の不整合を防ぐ、Codex Phase 3d P2 反映)
+                self.engine.lock().unwrap().handle_seek_request(0.0);
             } else {
                 // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
                 if let Some(info) = &self.info {
@@ -498,6 +654,7 @@ impl VideoPlayer {
                     }
                     self.clock.clear_seek_target_override(serial);
                 }
+                self.emit_first_frame_event(pts);
                 let _ = pts_for_log;
                 return next_due;
             }
@@ -542,6 +699,7 @@ impl VideoPlayer {
                 }
             }
             upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+            self.emit_first_frame_event(pts_for_log);
             displayed_pts = Some(pts_for_log);
         }
 

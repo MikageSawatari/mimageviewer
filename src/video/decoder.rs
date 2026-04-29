@@ -105,6 +105,9 @@ pub struct DecodeHandles {
 /// `hw_decode` が true なら D3D11VA HW デコードを試行する。コーデック非対応 / デバイス
 /// 初期化失敗 / get_format で SW 形式が返った場合は **黙って SW にフォールバック**
 /// する (perf log の `video.open.decode_path` で実際の経路を確認可能)。
+/// `engine_state` は `EngineActor::published_state_handle()` で取得した
+/// `Arc<AtomicU8>` (Phase 3d)。pacing loop で `state == Playing` のときだけ
+/// audio_buf escape を有効化する。
 pub fn spawn(
     path: PathBuf,
     clock: Arc<AvClock>,
@@ -114,6 +117,7 @@ pub fn spawn(
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
 ) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
@@ -134,6 +138,7 @@ pub fn spawn(
                 hw_decode,
                 #[cfg(windows)]
                 gpu_video_device,
+                engine_state,
                 video_tx,
                 audio_tx,
                 info_tx,
@@ -157,6 +162,7 @@ fn run_decoder(
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
     video_tx: Sender<VideoFrame>,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
@@ -561,6 +567,10 @@ fn run_decoder(
                                     // させる。これを抜くと decoder が動画 PTS を無視して
                                     // 最大速で blit + send し続け、UI 側で「全フレームが早送
                                     // り」状態のカクつきになる (= GPU 経路初期実装の bug)。
+                                    //
+                                    // Phase 3d: audio_buf escape は **engine が Playing の
+                                    // ときだけ** 有効化する (= Buffering / Loading / Seeking
+                                    // 中は急送出しない、序盤早送りの構造的解消)。
                                     const PACE_LEAD_SECS: f64 = 0.10;
                                     const AUDIO_SAFE_LO: f64 = 0.25;
                                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
@@ -571,7 +581,10 @@ fn run_decoder(
                                         if ahead <= PACE_LEAD_SECS {
                                             break;
                                         }
-                                        if clock.is_audio_active()
+                                        let engine_playing = engine_state.load(Ordering::Acquire)
+                                            == crate::video::engine::actor::state_code::PLAYING;
+                                        if engine_playing
+                                            && clock.is_audio_active()
                                             && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
                                         {
                                             break;
@@ -749,6 +762,8 @@ fn run_decoder(
                     //
                     // audio safety: audio_active かつ総音声バッファが AUDIO_SAFE_LO 以下なら
                     // pacing skip して audio packet 読み込みを優先 (sleep で audio 枯渇させない)。
+                    // Phase 3d: audio_buf escape は **engine が Playing のときだけ** 有効化する
+                    // (= Buffering / Loading / Seeking 中は急送出しない)。
                     const PACE_LEAD_SECS: f64 = 0.10;
                     const AUDIO_SAFE_LO: f64 = 0.25;
                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
@@ -763,7 +778,10 @@ fn run_decoder(
                         if ahead <= PACE_LEAD_SECS {
                             break;
                         }
-                        if clock.is_audio_active()
+                        let engine_playing = engine_state.load(Ordering::Acquire)
+                            == crate::video::engine::actor::state_code::PLAYING;
+                        if engine_playing
+                            && clock.is_audio_active()
                             && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
                         {
                             // audio が枯渇しそう → pacing skip して decoder を進める
