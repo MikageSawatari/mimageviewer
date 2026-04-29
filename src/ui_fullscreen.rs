@@ -942,16 +942,11 @@ impl App {
                         // ── 動画 HUD (下部の再生バー + 時刻 + 音量 + シークバー) ──
                         // 入力ハンドリングは handle_image_keys の冒頭で先に呼ばれる
                         // (handle_video_input)。ここでは描画のみ。
+                        // Phase 5.6 ミニツールバーはパネル描画 **後** (= 上層) に
+                        // 移すため、ここでは draw_video_hud / paused_hint のみ。
                         if state.is_video {
                             self.draw_video_hud(ui, ctx, full_rect, fs_idx);
-                            // Phase 5.1: 一時停止中はキー操作のヒントを画面中央下に薄く表示。
                             self.draw_video_paused_hint(ui, full_rect, fs_idx);
-                            // Phase 5.6: 動画モード専用の小ツールバー (ピン / タイル)。
-                            // ホバー上ツールバーが上部に重なるため、画面右上に float 表示。
-                            #[cfg(windows)]
-                            {
-                                self.draw_video_mini_toolbar(ui, ctx, full_rect, fs_idx);
-                            }
                         }
 
                         // ── チェックマーク ──
@@ -1020,6 +1015,10 @@ impl App {
                                 } else {
                                     self.draw_video_jump_panel(ui, ctx, full_rect, fs_idx);
                                     self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
+                                    // Phase 5.6 ミニツールバー: 右パネルが描画された後に
+                                    // 上層として乗せる (Codex P5.6 M 反映)。これでパネルが
+                                    // 表示されているときも 📌 / ▦ ボタンに到達できる。
+                                    self.draw_video_mini_toolbar(ui, ctx, full_rect, fs_idx);
                                 }
                             }
                         } else if adjustment_active {
