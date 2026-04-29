@@ -5114,6 +5114,9 @@ impl App {
     /// 動画 VideoPlayer の `displayed_frame_seq` (= GPU/CPU 経路問わず tick で +1)
     /// の変化で frame interval (ms) を履歴に記録。経路非依存なので CPU sw decode
     /// の動画でも overlay が機能する。
+    /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
+    /// 等の transient による wall 待ち時間」とみなして履歴に入れない (= 通常 frame
+    /// pacing と区別)。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
         let cur_seq: Option<u64> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
@@ -5128,9 +5131,21 @@ impl App {
             {
                 let interval_ms =
                     now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
-                self.video_perf_history.push_back(interval_ms);
-                while self.video_perf_history.len() > 200 {
-                    self.video_perf_history.pop_front();
+                let expected_ms = match self.fs_cache.get(&fs_idx) {
+                    Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player
+                        .info()
+                        .map(|i| i.avg_fps as f32)
+                        .filter(|fps| *fps > 0.5 && fps.is_finite())
+                        .map(|fps| 1000.0 / fps)
+                        .unwrap_or(33.3),
+                    _ => 33.3,
+                };
+                let transient_threshold = expected_ms * 3.0;
+                if interval_ms <= transient_threshold {
+                    self.video_perf_history.push_back(interval_ms);
+                    while self.video_perf_history.len() > 200 {
+                        self.video_perf_history.pop_front();
+                    }
                 }
             }
             self.video_perf_last_wall = Some(now);
@@ -5139,17 +5154,32 @@ impl App {
     }
 
     /// FPS / フレーム間隔のオーバーレイ。直近 200 frame の interval (ms) を折れ線で、
-    /// 50ms 超のフレームを赤縦線で目立たせる。左上半透明。
+    /// 動画 fps から期待値の 1.5x 超を赤縦線 (hitch) で目立たせる。左上半透明。
     pub(crate) fn draw_video_perf_overlay(
         &self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
     ) {
         let painter = ui.painter().clone();
-        const W: f32 = 280.0;
-        const H: f32 = 90.0;
-        const Y_MAX_MS: f32 = 66.0; // 30fps 基準の 2x まで縦に取る
-        const HITCH_MS: f32 = 50.0; // 赤縦線で強調する閾値
+        // 動画の fps から期待 interval (ms) を取得。fps 不明なら 30fps 仮定。
+        // hitch 閾値は期待値の 1.5x (= 50% 超過 = 1 frame 落ち相当)。
+        let fs_idx_for_info = self.fullscreen_idx;
+        let expected_ms: f32 = fs_idx_for_info
+            .and_then(|idx| match self.fs_cache.get(&idx) {
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                    player.info().map(|i| i.avg_fps as f32)
+                }
+                _ => None,
+            })
+            .filter(|fps| *fps > 0.5 && fps.is_finite())
+            .map(|fps| 1000.0 / fps)
+            .unwrap_or(33.3);
+        let hitch_ms: f32 = (expected_ms * 1.5).max(20.0);
+        // 縦軸上限は期待値の 2x、ただし最小 50ms (= 60fps 基準でも見やすい)。
+        let y_max_ms: f32 = (expected_ms * 2.0).max(50.0);
+
+        const W: f32 = 360.0;
+        const H: f32 = 92.0;
         let rect = egui::Rect::from_min_size(
             egui::pos2(full_rect.min.x + 8.0, full_rect.min.y + 8.0),
             egui::vec2(W, H),
@@ -5193,17 +5223,19 @@ impl App {
             .iter()
             .copied()
             .fold(0.0_f32, f32::max);
+        // hitch = 期待間隔の 1.5x を超えるフレーム (= 約 1 frame 以上の遅延)。
         let hitches = self
             .video_perf_history
             .iter()
-            .filter(|&&v| v > HITCH_MS)
+            .filter(|&&v| v > hitch_ms)
             .count();
         let header = format!(
-            "Frame avg {:.1}ms  ({:.1}fps)   max {:.1}ms   hitches>{:.0}ms: {}",
+            "{:.1}fps target ({:.1}ms)  avg {:.1}ms  max {:.1}ms  hitch>{:.0}ms:{}",
+            1000.0 / expected_ms,
+            expected_ms,
             avg,
-            if avg > 0.0 { 1000.0 / avg } else { 0.0 },
-            HITCH_MS,
             max,
+            hitch_ms,
             hitches
         );
         painter.text(
@@ -5219,14 +5251,15 @@ impl App {
             egui::pos2(rect.min.x + 6.0, rect.min.y + 22.0),
             egui::pos2(rect.max.x - 6.0, rect.max.y - 14.0),
         );
-        // 33.3ms (= 30fps) のガイドライン
         let y_for = |ms: f32| -> f32 {
-            graph.max.y - (ms.clamp(0.0, Y_MAX_MS) / Y_MAX_MS) * graph.height()
+            graph.max.y - (ms.clamp(0.0, y_max_ms) / y_max_ms) * graph.height()
         };
-        for &(ms, label, color) in &[
-            (16.7_f32, "16.7", egui::Color32::from_rgb(80, 200, 120)),
-            (33.3_f32, "33.3", egui::Color32::from_rgb(200, 200, 80)),
-            (HITCH_MS, "50.0", egui::Color32::from_rgb(220, 100, 100)),
+        // ガイドライン: 期待値、期待値 (= target、黄)、hitch 閾値 (赤)。
+        // 追加で半分の値 (= 60Hz 表示時の vsync 周期 16.7ms 等) も控えめに描く。
+        for &(ms, color) in &[
+            (expected_ms * 0.5, egui::Color32::from_rgb(80, 200, 120)),
+            (expected_ms, egui::Color32::from_rgb(200, 200, 80)),
+            (hitch_ms, egui::Color32::from_rgb(220, 100, 100)),
         ] {
             let y = y_for(ms);
             painter.line_segment(
@@ -5239,7 +5272,7 @@ impl App {
             painter.text(
                 egui::pos2(graph.max.x - 2.0, y - 1.0),
                 egui::Align2::RIGHT_BOTTOM,
-                label,
+                format!("{:.1}", ms),
                 egui::FontId::proportional(9.0),
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 200),
             );
@@ -5253,7 +5286,7 @@ impl App {
 
         // ヒッチ赤縦線 (折れ線描画前に下層に置く)
         for (i, &v) in self.video_perf_history.iter().enumerate() {
-            if v > HITCH_MS {
+            if v > hitch_ms {
                 let x = x_for(i);
                 painter.line_segment(
                     [
