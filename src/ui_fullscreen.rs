@@ -4954,15 +4954,37 @@ impl App {
                 }
 
                 // 直近キャッシュからサムネ取得 → GPU テクスチャに反映 → 描画
+                // Phase 5.2: ラベルを **サムネの下** に独立して配置するため、
+                // 先にラベル galley を作って高さを取り、サムネの y 位置でその分の
+                // 余白を確保する。
                 let thumb_opt = self.fs_video_player(fs_idx)
                     .and_then(|p| p.nearest_seek_thumbnail(target));
+                let label = format_secs(target);
+                let galley =
+                    painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
+                let label_size = galley.size();
+                const GAP_THUMB_TO_HUD: f32 = 8.0;
+                const GAP_THUMB_TO_LABEL: f32 = 4.0;
+                const LABEL_PAD: f32 = 4.0;
                 let thumb_drawn = if let Some(thumb) = thumb_opt.as_ref() {
                     let tex_id = self.upload_seek_thumb_texture(ui.ctx(), fs_idx, thumb);
                     let thumb_w = thumb.width as f32;
                     let thumb_h = thumb.height as f32;
                     let thumb_x = (x - thumb_w / 2.0)
-                        .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - thumb_w - 2.0);
-                    let thumb_y = hud_rect.min.y - thumb_h - 8.0;
+                        .clamp(full_rect.min.x + 4.0, full_rect.max.x - thumb_w - 4.0);
+                    // サムネ → 余白 → ラベル → HUD という縦方向レイアウト。
+                    let label_block_h = label_size.y + LABEL_PAD * 2.0;
+                    let mut thumb_y = hud_rect.min.y
+                        - GAP_THUMB_TO_HUD
+                        - label_block_h
+                        - GAP_THUMB_TO_LABEL
+                        - thumb_h;
+                    // 上端に余裕がない場合 (= 縦の小さなウィンドウ) は画面上端に
+                    // 寄せる。サムネがウィンドウ高さを超える極端ケースは想定しない。
+                    let min_y = full_rect.min.y + 4.0;
+                    if thumb_y < min_y {
+                        thumb_y = min_y;
+                    }
                     let thumb_rect = egui::Rect::from_min_size(
                         egui::pos2(thumb_x, thumb_y),
                         egui::vec2(thumb_w, thumb_h),
@@ -4990,18 +5012,15 @@ impl App {
                     None
                 };
 
-                // 時刻ラベル: サムネがあればその下端、なければ HUD 上端の少し上
-                let label = format_secs(target);
-                let galley =
-                    painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
-                let label_size = galley.size();
+                // 時刻ラベル: Phase 5.2 でサムネに重ねず、サムネの **直下** に独立行
+                // として表示する。サムネが無いケースは従来通り HUD 上端の上。
                 let label_pos = if let Some(thumb_rect) = thumb_drawn {
                     egui::pos2(
                         (x - label_size.x / 2.0).clamp(
-                            thumb_rect.min.x,
-                            thumb_rect.max.x - label_size.x,
+                            full_rect.min.x + LABEL_PAD,
+                            full_rect.max.x - label_size.x - LABEL_PAD,
                         ),
-                        thumb_rect.max.y - label_size.y - 4.0,
+                        thumb_rect.max.y + GAP_THUMB_TO_LABEL + LABEL_PAD,
                     )
                 } else {
                     egui::pos2(
@@ -5010,7 +5029,7 @@ impl App {
                         hud_rect.min.y - label_size.y - 6.0,
                     )
                 };
-                let bg = egui::Rect::from_min_size(label_pos, label_size).expand(4.0);
+                let bg = egui::Rect::from_min_size(label_pos, label_size).expand(LABEL_PAD);
                 painter.rect_filled(
                     bg,
                     3.0,

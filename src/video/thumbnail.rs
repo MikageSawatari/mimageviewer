@@ -18,9 +18,10 @@
 //!
 //! ## メモリ
 //!
-//! `MAX_ENTRIES * THUMB_W * THUMB_H * 4` バイト = 32 × 160 × 90 × 4 ≈ 1.8 MB。
-//! VideoPlayer 1 つにつき 1 worker なので、フルスクリーンで 1 動画開いている間だけ
-//! 確保される。Drop で worker と一緒に解放。
+//! `MAX_ENTRIES * THUMB_W * THUMB_H * 4` バイト = 32 × 320 × 180 × 4 ≈ 7.4 MB
+//! (Phase 5.2 でサイズを 2x に拡大、見た目を改善)。VideoPlayer 1 つにつき 1 worker
+//! なので、フルスクリーンで 1 動画開いている間だけ確保される。Drop で worker と
+//! 一緒に解放。
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -30,9 +31,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_channel::{Sender, bounded};
 
-/// サムネ画像のピクセルサイズ。HUD で表示する際は egui 側で更にスケールできる。
-pub const THUMB_W: u32 = 160;
-pub const THUMB_H: u32 = 90;
+/// サムネ画像のピクセルサイズ (16:9)。HUD で表示する際は egui 側で更にスケールできる。
+/// Phase 5.2 で 160x90 → 320x180 に 2x 拡大 (見た目改善)。
+pub const THUMB_W: u32 = 320;
+pub const THUMB_H: u32 = 180;
 /// LRU 容量。これ以上は古い順に捨てる。
 const MAX_ENTRIES: usize = 32;
 /// キャッシュ key の粒度 (秒)。
