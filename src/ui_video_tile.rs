@@ -22,8 +22,9 @@ use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::video::tile_thumbnails::{TileThumbnail, TileThumbnailWorker};
 
-/// 横方向の基本タイル数 (16:9 / 4:3 で同じ列数を狙う、画面幅により増減)。
-const BASE_COLUMNS: usize = 10;
+// 列数候補は `crate::settings::VIDEO_TILE_COLUMN_CANDIDATES` (= 6/10/16/20/26/30)。
+// `Settings.video_tile_columns` が source of truth。Ctrl+Wheel で次/前の候補に
+// 切替し、Setting に保存する。
 
 /// 候補となる間隔 (秒)。タイル数が画面に収まる範囲で最大の間隔を選ぶ
 /// (= タイル数最少 = 抽出待ち最短)。
@@ -81,18 +82,17 @@ impl App {
             16.0 / 9.0
         };
 
-        // タイルサイズと列数: 画面幅 / 列数 = タイル幅 (横向き)、高さは aspect で逆算。
-        // 列数は BASE_COLUMNS を基準に、画面が狭すぎなら詰める。
-        let mut columns = BASE_COLUMNS;
+        // タイルサイズと列数: Setting の video_tile_columns を優先。範囲外なら 10 に
+        // 戻して保存。サムネ幅は画面幅 / 列数 (横向き)、高さは aspect で逆算。
+        let mut columns = self.settings.video_tile_columns;
+        if !crate::settings::VIDEO_TILE_COLUMN_CANDIDATES.contains(&columns) {
+            columns = 10;
+            self.settings.video_tile_columns = 10;
+        }
         // 画面幅 (left/right に余白 16px を確保)。
         let usable_w = (screen_size.x - 32.0).max(200.0);
-        let mut tile_w = (usable_w / columns as f32).floor() as u32;
-        // タイル幅が小さすぎないよう、150px 下限。下回るなら列数を減らす。
-        while tile_w < 150 && columns > 4 {
-            columns -= 1;
-            tile_w = (usable_w / columns as f32).floor() as u32;
-        }
-        let tile_h = ((tile_w as f64) / aspect).round().max(60.0) as u32;
+        let tile_w = (usable_w / columns as f32).floor().max(40.0) as u32;
+        let tile_h = ((tile_w as f64) / aspect).round().max(30.0) as u32;
 
         // 画面に収まる最大行数を計算。上下に余白 + ファイル名行 (任意) を引く。
         let usable_h = (screen_size.y - 80.0).max(200.0);
@@ -290,6 +290,46 @@ impl App {
             }
             if resp.clicked() {
                 clicked_pts = Some(pts);
+            }
+        }
+
+        // Ctrl+Wheel で列数候補を切替 (Phase 6.D)。タイル中のみ有効。
+        let wheel_y = ctx.input(|i| {
+            if i.modifiers.ctrl {
+                i.smooth_scroll_delta.y
+            } else {
+                0.0
+            }
+        });
+        if wheel_y.abs() > 0.5 {
+            let cur = self.settings.video_tile_columns;
+            let cands = crate::settings::VIDEO_TILE_COLUMN_CANDIDATES;
+            let idx = cands.iter().position(|&v| v == cur).unwrap_or(1);
+            // wheel_y > 0 = 上回転 = 列数を **減らす** (= 1 タイルが大きくなる、直感的)
+            // wheel_y < 0 = 下回転 = 列数を **増やす**
+            let new_idx = if wheel_y > 0.0 {
+                idx.saturating_sub(1)
+            } else {
+                (idx + 1).min(cands.len() - 1)
+            };
+            if new_idx != idx {
+                let new_cols = cands[new_idx];
+                self.settings.video_tile_columns = new_cols;
+                self.settings.save();
+                // 列数変わると tile_w/tile_h と timestamps が変わるので、現在の
+                // state を捨てて再 spawn。
+                let video_path = state_video_path.clone();
+                let cur_path = match self.fs_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
+                    _ => None,
+                };
+                if cur_path.as_ref() == Some(&video_path) {
+                    self.video_tile_state = None;
+                    self.video_tile_textures.clear();
+                    let screen = ctx.content_rect().size();
+                    self.toggle_video_tile_mode(fs_idx, screen);
+                }
+                return true;
             }
         }
 

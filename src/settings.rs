@@ -835,6 +835,17 @@ pub struct Settings {
     /// ピン留めサムネ (= Phase 5.4.1 で実装予定) は本設定とは独立で常に最優先。
     #[serde(default = "default_true")]
     pub video_thumb_use_sidecar_image: bool,
+    /// 動画タイルモードの列数 (Phase 6.D)。タイル中 Ctrl+Wheel で
+    /// 6/10/16/20/26/30 のいずれかに切替可能。値が範囲外なら 10 にクランプ。
+    #[serde(default = "default_video_tile_columns")]
+    pub video_tile_columns: usize,
+}
+
+/// 動画タイルモード列数の候補 (Phase 6.D)。
+pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[6, 10, 16, 20, 26, 30];
+
+fn default_video_tile_columns() -> usize {
+    10
 }
 
 fn default_video_volume() -> f64 {
@@ -1056,6 +1067,7 @@ impl Default for Settings {
             video_resume_positions: std::collections::HashMap::new(),
             video_hw_decode: false,
             video_thumb_use_sidecar_image: true,
+            video_tile_columns: default_video_tile_columns(),
         }
     }
 }
