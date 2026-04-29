@@ -3384,15 +3384,7 @@ impl App {
                 "fs_video_tile_btn",
                 |hovered| bar_button_bg(hovered, tile_active),
                 tile_active,
-                |p, c, _r| {
-                    p.text(
-                        c,
-                        egui::Align2::CENTER_CENTER,
-                        "▦",
-                        egui::FontId::proportional(20.0),
-                        egui::Color32::WHITE,
-                    );
-                },
+                |p, c, r| draw_tile_grid_icon(p, c, r),
             );
             let tile_resp = tile_resp.on_hover_text(if tile_active {
                 "タイルモード解除 [S]"
@@ -4142,6 +4134,25 @@ fn draw_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
 }
 
 /// 🔬 分析アイコン（虫眼鏡＋十字線）を描画する。
+/// タイルモード アイコン: 2x2 の塗りつぶし正方形 (= ■ ■ / ■ ■)。
+/// 旧 ▦ 文字は font glyph によっては tofu (□) に化けるため自前描画に切替。
+fn draw_tile_grid_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    // セル 1 個の半幅、セル間ギャップ
+    let cell = r * 0.36;
+    let gap = r * 0.10;
+    let off = cell + gap * 0.5;
+    for &(dx, dy) in &[(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let cx = c.x + dx * off;
+        let cy = c.y + dy * off;
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(cell, cell)),
+            1.0,
+            white,
+        );
+    }
+}
+
 fn draw_analysis_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
     let stroke = egui::Stroke::new(1.8, white);

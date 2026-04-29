@@ -45,13 +45,16 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) -> bool {
-        // 表示判定: TAB 固定 OR 画面右 1/4 にカーソル
+        // 表示判定: TAB 固定 OR 画面右端 80px 以内にカーソルがあり、かつ HUD 領域
+        // (下端 44px) より上 (Phase 7: シークバー / 音量等の操作中に右パネルが
+        // 出てくる問題の解消)。
         let panel_w = VIDEO_PANEL_WIDTH.min(full_rect.width() * 0.5);
-        let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
+        let hover_x_threshold = full_rect.max.x - 80.0;
+        let hover_y_max = full_rect.max.y - 48.0; // HUD 44px + 4px 余白
         let hover_in_right = ctx.input(|i| {
             i.pointer
                 .hover_pos()
-                .map(|p| p.x > hover_threshold)
+                .map(|p| p.x > hover_x_threshold && p.y < hover_y_max)
                 .unwrap_or(false)
         });
         if !self.show_metadata_panel && !hover_in_right {
@@ -68,9 +71,11 @@ impl App {
         };
 
         let panel_top = full_rect.min.y + TOP_BAR_H;
+        // Phase 7: HUD (下部 44px) と重ならないようパネルをそこで終わらせる。
+        let panel_bottom = full_rect.max.y - 44.0;
         let panel_rect = egui::Rect::from_min_max(
             egui::pos2(full_rect.max.x - panel_w, panel_top),
-            full_rect.max,
+            egui::pos2(full_rect.max.x, panel_bottom),
         );
 
         let painter = ui.painter().clone();
@@ -213,6 +218,8 @@ pub(crate) enum JumpPanelAction {
     DeleteBookmark(i64),
     /// 現在位置にブックマークを追加 (= 上部 🔖 ボタン)。
     AddBookmarkHere,
+    /// 現在のフレームを動画グリッドサムネに固定 / 解除トグル (= 上部 📌 ボタン)。
+    SetPinAtCurrent,
 }
 
 impl App {
@@ -226,15 +233,15 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) -> bool {
-        // 表示判定: 画面左 1/4 にカーソル がある間表示。
-        // (画像の adjustment_active と違って動画では常時固定モードを今は持たないが、
-        //  今後 Phase 5.6 でホバーバーから固定可にする想定。)
+        // 表示判定: 画面左端 80px 以内にカーソルがあり、かつ HUD 領域 (下端 44px)
+        // より上 (Phase 7: シークバー / 再生ボタン操作中に左パネルが出てくる問題の解消)。
         let panel_w = VIDEO_JUMP_PANEL_WIDTH.min(full_rect.width() * 0.4);
-        let hover_threshold = full_rect.min.x + full_rect.width() * 0.25;
+        let hover_x_threshold = full_rect.min.x + 80.0;
+        let hover_y_max = full_rect.max.y - 48.0;
         let hover_in_left = ctx.input(|i| {
             i.pointer
                 .hover_pos()
-                .map(|p| p.x < hover_threshold)
+                .map(|p| p.x < hover_x_threshold && p.y < hover_y_max)
                 .unwrap_or(false)
         });
         if !hover_in_left {
@@ -296,9 +303,11 @@ impl App {
         // 中身が空でもパネル自体は出す)。
 
         let panel_top = full_rect.min.y + TOP_BAR_H;
+        // Phase 7: HUD (下部 44px) と重ならないようパネルをそこで終わらせる。
+        let panel_bottom = full_rect.max.y - 44.0;
         let panel_rect = egui::Rect::from_min_max(
             egui::pos2(full_rect.min.x, panel_top),
-            egui::pos2(full_rect.min.x + panel_w, full_rect.max.y),
+            egui::pos2(full_rect.min.x + panel_w, panel_bottom),
         );
 
         let painter = ui.painter().clone();
@@ -367,16 +376,40 @@ impl App {
             .max_height(scroll_height)
             .show(&mut content_ui, |ui| {
                 ui.add_space(6.0);
+                // 上部ボタン群: 📌 ピン (= 現フレームを動画グリッドサムネに) と
+                // 🔖 ブックマーク追加。テキスト色はパネル暗背景に合わせて
+                // 明示的に明色固定 + 視認性確保のため explicit fill を入れる。
+                let btn_bg = egui::Color32::from_rgba_unmultiplied(50, 60, 90, 240);
+                let btn_bg_hover = egui::Color32::from_rgba_unmultiplied(80, 100, 150, 255);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    let resp = ui.add(
+                    // 📌 ピン (Phase 7.B で実装予定の handler を呼ぶ)
+                    let pin_resp = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("📌 現フレームをサムネ固定")
+                                .color(egui::Color32::WHITE)
+                                .size(12.0),
+                        )
+                        .fill(btn_bg)
+                        .stroke(egui::Stroke::new(1.0, btn_bg_hover)),
+                    );
+                    if pin_resp.clicked() {
+                        scroll_actions.push(JumpPanelAction::SetPinAtCurrent);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let bm_resp = ui.add(
                         egui::Button::new(
                             egui::RichText::new("🔖 現在位置にブックマーク追加 [B]")
-                                .color(TEXT_COLOR)
-                                .size(13.0),
-                        ),
+                                .color(egui::Color32::WHITE)
+                                .size(12.0),
+                        )
+                        .fill(btn_bg)
+                        .stroke(egui::Stroke::new(1.0, btn_bg_hover)),
                     );
-                    if resp.clicked() {
+                    if bm_resp.clicked() {
                         scroll_actions.push(JumpPanelAction::AddBookmarkHere);
                     }
                 });
@@ -452,6 +485,9 @@ impl App {
                 }
                 JumpPanelAction::AddBookmarkHere => {
                     self.add_video_bookmark_at_current(fs_idx);
+                }
+                JumpPanelAction::SetPinAtCurrent => {
+                    self.toggle_video_pin_at_current(fs_idx);
                 }
             }
         }
@@ -592,6 +628,40 @@ impl App {
         });
         ui.add_space(2.0);
         out
+    }
+
+    /// 現在のフレームをピン留め (= 動画グリッドサムネに固定) するトグル。
+    /// 既存ピンがあれば削除、なければ現在位置を set_pin。`thumb_webp` は今回は空
+    /// で書く (= グリッド側は WebP が空なら現状動作 = sidecar / shell に fall-through、
+    /// 後続フェーズで本物のフレーム抽出を入れる予定)。
+    pub(crate) fn toggle_video_pin_at_current(&mut self, fs_idx: usize) {
+        let snapshot = match self.fs_cache.get(&fs_idx) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                if player.error().is_some() || player.info().is_none() {
+                    None
+                } else {
+                    Some((player.path().clone(), player.position()))
+                }
+            }
+            _ => None,
+        };
+        let (Some((path, pts)), Some(db)) = (snapshot, self.video_pin_db.as_ref()) else {
+            return;
+        };
+        let already_pinned = db.lookup(&path).is_some();
+        if already_pinned {
+            if let Err(e) = db.remove(&path) {
+                crate::logger::log(format!("video pin remove failed: {e}"));
+            } else {
+                crate::logger::log("video pin removed".to_string());
+            }
+        } else {
+            if let Err(e) = db.set_pin(&path, pts, &[]) {
+                crate::logger::log(format!("video pin set failed: {e}"));
+            } else {
+                crate::logger::log(format!("video pin set: pts={pts:.2}s"));
+            }
+        }
     }
 
     /// 現在の再生位置に新規ブックマークを追加する。B キー / 🔖 ボタンの両経路から呼ばれる。

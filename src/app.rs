@@ -1574,7 +1574,10 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
-    // ── 動画ブックマーク DB ───────────────────────────────────
+    // ── 動画ピン / ブックマーク DB ───────────────────────────
+    /// 動画フレーム ピン留め DB (= ユーザーが固定したフレーム = 動画グリッドサムネ
+    /// 最優先)。Phase 7 で左パネル上部の 📌 ボタンから set_pin / remove する。
+    pub(crate) video_pin_db: Option<crate::video_pins::VideoPinDb>,
     /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
     /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
@@ -2207,6 +2210,10 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
 
         let t = std::time::Instant::now();
+        let video_pin_db = crate::video_pins::VideoPinDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
+
+        let t = std::time::Instant::now();
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
@@ -2385,6 +2392,7 @@ impl Default for App {
             search_or_mode: false,
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
+            video_pin_db,
             video_bookmark_db,
             #[cfg(windows)]
             video_tile_state: None,
