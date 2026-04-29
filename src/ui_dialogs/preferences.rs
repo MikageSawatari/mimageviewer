@@ -1345,7 +1345,7 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     ui.checkbox(&mut s.video_autoplay, "フルスクリーン化と同時に自動再生")
         .on_hover_text(
-            "OFF にすると最初のフレームで停止表示になり、Space で再生開始。",
+            "OFF (既定) にすると最初のフレームで停止表示になり、Enter で再生開始。",
         );
     ui.checkbox(&mut s.video_loop, "終端まで再生したら最初から繰り返す");
     ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");

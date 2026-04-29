@@ -800,7 +800,9 @@ pub struct Settings {
     #[serde(default = "default_video_volume")]
     pub video_volume: f64,
     /// フルスクリーン化時に自動再生を開始するか。OFF なら最初のフレームで停止表示。
-    #[serde(default = "default_true")]
+    /// デフォルトは false (= 一時停止状態で開く)。Phase 5.1 で既定挙動を変更。
+    /// 既存ユーザーの設定値はそのまま保持される (serde でフィールドが書き込み済のため)。
+    #[serde(default)]
     pub video_autoplay: bool,
     /// 終端到達時に先頭から再生を繰り返すか。
     #[serde(default)]
@@ -1031,7 +1033,7 @@ impl Default for Settings {
             update_check_enabled: true,
             update_check_dismissed_version: None,
             video_volume: default_video_volume(),
-            video_autoplay: true,
+            video_autoplay: false,
             video_loop: false,
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),

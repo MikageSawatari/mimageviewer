@@ -944,6 +944,8 @@ impl App {
                         // (handle_video_input)。ここでは描画のみ。
                         if state.is_video {
                             self.draw_video_hud(ui, ctx, full_rect, fs_idx);
+                            // Phase 5.1: 一時停止中はキー操作のヒントを画面中央下に薄く表示。
+                            self.draw_video_paused_hint(ui, full_rect, fs_idx);
                         }
 
                         // ── チェックマーク ──
@@ -1541,10 +1543,11 @@ impl App {
             return self.handle_erase_keys(ctx, fs_idx);
         }
 
-        // 動画フルスクリーン中は専用キーマップ (Space=play/pause、←→=シーク、↑↓=音量、M=mute、L=loop)
-        // を画像系のキー処理より先に走らせて、Space などの画像系処理 (チェックトグル等) を回避する。
-        // handle_video_input は内部で is_video 判定 + 必要キーを consume するので、後段の
-        // consume_key は何も拾えない。
+        // 動画フルスクリーン中は専用キーマップ (Enter=play/pause、Shift+Enter=外部プレイヤー、
+        // ←→=シーク、↑↓=音量、M=mute、L=loop) を画像系のキー処理より先に走らせる。
+        // Space は **動画モードでも画像と同じ選択トグル** として扱うため、ここでは
+        // consume せず、後段 (line ~1941) の image key_space ハンドラに流す
+        // (Phase 5.1: 画像/動画混在時のキーアサイン重複を解消)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         if is_video_fs {
             let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
@@ -4633,11 +4636,11 @@ impl App {
             return;
         }
 
-        // 画像系のキー処理に流れて Space=チェックトグル等の挙動が混ざるのを避けるため、
-        // ここで consume_key して入力イベントから除去する。Shift 修飾の有無も区別する。
-        // Shift+Enter: egui の `consume_key` の修飾子マッチが厳密過ぎるケース
-        // (Caps Lock + Shift など) を吸収するため、`modifiers.shift` を手動で見て
-        // Enter 単独 consume との両方を許容する。
+        // 動画モードのキー処理: Space は consume せず後段の image 選択トグルに流す
+        // (Phase 5.1: 画像と動画でキーアサインを揃える)。
+        // 再生/一時停止トグルは **Enter** に移行。Shift+Enter は外部プレイヤー起動。
+        // egui の `consume_key` は修飾子マッチが厳密 (Caps Lock + Shift などで取りこぼす)
+        // ので、`modifiers.shift` を見た fallback も併用する。
         let shift_held_now = ctx.input(|i| i.modifiers.shift);
         let shift_enter = ctx.input_mut(|i| {
             let direct = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
@@ -4648,9 +4651,10 @@ impl App {
         if shift_enter {
             crate::logger::log("video Shift+Enter pressed → external player".to_string());
         }
-        let space = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Space)
-        });
+        // Enter 単独: 再生 / 一時停止トグル。Shift+Enter は上で先に取っているので
+        // ここでは shift 無しの Enter のみが残っている。
+        let enter = !shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let shift_left = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
         });
@@ -4708,7 +4712,7 @@ impl App {
 
         // player に作用させる (借用はこの if-let のスコープ内で完結)
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            if space {
+            if enter {
                 player.toggle_play();
             }
             if left {
@@ -5068,6 +5072,58 @@ impl App {
         painter.galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
     }
 
+    /// 動画一時停止中のキー操作ヒントを画面中央下 (HUD 直上) に薄く表示する。
+    /// Phase 5.1: 既定挙動を「開いたら一時停止」に変えたため、Enter で再生開始 /
+    /// Shift+Enter で外部プレイヤー、を明示する。
+    pub(crate) fn draw_video_paused_hint(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        // 再生中なら表示しない。
+        let is_playing = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.is_playing(),
+            _ => return,
+        };
+        if is_playing {
+            return;
+        }
+        let painter = ui.painter();
+        let line1 = "[Enter] 再生開始";
+        let line2 = "[Shift]+[Enter] 外部プレイヤーで再生";
+        let font = egui::FontId::proportional(16.0);
+        let text_color = egui::Color32::from_rgba_unmultiplied(230, 230, 230, 220);
+        let g1 = painter.layout_no_wrap(line1.to_string(), font.clone(), text_color);
+        let g2 = painter.layout_no_wrap(line2.to_string(), font.clone(), text_color);
+        let line_gap = 4.0;
+        let block_w = g1.size().x.max(g2.size().x);
+        let block_h = g1.size().y + line_gap + g2.size().y;
+        let pad = 10.0;
+        // HUD (下部 44px) 直上、画面中央。
+        let hud = video_hud_rect(full_rect);
+        let center_x = full_rect.center().x;
+        let bottom_y = hud.min.y - 16.0;
+        let bg_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                center_x - block_w / 2.0 - pad,
+                bottom_y - block_h - pad,
+            ),
+            egui::pos2(center_x + block_w / 2.0 + pad, bottom_y),
+        );
+        painter.rect_filled(
+            bg_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+        );
+        let l1_pos = egui::pos2(center_x - g1.size().x / 2.0, bg_rect.min.y + pad);
+        painter.galley(l1_pos, g1, text_color);
+        let l2_pos = egui::pos2(
+            center_x - g2.size().x / 2.0,
+            bg_rect.min.y + pad + (block_h - g2.size().y),
+        );
+        painter.galley(l2_pos, g2, text_color);
+    }
 }
 
 /// 動画 HUD の下部バー領域 (高さ 44px)。
