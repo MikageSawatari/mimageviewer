@@ -1548,7 +1548,10 @@ impl App {
         // Space は **動画モードでも画像と同じ選択トグル** として扱うため、ここでは
         // consume せず、後段 (line ~1941) の image key_space ハンドラに流す
         // (Phase 5.1: 画像/動画混在時のキーアサイン重複を解消)。
-        let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        // フルスクリーン用コンテキストメニュー表示中は奪わない (= メニュー側の Enter
+        // 選択操作を優先、Codex Phase 5.1 P2 反映)。
+        let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && self.fs_context_menu_idx.is_none();
         if is_video_fs {
             let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
                 Some(p.clone())
@@ -5075,18 +5078,38 @@ impl App {
     /// 動画一時停止中のキー操作ヒントを画面中央下 (HUD 直上) に薄く表示する。
     /// Phase 5.1: 既定挙動を「開いたら一時停止」に変えたため、Enter で再生開始 /
     /// Shift+Enter で外部プレイヤー、を明示する。
+    ///
+    /// 表示条件 (Codex Phase 5.1 P2 反映):
+    /// - エラー無し
+    /// - メタデータ取得済 (= info().is_some()、Loading 中は隠す)
+    /// - 再生中ではない
+    /// - 末尾近くではない (= EOF 状態では Enter は seek-to-0 になるため、ここで
+    ///   「再生開始」と書くと挙動と齟齬。loop 設定オフで末尾停止しているケースを除外)
     pub(crate) fn draw_video_paused_hint(
         &self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         fs_idx: usize,
     ) {
-        // 再生中なら表示しない。
-        let is_playing = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.is_playing(),
-            _ => return,
+        let show_hint = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                if player.error().is_some() {
+                    false
+                } else if player.info().is_none() {
+                    false
+                } else if player.is_playing() {
+                    false
+                } else {
+                    let dur = player.duration();
+                    let pos = player.position();
+                    // duration が取れていない (= 0) ならガードしない、取れていれば
+                    // 末尾 0.5s 以内は EOF 扱いとして hint 非表示。
+                    !(dur > 0.0 && pos >= dur - 0.5)
+                }
+            }
+            _ => false,
         };
-        if is_playing {
+        if !show_hint {
             return;
         }
         let painter = ui.painter();
