@@ -1003,11 +1003,14 @@ impl App {
                                 self.reset_analysis_mode();
                             }
                         } else if state.is_video {
-                            // 動画再生中は左 (adjustment) / 右 (metadata) の画像系パネルは
-                            // 出さない (内容が画像専用で、動画には無意味)。動画用の情報は
-                            // draw_video_hud (下部バー) と上部ホバーバーで提供する。
-                            // 将来的に動画専用の右パネル (コーデック詳細・チャプター等) を
-                            // 追加するならここに分岐する。
+                            // 動画は専用パネルに分岐する (Phase 5.4):
+                            //   右 = メタ情報 (タイトル / コーデック / チャプター…)
+                            //   左 = ジャンプ先サムネ (ピン / ブックマーク / チャプター)
+                            //         — Phase 5.4-D-left + 5.4.1 で配線予定。
+                            #[cfg(windows)]
+                            {
+                                self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
+                            }
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
                             // 上部ホバーバーと重ならないよう、左パネルは上部バーの下から開始する。

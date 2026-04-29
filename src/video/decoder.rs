@@ -91,6 +91,8 @@ pub struct VideoInfo {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub description: Option<String>,
+    /// 平均フレームレート (Phase 5.4 の右パネル表示用)。
+    pub avg_fps: f64,
     /// 埋め込みチャプター (Phase 5.4)。`AVChapter*` 配列を時間秒単位で 1 度だけ
     /// 抽出して保持する。空配列ならチャプターは無し。
     pub chapters: Vec<Chapter>,
@@ -451,6 +453,7 @@ fn run_decoder(
         title,
         artist,
         description,
+        avg_fps: video_avg_fps,
         chapters,
     };
     let _ = info_tx.send(Ok(info));

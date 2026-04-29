@@ -75,6 +75,8 @@ pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
 pub mod ui_susie_diagnostic;
+#[cfg(windows)]
+pub mod ui_video_panels;
 pub mod update_check;
 pub mod video;
 pub mod video_bookmarks;
