@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::tile_thumb_cache::TileThumbCache;
+
 /// 1 タイル分の抽出結果。
 #[derive(Clone)]
 pub struct TileThumbnail {
@@ -48,11 +50,17 @@ pub struct TileThumbnailWorker {
 impl TileThumbnailWorker {
     /// `timestamps` 長の結果スロットを 0 埋めで用意し、worker thread を起動する。
     /// `max_w` / `max_h` でアスペクト保持リサイズの上限を指定。
+    /// `cache` が Some なら DB ヒット → WebP デコード経路で抽出を skip し、ミスは
+    /// 抽出後に WebP エンコードして書き戻す (= Phase 6.D-2)。
+    /// `interval_ms` / `video_mtime` はキャッシュキー用。`cache=None` のときは無視。
     pub fn spawn(
         path: PathBuf,
         timestamps: Vec<f64>,
         max_w: u32,
         max_h: u32,
+        cache: Option<Arc<TileThumbCache>>,
+        interval_ms: u32,
+        video_mtime: i64,
     ) -> Self {
         let n = timestamps.len();
         let state = Arc::new(Mutex::new(vec![None; n]));
@@ -72,6 +80,9 @@ impl TileThumbnailWorker {
                     max_h,
                     worker_state,
                     worker_cancel.clone(),
+                    cache,
+                    interval_ms,
+                    video_mtime,
                 );
                 worker_finished.store(true, Ordering::Release);
             })
@@ -125,6 +136,9 @@ fn run_worker(
     max_h: u32,
     state: Arc<Mutex<Vec<Option<TileThumbnail>>>>,
     cancel: Arc<AtomicBool>,
+    cache: Option<Arc<TileThumbCache>>,
+    interval_ms: u32,
+    video_mtime: i64,
 ) {
     use ffmpeg_the_third as ffmpeg;
     use ffmpeg::format::Pixel;
@@ -132,9 +146,44 @@ fn run_worker(
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
     use ffmpeg::util::frame::video::Video;
 
+    // Phase 6.D-2: 起動直後にキャッシュをまとめてチェックして state に load。
+    // 残った None スロットだけが ffmpeg 抽出の対象になる。タイル列数を切替えても
+    // 同 path/interval/tile_w なら再開可能。
+    if let Some(c) = cache.as_ref() {
+        for (idx, &pts) in timestamps.iter().enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(webp) =
+                c.lookup_webp(&path, interval_ms, max_w, idx as u32, video_mtime)
+            {
+                if let Some((w, h, rgba)) = decode_webp_to_rgba(&webp) {
+                    let thumb = TileThumbnail {
+                        pts_secs: pts,
+                        width: w,
+                        height: h,
+                        rgba: Arc::new(rgba),
+                    };
+                    if let Ok(mut s) = state.lock() {
+                        if idx < s.len() {
+                            s[idx] = Some(thumb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Err(e) = ffmpeg::init() {
         crate::logger::log(format!("video-tile-thumb: ffmpeg init failed: {e}"));
         return;
+    }
+    // 全スロット既にキャッシュから埋まっているなら ffmpeg open 自体スキップ。
+    {
+        let s = state.lock().unwrap();
+        if s.iter().all(|t| t.is_some()) {
+            return;
+        }
     }
     let mut input = match ffmpeg::format::input(&path) {
         Ok(i) => i,
@@ -190,6 +239,13 @@ fn run_worker(
     for (idx, &target_secs) in timestamps.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
             return;
+        }
+        // 既にキャッシュからロード済みのスロットは skip
+        {
+            let s = state.lock().unwrap();
+            if s.get(idx).map(|t| t.is_some()).unwrap_or(false) {
+                continue;
+            }
         }
         // backward seek + 1 frame
         let target_pts = (target_secs * 1_000_000.0) as i64;
@@ -262,6 +318,25 @@ fn run_worker(
             }
             out
         };
+        // Phase 6.D-2: 抽出済 RGBA を WebP に encode してキャッシュに書く
+        // (失敗しても extraction 経路は止まらない)。
+        if let Some(c) = cache.as_ref() {
+            let encoder = webp::Encoder::from_rgba(&buf, dst_w, dst_h);
+            // q=70: グリッドサムネと同等品位、サイズ優先
+            let webp_bytes = encoder.encode(70.0).to_vec();
+            if let Err(e) = c.store_webp(
+                &path,
+                interval_ms,
+                max_w,
+                max_h,
+                idx as u32,
+                &webp_bytes,
+                video_mtime,
+            ) {
+                crate::logger::log(format!("video-tile-thumb cache store failed: {e}"));
+            }
+        }
+
         let thumb = TileThumbnail {
             pts_secs: target_secs,
             width: dst_w,
@@ -274,6 +349,14 @@ fn run_worker(
             }
         }
     }
+}
+
+/// WebP バイト列を RGBA8 にデコードする。失敗時は None。
+fn decode_webp_to_rgba(webp: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let img = image::load_from_memory(webp).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Some((w, h, rgba.into_raw()))
 }
 
 fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {

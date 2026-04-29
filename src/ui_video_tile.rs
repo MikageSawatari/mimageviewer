@@ -114,11 +114,24 @@ impl App {
             return;
         }
 
+        // Phase 6.D-2: 永続キャッシュを worker に渡す。動画 mtime をキーに mismatch
+        // 検出して古いキャッシュを自動破棄する。
+        let interval_ms = (interval * 1000.0).round() as u32;
+        let video_mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cache = self.video_tile_cache.clone();
         let worker = TileThumbnailWorker::spawn(
             path.clone(),
             timestamps.clone(),
             tile_w,
             tile_h,
+            cache,
+            interval_ms,
+            video_mtime,
         );
         self.video_tile_state = Some(VideoTileState {
             video_path: path,

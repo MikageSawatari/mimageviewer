@@ -1601,6 +1601,12 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) video_jump_textures:
         std::collections::HashMap<i64, ((u64, u32, u32), egui::TextureHandle)>,
+    /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2)。
+    /// 同 (動画 path, interval, tile_w, slot, video_mtime) のキーで再オープン時に
+    /// 即座に表示できる。
+    #[cfg(windows)]
+    pub(crate) video_tile_cache:
+        Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2215,6 +2221,12 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
         let t = std::time::Instant::now();
+        let video_tile_cache = crate::video::tile_thumb_cache::TileThumbCache::open()
+            .ok()
+            .map(std::sync::Arc::new);
+        crate::perf::emit_ms("startup", "db_open_video_tile_cache", 0, t);
+
+        let t = std::time::Instant::now();
         let rating_db = crate::rating_db::RatingDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_rating", 0, t);
 
@@ -2391,6 +2403,8 @@ impl Default for App {
             video_tile_textures: std::collections::HashMap::new(),
             #[cfg(windows)]
             video_jump_textures: std::collections::HashMap::new(),
+            #[cfg(windows)]
+            video_tile_cache,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
