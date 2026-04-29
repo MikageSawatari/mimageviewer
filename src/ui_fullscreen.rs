@@ -1074,10 +1074,39 @@ impl App {
                         if !self.erase_mode {
                             let saved_nav = nav_delta;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+                            // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
+                            // 動画なら video_meta (duration, bitrate) と画像 dims (= 動画解像度) を
+                            // 動画用 info text 構築のために流す。
+                            let is_video_mode = state.is_video;
+                            let mut video_dims: Option<(u32, u32)> = None;
+                            let mut video_meta: Option<(f64, i64)> = None;
+                            #[cfg(windows)]
+                            if is_video_mode {
+                                if let Some(crate::fs_animation::FsCacheEntry::Video {
+                                    player, ..
+                                }) = self.fs_cache.get(&fs_idx)
+                                {
+                                    if let Some(info) = player.info() {
+                                        video_dims = Some((info.width, info.height));
+                                        video_meta =
+                                            Some((info.duration_secs, info.bit_rate_bps));
+                                    }
+                                }
+                            }
+                            let display_dims = if is_video_mode {
+                                video_dims
+                            } else {
+                                state.image_dims
+                            };
+                            #[cfg(windows)]
+                            let tile_active = self.video_tile_state.is_some();
+                            #[cfg(not(windows))]
+                            let tile_active = false;
+                            let mut tile_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
-                                state.image_dims, state.image_file_size,
+                                display_dims, state.image_file_size,
                                 state.image_downscaled,
                                 &mut close_fs, &mut nav_delta,
                                 &mut self.show_metadata_panel,
@@ -1092,7 +1121,17 @@ impl App {
                                 &mut self.adjustment_mode,
                                 has_page_override,
                                 state.pdf_content_type,
+                                is_video_mode,
+                                video_meta,
+                                tile_active,
+                                &mut tile_pressed,
                             );
+                            // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
+                            #[cfg(windows)]
+                            if tile_pressed {
+                                let screen = ctx.content_rect().size();
+                                self.toggle_video_tile_mode(fs_idx, screen);
+                            }
                             // ホイール/キーで確定した nav_delta を保護
                             if nav_locked { nav_delta = saved_nav; }
                         }
@@ -3265,7 +3304,7 @@ impl App {
         spread_mode: &mut SpreadMode,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
-        // AI アップスケール後のサイズとモデル名（表示用）
+        // AI アップスケール後のサイズとモデル名（表示用）。動画モードでは無視される。
         ai_upscale_info: Option<(&str, u32, u32)>,
         // 画像補正パネル表示トグル
         adjustment_mode: &mut bool,
@@ -3273,6 +3312,15 @@ impl App {
         has_page_override: bool,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
         pdf_content_type: Option<PdfPageContentType>,
+        // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
+        // 切替、右側情報も動画情報に差し替える。
+        is_video: bool,
+        // 動画情報 (= info() の値抜粋、is_video=true のときのみ有効)。
+        // (duration_secs, bit_rate_bps)
+        video_meta: Option<(f64, i64)>,
+        // ▦ タイルボタンの状態 + 押下フラグ。
+        tile_active: bool,
+        tile_pressed: &mut bool,
     ) {
         let hover_in_top =
             ctx.input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
@@ -3327,80 +3375,113 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // ▶/⏸ スライドショーボタン
-        let play_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_play_btn",
-            |hovered| {
-                if *slideshow_playing {
-                    egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
-                } else if hovered {
-                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-                }
-            },
-            false,
-            |p, c, r| {
-                if *slideshow_playing {
-                    draw_pause_icon(p, c, r);
-                } else {
-                    draw_play_triangle(p, c, r);
-                }
-            },
-        );
-        let play_resp = if *slideshow_playing {
-            play_resp.on_hover_text("スライドショー停止")
+        // ▶/⏸ スライドショーボタン (画像モード) または ▦ タイルボタン (動画モード)
+        if is_video {
+            let tile_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_video_tile_btn",
+                |hovered| bar_button_bg(hovered, tile_active),
+                tile_active,
+                |p, c, _r| {
+                    p.text(
+                        c,
+                        egui::Align2::CENTER_CENTER,
+                        "▦",
+                        egui::FontId::proportional(20.0),
+                        egui::Color32::WHITE,
+                    );
+                },
+            );
+            let tile_resp = tile_resp.on_hover_text(if tile_active {
+                "タイルモード解除 [S]"
+            } else {
+                "タイルモード [S]"
+            });
+            if tile_resp.clicked() {
+                *tile_pressed = true;
+            }
+            if tile_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         } else {
-            play_resp.on_hover_text("スライドショー")
-        };
-        if play_resp.clicked() {
-            *slideshow_playing = !*slideshow_playing;
+            let play_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_play_btn",
+                |hovered| {
+                    if *slideshow_playing {
+                        egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
+                    } else if hovered {
+                        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+                    }
+                },
+                false,
+                |p, c, r| {
+                    if *slideshow_playing {
+                        draw_pause_icon(p, c, r);
+                    } else {
+                        draw_play_triangle(p, c, r);
+                    }
+                },
+            );
+            let play_resp = if *slideshow_playing {
+                play_resp.on_hover_text("スライドショー停止")
+            } else {
+                play_resp.on_hover_text("スライドショー")
+            };
+            if play_resp.clicked() {
+                *slideshow_playing = !*slideshow_playing;
+            }
+            if play_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
-        if play_resp.hovered() {
-            *nav_delta = 0;
-        }
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // ↷ 右回転ボタン
-        let rcw_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_rcw_btn",
-            |hovered| bar_button_bg(hovered, false),
-            false,
-            |p, c, r| draw_rotate_icon(p, c, r, true),
-        );
-        let rcw_resp = rcw_resp.on_hover_text("右回転 [R]");
-        if rcw_resp.clicked() {
-            *rotate_cw = true;
-        }
-        if rcw_resp.hovered() {
-            *nav_delta = 0;
-        }
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        // ↷ 右回転 / ↶ 左回転ボタン (画像のみ — 動画では意味を持たないため非表示)
+        if !is_video {
+            let rcw_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_rcw_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_rotate_icon(p, c, r, true),
+            );
+            let rcw_resp = rcw_resp.on_hover_text("右回転 [R]");
+            if rcw_resp.clicked() {
+                *rotate_cw = true;
+            }
+            if rcw_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // ↶ 左回転ボタン
-        let rccw_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_rccw_btn",
-            |hovered| bar_button_bg(hovered, false),
-            false,
-            |p, c, r| draw_rotate_icon(p, c, r, false),
-        );
-        let rccw_resp = rccw_resp.on_hover_text("左回転 [L]");
-        if rccw_resp.clicked() {
-            *rotate_ccw = true;
+            let rccw_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_rccw_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_rotate_icon(p, c, r, false),
+            );
+            let rccw_resp = rccw_resp.on_hover_text("左回転 [L]");
+            if rccw_resp.clicked() {
+                *rotate_ccw = true;
+            }
+            if rccw_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
-        if rccw_resp.hovered() {
-            *nav_delta = 0;
-        }
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
         // ℹ Info ボタン
         let info_resp = draw_bar_button(
@@ -3421,8 +3502,8 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // 🔬 分析ボタン（見開きダブル中は非表示）
-        if !is_spread_double {
+        // 🔬 分析ボタン（見開きダブル中は非表示。動画では意味を持たないため非表示）
+        if !is_spread_double && !is_video {
             let analysis_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -3442,28 +3523,35 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // 📖 見開きモードボタン (クリックでポップアップ)
+        // 📖 見開きモードボタン (画像のみ。動画では非表示)
         let spread_active = spread_mode.is_spread();
         let sm = *spread_mode;
-        let spread_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_spread_btn",
-            |hovered| bar_button_bg(hovered, spread_active),
-            spread_active,
-            |p, c, r| draw_spread_icon(p, c, r, sm),
-        );
-        let spread_resp = spread_resp.on_hover_text("見開き設定 [1-5]");
-        if spread_resp.clicked() {
-            *spread_popup_open = !*spread_popup_open;
-        }
-        if spread_resp.hovered() {
-            *nav_delta = 0;
+        let mut spread_resp_rect = egui::Rect::NOTHING;
+        if !is_video {
+            let spread_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_spread_btn",
+                |hovered| bar_button_bg(hovered, spread_active),
+                spread_active,
+                |p, c, r| draw_spread_icon(p, c, r, sm),
+            );
+            let spread_resp = spread_resp.on_hover_text("見開き設定 [1-5]");
+            spread_resp_rect = spread_resp.rect;
+            if spread_resp.clicked() {
+                *spread_popup_open = !*spread_popup_open;
+            }
+            if spread_resp.hovered() {
+                *nav_delta = 0;
+            }
+        } else if *spread_popup_open {
+            // 動画モードに切り替わったときは popup を閉じる (見開きは画像のみ)
+            *spread_popup_open = false;
         }
 
-        // 見開きポップアップ
-        if *spread_popup_open {
+        // 見開きポップアップ (画像のみ)
+        if *spread_popup_open && !is_video {
             let popup_x = next_x;
             let popup_y = bar_rect.max.y + 4.0;
             let popup_w = 200.0_f32;
@@ -3548,7 +3636,7 @@ impl App {
             // ポップアップ外クリックで閉じる
             let pointer_pos = ctx.input(|i| i.pointer.press_origin());
             if let Some(pos) = pointer_pos {
-                if !popup_rect.contains(pos) && !spread_resp.rect.contains(pos) {
+                if !popup_rect.contains(pos) && !spread_resp_rect.contains(pos) {
                     if ctx.input(|i| i.pointer.any_pressed()) {
                         *spread_popup_open = false;
                     }
@@ -3556,10 +3644,12 @@ impl App {
             }
         }
 
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        if !is_video {
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
 
-        // 🎨 画像補正パネルトグルボタン
-        {
+        // 🎨 画像補正パネルトグルボタン (動画では非表示)
+        if !is_video {
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(next_x, bar_rect.min.y + BAR_BUTTON_MARGIN),
                 egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
@@ -3604,17 +3694,33 @@ impl App {
 
         // ── 左側: フォルダ + ファイル名 (または archive > entry) ──
         // 右側のボタン / 情報テキストと衝突しないように幅制限して右端を切る。
+        // Phase 6: 動画モードでは AI アップスケール / PDF 情報を渡さず、
+        // 動画専用の info text に切り替える。
+        let info_text = if is_video {
+            build_info_text_video(image_dims, image_file_size, video_meta)
+        } else {
+            build_info_text(
+                image_dims,
+                image_file_size,
+                image_downscaled,
+                ai_upscale_info,
+                pdf_content_type,
+            )
+        };
         if !location_display.is_empty() {
-            let max_x = next_x
-                - 12.0
-                - compute_info_text_width(
-                    ui,
-                    image_dims,
-                    image_file_size,
-                    image_downscaled,
-                    ai_upscale_info,
-                    pdf_content_type,
-                );
+            let info_w = if info_text.is_empty() {
+                0.0
+            } else {
+                ui.painter()
+                    .layout_no_wrap(
+                        info_text.clone(),
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            };
+            let max_x = next_x - 12.0 - info_w;
             let avail_width = (max_x - (bar_rect.min.x + 12.0)).max(40.0);
             let galley = ui.painter().layout(
                 location_display.to_string(),
@@ -3630,18 +3736,29 @@ impl App {
             );
         }
 
-        // ── 右側: 画像サイズ・ファイルサイズ・PDF 情報 ──
-        // ファイル名は location_display 側へ統合したのでここからは除いている。
-        draw_fs_bar_info_text(
-            ui,
-            bar_rect,
-            egui::pos2(next_x - 12.0, bar_rect.center().y),
-            image_dims,
-            image_file_size,
-            image_downscaled,
-            ai_upscale_info,
-            pdf_content_type,
-        );
+        // ── 右側: 画像サイズ / 動画情報 / ファイルサイズ ──
+        if is_video {
+            if !info_text.is_empty() {
+                ui.painter().text(
+                    egui::pos2(next_x - 12.0, bar_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    info_text,
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        } else {
+            draw_fs_bar_info_text(
+                ui,
+                bar_rect,
+                egui::pos2(next_x - 12.0, bar_rect.center().y),
+                image_dims,
+                image_file_size,
+                image_downscaled,
+                ai_upscale_info,
+                pdf_content_type,
+            );
+        }
     }
 }
 
@@ -4252,7 +4369,58 @@ fn build_info_text(
     parts.join("    ")
 }
 
+/// 動画モード時の上ホバーバー右側情報を組み立てる (Phase 6)。
+/// `(W × H、長さ mm:ss、平均 X.X Mbps、ファイルサイズ)` をスペース区切りで連結。
+/// 各項目は値が無い (0 / None) ならスキップ。
+fn build_info_text_video(
+    dims: Option<(u32, u32)>,
+    file_size: Option<u64>,
+    video_meta: Option<(f64, i64)>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some((w, h)) = dims {
+        parts.push(format!("{w} × {h}"));
+    }
+    if let Some((dur, bitrate)) = video_meta {
+        if dur > 0.0 {
+            parts.push(format_duration(dur));
+        }
+        if bitrate > 0 {
+            parts.push(format_bitrate(bitrate));
+        }
+    }
+    if let Some(bytes) = file_size {
+        parts.push(format_bytes_small(bytes));
+    }
+    parts.join("    ")
+}
+
+/// 動画長さを mm:ss / hh:mm:ss にフォーマット (右上 info 表示用)。
+fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// 平均ビットレートを Mbps / kbps の人間可読表記にフォーマット。
+fn format_bitrate(bps: i64) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
+    } else if bps >= 1_000 {
+        format!("{} kbps", bps / 1_000)
+    } else {
+        format!("{bps} bps")
+    }
+}
+
 /// 右側情報テキストの描画幅を返す。左側 `location_display` を折り詰めするのに使う。
+#[allow(dead_code)] // 動画分岐で個別計算するように整理したため画像経路のみで使用
 fn compute_info_text_width(
     ui: &egui::Ui,
     image_dims: Option<(u32, u32)>,
