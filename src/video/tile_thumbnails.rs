@@ -143,19 +143,23 @@ fn run_worker(
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
     use ffmpeg::util::frame::video::Video;
 
-    // Phase 6.D-2: 起動直後にキャッシュをまとめてチェックして state に load。
-    // 残った None スロットだけが ffmpeg 抽出の対象になる。
-    // Phase 8.C: キーは絶対 PTS (timestamp_ms) になったので、間隔 5 秒 → 1 秒
-    // 切替時にも共通 PTS のサムネを再利用できる。
+    // 起動直後にキャッシュをまとめてチェックして state に load。残った None スロット
+    // だけが ffmpeg 抽出の対象。キーは絶対 PTS なので間隔切替時にも再利用される。
+    // 1 度の Mutex 取得で全スロットを照会する (simplify P2)。
     if let Some(c) = cache.as_ref() {
-        for (idx, &pts) in timestamps.iter().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let ts_ms: Vec<i64> = timestamps
+            .iter()
+            .map(|&p| (p * 1000.0).round() as i64)
+            .collect();
+        let hits = c.lookup_webp_batch(&path, max_w, &ts_ms, video_mtime);
+        for (idx, (&pts, webp_opt)) in timestamps.iter().zip(hits.into_iter()).enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return;
             }
-            let timestamp_ms = (pts * 1000.0).round() as i64;
-            if let Some(webp) =
-                c.lookup_webp(&path, max_w, timestamp_ms, video_mtime)
-            {
+            if let Some(webp) = webp_opt {
                 if let Some((w, h, rgba)) = crate::catalog::decode_thumb_to_rgba(&webp) {
                     let thumb = TileThumbnail {
                         pts_secs: pts,
@@ -327,10 +331,10 @@ fn run_worker(
             if let Err(e) = c.store_webp(
                 &path,
                 max_w,
-                dst_h,
                 timestamp_ms,
-                &webp_bytes,
                 video_mtime,
+                dst_h,
+                &webp_bytes,
             ) {
                 crate::logger::log(format!("video-tile-thumb cache store failed: {e}"));
             }

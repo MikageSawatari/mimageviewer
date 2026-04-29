@@ -679,8 +679,8 @@ impl VideoPlayer {
                     }
                     self.clock.clear_seek_target_override(serial);
                 } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                    // Phase 8.B 診断: override 中で frame pts が target - 0.75 未満
-                    // のとき (= 解除されない最大の原因候補)。
+                    // override 中で frame pts < target - 0.75 (= preroll 不足で
+                    // 解除条件を満たさない経路) を perflog から特定するための診断。
                     crate::perf::event(
                         "video",
                         "seek_override_skip_clear_gpu",
@@ -727,8 +727,7 @@ impl VideoPlayer {
                 }
                 self.clock.clear_seek_target_override(frame.seek_serial);
             } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                // Phase 8.B 診断: CPU 経路 - override 中で frame pts が target - 0.75
-                // 未満のとき。GPU/CPU 経路どちらが多いかで preroll 失敗を特定する。
+                // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
                 crate::perf::event(
                     "video",
                     "seek_override_skip_clear_cpu",

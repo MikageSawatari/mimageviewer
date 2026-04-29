@@ -64,6 +64,18 @@ impl VideoPinDb {
         crate::data_dir::get().join("video_pins.db")
     }
 
+    /// pts のみ (= WebP BLOB は取り出さない) のフェッチ。
+    /// 描画ループでパネルを毎フレーム再描画する状況 (~60fps) でも、数十 KB の
+    /// WebP を毎回 Vec 化するコストを払わずに済む (simplify P1 指摘)。
+    pub fn lookup_pts(&self, video_path: &Path) -> Option<f64> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT pin_pts_secs FROM video_pins WHERE path = ?1")
+            .ok()?;
+        stmt.query_row([&key], |row| row.get::<_, f64>(0)).ok()
+    }
+
     /// 動画パスに対応するピン情報を取得。Phase 5.3 ではスキーマ通りに読みに行くが、
     /// 行が無ければ `None` を返す (= 通常の運用)。Phase 5.4.1 で `set_pin` が
     /// 配線されるまで実質常に `None`。

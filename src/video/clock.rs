@@ -116,6 +116,13 @@ pub struct AvClock {
 
 const SEEK_NONE: u64 = u64::MAX;
 
+/// `seek_override_clear` perf event の `result` 値 (analyze_perf.py が grep する)。
+/// 文字列リテラルを散らさず const にして typo を防ぐ。
+const RES_ALREADY_CLEAR: &str = "already_clear";
+const RES_STALE_SERIAL: &str = "stale_serial";
+const RES_CLEARED: &str = "cleared";
+const RES_CAS_FAILED: &str = "cas_failed";
+
 /// シーク完了判定の許容差 (秒)。
 /// 用法は呼び出し側で異なる:
 /// - video tick (`pts_clears_seek_override`): **片側**。pts > target は無制限許容
@@ -139,6 +146,33 @@ pub(crate) fn pts_clears_seek_override(frame_pts: f64, now: f64) -> bool {
 /// (= 60fps コンテンツが 30fps 表示に落ちる現象を回避)。
 /// AV 同期上は 16ms 程度の lead は知覚されない (audio-video sync 許容窓は ±50ms)。
 pub(crate) const DISPLAY_LEAD_TOLERANCE_SECS: f64 = 0.016;
+
+/// `clear_seek_target_override` の 4 通りの結果を 1 つの perf event で記録するヘルパ。
+/// `crate::perf::is_enabled()` が false なら何もせず即 return (= 引数の評価コスト
+/// だけ、JSON 値のアロケーションは発生しない)。
+fn log_clear_result(
+    completed_serial: u64,
+    override_serial: Option<u64>,
+    target: Option<f64>,
+    result: &'static str,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let mut fields: Vec<(&str, serde_json::Value)> = Vec::with_capacity(4);
+    fields.push((
+        "completed_serial",
+        serde_json::Value::from(completed_serial as i64),
+    ));
+    if let Some(s) = override_serial {
+        fields.push(("override_serial", serde_json::Value::from(s as i64)));
+    }
+    if let Some(t) = target {
+        fields.push(("target", serde_json::Value::from(t)));
+    }
+    fields.push(("result", serde_json::Value::from(result)));
+    crate::perf::event("video", "seek_override_clear", None, 0, &fields);
+}
 
 impl AvClock {
     pub fn new(initial_volume: f64) -> Self {
@@ -335,8 +369,6 @@ impl AvClock {
             direction,
             serial: new_serial,
         });
-        // Phase 8.B 診断: override 設定経路を perflog に記録。
-        // pace_now が固定される現象 (Codex P1 指摘) の根本原因特定用。
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "video",
@@ -425,37 +457,17 @@ impl AvClock {
         //   - bits が新世代に変わる → CAS が expected 不一致で失敗 (誤クリアなし)
         let cur_bits = self.seek_target_override_bits.load(Ordering::Acquire);
         if cur_bits == SEEK_NONE {
-            // Phase 8.B 診断: 既に解除済みケース (= 別経路が先行クリア)。
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "video",
-                    "seek_override_clear",
-                    None,
-                    0,
-                    &[
-                        ("completed_serial", serde_json::Value::from(completed_serial as i64)),
-                        ("result", serde_json::Value::from("already_clear")),
-                    ],
-                );
-            }
+            log_clear_result(completed_serial, None, None, RES_ALREADY_CLEAR);
             return;
         }
         let override_serial = self.seek_override_serial.load(Ordering::Acquire);
         if completed_serial < override_serial {
-            // Phase 8.B 診断: 古い世代のクリア要求 (新 seek が割り込んだケース)。
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "video",
-                    "seek_override_clear",
-                    None,
-                    0,
-                    &[
-                        ("completed_serial", serde_json::Value::from(completed_serial as i64)),
-                        ("override_serial", serde_json::Value::from(override_serial as i64)),
-                        ("result", serde_json::Value::from("stale_serial")),
-                    ],
-                );
-            }
+            log_clear_result(
+                completed_serial,
+                Some(override_serial),
+                None,
+                RES_STALE_SERIAL,
+            );
             return;
         }
         let cas_result = self.seek_target_override_bits.compare_exchange(
@@ -464,21 +476,17 @@ impl AvClock {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        if crate::perf::is_enabled() {
-            let result_str = if cas_result.is_ok() { "cleared" } else { "cas_failed" };
-            crate::perf::event(
-                "video",
-                "seek_override_clear",
-                None,
-                0,
-                &[
-                    ("completed_serial", serde_json::Value::from(completed_serial as i64)),
-                    ("override_serial", serde_json::Value::from(override_serial as i64)),
-                    ("target", serde_json::Value::from(f64::from_bits(cur_bits))),
-                    ("result", serde_json::Value::from(result_str)),
-                ],
-            );
-        }
+        let result_str = if cas_result.is_ok() {
+            RES_CLEARED
+        } else {
+            RES_CAS_FAILED
+        };
+        log_clear_result(
+            completed_serial,
+            Some(override_serial),
+            Some(f64::from_bits(cur_bits)),
+            result_str,
+        );
     }
 
     /// fallback wall clock を `(pts, 今)` に再アンカー。

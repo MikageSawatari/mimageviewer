@@ -288,12 +288,12 @@ impl App {
             .map(|db| db.list(&video_path))
             .unwrap_or_default();
         // ピン位置を毎フレーム読み出してボタンラベル + ジャンプ行に反映する。
+        // BLOB を取り出さない `lookup_pts` を使うことで毎フレーム数十 KB の WebP を
+        // Vec 化するコストを回避 (simplify P1)。
         let pin_pts: Option<f64> = self
             .video_pin_db
             .as_ref()
-            .and_then(|db| db.lookup(&video_path))
-            .map(|pin| pin.pin_pts_secs);
-        let pinned: bool = pin_pts.is_some();
+            .and_then(|db| db.lookup_pts(&video_path));
         let chapters: Vec<Chapter> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 player.info().map(|i| i.chapters.clone()).unwrap_or_default()
@@ -433,7 +433,7 @@ impl App {
                     ui.add_space(10.0);
                     // 📌 ピン: 現状を反映してラベルを切り替える (= クリックで何が
                     // 起きるかが見える)。ピン中はアクセント色 (緑系) で視覚的に強調。
-                    let (pin_label, pin_fill) = if pinned {
+                    let (pin_label, pin_fill) = if pin_pts.is_some() {
                         (
                             "✓ ピン留め中 (クリックで解除)",
                             egui::Color32::from_rgba_unmultiplied(60, 110, 60, 240),

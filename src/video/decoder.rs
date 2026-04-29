@@ -557,13 +557,10 @@ fn run_decoder(
                 ));
                 seek_result = backward(&mut input);
             }
-            // Phase 8.B P1b (Codex): direction=0 (絶対 seek、シークバークリック /
-            // resume 復元) も backward 失敗時の retry 経路を持たせる。
-            // input.seek(target.., target..) で「target 以降のキーフレーム」へ
-            // 飛ぶ実装にフォールバックし、それも失敗したら諦める。
-            // 旧コード: direction=0 の retry が無く、失敗時は drop_before_secs=None
-            //          のまま decoder が現在の demux 位置から流す → override が
-            //          永久残留する pace_now stuck の原因 (Codex 解析)。
+            // direction=0 (絶対 seek) も backward 失敗時に forward retry する。
+            // retry を入れないと最終失敗時 drop_before_secs=None のまま decoder が
+            // 現在の demux 位置から流し、target 近傍フレームが永久に来ず override が
+            // 残留して pace_now=target に張り付く (Phase 8.B 修正前の症状)。
             if seek_result.is_err() && direction == 0 {
                 crate::logger::log(format!(
                     "backward seek failed at {target_secs:.3}s, retry as forward"
@@ -573,13 +570,9 @@ fn run_decoder(
             crate::logger::log(format!(
                 "seek: target={target_secs:.3}s dir={direction} serial={serial} result={seek_result:?}"
             ));
-            let seek_ok = seek_result.is_ok();
-            if !seek_ok {
-                // Phase 8.B P1a (Codex): seek 完全失敗時は override を明示解除。
-                // 旧コードは drop_before_secs=None で「素通し」させ、target 近傍
-                // フレームが来るのを期待していたが、demux 位置が target からかけ
-                // 離れていると永久に来ない (= pace_now=target 固定 + UI ハング)。
-                // ここで明示解除すれば pace_now が wall extrapolation に切り替わる。
+            if seek_result.is_err() {
+                // 完全失敗: override を明示解除しないと pace_now が target 固定で
+                // UI が hang する。clock 経由で wall extrapolation に切替える。
                 drop_before_secs = None;
                 clock.clear_seek_target_override(serial);
                 if crate::perf::is_enabled() {

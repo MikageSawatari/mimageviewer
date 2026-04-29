@@ -133,6 +133,36 @@ impl TileThumbCache {
     ) -> Option<Vec<u8>> {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().ok()?;
+        Self::lookup_with_conn(&conn, &key, tile_w, timestamp_ms, video_mtime)
+    }
+
+    /// 複数の timestamp を 1 度の Mutex 取得で照会するバッチ版。タイル worker の
+    /// 起動時 (~100 スロット) で per-slot lock を回避するため (simplify P2)。
+    /// 戻り値は入力順 (= スロット順) と一致する。
+    pub fn lookup_webp_batch(
+        &self,
+        video_path: &Path,
+        tile_w: u32,
+        timestamps_ms: &[i64],
+        video_mtime: i64,
+    ) -> Vec<Option<Vec<u8>>> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let Ok(conn) = self.conn.lock() else {
+            return vec![None; timestamps_ms.len()];
+        };
+        timestamps_ms
+            .iter()
+            .map(|&ts| Self::lookup_with_conn(&conn, &key, tile_w, ts, video_mtime))
+            .collect()
+    }
+
+    fn lookup_with_conn(
+        conn: &rusqlite::Connection,
+        key: &str,
+        tile_w: u32,
+        timestamp_ms: i64,
+        video_mtime: i64,
+    ) -> Option<Vec<u8>> {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT webp, video_mtime FROM video_tile_thumbs
@@ -161,14 +191,16 @@ impl TileThumbCache {
     }
 
     /// 1 タイル分の WebP を保存。同 PRIMARY KEY なら ON CONFLICT で上書き。
+    /// 引数順は `lookup_webp` の prefix `(path, tile_w, timestamp_ms, video_mtime)`
+    /// に揃え、payload (`tile_h`, `webp`) を末尾に置く。
     pub fn store_webp(
         &self,
         video_path: &Path,
         tile_w: u32,
-        tile_h: u32,
         timestamp_ms: i64,
-        webp: &[u8],
         video_mtime: i64,
+        tile_h: u32,
+        webp: &[u8],
     ) -> Result<(), rusqlite::Error> {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -222,7 +254,7 @@ mod tests {
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
         let webp = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        db.store_webp(p, 320, 180, 5000, &webp, 99).unwrap();
+        db.store_webp(p, 320, 5000, 99, 180, &webp).unwrap();
         let got = db.lookup_webp(p, 320, 5000, 99).unwrap();
         assert_eq!(got, webp);
     }
@@ -231,7 +263,7 @@ mod tests {
     fn lookup_drops_stale_mtime() {
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
-        db.store_webp(p, 320, 180, 5000, &[1, 2, 3], 100).unwrap();
+        db.store_webp(p, 320, 5000, 100, 180, &[1, 2, 3]).unwrap();
         // mtime 違い → None + 該当行削除
         assert!(db.lookup_webp(p, 320, 5000, 999).is_none());
         // 削除されたので再度 100 で照会しても見つからない
@@ -242,15 +274,15 @@ mod tests {
     fn store_overwrites_same_pk() {
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
-        db.store_webp(p, 320, 180, 5000, &[1], 100).unwrap();
-        db.store_webp(p, 320, 180, 5000, &[2, 3], 100).unwrap();
+        db.store_webp(p, 320, 5000, 100, 180, &[1]).unwrap();
+        db.store_webp(p, 320, 5000, 100, 180, &[2, 3]).unwrap();
         assert_eq!(db.lookup_webp(p, 320, 5000, 100).unwrap(), vec![2, 3]);
     }
 
     #[test]
     fn case_and_separator_normalized() {
         let db = open_in_memory();
-        db.store_webp(Path::new("C:\\V.MP4"), 320, 180, 5000, &[9], 100)
+        db.store_webp(Path::new("C:\\V.MP4"), 320, 5000, 100, 180, &[9])
             .unwrap();
         assert!(db
             .lookup_webp(Path::new("c:/v.mp4"), 320, 5000, 100)
@@ -264,8 +296,8 @@ mod tests {
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
         // 5 秒間隔: pts=0ms, 5000ms, 10000ms, ...
-        db.store_webp(p, 320, 180, 5000, &[5], 100).unwrap();
-        db.store_webp(p, 320, 180, 10000, &[10], 100).unwrap();
+        db.store_webp(p, 320, 5000, 100, 180, &[5]).unwrap();
+        db.store_webp(p, 320, 10000, 100, 180, &[10]).unwrap();
         // 1 秒間隔再描画時: pts=5000ms, 10000ms はキャッシュヒット
         assert_eq!(db.lookup_webp(p, 320, 5000, 100).unwrap(), vec![5]);
         assert_eq!(db.lookup_webp(p, 320, 10000, 100).unwrap(), vec![10]);
