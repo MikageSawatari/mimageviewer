@@ -82,7 +82,6 @@ pub mod ui_video_tile;
 pub mod update_check;
 pub mod video;
 pub mod video_bookmarks;
-pub mod video_pins;
 pub mod video_thumb;
 pub mod wic_decoder;
 pub mod xmp_reader;

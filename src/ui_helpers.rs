@@ -115,6 +115,31 @@ pub fn format_bytes_small(bytes: u64) -> String {
     }
 }
 
+/// 秒を mm:ss / hh:mm:ss にフォーマット (動画 HUD / シークラベル / ジャンプ行など共通)。
+/// 分・秒は 2 桁ゼロ詰め。時はゼロ詰めなし (= "1:23:45")。
+pub fn format_hms(secs: f64) -> String {
+    let total = secs.max(0.0).round() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// 平均ビットレートを Mbps / kbps の人間可読表記にフォーマット (上ホバー右側情報用)。
+pub fn format_bitrate_bps(bps: i64) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
+    } else if bps >= 1_000 {
+        format!("{} kbps", bps / 1_000)
+    } else {
+        format!("{bps} bps")
+    }
+}
+
 /// 整数を 3 桁区切りにフォーマット (例: 1234 → "1,234")
 pub fn format_count(n: u64) -> String {
     let s = n.to_string();

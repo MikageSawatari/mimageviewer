@@ -4383,10 +4383,10 @@ fn build_info_text_video(
     }
     if let Some((dur, bitrate)) = video_meta {
         if dur > 0.0 {
-            parts.push(format_duration(dur));
+            parts.push(crate::ui_helpers::format_hms(dur));
         }
         if bitrate > 0 {
-            parts.push(format_bitrate(bitrate));
+            parts.push(crate::ui_helpers::format_bitrate_bps(bitrate));
         }
     }
     if let Some(bytes) = file_size {
@@ -4395,55 +4395,6 @@ fn build_info_text_video(
     parts.join("    ")
 }
 
-/// 動画長さを mm:ss / hh:mm:ss にフォーマット (右上 info 表示用)。
-fn format_duration(secs: f64) -> String {
-    let total = secs.max(0.0).round() as i64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
-/// 平均ビットレートを Mbps / kbps の人間可読表記にフォーマット。
-fn format_bitrate(bps: i64) -> String {
-    if bps >= 1_000_000 {
-        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
-    } else if bps >= 1_000 {
-        format!("{} kbps", bps / 1_000)
-    } else {
-        format!("{bps} bps")
-    }
-}
-
-/// 右側情報テキストの描画幅を返す。左側 `location_display` を折り詰めするのに使う。
-#[allow(dead_code)] // 動画分岐で個別計算するように整理したため画像経路のみで使用
-fn compute_info_text_width(
-    ui: &egui::Ui,
-    image_dims: Option<(u32, u32)>,
-    image_file_size: Option<u64>,
-    image_downscaled: bool,
-    ai_upscale_info: Option<(&str, u32, u32)>,
-    pdf_content_type: Option<PdfPageContentType>,
-) -> f32 {
-    let text = build_info_text(
-        image_dims,
-        image_file_size,
-        image_downscaled,
-        ai_upscale_info,
-        pdf_content_type,
-    );
-    if text.is_empty() {
-        return 0.0;
-    }
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text, egui::FontId::proportional(15.0), egui::Color32::WHITE);
-    galley.size().x
-}
 
 /// 回転アイコンを自前描画する。
 fn draw_rotate_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32, clockwise: bool) {
@@ -4805,8 +4756,8 @@ impl App {
         fs_idx: usize,
         thumb: &crate::video::thumbnail::Thumbnail,
     ) -> egui::TextureId {
-        // bucket key: target_secs / 0.5s 単位の整数。同じ key なら upload skip。
-        let key = (thumb.target_secs / 0.5).round() as i64;
+        // bucket key: thumbnail::SECONDS_PER_BUCKET (= 0.5s) の整数。同 key なら upload skip。
+        let key = crate::video::thumbnail::bucket_key(thumb.target_secs);
         let need_recreate = match &self.video_seek_thumb_tex {
             Some((idx, _, _)) if *idx != fs_idx => true,
             None => true,
@@ -5175,8 +5126,8 @@ impl App {
         // ── 時刻表示 ──
         let time_text = format!(
             "{} / {}",
-            format_secs(position),
-            format_secs(duration.max(position)),
+            crate::ui_helpers::format_hms(position),
+            crate::ui_helpers::format_hms(duration.max(position)),
         );
         let time_galley = painter.layout_no_wrap(time_text, time_font, egui::Color32::WHITE);
         let time_w = time_galley.size().x;
@@ -5272,7 +5223,7 @@ impl App {
                 // 余白を確保する。
                 let thumb_opt = self.fs_video_player(fs_idx)
                     .and_then(|p| p.nearest_seek_thumbnail(target));
-                let label = format_secs(target);
+                let label = crate::ui_helpers::format_hms(target);
                 let galley =
                     painter.layout_no_wrap(label, label_font.clone(), egui::Color32::WHITE);
                 let label_size = galley.size();
@@ -5491,17 +5442,6 @@ pub(crate) fn video_hud_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
-fn format_secs(s: f64) -> String {
-    let total = s.max(0.0).round() as i64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let sec = total % 60;
-    if h > 0 {
-        format!("{h:02}:{m:02}:{sec:02}")
-    } else {
-        format!("{m:02}:{sec:02}")
-    }
-}
 
 #[cfg(test)]
 mod tests {

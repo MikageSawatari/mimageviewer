@@ -37,8 +37,9 @@ pub const THUMB_W: u32 = 320;
 pub const THUMB_H: u32 = 180;
 /// LRU 容量。これ以上は古い順に捨てる。
 const MAX_ENTRIES: usize = 32;
-/// キャッシュ key の粒度 (秒)。
-const SECONDS_PER_BUCKET: f64 = 0.5;
+/// キャッシュ key の粒度 (秒)。シーク サムネ + 動画ジャンプパネル左サムネで共通の
+/// 粒度を使う必要がある (= UI が同 pts に対して同じ key を期待するため)。
+pub const SECONDS_PER_BUCKET: f64 = 0.5;
 
 /// 1 件のサムネイル (RGBA、`THUMB_W x THUMB_H` 固定とは限らないので w/h を持つ)。
 #[derive(Clone)]
@@ -92,7 +93,10 @@ impl ThumbnailState {
     }
 }
 
-fn bucket_key(secs: f64) -> i64 {
+/// シークサムネのキャッシュキー (秒 → 0.5 秒バケット整数)。同 pts の連続要求で
+/// hit させるため、ホバー側 (シークバー / 動画左ジャンプパネル) からも同一関数を
+/// 使う必要がある。
+pub fn bucket_key(secs: f64) -> i64 {
     (secs / SECONDS_PER_BUCKET).round() as i64
 }
 

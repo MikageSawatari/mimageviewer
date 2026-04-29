@@ -157,7 +157,7 @@ fn run_worker(
             if let Some(webp) =
                 c.lookup_webp(&path, interval_ms, max_w, idx as u32, video_mtime)
             {
-                if let Some((w, h, rgba)) = decode_webp_to_rgba(&webp) {
+                if let Some((w, h, rgba)) = crate::catalog::decode_thumb_to_rgba(&webp) {
                     let thumb = TileThumbnail {
                         pts_secs: pts,
                         width: w,
@@ -351,13 +351,6 @@ fn run_worker(
     }
 }
 
-/// WebP バイト列を RGBA8 にデコードする。失敗時は None。
-fn decode_webp_to_rgba(webp: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let img = image::load_from_memory(webp).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    Some((w, h, rgba.into_raw()))
-}
 
 fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 {

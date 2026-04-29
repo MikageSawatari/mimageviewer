@@ -291,13 +291,20 @@ pub fn encode_thumb_webp(
 /// キャッシュされたサムネイル (WebP あるいは旧 JPEG) を egui::ColorImage にデコードする。
 /// `image::load_from_memory` が自動でフォーマット判定するため両対応。
 pub fn decode_thumb_to_color_image(data: &[u8]) -> Option<egui::ColorImage> {
+    let (w, h, rgba) = decode_thumb_to_rgba(data)?;
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &rgba,
+    ))
+}
+
+/// `image::load_from_memory` でデコードして RGBA8 + (w, h) を返す。
+/// `decode_thumb_to_color_image` と動画タイル サムネ cache の WebP 復元で共用。
+pub fn decode_thumb_to_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let img = image::load_from_memory(data).ok()?;
     let rgba = img.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        size,
-        rgba.as_raw(),
-    ))
+    let (w, h) = (rgba.width(), rgba.height());
+    Some((w, h, rgba.into_raw()))
 }
 
 /// キャッシュディレクトリのデフォルト位置（DATA_DIR\cache）

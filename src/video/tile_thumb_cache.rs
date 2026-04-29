@@ -84,7 +84,7 @@ impl TileThumbCache {
         slot: u32,
         video_mtime: i64,
     ) -> Option<Vec<u8>> {
-        let key = normalize_path(video_path);
+        let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().ok()?;
         let mut stmt = conn
             .prepare_cached(
@@ -103,10 +103,12 @@ impl TileThumbCache {
             Some((webp, mtime)) if mtime == video_mtime => Some(webp),
             Some(_) => {
                 drop(stmt);
-                // mtime 不一致 → 古いキャッシュなので削除して None
+                // 古い mtime の行だけを削除する。同 path で別 mtime の行が同時に
+                // 存在することは想定しないが、念のため `mtime != video_mtime` で
+                // 限定して、現在 mtime の行 (= 別 worker が書いたもの) を巻き込まない。
                 let _ = conn.execute(
-                    "DELETE FROM video_tile_thumbs WHERE path = ?1",
-                    [&key],
+                    "DELETE FROM video_tile_thumbs WHERE path = ?1 AND video_mtime != ?2",
+                    rusqlite::params![key, video_mtime],
                 );
                 None
             }
@@ -125,7 +127,7 @@ impl TileThumbCache {
         webp: &[u8],
         video_mtime: i64,
     ) -> Result<(), rusqlite::Error> {
-        let key = normalize_path(video_path);
+        let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute(
             "INSERT INTO video_tile_thumbs
@@ -138,11 +140,10 @@ impl TileThumbCache {
         Ok(())
     }
 
-    /// 動画 1 ファイル分のキャッシュを削除 (= 動画ファイル削除時 cleanup 用、
-    /// Phase 6 では未配線)。
+    /// 動画 1 ファイル分のキャッシュを削除 (= 動画ファイル削除時 cleanup 用、未配線)。
     #[allow(dead_code)]
     pub fn clear_for(&self, video_path: &Path) -> Result<(), rusqlite::Error> {
-        let key = normalize_path(video_path);
+        let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute(
             "DELETE FROM video_tile_thumbs WHERE path = ?1",
@@ -150,10 +151,6 @@ impl TileThumbCache {
         )?;
         Ok(())
     }
-}
-
-fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -175,6 +172,30 @@ mod tests {
         assert!(db
             .lookup_webp(Path::new("c:/none.mp4"), 1000, 320, 0, 12345)
             .is_none());
+    }
+
+    #[test]
+    fn stale_mtime_only_clears_old_rows() {
+        // 同 path で 2 mtime の行を入れて、古い方だけ消えることを確認 (Codex P1)。
+        let db = open_in_memory();
+        let p = Path::new("c:/v.mp4");
+        // 古い mtime の行
+        db.store_webp(p, 5000, 320, 180, 0, &[1], 100).unwrap();
+        // 直に挿入 (新 mtime の行を tile_w 違いで)
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO video_tile_thumbs
+                    (path, interval_ms, tile_w, tile_h, slot, webp, video_mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params!["c:/v.mp4", 5000, 640, 360, 0, &[2u8] as &[u8], 200],
+            )
+            .unwrap();
+        }
+        // 新 mtime=200 で lookup → tile_w=320 は mismatch (mtime=100 → DELETE)、
+        // tile_w=640 (mtime=200) は残る
+        assert!(db.lookup_webp(p, 5000, 320, 0, 200).is_none());
+        assert!(db.lookup_webp(p, 5000, 640, 0, 200).is_some());
     }
 
     #[test]

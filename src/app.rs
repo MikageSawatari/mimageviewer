@@ -1574,15 +1574,9 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
-    // ── 動画ピン / ブックマーク DB (Phase 5.4 / Phase 6) ──────────
-    /// 動画フレーム ピン留め DB。Phase 5 では UI 配線していたが、Phase 6 で
-    /// 「動画にピン UI は要らない」方針に変更したため authoring UI は削除。
-    /// DB スキーマと open() 自体は維持し、将来再導入が容易な状態を保つ
-    /// (= フィールド削除は break 変更が大きいため後回し)。
-    #[allow(dead_code)]
-    pub(crate) video_pin_db: Option<crate::video_pins::VideoPinDb>,
+    // ── 動画ブックマーク DB ───────────────────────────────────
     /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
-    /// 表示される。Phase 5.4 / 5.4.1 で B キー authoring 配線。
+    /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
 
     // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
@@ -2213,10 +2207,6 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
 
         let t = std::time::Instant::now();
-        let video_pin_db = crate::video_pins::VideoPinDb::open().ok();
-        crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
-
-        let t = std::time::Instant::now();
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
@@ -2395,7 +2385,6 @@ impl Default for App {
             search_or_mode: false,
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
-            video_pin_db,
             video_bookmark_db,
             #[cfg(windows)]
             video_tile_state: None,

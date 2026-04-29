@@ -19,6 +19,14 @@ pub fn normalize(path: &Path) -> String {
     no_drive.to_lowercase().replace('\\', "/")
 }
 
+/// ドライブ文字を **保持** したまま小文字化・スラッシュ統一したパス文字列を返す。
+/// rotation_db / rating_db / video_pins / video_bookmarks / video_tile_thumb_cache 等の
+/// DB キー用に使う共通実装。`normalize` (= ドライブ文字除外、お気に入り検索用) とは
+/// 別の規則であることに注意。
+pub fn normalize_keep_drive(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase().replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

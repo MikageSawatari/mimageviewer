@@ -173,7 +173,7 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
         put(ui, "説明", d);
     }
 
-    let dur_str = format_secs(info.duration_secs);
+    let dur_str = crate::ui_helpers::format_hms(info.duration_secs);
     put(ui, "長さ", &dur_str);
 
     let res_str = format!("{} × {} px", info.width, info.height);
@@ -203,17 +203,6 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
     put(ui, "デコーダ", decode_label);
 }
 
-fn format_secs(s: f64) -> String {
-    let total = s.max(0.0).round() as i64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let sec = total % 60;
-    if h > 0 {
-        format!("{h:02}:{m:02}:{sec:02}")
-    } else {
-        format!("{m:02}:{sec:02}")
-    }
-}
 
 /// 左パネルでクリックされた行から発生する操作。
 #[derive(Debug)]
@@ -490,7 +479,7 @@ impl App {
             }
             _ => None,
         };
-        let bucket: i64 = (pts_secs / 0.5).round() as i64;
+        let bucket: i64 = crate::video::thumbnail::bucket_key(pts_secs);
         let tex_id = if let Some(t) = thumb_data.as_ref() {
             let key = (t.target_secs.to_bits(), t.width, t.height);
             let cached = self
@@ -562,7 +551,7 @@ impl App {
             // 縦 2 行: 時間 + タイトル
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                let time_label = format_secs(pts_secs);
+                let time_label = crate::ui_helpers::format_hms(pts_secs);
                 let time_resp = ui.add(
                     egui::Button::new(
                         egui::RichText::new(format!("{icon}  {time_label}"))

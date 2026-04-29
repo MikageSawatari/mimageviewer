@@ -287,7 +287,7 @@ impl App {
             painter.text(
                 egui::pos2(tile_rect.center().x, tile_rect.max.y + label_h * 0.5),
                 egui::Align2::CENTER_CENTER,
-                format_secs(pts),
+                crate::ui_helpers::format_hms(pts),
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_rgb(220, 220, 220),
             );
@@ -306,10 +306,17 @@ impl App {
             }
         }
 
-        // Ctrl+Wheel で列数候補を切替 (Phase 6.D)。タイル中のみ有効。
-        let wheel_y = ctx.input(|i| {
+        // Ctrl+Wheel で列数候補を切替。タイル中のみ有効。
+        // smooth_scroll_delta は数フレーム残留するため、`input_mut` で取り出した
+        // 上で 0.0 にリセットしないと 1 ノッチが連続発火して settings.save() が
+        // 多重実行 + worker 多重 spawn になる。
+        let wheel_y = ctx.input_mut(|i| {
             if i.modifiers.ctrl {
-                i.smooth_scroll_delta.y
+                let y = i.smooth_scroll_delta.y;
+                if y.abs() > 0.5 {
+                    i.smooth_scroll_delta.y = 0.0;
+                }
+                y
             } else {
                 0.0
             }
@@ -428,18 +435,6 @@ fn format_interval(secs: f64) -> String {
         format!("{m} 分")
     } else {
         format!("{} 秒", secs.round() as i64)
-    }
-}
-
-fn format_secs(s: f64) -> String {
-    let total = s.max(0.0).round() as i64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let sec = total % 60;
-    if h > 0 {
-        format!("{h:02}:{m:02}:{sec:02}")
-    } else {
-        format!("{m:02}:{sec:02}")
     }
 }
 

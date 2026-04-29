@@ -79,7 +79,7 @@ impl VideoBookmarkDb {
 
     /// 指定動画の全ブックマークを `pts_secs` 昇順で返す。
     pub fn list(&self, video_path: &Path) -> Vec<VideoBookmark> {
-        let key = normalize_path(video_path);
+        let key = crate::path_key::normalize_keep_drive(video_path);
         let stmt = self.conn.prepare_cached(
             "SELECT id, pts_secs, title, thumb_webp FROM video_bookmarks
               WHERE path = ?1 ORDER BY pts_secs ASC",
@@ -116,7 +116,7 @@ impl VideoBookmarkDb {
         title: Option<&str>,
         thumb_webp: &[u8],
     ) -> Result<i64, rusqlite::Error> {
-        let key = normalize_path(video_path);
+        let key = crate::path_key::normalize_keep_drive(video_path);
         let title_arg: Option<&str> = title.filter(|s| !s.is_empty());
         let blob: Option<&[u8]> = if thumb_webp.is_empty() {
             None
@@ -148,15 +148,11 @@ impl VideoBookmarkDb {
     /// Phase 5.4 では未配線)。
     #[allow(dead_code)]
     pub fn clear_for(&self, video_path: &Path) -> Result<(), rusqlite::Error> {
-        let key = normalize_path(video_path);
+        let key = crate::path_key::normalize_keep_drive(video_path);
         self.conn
             .execute("DELETE FROM video_bookmarks WHERE path = ?1", [&key])?;
         Ok(())
     }
-}
-
-fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
 #[cfg(test)]
