@@ -1377,6 +1377,22 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if count > 0 && ui.button("すべての再生位置をクリア").clicked() {
         s.video_resume_positions.clear();
     }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("グリッドサムネイル").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.video_thumb_use_sidecar_image,
+        "同名ファイル名の画像があれば動画サムネに優先採用",
+    )
+    .on_hover_text(
+        "例: movie.mp4 の隣に movie.jpg があれば、それをサムネに使う。\n\
+         OFF にすると Windows 標準のサムネのみ採用 (= 既定動作)。\n\
+         ピン留めしたフレーム (今後実装予定) は本設定に関わらず常に最優先。",
+    );
 }
 
 fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

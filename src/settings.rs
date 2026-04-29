@@ -820,6 +820,13 @@ pub struct Settings {
     /// 有効化することを想定。
     #[serde(default)]
     pub video_hw_decode: bool,
+    /// 動画グリッドサムネに、同名ファイル名の画像 (= sidecar、例 movie.mp4 の隣の
+    /// movie.jpg) があれば優先採用するか。Phase 5.3 で導入。
+    /// 既存ユーザー (= 過去の動作と整合) のため既定 true。OFF にすると Windows Shell
+    /// 経由の動画自身のデフォルトサムネのみが使われる。
+    /// ピン留めサムネ (= Phase 5.4.1 で実装予定) は本設定とは独立で常に最優先。
+    #[serde(default = "default_true")]
+    pub video_thumb_use_sidecar_image: bool,
 }
 
 fn default_video_volume() -> f64 {
@@ -1038,6 +1045,7 @@ impl Default for Settings {
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
             video_hw_decode: false,
+            video_thumb_use_sidecar_image: true,
         }
     }
 }

@@ -5705,6 +5705,14 @@ impl App {
                 let call_t0 = Instant::now();
 
                 let stem = stem_lower(&path);
+                // Phase 5.3 動画サムネイル優先順位 (詳細は docs/video-engine-redesign.md
+                // §5.3 / §5.4.1):
+                //   1. ユーザーがピン留めしたフレーム (video_pins DB) — ★優先度最上
+                //      実装は Phase 5.4.1 で配線する (DB スキーマは crate::video_pins
+                //      に用意済)。ここでは fall-through する。
+                //   2. 同名ファイル名画像 (sidecar、`thumb_overrides` map) —
+                //      Settings.video_thumb_use_sidecar_image で gating される。
+                //   3. Windows Shell の動画自身のデフォルトサムネ。
                 let (ci, source_tag) = if let Some(img_path) = thumb_overrides.get(&stem) {
                     if retries == 0 {
                         crate::logger::log(format!(
@@ -8056,6 +8064,11 @@ impl App {
 
     /// 動画 + 画像の重複: 同名の動画があれば画像をスキップし、
     /// 画像ファイルを動画のサムネイルソースとして記録する。
+    ///
+    /// Phase 5.3: `Settings.video_thumb_use_sidecar_image` で有効/無効を切替可能に。
+    /// OFF のときは override を記録しない (= グリッドではシェル既定サムネのみ採用)
+    /// が、画像ファイルの listing からの除外は維持する (= 同名画像が動画と並んで二重
+    /// 表示されるのは望ましくないため)。
     fn filter_video_image_duplicates(&mut self, all_media: &mut Vec<(PathBuf, bool, i64, i64)>) {
         let video_stems: std::collections::HashSet<String> = all_media
             .iter()
@@ -8067,12 +8080,13 @@ impl App {
             return;
         }
 
+        let use_sidecar = self.settings.video_thumb_use_sidecar_image;
         for (p, is_video, _, _) in all_media.iter() {
             if *is_video {
                 continue;
             }
             let stem = stem_lower(p);
-            if video_stems.contains(&stem) {
+            if video_stems.contains(&stem) && use_sidecar {
                 self.video_thumb_overrides.insert(stem, p.clone());
             }
         }
