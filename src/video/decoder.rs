@@ -698,12 +698,13 @@ fn run_decoder(
                                     const PACE_LEAD_SECS: f64 = 0.10;
                                     const AUDIO_SAFE_LO: f64 = 0.25;
                                     const AUDIO_SAFE_HI: f64 = 0.75;
-                                    // Phase 8.F (Codex P1): seek burst の pts ahead 上限。
-                                    // override 中でも pts - pace_now がこれを超えたら burst を止め
-                                    // 通常 pacing に戻る。これがないと seek 直後に decoder が
-                                    // 0.5s+ 先行し、override clear 後の pacing 待ちで demux が
-                                    // ブロックされ、その間に audio ring が drain して途切れる。
+                                    // Phase 8.F: seek burst の pts ahead 上限。
                                     const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
+                                    // Phase 8.G (Codex 指摘で AUDIO_CRITICAL_LO 導入):
+                                    // steady-state では audio_buf が LO=0.25 直下を hover する
+                                    // ため、escape 緊急閾値を LO に置くと「常に緊急 → 無制限
+                                    // burst」になる。CRITICAL_LO=0.08 でほぼ枯渇時のみ無制限化。
+                                    const AUDIO_CRITICAL_LO: f64 = 0.08;
                                     let mut in_audio_escape = false;
                                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
                                         let audio_buf = clock.total_audio_buffer_secs();
@@ -739,9 +740,19 @@ fn run_decoder(
                                         if ahead <= pace_lead {
                                             break;
                                         }
+                                        // Phase 8.G: escape burst にも lead cap を適用。
+                                        // 旧コードは escape 中無制限 burst → video_tx (cap 8) 超過
+                                        // → drop → audio_tx 満杯で decoder block → 440ms stall
+                                        // が周期発生し pan のカクつきを生んでいた。
+                                        // - ahead < cap (200ms): burst 継続
+                                        // - audio_buf < CRITICAL (80ms、= ほぼ枯渇): 無制限 burst
+                                        // - それ以外: sleep して steady wall-rate 生産に戻る
                                         if in_audio_escape {
-                                            // escape 中: 1 frame 送って yield
-                                            break;
+                                            if ahead < SEEK_BURST_LEAD_MAX_SECS
+                                                || audio_buf < AUDIO_CRITICAL_LO
+                                            {
+                                                break;
+                                            }
                                         }
                                         std::thread::sleep(std::time::Duration::from_millis(5));
                                     }
@@ -923,9 +934,8 @@ fn run_decoder(
                     const PACE_LEAD_SECS: f64 = 0.10;
                     const AUDIO_SAFE_LO: f64 = 0.25;
                     const AUDIO_SAFE_HI: f64 = 0.75;
-                    // Phase 8.F: GPU 経路と同じく seek burst lead 上限 + audio_active
-                    // ベースの hysteresis (engine_playing 待ちなし)。
                     const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
+                    const AUDIO_CRITICAL_LO: f64 = 0.08;
                     let mut in_audio_escape = false;
                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
                         let audio_buf = clock.total_audio_buffer_secs();
@@ -949,9 +959,13 @@ fn run_decoder(
                         if ahead <= pace_lead {
                             break;
                         }
+                        // Phase 8.G: escape burst にも lead cap (詳細は GPU 経路の同コメント)。
                         if in_audio_escape {
-                            // escape 中: 1 frame 送って yield (audio 補充を優先)
-                            break;
+                            if ahead < SEEK_BURST_LEAD_MAX_SECS
+                                || audio_buf < AUDIO_CRITICAL_LO
+                            {
+                                break;
+                            }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
