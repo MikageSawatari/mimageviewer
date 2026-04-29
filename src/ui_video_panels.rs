@@ -270,10 +270,16 @@ impl App {
             _ => Vec::new(),
         };
 
-        // Phase 6.C: 各行のサムネを順番にリクエストする (= ThumbnailWorker は
-        // 最新リクエスト 1 件のみ処理する drain semantics なので、フレームごとに
-        // 1 行だけリクエストして、worker が処理する間も他行は cache から読む)。
-        // 既に nearest() でヒットする pts は skip し、最初に miss する pts を request。
+        // Phase 6.C / 7.G: 各行のサムネを順番にリクエストする。
+        // ThumbnailWorker は MAX_ENTRIES=32 の LRU + 最新リクエスト 1 件のみ処理する
+        // drain semantics。
+        // - フレームごとに 1 行だけ worker に request、他行は cache から読む。
+        // - 一度 GPU テクスチャ化 (= self.video_jump_textures に bucket キーで載った)
+        //   ら、worker LRU で evicted されても **再 request しない** (Phase 7.G):
+        //   = チャプター多数動画 (> 32 件) で worker LRU が thrash して古い行サムネが
+        //     何度も再生成 + 再 upload → 「再描画されているような動作」を解消する。
+        //     UI は video_jump_textures の TextureHandle を直接読むので、worker の
+        //     RGBA キャッシュが残っているかどうかは関係なく安定描画できる。
         let pending_pts: Option<f64> = {
             let pin_pts: Vec<f64> = bookmarks.iter().map(|b| b.pts_secs).collect();
             let chap_pts: Vec<f64> = chapters.iter().map(|c| c.start_secs).collect();
@@ -283,6 +289,12 @@ impl App {
                 self.fs_cache.get(&fs_idx)
             {
                 for pts in all_pts {
+                    let bucket = crate::video::thumbnail::bucket_key(pts);
+                    // 既にテクスチャ アップロード済みならスキップ (= worker LRU 状態に
+                    // 関わらず行は表示できる)。
+                    if self.video_jump_textures.contains_key(&bucket) {
+                        continue;
+                    }
                     if player.nearest_seek_thumbnail(pts).is_none() {
                         found = Some(pts);
                         break;
@@ -508,22 +520,24 @@ impl App {
         fs_idx: usize,
     ) -> Vec<JumpPanelAction> {
         let mut out: Vec<JumpPanelAction> = Vec::new();
-        // サムネ取得 + texture upload (借用を短く保つ)
-        let thumb_data = match self.fs_cache.get(&fs_idx) {
-            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                player.nearest_seek_thumbnail(pts_secs)
-            }
-            _ => None,
-        };
         let bucket: i64 = crate::video::thumbnail::bucket_key(pts_secs);
-        let tex_id = if let Some(t) = thumb_data.as_ref() {
-            let key = (t.target_secs.to_bits(), t.width, t.height);
-            let cached = self
-                .video_jump_textures
-                .get(&bucket)
-                .map(|(k, _)| *k == key)
-                .unwrap_or(false);
-            if !cached {
+
+        // 既に video_jump_textures にアップロード済ならそれを使う (Phase 7.G:
+        // worker LRU evict 後でも texture が安定して残るので、サムネ「再描画」が消える)。
+        let tex_id: Option<egui::TextureId> = if let Some((_, tex)) =
+            self.video_jump_textures.get(&bucket)
+        {
+            Some(tex.id())
+        } else {
+            // 未アップロードなら worker から最新サムネを取り出して texture を作る。
+            let thumb_data = match self.fs_cache.get(&fs_idx) {
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                    player.nearest_seek_thumbnail(pts_secs)
+                }
+                _ => None,
+            };
+            if let Some(t) = thumb_data {
+                let key = (t.target_secs.to_bits(), t.width, t.height);
                 let img = egui::ColorImage::from_rgba_unmultiplied(
                     [t.width as usize, t.height as usize],
                     &t.rgba,
@@ -533,11 +547,12 @@ impl App {
                     img,
                     egui::TextureOptions::LINEAR,
                 );
+                let id = tex.id();
                 self.video_jump_textures.insert(bucket, (key, tex));
+                Some(id)
+            } else {
+                None
             }
-            self.video_jump_textures.get(&bucket).map(|(_, tex)| tex.id())
-        } else {
-            None
         };
 
         // 1 行 = サムネ列 + 時間/タイトル列 + × 列。サムネ size は固定 120x68。
