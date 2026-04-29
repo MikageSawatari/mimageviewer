@@ -1812,7 +1812,25 @@ impl App {
             };
             let (label, key) = items[next];
             params.upscale_model = key.map(|s| s.to_string());
-            self.show_feedback_toast(format!("[U:{}アップスケール {}]", scope.label(), label));
+            // 切替先がアップスケール **有効** で、かつ画像サイズが
+            // `ai_upscale_skip_px` 閾値以上なら処理がスキップされる。
+            // 「切り替えたのに見た目が変わらない」違和感を避けるため
+            // トーストに 2 行目で明示する。
+            let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
+            if key.is_some()
+                && let Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) =
+                    self.fs_cache.get(&fs_idx)
+            {
+                let w = pixels.size[0] as u32;
+                let h = pixels.size[1] as u32;
+                let threshold = self.settings.ai_upscale_skip_px;
+                if !crate::ai::upscale::should_process(w, h, threshold) {
+                    toast.push_str(&format!(
+                        "\n(解像度が高いためアップスケール処理無効: {w}×{h} ≥ {threshold}px)"
+                    ));
+                }
+            }
+            self.show_feedback_toast(toast);
             self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
                 app.write_params_for_scope(fs_idx, scope, params);
                 app.clear_all_adjustment_and_ai_caches(fs_idx);

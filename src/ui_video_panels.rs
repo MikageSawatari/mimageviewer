@@ -287,12 +287,13 @@ impl App {
             .as_ref()
             .map(|db| db.list(&video_path))
             .unwrap_or_default();
-        // ピン状態を毎フレーム読み出してボタンラベルに反映する。
-        let pinned: bool = self
+        // ピン位置を毎フレーム読み出してボタンラベル + ジャンプ行に反映する。
+        let pin_pts: Option<f64> = self
             .video_pin_db
             .as_ref()
             .and_then(|db| db.lookup(&video_path))
-            .is_some();
+            .map(|pin| pin.pin_pts_secs);
+        let pinned: bool = pin_pts.is_some();
         let chapters: Vec<Chapter> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 player.info().map(|i| i.chapters.clone()).unwrap_or_default()
@@ -311,9 +312,14 @@ impl App {
         //     UI は video_jump_textures の TextureHandle を直接読むので、worker の
         //     RGBA キャッシュが残っているかどうかは関係なく安定描画できる。
         let pending_pts: Option<f64> = {
-            let pin_pts: Vec<f64> = bookmarks.iter().map(|b| b.pts_secs).collect();
+            // ピン留め (1 件) + ブックマーク + チャプターの順で worker に
+            // サムネ抽出を依頼する。ピン位置は最上段に出すので最優先。
+            let pin_iter = pin_pts.into_iter();
+            let bm_pts: Vec<f64> = bookmarks.iter().map(|b| b.pts_secs).collect();
             let chap_pts: Vec<f64> = chapters.iter().map(|c| c.start_secs).collect();
-            let all_pts = pin_pts.into_iter().chain(chap_pts.into_iter());
+            let all_pts = pin_iter
+                .chain(bm_pts.into_iter())
+                .chain(chap_pts.into_iter());
             let mut found: Option<f64> = None;
             if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
                 self.fs_cache.get(&fs_idx)
@@ -486,6 +492,22 @@ impl App {
                 ui.add_space(6.0);
 
                 let mut had_section = false;
+                // 📌 ピン留め (= ユーザーが選んだ代表フレーム) を最上段に表示。
+                // クリックでその位置にシーク。削除はピンボタン側のトグル経由。
+                if let Some(pts) = pin_pts {
+                    section_label(ui, "📌 ピン留め");
+                    let acts = self.draw_video_jump_row(
+                        ui,
+                        "📌",
+                        pts,
+                        Some("代表フレーム"),
+                        None,
+                        fs_idx,
+                    );
+                    scroll_actions.extend(acts);
+                    ui.add_space(8.0);
+                    had_section = true;
+                }
                 if !bookmarks.is_empty() {
                     section_label(ui, "🔖 ブックマーク");
                     for b in bookmarks.iter() {

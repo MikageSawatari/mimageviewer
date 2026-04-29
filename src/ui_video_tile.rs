@@ -307,14 +307,19 @@ impl App {
         }
 
         // Ctrl+Wheel で列数候補を切替。タイル中のみ有効。
-        // smooth_scroll_delta は数フレーム残留するため、`input_mut` で取り出した
-        // 上で 0.0 にリセットしないと 1 ノッチが連続発火して settings.save() が
-        // 多重実行 + worker 多重 spawn になる。
+        // ⚠️ egui 0.33 は Ctrl+Wheel を「ズーム入力」と判定して `smooth_scroll_delta`
+        // ではなく `zoom_factor_delta` 側に流すため、smooth 経由では値が来ない。
+        // 一方 `raw_scroll_delta` は modifier に関わらず生 delta が積まれるので、
+        // Ctrl 押下時はそちらを使う。1 ノッチで連続発火しないよう raw / smooth /
+        // 該当 MouseWheel イベントを全て消費する。
         let wheel_y = ctx.input_mut(|i| {
             if i.modifiers.ctrl {
-                let y = i.smooth_scroll_delta.y;
+                let y = i.raw_scroll_delta.y;
                 if y.abs() > 0.5 {
+                    i.raw_scroll_delta.y = 0.0;
                     i.smooth_scroll_delta.y = 0.0;
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
                 }
                 y
             } else {
