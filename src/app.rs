@@ -1627,12 +1627,14 @@ pub struct App {
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
-    /// 直近 N フレームの間隔 (ms)。新フレームが届いた wall 時刻と GPU handle 変化で検知。
+    /// 直近 N フレームの間隔 (ms)。新フレームが届いた wall 時刻と GPU fence 値の変化で検知。
     pub(crate) video_perf_history: std::collections::VecDeque<f32>,
     /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
     pub(crate) video_perf_last_wall: Option<std::time::Instant>,
-    /// 前回サンプリング時の GPU 共有 handle (= 新フレーム検知用)。
-    pub(crate) video_perf_last_handle: Option<isize>,
+    /// 前回サンプリング時の GPU フレーム fence_value (= 新フレーム検知用、単調増加)。
+    /// shared_handle は NT HANDLE で Windows がクローズ後に再利用するため
+    /// 信頼できない。fence_value は decoder 側で per-frame +1 されるので確実。
+    pub(crate) video_perf_last_fence: Option<u64>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2441,7 +2443,7 @@ impl Default for App {
             video_perf_overlay_visible: false,
             video_perf_history: std::collections::VecDeque::with_capacity(200),
             video_perf_last_wall: None,
-            video_perf_last_handle: None,
+            video_perf_last_fence: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

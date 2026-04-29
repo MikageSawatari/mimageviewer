@@ -5055,7 +5055,7 @@ impl App {
             // 切替時に履歴を一旦クリア (= ON 直後は素のグラフから始まる)。
             self.video_perf_history.clear();
             self.video_perf_last_wall = None;
-            self.video_perf_last_handle = None;
+            self.video_perf_last_fence = None;
         }
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
         // (handle_image_keys 後段) の通常 ESC で扱う。
@@ -5099,30 +5099,33 @@ impl App {
         }
     }
 
-    /// 動画 GPU フレーム handle の変化を検出して frame interval (ms) を履歴に記録する。
-    /// オーバーレイ表示の有無に関わらず軽量にサンプリング (= 切替直後でも素直に出る)。
-    /// CPU 経路では handle が無く検出できないため履歴は空のまま (= 描画側でガード)。
+    /// 動画 GPU フレームの fence_value 変化を検出して frame interval (ms) を履歴に記録。
+    /// fence_value は decoder 側で per-frame に +1 される単調増加値で、handle の
+    /// 再利用 (CloseHandle 後の再発行) に影響されず確実に新フレームを検知できる。
+    /// CPU 経路では gpu_latest が無く履歴は空のまま (= 描画側で診断表示)。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
         #[cfg(windows)]
         {
-            let cur_handle: Option<isize> = match self.fs_cache.get(&fs_idx) {
+            let cur_fence: Option<u64> = match self.fs_cache.get(&fs_idx) {
                 Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                    player.gpu_latest().map(|f| f.shared_handle.0 as isize)
+                    player.gpu_latest().map(|f| f.fence_value)
                 }
                 _ => None,
             };
-            if cur_handle != self.video_perf_last_handle {
+            if cur_fence != self.video_perf_last_fence {
                 let now = std::time::Instant::now();
-                if let Some(prev) = self.video_perf_last_wall {
+                if let (Some(prev_wall), Some(_)) =
+                    (self.video_perf_last_wall, self.video_perf_last_fence)
+                {
                     let interval_ms =
-                        now.saturating_duration_since(prev).as_secs_f32() * 1000.0;
+                        now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
                     self.video_perf_history.push_back(interval_ms);
                     while self.video_perf_history.len() > 200 {
                         self.video_perf_history.pop_front();
                     }
                 }
                 self.video_perf_last_wall = Some(now);
-                self.video_perf_last_handle = cur_handle;
+                self.video_perf_last_fence = cur_fence;
             }
         }
         #[cfg(not(windows))]
@@ -5162,11 +5165,20 @@ impl App {
         // ヘッダ統計
         let n = self.video_perf_history.len();
         if n == 0 {
+            let msg = format!(
+                "Perf: collecting…  last_fence={:?}  wall={}",
+                self.video_perf_last_fence,
+                if self.video_perf_last_wall.is_some() {
+                    "set"
+                } else {
+                    "none"
+                }
+            );
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Perf: collecting…",
-                egui::FontId::proportional(12.0),
+                msg,
+                egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
             );
             return;
@@ -5590,6 +5602,60 @@ impl App {
                     egui::pos2(bar_rect.min.x + bar_rect.width() * progress, bar_rect.max.y),
                 );
                 painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
+            }
+
+            // ── マーカー描画: チャプター / ブックマーク / ピン留め ──
+            // バーより少し上下に飛び出した縦線で位置を可視化。色:
+            //   チャプター: 水色 (📑)
+            //   ブックマーク: 黄  (🔖)
+            //   ピン:     緑   (📌)
+            // クリック判定はシークバー全体に乗せたままで、マーカーは描画のみ。
+            if duration > 0.0 {
+                let video_path = self
+                    .fs_video_player(fs_idx)
+                    .map(|p| p.path().clone());
+                if let Some(path) = video_path.as_ref() {
+                    // チャプター
+                    let chapters: Vec<f64> = self
+                        .fs_video_player(fs_idx)
+                        .and_then(|p| p.info())
+                        .map(|i| i.chapters.iter().map(|c| c.start_secs).collect())
+                        .unwrap_or_default();
+                    // ブックマーク
+                    let bookmarks: Vec<f64> = self
+                        .video_bookmark_db
+                        .as_ref()
+                        .map(|db| db.list(path).iter().map(|b| b.pts_secs).collect())
+                        .unwrap_or_default();
+                    // ピン留め (1 件)
+                    let pin: Option<f64> = self
+                        .video_pin_db
+                        .as_ref()
+                        .and_then(|db| db.lookup_pts(path));
+
+                    let draw_marker = |pts: f64, color: egui::Color32| {
+                        let x = bar_rect.min.x
+                            + bar_rect.width() * (pts / duration).clamp(0.0, 1.0) as f32;
+                        // バー外に少し飛び出す: 上 6px, 下 6px。
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, bar_rect.min.y - 6.0),
+                                egui::pos2(x, bar_rect.max.y + 6.0),
+                            ],
+                            egui::Stroke::new(2.0, color),
+                        );
+                    };
+
+                    for c in &chapters {
+                        draw_marker(*c, egui::Color32::from_rgb(120, 200, 255));
+                    }
+                    for b in &bookmarks {
+                        draw_marker(*b, egui::Color32::from_rgb(255, 220, 80));
+                    }
+                    if let Some(p) = pin {
+                        draw_marker(p, egui::Color32::from_rgb(100, 230, 130));
+                    }
+                }
             }
             let seek_resp = ui.interact(
                 hit_rect,
