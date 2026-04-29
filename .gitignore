@@ -10,6 +10,9 @@ bench_thumbs.tsv
 /vendor/susie-worker
 /vendor/ort
 /vendor/ffmpeg
+/vendor/vst3sdk
+/vendor/vst3-host
+/crates/vst3-host/build
 /dev/
 /testdata/
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
