@@ -620,13 +620,16 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.label(
         "チェックを外した項目はツールバーから隠れます。\n\
-         セクション内の全項目を外すとセクション自体が非表示になります。",
+         セクション内の全項目を外すとセクション自体が非表示になります。\n\
+         上から順に画面のツールバー左端 → 右端に対応します。",
     );
     ui.add_space(6.0);
 
-    ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
-    ui.checkbox(&mut s.show_toolbar_tags, "タグ");
-    ui.checkbox(&mut s.show_toolbar_folder, "フォルダ (アドレスバー)");
+    // Phase 6.E: 設定の表示順を画面上のツールバーの左→右の並びに揃える。
+    // 画面の順:
+    //   上のフォルダ ⬆ → 前 ▲ → 次 ▼ → 列 → 比率 → ソート → ★ → お気に入り
+    //   → タグ → (フォルダアドレスバー、別位置)
+
     ui.checkbox(
         &mut s.show_toolbar_parent_button,
         "上のフォルダへ (⬆ ボタン)",
@@ -639,7 +642,6 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         &mut s.show_toolbar_next_folder,
         "次のフォルダへ (▼ ボタン、Ctrl+↓ と同じ動作)",
     );
-    ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
 
     // ── 列 ──
     ui.add_space(6.0);
@@ -702,6 +704,20 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
         }
     });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
+    ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
+    ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
+    ui.checkbox(&mut s.show_toolbar_tags, "タグ");
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
+    // フォルダ (アドレスバー) は他のツールバーセクションと別位置 (= ツールバー
+    // とは別のアドレスバー帯) に出るので、最後にまとめて表示。
+    ui.checkbox(&mut s.show_toolbar_folder, "フォルダ (アドレスバー、別の場所に表示)");
 }
 
 fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
