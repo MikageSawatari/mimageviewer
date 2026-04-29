@@ -4330,7 +4330,6 @@ fn draw_fs_bar_info_text(
 }
 
 /// 上部バー右側に表示する画像情報テキスト (PDF 種別 / 寸法 / AI / サイズ) を組み立てる。
-/// `draw_fs_bar_info_text` と `compute_info_text_width` 両方から使う。
 /// `image_downscaled` が true の場合、dims の直後 (AI 情報がある場合はその後) に
 /// `⚠ ダウンスケール表示中` マーカーを挿入する。
 fn build_info_text(
