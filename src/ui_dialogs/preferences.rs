@@ -631,6 +631,14 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         &mut s.show_toolbar_parent_button,
         "上のフォルダへ (⬆ ボタン)",
     );
+    ui.checkbox(
+        &mut s.show_toolbar_prev_folder,
+        "前のフォルダへ (▲ ボタン、Ctrl+↑ と同じ動作)",
+    );
+    ui.checkbox(
+        &mut s.show_toolbar_next_folder,
+        "次のフォルダへ (▼ ボタン、Ctrl+↓ と同じ動作)",
+    );
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
 
     // ── 列 ──

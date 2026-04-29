@@ -610,9 +610,17 @@ impl App {
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_parent = self.settings.show_toolbar_parent_button;
+        let show_prev_folder = self.settings.show_toolbar_prev_folder;
+        let show_next_folder = self.settings.show_toolbar_next_folder;
         let show_rating = self.settings.show_toolbar_rating;
-        let any_toolbar_section =
-            show_cols || show_aspect || show_sort || show_favs || show_parent || show_rating;
+        let any_toolbar_section = show_cols
+            || show_aspect
+            || show_sort
+            || show_favs
+            || show_parent
+            || show_prev_folder
+            || show_next_folder
+            || show_rating;
 
         if !any_toolbar_section {
             return None;
@@ -621,6 +629,8 @@ impl App {
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_sort_changed = false;
         let mut toolbar_parent_nav = false;
+        let mut toolbar_prev_folder_nav = false;
+        let mut toolbar_next_folder_nav = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_tag_click: Option<String> = None;
 
@@ -640,6 +650,31 @@ impl App {
                         .clicked()
                     {
                         toolbar_parent_nav = true;
+                    }
+                    first_section = false;
+                }
+                // Phase 5.8: 前のフォルダ / 次のフォルダ ボタン (= Ctrl+↑↓ と等価)。
+                // 「上」と区別するため、塗りつぶし三角 ▲▼ を使う (= 親フォルダボタン
+                // の輪郭三角 ⬆ とは形が違う)。
+                if show_prev_folder {
+                    let has_current = self.current_folder.is_some();
+                    if ui
+                        .add_enabled(has_current, egui::Button::new("▲"))
+                        .on_hover_text("前のフォルダへ [Ctrl+↑]")
+                        .clicked()
+                    {
+                        toolbar_prev_folder_nav = true;
+                    }
+                    first_section = false;
+                }
+                if show_next_folder {
+                    let has_current = self.current_folder.is_some();
+                    if ui
+                        .add_enabled(has_current, egui::Button::new("▼"))
+                        .on_hover_text("次のフォルダへ [Ctrl+↓]")
+                        .clicked()
+                    {
+                        toolbar_next_folder_nav = true;
                     }
                     first_section = false;
                 }
@@ -797,6 +832,19 @@ impl App {
                         .map(|s| s.to_string());
                     return Some(parent.to_path_buf());
                 }
+            }
+        }
+
+        // Phase 5.8: 前 / 次フォルダ ボタンは Ctrl+↑↓ と同じ DFS をキック。
+        // start_folder_nav は in-flight の連打もまとめてくれる。
+        if toolbar_prev_folder_nav {
+            if let Some(cur) = self.current_folder.clone() {
+                self.start_folder_nav(cur, false, crate::app::FolderNavMode::Grid);
+            }
+        }
+        if toolbar_next_folder_nav {
+            if let Some(cur) = self.current_folder.clone() {
+                self.start_folder_nav(cur, true, crate::app::FolderNavMode::Grid);
             }
         }
 

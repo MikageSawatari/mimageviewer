@@ -624,6 +624,14 @@ pub struct Settings {
     /// ツールバーに「上のフォルダへ」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_parent_button: bool,
+    /// ツールバーに「前のフォルダへ」ボタンを表示する (Phase 5.8)。
+    /// 既定 true、Ctrl+↑ と等価。
+    #[serde(default = "default_true")]
+    pub show_toolbar_prev_folder: bool,
+    /// ツールバーに「次のフォルダへ」ボタンを表示する (Phase 5.8)。
+    /// 既定 true、Ctrl+↓ と等価。
+    #[serde(default = "default_true")]
+    pub show_toolbar_next_folder: bool,
     /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_rating: bool,
@@ -1013,6 +1021,8 @@ impl Default for Settings {
             show_toolbar_tags: true,
             show_toolbar_folder: true,
             show_toolbar_parent_button: true,
+            show_toolbar_prev_folder: true,
+            show_toolbar_next_folder: true,
             show_toolbar_rating: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
