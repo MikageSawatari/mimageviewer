@@ -4846,11 +4846,20 @@ impl App {
         // ここでは shift 無しの Enter のみが残っている。
         let enter = !shift_held_now
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
+        // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
+        // (= マウスホイールと整合)。Shift+↑↓ だけ動画モードで音量に使う。
         let shift_left = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
         });
         let shift_right = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight)
+        });
+        let ctrl_left = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)
+        });
+        let ctrl_right = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)
         });
         let left = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
@@ -4864,12 +4873,7 @@ impl App {
         let shift_down = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
         });
-        let up = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-        });
-        let down = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-        });
+        // ↑↓ プレーンは consume しない (= image handler が file navigation に使う)。
         let mute_key = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::M)
         });
@@ -4904,14 +4908,11 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => player.volume(),
             _ => return,
         };
+        // Phase 7.H: 音量は Shift+↑↓ 限定 (= 20% step)。プレーン ↑↓ はファイル移動。
         let new_vol = if shift_up {
             Some((cur_volume + 0.20).min(1.0))
         } else if shift_down {
             Some((cur_volume - 0.20).max(0.0))
-        } else if up {
-            Some((cur_volume + 0.05).min(1.0))
-        } else if down {
-            Some((cur_volume - 0.05).max(0.0))
         } else {
             None
         };
@@ -4921,6 +4922,10 @@ impl App {
             if enter {
                 player.toggle_play();
             }
+            // Phase 7.H シーク粒度:
+            //   ←→ = 5 秒 (デフォルト、動画プレイヤー慣例)
+            //   Shift+←→ = 1 秒 (細かい、フレーム単位調整に近い)
+            //   Ctrl+←→ = 30 秒 (大きい、長い動画の早送り用)
             if left {
                 player.seek_relative(-5.0);
             }
@@ -4928,9 +4933,15 @@ impl App {
                 player.seek_relative(5.0);
             }
             if shift_left {
-                player.seek_relative(-30.0);
+                player.seek_relative(-1.0);
             }
             if shift_right {
+                player.seek_relative(1.0);
+            }
+            if ctrl_left {
+                player.seek_relative(-30.0);
+            }
+            if ctrl_right {
                 player.seek_relative(30.0);
             }
             if let Some(v) = new_vol {
