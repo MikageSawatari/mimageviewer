@@ -327,14 +327,39 @@ impl TesterApp {
             self.log("show_gui: GUI already shown");
             return;
         }
-        // 仮サイズで開く (実サイズは bridge から gui_attached イベントで返ってくる)。
-        // Pro-Q 4 など多くのプラグインは内部 paint 時に正しいサイズに上書きされる。
+        let bridge = self.bridge.as_ref().unwrap().clone();
+
+        // ── ステップ 1: プラグインに推奨サイズを問い合わせる ──
+        // attach の前に host HWND を正しいサイズで作るため。
+        if let Err(e) = bridge.send(&Cmd::QueryGuiSize) {
+            self.log(format!("send QueryGuiSize: {e}"));
+            return;
+        }
+        let (pref_w, pref_h) = match bridge.recv() {
+            Ok(Event::GuiSize { width, height }) => (width, height),
+            Ok(Event::Error { detail }) => {
+                self.log(format!("query_gui_size error: {detail}"));
+                // フォールバック: 推奨サイズ取れなければ 800x500 で開く
+                (800u32, 500u32)
+            }
+            Ok(other) => {
+                self.log(format!("unexpected event after QueryGuiSize: {other:?}"));
+                (800u32, 500u32)
+            }
+            Err(e) => {
+                self.log(format!("recv after QueryGuiSize: {e}"));
+                return;
+            }
+        };
+        self.log(format!("plugin preferred size: {}x{}", pref_w, pref_h));
+
+        // ── ステップ 2: 推奨サイズでホストウィンドウを作成 ──
         let title = self
             .last_loaded_name
             .as_deref()
             .unwrap_or("VST3 Plugin")
             .to_string();
-        let reply = match self.gui_host.show(&title, 800, 500) {
+        let reply = match self.gui_host.show(&title, pref_w, pref_h) {
             Ok(r) => r,
             Err(e) => {
                 self.log(format!("create gui window: {e}"));
@@ -348,8 +373,7 @@ impl TesterApp {
         self.gui_hwnd = reply.hwnd_u64;
         self.gui_close_signal = Some(reply.close_signal);
 
-        // bridge に attach 命令
-        let bridge = self.bridge.as_ref().unwrap().clone();
+        // ── ステップ 3: 正しいサイズの HWND で attach ──
         if let Err(e) = bridge.send(&Cmd::ShowGui {
             hwnd: self.gui_hwnd,
         }) {
@@ -360,7 +384,8 @@ impl TesterApp {
         match bridge.recv() {
             Ok(Event::GuiAttached { width, height }) => {
                 self.log(format!("gui attached: {}x{}", width, height));
-                if width > 0 && height > 0 {
+                // 想定外の差分があれば追従リサイズ
+                if width > 0 && height > 0 && (width != pref_w || height != pref_h) {
                     plugin_gui::resize_window_client(self.gui_hwnd, width, height);
                 }
             }

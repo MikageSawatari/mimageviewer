@@ -77,6 +77,11 @@ pub enum Cmd {
     /// プラグイン GUI を外す。HWND の破棄は host 側の責務。
     #[serde(rename = "hide_gui")]
     HideGui,
+    /// プラグインの推奨 GUI サイズだけ取得する (= attached しない)。
+    /// host はこのサイズでウィンドウを作ってから ShowGui を送ることで、
+    /// プラグインが子ウィンドウを正しいサイズで作成できる。
+    #[serde(rename = "query_gui_size")]
+    QueryGuiSize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -94,6 +99,8 @@ pub enum Event {
     Error { detail: String },
     GuiAttached { width: u32, height: u32 },
     GuiDetached,
+    /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
+    GuiSize { width: u32, height: u32 },
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。

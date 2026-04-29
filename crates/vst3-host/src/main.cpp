@@ -246,6 +246,26 @@ private:
             write_message("{\"event\":\"reset_done\"}");
             return true;
         }
+        if (cmd == "query_gui_size") {
+            // プラグインの推奨 GUI サイズだけ取得して返す。
+            // ホスト側は受け取ったサイズでウィンドウを作ってから show_gui を送ることで、
+            // attached 時点で親 HWND が正しいサイズに揃った状態にできる
+            // (子ウィンドウ作成時のサイズが正しくなる)。
+            if (!loader_) {
+                send_event_error("query_gui_size: no plugin loaded");
+                return true;
+            }
+            uint32_t w = 0, h = 0;
+            if (!loader_->get_gui_size(w, h)) {
+                send_event_error("query_gui_size: getSize failed");
+                return true;
+            }
+            std::string reply = "{\"event\":\"gui_size\",\"width\":" +
+                                std::to_string(w) + ",\"height\":" +
+                                std::to_string(h) + "}";
+            write_message(reply);
+            return true;
+        }
         if (cmd == "show_gui") {
             if (!loader_) {
                 send_event_error("show_gui: no plugin loaded");
