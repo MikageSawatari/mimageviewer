@@ -605,7 +605,6 @@ fn is_landscape(
 struct FsFrameState {
     is_video: bool,
     separator_text: Option<String>,
-    video_path: Option<std::path::PathBuf>,
     tex: Option<egui::TextureHandle>,
     thumb_tex: Option<egui::TextureHandle>,
     /// 上部ホバーバー左側に表示するパス文字列。
@@ -1253,11 +1252,6 @@ impl App {
             _ => None,
         };
         let is_separator = separator_text.is_some();
-        let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
-            Some(p.clone())
-        } else {
-            None
-        };
 
         let tex: Option<egui::TextureHandle> = if is_video {
             // 動画: VideoPlayer が in-place 更新するテクスチャをそのまま使う
@@ -1409,7 +1403,6 @@ impl App {
         FsFrameState {
             is_video,
             separator_text,
-            video_path,
             tex,
             thumb_tex,
             location_display,
