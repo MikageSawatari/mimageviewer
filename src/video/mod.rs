@@ -28,6 +28,7 @@ pub mod ffmpeg_loader;
 #[cfg(windows)]
 pub mod gpu_renderer;
 pub mod thumbnail;
+pub mod tile_thumbnails;
 
 use std::path::PathBuf;
 use std::sync::Arc;

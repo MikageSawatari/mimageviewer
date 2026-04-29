@@ -1,0 +1,302 @@
+//! 動画タイル モード (Phase 5.5) 用のサムネイル一括抽出ワーカー。
+//!
+//! 既存の `crate::video::thumbnail::ThumbnailWorker` はホバー時の単発リクエスト用
+//! (= `request()` は毎回上書きで最新のみ処理) で、タイルモードが要求する
+//! 「N 個のタイムスタンプを順に処理して全部保持」という用途には合わない。
+//!
+//! 本モジュールは:
+//! - `spawn(path, timestamps, max_w, max_h)` で N 個 (例: 10x10 = 100) のフレームを
+//!   バックグラウンドで順番に抽出する。
+//! - メインデコーダー (= 再生用) と独立した `ffmpeg::format::Input` を別途 open
+//!   するので、再生中の動画を停めずに動く。
+//! - 結果は `Arc<Mutex<Vec<Option<TileThumbnail>>>>` に蓄積され、UI は `snapshot()`
+//!   で共有 read。
+//! - 完了 (= 全 timestamps 処理) または cancel で thread 終了。Drop で確実に join。
+//!
+//! ## キャッシュ寿命
+//! 1 つの `TileThumbnailWorker` は (動画 path, interval_secs, max_w/h) のキーで
+//! 一意に対応する。VideoPlayer 内 (= フルスクリーン中) で生存し、Drop で worker と
+//! ピクセルデータをまとめて解放する。複数の interval を切り替えたいときは
+//! 新しい worker を spawn し直す (= 旧 worker の Drop で thread を終わらせる)。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 1 タイル分の抽出結果。
+#[derive(Clone)]
+pub struct TileThumbnail {
+    /// 元タイムスタンプ (秒)。クリック時の seek 先に使う。
+    pub pts_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+}
+
+/// タイルモード抽出ワーカー。
+pub struct TileThumbnailWorker {
+    /// 結果ストレージ: spawn 時に与えた timestamps と同じ長さの Vec。各要素は
+    /// 抽出完了済なら Some、未済 / 失敗なら None。
+    state: Arc<Mutex<Vec<Option<TileThumbnail>>>>,
+    cancel: Arc<AtomicBool>,
+    /// 完了フラグ (= worker thread が処理を終えたら true)。
+    finished: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TileThumbnailWorker {
+    /// `timestamps` 長の結果スロットを 0 埋めで用意し、worker thread を起動する。
+    /// `max_w` / `max_h` でアスペクト保持リサイズの上限を指定。
+    pub fn spawn(
+        path: PathBuf,
+        timestamps: Vec<f64>,
+        max_w: u32,
+        max_h: u32,
+    ) -> Self {
+        let n = timestamps.len();
+        let state = Arc::new(Mutex::new(vec![None; n]));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let worker_state = state.clone();
+        let worker_cancel = cancel.clone();
+        let worker_finished = finished.clone();
+        let thread = std::thread::Builder::new()
+            .name("video-tile-thumbs".into())
+            .spawn(move || {
+                run_worker(
+                    path,
+                    timestamps,
+                    max_w,
+                    max_h,
+                    worker_state,
+                    worker_cancel.clone(),
+                );
+                worker_finished.store(true, Ordering::Release);
+            })
+            .ok();
+
+        Self {
+            state,
+            cancel,
+            finished,
+            thread,
+        }
+    }
+
+    /// 現在までに抽出済の結果を借用なしで返す (= clone)。UI が毎フレーム呼ぶ。
+    /// 進捗表示用に「完了済み数 / 総数」の取得は `progress()` を使うとよい。
+    pub fn snapshot(&self) -> Vec<Option<TileThumbnail>> {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// (完了済み数, 総数) を返す。UI のプログレスバー用。
+    pub fn progress(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        let total = s.len();
+        let done = s.iter().filter(|t| t.is_some()).count();
+        (done, total)
+    }
+
+    /// worker が走り終わっているか。
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for TileThumbnailWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn run_worker(
+    path: PathBuf,
+    timestamps: Vec<f64>,
+    max_w: u32,
+    max_h: u32,
+    state: Arc<Mutex<Vec<Option<TileThumbnail>>>>,
+    cancel: Arc<AtomicBool>,
+) {
+    use ffmpeg_the_third as ffmpeg;
+    use ffmpeg::format::Pixel;
+    use ffmpeg::media::Type as MediaType;
+    use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
+    use ffmpeg::util::frame::video::Video;
+
+    if let Err(e) = ffmpeg::init() {
+        crate::logger::log(format!("video-tile-thumb: ffmpeg init failed: {e}"));
+        return;
+    }
+    let mut input = match ffmpeg::format::input(&path) {
+        Ok(i) => i,
+        Err(e) => {
+            crate::logger::log(format!("video-tile-thumb: open input failed: {e}"));
+            return;
+        }
+    };
+    let video_stream = match input.streams().best(MediaType::Video) {
+        Some(s) => s,
+        None => return,
+    };
+    let stream_idx = video_stream.index();
+    let time_base = video_stream.time_base();
+    let tb_num = time_base.numerator() as f64;
+    let tb_den = time_base.denominator() as f64;
+    let params = video_stream.parameters();
+
+    let codec_ctx = match ffmpeg::codec::context::Context::from_parameters(params) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::logger::log(format!("video-tile-thumb: codec ctx failed: {e}"));
+            return;
+        }
+    };
+    let mut decoder = match codec_ctx.decoder().video() {
+        Ok(d) => d,
+        Err(e) => {
+            crate::logger::log(format!("video-tile-thumb: decoder open failed: {e}"));
+            return;
+        }
+    };
+    let src_w = decoder.width();
+    let src_h = decoder.height();
+    let src_fmt = decoder.format();
+    let (dst_w, dst_h) = fit_within(src_w, src_h, max_w, max_h);
+    let mut scaler = match ScaleContext::get(
+        src_fmt,
+        src_w,
+        src_h,
+        Pixel::RGBA,
+        dst_w,
+        dst_h,
+        ScaleFlags::BILINEAR,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::logger::log(format!("video-tile-thumb: sws_scale init failed: {e}"));
+            return;
+        }
+    };
+
+    for (idx, &target_secs) in timestamps.iter().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        // backward seek + 1 frame
+        let target_pts = (target_secs * 1_000_000.0) as i64;
+        let seek_ok = unsafe {
+            use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
+            av_seek_frame(input.as_mut_ptr(), -1, target_pts, AVSEEK_FLAG_BACKWARD as i32) >= 0
+        };
+        if !seek_ok {
+            continue;
+        }
+        decoder.flush();
+
+        let mut got_frame: Option<Video> = None;
+        let mut video_packets_seen = 0;
+        let mut frames_tried = 0;
+        for item in input.packets() {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let (stream, packet) = match item {
+                Ok(sp) => sp,
+                Err(_) => break,
+            };
+            if stream.index() != stream_idx {
+                continue;
+            }
+            video_packets_seen += 1;
+            if video_packets_seen > 120 {
+                break;
+            }
+            if decoder.send_packet(&packet).is_err() {
+                continue;
+            }
+            let mut frame = Video::empty();
+            while decoder.receive_frame(&mut frame).is_ok() {
+                let pts = frame.pts().unwrap_or(0);
+                let pts_secs = pts as f64 * tb_num / tb_den;
+                if pts_secs >= target_secs - 0.5 {
+                    got_frame = Some(frame);
+                    break;
+                }
+                frames_tried += 1;
+                if frames_tried > 60 {
+                    got_frame = Some(frame);
+                    break;
+                }
+                frame = Video::empty();
+            }
+            if got_frame.is_some() {
+                break;
+            }
+        }
+        let Some(frame) = got_frame else {
+            continue;
+        };
+        let mut rgba = Video::empty();
+        if scaler.run(&frame, &mut rgba).is_err() {
+            continue;
+        }
+        let stride = rgba.stride(0);
+        let needed = (dst_w * 4) as usize;
+        let plane = rgba.data(0);
+        let buf: Vec<u8> = if stride == needed {
+            plane[..needed * dst_h as usize].to_vec()
+        } else {
+            let mut out = Vec::with_capacity(needed * dst_h as usize);
+            for row in 0..dst_h as usize {
+                let start = row * stride;
+                out.extend_from_slice(&plane[start..start + needed]);
+            }
+            out
+        };
+        let thumb = TileThumbnail {
+            pts_secs: target_secs,
+            width: dst_w,
+            height: dst_h,
+            rgba: Arc::new(buf),
+        };
+        if let Ok(mut s) = state.lock() {
+            if idx < s.len() {
+                s[idx] = Some(thumb);
+            }
+        }
+    }
+}
+
+fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 {
+        return (max_w, max_h);
+    }
+    let scale = (max_w as f64 / src_w as f64).min(max_h as f64 / src_h as f64);
+    let w = ((src_w as f64 * scale).round() as u32).max(1);
+    let h = ((src_h as f64 * scale).round() as u32).max(1);
+    (w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_within_preserves_aspect() {
+        // 16:9 source, fit into 320x180 → (320, 180)
+        let (w, h) = fit_within(1920, 1080, 320, 180);
+        assert_eq!((w, h), (320, 180));
+        // 4:3 source, fit into 320x180 → (240, 180)
+        let (w, h) = fit_within(800, 600, 320, 180);
+        assert_eq!((w, h), (240, 180));
+        // tall source, fit into 320x180 → (101, 180)
+        let (w, h) = fit_within(360, 640, 320, 180);
+        assert_eq!(h, 180);
+        assert!((w as i32 - 101).abs() <= 1);
+    }
+}
