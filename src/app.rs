@@ -1627,8 +1627,11 @@ pub struct App {
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
-    /// 直近 N フレームの間隔 (ms)。新フレームが届いた wall 時刻と GPU fence 値の変化で検知。
-    pub(crate) video_perf_history: std::collections::VecDeque<f32>,
+    /// 直近 N フレームの (interval_ms, arrival_wall) の組。
+    /// `arrival_wall` を持たせると repaint 時に経過時間で連続スクロールできる
+    /// (= サンプル単位の離散スクロールにならず stair-step が消える)。
+    pub(crate) video_perf_history:
+        std::collections::VecDeque<(f32, std::time::Instant)>,
     /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
     pub(crate) video_perf_last_wall: Option<std::time::Instant>,
     /// 前回サンプリング時の displayed_frame_seq (= VideoPlayer の atomic カウンタ、

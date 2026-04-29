@@ -5142,7 +5142,7 @@ impl App {
                 };
                 let transient_threshold = expected_ms * 3.0;
                 if interval_ms <= transient_threshold {
-                    self.video_perf_history.push_back(interval_ms);
+                    self.video_perf_history.push_back((interval_ms, now));
                     while self.video_perf_history.len() > 200 {
                         self.video_perf_history.pop_front();
                     }
@@ -5217,17 +5217,18 @@ impl App {
             );
             return;
         }
-        let avg: f32 = self.video_perf_history.iter().sum::<f32>() / n as f32;
+        let avg: f32 =
+            self.video_perf_history.iter().map(|(v, _)| v).sum::<f32>() / n as f32;
         let max: f32 = self
             .video_perf_history
             .iter()
-            .copied()
+            .map(|(v, _)| *v)
             .fold(0.0_f32, f32::max);
         // hitch = 期待間隔の 1.5x を超えるフレーム (= 約 1 frame 以上の遅延)。
         let hitches = self
             .video_perf_history
             .iter()
-            .filter(|&&v| v > hitch_ms)
+            .filter(|(v, _)| *v > hitch_ms)
             .count();
         let header = format!(
             "{:.1}fps target ({:.1}ms)  avg {:.1}ms  max {:.1}ms  hitch>{:.0}ms:{}",
@@ -5277,39 +5278,61 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 200),
             );
         }
-        // X 軸: 容量 200 sample で graph_w を分割 (= 1 sample = graph_w/200 px)。
-        // 直近サンプルを **右端**、古い方が左にスクロール。容量未満なら左側は空白。
-        const CAPACITY: usize = 200;
-        let dx = graph.width() / CAPACITY as f32;
-        // 古いサンプル (= 履歴 index 0) ほど左寄り、最新 (= index n-1) が右端。
-        let x_for = |i: usize| graph.max.x - dx * (n - 1 - i) as f32;
+        // X 軸: **wall 経過時間ベースで連続スクロール**。
+        // - WINDOW_SECS 秒分のグラフを表示 (= graph_w を WINDOW_SECS で割った px/s)
+        // - 各サンプルの x = right_edge - (now - sample.arrival) * px_per_sec
+        // - repaint ごとに px_per_sec * dt だけ左へスクロール (= サブピクセル粒度)
+        // 旧実装はサンプル数 index で X を決めていたため、新サンプルが届く瞬間
+        // (= 16-33ms 間隔) に discrete に進むだけで stair-step がカクついていた。
+        const WINDOW_SECS: f32 = 6.0;
+        let px_per_sec = graph.width() / WINDOW_SECS;
+        let now = std::time::Instant::now();
+        let x_for = |arrival: std::time::Instant| -> f32 {
+            let dt = now.saturating_duration_since(arrival).as_secs_f32();
+            graph.max.x - dt * px_per_sec
+        };
+
+        // 連続描画のために repaint を ~16ms (= 60Hz) で予約。
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
+
+        // graph 矩形外にはみ出さないよう painter を clip。
+        let painter = painter.with_clip_rect(graph);
 
         // ヒッチ赤縦線 (折れ線描画前に下層に置く)
-        for (i, &v) in self.video_perf_history.iter().enumerate() {
-            if v > hitch_ms {
-                let x = x_for(i);
-                painter.line_segment(
-                    [
-                        egui::pos2(x, graph.min.y),
-                        egui::pos2(x, graph.max.y),
-                    ],
-                    egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180),
-                    ),
-                );
+        for (v, arrival) in &self.video_perf_history {
+            if *v > hitch_ms {
+                let x = x_for(*arrival);
+                if x >= graph.min.x && x <= graph.max.x {
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, graph.min.y),
+                            egui::pos2(x, graph.max.y),
+                        ],
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180),
+                        ),
+                    );
+                }
             }
         }
         // 折れ線 (右端が最新、左に向かって過去)。
         if n > 1 {
-            let mut prev = egui::pos2(x_for(0), y_for(self.video_perf_history[0]));
-            for (i, &v) in self.video_perf_history.iter().enumerate().skip(1) {
-                let p = egui::pos2(x_for(i), y_for(v));
-                painter.line_segment(
-                    [prev, p],
-                    egui::Stroke::new(1.2, egui::Color32::from_rgb(180, 230, 255)),
-                );
-                prev = p;
+            let mut prev: Option<egui::Pos2> = None;
+            for (v, arrival) in &self.video_perf_history {
+                let x = x_for(*arrival);
+                let p = egui::pos2(x, y_for(*v));
+                if let Some(prev_p) = prev {
+                    // graph 範囲外のセグメントはスキップ (両端 clip 簡略化)。
+                    if !(p.x < graph.min.x && prev_p.x < graph.min.x) {
+                        painter.line_segment(
+                            [prev_p, p],
+                            egui::Stroke::new(1.2, egui::Color32::from_rgb(180, 230, 255)),
+                        );
+                    }
+                }
+                prev = Some(p);
             }
         }
     }
