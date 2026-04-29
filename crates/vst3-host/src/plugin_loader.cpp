@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include "host_app.h"
 #include "pluginterfaces/base/funknownimpl.h"
@@ -95,16 +96,55 @@ bool PluginLoader::load(const std::string& plugin_path,
         return false;
     }
 
-    // Bus 設定: stereo input + stereo output に固定 (Phase 0)
-    Vst::SpeakerArrangement arr_in = Vst::SpeakerArr::kStereo;
-    Vst::SpeakerArrangement arr_out = Vst::SpeakerArr::kStereo;
-    if (processor_->setBusArrangements(&arr_in, 1, &arr_out, 1) != kResultOk) {
-        error_out = "setBusArrangements stereo/stereo failed";
+    // Bus 設定: 動的に取得した bus 数に合わせて arrangement を渡す。
+    // Pro-Q 4 等、サイドチェイン入力 bus を持つプラグインは 1 bus だけ
+    // 渡すと kResultFalse を返すため、全 audio bus 分を埋める必要がある。
+    //
+    // 戦略:
+    //   1) 全 bus を stereo で埋めて setBusArrangements
+    //   2) 失敗したら副 bus を空 (= mono など最小) にしてリトライ
+    //   3) それでも失敗すれば諦める
+    int32 num_in_buses = component_->getBusCount(Vst::kAudio, Vst::kInput);
+    int32 num_out_buses = component_->getBusCount(Vst::kAudio, Vst::kOutput);
+    if (num_in_buses < 1 || num_out_buses < 1) {
+        error_out = "plugin has no audio bus";
         unload();
         return false;
     }
-    component_->activateBus(Vst::kAudio, Vst::kInput, 0, true);
-    component_->activateBus(Vst::kAudio, Vst::kOutput, 0, true);
+
+    auto try_arrangements = [&](Vst::SpeakerArrangement aux) -> bool {
+        std::vector<Vst::SpeakerArrangement> ins(num_in_buses, Vst::SpeakerArr::kStereo);
+        std::vector<Vst::SpeakerArrangement> outs(num_out_buses, Vst::SpeakerArr::kStereo);
+        for (int32 i = 1; i < num_in_buses; ++i) ins[i] = aux;
+        for (int32 i = 1; i < num_out_buses; ++i) outs[i] = aux;
+        return processor_->setBusArrangements(
+                   ins.data(), num_in_buses, outs.data(), num_out_buses) == kResultOk;
+    };
+
+    bool arr_ok = try_arrangements(Vst::SpeakerArr::kStereo);
+    if (!arr_ok) {
+        // サイドチェインを mono で
+        arr_ok = try_arrangements(Vst::SpeakerArr::kMono);
+    }
+    if (!arr_ok) {
+        // サイドチェインを空 (= 無効化) で
+        arr_ok = try_arrangements(Vst::SpeakerArr::kEmpty);
+    }
+    if (!arr_ok) {
+        error_out = "setBusArrangements failed for stereo main bus (in="
+                    + std::to_string(num_in_buses) + " out="
+                    + std::to_string(num_out_buses) + ")";
+        unload();
+        return false;
+    }
+
+    // main bus (index 0) のみ active にし、副 bus は無効にして処理経路から外す
+    for (int32 i = 0; i < num_in_buses; ++i) {
+        component_->activateBus(Vst::kAudio, Vst::kInput, i, i == 0);
+    }
+    for (int32 i = 0; i < num_out_buses; ++i) {
+        component_->activateBus(Vst::kAudio, Vst::kOutput, i, i == 0);
+    }
 
     // ProcessSetup
     Vst::ProcessSetup setup{};
