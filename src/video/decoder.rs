@@ -989,6 +989,29 @@ fn run_decoder(
                 break; // 1 パケット消費したらループ先頭でシークチェック
             } else if let Some(ref mut a) = audio_setup {
                 if stream.index() == a.stream_idx {
+                    // Phase 8.E: post-seek audio preroll を packet 段階で **decode せず**
+                    // 切り捨てる。avformat は seek backward 後 keyframe 直前から packets
+                    // を返すため、音声 stream は target から数百 ms 前の packets が連続
+                    // して届く。旧コードはそれらを send_packet → receive_frame → resample
+                    // → drop_before_secs でドロップしていたが、デコード + resample が
+                    // 1 packet ~5ms かかり 50 packets で 250ms 分 demux ループが詰まり、
+                    // 結果として post-seek の音声出力が ~1 秒途切れる現象に直結していた。
+                    // packet の pts + duration が target より明確に前なら decode をスキップ。
+                    // (packet boundary 上では target を跨ぐもののみデコードして
+                    //  drop_before_secs の sample-level trim 経路で正確に切り出す。)
+                    if let Some(min) = drop_before_secs {
+                        let pkt_pts = packet.pts().unwrap_or(i64::MIN);
+                        if pkt_pts != i64::MIN {
+                            let pkt_pts_secs =
+                                (pkt_pts as f64) * a.time_base_num / a.time_base_den;
+                            let pkt_dur_secs = (packet.duration().max(0) as f64)
+                                * a.time_base_num
+                                / a.time_base_den;
+                            if pkt_pts_secs + pkt_dur_secs < min - 0.020 {
+                                continue;
+                            }
+                        }
+                    }
                     if let Err(e) = a.decoder.send_packet(&packet) {
                         crate::logger::log(format!("audio send_packet: {e}"));
                         continue;
