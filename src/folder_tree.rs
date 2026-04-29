@@ -309,13 +309,18 @@ pub fn walk_dirs_recursive_with_progress(
 /// path 配下の "子フォルダ + .zip ファイル" をソート済みで返す。
 /// .zip もナビゲーション対象として扱う (タスク 3)。
 pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
-    // 同名フォルダがある ZIP をスキップするかの設定を読み込む
+    // 同名フォルダがある ZIP をスキップするかの設定を読み込む。
+    // Phase 7.E: ユーザー設定の sort_order も流用してグリッド表示順と Ctrl+↑↓ DFS 順を
+    // 一致させる (旧: 常に lowercase 名前順 → 日付順設定のユーザーが「上下逆」に感じる
+    // 不具合の解消)。
     let settings = crate::settings::Settings::load();
     let skip_zip = settings.skip_zip_if_folder_exists;
+    let sort_order = settings.sort_order;
 
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    // (PathBuf, mtime_secs) を蓄積。ソート時に mtime と name を引く。
+    let mut dirs: Vec<(PathBuf, i64)> = Vec::new();
     let mut real_folder_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut zip_candidates: Vec<PathBuf> = Vec::new();
+    let mut zip_candidates: Vec<(PathBuf, i64)> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(path) {
         for e in entries.flatten() {
@@ -329,19 +334,34 @@ pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
                 Err(_) => continue,
             };
             let p = e.path();
+            // mtime は DateAsc/Desc のソートでだけ意味を持つので、それ以外なら
+            // 0 でも構わない。`metadata()` が追加 syscall になるので、必要なときだけ取る。
+            let mtime: i64 = if matches!(
+                sort_order,
+                crate::settings::SortOrder::DateAsc | crate::settings::SortOrder::DateDesc
+            ) {
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             if ft.is_dir() {
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     real_folder_names.insert(name.to_lowercase());
                 }
-                dirs.push(p);
+                dirs.push((p, mtime));
             } else if ft.is_file() && is_virtual_folder(&p) {
-                zip_candidates.push(p);
+                zip_candidates.push((p, mtime));
             }
         }
     }
 
     // ZIP フィルタ: 同名フォルダがあればスキップ
-    for zp in zip_candidates {
+    for (zp, mtime) in zip_candidates {
         if skip_zip {
             let stem = zp
                 .file_stem()
@@ -352,16 +372,19 @@ pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
                 continue; // スキップ
             }
         }
-        dirs.push(zp);
+        dirs.push((zp, mtime));
     }
 
-    let mut dirs = dirs;
+    // SortOrder::compare は &str / mtime / natural_key を取る。同関数を再利用して
+    // グリッドと完全に同じソート規則を使う。
     dirs.sort_by(|a, b| {
-        a.to_string_lossy()
-            .to_lowercase()
-            .cmp(&b.to_string_lossy().to_lowercase())
+        let name_a = a.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name_b = b.0.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        sort_order.compare(name_a, a.1, name_b, b.1, |s| {
+            crate::ui_helpers::natural_sort_key(s)
+        })
     });
-    dirs
+    dirs.into_iter().map(|(p, _)| p).collect()
 }
 
 /// Windows のファイルシステムは大文字小文字を区別しないため小文字化して比較。

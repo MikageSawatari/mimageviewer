@@ -5098,9 +5098,10 @@ impl App {
             egui::Sense::click(),
         );
         draw_hud_button_bg(&painter, replay_rect, replay_resp.hovered());
-        // ⏮ アイコン (左向き三角 + 縦バー)
-        draw_replay_icon(&painter, replay_rect.center(), btn_size * 0.36);
-        let replay_resp = replay_resp.on_hover_text("最初から再生");
+        // ⏮ アイコン (縦バー + 左向き三角 = "skip back to start")。
+        // Phase 7: 視認性のため再生 ▶ アイコンと同じ 0.4*btn_size サイズに。
+        draw_replay_icon(&painter, replay_rect.center(), btn_size * 0.4);
+        let replay_resp = replay_resp.on_hover_text("最初から再生 (頭出し + 即再生)");
         if replay_resp.clicked()
             && let Some(p) = self.fs_video_player(fs_idx)
         {
