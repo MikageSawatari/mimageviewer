@@ -75,6 +75,12 @@ pub struct VideoPlayer {
     /// +1。GPU/CPU 両経路で更新するので、UI 側の perf overlay が経路に依存せず
     /// 「新フレーム到着」を検知できる (Phase 8.I 修正)。
     displayed_frame_seq: AtomicU64,
+    /// 「skip された frame」の累積カウンタ。次の 2 経路で +1:
+    ///   - decoder の video_tx try_send が Full → 送信できず捨てた (Arc 共有 atomic)
+    ///   - tick で latest_renderable を上書き = 古い候補は dropped_past として
+    ///     表示前に捨てた (= UI 側 skip)
+    /// perf overlay はこの累積を per-sample で diff して赤縦線を出す。
+    skipped_frame_count: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     decode: DecodeHandles,
     /// 保持目的のフィールド (Drop で cpal Stream が停止する)。読み取りはしない。
@@ -183,6 +189,7 @@ impl VideoPlayer {
                 info_event_emitted: false,
                 first_frame_event_last_epoch: None,
                 displayed_frame_seq: AtomicU64::new(0),
+                skipped_frame_count: Arc::new(AtomicU64::new(0)),
                 cancel: Arc::new(AtomicBool::new(true)),
                 decode: dummy_decode_handles(),
                 audio: None,
@@ -236,6 +243,10 @@ impl VideoPlayer {
         // デバイスが取れなければ 48kHz をフォールバック。
         let target_rate = audio::default_output_sample_rate().unwrap_or(48_000);
 
+        // perf overlay 用 skip counter を decoder スレッドと共有 (= dropped_full 時に
+        // decoder 側から +1)。UI 側 dropped_past の +1 は VideoPlayer::tick 内で行う。
+        let skipped_frame_count = Arc::new(AtomicU64::new(0));
+
         let decode = decoder::spawn(
             path.clone(),
             clock.clone(),
@@ -246,6 +257,7 @@ impl VideoPlayer {
             gpu_video_device,
             engine_state_handle,
             engine_event_tx.clone(),
+            skipped_frame_count.clone(),
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
@@ -276,6 +288,7 @@ impl VideoPlayer {
             info_event_emitted: false,
             first_frame_event_last_epoch: None,
             displayed_frame_seq: AtomicU64::new(0),
+            skipped_frame_count,
             cancel,
             decode: DecodeHandles {
                 video_rx,
@@ -703,6 +716,10 @@ impl VideoPlayer {
                 }
                 self.emit_first_frame_event(pts);
                 self.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                if dropped_past > 0 {
+                    self.skipped_frame_count
+                        .fetch_add(dropped_past, Ordering::Relaxed);
+                }
                 let _ = pts_for_log;
                 return next_due;
             }
@@ -765,6 +782,13 @@ impl VideoPlayer {
             displayed_pts = Some(pts_for_log);
         }
 
+        // UI 側 skip 計上: latest_renderable を上書きした際に古い候補を捨てた
+        // 累積数 (= dropped_past) を perf overlay 用カウンタに反映。
+        if dropped_past > 0 {
+            self.skipped_frame_count
+                .fetch_add(dropped_past, Ordering::Relaxed);
+        }
+
         // perf: tick 1 回ごとの状況を記録 (channel 詰まり / 描画詰まりの可視化)
         if crate::perf::is_enabled()
             && (pulled > 0 || dropped_old_serial > 0 || dropped_past > 0 || displayed_pts.is_some())
@@ -820,6 +844,12 @@ impl VideoPlayer {
     /// 「新フレームが届いたか」を 1 atomic load で検知できる。
     pub fn displayed_frame_seq(&self) -> u64 {
         self.displayed_frame_seq.load(Ordering::Acquire)
+    }
+
+    /// skip された frame の累積数 (decoder 側 video_tx Full + UI 側 dropped_past)。
+    /// perf overlay が delta を取って赤縦線を出す。
+    pub fn skipped_frame_count(&self) -> u64 {
+        self.skipped_frame_count.load(Ordering::Acquire)
     }
 
     /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。

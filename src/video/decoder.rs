@@ -145,6 +145,7 @@ pub fn spawn(
     >,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
 ) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
@@ -175,6 +176,7 @@ pub fn spawn(
                 video_tx,
                 audio_tx,
                 info_tx,
+                skipped_frame_count,
             );
         })
         .expect("spawn video-decode thread");
@@ -200,6 +202,7 @@ fn run_decoder(
     video_tx: Sender<VideoFrame>,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
+    skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use ffmpeg_the_third as ffmpeg;
     use ffmpeg::format::Pixel;
@@ -770,6 +773,10 @@ fn run_decoder(
                                     if !dropped_full && send_result.is_ok() {
                                         last_enqueued_pts = pts_secs;
                                     }
+                                    if dropped_full {
+                                        skipped_frame_count
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     if crate::perf::is_enabled() {
                                         crate::perf::event(
                                             "video",
@@ -984,6 +991,10 @@ fn run_decoder(
                     let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
                     if !dropped_full && send_result.is_ok() {
                         last_enqueued_pts = pts_secs;
+                    }
+                    if dropped_full {
+                        skipped_frame_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     if crate::perf::is_enabled() {
                         crate::perf::event(

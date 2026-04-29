@@ -1627,16 +1627,19 @@ pub struct App {
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
-    /// 直近 N フレームの (interval_ms, arrival_wall) の組。
-    /// `arrival_wall` を持たせると repaint 時に経過時間で連続スクロールできる
-    /// (= サンプル単位の離散スクロールにならず stair-step が消える)。
+    /// 直近 N フレームの (interval_ms, arrival_wall, skipped_count) の組。
+    /// `arrival_wall` で repaint 時の連続スクロールを可能にし、`skipped_count` で
+    /// このサンプル区間に何 frame skip されたかを記録する (赤縦線の判定)。
     pub(crate) video_perf_history:
-        std::collections::VecDeque<(f32, std::time::Instant)>,
+        std::collections::VecDeque<(f32, std::time::Instant, u32)>,
     /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
     pub(crate) video_perf_last_wall: Option<std::time::Instant>,
     /// 前回サンプリング時の displayed_frame_seq (= VideoPlayer の atomic カウンタ、
     /// GPU/CPU 経路の両方で tick 内 +1)。これで経路に依存せず新フレーム検知できる。
     pub(crate) video_perf_last_seq: Option<u64>,
+    /// 前回サンプリング時の skipped_frame_count (= decoder 側 dropped_full +
+    /// UI 側 dropped_past の累積)。delta を per-sample で出して skip 検知に使う。
+    pub(crate) video_perf_last_skip: Option<u64>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2446,6 +2449,7 @@ impl Default for App {
             video_perf_history: std::collections::VecDeque::with_capacity(200),
             video_perf_last_wall: None,
             video_perf_last_seq: None,
+            video_perf_last_skip: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

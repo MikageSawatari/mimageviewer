@@ -5060,6 +5060,7 @@ impl App {
             self.video_perf_history.clear();
             self.video_perf_last_wall = None;
             self.video_perf_last_seq = None;
+            self.video_perf_last_skip = None;
         }
         if rewind_key
             && let Some(p) = self.fs_video_player(fs_idx)
@@ -5112,44 +5113,52 @@ impl App {
     }
 
     /// 動画 VideoPlayer の `displayed_frame_seq` (= GPU/CPU 経路問わず tick で +1)
-    /// の変化で frame interval (ms) を履歴に記録。経路非依存なので CPU sw decode
-    /// の動画でも overlay が機能する。
+    /// の変化で frame interval (ms) を履歴に記録。`skipped_frame_count` の delta も
+    /// 同時に記録し、赤縦線で「実際の skip 発生」を表示する。
     /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
-    /// 等の transient による wall 待ち時間」とみなして履歴に入れない (= 通常 frame
-    /// pacing と区別)。
+    /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
-        let cur_seq: Option<u64> = match self.fs_cache.get(&fs_idx) {
+        let snapshot: Option<(u64, u64, f32)> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                Some(player.displayed_frame_seq())
+                let expected_ms = player
+                    .info()
+                    .map(|i| i.avg_fps as f32)
+                    .filter(|fps| *fps > 0.5 && fps.is_finite())
+                    .map(|fps| 1000.0 / fps)
+                    .unwrap_or(33.3);
+                Some((
+                    player.displayed_frame_seq(),
+                    player.skipped_frame_count(),
+                    expected_ms,
+                ))
             }
             _ => None,
         };
-        if cur_seq != self.video_perf_last_seq && cur_seq.is_some() {
+        let Some((cur_seq, cur_skip, expected_ms)) = snapshot else {
+            return;
+        };
+        if Some(cur_seq) != self.video_perf_last_seq {
             let now = std::time::Instant::now();
-            if let (Some(prev_wall), Some(_)) =
-                (self.video_perf_last_wall, self.video_perf_last_seq)
-            {
+            if let (Some(prev_wall), Some(_), Some(prev_skip)) = (
+                self.video_perf_last_wall,
+                self.video_perf_last_seq,
+                self.video_perf_last_skip,
+            ) {
                 let interval_ms =
                     now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
-                let expected_ms = match self.fs_cache.get(&fs_idx) {
-                    Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player
-                        .info()
-                        .map(|i| i.avg_fps as f32)
-                        .filter(|fps| *fps > 0.5 && fps.is_finite())
-                        .map(|fps| 1000.0 / fps)
-                        .unwrap_or(33.3),
-                    _ => 33.3,
-                };
+                let skip_delta = cur_skip.saturating_sub(prev_skip) as u32;
                 let transient_threshold = expected_ms * 3.0;
                 if interval_ms <= transient_threshold {
-                    self.video_perf_history.push_back((interval_ms, now));
+                    self.video_perf_history
+                        .push_back((interval_ms, now, skip_delta));
                     while self.video_perf_history.len() > 200 {
                         self.video_perf_history.pop_front();
                     }
                 }
             }
             self.video_perf_last_wall = Some(now);
-            self.video_perf_last_seq = cur_seq;
+            self.video_perf_last_seq = Some(cur_seq);
+            self.video_perf_last_skip = Some(cur_skip);
         }
     }
 
@@ -5218,26 +5227,25 @@ impl App {
             return;
         }
         let avg: f32 =
-            self.video_perf_history.iter().map(|(v, _)| v).sum::<f32>() / n as f32;
+            self.video_perf_history.iter().map(|(v, _, _)| v).sum::<f32>() / n as f32;
         let max: f32 = self
             .video_perf_history
             .iter()
-            .map(|(v, _)| *v)
+            .map(|(v, _, _)| *v)
             .fold(0.0_f32, f32::max);
-        // hitch = 期待間隔の 1.5x を超えるフレーム (= 約 1 frame 以上の遅延)。
-        let hitches = self
+        // skip 件数: skip_delta > 0 のサンプル数 (= 赤縦線の数)。
+        let skips: u32 = self
             .video_perf_history
             .iter()
-            .filter(|(v, _)| *v > hitch_ms)
-            .count();
+            .map(|(_, _, s)| *s)
+            .sum();
         let header = format!(
-            "{:.1}fps target ({:.1}ms)  avg {:.1}ms  max {:.1}ms  hitch>{:.0}ms:{}",
+            "{:.1}fps target ({:.1}ms)  avg {:.1}ms  max {:.1}ms  skipped:{}",
             1000.0 / expected_ms,
             expected_ms,
             avg,
             max,
-            hitch_ms,
-            hitches
+            skips
         );
         painter.text(
             egui::pos2(rect.min.x + 6.0, rect.min.y + 4.0),
@@ -5299,40 +5307,45 @@ impl App {
         // graph 矩形外にはみ出さないよう painter を clip。
         let painter = painter.with_clip_rect(graph);
 
-        // ヒッチ赤縦線 (折れ線描画前に下層に置く)
-        for (v, arrival) in &self.video_perf_history {
-            if *v > hitch_ms {
+        // 赤縦線: 実際に skip されたサンプル (= decoder dropped_full or UI dropped_past)。
+        // skip_delta が大きいほど色を濃くする (= 一気に複数 frame 飛んだのが分かる)。
+        for (_, arrival, skip) in &self.video_perf_history {
+            if *skip > 0 {
+                let alpha = (120 + (*skip as u32 * 40).min(135)) as u8;
                 let x = x_for(*arrival);
-                if x >= graph.min.x && x <= graph.max.x {
-                    painter.line_segment(
-                        [
-                            egui::pos2(x, graph.min.y),
-                            egui::pos2(x, graph.max.y),
-                        ],
-                        egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180),
-                        ),
-                    );
-                }
+                painter.line_segment(
+                    [
+                        egui::pos2(x, graph.min.y),
+                        egui::pos2(x, graph.max.y),
+                    ],
+                    egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgba_unmultiplied(255, 80, 80, alpha),
+                    ),
+                );
             }
         }
-        // 折れ線 (右端が最新、左に向かって過去)。
+        // 折れ線: 各 frame の到着間隔 (= UI が体感する処理時間)。
+        // 右端が最新、左に向かって過去。hitch 閾値を超えるセグメントは色を変えて
+        // 「期待値より遅い」状態が一目で分かるようにする。
         if n > 1 {
-            let mut prev: Option<egui::Pos2> = None;
-            for (v, arrival) in &self.video_perf_history {
+            let mut prev: Option<(egui::Pos2, f32)> = None;
+            for (v, arrival, _) in &self.video_perf_history {
                 let x = x_for(*arrival);
                 let p = egui::pos2(x, y_for(*v));
-                if let Some(prev_p) = prev {
-                    // graph 範囲外のセグメントはスキップ (両端 clip 簡略化)。
+                if let Some((prev_p, prev_v)) = prev {
                     if !(p.x < graph.min.x && prev_p.x < graph.min.x) {
-                        painter.line_segment(
-                            [prev_p, p],
-                            egui::Stroke::new(1.2, egui::Color32::from_rgb(180, 230, 255)),
-                        );
+                        // セグメント色: 両端どちらかが hitch_ms を超えていたら橙系
+                        let exceeds = *v > hitch_ms || prev_v > hitch_ms;
+                        let color = if exceeds {
+                            egui::Color32::from_rgb(255, 200, 100)
+                        } else {
+                            egui::Color32::from_rgb(180, 230, 255)
+                        };
+                        painter.line_segment([prev_p, p], egui::Stroke::new(1.2, color));
                     }
                 }
-                prev = Some(p);
+                prev = Some((p, *v));
             }
         }
     }
