@@ -33,10 +33,23 @@ mod ffi {
     pub const MONITOR_DEFAULTTONEAREST: u32 = 0x0000_0002;
     pub const MDT_EFFECTIVE_DPI: u32 = 0;
 
+    pub type MonitorEnumProc = unsafe extern "system" fn(
+        h_monitor: isize,
+        h_dc: isize,
+        rect: *mut Rect,
+        data: isize,
+    ) -> i32;
+
     #[link(name = "user32")]
     unsafe extern "system" {
         pub fn MonitorFromPoint(pt: Point, flags: u32) -> isize;
         pub fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+        pub fn EnumDisplayMonitors(
+            hdc: isize,
+            clip: *const Rect,
+            cb: MonitorEnumProc,
+            data: isize,
+        ) -> i32;
     }
 
     #[link(name = "shcore")]
@@ -164,4 +177,66 @@ pub fn get_monitor_logical_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
         let _ = (x, y);
         None
     }
+}
+
+/// 接続されている全モニターの中で **最大の物理ピクセル幅** を返す。
+/// 列挙不能 (=非 Windows / API 失敗) の場合は `None`。
+/// 動画タイル モード のサムネ抽出幅をディスプレイ非依存で固定するために使う
+/// (= マルチモニター環境で FS 幅が違ってもキャッシュを共有する)。
+#[cfg(target_os = "windows")]
+pub fn max_monitor_pixel_width() -> Option<u32> {
+    use ffi::*;
+    use std::cell::Cell;
+
+    // EnumDisplayMonitors のコールバックは extern "system" なので、状態は
+    // `data` ポインタ経由で渡す。Cell<u32> をスレッドローカル代わりに利用。
+    thread_local! {
+        static MAX_W: Cell<u32> = const { Cell::new(0) };
+    }
+
+    unsafe extern "system" fn cb(
+        h_monitor: isize,
+        _hdc: isize,
+        _rect: *mut Rect,
+        _data: isize,
+    ) -> i32 {
+        let mut info = MonitorInfo {
+            cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+            rc_monitor: Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            rc_work: Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            dw_flags: 0,
+        };
+        if unsafe { GetMonitorInfoW(h_monitor, &mut info) } != 0 {
+            let w = (info.rc_monitor.right - info.rc_monitor.left).max(0) as u32;
+            MAX_W.with(|c| {
+                if w > c.get() {
+                    c.set(w);
+                }
+            });
+        }
+        1 // continue enumeration
+    }
+
+    MAX_W.with(|c| c.set(0));
+    let ok = unsafe { EnumDisplayMonitors(0, std::ptr::null(), cb, 0) };
+    if ok == 0 {
+        return None;
+    }
+    let w = MAX_W.with(|c| c.get());
+    if w == 0 { None } else { Some(w) }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn max_monitor_pixel_width() -> Option<u32> {
+    None
 }

@@ -93,6 +93,21 @@ impl App {
         let usable_w = (screen_size.x - 32.0).max(200.0);
         let tile_w = (usable_w / columns as f32).floor().max(40.0) as u32;
         let tile_h = ((tile_w as f64) / aspect).round().max(30.0) as u32;
+        // 抽出幅は **接続モニター中の最大幅 / 最小列数** に固定する。
+        // - 列数を下げる (= タイル拡大) ときに拡大スケール → ぼやけを避ける
+        // - 列数を上げる (= タイル縮小) ときは縮小スケールで詳細維持
+        // - マルチモニターで FS 幅が違ってもキャッシュ再利用可 (= ユーザー環境の
+        //   最大解像度モニターを基準にすると、どのモニター上で再生しても同じ
+        //   tile_w で抽出された 1 つのキャッシュ行に集約される)
+        // egui の painter.image() が tile_rect にスケールするので描画側は再抽出不要。
+        // モニター情報が取れない場合のフォールバックは 640px (4K/6 ≈ 640 相当)。
+        let max_screen_w = crate::monitor::max_monitor_pixel_width().unwrap_or(3840) as f32;
+        let min_columns = *crate::settings::VIDEO_TILE_COLUMN_CANDIDATES
+            .iter()
+            .min()
+            .unwrap_or(&6);
+        let extract_w = ((max_screen_w / min_columns as f32).floor() as u32).max(tile_w);
+        let extract_h = ((extract_w as f64) / aspect).round().max(tile_h as f64) as u32;
 
         // 画面に収まる最大行数を計算。上下に余白 + ファイル名行 (任意) を引く。
         let usable_h = (screen_size.y - 80.0).max(200.0);
@@ -125,11 +140,13 @@ impl App {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let cache = self.video_tile_cache.clone();
+        // worker には extract サイズ (= 最大列幅) を渡す。描画用の tile_w/tile_h は
+        // VideoTileState に持って egui の painter.image スケーリングに使う。
         let worker = TileThumbnailWorker::spawn(
             path.clone(),
             timestamps.clone(),
-            tile_w,
-            tile_h,
+            extract_w,
+            extract_h,
             cache,
             video_mtime,
         );

@@ -124,25 +124,28 @@ impl TileThumbCache {
 
     /// キャッシュ ヒットなら WebP バイト列を返す。`video_mtime` が DB と一致しない
     /// 行は古いとみなし削除して `None`。
+    ///
+    /// **`tile_w` は意図的にキーに含めない**: 同 `(path, timestamp_ms)` で別 tile_w
+    /// 行が複数あっても、その中で最大の `tile_w` を取って返す (= 列数を増減すると
+    /// tile_w も連動して変わる UI で、別列数で抽出済みのサムネを描画時の egui 側
+    /// リサイズで再利用できる、Phase 8.D)。
     pub fn lookup_webp(
         &self,
         video_path: &Path,
-        tile_w: u32,
         timestamp_ms: i64,
         video_mtime: i64,
     ) -> Option<Vec<u8>> {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().ok()?;
-        Self::lookup_with_conn(&conn, &key, tile_w, timestamp_ms, video_mtime)
+        Self::lookup_with_conn(&conn, &key, timestamp_ms, video_mtime)
     }
 
     /// 複数の timestamp を 1 度の Mutex 取得で照会するバッチ版。タイル worker の
-    /// 起動時 (~100 スロット) で per-slot lock を回避するため (simplify P2)。
+    /// 起動時 (~100 スロット) で per-slot lock を回避するため。
     /// 戻り値は入力順 (= スロット順) と一致する。
     pub fn lookup_webp_batch(
         &self,
         video_path: &Path,
-        tile_w: u32,
         timestamps_ms: &[i64],
         video_mtime: i64,
     ) -> Vec<Option<Vec<u8>>> {
@@ -152,26 +155,28 @@ impl TileThumbCache {
         };
         timestamps_ms
             .iter()
-            .map(|&ts| Self::lookup_with_conn(&conn, &key, tile_w, ts, video_mtime))
+            .map(|&ts| Self::lookup_with_conn(&conn, &key, ts, video_mtime))
             .collect()
     }
 
     fn lookup_with_conn(
         conn: &rusqlite::Connection,
         key: &str,
-        tile_w: u32,
         timestamp_ms: i64,
         video_mtime: i64,
     ) -> Option<Vec<u8>> {
+        // 同 (path, timestamp_ms) で複数 tile_w 行があり得るため、最大幅を 1 件取る。
+        // 描画時に egui がタイル矩形へスケーリングするため、tile_w 不一致は問題ない。
         let mut stmt = conn
             .prepare_cached(
                 "SELECT webp, video_mtime FROM video_tile_thumbs
-                  WHERE path = ?1 AND tile_w = ?2 AND timestamp_ms = ?3",
+                  WHERE path = ?1 AND timestamp_ms = ?2
+                  ORDER BY tile_w DESC LIMIT 1",
             )
             .ok()?;
         let row: Option<(Vec<u8>, i64)> = stmt
             .query_row(
-                rusqlite::params![key, tile_w, timestamp_ms],
+                rusqlite::params![key, timestamp_ms],
                 |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
             )
             .ok();
@@ -245,7 +250,7 @@ mod tests {
     fn lookup_missing_returns_none() {
         let db = open_in_memory();
         assert!(db
-            .lookup_webp(Path::new("c:/none.mp4"), 320, 5000, 12345)
+            .lookup_webp(Path::new("c:/none.mp4"), 5000, 12345)
             .is_none());
     }
 
@@ -255,7 +260,7 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         let webp = vec![0xDE, 0xAD, 0xBE, 0xEF];
         db.store_webp(p, 320, 5000, 99, 180, &webp).unwrap();
-        let got = db.lookup_webp(p, 320, 5000, 99).unwrap();
+        let got = db.lookup_webp(p, 5000, 99).unwrap();
         assert_eq!(got, webp);
     }
 
@@ -265,9 +270,9 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         db.store_webp(p, 320, 5000, 100, 180, &[1, 2, 3]).unwrap();
         // mtime 違い → None + 該当行削除
-        assert!(db.lookup_webp(p, 320, 5000, 999).is_none());
+        assert!(db.lookup_webp(p, 5000, 999).is_none());
         // 削除されたので再度 100 で照会しても見つからない
-        assert!(db.lookup_webp(p, 320, 5000, 100).is_none());
+        assert!(db.lookup_webp(p, 5000, 100).is_none());
     }
 
     #[test]
@@ -276,7 +281,7 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         db.store_webp(p, 320, 5000, 100, 180, &[1]).unwrap();
         db.store_webp(p, 320, 5000, 100, 180, &[2, 3]).unwrap();
-        assert_eq!(db.lookup_webp(p, 320, 5000, 100).unwrap(), vec![2, 3]);
+        assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![2, 3]);
     }
 
     #[test]
@@ -285,7 +290,7 @@ mod tests {
         db.store_webp(Path::new("C:\\V.MP4"), 320, 5000, 100, 180, &[9])
             .unwrap();
         assert!(db
-            .lookup_webp(Path::new("c:/v.mp4"), 320, 5000, 100)
+            .lookup_webp(Path::new("c:/v.mp4"), 5000, 100)
             .is_some());
     }
 
@@ -295,14 +300,27 @@ mod tests {
         // 1 秒間隔再描画時 (= pts=5000ms スロット) にヒットすることを確認。
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
-        // 5 秒間隔: pts=0ms, 5000ms, 10000ms, ...
         db.store_webp(p, 320, 5000, 100, 180, &[5]).unwrap();
         db.store_webp(p, 320, 10000, 100, 180, &[10]).unwrap();
-        // 1 秒間隔再描画時: pts=5000ms, 10000ms はキャッシュヒット
-        assert_eq!(db.lookup_webp(p, 320, 5000, 100).unwrap(), vec![5]);
-        assert_eq!(db.lookup_webp(p, 320, 10000, 100).unwrap(), vec![10]);
-        // 1 秒間隔の他スロット (pts=1000ms 等) は当然 miss
-        assert!(db.lookup_webp(p, 320, 1000, 100).is_none());
+        assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![5]);
+        assert_eq!(db.lookup_webp(p, 10000, 100).unwrap(), vec![10]);
+        assert!(db.lookup_webp(p, 1000, 100).is_none());
+    }
+
+    #[test]
+    fn lookup_reuses_across_tile_widths() {
+        // Phase 8.D 動機ケース: 列数増加で tile_w が変わっても、同 pts の既存
+        // キャッシュ (= 別 tile_w) は再利用される (描画時に egui がスケール)。
+        let db = open_in_memory();
+        let p = Path::new("c:/v.mp4");
+        // 列 10 で tile_w=200 のサムネを保存
+        db.store_webp(p, 200, 5000, 100, 112, &[7]).unwrap();
+        // 列 16 で tile_w=125 を要求 — 既存の 200 幅サムネが返ってくる
+        let got = db.lookup_webp(p, 5000, 100).unwrap();
+        assert_eq!(got, vec![7]);
+        // 同 pts に複数 tile_w がある場合は最大幅を採用 (= 縮小スケールの方が綺麗)
+        db.store_webp(p, 320, 5000, 100, 180, &[42]).unwrap();
+        assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![42]);
     }
 
     #[test]
@@ -322,7 +340,6 @@ mod tests {
              );",
         )
         .unwrap();
-        // 5 秒間隔の slot=2 (= pts 10000ms) を v1 で保存
         conn.execute(
             "INSERT INTO video_tile_thumbs
                 (path, interval_ms, tile_w, tile_h, slot, webp, video_mtime)
@@ -334,8 +351,7 @@ mod tests {
         let db = TileThumbCache {
             conn: Mutex::new(conn),
         };
-        // v2 lookup: pts=10000ms (= 5000 * 2) でヒットすること
-        let got = db.lookup_webp(Path::new("c:/v.mp4"), 320, 10000, 100);
+        let got = db.lookup_webp(Path::new("c:/v.mp4"), 10000, 100);
         assert_eq!(got.as_deref(), Some(&[42u8][..]));
     }
 }

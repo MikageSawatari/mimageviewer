@@ -154,7 +154,7 @@ fn run_worker(
             .iter()
             .map(|&p| (p * 1000.0).round() as i64)
             .collect();
-        let hits = c.lookup_webp_batch(&path, max_w, &ts_ms, video_mtime);
+        let hits = c.lookup_webp_batch(&path, &ts_ms, video_mtime);
         for (idx, (&pts, webp_opt)) in timestamps.iter().zip(hits.into_iter()).enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return;
