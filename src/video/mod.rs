@@ -670,13 +670,28 @@ impl VideoPlayer {
                          (pts={pts:.3}, serial={serial})"
                     ));
                 }
-                if clock::pts_clears_seek_override(pts, self.clock.now_secs()) {
+                let now_for_clear = self.clock.now_secs();
+                if clock::pts_clears_seek_override(pts, now_for_clear) {
                     if self.clock.is_audio_active() {
                         self.clock.set_audio_pts(pts);
                     } else {
                         self.clock.set_fallback_anchor(pts);
                     }
                     self.clock.clear_seek_target_override(serial);
+                } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                    // Phase 8.B 診断: override 中で frame pts が target - 0.75 未満
+                    // のとき (= 解除されない最大の原因候補)。
+                    crate::perf::event(
+                        "video",
+                        "seek_override_skip_clear_gpu",
+                        None,
+                        0,
+                        &[
+                            ("frame_pts", serde_json::Value::from(pts)),
+                            ("now", serde_json::Value::from(now_for_clear)),
+                            ("frame_serial", serde_json::Value::from(serial as i64)),
+                        ],
+                    );
                 }
                 self.emit_first_frame_event(pts);
                 let _ = pts_for_log;
@@ -711,6 +726,20 @@ impl VideoPlayer {
                     self.clock.set_fallback_anchor(frame.pts_secs);
                 }
                 self.clock.clear_seek_target_override(frame.seek_serial);
+            } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                // Phase 8.B 診断: CPU 経路 - override 中で frame pts が target - 0.75
+                // 未満のとき。GPU/CPU 経路どちらが多いかで preroll 失敗を特定する。
+                crate::perf::event(
+                    "video",
+                    "seek_override_skip_clear_cpu",
+                    None,
+                    0,
+                    &[
+                        ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                        ("now", serde_json::Value::from(now_after)),
+                        ("frame_serial", serde_json::Value::from(frame.seek_serial as i64)),
+                    ],
+                );
             }
             let upload_t0 = std::time::Instant::now();
             match self.texture.as_mut() {

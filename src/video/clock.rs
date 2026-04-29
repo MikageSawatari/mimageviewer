@@ -335,6 +335,21 @@ impl AvClock {
             direction,
             serial: new_serial,
         });
+        // Phase 8.B 診断: override 設定経路を perflog に記録。
+        // pace_now が固定される現象 (Codex P1 指摘) の根本原因特定用。
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "video",
+                "seek_override_set",
+                None,
+                0,
+                &[
+                    ("target", serde_json::Value::from(clamped)),
+                    ("direction", serde_json::Value::from(direction as i64)),
+                    ("serial", serde_json::Value::from(new_serial as i64)),
+                ],
+            );
+        }
     }
 
     /// 現在 seek の override が立っているか (= seek 完了待ち)。tick が EOF 検出を
@@ -410,18 +425,60 @@ impl AvClock {
         //   - bits が新世代に変わる → CAS が expected 不一致で失敗 (誤クリアなし)
         let cur_bits = self.seek_target_override_bits.load(Ordering::Acquire);
         if cur_bits == SEEK_NONE {
+            // Phase 8.B 診断: 既に解除済みケース (= 別経路が先行クリア)。
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "video",
+                    "seek_override_clear",
+                    None,
+                    0,
+                    &[
+                        ("completed_serial", serde_json::Value::from(completed_serial as i64)),
+                        ("result", serde_json::Value::from("already_clear")),
+                    ],
+                );
+            }
             return;
         }
         let override_serial = self.seek_override_serial.load(Ordering::Acquire);
         if completed_serial < override_serial {
+            // Phase 8.B 診断: 古い世代のクリア要求 (新 seek が割り込んだケース)。
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "video",
+                    "seek_override_clear",
+                    None,
+                    0,
+                    &[
+                        ("completed_serial", serde_json::Value::from(completed_serial as i64)),
+                        ("override_serial", serde_json::Value::from(override_serial as i64)),
+                        ("result", serde_json::Value::from("stale_serial")),
+                    ],
+                );
+            }
             return;
         }
-        let _ = self.seek_target_override_bits.compare_exchange(
+        let cas_result = self.seek_target_override_bits.compare_exchange(
             cur_bits,
             SEEK_NONE,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        if crate::perf::is_enabled() {
+            let result_str = if cas_result.is_ok() { "cleared" } else { "cas_failed" };
+            crate::perf::event(
+                "video",
+                "seek_override_clear",
+                None,
+                0,
+                &[
+                    ("completed_serial", serde_json::Value::from(completed_serial as i64)),
+                    ("override_serial", serde_json::Value::from(override_serial as i64)),
+                    ("target", serde_json::Value::from(f64::from_bits(cur_bits))),
+                    ("result", serde_json::Value::from(result_str)),
+                ],
+            );
+        }
     }
 
     /// fallback wall clock を `(pts, 今)` に再アンカー。
