@@ -26,6 +26,7 @@ using namespace Steinberg;
 PluginLoader::PluginLoader() {
     host_app_ = owned(new HostApplication);
     component_handler_ = owned(new ComponentHandler);
+    plug_frame_ = owned(new PlugFrame);
 }
 
 PluginLoader::~PluginLoader() {
@@ -279,18 +280,31 @@ bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
         view_ = nullptr;
         return false;
     }
+    // attached より **前に** setFrame を呼ぶ。Pro-Q 4 等多くのプラグインは
+    // frame が無いと描画開始しない (= 真っ白でハング)。
+    view_->setFrame(plug_frame_);
+
     if (view_->attached(hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
         error_out = "attached() failed";
+        view_->setFrame(nullptr);
         view_ = nullptr;
         return false;
     }
     view_attached_ = true;
+
+    // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
+    // これも描画開始トリガとして必要なプラグインが多い。
+    Steinberg::ViewRect rect{};
+    if (view_->getSize(&rect) == Steinberg::kResultOk) {
+        view_->onSize(&rect);
+    }
     return true;
 }
 
 void PluginLoader::hide_gui() {
     if (view_attached_ && view_) {
         view_->removed();
+        view_->setFrame(nullptr);
     }
     view_attached_ = false;
     view_ = nullptr;

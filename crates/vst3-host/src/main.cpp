@@ -14,6 +14,7 @@
 
 #include <fcntl.h>
 #include <io.h>
+#include <objbase.h>  // CoInitializeEx
 #include <windows.h>
 
 #include "audio_pipe.h"
@@ -292,6 +293,14 @@ private:
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
+    // VST3 GUI (IPlugView) は STA (Single-Threaded Apartment) で動かす必要がある。
+    // bridge の main thread で plugin の操作 (setFrame, attached 等) を呼ぶので
+    // ここで COM を STA 初期化する。これが無いとプラグイン GUI が真っ白でハング。
+    HRESULT co_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     miv::Bridge bridge;
-    return bridge.run();
+    int rc = bridge.run();
+    if (SUCCEEDED(co_hr)) {
+        CoUninitialize();
+    }
+    return rc;
 }

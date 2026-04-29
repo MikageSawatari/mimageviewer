@@ -157,6 +157,16 @@ thread_local! {
 }
 
 fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
+    // VST3 GUI は STA (Single-Threaded Apartment) を要求する。
+    // GUI スレッドで COM を STA 初期化しておかないとプラグイン GUI が
+    // 真っ白でハングするケースがある (Pro-Q 4 など)。
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    let co_hr = unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
+    };
+
     // GUI スレッドの per-thread state を初期化
     THREAD_STATE.with(|s| {
         *s.borrow_mut() = Some(Box::new(ThreadState {
@@ -211,6 +221,11 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
     close_window();
     // クラス解除はプロセス終了時に OS が片付けるので明示的には呼ばない
     // (UnregisterClassW の HINSTANCE 渡しが windows-rs のバージョン差で揺れるため)。
+    if co_hr.is_ok() {
+        unsafe {
+            CoUninitialize();
+        }
+    }
 }
 
 fn run_message_loop(cmd_rx: &Receiver<Cmd>) {

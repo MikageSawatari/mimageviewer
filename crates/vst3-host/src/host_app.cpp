@@ -49,6 +49,22 @@ tresult PLUGIN_API HostApplication::createInstance(TUID cid, TUID iid, void** ob
     return kResultFalse;
 }
 
+// IPlugFrame 最小実装
+IMPLEMENT_FUNKNOWN_METHODS(PlugFrame, Steinberg::IPlugFrame, Steinberg::IPlugFrame::iid)
+
+tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
+                                          Steinberg::ViewRect* newSize) {
+    // プラグインからリサイズ要求が来た。
+    // Phase 0b ではホストウィンドウサイズを変えないが、kResultOk を返さないと
+    // プラグインが「リサイズ拒否された」と判断して描画を保留することがある。
+    // VST3 仕様上は host がサイズ変更を実行してから view->onSize(newSize) を
+    // 呼び返すのが正しい。tester では view->onSize(newSize) だけ呼ぶ。
+    if (view && newSize) {
+        view->onSize(newSize);
+    }
+    return kResultOk;
+}
+
 // IComponentHandler 最小実装
 // POC では parameter 自動化のフィードバックは無視する (= no-op)。
 IMPLEMENT_FUNKNOWN_METHODS(ComponentHandler, Vst::IComponentHandler, Vst::IComponentHandler::iid)

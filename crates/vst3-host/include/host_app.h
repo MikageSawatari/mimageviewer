@@ -8,6 +8,7 @@
 
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
+#include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivsthostapplication.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 
@@ -25,6 +26,22 @@ public:
                                                   void** obj) override;
 
     // FUnknown
+    DECLARE_FUNKNOWN_METHODS
+};
+
+/// IPlugFrame の最小実装。
+/// プラグインから「このサイズに変更して」と要求が来たときに `kResultOk` を
+/// 返すだけのスタブ。実際にホストウィンドウのサイズを変えるには Rust 側に
+/// IPC で通知する必要があるが、Phase 0b では描画開始に必要な最小機能のみ。
+/// Pro-Q 4 など多くのプラグインは setFrame(frame) を呼ばないと描画を開始しない。
+class PlugFrame : public Steinberg::IPlugFrame {
+public:
+    PlugFrame() = default;
+    virtual ~PlugFrame() = default;
+
+    Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView* view,
+                                              Steinberg::ViewRect* newSize) override;
+
     DECLARE_FUNKNOWN_METHODS
 };
 

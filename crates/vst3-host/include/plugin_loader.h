@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
@@ -74,6 +75,7 @@ public:
 private:
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
+    Steinberg::IPtr<PlugFrame> plug_frame_;
 
     VST3::Hosting::Module::Ptr module_;
     Steinberg::IPtr<Steinberg::Vst::IComponent> component_;
