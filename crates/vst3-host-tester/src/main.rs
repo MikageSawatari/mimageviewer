@@ -593,6 +593,7 @@ impl eframe::App for TesterApp {
             ui.heading("Audio");
             {
                 let mut mode_val = *self.mode.lock().unwrap();
+                let prev_mode = mode_val;
                 ui.horizontal(|ui| {
                     ui.label("Mode:");
                     if ui
@@ -608,8 +609,12 @@ impl eframe::App for TesterApp {
                     );
                     if resp.clicked() && through_enabled {
                         *self.mode.lock().unwrap() = Mode::Through;
+                        mode_val = Mode::Through;
                     }
                 });
+                if prev_mode != mode_val {
+                    self.log(format!("mode changed: {:?} -> {:?}", prev_mode, mode_val));
+                }
             }
 
             ui.horizontal(|ui| {

@@ -27,11 +27,12 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SetWindowPos, ShowWindow, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, IDC_ARROW,
+    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow, SW_SHOW,
+    SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -307,14 +308,25 @@ fn create_window(
             });
         }
 
-        // クライアント領域 width x height になるよう外枠サイズを調整
+        // クライアント領域 width x height になるよう外枠サイズを調整。
+        // Per-Monitor v2 DPI 環境では AdjustWindowRectEx (= 96 DPI 想定) だと
+        // フレーム厚を過小評価し、結果クライアント領域が意図より狭くなる
+        // (プラグイン GUI の上下が見切れる原因)。AdjustWindowRectExForDpi で
+        // 実 DPI を渡して計算する。
         let mut rect = windows::Win32::Foundation::RECT {
             left: 0,
             top: 0,
             right: width as i32,
             bottom: height as i32,
         };
-        let _ = AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0));
+        let dpi = GetDpiForSystem();
+        let _ = AdjustWindowRectExForDpi(
+            &mut rect,
+            WS_OVERLAPPEDWINDOW,
+            false,
+            WINDOW_EX_STYLE(0),
+            dpi,
+        );
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
 
@@ -375,7 +387,14 @@ pub fn resize_window_client(hwnd_u64: u64, width: u32, height: u32) {
             right: width as i32,
             bottom: height as i32,
         };
-        let _ = AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0));
+        let dpi = GetDpiForSystem();
+        let _ = AdjustWindowRectExForDpi(
+            &mut rect,
+            WS_OVERLAPPEDWINDOW,
+            false,
+            WINDOW_EX_STYLE(0),
+            dpi,
+        );
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
         let hwnd = HWND(hwnd_u64 as *mut _);
