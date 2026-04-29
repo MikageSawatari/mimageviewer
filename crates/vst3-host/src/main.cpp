@@ -4,11 +4,29 @@
 // stdout で応答 / 通知を返す。音声バッファは shared memory + named events で受け渡す。
 //
 // プロトコル詳細は include/protocol.h 参照。
+//
+// ## スレッド構成
+//
+// - **main thread**: 起動後すぐ GUI thread に変身 (= 自分が GUI スレッドになる)。
+//   PeekMessage ループで Win32 メッセージを処理しつつ、コマンドキューを polling して
+//   GUI 関連の VST3 操作 (createView / attached / removed / onSize 等) を実行する。
+//   COM は STA (Single-Threaded Apartment) で初期化。
+// - **stdin pump thread**: 親プロセスからのコマンドを読んで、コマンドキューに投入する
+//   だけの専用スレッド。blocking read OK。
+// - **audio thread**: 音声処理ループ (既存)。
+//
+// プラグインの GUI 子ウィンドウは bridge プロセスのいずれかのスレッドで作られるが、
+// VST3 規約により attached を呼んだスレッド = main (GUI) thread で作成される。
+// 子ウィンドウのメッセージは作成スレッドにディスパッチされるので、main thread の
+// PeekMessage ループで処理される。これが無いと描画停止 (= 真っ白でハング)。
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -47,8 +65,16 @@ static bool read_message(std::string& out) {
     return true;
 }
 
+// stdout 書き込みは複数スレッド (main / audio thread) から呼ばれる可能性があるため
+// mutex で保護する。
+static std::mutex& stdout_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 // length-prefixed UTF-8 メッセージを書き出して flush する。
 static void write_message(const std::string& payload) {
+    std::lock_guard<std::mutex> lk(stdout_mutex());
     uint32_t len = static_cast<uint32_t>(payload.size());
     std::fwrite(&len, sizeof(len), 1, stdout);
     std::fwrite(payload.data(), 1, payload.size(), stdout);
@@ -95,21 +121,84 @@ public:
     int run() {
         setup_streams();
 
-        std::string msg;
-        while (read_message(msg)) {
-            if (!handle_message(msg)) {
-                // shutdown 命令 or 致命的エラー
-                break;
+        // VST3 GUI は STA を要求する。main thread (= GUI thread) で COM を初期化。
+        HRESULT co_hr = CoInitializeEx(nullptr,
+                                       COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+        // stdin pump を別スレッドに分離。読んだコマンドはキューに投入する。
+        running_ = true;
+        std::thread stdin_thread([this]() {
+            std::string msg;
+            while (read_message(msg)) {
+                {
+                    std::lock_guard<std::mutex> lk(cmd_mutex_);
+                    cmd_queue_.push_back(std::move(msg));
+                }
+                cmd_cv_.notify_all();
+                msg.clear();
             }
+            // EOF: 親が stdin を閉じた → graceful shutdown
+            {
+                std::lock_guard<std::mutex> lk(cmd_mutex_);
+                running_ = false;
+            }
+            cmd_cv_.notify_all();
+        });
+
+        // メインスレッド: メッセージポンプ + コマンド処理ループ
+        run_gui_loop();
+
+        if (audio_thread_.joinable()) {
+            audio_running_ = false;
+            audio_thread_.join();
         }
-        // 親が stdin を閉じたら graceful shutdown
+        if (stdin_thread.joinable()) {
+            // stdin はブロッキング read 中。fclose(stdin) で抜ける。
+            // ただしユーザー側 (Rust) が stdin を閉じれば自然に EOF が来るので
+            // 通常は join で待てる。安全のため数秒待ってデタッチでもよいが、
+            // 単純化のため join。
+            stdin_thread.detach();
+        }
+
         if (loader_) {
             loader_->unload();
+        }
+        if (SUCCEEDED(co_hr)) {
+            CoUninitialize();
         }
         return 0;
     }
 
 private:
+    // ── メインループ: メッセージポンプ + コマンドキュー処理 ──
+    void run_gui_loop() {
+        while (running_) {
+            // 1) Win32 メッセージを全消化
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                ::TranslateMessage(&msg);
+                ::DispatchMessageW(&msg);
+            }
+            // 2) コマンドキューを 1 件処理
+            std::string cmd_msg;
+            {
+                std::unique_lock<std::mutex> lk(cmd_mutex_);
+                if (cmd_queue_.empty()) {
+                    // メッセージが届いた瞬間に起こされるよう、PostThreadMessage を
+                    // 使った方が厳密だが、シンプルに 8ms 程度のタイムアウトで
+                    // PeekMessage と交互ポーリングする。
+                    cmd_cv_.wait_for(lk, std::chrono::milliseconds(8));
+                    continue;
+                }
+                cmd_msg = std::move(cmd_queue_.front());
+                cmd_queue_.pop_front();
+            }
+            if (!handle_message(cmd_msg)) {
+                running_ = false;
+            }
+        }
+    }
+
     // 単純な JSON 解析: { "cmd": "<value>", ... } から cmd を取り出す。
     // POC 用なので本格的な JSON パーサは入れない (将来 nlohmann/json 採用検討)。
     static std::string extract_string_field(const std::string& json, const std::string& key) {
@@ -144,7 +233,6 @@ private:
     bool handle_message(const std::string& msg) {
         std::string cmd = extract_string_field(msg, "cmd");
         if (cmd == "hello") {
-            // 親に ready を返す。shm 名は親が "open" 段階で渡してくる仕様。
             std::string reply = "{\"event\":\"ready\",\"version\":" +
                                 std::to_string(PROTOCOL_VERSION) + "}";
             write_message(reply);
@@ -163,7 +251,6 @@ private:
                 send_event_error("show_gui: no plugin loaded");
                 return true;
             }
-            // hwnd は u64 (= ポインタ値) で渡される
             uint64_t hwnd_u = extract_number_field(msg, "hwnd");
             if (hwnd_u == 0) {
                 send_event_error("show_gui: hwnd missing");
@@ -174,7 +261,6 @@ private:
                 send_event_error("show_gui: " + err);
                 return true;
             }
-            // 推奨サイズを通知
             uint32_t w = 0, h = 0;
             if (loader_->get_gui_size(w, h)) {
                 std::string reply = "{\"event\":\"gui_attached\",\"width\":" +
@@ -194,6 +280,8 @@ private:
         if (cmd == "close") {
             if (loader_) loader_->unload();
             loader_.reset();
+            audio_running_ = false;
+            if (audio_thread_.joinable()) audio_thread_.join();
             pipe_.detach();
             write_message("{\"event\":\"closed\"}");
             return true;
@@ -219,14 +307,12 @@ private:
             return true;
         }
 
-        // shared memory アタッチ
         std::string err;
         if (!pipe_.attach(shm_name, shm_size, sig_in_name, sig_out_name, err)) {
             send_event_error("attach failed: " + err);
             return true;
         }
 
-        // VST3 プラグインロード
         loader_ = std::make_unique<PluginLoader>();
         LoadedPluginInfo info;
         if (!loader_->load(plugin_path, sample_rate, block_size, info, err)) {
@@ -236,56 +322,55 @@ private:
             return true;
         }
 
-        // ロード成功通知
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
                             "\",\"latency_samples\":" +
                             std::to_string(info.latency_samples) + "}";
         write_message(reply);
 
-        // 音声処理スレッド開始
-        running_ = true;
+        audio_running_ = true;
         audio_thread_ = std::thread(&Bridge::audio_loop, this, block_size);
         return true;
     }
 
     void audio_loop(uint32_t block_size) {
-        // POC 用の最小ループ: 親 → in_ring → process → out_ring → 親
-        // チャンネル数は stereo 固定 (= 2)
         const uint32_t channels = 2;
         std::vector<float> input(block_size * channels);
         std::vector<float> output(block_size * channels);
 
-        while (running_) {
-            // 親がデータを書くまで待機 (timeout 付き、graceful shutdown 対応)
+        while (audio_running_) {
             if (!pipe_.read_in(input.data(),
                                 block_size * channels,
                                 100 /* ms */)) {
-                if (!running_) break;
-                continue;  // タイムアウトはノーマル (再生停止中等)
+                if (!audio_running_) break;
+                continue;
             }
-            // プラグインで処理
             if (loader_ && !loader_->process_block(input.data(), output.data(), block_size)) {
                 send_event_error("process_block failed");
-                running_ = false;
+                audio_running_ = false;
                 break;
             }
-            // 親に書き戻し
             if (!pipe_.write_out(output.data(),
                                   block_size * channels,
                                   100 /* ms */)) {
-                if (!running_) break;
+                if (!audio_running_) break;
                 continue;
             }
         }
     }
 
-    PluginLoader* loader_ptr() { return loader_.get(); }
-
     std::unique_ptr<PluginLoader> loader_;
     AudioPipe pipe_;
-    std::thread audio_thread_;
+
+    // GUI / コマンドキュー
+    std::mutex cmd_mutex_;
+    std::condition_variable cmd_cv_;
+    std::deque<std::string> cmd_queue_;
     std::atomic<bool> running_{false};
+
+    // audio
+    std::thread audio_thread_;
+    std::atomic<bool> audio_running_{false};
 };
 
 }  // namespace miv
@@ -293,14 +378,6 @@ private:
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
-    // VST3 GUI (IPlugView) は STA (Single-Threaded Apartment) で動かす必要がある。
-    // bridge の main thread で plugin の操作 (setFrame, attached 等) を呼ぶので
-    // ここで COM を STA 初期化する。これが無いとプラグイン GUI が真っ白でハング。
-    HRESULT co_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     miv::Bridge bridge;
-    int rc = bridge.run();
-    if (SUCCEEDED(co_hr)) {
-        CoUninitialize();
-    }
-    return rc;
+    return bridge.run();
 }
