@@ -1612,6 +1612,11 @@ pub struct App {
     /// 同左ジャンプパネル用。
     #[cfg(windows)]
     pub(crate) show_video_jump_panel_visible: bool,
+    /// 次の `open_fullscreen` を「グリッド (サムネ一覧) からのオープン」として扱う
+    /// フラグ (Phase 7.J)。`VideoAutoplayMode::OnlyFromGrid` のときに自動再生する
+    /// かどうかの判定に使う。`open_fullscreen` 経由で動画を実際に open するときに
+    /// `mem::take` で取り出して reset される (= 1 度だけ有効)。
+    pub(crate) fs_open_intent_from_grid: bool,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2414,6 +2419,7 @@ impl Default for App {
             show_video_metadata_panel_visible: false,
             #[cfg(windows)]
             show_video_jump_panel_visible: false,
+            fs_open_intent_from_grid: false,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
@@ -7113,7 +7119,9 @@ impl App {
                         | Some(GridItem::Video(_)) => {
                             // 動画も画像と同じくフルスクリーン化 → インライン再生。
                             // 外部プレイヤー起動はフルスクリーン中の Shift+Enter から。
+                            // Phase 7.J: Enter からの open はグリッド意図扱い。
                             self.bump_input_seq_for_item("grid_enter", idx);
+                            self.fs_open_intent_from_grid = true;
                             self.open_fullscreen(idx);
                         }
                         Some(GridItem::ConvertibleArchive { path, format }) => {
@@ -9463,7 +9471,23 @@ impl App {
                 // ミュートだけ切る (= 解除時に元の音量に戻る)。0.0 を渡してしまうと
                 // 「ミュート解除しても音が出ない」状態になり Codex に指摘された。
                 let vol = self.settings.video_volume;
-                let autoplay = self.settings.video_autoplay;
+                // Phase 7.J: 自動再生 3 モード化 (Off / OnlyFromGrid / Always)。
+                // migration: 旧 video_autoplay=true で video_autoplay_mode が
+                // デフォルト (= Off、つまり明示的に保存していない) なら Always に
+                // bridge する (= 旧設定からのアップグレードで挙動が突然変わらない)。
+                let mode = if self.settings.video_autoplay
+                    && self.settings.video_autoplay_mode == crate::settings::VideoAutoplayMode::Off
+                {
+                    crate::settings::VideoAutoplayMode::Always
+                } else {
+                    self.settings.video_autoplay_mode
+                };
+                let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
+                let autoplay = match mode {
+                    crate::settings::VideoAutoplayMode::Always => true,
+                    crate::settings::VideoAutoplayMode::OnlyFromGrid => from_grid,
+                    crate::settings::VideoAutoplayMode::Off => false,
+                };
                 // resume 位置の取得: 直近に保存した位置を渡して最初の info 受領後に
                 // 自動シークさせる。Windows の case-insensitive パスを揃えるため
                 // adjustment_db::normalize_path に合わせる。

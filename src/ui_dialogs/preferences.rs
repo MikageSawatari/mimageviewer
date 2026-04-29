@@ -1371,10 +1371,22 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.label(egui::RichText::new("再生").strong());
     ui.add_space(4.0);
-    ui.checkbox(&mut s.video_autoplay, "フルスクリーン化と同時に自動再生")
-        .on_hover_text(
-            "OFF (既定) にすると最初のフレームで停止表示になり、Enter で再生開始。",
-        );
+    // Phase 7.J: 自動再生 3 モード (Off / OnlyFromGrid / Always)。
+    // 旧 video_autoplay (bool) も内部で migration 用に保持。
+    ui.label("自動再生:");
+    use crate::settings::VideoAutoplayMode;
+    for &mode in VideoAutoplayMode::all() {
+        if ui
+            .radio_value(&mut s.video_autoplay_mode, mode, mode.label())
+            .changed()
+        {
+            // 旧 bool 設定は新モードと矛盾しないように同期しておく
+            // (例: ユーザーが新 UI で Always を選んだら video_autoplay=true、それ以外は
+            // false。古いコードを誤読したときの不整合を防ぐ)。
+            s.video_autoplay = matches!(mode, VideoAutoplayMode::Always);
+        }
+    }
+    ui.add_space(4.0);
     ui.checkbox(&mut s.video_loop, "終端まで再生したら最初から繰り返す");
     ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");
 

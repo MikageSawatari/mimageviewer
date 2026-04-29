@@ -807,11 +807,15 @@ pub struct Settings {
     /// 動画再生時の既定音量 (0.0-1.0)。
     #[serde(default = "default_video_volume")]
     pub video_volume: f64,
-    /// フルスクリーン化時に自動再生を開始するか。OFF なら最初のフレームで停止表示。
-    /// デフォルトは false (= 一時停止状態で開く)。Phase 5.1 で既定挙動を変更。
-    /// 既存ユーザーの設定値はそのまま保持される (serde でフィールドが書き込み済のため)。
+    /// フルスクリーン化時に自動再生を開始するか (旧: bool)。
+    /// Phase 7.J で 3 モード (Off / OnlyFromGrid / Always) に拡張。新フィールド
+    /// `video_autoplay_mode` を見るのが推奨。本フィールドは migration 用に残す:
+    /// `video_autoplay_mode` がデフォルト値 (= 未保存) のときだけ参照される。
     #[serde(default)]
     pub video_autoplay: bool,
+    /// 動画フルスクリーン時の自動再生ポリシー (Phase 7.J)。
+    #[serde(default)]
+    pub video_autoplay_mode: VideoAutoplayMode,
     /// 終端到達時に先頭から再生を繰り返すか。
     #[serde(default)]
     pub video_loop: bool,
@@ -846,6 +850,33 @@ pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[6, 10, 16, 20, 26, 30];
 
 fn default_video_tile_columns() -> usize {
     10
+}
+
+/// 動画フルスクリーン時の自動再生ポリシー (Phase 7.J)。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoAutoplayMode {
+    /// 開いた瞬間は常に一時停止状態 (= 旧 video_autoplay=false 相当)。
+    #[default]
+    Off,
+    /// サムネイル一覧 (グリッド) から開いたときだけ自動再生する。
+    /// フルスクリーン中の ↑↓ / ホイール等での切替時は一時停止のまま
+    /// (= 動画と認識せずにファイル送りした場合に備え)。
+    OnlyFromGrid,
+    /// 常に自動再生 (= 旧 video_autoplay=true 相当)。
+    Always,
+}
+
+impl VideoAutoplayMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "動画は自動再生しない",
+            Self::OnlyFromGrid => "サムネイル一覧から開いたときだけ自動再生する",
+            Self::Always => "常に自動再生する",
+        }
+    }
+    pub fn all() -> &'static [Self] {
+        &[Self::Off, Self::OnlyFromGrid, Self::Always]
+    }
 }
 
 fn default_video_volume() -> f64 {
@@ -1062,6 +1093,7 @@ impl Default for Settings {
             update_check_dismissed_version: None,
             video_volume: default_video_volume(),
             video_autoplay: false,
+            video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
