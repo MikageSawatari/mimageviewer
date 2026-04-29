@@ -71,6 +71,12 @@ pub enum Cmd {
     Reset,
     Close,
     Shutdown,
+    /// プラグイン GUI を指定 HWND にアタッチする。
+    #[serde(rename = "show_gui")]
+    ShowGui { hwnd: u64 },
+    /// プラグイン GUI を外す。HWND の破棄は host 側の責務。
+    #[serde(rename = "hide_gui")]
+    HideGui,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -86,6 +92,8 @@ pub enum Event {
     ResetDone,
     Closed,
     Error { detail: String },
+    GuiAttached { width: u32, height: u32 },
+    GuiDetached,
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。

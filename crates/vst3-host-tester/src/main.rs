@@ -16,6 +16,8 @@
 
 mod audio;
 mod bridge;
+#[cfg(windows)]
+mod plugin_gui;
 mod scanner;
 
 use std::sync::{Arc, Mutex};
@@ -59,6 +61,14 @@ struct TesterApp {
     last_latency: Option<u32>,
     bridge_exe_path: std::path::PathBuf,
 
+    // GUI 表示まわり
+    #[cfg(windows)]
+    gui_host: plugin_gui::GuiHost,
+    /// 現在表示中のプラグイン GUI ウィンドウの HWND (u64 化)。0 = 表示なし。
+    gui_hwnd: u64,
+    /// GUI ウィンドウの × クリックを GUI スレッドから受け取る側。Some の時のみ表示中。
+    gui_close_signal: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+
     // log buffer for the bottom panel
     log_lines: Arc<Mutex<Vec<String>>>,
 }
@@ -89,6 +99,10 @@ impl TesterApp {
             last_latency: None,
             bridge_exe_path,
             log_lines: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(windows)]
+            gui_host: plugin_gui::GuiHost::spawn(),
+            gui_hwnd: 0,
+            gui_close_signal: None,
         };
         app.scan();
         app.start_audio();
@@ -213,7 +227,106 @@ impl TesterApp {
         }
     }
 
+    #[cfg(windows)]
+    fn show_gui(&mut self) {
+        if self.bridge.is_none() {
+            self.log("show_gui: no plugin loaded");
+            return;
+        }
+        if self.gui_hwnd != 0 {
+            self.log("show_gui: GUI already shown");
+            return;
+        }
+        // 仮サイズで開く (実サイズは bridge から gui_attached イベントで返ってくる)。
+        // Pro-Q 4 など多くのプラグインは内部 paint 時に正しいサイズに上書きされる。
+        let title = self
+            .last_loaded_name
+            .as_deref()
+            .unwrap_or("VST3 Plugin")
+            .to_string();
+        let reply = match self.gui_host.show(&title, 800, 500) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log(format!("create gui window: {e}"));
+                return;
+            }
+        };
+        if reply.hwnd_u64 == 0 {
+            self.log("create gui window: HWND not returned");
+            return;
+        }
+        self.gui_hwnd = reply.hwnd_u64;
+        self.gui_close_signal = Some(reply.close_signal);
+
+        // bridge に attach 命令
+        let bridge = self.bridge.as_ref().unwrap().clone();
+        if let Err(e) = bridge.send(&Cmd::ShowGui {
+            hwnd: self.gui_hwnd,
+        }) {
+            self.log(format!("send ShowGui: {e}"));
+            self.close_gui();
+            return;
+        }
+        match bridge.recv() {
+            Ok(Event::GuiAttached { width, height }) => {
+                self.log(format!("gui attached: {}x{}", width, height));
+                if width > 0 && height > 0 {
+                    plugin_gui::resize_window_client(self.gui_hwnd, width, height);
+                }
+            }
+            Ok(Event::Error { detail }) => {
+                self.log(format!("gui attach error: {detail}"));
+                self.close_gui();
+            }
+            Ok(other) => {
+                self.log(format!("unexpected event after ShowGui: {other:?}"));
+            }
+            Err(e) => {
+                self.log(format!("recv after ShowGui: {e}"));
+                self.close_gui();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn close_gui(&mut self) {
+        if self.gui_hwnd == 0 {
+            return;
+        }
+        // bridge にデタッチ命令を先に送る (順序逆だと crash することがある)
+        if let Some(br) = self.bridge.as_ref() {
+            let _ = br.send(&Cmd::HideGui);
+            // 応答 (gui_detached) は best-effort で待つが、blocking しない。
+            // 短い timeout が無いので skip。
+        }
+        self.gui_host.close();
+        self.gui_hwnd = 0;
+        self.gui_close_signal = None;
+        self.log("gui closed");
+    }
+
+    /// GUI ウィンドウからの × クリックを polling して、来てたら close_gui する。
+    #[cfg(windows)]
+    fn poll_gui_close(&mut self) {
+        let should_close = {
+            let Some(arc) = self.gui_close_signal.as_ref() else {
+                return;
+            };
+            let guard = arc.lock().unwrap();
+            let Some(rx) = guard.as_ref() else {
+                return;
+            };
+            matches!(rx.try_recv(), Ok(()))
+        };
+        if should_close {
+            self.close_gui();
+        }
+    }
+
     fn unload(&mut self) {
+        // GUI が出ていれば先に閉じる (bridge より先)
+        #[cfg(windows)]
+        self.close_gui();
         // audio engine を先に止めて bridge への参照を 1 つに減らす
         self.audio = None;
         if let Some(br) = self.bridge.take() {
@@ -324,6 +437,23 @@ impl eframe::App for TesterApp {
                 {
                     self.unload();
                 }
+                #[cfg(windows)]
+                {
+                    let show_gui_enabled = self.bridge.is_some() && self.gui_hwnd == 0;
+                    if ui
+                        .add_enabled(show_gui_enabled, egui::Button::new("Show GUI"))
+                        .clicked()
+                    {
+                        self.show_gui();
+                    }
+                    let close_gui_enabled = self.gui_hwnd != 0;
+                    if ui
+                        .add_enabled(close_gui_enabled, egui::Button::new("Close GUI"))
+                        .clicked()
+                    {
+                        self.close_gui();
+                    }
+                }
             });
             ui.separator();
             if let Some(name) = &self.last_loaded_name {
@@ -396,6 +526,10 @@ impl eframe::App for TesterApp {
                     }
                 });
         });
+
+        // GUI ウィンドウの × クリックを拾う
+        #[cfg(windows)]
+        self.poll_gui_close();
 
         // bridge から非同期に来るイベント (latency_changed 等) のポーリングは
         // Phase 0b 後段で追加する。現状は load 時の同期 recv のみ。

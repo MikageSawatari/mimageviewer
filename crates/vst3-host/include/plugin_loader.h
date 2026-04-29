@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -57,6 +58,19 @@ public:
     // 現在のプラグイン latency (= IAudioProcessor::getLatencySamples())。
     uint32_t latency_samples() const { return cached_latency_samples_; }
 
+    // ── GUI (IPlugView) 制御 ──
+    //
+    // VST3 ではプラグインの GUI は別オブジェクト (`IPlugView`) として提供され、
+    // ホストが用意した親 HWND に `attached()` で取り付ける。
+    // tester では Win32 で空ウィンドウを 1 つ作り、その HWND を渡す方式。
+
+    /// プラグインの推奨 GUI サイズを取得する。返り値 false = エディター無し。
+    bool get_gui_size(uint32_t& width_out, uint32_t& height_out);
+    /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
+    bool show_gui(void* hwnd, std::string& error_out);
+    /// GUI を外す。HWND 自体は呼び出し側が破棄する。
+    void hide_gui();
+
 private:
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
@@ -65,6 +79,8 @@ private:
     Steinberg::IPtr<Steinberg::Vst::IComponent> component_;
     Steinberg::IPtr<Steinberg::Vst::IAudioProcessor> processor_;
     Steinberg::IPtr<Steinberg::Vst::IEditController> controller_;
+    Steinberg::IPtr<Steinberg::IPlugView> view_;
+    bool view_attached_ = false;
 
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;

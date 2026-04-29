@@ -197,6 +197,65 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
     return true;
 }
 
+bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
+    if (!controller_) return false;
+    // view_ が無ければ一時的に作って size だけ取って捨てるのが行儀よい。
+    Steinberg::IPtr<Steinberg::IPlugView> v = view_;
+    if (!v) {
+        v = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
+        if (!v) return false;
+    }
+    Steinberg::ViewRect rect{};
+    if (v->getSize(&rect) != Steinberg::kResultOk) {
+        return false;
+    }
+    int32_t w = rect.right - rect.left;
+    int32_t h = rect.bottom - rect.top;
+    if (w <= 0 || h <= 0) return false;
+    width_out = static_cast<uint32_t>(w);
+    height_out = static_cast<uint32_t>(h);
+    return true;
+}
+
+bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
+    if (!controller_) {
+        error_out = "controller not available";
+        return false;
+    }
+    if (view_attached_) {
+        // すでにアタッチ済みなら一度外して付け直す
+        hide_gui();
+    }
+    if (!view_) {
+        view_ = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
+        if (!view_) {
+            error_out = "createView returned null (no editor)";
+            return false;
+        }
+    }
+    // VST3 の HWND タイプは "HWND" 文字列で指定 (kPlatformTypeHWND)
+    if (view_->isPlatformTypeSupported(Steinberg::kPlatformTypeHWND) != Steinberg::kResultTrue) {
+        error_out = "plugin view does not support HWND platform";
+        view_ = nullptr;
+        return false;
+    }
+    if (view_->attached(hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
+        error_out = "attached() failed";
+        view_ = nullptr;
+        return false;
+    }
+    view_attached_ = true;
+    return true;
+}
+
+void PluginLoader::hide_gui() {
+    if (view_attached_ && view_) {
+        view_->removed();
+    }
+    view_attached_ = false;
+    view_ = nullptr;
+}
+
 void PluginLoader::reset() {
     if (!processor_) return;
     // VST3 標準: setProcessing(false) → setProcessing(true) でフィルタ履歴 flush
@@ -205,6 +264,8 @@ void PluginLoader::reset() {
 }
 
 void PluginLoader::unload() {
+    // GUI が出ていれば先に外す (順序逆だとプラグインが crash することがある)
+    hide_gui();
     if (active_ && processor_) {
         processor_->setProcessing(false);
     }

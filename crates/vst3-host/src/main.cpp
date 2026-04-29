@@ -157,6 +157,39 @@ private:
             write_message("{\"event\":\"reset_done\"}");
             return true;
         }
+        if (cmd == "show_gui") {
+            if (!loader_) {
+                send_event_error("show_gui: no plugin loaded");
+                return true;
+            }
+            // hwnd は u64 (= ポインタ値) で渡される
+            uint64_t hwnd_u = extract_number_field(msg, "hwnd");
+            if (hwnd_u == 0) {
+                send_event_error("show_gui: hwnd missing");
+                return true;
+            }
+            std::string err;
+            if (!loader_->show_gui(reinterpret_cast<void*>(hwnd_u), err)) {
+                send_event_error("show_gui: " + err);
+                return true;
+            }
+            // 推奨サイズを通知
+            uint32_t w = 0, h = 0;
+            if (loader_->get_gui_size(w, h)) {
+                std::string reply = "{\"event\":\"gui_attached\",\"width\":" +
+                                    std::to_string(w) + ",\"height\":" +
+                                    std::to_string(h) + "}";
+                write_message(reply);
+            } else {
+                write_message("{\"event\":\"gui_attached\",\"width\":0,\"height\":0}");
+            }
+            return true;
+        }
+        if (cmd == "hide_gui") {
+            if (loader_) loader_->hide_gui();
+            write_message("{\"event\":\"gui_detached\"}");
+            return true;
+        }
         if (cmd == "close") {
             if (loader_) loader_->unload();
             loader_.reset();
