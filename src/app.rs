@@ -1625,6 +1625,14 @@ pub struct App {
     /// ピン操作後にジャンプパネルへ短時間表示する状態テキスト (Phase 8.B'-2)。
     /// `(message, until)` で `Instant::now() < until` の間だけ表示。
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
+    /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
+    pub(crate) video_perf_overlay_visible: bool,
+    /// 直近 N フレームの間隔 (ms)。新フレームが届いた wall 時刻と GPU handle 変化で検知。
+    pub(crate) video_perf_history: std::collections::VecDeque<f32>,
+    /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
+    pub(crate) video_perf_last_wall: Option<std::time::Instant>,
+    /// 前回サンプリング時の GPU 共有 handle (= 新フレーム検知用)。
+    pub(crate) video_perf_last_handle: Option<isize>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2430,6 +2438,10 @@ impl Default for App {
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
             video_pin_status: None,
+            video_perf_overlay_visible: false,
+            video_perf_history: std::collections::VecDeque::with_capacity(200),
+            video_perf_last_wall: None,
+            video_perf_last_handle: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

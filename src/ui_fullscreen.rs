@@ -946,6 +946,10 @@ impl App {
                         if state.is_video {
                             self.draw_video_hud(ui, ctx, full_rect, fs_idx);
                             self.draw_video_paused_hint(ui, full_rect, fs_idx);
+                            self.sample_video_perf(fs_idx);
+                            if self.video_perf_overlay_visible {
+                                self.draw_video_perf_overlay(ui, full_rect);
+                            }
                         }
 
                         // ── チェックマーク ──
@@ -4961,6 +4965,11 @@ impl App {
         let tile_key = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::S)
         });
+        // Phase 8.I: P キーでフレームレート オーバーレイのトグル (動画モード限定)。
+        // 画像モードの P (post-filter) とは handle_video_input 先行 consume で分離。
+        let perf_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::P)
+        });
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
@@ -5041,6 +5050,13 @@ impl App {
             let screen = ctx.content_rect().size();
             self.toggle_video_tile_mode(fs_idx, screen);
         }
+        if perf_key {
+            self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+            // 切替時に履歴を一旦クリア (= ON 直後は素のグラフから始まる)。
+            self.video_perf_history.clear();
+            self.video_perf_last_wall = None;
+            self.video_perf_last_handle = None;
+        }
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
         // (handle_image_keys 後段) の通常 ESC で扱う。
         if escape_for_tile {
@@ -5079,6 +5095,166 @@ impl App {
                             .unwrap_or("?")
                     ));
                 }
+            }
+        }
+    }
+
+    /// 動画 GPU フレーム handle の変化を検出して frame interval (ms) を履歴に記録する。
+    /// オーバーレイ表示の有無に関わらず軽量にサンプリング (= 切替直後でも素直に出る)。
+    /// CPU 経路では handle が無く検出できないため履歴は空のまま (= 描画側でガード)。
+    pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
+        #[cfg(windows)]
+        {
+            let cur_handle: Option<isize> = match self.fs_cache.get(&fs_idx) {
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                    player.gpu_latest().map(|f| f.shared_handle.0 as isize)
+                }
+                _ => None,
+            };
+            if cur_handle != self.video_perf_last_handle {
+                let now = std::time::Instant::now();
+                if let Some(prev) = self.video_perf_last_wall {
+                    let interval_ms =
+                        now.saturating_duration_since(prev).as_secs_f32() * 1000.0;
+                    self.video_perf_history.push_back(interval_ms);
+                    while self.video_perf_history.len() > 200 {
+                        self.video_perf_history.pop_front();
+                    }
+                }
+                self.video_perf_last_wall = Some(now);
+                self.video_perf_last_handle = cur_handle;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = fs_idx;
+        }
+    }
+
+    /// FPS / フレーム間隔のオーバーレイ。直近 200 frame の interval (ms) を折れ線で、
+    /// 50ms 超のフレームを赤縦線で目立たせる。左上半透明。
+    pub(crate) fn draw_video_perf_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+    ) {
+        let painter = ui.painter().clone();
+        const W: f32 = 280.0;
+        const H: f32 = 90.0;
+        const Y_MAX_MS: f32 = 66.0; // 30fps 基準の 2x まで縦に取る
+        const HITCH_MS: f32 = 50.0; // 赤縦線で強調する閾値
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(full_rect.min.x + 8.0, full_rect.min.y + 8.0),
+            egui::vec2(W, H),
+        );
+        painter.rect_filled(
+            rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 170),
+        );
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(140)),
+            egui::StrokeKind::Inside,
+        );
+
+        // ヘッダ統計
+        let n = self.video_perf_history.len();
+        if n == 0 {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Perf: collecting…",
+                egui::FontId::proportional(12.0),
+                egui::Color32::WHITE,
+            );
+            return;
+        }
+        let avg: f32 = self.video_perf_history.iter().sum::<f32>() / n as f32;
+        let max: f32 = self
+            .video_perf_history
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
+        let hitches = self
+            .video_perf_history
+            .iter()
+            .filter(|&&v| v > HITCH_MS)
+            .count();
+        let header = format!(
+            "Frame avg {:.1}ms  ({:.1}fps)   max {:.1}ms   hitches>{:.0}ms: {}",
+            avg,
+            if avg > 0.0 { 1000.0 / avg } else { 0.0 },
+            HITCH_MS,
+            max,
+            hitches
+        );
+        painter.text(
+            egui::pos2(rect.min.x + 6.0, rect.min.y + 4.0),
+            egui::Align2::LEFT_TOP,
+            header,
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+
+        // グラフ領域
+        let graph = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 6.0, rect.min.y + 22.0),
+            egui::pos2(rect.max.x - 6.0, rect.max.y - 14.0),
+        );
+        // 33.3ms (= 30fps) のガイドライン
+        let y_for = |ms: f32| -> f32 {
+            graph.max.y - (ms.clamp(0.0, Y_MAX_MS) / Y_MAX_MS) * graph.height()
+        };
+        for &(ms, label, color) in &[
+            (16.7_f32, "16.7", egui::Color32::from_rgb(80, 200, 120)),
+            (33.3_f32, "33.3", egui::Color32::from_rgb(200, 200, 80)),
+            (HITCH_MS, "50.0", egui::Color32::from_rgb(220, 100, 100)),
+        ] {
+            let y = y_for(ms);
+            painter.line_segment(
+                [
+                    egui::pos2(graph.min.x, y),
+                    egui::pos2(graph.max.x, y),
+                ],
+                egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 140)),
+            );
+            painter.text(
+                egui::pos2(graph.max.x - 2.0, y - 1.0),
+                egui::Align2::RIGHT_BOTTOM,
+                label,
+                egui::FontId::proportional(9.0),
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 200),
+            );
+        }
+        // ヒッチ赤縦線 (折れ線描画前に下層に置く)
+        let dx = if n > 1 { graph.width() / (n - 1) as f32 } else { 0.0 };
+        for (i, &v) in self.video_perf_history.iter().enumerate() {
+            if v > HITCH_MS {
+                let x = graph.min.x + dx * i as f32;
+                painter.line_segment(
+                    [
+                        egui::pos2(x, graph.min.y),
+                        egui::pos2(x, graph.max.y),
+                    ],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180),
+                    ),
+                );
+            }
+        }
+        // 折れ線
+        if n > 1 {
+            let mut prev = egui::pos2(graph.min.x, y_for(self.video_perf_history[0]));
+            for (i, &v) in self.video_perf_history.iter().enumerate().skip(1) {
+                let p = egui::pos2(graph.min.x + dx * i as f32, y_for(v));
+                painter.line_segment(
+                    [prev, p],
+                    egui::Stroke::new(1.2, egui::Color32::from_rgb(180, 230, 255)),
+                );
+                prev = p;
             }
         }
     }
@@ -5457,23 +5633,26 @@ impl App {
                 const GAP_THUMB_TO_HUD: f32 = 8.0;
                 const GAP_THUMB_TO_LABEL: f32 = 4.0;
                 const LABEL_PAD: f32 = 4.0;
-                // サムネ既定サイズ (= ロード前後で位置・寸法を一定に保つ)。動画の
-                // aspect が既知ならそれを使い、不明なら 16:9 で代替。
-                const PLACEHOLDER_W: f32 = 200.0;
-                let aspect = self
+                // サムネ既定サイズ (= ロード前後で位置・寸法を一致させる)。
+                // ワーカーは THUMB_W x THUMB_H 上限で aspect-fit するので同じ計算を
+                // ここでも行い、ロード後のサムネと完全に同じ寸法でプレースホルダを
+                // 出す (= ちらつき防止)。動画 info が無い場合は 16:9 で代替。
+                let (src_w, src_h) = self
                     .fs_video_player(fs_idx)
                     .and_then(|p| p.info())
-                    .map(|i| {
-                        if i.height > 0 {
-                            i.width as f32 / i.height as f32
-                        } else {
-                            16.0 / 9.0
-                        }
-                    })
-                    .unwrap_or(16.0 / 9.0);
+                    .map(|i| (i.width.max(1), i.height.max(1)))
+                    .unwrap_or((1280, 720));
+                let (placeholder_w, placeholder_h) = {
+                    let max_w = crate::video::thumbnail::THUMB_W as f64;
+                    let max_h = crate::video::thumbnail::THUMB_H as f64;
+                    let scale = (max_w / src_w as f64).min(max_h / src_h as f64);
+                    let w = ((src_w as f64 * scale).round() as f32).max(1.0);
+                    let h = ((src_h as f64 * scale).round() as f32).max(1.0);
+                    (w, h)
+                };
                 let (thumb_w, thumb_h) = match thumb_opt.as_ref() {
                     Some(t) => (t.width as f32, t.height as f32),
-                    None => (PLACEHOLDER_W, (PLACEHOLDER_W / aspect).round()),
+                    None => (placeholder_w, placeholder_h),
                 };
                 let thumb_x = (x - thumb_w / 2.0)
                     .clamp(full_rect.min.x + 4.0, full_rect.max.x - thumb_w - 4.0);
