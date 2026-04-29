@@ -85,6 +85,24 @@ pub struct VideoInfo {
     /// GPU 経路 (D3D11 video processor blit) が利用可能か。
     /// 第 1 フレーム到着時に確定。`false` の間は CPU readback 経路。
     pub gpu_path_active: bool,
+    /// 動画ファイルに埋め込まれた標準メタデータ (Phase 5.4)。
+    /// FFmpeg avformat が解釈できる形式 (Matroska tags / MP4 udta / ffmetadata) を
+    /// 想定。値が無いキーは None。
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub description: Option<String>,
+    /// 埋め込みチャプター (Phase 5.4)。`AVChapter*` 配列を時間秒単位で 1 度だけ
+    /// 抽出して保持する。空配列ならチャプターは無し。
+    pub chapters: Vec<Chapter>,
+}
+
+/// 埋め込みチャプター 1 件分。`AVChapter` の `start`/`end` を `time_base` で秒に
+/// 変換済の値を持つ。
+#[derive(Clone, Debug)]
+pub struct Chapter {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub title: Option<String>,
 }
 
 pub struct DecodeHandles {
@@ -381,6 +399,46 @@ fn run_decoder(
     let gpu_path_active = gpu_video_device.is_some();
     #[cfg(not(windows))]
     let gpu_path_active = false;
+
+    // ── 埋め込みメタデータ + チャプター (Phase 5.4) ──
+    // 標準キーを拾う。Matroska / MP4 / ffmetadata で共通する小文字キー名を探し、
+    // 大文字違いも順に試す。値が空なら None。
+    let title = read_metadata_value(&input, &["title", "TITLE"]);
+    let artist = read_metadata_value(&input, &["artist", "ARTIST", "author"]);
+    let description = read_metadata_value(
+        &input,
+        &["description", "DESCRIPTION", "comment", "COMMENT"],
+    );
+    let chapters: Vec<Chapter> = input
+        .chapters()
+        .map(|c| {
+            // chapter time は AVChapter::time_base 単位の整数で、秒換算は
+            // start * (num/den)。time_base が 0/0 なら 0.0 にフォールバック。
+            let tb = c.time_base();
+            let tb_num = tb.numerator() as f64;
+            let tb_den = tb.denominator() as f64;
+            let to_secs = |t: i64| -> f64 {
+                if tb_den > 0.0 {
+                    t as f64 * tb_num / tb_den
+                } else {
+                    0.0
+                }
+            };
+            let title = {
+                let md = c.metadata();
+                md.get("title")
+                    .or_else(|| md.get("TITLE"))
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            };
+            Chapter {
+                start_secs: to_secs(c.start()),
+                end_secs: to_secs(c.end()),
+                title,
+            }
+        })
+        .collect();
+
     let info = VideoInfo {
         width: src_w,
         height: src_h,
@@ -390,6 +448,10 @@ fn run_decoder(
         has_audio,
         hw_decode_active: hw_active_initially,
         gpu_path_active,
+        title,
+        artist,
+        description,
+        chapters,
     };
     let _ = info_tx.send(Ok(info));
 
@@ -1197,6 +1259,23 @@ fn duration_to_secs(dur: i64) -> f64 {
         return 0.0;
     }
     dur as f64 / 1_000_000.0
+}
+
+/// AVFormatContext のグローバル metadata から、与えられたキー候補を順番に試して
+/// 最初に値が取れたもの (空文字でない) を返す。Phase 5.4 の埋め込みメタ抽出用。
+fn read_metadata_value(
+    input: &ffmpeg_the_third::format::context::Input,
+    keys: &[&str],
+) -> Option<String> {
+    let dict = input.metadata();
+    for k in keys {
+        if let Some(v) = dict.get(k) {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// AV_PIX_FMT_D3D11 の AVFrame を mIV 側 D3D11 デバイス上で NV12→RGBA blit して
