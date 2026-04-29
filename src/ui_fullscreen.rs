@@ -841,7 +841,9 @@ impl App {
                         // 分析モードは画像エリアを左側に制限する（右パネルと重ならないよう）。
                         // 補正モードは左パネルを画像の上にオーバーレイする（画像位置は移動しない）。
                         let analysis_active = self.analysis_mode && !is_spread_double;
-                        let adjustment_active = self.adjustment_mode && !is_spread_double;
+                        // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
+                        // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
+                        let adjustment_active = self.adjustment_mode;
                         let image_rect = if analysis_active {
                             analysis_image_rect(full_rect)
                         } else {
@@ -1111,6 +1113,7 @@ impl App {
                             if self.spread_mode.is_spread() && self.analysis_mode {
                                 self.reset_analysis_mode();
                             }
+                            self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                             self.normalize_spread_position();
                         }
                     });
@@ -1710,6 +1713,7 @@ impl App {
             if mode != self.spread_mode {
                 self.spread_mode = mode;
                 self.spread_popup_open = false;
+                self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                 // DB に保存
                 if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                     let _ = db.set(folder, mode, self.settings.default_spread_mode);
@@ -3016,28 +3020,23 @@ impl App {
             } else {
                 None
             };
-            Self::draw_fs_spread_page(
-                &painter,
-                left_rect,
-                left_idx,
-                left_rot,
-                &self.fs_cache,
-                &self.thumbnails,
-                &bg_style,
-                &left_location,
-                holdover_for_locked,
-            );
-            Self::draw_fs_spread_page(
-                &painter,
-                right_rect,
-                right_idx,
-                right_rot,
-                &self.fs_cache,
-                &self.thumbnails,
-                &bg_style,
-                &right_location,
-                holdover_for_locked,
-            );
+            for (rect, idx, rot, location) in [
+                (left_rect, left_idx, left_rot, &left_location),
+                (right_rect, right_idx, right_rot, &right_location),
+            ] {
+                Self::draw_fs_spread_page(
+                    &painter,
+                    rect,
+                    idx,
+                    rot,
+                    &self.adjustment_cache,
+                    &self.fs_cache,
+                    &self.thumbnails,
+                    &bg_style,
+                    location,
+                    holdover_for_locked,
+                );
+            }
 
             // ルーペが参照するレイアウトを記録 (両ページのサイズが既知のときのみ信頼できる)
             self.fs_spread_layout = Some(FsSpreadLayout {
@@ -3072,28 +3071,23 @@ impl App {
             } else {
                 None
             };
-            Self::draw_fs_spread_page(
-                &painter,
-                left_rect,
-                left_idx,
-                left_rot,
-                &self.fs_cache,
-                &self.thumbnails,
-                &bg_style,
-                &left_location,
-                holdover_for_locked,
-            );
-            Self::draw_fs_spread_page(
-                &painter,
-                right_rect,
-                right_idx,
-                right_rot,
-                &self.fs_cache,
-                &self.thumbnails,
-                &bg_style,
-                &right_location,
-                holdover_for_locked,
-            );
+            for (rect, idx, rot, location) in [
+                (left_rect, left_idx, left_rot, &left_location),
+                (right_rect, right_idx, right_rot, &right_location),
+            ] {
+                Self::draw_fs_spread_page(
+                    &painter,
+                    rect,
+                    idx,
+                    rot,
+                    &self.adjustment_cache,
+                    &self.fs_cache,
+                    &self.thumbnails,
+                    &bg_style,
+                    location,
+                    holdover_for_locked,
+                );
+            }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
             self.fs_spread_layout = None;
@@ -3134,27 +3128,32 @@ impl App {
     /// 見開きモードの1ページ分を指定領域に描画。
     /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
     /// `location_display` は draw_fs_image と同じで、空なら読込中ラベル描画をスキップ。
+    /// テクスチャ優先順位は adjustment_cache → fs_cache → thumbnail → holdover。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         painter: &egui::Painter,
         rect: egui::Rect,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
+        adjustment_cache: &std::collections::HashMap<usize, FsCacheEntry>,
         fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
         thumbnails: &[ThumbnailState],
         bg_style: &FsBgStyle<'_>,
         location_display: &str,
         holdover_tex: Option<&egui::TextureHandle>,
     ) {
-        // テクスチャ取得（フルサイズ or サムネイル → ロック中なら最後に holdover）
-        let tex = match fs_cache.get(&idx) {
+        // テクスチャ取得（補正済 or フルサイズ or サムネイル → ロック中なら最後に holdover）
+        let tex = match adjustment_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-            Some(FsCacheEntry::Animated {
-                frames,
-                current_frame,
-                ..
-            }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-            _ => None,
+            _ => match fs_cache.get(&idx) {
+                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                Some(FsCacheEntry::Animated {
+                    frames,
+                    current_frame,
+                    ..
+                }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+                _ => None,
+            },
         };
         let thumb_tex = match thumbnails.get(idx) {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
