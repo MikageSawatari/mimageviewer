@@ -21,8 +21,11 @@ use crate::video_bookmarks::VideoBookmark;
 
 /// 右側パネルの幅 (画像と揃える)。
 const VIDEO_PANEL_WIDTH: f32 = 380.0;
-/// 左側ジャンプパネルの幅。
-const VIDEO_JUMP_PANEL_WIDTH: f32 = 280.0;
+/// 左側ジャンプパネルの幅 (Phase 6: サムネ表示のため広げる)。
+const VIDEO_JUMP_PANEL_WIDTH: f32 = 320.0;
+/// 左側ジャンプパネル内のサムネサイズ (16:9 想定、実際の動画 aspect で再計算)。
+const JUMP_THUMB_W: u32 = 120;
+const JUMP_THUMB_H: u32 = 68;
 /// フルスクリーン上部バーの高さ (`ui_metadata_panel` の `TOP_BAR_H` と同期)。
 const TOP_BAR_H: f32 = 44.0;
 /// パネル内タイトル行の高さ。
@@ -270,6 +273,36 @@ impl App {
             }
             _ => Vec::new(),
         };
+
+        // Phase 6.C: 各行のサムネを順番にリクエストする (= ThumbnailWorker は
+        // 最新リクエスト 1 件のみ処理する drain semantics なので、フレームごとに
+        // 1 行だけリクエストして、worker が処理する間も他行は cache から読む)。
+        // 既に nearest() でヒットする pts は skip し、最初に miss する pts を request。
+        let pending_pts: Option<f64> = {
+            let pin_pts: Vec<f64> = bookmarks.iter().map(|b| b.pts_secs).collect();
+            let chap_pts: Vec<f64> = chapters.iter().map(|c| c.start_secs).collect();
+            let all_pts = pin_pts.into_iter().chain(chap_pts.into_iter());
+            let mut found: Option<f64> = None;
+            if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
+                self.fs_cache.get(&fs_idx)
+            {
+                for pts in all_pts {
+                    if player.nearest_seek_thumbnail(pts).is_none() {
+                        found = Some(pts);
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        if let Some(pts) = pending_pts {
+            if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
+                self.fs_cache.get(&fs_idx)
+            {
+                player.request_seek_thumbnail(pts);
+            }
+        }
+
         // Phase 6: 動画モードの左パネルは常時表示候補 (= 🔖 ボタンがあるため、
         // 中身が空でもパネル自体は出す)。
 
@@ -336,11 +369,15 @@ impl App {
                 .max_rect(content_rect)
                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
         );
+        // 各行を描画。サムネは self.video_jump_textures を介して player の thumb cache から
+        // 取得する。借用衝突を避けるため、サムネ取得 + texture upload は内部で完結させる。
+        let mut scroll_actions: Vec<JumpPanelAction> = Vec::new();
+        let scroll_height = content_rect.height();
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
+            .max_height(scroll_height)
             .show(&mut content_ui, |ui| {
                 ui.add_space(6.0);
-                // 🔖 ブックマーク追加ボタン (Phase 6 — 上部固定)
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     let resp = ui.add(
@@ -351,46 +388,49 @@ impl App {
                         ),
                     );
                     if resp.clicked() {
-                        action = Some(JumpPanelAction::AddBookmarkHere);
+                        scroll_actions.push(JumpPanelAction::AddBookmarkHere);
                     }
                 });
                 ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
+                let mut had_section = false;
                 if !bookmarks.is_empty() {
                     section_label(ui, "🔖 ブックマーク");
                     for b in bookmarks.iter() {
-                        if let Some(act) = draw_jump_row(
+                        let acts = self.draw_video_jump_row(
                             ui,
                             "🔖",
                             b.pts_secs,
                             b.title.as_deref(),
                             Some(b.id),
-                        ) {
-                            action = Some(act);
-                        }
+                            fs_idx,
+                        );
+                        scroll_actions.extend(acts);
                     }
                     ui.add_space(8.0);
+                    had_section = true;
                 }
 
                 if !chapters.is_empty() {
                     section_label(ui, "📑 チャプター");
                     for c in chapters.iter() {
-                        if let Some(act) = draw_jump_row(
+                        let acts = self.draw_video_jump_row(
                             ui,
                             "📑",
                             c.start_secs,
                             c.title.as_deref(),
                             None,
-                        ) {
-                            action = Some(act);
-                        }
+                            fs_idx,
+                        );
+                        scroll_actions.extend(acts);
                     }
                     ui.add_space(8.0);
+                    had_section = true;
                 }
 
-                if bookmarks.is_empty() && chapters.is_empty() {
+                if !had_section {
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
                         ui.colored_label(
@@ -402,6 +442,10 @@ impl App {
 
                 ui.add_space(16.0);
             });
+        // 最初のアクションだけ採用 (= 1 フレーム 1 アクション)。
+        if let Some(a) = scroll_actions.into_iter().next() {
+            action = Some(a);
+        }
 
         if let Some(act) = action {
             match act {
@@ -424,6 +468,141 @@ impl App {
         }
 
         true
+    }
+
+    /// Phase 6.C: 1 行分のジャンプ行を描画する (サムネ + 時間 + タイトル + 削除 ×)。
+    /// インスタンスメソッド版で、サムネは player の seek thumb cache + 自前の
+    /// texture cache 経由で表示する。クリック / 削除アクションは Vec で返す。
+    fn draw_video_jump_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: &str,
+        pts_secs: f64,
+        title: Option<&str>,
+        delete_id: Option<i64>,
+        fs_idx: usize,
+    ) -> Vec<JumpPanelAction> {
+        let mut out: Vec<JumpPanelAction> = Vec::new();
+        // サムネ取得 + texture upload (借用を短く保つ)
+        let thumb_data = match self.fs_cache.get(&fs_idx) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                player.nearest_seek_thumbnail(pts_secs)
+            }
+            _ => None,
+        };
+        let bucket: i64 = (pts_secs / 0.5).round() as i64;
+        let tex_id = if let Some(t) = thumb_data.as_ref() {
+            let key = (t.target_secs.to_bits(), t.width, t.height);
+            let cached = self
+                .video_jump_textures
+                .get(&bucket)
+                .map(|(k, _)| *k == key)
+                .unwrap_or(false);
+            if !cached {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [t.width as usize, t.height as usize],
+                    &t.rgba,
+                );
+                let tex = ui.ctx().load_texture(
+                    format!("video_jump_thumb:{bucket}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.video_jump_textures.insert(bucket, (key, tex));
+            }
+            self.video_jump_textures.get(&bucket).map(|(_, tex)| tex.id())
+        } else {
+            None
+        };
+
+        // 1 行 = サムネ列 + 時間/タイトル列 + × 列。サムネ size は固定 120x68。
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            // サムネプレースホルダ rect
+            let thumb_size = egui::vec2(JUMP_THUMB_W as f32, JUMP_THUMB_H as f32);
+            let (thumb_rect, _r) = ui.allocate_exact_size(thumb_size, egui::Sense::click());
+            let painter = ui.painter();
+            painter.rect_filled(
+                thumb_rect,
+                3.0,
+                egui::Color32::from_rgba_unmultiplied(35, 35, 40, 255),
+            );
+            if let Some(tid) = tex_id {
+                painter.image(
+                    tid,
+                    thumb_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                painter.text(
+                    thumb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "...",
+                    egui::FontId::proportional(14.0),
+                    DIM_COLOR,
+                );
+            }
+            painter.rect_stroke(
+                thumb_rect,
+                3.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                egui::StrokeKind::Inside,
+            );
+            // クリック判定 (サムネ + 時刻ラベル両方)
+            let click_resp = ui.interact(
+                thumb_rect,
+                egui::Id::new(("video_jump_thumb_click", bucket, delete_id.unwrap_or(0))),
+                egui::Sense::click(),
+            );
+            if click_resp.clicked() {
+                out.push(JumpPanelAction::Seek(pts_secs));
+            }
+            ui.add_space(6.0);
+            // 縦 2 行: 時間 + タイトル
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                let time_label = format_secs(pts_secs);
+                let time_resp = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(format!("{icon}  {time_label}"))
+                            .color(TEXT_COLOR)
+                            .size(13.0),
+                    )
+                    .frame(false),
+                );
+                if time_resp.clicked() {
+                    out.push(JumpPanelAction::Seek(pts_secs));
+                }
+                if let Some(t) = title {
+                    ui.colored_label(
+                        DIM_COLOR,
+                        egui::RichText::new(t).size(11.0),
+                    );
+                }
+            });
+            // 削除ボタン (右端)
+            if let Some(id) = delete_id {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let x_resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("×")
+                                    .color(DIM_COLOR)
+                                    .size(14.0),
+                            )
+                            .frame(false),
+                        );
+                        if x_resp.clicked() {
+                            out.push(JumpPanelAction::DeleteBookmark(id));
+                        }
+                    },
+                );
+            }
+        });
+        ui.add_space(2.0);
+        out
     }
 
     /// 現在の再生位置に新規ブックマークを追加する。B キー / 🔖 ボタンの両経路から呼ばれる。
@@ -463,48 +642,3 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
 }
 
-/// ジャンプ行を 1 つ描画する。アイコン + mm:ss + タイトル + (削除可なら × ボタン)。
-/// 戻り値はクリック / 削除発生時のみ。
-fn draw_jump_row(
-    ui: &mut egui::Ui,
-    icon: &str,
-    pts_secs: f64,
-    title: Option<&str>,
-    delete_id: Option<i64>,
-) -> Option<JumpPanelAction> {
-    let mut out: Option<JumpPanelAction> = None;
-    ui.horizontal(|ui| {
-        ui.add_space(16.0);
-        let mm = format_secs(pts_secs);
-        let txt = if let Some(t) = title {
-            format!("{icon}  {mm}  {t}")
-        } else {
-            format!("{icon}  {mm}")
-        };
-        let r = ui.add(
-            egui::Button::new(
-                egui::RichText::new(txt).color(TEXT_COLOR).size(13.0),
-            )
-            .frame(false),
-        );
-        if r.clicked() {
-            out = Some(JumpPanelAction::Seek(pts_secs));
-        }
-        if let Some(id) = delete_id {
-            ui.add_space(4.0);
-            let x = ui.add(
-                egui::Button::new(
-                    egui::RichText::new("×")
-                        .color(DIM_COLOR)
-                        .size(13.0),
-                )
-                .frame(false),
-            );
-            if x.clicked() {
-                out = Some(JumpPanelAction::DeleteBookmark(id));
-            }
-        }
-    });
-    ui.add_space(2.0);
-    out
-}

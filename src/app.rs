@@ -1595,6 +1595,12 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) video_tile_textures:
         std::collections::HashMap<usize, ((u64, u64, u32, u32), egui::TextureHandle)>,
+    /// 動画ジャンプパネル (左) の各行サムネ texture キャッシュ。
+    /// key: bucket(pts_secs) — 同一 pts は同じ texture を再利用。動画切替で
+    /// `clear()` する。
+    #[cfg(windows)]
+    pub(crate) video_jump_textures:
+        std::collections::HashMap<i64, ((u64, u32, u32), egui::TextureHandle)>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2383,6 +2389,8 @@ impl Default for App {
             video_tile_state: None,
             #[cfg(windows)]
             video_tile_textures: std::collections::HashMap::new(),
+            #[cfg(windows)]
+            video_jump_textures: std::collections::HashMap::new(),
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
@@ -10085,10 +10093,12 @@ impl App {
         self.fs_middle_zoom_drag = None;
         self.fs_context_menu_idx = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
+        // Phase 6.C: 左ジャンプパネルのサムネ texture キャッシュもクリア。
         #[cfg(windows)]
         {
             self.video_tile_state = None;
             self.video_tile_textures.clear();
+            self.video_jump_textures.clear();
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
