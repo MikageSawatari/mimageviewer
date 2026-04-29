@@ -622,10 +622,7 @@ fn run_bench(
             let mut regular: Vec<LoadRequest> = Vec::new();
             let mut heavy: Vec<LoadRequest> = Vec::new();
             for r in new_reqs {
-                let is_heavy = matches!(
-                    contents.items.get(r.idx),
-                    Some(GridItem::ZipFile(_) | GridItem::Folder(_))
-                );
+                let is_heavy = contents.items.get(r.idx).is_some_and(|it| it.is_heavy_io());
                 if is_heavy {
                     heavy.push(r);
                 } else {

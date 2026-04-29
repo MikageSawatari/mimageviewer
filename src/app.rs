@@ -6493,13 +6493,7 @@ impl App {
             }
             req.input_seq = self.input_seq;
             req.items_gen = self.items_generation;
-            // ZipFile / Folder (本物の同期 I/O) → heavy_io_queue、それ以外 → reload_queue
-            // PdfFile は別プロセス IPC 待ちでメインプロセス内負荷が無いため通常キュー側で
-            // PDFium pool (POOL_SIZE=3) の並列度を活かす。
-            let is_heavy = matches!(
-                self.items.get(i),
-                Some(GridItem::ZipFile(_) | GridItem::Folder(_))
-            );
+            let is_heavy = self.items.get(i).is_some_and(|it| it.is_heavy_io());
             // perf: エンキューイベント (タスク種別 + 優先度 + 相関 seq)
             if crate::perf::is_enabled() {
                 let perf_key = self.perf_item_key(i);

@@ -114,6 +114,14 @@ impl GridItem {
         matches!(self, Self::Folder(_) | Self::ZipFile(_) | Self::PdfFile(_))
     }
 
+    /// 代表サムネ生成に本物の同期 I/O を伴うか (heavy_io_queue 振り分け用)。
+    /// Folder は `fs::read_dir` 再帰探索、ZipFile はセントラルディレクトリ読み込みで
+    /// メインプロセス内が秒単位ブロックされる。PdfFile は別プロセス IPC 待ちで
+    /// メインプロセス内 CPU を消費しないため通常 reload_queue に振る。
+    pub fn is_heavy_io(&self) -> bool {
+        matches!(self, Self::Folder(_) | Self::ZipFile(_))
+    }
+
     /// コンテナ系アイテム (Folder / ZipFile / PdfFile / ConvertibleArchive) のパスを返す。
     /// 画像・ページ系や Video / Separator / SearchContainer は対象外で `None`。
     /// 「開く」アクションのナビゲーション先抽出などで使う。
