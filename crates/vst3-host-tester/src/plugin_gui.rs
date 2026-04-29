@@ -29,9 +29,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, IDC_ARROW,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow, SW_SHOW,
-    SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
+    SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
     WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
@@ -59,6 +59,11 @@ pub enum Cmd {
 #[derive(Debug)]
 pub struct ShowReply {
     pub hwnd_u64: u64,
+    /// 実際のクライアント領域サイズ (デバッグ用)。要求値と一致しなければ DPI 計算がズレている。
+    pub actual_client_w: u32,
+    pub actual_client_h: u32,
+    /// AdjustWindowRectExForDpi に渡した DPI 値 (デバッグ用)。
+    pub used_dpi: u32,
     /// ユーザーが × を押したときに Sender 側から「閉じてほしい」が届く。
     /// メインスレッドはこれを polling するか recv して、bridge に hide_gui を送る。
     pub close_signal: Arc<Mutex<Option<Receiver<()>>>>,
@@ -196,9 +201,12 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             } => {
                 let result = create_window(&title, width, height);
                 match result {
-                    Ok((hwnd_u64, close_rx)) => {
+                    Ok((hwnd_u64, close_rx, actual_w, actual_h, used_dpi)) => {
                         let _ = reply.send(ShowReply {
                             hwnd_u64,
+                            actual_client_w: actual_w,
+                            actual_client_h: actual_h,
+                            used_dpi,
                             close_signal: Arc::new(Mutex::new(Some(close_rx))),
                         });
                         // ウィンドウ作成成功 → メッセージループを回す。
@@ -211,6 +219,9 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                     Err(e) => {
                         let _ = reply.send(ShowReply {
                             hwnd_u64: 0,
+                            actual_client_w: 0,
+                            actual_client_h: 0,
+                            used_dpi: 0,
                             close_signal: Arc::new(Mutex::new(None)),
                         });
                         eprintln!("create_window failed: {e}");
@@ -258,6 +269,9 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
                     // とりあえずエラー扱い (UI 側でガードしているはず)。
                     let _ = reply.send(ShowReply {
                         hwnd_u64: 0,
+                        actual_client_w: 0,
+                        actual_client_h: 0,
+                        used_dpi: 0,
                         close_signal: Arc::new(Mutex::new(None)),
                     });
                 }
@@ -274,7 +288,7 @@ fn create_window(
     title: &str,
     width: u32,
     height: u32,
-) -> std::io::Result<(u64, Receiver<()>)> {
+) -> std::io::Result<(u64, Receiver<()>, u32, u32, u32)> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())
@@ -349,6 +363,12 @@ fn create_window(
 
         let _ = ShowWindow(hwnd, SW_SHOW);
 
+        // 実 client rect を確認 (デバッグ用)
+        let mut actual = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(hwnd, &mut actual);
+        let actual_w = (actual.right - actual.left) as u32;
+        let actual_h = (actual.bottom - actual.top) as u32;
+
         let (tx, rx) = channel::<()>();
         THREAD_STATE.with(|s| {
             if let Some(st) = s.borrow_mut().as_mut() {
@@ -356,7 +376,7 @@ fn create_window(
                 st.close_tx = Some(tx);
             }
         });
-        Ok((hwnd.0 as u64, rx))
+        Ok((hwnd.0 as u64, rx, actual_w, actual_h, dpi))
     }
 }
 

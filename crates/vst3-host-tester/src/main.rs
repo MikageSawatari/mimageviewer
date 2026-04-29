@@ -370,6 +370,10 @@ impl TesterApp {
             self.log("create gui window: HWND not returned");
             return;
         }
+        self.log(format!(
+            "host window: requested {}x{}, actual client {}x{} (dpi={})",
+            pref_w, pref_h, reply.actual_client_w, reply.actual_client_h, reply.used_dpi
+        ));
         self.gui_hwnd = reply.hwnd_u64;
         self.gui_close_signal = Some(reply.close_signal);
 

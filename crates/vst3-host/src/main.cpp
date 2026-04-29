@@ -20,7 +20,10 @@
 // 子ウィンドウのメッセージは作成スレッドにディスパッチされるので、main thread の
 // PeekMessage ループで処理される。これが無いと描画停止 (= 真っ白でハング)。
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +32,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <io.h>
@@ -358,25 +362,65 @@ private:
         std::vector<float> input(block_size * channels);
         std::vector<float> output(block_size * channels);
 
+        std::fprintf(stderr, "[BRIDGE] audio_loop start (block=%u)\n", block_size);
+        std::fflush(stderr);
+        uint64_t blocks_in = 0, blocks_processed = 0, blocks_out = 0;
+        uint64_t timeouts_in = 0, timeouts_out = 0;
+        float input_peak = 0.0f, output_peak = 0.0f;
+        auto last_report = std::chrono::steady_clock::now();
+        auto report_now = [&]() {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_report).count() < 1000) {
+                return;
+            }
+            std::fprintf(stderr,
+                "[BRIDGE] audio: in=%llu proc=%llu out=%llu to_in=%llu to_out=%llu in_peak=%.4f out_peak=%.4f\n",
+                (unsigned long long)blocks_in,
+                (unsigned long long)blocks_processed,
+                (unsigned long long)blocks_out,
+                (unsigned long long)timeouts_in,
+                (unsigned long long)timeouts_out,
+                input_peak, output_peak);
+            std::fflush(stderr);
+            blocks_in = blocks_processed = blocks_out = 0;
+            timeouts_in = timeouts_out = 0;
+            input_peak = output_peak = 0.0f;
+            last_report = now;
+        };
+
         while (audio_running_) {
             if (!pipe_.read_in(input.data(),
                                 block_size * channels,
                                 100 /* ms */)) {
+                ++timeouts_in;
+                report_now();
                 if (!audio_running_) break;
                 continue;
             }
+            ++blocks_in;
+            for (float v : input) input_peak = std::max(input_peak, std::fabs(v));
+
             if (loader_ && !loader_->process_block(input.data(), output.data(), block_size)) {
                 send_event_error("process_block failed");
                 audio_running_ = false;
                 break;
             }
+            ++blocks_processed;
+            for (float v : output) output_peak = std::max(output_peak, std::fabs(v));
+
             if (!pipe_.write_out(output.data(),
                                   block_size * channels,
                                   100 /* ms */)) {
+                ++timeouts_out;
+                report_now();
                 if (!audio_running_) break;
                 continue;
             }
+            ++blocks_out;
+            report_now();
         }
+        std::fprintf(stderr, "[BRIDGE] audio_loop exit\n");
+        std::fflush(stderr);
     }
 
     std::unique_ptr<PluginLoader> loader_;
