@@ -29,20 +29,27 @@ public:
     DECLARE_FUNKNOWN_METHODS
 };
 
-/// IPlugFrame の最小実装。
-/// プラグインから「このサイズに変更して」と要求が来たときに `kResultOk` を
-/// 返すだけのスタブ。実際にホストウィンドウのサイズを変えるには Rust 側に
-/// IPC で通知する必要があるが、Phase 0b では描画開始に必要な最小機能のみ。
-/// Pro-Q 4 など多くのプラグインは setFrame(frame) を呼ばないと描画を開始しない。
+/// IPlugFrame 実装: プラグインから「このサイズに変更して」と要求が来たら、
+/// 親 HWND (= tester プロセスのウィンドウ) を SetWindowPos でリサイズし、
+/// view->onSize で受領を通知する。これが無いとプラグインのリサイズ追従や
+/// 初期描画が動かない。
 class PlugFrame : public Steinberg::IPlugFrame {
 public:
     PlugFrame() = default;
     virtual ~PlugFrame() = default;
 
+    /// show_gui で受け取った host HWND を保存しておく。
+    /// resizeView で SetWindowPos するために必要 (= プロセス境界をまたぐ HWND
+    /// 操作も Win32 API は許容)。
+    void set_host_hwnd(void* hwnd) { host_hwnd_ = hwnd; }
+
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView* view,
                                               Steinberg::ViewRect* newSize) override;
 
     DECLARE_FUNKNOWN_METHODS
+
+private:
+    void* host_hwnd_ = nullptr;
 };
 
 class ComponentHandler : public Steinberg::Vst::IComponentHandler {

@@ -10,6 +10,10 @@
 #include <cstring>
 #include <vector>
 
+#include <windows.h>
+
+#include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
+
 namespace {
 // stderr へのデバッグログ。tester 側で pipe して log_file に流す。
 template <typename... Args>
@@ -262,6 +266,18 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
         v = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
         if (!v) return false;
     }
+    // DPI scale をプラグインに伝えてから getSize する。
+    // 伝えないと「自分は 100% 描画」と判断して論理ピクセルでサイズを返すケースが
+    // ある (Pro-Q 4 等)。setContentScaleFactor を呼ぶと scale 込みの物理ピクセル
+    // 数値で返ってくる。
+    Steinberg::FUnknownPtr<Steinberg::IPlugViewContentScaleSupport> css(v);
+    if (css) {
+        UINT dpi = GetDpiForSystem();
+        if (dpi == 0) dpi = 96;
+        float factor = static_cast<float>(dpi) / 96.0f;
+        css->setContentScaleFactor(factor);
+        blog("get_gui_size: setContentScaleFactor=%.3f (dpi=%u)", factor, dpi);
+    }
     Steinberg::ViewRect rect{};
     if (v->getSize(&rect) != Steinberg::kResultOk) {
         return false;
@@ -304,7 +320,23 @@ bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
     blog("show_gui: setFrame");
     // attached より **前に** setFrame を呼ぶ。Pro-Q 4 等多くのプラグインは
     // frame が無いと描画開始しない (= 真っ白でハング)。
+    plug_frame_->set_host_hwnd(hwnd);
     view_->setFrame(plug_frame_);
+
+    // DPI scale をプラグインに伝える。これが無いとプラグインは "100% 想定" で
+    // 描画してしまい、Per-Monitor v2 環境で位置/サイズがずれる
+    // (Pro-Q 4 で「右下しか見えない」現象の原因)。
+    Steinberg::FUnknownPtr<Steinberg::IPlugViewContentScaleSupport> css(view_);
+    if (css) {
+        UINT dpi = GetDpiForWindow(reinterpret_cast<HWND>(hwnd));
+        if (dpi == 0) dpi = GetDpiForSystem();
+        if (dpi == 0) dpi = 96;
+        float factor = static_cast<float>(dpi) / 96.0f;
+        css->setContentScaleFactor(factor);
+        blog("show_gui: setContentScaleFactor=%.3f (dpi=%u)", factor, dpi);
+    } else {
+        blog("show_gui: plugin does not implement IPlugViewContentScaleSupport");
+    }
 
     blog("show_gui: attached(hwnd, HWND)");
     if (view_->attached(hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
