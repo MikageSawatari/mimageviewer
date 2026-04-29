@@ -104,11 +104,26 @@ struct TesterApp {
 
     // log buffer for the bottom panel
     log_lines: Arc<Mutex<Vec<String>>>,
+    /// 永続ログファイル (= 解析依頼時に Claude に直接読ませる用)。
+    /// 場所: %TEMP%\vst3-host-tester.log (= 例: C:\Users\<USER>\AppData\Local\Temp\)
+    log_file: Option<Arc<Mutex<std::fs::File>>>,
+    log_file_path: std::path::PathBuf,
 }
 
 impl TesterApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
+        // 永続ログファイル: %TEMP%\vst3-host-tester.log
+        // 起動ごとに上書き (truncate) して 1 セッション分だけ残す。
+        // 解析時はこのファイルを Claude Code に Read させればよい。
+        let log_file_path = std::env::temp_dir().join("vst3-host-tester.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_file_path)
+            .ok()
+            .map(|f| Arc::new(Mutex::new(f)));
         // bridge exe は worktree 内の vendor/vst3-host/ にある (CMake の出力先)
         // 実行時の cwd は workspace ルートまたは tester crate ディレクトリのどちらかが想定される
         let candidates = [
@@ -133,20 +148,35 @@ impl TesterApp {
             last_latency: None,
             bridge_exe_path,
             log_lines: Arc::new(Mutex::new(Vec::new())),
+            log_file,
+            log_file_path,
             #[cfg(windows)]
             gui_host: plugin_gui::GuiHost::spawn(),
             gui_hwnd: 0,
             gui_close_signal: None,
         };
+        app.log(format!("ログファイル: {}", app.log_file_path.display()));
         app.scan();
         app.start_audio();
         app
     }
 
     fn log(&self, line: impl Into<String>) {
+        let line: String = line.into();
+        // タイムスタンプ付きでファイルに append (UI 側はそのまま)
+        if let Some(file) = self.log_file.as_ref() {
+            use std::io::Write;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            if let Ok(mut f) = file.lock() {
+                let _ = writeln!(f, "[{:>13.3}] {}", now, &line);
+                let _ = f.flush();
+            }
+        }
         let mut lines = self.log_lines.lock().unwrap();
-        lines.push(line.into());
-        // 上限: 200 行
+        lines.push(line);
         if lines.len() > 200 {
             let drop_n = lines.len() - 200;
             lines.drain(..drop_n);
@@ -394,6 +424,9 @@ impl eframe::App for TesterApp {
                 ui.heading("VST3 Host Tester");
                 ui.separator();
                 ui.label(format!("bridge exe: {}", self.bridge_exe_path.display()));
+            });
+            ui.horizontal(|ui| {
+                ui.small(format!("ログ: {}", self.log_file_path.display()));
             });
         });
 

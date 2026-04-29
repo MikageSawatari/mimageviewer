@@ -202,9 +202,15 @@ impl Bridge {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0);
-        let shm_name = format!("Local\\miv-vst-shm-{}-{}", pid, stamp);
-        let sig_in_name = format!("Local\\miv-vst-sigin-{}-{}", pid, stamp);
-        let sig_out_name = format!("Local\\miv-vst-sigout-{}-{}", pid, stamp);
+        // 名前空間プレフィックス (`Local\`) は付けない。
+        // - 付けないと CreateFileMappingW のデフォルト = Local 名前空間
+        //   (= セッション内有効) になり同等の挙動。
+        // - 付けると JSON シリアライズで `Local\\miv-...` にエスケープされ、
+        //   bridge 側の素朴 JSON 抽出 (エスケープ解除なし) で `\\` が
+        //   そのまま渡って名前不一致になる。素直に英数字+ハイフンのみで作る。
+        let shm_name = format!("miv-vst-shm-{}-{}", pid, stamp);
+        let sig_in_name = format!("miv-vst-sigin-{}-{}", pid, stamp);
+        let sig_out_name = format!("miv-vst-sigout-{}-{}", pid, stamp);
 
         // 容量: block_size * channels * 8 (= 8 ブロック分のマージン) — sample 単位で持つ
         let capacity = block_size * 2 * 8;
