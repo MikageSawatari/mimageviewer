@@ -1004,11 +1004,11 @@ impl App {
                             }
                         } else if state.is_video {
                             // 動画は専用パネルに分岐する (Phase 5.4):
-                            //   右 = メタ情報 (タイトル / コーデック / チャプター…)
-                            //   左 = ジャンプ先サムネ (ピン / ブックマーク / チャプター)
-                            //         — Phase 5.4-D-left + 5.4.1 で配線予定。
+                            //   左 = ジャンプ先 (ピン / ブックマーク / チャプター)、
+                            //   右 = メタ情報 (タイトル / コーデック / チャプター…)。
                             #[cfg(windows)]
                             {
+                                self.draw_video_jump_panel(ui, ctx, full_rect, fs_idx);
                                 self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
                             }
                         } else if adjustment_active {
@@ -4691,6 +4691,11 @@ impl App {
         let loop_key = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::L)
         });
+        // Phase 5.4.1: B キーで現在位置にブックマーク追加 (動画モード限定)。
+        // 画像モードの B (透過背景循環) とは handle_video_input 先行 consume で分離。
+        let bookmark_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::B)
+        });
 
         if shift_enter {
             if let Some(p) = video_path {
@@ -4747,6 +4752,33 @@ impl App {
         }
         if loop_key {
             self.settings.video_loop = !self.settings.video_loop;
+        }
+
+        // Phase 5.4.1: ブックマーク追加。現在位置 + 動画パスを取得して DB に挿入。
+        // 借用衝突を避けるため `if let Some(player)` 短いスコープで pos / path を抜く。
+        if bookmark_key {
+            let snapshot = match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => {
+                    Some((player.path().clone(), player.position()))
+                }
+                _ => None,
+            };
+            if let (Some((path, pts)), Some(db)) =
+                (snapshot, self.video_bookmark_db.as_ref())
+            {
+                if let Err(e) = db.add(&path, pts, None, &[]) {
+                    crate::logger::log(format!(
+                        "video bookmark add failed: {e}"
+                    ));
+                } else {
+                    crate::logger::log(format!(
+                        "video bookmark added: pts={pts:.2}s {}",
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?")
+                    ));
+                }
+            }
         }
     }
 

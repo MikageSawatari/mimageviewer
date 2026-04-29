@@ -1574,6 +1574,14 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
+    // ── 動画ピン / ブックマーク DB (Phase 5.4) ────────────────────
+    /// ユーザーが固定したフレーム位置 (= グリッドサムネ最優先)。Phase 5.4 で
+    /// 読み取り側の API 配線、Phase 5.6 で HUD ボタンから書き込み配線予定。
+    pub(crate) video_pin_db: Option<crate::video_pins::VideoPinDb>,
+    /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
+    /// 表示される。Phase 5.4 / 5.4.1 で B キー authoring 配線。
+    pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
+
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
     pub(crate) rating_db: Option<crate::rating_db::RatingDb>,
@@ -2179,6 +2187,14 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
 
         let t = std::time::Instant::now();
+        let video_pin_db = crate::video_pins::VideoPinDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
+
+        let t = std::time::Instant::now();
+        let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
+
+        let t = std::time::Instant::now();
         let rating_db = crate::rating_db::RatingDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_rating", 0, t);
 
@@ -2347,6 +2363,8 @@ impl Default for App {
             search_or_mode: false,
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
+            video_pin_db,
+            video_bookmark_db,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
