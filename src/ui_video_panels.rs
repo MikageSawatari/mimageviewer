@@ -277,6 +277,12 @@ pub(crate) enum JumpPanelAction {
     DeleteBookmark(i64),
 }
 
+/// Phase 5.6 動画モード専用の小ツールバー (画面右上に float)。
+/// ピン留めボタン (📌 / トグル) + タイルモードボタン (▦)。
+/// ホバー時のみ表示する (= 通常時は非表示で動画再生を邪魔しない)。
+const MINI_TOOLBAR_W: f32 = 80.0;
+const MINI_TOOLBAR_H: f32 = 36.0;
+
 impl App {
     /// 動画フルスクリーン中の **左パネル** (= ジャンプ先サムネ) を描画する。
     /// 戻り値: パネルが描画された (= 表示中) ら `true`、隠れていれば `false`。
@@ -469,6 +475,164 @@ impl App {
         }
 
         true
+    }
+}
+
+impl App {
+    /// Phase 5.6 動画モード専用ミニ ツールバー。画面右上 (上部ホバーバー直下) に
+    /// 表示される 2 ボタン (📌 ピン / ▦ タイル)。上部ホバーが見えているときだけ
+    /// (= カーソルが画面上 1/3 にいるとき) 描画。
+    pub(crate) fn draw_video_mini_toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        // 表示条件: 上部 1/3 にカーソルがある (= 上部ホバーバーと連動)
+        let hover_in_top = ctx
+            .input(|i| i.pointer.hover_pos().map(|p| p.y < full_rect.height() * 0.33).unwrap_or(false));
+        if !hover_in_top {
+            return;
+        }
+        // 動画パスとピン状況を取得
+        let video_path: Option<PathBuf> = match self.fs_cache.get(&fs_idx) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                if player.error().is_some() || player.info().is_none() {
+                    None
+                } else {
+                    Some(player.path().clone())
+                }
+            }
+            _ => None,
+        };
+        let Some(video_path) = video_path else {
+            return;
+        };
+        let pinned = self
+            .video_pin_db
+            .as_ref()
+            .and_then(|db| db.lookup(&video_path))
+            .is_some();
+
+        // 画面右上に配置 (上部ホバーバー = 44px の直下から 8px 余白)
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                full_rect.max.x - MINI_TOOLBAR_W - 12.0,
+                full_rect.min.y + TOP_BAR_H + 8.0,
+            ),
+            egui::vec2(MINI_TOOLBAR_W, MINI_TOOLBAR_H),
+        );
+        let painter = ui.painter().clone();
+        painter.rect_filled(
+            bar_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+        );
+
+        // ピンボタン (左半分)
+        let pin_rect = egui::Rect::from_min_size(
+            bar_rect.min,
+            egui::vec2(MINI_TOOLBAR_W * 0.5, MINI_TOOLBAR_H),
+        );
+        let pin_resp = ui.interact(
+            pin_rect,
+            egui::Id::new(("video_mini_pin", fs_idx)),
+            egui::Sense::click(),
+        );
+        if pin_resp.hovered() {
+            painter.rect_filled(
+                pin_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+            );
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let pin_color = if pinned {
+            egui::Color32::from_rgb(255, 200, 80)
+        } else {
+            egui::Color32::from_rgb(220, 220, 220)
+        };
+        painter.text(
+            pin_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "📌",
+            egui::FontId::proportional(20.0),
+            pin_color,
+        );
+        let pin_resp = pin_resp.on_hover_text(if pinned {
+            "ピンを解除"
+        } else {
+            "現在のフレームをサムネに固定"
+        });
+        if pin_resp.clicked() {
+            self.toggle_video_pin(fs_idx, &video_path);
+        }
+
+        // タイルボタン (右半分)
+        let tile_rect = egui::Rect::from_min_size(
+            egui::pos2(bar_rect.min.x + MINI_TOOLBAR_W * 0.5, bar_rect.min.y),
+            egui::vec2(MINI_TOOLBAR_W * 0.5, MINI_TOOLBAR_H),
+        );
+        let tile_resp = ui.interact(
+            tile_rect,
+            egui::Id::new(("video_mini_tile", fs_idx)),
+            egui::Sense::click(),
+        );
+        if tile_resp.hovered() {
+            painter.rect_filled(
+                tile_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+            );
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tile_active = self.video_tile_state.is_some();
+        let tile_color = if tile_active {
+            egui::Color32::from_rgb(120, 200, 255)
+        } else {
+            egui::Color32::from_rgb(220, 220, 220)
+        };
+        painter.text(
+            tile_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "▦",
+            egui::FontId::proportional(22.0),
+            tile_color,
+        );
+        let tile_resp = tile_resp.on_hover_text("タイルモード ON/OFF (S)");
+        if tile_resp.clicked() {
+            let screen = ctx.content_rect().size();
+            self.toggle_video_tile_mode(fs_idx, screen);
+        }
+    }
+
+    /// ピン留めボタン押下時の処理。既存ピンがあれば削除、なければ現在位置で追加。
+    /// thumb_webp は将来実装予定 (Phase 5.6 段階では空 BLOB で記録)。
+    fn toggle_video_pin(&mut self, fs_idx: usize, video_path: &std::path::Path) {
+        let Some(db) = self.video_pin_db.as_ref() else {
+            return;
+        };
+        let exists = db.lookup(video_path).is_some();
+        if exists {
+            if let Err(e) = db.remove(video_path) {
+                crate::logger::log(format!("video pin remove failed: {e}"));
+            } else {
+                crate::logger::log("video pin removed".to_string());
+            }
+            return;
+        }
+        let pts = match self.fs_cache.get(&fs_idx) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                player.position()
+            }
+            _ => return,
+        };
+        if let Err(e) = db.set_pin(video_path, pts, &[]) {
+            crate::logger::log(format!("video pin set failed: {e}"));
+        } else {
+            crate::logger::log(format!("video pin set: pts={pts:.2}s"));
+        }
     }
 }
 

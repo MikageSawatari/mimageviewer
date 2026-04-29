@@ -946,6 +946,12 @@ impl App {
                             self.draw_video_hud(ui, ctx, full_rect, fs_idx);
                             // Phase 5.1: 一時停止中はキー操作のヒントを画面中央下に薄く表示。
                             self.draw_video_paused_hint(ui, full_rect, fs_idx);
+                            // Phase 5.6: 動画モード専用の小ツールバー (ピン / タイル)。
+                            // ホバー上ツールバーが上部に重なるため、画面右上に float 表示。
+                            #[cfg(windows)]
+                            {
+                                self.draw_video_mini_toolbar(ui, ctx, full_rect, fs_idx);
+                            }
                         }
 
                         // ── チェックマーク ──
