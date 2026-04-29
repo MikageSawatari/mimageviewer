@@ -287,6 +287,12 @@ impl App {
             .as_ref()
             .map(|db| db.list(&video_path))
             .unwrap_or_default();
+        // ピン状態を毎フレーム読み出してボタンラベルに反映する。
+        let pinned: bool = self
+            .video_pin_db
+            .as_ref()
+            .and_then(|db| db.lookup(&video_path))
+            .is_some();
         let chapters: Vec<Chapter> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 player.info().map(|i| i.chapters.clone()).unwrap_or_default()
@@ -419,17 +425,27 @@ impl App {
                 let btn_bg_hover = egui::Color32::from_rgba_unmultiplied(80, 100, 150, 255);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    // 📌 ピン (Phase 7.B で実装予定の handler を呼ぶ)
+                    // 📌 ピン: 現状を反映してラベルを切り替える (= クリックで何が
+                    // 起きるかが見える)。ピン中はアクセント色 (緑系) で視覚的に強調。
+                    let (pin_label, pin_fill) = if pinned {
+                        (
+                            "✓ ピン留め中 (クリックで解除)",
+                            egui::Color32::from_rgba_unmultiplied(60, 110, 60, 240),
+                        )
+                    } else {
+                        ("📌 現フレームをサムネ固定", btn_bg)
+                    };
                     let pin_resp = ui.add(
                         egui::Button::new(
-                            egui::RichText::new("📌 現フレームをサムネ固定")
+                            egui::RichText::new(pin_label)
                                 .color(egui::Color32::WHITE)
                                 .size(12.0),
                         )
-                        .fill(btn_bg)
+                        .fill(pin_fill)
                         .stroke(egui::Stroke::new(1.0, btn_bg_hover)),
                     );
                     if pin_resp.clicked() {
+                        crate::logger::log("video pin: button clicked".to_string());
                         scroll_actions.push(JumpPanelAction::SetPinAtCurrent);
                     }
                 });
@@ -449,6 +465,22 @@ impl App {
                         scroll_actions.push(JumpPanelAction::AddBookmarkHere);
                     }
                 });
+                // 直近のピン操作結果を 3 秒間表示 (= 押した感の即時フィードバック)。
+                if let Some((msg, until)) = self.video_pin_status.as_ref() {
+                    let now = std::time::Instant::now();
+                    if now < *until {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(180, 220, 180),
+                                egui::RichText::new(msg).size(11.0),
+                            );
+                        });
+                        // 3 秒後に消えるよう repaint を予約 (= 入力なしでも非表示化)。
+                        ui.ctx().request_repaint_after(*until - now);
+                    }
+                }
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -678,6 +710,7 @@ impl App {
     /// バグだった。本実装ではシークサムネ ワーカーに pts を渡して 500ms 内に
     /// 抽出 → WebP 化 → 保存する。500ms 内に取れなければエラー扱い。
     pub(crate) fn toggle_video_pin_at_current(&mut self, fs_idx: usize) {
+        crate::logger::log("video pin: toggle invoked".to_string());
         let snapshot = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 if player.error().is_some() || player.info().is_none() {
@@ -689,22 +722,29 @@ impl App {
             _ => None,
         };
         let Some((path, pts)) = snapshot else {
+            crate::logger::log(
+                "video pin: no playable video at current fs index (info未取得 or error)"
+                    .to_string(),
+            );
+            self.set_pin_status("✗ 動画情報がまだ読めていません");
             return;
         };
         let Some(db) = self.video_pin_db.as_ref() else {
             crate::logger::log("video pin: DB not open".to_string());
+            self.set_pin_status("✗ DB を開けません");
             return;
         };
         let already_pinned = db.lookup(&path).is_some();
         if already_pinned {
             if let Err(e) = db.remove(&path) {
                 crate::logger::log(format!("video pin remove failed: {e}"));
+                self.set_pin_status("✗ ピン解除に失敗しました");
             } else {
                 crate::logger::log(format!(
                     "video pin removed: {}",
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 ));
-                // グリッド側のサムネ反映のためフォルダ再読込フラグを立てる
+                self.set_pin_status("✓ ピン留めを解除しました");
                 self.video_thumb_overrides_dirty = true;
             }
             return;
@@ -740,14 +780,27 @@ impl App {
         let webp_len = webp.len();
         if let Err(e) = db.set_pin(&path, pts, &webp) {
             crate::logger::log(format!("video pin set failed: {e}"));
+            self.set_pin_status("✗ ピン保存に失敗しました");
         } else {
             crate::logger::log(format!(
                 "video pin set: pts={pts:.2}s webp={}B {}",
                 webp_len,
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
             ));
+            if webp_len == 0 {
+                self.set_pin_status("△ 位置のみ保存 (フレーム抽出に失敗)");
+            } else {
+                self.set_pin_status("✓ サムネを更新しました");
+            }
             self.video_thumb_overrides_dirty = true;
         }
+    }
+
+    fn set_pin_status(&mut self, msg: &str) {
+        self.video_pin_status = Some((
+            msg.to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        ));
     }
 
     /// 現在の再生位置に新規ブックマークを追加する。B キー / 🔖 ボタンの両経路から呼ばれる。

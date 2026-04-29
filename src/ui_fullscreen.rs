@@ -2142,8 +2142,16 @@ impl App {
             self.handle_middle_drag_zoom(ctx, full_rect);
         }
 
+        // 動画タイルモード中は generic ホイール処理を完全にスキップして、
+        // タイル overlay 側の Ctrl+Wheel (= 列数切替) を有効にする。
+        // ここで raw/smooth_scroll_delta をクリアしてしまうと overlay が
+        // wheel を見えず、ユーザー視点で「Ctrl+Wheel が動画ズーム扱い」になる。
+        #[cfg(windows)]
+        let in_video_tile = self.video_tile_state.is_some();
+        #[cfg(not(windows))]
+        let in_video_tile = false;
         let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
-        if wheel_y.abs() > 0.5 && !cursor_in_panel {
+        if wheel_y.abs() > 0.5 && !cursor_in_panel && !in_video_tile {
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;

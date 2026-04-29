@@ -1620,6 +1620,9 @@ pub struct App {
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
     /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
     pub(crate) video_thumb_overrides_dirty: bool,
+    /// ピン操作後にジャンプパネルへ短時間表示する状態テキスト (Phase 8.B'-2)。
+    /// `(message, until)` で `Instant::now() < until` の間だけ表示。
+    pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2424,6 +2427,7 @@ impl Default for App {
             show_video_jump_panel_visible: false,
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
+            video_pin_status: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
