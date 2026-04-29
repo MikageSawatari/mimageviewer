@@ -6709,11 +6709,21 @@ impl App {
         if !self.requested.is_empty() {
             return;
         }
-        let Some(queue_arc) = self.reload_queue.clone() else {
+        let Some(reload_arc) = self.reload_queue.clone() else {
+            return;
+        };
+        let Some(heavy_arc) = self.heavy_io_queue.clone() else {
             return;
         };
         {
-            let (ref mtx, _) = *queue_arc;
+            let (ref mtx, _) = *reload_arc;
+            let q = mtx.lock().unwrap();
+            if !q.is_empty() {
+                return;
+            }
+        }
+        {
+            let (ref mtx, _) = *heavy_arc;
             let q = mtx.lock().unwrap();
             if !q.is_empty() {
                 return;
@@ -6794,17 +6804,34 @@ impl App {
             upgrade_reqs.len(),
             current_display_px,
         ));
-        let upgrade_count = upgrade_reqs.len();
-        let (ref mtx, ref cvar) = *queue_arc;
-        let mut q = mtx.lock().unwrap();
+        let mut heavy_reqs: Vec<LoadRequest> = Vec::new();
+        let mut regular_reqs: Vec<LoadRequest> = Vec::new();
         for r in upgrade_reqs {
-            // true = 高画質化要求
-            self.requested.insert(r.idx, true);
-            q.push(r);
+            if self
+                .items
+                .get(r.idx)
+                .is_some_and(|it| it.is_heavy_io())
+            {
+                heavy_reqs.push(r);
+            } else {
+                regular_reqs.push(r);
+            }
         }
-        drop(q);
-        for _ in 0..upgrade_count {
-            cvar.notify_one();
+        for (reqs, queue) in [(regular_reqs, &reload_arc), (heavy_reqs, &heavy_arc)] {
+            if reqs.is_empty() {
+                continue;
+            }
+            let count = reqs.len();
+            let (ref mtx, ref cvar) = **queue;
+            let mut q = mtx.lock().unwrap();
+            for r in reqs {
+                self.requested.insert(r.idx, true);
+                q.push(r);
+            }
+            drop(q);
+            for _ in 0..count {
+                cvar.notify_one();
+            }
         }
     }
 
