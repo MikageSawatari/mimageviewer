@@ -138,10 +138,12 @@ unsafe impl Send for GpuLatestFrame {}
 #[cfg(windows)]
 unsafe impl Sync for GpuLatestFrame {}
 
-/// `future_frames` キューの最大長。channel(8) と同じ値。
-/// 1080p RGBA で 8 * ~8MB = 64MB。decoder pacing とチャネル背圧で実質
-/// この上限に達することは稀。
-const MAX_RENDER_QUEUE: usize = 8;
+/// `future_frames` キューの最大長。decoder の `video_tx` (= 24) と揃える。
+/// 1080p RGBA で 24 × ~8MB = 192MB 程度 (CPU 経路の上限)。GPU 経路では
+/// 1 frame ≈ HANDLE+メタのみで実コストは無視できる。decoder の burst-stall
+/// パターン (~400ms) + HDD random read (~100-300ms) を ~800ms buffer で
+/// 吸収して UI tick の空振りを抑える (Phase 8.J)。
+const MAX_RENDER_QUEUE: usize = 24;
 
 impl VideoPlayer {
     /// 新しい VideoPlayer を作る。FFmpeg DLL のロードはここで行う (冪等)。

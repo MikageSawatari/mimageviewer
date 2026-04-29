@@ -150,7 +150,12 @@ pub fn spawn(
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
     // 維持し、vsync 1 周期で取り損ねた分を次周期に displayable な状態で
     // 取れるようにする。bounded(4) では 60fps で常に Full → drop に陥る。
-    let (video_tx, video_rx) = bounded::<VideoFrame>(8);
+    // Phase 8.J: 8 → 24 に増やす。
+    // - GPU 経路: 1 frame = HANDLE+メタのみ、メモリコスト無視
+    // - CPU 経路: 1080p RGBA × 24 = 192MB (= 許容範囲)
+    // 30fps で 800ms 分 buffer できるので、Phase 8.G で残った micro-burst の
+    // 350-400ms stall + HDD random read 100-300ms スパイクの両方を吸収。
+    let (video_tx, video_rx) = bounded::<VideoFrame>(24);
     let (audio_tx, audio_rx) = bounded::<AudioFrame>(32);
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
 
