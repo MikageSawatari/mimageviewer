@@ -43,7 +43,12 @@ fn main() -> eframe::Result {
 
 struct TesterApp {
     plugins: Vec<DiscoveredPlugin>,
+    /// 選択中のプラグインインデックス (`plugins` に対する index)。
+    /// フィルタ後の表示インデックスではなく、絞り込みが変わっても同じ要素を指し続けるため
+    /// `plugins` 側を使う。
     selected: Option<usize>,
+    /// 検索フィルタ (case-insensitive 部分一致)。空なら全件表示。
+    filter: String,
 
     bridge: Option<Arc<Bridge>>,
     audio: Option<AudioEngine>,
@@ -75,6 +80,7 @@ impl TesterApp {
         let mut app = Self {
             plugins: Vec::new(),
             selected: None,
+            filter: String::new(),
             bridge: None,
             audio: None,
             mode: Arc::new(Mutex::new(Mode::Bypass)),
@@ -246,13 +252,47 @@ impl eframe::App for TesterApp {
             .default_width(280.0)
             .show(ctx, |ui| {
                 ui.heading("Plugins");
-                if ui.button("Rescan").clicked() {
-                    self.scan();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Rescan").clicked() {
+                        self.scan();
+                    }
+                    if ui.button("Clear").on_hover_text("検索フィルタをクリア").clicked() {
+                        self.filter.clear();
+                    }
+                });
+                // 検索ボックス。display_name に対する case-insensitive 部分一致。
+                // path 側にもマッチさせる (ベンダー名がディレクトリ名に入っているケース対策)。
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("検索 (名前・パス、部分一致)")
+                        .desired_width(f32::INFINITY),
+                );
+
+                let needle = self.filter.trim().to_ascii_lowercase();
+                let total = self.plugins.len();
+                let matches: Vec<usize> = if needle.is_empty() {
+                    (0..total).collect()
+                } else {
+                    self.plugins
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            p.display_name.to_ascii_lowercase().contains(&needle)
+                                || p.path
+                                    .to_string_lossy()
+                                    .to_ascii_lowercase()
+                                    .contains(&needle)
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                };
+                ui.label(format!("{} / {} 件", matches.len(), total));
                 ui.separator();
+
                 let mut clicked: Option<usize> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (i, p) in self.plugins.iter().enumerate() {
+                    for &i in &matches {
+                        let p = &self.plugins[i];
                         let selected = self.selected == Some(i);
                         if ui
                             .selectable_label(selected, &p.display_name)
