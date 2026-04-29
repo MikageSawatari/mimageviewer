@@ -624,7 +624,7 @@ fn run_bench(
             for r in new_reqs {
                 let is_heavy = matches!(
                     contents.items.get(r.idx),
-                    Some(GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::Folder(_))
+                    Some(GridItem::ZipFile(_) | GridItem::Folder(_))
                 );
                 if is_heavy {
                     heavy.push(r);

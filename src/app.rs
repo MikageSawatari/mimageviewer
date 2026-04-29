@@ -1164,10 +1164,12 @@ pub struct App {
     /// アイテム idx → 画像メタデータ (mtime, file_size)。フォルダ・動画は None
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
-    /// 通常画像 (Image, ZipImage, PdfPage) 用
+    /// 通常画像 (Image, ZipImage, PdfPage) + PdfFile (フォルダ代表画、IPC 待ち) 用
     pub(crate) reload_queue: Option<Arc<NotifyQueue>>,
-    /// 重い I/O (ZipFile, PdfFile, Folder) 用の専用キュー。
+    /// 重い同期 I/O (ZipFile, Folder) 用の専用キュー。
     /// 専用 I/O ワーカー (2本) が priority 順に取り出す。
+    /// PdfFile は別プロセス IPC のため通常キュー側に振り分けて
+    /// PDFium pool (POOL_SIZE=3) の並列度を活かす。
     pub(crate) heavy_io_queue: Option<Arc<NotifyQueue>>,
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。
@@ -5085,8 +5087,8 @@ impl App {
     ///   正しい値を入れ直すまで保守的に 0 にしておく
     /// - idx-keyed HashMap 群 (rotation / rating / adjustment / thumb_pixels / ai_* / fs_*)
     /// - in-flight pending (fs_pending / ai_upscale_pending) のキャンセル
-    /// - reload_queue / heavy_io_queue の排水: 旧 idx 向け重い I/O (ZIP/PDF/Folder 代表画)
-    ///   が worker スロットを占有し続けるのを防ぐ。次フレームの
+    /// - reload_queue / heavy_io_queue の排水: 旧 idx 向け重い I/O (ZIP/Folder 代表画)
+    ///   や PDF レンダ要求が worker スロットを占有し続けるのを防ぐ。次フレームの
     ///   `update_keep_range_and_requests` が新 items に対応した request を再投入する
     ///
     /// items / thumbnails / image_metas / search_filter / selected / checked /
@@ -5668,11 +5670,11 @@ impl App {
             });
         };
 
-        // 通常ワーカー: reload_queue (Image, ZipImage, PdfPage)
+        // 通常ワーカー: reload_queue (Image, ZipImage, PdfPage, PdfFile)
         for i in 0..regular_threads {
             spawn_worker(i, "w", Arc::clone(&reload_queue));
         }
-        // I/O ワーカー: heavy_io_queue (ZipFile, PdfFile, Folder)
+        // I/O ワーカー: heavy_io_queue (ZipFile, Folder)
         for i in 0..io_threads {
             spawn_worker(i, "io", Arc::clone(&heavy_io_queue));
         }
@@ -6491,10 +6493,12 @@ impl App {
             }
             req.input_seq = self.input_seq;
             req.items_gen = self.items_generation;
-            // ZipFile / PdfFile / Folder → heavy_io_queue、それ以外 → reload_queue
+            // ZipFile / Folder (本物の同期 I/O) → heavy_io_queue、それ以外 → reload_queue
+            // PdfFile は別プロセス IPC 待ちでメインプロセス内負荷が無いため通常キュー側で
+            // PDFium pool (POOL_SIZE=3) の並列度を活かす。
             let is_heavy = matches!(
                 self.items.get(i),
-                Some(GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::Folder(_))
+                Some(GridItem::ZipFile(_) | GridItem::Folder(_))
             );
             // perf: エンキューイベント (タスク種別 + 優先度 + 相関 seq)
             if crate::perf::is_enabled() {
