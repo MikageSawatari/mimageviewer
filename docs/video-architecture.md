@@ -79,7 +79,13 @@ src/video/
 ├── mod.rs                  # VideoPlayer 公開 API (open / tick / seek / volume / loop)
 ├── decoder.rs              # demux + decode worker thread (HW/SW 自動切替)
 ├── audio.rs                # cpal WASAPI Shared 出力
-├── clock.rs                # AV master clock (audio PTS 基準)
+├── clock.rs                # AvClock (薄い facade、engine/ に委譲) — 詳細は下記
+├── engine/                 # 動画再生エンジン (state machine + master clock 分割実装)
+│   ├── mod.rs              # EngineEvent enum (Decoder/Audio events)
+│   ├── actor.rs            # EngineActor (state machine の source of truth)
+│   ├── state.rs            # EngineState / DecoderEvent / AudioEvent / ReadinessLatch
+│   ├── clock.rs            # MasterClock + ClockAnchor (純粋な値オブジェクト)
+│   └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、単独で unit test 可)
 ├── ffmpeg_loader.rs        # DLL extraction + LoadLibrary (一度だけ実行)
 ├── thumbnail.rs            # シーク先サムネイル取得 worker
 └── gpu_renderer/           # ★ DX12 backend 時のみ active、unsafe を局所化
@@ -89,6 +95,11 @@ src/video/
     ├── video_paint.rs      # egui_wgpu Callback で fullscreen quad 描画
     └── wgpu_import.rs      # NT shared HANDLE → wgpu::Texture (wgpu_hal::dx12 経由)
 ```
+
+エンジン側のリデザイン経緯は [docs/video-engine-redesign.md](video-engine-redesign.md) を
+参照。Phase 1 (skeleton) → Phase 2 (facade 化、AvClock を MasterClock + AudioBookkeeping に
+分割) → Phase 3 (state machine 配線) → Phase 4 (薄い facade 化を最終形として固定) の
+順で導入された。
 
 ### 各ファイルの責務
 
@@ -110,13 +121,21 @@ src/video/
 #### `audio.rs`
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
-- AvClock の audio PTS anchor を更新 (= マスタークロック)
+- AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)
 - audio 出力失敗時はクロックを wall-clock fallback に切替
+- 音声バッファ ≥500ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
 
-#### `clock.rs` (`AvClock`)
-- audio PTS を基準とした提示時刻計算 (= UI tick で `now_secs()` を取得)
-- seek 時は seek_serial をインクリメント (古いフレームを drop する目印)
-- post-seek の override 機構で「初フレーム到着まで時刻凍結」する
+#### `clock.rs` (`AvClock` — 薄い facade)
+- 公開 API は変更しないまま内部実装を `engine/` に委譲する **薄い facade**。
+- 委譲先:
+  - 時刻計算 (`now_secs` / `set_audio_pts` / `set_fallback_anchor` / `notify_seek_completed` の anchor 部分) → `engine::clock::MasterClock`
+  - 音声バッファ会計 (`set_audio_pump_buf_secs` / `add_audio_tx_queued_secs` / `total_audio_buffer_secs`) → `engine::audio_bookkeeping::AudioBookkeeping`
+- AvClock 自身が保持する状態:
+  - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_serial` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と内部 epoch で並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
+  - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.effective_volume()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
+- ⚠️ **新規コードからは AvClock を直接呼び出さない**。新しい状態を扱う処理は必ず
+  `EngineActor` 経由 (= `apply_command` / `handle_seek_request` / イベント送信) で書く。
+  volume / muted を engine 側に移す改修も Phase 5+ で個別タスクとして扱う。
 
 #### `gpu_renderer/d3d11_device.rs` (`GpuVideoDevice`)
 - D3D11 Device + VideoDevice + VideoContext + VideoContext1 + ID3D11Fence の所有

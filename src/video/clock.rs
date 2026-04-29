@@ -1,4 +1,4 @@
-//! 動画再生用 AV マスタークロック。
+//! 動画再生用 AV マスタークロック (= 互換 facade)。
 //!
 //! 音声 PTS をマスターにする一般的な実装 (mpv / ffplay 等と同じ)。
 //! 音声スレッドは出力したサンプル列の PTS を [`AvClock::set_audio_pts`] で報告し、
@@ -11,6 +11,32 @@
 //! `AtomicU64` に格納する。シーク要求 (target / direction / serial) はトリプルで
 //! 整合性が必要なので [`Mutex<SeekRequest>`] で保護する。fill_output などの RT 経路は
 //! 触らないので RT パフォーマンスに影響しない。
+//!
+//! # ⚠️ Phase 4 以降: 新規コードからは直接呼ばない
+//!
+//! Phase 2b 以降、`AvClock` は実装の大半を `engine::clock::MasterClock` (anchor 部分)
+//! および `engine::audio_bookkeeping::AudioBookkeeping` (バッファ会計) に委譲した
+//! **薄い facade**。残りの状態は所有関係が 2 種類に分かれている:
+//!
+//! - **EngineActor と並列管理されている互換複製** (`playing` / `audio_active` /
+//!   `eof_reached` / `seek_request` / `seek_serial` / `seek_target_override`):
+//!   `EngineActor` の `published_state` (`Arc<AtomicU8>`) + 内部 epoch が source of
+//!   truth。新規コードはこれらを `EngineActor` 経由で読むこと。
+//! - **AvClock 単独で source of truth を保持しているレガシー所有状態** (`volume` /
+//!   `muted`): `TransportCommand::SetVolume / SetMuted` は `EngineActor` 側では
+//!   no-op で、`audio.rs` が `clock.effective_volume()` を直接読む構造になっている。
+//!   将来 `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、
+//!   Phase 4 時点では AvClock 所有のまま。
+//!
+//! AvClock を残しているのは [`decoder.rs`] / [`audio.rs`] / [`super::VideoPlayer`] の
+//! 既存呼び出し点 (89 箇所) を壊さないための互換レイヤとして。**新規コードでは
+//! [`super::engine::actor::EngineActor`] を直接叩く** こと:
+//!
+//! - 状態遷移: `apply_command(TransportCommand::*)` を経由
+//! - シーク: `handle_seek_request(target_secs)` を経由
+//! - decoder/audio からの events は `EngineEvent` channel に push
+//!
+//! 詳細は [docs/video-engine-redesign.md] の「Phase 4」節を参照。
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,17 +63,20 @@ pub(super) struct SeekRequest {
 /// Phase 2b: 内部状態は `MasterClock` (anchor 部分) と `AudioBookkeeping`
 /// (pump/tx queued 会計) に分割。AvClock は旧 API を維持したまま委譲する。
 /// 公開 API は変えていないので、`decoder.rs` / `audio.rs` / `VideoPlayer` から
-/// 見える挙動は等価。Phase 4 で AvClock 自体を撤去し、`TransportController` API
-/// に置き換える計画。
+/// 見える挙動は等価。Phase 4 (= 当初計画の AvClock 撤去) は規模を縮小し、
+/// AvClock を **薄い互換 facade として残したまま** 状態の source of truth を
+/// `EngineActor` に確立する方針に軌道修正された。詳細は
+/// [docs/video-engine-redesign.md] の「Phase 4」節を参照。
 pub struct AvClock {
     /// anchor 部分。`audio_pts` / `audio_recorded_at` / `fallback_pts` /
     /// `fallback_recorded_at` を 1 つの `ClockAnchor` (Audio/Wall/Frozen) に統合した。
     /// audio_active=true → Audio source、false → Wall source (= 旧 fallback path)。
     /// playing=false / is_seeking=true のときは内部で Frozen に置換される。
-    /// Phase 4 で `EngineActor` が直接所有する想定。
+    /// 実体は `engine::clock::MasterClock` 側で、本フィールドは委譲先。
     master_clock: MasterClock,
     /// 再生中フラグ。false の間は `now_secs()` が進まない (= MasterClock を Frozen
-    /// 風に扱う)。Phase 4 で `EngineState::Paused` に統合。
+    /// 風に扱う)。`EngineActor` の `published_state` PLAYING bit と並列に管理されている
+    /// 互換用複製。新規読み手は EngineActor の `published_state` を見ること。
     playing: AtomicBool,
     /// pending なシーク要求。`None` = 未消費なし。
     /// take/request の両方が Mutex を取り、整合性のある (target, direction, serial)

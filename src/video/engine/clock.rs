@@ -139,10 +139,12 @@ impl MasterClock {
     ///
     /// 他のスレッド (decoder/audio/UI) からは呼ばないこと。最終目標は `pub(super)`
     /// で `video::engine` モジュール外に漏らさないことだが (Codex Phase 1a P1 反映)、
-    /// **Phase 2b 〜 Phase 3 の facade 期間中だけ `pub(crate)`** に緩める:
-    /// `AvClock` (= video::engine 外) が facade として MasterClock を所有し、
-    /// 旧 `set_audio_pts` 等から内部委譲する必要があるため。Phase 4 で AvClock を
-    /// 削除するときに `pub(super)` に戻す。
+    /// **`pub(crate)`** に緩めた状態を維持する:
+    /// `AvClock` (= video::engine 外、`src/video/clock.rs`) が facade として
+    /// MasterClock を所有し、旧 `set_audio_pts` 等から内部委譲する必要があるため。
+    /// Phase 4 では AvClock を撤去せず薄い facade として残す方針に軌道修正したため
+    /// (詳細は [docs/video-engine-redesign.md] の Phase 4 節)、本可視性も `pub(crate)`
+    /// のまま。将来 AvClock が完全撤去できた段階で `pub(super)` に戻すこと。
     ///
     /// 入力 anchor の `pts_secs` / `speed` が NaN や負値だと `now_secs()` の戻り値が
     /// 非有限になりうる。caller を信頼し、debug build のみ assert で検出する。

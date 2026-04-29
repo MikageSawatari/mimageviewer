@@ -117,7 +117,13 @@ mimageviewer/
 │   │   ├── ffmpeg_loader.rs # DLL を APPDATA に展開し SetDllDirectoryW で検索パス設定
 │   │   ├── decoder.rs       # 動画/音声デコード worker (avformat/avcodec/swscale/swresample)
 │   │   ├── audio.rs         # cpal (WASAPI) 経由の音声出力 + ring buffer
-│   │   └── clock.rs         # AV マスタークロック (音声 PTS 基準、シーク/一時停止/音量)
+│   │   ├── clock.rs         # AvClock (薄い互換 facade、内部は engine/ に委譲)
+│   │   └── engine/          # 動画再生エンジン (state machine + master clock 分割)
+│   │       ├── mod.rs       # EngineEvent enum (Decoder/Audio events)
+│   │       ├── actor.rs     # EngineActor (state machine、source of truth)
+│   │       ├── state.rs     # EngineState / DecoderEvent / AudioEvent / ReadinessLatch
+│   │       ├── clock.rs     # MasterClock + ClockAnchor (純粋値オブジェクト)
+│   │       └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、unit test 容易)
 │   ├── video_thumb.rs       # 動画サムネイル取得（Windows Shell API）
 │   ├── zip_loader.rs        # ZIP アーカイブ内画像列挙・読み込み（ZIP in ZIP フラット展開、画像判定は is_recognized_image_ext 経由）
 │   ├── archive_converter.rs # 7z/LZH → 無圧縮 ZIP 変換（sevenz-rust2 / delharc）（v0.7.0）
@@ -689,6 +695,37 @@ Windows エクスプローラー互換も取りたいときは、APP13 Photoshop
 IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バイナリ構築は工数大
 (200-400 行 + 相互作用テスト)。現状は優先度低、マニュアル側でエクスプローラー非対応を
 明記して回避。
+
+## 動画メタ情報の扱いと外部ダウンローダの言及禁止ポリシー
+
+動画ファイルに埋め込まれているチャプター情報・タイトル・説明文等のメタ情報を mIV が
+読んで右パネルやサムネイル一覧に表示する機能は、**FFmpeg の avformat が抽出する
+標準メタデータ** (Matroska tags / MP4 udta / ffmetadata 形式の `;FFMETADATA1` 等) を
+ソースとして扱う。**特定の外部ダウンローダの名前・URL・使用例は、ユーザー向けマニュアル
+(`htdocs/mimageviewer/manual/`)・製品ページ (`htdocs/mimageviewer/index.html`)・
+README.md・更新履歴・GitHub Releases の body・コミットメッセージ・配布同梱の readme 等、
+公開される文書には一切記載しない**。
+
+理由: 一部の動画サイト (YouTube 等) は ToS でサードパーティダウンロードを制限しており、
+特定ツール名を明記すると mIV がそのワークフローを推奨していると誤解されかねないため。
+mIV は **既にローカルに存在する動画ファイルを開くだけ** のビューワであり、ダウンロード
+手段を提供したり推奨したりしない。
+
+書き方の例 (どちらも内容は同じ):
+
+| NG (公開文書) | OK (公開文書) |
+|---|---|
+| 「<外部ツール名> で `<オプション>` を付けると…」 | 「動画にチャプターメタデータが埋め込まれていれば…」 |
+| 「<外部ツール> でダウンロードした動画の…」 | 「ローカルに保存済みの動画の…」 |
+| 「外部ツール (<具体名>, <別名> 等) で取得した…」 | 「外部ツールで取得した…」(具体名なし) |
+
+`docs/` 配下の設計ドキュメント (技術者向け) でも、特定ツール名を出さず「FFmpeg avformat が
+解釈できる標準的なメタデータ形式」と書く。コミットメッセージも同様。
+
+このポリシーはレビュー観点として恒久的に有効。新機能を追加・更新する際、文書差分に
+特定ダウンローダ名が出ていないか確認すること。レビュー時のセルフチェックは
+`git grep -i -E '<該当ツール名>' -- '*.md' '*.html' '*.txt'` 等で機械的に確認する
+(具体名を CLAUDE.md にも書かないため、レビュー時はその場で対象名を補完する)。
 
 ## Distribution
 

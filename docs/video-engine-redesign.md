@@ -566,10 +566,25 @@ VideoEngine drop 時:
 - **ここで序盤早送り問題が消える**
 - UI 側 (ui_fullscreen.rs) も TransportController に書き換え
 
-### Phase 4: 旧 AvClock 削除 + ドキュメント整備
-- AvClock とそれに依存する全 API を撤去
-- `docs/video-architecture.md` を新構造に合わせて全面改訂
-- `CLAUDE.md` に「動画再生エンジンの操作は TransportController 経由のみ」と明記
+### Phase 4: AvClock を薄い facade として固定 + ドキュメント整備
+- AvClock は **削除しない** (= 当初計画から軌道修正)。
+  - 理由 1: 内部状態の大半は既に Phase 2b で `MasterClock` + `AudioBookkeeping` に
+    移譲済 (= AvClock は薄い facade になっている)。
+  - 理由 2: `decoder.rs` / `audio.rs` / `mod.rs` 計 89 箇所の AvClock 呼び出しを直接
+    `EngineActor` API に書き換える変更は範囲が広く、Phase 3e で安定したばかりの
+    再生挙動を回帰させるリスクが大きい。
+  - 理由 3: AvClock 経由で動かしてもエンジンの **source of truth** は EngineActor
+    (= `published_state` + 内部 epoch) なので、設計目標 (= 序盤早送り問題の構造的解決 +
+    内部/外部の責務分離) は既に達成されている。
+- 代わりに `clock.rs` のドキュメンテーションコメントで **AvClock は互換 facade で
+  あり、新規コードからは EngineActor を直接叩くこと** を明記する。
+- `docs/video-architecture.md` を新モジュール構成 (engine/) に合わせて改訂。
+- `CLAUDE.md` に動画メタ情報の扱いポリシーを追記 (= 外部ダウンローダ名を文書に
+  載せない方針、新機能ロードマップで関連)。
+- Phase 5 以降の UI/UX 機能ロードマップを本ドキュメント末尾に追加。
+
+将来 AvClock を完全撤去する場合は、Phase 5+ の機能追加で `decoder.rs` / `audio.rs`
+側のロジックに手を入れるタイミングで callsite ごとに段階移行するのが安全。
 
 各 phase でリリース可能な状態を保つ (= 中間状態でも動画は再生できる)。
 
@@ -585,9 +600,12 @@ VideoEngine drop 時:
 - 倍速 (1.5x / 0.5x) でもまんべんなく安定
 - フルHD/4K/30fps/60fps の 4 組合せ × resume あり/なし の合計 8 ケース手動回帰
 
-### Phase 4 完了時
-- `cargo test` 全通過
-- 静的検査: `grep -r AvClock src/` がヒット 0
+### Phase 4 完了時 (= 軌道修正後の最終形)
+- `cargo test` 全通過 (テスト数は Phase 3 から増減しない)
+- `cargo build --release` 成功
+- `clock.rs` のモジュール doc-comment が「AvClock は互換 facade である」旨を明示
+- `docs/video-architecture.md` の `clock.rs` 節が新構造 (= engine/ 委譲) を反映
+- AvClock を完全削除する場合の段階移行計画が本ドキュメントに記録されている
 
 ## 倍速再生 (Codex P2 反映)
 
@@ -707,3 +725,179 @@ backward seek (例: 30秒位置 → 10秒位置) でも、`handle_seek_request` 
 - Chromium: `media::PipelineStatus` + `Renderer` の分離が本提案と同形
 - ffplay: `is->paused` / `is->seek_req` を 1 つの `VideoState` 構造体に詰めている
   → 我々の AvClock と同じ問題を持つ (移行先として参考にしない)
+
+## Phase 5 以降 (UI / UX 改善ロードマップ)
+
+エンジン側 (Phase 1–4) で再生 / シーク / pacing が安定したので、フルスクリーン動画再生の
+UX を整える。各項目は独立に着手可能。実装順は本節の番号順を想定 (依存関係順) だが、
+ユーザー優先度に応じて入れ替え可。
+
+### 5.1 既定挙動: 開いたら一時停止 + Enter で再生 + Space は選択
+
+**現状**: フルスクリーンで動画を開くと autoplay (`OpenOptions.autoplay = true`) で
+即座に再生開始する。Space キーで再生/一時停止トグル。
+
+**問題**:
+- 画像と動画が混在するフォルダで連続表示すると、動画だけ突然音が出る・誤クリックで
+  即再生開始してしまう体験になる。
+- Space キーは画像ビュアの「選択」と被っており、画像/動画混在選択時に挙動が文脈依存
+  でブレる。
+
+**変更**:
+- `OpenOptions.autoplay` のデフォルトを `false` (= 一時停止状態で開く) に変える。
+  最初のフレーム表示後は `EngineState::Paused` に留まる。
+- 環境設定の動画 autoplay 既定値も「自動再生しない」に変更 (旧設定を持つユーザーは
+  そのまま保持。新規ユーザーが false で始まる)。
+- フルスクリーン動画表示中の **Enter キー** で再生開始 / トグル。Shift+Enter で
+  外部プレイヤー起動 (既存機能の再アサイン)。
+- **Space キーは画像と同じ「選択」アサイン**に固定する (動画でも選択可能)。
+- 一時停止中はホバーバー直下の中央に「[Enter] 再生 / [Shift]+[Enter] 外部プレイヤー」
+  ヒントオーバーレイを薄く表示 (3 秒で fade)。
+
+**実装ポイント**:
+- `OpenOptions::default()` の `autoplay: true` → `false`
+- `Settings` の動画 autoplay 既定値変更 + migration (既存ユーザーの設定値はそのまま)
+- `ui_fullscreen.rs` の動画キーバインド差し替え: Space → 選択トグル、Enter → 再生トグル
+- ヒントオーバーレイは Paused 状態でのみ描画
+
+### 5.2 シークバーサムネイル: 2x サイズ + 時刻ラベル位置変更
+
+**現状**: シークバー hover 時にサムネ + mm:ss を重ねて表示。サムネは小さい。
+
+**変更**:
+- サムネサイズを縦横 2x (現行 ~120x68 → ~240x136 程度)。
+- mm:ss 表示はサムネ上に重ねず、**サムネの直下** に独立行として配置。背景は
+  半透明黒で読みやすく。
+
+**実装ポイント**:
+- `ui_fullscreen.rs` のシークバー hover 描画ブロック (thumbnail + label) のレイアウトを
+  「サムネ + 直下に label」の縦並びに変更。
+- サムネ抽出は既存の `ThumbnailWorker`。出力解像度を 2x に上げる (= スケール時に
+  upscale でぼやけないよう、ワーカー側のリクエスト解像度自体を上げる)。
+
+### 5.3 動画サムネイルの優先順位
+
+**現状**: 動画ファイルのグリッドサムネは `IShellItemImageFactory` 経由で
+Windows 標準サムネをそのまま使う。
+
+**変更**: 以下の優先順位で決定する。
+1. **ユーザーがピン留めした位置のフレーム** (= Phase 5.4 で UI を提供するピン機能の
+   出力。詳細は 5.4「ピン / ブックマークの authoring UI」節を参照)
+2. **同一ファイル名の画像** (環境設定で「同一ファイル名画像をサムネに使う」が ON のとき)
+   例: `movie.mp4` の隣に `movie.jpg` があれば後者をサムネに採用。拡張子優先順は
+   既存のサムネカタログと整合させる。
+3. **動画自体のデフォルトサムネ** (Windows Shell 経由、現状動作)
+
+**実装ポイント**:
+- `video_thumb.rs` の thumbnail 取得ロジックを上記 fallback chain に変更。
+- サムネカタログ DB のキーは「動画ファイルパス」のまま。生成時に上記順で source を
+  選び、source の path/mtime を一緒に記録 (sidecar 画像の更新検知)。
+- ピン留め情報は `rotation_db.rs` と同じ場所の SQLite (新テーブル `video_pins`) に保存:
+  `(video_path, pin_pts_secs, thumb_webp)`。
+
+### 5.4 埋め込みメタ情報の取り込み (チャプター等)
+
+**前提**: 動画ファイルに埋め込まれた標準メタデータ (Matroska tags / MP4 udta /
+FFmpeg avformat が解釈できる ffmetadata 形式) を読み取り、UI に反映する。
+**特定の外部ダウンローダ名は文書に出さない方針** (CLAUDE.md「動画メタ情報の扱いと
+外部ダウンローダの言及禁止ポリシー」を参照)。
+
+**右パネル (= メタデータ) の表示**:
+- 現状画像で出している EXIF パネルと同じ位置に、動画では:
+  - タイトル / 作者 / アルバム / 説明 (avformat の global metadata)
+  - チャプター一覧 (start_pts, end_pts, title)
+  - 解像度 / fps / duration / コーデック / 音声トラック数 (既に拾える)
+
+**左パネル (= ナビゲーション)**:
+画像と動画で **左右パネルの役割を入れ替える**。動画の左パネルは「ジャンプ可能位置の
+サムネ縦並び」とし、上から:
+1. ユーザーがピン留めした位置 (1 個まで、`📌` アイコン)
+2. ユーザーが 🔖 でブックマークした位置 (任意個数)
+3. 埋め込みメタデータのチャプター開始位置
+
+各サムネ右側に mm:ss 表示。クリックでその位置に seek。
+
+**実装ポイント**:
+- `decoder.rs` 開始時に `AVFormatContext->metadata` + `AVChapter*` 配列を読んで
+  `VideoInfo` に追加フィールド `chapters: Vec<Chapter>` / `title: Option<String>` 等。
+- `Chapter { start_secs: f64, end_secs: f64, title: String }`。
+- ブックマーク・ピンは Phase 5.3 と同じ DB (`video_pins` / `video_bookmarks`)。
+- `ui_fullscreen.rs` の左右パネル切り替え分岐に動画モードを追加。
+
+#### 5.4.1 ピン / ブックマーク の authoring UI (Phase 5.3/5.4 共通の前提)
+
+5.3 のサムネ優先順位 1 と 5.4 の左パネル 1/2 行目を成立させるには、ユーザーが
+**ピンとブックマークを作成・更新・削除できる UI** が必要。仕様:
+
+- **ピン (📌)**: 動画再生中の現在位置をグリッドサムネとして固定する。1 動画につき
+  最大 1 個。
+  - 作成: フルスクリーン動画再生中のホバー上ツールバー (Phase 5.6) のピンボタン、
+    あるいはコンテキストメニュー「現在のフレームをサムネに固定」。
+  - 更新: 既にピンがある動画でもう一度押すと現在フレームで上書き。
+  - 削除: 同じボタンの長押しまたはコンテキストメニュー「ピンを削除」。
+  - 画像本体: ピンを作った時点でフレームを抽出し、`video_pins.thumb_webp`
+    に WebP で格納 (= 後でピン位置までシークしなくても表示できる)。
+- **ブックマーク (🔖)**: 任意の位置を任意個数記録。タイトル省略可。
+  - 作成: フルスクリーン動画再生中の B キー (新規) で「現在位置をブックマーク」、
+    または左パネルのプラスボタン。
+  - 削除: 左パネルの各ブックマーク行の右側 × ボタン。
+  - 順序: 時刻昇順 (= 自動ソート、ユーザー並び替え不要)。
+
+DB スキーマは `video_pins (video_path, pin_pts_secs, thumb_webp BLOB)` と
+`video_bookmarks (video_path, pts_secs, title, thumb_webp BLOB)` の 2 テーブル。
+両方 `rotation_db.rs` と同じ SQLite ファイル (= `%APPDATA%/mimageviewer/rotations.db` 等
+の現行 DB) に格納する想定。
+
+### 5.5 タイル サムネイル一覧 + クリック シーク (S キー)
+
+**変更**: フルスクリーン動画中に **S キー** でタイルモードに切替。
+
+**キーアサインの優先順位**:
+- 現状の `S` キーは画像フルスクリーンでスライドショー トグル ([src/ui_fullscreen.rs](../src/ui_fullscreen.rs))
+  に割り当てられている。動画モードでは S をタイルモードに **再アサイン** し、
+  画像モードのスライドショー アサインは温存する (= 文脈別に同キーを別機能に振る)。
+- もし将来「動画でもスライドショー (= 自動次動画再生) を S にしたい」要件が出たら、
+  動画タイルモードを別キー (例: T) に動かす。本ロードマップ着手時にあらためて検討する。
+
+**仕様**:
+- 1/2/5/10/20/30 秒、1/2/5/10/20/30 分の **時間間隔候補** から、画面に切れずに
+  最大数並ぶ最大の間隔を自動選択。
+- 基本横 10 列。動画のアスペクト比をサムネに反映 (16:9 動画なら横長サムネ)。
+- 各サムネをクリックするとその時刻に seek してタイルモード解除 + 再生。
+- 1 度生成したタイル一覧は VideoPlayer 生存中はメモリにキャッシュ (= 動画切替で破棄)。
+  キャッシュは時間間隔ごとに別 (= 同じ動画で違う間隔を選ぶと次回は再生成不要)。
+
+**実装ポイント**:
+- 既存 `ThumbnailWorker` を流用してバッチ抽出。一括 seek + decode を decoder thread
+  外で行うため、専用のバックグラウンド actor (= 軽量な短命スレッド) を用意し、
+  抽出中は通常再生 pacing と競合しないように分離する。
+- タイル UI は eframe の `egui::Grid` + クリックハンドラ。
+- キャッシュキー: `(video_path, interval_secs, tile_w_px)`。VideoPlayer 内 `HashMap`。
+- ESC で抜ける。再表示時はキャッシュ ヒットなら即時、ミスなら抽出進捗バー表示。
+
+### 5.6 ホバー上ツールバーの整理
+
+**現状**: 画像と共通の上ホバーバーに各種ボタン (回転 / 補正 / プリセット / etc.) が
+並ぶが、動画では多くが意味を持たない。
+
+**変更**: 動画モード時のホバー上ツールバーを最小化:
+- (新規) **タイル サムネイル ボタン** (S キー相当)
+- 必要に応じて 外部プレイヤー / 設定 など最低限のアイコン
+
+詳細レイアウトは実装時に再検討。Phase 5.5 ボタンの追加が最優先。
+
+### 5.7 (Phase 4 の追加スコープ — エンジン側で先行実装が望ましい)
+
+Phase 5.1–5.6 のいずれも:
+- `EngineActor` の `apply_command(TransportCommand::Pause)` の信頼性
+- `OpenOptions.autoplay = false` で開いたときの遷移経路:
+  - `Loading` → `Buffering` で **READY (= `FirstFrameReady ∧ (NoAudio ∨ BufferReady)`)** が
+    完成するまでは従来通り (= 既存 latch 不変条件を維持)。
+  - READY 完成時に `try_transition_from_buffering` が `autoplay=false` を尊重して
+    `Playing` ではなく `Paused` に遷移する。
+  - Paused に入った後はじめて video frame が UI に表示される (= Buffering 期間中の
+    fr ame は依然非表示で、latch invariant を崩さない)。
+
+を前提にする。Phase 4 完了時点で `try_transition_from_buffering` が `autoplay=false`
+を尊重して Paused に遷移するパスは既に存在する (Phase 3a で実装済) ので、5.1 の
+切り替えは小さい追加で達成できる見込み。
