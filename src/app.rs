@@ -2918,24 +2918,9 @@ impl App {
 
         let sort_t0 = std::time::Instant::now();
         let sort = self.settings.sort_order;
-        {
-            // folders (Folder / ZipFile / PdfFile / ConvertibleArchive) も
-            // ツールバーの sort_order に従って並べる。以前はファイル名昇順
-            // 固定で、「日付↓」等を切り替えても上段ブロックの並びが変わらない
-            // バグがあった。Explorer / Finder と同様にフォルダ群を先頭ブロック、
-            // ファイル群を後続ブロックに分ける構造は維持する。
-            let mut paired: Vec<_> = folders.into_iter().zip(folder_metas).collect();
-            paired.sort_by(|(a, ma), (b, mb)| {
-                let an = a.name();
-                let bn = b.name();
-                let a_mt = ma.map(|(mt, _)| mt).unwrap_or(0);
-                let b_mt = mb.map(|(mt, _)| mt).unwrap_or(0);
-                sort.compare(&an, a_mt, &bn, b_mt, natural_sort_key)
-            });
-            let (f, m): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
-            folders = f;
-            folder_metas = m;
-        }
+        // folders (Folder / ZipFile / PdfFile / ConvertibleArchive) も sort_order に
+        // 従って並べる (Explorer / Finder と同じ慣習で 2 段構成は維持)。
+        crate::grid_item::sort_folder_block(&mut folders, &mut folder_metas, sort);
         all_media.sort_by(|(a, _, a_mt, _), (b, _, b_mt, _)| {
             let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");

@@ -254,6 +254,34 @@ pub enum ThumbnailState {
     Evicted,
 }
 
+/// グリッド上段のフォルダ系ブロック (Folder / ZipFile / PdfFile / ConvertibleArchive 等)
+/// を `SortOrder` に従って並べ替える。`folder_metas` は同インデックスの
+/// `Some((mtime_secs, size))` (取得失敗時 `None`)。
+///
+/// `App::load_folder_inner` から呼ばれる本番経路。テストからも公開 API として直接呼んで
+/// 「フォルダ系も sort_order に従う」「同 mtime は名前で安定」等の不変条件を検証する。
+pub fn sort_folder_block(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+    sort: crate::settings::SortOrder,
+) {
+    // pub fn の契約違反 (folders と folder_metas の長さ不一致) は release でも止める。
+    // zip は短い方に合わせるので silently drop されると並びが壊れる。
+    assert_eq!(folders.len(), folder_metas.len());
+    let mut paired: Vec<_> = folders.drain(..).zip(folder_metas.drain(..)).collect();
+    paired.sort_by(|(a, ma), (b, mb)| {
+        let an = a.name();
+        let bn = b.name();
+        let a_mt = ma.map(|(mt, _)| mt).unwrap_or(0);
+        let b_mt = mb.map(|(mt, _)| mt).unwrap_or(0);
+        sort.compare(&an, a_mt, &bn, b_mt, crate::ui_helpers::natural_sort_key)
+    });
+    for (f, m) in paired {
+        folders.push(f);
+        folder_metas.push(m);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
