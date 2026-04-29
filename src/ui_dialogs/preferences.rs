@@ -400,6 +400,7 @@ impl App {
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
+                    self.settings.video_thumb_use_sidecar_image,
                 );
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
@@ -439,11 +440,14 @@ impl App {
                 }
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み
+                // (Phase 5.3: video_thumb_use_sidecar_image も含む — 切り替え時に
+                // video_thumb_overrides を作り直すため)
                 let new_dup = (
                     self.settings.skip_zip_if_folder_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
+                    self.settings.video_thumb_use_sidecar_image,
                 );
                 if old_dup != new_dup {
                     self.reload_current_folder_preserving_override();
