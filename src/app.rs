@@ -7173,6 +7173,10 @@ impl App {
             self.handle_meta_undo_keys(ctx);
 
             if enter {
+                // Shift+Enter で動画を外部プレイヤーで開く (フルスクリーン中と
+                // 同じ挙動をグリッドからも使えるようにする)。
+                let shift_enter =
+                    !self.ime_input_active() && ctx.input(|i| i.modifiers.shift);
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p))
@@ -7182,13 +7186,16 @@ impl App {
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             return Some(p);
                         }
+                        Some(GridItem::Video(p)) if shift_enter => {
+                            crate::ui_helpers::open_external_player(p);
+                        }
                         Some(GridItem::Image(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::ZipSeparator { .. })
                         | Some(GridItem::PdfPage { .. })
                         | Some(GridItem::Video(_)) => {
                             // 動画も画像と同じくフルスクリーン化 → インライン再生。
-                            // 外部プレイヤー起動はフルスクリーン中の Shift+Enter から。
+                            // Shift+Enter は上の専用分岐で外部プレイヤーへ。
                             // Phase 7.J: Enter からの open はグリッド意図扱い。
                             self.bump_input_seq_for_item("grid_enter", idx);
                             self.fs_open_intent_from_grid = true;
