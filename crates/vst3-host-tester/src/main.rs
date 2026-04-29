@@ -228,7 +228,30 @@ impl TesterApp {
                 ));
                 return;
             }
-            match Bridge::spawn(&self.bridge_exe_path) {
+            // bridge の stderr はログファイル + UI ログに合流させる
+            let log_lines_for_bridge = Arc::clone(&self.log_lines);
+            let log_file_for_bridge = self.log_file.clone();
+            let stderr_cb = move |line: String| {
+                if let Some(file) = &log_file_for_bridge {
+                    use std::io::Write;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    if let Ok(mut f) = file.lock() {
+                        let _ = writeln!(f, "[{:>13.3}] [bridge-stderr] {}", now, &line);
+                        let _ = f.flush();
+                    }
+                }
+                if let Ok(mut lines) = log_lines_for_bridge.lock() {
+                    lines.push(format!("[bridge] {line}"));
+                    if lines.len() > 200 {
+                        let drop_n = lines.len() - 200;
+                        lines.drain(..drop_n);
+                    }
+                }
+            };
+            match Bridge::spawn(&self.bridge_exe_path, stderr_cb) {
                 Ok(mut br) => {
                     if let Err(e) = br.send(&Cmd::Hello { version: 1 }) {
                         self.log(format!("bridge hello send failed: {e}"));

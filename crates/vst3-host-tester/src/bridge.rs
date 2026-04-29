@@ -135,14 +135,31 @@ unsafe impl Sync for EventHandle {}
 
 impl Bridge {
     /// bridge exe を子プロセスとして起動する。
-    pub fn spawn(exe_path: &std::path::Path) -> std::io::Result<Self> {
+    /// `stderr_cb` は bridge プロセスの stderr に書かれた 1 行を受け取るコールバック。
+    /// tester 側はこれを使ってログファイルにブリッジの内部状態 (show_gui の各ステップ等)
+    /// を合流させる。バックグラウンドスレッドが子プロセス終了まで動き続ける。
+    pub fn spawn<F>(exe_path: &std::path::Path, stderr_cb: F) -> std::io::Result<Self>
+    where
+        F: Fn(String) + Send + 'static,
+    {
         let mut child = Command::new(exe_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+        std::thread::Builder::new()
+            .name("bridge-stderr-pump".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    stderr_cb(line);
+                }
+            })
+            .ok(); // spawn 失敗しても致命ではない (= ログが流れないだけ)
         Ok(Self {
             child,
             stdin: Mutex::new(stdin),

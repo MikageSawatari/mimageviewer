@@ -6,8 +6,24 @@
 #include "plugin_loader.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <vector>
+
+namespace {
+// stderr へのデバッグログ。tester 側で pipe して log_file に流す。
+template <typename... Args>
+void blog(const char* fmt, Args... args) {
+    std::fprintf(stderr, "[BRIDGE] ");
+    std::fprintf(stderr, fmt, args...);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+inline void blog(const char* msg) {
+    std::fprintf(stderr, "[BRIDGE] %s\n", msg);
+    std::fflush(stderr);
+}
+}  // namespace
 
 #include "host_app.h"
 #include "pluginterfaces/base/funknownimpl.h"
@@ -259,31 +275,38 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
 }
 
 bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
+    blog("show_gui start hwnd=0x%llx", (unsigned long long)hwnd);
     if (!controller_) {
         error_out = "controller not available";
         return false;
     }
     if (view_attached_) {
         // すでにアタッチ済みなら一度外して付け直す
+        blog("show_gui: already attached, hiding first");
         hide_gui();
     }
     if (!view_) {
+        blog("show_gui: createView(kEditor)");
         view_ = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
         if (!view_) {
             error_out = "createView returned null (no editor)";
             return false;
         }
+        blog("show_gui: createView ok");
     }
     // VST3 の HWND タイプは "HWND" 文字列で指定 (kPlatformTypeHWND)
+    blog("show_gui: isPlatformTypeSupported(HWND)");
     if (view_->isPlatformTypeSupported(Steinberg::kPlatformTypeHWND) != Steinberg::kResultTrue) {
         error_out = "plugin view does not support HWND platform";
         view_ = nullptr;
         return false;
     }
+    blog("show_gui: setFrame");
     // attached より **前に** setFrame を呼ぶ。Pro-Q 4 等多くのプラグインは
     // frame が無いと描画開始しない (= 真っ白でハング)。
     view_->setFrame(plug_frame_);
 
+    blog("show_gui: attached(hwnd, HWND)");
     if (view_->attached(hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
         error_out = "attached() failed";
         view_->setFrame(nullptr);
@@ -291,13 +314,20 @@ bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
         return false;
     }
     view_attached_ = true;
+    blog("show_gui: attached ok");
 
     // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
     // これも描画開始トリガとして必要なプラグインが多い。
     Steinberg::ViewRect rect{};
     if (view_->getSize(&rect) == Steinberg::kResultOk) {
+        blog("show_gui: getSize=%dx%d, onSize",
+             rect.right - rect.left, rect.bottom - rect.top);
         view_->onSize(&rect);
+        blog("show_gui: onSize done");
+    } else {
+        blog("show_gui: getSize failed");
     }
+    blog("show_gui done");
     return true;
 }
 
