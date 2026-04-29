@@ -100,21 +100,23 @@
       </div>
     </div>
 
-    <h2>動画（サムネイルのみ）</h2>
-    <p>動画ファイルはサムネイル表示のみ対応しています。再生機能はありません。
-    サムネイルは Windows Shell API（IShellItemImageFactory）を使用して取得します。</p>
+    <h2>動画（インライン再生）</h2>
+    <p>動画ファイルはフルスクリーンでインライン再生できます (FFmpeg LGPL DLL バックエンド)。
+    グリッドサムネは Windows Shell API + 同名ファイル名画像 (sidecar) + ピン留めフレームの
+    優先順位で表示します。フルスクリーン操作の詳細は
+    <a href="fullscreen.html#video">フルスクリーン → 動画</a> 節を参照してください。</p>
     <div class="table-wrap">
       <table>
         <thead>
           <tr><th>拡張子</th><th>フォーマット</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>.mp4</code></td><td>MPEG-4</td></tr>
-          <tr><td><code>.avi</code></td><td>AVI</td></tr>
+          <tr><td><code>.mp4</code></td><td>MPEG-4 (H.264 / HEVC / AV1 等)</td></tr>
+          <tr><td><code>.mkv</code></td><td>Matroska (ほぼ全コーデック)</td></tr>
           <tr><td><code>.mov</code></td><td>QuickTime</td></tr>
-          <tr><td><code>.mkv</code></td><td>Matroska</td></tr>
-          <tr><td><code>.wmv</code></td><td>Windows Media Video</td></tr>
-          <tr><td><code>.mpg</code> / <code>.mpeg</code></td><td>MPEG</td></tr>
+          <tr><td><code>.avi</code></td><td>AVI</td></tr>
+          <tr><td><code>.wmv</code></td><td>Windows Media Video / VC-1</td></tr>
+          <tr><td><code>.mpg</code> / <code>.mpeg</code></td><td>MPEG-1 / MPEG-2</td></tr>
         </tbody>
       </table>
     </div>
@@ -122,8 +124,8 @@
     <div class="box tip">
       <span class="box-icon">💡</span>
       <div class="box-body">
-        動画サムネイルが表示されない場合は、対応するコーデックが Windows にインストールされていない可能性があります。
-        <strong>K-Lite Codec Pack</strong> などの一般的なコーデックパックをインストールすることで改善する場合があります。
+        音声は WASAPI 共有モード経由 (cpal)。ハードウェア デコード (D3D11VA) は環境設定の
+        「動画」ページで有効化できます。失敗時は自動で SW デコードに fall-back します。
       </div>
     </div>
 

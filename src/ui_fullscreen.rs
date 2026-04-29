@@ -4963,12 +4963,16 @@ impl App {
             }
         }
 
-        // 設定への反映 (player 借用は終わっているので self.settings を書き換え可能)
+        // 設定への反映 (player 借用は終わっているので self.settings を書き換え可能)。
+        // Phase 8 (Codex P3-1): 即時 save 化。グリッド列数や動画タイル列数が
+        // 即時保存されるのと挙動を揃え、強制終了時の loss を防ぐ。
         if let Some(v) = new_vol {
             self.settings.video_volume = v;
+            self.settings.save();
         }
         if loop_key {
             self.settings.video_loop = !self.settings.video_loop;
+            self.settings.save();
         }
 
         // Phase 5.5: S キーでタイルモード トグル。画面サイズは Context 側から取得。
@@ -5471,7 +5475,9 @@ impl App {
             if let Some(p) = self.fs_video_player(fs_idx) {
                 p.set_volume(frac);
             }
+            // Phase 8 (Codex P3-1): 即時 save (HUD スライダー操作の永続化)。
             self.settings.video_volume = frac;
+            self.settings.save();
         }
 
         // ── 音量 % テキスト (一番最後に描画 = 上に乗せる) ──

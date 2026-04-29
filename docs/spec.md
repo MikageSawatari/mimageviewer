@@ -468,9 +468,21 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] AI アップスケール（ONNX Runtime + DirectML、Real-ESRGAN / Real-CUGAN / NMKD-Siax）
 - [x] **TensorRT バックエンド対応**（NVIDIA GPU 専用、設定で有効化、DirectML 比 1.4-3.4x 高速）
   - `ai/runtime.rs` で multi-EP 対応、`AiBackend::DirectMl` / `TensorRt` / `Cpu` を切り替え
-  - 起動時バックエンドフォールバック: TRT pack 不在/破損なら DirectML に自動退避
-  - エンジンビルダー: `mimageviewer.exe --tensorrt-build <model>` 子プロセスで TRT 経路の 6 モデル (Upscale 5 + Denoise) を順次コンパイル。Classifier / MI-GAN は DirectML 経路のため除外
-  - 環境設定 → パフォーマンス → AI バックエンド ページから操作 (バックエンド選択 / FP16 トグル / 全エンジンビルド / キャッシュ削除 / 再起動)
+  - **配布**: 事前ビルド済みエンジン + CUDA/cuDNN/TensorRT/OnnxRuntime GPU 版 DLL を
+    まとめた「TensorRT パック」(約 1.97 GB) を GitHub Releases から配布。アプリ内
+    「TensorRT パックをダウンロード」ボタン (`ai/tensorrt_installer.rs`) で取得 → 自動展開
+    → 即座にバックエンド切替 (アプリ再起動不要)。途中中断時は次回再開。
+  - **ユーザー側のエンジンビルドは廃止**: 旧版は `mimageviewer.exe --tensorrt-build <model>`
+    子プロセスでビルドさせていたが、現在はビルド済みエンジンが pack に同梱されるため
+    待ち時間ゼロで使い始められる。
+  - **FP16 は常時有効** (= 旧 FP16 ON/OFF トグル UI は削除)。実測で画質はほぼ同等、
+    FP32 比 1.5-2x 高速のため切替メリットなし。
+  - 起動時 / インストール完了時のバックエンドフォールバック: TRT pack 不在/破損なら
+    DirectML に自動退避し、画面右上にバナー通知 → 「ワーカーを再起動」で手動復旧可。
+  - 推論は別プロセス (TRT worker) で動作。クラッシュ時は最大 3 回まで自動再起動、それでも
+    復旧しなければ DirectML フォールバック + バナー通知。
+  - エンジンキャッシュ削除: 環境設定 → パフォーマンス → AI バックエンド から
+    実行可能 (再ダウンロードで復旧)。
   - tile size の backend-aware 切替: TRT は 256、DirectML は 192 (実測ベース)
 - [x] AI JPEG ノイズ除去（RealPLKSR ~28MB 高品質 / OmniSR ~5.5MB 軽量、ブロックノイズ+モスキートノイズ除去）
 - [x] 画像タイプ自動判別（MobileNetV3 + ヒューリスティクス → モデル自動選択）

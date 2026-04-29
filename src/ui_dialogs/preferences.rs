@@ -198,6 +198,8 @@ pub(crate) struct PreferencesState {
     /// 「TensorRT パックをダウンロード」ボタンが押されたか。
     /// 環境設定の Apply/Cancel 後に App 側で読み取って TRT install dialog を開く。
     pub start_trt_install_requested: bool,
+    /// エンジンキャッシュ削除の確認ダイアログ表示中フラグ (Codex P3-2)。
+    pub trt_cache_delete_confirm_open: bool,
 }
 
 impl PreferencesState {
@@ -257,6 +259,7 @@ impl PreferencesState {
             trt_pack_size_mib,
             trt_engine_cache_size_mib,
             start_trt_install_requested: false,
+            trt_cache_delete_confirm_open: false,
         }
     }
 }
@@ -1050,25 +1053,60 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .button("エンジンキャッシュを削除")
                 .clicked()
             {
-                let dir = crate::ai::tensorrt_pack::engine_cache_dir();
-                match std::fs::remove_dir_all(&dir) {
-                    Ok(()) => {
-                        state.trt_engine_cache_size_mib = 0;
-                        crate::logger::log(format!(
-                            "[AI] エンジンキャッシュを削除しました: {}",
-                            dir.display()
+                // Codex P3-2: ボタンクリックで即削除ではなく、確認ダイアログを開く
+                // (= 他のキャッシュ管理 UI と挙動を揃える)
+                state.trt_cache_delete_confirm_open = true;
+            }
+            // 確認ダイアログ
+            if state.trt_cache_delete_confirm_open {
+                let mut do_delete = false;
+                let mut do_cancel = false;
+                egui::Window::new("エンジンキャッシュ削除の確認")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut state.trt_cache_delete_confirm_open.clone())
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!(
+                            "エンジンキャッシュ ({} MiB) を削除します。",
+                            state.trt_engine_cache_size_mib
                         ));
+                        ui.label(
+                            "再ダウンロードに 5〜15 分かかります。実行してよろしいですか?",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("削除する").clicked() {
+                                do_delete = true;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                do_cancel = true;
+                            }
+                        });
+                    });
+                if do_delete {
+                    let dir = crate::ai::tensorrt_pack::engine_cache_dir();
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {
+                            state.trt_engine_cache_size_mib = 0;
+                            crate::logger::log(format!(
+                                "[AI] エンジンキャッシュを削除しました: {}",
+                                dir.display()
+                            ));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            state.trt_engine_cache_size_mib = 0;
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "[AI] エンジンキャッシュ削除に失敗: {} ({})",
+                                dir.display(),
+                                e
+                            ));
+                        }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        state.trt_engine_cache_size_mib = 0;
-                    }
-                    Err(e) => {
-                        crate::logger::log(format!(
-                            "[AI] エンジンキャッシュ削除に失敗: {} ({})",
-                            dir.display(),
-                            e
-                        ));
-                    }
+                    state.trt_cache_delete_confirm_open = false;
+                } else if do_cancel {
+                    state.trt_cache_delete_confirm_open = false;
                 }
             }
         }

@@ -36,7 +36,9 @@ Windows 向け高速サムネイルビューワー
 - Susie 画像プラグイン対応（.spi、32bit）— PC-98 / X68000 時代の PI / MAG / PIC / PIC2 / XLD4 等のレトロ画像形式
 - PDF 表示（ページごとレンダリング、パスワード付き対応、PDFium 内蔵）
 - RAW / HEIC / AVIF / JPEG XL 対応（Windows WIC 経由）
-- 動画サムネイル表示（MP4, AVI, MKV 等）
+- 動画 インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、FFmpeg LGPL DLL バックエンド）
+  - フルスクリーンで Enter 再生、Shift+Enter で外部プレイヤー、シーク / 音量 / ループ操作
+  - チャプター / ブックマーク ジャンプ、ピン留めしたフレームをグリッドサムネに固定、タイル モード一覧
 - ルーペ機能（Shift 押しっぱなし / M キーでトグル、見開き・消しゴム・分析モードでも併用可）
 - UI テーマ（システム / ライト / ダーク）— Windows のアプリ用テーマにリアルタイム追従
 - 透過画像の背景色切替（B キーで テーマ既定 → 白 → 黒 → 市松 の順に循環）
@@ -53,7 +55,7 @@ Windows 向け高速サムネイルビューワー
 | アニメーション | GIF, APNG（Animated WebP は先頭フレームのみ表示） |
 | ドキュメント | PDF |
 | アーカイブ | ZIP（展開不要でブラウズ）、7z / LZH（クリックで ZIP に自動変換） |
-| 動画（サムネイルのみ） | MP4, AVI, MOV, MKV, WMV, MPEG |
+| 動画（インライン再生） | MP4, MKV, MOV, AVI, WMV, MPG, MPEG, HEVC, AV1 ほか FFmpeg avformat 対応形式 |
 
 ## 動作環境
 
