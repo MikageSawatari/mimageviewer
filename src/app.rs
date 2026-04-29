@@ -1600,9 +1600,9 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) video_jump_textures:
         std::collections::HashMap<i64, ((u64, u32, u32), egui::TextureHandle)>,
-    /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2)。
-    /// 同 (動画 path, interval, tile_w, slot, video_mtime) のキーで再オープン時に
-    /// 即座に表示できる。
+    /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
+    /// 同 (動画 path, tile_w, timestamp_ms) のキーで再オープン時に即座に表示できる。
+    /// 列数が同じなら抽出間隔を変えても共通 PTS のサムネは再利用される。
     #[cfg(windows)]
     pub(crate) video_tile_cache:
         Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,

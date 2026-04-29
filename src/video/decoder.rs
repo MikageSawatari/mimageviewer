@@ -593,9 +593,17 @@ fn run_decoder(
             if let Some(ref mut a) = audio_setup {
                 a.decoder.flush();
             }
-            // notify_seek_completed が pre-seek 音声会計のリセットも担う
-            // (post-seek hang 防止のため不可分)。
-            clock.notify_seek_completed(target_secs);
+            // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
+            // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
+            // 経路が monotonic-clamp で進まなくなる (Codex P1 指摘)。
+            // 失敗経路は anchor 据え置き + 音声会計だけリセットし、後続の最初の有効
+            // frame / sample が set_audio_pts / set_fallback_anchor 経由で自然に
+            // 現在位置にアンカーし直す。
+            if seek_result.is_ok() {
+                clock.notify_seek_completed(target_secs);
+            } else {
+                clock.reset_audio_bookkeeping_only();
+            }
             // Phase 3e: engine にも SeekCompleted を通知 (= Seeking → Buffering 遷移)。
             // これがないと engine は永久 Seeking 状態に張り付き、pacing escape が
             // 解除されない (Codex Phase 3e P1 反映)。

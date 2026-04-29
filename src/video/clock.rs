@@ -118,7 +118,6 @@ const SEEK_NONE: u64 = u64::MAX;
 
 /// `seek_override_clear` perf event の `result` 値 (analyze_perf.py が grep する)。
 /// 文字列リテラルを散らさず const にして typo を防ぐ。
-const RES_ALREADY_CLEAR: &str = "already_clear";
 const RES_STALE_SERIAL: &str = "stale_serial";
 const RES_CLEARED: &str = "cleared";
 const RES_CAS_FAILED: &str = "cas_failed";
@@ -457,7 +456,8 @@ impl AvClock {
         //   - bits が新世代に変わる → CAS が expected 不一致で失敗 (誤クリアなし)
         let cur_bits = self.seek_target_override_bits.load(Ordering::Acquire);
         if cur_bits == SEEK_NONE {
-            log_clear_result(completed_serial, None, None, RES_ALREADY_CLEAR);
+            // 通常再生中の audio/video コールバックも毎フレーム到達するため
+            // ここでは perflog しない (Codex P2 指摘の flooding 回避)。
             return;
         }
         let override_serial = self.seek_override_serial.load(Ordering::Acquire);
@@ -487,6 +487,13 @@ impl AvClock {
             Some(f64::from_bits(cur_bits)),
             result_str,
         );
+    }
+
+    /// seek 失敗時の後始末: anchor は触らずに pre-seek 音声会計だけ 0 リセット。
+    /// `notify_seek_completed` を呼ぶと anchor が target に書き換わり、demux 位置と
+    /// 整合しないクロック状態を作ってしまうため、失敗経路ではこちらを使う。
+    pub fn reset_audio_bookkeeping_only(&self) {
+        self.audio_bookkeeping.reset();
     }
 
     /// fallback wall clock を `(pts, 今)` に再アンカー。
