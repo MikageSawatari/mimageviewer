@@ -4142,6 +4142,40 @@ fn draw_play_triangle(painter: &egui::Painter, c: egui::Pos2, r: f32) {
 }
 
 /// ⏮ 最初から再生アイコン (左向き三角 + 縦バー) を描画する。
+/// ループ再生アイコン: 矢印付きの円弧 (↻ 風)。`color` で塗り色を指定 (ON/OFF 切替用)。
+/// 自前線描画にしてフォント glyph 依存を避ける。
+fn draw_loop_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new((r * 0.18).max(1.5), color);
+    // 上半弧 + 右半弧 (= 円のうち左下を切り取った C 字)。
+    // セグメントで近似 (egui の painter は arc 直接描画 API がないため)。
+    let segs = 24;
+    let start_deg = -200.0_f32; // 左下から開始
+    let end_deg = 30.0_f32; // 右上で終了 (= 矢印の根本)
+    let mut last: Option<egui::Pos2> = None;
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let deg = start_deg + (end_deg - start_deg) * t;
+        let rad = deg.to_radians();
+        let p = egui::pos2(c.x + r * rad.cos(), c.y + r * rad.sin());
+        if let Some(prev) = last {
+            painter.line_segment([prev, p], stroke);
+        }
+        last = Some(p);
+    }
+    // 矢印の頭 (右上端から右下方向への小三角)。
+    if let Some(tip) = last {
+        let arrow_len = r * 0.45;
+        // 矢じりは終点から「弧の接線方向ではなく外側」に出すと "↻" らしく見える。
+        let p1 = egui::pos2(tip.x + arrow_len * 0.4, tip.y - arrow_len * 0.7);
+        let p2 = egui::pos2(tip.x - arrow_len * 0.6, tip.y - arrow_len * 0.4);
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, p1, p2],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
 fn draw_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
     // 左端の縦バー
@@ -5273,6 +5307,49 @@ impl App {
             p.toggle_play();
         }
 
+        // ── ループ再生 トグルボタン (L キーと同等) ──
+        let loop_on = self.settings.video_loop;
+        let loop_rect = egui::Rect::from_min_size(
+            egui::pos2(play_rect.max.x + pad, cy - btn_size / 2.0),
+            egui::vec2(btn_size, btn_size),
+        );
+        let loop_resp = ui.interact(
+            loop_rect,
+            egui::Id::new(("video_loop", fs_idx)),
+            egui::Sense::click(),
+        );
+        // ループ ON のときはアクセント色 (緑) で背景塗り、ホバーは色濃く。
+        let loop_bg = if loop_on {
+            if loop_resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(60, 130, 60, 220)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(50, 100, 50, 180)
+            }
+        } else if loop_resp.hovered() {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect_filled(loop_rect, 4.0, loop_bg);
+        let loop_color = if loop_on {
+            egui::Color32::from_rgb(180, 240, 180)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+        };
+        draw_loop_icon(&painter, loop_rect.center(), btn_size * 0.32, loop_color);
+        let loop_resp = loop_resp.on_hover_text(if loop_on {
+            "ループ再生 ON (クリックで OFF) [L]"
+        } else {
+            "ループ再生 OFF (クリックで ON) [L]"
+        });
+        if loop_resp.clicked() {
+            self.settings.video_loop = !self.settings.video_loop;
+            self.settings.save();
+            if let Some(p) = self.fs_video_player(fs_idx) {
+                p.set_loop_enabled(self.settings.video_loop);
+            }
+        }
+
         // ── 時刻表示 ──
         let time_text = format!(
             "{} / {}",
@@ -5282,7 +5359,7 @@ impl App {
         let time_galley = painter.layout_no_wrap(time_text, time_font, egui::Color32::WHITE);
         let time_w = time_galley.size().x;
         let time_h = time_galley.size().y;
-        let time_pos = egui::pos2(play_rect.max.x + pad, cy - time_h / 2.0);
+        let time_pos = egui::pos2(loop_rect.max.x + pad, cy - time_h / 2.0);
         painter.galley(time_pos, time_galley, egui::Color32::WHITE);
 
         // ── 音量 % (右端、レイアウトのみ — テキストは最後に上に重ねて描く) ──
@@ -5368,9 +5445,9 @@ impl App {
                 }
 
                 // 直近キャッシュからサムネ取得 → GPU テクスチャに反映 → 描画
-                // Phase 5.2: ラベルを **サムネの下** に独立して配置するため、
-                // 先にラベル galley を作って高さを取り、サムネの y 位置でその分の
-                // 余白を確保する。
+                // Phase 8.H: サムネ未到着時もプレースホルダ枠を出して「ロード後に
+                // 枠が出る」ちらつきを防ぐ。サイズは動画 aspect から逆算した固定値で、
+                // ロード完了で同じ位置に画像差し替え。
                 let thumb_opt = self.fs_video_player(fs_idx)
                     .and_then(|p| p.nearest_seek_thumbnail(target));
                 let label = crate::ui_helpers::format_hms(target);
@@ -5380,69 +5457,88 @@ impl App {
                 const GAP_THUMB_TO_HUD: f32 = 8.0;
                 const GAP_THUMB_TO_LABEL: f32 = 4.0;
                 const LABEL_PAD: f32 = 4.0;
-                let thumb_drawn = if let Some(thumb) = thumb_opt.as_ref() {
+                // サムネ既定サイズ (= ロード前後で位置・寸法を一定に保つ)。動画の
+                // aspect が既知ならそれを使い、不明なら 16:9 で代替。
+                const PLACEHOLDER_W: f32 = 200.0;
+                let aspect = self
+                    .fs_video_player(fs_idx)
+                    .and_then(|p| p.info())
+                    .map(|i| {
+                        if i.height > 0 {
+                            i.width as f32 / i.height as f32
+                        } else {
+                            16.0 / 9.0
+                        }
+                    })
+                    .unwrap_or(16.0 / 9.0);
+                let (thumb_w, thumb_h) = match thumb_opt.as_ref() {
+                    Some(t) => (t.width as f32, t.height as f32),
+                    None => (PLACEHOLDER_W, (PLACEHOLDER_W / aspect).round()),
+                };
+                let thumb_x = (x - thumb_w / 2.0)
+                    .clamp(full_rect.min.x + 4.0, full_rect.max.x - thumb_w - 4.0);
+                let label_block_h = label_size.y + LABEL_PAD * 2.0;
+                let mut thumb_y = hud_rect.min.y
+                    - GAP_THUMB_TO_HUD
+                    - label_block_h
+                    - GAP_THUMB_TO_LABEL
+                    - thumb_h;
+                let min_y = full_rect.min.y + 4.0;
+                if thumb_y < min_y {
+                    thumb_y = min_y;
+                }
+                let thumb_rect = egui::Rect::from_min_size(
+                    egui::pos2(thumb_x, thumb_y),
+                    egui::vec2(thumb_w, thumb_h),
+                );
+                // 共通: 外側の黒背景 (= 枠の外側 padding) + 中身は黒で塗っておく。
+                painter.rect_filled(
+                    thumb_rect.expand(2.0),
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                );
+                painter.rect_filled(thumb_rect, 2.0, egui::Color32::BLACK);
+                if let Some(thumb) = thumb_opt.as_ref() {
                     let tex_id = self.upload_seek_thumb_texture(ui.ctx(), fs_idx, thumb);
-                    let thumb_w = thumb.width as f32;
-                    let thumb_h = thumb.height as f32;
-                    let thumb_x = (x - thumb_w / 2.0)
-                        .clamp(full_rect.min.x + 4.0, full_rect.max.x - thumb_w - 4.0);
-                    // サムネ → 余白 → ラベル → HUD という縦方向レイアウト。
-                    let label_block_h = label_size.y + LABEL_PAD * 2.0;
-                    let mut thumb_y = hud_rect.min.y
-                        - GAP_THUMB_TO_HUD
-                        - label_block_h
-                        - GAP_THUMB_TO_LABEL
-                        - thumb_h;
-                    // 上端に余裕がない場合 (= 縦の小さなウィンドウ) は画面上端に
-                    // 寄せる。サムネがウィンドウ高さを超える極端ケースは想定しない。
-                    let min_y = full_rect.min.y + 4.0;
-                    if thumb_y < min_y {
-                        thumb_y = min_y;
-                    }
-                    let thumb_rect = egui::Rect::from_min_size(
-                        egui::pos2(thumb_x, thumb_y),
-                        egui::vec2(thumb_w, thumb_h),
-                    );
-                    // 黒背景 (枠 + うっすら内側 padding) + 画像 + 白枠
-                    painter.rect_filled(
-                        thumb_rect.expand(2.0),
-                        3.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
-                    );
                     painter.image(
                         tex_id,
                         thumb_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
-                    painter.rect_stroke(
-                        thumb_rect,
-                        2.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
-                        egui::StrokeKind::Inside,
+                } else {
+                    // 読み込み中表示 (= サムネ未到着、worker が抽出中)。
+                    let loading = "読込中...";
+                    let loading_galley = painter.layout_no_wrap(
+                        loading.to_string(),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_rgb(200, 200, 200),
                     );
-                    Some(thumb_rect)
-                } else {
-                    None
-                };
+                    let loading_pos = egui::pos2(
+                        thumb_rect.center().x - loading_galley.size().x / 2.0,
+                        thumb_rect.center().y - loading_galley.size().y / 2.0,
+                    );
+                    painter.galley(
+                        loading_pos,
+                        loading_galley,
+                        egui::Color32::from_rgb(200, 200, 200),
+                    );
+                }
+                painter.rect_stroke(
+                    thumb_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                    egui::StrokeKind::Inside,
+                );
 
-                // 時刻ラベル: Phase 5.2 でサムネに重ねず、サムネの **直下** に独立行
-                // として表示する。サムネが無いケースは従来通り HUD 上端の上。
-                let label_pos = if let Some(thumb_rect) = thumb_drawn {
-                    egui::pos2(
-                        (x - label_size.x / 2.0).clamp(
-                            full_rect.min.x + LABEL_PAD,
-                            full_rect.max.x - label_size.x - LABEL_PAD,
-                        ),
-                        thumb_rect.max.y + GAP_THUMB_TO_LABEL + LABEL_PAD,
-                    )
-                } else {
-                    egui::pos2(
-                        (x - label_size.x / 2.0)
-                            .clamp(hud_rect.min.x + 2.0, hud_rect.max.x - label_size.x - 2.0),
-                        hud_rect.min.y - label_size.y - 6.0,
-                    )
-                };
+                // 時刻ラベル: サムネ枠の **直下** に常に独立行で表示。
+                let label_pos = egui::pos2(
+                    (x - label_size.x / 2.0).clamp(
+                        full_rect.min.x + LABEL_PAD,
+                        full_rect.max.x - label_size.x - LABEL_PAD,
+                    ),
+                    thumb_rect.max.y + GAP_THUMB_TO_LABEL + LABEL_PAD,
+                );
                 let bg = egui::Rect::from_min_size(label_pos, label_size).expand(LABEL_PAD);
                 painter.rect_filled(
                     bg,
