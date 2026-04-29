@@ -1604,6 +1604,14 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) video_tile_cache:
         Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
+    /// 動画フルスクリーン中の右メタ情報パネルが現在表示中か (Phase 7.I: ホバー
+    /// 条件のヒステリシス用 — 表示後はパネル矩形全体をホバー範囲にして、
+    /// パネル上スクロール中に消えないようにする)。
+    #[cfg(windows)]
+    pub(crate) show_video_metadata_panel_visible: bool,
+    /// 同左ジャンプパネル用。
+    #[cfg(windows)]
+    pub(crate) show_video_jump_panel_visible: bool,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2402,6 +2410,10 @@ impl Default for App {
             video_jump_textures: std::collections::HashMap::new(),
             #[cfg(windows)]
             video_tile_cache,
+            #[cfg(windows)]
+            show_video_metadata_panel_visible: false,
+            #[cfg(windows)]
+            show_video_jump_panel_visible: false,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

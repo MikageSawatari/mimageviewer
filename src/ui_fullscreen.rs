@@ -2320,14 +2320,13 @@ impl App {
                         // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
                         // で seek + close を行うため、background catch-all は完全抑止
                         // (Codex P5.5 H1 反映)。
+                        // Phase 7.I 追加: 一時停止中の中央 2 ボタン (最初から / 続きから)
+                        // の領域を除外。
                         let tile_active = self.video_tile_state.is_some();
                         let pos_opt = fs_response.interact_pointer_pos();
                         let in_hud = pos_opt
                             .map(|p| video_hud_rect(full_rect).contains(p))
                             .unwrap_or(false);
-                        // パネル領域 (画面端 1/4) を判定して toggle_play 抑止に使う。
-                        // パネル自体が描画されているかは hover で動的に決まるので、
-                        // ここでは「画面端 1/4 以内に居たら誤発火しない」程度の保守判定。
                         let in_video_panel = pos_opt
                             .map(|p| {
                                 let left_thresh = full_rect.min.x + full_rect.width() * 0.25;
@@ -2336,10 +2335,29 @@ impl App {
                                     && p.y >= full_rect.min.y + 44.0
                             })
                             .unwrap_or(false);
+                        // 中央ボタン (一時停止時のみ描画) の領域を除外。
+                        let video_paused = self
+                            .fullscreen_idx
+                            .and_then(|idx| self.fs_video_player(idx))
+                            .map(|p| !p.is_playing())
+                            .unwrap_or(false);
+                        let in_center_buttons = if video_paused {
+                            pos_opt
+                                .map(|p| {
+                                    let cx = full_rect.center().x;
+                                    let cy = full_rect.center().y;
+                                    // 2 ボタンを覆う 320x150 の中央帯 (= 各 112x112 + gap)
+                                    (p.x - cx).abs() < 160.0 && (p.y - cy).abs() < 75.0
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
                         if fs_response.clicked()
                             && !tile_active
                             && !in_hud
                             && !in_video_panel
+                            && !in_center_buttons
                             && let Some(idx) = self.fullscreen_idx
                             && let Some(p) = self.fs_video_player(idx)
                         {
@@ -5070,9 +5088,96 @@ impl App {
             return;
         }
 
-        // ── 一時停止中: 中央に再生アイコン ──
+        // ── 一時停止中: 中央に再生アイコン (続きから) + ⏮ アイコン (最初から) ──
+        // Phase 7.I: 「前回の続きからみたいのか / 最初から観たいのか選べるように」
+        // 同サイズの 2 ボタンを左右に並べる。
         if !is_playing {
-            draw_play_icon(ui.painter(), full_rect.center(), 56.0);
+            let painter = ui.painter().clone();
+            let icon_radius = 56.0;
+            let gap = 64.0;
+            let left_center = egui::pos2(full_rect.center().x - icon_radius - gap / 2.0, full_rect.center().y);
+            let right_center = egui::pos2(full_rect.center().x + icon_radius + gap / 2.0, full_rect.center().y);
+
+            // ⏮ 最初から再生 (左)
+            let left_rect = egui::Rect::from_center_size(
+                left_center,
+                egui::vec2(icon_radius * 2.0, icon_radius * 2.0),
+            );
+            let left_resp = ui.interact(
+                left_rect,
+                egui::Id::new(("video_center_replay", fs_idx)),
+                egui::Sense::click(),
+            );
+            // 半透明黒の円形バッジで視認性 + ホバー時に明るく
+            let left_bg_alpha = if left_resp.hovered() { 180 } else { 110 };
+            painter.circle_filled(
+                left_center,
+                icon_radius,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, left_bg_alpha),
+            );
+            painter.circle_stroke(
+                left_center,
+                icon_radius,
+                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+            );
+            draw_replay_icon(&painter, left_center, icon_radius * 0.6);
+            // 「最初から」ラベル (アイコン直下)
+            painter.text(
+                egui::pos2(left_center.x, left_center.y + icon_radius + 14.0),
+                egui::Align2::CENTER_CENTER,
+                "最初から",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgba_unmultiplied(230, 230, 230, 230),
+            );
+            if left_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if left_resp.clicked()
+                && let Some(p) = self.fs_video_player(fs_idx)
+            {
+                p.seek(0.0);
+                if !p.is_playing() {
+                    p.toggle_play();
+                }
+            }
+
+            // ▶ 続きから再生 (右、= 既存の center 再生アイコン位置を踏襲)
+            let right_rect = egui::Rect::from_center_size(
+                right_center,
+                egui::vec2(icon_radius * 2.0, icon_radius * 2.0),
+            );
+            let right_resp = ui.interact(
+                right_rect,
+                egui::Id::new(("video_center_play", fs_idx)),
+                egui::Sense::click(),
+            );
+            let right_bg_alpha = if right_resp.hovered() { 180 } else { 110 };
+            painter.circle_filled(
+                right_center,
+                icon_radius,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, right_bg_alpha),
+            );
+            painter.circle_stroke(
+                right_center,
+                icon_radius,
+                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+            );
+            draw_play_icon(&painter, right_center, icon_radius);
+            painter.text(
+                egui::pos2(right_center.x, right_center.y + icon_radius + 14.0),
+                egui::Align2::CENTER_CENTER,
+                "続きから",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgba_unmultiplied(230, 230, 230, 230),
+            );
+            if right_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if right_resp.clicked()
+                && let Some(p) = self.fs_video_player(fs_idx)
+            {
+                p.toggle_play();
+            }
         }
 
         // ── 下部 HUD バー ──
@@ -5420,10 +5525,10 @@ impl App {
         let block_w = g1.size().x.max(g2.size().x);
         let block_h = g1.size().y + line_gap + g2.size().y;
         let pad = 10.0;
-        // 中央 56px 半径の再生アイコン直下に配置 (= draw_play_icon の呼び出し位置)。
-        // アイコン半径 56 + 余白 18 = 74px 下げたところを bg_rect の上端にする。
+        // 中央 2 ボタン (= 半径 56、ラベル "最初から" / "続きから" 込み) の直下に配置。
+        // ボタン center.y からアイコン半径 56 + ラベル 14px 余白 + ヒント余白 28px = 98px。
         let center_x = full_rect.center().x;
-        let top_y = full_rect.center().y + 74.0;
+        let top_y = full_rect.center().y + 98.0;
         let bg_rect = egui::Rect::from_min_max(
             egui::pos2(center_x - block_w / 2.0 - pad, top_y),
             egui::pos2(

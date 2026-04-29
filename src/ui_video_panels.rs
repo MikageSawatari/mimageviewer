@@ -45,21 +45,34 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) -> bool {
-        // 表示判定: TAB 固定 OR 画面右端 80px 以内にカーソルがあり、かつ HUD 領域
-        // (下端 44px) より上 (Phase 7: シークバー / 音量等の操作中に右パネルが
-        // 出てくる問題の解消)。
+        // 表示判定: TAB 固定 OR 「entry zone (画面右端 80px 以内)」にカーソルが
+        // 入った時点でパネル表示開始、表示中はカーソルが「パネル矩形全体」内にあれば
+        // 継続表示。これでパネル上をホイール スクロール / 行クリックしている間に
+        // パネルが消える問題を解消 (Phase 7: シークバー / 音量等の操作中に右パネルが
+        // 出てくる問題は entry zone の幅で別途抑止する)。
         let panel_w = VIDEO_PANEL_WIDTH.min(full_rect.width() * 0.5);
-        let hover_x_threshold = full_rect.max.x - 80.0;
         let hover_y_max = full_rect.max.y - 48.0; // HUD 44px + 4px 余白
-        let hover_in_right = ctx.input(|i| {
+        let entry_x_threshold = full_rect.max.x - 80.0;
+        let panel_x_threshold = full_rect.max.x - panel_w;
+        let was_visible = self.show_video_metadata_panel_visible;
+        let hover_in_zone = ctx.input(|i| {
             i.pointer
                 .hover_pos()
-                .map(|p| p.x > hover_x_threshold && p.y < hover_y_max)
+                .map(|p| {
+                    let x_min = if was_visible {
+                        panel_x_threshold
+                    } else {
+                        entry_x_threshold
+                    };
+                    p.x > x_min && p.y < hover_y_max
+                })
                 .unwrap_or(false)
         });
-        if !self.show_metadata_panel && !hover_in_right {
+        if !self.show_metadata_panel && !hover_in_zone {
+            self.show_video_metadata_panel_visible = false;
             return false;
         }
+        self.show_video_metadata_panel_visible = true;
 
         // VideoPlayer から info() を取り出す。未着のうちはパネル自体は出すがコンテンツが
         // 「読み込み中...」になる (動画 metadata は open 直後に来るので一瞬だけ)。
@@ -233,20 +246,31 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) -> bool {
-        // 表示判定: 画面左端 80px 以内にカーソルがあり、かつ HUD 領域 (下端 44px)
-        // より上 (Phase 7: シークバー / 再生ボタン操作中に左パネルが出てくる問題の解消)。
+        // 表示判定: entry zone (画面左端 80px 以内) で表示開始、表示中は
+        // 「パネル矩形全体」内なら継続表示 (パネル上ホイール / 行クリックで消えない)。
         let panel_w = VIDEO_JUMP_PANEL_WIDTH.min(full_rect.width() * 0.4);
-        let hover_x_threshold = full_rect.min.x + 80.0;
         let hover_y_max = full_rect.max.y - 48.0;
-        let hover_in_left = ctx.input(|i| {
+        let entry_x_threshold = full_rect.min.x + 80.0;
+        let panel_x_threshold = full_rect.min.x + panel_w;
+        let was_visible = self.show_video_jump_panel_visible;
+        let hover_in_zone = ctx.input(|i| {
             i.pointer
                 .hover_pos()
-                .map(|p| p.x < hover_x_threshold && p.y < hover_y_max)
+                .map(|p| {
+                    let x_max = if was_visible {
+                        panel_x_threshold
+                    } else {
+                        entry_x_threshold
+                    };
+                    p.x < x_max && p.y < hover_y_max
+                })
                 .unwrap_or(false)
         });
-        if !hover_in_left {
+        if !hover_in_zone {
+            self.show_video_jump_panel_visible = false;
             return false;
         }
+        self.show_video_jump_panel_visible = true;
 
         // 動画パスとピン/ブックマーク読み出し
         let video_path: Option<PathBuf> = match self.fs_cache.get(&fs_idx) {
