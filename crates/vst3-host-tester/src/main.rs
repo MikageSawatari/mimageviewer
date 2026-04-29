@@ -26,6 +26,39 @@ use audio::{AudioEngine, Mode, ToneParams};
 use bridge::{Bridge, Cmd, Event};
 use scanner::DiscoveredPlugin;
 
+/// Windows のシステムフォントから日本語フォントを読み込んで egui に設定する。
+/// 未設定だとログ等の日本語が □ で表示される。
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let font_paths = [
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+    ];
+    for path in &font_paths {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "japanese".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            // 先頭に挿入 = プライマリ。fallback (末尾) だと Latin と
+            // メトリクスが混在して TextEdit の縦位置がずれる。
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "japanese".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "japanese".to_owned());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -74,7 +107,8 @@ struct TesterApp {
 }
 
 impl TesterApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        setup_fonts(&cc.egui_ctx);
         // bridge exe は worktree 内の vendor/vst3-host/ にある (CMake の出力先)
         // 実行時の cwd は workspace ルートまたは tester crate ディレクトリのどちらかが想定される
         let candidates = [
@@ -217,6 +251,7 @@ impl TesterApp {
                         }
                     }
                     self.bridge = Some(Arc::new(br));
+                    self.log("bridge online — Show GUI / Through mode が利用可能になりました");
                     // bridge ハンドルが変わったので audio engine を再構築
                     self.restart_audio();
                 }
@@ -224,6 +259,8 @@ impl TesterApp {
                     self.log(format!("bridge spawn failed: {e}"));
                 }
             }
+        } else {
+            self.log("bridge は既に起動済みです (先に Unload してください)");
         }
     }
 
@@ -440,10 +477,18 @@ impl eframe::App for TesterApp {
                 #[cfg(windows)]
                 {
                     let show_gui_enabled = self.bridge.is_some() && self.gui_hwnd == 0;
-                    if ui
+                    let resp = ui
                         .add_enabled(show_gui_enabled, egui::Button::new("Show GUI"))
-                        .clicked()
-                    {
+                        .on_disabled_hover_text(format!(
+                            "disabled — bridge: {}, gui_hwnd: 0x{:X}",
+                            if self.bridge.is_some() {
+                                "loaded"
+                            } else {
+                                "not loaded"
+                            },
+                            self.gui_hwnd
+                        ));
+                    if resp.clicked() {
                         self.show_gui();
                     }
                     let close_gui_enabled = self.gui_hwnd != 0;
