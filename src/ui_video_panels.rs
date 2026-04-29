@@ -670,9 +670,13 @@ impl App {
     }
 
     /// 現在のフレームをピン留め (= 動画グリッドサムネに固定) するトグル。
-    /// 既存ピンがあれば削除、なければ現在位置を set_pin。`thumb_webp` は今回は空
-    /// で書く (= グリッド側は WebP が空なら現状動作 = sidecar / shell に fall-through、
-    /// 後続フェーズで本物のフレーム抽出を入れる予定)。
+    /// 既存ピンがあれば削除、なければ現在位置のフレームを ThumbnailWorker で
+    /// 抽出 → WebP encode → DB に保存する。
+    ///
+    /// Phase 8.B': 旧実装は thumb_webp=空 で保存していたため、グリッドが「ピンが
+    /// あっても画像が無い」状態で fall-through、ユーザーから見ると何も起きない
+    /// バグだった。本実装ではシークサムネ ワーカーに pts を渡して 500ms 内に
+    /// 抽出 → WebP 化 → 保存する。500ms 内に取れなければエラー扱い。
     pub(crate) fn toggle_video_pin_at_current(&mut self, fs_idx: usize) {
         let snapshot = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
@@ -684,7 +688,11 @@ impl App {
             }
             _ => None,
         };
-        let (Some((path, pts)), Some(db)) = (snapshot, self.video_pin_db.as_ref()) else {
+        let Some((path, pts)) = snapshot else {
+            return;
+        };
+        let Some(db) = self.video_pin_db.as_ref() else {
+            crate::logger::log("video pin: DB not open".to_string());
             return;
         };
         let already_pinned = db.lookup(&path).is_some();
@@ -692,14 +700,53 @@ impl App {
             if let Err(e) = db.remove(&path) {
                 crate::logger::log(format!("video pin remove failed: {e}"));
             } else {
-                crate::logger::log("video pin removed".to_string());
+                crate::logger::log(format!(
+                    "video pin removed: {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
+                // グリッド側のサムネ反映のためフォルダ再読込フラグを立てる
+                self.video_thumb_overrides_dirty = true;
             }
+            return;
+        }
+
+        // ── 新規ピン: ThumbnailWorker でフレーム抽出を依頼 + ポーリング待機 ──
+        if let Some(player) = self.fs_video_player(fs_idx) {
+            player.request_seek_thumbnail(pts);
+        }
+        // 最大 600ms ポーリング (= worker が seek + 1 frame decode + scale ≈ 50-300ms)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        let mut thumb: Option<crate::video::thumbnail::Thumbnail> = None;
+        loop {
+            if let Some(player) = self.fs_video_player(fs_idx) {
+                if let Some(t) = player.nearest_seek_thumbnail(pts) {
+                    thumb = Some(t);
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let webp = if let Some(t) = thumb {
+            let encoder = webp::Encoder::from_rgba(&t.rgba, t.width, t.height);
+            encoder.encode(75.0).to_vec()
         } else {
-            if let Err(e) = db.set_pin(&path, pts, &[]) {
-                crate::logger::log(format!("video pin set failed: {e}"));
-            } else {
-                crate::logger::log(format!("video pin set: pts={pts:.2}s"));
-            }
+            crate::logger::log("video pin: thumb extraction timed out".to_string());
+            Vec::new()
+        };
+        let webp_len = webp.len();
+        if let Err(e) = db.set_pin(&path, pts, &webp) {
+            crate::logger::log(format!("video pin set failed: {e}"));
+        } else {
+            crate::logger::log(format!(
+                "video pin set: pts={pts:.2}s webp={}B {}",
+                webp_len,
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+            ));
+            self.video_thumb_overrides_dirty = true;
         }
     }
 

@@ -665,14 +665,41 @@ fn run_decoder(
                                     // 直後の wall pace_now がまだ小さい期間に未来 frames を
                                     // 連続送出する bug を防ぐ、ユーザー報告の「序盤早送り」)。
                                     const PACE_LEAD_SECS: f64 = 0.10;
+                                    // Phase 8: audio バッファ ヒステリシス。
+                                    //   audio_buf < SAFE_LO で「枯渇しそう」escape 開始
+                                    //   audio_buf >= SAFE_HI で escape 解除 (= 通常 pacing)
+                                    //   間 (LO..HI) は escape 状態を維持 (in_escape で track)
+                                    // 旧: 単閾値 LO=0.25 のみ → audio_buf > LO になった瞬間 escape
+                                    //     終了するが、pace_now が動かない場合 ahead > PACE_LEAD で
+                                    //     break 出来ず無制限バーストが残る現象 (perflog 解析)。
+                                    //     さらに resume seek で is_seeking() が暫く true のまま
+                                    //     pacing 即 break 継続 → audio_buf が 0 → 2.0+s に膨張
+                                    //     して silent gap / hitch 発生。
+                                    //   修正: SAFE_HI で「もう audio は十分」と判断して seeking
+                                    //     中でも pacing sleep に入る。これにより burst 量が HI
+                                    //     程度に制限される。
                                     const AUDIO_SAFE_LO: f64 = 0.25;
+                                    const AUDIO_SAFE_HI: f64 = 0.75;
+                                    let mut in_audio_escape = false;
                                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
-                                        if clock.is_seeking() {
+                                        let engine_playing = engine_state.load(Ordering::Acquire)
+                                            == crate::video::engine::actor::state_code::PLAYING;
+                                        let audio_buf = clock.total_audio_buffer_secs();
+                                        let audio_active = clock.is_audio_active();
+                                        // ヒステリシス更新
+                                        if engine_playing && audio_active {
+                                            if audio_buf < AUDIO_SAFE_LO {
+                                                in_audio_escape = true;
+                                            } else if audio_buf >= AUDIO_SAFE_HI {
+                                                in_audio_escape = false;
+                                            }
+                                        }
+                                        // seek override 中でも、audio_buf が HI 以上溜まっている
+                                        // 状態であれば pacing sleep を許可する (= burst 防止)。
+                                        if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
                                             break;
                                         }
                                         let ahead = pts_secs - clock.video_pacing_now_secs();
-                                        let engine_playing = engine_state.load(Ordering::Acquire)
-                                            == crate::video::engine::actor::state_code::PLAYING;
                                         let pace_lead = if engine_playing {
                                             PACE_LEAD_SECS
                                         } else {
@@ -681,10 +708,8 @@ fn run_decoder(
                                         if ahead <= pace_lead {
                                             break;
                                         }
-                                        if engine_playing
-                                            && clock.is_audio_active()
-                                            && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
-                                        {
+                                        if in_audio_escape {
+                                            // escape 中: 1 frame 送って yield
                                             break;
                                         }
                                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -865,27 +890,35 @@ fn run_decoder(
                     // Phase 3e: PACE_LEAD も engine が Playing のときだけ。Loading/Buffering
                     // 中は閾値 0 で wall に厳密追従させ、序盤の連続送出を抑える。
                     const PACE_LEAD_SECS: f64 = 0.10;
+                    // Phase 8: audio バッファ ヒステリシス (詳細は GPU 経路の同箇所
+                    // コメント参照)。LO で escape 開始、HI で escape 解除。
                     const AUDIO_SAFE_LO: f64 = 0.25;
+                    const AUDIO_SAFE_HI: f64 = 0.75;
+                    let mut in_audio_escape = false;
                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
-                        // override 中は pace_now が target で凍結する。pacing でブロック
-                        // すると UI が第一フレームを受け取れず override が clear されず
-                        // デッドロック (4K HEVC forward seek で keyframe が target+GOP
-                        // 先になると顕著)。clear されるまで pacing をスキップして送る。
-                        if clock.is_seeking() {
+                        let engine_playing = engine_state.load(Ordering::Acquire)
+                            == crate::video::engine::actor::state_code::PLAYING;
+                        let audio_buf = clock.total_audio_buffer_secs();
+                        let audio_active = clock.is_audio_active();
+                        if engine_playing && audio_active {
+                            if audio_buf < AUDIO_SAFE_LO {
+                                in_audio_escape = true;
+                            } else if audio_buf >= AUDIO_SAFE_HI {
+                                in_audio_escape = false;
+                            }
+                        }
+                        // seek override 中でも、audio_buf が HI 以上 (= burst 完成)
+                        // なら pacing sleep に入って burst 上限を効かせる。
+                        if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
                             break;
                         }
                         let ahead = pts_secs - clock.video_pacing_now_secs();
-                        let engine_playing = engine_state.load(Ordering::Acquire)
-                            == crate::video::engine::actor::state_code::PLAYING;
                         let pace_lead = if engine_playing { PACE_LEAD_SECS } else { 0.0 };
                         if ahead <= pace_lead {
                             break;
                         }
-                        if engine_playing
-                            && clock.is_audio_active()
-                            && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
-                        {
-                            // audio が枯渇しそう → pacing skip して decoder を進める
+                        if in_audio_escape {
+                            // escape 中: 1 frame 送って yield (audio 補充を優先)
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(5));

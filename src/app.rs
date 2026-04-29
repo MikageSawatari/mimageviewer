@@ -1617,6 +1617,9 @@ pub struct App {
     /// かどうかの判定に使う。`open_fullscreen` 経由で動画を実際に open するときに
     /// `mem::take` で取り出して reset される (= 1 度だけ有効)。
     pub(crate) fs_open_intent_from_grid: bool,
+    /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
+    /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
+    pub(crate) video_thumb_overrides_dirty: bool,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2420,6 +2423,7 @@ impl Default for App {
             #[cfg(windows)]
             show_video_jump_panel_visible: false,
             fs_open_intent_from_grid: false,
+            video_thumb_overrides_dirty: false,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
@@ -4949,7 +4953,29 @@ impl App {
             catalog_arc,
         );
         if !video_items.is_empty() {
-            self.spawn_video_thread(tx, cancel, video_items, self.video_thumb_overrides.clone());
+            // Phase 8.B': ピン留めフレームを path → WebP の map で snapshot し
+            // worker thread に渡す (= grid サムネ最優先で使用される)。
+            let pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>> = if let Some(db) =
+                self.video_pin_db.as_ref()
+            {
+                video_items
+                    .iter()
+                    .filter_map(|(_, p, _)| {
+                        db.lookup(p)
+                            .filter(|pin| !pin.thumb_webp.is_empty())
+                            .map(|pin| (p.clone(), pin.thumb_webp))
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+            self.spawn_video_thread(
+                tx,
+                cancel,
+                video_items,
+                self.video_thumb_overrides.clone(),
+                pin_blobs,
+            );
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -5660,6 +5686,10 @@ impl App {
         cancel: Arc<AtomicBool>,
         video_items: Vec<(usize, PathBuf, u64)>,
         thumb_overrides: std::collections::HashMap<String, PathBuf>,
+        // Phase 8.B': ユーザーピン留め フレームの WebP マップ (動画 path → WebP)。
+        // priority chain の最上位で使う。空 BLOB のものは含まれない (= 抽出失敗で
+        // ピンを保存したケース、fall-through する)。
+        pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>>,
     ) {
         let thumb_size = self.last_cell_size.max(256.0) as i32;
         let display_px = compute_display_px(
@@ -5778,15 +5808,26 @@ impl App {
                 let call_t0 = Instant::now();
 
                 let stem = stem_lower(&path);
-                // Phase 5.3 動画サムネイル優先順位 (詳細は docs/video-engine-redesign.md
-                // §5.3 / §5.4.1):
-                //   1. ユーザーがピン留めしたフレーム (video_pins DB) — ★優先度最上
-                //      実装は Phase 5.4.1 で配線する (DB スキーマは crate::video_pins
-                //      に用意済)。ここでは fall-through する。
-                //   2. 同名ファイル名画像 (sidecar、`thumb_overrides` map) —
-                //      Settings.video_thumb_use_sidecar_image で gating される。
-                //   3. Windows Shell の動画自身のデフォルトサムネ。
-                let (ci, source_tag) = if let Some(img_path) = thumb_overrides.get(&stem) {
+                // Phase 8.B': ピン留めフレームを最優先で適用 (priority chain の 1.)。
+                // pin_blobs map は spawn 時に snapshot されているので thread 安全。
+                // WebP デコード失敗時は fall-through。
+                let pin_ci: Option<egui::ColorImage> = pin_blobs
+                    .get(&path)
+                    .and_then(|webp| crate::catalog::decode_thumb_to_color_image(webp));
+
+                // 動画サムネイル優先順位:
+                //   1. ピン留めフレーム (video_pins DB) — ★最優先 (Phase 8.B')
+                //   2. 同名ファイル名画像 (sidecar、Settings.video_thumb_use_sidecar_image)
+                //   3. Windows Shell の動画自身のデフォルトサムネ
+                let (ci, source_tag) = if let Some(ci) = pin_ci {
+                    if retries == 0 {
+                        crate::logger::log(format!(
+                            "  video thumb pin: idx={idx} {}",
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
+                    }
+                    (Some(ci), "pin")
+                } else if let Some(img_path) = thumb_overrides.get(&stem) {
                     if retries == 0 {
                         crate::logger::log(format!(
                             "  video thumb override: idx={idx} stem={stem} img={}",
@@ -10078,6 +10119,15 @@ impl App {
     pub(crate) fn close_fullscreen(&mut self) {
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
+        // Phase 8.B': 動画ピン留めが変更されていたら現在フォルダを再ロードして
+        // グリッドサムネに反映 (= ピンの WebP がグリッド表示に出る)。
+        if std::mem::take(&mut self.video_thumb_overrides_dirty) {
+            if let Some(cur) = self.current_folder.clone() {
+                // 現フォルダ + 履歴を温存したまま再ロード
+                self.folder_history.remove(&cur);
+                self.load_folder(cur);
+            }
+        }
         // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
         // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
         // 実行される。ms を計測してブロックの所在を特定する。
