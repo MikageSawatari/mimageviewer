@@ -116,7 +116,8 @@ impl App {
 
         // Phase 6.D-2: 永続キャッシュを worker に渡す。動画 mtime をキーに mismatch
         // 検出して古いキャッシュを自動破棄する。
-        let interval_ms = (interval * 1000.0).round() as u32;
+        // Phase 8.C: キャッシュキーを (path, tile_w, timestamp_ms) に変更したため
+        // worker には interval_ms を渡さない (= 個別 timestamp で lookup する)。
         let video_mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
@@ -130,7 +131,6 @@ impl App {
             tile_w,
             tile_h,
             cache,
-            interval_ms,
             video_mtime,
         );
         self.video_tile_state = Some(VideoTileState {

@@ -51,15 +51,14 @@ impl TileThumbnailWorker {
     /// `timestamps` 長の結果スロットを 0 埋めで用意し、worker thread を起動する。
     /// `max_w` / `max_h` でアスペクト保持リサイズの上限を指定。
     /// `cache` が Some なら DB ヒット → WebP デコード経路で抽出を skip し、ミスは
-    /// 抽出後に WebP エンコードして書き戻す (= Phase 6.D-2)。
-    /// `interval_ms` / `video_mtime` はキャッシュキー用。`cache=None` のときは無視。
+    /// 抽出後に WebP エンコードして書き戻す (= Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
+    /// `video_mtime` はキャッシュ無効化判定用。
     pub fn spawn(
         path: PathBuf,
         timestamps: Vec<f64>,
         max_w: u32,
         max_h: u32,
         cache: Option<Arc<TileThumbCache>>,
-        interval_ms: u32,
         video_mtime: i64,
     ) -> Self {
         let n = timestamps.len();
@@ -81,7 +80,6 @@ impl TileThumbnailWorker {
                     worker_state,
                     worker_cancel.clone(),
                     cache,
-                    interval_ms,
                     video_mtime,
                 );
                 worker_finished.store(true, Ordering::Release);
@@ -137,7 +135,6 @@ fn run_worker(
     state: Arc<Mutex<Vec<Option<TileThumbnail>>>>,
     cancel: Arc<AtomicBool>,
     cache: Option<Arc<TileThumbCache>>,
-    interval_ms: u32,
     video_mtime: i64,
 ) {
     use ffmpeg_the_third as ffmpeg;
@@ -147,15 +144,17 @@ fn run_worker(
     use ffmpeg::util::frame::video::Video;
 
     // Phase 6.D-2: 起動直後にキャッシュをまとめてチェックして state に load。
-    // 残った None スロットだけが ffmpeg 抽出の対象になる。タイル列数を切替えても
-    // 同 path/interval/tile_w なら再開可能。
+    // 残った None スロットだけが ffmpeg 抽出の対象になる。
+    // Phase 8.C: キーは絶対 PTS (timestamp_ms) になったので、間隔 5 秒 → 1 秒
+    // 切替時にも共通 PTS のサムネを再利用できる。
     if let Some(c) = cache.as_ref() {
         for (idx, &pts) in timestamps.iter().enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return;
             }
+            let timestamp_ms = (pts * 1000.0).round() as i64;
             if let Some(webp) =
-                c.lookup_webp(&path, interval_ms, max_w, idx as u32, video_mtime)
+                c.lookup_webp(&path, max_w, timestamp_ms, video_mtime)
             {
                 if let Some((w, h, rgba)) = crate::catalog::decode_thumb_to_rgba(&webp) {
                     let thumb = TileThumbnail {
@@ -319,17 +318,17 @@ fn run_worker(
             out
         };
         // Phase 6.D-2: 抽出済 RGBA を WebP に encode してキャッシュに書く
-        // (失敗しても extraction 経路は止まらない)。
+        // (失敗しても extraction 経路は止まらない)。Phase 8.C: 絶対 PTS キー化。
         if let Some(c) = cache.as_ref() {
             let encoder = webp::Encoder::from_rgba(&buf, dst_w, dst_h);
             // q=70: グリッドサムネと同等品位、サイズ優先
             let webp_bytes = encoder.encode(70.0).to_vec();
+            let timestamp_ms = (target_secs * 1000.0).round() as i64;
             if let Err(e) = c.store_webp(
                 &path,
-                interval_ms,
                 max_w,
-                max_h,
-                idx as u32,
+                dst_h,
+                timestamp_ms,
                 &webp_bytes,
                 video_mtime,
             ) {
