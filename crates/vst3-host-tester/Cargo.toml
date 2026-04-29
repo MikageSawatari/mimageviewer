@@ -1,0 +1,48 @@
+[package]
+name = "vst3-host-tester"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+# mIV 本体に依存しない検証用 GUI exe。`crates/vst3-host/` (C++) の bridge を
+# 子プロセスとして起動し、VST3 プラグインのスキャン・ロード・GUI 表示・
+# 音声パススルーを単独で試験できる。
+#
+# 動画再生機構と切り離してあるので mIV のフルビルド (1 分超) を待たずに
+# `cargo run -p vst3-host-tester` だけで反復試験できる。
+
+[[bin]]
+name = "vst3-host-tester"
+path = "src/main.rs"
+
+[dependencies]
+# 軽量 GUI (mIV 本体と同じ系統)
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.33"
+
+# 音声出力 (mIV 本体と同じ)
+cpal = "0.16"
+
+# bridge プロセス起動と shared memory + Windows event
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+raw-window-handle = "0.6"
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+
+[lints.rust]
+unused_imports = "warn"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/susie-worker", "crates/launcher", "tools/png2mag"]
+members = ["crates/susie-worker", "crates/launcher", "crates/vst3-host-tester", "tools/png2mag"]
 
 [package]
 name = "mimageviewer"
