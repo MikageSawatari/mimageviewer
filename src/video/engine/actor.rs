@@ -252,7 +252,9 @@ impl EngineActor {
     }
 
     /// command 処理。`select!` の cmd lane から呼ぶ。
-    pub(super) fn apply_command(&mut self, cmd: TransportCommand) {
+    /// `pub` (Phase 3e で VideoPlayer の seek 系から Play を発行する用、Phase 4 で
+    /// `pub(super)` に戻す)。
+    pub fn apply_command(&mut self, cmd: TransportCommand) {
         match cmd {
             TransportCommand::Play => self.handle_play(),
             TransportCommand::Pause => self.handle_pause(),

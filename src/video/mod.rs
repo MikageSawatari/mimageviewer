@@ -236,6 +236,7 @@ impl VideoPlayer {
             #[cfg(windows)]
             gpu_video_device,
             engine_state_handle,
+            engine_event_tx.clone(),
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
@@ -352,8 +353,12 @@ impl VideoPlayer {
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
             self.clock.request_seek(0.0, 0);
             self.clock.set_playing(true);
-            // engine 側にも seek を伝えて epoch を同期させる (Codex Phase 3d P2 反映)
-            self.engine.lock().unwrap().handle_seek_request(0.0);
+            // engine 側にも seek を伝えて epoch を同期させる (Codex Phase 3d P2 反映)。
+            // user 操作の seek は autoplay 強制 (Codex Phase 3e P2 反映: seek 後に
+            // Paused にならないように)。
+            let mut g = self.engine.lock().unwrap();
+            g.apply_command(engine::actor::TransportCommand::Play);
+            g.handle_seek_request(0.0);
             return;
         }
         self.clock.set_playing(!self.clock.is_playing());
@@ -374,8 +379,11 @@ impl VideoPlayer {
             self.clock.set_playing(true);
         }
         // engine の seek_epoch も進めて、AvClock seek_serial と同期させる
-        // (Codex Phase 3d P2 反映: BufferReady/FirstFrameReady の epoch 不整合解消)。
-        self.engine.lock().unwrap().handle_seek_request(clamped);
+        // (Codex Phase 3d P2 反映)。user 操作 seek は autoplay 強制
+        // (Codex Phase 3e P2 反映: AvClock 側で playing=true にしているため整合性)。
+        let mut g = self.engine.lock().unwrap();
+        g.apply_command(engine::actor::TransportCommand::Play);
+        g.handle_seek_request(clamped);
     }
 
     /// 相対シーク。`delta_secs > 0` なら前方 (`target..` のキーフレーム = preroll なし)、
@@ -390,7 +398,10 @@ impl VideoPlayer {
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
-        self.engine.lock().unwrap().handle_seek_request(target);
+        // user 操作 seek は autoplay 強制 (Codex Phase 3e P2 反映)。
+        let mut g = self.engine.lock().unwrap();
+        g.apply_command(engine::actor::TransportCommand::Play);
+        g.handle_seek_request(target);
     }
 
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
@@ -491,7 +502,15 @@ impl VideoPlayer {
                                 // (Codex Phase 3d P2 反映: pre-info user seek 経路で
                                 // ズレるリスクは pending_resume_secs.take() の他に
                                 // 経路がないので、ここで二重 seek を許容しても重複
-                                // epoch++ 1 回分の副作用のみで害はない)
+                                // epoch++ 1 回分の副作用のみで害はない)。
+                                //
+                                // **意図的に apply_command(Play) は呼ばない**:
+                                // open-time の resume は user 操作ではなく自動復元
+                                // なので、`OpenOptions.autoplay` (= 設定の
+                                // video_autoplay) を尊重する。autoplay=false なら
+                                // post-seek READY で Paused に遷移する設計。
+                                // user 操作の seek/seek_relative/toggle_play は
+                                // 別経路で apply_command(Play) を呼ぶ。
                                 self.engine
                                     .lock()
                                     .unwrap()
@@ -611,8 +630,11 @@ impl VideoPlayer {
                 self.clock.request_seek(0.0, 0);
                 self.clock.set_playing(true);
                 // engine 側の epoch も同期 (= AvClock seek_serial と engine
-                // current_seek_epoch の不整合を防ぐ、Codex Phase 3d P2 反映)
-                self.engine.lock().unwrap().handle_seek_request(0.0);
+                // current_seek_epoch の不整合を防ぐ、Codex Phase 3d P2 反映)。
+                // loop 周回も autoplay 強制 (Codex Phase 3e P2 反映)。
+                let mut g = self.engine.lock().unwrap();
+                g.apply_command(engine::actor::TransportCommand::Play);
+                g.handle_seek_request(0.0);
             } else {
                 // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
                 if let Some(info) = &self.info {

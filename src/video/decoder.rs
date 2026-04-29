@@ -108,6 +108,9 @@ pub struct DecodeHandles {
 /// `engine_state` は `EngineActor::published_state_handle()` で取得した
 /// `Arc<AtomicU8>` (Phase 3d)。pacing loop で `state == Playing` のときだけ
 /// audio_buf escape を有効化する。
+/// `engine_event_tx` (Phase 3e) は decoder thread から SeekCompleted を engine に
+/// 通知するために使う。これがないと runtime seek 後 engine が永久 Seeking 状態に
+/// 張り付き、pacing escape も解除されない。
 pub fn spawn(
     path: PathBuf,
     clock: Arc<AvClock>,
@@ -118,6 +121,7 @@ pub fn spawn(
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
+    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
 ) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
@@ -139,6 +143,7 @@ pub fn spawn(
                 #[cfg(windows)]
                 gpu_video_device,
                 engine_state,
+                engine_event_tx,
                 video_tx,
                 audio_tx,
                 info_tx,
@@ -163,6 +168,7 @@ fn run_decoder(
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
+    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     video_tx: Sender<VideoFrame>,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
@@ -497,6 +503,17 @@ fn run_decoder(
             // notify_seek_completed が pre-seek 音声会計のリセットも担う
             // (post-seek hang 防止のため不可分)。
             clock.notify_seek_completed(target_secs);
+            // Phase 3e: engine にも SeekCompleted を通知 (= Seeking → Buffering 遷移)。
+            // これがないと engine は永久 Seeking 状態に張り付き、pacing escape が
+            // 解除されない (Codex Phase 3e P1 反映)。
+            let _ = engine_event_tx.try_send(
+                crate::video::engine::EngineEvent::Decoder(
+                    crate::video::engine::state::DecoderEvent::SeekCompleted {
+                        epoch: serial,
+                        actual_pts: target_secs,
+                    },
+                ),
+            );
         }
 
         // 1 パケット読み込み
@@ -571,6 +588,12 @@ fn run_decoder(
                                     // Phase 3d: audio_buf escape は **engine が Playing の
                                     // ときだけ** 有効化する (= Buffering / Loading / Seeking
                                     // 中は急送出しない、序盤早送りの構造的解消)。
+                                    //
+                                    // Phase 3e: `PACE_LEAD` も engine が Playing のときだけ
+                                    // 適用する。Loading/Buffering 中は閾値 0 で「pts が past
+                                    // のときだけ send」する厳しい pacing にする (= 動画 open
+                                    // 直後の wall pace_now がまだ小さい期間に未来 frames を
+                                    // 連続送出する bug を防ぐ、ユーザー報告の「序盤早送り」)。
                                     const PACE_LEAD_SECS: f64 = 0.10;
                                     const AUDIO_SAFE_LO: f64 = 0.25;
                                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
@@ -578,11 +601,16 @@ fn run_decoder(
                                             break;
                                         }
                                         let ahead = pts_secs - clock.video_pacing_now_secs();
-                                        if ahead <= PACE_LEAD_SECS {
-                                            break;
-                                        }
                                         let engine_playing = engine_state.load(Ordering::Acquire)
                                             == crate::video::engine::actor::state_code::PLAYING;
+                                        let pace_lead = if engine_playing {
+                                            PACE_LEAD_SECS
+                                        } else {
+                                            0.0
+                                        };
+                                        if ahead <= pace_lead {
+                                            break;
+                                        }
                                         if engine_playing
                                             && clock.is_audio_active()
                                             && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
@@ -764,6 +792,8 @@ fn run_decoder(
                     // pacing skip して audio packet 読み込みを優先 (sleep で audio 枯渇させない)。
                     // Phase 3d: audio_buf escape は **engine が Playing のときだけ** 有効化する
                     // (= Buffering / Loading / Seeking 中は急送出しない)。
+                    // Phase 3e: PACE_LEAD も engine が Playing のときだけ。Loading/Buffering
+                    // 中は閾値 0 で wall に厳密追従させ、序盤の連続送出を抑える。
                     const PACE_LEAD_SECS: f64 = 0.10;
                     const AUDIO_SAFE_LO: f64 = 0.25;
                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
@@ -775,11 +805,12 @@ fn run_decoder(
                             break;
                         }
                         let ahead = pts_secs - clock.video_pacing_now_secs();
-                        if ahead <= PACE_LEAD_SECS {
-                            break;
-                        }
                         let engine_playing = engine_state.load(Ordering::Acquire)
                             == crate::video::engine::actor::state_code::PLAYING;
+                        let pace_lead = if engine_playing { PACE_LEAD_SECS } else { 0.0 };
+                        if ahead <= pace_lead {
+                            break;
+                        }
                         if engine_playing
                             && clock.is_audio_active()
                             && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
