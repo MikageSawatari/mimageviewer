@@ -1631,10 +1631,9 @@ pub struct App {
     pub(crate) video_perf_history: std::collections::VecDeque<f32>,
     /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
     pub(crate) video_perf_last_wall: Option<std::time::Instant>,
-    /// 前回サンプリング時の GPU フレーム fence_value (= 新フレーム検知用、単調増加)。
-    /// shared_handle は NT HANDLE で Windows がクローズ後に再利用するため
-    /// 信頼できない。fence_value は decoder 側で per-frame +1 されるので確実。
-    pub(crate) video_perf_last_fence: Option<u64>,
+    /// 前回サンプリング時の displayed_frame_seq (= VideoPlayer の atomic カウンタ、
+    /// GPU/CPU 経路の両方で tick 内 +1)。これで経路に依存せず新フレーム検知できる。
+    pub(crate) video_perf_last_seq: Option<u64>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2443,7 +2442,7 @@ impl Default for App {
             video_perf_overlay_visible: false,
             video_perf_history: std::collections::VecDeque::with_capacity(200),
             video_perf_last_wall: None,
-            video_perf_last_fence: None,
+            video_perf_last_seq: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

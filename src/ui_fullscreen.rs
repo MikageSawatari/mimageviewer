@@ -4970,6 +4970,10 @@ impl App {
         let perf_key = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::P)
         });
+        // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
+        let rewind_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::W)
+        });
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
@@ -5055,7 +5059,15 @@ impl App {
             // 切替時に履歴を一旦クリア (= ON 直後は素のグラフから始まる)。
             self.video_perf_history.clear();
             self.video_perf_last_wall = None;
-            self.video_perf_last_fence = None;
+            self.video_perf_last_seq = None;
+        }
+        if rewind_key
+            && let Some(p) = self.fs_video_player(fs_idx)
+        {
+            p.seek(0.0);
+            if !p.is_playing() {
+                p.toggle_play();
+            }
         }
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
         // (handle_image_keys 後段) の通常 ESC で扱う。
@@ -5099,38 +5111,30 @@ impl App {
         }
     }
 
-    /// 動画 GPU フレームの fence_value 変化を検出して frame interval (ms) を履歴に記録。
-    /// fence_value は decoder 側で per-frame に +1 される単調増加値で、handle の
-    /// 再利用 (CloseHandle 後の再発行) に影響されず確実に新フレームを検知できる。
-    /// CPU 経路では gpu_latest が無く履歴は空のまま (= 描画側で診断表示)。
+    /// 動画 VideoPlayer の `displayed_frame_seq` (= GPU/CPU 経路問わず tick で +1)
+    /// の変化で frame interval (ms) を履歴に記録。経路非依存なので CPU sw decode
+    /// の動画でも overlay が機能する。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
-        #[cfg(windows)]
-        {
-            let cur_fence: Option<u64> = match self.fs_cache.get(&fs_idx) {
-                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                    player.gpu_latest().map(|f| f.fence_value)
-                }
-                _ => None,
-            };
-            if cur_fence != self.video_perf_last_fence {
-                let now = std::time::Instant::now();
-                if let (Some(prev_wall), Some(_)) =
-                    (self.video_perf_last_wall, self.video_perf_last_fence)
-                {
-                    let interval_ms =
-                        now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
-                    self.video_perf_history.push_back(interval_ms);
-                    while self.video_perf_history.len() > 200 {
-                        self.video_perf_history.pop_front();
-                    }
-                }
-                self.video_perf_last_wall = Some(now);
-                self.video_perf_last_fence = cur_fence;
+        let cur_seq: Option<u64> = match self.fs_cache.get(&fs_idx) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                Some(player.displayed_frame_seq())
             }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = fs_idx;
+            _ => None,
+        };
+        if cur_seq != self.video_perf_last_seq && cur_seq.is_some() {
+            let now = std::time::Instant::now();
+            if let (Some(prev_wall), Some(_)) =
+                (self.video_perf_last_wall, self.video_perf_last_seq)
+            {
+                let interval_ms =
+                    now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
+                self.video_perf_history.push_back(interval_ms);
+                while self.video_perf_history.len() > 200 {
+                    self.video_perf_history.pop_front();
+                }
+            }
+            self.video_perf_last_wall = Some(now);
+            self.video_perf_last_seq = cur_seq;
         }
     }
 
@@ -5166,8 +5170,8 @@ impl App {
         let n = self.video_perf_history.len();
         if n == 0 {
             let msg = format!(
-                "Perf: collecting…  last_fence={:?}  wall={}",
-                self.video_perf_last_fence,
+                "Perf: collecting…  last_seq={:?}  wall={}",
+                self.video_perf_last_seq,
                 if self.video_perf_last_wall.is_some() {
                     "set"
                 } else {
@@ -5240,11 +5244,17 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 200),
             );
         }
+        // X 軸: 容量 200 sample で graph_w を分割 (= 1 sample = graph_w/200 px)。
+        // 直近サンプルを **右端**、古い方が左にスクロール。容量未満なら左側は空白。
+        const CAPACITY: usize = 200;
+        let dx = graph.width() / CAPACITY as f32;
+        // 古いサンプル (= 履歴 index 0) ほど左寄り、最新 (= index n-1) が右端。
+        let x_for = |i: usize| graph.max.x - dx * (n - 1 - i) as f32;
+
         // ヒッチ赤縦線 (折れ線描画前に下層に置く)
-        let dx = if n > 1 { graph.width() / (n - 1) as f32 } else { 0.0 };
         for (i, &v) in self.video_perf_history.iter().enumerate() {
             if v > HITCH_MS {
-                let x = graph.min.x + dx * i as f32;
+                let x = x_for(i);
                 painter.line_segment(
                     [
                         egui::pos2(x, graph.min.y),
@@ -5257,11 +5267,11 @@ impl App {
                 );
             }
         }
-        // 折れ線
+        // 折れ線 (右端が最新、左に向かって過去)。
         if n > 1 {
-            let mut prev = egui::pos2(graph.min.x, y_for(self.video_perf_history[0]));
+            let mut prev = egui::pos2(x_for(0), y_for(self.video_perf_history[0]));
             for (i, &v) in self.video_perf_history.iter().enumerate().skip(1) {
-                let p = egui::pos2(graph.min.x + dx * i as f32, y_for(v));
+                let p = egui::pos2(x_for(i), y_for(v));
                 painter.line_segment(
                     [prev, p],
                     egui::Stroke::new(1.2, egui::Color32::from_rgb(180, 230, 255)),
@@ -5462,7 +5472,7 @@ impl App {
         // ⏮ アイコン (縦バー + 左向き三角 = "skip back to start")。
         // Phase 7: 視認性のため再生 ▶ アイコンと同じ 0.4*btn_size サイズに。
         draw_replay_icon(&painter, replay_rect.center(), btn_size * 0.4);
-        let replay_resp = replay_resp.on_hover_text("最初から再生 (頭出し + 即再生)");
+        let replay_resp = replay_resp.on_hover_text("最初から再生 (頭出し + 即再生) [W]");
         if replay_resp.clicked()
             && let Some(p) = self.fs_video_player(fs_idx)
         {
@@ -5489,6 +5499,11 @@ impl App {
         } else {
             draw_play_triangle(&painter, play_rect.center(), btn_size * 0.4);
         }
+        let play_resp = play_resp.on_hover_text(if is_playing {
+            "一時停止 [Enter]"
+        } else {
+            "再生 [Enter]"
+        });
         if play_resp.clicked()
             && let Some(p) = self.fs_video_player(fs_idx)
         {
@@ -5810,6 +5825,11 @@ impl App {
         );
         draw_hud_button_bg(&painter, mute_rect, mute_resp.hovered());
         draw_speaker_icon(&painter, mute_rect.center(), btn_size * 0.55, muted);
+        let mute_resp = mute_resp.on_hover_text(if muted {
+            "ミュート解除 [M]"
+        } else {
+            "ミュート [M]"
+        });
         if mute_resp.clicked()
             && let Some(p) = self.fs_video_player(fs_idx)
         {

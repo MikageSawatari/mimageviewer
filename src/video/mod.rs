@@ -33,7 +33,7 @@ pub mod tile_thumbnails;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
@@ -71,6 +71,10 @@ pub struct VideoPlayer {
     /// epoch++ するので、tick 側では「engine.current_seek_epoch を読み取って
     /// 自分の last_seen_epoch と比べる」方式で再発火する。
     first_frame_event_last_epoch: Option<engine::state::SeekEpoch>,
+    /// 表示したフレーム数の累積カウンタ。tick で latest_renderable を採用するたびに
+    /// +1。GPU/CPU 両経路で更新するので、UI 側の perf overlay が経路に依存せず
+    /// 「新フレーム到着」を検知できる (Phase 8.I 修正)。
+    displayed_frame_seq: AtomicU64,
     cancel: Arc<AtomicBool>,
     decode: DecodeHandles,
     /// 保持目的のフィールド (Drop で cpal Stream が停止する)。読み取りはしない。
@@ -176,6 +180,7 @@ impl VideoPlayer {
                 engine_event_rx,
                 info_event_emitted: false,
                 first_frame_event_last_epoch: None,
+                displayed_frame_seq: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
                 decode: dummy_decode_handles(),
                 audio: None,
@@ -268,6 +273,7 @@ impl VideoPlayer {
             engine_event_rx,
             info_event_emitted: false,
             first_frame_event_last_epoch: None,
+            displayed_frame_seq: AtomicU64::new(0),
             cancel,
             decode: DecodeHandles {
                 video_rx,
@@ -694,6 +700,7 @@ impl VideoPlayer {
                     );
                 }
                 self.emit_first_frame_event(pts);
+                self.displayed_frame_seq.fetch_add(1, Ordering::Release);
                 let _ = pts_for_log;
                 return next_due;
             }
@@ -752,6 +759,7 @@ impl VideoPlayer {
             }
             upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
             self.emit_first_frame_event(pts_for_log);
+            self.displayed_frame_seq.fetch_add(1, Ordering::Release);
             displayed_pts = Some(pts_for_log);
         }
 
@@ -804,6 +812,12 @@ impl VideoPlayer {
 
     pub fn texture(&self) -> Option<&TextureHandle> {
         self.texture.as_ref()
+    }
+
+    /// 表示済フレーム数の累積値。perf overlay が経路 (GPU/CPU) に依存せず
+    /// 「新フレームが届いたか」を 1 atomic load で検知できる。
+    pub fn displayed_frame_seq(&self) -> u64 {
+        self.displayed_frame_seq.load(Ordering::Acquire)
     }
 
     /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。
