@@ -1263,9 +1263,7 @@ impl App {
         });
 
         let mut location_display = self.location_display_for(fs_idx);
-        // 動画の場合は decode 経路 (HW/SW) と GPU パス / VSR 状態を末尾に追記。
-        // VSR の状態は decoder 起動時の固定値ではなく **現在の `gpu_video_device.vsr_active()`** を
-        // 参照することで、Settings UI で動的に切り替えた値が即時反映される。
+        // 動画の場合は decode 経路 (HW/SW) と GPU パスを末尾に追記。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if let Some(info) = player.info() {
                 let hw = if info.hw_decode_active { "HW" } else { "SW" };
@@ -1274,14 +1272,6 @@ impl App {
                 {
                     if info.gpu_path_active {
                         tags.push("GPU".into());
-                    }
-                    let vsr_active = self
-                        .gpu_video_device
-                        .as_ref()
-                        .map(|d| d.vsr_active())
-                        .unwrap_or(false);
-                    if vsr_active {
-                        tags.push("VSR".into());
                     }
                 }
                 location_display = format!("{}  [{}]", location_display, tags.join("/"));
@@ -2594,6 +2584,9 @@ impl App {
                     g.width,
                     g.height,
                     g.ten_bit,
+                    g.fence_shared_handle,
+                    g.fence_value,
+                    g.fence_gen,
                 ),
             );
             ui.painter().add(cb);
@@ -5075,6 +5068,7 @@ impl App {
         // ── 音量 % テキスト (一番最後に描画 = 上に乗せる) ──
         painter.galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
     }
+
 }
 
 /// 動画 HUD の下部バー領域 (高さ 44px)。

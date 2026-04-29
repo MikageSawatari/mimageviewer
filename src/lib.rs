@@ -1,5 +1,21 @@
 //! mimageviewer ライブラリクレート。
 //! 統合テストやベンチマーク bin から公開モジュールにアクセスするためのエントリポイント。
+//!
+//! `app` は bin (main.rs) 専属の private module なので lib からはアクセスできない。
+//! lib 経由で参照される module (例: `video`) が `crate::app::FOO` を使う場合、
+//! main.rs と lib.rs の両方からアクセスできるよう、ここに `app` 互換 stub を置く
+//! (= main.rs の app module の同名定数の真値とは別実体だが、lib 側で実用上問題がないもの)。
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod app {
+    /// GPU テクスチャ上限。bin (lib) 側の video モジュールで `crate::app::MAX_TEXTURE_DIM`
+    /// として参照される。本体 (main.rs) の `app` module 内の同名定数と値が一致するよう、
+    /// 変更時はここも合わせて更新すること。
+    pub const MAX_TEXTURE_DIM: usize = 8192;
+    pub const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 3.0;
+    pub const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
+}
 
 pub mod activity_gate;
 pub mod adjustment;
@@ -54,6 +70,8 @@ pub mod rating_write_worker;
 pub mod tag_write_worker;
 pub mod thumb_loader;
 pub mod undo_stack;
+#[cfg(windows)]
+pub mod video;
 pub mod ui_helpers;
 pub mod ui_susie_diagnostic;
 pub mod update_check;

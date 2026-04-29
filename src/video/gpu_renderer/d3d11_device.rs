@@ -2,7 +2,7 @@
 //!
 //! このモジュールは D3D11 単独で完結し、wgpu / egui には依存しない。FFmpeg の
 //! `hw_device_ctx` に渡せる `ID3D11Device` と、NV12 → RGBA 変換を実行する
-//! `ID3D11VideoProcessor` を管理する。NVIDIA RTX VSR の opt-in もここで行う。
+//! `ID3D11VideoProcessor` を管理する。
 //!
 //! ## 共有テクスチャの作り方
 //! wgpu (d3d12) と D3D11 の間でフレームを受け渡すには **NT shared handle** を使う。
@@ -23,34 +23,40 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_FENCE_FLAG_SHARED, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-    ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView,
+    D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Device, ID3D11Device5,
+    ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020,
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL,
     DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIResource1;
+use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
 use windows::core::Interface;
-
-use super::vsr::{self, VsrCapability};
 
 /// 出力テクスチャのリングバッファサイズ。decoder が書き → UI が読む間
 /// に少なくとも 2 枚 in-flight を許す。
 #[allow(dead_code)]
 const OUTPUT_RING_SIZE: usize = 3;
 
-/// 1 フレームの GPU 出力。`KeyedMutex` で wgpu 側との読み書き排他。
+/// 1 フレームの GPU 出力。
+///
+/// 同期は **D3D11/D3D12 共有 fence** で行う:
+/// - decoder thread で `CopyResource` 完了後に `ID3D11DeviceContext4::Signal(fence, value)`
+/// - UI thread (egui_wgpu) は wgpu の DX12 command queue で `Wait(fence, value)` してから
+///   このフレームを sample する
 ///
 /// SAFETY: `shared_handle` は NT HANDLE で `*mut c_void` 相当だが、本構造体は
 /// channel 越しにスレッドを跨いで運ぶ必要があるため `Send` を unsafe impl する。
@@ -62,11 +68,26 @@ pub struct D3d11Frame {
     pub pts_secs: f64,
     /// シーク世代。
     pub seek_serial: u64,
-    /// NT shared handle. wgpu 側で `OpenSharedHandle` する。
+    /// NT shared handle (テクスチャ用、フレーム毎に新規)。wgpu 側で `OpenSharedHandle` する。
     /// `Drop` で `CloseHandle` する責任は所有者にある。
     pub shared_handle: HANDLE,
-    /// keyed mutex の key。書き込み完了時 1、読み取り完了時 0 を release。
-    pub keyed_mutex_key: u64,
+    /// 共有テクスチャが 10-bit (R10G10B10A2_UNORM) か。入力が P010/P016 の
+    /// HDR ソースの場合のみ true になる。wgpu 側 import 時の format 選択に必要
+    /// (false → Bgra8Unorm、true → Rgb10a2Unorm)。
+    pub ten_bit: bool,
+    /// このフレームの GPU 完了に対応する fence 値。`ID3D11DeviceContext4::Signal` で
+    /// この値まで進めてあるので、wgpu 側は `Wait(fence, fence_value)` してから
+    /// テクスチャを sample すれば 中身が確実に書き込まれている。
+    pub fence_value: u64,
+    /// fence の NT shared handle。wgpu 側でこれを `ID3D12Fence` として開くが、
+    /// `GpuVideoDevice` の寿命中は同じ値が来るので、wgpu 側でキャッシュ判定キーに使う。
+    /// **HANDLE 自体の所有権は `GpuVideoDevice` にあり、本フレームは値を借りているだけ。
+    /// `Drop` で close してはいけない**。
+    pub fence_shared_handle: HANDLE,
+    /// プロセス内ユニークな fence 世代 ID。HANDLE 値だけだと kernel が値を
+    /// 再利用したときに stale な D3D12 fence をキャッシュしたまま使ってしまうため、
+    /// この値で再 open 判定する (Codex P1)。
+    pub fence_gen: u64,
 }
 
 // HANDLE は OS のリソース ID 相当 (= 単純な i64 値) で、所有権を移動する分には
@@ -125,15 +146,54 @@ pub struct GpuVideoDevice {
     /// SAFETY: ID3D11DeviceContext は **Send/Sync 安全ではない**。本構造体は全体を
     /// `Mutex` で囲む前提で外から使い、内部では context を直接共有する。
     context: ID3D11DeviceContext,
+    /// `Signal(fence, value)` を呼ぶための ID3D11DeviceContext4 view。`context` と同一
+    /// オブジェクトを cast 経由で持っているだけ。
+    context4: ID3D11DeviceContext4,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
+    /// `VideoProcessorSetStreamColorSpace1` / `VideoProcessorSetOutputColorSpace1` を
+    /// 呼ぶための ID3D11VideoContext1 view (= `video_context` と同一オブジェクトの cast)。
+    video_context1: ID3D11VideoContext1,
     /// processor + enumerator のキャッシュ。同一 (in_size, out_size, format) なら使い回す。
     processor_cache: std::cell::RefCell<Option<ProcessorState>>,
-    /// VSR を opt-in するか (= 設定の `video_rtx_vsr`)。設定が動的に切り替わるため
-    /// `AtomicBool` で保持し、`set_vsr_enabled` を `&self` で呼べるようにする。
-    /// `VideoProcessorBlt` 直前に load して NVIDIA 拡張を流すか判定。
-    vsr_enabled: std::sync::atomic::AtomicBool,
-    vsr_capability: VsrCapability,
+    /// CopyResource 完了の signaling 用。device 寿命中 1 個。各フレームは
+    /// `next_fence_value.fetch_add(1)` で得た値で `Signal(fence, value)` する。
+    fence: ID3D11Fence,
+    /// `fence` の NT shared handle (D3D12 側で `OpenSharedHandle` するため)。
+    /// `Drop` で `CloseHandle` する責任は本構造体にある。
+    fence_shared_handle: HANDLE,
+    /// 次に Signal する fence 値 (1, 2, 3, ... と単調増加)。
+    next_fence_value: std::sync::atomic::AtomicU64,
+    /// プロセスグローバルにユニークな fence の世代 ID。HANDLE 値だけだと
+    /// kernel が値を再利用したときに stale な D3D12 fence をキャッシュ
+    /// したまま使ってしまう (= sync race 復活、または永久 Wait)。
+    /// (Codex P1 指摘) wgpu 側は `fence_gen` で再 open 判定する。
+    fence_gen: u64,
+}
+
+/// 入力動画の色空間ヒント。FFmpeg の transfer characteristic から決定し、
+/// `VideoProcessorSetStreamColorSpace1` に渡す DXGI_COLOR_SPACE_TYPE を選ぶ。
+/// SDR を default とし、HDR PQ / HDR HLG だけ別扱い (Codex Medium)。
+#[derive(Clone, Copy, Debug)]
+pub enum VideoColorHint {
+    /// BT.709 SDR studio range (8-bit NV12 や SDR 10-bit P010 など)。
+    Sdr,
+    /// BT.2020 PQ (SMPTE2084) HDR。
+    HdrPq,
+    /// BT.2020 HLG (ARIB STD B67) HDR。
+    HdrHlg,
+}
+
+/// `blit_nv12_to_rgba` の戻り値。
+/// - `output_texture` は呼び出し側でこのフレームの寿命中保持する責任を負う
+///   (= drop すると D3D11 側のテクスチャ解放、ただし NT shared handle は別命数管理なので
+///   D3D12 側からは引き続き参照可能)
+/// - `shared_handle` は `D3d11Frame` の `Drop` で `CloseHandle` される
+/// - `fence_value` を `D3d11Frame` に乗せて wgpu 側 `Wait(fence, fence_value)` に渡す
+pub struct BlitOutput {
+    pub output_texture: ID3D11Texture2D,
+    pub shared_handle: HANDLE,
+    pub fence_value: u64,
 }
 
 struct ProcessorState {
@@ -145,12 +205,17 @@ struct ProcessorState {
     out_w: u32,
     out_h: u32,
     out_format: DXGI_FORMAT,
+    /// `ContentDesc.InputFrameRate` に渡した実 fps。違う fps の動画に切り替わった
+    /// ときに processor を作り直すためキャッシュキーに含める (Codex Medium)。
+    /// 0/0 はフォールバック判定後の値 (60/1 等) を保持。
+    fps_num: u32,
+    fps_den: u32,
 }
 
 impl GpuVideoDevice {
     /// D3D11 デバイス + ビデオデバイスを作成する。失敗時はフォールバックを呼び出し側で
     /// 処理する想定。
-    pub fn new(vsr_enabled: bool) -> Result<Arc<Self>, GpuVideoError> {
+    pub fn new() -> Result<Arc<Self>, GpuVideoError> {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL::default();
@@ -189,44 +254,80 @@ impl GpuVideoDevice {
         let video_context: ID3D11VideoContext = context
             .cast()
             .map_err(|_| GpuVideoError::NoVideoDevice)?;
+        let video_context1: ID3D11VideoContext1 = video_context.cast().map_err(|e| {
+            GpuVideoError::DeviceCreate(format!("ID3D11VideoContext1 cast: {e:?}"))
+        })?;
 
-        let vsr_capability = vsr::detect_vsr_capability(&device);
         crate::logger::log(format!(
-            "GpuVideoDevice: created (vsr_enabled={vsr_enabled}, capability={vsr_capability:?})"
+            "GpuVideoDevice: created (feature_level=0x{:X})",
+            feature_level.0
         ));
+
+        // 共有 fence を作成。ID3D11Device5 (= D3D11.4) で初めて利用可能だが、
+        // Windows 10 1809 以降の更新済み環境では存在する。失敗したら呼び出し側で
+        // SW フォールバックされるよう Err を返す。
+        let device5: ID3D11Device5 = device
+            .cast()
+            .map_err(|e| GpuVideoError::DeviceCreate(format!("cast ID3D11Device5: {e:?}")))?;
+        let context4: ID3D11DeviceContext4 = context
+            .cast()
+            .map_err(|e| GpuVideoError::DeviceCreate(format!("cast ID3D11DeviceContext4: {e:?}")))?;
+        let mut fence_opt: Option<ID3D11Fence> = None;
+        unsafe {
+            device5
+                .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)
+                .map_err(|e| GpuVideoError::DeviceCreate(format!("CreateFence: {e:?}")))?;
+        }
+        let fence = fence_opt
+            .ok_or_else(|| GpuVideoError::DeviceCreate("CreateFence returned null".into()))?;
+        let fence_shared_handle = unsafe {
+            fence
+                .CreateSharedHandle(
+                    None,
+                    windows::Win32::Foundation::GENERIC_ALL.0,
+                    windows::core::PCWSTR::null(),
+                )
+                .map_err(|e| {
+                    GpuVideoError::DeviceCreate(format!("Fence CreateSharedHandle: {e:?}"))
+                })?
+        };
+
+        // プロセス内ユニーク世代 ID。0 は予約 (= 未開封キャッシュ判定で使う)、
+        // GpuVideoDevice の生成ごとに 1, 2, 3, ... と進む。HANDLE 値は kernel が
+        // 再利用しうるので別軸の identity が必要 (Codex P1)。
+        static NEXT_FENCE_GEN: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let fence_gen = NEXT_FENCE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         Ok(Arc::new(Self {
             device,
             context,
+            context4,
             video_device,
             video_context,
+            video_context1,
             processor_cache: std::cell::RefCell::new(None),
-            vsr_enabled: std::sync::atomic::AtomicBool::new(vsr_enabled),
-            vsr_capability,
+            fence,
+            fence_shared_handle,
+            next_fence_value: std::sync::atomic::AtomicU64::new(0),
+            fence_gen,
         }))
+    }
+
+    pub fn fence_shared_handle(&self) -> HANDLE {
+        self.fence_shared_handle
+    }
+
+    pub fn fence_gen(&self) -> u64 {
+        self.fence_gen
     }
 
     pub fn raw_device(&self) -> &ID3D11Device {
         &self.device
     }
 
-    pub fn vsr_capability(&self) -> VsrCapability {
-        self.vsr_capability
-    }
-
-    /// 設定 UI から動的に呼ばれる。`&self` で呼べるよう atomic を使用。
-    pub fn set_vsr_enabled(&self, enabled: bool) {
-        self.vsr_enabled
-            .store(enabled, std::sync::atomic::Ordering::Release);
-    }
-
-    /// VSR が opt-in されており、ドライバ側でも有効と判定されているか。
-    /// decoder が出力ターゲットサイズを決める際の参考にする (= VSR 有効時は
-    /// アップスケールターゲット解像度に出力する必要がある、入力 == 出力だと
-    /// アップスケール処理が走らないため)。
-    pub fn vsr_active(&self) -> bool {
-        self.vsr_enabled.load(std::sync::atomic::Ordering::Acquire)
-            && self.vsr_capability.is_available()
+    pub fn raw_context(&self) -> &ID3D11DeviceContext {
+        &self.context
     }
 
     /// 入力 NV12 / P010 テクスチャを RGBA 共有テクスチャに blit する。
@@ -243,7 +344,11 @@ impl GpuVideoDevice {
         out_w: u32,
         out_h: u32,
         ten_bit: bool,
-    ) -> Result<(ID3D11Texture2D, HANDLE), GpuVideoError> {
+        color_hint: VideoColorHint,
+        input_fps_num: u32,
+        input_fps_den: u32,
+        pts_secs: f64,
+    ) -> Result<BlitOutput, GpuVideoError> {
         // 1. 入力テクスチャの属性を読む。
         //    FFmpeg HW frames context の確保サイズは 16 ピクセルアライン (= coded_width/height)
         //    で、AVFrame の `width()/height()` (active_w/active_h) より大きいことがある
@@ -264,18 +369,55 @@ impl GpuVideoDevice {
         };
 
         // 2. processor / enumerator を確保 (キャッシュ)
-        self.ensure_processor(in_w, in_h, in_format, out_w, out_h, out_format)?;
+        self.ensure_processor(
+            in_w,
+            in_h,
+            in_format,
+            out_w,
+            out_h,
+            out_format,
+            input_fps_num,
+            input_fps_den,
+        )?;
         let cache = self.processor_cache.borrow();
         let state = cache.as_ref().expect("ensured above");
 
-        // 3. 出力先を 2 段構成にする:
-        //    - 中間 RT テクスチャ (NT shared なし) → VideoProcessorBlt の宛先
-        //    - 共有 RGBA テクスチャ (NT shared + keyed mutex) → wgpu で読み取り
-        //    NVIDIA ドライバは NT_SHARED+KEYEDMUTEX 付きテクスチャを VideoProcessorBlt
-        //    の出力として拒否する (E_INVALIDARG)。これが「VSR が走らない」根本原因。
-        //    Blt 後に CopyResource で 共有テクスチャに転送して解決する。
+        // 3. 出力先を 2 段構成にする (vsr_probe で driver 仕様確定):
+        //    - 中間 RT テクスチャ (NT/KM なし) → VideoProcessorBlt の宛先
+        //    - 共有 RGBA テクスチャ (NT|KEYEDMUTEX) → wgpu D3D12 OpenSharedHandle 用
+        //    NVIDIA driver:
+        //      * NT shared 単独 (= NTHANDLE のみ) は CreateTexture2D で E_INVALIDARG
+        //        (vsr_probe の flags-probe で全 size/format 一様に確認)
+        //      * 同 driver は KEYEDMUTEX 付き NT shared を VideoProcessorBlt 出力として
+        //        E_INVALIDARG で拒否する (= 過去観察)
+        //    ⇒ VPP 出力は NT/KM どちらも持たない intermediate に出して、CopyResource で
+        //       NT|KM 持ちの共有テクスチャに転送する。同期は keyed mutex には依存せず
+        //       (D3D12 側で IDXGIKeyedMutex 取得不可)、ID3D11Fence ↔ ID3D12Fence の
+        //       共有 fence で行う (`Signal`/`Wait`)。
         let intermediate = self.create_intermediate_rt(out_w, out_h, out_format)?;
         let (out_tex, shared_handle) = self.create_shared_output(out_w, out_h, out_format)?;
+
+        // shared_handle は CreateInputView/OutputView/Blt のいずれかが失敗して `?` で
+        // 早期リターンされても close する必要がある (Codex P2)。BlitOutput を返す直前で
+        // disarm() してリーク防止責任を呼び出し側 (D3d11Frame::Drop) に移譲する。
+        struct HandleGuard(HANDLE);
+        impl HandleGuard {
+            fn disarm(mut self) -> HANDLE {
+                let h = self.0;
+                self.0 = HANDLE::default();
+                h
+            }
+        }
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() {
+                    unsafe {
+                        let _ = windows::Win32::Foundation::CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+        let handle_guard = HandleGuard(shared_handle);
 
         // 4. 入力 view を作成
         let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
@@ -346,14 +488,48 @@ impl GpuVideoDevice {
                 .VideoProcessorSetStreamDestRect(&state.processor, 0, true, Some(&dst_rect));
         }
 
-        // 7. VSR opt-in (有効化されており、ドライバが対応する場合のみ)
-        if self.vsr_active() {
-            unsafe {
-                vsr::apply_nvidia_vsr_extension(&self.video_context, &state.processor);
+        // 100 frame ごとに 1 行診断ログ (= ~1.6 秒に 1 行 @ 60fps)。
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n == 0 || n % 100 == 0 {
+                crate::logger::log(format!(
+                    "VPP blit #{n} pts={pts_secs:.2}s in={active_w}x{active_h} \
+                     ({:?} {}) out={out_w}x{out_h} ({:?}) fps={}/{} hint={:?}",
+                    in_format,
+                    if ten_bit { "10b" } else { "8b" },
+                    out_format,
+                    input_fps_num,
+                    input_fps_den,
+                    color_hint,
+                ));
             }
         }
 
-        // 7. ストリームを構成して blit
+        // 色空間ヒントを毎 Blt で reassert する。
+        //   - SDR: BT.709 studio range G22 (NV12 と SDR 10-bit P010 を区別しない)
+        //   - HDR PQ: BT.2020 studio range G2084
+        //   - HDR HLG: BT.2020 studio range GHLG
+        // 出力は固定 RGB sRGB (BT.709 G22 full range)。HDR 入力は VPP がトーンマップする。
+        let in_color_space: DXGI_COLOR_SPACE_TYPE = match color_hint {
+            VideoColorHint::Sdr => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            VideoColorHint::HdrPq => DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+            VideoColorHint::HdrHlg => DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020,
+        };
+        let _ = ten_bit; // ten_bit は出力 format で既に使用済 (10-bit 入力 = R10G10B10A2 出力)
+        let out_color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        unsafe {
+            self.video_context1.VideoProcessorSetStreamColorSpace1(
+                &state.processor,
+                0,
+                in_color_space,
+            );
+            self.video_context1
+                .VideoProcessorSetOutputColorSpace1(&state.processor, out_color_space);
+        }
+
+        // ストリームを構成して blit
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
@@ -384,15 +560,75 @@ impl GpuVideoDevice {
                     ));
                     GpuVideoError::Blt(format!("Blt: {e:?}"))
                 })?;
-            // Blt 完了後、中間テクスチャの内容を NT shared テクスチャにコピーする。
-            // NVIDIA driver は NT_SHARED+KEYEDMUTEX 付きテクスチャを VPP の宛先として
-            // 拒否するが、CopyResource なら問題なく転送できる。同 D3D11 device 内 GPU
-            // copy なので latency は ~0.1ms オーダ。
+            // Blt 完了後、中間テクスチャ (NT/KM なし) の内容を NT|KM 共有テクスチャに
+            // コピーする。同 D3D11 device 内 GPU copy なので latency は ~0.1ms オーダ。
+            //
+            // **重要**: KEYEDMUTEX 付きテクスチャは IDXGIKeyedMutex の AcquireSync/
+            // ReleaseSync を D3D11 側で呼ばないと、D3D12 OpenSharedHandle 経由で
+            // 読み取った時に内容ゼロ (= 黒画面) になる。out_tex は毎フレーム新規作成で
+            // 初期 key=0 から始まるので、毎回 AcquireSync(0) → write → ReleaseSync(1)
+            // を呼べば独立に完結する (key 状態を frame 間で持ち越す必要なし)。
+            // 同期自体はこの mutex には依存せず ID3D11Fence ↔ ID3D12Fence で行う。
+            // INFINITE timeout は危険 (driver state 異常で永久ブロック)。
+            // 100ms timeout で fail-fast、タイムアウト時はそのフレームを諦めて Err を返す。
+            // 通常は fresh out_tex (= released-with-key-0 状態) なので即取れる。
+            let km_acquired = match out_tex.cast::<IDXGIKeyedMutex>() {
+                Ok(km) => match km.AcquireSync(0, 100) {
+                    Ok(()) => Some(km),
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "KeyedMutex AcquireSync(0) timeout/err: {e:?} — skipping frame"
+                        ));
+                        return Err(GpuVideoError::Blt(format!(
+                            "KeyedMutex AcquireSync: {e:?}"
+                        )));
+                    }
+                },
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "cast IDXGIKeyedMutex failed: {e:?}"
+                    ));
+                    None
+                }
+            };
             self.context.CopyResource(&out_tex, &intermediate);
+            // KeyedMutex を release (key=1) — D3D12 OpenSharedHandle 側はこれ以降の状態
+            // (= "key=1 で release 済み") を読み取れる。AcquireSync 自体はしない (= D3D12 の
+            // ID3D12Resource は IDXGIKeyedMutex を取得できないため)。実 sync は fence 任せ。
+            // ReleaseSync 失敗時は frame を発行しない (Codex P3): release されないと D3D12
+            // 側の OpenSharedHandle が空テクスチャしか読めなくなる。
+            if let Some(km) = km_acquired {
+                if let Err(e) = km.ReleaseSync(1) {
+                    crate::logger::log(format!("KeyedMutex ReleaseSync(1) failed: {e:?}"));
+                    return Err(GpuVideoError::Blt(format!(
+                        "KeyedMutex ReleaseSync: {e:?}"
+                    )));
+                }
+            }
             self.context.Flush();
         }
+        // 共有 fence を 1 進めて Signal。D3D12 側が `Wait(fence, fence_value)` で
+        // GPU レベルの待ち合わせをする。Flush() は queue にコマンドを投入するだけで
+        // GPU 完了は待たないが、Signal はその queue に入れた直後に置かれるので、
+        // GPU 上では「CopyResource 完了 → Signal」の順序が保証される。
+        let fence_value = self
+            .next_fence_value
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        unsafe {
+            self.context4
+                .Signal(&self.fence, fence_value)
+                .map_err(|e| GpuVideoError::Blt(format!("Fence Signal({fence_value}): {e:?}")))?;
+        }
 
-        Ok((out_tex, shared_handle))
+        // 全成功: HANDLE 所有権を BlitOutput → D3d11Frame に移譲する。以降 guard が drop
+        // しても close は走らない (= D3d11Frame::Drop の責任になる)。
+        let shared_handle = handle_guard.disarm();
+        Ok(BlitOutput {
+            output_texture: out_tex,
+            shared_handle,
+            fence_value,
+        })
     }
 
     fn ensure_processor(
@@ -403,7 +639,19 @@ impl GpuVideoDevice {
         out_w: u32,
         out_h: u32,
         out_format: DXGI_FORMAT,
+        input_fps_num: u32,
+        input_fps_den: u32,
     ) -> Result<(), GpuVideoError> {
+        // ContentDesc の InputFrameRate に実 fps を渡す。ドライバは内部スケジューラで
+        // フレームレートを参照している可能性があり、嘘値 (60/1 ハードコード) を渡すと
+        // mid-stream で「規定外コンテンツ」と判定されることがある。
+        // fps が分からないケース (= 0) は安全側で 60/1 にフォールバック。
+        let (fps_num, fps_den) = if input_fps_num == 0 || input_fps_den == 0 {
+            (60u32, 1u32)
+        } else {
+            (input_fps_num, input_fps_den)
+        };
+
         let cur = self.processor_cache.borrow();
         if let Some(s) = cur.as_ref() {
             if s.in_w == in_w
@@ -412,23 +660,24 @@ impl GpuVideoDevice {
                 && s.out_w == out_w
                 && s.out_h == out_h
                 && s.out_format == out_format
+                && s.fps_num == fps_num
+                && s.fps_den == fps_den
             {
                 return Ok(());
             }
         }
         drop(cur);
-
         let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: DXGI_RATIONAL {
-                Numerator: 60,
-                Denominator: 1,
+                Numerator: fps_num,
+                Denominator: fps_den,
             },
             InputWidth: in_w,
             InputHeight: in_h,
             OutputFrameRate: DXGI_RATIONAL {
-                Numerator: 60,
-                Denominator: 1,
+                Numerator: fps_num,
+                Denominator: fps_den,
             },
             OutputWidth: out_w,
             OutputHeight: out_h,
@@ -453,20 +702,22 @@ impl GpuVideoDevice {
             out_w,
             out_h,
             out_format,
+            fps_num,
+            fps_den,
         });
         Ok(())
     }
 
     /// 中間テクスチャ (= NT shared フラグなし、純粋に D3D11 内部の RT)。
-    /// VideoProcessorBlt の宛先用。NVIDIA ドライバは NT_SHARED+KEYEDMUTEX 付き
-    /// テクスチャを VPP 出力として拒否する (E_INVALIDARG) ため、まずこちらに blit
-    /// してから CopyResource で shared テクスチャに転送する。
+    /// `blit_nv12_to_rgba` の 2 段構成 (VPP 出力 → CopyResource → 共有テクスチャ) の
+    /// 1 段目で使う。NVIDIA driver は VPP 出力に NT/KM 付き shared テクスチャを許さない。
     fn create_intermediate_rt(
         &self,
         w: u32,
         h: u32,
         format: DXGI_FORMAT,
     ) -> Result<ID3D11Texture2D, GpuVideoError> {
+        let bind_flags = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -478,7 +729,7 @@ impl GpuVideoDevice {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            BindFlags: bind_flags,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -486,17 +737,32 @@ impl GpuVideoDevice {
         unsafe {
             self.device
                 .CreateTexture2D(&desc, None, Some(&mut tex))
-                .map_err(|e| GpuVideoError::TextureCreate(format!("intermediate: {e:?}")))?;
+                .map_err(|e| {
+                    GpuVideoError::TextureCreate(format!(
+                        "intermediate {w}x{h} format={format:?} bind=0x{bind_flags:X}: {e:?}"
+                    ))
+                })?;
         }
         tex.ok_or_else(|| GpuVideoError::TextureCreate("intermediate null".into()))
     }
 
+    /// 2 段アーキ用 shared output (CopyResource の宛先)。
+    /// vsr_probe の flags-probe で観測した driver 仕様:
+    ///   - `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` 単独は CreateTexture2D で E_INVALIDARG
+    ///   - `NTHANDLE | KEYEDMUTEX` の組合せは全 size/format で OK
+    /// よって NT 共有を作るには KEYEDMUTEX flag が必須 (同 driver の隠れ仕様)。
+    /// ただし keyed mutex 同期自体は使わない (D3D12 側で IDXGIKeyedMutex を取得できないため、
+    /// 同期は ID3D11Fence ↔ ID3D12Fence の共有 fence で実装、`AcquireSync/ReleaseSync` も
+    /// 呼ばない)。flag は CreateTexture2D 通すための形式的なもの。
     fn create_shared_output(
         &self,
         w: u32,
         h: u32,
         format: DXGI_FORMAT,
     ) -> Result<(ID3D11Texture2D, HANDLE), GpuVideoError> {
+        let bind_flags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+        let misc_flags =
+            (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32;
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -508,22 +774,24 @@ impl GpuVideoDevice {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            BindFlags: bind_flags,
             CPUAccessFlags: 0,
             // KEYEDMUTEX は付けない: 真に正しく実装するなら AcquireSync/ReleaseSync の
             // ペアを D3D11 側 (write) と D3D12 側 (read) 両方に入れる必要があるが、
-            // ID3D12Resource からは IDXGIKeyedMutex を取れないため D3D12 側で実装が
-            // 困難。代わりに D3D11 側 `Flush()` の暗黙バリア + D3D12 が描画する頃には
-            // 数フレーム経過していること (= producer-consumer chan のバッファリング)
-            // で実用上の競合を避ける。Codex P1 助言で本格化を検討する場合は
-            // `ID3D11Fence` + `D3D11_FENCE_FLAG_SHARED` ↔ `ID3D12Fence` を使う。
-            MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
+            // ID3D12Resource からは IDXGIKeyedMutex を取れないため D3D12 側で実装が困難。
+            // 代わりに ID3D11Fence ↔ ID3D12Fence の共有 fence で同期している (`Signal`/`Wait`)。
+            MiscFlags: misc_flags,
         };
         let mut tex: Option<ID3D11Texture2D> = None;
         unsafe {
             self.device
                 .CreateTexture2D(&desc, None, Some(&mut tex))
-                .map_err(|e| GpuVideoError::TextureCreate(format!("{e:?}")))?;
+                .map_err(|e| {
+                    GpuVideoError::TextureCreate(format!(
+                        "shared_output {w}x{h} format={format:?} bind=0x{bind_flags:X} \
+                         misc=0x{misc_flags:X}: {e:?}"
+                    ))
+                })?;
         }
         let tex = tex.ok_or_else(|| GpuVideoError::TextureCreate("null texture".into()))?;
         let dxgi: IDXGIResource1 = tex
@@ -538,6 +806,20 @@ impl GpuVideoDevice {
             .map_err(|e| GpuVideoError::SharedHandle(format!("{e:?}")))?
         };
         Ok((tex, handle))
+    }
+}
+
+impl Drop for GpuVideoDevice {
+    fn drop(&mut self) {
+        // fence の NT shared handle は CreateSharedHandle で取得しており、本構造体が
+        // 唯一の所有者。device drop タイミングで close する。D3D12 側で OpenSharedHandle
+        // 経由で得た ID3D12Fence COM オブジェクトは内部参照を持っているので、ここで
+        // close しても D3D12 側の fence は生存する (NT カーネルオブジェクトは refcount)。
+        if !self.fence_shared_handle.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.fence_shared_handle);
+            }
+        }
     }
 }
 

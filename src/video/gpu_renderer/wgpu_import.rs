@@ -14,21 +14,20 @@
 //!  wgpu::Device::create_texture_from_hal::<Dx12> ──► wgpu::Texture
 //! ```
 //!
-//! ## 同期 (TODO: 改善余地あり)
-//! 共有テクスチャは `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` で作っているが、
+//! ## 同期
+//! 共有テクスチャは `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | KEYEDMUTEX` で作っているが、
 //! D3D12 側は `ID3D12Resource` から `IDXGIKeyedMutex` を直接取得できないため
-//! (ID3D12Resource は IDXGIKeyedMutex を実装しない)、書き込み完了の
-//! 待ち合わせは **`ID3D11Fence` + `D3D11_FENCE_FLAG_SHARED`** で行うのが標準解。
+//! (ID3D12Resource は IDXGIKeyedMutex を実装しない)、書き込み完了の待ち合わせは
+//! **`ID3D11Fence` + `D3D11_FENCE_FLAG_SHARED` ↔ `ID3D12Fence`** で行う。
 //!
-//! 本初期実装では:
-//! - D3D11 側 keyed mutex は **書き込み側 (decoder thread) のみ** で 0→1→0 で
-//!   AcquireSync/ReleaseSync する (= 同一 D3D11 デバイス内の Blt が直列化される)
-//! - D3D12 側は **D3D11 が flush 済みであることを producer-consumer channel で
-//!   暗黙に保証** し、明示的 fence を持たない (= GPU 描画が走るまでに数 frame の
-//!   余裕があるので競合は実用上発生しない)
+//! - D3D11 側 (decoder thread): VPP blit + CopyResource 完了後に
+//!   `ID3D11DeviceContext4::Signal(fence, value)` で fence を進める
+//! - D3D12 側 (UI thread): `ID3D12CommandQueue::Wait(fence, value)` を queue に積んでから
+//!   テクスチャを sample。GPU レベルで CopyResource 完了が保証される
 //!
-//! 本格的にするなら `ID3D11Fence::CreateSharedHandle` ↔ `ID3D12Fence` で
-//! signal/wait を組むが、複雑性に見合うか要検討 (Codex P1 助言)。
+//! KEYEDMUTEX flag は CreateTexture2D を通すための形式上の指定 (NVIDIA driver 仕様で
+//! `NTHANDLE` 単独は E_INVALIDARG) で、AcquireSync/ReleaseSync 自体は decoder thread
+//! 側で 0→1 を 1 回回すだけ。実 sync は fence が担っている。
 
 use windows::Win32::Foundation::HANDLE as WinHandle061;
 // wgpu-hal 27 が要求する windows 0.58 系の ID3D12Resource。本体の windows 0.61

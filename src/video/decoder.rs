@@ -39,10 +39,10 @@ pub struct VideoFrame {
 
 /// 動画フレームのピクセルデータ。
 pub enum VideoFrameData {
-    /// CPU 上の RGBA8 (旧経路: SW デコード or HW + av_hwframe_transfer_data + swscale)。
+    /// CPU 上の RGBA8 (CPU 経路: SW デコード or HW + av_hwframe_transfer_data + swscale)。
     /// `Vec<u8>` は `width * height * 4` バイト。
     Cpu(Vec<u8>),
-    /// GPU 上の D3D11 NT 共有テクスチャ (新経路: HW + VideoProcessorBlt)。
+    /// GPU 上の D3D11 NT 共有テクスチャ (GPU 経路: HW + VideoProcessorBlt → RGBA shared)。
     /// UI は `import_shared_d3d11_texture` で wgpu::Texture に import して描画する。
     /// テクスチャの寿命管理は `D3d11Frame` が `Drop` で `CloseHandle` する責務を持つ。
     #[cfg(windows)]
@@ -85,9 +85,6 @@ pub struct VideoInfo {
     /// GPU 経路 (D3D11 video processor blit) が利用可能か。
     /// 第 1 フレーム到着時に確定。`false` の間は CPU readback 経路。
     pub gpu_path_active: bool,
-    /// NVIDIA RTX VSR が opt-in されているか (= ドライバに拡張 GUID を流したか)。
-    /// 実際にドライバ側で有効化されているかは別問題 (コンパネ ON / RTX GPU 必須)。
-    pub vsr_optin: bool,
 }
 
 pub struct DecodeHandles {
@@ -202,6 +199,18 @@ fn run_decoder(
         let r = video_stream.avg_frame_rate();
         let d = r.denominator();
         if d == 0 { 0.0 } else { r.numerator() as f64 / d as f64 }
+    };
+    // VPP ContentDesc に渡す raw 分数 (= num/den のまま渡すことで丸め誤差を排除)。
+    // 0 の場合は VPP 側で 60/1 にフォールバックされる。
+    let (video_fps_num, video_fps_den) = {
+        let r = video_stream.avg_frame_rate();
+        let n = r.numerator();
+        let d = r.denominator();
+        if n <= 0 || d <= 0 {
+            (0u32, 0u32)
+        } else {
+            (n as u32, d as u32)
+        }
     };
 
     let mut video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params) {
@@ -357,12 +366,9 @@ fn run_decoder(
         .map(|c| c.name().to_string())
         .unwrap_or_else(|| "?".to_string());
     #[cfg(windows)]
-    let (gpu_path_active, vsr_optin) = match gpu_video_device.as_ref() {
-        Some(d) => (true, d.vsr_active()),
-        None => (false, false),
-    };
+    let gpu_path_active = gpu_video_device.is_some();
     #[cfg(not(windows))]
-    let (gpu_path_active, vsr_optin) = (false, false);
+    let gpu_path_active = false;
     let info = VideoInfo {
         width: src_w,
         height: src_h,
@@ -372,7 +378,6 @@ fn run_decoder(
         has_audio,
         hw_decode_active: hw_active_initially,
         gpu_path_active,
-        vsr_optin,
     };
     let _ = info_tx.send(Ok(info));
 
@@ -547,10 +552,73 @@ fn run_decoder(
                                 current_seek_serial,
                                 &mut first_frame_logged,
                                 hw_active_initially,
+                                video_fps_num,
+                                video_fps_den,
                             ) {
                                 Ok(gpu_frame_out) => {
+                                    // ── デコーダのペーシング (GPU 経路) ──
+                                    // CPU 経路と同じロジックで pts を wall pacing now に追従
+                                    // させる。これを抜くと decoder が動画 PTS を無視して
+                                    // 最大速で blit + send し続け、UI 側で「全フレームが早送
+                                    // り」状態のカクつきになる (= GPU 経路初期実装の bug)。
+                                    const PACE_LEAD_SECS: f64 = 0.10;
+                                    const AUDIO_SAFE_LO: f64 = 0.25;
+                                    while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                                        if clock.is_seeking() {
+                                            break;
+                                        }
+                                        let ahead = pts_secs - clock.video_pacing_now_secs();
+                                        if ahead <= PACE_LEAD_SECS {
+                                            break;
+                                        }
+                                        if clock.is_audio_active()
+                                            && clock.total_audio_buffer_secs() < AUDIO_SAFE_LO
+                                        {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
+                                    }
+
                                     use crossbeam_channel::TrySendError;
+                                    let pts_gap = pts_secs - last_enqueued_pts;
                                     let send_result = video_tx.try_send(gpu_frame_out);
+                                    let dropped_full =
+                                        matches!(&send_result, Err(TrySendError::Full(_)));
+                                    if !dropped_full && send_result.is_ok() {
+                                        last_enqueued_pts = pts_secs;
+                                    }
+                                    if crate::perf::is_enabled() {
+                                        crate::perf::event(
+                                            "video",
+                                            "decode",
+                                            None,
+                                            0,
+                                            &[
+                                                ("pts", serde_json::Value::from(pts_secs)),
+                                                ("path", serde_json::Value::from("gpu_blit")),
+                                                (
+                                                    "dropped_full",
+                                                    serde_json::Value::from(dropped_full),
+                                                ),
+                                                (
+                                                    "pts_gap_ms",
+                                                    serde_json::Value::from(pts_gap * 1000.0),
+                                                ),
+                                                (
+                                                    "audio_buf_secs",
+                                                    serde_json::Value::from(
+                                                        clock.total_audio_buffer_secs(),
+                                                    ),
+                                                ),
+                                                (
+                                                    "pace_now",
+                                                    serde_json::Value::from(
+                                                        clock.video_pacing_now_secs(),
+                                                    ),
+                                                ),
+                                            ],
+                                        );
+                                    }
                                     if let Err(TrySendError::Disconnected(_)) = send_result {
                                         break 'outer;
                                     }
@@ -558,7 +626,7 @@ fn run_decoder(
                                 }
                                 Err(e) => {
                                     crate::logger::log(format!(
-                                        "GPU blit path failed, fallback to CPU readback: {e}"
+                                        "GPU path failed, fallback to CPU readback: {e}"
                                     ));
                                     // フォールスルーして既存の CPU 経路に進む。
                                 }
@@ -1102,6 +1170,8 @@ fn try_gpu_blit_path(
     current_seek_serial: u64,
     first_frame_logged: &mut bool,
     hw_active_initially: bool,
+    fps_num: u32,
+    fps_den: u32,
 ) -> Result<VideoFrame, crate::video::gpu_renderer::GpuVideoError> {
     use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
     use windows::core::Interface;
@@ -1149,34 +1219,25 @@ fn try_gpu_blit_path(
             | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P016
     );
 
-    // **VSR (NVIDIA RTX Video Super Resolution) を実際に発動させる条件**:
-    // 入力と出力のサイズが異なっている (= アップスケール) こと。同サイズだと
-    // 単なるカラーコンバートとなり、ドライバは VSR 処理を走らせない。
-    // ソースが 1440p 以下の場合は出力を 4K (3840x2160) のアスペクト維持
-    // クランプにする。それ以上の解像度はそのまま渡す (= アップスケール不要)。
-    let (final_w, final_h) = if gpu_dev.vsr_active() && dst_w <= 2560 && dst_h <= 1440 {
-        let in_aspect = dst_w as f32 / dst_h.max(1) as f32;
-        // 4K 横ベースで縦をアスペクト合わせ
-        let target_w = 3840u32;
-        let target_h = (target_w as f32 / in_aspect).round() as u32;
-        // 縦が 4K 上限超えるなら縦ベースに切替
-        if target_h > 2160 {
-            let target_h = 2160u32;
-            let target_w = (target_h as f32 * in_aspect).round() as u32;
-            (target_w, target_h)
-        } else {
-            (target_w, target_h)
-        }
-    } else {
-        (dst_w, dst_h)
-    };
+    let (final_w, final_h) = (dst_w, dst_h);
 
-    // GPU で NV12→RGBA 変換 (VSR 有効時はアップスケール込み)、出力は NT 共有テクスチャ。
+    // GPU で NV12→RGBA 変換、出力は NT 共有テクスチャ。
     // active_w/active_h は AVFrame の論理寸法 (= 実画像領域)。FFmpeg HW frames は
     // 16 アライン由来で texture 寸法が大きい場合があるので、ここで active 領域を渡す。
     let active_w = frame.width();
     let active_h = frame.height();
-    let (_out_tex, shared_handle) = unsafe {
+    // 色空間ヒント: FFmpeg の transfer characteristic から HDR PQ / HDR HLG / SDR を判定。
+    // 多くの SDR 動画は transfer 未指定 (UNSPECIFIED) で来るが、その場合は SDR にフォール
+    // バック。VPP は色空間情報なしより、何か明示された方が良い結果になる。
+    let color_hint = {
+        use ffmpeg_the_third::util::color::TransferCharacteristic as Trc;
+        match frame.color_transfer_characteristic() {
+            Trc::SMPTE2084 => crate::video::gpu_renderer::VideoColorHint::HdrPq,
+            Trc::ARIB_STD_B67 => crate::video::gpu_renderer::VideoColorHint::HdrHlg,
+            _ => crate::video::gpu_renderer::VideoColorHint::Sdr,
+        }
+    };
+    let blit = unsafe {
         gpu_dev.blit_nv12_to_rgba(
             &texture,
             subresource,
@@ -1185,8 +1246,20 @@ fn try_gpu_blit_path(
             final_w,
             final_h,
             ten_bit,
+            color_hint,
+            fps_num,
+            fps_den,
+            pts_secs,
         )?
     };
+    // `output_texture` は D3D11 側の COM オブジェクト。NT shared handle 経由で
+    // D3D12 側に開いてもらう運用なので、ここで drop しても問題ない (NT カーネル
+    // オブジェクトの refcount で D3D12 側のリソースは生存)。
+    let _ = blit.output_texture;
+    let shared_handle = blit.shared_handle;
+    let fence_value = blit.fence_value;
+    let fence_shared_handle = gpu_dev.fence_shared_handle();
+    let fence_gen = gpu_dev.fence_gen();
 
     // perf: 初回フレームは GPU 経路を明示
     if !*first_frame_logged && crate::perf::is_enabled() {
@@ -1218,7 +1291,10 @@ fn try_gpu_blit_path(
         pts_secs,
         seek_serial: current_seek_serial,
         shared_handle,
-        keyed_mutex_key: 1,
+        ten_bit,
+        fence_value,
+        fence_shared_handle,
+        fence_gen,
     };
     Ok(VideoFrame {
         width: final_w,

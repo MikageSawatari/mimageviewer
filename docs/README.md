@@ -40,6 +40,7 @@
 | [search-bench-results.md](search-bench-results.md) | Tantivy + bigram プロトタイプ計測結果 (50 万件規模まで) |
 | [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 |
 | [tag-feature.md](tag-feature.md) | ハッシュタグ型タグ機能 (`dc:subject` に `#タグ` 書き込み + Ctrl+G 連携) の設計ドキュメント |
+| [video-architecture.md](video-architecture.md) | 動画インライン再生サブシステムの設計指針と内部構造 (D3D11VA HW デコード + DX12 zero-copy interop + CPU fallback)。**Phase 2 (DComp / NVIDIA VSR) 撤回の経緯も巻末に記載** |
 
 ---
 

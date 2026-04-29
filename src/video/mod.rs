@@ -23,6 +23,7 @@
 pub mod audio;
 pub mod clock;
 pub mod decoder;
+pub mod engine;
 pub mod ffmpeg_loader;
 #[cfg(windows)]
 pub mod gpu_renderer;
@@ -87,6 +88,15 @@ pub struct GpuLatestFrame {
     pub width: u32,
     pub height: u32,
     pub ten_bit: bool,
+    /// このフレームの GPU 完了に対応する fence 値。wgpu 側で
+    /// `ID3D12CommandQueue::Wait(fence, fence_value)` してから sample する。
+    pub fence_value: u64,
+    /// fence の NT shared handle (`GpuVideoDevice` 寿命中は同じ値)。
+    /// wgpu 側で `OpenSharedHandle` するが、所有権は `GpuVideoDevice` が持っているので
+    /// このフィールドからは close しない。
+    pub fence_shared_handle: windows::Win32::Foundation::HANDLE,
+    /// プロセス内ユニークな fence 世代 ID。wgpu 側のキャッシュキー (Codex P1)。
+    pub fence_gen: u64,
 }
 
 // HANDLE は thread を渡って良い (D3d11Frame と同様の論理)。
@@ -596,7 +606,10 @@ impl VideoPlayer {
             shared_handle: d.shared_handle,
             width: d.width,
             height: d.height,
-            ten_bit: false,
+            ten_bit: d.ten_bit,
+            fence_value: d.fence_value,
+            fence_shared_handle: d.fence_shared_handle,
+            fence_gen: d.fence_gen,
         })
     }
 

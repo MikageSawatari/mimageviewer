@@ -367,9 +367,7 @@ fn main() -> eframe::Result {
                         // egui_wgpu の callback_resources に動画描画用の wgpu パイプラインを
                         // 起動時 1 度だけ登録 (= 各 paint で再利用される shared resource)。
                         crate::video::gpu_renderer::init_video_pipeline(&rs);
-                        match crate::video::gpu_renderer::GpuVideoDevice::new(
-                            app.settings.video_rtx_vsr,
-                        ) {
+                        match crate::video::gpu_renderer::GpuVideoDevice::new() {
                             Ok(dev) => {
                                 crate::logger::log(
                                     "GPU video device: created (D3D11 + video processor)"

@@ -13,8 +13,11 @@
 //! 触らないので RT パフォーマンスに影響しない。
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
+
+use crate::video::engine::audio_bookkeeping::AudioBookkeeping;
+use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 
 /// シーク要求の整合性ある 1 件分。AvClock の `seek_request` Mutex が保護する。
 /// `decoder` モジュールが `take_seek_request()` で取り出す。
@@ -29,16 +32,22 @@ pub(super) struct SeekRequest {
     pub serial: u64,
 }
 
+/// 動画再生用 AV マスタークロック (facade)。
+///
+/// Phase 2b: 内部状態は `MasterClock` (anchor 部分) と `AudioBookkeeping`
+/// (pump/tx queued 会計) に分割。AvClock は旧 API を維持したまま委譲する。
+/// 公開 API は変えていないので、`decoder.rs` / `audio.rs` / `VideoPlayer` から
+/// 見える挙動は等価。Phase 4 で AvClock 自体を撤去し、`TransportController` API
+/// に置き換える計画。
 pub struct AvClock {
-    /// `Instant::now()` の参照点 (構築時刻)。以降のすべての時刻はこれからの差分 ns で扱う。
-    epoch: Instant,
-    /// 最後に報告された音声 PTS (秒、f64 bits)。
-    /// 動画ストリームしか無い (音声無し) ファイルでは、デコーダ側が
-    /// `set_audio_pts` で video PTS を直接報告するフォールバックを使う。
-    audio_pts_bits: AtomicU64,
-    /// その PTS を報告した時刻 (epoch からの ns)。
-    audio_recorded_at_nanos: AtomicI64,
-    /// 再生中フラグ。false の間は now_secs() が進まない。
+    /// anchor 部分。`audio_pts` / `audio_recorded_at` / `fallback_pts` /
+    /// `fallback_recorded_at` を 1 つの `ClockAnchor` (Audio/Wall/Frozen) に統合した。
+    /// audio_active=true → Audio source、false → Wall source (= 旧 fallback path)。
+    /// playing=false / is_seeking=true のときは内部で Frozen に置換される。
+    /// Phase 4 で `EngineActor` が直接所有する想定。
+    master_clock: MasterClock,
+    /// 再生中フラグ。false の間は `now_secs()` が進まない (= MasterClock を Frozen
+    /// 風に扱う)。Phase 4 で `EngineState::Paused` に統合。
     playing: AtomicBool,
     /// pending なシーク要求。`None` = 未消費なし。
     /// take/request の両方が Mutex を取り、整合性のある (target, direction, serial)
@@ -59,19 +68,14 @@ pub struct AvClock {
     /// 「古い fill_output コールバックが、新たに発生した override を誤クリアする」
     /// race を排除する (Codex P1 指摘)。
     seek_override_serial: AtomicU64,
-    /// pump リングバッファの残量 (秒、f64 bits)。pump push / fill_output pop で更新。
-    audio_pump_buf_secs_bits: AtomicU64,
-    /// audio_tx に積まれているフレーム合計時間 (秒、f64 bits)。decoder の send 後 +,
-    /// pump の recv 後 -。`pump_buf + tx_queued` で総音声バッファ秒数になる。
-    audio_tx_queued_secs_bits: AtomicU64,
+    /// 音声バッファ会計 (pump 残量 + tx queued)。
+    /// Phase 2a で `AudioBookkeeping` に切り出し、AvClock は委譲のみ。動作は等価。
+    audio_bookkeeping: AudioBookkeeping,
     /// audio が「healthy」状態か。decoder が `notify_audio_active(true)` で開始、
     /// audio 出力起動失敗 / 音声ストリーム不在のとき false。
-    /// false なら `now_secs()` はフォールバック wall clock を使う。
+    /// false なら `now_secs()` はフォールバック wall clock を使う (= MasterClock の
+    /// `ClockSource::Wall`)。
     audio_active: AtomicBool,
-    /// フォールバック wall clock の基準 PTS (秒、f64 bits)。
-    fallback_pts_bits: AtomicU64,
-    /// 同 recorded_at_nanos (epoch から)。
-    fallback_recorded_at_nanos: AtomicI64,
     /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
     /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
     eof_reached: AtomicBool,
@@ -109,20 +113,20 @@ pub(crate) const DISPLAY_LEAD_TOLERANCE_SECS: f64 = 0.016;
 
 impl AvClock {
     pub fn new(initial_volume: f64) -> Self {
+        // 初期 anchor は (pts=0.0、wall=now、Frozen)。
+        // playing=false / audio_active=false の間は now_secs() が anchor PTS を
+        // そのまま返す挙動を再現するため、Frozen で開始するのが等価。
+        let master_clock =
+            MasterClock::with_anchor(ClockAnchor::frozen_at(0.0));
         Self {
-            epoch: Instant::now(),
-            audio_pts_bits: AtomicU64::new(0.0_f64.to_bits()),
-            audio_recorded_at_nanos: AtomicI64::new(0),
+            master_clock,
             playing: AtomicBool::new(false),
             seek_request: Mutex::new(None),
             seek_serial: AtomicU64::new(0),
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
-            audio_pump_buf_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
-            audio_tx_queued_secs_bits: AtomicU64::new(0.0_f64.to_bits()),
+            audio_bookkeeping: AudioBookkeeping::new(),
             audio_active: AtomicBool::new(false),
-            fallback_pts_bits: AtomicU64::new(0.0_f64.to_bits()),
-            fallback_recorded_at_nanos: AtomicI64::new(0),
             eof_reached: AtomicBool::new(false),
             volume_bits: AtomicU64::new(initial_volume.clamp(0.0, 1.0).to_bits()),
             muted: AtomicBool::new(false),
@@ -134,42 +138,61 @@ impl AvClock {
     /// この関数が呼ばれた場合、勝手に audio master 化してしまうのを防ぐため
     /// (Codex 指摘)。activate は `notify_audio_active` 経由で明示的に行う。
     ///
-    /// ⚠️ 単調性ガード: 入力 pts が現在の `now_secs()` より小さい (= 過去) 場合、
-    /// 現在値で固定して **後退させない**。これは notify_seek_completed が wall
-    /// 推定で先行させた `now_secs` に対して、後追いで届いた実 audio pts が少しだけ
-    /// 過去に位置するケース (post-seek の最初の数フレーム) で UI が逆方向にジャンプ
-    /// しないようにする。
+    /// ⚠️ 単調性ガード: 入力 pts が **前回 anchor の audio pts** より小さい (= 後退)
+    /// 場合、前回値で固定して後退させない。post-seek の最初の数フレームで古い
+    /// pts が後追いで届くケースで UI が逆方向にジャンプしないように。
+    ///
+    /// 過去実装は `pts_secs.max(self.now_secs())` で **wall extrapolation 値** と
+    /// 比較していたが、これだと cpal callback の wall jitter で `now_secs()` が
+    /// `pts_secs` より進む → anchor が wall に強制ロック → 長時間 wall pace で進む
+    /// → video PTS (30fps 一定) を pace_now が確実に追い越し、decoder が永遠に
+    /// catch-up モード = 全フレームカクつき、という実害が出た。前回 anchor PTS と
+    /// 比較するなら、wall extrapolation の影響を受けない。
     pub fn set_audio_pts(&self, pts_secs: f64) {
-        let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        let monotonic = pts_secs.max(self.now_secs());
-        self.write_audio_anchor(monotonic, now_ns);
+        let prev = self.master_clock.anchor();
+        let prev_audio_pts = if matches!(prev.source, ClockSource::Audio) {
+            prev.pts_secs
+        } else {
+            f64::NEG_INFINITY
+        };
+        let monotonic = pts_secs.max(prev_audio_pts);
+        self.write_audio_anchor_at(monotonic, Instant::now());
+    }
+
+    /// **Wall** anchor で全置換する内部ヘルパ。
+    /// 用途: 音声無し (audio_active=false) の場合の wall extrapolation 起点設定。
+    /// `set_fallback_anchor` から呼ばれる。`notify_seek_completed` の audio_active=false
+    /// 経路もここを通る。
+    ///
+    /// Codex Phase 2b P2 反映: 旧版は audio_active を見て Audio/Wall を選んでいたが、
+    /// `set_fallback_anchor()` の呼び出し直後に pump が `notify_audio_active()` した
+    /// 場合、video frame PTS が audio master anchor になる race があった。
+    /// この helper は **常に Wall** を書く。Audio source は `write_audio_anchor_at`
+    /// 経由でのみ書ける。
+    fn write_fallback_anchor_at(&self, pts: f64, wall: Instant) {
+        self.master_clock.set_anchor(ClockAnchor::wall(pts, wall));
+    }
+
+    /// **Audio** anchor で全置換する内部ヘルパ。
+    /// 用途: audio actor (cpal callback / pump) が報告した実 audio PTS を anchor 化する。
+    /// Phase 2b: MasterClock に Audio source で書く。
+    fn write_audio_anchor_at(&self, pts: f64, wall: Instant) {
+        self.master_clock.set_anchor(ClockAnchor::audio(pts, wall));
+    }
+
+    /// EOF 時に再生位置を duration に進めたいが、audio_active 状態は変えたくない
+    /// ケース (audioless 動画でも duration まで進めて停止アニメを揃えるため)。
+    pub fn set_position_at_eof(&self, pts_secs: f64) {
+        // EOF 時は時間進行を止める (= 元コードでも recorded_at を今にしていたので
+        // 直後の経過は 0)。ここでは Frozen anchor で書く。
+        self.master_clock
+            .set_anchor(ClockAnchor::frozen_at(pts_secs));
     }
 
     /// 真の音声フレームが pump に到達した時に呼ぶ。これで `audio_active = true`
     /// になり、`now_secs()` が audio master モードに切り替わる。
     pub fn notify_audio_active(&self) {
         self.audio_active.store(true, Ordering::Release);
-    }
-
-    /// fallback wall clock を `(pts, now_ns)` で書き直す内部ヘルパ。
-    /// `notify_seek_completed` / `set_position_at_eof` / `set_fallback_anchor` で共有。
-    fn write_fallback_anchor(&self, pts: f64, now_ns: i64) {
-        self.fallback_pts_bits.store(pts.to_bits(), Ordering::Release);
-        self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
-    }
-
-    /// audio anchor を `(pts, now_ns)` で書き直す内部ヘルパ。
-    fn write_audio_anchor(&self, pts: f64, now_ns: i64) {
-        self.audio_pts_bits.store(pts.to_bits(), Ordering::Release);
-        self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
-    }
-
-    /// EOF 時に再生位置を duration に進めたいが、audio_active 状態は変えたくない
-    /// ケース (audioless 動画でも duration まで進めて停止アニメを揃えるため)。
-    pub fn set_position_at_eof(&self, pts_secs: f64) {
-        let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        self.write_audio_anchor(pts_secs, now_ns);
-        self.write_fallback_anchor(pts_secs, now_ns);
     }
 
     /// 音声ストリームが無い / 出力起動失敗のときに呼ぶ。`now_secs()` は wall clock
@@ -184,38 +207,32 @@ impl AvClock {
 
     /// 現在の理想的な再生位置 (秒) を返す。
     /// - シーク中 (override 設定中) は target を返す
-    /// - audio_active = true なら audio_pts + 経過 (audio master)
-    /// - そうでなければ fallback_pts + 経過 (wall clock master)
-    /// 一時停止中はスナップショット (extrapolation 停止)。
+    /// - playing=true → MasterClock の extrapolation を返す
+    /// - playing=false → anchor PTS をそのまま返す (時間進行停止)
+    ///
+    /// Phase 2b: 旧 audio_active / audio_pts / fallback_pts の分岐は MasterClock の
+    /// `ClockSource` (Audio/Wall) で表現済。`set_audio_pts` / `set_fallback_anchor`
+    /// が anchor source を適切に設定しているので、この関数では override と playing
+    /// の制御だけ行う。
     pub fn now_secs(&self) -> f64 {
         let override_bits = self.seek_target_override_bits.load(Ordering::Acquire);
         if override_bits != SEEK_NONE {
             return f64::from_bits(override_bits);
         }
         let playing = self.playing.load(Ordering::Acquire);
-        if self.audio_active.load(Ordering::Acquire) {
-            let pts = f64::from_bits(self.audio_pts_bits.load(Ordering::Acquire));
-            if !playing {
-                return pts;
-            }
-            let recorded = self.audio_recorded_at_nanos.load(Ordering::Acquire);
-            if recorded == 0 {
-                return pts;
-            }
-            let now = self.epoch.elapsed().as_nanos() as i64;
-            return pts + (now - recorded).max(0) as f64 / 1_000_000_000.0;
-        }
-        // ── 音声無し / 出力失敗時は wall clock anchor で進行 ──
-        let pts = f64::from_bits(self.fallback_pts_bits.load(Ordering::Acquire));
+        let anchor = self.master_clock.anchor();
         if !playing {
-            return pts;
+            // 一時停止中はスナップショット (extrapolation 停止)。
+            return anchor.pts_secs;
         }
-        let recorded = self.fallback_recorded_at_nanos.load(Ordering::Acquire);
-        if recorded == 0 {
-            return pts;
+        // playing=true: MasterClock の Audio/Wall extrapolation を活かす。
+        // Frozen anchor (= 構築直後で set_*_anchor が一度も呼ばれていない) は、
+        // playing=true でも extrapolation せず anchor PTS をそのまま返す
+        // (= 旧コード `recorded == 0` 判定と等価)。
+        if matches!(anchor.source, ClockSource::Frozen) {
+            return anchor.pts_secs;
         }
-        let now = self.epoch.elapsed().as_nanos() as i64;
-        pts + (now - recorded).max(0) as f64 / 1_000_000_000.0
+        self.master_clock.now_secs()
     }
 
     /// decoder のペーシングが「自分が今の clock からどれだけ先行しているか」を
@@ -233,28 +250,34 @@ impl AvClock {
         self.playing.load(Ordering::Acquire)
     }
 
-    /// 再生/一時停止を切り替える。一時停止時は audio_recorded_at を「今」に
-    /// 巻き戻して、再生再開時に時間ジャンプが起きないようにする。
+    /// 再生/一時停止を切り替える。一時停止時は anchor を「現在時刻スナップショット」
+    /// に固定し、再生再開時は wall 起点を「今」に巻き戻して時間ジャンプを抑える。
+    /// Phase 2b: MasterClock 経由で anchor を更新。
     pub fn set_playing(&self, playing: bool) {
         if playing == self.playing.load(Ordering::Acquire) {
             return;
         }
-        let now_ns = self.epoch.elapsed().as_nanos() as i64;
+        let wall_now = Instant::now();
         if playing {
-            // 再生再開: audio / fallback 両方の recorded_at を今に巻き戻す
-            self.audio_recorded_at_nanos.store(now_ns, Ordering::Release);
-            // fallback も同時アンカー (audio が無いケースで now_secs が wall 進行する)
-            let cur_fallback = f64::from_bits(self.fallback_pts_bits.load(Ordering::Acquire));
-            // 一時停止前の fallback_pts はそのまま、recorded_at だけ更新
-            let _ = cur_fallback;
-            self.fallback_recorded_at_nanos.store(now_ns, Ordering::Release);
+            // 再生再開: 現 anchor の pts をそのまま使い、wall 起点を「今」に書き換える。
+            // audio_active=true → Audio source、false → Wall source。
+            let cur = self.master_clock.anchor();
+            let source = if self.audio_active.load(Ordering::Acquire) {
+                ClockSource::Audio
+            } else {
+                ClockSource::Wall
+            };
+            self.master_clock.set_anchor(ClockAnchor {
+                pts_secs: cur.pts_secs,
+                wall_at_anchor: wall_now,
+                speed: 1.0,
+                source,
+            });
         } else {
-            // 一時停止: 現時刻スナップショットで固定 (どちらの master でも巻き戻し抑止)
-            let frozen = self.now_secs();
-            if self.audio_active.load(Ordering::Acquire) {
-                self.audio_pts_bits.store(frozen.to_bits(), Ordering::Release);
-            }
-            self.fallback_pts_bits.store(frozen.to_bits(), Ordering::Release);
+            // 一時停止: 現時点の now_secs() で Frozen に固定。
+            let frozen_pts = self.now_secs();
+            self.master_clock
+                .set_anchor(ClockAnchor::frozen_at(frozen_pts));
         }
         self.playing.store(playing, Ordering::Release);
     }
@@ -325,19 +348,21 @@ impl AvClock {
     /// fill_output 側 (post-seek 後最初の有効サンプル消費時) または UI tick 側
     /// (post-seek 後最初の動画フレーム到着時) で行う。
     pub fn notify_seek_completed(&self, new_pts: f64) {
-        let now_ns = self.epoch.elapsed().as_nanos() as i64;
         // recorded_at = 今 にしておき、now_secs を wall 推定で進める。後追いで届く実
         // audio pts が現在値より小さくても `set_audio_pts` の単調性ガードで後退を防ぐ。
         // sentinel 0 を入れる旧設計は cpal の HW バッファ drain (~500ms) 中 video が
         // 凍結する現象を起こしていた。
-        self.write_audio_anchor(new_pts, now_ns);
-        self.write_fallback_anchor(new_pts, now_ns);
+        // Phase 2b: 旧 audio anchor + fallback anchor の 2 経路 write を、MasterClock
+        // の単一 anchor write に統合。audio_active に応じて Audio/Wall を選ぶ。
+        let wall = Instant::now();
+        if self.audio_active.load(Ordering::Acquire) {
+            self.write_audio_anchor_at(new_pts, wall);
+        } else {
+            self.write_fallback_anchor_at(new_pts, wall);
+        }
         // pre-seek の audio バッファ会計を 0 に (pacing が「audio 十分」と誤認して
         // decoder が sleep し新世代 audio packet を読まなくなる post-seek hang を防止)。
-        self.audio_pump_buf_secs_bits
-            .store(0.0_f64.to_bits(), Ordering::Release);
-        self.audio_tx_queued_secs_bits
-            .store(0.0_f64.to_bits(), Ordering::Release);
+        self.audio_bookkeeping.reset();
     }
 
     /// post-seek 後の有効フレーム / サンプルを最初に消費した時に呼ぶ。
@@ -374,42 +399,29 @@ impl AvClock {
     /// post-seek の override クリア前に呼ぶことで、`notify_seek_completed` 時点の
     /// 古い anchor が clear 直後に時間ジャンプするのを防ぐ (= 見た目フリッカー)。
     /// audio 経路は `set_audio_pts` で同等の役割を果たす。
+    /// Phase 2b: MasterClock の Wall anchor として書く (audio_active=false 前提)。
     pub fn set_fallback_anchor(&self, pts: f64) {
-        let now_ns = self.epoch.elapsed().as_nanos() as i64;
-        self.write_fallback_anchor(pts, now_ns);
+        self.write_fallback_anchor_at(pts, Instant::now());
     }
 
     /// pump 内ringbuffer 残量 (秒) を報告 (audio.rs から)。
+    /// Phase 2a: `AudioBookkeeping` に委譲。
     pub fn set_audio_pump_buf_secs(&self, secs: f64) {
-        self.audio_pump_buf_secs_bits
-            .store(secs.to_bits(), Ordering::Release);
+        self.audio_bookkeeping.set_pump_buf_secs(secs);
     }
 
     /// audio_tx に積まれているフレーム合計時間 (秒) の差分を加える。
     /// decoder の send 直後に +duration、pump の recv 直後に -duration を呼ぶ。
+    /// Phase 2a: `AudioBookkeeping` に委譲。
     pub fn add_audio_tx_queued_secs(&self, delta_secs: f64) {
-        // f64 の atomic 加算は CAS ループで実装。短時間の write 競合のみなのでコスト低。
-        let mut cur = self.audio_tx_queued_secs_bits.load(Ordering::Relaxed);
-        loop {
-            let new_val = (f64::from_bits(cur) + delta_secs).max(0.0);
-            match self.audio_tx_queued_secs_bits.compare_exchange_weak(
-                cur,
-                new_val.to_bits(),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => cur = actual,
-            }
-        }
+        self.audio_bookkeeping.add_tx_queued(delta_secs);
     }
 
     /// 現在の総音声バッファ秒数 (= pump + audio_tx queued)。
     /// decoder pacing が「audio が枯渇しそう (= 沈黙する) を回避すべきか」判定する。
+    /// Phase 2a: `AudioBookkeeping` に委譲。
     pub fn total_audio_buffer_secs(&self) -> f64 {
-        let pump = f64::from_bits(self.audio_pump_buf_secs_bits.load(Ordering::Acquire));
-        let tx = f64::from_bits(self.audio_tx_queued_secs_bits.load(Ordering::Acquire));
-        pump + tx
+        self.audio_bookkeeping.total_secs()
     }
 
 

@@ -1341,35 +1341,6 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(8.0);
 
-    ui.label(egui::RichText::new("NVIDIA RTX Video Super Resolution").strong());
-    ui.add_space(4.0);
-    ui.label(
-        "NVIDIA RTX 30/40/50 シリーズの GPU で利用可能な AI 動画アップスケーリング。\n\
-         低解像度動画 (720p/1080p) を 4K モニターで表示する際にディテール / シャープネスを向上します。",
-    );
-    ui.add_space(6.0);
-    ui.checkbox(&mut s.video_rtx_vsr, "RTX Super Resolution を有効にする")
-        .on_hover_text(
-            "ON: GPU 側でアップスケール処理を要求 (アプリの opt-in)。\n\
-             OFF (既定): 通常のスケーラ。\n\
-             ハードウェアデコード ON が前提です。",
-        );
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(
-            "⚠️ NVIDIA コントロールパネルの「動画 → RTX Video Enhancement」が ON でないと\n\
-             効果は発生しません。本設定はアプリの opt-in のみで、コンパネ側がマスタースイッチです。\n\
-             ⚠️ リモートデスクトップ等で DX12 が利用できない環境では本機能は自動的に無効化されます\n\
-             (動画は CPU 経由で再生されます)。",
-        )
-        .size(11.0)
-        .color(egui::Color32::from_gray(150)),
-    );
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-
     ui.label(egui::RichText::new("再生").strong());
     ui.add_space(4.0);
     ui.checkbox(&mut s.video_autoplay, "フルスクリーン化と同時に自動再生")
