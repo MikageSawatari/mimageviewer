@@ -1582,6 +1582,17 @@ pub struct App {
     /// 表示される。Phase 5.4 / 5.4.1 で B キー authoring 配線。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
 
+    // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
+    /// S キーでトグルされる動画タイルモード状態。再生中に間隔別にサムネを並べて
+    /// クリックでシーク。VideoPlayer 切替で自動破棄 (Drop で worker 終了)。
+    #[cfg(windows)]
+    pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
+    /// タイルモードのサムネ texture キャッシュ (slot_idx → (key, tex))。
+    /// state Drop 時にこちらも `clear()` で解放する想定。
+    #[cfg(windows)]
+    pub(crate) video_tile_textures:
+        std::collections::HashMap<usize, ((u64, u64, u32, u32), egui::TextureHandle)>,
+
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
     pub(crate) rating_db: Option<crate::rating_db::RatingDb>,
@@ -2365,6 +2376,10 @@ impl Default for App {
             rotation_cache: std::collections::HashMap::new(),
             video_pin_db,
             video_bookmark_db,
+            #[cfg(windows)]
+            video_tile_state: None,
+            #[cfg(windows)]
+            video_tile_textures: std::collections::HashMap::new(),
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

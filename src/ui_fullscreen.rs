@@ -1006,10 +1006,15 @@ impl App {
                             // 動画は専用パネルに分岐する (Phase 5.4):
                             //   左 = ジャンプ先 (ピン / ブックマーク / チャプター)、
                             //   右 = メタ情報 (タイトル / コーデック / チャプター…)。
+                            // Phase 5.5: タイルモード中は他のパネルを抑止しオーバーレイのみ描画。
                             #[cfg(windows)]
                             {
-                                self.draw_video_jump_panel(ui, ctx, full_rect, fs_idx);
-                                self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
+                                if self.video_tile_state.is_some() {
+                                    self.draw_video_tile_overlay(ui, ctx, full_rect, fs_idx);
+                                } else {
+                                    self.draw_video_jump_panel(ui, ctx, full_rect, fs_idx);
+                                    self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
+                                }
                             }
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
@@ -4710,6 +4715,16 @@ impl App {
         let bookmark_key = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::B)
         });
+        // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
+        // S (スライドショー) とは handle_video_input 先行 consume で分離する。
+        let tile_key = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::S)
+        });
+        // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
+        // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
+        // 横取りする。
+        let escape_for_tile = self.video_tile_state.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
         if shift_enter {
             if let Some(p) = video_path {
@@ -4766,6 +4781,19 @@ impl App {
         }
         if loop_key {
             self.settings.video_loop = !self.settings.video_loop;
+        }
+
+        // Phase 5.5: S キーでタイルモード トグル。画面サイズは Context 側から取得。
+        // toggle 内で fs_cache / video_tile_state を借用するので、player 借用後に呼ぶ。
+        if tile_key {
+            let screen = ctx.content_rect().size();
+            self.toggle_video_tile_mode(fs_idx, screen);
+        }
+        // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
+        // (handle_image_keys 後段) の通常 ESC で扱う。
+        if escape_for_tile {
+            self.video_tile_state = None;
+            self.video_tile_textures.clear();
         }
 
         // Phase 5.4.1: ブックマーク追加。現在位置 + 動画パスを取得して DB に挿入。
