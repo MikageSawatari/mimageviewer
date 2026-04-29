@@ -54,9 +54,16 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn toggle_video_tile_mode(&mut self, fs_idx: usize, screen_size: egui::Vec2) {
         if self.video_tile_state.is_some() {
+            // Codex P5.5 H2 反映: state Drop だけでは texture cache がクリアされない
+            // (Drop impl が無いため)。閉じる側で明示的にクリアしてリーク防止。
             self.video_tile_state = None;
+            self.video_tile_textures.clear();
             return;
         }
+        // 古い texture が残っていれば再 open 前にもクリア (= 異なる動画 / 異なる
+        // 列数の grid から切り替えるとき、古いキーで残った texture が誤マッチする
+        // のを防ぐ)。
+        self.video_tile_textures.clear();
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         else {
             return;
@@ -98,7 +105,11 @@ impl App {
         let dur = info.duration_secs;
         let interval = pick_interval(dur, max_tiles);
 
-        let timestamps: Vec<f64> = generate_timestamps(dur, interval);
+        // Codex P5.5 M4 反映: `pick_interval` は溢れる場合に最大候補 (1800 秒) を
+        // 返すため、超長時間動画では duration / 1800 が依然 max_tiles を超える可能性が
+        // ある (= 100 時間動画で 200 タイル等)。ここで明示的に max_tiles に切り詰めて
+        // メモリ / GPU テクスチャ確保を抑える。
+        let timestamps: Vec<f64> = generate_timestamps(dur, interval, max_tiles);
         if timestamps.is_empty() {
             return;
         }
@@ -345,13 +356,13 @@ fn pick_interval(duration_secs: f64, max_tiles: usize) -> f64 {
     *INTERVAL_CANDIDATES_SECS.last().unwrap_or(&30.0)
 }
 
-fn generate_timestamps(duration_secs: f64, interval_secs: f64) -> Vec<f64> {
-    if duration_secs <= 0.0 || interval_secs <= 0.0 {
+fn generate_timestamps(duration_secs: f64, interval_secs: f64, max_count: usize) -> Vec<f64> {
+    if duration_secs <= 0.0 || interval_secs <= 0.0 || max_count == 0 {
         return Vec::new();
     }
-    let mut out: Vec<f64> = Vec::new();
+    let mut out: Vec<f64> = Vec::with_capacity(max_count.min(1024));
     let mut t = 0.0;
-    while t < duration_secs - 0.01 {
+    while t < duration_secs - 0.01 && out.len() < max_count {
         out.push(t);
         t += interval_secs;
     }
@@ -406,7 +417,7 @@ mod tests {
 
     #[test]
     fn generate_timestamps_basic() {
-        let ts = generate_timestamps(30.0, 5.0);
+        let ts = generate_timestamps(30.0, 5.0, 100);
         assert_eq!(ts.len(), 6); // 0,5,10,15,20,25
         assert!((ts[0] - 0.0).abs() < 1e-9);
         assert!((ts[5] - 25.0).abs() < 1e-9);
@@ -414,7 +425,16 @@ mod tests {
 
     #[test]
     fn generate_timestamps_zero_dur() {
-        assert!(generate_timestamps(0.0, 5.0).is_empty());
-        assert!(generate_timestamps(5.0, 0.0).is_empty());
+        assert!(generate_timestamps(0.0, 5.0, 100).is_empty());
+        assert!(generate_timestamps(5.0, 0.0, 100).is_empty());
+        assert!(generate_timestamps(30.0, 5.0, 0).is_empty());
+    }
+
+    #[test]
+    fn generate_timestamps_capped_by_max_count() {
+        // 1 時間 / 1 秒間隔 = 3600 タイルになるが、max_count=10 で切り詰める
+        let ts = generate_timestamps(3600.0, 1.0, 10);
+        assert_eq!(ts.len(), 10);
+        assert!((ts[9] - 9.0).abs() < 1e-9);
     }
 }

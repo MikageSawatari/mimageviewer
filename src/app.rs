@@ -10081,6 +10081,12 @@ impl App {
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;
         self.fs_context_menu_idx = None;
+        // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
+        #[cfg(windows)]
+        {
+            self.video_tile_state = None;
+            self.video_tile_textures.clear();
+        }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
         for (cancel, _, _) in self.fs_pending.values() {

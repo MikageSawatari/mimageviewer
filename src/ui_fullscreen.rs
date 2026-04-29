@@ -2282,6 +2282,10 @@ impl App {
                         // 音量等のウィジェット側で処理させたいので除外する。
                         // Phase 5.4 追加: 左ジャンプパネル / 右メタ情報パネルの上で
                         // クリックしたら toggle_play しない (Codex P5.4 M1 反映)。
+                        // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
+                        // で seek + close を行うため、background catch-all は完全抑止
+                        // (Codex P5.5 H1 反映)。
+                        let tile_active = self.video_tile_state.is_some();
                         let pos_opt = fs_response.interact_pointer_pos();
                         let in_hud = pos_opt
                             .map(|p| video_hud_rect(full_rect).contains(p))
@@ -2298,6 +2302,7 @@ impl App {
                             })
                             .unwrap_or(false);
                         if fs_response.clicked()
+                            && !tile_active
                             && !in_hud
                             && !in_video_panel
                             && let Some(idx) = self.fullscreen_idx
