@@ -2275,12 +2275,26 @@ impl App {
                         // 外部プレイヤーで開きたい場合は Shift+Enter。
                         // ただし下部 HUD バーの矩形内のクリックは play/pause / シーク /
                         // 音量等のウィジェット側で処理させたいので除外する。
-                        let in_hud = fs_response
-                            .interact_pointer_pos()
+                        // Phase 5.4 追加: 左ジャンプパネル / 右メタ情報パネルの上で
+                        // クリックしたら toggle_play しない (Codex P5.4 M1 反映)。
+                        let pos_opt = fs_response.interact_pointer_pos();
+                        let in_hud = pos_opt
                             .map(|p| video_hud_rect(full_rect).contains(p))
+                            .unwrap_or(false);
+                        // パネル領域 (画面端 1/4) を判定して toggle_play 抑止に使う。
+                        // パネル自体が描画されているかは hover で動的に決まるので、
+                        // ここでは「画面端 1/4 以内に居たら誤発火しない」程度の保守判定。
+                        let in_video_panel = pos_opt
+                            .map(|p| {
+                                let left_thresh = full_rect.min.x + full_rect.width() * 0.25;
+                                let right_thresh = full_rect.max.x - full_rect.width() * 0.25;
+                                (p.x < left_thresh || p.x > right_thresh)
+                                    && p.y >= full_rect.min.y + 44.0
+                            })
                             .unwrap_or(false);
                         if fs_response.clicked()
                             && !in_hud
+                            && !in_video_panel
                             && let Some(idx) = self.fullscreen_idx
                             && let Some(p) = self.fs_video_player(idx)
                         {
@@ -4756,10 +4770,17 @@ impl App {
 
         // Phase 5.4.1: ブックマーク追加。現在位置 + 動画パスを取得して DB に挿入。
         // 借用衝突を避けるため `if let Some(player)` 短いスコープで pos / path を抜く。
+        // Codex P5.4 M2 反映: Loading / エラー状態では追加させない (= 0.0s に
+        // ゴミブックマークが入るのを防ぐ)。info() が来ている = duration / has_audio が
+        // 確定 = 1 フレーム以上は decoder が動いている前提。
         if bookmark_key {
             let snapshot = match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Video { player, .. }) => {
-                    Some((player.path().clone(), player.position()))
+                    if player.error().is_some() || player.info().is_none() {
+                        None
+                    } else {
+                        Some((player.path().clone(), player.position()))
+                    }
                 }
                 _ => None,
             };
