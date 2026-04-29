@@ -1574,9 +1574,12 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
-    // ── 動画ピン / ブックマーク DB (Phase 5.4) ────────────────────
-    /// ユーザーが固定したフレーム位置 (= グリッドサムネ最優先)。Phase 5.4 で
-    /// 読み取り側の API 配線、Phase 5.6 で HUD ボタンから書き込み配線予定。
+    // ── 動画ピン / ブックマーク DB (Phase 5.4 / Phase 6) ──────────
+    /// 動画フレーム ピン留め DB。Phase 5 では UI 配線していたが、Phase 6 で
+    /// 「動画にピン UI は要らない」方針に変更したため authoring UI は削除。
+    /// DB スキーマと open() 自体は維持し、将来再導入が容易な状態を保つ
+    /// (= フィールド削除は break 変更が大きいため後回し)。
+    #[allow(dead_code)]
     pub(crate) video_pin_db: Option<crate::video_pins::VideoPinDb>,
     /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
     /// 表示される。Phase 5.4 / 5.4.1 で B キー authoring 配線。

@@ -18,7 +18,6 @@ use eframe::egui;
 use crate::app::App;
 use crate::video::decoder::{Chapter, VideoInfo};
 use crate::video_bookmarks::VideoBookmark;
-use crate::video_pins::VideoPin;
 
 /// 右側パネルの幅 (画像と揃える)。
 const VIDEO_PANEL_WIDTH: f32 = 380.0;
@@ -124,7 +123,8 @@ impl App {
             egui::pos2(panel_rect.min.x, title_rect.max.y),
             panel_rect.max,
         );
-        let mut seek_to: Option<f64> = None;
+        // Phase 6: チャプターは左ジャンプパネルに集約したため、右パネルからは削除。
+        // 右パネルは「動画自体の固定情報」(タイトル / コーデック / 長さ等) のみ。
         let mut content_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(content_rect)
@@ -134,32 +134,14 @@ impl App {
             .auto_shrink([false; 2])
             .show(&mut content_ui, |ui| {
                 ui.add_space(8.0);
-
                 if let Some(info) = info.as_ref() {
                     draw_kv_section(ui, info);
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    seek_to = draw_chapters_section(ui, info);
                 } else {
                     ui.add_space(8.0);
                     ui.colored_label(DIM_COLOR, "読み込み中...");
                 }
-
                 ui.add_space(16.0);
             });
-
-        // クリックで seek (UI スレッド内のため借用衝突は出ない)
-        if let Some(t) = seek_to {
-            if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
-                self.fs_cache.get(&fs_idx)
-            {
-                // 5.1 と同じ流儀で apply_command(Play) 経由は user-seek に任せ、
-                // ここではダイレクトに seek して current 状態を維持する
-                // (チャプター ジャンプの一般的挙動)。
-                player.seek(t);
-            }
-        }
 
         true
     }
@@ -218,44 +200,6 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
     put(ui, "デコーダ", decode_label);
 }
 
-fn draw_chapters_section(ui: &mut egui::Ui, info: &VideoInfo) -> Option<f64> {
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.colored_label(LABEL_COLOR, "チャプター");
-    });
-    ui.add_space(2.0);
-    if info.chapters.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            ui.colored_label(DIM_COLOR, "(なし)");
-        });
-        return None;
-    }
-    let mut clicked: Option<f64> = None;
-    for c in info.chapters.iter() {
-        let label_time = format_secs(c.start_secs);
-        let label_text = c.title.as_deref().unwrap_or("(無題)");
-        let resp = ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            let r1 = ui.add(
-                egui::Button::new(
-                    egui::RichText::new(format!("{label_time}  {label_text}"))
-                        .color(TEXT_COLOR)
-                        .size(13.0),
-                )
-                .frame(false),
-            );
-            r1
-        });
-        let btn = resp.inner;
-        if btn.clicked() {
-            clicked = Some(c.start_secs);
-        }
-        ui.add_space(2.0);
-    }
-    clicked
-}
-
 fn format_secs(s: f64) -> String {
     let total = s.max(0.0).round() as i64;
     let h = total / 3600;
@@ -271,17 +215,13 @@ fn format_secs(s: f64) -> String {
 /// 左パネルでクリックされた行から発生する操作。
 #[derive(Debug)]
 pub(crate) enum JumpPanelAction {
-    /// 指定秒に seek (ピン / ブックマーク / チャプター 共通)。
+    /// 指定秒に seek (ブックマーク / チャプター 共通)。
     Seek(f64),
     /// このブックマーク id を削除。
     DeleteBookmark(i64),
+    /// 現在位置にブックマークを追加 (= 上部 🔖 ボタン)。
+    AddBookmarkHere,
 }
-
-/// Phase 5.6 動画モード専用の小ツールバー (画面右上に float)。
-/// ピン留めボタン (📌 / トグル) + タイルモードボタン (▦)。
-/// ホバー時のみ表示する (= 通常時は非表示で動画再生を邪魔しない)。
-const MINI_TOOLBAR_W: f32 = 80.0;
-const MINI_TOOLBAR_H: f32 = 36.0;
 
 impl App {
     /// 動画フルスクリーン中の **左パネル** (= ジャンプ先サムネ) を描画する。
@@ -319,10 +259,6 @@ impl App {
         let Some(video_path) = video_path else {
             return false;
         };
-        let pin: Option<VideoPin> = self
-            .video_pin_db
-            .as_ref()
-            .and_then(|db| db.lookup(&video_path));
         let bookmarks: Vec<VideoBookmark> = self
             .video_bookmark_db
             .as_ref()
@@ -334,11 +270,8 @@ impl App {
             }
             _ => Vec::new(),
         };
-        if pin.is_none() && bookmarks.is_empty() && chapters.is_empty() {
-            // 何も無いときはパネルそのものを出さない (左 1/4 ホバーで毎回空パネルが
-            // 出るのは邪魔)。
-            return false;
-        }
+        // Phase 6: 動画モードの左パネルは常時表示候補 (= 🔖 ボタンがあるため、
+        // 中身が空でもパネル自体は出す)。
 
         let panel_top = full_rect.min.y + TOP_BAR_H;
         let panel_rect = egui::Rect::from_min_max(
@@ -406,21 +339,24 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(&mut content_ui, |ui| {
-                ui.add_space(8.0);
-
-                if let Some(p) = pin.as_ref() {
-                    section_label(ui, "📌 ピン");
-                    if let Some(act) = draw_jump_row(
-                        ui,
-                        "📌",
-                        p.pin_pts_secs,
-                        None,
-                        None,
-                    ) {
-                        action = Some(act);
+                ui.add_space(6.0);
+                // 🔖 ブックマーク追加ボタン (Phase 6 — 上部固定)
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let resp = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("🔖 現在位置にブックマーク追加 [B]")
+                                .color(TEXT_COLOR)
+                                .size(13.0),
+                        ),
+                    );
+                    if resp.clicked() {
+                        action = Some(JumpPanelAction::AddBookmarkHere);
                     }
-                    ui.add_space(8.0);
-                }
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
 
                 if !bookmarks.is_empty() {
                     section_label(ui, "🔖 ブックマーク");
@@ -454,6 +390,16 @@ impl App {
                     ui.add_space(8.0);
                 }
 
+                if bookmarks.is_empty() && chapters.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.colored_label(
+                            DIM_COLOR,
+                            "ブックマーク・チャプターはまだありません",
+                        );
+                    });
+                }
+
                 ui.add_space(16.0);
             });
 
@@ -471,167 +417,40 @@ impl App {
                         let _ = db.remove(id);
                     }
                 }
+                JumpPanelAction::AddBookmarkHere => {
+                    self.add_video_bookmark_at_current(fs_idx);
+                }
             }
         }
 
         true
     }
-}
 
-impl App {
-    /// Phase 5.6 動画モード専用ミニ ツールバー。画面右上 (上部ホバーバー直下) に
-    /// 表示される 2 ボタン (📌 ピン / ▦ タイル)。上部ホバーが見えているときだけ
-    /// (= カーソルが画面上 1/3 にいるとき) 描画。
-    pub(crate) fn draw_video_mini_toolbar(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        full_rect: egui::Rect,
-        fs_idx: usize,
-    ) {
-        // 表示条件: 上部 1/3 にカーソルがある (= 上部ホバーバーと連動)
-        let hover_in_top = ctx
-            .input(|i| i.pointer.hover_pos().map(|p| p.y < full_rect.height() * 0.33).unwrap_or(false));
-        if !hover_in_top {
-            return;
-        }
-        // 動画パスとピン状況を取得
-        let video_path: Option<PathBuf> = match self.fs_cache.get(&fs_idx) {
+    /// 現在の再生位置に新規ブックマークを追加する。B キー / 🔖 ボタンの両経路から呼ばれる。
+    /// info() が無い (= Loading 中) や error 状態では no-op にする
+    /// (= Codex Phase 5.4 M2 の guard を再利用)。
+    pub(crate) fn add_video_bookmark_at_current(&mut self, fs_idx: usize) {
+        let snapshot = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 if player.error().is_some() || player.info().is_none() {
                     None
                 } else {
-                    Some(player.path().clone())
+                    Some((player.path().clone(), player.position()))
                 }
             }
             _ => None,
         };
-        let Some(video_path) = video_path else {
-            return;
-        };
-        let pinned = self
-            .video_pin_db
-            .as_ref()
-            .and_then(|db| db.lookup(&video_path))
-            .is_some();
-
-        // 画面右上に配置 (上部ホバーバー = 44px の直下から 8px 余白)
-        let bar_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                full_rect.max.x - MINI_TOOLBAR_W - 12.0,
-                full_rect.min.y + TOP_BAR_H + 8.0,
-            ),
-            egui::vec2(MINI_TOOLBAR_W, MINI_TOOLBAR_H),
-        );
-        let painter = ui.painter().clone();
-        painter.rect_filled(
-            bar_rect,
-            6.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
-        );
-
-        // ピンボタン (左半分)
-        let pin_rect = egui::Rect::from_min_size(
-            bar_rect.min,
-            egui::vec2(MINI_TOOLBAR_W * 0.5, MINI_TOOLBAR_H),
-        );
-        let pin_resp = ui.interact(
-            pin_rect,
-            egui::Id::new(("video_mini_pin", fs_idx)),
-            egui::Sense::click(),
-        );
-        if pin_resp.hovered() {
-            painter.rect_filled(
-                pin_rect,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
-            );
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let pin_color = if pinned {
-            egui::Color32::from_rgb(255, 200, 80)
-        } else {
-            egui::Color32::from_rgb(220, 220, 220)
-        };
-        painter.text(
-            pin_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "📌",
-            egui::FontId::proportional(20.0),
-            pin_color,
-        );
-        let pin_resp = pin_resp.on_hover_text(if pinned {
-            "ピンを解除"
-        } else {
-            "現在のフレームをサムネに固定"
-        });
-        if pin_resp.clicked() {
-            self.toggle_video_pin(fs_idx, &video_path);
-        }
-
-        // タイルボタン (右半分)
-        let tile_rect = egui::Rect::from_min_size(
-            egui::pos2(bar_rect.min.x + MINI_TOOLBAR_W * 0.5, bar_rect.min.y),
-            egui::vec2(MINI_TOOLBAR_W * 0.5, MINI_TOOLBAR_H),
-        );
-        let tile_resp = ui.interact(
-            tile_rect,
-            egui::Id::new(("video_mini_tile", fs_idx)),
-            egui::Sense::click(),
-        );
-        if tile_resp.hovered() {
-            painter.rect_filled(
-                tile_rect,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
-            );
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let tile_active = self.video_tile_state.is_some();
-        let tile_color = if tile_active {
-            egui::Color32::from_rgb(120, 200, 255)
-        } else {
-            egui::Color32::from_rgb(220, 220, 220)
-        };
-        painter.text(
-            tile_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "▦",
-            egui::FontId::proportional(22.0),
-            tile_color,
-        );
-        let tile_resp = tile_resp.on_hover_text("タイルモード ON/OFF (S)");
-        if tile_resp.clicked() {
-            let screen = ctx.content_rect().size();
-            self.toggle_video_tile_mode(fs_idx, screen);
-        }
-    }
-
-    /// ピン留めボタン押下時の処理。既存ピンがあれば削除、なければ現在位置で追加。
-    /// thumb_webp は将来実装予定 (Phase 5.6 段階では空 BLOB で記録)。
-    fn toggle_video_pin(&mut self, fs_idx: usize, video_path: &std::path::Path) {
-        let Some(db) = self.video_pin_db.as_ref() else {
-            return;
-        };
-        let exists = db.lookup(video_path).is_some();
-        if exists {
-            if let Err(e) = db.remove(video_path) {
-                crate::logger::log(format!("video pin remove failed: {e}"));
+        if let (Some((path, pts)), Some(db)) =
+            (snapshot, self.video_bookmark_db.as_ref())
+        {
+            if let Err(e) = db.add(&path, pts, None, &[]) {
+                crate::logger::log(format!("video bookmark add failed: {e}"));
             } else {
-                crate::logger::log("video pin removed".to_string());
+                crate::logger::log(format!(
+                    "video bookmark added: pts={pts:.2}s {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
             }
-            return;
-        }
-        let pts = match self.fs_cache.get(&fs_idx) {
-            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                player.position()
-            }
-            _ => return,
-        };
-        if let Err(e) = db.set_pin(video_path, pts, &[]) {
-            crate::logger::log(format!("video pin set failed: {e}"));
-        } else {
-            crate::logger::log(format!("video pin set: pts={pts:.2}s"));
         }
     }
 }

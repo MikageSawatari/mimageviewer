@@ -1015,10 +1015,8 @@ impl App {
                                 } else {
                                     self.draw_video_jump_panel(ui, ctx, full_rect, fs_idx);
                                     self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
-                                    // Phase 5.6 ミニツールバー: 右パネルが描画された後に
-                                    // 上層として乗せる (Codex P5.6 M 反映)。これでパネルが
-                                    // 表示されているときも 📌 / ▦ ボタンに到達できる。
-                                    self.draw_video_mini_toolbar(ui, ctx, full_rect, fs_idx);
+                                    // Phase 6: ミニツールバーは廃止。タイルモードは上ホバー
+                                    // バーの ▦ ボタン (Phase 6.B) で起動する。
                                 }
                             }
                         } else if adjustment_active {
@@ -3997,6 +3995,35 @@ fn draw_play_triangle(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     ));
 }
 
+/// ⏮ 最初から再生アイコン (左向き三角 + 縦バー) を描画する。
+fn draw_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    // 左端の縦バー
+    let bar_w = r * 0.24;
+    let bar_x = c.x - r * 0.85;
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(bar_x, c.y - r * 0.75),
+            egui::pos2(bar_x + bar_w, c.y + r * 0.75),
+        ),
+        0.0,
+        white,
+    );
+    // 縦バーの右に左向き三角 (= ◀ )
+    let tri_left = bar_x + bar_w + r * 0.10;
+    let tri_right = c.x + r * 0.5;
+    let points = vec![
+        egui::pos2(tri_right, c.y - r * 0.75),
+        egui::pos2(tri_right, c.y + r * 0.75),
+        egui::pos2(tri_left, c.y),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        white,
+        egui::Stroke::NONE,
+    ));
+}
+
 /// 🔬 分析アイコン（虫眼鏡＋十字線）を描画する。
 fn draw_analysis_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
@@ -4931,9 +4958,33 @@ impl App {
         let time_font = egui::FontId::proportional(14.0);
         let label_font = egui::FontId::proportional(13.0);
 
+        // ── ⏮ 最初から再生ボタン (Phase 6) ──
+        let replay_rect = egui::Rect::from_min_size(
+            egui::pos2(hud_rect.min.x + pad, cy - btn_size / 2.0),
+            egui::vec2(btn_size, btn_size),
+        );
+        let replay_resp = ui.interact(
+            replay_rect,
+            egui::Id::new(("video_replay", fs_idx)),
+            egui::Sense::click(),
+        );
+        draw_hud_button_bg(&painter, replay_rect, replay_resp.hovered());
+        // ⏮ アイコン (左向き三角 + 縦バー)
+        draw_replay_icon(&painter, replay_rect.center(), btn_size * 0.36);
+        let replay_resp = replay_resp.on_hover_text("最初から再生");
+        if replay_resp.clicked()
+            && let Some(p) = self.fs_video_player(fs_idx)
+        {
+            p.seek(0.0);
+            // 「最初から再生」ボタンなので即時に再生開始する。
+            if !p.is_playing() {
+                p.toggle_play();
+            }
+        }
+
         // ── 再生 / 一時停止 ボタン ──
         let play_rect = egui::Rect::from_min_size(
-            egui::pos2(hud_rect.min.x + pad, cy - btn_size / 2.0),
+            egui::pos2(replay_rect.max.x + pad, cy - btn_size / 2.0),
             egui::vec2(btn_size, btn_size),
         );
         let play_resp = ui.interact(
@@ -5188,9 +5239,10 @@ impl App {
         painter.galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
     }
 
-    /// 動画一時停止中のキー操作ヒントを画面中央下 (HUD 直上) に薄く表示する。
-    /// Phase 5.1: 既定挙動を「開いたら一時停止」に変えたため、Enter で再生開始 /
-    /// Shift+Enter で外部プレイヤー、を明示する。
+    /// 動画一時停止中のキー操作ヒントを **画面中央の再生アイコン直下** に表示する
+    /// (Phase 6 改修: 旧 HUD 直上から、再生アイコン直下に移動。一時停止中の
+    /// 56px 半径再生アイコンが画面中央に出ているので、その下にヒントを置くことで
+    /// 「Enter を押せば再生」の関連付けが瞬時に分かるようにする)。
     ///
     /// 表示条件 (Codex Phase 5.1 P2 反映):
     /// - エラー無し
@@ -5215,8 +5267,6 @@ impl App {
                 } else {
                     let dur = player.duration();
                     let pos = player.position();
-                    // duration が取れていない (= 0) ならガードしない、取れていれば
-                    // 末尾 0.5s 以内は EOF 扱いとして hint 非表示。
                     !(dur > 0.0 && pos >= dur - 0.5)
                 }
             }
@@ -5229,28 +5279,28 @@ impl App {
         let line1 = "[Enter] 再生開始";
         let line2 = "[Shift]+[Enter] 外部プレイヤーで再生";
         let font = egui::FontId::proportional(16.0);
-        let text_color = egui::Color32::from_rgba_unmultiplied(230, 230, 230, 220);
+        let text_color = egui::Color32::from_rgba_unmultiplied(230, 230, 230, 230);
         let g1 = painter.layout_no_wrap(line1.to_string(), font.clone(), text_color);
         let g2 = painter.layout_no_wrap(line2.to_string(), font.clone(), text_color);
         let line_gap = 4.0;
         let block_w = g1.size().x.max(g2.size().x);
         let block_h = g1.size().y + line_gap + g2.size().y;
         let pad = 10.0;
-        // HUD (下部 44px) 直上、画面中央。
-        let hud = video_hud_rect(full_rect);
+        // 中央 56px 半径の再生アイコン直下に配置 (= draw_play_icon の呼び出し位置)。
+        // アイコン半径 56 + 余白 18 = 74px 下げたところを bg_rect の上端にする。
         let center_x = full_rect.center().x;
-        let bottom_y = hud.min.y - 16.0;
+        let top_y = full_rect.center().y + 74.0;
         let bg_rect = egui::Rect::from_min_max(
+            egui::pos2(center_x - block_w / 2.0 - pad, top_y),
             egui::pos2(
-                center_x - block_w / 2.0 - pad,
-                bottom_y - block_h - pad,
+                center_x + block_w / 2.0 + pad,
+                top_y + block_h + pad * 2.0,
             ),
-            egui::pos2(center_x + block_w / 2.0 + pad, bottom_y),
         );
         painter.rect_filled(
             bg_rect,
             6.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
         );
         let l1_pos = egui::pos2(center_x - g1.size().x / 2.0, bg_rect.min.y + pad);
         painter.galley(l1_pos, g1, text_color);
