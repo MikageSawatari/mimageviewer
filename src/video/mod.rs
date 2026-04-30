@@ -417,9 +417,17 @@ impl VideoPlayer {
             // engine 側にも seek を伝えて epoch を同期させる (Codex Phase 3d P2 反映)。
             // user 操作の seek は autoplay 強制 (Codex Phase 3e P2 反映: seek 後に
             // Paused にならないように)。
+            //
+            // ⚠️ 呼び出し順は handle_seek_request → apply_command(Play) (Codex P2 反映、
+            // 2026-04-30): 先に apply_command(Play) を呼ぶと state=Eof なら handle_play
+            // が内部で handle_seek_request(0.0) を呼んで epoch++ し、続く明示
+            // handle_seek_request で **epoch が二重 ++** され、decoder からの
+            // SeekCompleted{epoch=serial} が stale 判定されて捨てられる。
+            // 先に handle_seek_request を呼べば state=Seeking{0.0} に遷移し、続く
+            // apply_command(Play) は Seeking arm の autoplay=true 設定だけ走る。
             let mut g = self.engine.lock().unwrap();
-            g.apply_command(engine::actor::TransportCommand::Play);
             g.handle_seek_request(0.0);
+            g.apply_command(engine::actor::TransportCommand::Play);
             return;
         }
         // Phase 9.C (2026-04-30): engine state machine も pause/play 同期する。
@@ -456,9 +464,11 @@ impl VideoPlayer {
         // engine の seek_epoch も進めて、AvClock seek_serial と同期させる
         // (Codex Phase 3d P2 反映)。user 操作 seek は autoplay 強制
         // (Codex Phase 3e P2 反映: AvClock 側で playing=true にしているため整合性)。
+        // 呼び出し順注意: handle_seek_request → apply_command(Play)
+        // (Codex P2 反映、2026-04-30、詳細は toggle_play を参照)。
         let mut g = self.engine.lock().unwrap();
-        g.apply_command(engine::actor::TransportCommand::Play);
         g.handle_seek_request(clamped);
+        g.apply_command(engine::actor::TransportCommand::Play);
     }
 
     /// 相対シーク。`delta_secs > 0` なら前方 (`target..` のキーフレーム = preroll なし)、
@@ -474,9 +484,11 @@ impl VideoPlayer {
             self.clock.set_playing(true);
         }
         // user 操作 seek は autoplay 強制 (Codex Phase 3e P2 反映)。
+        // 呼び出し順注意: handle_seek_request → apply_command(Play)
+        // (Codex P2 反映、2026-04-30、詳細は toggle_play を参照)。
         let mut g = self.engine.lock().unwrap();
-        g.apply_command(engine::actor::TransportCommand::Play);
         g.handle_seek_request(target);
+        g.apply_command(engine::actor::TransportCommand::Play);
     }
 
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
@@ -707,9 +719,11 @@ impl VideoPlayer {
                 // engine 側の epoch も同期 (= AvClock seek_serial と engine
                 // current_seek_epoch の不整合を防ぐ、Codex Phase 3d P2 反映)。
                 // loop 周回も autoplay 強制 (Codex Phase 3e P2 反映)。
+                // 呼び出し順注意: handle_seek_request → apply_command(Play)
+                // (Codex P2 反映、2026-04-30、詳細は toggle_play を参照)。
                 let mut g = self.engine.lock().unwrap();
-                g.apply_command(engine::actor::TransportCommand::Play);
                 g.handle_seek_request(0.0);
+                g.apply_command(engine::actor::TransportCommand::Play);
             } else {
                 // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
                 if let Some(info) = &self.info {

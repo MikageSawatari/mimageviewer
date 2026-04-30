@@ -1084,16 +1084,20 @@ fn run_video_decode(
                                 if cancel.load(Ordering::Acquire) {
                                     break;
                                 }
+                                // ⚠️ seek_serial check は **park sleep より先** (Codex P? 反映、
+                                // 2026-04-30): paused 状態のまま seek 要求が来たケース
+                                // (将来 pause 維持 seek を入れたとき) でも、park sleep の
+                                // 50ms を待たずに即 break して新世代を処理できるようにする。
+                                if clock.current_seek_serial() != current_seek_serial {
+                                    new_seek_pending = true;
+                                    break;
+                                }
                                 let engine_st = engine_state.load(Ordering::Acquire);
                                 if engine_st == crate::video::engine::actor::state_code::PAUSED
                                     || engine_st == crate::video::engine::actor::state_code::EOF
                                 {
                                     std::thread::sleep(std::time::Duration::from_millis(50));
                                     continue;
-                                }
-                                if clock.current_seek_serial() != current_seek_serial {
-                                    new_seek_pending = true;
-                                    break;
                                 }
                                 let audio_buf = clock.total_audio_buffer_secs();
                                 let audio_active = clock.is_audio_active();
@@ -1351,8 +1355,13 @@ fn run_video_decode(
             let mut in_audio_escape = false;
             let mut new_seek_pending = false;
             // Phase 9.C/D: pause-park (詳細は GPU 経路の同コメント参照)。
+            // seek_serial check は park sleep より先 (Codex P? 反映、2026-04-30)。
             loop {
                 if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                if clock.current_seek_serial() != current_seek_serial {
+                    new_seek_pending = true;
                     break;
                 }
                 let engine_st = engine_state.load(Ordering::Acquire);
@@ -1361,10 +1370,6 @@ fn run_video_decode(
                 {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
-                }
-                if clock.current_seek_serial() != current_seek_serial {
-                    new_seek_pending = true;
-                    break;
                 }
                 let audio_buf = clock.total_audio_buffer_secs();
                 let audio_active = clock.is_audio_active();
