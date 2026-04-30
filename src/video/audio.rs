@@ -431,3 +431,124 @@ fn fill_output(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `fill_output` の bookkeeping invariant をテストで pin する。
+    //!
+    //! Codex review (= `.claude/codex-reviews/fill-output-bookkeeping-result.md`) の
+    //! 提案テスト 2 件 + 完全 drain ケースを実装。実消費ベース bookkeeping が
+    //! 各シナリオで意図通り動くことを構造的に保証する。
+
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    fn make_clock() -> Arc<AvClock> {
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(0.6, seek_serial));
+        clock.set_playing(true);
+        clock.notify_audio_active();
+        clock
+    }
+
+    fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
+        Arc::new(Mutex::new(AudioBuffer {
+            samples: std::collections::VecDeque::new(),
+            next_pts_secs: 0.0,
+            sample_rate,
+            samples_per_sec: sample_rate as f64 * 2.0,
+            pump_seek_serial: 0,
+        }))
+    }
+
+    /// 完全 underrun (= buffer 空) で callback が来ても `next_pts_secs` が進まない。
+    /// Codex review 提案 (P? runtime-check の対案、= bookkeeping を実消費に寄せた
+    /// 効果の核心)。pre-fill burst で buffer 空のまま callback 連続発火しても、
+    /// pts drift しないことを保証する。
+    #[test]
+    fn fill_output_empty_buffer_does_not_advance_pts() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let pts_before = buf.lock().unwrap().next_pts_secs;
+
+        let mut out = [1.0_f32; 480]; // non-zero で初期化、silence 化されること確認
+        fill_output(&mut out, &buf, &clock);
+
+        let pts_after = buf.lock().unwrap().next_pts_secs;
+        assert_eq!(
+            pts_before, pts_after,
+            "empty buffer must not advance next_pts_secs"
+        );
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "output should be all silence on full underrun"
+        );
+    }
+
+    /// 部分 drain (= want 未満の samples が buffer にある) で callback が来た場合、
+    /// `next_pts_secs` は **実消費サンプル数だけ** 進む (= want 分ではない)。
+    /// 旧版 (= consumed_secs = want / samples_per_sec) と新版 (= real_consumed /
+    /// samples_per_sec) の動作差を直接確認する。
+    #[test]
+    fn fill_output_partial_drain_advances_only_real_consumed() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+
+        // want = 480 samples、buffer に 100 samples だけ入れる → 部分 drain
+        {
+            let mut b = buf.lock().unwrap();
+            for _ in 0..100 {
+                b.samples.push_back(0.5);
+            }
+        }
+        let pts_before = buf.lock().unwrap().next_pts_secs;
+
+        let mut out = [0.0_f32; 480];
+        fill_output(&mut out, &buf, &clock);
+
+        let pts_after = buf.lock().unwrap().next_pts_secs;
+        let expected_advance = 100.0 / (48_000.0 * 2.0);
+        assert!(
+            (pts_after - pts_before - expected_advance).abs() < 1e-12,
+            "partial drain: pts must advance by real_consumed/samples_per_sec only \
+             (expected {expected_advance:.9}s, got {:.9}s)",
+            pts_after - pts_before
+        );
+
+        // 出力: 最初 100 samples は 0.5 * 0.6 (volume) = 0.3、残り 380 は silence
+        for (i, &v) in out.iter().take(100).enumerate() {
+            assert!((v - 0.3).abs() < 1e-6, "sample {i} should be 0.3, got {v}");
+        }
+        for (i, &v) in out.iter().skip(100).enumerate() {
+            assert_eq!(v, 0.0, "sample {} (idx {}) should be silence", i + 100, i + 100);
+        }
+    }
+
+    /// 完全 drain (= buffer に want 以上 samples) では旧版と同じ進行量。
+    /// 通常再生中の挙動が refactor で変わっていないことを保証する回帰テスト。
+    #[test]
+    fn fill_output_full_drain_advances_full_amount() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+
+        {
+            let mut b = buf.lock().unwrap();
+            for _ in 0..480 {
+                b.samples.push_back(0.5);
+            }
+        }
+        let pts_before = buf.lock().unwrap().next_pts_secs;
+
+        let mut out = [0.0_f32; 480];
+        fill_output(&mut out, &buf, &clock);
+
+        let pts_after = buf.lock().unwrap().next_pts_secs;
+        let expected_advance = 480.0 / (48_000.0 * 2.0);
+        assert!(
+            (pts_after - pts_before - expected_advance).abs() < 1e-12,
+            "full drain: pts advances by want/samples_per_sec (expected {expected_advance:.9}s, got {:.9}s)",
+            pts_after - pts_before
+        );
+    }
+}

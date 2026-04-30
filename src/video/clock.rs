@@ -214,12 +214,25 @@ impl AvClock {
     /// catch-up モード = 全フレームカクつき、という実害が出た。前回 anchor PTS と
     /// 比較するなら、wall extrapolation の影響を受けない。
     ///
-    /// **設計メモ (= 旧 Phase 9.A wall-rate cap 撤去経緯)**:
-    /// 旧版は cpal pre-fill burst 時の anchor pts 異常前進 (= 2.5x wall) を後段で
-    /// cap する `wall_dt + 5ms jitter` 上限ロジックを持っていたが、これは
-    /// `fill_output` 側の bookkeeping バグ (= silence 出力中も `next_pts_secs` を
-    /// 進めていた) の対症療法だった。bookkeeping を上流で正確化 (= 実消費サンプル
-    /// 数だけ pts 進行) した結果、cap 自体が不要になり撤去。
+    /// **設計メモ (= Phase 9.A wall-rate cap の位置付け)**:
+    /// 旧版は `fill_output` が silence 出力中も `next_pts_secs` を full want 分
+    /// 進めるバグがあり、cpal pre-fill burst で anchor pts が wall の 2.5x 速で
+    /// 前進していた。これを後段で cap する `wall_dt + 5ms jitter` 上限ロジックは
+    /// 当時 **対症療法** だった。
+    ///
+    /// 現行版は `fill_output` 側で **実消費サンプル数のみ pts 進行** するよう上流
+    /// で正確化済 (= bookkeeping バグ自体が消えた)。理論的には cap 不要だが、
+    /// **buffer 非空での stream pre-fill burst** (= pump thread が `stream.play()`
+    /// より先に samples を push してしまうケース) では、callback が wall より速く
+    /// 連続 pop して `real_consumed` が wall 進行を超える可能性が残る (Codex P? 指摘)。
+    ///
+    /// そのため cap は **defensive safety net** として保持する:
+    /// - 通常動作では `pts_secs - prev.pts_secs ≈ wall_dt` で cap 無効
+    /// - pre-fill burst 等の異常系で `wall_dt + 5ms` を超える進行を頭打ち
+    /// - コスト: 1 atomic load + Instant::now + 比較 ≈ 数十 ns (RT 影響無視できる)
+    ///
+    /// 実機 perf-log smoke で「pace/wall ≈ 1.0 (= cap 無発動)」を確認できた段階で、
+    /// 次のリファクタ機会に cap 撤去を再検討する。
     pub fn set_audio_pts(&self, pts_secs: f64) {
         let prev = self.master_clock.anchor();
         let wall = Instant::now();
@@ -228,10 +241,19 @@ impl AvClock {
         } else {
             f64::NEG_INFINITY
         };
-        // 単調性ガードのみ: 後退する pts は前回値に固定する。
-        // 前回が Audio source 以外 (= Wall/Frozen、起動直後 / seek 直後) なら
-        // `prev_audio_pts = NEG_INFINITY` で実質無効 → 入力 pts をそのまま採用。
-        let monotonic = pts_secs.max(prev_audio_pts);
+        // wall-rate cap: defensive safety net (詳細は doc コメント参照)。
+        let capped = if matches!(prev.source, ClockSource::Audio) {
+            // 前回 anchor が Audio source = 連続的 audio update。wall 経過量で cap。
+            let wall_dt = wall.saturating_duration_since(prev.wall_at_anchor).as_secs_f64();
+            const JITTER_TOLERANCE_SECS: f64 = 0.005;
+            let max_advance = wall_dt + JITTER_TOLERANCE_SECS;
+            (pts_secs - prev.pts_secs).min(max_advance).max(0.0) + prev.pts_secs
+        } else {
+            // 前回 Wall/Frozen → audio 起動直後 / seek 直後の起点。cap 無効化
+            // (= seek target 等の絶対位置を尊重)。
+            pts_secs
+        };
+        let monotonic = capped.max(prev_audio_pts);
         self.write_audio_anchor_at(monotonic, wall);
     }
 
