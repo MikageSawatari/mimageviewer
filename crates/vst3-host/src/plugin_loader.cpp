@@ -233,10 +233,16 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
     if (!active_ || !processor_) return false;
     if (num_frames > block_size_) return false;
 
-    // f32 packed stereo → planar に分解
+    // f32 packed stereo → planar に分解。同時に silence 検出も行う。
+    bool ch0_silent = true;
+    bool ch1_silent = true;
     for (uint32_t i = 0; i < num_frames; ++i) {
-        in_buffer_l_[i] = input[i * 2 + 0];
-        in_buffer_r_[i] = input[i * 2 + 1];
+        float l = input[i * 2 + 0];
+        float r = input[i * 2 + 1];
+        in_buffer_l_[i] = l;
+        in_buffer_r_[i] = r;
+        if (l != 0.0f) ch0_silent = false;
+        if (r != 0.0f) ch1_silent = false;
     }
 
     // ProcessData セットアップ — VST3 仕様により ProcessData::numInputs/numOutputs
@@ -251,9 +257,13 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
     float* main_out_planar[2] = { out_buffer_l_.data(), out_buffer_r_.data() };
     in_buses[0].numChannels = 2;
     in_buses[0].channelBuffers32 = main_in_planar;
-    in_buses[0].silenceFlags = 0;
+    // 入力が無音なら silenceFlags を立ててプラグインの silence skip 最適化を許可。
+    // bit i = ch i が無音。常時 0 にしているとプラグインが毎ブロック処理を走らせて
+    // CPU を浪費しバッファアンダーラン (= プチプチ) を誘発する。
+    in_buses[0].silenceFlags = (ch0_silent ? 0x1 : 0) | (ch1_silent ? 0x2 : 0);
     out_buses[0].numChannels = 2;
     out_buses[0].channelBuffers32 = main_out_planar;
+    // 出力 silenceFlags はプラグインが書き換えてくる
     out_buses[0].silenceFlags = 0;
 
     // 副 bus (サイドチェイン等): silence buffer + silenceFlags 全立て

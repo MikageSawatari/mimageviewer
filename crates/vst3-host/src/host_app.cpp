@@ -9,6 +9,7 @@
 
 #include "pluginterfaces/base/funknownimpl.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
+#include "public.sdk/source/vst/hosting/pluginterfacesupport.h"
 
 namespace miv {
 
@@ -16,10 +17,44 @@ using namespace Steinberg;
 
 // IHostApplication 実装
 HostApplication::HostApplication() {
-    FUNKNOWN_CTOR
+    plug_iface_support_ = Steinberg::owned(new Vst::PlugInterfaceSupport);
 }
 
-IMPLEMENT_FUNKNOWN_METHODS(HostApplication, Vst::IHostApplication, Vst::IHostApplication::iid)
+// FUnknown の addRef/release は単純 atomic ref count
+Steinberg::uint32 PLUGIN_API HostApplication::addRef() {
+    return static_cast<Steinberg::uint32>(++ref_count_);
+}
+Steinberg::uint32 PLUGIN_API HostApplication::release() {
+    auto cnt = --ref_count_;
+    if (cnt == 0) {
+        delete this;
+        return 0;
+    }
+    return static_cast<Steinberg::uint32>(cnt);
+}
+
+// queryInterface: IHostApplication / IPlugInterfaceSupport / FUnknown を返す。
+// IPlugInterfaceSupport を返すことで、プラグインから「ホストはどの拡張 IF を
+// サポートするか」を問い合わせられた時に応答できる。これがないと一部の
+// プラグイン (Pro-Q 4 等) が機能制限モードで動作する。
+tresult PLUGIN_API HostApplication::queryInterface(const TUID _iid, void** obj) {
+    if (!obj) return kInvalidArgument;
+    if (FUnknownPrivate::iidEqual(_iid, FUnknown::iid) ||
+        FUnknownPrivate::iidEqual(_iid, Vst::IHostApplication::iid)) {
+        addRef();
+        *obj = static_cast<Vst::IHostApplication*>(this);
+        return kResultOk;
+    }
+    if (FUnknownPrivate::iidEqual(_iid, Vst::IPlugInterfaceSupport::iid)) {
+        if (plug_iface_support_) {
+            plug_iface_support_->addRef();
+            *obj = static_cast<Vst::IPlugInterfaceSupport*>(plug_iface_support_.get());
+            return kResultOk;
+        }
+    }
+    *obj = nullptr;
+    return kNoInterface;
+}
 
 tresult PLUGIN_API HostApplication::getName(Vst::String128 name) {
     // "mImageViewer-VST3-Host" の UTF-16
@@ -94,16 +129,18 @@ tresult PLUGIN_API ComponentHandler::beginEdit(Vst::ParamID /*id*/) {
 }
 
 tresult PLUGIN_API ComponentHandler::performEdit(Vst::ParamID id, Vst::ParamValue value) {
-    // UI スレッド (= bridge main thread = GUI thread) からプラグイン経由で呼ばれる。
-    // 値を pending に積んでおき、audio thread が drain_into で取り出して process に渡す。
+    // UI スレッドからプラグイン経由で呼ばれる。同一 ParamID の連続更新は
+    // last-write-wins で集約 (= map の operator[] で上書き)。これがないと
+    // UI 高速ドラッグ時に同一 sampleOffset=0 に複数 point が積まれて
+    // プラグインの補間器が振動 → クリックノイズになる。
     std::lock_guard<std::mutex> lk(pending_mutex_);
-    pending_changes_.emplace_back(id, value);
+    pending_changes_[id] = value;
     return kResultOk;
 }
 
 void ComponentHandler::drain_into(Vst::IParameterChanges* output) {
     if (!output) return;
-    std::vector<std::pair<Vst::ParamID, Vst::ParamValue>> snapshot;
+    std::unordered_map<Vst::ParamID, Vst::ParamValue> snapshot;
     {
         std::lock_guard<std::mutex> lk(pending_mutex_);
         if (pending_changes_.empty()) return;

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,8 @@
 #include "pluginterfaces/vst/ivsthostapplication.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstpluginterfacesupport.h"
+#include "public.sdk/source/vst/hosting/pluginterfacesupport.h"
 
 namespace miv {
 
@@ -30,8 +33,15 @@ public:
                                                   Steinberg::TUID iid,
                                                   void** obj) override;
 
-    // FUnknown
-    DECLARE_FUNKNOWN_METHODS
+    // FUnknown — IPlugInterfaceSupport を additional に返すため queryInterface を
+    // カスタム実装する。addRef/release は標準 ref count。
+    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID _iid, void** obj) override;
+    Steinberg::uint32 PLUGIN_API addRef() override;
+    Steinberg::uint32 PLUGIN_API release() override;
+
+private:
+    Steinberg::int32 ref_count_ = 1;
+    Steinberg::IPtr<Steinberg::Vst::PlugInterfaceSupport> plug_iface_support_;
 };
 
 /// IPlugFrame 実装: プラグインから「このサイズに変更して」と要求が来たら、
@@ -77,7 +87,10 @@ public:
 
 private:
     std::mutex pending_mutex_;
-    std::vector<std::pair<Steinberg::Vst::ParamID, Steinberg::Vst::ParamValue>> pending_changes_;
+    // 同一 ParamID の更新は last-write-wins で集約。
+    // vector に push していると、UI 高速ドラッグ時に同 ParamID で複数値が
+    // sampleOffset=0 に集中して積まれ、プラグインの補間器が振動 → クリックノイズ。
+    std::unordered_map<Steinberg::Vst::ParamID, Steinberg::Vst::ParamValue> pending_changes_;
 };
 
 }  // namespace miv
