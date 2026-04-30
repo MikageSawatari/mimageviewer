@@ -28,6 +28,15 @@ pub struct AudioBookkeeping {
     /// audio_tx に積まれているフレーム合計時間 (秒、f64 bits)。decoder の send 後
     /// `add_tx_queued(+duration)`、pump の recv 後 `add_tx_queued(-duration)`。
     tx_queued_secs_bits: AtomicU64,
+    /// VST3 プラグインチェーン全体の構造的遅延 (= PDC latency、秒、f64 bits)。
+    /// `audio-pump` push 時に最新値が publish される。
+    ///
+    /// **重要**: `pump_buf_secs` には**含めない**。decoder pacing は actual buffer 残量で
+    /// `audio_escape` 判定し、先読み許可量だけ `PACE_LEAD + pdc_latency` を使う設計
+    /// (= Codex 助言、2026-05-01)。
+    /// これがないと、AudioBuffer が空で cpal が underrun している瞬間でも、
+    /// 「pdc 分のバッファあり」に見えて補充が発動しない退行を起こす。
+    vst3_pdc_latency_secs_bits: AtomicU64,
 }
 
 impl AudioBookkeeping {
@@ -35,6 +44,7 @@ impl AudioBookkeeping {
         Self {
             pump_buf_secs_bits: AtomicU64::new(0),
             tx_queued_secs_bits: AtomicU64::new(0),
+            vst3_pdc_latency_secs_bits: AtomicU64::new(0),
         }
     }
 
@@ -76,13 +86,24 @@ impl AudioBookkeeping {
     }
 
     /// pump_buf + tx_queued の合計。decoder pacing が「audio safe lo を割っているか」
-    /// を判定する材料。
+    /// を判定する材料。**actual buffer 残量のみ** (= PDC latency は含まない)。
     pub fn total_secs(&self) -> f64 {
         self.pump_buf_secs() + self.tx_queued_secs()
     }
 
+    /// VST3 PDC latency (秒) を上書き publish。pump push 時に呼ばれる。
+    pub fn set_vst3_pdc_latency_secs(&self, secs: f64) {
+        let v = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
+        self.vst3_pdc_latency_secs_bits.store(v.to_bits(), Ordering::Release);
+    }
+
+    /// VST3 PDC latency (秒) を返す。decoder pacing が先読み許可量計算に使う。
+    pub fn vst3_pdc_latency_secs(&self) -> f64 {
+        f64::from_bits(self.vst3_pdc_latency_secs_bits.load(Ordering::Acquire))
+    }
+
     /// post-seek で pre-seek の会計を 0 リセット (= AvClock::notify_seek_completed の
-    /// 旧挙動と同等)。
+    /// 旧挙動と同等)。PDC latency は次の pump push で再 publish されるので reset しない。
     pub fn reset(&self) {
         self.pump_buf_secs_bits.store(0, Ordering::Release);
         self.tx_queued_secs_bits.store(0, Ordering::Release);

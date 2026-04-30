@@ -188,7 +188,19 @@ private:
                 ::TranslateMessage(&msg);
                 ::DispatchMessageW(&msg);
             }
-            // 2) コマンドキューを 1 件処理
+            // 2) latency_changed 検出 (= プラグインが kLatencyChanged を発火していないか)
+            // VST3 では UI でモード切替等が起きると plugin が IComponentHandler::
+            // restartComponent(kLatencyChanged) を呼ぶ。ComponentHandler が flag を立て、
+            // ここで polling して親プロセス (mIV) に通知する。
+            if (loader_) {
+                uint32_t new_latency = 0;
+                if (loader_->poll_latency_change(new_latency)) {
+                    std::string reply = "{\"event\":\"latency_changed\",\"latency_samples\":" +
+                                        std::to_string(new_latency) + "}";
+                    write_message(reply);
+                }
+            }
+            // 3) コマンドキューを 1 件処理
             std::string cmd_msg;
             {
                 std::unique_lock<std::mutex> lk(cmd_mutex_);

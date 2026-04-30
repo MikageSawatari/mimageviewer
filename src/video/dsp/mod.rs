@@ -19,11 +19,29 @@ pub mod extract;
 pub mod gui;
 pub mod scanner;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use bridge::{Bridge, Cmd, Event};
 pub use scanner::{DiscoveredPlugin, default_vst3_paths, scan};
+
+/// PDC (Plugin Delay Compensation) で許容する最大遅延 (秒)。
+///
+/// 用途:
+/// - decoder pacing 側: `PACE_LEAD + min(pdc_latency, MAX_PDC_LATENCY_SECS)` で
+///   先読み許可量を計算 (= plugin に未来 input を供給するため)
+/// - 自動 bypass 側: 単一 plugin が報告した latency がこれを超えたら自動で bypass=true
+///   に切り替え、警告ログを出す
+///
+/// 2.0 秒の根拠 (Codex 助言、2026-05-01):
+/// - 実用的なプラグイン latency は数十ms〜数百ms (= linear-phase EQ で 100-200ms、
+///   look-ahead リミッターで 5-50ms、plate reverb pre-delay で 数百ms)
+/// - 1 秒を超える「構造的遅延」は PDC で動画クロックを遅らせる範囲としては大きすぎる
+///   (= 動画再生開始時に音声出力までの待ち時間が長くなる)
+/// - 共有メモリ ring (= 80ms) と AudioBuffer cap (= 300ms) のジッタ吸収余裕が
+///   2 秒級では不足、underrun リスクが上がる
+/// - 2 秒は実用シナリオを十分カバーする上限
+pub const MAX_PDC_LATENCY_SECS: f64 = 2.0;
 
 /// DSP bridge 全体の状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +74,8 @@ pub struct SlotInfo {
     /// 旧 `gui_hwnd != 0` を「可視」の意味で使っていたが、永続 GuiHost 設計では
     /// HWND は作成後に保持され続けるので、可視状態は別フラグで管理する。
     pub gui_visible: bool,
+    /// `MAX_PDC_LATENCY_SECS` 超過で自動 bypass にされたか。UI 側で警告バッジ表示に使う。
+    pub auto_bypassed_for_latency: bool,
 }
 
 /// DspBridge — VST3 プラグインホスト bridge との対話を管理する singleton。
@@ -75,6 +95,10 @@ pub struct DspBridge {
     /// 適用する。これにより fullscreen 中に後から作った HWND にも TOPMOST が
     /// 自動適用される (Codex P3 不具合 3 対応)。
     gui_topmost_desired: AtomicBool,
+    /// audio output の sample_rate (= cpal 出力レート)。`add_plugin` の 1 回目で
+    /// 設定される (= 全 slot 同一)。UI で latency を ms 表示する際に使う。
+    /// 0 = 未設定 (= プラグイン未追加状態)。
+    sample_rate: AtomicU32,
 }
 
 struct DspBridgeInner {
@@ -115,6 +139,11 @@ pub(crate) struct PluginSlot {
     /// `set_all_guis_visible(true)` (= VST ボタン全表示) は user_hidden=true のスロット
     /// を skip する (= ユーザー報告 2026-04 「個別に閉じたものは再表示しないで」)。
     pub user_hidden: bool,
+    /// 自動 bypass が発動しているか (= latency が `MAX_PDC_LATENCY_SECS` 超過で
+    /// `bypass=true` に切り替えられた状態)。UI 側で「上限超過のため自動 OFF」表示や
+    /// 警告アイコンを出すために使う。settings には永続化しない (= ランタイム保護)。
+    /// ユーザーが手動で再 ON にしてもまた latency が超過なら同じチェックで再発火する。
+    pub auto_bypassed_for_latency: bool,
     /// プラグイン GUI ホスト (Win32 子ウィンドウスレッド)。slot 削除で自動終了する。
     pub gui_host: Option<gui::GuiHost>,
     /// ホストウィンドウの × ボタン押下シグナル。
@@ -142,7 +171,14 @@ impl DspBridge {
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             gui_topmost_desired: AtomicBool::new(false),
+            sample_rate: AtomicU32::new(0),
         })
+    }
+
+    /// audio output の sample_rate (= cpal 出力レート)。0 = 未設定。UI で
+    /// プラグイン latency を ms に変換する際の分母として使う。
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Acquire)
     }
 
     /// `audio-pump` スレッドからのホットパスチェック。Mutex を取らない。
@@ -156,6 +192,141 @@ impl DspBridge {
     #[inline]
     pub fn active_slot_count(&self) -> usize {
         self.active_slot_count.load(Ordering::Acquire)
+    }
+
+    /// PDC (Plugin Delay Compensation) 用: アクティブな (Loaded && !bypass) スロットの
+    /// `latency_samples` を合計して返す (= プラグインチェーン全体の構造的遅延、サンプル数)。
+    ///
+    /// audio-pump 側はこれを sample_rate で割って秒に変換し、AudioBuffer に同梱する。
+    /// `fill_output` がそれを `clock.set_audio_pts` 時に減算することで、video clock を
+    /// プラグインチェーン分遅らせ、A/V sync が保たれる仕組み。
+    ///
+    /// **呼び出し頻度**: pump push 毎 (= ~21ms 周期)。Mutex を取るが slots iter のみで
+    /// 軽量。bypass 切替や latency 変化があれば次の push で自動追従する。
+    ///
+    /// **動的 latency 反映**: 各スロットの bridge から `cached_latency_samples_value()` を
+    /// pull して、Loaded 時の値と異なれば slot.latency_samples を更新する。
+    /// プラグインが UI でモード切替して `restartComponent(kLatencyChanged)` を発火すると、
+    /// bridge プロセスがそれを検知し stdout で通知 → mIV 側 event-pump が atomic 更新 →
+    /// このメソッドが次回呼ばれた時に slot に反映、UI も次のフレームで新しい値が見える。
+    ///
+    /// **自動 bypass (Codex 助言、2026-05-01 改訂)**:
+    /// 2 段階のチェックを行う:
+    ///
+    /// 1. **個別 latency 更新時** (= `latest != s.latency_samples`): その slot 単独で
+    ///    `MAX_PDC_LATENCY_SECS` 超過なら bypass する (= 単一 plugin が大きすぎる)。
+    ///    ログ連打を避けるため値変化時のみ。
+    ///
+    /// 2. **合計 active total** が `MAX_PDC_LATENCY_SECS` を超えるなら、active slot の
+    ///    うち latency_samples 最大のものを bypass する (= 合計が cap 以下になるまで loop)。
+    ///    複数 plugin の合計が原因のケース (= 個別はどれも < 2s だが合計 > 2s) に対応。
+    ///    既に `auto_bypassed_for_latency && bypass` の slot にはログを再発火しない。
+    ///
+    /// settings には永続化しない (= ランタイム保護、再起動後は再評価される)。
+    pub fn total_latency_samples(&self) -> u32 {
+        let sr = self.sample_rate.load(Ordering::Acquire);
+        let max_samples: u32 = if sr > 0 {
+            (MAX_PDC_LATENCY_SECS * sr as f64) as u32
+        } else {
+            (MAX_PDC_LATENCY_SECS * 48_000.0) as u32 // 起動直後 fallback
+        };
+
+        let mut inner = self.inner.lock().unwrap();
+        let mut active_changed = false;
+
+        // ── Step 1: 個別 latency 更新の反映 + 単独超過の auto-bypass ──
+        for s in inner.slots.iter_mut() {
+            if !matches!(s.state, SlotState::Loaded) {
+                continue;
+            }
+            let latest = s.bridge.cached_latency_samples_value();
+            if latest != u32::MAX && latest != s.latency_samples {
+                crate::logger::log(format!(
+                    "[VST3 PDC] slot latency_samples updated: '{}' {} -> {}",
+                    s.plugin_name.as_deref().unwrap_or("?"),
+                    s.latency_samples,
+                    latest
+                ));
+                s.latency_samples = latest;
+                // 個別 plugin 単独で上限超過 → 即 bypass
+                if latest > max_samples && !s.bypass {
+                    crate::logger::log(format!(
+                        "[VST3 PDC] AUTO-BYPASS (individual): '{}' latency {} samples ({:.1}ms) \
+                         exceeds {:.1}s cap.",
+                        s.plugin_name.as_deref().unwrap_or("?"),
+                        latest,
+                        latest as f64 / sr.max(1) as f64 * 1000.0,
+                        MAX_PDC_LATENCY_SECS,
+                    ));
+                    s.bypass = true;
+                    s.auto_bypassed_for_latency = true;
+                    active_changed = true;
+                }
+            }
+        }
+
+        // ── Step 2: active 合計超過チェック + 最大 latency slot の auto-bypass loop ──
+        // 個別では cap 内でも、合計が超えるケース (例: 1973ms + 50ms = 2023ms) に対応。
+        // 合計が cap 以下になるまで、active で最大 latency の slot を bypass し続ける。
+        loop {
+            let total: u32 = inner
+                .slots
+                .iter()
+                .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
+                .map(|s| s.latency_samples)
+                .fold(0u32, |a, b| a.saturating_add(b));
+            if total <= max_samples {
+                break;
+            }
+            // active で最大 latency の slot を 1 つ bypass
+            let target_idx = inner
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.bypass && matches!(s.state, SlotState::Loaded))
+                .max_by_key(|(_, s)| s.latency_samples)
+                .map(|(i, _)| i);
+            let Some(idx) = target_idx else {
+                break;  // active slot が無いのに total > max は通常起きない、防御
+            };
+            let slot = &mut inner.slots[idx];
+            // 既に auto-bypass 済の slot にはログ再発火しない (= ログ連打防止)
+            let already_logged = slot.auto_bypassed_for_latency;
+            slot.bypass = true;
+            slot.auto_bypassed_for_latency = true;
+            active_changed = true;
+            if !already_logged {
+                let total_ms = total as f64 / sr.max(1) as f64 * 1000.0;
+                let this_ms = slot.latency_samples as f64 / sr.max(1) as f64 * 1000.0;
+                crate::logger::log(format!(
+                    "[VST3 PDC] AUTO-BYPASS (total): chain total {:.1}ms exceeds {:.1}s cap, \
+                     disabling largest active plugin '{}' ({:.1}ms).",
+                    total_ms,
+                    MAX_PDC_LATENCY_SECS,
+                    slot.plugin_name.as_deref().unwrap_or("?"),
+                    this_ms,
+                ));
+            }
+            // loop 継続: bypass 後の total を再計算
+        }
+
+        // active_slot_count atomic を更新
+        if active_changed {
+            let count = inner
+                .slots
+                .iter()
+                .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
+                .count();
+            self.active_slot_count.store(count, Ordering::Release);
+        }
+
+        // 最終 total を返す
+        inner
+            .slots
+            .iter()
+            .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
+            .map(|s| s.latency_samples)
+            .fold(0u32, |a, b| a.saturating_add(b))
     }
 
     pub fn state(&self) -> DspState {
@@ -176,6 +347,7 @@ impl DspBridge {
                 latency_samples: s.latency_samples,
                 bypass: s.bypass,
                 gui_visible: s.gui_visible,
+                auto_bypassed_for_latency: s.auto_bypassed_for_latency,
             })
             .collect()
     }
@@ -189,6 +361,7 @@ impl DspBridge {
             latency_samples: s.latency_samples,
             bypass: s.bypass,
             gui_visible: s.gui_visible,
+            auto_bypassed_for_latency: s.auto_bypassed_for_latency,
         })
     }
 
@@ -272,6 +445,14 @@ impl DspBridge {
                 Err(e) => return Err(format!("recv: {e}")),
             }
         };
+        // PDC 診断: プラグインがレポートした latency をログに残す。
+        crate::logger::log(format!(
+            "[VST3 PDC] plugin loaded: '{}' latency_samples={} ({:.3}ms@{}Hz)",
+            plugin_name,
+            latency_samples,
+            latency_samples as f64 / sample_rate as f64 * 1000.0,
+            sample_rate,
+        ));
 
         // ── プラグイン pre-warm: 無音ブロックを数回流し、内部状態 (フィルタ係数の
         //   FTZ 経路 / IIR ステート / 内部 alloc / ページフォルト等) を温める。
@@ -294,6 +475,9 @@ impl DspBridge {
             }
         }
 
+        // sample_rate を DspBridge に保存 (= UI 表示用、初回 add_plugin で設定)
+        self.sample_rate.store(sample_rate, Ordering::Release);
+
         // ── 完成したスロットを Vec に追加 (Mutex 内で短時間) ──
         let mut inner = self.inner.lock().unwrap();
         let idx = inner.slots.len();
@@ -307,6 +491,7 @@ impl DspBridge {
             gui_hwnd: 0,
             gui_visible: false,
             user_hidden: false,
+            auto_bypassed_for_latency: false,
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
@@ -788,9 +973,60 @@ impl DspBridge {
 
     /// 指定 idx の bypass フラグを設定する。
     pub fn set_bypass(&self, idx: usize, bypass: bool) {
+        let sr = self.sample_rate.load(Ordering::Acquire);
+        let max_samples: u32 = if sr > 0 {
+            (MAX_PDC_LATENCY_SECS * sr as f64) as u32
+        } else {
+            (MAX_PDC_LATENCY_SECS * 48_000.0) as u32
+        };
+
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(idx) {
-            slot.bypass = bypass;
+            // 手動 ON 時の事前チェック (= Codex P1-G、2026-05-01):
+            // この slot を ON にして active total が MAX_PDC_LATENCY_SECS を
+            // 超えるなら refuse (= bypass=true 維持) + auto_bypassed_for_latency=true。
+            // ユーザーは UI 上で「ON にしようとしたが上限超過のため OFF のまま」と認識できる。
+            if !bypass && slot.bypass {
+                let this_latency = slot.latency_samples;
+                let other_active_total: u32 = inner
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| {
+                        *i != idx
+                            && !s.bypass
+                            && matches!(s.state, SlotState::Loaded)
+                    })
+                    .map(|(_, s)| s.latency_samples)
+                    .sum();
+                let would_be_total = other_active_total.saturating_add(this_latency);
+                if would_be_total > max_samples {
+                    let plugin_name = inner
+                        .slots
+                        .get(idx)
+                        .and_then(|s| s.plugin_name.clone())
+                        .unwrap_or_else(|| "(?)".to_string());
+                    let this_ms = this_latency as f64 / sr.max(1) as f64 * 1000.0;
+                    let total_ms = would_be_total as f64 / sr.max(1) as f64 * 1000.0;
+                    crate::logger::log(format!(
+                        "[VST3 PDC] REFUSE manual ON: '{}' ({:.1}ms) would push total to {:.1}ms (cap {:.1}s). Reduce other plugin latencies or this plugin first.",
+                        plugin_name, this_ms, total_ms, MAX_PDC_LATENCY_SECS,
+                    ));
+                    if let Some(s) = inner.slots.get_mut(idx) {
+                        s.bypass = true; // refuse: 維持
+                        s.auto_bypassed_for_latency = true;
+                    }
+                    self.recalc_active_count(&inner);
+                    return;
+                }
+            }
+            // 通常経路: bypass を反映、ON に戻すなら auto-bypass フラグもクリア
+            if let Some(s) = inner.slots.get_mut(idx) {
+                s.bypass = bypass;
+                if !bypass {
+                    s.auto_bypassed_for_latency = false;
+                }
+            }
         }
         self.recalc_active_count(&inner);
     }

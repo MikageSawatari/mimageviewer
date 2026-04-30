@@ -54,7 +54,24 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 
 ## 🟢 修正済 / 検証待ち
 
-(現在なし)
+### Step 1: PDC 最小実装 [課題 3] (2026-04, 検証待ち)
+- `DspBridge::total_latency_samples()` accessor 追加
+  (= `!bypass && Loaded` スロットの latency_samples 合算)
+- `AudioBuffer.pdc_latency_secs: f64` フィールド追加
+- pump push 時に `bridge.total_latency_samples() / sample_rate` を計算して更新
+  (= 値変化時はログ出力)
+- `fill_output` で `pts_for_video = (pts_now - pdc_latency_secs).max(0.0)` を
+  `clock.set_audio_pts` に渡す
+- VST 無効 / 全 bypass のときは pdc_latency_secs=0 なので影響ゼロ (= 既存動作)
+- 検証手順 (Codex 提案):
+  1. mIV Test Latency = 0 samples で現状一致 → ✅ 自動 (pdc=0 で既存と同じ pts)
+  2. 4800 samples (= 100ms) で動画 100ms 先行を確認 (PDC OFF) → ⏳ ユーザー検証
+  3. PDC ON で同期復元 → ⏳ ユーザー検証
+  4. 直列 2400 + 4800 = 150ms 合算 → ⏳ ユーザー検証
+  5. 再生中 latency 変更 → 短時間のジャンプ発生 (= flush/anchor reset は **未実装**)
+     最大 300ms (= バッファ内の旧 latency 処理済 samples 分) のずれが出る可能性
+- LatencyChanged event ハンドリング (flush + anchor reset) は未実装。
+  通常は固定 latency なので問題にならない。プラグインモード切替で気になれば後続対応。
 
 ---
 
@@ -115,6 +132,52 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 ---
 
 ## 📋 Codex 回答外 / Future Work
+
+### VST Instrument (MIDI 入力) を一覧から除外する [P2, 2026-04 ユーザー報告]
+- 症状: 検出済プラグイン一覧に Instrument 系 (= MIDI 入力で音を生成するシンセ) も
+  混在している。mIV は MIDI 入力経路を持たず Effect (音声入力→音声出力) のみ
+  使えるので、Instrument を出しても無駄に選択肢が増えるだけ
+- VST3 SDK では `IPluginFactory2::PClassInfo2.category` または `PClassInfoW.category`
+  を見れば判別可能:
+  - Effect: `kVstAudioEffectClass` (= "Audio Module Class")。`subCategories` に
+    "Fx" 系のキーワードが入る (例: "Fx|EQ", "Fx|Dynamics", "Fx|Spatial" 等)
+  - Instrument: 同じ `kVstAudioEffectClass` だが `subCategories` に "Instrument"
+    系 (例: "Instrument|Synth", "Instrument|Sampler", "Instrument|Drum") が入る
+- 修正案:
+  - `crates/vst3-host/src/plugin_loader.cpp` (もしくは scanner) で classInfo の
+    subCategories を読み、"Instrument" を含むものに `is_instrument: bool` フラグ
+  - mIV 側 `DiscoveredPlugin` 構造体に `is_instrument: bool` を追加して
+    scanner result に渡す
+  - 環境設定 VST3 プラグインページで Instrument 系をデフォルト非表示
+    (= 「Instrument も表示」チェックボックスを設けて opt-in にしてもよい)
+- 関連ファイル:
+  - `crates/vst3-host/src/main.cpp` (= scan コマンド or load 時の応答)
+  - `src/video/dsp/scanner.rs` (= DiscoveredPlugin に is_instrument 追加)
+  - `src/ui_dialogs/preferences.rs` の `page_vst3()` (= フィルタ追加)
+
+### 環境設定 VST3 プラグインページ: 検出済プラグイン一覧のスクロールエリアが正しく拡張されない [P2, 2026-04 ユーザー報告]
+- 症状: 環境設定→VST3 プラグインページで、「(556 個検出)」と表示されているにも
+  関わらず、ダイアログを広げても下部の検索結果一覧 (= AA_VEQ-MG4+, Acid V, …) が
+  10 個程度しか表示されない。スクロールエリアの高さがダイアログ拡張に追従していない
+- 推測: `egui::ScrollArea` の `max_height` が固定値で指定されている、または
+  `auto_shrink` が逆方向に効いていて、利用可能な縦スペースが活用されていない
+- 修正案:
+  - `ScrollArea::vertical().auto_shrink([false; 2])` で縦方向の縮小を抑止
+  - `.max_height(ui.available_height())` で残り高さいっぱいまで使う
+  - もしくは `ui.allocate_ui_with_layout` で残スペースを確保した後に ScrollArea
+- 関連ファイル: `src/ui_dialogs/preferences.rs` の `page_vst3()`
+
+### プラグイン GUI 非表示状態の永続化 [P1, 2026-04 ユーザー報告]
+- 現状: `PluginSlot.user_hidden: bool` フィールドはランタイム保持のみ
+  (= settings に保存されない)。再起動するとすべての GUI が再表示状態になる
+- ユーザー要望: 「GUI ×」で閉じた状態を再起動後も維持
+- 実装案:
+  - `Vst3PluginEntry` に `user_hidden: bool` フィールドを追加 (= settings.json)
+  - `add_plugin` 時に entry の `user_hidden` を slot にコピー
+  - `user_hide_slot_gui` / `show_slot_gui` 時に settings 側も更新
+  - 起動直後 (= プラグインロード後) に user_hidden=true なものは show_gui で
+    作成しない (= 「ユーザーが閉じた」状態を保つ)
+- 関連: `vst3_gui_visible` (= VST ボタン全体の ON/OFF) は既に永続化されている
 
 ### プラグイン内部状態の永続化 (= EQ カーブ等の保存) [P1, 2026-04 ユーザー報告]
 - VST3 `IComponent::getState` / `setState` chunk のシリアライズ

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -105,6 +106,13 @@ public:
     /// process に届ける。スレッド安全 (= mutex で保護)。
     void drain_into(Steinberg::Vst::IParameterChanges* output);
 
+    /// プラグインが `restartComponent(kLatencyChanged)` を呼んだかをチェックして
+    /// (= flag が立っていれば) クリアして true を返す。PluginLoader が main loop で
+    /// polling して、true なら getLatencySamples() を再取得して mIV に通知する。
+    bool consume_latency_changed_flag() {
+        return latency_changed_pending_.exchange(false, std::memory_order_acq_rel);
+    }
+
     DECLARE_FUNKNOWN_METHODS
 
 private:
@@ -113,6 +121,10 @@ private:
     // vector に push していると、UI 高速ドラッグ時に同 ParamID で複数値が
     // sampleOffset=0 に集中して積まれ、プラグインの補間器が振動 → クリックノイズ。
     std::unordered_map<Steinberg::Vst::ParamID, Steinberg::Vst::ParamValue> pending_changes_;
+    /// `restartComponent(kLatencyChanged)` を受けて latency 再取得が必要かを示すフラグ。
+    /// VST3 規約上、この通知は audio 処理を一旦止めて latency を再問い合わせろという指示。
+    /// プラグインスレッド (any) から set、main thread から polling consume する。
+    std::atomic<bool> latency_changed_pending_{false};
 };
 
 }  // namespace miv

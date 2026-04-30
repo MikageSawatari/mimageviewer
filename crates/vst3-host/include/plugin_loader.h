@@ -59,6 +59,16 @@ public:
     // 現在のプラグイン latency (= IAudioProcessor::getLatencySamples())。
     uint32_t latency_samples() const { return cached_latency_samples_; }
 
+    /// プラグインから `restartComponent(kLatencyChanged)` が来ていないか polling し、
+    /// 来ていれば最新値を取得して返す。main loop で 1 イテレーションに 1 回呼ぶ想定。
+    /// - 戻り値 true: latency が変更されていた。`new_latency_out` に新値が入る。
+    ///   呼び出し側はこれを親プロセスに `latency_changed` イベントで通知する。
+    /// - 戻り値 false: 変更なし (= フラグが立っていなかった)。
+    ///
+    /// 内部: ComponentHandler のフラグを atomically consume してから、processor に
+    /// `getLatencySamples()` を再問い合わせし、cached_latency_samples_ を更新する。
+    bool poll_latency_change(uint32_t& new_latency_out);
+
     // ── GUI (IPlugView) 制御 ──
     //
     // VST3 ではプラグインの GUI は別オブジェクト (`IPlugView`) として提供され、

@@ -589,12 +589,14 @@ fn run_decoder(
     // これにより `audio_tx` (bounded=32) が満杯でも demux/video decode は止まらず、
     // `video_tx` (bounded=24) が枯渇しなくなる (旧構造の "buf 0/24" 振動の解消)。
     //
-    // 容量 64: ~1 秒分の音声 packet (= 約 50 packets/sec × 1.3s) を吸収可能。これ以上は
-    // demux 側の `audio_pkt_tx.send` で blocking して逆圧をかける (= audio 出力が
-    // 詰まるなら demux も止める方が、丸ごと burst 補充が走るより破綻しにくい)。
+    // 容量 256: ~5 秒分の音声 packet (= 約 50 packets/sec × 5s) を吸収可能。
+    // VST3 PDC が 2.0 秒近辺の場合に audio chain が starve しないよう、
+    // demux horizon を pace_lead (0.60s) + packet queue (5s) ≒ 5.6s まで広げる
+    // (= Codex 助言、2026-05-01)。compressed audio packet なのでメモリは軽い
+    // (= 数 KB/packet × 256 ≒ 数百 KB)。
     let audio_stream_idx_for_demux: Option<usize> =
         audio_setup.as_ref().map(|a| a.stream_idx);
-    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(64);
+    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(256);
     // audio decode thread の JoinHandle。run_decoder 終了時に
     // `drop(audio_pkt_tx)` → channel disconnect → audio thread exit を経由して join する。
     // `audio_setup` は ここで consume される (= 以降 demux からは触らない)。
@@ -635,13 +637,14 @@ fn run_decoder(
     // 飢餓状態に)。Phase B では demux thread が `input.packets()` ループを単独で
     // 回し、video packet を `video_pkt_tx` に enqueue するだけに専念する。
     //
-    // 容量 64: 60fps で ~1 秒分の video packet を吸収可能。post-seek burst の
-    // 数十フレーム + steady-state の数フレームには十分な余裕。video decode 側で
-    // pacing sleep (5ms × 数十回) が入っているとき、demux は packet を 64 個まで
-    // queue しながら次のシークまで待てる。
+    // 容量 256: 60fps で ~4.3 秒分、120fps で ~2.1 秒分の video packet を吸収可能。
+    // VST3 PDC 2.0 秒近辺で video pacing が wait に入っているとき、demux が
+    // video_pkt_tx full で止まると audio packet も止まる構造だったため拡大
+    // (= Codex 助言、2026-05-01)。compressed video packet なので decoded frame queue を
+    // 増やすより遥かに軽い (= 数 KB-数十 KB/packet × 256 ≒ 数 MB)。
     let video_tb_num = video_time_base.numerator() as f64;
     let video_tb_den = video_time_base.denominator() as f64;
-    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoWorkerMsg>(64);
+    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoWorkerMsg>(256);
     let video_decode_handle: std::thread::JoinHandle<()> = {
         let clock_v = clock.clone();
         let cancel_v = cancel.clone();
@@ -1054,11 +1057,33 @@ fn run_video_decode(
                             // (詳細コメントは旧 run_decoder GPU 経路コメント参照、
                             //  Phase 8.K の PACE_LEAD=0.30 / post_seek_frame_sent /
                             //  SEEK_BURST_LEAD_MAX_SECS / generation race check 等)。
+                            //
+                            // **PDC-aware pacing** (2026-05-01, Codex 助言):
+                            // VST3 plugin が PDC latency=N を報告したとき、video clock は
+                            // N 秒遅れて進行する。pace_lead に `pdc_latency` を加えて
+                            // VIDEO_QUEUE_LEAD_CAP_SECS で cap (= queue 過剰生産防止)。
+                            //
+                            // audio_buf は **actual buffer のみ** (= PDC は別 metric)。
+                            // これにより cpal underrun 時 (= AudioBuffer 空) には audio_escape
+                            // が確実に発動する。
+                            //
+                            // **微小 frame drop 修正** (2026-05-01, Codex 助言、追加修正):
+                            // 旧: `audio_buf < AUDIO_CRITICAL_LO` で video frame の pace_lead
+                            //     bypass を許可していた → PDC 大時に audio_buf が
+                            //     構造的に低水位 (= 70-80ms) になり、bypass が常時発動して
+                            //     queue を future frame で満杯にし、UI 表示 gap (= 微小スキップ)
+                            //     を引き起こしていた
+                            // 新: `pace_lead` bypass 条件は `ahead < SEEK_BURST_LEAD_MAX_SECS`
+                            //     のみ (= seek/burst 直後の小ahead) に限定。actual audio low は
+                            //     video frame の過剰生産で解決しない (= demux/audio decode は
+                            //     別 thread)。
+                            // 同時に AUDIO_SAFE_LO/HI を AudioBuffer cap (300ms) 前提の値に縮小
+                            // (= VST 有効時の steady state 70-80ms で常時 escape にならないため)。
                             const PACE_LEAD_SECS: f64 = 0.30;
-                            const AUDIO_SAFE_LO: f64 = 0.25;
-                            const AUDIO_SAFE_HI: f64 = 0.75;
+                            const AUDIO_SAFE_LO: f64 = 0.10;   // 旧 0.25 (= cap 1.5s 時代)
+                            const AUDIO_SAFE_HI: f64 = 0.20;   // 旧 0.75 (= cap 300ms に整合)
                             const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
-                            const AUDIO_CRITICAL_LO: f64 = 0.08;
+                            const AUDIO_CRITICAL_LO: f64 = 0.03;  // 旧 0.08 (= 将来 audio 専用 emergency 用に保持)
                             let mut in_audio_escape = false;
                             let mut new_seek_pending = false;
                             // Phase 9.C (2026-04-30): pause-park。旧コードは
@@ -1150,20 +1175,40 @@ fn run_video_decode(
                                         break;
                                     }
                                 }
+                                // PDC-aware pace_lead (Codex 助言、2026-05-01 改訂):
+                                // VST3 plugin の構造的遅延分だけ先読み許可量を増やす
+                                // (= plugin に未来 input を供給するため demux/decode を
+                                // 進める)。ただし decoded video frame queue 容量
+                                // (= video_tx 24 + future_frames 24 = 48 frames ≒ 800ms@60fps)
+                                // を超えて先読みすると queue が常時 full → dropped_full 連発 →
+                                // queue 先頭 PTS が `now + (pace_lead - queue_span)` 先行で
+                                // 表示不可、という構造的スタッターを起こす。
+                                //
+                                // VIDEO_QUEUE_LEAD_CAP_SECS で安全側 0.60s に cap する
+                                // (= 60fps で 36 frames 相当、queue 48 frames に余裕あり)。
+                                // 非 Windows では VST3 機能なし → pdc_latency=0 = 既存動作。
+                                const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
+                                #[cfg(windows)]
+                                let pdc_latency = clock
+                                    .vst3_pdc_latency_secs()
+                                    .min(crate::video::dsp::MAX_PDC_LATENCY_SECS);
+                                #[cfg(not(windows))]
+                                let pdc_latency: f64 = 0.0;
                                 let pace_lead = if allow_pace_lead {
-                                    PACE_LEAD_SECS
+                                    (PACE_LEAD_SECS + pdc_latency).min(VIDEO_QUEUE_LEAD_CAP_SECS)
                                 } else {
                                     0.0
                                 };
                                 if ahead <= pace_lead {
                                     break;
                                 }
-                                if in_audio_escape {
-                                    if ahead < SEEK_BURST_LEAD_MAX_SECS
-                                        || audio_buf < AUDIO_CRITICAL_LO
-                                    {
-                                        break;
-                                    }
+                                // audio_escape bypass: actual audio が低水位かつ ahead が小さいとき
+                                // (= seek/burst 直後の post-seek 1 枚目補填) のみ pace_lead を超えた
+                                // 送出を許可。`audio_buf < AUDIO_CRITICAL_LO` 単独 bypass は撤去
+                                // (= Codex 助言、2026-05-01。video frame の過剰生産は audio を救わない)。
+                                let _ = AUDIO_CRITICAL_LO;  // 将来 audio 専用 emergency 用に定数保持
+                                if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
+                                    break;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(5));
                             }
@@ -1342,12 +1387,13 @@ fn run_video_decode(
             let scale_ms = send_t0.elapsed().as_secs_f64() * 1000.0 - decode_ms;
 
             // ── デコーダのペーシング (CPU 経路) ──
-            // (詳細コメントは旧 run_decoder CPU 経路コメント参照、Phase 8.K)。
+            // (詳細コメントは旧 run_decoder CPU 経路コメント + GPU 経路コメント参照)。
+            // 微小 frame drop 修正 (2026-05-01、Codex 助言): 詳細は GPU 経路コメント参照。
             const PACE_LEAD_SECS: f64 = 0.30;
-            const AUDIO_SAFE_LO: f64 = 0.25;
-            const AUDIO_SAFE_HI: f64 = 0.75;
+            const AUDIO_SAFE_LO: f64 = 0.10;   // 旧 0.25 (= 300ms cap 整合)
+            const AUDIO_SAFE_HI: f64 = 0.20;   // 旧 0.75
             const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
-            const AUDIO_CRITICAL_LO: f64 = 0.08;
+            const AUDIO_CRITICAL_LO: f64 = 0.03;  // 旧 0.08 (= 将来 audio 専用 emergency 用に保持)
             let mut in_audio_escape = false;
             let mut new_seek_pending = false;
             // Phase 9.C/D: pause-park (詳細は GPU 経路の同コメント参照)。
@@ -1401,15 +1447,27 @@ fn run_video_decode(
                         break;
                     }
                 }
-                let pace_lead = if allow_pace_lead { PACE_LEAD_SECS } else { 0.0 };
+                // PDC-aware pace_lead with queue-cap (= GPU 経路と同じ理屈、Codex 助言改訂版)。
+                // 詳細コメントは GPU 経路を参照。
+                const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
+                #[cfg(windows)]
+                let pdc_latency = clock
+                    .vst3_pdc_latency_secs()
+                    .min(crate::video::dsp::MAX_PDC_LATENCY_SECS);
+                #[cfg(not(windows))]
+                let pdc_latency: f64 = 0.0;
+                let pace_lead = if allow_pace_lead {
+                    (PACE_LEAD_SECS + pdc_latency).min(VIDEO_QUEUE_LEAD_CAP_SECS)
+                } else {
+                    0.0
+                };
                 if ahead <= pace_lead {
                     break;
                 }
-                if in_audio_escape {
-                    if ahead < SEEK_BURST_LEAD_MAX_SECS || audio_buf < AUDIO_CRITICAL_LO
-                    {
-                        break;
-                    }
+                // audio_escape bypass: GPU 経路と同じ理屈で `audio_buf < CRITICAL` 単独 bypass を撤去。
+                let _ = AUDIO_CRITICAL_LO;  // 将来 audio 専用 emergency 用に定数保持
+                if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }

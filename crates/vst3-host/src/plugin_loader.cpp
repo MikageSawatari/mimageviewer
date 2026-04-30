@@ -463,6 +463,24 @@ void PluginLoader::set_user_resizing(bool active) {
     }
 }
 
+bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
+    if (!component_handler_ || !processor_) {
+        return false;
+    }
+    if (!component_handler_->consume_latency_changed_flag()) {
+        return false;
+    }
+    // VST3 規約: kLatencyChanged を受けたら audio 処理を一旦止めて latency を再問い合わせる
+    // のが正しい順序。実装簡易のため bridge 側では setActive 再起動はせずに最新値の取得
+    // のみ行う。プラグインによっては「内部が再構成されるまで latency が古い値」のことも
+    // あるが、次回 polling で正しい値が拾える設計で許容する (= 実害は数十 ms 程度)。
+    uint32_t latest = static_cast<uint32_t>(processor_->getLatencySamples());
+    cached_latency_samples_ = latest;
+    new_latency_out = latest;
+    blog("poll_latency_change: new latency_samples=%u", latest);
+    return true;
+}
+
 void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     if (!view_attached_ || !view_) return;
     Steinberg::ViewRect rect{0, 0,

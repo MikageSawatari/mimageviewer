@@ -194,9 +194,27 @@ tresult PLUGIN_API ComponentHandler::endEdit(Vst::ParamID /*id*/) {
     return kResultOk;
 }
 
-tresult PLUGIN_API ComponentHandler::restartComponent(int32 /*flags*/) {
-    // restartComponent(kLatencyChanged) を受けたら親に latency_changed を通知すべきだが、
-    // POC では無視 (Phase B で実装)。
+tresult PLUGIN_API ComponentHandler::restartComponent(int32 flags) {
+    // VST3 の restartComponent: プラグインから host への「再構成してください」通知。
+    // flags は ivstcomponent.h の RestartFlags のビットマスク:
+    //   - kReloadComponent (1)       : component の再ロードが必要
+    //   - kIoChanged (1<<1)           : I/O bus が変わった
+    //   - kParamValuesChanged (1<<2)  : パラメータ値が変わった (UI 同期目的)
+    //   - kLatencyChanged (1<<3)      : ★ getLatencySamples() の戻り値が変わった
+    //   - kParamTitlesChanged (1<<4)  : パラメータ表示名が変わった
+    //   - kMidiCCAssignmentChanged (1<<5)
+    //   - kNoteExpressionChanged (1<<6)
+    //   - kIoTitlesChanged (1<<7)
+    //   - kPrefOfKeySupportChanged (1<<8)
+    //   - kRoutingInfoChanged (1<<9)
+    //   - kKeyswitchChanged (1<<10)
+    //
+    // mIV では kLatencyChanged のみ重要 (PDC を再計算するため)。フラグを立てて
+    // main thread の polling で getLatencySamples() を呼び直し、親に通知する。
+    constexpr int32 kLatencyChanged = (1 << 3);
+    if (flags & kLatencyChanged) {
+        latency_changed_pending_.store(true, std::memory_order_release);
+    }
     return kResultOk;
 }
 

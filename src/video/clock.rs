@@ -278,6 +278,27 @@ impl AvClock {
         self.master_clock.set_anchor(ClockAnchor::audio(pts, wall));
     }
 
+    /// **PDC latency 変化時専用** の anchor 強制再設定。
+    /// `set_audio_pts` の wall-rate cap + monotonic guard を **両方バイパス** して
+    /// 指定値で anchor を全置換する (= source は Audio に維持)。
+    ///
+    /// 使い道: VST プラグインの latency が変化した瞬間。video clock の anchor を
+    /// 新しい `pts_for_video` に飛ばすことで、長時間の凍結 (= monotonic guard が
+    /// 後退を防ぐため、latency 増加分だけ pts_now が追いつくまで止まる) を回避し、
+    /// **映像が前後にジャンプ**する挙動にする (= ユーザー要望)。
+    ///
+    /// シーク本体 (= `notify_seek_completed`) との違い:
+    /// - シークは seek_serial を進めて pump も flush するが、こちらは latency 変化のみで
+    ///   seek_serial は維持する (= 通常の audio 経路を継続)
+    /// - 短時間の audio バッファ ~300ms 分は古い latency で処理されているが、
+    ///   その間は新 latency 基準で映像位置が表示される (= 厳密には 300ms 以内
+    ///   ずれる可能性あり、許容)
+    pub fn set_audio_pts_jump(&self, pts_secs: f64) {
+        let wall = Instant::now();
+        let pts = pts_secs.max(0.0);
+        self.write_audio_anchor_at(pts, wall);
+    }
+
     /// EOF 時に再生位置を duration に進めたいが、audio_active 状態は変えたくない
     /// ケース (audioless 動画でも duration まで進めて停止アニメを揃えるため)。
     pub fn set_position_at_eof(&self, pts_secs: f64) {
@@ -551,9 +572,21 @@ impl AvClock {
 
     /// 現在の総音声バッファ秒数 (= pump + audio_tx queued)。
     /// decoder pacing が「audio が枯渇しそう (= 沈黙する) を回避すべきか」判定する。
+    /// **actual buffer のみ** (= VST3 PDC latency は含まない、`vst3_pdc_latency_secs` で別取得)。
     /// Phase 2a: `AudioBookkeeping` に委譲。
     pub fn total_audio_buffer_secs(&self) -> f64 {
         self.audio_bookkeeping.total_secs()
+    }
+
+    /// VST3 PDC latency (秒) を pump push 時に publish する。
+    pub fn set_vst3_pdc_latency_secs(&self, secs: f64) {
+        self.audio_bookkeeping.set_vst3_pdc_latency_secs(secs);
+    }
+
+    /// VST3 PDC latency (秒) を返す。decoder pacing が「先読み許可量 = PACE_LEAD + pdc」
+    /// で必要な未来入力量を確保するために使う。
+    pub fn vst3_pdc_latency_secs(&self) -> f64 {
+        self.audio_bookkeeping.vst3_pdc_latency_secs()
     }
 
 

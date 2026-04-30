@@ -217,6 +217,11 @@ pub(crate) struct PreferencesState {
     pub vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
     /// VST3 ページ内のフィルタ文字列。
     pub vst3_filter: String,
+    /// 現在 auto-bypass されているスロットのスナップショット (= 名前, latency_ms)。
+    /// VST3 ページ下部の赤字警告表示用。`show_preferences_dialog` の頭で
+    /// `dsp_bridge` から毎フレーム refresh される (= ON/OFF が即座に反映)。
+    #[cfg(windows)]
+    pub vst3_auto_bypassed: Vec<(String, f64)>,
 }
 
 impl PreferencesState {
@@ -280,6 +285,8 @@ impl PreferencesState {
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_filter: String::new(),
+            #[cfg(windows)]
+            vst3_auto_bypassed: Vec::new(),
         }
     }
 }
@@ -326,6 +333,31 @@ impl App {
                 new_state.vst3_discovered = self.vst3_discovered.clone();
             }
             self.pref_state = Some(new_state);
+        }
+
+        // 毎フレーム refresh: auto-bypass されたスロットを取得して PreferencesState に反映。
+        // VST3 ページ下部の赤字警告表示用。最新状態を見せたいので毎フレーム更新する
+        // (= ユーザーが手動で再 ON した瞬間に警告が消える等、即時反映)。
+        #[cfg(windows)]
+        if let Some(state) = self.pref_state.as_mut() {
+            let sample_rate = self.dsp_bridge.sample_rate();
+            state.vst3_auto_bypassed = self
+                .dsp_bridge
+                .slots()
+                .into_iter()
+                .filter(|s| s.auto_bypassed_for_latency && s.bypass)
+                .map(|s| {
+                    let ms = if sample_rate > 0 {
+                        s.latency_samples as f64 / sample_rate as f64 * 1000.0
+                    } else {
+                        0.0
+                    };
+                    (
+                        s.plugin_name.unwrap_or_else(|| "(不明)".to_string()),
+                        ms,
+                    )
+                })
+                .collect();
         }
 
         let mut open = true;
@@ -1587,6 +1619,25 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
             .small(),
         );
         return;
+    }
+
+    // ── 自動 OFF された plugin の警告 (= MAX_PDC_LATENCY_SECS=2s 超で auto-bypass) ──
+    // 警告は VST3 enabled 時のみ表示。再生中に latency 変化で発火するので、
+    // ここに常設しておけばユーザーは設定画面を開いた時に気付ける。
+    if !state.vst3_auto_bypassed.is_empty() {
+        ui.add_space(8.0);
+        let warn_color = egui::Color32::from_rgb(220, 80, 80);
+        for (name, ms) in &state.vst3_auto_bypassed {
+            ui.label(
+                egui::RichText::new(format!(
+                    "[!] 「{}」は遅延 {:.1}ms (上限 2000ms 超) のため自動 OFF にしました。\n     プラグイン側で遅延を減らしてから手動で再 ON してください。",
+                    name, ms
+                ))
+                .color(warn_color)
+                .strong()
+                .small(),
+            );
+        }
     }
 
     ui.add_space(12.0);

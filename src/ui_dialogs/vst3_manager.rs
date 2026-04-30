@@ -171,6 +171,7 @@ impl App {
                     .color(egui::Color32::from_rgb(170, 170, 170)),
                 );
             } else {
+                let sample_rate = self.dsp_bridge.sample_rate();
                 for (idx, slot) in slots.iter().enumerate() {
                     ui.horizontal(|ui| {
                         // ON/OFF: bypass を反転して「ON = 効いている」表示にする
@@ -213,6 +214,59 @@ impl App {
                                     .clicked()
                                 {
                                     clicked_show_gui = Some(idx);
+                                }
+                                // ── latency 表示 (= プラグインが報告した遅延) ──
+                                // bypass=true や Loaded 以外なら表示しない (= 影響しない)
+                                if !slot.bypass
+                                    && matches!(slot.state, SlotState::Loaded)
+                                    && slot.latency_samples > 0
+                                {
+                                    let ms_text = if sample_rate > 0 {
+                                        format!(
+                                            "{:.1}ms",
+                                            slot.latency_samples as f64 / sample_rate as f64
+                                                * 1000.0
+                                        )
+                                    } else {
+                                        format!("{}sm", slot.latency_samples)
+                                    };
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(ms_text)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(255, 200, 100)),
+                                    )
+                                    .on_hover_text(format!(
+                                        "プラグインが報告したレイテンシ\n\
+                                         {} samples @ {}Hz\n\
+                                         (PDC で動画クロックを後ろにずらして同期補正済み)",
+                                        slot.latency_samples,
+                                        if sample_rate > 0 { sample_rate } else { 48000 },
+                                    ));
+                                }
+                                // ── 自動 OFF バッジ (= 上限超過で auto-bypass) ──
+                                // bypass=true && auto_bypassed_for_latency=true の組み合わせで判定。
+                                // ユーザーが手動で再 ON にすると set_bypass で auto フラグ解除される。
+                                if slot.auto_bypassed_for_latency && slot.bypass {
+                                    let latency_ms = if sample_rate > 0 {
+                                        slot.latency_samples as f64 / sample_rate as f64 * 1000.0
+                                    } else {
+                                        0.0
+                                    };
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new("[!] auto-OFF")
+                                            .small()
+                                            .strong()
+                                            .background_color(egui::Color32::from_rgb(180, 30, 30))
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .on_hover_text(format!(
+                                        "レイテンシが上限 (2.0 秒) を超えたため自動 OFF\n\
+                                         検出値: {:.1}ms\n\
+                                         プラグイン側で遅延を減らしてから手動で再 ON してください。",
+                                        latency_ms,
+                                    ));
                                 }
                             },
                         );

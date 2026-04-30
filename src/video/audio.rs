@@ -71,6 +71,30 @@ struct AudioBuffer {
     /// 最後に push したフレームの seek_serial。AvClock の現行 serial と異なれば
     /// pump thread 側で破棄する。
     pump_seek_serial: u64,
+    /// PDC (Plugin Delay Compensation) 用: 直近 push 時点でのプラグインチェーン
+    /// 全体の構造的遅延 (秒)。`fill_output` がこれを `clock.set_audio_pts` で減算し、
+    /// video clock を audio より遅らせて A/V sync を保つ。
+    ///
+    /// **意味**: VST プラグインに `latency_samples = N` の lookahead がある場合、
+    /// プラグインの output 1 sample は input N サンプル前に対応する。pump は
+    /// 「output sample の input PTS = input frame の PTS」として buffer に push して
+    /// いるが、実際にスピーカーから出る音は input PTS - N/sr の時刻に対応するため、
+    /// video clock もそこに合わせる必要がある。
+    ///
+    /// **更新タイミング**: pump push 時に `bridge.total_latency_samples()` から計算。
+    /// バッファ内のサンプルは厳密には push 時点ごとに異なる latency 値で処理されている
+    /// 可能性があるが、(a) 通常は latency は固定 / 緩慢に変化、(b) 変化時は
+    /// 後続 frame で値が更新されるので緩やかに追従、という設計で許容する。
+    pdc_latency_secs: f64,
+    /// PDC latency 変化を `fill_output` 側で検出するためのトラッキング値。
+    /// `pdc_latency_secs` (pump 更新) と `pdc_latency_secs_applied` (fill_output 適用済)
+    /// を比較して、不一致なら latency 変化が起きた → video clock を jump 再設定する
+    /// (= 通常の monotonic guard を一回バイパス)。
+    ///
+    /// これによりプラグインモード切替で latency が ±100ms..±数秒 変化しても、
+    /// 動画凍結 / 長時間の wall-rate キャッチアップ無しで瞬時に映像位置が補正される
+    /// (= ユーザー要望: 「映像ジャンプの方が好ましい」)。
+    pdc_latency_secs_applied: f64,
 }
 
 /// 既定音声出力デバイスのサンプルレートを取得する (実際にはストリームは開かない)。
@@ -128,6 +152,8 @@ pub fn start(
         sample_rate,
         samples_per_sec: sample_rate as f64 * 2.0,
         pump_seek_serial: 0,
+        pdc_latency_secs: 0.0,
+        pdc_latency_secs_applied: 0.0,
     }));
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -185,9 +211,20 @@ pub fn start(
 
 /// `AudioBuffer.samples` の長さを秒に変換して clock に publish する。
 /// pump push / fill_output pop の両方から呼ばれる。
+///
+/// **PDC latency は pump_buf に含めない** (= Codex 助言、2026-05-01)。
+/// 旧版は `secs + pdc_latency_secs` を publish していたが、それだと AudioBuffer が
+/// 完全に空 (= cpal underrun 中) でも「PDC 分のバッファあり」に見えてしまい、
+/// decoder pacing の `audio_escape` / emergency 補充が発動せず、結果として高 latency 時に
+/// 音声がブツブツ途切れる退行を起こす。
+///
+/// **PDC latency は別 metric で publish する** (`set_vst3_pdc_latency_secs`)。
+/// decoder pacing 側は actual buffer 残量で `audio_escape` を判定し、先読み許可量だけ
+/// `PACE_LEAD + pdc_latency` を加算する設計。
 fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
     let secs = buf.samples.len() as f64 / buf.samples_per_sec;
     clock.set_audio_pump_buf_secs(secs);
+    clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
 }
 
 /// audio-pump スレッドの Windows 優先度を `THREAD_PRIORITY_ABOVE_NORMAL` に上げる。
@@ -292,24 +329,40 @@ fn run_pump(
         // ── VST3 plugin processing (optional) ──
         // bridge が enable=true & active_slot_count > 0 のときだけ frame.samples を bridge に通す。
         // 通常の動画再生 (= VST3 disable / 全 bypass) ではゼロオーバーヘッド (= 2 つの atomic 読み)。
+        // 同時に PDC (Plugin Delay Compensation) 用の latency 値も取得しておく。
         #[cfg(windows)]
-        let processed_samples: std::borrow::Cow<'_, [f32]> = if let Some(b) = &dsp_bridge {
-            if b.is_enabled() && b.active_slot_count() > 0 {
-                fx_out.resize(frame.samples.len(), 0.0);
-                if let Err(e) = b.process_block(&frame.samples, &mut fx_out) {
-                    crate::logger::log(format!("vst3 process_block failed: {e}"));
-                    std::borrow::Cow::Borrowed(&frame.samples[..])
+        let (processed_samples, current_pdc_latency_secs): (std::borrow::Cow<'_, [f32]>, f64) =
+            if let Some(b) = &dsp_bridge {
+                if b.is_enabled() && b.active_slot_count() > 0 {
+                    fx_out.resize(frame.samples.len(), 0.0);
+                    let processed: std::borrow::Cow<'_, [f32]> =
+                        if let Err(e) = b.process_block(&frame.samples, &mut fx_out) {
+                            crate::logger::log(format!("vst3 process_block failed: {e}"));
+                            std::borrow::Cow::Borrowed(&frame.samples[..])
+                        } else {
+                            std::borrow::Cow::Borrowed(&fx_out[..])
+                        };
+                    // PDC: アクティブスロット (= !bypass && Loaded) の latency_samples を合算。
+                    // sample_rate は buffer 構築時に固定なので、frame.sample_rate ではなく
+                    // buffer の sample_rate を使う (= cpal output と同じ rate)。
+                    let total_lat_samples = b.total_latency_samples();
+                    let lat_secs = if total_lat_samples > 0 {
+                        let sr = buffer.lock().unwrap().sample_rate;
+                        total_lat_samples as f64 / sr as f64
+                    } else {
+                        0.0
+                    };
+                    (processed, lat_secs)
                 } else {
-                    std::borrow::Cow::Borrowed(&fx_out[..])
+                    (std::borrow::Cow::Borrowed(&frame.samples[..]), 0.0)
                 }
             } else {
-                std::borrow::Cow::Borrowed(&frame.samples[..])
-            }
-        } else {
-            std::borrow::Cow::Borrowed(&frame.samples[..])
-        };
+                (std::borrow::Cow::Borrowed(&frame.samples[..]), 0.0)
+            };
         #[cfg(not(windows))]
         let processed_samples: &[f32] = &frame.samples;
+        #[cfg(not(windows))]
+        let current_pdc_latency_secs: f64 = 0.0;
 
         // 古い seek_serial の破棄 + push を 1 ロックで実行。
         // clock.current_seek_serial() より古いフレームは、audio_tx に
@@ -337,6 +390,16 @@ fn run_pump(
             buf.next_pts_secs = frame.pts_secs;
         }
         buf.samples.extend(processed_samples.iter().copied());
+        // PDC (Plugin Delay Compensation) latency を反映。fill_output で video clock
+        // 計算時に減算される。値が変化したらログに残す (= プラグインモード切替の検出)。
+        if (buf.pdc_latency_secs - current_pdc_latency_secs).abs() > 1e-6 {
+            crate::logger::log(format!(
+                "PDC latency changed: {:.3}ms -> {:.3}ms",
+                buf.pdc_latency_secs * 1000.0,
+                current_pdc_latency_secs * 1000.0
+            ));
+            buf.pdc_latency_secs = current_pdc_latency_secs;
+        }
         publish_buffer_secs(&buf, &clock);
 
         // ── BufferReady emit (Phase 3d / 8.K) ──
@@ -465,6 +528,39 @@ fn fill_output(
     buf.next_pts_secs += consumed_secs;
     let pts_now = buf.next_pts_secs;
     let pump_serial = buf.pump_seek_serial;
+    // PDC (Plugin Delay Compensation): video clock 用の pts は input PTS から
+    // プラグインチェーン latency を引いた時刻。プラグインの output 1 sample が
+    // 実際に対応する input の時刻 = pts_now - pdc_latency_secs。
+    // VST 無効 / 全 bypass のときは pdc_latency_secs = 0 なので影響なし (= 既存動作)。
+    let pdc_latency = buf.pdc_latency_secs;
+    let pts_for_video = (pts_now - pdc_latency).max(0.0);
+    // PDC latency 変化検出 + 閾値付きジャンプ判定:
+    // - **大きい変化 (> 100ms)**: monotonic guard をバイパスして video clock を強制
+    //   再設定 (= 「映像ジャンプ」)。プラグインモード切替や linear-phase ON/OFF 等の
+    //   ステップ変化を凍結時間なしで反映する。
+    // - **小さい変化 (≤ 100ms)**: 通常 set_audio_pts を呼ぶ (= monotonic + wall-rate cap)。
+    //   小刻みなノイズ (= プラグインが ±20-50ms の jitter を出すケース) でも頻繁な
+    //   ジャンプを発生させず、滑らかな再生を維持する。Δ100ms 以内の遅れ/早回しは
+    //   人間の知覚しきい値以下で実用上気付かない。
+    //
+    // 閾値の根拠: 一般的な VST plugin の latency は 0 / 数ms / 数十ms / 数百ms /
+    // 1秒以上 の段差で離散的に変化する。100ms はモード切替を確実に拾えて、サンプル
+    // 単位ノイズ (= ±100ms 以下) には反応しない実用的な値。
+    const PDC_JUMP_THRESHOLD_SECS: f64 = 0.1;
+    let delta_secs = pdc_latency - buf.pdc_latency_secs_applied;
+    let latency_jumped = delta_secs.abs() > PDC_JUMP_THRESHOLD_SECS;
+    // 値変化検出のしきい値は微小 (= 1us)。jitter でも applied は更新する
+    // (= 累積による誤検知防止)。jump 判定は別の閾値で行う。
+    if delta_secs.abs() > 1e-6 {
+        buf.pdc_latency_secs_applied = pdc_latency;
+        if latency_jumped {
+            crate::logger::log(format!(
+                "[VST3 PDC] fill_output: large latency change ({:+.1}ms) -> jump video clock to {:.3}s",
+                delta_secs * 1000.0,
+                pts_for_video
+            ));
+        }
+    }
     // publish は Mutex 内で行う。Mutex 外に出すと run_pump の push 後 publish が
     // stale な fill_output 側 publish に上書きされる race がある。
     // overhead = 1 atomic store ≈ 1 ns 程度なので RT への影響は無視できる。
@@ -474,14 +570,23 @@ fn fill_output(
     // set_audio_pts を呼ぶとシーク前位置でクロックが進み、シークバーがスナップバック。
     // 二段読みで race を排除する。
     if pump_serial >= clock.current_seek_serial() {
-        clock.set_audio_pts(pts_now);
+        if latency_jumped {
+            // PDC latency 変化時: monotonic guard をバイパスして anchor を強制再設定。
+            // 後退方向 (= latency 増加) でも前進方向 (= latency 減少) でも、video clock が
+            // 即座に新しい pts_for_video へジャンプし、その後通常 anchor 更新に戻る。
+            clock.set_audio_pts_jump(pts_for_video);
+        } else {
+            clock.set_audio_pts(pts_for_video);
+        }
         // override クリアは「target 近傍のサンプル」を消費した時のみ。
         // target から大きく離れた場合は decoder 側 seek が外れて古い位置の audio が
         // 新世代 serial で来ているケースで、ここで clear するとシークバーが
         // 元位置に戻る (override 中は now_secs が target を返すので diff で判定可能、
         // 通常再生中は now_secs ≈ pts_now なので diff ~0 で常に clear する)。
+        // NB: override クリア判定は pts_for_video ベース (= clock.now_secs() と同じ
+        // 時間軸) で行うので PDC 適用後の値で比較する。
         let now = clock.now_secs();
-        if (pts_now - now).abs() <= SEEK_TARGET_TOLERANCE_SECS {
+        if (pts_for_video - now).abs() <= SEEK_TARGET_TOLERANCE_SECS {
             clock.clear_seek_target_override(pump_serial);
         }
     }
@@ -514,6 +619,8 @@ mod tests {
             sample_rate,
             samples_per_sec: sample_rate as f64 * 2.0,
             pump_seek_serial: 0,
+            pdc_latency_secs: 0.0,
+            pdc_latency_secs_applied: 0.0,
         }))
     }
 

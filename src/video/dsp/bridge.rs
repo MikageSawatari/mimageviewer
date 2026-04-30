@@ -129,8 +129,16 @@ pub enum Event {
 pub struct Bridge {
     child: Child,
     stdin: Mutex<ChildStdin>,
-    // stdout は recv で blocking read するので Arc<Mutex<>> で保持
-    stdout: Arc<Mutex<ChildStdout>>,
+    /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
+    /// stdout を読んで非同期 (LatencyChanged) 以外の event をここに流す。
+    /// recv() はここから読む。
+    event_rx: crossbeam_channel::Receiver<std::io::Result<Event>>,
+    /// プラグインの最新 latency_samples (= bridge から非同期通知された値)。
+    /// 初期値 = u32::MAX (= 「未受信」マーカ)。Loaded event 受信後に通常値が入る。
+    /// audio-pump が `total_latency_samples()` から定期 polling して slot.latency_samples
+    /// を更新する。プラグインが UI でモード切替して `restartComponent(kLatencyChanged)`
+    /// を発火すると、event-pump がここを atomically 更新する。
+    cached_latency_samples: Arc<AtomicU32>,
     #[cfg(windows)]
     shm: Option<SharedMemory>,
     #[cfg(windows)]
@@ -202,10 +210,61 @@ impl Bridge {
                 }
             })
             .ok(); // spawn 失敗しても致命ではない (= ログが流れないだけ)
+
+        // event-pump thread: stdout を read し続けて、LatencyChanged は atomic に
+        // 反映、それ以外は channel 経由で recv() に渡す。
+        // この設計により:
+        //   1. 同期 event (Loaded/Ready/etc) は recv() で blocking 取得できる
+        //   2. 非同期 event (LatencyChanged) は誰も recv() を呼んでなくても捕捉される
+        // bridge が exit すると stdout EOF → pump 終了 → channel sender drop → recv() で
+        // disconnected error。
+        let cached_latency = Arc::new(AtomicU32::new(u32::MAX));
+        let (event_tx, event_rx) =
+            crossbeam_channel::bounded::<std::io::Result<Event>>(64);
+        let cached_latency_for_pump = cached_latency.clone();
+        std::thread::Builder::new()
+            .name("bridge-event-pump".into())
+            .spawn(move || {
+                let mut stdout = stdout;
+                loop {
+                    match read_event_blocking(&mut stdout) {
+                        Ok(Event::LatencyChanged { latency_samples }) => {
+                            cached_latency_for_pump
+                                .store(latency_samples, Ordering::Release);
+                            // 通知ログ (mIV 側 audio-pump が次に total_latency_samples を
+                            // 呼んだ時に拾う想定)
+                            crate::logger::log(format!(
+                                "[VST3 PDC] bridge LatencyChanged: latency_samples={} ({:.3}ms@assumed-48kHz)",
+                                latency_samples,
+                                latency_samples as f64 / 48000.0 * 1000.0,
+                            ));
+                            // channel には流さない (= 同期 recv() を妨げないため)
+                        }
+                        Ok(other) => {
+                            // Loaded を受信したら cached_latency にも反映する
+                            // (= 起動直後は LatencyChanged 通知が来ないプラグインに対応)
+                            if let Event::Loaded { latency_samples, .. } = &other {
+                                cached_latency_for_pump
+                                    .store(*latency_samples, Ordering::Release);
+                            }
+                            if event_tx.send(Ok(other)).is_err() {
+                                break;  // receiver dropped
+                            }
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(Err(e));
+                            break;  // EOF or error
+                        }
+                    }
+                }
+            })
+            .ok();
+
         Ok(Self {
             child,
             stdin: Mutex::new(stdin),
-            stdout: Arc::new(Mutex::new(stdout)),
+            event_rx,
+            cached_latency_samples: cached_latency,
             #[cfg(windows)]
             shm: None,
             #[cfg(windows)]
@@ -213,6 +272,13 @@ impl Bridge {
             #[cfg(windows)]
             sig_out: None,
         })
+    }
+
+    /// audio-pump が定期 polling する用: bridge から非同期通知された最新の
+    /// latency_samples を取得する。Loaded event 未受信なら u32::MAX を返す
+    /// (= 呼び出し側は「まだ不明」として 0 扱いに fallback すべき)。
+    pub fn cached_latency_samples_value(&self) -> u32 {
+        self.cached_latency_samples.load(Ordering::Acquire)
     }
 
     /// 制御メッセージを送る。
@@ -230,23 +296,40 @@ impl Bridge {
     }
 
     /// イベントを 1 つ受信する (blocking)。
+    /// 内部的には event-pump スレッドが stdout から読み出して channel に流したものを取得。
+    /// LatencyChanged event は pump が intercept して `cached_latency_samples` に
+    /// 直接反映するため、ここには来ない (= 同期待ちを妨げない)。
     pub fn recv(&self) -> std::io::Result<Event> {
-        let mut stdout = self.stdout.lock().unwrap();
-        let mut len_buf = [0u8; 4];
-        stdout.read_exact(&mut len_buf)?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len > 64 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "control message too large",
-            ));
+        match self.event_rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "event channel disconnected (bridge process likely exited)",
+            )),
         }
-        let mut body = vec![0u8; len];
-        stdout.read_exact(&mut body)?;
-        let event: Event = serde_json::from_slice(&body)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(event)
     }
+}
+
+/// stdout から 1 event を blocking で読む。bridge::Bridge spawn 時の event-pump
+/// thread から呼ばれる。
+fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
+    let mut len_buf = [0u8; 4];
+    stdout.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > 64 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control message too large",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    stdout.read_exact(&mut body)?;
+    let event: Event = serde_json::from_slice(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(event)
+}
+
+impl Bridge {
 
     /// shared memory + named events を作って bridge にアタッチさせる。
     #[cfg(windows)]
