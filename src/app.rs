@@ -2220,6 +2220,17 @@ pub struct App {
     pub(crate) dsp_bridge: std::sync::Arc<crate::video::dsp::DspBridge>,
     /// VST3 プラグイン管理ウィンドウの表示状態。
     pub(crate) show_vst3_manager: bool,
+    /// VST3 プラグインチェーンエディタ (= 大きいダイアログ) の表示状態。
+    /// プレイバックパネルの「編集…」ボタンから開く。
+    #[cfg(windows)]
+    pub(crate) show_vst3_chain_editor: bool,
+    /// チェーンエディタ内の検索フィルタ文字列。
+    #[cfg(windows)]
+    pub(crate) vst3_chain_editor_filter: String,
+    /// チェーンエディタの「プラグイン候補リスト展開」状態 (将来拡張用、未使用)。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) vst3_chain_editor_picker_open: bool,
     /// VST3 プラグイン候補のスキャン結果 (lazy ロード、初回 enable で実行)。
     #[cfg(windows)]
     pub(crate) vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
@@ -2652,6 +2663,12 @@ impl Default for App {
             dsp_bridge: crate::video::dsp::DspBridge::new(),
             show_vst3_manager: false,
             #[cfg(windows)]
+            show_vst3_chain_editor: false,
+            #[cfg(windows)]
+            vst3_chain_editor_filter: String::new(),
+            #[cfg(windows)]
+            vst3_chain_editor_picker_open: false,
+            #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_init_kicked: false,
             #[cfg(windows)]
@@ -2827,6 +2844,10 @@ impl App {
             || self.show_about_dialog
             || self.show_update_dialog
             || self.show_vst3_manager
+            || {
+                #[cfg(windows)] { self.show_vst3_chain_editor }
+                #[cfg(not(windows))] { false }
+            }
             || self.slot_save_dialog.is_some()
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
@@ -13430,7 +13451,7 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
-        // VST3 プラグイン管理ウィンドウ。
+        // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。
         //    両方のビューポートで描画すると egui::Window の位置が二重管理になり、
         //    ビューポート切替時に位置がリセットされたように見える (ユーザー報告 2026-04)。
@@ -13439,6 +13460,7 @@ impl eframe::App for App {
         #[cfg(windows)]
         if self.fullscreen_idx.is_none() {
             self.show_vst3_manager(ctx);
+            self.show_vst3_chain_editor_dialog(ctx);
             self.vst3_pump_gui_signals();
         }
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。

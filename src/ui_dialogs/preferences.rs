@@ -202,14 +202,8 @@ pub(crate) struct PreferencesState {
     pub trt_cache_delete_confirm_open: bool,
 
     // ── VST3 プラグイン編集 ────────────────────────────────────────
-    /// 環境設定を開いた時点でスキャンされていた VST3 プラグイン候補のスナップショット。
-    /// preferences 内で「再スキャン」を押すと更新される。Apply 後に App 側に反映する。
-    #[cfg(windows)]
-    pub vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
-    /// VST3 「プラグインを追加」ポップアップ内のフィルタ文字列。
-    pub vst3_picker_filter: String,
-    /// VST3 「プラグインを追加」ポップアップを表示しているか。
-    pub vst3_picker_open: bool,
+    // チェーン編集 UI 自体は独立ダイアログ (`vst3_chain_editor.rs`) に移動済。
+    // preferences 側はチェーン状態の **読み取り専用サマリ表示**のみ行う。
 }
 
 impl PreferencesState {
@@ -270,10 +264,6 @@ impl PreferencesState {
             trt_engine_cache_size_mib,
             start_trt_install_requested: false,
             trt_cache_delete_confirm_open: false,
-            #[cfg(windows)]
-            vst3_discovered: Vec::new(),
-            vst3_picker_filter: String::new(),
-            vst3_picker_open: false,
         }
     }
 }
@@ -309,16 +299,10 @@ impl App {
 
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
-            let mut new_state = PreferencesState::from_settings(
+            self.pref_state = Some(PreferencesState::from_settings(
                 &self.settings,
                 self.ai_runtime.as_deref(),
-            );
-            // 既にスキャン済みのプラグイン候補を引き継ぐ (= 再スキャンせずに使える)。
-            #[cfg(windows)]
-            {
-                new_state.vst3_discovered = self.vst3_discovered.clone();
-            }
-            self.pref_state = Some(new_state);
+            ));
         }
 
         let mut open = true;
@@ -439,26 +423,10 @@ impl App {
                 let new_ai_backend = state.settings.ai_backend.clone();
 
                 // VST3 enable 状態の変化を検出してホットリロード (= bridge spawn / shutdown)。
+                // チェーン編集自体は独立ダイアログで即時反映するので、ここでは enable
+                // 状態のみ追跡する。
                 let old_vst3_enabled = self.settings.vst3_enabled;
                 let new_vst3_enabled = state.settings.vst3_enabled;
-                // VST3 プラグインチェーンの変更を検出 (= 再ロードトリガ)
-                #[cfg(windows)]
-                let old_vst3_chain: Vec<String> = self
-                    .settings
-                    .vst3_plugins
-                    .iter()
-                    .map(|e| e.path.clone())
-                    .collect();
-                #[cfg(windows)]
-                let new_vst3_chain: Vec<String> = state
-                    .settings
-                    .vst3_plugins
-                    .iter()
-                    .map(|e| e.path.clone())
-                    .collect();
-                // 環境設定で再スキャンされた場合、App 側の vst3_discovered も同期する
-                #[cfg(windows)]
-                let new_vst3_discovered = state.vst3_discovered.clone();
 
                 // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
                 // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
@@ -501,70 +469,13 @@ impl App {
                     self.exif_cache.clear();
                 }
 
-                // VST3 enable 状態の変化反映 (= bridge spawn / shutdown)。
+                // VST3 enable 状態の変化反映 (= bridge spawn / shutdown + 全プラグインロード)。
                 #[cfg(windows)]
-                {
-                    self.vst3_discovered = new_vst3_discovered;
-                    let chain_changed = old_vst3_chain != new_vst3_chain;
-                    if old_vst3_enabled != new_vst3_enabled {
-                        if new_vst3_enabled {
-                            // worker thread で enable + チェーン全体ロード (= 起動時と同じ流れ)。
-                            let bridge = self.dsp_bridge.clone();
-                            let plugins = self.settings.vst3_plugins.clone();
-                            std::thread::Builder::new()
-                                .name("vst3-enable".into())
-                                .spawn(move || {
-                                    if let Err(e) = bridge.enable() {
-                                        crate::logger::log(format!("vst3 enable failed: {e}"));
-                                        return;
-                                    }
-                                    let sample_rate =
-                                        crate::video::audio::default_output_sample_rate()
-                                            .unwrap_or(48_000);
-                                    for entry in plugins {
-                                        if let Err(e) =
-                                            bridge.add_plugin(&entry.path, sample_rate, 480, entry.bypass)
-                                        {
-                                            crate::logger::log(format!(
-                                                "vst3 enable add_plugin {} failed: {e}",
-                                                entry.path
-                                            ));
-                                        }
-                                    }
-                                })
-                                .ok();
-                        } else {
-                            self.dsp_bridge.disable();
-                        }
-                    } else if chain_changed && new_vst3_enabled {
-                        // enable 状態変更なしでチェーン構成だけ変わったケース:
-                        // bridge を nuke して全部再ロード (= 順序・追加・削除を全部反映)。
-                        // worker thread でやらないと UI が固まる (1 plugin あたり数百 ms)。
-                        let bridge = self.dsp_bridge.clone();
-                        let plugins = self.settings.vst3_plugins.clone();
-                        std::thread::Builder::new()
-                            .name("vst3-rebuild".into())
-                            .spawn(move || {
-                                bridge.disable();
-                                if let Err(e) = bridge.enable() {
-                                    crate::logger::log(format!("vst3 rebuild enable: {e}"));
-                                    return;
-                                }
-                                let sample_rate =
-                                    crate::video::audio::default_output_sample_rate()
-                                        .unwrap_or(48_000);
-                                for entry in plugins {
-                                    if let Err(e) =
-                                        bridge.add_plugin(&entry.path, sample_rate, 480, entry.bypass)
-                                    {
-                                        crate::logger::log(format!(
-                                            "vst3 rebuild add_plugin {} failed: {e}",
-                                            entry.path
-                                        ));
-                                    }
-                                }
-                            })
-                            .ok();
+                if old_vst3_enabled != new_vst3_enabled {
+                    if new_vst3_enabled {
+                        self.kick_off_vst3_chain_rebuild();
+                    } else {
+                        self.dsp_bridge.disable();
                     }
                 }
                 #[cfg(not(windows))]
@@ -1615,210 +1526,49 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 
     if state.settings.vst3_enabled {
-        ui.add_space(8.0);
-        page_vst3_chain_editor(ui, state);
-    }
-}
-
-/// VST3 プラグインチェーン編集 UI (環境設定→動画タブ用)。
-/// - 上: 現在のチェーン (最大 10、↑↓ で並べ替え、× で削除)
-/// - 下: プラグイン追加ピッカー (スキャン + 検索)
-#[cfg(windows)]
-fn page_vst3_chain_editor(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    use crate::settings::Vst3PluginEntry;
-
-    const MAX_CHAIN_LEN: usize = 10;
-
-    let chain_len = state.settings.vst3_plugins.len();
-    ui.label(
-        egui::RichText::new(format!("プラグインチェーン ({chain_len}/{MAX_CHAIN_LEN})"))
-            .strong(),
-    );
-    ui.label(
-        egui::RichText::new(
-            "上から順に音声を通します。動画再生中はホバーバーの VST ボタンから\n\
-             ON/OFF (バイパス) を切り替えできます。",
-        )
-        .small()
-        .weak(),
-    );
-    ui.add_space(4.0);
-
-    // ── チェーン一覧 ──
-    let mut clicked_remove: Option<usize> = None;
-    let mut clicked_move_up: Option<usize> = None;
-    let mut clicked_move_down: Option<usize> = None;
-
-    if state.settings.vst3_plugins.is_empty() {
-        ui.label(egui::RichText::new("(空)").weak());
-    } else {
-        let total = state.settings.vst3_plugins.len();
-        for (idx, entry) in state.settings.vst3_plugins.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("{}.", idx + 1)).weak());
+        ui.add_space(6.0);
+        let chain_count = state.settings.vst3_plugins.len();
+        if chain_count == 0 {
+            ui.label(
+                egui::RichText::new(
+                    "チェーンは空です。動画再生中にホバーバーの VST ボタンから\n\
+                     パネルを開き、「チェーン編集…」でプラグインを追加してください。",
+                )
+                .small()
+                .weak(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "現在のチェーン: {} 個ロード中 (順番に音声を通します)",
+                    chain_count
+                ))
+                .small(),
+            );
+            for (i, entry) in state.settings.vst3_plugins.iter().enumerate() {
                 let name = std::path::Path::new(&entry.path)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("(不明)");
-                ui.label(egui::RichText::new(name).strong())
-                    .on_hover_text(entry.path.as_str());
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("チェーンから削除")
-                            .clicked()
-                        {
-                            clicked_remove = Some(idx);
-                        }
-                        let down_enabled = idx + 1 < total;
-                        if ui
-                            .add_enabled(down_enabled, egui::Button::new("↓").small())
-                            .on_hover_text("下へ")
-                            .clicked()
-                        {
-                            clicked_move_down = Some(idx);
-                        }
-                        let up_enabled = idx > 0;
-                        if ui
-                            .add_enabled(up_enabled, egui::Button::new("↑").small())
-                            .on_hover_text("上へ")
-                            .clicked()
-                        {
-                            clicked_move_up = Some(idx);
-                        }
-                    },
+                let bypass_marker = if entry.bypass { " [バイパス]" } else { "" };
+                ui.label(
+                    egui::RichText::new(format!("  {}. {}{}", i + 1, name, bypass_marker))
+                        .small(),
                 );
-            });
-        }
-    }
-
-    if let Some(idx) = clicked_remove {
-        state.settings.vst3_plugins.remove(idx);
-    }
-    if let Some(idx) = clicked_move_up {
-        if idx > 0 {
-            state.settings.vst3_plugins.swap(idx, idx - 1);
-        }
-    }
-    if let Some(idx) = clicked_move_down {
-        if idx + 1 < state.settings.vst3_plugins.len() {
-            state.settings.vst3_plugins.swap(idx, idx + 1);
-        }
-    }
-
-    ui.add_space(8.0);
-
-    // ── プラグイン追加 ──
-    let chain_full = state.settings.vst3_plugins.len() >= MAX_CHAIN_LEN;
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!chain_full, egui::Button::new("プラグインを追加…"))
-            .on_hover_text(if chain_full {
-                "チェーンが上限に達しています (最大 10 個)".to_string()
-            } else {
-                "プラグイン候補からチェーンに追加".to_string()
-            })
-            .clicked()
-        {
-            state.vst3_picker_open = !state.vst3_picker_open;
-        }
-        if ui
-            .button(if state.vst3_discovered.is_empty() {
-                "スキャン"
-            } else {
-                "再スキャン"
-            })
-            .on_hover_text(
-                "%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査して .vst3 を列挙",
-            )
-            .clicked()
-        {
-            state.vst3_discovered =
-                crate::video::dsp::scan(&crate::video::dsp::default_vst3_paths());
-        }
-        if !state.vst3_discovered.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("({} 個検出)", state.vst3_discovered.len()))
-                    .weak()
-                    .small(),
-            );
-        }
-    });
-
-    // ── 候補ピッカー (展開トグル) ──
-    if state.vst3_picker_open {
-        ui.add_space(4.0);
-        if state.vst3_discovered.is_empty() {
-            ui.label(
-                egui::RichText::new("スキャンを実行してください。")
-                    .weak()
-                    .small(),
-            );
-        } else {
-            ui.horizontal(|ui| {
-                ui.label("検索:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.vst3_picker_filter)
-                        .hint_text("プラグイン名…")
-                        .desired_width(f32::INFINITY),
-                );
-            });
-            let filter_lower = state.vst3_picker_filter.to_ascii_lowercase();
-            let mut clicked_add: Option<String> = None;
-            // チェーンに既にあるパスを除外する
-            let existing: std::collections::HashSet<String> = state
-                .settings
-                .vst3_plugins
-                .iter()
-                .map(|e| e.path.clone())
-                .collect();
-            egui::ScrollArea::vertical()
-                .id_salt("vst3-pref-picker-scroll")
-                .max_height(180.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for plugin in &state.vst3_discovered {
-                        let path_s = plugin.path.to_string_lossy().to_string();
-                        if existing.contains(&path_s) {
-                            continue;
-                        }
-                        if !filter_lower.is_empty()
-                            && !plugin
-                                .display_name
-                                .to_ascii_lowercase()
-                                .contains(&filter_lower)
-                        {
-                            continue;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(&plugin.display_name)
-                                    .min_size(egui::vec2(ui.available_width(), 0.0)),
-                            )
-                            .on_hover_text(&path_s)
-                            .clicked()
-                        {
-                            clicked_add = Some(path_s);
-                        }
-                    }
-                });
-            if let Some(path) = clicked_add {
-                if state.settings.vst3_plugins.len() < MAX_CHAIN_LEN {
-                    state.settings.vst3_plugins.push(Vst3PluginEntry {
-                        path,
-                        bypass: false,
-                        state: None,
-                    });
-                }
             }
         }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "チェーンの編集 (追加・削除・並べ替え) は動画再生中にホバーバーの\n\
+                 VST ボタンを押し、パネルの「チェーン編集…」から行います。",
+            )
+            .small()
+            .weak(),
+        );
     }
 }
 
-#[cfg(not(windows))]
-fn page_vst3_chain_editor(_ui: &mut egui::Ui, _state: &mut PreferencesState) {}
 
 fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;

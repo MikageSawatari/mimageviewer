@@ -44,6 +44,7 @@ impl App {
         let mut clicked_show_gui: Option<usize> = None;
         let mut clicked_hide_gui: Option<usize> = None;
         let mut clicked_toggle_bypass: Option<(usize, bool)> = None;
+        let mut clicked_open_editor = false;
 
         let bridge = self.dsp_bridge.clone();
         let state = bridge.state();
@@ -221,11 +222,17 @@ impl App {
             }
 
             ui.separator();
-            ui.label(
-                egui::RichText::new("チェーン編集は 環境設定→動画")
-                    .small()
-                    .color(egui::Color32::from_rgb(160, 160, 160)),
-            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button("チェーン編集…")
+                    .on_hover_text(
+                        "プラグインを追加・並べ替え・削除する編集ダイアログを開きます。",
+                    )
+                    .clicked()
+                {
+                    clicked_open_editor = true;
+                }
+            });
         });
 
         // ── ボタンクリック処理 (Window closure 外で実行 = self の借用解放後) ──
@@ -250,6 +257,9 @@ impl App {
         if let Some(compact) = clicked_video_size {
             self.settings.vst3_video_compact = compact;
             self.settings.save();
+        }
+        if clicked_open_editor {
+            self.show_vst3_chain_editor = true;
         }
 
         self.show_vst3_manager = open;
