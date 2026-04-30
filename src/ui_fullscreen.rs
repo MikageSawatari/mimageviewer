@@ -5249,8 +5249,11 @@ impl App {
             .back()
             .map(|(_, _, _, b)| *b)
             .unwrap_or(0);
+        // ラベルは "frame 到着間隔のばらつき (= jitter)" を示すと意味付け。
+        // 平均値は wall rate と一致するのが正常で、max が target を超えるほど
+        // pipeline の変動が大きい。
         let header = format!(
-            "{:.1}fps ({:.1}ms)  avg {:.1}ms  max {:.1}ms  skip:{}  buf:{}/{}",
+            "target {:.1}fps ({:.1}ms)  jitter avg {:.1}ms / max {:.1}ms  skip:{}  buf:{}/{}",
             1000.0 / expected_ms,
             expected_ms,
             avg,
