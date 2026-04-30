@@ -18,7 +18,7 @@
 //!   stub (= TODO Phase 3b で channel 配線を行うときに発火する)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::clock::{ClockAnchor, MasterClock};
@@ -91,7 +91,23 @@ pub struct EngineActor {
 
     /// 現在の seek 世代。`handle_seek_request` でのみ +1 する。
     /// `SeekCompleted` / `enter_buffering` では進めない。
-    current_seek_epoch: SeekEpoch,
+    ///
+    /// `Arc<AtomicU64>` で `AvClock` と **同一インスタンスを共有** する
+    /// (= 旧版は AvClock と別カウンタを持っていたが、Codex P2 で「呼び出し順を
+    /// 間違えると二重 ++」バグが発生したため、構造的に統合)。
+    /// `handle_seek_request` は **adaptive** に動作する:
+    ///   - 共有カウンタが `last_observed_serial` より進んでいる
+    ///     (= `clock.request_seek` で既に bump 済) → 値を観測するだけで bump しない
+    ///   - 進んでいない (= 内部経路、loop replay 等) → fetch_add で bump し、
+    ///     `clock.request_seek` 経由で SeekRequest を decoder に publish する
+    seek_serial: Arc<AtomicU64>,
+    /// `clock.request_seek` の publish 用。内部 seek (loop replay / EOF replay /
+    /// resume) では `seek_serial` を bump した後、ここ経由で decoder に SeekRequest を
+    /// 流す必要がある。
+    av_clock: Arc<crate::video::clock::AvClock>,
+    /// 直近の `handle_seek_request` 呼び出しで観測したカウンタ値。次回呼び出しが
+    /// 「外部 path (= 既に bump 済)」か「内部 path (= 自分が bump すべき)」を判定する。
+    last_observed_serial: SeekEpoch,
 
     /// readiness latch (Buffering → Playing 遷移用)。
     latch: ReadinessLatch,
@@ -120,22 +136,33 @@ pub mod state_code {
 
 #[allow(dead_code)]
 impl EngineActor {
-    /// 新規 actor を構築 (Idle 状態)。実 spawn は Phase 3 で `run` を別 thread で
-    /// 走らせる想定。
-    pub fn new(opts: OpenOptions) -> Self {
+    /// 新規 actor を構築 (Idle 状態)。
+    ///
+    /// `seek_serial` は `AvClock` と共有する `Arc<AtomicU64>`。`av_clock` は内部 seek
+    /// (loop replay / EOF replay / resume) で SeekRequest を decoder に publish する
+    /// 経路として使う。両方とも `VideoPlayer::open` で組み立てた同じインスタンスへの
+    /// `Arc::clone` を渡す。
+    pub fn new(
+        opts: OpenOptions,
+        seek_serial: Arc<AtomicU64>,
+        av_clock: Arc<crate::video::clock::AvClock>,
+    ) -> Self {
         let clock = MasterClock::with_anchor(ClockAnchor::frozen_at(
             opts.resume_secs.unwrap_or(0.0),
         ));
+        let initial_serial = seek_serial.load(Ordering::Acquire);
         Self {
             clock,
             state: EngineState::Idle,
             published_state: Arc::new(AtomicU8::new(state_code::IDLE)),
             duration_secs: None,
             has_audio: false,
-            current_seek_epoch: 0,
-            latch: ReadinessLatch::new(0),
+            seek_serial,
+            av_clock,
+            last_observed_serial: initial_serial,
+            latch: ReadinessLatch::new(initial_serial),
             last_audio_pts: f64::NEG_INFINITY,
-            last_audio_epoch: 0,
+            last_audio_epoch: initial_serial,
             opts,
         }
     }
@@ -167,8 +194,9 @@ impl EngineActor {
 
     /// 現在の seek 世代を返す。VideoPlayer::tick が「FirstFrameReady を新世代で
     /// 再発火するか」判定するために観察する用途 (Phase 3c)。
+    /// 共有 `Arc<AtomicU64>` を `Acquire` で読む。
     pub fn current_seek_epoch(&self) -> SeekEpoch {
-        self.current_seek_epoch
+        self.seek_serial.load(Ordering::Acquire)
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -184,7 +212,7 @@ impl EngineActor {
             "transition_to_playing requires non-Frozen anchor"
         );
         self.last_audio_pts = anchor.pts_secs;
-        self.last_audio_epoch = self.current_seek_epoch;
+        self.last_audio_epoch = self.current_seek_epoch();
         self.clock.set_anchor(anchor);
         self.state = EngineState::Playing;
         self.published_state
@@ -206,7 +234,7 @@ impl EngineActor {
     /// 非 seek 経路で再 buffering する場合に、前回 ready 済みの latch が残ったまま
     /// 即 Playing に戻る race を防ぐ。
     fn transition_to_buffering(&mut self, pts: f64) {
-        self.latch = ReadinessLatch::new(self.current_seek_epoch);
+        self.latch = ReadinessLatch::new(self.current_seek_epoch());
         self.clock.set_anchor(ClockAnchor::frozen_at(pts));
         self.state = EngineState::Buffering;
         self.published_state
@@ -349,21 +377,36 @@ impl EngineActor {
         }
     }
 
-    /// epoch++ + latch reset + Seeking 遷移 + (将来) decoder への SeekTo 命令。
-    /// **epoch++ はこの関数の中だけ** で行う (設計 v4 P1)。
-    /// `pub` (Phase 3d で VideoPlayer の seek/seek_relative/toggle_play から呼ぶ、
-    /// Phase 4 で apply_command 経由の channel に置き換え予定)。
+    /// シーク要求を受けて state を Seeking に遷移させる。**adaptive bump**:
+    /// - 共有カウンタが `last_observed_serial` より進んでいる場合 (= 外部経路、
+    ///   `clock.request_seek` で既に bump 済) → 観測のみで bump しない。
+    ///   decoder には `clock.request_seek` 経路で既に SeekRequest が publish 済。
+    /// - 進んでいない場合 (= 内部経路、loop replay / EOF replay / resume) →
+    ///   `av_clock.request_seek(target)` を呼び、それが内部で fetch_add(1) して
+    ///   SeekRequest を decoder に publish する。本関数は state 更新だけを担当。
+    ///
+    /// この設計で **「双方が独立に bump する」古い API パターン (= Codex P2 の二重 ++
+    /// バグ源)** を構造的に排除した。caller は `mod.rs::seek` 系で従来通り
+    /// `clock.request_seek` → `engine.handle_seek_request` の順に呼べばよい。
+    /// `pub` (mod.rs から呼ぶ、Phase 4 で apply_command 経由 channel に置き換え予定)。
     pub fn handle_seek_request(&mut self, target_secs: f64) {
         let target = if let Some(d) = self.duration_secs {
             target_secs.clamp(0.0, d)
         } else {
             target_secs.max(0.0)
         };
-        self.current_seek_epoch = self.current_seek_epoch.saturating_add(1);
-        self.latch = ReadinessLatch::new(self.current_seek_epoch);
+        let observed = self.seek_serial.load(Ordering::Acquire);
+        if observed <= self.last_observed_serial {
+            // 内部経路: 自分で bump して clock 経由で decoder に publish。
+            // av_clock.request_seek が fetch_add(1) → SeekRequest を Mutex に push し、
+            // decoder の `take_seek_request` で消費される。
+            self.av_clock.request_seek(target);
+        }
+        // どちらの経路でも、ここで最新値を読む (= bump 後の値)。
+        let new_epoch = self.seek_serial.load(Ordering::Acquire);
+        self.last_observed_serial = new_epoch;
+        self.latch = ReadinessLatch::new(new_epoch);
         self.transition_to_seeking(target);
-        // 注: 実際の decoder への SeekTo 送出は Phase 3b で配線する。
-        // EngineActor 自身は state machine と clock 管理に専念。
     }
 
     /// decoder event 処理。
@@ -403,7 +446,7 @@ impl EngineActor {
                 self.transition_to_buffering(0.0);
             }
             DecoderEvent::SeekCompleted { epoch, actual_pts } => {
-                if epoch < self.current_seek_epoch {
+                if epoch < self.current_seek_epoch() {
                     return;
                 }
                 // Seeking → Buffering (preroll、READY を待つ)
@@ -411,7 +454,7 @@ impl EngineActor {
                 self.transition_to_buffering(actual_pts);
             }
             DecoderEvent::FirstFrameReady { epoch, pts } => {
-                if epoch < self.current_seek_epoch {
+                if epoch < self.current_seek_epoch() {
                     return;
                 }
                 if epoch > self.latch.epoch {
@@ -426,7 +469,7 @@ impl EngineActor {
                 epoch,
                 duration_secs,
             } => {
-                if epoch < self.current_seek_epoch {
+                if epoch < self.current_seek_epoch() {
                     return;
                 }
                 if self.opts.loop_enabled {
@@ -452,7 +495,7 @@ impl EngineActor {
     pub fn handle_audio_event(&mut self, ev: AudioEvent) {
         match ev {
             AudioEvent::AudioRendered { epoch, pts, wall_now } => {
-                if epoch < self.current_seek_epoch {
+                if epoch < self.current_seek_epoch() {
                     return;
                 }
                 // monotonic guard と anchor 更新は **Playing 中のみ** 行う。
@@ -475,7 +518,7 @@ impl EngineActor {
                 self.clock.set_anchor(ClockAnchor::audio(pts, wall_now));
             }
             AudioEvent::BufferReady { epoch, pts, wall_now } => {
-                if epoch < self.current_seek_epoch {
+                if epoch < self.current_seek_epoch() {
                     return;
                 }
                 if epoch > self.latch.epoch {
@@ -486,7 +529,7 @@ impl EngineActor {
                 self.try_transition_from_buffering();
             }
             AudioEvent::BufferStarved { epoch } => {
-                if epoch < self.current_seek_epoch {
+                if epoch < self.current_seek_epoch() {
                     return;
                 }
                 // Playing 中で audio が枯渇したら Buffering に戻して再 preroll。
@@ -545,9 +588,21 @@ const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 1.0;
 mod tests {
     use super::*;
     use super::super::clock::ClockSource;
+    use crate::video::clock::AvClock;
+
+    /// テスト用 EngineActor 構築ヘルパ。
+    /// 共有 `seek_serial` と `AvClock` を組み立てる (= 本番の `VideoPlayer::open` と
+    /// 同じ依存関係)。テストでは `seek_serial` を test 内から直接観察したい場合があるが、
+    /// `actor.current_seek_epoch()` (= `seek_serial.load()`) で同等に読める。
+    fn fresh_actor_with_opts(opts: OpenOptions) -> EngineActor {
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let initial_volume = opts.initial_volume;
+        let av_clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+        EngineActor::new(opts, seek_serial, av_clock)
+    }
 
     fn fresh_actor() -> EngineActor {
-        EngineActor::new(OpenOptions::default())
+        fresh_actor_with_opts(OpenOptions::default())
     }
 
     #[test]
@@ -555,7 +610,7 @@ mod tests {
         let a = fresh_actor();
         assert_eq!(a.state, EngineState::Idle);
         assert_eq!(a.published_state_code(), state_code::IDLE);
-        assert_eq!(a.current_seek_epoch, 0);
+        assert_eq!(a.current_seek_epoch(), 0);
         assert!((a.clock().now_secs() - 0.0).abs() < 1e-9);
         assert_eq!(a.clock().anchor().source, ClockSource::Frozen);
     }
@@ -566,23 +621,23 @@ mod tests {
             resume_secs: Some(42.5),
             ..Default::default()
         };
-        let a = EngineActor::new(opts);
+        let a = fresh_actor_with_opts(opts);
         assert!((a.clock().now_secs() - 42.5).abs() < 1e-9);
     }
 
     #[test]
     fn handle_seek_request_advances_epoch_once() {
         let mut a = fresh_actor();
-        assert_eq!(a.current_seek_epoch, 0);
+        assert_eq!(a.current_seek_epoch(), 0);
         a.handle_seek_request(10.0);
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
         assert_eq!(a.state, EngineState::Seeking { target_secs: 10.0 });
         assert_eq!(a.latch.epoch, 1);
         // anchor は target で frozen
         assert!((a.clock().now_secs() - 10.0).abs() < 1e-9);
 
         a.handle_seek_request(20.0);
-        assert_eq!(a.current_seek_epoch, 2);
+        assert_eq!(a.current_seek_epoch(), 2);
         assert_eq!(a.latch.epoch, 2);
         assert_eq!(a.state, EngineState::Seeking { target_secs: 20.0 });
     }
@@ -612,7 +667,7 @@ mod tests {
         let mut a = fresh_actor();
         a.handle_seek_request(3.0); // epoch=1
         a.transition_to_buffering(3.5);
-        assert_eq!(a.current_seek_epoch, 1, "Buffering must not advance epoch");
+        assert_eq!(a.current_seek_epoch(), 1, "Buffering must not advance epoch");
         assert_eq!(a.state, EngineState::Buffering);
         assert_eq!(a.published_state_code(), state_code::BUFFERING);
     }
@@ -650,7 +705,7 @@ mod tests {
 
     #[test]
     fn try_transition_paused_when_autoplay_disabled() {
-        let mut a = EngineActor::new(OpenOptions {
+        let mut a = fresh_actor_with_opts(OpenOptions {
             autoplay: false,
             ..Default::default()
         });
@@ -729,7 +784,7 @@ mod tests {
     // ──────────────────────────────────────────────────────────────
 
     fn fresh_with_resume(secs: f64, autoplay: bool) -> EngineActor {
-        EngineActor::new(OpenOptions {
+        fresh_actor_with_opts(OpenOptions {
             resume_secs: Some(secs),
             autoplay,
             ..Default::default()
@@ -795,7 +850,7 @@ mod tests {
         });
         // resume が消費されて Seeking に遷移
         assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
 
         // SeekCompleted で Buffering に
         a.handle_decoder_event(DecoderEvent::SeekCompleted {
@@ -825,7 +880,7 @@ mod tests {
         });
         // resume=28 > duration=30 - 5 (= END_GUARD) → 末尾近くなので無視 → 通常 Buffering
         assert_eq!(a.state, EngineState::Buffering);
-        assert_eq!(a.current_seek_epoch, 0, "no seek consumed");
+        assert_eq!(a.current_seek_epoch(), 0, "no seek consumed");
     }
 
     #[test]
@@ -839,7 +894,7 @@ mod tests {
         });
         // resume=0.5 < MIN(1.0) → 無視 → 通常 Buffering
         assert_eq!(a.state, EngineState::Buffering);
-        assert_eq!(a.current_seek_epoch, 0);
+        assert_eq!(a.current_seek_epoch(), 0);
     }
 
     #[test]
@@ -853,7 +908,7 @@ mod tests {
         });
         // ユーザーが手動 seek
         a.handle_seek_request(10.0);
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
 
         // 古い epoch=0 の FirstFrameReady が遅れて届く → 無視されるべき
         a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
@@ -1017,7 +1072,7 @@ mod tests {
 
     #[test]
     fn play_during_buffering_sets_autoplay_true() {
-        let mut a = EngineActor::new(OpenOptions {
+        let mut a = fresh_actor_with_opts(OpenOptions {
             autoplay: false,
             ..Default::default()
         });
@@ -1074,7 +1129,7 @@ mod tests {
 
     #[test]
     fn eof_with_loop_enabled_seeks_to_zero() {
-        let mut a = EngineActor::new(OpenOptions {
+        let mut a = fresh_actor_with_opts(OpenOptions {
             loop_enabled: true,
             ..Default::default()
         });
@@ -1090,7 +1145,7 @@ mod tests {
             duration_secs: 30.0,
         });
         assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
     }
 
     #[test]
@@ -1242,7 +1297,7 @@ mod tests {
         a.begin_loading();
         // info 到着前に user seek (epoch++)
         a.apply_command(TransportCommand::SeekAbsolute { target_secs: 5.0 });
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
         assert_eq!(a.state, EngineState::Seeking { target_secs: 5.0 });
 
         // 古い epoch=0 の InfoReceived が遅れて届く → state 遷移はしないが
@@ -1297,14 +1352,14 @@ mod tests {
 
         // handle_seek_request で epoch=1 / state=Seeking に
         a.handle_seek_request(10.0);
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
         assert_eq!(a.state, EngineState::Seeking { target_secs: 10.0 });
         let opts_autoplay_before = a.opts.autoplay;
 
         // apply_command(Play) → handle_play は Seeking arm を通る
         a.apply_command(TransportCommand::Play);
         assert_eq!(
-            a.current_seek_epoch, 1,
+            a.current_seek_epoch(), 1,
             "epoch must not advance — Seeking arm only sets autoplay"
         );
         assert_eq!(a.state, EngineState::Seeking { target_secs: 10.0 });
@@ -1333,12 +1388,12 @@ mod tests {
             duration_secs: 30.0,
         });
         assert_eq!(a.state, EngineState::Eof);
-        assert_eq!(a.current_seek_epoch, 0);
+        assert_eq!(a.current_seek_epoch(), 0);
 
         a.apply_command(TransportCommand::Play);
         // 内部で handle_seek_request(0.0) が呼ばれて epoch=1
         assert_eq!(
-            a.current_seek_epoch, 1,
+            a.current_seek_epoch(), 1,
             "Eof + Play は handle_seek_request(0.0) を内部呼びして epoch++ する"
         );
         assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
@@ -1354,7 +1409,7 @@ mod tests {
             let mut a = fresh_actor();
             a.handle_seek_request(5.0);
             a.apply_command(TransportCommand::Play);
-            assert_eq!(a.current_seek_epoch, 1, "Idle: epoch=1");
+            assert_eq!(a.current_seek_epoch(), 1, "Idle: epoch=1");
         }
         // ケース 2: Loading
         {
@@ -1362,7 +1417,7 @@ mod tests {
             a.begin_loading();
             a.handle_seek_request(5.0);
             a.apply_command(TransportCommand::Play);
-            assert_eq!(a.current_seek_epoch, 1, "Loading: epoch=1");
+            assert_eq!(a.current_seek_epoch(), 1, "Loading: epoch=1");
         }
         // ケース 3: Paused (Playing 経由)
         {
@@ -1378,7 +1433,7 @@ mod tests {
             assert_eq!(a.state, EngineState::Paused);
             a.handle_seek_request(10.0);
             a.apply_command(TransportCommand::Play);
-            assert_eq!(a.current_seek_epoch, 1, "Paused: epoch=1");
+            assert_eq!(a.current_seek_epoch(), 1, "Paused: epoch=1");
         }
         // ケース 4: Eof
         {
@@ -1396,12 +1451,12 @@ mod tests {
             });
             // 正しい順: handle_seek_request → apply_command(Play)
             a.handle_seek_request(0.0);
-            assert_eq!(a.current_seek_epoch, 1);
+            assert_eq!(a.current_seek_epoch(), 1);
             assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
             a.apply_command(TransportCommand::Play);
             // handle_play が Seeking arm を通って autoplay=true セットのみ → epoch=1 維持
             assert_eq!(
-                a.current_seek_epoch, 1,
+                a.current_seek_epoch(), 1,
                 "Eof: handle_seek_request → apply_command(Play) の順なら epoch=1"
             );
         }
@@ -1419,7 +1474,7 @@ mod tests {
         });
         for i in 1..=5 {
             a.handle_seek_request(i as f64 * 10.0);
-            assert_eq!(a.current_seek_epoch, i, "after seek #{i}");
+            assert_eq!(a.current_seek_epoch(), i, "after seek #{i}");
             assert_eq!(a.latch.epoch, i, "latch epoch must follow current_seek_epoch");
         }
     }
@@ -1439,7 +1494,7 @@ mod tests {
         });
         // 新世代に
         a.handle_seek_request(15.0);
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
 
         // 古い epoch=0 の BufferReady → 捨てられる
         a.handle_audio_event(AudioEvent::BufferReady {
@@ -1489,7 +1544,7 @@ mod tests {
     /// は二重 epoch++ で SeekCompleted が drop され Playing に行けなかった。
     #[test]
     fn loop_replay_reaches_playing_after_eof() {
-        let mut a = EngineActor::new(OpenOptions {
+        let mut a = fresh_actor_with_opts(OpenOptions {
             loop_enabled: true,
             ..Default::default()
         });
@@ -1507,7 +1562,7 @@ mod tests {
             duration_secs: 30.0,
         });
         assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
 
         // decoder からの SeekCompleted{epoch=1} → Buffering
         a.handle_decoder_event(DecoderEvent::SeekCompleted {
@@ -1546,11 +1601,11 @@ mod tests {
 
         // 正しい順: handle_seek_request(15.0) → apply_command(Play)
         a.handle_seek_request(15.0);
-        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.current_seek_epoch(), 1);
         assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
         a.apply_command(TransportCommand::Play);
         // handle_play が Seeking arm を通る → epoch++ なし、state そのまま
-        assert_eq!(a.current_seek_epoch, 1, "no double-increment");
+        assert_eq!(a.current_seek_epoch(), 1, "no double-increment");
         assert_eq!(
             a.state,
             EngineState::Seeking { target_secs: 15.0 },

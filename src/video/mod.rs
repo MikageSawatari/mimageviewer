@@ -182,12 +182,19 @@ impl VideoPlayer {
         if let Err(e) = ffmpeg_loader::init() {
             // open 失敗時の dummy engine (Idle のまま)。実 decoder は起きないので、
             // begin_loading は呼ばない (= Phase 3+ で resume 適用も走らない)。
-            let engine = Arc::new(Mutex::new(EngineActor::new(OpenOptions {
-                initial_volume,
-                autoplay,
-                resume_secs,
-                ..Default::default()
-            })));
+            // 共有 seek_serial を 1 個作り、AvClock と EngineActor 双方に clone を渡す。
+            let seek_serial = Arc::new(AtomicU64::new(0));
+            let dummy_clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+            let engine = Arc::new(Mutex::new(EngineActor::new(
+                OpenOptions {
+                    initial_volume,
+                    autoplay,
+                    resume_secs,
+                    ..Default::default()
+                },
+                seek_serial,
+                dummy_clock.clone(),
+            )));
             let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(64);
             // FFmpeg 初期化失敗時の dummy: engine state は IDLE で固定。
             let engine_state_atomic = Arc::new(AtomicU8::new(
@@ -195,7 +202,7 @@ impl VideoPlayer {
             ));
             return Self {
                 path,
-                clock: Arc::new(AvClock::new(initial_volume)),
+                clock: dummy_clock,
                 engine,
                 engine_state_atomic,
                 engine_event_tx,
@@ -227,7 +234,11 @@ impl VideoPlayer {
         let (engine_event_tx, engine_event_rx) =
             crossbeam_channel::bounded::<EngineEvent>(64);
 
-        let clock = Arc::new(AvClock::new(initial_volume));
+        // 共有 seek 世代カウンタを 1 個生成し、AvClock と EngineActor の両方に clone を
+        // 渡す。これで両者の seek 世代が構造的に常に一致する (= 旧版の「2 つのカウンタを
+        // 規律で同期」設計を撤去)。詳細は EngineActor.seek_serial の doc コメント参照。
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
         let cancel = Arc::new(AtomicBool::new(false));
 
         // EngineActor 構築。Phase 3b 時点では `engine` は `tick`/`apply_command` から
@@ -240,7 +251,11 @@ impl VideoPlayer {
             loop_enabled: false, // VideoPlayer 側で個別管理 (Phase 3+ で統合予定)
             hw_decode,
         };
-        let engine = Arc::new(Mutex::new(EngineActor::new(opts)));
+        let engine = Arc::new(Mutex::new(EngineActor::new(
+            opts,
+            seek_serial,
+            clock.clone(),
+        )));
         // begin_loading() を decoder::spawn の **前** に呼ぶ。これにより decoder
         // thread が起動した瞬間から `engine_state_handle` を `Loading` で観察できる
         // (= Idle を一瞬観察する race を排除する)。

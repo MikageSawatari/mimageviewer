@@ -38,7 +38,7 @@
 //!
 //! 詳細は [docs/video-engine-redesign.md] の「Phase 4」節を参照。
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -82,7 +82,12 @@ pub struct AvClock {
     /// 音声 RT コールバック (`fill_output`) と UI の `tick` がポーリングで読むので
     /// atomic で公開する。Mutex を取らずに「自分が処理中の世代より新しい seek が
     /// 走ったか」だけ見れる。
-    seek_serial: AtomicU64,
+    ///
+    /// `Arc<AtomicU64>` で `EngineActor` と **同一インスタンスを共有** する
+    /// (= 旧版は AvClock と EngineActor がそれぞれ別カウンタを持ち、`mod.rs::seek`
+    /// 系の caller が両方を bump する規律で同期していたが、規律違反で二重 ++ する
+    /// バグ (Codex P2) があったため、構造的に共有化した)。
+    seek_serial: Arc<AtomicU64>,
     /// **シーク中の表示位置 override** (秒、f64 bits、SEEK_NONE = 無効)。
     /// 設定中は `now_secs()` が audio_pts ではなく target を返し続け、UI のフリッカ
     /// (target → target+ε → target に戻る) を防ぐ。fill_output / UI tick が
@@ -170,7 +175,9 @@ fn log_clear_result(
 }
 
 impl AvClock {
-    pub fn new(initial_volume: f64) -> Self {
+    /// `seek_serial` は `EngineActor` と共有する `Arc<AtomicU64>`。
+    /// 構築側 (`VideoPlayer::open`) が 1 個作って両方に clone を渡す。
+    pub fn new(initial_volume: f64, seek_serial: Arc<AtomicU64>) -> Self {
         // 初期 anchor は (pts=0.0、wall=now、Frozen)。
         // playing=false / audio_active=false の間は now_secs() が anchor PTS を
         // そのまま返す挙動を再現するため、Frozen で開始するのが等価。
@@ -180,7 +187,7 @@ impl AvClock {
             master_clock,
             playing: AtomicBool::new(false),
             seek_request: Mutex::new(None),
-            seek_serial: AtomicU64::new(0),
+            seek_serial,
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
             audio_bookkeeping: AudioBookkeeping::new(),
