@@ -398,11 +398,35 @@ impl VideoPlayer {
             g.handle_seek_request(0.0);
             return;
         }
-        self.clock.set_playing(!self.clock.is_playing());
+        // Phase 9.C (2026-04-30): engine state machine も pause/play 同期する。
+        // 旧コードは clock.is_playing flag だけ更新していたため、engine state は
+        // Playing のまま固定で、perf overlay の warmup 区間表示にも反映されず、
+        // EngineState::parks_decoder() が立たないので decoder 側の pause-park 経路と
+        // 食い違っていた。
+        let new_playing = !self.clock.is_playing();
+        self.clock.set_playing(new_playing);
+        let mut g = self.engine.lock().unwrap();
+        g.apply_command(if new_playing {
+            engine::actor::TransportCommand::Play
+        } else {
+            engine::actor::TransportCommand::Pause
+        });
     }
 
     pub fn set_playing(&self, p: bool) {
+        let prev = self.clock.is_playing();
         self.clock.set_playing(p);
+        // Phase 9.C: engine 状態も同期。set_playing は外部 API なので呼び出し元が
+        // 既に engine.apply_command を呼んでいるケースがあるが、apply_command は
+        // idempotent (= 既に Playing で Play を受けても no-op) なので安全。
+        if prev != p {
+            let mut g = self.engine.lock().unwrap();
+            g.apply_command(if p {
+                engine::actor::TransportCommand::Play
+            } else {
+                engine::actor::TransportCommand::Pause
+            });
+        }
     }
 
     /// 絶対シーク (シークバークリック等)。`direction = 0` で `..target` のキーフレーム

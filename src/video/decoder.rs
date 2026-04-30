@@ -1054,7 +1054,22 @@ fn run_video_decode(
                             const AUDIO_CRITICAL_LO: f64 = 0.08;
                             let mut in_audio_escape = false;
                             let mut new_seek_pending = false;
-                            while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                            // Phase 9.C (2026-04-30): pause-park。旧コードは
+                            // `while !cancel && clock.is_playing()` で pause 時に loop が
+                            // 抜けて try_send に落ち、decoder が HW デコード上限速度で
+                            // バーストして video_tx (cap=24) を溢れさせていた
+                            // (実測: 261 dropped_full / セッション)。
+                            // 修正: pause 時は loop を抜けず 50ms sleep で park。
+                            // resume 時は次の iteration で `clock.is_playing()=true` に
+                            // なり pacing checks が再開する。
+                            loop {
+                                if cancel.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                if !clock.is_playing() {
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    continue;
+                                }
                                 if clock.current_seek_serial() != current_seek_serial {
                                     new_seek_pending = true;
                                     break;
@@ -1288,7 +1303,15 @@ fn run_video_decode(
             const AUDIO_CRITICAL_LO: f64 = 0.08;
             let mut in_audio_escape = false;
             let mut new_seek_pending = false;
-            while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+            // Phase 9.C: pause-park (詳細は GPU 経路の同コメント参照)。
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                if !clock.is_playing() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
                 if clock.current_seek_serial() != current_seek_serial {
                     new_seek_pending = true;
                     break;
