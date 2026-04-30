@@ -323,26 +323,34 @@ fn fill_output(
         return;
     }
 
-    // ── Warmup gate (Phase 9.B、2026-04-30 追加) ──
+    // ── Warmup gate (Phase 9.B、Phase 9.E で範囲縮小) ──
     //
-    // 動画 open / シーク直後、engine state が `Buffering` (= まだ readiness latch が
-    // 揃っていない期間) の間は **音声出力を silence にして PTS を進めない**。
-    // これにより future_frames のプリフィルと UI 表示 pace の同期が取れる:
+    // Phase 9.B: 動画 open 直後、cpal stream の起動時に複数 callback が短時間で
+    // 連続発火 (= pre-fill burst) し、各 callback が `next_pts_secs` を 1 buffer 分
+    // (10ms) ずつ進めるため anchor.pts が wall の 2-3x 速で前進する問題があった。
+    // これを engine_state ≠ Playing の間 silence にして抑止していた。
     //
-    // - 旧挙動: notify_seek_completed が anchor を Audio source で書く → cpal callback
-    //   で set_audio_pts が anchor.pts を 1x wall で進める → UI tick が
-    //   "現在 pace_now" に追いついた frames を **複数まとめて** display 経路に流す
-    //   → GPU 早期 return 経路で dropped_past が発生 (= perf overlay の赤縦線)。
-    // - 新挙動: Buffering 中は cpal を silence にして anchor.pts を凍結 → UI が
-    //   常に target 位置の frame だけを display → engine が Playing に遷移したら
-    //   anchor を進め始める → 1 frame/tick で滑らかに消費。
+    // Phase 9.E (2026-04-30 fixup): silence の範囲を **LOADING のみ** に縮小。
+    // Buffering (= 通常 seek 直後) では drain を許可する:
     //
-    // Buffering の典型的な持続時間は 100-200ms (= audio buffer が READY_THRESHOLD
-    // に到達するまで)。この間ユーザーは brief な silence を聞くが、シーク直後の
-    // 体感としては自然 (= 音声デバイスのレイテンシと同程度)。
-    let engine_playing = engine_state.load(std::sync::atomic::Ordering::Acquire)
-        == crate::video::engine::actor::state_code::PLAYING;
-    if !engine_playing {
+    // - LOADING 経路: 動画 open 直後、cpal stream 初期化中。pre-fill burst の
+    //   主因がここなので silence 維持が必要。
+    // - BUFFERING 経路: seek 後の readiness 待ち。cpal stream は既に稼働中で
+    //   pre-fill burst は起きない。silence にすると:
+    //   1. AudioBuffer がドレインされず満杯
+    //   2. pump が backpressure → audio_tx (32) full → audio decode が send block
+    //   3. audio_pkt_tx (64) full → demux が send block
+    //   4. demux が新 packet 読まず take_seek_request 走らない
+    //   5. **forward seek の 1 枚目が永久に届かない deadlock** (Codex 解析で特定)
+    //
+    // pre-fill burst による pace_now drift は Phase 9.A の wall-rate cap
+    // (= `set_audio_pts` で anchor pts 進行を wall 進行に制限) で十分カバー済。
+    // 二重対策だった Phase 9.B の Buffering 範囲を撤回しても drift は再発しない。
+    let engine_st = engine_state.load(std::sync::atomic::Ordering::Acquire);
+    let in_loading_warmup =
+        engine_st == crate::video::engine::actor::state_code::LOADING
+            || engine_st == crate::video::engine::actor::state_code::IDLE;
+    if in_loading_warmup {
         out.fill(0.0);
         // bookkeeping は通常通り実施 (= pump からの publish との race を避ける)。
         publish_buffer_secs(&buf, clock);

@@ -1117,13 +1117,23 @@ fn run_video_decode(
                                     std::thread::sleep(std::time::Duration::from_millis(5));
                                     continue;
                                 }
+                                // Phase 9.E (2026-04-30 fixup): post-seek 1 枚目は
+                                // **audio_buf に関係なく必ず送出** (= override clear に必須)。
+                                // 旧コード (Phase 8.F-9.D) は seek_burst 全体を
+                                // `audio_buf < AUDIO_SAFE_HI` で gate していたが、forward
+                                // seek (= avformat が target 後の keyframe に着地) で
+                                // ahead が 0.5-2 秒になり、かつ audio buffer が満杯
+                                // (= 一時停止後など) のとき、`!post_seek_frame_sent` 経路が
+                                // 発火せず 1 枚目が送出できない → override が永久残留 →
+                                // deadlock。Codex 解析で特定。
+                                if clock.is_seeking() && !post_seek_frame_sent {
+                                    break;
+                                }
                                 if clock.is_seeking()
                                     && !in_audio_escape
                                     && audio_buf < AUDIO_SAFE_HI
                                 {
-                                    if !post_seek_frame_sent
-                                        || ahead < SEEK_BURST_LEAD_MAX_SECS
-                                    {
+                                    if ahead < SEEK_BURST_LEAD_MAX_SECS {
                                         break;
                                     }
                                     if audio_active && audio_buf < AUDIO_SAFE_LO {
@@ -1368,8 +1378,13 @@ fn run_video_decode(
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 }
+                // Phase 9.E: post-seek 1 枚目は audio_buf 不問で必ず送出
+                // (詳細は GPU 経路の同コメント参照、forward seek deadlock 修正)。
+                if clock.is_seeking() && !post_seek_frame_sent {
+                    break;
+                }
                 if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
-                    if !post_seek_frame_sent || ahead < SEEK_BURST_LEAD_MAX_SECS {
+                    if ahead < SEEK_BURST_LEAD_MAX_SECS {
                         break;
                     }
                     if audio_active && audio_buf < AUDIO_SAFE_LO {

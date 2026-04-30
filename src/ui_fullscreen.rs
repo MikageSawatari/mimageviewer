@@ -5330,15 +5330,45 @@ impl App {
         // (= 16-33ms 間隔) に discrete に進むだけで stair-step がカクついていた。
         const WINDOW_SECS: f32 = 6.0;
         let px_per_sec = graph.width() / WINDOW_SECS;
-        let now = std::time::Instant::now();
+        // Phase 9.E (2026-04-30): 一時停止中はグラフのスクロールを止める。
+        // 旧挙動: `now = Instant::now()` を毎 frame 計算するため、pause 中も時間が
+        // 進み、サンプルは左に流れて画面外に消える (= ユーザー要望「pause 中は perf
+        // graph を止めたほうがよい」)。
+        // 新挙動: paused なら最新サンプルの arrival 時刻を `now` として使う。
+        // これで `now - latest_arrival = 0` で latest が右端に固定、過去 sample も
+        // arrival との差分で配置が固定される。
+        let is_paused = self
+            .fullscreen_idx
+            .and_then(|idx| match self.fs_cache.get(&idx) {
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => Some(
+                    player.engine_state_code()
+                        == crate::video::engine::actor::state_code::PAUSED,
+                ),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let now = if is_paused {
+            self.video_perf_history
+                .back()
+                .map(|(_, arr, _, _, _)| *arr)
+                .unwrap_or_else(std::time::Instant::now)
+        } else {
+            std::time::Instant::now()
+        };
         let x_for = |arrival: std::time::Instant| -> f32 {
             let dt = now.saturating_duration_since(arrival).as_secs_f32();
             graph.max.x - dt * px_per_sec
         };
 
         // 連続描画のために repaint を ~16ms (= 60Hz) で予約。
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(16));
+        // ただし pause 中は再描画しても画面は変わらないので 1Hz に落として
+        // CPU を節約 (= ユーザーが resume したら次の frame 到着で repaint される)。
+        let repaint_interval = if is_paused {
+            std::time::Duration::from_millis(1000)
+        } else {
+            std::time::Duration::from_millis(16)
+        };
+        ui.ctx().request_repaint_after(repaint_interval);
 
         // graph 矩形外にはみ出さないよう painter を clip。
         let painter = painter.with_clip_rect(graph);
