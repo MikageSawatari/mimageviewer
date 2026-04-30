@@ -384,6 +384,12 @@ impl VideoPlayer {
         self.clock.is_playing()
     }
 
+    /// Phase 9.G: シーク中 (= override 設定中、UI が post-seek 1 枚目を表示する前) か。
+    /// perf overlay の graph freeze 判定に使う。
+    pub fn is_seeking(&self) -> bool {
+        self.clock.is_seeking()
+    }
+
     pub fn toggle_play(&self) {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。

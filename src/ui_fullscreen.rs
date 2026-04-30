@@ -5129,36 +5129,53 @@ impl App {
                 let state = player.engine_state_code();
                 let is_warmup =
                     state != crate::video::engine::actor::state_code::PLAYING;
-                let is_paused =
-                    state == crate::video::engine::actor::state_code::PAUSED;
+                // Phase 9.G: graph freeze 判定 = pause OR seeking。
+                // - PAUSED: ユーザー一時停止中
+                // - is_seeking() (= override active、demux が seek 処理中で
+                //   post-seek 1 枚目が UI に届くまで): 「黒い空間」を防ぐ
+                let is_paused_or_seeking = state
+                    == crate::video::engine::actor::state_code::PAUSED
+                    || player.is_seeking();
                 Some((
                     player.displayed_frame_seq(),
                     player.skipped_frame_count(),
                     player.pending_frames(),
                     expected_ms,
                     is_warmup,
-                    is_paused,
+                    is_paused_or_seeking,
                 ))
             }
             _ => None,
         };
-        let Some((cur_seq, cur_skip, cur_buf, expected_ms, is_warmup, is_paused)) = snapshot
+        let Some((cur_seq, cur_skip, cur_buf, expected_ms, is_warmup, is_freeze)) = snapshot
         else {
             return;
         };
-        // Phase 9.F: pause→resume 検出 + history の arrival shift。
-        // pause 中は graph を凍結したいので draw 側で `now` を最新 arrival で固定
-        // しているが、resume 時に Instant::now() に切り替わると graph が一気に
-        // 進んで「ジャンプ」する。pause 期間分だけ history の arrival を未来へ
-        // 進めて、視覚位置をそのままに保つ。
+        // Phase 9.F/G: freeze→resume 検出 + history の arrival shift。
+        //
+        // freeze の対象:
+        //   - 一時停止 (engine state == PAUSED): ユーザー操作
+        //   - シーク処理中 (clock.is_seeking() = override 設定中): demux が seek
+        //     を処理して post-seek 1 枚目が UI に届くまでの「黒い空間」期間
+        //
+        // freeze 中は perf graph の `now` を最新 arrival で固定しているが、
+        // resume 時に Instant::now() に切り替わると graph が一気に進んで「ジャンプ」
+        // する。freeze 期間分だけ history の arrival を未来へ進めて、視覚位置を
+        // そのままに保つ。さらに freeze 中は新規サンプル収集も停止 (= seek 処理中の
+        // 「黒い空間」を生まない、ユーザー要望)。
         let now_real = std::time::Instant::now();
-        match (self.video_perf_pause_start, is_paused) {
+        match (self.video_perf_pause_start, is_freeze) {
             (None, true) => {
-                // playing → paused: pause start を記録
+                // playing → freeze: 開始時刻を記録、以降のサンプル収集は停止
                 self.video_perf_pause_start = Some(now_real);
+                return;
+            }
+            (Some(_), true) => {
+                // freeze 継続中: サンプル収集停止
+                return;
             }
             (Some(pause_start), false) => {
-                // paused → playing: pause 期間分の offset を計算して history を shift
+                // freeze → playing: 期間分 offset を計算して history を shift
                 let pause_dur = now_real.saturating_duration_since(pause_start);
                 if pause_dur > std::time::Duration::from_millis(10) {
                     for entry in self.video_perf_history.iter_mut() {
@@ -5361,24 +5378,25 @@ impl App {
         // (= 16-33ms 間隔) に discrete に進むだけで stair-step がカクついていた。
         const WINDOW_SECS: f32 = 6.0;
         let px_per_sec = graph.width() / WINDOW_SECS;
-        // Phase 9.E (2026-04-30): 一時停止中はグラフのスクロールを止める。
-        // 旧挙動: `now = Instant::now()` を毎 frame 計算するため、pause 中も時間が
-        // 進み、サンプルは左に流れて画面外に消える (= ユーザー要望「pause 中は perf
-        // graph を止めたほうがよい」)。
-        // 新挙動: paused なら最新サンプルの arrival 時刻を `now` として使う。
-        // これで `now - latest_arrival = 0` で latest が右端に固定、過去 sample も
-        // arrival との差分で配置が固定される。
-        let is_paused = self
+        // Phase 9.E/G: 一時停止 / シーク処理中はグラフのスクロールを止める。
+        // 旧挙動: `now = Instant::now()` を毎 frame 計算するため、pause / seek 中も
+        // 時間が進み、サンプルは左に流れて画面外に消える + seek 後に「黒い空間」が
+        // できる。
+        // 新挙動: pause/seek 中は最新サンプルの arrival 時刻を `now` として使い、
+        // graph を凍結。post-seek 1 枚目が来た時点で再開すると同時に history の
+        // arrival を freeze 期間分 shift してジャンプを抑止 (sample_video_perf 側)。
+        let is_freeze = self
             .fullscreen_idx
             .and_then(|idx| match self.fs_cache.get(&idx) {
                 Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => Some(
                     player.engine_state_code()
-                        == crate::video::engine::actor::state_code::PAUSED,
+                        == crate::video::engine::actor::state_code::PAUSED
+                        || player.is_seeking(),
                 ),
                 _ => None,
             })
             .unwrap_or(false);
-        let now = if is_paused {
+        let now = if is_freeze {
             self.video_perf_history
                 .back()
                 .map(|(_, arr, _, _, _)| *arr)
@@ -5392,9 +5410,9 @@ impl App {
         };
 
         // 連続描画のために repaint を ~16ms (= 60Hz) で予約。
-        // ただし pause 中は再描画しても画面は変わらないので 1Hz に落として
-        // CPU を節約 (= ユーザーが resume したら次の frame 到着で repaint される)。
-        let repaint_interval = if is_paused {
+        // ただし freeze 中 (= pause / seek) は再描画しても画面は変わらないので
+        // 1Hz に落として CPU 節約。
+        let repaint_interval = if is_freeze {
             std::time::Duration::from_millis(1000)
         } else {
             std::time::Duration::from_millis(16)
