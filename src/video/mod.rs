@@ -72,8 +72,9 @@ pub struct VideoPlayer {
     /// info を取り出した直後に発火し、以降は false で抑止する。
     info_event_emitted: bool,
     /// `FirstFrameReady` を engine に 1 度だけ流すためのフラグ (= 現 epoch 内)。
-    /// `notify_seek_completed` 経路 (= seek 後再 buffering) では engine 側で
-    /// epoch++ するので、tick 側では「engine.current_seek_epoch を読み取って
+    /// 共有 `seek_serial` が新世代に進む (= 外部 `clock.request_seek` または engine
+    /// 内部経路の `av_clock.request_seek` 経由) と engine の latch が reset されるので、
+    /// tick 側では「engine.current_seek_epoch() (= seek_serial.load()) を読み取って
     /// 自分の last_seen_epoch と比べる」方式で再発火する。
     first_frame_event_last_epoch: Option<engine::state::SeekEpoch>,
     /// 表示したフレーム数の累積カウンタ。tick で latest_renderable を採用するたびに
@@ -606,11 +607,13 @@ impl VideoPlayer {
                                 && !near_end
                             {
                                 self.clock.request_seek(resume);
-                                // engine の epoch も同時に進めて AvClock と同期。
-                                // pre-info user seek 経路でズレるリスクは
-                                // pending_resume_secs.take() の他に経路がないので、
-                                // ここで二重 seek を許容しても重複 epoch++ 1 回分の
-                                // 副作用のみで害はない。
+                                // 共有 seek_serial は clock.request_seek で 1 回 bump。
+                                // 続く engine.handle_seek_request は adaptive ロジックで
+                                // 「外部 bump 検知」となり、自身は bump せず state 更新のみ。
+                                // engine の InfoReceived ハンドラ内 resume 経路と二重に
+                                // 走ったとしても、後発側は observed (= bump 後) と
+                                // last_observed_serial (= 進行済) で外部判定 → 余計な
+                                // bump を避ける構造になっている。
                                 //
                                 // **意図的に apply_command(Play) は呼ばない**:
                                 // open-time の resume は user 操作ではなく自動復元

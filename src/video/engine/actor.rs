@@ -7,10 +7,14 @@
 //! - `handle_decoder_event` / `handle_audio_event` の full 実装
 //! - `try_transition_from_buffering` を全 readiness event 経路から呼ぶ
 //! - 状態遷移は必ず helper 経由 (= anchor → state の Release publish 順)
-//! - epoch++ は `handle_seek_request` の **1 箇所のみ**
 //!
-//! ## 不変条件
-//! - `current_seek_epoch` のインクリメントは `handle_seek_request` の **1 箇所のみ**
+//! ## 不変条件 (counter consolidation 反映後)
+//! - **共有 `seek_serial` の bump は 1 論理 seek につき 1 回のみ**:
+//!   - 外部経路 (mod.rs::seek 系): `AvClock::request_seek` で bump → SeekRequest publish
+//!     → 続く `EngineActor::handle_seek_request` は **bump せず** state 更新のみ。
+//!   - 内部経路 (engine 内 EofReached/InfoReceived arms 等): `EngineActor::handle_seek_request`
+//!     が `av_clock.request_seek` を呼んで bump + publish + state 更新を一括実施。
+//!   - `last_observed_serial` で「直前 caller が外部 bump 済か」を adaptive に判定。
 //! - `set_anchor` は EngineActor 経由でしか呼ばない (= MasterClock の `pub(crate)` で
 //!   facade 期間中暫定、Phase 4 で `pub(super)` に戻す)
 //! - state 遷移は必ず `transition_to_*` helper を経由 (= anchor → state の順)
@@ -89,8 +93,8 @@ pub struct EngineActor {
     duration_secs: Option<f64>,
     has_audio: bool,
 
-    /// 現在の seek 世代。`handle_seek_request` でのみ +1 する。
-    /// `SeekCompleted` / `enter_buffering` では進めない。
+    /// 現在の seek 世代。`AvClock::request_seek` で bump され、`SeekCompleted` /
+    /// `enter_buffering` では進めない。
     ///
     /// `Arc<AtomicU64>` で `AvClock` と **同一インスタンスを共有** する
     /// (= 旧版は AvClock と別カウンタを持っていたが、Codex P2 で「呼び出し順を
@@ -1646,5 +1650,97 @@ mod tests {
             pts: 28.5,
         });
         assert_eq!(a.state, EngineState::Playing);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Counter consolidation 反映後の追加 invariant テスト (Codex P3 提案)
+    // ──────────────────────────────────────────────────────────────
+
+    /// 外部経路 (= 先に `clock.request_seek` で bump 済) で engine.handle_seek_request
+    /// を呼んだとき、共有 seek_serial が **二重 bump にならない** ことを保証する。
+    /// counter consolidation の核心 invariant — 旧版の Codex P2 バグ (epoch 2 進む) の
+    /// 構造的修正がきっちり機能しているかを直接的に検証する。
+    #[test]
+    fn external_clock_bump_then_engine_handle_does_not_bump_again() {
+        // fresh_actor_with_opts は seek_serial と AvClock を組み立てる helper。
+        // ここでは clock を直接呼べるよう、AvClock を共有して保持する。
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let av_clock = Arc::new(AvClock::new(0.6, seek_serial.clone()));
+        let mut a = EngineActor::new(
+            OpenOptions::default(),
+            seek_serial.clone(),
+            av_clock.clone(),
+        );
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 60.0,
+            has_audio: false,
+        });
+        // 初期状態: counter=0
+        assert_eq!(seek_serial.load(Ordering::Acquire), 0);
+
+        // 外部経路: clock.request_seek が +1 → SeekRequest を publish
+        av_clock.request_seek(15.0);
+        assert_eq!(
+            seek_serial.load(Ordering::Acquire),
+            1,
+            "clock.request_seek bumps shared counter"
+        );
+
+        // 続いて engine.handle_seek_request を呼ぶ — 既に外部 bump 済なので
+        // adaptive ロジックが external 検知 → 自身は bump しない
+        a.handle_seek_request(15.0);
+        assert_eq!(
+            seek_serial.load(Ordering::Acquire),
+            1,
+            "engine.handle_seek_request must NOT bump again (= adaptive external path)"
+        );
+        assert_eq!(a.current_seek_epoch(), 1);
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
+    }
+
+    /// 内部経路 (= 直前に clock.request_seek が呼ばれていない) で
+    /// engine.handle_seek_request を呼んだとき、共有 seek_serial が **+1** され、かつ
+    /// `AvClock::take_seek_request` で SeekRequest が **decoder に届く** ことを保証する。
+    /// counter consolidation で engine が internal seek 経路で publish の責務を
+    /// 取ったことの直接的な検証。
+    #[test]
+    fn internal_engine_seek_publishes_seek_request_via_av_clock() {
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let av_clock = Arc::new(AvClock::new(0.6, seek_serial.clone()));
+        let mut a = EngineActor::new(
+            OpenOptions::default(),
+            seek_serial.clone(),
+            av_clock.clone(),
+        );
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 60.0,
+            has_audio: false,
+        });
+        assert_eq!(seek_serial.load(Ordering::Acquire), 0);
+
+        // 内部経路: clock.request_seek を経由せず、いきなり engine 側を呼ぶ
+        // (= 実コードでは EofReached + loop / InfoReceived + resume / handle_play Eof
+        //  arm からこのパターンで呼ばれる)
+        a.handle_seek_request(20.0);
+        assert_eq!(
+            seek_serial.load(Ordering::Acquire),
+            1,
+            "internal seek must bump shared counter via av_clock.request_seek"
+        );
+
+        // SeekRequest が decoder に publish 済 (take_seek_request で取り出せる)
+        let req = av_clock
+            .take_seek_request()
+            .expect("internal seek must publish SeekRequest for decoder");
+        assert_eq!(req.serial, 1);
+        assert!(
+            (req.target_secs - 20.0).abs() < 1e-9,
+            "published target should match handle_seek_request arg"
+        );
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 20.0 });
     }
 }

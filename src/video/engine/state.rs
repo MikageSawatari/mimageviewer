@@ -135,7 +135,9 @@ pub enum AudioEvent {
 /// readiness latch (Buffering → Playing 遷移用)。
 ///
 /// 全 events は `SeekEpoch` を含み、stale (= `epoch < current_seek_epoch`) は捨てる。
-/// epoch++ は EngineActor の `handle_seek_request` の **1 箇所のみ** で行う。
+/// 1 論理 seek につき epoch (= 共有 `Arc<AtomicU64>`) を 1 回だけ bump する:
+/// 外部経路は `AvClock::request_seek`、engine 内部経路は
+/// `EngineActor::handle_seek_request` 経由で `av_clock.request_seek` をディスパッチする。
 /// SeekCompleted / Buffering 入場では epoch を進めない (= 既に進めた値を使う)。
 #[derive(Debug)]
 pub struct ReadinessLatch {
