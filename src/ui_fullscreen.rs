@@ -5118,7 +5118,7 @@ impl App {
     /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
     /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
-        let snapshot: Option<(u64, u64, usize, f32, bool)> = match self.fs_cache.get(&fs_idx) {
+        let snapshot: Option<(u64, u64, usize, f32, bool, bool)> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 let expected_ms = player
                     .info()
@@ -5126,21 +5126,52 @@ impl App {
                     .filter(|fps| *fps > 0.5 && fps.is_finite())
                     .map(|fps| 1000.0 / fps)
                     .unwrap_or(33.3);
-                let is_warmup = player.engine_state_code()
-                    != crate::video::engine::actor::state_code::PLAYING;
+                let state = player.engine_state_code();
+                let is_warmup =
+                    state != crate::video::engine::actor::state_code::PLAYING;
+                let is_paused =
+                    state == crate::video::engine::actor::state_code::PAUSED;
                 Some((
                     player.displayed_frame_seq(),
                     player.skipped_frame_count(),
                     player.pending_frames(),
                     expected_ms,
                     is_warmup,
+                    is_paused,
                 ))
             }
             _ => None,
         };
-        let Some((cur_seq, cur_skip, cur_buf, expected_ms, is_warmup)) = snapshot else {
+        let Some((cur_seq, cur_skip, cur_buf, expected_ms, is_warmup, is_paused)) = snapshot
+        else {
             return;
         };
+        // Phase 9.F: pause→resume 検出 + history の arrival shift。
+        // pause 中は graph を凍結したいので draw 側で `now` を最新 arrival で固定
+        // しているが、resume 時に Instant::now() に切り替わると graph が一気に
+        // 進んで「ジャンプ」する。pause 期間分だけ history の arrival を未来へ
+        // 進めて、視覚位置をそのままに保つ。
+        let now_real = std::time::Instant::now();
+        match (self.video_perf_pause_start, is_paused) {
+            (None, true) => {
+                // playing → paused: pause start を記録
+                self.video_perf_pause_start = Some(now_real);
+            }
+            (Some(pause_start), false) => {
+                // paused → playing: pause 期間分の offset を計算して history を shift
+                let pause_dur = now_real.saturating_duration_since(pause_start);
+                if pause_dur > std::time::Duration::from_millis(10) {
+                    for entry in self.video_perf_history.iter_mut() {
+                        entry.1 = entry.1 + pause_dur;
+                    }
+                    if let Some(prev) = self.video_perf_last_wall.as_mut() {
+                        *prev = *prev + pause_dur;
+                    }
+                }
+                self.video_perf_pause_start = None;
+            }
+            _ => {}
+        }
         if Some(cur_seq) != self.video_perf_last_seq {
             let now = std::time::Instant::now();
             if let (Some(prev_wall), Some(_), Some(prev_skip)) = (

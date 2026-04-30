@@ -1643,6 +1643,11 @@ pub struct App {
     /// 前回サンプリング時の skipped_frame_count (= decoder 側 dropped_full +
     /// UI 側 dropped_past の累積)。delta を per-sample で出して skip 検知に使う。
     pub(crate) video_perf_last_skip: Option<u64>,
+    /// Phase 9.F: 一時停止が開始された wall 時刻。Some の間は pause 中。
+    /// resume 時に (Instant::now - pause_start) を全 history の arrival に加算して
+    /// graph 表示位置を維持する (= ユーザー要望「pause→resume 時にグラフがジャンプ
+    /// しないようにしたい」を反映)。
+    pub(crate) video_perf_pause_start: Option<std::time::Instant>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2453,6 +2458,7 @@ impl Default for App {
             video_perf_last_wall: None,
             video_perf_last_seq: None,
             video_perf_last_skip: None,
+            video_perf_pause_start: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,

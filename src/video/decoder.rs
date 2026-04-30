@@ -716,23 +716,34 @@ fn run_decoder(
                 if ret >= 0 { Ok(()) } else { Err(ffmpeg::Error::from(ret)) }
             };
 
-            let mut seek_result = if direction > 0 {
-                input.seek(target_pts, target_pts..)
-            } else {
-                backward(&mut input)
-            };
-            // 前方で keyframe が target 以降に無い (≒ EOF 直前) → backward retry
-            if seek_result.is_err() && direction > 0 {
-                crate::logger::log(format!(
-                    "forward seek failed at {target_secs:.3}s, retry as backward"
-                ));
-                seek_result = backward(&mut input);
-            }
-            // direction=0 (絶対 seek) も backward 失敗時に forward retry する。
-            // retry を入れないと最終失敗時 drop_before_secs=None のまま decoder が
-            // 現在の demux 位置から流し、target 近傍フレームが永久に来ず override が
-            // 残留して pace_now=target に張り付く (Phase 8.B 修正前の症状)。
-            if seek_result.is_err() && direction == 0 {
+            // Phase 9.F (2026-04-30): direction に関係なく **常に backward+preroll** を
+            // 使う。旧コードは `direction > 0` (= 前方相対) で `input.seek(target..)`
+            // (= avformat_seek_file with min_ts=target、target 以降の keyframe に着地)
+            // を使い、preroll なしで「最寄り keyframe から再生」する設計だった。
+            //
+            // しかし forward seek は典型的な GOP (1-3 秒) で **target+0.5〜2 秒の
+            // keyframe** に着地し、video 1 枚目 pts >> target になる。一方 mp4 の
+            // 音声 packet 順は概ね pts 順なので、avformat 内部の read 位置が
+            // keyframe + audio になっていても、最初の audio packet pts は keyframe
+            // pts より少し前に出ることがある (= mp4 muxing で audio が video keyframe
+            // 直前に挟まれているケース)。
+            //
+            // 結果として transition_to_playing 時に anchor.pts (= audio_pts) が
+            // video frame pts より **数百 ms 〜数秒** 早くなり、UI tick の
+            // `pts <= now + lead_tol` 判定で video frame が future 扱いになって
+            // 表示が止まり、音声だけ進んで video が「早送りで追いつく」現象に
+            // (= ユーザー報告)。
+            //
+            // backward+preroll なら video/audio 両方が **target 直前の keyframe** で
+            // 始まり drop_before_secs で target にトリム → 確実に同位置で再生開始。
+            // GOP が長い動画では preroll decode のために 0.5〜3 秒余分にかかるが、
+            // SW デコードでも 30fps wall × 数秒 = ~100ms 程度の遅延に収まり実用上
+            // 問題ない。
+            let _ = direction; // 互換のため引数は残すが、実際は方向不問
+            let mut seek_result = backward(&mut input);
+            // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
+            // keyframe が無い場合)。
+            if seek_result.is_err() {
                 crate::logger::log(format!(
                     "backward seek failed at {target_secs:.3}s, retry as forward"
                 ));
