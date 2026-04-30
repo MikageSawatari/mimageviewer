@@ -925,9 +925,18 @@ impl App {
             self.request_tag_toggle_for_selection(&name);
         }
 
-        // VST3 プラグイン管理ボタンが押された
+        // VST3 プラグイン管理ボタンが押された:
+        // 管理パネル + 全プラグイン GUI を一斉トグル (= ホバーバーと同じ挙動)。
+        #[cfg(windows)]
         if toolbar_vst3_clicked {
-            self.show_vst3_manager = true;
+            let opening = !self.show_vst3_manager;
+            self.show_vst3_manager = opening;
+            self.dsp_bridge.set_all_guis_visible(opening);
+            self.settings.vst3_gui_visible = opening;
+        }
+        #[cfg(not(windows))]
+        if toolbar_vst3_clicked {
+            self.show_vst3_manager = !self.show_vst3_manager;
         }
 
         toolbar_fav_nav

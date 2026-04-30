@@ -42,27 +42,33 @@ impl App {
         let state = bridge.state();
         let slots = bridge.slots();
 
+        // 動画サイズ切替の初期値を読み取る (動画パネルのトグルで変化する)
+        let video_compact = self.settings.vst3_video_compact;
+        let mut clicked_video_size: Option<bool> = None;
+
+        // 旧コミット既定 720x540 はサイズが大きすぎる。チェーン編集と簡易スキャン
+        // に必要な最小限まで絞り、ユーザーがリサイズで広げられる構成にする。
         let initial_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
 
         egui::Window::new("VST3 プラグイン管理")
             .open(&mut open)
             .default_pos(initial_pos)
-            .default_width(720.0)
-            .default_height(540.0)
+            .default_width(360.0)
+            .default_height(380.0)
+            .min_width(280.0)
+            .min_height(220.0)
             .resizable(true)
             .show(ctx, |ui| {
-                // ── 状態表示 ──
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("状態:").strong());
-                    let label = match state {
-                        DspState::Disabled => "無効 (環境設定で有効化してください)",
-                        DspState::Enabled => "有効",
-                        DspState::Error(e) => return ui.label(format!("エラー: {e}")),
-                    };
-                    ui.label(label)
-                });
-                ui.add_space(4.0);
-
+                // ── 状態 + 動画サイズ切替 (1 行に集約) ──
+                if matches!(state, DspState::Error(_)) {
+                    if let DspState::Error(e) = state {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 90, 90),
+                            format!("エラー: {e}"),
+                        );
+                    }
+                    return;
+                }
                 if matches!(state, DspState::Disabled) {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 160, 60),
@@ -71,110 +77,146 @@ impl App {
                     return;
                 }
 
+                // ── 動画表示サイズトグル ──
+                // プラグイン GUI のためにスペースを空けたいユーザー向け。
+                // フル / 右上 1/4 の 2 段階。
+                ui.horizontal(|ui| {
+                    ui.label("動画:");
+                    let mut new_compact = video_compact;
+                    if ui
+                        .selectable_label(!new_compact, "フル")
+                        .on_hover_text("動画をフルスクリーン全体に表示する (= 既定)")
+                        .clicked()
+                    {
+                        new_compact = false;
+                    }
+                    if ui
+                        .selectable_label(new_compact, "右上 1/4")
+                        .on_hover_text(
+                            "動画を右上 1/4 に縮小し、左下 3/4 をプラグイン GUI 用に空ける。\n\
+                             プラグイン分析時の作業領域として使う。",
+                        )
+                        .clicked()
+                    {
+                        new_compact = true;
+                    }
+                    if new_compact != video_compact {
+                        clicked_video_size = Some(new_compact);
+                    }
+                });
+                ui.separator();
+
                 // ── プラグインチェーン (= 現在ロード中のスロット一覧) ──
                 ui.label(
-                    egui::RichText::new(format!(
-                        "プラグインチェーン ({} 個、上から順に音声を通します)",
-                        slots.len()
-                    ))
-                    .strong(),
+                    egui::RichText::new(format!("チェーン ({} 個)", slots.len())).strong(),
                 );
-                ui.add_space(4.0);
 
                 if slots.is_empty() {
-                    ui.label("チェーンは空です。下の候補リストから追加してください。");
+                    ui.label(egui::RichText::new("(空)").weak());
                 } else {
                     egui::ScrollArea::vertical()
                         .id_salt("vst3-chain-scroll")
-                        .max_height(200.0)
+                        .max_height(140.0)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for (idx, slot) in slots.iter().enumerate() {
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{}.", idx + 1));
-                                        let name = slot
-                                            .plugin_name
-                                            .as_deref()
-                                            .unwrap_or("(不明)");
-                                        let state_label = match slot.state {
-                                            SlotState::Loading => " (ロード中…)",
-                                            SlotState::Loaded => "",
-                                            SlotState::Error => " (エラー)",
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("{name}{state_label}"))
-                                                .strong(),
-                                        );
-                                    });
+                                ui.horizontal(|ui| {
+                                    // 番号
                                     ui.label(
-                                        egui::RichText::new(slot.plugin_path.as_str())
-                                            .small()
+                                        egui::RichText::new(format!("{}.", idx + 1))
                                             .weak(),
                                     );
-                                    ui.horizontal(|ui| {
-                                        let mut bypass = slot.bypass;
-                                        if ui
-                                            .checkbox(&mut bypass, "バイパス")
-                                            .on_hover_text(
-                                                "ON: このスロットをスキップ (= 音声をパススルー)。\n\
-                                                 ロードは維持される (再 ON で即座に効く)。",
-                                            )
-                                            .changed()
-                                        {
-                                            clicked_toggle_bypass = Some((idx, bypass));
-                                        }
-                                        ui.separator();
-                                        if slot.gui_hwnd != 0 {
-                                            if ui.button("GUI 閉じる").clicked() {
-                                                clicked_hide_gui = Some(idx);
+
+                                    // プラグイン名 (state を suffix)
+                                    let name = slot.plugin_name.as_deref().unwrap_or("(不明)");
+                                    let state_suffix = match slot.state {
+                                        SlotState::Loading => " (…)",
+                                        SlotState::Loaded => "",
+                                        SlotState::Error => " (エラー)",
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!("{name}{state_suffix}"))
+                                            .strong(),
+                                    )
+                                    .on_hover_text(slot.plugin_path.as_str());
+
+                                    // 右寄せでアクションボタン
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button("✕")
+                                                .on_hover_text("チェーンから削除")
+                                                .clicked()
+                                            {
+                                                clicked_remove = Some(idx);
                                             }
-                                        } else if ui.button("GUI 表示").clicked() {
-                                            clicked_show_gui = Some(idx);
-                                        }
-                                        ui.separator();
-                                        let up_enabled = idx > 0;
-                                        let down_enabled = idx + 1 < slots.len();
-                                        if ui
-                                            .add_enabled(up_enabled, egui::Button::new("↑"))
-                                            .clicked()
-                                        {
-                                            clicked_move_up = Some(idx);
-                                        }
-                                        if ui
-                                            .add_enabled(down_enabled, egui::Button::new("↓"))
-                                            .clicked()
-                                        {
-                                            clicked_move_down = Some(idx);
-                                        }
-                                        if ui
-                                            .button(
-                                                egui::RichText::new("削除")
-                                                    .color(egui::Color32::from_rgb(220, 90, 90)),
-                                            )
-                                            .clicked()
-                                        {
-                                            clicked_remove = Some(idx);
-                                        }
-                                    });
+                                            let down_enabled = idx + 1 < slots.len();
+                                            if ui
+                                                .add_enabled(
+                                                    down_enabled,
+                                                    egui::Button::new("↓").small(),
+                                                )
+                                                .on_hover_text("下へ")
+                                                .clicked()
+                                            {
+                                                clicked_move_down = Some(idx);
+                                            }
+                                            let up_enabled = idx > 0;
+                                            if ui
+                                                .add_enabled(
+                                                    up_enabled,
+                                                    egui::Button::new("↑").small(),
+                                                )
+                                                .on_hover_text("上へ")
+                                                .clicked()
+                                            {
+                                                clicked_move_up = Some(idx);
+                                            }
+                                            if slot.gui_hwnd != 0 {
+                                                if ui
+                                                    .small_button("GUI ✕")
+                                                    .on_hover_text("プラグイン GUI を閉じる")
+                                                    .clicked()
+                                                {
+                                                    clicked_hide_gui = Some(idx);
+                                                }
+                                            } else if ui
+                                                .small_button("GUI")
+                                                .on_hover_text("プラグイン GUI を表示")
+                                                .clicked()
+                                            {
+                                                clicked_show_gui = Some(idx);
+                                            }
+                                            let mut bypass = slot.bypass;
+                                            if ui
+                                                .checkbox(&mut bypass, "バイパス")
+                                                .on_hover_text(
+                                                    "ON: このスロットをスキップ (= 音声をパススルー)",
+                                                )
+                                                .changed()
+                                            {
+                                                clicked_toggle_bypass = Some((idx, bypass));
+                                            }
+                                        },
+                                    );
                                 });
                             }
                         });
                 }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
 
-                // ── プラグイン候補一覧 + 検索 ──
+                ui.separator();
+
+                // ── プラグイン追加 (検索 + 候補リスト) ──
                 ui.horizontal(|ui| {
                     if ui
-                        .button(if self.vst3_discovered.is_empty() {
-                            "プラグインをスキャン"
+                        .small_button(if self.vst3_discovered.is_empty() {
+                            "スキャン"
                         } else {
                             "再スキャン"
                         })
                         .on_hover_text(
-                            "%COMMONPROGRAMFILES%\\VST3\\ と %LOCALAPPDATA%\\Programs\\Common\\VST3\\\n\
-                             以下を再帰的に走査して .vst3 を列挙します。",
+                            "%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査して .vst3 を列挙",
                         )
                         .clicked()
                     {
@@ -183,22 +225,17 @@ impl App {
                     ui.add(
                         egui::TextEdit::singleline(&mut filter)
                             .hint_text("検索…")
-                            .desired_width(200.0),
+                            .desired_width(f32::INFINITY),
                     );
                 });
-                ui.add_space(4.0);
 
                 if self.vst3_discovered.is_empty() {
-                    ui.label("「プラグインをスキャン」ボタンを押してください。");
+                    ui.label(egui::RichText::new("(スキャン未実行)").weak().small());
                 } else {
-                    ui.label(format!(
-                        "{} 個の VST3 プラグインが見つかりました — クリックでチェーン末尾に追加",
-                        self.vst3_discovered.len()
-                    ));
                     let filter_lower = filter.to_ascii_lowercase();
                     egui::ScrollArea::vertical()
                         .id_salt("vst3-discovered-scroll")
-                        .max_height(220.0)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for plugin in &self.vst3_discovered {
                                 if !filter_lower.is_empty()
@@ -209,19 +246,20 @@ impl App {
                                 {
                                     continue;
                                 }
-                                ui.horizontal(|ui| {
-                                    if ui.button(&plugin.display_name).clicked() {
-                                        clicked_add =
-                                            Some(plugin.path.to_string_lossy().to_string());
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(
-                                            plugin.path.to_string_lossy().to_string(),
-                                        )
-                                        .small()
-                                        .weak(),
-                                    );
-                                });
+                                if ui
+                                    .add(
+                                        egui::Button::new(&plugin.display_name)
+                                            .min_size(egui::vec2(
+                                                ui.available_width(),
+                                                0.0,
+                                            )),
+                                    )
+                                    .on_hover_text(plugin.path.to_string_lossy())
+                                    .clicked()
+                                {
+                                    clicked_add =
+                                        Some(plugin.path.to_string_lossy().to_string());
+                                }
                             }
                         });
                 }
@@ -281,6 +319,10 @@ impl App {
                     self.settings.save();
                 }
             }
+        }
+        if let Some(compact) = clicked_video_size {
+            self.settings.vst3_video_compact = compact;
+            self.settings.save();
         }
         if let Some(path) = clicked_add {
             // settings 側に先に登録してから worker thread で実ロード

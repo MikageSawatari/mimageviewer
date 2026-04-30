@@ -874,6 +874,11 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+    /// 動画フルスクリーン再生中、動画を右上 1/4 に縮小表示する (= プラグイン作業領域確保用)。
+    /// false (= 既定): 動画はフルスクリーン全体を使う。
+    /// true: 動画を右上 1/4 (幅・高さ各 1/2 = 面積 1/4) に縮小、左下 3/4 はプラグイン GUI 用に空く。
+    #[serde(default)]
+    pub vst3_video_compact: bool,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -1153,6 +1158,7 @@ impl Default for Settings {
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
+            vst3_video_compact: false,
         }
     }
 }
@@ -1290,6 +1296,7 @@ impl Settings {
         self.vst3_plugin_path = src.vst3_plugin_path.take(); // legacy migration field
         self.vst3_plugin_state = src.vst3_plugin_state.take(); // legacy migration field
         self.vst3_gui_visible = src.vst3_gui_visible;
+        self.vst3_video_compact = src.vst3_video_compact;
     }
 
     pub fn save(&self) {

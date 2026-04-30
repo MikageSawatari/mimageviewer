@@ -366,24 +366,24 @@ impl DspBridge {
         bridge_arc
             .send(&Cmd::QueryGuiSize)
             .map_err(|e| format!("send QueryGuiSize: {e}"))?;
-        let (pref_w, pref_h) = match bridge_arc.recv() {
-            Ok(Event::GuiSize { width, height }) => (width, height),
+        let (pref_w, pref_h, resizable) = match bridge_arc.recv() {
+            Ok(Event::GuiSize { width, height, resizable }) => (width, height, resizable),
             Ok(other) => {
                 crate::logger::log(format!(
                     "vst3 query_gui_size: unexpected {other:?}, fallback 1200x800"
                 ));
-                (1200, 800)
+                (1200, 800, true)
             }
             Err(e) => {
                 crate::logger::log(format!("vst3 query_gui_size: {e}, fallback 1200x800"));
-                (1200, 800)
+                (1200, 800, true)
             }
         };
 
-        // ─ Step 2: ホストウィンドウを spawn ─
+        // ─ Step 2: ホストウィンドウを spawn (resizable に応じてサイズ変更可否を切替) ─
         let gui_host = gui::GuiHost::spawn();
         let reply = gui_host
-            .show(&plugin_name, pref_w, pref_h)
+            .show(&plugin_name, pref_w, pref_h, resizable)
             .map_err(|e| format!("create gui window: {e}"))?;
         if reply.hwnd_u64 == 0 {
             return Err("HWND not returned".to_string());

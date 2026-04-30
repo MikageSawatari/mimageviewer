@@ -540,6 +540,17 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// VST3 コンパクト表示モード時の動画表示領域 (= 右上 1/4 = 幅・高さ各 1/2)。
+/// 残った左下 3/4 は黒背景のままなのでプラグイン GUI ウィンドウを置きやすい。
+fn vst3_compact_image_rect(full_rect: egui::Rect) -> egui::Rect {
+    let half_w = full_rect.width() * 0.5;
+    let half_h = full_rect.height() * 0.5;
+    egui::Rect::from_min_max(
+        egui::pos2(full_rect.max.x - half_w, full_rect.min.y),
+        egui::pos2(full_rect.max.x, full_rect.min.y + half_h),
+    )
+}
+
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
@@ -843,8 +854,16 @@ impl App {
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
                         let adjustment_active = self.adjustment_mode;
+                        // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
+                        // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
+                        // ときは無視する (= プラグインで分析するのは動画なので)。
+                        let vst3_compact_active =
+                            cfg!(windows) && state.is_video && self.settings.vst3_enabled
+                                && self.settings.vst3_video_compact;
                         let image_rect = if analysis_active {
                             analysis_image_rect(full_rect)
+                        } else if vst3_compact_active {
+                            vst3_compact_image_rect(full_rect)
                         } else {
                             full_rect
                         };
@@ -1143,7 +1162,16 @@ impl App {
                                 let screen = ctx.content_rect().size();
                                 self.toggle_video_tile_mode(fs_idx, screen);
                             }
-                            // VST ボタンが押されたら管理パネルをトグル
+                            // VST ボタンが押されたら「管理パネル + 全プラグイン GUI」を一斉トグル。
+                            // workspace 全体を「VST3 を見る」「VST3 を畳む」の 2 状態に切り替える。
+                            #[cfg(windows)]
+                            if vst3_pressed {
+                                let opening = !self.show_vst3_manager;
+                                self.show_vst3_manager = opening;
+                                self.dsp_bridge.set_all_guis_visible(opening);
+                                self.settings.vst3_gui_visible = opening;
+                            }
+                            #[cfg(not(windows))]
                             if vst3_pressed {
                                 self.show_vst3_manager = !self.show_vst3_manager;
                             }

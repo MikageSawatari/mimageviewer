@@ -256,7 +256,7 @@ private:
             return true;
         }
         if (cmd == "query_gui_size") {
-            // プラグインの推奨 GUI サイズを scale 込みで取得して返す。
+            // プラグインの推奨 GUI サイズ + canResize 属性を scale 込みで取得して返す。
             // bridge プロセスは Per-Monitor v2 Aware なので GetDpiForSystem は
             // primary monitor の DPI (= ユーザー環境では 144 等) を返す。
             if (!loader_) {
@@ -266,13 +266,16 @@ private:
             UINT dpi = GetDpiForSystem();
             if (dpi == 0) dpi = 96;
             uint32_t w = 0, h = 0;
-            if (!loader_->query_gui_size_at_dpi(dpi, w, h)) {
+            bool resizable = false;
+            if (!loader_->query_gui_size_at_dpi(dpi, w, h, resizable)) {
                 send_event_error("query_gui_size: getSize failed");
                 return true;
             }
             std::string reply = "{\"event\":\"gui_size\",\"width\":" +
                                 std::to_string(w) + ",\"height\":" +
-                                std::to_string(h) + "}";
+                                std::to_string(h) +
+                                ",\"resizable\":" + (resizable ? "true" : "false") +
+                                "}";
             write_message(reply);
             return true;
         }

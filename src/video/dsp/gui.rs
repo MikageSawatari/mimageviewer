@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
     SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_SIZE, WNDCLASSEXW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -44,10 +44,14 @@ pub enum Cmd {
     /// close_signal_rx に値が来たらユーザーが × を押した = メインスレッドが
     /// bridge に `hide_gui` 送信 → このスレッドに `Close` を投げてウィンドウ破棄、
     /// の流れにする。
+    /// `resizable=false` ならウィンドウ枠を固定 (= WS_THICKFRAME 抜き) して
+    /// ユーザーがドラッグでリサイズしても無効になる (SSL Meter Pro 等の
+    /// canResize=false プラグイン用)。
     Show {
         title: String,
         width: u32,
         height: u32,
+        resizable: bool,
         reply: Sender<ShowReply>,
     },
     /// 既存ウィンドウを閉じる (= プラグイン側 `removed()` 完了後に呼ぶ)。
@@ -91,13 +95,20 @@ impl GuiHost {
         }
     }
 
-    pub fn show(&self, title: &str, width: u32, height: u32) -> std::io::Result<ShowReply> {
+    pub fn show(
+        &self,
+        title: &str,
+        width: u32,
+        height: u32,
+        resizable: bool,
+    ) -> std::io::Result<ShowReply> {
         let (tx, rx) = channel::<ShowReply>();
         self.cmd_tx
             .send(Cmd::Show {
                 title: title.to_string(),
                 width,
                 height,
+                resizable,
                 reply: tx,
             })
             .map_err(|_| std::io::Error::other("gui thread terminated"))?;
@@ -222,9 +233,10 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                 title,
                 width,
                 height,
+                resizable,
                 reply,
             } => {
-                let result = create_window(&title, width, height);
+                let result = create_window(&title, width, height, resizable);
                 match result {
                     Ok((hwnd_u64, close_rx, resize_rx, actual_w, actual_h, used_dpi)) => {
                         let _ = reply.send(ShowReply {
@@ -316,6 +328,7 @@ fn create_window(
     title: &str,
     width: u32,
     height: u32,
+    resizable: bool,
 ) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, u32, u32, u32)> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
@@ -331,16 +344,23 @@ fn create_window(
         //    既存登録はそのまま使えるので「既に登録済み」エラーは無視して継続する。
         let cursor = LoadCursorW(None, IDC_ARROW)
             .map_err(|e| std::io::Error::other(format!("LoadCursorW: {e}")))?;
+        // hbrBackground = NULL: 背景の自動消去 (= WM_ERASEBKGND の DefWindowProc
+        // による塗りつぶし) を無効化する。プラグインの子ウィンドウがクライアント
+        // 領域を完全に占めているので、親側で消去する必要がない。Insight2 等の
+        // リサイズ時に「親が一旦システム色で塗る → プラグインが描き直す」のチラつき
+        // (= flicker フレーム) を抑える効果がある。
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: Default::default(),
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance.into(),
             hCursor: cursor,
-            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszClassName: PCWSTR(class_w.as_ptr()),
             ..Default::default()
         };
+        // COLOR_WINDOW は将来 hbrBackground に戻す可能性のための保留 (現在未使用)。
+        let _ = COLOR_WINDOW;
         if RegisterClassExW(&class) == 0 {
             let err = std::io::Error::last_os_error();
             // ERROR_CLASS_ALREADY_EXISTS = 1410: 別スレッド・別 GuiHost 由来で既に
@@ -372,9 +392,21 @@ fn create_window(
         };
         let dpi = GetDpiForSystem();
         let ex_style = WS_EX_TOPMOST;
+        // ウィンドウスタイル:
+        // - WS_OVERLAPPEDWINDOW = OVERLAPPED|CAPTION|SYSMENU|THICKFRAME|MIN/MAXBOX
+        // - resizable=false の場合は WS_THICKFRAME (= リサイズ枠) を抜く。プラグインが
+        //   canResize() で false を返した (= SSL Meter Pro 等の固定サイズ表示) なら
+        //   ユーザーがドラッグしても外側ウィンドウが大きくならず、紛らわしい挙動を防ぐ。
+        // - WS_CLIPCHILDREN を追加: プラグイン子ウィンドウの領域は親が描画しない
+        //   設定。Insight2 のリサイズ時に親→子の上書きで起きる flicker フレーム
+        //   をさらに抑える効果がある。
+        let mut win_style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        if !resizable {
+            win_style &= !WS_THICKFRAME;
+        }
         let _ = AdjustWindowRectExForDpi(
             &mut rect,
-            WS_OVERLAPPEDWINDOW,
+            win_style,
             false,
             ex_style,
             dpi,
@@ -387,7 +419,7 @@ fn create_window(
             ex_style,
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
-            WS_OVERLAPPEDWINDOW,
+            win_style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             outer_w,

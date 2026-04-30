@@ -108,7 +108,14 @@ pub enum Event {
     GuiAttached { width: u32, height: u32 },
     GuiDetached,
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
-    GuiSize { width: u32, height: u32 },
+    /// `resizable` は IPlugView::canResize() の結果 (= ホスト側が WS_THICKFRAME を
+    /// 付けるかの判断に使う)。古い bridge との互換性のため `#[serde(default)]` で false。
+    GuiSize {
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        resizable: bool,
+    },
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
@@ -157,11 +164,24 @@ impl Bridge {
     where
         F: Fn(String) + Send + 'static,
     {
-        let mut child = Command::new(exe_path)
+        let mut command = Command::new(exe_path);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        // Windows で bridge が console subsystem (= stdin/stdout 必須なので window
+        // subsystem 化できない) で起動するときに、デフォルトでは黒い cmd ウィンドウが
+        // 一瞬チラついて表示される。`CREATE_NO_WINDOW (0x08000000)` を付けると
+        // コンソールが割り当てられず、ユーザー視点では完全にバックグラウンド処理になる。
+        // bridge は GUI スレッドで PeekMessage ループを回すので、コンソールが無くても
+        // プラグイン GUI は問題なく表示される。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn()?;
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");

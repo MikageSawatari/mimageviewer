@@ -356,9 +356,10 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
     return true;
 }
 
-bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out) {
+bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
+                                          bool& resizable_out) {
     // 一時 view を作り、指定 DPI の scale を伝えてから getSize → 破棄。
-    // ホストウィンドウを作る前に正しいサイズを知るためのクエリ用。
+    // ホストウィンドウを作る前に正しいサイズと resizable 属性を知るためのクエリ用。
     if (!controller_) return false;
     auto v = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
     if (!v) return false;
@@ -376,6 +377,10 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
     if (w <= 0 || h <= 0) return false;
     width_out = static_cast<uint32_t>(w);
     height_out = static_cast<uint32_t>(h);
+    // canResize は IPlugView 規約: kResultTrue = サイズ変更可、kResultFalse = 不可。
+    // SSL Meter Pro 等の固定サイズ プラグインは false を返すので、ホスト側で
+    // WS_THICKFRAME を外して外側ウィンドウのリサイズ自体を禁止する。
+    resizable_out = (v->canResize() == Steinberg::kResultTrue);
     return true;
 }
 

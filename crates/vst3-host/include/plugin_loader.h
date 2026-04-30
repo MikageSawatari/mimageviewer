@@ -73,7 +73,10 @@ public:
 
     /// 指定 DPI で setContentScaleFactor してからプラグイン推奨サイズを取得する。
     /// ホストウィンドウを作る前のサイズクエリ用 (一時 view を使い捨て)。
-    bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out);
+    /// `resizable_out` には IPlugView::canResize() の結果を返す (= ホストが外側
+    /// ウィンドウのリサイズ枠を出すかの判断材料)。
+    bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
+                                bool& resizable_out);
     /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
     bool show_gui(void* hwnd, std::string& error_out);
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
