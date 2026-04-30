@@ -1059,14 +1059,24 @@ fn run_video_decode(
                             // 抜けて try_send に落ち、decoder が HW デコード上限速度で
                             // バーストして video_tx (cap=24) を溢れさせていた
                             // (実測: 261 dropped_full / セッション)。
-                            // 修正: pause 時は loop を抜けず 50ms sleep で park。
-                            // resume 時は次の iteration で `clock.is_playing()=true` に
-                            // なり pacing checks が再開する。
+                            //
+                            // Phase 9.D (2026-04-30 fixup): park 条件を
+                            // `engine_state in [PAUSED, EOF]` に変更。
+                            // 旧 9.C 版は `!clock.is_playing()` で park していたが、
+                            // 動画 open 直後 (= autoplay=false で Loading 状態) も
+                            // is_playing()=false で park してしまい、post-seek frame が
+                            // 生成されず「動画を準備中…」のまま停止する regression があった。
+                            // EngineState::parks_decoder() が true を返す state
+                            // (= Paused/Eof) のみで park、Loading/Buffering/Seeking 中は
+                            // pacing logic に進む (= pace_lead=0 で 1 frame ずつ処理)。
                             loop {
                                 if cancel.load(Ordering::Acquire) {
                                     break;
                                 }
-                                if !clock.is_playing() {
+                                let engine_st = engine_state.load(Ordering::Acquire);
+                                if engine_st == crate::video::engine::actor::state_code::PAUSED
+                                    || engine_st == crate::video::engine::actor::state_code::EOF
+                                {
                                     std::thread::sleep(std::time::Duration::from_millis(50));
                                     continue;
                                 }
@@ -1076,8 +1086,25 @@ fn run_video_decode(
                                 }
                                 let audio_buf = clock.total_audio_buffer_secs();
                                 let audio_active = clock.is_audio_active();
-                                let engine_playing = engine_state.load(Ordering::Acquire)
+                                // Phase 9.D (2026-04-30): Buffering 中も PACE_LEAD で
+                                // lookahead を許可する。旧 (Phase 9.C 以前): pace_lead=0
+                                // で 1 frame ずつ生産して engine が Buffering→Playing に
+                                // 遷移するまで stall していたため、Playing 遷移時に
+                                // future_frames がほぼ空 → UI 消費に追いつかず frame
+                                // batching → silent dropped_past。
+                                //
+                                // 新挙動: Buffering でも 0.30s の lookahead を許可
+                                // (= 60fps で 18 frames、30fps で 9 frames)。pace_now は
+                                // Frozen のまま (= clock 進行なし)、ahead が PACE_LEAD に
+                                // 達するまで decoder は frame を生産。これにより
+                                // Buffering→Playing 遷移時には buffer がほぼ満杯
+                                // (ユーザー要望: 「バッファが半分まで埋まったら開始」)。
+                                let engine_st = engine_state.load(Ordering::Acquire);
+                                let engine_playing = engine_st
                                     == crate::video::engine::actor::state_code::PLAYING;
+                                let allow_pace_lead = engine_playing
+                                    || engine_st
+                                        == crate::video::engine::actor::state_code::BUFFERING;
                                 if audio_active {
                                     if audio_buf < AUDIO_SAFE_LO {
                                         in_audio_escape = true;
@@ -1103,7 +1130,7 @@ fn run_video_decode(
                                         break;
                                     }
                                 }
-                                let pace_lead = if engine_playing {
+                                let pace_lead = if allow_pace_lead {
                                     PACE_LEAD_SECS
                                 } else {
                                     0.0
@@ -1303,12 +1330,15 @@ fn run_video_decode(
             const AUDIO_CRITICAL_LO: f64 = 0.08;
             let mut in_audio_escape = false;
             let mut new_seek_pending = false;
-            // Phase 9.C: pause-park (詳細は GPU 経路の同コメント参照)。
+            // Phase 9.C/D: pause-park (詳細は GPU 経路の同コメント参照)。
             loop {
                 if cancel.load(Ordering::Acquire) {
                     break;
                 }
-                if !clock.is_playing() {
+                let engine_st = engine_state.load(Ordering::Acquire);
+                if engine_st == crate::video::engine::actor::state_code::PAUSED
+                    || engine_st == crate::video::engine::actor::state_code::EOF
+                {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
@@ -1318,8 +1348,14 @@ fn run_video_decode(
                 }
                 let audio_buf = clock.total_audio_buffer_secs();
                 let audio_active = clock.is_audio_active();
-                let engine_playing = engine_state.load(Ordering::Acquire)
+                // Phase 9.D (2026-04-30): Buffering 中も PACE_LEAD で lookahead 許可
+                // (詳細は GPU 経路の同コメント参照)。
+                let engine_st_inner = engine_state.load(Ordering::Acquire);
+                let engine_playing = engine_st_inner
                     == crate::video::engine::actor::state_code::PLAYING;
+                let allow_pace_lead = engine_playing
+                    || engine_st_inner
+                        == crate::video::engine::actor::state_code::BUFFERING;
                 if audio_active {
                     if audio_buf < AUDIO_SAFE_LO {
                         in_audio_escape = true;
@@ -1340,7 +1376,7 @@ fn run_video_decode(
                         break;
                     }
                 }
-                let pace_lead = if engine_playing { PACE_LEAD_SECS } else { 0.0 };
+                let pace_lead = if allow_pace_lead { PACE_LEAD_SECS } else { 0.0 };
                 if ahead <= pace_lead {
                     break;
                 }
