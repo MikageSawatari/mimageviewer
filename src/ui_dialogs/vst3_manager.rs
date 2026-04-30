@@ -60,8 +60,24 @@ impl App {
         // ずれてしまうユーザー報告に対応)。
         let initial_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
 
+        // ── タイトルバー含めた全体の dark Frame ──
+        // egui::Window のタイトルバーは ctx.style() の visuals を使うため、
+        // .show(ctx, |ui| ui.style_mut().visuals = dark()) では **タイトルバーだけ
+        // light のまま** になる (= "再表示すると白背景" の根本原因)。
+        // .frame(custom_frame) でウィンドウ全体の outer Frame を黒で塗り、その上に
+        // 内側の widget も dark visuals で描画することで、再表示しても黒背景で安定。
+        let bg = egui::Color32::from_rgba_unmultiplied(20, 20, 20, 245);
+        let stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(120, 120, 120, 200),
+        );
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(bg)
+            .stroke(stroke);
+
         egui::Window::new("VST3")
             .id(egui::Id::new("vst3-playback-panel"))
+            .frame(frame)
             .open(&mut open)
             .default_pos(initial_pos)
             .default_width(280.0)
@@ -69,24 +85,13 @@ impl App {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                // ── 配色を完全な dark テーマに切り替え ──
-                // egui::Window の chrome (タイトルバー / 枠) はその時点の Visuals を使う。
-                // ui.style_mut() で **このウィンドウだけ** dark に切り替えることで、
-                // light テーマ下でも黒ベースで描画される (= 動画 (黒背景) と馴染む)。
-                // 旧版は override_text_color のみ調整していたが、widget の bg が
-                // 明るいまま残っていてボタン文字が読めなくなる問題があった
-                // (ユーザー報告 2026-04)。
+                // ── 内側 widget の visuals を dark に ──
+                // (タイトルバーの色は frame() で固定済。ここは widget 群の bg/fg)
                 let style = ui.style_mut();
                 style.visuals = egui::Visuals::dark();
-                // ウィンドウ背景・枠を mIV のフルスクリーン黒に寄せる
-                style.visuals.window_fill =
-                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240);
-                style.visuals.panel_fill =
-                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240);
-                style.visuals.window_stroke = egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(120, 120, 120, 200),
-                );
+                style.visuals.window_fill = bg;
+                style.visuals.panel_fill = bg;
+                style.visuals.window_stroke = stroke;
                 // ボタン地色を少し明るめにして可読性を確保 (= 黒背景に薄灰ボタン)
                 style.visuals.widgets.inactive.weak_bg_fill =
                     egui::Color32::from_rgb(50, 50, 50);
@@ -194,7 +199,7 @@ impl App {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if slot.gui_hwnd != 0 {
+                                if slot.gui_visible {
                                     if ui
                                         .small_button("GUI ✕")
                                         .on_hover_text("プラグイン GUI を閉じる")

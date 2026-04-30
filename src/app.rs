@@ -2227,6 +2227,11 @@ pub struct App {
     /// プラグイン GUI とその HWND は [`crate::video::dsp::DspBridge`] 内のスロットに
     /// per-plugin で持たれている (= App には保持しない)。
     pub(crate) vst3_init_kicked: bool,
+    /// 直前フレームでフルスクリーンモードだったか (= TOPMOST 切替検出用)。
+    /// 状態が遷移したら `dsp_bridge.set_all_guis_topmost` を呼んでプラグイン GUI の
+    /// z-order を調整する (= 動画再生中だけ手前)。
+    #[cfg(windows)]
+    pub(crate) vst3_was_fullscreen: bool,
 }
 
 impl Default for App {
@@ -2649,6 +2654,8 @@ impl Default for App {
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_init_kicked: false,
+            #[cfg(windows)]
+            vst3_was_fullscreen: false,
         }
     }
 }
@@ -13124,6 +13131,17 @@ impl eframe::App for App {
         // worker thread で実行されるので UI スレッドはブロックされない。
         #[cfg(windows)]
         self.kick_off_vst3_startup();
+        // VST3 プラグイン GUI の TOPMOST 切替: フルスクリーン動画再生中のみ手前に出す。
+        // 遷移検出して必要なときだけ z-order 操作 (毎フレーム呼ぶと余計な
+        // SetWindowPos が発生してプラグイン GUI のフォーカスを乱す)。
+        #[cfg(windows)]
+        {
+            let is_fs = self.fullscreen_idx.is_some();
+            if is_fs != self.vst3_was_fullscreen {
+                self.dsp_bridge.set_all_guis_topmost(is_fs);
+                self.vst3_was_fullscreen = is_fs;
+            }
+        }
         if !self.startup_done {
             self.kick_off_startup_init();
             self.poll_startup_init();
@@ -13399,10 +13417,14 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
-        // VST3 プラグイン管理ウィンドウ (環境設定の「VST3 プラグイン管理を開く…」から起動)。
-        // 表示中は GUI ホストウィンドウのシグナル (close / resize) も pump する。
+        // VST3 プラグイン管理ウィンドウ。
+        // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。
+        //    両方のビューポートで描画すると egui::Window の位置が二重管理になり、
+        //    ビューポート切替時に位置がリセットされたように見える (ユーザー報告 2026-04)。
+        // pump_gui_signals は close/resize シグナルを 1 回 drain するだけなので
+        // どちらでも 1 回呼べば OK (= ここでは fullscreen 中は呼ばない)。
         #[cfg(windows)]
-        {
+        if self.fullscreen_idx.is_none() {
             self.show_vst3_manager(ctx);
             self.vst3_pump_gui_signals();
         }

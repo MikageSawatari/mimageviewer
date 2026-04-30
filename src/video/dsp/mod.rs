@@ -52,8 +52,10 @@ pub struct SlotInfo {
     pub state: SlotState,
     pub latency_samples: u32,
     pub bypass: bool,
-    /// プラグイン GUI が表示中なら HWND の u64 値。0 なら非表示。
-    pub gui_hwnd: u64,
+    /// プラグイン GUI が現在可視かどうか (= ShowWindow 状態)。
+    /// 旧 `gui_hwnd != 0` を「可視」の意味で使っていたが、永続 GuiHost 設計では
+    /// HWND は作成後に保持され続けるので、可視状態は別フラグで管理する。
+    pub gui_visible: bool,
 }
 
 /// DspBridge — VST3 プラグインホスト bridge との対話を管理する singleton。
@@ -87,8 +89,16 @@ pub(crate) struct PluginSlot {
     pub state: SlotState,
     pub latency_samples: u32,
     pub bypass: bool,
-    /// プラグイン GUI HWND (0 = 非表示)。
+    /// プラグイン GUI HWND (0 = まだ作成されていない)。
+    /// **一度作成されたら slot 削除まで非 0** のまま保持される (= 永続 GuiHost 設計)。
+    /// 表示・非表示の切替は `gui_visible` フラグで管理し、ShowWindow(SW_HIDE/SW_SHOWNA)
+    /// で実装する。これにより show/hide のたびに createView/removed をする
+    /// プラグイン重い処理 (Pro-Q 4 / Insight2 等) を 1 回に抑え、DAW 並みの
+    /// 高速トグルを実現する。
     pub gui_hwnd: u64,
+    /// プラグイン GUI が現在可視か (= ShowWindow の状態を mIV 側で覚えておく)。
+    /// `gui_hwnd != 0 && !gui_visible` = ウィンドウは作成済みだが SW_HIDE 状態。
+    pub gui_visible: bool,
     /// プラグイン GUI ホスト (Win32 子ウィンドウスレッド)。slot 削除で自動終了する。
     pub gui_host: Option<gui::GuiHost>,
     /// ホストウィンドウの × ボタン押下シグナル。
@@ -143,7 +153,7 @@ impl DspBridge {
                 state: s.state,
                 latency_samples: s.latency_samples,
                 bypass: s.bypass,
-                gui_hwnd: s.gui_hwnd,
+                gui_visible: s.gui_visible,
             })
             .collect()
     }
@@ -156,7 +166,7 @@ impl DspBridge {
             state: s.state,
             latency_samples: s.latency_samples,
             bypass: s.bypass,
-            gui_hwnd: s.gui_hwnd,
+            gui_visible: s.gui_visible,
         })
     }
 
@@ -273,6 +283,7 @@ impl DspBridge {
             latency_samples,
             bypass,
             gui_hwnd: 0,
+            gui_visible: false,
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
@@ -324,11 +335,15 @@ impl DspBridge {
         }
     }
 
-    /// 指定 idx のプラグイン GUI を表示する。GUI ホストウィンドウを spawn し、
-    /// bridge に attach 命令を送る。既に表示中なら最前面化のみ行う。
-    /// メインスレッドから呼ぶ前提 (= bridge 応答待ち ms オーダー)。
+    /// 指定 idx のプラグイン GUI を表示する。
+    ///
+    /// **永続 GuiHost 設計**: 一度作成された window は slot 削除まで保持される。
+    /// 2 回目以降の呼び出しは ShowWindow(SW_SHOWNA) でウィンドウを可視化するだけ
+    /// (= プラグインの createView/removed をスキップ → DAW 並みの高速トグル)。
+    ///
+    /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
-        // 既存表示の最前面化チェック (Mutex 短時間)
+        // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
         {
             let inner = self.inner.lock().unwrap();
             if let Some(slot) = inner.slots.get(idx) {
@@ -338,7 +353,13 @@ impl DspBridge {
                 if slot.gui_hwnd != 0 {
                     let hwnd = slot.gui_hwnd;
                     drop(inner);
+                    gui::set_window_visible(hwnd, true);
                     gui::bring_to_front(hwnd);
+                    // 可視状態を反映 (Mutex 内)
+                    let mut inner2 = self.inner.lock().unwrap();
+                    if let Some(s2) = inner2.slots.get_mut(idx) {
+                        s2.gui_visible = true;
+                    }
                     return Ok(());
                 }
             } else {
@@ -417,6 +438,7 @@ impl DspBridge {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(idx) {
             slot.gui_hwnd = hwnd;
+            slot.gui_visible = true;
             slot.gui_host = Some(gui_host);
             slot.gui_close_signal = Some(reply.close_signal);
             slot.gui_resize_signal = Some(reply.resize_signal);
@@ -424,28 +446,24 @@ impl DspBridge {
         Ok(())
     }
 
-    /// 指定 idx のプラグイン GUI を閉じる。bridge にデタッチ命令を送ってから
-    /// ホストウィンドウを破棄する。
+    /// 指定 idx のプラグイン GUI を **隠す**。
+    ///
+    /// **永続 GuiHost 設計**: ウィンドウは破棄せず ShowWindow(SW_HIDE) で隠すだけ。
+    /// プラグインの IPlugView は attached のまま (= audio はそのまま流れる、
+    /// 内部状態は維持)。次の `show_slot_gui` 呼び出しは ShowWindow(SW_SHOWNA)
+    /// 一発で復活する (DAW 並みの高速トグル)。
     pub fn hide_slot_gui(&self, idx: usize) {
-        // bridge デタッチを先に送る (順序逆だと crash 報告あり)
-        let bridge_arc = {
-            let inner = self.inner.lock().unwrap();
-            match inner.slots.get(idx) {
-                Some(s) if s.gui_hwnd != 0 => Some(s.bridge.clone()),
-                _ => None,
+        let hwnd = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(slot) = inner.slots.get_mut(idx) {
+                slot.gui_visible = false;
+                slot.gui_hwnd
+            } else {
+                0
             }
         };
-        if let Some(b) = bridge_arc {
-            let _ = b.send(&Cmd::HideGui);
-        }
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(slot) = inner.slots.get_mut(idx) {
-            if let Some(host) = slot.gui_host.take() {
-                host.close();
-            }
-            slot.gui_hwnd = 0;
-            slot.gui_close_signal = None;
-            slot.gui_resize_signal = None;
+        if hwnd != 0 {
+            gui::set_window_visible(hwnd, false);
         }
     }
 
@@ -453,7 +471,7 @@ impl DspBridge {
     pub fn toggle_slot_gui(&self, idx: usize) -> Result<(), String> {
         let visible = {
             let inner = self.inner.lock().unwrap();
-            inner.slots.get(idx).map(|s| s.gui_hwnd != 0).unwrap_or(false)
+            inner.slots.get(idx).map(|s| s.gui_visible).unwrap_or(false)
         };
         if visible {
             self.hide_slot_gui(idx);
@@ -479,13 +497,32 @@ impl DspBridge {
         }
     }
 
+    /// 全プラグイン GUI ウィンドウの TOPMOST 属性を一斉切替。
+    /// - フルスクリーン動画再生に入るとき `true` (= 動画の上に出す)
+    /// - フルスクリーン解除時 `false` (= 通常 z-order に戻す。SSL Meter Pro 等の
+    ///   ポップアップメニューが正しく動作するため非フルスクリーン中は TOPMOST 解除)
+    pub fn set_all_guis_topmost(&self, topmost: bool) {
+        let hwnds: Vec<u64> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .filter(|s| s.gui_hwnd != 0)
+                .map(|s| s.gui_hwnd)
+                .collect()
+        };
+        for hwnd in hwnds {
+            gui::set_window_topmost(hwnd, topmost);
+        }
+    }
+
     /// V キーハンドラ用: 「現在 1 個でも表示されているなら全て非表示」
     /// 「1 個も表示されていないなら全て表示」のトグル。
     /// 戻り値: 操作後の表示状態 (true = 全て表示)。
     pub fn toggle_all_guis(&self) -> bool {
         let any_visible = {
             let inner = self.inner.lock().unwrap();
-            inner.slots.iter().any(|s| s.gui_hwnd != 0)
+            inner.slots.iter().any(|s| s.gui_visible)
         };
         let target = !any_visible;
         self.set_all_guis_visible(target);
@@ -493,7 +530,8 @@ impl DspBridge {
     }
 
     /// 毎 frame 呼ぶ: 全スロットの GUI close/resize シグナルを処理する。
-    /// close 通知 (= ユーザーが × を押した) → そのスロットの GUI を閉じる。
+    /// close 通知 (= ユーザーが × を押した) → そのスロットの GUI を **隠す** (= 永続 GuiHost
+    /// 設計のため window/view は破棄しない)。
     /// resize 通知 → bridge に notify_host_resize を送る。
     pub fn pump_gui_signals(&self) {
         // close 通知の検出 (Mutex 内で全 slot を調べる)
@@ -545,12 +583,24 @@ impl DspBridge {
     }
 
     /// 指定 idx のスロットを削除する。bridge 子プロセスは shutdown される。
+    /// **永続 GuiHost 設計**: ウィンドウが残っている場合はここで完全破棄する
+    /// (= bridge にデタッチ命令 → GuiHost drop でウィンドウ destroy + thread quit)。
     pub fn remove_plugin(&self, idx: usize) {
         let mut inner = self.inner.lock().unwrap();
         if idx >= inner.slots.len() {
             return;
         }
-        let slot = inner.slots.remove(idx);
+        let mut slot = inner.slots.remove(idx);
+        // GUI が作られていたら撤収
+        if slot.gui_hwnd != 0 {
+            // bridge にデタッチ命令 (= plugin view->removed())
+            let _ = slot.bridge.send(&Cmd::HideGui);
+            // GuiHost drop で Cmd::Quit が送られてスレッドが close_window 経由で
+            // DestroyWindow → 自然 exit する (detach 方式)。
+            if let Some(host) = slot.gui_host.take() {
+                host.close();
+            }
+        }
         let _ = slot.bridge.shutdown_async();
         self.recalc_active_count(&inner);
     }

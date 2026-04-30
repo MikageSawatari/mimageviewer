@@ -58,12 +58,13 @@ public:
     /// 操作も Win32 API は許容)。
     void set_host_hwnd(void* hwnd) { host_hwnd_ = hwnd; }
 
-    /// `notify_host_resize` ハンドラから呼ばれて、プラグインへ onSize を投げる
-    /// **直前に suppress=true** にし、戻った直後に false に戻す。
-    /// プラグインが onSize 中に再帰的に resizeView を呼んでくるケース
-    /// (Insight2 等) で SetWindowPos が連発しユーザーのドラッグと衝突する
-    /// 「振動」を抑える。
-    void set_resize_suppressed(bool suppressed) { resize_suppressed_ = suppressed; }
+    /// `notify_host_resize` ハンドラから呼ばれる。タイムスタンプを更新しておくと、
+    /// その後 250ms 以内にプラグインから来る `resizeView` コールバックを
+    /// SetWindowPos スキップ扱いにする (= フィードバックループ抑止)。
+    /// 同期再帰だけでなく PostMessage 経由の **非同期 resizeView** にも対応するため
+    /// 時間ベースで判定する。Insight2 はリサイズドラッグ中に内部で複数回非同期
+    /// resizeView を発火するため、瞬間的なフラグでは間に合わなかった。
+    void mark_user_resize();
 
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView* view,
                                               Steinberg::ViewRect* newSize) override;
@@ -72,10 +73,10 @@ public:
 
 private:
     void* host_hwnd_ = nullptr;
-    /// 親が view->onSize を呼んでいる最中フラグ。プラグインがそれに反応して
-    /// 再帰的に resizeView を呼んできても、SetWindowPos しない (= フィードバック
-    /// ループ抑止)。view->onSize 自体は呼んで返答する。
-    bool resize_suppressed_ = false;
+    /// 直前のホスト主導リサイズ (= notify_host_resize) のタイムスタンプ (ミリ秒)。
+    /// resizeView コールバックが来た時刻と比較して、近い時刻なら "ユーザー drag
+    /// による波及" とみなして SetWindowPos スキップ。0 = 未初期化。
+    uint64_t last_user_resize_tick_ = 0;
 };
 
 class ComponentHandler : public Steinberg::Vst::IComponentHandler {

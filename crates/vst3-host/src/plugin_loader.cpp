@@ -462,17 +462,13 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     Steinberg::ViewRect rect{0, 0,
                              static_cast<Steinberg::int32>(width),
                              static_cast<Steinberg::int32>(height)};
-    // プラグインが onSize 中に resizeView を再呼び出しした場合、ホスト HWND を
-    // SetWindowPos でリサイズすると **ユーザーのドラッグ中ウィンドウが暴れる**
-    // (= フィードバックループ)。suppressed フラグを立てて view->onSize 中は
-    // resizeView の SetWindowPos を skip させる。
+    // タイムスタンプを更新: その後 250ms 間、プラグインから resizeView が
+    // 同期 / 非同期 (PostMessage) どちらで来ても SetWindowPos スキップ扱い。
+    // Insight2 の「リサイズ中暴れる」フィードバックループ対策。
     if (plug_frame_) {
-        plug_frame_->set_resize_suppressed(true);
+        plug_frame_->mark_user_resize();
     }
     view_->onSize(&rect);
-    if (plug_frame_) {
-        plug_frame_->set_resize_suppressed(false);
-    }
 }
 
 void PluginLoader::hide_gui() {

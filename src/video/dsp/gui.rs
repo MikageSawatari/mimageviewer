@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
     SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -404,7 +404,12 @@ fn create_window(
             bottom: height as i32,
         };
         let dpi = GetDpiForSystem();
-        let ex_style = WS_EX_TOPMOST;
+        // 旧版は `WS_EX_TOPMOST` を常時付けていたが、SSL Meter Pro 等のプラグインで
+        // 右クリックメニューが即閉じる問題が発生 (TOPMOST + 非フォアグラウンドでは
+        // ポップアップメニューがフォーカスを取れない)。
+        // 既定は **TOPMOST 無し**で作成し、フルスクリーン動画再生時のみ動的に
+        // SetWindowPos(HWND_TOPMOST) で持ち上げる (= `set_window_topmost` ヘルパー)。
+        let ex_style = WINDOW_EX_STYLE(0);
         // ウィンドウスタイル:
         // - WS_OVERLAPPEDWINDOW = OVERLAPPED|CAPTION|SYSMENU|THICKFRAME|MIN/MAXBOX
         // - resizable=false の場合は WS_THICKFRAME (= リサイズ枠) を抜く。プラグインが
@@ -496,6 +501,50 @@ pub fn bring_to_front(hwnd_u64: u64) {
         let hwnd = HWND(hwnd_u64 as *mut _);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    }
+}
+
+/// 既存ウィンドウを TOPMOST にする / 解除する。
+///
+/// プラグイン GUI は通常時は regular な top-level window だが、mIV のフルスクリーン
+/// 動画再生中は **動画ビューポート (= フルスクリーンサイズの普通のウィンドウ) の
+/// 後ろに隠れる** ため、フルスクリーン中だけ動的に TOPMOST を付ける。
+/// この方式なら通常時は `WS_EX_TOPMOST` 無しなので SSL Meter Pro 等の右クリック
+/// メニューも問題なく動作する (TOPMOST + 非フォアグラウンドだとポップアップが
+/// フォーカスを取れず即閉じる挙動を回避)。
+pub fn set_window_topmost(hwnd_u64: u64, topmost: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    if hwnd_u64 == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_u64 as *mut _);
+        let z = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        let _ = SetWindowPos(
+            hwnd,
+            Some(z),
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 既存ウィンドウの可視状態をトグルする (= ShowWindow(SW_SHOW/SW_HIDE))。
+///
+/// **永続 GuiHost** デザインの中核ヘルパー。プラグイン GUI を
+/// `show/hide_slot_gui` で頻繁にトグルする際、毎回 createView/removed を
+/// 呼ぶと plugin の重い初期化が走り「重くなって固まる」「DAW より遅い」
+/// 報告 (2026-04) の根本原因になっていた。窓は破棄せず可視状態のみ切替える。
+pub fn set_window_visible(hwnd_u64: u64, visible: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA, ShowWindow};
+    if hwnd_u64 == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_u64 as *mut _);
+        let _ = ShowWindow(hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
     }
 }
 
