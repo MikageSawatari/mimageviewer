@@ -5118,7 +5118,7 @@ impl App {
     /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
     /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
-        let snapshot: Option<(u64, u64, f32)> = match self.fs_cache.get(&fs_idx) {
+        let snapshot: Option<(u64, u64, usize, f32)> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 let expected_ms = player
                     .info()
@@ -5129,12 +5129,13 @@ impl App {
                 Some((
                     player.displayed_frame_seq(),
                     player.skipped_frame_count(),
+                    player.pending_frames(),
                     expected_ms,
                 ))
             }
             _ => None,
         };
-        let Some((cur_seq, cur_skip, expected_ms)) = snapshot else {
+        let Some((cur_seq, cur_skip, cur_buf, expected_ms)) = snapshot else {
             return;
         };
         if Some(cur_seq) != self.video_perf_last_seq {
@@ -5147,10 +5148,11 @@ impl App {
                 let interval_ms =
                     now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
                 let skip_delta = cur_skip.saturating_sub(prev_skip) as u32;
+                let buf_clamped = cur_buf.min(255) as u8;
                 let transient_threshold = expected_ms * 3.0;
                 if interval_ms <= transient_threshold {
                     self.video_perf_history
-                        .push_back((interval_ms, now, skip_delta));
+                        .push_back((interval_ms, now, skip_delta, buf_clamped));
                     while self.video_perf_history.len() > 200 {
                         self.video_perf_history.pop_front();
                     }
@@ -5188,7 +5190,7 @@ impl App {
         let y_max_ms: f32 = (expected_ms * 2.0).max(50.0);
 
         const W: f32 = 360.0;
-        const H: f32 = 92.0;
+        const H: f32 = 110.0; // 主グラフ + 下部 buffer strip 用に少し縦長く
         let rect = egui::Rect::from_min_size(
             egui::pos2(full_rect.min.x + 8.0, full_rect.min.y + 8.0),
             egui::vec2(W, H),
@@ -5226,26 +5228,36 @@ impl App {
             );
             return;
         }
-        let avg: f32 =
-            self.video_perf_history.iter().map(|(v, _, _)| v).sum::<f32>() / n as f32;
+        let avg: f32 = self
+            .video_perf_history
+            .iter()
+            .map(|(v, _, _, _)| v)
+            .sum::<f32>()
+            / n as f32;
         let max: f32 = self
             .video_perf_history
             .iter()
-            .map(|(v, _, _)| *v)
+            .map(|(v, _, _, _)| *v)
             .fold(0.0_f32, f32::max);
-        // skip 件数: skip_delta > 0 のサンプル数 (= 赤縦線の数)。
         let skips: u32 = self
             .video_perf_history
             .iter()
-            .map(|(_, _, s)| *s)
+            .map(|(_, _, s, _)| *s)
             .sum();
+        let cur_buf = self
+            .video_perf_history
+            .back()
+            .map(|(_, _, _, b)| *b)
+            .unwrap_or(0);
         let header = format!(
-            "{:.1}fps target ({:.1}ms)  avg {:.1}ms  max {:.1}ms  skipped:{}",
+            "{:.1}fps ({:.1}ms)  avg {:.1}ms  max {:.1}ms  skip:{}  buf:{}/{}",
             1000.0 / expected_ms,
             expected_ms,
             avg,
             max,
-            skips
+            skips,
+            cur_buf,
+            crate::video::MAX_RENDER_QUEUE,
         );
         painter.text(
             egui::pos2(rect.min.x + 6.0, rect.min.y + 4.0),
@@ -5255,10 +5267,18 @@ impl App {
             egui::Color32::WHITE,
         );
 
-        // グラフ領域
+        // グラフ領域: 上部 (interval) + 下部 (buffer strip) に分割。
+        // 中央に細い区切り線を入れて視覚的に分離。
+        let main_top = rect.min.y + 22.0;
+        let strip_h = 14.0;
+        let strip_top = rect.max.y - 4.0 - strip_h;
         let graph = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + 6.0, rect.min.y + 22.0),
-            egui::pos2(rect.max.x - 6.0, rect.max.y - 14.0),
+            egui::pos2(rect.min.x + 6.0, main_top),
+            egui::pos2(rect.max.x - 6.0, strip_top - 2.0),
+        );
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 6.0, strip_top),
+            egui::pos2(rect.max.x - 6.0, strip_top + strip_h),
         );
         let y_for = |ms: f32| -> f32 {
             graph.max.y - (ms.clamp(0.0, y_max_ms) / y_max_ms) * graph.height()
@@ -5309,7 +5329,7 @@ impl App {
 
         // 赤縦線: 実際に skip されたサンプル (= decoder dropped_full or UI dropped_past)。
         // skip_delta が大きいほど色を濃くする (= 一気に複数 frame 飛んだのが分かる)。
-        for (_, arrival, skip) in &self.video_perf_history {
+        for (_, arrival, skip, _) in &self.video_perf_history {
             if *skip > 0 {
                 let alpha = (120 + (*skip as u32 * 40).min(135)) as u8;
                 let x = x_for(*arrival);
@@ -5330,12 +5350,11 @@ impl App {
         // 「期待値より遅い」状態が一目で分かるようにする。
         if n > 1 {
             let mut prev: Option<(egui::Pos2, f32)> = None;
-            for (v, arrival, _) in &self.video_perf_history {
+            for (v, arrival, _, _) in &self.video_perf_history {
                 let x = x_for(*arrival);
                 let p = egui::pos2(x, y_for(*v));
                 if let Some((prev_p, prev_v)) = prev {
                     if !(p.x < graph.min.x && prev_p.x < graph.min.x) {
-                        // セグメント色: 両端どちらかが hitch_ms を超えていたら橙系
                         let exceeds = *v > hitch_ms || prev_v > hitch_ms;
                         let color = if exceeds {
                             egui::Color32::from_rgb(255, 200, 100)
@@ -5348,6 +5367,62 @@ impl App {
                 prev = Some((p, *v));
             }
         }
+        // 上下グラフの境界線。
+        let painter_root = ui.painter().clone();
+        painter_root.line_segment(
+            [
+                egui::pos2(strip.min.x, strip.min.y - 1.0),
+                egui::pos2(strip.max.x, strip.min.y - 1.0),
+            ],
+            egui::Stroke::new(0.5, egui::Color32::from_gray(80)),
+        );
+
+        // ── 下部 buffer strip: future_frames キュー残量 (= 表示待ち) ──
+        // 高さ 14px の縦棒で 0..MAX_RENDER_QUEUE をスケール。0 = starvation 危険、
+        // 満杯 = decoder 過剰生産。skip 赤縦線の真下を見ると context が分かる:
+        //   - 赤線 + buf=0  → UI starvation (= queue 空で frame 不足)
+        //   - 赤線 + buf 満杯 → decoder 側 dropped_full (= channel overflow)
+        let strip_painter = painter_root.with_clip_rect(strip);
+        // 背景うっすら
+        strip_painter.rect_filled(
+            strip,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(20, 20, 30, 200),
+        );
+        let max_buf = crate::video::MAX_RENDER_QUEUE.max(1) as f32;
+        let bar_w = (strip.width() / 200.0).max(1.0); // 1 sample あたりの幅
+        for (_, arrival, _, buf) in &self.video_perf_history {
+            let x = graph.max.x - {
+                let dt = now.saturating_duration_since(*arrival).as_secs_f32();
+                dt * px_per_sec
+            };
+            if x < strip.min.x - bar_w || x > strip.max.x {
+                continue;
+            }
+            let level = (*buf as f32 / max_buf).clamp(0.0, 1.0);
+            let bar_h = level * strip.height();
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x - bar_w * 0.5, strip.max.y - bar_h),
+                egui::pos2(x + bar_w * 0.5, strip.max.y),
+            );
+            // buf 残量で色を変化: 緑 (健全) → 黄 (中) → 赤 (危険、starvation 寸前)
+            let color = if *buf == 0 {
+                egui::Color32::from_rgb(220, 80, 80)
+            } else if level < 0.25 {
+                egui::Color32::from_rgb(220, 200, 80)
+            } else {
+                egui::Color32::from_rgb(120, 200, 130)
+            };
+            strip_painter.rect_filled(bar, 0.0, color);
+        }
+        // strip ラベル (= "buf")
+        painter_root.text(
+            egui::pos2(strip.min.x - 2.0, strip.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "",
+            egui::FontId::proportional(9.0),
+            egui::Color32::from_gray(160),
+        );
     }
 
     /// 動画再生時のホバー HUD を描画する。下部 44px に play/pause / seek bar /

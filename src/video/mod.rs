@@ -149,7 +149,7 @@ unsafe impl Sync for GpuLatestFrame {}
 /// 1 frame ≈ HANDLE+メタのみで実コストは無視できる。decoder の burst-stall
 /// パターン (~400ms) + HDD random read (~100-300ms) を ~800ms buffer で
 /// 吸収して UI tick の空振りを抑える (Phase 8.J)。
-const MAX_RENDER_QUEUE: usize = 24;
+pub(crate) const MAX_RENDER_QUEUE: usize = 24;
 
 impl VideoPlayer {
     /// 新しい VideoPlayer を作る。FFmpeg DLL のロードはここで行う (冪等)。
@@ -850,6 +850,13 @@ impl VideoPlayer {
     /// perf overlay が delta を取って赤縦線を出す。
     pub fn skipped_frame_count(&self) -> u64 {
         self.skipped_frame_count.load(Ordering::Acquire)
+    }
+
+    /// UI 側 future_frames に並んでいる frame 数 (= 表示待ち バッファ残量)。
+    /// perf overlay で skip 発生時のコンテキスト (= starvation か overflow か) を
+    /// 見極めるために使う。
+    pub fn pending_frames(&self) -> usize {
+        self.future_frames.len()
     }
 
     /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。
