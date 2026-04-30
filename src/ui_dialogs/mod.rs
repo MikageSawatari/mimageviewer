@@ -29,6 +29,4 @@ mod update_notice;
 #[cfg(windows)]
 mod vst3_actions;
 #[cfg(windows)]
-mod vst3_chain_editor;
-#[cfg(windows)]
 mod vst3_manager;

@@ -1226,7 +1226,6 @@ impl App {
                 #[cfg(windows)]
                 {
                     self.show_vst3_manager(ctx);
-                    self.show_vst3_chain_editor_dialog(ctx);
                     self.vst3_pump_gui_signals();
                 }
             },
