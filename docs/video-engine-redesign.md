@@ -588,6 +588,57 @@ VideoEngine drop 時:
 
 各 phase でリリース可能な状態を保つ (= 中間状態でも動画は再生できる)。
 
+### Phase 9: decoder.rs を 3-thread 構造に分離 (2026-04-30)
+
+Phase 8.K (commit 6685e41) の対症療法 (PACE_LEAD=0.30 / post_seek_frame_sent flag /
+generation race check 等) で序盤再生は安定したが、音声付き動画 (Candyfloss_test /
+SilentBloom 等) で「audio_tx (bounded=32) 満杯 → 単一 decode thread 全体が block →
+video もデコード止まる → buf 0/24 振動」の構造的問題が残っていた。
+
+**Phase 9 で `run_decoder` 単体を 3 thread 構成に分離**:
+
+- `video-decode` thread (= `run_decoder` 本体): demux + seek 調停 + EOF idle wait に
+  専念。`Input::packets()` の packet を stream index で振り分けて `video_pkt_tx` /
+  `audio_pkt_tx` (各 bounded=64) に enqueue する。
+- `video-decode` thread (= `run_video_decode`): 動画 decode + GPU blit / swscale +
+  pacing。Phase 8.K の pacing logic を **そのまま移植**。
+- `video-audio-decode` thread (= `run_audio_decode`): 音声 decode + resample +
+  post-seek trim + EOF drain (= 末尾サンプル出し切り)。
+
+**新 channel メッセージ型**:
+
+```rust
+enum VideoWorkerMsg { Packet(Packet), Flush { serial, target_secs }, Eof }
+enum AudioWorkerMsg { Packet(Packet), Flush { serial, target_secs }, Eof }
+```
+
+順序保証 channel に enqueue するため、Flush と pre/post-seek packet の到着順が
+逆転しない。`target_secs.is_some()` (= seek 成功) で受信側は post-seek preroll trim、
+`None` (= seek 失敗) で trim なし通常 pacing に戻す。
+
+**SeekCompleted の発火点**: 旧構造と同じく demux thread が `clock.notify_seek_completed`
++ `engine_event_tx::SeekCompleted` を発火。post-seek 1 枚目の表示 (= UI tick で seek
+override clear) は video decode thread が `post_seek_frame_sent=false` で待機 →
+1 枚送出 → true、の流れ。
+
+**HwDevice の Send**: `unsafe impl Send for HwDevice {}` を追加 (AVBufferRef refcount は
+thread-safe)。SW 再試行時は `_hw_device = None` で None 状態に置き換える (旧構造の
+`drop(_hw_device)` を変更)。
+
+**Drop / shutdown 順**: VideoPlayer drop → cancel.store → demux thread が break →
+関数末尾で `audio_pkt_tx` / `video_pkt_tx` を drop → 各 decode thread が channel
+disconnect で recv() 抜け → exit → demux が `audio → video` の順で `join()`。
+
+**期待される効果**:
+- audio_tx 満杯時: demux が `audio_pkt_tx.send` で逆圧を受けるだけで video decode は
+  止まらない → `buf 0/24` 振動の解消。
+- video decode 重い時 (4K HEVC SW): demux は別 thread で steady に packet を流し、
+  音声 packet も滞らない。
+
+詳細な thread 境界設計は [docs/video-architecture.md](video-architecture.md) の
+`decoder.rs` (3-thread 構成) 節を、各 thread の責務と shared resource は
+[docs/async-architecture.md](async-architecture.md) の thread 表を参照。
+
 ## 検証
 
 ### Phase 2 完了時 (resume 未修正)

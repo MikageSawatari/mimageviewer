@@ -77,7 +77,7 @@ egui::Image で描画
 ```
 src/video/
 ├── mod.rs                  # VideoPlayer 公開 API (open / tick / seek / volume / loop)
-├── decoder.rs              # demux + decode worker thread (HW/SW 自動切替)
+├── decoder.rs              # demux + 動画/音声 decode の 3-thread 構成 (HW/SW 自動切替)
 ├── audio.rs                # cpal WASAPI Shared 出力
 ├── clock.rs                # AvClock (薄い facade、engine/ に委譲) — 詳細は下記
 ├── engine/                 # 動画再生エンジン (state machine + master clock 分割実装)
@@ -110,13 +110,52 @@ src/video/
 - `texture: Option<TextureHandle>` で CPU 経路の最新フレーム保持
 - `future_frames: VecDeque<VideoFrame>` で FIFO 連続性を保証 (= UI が pts ジャンプしない)
 
-#### `decoder.rs`
-- FFmpeg の demux + decode を別スレッドで実行
-- HW (D3D11VA、`AV_PIX_FMT_D3D11`) → SW (CPU readback + swscale) に自動 fallback
-- GpuVideoDevice が利用可能なら `try_gpu_blit_path` で **NT 共有テクスチャを VideoFrame::Gpu として送出**
-- それ以外は CPU readback + swscale で `VideoFrame::Cpu(Vec<u8>)` を送出
-- audio フレームも同じワーカーで処理 (mpsc bounded channel で UI に送出)
-- pts pacing で channel 過剰生成を抑制
+#### `decoder.rs` (3-thread 構成)
+
+1 動画につき 3 thread を起動し、demux / video decode / audio decode を並行動作させる。
+旧構造 (1 thread で demux + 全 decode) では `audio_tx` (bounded=32) または
+`video_tx` (bounded=24) が満杯になると thread 全体が block して両方の経路が同時に
+止まり、`buf 0/24` の周期的な振動 (= ユーザー報告の「Candyfloss_test / SilentBloom
+で頻繁にバッファが空になる」現象) を引き起こしていた。これを解消するため Phase A
+(audio decode 分離) → Phase B (demux 分離) で段階的にリファクタした。
+
+| thread 名 | 責務 | 入力 | 出力 |
+|---|---|---|---|
+| `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火 | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` / `audio_pkt_tx` (各 bounded=64) |
+| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoWorkerMsg::{Packet, Flush, Eof}`) | `video_tx` (bounded=24、`VideoFrame`) |
+| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、EOF drain | `audio_pkt_rx` (`AudioWorkerMsg::{Packet, Flush, Eof}`) | `audio_tx` (bounded=32、`AudioFrame`) |
+
+**seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
+(= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、両 decode thread に
+`Flush { serial, target_secs: Option<f64> }` を順序保証 channel で enqueue する。
+`target_secs.is_some()` (= seek 成功) なら受信側で post-seek preroll trim を実施
+(動画は `drop_before_secs` + `post_seek_frame_sent=false` で 1 枚目を保護、音声は
+packet/sample 段階の trim)。`target_secs.is_none()` (= seek 失敗) なら trim なしで
+通常 pacing に戻す。
+
+**EOF**: demux thread が `input.packets()` 空を検出 → `clock.notify_eof_reached()`
++ 両 channel に `Eof` を送る。動画は内部残フレームを失っても許容なので drain なし、
+音声は `avcodec_send_packet(NULL)` + receive_frame ループで残サンプルを drain
+(= 末尾の数十 ms の音声を出し切る)。demux thread はその後 `peek_seek_request_pending`
+の idle wait に入り、cancel か新 seek 要求まで待機。
+
+**Drop / shutdown 順**: VideoPlayer drop → `cancel.store(true)` → demux thread が
+break → 関数末尾で `audio_pkt_tx` / `video_pkt_tx` を順次 drop → 各 decode thread が
+channel disconnect で recv() 抜け → exit。demux thread が両 decode thread を
+**audio → video** の順で `join()` する (cpal stream の bookkeeping を Drop より前に
+完了させたい)。
+
+**HW デコード fallback**: `try_init_d3d11va` 失敗 → SW デコードに fallback。`HwDevice`
+は AVBufferRef の RAII ラッパーで、`unsafe impl Send for HwDevice` を付けて video
+decode thread に move する (= AVBufferRef refcount は thread-safe)。SW 再試行時は
+`_hw_device = None` で None 状態に置き換える。
+
+**pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
+`SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
+check) は **そのまま video decode thread に移植**。動作対象だけが変わる (= 旧構造の
+demux+decode 同居から video decode 単独 thread に)。詳細は
+[docs/video-engine-redesign.md](video-engine-redesign.md) の「Decoder pacing 規定」
+節を参照。
 
 #### `audio.rs`
 - cpal で WASAPI Shared mode の出力 stream

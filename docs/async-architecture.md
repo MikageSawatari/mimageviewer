@@ -17,8 +17,10 @@
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
 | AI 推論 | `std::thread` + mpsc | 1 (全モデル共通) | ort (DirectML) の upscale/denoise/inpaint |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
-| 動画デコード | `std::thread` (`video-decode`) | フルスクリーン中の動画 1 つにつき 1 本 | FFmpeg (`avformat_open_input` → `avcodec_send_packet` → `swscale` → bounded mpsc) で 1 動画分を直列に流す。`Arc<AtomicBool>` キャンセルで Drop 時停止 |
-| 動画音声 pump | `std::thread` (`audio-pump`) | 動画 1 つにつき 1 本 | デコーダから受けた音声フレームを `swresample` 後 ring buffer に押し込む。RT 出力は cpal の専用スレッドが担当 |
+| 動画 demux | `std::thread` (`video-demux`、= `run_decoder` の本体) | 動画 1 つにつき 1 本 | FFmpeg `avformat_open_input` で開いた `Input` を保持し、`packets()` で取り出した packet を stream index で振り分けて `video_pkt_tx` / `audio_pkt_tx` (各 bounded=64) に流す。seek 要求 (`AvClock::take_seek_request`) は demux thread が pull し、`input.seek` 後に `Flush` marker を両 decode thread に送る。EOF 時は両 channel に `Eof` を送って自身は idle wait |
+| 動画 video decode | `std::thread` (`video-decode`、= `run_video_decode`) | 動画 1 つにつき 1 本 | `video_pkt_rx` から `VideoWorkerMsg::{Packet, Flush, Eof}` を受け、HW (D3D11VA + GPU blit) → SW (`av_hwframe_transfer_data` + swscale) で frame を生成、PACE_LEAD=0.30 の pacing 後に `video_tx` (bounded=24) へ `try_send`。`Flush` で `flush()` + `current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent` を更新 |
+| 動画 audio decode | `std::thread` (`video-audio-decode`、= `run_audio_decode`) | 動画 1 つにつき 1 本 (音声無し動画では起動しない) | `audio_pkt_rx` から `AudioWorkerMsg::{Packet, Flush, Eof}` を受け、avcodec decode + swresample で f32 stereo 48kHz に揃え、post-seek packet/sample trim 後に `audio_tx` (bounded=32) へ送出。`Eof` では `avcodec_send_packet(NULL)` + receive_frame ループで残サンプルを drain (= 末尾の数十 ms の音声を出し切る) |
+| 動画音声 pump | `std::thread` (`audio-pump`) | 動画 1 つにつき 1 本 | `audio_tx` から受けたフレームを ring buffer に押し込む。RT 出力は cpal の専用スレッドが担当 |
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、`AvClock::set_audio_pts` でマスタークロックを更新 |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |

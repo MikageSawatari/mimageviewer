@@ -22,9 +22,81 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::AvClock;
+
+/// Phase B (3-thread split): demux thread から video decode thread に流すメッセージ。
+///
+/// Phase A で audio decode を分離した後も、demux と video decode は同じスレッドで
+/// 動いていた。video decode 中に I/O bound な demux が止まると、(1) 音声 packet も
+/// 流れず audio decode 待機が広がる、(2) HDD random read のスパイクが video decode
+/// 経路の中で吸収されない、という二次的なストールが残る。Phase B は demux も独立
+/// スレッドにして video decode と並行動作させる。
+///
+/// `Flush` と `Eof` は `AudioWorkerMsg` と同じセマンティクスで、順序保証は channel
+/// が担保する。`Packet` には `seek_serial` を含めず、video decode thread 側が
+/// `Flush` を受領した時点で `current_seek_serial` を更新する (= 順序保証で十分、
+/// Mutex 不要)。
+enum VideoWorkerMsg {
+    /// avformat から取り出した未デコード動画 packet。video decode thread が
+    /// `send_packet` → `receive_frame` → (GPU blit / swscale) → pacing →
+    /// `video_tx.try_send` を行う。
+    Packet(ffmpeg_the_third::Packet),
+    /// シーク完了通知。video decode thread はこれを受けて自分の avcodec デコーダ
+    /// を `flush()` し、`current_seek_serial` を更新、`drop_before_secs` を
+    /// `target_secs` に設定する。`target_secs` が `Some(t)` のときは post-seek
+    /// 1 枚目を待機する (= post_seek_frame_sent=false)、`None` (= seek 失敗) は
+    /// 通常 pacing に戻す。
+    Flush {
+        serial: u64,
+        target_secs: Option<f64>,
+    },
+    /// EOF 到達通知。video decode thread は何もせずに次の `Packet` か `Flush`
+    /// か channel disconnect を待つ (旧 `run_decoder` の挙動と同じく、内部
+    /// 残フレームは EOF で失われる)。
+    Eof,
+}
+
+// HwDevice (= AVBufferRef のラッパー) を別スレッドに move するため Send を実装する。
+// FFmpeg の av_buffer_ref / av_buffer_unref は内部で atomic refcount を使っているので、
+// 異なるスレッドからの ref/unref は安全 (Sync は不要 = 1 thread が排他所有する形で使う)。
+unsafe impl Send for HwDevice {}
+
+/// Phase A (3-thread split): demux + video decode thread から audio decode thread に
+/// 流すメッセージ。
+///
+/// 旧構造では `run_decoder` が音声 packet を受け取った時点で `send_packet` →
+/// `receive_frame` → `swresample` → `audio_tx.send` まで実行していたが、
+/// `audio_tx` (bounded=32) が満杯のときに `audio_tx.send` がブロックすると、
+/// 同じスレッドで動いている動画 demux/decode も停止してしまい、
+/// `video_tx` (bounded=24) が空 → UI 側 `buf 0/24` が頻発していた。
+///
+/// Phase A では音声 decode を独立スレッドに切り出し、demux 側は `Packet` を
+/// `audio_pkt_tx` に enqueue するだけにする。`audio_pkt_tx` (bounded=64) が満杯に
+/// なっても demux スレッドが一時停止するだけで、video decode は別経路でそのまま
+/// 進行する (Phase B で demux も video decode から分離予定)。
+///
+/// `Flush` / `Eof` は順序保証のため packet と同じ channel に enqueue する
+/// (Mutex + 別チャネルだと「Flush 通知より後に届いた packet が前世代として
+/// decode される」race が起きる)。
+enum AudioWorkerMsg {
+    /// avformat から取り出した未デコード音声 packet。audio decode thread が
+    /// `send_packet` → `receive_frame` → resample → `audio_tx.send` を行う。
+    Packet(ffmpeg_the_third::Packet),
+    /// シーク完了通知。audio decode thread はこれを受けたら自分の avcodec デコーダ
+    /// を `flush()` して、`drop_before_secs` を `target_secs` (= preroll 中に切り
+    /// 捨てる下限) に設定する。`target_secs` が `None` なら seek 失敗 (= demux 位置
+    /// は動いていない) なので preroll trim は行わない。
+    Flush {
+        serial: u64,
+        target_secs: Option<f64>,
+    },
+    /// EOF 到達通知。audio decode thread は内部 decoder を flush して残フレームを
+    /// drain (= 末尾の音声を出し切る)、その後次の `Flush` か `Packet` か
+    /// channel disconnect を待つ。
+    Eof,
+}
 
 /// 1 動画フレーム。CPU readback (旧経路) と GPU 共有テクスチャ (新経路) の二択。
 pub struct VideoFrame {
@@ -161,7 +233,7 @@ pub fn spawn(
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
 
     std::thread::Builder::new()
-        .name("video-decode".into())
+        .name("video-demux".into())
         .spawn(move || {
             run_decoder(
                 path,
@@ -205,12 +277,11 @@ fn run_decoder(
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use ffmpeg_the_third as ffmpeg;
-    use ffmpeg::format::Pixel;
+    // Phase B: Pixel / ScaleContext / ScaleFlags / Video は run_video_decode に移管。
+    // run_decoder = demux thread はもう video frame を直接触らない。
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::media::Type as MediaType;
     use ffmpeg::software::resampling::Context as ResampleContext;
-    use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
-    use ffmpeg::util::frame::{audio::Audio, video::Video};
 
     // ── FFmpeg ライブラリ初期化 ──
     if let Err(e) = ffmpeg::init() {
@@ -291,9 +362,12 @@ fn run_decoder(
         None
     };
     let hw_active_initially = hw_setup_result.is_some();
-    let _hw_device = hw_setup_result;
+    // Phase B: `_hw_device` は mut にする (= SW 再試行時に take() で空にする)。
+    // 以前は `drop(_hw_device)` で move していたが、後段で video decode thread に
+    // move する必要があるため、None 状態に置き換える形に変更。
+    let mut _hw_device = hw_setup_result;
 
-    let mut video_decoder = match video_decoder_ctx.decoder().video() {
+    let video_decoder = match video_decoder_ctx.decoder().video() {
         Ok(d) => d,
         Err(e) => {
             // HW 有効で open 失敗 → SW で再試行
@@ -310,7 +384,10 @@ fn run_decoder(
                         return;
                     }
                 };
-                drop(_hw_device);
+                // HW デバイスを drop (= AVBufferRef を unref) して None にする。
+                // この値は後段で video decode thread に move されるが、SW 再試行後は
+                // None なのでそのまま渡しても問題ない。
+                _hw_device = None;
                 match retry_ctx.decoder().video() {
                     Ok(d) => d,
                     Err(e2) => {
@@ -339,11 +416,8 @@ fn run_decoder(
     // (key に width/height を含めるのは、HW のサーフェス内部寸法と display 寸法が
     // 異なる場合や mid-stream で resolution change が起きた場合に
     // ScaleContext::run が `InputChanged` で全 frame skip に陥るのを防ぐため。)
-    let mut scaler: Option<ScaleContext> = None;
-    let mut scaler_key: Option<(Pixel, u32, u32)> = None;
-    // 1 フレーム目で実際の format を perf に出力する (HW 期待で SW にフォールバックした
-    // ケースを `decode_path` から判別するため)。
-    let mut first_frame_logged = false;
+    // Phase B: scaler / scaler_key / first_frame_logged はすべて run_video_decode の
+    // ローカル変数として所有される (= デコーダ + GPU パスは別 thread)。
 
     // ── 音声ストリーム選択 (任意) ──
     let audio_setup = match input.streams().best(MediaType::Audio) {
@@ -510,27 +584,106 @@ fn run_decoder(
         );
     }
 
-    // ── デコードループ ──
+    // ── Phase A (3-thread split): audio decode を独立スレッドに切り出す ──
+    // 音声 packet 検出時は decode せず `audio_pkt_tx` に enqueue するだけにする。
+    // これにより `audio_tx` (bounded=32) が満杯でも demux/video decode は止まらず、
+    // `video_tx` (bounded=24) が枯渇しなくなる (旧構造の "buf 0/24" 振動の解消)。
+    //
+    // 容量 64: ~1 秒分の音声 packet (= 約 50 packets/sec × 1.3s) を吸収可能。これ以上は
+    // demux 側の `audio_pkt_tx.send` で blocking して逆圧をかける (= audio 出力が
+    // 詰まるなら demux も止める方が、丸ごと burst 補充が走るより破綻しにくい)。
+    let audio_stream_idx_for_demux: Option<usize> =
+        audio_setup.as_ref().map(|a| a.stream_idx);
+    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(64);
+    // audio decode thread の JoinHandle。run_decoder 終了時に
+    // `drop(audio_pkt_tx)` → channel disconnect → audio thread exit を経由して join する。
+    // `audio_setup` は ここで consume される (= 以降 demux からは触らない)。
+    let audio_decode_handle: Option<std::thread::JoinHandle<()>> = if let Some(setup) =
+        audio_setup
+    {
+        let clock_a = clock.clone();
+        let cancel_a = cancel.clone();
+        // audio_tx の所有を audio decode thread に move。run_decoder 側は
+        // 以降 audio_tx を直接触らない (audio_pkt_tx 経由で間接的に流す)。
+        let audio_tx_for_thread = audio_tx;
+        Some(
+            std::thread::Builder::new()
+                .name("video-audio-decode".into())
+                .spawn(move || {
+                    run_audio_decode(
+                        setup,
+                        audio_pkt_rx,
+                        audio_tx_for_thread,
+                        clock_a,
+                        cancel_a,
+                    );
+                })
+                .expect("spawn video-audio-decode thread"),
+        )
+    } else {
+        // 音声無し動画: audio_tx と audio_pkt_rx を即 close する。AudioOutput pump は
+        // 元から起動しないか、起動しても channel disconnect で即終了する。
+        drop(audio_tx);
+        drop(audio_pkt_rx);
+        None
+    };
+
+    // ── Phase B (3-thread split): video decode も独立スレッドに切り出す ──
+    // 旧構造では demux と video decode が同居しており、4K HEVC SW デコードや
+    // HDD random read 100-300ms スパイクで video decode が止まると demux も止まり、
+    // 音声 packet の `audio_pkt_tx` への流量も途絶えていた (= audio decode thread が
+    // 飢餓状態に)。Phase B では demux thread が `input.packets()` ループを単独で
+    // 回し、video packet を `video_pkt_tx` に enqueue するだけに専念する。
+    //
+    // 容量 64: 60fps で ~1 秒分の video packet を吸収可能。post-seek burst の
+    // 数十フレーム + steady-state の数フレームには十分な余裕。video decode 側で
+    // pacing sleep (5ms × 数十回) が入っているとき、demux は packet を 64 個まで
+    // queue しながら次のシークまで待てる。
     let video_tb_num = video_time_base.numerator() as f64;
     let video_tb_den = video_time_base.denominator() as f64;
-    let mut audio_setup = audio_setup;
-    let mut current_seek_serial: u64 = 0;
-    // 直前に video_tx へ enqueue 成功したフレームの pts。pts ギャップ計測用。
-    let mut last_enqueued_pts: f64 = 0.0;
-    // Phase 8.K (Codex P1): post-seek 第 1 フレーム送出済みフラグ。
-    // SEEK_BURST_LEAD_MAX_SECS=0.20 cap は通常の seek burst 抑制には機能するが、
-    // sparse/低 fps/VFR 動画で「seek target 直後のフレーム pts が target+0.20 を
-    // 超える」ケースで送出を阻害し UI が seek 完了を検知できず hang する。
-    // post-seek の 1 枚目だけは ahead に関係なく送出して override を確実に解除する。
-    // 起動時は true (まだ seek していない = cap 通常適用)、seek 受信時に false へ、
-    // 送出成功時に true へ戻す。
-    let mut post_seek_frame_sent: bool = true;
-    // post-seek preroll: avformat_seek_file は target ぴったりではなく
-    // **直前の keyframe** に戻ることが多い。そのまま再生すると seek 直前の
-    // PTS (例: 10s) のフレームが届き、それで AvClock が更新されてシークバーが
-    // 戻って見える。target_secs 未満のフレームは renderer/audio に届く前に
-    // ここで捨てる (動画) / 部分 trim する (音声)。
-    let mut drop_before_secs: Option<f64> = None;
+    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoWorkerMsg>(64);
+    let video_decode_handle: std::thread::JoinHandle<()> = {
+        let clock_v = clock.clone();
+        let cancel_v = cancel.clone();
+        let engine_state_v = engine_state.clone();
+        let skipped_frame_count_v = skipped_frame_count.clone();
+        // video_tx の所有を video decode thread に move。run_decoder (= demux) 側は
+        // 以降 video_tx を直接触らない (video_pkt_tx 経由で間接的に流す)。
+        let video_tx_for_thread = video_tx;
+        // gpu_video_device は cfg(windows) のみ存在する Option<Arc<...>>。
+        // Arc は move で thread 跨ぎ OK。
+        #[cfg(windows)]
+        let gpu_video_device_v = gpu_video_device;
+        std::thread::Builder::new()
+            .name("video-decode".into())
+            .spawn(move || {
+                run_video_decode(
+                    video_decoder,
+                    _hw_device,
+                    #[cfg(windows)]
+                    gpu_video_device_v,
+                    video_pkt_rx,
+                    video_tx_for_thread,
+                    clock_v,
+                    cancel_v,
+                    engine_state_v,
+                    skipped_frame_count_v,
+                    dst_w,
+                    dst_h,
+                    video_tb_num,
+                    video_tb_den,
+                    video_fps_num,
+                    video_fps_den,
+                    hw_active_initially,
+                )
+            })
+            .expect("spawn video-decode thread")
+    };
+    // この時点で run_decoder = demux thread として再構成される。video_decoder /
+    // _hw_device / gpu_video_device / video_tx はすべて video decode thread が所有。
+    // 以下のループは demux + seek 調停 + EOF idle wait に専念する。
+
+    // ── デコードループ (demux thread) ──
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
@@ -544,10 +697,10 @@ fn run_decoder(
                 direction,
                 serial,
             } = req;
-            current_seek_serial = serial;
-            drop_before_secs = Some(target_secs);
-            // Phase 8.K (Codex P1): 新世代 seek なので「post-seek 1 枚目未送出」状態へ。
-            post_seek_frame_sent = false;
+            // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
+            // すべて video decode thread のローカル変数として所有される。demux thread は
+            // 「seek 要求を受け取り → input.seek() を実行 → 両 decode thread に Flush
+            // marker を送る」までを担当。
             // タイムスタンプは AV_TIME_BASE_Q (1/1_000_000 秒、マイクロ秒) 単位。
             let target_pts = (target_secs * 1_000_000.0) as i64;
 
@@ -591,12 +744,7 @@ fn run_decoder(
             if seek_result.is_err() {
                 // 完全失敗: override を明示解除しないと pace_now が target 固定で
                 // UI が hang する。clock 経由で wall extrapolation に切替える。
-                drop_before_secs = None;
                 clock.clear_seek_target_override(serial);
-                // Phase 8.K (Codex P3): override が clear された後は post-seek 1 枚目
-                // 保護も不要 (= 通常 pacing に戻す)。これを true にしないと、次の
-                // 通常フレームが video_tx full 時に full-wait 経路に入り続けてしまう。
-                post_seek_frame_sent = true;
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "video",
@@ -611,9 +759,34 @@ fn run_decoder(
                     );
                 }
             }
-            video_decoder.flush();
-            if let Some(ref mut a) = audio_setup {
-                a.decoder.flush();
+            // Phase B: video / audio どちらの decoder も別 thread が所有しているので、
+            // Flush は channel 経由で送る。順序保証 channel なので、Flush 後に enqueue
+            // される packet は前世代として処理されない。
+            // - 成功時: target_secs = Some(t) → 受信側は post-seek preroll 用に
+            //   drop_before_secs = Some(t) を設定 (video は post_seek_frame_sent=false に)
+            // - 失敗時: target_secs = None → 受信側は preroll trim せず通常 pacing に戻す
+            let target_for_flush = if seek_result.is_ok() {
+                Some(target_secs)
+            } else {
+                None
+            };
+            // video_pkt_tx は drop されない (video decode thread が生きている間ずっと
+            // 受信可能)。send は blocking なので順序保証されるが、cancel 中は
+            // disconnect になる可能性がある (= video decode thread 終了後)。
+            if video_pkt_tx
+                .send(VideoWorkerMsg::Flush {
+                    serial,
+                    target_secs: target_for_flush,
+                })
+                .is_err()
+            {
+                break 'outer;
+            }
+            if audio_stream_idx_for_demux.is_some() {
+                let _ = audio_pkt_tx.send(AudioWorkerMsg::Flush {
+                    serial,
+                    target_secs: target_for_flush,
+                });
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
             // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
@@ -658,581 +831,40 @@ fn run_decoder(
                 break 'outer;
             }
             if stream.index() == video_stream_idx {
-                let send_t0 = std::time::Instant::now();
-                if let Err(e) = video_decoder.send_packet(&packet) {
-                    crate::logger::log(format!("video send_packet: {e}"));
-                    continue;
-                }
-                let mut frame = Video::empty();
-                while video_decoder.receive_frame(&mut frame).is_ok() {
-                    if cancel.load(Ordering::Acquire) {
-                        break 'outer;
-                    }
-                    let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
-                    let pts = frame.pts().unwrap_or(0);
-                    let pts_secs = (pts as f64) * video_tb_num / video_tb_den;
-                    // post-seek preroll: target 前のフレームは描画しない
-                    if let Some(min) = drop_before_secs {
-                        if pts_secs + 0.005 < min {
-                            continue;
-                        } else {
-                            // target に到達した → preroll guard 解除 (動画側のみ)
-                            // 音声側はまだ trim 必要なので drop_before_secs はそのまま残す
-                        }
-                    }
-
-                    // ── GPU 経路 (HW デコード + 共有 D3D11 device) ──
-                    // frame.format() == AV_PIX_FMT_D3D11 かつ mIV 側で GpuVideoDevice が
-                    // 利用可能な場合、av_hwframe_transfer_data + swscale を **完全に
-                    // スキップ** して、ID3D11VideoProcessor で直接 NV12→RGBA blit する。
-                    // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
-                    #[cfg(windows)]
-                    if matches!(frame.format(), Pixel::D3D11) {
-                        if let Some(gpu_dev) = gpu_video_device.as_ref() {
-                            match try_gpu_blit_path(
-                                gpu_dev,
-                                &frame,
-                                dst_w,
-                                dst_h,
-                                pts_secs,
-                                current_seek_serial,
-                                &mut first_frame_logged,
-                                hw_active_initially,
-                                video_fps_num,
-                                video_fps_den,
-                            ) {
-                                Ok(gpu_frame_out) => {
-                                    // ── デコーダのペーシング (GPU 経路) ──
-                                    // CPU 経路と同じロジックで pts を wall pacing now に追従
-                                    // させる。これを抜くと decoder が動画 PTS を無視して
-                                    // 最大速で blit + send し続け、UI 側で「全フレームが早送
-                                    // り」状態のカクつきになる (= GPU 経路初期実装の bug)。
-                                    //
-                                    // Phase 3d: audio_buf escape は **engine が Playing の
-                                    // ときだけ** 有効化する (= Buffering / Loading / Seeking
-                                    // 中は急送出しない、序盤早送りの構造的解消)。
-                                    //
-                                    // Phase 3e: `PACE_LEAD` も engine が Playing のときだけ
-                                    // 適用する。Loading/Buffering 中は閾値 0 で「pts が past
-                                    // のときだけ send」する厳しい pacing にする (= 動画 open
-                                    // 直後の wall pace_now がまだ小さい期間に未来 frames を
-                                    // 連続送出する bug を防ぐ、ユーザー報告の「序盤早送り」)。
-                                    // Phase 8.K: PACE_LEAD を 0.10 → 0.30 に拡大。
-                                    // 旧 0.10 は 30fps で ~3 frames 分しか先読みせず、
-                                    // future_frames 残量が常に 3/24 = 12.5% (= yellow) で
-                                    // 推移し、decoder の僅かなストールで容易に枯渇していた。
-                                    // 0.30s = 9 frames @ 30fps / 18 frames @ 60fps にすると
-                                    // buf strip が steady-state で green を維持し、I/O や
-                                    // demux の短時間スパイクを吸収できる。
-                                    // (VLC default cache 300ms / mpv cache-secs 1.0s と整合)
-                                    const PACE_LEAD_SECS: f64 = 0.30;
-                                    const AUDIO_SAFE_LO: f64 = 0.25;
-                                    const AUDIO_SAFE_HI: f64 = 0.75;
-                                    // Phase 8.F: seek burst の pts ahead 上限。
-                                    const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
-                                    // Phase 8.G (Codex 指摘で AUDIO_CRITICAL_LO 導入):
-                                    // steady-state では audio_buf が LO=0.25 直下を hover する
-                                    // ため、escape 緊急閾値を LO に置くと「常に緊急 → 無制限
-                                    // burst」になる。CRITICAL_LO=0.08 でほぼ枯渇時のみ無制限化。
-                                    const AUDIO_CRITICAL_LO: f64 = 0.08;
-                                    let mut in_audio_escape = false;
-                                    let mut new_seek_pending = false;
-                                    while !cancel.load(Ordering::Acquire) && clock.is_playing() {
-                                        // Phase 8.K (Codex P1 #1 / P3): 新世代 seek 受信時の早期脱出。
-                                        // pacing loop sleep 中に user seek が来ると clock.is_seeking()
-                                        // は flip するが post_seek_frame_sent は前世代の true のまま
-                                        // で、cap 判定に引っかかって sleep 無限ループになる。
-                                        // 古い世代のフレーム送出をスキップして outer loop へ戻し、
-                                        // take_seek_request で新世代を即消費させる。
-                                        if clock.current_seek_serial() != current_seek_serial {
-                                            new_seek_pending = true;
-                                            break;
-                                        }
-                                        let audio_buf = clock.total_audio_buffer_secs();
-                                        let audio_active = clock.is_audio_active();
-                                        let engine_playing = engine_state.load(Ordering::Acquire)
-                                            == crate::video::engine::actor::state_code::PLAYING;
-                                        // Phase 8.F (Codex P2): 旧コードは engine_playing が
-                                        // 立つまで in_audio_escape を更新しなかったため、Buffering
-                                        // 中の audio starvation を検知できず pacing sleep が長く
-                                        // なっていた。audio_active であれば常時更新する。
-                                        if audio_active {
-                                            if audio_buf < AUDIO_SAFE_LO {
-                                                in_audio_escape = true;
-                                            } else if audio_buf >= AUDIO_SAFE_HI {
-                                                in_audio_escape = false;
-                                            }
-                                        }
-                                        let ahead = pts_secs - clock.video_pacing_now_secs();
-                                        // Phase 8.K (Codex P1 #2): post-seek 1 枚目で video_tx full
-                                        // なら try_send で drop されてしまう。drop すると override
-                                        // が解除されず seek が hang する。1 枚目限定で空きを待つ。
-                                        // 通常時 (post_seek_frame_sent=true) は drop 許容のまま。
-                                        if !post_seek_frame_sent && video_tx.is_full() {
-                                            std::thread::sleep(std::time::Duration::from_millis(5));
-                                            continue;
-                                        }
-                                        // seek override 中でも、audio_buf が HI 以上または ahead
-                                        // が上限に達したら burst を止める (Phase 8.F P1)。
-                                        // ただし audio が枯渇しそう (< LO) なときは ahead 上限を
-                                        // 緩めて burst 継続 (= audio 優先)。
-                                        // Phase 8.K: 音声無し動画では audio_buf=0 が常に < LO なので、
-                                        // 旧コードでは seek burst が無制限になり open 直後に
-                                        // 数百フレームをデコード → video_tx (cap 24) 溢れで 80% drop
-                                        // → demux 位置が表示位置から大きく乖離 → 7+ 秒の表示フリーズ
-                                        // を引き起こしていた。audio_active 判定で「音声があるとき
-                                        // だけ」audio_buf による緊急 burst を許可する。
-                                        // Phase 8.K (Codex P1): post-seek 1 枚目は ahead に関係なく
-                                        // 送出して seek override 解除を保証する (sparse/低 fps 対策)。
-                                        if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
-                                            if !post_seek_frame_sent
-                                                || ahead < SEEK_BURST_LEAD_MAX_SECS
-                                            {
-                                                break;
-                                            }
-                                            if audio_active && audio_buf < AUDIO_SAFE_LO {
-                                                break;
-                                            }
-                                        }
-                                        let pace_lead = if engine_playing {
-                                            PACE_LEAD_SECS
-                                        } else {
-                                            0.0
-                                        };
-                                        if ahead <= pace_lead {
-                                            break;
-                                        }
-                                        // Phase 8.G: escape burst にも lead cap を適用。
-                                        // 旧コードは escape 中無制限 burst → video_tx (cap 8) 超過
-                                        // → drop → audio_tx 満杯で decoder block → 440ms stall
-                                        // が周期発生し pan のカクつきを生んでいた。
-                                        // - ahead < cap (200ms): burst 継続
-                                        // - audio_buf < CRITICAL (80ms、= ほぼ枯渇): 無制限 burst
-                                        // - それ以外: sleep して steady wall-rate 生産に戻る
-                                        if in_audio_escape {
-                                            if ahead < SEEK_BURST_LEAD_MAX_SECS
-                                                || audio_buf < AUDIO_CRITICAL_LO
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(5));
-                                    }
-
-                                    // Phase 8.K (Codex P3): 新世代 seek 受信中ならこのフレームは
-                                    // 古い世代なので送らずに outer loop に戻り、新 seek を消費する。
-                                    if new_seek_pending {
-                                        continue 'outer;
-                                    }
-
-                                    use crossbeam_channel::TrySendError;
-                                    let pts_gap = pts_secs - last_enqueued_pts;
-                                    let send_result = video_tx.try_send(gpu_frame_out);
-                                    let dropped_full =
-                                        matches!(&send_result, Err(TrySendError::Full(_)));
-                                    if !dropped_full && send_result.is_ok() {
-                                        last_enqueued_pts = pts_secs;
-                                        // Phase 8.K (Codex P1): post-seek 1 枚目を送出した。
-                                        post_seek_frame_sent = true;
-                                    }
-                                    if dropped_full {
-                                        skipped_frame_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    if crate::perf::is_enabled() {
-                                        crate::perf::event(
-                                            "video",
-                                            "decode",
-                                            None,
-                                            0,
-                                            &[
-                                                ("pts", serde_json::Value::from(pts_secs)),
-                                                ("path", serde_json::Value::from("gpu_blit")),
-                                                (
-                                                    "dropped_full",
-                                                    serde_json::Value::from(dropped_full),
-                                                ),
-                                                (
-                                                    "pts_gap_ms",
-                                                    serde_json::Value::from(pts_gap * 1000.0),
-                                                ),
-                                                (
-                                                    "audio_buf_secs",
-                                                    serde_json::Value::from(
-                                                        clock.total_audio_buffer_secs(),
-                                                    ),
-                                                ),
-                                                (
-                                                    "pace_now",
-                                                    serde_json::Value::from(
-                                                        clock.video_pacing_now_secs(),
-                                                    ),
-                                                ),
-                                            ],
-                                        );
-                                    }
-                                    if let Err(TrySendError::Disconnected(_)) = send_result {
-                                        break 'outer;
-                                    }
-                                    continue;
-                                }
-                                Err(e) => {
-                                    crate::logger::log(format!(
-                                        "GPU path failed, fallback to CPU readback: {e}"
-                                    ));
-                                    // フォールスルーして既存の CPU 経路に進む。
-                                }
-                            }
-                        }
-                    }
-
-                    // HW デコードの場合、`frame.format()` は `AV_PIX_FMT_D3D11`。
-                    // av_hwframe_transfer_data で GPU → CPU メモリに NV12 (10-bit なら P010)
-                    // として落とし、その SW フレームを scaler に食わせる。
-                    // get_format で SW にフォールバックされていれば format() は SW pix_fmt
-                    // を返すのでこの分岐に入らない。
-                    let mut sw_owned: Option<Video> = None;
-                    let frame_for_scaler: &Video = {
-                        let fmt = frame.format();
-                        if matches!(fmt, Pixel::D3D11) {
-                            let mut sw = Video::empty();
-                            unsafe {
-                                use ffmpeg_the_third::ffi::av_hwframe_transfer_data;
-                                let ret = av_hwframe_transfer_data(
-                                    sw.as_mut_ptr(),
-                                    frame.as_ptr(),
-                                    0,
-                                );
-                                if ret < 0 {
-                                    crate::logger::log(format!(
-                                        "av_hwframe_transfer_data failed: {ret}"
-                                    ));
-                                    continue;
-                                }
-                            }
-                            sw_owned = Some(sw);
-                            sw_owned.as_ref().unwrap()
-                        } else {
-                            &frame
-                        }
-                    };
-
-                    // scaler の lazy 構築 / 入力 (フォーマット|寸法) 変化時の再構築。
-                    let cur_fmt = frame_for_scaler.format();
-                    let cur_w = frame_for_scaler.width();
-                    let cur_h = frame_for_scaler.height();
-                    let cur_key = (cur_fmt, cur_w, cur_h);
-                    if !first_frame_logged && crate::perf::is_enabled() {
-                        let actual_path = if matches!(frame.format(), Pixel::D3D11) {
-                            "hw_d3d11va"
-                        } else if hw_active_initially {
-                            "sw_fallback_after_hw_init"
-                        } else {
-                            "sw"
-                        };
-                        crate::perf::event(
-                            "video",
-                            "first_frame",
-                            None,
-                            0,
-                            &[
-                                ("decode_path", serde_json::Value::from(actual_path)),
-                                ("frame_pix_fmt", serde_json::Value::from(format!("{cur_fmt:?}"))),
-                                ("frame_w", serde_json::Value::from(cur_w as i64)),
-                                ("frame_h", serde_json::Value::from(cur_h as i64)),
-                            ],
-                        );
-                        first_frame_logged = true;
-                    }
-                    if scaler.is_none() || scaler_key != Some(cur_key) {
-                        match ScaleContext::get(
-                            cur_fmt, cur_w, cur_h, Pixel::RGBA, dst_w, dst_h, ScaleFlags::BILINEAR,
-                        ) {
-                            Ok(s) => {
-                                scaler = Some(s);
-                                scaler_key = Some(cur_key);
-                            }
-                            Err(e) => {
-                                crate::logger::log(format!("sws_scale init: {e}"));
-                                continue;
-                            }
-                        }
-                    }
-                    let scaler_ref = scaler.as_mut().expect("scaler initialized above");
-                    let mut rgba = Video::empty();
-                    if let Err(e) = scaler_ref.run(frame_for_scaler, &mut rgba) {
-                        crate::logger::log(format!("sws_scale: {e}"));
-                        continue;
-                    }
-                    drop(sw_owned);
-                    // Plane 0 から bytes を取り出し (RGBA はパッキング 1 plane)
-                    let stride = rgba.stride(0);
-                    let needed_stride = (dst_w * 4) as usize;
-                    let plane = rgba.data(0);
-                    let bgra: Vec<u8> = if stride == needed_stride {
-                        plane.to_vec()
-                    } else {
-                        // パディング除去
-                        let mut out = Vec::with_capacity(needed_stride * dst_h as usize);
-                        for row in 0..dst_h as usize {
-                            let start = row * stride;
-                            out.extend_from_slice(&plane[start..start + needed_stride]);
-                        }
-                        out
-                    };
-                    let frame_out = VideoFrame {
-                        width: dst_w,
-                        height: dst_h,
-                        data: super::decoder::VideoFrameData::Cpu(bgra),
-                        pts_secs,
-                        seek_serial: current_seek_serial,
-                    };
-                    // **動画フレームは try_send (非ブロッキング)**。bounded(4) が満杯なら
-                    // フレームを drop して音声経路を生かす (Codex 指摘)。これにより
-                    // 動画 demux/decode が UI の消費に詰まったときも音声 demux/decode が
-                    // 止まらず、音声 ringbuf の underrun = ブチブチノイズを防ぐ。
-                    let scale_ms = send_t0.elapsed().as_secs_f64() * 1000.0 - decode_ms;
-
-                    // ── デコーダのペーシング ──
-                    //
-                    // pts が `video_pacing_now_secs() + PACE_LEAD` 以上先行している間 sleep。
-                    // pacing 無しだと try_send Full でフレーム連続 drop → channel 内 pts が
-                    // 不連続になり UI 側で「数百 ms 凍結 → ジャンプ」のカクツキを生む。
-                    //
-                    // audio safety: audio_active かつ総音声バッファが AUDIO_SAFE_LO 以下なら
-                    // pacing skip して audio packet 読み込みを優先 (sleep で audio 枯渇させない)。
-                    // Phase 3d: audio_buf escape は **engine が Playing のときだけ** 有効化する
-                    // (= Buffering / Loading / Seeking 中は急送出しない)。
-                    // Phase 3e: PACE_LEAD も engine が Playing のときだけ。Loading/Buffering
-                    // 中は閾値 0 で wall に厳密追従させ、序盤の連続送出を抑える。
-                    // Phase 8.K: PACE_LEAD を 0.10 → 0.30 に拡大 (詳細は GPU 経路の同コメント)。
-                    const PACE_LEAD_SECS: f64 = 0.30;
-                    const AUDIO_SAFE_LO: f64 = 0.25;
-                    const AUDIO_SAFE_HI: f64 = 0.75;
-                    const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
-                    const AUDIO_CRITICAL_LO: f64 = 0.08;
-                    let mut in_audio_escape = false;
-                    let mut new_seek_pending = false;
-                    while !cancel.load(Ordering::Acquire) && clock.is_playing() {
-                        // Phase 8.K (Codex P1 #1 / P3): 新世代 seek 受信時の早期脱出
-                        // (詳細は GPU 経路コメント)。
-                        if clock.current_seek_serial() != current_seek_serial {
-                            new_seek_pending = true;
-                            break;
-                        }
-                        let audio_buf = clock.total_audio_buffer_secs();
-                        let audio_active = clock.is_audio_active();
-                        let engine_playing = engine_state.load(Ordering::Acquire)
-                            == crate::video::engine::actor::state_code::PLAYING;
-                        if audio_active {
-                            if audio_buf < AUDIO_SAFE_LO {
-                                in_audio_escape = true;
-                            } else if audio_buf >= AUDIO_SAFE_HI {
-                                in_audio_escape = false;
-                            }
-                        }
-                        let ahead = pts_secs - clock.video_pacing_now_secs();
-                        // Phase 8.K (Codex P1 #2): post-seek 1 枚目で video_tx full なら
-                        // try_send で drop されないように空きを待つ (詳細は GPU 経路コメント)。
-                        if !post_seek_frame_sent && video_tx.is_full() {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                            continue;
-                        }
-                        // Phase 8.K: 音声無し動画では audio_buf=0 が常に < LO になり、
-                        // 旧コードは seek burst が無制限化 → video_tx 溢れで大量 drop →
-                        // 表示フリーズ。audio_active で gate する (詳細は GPU 経路コメント)。
-                        // Phase 8.K (Codex P1): post-seek 1 枚目は ahead に関係なく送出 (同上)。
-                        if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
-                            if !post_seek_frame_sent || ahead < SEEK_BURST_LEAD_MAX_SECS {
-                                break;
-                            }
-                            if audio_active && audio_buf < AUDIO_SAFE_LO {
-                                break;
-                            }
-                        }
-                        let pace_lead = if engine_playing { PACE_LEAD_SECS } else { 0.0 };
-                        if ahead <= pace_lead {
-                            break;
-                        }
-                        // Phase 8.G: escape burst にも lead cap (詳細は GPU 経路の同コメント)。
-                        if in_audio_escape {
-                            if ahead < SEEK_BURST_LEAD_MAX_SECS
-                                || audio_buf < AUDIO_CRITICAL_LO
-                            {
-                                break;
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-
-                    // Phase 8.K (Codex P3): 新世代 seek 受信中ならこのフレームは古い世代
-                    // なので送らずに outer loop に戻り、新 seek を消費する (詳細は GPU 経路)。
-                    if new_seek_pending {
-                        continue 'outer;
-                    }
-
-                    // perf: 直前に enqueue した pts との差を記録 (= channel に
-                    // 入っているフレームの pts ギャップが分かる、dropped_full だけでは
-                    // 「どれくらい飛んだか」が見えないため)。
-                    let pts_gap = pts_secs - last_enqueued_pts;
-                    use crossbeam_channel::TrySendError;
-                    let send_result = video_tx.try_send(frame_out);
-                    let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
-                    if !dropped_full && send_result.is_ok() {
-                        last_enqueued_pts = pts_secs;
-                        // Phase 8.K (Codex P1): post-seek 1 枚目を送出した。
-                        post_seek_frame_sent = true;
-                    }
-                    if dropped_full {
-                        skipped_frame_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "video",
-                            "decode",
-                            None,
-                            0,
-                            &[
-                                ("pts", serde_json::Value::from(pts_secs)),
-                                ("decode_ms", serde_json::Value::from(decode_ms.round() / 1.0)),
-                                ("scale_ms", serde_json::Value::from(scale_ms.round() / 1.0)),
-                                ("dropped_full", serde_json::Value::from(dropped_full)),
-                                ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
-                                ("audio_buf_secs", serde_json::Value::from(clock.total_audio_buffer_secs())),
-                                ("pace_now", serde_json::Value::from(clock.video_pacing_now_secs())),
-                            ],
-                        );
-                    }
-                    if let Err(TrySendError::Disconnected(_)) = send_result {
-                        break 'outer;
-                    }
+                // Phase B: video packet は decode せず video decode thread に転送する。
+                // pre-decode preroll trim (= drop_before_secs check) と pacing logic は
+                // すべて video decode thread 側に移管。
+                //
+                // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
+                // 直前の Flush marker と packet の到着順が逆転しない。bounded(64) が
+                // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい。
+                if video_pkt_tx
+                    .send(VideoWorkerMsg::Packet(packet))
+                    .is_err()
+                {
+                    // video decode thread が既に終了している → 自分も exit。
+                    break 'outer;
                 }
                 break; // 1 パケット消費したらループ先頭でシークチェック
-            } else if let Some(ref mut a) = audio_setup {
-                if stream.index() == a.stream_idx {
-                    // Phase 8.E: post-seek audio preroll を packet 段階で **decode せず**
-                    // 切り捨てる。avformat は seek backward 後 keyframe 直前から packets
-                    // を返すため、音声 stream は target から数百 ms 前の packets が連続
-                    // して届く。旧コードはそれらを send_packet → receive_frame → resample
-                    // → drop_before_secs でドロップしていたが、デコード + resample が
-                    // 1 packet ~5ms かかり 50 packets で 250ms 分 demux ループが詰まり、
-                    // 結果として post-seek の音声出力が ~1 秒途切れる現象に直結していた。
-                    // packet の pts + duration が target より明確に前なら decode をスキップ。
-                    // (packet boundary 上では target を跨ぐもののみデコードして
-                    //  drop_before_secs の sample-level trim 経路で正確に切り出す。)
-                    if let Some(min) = drop_before_secs {
-                        let pkt_pts = packet.pts().unwrap_or(i64::MIN);
-                        if pkt_pts != i64::MIN {
-                            let pkt_pts_secs =
-                                (pkt_pts as f64) * a.time_base_num / a.time_base_den;
-                            let pkt_dur_secs = (packet.duration().max(0) as f64)
-                                * a.time_base_num
-                                / a.time_base_den;
-                            if pkt_pts_secs + pkt_dur_secs < min - 0.020 {
-                                continue;
-                            }
-                        }
+            } else if let Some(audio_idx) = audio_stream_idx_for_demux {
+                if stream.index() == audio_idx {
+                    // Phase A: 音声 packet は decode せず audio decode thread に転送する。
+                    // packet 段階の pre-decode preroll trim と sample-level trim は両方
+                    // audio decode thread 側に移管した (= AudioWorkerMsg::Flush で渡した
+                    // target_secs を audio thread が `drop_before_secs` として保持)。
+                    //
+                    // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
+                    // 直前の Flush marker と packet の到着順が逆転しない。bounded(64) が
+                    // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい
+                    // (audio_pkt_rx 側が止まっているのに packet を取り続けると memory が
+                    // 無制限に膨らむ)。stall 中も cancel は反映可能 (recv 側 disconnect で
+                    // SendError → 'outer break)。
+                    if audio_pkt_tx.send(AudioWorkerMsg::Packet(packet)).is_err() {
+                        // audio decode thread が既に終了している (= disconnect)。
+                        // VideoPlayer の shutdown 経路 → 自分も exit。
+                        break 'outer;
                     }
-                    if let Err(e) = a.decoder.send_packet(&packet) {
-                        crate::logger::log(format!("audio send_packet: {e}"));
-                        continue;
-                    }
-                    let mut frame = Audio::empty();
-                    while a.decoder.receive_frame(&mut frame).is_ok() {
-                        if cancel.load(Ordering::Acquire) {
-                            break 'outer;
-                        }
-                        let pts = frame.pts().unwrap_or(0);
-                        let mut pts_secs = (pts as f64) * a.time_base_num / a.time_base_den;
-                        let mut resampled = Audio::empty();
-                        if let Err(e) = a.resampler.run(&frame, &mut resampled) {
-                            crate::logger::log(format!("swr resample: {e}"));
-                            continue;
-                        }
-                        // 1 plane (packed) の f32 を取り出す。
-                        //
-                        // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
-                        // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
-                        // のため **実サンプル数より大きいバイト列を返す**。
-                        // `chunks_exact(4)` で f32 化すると末尾のパディング
-                        // (未初期化メモリ or 0) も f32 として再生してしまい、
-                        // 強い "ブチブチ" ノイズの原因になる。
-                        //
-                        // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
-                        // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
-                        // を指定して `from_raw_parts` でスライス化する。これにより
-                        // FFmpeg の linesize パディングを完全にスキップできる。
-                        //
-                        // SAFETY:
-                        //   - resampled は packed format (Sample::F32(Type::Packed))
-                        //   - data[0] は frame の生存中有効
-                        //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
-                        //   - resampler.run() の出力なので i32 オーバーフローは起きない
-                        const CHANNELS: usize = 2;
-                        let nb_samples = resampled.samples();
-                        if nb_samples == 0 {
-                            // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
-                            // raw pointer dereference を避けて早期 continue。
-                            continue;
-                        }
-                        // ランタイム不変条件チェック (Codex P3): resampler の出力が
-                        // 期待通り f32 packed であること。デバッグ時に format/layout
-                        // を取り違えていれば即座に panic で気付ける。
-                        debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
-                        debug_assert!(resampled.is_packed());
-                        let element_count = nb_samples * CHANNELS;
-                        let samples: Vec<f32> = unsafe {
-                            let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
-                            debug_assert!(!raw_ptr.is_null());
-                            std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
-                        };
-                        let mut samples = samples;
-
-                        // post-seek preroll の trim:
-                        // avformat_seek は keyframe に戻るので、target_secs 未満の
-                        // 音声フレームが届く。完全に target 前ならフレーム破棄、
-                        // 跨ぐなら先頭 N サンプルを drain して target ぴったりから始める。
-                        if let Some(min) = drop_before_secs {
-                            const CHANNELS: usize = 2;
-                            let frame_secs = (samples.len() / CHANNELS) as f64
-                                / a.out_rate as f64;
-                            if pts_secs + frame_secs <= min {
-                                // 完全に target 前 → 捨てる
-                                continue;
-                            }
-                            if pts_secs < min {
-                                let skip_pairs = ((min - pts_secs) * a.out_rate as f64)
-                                    .ceil() as usize;
-                                let skip = (skip_pairs * CHANNELS).min(samples.len());
-                                samples.drain(..skip);
-                                pts_secs = min;
-                                if samples.is_empty() {
-                                    continue;
-                                }
-                            } else {
-                                // target に到達 → preroll guard 解除
-                                drop_before_secs = None;
-                            }
-                        }
-
-                        // 1 stereo pair = 2 float (samples_per_sec stereo = a.out_rate * 2)
-                        let duration_secs = (samples.len() / 2) as f64 / a.out_rate as f64;
-                        let frame_out = AudioFrame {
-                            samples,
-                            pts_secs,
-                            seek_serial: current_seek_serial,
-                            duration_secs,
-                        };
-                        // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
-                        // 競合しないよう順序を保つ。失敗時はロールバック (Codex 指摘)。
-                        clock.add_audio_tx_queued_secs(duration_secs);
-                        if audio_tx.send(frame_out).is_err() {
-                            clock.add_audio_tx_queued_secs(-duration_secs);
-                            break 'outer;
-                        }
-                    }
-                    break;
+                    break; // 1 パケット消費したらループ先頭でシークチェック
                 }
             }
         }
@@ -1246,13 +878,21 @@ fn run_decoder(
             // idle ループで待つ。これで末尾停止後の re-seek / replay が
             // decoder 再生成なしで動作する。
             clock.notify_eof_reached();
+            // Phase A: audio decode thread にも Eof を通知して残フレームを drain させる。
+            // (= 末尾の音声を確実に出し切る。drain しないと数十 ms の音声が抜ける。)
+            if audio_stream_idx_for_demux.is_some() {
+                let _ = audio_pkt_tx.send(AudioWorkerMsg::Eof);
+            }
+            // Phase B: video decode thread にも Eof を通知。動画は内部残フレームを
+            // 失っても許容なので drain しないが、Eof 自体は送って状態を伝える。
+            let _ = video_pkt_tx.send(VideoWorkerMsg::Eof);
             loop {
                 if cancel.load(Ordering::Acquire) {
                     crate::logger::log(format!(
                         "video decoder finished: {}",
                         path.display()
                     ));
-                    return;
+                    break 'outer;
                 }
                 if clock.peek_seek_request_pending() {
                     clock.clear_eof_reached();
@@ -1262,6 +902,705 @@ fn run_decoder(
             }
         }
     }
+
+    // Phase A/B: 終了時の cleanup。各 *_pkt_tx を drop → channel disconnect →
+    // 各 decode thread の recv() が Err で抜け → exit → join。
+    // 順序: audio を先に join (= cpal stream の bookkeeping を Drop より前に
+    // 完了させたい)、次に video。
+    drop(audio_pkt_tx);
+    if let Some(handle) = audio_decode_handle {
+        if let Err(e) = handle.join() {
+            crate::logger::log(format!("video-audio-decode thread panicked: {e:?}"));
+        }
+    }
+    drop(video_pkt_tx);
+    if let Err(e) = video_decode_handle.join() {
+        crate::logger::log(format!("video-decode thread panicked: {e:?}"));
+    }
+}
+
+/// Phase B: 動画 decode + (HW D3D11VA GPU blit / SW swscale) + pacing + VideoFrame
+/// 送出を担う独立スレッド。
+///
+/// 旧 `run_decoder` の動画 packet 処理ブロック (~450 行) を、`video_pkt_rx` から
+/// 受け取った [`VideoWorkerMsg`] を処理する形に再構成したもの。
+///
+/// 呼び出し元 (= demux thread) は動画 packet を `video_pkt_tx` に enqueue する
+/// だけで、`video_tx` (bounded=24) が満杯のときも自スレッドはブロックしない
+/// (= drop してカウンタ加算)。`video_pkt_rx` (bounded=64) は demux ↔ video decode
+/// の逆圧経路として機能する。
+///
+/// シーク時は demux 側が `VideoWorkerMsg::Flush { serial, target_secs }` を送る。
+/// この thread は `Flush` 受領で内部 decoder を `flush()` し、
+/// `current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent` をリセット
+/// する。`target_secs.is_none()` (= seek 失敗) の場合は preroll trim せず通常
+/// pacing に戻す (= post_seek_frame_sent を直ちに true)。
+///
+/// EOF 時は `VideoWorkerMsg::Eof` を受け取るが、動画は内部残フレームを失っても
+/// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
+#[allow(clippy::too_many_arguments)]
+fn run_video_decode(
+    mut video_decoder: ffmpeg_the_third::decoder::Video,
+    _hw_device: Option<HwDevice>,
+    #[cfg(windows)] gpu_video_device: Option<
+        std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
+    video_pkt_rx: Receiver<VideoWorkerMsg>,
+    video_tx: Sender<VideoFrame>,
+    clock: Arc<AvClock>,
+    cancel: Arc<AtomicBool>,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
+    skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
+    dst_w: u32,
+    dst_h: u32,
+    video_tb_num: f64,
+    video_tb_den: f64,
+    video_fps_num: u32,
+    video_fps_den: u32,
+    hw_active_initially: bool,
+) {
+    use ffmpeg_the_third as ffmpeg;
+    use ffmpeg::format::Pixel;
+    use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
+    use ffmpeg::util::frame::video::Video;
+
+    let mut scaler: Option<ScaleContext> = None;
+    let mut scaler_key: Option<(Pixel, u32, u32)> = None;
+    let mut first_frame_logged = false;
+    let mut current_seek_serial: u64 = 0;
+    let mut drop_before_secs: Option<f64> = None;
+    let mut post_seek_frame_sent: bool = true;
+    let mut last_enqueued_pts: f64 = 0.0;
+
+    'outer: loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let msg = match video_pkt_rx.recv() {
+            Ok(m) => m,
+            Err(_) => break, // demux thread exited → channel disconnect
+        };
+        let packet = match msg {
+            VideoWorkerMsg::Flush { serial, target_secs } => {
+                video_decoder.flush();
+                current_seek_serial = serial;
+                drop_before_secs = target_secs;
+                // 成功時 (target_secs = Some) → post-seek 1 枚目を待つので false
+                // 失敗時 (target_secs = None) → 通常 pacing に戻すので true
+                post_seek_frame_sent = target_secs.is_none();
+                continue;
+            }
+            VideoWorkerMsg::Eof => {
+                // 動画は EOF で内部 frame を失っても許容 (旧 run_decoder と同じ挙動)。
+                // 何もせず次の Packet/Flush/disconnect を待つ。
+                continue;
+            }
+            VideoWorkerMsg::Packet(p) => p,
+        };
+
+        let send_t0 = std::time::Instant::now();
+        if let Err(e) = video_decoder.send_packet(&packet) {
+            crate::logger::log(format!("video send_packet: {e}"));
+            continue;
+        }
+        let mut frame = Video::empty();
+        while video_decoder.receive_frame(&mut frame).is_ok() {
+            if cancel.load(Ordering::Acquire) {
+                break 'outer;
+            }
+            let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+            let pts = frame.pts().unwrap_or(0);
+            let pts_secs = (pts as f64) * video_tb_num / video_tb_den;
+            // post-seek preroll: target 前のフレームは描画しない
+            if let Some(min) = drop_before_secs {
+                if pts_secs + 0.005 < min {
+                    continue;
+                } else {
+                    // target に到達した → preroll guard 解除 (動画側のみ)
+                    // 音声側はまだ trim 必要なので drop_before_secs は audio thread
+                    // が独自に管理する (= ここでは触らない)。
+                }
+            }
+
+            // ── GPU 経路 (HW デコード + 共有 D3D11 device) ──
+            // frame.format() == AV_PIX_FMT_D3D11 かつ mIV 側で GpuVideoDevice が
+            // 利用可能な場合、av_hwframe_transfer_data + swscale を **完全に
+            // スキップ** して、ID3D11VideoProcessor で直接 NV12→RGBA blit する。
+            // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
+            #[cfg(windows)]
+            if matches!(frame.format(), Pixel::D3D11) {
+                if let Some(gpu_dev) = gpu_video_device.as_ref() {
+                    match try_gpu_blit_path(
+                        gpu_dev,
+                        &frame,
+                        dst_w,
+                        dst_h,
+                        pts_secs,
+                        current_seek_serial,
+                        &mut first_frame_logged,
+                        hw_active_initially,
+                        video_fps_num,
+                        video_fps_den,
+                    ) {
+                        Ok(gpu_frame_out) => {
+                            // ── デコーダのペーシング (GPU 経路) ──
+                            // (詳細コメントは旧 run_decoder GPU 経路コメント参照、
+                            //  Phase 8.K の PACE_LEAD=0.30 / post_seek_frame_sent /
+                            //  SEEK_BURST_LEAD_MAX_SECS / generation race check 等)。
+                            const PACE_LEAD_SECS: f64 = 0.30;
+                            const AUDIO_SAFE_LO: f64 = 0.25;
+                            const AUDIO_SAFE_HI: f64 = 0.75;
+                            const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
+                            const AUDIO_CRITICAL_LO: f64 = 0.08;
+                            let mut in_audio_escape = false;
+                            let mut new_seek_pending = false;
+                            while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                                if clock.current_seek_serial() != current_seek_serial {
+                                    new_seek_pending = true;
+                                    break;
+                                }
+                                let audio_buf = clock.total_audio_buffer_secs();
+                                let audio_active = clock.is_audio_active();
+                                let engine_playing = engine_state.load(Ordering::Acquire)
+                                    == crate::video::engine::actor::state_code::PLAYING;
+                                if audio_active {
+                                    if audio_buf < AUDIO_SAFE_LO {
+                                        in_audio_escape = true;
+                                    } else if audio_buf >= AUDIO_SAFE_HI {
+                                        in_audio_escape = false;
+                                    }
+                                }
+                                let ahead = pts_secs - clock.video_pacing_now_secs();
+                                if !post_seek_frame_sent && video_tx.is_full() {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                    continue;
+                                }
+                                if clock.is_seeking()
+                                    && !in_audio_escape
+                                    && audio_buf < AUDIO_SAFE_HI
+                                {
+                                    if !post_seek_frame_sent
+                                        || ahead < SEEK_BURST_LEAD_MAX_SECS
+                                    {
+                                        break;
+                                    }
+                                    if audio_active && audio_buf < AUDIO_SAFE_LO {
+                                        break;
+                                    }
+                                }
+                                let pace_lead = if engine_playing {
+                                    PACE_LEAD_SECS
+                                } else {
+                                    0.0
+                                };
+                                if ahead <= pace_lead {
+                                    break;
+                                }
+                                if in_audio_escape {
+                                    if ahead < SEEK_BURST_LEAD_MAX_SECS
+                                        || audio_buf < AUDIO_CRITICAL_LO
+                                    {
+                                        break;
+                                    }
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            if new_seek_pending {
+                                // Phase B: 新世代 seek 受信時は次の recv() に戻る。
+                                // 以降のフレームも generation race check で同様に
+                                // skip され、Flush に到達したら video_decoder.flush()
+                                // で残バッファごと clean up される。
+                                continue 'outer;
+                            }
+                            use crossbeam_channel::TrySendError;
+                            let pts_gap = pts_secs - last_enqueued_pts;
+                            let send_result = video_tx.try_send(gpu_frame_out);
+                            let dropped_full =
+                                matches!(&send_result, Err(TrySendError::Full(_)));
+                            if !dropped_full && send_result.is_ok() {
+                                last_enqueued_pts = pts_secs;
+                                post_seek_frame_sent = true;
+                            }
+                            if dropped_full {
+                                skipped_frame_count
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "video",
+                                    "decode",
+                                    None,
+                                    0,
+                                    &[
+                                        ("pts", serde_json::Value::from(pts_secs)),
+                                        ("path", serde_json::Value::from("gpu_blit")),
+                                        (
+                                            "dropped_full",
+                                            serde_json::Value::from(dropped_full),
+                                        ),
+                                        (
+                                            "pts_gap_ms",
+                                            serde_json::Value::from(pts_gap * 1000.0),
+                                        ),
+                                        (
+                                            "audio_buf_secs",
+                                            serde_json::Value::from(
+                                                clock.total_audio_buffer_secs(),
+                                            ),
+                                        ),
+                                        (
+                                            "pace_now",
+                                            serde_json::Value::from(
+                                                clock.video_pacing_now_secs(),
+                                            ),
+                                        ),
+                                    ],
+                                );
+                            }
+                            if let Err(TrySendError::Disconnected(_)) = send_result {
+                                break 'outer;
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "GPU path failed, fallback to CPU readback: {e}"
+                            ));
+                            // フォールスルーして既存の CPU 経路に進む。
+                        }
+                    }
+                }
+            }
+
+            // HW デコードの場合、`frame.format()` は `AV_PIX_FMT_D3D11`。
+            // av_hwframe_transfer_data で GPU → CPU メモリに NV12 (10-bit なら P010)
+            // として落とし、その SW フレームを scaler に食わせる。
+            let mut sw_owned: Option<Video> = None;
+            let frame_for_scaler: &Video = {
+                let fmt = frame.format();
+                if matches!(fmt, Pixel::D3D11) {
+                    let mut sw = Video::empty();
+                    unsafe {
+                        use ffmpeg_the_third::ffi::av_hwframe_transfer_data;
+                        let ret = av_hwframe_transfer_data(
+                            sw.as_mut_ptr(),
+                            frame.as_ptr(),
+                            0,
+                        );
+                        if ret < 0 {
+                            crate::logger::log(format!(
+                                "av_hwframe_transfer_data failed: {ret}"
+                            ));
+                            continue;
+                        }
+                    }
+                    sw_owned = Some(sw);
+                    sw_owned.as_ref().unwrap()
+                } else {
+                    &frame
+                }
+            };
+
+            // scaler の lazy 構築 / 入力 (フォーマット|寸法) 変化時の再構築。
+            let cur_fmt = frame_for_scaler.format();
+            let cur_w = frame_for_scaler.width();
+            let cur_h = frame_for_scaler.height();
+            let cur_key = (cur_fmt, cur_w, cur_h);
+            if !first_frame_logged && crate::perf::is_enabled() {
+                let actual_path = if matches!(frame.format(), Pixel::D3D11) {
+                    "hw_d3d11va"
+                } else if hw_active_initially {
+                    "sw_fallback_after_hw_init"
+                } else {
+                    "sw"
+                };
+                crate::perf::event(
+                    "video",
+                    "first_frame",
+                    None,
+                    0,
+                    &[
+                        ("decode_path", serde_json::Value::from(actual_path)),
+                        ("frame_pix_fmt", serde_json::Value::from(format!("{cur_fmt:?}"))),
+                        ("frame_w", serde_json::Value::from(cur_w as i64)),
+                        ("frame_h", serde_json::Value::from(cur_h as i64)),
+                    ],
+                );
+                first_frame_logged = true;
+            }
+            if scaler.is_none() || scaler_key != Some(cur_key) {
+                match ScaleContext::get(
+                    cur_fmt,
+                    cur_w,
+                    cur_h,
+                    Pixel::RGBA,
+                    dst_w,
+                    dst_h,
+                    ScaleFlags::BILINEAR,
+                ) {
+                    Ok(s) => {
+                        scaler = Some(s);
+                        scaler_key = Some(cur_key);
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("sws_scale init: {e}"));
+                        continue;
+                    }
+                }
+            }
+            let scaler_ref = scaler.as_mut().expect("scaler initialized above");
+            let mut rgba = Video::empty();
+            if let Err(e) = scaler_ref.run(frame_for_scaler, &mut rgba) {
+                crate::logger::log(format!("sws_scale: {e}"));
+                continue;
+            }
+            drop(sw_owned);
+            // Plane 0 から bytes を取り出し (RGBA はパッキング 1 plane)
+            let stride = rgba.stride(0);
+            let needed_stride = (dst_w * 4) as usize;
+            let plane = rgba.data(0);
+            let bgra: Vec<u8> = if stride == needed_stride {
+                plane.to_vec()
+            } else {
+                // パディング除去
+                let mut out = Vec::with_capacity(needed_stride * dst_h as usize);
+                for row in 0..dst_h as usize {
+                    let start = row * stride;
+                    out.extend_from_slice(&plane[start..start + needed_stride]);
+                }
+                out
+            };
+            let frame_out = VideoFrame {
+                width: dst_w,
+                height: dst_h,
+                data: VideoFrameData::Cpu(bgra),
+                pts_secs,
+                seek_serial: current_seek_serial,
+            };
+            let scale_ms = send_t0.elapsed().as_secs_f64() * 1000.0 - decode_ms;
+
+            // ── デコーダのペーシング (CPU 経路) ──
+            // (詳細コメントは旧 run_decoder CPU 経路コメント参照、Phase 8.K)。
+            const PACE_LEAD_SECS: f64 = 0.30;
+            const AUDIO_SAFE_LO: f64 = 0.25;
+            const AUDIO_SAFE_HI: f64 = 0.75;
+            const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
+            const AUDIO_CRITICAL_LO: f64 = 0.08;
+            let mut in_audio_escape = false;
+            let mut new_seek_pending = false;
+            while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                if clock.current_seek_serial() != current_seek_serial {
+                    new_seek_pending = true;
+                    break;
+                }
+                let audio_buf = clock.total_audio_buffer_secs();
+                let audio_active = clock.is_audio_active();
+                let engine_playing = engine_state.load(Ordering::Acquire)
+                    == crate::video::engine::actor::state_code::PLAYING;
+                if audio_active {
+                    if audio_buf < AUDIO_SAFE_LO {
+                        in_audio_escape = true;
+                    } else if audio_buf >= AUDIO_SAFE_HI {
+                        in_audio_escape = false;
+                    }
+                }
+                let ahead = pts_secs - clock.video_pacing_now_secs();
+                if !post_seek_frame_sent && video_tx.is_full() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
+                    if !post_seek_frame_sent || ahead < SEEK_BURST_LEAD_MAX_SECS {
+                        break;
+                    }
+                    if audio_active && audio_buf < AUDIO_SAFE_LO {
+                        break;
+                    }
+                }
+                let pace_lead = if engine_playing { PACE_LEAD_SECS } else { 0.0 };
+                if ahead <= pace_lead {
+                    break;
+                }
+                if in_audio_escape {
+                    if ahead < SEEK_BURST_LEAD_MAX_SECS || audio_buf < AUDIO_CRITICAL_LO
+                    {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if new_seek_pending {
+                continue 'outer;
+            }
+
+            let pts_gap = pts_secs - last_enqueued_pts;
+            use crossbeam_channel::TrySendError;
+            let send_result = video_tx.try_send(frame_out);
+            let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
+            if !dropped_full && send_result.is_ok() {
+                last_enqueued_pts = pts_secs;
+                post_seek_frame_sent = true;
+            }
+            if dropped_full {
+                skipped_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "video",
+                    "decode",
+                    None,
+                    0,
+                    &[
+                        ("pts", serde_json::Value::from(pts_secs)),
+                        ("decode_ms", serde_json::Value::from(decode_ms.round() / 1.0)),
+                        ("scale_ms", serde_json::Value::from(scale_ms.round() / 1.0)),
+                        ("dropped_full", serde_json::Value::from(dropped_full)),
+                        ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
+                        (
+                            "audio_buf_secs",
+                            serde_json::Value::from(clock.total_audio_buffer_secs()),
+                        ),
+                        (
+                            "pace_now",
+                            serde_json::Value::from(clock.video_pacing_now_secs()),
+                        ),
+                    ],
+                );
+            }
+            if let Err(TrySendError::Disconnected(_)) = send_result {
+                break 'outer;
+            }
+        }
+    }
+}
+
+/// Phase A: 音声 decode + resample + AudioFrame 送出を担う独立スレッド。
+///
+/// 旧 `run_decoder` の音声 packet 処理ブロック (avcodec decode + swresample +
+/// `audio_tx.send`) と post-seek preroll trim (packet 段階 + sample 段階) を、
+/// `audio_pkt_rx` から受け取った [`AudioWorkerMsg`] を処理する形に再構成したもの。
+///
+/// 呼び出し元 (= demux + video decode thread) は音声 packet を `audio_pkt_tx` に
+/// enqueue するだけで、`audio_tx` (bounded=32) が満杯のときも自スレッドはブロック
+/// しない。`audio_pkt_rx` (bounded=64) は両 thread 間の逆圧経路として機能する。
+///
+/// シーク時は呼び出し元が `AudioWorkerMsg::Flush { serial, target_secs }` を送る。
+/// この thread は `Flush` 受領で内部 decoder を `flush()` し、
+/// `current_seek_serial` / `drop_before_secs` をリセットする。`target_secs` が
+/// `None` なら seek 失敗 (= demux 位置は動いていない) なので preroll trim は行わない。
+///
+/// EOF 時は `AudioWorkerMsg::Eof` を受けて内部 decoder を flush + 残フレーム drain。
+/// その後は次の `Flush` か `Packet` か channel disconnect (= run_decoder 終了) を待つ。
+fn run_audio_decode(
+    mut setup: AudioSetup,
+    audio_pkt_rx: Receiver<AudioWorkerMsg>,
+    audio_tx: Sender<AudioFrame>,
+    clock: Arc<AvClock>,
+    cancel: Arc<AtomicBool>,
+) {
+    use ffmpeg_the_third::util::frame::audio::Audio;
+
+    // run_decoder と同じ thread-local state。Flush で reset する。
+    let mut current_seek_serial: u64 = 0;
+    let mut drop_before_secs: Option<f64> = None;
+
+    'outer: loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let msg = match audio_pkt_rx.recv() {
+            Ok(m) => m,
+            // demux 側が exit (= run_decoder 終了 / cancel) → audio_pkt_tx drop →
+            // 自スレッドも exit。
+            Err(_) => break,
+        };
+        match msg {
+            AudioWorkerMsg::Flush { serial, target_secs } => {
+                setup.decoder.flush();
+                current_seek_serial = serial;
+                drop_before_secs = target_secs;
+            }
+            AudioWorkerMsg::Eof => {
+                // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
+                // 残サンプルを最後まで取り出して送る。これにより末尾の数十 ms が
+                // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
+                use ffmpeg_the_third::ffi::avcodec_send_packet;
+                unsafe {
+                    let _ = avcodec_send_packet(
+                        setup.decoder.as_mut_ptr(),
+                        std::ptr::null(),
+                    );
+                }
+                let mut frame = Audio::empty();
+                while setup.decoder.receive_frame(&mut frame).is_ok() {
+                    if cancel.load(Ordering::Acquire) {
+                        break 'outer;
+                    }
+                    if !emit_audio_frame(
+                        &mut setup,
+                        &frame,
+                        &mut drop_before_secs,
+                        current_seek_serial,
+                        &clock,
+                        &audio_tx,
+                    ) {
+                        break 'outer;
+                    }
+                }
+                // EOF 後 decoder を flush して次回の Packet/Flush に備える。
+                setup.decoder.flush();
+            }
+            AudioWorkerMsg::Packet(packet) => {
+                // Phase 8.E: post-seek audio preroll を packet 段階で **decode せず**
+                // 切り捨てる。avformat は seek backward 後 keyframe 直前から packets
+                // を返すため、音声 stream は target から数百 ms 前の packets が連続
+                // して届く。旧コードはそれらを send_packet → receive_frame → resample
+                // → drop_before_secs でドロップしていたが、デコード + resample が
+                // 1 packet ~5ms かかり 50 packets で 250ms 分 demux ループが詰まり、
+                // 結果として post-seek の音声出力が ~1 秒途切れる現象に直結していた。
+                // packet の pts + duration が target より明確に前なら decode をスキップ。
+                // (packet boundary 上では target を跨ぐもののみデコードして
+                //  drop_before_secs の sample-level trim 経路で正確に切り出す。)
+                if let Some(min) = drop_before_secs {
+                    let pkt_pts = packet.pts().unwrap_or(i64::MIN);
+                    if pkt_pts != i64::MIN {
+                        let pkt_pts_secs =
+                            (pkt_pts as f64) * setup.time_base_num / setup.time_base_den;
+                        let pkt_dur_secs = (packet.duration().max(0) as f64)
+                            * setup.time_base_num
+                            / setup.time_base_den;
+                        if pkt_pts_secs + pkt_dur_secs < min - 0.020 {
+                            continue;
+                        }
+                    }
+                }
+                if let Err(e) = setup.decoder.send_packet(&packet) {
+                    crate::logger::log(format!("audio send_packet: {e}"));
+                    continue;
+                }
+                let mut frame = Audio::empty();
+                while setup.decoder.receive_frame(&mut frame).is_ok() {
+                    if cancel.load(Ordering::Acquire) {
+                        break 'outer;
+                    }
+                    if !emit_audio_frame(
+                        &mut setup,
+                        &frame,
+                        &mut drop_before_secs,
+                        current_seek_serial,
+                        &clock,
+                        &audio_tx,
+                    ) {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 1 audio frame を resample → trim → AudioFrame 化 → audio_tx に送出。
+///
+/// 戻り値: false なら audio_tx が disconnected なので呼び出し元はスレッド終了する。
+/// drop_before_secs は preroll trim で drain した結果ここで `None` に戻ることがある。
+fn emit_audio_frame(
+    setup: &mut AudioSetup,
+    frame: &ffmpeg_the_third::util::frame::audio::Audio,
+    drop_before_secs: &mut Option<f64>,
+    current_seek_serial: u64,
+    clock: &AvClock,
+    audio_tx: &Sender<AudioFrame>,
+) -> bool {
+    use ffmpeg_the_third as ffmpeg;
+    use ffmpeg::format::sample::{Sample, Type as SampleType};
+    use ffmpeg::util::frame::audio::Audio;
+
+    let pts = frame.pts().unwrap_or(0);
+    let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
+    let mut resampled = Audio::empty();
+    if let Err(e) = setup.resampler.run(frame, &mut resampled) {
+        crate::logger::log(format!("swr resample: {e}"));
+        return true; // 1 frame 失敗は致命的でない
+    }
+    // 1 plane (packed) の f32 を取り出す。
+    //
+    // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
+    // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
+    // のため **実サンプル数より大きいバイト列を返す**。
+    // `chunks_exact(4)` で f32 化すると末尾のパディング
+    // (未初期化メモリ or 0) も f32 として再生してしまい、
+    // 強い "ブチブチ" ノイズの原因になる。
+    //
+    // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
+    // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
+    // を指定して `from_raw_parts` でスライス化する。これにより
+    // FFmpeg の linesize パディングを完全にスキップできる。
+    //
+    // SAFETY:
+    //   - resampled は packed format (Sample::F32(Type::Packed))
+    //   - data[0] は frame の生存中有効
+    //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
+    //   - resampler.run() の出力なので i32 オーバーフローは起きない
+    const CHANNELS: usize = 2;
+    let nb_samples = resampled.samples();
+    if nb_samples == 0 {
+        // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
+        // raw pointer dereference を避けて早期 return。
+        return true;
+    }
+    // ランタイム不変条件チェック (Codex P3): resampler の出力が
+    // 期待通り f32 packed であること。デバッグ時に format/layout
+    // を取り違えていれば即座に panic で気付ける。
+    debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
+    debug_assert!(resampled.is_packed());
+    let element_count = nb_samples * CHANNELS;
+    let mut samples: Vec<f32> = unsafe {
+        let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
+        debug_assert!(!raw_ptr.is_null());
+        std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
+    };
+
+    // post-seek preroll の trim:
+    // avformat_seek は keyframe に戻るので、target_secs 未満の
+    // 音声フレームが届く。完全に target 前ならフレーム破棄、
+    // 跨ぐなら先頭 N サンプルを drain して target ぴったりから始める。
+    if let Some(min) = *drop_before_secs {
+        let frame_secs =
+            (samples.len() / CHANNELS) as f64 / setup.out_rate as f64;
+        if pts_secs + frame_secs <= min {
+            // 完全に target 前 → 捨てる
+            return true;
+        }
+        if pts_secs < min {
+            let skip_pairs = ((min - pts_secs) * setup.out_rate as f64).ceil() as usize;
+            let skip = (skip_pairs * CHANNELS).min(samples.len());
+            samples.drain(..skip);
+            pts_secs = min;
+            if samples.is_empty() {
+                return true;
+            }
+        } else {
+            // target に到達 → preroll guard 解除
+            *drop_before_secs = None;
+        }
+    }
+
+    // 1 stereo pair = 2 float (samples_per_sec stereo = setup.out_rate * 2)
+    let duration_secs = (samples.len() / 2) as f64 / setup.out_rate as f64;
+    let frame_out = AudioFrame {
+        samples,
+        pts_secs,
+        seek_serial: current_seek_serial,
+        duration_secs,
+    };
+    // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
+    // 競合しないよう順序を保つ。失敗時はロールバック (Codex 指摘)。
+    clock.add_audio_tx_queued_secs(duration_secs);
+    if audio_tx.send(frame_out).is_err() {
+        clock.add_audio_tx_queued_secs(-duration_secs);
+        return false;
+    }
+    true
 }
 
 struct AudioSetup {
