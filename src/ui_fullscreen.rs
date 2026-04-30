@@ -5133,9 +5133,7 @@ impl App {
                 // - PAUSED: ユーザー一時停止中
                 // - is_seeking() (= override active、demux が seek 処理中で
                 //   post-seek 1 枚目が UI に届くまで): 「黒い空間」を防ぐ
-                let is_paused_or_seeking = state
-                    == crate::video::engine::actor::state_code::PAUSED
-                    || player.is_seeking();
+                let is_paused_or_seeking = player.is_paused_or_seeking();
                 Some((
                     player.displayed_frame_seq(),
                     player.skipped_frame_count(),
@@ -5164,30 +5162,25 @@ impl App {
         // そのままに保つ。さらに freeze 中は新規サンプル収集も停止 (= seek 処理中の
         // 「黒い空間」を生まない、ユーザー要望)。
         let now_real = std::time::Instant::now();
-        match (self.video_perf_pause_start, is_freeze) {
-            (None, true) => {
-                // playing → freeze: 開始時刻を記録、以降のサンプル収集は停止
+        if is_freeze {
+            // playing → freeze (or freeze 継続): 開始時刻を記録 (or 維持) して
+            // サンプル収集を停止。
+            if self.video_perf_pause_start.is_none() {
                 self.video_perf_pause_start = Some(now_real);
-                return;
             }
-            (Some(_), true) => {
-                // freeze 継続中: サンプル収集停止
-                return;
-            }
-            (Some(pause_start), false) => {
-                // freeze → playing: 期間分 offset を計算して history を shift
-                let pause_dur = now_real.saturating_duration_since(pause_start);
-                if pause_dur > std::time::Duration::from_millis(10) {
-                    for entry in self.video_perf_history.iter_mut() {
-                        entry.1 = entry.1 + pause_dur;
-                    }
-                    if let Some(prev) = self.video_perf_last_wall.as_mut() {
-                        *prev = *prev + pause_dur;
-                    }
+            return;
+        }
+        if let Some(pause_start) = self.video_perf_pause_start.take() {
+            // freeze → playing: 期間分 offset を計算して history を shift。
+            let pause_dur = now_real.saturating_duration_since(pause_start);
+            if pause_dur > std::time::Duration::from_millis(10) {
+                for entry in self.video_perf_history.iter_mut() {
+                    entry.1 += pause_dur;
                 }
-                self.video_perf_pause_start = None;
+                if let Some(prev) = self.video_perf_last_wall.as_mut() {
+                    *prev += pause_dur;
+                }
             }
-            _ => {}
         }
         if Some(cur_seq) != self.video_perf_last_seq {
             let now = std::time::Instant::now();
@@ -5388,11 +5381,9 @@ impl App {
         let is_freeze = self
             .fullscreen_idx
             .and_then(|idx| match self.fs_cache.get(&idx) {
-                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => Some(
-                    player.engine_state_code()
-                        == crate::video::engine::actor::state_code::PAUSED
-                        || player.is_seeking(),
-                ),
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                    Some(player.is_paused_or_seeking())
+                }
                 _ => None,
             })
             .unwrap_or(false);
@@ -5433,11 +5424,23 @@ impl App {
         // (= cpal 出力が silent なので audio anchor が pace を進めない、UI 表示も
         // 凍結 frame のみ)。区間終了 (= Playing 遷移) と同時に滑らかな再生が始まる。
         {
-            let mut run_start: Option<std::time::Instant> = None;
-            let mut last_arrival: Option<std::time::Instant> = None;
+            let warmup_color = egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32);
+            let draw_run = |start: std::time::Instant, end: std::time::Instant| {
+                let x_start = x_for(start);
+                let x_end = x_for(end);
+                let lo = x_start.min(x_end);
+                let hi = x_start.max(x_end).max(lo + 2.0);
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(lo, graph.min.y),
+                    egui::pos2(hi, graph.max.y),
+                );
+                painter.rect_filled(r, 0.0, warmup_color);
+            };
             // 微小なギャップを 1 つの run として merge するため、隣接 sample の
             // arrival_dt を見て threshold (~50ms) を超えたら run を切る。
             const RUN_GAP_THRESHOLD_MS: f32 = 50.0;
+            let mut run_start: Option<std::time::Instant> = None;
+            let mut last_arrival: Option<std::time::Instant> = None;
             for (_, arrival, _, _, is_warmup) in &self.video_perf_history {
                 if *is_warmup {
                     if run_start.is_none() {
@@ -5445,19 +5448,9 @@ impl App {
                     } else if let Some(last) = last_arrival {
                         let gap_ms = arrival.saturating_duration_since(last).as_secs_f32() * 1000.0;
                         if gap_ms > RUN_GAP_THRESHOLD_MS {
-                            // 過去 run を flush
+                            // 過去 run を flush して新 run を開始
                             if let Some(start) = run_start {
-                                let x_start = x_for(start);
-                                let x_end = x_for(last);
-                                let r = egui::Rect::from_min_max(
-                                    egui::pos2(x_start.min(x_end), graph.min.y),
-                                    egui::pos2(x_start.max(x_end).max(x_start.min(x_end) + 2.0), graph.max.y),
-                                );
-                                painter.rect_filled(
-                                    r,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32),
-                                );
+                                draw_run(start, last);
                             }
                             run_start = Some(*arrival);
                         }
@@ -5466,34 +5459,14 @@ impl App {
                 } else if let Some(start) = run_start {
                     // run 終了: 矩形を描画してリセット
                     let end = last_arrival.unwrap_or(*arrival);
-                    let x_start = x_for(start);
-                    let x_end = x_for(end);
-                    let r = egui::Rect::from_min_max(
-                        egui::pos2(x_start.min(x_end), graph.min.y),
-                        egui::pos2(x_start.max(x_end).max(x_start.min(x_end) + 2.0), graph.max.y),
-                    );
-                    painter.rect_filled(
-                        r,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32),
-                    );
+                    draw_run(start, end);
                     run_start = None;
                     last_arrival = None;
                 }
             }
             // 履歴末尾が warmup 中の場合、現在 run を最右端まで描画。
             if let (Some(start), Some(end)) = (run_start, last_arrival) {
-                let x_start = x_for(start);
-                let x_end = x_for(end);
-                let r = egui::Rect::from_min_max(
-                    egui::pos2(x_start.min(x_end), graph.min.y),
-                    egui::pos2(x_start.max(x_end).max(x_start.min(x_end) + 2.0), graph.max.y),
-                );
-                painter.rect_filled(
-                    r,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32),
-                );
+                draw_run(start, end);
             }
         }
 

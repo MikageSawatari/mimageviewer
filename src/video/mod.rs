@@ -390,6 +390,24 @@ impl VideoPlayer {
         self.clock.is_seeking()
     }
 
+    /// Phase 9.G: perf overlay graph の freeze 判定。pause OR seek 処理中なら true。
+    /// `sample_video_perf` と `draw_video_perf_overlay` で同じ条件を見るため
+    /// VideoPlayer 側にまとめている (engine_state_atomic load + clock.is_seeking 1 回)。
+    pub fn is_paused_or_seeking(&self) -> bool {
+        self.engine_state_code() == engine::actor::state_code::PAUSED || self.is_seeking()
+    }
+
+    /// Phase 9.C: engine state machine に Play / Pause を伝える。
+    /// `toggle_play` / `set_playing` から共有。`apply_command` は idempotent。
+    fn dispatch_play_pause(&self, playing: bool) {
+        let cmd = if playing {
+            engine::actor::TransportCommand::Play
+        } else {
+            engine::actor::TransportCommand::Pause
+        };
+        self.engine.lock().unwrap().apply_command(cmd);
+    }
+
     pub fn toggle_play(&self) {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
@@ -411,12 +429,7 @@ impl VideoPlayer {
         // 食い違っていた。
         let new_playing = !self.clock.is_playing();
         self.clock.set_playing(new_playing);
-        let mut g = self.engine.lock().unwrap();
-        g.apply_command(if new_playing {
-            engine::actor::TransportCommand::Play
-        } else {
-            engine::actor::TransportCommand::Pause
-        });
+        self.dispatch_play_pause(new_playing);
     }
 
     pub fn set_playing(&self, p: bool) {
@@ -426,12 +439,7 @@ impl VideoPlayer {
         // 既に engine.apply_command を呼んでいるケースがあるが、apply_command は
         // idempotent (= 既に Playing で Play を受けても no-op) なので安全。
         if prev != p {
-            let mut g = self.engine.lock().unwrap();
-            g.apply_command(if p {
-                engine::actor::TransportCommand::Play
-            } else {
-                engine::actor::TransportCommand::Pause
-            });
+            self.dispatch_play_pause(p);
         }
     }
 

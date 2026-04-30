@@ -1110,7 +1110,6 @@ fn run_video_decode(
                                 // 達するまで decoder は frame を生産。これにより
                                 // Buffering→Playing 遷移時には buffer がほぼ満杯
                                 // (ユーザー要望: 「バッファが半分まで埋まったら開始」)。
-                                let engine_st = engine_state.load(Ordering::Acquire);
                                 let engine_playing = engine_st
                                     == crate::video::engine::actor::state_code::PLAYING;
                                 let allow_pace_lead = engine_playing
@@ -1371,11 +1370,10 @@ fn run_video_decode(
                 let audio_active = clock.is_audio_active();
                 // Phase 9.D (2026-04-30): Buffering 中も PACE_LEAD で lookahead 許可
                 // (詳細は GPU 経路の同コメント参照)。
-                let engine_st_inner = engine_state.load(Ordering::Acquire);
-                let engine_playing = engine_st_inner
+                let engine_playing = engine_st
                     == crate::video::engine::actor::state_code::PLAYING;
                 let allow_pace_lead = engine_playing
-                    || engine_st_inner
+                    || engine_st
                         == crate::video::engine::actor::state_code::BUFFERING;
                 if audio_active {
                     if audio_buf < AUDIO_SAFE_LO {
