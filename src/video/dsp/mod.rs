@@ -502,7 +502,8 @@ impl DspBridge {
     }
 
     /// シーク時の同期 reset fence (= Codex 助言、2026-05-01):
-    /// 全プラグインに `Cmd::Reset` を送り、**全 bridge が `ResetDone` ack を返すまで待つ**。
+    /// **アクティブ (= !bypass && Loaded)** プラグインに `Cmd::Reset` を送り、
+    /// 各 bridge が `ResetDone` ack を返すまで待つ。
     ///
     /// bridge 側の挙動:
     /// 1. control thread が `reset_pending_` flag を立てる
@@ -517,9 +518,18 @@ impl DspBridge {
     /// process_block する直前」に呼ぶ。これにより post-seek input は reset 後の plugin で
     /// 処理される。
     ///
-    /// **timeout**: 200ms。bridge audio thread の `read_in_available` 100ms timeout +
-    /// reset 自身の処理時間 (= setProcessing false/true、数 ms) + IPC roundtrip を考慮。
-    /// timeout 時は ack なしで return (= log 出力のみ、後続 process_block は走る)。
+    /// **active filter** (Codex P2-1, 2026-05-01): bypass=true の slot は `process_block`
+    /// チェーンに入っていないので reset 不要。`process_block()` / `total_latency_samples()`
+    /// と同じ active 判定 (= !bypass && Loaded) で filter する。これで bypass 状態の slot
+    /// (= 例 auto-bypass された plugin) で無駄な reset を走らせないので、シーク 1 回あたりの
+    /// 総 reset 時間が短縮される。
+    ///
+    /// **timeout** (Codex P2-2, 2026-05-01): 2.0 秒に延長。
+    /// 内訳: bridge audio thread `read_in_available` 100ms timeout + reset 処理 数 ms +
+    /// `flush_with_silence` (= 最大 ~200ms@2s latency) + IPC roundtrip + 安全余裕。
+    /// timeout 時は **CRITICAL log** を出して return (= 後続 process_block は走るので、
+    /// pre-seek tail が一瞬漏れる可能性あり、log でユーザーが気付ける)。
+    /// 完全な fence-fail (= 該当 bridge を mute or 一時 bypass) は将来課題 (P2-2 残)。
     pub fn reset_plugins_sync(&self) {
         if !self.is_enabled() {
             return;
@@ -529,7 +539,7 @@ impl DspBridge {
             inner
                 .slots
                 .iter()
-                .filter(|s| matches!(s.state, SlotState::Loaded))
+                .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
                 .map(|s| s.bridge.clone())
                 .collect()
         };
@@ -537,14 +547,14 @@ impl DspBridge {
             return;
         }
         // 各 bridge ごとに `reset_sync` (= ID 付き send + ack 照合 wait) を呼ぶ。
-        // 順次実行で十分 (= bridge 数 max 10、各 reset は数 ms-数十 ms 程度)。
-        // timeout は plugin の flush_with_silence 処理時間も含めて 500ms に拡大
-        // (= latency 2s plugin で silence flush に最大 ~200ms かかるため)。
-        let timeout = std::time::Duration::from_millis(500);
+        // 順次実行で十分 (= active bridge 数 max 10、各 reset は数 ms-数百 ms)。
+        let timeout = std::time::Duration::from_secs(2);
         for b in &bridges {
             if !b.reset_sync(timeout) {
                 crate::logger::log(
-                    "[VST3] reset_plugins_sync: ResetDone ack timeout, continuing".to_string()
+                    "[VST3] CRITICAL: reset_plugins_sync ResetDone ack timeout (2s), \
+                     pre-seek audio may leak briefly. Plugin may be unresponsive or \
+                     processing too slowly.".to_string()
                 );
             }
         }

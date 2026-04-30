@@ -133,6 +133,28 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 
 ## 📋 Codex 回答外 / Future Work
 
+### シーク後の post-seek pre-roll discard [P3, Codex P2-3, 2026-05-01]
+- 現状: シーク時に bridge audio thread が `flush_with_silence(latency)` で plugin
+  delay-line を silence で埋める → pre-seek 残留は解消
+- 副作用: 純粋 latency plugin (例: mIV Test Latency) では post-seek の最初 N samples
+  が silence (= delay-line 内 silence の出力)、その後 N samples 経って実 audio が出る
+  → **シーク後 ~latency 秒の silence ギャップ**
+- ユーザー報告: 「治った」(= silence 許容、pre-seek 漏れより遥かに良い)
+- 完全な即時再生:
+  1. reset 後、post-seek 実 audio を N samples 先まで pre-load
+  2. plugin output (= silence 埋め部分) を discard
+  3. その後の output (= delayed 実 audio) を AudioBuffer に流す
+- 実装には mIV pump 側の協力 (= pre-roll 供給 + discard モード) が必要
+- 関連: `crates/vst3-host/src/plugin_loader.cpp::flush_with_silence`
+
+### reset_sync timeout 時の fence-fail policy [P3, Codex P2-2, 2026-05-01]
+- 現状: timeout (= 2 秒) 時は CRITICAL log を出して continue
+- 副作用: 後続 process_block が走るので pre-seek tail が一瞬漏れる可能性
+- 完全な fail-closed:
+  - 該当 bridge を一時 mute (= 出力を silence で埋める) until ack arrives
+  - もしくはユーザーに通知 (= 「plugin が応答しない」warning UI)
+- 現在は 2 秒 timeout で実用的にはほぼ起きない設計
+
 ### VST Instrument (MIDI 入力) を一覧から除外する [P2, 2026-04 ユーザー報告]
 - 症状: 検出済プラグイン一覧に Instrument 系 (= MIDI 入力で音を生成するシンセ) も
   混在している。mIV は MIDI 入力経路を持たず Effect (音声入力→音声出力) のみ

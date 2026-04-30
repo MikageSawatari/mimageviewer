@@ -517,6 +517,21 @@ void PluginLoader::flush_with_silence(uint32_t num_samples) {
     if (!processor_ || num_samples == 0) return;
     // process_block の上限 (= setupProcessing 時の maxSamplesPerBlock)。
     // 大きすぎる latency でも安全に分割処理する。
+    //
+    // **既知の制約** (Codex P2-3, 2026-05-01):
+    // この実装は plugin の delay-line を **silence で埋める** だけなので、
+    // 純粋 latency plugin (= mIV Test Latency 等) では reset 後 plugin output が
+    // 「最初の N samples = silence、その後 = 実 audio」となる。pre-seek tail の
+    // 漏れは防げるが、**シーク後 N samples ぶんの silence ギャップ** は残る。
+    //
+    // 完全な「シーク即時再生」を実現するには post-seek pre-roll discard が必要:
+    // 1. reset 後、post-seek 実 audio を N samples 先まで pre-load
+    // 2. plugin output (= silence 埋め部分) を **discard** する (= 内部 only)
+    // 3. その後の output (= delayed 実 audio) を AudioBuffer に流す
+    // これは plugin 内部状態を post-seek に合わせて warm-up することに相当する。
+    // 実装には mIV pump 側の協力 (= pre-roll 用 audio 供給 + discard モード) が必要。
+    // 現在は silence ギャップを許容して未実装 (= ユーザー報告: 「治った」)。
+    // 将来 UX 改善の TODO 候補。
     const uint32_t blk = block_size_ > 0 ? block_size_ : 480;
     const uint32_t channels = 2;
     std::vector<float> silence(blk * channels, 0.0f);
