@@ -5118,7 +5118,7 @@ impl App {
     /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
     /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
-        let snapshot: Option<(u64, u64, usize, f32)> = match self.fs_cache.get(&fs_idx) {
+        let snapshot: Option<(u64, u64, usize, f32, bool)> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                 let expected_ms = player
                     .info()
@@ -5126,16 +5126,19 @@ impl App {
                     .filter(|fps| *fps > 0.5 && fps.is_finite())
                     .map(|fps| 1000.0 / fps)
                     .unwrap_or(33.3);
+                let is_warmup = player.engine_state_code()
+                    != crate::video::engine::actor::state_code::PLAYING;
                 Some((
                     player.displayed_frame_seq(),
                     player.skipped_frame_count(),
                     player.pending_frames(),
                     expected_ms,
+                    is_warmup,
                 ))
             }
             _ => None,
         };
-        let Some((cur_seq, cur_skip, cur_buf, expected_ms)) = snapshot else {
+        let Some((cur_seq, cur_skip, cur_buf, expected_ms, is_warmup)) = snapshot else {
             return;
         };
         if Some(cur_seq) != self.video_perf_last_seq {
@@ -5151,8 +5154,13 @@ impl App {
                 let buf_clamped = cur_buf.min(255) as u8;
                 let transient_threshold = expected_ms * 3.0;
                 if interval_ms <= transient_threshold {
-                    self.video_perf_history
-                        .push_back((interval_ms, now, skip_delta, buf_clamped));
+                    self.video_perf_history.push_back((
+                        interval_ms,
+                        now,
+                        skip_delta,
+                        buf_clamped,
+                        is_warmup,
+                    ));
                     // Phase 8.K: 容量 200 だと 60fps で 3.3 秒分しか保持できず、
                     // graph の WINDOW_SECS=6.0 に対し左 半分以上が空欄になる。
                     // 6 秒 × 100fps の余裕を持たせて 600 に拡大。
@@ -5234,23 +5242,23 @@ impl App {
         let avg: f32 = self
             .video_perf_history
             .iter()
-            .map(|(v, _, _, _)| v)
+            .map(|(v, _, _, _, _)| v)
             .sum::<f32>()
             / n as f32;
         let max: f32 = self
             .video_perf_history
             .iter()
-            .map(|(v, _, _, _)| *v)
+            .map(|(v, _, _, _, _)| *v)
             .fold(0.0_f32, f32::max);
         let skips: u32 = self
             .video_perf_history
             .iter()
-            .map(|(_, _, s, _)| *s)
+            .map(|(_, _, s, _, _)| *s)
             .sum();
         let cur_buf = self
             .video_perf_history
             .back()
-            .map(|(_, _, _, b)| *b)
+            .map(|(_, _, _, b, _)| *b)
             .unwrap_or(0);
         // ラベルは "frame 到着間隔のばらつき (= jitter)" を示すと意味付け。
         // 平均値は wall rate と一致するのが正常で、max が target を超えるほど
@@ -5335,9 +5343,84 @@ impl App {
         // graph 矩形外にはみ出さないよう painter を clip。
         let painter = painter.with_clip_rect(graph);
 
+        // ── Warmup region 背景タイント (Phase 9.B、2026-04-30 追加) ──
+        //
+        // engine state ≠ Playing (= Loading / Buffering / Seeking / Paused / Eof)
+        // の連続 sample 範囲を緑がかった半透明矩形で塗る。動画 open / W キー戻り /
+        // シーク直後に「クロックは凍結 + 音声 silence + 表示 frame は固定」状態が
+        // 数十-数百 ms 続く期間 (= "warmup") をユーザーが視認できるようにする。
+        //
+        // この warmup 区間中は意図的に頻繁な dropped_past が起きない設計
+        // (= cpal 出力が silent なので audio anchor が pace を進めない、UI 表示も
+        // 凍結 frame のみ)。区間終了 (= Playing 遷移) と同時に滑らかな再生が始まる。
+        {
+            let mut run_start: Option<std::time::Instant> = None;
+            let mut last_arrival: Option<std::time::Instant> = None;
+            // 微小なギャップを 1 つの run として merge するため、隣接 sample の
+            // arrival_dt を見て threshold (~50ms) を超えたら run を切る。
+            const RUN_GAP_THRESHOLD_MS: f32 = 50.0;
+            for (_, arrival, _, _, is_warmup) in &self.video_perf_history {
+                if *is_warmup {
+                    if run_start.is_none() {
+                        run_start = Some(*arrival);
+                    } else if let Some(last) = last_arrival {
+                        let gap_ms = arrival.saturating_duration_since(last).as_secs_f32() * 1000.0;
+                        if gap_ms > RUN_GAP_THRESHOLD_MS {
+                            // 過去 run を flush
+                            if let Some(start) = run_start {
+                                let x_start = x_for(start);
+                                let x_end = x_for(last);
+                                let r = egui::Rect::from_min_max(
+                                    egui::pos2(x_start.min(x_end), graph.min.y),
+                                    egui::pos2(x_start.max(x_end).max(x_start.min(x_end) + 2.0), graph.max.y),
+                                );
+                                painter.rect_filled(
+                                    r,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32),
+                                );
+                            }
+                            run_start = Some(*arrival);
+                        }
+                    }
+                    last_arrival = Some(*arrival);
+                } else if let Some(start) = run_start {
+                    // run 終了: 矩形を描画してリセット
+                    let end = last_arrival.unwrap_or(*arrival);
+                    let x_start = x_for(start);
+                    let x_end = x_for(end);
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(x_start.min(x_end), graph.min.y),
+                        egui::pos2(x_start.max(x_end).max(x_start.min(x_end) + 2.0), graph.max.y),
+                    );
+                    painter.rect_filled(
+                        r,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32),
+                    );
+                    run_start = None;
+                    last_arrival = None;
+                }
+            }
+            // 履歴末尾が warmup 中の場合、現在 run を最右端まで描画。
+            if let (Some(start), Some(end)) = (run_start, last_arrival) {
+                let x_start = x_for(start);
+                let x_end = x_for(end);
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(x_start.min(x_end), graph.min.y),
+                    egui::pos2(x_start.max(x_end).max(x_start.min(x_end) + 2.0), graph.max.y),
+                );
+                painter.rect_filled(
+                    r,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(80, 200, 120, 32),
+                );
+            }
+        }
+
         // 赤縦線: 実際に skip されたサンプル (= decoder dropped_full or UI dropped_past)。
         // skip_delta が大きいほど色を濃くする (= 一気に複数 frame 飛んだのが分かる)。
-        for (_, arrival, skip, _) in &self.video_perf_history {
+        for (_, arrival, skip, _, _) in &self.video_perf_history {
             if *skip > 0 {
                 let alpha = (120 + (*skip as u32 * 40).min(135)) as u8;
                 let x = x_for(*arrival);
@@ -5358,7 +5441,7 @@ impl App {
         // 「期待値より遅い」状態が一目で分かるようにする。
         if n > 1 {
             let mut prev: Option<(egui::Pos2, f32)> = None;
-            for (v, arrival, _, _) in &self.video_perf_history {
+            for (v, arrival, _, _, _) in &self.video_perf_history {
                 let x = x_for(*arrival);
                 let p = egui::pos2(x, y_for(*v));
                 if let Some((prev_p, prev_v)) = prev {
@@ -5399,7 +5482,7 @@ impl App {
         );
         let max_buf = crate::video::MAX_RENDER_QUEUE.max(1) as f32;
         let bar_w = (strip.width() / 200.0).max(1.0); // 1 sample あたりの幅
-        for (_, arrival, _, buf) in &self.video_perf_history {
+        for (_, arrival, _, buf, _) in &self.video_perf_history {
             let x = graph.max.x - {
                 let dt = now.saturating_duration_since(*arrival).as_secs_f32();
                 dt * px_per_sec

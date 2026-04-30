@@ -33,7 +33,7 @@ pub mod tile_thumbnails;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
@@ -55,6 +55,9 @@ pub struct VideoPlayer {
     /// 遷移は Phase 3c で配線完了後に有効化する (= 現在は AvClock が引き続き source of truth)。
     #[allow(dead_code)]
     engine: Arc<Mutex<EngineActor>>,
+    /// Phase 9.B: EngineActor の `published_state` を Mutex なしで読むための clone。
+    /// perf overlay が warmup 区間 (= state ≠ Playing) を表示するときに使う。
+    engine_state_atomic: Arc<AtomicU8>,
     /// Phase 3c で追加。decoder/audio thread から push される events を tick で
     /// drain して engine に dispatch する。capacity 64 (= burst tolerance、
     /// drop 不可なので unbounded 寄りの bounded)。
@@ -180,10 +183,15 @@ impl VideoPlayer {
                 ..Default::default()
             })));
             let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(64);
+            // FFmpeg 初期化失敗時の dummy: engine state は IDLE で固定。
+            let engine_state_atomic = Arc::new(AtomicU8::new(
+                crate::video::engine::actor::state_code::IDLE,
+            ));
             return Self {
                 path,
                 clock: Arc::new(AvClock::new(initial_volume)),
                 engine,
+                engine_state_atomic,
                 engine_event_tx,
                 engine_event_rx,
                 info_event_emitted: false,
@@ -255,7 +263,7 @@ impl VideoPlayer {
             hw_decode,
             #[cfg(windows)]
             gpu_video_device,
-            engine_state_handle,
+            engine_state_handle.clone(),
             engine_event_tx.clone(),
             skipped_frame_count.clone(),
         );
@@ -264,7 +272,12 @@ impl VideoPlayer {
         // 音声を二重に消費するので、decoder の audio_rx を audio.start に渡す。
         // ここで decode.audio_rx を取り出す必要があるので構造体を分解する。
         let DecodeHandles { video_rx, audio_rx, info_rx } = decode;
-        let audio = match audio::start(audio_rx, clock.clone(), engine_event_tx.clone()) {
+        let audio = match audio::start(
+            audio_rx,
+            clock.clone(),
+            engine_event_tx.clone(),
+            engine_state_handle.clone(),
+        ) {
             Ok(a) => Some(a),
             Err(e) => {
                 crate::logger::log(format!("audio output failed: {e} (映像のみ再生)"));
@@ -283,6 +296,7 @@ impl VideoPlayer {
             path,
             clock,
             engine,
+            engine_state_atomic: engine_state_handle,
             engine_event_tx,
             engine_event_rx,
             info_event_emitted: false,
@@ -857,6 +871,14 @@ impl VideoPlayer {
     /// 見極めるために使う。
     pub fn pending_frames(&self) -> usize {
         self.future_frames.len()
+    }
+
+    /// EngineActor の現 state code (Phase 9.B: perf overlay の warmup 区間表示用)。
+    /// `Playing` 以外 (= Buffering / Loading / Seeking / Paused / Eof) なら cpal
+    /// 出力が silent になっており、UI tick の表示も target 位置で凍結している。
+    /// `published_state_handle` 経由なので Mutex を取らない atomic load で済む。
+    pub fn engine_state_code(&self) -> u8 {
+        self.engine_state_atomic.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。

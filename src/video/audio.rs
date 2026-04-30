@@ -100,6 +100,7 @@ pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
     let device = host
@@ -151,11 +152,12 @@ pub fn start(
     // ── cpal output callback: buffer → device ──
     let cb_buffer = buffer.clone();
     let cb_clock = clock.clone();
+    let cb_engine_state = engine_state.clone();
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_output(out, &cb_buffer, &cb_clock);
+                fill_output(out, &cb_buffer, &cb_clock, &cb_engine_state);
             },
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
@@ -292,7 +294,12 @@ fn run_pump(
     crate::logger::log("audio-pump terminated");
 }
 
-fn fill_output(out: &mut [f32], buffer: &Arc<Mutex<AudioBuffer>>, clock: &Arc<AvClock>) {
+fn fill_output(
+    out: &mut [f32],
+    buffer: &Arc<Mutex<AudioBuffer>>,
+    clock: &Arc<AvClock>,
+    engine_state: &Arc<std::sync::atomic::AtomicU8>,
+) {
     // 先に clock の seek_serial を読む。post-seek 直後で pump がまだ古い世代の
     // バッファを抱えている場合は、ここで全消去して silence を出す
     // (Codex 指摘: 古い samples を再生して set_audio_pts でクロックを巻き戻す経路を塞ぐ)。
@@ -313,6 +320,32 @@ fn fill_output(out: &mut [f32], buffer: &Arc<Mutex<AudioBuffer>>, clock: &Arc<Av
     // 一時停止中は無音 (PTS も進めない)
     if !clock.is_playing() {
         out.fill(0.0);
+        return;
+    }
+
+    // ── Warmup gate (Phase 9.B、2026-04-30 追加) ──
+    //
+    // 動画 open / シーク直後、engine state が `Buffering` (= まだ readiness latch が
+    // 揃っていない期間) の間は **音声出力を silence にして PTS を進めない**。
+    // これにより future_frames のプリフィルと UI 表示 pace の同期が取れる:
+    //
+    // - 旧挙動: notify_seek_completed が anchor を Audio source で書く → cpal callback
+    //   で set_audio_pts が anchor.pts を 1x wall で進める → UI tick が
+    //   "現在 pace_now" に追いついた frames を **複数まとめて** display 経路に流す
+    //   → GPU 早期 return 経路で dropped_past が発生 (= perf overlay の赤縦線)。
+    // - 新挙動: Buffering 中は cpal を silence にして anchor.pts を凍結 → UI が
+    //   常に target 位置の frame だけを display → engine が Playing に遷移したら
+    //   anchor を進め始める → 1 frame/tick で滑らかに消費。
+    //
+    // Buffering の典型的な持続時間は 100-200ms (= audio buffer が READY_THRESHOLD
+    // に到達するまで)。この間ユーザーは brief な silence を聞くが、シーク直後の
+    // 体感としては自然 (= 音声デバイスのレイテンシと同程度)。
+    let engine_playing = engine_state.load(std::sync::atomic::Ordering::Acquire)
+        == crate::video::engine::actor::state_code::PLAYING;
+    if !engine_playing {
+        out.fill(0.0);
+        // bookkeeping は通常通り実施 (= pump からの publish との race を避ける)。
+        publish_buffer_secs(&buf, clock);
         return;
     }
 

@@ -1627,12 +1627,14 @@ pub struct App {
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
-    /// 直近 N フレームの (interval_ms, arrival_wall, skipped_count, buffer_len) の組。
+    /// 直近 N フレームの (interval_ms, arrival_wall, skipped_count, buffer_len, is_warmup) の組。
     /// `arrival_wall` で repaint 時の連続スクロールを可能にし、`skipped_count` で
     /// このサンプル区間に何 frame skip されたか、`buffer_len` で UI side
-    /// future_frames キュー残量を記録する (= skip 時のコンテキスト判別用)。
+    /// future_frames キュー残量、`is_warmup` で「engine state ≠ Playing (= Buffering /
+    /// Loading / Seeking、cpal 出力が silent な期間)」を記録する。perf overlay の
+    /// graph 上で warmup 区間を背景色で識別する用 (Phase 9.B)。
     pub(crate) video_perf_history:
-        std::collections::VecDeque<(f32, std::time::Instant, u32, u8)>,
+        std::collections::VecDeque<(f32, std::time::Instant, u32, u8, bool)>,
     /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
     pub(crate) video_perf_last_wall: Option<std::time::Instant>,
     /// 前回サンプリング時の displayed_frame_seq (= VideoPlayer の atomic カウンタ、
