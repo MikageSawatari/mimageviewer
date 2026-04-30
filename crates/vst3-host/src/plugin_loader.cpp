@@ -248,9 +248,20 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
     }
 
     Vst::ProcessContext ctx{};
-    ctx.state = Vst::ProcessContext::kPlaying;
+    // 時間進行を伝えるフラグも立てる。立てないと Pro-Q 4 のアナライザ等は
+    // 時刻情報を信用せずアナライザ更新を停止する。
+    ctx.state = Vst::ProcessContext::kPlaying
+              | Vst::ProcessContext::kContTimeValid
+              | Vst::ProcessContext::kProjectTimeMusicValid
+              | Vst::ProcessContext::kTempoValid;
     ctx.sampleRate = static_cast<double>(sample_rate_);
+    ctx.projectTimeSamples = process_time_samples_;
+    ctx.continousTimeSamples = process_time_samples_;
+    ctx.projectTimeMusic = static_cast<double>(process_time_samples_) /
+                            static_cast<double>(sample_rate_) *
+                            (120.0 / 60.0); // 120 BPM 想定の quarter note 数
     ctx.tempo = 120.0;
+    process_time_samples_ += static_cast<int64_t>(num_frames);
 
     Vst::EventList input_events;
     Vst::EventList output_events;
@@ -402,6 +413,14 @@ bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
     return true;
 }
 
+void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
+    if (!view_attached_ || !view_) return;
+    Steinberg::ViewRect rect{0, 0,
+                             static_cast<Steinberg::int32>(width),
+                             static_cast<Steinberg::int32>(height)};
+    view_->onSize(&rect);
+}
+
 void PluginLoader::hide_gui() {
     if (view_attached_ && view_) {
         view_->removed();
@@ -416,6 +435,8 @@ void PluginLoader::reset() {
     // VST3 標準: setProcessing(false) → setProcessing(true) でフィルタ履歴 flush
     processor_->setProcessing(false);
     processor_->setProcessing(true);
+    // 時刻もリセット (= ProcessContext の sample カウンタ)
+    process_time_samples_ = 0;
 }
 
 void PluginLoader::unload() {

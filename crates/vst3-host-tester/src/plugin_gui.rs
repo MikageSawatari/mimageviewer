@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
     SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -67,6 +67,9 @@ pub struct ShowReply {
     /// ユーザーが × を押したときに Sender 側から「閉じてほしい」が届く。
     /// メインスレッドはこれを polling するか recv して、bridge に hide_gui を送る。
     pub close_signal: Arc<Mutex<Option<Receiver<()>>>>,
+    /// ユーザーがホストウィンドウをリサイズしたときに新クライアント領域サイズが届く。
+    /// メインスレッドはこれを polling して、bridge に notify_host_resize を送る。
+    pub resize_signal: Arc<Mutex<Option<Receiver<(u32, u32)>>>>,
 }
 
 /// 専用スレッドで Win32 メッセージループを回す GUI ホスト。
@@ -122,6 +125,9 @@ struct ThreadState {
     hwnd: Option<HWND>,
     /// ユーザーが × を押した瞬間、メインスレッドに通知するための sender。
     close_tx: Option<Sender<()>>,
+    /// ユーザーがホストウィンドウをリサイズしたとき、新クライアントサイズを通知。
+    /// メインスレッドはこれを受けて bridge に notify_host_resize を送る。
+    resize_tx: Option<Sender<(u32, u32)>>,
     class_registered: bool,
 }
 
@@ -147,6 +153,24 @@ extern "system" fn wndproc(
                     let _ = tx.send(());
                 }
                 LRESULT(0)
+            }
+            WM_SIZE => {
+                // ユーザーがホストウィンドウをドラッグでリサイズした。
+                // 新しいクライアント領域サイズを取得してメインスレッドに通知。
+                let lparam_v = lparam.0 as u32;
+                let w = (lparam_v & 0xFFFF) as u32;
+                let h = ((lparam_v >> 16) & 0xFFFF) as u32;
+                if w > 0 && h > 0 {
+                    let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE.with(|s| {
+                        s.borrow()
+                            .as_ref()
+                            .and_then(|st| st.resize_tx.clone())
+                    });
+                    if let Some(tx) = tx_opt {
+                        let _ = tx.send((w, h));
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_DESTROY => {
                 PostQuitMessage(0);
@@ -178,6 +202,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
         *s.borrow_mut() = Some(Box::new(ThreadState {
             hwnd: None,
             close_tx: None,
+            resize_tx: None,
             class_registered: false,
         }));
     });
@@ -201,13 +226,14 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             } => {
                 let result = create_window(&title, width, height);
                 match result {
-                    Ok((hwnd_u64, close_rx, actual_w, actual_h, used_dpi)) => {
+                    Ok((hwnd_u64, close_rx, resize_rx, actual_w, actual_h, used_dpi)) => {
                         let _ = reply.send(ShowReply {
                             hwnd_u64,
                             actual_client_w: actual_w,
                             actual_client_h: actual_h,
                             used_dpi,
                             close_signal: Arc::new(Mutex::new(Some(close_rx))),
+                            resize_signal: Arc::new(Mutex::new(Some(resize_rx))),
                         });
                         // ウィンドウ作成成功 → メッセージループを回す。
                         // 並行して cmd_rx も polling する必要があるので、
@@ -223,6 +249,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                             actual_client_h: 0,
                             used_dpi: 0,
                             close_signal: Arc::new(Mutex::new(None)),
+                            resize_signal: Arc::new(Mutex::new(None)),
                         });
                         eprintln!("create_window failed: {e}");
                     }
@@ -273,6 +300,7 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
                         actual_client_h: 0,
                         used_dpi: 0,
                         close_signal: Arc::new(Mutex::new(None)),
+                        resize_signal: Arc::new(Mutex::new(None)),
                     });
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -288,7 +316,7 @@ fn create_window(
     title: &str,
     width: u32,
     height: u32,
-) -> std::io::Result<(u64, Receiver<()>, u32, u32, u32)> {
+) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, u32, u32, u32)> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())
@@ -369,14 +397,16 @@ fn create_window(
         let actual_w = (actual.right - actual.left) as u32;
         let actual_h = (actual.bottom - actual.top) as u32;
 
-        let (tx, rx) = channel::<()>();
+        let (close_tx, close_rx) = channel::<()>();
+        let (resize_tx, resize_rx) = channel::<(u32, u32)>();
         THREAD_STATE.with(|s| {
             if let Some(st) = s.borrow_mut().as_mut() {
                 st.hwnd = Some(hwnd);
-                st.close_tx = Some(tx);
+                st.close_tx = Some(close_tx);
+                st.resize_tx = Some(resize_tx);
             }
         });
-        Ok((hwnd.0 as u64, rx, actual_w, actual_h, dpi))
+        Ok((hwnd.0 as u64, close_rx, resize_rx, actual_w, actual_h, dpi))
     }
 }
 

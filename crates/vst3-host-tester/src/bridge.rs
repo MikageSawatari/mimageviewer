@@ -82,6 +82,10 @@ pub enum Cmd {
     /// プラグインが子ウィンドウを正しいサイズで作成できる。
     #[serde(rename = "query_gui_size")]
     QueryGuiSize,
+    /// ホストウィンドウのリサイズが起きたことをプラグインに通知する。
+    /// bridge は view->onSize(rect) を呼んでプラグインの子ウィンドウを追従させる。
+    #[serde(rename = "notify_host_resize")]
+    NotifyHostResize { width: u32, height: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -302,6 +302,17 @@ private:
             write_message("{\"event\":\"gui_detached\"}");
             return true;
         }
+        if (cmd == "notify_host_resize") {
+            // host (tester) ウィンドウがユーザーリサイズされた → プラグインに通知して
+            // 子ウィンドウを追従させる。応答は不要。
+            if (!loader_) return true;
+            uint32_t w = static_cast<uint32_t>(extract_number_field(msg, "width"));
+            uint32_t h = static_cast<uint32_t>(extract_number_field(msg, "height"));
+            if (w > 0 && h > 0) {
+                loader_->notify_host_resize(w, h);
+            }
+            return true;
+        }
         if (cmd == "close") {
             if (loader_) loader_->unload();
             loader_.reset();

@@ -101,6 +101,8 @@ struct TesterApp {
     gui_hwnd: u64,
     /// GUI ウィンドウの × クリックを GUI スレッドから受け取る側。Some の時のみ表示中。
     gui_close_signal: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    /// GUI ウィンドウのユーザーリサイズを GUI スレッドから受け取る側。
+    gui_resize_signal: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
 
     // log buffer for the bottom panel
     log_lines: Arc<Mutex<Vec<String>>>,
@@ -154,6 +156,7 @@ impl TesterApp {
             gui_host: plugin_gui::GuiHost::spawn(),
             gui_hwnd: 0,
             gui_close_signal: None,
+            gui_resize_signal: None,
         };
         app.log(format!("ログファイル: {}", app.log_file_path.display()));
         app.scan();
@@ -376,6 +379,7 @@ impl TesterApp {
         ));
         self.gui_hwnd = reply.hwnd_u64;
         self.gui_close_signal = Some(reply.close_signal);
+        self.gui_resize_signal = Some(reply.resize_signal);
 
         // ── ステップ 3: 正しいサイズの HWND で attach ──
         if let Err(e) = bridge.send(&Cmd::ShowGui {
@@ -421,7 +425,32 @@ impl TesterApp {
         self.gui_host.close();
         self.gui_hwnd = 0;
         self.gui_close_signal = None;
+        self.gui_resize_signal = None;
         self.log("gui closed");
+    }
+
+    /// ホストウィンドウのリサイズを polling して、来てたら bridge に通知する。
+    /// プラグインの子ウィンドウサイズが追従する。
+    #[cfg(windows)]
+    fn poll_gui_resize(&mut self) {
+        let Some(arc) = self.gui_resize_signal.as_ref() else {
+            return;
+        };
+        // 連続した WM_SIZE は最後の 1 回だけ処理 (ドラッグ中に多発するため)
+        let mut last: Option<(u32, u32)> = None;
+        {
+            let guard = arc.lock().unwrap();
+            if let Some(rx) = guard.as_ref() {
+                while let Ok(size) = rx.try_recv() {
+                    last = Some(size);
+                }
+            }
+        }
+        if let Some((w, h)) = last {
+            if let Some(br) = self.bridge.as_ref() {
+                let _ = br.send(&Cmd::NotifyHostResize { width: w, height: h });
+            }
+        }
     }
 
     /// GUI ウィンドウからの × クリックを polling して、来てたら close_gui する。
@@ -665,6 +694,9 @@ impl eframe::App for TesterApp {
         // GUI ウィンドウの × クリックを拾う
         #[cfg(windows)]
         self.poll_gui_close();
+        // GUI ウィンドウのリサイズを bridge に転送
+        #[cfg(windows)]
+        self.poll_gui_resize();
 
         // bridge から非同期に来るイベント (latency_changed 等) のポーリングは
         // Phase 0b 後段で追加する。現状は load 時の同期 recv のみ。

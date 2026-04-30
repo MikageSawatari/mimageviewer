@@ -79,6 +79,10 @@ public:
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 
+    /// ホストウィンドウのクライアント領域がユーザーリサイズされたことを
+    /// プラグインに通知する。view->onSize(rect) を呼ぶ。
+    void notify_host_resize(uint32_t width, uint32_t height);
+
 private:
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
@@ -100,6 +104,11 @@ private:
     // num_in_buses_ = 2 になる。ProcessData::numInputs はこの値と一致する必要がある。
     int32_t num_in_buses_ = 0;
     int32_t num_out_buses_ = 0;
+
+    // ProcessContext の時刻フィールド (sample 単位)。process_block ごとに進める。
+    // 進めないと Pro-Q 4 等のアナライザ系は「時間が止まっている」と判断して
+    // 更新を停止する。
+    int64_t process_time_samples_ = 0;
 
     // process() に渡す ProcessData の事前確保バッファ (アロケーションを避けるため)
     std::vector<float> in_buffer_l_;
