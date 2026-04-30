@@ -103,7 +103,6 @@ pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
-    engine_state: Arc<std::sync::atomic::AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
@@ -160,12 +159,11 @@ pub fn start(
     // ── cpal output callback: buffer → device ──
     let cb_buffer = buffer.clone();
     let cb_clock = clock.clone();
-    let cb_engine_state = engine_state.clone();
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_output(out, &cb_buffer, &cb_clock, &cb_engine_state);
+                fill_output(out, &cb_buffer, &cb_clock);
             },
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
@@ -337,11 +335,27 @@ fn fill_output(
     out: &mut [f32],
     buffer: &Arc<Mutex<AudioBuffer>>,
     clock: &Arc<AvClock>,
-    engine_state: &Arc<std::sync::atomic::AtomicU8>,
 ) {
-    // 先に clock の seek_serial を読む。post-seek 直後で pump がまだ古い世代の
-    // バッファを抱えている場合は、ここで全消去して silence を出す
-    // (= 古い samples を再生して set_audio_pts でクロックを巻き戻す経路を塞ぐ)。
+    // ── 設計 (counter consolidation 後の bookkeeping 上流移動) ──
+    //
+    // 旧版は cpal callback ごとに無条件で `next_pts_secs += want / samples_per_sec`
+    // を加算していた (= 「常に full 期間分進める」)。silence 出力中も進むので、
+    // cpal stream 起動直後 (~50ms) の pre-fill burst で callback が連続発火すると
+    // anchor pts が wall の 2-3x 速で前進、decoder の pacing が誤判定して future_frames
+    // が枯渇する問題があった (= Phase 9.A 報告)。
+    //
+    // 旧版の対症療法 (削除済):
+    //   - Phase 9.A: `set_audio_pts` の wall-rate cap (= 後段で異常前進を頭打ち)
+    //   - Phase 9.B/9.E: LOADING/IDLE 中 silence + `next_pts_secs` 進行 skip
+    //
+    // 新版: **実際に消費したサンプル数だけ `next_pts_secs` を進める** (= bookkeeping を
+    // 上流に正確化)。silence 出力 (= underrun または warmup で buffer 空) では
+    // `real_consumed = 0` となり pts は 1 mode も進まない → cap も silence gate も不要。
+    //
+    // 残った早期 return:
+    //   - pre-seek サンプル全消去 (= clock_serial > pump_serial)
+    //   - 一時停止中の silence (= clock.is_playing()=false)
+    // どちらも「**buffer から pop しない**」設計上必要な分岐。
     let clock_serial = clock.current_seek_serial();
     let mut buf = buffer.lock().unwrap();
 
@@ -356,69 +370,43 @@ fn fill_output(
 
     let want = out.len();
 
-    // 一時停止中は無音 (PTS も進めない)
+    // 一時停止中は無音 (samples 保持、PTS も進めない)
     if !clock.is_playing() {
         out.fill(0.0);
         return;
     }
 
-    // ── Warmup gate (Phase 9.B、Phase 9.E で範囲縮小) ──
-    //
-    // Phase 9.B: 動画 open 直後、cpal stream の起動時に複数 callback が短時間で
-    // 連続発火 (= pre-fill burst) し、各 callback が `next_pts_secs` を 1 buffer 分
-    // (10ms) ずつ進めるため anchor.pts が wall の 2-3x 速で前進する問題があった。
-    // これを engine_state ≠ Playing の間 silence にして抑止していた。
-    //
-    // Phase 9.E (2026-04-30 fixup): silence の範囲を **LOADING のみ** に縮小。
-    // Buffering (= 通常 seek 直後) では drain を許可する:
-    //
-    // - LOADING 経路: 動画 open 直後、cpal stream 初期化中。pre-fill burst の
-    //   主因がここなので silence 維持が必要。
-    // - BUFFERING 経路: seek 後の readiness 待ち。cpal stream は既に稼働中で
-    //   pre-fill burst は起きない。silence にすると:
-    //   1. AudioBuffer がドレインされず満杯
-    //   2. pump が backpressure → audio_tx (32) full → audio decode が send block
-    //   3. audio_pkt_tx (64) full → demux が send block
-    //   4. demux が新 packet 読まず take_seek_request 走らない
-    //   5. **forward seek の 1 枚目が永久に届かない deadlock**
-    //
-    // pre-fill burst による pace_now drift は Phase 9.A の wall-rate cap
-    // (= `set_audio_pts` で anchor pts 進行を wall 進行に制限) で十分カバー済。
-    // 二重対策だった Phase 9.B の Buffering 範囲を撤回しても drift は再発しない。
-    let engine_st = engine_state.load(std::sync::atomic::Ordering::Acquire);
-    let in_loading_warmup =
-        engine_st == crate::video::engine::actor::state_code::LOADING
-            || engine_st == crate::video::engine::actor::state_code::IDLE;
-    if in_loading_warmup {
-        out.fill(0.0);
-        // bookkeeping は通常通り実施 (= pump からの publish との race を避ける)。
-        publish_buffer_secs(&buf, clock);
-        return;
-    }
-
     let vol = clock.effective_volume();
 
+    // ── 実消費サンプル数を数えながらドレイン ──
+    let mut real_consumed: usize = 0;
     let mut written = 0;
     while written < want {
         match buf.samples.pop_front() {
             Some(s) => {
                 out[written] = s * vol;
                 written += 1;
+                real_consumed += 1;
             }
             None => {
-                // underrun: 残りを silence で埋める
+                // underrun: 残りを silence で埋める。real_consumed はここで止まる。
                 for o in &mut out[written..] {
                     *o = 0.0;
                 }
-                written = want;
+                break;
             }
         }
     }
 
-    // pump が pre-seek サンプルを抱えている間 (clock_serial > pump_serial) に
-    // set_audio_pts を呼ぶとシーク前位置でクロックが進み、シークバーがスナップバック。
-    // 二段読みで race を排除する。
-    let consumed_secs = want as f64 / buf.samples_per_sec;
+    // ── bookkeeping (実消費分のみ) ──
+    if real_consumed == 0 {
+        // 完全 underrun (= buffer 空 から callback 来た)。pts を進めず、buffer 状態を
+        // pump 側に publish して終了。warmup 期間の pre-fill burst が来ても pts drift
+        // しない (= 旧 Phase 9.A wall-rate cap / 9.B silence gate を不要にする根拠)。
+        publish_buffer_secs(&buf, clock);
+        return;
+    }
+    let consumed_secs = real_consumed as f64 / buf.samples_per_sec;
     buf.next_pts_secs += consumed_secs;
     let pts_now = buf.next_pts_secs;
     let pump_serial = buf.pump_seek_serial;
@@ -427,6 +415,9 @@ fn fill_output(
     // overhead = 1 atomic store ≈ 1 ns 程度なので RT への影響は無視できる。
     publish_buffer_secs(&buf, clock);
     drop(buf);
+    // pump が pre-seek サンプルを抱えている間 (clock_serial > pump_serial) に
+    // set_audio_pts を呼ぶとシーク前位置でクロックが進み、シークバーがスナップバック。
+    // 二段読みで race を排除する。
     if pump_serial >= clock.current_seek_serial() {
         clock.set_audio_pts(pts_now);
         // override クリアは「target 近傍のサンプル」を消費した時のみ。
