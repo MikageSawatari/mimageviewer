@@ -239,7 +239,9 @@ impl App {
             }
         }
         if let Some(idx) = clicked_hide_gui {
-            self.dsp_bridge.hide_slot_gui(idx);
+            // ユーザーが個別に GUI × した → user_hidden=true をセット
+            // (= 以降の VST 全表示でも skip される)
+            self.dsp_bridge.user_hide_slot_gui(idx);
         }
         if let Some((idx, bypass)) = clicked_toggle_bypass {
             self.dsp_bridge.set_bypass(idx, bypass);

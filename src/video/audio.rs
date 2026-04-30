@@ -230,14 +230,29 @@ fn run_pump(
     // 初期容量を 4096 (= 約 0.04 秒@48kHz stereo) で確保する。
     #[cfg(windows)]
     let mut fx_out: Vec<f32> = Vec::with_capacity(4096);
-    // 厚さ ~1.5 秒のバッファを目安に流量制御する。
-    // 0.5 秒だと cpal RT 周期と decoder 不安定さで underrun → ブチブチに。
-    // 1.5 秒でも遅延体感は問題なく、シーク時にバッファ捨てるので問題なし。
-    // ※ samples は interleaved stereo (channels=2) なので sample_rate * 2 * 1.5。
+    // ── 出力バッファ厚 (audio_buffer の cap) ──
+    //
+    // この長さは「VST プラグインが処理した audio が **スピーカーから出るまでの** 遅延」
+    // に直結する。pump → bridge → audio_buffer → cpal → 出力 のパイプラインで、
+    // pump はバッファが満杯にならない限りすぐに次のフレームを処理するため、
+    // バッファ fill = 「**プラグインで加工済みの audio が並んでいる量**」となる。
+    //
+    // ユーザーが EQ ノブを動かす → プラグインの新しい係数で audio 加工 →
+    // pump が新加工 audio を audio_buffer に push → cpal が audio_buffer から順次
+    // pop して出力。**ユーザー操作 → 音への反映 = audio_buffer fill 量**。
+    //
+    // 旧版は 1.5 秒固定にしていたが、ユーザー報告 (2026-04) で「EQ 反映が
+    // 数百 ms 遅れる」が判明 → **300 ms に縮小**して反応性を確保する。
+    // 0.5 秒以下にすると cpal の RT 周期 (= 10-20 ms) と pump の処理時間ジッタ
+    // で稀に underrun (= 一瞬の無音) が出るリスクがあるが、300 ms あれば
+    // VST3 bridge IPC roundtrip (= ~1-5 ms) の数十倍の余裕があるので実用上は安定。
+    //
+    // ※ samples は interleaved stereo (channels=2)。
     // sample_rate は構築時に固定なので 1 度だけロックして拾う。
+    const TARGET_BUFFER_SECS: f64 = 0.3;
     let cap_samples = {
         let b = buffer.lock().unwrap();
-        (b.sample_rate as usize * 2 * 3) / 2
+        (b.sample_rate as f64 * 2.0 * TARGET_BUFFER_SECS) as usize
     };
 
     // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。

@@ -84,6 +84,11 @@ struct DspBridgeInner {
     /// 2 本必要なのは ping-pong 時のみだが、シンプルさのため常に 2 本持つ。
     scratch_a: Vec<f32>,
     scratch_b: Vec<f32>,
+    /// 直近 hide した時点の z-order スナップショット (top-to-bottom 順 HWND リスト)。
+    /// `set_all_guis_visible(false)` 直前に取得し、`set_all_guis_visible(true)` で
+    /// 復元するために使う。これにより VST ボタン toggle で z-order が保たれる
+    /// (= ユーザー報告 2026-04 「登録順に戻る」の対策)。
+    last_z_order_snapshot: Vec<u64>,
 }
 
 pub(crate) struct PluginSlot {
@@ -105,6 +110,11 @@ pub(crate) struct PluginSlot {
     /// プラグイン GUI が現在可視か (= ShowWindow の状態を mIV 側で覚えておく)。
     /// `gui_hwnd != 0 && !gui_visible` = ウィンドウは作成済みだが SW_HIDE 状態。
     pub gui_visible: bool,
+    /// ユーザーが個別に GUI × で閉じたかどうか (= 一斉表示しても再表示しない希望)。
+    /// パネルの「GUI ×」ボタンで true、「GUI」ボタンで false。
+    /// `set_all_guis_visible(true)` (= VST ボタン全表示) は user_hidden=true のスロット
+    /// を skip する (= ユーザー報告 2026-04 「個別に閉じたものは再表示しないで」)。
+    pub user_hidden: bool,
     /// プラグイン GUI ホスト (Win32 子ウィンドウスレッド)。slot 削除で自動終了する。
     pub gui_host: Option<gui::GuiHost>,
     /// ホストウィンドウの × ボタン押下シグナル。
@@ -127,6 +137,7 @@ impl DspBridge {
                 slots: Vec::new(),
                 scratch_a: Vec::new(),
                 scratch_b: Vec::new(),
+                last_z_order_snapshot: Vec::new(),
             }),
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
@@ -295,6 +306,7 @@ impl DspBridge {
             bypass,
             gui_hwnd: 0,
             gui_visible: false,
+            user_hidden: false,
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
@@ -375,6 +387,7 @@ impl DspBridge {
                     let mut inner2 = self.inner.lock().unwrap();
                     if let Some(s2) = inner2.slots.get_mut(idx) {
                         s2.gui_visible = true;
+                        s2.user_hidden = false; // 明示的に show したので user_hidden 解除
                     }
                     return Ok(());
                 }
@@ -470,17 +483,34 @@ impl DspBridge {
         Ok(())
     }
 
-    /// 指定 idx のプラグイン GUI を **隠す**。
-    ///
-    /// **永続 GuiHost 設計**: ウィンドウは破棄せず ShowWindow(SW_HIDE) で隠すだけ。
-    /// プラグインの IPlugView は attached のまま (= audio はそのまま流れる、
-    /// 内部状態は維持)。次の `show_slot_gui` 呼び出しは ShowWindow(SW_SHOWNA)
-    /// 一発で復活する (DAW 並みの高速トグル)。
+    /// 指定 idx のプラグイン GUI を **隠す** (= 一括 hide / 内部呼出用)。
+    /// `user_hidden` フラグは触らない。VST 全体トグル / フルスクリーン解除等の
+    /// 暗黙 hide パスで使う。
     pub fn hide_slot_gui(&self, idx: usize) {
         let hwnd = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(slot) = inner.slots.get_mut(idx) {
                 slot.gui_visible = false;
+                slot.gui_hwnd
+            } else {
+                0
+            }
+        };
+        if hwnd != 0 {
+            gui::set_window_visible(hwnd, false);
+        }
+    }
+
+    /// 指定 idx のプラグイン GUI をユーザーが明示的に閉じた。
+    /// `user_hidden = true` をセットし、以降の `set_all_guis_visible(true)` (=
+    /// VST ボタン全表示) では表示しない (= ユーザー報告 2026-04 「個別に閉じた
+    /// ものは再表示しないでほしい」)。
+    pub fn user_hide_slot_gui(&self, idx: usize) {
+        let hwnd = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(slot) = inner.slots.get_mut(idx) {
+                slot.gui_visible = false;
+                slot.user_hidden = true;
                 slot.gui_hwnd
             } else {
                 0
@@ -505,18 +535,80 @@ impl DspBridge {
         }
     }
 
-    /// 全プラグイン GUI を表示/非表示一斉トグル (V キーハンドラ)。
-    /// `target_visible=true` なら表示、false なら非表示にする。
+    /// 全プラグイン GUI を表示/非表示一斉トグル (= VST ボタン)。
+    ///
+    /// **z-order 保持** (Codex P1 / ユーザー報告 2026-04):
+    /// - hide 直前に **現在の z-order を snapshot**
+    /// - show 後に snapshot を bottom-to-top で SetWindowPos 復元
+    /// これでユーザーが手で並べた前後関係が VST トグル後も保たれる。
+    ///
+    /// **per-slot user_hidden 尊重**: スロットごとの `user_hidden` フラグが
+    /// true のスロットは、VST 全体トグルで show=true にしても表示しない
+    /// (= ユーザーが個別に GUI × した状態を尊重)。
     pub fn set_all_guis_visible(&self, target_visible: bool) {
-        let n = {
-            let inner = self.inner.lock().unwrap();
-            inner.slots.len()
-        };
-        for idx in 0..n {
-            if target_visible {
-                let _ = self.show_slot_gui(idx);
+        if !target_visible {
+            // ── hide 経路: 現 z-order を snapshot してから全 hide ──
+            let target_hwnds: Vec<u64> = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .slots
+                    .iter()
+                    .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
+                    .map(|s| s.gui_hwnd)
+                    .collect()
+            };
+            let snapshot = if target_hwnds.is_empty() {
+                Vec::new()
             } else {
+                gui::snapshot_z_order(&target_hwnds)
+            };
+            let n = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.last_z_order_snapshot = snapshot;
+                inner.slots.len()
+            };
+            for idx in 0..n {
                 self.hide_slot_gui(idx);
+            }
+        } else {
+            // ── show 経路: 全 SW_SHOWNA → snapshot 順序で z-order 復元 ──
+            // user_hidden=true のスロットは飛ばす。
+            let n = {
+                let inner = self.inner.lock().unwrap();
+                inner.slots.len()
+            };
+            let mut shown_hwnds: Vec<u64> = Vec::with_capacity(n);
+            for idx in 0..n {
+                let user_hidden = {
+                    let inner = self.inner.lock().unwrap();
+                    inner.slots.get(idx).map(|s| s.user_hidden).unwrap_or(false)
+                };
+                if user_hidden {
+                    continue;
+                }
+                let _ = self.show_slot_gui(idx);
+                let hwnd = {
+                    let inner = self.inner.lock().unwrap();
+                    inner.slots.get(idx).map(|s| s.gui_hwnd).unwrap_or(0)
+                };
+                if hwnd != 0 {
+                    shown_hwnds.push(hwnd);
+                }
+            }
+            // ── z-order 復元: snapshot を bottom-to-top で SetWindowPos ──
+            // snapshot に含まれる HWND だけ対象 (= user_hidden で skip した
+            // スロットや、新規に追加されて snapshot に無いものは触らない)。
+            let snapshot: Vec<u64> = {
+                let inner = self.inner.lock().unwrap();
+                inner.last_z_order_snapshot.clone()
+            };
+            let shown_set: std::collections::HashSet<u64> =
+                shown_hwnds.iter().copied().collect();
+            for hwnd in snapshot.iter().rev() {
+                if shown_set.contains(hwnd) {
+                    let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
+                    gui::set_window_topmost(*hwnd, topmost);
+                }
             }
         }
     }
