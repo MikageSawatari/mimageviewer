@@ -90,6 +90,13 @@ pub enum Cmd {
     /// 歪みが消えれば plugin process が原因、残れば bridge パイプラインが原因。
     #[serde(rename = "set_passthrough")]
     SetPassthrough { enable: u32 },
+    /// ユーザー drag によるリサイズが進行中かを bridge に通知する。
+    /// `active=true` 中、bridge は plugin の `resizeView` callback で host HWND
+    /// への `SetWindowPos` をスキップする (= ユーザー drag と plugin リサイズ要求の
+    /// 衝突によるウィンドウ振動を抑止、Codex P4)。
+    /// Rust 側 wndproc が `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` を受けて発行する。
+    #[serde(rename = "set_user_resizing")]
+    SetUserResizing { active: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

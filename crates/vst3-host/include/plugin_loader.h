@@ -86,6 +86,10 @@ public:
     /// プラグインに通知する。view->onSize(rect) を呼ぶ。
     void notify_host_resize(uint32_t width, uint32_t height);
 
+    /// ユーザー drag による resize/move session が進行中かを設定する (Codex P4)。
+    /// PlugFrame に伝搬し、session 中は `resizeView` の SetWindowPos を抑止する。
+    void set_user_resizing(bool active);
+
 private:
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;

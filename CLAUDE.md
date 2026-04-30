@@ -680,6 +680,61 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 **VST トレードマーク (ロゴ) は使わない**。「VST3 プラグインをサポート」テキスト表記のみで運用
 (= トレードマークガイドライン回避)。
 
+## Markdown / テキストファイルのエンコーディング (BOM 必須ケース)
+
+Claude Code の `Write` tool は **UTF-8 (BOM なし)** で書き出す。Linux / macOS や
+モダンエディタはこれで問題ないが、以下のツール群は BOM 無し UTF-8 を
+**Windows ANSI (= CP932 in JP)** として誤読し、日本語が mojibake になる:
+
+- **Codex GUI** (= ローカル Codex デスクトップツール) — ユーザー報告 2026-04
+  「ブリーフが文字化けしている」
+- **Windows メモ帳 (旧バージョン)** — Win11 22H2 以降は UTF-8 既定だが、社用 PC で
+  古い設定が残っているケースあり
+- **PowerShell 5.1** の `Get-Content` (デフォルト) — `-Encoding utf8` 明示しない限り
+  CP932 で読む
+
+このため、外部ツールに渡す **Markdown / テキストブリーフ** には UTF-8 BOM
+(`EF BB BF`) を **明示的に付与**する。
+
+### 付与方法
+
+Claude Code 経由で書き出した直後に、以下のヘルパースクリプトで BOM を付ける:
+
+```bash
+python scripts/write_utf8_bom.py docs/foo-brief.md
+```
+
+冪等 (= 既に BOM があれば no-op)。複数ファイル指定可。
+
+### 検証
+
+```bash
+file docs/foo-brief.md
+# Expected: "Unicode text, UTF-8 (with BOM) text"
+head -c 3 docs/foo-brief.md | xxd
+# Expected: "00000000: efbb bf"
+```
+
+### 過去の経緯
+
+- 2026-04: PowerShell スクリプト `upload-trt-pack.ps1` の日本語文字列が CP932
+  読みで mojibake → 該当スクリプトは ASCII オンリーに置換 (BOM の代わり)
+  (commit f81fec7)。ASCII で書ける用途は ASCII 化が単純で堅い。
+- 2026-04: Codex GUI に渡す Markdown ブリーフが mojibake → BOM 付与で回避
+  (本ポリシー策定)。Markdown / 日本語文章は ASCII 化できないので BOM を使う。
+
+### 使い分け
+
+| ファイル種別                              | 推奨方式            |
+|-------------------------------------------|---------------------|
+| `*.rs` / `*.cpp` / `*.h`                  | UTF-8 BOM **無し**  |
+| `*.md` / `*.txt` (リポジトリ内、開発用)   | UTF-8 BOM **無し**  |
+| `*.md` / `*.txt` (**外部ツールに渡す用**) | UTF-8 BOM **あり**  |
+| `*.ps1` (PowerShell スクリプト)           | ASCII オンリー推奨  |
+
+リポジトリ内の通常 Markdown ドキュメント (`docs/*.md`、`README.md` 等) は
+BOM 不要 (= Linux / macOS / git diff の互換性のため)。
+
 ## UI 文字列の Unicode グリフ選定ルール
 
 mIV はプライマリ proportional フォントに **Yu Gothic Medium** (Windows 標準) を

@@ -66,6 +66,12 @@ public:
     /// resizeView を発火するため、瞬間的なフラグでは間に合わなかった。
     void mark_user_resize();
 
+    /// ユーザー drag によるリサイズ session の開始 / 終了 (Codex P4)。
+    /// `active=true` 中は `resizeView` callback で SetWindowPos を **常に**
+    /// スキップする。`set_user_resizing(false)` 後にタイムスタンプ式の 250ms
+    /// fallback と組み合わせて Insight2 の非同期 resizeView も抑止する。
+    void set_user_resizing(bool active);
+
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView* view,
                                               Steinberg::ViewRect* newSize) override;
 
@@ -77,6 +83,10 @@ private:
     /// resizeView コールバックが来た時刻と比較して、近い時刻なら "ユーザー drag
     /// による波及" とみなして SetWindowPos スキップ。0 = 未初期化。
     uint64_t last_user_resize_tick_ = 0;
+    /// ユーザー drag による resize/move session 中フラグ (Codex P4)。
+    /// host wndproc の WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE で true/false が
+    /// 設定される。true 中は resizeView の SetWindowPos を常にスキップする。
+    bool user_resizing_ = false;
 };
 
 class ComponentHandler : public Steinberg::Vst::IComponentHandler {

@@ -329,6 +329,15 @@ private:
             }
             return true;
         }
+        if (cmd == "set_user_resizing") {
+            // ユーザー drag による resize/move session の開始 / 終了通知 (Codex P4)。
+            // session 中は plugin の resizeView による host SetWindowPos を抑止して
+            // ユーザー drag との衝突 (= ウィンドウ振動) を防ぐ。
+            if (!loader_) return true;
+            uint64_t active = extract_number_field(msg, "active");
+            loader_->set_user_resizing(active != 0);
+            return true;
+        }
         if (cmd == "close") {
             if (loader_) loader_->unload();
             loader_.reset();

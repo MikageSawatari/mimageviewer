@@ -39,6 +39,11 @@ use windows::core::{HSTRING, PCWSTR};
 
 const WINDOW_CLASS: &str = "MivVst3PluginHostWindow";
 
+// WM_ENTERSIZEMOVE = 0x0231, WM_EXITSIZEMOVE = 0x0232 (Win32 SDK 定義値)
+// windows-rs から直接定数を引くのが面倒なので生数値を使う (= 値は安定).
+const WM_ENTERSIZEMOVE_VAL: u32 = 0x0231;
+const WM_EXITSIZEMOVE_VAL: u32 = 0x0232;
+
 #[derive(Debug)]
 pub enum Cmd {
     /// 新規ウィンドウを作って HWND を返す。返り値: (hwnd_u64, close_signal_rx)。
@@ -75,6 +80,10 @@ pub struct ShowReply {
     /// ユーザーがホストウィンドウをリサイズしたときに新クライアント領域サイズが届く。
     /// メインスレッドはこれを polling して、bridge に notify_host_resize を送る。
     pub resize_signal: Arc<Mutex<Option<Receiver<(u32, u32)>>>>,
+    /// ユーザー drag による resize/move session の開始 / 終了通知。
+    /// `true` = 開始 (WM_ENTERSIZEMOVE)、`false` = 終了 (WM_EXITSIZEMOVE)。
+    /// メインスレッドはこれを polling し、bridge に SetUserResizing で伝える。
+    pub resize_session_signal: Arc<Mutex<Option<Receiver<bool>>>>,
 }
 
 /// 専用スレッドで Win32 メッセージループを回す GUI ホスト。
@@ -153,6 +162,10 @@ struct ThreadState {
     /// ユーザーがホストウィンドウをリサイズしたとき、新クライアントサイズを通知。
     /// メインスレッドはこれを受けて bridge に notify_host_resize を送る。
     resize_tx: Option<Sender<(u32, u32)>>,
+    /// ユーザー drag による resize session の開始 / 終了通知 (= true=開始, false=終了)。
+    /// メインスレッドはこれを受けて bridge に SetUserResizing を送り、bridge 側の
+    /// resizeView feedback を抑止する。Codex P4 対応。
+    resize_session_tx: Option<Sender<bool>>,
     class_registered: bool,
 }
 
@@ -209,6 +222,21 @@ extern "system" fn wndproc(
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+            WM_ENTERSIZEMOVE_VAL | WM_EXITSIZEMOVE_VAL => {
+                // ユーザーが drag による resize/move session を開始 / 終了した。
+                // bridge に通知して plugin の resizeView による host SetWindowPos を
+                // 抑止する (Codex P4)。
+                let active = msg == WM_ENTERSIZEMOVE_VAL;
+                let tx_opt: Option<Sender<bool>> = THREAD_STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|st| st.resize_session_tx.clone())
+                });
+                if let Some(tx) = tx_opt {
+                    let _ = tx.send(active);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_DESTROY => {
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -240,6 +268,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             hwnd: None,
             close_tx: None,
             resize_tx: None,
+            resize_session_tx: None,
             class_registered: false,
         }));
     });
@@ -264,7 +293,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             } => {
                 let result = create_window(&title, width, height, resizable);
                 match result {
-                    Ok((hwnd_u64, close_rx, resize_rx, actual_w, actual_h, used_dpi)) => {
+                    Ok((hwnd_u64, close_rx, resize_rx, resize_session_rx, actual_w, actual_h, used_dpi)) => {
                         let _ = reply.send(ShowReply {
                             hwnd_u64,
                             actual_client_w: actual_w,
@@ -272,6 +301,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                             used_dpi,
                             close_signal: Arc::new(Mutex::new(Some(close_rx))),
                             resize_signal: Arc::new(Mutex::new(Some(resize_rx))),
+                            resize_session_signal: Arc::new(Mutex::new(Some(resize_session_rx))),
                         });
                         // ウィンドウ作成成功 → メッセージループを回す。
                         // 並行して cmd_rx も polling する必要があるので、
@@ -288,6 +318,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                             used_dpi: 0,
                             close_signal: Arc::new(Mutex::new(None)),
                             resize_signal: Arc::new(Mutex::new(None)),
+                            resize_session_signal: Arc::new(Mutex::new(None)),
                         });
                         eprintln!("create_window failed: {e}");
                     }
@@ -339,6 +370,7 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
                         used_dpi: 0,
                         close_signal: Arc::new(Mutex::new(None)),
                         resize_signal: Arc::new(Mutex::new(None)),
+                        resize_session_signal: Arc::new(Mutex::new(None)),
                     });
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -355,7 +387,7 @@ fn create_window(
     width: u32,
     height: u32,
     resizable: bool,
-) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, u32, u32, u32)> {
+) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, Receiver<bool>, u32, u32, u32)> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())
@@ -472,14 +504,16 @@ fn create_window(
 
         let (close_tx, close_rx) = channel::<()>();
         let (resize_tx, resize_rx) = channel::<(u32, u32)>();
+        let (resize_session_tx, resize_session_rx) = channel::<bool>();
         THREAD_STATE.with(|s| {
             if let Some(st) = s.borrow_mut().as_mut() {
                 st.hwnd = Some(hwnd);
                 st.close_tx = Some(close_tx);
                 st.resize_tx = Some(resize_tx);
+                st.resize_session_tx = Some(resize_session_tx);
             }
         });
-        Ok((hwnd.0 as u64, close_rx, resize_rx, actual_w, actual_h, dpi))
+        Ok((hwnd.0 as u64, close_rx, resize_rx, resize_session_rx, actual_w, actual_h, dpi))
     }
 }
 
@@ -515,6 +549,54 @@ pub fn bring_to_front(hwnd_u64: u64) {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
+}
+
+/// 指定 HWND 群の現在の z-order を top-to-bottom 順 (= 最前面から背面) で返す。
+///
+/// `EnumWindows` でデスクトップの top-level window を前面順に走査し、
+/// `targets` に含まれる HWND だけを拾って順序付きで返す。
+/// `set_all_guis_topmost` で TOPMOST 切替前に snapshot し、切替後に bottom-to-top
+/// で再適用するために使う (= 元の前後関係を保つ、Codex P1 対応)。
+pub fn snapshot_z_order(targets: &[u64]) -> Vec<u64> {
+    use windows::Win32::Foundation::{GetLastError, HWND as Hwnd2};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GW_HWNDNEXT, GetTopWindow,
+    };
+
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let target_set: std::collections::HashSet<u64> = targets.iter().copied().collect();
+    let mut found: Vec<u64> = Vec::with_capacity(targets.len());
+
+    // GetTopWindow(NULL) → desktop の最前面 top-level → GetWindow(GW_HWNDNEXT) で
+    // z-order を top→bottom 順にたどる。target_set に含まれるものだけ拾う。
+    unsafe {
+        let mut h = GetTopWindow(None).unwrap_or(Hwnd2(std::ptr::null_mut()));
+        let _ = GetLastError(); // 未使用警告抑制
+        let mut safety_iter = 0u32;
+        while !h.0.is_null() && safety_iter < 65536 {
+            safety_iter += 1;
+            let h_u = h.0 as u64;
+            if target_set.contains(&h_u) {
+                found.push(h_u);
+                if found.len() == targets.len() {
+                    break;
+                }
+            }
+            h = match GetWindow(h, GW_HWNDNEXT) {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+        }
+    }
+    // 取りこぼした HWND は targets の元順序で末尾に追加 (= 保険)。
+    for h in targets {
+        if !found.contains(h) {
+            found.push(*h);
+        }
+    }
+    found
 }
 
 /// 既存ウィンドウを TOPMOST にする / 解除する。

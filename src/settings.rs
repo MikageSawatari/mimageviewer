@@ -1289,12 +1289,18 @@ impl Settings {
         // ── 補正プリセット (フルスクリーン `P` / スロットダイアログで編集) ──
         self.global_preset = std::mem::take(&mut src.global_preset);
         self.preset_slots = std::mem::take(&mut src.preset_slots);
-        // ── VST3 プラグイン (専用管理ウィンドウ / V キーで編集) ──
-        // `vst3_enabled` は環境設定から触るので除外。それ以外は管理ウィンドウや
-        // V キーの runtime 操作で変わるので preferences 側を上書きする。
-        self.vst3_plugins = std::mem::take(&mut src.vst3_plugins);
-        self.vst3_plugin_path = src.vst3_plugin_path.take(); // legacy migration field
-        self.vst3_plugin_state = src.vst3_plugin_state.take(); // legacy migration field
+        // ── VST3 プラグイン (環境設定→VST3 プラグインページで編集) ──
+        // ⚠️ `vst3_plugins` は **環境設定で編集する** フィールド (旧設計では
+        // 管理ウィンドウで編集していた経緯で overwrite していたが、現設計では
+        // preferences が source of truth)。ここで上書きすると preferences で
+        // 追加したプラグインが OK 押下時に消える (= ユーザー報告 2026-04)。
+        // よって `self.vst3_plugins` には触らず、preferences 側の変更をそのまま
+        // 採用する (= state.settings = ... が後段で上書きする)。
+        // legacy migration field (deprecated path/state) のみ App 側を残す。
+        self.vst3_plugin_path = src.vst3_plugin_path.take();
+        self.vst3_plugin_state = src.vst3_plugin_state.take();
+        // `vst3_gui_visible` は VST ボタン runtime トグルで変わるので App 側を保つ。
+        // `vst3_video_compact` も同様 (= プレイバックパネルで切替)。
         self.vst3_gui_visible = src.vst3_gui_visible;
         self.vst3_video_compact = src.vst3_video_compact;
     }

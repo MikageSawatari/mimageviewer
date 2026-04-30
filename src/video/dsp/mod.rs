@@ -69,6 +69,12 @@ pub struct DspBridge {
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
     /// audio-pump はこれが 0 ならパススルーで早期 return できる。
     active_slot_count: AtomicUsize,
+    /// プラグイン GUI ウィンドウを TOPMOST にしておきたいか (= フルスクリーン
+    /// 動画再生中の "希望状態")。`set_all_guis_topmost` で更新され、`show_slot_gui`
+    /// の新規作成・再表示パスで「現在の希望状態に合わせて」最終的な TOPMOST を
+    /// 適用する。これにより fullscreen 中に後から作った HWND にも TOPMOST が
+    /// 自動適用される (Codex P3 不具合 3 対応)。
+    gui_topmost_desired: AtomicBool,
 }
 
 struct DspBridgeInner {
@@ -107,6 +113,10 @@ pub(crate) struct PluginSlot {
     /// ホストウィンドウのリサイズシグナル。
     pub gui_resize_signal:
         Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
+    /// ホストウィンドウの WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE シグナル
+    /// (= ユーザー drag による resize/move session 開始 / 終了、Codex P4 対応)。
+    pub gui_resize_session_signal:
+        Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
 }
 
 impl DspBridge {
@@ -120,6 +130,7 @@ impl DspBridge {
             }),
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
+            gui_topmost_desired: AtomicBool::new(false),
         })
     }
 
@@ -287,6 +298,7 @@ impl DspBridge {
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
+            gui_resize_session_signal: None,
         });
         self.recalc_active_count(&inner);
         Ok(idx)
@@ -344,10 +356,9 @@ impl DspBridge {
     /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
         // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
-        // **z-order は触らない**: ユーザーが手で並べた前後関係を保持する。
-        // 旧版は bring_to_front (= SetWindowPos HWND_TOPMOST) を呼んでいたが、
-        // 複数 GUI を一斉に show する際に呼び出し順で z-order が決まり、
-        // 「再表示で順序が変わる」ユーザー報告 (2026-04) の原因になっていた。
+        // **z-order は触らない**: ユーザーが手で並べた前後関係を保持する (Codex P1)。
+        // ただし `gui_topmost_desired` の現在値は最後に適用する (= fullscreen 中に
+        // 作った HWND にも TOPMOST が反映される、Codex P3)。
         {
             let inner = self.inner.lock().unwrap();
             if let Some(slot) = inner.slots.get(idx) {
@@ -358,6 +369,9 @@ impl DspBridge {
                     let hwnd = slot.gui_hwnd;
                     drop(inner);
                     gui::set_window_visible(hwnd, true);
+                    // 現在の topmost desired state を反映
+                    let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
+                    gui::set_window_topmost(hwnd, topmost);
                     let mut inner2 = self.inner.lock().unwrap();
                     if let Some(s2) = inner2.slots.get_mut(idx) {
                         s2.gui_visible = true;
@@ -444,6 +458,14 @@ impl DspBridge {
             slot.gui_host = Some(gui_host);
             slot.gui_close_signal = Some(reply.close_signal);
             slot.gui_resize_signal = Some(reply.resize_signal);
+            slot.gui_resize_session_signal = Some(reply.resize_session_signal);
+        }
+        drop(inner);
+        // 新規作成時も「現在の topmost desired state」を反映
+        // (= フルスクリーン中に作った HWND にも TOPMOST が必ず付く、Codex P3 対応)。
+        let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
+        if topmost {
+            gui::set_window_topmost(hwnd, true);
         }
         Ok(())
     }
@@ -503,8 +525,22 @@ impl DspBridge {
     /// - フルスクリーン動画再生に入るとき `true` (= 動画の上に出す)
     /// - フルスクリーン解除時 `false` (= 通常 z-order に戻す。SSL Meter Pro 等の
     ///   ポップアップメニューが正しく動作するため非フルスクリーン中は TOPMOST 解除)
+    ///
+    /// **Codex P1 対応**: `SetWindowPos(HWND_TOPMOST/HWND_NOTOPMOST)` は呼び出し
+    /// 順に z-order を上書きするため、ユーザーが手で並べた前後関係が壊れる。
+    /// 切替前にデスクトップの top-to-bottom 順で plugin HWND の現在 z-order を
+    /// snapshot し、切替後に bottom-to-top で再適用して元の前後関係を復元する。
+    ///
+    /// **Codex P3 対応**: `gui_topmost_desired` を更新することで、後から
+    /// `show_slot_gui` で作る / 再表示する HWND にも自動的に同じ TOPMOST 状態が
+    /// 適用される (= フルスクリーン中に VST ボタン 1 回目で plugin GUI を作る
+    /// ケースでも見える状態になる)。
     pub fn set_all_guis_topmost(&self, topmost: bool) {
-        let hwnds: Vec<u64> = {
+        // 希望状態を更新 (= 後続の show_slot_gui で参照される)
+        self.gui_topmost_desired.store(topmost, Ordering::Release);
+
+        // 対象 HWND を収集
+        let target_hwnds: Vec<u64> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .slots
@@ -513,8 +549,19 @@ impl DspBridge {
                 .map(|s| s.gui_hwnd)
                 .collect()
         };
-        for hwnd in hwnds {
-            gui::set_window_topmost(hwnd, topmost);
+        if target_hwnds.is_empty() {
+            return;
+        }
+
+        // 現在の z-order を top-to-bottom で snapshot (= EnumWindows で desktop の
+        // 前面順を走査し、target_hwnds に該当するものだけ拾う)。
+        let ordered_top_to_bottom = gui::snapshot_z_order(&target_hwnds);
+
+        // TOPMOST 切替後に bottom-to-top で SetWindowPos して元順序を復元。
+        // bottom-to-top 順に呼ぶと、最後に呼んだ HWND が一番上に来るので、
+        // ユーザーが見ていた順序がそのまま再現される。
+        for hwnd in ordered_top_to_bottom.iter().rev() {
+            gui::set_window_topmost(*hwnd, topmost);
         }
     }
 
@@ -539,6 +586,7 @@ impl DspBridge {
         // close 通知の検出 (Mutex 内で全 slot を調べる)
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
+        let mut session_targets: Vec<(usize, bool)> = Vec::new();
         {
             let inner = self.inner.lock().unwrap();
             for (idx, slot) in inner.slots.iter().enumerate() {
@@ -566,11 +614,35 @@ impl DspBridge {
                         }
                     }
                 }
+                if let Some(arc) = slot.gui_resize_session_signal.as_ref() {
+                    if let Ok(guard) = arc.lock() {
+                        if let Some(rx) = guard.as_ref() {
+                            // 直近の active 状態だけ採用 (= drain しながら最後だけ覚える)
+                            let mut latest: Option<bool> = None;
+                            while let Ok(active) = rx.try_recv() {
+                                latest = Some(active);
+                            }
+                            if let Some(active) = latest {
+                                session_targets.push((idx, active));
+                            }
+                        }
+                    }
+                }
             }
         }
         // close は Mutex 外で実施 (DspBridge::hide_slot_gui が再 lock するので)
         for idx in close_targets {
             self.hide_slot_gui(idx);
+        }
+        // session 切替は bridge に最初に伝える (= 後続の resize より先に状態確定)
+        for (idx, active) in session_targets {
+            let bridge_arc = {
+                let inner = self.inner.lock().unwrap();
+                inner.slots.get(idx).map(|s| s.bridge.clone())
+            };
+            if let Some(b) = bridge_arc {
+                let _ = b.send(&Cmd::SetUserResizing { active: if active { 1 } else { 0 } });
+            }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
         for (idx, w, h) in resize_targets {

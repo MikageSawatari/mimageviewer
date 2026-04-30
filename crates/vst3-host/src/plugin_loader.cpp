@@ -457,6 +457,12 @@ bool PluginLoader::show_gui(void* hwnd, std::string& error_out) {
     return true;
 }
 
+void PluginLoader::set_user_resizing(bool active) {
+    if (plug_frame_) {
+        plug_frame_->set_user_resizing(active);
+    }
+}
+
 void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     if (!view_attached_ || !view_) return;
     Steinberg::ViewRect rect{0, 0,

@@ -93,6 +93,15 @@ void PlugFrame::mark_user_resize() {
     last_user_resize_tick_ = static_cast<uint64_t>(GetTickCount64());
 }
 
+void PlugFrame::set_user_resizing(bool active) {
+    user_resizing_ = active;
+    // session 終了時にもタイムスタンプを更新しておくと、直後の遅延 resizeView
+    // が 250ms fallback で抑止される。Codex P4 「session 後の余韻」対応。
+    if (!active) {
+        last_user_resize_tick_ = static_cast<uint64_t>(GetTickCount64());
+    }
+}
+
 tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
                                           Steinberg::ViewRect* newSize) {
     // プラグインからリサイズ要求が来た。VST3 仕様: host が
@@ -117,9 +126,12 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
     // に戻る → 暴れる。
     // 直近 250ms 以内に user resize があったときは SetWindowPos をスキップして
     // view->onSize で確認だけ返答する (= フィードバックループ抑止)。
+    // Codex P4: session フラグ優先。WM_ENTERSIZEMOVE-EXITSIZEMOVE 中はずっと
+    // SetWindowPos スキップ。fallback として 250ms タイムスタンプ抑止も併用
+    // (= session 後の遅延 resizeView や session 経路を通らない場合の保険)。
     constexpr uint64_t SUPPRESS_WINDOW_MS = 250;
-    bool suppressed = false;
-    if (last_user_resize_tick_ > 0) {
+    bool suppressed = user_resizing_;
+    if (!suppressed && last_user_resize_tick_ > 0) {
         uint64_t now = static_cast<uint64_t>(GetTickCount64());
         if (now - last_user_resize_tick_ < SUPPRESS_WINDOW_MS) {
             suppressed = true;

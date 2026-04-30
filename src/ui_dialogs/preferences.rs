@@ -712,15 +712,10 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         &mut s.show_toolbar_next_folder,
         "次のフォルダへ (▼ ボタン、Ctrl+↓ と同じ動作)",
     );
-    ui.checkbox(
-        &mut s.show_toolbar_vst3,
-        "VST3 プラグイン管理 (VST ボタン、動画タブで VST3 を有効にしているときのみ表示)",
-    )
-    .on_hover_text(
-        "クリックで VST3 プラグイン管理ウィンドウが開きます。\n\
-         環境設定 → 動画 タブで VST3 機能を有効にしているときだけ\n\
-         実際にツールバーに描画されます。",
-    );
+    // (旧) VST3 ツールバーボタン: v0.9.0 開発中に削除。動画再生中はホバーバーから
+    // パネルを開く運用に統一。settings の `show_toolbar_vst3` は legacy フラグとして残るが
+    // 動作には影響しない。
+    let _ = &mut s.show_toolbar_vst3; // 未使用警告抑制
 
     // ── 列 ──
     ui.add_space(6.0);
