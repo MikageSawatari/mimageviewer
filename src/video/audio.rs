@@ -344,13 +344,16 @@ fn fill_output(
     // anchor pts が wall の 2-3x 速で前進、decoder の pacing が誤判定して future_frames
     // が枯渇する問題があった (= Phase 9.A 報告)。
     //
-    // 旧版の対症療法 (削除済):
-    //   - Phase 9.A: `set_audio_pts` の wall-rate cap (= 後段で異常前進を頭打ち)
-    //   - Phase 9.B/9.E: LOADING/IDLE 中 silence + `next_pts_secs` 進行 skip
+    // 旧版の 2 段防御の現状:
+    //   - Phase 9.B/9.E LOADING/IDLE silence gate: **撤去** (= 上流 bookkeeping で対処済)
+    //   - Phase 9.A `set_audio_pts` wall-rate cap: **保持** (defensive safety net、
+    //     詳細は `clock.rs::set_audio_pts` の doc コメント参照)
     //
     // 新版: **実際に消費したサンプル数だけ `next_pts_secs` を進める** (= bookkeeping を
     // 上流に正確化)。silence 出力 (= underrun または warmup で buffer 空) では
-    // `real_consumed = 0` となり pts は 1 mode も進まない → cap も silence gate も不要。
+    // `real_consumed = 0` となり pts は 1 mode も進まない → silence gate は不要に。
+    // wall-rate cap は通常動作で無発動だが、buffer 非空での pre-fill burst (= callback
+    // 連続 pop が wall 進行を超えるシナリオ) への保険として残す (Codex P? 反映)。
     //
     // 残った早期 return:
     //   - pre-seek サンプル全消去 (= clock_serial > pump_serial)
