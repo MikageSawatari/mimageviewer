@@ -323,32 +323,37 @@ fn create_window(
             .map_err(|e| std::io::Error::other(format!("GetModuleHandleW: {e}")))?;
         let class_w = HSTRING::from(WINDOW_CLASS);
 
-        // 1 度だけクラス登録 (スレッドローカル状態に記録)
-        let need_register = THREAD_STATE.with(|s| {
-            !s.borrow().as_ref().map(|st| st.class_registered).unwrap_or(true)
-        });
-        if need_register {
-            let cursor = LoadCursorW(None, IDC_ARROW)
-                .map_err(|e| std::io::Error::other(format!("LoadCursorW: {e}")))?;
-            let class = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: Default::default(),
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinstance.into(),
-                hCursor: cursor,
-                hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
-                lpszClassName: PCWSTR(class_w.as_ptr()),
-                ..Default::default()
-            };
-            if RegisterClassExW(&class) == 0 {
-                return Err(std::io::Error::last_os_error());
+        // ── ウィンドウクラス登録 ──
+        // ⚠️ プロセス全体で 1 回だけ登録する。Win32 のウィンドウクラスは
+        //    プロセスグローバルなので、別スレッドで `GuiHost::spawn` を再度呼ぶと
+        //    `RegisterClassExW` が `ERROR_CLASS_ALREADY_EXISTS (1410)` で失敗する
+        //    (= 旧コードのバグ。スレッドローカル状態で「未登録」と判断していた)。
+        //    既存登録はそのまま使えるので「既に登録済み」エラーは無視して継続する。
+        let cursor = LoadCursorW(None, IDC_ARROW)
+            .map_err(|e| std::io::Error::other(format!("LoadCursorW: {e}")))?;
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: Default::default(),
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinstance.into(),
+            hCursor: cursor,
+            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
+            lpszClassName: PCWSTR(class_w.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&class) == 0 {
+            let err = std::io::Error::last_os_error();
+            // ERROR_CLASS_ALREADY_EXISTS = 1410: 別スレッド・別 GuiHost 由来で既に
+            // 登録済みのケース。このエラーだけは無視して続行する。
+            if err.raw_os_error() != Some(1410) {
+                return Err(err);
             }
-            THREAD_STATE.with(|s| {
-                if let Some(st) = s.borrow_mut().as_mut() {
-                    st.class_registered = true;
-                }
-            });
         }
+        THREAD_STATE.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                st.class_registered = true;
+            }
+        });
 
         // クライアント領域 width x height になるよう外枠サイズを調整。
         // Per-Monitor v2 DPI 環境では AdjustWindowRectEx (= 96 DPI 想定) だと

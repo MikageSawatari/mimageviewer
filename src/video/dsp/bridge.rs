@@ -336,38 +336,65 @@ impl Bridge {
     }
 
     /// bridge から host への音声読み出し (= out_ring から pop、sig_out を待つ)。
-    /// 戻り値: 実際に読めた sample 数 (タイムアウトすると 0)。
+    /// 戻り値: 実際に読めた sample 数 (タイムアウト時は 0〜want 未満)。
+    ///
+    /// **要求した dst.len() 分が揃うまでループで待つ**。
+    ///
+    /// 旧版は「1 度だけ sig_out を待ち、avail < want なら部分取得」だったが、
+    /// bridge audio_loop は read_in_available でブロックを 480 サンプル単位に
+    /// 細切れに処理するため、host が 1 回 push した 2048 サンプル (= ffmpeg AAC の
+    /// 典型 1 frame) は **複数回に分けて out_ring に書かれる**。1 回しか待たない
+    /// と先頭 480 サンプルだけ取れて残り 1568 サンプルは 0 fill → **クリック ノイズ
+    /// が連発**する (= ユーザー報告の「ずっとブツブツ」の根本原因)。
+    /// 必要量が揃うまで何度でも sig_out を待ち直し、deadline で切り上げる。
     #[cfg(windows)]
     pub fn pull_audio(&self, dst: &mut [f32], timeout_ms: u32) -> std::io::Result<usize> {
         let shm = self.shm.as_ref().ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
         let sig_out = self.sig_out.as_ref().ok_or_else(|| std::io::Error::other("sig_out missing"))?;
+        let want = dst.len() as u32;
+        if want == 0 {
+            return Ok(0);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let mut total_taken: u32 = 0;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
             let cap = std::ptr::addr_of!((*header).capacity).read_unaligned();
             let out_ring = (shm.base.Value as *mut u8)
                 .add(std::mem::size_of::<ShmHeader>())
                 .add((cap as usize) * 4) as *mut f32;
-
-            let r_pos = (*header).out_read.load(Ordering::Relaxed);
-            let mut w_pos = (*header).out_write.load(Ordering::Acquire);
-            let mut avail = w_pos.wrapping_sub(r_pos);
-            let want = dst.len() as u32;
-            if avail < want {
-                let res = WaitForSingleObject(sig_out.handle, timeout_ms);
-                if res.0 != 0 { /* WAIT_OBJECT_0 = 0 */
-                    return Ok(0);
+            while total_taken < want {
+                let r_pos = (*header).out_read.load(Ordering::Relaxed);
+                let w_pos = (*header).out_write.load(Ordering::Acquire);
+                let avail = w_pos.wrapping_sub(r_pos);
+                if avail > 0 {
+                    let take = avail.min(want - total_taken) as usize;
+                    for i in 0..take {
+                        let idx = (r_pos.wrapping_add(i as u32)) % cap;
+                        dst[total_taken as usize + i] = out_ring.add(idx as usize).read();
+                    }
+                    (*header)
+                        .out_read
+                        .store(r_pos.wrapping_add(take as u32), Ordering::Release);
+                    total_taken += take as u32;
+                    if total_taken >= want {
+                        break;
+                    }
+                    // まだ不足: bridge が次の chunk を書き込むのを引き続き待つ
                 }
-                w_pos = (*header).out_write.load(Ordering::Acquire);
-                avail = w_pos.wrapping_sub(r_pos);
+                // avail==0 か、まだ不足: deadline まで sig_out を待つ
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = (deadline - now).as_millis().min(u32::MAX as u128) as u32;
+                let res = WaitForSingleObject(sig_out.handle, remaining.max(1));
+                if res.0 != 0 {
+                    break; // timeout / abandoned
+                }
             }
-            let take = avail.min(want) as usize;
-            for i in 0..take {
-                let idx = (r_pos.wrapping_add(i as u32)) % cap;
-                dst[i] = out_ring.add(idx as usize).read();
-            }
-            (*header).out_read.store(r_pos.wrapping_add(take as u32), Ordering::Release);
-            Ok(take)
         }
+        Ok(total_taken as usize)
     }
 
     /// graceful shutdown: bridge に shutdown 命令を送って exit を待つ。
