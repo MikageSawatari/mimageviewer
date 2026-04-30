@@ -94,6 +94,11 @@ struct TesterApp {
     last_latency: Option<u32>,
     bridge_exe_path: std::path::PathBuf,
 
+    /// audio engine 診断ログ用の最終値
+    last_audio_log_at: std::time::Instant,
+    last_logged_frames: u32,
+    last_logged_underruns: u32,
+
     // GUI 表示まわり
     #[cfg(windows)]
     gui_host: plugin_gui::GuiHost,
@@ -149,6 +154,9 @@ impl TesterApp {
             last_loaded_name: None,
             last_latency: None,
             bridge_exe_path,
+            last_audio_log_at: std::time::Instant::now(),
+            last_logged_frames: 0,
+            last_logged_underruns: 0,
             log_lines: Arc::new(Mutex::new(Vec::new())),
             log_file,
             log_file_path,
@@ -697,6 +705,26 @@ impl eframe::App for TesterApp {
         // GUI ウィンドウのリサイズを bridge に転送
         #[cfg(windows)]
         self.poll_gui_resize();
+
+        // audio 診断: cpal の実 callback サイズと underrun 回数を 1 秒ごとに log
+        if let Some(audio) = self.audio.as_ref() {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_audio_log_at).as_secs() >= 1 {
+                use std::sync::atomic::Ordering;
+                let frames = audio.actual_n_frames.load(Ordering::Relaxed);
+                let total_under = audio.underruns.load(Ordering::Relaxed);
+                let delta_under = total_under.wrapping_sub(self.last_logged_underruns);
+                if frames != self.last_logged_frames || delta_under > 0 {
+                    self.log(format!(
+                        "audio: cpal n_frames={} bridge_block={} underruns(+1s)={}",
+                        frames, audio.block_size, delta_under
+                    ));
+                    self.last_logged_frames = frames;
+                    self.last_logged_underruns = total_under;
+                }
+                self.last_audio_log_at = now;
+            }
+        }
 
         // bridge から非同期に来るイベント (latency_changed 等) のポーリングは
         // Phase 0b 後段で追加する。現状は load 時の同期 recv のみ。

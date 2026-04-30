@@ -53,6 +53,13 @@ pub struct AudioEngine {
     pub tone: ToneParams,
     #[allow(dead_code)]
     pub mode: Arc<Mutex<Mode>>,
+    /// cpal callback で実際に渡される n_frames。Fixed(480) が WASAPI Shared 等で
+    /// 拒否されると bridge block_size と一致せず、ring buffer のアンダーラン
+    /// (= プチプチノイズ) の原因になる。
+    pub actual_n_frames: Arc<AtomicU32>,
+    /// callback 内で発生したアンダーラン回数 (= bridge から十分なサンプルを
+    /// 取れなかった回数)。
+    pub underruns: Arc<AtomicU32>,
 }
 
 impl AudioEngine {
@@ -82,6 +89,10 @@ impl AudioEngine {
         // 1 秒間に積み重なって、ring buffer のアンダー/オーバーランが起きてブチブチノイズになる。
         // WASAPI Shared では Fixed が拒否される場合があるが、その場合 Default に
         // フォールバックする。
+        let actual_n_frames = Arc::new(AtomicU32::new(0));
+        let underruns = Arc::new(AtomicU32::new(0));
+        let actual_n_frames_cb = Arc::clone(&actual_n_frames);
+        let underruns_cb = Arc::clone(&underruns);
         let mut phase: f32 = 0.0;
         let tone_for_cb = tone.clone();
         let mode_for_cb = Arc::clone(&mode);
@@ -100,6 +111,8 @@ impl AudioEngine {
                     &stream_config,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                         let n_frames = data.len() / channels as usize;
+                        // 毎回上書き (UI 側で polling)
+                        actual_n_frames_cb.store(n_frames as u32, Ordering::Relaxed);
                         let amp = tone_for_cb.amplitude_milli.load(Ordering::Relaxed) as f32 / 1000.0;
                         let muted = tone_for_cb.muted.load(Ordering::Relaxed);
                         let freq = tone_for_cb.freq_hz.load(Ordering::Relaxed) as f32;
@@ -135,6 +148,7 @@ impl AudioEngine {
                                     }
                                 } else {
                                     // bridge から戻ってこないときは silence (= 安全側)
+                                    underruns_cb.fetch_add(1, Ordering::Relaxed);
                                     for s in data.iter_mut() {
                                         *s = 0.0;
                                     }
@@ -167,6 +181,8 @@ impl AudioEngine {
             block_size,
             tone,
             mode,
+            actual_n_frames,
+            underruns,
         })
     }
 }
