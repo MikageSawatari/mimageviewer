@@ -2,6 +2,7 @@
 
 #include "audio_pipe.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <string>
@@ -106,6 +107,33 @@ bool AudioPipe::read_in(float* out, uint32_t num_samples, uint32_t timeout_ms) {
     }
     r.store(r_pos + num_samples, std::memory_order_release);
     return true;
+}
+
+uint32_t AudioPipe::read_in_available(float* out, uint32_t max_samples, uint32_t timeout_ms) {
+    if (!header_) return 0;
+    auto& w = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->in_write);
+    auto& r = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->in_read);
+
+    uint32_t r_pos = r.load(std::memory_order_relaxed);
+    uint32_t w_pos = w.load(std::memory_order_acquire);
+    uint32_t avail = w_pos - r_pos;
+
+    if (avail == 0) {
+        if (WaitForSingleObject(sig_in_, timeout_ms) != WAIT_OBJECT_0) {
+            return 0;  // timeout
+        }
+        w_pos = w.load(std::memory_order_acquire);
+        avail = w_pos - r_pos;
+        if (avail == 0) return 0;
+    }
+
+    uint32_t to_read = std::min(avail, max_samples);
+    uint32_t cap = header_->capacity;
+    for (uint32_t i = 0; i < to_read; ++i) {
+        out[i] = in_ring_[(r_pos + i) % cap];
+    }
+    r.store(r_pos + to_read, std::memory_order_release);
+    return to_read;
 }
 
 bool AudioPipe::write_out(const float* in, uint32_t num_samples, uint32_t timeout_ms) {

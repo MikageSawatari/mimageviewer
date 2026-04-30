@@ -369,16 +369,24 @@ private:
         return true;
     }
 
-    void audio_loop(uint32_t block_size) {
+    void audio_loop(uint32_t max_block_size) {
+        // 可変ブロックサイズモード: tester (cpal) から push されたサンプル数を
+        // そのまま 1 ブロックとして処理する (上限は max_block_size = setupProcessing
+        // で渡した maxSamplesPerBlock)。
+        // 固定 480 で待つと cpal の 441 frame と一致せず周期的アンダーラン
+        // (= プチプチノイズ) が発生する問題への対策。
         const uint32_t channels = 2;
-        std::vector<float> input(block_size * channels);
-        std::vector<float> output(block_size * channels);
+        std::vector<float> input(max_block_size * channels);
+        std::vector<float> output(max_block_size * channels);
 
-        std::fprintf(stderr, "[BRIDGE] audio_loop start (block=%u)\n", block_size);
+        std::fprintf(stderr, "[BRIDGE] audio_loop start (max_block=%u, variable size)\n",
+                     max_block_size);
         std::fflush(stderr);
         uint64_t blocks_in = 0, blocks_processed = 0, blocks_out = 0;
         uint64_t timeouts_in = 0, timeouts_out = 0;
+        uint64_t total_frames = 0;
         float input_peak = 0.0f, output_peak = 0.0f;
+        uint32_t last_block_frames = 0;
         auto last_report = std::chrono::steady_clock::now();
         auto report_now = [&]() {
             auto now = std::chrono::steady_clock::now();
@@ -386,43 +394,60 @@ private:
                 return;
             }
             std::fprintf(stderr,
-                "[BRIDGE] audio: in=%llu proc=%llu out=%llu to_in=%llu to_out=%llu in_peak=%.4f out_peak=%.4f\n",
+                "[BRIDGE] audio: in=%llu proc=%llu out=%llu frames=%llu last_blk=%u to_in=%llu to_out=%llu in_peak=%.4f out_peak=%.4f\n",
                 (unsigned long long)blocks_in,
                 (unsigned long long)blocks_processed,
                 (unsigned long long)blocks_out,
+                (unsigned long long)total_frames,
+                last_block_frames,
                 (unsigned long long)timeouts_in,
                 (unsigned long long)timeouts_out,
                 input_peak, output_peak);
             std::fflush(stderr);
             blocks_in = blocks_processed = blocks_out = 0;
             timeouts_in = timeouts_out = 0;
+            total_frames = 0;
             input_peak = output_peak = 0.0f;
             last_report = now;
         };
 
         while (audio_running_) {
-            if (!pipe_.read_in(input.data(),
-                                block_size * channels,
-                                100 /* ms */)) {
+            uint32_t got = pipe_.read_in_available(input.data(),
+                                                    max_block_size * channels,
+                                                    100 /* ms */);
+            if (got == 0) {
                 ++timeouts_in;
                 report_now();
                 if (!audio_running_) break;
                 continue;
             }
+            // 必ず channels の倍数に揃える (= 半端な 1 sample があれば次回に持ち越す)。
+            uint32_t aligned = got - (got % channels);
+            if (aligned == 0) {
+                continue;
+            }
+            // ※ もし got != aligned なら半端 sample を捨てている形。read_in_available の
+            // 設計上、push 側 (tester) も channel-aligned で push しているはずなので
+            // 通常は got % channels == 0 になる。
+            uint32_t frames = aligned / channels;
             ++blocks_in;
-            for (float v : input) input_peak = std::max(input_peak, std::fabs(v));
+            last_block_frames = frames;
+            total_frames += frames;
+            for (uint32_t i = 0; i < aligned; ++i) {
+                input_peak = std::max(input_peak, std::fabs(input[i]));
+            }
 
-            if (loader_ && !loader_->process_block(input.data(), output.data(), block_size)) {
+            if (loader_ && !loader_->process_block(input.data(), output.data(), frames)) {
                 send_event_error("process_block failed");
                 audio_running_ = false;
                 break;
             }
             ++blocks_processed;
-            for (float v : output) output_peak = std::max(output_peak, std::fabs(v));
+            for (uint32_t i = 0; i < aligned; ++i) {
+                output_peak = std::max(output_peak, std::fabs(output[i]));
+            }
 
-            if (!pipe_.write_out(output.data(),
-                                  block_size * channels,
-                                  100 /* ms */)) {
+            if (!pipe_.write_out(output.data(), aligned, 100 /* ms */)) {
                 ++timeouts_out;
                 report_now();
                 if (!audio_running_) break;

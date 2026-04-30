@@ -43,6 +43,13 @@ public:
     // タイムアウトすると false を返す。
     bool read_in(float* out, uint32_t num_samples, uint32_t timeout_ms);
 
+    /// in_ring から **来ている分だけ** 読む (最大 max_samples まで)。
+    /// 1 sample も来ていなければ sig_in を待ち、待てた分を返す。
+    /// 戻り値: 実際に読んだ sample 数 (0 ならタイムアウト)。
+    /// cpal の callback サイズと bridge の固定 block_size が一致しないときに、
+    /// 「来た分だけ即時処理」する可変ブロックサイズモード用。
+    uint32_t read_in_available(float* out, uint32_t max_samples, uint32_t timeout_ms);
+
     // out_ring に num_samples 個の f32 を書き、sig_out を発火する。
     // ring が満杯なら sig_in (= 親が読み出すまで) を待つ仕様にしてもよいが、
     // 通常 cpal 側が確実に読みに来るので timeout_ms 内で書ければ OK。
