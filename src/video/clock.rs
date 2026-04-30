@@ -212,13 +212,49 @@ impl AvClock {
     /// 比較するなら、wall extrapolation の影響を受けない。
     pub fn set_audio_pts(&self, pts_secs: f64) {
         let prev = self.master_clock.anchor();
+        let wall = Instant::now();
         let prev_audio_pts = if matches!(prev.source, ClockSource::Audio) {
             prev.pts_secs
         } else {
             f64::NEG_INFINITY
         };
-        let monotonic = pts_secs.max(prev_audio_pts);
-        self.write_audio_anchor_at(monotonic, Instant::now());
+        // ⚠️ wall-rate cap (Phase 9.A、2026-04-30 追加):
+        //
+        // 動画オープン直後 (~3 秒間)、cpal の出力 callback `fill_output` が
+        // OS の音声バッファを pre-fill するために短時間で複数回呼ばれる。
+        // 各呼び出しは `next_pts_secs += want / samples_per_sec` で期待 wall 進行量
+        // 分の pts を加算するため、wall 1 秒に対して anchor の pts が **2.5x 進む**
+        // 現象が観測された (perf-log: 60fps audio video で pace/wall=1.27-1.60、
+        // 開始 0-3 秒の窓では 2.55x)。
+        //
+        // 結果として `now_secs()` (= pace_now) が wall より 2.5x 速く進み、
+        // decoder pacing が「先読みが足りない」と判定して 2.5x のレートで生産しようとし、
+        // HW デコード上限を超えて future_frames が枯渇する (= buf:0/24 振動)。
+        //
+        // 物理的に音声デバイスは hardware rate (= wall rate) でしかサンプルを
+        // 消費できないため、anchor の pts 進行も wall 進行を超えてはならない。
+        // 前回 anchor からの wall 経過分 + 5ms ジッタ余裕を上限に capping する。
+        //
+        // これは **AudioSource (= cpal callback 由来)** だけに適用する:
+        // - `notify_seek_completed` 経路: 直接 `write_audio_anchor_at` を呼ぶので
+        //   ここを通らない。明示的 anchor 再設定として扱う。
+        // - `set_fallback_anchor` 経路: Wall source なので prev.source 判定で
+        //   `prev_audio_pts = NEG_INFINITY` → cap 計算は wall 経過に依存せず
+        //   `pts_secs` がそのまま採用される。
+        let capped = if matches!(prev.source, ClockSource::Audio) {
+            // 前回 anchor が Audio source = 連続的な audio update。wall 経過量で cap。
+            let wall_dt = wall.saturating_duration_since(prev.wall_at_anchor).as_secs_f64();
+            const JITTER_TOLERANCE_SECS: f64 = 0.005;
+            let max_advance = wall_dt + JITTER_TOLERANCE_SECS;
+            (pts_secs - prev.pts_secs).min(max_advance).max(0.0) + prev.pts_secs
+        } else {
+            // 前回が Wall/Frozen → audio 起動直後 / fallback 直後 / seek 直後。
+            // この呼び出しが anchor を Audio source に切り替える起点なので、
+            // wall-rate cap を適用しない (= seek target 等の絶対位置を尊重)。
+            pts_secs
+        };
+        let monotonic = capped.max(prev_audio_pts);
+        self.write_audio_anchor_at(monotonic, wall);
     }
 
     /// **Wall** anchor で全置換する内部ヘルパ。
