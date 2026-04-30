@@ -2819,6 +2819,7 @@ impl App {
             || self.show_pdf_password_dialog
             || self.show_about_dialog
             || self.show_update_dialog
+            || self.show_vst3_manager
             || self.slot_save_dialog.is_some()
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()

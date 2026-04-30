@@ -190,6 +190,27 @@ fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
     clock.set_audio_pump_buf_secs(secs);
 }
 
+/// audio-pump スレッドの Windows 優先度を `THREAD_PRIORITY_ABOVE_NORMAL` に上げる。
+///
+/// `audio-pump` は decoder → (VST3 bridge IPC) → cpal ring buffer の橋渡しを担うので、
+/// ここが UI 描画スレッド (= 通常優先度) より遅延すると下流の cpal callback が
+/// underrun (= プチプチノイズ) を起こす。`THREAD_PRIORITY_TIME_CRITICAL` まで
+/// 上げると Windows のスケジューラが他タスクを大きく待たせるので AboveNormal 止まり
+/// で十分。VST3 bridge プロセス側の audio thread はさらに TIME_CRITICAL + Pro Audio
+/// MMCSS で動いているので、このスレッドが少し遅れても実害は小さい。
+#[cfg(windows)]
+fn boost_audio_pump_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    unsafe {
+        let h = GetCurrentThread();
+        if SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL).is_err() {
+            crate::logger::log("audio-pump: SetThreadPriority(AboveNormal) failed");
+        }
+    }
+}
+
 /// `dsp_bridge` が渡されていて enable 状態のとき、pump で受け取った frame を
 /// VST3 プラグイン経由に通してから AudioBuffer に push する。
 fn run_pump(
@@ -201,6 +222,9 @@ fn run_pump(
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
+    #[cfg(windows)]
+    boost_audio_pump_priority();
+
     // VST3 プラグイン処理用の出力バッファ (= bridge.process_block の dst)。
     // frame サイズに応じて伸縮させるが、頻繁な realloc を避けるため
     // 初期容量を 4096 (= 約 0.04 秒@48kHz stereo) で確保する。
@@ -326,6 +350,19 @@ fn run_pump(
                     },
                 ),
             );
+        }
+    }
+    // ── 終了時の silence flush ──
+    // VST3 bridge の in_ring に残った最終 audio がプラグイン visualizer (LUFS / EQ
+    // analyzer 等) に表示され続けるのを止めるため、無音ブロックを 10 個 (= 約 100ms)
+    // 流して bridge → プラグインの内部状態を 0 に落とす。
+    // bridge プロセス自体は DspBridge に保持されたまま生存するので、次の動画再生で
+    // 再利用される。
+    #[cfg(windows)]
+    if let Some(b) = &dsp_bridge {
+        if b.is_enabled() && b.active_slot_count() > 0 {
+            // block_size は decoder/cpal と同じ 480 で固定 (= 暫定)。
+            b.flush_silence(480, 10);
         }
     }
     crate::logger::log("audio-pump terminated");

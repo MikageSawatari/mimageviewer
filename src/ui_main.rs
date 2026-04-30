@@ -621,6 +621,9 @@ impl App {
         let show_parent = self.settings.show_toolbar_parent_button;
         let show_prev_folder = self.settings.show_toolbar_prev_folder;
         let show_next_folder = self.settings.show_toolbar_next_folder;
+        // VST3 ボタン: 環境設定で機能を有効にしている (vst3_enabled) かつ
+        // ツールバーで非表示にしていない (show_toolbar_vst3) ときだけ表示。
+        let show_vst3 = self.settings.show_toolbar_vst3 && self.settings.vst3_enabled;
         let show_rating = self.settings.show_toolbar_rating;
         let any_toolbar_section = show_cols
             || show_aspect
@@ -629,6 +632,7 @@ impl App {
             || show_parent
             || show_prev_folder
             || show_next_folder
+            || show_vst3
             || show_rating;
 
         if !any_toolbar_section {
@@ -642,6 +646,7 @@ impl App {
         let mut toolbar_next_folder_nav = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_tag_click: Option<String> = None;
+        let mut toolbar_vst3_clicked = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -684,6 +689,33 @@ impl App {
                         .clicked()
                     {
                         toolbar_next_folder_nav = true;
+                    }
+                    first_section = false;
+                }
+                // VST3 プラグイン管理ボタン (v0.9.0+)。
+                // 動画の音声に VST3 プラグインを通すための管理ウィンドウ起動ボタン。
+                // 環境設定の VST3 機能 ON のときだけ表示する (= settings.vst3_enabled)。
+                if show_vst3 {
+                    let chain_count = self.settings.vst3_plugins.len();
+                    let label = if chain_count == 0 {
+                        "🎚".to_string()
+                    } else {
+                        format!("🎚{chain_count}")
+                    };
+                    let hover = if chain_count == 0 {
+                        "VST3 プラグイン管理を開く".to_string()
+                    } else {
+                        format!(
+                            "VST3 プラグイン管理を開く ({} 個ロード中)",
+                            chain_count
+                        )
+                    };
+                    if ui
+                        .button(label)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        toolbar_vst3_clicked = true;
                     }
                     first_section = false;
                 }
@@ -888,6 +920,11 @@ impl App {
         // ツールバーのタグ項目クリック
         if let Some(name) = toolbar_tag_click {
             self.request_tag_toggle_for_selection(&name);
+        }
+
+        // VST3 プラグイン管理ボタンが押された
+        if toolbar_vst3_clicked {
+            self.show_vst3_manager = true;
         }
 
         toolbar_fav_nav

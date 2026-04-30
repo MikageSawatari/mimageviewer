@@ -200,9 +200,6 @@ pub(crate) struct PreferencesState {
     pub start_trt_install_requested: bool,
     /// エンジンキャッシュ削除の確認ダイアログ表示中フラグ (Codex P3-2)。
     pub trt_cache_delete_confirm_open: bool,
-    /// VST3 プラグイン管理ウィンドウを開いてほしいフラグ (preferences の Apply/Cancel 後に
-    /// App 側で読み取って `show_vst3_manager = true` にする)。
-    pub open_vst3_manager_requested: bool,
 }
 
 impl PreferencesState {
@@ -263,7 +260,6 @@ impl PreferencesState {
             trt_engine_cache_size_mib,
             start_trt_install_requested: false,
             trt_cache_delete_confirm_open: false,
-            open_vst3_manager_requested: false,
         }
     }
 }
@@ -522,15 +518,6 @@ impl App {
                 );
             }
         }
-        // VST3 プラグイン管理ウィンドウ起動要求の処理。
-        // 環境設定ダイアログから「VST3 プラグイン管理を開く…」が押されたとき、
-        // 環境設定はそのまま開いたままで管理ウィンドウだけ表示する (両方並べて確認できるように)。
-        if let Some(ps) = self.pref_state.as_mut() {
-            if ps.open_vst3_manager_requested {
-                ps.open_vst3_manager_requested = false;
-                self.show_vst3_manager = true;
-            }
-        }
     }
 }
 
@@ -683,6 +670,15 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(
         &mut s.show_toolbar_next_folder,
         "次のフォルダへ (▼ ボタン、Ctrl+↓ と同じ動作)",
+    );
+    ui.checkbox(
+        &mut s.show_toolbar_vst3,
+        "VST3 プラグイン管理 (🎚 ボタン、動画タブで VST3 を有効にしているときのみ表示)",
+    )
+    .on_hover_text(
+        "クリックで VST3 プラグイン管理ウィンドウが開きます。\n\
+         環境設定 → 動画 タブで VST3 機能を有効にしているときだけ\n\
+         実際にツールバーに描画されます。",
     );
 
     // ── 列 ──
@@ -1544,7 +1540,8 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         let chain_count = s.vst3_plugins.len();
         if chain_count == 0 {
             ui.label(
-                "チェーンは空です。「VST3 プラグイン管理」からプラグインを追加してください。",
+                "チェーンは空です。ツールバーの 🎚 ボタンからプラグイン管理ウィンドウを\n\
+                 開いてプラグインを追加してください。",
             );
         } else {
             ui.label(format!(
@@ -1561,16 +1558,13 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
         }
         ui.add_space(4.0);
-        if ui
-            .button("VST3 プラグイン管理を開く…")
-            .on_hover_text(
-                "プラグイン一覧の検索・チェーンへの追加・順番入れ替え・\n\
-                 バイパス・GUI 表示などの管理ウィンドウを開きます。",
+        ui.label(
+            egui::RichText::new(
+                "プラグインの追加・順番入れ替え・GUI 表示はツールバーの 🎚 ボタンから行います。",
             )
-            .clicked()
-        {
-            state.open_vst3_manager_requested = true;
-        }
+            .small()
+            .weak(),
+        );
     }
 }
 

@@ -632,6 +632,11 @@ pub struct Settings {
     /// 既定 true、Ctrl+↓ と等価。
     #[serde(default = "default_true")]
     pub show_toolbar_next_folder: bool,
+    /// ツールバーに「VST3 プラグイン管理」ボタン (🎚) を表示する (v0.9.0)。
+    /// `vst3_enabled = true` のときだけ実際にツールバーに描画される (= 二重ガード)。
+    /// 既定 true。
+    #[serde(default = "default_true")]
+    pub show_toolbar_vst3: bool,
     /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_rating: bool,
@@ -1107,6 +1112,7 @@ impl Default for Settings {
             show_toolbar_parent_button: true,
             show_toolbar_prev_folder: true,
             show_toolbar_next_folder: true,
+            show_toolbar_vst3: true,
             show_toolbar_rating: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),

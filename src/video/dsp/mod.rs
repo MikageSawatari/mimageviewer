@@ -241,8 +241,28 @@ impl DspBridge {
             }
         };
 
-        // ── 完成したスロットを Vec に追加 (Mutex 内で短時間) ──
+        // ── プラグイン pre-warm: 無音ブロックを数回流し、内部状態 (フィルタ係数の
+        //   FTZ 経路 / IIR ステート / 内部 alloc / ページフォルト等) を温める。
+        //   これがないと「動画再生開始直後に process_block の応答が遅く、cpal が
+        //   下流で underrun してプチプチノイズになる」現象が出る (動画 4-5 個目以降は
+        //   別動画が来ても plugin の状態は維持されているので問題なし、初回のみ重い)。
+        //   block_size * 2 channels, 20 ブロック ≈ 200ms 相当の silence を流す。
         let bridge_arc = Arc::new(bridge);
+        {
+            let n = (block_size as usize) * 2;
+            let silence = vec![0.0f32; n];
+            let mut dst = vec![0.0f32; n];
+            for _ in 0..20 {
+                if bridge_arc.push_audio(&silence).is_err() {
+                    break;
+                }
+                if bridge_arc.pull_audio(&mut dst, 200).is_err() {
+                    break;
+                }
+            }
+        }
+
+        // ── 完成したスロットを Vec に追加 (Mutex 内で短時間) ──
         let mut inner = self.inner.lock().unwrap();
         let idx = inner.slots.len();
         inner.slots.push(PluginSlot {
@@ -259,6 +279,49 @@ impl DspBridge {
         });
         self.recalc_active_count(&inner);
         Ok(idx)
+    }
+
+    /// 全 active プラグインに **無音ブロックを N 個流す**。
+    ///
+    /// 用途は 2 つ:
+    /// 1. 動画再生終了時 (= AudioOutput drop): bridge in_ring に残った最後の audio が
+    ///    プラグイン LUFS / Visualizer に表示され続けるのを止めるため、silence を
+    ///    押し込んで visualizer を 0 に落とす
+    /// 2. 動画再生直前の追加 warm-up: kick_off_vst3_startup から呼び、cpal callback の
+    ///    最初の数ブロックに対して bridge IPC が安定して走る状態にする
+    ///
+    /// blocks=10 で約 100ms 相当 (block_size=480 @ 48kHz)。bridge への push が
+    /// fail した時点で打ち切り (= 既にシャットダウン中の bridge をキックして
+    /// 待機しないようにする)。
+    pub fn flush_silence(&self, block_size: u32, blocks: u32) {
+        if !self.is_enabled() {
+            return;
+        }
+        let bridges: Vec<Arc<Bridge>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .filter(|s| matches!(s.state, SlotState::Loaded))
+                .map(|s| s.bridge.clone())
+                .collect()
+        };
+        if bridges.is_empty() {
+            return;
+        }
+        let n = (block_size as usize) * 2;
+        let silence = vec![0.0f32; n];
+        let mut dst = vec![0.0f32; n];
+        for b in &bridges {
+            for _ in 0..blocks {
+                if b.push_audio(&silence).is_err() {
+                    break;
+                }
+                if b.pull_audio(&mut dst, 200).is_err() {
+                    break;
+                }
+            }
+        }
     }
 
     /// 指定 idx のプラグイン GUI を表示する。GUI ホストウィンドウを spawn し、
