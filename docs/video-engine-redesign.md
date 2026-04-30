@@ -639,6 +639,101 @@ disconnect で recv() 抜け → exit → demux が `audio → video` の順で 
 `decoder.rs` (3-thread 構成) 節を、各 thread の責務と shared resource は
 [docs/async-architecture.md](async-architecture.md) の thread 表を参照。
 
+### Phase 9 シリーズの追加修正 (Phase 9.A〜9.G + Codex P2、2026-04-30)
+
+3-thread 分離後、ユーザー実機テストで判明した問題への対症療法を順次反映。
+
+**Phase 9.A: `set_audio_pts` の wall-rate cap (`clock.rs`)**
+
+動画 open 直後 (~3 秒) に cpal 出力 callback `fill_output` が OS 音声バッファを
+pre-fill するために短時間で複数回 fire し、各 callback が `next_pts_secs += want /
+samples_per_sec` で期待 wall 進行量分の pts を加算するため、anchor の pts が wall
+時刻の **2.5x 速で前進** する事象を観測 (perf-log で pace/wall=2.55x@0-3s 窓)。
+結果として `now_secs()` (= pace_now) が wall より 2.5x 速く進み、decoder pacing が
+「先読み不足」と誤判定して 2.5x レートで生産しようとし、HW デコード上限を超えて
+future_frames が枯渇 (= buf:0/24 振動)。
+
+修正: `set_audio_pts` で前回 anchor が Audio source なら、wall 経過量 + 5ms ジッタ
+余裕を上限に pts 進行を cap する。Audio 起動直後 / fallback 直後 / seek 直後
+(= 前回が Wall/Frozen) は cap せず絶対値を尊重 (seek target を尊重)。
+
+**Phase 9.B/9.E: cpal warmup silence の範囲 (`audio.rs`)**
+
+Phase 9.A だけでは driver 側の pre-fill burst を完全には抑えられないため、`fill_output`
+で engine_state が **LOADING/IDLE のとき silence + 早期 return** で `next_pts_secs`
+更新自体を skip。Phase 9.B 初版は `engine ≠ Playing` の全期間 silence にしていたが、
+forward seek の Buffering 期間で deadlock を起こしたため (audio_pkt_tx 満杯 → demux
+block で seek take_request されない)、Phase 9.E で **LOADING/IDLE のみ** に縮小。
+Buffering / Seeking / Paused / Eof は他の経路 (`!clock.is_playing()` 早期 return @
+audio.rs:321) で silence される。
+
+**Phase 9.C/9.D: pause-park engine state + Buffering 中 lookahead 許可 (`decoder.rs`)**
+
+旧 Phase 9.C は decoder pacing loop の park 条件を `!clock.is_playing()` にしたが、
+動画 open 直後 (autoplay=false で Loading 状態) も is_playing()=false で park され、
+post-seek frame が生成されず「動画を準備中…」のまま停止する regression が発生。
+
+Phase 9.D で park 条件を `engine_state in [PAUSED, EOF]` に変更し、Loading /
+Buffering / Seeking 中は pacing logic に進ませる。さらに `allow_pace_lead =
+engine_playing || engine_st == BUFFERING` で **Buffering 中も PACE_LEAD=0.30s の
+lookahead を許可** (= 60fps で 18 frames 先読み)。これにより Buffering→Playing
+遷移時には buffer がほぼ満杯で、UI 消費追従の frame batching が起きない。
+
+**Phase 9.E: post-seek 1 枚目の unconditional 送出 (`decoder.rs`)**
+
+forward seek (`+10s` 等) の deadlock 修正。post-seek 1 枚目までは
+`audio_buf < AUDIO_SAFE_HI` の seek_burst 条件で gate していたが、Phase 9.B の
+warmup silence と組み合わさって audio buffer がいつまでも満杯にならず 1 枚目が
+送出されない循環に陥っていた。修正: `clock.is_seeking() && !post_seek_frame_sent`
+の場合は無条件で 1 枚送出 (lead cap や audio buffer 状態と関係なく)。
+
+**Phase 9.F: forward seek の A/V desync 修正 (`decoder.rs`)**
+
+`input.seek(target..)` (前方シーク) は video keyframe にスナップして target より
+未来に着地するが、mp4 muxing の都合で audio packet が video keyframe より前に
+配置されることがある。結果として post-seek の anchor が `audio_pts < video_pts` で
+始まり、pace_now が video より遅れて 0.87s stall。
+
+修正: シーク方向に関係なく **常に backward+preroll** を使う (`av_seek_frame +
+AVSEEK_FLAG_BACKWARD`)。post-seek の `drop_before_secs` で target より前のフレームを
+trim し、target の最初のフレームから再生開始。`direction` 引数は互換のため残すが
+実動作では参照しない。
+
+**Phase 9.G: perf overlay graph freeze during pause AND seek (`ui_fullscreen.rs`)**
+
+Phase 9.F まで適用後、ユーザー報告で「seek 直後に黒い空間が出てから赤線で再開する」
+事象が判明。原因: perf overlay graph の "now" tick が wall 時刻ベースで進む一方、
+seek 処理中 (= override 設定中、UI が post-seek 1 枚目を受け取る前) はサンプル新規
+追加が止まり、graph が「データなし区間」として黒く描画されていた。
+
+修正: `VideoPlayer::is_seeking()` を追加し、`is_paused_or_seeking() = engine.PAUSED ||
+clock.is_seeking()` を新たな freeze 条件として使う。`sample_video_perf` は freeze 中
+サンプル追加を skip + history を pause_dur 分シフト、`draw_video_perf_overlay` は
+freeze 中 graph の "now" を最後のサンプル時刻に固定。pre-seek の折れ線が post-seek
+の赤線エリアに滑らかに繋がる。
+
+**Codex P2: EOF replay seek の engine epoch 二重 ++ (`mod.rs`)**
+
+`apply_command(Play)` を `handle_seek_request` より先に呼ぶと、state=Eof のとき
+`handle_play()` が内部で `handle_seek_request(0.0)` を呼んで epoch++ し、続く明示
+`handle_seek_request` で **epoch が二重 ++** されていた。decoder からの
+`SeekCompleted { epoch: serial }` (= AvClock seek_serial、+1 のみ) と engine の
+`current_seek_epoch` (+2) がズレ、stale 判定で捨てられて engine が Seeking から抜け
+ない可能性があった。
+
+修正: 呼び出し順を **handle_seek_request → apply_command(Play)** に逆転。
+handle_seek_request 後は state=Seeking なので、続く handle_play は Seeking arm の
+`autoplay = true` 設定だけ走り epoch は ++ しない。該当箇所は `toggle_play` EOF
+replay / `seek` / `seek_relative` / loop replay の 4 site。
+
+**Codex P? : decoder pause-park の seek_serial check 順序 (`decoder.rs`)**
+
+GPU/CPU 両 pacing loop で、PAUSED/EOF park の 50ms sleep が `seek_serial` チェックより
+先にあった。pause 状態で seek 要求が来たケース (現状 UI に経路はないが将来 pause 維持
+seek を入れる際に effective) で 50ms sleep を待たないと新世代を検出しない。
+
+修正: `seek_serial` check を park sleep より先に移動。
+
 ## 検証
 
 ### Phase 2 完了時 (resume 未修正)

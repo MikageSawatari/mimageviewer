@@ -157,12 +157,25 @@ demux+decode 同居から video decode 単独 thread に)。詳細は
 [docs/video-engine-redesign.md](video-engine-redesign.md) の「Decoder pacing 規定」
 節を参照。
 
+Phase 9 分離後に追加した 9.A〜9.G + Codex P2/P? 修正 (set_audio_pts wall-rate cap、
+LOADING/IDLE silence、Buffering 中 lookahead 許可、post-seek 1 枚目 unconditional、
+forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二重 ++ 修正
+等) は engine-redesign.md の「Phase 9 シリーズの追加修正」節に記述。
+
 #### `audio.rs`
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
 - AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)
 - audio 出力失敗時はクロックを wall-clock fallback に切替
-- 音声バッファ ≥500ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
+- 音声バッファ ≥150ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
+  (Phase 8.K で 500ms から下げた、典型的 audio_buf hover 帯に合わせた)
+- `fill_output` の silence 範囲 (Phase 9.B/9.E):
+  - `!clock.is_playing()` 早期 return: PAUSED / EOF (clock.set_playing(false) 経路)
+  - engine_state が **LOADING / IDLE** の warmup gate: silence + `next_pts_secs` 進行 skip
+    (= cpal pre-fill burst による pace_now drift 抑止)
+  - Buffering / Seeking / Paused / Eof 中の音声は他経路 (clock.is_playing() 早期 return) で
+    silence される。Buffering 期間で silence を強制すると forward seek deadlock を起こすため
+    LOADING/IDLE のみに限定 (Phase 9.E で確定)。
 
 #### `clock.rs` (`AvClock` — 薄い facade)
 - 公開 API は変更しないまま内部実装を `engine/` に委譲する **薄い facade**。
