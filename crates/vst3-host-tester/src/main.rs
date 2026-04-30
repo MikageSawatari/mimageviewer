@@ -98,6 +98,7 @@ struct TesterApp {
     last_audio_log_at: std::time::Instant,
     last_logged_frames: u32,
     last_logged_underruns: u32,
+    last_logged_partials: u32,
 
     // GUI 表示まわり
     #[cfg(windows)]
@@ -157,6 +158,7 @@ impl TesterApp {
             last_audio_log_at: std::time::Instant::now(),
             last_logged_frames: 0,
             last_logged_underruns: 0,
+            last_logged_partials: 0,
             log_lines: Arc::new(Mutex::new(Vec::new())),
             log_file,
             log_file_path,
@@ -508,6 +510,19 @@ impl TesterApp {
 
 impl eframe::App for TesterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── graceful shutdown ──
+        // ウィンドウ × クリック等で close 要求が出たら、bridge とプラグイン GUI を
+        // 順番に破棄してから終了する。Rust の Drop だと宣言順の逆で gui_host が
+        // bridge より先に落ちて、プラグイン attach 中にホスト HWND が消える
+        // → bridge が応答待ちでハング、になりがち。
+        if ctx.input(|i| i.viewport().close_requested()) {
+            #[cfg(windows)]
+            self.close_gui();
+            self.unload();
+            self.audio = None;
+            // close_requested はそのまま伝播してウィンドウが閉じる
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("VST3 Host Tester");
@@ -712,16 +727,21 @@ impl eframe::App for TesterApp {
             if now.duration_since(self.last_audio_log_at).as_secs() >= 1 {
                 use std::sync::atomic::Ordering;
                 let frames = audio.actual_n_frames.load(Ordering::Relaxed);
+                // min/max を読んでリセット
+                let mn = audio.min_n_frames.swap(u32::MAX, Ordering::Relaxed);
+                let mx = audio.max_n_frames.swap(0, Ordering::Relaxed);
                 let total_under = audio.underruns.load(Ordering::Relaxed);
+                let total_partial = audio.partial_pulls.load(Ordering::Relaxed);
                 let delta_under = total_under.wrapping_sub(self.last_logged_underruns);
-                if frames != self.last_logged_frames || delta_under > 0 {
-                    self.log(format!(
-                        "audio: cpal n_frames={} bridge_block={} underruns(+1s)={}",
-                        frames, audio.block_size, delta_under
-                    ));
-                    self.last_logged_frames = frames;
-                    self.last_logged_underruns = total_under;
-                }
+                let delta_partial = total_partial.wrapping_sub(self.last_logged_partials);
+                let mn_print = if mn == u32::MAX { 0 } else { mn };
+                self.log(format!(
+                    "audio: cpal n_frames={}, min={}, max={} (block={}) underruns/s={} partial_pulls/s={}",
+                    frames, mn_print, mx, audio.block_size, delta_under, delta_partial
+                ));
+                self.last_logged_frames = frames;
+                self.last_logged_underruns = total_under;
+                self.last_logged_partials = total_partial;
                 self.last_audio_log_at = now;
             }
         }

@@ -53,13 +53,18 @@ pub struct AudioEngine {
     pub tone: ToneParams,
     #[allow(dead_code)]
     pub mode: Arc<Mutex<Mode>>,
-    /// cpal callback で実際に渡される n_frames。Fixed(480) が WASAPI Shared 等で
-    /// 拒否されると bridge block_size と一致せず、ring buffer のアンダーラン
-    /// (= プチプチノイズ) の原因になる。
+    /// cpal callback で実際に渡される n_frames (= 最後の値)。
     pub actual_n_frames: Arc<AtomicU32>,
+    /// 1 秒間の最小 / 最大 callback frame 数。これが安定していれば cpal は
+    /// 一定サイズで呼ばれているが、ばらつくとそれ自体がノイズ要因になる。
+    pub min_n_frames: Arc<AtomicU32>,
+    pub max_n_frames: Arc<AtomicU32>,
     /// callback 内で発生したアンダーラン回数 (= bridge から十分なサンプルを
     /// 取れなかった回数)。
     pub underruns: Arc<AtomicU32>,
+    /// callback 内で部分的にしか取れなかった回数 (= bridge から got>0 だが
+    /// got<期待 のケース、= 半端取得)。
+    pub partial_pulls: Arc<AtomicU32>,
 }
 
 impl AudioEngine {
@@ -90,9 +95,15 @@ impl AudioEngine {
         // WASAPI Shared では Fixed が拒否される場合があるが、その場合 Default に
         // フォールバックする。
         let actual_n_frames = Arc::new(AtomicU32::new(0));
+        let min_n_frames = Arc::new(AtomicU32::new(u32::MAX));
+        let max_n_frames = Arc::new(AtomicU32::new(0));
         let underruns = Arc::new(AtomicU32::new(0));
+        let partial_pulls = Arc::new(AtomicU32::new(0));
         let actual_n_frames_cb = Arc::clone(&actual_n_frames);
+        let min_n_frames_cb = Arc::clone(&min_n_frames);
+        let max_n_frames_cb = Arc::clone(&max_n_frames);
         let underruns_cb = Arc::clone(&underruns);
+        let partial_pulls_cb = Arc::clone(&partial_pulls);
         let mut phase: f32 = 0.0;
         let tone_for_cb = tone.clone();
         let mode_for_cb = Arc::clone(&mode);
@@ -113,6 +124,10 @@ impl AudioEngine {
                         let n_frames = data.len() / channels as usize;
                         // 毎回上書き (UI 側で polling)
                         actual_n_frames_cb.store(n_frames as u32, Ordering::Relaxed);
+                        // 最小/最大トラッキング (UI 側で 1 秒ごとに読んでリセット)
+                        let nu = n_frames as u32;
+                        min_n_frames_cb.fetch_min(nu, Ordering::Relaxed);
+                        max_n_frames_cb.fetch_max(nu, Ordering::Relaxed);
                         let amp = tone_for_cb.amplitude_milli.load(Ordering::Relaxed) as f32 / 1000.0;
                         let muted = tone_for_cb.muted.load(Ordering::Relaxed);
                         let freq = tone_for_cb.freq_hz.load(Ordering::Relaxed) as f32;
@@ -148,7 +163,11 @@ impl AudioEngine {
                                     }
                                 } else {
                                     // bridge から戻ってこないときは silence (= 安全側)
-                                    underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                    if got == 0 {
+                                        underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        partial_pulls_cb.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     for s in data.iter_mut() {
                                         *s = 0.0;
                                     }
@@ -182,7 +201,10 @@ impl AudioEngine {
             tone,
             mode,
             actual_n_frames,
+            min_n_frames,
+            max_n_frames,
             underruns,
+            partial_pulls,
         })
     }
 }
