@@ -722,9 +722,13 @@ impl DspBridge {
                 }
             }
         }
-        // close は Mutex 外で実施 (DspBridge::hide_slot_gui が再 lock するので)
+        // close は Mutex 外で実施 (DspBridge::user_hide_slot_gui が再 lock するので)。
+        // **user_hide_slot_gui を使う**: プラグインウィンドウの × ボタン押下は
+        // ユーザーの明示的な意図 = `user_hidden=true` をセットして以降の VST 全表示
+        // トグルでも復活しないようにする (= ユーザー報告 2026-04 「× で閉じた状態を
+        // 記憶したい」)。
         for idx in close_targets {
-            self.hide_slot_gui(idx);
+            self.user_hide_slot_gui(idx);
         }
         // session 切替は bridge に最初に伝える (= 後続の resize より先に状態確定)
         for (idx, active) in session_targets {
