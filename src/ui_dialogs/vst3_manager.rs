@@ -55,41 +55,58 @@ impl App {
 
         // 動画再生中の使い勝手を考慮した小さめ初期サイズ。チェーン編集を含まない
         // ので幅は狭くて済む (= プラグイン名 + バイパス + GUI ボタンが収まれば OK)。
+        // **位置は固定 ID で永続化** (= 旧版で RichText タイトルを使ったため Window の
+        // 内部 ID がフレームごとに変動し、ドラッグ位置が記憶されず 1 フレームごとに
+        // ずれてしまうユーザー報告に対応)。
         let initial_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
 
-        // ── 配色 (= 動画 (黒背景) との一体感を出す ─
-        // egui::Window のデフォルトは UI テーマ依存の明るい灰系で、フルスクリーン
-        // 動画再生時に目立ちすぎる。背景・枠・フォントを黒+白系で統一する。
-        let bg = egui::Color32::from_rgba_unmultiplied(20, 20, 20, 235);
-        let stroke = egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(120, 120, 120, 200),
-        );
-        let frame = egui::Frame::window(&ctx.style())
-            .fill(bg)
-            .stroke(stroke)
-            .corner_radius(6);
-
-        egui::Window::new(
-            egui::RichText::new("VST3")
-                .strong()
-                .color(egui::Color32::from_rgb(220, 220, 220)),
-        )
-        .frame(frame)
-        .open(&mut open)
-        .default_pos(initial_pos)
-        .default_width(280.0)
-        .min_width(220.0)
-        .resizable(false)
-        .collapsible(false)
-        .show(ctx, |ui| {
-            // 全体のテキスト色を明るめに統一
-            let visuals = ui.visuals_mut();
-            visuals.override_text_color = Some(egui::Color32::from_rgb(230, 230, 230));
-            visuals.widgets.inactive.fg_stroke.color =
-                egui::Color32::from_rgb(220, 220, 220);
-            visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
-            visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+        egui::Window::new("VST3")
+            .id(egui::Id::new("vst3-playback-panel"))
+            .open(&mut open)
+            .default_pos(initial_pos)
+            .default_width(280.0)
+            .min_width(220.0)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                // ── 配色を完全な dark テーマに切り替え ──
+                // egui::Window の chrome (タイトルバー / 枠) はその時点の Visuals を使う。
+                // ui.style_mut() で **このウィンドウだけ** dark に切り替えることで、
+                // light テーマ下でも黒ベースで描画される (= 動画 (黒背景) と馴染む)。
+                // 旧版は override_text_color のみ調整していたが、widget の bg が
+                // 明るいまま残っていてボタン文字が読めなくなる問題があった
+                // (ユーザー報告 2026-04)。
+                let style = ui.style_mut();
+                style.visuals = egui::Visuals::dark();
+                // ウィンドウ背景・枠を mIV のフルスクリーン黒に寄せる
+                style.visuals.window_fill =
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240);
+                style.visuals.panel_fill =
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240);
+                style.visuals.window_stroke = egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(120, 120, 120, 200),
+                );
+                // ボタン地色を少し明るめにして可読性を確保 (= 黒背景に薄灰ボタン)
+                style.visuals.widgets.inactive.weak_bg_fill =
+                    egui::Color32::from_rgb(50, 50, 50);
+                style.visuals.widgets.inactive.bg_fill =
+                    egui::Color32::from_rgb(60, 60, 60);
+                style.visuals.widgets.hovered.weak_bg_fill =
+                    egui::Color32::from_rgb(80, 80, 80);
+                style.visuals.widgets.hovered.bg_fill =
+                    egui::Color32::from_rgb(90, 90, 90);
+                style.visuals.widgets.active.weak_bg_fill =
+                    egui::Color32::from_rgb(100, 100, 100);
+                style.visuals.widgets.active.bg_fill =
+                    egui::Color32::from_rgb(110, 110, 110);
+                // テキストは全状態で白系
+                style.visuals.widgets.inactive.fg_stroke.color =
+                    egui::Color32::from_rgb(230, 230, 230);
+                style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+                style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+                style.visuals.widgets.noninteractive.fg_stroke.color =
+                    egui::Color32::from_rgb(220, 220, 220);
 
             if matches!(state, DspState::Error(_)) {
                 if let DspState::Error(e) = state {

@@ -58,6 +58,13 @@ public:
     /// 操作も Win32 API は許容)。
     void set_host_hwnd(void* hwnd) { host_hwnd_ = hwnd; }
 
+    /// `notify_host_resize` ハンドラから呼ばれて、プラグインへ onSize を投げる
+    /// **直前に suppress=true** にし、戻った直後に false に戻す。
+    /// プラグインが onSize 中に再帰的に resizeView を呼んでくるケース
+    /// (Insight2 等) で SetWindowPos が連発しユーザーのドラッグと衝突する
+    /// 「振動」を抑える。
+    void set_resize_suppressed(bool suppressed) { resize_suppressed_ = suppressed; }
+
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView* view,
                                               Steinberg::ViewRect* newSize) override;
 
@@ -65,6 +72,10 @@ public:
 
 private:
     void* host_hwnd_ = nullptr;
+    /// 親が view->onSize を呼んでいる最中フラグ。プラグインがそれに反応して
+    /// 再帰的に resizeView を呼んできても、SetWindowPos しない (= フィードバック
+    /// ループ抑止)。view->onSize 自体は呼んで返答する。
+    bool resize_suppressed_ = false;
 };
 
 class ComponentHandler : public Steinberg::Vst::IComponentHandler {

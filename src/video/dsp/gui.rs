@@ -77,9 +77,20 @@ pub struct ShowReply {
 }
 
 /// 専用スレッドで Win32 メッセージループを回す GUI ホスト。
+///
+/// **スレッドは detach 方式**で管理する: drop 時に `Cmd::Quit` を送信するだけで
+/// `join` は呼ばない。理由はプラグイン (Pro-Q 4 / Insight2 等) の `removed()`
+/// が時間を取るケースで、show/hide を高速にトグルするとメインスレッドが
+/// 連鎖的にブロックされ「重くなって固まる」ユーザー報告 (2026-04) が発生した。
+/// detach なら Cmd::Quit 送信だけで即座にメインに戻り、スレッドはバックグラウンド
+/// で自然に exit する (= 通常 100ms 以内)。万一 Quit が届く前にプロセスが終了
+/// してもデーモンスレッドとして OS が回収するので問題ない。
 pub struct GuiHost {
     cmd_tx: Sender<Cmd>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// JoinHandle は保持するだけ (drop 時に detach されるため)。
+    /// `Option::take` は使わないが、`thread` の所有権を保持して revealed lifetime
+    /// が混乱しないようにするため `Option` のまま残す。
+    _thread: std::thread::JoinHandle<()>,
 }
 
 impl GuiHost {
@@ -91,7 +102,7 @@ impl GuiHost {
             .expect("spawn gui thread");
         Self {
             cmd_tx,
-            thread: Some(thread),
+            _thread: thread,
         }
     }
 
@@ -123,10 +134,12 @@ impl GuiHost {
 
 impl Drop for GuiHost {
     fn drop(&mut self) {
+        // Quit を送るだけで join しない (= detach)。
+        // join するとプラグインの removed() の重さがメインスレッドに伝搬して
+        // show/hide 高速トグル時に GUI が重くなる / 固まる (ユーザー報告 2026-04)。
         let _ = self.cmd_tx.send(Cmd::Quit);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        // _thread はそのままドロップ → 内部の OwnedHandle のみ閉じ、
+        // OS スレッド自体は Cmd::Quit を受信した時点で自発的に exit する。
     }
 }
 

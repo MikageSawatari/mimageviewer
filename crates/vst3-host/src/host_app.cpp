@@ -103,7 +103,17 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
     }
     int32 w = newSize->right - newSize->left;
     int32 h = newSize->bottom - newSize->top;
-    if (host_hwnd_ && w > 0 && h > 0) {
+    // ── フィードバックループ抑止 (Insight2 リサイズ振動への対策) ──
+    // ユーザーがホストウィンドウをドラッグしてリサイズ中、host は WM_SIZE 受信
+    // ごとに `notify_host_resize` → view->onSize を呼ぶ。Insight2 等の plugin は
+    // onSize 内で **再帰的に resizeView をコールバック**してくる (= 自分のレイアウト
+    // に合わせた "微調整" サイズを要求)。
+    // ここで SetWindowPos するとユーザーのドラッグ中ウィンドウが瞬間的にプラグイン
+    // 推奨サイズへ吸着し、次の WM_SIZE でユーザー位置に戻る → 暴れる。
+    // resize_suppressed_=true 中は SetWindowPos をスキップして view->onSize で確認
+    // だけ返す (= プラグインに「了解」を伝える)。これでユーザーのドラッグが
+    // 邪魔されない。
+    if (host_hwnd_ && w > 0 && h > 0 && !resize_suppressed_) {
         HWND hwnd = reinterpret_cast<HWND>(host_hwnd_);
         UINT dpi = GetDpiForWindow(hwnd);
         if (dpi == 0) dpi = 96;
