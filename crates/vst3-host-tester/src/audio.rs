@@ -76,7 +76,12 @@ impl AudioEngine {
             return Err(format!("output device has only {channels} channel(s); need stereo"));
         }
 
-        let block_size = 480u32; // 10 ms @ 48kHz / WASAPI Shared 想定
+        let block_size = 480u32; // bridge 側に渡す処理ブロックサイズ
+        // cpal の callback サイズを bridge と一致させる。
+        // 一致しないと「441 push / 480 wait」のような数サンプル単位のずれが
+        // 1 秒間に積み重なって、ring buffer のアンダー/オーバーランが起きてブチブチノイズになる。
+        // WASAPI Shared では Fixed が拒否される場合があるが、その場合 Default に
+        // フォールバックする。
         let mut phase: f32 = 0.0;
         let tone_for_cb = tone.clone();
         let mode_for_cb = Arc::clone(&mode);
@@ -88,7 +93,9 @@ impl AudioEngine {
         let err_fn = |e| eprintln!("cpal stream error: {e}");
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => {
-                let stream_config: cpal::StreamConfig = config.clone().into();
+                let mut stream_config: cpal::StreamConfig = config.clone().into();
+                // バッファサイズ固定を試みる (失敗時は default のままで継続)
+                stream_config.buffer_size = cpal::BufferSize::Fixed(block_size);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {

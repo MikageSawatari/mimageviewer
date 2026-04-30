@@ -33,8 +33,10 @@ inline void blog(const char* msg) {
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
+#include "pluginterfaces/vst/ivstmessage.h"  // IConnectionPoint
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "pluginterfaces/vst/vsttypes.h"
+#include "public.sdk/source/common/memorystream.h"
 #include "public.sdk/source/vst/hosting/processdata.h"
 #include "public.sdk/source/vst/hosting/eventlist.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
@@ -104,6 +106,27 @@ bool PluginLoader::load(const std::string& plugin_path,
             }
             if (controller_) {
                 controller_->setComponentHandler(component_handler_);
+
+                // VST3 必須: IComponent と IEditController を IConnectionPoint で
+                // 接続し、component の state を controller に同期する。
+                // これが無いと一部のプラグイン (Pro-Q 4 等) は UI 操作が音声処理に
+                // 反映されず、内部アナライザも動作しない。
+                auto component_cp = Steinberg::FUnknownPtr<Steinberg::Vst::IConnectionPoint>(component_);
+                auto controller_cp = Steinberg::FUnknownPtr<Steinberg::Vst::IConnectionPoint>(controller_);
+                if (component_cp && controller_cp) {
+                    component_cp->connect(controller_cp);
+                    controller_cp->connect(component_cp);
+                    blog("load: component <-> controller connected");
+                }
+
+                // component の state を controller にコピー (= デフォルトパラメータ等)。
+                Steinberg::MemoryStream stream;
+                if (component_->getState(&stream) == Steinberg::kResultOk) {
+                    stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                    if (controller_->setComponentState(&stream) == Steinberg::kResultOk) {
+                        blog("load: setComponentState ok");
+                    }
+                }
             }
 
             info_out.plugin_name = info.name();
@@ -449,6 +472,15 @@ void PluginLoader::unload() {
         component_->setActive(false);
     }
     active_ = false;
+    // ConnectionPoint を切断 (load で connect した分)
+    if (component_ && controller_) {
+        auto comp_cp = Steinberg::FUnknownPtr<Vst::IConnectionPoint>(component_);
+        auto ctrl_cp = Steinberg::FUnknownPtr<Vst::IConnectionPoint>(controller_);
+        if (comp_cp && ctrl_cp) {
+            comp_cp->disconnect(ctrl_cp);
+            ctrl_cp->disconnect(comp_cp);
+        }
+    }
     if (controller_ && controller_ != Steinberg::FUnknownPtr<Vst::IEditController>(component_)) {
         controller_->terminate();
     }
