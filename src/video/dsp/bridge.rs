@@ -377,6 +377,14 @@ impl Bridge {
         let _ = self.child.wait();
         Ok(())
     }
+
+    /// `Arc<Bridge>` から呼ぶ用の shutdown。`shutdown` 命令を送るだけで exit 待ちはしない。
+    /// 子プロセスは shutdown を受信して自発的に exit するか、Arc の最後の参照が落ちた時点で
+    /// Drop 経路で kill される。
+    pub fn shutdown_async(&self) -> std::io::Result<()> {
+        let _ = self.send(&Cmd::Shutdown);
+        Ok(())
+    }
 }
 
 #[cfg(windows)]

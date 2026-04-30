@@ -97,7 +97,8 @@ pub fn default_output_sample_rate() -> Option<u32> {
 /// 旧 Phase 3d の「1 度だけ emit」では Loading 中に届いた event が latch reset
 /// で消える race があったため、Phase 8.K で level 化した。
 /// 音声出力ストリームを起動する。`dsp_bridge` を渡すと audio-pump で VST3 プラグイン
-/// 処理を挿入する (= `is_enabled()=true` & `Loaded` のときのみ)。それ以外はパススルー。
+/// 処理 (チェーン) を挿入する。`is_enabled()=true` かつアクティブスロット
+/// (= bypass=false の Loaded スロット) が 1 個以上のときのみ実行され、それ以外はパススルー。
 pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
@@ -252,11 +253,11 @@ fn run_pump(
         }
 
         // ── VST3 plugin processing (optional) ──
-        // bridge が enable=true & loaded のときだけ frame.samples を bridge に通す。
-        // 通常の動画再生 (= VST3 disable) ではゼロオーバーヘッド (= AtomicBool 1 回読み)。
+        // bridge が enable=true & active_slot_count > 0 のときだけ frame.samples を bridge に通す。
+        // 通常の動画再生 (= VST3 disable / 全 bypass) ではゼロオーバーヘッド (= 2 つの atomic 読み)。
         #[cfg(windows)]
         let processed_samples: std::borrow::Cow<'_, [f32]> = if let Some(b) = &dsp_bridge {
-            if b.is_enabled() && matches!(b.state(), crate::video::dsp::DspState::Loaded) {
+            if b.is_enabled() && b.active_slot_count() > 0 {
                 fx_out.resize(frame.samples.len(), 0.0);
                 if let Err(e) = b.process_block(&frame.samples, &mut fx_out) {
                     crate::logger::log(format!("vst3 process_block failed: {e}"));

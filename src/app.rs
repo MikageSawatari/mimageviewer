@@ -2223,23 +2223,9 @@ pub struct App {
     /// VST3 プラグイン候補のスキャン結果 (lazy ロード、初回 enable で実行)。
     #[cfg(windows)]
     pub(crate) vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
-    /// VST3 プラグイン GUI ホスト (Win32 子ウィンドウ管理)。
-    /// 表示されているときだけ Some。
-    #[cfg(windows)]
-    pub(crate) vst3_gui_host: Option<crate::video::dsp::gui::GuiHost>,
-    /// VST3 プラグイン GUI の現在の HWND (`u64` 化)。`SetParent` 用に bridge へ渡す。
-    pub(crate) vst3_gui_hwnd: Option<u64>,
-    /// プラグイン GUI ホストウィンドウの × ボタン押下シグナル (= ウィンドウ閉じ要求)。
-    #[cfg(windows)]
-    pub(crate) vst3_gui_close_signal: Option<
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
-    >,
-    /// プラグイン GUI ホストウィンドウのリサイズシグナル (= 新クライアント領域サイズ)。
-    #[cfg(windows)]
-    pub(crate) vst3_gui_resize_signal: Option<
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>,
-    >,
-    /// 起動時に VST3 bridge enable + 自動ロードを 1 回だけ走らせるための gate。
+    /// 起動時に VST3 bridge enable + チェーン自動ロードを 1 回だけ走らせるための gate。
+    /// プラグイン GUI とその HWND は [`crate::video::dsp::DspBridge`] 内のスロットに
+    /// per-plugin で持たれている (= App には保持しない)。
     pub(crate) vst3_init_kicked: bool,
 }
 
@@ -2662,13 +2648,6 @@ impl Default for App {
             show_vst3_manager: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
-            #[cfg(windows)]
-            vst3_gui_host: None,
-            vst3_gui_hwnd: None,
-            #[cfg(windows)]
-            vst3_gui_close_signal: None,
-            #[cfg(windows)]
-            vst3_gui_resize_signal: None,
             vst3_init_kicked: false,
         }
     }
@@ -3261,8 +3240,8 @@ impl App {
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
     /// 1 度しか走らせない。
     /// 起動時 1 回だけ呼び出される: settings.vst3_enabled が true なら bridge を spawn し、
-    /// settings.vst3_plugin_path に値があれば自動ロードする。
-    /// **worker thread で実行する** (= bridge spawn は ~数百 ms かかるので UI スレッドを止めない)。
+    /// settings.vst3_plugins のチェーン全体を順番に自動ロードする。
+    /// **worker thread で実行する** (= 1 個ロードあたり ~数百 ms 〜数秒、UI スレッドを止めない)。
     #[cfg(windows)]
     pub(crate) fn kick_off_vst3_startup(&mut self) {
         if self.vst3_init_kicked {
@@ -3273,15 +3252,19 @@ impl App {
             return;
         }
         let bridge = self.dsp_bridge.clone();
-        let plugin_path = self.settings.vst3_plugin_path.clone();
-        let restore = self
-            .settings
-            .vst3_plugin_state
-            .as_ref()
-            .and_then(|b64| {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD.decode(b64).ok()
-            });
+        let plugins = self.settings.vst3_plugins.clone();
+        if plugins.is_empty() {
+            // チェーン未設定なら enable だけしてプラグインは管理ウィンドウで追加してもらう
+            std::thread::Builder::new()
+                .name("vst3-startup".into())
+                .spawn(move || {
+                    if let Err(e) = bridge.enable() {
+                        crate::logger::log(format!("vst3 startup enable failed: {e}"));
+                    }
+                })
+                .ok();
+            return;
+        }
         std::thread::Builder::new()
             .name("vst3-startup".into())
             .spawn(move || {
@@ -3289,17 +3272,15 @@ impl App {
                     crate::logger::log(format!("vst3 startup enable failed: {e}"));
                     return;
                 }
-                if let Some(path) = plugin_path {
-                    let sample_rate =
-                        crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
-                    if let Err(e) = bridge.load_plugin(
-                        &path,
-                        sample_rate,
-                        480,
-                        restore.as_deref(),
-                    ) {
+                let sample_rate =
+                    crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
+                for entry in plugins {
+                    if let Err(e) =
+                        bridge.add_plugin(&entry.path, sample_rate, 480, entry.bypass)
+                    {
                         crate::logger::log(format!(
-                            "vst3 startup auto-load failed: {e} (プラグイン管理から再選択してください)"
+                            "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
+                            entry.path
                         ));
                     }
                 }
@@ -7241,15 +7222,15 @@ impl App {
                 }
             }
 
-            // V: VST3 プラグイン GUI を表示/非表示トグル
-            // VST3 機能 (= settings.vst3_enabled) が有効、かつプラグインがロード済みのときだけ反応する。
-            // IME 変換中や TextEdit フォーカス中は無効化する。
+            // V: VST3 プラグイン GUI を一斉表示/非表示トグル
+            // VST3 機能 (= settings.vst3_enabled) が有効、かつチェーンに 1 個でもプラグインが
+            // あるときだけ反応する。IME 変換中や TextEdit フォーカス中は無効化する。
             #[cfg(windows)]
             {
                 let v_pressed = ctx
                     .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
                 if v_pressed && self.settings.vst3_enabled && !self.ime_input_active() {
-                    self.vst3_toggle_plugin_gui();
+                    self.vst3_toggle_all_plugin_guis();
                 }
             }
 

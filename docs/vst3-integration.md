@@ -2,8 +2,8 @@
 
 ## 1. ゴール (v0.9.0 スコープ)
 
-動画音声に **1 個の VST3 プラグインを挿入**して、加工後の音声をスピーカーに
-出力する。LUFS 測定 / FabFilter Pro-Q 4 等の EQ 用途を想定。
+動画音声に **VST3 プラグインのチェーン** (複数プラグインを直列接続) を挿入して、
+加工後の音声をスピーカーに出力する。LUFS 測定 + EQ + コンプ等の組み合わせを想定。
 
 設計判断 (= [vst-bitwig-... プラン](file:///C:/Users/mikag/.claude/plans/vst-bitwig-vst-vst-lufs-eq-vst-scalable-flame.md) からの抜粋):
 
@@ -11,36 +11,51 @@
   Rust 本体とは stdin/stdout (制御) + shared memory + named event (音声)。
 - **Phase 0b は完成済み**。`crates/vst3-host/` (C++) と
   `crates/vst3-host-tester/` (Rust 検証用 GUI) が動作確認済み。
-- **v0.9.0 では単一プラグイン**。チェーン (複数挿入) は v0.10.0 以降。
+- **v0.9.0 はチェーン (複数プラグイン) 対応**。各プラグインは別 bridge 子プロセスで
+  動かし、`audio-pump` がチェーン順に IPC を回す。プラグインクラッシュは隣のプラグインに
+  波及しない (= 個別 bridge プロセス分離)。
+- **チェーン長の実用上限**: 各 IPC roundtrip ~1-2ms × N。1024-sample frame
+  (= 21ms) を realtime で処理する余裕を考慮すると **5 個程度まで**が安全圏。
 - **デフォルト OFF**。利用者は少数想定。環境設定で ON にしたときに初回スキャン。
-- **プラグインインスタンス永続化**。アプリ起動中ずっと bridge を握り、動画切替で
+- **プラグインインスタンス永続化**。アプリ起動中ずっと bridge 群を握り、動画切替で
   再ロードしない (= EQ カーブや LUFS の積算が動画切替で消えない)。
+- **プラグイン GUI は常に最前面** (`WS_EX_TOPMOST`)。動画フルスクリーン中も裏に
+  隠れず、動画を見ながら EQ 調整 / LUFS 確認ができる。
 
 ## 2. 全体構成
 
 ```
 mimageviewer-core.exe (Rust)
 ├─ DspBridge (singleton, src/video/dsp/)
-│   ├─ Child process: mimageviewer-vst3-host.exe
-│   │   (アプリ起動中ずっと生存。VST3 enable 時にspawn)
-│   ├─ stdin/stdout: 制御 (length-prefixed JSON)
-│   ├─ Shared memory: 2 本の SPSC ring buffer (in/out, f32 stereo)
-│   └─ Named events: sig_in / sig_out で同期
-├─ src/video/audio.rs: pump thread が DspBridge::process_block を呼ぶ
-│   (AudioBuffer に push する直前に挿入。enable=false なら no-op)
+│   ├─ Vec<PluginSlot>          ← チェーン (順番が音声適用順)
+│   │   ├─ Slot[0]: bridge プロセス + プラグイン名 + GUI HWND + bypass フラグ
+│   │   ├─ Slot[1]: ...
+│   │   └─ ...
+│   ├─ active_slot_count (atomic): bypass=false の Loaded 個数
+│   └─ scratch_a / scratch_b: 多段チェーンの ping-pong 用 (alloc 再利用)
+├─ src/video/audio.rs: audio-pump thread が DspBridge::process_block を呼び、
+│   全アクティブスロットを順番に IPC で通す。enable=false / 全 bypass / 0 個なら no-op
 ├─ src/video/dsp/gui.rs: プラグイン GUI ホスト (Win32 子ウィンドウ)
-│   (V キーでトグル、独立した HWND で表示)
+│   - WS_EX_TOPMOST で常に最前面 (動画フルスクリーンに隠れない)
+│   - 各スロットが個別の HWND を持つ。V キーで全スロット一斉トグル
 └─ Settings (settings.json):
     - vst3_enabled: bool (default false)
-    - vst3_plugin_path: Option<String>
-    - vst3_plugin_state: Option<Base64<Vec<u8>>> (= IComponent::getState())
-    - vst3_gui_visible: bool
+    - vst3_plugins: Vec<Vst3PluginEntry>  ← チェーン定義
+    -   .path: String
+    -   .bypass: bool
+    -   .state: Option<Base64<...>>  (= IComponent::getState、将来用)
+    - vst3_gui_visible: bool  (V キートグル状態)
 
+各 PluginSlot は独立した bridge 子プロセス:
 vendor/vst3-host/mimageviewer-vst3-host.exe (C++ bridge)
-├─ build 済み exe (CMake で別途生成。Cargo は触らない)
-└─ include_bytes! でメイン exe に埋め込み、初回 enable 時に
-   %APPDATA%\mimageviewer\vst3\mimageviewer-vst3-host.exe へ展開
-   (PDFium / Susie ワーカー / FFmpeg DLL と同パターン)
+├─ 1 プロセス = 1 プラグイン (= プラグインクラッシュの隔離)
+├─ stdin/stdout: 制御 (length-prefixed JSON)
+├─ Shared memory: 2 本の SPSC ring (in/out, f32 stereo) — slot 別に独立
+└─ Named events: sig_in / sig_out で同期
+
+include_bytes! でメイン exe に埋め込み、初回 enable 時に
+%APPDATA%\mimageviewer\vst3\mimageviewer-vst3-host.exe へ展開
+(PDFium / Susie ワーカー / FFmpeg DLL と同パターン)
 ```
 
 ## 3. ディレクトリ / モジュールマップ

@@ -1700,14 +1700,14 @@ impl App {
             self.apply_slot_in_viewing_mode(ctx, 2);
         }
 
-        // V: VST3 プラグイン GUI を表示/非表示トグル (フルスクリーン時)
+        // V: VST3 プラグイン GUI を一斉表示/非表示トグル (フルスクリーン時)
         // 動画分析中に動画を見ながらプラグイン GUI のオン・オフをしたい用途。
         #[cfg(windows)]
         {
             let v_pressed = ctx
                 .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
             if v_pressed && self.settings.vst3_enabled && !self.ime_input_active() {
-                self.vst3_toggle_plugin_gui();
+                self.vst3_toggle_all_plugin_guis();
             }
         }
 

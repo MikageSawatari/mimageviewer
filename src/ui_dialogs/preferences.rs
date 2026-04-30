@@ -1541,19 +1541,32 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
     if s.vst3_enabled {
         ui.add_space(4.0);
-        if let Some(path) = &s.vst3_plugin_path {
-            let name = std::path::Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(不明)");
-            ui.label(format!("選択中: {name}"));
+        let chain_count = s.vst3_plugins.len();
+        if chain_count == 0 {
+            ui.label(
+                "チェーンは空です。「VST3 プラグイン管理」からプラグインを追加してください。",
+            );
         } else {
-            ui.label("プラグイン未選択。「VST3 プラグイン管理」から選択してください。");
+            ui.label(format!(
+                "チェーン: {} 個のプラグインがロード対象 (順番に音声を通します)",
+                chain_count
+            ));
+            for (i, entry) in s.vst3_plugins.iter().enumerate() {
+                let name = std::path::Path::new(&entry.path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(不明)");
+                let bypass_marker = if entry.bypass { " [バイパス]" } else { "" };
+                ui.label(format!("  {}. {}{}", i + 1, name, bypass_marker));
+            }
         }
         ui.add_space(4.0);
         if ui
             .button("VST3 プラグイン管理を開く…")
-            .on_hover_text("プラグイン一覧の検索・ロード・GUI 表示の管理ウィンドウを開きます。")
+            .on_hover_text(
+                "プラグイン一覧の検索・チェーンへの追加・順番入れ替え・\n\
+                 バイパス・GUI 表示などの管理ウィンドウを開きます。",
+            )
             .clicked()
         {
             state.open_vst3_manager_requested = true;

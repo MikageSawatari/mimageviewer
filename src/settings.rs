@@ -852,18 +852,39 @@ pub struct Settings {
     /// 起動せず、音声経路もパススルー (オーバーヘッドゼロ)。
     #[serde(default)]
     pub vst3_enabled: bool,
-    /// 最後に選択した VST3 プラグインの絶対パス。
-    /// 起動時に自動ロードされる (= ユーザーが管理ウィンドウで都度選択し直す必要がない)。
+    /// VST3 プラグインのチェーン (= 適用順序の配列)。配列の先頭から順番に音声を通す。
+    /// 各エントリは個別に bypass トグル可能 (ロード状態は維持しつつスルー)。
+    /// 起動時に自動ロードされる (= ユーザーが管理ウィンドウで都度設定し直す必要がない)。
+    #[serde(default)]
+    pub vst3_plugins: Vec<Vst3PluginEntry>,
+    /// (deprecated) v0.9.0 開発初期版で使われていた単一プラグインパス。
+    /// 読み込み時に `vst3_plugins` に migration するための互換フィールド。
+    /// 一度 migrate されると settings.json への次回書き込みで消える。
     #[serde(default)]
     pub vst3_plugin_path: Option<String>,
-    /// プラグイン側の現在状態 (= IComponent::getState() chunk) を Base64 エンコードしたもの。
-    /// アプリ終了時に bridge から取得し、次回起動時に復元する (= EQ カーブ等が保持される)。
-    /// v0.9.0 では bridge 側 query_state プロトコル未実装のため未使用 (将来拡張)。
+    /// (deprecated) 同上。`Vst3PluginEntry::state` に migration する。
     #[serde(default)]
     pub vst3_plugin_state: Option<String>,
     /// プラグイン GUI の表示状態。V キー / 管理ウィンドウのトグル状態を永続化する。
+    /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+}
+
+/// VST3 プラグインチェーンの 1 エントリ。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct Vst3PluginEntry {
+    /// .vst3 ファイル / バンドルディレクトリへの絶対パス。
+    pub path: String,
+    /// true ならこのスロットを音声処理でスキップ (= ロード済みのままパススルー)。
+    /// false なら通常通り `IAudioProcessor::process` を呼ぶ。
+    #[serde(default)]
+    pub bypass: bool,
+    /// プラグイン側の現在状態 (= IComponent::getState chunk) を Base64 エンコードしたもの。
+    /// 終了時に bridge から取得し、次回起動時に復元する (= EQ カーブ等が保持される)。
+    /// v0.9.0 では bridge 側 query_state プロトコル未実装のため未使用 (将来拡張)。
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
@@ -1122,6 +1143,7 @@ impl Default for Settings {
             video_thumb_use_sidecar_image: true,
             video_tile_columns: default_video_tile_columns(),
             vst3_enabled: false,
+            vst3_plugins: Vec::new(),
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
@@ -1154,13 +1176,38 @@ impl Settings {
         });
         // migration: UUID nil チェック → 割り当てが発生したかを検出
         let had_nil_uuids = settings.favorites.iter().any(|f| f.id.is_nil());
+        // migration: VST3 旧形式 (vst3_plugin_path / vst3_plugin_state) を Vec に移送
+        let vst3_migrated = settings.migrate_vst3_legacy();
         settings.sanitize();
         // 新規 UUID を発行したので settings.json に書き戻して永続化する。
         // これで次回起動以降は sanitize でのマイグレーションが不要になる。
-        if had_nil_uuids {
+        if had_nil_uuids || vst3_migrated {
             settings.save();
         }
         settings
+    }
+
+    /// v0.9.0 開発初期版の単一 VST3 プラグイン形式 (`vst3_plugin_path` + `vst3_plugin_state`)
+    /// から Vec 形式 (`vst3_plugins`) への migration。
+    /// 一度実行されたら旧フィールドは None にクリアし、次回 save で settings.json から消える。
+    /// 戻り値: migration が発生したか (= save が必要か)。
+    fn migrate_vst3_legacy(&mut self) -> bool {
+        if self.vst3_plugin_path.is_none() {
+            return false;
+        }
+        // 既に新形式に値があるなら旧形式のクリアだけ行う (= 新形式が source of truth)。
+        if self.vst3_plugins.is_empty() {
+            if let Some(path) = self.vst3_plugin_path.as_ref() {
+                self.vst3_plugins.push(Vst3PluginEntry {
+                    path: path.clone(),
+                    bypass: false,
+                    state: self.vst3_plugin_state.clone(),
+                });
+            }
+        }
+        self.vst3_plugin_path = None;
+        self.vst3_plugin_state = None;
+        true
     }
 
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
@@ -1233,8 +1280,9 @@ impl Settings {
         // ── VST3 プラグイン (専用管理ウィンドウ / V キーで編集) ──
         // `vst3_enabled` は環境設定から触るので除外。それ以外は管理ウィンドウや
         // V キーの runtime 操作で変わるので preferences 側を上書きする。
-        self.vst3_plugin_path = src.vst3_plugin_path.take();
-        self.vst3_plugin_state = src.vst3_plugin_state.take();
+        self.vst3_plugins = std::mem::take(&mut src.vst3_plugins);
+        self.vst3_plugin_path = src.vst3_plugin_path.take(); // legacy migration field
+        self.vst3_plugin_state = src.vst3_plugin_state.take(); // legacy migration field
         self.vst3_gui_visible = src.vst3_gui_visible;
     }
 

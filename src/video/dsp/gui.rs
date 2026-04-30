@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
     SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_SIZE, WNDCLASSEXW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -355,6 +355,10 @@ fn create_window(
         // フレーム厚を過小評価し、結果クライアント領域が意図より狭くなる
         // (プラグイン GUI の上下が見切れる原因)。AdjustWindowRectExForDpi で
         // 実 DPI を渡して計算する。
+        // ⚠️ プラグイン GUI は **常に最前面** で表示する (`WS_EX_TOPMOST`)。
+        // 動画フルスクリーン再生中も裏に隠れないようにするため。ユーザーは
+        // 動画を見ながら EQ カーブを調整したり LUFS を確認したりするので、
+        // 隠れる挙動だと用途を満たせない (= 開いていながら確認できない状態)。
         let mut rect = windows::Win32::Foundation::RECT {
             left: 0,
             top: 0,
@@ -362,11 +366,12 @@ fn create_window(
             bottom: height as i32,
         };
         let dpi = GetDpiForSystem();
+        let ex_style = WS_EX_TOPMOST;
         let _ = AdjustWindowRectExForDpi(
             &mut rect,
             WS_OVERLAPPEDWINDOW,
             false,
-            WINDOW_EX_STYLE(0),
+            ex_style,
             dpi,
         );
         let outer_w = rect.right - rect.left;
@@ -374,7 +379,7 @@ fn create_window(
 
         let title_w = HSTRING::from(title);
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            ex_style,
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             WS_OVERLAPPEDWINDOW,
@@ -424,12 +429,15 @@ fn close_window() {
     });
 }
 
-/// プラグインの推奨サイズに合わせてホストウィンドウのクライアント領域をリサイズする。
-/// プラグイン GUI ホストウィンドウを最前面に移動 + 表示する。
+/// プラグイン GUI ホストウィンドウを最前面 (= topmost) に固定 + 表示する。
 /// V キートグル時に既に開いているウィンドウを再度前に出すためのヘルパー。
+///
+/// `WS_EX_TOPMOST` 属性は CreateWindowExW で既に設定済みだが、
+/// 一部の環境 (= Always On Top を解除する別アプリの介入等) で外れることがあるため、
+/// 念のため SetWindowPos(HWND_TOPMOST) も毎回呼ぶ。
 pub fn bring_to_front(hwnd_u64: u64) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, SW_SHOW, ShowWindow,
+        HWND_TOPMOST, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow,
     };
     if hwnd_u64 == 0 {
         return;
@@ -437,7 +445,7 @@ pub fn bring_to_front(hwnd_u64: u64) {
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 }
 
