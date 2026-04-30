@@ -99,6 +99,9 @@ struct TesterApp {
     last_logged_frames: u32,
     last_logged_underruns: u32,
     last_logged_partials: u32,
+    /// 診断用: bridge 経由するが plugin process を skip する。
+    /// 歪みの原因切り分け用。
+    bridge_passthrough: bool,
 
     // GUI 表示まわり
     #[cfg(windows)]
@@ -159,6 +162,7 @@ impl TesterApp {
             last_logged_frames: 0,
             last_logged_underruns: 0,
             last_logged_partials: 0,
+            bridge_passthrough: false,
             log_lines: Arc::new(Mutex::new(Vec::new())),
             log_file,
             log_file_path,
@@ -672,6 +676,25 @@ impl eframe::App for TesterApp {
                     self.log(format!("mode changed: {:?} -> {:?}", prev_mode, mode_val));
                 }
             }
+
+            ui.horizontal(|ui| {
+                let was = self.bridge_passthrough;
+                ui.checkbox(
+                    &mut self.bridge_passthrough,
+                    "Bridge passthrough (plugin スキップ、診断用)",
+                );
+                if was != self.bridge_passthrough {
+                    if let Some(br) = self.bridge.as_ref() {
+                        let _ = br.send(&Cmd::SetPassthrough {
+                            enable: if self.bridge_passthrough { 1 } else { 0 },
+                        });
+                    }
+                    self.log(format!(
+                        "bridge passthrough: {}",
+                        self.bridge_passthrough
+                    ));
+                }
+            });
 
             ui.horizontal(|ui| {
                 use std::sync::atomic::Ordering;

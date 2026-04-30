@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>  // memcpy
 #include <deque>
 #include <iostream>
 #include <mutex>
@@ -306,6 +307,14 @@ private:
             write_message("{\"event\":\"gui_detached\"}");
             return true;
         }
+        if (cmd == "set_passthrough") {
+            // 診断用: plugin を経由せず in→out 単純コピー。
+            // これで歪みが消えれば plugin process 経路が原因、残れば bridge
+            // パイプライン (ring buffer / 変換ロジック) が原因と切り分けられる。
+            uint64_t enable = extract_number_field(msg, "enable");
+            passthrough_.store(enable != 0, std::memory_order_relaxed);
+            return true;
+        }
         if (cmd == "notify_host_resize") {
             // host (tester) ウィンドウがユーザーリサイズされた → プラグインに通知して
             // 子ウィンドウを追従させる。応答は不要。
@@ -464,7 +473,10 @@ private:
                 input_peak = std::max(input_peak, std::fabs(input[i]));
             }
 
-            if (loader_ && !loader_->process_block(input.data(), output.data(), frames)) {
+            if (passthrough_.load(std::memory_order_relaxed)) {
+                // 診断用パススルー: plugin 経由せずそのままコピー
+                std::memcpy(output.data(), input.data(), aligned * sizeof(float));
+            } else if (loader_ && !loader_->process_block(input.data(), output.data(), frames)) {
                 send_event_error("process_block failed");
                 audio_running_ = false;
                 break;
@@ -502,6 +514,8 @@ private:
     // audio
     std::thread audio_thread_;
     std::atomic<bool> audio_running_{false};
+    // 診断用 passthrough flag (= true なら plugin を経由しない)
+    std::atomic<bool> passthrough_{false};
 };
 
 }  // namespace miv

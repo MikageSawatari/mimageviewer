@@ -86,6 +86,10 @@ pub enum Cmd {
     /// bridge は view->onSize(rect) を呼んでプラグインの子ウィンドウを追従させる。
     #[serde(rename = "notify_host_resize")]
     NotifyHostResize { width: u32, height: u32 },
+    /// 診断用: bridge 内で plugin を経由せずに in→out 単純コピーする。
+    /// 歪みが消えれば plugin process が原因、残れば bridge パイプラインが原因。
+    #[serde(rename = "set_passthrough")]
+    SetPassthrough { enable: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
