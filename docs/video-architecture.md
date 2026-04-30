@@ -169,13 +169,17 @@ forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二
 - audio 出力失敗時はクロックを wall-clock fallback に切替
 - 音声バッファ ≥150ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
   (Phase 8.K で 500ms から下げた、典型的 audio_buf hover 帯に合わせた)
-- `fill_output` の silence 範囲 (Phase 9.B/9.E):
-  - `!clock.is_playing()` 早期 return: PAUSED / EOF (clock.set_playing(false) 経路)
-  - engine_state が **LOADING / IDLE** の warmup gate: silence + `next_pts_secs` 進行 skip
-    (= cpal pre-fill burst による pace_now drift 抑止)
-  - Buffering / Seeking / Paused / Eof 中の音声は他経路 (clock.is_playing() 早期 return) で
-    silence される。Buffering 期間で silence を強制すると forward seek deadlock を起こすため
-    LOADING/IDLE のみに限定 (Phase 9.E で確定)。
+- VST3 plugin chain 統合 (v0.9.0+): `audio-pump` thread が `audio_rx` から受領した
+  AudioFrame を `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた
+  処理済みサンプルを ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer
+  1.5s で吸収)
+- `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
+  - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
+    `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want
+    分進める」バグを修正、上流で正確化)。
+  - 早期 return: `!clock.is_playing()` (= PAUSED / EOF) と `pump_seek_serial < clock_serial`
+    (= pre-seek サンプル全消去) のみ。LOADING/IDLE silence gate は撤去 (= 上流 bookkeeping
+    で対処済)。詳細は [docs/video-engine-redesign.md] の「Phase 9 後の Post-cleanup refactor」節。
 
 #### `clock.rs` (`AvClock` — 薄い facade)
 - 公開 API は変更しないまま内部実装を `engine/` に委譲する **薄い facade**。
@@ -183,8 +187,18 @@ forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二
   - 時刻計算 (`now_secs` / `set_audio_pts` / `set_fallback_anchor` / `notify_seek_completed` の anchor 部分) → `engine::clock::MasterClock`
   - 音声バッファ会計 (`set_audio_pump_buf_secs` / `add_audio_tx_queued_secs` / `total_audio_buffer_secs`) → `engine::audio_bookkeeping::AudioBookkeeping`
 - AvClock 自身が保持する状態:
-  - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_serial` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と内部 epoch で並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
+  - **`seek_serial: Arc<AtomicU64>`** (counter consolidation 後): `EngineActor` と
+    **同一インスタンスを共有**。`AvClock::request_seek` で fetch_add(1)、
+    `EngineActor::handle_seek_request` は adaptive ロジックで「外部 bump 検知時は
+    state 更新のみ」「内部 bump 必要時は av_clock.request_seek 経由で publish」を
+    自動判別。詳細は [docs/video-engine-redesign.md] の「counter consolidation」節。
+  - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
   - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.effective_volume()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
+- `set_audio_pts` の wall-rate cap: defensive safety net として保持。bookkeeping は
+  上流 (`fill_output`) で正確化済だが、buffer 非空での pre-fill burst (= callback
+  連続 pop が wall 進行を超える) シナリオへの保険として `wall_dt + 5ms ジッタ` で
+  pts 進行を頭打ちにする。実機 perf-log smoke で「pace/wall ≈ 1.0 (= cap 無発動)」
+  確認後に撤去再検討。
 - ⚠️ **新規コードからは AvClock を直接呼び出さない**。新しい状態を扱う処理は必ず
   `EngineActor` 経由 (= `apply_command` / `handle_seek_request` / イベント送信) で書く。
   volume / muted を engine 側に移す改修も Phase 5+ で個別タスクとして扱う。

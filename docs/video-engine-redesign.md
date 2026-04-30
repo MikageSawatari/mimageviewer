@@ -734,6 +734,81 @@ seek を入れる際に effective) で 50ms sleep を待たないと新世代を
 
 修正: `seek_serial` check を park sleep より先に移動。
 
+### Phase 9 後の Post-cleanup refactor (counter consolidation + fill_output bookkeeping)
+
+Phase 9.A〜9.G + Codex P2 で対症療法ベースに修正したものを、構造的にクリーンアップする
+2 件の refactor を実施 (commit `10fd50f` / `9eff9b5` / `4bf7d58` / `07f55be`)。
+
+#### 1. Counter consolidation (`AvClock.seek_serial` と `EngineActor.current_seek_epoch`)
+
+**旧設計**: 2 個の seek 世代カウンタを「両方を bump する」規律で同期。Codex P2 で
+規律違反 (= 二重 ++) バグが見つかった経緯 (上記節を参照)。
+
+**新設計**: `Arc<AtomicU64>` を 1 個共有 + adaptive `handle_seek_request`:
+- `AvClock` と `EngineActor` で同じ `Arc<AtomicU64>` を保持
+- `EngineActor::handle_seek_request` は **adaptive** に動作:
+  - 観測した counter > `last_observed_serial` → 外部経路 (= caller が clock.request_seek
+    で既に bump 済) → 自身は bump せず state 更新のみ
+  - 観測した counter == `last_observed_serial` → 内部経路 (= loop replay / EOF replay /
+    resume) → `av_clock.request_seek` 経由で bump + SeekRequest publish + state 更新
+- `EngineActor` に `Arc<AvClock>` を持たせて内部経路の publish 経路を確保
+
+**caller pattern (mod.rs::seek 系)**: 旧と同じ `clock.request_seek` → `engine.handle_seek_request`
+の順。adaptive ロジックが規律違反を構造的に吸収するので、Codex P2 タイプのバグは再発し得ない。
+
+**追加テスト 2 件** (Codex review 提案):
+- `external_clock_bump_then_engine_handle_does_not_bump_again`: 外部経路で counter が
+  +1 のみであることを直接確認
+- `internal_engine_seek_publishes_seek_request_via_av_clock`: 内部経路で counter +1 +
+  AvClock.take_seek_request() で SeekRequest が decoder に届くことを確認
+
+#### 2. fill_output bookkeeping 上流移動 + 9.B/9.E silence gate 撤去
+
+**旧問題**: `fill_output` が cpal callback ごとに無条件で `next_pts_secs += want / samples_per_sec`
+を加算していた (= 「常に full 期間進める」)。silence 出力中も進むので pre-fill burst
+で anchor pts が wall の 2.5x 速で前進。
+
+**旧対症療法 (= 2 段防御)**:
+- Phase 9.A: `set_audio_pts` の wall-rate cap (= 後段で異常前進を頭打ち)
+- Phase 9.B/9.E: LOADING/IDLE 中 silence + `next_pts_secs` 進行 skip
+
+**新設計**: `fill_output` のドレインループで **実消費サンプル数** を `real_consumed`
+として計数し、bookkeeping は `real_consumed` 分のみ進める:
+
+```rust
+let mut real_consumed: usize = 0;
+while written < want {
+    match buf.samples.pop_front() {
+        Some(s) => { ...; real_consumed += 1; }
+        None => { /* silence rest */ break; }
+    }
+}
+if real_consumed == 0 { publish_buffer_secs(&buf, clock); return; }
+let consumed_secs = real_consumed as f64 / buf.samples_per_sec;
+buf.next_pts_secs += consumed_secs;
+// ... set_audio_pts
+```
+
+**撤去**:
+- Phase 9.B/9.E LOADING/IDLE silence gate (= 不要)
+- `audio.rs::start` / `fill_output` の `engine_state: Arc<AtomicU8>` 引数 (= silence gate
+  のためだけに渡していた)
+
+**保持** (Codex review P? 反映):
+- Phase 9.A wall-rate cap (`clock.rs::set_audio_pts`) は **defensive safety net**
+  として復活保持。Codex の指摘「`real_consumed` は callback で渡した量であり、
+  hardware が wall 時間どおりに再生済みの量ではない。buffer 非空での pre-fill burst
+  では callback 連続 pop が wall 進行を超える可能性が残る」を踏まえ、bookkeeping
+  上流化と cap 復活を組み合わせた belt-and-suspenders 構成。
+- 通常動作では `pts_secs - prev.pts_secs ≈ wall_dt` で cap 無効、異常系のみ発動。
+- 実機 perf-log smoke で「pace/wall ≈ 1.0 (= cap 無発動)」を確認できた段階で、
+  次のリファクタ機会に cap 撤去を再検討。
+
+**追加テスト 3 件** (Codex review 提案 + 回帰用):
+- `fill_output_empty_buffer_does_not_advance_pts`: 完全 underrun で pts 進行 0
+- `fill_output_partial_drain_advances_only_real_consumed`: 部分 drain で実消費分のみ
+- `fill_output_full_drain_advances_full_amount`: 完全 drain で旧版と同じ全消費量
+
 ## 検証
 
 ### Phase 2 完了時 (resume 未修正)
