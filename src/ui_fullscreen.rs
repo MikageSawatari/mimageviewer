@@ -1172,6 +1172,17 @@ impl App {
                             self.normalize_spread_position();
                         }
                     });
+
+                // ── VST3 プラグイン管理ウィンドウ (フルスクリーン中も表示) ──
+                // egui::Window はビューポート単位で z-order が独立しているので、
+                // フルスクリーンビューポート内で `show_vst3_manager` を呼ぶことで
+                // 動画の手前に管理パネルを描画できる。動画分析中に動画を見ながら
+                // プラグインを追加・順序入れ替え・バイパス切替・GUI 表示できる。
+                #[cfg(windows)]
+                {
+                    self.show_vst3_manager(ctx);
+                    self.vst3_pump_gui_signals();
+                }
             },
         );
 
