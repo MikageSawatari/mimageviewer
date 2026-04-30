@@ -34,10 +34,14 @@
 #include <thread>
 #include <vector>
 
+#include <xmmintrin.h> // _MM_SET_FLUSH_ZERO_MODE
+#include <pmmintrin.h> // _MM_SET_DENORMALS_ZERO_MODE
+
 #include <fcntl.h>
 #include <io.h>
 #include <objbase.h>  // CoInitializeEx
 #include <windows.h>
+#include <avrt.h>      // AvSetMmThreadCharacteristicsW (MMCSS) — windows.h の後
 
 #include "audio_pipe.h"
 #include "host_app.h"
@@ -379,8 +383,31 @@ private:
         std::vector<float> input(max_block_size * channels);
         std::vector<float> output(max_block_size * channels);
 
-        std::fprintf(stderr, "[BRIDGE] audio_loop start (max_block=%u, variable size)\n",
-                     max_block_size);
+        // ── audio thread を realtime 優先度に上げる ──
+        // VST3 host の責務: audio スレッドを GUI thread 等より高優先度にすることで、
+        // プラグイン GUI のアナライザ FFT などに割り込まれず一定周期で処理できる。
+        // これがないと thread スケジューラ jitter で audio 出力にノイズが乗る。
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+        // MMCSS (Multimedia Class Scheduler Service) に "Pro Audio" タスクとして
+        // 登録すると、Windows audio scheduler から特別待遇を受ける (= プリエンプト
+        // されにくい)。WASAPI Exclusive 系の audio app と同等の品質を確保。
+        DWORD mmcss_index = 0;
+        HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_index);
+        if (mmcss_handle) {
+            AvSetMmThreadPriority(mmcss_handle, AVRT_PRIORITY_HIGH);
+        }
+
+        // ── Denormal flush を有効化 ──
+        // プラグイン内部のフィルタ計算で 1e-30 オーダーの極小値が出ると CPU 計算が
+        // 極端に遅くなる (denormal handling)。FTZ/DAZ をセットして「極小値は 0 に
+        // 丸める」モードにすることで、フィルタが安定して定時間内に処理される。
+        // これがないと CPU spike → 周期的に処理が間に合わない → ノイズ。
+        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+        _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+
+        std::fprintf(stderr, "[BRIDGE] audio_loop start (max_block=%u, variable size, mmcss=%s)\n",
+                     max_block_size, mmcss_handle ? "ok" : "failed");
         std::fflush(stderr);
         uint64_t blocks_in = 0, blocks_processed = 0, blocks_out = 0;
         uint64_t timeouts_in = 0, timeouts_out = 0;
@@ -455,6 +482,9 @@ private:
             }
             ++blocks_out;
             report_now();
+        }
+        if (mmcss_handle) {
+            AvRevertMmThreadCharacteristics(mmcss_handle);
         }
         std::fprintf(stderr, "[BRIDGE] audio_loop exit\n");
         std::fflush(stderr);

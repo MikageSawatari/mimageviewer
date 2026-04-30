@@ -98,6 +98,7 @@ if(WIN32)
         ole32
         shell32
         advapi32
+        avrt        # AvSetMmThreadCharacteristicsW (MMCSS)
     )
 endif()
 
