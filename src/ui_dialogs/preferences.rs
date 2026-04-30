@@ -200,6 +200,9 @@ pub(crate) struct PreferencesState {
     pub start_trt_install_requested: bool,
     /// エンジンキャッシュ削除の確認ダイアログ表示中フラグ (Codex P3-2)。
     pub trt_cache_delete_confirm_open: bool,
+    /// VST3 プラグイン管理ウィンドウを開いてほしいフラグ (preferences の Apply/Cancel 後に
+    /// App 側で読み取って `show_vst3_manager = true` にする)。
+    pub open_vst3_manager_requested: bool,
 }
 
 impl PreferencesState {
@@ -260,6 +263,7 @@ impl PreferencesState {
             trt_engine_cache_size_mib,
             start_trt_install_requested: false,
             trt_cache_delete_confirm_open: false,
+            open_vst3_manager_requested: false,
         }
     }
 }
@@ -418,6 +422,10 @@ impl App {
                 let old_ai_backend = self.settings.ai_backend.clone();
                 let new_ai_backend = state.settings.ai_backend.clone();
 
+                // VST3 enable 状態の変化を検出してホットリロード (= bridge spawn / shutdown)。
+                let old_vst3_enabled = self.settings.vst3_enabled;
+                let new_vst3_enabled = state.settings.vst3_enabled;
+
                 // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
                 // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
                 // 開いたアプリ履歴等) や runtime (ツールバー選択 / ウィンドウ移動 / レーティング
@@ -459,6 +467,28 @@ impl App {
                     self.exif_cache.clear();
                 }
 
+                // VST3 enable 状態の変化反映 (= bridge spawn / shutdown)。
+                #[cfg(windows)]
+                if old_vst3_enabled != new_vst3_enabled {
+                    if new_vst3_enabled {
+                        // worker thread で enable する (bridge spawn は ~数百 ms 取るので
+                        // UI スレッドからは外す)。
+                        let bridge = self.dsp_bridge.clone();
+                        std::thread::Builder::new()
+                            .name("vst3-enable".into())
+                            .spawn(move || {
+                                if let Err(e) = bridge.enable() {
+                                    crate::logger::log(format!("vst3 enable failed: {e}"));
+                                }
+                            })
+                            .ok();
+                    } else {
+                        self.dsp_bridge.disable();
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = (old_vst3_enabled, new_vst3_enabled);
+
                 let new_susie = (
                     self.settings.susie_enabled,
                     self.settings.susie_allow_parallel,
@@ -490,6 +520,15 @@ impl App {
                 self.trt_install_state = Some(
                     crate::ui_dialogs::trt_install::TrtInstallState::new(target_sm),
                 );
+            }
+        }
+        // VST3 プラグイン管理ウィンドウ起動要求の処理。
+        // 環境設定ダイアログから「VST3 プラグイン管理を開く…」が押されたとき、
+        // 環境設定はそのまま開いたままで管理ウィンドウだけ表示する (両方並べて確認できるように)。
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.open_vst3_manager_requested {
+                ps.open_vst3_manager_requested = false;
+                self.show_vst3_manager = true;
             }
         }
     }
@@ -1471,6 +1510,55 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
          OFF にすると Windows 標準のサムネのみ採用 (= 既定動作)。\n\
          ピン留めしたフレーム (今後実装予定) は本設定に関わらず常に最優先。",
     );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    // ── VST3 プラグイン処理 (v0.9.0+) ──
+    ui.label(egui::RichText::new("VST3 プラグイン処理").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "動画音声を VST3 プラグインで加工してから再生します。\n\
+         LUFS 測定 (Youlean LM2 等) や EQ (FabFilter Pro-Q 等) で\n\
+         動画の音声をリアルタイムに分析・加工できます。",
+    );
+    ui.add_space(6.0);
+    if ui
+        .checkbox(
+            &mut s.vst3_enabled,
+            "VST3 プラグイン処理を有効にする",
+        )
+        .on_hover_text(
+            "ON: 動画再生時に選択した VST3 プラグインを通します。\n\
+             OFF (既定): プラグイン処理なし (= 通常再生)。\n\
+             有効化すると %COMMONPROGRAMFILES%\\VST3\\ などからプラグインをスキャンします。",
+        )
+        .changed()
+    {
+        // チェックボックスの変更は ApplyButton 経由で `dsp_bridge.enable/disable` に反映される。
+        // (preferences の OK / Apply で settings を保存する際に State 適用)
+    }
+    if s.vst3_enabled {
+        ui.add_space(4.0);
+        if let Some(path) = &s.vst3_plugin_path {
+            let name = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("(不明)");
+            ui.label(format!("選択中: {name}"));
+        } else {
+            ui.label("プラグイン未選択。「VST3 プラグイン管理」から選択してください。");
+        }
+        ui.add_space(4.0);
+        if ui
+            .button("VST3 プラグイン管理を開く…")
+            .on_hover_text("プラグイン一覧の検索・ロード・GUI 表示の管理ウィンドウを開きます。")
+            .clicked()
+        {
+            state.open_vst3_manager_requested = true;
+        }
+    }
 }
 
 fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {

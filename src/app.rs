@@ -2209,6 +2209,38 @@ pub struct App {
     /// `spawn_housekeeping` を 1 回呼んで false に倒す (Codex 指摘: VACUUM が
     /// supervisor の初回 scan と writer mutex を取り合うのを避ける)。
     pub(crate) housekeeping_armed: bool,
+
+    // ── VST3 プラグイン処理 (v0.9.0+) ──
+    /// DspBridge — VST3 ホスト bridge プロセスとの対話を管理する singleton。
+    /// `Arc<DspBridge>` 化して audio-pump thread と UI thread から共有アクセス。
+    /// `settings.vst3_enabled = false` の間は bridge プロセスを起動せず、
+    /// 音声経路もパススルー (= オーバーヘッドゼロ)。
+    /// 詳細は [docs/vst3-integration.md](../docs/vst3-integration.md) 参照。
+    #[cfg(windows)]
+    pub(crate) dsp_bridge: std::sync::Arc<crate::video::dsp::DspBridge>,
+    /// VST3 プラグイン管理ウィンドウの表示状態。
+    pub(crate) show_vst3_manager: bool,
+    /// VST3 プラグイン候補のスキャン結果 (lazy ロード、初回 enable で実行)。
+    #[cfg(windows)]
+    pub(crate) vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
+    /// VST3 プラグイン GUI ホスト (Win32 子ウィンドウ管理)。
+    /// 表示されているときだけ Some。
+    #[cfg(windows)]
+    pub(crate) vst3_gui_host: Option<crate::video::dsp::gui::GuiHost>,
+    /// VST3 プラグイン GUI の現在の HWND (`u64` 化)。`SetParent` 用に bridge へ渡す。
+    pub(crate) vst3_gui_hwnd: Option<u64>,
+    /// プラグイン GUI ホストウィンドウの × ボタン押下シグナル (= ウィンドウ閉じ要求)。
+    #[cfg(windows)]
+    pub(crate) vst3_gui_close_signal: Option<
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    >,
+    /// プラグイン GUI ホストウィンドウのリサイズシグナル (= 新クライアント領域サイズ)。
+    #[cfg(windows)]
+    pub(crate) vst3_gui_resize_signal: Option<
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>,
+    >,
+    /// 起動時に VST3 bridge enable + 自動ロードを 1 回だけ走らせるための gate。
+    pub(crate) vst3_init_kicked: bool,
 }
 
 impl Default for App {
@@ -2624,6 +2656,20 @@ impl Default for App {
             startup_init: None,
             startup_done: false,
             housekeeping_armed: false,
+
+            #[cfg(windows)]
+            dsp_bridge: crate::video::dsp::DspBridge::new(),
+            show_vst3_manager: false,
+            #[cfg(windows)]
+            vst3_discovered: Vec::new(),
+            #[cfg(windows)]
+            vst3_gui_host: None,
+            vst3_gui_hwnd: None,
+            #[cfg(windows)]
+            vst3_gui_close_signal: None,
+            #[cfg(windows)]
+            vst3_gui_resize_signal: None,
+            vst3_init_kicked: false,
         }
     }
 }
@@ -3214,6 +3260,53 @@ impl App {
 
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
     /// 1 度しか走らせない。
+    /// 起動時 1 回だけ呼び出される: settings.vst3_enabled が true なら bridge を spawn し、
+    /// settings.vst3_plugin_path に値があれば自動ロードする。
+    /// **worker thread で実行する** (= bridge spawn は ~数百 ms かかるので UI スレッドを止めない)。
+    #[cfg(windows)]
+    pub(crate) fn kick_off_vst3_startup(&mut self) {
+        if self.vst3_init_kicked {
+            return;
+        }
+        self.vst3_init_kicked = true;
+        if !self.settings.vst3_enabled {
+            return;
+        }
+        let bridge = self.dsp_bridge.clone();
+        let plugin_path = self.settings.vst3_plugin_path.clone();
+        let restore = self
+            .settings
+            .vst3_plugin_state
+            .as_ref()
+            .and_then(|b64| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            });
+        std::thread::Builder::new()
+            .name("vst3-startup".into())
+            .spawn(move || {
+                if let Err(e) = bridge.enable() {
+                    crate::logger::log(format!("vst3 startup enable failed: {e}"));
+                    return;
+                }
+                if let Some(path) = plugin_path {
+                    let sample_rate =
+                        crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
+                    if let Err(e) = bridge.load_plugin(
+                        &path,
+                        sample_rate,
+                        480,
+                        restore.as_deref(),
+                    ) {
+                        crate::logger::log(format!(
+                            "vst3 startup auto-load failed: {e} (プラグイン管理から再選択してください)"
+                        ));
+                    }
+                }
+            })
+            .ok();
+    }
+
     pub(crate) fn kick_off_startup_init(&mut self) {
         if self.startup_init.is_some() || self.startup_done {
             return;
@@ -7148,6 +7241,18 @@ impl App {
                 }
             }
 
+            // V: VST3 プラグイン GUI を表示/非表示トグル
+            // VST3 機能 (= settings.vst3_enabled) が有効、かつプラグインがロード済みのときだけ反応する。
+            // IME 変換中や TextEdit フォーカス中は無効化する。
+            #[cfg(windows)]
+            {
+                let v_pressed = ctx
+                    .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
+                if v_pressed && self.settings.vst3_enabled && !self.ime_input_active() {
+                    self.vst3_toggle_plugin_gui();
+                }
+            }
+
             // Ctrl+1〜0: 補正プリセットスロットを一括適用
             {
                 const SLOT_KEYS: [egui::Key; 10] = [
@@ -9617,6 +9722,11 @@ impl App {
                     } else {
                         None
                     },
+                    // VST3 plugin processing (optional). bridge は App lifetime で
+                    // 1 個だけ存在し、`is_enabled()=false` の間は audio-pump 側でゼロ
+                    // オーバーヘッドで no-op (= デフォルト挙動を壊さない)。
+                    #[cfg(windows)]
+                    Some(self.dsp_bridge.clone()),
                 );
                 if self.settings.video_start_muted {
                     player.set_muted(true);
@@ -13031,6 +13141,10 @@ impl eframe::App for App {
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
         self.poll_housekeeping_arm();
+        // VST3 起動時の bridge enable + 自動ロード (1 回だけ、settings.vst3_enabled が true のときのみ)。
+        // worker thread で実行されるので UI スレッドはブロックされない。
+        #[cfg(windows)]
+        self.kick_off_vst3_startup();
         if !self.startup_done {
             self.kick_off_startup_init();
             self.poll_startup_init();
@@ -13306,6 +13420,13 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
+        // VST3 プラグイン管理ウィンドウ (環境設定の「VST3 プラグイン管理を開く…」から起動)。
+        // 表示中は GUI ホストウィンドウのシグナル (close / resize) も pump する。
+        #[cfg(windows)]
+        {
+            self.show_vst3_manager(ctx);
+            self.vst3_pump_gui_signals();
+        }
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
         self.poll_trt_worker_notice();

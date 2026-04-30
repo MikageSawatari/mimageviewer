@@ -96,11 +96,14 @@ pub fn default_output_sample_rate() -> Option<u32> {
 /// emit する。EngineActor が Buffering → Playing に遷移するためのトリガ。
 /// 旧 Phase 3d の「1 度だけ emit」では Loading 中に届いた event が latch reset
 /// で消える race があったため、Phase 8.K で level 化した。
+/// 音声出力ストリームを起動する。`dsp_bridge` を渡すと audio-pump で VST3 プラグイン
+/// 処理を挿入する (= `is_enabled()=true` & `Loaded` のときのみ)。それ以外はパススルー。
 pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
+    #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
     let device = host
@@ -130,11 +133,13 @@ pub fn start(
     let cancel = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
-    // ── pump thread: audio_rx → buffer ──
+    // ── pump thread: audio_rx → (optional VST3 bridge) → buffer ──
     let pump_buffer = buffer.clone();
     let pump_cancel = cancel.clone();
     let pump_clock = clock.clone();
     let pump_engine_event_tx = engine_event_tx.clone();
+    #[cfg(windows)]
+    let pump_dsp_bridge = dsp_bridge;
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
@@ -145,6 +150,8 @@ pub fn start(
                 pump_cancel,
                 pump_clock,
                 pump_engine_event_tx,
+                #[cfg(windows)]
+                pump_dsp_bridge,
             );
         })
         .map_err(|e| format!("spawn audio-pump: {e}"))?;
@@ -184,6 +191,8 @@ fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
     clock.set_audio_pump_buf_secs(secs);
 }
 
+/// `dsp_bridge` が渡されていて enable 状態のとき、pump で受け取った frame を
+/// VST3 プラグイン経由に通してから AudioBuffer に push する。
 fn run_pump(
     rx: Receiver<AudioFrame>,
     shutdown_rx: crossbeam_channel::Receiver<()>,
@@ -191,7 +200,13 @@ fn run_pump(
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
+    // VST3 プラグイン処理用の出力バッファ (= bridge.process_block の dst)。
+    // frame サイズに応じて伸縮させるが、頻繁な realloc を避けるため
+    // 初期容量を 4096 (= 約 0.04 秒@48kHz stereo) で確保する。
+    #[cfg(windows)]
+    let mut fx_out: Vec<f32> = Vec::with_capacity(4096);
     // 厚さ ~1.5 秒のバッファを目安に流量制御する。
     // 0.5 秒だと cpal RT 周期と decoder 不安定さで underrun → ブチブチに。
     // 1.5 秒でも遅延体感は問題なく、シーク時にバッファ捨てるので問題なし。
@@ -236,6 +251,28 @@ fn run_pump(
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
+        // ── VST3 plugin processing (optional) ──
+        // bridge が enable=true & loaded のときだけ frame.samples を bridge に通す。
+        // 通常の動画再生 (= VST3 disable) ではゼロオーバーヘッド (= AtomicBool 1 回読み)。
+        #[cfg(windows)]
+        let processed_samples: std::borrow::Cow<'_, [f32]> = if let Some(b) = &dsp_bridge {
+            if b.is_enabled() && matches!(b.state(), crate::video::dsp::DspState::Loaded) {
+                fx_out.resize(frame.samples.len(), 0.0);
+                if let Err(e) = b.process_block(&frame.samples, &mut fx_out) {
+                    crate::logger::log(format!("vst3 process_block failed: {e}"));
+                    std::borrow::Cow::Borrowed(&frame.samples[..])
+                } else {
+                    std::borrow::Cow::Borrowed(&fx_out[..])
+                }
+            } else {
+                std::borrow::Cow::Borrowed(&frame.samples[..])
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&frame.samples[..])
+        };
+        #[cfg(not(windows))]
+        let processed_samples: &[f32] = &frame.samples;
+
         // 古い seek_serial の破棄 + push を 1 ロックで実行。
         // clock.current_seek_serial() より古いフレームは、audio_tx に
         // 積まれていた pre-seek の遅延フレームなので捨てる (新世代に追い付くため)。
@@ -260,7 +297,7 @@ fn run_pump(
             // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)
             buf.next_pts_secs = frame.pts_secs;
         }
-        buf.samples.extend(frame.samples.iter().copied());
+        buf.samples.extend(processed_samples.iter().copied());
         publish_buffer_secs(&buf, &clock);
 
         // ── BufferReady emit (Phase 3d / 8.K) ──

@@ -23,6 +23,8 @@
 pub mod audio;
 pub mod clock;
 pub mod decoder;
+#[cfg(windows)]
+pub mod dsp;
 pub mod engine;
 pub mod ffmpeg_loader;
 #[cfg(windows)]
@@ -162,6 +164,9 @@ impl VideoPlayer {
     /// `initial_volume` は 0.0-1.0。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
     /// `hw_decode` が true なら D3D11VA HW デコードを試行 (失敗時は SW にフォールバック)。
+    /// VST3 プラグイン処理用の DspBridge は `dsp_bridge` 引数で渡す。
+    /// `None` または `is_enabled()=false` なら audio-pump はパススルー。
+    /// `is_enabled()=true` のときは pump thread で `bridge.process_block` を呼ぶ。
     pub fn open(
         path: PathBuf,
         initial_volume: f64,
@@ -171,6 +176,7 @@ impl VideoPlayer {
         #[cfg(windows)] gpu_video_device: Option<
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
+        #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
     ) -> Self {
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
@@ -277,6 +283,8 @@ impl VideoPlayer {
             clock.clone(),
             engine_event_tx.clone(),
             engine_state_handle.clone(),
+            #[cfg(windows)]
+            dsp_bridge,
         ) {
             Ok(a) => Some(a),
             Err(e) => {

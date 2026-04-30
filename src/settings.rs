@@ -843,6 +843,27 @@ pub struct Settings {
     /// 6/10/16/20/26/30 のいずれかに切替可能。値が範囲外なら 10 にクランプ。
     #[serde(default = "default_video_tile_columns")]
     pub video_tile_columns: usize,
+
+    // ── VST3 プラグイン処理 (v0.9.0+) ──
+    //
+    // 動画音声を VST3 プラグインで加工 (LUFS 測定 / EQ 等)。デフォルト OFF。
+    // 詳細は docs/vst3-integration.md 参照。
+    /// VST3 プラグイン処理を有効にするか。OFF (= デフォルト) なら bridge プロセスを
+    /// 起動せず、音声経路もパススルー (オーバーヘッドゼロ)。
+    #[serde(default)]
+    pub vst3_enabled: bool,
+    /// 最後に選択した VST3 プラグインの絶対パス。
+    /// 起動時に自動ロードされる (= ユーザーが管理ウィンドウで都度選択し直す必要がない)。
+    #[serde(default)]
+    pub vst3_plugin_path: Option<String>,
+    /// プラグイン側の現在状態 (= IComponent::getState() chunk) を Base64 エンコードしたもの。
+    /// アプリ終了時に bridge から取得し、次回起動時に復元する (= EQ カーブ等が保持される)。
+    /// v0.9.0 では bridge 側 query_state プロトコル未実装のため未使用 (将来拡張)。
+    #[serde(default)]
+    pub vst3_plugin_state: Option<String>,
+    /// プラグイン GUI の表示状態。V キー / 管理ウィンドウのトグル状態を永続化する。
+    #[serde(default = "default_true")]
+    pub vst3_gui_visible: bool,
 }
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
@@ -1100,6 +1121,10 @@ impl Default for Settings {
             video_hw_decode: false,
             video_thumb_use_sidecar_image: true,
             video_tile_columns: default_video_tile_columns(),
+            vst3_enabled: false,
+            vst3_plugin_path: None,
+            vst3_plugin_state: None,
+            vst3_gui_visible: true,
         }
     }
 }
@@ -1205,6 +1230,12 @@ impl Settings {
         // ── 補正プリセット (フルスクリーン `P` / スロットダイアログで編集) ──
         self.global_preset = std::mem::take(&mut src.global_preset);
         self.preset_slots = std::mem::take(&mut src.preset_slots);
+        // ── VST3 プラグイン (専用管理ウィンドウ / V キーで編集) ──
+        // `vst3_enabled` は環境設定から触るので除外。それ以外は管理ウィンドウや
+        // V キーの runtime 操作で変わるので preferences 側を上書きする。
+        self.vst3_plugin_path = src.vst3_plugin_path.take();
+        self.vst3_plugin_state = src.vst3_plugin_state.take();
+        self.vst3_gui_visible = src.vst3_gui_visible;
     }
 
     pub fn save(&self) {

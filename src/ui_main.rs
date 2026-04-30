@@ -440,6 +440,15 @@ impl App {
                         self.show_preferences = true;
                         ui.close();
                     }
+                    // VST3 機能 ON のときだけ管理ウィンドウへのショートカットを出す
+                    // (= デフォルト OFF の利用者にはノイズにならない)。
+                    #[cfg(windows)]
+                    if self.settings.vst3_enabled {
+                        if ui.button("VST3 プラグイン管理…").clicked() {
+                            self.show_vst3_manager = true;
+                            ui.close();
+                        }
+                    }
                 });
 
                 ui.menu_button("ヘルプ", |ui| {

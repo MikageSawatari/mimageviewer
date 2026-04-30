@@ -33,6 +33,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - TRT エンジンビルダー (--tensorrt-build サブプロセス、初回1回)│
 │   - TRT 推論ワーカー (--tensorrt-infer-worker サブプロセス × 1)│
 │   - AI 推論スレッド (ort + DirectML、TRT は別プロセス経由)     │
+│   - VST3 host bridge プロセス (mimageviewer-vst3-host.exe × 1)│
+│     [docs/vst3-integration.md](vst3-integration.md)            │
 │   - 動画サムネイルスレッド, フォルダナビゲーション, etc.       │
 └───────────────┬──────────────────────────────────────────────┘
                 │ デコード結果を mpsc で返す

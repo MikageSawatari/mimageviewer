@@ -137,6 +137,14 @@ fn check_vendor_files() {
             "vendor/models/migan.onnx",
             "インストール済み環境の %APPDATA%\\mimageviewer\\models\\ からコピー",
         ),
+        // VST3 host bridge プロセス。CMake で `crates/vst3-host/` をビルドすると
+        // ここに配置される。本体 (`mimageviewer-core.exe`) に `include_bytes!` で
+        // 内包し、初回 VST3 enable 時に `%APPDATA%\mimageviewer\vst3\` へ展開する
+        // (PDFium / Susie ワーカーと同パターン)。
+        (
+            "vendor/vst3-host/mimageviewer-vst3-host.exe",
+            "cmake -S crates/vst3-host -B crates/vst3-host/build -G \"Visual Studio 17 2022\" -A x64 && cmake --build crates/vst3-host/build --config Release",
+        ),
     ];
 
     let missing: Vec<&(&str, &str)> = required

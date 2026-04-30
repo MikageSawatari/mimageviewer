@@ -636,6 +636,50 @@ x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコー
 ワーカー exe のパスを直接指定できる。`setup-susie-worker.sh` を走らせて
 `vendor/susie-worker/` に配置済みであれば、テストは自動でそれを拾う。
 
+## VST3 host bridge 管理 (v0.9.0+)
+
+動画音声に VST3 プラグインを挿入する機能 (LUFS 測定 / EQ / 等) のために、
+**C++ で書かれた bridge プロセス** (`mimageviewer-vst3-host.exe`) を別途配置する。
+詳細は [docs/vst3-integration.md](docs/vst3-integration.md) を参照。
+
+VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以降) ので mIV (MIT) と
+互換。bridge ビルド成果物は通常の `include_bytes!` で本体に内包する (PDFium / Susie ワーカーと
+同じパターン)。
+
+### セットアップ (メインビルド前に必須)
+
+```bash
+# 1. VST3 SDK を vendor/vst3sdk/ に取得 (~490 MB)
+bash scripts/setup-vst3-sdk.sh
+
+# 2. CMake で C++ bridge をビルド
+cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 17 2022" -A x64
+cmake --build crates/vst3-host/build --config Release
+# → vendor/vst3-host/mimageviewer-vst3-host.exe (~640 KB)
+```
+
+- 前提:
+  - Visual Studio 2022 (MSVC C++ デスクトップ開発ワークロード)
+  - CMake 3.20+
+  - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
+- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` (.gitignore)。
+  メイン exe のリリースビルド時に `include_bytes!` で内包される
+- 動作確認用: `crates/vst3-host-tester/` (Rust 単独 GUI exe)。本体に依存せずに
+  プラグインのロード / GUI / 音声パススルーをテストできる。`cargo run -p vst3-host-tester`
+
+### ライセンス対応 (リリース時)
+
+VST3 SDK 3.8.0+ は MIT 単一ライセンスなので、**追加の法務作業は不要**。
+ただし以下を環境設定→ヘルプの「ソフトウェア情報」と `installer/readme.txt` に追記する:
+
+```
+This software supports VST3 plugins via the Steinberg VST3 SDK
+(https://github.com/steinbergmedia/vst3sdk) under the MIT License.
+```
+
+**VST トレードマーク (ロゴ) は使わない**。「VST3 プラグインをサポート」テキスト表記のみで運用
+(= トレードマークガイドライン回避)。
+
 ## UI スナップショットテスト
 
 `tests/ui_snapshot.rs` + `tests/snapshots/*.png` に、`egui_kittest` を使った
@@ -852,6 +896,13 @@ mIV は **既にローカルに存在する動画ファイルを開くだけ** �
 10. FFmpeg LGPL shared build の更新確認（`bash scripts/setup-ffmpeg.sh check`、
     バージョンを上げる場合は `vendor/ffmpeg/VERSION` と `src/video/ffmpeg_loader.rs` の
     DLL 名が一致するか確認）。LGPL 通知の更新も忘れずに (本ファイル「FFmpeg LGPL DLL 管理」節)
+11. VST3 host bridge の確認 (v0.9.0+):
+    - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
+    - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み
+      (`cmake --build crates/vst3-host/build --config Release`)
+    - 商用プラグイン (Pro-Q 4 等) で実機確認: 環境設定→動画タブで VST3 を ON →
+      管理ウィンドウからプラグインをロード → 動画再生で音声がプラグインを通る /
+      V キーで GUI トグル
     ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
       不足していると `cargo build` が復旧手順付きで止まるようになっている。
 
