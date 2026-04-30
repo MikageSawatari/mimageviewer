@@ -29,8 +29,7 @@ pub enum EngineState {
     ///
     /// 設計 doc では `Buffering { resume_target: Option<f64> }` と書かれているが、
     /// `resume_target` は EngineActor の context (= seek 履歴) でカバーでき、
-    /// state 自身は payload を持たない方が `==` 比較・log 表記がシンプル
-    /// (Codex Phase 1b P2 反映)。
+    /// state 自身は payload を持たない方が `==` 比較・log 表記がシンプル。
     Buffering,
     /// 通常再生中。Clock は Audio または Wall で進行。
     Playing,
@@ -170,7 +169,7 @@ impl ReadinessLatch {
     /// `has_audio = false` の場合は `BufferReady` を待たない (= 動画のみ動画ファイル)。
     /// `is_ready=true` の必要十分条件として、anchor 構築に必要な `Option` (=
     /// `first_frame_pts`、有 audio なら `audio_anchor`) も同時に存在することを保証
-    /// する (= 呼び出し側の `expect` を不要にする、Codex Phase 1c P2 反映)。
+    /// する (= 呼び出し側の `expect` を不要にする)。
     pub fn is_ready(&self, has_audio: bool) -> bool {
         if !self.first_frame || self.first_frame_pts.is_none() {
             return false;

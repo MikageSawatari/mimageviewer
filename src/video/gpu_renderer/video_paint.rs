@@ -38,8 +38,7 @@ pub struct VideoPipeline {
 /// `callback_resources` にキャッシュしておく。
 /// 動画を切り替えると新しい `GpuVideoDevice` (= 新しい fence) になるので、
 /// `cached_gen` (プロセス内ユニーク世代 ID) を比較して必要に応じて再 open する。
-/// HANDLE 値だけだと kernel が値を再利用したときに stale な fence を使ってしまう
-/// (Codex P1 指摘)。
+/// HANDLE 値だけだと kernel が値を再利用したときに stale な fence を使ってしまう。
 struct VideoFenceInterop {
     cached_gen: u64,
     fence: windows_058::Win32::Graphics::Direct3D12::ID3D12Fence,
@@ -199,7 +198,7 @@ pub struct VideoPaintCallback {
     fence_shared_handle: HANDLE,
     /// このフレームに対応する fence 値。`ID3D12CommandQueue::Wait(fence, fence_value)` する。
     fence_value: u64,
-    /// プロセス内ユニーク fence 世代 ID (キャッシュ判定キー、Codex P1 反映)。
+    /// プロセス内ユニーク fence 世代 ID (キャッシュ判定キー)。
     fence_gen: u64,
     /// `prepare` で作った per-frame state を持つ。`Arc<Mutex>` で `&self` 互換。
     inner: Arc<std::sync::Mutex<VideoPaintInner>>,

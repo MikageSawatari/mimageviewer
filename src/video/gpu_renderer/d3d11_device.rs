@@ -97,7 +97,7 @@ unsafe impl Send for D3d11Frame {}
 impl Drop for D3d11Frame {
     fn drop(&mut self) {
         // NT shared HANDLE は CreateSharedHandle で取得しているので明示的に
-        // CloseHandle で解放しないと毎フレームのリークになる (= Codex P2-1 反映)。
+        // CloseHandle で解放しないと毎フレームのリークになる。
         // wgpu 側 (D3D12 OpenSharedHandle) は HANDLE 値を内部複製しているので、
         // ここで close しても D3D12 リソースは生存する。
         if !self.shared_handle.is_invalid() {
@@ -167,7 +167,7 @@ pub struct GpuVideoDevice {
     /// プロセスグローバルにユニークな fence の世代 ID。HANDLE 値だけだと
     /// kernel が値を再利用したときに stale な D3D12 fence をキャッシュ
     /// したまま使ってしまう (= sync race 復活、または永久 Wait)。
-    /// (Codex P1 指摘) wgpu 側は `fence_gen` で再 open 判定する。
+    /// wgpu 側は `fence_gen` で再 open 判定する。
     fence_gen: u64,
 }
 

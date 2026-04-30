@@ -8,7 +8,7 @@
 //! 一時停止・シークの状態もここに集約する。
 //!
 //! 大半のフィールドが atomic で Mutex 不要。f64 は `to_bits` / `from_bits` で
-//! `AtomicU64` に格納する。シーク要求 (target / direction / serial) はトリプルで
+//! `AtomicU64` に格納する。シーク要求 (target / serial) はペアで
 //! 整合性が必要なので [`Mutex<SeekRequest>`] で保護する。fill_output などの RT 経路は
 //! 触らないので RT パフォーマンスに影響しない。
 //!
@@ -50,10 +50,6 @@ use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SeekRequest {
     pub target_secs: f64,
-    /// `1` = 前方相対 (`target..` のキーフレームに飛ぶ。preroll なし)
-    /// `-1` = 後方相対 (`..target` のキーフレームに飛ぶ。preroll で target に進む)
-    /// `0` = 絶対 (シークバー直接クリック。`..target` のキーフレーム)
-    pub direction: i8,
     /// シーク世代。request 時点で `seek_serial` から取得・進めた値。
     pub serial: u64,
 }
@@ -79,8 +75,8 @@ pub struct AvClock {
     /// 互換用複製。新規読み手は EngineActor の `published_state` を見ること。
     playing: AtomicBool,
     /// pending なシーク要求。`None` = 未消費なし。
-    /// take/request の両方が Mutex を取り、整合性のある (target, direction, serial)
-    /// トリプルを観測できるようにする。
+    /// take/request の両方が Mutex を取り、整合性のある (target, serial)
+    /// ペアを観測できるようにする。
     seek_request: Mutex<Option<SeekRequest>>,
     /// 直近のシーク要求の世代。`request_seek` のたびに +1。
     /// 音声 RT コールバック (`fill_output`) と UI の `tick` がポーリングで読むので
@@ -95,7 +91,7 @@ pub struct AvClock {
     /// override がセットされた時の seek_serial。clear 時にこれと現在の seek_serial を
     /// CAS 比較し、**新しいシーク要求が来ていたら clear をスキップ**する。これで
     /// 「古い fill_output コールバックが、新たに発生した override を誤クリアする」
-    /// race を排除する (Codex P1 指摘)。
+    /// race を排除する。
     seek_override_serial: AtomicU64,
     /// 音声バッファ会計 (pump 残量 + tx queued)。
     /// Phase 2a で `AudioBookkeeping` に切り出し、AvClock は委譲のみ。動作は等価。
@@ -197,8 +193,8 @@ impl AvClock {
 
     /// 音声スレッドが「ちょうどこの PTS のサンプルを出力した」と報告する。
     /// **audio_active 状態は変更しない** — silent な fill_output (= 真の音声無し) で
-    /// この関数が呼ばれた場合、勝手に audio master 化してしまうのを防ぐため
-    /// (Codex 指摘)。activate は `notify_audio_active` 経由で明示的に行う。
+    /// この関数が呼ばれた場合、勝手に audio master 化してしまうのを防ぐため、
+    /// activate は `notify_audio_active` 経由で明示的に行う。
     ///
     /// ⚠️ 単調性ガード: 入力 pts が **前回 anchor の audio pts** より小さい (= 後退)
     /// 場合、前回値で固定して後退させない。post-seek の最初の数フレームで古い
@@ -262,9 +258,9 @@ impl AvClock {
     /// `set_fallback_anchor` から呼ばれる。`notify_seek_completed` の audio_active=false
     /// 経路もここを通る。
     ///
-    /// Codex Phase 2b P2 反映: 旧版は audio_active を見て Audio/Wall を選んでいたが、
-    /// `set_fallback_anchor()` の呼び出し直後に pump が `notify_audio_active()` した
-    /// 場合、video frame PTS が audio master anchor になる race があった。
+    /// 旧版は audio_active を見て Audio/Wall を選んでいたが、`set_fallback_anchor()`
+    /// の呼び出し直後に pump が `notify_audio_active()` した場合、video frame PTS が
+    /// audio master anchor になる race があった。
     /// この helper は **常に Wall** を書く。Audio source は `write_audio_anchor_at`
     /// 経由でのみ書ける。
     fn write_fallback_anchor_at(&self, pts: f64, wall: Instant) {
@@ -382,13 +378,10 @@ impl AvClock {
 
     /// シーク要求を出す。デコーダは [`AvClock::take_seek_request`] で取り出す。
     ///
-    /// `direction` はシーク方向のヒント:
-    ///   - `1` = 前方相対 (`seek_relative(+5)` 等)。decoder は `target_pts..` で
-    ///     target 以降のキーフレームに飛ぶ → preroll なしで即時表示
-    ///   - `-1` = 後方相対 (`seek_relative(-5)` 等)。decoder は `..target_pts` で
-    ///     target 以前のキーフレームに飛ぶ → preroll で target に進む
-    ///   - `0` = 絶対 (シークバー直接クリック)。decoder は `..target_pts`
-    pub fn request_seek(&self, target_secs: f64, direction: i8) {
+    /// 旧 API では `direction` 引数で前方/後方/絶対のヒントを渡していたが、
+    /// Phase 9.F で「方向に関係なく **常に backward+preroll**」に統一したため、
+    /// decoder 側で direction を参照しなくなった。引数は撤去済み。
+    pub fn request_seek(&self, target_secs: f64) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
@@ -401,7 +394,6 @@ impl AvClock {
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
             target_secs: clamped,
-            direction,
             serial: new_serial,
         });
         if crate::perf::is_enabled() {
@@ -412,7 +404,6 @@ impl AvClock {
                 0,
                 &[
                     ("target", serde_json::Value::from(clamped)),
-                    ("direction", serde_json::Value::from(direction as i64)),
                     ("serial", serde_json::Value::from(new_serial as i64)),
                 ],
             );
@@ -485,7 +476,7 @@ impl AvClock {
         //
         // 逆順 (serial → bits → CAS) だと、serial load から bits load の間に
         // request_seek が来ると、cur_bits が **新世代 target** になり、後続の CAS が
-        // 成功して新 override を誤って消してしまう (Codex 指摘の race)。
+        // 成功して新 override を誤って消してしまう (race)。
         //
         // bits を先に取れば、その後 request_seek が割り込んでも:
         //   - serial が進む → completed_serial < override_serial で早期 return、または
@@ -493,7 +484,7 @@ impl AvClock {
         let cur_bits = self.seek_target_override_bits.load(Ordering::Acquire);
         if cur_bits == SEEK_NONE {
             // 通常再生中の audio/video コールバックも毎フレーム到達するため
-            // ここでは perflog しない (Codex P2 指摘の flooding 回避)。
+            // ここでは perflog しない (= flooding 回避)。
             return;
         }
         let override_serial = self.seek_override_serial.load(Ordering::Acquire);

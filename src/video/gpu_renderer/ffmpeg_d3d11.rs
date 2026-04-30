@@ -75,7 +75,7 @@ pub unsafe fn create_ffmpeg_hw_device_ctx(
         ));
     }
 
-    // 1. すべての COM ポインタを **AddRef 前に** 取得する (Codex P3 反映)。
+    // 1. すべての COM ポインタを **AddRef 前に** 取得する。
     //    キャストや GetImmediateContext の失敗時に AddRef したまま手放してしまうリーク
     //    を避ける。全ポインタが揃ってから一括 AddRef + d3d11_ctx に書き込む。
     let imm_ctx: ID3D11DeviceContext = unsafe { gpu_dev.raw_device().GetImmediateContext() }

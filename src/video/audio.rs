@@ -25,7 +25,7 @@ use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
 
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
-/// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする (Codex 指摘)。
+/// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
 pub struct AudioOutput {
     /// cpal Stream は !Send。Option にして drop 時に明示的に落とす。
     stream: Option<cpal::Stream>,
@@ -282,7 +282,8 @@ fn run_pump(
         if frame.seek_serial < buf.pump_seek_serial || frame.seek_serial < clock_serial {
             continue;
         }
-        // audio master 化は **stale 破棄を通過したフレーム** で実施 (Codex 指摘)。
+        // audio master 化は **stale 破棄を通過したフレーム** で実施
+        // (= pre-seek の古い frame で audio master をフラグ立てない)。
         if !activated {
             clock.notify_audio_active();
             activated = true;
@@ -340,7 +341,7 @@ fn fill_output(
 ) {
     // 先に clock の seek_serial を読む。post-seek 直後で pump がまだ古い世代の
     // バッファを抱えている場合は、ここで全消去して silence を出す
-    // (Codex 指摘: 古い samples を再生して set_audio_pts でクロックを巻き戻す経路を塞ぐ)。
+    // (= 古い samples を再生して set_audio_pts でクロックを巻き戻す経路を塞ぐ)。
     let clock_serial = clock.current_seek_serial();
     let mut buf = buffer.lock().unwrap();
 
@@ -379,7 +380,7 @@ fn fill_output(
     //   2. pump が backpressure → audio_tx (32) full → audio decode が send block
     //   3. audio_pkt_tx (64) full → demux が send block
     //   4. demux が新 packet 読まず take_seek_request 走らない
-    //   5. **forward seek の 1 枚目が永久に届かない deadlock** (Codex 解析で特定)
+    //   5. **forward seek の 1 枚目が永久に届かない deadlock**
     //
     // pre-fill burst による pace_now drift は Phase 9.A の wall-rate cap
     // (= `set_audio_pts` で anchor pts 進行を wall 進行に制限) で十分カバー済。
@@ -422,7 +423,7 @@ fn fill_output(
     let pts_now = buf.next_pts_secs;
     let pump_serial = buf.pump_seek_serial;
     // publish は Mutex 内で行う。Mutex 外に出すと run_pump の push 後 publish が
-    // stale な fill_output 側 publish に上書きされる race がある (Codex 指摘)。
+    // stale な fill_output 側 publish に上書きされる race がある。
     // overhead = 1 atomic store ≈ 1 ns 程度なので RT への影響は無視できる。
     publish_buffer_secs(&buf, clock);
     drop(buf);

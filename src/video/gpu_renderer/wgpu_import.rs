@@ -80,7 +80,7 @@ pub unsafe fn import_shared_d3d11_texture(
 
     // windows 0.61 と 0.58 の HANDLE は **size_of/align_of 同一** で、内部は
     // どちらも単一の isize/ptr フィールドの transparent newtype。値を取り出して
-    // 0.58 側の HANDLE に詰め直して使う (Codex P3 反映で assertion 化)。
+    // 0.58 側の HANDLE に詰め直して使う (assertion で size/align 一致を強制)。
     const _: () = assert!(
         std::mem::size_of::<WinHandle061>() == std::mem::size_of::<WinHandle058>(),
         "HANDLE size mismatch between windows 0.61 and 0.58"

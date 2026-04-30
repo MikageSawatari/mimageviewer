@@ -116,7 +116,7 @@ impl TileThumbnailWorker {
 
 impl Drop for TileThumbnailWorker {
     fn drop(&mut self) {
-        // Codex P5.5 M3 反映: UI スレッドから join を待つと数百 ms ブロックする
+        // UI スレッドから join を待つと数百 ms ブロックする
         // (= ffmpeg の seek/decode/swscale が cancel チェック粒度より長い)。
         // worker thread は cancel フラグを Acquire で 1 タイムスタンプ毎に確認するので、
         // 切り替え後は数百 ms 以内に自然終了する。Drop では join せず detach 扱いに

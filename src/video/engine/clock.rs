@@ -12,7 +12,7 @@
 //! - anchor 書き込みは **EngineActor のみ** (= `pub(super) fn set_anchor`)。
 //!   AudioActor / DecoderActor / UI tick からは絶対に呼ばない。
 //!   この制約は `pub(super)` で `video::engine` モジュール内に閉じることで型レベルに
-//!   強制する (Codex Phase 1a P1 反映)。
+//!   強制する。
 //! - `now_secs()` の単調性は **caller (= EngineActor) の書き込み順** に依存。
 //!   MasterClock 自身は単調性ガードを持たない (= 旧 `AvClock::set_audio_pts` の
 //!   `pts_secs.max(self.now_secs())` のような暗黙ガードは廃止)。
@@ -138,8 +138,8 @@ impl MasterClock {
     /// **EngineActor 専用**: anchor を全置換する。
     ///
     /// 他のスレッド (decoder/audio/UI) からは呼ばないこと。最終目標は `pub(super)`
-    /// で `video::engine` モジュール外に漏らさないことだが (Codex Phase 1a P1 反映)、
-    /// **`pub(crate)`** に緩めた状態を維持する:
+    /// で `video::engine` モジュール外に漏らさないことだが、現状は **`pub(crate)`**
+    /// に緩めた状態を維持する:
     /// `AvClock` (= video::engine 外、`src/video/clock.rs`) が facade として
     /// MasterClock を所有し、旧 `set_audio_pts` 等から内部委譲する必要があるため。
     /// Phase 4 では AvClock を撤去せず薄い facade として残す方針に軌道修正したため

@@ -117,7 +117,7 @@ pub struct VideoPlayer {
     /// `gpu_latest_info()` 経由で view-only 情報 (handle, dims) を得る。
     /// 次の GPU フレームが到着して置き換わるまで本フィールドが保持し、
     /// 置換時に旧 D3d11Frame::Drop で HANDLE を CloseHandle する (= UI が同 handle を
-    /// 描画している期間は HANDLE が valid であることを保証、Codex P1 反映)。
+    /// 描画している期間は HANDLE が valid であることを保証する)。
     #[cfg(windows)]
     gpu_latest: Option<crate::video::gpu_renderer::D3d11Frame>,
 }
@@ -243,7 +243,7 @@ impl VideoPlayer {
         let engine = Arc::new(Mutex::new(EngineActor::new(opts)));
         // begin_loading() を decoder::spawn の **前** に呼ぶ。これにより decoder
         // thread が起動した瞬間から `engine_state_handle` を `Loading` で観察できる
-        // (= Idle を一瞬観察する race を排除、Codex Phase 3d P2 反映)。
+        // (= Idle を一瞬観察する race を排除する)。
         let engine_state_handle = {
             let mut g = engine.lock().unwrap();
             g.begin_loading();
@@ -420,19 +420,18 @@ impl VideoPlayer {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
-            self.clock.request_seek(0.0, 0);
+            self.clock.request_seek(0.0);
             self.clock.set_playing(true);
-            // engine 側にも seek を伝えて epoch を同期させる (Codex Phase 3d P2 反映)。
-            // user 操作の seek は autoplay 強制 (Codex Phase 3e P2 反映: seek 後に
-            // Paused にならないように)。
+            // engine 側にも seek を伝えて epoch を同期させる。user 操作の seek は
+            // autoplay 強制 (= seek 後に Paused にならないように)。
             //
-            // ⚠️ 呼び出し順は handle_seek_request → apply_command(Play) (Codex P2 反映、
-            // 2026-04-30): 先に apply_command(Play) を呼ぶと state=Eof なら handle_play
-            // が内部で handle_seek_request(0.0) を呼んで epoch++ し、続く明示
-            // handle_seek_request で **epoch が二重 ++** され、decoder からの
-            // SeekCompleted{epoch=serial} が stale 判定されて捨てられる。
-            // 先に handle_seek_request を呼べば state=Seeking{0.0} に遷移し、続く
-            // apply_command(Play) は Seeking arm の autoplay=true 設定だけ走る。
+            // ⚠️ 呼び出し順は handle_seek_request → apply_command(Play):
+            // 先に apply_command(Play) を呼ぶと state=Eof なら handle_play が内部で
+            // handle_seek_request(0.0) を呼んで epoch++ し、続く明示 handle_seek_request
+            // で **epoch が二重 ++** され、decoder からの SeekCompleted{epoch=serial}
+            // が stale 判定されて捨てられる。先に handle_seek_request を呼べば
+            // state=Seeking{0.0} に遷移し、続く apply_command(Play) は Seeking arm の
+            // autoplay=true 設定だけ走る。
             let mut g = self.engine.lock().unwrap();
             g.handle_seek_request(0.0);
             g.apply_command(engine::actor::TransportCommand::Play);
@@ -459,41 +458,41 @@ impl VideoPlayer {
         }
     }
 
-    /// 絶対シーク (シークバークリック等)。`direction = 0` で `..target` のキーフレーム
-    /// にスナップ。target は `[0, duration - 0.1s)` にクランプされる。
+    /// 絶対シーク (シークバークリック等)。`..target` のキーフレームにスナップ
+    /// (Phase 9.F 以降、direction に関係なく **常に backward+preroll**)。
+    /// target は `[0, duration - 0.1s)` にクランプされる。
     /// 一時停止中なら自動的に再生再開する (post-EOF / pause からの seek を
     /// ユーザー操作 1 回で完結させる)。
     pub fn seek(&self, target_secs: f64) {
         let clamped = self.clamp_seek_target(target_secs);
-        self.clock.request_seek(clamped, 0);
+        self.clock.request_seek(clamped);
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
-        // engine の seek_epoch も進めて、AvClock seek_serial と同期させる
-        // (Codex Phase 3d P2 反映)。user 操作 seek は autoplay 強制
-        // (Codex Phase 3e P2 反映: AvClock 側で playing=true にしているため整合性)。
+        // engine の seek_epoch も進めて、AvClock seek_serial と同期させる。
+        // user 操作 seek は autoplay 強制 (AvClock 側で playing=true にしているため整合性)。
         // 呼び出し順注意: handle_seek_request → apply_command(Play)
-        // (Codex P2 反映、2026-04-30、詳細は toggle_play を参照)。
+        // (詳細は toggle_play を参照)。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(clamped);
         g.apply_command(engine::actor::TransportCommand::Play);
     }
 
-    /// 相対シーク。`delta_secs > 0` なら前方 (`target..` のキーフレーム = preroll なし)、
-    /// `delta_secs < 0` なら後方 (`..target` のキーフレーム + preroll で target に進む)。
+    /// 相対シーク。Phase 9.F 以降、前方/後方どちらでも **常に backward+preroll**
+    /// (= `..target` のキーフレーム + preroll で target に進む) に統一されたため、
+    /// `delta_secs` の符号は target 計算にしか使われない。
     /// 一時停止中なら自動的に再生再開する。
     pub fn seek_relative(&self, delta_secs: f64) {
         let cur = self.position();
         let raw = (cur + delta_secs).max(0.0);
         let target = self.clamp_seek_target(raw);
-        let direction: i8 = if delta_secs > 0.0 { 1 } else { -1 };
-        self.clock.request_seek(target, direction);
+        self.clock.request_seek(target);
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
-        // user 操作 seek は autoplay 強制 (Codex Phase 3e P2 反映)。
+        // user 操作 seek は autoplay 強制。
         // 呼び出し順注意: handle_seek_request → apply_command(Play)
-        // (Codex P2 反映、2026-04-30、詳細は toggle_play を参照)。
+        // (詳細は toggle_play を参照)。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(target);
         g.apply_command(engine::actor::TransportCommand::Play);
@@ -561,11 +560,10 @@ impl VideoPlayer {
                         // engine の InfoReceived ハンドラ内で並行処理される。
                         // (= 二重で seek が走らないよう、Phase 3d で旧経路を撤去する。)
                         if !self.info_event_emitted {
-                            // Codex Phase 3d P1 反映: audio output 起動に失敗した場合
-                            // (`self.audio.is_none()`) は has_audio=false で engine に
-                            // 通知する。さもなくば engine が BufferReady を永久に待ち
-                            // Buffering で固まる (= audio が決して再生されないため
-                            // audio.rs から BufferReady が出ない)。
+                            // audio output 起動に失敗した場合 (`self.audio.is_none()`)
+                            // は has_audio=false で engine に通知する。さもなくば engine が
+                            // BufferReady を永久に待ち Buffering で固まる (= audio が決して
+                            // 再生されないため audio.rs から BufferReady が出ない)。
                             let has_audio_effective =
                                 info.has_audio && self.audio.is_some();
                             let _ = self.engine_event_tx.try_send(EngineEvent::Decoder(
@@ -592,12 +590,12 @@ impl VideoPlayer {
                             if resume >= crate::app::VIDEO_RESUME_MIN_POSITION_SECS
                                 && !near_end
                             {
-                                self.clock.request_seek(resume, 0);
-                                // engine の epoch も同時に進めて AvClock と同期
-                                // (Codex Phase 3d P2 反映: pre-info user seek 経路で
-                                // ズレるリスクは pending_resume_secs.take() の他に
-                                // 経路がないので、ここで二重 seek を許容しても重複
-                                // epoch++ 1 回分の副作用のみで害はない)。
+                                self.clock.request_seek(resume);
+                                // engine の epoch も同時に進めて AvClock と同期。
+                                // pre-info user seek 経路でズレるリスクは
+                                // pending_resume_secs.take() の他に経路がないので、
+                                // ここで二重 seek を許容しても重複 epoch++ 1 回分の
+                                // 副作用のみで害はない。
                                 //
                                 // **意図的に apply_command(Play) は呼ばない**:
                                 // open-time の resume は user 操作ではなく自動復元
@@ -631,7 +629,7 @@ impl VideoPlayer {
 
         // ── 動画フレーム取得・表示判定 ──
         //
-        // 設計 (Codex 指摘の「FIFO 連続性」を保証):
+        // 設計 (FIFO 連続性を保証):
         //   1. video_rx から取得可能なフレームを `future_frames` キューに push
         //      (キュー上限まで)。channel から取り出したフレームは drop しない。
         //   2. キュー先頭から「pts <= now + 許容差」のものを順に latest_renderable
@@ -722,13 +720,12 @@ impl VideoPlayer {
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 // ループ再生 ON: 先頭にシークし続行 (= 設定の video_loop)。
-                self.clock.request_seek(0.0, 0);
+                self.clock.request_seek(0.0);
                 self.clock.set_playing(true);
                 // engine 側の epoch も同期 (= AvClock seek_serial と engine
-                // current_seek_epoch の不整合を防ぐ、Codex Phase 3d P2 反映)。
-                // loop 周回も autoplay 強制 (Codex Phase 3e P2 反映)。
+                // current_seek_epoch の不整合を防ぐ)。loop 周回も autoplay 強制。
                 // 呼び出し順注意: handle_seek_request → apply_command(Play)
-                // (Codex P2 反映、2026-04-30、詳細は toggle_play を参照)。
+                // (詳細は toggle_play を参照)。
                 let mut g = self.engine.lock().unwrap();
                 g.handle_seek_request(0.0);
                 g.apply_command(engine::actor::TransportCommand::Play);
@@ -964,7 +961,7 @@ impl VideoPlayer {
     /// マウスホイール等で次の動画に瞬時に切り替わる時、 fs_cache 上の旧 entry の
     /// Drop が「フィールド宣言順」(audio が後ろのため最後) で行われると、cpal stream
     /// が止まるまでの数百 ms のあいだ前動画の音声が hardware buffer から流れ続ける
-    /// 現象が観測される (Codex 指摘)。先に shutdown() を呼ぶことで、entry を
+    /// 現象が観測される。先に shutdown() を呼ぶことで、entry を
     /// fs_cache から消す瞬間に音声が止まる。
     pub fn shutdown(&mut self) {
         self.cancel

@@ -694,7 +694,6 @@ fn run_decoder(
         if let Some(req) = clock.take_seek_request() {
             let super::clock::SeekRequest {
                 target_secs,
-                direction,
                 serial,
             } = req;
             // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
@@ -716,10 +715,10 @@ fn run_decoder(
                 if ret >= 0 { Ok(()) } else { Err(ffmpeg::Error::from(ret)) }
             };
 
-            // Phase 9.F (2026-04-30): direction に関係なく **常に backward+preroll** を
-            // 使う。旧コードは `direction > 0` (= 前方相対) で `input.seek(target..)`
-            // (= avformat_seek_file with min_ts=target、target 以降の keyframe に着地)
-            // を使い、preroll なしで「最寄り keyframe から再生」する設計だった。
+            // Phase 9.F (2026-04-30): 前方/後方/絶対に関係なく **常に backward+preroll**
+            // を使う。旧コードは前方相対で `input.seek(target..)` (= avformat_seek_file
+            // with min_ts=target、target 以降の keyframe に着地) を使い、preroll なしで
+            // 「最寄り keyframe から再生」する設計だった。
             //
             // しかし forward seek は典型的な GOP (1-3 秒) で **target+0.5〜2 秒の
             // keyframe** に着地し、video 1 枚目 pts >> target になる。一方 mp4 の
@@ -731,15 +730,13 @@ fn run_decoder(
             // 結果として transition_to_playing 時に anchor.pts (= audio_pts) が
             // video frame pts より **数百 ms 〜数秒** 早くなり、UI tick の
             // `pts <= now + lead_tol` 判定で video frame が future 扱いになって
-            // 表示が止まり、音声だけ進んで video が「早送りで追いつく」現象に
-            // (= ユーザー報告)。
+            // 表示が止まり、音声だけ進んで video が「早送りで追いつく」現象に。
             //
             // backward+preroll なら video/audio 両方が **target 直前の keyframe** で
             // 始まり drop_before_secs で target にトリム → 確実に同位置で再生開始。
             // GOP が長い動画では preroll decode のために 0.5〜3 秒余分にかかるが、
             // SW デコードでも 30fps wall × 数秒 = ~100ms 程度の遅延に収まり実用上
             // 問題ない。
-            let _ = direction; // 互換のため引数は残すが、実際は方向不問
             let mut seek_result = backward(&mut input);
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
@@ -750,7 +747,7 @@ fn run_decoder(
                 seek_result = input.seek(target_pts, target_pts..);
             }
             crate::logger::log(format!(
-                "seek: target={target_secs:.3}s dir={direction} serial={serial} result={seek_result:?}"
+                "seek: target={target_secs:.3}s serial={serial} result={seek_result:?}"
             ));
             if seek_result.is_err() {
                 // 完全失敗: override を明示解除しないと pace_now が target 固定で
@@ -765,7 +762,6 @@ fn run_decoder(
                         &[
                             ("target", serde_json::Value::from(target_secs)),
                             ("serial", serde_json::Value::from(serial as i64)),
-                            ("direction", serde_json::Value::from(direction as i64)),
                         ],
                     );
                 }
@@ -801,7 +797,7 @@ fn run_decoder(
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
             // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
-            // 経路が monotonic-clamp で進まなくなる (Codex P1 指摘)。
+            // 経路が monotonic-clamp で進まなくなる。
             // 失敗経路は anchor 据え置き + 音声会計だけリセットし、後続の最初の有効
             // frame / sample が set_audio_pts / set_fallback_anchor 経由で自然に
             // 現在位置にアンカーし直す。
@@ -812,7 +808,7 @@ fn run_decoder(
             }
             // Phase 3e: engine にも SeekCompleted を通知 (= Seeking → Buffering 遷移)。
             // これがないと engine は永久 Seeking 状態に張り付き、pacing escape が
-            // 解除されない (Codex Phase 3e P1 反映)。
+            // 解除されない。
             let _ = engine_event_tx.try_send(
                 crate::video::engine::EngineEvent::Decoder(
                     crate::video::engine::state::DecoderEvent::SeekCompleted {
@@ -1084,10 +1080,10 @@ fn run_video_decode(
                                 if cancel.load(Ordering::Acquire) {
                                     break;
                                 }
-                                // ⚠️ seek_serial check は **park sleep より先** (Codex P? 反映、
-                                // 2026-04-30): paused 状態のまま seek 要求が来たケース
-                                // (将来 pause 維持 seek を入れたとき) でも、park sleep の
-                                // 50ms を待たずに即 break して新世代を処理できるようにする。
+                                // ⚠️ seek_serial check は **park sleep より先**:
+                                // paused 状態のまま seek 要求が来たケース (将来 pause 維持
+                                // seek を入れたとき) でも、park sleep の 50ms を待たずに
+                                // 即 break して新世代を処理できるようにする。
                                 if clock.current_seek_serial() != current_seek_serial {
                                     new_seek_pending = true;
                                     break;
@@ -1139,7 +1135,7 @@ fn run_video_decode(
                                 // ahead が 0.5-2 秒になり、かつ audio buffer が満杯
                                 // (= 一時停止後など) のとき、`!post_seek_frame_sent` 経路が
                                 // 発火せず 1 枚目が送出できない → override が永久残留 →
-                                // deadlock。Codex 解析で特定。
+                                // deadlock になっていた。
                                 if clock.is_seeking() && !post_seek_frame_sent {
                                     break;
                                 }
@@ -1355,7 +1351,7 @@ fn run_video_decode(
             let mut in_audio_escape = false;
             let mut new_seek_pending = false;
             // Phase 9.C/D: pause-park (詳細は GPU 経路の同コメント参照)。
-            // seek_serial check は park sleep より先 (Codex P? 反映、2026-04-30)。
+            // seek_serial check は park sleep より先。
             loop {
                 if cancel.load(Ordering::Acquire) {
                     break;
@@ -1682,7 +1678,7 @@ fn emit_audio_frame(
         duration_secs,
     };
     // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
-    // 競合しないよう順序を保つ。失敗時はロールバック (Codex 指摘)。
+    // 競合しないよう順序を保つ。失敗時はロールバック。
     clock.add_audio_tx_queued_secs(duration_secs);
     if audio_tx.send(frame_out).is_err() {
         clock.add_audio_tx_queued_secs(-duration_secs);

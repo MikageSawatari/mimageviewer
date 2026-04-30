@@ -150,7 +150,7 @@ impl ThumbnailWorker {
     /// 「この `target_secs` のサムネが欲しい」と通知する。
     /// `pending_target_bits` を最新値で上書きし、wake channel を try_send で叩く。
     /// 上書きセマンティクスなので「マウス連続移動で古い target が処理待ちで残り
-    /// 最新が落ちる」(Codex 指摘) ことが起きない。
+    /// 最新が落ちる」ことが起きない。
     pub fn request(&self, target_secs: f64) {
         self.pending_target_bits
             .store(target_secs.to_bits(), Ordering::Release);
@@ -286,7 +286,7 @@ fn run_worker(
         let mut frames_tried = 0;
         // video packet を最大 120 個まで処理する (= keyframe → target が
         // 数秒先でも届く余裕)。subtitle/data ストリームのパケットは数えない
-        // (Codex 指摘: take(120) を全 packet で数えると音声/字幕で枠を食い潰す)。
+        // (= take(120) を全 packet で数えると音声/字幕で枠を食い潰すため)。
         for item in input.packets() {
             if cancel.load(Ordering::Acquire) {
                 return;

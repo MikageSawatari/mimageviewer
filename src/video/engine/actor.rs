@@ -204,7 +204,7 @@ impl EngineActor {
     ///
     /// **重要**: latch は `current_seek_epoch` でリセットする。BufferStarved 等の
     /// 非 seek 経路で再 buffering する場合に、前回 ready 済みの latch が残ったまま
-    /// 即 Playing に戻る race を防ぐ (Codex Phase 1c P1 反映)。
+    /// 即 Playing に戻る race を防ぐ。
     fn transition_to_buffering(&mut self, pts: f64) {
         self.latch = ReadinessLatch::new(self.current_seek_epoch);
         self.clock.set_anchor(ClockAnchor::frozen_at(pts));
@@ -301,8 +301,7 @@ impl EngineActor {
     /// - Playing → no-op
     fn handle_play(&mut self) {
         // 全ての非 Idle/非 Playing パスで autoplay=true を保証 (= Pause→Seek→READY の
-        // 後 Paused に戻ってしまう、EOF Play で seek 後 Paused に戻る、等の防止 —
-        // Codex Phase 3a P1/P2 反映)。
+        // 後 Paused に戻ってしまう、EOF Play で seek 後 Paused に戻る、等の防止)。
         self.opts.autoplay = true;
         match self.state {
             EngineState::Paused => {
@@ -331,8 +330,8 @@ impl EngineActor {
     }
 
     /// `Pause` 命令の処理。
-    /// 全ての非 Eof パスで autoplay=false を保証 (= Codex Phase 3a P1 反映: Playing
-    /// 中の Pause 後に Seek が来ても、Buffering 完了時に Playing に戻らないようにする)。
+    /// 全ての非 Eof パスで autoplay=false を保証 (= Playing 中の Pause 後に Seek が
+    /// 来ても、Buffering 完了時に Playing に戻らないようにする)。
     fn handle_pause(&mut self) {
         self.opts.autoplay = false;
         match self.state {
@@ -378,8 +377,8 @@ impl EngineActor {
                 duration_secs,
                 has_audio,
             } => {
-                // metadata は **epoch 関係なく常に保存** する (Codex Phase 3a P2 反映:
-                // pre-info user seek が走った場合でも duration/has_audio は捨てない)。
+                // metadata は **epoch 関係なく常に保存** する (= pre-info user seek が
+                // 走った場合でも duration/has_audio は捨てない)。
                 self.duration_secs = Some(duration_secs);
                 self.has_audio = has_audio;
                 // 状態遷移は state=Loading のときだけ行う。
@@ -1176,7 +1175,7 @@ mod tests {
 
     #[test]
     fn pause_then_seek_keeps_paused_after_ready() {
-        // Codex Phase 3a P1 反映: Playing → Pause → Seek → READY で Paused 状態を維持
+        // Playing → Pause → Seek → READY で Paused 状態を維持する不変条件のテスト
         let mut a = fresh_actor();
         a.begin_loading();
         a.handle_decoder_event(DecoderEvent::InfoReceived {
@@ -1203,7 +1202,7 @@ mod tests {
 
     #[test]
     fn play_from_eof_forces_autoplay_true() {
-        // Codex Phase 3a P2 反映: Pause で autoplay=false の状態でも、Eof Play は再生
+        // Pause で autoplay=false の状態でも、Eof Play は再生再開を強制する不変条件のテスト
         let mut a = fresh_actor();
         a.begin_loading();
         a.handle_decoder_event(DecoderEvent::InfoReceived {
@@ -1238,7 +1237,7 @@ mod tests {
 
     #[test]
     fn info_received_metadata_saved_even_if_pre_info_seek() {
-        // Codex Phase 3a P2 反映: pre-info で user seek が走っても duration/has_audio は保存
+        // pre-info で user seek が走っても duration/has_audio は保存される不変条件のテスト
         let mut a = fresh_actor();
         a.begin_loading();
         // info 到着前に user seek (epoch++)
@@ -1273,4 +1272,5 @@ mod tests {
         a.apply_command(TransportCommand::SeekAbsolute { target_secs: -5.0 });
         assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
     }
+
 }
