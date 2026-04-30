@@ -196,6 +196,12 @@ bool PluginLoader::load(const std::string& plugin_path,
     in_buffer_r_.resize(block_size);
     out_buffer_l_.resize(block_size);
     out_buffer_r_.resize(block_size);
+    // 副 bus 用 silence (サイドチェインに無音を流すため)
+    dummy_in_buf_.assign(block_size, 0.0f);
+    dummy_out_buf_.assign(block_size, 0.0f);
+    // process_block で参照する bus 数
+    num_in_buses_ = num_in_buses;
+    num_out_buses_ = num_out_buses;
 
     return true;
 }
@@ -210,17 +216,36 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
         in_buffer_r_[i] = input[i * 2 + 1];
     }
 
-    // ProcessData セットアップ
-    Vst::AudioBusBuffers in_bus{};
-    Vst::AudioBusBuffers out_bus{};
-    in_bus.numChannels = 2;
-    out_bus.numChannels = 2;
-    float* in_planar[2] = { in_buffer_l_.data(), in_buffer_r_.data() };
-    float* out_planar[2] = { out_buffer_l_.data(), out_buffer_r_.data() };
-    in_bus.channelBuffers32 = in_planar;
-    out_bus.channelBuffers32 = out_planar;
-    in_bus.silenceFlags = 0;
-    out_bus.silenceFlags = 0;
+    // ProcessData セットアップ — VST3 仕様により ProcessData::numInputs/numOutputs
+    // は **getBusCount で得た値と一致** させる必要がある。Pro-Q 4 等サイドチェイン
+    // 入力 bus を持つプラグインに 1 個だけ渡すと UB → 音声が届いていないように
+    // 見える原因になる。
+    std::vector<Vst::AudioBusBuffers> in_buses(num_in_buses_);
+    std::vector<Vst::AudioBusBuffers> out_buses(num_out_buses_);
+
+    // main bus
+    float* main_in_planar[2] = { in_buffer_l_.data(), in_buffer_r_.data() };
+    float* main_out_planar[2] = { out_buffer_l_.data(), out_buffer_r_.data() };
+    in_buses[0].numChannels = 2;
+    in_buses[0].channelBuffers32 = main_in_planar;
+    in_buses[0].silenceFlags = 0;
+    out_buses[0].numChannels = 2;
+    out_buses[0].channelBuffers32 = main_out_planar;
+    out_buses[0].silenceFlags = 0;
+
+    // 副 bus (サイドチェイン等): silence buffer + silenceFlags 全立て
+    float* dummy_in_planar[2] = { dummy_in_buf_.data(), dummy_in_buf_.data() };
+    float* dummy_out_planar[2] = { dummy_out_buf_.data(), dummy_out_buf_.data() };
+    for (int32 i = 1; i < num_in_buses_; ++i) {
+        in_buses[i].numChannels = 2;
+        in_buses[i].channelBuffers32 = dummy_in_planar;
+        in_buses[i].silenceFlags = 0x3;  // ch0+ch1 silent
+    }
+    for (int32 i = 1; i < num_out_buses_; ++i) {
+        out_buses[i].numChannels = 2;
+        out_buses[i].channelBuffers32 = dummy_out_planar;
+        out_buses[i].silenceFlags = 0x3;
+    }
 
     Vst::ProcessContext ctx{};
     ctx.state = Vst::ProcessContext::kPlaying;
@@ -236,10 +261,10 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
     data.processMode = Vst::kRealtime;
     data.symbolicSampleSize = Vst::kSample32;
     data.numSamples = static_cast<int32>(num_frames);
-    data.numInputs = 1;
-    data.numOutputs = 1;
-    data.inputs = &in_bus;
-    data.outputs = &out_bus;
+    data.numInputs = num_in_buses_;
+    data.numOutputs = num_out_buses_;
+    data.inputs = in_buses.data();
+    data.outputs = out_buses.data();
     data.inputParameterChanges = &input_params;
     data.outputParameterChanges = &output_params;
     data.inputEvents = &input_events;
@@ -259,29 +284,43 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
 }
 
 bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
+    // 既存 view_ から純粋に getSize する (= scale 設定を変更しない)。
+    // 既に show_gui で setContentScaleFactor 済みであれば、その scale 込みの
+    // 物理ピクセル値を返す。
+    // view_ が無ければ一時 view を作って素のサイズを取得 (scale 1.0 想定)。
     if (!controller_) return false;
-    // view_ が無ければ一時的に作って size だけ取って捨てるのが行儀よい。
     Steinberg::IPtr<Steinberg::IPlugView> v = view_;
     if (!v) {
         v = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
         if (!v) return false;
     }
-    // DPI scale をプラグインに伝えてから getSize する。
-    // 伝えないと「自分は 100% 描画」と判断して論理ピクセルでサイズを返すケースが
-    // ある (Pro-Q 4 等)。setContentScaleFactor を呼ぶと scale 込みの物理ピクセル
-    // 数値で返ってくる。
-    Steinberg::FUnknownPtr<Steinberg::IPlugViewContentScaleSupport> css(v);
-    if (css) {
-        UINT dpi = GetDpiForSystem();
-        if (dpi == 0) dpi = 96;
-        float factor = static_cast<float>(dpi) / 96.0f;
-        css->setContentScaleFactor(factor);
-        blog("get_gui_size: setContentScaleFactor=%.3f (dpi=%u)", factor, dpi);
-    }
     Steinberg::ViewRect rect{};
     if (v->getSize(&rect) != Steinberg::kResultOk) {
         return false;
     }
+    int32_t w = rect.right - rect.left;
+    int32_t h = rect.bottom - rect.top;
+    if (w <= 0 || h <= 0) return false;
+    width_out = static_cast<uint32_t>(w);
+    height_out = static_cast<uint32_t>(h);
+    return true;
+}
+
+bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out) {
+    // 一時 view を作り、指定 DPI の scale を伝えてから getSize → 破棄。
+    // ホストウィンドウを作る前に正しいサイズを知るためのクエリ用。
+    if (!controller_) return false;
+    auto v = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
+    if (!v) return false;
+    Steinberg::FUnknownPtr<Steinberg::IPlugViewContentScaleSupport> css(v);
+    if (css) {
+        if (dpi == 0) dpi = 96;
+        float factor = static_cast<float>(dpi) / 96.0f;
+        css->setContentScaleFactor(factor);
+        blog("query_gui_size_at_dpi: setContentScaleFactor=%.3f (dpi=%u)", factor, dpi);
+    }
+    Steinberg::ViewRect rect{};
+    if (v->getSize(&rect) != Steinberg::kResultOk) return false;
     int32_t w = rect.right - rect.left;
     int32_t h = rect.bottom - rect.top;
     if (w <= 0 || h <= 0) return false;

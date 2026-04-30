@@ -251,16 +251,17 @@ private:
             return true;
         }
         if (cmd == "query_gui_size") {
-            // プラグインの推奨 GUI サイズだけ取得して返す。
-            // ホスト側は受け取ったサイズでウィンドウを作ってから show_gui を送ることで、
-            // attached 時点で親 HWND が正しいサイズに揃った状態にできる
-            // (子ウィンドウ作成時のサイズが正しくなる)。
+            // プラグインの推奨 GUI サイズを scale 込みで取得して返す。
+            // bridge プロセスは Per-Monitor v2 Aware なので GetDpiForSystem は
+            // primary monitor の DPI (= ユーザー環境では 144 等) を返す。
             if (!loader_) {
                 send_event_error("query_gui_size: no plugin loaded");
                 return true;
             }
+            UINT dpi = GetDpiForSystem();
+            if (dpi == 0) dpi = 96;
             uint32_t w = 0, h = 0;
-            if (!loader_->get_gui_size(w, h)) {
+            if (!loader_->query_gui_size_at_dpi(dpi, w, h)) {
                 send_event_error("query_gui_size: getSize failed");
                 return true;
             }
@@ -442,6 +443,11 @@ private:
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
+    // bridge プロセスを Per-Monitor v2 DPI Aware に設定する。
+    // これがないと GetDpiForSystem / GetDpiForWindow がプライマリ DPI ではなく
+    // 96 を返してしまい、setContentScaleFactor で正しい scale を伝えられない。
+    // VST3 GUI を任意のスレッドで attached する前に必ずプロセス全体に設定する必要がある。
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     miv::Bridge bridge;
     return bridge.run();
 }

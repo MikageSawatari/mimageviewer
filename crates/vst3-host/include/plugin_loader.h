@@ -65,8 +65,15 @@ public:
     // ホストが用意した親 HWND に `attached()` で取り付ける。
     // tester では Win32 で空ウィンドウを 1 つ作り、その HWND を渡す方式。
 
-    /// プラグインの推奨 GUI サイズを取得する。返り値 false = エディター無し。
+    /// プラグインの推奨 GUI サイズを取得する。
+    /// 既に attached された view_ がある場合は scale 設定を変更せず getSize する
+    /// (= show_gui 後の正しいサイズ)。view_ が無ければ一時 view を作って scale 1.0
+    /// 想定で getSize する。返り値 false = エディター無し。
     bool get_gui_size(uint32_t& width_out, uint32_t& height_out);
+
+    /// 指定 DPI で setContentScaleFactor してからプラグイン推奨サイズを取得する。
+    /// ホストウィンドウを作る前のサイズクエリ用 (一時 view を使い捨て)。
+    bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out);
     /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
     bool show_gui(void* hwnd, std::string& error_out);
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
@@ -89,11 +96,19 @@ private:
     uint32_t cached_latency_samples_ = 0;
     bool active_ = false;
 
+    // bus 数 (load 時に取得)。Pro-Q 4 等のサイドチェイン入力プラグインは
+    // num_in_buses_ = 2 になる。ProcessData::numInputs はこの値と一致する必要がある。
+    int32_t num_in_buses_ = 0;
+    int32_t num_out_buses_ = 0;
+
     // process() に渡す ProcessData の事前確保バッファ (アロケーションを避けるため)
     std::vector<float> in_buffer_l_;
     std::vector<float> in_buffer_r_;
     std::vector<float> out_buffer_l_;
     std::vector<float> out_buffer_r_;
+    // 副 bus 用 silence buffer (= サイドチェイン input/output 用、無音固定)
+    std::vector<float> dummy_in_buf_;
+    std::vector<float> dummy_out_buf_;
 };
 
 }  // namespace miv
