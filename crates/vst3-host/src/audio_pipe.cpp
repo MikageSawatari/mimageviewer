@@ -168,4 +168,23 @@ bool AudioPipe::write_out(const float* in, uint32_t num_samples, uint32_t timeou
     return true;
 }
 
+void AudioPipe::discard_all() {
+    if (!header_) return;
+    // SPSC 規則上、in_ring は consumer (= bridge audio thread) のみが read 側 index を
+    // 進めてよく、out_ring は producer (= bridge audio thread) のみが write 側 index を
+    // 進めてよい。reset fence では Rust 側が push_audio / pull_audio を停止しているので
+    // 一時的に producer/consumer 両方の index に触れて全 discard する。
+    //
+    // 実装: 両 ring とも read 側を write 側まで一気に進める (= 「全部読んだ扱い」)。
+    // これで未消費 sample がすべて捨てられる。物理的に zero-fill する必要はない
+    // (= 次に書き込まれるとき index ベースで上書きされるだけ)。
+    auto& in_w = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->in_write);
+    auto& in_r = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->in_read);
+    auto& out_w = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->out_write);
+    auto& out_r = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->out_read);
+
+    in_r.store(in_w.load(std::memory_order_acquire), std::memory_order_release);
+    out_r.store(out_w.load(std::memory_order_acquire), std::memory_order_release);
+}
+
 }  // namespace miv

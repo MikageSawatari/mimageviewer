@@ -263,8 +263,12 @@ private:
             return handle_open(msg);
         }
         if (cmd == "reset") {
-            if (loader_) loader_->reset();
-            write_message("{\"event\":\"reset_done\"}");
+            // JSON から reset_id を取得 (= 旧 protocol で reset_id 無しの場合は 0)。
+            // pending_reset_id_ に格納してから reset_pending_ を立てる順序で memory ordering
+            // を担保 (= audio thread は reset_pending_ を見たら pending_reset_id_ も読める)。
+            auto id = extract_number_field(msg, "reset_id");
+            pending_reset_id_.store(static_cast<uint64_t>(id), std::memory_order_release);
+            reset_pending_.store(true, std::memory_order_release);
             return true;
         }
         if (cmd == "query_gui_size") {
@@ -472,6 +476,41 @@ private:
         };
 
         while (audio_running_) {
+            // ── reset fence (= Codex 助言、2026-05-01) ──
+            // control thread が `reset_pending_` を立てたら、ここで in/out ring を
+            // drain して plugin を reset する。process と setProcessing は同一 thread で
+            // 直列化されるので race なし。
+            if (reset_pending_.exchange(false, std::memory_order_acq_rel)) {
+                uint64_t reset_id = pending_reset_id_.load(std::memory_order_acquire);
+                pipe_.discard_all();
+                if (loader_) {
+                    loader_->reset();
+                    // setProcessing(false/true) の後に **silence で delay-line を埋める**。
+                    // VST3 仕様上 setProcessing は "should clear internal state" であり、
+                    // 全 plugin が delay-line をクリアする保証はないため、明示的に
+                    // latency_samples 分の silence を流して plugin output が silence で
+                    // 始まることを保証する (= シーク後 pre-seek audio 残留の確実防止)。
+                    uint32_t lat = loader_->latency_samples();
+                    if (lat > 0) {
+                        loader_->flush_with_silence(lat);
+                        std::fprintf(stderr, "[BRIDGE] reset done id=%llu (in/out ring drained, plugin reset, %u samples silence flushed)\n",
+                                     (unsigned long long)reset_id, lat);
+                    } else {
+                        std::fprintf(stderr, "[BRIDGE] reset done id=%llu (in/out ring drained, plugin reset, no latency)\n",
+                                     (unsigned long long)reset_id);
+                    }
+                } else {
+                    std::fprintf(stderr, "[BRIDGE] reset done id=%llu (no loader)\n",
+                                 (unsigned long long)reset_id);
+                }
+                std::fflush(stderr);
+                // ack に reset_id をエコー (= mIV 側 wait が ID 照合する)
+                std::string reply = "{\"event\":\"reset_done\",\"reset_id\":" +
+                                    std::to_string(reset_id) + "}";
+                write_message(reply);
+                // Rust pump は reset_done ack 待ちなので、次 push まで待つ。
+                continue;
+            }
             uint32_t got = pipe_.read_in_available(input.data(),
                                                     max_block_size * channels,
                                                     100 /* ms */);
@@ -540,6 +579,20 @@ private:
     std::atomic<bool> audio_running_{false};
     // 診断用 passthrough flag (= true なら plugin を経由しない)
     std::atomic<bool> passthrough_{false};
+    // シーク時 reset 用 fence。control thread (= run_gui_loop で `cmd == "reset"`) が
+    // この atomic を立て、audio thread が loop 先頭で exchange して true なら
+    // in/out ring を drain + plugin reset + reset_done event を出す。
+    // これにより GUI/control thread と audio thread の race を排除し、
+    // process と setProcessing(false/true) を audio thread 上で直列化する
+    // (= Codex 助言、2026-05-01、VST3 公式 threading model にも整合)。
+    std::atomic<bool> reset_pending_{false};
+    /// `Cmd::Reset { reset_id }` の reset_id を保持する。control thread が
+    /// `reset_pending_` を立てる際にここに ID を書き込み、audio thread が reset 実行後
+    /// `Event::ResetDone { reset_id }` で返す。これにより mIV 側は stale ack race を
+    /// 防げる (= Codex 助言、2026-05-01)。
+    /// reset は同期呼び出し前提のため、複数 reset が短時間連続する場合は最後の ID で
+    /// coalesce される (= bool + latest id 設計、堅牢化が必要なら queue 化)。
+    std::atomic<uint64_t> pending_reset_id_{0};
 };
 
 }  // namespace miv

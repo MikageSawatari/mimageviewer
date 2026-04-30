@@ -303,6 +303,12 @@ fn run_pump(
     const READY_THRESHOLD_SECS: f64 = 0.15;
 
     let mut activated = false;
+    // VST3 sync reset 用の世代追跡。新 seek 世代の最初の有効 frame を検出したら、
+    // 「VST process_block の前」に sync reset (= bridge audio thread が in/out ring drain
+    // + plugin reset + ResetDone ack) を実行し、ack 受信後に post-seek audio を流す。
+    // これで pre-seek audio が plugin delay-line から漏れることを防ぐ
+    // (= Codex 助言、2026-05-01、シーク後 pre-seek audio 残留問題の解消)。
+    let mut last_seen_seek_serial: u64 = 0;
     while !cancel.load(Ordering::Acquire) {
         // shutdown 通知が先に来たら即抜ける (drop 時のレイテンシ削減)。
         // 通常時は audio_rx の recv_timeout で 100ms 周期に cancel 確認。
@@ -316,6 +322,27 @@ fn run_pump(
 
         // recv 直後に audio_tx queued 合計から減算 (decoder send 時 + に対応)
         clock.add_audio_tx_queued_secs(-frame.duration_secs);
+
+        // ── 新 seek 世代の検出 → VST plugin sync reset (= 内部 delay-line + ring 完全 flush) ──
+        // PDC が大きいプラグインは内部 delay-line に pre-seek 音声を持っており、
+        // 単純な non-sync reset では bridge audio thread と GUI thread の race で
+        // pre-seek audio が漏れていた。bridge 側で audio thread 自身が reset を実行し、
+        // ResetDone ack を待つことで race 完全排除 (= 200ms timeout、Codex 助言)。
+        // skip された stale frame では発火しない (= 後述の skip check より前なので
+        // pump_seek_serial と clock_serial の比較も含む)。
+        let frame_seek_serial = frame.seek_serial;
+        let cur_clock_serial = clock.current_seek_serial();
+        if frame_seek_serial > last_seen_seek_serial
+            && frame_seek_serial >= cur_clock_serial
+        {
+            #[cfg(windows)]
+            if let Some(b) = &dsp_bridge {
+                if b.is_enabled() && b.active_slot_count() > 0 {
+                    b.reset_plugins_sync();
+                }
+            }
+            last_seen_seek_serial = frame_seek_serial;
+        }
 
         // バッファ満杯なら一旦待つ。Condvar 化は将来の最適化。
         loop {

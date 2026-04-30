@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
@@ -68,7 +68,10 @@ pub enum Cmd {
         sig_in: String,
         sig_out: String,
     },
-    Reset,
+    /// シーク等で plugin の内部状態を flush する。`reset_id` は generation ID で、
+    /// stale ack race を防ぐ (= timeout した過去 reset の ack が次回成功と誤認されない)。
+    /// bridge は `Event::ResetDone { reset_id }` で同じ ID を返す。
+    Reset { reset_id: u64 },
     Close,
     Shutdown,
     /// プラグイン GUI を指定 HWND にアタッチする。
@@ -109,7 +112,13 @@ pub enum Event {
         latency_samples: u32,
     },
     LatencyChanged { latency_samples: u32 },
-    ResetDone,
+    /// `Cmd::Reset { reset_id }` への応答。同じ `reset_id` をエコーで返す。
+    /// 待機側はこれを照合して「自分が送った reset の ack か」を判定する
+    /// (= stale ack race 防止、Codex 助言、2026-05-01)。
+    ResetDone {
+        #[serde(default)]
+        reset_id: u64,
+    },
     Closed,
     Error { detail: String },
     GuiAttached { width: u32, height: u32 },
@@ -130,7 +139,7 @@ pub struct Bridge {
     child: Child,
     stdin: Mutex<ChildStdin>,
     /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
-    /// stdout を読んで非同期 (LatencyChanged) 以外の event をここに流す。
+    /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
     /// recv() はここから読む。
     event_rx: crossbeam_channel::Receiver<std::io::Result<Event>>,
     /// プラグインの最新 latency_samples (= bridge から非同期通知された値)。
@@ -139,6 +148,14 @@ pub struct Bridge {
     /// を更新する。プラグインが UI でモード切替して `restartComponent(kLatencyChanged)`
     /// を発火すると、event-pump がここを atomically 更新する。
     cached_latency_samples: Arc<AtomicU32>,
+    /// シーク時の同期 reset 用 ack channel。bridge audio thread が in/out ring drain +
+    /// `loader_->reset()` を実行した後に `Event::ResetDone { reset_id }` を返してくる。
+    /// 一般 `event_rx` に流すと `query_gui_size` などの同期 recv() が誤って拾うので分離。
+    /// 値は `reset_id` の世代 ID で、`wait_reset_done(expected_id)` が照合に使う
+    /// (= stale ack race 防止、Codex 助言、2026-05-01)。
+    reset_ack_rx: crossbeam_channel::Receiver<u64>,
+    /// reset_sync helper が使う世代 ID counter。`fetch_add(1)` で発行する。
+    next_reset_id: AtomicU64,
     #[cfg(windows)]
     shm: Option<SharedMemory>,
     #[cfg(windows)]
@@ -221,6 +238,11 @@ impl Bridge {
         let cached_latency = Arc::new(AtomicU32::new(u32::MAX));
         let (event_tx, event_rx) =
             crossbeam_channel::bounded::<std::io::Result<Event>>(64);
+        // ResetDone 専用 ack channel。bridge audio thread が reset 実行後に流す
+        // `Event::ResetDone { reset_id }` の reset_id をここに送る。
+        // `wait_reset_done(expected_id)` が照合してから受理する (= stale ack 排除)。
+        // bounded(8) は十分 (= 通常 1 個ずつ即消費、複数 reset 連続でも全 ID を保持)。
+        let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
         let cached_latency_for_pump = cached_latency.clone();
         std::thread::Builder::new()
             .name("bridge-event-pump".into())
@@ -239,6 +261,13 @@ impl Bridge {
                                 latency_samples as f64 / 48000.0 * 1000.0,
                             ));
                             // channel には流さない (= 同期 recv() を妨げないため)
+                        }
+                        Ok(Event::ResetDone { reset_id }) => {
+                            // ResetDone は専用 ack channel に流す (= 一般 event_rx に
+                            // 流すと query_gui_size 等の同期 recv() が誤って拾う)。
+                            // reset_id を流して `wait_reset_done(expected_id)` が照合する
+                            // (= stale ack race 防止、Codex 助言、2026-05-01)。
+                            let _ = reset_ack_tx.try_send(reset_id);
                         }
                         Ok(other) => {
                             // Loaded を受信したら cached_latency にも反映する
@@ -265,6 +294,8 @@ impl Bridge {
             stdin: Mutex::new(stdin),
             event_rx,
             cached_latency_samples: cached_latency,
+            reset_ack_rx,
+            next_reset_id: AtomicU64::new(0),
             #[cfg(windows)]
             shm: None,
             #[cfg(windows)]
@@ -272,6 +303,50 @@ impl Bridge {
             #[cfg(windows)]
             sig_out: None,
         })
+    }
+
+    /// シーク時の同期 reset (= Codex 助言、2026-05-01、ack generation ID で stale-ack race 防止):
+    ///
+    /// 1. world-unique な `reset_id` を発行 (= per-bridge atomic counter で +1)
+    /// 2. `Cmd::Reset { reset_id }` を bridge に送る
+    /// 3. ack channel から `expected_id == reset_id` の ResetDone を timeout 内で待つ
+    ///    - 古い ID (= 過去 timeout した reset の遅延 ack) が来たら drop してログ
+    ///    - 未来 ID は通常起きないが、来たら drop してログ
+    ///    - timeout したら false (= 呼び出し側は fallback で続行)
+    ///
+    /// 戻り値: true = ack 一致受信、false = timeout (= 200ms 経っても合致しなかった)。
+    pub fn reset_sync(&self, timeout: std::time::Duration) -> bool {
+        // generation ID 発行 (= 0 から始まらないように +1 してから atomic に格納)。
+        // wrapping_add で u64 overflow しても新規 ID として扱える (= 18 京回 reset で
+        // overflow なので実用上発生しない)。
+        let id = self
+            .next_reset_id
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        if let Err(e) = self.send(&Cmd::Reset { reset_id: id }) {
+            crate::logger::log(format!(
+                "[VST3] reset_sync: send failed for id={id}: {e}"
+            ));
+            return false;
+        }
+        // ID 照合 loop (= 一致するまで old/future を drop)
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            match self.reset_ack_rx.recv_timeout(deadline - now) {
+                Ok(got_id) if got_id == id => return true,
+                Ok(got_id) => {
+                    crate::logger::log(format!(
+                        "[VST3] reset_sync: ignored stale ResetDone ack id={got_id}, expected={id}"
+                    ));
+                    // 続行して expected を待つ
+                }
+                Err(_) => return false,  // timeout
+            }
+        }
     }
 
     /// audio-pump が定期 polling する用: bridge から非同期通知された最新の

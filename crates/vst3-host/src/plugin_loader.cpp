@@ -513,6 +513,24 @@ void PluginLoader::reset() {
     process_time_samples_ = 0;
 }
 
+void PluginLoader::flush_with_silence(uint32_t num_samples) {
+    if (!processor_ || num_samples == 0) return;
+    // process_block の上限 (= setupProcessing 時の maxSamplesPerBlock)。
+    // 大きすぎる latency でも安全に分割処理する。
+    const uint32_t blk = block_size_ > 0 ? block_size_ : 480;
+    const uint32_t channels = 2;
+    std::vector<float> silence(blk * channels, 0.0f);
+    std::vector<float> dst(blk * channels, 0.0f);
+    uint32_t pushed = 0;
+    while (pushed < num_samples) {
+        uint32_t this_blk = std::min(blk, num_samples - pushed);
+        if (!process_block(silence.data(), dst.data(), this_blk)) {
+            break;  // process error: 諦めて return
+        }
+        pushed += this_blk;
+    }
+}
+
 void PluginLoader::unload() {
     // GUI が出ていれば先に外す (順序逆だとプラグインが crash することがある)
     hide_gui();

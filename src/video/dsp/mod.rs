@@ -501,6 +501,55 @@ impl DspBridge {
         Ok(idx)
     }
 
+    /// シーク時の同期 reset fence (= Codex 助言、2026-05-01):
+    /// 全プラグインに `Cmd::Reset` を送り、**全 bridge が `ResetDone` ack を返すまで待つ**。
+    ///
+    /// bridge 側の挙動:
+    /// 1. control thread が `reset_pending_` flag を立てる
+    /// 2. audio thread が loop 先頭で flag を見て、in/out ring を drain + plugin reset
+    ///    + ResetDone を返す (= process と setProcessing を同 thread で直列化、race 排除)
+    ///
+    /// mIV 側の効果:
+    /// - シーク前 audio (= bridge in_ring + out_ring + plugin delay-line) を完全 flush
+    /// - post-seek audio が plugin に流れる時点で plugin は zero state (= 正しい新規再生)
+    ///
+    /// **呼び出しタイミング**: pump thread から「新 seek 世代の最初の post-seek frame を
+    /// process_block する直前」に呼ぶ。これにより post-seek input は reset 後の plugin で
+    /// 処理される。
+    ///
+    /// **timeout**: 200ms。bridge audio thread の `read_in_available` 100ms timeout +
+    /// reset 自身の処理時間 (= setProcessing false/true、数 ms) + IPC roundtrip を考慮。
+    /// timeout 時は ack なしで return (= log 出力のみ、後続 process_block は走る)。
+    pub fn reset_plugins_sync(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let bridges: Vec<Arc<Bridge>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .filter(|s| matches!(s.state, SlotState::Loaded))
+                .map(|s| s.bridge.clone())
+                .collect()
+        };
+        if bridges.is_empty() {
+            return;
+        }
+        // 各 bridge ごとに `reset_sync` (= ID 付き send + ack 照合 wait) を呼ぶ。
+        // 順次実行で十分 (= bridge 数 max 10、各 reset は数 ms-数十 ms 程度)。
+        // timeout は plugin の flush_with_silence 処理時間も含めて 500ms に拡大
+        // (= latency 2s plugin で silence flush に最大 ~200ms かかるため)。
+        let timeout = std::time::Duration::from_millis(500);
+        for b in &bridges {
+            if !b.reset_sync(timeout) {
+                crate::logger::log(
+                    "[VST3] reset_plugins_sync: ResetDone ack timeout, continuing".to_string()
+                );
+            }
+        }
+    }
+
     /// 全 active プラグインに **無音ブロックを N 個流す**。
     ///
     /// 用途は 2 つ:

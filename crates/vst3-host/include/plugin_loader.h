@@ -53,6 +53,15 @@ public:
     // 状態リセット (再生位置変更時等)。プラグイン内部のフィルタ履歴を flush する。
     void reset();
 
+    // reset() の後に呼ぶ delay-line silence fill。VST3 仕様上 setProcessing による
+    // 内部状態 clear は "should" であり、すべての plugin が delay-line をクリアする
+    // 保証はない。silence (= zeros) を `latency_samples` 分だけ process_block に流して、
+    // delay-line を確実に silence で埋める。これによりシーク後の最初の real audio が
+    // delay-line から押し出される silence の **後ろ** に並ぶので、pre-seek audio が
+    // 漏れ出すことを防ぐ (= "belt-and-suspenders" な確実 flush)。
+    // num_samples = 0 (= no latency) なら no-op。
+    void flush_with_silence(uint32_t num_samples);
+
     // プラグインのアンロードと VST3 SDK のクリーンアップ。
     void unload();
 

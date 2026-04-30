@@ -55,6 +55,13 @@ public:
     // 通常 cpal 側が確実に読みに来るので timeout_ms 内で書ければ OK。
     bool write_out(const float* in, uint32_t num_samples, uint32_t timeout_ms);
 
+    /// in_ring と out_ring の両方の未消費データをすべて捨てる。
+    /// シーク等で plugin reset を行うときに、pre-seek の audio が残ったまま
+    /// 新しい状態に進まないよう、reset fence の一部として呼ぶ。
+    /// **呼び出し前提**: Rust 側が `reset_plugins_sync` で ack 待ちに入っており、
+    /// 並行して push_audio / pull_audio をしていないこと (= SPSC 規則を一時的に破る)。
+    void discard_all();
+
     const ShmHeader* header() const { return header_; }
 
 private:
