@@ -1826,6 +1826,7 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 path,
                 bypass: false,
                 state: None,
+                user_hidden: false,
             });
         }
     }

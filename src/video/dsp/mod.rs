@@ -404,6 +404,7 @@ impl DspBridge {
         sample_rate: u32,
         block_size: u32,
         bypass: bool,
+        user_hidden: bool,
     ) -> Result<usize, String> {
         // enable 状態チェック (Mutex を保持しない)
         if !self.is_enabled() {
@@ -490,7 +491,7 @@ impl DspBridge {
             bypass,
             gui_hwnd: 0,
             gui_visible: false,
-            user_hidden: false,
+            user_hidden,
             auto_bypassed_for_latency: false,
             gui_host: None,
             gui_close_signal: None,
@@ -712,6 +713,10 @@ impl DspBridge {
         if let Some(slot) = inner.slots.get_mut(idx) {
             slot.gui_hwnd = hwnd;
             slot.gui_visible = true;
+            // 起動後 settings から復元された user_hidden=true 状態でも、明示的な
+            // show_slot_gui (= パネル「GUI」ボタン押下) で初めて作成された window
+            // なので user_hidden を解除する (= 既存 hwnd!=0 の早期 return path と同様)。
+            slot.user_hidden = false;
             slot.gui_host = Some(gui_host);
             slot.gui_close_signal = Some(reply.close_signal);
             slot.gui_resize_signal = Some(reply.resize_signal);
@@ -918,7 +923,11 @@ impl DspBridge {
     /// close 通知 (= ユーザーが × を押した) → そのスロットの GUI を **隠す** (= 永続 GuiHost
     /// 設計のため window/view は破棄しない)。
     /// resize 通知 → bridge に notify_host_resize を送る。
-    pub fn pump_gui_signals(&self) {
+    ///
+    /// 戻り値: `user_hidden=true` に切り替わった (= ユーザーが × で閉じた) スロットの
+    /// idx 一覧。呼出側 (App) は settings.vst3_plugins[idx].user_hidden へ反映して
+    /// 永続化する (= 再起動後の VST 一括表示でこのスロットを skip させる)。
+    pub fn pump_gui_signals(&self) -> Vec<usize> {
         // close 通知の検出 (Mutex 内で全 slot を調べる)
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
@@ -971,7 +980,7 @@ impl DspBridge {
         // ユーザーの明示的な意図 = `user_hidden=true` をセットして以降の VST 全表示
         // トグルでも復活しないようにする (= ユーザー報告 2026-04 「× で閉じた状態を
         // 記憶したい」)。
-        for idx in close_targets {
+        for &idx in &close_targets {
             self.user_hide_slot_gui(idx);
         }
         // session 切替は bridge に最初に伝える (= 後続の resize より先に状態確定)
@@ -994,6 +1003,7 @@ impl DspBridge {
                 let _ = b.send(&Cmd::NotifyHostResize { width: w, height: h });
             }
         }
+        close_targets
     }
 
     /// 指定 idx のスロットを削除する。bridge 子プロセスは shutdown される。

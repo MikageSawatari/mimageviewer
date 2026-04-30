@@ -895,6 +895,13 @@ pub struct Vst3PluginEntry {
     /// v0.9.0 では bridge 側 query_state プロトコル未実装のため未使用 (将来拡張)。
     #[serde(default)]
     pub state: Option<String>,
+    /// ユーザーが個別に GUI × で閉じた状態を永続化する (= 2026-04 ユーザー要望)。
+    /// true: 起動後の VST 一括表示 (= VST ボタン / `set_all_guis_visible(true)`) で
+    /// このスロットの GUI は表示されない。`show_slot_gui` の明示呼び出し
+    /// (= パネルの「GUI」ボタン) で false に戻る。
+    /// false (= 既定): 通常通り表示候補に含まれる。
+    #[serde(default)]
+    pub user_hidden: bool,
 }
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
@@ -1214,6 +1221,7 @@ impl Settings {
                     path: path.clone(),
                     bypass: false,
                     state: self.vst3_plugin_state.clone(),
+                    user_hidden: false,
                 });
             }
         }

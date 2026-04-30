@@ -3283,9 +3283,13 @@ impl App {
                 let sample_rate =
                     crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
                 for entry in plugins {
-                    if let Err(e) =
-                        bridge.add_plugin(&entry.path, sample_rate, 480, entry.bypass)
-                    {
+                    if let Err(e) = bridge.add_plugin(
+                        &entry.path,
+                        sample_rate,
+                        480,
+                        entry.bypass,
+                        entry.user_hidden,
+                    ) {
                         crate::logger::log(format!(
                             "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
                             entry.path

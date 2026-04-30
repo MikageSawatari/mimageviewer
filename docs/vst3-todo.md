@@ -189,16 +189,14 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   - もしくは `ui.allocate_ui_with_layout` で残スペースを確保した後に ScrollArea
 - 関連ファイル: `src/ui_dialogs/preferences.rs` の `page_vst3()`
 
-### プラグイン GUI 非表示状態の永続化 [P1, 2026-04 ユーザー報告]
-- 現状: `PluginSlot.user_hidden: bool` フィールドはランタイム保持のみ
-  (= settings に保存されない)。再起動するとすべての GUI が再表示状態になる
-- ユーザー要望: 「GUI ×」で閉じた状態を再起動後も維持
-- 実装案:
-  - `Vst3PluginEntry` に `user_hidden: bool` フィールドを追加 (= settings.json)
-  - `add_plugin` 時に entry の `user_hidden` を slot にコピー
-  - `user_hide_slot_gui` / `show_slot_gui` 時に settings 側も更新
-  - 起動直後 (= プラグインロード後) に user_hidden=true なものは show_gui で
-    作成しない (= 「ユーザーが閉じた」状態を保つ)
+### ~~プラグイン GUI 非表示状態の永続化~~ [P1, 2026-04 ユーザー報告] → 🟢 修正済 (2026-05-01)
+- 実装: `Vst3PluginEntry.user_hidden: bool` (settings.json) を追加し、
+  `add_plugin` 時に slot にコピー。パネル「GUI / GUI ×」ボタンとプラグイン
+  ウィンドウ × 押下 (= `pump_gui_signals`) 経路すべてで settings 側を同期。
+  `set_all_guis_visible(true)` は元から user_hidden=true スロットを skip する
+  ため、起動時自動表示で × したスロットは再表示されない
+- 副次変更: `pump_gui_signals` の戻り値を `Vec<usize>` (= user_hidden 化された
+  idx 一覧) に変更し、App 側 wrapper (`vst3_pump_gui_signals`) で settings.save()
 - 関連: `vst3_gui_visible` (= VST ボタン全体の ON/OFF) は既に永続化されている
 
 ### プラグイン内部状態の永続化 (= EQ カーブ等の保存) [P1, 2026-04 ユーザー報告]

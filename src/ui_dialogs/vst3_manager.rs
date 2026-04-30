@@ -289,13 +289,31 @@ impl App {
             if let Err(e) = self.dsp_bridge.show_slot_gui(idx) {
                 crate::logger::log(format!("vst3 show_slot_gui: {e}"));
             } else {
+                // 明示的な show は user_hidden 解除も意味する (= 起動時 settings から
+                // 復元した user_hidden=true を、ユーザーが「GUI」ボタンで上書き)。
+                let mut changed = !self.settings.vst3_gui_visible;
                 self.settings.vst3_gui_visible = true;
+                if let Some(entry) = self.settings.vst3_plugins.get_mut(idx) {
+                    if entry.user_hidden {
+                        entry.user_hidden = false;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.settings.save();
+                }
             }
         }
         if let Some(idx) = clicked_hide_gui {
             // ユーザーが個別に GUI × した → user_hidden=true をセット
-            // (= 以降の VST 全表示でも skip される)
+            // (= 以降の VST 全表示でも skip される、再起動後も維持)
             self.dsp_bridge.user_hide_slot_gui(idx);
+            if let Some(entry) = self.settings.vst3_plugins.get_mut(idx) {
+                if !entry.user_hidden {
+                    entry.user_hidden = true;
+                    self.settings.save();
+                }
+            }
         }
         if let Some((idx, bypass)) = clicked_toggle_bypass {
             self.dsp_bridge.set_bypass(idx, bypass);
