@@ -1273,4 +1273,323 @@ mod tests {
         assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // Phase 9 + Codex P2 反映後の不変条件テスト群
+    // (= 「epoch++ は handle_seek_request の 1 箇所のみ」を保証する。
+    //   Phase 9 シリーズで何度か破った invariant なので、回帰防止としてここに固める。)
+    // ──────────────────────────────────────────────────────────────
+
+    /// handle_play が **Seeking 状態** で呼ばれたとき、epoch を ++ せず autoplay=true
+    /// だけ立てることを保証 (Codex P2 修正の核心)。
+    /// この invariant を破ると、`handle_seek_request → apply_command(Play)` 順の
+    /// `seek` / `seek_relative` / `toggle_play` EOF replay / loop replay が epoch を
+    /// 二重 ++ し、decoder からの `SeekCompleted{epoch=serial}` が stale 判定で捨てられ
+    /// engine が Seeking に張り付く。
+    #[test]
+    fn handle_play_in_seeking_state_does_not_advance_epoch() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: false,
+        });
+
+        // handle_seek_request で epoch=1 / state=Seeking に
+        a.handle_seek_request(10.0);
+        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 10.0 });
+        let opts_autoplay_before = a.opts.autoplay;
+
+        // apply_command(Play) → handle_play は Seeking arm を通る
+        a.apply_command(TransportCommand::Play);
+        assert_eq!(
+            a.current_seek_epoch, 1,
+            "epoch must not advance — Seeking arm only sets autoplay"
+        );
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 10.0 });
+        // autoplay=true が立つ (元が true のときも true のまま)
+        assert!(a.opts.autoplay);
+        let _ = opts_autoplay_before;
+    }
+
+    /// handle_play が **Eof 状態** で呼ばれたとき、内部で handle_seek_request(0.0)
+    /// を呼んで epoch を ++ することを保証 (= Eof 専用の自動 replay 仕様)。
+    /// この振る舞いが「呼び出し順注意 (handle_seek_request → apply_command(Play))」
+    /// 規約の根拠 — 先に apply_command(Play) を呼ぶと Eof arm がここで epoch++ し、
+    /// 続く明示 handle_seek_request で更に ++ するので二重 ++ 問題が起きる。
+    #[test]
+    fn handle_play_in_eof_state_advances_epoch_once_via_internal_seek() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: false,
+        });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        a.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 30.0,
+        });
+        assert_eq!(a.state, EngineState::Eof);
+        assert_eq!(a.current_seek_epoch, 0);
+
+        a.apply_command(TransportCommand::Play);
+        // 内部で handle_seek_request(0.0) が呼ばれて epoch=1
+        assert_eq!(
+            a.current_seek_epoch, 1,
+            "Eof + Play は handle_seek_request(0.0) を内部呼びして epoch++ する"
+        );
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
+    }
+
+    /// 正しい呼び出し順 (mod.rs::seek / seek_relative / toggle_play / loop replay):
+    /// handle_seek_request(target) → apply_command(Play) で epoch がちょうど 1 進む。
+    /// state が Eof でも Paused でも Playing でも同じ。
+    #[test]
+    fn seek_then_play_advances_epoch_exactly_once_from_any_state() {
+        // ケース 1: Idle (= 開いた直後、まだ begin_loading 前)
+        {
+            let mut a = fresh_actor();
+            a.handle_seek_request(5.0);
+            a.apply_command(TransportCommand::Play);
+            assert_eq!(a.current_seek_epoch, 1, "Idle: epoch=1");
+        }
+        // ケース 2: Loading
+        {
+            let mut a = fresh_actor();
+            a.begin_loading();
+            a.handle_seek_request(5.0);
+            a.apply_command(TransportCommand::Play);
+            assert_eq!(a.current_seek_epoch, 1, "Loading: epoch=1");
+        }
+        // ケース 3: Paused (Playing 経由)
+        {
+            let mut a = fresh_actor();
+            a.begin_loading();
+            a.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: false,
+            });
+            a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+            a.apply_command(TransportCommand::Pause);
+            assert_eq!(a.state, EngineState::Paused);
+            a.handle_seek_request(10.0);
+            a.apply_command(TransportCommand::Play);
+            assert_eq!(a.current_seek_epoch, 1, "Paused: epoch=1");
+        }
+        // ケース 4: Eof
+        {
+            let mut a = fresh_actor();
+            a.begin_loading();
+            a.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: false,
+            });
+            a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+            a.handle_decoder_event(DecoderEvent::EofReached {
+                epoch: 0,
+                duration_secs: 30.0,
+            });
+            // 正しい順: handle_seek_request → apply_command(Play)
+            a.handle_seek_request(0.0);
+            assert_eq!(a.current_seek_epoch, 1);
+            assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
+            a.apply_command(TransportCommand::Play);
+            // handle_play が Seeking arm を通って autoplay=true セットのみ → epoch=1 維持
+            assert_eq!(
+                a.current_seek_epoch, 1,
+                "Eof: handle_seek_request → apply_command(Play) の順なら epoch=1"
+            );
+        }
+    }
+
+    /// 連続 seek 要求は各回ごとにきっちり epoch が +1 される (= バースト連打の race なし)。
+    #[test]
+    fn successive_seeks_each_advance_epoch_by_one() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 100.0,
+            has_audio: false,
+        });
+        for i in 1..=5 {
+            a.handle_seek_request(i as f64 * 10.0);
+            assert_eq!(a.current_seek_epoch, i, "after seek #{i}");
+            assert_eq!(a.latch.epoch, i, "latch epoch must follow current_seek_epoch");
+        }
+    }
+
+    /// stale BufferReady (epoch < current_seek_epoch) は捨てられて遷移しない。
+    /// `audio_rendered_after_seek_resets_guard` の対になるテスト (= rendered ではなく
+    /// 初期化用の BufferReady 経路をカバー)。
+    #[test]
+    fn stale_buffer_ready_dropped_after_seek() {
+        let mut a = fresh_actor();
+        a.has_audio = true;
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+        });
+        // 新世代に
+        a.handle_seek_request(15.0);
+        assert_eq!(a.current_seek_epoch, 1);
+
+        // 古い epoch=0 の BufferReady → 捨てられる
+        a.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+        assert!(
+            !a.latch.buffer_ready,
+            "stale BufferReady must not satisfy latch"
+        );
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
+    }
+
+    /// stale EofReached も捨てられる (= 新世代 seek 中に旧世代 EOF が来てもループや
+    /// 状態遷移を誤起動しない)。
+    #[test]
+    fn stale_eof_dropped_after_seek() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: false,
+        });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        assert_eq!(a.state, EngineState::Playing);
+
+        // 新 seek → epoch=1
+        a.handle_seek_request(20.0);
+
+        // 古い epoch=0 の EofReached → 無視
+        a.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 30.0,
+        });
+        assert_eq!(
+            a.state,
+            EngineState::Seeking { target_secs: 20.0 },
+            "stale EOF must not transition out of Seeking"
+        );
+    }
+
+    /// loop replay: EOF + loop_enabled=true で seek(0) → SeekCompleted →
+    /// FirstFrameReady で Playing に到達する end-to-end フロー。
+    /// 旧 mod.rs のループ replay 経路 (apply_command(Play) → handle_seek_request)
+    /// は二重 epoch++ で SeekCompleted が drop され Playing に行けなかった。
+    #[test]
+    fn loop_replay_reaches_playing_after_eof() {
+        let mut a = EngineActor::new(OpenOptions {
+            loop_enabled: true,
+            ..Default::default()
+        });
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: false,
+        });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+
+        // EOF 到達 → loop_enabled なので handle_seek_request(0.0) が内部発火
+        a.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 30.0,
+        });
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
+        assert_eq!(a.current_seek_epoch, 1);
+
+        // decoder からの SeekCompleted{epoch=1} → Buffering
+        a.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts: 0.0,
+        });
+        assert_eq!(a.state, EngineState::Buffering);
+
+        // FirstFrameReady{epoch=1} → Playing
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 1, pts: 0.0 });
+        assert_eq!(a.state, EngineState::Playing);
+    }
+
+    /// EOF からの seek が target=0 ではなく user 指定 target を尊重することを保証。
+    /// 旧 mod.rs::seek が Eof 状態で `apply_command(Play) → handle_seek_request(target)`
+    /// 順だと、handle_play が internal で handle_seek_request(0.0) を呼んで Seeking{0.0}
+    /// に遷移、続く明示 handle_seek_request(target) で再 Seeking{target} に上書き、
+    /// epoch は 2 進むという二重ステップ問題があった。
+    /// 正しい順 (handle_seek_request(target) → apply_command(Play)) で 1 ステップで
+    /// 終わることを保証する。
+    #[test]
+    fn seek_to_target_during_eof_uses_target_not_zero() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: false,
+        });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        a.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 30.0,
+        });
+        assert_eq!(a.state, EngineState::Eof);
+
+        // 正しい順: handle_seek_request(15.0) → apply_command(Play)
+        a.handle_seek_request(15.0);
+        assert_eq!(a.current_seek_epoch, 1);
+        assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
+        a.apply_command(TransportCommand::Play);
+        // handle_play が Seeking arm を通る → epoch++ なし、state そのまま
+        assert_eq!(a.current_seek_epoch, 1, "no double-increment");
+        assert_eq!(
+            a.state,
+            EngineState::Seeking { target_secs: 15.0 },
+            "target must be 15.0, not 0.0"
+        );
+        assert!(a.opts.autoplay, "Play forces autoplay=true");
+    }
+
+    /// seek 後の SeekCompleted で actual_pts が target と微妙に異なっても
+    /// (= keyframe スナップで実 pts が target ± preroll) Buffering に正しく遷移し
+    /// 後続の FirstFrameReady で Playing に行ける。
+    #[test]
+    fn seek_completed_with_actual_pts_offset_still_reaches_playing() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 60.0,
+            has_audio: false,
+        });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+
+        // 30.0 を target に seek、actual は 28.5 (= keyframe が target より前)
+        a.handle_seek_request(30.0);
+        a.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts: 28.5,
+        });
+        assert_eq!(a.state, EngineState::Buffering);
+        // anchor は actual_pts (28.5) で frozen
+        assert!(
+            (a.clock().anchor().pts_secs - 28.5).abs() < 1e-9,
+            "anchor must be set to actual_pts (preroll-aware)"
+        );
+
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: 28.5,
+        });
+        assert_eq!(a.state, EngineState::Playing);
+    }
 }
