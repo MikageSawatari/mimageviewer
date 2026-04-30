@@ -91,9 +91,11 @@ pub fn default_output_sample_rate() -> Option<u32> {
 /// `audio_rx` がドロップされると pump スレッドは終了するが、cpal Stream は無音で
 /// 鳴り続ける (UI から AudioOutput を drop すれば停止)。
 ///
-/// `engine_event_tx` (Phase 3d): 音声バッファが READY_THRESHOLD (= 500ms) に到達した
-/// 時に `AudioEvent::BufferReady` を 1 度だけ送出する。EngineActor が Buffering →
-/// Playing に遷移するためのトリガ。
+/// `engine_event_tx` (Phase 3d / 8.K): 音声バッファが READY_THRESHOLD に到達して
+/// いる間、audio frame ごとに `AudioEvent::BufferReady` を level event として
+/// emit する。EngineActor が Buffering → Playing に遷移するためのトリガ。
+/// 旧 Phase 3d の「1 度だけ emit」では Loading 中に届いた event が latch reset
+/// で消える race があったため、Phase 8.K で level 化した。
 pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
@@ -199,12 +201,16 @@ fn run_pump(
     };
 
     // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。
-    // 設計 v3 で 500ms に確定 (= 250ms low + hysteresis を期待した値)。
-    const READY_THRESHOLD_SECS: f64 = 0.5;
+    // 設計 v3 では 500ms (= 250ms low + hysteresis 想定) で確定したが、Phase 8.K で
+    // 実測した結果、典型的な audio_buf は 200-400ms 範囲を hover し 500ms に到達しない
+    // ことが判明 (= 単一 demux+decode スレッドで video pacing と競合している影響)。
+    // 結果として BufferReady が発火せず engine が永久 Buffering、video decoder の
+    // pace_lead=0 で「ahead < 0.20s cap」状態が続き future_frames が枯渇 → buf strip
+    // が常時黄色になっていた。150ms に下げて typical level の下回りに合わせる。
+    // (= 後続の demux thread split refactor で本来の余裕に戻したい)
+    const READY_THRESHOLD_SECS: f64 = 0.15;
 
     let mut activated = false;
-    // 直近で BufferReady を emit した seek_serial。新 epoch では再 emit。
-    let mut buffer_ready_emitted_serial: Option<u64> = None;
     while !cancel.load(Ordering::Acquire) {
         // shutdown 通知が先に来たら即抜ける (drop 時のレイテンシ削減)。
         // 通常時は audio_rx の recv_timeout で 100ms 周期に cancel 確認。
@@ -246,8 +252,8 @@ fn run_pump(
             buf.samples.clear();
             buf.next_pts_secs = frame.pts_secs;
             buf.pump_seek_serial = frame.seek_serial;
-            // 新 seek 世代では BufferReady を **再 emit する** ため latch を解除。
-            buffer_ready_emitted_serial = None;
+            // Phase 8.K: BufferReady は level event 化したため latch 不要。
+            // (旧 buffer_ready_emitted_serial は撤去)
         } else if buf.samples.is_empty() && frame.pts_secs > buf.next_pts_secs {
             // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)
             buf.next_pts_secs = frame.pts_secs;
@@ -255,18 +261,23 @@ fn run_pump(
         buf.samples.extend(frame.samples.iter().copied());
         publish_buffer_secs(&buf, &clock);
 
-        // ── BufferReady emit (Phase 3d) ──
-        // buffer 残量が READY_THRESHOLD に到達した時点で 1 度だけ EngineActor に
-        // 通知する (= Buffering → Playing 遷移トリガ)。同 seek_serial 内では 2 度
-        // 送らない (`buffer_ready_emitted_serial` で抑止)。次 seek 世代でリセット。
+        // ── BufferReady emit (Phase 3d / 8.K) ──
+        // buffer 残量が READY_THRESHOLD に到達したら EngineActor に通知する
+        // (= Buffering → Playing 遷移トリガ)。
+        //
+        // Phase 8.K (Codex P1): 旧コードは「同 seek_serial 内では 1 度だけ」
+        // (`buffer_ready_emitted_serial`) で edge event 化していたが、エンジンが
+        // Loading 状態の間に届くと InfoReceived → transition_to_buffering で
+        // latch がリセットされ、その後二度と emit されない race があった。
+        // → level event 化し、threshold を超えている間は毎 frame emit する。
+        // EngineActor 側は idempotent (`latch.buffer_ready=true` の repeat set)
+        // なので過剰 emit は無害。`bounded(64)` の channel は full なら try_send
+        // で drop されるが、次 frame の emit で復旧する。
         let buf_secs = buf.samples.len() as f64 / buf.samples_per_sec;
         let cur_pts = buf.next_pts_secs;
         let cur_serial = buf.pump_seek_serial;
         drop(buf);
-        if buf_secs >= READY_THRESHOLD_SECS
-            && buffer_ready_emitted_serial != Some(cur_serial)
-        {
-            buffer_ready_emitted_serial = Some(cur_serial);
+        if buf_secs >= READY_THRESHOLD_SECS {
             let _ = engine_event_tx.try_send(
                 crate::video::engine::EngineEvent::Audio(
                     crate::video::engine::state::AudioEvent::BufferReady {

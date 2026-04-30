@@ -517,6 +517,14 @@ fn run_decoder(
     let mut current_seek_serial: u64 = 0;
     // 直前に video_tx へ enqueue 成功したフレームの pts。pts ギャップ計測用。
     let mut last_enqueued_pts: f64 = 0.0;
+    // Phase 8.K (Codex P1): post-seek 第 1 フレーム送出済みフラグ。
+    // SEEK_BURST_LEAD_MAX_SECS=0.20 cap は通常の seek burst 抑制には機能するが、
+    // sparse/低 fps/VFR 動画で「seek target 直後のフレーム pts が target+0.20 を
+    // 超える」ケースで送出を阻害し UI が seek 完了を検知できず hang する。
+    // post-seek の 1 枚目だけは ahead に関係なく送出して override を確実に解除する。
+    // 起動時は true (まだ seek していない = cap 通常適用)、seek 受信時に false へ、
+    // 送出成功時に true へ戻す。
+    let mut post_seek_frame_sent: bool = true;
     // post-seek preroll: avformat_seek_file は target ぴったりではなく
     // **直前の keyframe** に戻ることが多い。そのまま再生すると seek 直前の
     // PTS (例: 10s) のフレームが届き、それで AvClock が更新されてシークバーが
@@ -538,6 +546,8 @@ fn run_decoder(
             } = req;
             current_seek_serial = serial;
             drop_before_secs = Some(target_secs);
+            // Phase 8.K (Codex P1): 新世代 seek なので「post-seek 1 枚目未送出」状態へ。
+            post_seek_frame_sent = false;
             // タイムスタンプは AV_TIME_BASE_Q (1/1_000_000 秒、マイクロ秒) 単位。
             let target_pts = (target_secs * 1_000_000.0) as i64;
 
@@ -583,6 +593,10 @@ fn run_decoder(
                 // UI が hang する。clock 経由で wall extrapolation に切替える。
                 drop_before_secs = None;
                 clock.clear_seek_target_override(serial);
+                // Phase 8.K (Codex P3): override が clear された後は post-seek 1 枚目
+                // 保護も不要 (= 通常 pacing に戻す)。これを true にしないと、次の
+                // 通常フレームが video_tx full 時に full-wait 経路に入り続けてしまう。
+                post_seek_frame_sent = true;
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "video",
@@ -703,7 +717,15 @@ fn run_decoder(
                                     // のときだけ send」する厳しい pacing にする (= 動画 open
                                     // 直後の wall pace_now がまだ小さい期間に未来 frames を
                                     // 連続送出する bug を防ぐ、ユーザー報告の「序盤早送り」)。
-                                    const PACE_LEAD_SECS: f64 = 0.10;
+                                    // Phase 8.K: PACE_LEAD を 0.10 → 0.30 に拡大。
+                                    // 旧 0.10 は 30fps で ~3 frames 分しか先読みせず、
+                                    // future_frames 残量が常に 3/24 = 12.5% (= yellow) で
+                                    // 推移し、decoder の僅かなストールで容易に枯渇していた。
+                                    // 0.30s = 9 frames @ 30fps / 18 frames @ 60fps にすると
+                                    // buf strip が steady-state で green を維持し、I/O や
+                                    // demux の短時間スパイクを吸収できる。
+                                    // (VLC default cache 300ms / mpv cache-secs 1.0s と整合)
+                                    const PACE_LEAD_SECS: f64 = 0.30;
                                     const AUDIO_SAFE_LO: f64 = 0.25;
                                     const AUDIO_SAFE_HI: f64 = 0.75;
                                     // Phase 8.F: seek burst の pts ahead 上限。
@@ -714,7 +736,18 @@ fn run_decoder(
                                     // burst」になる。CRITICAL_LO=0.08 でほぼ枯渇時のみ無制限化。
                                     const AUDIO_CRITICAL_LO: f64 = 0.08;
                                     let mut in_audio_escape = false;
+                                    let mut new_seek_pending = false;
                                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                                        // Phase 8.K (Codex P1 #1 / P3): 新世代 seek 受信時の早期脱出。
+                                        // pacing loop sleep 中に user seek が来ると clock.is_seeking()
+                                        // は flip するが post_seek_frame_sent は前世代の true のまま
+                                        // で、cap 判定に引っかかって sleep 無限ループになる。
+                                        // 古い世代のフレーム送出をスキップして outer loop へ戻し、
+                                        // take_seek_request で新世代を即消費させる。
+                                        if clock.current_seek_serial() != current_seek_serial {
+                                            new_seek_pending = true;
+                                            break;
+                                        }
                                         let audio_buf = clock.total_audio_buffer_secs();
                                         let audio_active = clock.is_audio_active();
                                         let engine_playing = engine_state.load(Ordering::Acquire)
@@ -731,12 +764,33 @@ fn run_decoder(
                                             }
                                         }
                                         let ahead = pts_secs - clock.video_pacing_now_secs();
+                                        // Phase 8.K (Codex P1 #2): post-seek 1 枚目で video_tx full
+                                        // なら try_send で drop されてしまう。drop すると override
+                                        // が解除されず seek が hang する。1 枚目限定で空きを待つ。
+                                        // 通常時 (post_seek_frame_sent=true) は drop 許容のまま。
+                                        if !post_seek_frame_sent && video_tx.is_full() {
+                                            std::thread::sleep(std::time::Duration::from_millis(5));
+                                            continue;
+                                        }
                                         // seek override 中でも、audio_buf が HI 以上または ahead
                                         // が上限に達したら burst を止める (Phase 8.F P1)。
                                         // ただし audio が枯渇しそう (< LO) なときは ahead 上限を
                                         // 緩めて burst 継続 (= audio 優先)。
+                                        // Phase 8.K: 音声無し動画では audio_buf=0 が常に < LO なので、
+                                        // 旧コードでは seek burst が無制限になり open 直後に
+                                        // 数百フレームをデコード → video_tx (cap 24) 溢れで 80% drop
+                                        // → demux 位置が表示位置から大きく乖離 → 7+ 秒の表示フリーズ
+                                        // を引き起こしていた。audio_active 判定で「音声があるとき
+                                        // だけ」audio_buf による緊急 burst を許可する。
+                                        // Phase 8.K (Codex P1): post-seek 1 枚目は ahead に関係なく
+                                        // 送出して seek override 解除を保証する (sparse/低 fps 対策)。
                                         if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
-                                            if ahead < SEEK_BURST_LEAD_MAX_SECS || audio_buf < AUDIO_SAFE_LO {
+                                            if !post_seek_frame_sent
+                                                || ahead < SEEK_BURST_LEAD_MAX_SECS
+                                            {
+                                                break;
+                                            }
+                                            if audio_active && audio_buf < AUDIO_SAFE_LO {
                                                 break;
                                             }
                                         }
@@ -765,6 +819,12 @@ fn run_decoder(
                                         std::thread::sleep(std::time::Duration::from_millis(5));
                                     }
 
+                                    // Phase 8.K (Codex P3): 新世代 seek 受信中ならこのフレームは
+                                    // 古い世代なので送らずに outer loop に戻り、新 seek を消費する。
+                                    if new_seek_pending {
+                                        continue 'outer;
+                                    }
+
                                     use crossbeam_channel::TrySendError;
                                     let pts_gap = pts_secs - last_enqueued_pts;
                                     let send_result = video_tx.try_send(gpu_frame_out);
@@ -772,6 +832,8 @@ fn run_decoder(
                                         matches!(&send_result, Err(TrySendError::Full(_)));
                                     if !dropped_full && send_result.is_ok() {
                                         last_enqueued_pts = pts_secs;
+                                        // Phase 8.K (Codex P1): post-seek 1 枚目を送出した。
+                                        post_seek_frame_sent = true;
                                     }
                                     if dropped_full {
                                         skipped_frame_count
@@ -943,13 +1005,21 @@ fn run_decoder(
                     // (= Buffering / Loading / Seeking 中は急送出しない)。
                     // Phase 3e: PACE_LEAD も engine が Playing のときだけ。Loading/Buffering
                     // 中は閾値 0 で wall に厳密追従させ、序盤の連続送出を抑える。
-                    const PACE_LEAD_SECS: f64 = 0.10;
+                    // Phase 8.K: PACE_LEAD を 0.10 → 0.30 に拡大 (詳細は GPU 経路の同コメント)。
+                    const PACE_LEAD_SECS: f64 = 0.30;
                     const AUDIO_SAFE_LO: f64 = 0.25;
                     const AUDIO_SAFE_HI: f64 = 0.75;
                     const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
                     const AUDIO_CRITICAL_LO: f64 = 0.08;
                     let mut in_audio_escape = false;
+                    let mut new_seek_pending = false;
                     while !cancel.load(Ordering::Acquire) && clock.is_playing() {
+                        // Phase 8.K (Codex P1 #1 / P3): 新世代 seek 受信時の早期脱出
+                        // (詳細は GPU 経路コメント)。
+                        if clock.current_seek_serial() != current_seek_serial {
+                            new_seek_pending = true;
+                            break;
+                        }
                         let audio_buf = clock.total_audio_buffer_secs();
                         let audio_active = clock.is_audio_active();
                         let engine_playing = engine_state.load(Ordering::Acquire)
@@ -962,8 +1032,21 @@ fn run_decoder(
                             }
                         }
                         let ahead = pts_secs - clock.video_pacing_now_secs();
+                        // Phase 8.K (Codex P1 #2): post-seek 1 枚目で video_tx full なら
+                        // try_send で drop されないように空きを待つ (詳細は GPU 経路コメント)。
+                        if !post_seek_frame_sent && video_tx.is_full() {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        // Phase 8.K: 音声無し動画では audio_buf=0 が常に < LO になり、
+                        // 旧コードは seek burst が無制限化 → video_tx 溢れで大量 drop →
+                        // 表示フリーズ。audio_active で gate する (詳細は GPU 経路コメント)。
+                        // Phase 8.K (Codex P1): post-seek 1 枚目は ahead に関係なく送出 (同上)。
                         if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
-                            if ahead < SEEK_BURST_LEAD_MAX_SECS || audio_buf < AUDIO_SAFE_LO {
+                            if !post_seek_frame_sent || ahead < SEEK_BURST_LEAD_MAX_SECS {
+                                break;
+                            }
+                            if audio_active && audio_buf < AUDIO_SAFE_LO {
                                 break;
                             }
                         }
@@ -982,6 +1065,12 @@ fn run_decoder(
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
 
+                    // Phase 8.K (Codex P3): 新世代 seek 受信中ならこのフレームは古い世代
+                    // なので送らずに outer loop に戻り、新 seek を消費する (詳細は GPU 経路)。
+                    if new_seek_pending {
+                        continue 'outer;
+                    }
+
                     // perf: 直前に enqueue した pts との差を記録 (= channel に
                     // 入っているフレームの pts ギャップが分かる、dropped_full だけでは
                     // 「どれくらい飛んだか」が見えないため)。
@@ -991,6 +1080,8 @@ fn run_decoder(
                     let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
                     if !dropped_full && send_result.is_ok() {
                         last_enqueued_pts = pts_secs;
+                        // Phase 8.K (Codex P1): post-seek 1 枚目を送出した。
+                        post_seek_frame_sent = true;
                     }
                     if dropped_full {
                         skipped_frame_count

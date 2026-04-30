@@ -5153,7 +5153,10 @@ impl App {
                 if interval_ms <= transient_threshold {
                     self.video_perf_history
                         .push_back((interval_ms, now, skip_delta, buf_clamped));
-                    while self.video_perf_history.len() > 200 {
+                    // Phase 8.K: 容量 200 だと 60fps で 3.3 秒分しか保持できず、
+                    // graph の WINDOW_SECS=6.0 に対し左 半分以上が空欄になる。
+                    // 6 秒 × 100fps の余裕を持たせて 600 に拡大。
+                    while self.video_perf_history.len() > 600 {
                         self.video_perf_history.pop_front();
                     }
                 }
@@ -5252,8 +5255,10 @@ impl App {
         // ラベルは "frame 到着間隔のばらつき (= jitter)" を示すと意味付け。
         // 平均値は wall rate と一致するのが正常で、max が target を超えるほど
         // pipeline の変動が大きい。
+        // Phase 8.K: header 文字列を短縮 (360px 枠を超えないため)。
+        // "target 60.0fps/16.7ms  jit 17.0/25.5  skip:5  buf:3/24"
         let header = format!(
-            "target {:.1}fps ({:.1}ms)  jitter avg {:.1}ms / max {:.1}ms  skip:{}  buf:{}/{}",
+            "{:.1}fps/{:.1}ms  jit {:.1}/{:.1}  skip:{}  buf:{}/{}",
             1000.0 / expected_ms,
             expected_ms,
             avg,
@@ -5403,7 +5408,14 @@ impl App {
                 continue;
             }
             let level = (*buf as f32 / max_buf).clamp(0.0, 1.0);
-            let bar_h = level * strip.height();
+            // Phase 8.K: buf=0 では level=0 で bar 高さ 0 になり描画されない。
+            // starvation を視認できるよう strip 全高に minimum-height (= 全高) で
+            // 描く。0 < buf でも視認性のため最低 2px は確保。
+            let bar_h = if *buf == 0 {
+                strip.height()
+            } else {
+                (level * strip.height()).max(2.0)
+            };
             let bar = egui::Rect::from_min_max(
                 egui::pos2(x - bar_w * 0.5, strip.max.y - bar_h),
                 egui::pos2(x + bar_w * 0.5, strip.max.y),

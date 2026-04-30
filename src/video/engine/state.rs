@@ -119,8 +119,8 @@ pub enum AudioEvent {
         pts: f64,
         wall_now: Instant,
     },
-    /// audio buffer が READY_THRESHOLD (= 500ms) に到達した。Buffering→Playing
-    /// 判定の latch を閉じる。
+    /// audio buffer が READY_THRESHOLD に到達している間、level event として届く
+    /// (Phase 8.K で edge → level 化)。Buffering→Playing 判定の latch を閉じる。
     BufferReady {
         epoch: SeekEpoch,
         pts: f64,
