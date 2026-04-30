@@ -31,9 +31,8 @@ use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
-    SW_SHOWNOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CLOSE, WM_DESTROY, WM_SIZE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW,
+    SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
+    WM_SIZE, WNDCLASSEXW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -372,14 +371,7 @@ fn create_window(
             bottom: height as i32,
         };
         let dpi = GetDpiForSystem();
-        // ⚠️ `WS_EX_NOACTIVATE` を併用する。これがないと CreateWindowExW + ShowWindow で
-        // mIV メインウィンドウからフォーカスを奪い、ユーザーが続けて V キーを押しても
-        // egui がイベントを受け取れなくなる (= "Vキーを何度も押すと表示されなくなる" の
-        // 根本原因)。`NOACTIVATE` 指定だとプラグイン GUI は最前面に乗りつつフォーカスは
-        // 奪わないので、ユーザーは mIV のキーボード操作を継続したまま「目だけ」プラグイン
-        // GUI を確認できる。プラグイン GUI を直接操作したいときは普通にクリックすれば
-        // フォーカスが切り替わる (= 自然な挙動)。
-        let ex_style = WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+        let ex_style = WS_EX_TOPMOST;
         let _ = AdjustWindowRectExForDpi(
             &mut rect,
             WS_OVERLAPPEDWINDOW,
@@ -407,9 +399,7 @@ fn create_window(
         )
         .map_err(|e| std::io::Error::other(format!("CreateWindowExW: {e}")))?;
 
-        // SW_SHOWNOACTIVATE: ウィンドウを表示するがフォーカスは奪わない (= mIV 側を
-        // アクティブのまま保つ)。WS_EX_NOACTIVATE と合わせて V キー連打が効くようにする。
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = ShowWindow(hwnd, SW_SHOW);
 
         // 実 client rect を確認 (デバッグ用)
         let mut actual = windows::Win32::Foundation::RECT::default();
@@ -452,21 +442,15 @@ fn close_window() {
 /// 念のため SetWindowPos(HWND_TOPMOST) も毎回呼ぶ。
 pub fn bring_to_front(hwnd_u64: u64) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_TOPMOST, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow,
+        HWND_TOPMOST, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow,
     };
     if hwnd_u64 == 0 {
         return;
     }
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
-        // SW_SHOWNA: 非アクティブ状態で表示 (= フォーカスを奪わない)。
-        let _ = ShowWindow(hwnd, SW_SHOWNA);
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 }
 
