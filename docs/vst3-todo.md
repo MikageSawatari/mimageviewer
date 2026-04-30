@@ -58,43 +58,63 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 
 ---
 
-## ⏳ Codex 回答待ち
+## 📋 Codex 第 2 弾 回答 → 着手順 (= 次セッションで実装)
 
-`docs/codex-vst3-bug-brief.md` で第 2 弾調査依頼済。
-回答は `docs/codex-vst3-bug-answer.md` に上書き予定。
+`docs/codex-vst3-bug-answer.md` に Codex 回答受領済 (= コード片 + 場所 + 理由)。
+**Codex 推奨着手順** (= 依存関係と検証容易性で並べた):
 
-### 課題 1: 一括表示時の "パラパラ" + z-order 復元時のチラつき (P1)
-- 各 GUI が SW_SHOWNA で 1 つずつ現れ、最後に z-order が並び変わる
-- 期待: 最初から正しい z-order で同時表示 (= no flicker)
-- 検討: `BeginDeferWindowPos` / `DeferWindowPos` でアトミック化
+### Step 1 (P1): PDC 最小実装 [課題 3]
+- **mIV Test Latency** プラグインで検証可能、機能正当性の問題
+- DspBridge に `total_latency_samples()` accessor 追加
+- AudioBuffer に `pdc_latency_secs: f64` フィールド追加
+- run_pump push 前に latency_secs を計算して buffer に書く
+- fill_output で `pts_for_video = pts_now - pdc_latency_secs` を `clock.set_audio_pts`
+- **方式**: 「動画クロックを plugin latency 分だけ遅らせる」(= audio 先読み版より低リスク)
+- LatencyChanged event 受信時に flush + anchor reset
+- 複数 plugin 直列は `N1+N2+N3` 合算して video clock shift
+- 検証手順 (Codex 提案):
+  1. mIV Test Latency = 0 samples で現状一致確認
+  2. 4800 samples (= 100ms) で動画 100ms 先行を確認 (PDC OFF)
+  3. PDC ON で同期復元確認
+  4. 直列 2400 + 4800 = 150ms 合算確認
+  5. 再生中 latency 変更 → flush/anchor reset 後にジャンプなし
 
-### 課題 2: 音声 latency をさらに縮小 (P1)
-- 現状 300ms。さらに短くしたい (DAW は ~10-50ms)
-- 検討: cpal callback 内で plugin 処理 vs 別スレッド (= 現行)
-- bridge プロセス境界が前提でどこまで詰められるか
-- ユーザー提案: 「OS に渡す直前で処理」の実現性
+### Step 2 (P1): 音声 buffer 縮小 (300ms → 120-150ms) [課題 2]
+- `TARGET_BUFFER_SECS: 0.3` → `0.12 (Windows) / 0.20 (other)` を提案
+- 100ms 未満は実機計測必須、現時点では攻めすぎ
+- pump の sleep 10ms → 2ms に短縮 (= "低水位追従")
+- cpal callback 内 IPC は **P3** (= まだ入れない、deadline miss リスク高)
+- どうしても入れるなら `try_process_block(deadline=2ms)` + bypass fallback
 
-### 課題 3: PDC (Plugin Delay Compensation) 実装 (P1)
-- VST3 plugin の `getLatencySamples()` を host 側で **未補正**
-- 「mIV Test Latency」プラグインで A/V ズレを検証済
-- audio anchor 設計を踏まえた補正案が必要
-- LatencyChanged event の処理 (= 動的変化)
+### Step 3 (P2): リサイズ latest-only coalescing [課題 5]
+- **bridge 側**: `notify_host_resize` を pending に入れて control loop で 1 tick 1 回 onSize
+  (= 古い notify を消化しない、Bitwig 並みのレスポンス)
+- **mIV 側**: `last_resize_notify` で 33ms throttle (= 30fps)
+- WM_ENTERSIZEMOVE 中の no-notify は drag 中追従止まるので非推奨
+- ack 方式は実装コスト大、まずは latest-only + throttle で十分
 
-### 課題 4: ピーク超過時の clip 挙動 (P2)
-- 現状: f32 を OS にそのまま渡す → OS mixer / DAC で hard clip
-- DAW では soft limiter / brickwall limiter を出力段に挟む
-- 視覚的 clip indicator (= "OVER" 表示) も検討
+### Step 4 (P1): GUI 一括表示の `DeferWindowPos` 化 [課題 1]
+- `gui.rs` に `show_windows_in_z_order` helper 新設
+- `BeginDeferWindowPos` + `DeferWindowPos(SWP_SHOWWINDOW | SWP_NOACTIVATE | ...)`
+  + `EndDeferWindowPos` で **show + z-order を 1 batch にアトミック化**
+- snapshot HWND を bottom-to-top で積む → 最後の HWND が最前面
+- `set_all_guis_visible(true)` 経路で snapshot HWND を優先して使う
+- fallback は bottom-to-top の個別 SetWindowPos
 
-### 課題 5: リサイズイベントのスロットリング (P2)
-- ユーザー報告: Bitwig だと Insight2 のリサイズが速い、mIV だと「バッファに
-  詰まったリサイズを時間をかけてトレース」する挙動
-- 仮説: notify_host_resize が plugin 処理速度より速く積み重なる
-- 検討: throttle (~50ms) / back-pressure (= ack 待ち) / drain (= 古い notify
-  skip) / WM_EXITSIZEMOVE のみ送信
+### Step 5 (P2): peak indicator [課題 4]
+- まず **表示だけ** (= "OVER" 表示)、soft limiter は設定付きで後続
+- fill_output 内で `peak = peak.max(y.abs())` を AtomicU32 に publish
+- UI 側 (パネル / HUD) で 200-500ms ホールド表示
+- soft limiter (`x / (1 + x.abs() * 0.25)`) は設定で OFF 可能に
+
+### 依存関係 (Codex 指摘)
+- Step 1 (PDC) と Step 2 (latency 縮小) は同じ audio clock/buffer に触るので
+  近い順で実施するのが安全
+- Step 3 (resize) と Step 4 (DeferWindowPos) は GUI 領域だが独立、並行可能
 
 ---
 
-## 📋 未着手 / Future Work
+## 📋 Codex 回答外 / Future Work
 
 ### プラグイン内部状態の永続化 (= EQ カーブ等の保存) [P1, 2026-04 ユーザー報告]
 - VST3 `IComponent::getState` / `setState` chunk のシリアライズ
