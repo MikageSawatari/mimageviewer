@@ -291,6 +291,12 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
     Vst::ParameterChanges input_params;
     Vst::ParameterChanges output_params;
 
+    // UI スレッドから蓄積された param 変更 (例: EQ カーブ操作) を取り出して
+    // input_params に積む。これが無いと UI 操作が音声処理に反映されない。
+    if (component_handler_) {
+        component_handler_->drain_into(&input_params);
+    }
+
     Vst::ProcessData data{};
     data.processMode = Vst::kRealtime;
     data.symbolicSampleSize = Vst::kSample32;

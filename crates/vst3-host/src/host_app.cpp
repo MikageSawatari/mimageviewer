@@ -93,8 +93,30 @@ tresult PLUGIN_API ComponentHandler::beginEdit(Vst::ParamID /*id*/) {
     return kResultOk;
 }
 
-tresult PLUGIN_API ComponentHandler::performEdit(Vst::ParamID /*id*/, Vst::ParamValue /*value*/) {
+tresult PLUGIN_API ComponentHandler::performEdit(Vst::ParamID id, Vst::ParamValue value) {
+    // UI スレッド (= bridge main thread = GUI thread) からプラグイン経由で呼ばれる。
+    // 値を pending に積んでおき、audio thread が drain_into で取り出して process に渡す。
+    std::lock_guard<std::mutex> lk(pending_mutex_);
+    pending_changes_.emplace_back(id, value);
     return kResultOk;
+}
+
+void ComponentHandler::drain_into(Vst::IParameterChanges* output) {
+    if (!output) return;
+    std::vector<std::pair<Vst::ParamID, Vst::ParamValue>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(pending_mutex_);
+        if (pending_changes_.empty()) return;
+        snapshot.swap(pending_changes_);
+    }
+    for (auto& [id, val] : snapshot) {
+        Steinberg::int32 idx = 0;
+        auto* queue = output->addParameterData(id, idx);
+        if (queue) {
+            Steinberg::int32 point = 0;
+            queue->addPoint(0, val, point);
+        }
+    }
 }
 
 tresult PLUGIN_API ComponentHandler::endEdit(Vst::ParamID /*id*/) {

@@ -6,11 +6,16 @@
 
 #pragma once
 
+#include <mutex>
+#include <utility>
+#include <vector>
+
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivsthostapplication.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
 
 namespace miv {
 
@@ -63,7 +68,16 @@ public:
     Steinberg::tresult PLUGIN_API endEdit(Steinberg::Vst::ParamID id) override;
     Steinberg::tresult PLUGIN_API restartComponent(Steinberg::int32 flags) override;
 
+    /// 蓄積された param 変更を ParameterChanges に投入する。
+    /// audio thread が process 直前に呼んで、UI 由来のパラメータ変更を
+    /// process に届ける。スレッド安全 (= mutex で保護)。
+    void drain_into(Steinberg::Vst::IParameterChanges* output);
+
     DECLARE_FUNKNOWN_METHODS
+
+private:
+    std::mutex pending_mutex_;
+    std::vector<std::pair<Steinberg::Vst::ParamID, Steinberg::Vst::ParamValue>> pending_changes_;
 };
 
 }  // namespace miv
