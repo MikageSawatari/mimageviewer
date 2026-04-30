@@ -632,7 +632,7 @@ pub struct Settings {
     /// 既定 true、Ctrl+↓ と等価。
     #[serde(default = "default_true")]
     pub show_toolbar_next_folder: bool,
-    /// ツールバーに「VST3 プラグイン管理」ボタン (🎚) を表示する (v0.9.0)。
+    /// ツールバーに「VST3 プラグイン管理」ボタン (VST テキスト) を表示する (v0.9.0)。
     /// `vst3_enabled = true` のときだけ実際にツールバーに描画される (= 二重ガード)。
     /// 既定 true。
     #[serde(default = "default_true")]

@@ -695,12 +695,15 @@ impl App {
                 // VST3 プラグイン管理ボタン (v0.9.0+)。
                 // 動画の音声に VST3 プラグインを通すための管理ウィンドウ起動ボタン。
                 // 環境設定の VST3 機能 ON のときだけ表示する (= settings.vst3_enabled)。
+                // 旧版は 🎚 (U+1F39A LEVEL SLIDER) を使っていたが、mIV のフォント設定
+                // (Noto Sans CJK JP 系) には emoji グリフが含まれず "□1," のような
+                // tofu 化していた。テキスト "VST" + 個数で書く。
                 if show_vst3 {
                     let chain_count = self.settings.vst3_plugins.len();
                     let label = if chain_count == 0 {
-                        "🎚".to_string()
+                        "VST".to_string()
                     } else {
-                        format!("🎚{chain_count}")
+                        format!("VST({chain_count})")
                     };
                     let hover = if chain_count == 0 {
                         "VST3 プラグイン管理を開く".to_string()

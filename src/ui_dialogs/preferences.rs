@@ -673,7 +673,7 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.checkbox(
         &mut s.show_toolbar_vst3,
-        "VST3 プラグイン管理 (🎚 ボタン、動画タブで VST3 を有効にしているときのみ表示)",
+        "VST3 プラグイン管理 (VST ボタン、動画タブで VST3 を有効にしているときのみ表示)",
     )
     .on_hover_text(
         "クリックで VST3 プラグイン管理ウィンドウが開きます。\n\
@@ -1540,7 +1540,7 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         let chain_count = s.vst3_plugins.len();
         if chain_count == 0 {
             ui.label(
-                "チェーンは空です。ツールバーの 🎚 ボタンからプラグイン管理ウィンドウを\n\
+                "チェーンは空です。ツールバーの VST ボタンからプラグイン管理ウィンドウを\n\
                  開いてプラグインを追加してください。",
             );
         } else {
@@ -1560,7 +1560,7 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "プラグインの追加・順番入れ替え・GUI 表示はツールバーの 🎚 ボタンから行います。",
+                "プラグインの追加・順番入れ替え・GUI 表示はツールバーの VST ボタンから行います。",
             )
             .small()
             .weak(),

@@ -7223,17 +7223,14 @@ impl App {
                 }
             }
 
-            // V: VST3 プラグイン GUI を一斉表示/非表示トグル
-            // VST3 機能 (= settings.vst3_enabled) が有効、かつチェーンに 1 個でもプラグインが
-            // あるときだけ反応する。IME 変換中や TextEdit フォーカス中は無効化する。
-            #[cfg(windows)]
-            {
-                let v_pressed = ctx
-                    .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
-                if v_pressed && self.settings.vst3_enabled && !self.ime_input_active() {
-                    self.vst3_toggle_all_plugin_guis();
-                }
-            }
+            // ──
+            // VST3 プラグイン GUI のショートカットキー (旧 V キー) は撤去した。
+            // 理由: プラグイン GUI が最前面で開くと mIV メインウィンドウから
+            // フォーカスを奪い、その後 V キーを押しても egui がイベントを受け
+            // 取れず無反応になる (= "Vキーを何度も押すと表示されなくなる")。
+            // ツールバー / フルスクリーンホバーバーの "VST" ボタンから管理
+            // パネルを開いて GUI 表示・非表示する UI に統一。
+            // ──
 
             // Ctrl+1〜0: 補正プリセットスロットを一括適用
             {

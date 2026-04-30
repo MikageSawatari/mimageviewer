@@ -1106,6 +1106,11 @@ impl App {
                             #[cfg(not(windows))]
                             let tile_active = false;
                             let mut tile_pressed = false;
+                            // VST ボタン: 動画モード + VST3 機能有効のときだけ表示
+                            let show_vst3_button =
+                                cfg!(windows) && is_video_mode && self.settings.vst3_enabled;
+                            let vst3_panel_open = self.show_vst3_manager;
+                            let mut vst3_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
@@ -1128,12 +1133,19 @@ impl App {
                                 video_meta,
                                 tile_active,
                                 &mut tile_pressed,
+                                show_vst3_button,
+                                vst3_panel_open,
+                                &mut vst3_pressed,
                             );
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
                             #[cfg(windows)]
                             if tile_pressed {
                                 let screen = ctx.content_rect().size();
                                 self.toggle_video_tile_mode(fs_idx, screen);
+                            }
+                            // VST ボタンが押されたら管理パネルをトグル
+                            if vst3_pressed {
+                                self.show_vst3_manager = !self.show_vst3_manager;
                             }
                             // ホイール/キーで確定した nav_delta を保護
                             if nav_locked { nav_delta = saved_nav; }
@@ -1711,16 +1723,8 @@ impl App {
             self.apply_slot_in_viewing_mode(ctx, 2);
         }
 
-        // V: VST3 プラグイン GUI を一斉表示/非表示トグル (フルスクリーン時)
-        // 動画分析中に動画を見ながらプラグイン GUI のオン・オフをしたい用途。
-        #[cfg(windows)]
-        {
-            let v_pressed = ctx
-                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
-            if v_pressed && self.settings.vst3_enabled && !self.ime_input_active() {
-                self.vst3_toggle_all_plugin_guis();
-            }
-        }
+        // V キー (VST3 プラグイン GUI トグル) は撤去した。理由は app.rs 同箇所参照。
+        // フルスクリーン中はホバーバーの "VST" ボタンから管理パネルを開く運用。
 
         // 消しゴムモード中は ui_erase が先に Ctrl+Z を吸収する。
         self.handle_meta_undo_keys(ctx);
@@ -3384,6 +3388,11 @@ impl App {
         // ▦ タイルボタンの状態 + 押下フラグ。
         tile_active: bool,
         tile_pressed: &mut bool,
+        // VST3 プラグイン管理ボタン (動画モード + vst3_enabled のときのみ表示)。
+        // active = 管理パネルが既に開いている。pressed = クリックされた。
+        show_vst3_button: bool,
+        vst3_panel_open: bool,
+        vst3_pressed: &mut bool,
     ) {
         let hover_in_top =
             ctx.input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
@@ -3437,6 +3446,33 @@ impl App {
             *nav_delta = 0;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // VST ボタン: 動画モード + VST3 機能 ON のときだけ表示。
+        // クリックで管理パネルを開く / 閉じる。management panel は egui::Window で
+        // フルスクリーンビューポート内に描画されるので動画の手前に出る。
+        if show_vst3_button {
+            let vst_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_vst3_btn",
+                |hovered| bar_button_bg(hovered, vst3_panel_open),
+                vst3_panel_open,
+                |p, c, _r| draw_vst_text_label(p, c),
+            );
+            let vst_resp = vst_resp.on_hover_text(if vst3_panel_open {
+                "VST3 プラグイン管理を閉じる"
+            } else {
+                "VST3 プラグイン管理を開く"
+            });
+            if vst_resp.clicked() {
+                *vst3_pressed = true;
+            }
+            if vst_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
 
         // ▶/⏸ スライドショーボタン (画像モード) または ▦ タイルボタン (動画モード)
         if is_video {
@@ -4052,6 +4088,19 @@ fn draw_bar_button(
     let r = BAR_BUTTON_SIZE * 0.28;
     icon_fn(ui.painter(), rect.center(), r);
     resp
+}
+
+/// "VST" テキストラベルを描画する (= ホバーバーの VST3 管理ボタン用アイコン)。
+/// 🎚 (LEVEL SLIDER) は mIV のフォント (Noto Sans CJK JP) で tofu 化するため
+/// テキストで描く。3 文字なら 32px のボタンに収まる。
+fn draw_vst_text_label(painter: &egui::Painter, c: egui::Pos2) {
+    painter.text(
+        c,
+        egui::Align2::CENTER_CENTER,
+        "VST",
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
 }
 
 /// × アイコンを描画する。
