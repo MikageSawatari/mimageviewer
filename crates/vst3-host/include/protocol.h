@@ -51,19 +51,29 @@ namespace miv {
 
 // 共有メモリのレイアウト header。block_size は openコマンドで親が指定する値。
 // in_ring / out_ring の容量はそれぞれ block_size * 4 sample (8 ブロック分マージン)。
+//
+// **重要**: Rust 側 (bridge.rs::ShmHeader) と **完全に同じバイトレイアウト** に
+// なっていなければならない。`alignas(64)` を使うと struct 全体が 64 byte 倍数に
+// padding されて Rust 側 (`#[repr(C)]` で 272 byte) とサイズがずれる。
+// 各 atomic は **手動 padding (uint8_t[60])** で cache-line 分離する。
+// これで C++ sizeof = Rust size_of = 272 byte で一致。
 struct ShmHeader {
-    // 同期用の atomic 32-bit (64 byte align で配置)
-    alignas(64) uint32_t in_write;   // 親が書いた累積 sample 数 (mono = 1, stereo = 2)
-    alignas(64) uint32_t in_read;    // bridge が読んだ累積
-    alignas(64) uint32_t out_write;  // bridge が書いた累積
-    alignas(64) uint32_t out_read;   // 親が読んだ累積
-
+    uint32_t in_write;          // 親が書いた累積 sample 数 (mono = 1, stereo = 2)
+    uint8_t _pad0[60];
+    uint32_t in_read;           // bridge が読んだ累積
+    uint8_t _pad1[60];
+    uint32_t out_write;         // bridge が書いた累積
+    uint8_t _pad2[60];
+    uint32_t out_read;          // 親が読んだ累積
+    uint8_t _pad3[60];
     // 容量 (sample 数、stereo なら *2 されている)。両 ring 共通。
-    alignas(64) uint32_t capacity;
-    uint32_t channels;     // 通常 2 (stereo)
-    uint32_t sample_rate;  // 48000 等
-    uint32_t block_size;   // 1 ブロックの sample 数 (mono、stereo の場合 *channels で frame 換算)
+    uint32_t capacity;
+    uint32_t channels;          // 通常 2 (stereo)
+    uint32_t sample_rate;       // 48000 等
+    uint32_t block_size;        // 1 ブロックの sample 数
 };
+static_assert(sizeof(ShmHeader) == 272,
+              "ShmHeader must be 272 bytes to match Rust side");
 
 constexpr uint32_t PROTOCOL_VERSION = 1;
 
