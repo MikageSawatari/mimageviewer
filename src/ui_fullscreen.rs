@@ -1164,12 +1164,17 @@ impl App {
                             }
                             // VST ボタンが押されたら「管理パネル + 全プラグイン GUI」を一斉トグル。
                             // workspace 全体を「VST3 を見る」「VST3 を畳む」の 2 状態に切り替える。
+                            // 畳むときは動画 compact mode (右上 1/4) も自動解除する。
                             #[cfg(windows)]
                             if vst3_pressed {
                                 let opening = !self.show_vst3_manager;
                                 self.show_vst3_manager = opening;
                                 self.dsp_bridge.set_all_guis_visible(opening);
                                 self.settings.vst3_gui_visible = opening;
+                                if !opening && self.settings.vst3_video_compact {
+                                    self.settings.vst3_video_compact = false;
+                                }
+                                self.settings.save();
                             }
                             #[cfg(not(windows))]
                             if vst3_pressed {

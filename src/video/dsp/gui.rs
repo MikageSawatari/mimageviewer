@@ -30,9 +30,10 @@ use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
-    SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE,
+    WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -165,6 +166,18 @@ extern "system" fn wndproc(
 ) -> LRESULT {
     unsafe {
         match msg {
+            WM_PARENTNOTIFY => {
+                // 子ウィンドウ (= プラグインの GUI 本体) でクリックが起きたら
+                // ホストウィンドウを **明示的に foreground** にする。
+                // これがないと SSL Meter Pro 等の `TrackPopupMenu` で開く
+                // 右クリックメニューがフォーカスを取れず即閉じる事象が出る
+                // (= owner top-level window が foreground でないと popup は不安定)。
+                let event_msg = (wparam.0 & 0xFFFF) as u32;
+                if event_msg == WM_LBUTTONDOWN || event_msg == WM_RBUTTONDOWN {
+                    let _ = SetForegroundWindow(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_CLOSE => {
                 // ユーザーが × を押した。メインスレッドに通知し、
                 // メインスレッドからの Cmd::Close を待つ (= ここでは破棄しない)。

@@ -680,6 +680,43 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 **VST トレードマーク (ロゴ) は使わない**。「VST3 プラグインをサポート」テキスト表記のみで運用
 (= トレードマークガイドライン回避)。
 
+## UI 文字列の Unicode グリフ選定ルール
+
+mIV はプライマリ proportional フォントに **Yu Gothic Medium** (Windows 標準) を
+使う ([src/main.rs `setup_fonts`](src/main.rs))。Yu Gothic は日本語 + 基本 Latin
++ Latin-1 Supplement までは網羅するが、**Misc Symbols** や **絵文字**は欠落
+していることが多く、UI に置くと **□ (tofu)** で表示される。egui の NotoEmoji
+fallback はあるが、プライマリが「tofu glyph」を返した時点で fallback まで
+到達しない実環境ケースがあり、過去に複数の文字化けバグが繰り返されている
+(2026-04 までに 🎚 / ✕ で発生)。
+
+### 安全な代替表
+
+| 危険 (フォント依存) | 安全 (Latin-1 / ASCII)         |
+|---------------------|---------------------------------|
+| ✕ (U+2715)          | × (U+00D7 multiplication sign)  |
+| ✖ (U+2716)          | × (U+00D7)                      |
+| 🎚 (U+1F39A)         | "VST" 等のテキスト              |
+| 🟢⚫🔴 (status emoji)  | "[ON]" "[OFF]" 等              |
+
+**矢印** ↑ U+2191 / ↓ U+2193 は Yu Gothic に含まれており OK。
+**チェック** ✓ U+2713 / ✗ U+2717 は環境依存 (= 一部 Yu Gothic バリアントには
+ある)。新しい場所で使う前に lint と実機で確認すること。
+
+### コミット前 lint
+
+```bash
+python scripts/check_ui_glyphs.py
+```
+
+`src/` 配下の .rs ファイルから「実際に tofu 化したと確認された Unicode 文字」
+を含む行を列挙する。0 件で exit 0、見つかれば exit 1。
+新たに tofu 報告があった文字は同スクリプトの `DANGEROUS` dict に追加する。
+誤検出の場合は該当行に `// glyph-lint:skip` を付ける。
+
+CI には現状未統合だが、UI 文字列を新規追加・変更したコミット前に手動で
+1 度走らせる慣行にする。
+
 ## UI スナップショットテスト
 
 `tests/ui_snapshot.rs` + `tests/snapshots/*.png` に、`egui_kittest` を使った

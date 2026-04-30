@@ -344,6 +344,10 @@ impl DspBridge {
     /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
         // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
+        // **z-order は触らない**: ユーザーが手で並べた前後関係を保持する。
+        // 旧版は bring_to_front (= SetWindowPos HWND_TOPMOST) を呼んでいたが、
+        // 複数 GUI を一斉に show する際に呼び出し順で z-order が決まり、
+        // 「再表示で順序が変わる」ユーザー報告 (2026-04) の原因になっていた。
         {
             let inner = self.inner.lock().unwrap();
             if let Some(slot) = inner.slots.get(idx) {
@@ -354,8 +358,6 @@ impl DspBridge {
                     let hwnd = slot.gui_hwnd;
                     drop(inner);
                     gui::set_window_visible(hwnd, true);
-                    gui::bring_to_front(hwnd);
-                    // 可視状態を反映 (Mutex 内)
                     let mut inner2 = self.inner.lock().unwrap();
                     if let Some(s2) = inner2.slots.get_mut(idx) {
                         s2.gui_visible = true;

@@ -1621,7 +1621,7 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 }
 
 /// VST3 プラグインチェーン編集 UI (環境設定→動画タブ用)。
-/// - 上: 現在のチェーン (最大 10、↑↓ で並べ替え、✕ で削除)
+/// - 上: 現在のチェーン (最大 10、↑↓ で並べ替え、× で削除)
 /// - 下: プラグイン追加ピッカー (スキャン + 検索)
 #[cfg(windows)]
 fn page_vst3_chain_editor(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -1666,7 +1666,7 @@ fn page_vst3_chain_editor(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         if ui
-                            .small_button("✕")
+                            .small_button("×")
                             .on_hover_text("チェーンから削除")
                             .clicked()
                         {

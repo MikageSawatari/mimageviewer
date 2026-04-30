@@ -13131,14 +13131,27 @@ impl eframe::App for App {
         // worker thread で実行されるので UI スレッドはブロックされない。
         #[cfg(windows)]
         self.kick_off_vst3_startup();
-        // VST3 プラグイン GUI の TOPMOST 切替: フルスクリーン動画再生中のみ手前に出す。
-        // 遷移検出して必要なときだけ z-order 操作 (毎フレーム呼ぶと余計な
-        // SetWindowPos が発生してプラグイン GUI のフォーカスを乱す)。
+        // VST3 プラグイン GUI の TOPMOST 切替 + フルスクリーン解除時の cleanup。
+        // - 遷移時 (= フルスクリーン入退) のみ操作 (毎フレーム呼ぶと余計な SetWindowPos
+        //   が発生してプラグイン GUI のフォーカスを乱す)。
+        // - **フルスクリーン解除**: 動画閲覧をやめたら全プラグイン GUI を隠して
+        //   管理パネルも閉じる (= ユーザー要望「動画再生中のみの表示」を満たす)。
+        //   ついでに動画 compact mode (右上 1/4) も自動解除 (= 次に動画見るときの
+        //   既定をフルサイズに戻す)。
         #[cfg(windows)]
         {
             let is_fs = self.fullscreen_idx.is_some();
             if is_fs != self.vst3_was_fullscreen {
                 self.dsp_bridge.set_all_guis_topmost(is_fs);
+                if !is_fs {
+                    // フルスクリーン解除 → VST 関連 UI を全部畳む
+                    self.dsp_bridge.set_all_guis_visible(false);
+                    self.show_vst3_manager = false;
+                    if self.settings.vst3_video_compact {
+                        self.settings.vst3_video_compact = false;
+                        self.settings.save();
+                    }
+                }
                 self.vst3_was_fullscreen = is_fs;
             }
         }
