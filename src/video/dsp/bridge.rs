@@ -433,7 +433,9 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
     stdout.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     // `plugin_state` event の chunk は plugin によって数百 KB になる
-    // (= ML / preset 内蔵 plugin)。C++ 側 `MAX_CONTROL_MSG_SIZE` と揃える。
+    // (= ML / preset 内蔵 plugin)。
+    // **C++ 側 `crates/vst3-host/include/protocol.h::MAX_CONTROL_MSG_SIZE`
+    // と必ず一致**させること。protocol.h を変えたらここも変える。
     const MAX_CONTROL_MSG_SIZE: usize = 4 * 1024 * 1024;
     if len > MAX_CONTROL_MSG_SIZE {
         return Err(std::io::Error::new(

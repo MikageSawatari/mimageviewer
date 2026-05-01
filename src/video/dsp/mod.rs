@@ -462,14 +462,12 @@ impl DspBridge {
         // 処理時には既に正しいフィルタ係数で動作する (= 初回処理時のクリック軽減)。
         // fire-and-forget (= ack 不要)、失敗時は bridge が `Event::Error` を発行して
         // ログに残るので、起動全体は中断しない。
-        if let Some(s) = initial_state {
-            if !s.is_empty() {
-                if let Err(e) = bridge.send(&Cmd::RestoreState { state: s.to_string() }) {
-                    crate::logger::log(format!(
-                        "[VST3] restore_state send failed for '{}': {e} (続行)",
-                        plugin_name,
-                    ));
-                }
+        if let Some(s) = initial_state.filter(|s| !s.is_empty()) {
+            if let Err(e) = bridge.send(&Cmd::RestoreState { state: s.to_string() }) {
+                crate::logger::log(format!(
+                    "[VST3] restore_state send failed for '{}': {e} (続行)",
+                    plugin_name,
+                ));
             }
         }
 
@@ -520,14 +518,16 @@ impl DspBridge {
         Ok(idx)
     }
 
-    /// 全 Loaded スロットのプラグイン内部状態 (= EQ カーブ / chunk) を順次 query する。
+    /// 全 Loaded スロットのプラグイン内部状態 (= EQ カーブ / chunk) を **並列に** query する。
     /// 戻り値: `(plugin_path, base64_state)` のリスト。失敗した slot は **含めない**
     /// (= 呼出側は path 検索で既存 state を上書きするだけ、失敗 slot の state は保持される)。
     ///
     /// **path をキーにする**: `settings.vst3_plugins` と bridge slots は load 失敗で
     /// index がズレうるため (Codex P2、2026-05-01)。path 一意性は preferences が保証。
     ///
-    /// **timeout**: 各 query 1000ms。チェーン上限 10 個で worst case 10 秒。
+    /// **並列実行**: 各 bridge への IPC は独立 (= 別子プロセス + 別 stdin/stdout +
+    /// 別 shm) なので、N 個の `query_state_sync` を並列に走らせて total wait を
+    /// `N × 1秒` から `max(1秒)` に短縮する。チェーン上限 10 個で worst case ~1 秒。
     /// shutdown / settings.save 経由で呼ばれるので UI 同期 hot-path には乗らない。
     /// bypass の slot も query する (= 内部 state はあるので保存対象)。
     pub fn snapshot_all_plugin_states(&self) -> Vec<(String, String)> {
@@ -543,17 +543,33 @@ impl DspBridge {
                 .map(|s| (s.plugin_path.clone(), s.bridge.clone()))
                 .collect()
         };
-        let mut out = Vec::with_capacity(bridges.len());
+        if bridges.is_empty() {
+            return Vec::new();
+        }
         let timeout = std::time::Duration::from_secs(1);
-        for (path, b) in bridges {
-            match b.query_state_sync(timeout) {
-                Ok(state) => out.push((path, state)),
-                Err(e) => {
-                    crate::logger::log(format!(
-                        "[VST3] snapshot_all_plugin_states: query failed for '{}': {e}",
-                        path,
-                    ));
-                }
+        // 各 bridge ごとに thread を spawn して query_state_sync を並列実行。
+        // bridge は Arc なのでクローンで thread に渡せる。
+        let handles: Vec<std::thread::JoinHandle<(String, Result<String, String>)>> =
+            bridges
+                .into_iter()
+                .map(|(path, b)| {
+                    std::thread::spawn(move || {
+                        let result = b.query_state_sync(timeout);
+                        (path, result)
+                    })
+                })
+                .collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok((path, Ok(state))) => out.push((path, state)),
+                Ok((path, Err(e))) => crate::logger::log(format!(
+                    "[VST3] snapshot_all_plugin_states: query failed for '{}': {e}",
+                    path,
+                )),
+                Err(_) => crate::logger::log(
+                    "[VST3] snapshot_all_plugin_states: worker thread panicked".to_string(),
+                ),
             }
         }
         out

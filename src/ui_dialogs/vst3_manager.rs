@@ -300,9 +300,7 @@ impl App {
                 // 復元した user_hidden=true を、ユーザーが「GUI」ボタンで上書き)。
                 let mut changed = !self.settings.vst3_gui_visible;
                 self.settings.vst3_gui_visible = true;
-                if let Some(entry) =
-                    self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
-                {
+                if let Some(entry) = self.find_vst3_entry_mut(&path) {
                     if entry.user_hidden {
                         entry.user_hidden = false;
                         changed = true;
@@ -317,9 +315,7 @@ impl App {
             // ユーザーが個別に GUI × した → user_hidden=true をセット
             // (= 以降の VST 全表示でも skip される、再起動後も維持)
             self.dsp_bridge.user_hide_slot_gui(idx);
-            if let Some(entry) =
-                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
-            {
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
                 if !entry.user_hidden {
                     entry.user_hidden = true;
                     self.settings.save();
@@ -329,9 +325,7 @@ impl App {
         if let Some((idx, path, bypass)) = clicked_toggle_bypass {
             self.dsp_bridge.set_bypass(idx, bypass);
             // settings 側も同期 (= 永続化、次回起動時にこの bypass で復元される)
-            if let Some(entry) =
-                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
-            {
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
                 entry.bypass = bypass;
                 self.settings.save();
             }

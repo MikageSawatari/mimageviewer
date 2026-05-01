@@ -6,16 +6,29 @@
 #![cfg(windows)]
 
 use crate::app::App;
+use crate::settings::Vst3PluginEntry;
 
 impl App {
+    /// `settings.vst3_plugins` を **plugin_path** で検索する共通 helper。
+    /// bridge slot idx と settings idx は load 失敗で詰まるとズレるため
+    /// (Codex P2、2026-05-01)、path をキーに entry を引く流儀に統一する。
+    /// path は preferences 側で重複追加を弾いているので一意。
+    pub(crate) fn find_vst3_entry_mut(
+        &mut self,
+        path: &str,
+    ) -> Option<&mut Vst3PluginEntry> {
+        self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
+    }
+
     /// 全 Loaded プラグインの内部状態 (= EQ カーブ / chunk) を bridge から取得して、
     /// `settings.vst3_plugins` の対応する entry の `state` フィールドに **path 一致**
     /// で書き込む。**呼び出し側で `self.settings.save()` を別途呼ぶこと**。
     /// 戻り値: 更新された entry 数 (= 0 なら save 不要の判断材料に使える)。
     ///
-    /// **同期で走る**: 各 plugin への IPC roundtrip × 通常 10ms / hung 時 1000ms。
-    /// チェーン上限 10 個で worst case 10 秒だが、典型は数十 ms。on_exit / chain
-    /// rebuild など save 直前のフックで 1 回だけ呼ぶ想定 (= UI hot-path には乗らない)。
+    /// **並列で走る**: bridge ごとに別スレッドを spawn して `query_state_sync` を
+    /// 同時実行する (1s timeout)。チェーン上限 10 個で worst case ~1 秒、
+    /// 典型は数十 ms。on_exit / chain rebuild など save 直前のフックで 1 回だけ
+    /// 呼ぶ想定 (= UI hot-path には乗らない)。
     pub(crate) fn snapshot_vst3_states_into_settings(&mut self) -> usize {
         if !self.settings.vst3_enabled {
             return 0;
@@ -23,9 +36,7 @@ impl App {
         let snapshots = self.dsp_bridge.snapshot_all_plugin_states();
         let mut updated = 0;
         for (path, state) in snapshots {
-            if let Some(entry) =
-                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
-            {
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
                 let new_state = Some(state);
                 if entry.state != new_state {
                     entry.state = new_state;
@@ -49,9 +60,7 @@ impl App {
         }
         let mut changed = false;
         for path in user_hidden_paths {
-            if let Some(entry) =
-                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
-            {
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
                 if !entry.user_hidden {
                     entry.user_hidden = true;
                     changed = true;

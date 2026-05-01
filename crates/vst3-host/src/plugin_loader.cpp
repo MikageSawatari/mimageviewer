@@ -560,15 +560,21 @@ bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
     // setState 中の audio 処理クリック対策: 一時的に setProcessing(false) で停止する。
     // VST3 仕様上 setState は active でも許可されているが、内部状態の途中書換による
     // 1 ブロック分のクリックを避けるため。
+    // RAII guard で「pause 中に return しても必ず resume される」ことを保証する
+    // (= setState 失敗時 / controller setState 失敗時の二重 re-enable 重複を排除)。
+    struct ProcessingPauseGuard {
+        Steinberg::Vst::IAudioProcessor* p;
+        bool was_processing;
+        ~ProcessingPauseGuard() {
+            if (was_processing && p) p->setProcessing(true);
+        }
+    };
     bool was_processing = active_;
     if (was_processing && processor_) {
         processor_->setProcessing(false);
     }
-    auto setres = component_->setState(&stream);
-    if (setres != Steinberg::kResultOk) {
-        if (was_processing && processor_) {
-            processor_->setProcessing(true);
-        }
+    ProcessingPauseGuard guard{processor_.get(), was_processing};
+    if (component_->setState(&stream) != Steinberg::kResultOk) {
         return false;
     }
     // controller 側にも同じ state を流して UI 表示と整合させる。
@@ -577,9 +583,6 @@ bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
         if (stream.seek(0, Steinberg::IBStream::kIBSeekSet, &zero2) == Steinberg::kResultOk) {
             controller_->setComponentState(&stream);
         }
-    }
-    if (was_processing && processor_) {
-        processor_->setProcessing(true);
     }
     return true;
 }

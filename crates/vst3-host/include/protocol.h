@@ -81,7 +81,9 @@ constexpr uint32_t PROTOCOL_VERSION = 1;
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は
 // プラグインによっては数百 KB に達する (= ML 系プラグインや、波形 / プリセット
 // 内蔵プラグイン)。base64 化で +33% の overhead を考えても、4 MB あれば実用上
-// 困らない。Rust 側 `read_event_blocking` も同じ上限。
+// 困らない。
+// **Rust 側 `src/video/dsp/bridge.rs::read_event_blocking` の同名定数と必ず
+// 一致**させること。ここを変えたら Rust 側も同期する。
 constexpr uint32_t MAX_CONTROL_MSG_SIZE = 4 * 1024 * 1024;
 
 }  // namespace miv
