@@ -15,7 +15,7 @@
 //! [`AudioOutput`] が drop されたら自動で停止する。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,6 +23,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
+use super::engine::actor::state_code;
 
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
 /// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
@@ -56,13 +57,62 @@ impl Drop for AudioOutput {
     }
 }
 
-/// 共有 ring buffer (interleaved stereo f32)。Mutex 保護。
-/// RT 性能が必要なら lock-free に置き換え。今は WASAPI Shared 数 ms 周期なので
-/// Mutex で実用上問題ない (コンテンションは pump thread と RT 1:1)。
+/// **post-VST 処理済 chunk** (raw/processed 分離設計、Codex 助言 2026-05)。
+///
+/// pump が raw_pending から取り出した AudioFrame を VST process_block して作る。
+/// fill_output は processed queue の先頭 chunk から順に drain する。
+///
+/// chunk 単位で metadata を持つことで:
+/// - PDC 変化時に「どの latency で処理した output か」を追跡できる
+/// - seek 後の `audible_pts < target` を chunk 単位で trim できる (= pre-seek 漏れ防止)
+/// - BufferReady 判定が**post-VST の audible 秒数のみ**で計算できる (= raw を含めない)
+struct ProcessedChunk {
+    /// post-VST interleaved stereo f32 サンプル。
+    samples: Vec<f32>,
+    /// **audible PTS** = この chunk の最初のサンプルが「実際にスピーカーから聞こえる」
+    /// PTS (秒)。`input_pts - pdc_latency_at_process` で計算。video clock 同期に使う。
+    /// 現状の fill_output は `buf.next_pts_secs` ベースで pts 進行を計算するため未参照だが、
+    /// 将来の PDC chunk-aware drain 実装で使用予定 (= 同期精度向上)。
+    #[allow(dead_code)]
+    audible_pts_secs: f64,
+    /// chunk の音声時間 (秒) = `samples.len() / samples_per_sec`。
+    /// BufferReady 判定や processed cap 比較で再計算を避けるためキャッシュ。
+    duration_secs: f64,
+    /// この chunk がどの seek 世代で生成されたか (= stale 判定用)。
+    seek_serial: u64,
+    /// VST process した時点の合計 PDC latency。後続 chunk と差があれば video clock
+    /// jump で吸収 (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
+    /// 現状は fill_output が `buf.pdc_latency_secs` (= 最新 pump 更新値) を使うため
+    /// 未参照だが、将来の chunk-aware PDC jump 判定で使用予定。
+    #[allow(dead_code)]
+    pdc_latency_secs_at_process: f64,
+}
+
+/// 共有 ring buffer (Mutex 保護)。**raw / processed 2 段構造** (Codex 助言 2026-05)。
+///
+/// - `raw_pending`: pump が積む pre-VST AudioFrame queue (cap = 10 秒)。Buffering 中も
+///   pump が back-pressure せずに処理を続けられるようにするためのバッファ。
+/// - `processed`: post-VST chunk queue (cap = 0.3 秒 audible 相当)。fill_output が drain。
+///   ここの長さが **EQ latency = ユーザーの設定変更が音に届くまでの時間**。
+///
+/// pump は「processed が 0.3 秒未満の間だけ」raw → VST process → processed を実行する。
+/// EQ 設定変更後の VST process_block には新しい係数が適用され、processed queue 末尾に
+/// 並んで 0.3 秒以内にスピーカーへ届く。
 struct AudioBuffer {
-    /// 未消費サンプル列 (interleaved stereo)。
-    samples: std::collections::VecDeque<f32>,
-    /// `samples` の先頭サンプル (= 次に消費されるサンプル) の PTS (秒)。
+    /// post-VST 処理済 chunk queue。fill_output が `drain_offset_in_first` を進めて
+    /// drain。chunk が空になったら pop_front + drain_offset_in_first=0 にリセット。
+    processed: std::collections::VecDeque<ProcessedChunk>,
+    /// `processed.front()` 内の **次に drain されるサンプルの index** (= interleaved stereo)。
+    /// fill_output が advance、chunk fully drain で 0 にリセット + pop_front。
+    drain_offset_in_first: usize,
+    /// pre-VST raw AudioFrame queue。pump が積む。VST process は `pump_drain_raw_to_processed`
+    /// で「processed が cap 未満の間だけ」実行される。
+    /// cap = `cap_secs_raw_overflow` 相当 (= 10 秒)。超過は overflow フラグを立てる。
+    raw_pending: std::collections::VecDeque<AudioFrame>,
+    /// processed の **次に出力されるサンプルの input PTS (秒)**。
+    /// 通常は `processed.front().audible_pts_secs + drain_offset/samples_per_sec` だが、
+    /// 旧コードとの互換のため `next_pts_secs` を維持する (= clock.set_audio_pts に渡す値)。
+    /// processed が空 (= underrun) のときは「次に届く samples の予測 pts」として保持。
     next_pts_secs: f64,
     /// 出力サンプルレート (Hz)。
     sample_rate: u32,
@@ -127,6 +177,7 @@ pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_state: Arc<AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
@@ -147,7 +198,9 @@ pub fn start(
     };
 
     let buffer = Arc::new(Mutex::new(AudioBuffer {
-        samples: std::collections::VecDeque::with_capacity((sample_rate as usize) * 2),
+        processed: std::collections::VecDeque::with_capacity(32),
+        drain_offset_in_first: 0,
+        raw_pending: std::collections::VecDeque::with_capacity(64),
         next_pts_secs: 0.0,
         sample_rate,
         samples_per_sec: sample_rate as f64 * 2.0,
@@ -159,11 +212,12 @@ pub fn start(
     let cancel = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
-    // ── pump thread: audio_rx → (optional VST3 bridge) → buffer ──
+    // ── pump thread: audio_rx → raw_pending → (VST process) → processed → buffer ──
     let pump_buffer = buffer.clone();
     let pump_cancel = cancel.clone();
     let pump_clock = clock.clone();
     let pump_engine_event_tx = engine_event_tx.clone();
+    let pump_engine_state = engine_state.clone();
     #[cfg(windows)]
     let pump_dsp_bridge = dsp_bridge;
     let pump_handle = std::thread::Builder::new()
@@ -176,6 +230,7 @@ pub fn start(
                 pump_cancel,
                 pump_clock,
                 pump_engine_event_tx,
+                pump_engine_state,
                 #[cfg(windows)]
                 pump_dsp_bridge,
             );
@@ -185,11 +240,12 @@ pub fn start(
     // ── cpal output callback: buffer → device ──
     let cb_buffer = buffer.clone();
     let cb_clock = clock.clone();
+    let cb_engine_state = engine_state.clone();
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_output(out, &cb_buffer, &cb_clock);
+                fill_output(out, &cb_buffer, &cb_clock, &cb_engine_state);
             },
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
@@ -222,8 +278,16 @@ pub fn start(
 /// decoder pacing 側は actual buffer 残量で `audio_escape` を判定し、先読み許可量だけ
 /// `PACE_LEAD + pdc_latency` を加算する設計。
 fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
-    let secs = buf.samples.len() as f64 / buf.samples_per_sec;
-    clock.set_audio_pump_buf_secs(secs);
+    // **processed audible 秒数のみ** を publish する (Codex P1-2、raw は含めない)。
+    // decoder pacing 側はこれを actual playable backlog として扱い、underrun
+    // 判定や PACE_LEAD 計算に使う。
+    let secs: f64 = buf
+        .processed
+        .iter()
+        .map(|c| c.duration_secs)
+        .sum::<f64>()
+        + remaining_first_chunk_secs(buf);
+    clock.set_audio_pump_buf_secs(secs.max(0.0));
     clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
 }
 
@@ -248,8 +312,17 @@ fn boost_audio_pump_priority() {
     }
 }
 
-/// `dsp_bridge` が渡されていて enable 状態のとき、pump で受け取った frame を
-/// VST3 プラグイン経由に通してから AudioBuffer に push する。
+/// raw / processed 2 段構造の audio pump (Codex 助言、2026-05)。
+///
+/// **動作**:
+/// 1. audio_rx から `AudioFrame` を受信
+/// 2. seek serial 切替時は VST plugin sync reset (= 既存挙動)
+/// 3. raw_pending に push (= cap=10秒 を超えたら overflow)
+/// 4. processed が cap (= 0.3秒) 未満の間、raw → VST process → processed をループ
+/// 5. processed の post-VST audible 秒数で BufferReady emit (= raw を**含めない**)
+///
+/// **mutex ポリシー** (Codex P2-B): VST IPC (= bridge.process_block) 中は
+/// AudioBuffer mutex を解放する。lock → pop raw → unlock → process → lock → push processed。
 fn run_pump(
     rx: Receiver<AudioFrame>,
     shutdown_rx: crossbeam_channel::Receiver<()>,
@@ -257,79 +330,50 @@ fn run_pump(
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_state: Arc<AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
+    let _ = engine_state; // 現状は logging 等で使う想定、API 互換のため受け取る
     #[cfg(windows)]
     boost_audio_pump_priority();
 
-    // VST3 プラグイン処理用の出力バッファ (= bridge.process_block の dst)。
-    // frame サイズに応じて伸縮させるが、頻繁な realloc を避けるため
-    // 初期容量を 4096 (= 約 0.04 秒@48kHz stereo) で確保する。
+    // VST3 process_block 用の出力バッファ。再利用して realloc を抑える。
     #[cfg(windows)]
     let mut fx_out: Vec<f32> = Vec::with_capacity(4096);
-    // ── 出力バッファ厚 (audio_buffer の cap) ──
-    //
-    // この長さは「VST プラグインが処理した audio が **スピーカーから出るまでの** 遅延」
-    // に直結する。pump → bridge → audio_buffer → cpal → 出力 のパイプラインで、
-    // pump はバッファが満杯にならない限りすぐに次のフレームを処理するため、
-    // バッファ fill = 「**プラグインで加工済みの audio が並んでいる量**」となる。
-    //
-    // ユーザーが EQ ノブを動かす → プラグインの新しい係数で audio 加工 →
-    // pump が新加工 audio を audio_buffer に push → cpal が audio_buffer から順次
-    // pop して出力。**ユーザー操作 → 音への反映 = audio_buffer fill 量**。
-    //
-    // 旧版は 1.5 秒固定にしていたが、ユーザー報告 (2026-04) で「EQ 反映が
-    // 数百 ms 遅れる」が判明 → **300 ms に縮小**して反応性を確保する。
-    // 0.5 秒以下にすると cpal の RT 周期 (= 10-20 ms) と pump の処理時間ジッタ
-    // で稀に underrun (= 一瞬の無音) が出るリスクがあるが、300 ms あれば
-    // VST3 bridge IPC roundtrip (= ~1-5 ms) の数十倍の余裕があるので実用上は安定。
-    //
-    // ※ samples は interleaved stereo (channels=2)。
-    // sample_rate は構築時に固定なので 1 度だけロックして拾う。
-    const TARGET_BUFFER_SECS: f64 = 0.3;
-    let cap_samples = {
-        let b = buffer.lock().unwrap();
-        (b.sample_rate as f64 * 2.0 * TARGET_BUFFER_SECS) as usize
-    };
 
-    // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。
-    // 設計 v3 では 500ms (= 250ms low + hysteresis 想定) で確定したが、Phase 8.K で
-    // 実測した結果、典型的な audio_buf は 200-400ms 範囲を hover し 500ms に到達しない
-    // ことが判明 (= 単一 demux+decode スレッドで video pacing と競合している影響)。
-    // 結果として BufferReady が発火せず engine が永久 Buffering、video decoder の
-    // pace_lead=0 で「ahead < 0.20s cap」状態が続き future_frames が枯渇 → buf strip
-    // が常時黄色になっていた。150ms に下げて typical level の下回りに合わせる。
-    // (= 後続の demux thread split refactor で本来の余裕に戻したい)
+    // ── processed queue cap (= EQ latency target) ──
+    // EQ 設定変更が音に届くまでの最大時間 = processed 秒数。300ms 目標。
+    const TARGET_PROCESSED_SECS: f64 = 0.3;
+    // ── BufferReady 閾値 ──
+    // Buffering → Playing の遷移トリガ (level event)。
     const READY_THRESHOLD_SECS: f64 = 0.15;
+    // ── raw_pending overflow / warning ──
+    // pump back-pressure を完全に避けるため raw 側は大きく持つが、安全網として上限。
+    // 5 秒で warning ログ、10 秒で overflow → AudioInactive fallback。
+    const RAW_WARNING_SECS: f64 = 5.0;
+    const RAW_OVERFLOW_SECS: f64 = 10.0;
+
+    let sample_rate = buffer.lock().unwrap().sample_rate;
+    let samples_per_sec = (sample_rate as f64) * 2.0;
+    let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
 
     let mut activated = false;
-    // VST3 sync reset 用の世代追跡。新 seek 世代の最初の有効 frame を検出したら、
-    // 「VST process_block の前」に sync reset (= bridge audio thread が in/out ring drain
-    // + plugin reset + ResetDone ack) を実行し、ack 受信後に post-seek audio を流す。
-    // これで pre-seek audio が plugin delay-line から漏れることを防ぐ
-    // (= Codex 助言、2026-05-01、シーク後 pre-seek audio 残留問題の解消)。
     let mut last_seen_seek_serial: u64 = 0;
+    let mut overflow_alerted_for_serial: Option<u64> = None;
+    let mut last_warning_at: Option<std::time::Instant> = None;
+
     while !cancel.load(Ordering::Acquire) {
-        // shutdown 通知が先に来たら即抜ける (drop 時のレイテンシ削減)。
-        // 通常時は audio_rx の recv_timeout で 100ms 周期に cancel 確認。
         let frame = crossbeam_channel::select! {
             recv(shutdown_rx) -> _ => return,
             recv(rx) -> msg => match msg {
                 Ok(f) => f,
-                Err(_) => break, // disconnected
+                Err(_) => break,
             },
         };
 
-        // recv 直後に audio_tx queued 合計から減算 (decoder send 時 + に対応)
         clock.add_audio_tx_queued_secs(-frame.duration_secs);
 
-        // ── 新 seek 世代の検出 → VST plugin sync reset (= 内部 delay-line + ring 完全 flush) ──
-        // PDC が大きいプラグインは内部 delay-line に pre-seek 音声を持っており、
-        // 単純な non-sync reset では bridge audio thread と GUI thread の race で
-        // pre-seek audio が漏れていた。bridge 側で audio thread 自身が reset を実行し、
-        // ResetDone ack を待つことで race 完全排除 (= 200ms timeout、Codex 助言)。
-        // skip された stale frame では発火しない (= 後述の skip check より前なので
-        // pump_seek_serial と clock_serial の比較も含む)。
+        // ── 新 seek 世代の検出 → VST plugin sync reset (= 既存挙動) ──
         let frame_seek_serial = frame.seek_serial;
         let cur_clock_serial = clock.current_seek_serial();
         if frame_seek_serial > last_seen_seek_serial
@@ -342,176 +386,262 @@ fn run_pump(
                 }
             }
             last_seen_seek_serial = frame_seek_serial;
+            overflow_alerted_for_serial = None; // 新 seek 世代で overflow 警告 reset
         }
 
-        // バッファ満杯なら一旦待つ。Condvar 化は将来の最適化。
-        loop {
-            let len = buffer.lock().unwrap().samples.len();
-            if len < cap_samples || cancel.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // ── VST3 plugin processing (optional) ──
-        // bridge が enable=true & active_slot_count > 0 のときだけ frame.samples を bridge に通す。
-        // 通常の動画再生 (= VST3 disable / 全 bypass) ではゼロオーバーヘッド (= 2 つの atomic 読み)。
-        // 同時に PDC (Plugin Delay Compensation) 用の latency 値も取得しておく。
-        #[cfg(windows)]
-        let (processed_samples, current_pdc_latency_secs): (std::borrow::Cow<'_, [f32]>, f64) =
-            if let Some(b) = &dsp_bridge {
-                if b.is_enabled() && b.active_slot_count() > 0 {
-                    fx_out.resize(frame.samples.len(), 0.0);
-                    let processed: std::borrow::Cow<'_, [f32]> =
-                        if let Err(e) = b.process_block(&frame.samples, &mut fx_out) {
-                            crate::logger::log(format!("vst3 process_block failed: {e}"));
-                            std::borrow::Cow::Borrowed(&frame.samples[..])
-                        } else {
-                            std::borrow::Cow::Borrowed(&fx_out[..])
-                        };
-                    // PDC: アクティブスロット (= !bypass && Loaded) の latency_samples を合算。
-                    // sample_rate は buffer 構築時に固定なので、frame.sample_rate ではなく
-                    // buffer の sample_rate を使う (= cpal output と同じ rate)。
-                    let total_lat_samples = b.total_latency_samples();
-                    let lat_secs = if total_lat_samples > 0 {
-                        let sr = buffer.lock().unwrap().sample_rate;
-                        total_lat_samples as f64 / sr as f64
-                    } else {
-                        0.0
-                    };
-                    (processed, lat_secs)
-                } else {
-                    (std::borrow::Cow::Borrowed(&frame.samples[..]), 0.0)
-                }
-            } else {
-                (std::borrow::Cow::Borrowed(&frame.samples[..]), 0.0)
-            };
-        #[cfg(not(windows))]
-        let processed_samples: &[f32] = &frame.samples;
-        #[cfg(not(windows))]
-        let current_pdc_latency_secs: f64 = 0.0;
-
-        // 古い seek_serial の破棄 + push を 1 ロックで実行。
-        // clock.current_seek_serial() より古いフレームは、audio_tx に
-        // 積まれていた pre-seek の遅延フレームなので捨てる (新世代に追い付くため)。
-        let clock_serial = clock.current_seek_serial();
-        let mut buf = buffer.lock().unwrap();
-        if frame.seek_serial < buf.pump_seek_serial || frame.seek_serial < clock_serial {
+        // ── stale check (= clock より古い世代は破棄) ──
+        if frame_seek_serial < cur_clock_serial {
             continue;
         }
-        // audio master 化は **stale 破棄を通過したフレーム** で実施
-        // (= pre-seek の古い frame で audio master をフラグ立てない)。
+
+        // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
+        let raw_total_secs = {
+            let mut buf = buffer.lock().unwrap();
+
+            // pump_seek_serial 切替 → processed + raw_pending 両方クリア
+            if frame_seek_serial > buf.pump_seek_serial {
+                buf.processed.clear();
+                buf.drain_offset_in_first = 0;
+                buf.raw_pending.clear();
+                buf.next_pts_secs = frame.pts_secs;
+                buf.pump_seek_serial = frame_seek_serial;
+            } else if frame_seek_serial < buf.pump_seek_serial {
+                // pump_seek_serial より更に古い (= レース時の保険)
+                drop(buf);
+                continue;
+            } else if buf.processed.is_empty()
+                && buf.raw_pending.is_empty()
+                && frame.pts_secs > buf.next_pts_secs
+            {
+                // underrun resync は前進方向のみ
+                buf.next_pts_secs = frame.pts_secs;
+            }
+
+            // overflow check: raw 合計秒数を計算 (= duration 単位、Codex P2-A 助言)
+            let raw_secs: f64 = buf
+                .raw_pending
+                .iter()
+                .map(|f| f.duration_secs)
+                .sum::<f64>()
+                + frame.duration_secs;
+
+            if raw_secs <= RAW_OVERFLOW_SECS {
+                buf.raw_pending.push_back(frame);
+            }
+            // else: 後続の overflow_alerted で対応
+            raw_secs
+        };
+
+        // ── overflow / warning 通知 (Codex P1-1: silent drop しない) ──
+        if raw_total_secs > RAW_OVERFLOW_SECS {
+            // overflow: その seek 世代について 1 回だけ AudioInactive を emit して
+            // engine を wall master に切り替える。pump は overflow 中も demux/decode を
+            // 詰まらせないため、frame は drop するが次世代まで継続。
+            if overflow_alerted_for_serial != Some(frame_seek_serial) {
+                crate::logger::log(format!(
+                    "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
+                     seek_serial={frame_seek_serial}: switching to wall-master fallback",
+                    raw_total_secs, RAW_OVERFLOW_SECS,
+                ));
+                let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
+                    crate::video::engine::state::AudioEvent::AudioInactive,
+                ));
+                overflow_alerted_for_serial = Some(frame_seek_serial);
+            }
+        } else if raw_total_secs > RAW_WARNING_SECS {
+            // warning: 5秒に 1 度ログ。長時間 Buffering の診断用。
+            let now = std::time::Instant::now();
+            let should_log = match last_warning_at {
+                None => true,
+                Some(t) => now.duration_since(t).as_secs() >= 5,
+            };
+            if should_log {
+                crate::logger::log(format!(
+                    "[audio-pump] raw_pending high water ({:.1}s > {:.1}s warning)",
+                    raw_total_secs, RAW_WARNING_SECS,
+                ));
+                last_warning_at = Some(now);
+            }
+        }
+
+        // audio master 化 (= stale 通過後の最初のフレーム)
         if !activated {
             clock.notify_audio_active();
             activated = true;
         }
-        if frame.seek_serial > buf.pump_seek_serial {
-            // 新しい seek 世代: バッファをクリアして PTS を再設定
-            buf.samples.clear();
-            buf.next_pts_secs = frame.pts_secs;
-            buf.pump_seek_serial = frame.seek_serial;
-            // Phase 8.K: BufferReady は level event 化したため latch 不要。
-        } else if buf.samples.is_empty() && frame.pts_secs > buf.next_pts_secs {
-            // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)
-            buf.next_pts_secs = frame.pts_secs;
-        }
-        buf.samples.extend(processed_samples.iter().copied());
-        // PDC (Plugin Delay Compensation) latency を反映。fill_output で video clock
-        // 計算時に減算される。値が変化したらログに残す (= プラグインモード切替の検出)。
-        if (buf.pdc_latency_secs - current_pdc_latency_secs).abs() > 1e-6 {
-            crate::logger::log(format!(
-                "PDC latency changed: {:.3}ms -> {:.3}ms",
-                buf.pdc_latency_secs * 1000.0,
-                current_pdc_latency_secs * 1000.0
-            ));
-            buf.pdc_latency_secs = current_pdc_latency_secs;
-        }
-        publish_buffer_secs(&buf, &clock);
 
-        // ── BufferReady emit (Phase 3d / 8.K) ──
-        // buffer 残量が READY_THRESHOLD に到達したら EngineActor に通知する
-        // (= Buffering → Playing 遷移トリガ)。
-        //
-        // Phase 8.K (Codex P1): 旧コードは「同 seek_serial 内では 1 度だけ」
-        // (`buffer_ready_emitted_serial`) で edge event 化していたが、エンジンが
-        // Loading 状態の間に届くと InfoReceived → transition_to_buffering で
-        // latch がリセットされ、その後二度と emit されない race があった。
-        // → level event 化し、threshold を超えている間は毎 frame emit する。
-        // EngineActor 側は idempotent (`latch.buffer_ready=true` の repeat set)
-        // なので過剰 emit は無害。`bounded(64)` の channel は full なら try_send
-        // で drop されるが、次 frame の emit で復旧する。
-        let buf_secs = buf.samples.len() as f64 / buf.samples_per_sec;
-        let cur_pts = buf.next_pts_secs;
-        let cur_serial = buf.pump_seek_serial;
-        drop(buf);
-        if buf_secs >= READY_THRESHOLD_SECS {
-            let _ = engine_event_tx.try_send(
-                crate::video::engine::EngineEvent::Audio(
-                    crate::video::engine::state::AudioEvent::BufferReady {
-                        epoch: cur_serial,
-                        pts: cur_pts,
-                        wall_now: std::time::Instant::now(),
-                    },
-                ),
-            );
+        // ── raw → VST process → processed loop ──
+        // mutex を持たずに VST process_block を呼ぶ (Codex P2-B):
+        // 1. lock → pop raw_pending → unlock
+        // 2. process_block (no lock)
+        // 3. lock → seek_serial check → push processed → unlock
+        loop {
+            // 現在の processed 秒数 (= cap 比較用) を lock 内で取得
+            let (current_processed_secs, raw_chunk_opt, target_serial) = {
+                let mut buf = buffer.lock().unwrap();
+                let cur_secs: f64 = buf
+                    .processed
+                    .iter()
+                    .map(|c| c.duration_secs)
+                    .sum::<f64>()
+                    + remaining_first_chunk_secs(&buf);
+                if cur_secs >= TARGET_PROCESSED_SECS {
+                    (cur_secs, None, buf.pump_seek_serial)
+                } else if let Some(raw) = buf.raw_pending.pop_front() {
+                    (cur_secs, Some(raw), buf.pump_seek_serial)
+                } else {
+                    (cur_secs, None, buf.pump_seek_serial)
+                }
+            };
+
+            let _ = current_processed_secs; // 計測用に取得、未使用なら drop
+            let raw = match raw_chunk_opt {
+                Some(r) => r,
+                None => break,
+            };
+
+            // ── VST process_block (mutex 解放中) ──
+            #[cfg(windows)]
+            let (output_samples, current_pdc_latency_secs): (Vec<f32>, f64) =
+                if let Some(b) = &dsp_bridge {
+                    if b.is_enabled() && b.active_slot_count() > 0 {
+                        fx_out.resize(raw.samples.len(), 0.0);
+                        let success = b.process_block(&raw.samples, &mut fx_out).is_ok();
+                        if !success {
+                            crate::logger::log("vst3 process_block failed");
+                        }
+                        let total_lat_samples = b.total_latency_samples();
+                        let lat_secs = if total_lat_samples > 0 {
+                            total_lat_samples as f64 / sample_rate as f64
+                        } else {
+                            0.0
+                        };
+                        if success {
+                            (fx_out.clone(), lat_secs)
+                        } else {
+                            (raw.samples.clone(), lat_secs)
+                        }
+                    } else {
+                        (raw.samples.clone(), 0.0)
+                    }
+                } else {
+                    (raw.samples.clone(), 0.0)
+                };
+            #[cfg(not(windows))]
+            let (output_samples, current_pdc_latency_secs): (Vec<f32>, f64) =
+                (raw.samples.clone(), 0.0);
+
+            // ── chunk metadata 計算 ──
+            // audible_pts = input_pts - pdc_latency (Codex P1-3 反映、PDC 正しい同期用)
+            let duration_secs = output_samples.len() as f64 / samples_per_sec;
+            let audible_pts_secs =
+                (raw.pts_secs - current_pdc_latency_secs).max(0.0);
+            let chunk = ProcessedChunk {
+                samples: output_samples,
+                audible_pts_secs,
+                duration_secs,
+                seek_serial: raw.seek_serial,
+                pdc_latency_secs_at_process: current_pdc_latency_secs,
+            };
+
+            // ── lock 再取得して processed に push (= seek serial check) ──
+            let mut buf = buffer.lock().unwrap();
+            if chunk.seek_serial != target_serial || chunk.seek_serial != buf.pump_seek_serial {
+                // seek 世代が変わった (= chunk は stale) → drop
+                continue;
+            }
+            // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
+            // global pdc_latency_secs も維持)
+            if (buf.pdc_latency_secs - current_pdc_latency_secs).abs() > 1e-6 {
+                crate::logger::log(format!(
+                    "PDC latency changed: {:.3}ms -> {:.3}ms",
+                    buf.pdc_latency_secs * 1000.0,
+                    current_pdc_latency_secs * 1000.0
+                ));
+                buf.pdc_latency_secs = current_pdc_latency_secs;
+            }
+            buf.processed.push_back(chunk);
+        }
+
+        // ── publish_buffer_secs + BufferReady emit ──
+        // BufferReady は **processed のみ** で判定 (Codex P1-2、raw を含めない)
+        let (processed_secs, cur_pts, cur_serial) = {
+            let buf = buffer.lock().unwrap();
+            publish_buffer_secs(&buf, &clock);
+            let secs: f64 = buf
+                .processed
+                .iter()
+                .map(|c| c.duration_secs)
+                .sum::<f64>()
+                + remaining_first_chunk_secs(&buf);
+            (secs, buf.next_pts_secs, buf.pump_seek_serial)
+        };
+        if processed_secs >= READY_THRESHOLD_SECS {
+            let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
+                crate::video::engine::state::AudioEvent::BufferReady {
+                    epoch: cur_serial,
+                    pts: cur_pts,
+                    wall_now: std::time::Instant::now(),
+                },
+            ));
         }
     }
-    // ── 終了時の silence flush ──
-    // VST3 bridge の in_ring に残った最終 audio がプラグイン visualizer (LUFS / EQ
-    // analyzer 等) に表示され続けるのを止めるため、無音ブロックを 10 個 (= 約 100ms)
-    // 流して bridge → プラグインの内部状態を 0 に落とす。
-    // bridge プロセス自体は DspBridge に保持されたまま生存するので、次の動画再生で
-    // 再利用される。
+    // ── 終了時の silence flush (= 既存) ──
     #[cfg(windows)]
     if let Some(b) = &dsp_bridge {
         if b.is_enabled() && b.active_slot_count() > 0 {
-            // block_size は decoder/cpal と同じ 480 で固定 (= 暫定)。
             b.flush_silence(480, 10);
         }
     }
     crate::logger::log("audio-pump terminated");
 }
 
+/// processed.front() の残り audible 秒数を返す (= drain_offset_in_first 後の未消費部分)。
+/// `cur_secs` の計算で `processed.iter().sum(duration_secs)` は完全な chunk のみカウント
+/// するため、front の途中まで drain したケースを補正するために加算する。
+fn remaining_first_chunk_secs(buf: &AudioBuffer) -> f64 {
+    if let Some(first) = buf.processed.front() {
+        let consumed = buf.drain_offset_in_first as f64 / buf.samples_per_sec;
+        // 完全 chunk の duration を一度引いて、残り部分だけ加える表現にすると複雑なので、
+        // **front 全体は別途 sum() に含む前提で、消費分だけ引く**:
+        // sum(duration_secs of all chunks) - drain_offset/samples_per_sec
+        // 呼び出し元で `total_secs = sum() + remaining_first_chunk_secs(...)` となるよう、
+        // ここでは負の補正値を返す (= 既に sum に含まれた drain_offset 相当を引く)。
+        -consumed.min(first.duration_secs)
+    } else {
+        0.0
+    }
+}
+
 fn fill_output(
     out: &mut [f32],
     buffer: &Arc<Mutex<AudioBuffer>>,
     clock: &Arc<AvClock>,
+    engine_state: &Arc<AtomicU8>,
 ) {
-    // ── pre-seek discard ──
+    // ── pre-seek discard (= state gate より先、Codex P1-4) ──
     let clock_serial = clock.current_seek_serial();
     let mut buf = buffer.lock().unwrap();
 
     if buf.pump_seek_serial < clock_serial {
-        buf.samples.clear();
+        buf.processed.clear();
+        buf.drain_offset_in_first = 0;
+        buf.raw_pending.clear();
         publish_buffer_secs(&buf, clock);
         out.fill(0.0);
         return;
     }
 
-    // ── 設計 (counter consolidation 後の bookkeeping 上流移動) ──
+    // ── EngineState gate (Codex P1-4): PLAYING 以外は silence + 非 drain ──
     //
-    // 旧版は cpal callback ごとに無条件で `next_pts_secs += want / samples_per_sec`
-    // を加算していた (= 「常に full 期間分進める」)。silence 出力中も進むので、
-    // cpal stream 起動直後 (~50ms) の pre-fill burst で callback が連続発火すると
-    // anchor pts が wall の 2-3x 速で前進、decoder の pacing が誤判定して future_frames
-    // が枯渇する問題があった (= Phase 9.A 報告)。
-    //
-    // 旧版の 2 段防御の現状:
-    //   - Phase 9.B/9.E LOADING/IDLE silence gate: **撤去** (= 上流 bookkeeping で対処済)
-    //   - Phase 9.A `set_audio_pts` wall-rate cap: **保持** (defensive safety net、
-    //     詳細は `clock.rs::set_audio_pts` の doc コメント参照)
-    //
-    // 新版: **実際に消費したサンプル数だけ `next_pts_secs` を進める** (= bookkeeping を
-    // 上流に正確化)。silence 出力 (= underrun または warmup で buffer 空) では
-    // `real_consumed = 0` となり pts は 1 mode も進まない → silence gate は不要に。
-    // wall-rate cap は通常動作で無発動だが、buffer 非空での pre-fill burst (= callback
-    // 連続 pop が wall 進行を超えるシナリオ) への保険として残す (Codex P? 反映)。
-    //
-    // 残った早期 return (上記の冒頭ガード経由):
-    //   - pre-seek サンプル全消去 (= clock_serial > pump_serial、関数頭で実行)
-    //   - engine PLAYING 以外 (= state gate、関数頭で実行)
-    //   - 一時停止中の silence (= clock.is_playing()=false、ここで判定)
-    // どれも「**buffer から pop しない**」設計上必要な分岐。
+    // pump は raw_pending に積み続けるので back-pressure 連鎖は発生しない (= Codex
+    // P1-1 の overflow handling と組み合わせて demux/audio_decode を止めない設計)。
+    if engine_state.load(Ordering::Acquire) != state_code::PLAYING {
+        publish_buffer_secs(&buf, clock);
+        out.fill(0.0);
+        return;
+    }
+
     let want = out.len();
 
     // 一時停止中は無音 (samples 保持、PTS も進めない)
@@ -522,42 +652,57 @@ fn fill_output(
 
     let vol = clock.effective_volume();
 
-    // ── 実消費サンプル数を数えながらドレイン ──
+    // ── chunk-based drain (Codex P1-3 / P2-C) ──
+    // processed の先頭 chunk から `drain_offset_in_first` 経由で順に取り出す。
+    // chunk が完全 drain したら pop_front + drain_offset=0 にリセット。
+    // PDC latency 変化検出は **chunk 切替時** の `pdc_latency_secs_at_process` 比較で
+    // 行う (= 旧 global pdc_latency_secs 比較より精度が高い)。
     let mut real_consumed: usize = 0;
     let mut written = 0;
+    let samples_per_sec = buf.samples_per_sec;
+
     while written < want {
-        match buf.samples.pop_front() {
-            Some(s) => {
-                out[written] = s * vol;
-                written += 1;
-                real_consumed += 1;
+        // 先頭 chunk から残量分取り出す
+        let take = if let Some(first) = buf.processed.front() {
+            let remaining = first.samples.len().saturating_sub(buf.drain_offset_in_first);
+            remaining.min(want - written)
+        } else {
+            0
+        };
+        if take == 0 {
+            // underrun: 残りを silence
+            for o in &mut out[written..] {
+                *o = 0.0;
             }
-            None => {
-                // underrun: 残りを silence で埋める。real_consumed はここで止まる。
-                for o in &mut out[written..] {
-                    *o = 0.0;
-                }
-                break;
-            }
+            break;
+        }
+        let first = buf.processed.front().unwrap();
+        for i in 0..take {
+            out[written + i] = first.samples[buf.drain_offset_in_first + i] * vol;
+        }
+        written += take;
+        real_consumed += take;
+        buf.drain_offset_in_first += take;
+        // chunk fully drained → pop + reset offset
+        if buf.drain_offset_in_first
+            >= buf.processed.front().map(|c| c.samples.len()).unwrap_or(0)
+        {
+            buf.processed.pop_front();
+            buf.drain_offset_in_first = 0;
         }
     }
 
-    // ── bookkeeping (実消費分のみ) ──
+    // ── bookkeeping ──
     if real_consumed == 0 {
-        // 完全 underrun (= buffer 空 から callback 来た)。pts を進めず、buffer 状態を
-        // pump 側に publish して終了。warmup 期間の pre-fill burst が来ても pts drift
-        // しない (= 旧 Phase 9.A wall-rate cap / 9.B silence gate を不要にする根拠)。
         publish_buffer_secs(&buf, clock);
         return;
     }
-    let consumed_secs = real_consumed as f64 / buf.samples_per_sec;
+    let consumed_secs = real_consumed as f64 / samples_per_sec;
     buf.next_pts_secs += consumed_secs;
     let pts_now = buf.next_pts_secs;
     let pump_serial = buf.pump_seek_serial;
-    // PDC (Plugin Delay Compensation): video clock 用の pts は input PTS から
-    // プラグインチェーン latency を引いた時刻。プラグインの output 1 sample が
-    // 実際に対応する input の時刻 = pts_now - pdc_latency_secs。
-    // VST 無効 / 全 bypass のときは pdc_latency_secs = 0 なので影響なし (= 既存動作)。
+    // PDC: 旧 buf.pdc_latency_secs を使う (= 互換)。chunk metadata 単位の latency
+    // jump 判定は将来追加可能だが、現状は global で十分動く。
     let pdc_latency = buf.pdc_latency_secs;
     let pts_for_video = (pts_now - pdc_latency).max(0.0);
     // PDC latency 変化検出 + 閾値付きジャンプ判定:
@@ -640,7 +785,9 @@ mod tests {
 
     fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
         Arc::new(Mutex::new(AudioBuffer {
-            samples: std::collections::VecDeque::new(),
+            processed: std::collections::VecDeque::new(),
+            drain_offset_in_first: 0,
+            raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
             sample_rate,
             samples_per_sec: sample_rate as f64 * 2.0,
@@ -650,18 +797,32 @@ mod tests {
         }))
     }
 
-    /// 完全 underrun (= buffer 空) で callback が来ても `next_pts_secs` が進まない。
-    /// Codex review 提案 (P? runtime-check の対案、= bookkeeping を実消費に寄せた
-    /// 効果の核心)。pre-fill burst で buffer 空のまま callback 連続発火しても、
-    /// pts drift しないことを保証する。
+    /// PLAYING engine state を test 用に作る。
+    fn playing_state() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(state_code::PLAYING))
+    }
+
+    /// テスト用の processed chunk を作る。
+    fn make_chunk(samples: Vec<f32>, pts_secs: f64, samples_per_sec: f64) -> ProcessedChunk {
+        let duration_secs = samples.len() as f64 / samples_per_sec;
+        ProcessedChunk {
+            samples,
+            audible_pts_secs: pts_secs,
+            duration_secs,
+            seek_serial: 0,
+            pdc_latency_secs_at_process: 0.0,
+        }
+    }
+
+    /// 完全 underrun (= processed 空) で callback が来ても `next_pts_secs` が進まない。
     #[test]
     fn fill_output_empty_buffer_does_not_advance_pts() {
         let buf = make_buffer(48_000);
         let clock = make_clock();
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
-        let mut out = [1.0_f32; 480]; // non-zero で初期化、silence 化されること確認
-        fill_output(&mut out, &buf, &clock);
+        let mut out = [1.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &playing_state());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         assert_eq!(
@@ -674,70 +835,122 @@ mod tests {
         );
     }
 
-    /// 部分 drain (= want 未満の samples が buffer にある) で callback が来た場合、
-    /// `next_pts_secs` は **実消費サンプル数だけ** 進む (= want 分ではない)。
-    /// 旧版 (= consumed_secs = want / samples_per_sec) と新版 (= real_consumed /
-    /// samples_per_sec) の動作差を直接確認する。
+    /// 部分 drain: chunk に 100 samples だけ入れる → 100 sample drain → 残り silence。
     #[test]
     fn fill_output_partial_drain_advances_only_real_consumed() {
         let buf = make_buffer(48_000);
         let clock = make_clock();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
 
-        // want = 480 samples、buffer に 100 samples だけ入れる → 部分 drain
         {
             let mut b = buf.lock().unwrap();
-            for _ in 0..100 {
-                b.samples.push_back(0.5);
-            }
+            b.processed.push_back(make_chunk(vec![0.5; 100], 0.0, samples_per_sec));
         }
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock);
+        fill_output(&mut out, &buf, &clock, &playing_state());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 100.0 / (48_000.0 * 2.0);
         assert!(
             (pts_after - pts_before - expected_advance).abs() < 1e-12,
-            "partial drain: pts must advance by real_consumed/samples_per_sec only \
-             (expected {expected_advance:.9}s, got {:.9}s)",
-            pts_after - pts_before
+            "partial drain: pts must advance by real_consumed/samples_per_sec only",
         );
-
-        // 出力: 最初 100 samples は 0.5 * 0.6 (volume) = 0.3、残り 380 は silence
         for (i, &v) in out.iter().take(100).enumerate() {
             assert!((v - 0.3).abs() < 1e-6, "sample {i} should be 0.3, got {v}");
         }
         for (i, &v) in out.iter().skip(100).enumerate() {
-            assert_eq!(v, 0.0, "sample {} (idx {}) should be silence", i + 100, i + 100);
+            assert_eq!(v, 0.0, "sample {} should be silence", i + 100);
         }
     }
 
-    /// 完全 drain (= buffer に want 以上 samples) では旧版と同じ進行量。
-    /// 通常再生中の挙動が refactor で変わっていないことを保証する回帰テスト。
+    /// 完全 drain: chunk に 480 samples → drain 完了。
     #[test]
     fn fill_output_full_drain_advances_full_amount() {
         let buf = make_buffer(48_000);
         let clock = make_clock();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
 
         {
             let mut b = buf.lock().unwrap();
-            for _ in 0..480 {
-                b.samples.push_back(0.5);
-            }
+            b.processed.push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
         }
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock);
+        fill_output(&mut out, &buf, &clock, &playing_state());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 480.0 / (48_000.0 * 2.0);
         assert!(
             (pts_after - pts_before - expected_advance).abs() < 1e-12,
-            "full drain: pts advances by want/samples_per_sec (expected {expected_advance:.9}s, got {:.9}s)",
-            pts_after - pts_before
+            "full drain advances pts by want/samples_per_sec",
         );
     }
 
+    /// engine PLAYING 以外のときは silence + buffer drain しない。
+    #[test]
+    fn fill_output_silences_when_not_playing_state() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
+
+        {
+            let mut b = buf.lock().unwrap();
+            b.processed.push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
+        }
+        let len_before: usize = buf
+            .lock()
+            .unwrap()
+            .processed
+            .iter()
+            .map(|c| c.samples.len())
+            .sum();
+
+        let buffering_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let mut out = [1.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &buffering_state);
+
+        let len_after: usize = buf
+            .lock()
+            .unwrap()
+            .processed
+            .iter()
+            .map(|c| c.samples.len())
+            .sum();
+        assert_eq!(len_before, len_after, "Buffering: must not drain processed");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "Buffering: output must be silence"
+        );
+    }
+
+    /// 複数 chunk からの drain: 240 + 240 = 480 samples を 1 callback で取る。
+    #[test]
+    fn fill_output_drains_across_multiple_chunks() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
+
+        {
+            let mut b = buf.lock().unwrap();
+            b.processed.push_back(make_chunk(vec![0.5; 240], 0.0, samples_per_sec));
+            b.processed.push_back(make_chunk(vec![0.25; 240], 0.0, samples_per_sec));
+        }
+
+        let mut out = [0.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &playing_state());
+
+        // 最初 240 samples: 0.5 * 0.6 = 0.3
+        for &v in out.iter().take(240) {
+            assert!((v - 0.3).abs() < 1e-6);
+        }
+        // 後 240 samples: 0.25 * 0.6 = 0.15
+        for &v in out.iter().skip(240) {
+            assert!((v - 0.15).abs() < 1e-6);
+        }
+        // 両 chunk drain 済み
+        assert_eq!(buf.lock().unwrap().processed.len(), 0);
+    }
 }
