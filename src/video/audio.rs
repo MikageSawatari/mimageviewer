@@ -359,7 +359,17 @@ fn run_pump(
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
-    let mut overflow_alerted_for_serial: Option<u64> = None;
+    /// このシーク世代の seek_target (= 最初の post-seek フレームの input PTS)。
+    /// PDC 適用後の chunk が `audible_pts < seek_target` だと「pre-target silence」と
+    /// 判定して push せずに drop する (= Codex P1-1: 早すぎる BufferReady 防止)。
+    /// 新 seek 世代の最初のフレームで Some(pts_secs) に set。
+    /// 「最初の post-target chunk が processed に届いた」時点で None にすると、その後の
+    /// chunk は無条件 push でいい。
+    let mut seek_target_secs: Option<f64> = None;
+    /// このシーク世代について overflow fallback (= wall master) に切り替わったか。
+    /// `Some(serial)` なら fill_output / pump とも処理を停止する。
+    /// 新 seek 世代で None にリセット (= 再度 audio master を試す)。
+    let mut overflow_for_serial: Option<u64> = None;
     let mut last_warning_at: Option<std::time::Instant> = None;
 
     while !cancel.load(Ordering::Acquire) {
@@ -386,11 +396,21 @@ fn run_pump(
                 }
             }
             last_seen_seek_serial = frame_seek_serial;
-            overflow_alerted_for_serial = None; // 新 seek 世代で overflow 警告 reset
+            // 新 seek 世代: overflow / target / activate を全 reset
+            overflow_for_serial = None;
+            seek_target_secs = Some(frame.pts_secs);
+            activated = false; // 再度 audio master を試す
         }
 
         // ── stale check (= clock より古い世代は破棄) ──
         if frame_seek_serial < cur_clock_serial {
+            continue;
+        }
+
+        // ── overflow 中はその世代について no-op (Codex P1-2 反映) ──
+        // 既に overflow_for_serial に切り替わっている世代は frame を捨てる。
+        // pump は demux/audio_decode を詰まらせないために consume だけする。
+        if overflow_for_serial == Some(frame_seek_serial) {
             continue;
         }
 
@@ -432,22 +452,32 @@ fn run_pump(
             raw_secs
         };
 
-        // ── overflow / warning 通知 (Codex P1-1: silent drop しない) ──
+        // ── overflow / warning 通知 (Codex P1-1: silent drop しない、P1-2: 完全 fallback) ──
         if raw_total_secs > RAW_OVERFLOW_SECS {
-            // overflow: その seek 世代について 1 回だけ AudioInactive を emit して
-            // engine を wall master に切り替える。pump は overflow 中も demux/decode を
-            // 詰まらせないため、frame は drop するが次世代まで継続。
-            if overflow_alerted_for_serial != Some(frame_seek_serial) {
-                crate::logger::log(format!(
-                    "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
-                     seek_serial={frame_seek_serial}: switching to wall-master fallback",
-                    raw_total_secs, RAW_OVERFLOW_SECS,
-                ));
-                let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
-                    crate::video::engine::state::AudioEvent::AudioInactive,
-                ));
-                overflow_alerted_for_serial = Some(frame_seek_serial);
+            // overflow: その seek 世代を terminal fallback として処理する。
+            // - processed + raw_pending を全 clear (= 残った post-VST output で
+            //   audio master が再支配しないように)
+            // - clock.mark_audio_inactive() で wall master に切替
+            // - emit AudioInactive で engine の has_audio=false 化
+            // - overflow_for_serial に set して以降このセッションでは consume only
+            crate::logger::log(format!(
+                "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
+                 seek_serial={frame_seek_serial}: terminal fallback (clear + wall master)",
+                raw_total_secs, RAW_OVERFLOW_SECS,
+            ));
+            {
+                let mut buf = buffer.lock().unwrap();
+                buf.processed.clear();
+                buf.drain_offset_in_first = 0;
+                buf.raw_pending.clear();
+                publish_buffer_secs(&buf, &clock);
             }
+            clock.mark_audio_inactive();
+            let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
+                crate::video::engine::state::AudioEvent::AudioInactive,
+            ));
+            overflow_for_serial = Some(frame_seek_serial);
+            continue;
         } else if raw_total_secs > RAW_WARNING_SECS {
             // warning: 5秒に 1 度ログ。長時間 Buffering の診断用。
             let now = std::time::Instant::now();
@@ -536,10 +566,52 @@ fn run_pump(
             let duration_secs = output_samples.len() as f64 / samples_per_sec;
             let audible_pts_secs =
                 (raw.pts_secs - current_pdc_latency_secs).max(0.0);
+
+            // ── pre-target trim (Codex P1-1: PDC plugin で早すぎる BufferReady 防止) ──
+            //
+            // PDC=N の plugin では post-VST output 最初の N 秒分は delay-line silence
+            // (= flush_with_silence で埋めた silence)。これを processed に push すると
+            // BufferReady が pre-target silence で fire し、Playing 入場直後に無音 +
+            // wrong clock anchor になる。
+            //
+            // 対策: pre_target_trim_decision で DropAll / TrimFront / KeepAll を判定。
+            // 最初の post-target chunk (= TrimFront or KeepAll で push 成功) が
+            // 出来た時点で seek_target_secs を None にする (= 以降は無条件 push)。
+            let mut samples = output_samples;
+            let mut chunk_audible_pts = audible_pts_secs;
+            if let Some(target) = seek_target_secs {
+                match pre_target_trim_decision(
+                    audible_pts_secs,
+                    duration_secs,
+                    target,
+                    samples_per_sec,
+                    2,
+                ) {
+                    TrimResult::DropAll => continue,
+                    TrimResult::TrimFront {
+                        trim_samples,
+                        new_audible_pts,
+                    } => {
+                        if trim_samples >= samples.len() {
+                            continue;
+                        }
+                        samples.drain(..trim_samples);
+                        chunk_audible_pts = new_audible_pts;
+                        seek_target_secs = None;
+                    }
+                    TrimResult::KeepAll => {
+                        seek_target_secs = None;
+                    }
+                }
+            }
+            if samples.is_empty() {
+                continue; // 全 trim で空になった (= 通常ありえないが防御)
+            }
+            let chunk_duration = samples.len() as f64 / samples_per_sec;
             let chunk = ProcessedChunk {
-                samples: output_samples,
-                audible_pts_secs,
-                duration_secs,
+                samples,
+                audible_pts_secs: chunk_audible_pts,
+                duration_secs: chunk_duration,
                 seek_serial: raw.seek_serial,
                 pdc_latency_secs_at_process: current_pdc_latency_secs,
             };
@@ -549,6 +621,20 @@ fn run_pump(
             if chunk.seek_serial != target_serial || chunk.seek_serial != buf.pump_seek_serial {
                 // seek 世代が変わった (= chunk は stale) → drop
                 continue;
+            }
+            // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
+            // AAC/Opus 等は 23ms/frame なので通常は cap=300ms に余裕。長い frame
+            // (= 一部の独自エンコード) では cap を一時的に超える可能性があるので
+            // ログだけ出して push する (= 分割は将来課題)。
+            let cur_processed_secs: f64 =
+                buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
+                    + remaining_first_chunk_secs(&buf);
+            if cur_processed_secs + chunk.duration_secs > TARGET_PROCESSED_SECS * 1.5 {
+                crate::logger::log(format!(
+                    "[audio-pump] processed cap exceeded: {:.3}s + {:.3}s > {:.3}s target \
+                     (chunk too large to fit; EQ latency briefly elevated)",
+                    cur_processed_secs, chunk.duration_secs, TARGET_PROCESSED_SECS,
+                ));
             }
             // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
             // global pdc_latency_secs も維持)
@@ -594,6 +680,56 @@ fn run_pump(
         }
     }
     crate::logger::log("audio-pump terminated");
+}
+
+/// pre-target trim 結果。
+enum TrimResult {
+    /// chunk 全体が target 前 (= drop)
+    DropAll,
+    /// chunk 全体が target 以降 (= 無加工で push、`audible_pts` を返す)
+    KeepAll,
+    /// chunk が target を跨ぐ (= 先頭を sample-level trim、新 `audible_pts` を返す)
+    TrimFront {
+        /// 先頭から drop する sample 数 (= channel-aligned)
+        trim_samples: usize,
+        /// trim 後の chunk 先頭の audible PTS
+        new_audible_pts: f64,
+    },
+}
+
+/// PDC 有効時の pre-target trim 判定 (Codex P1-1 反映)。
+///
+/// chunk の audible 範囲 [audible_pts, audible_pts + duration) と target を比較:
+/// - `audible_end <= target`: chunk 全体が pre-target → DropAll
+/// - `audible_pts >= target`: chunk 全体が post-target → KeepAll
+/// - 跨ぎ: TrimFront で先頭を `target` 秒 sample-level trim
+///
+/// 戻り値の `trim_samples` は **interleaved stereo の sample 数** (= channels=2 単位
+/// に丸めた値)。呼出側はこの値で `samples.drain(..trim_samples)` する。
+fn pre_target_trim_decision(
+    audible_pts_secs: f64,
+    duration_secs: f64,
+    target_secs: f64,
+    samples_per_sec: f64,
+    channels: usize,
+) -> TrimResult {
+    let audible_end = audible_pts_secs + duration_secs;
+    if audible_end <= target_secs - 1e-6 {
+        TrimResult::DropAll
+    } else if audible_pts_secs >= target_secs - 1e-6 {
+        TrimResult::KeepAll
+    } else {
+        let trim_secs = target_secs - audible_pts_secs;
+        let trim_samples_raw = (trim_secs * samples_per_sec).round() as usize;
+        // channel-aligned (= interleaved stereo は 2 単位)
+        let trim_samples = (trim_samples_raw / channels) * channels;
+        let new_audible_pts =
+            audible_pts_secs + trim_samples as f64 / samples_per_sec;
+        TrimResult::TrimFront {
+            trim_samples,
+            new_audible_pts,
+        }
+    }
 }
 
 /// processed.front() の残り audible 秒数を返す (= drain_offset_in_first 後の未消費部分)。
@@ -924,6 +1060,81 @@ mod tests {
             out.iter().all(|&s| s == 0.0),
             "Buffering: output must be silence"
         );
+    }
+
+    /// PDC pre-target trim: chunk 全体が target 前なら DropAll。
+    #[test]
+    fn pre_target_trim_drops_chunk_fully_before_target() {
+        // PDC = 1.0 sec、input pts = 5.0、duration = 0.023 (= 1 frame)
+        // audible_pts = 5.0 - 1.0 = 4.0、audible_end = 4.023
+        // target = 5.0 → audible_end < target → DropAll
+        let result = pre_target_trim_decision(4.0, 0.023, 5.0, 96000.0, 2);
+        assert!(matches!(result, TrimResult::DropAll));
+    }
+
+    /// PDC pre-target trim: chunk 全体が target 以降なら KeepAll。
+    #[test]
+    fn pre_target_trim_keeps_chunk_fully_after_target() {
+        // input pts = 5.5、PDC = 0.0、audible_pts = 5.5
+        // target = 5.0 → audible_pts >= target → KeepAll
+        let result = pre_target_trim_decision(5.5, 0.023, 5.0, 96000.0, 2);
+        assert!(matches!(result, TrimResult::KeepAll));
+    }
+
+    /// PDC pre-target trim: chunk が target を跨ぐ → TrimFront。
+    #[test]
+    fn pre_target_trim_splits_chunk_crossing_target() {
+        // PDC = 0.5、input pts = 5.5、duration = 1.0、audible_pts = 5.0
+        // target = 5.5 → 跨ぐ → 先頭 0.5 sec trim、new_audible = 5.5
+        // sample_per_sec = 96000、trim = 0.5 * 96000 = 48000 samples (channel-aligned)
+        let result = pre_target_trim_decision(5.0, 1.0, 5.5, 96000.0, 2);
+        match result {
+            TrimResult::TrimFront {
+                trim_samples,
+                new_audible_pts,
+            } => {
+                assert_eq!(trim_samples, 48000);
+                assert!((new_audible_pts - 5.5).abs() < 1e-6);
+            }
+            _ => panic!("expected TrimFront"),
+        }
+    }
+
+    /// PDC pre-target trim: PDC=1s + seek_target=10 のシナリオ。
+    /// pump push 結果として最初の 1 秒は drop、2 秒目以降が processed に入るかの確認。
+    #[test]
+    fn pre_target_trim_pdc_one_second_seek_to_ten() {
+        let target = 10.0;
+        let pdc = 1.0;
+        let frame_duration = 0.023;
+        let sps = 96000.0;
+
+        // input pts は target..target+pdc..target+pdc+0.1 まで増えていく。
+        // audible_pts は (target-pdc)..target..target+0.1 と進む。
+        // 各 frame の判定:
+        //   audible_end <= target - eps: DropAll
+        //   audible_pts >= target - eps: KeepAll (= 完全 post-target)
+        //   それ以外: TrimFront (= 跨ぎ)
+        // PDC=1s なので「最初の ~43 frame は DropAll」「~44 frame目で跨ぎ TrimFront」
+        // 「45 frame目以降は KeepAll」になる想定。これを構造的に検証:
+        let mut input_pts = target;
+        let mut saw_drop_all = false;
+        let mut saw_trim_front = false;
+        let mut saw_keep_all = false;
+        for _ in 0..50 {
+            let audible_pts = input_pts - pdc;
+            let result =
+                pre_target_trim_decision(audible_pts, frame_duration, target, sps, 2);
+            match result {
+                TrimResult::DropAll => saw_drop_all = true,
+                TrimResult::TrimFront { .. } => saw_trim_front = true,
+                TrimResult::KeepAll => saw_keep_all = true,
+            }
+            input_pts += frame_duration;
+        }
+        assert!(saw_drop_all, "early frames should be DropAll");
+        assert!(saw_trim_front, "transitional frame should be TrimFront");
+        assert!(saw_keep_all, "later frames should be KeepAll");
     }
 
     /// 複数 chunk からの drain: 240 + 240 = 480 samples を 1 callback で取る。
