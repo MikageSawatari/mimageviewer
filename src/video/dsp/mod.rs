@@ -144,6 +144,12 @@ pub(crate) struct PluginSlot {
     /// 警告アイコンを出すために使う。settings には永続化しない (= ランタイム保護)。
     /// ユーザーが手動で再 ON にしてもまた latency が超過なら同じチェックで再発火する。
     pub auto_bypassed_for_latency: bool,
+    /// 新規 GUI ウィンドウ作成時の初期位置 (左上、screen coordinate)。
+    /// `add_plugin` で settings から渡された値を保持し、初回 `show_slot_gui` で
+    /// CreateWindowExW に渡す。None なら OS 既定 (= CW_USEDEFAULT)。
+    /// ウィンドウ作成後 (= gui_hwnd != 0) は HWND の現在位置が source of truth に
+    /// なるので、この field は使われない (= 復元のための初期値専用)。
+    pub desired_window_pos: Option<(i32, i32)>,
     /// プラグイン GUI ホスト (Win32 子ウィンドウスレッド)。slot 削除で自動終了する。
     pub gui_host: Option<gui::GuiHost>,
     /// ホストウィンドウの × ボタン押下シグナル。
@@ -406,6 +412,7 @@ impl DspBridge {
         bypass: bool,
         user_hidden: bool,
         initial_state: Option<&str>,
+        initial_window_pos: Option<(i32, i32)>,
     ) -> Result<usize, String> {
         // enable 状態チェック (Mutex を保持しない)
         if !self.is_enabled() {
@@ -429,11 +436,13 @@ impl DspBridge {
             Ok(other) => return Err(format!("予期しないイベント (ready 待ち): {other:?}")),
             Err(e) => return Err(format!("ready recv: {e}")),
         }
+        // initial_state は `open_audio_pipe` → `Cmd::Open` に bake され、bridge 側で
+        // **audio_thread 起動前**に setState される (= race-free auto-restore、Codex P2-3)。
         bridge
-            .open_audio_pipe(plugin_path, sample_rate, block_size)
+            .open_audio_pipe(plugin_path, sample_rate, block_size, initial_state)
             .map_err(|e| format!("open_audio_pipe: {e}"))?;
 
-        // loaded イベントを待つ
+        // loaded イベントを待つ (= bridge は state 復元 + setActive 完了後に Loaded を返す)
         let (plugin_name, latency_samples) = loop {
             match bridge.recv() {
                 Ok(Event::Loaded {
@@ -455,21 +464,6 @@ impl DspBridge {
             latency_samples as f64 / sample_rate as f64 * 1000.0,
             sample_rate,
         ));
-
-        // ── 状態の auto-restore (= EQ カーブ / chunk を前回終了時から復元) ──
-        // settings.vst3_plugins[i].state に base64 文字列が保存されていれば bridge
-        // 側で setState する。pre-warm の **前** に流すことで、warm-up 用 silence
-        // 処理時には既に正しいフィルタ係数で動作する (= 初回処理時のクリック軽減)。
-        // fire-and-forget (= ack 不要)、失敗時は bridge が `Event::Error` を発行して
-        // ログに残るので、起動全体は中断しない。
-        if let Some(s) = initial_state.filter(|s| !s.is_empty()) {
-            if let Err(e) = bridge.send(&Cmd::RestoreState { state: s.to_string() }) {
-                crate::logger::log(format!(
-                    "[VST3] restore_state send failed for '{}': {e} (続行)",
-                    plugin_name,
-                ));
-            }
-        }
 
         // ── プラグイン pre-warm: 無音ブロックを数回流し、内部状態 (フィルタ係数の
         //   FTZ 経路 / IIR ステート / 内部 alloc / ページフォルト等) を温める。
@@ -509,6 +503,7 @@ impl DspBridge {
             gui_visible: false,
             user_hidden,
             auto_bypassed_for_latency: false,
+            desired_window_pos: initial_window_pos,
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
@@ -573,6 +568,29 @@ impl DspBridge {
             }
         }
         out
+    }
+
+    /// 全 Loaded スロットのプラグイン GUI ウィンドウ位置 + 外枠サイズを取得する。
+    /// 戻り値: `(plugin_path, x, y, w, h)` のリスト。HWND が無い slot
+    /// (= 一度も GUI を開かなかった) や `GetWindowRect` 失敗の slot は含めない。
+    ///
+    /// **path をキーにする**: settings との突合せ用 (= bridge slot idx と settings idx の
+    /// ズレを避ける、Codex P2、2026-05-01)。
+    /// 軽量同期処理で UI スレッドから呼んで OK (= GetWindowRect は ~us)。
+    pub fn snapshot_all_window_positions(&self) -> Vec<(String, i32, i32, u32, u32)> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().unwrap();
+        inner
+            .slots
+            .iter()
+            .filter(|s| s.gui_hwnd != 0)
+            .filter_map(|s| {
+                gui::get_window_rect(s.gui_hwnd)
+                    .map(|(x, y, w, h)| (s.plugin_path.clone(), x, y, w, h))
+            })
+            .collect()
     }
 
     /// シーク時の同期 reset fence (= Codex 助言、2026-05-01):
@@ -683,6 +701,10 @@ impl DspBridge {
     /// 2 回目以降の呼び出しは ShowWindow(SW_SHOWNA) でウィンドウを可視化するだけ
     /// (= プラグインの createView/removed をスキップ → DAW 並みの高速トグル)。
     ///
+    /// 新規ウィンドウ作成時の初期位置は `slot.desired_window_pos` を使う
+    /// (= settings から復元した値 / 終了時に保存した値、`add_plugin` で初期化、
+    /// 2026-05 ユーザー要望「ウィンドウ位置を復元してほしい」)。
+    ///
     /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
         // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
@@ -749,9 +771,15 @@ impl DspBridge {
         };
 
         // ─ Step 2: ホストウィンドウを spawn (resizable に応じてサイズ変更可否を切替) ─
+        // 初期位置は slot に保持されている `desired_window_pos` を使う (= settings から
+        // 復元した値、または前回終了時の値)。None なら OS 既定 (= 中央付近) で開く。
+        let initial_pos = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.get(idx).and_then(|s| s.desired_window_pos)
+        };
         let gui_host = gui::GuiHost::spawn();
         let reply = gui_host
-            .show(&plugin_name, pref_w, pref_h, resizable)
+            .show(&plugin_name, pref_w, pref_h, resizable, initial_pos)
             .map_err(|e| format!("create gui window: {e}"))?;
         if reply.hwnd_u64 == 0 {
             return Err("HWND not returned".to_string());

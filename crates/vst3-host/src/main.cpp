@@ -423,39 +423,38 @@ private:
             // プラグイン内部状態 (= EQ カーブ等) を base64 で取得して送り返す。
             // 親プロセス (mIV) は終了時 / preferences 経由でこれを呼び、
             // settings.json に永続化する → 次回起動時に restore される。
-            if (!loader_) {
+            //
+            // **audio thread fence** (Codex P2-2、2026-05-01): control thread からは
+            // フラグを立てるだけ。audio thread が loop 境界で getState を実行して
+            // event を発行する。process() と並走しないので thread safety を保てる。
+            if (!loader_ || !audio_running_) {
                 send_event_error("query_state: no plugin loaded");
                 return true;
             }
-            std::vector<uint8_t> bytes;
-            if (!loader_->query_state(bytes)) {
-                send_event_error("query_state: getState failed");
-                return true;
-            }
-            std::string b64 = base64_encode(bytes);
-            std::string reply = "{\"event\":\"plugin_state\",\"state\":\"" + b64 + "\"}";
-            write_message(reply);
+            query_state_pending_.store(true, std::memory_order_release);
             return true;
         }
         if (cmd == "restore_state") {
-            // base64 でエンコードされたプラグイン状態を decode → setState で復元。
-            // 起動直後の auto-restore (= add_plugin 完了後) で使う。
-            // ack は返さない (= 失敗しても起動継続、err は親側でログ確認)。
-            if (!loader_) {
+            // base64 state を decode して audio thread fence 経由で setState する。
+            // **初回 auto-restore は Cmd::Open の state field 経由** (= audio_thread 起動前)
+            // で適用されるので、こちらは runtime restore (= 将来のプリセット切替等) 用。
+            // 現状の使い方では呼ばれない。
+            if (!loader_ || !audio_running_) {
                 send_event_error("restore_state: no plugin loaded");
                 return true;
             }
             std::string b64 = extract_string_field(msg, "state");
-            if (b64.empty()) return true;  // 空 state は no-op
+            if (b64.empty()) return true;
             std::vector<uint8_t> bytes;
             if (!base64_decode(b64, bytes)) {
                 send_event_error("restore_state: invalid base64");
                 return true;
             }
-            if (!loader_->restore_state(bytes)) {
-                send_event_error("restore_state: setState failed");
-                return true;
+            {
+                std::lock_guard<std::mutex> lk(restore_state_mutex_);
+                restore_state_bytes_ = std::move(bytes);
             }
+            restore_state_pending_.store(true, std::memory_order_release);
             return true;
         }
         if (cmd == "close") {
@@ -501,6 +500,26 @@ private:
             loader_.reset();
             pipe_.detach();
             return true;
+        }
+
+        // **Initial state apply BEFORE audio_thread starts** (= Codex P2-3、2026-05-01):
+        // Cmd::Open に state field を bake することで、audio_thread が動き始める前 (=
+        // 完全シングルスレッド) に setState を適用できる。fire-and-forget Cmd::RestoreState
+        // 方式と違い「pre-warm が古い state で走る」race が発生しない。
+        // 旧 Cmd::RestoreState は runtime 用に残し、audio thread fence 経由で適用する。
+        std::string init_state = extract_string_field(msg, "state");
+        if (!init_state.empty()) {
+            std::vector<uint8_t> bytes;
+            if (base64_decode(init_state, bytes)) {
+                if (!loader_->restore_state(bytes)) {
+                    std::fprintf(stderr,
+                        "[BRIDGE] initial restore_state failed (continuing with default)\n");
+                }
+            } else {
+                std::fprintf(stderr,
+                    "[BRIDGE] initial state base64 decode failed (continuing with default)\n");
+            }
+            std::fflush(stderr);
         }
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
@@ -618,6 +637,39 @@ private:
             uint32_t got = pipe_.read_in_available(input.data(),
                                                     max_block_size * channels,
                                                     100 /* ms */);
+
+            // ── State op fence (Codex P2-2、2026-05-01) ──
+            // control thread が立てた query_state / restore_state を audio thread 上で
+            // ここで実行する。read の **後**・process の **前** に置くことで:
+            // - process と setState/getState が並走しない (= thread safety)
+            // - control が flag を立てた直後に push された input は、setState 反映済の
+            //   状態で次の process_block に渡る (= pre-warm が古い state で走る race を防止)
+            if (query_state_pending_.exchange(false, std::memory_order_acq_rel)) {
+                if (loader_) {
+                    std::vector<uint8_t> bytes;
+                    if (loader_->query_state(bytes)) {
+                        std::string b64 = base64_encode(bytes);
+                        std::string reply = "{\"event\":\"plugin_state\",\"state\":\"" +
+                                            b64 + "\"}";
+                        write_message(reply);
+                    } else {
+                        send_event_error("query_state: getState failed");
+                    }
+                }
+            }
+            if (restore_state_pending_.exchange(false, std::memory_order_acq_rel)) {
+                std::vector<uint8_t> bytes;
+                {
+                    std::lock_guard<std::mutex> lk(restore_state_mutex_);
+                    bytes = std::move(restore_state_bytes_);
+                }
+                if (loader_ && !bytes.empty()) {
+                    if (!loader_->restore_state(bytes)) {
+                        send_event_error("restore_state: setState failed");
+                    }
+                }
+            }
+
             if (got == 0) {
                 ++timeouts_in;
                 report_now();
@@ -697,6 +749,14 @@ private:
     /// reset は同期呼び出し前提のため、複数 reset が短時間連続する場合は最後の ID で
     /// coalesce される (= bool + latest id 設計、堅牢化が必要なら queue 化)。
     std::atomic<uint64_t> pending_reset_id_{0};
+    /// runtime state op (= query_state / restore_state) を audio thread 上で実行する
+    /// ための fence (Codex P2-2、2026-05-01)。control thread はフラグを立てるだけ、
+    /// audio thread が loop 境界で flag を exchange して loader_ を排他に触る。
+    /// VST3 plugin の thread safety を担保し、process と setState/getState の race を排除。
+    std::atomic<bool> query_state_pending_{false};
+    std::atomic<bool> restore_state_pending_{false};
+    std::mutex restore_state_mutex_;          // protects restore_state_bytes_
+    std::vector<uint8_t> restore_state_bytes_;
 };
 
 }  // namespace miv

@@ -199,19 +199,40 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   idx 一覧) に変更し、App 側 wrapper (`vst3_pump_gui_signals`) で settings.save()
 - 関連: `vst3_gui_visible` (= VST ボタン全体の ON/OFF) は既に永続化されている
 
-### ~~プラグイン内部状態の永続化 (= EQ カーブ等の保存)~~ [P1, 2026-04 ユーザー報告] → 🟢 修正済 (2026-05-01)
+### ~~プラグイン内部状態の永続化 (= EQ カーブ等の保存)~~ [P1, 2026-04 ユーザー報告] → 🟢 修正済 (2026-05-01, Codex P2-1/2/3 反映済)
 - 実装: bridge protocol を拡張 (`Cmd::QueryState` / `Cmd::RestoreState` /
   `Event::PluginState`) して `IComponent::getState` / `setState` を base64 で
   IPC する。`MAX_CONTROL_MSG_SIZE` を 64 KB → 4 MB に拡張 (= ML 系 / preset 内蔵
   plugin の大きい state にも対応)
 - 保存タイミング: `on_exit` (= アプリ終了直前)、VST3 OFF へのトグル直前、
   チェーン構成変更による rebuild 直前。いずれも snapshot → save の順
-- 復元タイミング: `add_plugin` 内で Loaded event 直後・pre-warm 前に
-  `Cmd::RestoreState` を fire-and-forget 送信 (= warm-up silence 処理時には
-  既に正しい係数で動作 → 初回処理時のクリック軽減)
+- **復元タイミング (Codex P2-3 反映)**: 初回 auto-restore は **`Cmd::Open` の
+  `state` field に bake** して bridge 側で `audio_thread` 起動前に適用
+  (= 完全シングルスレッド、race-free)。`Cmd::RestoreState` は runtime restore
+  用に残し、audio thread fence 経由で実行
+- **audio thread fence (Codex P2-2 反映)**: `query_state` / `restore_state` は
+  bridge audio thread の loop 境界 (= read 後・process 前) で実行する。
+  control thread はフラグを立てるだけ。これで `process()` と
+  `setState`/`getState` の並走が排除され、VST3 plugin の thread safety を担保
+- **OFF トグル時の guard 修正 (Codex P2-1 反映)**: snapshot helper の guard を
+  `settings.vst3_enabled` から `dsp_bridge.is_enabled()` に変更
+  (= preferences OK で settings 切替 **後** に呼ばれるパスでも teardown 前に
+  state を取得できる)
 - C++ 側: `PluginLoader::query_state` / `restore_state` を `MemoryStream` 経由で
-  実装。`restore_state` は安全のため一時的に `setProcessing(false)` してから
-  `setState` を呼び、終わったら再有効化する
+  実装。`restore_state` は RAII `ProcessingPauseGuard` で `setProcessing(false)
+  → setState → setProcessing(true)` を必ず対称化
+
+### ~~プラグイン GUI ウィンドウ位置の永続化 + 非 resizable プラグインのダブルクリック最大化抑止~~ [2026-05 ユーザー要望] → 🟢 修正済 (2026-05-01)
+- ウィンドウ位置: `Vst3PluginEntry` に `gui_pos: Option<(i32, i32)>` /
+  `gui_size: Option<(u32, u32)>` を追加。`add_plugin` に `initial_window_pos`
+  引数を追加して `PluginSlot.desired_window_pos` に格納、`show_slot_gui` の
+  新規ウィンドウ作成時に `gui::create_window` の `initial_pos` 引数として渡す。
+  保存は state snapshot と同じトリガ (on_exit / OFF / chain rebuild) で
+  `GetWindowRect` を呼んで settings に書き戻す
+- ダブルクリック最大化: `WS_OVERLAPPEDWINDOW` から `WS_MAXIMIZEBOX` を
+  非 resizable プラグインで抹く。これでタイトルバーのダブルクリックも無効化
+  され、SSL Meter Pro 等の固定サイズプラグインで「外枠だけ最大化されて中身が
+  追従しない」紛らわしい挙動が解消
 
 ### 右クリックメニュー即閉じ問題 (SSL Meter Pro) [P1, 既知]
 - bridge 側で plugin child window を `EnumChildWindows` + subclass する案を

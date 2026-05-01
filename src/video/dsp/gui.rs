@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
     SetWindowPos, ShowWindow, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE,
     WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -58,6 +58,11 @@ pub enum Cmd {
         width: u32,
         height: u32,
         resizable: bool,
+        /// 復元したいウィンドウ位置 (= 前回終了時の `GetWindowRect` の左上座標)。
+        /// None ならデフォルト中央配置 (= `CW_USEDEFAULT`) を使う。
+        /// 範囲外 (= 旧モニターが取り外された等) は OS 側 `SetWindowPos` で
+        /// クランプされるので追加チェックなし (= 大きく変な位置でも無事可視範囲に収まる)。
+        initial_pos: Option<(i32, i32)>,
         reply: Sender<ShowReply>,
     },
     /// 既存ウィンドウを閉じる (= プラグイン側 `removed()` 完了後に呼ぶ)。
@@ -122,6 +127,7 @@ impl GuiHost {
         width: u32,
         height: u32,
         resizable: bool,
+        initial_pos: Option<(i32, i32)>,
     ) -> std::io::Result<ShowReply> {
         let (tx, rx) = channel::<ShowReply>();
         self.cmd_tx
@@ -130,6 +136,7 @@ impl GuiHost {
                 width,
                 height,
                 resizable,
+                initial_pos,
                 reply: tx,
             })
             .map_err(|_| std::io::Error::other("gui thread terminated"))?;
@@ -289,9 +296,10 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                 width,
                 height,
                 resizable,
+                initial_pos,
                 reply,
             } => {
-                let result = create_window(&title, width, height, resizable);
+                let result = create_window(&title, width, height, resizable, initial_pos);
                 match result {
                     Ok((hwnd_u64, close_rx, resize_rx, resize_session_rx, actual_w, actual_h, used_dpi)) => {
                         let _ = reply.send(ShowReply {
@@ -387,6 +395,7 @@ fn create_window(
     width: u32,
     height: u32,
     resizable: bool,
+    initial_pos: Option<(i32, i32)>,
 ) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, Receiver<bool>, u32, u32, u32)> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
@@ -465,7 +474,13 @@ fn create_window(
         //   をさらに抑える効果がある。
         let mut win_style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         if !resizable {
-            win_style &= !WS_THICKFRAME;
+            // WS_THICKFRAME (= ドラッグでサイズ変更) を抜く。
+            // **WS_MAXIMIZEBOX も抜く** (= ユーザー報告 2026-05): タイトルバーの
+            // ダブルクリックは WS_MAXIMIZEBOX が立っていれば最大化を発動するため、
+            // SSL Meter Pro 等の固定サイズプラグインでも外枠だけが拡大して
+            // 中身がそのサイズで止まる紛らわしい挙動になる。MAXIMIZEBOX を抜くと
+            // ダブルクリックも無効化される。
+            win_style &= !(WS_THICKFRAME | WS_MAXIMIZEBOX);
         }
         let _ = AdjustWindowRectExForDpi(
             &mut rect,
@@ -477,14 +492,22 @@ fn create_window(
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
 
+        // 初期位置: ユーザーが前回終了時に動かしたウィンドウ位置を復元する
+        // (= 2026-05 ユーザー要望)。Option::None の場合は CW_USEDEFAULT (= OS 既定の
+        // カスケード配置) を使う。指定座標がモニター外でも Win32 が後段で
+        // SetWindowPos してくれるので追加クランプは不要。
+        let (init_x, init_y) = match initial_pos {
+            Some((x, y)) => (x, y),
+            None => (CW_USEDEFAULT, CW_USEDEFAULT),
+        };
         let title_w = HSTRING::from(title);
         let hwnd = CreateWindowExW(
             ex_style,
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             win_style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            init_x,
+            init_y,
             outer_w,
             outer_h,
             None,
@@ -529,6 +552,30 @@ fn close_window() {
             st.close_tx = None;
         }
     });
+}
+
+/// 指定 HWND の現在のデスクトップ位置 + 外枠サイズを返す。
+/// 戻り値: (x, y, width, height) (= screen coordinate、px)。HWND が無効なら None。
+/// プラグイン GUI ウィンドウの位置永続化用 (= 2026-05 ユーザー要望)。
+pub fn get_window_rect(hwnd_u64: u64) -> Option<(i32, i32, u32, u32)> {
+    use windows::Win32::Foundation::RECT as Rect;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    if hwnd_u64 == 0 {
+        return None;
+    }
+    let mut rect = Rect::default();
+    unsafe {
+        let hwnd = HWND(hwnd_u64 as *mut _);
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return None;
+        }
+    }
+    let w = (rect.right - rect.left).max(0) as u32;
+    let h = (rect.bottom - rect.top).max(0) as u32;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((rect.left, rect.top, w, h))
 }
 
 /// プラグイン GUI ホストウィンドウを最前面 (= topmost) に固定 + 表示する。

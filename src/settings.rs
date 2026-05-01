@@ -902,6 +902,19 @@ pub struct Vst3PluginEntry {
     /// false (= 既定): 通常通り表示候補に含まれる。
     #[serde(default)]
     pub user_hidden: bool,
+    /// プラグイン GUI ウィンドウの **デスクトップ位置** (画面座標、左上点)。
+    /// 終了時 / VST3 OFF / chain rebuild の直前に `GetWindowRect` で取得して保存。
+    /// 次回起動時に CreateWindowExW のデフォルト位置の代わりに使う (= 2026-05 ユーザー要望
+    /// 「ウィンドウ位置を復元してほしい」)。
+    /// None: 過去保存なし (= 初回 / 復元情報を破棄したい時)、デフォルト中央配置を使う。
+    #[serde(default)]
+    pub gui_pos: Option<(i32, i32)>,
+    /// プラグイン GUI ウィンドウの **外枠サイズ** (= title bar 込みの outer rect)。
+    /// resizable プラグインがユーザーリサイズで広げた状態を覚える用。非 resizable
+    /// プラグインの場合はプラグイン要求値が優先されるので保存しても基本使われない
+    /// (記録は残しておくが復元時の参照は resizable プラグインのみに限定)。
+    #[serde(default)]
+    pub gui_size: Option<(u32, u32)>,
 }
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
@@ -1222,6 +1235,8 @@ impl Settings {
                     bypass: false,
                     state: self.vst3_plugin_state.clone(),
                     user_hidden: false,
+                    gui_pos: None,
+                    gui_size: None,
                 });
             }
         }
@@ -1315,6 +1330,17 @@ impl Settings {
             {
                 entry.bypass = latest.bypass;
                 entry.user_hidden = latest.user_hidden;
+                // gui_pos / gui_size / state は runtime 側で更新される field なので、
+                // preferences ダイアログを開いている間に変わった最新値を採用する。
+                if latest.gui_pos.is_some() {
+                    entry.gui_pos = latest.gui_pos;
+                }
+                if latest.gui_size.is_some() {
+                    entry.gui_size = latest.gui_size;
+                }
+                if latest.state.is_some() {
+                    entry.state = latest.state.clone();
+                }
             }
         }
         self.vst3_plugin_path = src.vst3_plugin_path.take();

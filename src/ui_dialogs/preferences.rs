@@ -548,10 +548,12 @@ impl App {
                         if new_vst3_enabled {
                             self.kick_off_vst3_chain_rebuild();
                         } else {
-                            // VST3 OFF へのトグル: bridge teardown 前に内部状態を保存
-                            // (= 次回 ON 時の復元用)。
-                            let updated = self.snapshot_vst3_states_into_settings();
-                            if updated > 0 {
+                            // VST3 OFF へのトグル: bridge teardown 前に内部状態と
+                            // ウィンドウ位置を保存 (= 次回 ON 時の復元用)。
+                            let states = self.snapshot_vst3_states_into_settings();
+                            let positions =
+                                self.snapshot_vst3_window_positions_into_settings();
+                            if states > 0 || positions > 0 {
                                 self.settings.save();
                             }
                             self.dsp_bridge.disable();
@@ -1833,6 +1835,8 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 bypass: false,
                 state: None,
                 user_hidden: false,
+                gui_pos: None,
+                gui_size: None,
             });
         }
     }

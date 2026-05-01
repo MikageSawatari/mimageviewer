@@ -67,6 +67,11 @@ pub enum Cmd {
         shm_size: u64,
         sig_in: String,
         sig_out: String,
+        /// 起動時に復元したいプラグイン内部状態 (= base64 chunk)。bridge は
+        /// `IComponent::setState` を **`audio_thread` 起動前**・control thread 上で
+        /// 適用する (= Codex P2-3 race 解消、2026-05-01)。空または None なら no-op。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
     },
     /// シーク等で plugin の内部状態を flush する。`reset_id` は generation ID で、
     /// stale ack race を防ぐ (= timeout した過去 reset の ack が次回成功と誤認されない)。
@@ -453,12 +458,16 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
 impl Bridge {
 
     /// shared memory + named events を作って bridge にアタッチさせる。
+    /// `initial_state` を渡すと bridge が audio_thread 起動前にプラグイン内部状態を
+    /// 復元する (Codex P2-3、2026-05-01: race-free な auto-restore のため state は
+    /// 別 cmd ではなく Open に同梱する)。
     #[cfg(windows)]
     pub fn open_audio_pipe(
         &mut self,
         plugin_path: &str,
         sample_rate: u32,
         block_size: u32,
+        initial_state: Option<&str>,
     ) -> std::io::Result<()> {
         let pid = std::process::id();
         let stamp = std::time::SystemTime::now()
@@ -539,6 +548,9 @@ impl Bridge {
             shm_size,
             sig_in: sig_in_name,
             sig_out: sig_out_name,
+            state: initial_state
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
         })?;
         Ok(())
     }

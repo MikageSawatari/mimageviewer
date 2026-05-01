@@ -29,8 +29,13 @@ impl App {
     /// 同時実行する (1s timeout)。チェーン上限 10 個で worst case ~1 秒、
     /// 典型は数十 ms。on_exit / chain rebuild など save 直前のフックで 1 回だけ
     /// 呼ぶ想定 (= UI hot-path には乗らない)。
+    ///
+    /// **Guard は bridge.is_enabled() を見る**: preferences で OFF にトグルした直後は
+    /// `self.settings.vst3_enabled == false` だが、bridge 側 plugin はまだ生きている。
+    /// この経路でも snapshot を取りたい (= teardown 前) ので、settings ではなく bridge の
+    /// runtime 状態をガードに使う (Codex P2-1、2026-05-01)。
     pub(crate) fn snapshot_vst3_states_into_settings(&mut self) -> usize {
-        if !self.settings.vst3_enabled {
+        if !self.dsp_bridge.is_enabled() {
             return 0;
         }
         let snapshots = self.dsp_bridge.snapshot_all_plugin_states();
@@ -40,6 +45,31 @@ impl App {
                 let new_state = Some(state);
                 if entry.state != new_state {
                     entry.state = new_state;
+                    updated += 1;
+                }
+            }
+        }
+        updated
+    }
+
+    /// 全 GUI 表示済みプラグインのウィンドウ位置 + 外枠サイズを取得して
+    /// `settings.vst3_plugins[*].gui_pos / gui_size` に path 一致で書き込む
+    /// (= 2026-05 ユーザー要望「ウィンドウ位置を復元してほしい」)。
+    /// 戻り値: 更新された entry 数。`settings.save()` は呼び出し側で。
+    /// `GetWindowRect` を順次呼ぶだけなので軽量 (~us)、UI スレッドから OK。
+    pub(crate) fn snapshot_vst3_window_positions_into_settings(&mut self) -> usize {
+        if !self.dsp_bridge.is_enabled() {
+            return 0;
+        }
+        let snapshots = self.dsp_bridge.snapshot_all_window_positions();
+        let mut updated = 0;
+        for (path, x, y, w, h) in snapshots {
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
+                let new_pos = Some((x, y));
+                let new_size = Some((w, h));
+                if entry.gui_pos != new_pos || entry.gui_size != new_size {
+                    entry.gui_pos = new_pos;
+                    entry.gui_size = new_size;
                     updated += 1;
                 }
             }
@@ -83,8 +113,9 @@ impl App {
         if !self.settings.vst3_enabled {
             return;
         }
-        let snapshotted = self.snapshot_vst3_states_into_settings();
-        if snapshotted > 0 {
+        let states = self.snapshot_vst3_states_into_settings();
+        let positions = self.snapshot_vst3_window_positions_into_settings();
+        if states > 0 || positions > 0 {
             self.settings.save();
         }
         let bridge = self.dsp_bridge.clone();
@@ -107,6 +138,7 @@ impl App {
                         entry.bypass,
                         entry.user_hidden,
                         entry.state.as_deref(),
+                        entry.gui_pos,
                     ) {
                         crate::logger::log(format!(
                             "vst3 chain-rebuild add_plugin {} failed: {e}",

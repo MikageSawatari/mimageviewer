@@ -3290,6 +3290,7 @@ impl App {
                         entry.bypass,
                         entry.user_hidden,
                         entry.state.as_deref(),
+                        entry.gui_pos,
                     ) {
                         crate::logger::log(format!(
                             "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
@@ -13751,14 +13752,15 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // VST3 プラグイン内部状態 (= EQ カーブ / chunk) を bridge から snapshot して
-        // settings.json に永続化する。終了前に取らないと再起動時に default に戻る。
-        // bridge teardown は eframe の Drop で走るので、ここで先に query して
-        // 結果を settings に書き込んでから持続化する順序が必要。
+        // VST3 プラグイン内部状態 (= EQ カーブ / chunk) と GUI ウィンドウ位置 / サイズを
+        // bridge から snapshot して settings.json に永続化する。終了前に取らないと再起動時に
+        // 全部 default に戻る。bridge teardown は eframe の Drop で走るので、ここで先に
+        // query して結果を settings に書き込んでから持続化する順序が必要。
         #[cfg(windows)]
         {
-            let updated = self.snapshot_vst3_states_into_settings();
-            if updated > 0 {
+            let states = self.snapshot_vst3_states_into_settings();
+            let positions = self.snapshot_vst3_window_positions_into_settings();
+            if states > 0 || positions > 0 {
                 self.settings.save();
             }
         }
