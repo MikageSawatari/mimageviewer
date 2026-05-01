@@ -200,6 +200,8 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
 
     put(ui, "動画コーデック", &info.video_codec);
 
+    put(ui, "使用デコーダ", &info.video_decoder);
+
     if let Some(ac) = info.audio_codec.as_deref() {
         put(ui, "音声コーデック", ac);
     } else {
@@ -215,6 +217,13 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
 
     let decode_label = if info.hw_decode_active { "HW" } else { "SW" };
     put(ui, "デコーダ", decode_label);
+
+    let d3d11_label = if info.d3d11va_supported {
+        "対応"
+    } else {
+        "非対応"
+    };
+    put(ui, "D3D11VA候補", d3d11_label);
 }
 
 /// 左パネルでクリックされた行から発生する操作。

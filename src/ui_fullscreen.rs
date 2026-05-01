@@ -5294,16 +5294,19 @@ impl App {
     /// 動画 fps から期待値の 1.5x 超を赤縦線 (hitch) で目立たせる。左上半透明。
     pub(crate) fn draw_video_perf_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
         let painter = ui.painter().clone();
-        // 動画の fps から期待 interval (ms) を取得。fps 不明なら 30fps 仮定。
-        // hitch 閾値は期待値の 1.5x (= 50% 超過 = 1 frame 落ち相当)。
-        let fs_idx_for_info = self.fullscreen_idx;
-        let expected_ms: f32 = fs_idx_for_info
+        let video_info = self
+            .fullscreen_idx
             .and_then(|idx| match self.fs_cache.get(&idx) {
                 Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                    player.info().map(|i| i.avg_fps as f32)
+                    player.info().cloned()
                 }
                 _ => None,
-            })
+            });
+        // 動画の fps から期待 interval (ms) を取得。fps 不明なら 30fps 仮定。
+        // hitch 閾値は期待値の 1.5x (= 50% 超過 = 1 frame 落ち相当)。
+        let expected_ms: f32 = video_info
+            .as_ref()
+            .map(|i| i.avg_fps as f32)
             .filter(|fps| *fps > 0.5 && fps.is_finite())
             .map(|fps| 1000.0 / fps)
             .unwrap_or(33.3);
@@ -5311,8 +5314,8 @@ impl App {
         // 縦軸上限は期待値の 2x、ただし最小 50ms (= 60fps 基準でも見やすい)。
         let y_max_ms: f32 = (expected_ms * 2.0).max(50.0);
 
-        const W: f32 = 360.0;
-        const H: f32 = 110.0; // 主グラフ + 下部 buffer strip 用に少し縦長く
+        const W: f32 = 430.0;
+        const H: f32 = 124.0; // codec 行 + 主グラフ + 下部 buffer strip
         let rect = egui::Rect::from_min_size(
             egui::pos2(full_rect.min.x + 8.0, full_rect.min.y + 8.0),
             egui::vec2(W, H),
@@ -5395,10 +5398,26 @@ impl App {
             egui::FontId::proportional(11.0),
             egui::Color32::WHITE,
         );
+        if let Some(info) = video_info.as_ref() {
+            let decode = if info.hw_decode_active { "HW" } else { "SW" };
+            let path = if info.gpu_path_active { "GPU" } else { "CPU" };
+            let d3d11 = if info.d3d11va_supported { "yes" } else { "no" };
+            let codec_line = format!(
+                "codec {} / {}  {}/{}  D3D11VA:{}",
+                info.video_codec, info.video_decoder, decode, path, d3d11
+            );
+            painter.text(
+                egui::pos2(rect.min.x + 6.0, rect.min.y + 18.0),
+                egui::Align2::LEFT_TOP,
+                codec_line,
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_rgb(210, 230, 255),
+            );
+        }
 
         // グラフ領域: 上部 (interval) + 下部 (buffer strip) に分割。
         // 中央に細い区切り線を入れて視覚的に分離。
-        let main_top = rect.min.y + 22.0;
+        let main_top = rect.min.y + 36.0;
         let strip_h = 14.0;
         let strip_top = rect.max.y - 4.0 - strip_h;
         let graph = egui::Rect::from_min_max(

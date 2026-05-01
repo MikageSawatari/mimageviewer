@@ -150,6 +150,18 @@ channel disconnect で recv() 抜け → exit。demux thread が両 decode threa
 decode thread に move する (= AVBufferRef refcount は thread-safe)。SW 再試行時は
 `_hw_device = None` で None 状態に置き換える。
 
+**AV1 decoder 選択**: `hw_decode` 有効時、AV1 は既定 decoder (`libdav1d` になり得る)
+の前に native `av1` decoder を HW 専用 candidate として試す。native `av1` が存在しない、
+D3D11VA config を持たない、HW device 初期化や open に失敗した場合は既定 decoder に戻り、
+従来通り SW decode する。H.264 / HEVC 等は既定 decoder 1 個だけを使い、既存経路を維持する。
+
+**HW デコード診断**: open 時に stream codec id (`h264` / `hevc` / `av1` / `vp9`
+等)、FFmpeg が選択した decoder 名、D3D11VA HW config の有無、実際に初期化を試みた
+decode path を通常ログと perf `video/open` に記録する。左パネルの動画情報と
+P キーの perf overlay にも codec / decoder / HW-SW / GPU-CPU / D3D11VA 候補を表示する。
+AV1 などで `libdav1d` 等の SW decoder が選ばれているのか、H.264/HEVC 等で本来 HW 候補が
+あるのに fallback しているのかを切り分けるための初期診断として使う。
+
 **pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
 `SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
 check) は **そのまま video decode thread に移植**。動作対象だけが変わる (= 旧構造の

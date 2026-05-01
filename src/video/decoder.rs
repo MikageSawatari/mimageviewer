@@ -186,7 +186,14 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
+    /// Stream codec id name (h264 / hevc / av1 / vp9 ...).
     pub video_codec: String,
+    /// FFmpeg decoder selected by avcodec_find_decoder/open_as.
+    pub video_decoder: String,
+    /// Whether the selected/default decoder advertises D3D11VA output.
+    pub d3d11va_supported: bool,
+    /// Compact debug summary of the decoder's D3D11VA-capable HW configs.
+    pub d3d11va_config: String,
     pub audio_codec: Option<String>,
     pub has_audio: bool,
     /// HW デコードが実際に有効化されたか (sw / hw_d3d11va)。
@@ -368,15 +375,13 @@ fn run_decoder(
         }
     };
 
-    let mut video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params)
-    {
-        Ok(c) => c,
+    let video_params_owned = match clone_codec_parameters(&video_params) {
+        Ok(p) => p,
         Err(e) => {
-            let _ = info_tx.send(Err(format!("video codec context: {e}")));
+            let _ = info_tx.send(Err(format!("video codec parameters clone: {e}")));
             return;
         }
     };
-
     // ── HW デコード初期化 (D3D11VA) ──
     // 失敗時は黙って SW デコードに落ちる。`hw_device` を _hw_device で持って Drop 時に
     // unref されるようにし、AVCodecContext は内部でさらに ref を取るので競合しない。
@@ -386,57 +391,49 @@ fn run_decoder(
     // 同じデバイス上で動き、CreateVideoProcessorInputView で受け渡せる)。
     // gpu_video_device 不在 / 失敗時は従来通り FFmpeg が新デバイスを作成し、
     // 出力は av_hwframe_transfer_data で CPU readback する旧経路。
-    let codec_id = video_decoder_ctx.id();
-    let hw_setup_result: Option<HwDevice> = if hw_decode_requested {
+    let codec_id = video_params_owned.id();
+    let stream_codec_name = codec_id.name().to_string();
+    let opened_video_result = if hw_decode_requested {
         #[cfg(windows)]
         {
-            try_init_d3d11va(codec_id, &mut video_decoder_ctx, gpu_video_device.as_ref())
+            open_video_decoder_with_candidates(
+                &video_params_owned,
+                codec_id,
+                true,
+                gpu_video_device.as_ref(),
+            )
         }
         #[cfg(not(windows))]
         {
-            try_init_d3d11va(codec_id, &mut video_decoder_ctx)
+            open_video_decoder_with_candidates(&video_params_owned, codec_id, true)
         }
     } else {
-        None
-    };
-    let hw_active_initially = hw_setup_result.is_some();
-    // Phase B: `_hw_device` は mut にする (= SW 再試行時に take() で空にする)。
-    // 以前は `drop(_hw_device)` で move していたが、後段で video decode thread に
-    // move する必要があるため、None 状態に置き換える形に変更。
-    let mut _hw_device = hw_setup_result;
-
-    let video_decoder = match video_decoder_ctx.decoder().video() {
-        Ok(d) => d,
-        Err(e) => {
-            // HW 有効で open 失敗 → SW で再試行
-            if hw_active_initially {
-                crate::logger::log(format!("HW decoder open failed ({e}), retrying with SW"));
-                let retry_ctx = match ffmpeg::codec::context::Context::from_parameters(
-                    input.streams().best(MediaType::Video).unwrap().parameters(),
-                ) {
-                    Ok(c) => c,
-                    Err(e2) => {
-                        let _ = info_tx.send(Err(format!("video codec context (retry): {e2}")));
-                        return;
-                    }
-                };
-                // HW デバイスを drop (= AVBufferRef を unref) して None にする。
-                // この値は後段で video decode thread に move されるが、SW 再試行後は
-                // None なのでそのまま渡しても問題ない。
-                _hw_device = None;
-                match retry_ctx.decoder().video() {
-                    Ok(d) => d,
-                    Err(e2) => {
-                        let _ = info_tx.send(Err(format!("video decoder open (SW retry): {e2}")));
-                        return;
-                    }
-                }
-            } else {
-                let _ = info_tx.send(Err(format!("video decoder open: {e}")));
-                return;
-            }
+        #[cfg(windows)]
+        {
+            open_video_decoder_with_candidates(
+                &video_params_owned,
+                codec_id,
+                false,
+                gpu_video_device.as_ref(),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            open_video_decoder_with_candidates(&video_params_owned, codec_id, false)
         }
     };
+    let opened_video = match opened_video_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = info_tx.send(Err(format!("video decoder open: {e}")));
+            return;
+        }
+    };
+    let video_decoder = opened_video.decoder;
+    let video_decoder_name = opened_video.decoder_name;
+    let hw_probe = opened_video.hw_probe;
+    let hw_active_initially = opened_video.hw_device.is_some();
+    let _hw_device = opened_video.hw_device;
     let src_w = video_decoder.width();
     let src_h = video_decoder.height();
 
@@ -514,10 +511,6 @@ fn run_decoder(
 
     // ── 動画情報を通知 ──
     let duration_secs = duration_to_secs(input.duration());
-    let video_codec_name = video_decoder
-        .codec()
-        .map(|c| c.name().to_string())
-        .unwrap_or_else(|| "?".to_string());
     #[cfg(windows)]
     let gpu_path_active = gpu_video_device.is_some();
     #[cfg(not(windows))]
@@ -567,7 +560,10 @@ fn run_decoder(
         width: src_w,
         height: src_h,
         duration_secs,
-        video_codec: video_codec_name.clone(),
+        video_codec: stream_codec_name.clone(),
+        video_decoder: video_decoder_name.clone(),
+        d3d11va_supported: hw_probe.d3d11va_supported,
+        d3d11va_config: hw_probe.d3d11va_config.clone(),
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         has_audio,
         hw_decode_active: hw_active_initially,
@@ -580,6 +576,11 @@ fn run_decoder(
         chapters,
     };
     let _ = info_tx.send(Ok(info));
+
+    crate::logger::log(format!(
+        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} d3d11va_config={}",
+        hw_probe.d3d11va_supported, hw_probe.d3d11va_config
+    ));
 
     // perf: 動画特性を 1 行に記録 (解析時の最初の手がかり)。
     if crate::perf::is_enabled() {
@@ -614,7 +615,20 @@ fn run_decoder(
                 ("dst_h", serde_json::Value::from(dst_h as i64)),
                 ("pix_fmt", serde_json::Value::from(pix_fmt)),
                 ("decode_path", serde_json::Value::from(decode_path)),
-                ("video_codec", serde_json::Value::from(video_codec_name)),
+                ("video_codec", serde_json::Value::from(stream_codec_name)),
+                ("video_decoder", serde_json::Value::from(video_decoder_name)),
+                (
+                    "hw_decode_requested",
+                    serde_json::Value::from(hw_decode_requested),
+                ),
+                (
+                    "d3d11va_supported",
+                    serde_json::Value::from(hw_probe.d3d11va_supported),
+                ),
+                (
+                    "d3d11va_config",
+                    serde_json::Value::from(hw_probe.d3d11va_config),
+                ),
                 ("avg_fps", serde_json::Value::from(video_avg_fps)),
                 ("duration_secs", serde_json::Value::from(duration_secs)),
                 ("audio_codec", serde_json::Value::from(audio_codec)),
@@ -1413,7 +1427,7 @@ fn run_video_decode(
             let cur_w = frame_for_scaler.width();
             let cur_h = frame_for_scaler.height();
             let cur_key = (cur_fmt, cur_w, cur_h);
-            if !first_frame_logged && crate::perf::is_enabled() {
+            if !first_frame_logged {
                 let actual_path = if matches!(frame.format(), Pixel::D3D11) {
                     "hw_d3d11va"
                 } else if hw_active_initially {
@@ -1421,21 +1435,28 @@ fn run_video_decode(
                 } else {
                     "sw"
                 };
-                crate::perf::event(
-                    "video",
-                    "first_frame",
-                    None,
-                    0,
-                    &[
-                        ("decode_path", serde_json::Value::from(actual_path)),
-                        (
-                            "frame_pix_fmt",
-                            serde_json::Value::from(format!("{cur_fmt:?}")),
-                        ),
-                        ("frame_w", serde_json::Value::from(cur_w as i64)),
-                        ("frame_h", serde_json::Value::from(cur_h as i64)),
-                    ],
-                );
+                if actual_path == "sw_fallback_after_hw_init" {
+                    crate::logger::log(format!(
+                        "video decode_path: HW init succeeded but first frame is SW (pix_fmt={cur_fmt:?})"
+                    ));
+                }
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "video",
+                        "first_frame",
+                        None,
+                        0,
+                        &[
+                            ("decode_path", serde_json::Value::from(actual_path)),
+                            (
+                                "frame_pix_fmt",
+                                serde_json::Value::from(format!("{cur_fmt:?}")),
+                            ),
+                            ("frame_w", serde_json::Value::from(cur_w as i64)),
+                            ("frame_h", serde_json::Value::from(cur_h as i64)),
+                        ],
+                    );
+                }
                 first_frame_logged = true;
             }
             if scaler.is_none() || scaler_key != Some(cur_key) {
@@ -1910,6 +1931,254 @@ impl Drop for HwDevice {
 // HwDevice は単独で thread を渡らないが、`run_decoder` の所有スコープ内で持つだけ
 // なので Send/Sync は不要。明示的に impl しない。
 
+struct OpenedVideoDecoder {
+    decoder: ffmpeg_the_third::decoder::Video,
+    hw_device: Option<HwDevice>,
+    decoder_name: String,
+    hw_probe: D3d11vaProbe,
+}
+
+#[derive(Clone)]
+struct D3d11vaProbe {
+    d3d11va_supported: bool,
+    d3d11va_config: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecoderChoice {
+    Default,
+    ByName(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VideoDecoderCandidate {
+    choice: DecoderChoice,
+    reason: &'static str,
+    allow_sw_fallback: bool,
+}
+
+fn preferred_video_decoders(
+    codec_id: ffmpeg_the_third::codec::Id,
+    hw_decode_requested: bool,
+) -> Vec<VideoDecoderCandidate> {
+    let mut candidates = Vec::new();
+    if hw_decode_requested && codec_id == ffmpeg_the_third::codec::Id::AV1 {
+        candidates.push(VideoDecoderCandidate {
+            choice: DecoderChoice::ByName("av1"),
+            reason: "av1_hw_preferred",
+            allow_sw_fallback: false,
+        });
+    }
+    candidates.push(VideoDecoderCandidate {
+        choice: DecoderChoice::Default,
+        reason: "default",
+        allow_sw_fallback: true,
+    });
+    candidates
+}
+
+fn clone_codec_parameters(
+    params: &ffmpeg_the_third::codec::ParametersRef<'_>,
+) -> Result<ffmpeg_the_third::codec::Parameters, String> {
+    let mut cloned = ffmpeg_the_third::codec::Parameters::new();
+    let ret = unsafe {
+        ffmpeg_the_third::ffi::avcodec_parameters_copy(cloned.as_mut_ptr(), params.as_ptr())
+    };
+    if ret < 0 {
+        Err(format!("avcodec_parameters_copy failed: {ret}"))
+    } else {
+        Ok(cloned)
+    }
+}
+
+fn resolve_video_decoder_candidate(
+    codec_id: ffmpeg_the_third::codec::Id,
+    candidate: VideoDecoderCandidate,
+) -> Option<ffmpeg_the_third::Codec> {
+    let codec = match candidate.choice {
+        DecoderChoice::Default => ffmpeg_the_third::codec::decoder::find(codec_id),
+        DecoderChoice::ByName(name) => ffmpeg_the_third::codec::decoder::find_by_name(name),
+    }?;
+    if codec.id() != codec_id {
+        crate::logger::log(format!(
+            "video decoder candidate skipped: codec={} candidate={} reason={} stage=id_mismatch candidate_id={}",
+            codec_id.name(),
+            codec.name(),
+            candidate.reason,
+            codec.id().name(),
+        ));
+        return None;
+    }
+    Some(codec)
+}
+
+fn open_video_decoder_with_candidates(
+    video_params: &ffmpeg_the_third::codec::Parameters,
+    codec_id: ffmpeg_the_third::codec::Id,
+    hw_decode_requested: bool,
+    #[cfg(windows)] gpu_video_device: Option<
+        &std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
+) -> Result<OpenedVideoDecoder, String> {
+    let candidates = preferred_video_decoders(codec_id, hw_decode_requested);
+    let mut errors = Vec::<String>::new();
+
+    for candidate in candidates {
+        let Some(codec) = resolve_video_decoder_candidate(codec_id, candidate) else {
+            let label = match candidate.choice {
+                DecoderChoice::Default => "default".to_string(),
+                DecoderChoice::ByName(name) => name.to_string(),
+            };
+            errors.push(format!("{label}: decoder not found"));
+            continue;
+        };
+        let decoder_name = codec.name().to_string();
+        let hw_probe = probe_d3d11va_for_codec(codec);
+        crate::logger::log(format!(
+            "video decoder candidate: codec={} decoder={decoder_name} reason={} allow_sw_fallback={} hw_requested={hw_decode_requested} d3d11va_supported={} d3d11va_config={}",
+            codec_id.name(),
+            candidate.reason,
+            candidate.allow_sw_fallback,
+            hw_probe.d3d11va_supported,
+            hw_probe.d3d11va_config,
+        ));
+
+        let should_try_hw = hw_decode_requested && hw_probe.d3d11va_supported;
+        if should_try_hw {
+            let mut ctx =
+                ffmpeg_the_third::codec::context::Context::from_parameters(video_params.clone())
+                    .map_err(|e| format!("{decoder_name}: context: {e}"))?;
+            let hw_device = {
+                #[cfg(windows)]
+                {
+                    try_init_d3d11va_for_codec(&decoder_name, codec, &mut ctx, gpu_video_device)
+                }
+                #[cfg(not(windows))]
+                {
+                    try_init_d3d11va_for_codec(&decoder_name, codec, &mut ctx)
+                }
+            };
+            if let Some(hw_device) = hw_device {
+                match ctx.decoder().open_as(codec).and_then(|o| o.video()) {
+                    Ok(decoder) => {
+                        crate::logger::log(format!(
+                            "video decoder selected: codec={} decoder={decoder_name} reason={} decode_path=hw_d3d11va",
+                            codec_id.name(),
+                            candidate.reason
+                        ));
+                        return Ok(OpenedVideoDecoder {
+                            decoder,
+                            hw_device: Some(hw_device),
+                            decoder_name,
+                            hw_probe,
+                        });
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "video decoder candidate failed: codec={} decoder={decoder_name} reason={} stage=open_hw err={e}",
+                            codec_id.name(),
+                            candidate.reason
+                        ));
+                        errors.push(format!("{decoder_name}: open_hw: {e}"));
+                        if !candidate.allow_sw_fallback {
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                crate::logger::log(format!(
+                    "video decoder candidate failed: codec={} decoder={decoder_name} reason={} stage=hw_init",
+                    codec_id.name(),
+                    candidate.reason
+                ));
+                if !candidate.allow_sw_fallback {
+                    errors.push(format!("{decoder_name}: hw_init"));
+                    continue;
+                }
+            }
+        } else if hw_decode_requested && !candidate.allow_sw_fallback {
+            crate::logger::log(format!(
+                "video decoder candidate failed: codec={} decoder={decoder_name} reason={} stage=hw_probe",
+                codec_id.name(),
+                candidate.reason
+            ));
+            errors.push(format!("{decoder_name}: no_d3d11va"));
+            continue;
+        }
+
+        if candidate.allow_sw_fallback {
+            let ctx =
+                ffmpeg_the_third::codec::context::Context::from_parameters(video_params.clone())
+                    .map_err(|e| format!("{decoder_name}: context_sw: {e}"))?;
+            match ctx.decoder().open_as(codec).and_then(|o| o.video()) {
+                Ok(decoder) => {
+                    crate::logger::log(format!(
+                        "video decoder selected: codec={} decoder={decoder_name} reason={} decode_path=sw",
+                        codec_id.name(),
+                        candidate.reason
+                    ));
+                    return Ok(OpenedVideoDecoder {
+                        decoder,
+                        hw_device: None,
+                        decoder_name,
+                        hw_probe,
+                    });
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "video decoder candidate failed: codec={} decoder={decoder_name} reason={} stage=open_sw err={e}",
+                        codec_id.name(),
+                        candidate.reason
+                    ));
+                    errors.push(format!("{decoder_name}: open_sw: {e}"));
+                }
+            }
+        }
+    }
+
+    Err(errors.join("; "))
+}
+
+/// 指定 decoder について、D3D11VA の候補を列挙する。
+/// 実際に HW が使われるかは device 作成と get_format の結果で確定するため、
+/// ここでは「この decoder が D3D11VA を宣言しているか」だけを記録する。
+fn probe_d3d11va_for_codec(codec: ffmpeg_the_third::Codec) -> D3d11vaProbe {
+    use ffmpeg_the_third::ffi::*;
+
+    unsafe {
+        let mut configs = Vec::new();
+        let mut d3d11va_supported = false;
+        for i in 0_i32.. {
+            let cfg = avcodec_get_hw_config(codec.as_ptr(), i);
+            if cfg.is_null() {
+                break;
+            }
+            let cfg = &*cfg;
+            if cfg.device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA {
+                let has_device_ctx =
+                    (cfg.methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0;
+                let has_d3d11_pix_fmt = cfg.pix_fmt == AVPixelFormat::AV_PIX_FMT_D3D11;
+                if has_device_ctx && has_d3d11_pix_fmt {
+                    d3d11va_supported = true;
+                }
+                configs.push(format!(
+                    "idx={i},pix_fmt={:?},methods=0x{:x},device_ctx={has_device_ctx}",
+                    cfg.pix_fmt, cfg.methods
+                ));
+            }
+        }
+
+        D3d11vaProbe {
+            d3d11va_supported,
+            d3d11va_config: if configs.is_empty() {
+                "none".to_string()
+            } else {
+                configs.join(";")
+            },
+        }
+    }
+}
+
 /// D3D11VA HW デコードを試みる。サポート確認 → デバイス作成 → AVCodecContext へ装着
 /// までを行い、成功時は `Some(HwDevice)` を返す。失敗 (codec 非対応 / device 作成失敗)
 /// 時は `None` を返し、SW で続行する。
@@ -1917,8 +2186,9 @@ impl Drop for HwDevice {
 /// `gpu_video_device` が `Some` の場合は **そのデバイスを FFmpeg と共有** する
 /// (= mIV の VideoProcessor が同じデバイスで動作可能、CreateVideoProcessorInputView
 /// の前提)。`None` の場合は FFmpeg が独自デバイスを作る (旧経路)。
-fn try_init_d3d11va(
-    codec_id: ffmpeg_the_third::codec::Id,
+fn try_init_d3d11va_for_codec(
+    codec_name_for_log: &str,
+    codec: ffmpeg_the_third::Codec,
     ctx: &mut ffmpeg_the_third::codec::context::Context,
     #[cfg(windows)] gpu_video_device: Option<
         &std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
@@ -1927,39 +2197,15 @@ fn try_init_d3d11va(
     use ffmpeg_the_third::ffi::*;
 
     unsafe {
-        // 1. デコーダコーデックを取得 (avcodec_find_decoder)
-        let codec = avcodec_find_decoder(codec_id.into());
-        if codec.is_null() {
+        let probe = probe_d3d11va_for_codec(codec);
+        if !probe.d3d11va_supported {
             crate::logger::log(format!(
-                "HW: avcodec_find_decoder({codec_id:?}) returned null"
+                "HW: decoder {codec_name_for_log} does not support D3D11VA HW_DEVICE_CTX"
             ));
             return None;
         }
 
-        // 2. avcodec_get_hw_config で D3D11VA + HW_DEVICE_CTX をサポートするか確認
-        let mut supported = false;
-        for i in 0_i32.. {
-            let cfg = avcodec_get_hw_config(codec, i);
-            if cfg.is_null() {
-                break;
-            }
-            let cfg = &*cfg;
-            if cfg.device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA
-                && (cfg.methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0
-                && cfg.pix_fmt == AVPixelFormat::AV_PIX_FMT_D3D11
-            {
-                supported = true;
-                break;
-            }
-        }
-        if !supported {
-            crate::logger::log(format!(
-                "HW: codec {codec_id:?} does not support D3D11VA HW_DEVICE_CTX"
-            ));
-            return None;
-        }
-
-        // 3. HW デバイスコンテキスト作成。
+        // HW デバイスコンテキスト作成。
         //    gpu_video_device があれば mIV の D3D11 デバイスを共有、なければ FFmpeg
         //    が新デバイスを作る (= 旧経路)。
         #[cfg(windows)]
@@ -1967,7 +2213,7 @@ fn try_init_d3d11va(
             match crate::video::gpu_renderer::create_ffmpeg_hw_device_ctx(gpu_dev) {
                 Ok(b) => {
                     crate::logger::log(format!(
-                        "HW: D3D11VA shared with GpuVideoDevice for codec {codec_id:?}"
+                        "HW: D3D11VA shared with GpuVideoDevice for decoder {codec_name_for_log}"
                     ));
                     b
                 }
@@ -2024,7 +2270,7 @@ fn try_init_d3d11va(
             buf
         };
 
-        // 4. AVCodecContext にぶら下げる + get_format コールバック
+        // AVCodecContext にぶら下げる + get_format コールバック
         let avctx = ctx.as_mut_ptr();
         let new_ref = av_buffer_ref(buf_ref);
         if new_ref.is_null() {
@@ -2036,7 +2282,9 @@ fn try_init_d3d11va(
         (*avctx).hw_device_ctx = new_ref;
         (*avctx).get_format = Some(get_hw_format);
 
-        crate::logger::log(format!("HW: D3D11VA initialized for codec {codec_id:?}"));
+        crate::logger::log(format!(
+            "HW: D3D11VA initialized for decoder {codec_name_for_log}"
+        ));
         Some(HwDevice { buf_ref })
     }
 }
@@ -2260,4 +2508,46 @@ fn try_gpu_blit_path(
         pts_secs,
         seek_serial: current_seek_serial,
     })
+}
+
+#[cfg(test)]
+mod decoder_candidate_tests {
+    use super::{DecoderChoice, preferred_video_decoders};
+    use ffmpeg_the_third::codec::Id;
+
+    #[test]
+    fn h264_hevc_have_single_default_candidate_even_with_hw() {
+        for id in [Id::H264, Id::HEVC] {
+            let candidates = preferred_video_decoders(id, true);
+            assert_eq!(candidates.len(), 1, "{id:?}");
+            assert_eq!(candidates[0].choice, DecoderChoice::Default);
+            assert!(candidates[0].allow_sw_fallback);
+        }
+    }
+
+    #[test]
+    fn av1_hw_prefers_native_then_default() {
+        let candidates = preferred_video_decoders(Id::AV1, true);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].choice, DecoderChoice::ByName("av1"));
+        assert!(!candidates[0].allow_sw_fallback);
+        assert_eq!(candidates[1].choice, DecoderChoice::Default);
+        assert!(candidates[1].allow_sw_fallback);
+    }
+
+    #[test]
+    fn av1_without_hw_uses_default_only() {
+        let candidates = preferred_video_decoders(Id::AV1, false);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].choice, DecoderChoice::Default);
+        assert!(candidates[0].allow_sw_fallback);
+    }
+
+    #[test]
+    fn vp9_uses_default_only_even_with_hw() {
+        let candidates = preferred_video_decoders(Id::VP9, true);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].choice, DecoderChoice::Default);
+        assert!(candidates[0].allow_sw_fallback);
+    }
 }
