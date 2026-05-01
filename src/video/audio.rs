@@ -349,9 +349,16 @@ fn run_pump(
     const READY_THRESHOLD_SECS: f64 = 0.15;
     // ── raw_pending overflow / warning ──
     // pump back-pressure を完全に避けるため raw 側は大きく持つが、安全網として上限。
-    // 5 秒で warning ログ、10 秒で overflow → AudioInactive fallback。
-    const RAW_WARNING_SECS: f64 = 5.0;
-    const RAW_OVERFLOW_SECS: f64 = 10.0;
+    // 30 秒で overflow (= soft fallback)、15 秒で warning ログ。
+    //
+    // **値の根拠** (= 2026-05-01 ユーザー報告 H264 HW decode の overflow 多発で改訂):
+    // engine_state gate active 中 (= Buffering) は fill_output が非 drain なので
+    // pump は raw_pending に積み続ける。audio decoder の生成速度は ~23x real-time なので、
+    // Buffering 1 秒あたり 23 秒分の raw が積まれる。AV1 long GOP の 5 秒級 Buffering でも
+    // 余裕で収まるよう 30 秒に拡張。memory cost = 30 * 96000 * 4 byte = ~11 MB (許容)。
+    // 旧 10 秒では H264 HW decode の 1-2 秒 Buffering で頻繁に overflow していた。
+    const RAW_WARNING_SECS: f64 = 15.0;
+    const RAW_OVERFLOW_SECS: f64 = 30.0;
 
     let sample_rate = buffer.lock().unwrap().sample_rate;
     let samples_per_sec = (sample_rate as f64) * 2.0;
