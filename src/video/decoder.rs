@@ -161,16 +161,21 @@ pub struct AudioFrame {
     pub duration_secs: f64,
     /// この `seek_serial` におけるユーザー要求 seek 位置 (秒)。
     ///
-    /// **Codex P1 修正 (2026-05-01)**: Fast モードでは preroll trim を省略するため
-    /// `pts_secs` (= keyframe pts) と user-requested target が一致しない。pump 側で
-    /// BufferReady の audio_anchor を target ベースで報告するため、demux Flush 経由で
-    /// 受け取った target 値を audio decode thread が **同じ seek_serial の全 frame に
-    /// 焼き付けて** 伝搬する (= 1-shot ではなく persistent: pump がどのタイミングで
-    /// frame を観測しても target を取り出せる)。
+    /// **背景 (Codex P1 修正、2026-05-01)**: pump 側で BufferReady の audio_anchor を
+    /// target ベースで報告するため、demux Flush 経由で受け取った target 値を audio
+    /// decode thread が **同じ seek_serial の全 frame に焼き付けて** 伝搬する
+    /// (= 1-shot ではなく persistent: pump がどのタイミングで frame を観測しても
+    /// target を取り出せる)。
+    ///
+    /// **2 巡目 fix で audio は Fast でも target まで trim** するようになったため、
+    /// `pts_secs` ≈ target で frame が emit される (= 旧設計の「keyframe pts と target
+    /// が乖離」状態は audio 側では発生しない)。それでも `audible_pts.max(target)` の
+    /// max 演算は安全側として保持している (= PDC > 0 の場合 audible_pts < target が
+    /// 発生しうる、初期 open の audio anchor 等のケース)。
     ///
     /// 値の意味:
-    /// - `Some(target)`: seek が走った世代の frame。pump は target を BufferReady pts
-    ///   の下限としてmax 演算する (= audible_pts.max(target))。
+    /// - `Some(target)`: seek が走った世代の frame。pump は BufferReady pts の下限として
+    ///   max 演算する (= audible_pts.max(target))。
     /// - `None`: 非 seek flush (= 失敗 or 初期 open)。pump は audible_pts を素朴に使う。
     pub seek_target_secs: Option<f64>,
 }
@@ -1658,10 +1663,17 @@ fn run_video_decode(
 /// シーク時は呼び出し元が `AudioWorkerMsg::Flush { serial, seek_target_secs,
 /// trim_before_secs }` を送る。この thread は `Flush` 受領で内部 decoder を
 /// `flush()` し、`current_seek_serial` / `drop_before_secs` /
-/// `current_seek_target_secs` をリセットする。`trim_before_secs` が `None` なら
-/// preroll trim はスキップ (= Fast backward 成功 or seek 失敗)。`seek_target_secs`
-/// は世代単位で保持し、emit する全 AudioFrame に焼き付けて pump へ伝搬する
-/// (= pump が BufferReady の audio_anchor pts に target を反映するため)。
+/// `current_seek_target_secs` をリセットする。
+///
+/// **`trim_before_secs` の値**:
+/// - 成功時 (Precise / Fast / forward retry): demux 側で常に `Some(target)` が送られる。
+///   audio 側は seek 種別に関係なく target まで preroll trim する (= Codex 2 巡目 P1、
+///   2026-05-01: Fast でも audio trim を残さないと clock anchor が target で凍結し
+///   video pacing が 6-7 秒止まる regression が発生していた)。
+/// - 失敗時: `None` (= demux 位置が動いていないので trim せず通常 pacing に戻す)。
+///
+/// `seek_target_secs` は世代単位で保持し、emit する全 AudioFrame に焼き付けて pump
+/// へ伝搬する (= pump が BufferReady の audio_anchor pts に target を反映するため)。
 ///
 /// EOF 時は `AudioWorkerMsg::Eof` を受けて内部 decoder を flush + 残フレーム drain。
 /// その後は次の `Flush` か `Packet` か channel disconnect (= run_decoder 終了) を待つ。
