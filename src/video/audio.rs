@@ -293,20 +293,22 @@ fn run_pump(
     // ※ samples は interleaved stereo (channels=2)。
     // sample_rate は構築時に固定なので 1 度だけロックして拾う。
     const TARGET_BUFFER_SECS: f64 = 0.3;
-    // ── Buffering / Seeking 中の cap 拡張 (deadlock 回避、2026-05) ──
+    // ── Buffering / Seeking 中は cap を実質無制限にする (deadlock 回避、2026-05) ──
     //
     // engine が PLAYING 以外のときは fill_output が silence + 非 drain なので、
     // 通常 cap (= 0.3秒) のままだと pump が cap 待ちで詰まり、上流連鎖
-    // (audio decode block → demux block → video starvation) が発生する。
-    // Buffering/Seeking 中だけ cap を 5 秒に拡張して pump が詰まらないようにする。
-    // 5 秒は AV1 SW 長 GOP の forward decode 時間 (典型 2-5 秒) を上回る安全値。
-    // memory: 5 sec * 96000 samples_per_sec * 4 byte = ~2 MB (許容)。
-    const BUFFERING_BUFFER_SECS: f64 = 5.0;
+    // (audio decode block → demux block → video starvation) が発生する
+    // (= ユーザー報告「動画を準備中... のまま」)。
+    // 旧版は固定 5 秒に拡張していたが、Codex P2-2 で「AV1 は 5 秒を超える GOP も
+    // 普通にあり、5 秒 cap でも back-pressure が復活し得る」と指摘あり。pump 側の
+    // cap を実質無制限にして「Buffering 中は demux/audio decode を絶対に止めない」
+    // 設計に切り替える。memory は demux 読み込みが律速 (= 普通 ~10 sec 範囲)、
+    // 60 sec 級の極端な Buffering でも 60 * 96000 * 4 = ~23 MB の上限なので OK。
     let sample_rate = buffer.lock().unwrap().sample_rate;
     let cap_samples_playing =
         (sample_rate as f64 * 2.0 * TARGET_BUFFER_SECS) as usize;
-    let cap_samples_buffering =
-        (sample_rate as f64 * 2.0 * BUFFERING_BUFFER_SECS) as usize;
+    // Buffering 中の cap = usize::MAX (= 実質無制限)。pump は cap 待ちに入らない。
+    let cap_samples_buffering: usize = usize::MAX;
 
     // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。
     // 設計 v3 では 500ms (= 250ms low + hysteresis 想定) で確定したが、Phase 8.K で

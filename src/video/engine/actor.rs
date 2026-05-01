@@ -234,11 +234,20 @@ impl EngineActor {
     /// `Buffering` への遷移。**epoch は進めない** (= 既に handle_seek_request で進めた値、
     /// または 0 = 初回 open 用)。`pts` は anchor の凍結位置。
     ///
-    /// **重要**: latch は `current_seek_epoch` でリセットする。BufferStarved 等の
-    /// 非 seek 経路で再 buffering する場合に、前回 ready 済みの latch が残ったまま
-    /// 即 Playing に戻る race を防ぐ。
+    /// **同 epoch 再入場では `first_frame` を保つ** (= BufferStarved 経路、2026-05 修正):
+    /// `emit_first_frame_event` は同 epoch 内で 1 度しか発火しないため、BufferStarved
+    /// で latch を全 reset すると Playing に戻れない deadlock になる
+    /// (= ユーザー報告「音が出なくなり、再生しばらくして映像も止まる」)。
+    /// 同 epoch かつ `first_frame=true` の場合は `buffer_ready/audio_anchor` だけ
+    /// reset し、`first_frame` は保持する。新 epoch (= seek 経由) では従来通り全 reset。
     fn transition_to_buffering(&mut self, pts: f64) {
-        self.latch = ReadinessLatch::new(self.current_seek_epoch());
+        let cur_epoch = self.current_seek_epoch();
+        if self.latch.epoch == cur_epoch && self.latch.first_frame {
+            self.latch.buffer_ready = false;
+            self.latch.audio_anchor = None;
+        } else {
+            self.latch = ReadinessLatch::new(cur_epoch);
+        }
         self.clock.set_anchor(ClockAnchor::frozen_at(pts));
         self.state = EngineState::Buffering;
         self.published_state
@@ -567,12 +576,22 @@ impl EngineActor {
         }
         // anchor source の選択: audio あり → Audio anchor、なし → Wall anchor。
         // is_ready が true なら Option は必ず Some (= 改訂 is_ready で保証、設計 v3 P2)。
+        //
+        // **wall は `Instant::now()` を使う** (Codex P2-1、2026-05): BufferReady 時点で
+        // 保存した `wall` をそのまま anchor に使うと、Buffering 中は fill_output が
+        // 非 drain で audio が実際に流れていないため、FirstFrameReady の到達まで
+        // 数秒遅れた場合に anchor が「BufferReady からの経過分」だけ進んだ状態で
+        // Playing 入場する → 早送りが形を変えて再発。pts は latch から取り、wall は
+        // 「Playing 開始の今」にする。fill_output の最初の drain 直後に set_audio_pts
+        // で再 anchor されるため、この瞬間の anchor が短時間使われるだけで済む。
+        let now = Instant::now();
         let anchor = if self.has_audio {
-            let (pts, wall) = self.latch.audio_anchor.expect("is_ready guarantees audio_anchor");
-            ClockAnchor::audio(pts, wall)
+            let (pts, _wall) =
+                self.latch.audio_anchor.expect("is_ready guarantees audio_anchor");
+            ClockAnchor::audio(pts, now)
         } else {
             let pts = self.latch.first_frame_pts.expect("is_ready guarantees first_frame_pts");
-            ClockAnchor::wall(pts, Instant::now())
+            ClockAnchor::wall(pts, now)
         };
         if self.opts.autoplay {
             self.transition_to_playing(anchor);
@@ -735,9 +754,12 @@ mod tests {
     }
 
     #[test]
-    fn re_entering_buffering_resets_latch() {
-        // BufferStarved 等で Playing → Buffering に再入場するシナリオ。
-        // 前回 ready した latch が残ると即 Playing に bounce-back する race を防ぐ。
+    fn re_entering_buffering_same_epoch_preserves_first_frame() {
+        // **同 epoch 再入場では first_frame を保持する** (= 2026-05 修正、BufferStarved
+        // 経路の deadlock 回避)。FirstFrameReady は同 epoch 内で 1 度しか emit されない
+        // ので、latch を全 reset すると Playing に戻れなくなる。
+        // has_audio=false なら BufferReady は不要 → first_frame だけで is_ready=true →
+        // 再入場で即 Playing に戻れる (= 期待される自然な復帰)。
         let mut a = fresh_actor();
         a.has_audio = false;
         a.transition_to_buffering(0.0);
@@ -746,12 +768,36 @@ mod tests {
         a.try_transition_from_buffering();
         assert_eq!(a.state, EngineState::Playing);
 
-        // 再 Buffering 入場 — latch がクリアされ、即 Playing には戻らない
+        // 同 epoch で再 Buffering 入場 — first_frame は保持、buffer_ready はリセット
         a.transition_to_buffering(1.0);
-        assert!(!a.latch.first_frame);
+        assert!(a.latch.first_frame, "same-epoch re-entry preserves first_frame");
+        assert!(!a.latch.buffer_ready, "buffer_ready is reset on re-entry");
+        // has_audio=false なので BufferReady なしで is_ready=true → Playing に戻る
+        a.try_transition_from_buffering();
+        assert_eq!(a.state, EngineState::Playing,
+            "same-epoch re-entry can transition back to Playing without fresh first_frame");
+    }
+
+    #[test]
+    fn re_entering_buffering_new_epoch_resets_latch() {
+        // 新 epoch (= 実 seek 経由) では従来通り latch を全 reset。
+        // 即 Playing に bounce-back する race を防ぐ。
+        let mut a = fresh_actor();
+        a.has_audio = false;
+        a.transition_to_buffering(0.0);
+        a.latch.first_frame = true;
+        a.latch.first_frame_pts = Some(0.0);
+        a.try_transition_from_buffering();
+        assert_eq!(a.state, EngineState::Playing);
+
+        // epoch を進めてから transition_to_buffering → 全 reset
+        a.seek_serial.fetch_add(1, Ordering::AcqRel);
+        a.transition_to_buffering(1.0);
+        assert!(!a.latch.first_frame, "new epoch resets first_frame");
         assert!(!a.latch.buffer_ready);
         a.try_transition_from_buffering();
-        assert_eq!(a.state, EngineState::Buffering, "must wait for fresh first_frame");
+        assert_eq!(a.state, EngineState::Buffering,
+            "new epoch must wait for fresh FirstFrameReady");
     }
 
     #[test]
@@ -1192,7 +1238,14 @@ mod tests {
 
         a.handle_audio_event(AudioEvent::BufferStarved { epoch: 0 });
         assert_eq!(a.state, EngineState::Buffering);
-        assert!(!a.latch.first_frame, "latch reset on starvation");
+        // **同 epoch 再入場では first_frame を保持** (= 2026-05 修正)。
+        // FirstFrameReady は同 epoch で再 emit されないため、保持しないと
+        // BufferReady が来ても latch.is_ready が永久に false になり Playing に
+        // 戻れなくなる (= 「音が出なくなって映像も止まる」deadlock)。
+        // buffer_ready / audio_anchor だけ reset される。
+        assert!(a.latch.first_frame, "first_frame preserved across same-epoch re-entry");
+        assert!(!a.latch.buffer_ready, "buffer_ready is reset on re-entry");
+        assert!(a.latch.audio_anchor.is_none(), "audio_anchor is reset on re-entry");
     }
 
     #[test]
