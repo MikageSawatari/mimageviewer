@@ -933,7 +933,7 @@ fn run_decoder(
                     // Phase A: 音声 packet は decode せず audio decode thread に転送する。
                     // packet 段階の pre-decode preroll trim と sample-level trim は両方
                     // audio decode thread 側に移管した (= AudioWorkerMsg::Flush で渡した
-                    // target_secs を audio thread が `drop_before_secs` として保持)。
+                    // `trim_before_secs` を audio thread が `drop_before_secs` として保持)。
                     //
                     // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
                     // 直前の Flush marker と packet の到着順が逆転しない。bounded(64) が
@@ -1012,11 +1012,13 @@ fn run_decoder(
 /// (= drop してカウンタ加算)。`video_pkt_rx` (bounded=64) は demux ↔ video decode
 /// の逆圧経路として機能する。
 ///
-/// シーク時は demux 側が `VideoWorkerMsg::Flush { serial, target_secs }` を送る。
-/// この thread は `Flush` 受領で内部 decoder を `flush()` し、
-/// `current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent` をリセット
-/// する。`target_secs.is_none()` (= seek 失敗) の場合は preroll trim せず通常
-/// pacing に戻す (= post_seek_frame_sent を直ちに true)。
+/// シーク時は demux 側が `VideoWorkerMsg::Flush { serial, seek_target_secs,
+/// trim_before_secs }` を送る。この thread は `Flush` 受領で内部 decoder を
+/// `flush()` し、`current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent`
+/// をリセットする。`drop_before_secs` には `trim_before_secs` が入る (=
+/// `seek_target_secs` は video 側では使わず、pump 側 BufferReady 用に audio チェーン
+/// が持つ)。`trim_before_secs.is_none()` (= Fast backward 成功 or seek 失敗) の場合は
+/// preroll trim せず通常 pacing に戻す (= post_seek_frame_sent を直ちに true)。
 ///
 /// EOF 時は `VideoWorkerMsg::Eof` を受け取るが、動画は内部残フレームを失っても
 /// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
@@ -1635,10 +1637,13 @@ fn run_video_decode(
 /// enqueue するだけで、`audio_tx` (bounded=32) が満杯のときも自スレッドはブロック
 /// しない。`audio_pkt_rx` (bounded=64) は両 thread 間の逆圧経路として機能する。
 ///
-/// シーク時は呼び出し元が `AudioWorkerMsg::Flush { serial, target_secs }` を送る。
-/// この thread は `Flush` 受領で内部 decoder を `flush()` し、
-/// `current_seek_serial` / `drop_before_secs` をリセットする。`target_secs` が
-/// `None` なら seek 失敗 (= demux 位置は動いていない) なので preroll trim は行わない。
+/// シーク時は呼び出し元が `AudioWorkerMsg::Flush { serial, seek_target_secs,
+/// trim_before_secs }` を送る。この thread は `Flush` 受領で内部 decoder を
+/// `flush()` し、`current_seek_serial` / `drop_before_secs` /
+/// `current_seek_target_secs` をリセットする。`trim_before_secs` が `None` なら
+/// preroll trim はスキップ (= Fast backward 成功 or seek 失敗)。`seek_target_secs`
+/// は世代単位で保持し、emit する全 AudioFrame に焼き付けて pump へ伝搬する
+/// (= pump が BufferReady の audio_anchor pts に target を反映するため)。
 ///
 /// EOF 時は `AudioWorkerMsg::Eof` を受けて内部 decoder を flush + 残フレーム drain。
 /// その後は次の `Flush` か `Packet` か channel disconnect (= run_decoder 終了) を待つ。
