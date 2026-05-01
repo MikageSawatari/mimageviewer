@@ -69,7 +69,6 @@ impl AdjustScope {
             AdjustScope::Global => "標準",
         }
     }
-
 }
 
 /// 見開き描画時に書き出されるページ矩形レイアウト。
@@ -287,10 +286,7 @@ impl App {
 
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
     /// `resolve_fs_display_tex` を `include_thumb=true` で呼んで「最良の表示物」を取る。
-    pub(crate) fn current_fs_tex_for_holdover(
-        &self,
-        fs_idx: usize,
-    ) -> Option<egui::TextureHandle> {
+    pub(crate) fn current_fs_tex_for_holdover(&self, fs_idx: usize) -> Option<egui::TextureHandle> {
         self.resolve_fs_display_tex(fs_idx, true)
     }
 
@@ -685,7 +681,11 @@ impl App {
                             // 中央 contain フィット (= はみ出さないアスペクト維持)。
                             let avail = ui.available_size();
                             let tex_size = handle.size_vec2();
-                            if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
+                            if tex_size.x > 0.0
+                                && tex_size.y > 0.0
+                                && avail.x > 0.0
+                                && avail.y > 0.0
+                            {
                                 let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
                                 let w = tex_size.x * scale;
                                 let h = tex_size.y * scale;
@@ -1711,9 +1711,8 @@ impl App {
         // レーティング / Shift+F6: コンテナレーティング解除。
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
         // matches_logically 対策で Shift 版を先に consume する (NONE だと Shift 入りも吸収される)。
-        let container_rating_key: Option<u8> = ctx.input_mut(|i| {
-            crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT)
-        });
+        let container_rating_key: Option<u8> =
+            ctx.input_mut(|i| crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT));
         if let Some(stars) = container_rating_key
             && self.set_current_folder_rating(stars)
         {
@@ -1721,9 +1720,8 @@ impl App {
         }
 
         // F1-F5: レーティング 1〜5 / F6: レーティング解除
-        let rating_key: Option<u8> = ctx.input_mut(|i| {
-            crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE)
-        });
+        let rating_key: Option<u8> =
+            ctx.input_mut(|i| crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE));
         if let Some(stars) = rating_key {
             // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
             let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
@@ -1937,11 +1935,7 @@ impl App {
             };
             let next = all[next_idx];
             params.post_filter = next;
-            self.show_feedback_toast(format!(
-                "[P: {} / {}]",
-                scope.label(),
-                next.display_label()
-            ));
+            self.show_feedback_toast(format!("[P: {} / {}]", scope.label(), next.display_label()));
             self.capture_adjust_full(
                 format!("ポストフィルタ: {}", next.display_label()),
                 |app| {
@@ -2745,16 +2739,10 @@ impl App {
             let avail_aspect = full_rect.width() / full_rect.height().max(1.0);
             let img_rect = if aspect > avail_aspect {
                 let h = full_rect.width() / aspect;
-                egui::Rect::from_center_size(
-                    full_rect.center(),
-                    egui::vec2(full_rect.width(), h),
-                )
+                egui::Rect::from_center_size(full_rect.center(), egui::vec2(full_rect.width(), h))
             } else {
                 let w = full_rect.height() * aspect;
-                egui::Rect::from_center_size(
-                    full_rect.center(),
-                    egui::vec2(w, full_rect.height()),
-                )
+                egui::Rect::from_center_size(full_rect.center(), egui::vec2(w, full_rect.height()))
             };
             let cb = egui_wgpu::Callback::new_paint_callback(
                 img_rect,
@@ -4584,7 +4572,6 @@ fn build_info_text_video(
     parts.join("    ")
 }
 
-
 /// 回転アイコンを自前描画する。
 fn draw_rotate_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32, clockwise: bool) {
     let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
@@ -5014,8 +5001,7 @@ impl App {
         let shift_held_now = ctx.input(|i| i.modifiers.shift);
         let shift_enter = ctx.input_mut(|i| {
             let direct = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
-            let fallback = shift_held_now
-                && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            let fallback = shift_held_now && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
             direct || fallback
         });
         if shift_enter {
@@ -5028,56 +5014,33 @@ impl App {
         // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
         // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
         // (= マウスホイールと整合)。Shift+↑↓ だけ動画モードで音量に使う。
-        let shift_left = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
-        });
-        let shift_right = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight)
-        });
-        let ctrl_left = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)
-        });
-        let ctrl_right = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)
-        });
-        let left = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-        });
-        let right = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-        });
-        let shift_up = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
-        });
-        let shift_down = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
-        });
+        let shift_left =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
+        let shift_right =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight));
+        let ctrl_left =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+        let ctrl_right =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
+        let left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+        let right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
+        let shift_up = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
+        let shift_down =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
         // ↑↓ プレーンは consume しない (= image handler が file navigation に使う)。
-        let mute_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::M)
-        });
-        let loop_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::L)
-        });
+        let mute_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
+        let loop_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
         // Phase 5.4.1: B キーで現在位置にブックマーク追加 (動画モード限定)。
         // 画像モードの B (透過背景循環) とは handle_video_input 先行 consume で分離。
-        let bookmark_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::B)
-        });
+        let bookmark_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
-        let tile_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::S)
-        });
+        let tile_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
         // Phase 8.I: P キーでフレームレート オーバーレイのトグル (動画モード限定)。
         // 画像モードの P (post-filter) とは handle_video_input 先行 consume で分離。
-        let perf_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::P)
-        });
+        let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
-        let rewind_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::W)
-        });
+        let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
@@ -5164,11 +5127,10 @@ impl App {
             self.video_perf_history.clear();
             self.video_perf_last_wall = None;
             self.video_perf_last_seq = None;
-            self.video_perf_last_skip = None;
+            self.video_perf_last_decoder_skip = None;
+            self.video_perf_last_ui_skip = None;
         }
-        if rewind_key
-            && let Some(p) = self.fs_video_player(fs_idx)
-        {
+        if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
             p.seek(0.0);
             if !p.is_playing() {
                 p.toggle_play();
@@ -5197,19 +5159,13 @@ impl App {
                 }
                 _ => None,
             };
-            if let (Some((path, pts)), Some(db)) =
-                (snapshot, self.video_bookmark_db.as_ref())
-            {
+            if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
                 if let Err(e) = db.add(&path, pts, None, &[]) {
-                    crate::logger::log(format!(
-                        "video bookmark add failed: {e}"
-                    ));
+                    crate::logger::log(format!("video bookmark add failed: {e}"));
                 } else {
                     crate::logger::log(format!(
                         "video bookmark added: pts={pts:.2}s {}",
-                        path.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("?")
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                     ));
                 }
             }
@@ -5217,39 +5173,49 @@ impl App {
     }
 
     /// 動画 VideoPlayer の `displayed_frame_seq` (= GPU/CPU 経路問わず tick で +1)
-    /// の変化で frame interval (ms) を履歴に記録。`skipped_frame_count` の delta も
-    /// 同時に記録し、赤縦線で「実際の skip 発生」を表示する。
+    /// の変化で frame interval (ms) を履歴に記録。skip delta は decoder 側
+    /// `dropped_full` と UI 側 `dropped_past` に分けて記録し、色分け表示する。
     /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
     /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
-        let snapshot: Option<(u64, u64, usize, f32, bool, bool)> = match self.fs_cache.get(&fs_idx) {
-            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                let expected_ms = player
-                    .info()
-                    .map(|i| i.avg_fps as f32)
-                    .filter(|fps| *fps > 0.5 && fps.is_finite())
-                    .map(|fps| 1000.0 / fps)
-                    .unwrap_or(33.3);
-                let state = player.engine_state_code();
-                let is_warmup =
-                    state != crate::video::engine::actor::state_code::PLAYING;
-                // Phase 9.G: graph freeze 判定 = pause OR seeking。
-                // - PAUSED: ユーザー一時停止中
-                // - is_seeking() (= override active、demux が seek 処理中で
-                //   post-seek 1 枚目が UI に届くまで): 「黒い空間」を防ぐ
-                let is_paused_or_seeking = player.is_paused_or_seeking();
-                Some((
-                    player.displayed_frame_seq(),
-                    player.skipped_frame_count(),
-                    player.pending_frames(),
-                    expected_ms,
-                    is_warmup,
-                    is_paused_or_seeking,
-                ))
-            }
-            _ => None,
-        };
-        let Some((cur_seq, cur_skip, cur_buf, expected_ms, is_warmup, is_freeze)) = snapshot
+        let snapshot: Option<(u64, u64, u64, usize, f32, bool, bool)> =
+            match self.fs_cache.get(&fs_idx) {
+                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                    let (decoder_skips, ui_skips) = player.skip_counters();
+                    let expected_ms = player
+                        .info()
+                        .map(|i| i.avg_fps as f32)
+                        .filter(|fps| *fps > 0.5 && fps.is_finite())
+                        .map(|fps| 1000.0 / fps)
+                        .unwrap_or(33.3);
+                    let state = player.engine_state_code();
+                    let is_warmup = state != crate::video::engine::actor::state_code::PLAYING;
+                    // Phase 9.G: graph freeze 判定 = pause OR seeking。
+                    // - PAUSED: ユーザー一時停止中
+                    // - is_seeking() (= override active、demux が seek 処理中で
+                    //   post-seek 1 枚目が UI に届くまで): 「黒い空間」を防ぐ
+                    let is_paused_or_seeking = player.is_paused_or_seeking();
+                    Some((
+                        player.displayed_frame_seq(),
+                        decoder_skips,
+                        ui_skips,
+                        player.pending_frames(),
+                        expected_ms,
+                        is_warmup,
+                        is_paused_or_seeking,
+                    ))
+                }
+                _ => None,
+            };
+        let Some((
+            cur_seq,
+            cur_decoder_skip,
+            cur_ui_skip,
+            cur_buf,
+            expected_ms,
+            is_warmup,
+            is_freeze,
+        )) = snapshot
         else {
             return;
         };
@@ -5279,7 +5245,7 @@ impl App {
             let pause_dur = now_real.saturating_duration_since(pause_start);
             if pause_dur > std::time::Duration::from_millis(10) {
                 for entry in self.video_perf_history.iter_mut() {
-                    entry.1 += pause_dur;
+                    entry.arrival += pause_dur;
                 }
                 if let Some(prev) = self.video_perf_last_wall.as_mut() {
                     *prev += pause_dur;
@@ -5288,24 +5254,27 @@ impl App {
         }
         if Some(cur_seq) != self.video_perf_last_seq {
             let now = std::time::Instant::now();
-            if let (Some(prev_wall), Some(_), Some(prev_skip)) = (
+            if let (Some(prev_wall), Some(_), Some(prev_decoder_skip), Some(prev_ui_skip)) = (
                 self.video_perf_last_wall,
                 self.video_perf_last_seq,
-                self.video_perf_last_skip,
+                self.video_perf_last_decoder_skip,
+                self.video_perf_last_ui_skip,
             ) {
-                let interval_ms =
-                    now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
-                let skip_delta = cur_skip.saturating_sub(prev_skip) as u32;
+                let interval_ms = now.saturating_duration_since(prev_wall).as_secs_f32() * 1000.0;
+                let decoder_delta = cur_decoder_skip.saturating_sub(prev_decoder_skip) as u32;
+                let ui_delta = cur_ui_skip.saturating_sub(prev_ui_skip) as u32;
                 let buf_clamped = cur_buf.min(255) as u8;
                 let transient_threshold = expected_ms * 3.0;
                 if interval_ms <= transient_threshold {
-                    self.video_perf_history.push_back((
-                        interval_ms,
-                        now,
-                        skip_delta,
-                        buf_clamped,
-                        is_warmup,
-                    ));
+                    self.video_perf_history
+                        .push_back(crate::app::VideoPerfSample {
+                            interval_ms,
+                            arrival: now,
+                            decoder_skips: decoder_delta,
+                            ui_skips: ui_delta,
+                            buffer_len: buf_clamped,
+                            is_warmup,
+                        });
                     // Phase 8.K: 容量 200 だと 60fps で 3.3 秒分しか保持できず、
                     // graph の WINDOW_SECS=6.0 に対し左 半分以上が空欄になる。
                     // 6 秒 × 100fps の余裕を持たせて 600 に拡大。
@@ -5316,17 +5285,14 @@ impl App {
             }
             self.video_perf_last_wall = Some(now);
             self.video_perf_last_seq = Some(cur_seq);
-            self.video_perf_last_skip = Some(cur_skip);
+            self.video_perf_last_decoder_skip = Some(cur_decoder_skip);
+            self.video_perf_last_ui_skip = Some(cur_ui_skip);
         }
     }
 
     /// FPS / フレーム間隔のオーバーレイ。直近 200 frame の interval (ms) を折れ線で、
     /// 動画 fps から期待値の 1.5x 超を赤縦線 (hitch) で目立たせる。左上半透明。
-    pub(crate) fn draw_video_perf_overlay(
-        &self,
-        ui: &mut egui::Ui,
-        full_rect: egui::Rect,
-    ) {
+    pub(crate) fn draw_video_perf_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
         let painter = ui.painter().clone();
         // 動画の fps から期待 interval (ms) を取得。fps 不明なら 30fps 仮定。
         // hitch 閾値は期待値の 1.5x (= 50% 超過 = 1 frame 落ち相当)。
@@ -5387,36 +5353,38 @@ impl App {
         let avg: f32 = self
             .video_perf_history
             .iter()
-            .map(|(v, _, _, _, _)| v)
+            .map(|s| s.interval_ms)
             .sum::<f32>()
             / n as f32;
         let max: f32 = self
             .video_perf_history
             .iter()
-            .map(|(v, _, _, _, _)| *v)
+            .map(|s| s.interval_ms)
             .fold(0.0_f32, f32::max);
-        let skips: u32 = self
+        let decoder_skips: u32 = self
             .video_perf_history
             .iter()
-            .map(|(_, _, s, _, _)| *s)
+            .map(|s| s.decoder_skips)
             .sum();
+        let ui_skips: u32 = self.video_perf_history.iter().map(|s| s.ui_skips).sum();
         let cur_buf = self
             .video_perf_history
             .back()
-            .map(|(_, _, _, b, _)| *b)
+            .map(|s| s.buffer_len)
             .unwrap_or(0);
         // ラベルは "frame 到着間隔のばらつき (= jitter)" を示すと意味付け。
         // 平均値は wall rate と一致するのが正常で、max が target を超えるほど
         // pipeline の変動が大きい。
         // Phase 8.K: header 文字列を短縮 (360px 枠を超えないため)。
-        // "target 60.0fps/16.7ms  jit 17.0/25.5  skip:5  buf:3/24"
+        // "60.0fps/16.7ms  jit 17.0/25.5  d:1 ui:5  buf:3/24"
         let header = format!(
-            "{:.1}fps/{:.1}ms  jit {:.1}/{:.1}  skip:{}  buf:{}/{}",
+            "{:.1}fps/{:.1}ms  jit {:.1}/{:.1}  d:{} ui:{}  buf:{}/{}",
             1000.0 / expected_ms,
             expected_ms,
             avg,
             max,
-            skips,
+            decoder_skips,
+            ui_skips,
             cur_buf,
             crate::video::MAX_RENDER_QUEUE,
         );
@@ -5453,11 +5421,11 @@ impl App {
         ] {
             let y = y_for(ms);
             painter.line_segment(
-                [
-                    egui::pos2(graph.min.x, y),
-                    egui::pos2(graph.max.x, y),
-                ],
-                egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 140)),
+                [egui::pos2(graph.min.x, y), egui::pos2(graph.max.x, y)],
+                egui::Stroke::new(
+                    0.5,
+                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 140),
+                ),
             );
             painter.text(
                 egui::pos2(graph.max.x - 2.0, y - 1.0),
@@ -5494,7 +5462,7 @@ impl App {
         let now = if is_freeze {
             self.video_perf_history
                 .back()
-                .map(|(_, arr, _, _, _)| *arr)
+                .map(|s| s.arrival)
                 .unwrap_or_else(std::time::Instant::now)
         } else {
             std::time::Instant::now()
@@ -5545,24 +5513,25 @@ impl App {
             const RUN_GAP_THRESHOLD_MS: f32 = 50.0;
             let mut run_start: Option<std::time::Instant> = None;
             let mut last_arrival: Option<std::time::Instant> = None;
-            for (_, arrival, _, _, is_warmup) in &self.video_perf_history {
-                if *is_warmup {
+            for sample in &self.video_perf_history {
+                if sample.is_warmup {
                     if run_start.is_none() {
-                        run_start = Some(*arrival);
+                        run_start = Some(sample.arrival);
                     } else if let Some(last) = last_arrival {
-                        let gap_ms = arrival.saturating_duration_since(last).as_secs_f32() * 1000.0;
+                        let gap_ms =
+                            sample.arrival.saturating_duration_since(last).as_secs_f32() * 1000.0;
                         if gap_ms > RUN_GAP_THRESHOLD_MS {
                             // 過去 run を flush して新 run を開始
                             if let Some(start) = run_start {
                                 draw_run(start, last);
                             }
-                            run_start = Some(*arrival);
+                            run_start = Some(sample.arrival);
                         }
                     }
-                    last_arrival = Some(*arrival);
+                    last_arrival = Some(sample.arrival);
                 } else if let Some(start) = run_start {
                     // run 終了: 矩形を描画してリセット
-                    let end = last_arrival.unwrap_or(*arrival);
+                    let end = last_arrival.unwrap_or(sample.arrival);
                     draw_run(start, end);
                     run_start = None;
                     last_arrival = None;
@@ -5574,20 +5543,30 @@ impl App {
             }
         }
 
-        // 赤縦線: 実際に skip されたサンプル (= decoder dropped_full or UI dropped_past)。
-        // skip_delta が大きいほど色を濃くする (= 一気に複数 frame 飛んだのが分かる)。
-        for (_, arrival, skip, _, _) in &self.video_perf_history {
-            if *skip > 0 {
-                let alpha = (120 + (*skip as u32 * 40).min(135)) as u8;
-                let x = x_for(*arrival);
+        // skip 縦線:
+        // - decoder dropped_full: video_tx overflow。濃い赤で表示。
+        // - UI dropped_past: tick が複数 displayable frame をまとめて消費。橙で表示。
+        // 同一サンプルで両方発生した場合も見えるよう、横に少しずらして描く。
+        for sample in &self.video_perf_history {
+            if sample.decoder_skips > 0 {
+                let alpha = (130 + (sample.decoder_skips * 45).min(125)) as u8;
+                let x = x_for(sample.arrival) - 0.8;
                 painter.line_segment(
-                    [
-                        egui::pos2(x, graph.min.y),
-                        egui::pos2(x, graph.max.y),
-                    ],
+                    [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
                     egui::Stroke::new(
                         1.5,
-                        egui::Color32::from_rgba_unmultiplied(255, 80, 80, alpha),
+                        egui::Color32::from_rgba_unmultiplied(255, 70, 90, alpha),
+                    ),
+                );
+            }
+            if sample.ui_skips > 0 {
+                let alpha = (120 + (sample.ui_skips * 35).min(135)) as u8;
+                let x = x_for(sample.arrival) + 0.8;
+                painter.line_segment(
+                    [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
+                    egui::Stroke::new(
+                        1.3,
+                        egui::Color32::from_rgba_unmultiplied(255, 170, 70, alpha),
                     ),
                 );
             }
@@ -5597,12 +5576,12 @@ impl App {
         // 「期待値より遅い」状態が一目で分かるようにする。
         if n > 1 {
             let mut prev: Option<(egui::Pos2, f32)> = None;
-            for (v, arrival, _, _, _) in &self.video_perf_history {
-                let x = x_for(*arrival);
-                let p = egui::pos2(x, y_for(*v));
+            for sample in &self.video_perf_history {
+                let x = x_for(sample.arrival);
+                let p = egui::pos2(x, y_for(sample.interval_ms));
                 if let Some((prev_p, prev_v)) = prev {
                     if !(p.x < graph.min.x && prev_p.x < graph.min.x) {
-                        let exceeds = *v > hitch_ms || prev_v > hitch_ms;
+                        let exceeds = sample.interval_ms > hitch_ms || prev_v > hitch_ms;
                         let color = if exceeds {
                             egui::Color32::from_rgb(255, 200, 100)
                         } else {
@@ -5611,7 +5590,7 @@ impl App {
                         painter.line_segment([prev_p, p], egui::Stroke::new(1.2, color));
                     }
                 }
-                prev = Some((p, *v));
+                prev = Some((p, sample.interval_ms));
             }
         }
         // 上下グラフの境界線。
@@ -5638,19 +5617,19 @@ impl App {
         );
         let max_buf = crate::video::MAX_RENDER_QUEUE.max(1) as f32;
         let bar_w = (strip.width() / 200.0).max(1.0); // 1 sample あたりの幅
-        for (_, arrival, _, buf, _) in &self.video_perf_history {
+        for sample in &self.video_perf_history {
             let x = graph.max.x - {
-                let dt = now.saturating_duration_since(*arrival).as_secs_f32();
+                let dt = now.saturating_duration_since(sample.arrival).as_secs_f32();
                 dt * px_per_sec
             };
             if x < strip.min.x - bar_w || x > strip.max.x {
                 continue;
             }
-            let level = (*buf as f32 / max_buf).clamp(0.0, 1.0);
+            let level = (sample.buffer_len as f32 / max_buf).clamp(0.0, 1.0);
             // Phase 8.K: buf=0 では level=0 で bar 高さ 0 になり描画されない。
             // starvation を視認できるよう strip 全高に minimum-height (= 全高) で
             // 描く。0 < buf でも視認性のため最低 2px は確保。
-            let bar_h = if *buf == 0 {
+            let bar_h = if sample.buffer_len == 0 {
                 strip.height()
             } else {
                 (level * strip.height()).max(2.0)
@@ -5660,7 +5639,7 @@ impl App {
                 egui::pos2(x + bar_w * 0.5, strip.max.y),
             );
             // buf 残量で色を変化: 緑 (健全) → 黄 (中) → 赤 (危険、starvation 寸前)
-            let color = if *buf == 0 {
+            let color = if sample.buffer_len == 0 {
                 egui::Color32::from_rgb(220, 80, 80)
             } else if level < 0.25 {
                 egui::Color32::from_rgb(220, 200, 80)
@@ -5755,8 +5734,14 @@ impl App {
             let painter = ui.painter().clone();
             let icon_radius = 56.0;
             let gap = 64.0;
-            let left_center = egui::pos2(full_rect.center().x - icon_radius - gap / 2.0, full_rect.center().y);
-            let right_center = egui::pos2(full_rect.center().x + icon_radius + gap / 2.0, full_rect.center().y);
+            let left_center = egui::pos2(
+                full_rect.center().x - icon_radius - gap / 2.0,
+                full_rect.center().y,
+            );
+            let right_center = egui::pos2(
+                full_rect.center().x + icon_radius + gap / 2.0,
+                full_rect.center().y,
+            );
 
             // ⏮ 最初から再生 (左)
             let left_rect = egui::Rect::from_center_size(
@@ -5778,7 +5763,10 @@ impl App {
             painter.circle_stroke(
                 left_center,
                 icon_radius,
-                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                egui::Stroke::new(
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                ),
             );
             draw_replay_icon(&painter, left_center, icon_radius * 0.6);
             // 「最初から」ラベル (アイコン直下)
@@ -5820,7 +5808,10 @@ impl App {
             painter.circle_stroke(
                 right_center,
                 icon_radius,
-                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
+                egui::Stroke::new(
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                ),
             );
             draw_play_icon(&painter, right_center, icon_radius);
             painter.text(
@@ -6024,9 +6015,7 @@ impl App {
             //   ピン:     緑   (📌)
             // クリック判定はシークバー全体に乗せたままで、マーカーは描画のみ。
             if duration > 0.0 {
-                let video_path = self
-                    .fs_video_player(fs_idx)
-                    .map(|p| p.path().clone());
+                let video_path = self.fs_video_player(fs_idx).map(|p| p.path().clone());
                 if let Some(path) = video_path.as_ref() {
                     // チャプター
                     let chapters: Vec<f64> = self
@@ -6103,7 +6092,8 @@ impl App {
                 // Phase 8.H: サムネ未到着時もプレースホルダ枠を出して「ロード後に
                 // 枠が出る」ちらつきを防ぐ。サイズは動画 aspect から逆算した固定値で、
                 // ロード完了で同じ位置に画像差し替え。
-                let thumb_opt = self.fs_video_player(fs_idx)
+                let thumb_opt = self
+                    .fs_video_player(fs_idx)
                     .and_then(|p| p.nearest_seek_thumbnail(target));
                 let label = crate::ui_helpers::format_hms(target);
                 let galley =
@@ -6198,11 +6188,7 @@ impl App {
                     thumb_rect.max.y + GAP_THUMB_TO_LABEL + LABEL_PAD,
                 );
                 let bg = egui::Rect::from_min_size(label_pos, label_size).expand(LABEL_PAD);
-                painter.rect_filled(
-                    bg,
-                    3.0,
-                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
-                );
+                painter.rect_filled(bg, 3.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200));
                 painter.galley(label_pos, galley, egui::Color32::WHITE);
             }
             if (seek_resp.clicked() || seek_resp.dragged())
@@ -6255,8 +6241,8 @@ impl App {
         if (vol_resp.clicked() || vol_resp.dragged())
             && let Some(pp) = vol_resp.interact_pointer_pos()
         {
-            let frac = ((pp.x - vol_slider_rect.min.x) / vol_slider_rect.width())
-                .clamp(0.0, 1.0) as f64;
+            let frac =
+                ((pp.x - vol_slider_rect.min.x) / vol_slider_rect.width()).clamp(0.0, 1.0) as f64;
             if let Some(p) = self.fs_video_player(fs_idx) {
                 p.set_volume(frac);
             }
@@ -6322,10 +6308,7 @@ impl App {
         let top_y = full_rect.center().y + 98.0;
         let bg_rect = egui::Rect::from_min_max(
             egui::pos2(center_x - block_w / 2.0 - pad, top_y),
-            egui::pos2(
-                center_x + block_w / 2.0 + pad,
-                top_y + block_h + pad * 2.0,
-            ),
+            egui::pos2(center_x + block_w / 2.0 + pad, top_y + block_h + pad * 2.0),
         );
         painter.rect_filled(
             bg_rect,
@@ -6352,7 +6335,6 @@ pub(crate) fn video_hud_rect(full_rect: egui::Rect) -> egui::Rect {
         full_rect.max,
     )
 }
-
 
 #[cfg(test)]
 mod tests {

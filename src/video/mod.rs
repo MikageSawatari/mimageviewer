@@ -35,7 +35,7 @@ pub mod tile_thumbnails;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
@@ -45,8 +45,8 @@ use thumbnail::{Thumbnail, ThumbnailWorker};
 
 use std::sync::Mutex;
 
-use engine::actor::{EngineActor, OpenOptions};
 use engine::EngineEvent;
+use engine::actor::{EngineActor, OpenOptions};
 
 pub struct VideoPlayer {
     path: PathBuf,
@@ -81,12 +81,11 @@ pub struct VideoPlayer {
     /// +1。GPU/CPU 両経路で更新するので、UI 側の perf overlay が経路に依存せず
     /// 「新フレーム到着」を検知できる (Phase 8.I 修正)。
     displayed_frame_seq: AtomicU64,
-    /// 「skip された frame」の累積カウンタ。次の 2 経路で +1:
-    ///   - decoder の video_tx try_send が Full → 送信できず捨てた (Arc 共有 atomic)
-    ///   - tick で latest_renderable を上書き = 古い候補は dropped_past として
-    ///     表示前に捨てた (= UI 側 skip)
-    /// perf overlay はこの累積を per-sample で diff して赤縦線を出す。
-    skipped_frame_count: Arc<AtomicU64>,
+    /// decoder の video_tx try_send が Full で送信できず捨てた累積数。
+    /// decoder thread と共有し、perf overlay では UI 側 dropped_past と色分けする。
+    decoder_dropped_full_count: Arc<AtomicU64>,
+    /// tick で latest_renderable を上書きし、古い候補を表示前に捨てた累積数。
+    ui_dropped_past_count: AtomicU64,
     cancel: Arc<AtomicBool>,
     decode: DecodeHandles,
     /// 保持目的のフィールド (Drop で cpal Stream が停止する)。読み取りはしない。
@@ -100,7 +99,7 @@ pub struct VideoPlayer {
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
     thumb_worker: Option<ThumbnailWorker>,
     /// 未来フレーム (pts > clock now) のキュー。channel から pull した順に末尾に push、
-    /// front から `pts <= now` のものを取り出して表示。FIFO 連続性を保つことで
+    /// front から `pts <= now + small_margin` のものを取り出して表示。FIFO 連続性を保つことで
     /// 高 fps コンテンツでも display が channel head の far-future にジャンプしない。
     future_frames: std::collections::VecDeque<VideoFrame>,
     /// 起動時 resume 用の保留シーク target (秒)。info 到着後に 1 度だけ実行する。
@@ -198,9 +197,8 @@ impl VideoPlayer {
             )));
             let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(64);
             // FFmpeg 初期化失敗時の dummy: engine state は IDLE で固定。
-            let engine_state_atomic = Arc::new(AtomicU8::new(
-                crate::video::engine::actor::state_code::IDLE,
-            ));
+            let engine_state_atomic =
+                Arc::new(AtomicU8::new(crate::video::engine::actor::state_code::IDLE));
             return Self {
                 path,
                 clock: dummy_clock,
@@ -211,7 +209,8 @@ impl VideoPlayer {
                 info_event_emitted: false,
                 first_frame_event_last_epoch: None,
                 displayed_frame_seq: AtomicU64::new(0),
-                skipped_frame_count: Arc::new(AtomicU64::new(0)),
+                decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
+                ui_dropped_past_count: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
                 decode: dummy_decode_handles(),
                 audio: None,
@@ -232,8 +231,7 @@ impl VideoPlayer {
         // engine event channel: decoder/audio thread が events を push、UI tick が
         // drain して engine.handle_*_event に dispatch する。capacity 64 (= 60fps の
         // ~1 秒分 + audio callback 数件のバッファ余地)。
-        let (engine_event_tx, engine_event_rx) =
-            crossbeam_channel::bounded::<EngineEvent>(64);
+        let (engine_event_tx, engine_event_rx) = crossbeam_channel::bounded::<EngineEvent>(64);
 
         // 共有 seek 世代カウンタを 1 個生成し、AvClock と EngineActor の両方に clone を
         // 渡す。これで両者の seek 世代が構造的に常に一致する (= 旧版の「2 つのカウンタを
@@ -274,8 +272,8 @@ impl VideoPlayer {
         let target_rate = audio::default_output_sample_rate().unwrap_or(48_000);
 
         // perf overlay 用 skip counter を decoder スレッドと共有 (= dropped_full 時に
-        // decoder 側から +1)。UI 側 dropped_past の +1 は VideoPlayer::tick 内で行う。
-        let skipped_frame_count = Arc::new(AtomicU64::new(0));
+        // decoder 側から +1)。UI 側 dropped_past は VideoPlayer::tick 内の別 counter。
+        let decoder_dropped_full_count = Arc::new(AtomicU64::new(0));
 
         let decode = decoder::spawn(
             path.clone(),
@@ -287,13 +285,17 @@ impl VideoPlayer {
             gpu_video_device,
             engine_state_handle.clone(),
             engine_event_tx.clone(),
-            skipped_frame_count.clone(),
+            decoder_dropped_full_count.clone(),
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
         // 音声を二重に消費するので、decoder の audio_rx を audio.start に渡す。
         // ここで decode.audio_rx を取り出す必要があるので構造体を分解する。
-        let DecodeHandles { video_rx, audio_rx, info_rx } = decode;
+        let DecodeHandles {
+            video_rx,
+            audio_rx,
+            info_rx,
+        } = decode;
         let audio = match audio::start(
             audio_rx,
             clock.clone(),
@@ -326,7 +328,8 @@ impl VideoPlayer {
             info_event_emitted: false,
             first_frame_event_last_epoch: None,
             displayed_frame_seq: AtomicU64::new(0),
-            skipped_frame_count,
+            decoder_dropped_full_count,
+            ui_dropped_past_count: AtomicU64::new(0),
             cancel,
             decode: DecodeHandles {
                 video_rx,
@@ -389,7 +392,9 @@ impl VideoPlayer {
 
     /// 直近キャッシュから target_secs に最も近いサムネを取り出す。
     pub fn nearest_seek_thumbnail(&self, target_secs: f64) -> Option<Thumbnail> {
-        self.thumb_worker.as_ref().and_then(|w| w.nearest(target_secs))
+        self.thumb_worker
+            .as_ref()
+            .and_then(|w| w.nearest(target_secs))
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -585,15 +590,10 @@ impl VideoPlayer {
                             // は has_audio=false で engine に通知する。さもなくば engine が
                             // BufferReady を永久に待ち Buffering で固まる (= audio が決して
                             // 再生されないため audio.rs から BufferReady が出ない)。
-                            let has_audio_effective =
-                                info.has_audio && self.audio.is_some();
+                            let has_audio_effective = info.has_audio && self.audio.is_some();
                             let _ = self.engine_event_tx.try_send(EngineEvent::Decoder(
                                 engine::state::DecoderEvent::InfoReceived {
-                                    epoch: self
-                                        .engine
-                                        .lock()
-                                        .unwrap()
-                                        .current_seek_epoch(),
+                                    epoch: self.engine.lock().unwrap().current_seek_epoch(),
                                     duration_secs: info.duration_secs,
                                     has_audio: has_audio_effective,
                                 },
@@ -608,9 +608,7 @@ impl VideoPlayer {
                             let dur = info.duration_secs;
                             let near_end = dur > 0.0
                                 && resume >= dur - crate::app::VIDEO_RESUME_END_GUARD_SECS;
-                            if resume >= crate::app::VIDEO_RESUME_MIN_POSITION_SECS
-                                && !near_end
-                            {
+                            if resume >= crate::app::VIDEO_RESUME_MIN_POSITION_SECS && !near_end {
                                 self.clock.request_seek(resume);
                                 // 共有 seek_serial は clock.request_seek で 1 回 bump。
                                 // 続く engine.handle_seek_request は adaptive ロジックで
@@ -627,10 +625,7 @@ impl VideoPlayer {
                                 // post-seek READY で Paused に遷移する設計。
                                 // user 操作の seek/seek_relative/toggle_play は
                                 // 別経路で apply_command(Play) を呼ぶ。
-                                self.engine
-                                    .lock()
-                                    .unwrap()
-                                    .handle_seek_request(resume);
+                                self.engine.lock().unwrap().handle_seek_request(resume);
                             }
                         }
                         self.info = Some(info);
@@ -655,10 +650,10 @@ impl VideoPlayer {
         // 設計 (FIFO 連続性を保証):
         //   1. video_rx から取得可能なフレームを `future_frames` キューに push
         //      (キュー上限まで)。channel から取り出したフレームは drop しない。
-        //   2. キュー先頭から「pts <= now + 許容差」のものを順に latest_renderable
-        //      に取り出す。最後に残った 1 枚を表示。
-        //   3. 最初に出会う「未来フレーム」(pts > now + 許容差) で停止し、
-        //      next_due = pts - now で次 tick を予約。キューに残す。
+        //   2. キュー先頭から「pts <= now + 小さな present 見込み余白」のものを順に
+        //      latest_renderable に取り出す。最後に残った 1 枚を表示。
+        //   3. 最初に出会う「未来フレーム」(pts > now + 小さな余白) で停止し、
+        //      next_due = pts - now - 余白 で次 tick を予約。キューに残す。
         let mut latest_renderable: Option<VideoFrame> = None;
         let mut next_due: Option<std::time::Duration> = None;
         let mut pulled = 0u64;
@@ -722,8 +717,10 @@ impl VideoPlayer {
                 latest_renderable = Some(frame);
                 continue;
             }
-            // 最初の真の未来フレーム → そのまま残し、次 tick を予約
-            let until = (front.pts_secs - now).max(0.001);
+            // 最初の真の未来フレーム → そのまま残し、次 tick を予約。
+            // request_repaint_after は厳密なタイマーではないため、表示許容と同じ
+            // 小さな margin だけ早めに起こし、displayable 判定側でまだ早ければ残す。
+            let until = (front.pts_secs - now - lead_tol).max(0.001);
             next_due = Some(std::time::Duration::from_secs_f64(until));
             break;
         }
@@ -738,10 +735,7 @@ impl VideoPlayer {
             && !seek_in_flight
             && self.is_playing()
         {
-            if self
-                .loop_enabled
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.loop_enabled.load(std::sync::atomic::Ordering::Acquire) {
                 // ループ再生 ON: 先頭にシークし続行 (= 設定の video_loop)。
                 self.clock.request_seek(0.0);
                 self.clock.set_playing(true);
@@ -811,7 +805,7 @@ impl VideoPlayer {
                 self.emit_first_frame_event(pts);
                 self.displayed_frame_seq.fetch_add(1, Ordering::Release);
                 if dropped_past > 0 {
-                    self.skipped_frame_count
+                    self.ui_dropped_past_count
                         .fetch_add(dropped_past, Ordering::Relaxed);
                 }
                 let _ = pts_for_log;
@@ -856,7 +850,10 @@ impl VideoPlayer {
                     &[
                         ("frame_pts", serde_json::Value::from(frame.pts_secs)),
                         ("now", serde_json::Value::from(now_after)),
-                        ("frame_serial", serde_json::Value::from(frame.seek_serial as i64)),
+                        (
+                            "frame_serial",
+                            serde_json::Value::from(frame.seek_serial as i64),
+                        ),
                     ],
                 );
             }
@@ -879,7 +876,7 @@ impl VideoPlayer {
         // UI 側 skip 計上: latest_renderable を上書きした際に古い候補を捨てた
         // 累積数 (= dropped_past) を perf overlay 用カウンタに反映。
         if dropped_past > 0 {
-            self.skipped_frame_count
+            self.ui_dropped_past_count
                 .fetch_add(dropped_past, Ordering::Relaxed);
         }
 
@@ -895,10 +892,16 @@ impl VideoPlayer {
                 0,
                 &[
                     ("now", serde_json::Value::from(now)),
-                    ("displayed_pts", serde_json::Value::from(displayed_pts.unwrap_or(f64::NAN))),
+                    (
+                        "displayed_pts",
+                        serde_json::Value::from(displayed_pts.unwrap_or(f64::NAN)),
+                    ),
                     ("lateness_ms", serde_json::Value::from(lateness_ms)),
                     ("pulled", serde_json::Value::from(pulled)),
-                    ("dropped_old_serial", serde_json::Value::from(dropped_old_serial)),
+                    (
+                        "dropped_old_serial",
+                        serde_json::Value::from(dropped_old_serial),
+                    ),
                     ("dropped_past", serde_json::Value::from(dropped_past)),
                     ("upload_ms", serde_json::Value::from(upload_ms)),
                 ],
@@ -941,9 +944,19 @@ impl VideoPlayer {
     }
 
     /// skip された frame の累積数 (decoder 側 video_tx Full + UI 側 dropped_past)。
-    /// perf overlay が delta を取って赤縦線を出す。
+    /// 互換用の合算値。perf overlay は `skip_counters()` で色分け表示する。
     pub fn skipped_frame_count(&self) -> u64 {
-        self.skipped_frame_count.load(Ordering::Acquire)
+        self.decoder_dropped_full_count.load(Ordering::Acquire)
+            + self.ui_dropped_past_count.load(Ordering::Acquire)
+    }
+
+    /// skip された frame の累積数を原因別に返す。
+    /// `(decoder_dropped_full, ui_dropped_past)`。
+    pub fn skip_counters(&self) -> (u64, u64) {
+        (
+            self.decoder_dropped_full_count.load(Ordering::Acquire),
+            self.ui_dropped_past_count.load(Ordering::Acquire),
+        )
     }
 
     /// UI 側 future_frames に並んでいる frame 数 (= 表示待ち バッファ残量)。
@@ -958,7 +971,8 @@ impl VideoPlayer {
     /// 出力が silent になっており、UI tick の表示も target 位置で凍結している。
     /// `published_state_handle` 経由なので Mutex を取らない atomic load で済む。
     pub fn engine_state_code(&self) -> u8 {
-        self.engine_state_atomic.load(std::sync::atomic::Ordering::Acquire)
+        self.engine_state_atomic
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。

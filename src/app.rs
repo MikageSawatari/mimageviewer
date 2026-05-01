@@ -60,7 +60,9 @@ pub(crate) struct StartupInitPending {
 }
 
 impl StartupInitPending {
-    fn try_recv(&self) -> Result<Option<crate::indexer_manager::IndexerManager>, mpsc::TryRecvError> {
+    fn try_recv(
+        &self,
+    ) -> Result<Option<crate::indexer_manager::IndexerManager>, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
     fn elapsed_ms(&self) -> f64 {
@@ -355,11 +357,7 @@ pub(crate) use crate::thumb_loader::{
 ///
 /// 前提: 呼び出し側で `rating_filter` が全 ON でないことを確認済み
 /// (全 ON なら全アイテム可視なのでそもそも呼ばない)。
-fn passes_rating_filter(
-    item: &GridItem,
-    stars: u8,
-    rating_filter: &[bool; 6],
-) -> bool {
+fn passes_rating_filter(item: &GridItem, stars: u8, rating_filter: &[bool; 6]) -> bool {
     if item.accepts_rating() {
         let s = stars as usize;
         s <= 5 && rating_filter[s]
@@ -631,8 +629,9 @@ fn run_metadata_search(
                 // target が Tags を含む場合、未インデックスの画像でも dc:subject を
                 // 直読みして hay に載せる (Ctrl+F で tag 絞り込みを機能させる)。
                 if is_image && use_tags {
-                    let tags_text =
-                        crate::ingest_text::build_tags_column(&crate::xmp_reader::read_dc_subject(path));
+                    let tags_text = crate::ingest_text::build_tags_column(
+                        &crate::xmp_reader::read_dc_subject(path),
+                    );
                     if !tags_text.is_empty() {
                         if !extended_meta.is_empty() {
                             extended_meta.push('\n');
@@ -785,6 +784,16 @@ use crate::ui_helpers::{
     truncate_name,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VideoPerfSample {
+    pub interval_ms: f32,
+    pub arrival: std::time::Instant,
+    pub decoder_skips: u32,
+    pub ui_skips: u32,
+    pub buffer_len: u8,
+    pub is_warmup: bool,
+}
+
 /// 消しゴムモードのツール種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EraseTool {
@@ -877,9 +886,8 @@ pub(crate) struct VirtualFolderWriteback {
     pub items_gen: u64,
     /// 現フォルダの cache_map 参照。worker がここに WebP データを put 後、
     /// 本構造体経由で親 catalog にミラーする。
-    pub cache_map: Arc<
-        std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
-    >,
+    pub cache_map:
+        Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
     /// 親 catalog の `pdfthumb:` / `zipthumb:` 行に書き込む mtime / size。
     /// PDF/ZIP **ファイル本体**の mtime / size を入れる (親 grid 表示時の値と一致)。
     pub parent_entry_mtime: i64,
@@ -1283,8 +1291,10 @@ pub struct App {
     /// お気に入りごとの索引件数 (名前 / メタ) のキャッシュ。
     /// `Instant` は最終取得時刻で、ダイアログ表示中はバックグラウンド更新を反映するため
     /// 一定間隔 (5s) で worker 経由で再計算する。close で None。
-    pub(crate) favorites_index_count_cache:
-        Option<(std::time::Instant, crate::ui_dialogs::favorites_editor::IndexFileCounts)>,
+    pub(crate) favorites_index_count_cache: Option<(
+        std::time::Instant,
+        crate::ui_dialogs::favorites_editor::IndexFileCounts,
+    )>,
     /// 件数 / サイズの再計算 worker (in-flight)。
     /// `Some` の間は重複起動しない。`try_recv()` で結果を回収して None に戻す。
     pub(crate) favorites_index_refresh_rx: Option<
@@ -1418,8 +1428,7 @@ pub struct App {
     /// 集計 / 削除のバックグラウンド実行ハンドル。保持中はダイアログのボタンを無効化する。
     pub(crate) cache_maint_pending: Option<crate::cache_maintenance::CacheMaintPending>,
     /// 変換済みアーカイブキャッシュ管理ダイアログのロード / 削除ワーカーのハンドル。
-    pub(crate) archive_cache_maint_pending:
-        Option<crate::cache_maintenance::ArchiveMaintPending>,
+    pub(crate) archive_cache_maint_pending: Option<crate::cache_maintenance::ArchiveMaintPending>,
 
     // ── 変換済みアーカイブキャッシュ (v0.7.0) ───────────────────
     /// 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
@@ -1627,22 +1636,23 @@ pub struct App {
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
-    /// 直近 N フレームの (interval_ms, arrival_wall, skipped_count, buffer_len, is_warmup) の組。
-    /// `arrival_wall` で repaint 時の連続スクロールを可能にし、`skipped_count` で
-    /// このサンプル区間に何 frame skip されたか、`buffer_len` で UI side
-    /// future_frames キュー残量、`is_warmup` で「engine state ≠ Playing (= Buffering /
-    /// Loading / Seeking、cpal 出力が silent な期間)」を記録する。perf overlay の
-    /// graph 上で warmup 区間を背景色で識別する用 (Phase 9.B)。
-    pub(crate) video_perf_history:
-        std::collections::VecDeque<(f32, std::time::Instant, u32, u8, bool)>,
+    /// 直近 N フレームの perf overlay サンプル。
+    /// `arrival` で repaint 時の連続スクロールを可能にし、`decoder_skips`
+    /// (= video_tx overflow) と `ui_skips` (= dropped_past) を色分けする。
+    /// `buffer_len` は UI side future_frames キュー残量、`is_warmup` は
+    /// 「engine state ≠ Playing (= Buffering / Loading / Seeking、cpal 出力が
+    /// silent な期間)」を記録する。perf overlay の graph 上で warmup 区間を
+    /// 背景色で識別する用 (Phase 9.B)。
+    pub(crate) video_perf_history: std::collections::VecDeque<VideoPerfSample>,
     /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
     pub(crate) video_perf_last_wall: Option<std::time::Instant>,
     /// 前回サンプリング時の displayed_frame_seq (= VideoPlayer の atomic カウンタ、
     /// GPU/CPU 経路の両方で tick 内 +1)。これで経路に依存せず新フレーム検知できる。
     pub(crate) video_perf_last_seq: Option<u64>,
-    /// 前回サンプリング時の skipped_frame_count (= decoder 側 dropped_full +
-    /// UI 側 dropped_past の累積)。delta を per-sample で出して skip 検知に使う。
-    pub(crate) video_perf_last_skip: Option<u64>,
+    /// 前回サンプリング時の decoder 側 dropped_full 累積。
+    pub(crate) video_perf_last_decoder_skip: Option<u64>,
+    /// 前回サンプリング時の UI 側 dropped_past 累積。
+    pub(crate) video_perf_last_ui_skip: Option<u64>,
     /// Phase 9.F: 一時停止が開始された wall 時刻。Some の間は pause 中。
     /// resume 時に (Instant::now - pause_start) を全 history の arrival に加算して
     /// graph 表示位置を維持する (= ユーザー要望「pause→resume 時にグラフがジャンプ
@@ -1821,8 +1831,7 @@ pub struct App {
     /// 発生するため、App レベルで 1 つ確保して使い回す。`None` の場合は
     /// 旧経路 (CPU readback + swscale) にフォールバック。
     #[cfg(windows)]
-    pub(crate) gpu_video_device:
-        Option<std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>>,
+    pub(crate) gpu_video_device: Option<std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>>,
 
     // ── PDF パスワード管理 ───────────────────────────────────────
     pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
@@ -1859,8 +1868,11 @@ pub struct App {
     ///
     /// `handle` を drop (新しい pending への置き換え含む) すると `PdfEnumerateHandle::Drop`
     /// が自動的に cancel を立て、pool dispatcher が pop 時に IPC 前で古いジョブを捨てる。
-    pub(crate) pdf_enumerate_pending:
-        Option<(PathBuf, Option<String>, crate::pdf_loader::PdfEnumerateHandle)>,
+    pub(crate) pdf_enumerate_pending: Option<(
+        PathBuf,
+        Option<String>,
+        crate::pdf_loader::PdfEnumerateHandle,
+    )>,
     /// Ctrl+↑↓ フォルダナビで非同期 PDF / ZIP に着地したときに保存する方向フラグ。
     /// `poll_pdf_enumerate` / `poll_zip_enumerate` が items を埋めたあとで fullscreen を
     /// 開き直すために使う (poll 側でフラグを take して先頭/末尾画像を open_fullscreen する)。
@@ -2058,7 +2070,8 @@ pub struct App {
     /// `cancel.store(true)` してしまっていた。idx ごとに独立保持することで両方の
     /// inpaint 結果を確実に受け取る。同じ idx への再投入時のみ前ジョブを cancel する。
     /// UI スレッドが MI-GAN 推論 (300-500ms) で固まらないようにするための非同期化エントリ。
-    pub(crate) erase_inpaint_pending: std::collections::HashMap<usize, crate::ui_erase::EraseInpaintPending>,
+    pub(crate) erase_inpaint_pending:
+        std::collections::HashMap<usize, crate::ui_erase::EraseInpaintPending>,
     /// 見開きから消しゴムに入ったときの状態スナップショット。`Some` の間は終了時に
     /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を `pair.0` (左ページ) に
     /// 揃えて見開きを復元する。Single から入った場合・見開き中でも片側だけのページ
@@ -2480,7 +2493,8 @@ impl Default for App {
             video_perf_history: std::collections::VecDeque::with_capacity(200),
             video_perf_last_wall: None,
             video_perf_last_seq: None,
-            video_perf_last_skip: None,
+            video_perf_last_decoder_skip: None,
+            video_perf_last_ui_skip: None,
             video_perf_pause_start: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
@@ -2923,16 +2937,15 @@ impl App {
         // 再ロード後に選択パスを探し、見つかればそこにカーソルを戻してスクロール依頼。
         // 見つからない (消えた) / そもそも未選択ならスクロール位置は触らない。
         if let Some(path) = selected_path {
-            let new_idx = self
-                .items
-                .iter()
-                .position(|it| matches!(it,
+            let new_idx = self.items.iter().position(|it| {
+                matches!(it,
                     GridItem::Folder(p)
                     | GridItem::Image(p)
                     | GridItem::Video(p)
                     | GridItem::ZipFile(p)
                     | GridItem::PdfFile(p) if p == &path)
-                    || matches!(it, GridItem::ConvertibleArchive { path: p, .. } if p == &path));
+                    || matches!(it, GridItem::ConvertibleArchive { path: p, .. } if p == &path)
+            });
             if let Some(idx) = new_idx {
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
@@ -3332,7 +3345,9 @@ impl App {
         if let Err(e) = spawn_result {
             // フォールバック: スレッド起動に失敗したら同期で実行する
             // (スレッド数制限の極端な環境向け保険)。
-            crate::logger::log(format!("startup-init spawn failed: {e} — running synchronously"));
+            crate::logger::log(format!(
+                "startup-init spawn failed: {e} — running synchronously"
+            ));
             self.indexer_manager = crate::indexer_manager::IndexerManager::new(
                 &self.settings.favorites,
                 self.settings.indexer_speed_profile,
@@ -3541,21 +3556,15 @@ impl App {
                     ctx.style().visuals.panel_fill,
                 );
                 ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(rect)
-                        .layout(egui::Layout::centered_and_justified(
-                            egui::Direction::TopDown,
-                        )),
+                    egui::UiBuilder::new().max_rect(rect).layout(
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    ),
                     |ui| {
                         ui.vertical_centered(|ui| {
                             ui.add_space(rect.height() * 0.3);
                             ui.spinner();
                             ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new("起動中…")
-                                    .size(20.0)
-                                    .strong(),
-                            );
+                            ui.label(egui::RichText::new("起動中…").size(20.0).strong());
                             ui.add_space(8.0);
                             ui.label(
                                 egui::RichText::new(progress_text)
@@ -3816,24 +3825,25 @@ impl App {
         // 現在地 = スタックの末尾 (深い場所)
         let current = self.favsearch.nav_stack.last().cloned().unwrap();
         // 包含するお気に入り根を探し、その直下からの相対パスを元のケースで組み立てる
-        let segments: Vec<String> = match self.find_nearest_favorite(&current).map(|f| f.path.clone()) {
-            Some(root) => {
-                let root_name = root
+        let segments: Vec<String> =
+            match self.find_nearest_favorite(&current).map(|f| f.path.clone()) {
+                Some(root) => {
+                    let root_name = root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string);
+                    let rel_components = current.components().skip(root.components().count());
+                    root_name
+                        .into_iter()
+                        .chain(rel_components.map(|c| c.as_os_str().to_string_lossy().to_string()))
+                        .collect()
+                }
+                None => current
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(str::to_string);
-                let rel_components = current.components().skip(root.components().count());
-                root_name
-                    .into_iter()
-                    .chain(rel_components.map(|c| c.as_os_str().to_string_lossy().to_string()))
-                    .collect()
-            }
-            None => current
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
-        };
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default(),
+            };
         self.address = format!("🔍 検索結果: \"{}\" > {}", query, segments.join(" > "));
     }
 
@@ -3963,7 +3973,14 @@ impl App {
                 _ => None,
             })
             .collect();
-        self.start_loading_items(synthetic, items, image_metas, existing_keys, Vec::new(), None);
+        self.start_loading_items(
+            synthetic,
+            items,
+            image_metas,
+            existing_keys,
+            Vec::new(),
+            None,
+        );
         self.update_favsearch_address();
     }
 
@@ -4045,8 +4062,8 @@ impl App {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = crate::zip_loader::enumerate_image_entries(&path_w)
-                    .map_err(|e| e.to_string());
+                let result =
+                    crate::zip_loader::enumerate_image_entries(&path_w).map_err(|e| e.to_string());
                 let _ = tx.send(result);
             });
 
@@ -4058,8 +4075,8 @@ impl App {
                 "zip-enumerate: spawn failed ({e}), falling back to synchronous enumerate"
             ));
             drop(rx);
-            let result = crate::zip_loader::enumerate_image_entries(&zip_path)
-                .map_err(|e| e.to_string());
+            let result =
+                crate::zip_loader::enumerate_image_entries(&zip_path).map_err(|e| e.to_string());
             self.finalize_zip_enumerate(zip_path, self.settings.sort_order, result);
             return;
         }
@@ -4173,7 +4190,14 @@ impl App {
             }
         }
 
-        self.start_loading_items(zip_path, items, image_metas, existing_keys, Vec::new(), None);
+        self.start_loading_items(
+            zip_path,
+            items,
+            image_metas,
+            existing_keys,
+            Vec::new(),
+            None,
+        );
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
@@ -4316,7 +4340,14 @@ impl App {
                     image_metas.push(Some((page.mtime, page.file_size as i64)));
                 }
 
-                self.start_loading_items(pdf_path, items, image_metas, existing_keys, Vec::new(), None);
+                self.start_loading_items(
+                    pdf_path,
+                    items,
+                    image_metas,
+                    existing_keys,
+                    Vec::new(),
+                    None,
+                );
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
                 if let Some(_forward) = self.fs_nav_after_pdf_enumerate.take() {
@@ -4409,9 +4440,11 @@ impl App {
         let (parent_prefix, target_key, target_idx, is_pdf) = match ext.as_deref() {
             Some("pdf") => {
                 // 最初の PdfPage の idx (通常 0、ZipSeparator 等が入らない PDF では 0 確定)。
-                let Some(target_idx) = self.items.iter().position(|it| {
-                    matches!(it, GridItem::PdfPage { page_num: 0, .. })
-                }) else {
+                let Some(target_idx) = self
+                    .items
+                    .iter()
+                    .position(|it| matches!(it, GridItem::PdfPage { page_num: 0, .. }))
+                else {
                     return;
                 };
                 (
@@ -4443,9 +4476,8 @@ impl App {
         // PDF/ZIP 開いた直後の prefetch 抑制 (= worker thrash 防止) を仕掛ける。
         // PDF だけに適用 (ZIP は decode が軽いので大した負荷にならない)。
         if is_pdf {
-            self.pdf_prefetch_grace_until = Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(100),
-            );
+            self.pdf_prefetch_grace_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
         }
 
         let Some(parent) = source_path.parent() else {
@@ -4498,13 +4530,7 @@ impl App {
                 }
                 crate::perf::event("nav", "virtual_seed_hit", Some(&parent_key), 0, &[]);
             } else {
-                crate::perf::event(
-                    "nav",
-                    "virtual_seed_undecodable",
-                    Some(&parent_key),
-                    0,
-                    &[],
-                );
+                crate::perf::event("nav", "virtual_seed_undecodable", Some(&parent_key), 0, &[]);
             }
         } else if !already_in_virtual {
             crate::perf::event("nav", "virtual_seed_miss", Some(&parent_key), 0, &[]);
@@ -5001,11 +5027,7 @@ impl App {
         // `pdf_prefetch_grace_until` も初期化して、仮想フォルダ開いた直後の数十 ms は
         // PDFium ワーカーを現ページ専用に空けておく (Ctrl+↑↓ 連打時の thrash 抑制)。
         if let Some(ref cat) = catalog_arc {
-            self.setup_virtual_folder_seed_and_writeback(
-                &source_path,
-                cat,
-                &cache_map,
-            );
+            self.setup_virtual_folder_seed_and_writeback(&source_path, cat, &cache_map);
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -5078,20 +5100,19 @@ impl App {
         if !video_items.is_empty() {
             // Phase 8.B': ピン留めフレームを path → WebP の map で snapshot し
             // worker thread に渡す (= grid サムネ最優先で使用される)。
-            let pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>> = if let Some(db) =
-                self.video_pin_db.as_ref()
-            {
-                video_items
-                    .iter()
-                    .filter_map(|(_, p, _)| {
-                        db.lookup(p)
-                            .filter(|pin| !pin.thumb_webp.is_empty())
-                            .map(|pin| (p.clone(), pin.thumb_webp))
-                    })
-                    .collect()
-            } else {
-                std::collections::HashMap::new()
-            };
+            let pin_blobs: std::collections::HashMap<PathBuf, Vec<u8>> =
+                if let Some(db) = self.video_pin_db.as_ref() {
+                    video_items
+                        .iter()
+                        .filter_map(|(_, p, _)| {
+                            db.lookup(p)
+                                .filter(|pin| !pin.thumb_webp.is_empty())
+                                .map(|pin| (p.clone(), pin.thumb_webp))
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
             self.spawn_video_thread(
                 tx,
                 cancel,
@@ -5418,7 +5439,10 @@ impl App {
         ));
 
         if failed_count > 0 {
-            let first = pending.failed.first().map(|(p, m)| format!("{}: {m}", p.display()));
+            let first = pending
+                .failed
+                .first()
+                .map(|(p, m)| format!("{}: {m}", p.display()));
             crate::logger::log(format!(
                 "[delete] first failed = {}",
                 first.unwrap_or_default()
@@ -5577,10 +5601,7 @@ impl App {
             crate::cache_maintenance::CacheMaintResult::Stats { folders, bytes } => {
                 self.cache_manager_stats = Some((folders, bytes));
             }
-            crate::cache_maintenance::CacheMaintResult::DeleteOldDone {
-                deleted,
-                new_stats,
-            } => {
+            crate::cache_maintenance::CacheMaintResult::DeleteOldDone { deleted, new_stats } => {
                 self.cache_manager_stats = Some(new_stats);
                 self.cache_manager_result =
                     Some(format!("{} 件のキャッシュを削除しました。", deleted));
@@ -6601,10 +6622,7 @@ impl App {
             req.priority = i >= visible_raw_start && i < visible_raw_end;
             // grace 中は PdfPage の prefetch (= 非 priority) のみスキップ。現在表示中の
             // PdfPage (= priority=true) は通常通り enqueue する。
-            if pdf_prefetch_blocked
-                && !req.priority
-                && req.pdf_page.is_some()
-            {
+            if pdf_prefetch_blocked && !req.priority && req.pdf_page.is_some() {
                 deferred_pdf_prefetch = true;
                 continue;
             }
@@ -6924,11 +6942,7 @@ impl App {
         let mut heavy_reqs: Vec<LoadRequest> = Vec::new();
         let mut regular_reqs: Vec<LoadRequest> = Vec::new();
         for r in upgrade_reqs {
-            if self
-                .items
-                .get(r.idx)
-                .is_some_and(|it| it.is_heavy_io())
-            {
+            if self.items.get(r.idx).is_some_and(|it| it.is_heavy_io()) {
                 heavy_reqs.push(r);
             } else {
                 regular_reqs.push(r);
@@ -7289,10 +7303,9 @@ impl App {
                         || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
                 });
                 if clear_key {
-                    self.capture_adjust_full(
-                        "個別設定を一括解除".to_string(),
-                        |app| app.clear_page_params_for_selection(),
-                    );
+                    self.capture_adjust_full("個別設定を一括解除".to_string(), |app| {
+                        app.clear_page_params_for_selection()
+                    });
                 }
             }
 
@@ -7301,8 +7314,7 @@ impl App {
             if enter {
                 // Shift+Enter で動画を外部プレイヤーで開く (フルスクリーン中と
                 // 同じ挙動をグリッドからも使えるようにする)。
-                let shift_enter =
-                    !self.ime_input_active() && ctx.input(|i| i.modifiers.shift);
+                let shift_enter = !self.ime_input_active() && ctx.input(|i| i.modifiers.shift);
                 if let Some(idx) = self.selected {
                     match self.items.get(idx) {
                         Some(GridItem::Folder(p))
@@ -8074,8 +8086,7 @@ impl App {
 
         if ctrl_v {
             if let Some(ref folder) = self.current_folder.clone() {
-                let rx =
-                    crate::ui_dialogs::context_menu::paste_files_from_clipboard(folder);
+                let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(folder);
                 self.paste_pending.push(rx);
             }
         }
@@ -8878,10 +8889,7 @@ impl App {
     ///
     /// 効果: ★5 を本に付けて★5 フィルタ ON のまま Ctrl+G 集約結果からそのフォルダを
     /// 開いても、中の画像が未評価でも空にならない (Codex P2 対応)。
-    pub(crate) fn maybe_suppress_rating_filter_for_opened_container_path(
-        &mut self,
-        anchor: &Path,
-    ) {
+    pub(crate) fn maybe_suppress_rating_filter_for_opened_container_path(&mut self, anchor: &Path) {
         if self.rating_filter_suppressed_at.is_some() {
             return;
         }
@@ -9027,9 +9035,10 @@ impl App {
         self.folder_rating_counts.clear();
         self.folder_rating_counts_loaded = false;
         let db_path = crate::data_dir::get().join("rating.db");
-        self.folder_rating_counter_handle = Some(
-            crate::folder_rating_counter::spawn_for_folder(db_path, folder_key.clone()),
-        );
+        self.folder_rating_counter_handle = Some(crate::folder_rating_counter::spawn_for_folder(
+            db_path,
+            folder_key.clone(),
+        ));
         self.folder_rating_counts_folder_key = Some(folder_key);
     }
 
@@ -9048,10 +9057,7 @@ impl App {
             match h.rx.try_recv() {
                 Ok(batch) => {
                     for (key, counts) in batch.entries {
-                        let e = self
-                            .folder_rating_counts
-                            .entry(key)
-                            .or_insert([0u32; 5]);
+                        let e = self.folder_rating_counts.entry(key).or_insert([0u32; 5]);
                         for i in 0..5 {
                             e[i] = e[i].saturating_add(counts[i]);
                         }
@@ -9463,7 +9469,10 @@ impl App {
             return &[];
         };
         let key = crate::adjustment_db::normalize_path(p);
-        self.tags_cache.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
+        self.tags_cache
+            .get(&key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
@@ -9622,8 +9631,7 @@ impl App {
     /// 直下ファイルフィルタが snapshot のまま古くならないようにする (Codex P3)。
     fn refresh_global_search_hit_stars(&mut self, idxs: &[usize]) {
         // 対象 idx → (rating_db キー, 新 stars) の対応を作る
-        let mut updates: std::collections::HashMap<String, u8> =
-            std::collections::HashMap::new();
+        let mut updates: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
         for &idx in idxs {
             let Some(key) = self.rating_path_key(idx) else {
                 continue;
@@ -9695,11 +9703,7 @@ impl App {
                 // 自動シークさせる。Windows の case-insensitive パスを揃えるため
                 // adjustment_db::normalize_path に合わせる。
                 let path_key = crate::adjustment_db::normalize_path(&vp);
-                let resume = self
-                    .settings
-                    .video_resume_positions
-                    .get(&path_key)
-                    .copied();
+                let resume = self.settings.video_resume_positions.get(&path_key).copied();
                 let player = crate::video::VideoPlayer::open(
                     vp,
                     vol,
@@ -10449,8 +10453,7 @@ impl App {
             crate::logger::log("[AI] runtime 未初期化のためバックエンド変更はスキップ".to_string());
             return;
         };
-        let want_trt = new_backend_str
-            .and_then(crate::ai::AiBackend::from_str)
+        let want_trt = new_backend_str.and_then(crate::ai::AiBackend::from_str)
             == Some(crate::ai::AiBackend::TensorRt);
         let has_trt = runtime.has_worker_pool();
 
@@ -10486,9 +10489,7 @@ impl App {
     pub(crate) fn ensure_ai_runtime(&mut self) {
         if self.ai_runtime.is_none() {
             // 常に DirectML で起動 (Phase 3)
-            match crate::ai::runtime::AiRuntime::new_with_backend(
-                crate::ai::AiBackend::DirectMl,
-            ) {
+            match crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl) {
                 Ok(rt) => {
                     let active = rt.active_backend();
                     crate::logger::log(format!(
@@ -10529,9 +10530,7 @@ impl App {
     /// 既に立っていたら早期 return (= 別の spawn が進行中)。worker 死亡時に
     /// 並行する複数の AI 推論が同じ DiedDuringInfer を観測しても 1 回しか
     /// 新 pool を起こさない (Codex P2 指摘)。
-    pub(crate) fn spawn_trt_worker_pool(
-        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
-    ) {
+    pub(crate) fn spawn_trt_worker_pool(runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>) {
         Self::spawn_trt_worker_pool_inner(runtime, /* guard = */ None);
     }
 
@@ -11360,10 +11359,7 @@ impl App {
     /// 指定 idx のコンテキストにおける「ページ個別を除いた有効パラメータ」。
     /// 個別設定の冗長判定 (個別を保存する意味があるか) に使う。
     /// お気に入り配下なら favorite 標準、そうでなければ global。
-    pub(crate) fn effective_default_for_idx(
-        &self,
-        idx: usize,
-    ) -> &crate::adjustment::AdjustParams {
+    pub(crate) fn effective_default_for_idx(&self, idx: usize) -> &crate::adjustment::AdjustParams {
         self.favorite_default_for_idx(idx)
             .unwrap_or(&self.settings.global_preset)
     }
@@ -11390,10 +11386,7 @@ impl App {
 
     /// U/N/P 補正ショートカットで書き換える対象のスコープを決定する。
     /// 個別設定 → お気に入り標準 → global の順で最初に存在する層を選ぶ。
-    pub(crate) fn resolve_adjust_scope(
-        &self,
-        fs_idx: usize,
-    ) -> crate::ui_fullscreen::AdjustScope {
+    pub(crate) fn resolve_adjust_scope(&self, fs_idx: usize) -> crate::ui_fullscreen::AdjustScope {
         use crate::ui_fullscreen::AdjustScope;
         if self.adjustment_page_params.contains_key(&fs_idx) {
             return AdjustScope::PageOverride;
@@ -11664,7 +11657,8 @@ impl App {
         };
         match &new_value {
             Some(p) => {
-                self.adjustment_favorite_params.insert(favorite_id, p.clone());
+                self.adjustment_favorite_params
+                    .insert(favorite_id, p.clone());
                 if let Some(db) = &self.adjustment_db {
                     let _ = db.set_favorite_params(favorite_id, p);
                 }
@@ -11767,10 +11761,12 @@ impl App {
     pub(crate) fn current_adjust_target_idx(&mut self) -> Option<usize> {
         let fs_idx = self.fullscreen_idx?;
         Some(match self.resolve_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => match self.adjust_spread_target {
-                AdjustSpreadTarget::Left => left,
-                AdjustSpreadTarget::Right => right,
-            },
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                match self.adjust_spread_target {
+                    AdjustSpreadTarget::Left => left,
+                    AdjustSpreadTarget::Right => right,
+                }
+            }
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
         })
     }
@@ -12338,7 +12334,12 @@ impl App {
         if do_save {
             self.video_resume_last_save = Some(now);
             for (key, pos, dur) in updates {
-                save_video_resume_position(&mut self.settings.video_resume_positions, key, pos, dur);
+                save_video_resume_position(
+                    &mut self.settings.video_resume_positions,
+                    key,
+                    pos,
+                    dur,
+                );
             }
         }
         if let Some(d) = next_repaint {
@@ -13030,13 +13031,12 @@ impl eframe::App for App {
                     let slot = self.placement_slot.clone().unwrap();
                     // 2 重起動時に既存インスタンスを復帰させるリスナーを起動。
                     // placement_slot もトレイ Open と同じ経路で SetWindowPlacement するため共有。
-                    self.activation_listener =
-                        crate::single_instance::spawn_activation_listener(
-                            hwnd_raw,
-                            ctx.clone(),
-                            slot,
-                            self.shutdown_requested.clone(),
-                        );
+                    self.activation_listener = crate::single_instance::spawn_activation_listener(
+                        hwnd_raw,
+                        ctx.clone(),
+                        slot,
+                        self.shutdown_requested.clone(),
+                    );
                 }
             }
         }
@@ -13044,8 +13044,7 @@ impl eframe::App for App {
         // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
         // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を
         // 走らせないで済むようここで一括 gate する。
-        let tray_active =
-            self.settings.minimize_to_tray_on_close || self.tray_controller.is_some();
+        let tray_active = self.settings.minimize_to_tray_on_close || self.tray_controller.is_some();
         if tray_active {
             // 実際の Win32 可視状態と App の `window_visible` を毎フレーム同期する。
             // トレイスレッドや 2 重起動アクティベーションリスナーが `ShowWindow` を直接呼ぶ
@@ -13054,8 +13053,7 @@ impl eframe::App for App {
             if let Some(hwnd_raw) = self.main_hwnd {
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
-                let is_visible_now =
-                    unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
+                let is_visible_now = unsafe { IsWindowVisible(HWND(hwnd_raw as *mut _)).as_bool() };
                 if is_visible_now && !self.window_visible {
                     crate::logger::log(
                         "tray: detected external ShowWindow — running sync_after_restore",
@@ -13087,7 +13085,6 @@ impl eframe::App for App {
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
         self.flush_idle_sidecars();
-
 
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -13300,8 +13297,7 @@ impl eframe::App for App {
                 .tag_prewarm_pending
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
-            || (self.folder_rating_counter_handle.is_some()
-                && !self.folder_rating_counts_loaded)
+            || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {
             ctx.request_repaint();
         }
@@ -14415,8 +14411,8 @@ pub(crate) fn draw_cell(
             // 下部に少し背景色の付いたボックスで「フォルダ階層 + ヒット件数」を出す。
             // 未ロード / 代表サムネなしのときは従来どおりアイコン + 階層パスで埋める
             // (サムネが読み込まれるまでの placeholder)。
-            let thumb_loaded = representative.is_some()
-                && matches!(thumb, ThumbnailState::Loaded { .. });
+            let thumb_loaded =
+                representative.is_some() && matches!(thumb, ThumbnailState::Loaded { .. });
 
             if thumb_loaded {
                 let thumb_h = inner.height() * 0.62;
@@ -14647,7 +14643,6 @@ pub(crate) fn draw_cell(
             draw_filter_match_badge(painter, rect, count);
         }
     }
-
 }
 
 /// resume 対象とみなす最小 position (秒)。これ未満は「最初から」扱い。
@@ -14730,8 +14725,7 @@ fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags:
     // 実測ベースで省略する。CJK は 1 文字 ≒ 11px、ASCII は ≒ 6px と幅が大きく違うので、
     // 平均幅近似は使えない (`avg_char_w` で計算すると CJK が枠外にはみ出す)。
     let text_color = egui::Color32::from_rgb(180, 255, 180);
-    let mut galley =
-        painter.layout_no_wrap(combined.clone(), font.clone(), text_color);
+    let mut galley = painter.layout_no_wrap(combined.clone(), font.clone(), text_color);
     if galley.size().x > max_text_w {
         // 末尾から 1 文字ずつ削って `…` 付きで再 layout。最低 1 文字 + `…` は残す。
         let chars: Vec<char> = combined.chars().collect();
@@ -15041,7 +15035,10 @@ mod tests {
     fn path_in_subtree_ci_keeps_drive_letter_distinct() {
         use std::path::Path;
         let anchor = PathBuf::from(r"C:\books\vol1.zip");
-        assert!(!path_in_subtree_ci(Path::new(r"D:\books\vol1.zip"), &anchor));
+        assert!(!path_in_subtree_ci(
+            Path::new(r"D:\books\vol1.zip"),
+            &anchor
+        ));
         assert!(!path_in_subtree_ci(
             Path::new(r"D:\books\vol1.zip\page001.jpg"),
             &anchor
@@ -15199,8 +15196,8 @@ mod phase_c_support {
 
 #[cfg(test)]
 mod phase_c_key_tests {
-    use super::*;
     use super::phase_c_support::setup_app;
+    use super::*;
 
     /// ベースライン: 新規 App はどの検索バーも開いていないこと。
     #[test]
@@ -15501,7 +15498,11 @@ mod phase_c_drill_nav_tests {
         let a_root = std::path::PathBuf::from("c:/root/2025-11-30");
         app.drill_into_container(a_root.clone(), false);
         match &app.global_search.view {
-            GlobalSearchView::DrilledInto { current_path, container_root, .. } => {
+            GlobalSearchView::DrilledInto {
+                current_path,
+                container_root,
+                ..
+            } => {
                 assert_eq!(current_path, &a_root);
                 assert_eq!(container_root, &a_root);
             }
@@ -15514,7 +15515,11 @@ mod phase_c_drill_nav_tests {
         app.global_search_ctrl_nav(true);
         let b_root = std::path::PathBuf::from("c:/root/output/2025-12-30-1");
         match &app.global_search.view {
-            GlobalSearchView::DrilledInto { current_path, container_root, .. } => {
+            GlobalSearchView::DrilledInto {
+                current_path,
+                container_root,
+                ..
+            } => {
                 assert_eq!(container_root, &b_root, "次コンテナ root に跳ぶべき");
                 assert_eq!(
                     current_path, &b_root,
@@ -15558,7 +15563,11 @@ mod phase_c_drill_nav_tests {
         // Ctrl+↓: subtree 内 DFS の次 (root/sub)。container_root は root のまま。
         app.global_search_ctrl_nav(true);
         match &app.global_search.view {
-            GlobalSearchView::DrilledInto { current_path, container_root, .. } => {
+            GlobalSearchView::DrilledInto {
+                current_path,
+                container_root,
+                ..
+            } => {
                 assert_eq!(container_root, &root, "container_root は不変");
                 assert_eq!(
                     current_path,
@@ -15661,10 +15670,13 @@ mod phase_c_drill_nav_tests {
         // BS で Aggregated に戻る
         app.drill_back_one_level();
         // 戻った先で folder_b の SearchContainer が selected であること
-        let selected_path = app.selected.and_then(|i| app.items.get(i)).map(|it| match it {
-            GridItem::SearchContainer { path, .. } => path.clone(),
-            _ => std::path::PathBuf::new(),
-        });
+        let selected_path = app
+            .selected
+            .and_then(|i| app.items.get(i))
+            .map(|it| match it {
+                GridItem::SearchContainer { path, .. } => path.clone(),
+                _ => std::path::PathBuf::new(),
+            });
         assert_eq!(
             selected_path,
             Some(std::path::PathBuf::from("c:/folder_b")),
@@ -15759,7 +15771,10 @@ mod phase_c_drill_nav_tests {
         assert!(app.checked.contains(&1), "A の checked が新 idx=1 に追従");
         assert!(app.checked.contains(&3), "C の checked が新 idx=3 に追従");
         assert!(!app.checked.contains(&0), "X (新規) は checked ではない");
-        assert!(!app.checked.contains(&2), "B は selected のみ、checked ではない");
+        assert!(
+            !app.checked.contains(&2),
+            "B は selected のみ、checked ではない"
+        );
     }
 
     /// 旧選択アイテムが新 items から消えた場合は selected = None に戻し、
@@ -15850,7 +15865,9 @@ mod phase_c_drill_nav_tests {
         app.maybe_suppress_rating_filter_for_opened_container_path(&folder);
         // suppression 起動 + filter は全 ON に
         assert_eq!(
-            app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p.clone()),
+            app.rating_filter_suppressed_at
+                .as_ref()
+                .map(|(p, _)| p.clone()),
             Some(folder),
             "★5 コンテナを開いたら suppression anchor が設定される"
         );
@@ -15897,9 +15914,10 @@ mod phase_c_drill_nav_tests {
             stars: 3,
         });
         // items に直接置く (drill_into_container は load_folder を呼ばないテスト用簡易セットアップ)
-        app.items.push(crate::grid_item::GridItem::Image(
-            std::path::PathBuf::from("c:/root/sub/a.jpg"),
-        ));
+        app.items
+            .push(crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "c:/root/sub/a.jpg",
+            )));
         // rating を 1 に変更
         app.set_rating(0, 1);
         let idxs = vec![0_usize];
@@ -15954,7 +15972,10 @@ mod phase_c_drill_nav_tests {
         let sub_idx = app.items.iter().position(|it| {
             matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub"))
         }).expect("subfolder in items");
-        assert!(app.idx_visible(sub_idx), "なし+★2 で unrated subfolder が表示");
+        assert!(
+            app.idx_visible(sub_idx),
+            "なし+★2 で unrated subfolder が表示"
+        );
         let badge = app.folder_rating_match(sub_idx).expect("badge");
         assert_eq!(
             badge.0, 1,
@@ -15998,7 +16019,10 @@ mod phase_c_drill_nav_tests {
             app.visible_indices.first().copied(),
             "target 不在のときは先頭の visible item に落ちるべき"
         );
-        assert!(app.selected.is_some(), "items が空でない限り selected は Some");
+        assert!(
+            app.selected.is_some(),
+            "items が空でない限り selected は Some"
+        );
     }
 
     /// drilled view 内で deeper subfolder に drill-in → BS で 1 階層戻ったとき、
@@ -16026,10 +16050,13 @@ mod phase_c_drill_nav_tests {
         app.drill_into_subfolder(std::path::PathBuf::from("c:/root/sub2"));
         // BS で /root に戻る
         app.drill_back_one_level();
-        let selected_path = app.selected.and_then(|i| app.items.get(i)).map(|it| match it {
-            GridItem::Folder(p) => p.clone(),
-            _ => std::path::PathBuf::new(),
-        });
+        let selected_path = app
+            .selected
+            .and_then(|i| app.items.get(i))
+            .map(|it| match it {
+                GridItem::Folder(p) => p.clone(),
+                _ => std::path::PathBuf::new(),
+            });
         assert_eq!(
             selected_path,
             Some(std::path::PathBuf::from("c:/root/sub2")),
@@ -16134,7 +16161,8 @@ mod phase_c_drill_address_tests {
             app.address
         );
         assert!(
-            app.address.contains("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"),
+            app.address
+                .contains("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"),
             "PDF ファイル名欠落: {}",
             app.address
         );
@@ -16186,8 +16214,8 @@ mod phase_c_drill_address_tests {
 /// 自動的に解除されること (Codex P2) を担保する。
 #[cfg(test)]
 mod favorite_adjustment_defaults_tests {
-    use super::*;
     use super::phase_c_support::setup_app;
+    use super::*;
     use crate::adjustment::AdjustParams;
     use crate::settings::FavoriteEntry;
     use crate::ui_fullscreen::AdjustScope;
@@ -16225,7 +16253,8 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.effective_params(idx).brightness, 20.0);
 
         // 個別設定を入れる → 最優先
-        app.adjustment_page_params.insert(idx, params_with_brightness(50.0));
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(50.0));
         assert_eq!(app.effective_params(idx).brightness, 50.0);
 
         // 個別解除 → お気に入り、お気に入り解除 → global に戻る
@@ -16324,7 +16353,8 @@ mod favorite_adjustment_defaults_tests {
         app.settings.global_preset = params_with_brightness(5.0);
         app.adjustment_favorite_params
             .insert(fav_id, params_with_brightness(20.0));
-        app.adjustment_page_params.insert(idx, params_with_brightness(5.0));
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(5.0));
 
         // favorite 未設定のとき effective_default は global なので、個別は当初から冗長
         // (ただし UI 経路では set_page_params が弾くのでここでは手動 insert)。
@@ -16348,7 +16378,8 @@ mod favorite_adjustment_defaults_tests {
         let idx = push_image(&mut app, "C:/pics/a.jpg");
 
         let fav_default = params_with_brightness(15.0);
-        app.adjustment_favorite_params.insert(fav_id, fav_default.clone());
+        app.adjustment_favorite_params
+            .insert(fav_id, fav_default.clone());
 
         // 個別を入れてから、favorite と同値を書く → 削除される
         app.adjustment_page_params
@@ -16499,7 +16530,10 @@ mod favorite_adjustment_defaults_tests {
         app.capture_adjust_full("op2".into(), |a| {
             a.set_page_params(idx, params_with_brightness(20.0));
         });
-        assert!(!app.meta_undo.can_redo(), "新しい操作で redo がクリアされる");
+        assert!(
+            !app.meta_undo.can_redo(),
+            "新しい操作で redo がクリアされる"
+        );
         assert_eq!(
             app.adjustment_page_params.get(&idx).unwrap().brightness,
             20.0
@@ -16800,7 +16834,10 @@ mod favorite_adjustment_defaults_tests {
             app.select_after_load.is_none(),
             "ヒントは take() で消費される (次回 load に持ち越さない)"
         );
-        assert!(app.scroll_to_selected, "選択行を可視化するスクロール要求が立つ");
+        assert!(
+            app.scroll_to_selected,
+            "選択行を可視化するスクロール要求が立つ"
+        );
     }
 
     /// Codex P3 (2026-04): ヒントの指す名前が items に無い場合 (削除等) は false を
@@ -16832,7 +16869,9 @@ mod favorite_adjustment_defaults_tests {
         use crate::grid_item::GridItem;
         let (mut app, _g, _tmp, _l) = setup_app();
         // Video アイテムを 1 件登録
-        app.items.push(GridItem::Video(std::path::PathBuf::from("C:/clips/movie.mp4")));
+        app.items.push(GridItem::Video(std::path::PathBuf::from(
+            "C:/clips/movie.mp4",
+        )));
         app.thumbnails.push(ThumbnailState::Pending);
         let idx = app.items.len() - 1;
 
@@ -16847,7 +16886,11 @@ mod favorite_adjustment_defaults_tests {
 
         // set_rating → rating_db に書き込みかつ rating_cache が更新される
         app.set_rating(idx, 3);
-        assert_eq!(app.get_rating(idx), 3, "set 直後に get で同値が読める (cache hit)");
+        assert_eq!(
+            app.get_rating(idx),
+            3,
+            "set 直後に get で同値が読める (cache hit)"
+        );
         // DB にも入っているはず
         let db_value = app
             .rating_db
@@ -16907,10 +16950,7 @@ mod favorite_adjustment_defaults_tests {
             Some(0),
             "fullscreen_idx は左ページに戻る (resolve_spread_pair で同ペアが復元される)"
         );
-        assert!(
-            app.erase_spread_ctx.is_none(),
-            "spread_ctx は消費される"
-        );
+        assert!(app.erase_spread_ctx.is_none(), "spread_ctx は消費される");
         assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
         assert_eq!(app.fs_pan, egui::Vec2::ZERO, "パンはリセット");
         assert!(!app.erase_mode);
@@ -16963,13 +17003,17 @@ mod favorite_adjustment_defaults_tests {
                 image::ImageFormat::WebP,
             )
             .unwrap();
-        let parent_key = format!(
-            "{}{}",
-            crate::thumb_loader::CACHE_KEY_PDF,
-            "foo.pdf"
-        );
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "foo.pdf");
         parent_db
-            .save(&parent_key, 12345, 67890, 4, 4, Some((100, 100)), &webp_bytes)
+            .save(
+                &parent_key,
+                12345,
+                67890,
+                4,
+                4,
+                Some((100, 100)),
+                &webp_bytes,
+            )
             .unwrap();
 
         // 仮想 catalog (PDF パスで別 SQLite) と空 cache_map を用意。
@@ -16992,7 +17036,10 @@ mod favorite_adjustment_defaults_tests {
         // 仮想 catalog の DB と cache_map の両方に page_0000 が入っているはず。
         let target_key = crate::grid_item::pdf_page_cache_key(0);
         let in_db = pdf_db.load_one(&target_key).unwrap();
-        assert!(in_db.is_some(), "PDF catalog DB に page_0000 が seed される");
+        assert!(
+            in_db.is_some(),
+            "PDF catalog DB に page_0000 が seed される"
+        );
         let entry = in_db.unwrap();
         assert_eq!(entry.mtime, 12345);
         assert_eq!(entry.file_size, 67890);
@@ -17081,11 +17128,7 @@ mod favorite_adjustment_defaults_tests {
             },
         );
 
-        let parent_key = format!(
-            "{}{}",
-            crate::thumb_loader::CACHE_KEY_PDF,
-            "bar.pdf"
-        );
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "bar.pdf");
         let cur_gen = app.items_generation;
         app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
             parent_catalog: Arc::clone(&parent_db_arc),
@@ -17406,8 +17449,8 @@ mod favorite_adjustment_defaults_tests {
     /// 同じ idx への再投入だけは旧版どおり cancel する。
     #[test]
     fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let (mut app, _g, _tmp, _l) = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
@@ -17426,7 +17469,11 @@ mod favorite_adjustment_defaults_tests {
         let cancel_p0 = p0.cancel.clone();
         app.erase_inpaint_pending.insert(0, p0);
         app.erase_inpaint_pending.insert(1, make_pending(1));
-        assert_eq!(app.erase_inpaint_pending.len(), 2, "両ページの pending が並走");
+        assert_eq!(
+            app.erase_inpaint_pending.len(),
+            2,
+            "両ページの pending が並走"
+        );
 
         // 異なる idx (1) への再投入をシミュレート: idx=0 の pending はそのまま残るべき。
         // (run_inpaint_and_cache の挙動を最小再現)

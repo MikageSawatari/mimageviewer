@@ -38,8 +38,8 @@
 //!
 //! 詳細は [docs/video-engine-redesign.md] の「Phase 4」節を参照。
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::video::engine::audio_bookkeeping::AudioBookkeeping;
@@ -182,11 +182,10 @@ pub(crate) fn pts_clears_seek_override(frame_pts: f64, now: f64) -> bool {
 }
 
 /// 「フレーム pts <= now + DISPLAY_LEAD_TOLERANCE_SECS なら displayable」と
-/// 判定する許容差 (秒)。約 1 vsync 周期 (60Hz = 16.7ms) を許容することで、
-/// vsync 直後に来た「ほぼ now のフレーム」を確実に 1 tick で表示できる
-/// (= 60fps コンテンツが 30fps 表示に落ちる現象を回避)。
-/// AV 同期上は 16ms 程度の lead は知覚されない (audio-video sync 許容窓は ±50ms)。
-pub(crate) const DISPLAY_LEAD_TOLERANCE_SECS: f64 = 0.016;
+/// 判定する許容差 (秒)。これは 1 vsync 先のフレームを出すための猶予ではなく、
+/// UI tick から実際の present までのごく小さい遅延と起床誤差を吸収するための
+/// 固定マージン。60fps/120fps で未来フレームを過剰に拾わないよう 1ms に抑える。
+pub(crate) const DISPLAY_LEAD_TOLERANCE_SECS: f64 = 0.001;
 
 /// `clear_seek_target_override` の 4 通りの結果を 1 つの perf event で記録するヘルパ。
 /// `crate::perf::is_enabled()` が false なら何もせず即 return (= 引数の評価コスト
@@ -222,8 +221,7 @@ impl AvClock {
         // 初期 anchor は (pts=0.0、wall=now、Frozen)。
         // playing=false / audio_active=false の間は now_secs() が anchor PTS を
         // そのまま返す挙動を再現するため、Frozen で開始するのが等価。
-        let master_clock =
-            MasterClock::with_anchor(ClockAnchor::frozen_at(0.0));
+        let master_clock = MasterClock::with_anchor(ClockAnchor::frozen_at(0.0));
         Self {
             master_clock,
             playing: AtomicBool::new(false),
@@ -285,7 +283,9 @@ impl AvClock {
         // wall-rate cap: defensive safety net (詳細は doc コメント参照)。
         let capped = if matches!(prev.source, ClockSource::Audio) {
             // 前回 anchor が Audio source = 連続的 audio update。wall 経過量で cap。
-            let wall_dt = wall.saturating_duration_since(prev.wall_at_anchor).as_secs_f64();
+            let wall_dt = wall
+                .saturating_duration_since(prev.wall_at_anchor)
+                .as_secs_f64();
             const JITTER_TOLERANCE_SECS: f64 = 0.005;
             let max_advance = wall_dt + JITTER_TOLERANCE_SECS;
             (pts_secs - prev.pts_secs).min(max_advance).max(0.0) + prev.pts_secs
@@ -691,7 +691,6 @@ impl AvClock {
     pub fn vst3_pdc_latency_secs(&self) -> f64 {
         self.audio_bookkeeping.vst3_pdc_latency_secs()
     }
-
 
     pub fn volume(&self) -> f64 {
         f64::from_bits(self.volume_bits.load(Ordering::Acquire))
