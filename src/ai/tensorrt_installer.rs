@@ -494,9 +494,7 @@ fn download_and_verify(
     // (2) <name>.partial で resume 可能ならそうする。
     let partial = dst.with_extension(format!(
         "{}.partial",
-        dst.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
+        dst.extension().and_then(|s| s.to_str()).unwrap_or("")
     ));
     // (2a) partial が「すでに完全サイズ」なら HTTP を出さずに hash check して
     // rename を試みる。Codex P2.3 指摘: 前回 DL 完了直後にクラッシュ等で
@@ -513,9 +511,8 @@ fn download_and_verify(
                     if dst.exists() {
                         let _ = fs::remove_file(dst);
                     }
-                    fs::rename(&partial, dst).map_err(|e| {
-                        format!("rename complete partial {}: {e}", asset.name)
-                    })?;
+                    fs::rename(&partial, dst)
+                        .map_err(|e| format!("rename complete partial {}: {e}", asset.name))?;
                     let _ = tx.send(InstallProgress::FileProgress {
                         name: asset.name.clone(),
                         bytes_done: asset.bytes,
@@ -574,15 +571,7 @@ fn download_and_verify(
             .unwrap_or(0)
             .min(asset.bytes);
 
-        match try_download_one(
-            &agent,
-            &url,
-            &partial,
-            asset,
-            resume_now,
-            cancel,
-            tx,
-        ) {
+        match try_download_one(&agent, &url, &partial, asset, resume_now, cancel, tx) {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -742,9 +731,7 @@ fn try_download_one(
         }
         if let Err(e) = file.write_all(&buf[..n]) {
             // ディスクフルは Permanent、それ以外も書き込みは即時 abort して安全側
-            return Err(DownloadAttemptError::Permanent(format!(
-                "write chunk: {e}"
-            )));
+            return Err(DownloadAttemptError::Permanent(format!("write chunk: {e}")));
         }
         bytes_done += n as u64;
         if last_progress.elapsed().as_millis() >= 50 {
@@ -825,8 +812,8 @@ fn write_install_sentinel(manifest: &Manifest, engine_pack_id: &str) -> Result<(
         "engine_pack_id": engine_pack_id,
         "installed_at": utc_now_iso8601(),
     });
-    let body_str = serde_json::to_string_pretty(&body)
-        .map_err(|e| format!("serialize INSTALL_OK: {e}"))?;
+    let body_str =
+        serde_json::to_string_pretty(&body).map_err(|e| format!("serialize INSTALL_OK: {e}"))?;
     fs::write(&tmp, body_str).map_err(|e| format!("write INSTALL_OK.tmp: {e}"))?;
     if sentinel.exists() {
         let _ = fs::remove_file(&sentinel);
@@ -906,7 +893,16 @@ fn unix_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let mdays: [u32; 12] = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month: u32 = 1;
     let mut day = days as u32 + 1;
@@ -964,10 +960,7 @@ mod tests {
 
     #[test]
     fn pick_engine_pack_fallback_when_unknown_sm() {
-        let packs = vec![
-            fake_engine("ampere_plus", 80),
-            fake_engine("hopper", 90),
-        ];
+        let packs = vec![fake_engine("ampere_plus", 80), fake_engine("hopper", 90)];
         // SM 不明 → 最小要求 (= 最も広く動く) pack
         let p = pick_engine_pack(&packs, None).unwrap();
         assert_eq!(p.id, "ampere_plus");
@@ -1003,7 +996,10 @@ mod tests {
         // ファイルが無ければ skip (CI 等 build 前は無いため)。
         let path = std::path::Path::new("dist/trt-pack-v2/manifest.json");
         if !path.exists() {
-            eprintln!("[skip] {} not found, run build_trt_pack first", path.display());
+            eprintln!(
+                "[skip] {} not found, run build_trt_pack first",
+                path.display()
+            );
             return;
         }
         let body = std::fs::read_to_string(path).expect("read manifest");

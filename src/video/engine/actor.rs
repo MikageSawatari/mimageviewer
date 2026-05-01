@@ -26,9 +26,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::clock::{ClockAnchor, MasterClock};
-use super::state::{
-    AudioEvent, DecoderEvent, EngineState, ReadinessLatch, SeekEpoch,
-};
+use super::state::{AudioEvent, DecoderEvent, EngineState, ReadinessLatch, SeekEpoch};
 
 /// 外部 (TransportController) から EngineActor への命令。
 #[derive(Debug, Clone)]
@@ -151,9 +149,8 @@ impl EngineActor {
         seek_serial: Arc<AtomicU64>,
         av_clock: Arc<crate::video::clock::AvClock>,
     ) -> Self {
-        let clock = MasterClock::with_anchor(ClockAnchor::frozen_at(
-            opts.resume_secs.unwrap_or(0.0),
-        ));
+        let clock =
+            MasterClock::with_anchor(ClockAnchor::frozen_at(opts.resume_secs.unwrap_or(0.0)));
         let initial_serial = seek_serial.load(Ordering::Acquire);
         Self {
             clock,
@@ -497,7 +494,8 @@ impl EngineActor {
                 // 致命的エラー: state を Idle に戻す (run loop は別途 channel close で抜ける)
                 self.transition_to_loading(self.clock.anchor().pts_secs);
                 self.state = EngineState::Idle;
-                self.published_state.store(state_code::IDLE, Ordering::Release);
+                self.published_state
+                    .store(state_code::IDLE, Ordering::Release);
             }
         }
     }
@@ -507,7 +505,11 @@ impl EngineActor {
     /// 移管したら `pub(super)` に戻す)。
     pub fn handle_audio_event(&mut self, ev: AudioEvent) {
         match ev {
-            AudioEvent::AudioRendered { epoch, pts, wall_now } => {
+            AudioEvent::AudioRendered {
+                epoch,
+                pts,
+                wall_now,
+            } => {
                 if epoch < self.current_seek_epoch() {
                     return;
                 }
@@ -530,7 +532,11 @@ impl EngineActor {
                 }
                 self.clock.set_anchor(ClockAnchor::audio(pts, wall_now));
             }
-            AudioEvent::BufferReady { epoch, pts, wall_now } => {
+            AudioEvent::BufferReady {
+                epoch,
+                pts,
+                wall_now,
+            } => {
                 if epoch < self.current_seek_epoch() {
                     return;
                 }
@@ -586,11 +592,16 @@ impl EngineActor {
         // で再 anchor されるため、この瞬間の anchor が短時間使われるだけで済む。
         let now = Instant::now();
         let anchor = if self.has_audio {
-            let (pts, _wall) =
-                self.latch.audio_anchor.expect("is_ready guarantees audio_anchor");
+            let (pts, _wall) = self
+                .latch
+                .audio_anchor
+                .expect("is_ready guarantees audio_anchor");
             ClockAnchor::audio(pts, now)
         } else {
-            let pts = self.latch.first_frame_pts.expect("is_ready guarantees first_frame_pts");
+            let pts = self
+                .latch
+                .first_frame_pts
+                .expect("is_ready guarantees first_frame_pts");
             ClockAnchor::wall(pts, now)
         };
         if self.opts.autoplay {
@@ -609,8 +620,8 @@ const VIDEO_RESUME_MIN_POSITION_SECS: f64 = 1.0;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::clock::ClockSource;
+    use super::*;
     use crate::video::clock::AvClock;
 
     /// テスト用 EngineActor 構築ヘルパ。
@@ -690,7 +701,11 @@ mod tests {
         let mut a = fresh_actor();
         a.handle_seek_request(3.0); // epoch=1
         a.transition_to_buffering(3.5);
-        assert_eq!(a.current_seek_epoch(), 1, "Buffering must not advance epoch");
+        assert_eq!(
+            a.current_seek_epoch(),
+            1,
+            "Buffering must not advance epoch"
+        );
         assert_eq!(a.state, EngineState::Buffering);
         assert_eq!(a.published_state_code(), state_code::BUFFERING);
     }
@@ -770,12 +785,18 @@ mod tests {
 
         // 同 epoch で再 Buffering 入場 — first_frame は保持、buffer_ready はリセット
         a.transition_to_buffering(1.0);
-        assert!(a.latch.first_frame, "same-epoch re-entry preserves first_frame");
+        assert!(
+            a.latch.first_frame,
+            "same-epoch re-entry preserves first_frame"
+        );
         assert!(!a.latch.buffer_ready, "buffer_ready is reset on re-entry");
         // has_audio=false なので BufferReady なしで is_ready=true → Playing に戻る
         a.try_transition_from_buffering();
-        assert_eq!(a.state, EngineState::Playing,
-            "same-epoch re-entry can transition back to Playing without fresh first_frame");
+        assert_eq!(
+            a.state,
+            EngineState::Playing,
+            "same-epoch re-entry can transition back to Playing without fresh first_frame"
+        );
     }
 
     #[test]
@@ -796,8 +817,11 @@ mod tests {
         assert!(!a.latch.first_frame, "new epoch resets first_frame");
         assert!(!a.latch.buffer_ready);
         a.try_transition_from_buffering();
-        assert_eq!(a.state, EngineState::Buffering,
-            "new epoch must wait for fresh FirstFrameReady");
+        assert_eq!(
+            a.state,
+            EngineState::Buffering,
+            "new epoch must wait for fresh FirstFrameReady"
+        );
     }
 
     #[test]
@@ -813,7 +837,10 @@ mod tests {
         // has_audio=true で buffer_ready=true でも audio_anchor=None なら blocked
         l.buffer_ready = true;
         l.audio_anchor = None;
-        assert!(!l.is_ready(true), "audio_anchor=None blocks readiness with audio");
+        assert!(
+            !l.is_ready(true),
+            "audio_anchor=None blocks readiness with audio"
+        );
         l.audio_anchor = Some((0.05, std::time::Instant::now()));
         assert!(l.is_ready(true));
     }
@@ -910,7 +937,10 @@ mod tests {
         assert_eq!(a.state, EngineState::Buffering);
 
         // FirstFrameReady (epoch=1) と BufferReady で Playing
-        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 1, pts: 15.02 });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: 15.02,
+        });
         a.handle_audio_event(AudioEvent::BufferReady {
             epoch: 1,
             pts: 15.05,
@@ -1035,8 +1065,10 @@ mod tests {
             wall_now: Instant::now(),
         });
         let anchor_after = a.clock().anchor().pts_secs;
-        assert!((anchor_before - anchor_after).abs() < 1e-9,
-                "backward audio pts must not regress anchor");
+        assert!(
+            (anchor_before - anchor_after).abs() < 1e-9,
+            "backward audio pts must not regress anchor"
+        );
     }
 
     #[test]
@@ -1081,8 +1113,10 @@ mod tests {
             pts: 5.10,
             wall_now: Instant::now(),
         });
-        assert!((a.clock().anchor().pts_secs - 5.10).abs() < 1e-9,
-                "new-epoch audio must reset monotonic guard");
+        assert!(
+            (a.clock().anchor().pts_secs - 5.10).abs() < 1e-9,
+            "new-epoch audio must reset monotonic guard"
+        );
     }
 
     #[test]
@@ -1243,9 +1277,15 @@ mod tests {
         // BufferReady が来ても latch.is_ready が永久に false になり Playing に
         // 戻れなくなる (= 「音が出なくなって映像も止まる」deadlock)。
         // buffer_ready / audio_anchor だけ reset される。
-        assert!(a.latch.first_frame, "first_frame preserved across same-epoch re-entry");
+        assert!(
+            a.latch.first_frame,
+            "first_frame preserved across same-epoch re-entry"
+        );
         assert!(!a.latch.buffer_ready, "buffer_ready is reset on re-entry");
-        assert!(a.latch.audio_anchor.is_none(), "audio_anchor is reset on re-entry");
+        assert!(
+            a.latch.audio_anchor.is_none(),
+            "audio_anchor is reset on re-entry"
+        );
     }
 
     #[test]
@@ -1307,7 +1347,10 @@ mod tests {
             epoch: 1,
             actual_pts: 30.0,
         });
-        a.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 1, pts: 30.0 });
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: 30.0,
+        });
         // autoplay=false のままなので Paused に行く
         assert_eq!(a.state, EngineState::Paused);
     }
@@ -1366,7 +1409,11 @@ mod tests {
         });
         assert_eq!(a.duration_secs, Some(45.0), "duration must be saved");
         assert!(a.has_audio, "has_audio must be saved");
-        assert_eq!(a.state, EngineState::Seeking { target_secs: 5.0 }, "state unchanged");
+        assert_eq!(
+            a.state,
+            EngineState::Seeking { target_secs: 5.0 },
+            "state unchanged"
+        );
     }
 
     #[test]
@@ -1416,7 +1463,8 @@ mod tests {
         // apply_command(Play) → handle_play は Seeking arm を通る
         a.apply_command(TransportCommand::Play);
         assert_eq!(
-            a.current_seek_epoch(), 1,
+            a.current_seek_epoch(),
+            1,
             "epoch must not advance — Seeking arm only sets autoplay"
         );
         assert_eq!(a.state, EngineState::Seeking { target_secs: 10.0 });
@@ -1450,7 +1498,8 @@ mod tests {
         a.apply_command(TransportCommand::Play);
         // 内部で handle_seek_request(0.0) が呼ばれて epoch=1
         assert_eq!(
-            a.current_seek_epoch(), 1,
+            a.current_seek_epoch(),
+            1,
             "Eof + Play は handle_seek_request(0.0) を内部呼びして epoch++ する"
         );
         assert_eq!(a.state, EngineState::Seeking { target_secs: 0.0 });
@@ -1513,7 +1562,8 @@ mod tests {
             a.apply_command(TransportCommand::Play);
             // handle_play が Seeking arm を通って autoplay=true セットのみ → epoch=1 維持
             assert_eq!(
-                a.current_seek_epoch(), 1,
+                a.current_seek_epoch(),
+                1,
                 "Eof: handle_seek_request → apply_command(Play) の順なら epoch=1"
             );
         }
@@ -1532,7 +1582,10 @@ mod tests {
         for i in 1..=5 {
             a.handle_seek_request(i as f64 * 10.0);
             assert_eq!(a.current_seek_epoch(), i, "after seek #{i}");
-            assert_eq!(a.latch.epoch, i, "latch epoch must follow current_seek_epoch");
+            assert_eq!(
+                a.latch.epoch, i,
+                "latch epoch must follow current_seek_epoch"
+            );
         }
     }
 

@@ -65,9 +65,9 @@ impl SingleInstanceGuard {
     pub fn acquire() -> Self {
         #[cfg(windows)]
         {
-            use windows::core::PCWSTR;
-            use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+            use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
             use windows::Win32::System::Threading::{CreateEventW, CreateMutexW};
+            use windows::core::PCWSTR;
 
             let mutex_name: Vec<u16> = MUTEX_NAME.encode_utf16().chain([0]).collect();
             let (mutex_handle, is_first) =
@@ -93,8 +93,7 @@ impl SingleInstanceGuard {
                 let activate_wide: Vec<u16> =
                     ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
                 // auto-reset (`bManualReset=false`) + 初期 non-signaled
-                match unsafe { CreateEventW(None, false, false, PCWSTR(activate_wide.as_ptr())) }
-                {
+                match unsafe { CreateEventW(None, false, false, PCWSTR(activate_wide.as_ptr())) } {
                     Ok(h) => {
                         let _ = ACTIVATE_EVENT_RAW.set(h.0 as isize);
                     }
@@ -106,8 +105,7 @@ impl SingleInstanceGuard {
                 }
                 let shutdown_wide: Vec<u16> =
                     SHUTDOWN_EVENT_NAME.encode_utf16().chain([0]).collect();
-                match unsafe { CreateEventW(None, false, false, PCWSTR(shutdown_wide.as_ptr())) }
-                {
+                match unsafe { CreateEventW(None, false, false, PCWSTR(shutdown_wide.as_ptr())) } {
                     Ok(h) => {
                         let _ = SHUTDOWN_EVENT_RAW.set(h.0 as isize);
                     }
@@ -169,9 +167,9 @@ pub const SHUTDOWN_EVENT_NAME: &str = "Global\\mImageViewerShutdown_v1";
 pub fn signal_activate_existing() -> bool {
     #[cfg(windows)]
     {
-        use windows::core::PCWSTR;
         use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+        use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        use windows::core::PCWSTR;
 
         let name_wide: Vec<u16> = ACTIVATE_EVENT_NAME.encode_utf16().chain([0]).collect();
         unsafe {
@@ -231,15 +229,15 @@ pub fn spawn_activation_listener(
     #[cfg(windows)]
     {
         use std::sync::atomic::Ordering;
-        use windows::core::PCWSTR;
         use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
         use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
-        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
-        use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
+        use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForMultipleObjects};
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, SW_SHOW,
-            SW_SHOWNOACTIVATE, WM_CLOSE,
+            IsWindowVisible, PostMessageW, SW_SHOW, SW_SHOWNOACTIVATE, SetForegroundWindow,
+            ShowWindow, WM_CLOSE,
         };
+        use windows::core::PCWSTR;
 
         let Some(&activate_event_raw) = ACTIVATE_EVENT_RAW.get() else {
             crate::logger::log(
@@ -250,14 +248,10 @@ pub fn spawn_activation_listener(
         // shutdown event は None でも activate listener 自体は動かせるように扱う
         // (古い DLL / まれに CreateEvent 失敗した場合のフォールバック)。
         let shutdown_event_raw = SHUTDOWN_EVENT_RAW.get().copied().unwrap_or(0);
-        let stop_event: HANDLE = match unsafe {
-            CreateEventW(None, true, false, PCWSTR::null())
-        } {
+        let stop_event: HANDLE = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
             Ok(h) => h,
             Err(e) => {
-                crate::logger::log(format!(
-                    "single_instance: CreateEventW(stop) failed: {e:?}"
-                ));
+                crate::logger::log(format!("single_instance: CreateEventW(stop) failed: {e:?}"));
                 return None;
             }
         };
@@ -288,8 +282,7 @@ pub fn spawn_activation_listener(
                 };
                 let wait_handles = [activate, shutdown, stop];
                 loop {
-                    let r =
-                        unsafe { WaitForMultipleObjects(&wait_handles, false, INFINITE) };
+                    let r = unsafe { WaitForMultipleObjects(&wait_handles, false, INFINITE) };
                     let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
                     if r == WAIT_OBJECT_0 {
                         crate::logger::log(

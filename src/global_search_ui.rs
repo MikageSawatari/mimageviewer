@@ -733,7 +733,11 @@ pub(crate) enum ThumbReuseKey {
     Archive(PathBuf),
     /// SearchContainer は representative も含めて識別。代表ヒットが変わったら
     /// 別テクスチャを再生成させる (古い代表サムネを残さない)。
-    Container(PathBuf, SearchContainerKind, Option<ContainerRepresentative>),
+    Container(
+        PathBuf,
+        SearchContainerKind,
+        Option<ContainerRepresentative>,
+    ),
     ZipImage(PathBuf, String),
     PdfPage(PathBuf, u32),
 }
@@ -745,9 +749,7 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         GridItem::Video(p) => Some(ThumbReuseKey::Video(p.clone())),
         GridItem::ZipFile(p) => Some(ThumbReuseKey::ZipFile(p.clone())),
         GridItem::PdfFile(p) => Some(ThumbReuseKey::PdfFile(p.clone())),
-        GridItem::ConvertibleArchive { path, .. } => {
-            Some(ThumbReuseKey::Archive(path.clone()))
-        }
+        GridItem::ConvertibleArchive { path, .. } => Some(ThumbReuseKey::Archive(path.clone())),
         GridItem::SearchContainer {
             path,
             kind,
@@ -815,9 +817,7 @@ impl App {
             .iter()
             .zip(self.thumbnails.iter())
             .filter_map(|(it, st)| match st {
-                ThumbnailState::Loaded { .. } => {
-                    thumb_reuse_key(it).map(|k| (k, st.clone()))
-                }
+                ThumbnailState::Loaded { .. } => thumb_reuse_key(it).map(|k| (k, st.clone())),
                 _ => None,
             })
             .collect();
@@ -1391,10 +1391,8 @@ impl App {
         };
 
         // 現コンテナを Aggregated と同じ並び順で求め、その中での位置を取る。
-        let containers = sort_containers_with_mode(
-            &self.global_search.containers,
-            self.global_search.sort_mode,
-        );
+        let containers =
+            sort_containers_with_mode(&self.global_search.containers, self.global_search.sort_mode);
         let Some(cur_idx) = containers.iter().position(|c| c.path == container_root) else {
             return;
         };
@@ -1439,7 +1437,9 @@ impl App {
         } else {
             cur_idx.checked_sub(1)
         };
-        let Some(next_idx) = next_container_idx else { return };
+        let Some(next_idx) = next_container_idx else {
+            return;
+        };
         let next = &containers[next_idx];
         self.global_search.view = GlobalSearchView::DrilledInto {
             container_root: next.path.clone(),
@@ -1580,10 +1580,7 @@ impl App {
                             };
                             if ui.button(label).clicked() {
                                 if !already_in_query {
-                                    append_tag_to_query(
-                                        &mut self.global_search.query,
-                                        &t.name,
-                                    );
+                                    append_tag_to_query(&mut self.global_search.query, &t.name);
                                     query_changed = true;
                                 }
                                 ui.close();
@@ -1671,10 +1668,8 @@ impl App {
                     }
                 }
 
-                if crate::ui_helpers::or_mode_checkbox(
-                    ui,
-                    &mut self.global_search.filters.or_mode,
-                ) {
+                if crate::ui_helpers::or_mode_checkbox(ui, &mut self.global_search.filters.or_mode)
+                {
                     filter_changed = true;
                 }
 
@@ -1863,9 +1858,8 @@ mod tests {
     /// 新 separator (U+001F) は通常ファイル名に現れないので `!` は関与しない。
     #[test]
     fn parent_container_handles_bang_in_filename() {
-        let (p, k) = parent_container(
-            "g:/photos/20230418_推し/20230416_181414-1024x1536-!fav_loli_A-8.png",
-        );
+        let (p, k) =
+            parent_container("g:/photos/20230418_推し/20230416_181414-1024x1536-!fav_loli_A-8.png");
         assert_eq!(p, PathBuf::from("g:/photos/20230418_推し"));
         assert_eq!(k, SearchContainerKind::Folder);
     }
@@ -2223,15 +2217,19 @@ mod tests {
         );
 
         // Level 3: /root/year2024/jan → matches のみ
-        let (l3, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false, &[true; 6]);
+        let (l3, _) =
+            build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false, &[true; 6]);
         assert_eq!(l3.len(), 1, "level3 item count");
-        assert!(
-            matches!(&l3[0],
-                GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan/matches"))
-        );
+        assert!(matches!(&l3[0],
+                GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan/matches")));
 
         // Level 4: /root/year2024/jan/matches → 画像 2 件が直下に並ぶ
-        let (l4, _) = build_drilled_items(&state, Path::new("C:/root/year2024/jan/matches"), false, &[true; 6]);
+        let (l4, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root/year2024/jan/matches"),
+            false,
+            &[true; 6],
+        );
         assert_eq!(l4.len(), 2, "level4 item count");
         for it in &l4 {
             assert!(matches!(it, GridItem::Image(_)));
@@ -2251,7 +2249,7 @@ mod tests {
             "c:/archives/target.zip!folder/pic1.jpg",
             "c:/archives/target.zip!folder/pic2.jpg",
             "c:/archives/other.zip!x.jpg", // 別 ZIP
-            "c:/loose/z.jpg",               // 通常ファイル
+            "c:/loose/z.jpg",              // 通常ファイル
         ] {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
@@ -2259,8 +2257,12 @@ mod tests {
                 stars: 0,
             });
         }
-        let (items, _) =
-            build_drilled_items(&state, Path::new("C:/archives/target.zip"), /*is_zip=*/ true, &[true; 6]);
+        let (items, _) = build_drilled_items(
+            &state,
+            Path::new("C:/archives/target.zip"),
+            /*is_zip=*/ true,
+            &[true; 6],
+        );
         assert_eq!(items.len(), 2, "target.zip のエントリ数");
         for it in &items {
             assert!(matches!(it, GridItem::ZipImage { .. }));
@@ -2383,7 +2385,10 @@ mod tests {
     fn hit_rating_key_handles_zip_and_regular_paths() {
         // 通常ファイル
         let k = hit_rating_key("C:/photos/a.jpg");
-        assert_eq!(k, crate::adjustment_db::normalize_path(Path::new("C:/photos/a.jpg")));
+        assert_eq!(
+            k,
+            crate::adjustment_db::normalize_path(Path::new("C:/photos/a.jpg"))
+        );
         // ZIP エントリ (\x1F セパレータ)
         let zip_key = format!("c:/album.zip{}IMG.JPG", crate::search_norm::ZIP_ENTRY_SEP);
         let k2 = hit_rating_key(&zip_key);
@@ -2487,6 +2492,9 @@ mod tests {
             thumb_reuse_key(&make(Some(rep1))),
             thumb_reuse_key(&make(Some(rep2.clone())))
         );
-        assert_ne!(thumb_reuse_key(&make(Some(rep2))), thumb_reuse_key(&make(None)));
+        assert_ne!(
+            thumb_reuse_key(&make(Some(rep2))),
+            thumb_reuse_key(&make(None))
+        );
     }
 }

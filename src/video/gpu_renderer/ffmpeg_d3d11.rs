@@ -66,9 +66,7 @@ struct AVD3D11VADeviceContext {
 pub unsafe fn create_ffmpeg_hw_device_ctx(
     gpu_dev: &Arc<GpuVideoDevice>,
 ) -> Result<*mut AVBufferRef, GpuVideoError> {
-    let buf = unsafe {
-        av_hwdevice_ctx_alloc(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA)
-    };
+    let buf = unsafe { av_hwdevice_ctx_alloc(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA) };
     if buf.is_null() {
         return Err(GpuVideoError::DeviceCreate(
             "av_hwdevice_ctx_alloc returned null".into(),

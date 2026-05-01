@@ -117,7 +117,8 @@ fn detect_scale_factor(runtime: &AiRuntime, model_kind: ModelKind) -> Result<u32
         return Ok(scale);
     }
 
-    let test_size = model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind)) as usize;
+    let test_size =
+        model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind)) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
     let tensor =
         ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
@@ -181,8 +182,9 @@ pub fn upscale_with_timings(
     let out_w = in_w * scale;
     let out_h = in_h * scale;
 
-    let tile_size = tile_size_override
-        .unwrap_or_else(|| model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind)));
+    let tile_size = tile_size_override.unwrap_or_else(|| {
+        model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind))
+    });
 
     crate::logger::log(format!(
         "[AI] Upscaling {}x{} → {}x{} ({}x) with {:?}, tile={}px overlap={}px",
@@ -507,11 +509,7 @@ fn compute_tiles(img_w: u32, img_h: u32, tile_size: u32, overlap: u32) -> Vec<Ti
 /// 出力テンソルの不要領域 (tile.w..tile_size の右端、tile.h..tile_size の下端) は
 /// 後段の `build_tile_output` で `tile.w * scale × tile.h * scale` に crop して
 /// 捨てるので、最終画像には混入しない。pad は zero (= 黒)。
-fn extract_tile(
-    rgb: &image::RgbImage,
-    tile: &TileRect,
-    tile_size: u32,
-) -> ndarray::Array4<f32> {
+fn extract_tile(rgb: &image::RgbImage, tile: &TileRect, tile_size: u32) -> ndarray::Array4<f32> {
     let canvas = tile_size as usize;
     let tw = tile.w as usize;
     let th = tile.h as usize;
@@ -625,8 +623,8 @@ fn run_tile_inference(
         Ok((
             output,
             InferBreakdown {
-                tensor_build_ms: 0.0, // ワーカー内部、計測されない
-                session_run_ms,       // ワーカー往復時間 (内部 GPU + IPC overhead)
+                tensor_build_ms: 0.0,   // ワーカー内部、計測されない
+                session_run_ms,         // ワーカー往復時間 (内部 GPU + IPC overhead)
                 tensor_extract_ms: 0.0, // ワーカー内部
                 post_copy_ms,
             },

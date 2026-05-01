@@ -641,10 +641,7 @@ pub(crate) fn parse_xmp_rating(xml: &[u8]) -> Option<u8> {
     found
 }
 
-fn scan_attributes_for_rating(
-    e: &quick_xml::events::BytesStart<'_>,
-    found: &mut Option<u8>,
-) {
+fn scan_attributes_for_rating(e: &quick_xml::events::BytesStart<'_>, found: &mut Option<u8>) {
     for attr in e.attributes().flatten() {
         let key = attr.key.as_ref();
         // prefix:local を分解。rdf:Description 上の xmp:Rating= 属性を拾う。
@@ -1025,11 +1022,7 @@ mod tests {
 </x:xmpmeta>"#;
         // JPEG APP1 セグメントを手動で構築
         let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
-        let payload: Vec<u8> = xmp_id
-            .iter()
-            .chain(xml.as_bytes())
-            .copied()
-            .collect();
+        let payload: Vec<u8> = xmp_id.iter().chain(xml.as_bytes()).copied().collect();
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(&[0xFF, 0xD8]);
         out.extend_from_slice(&[0xFF, 0xE1]);

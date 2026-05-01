@@ -428,8 +428,7 @@ impl App {
             let result = convert_to_zip(&src, &dst, format, &cancel_worker, Some(&cb));
             let msg = match result {
                 Ok(summary) => {
-                    let cached_size =
-                        std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
+                    let cached_size = std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
                     // ここで record。convert_guard 保持中なので maintenance と排他。
                     if let Ok(meta) = std::fs::metadata(&src) {
                         let src_mtime = crate::ui_helpers::mtime_secs(&meta);

@@ -319,7 +319,11 @@ mod tests {
         let path = tmp.path().join("夕焼け_IMG_1234.jpg");
         fs::write(&path, b"not a real image").unwrap();
         let pst = build_per_source_for_file(&path);
-        assert!(pst.name.contains("夕焼け_img_1234.jpg"), "name={}", pst.name);
+        assert!(
+            pst.name.contains("夕焼け_img_1234.jpg"),
+            "name={}",
+            pst.name
+        );
         // 他フィールドは空
         assert!(pst.exif.is_empty());
         assert!(pst.xmp_tweet.is_empty());

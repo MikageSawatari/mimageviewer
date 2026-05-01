@@ -218,8 +218,10 @@ mod tests {
         sleep(Duration::from_millis(50));
         let now = clock.now_secs();
         // 50ms ± 10ms 程度は OS スケジューラの jitter で許容
-        assert!(now >= 10.045 && now <= 10.150,
-                "expected ~10.05s, got {now}");
+        assert!(
+            now >= 10.045 && now <= 10.150,
+            "expected ~10.05s, got {now}"
+        );
     }
 
     #[test]
@@ -229,8 +231,7 @@ mod tests {
         clock.set_anchor(ClockAnchor::wall(5.0, t0));
         sleep(Duration::from_millis(30));
         let now = clock.now_secs();
-        assert!(now >= 5.025 && now <= 5.100,
-                "expected ~5.03s, got {now}");
+        assert!(now >= 5.025 && now <= 5.100, "expected ~5.03s, got {now}");
     }
 
     #[test]
@@ -264,8 +265,10 @@ mod tests {
         clock.set_anchor(ClockAnchor::audio(0.0, t0).with_speed(2.0));
         sleep(Duration::from_millis(50));
         let now = clock.now_secs();
-        assert!(now >= 0.090 && now <= 0.250,
-                "expected ~0.10s @ 2x speed, got {now}");
+        assert!(
+            now >= 0.090 && now <= 0.250,
+            "expected ~0.10s @ 2x speed, got {now}"
+        );
     }
 
     #[test]
@@ -281,7 +284,9 @@ mod tests {
         let clock = MasterClock::with_anchor(ClockAnchor::audio(50.0, t0));
         sleep(Duration::from_millis(10));
         let now = clock.now_secs();
-        assert!(now >= 50.005 && now <= 50.080,
-                "expected ~50.01s, got {now}");
+        assert!(
+            now >= 50.005 && now <= 50.080,
+            "expected ~50.01s, got {now}"
+        );
     }
 }

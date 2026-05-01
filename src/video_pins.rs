@@ -83,9 +83,7 @@ impl VideoPinDb {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let mut stmt = self
             .conn
-            .prepare_cached(
-                "SELECT pin_pts_secs, thumb_webp FROM video_pins WHERE path = ?1",
-            )
+            .prepare_cached("SELECT pin_pts_secs, thumb_webp FROM video_pins WHERE path = ?1")
             .ok()?;
         stmt.query_row([&key], |row| {
             let pin_pts_secs: f64 = row.get(0)?;
@@ -191,7 +189,8 @@ mod tests {
     #[test]
     fn case_and_separator_normalized() {
         let db = open_in_memory();
-        db.set_pin(Path::new("C:\\Videos\\A.mp4"), 3.0, &[9]).unwrap();
+        db.set_pin(Path::new("C:\\Videos\\A.mp4"), 3.0, &[9])
+            .unwrap();
         // 大文字小文字違い + スラッシュ違いでも同じレコードにヒットすること
         assert!(db.lookup(Path::new("c:/videos/a.mp4")).is_some());
     }

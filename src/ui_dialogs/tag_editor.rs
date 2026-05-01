@@ -42,11 +42,9 @@ impl App {
                 ui.set_min_width(480.0);
 
                 ui.label(
-                    egui::RichText::new(
-                        "タグを付与すると画像ファイルのメタデータを書き換えます。",
-                    )
-                    .color(egui::Color32::from_rgb(200, 170, 60))
-                    .size(11.0),
+                    egui::RichText::new("タグを付与すると画像ファイルのメタデータを書き換えます。")
+                        .color(egui::Color32::from_rgb(200, 170, 60))
+                        .size(11.0),
                 );
                 ui.add_space(4.0);
                 ui.separator();
@@ -105,15 +103,11 @@ impl App {
                                     ui.horizontal(|ui| {
                                         let up_en = i > 0;
                                         let dn_en = i + 1 < n;
-                                        if ui
-                                            .add_enabled(up_en, egui::Button::new("↑"))
-                                            .clicked()
+                                        if ui.add_enabled(up_en, egui::Button::new("↑")).clicked()
                                         {
                                             swap = Some((i - 1, i));
                                         }
-                                        if ui
-                                            .add_enabled(dn_en, egui::Button::new("↓"))
-                                            .clicked()
+                                        if ui.add_enabled(dn_en, egui::Button::new("↓")).clicked()
                                         {
                                             swap = Some((i, i + 1));
                                         }

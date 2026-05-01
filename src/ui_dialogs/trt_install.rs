@@ -177,10 +177,7 @@ impl TrtInstallState {
                 Some(InstallProgress::VerifyingFile { name }) => {
                     self.current_file = format!("{} (検証中)", name);
                 }
-                Some(InstallProgress::ExtractingEngine {
-                    entry_index,
-                    total,
-                }) => {
+                Some(InstallProgress::ExtractingEngine { entry_index, total }) => {
                     self.extract_done = entry_index;
                     self.extract_total = total;
                     self.current_file = format!("エンジン展開中 ({}/{})", entry_index + 1, total);
@@ -361,8 +358,12 @@ fn draw_confirm_phase(ui: &mut egui::Ui, state: &mut TrtInstallState, close: &mu
 
     ui.separator();
     ui.horizontal(|ui| {
-        let can_start = matches!(state.target_sm_x10, Some(sm) if sm >= 80) || state.target_sm_x10.is_none();
-        if ui.add_enabled(can_start, egui::Button::new("開始")).clicked() {
+        let can_start =
+            matches!(state.target_sm_x10, Some(sm) if sm >= 80) || state.target_sm_x10.is_none();
+        if ui
+            .add_enabled(can_start, egui::Button::new("開始"))
+            .clicked()
+        {
             state.start();
         }
         if ui.button("キャンセル").clicked() {
@@ -438,10 +439,8 @@ fn draw_done_phase(ui: &mut egui::Ui, close: &mut bool) {
     );
     ui.add_space(2.0);
     ui.label(
-        egui::RichText::new(
-            "※ ワーカープロセスの起動でエラーが出た場合は画面右上に通知が出ます。",
-        )
-        .small(),
+        egui::RichText::new("※ ワーカープロセスの起動でエラーが出た場合は画面右上に通知が出ます。")
+            .small(),
     );
     ui.separator();
     if ui.button("閉じる").clicked() {

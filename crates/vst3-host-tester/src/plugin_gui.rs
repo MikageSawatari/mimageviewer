@@ -30,9 +30,9 @@ use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
-    SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOMOVE,
+    SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE,
+    WM_DESTROY, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -133,22 +133,14 @@ struct ThreadState {
 
 unsafe impl Send for ThreadState {}
 
-extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_CLOSE => {
                 // ユーザーが × を押した。メインスレッドに通知し、
                 // メインスレッドからの Cmd::Close を待つ (= ここでは破棄しない)。
-                let tx_opt: Option<Sender<()>> = THREAD_STATE.with(|s| {
-                    s.borrow()
-                        .as_ref()
-                        .and_then(|st| st.close_tx.clone())
-                });
+                let tx_opt: Option<Sender<()>> =
+                    THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.close_tx.clone()));
                 if let Some(tx) = tx_opt {
                     let _ = tx.send(());
                 }
@@ -161,11 +153,8 @@ extern "system" fn wndproc(
                 let w = (lparam_v & 0xFFFF) as u32;
                 let h = ((lparam_v >> 16) & 0xFFFF) as u32;
                 if w > 0 && h > 0 {
-                    let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE.with(|s| {
-                        s.borrow()
-                            .as_ref()
-                            .and_then(|st| st.resize_tx.clone())
-                    });
+                    let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE
+                        .with(|s| s.borrow().as_ref().and_then(|st| st.resize_tx.clone()));
                     if let Some(tx) = tx_opt {
                         let _ = tx.send((w, h));
                     }
@@ -191,11 +180,9 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
     // GUI スレッドで COM を STA 初期化しておかないとプラグイン GUI が
     // 真っ白でハングするケースがある (Pro-Q 4 など)。
     use windows::Win32::System::Com::{
-        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
     };
-    let co_hr = unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-    };
+    let co_hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
 
     // GUI スレッドの per-thread state を初期化
     THREAD_STATE.with(|s| {
@@ -268,8 +255,8 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
 }
 
 fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
-    use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
     use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
+    use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
     unsafe {
         loop {
             // PeekMessage で非ブロッキング
@@ -325,7 +312,10 @@ fn create_window(
 
         // 1 度だけクラス登録 (スレッドローカル状態に記録)
         let need_register = THREAD_STATE.with(|s| {
-            !s.borrow().as_ref().map(|st| st.class_registered).unwrap_or(true)
+            !s.borrow()
+                .as_ref()
+                .map(|st| st.class_registered)
+                .unwrap_or(true)
         });
         if need_register {
             let cursor = LoadCursorW(None, IDC_ARROW)
@@ -448,6 +438,14 @@ pub fn resize_window_client(hwnd_u64: u64, width: u32, height: u32) {
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
         let hwnd = HWND(hwnd_u64 as *mut _);
-        let _ = SetWindowPos(hwnd, None, 0, 0, outer_w, outer_h, SWP_NOMOVE | SWP_NOZORDER);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            outer_w,
+            outer_h,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
     }
 }

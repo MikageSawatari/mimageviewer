@@ -15,8 +15,8 @@
 //! 境界で必ず割り込めるので、起動直後の大規模スキャン中でも応答性が保たれる。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -259,11 +259,7 @@ fn run_worker(
 /// dispatcher 経由で commit + reader reload を依頼する。pending が 0 なら no-op。
 /// dispatcher は Interactive 優先度のジョブを Background より先に処理するので、
 /// indexer の長時間 batch 中でも 1 sub-batch (1〜2 秒) 以内に応答が返る。
-fn flush_commit(
-    writer: &FtsWriterDispatcher,
-    fts: &FtsIndex,
-    pending_in_writer: &AtomicUsize,
-) {
+fn flush_commit(writer: &FtsWriterDispatcher, fts: &FtsIndex, pending_in_writer: &AtomicUsize) {
     if pending_in_writer.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -294,7 +290,12 @@ fn process_job(
     meta: &FtsMetaDb,
     fts: &FtsIndex,
     writer: &FtsWriterDispatcher,
-) -> (Result<TagAction, WriteError>, bool, Vec<String>, Vec<String>) {
+) -> (
+    Result<TagAction, WriteError>,
+    bool,
+    Vec<String>,
+    Vec<String>,
+) {
     let path_disp = job.path.display();
     // Toggle / ClearMiv / SetTags のいずれも、worker 内でまず実ファイルから dc:subject を
     // 読み出す。この値が Undo entry の `before` (= write 直前の真の disk 状態) になる。
@@ -321,7 +322,14 @@ fn process_job(
             crate::logger::log(format!(
                 "[TAG] worker: ClearMiv read dc:subject → {tags_before:?} (had #-tags={had}) | {path_disp}"
             ));
-            (TagOp::ClearMiv, if had { TagAction::Cleared } else { TagAction::NoOp })
+            (
+                TagOp::ClearMiv,
+                if had {
+                    TagAction::Cleared
+                } else {
+                    TagAction::NoOp
+                },
+            )
         }
         TagJobKind::SetTags(target) => {
             // SetTags は Undo/Redo 経路でしか使わないので、disk が既に target に
@@ -422,9 +430,7 @@ fn upsert_tags_via_dispatcher(
     let res = writer.upsert(doc, WriterPriority::Interactive);
     let wait_ms = t0.elapsed().as_millis();
     if wait_ms > 1000 {
-        crate::logger::log(format!(
-            "[TAG] worker: dispatcher upsert took {wait_ms} ms"
-        ));
+        crate::logger::log(format!("[TAG] worker: dispatcher upsert took {wait_ms} ms"));
     }
     match res {
         Ok(()) => true,

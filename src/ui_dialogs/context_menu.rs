@@ -622,11 +622,8 @@ impl crate::app::App {
 
         if do_start_delete {
             // 削除確認は閉じ、path だけを worker に渡す (idx は完了時に再解決)。
-            let paths: Vec<std::path::PathBuf> = self
-                .delete_targets
-                .iter()
-                .map(|(_, p)| p.clone())
-                .collect();
+            let paths: Vec<std::path::PathBuf> =
+                self.delete_targets.iter().map(|(_, p)| p.clone()).collect();
             self.show_delete_confirm = false;
             self.delete_targets.clear();
             self.start_delete_files(paths);
@@ -711,7 +708,6 @@ impl crate::app::App {
             self.show_delete_confirm = true;
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,11 +1017,7 @@ fn run_ps_script_inner(
     // process id + atomic counter で temp ファイル衝突を回避。
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!(
-        "miv_ps_{}_{}.ps1",
-        std::process::id(),
-        seq
-    ));
+    let tmp = std::env::temp_dir().join(format!("miv_ps_{}_{}.ps1", std::process::id(), seq));
     std::thread::Builder::new()
         .name("powershell-clipboard-exec".into())
         .spawn(move || {

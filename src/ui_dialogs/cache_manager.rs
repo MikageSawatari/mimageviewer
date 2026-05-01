@@ -119,9 +119,7 @@ impl App {
                             // 削除前に Connection を畳む (Codex P3): 同上。
                             self.evict_all_catalog_cache();
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
-                                crate::cache_maintenance::CacheMaintTask::DeleteFolder {
-                                    folder,
-                                },
+                                crate::cache_maintenance::CacheMaintTask::DeleteFolder { folder },
                                 cache_dir.clone(),
                             ));
                         }

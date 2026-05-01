@@ -12,8 +12,8 @@
 //! そのため実装はタグ書き込み worker よりだいぶ小さい。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
@@ -117,4 +117,3 @@ fn run_worker(
         });
     }
 }
-

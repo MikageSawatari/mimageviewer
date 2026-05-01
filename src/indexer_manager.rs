@@ -203,14 +203,11 @@ impl IndexerManager {
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         let data_dir = crate::data_dir::get();
-        let (meta_db, fts) = match open_stores_with_rebuild_sync(
-            &data_dir,
-            "IndexerManager",
-            progress.as_ref(),
-        ) {
-            Some(stores) => stores,
-            None => return None,
-        };
+        let (meta_db, fts) =
+            match open_stores_with_rebuild_sync(&data_dir, "IndexerManager", progress.as_ref()) {
+                Some(stores) => stores,
+                None => return None,
+            };
         Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate, progress)
     }
 
@@ -226,14 +223,11 @@ impl IndexerManager {
         activity_gate: Arc<ActivityGate>,
     ) -> Option<Self> {
         std::fs::create_dir_all(data_dir).ok();
-        let (meta_db, fts) = match open_stores_with_rebuild_sync(
-            data_dir,
-            "IndexerManager(test)",
-            None,
-        ) {
-            Some(stores) => stores,
-            None => return None,
-        };
+        let (meta_db, fts) =
+            match open_stores_with_rebuild_sync(data_dir, "IndexerManager(test)", None) {
+                Some(stores) => stores,
+                None => return None,
+            };
         Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate, None)
     }
 
@@ -485,14 +479,7 @@ impl IndexerManager {
         std::thread::Builder::new()
             .name("ctrl-g-search".to_string())
             .spawn(move || {
-                crate::global_search::run(
-                    &query,
-                    &favorite_ids,
-                    &scope,
-                    &fts,
-                    &cancel_cl,
-                    &tx,
-                );
+                crate::global_search::run(&query, &favorite_ids, &scope, &fts, &cancel_cl, &tx);
             })
             .ok();
 
@@ -635,10 +622,10 @@ impl Drop for IndexerManager {
 
         // STEP 3: 全 supervisor が止まった後に共有 writer を 1 回 commit する。
         // dispatcher の Background 優先度で submit (Interactive キューが空なので即実行)。
-        if let Err(e) = self
-            .writer
-            .commit(false, crate::fts_writer_dispatcher::WriterPriority::Background)
-        {
+        if let Err(e) = self.writer.commit(
+            false,
+            crate::fts_writer_dispatcher::WriterPriority::Background,
+        ) {
             crate::logger::log(format!("IndexerManager: final writer commit failed: {e}"));
         }
         // dispatcher 自身は Arc::strong_count が 0 になった時点で Drop → スレッド join される。
@@ -769,9 +756,7 @@ fn run_reconciliation(
         for (path, _status) in not_ok {
             crate::fts_index::delete_doc(writer, fields, &path);
             if let Err(e) = meta_db.delete_paths(&[path.clone()]) {
-                crate::logger::log(format!(
-                    "reconciliation: delete_paths {path} failed: {e}"
-                ));
+                crate::logger::log(format!("reconciliation: delete_paths {path} failed: {e}"));
             }
             report.failed_cleaned += 1;
         }
@@ -917,14 +902,7 @@ mod tests {
         let cancel_cl = Arc::clone(&cancel);
         std::thread::spawn(move || {
             let scope = crate::global_search::SearchScope::default();
-            crate::global_search::run(
-                "dummy",
-                &[fav_id],
-                &scope,
-                &fts_cl,
-                &cancel_cl,
-                &tx,
-            );
+            crate::global_search::run("dummy", &[fav_id], &scope, &fts_cl, &cancel_cl, &tx);
         });
         // 何らかの SearchStreamEvent が返ることを確認
         let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();

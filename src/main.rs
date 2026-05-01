@@ -44,6 +44,7 @@ pub mod perf;
 pub mod png_metadata;
 pub mod post_filter;
 pub mod rating_db;
+pub mod rating_write_worker;
 pub mod rotation_db;
 pub mod search_index_db;
 pub mod search_norm;
@@ -59,11 +60,8 @@ pub mod susie_loader;
 pub mod sys_memory;
 mod tag_ops;
 mod tag_prewarm;
-pub mod rating_write_worker;
 pub mod tag_write_worker;
 pub mod thumb_loader;
-mod undo_ops;
-pub mod undo_stack;
 pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;
@@ -79,6 +77,8 @@ pub mod ui_susie_diagnostic;
 pub mod ui_video_panels;
 #[cfg(windows)]
 pub mod ui_video_tile;
+mod undo_ops;
+pub mod undo_stack;
 pub mod update_check;
 pub mod video;
 pub mod video_bookmarks;
@@ -296,8 +296,7 @@ fn main() -> eframe::Result {
     // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends =
-            wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
             |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
                 if let Some(a) = adapters
@@ -367,7 +366,11 @@ fn main() -> eframe::Result {
                     let is_dx12 = matches!(backend, wgpu::Backend::Dx12);
                     crate::logger::log(format!(
                         "wgpu backend selected: {backend:?} (gpu_video_pipeline={})",
-                        if is_dx12 { "available" } else { "disabled (non-DX12)" }
+                        if is_dx12 {
+                            "available"
+                        } else {
+                            "disabled (non-DX12)"
+                        }
                     ));
                     if is_dx12 {
                         // egui_wgpu の callback_resources に動画描画用の wgpu パイプラインを

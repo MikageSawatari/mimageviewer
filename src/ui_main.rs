@@ -49,11 +49,7 @@ enum RatingFilterOp {
 /// `MIN_CELL_PX` 下限を強制しないと、`viewport_h / cell_h` が数百〜数千行に暴発して
 /// 1 フレームで数千セル描画して UI フリーズする (極端に窓を狭めた時の実害バグ)。
 const MIN_CELL_PX: f32 = 32.0;
-fn compute_cell_size(
-    avail_w: f32,
-    cols: usize,
-    height_ratio: f32,
-) -> Option<(f32, f32)> {
+fn compute_cell_size(avail_w: f32, cols: usize, height_ratio: f32) -> Option<(f32, f32)> {
     if avail_w <= 0.0 {
         return None;
     }
@@ -487,32 +483,29 @@ impl App {
                 // メニュー項目の右側に新バージョン通知バッジを表示する。
                 // 押すと更新ダイアログを開き、リリースページへの誘導 / skip 操作を行える。
                 if self.should_show_update_badge() {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let tag = self
-                                .update_info
-                                .as_ref()
-                                .map(|i| i.latest_tag.clone())
-                                .unwrap_or_default();
-                            let resp = ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(format!("🔔 新バージョン {tag}"))
-                                            .color(egui::Color32::from_rgb(100, 170, 100))
-                                            .size(12.0),
-                                    )
-                                    .fill(egui::Color32::from_rgb(40, 70, 40)),
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let tag = self
+                            .update_info
+                            .as_ref()
+                            .map(|i| i.latest_tag.clone())
+                            .unwrap_or_default();
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("🔔 新バージョン {tag}"))
+                                        .color(egui::Color32::from_rgb(100, 170, 100))
+                                        .size(12.0),
                                 )
-                                .on_hover_text(
-                                    "新しいバージョンがリリースされています。\n\
+                                .fill(egui::Color32::from_rgb(40, 70, 40)),
+                            )
+                            .on_hover_text(
+                                "新しいバージョンがリリースされています。\n\
                                      クリックで詳細を表示します。",
-                                );
-                            if resp.clicked() {
-                                self.show_update_dialog = true;
-                            }
-                        },
-                    );
+                            );
+                        if resp.clicked() {
+                            self.show_update_dialog = true;
+                        }
+                    });
                 }
             });
         });
@@ -918,41 +911,35 @@ impl App {
                     // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if folder_rating >= 1 && folder_rating <= 5 {
-                                let stars = "★".repeat(folder_rating as usize);
-                                ui.label(
-                                    egui::RichText::new(format!("📁{stars}"))
-                                        .color(egui::Color32::from_rgb(130, 170, 220))
-                                        .strong(),
-                                )
-                                .on_hover_text(
-                                    "このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]",
-                                );
-                                ui.add_space(4.0);
-                            }
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut self.address)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    self.address_has_focus = resp.has_focus();
-                                    if resp.lost_focus() && enter_pressed {
-                                        let p = PathBuf::from(&self.address);
-                                        if let Some(resolved) =
-                                            crate::folder_tree::resolve_openable_path(&p)
-                                        {
-                                            result = Some(resolved);
-                                        }
-                                    }
-                                },
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if folder_rating >= 1 && folder_rating <= 5 {
+                            let stars = "★".repeat(folder_rating as usize);
+                            ui.label(
+                                egui::RichText::new(format!("📁{stars}"))
+                                    .color(egui::Color32::from_rgb(130, 170, 220))
+                                    .strong(),
+                            )
+                            .on_hover_text(
+                                "このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]",
                             );
-                        },
-                    );
+                            ui.add_space(4.0);
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.address)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            self.address_has_focus = resp.has_focus();
+                            if resp.lost_focus() && enter_pressed {
+                                let p = PathBuf::from(&self.address);
+                                if let Some(resolved) =
+                                    crate::folder_tree::resolve_openable_path(&p)
+                                {
+                                    result = Some(resolved);
+                                }
+                            }
+                        });
+                    });
                 });
                 ui.add_space(3.0);
                 result
@@ -1014,7 +1001,8 @@ impl App {
                 }
 
                 // ── 検索対象ドロップダウン (§19.7) ──
-                let current = crate::global_search_ui::TargetChoice::from_target(&self.search_target);
+                let current =
+                    crate::global_search_ui::TargetChoice::from_target(&self.search_target);
                 let mut next = current;
                 egui::ComboBox::from_id_salt("ctrl_f_search_target")
                     .selected_text(current.label())
@@ -1526,8 +1514,8 @@ impl App {
                                 // ★内訳 tooltip を出す。
                                 if let Some((_total, per_star)) = filter_match {
                                     let hover_id = egui::Id::new(("folder_rating_badge", idx));
-                                    let resp = ui
-                                        .interact(cell_rect, hover_id, egui::Sense::hover());
+                                    let resp =
+                                        ui.interact(cell_rect, hover_id, egui::Sense::hover());
                                     if resp.hovered() {
                                         resp.on_hover_ui_at_pointer(|ui| {
                                             ui.vertical(|ui| {

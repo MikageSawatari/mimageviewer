@@ -186,8 +186,7 @@ fn query_sm_via_cuda_driver() -> Option<u32> {
             }
         };
         let cu_init: CuInitFn = std::mem::transmute(cu_init_ptr);
-        let cu_compute_cap: CuDeviceComputeCapabilityFn =
-            std::mem::transmute(cu_compute_cap_ptr);
+        let cu_compute_cap: CuDeviceComputeCapabilityFn = std::mem::transmute(cu_compute_cap_ptr);
 
         // CUDA_SUCCESS = 0。cuInit は冪等、複数回呼んでも問題ない。
         if cu_init(0) != 0 {
@@ -250,10 +249,15 @@ fn sm_from_description(desc: &str) -> Option<u32> {
         return Some(80);
     }
     // Turing (sm75 = RTX 20 series, GTX 16 series, T4)
-    if d.contains("RTX 20") || d.contains("RTX 2080") || d.contains("RTX 2070")
-        || d.contains("RTX 2060") || d.contains("GTX 16")
-        || d.contains("GTX 1660") || d.contains("GTX 1650")
-        || d.contains("TESLA T4") || d.contains(" T4 ")
+    if d.contains("RTX 20")
+        || d.contains("RTX 2080")
+        || d.contains("RTX 2070")
+        || d.contains("RTX 2060")
+        || d.contains("GTX 16")
+        || d.contains("GTX 1660")
+        || d.contains("GTX 1650")
+        || d.contains("TESLA T4")
+        || d.contains(" T4 ")
     {
         return Some(75);
     }
@@ -284,10 +288,16 @@ mod tests {
         assert_eq!(sm_from_description("NVIDIA GeForce RTX 4090"), Some(89));
         assert_eq!(sm_from_description("NVIDIA GeForce RTX 4080 Ti"), Some(89));
         assert_eq!(sm_from_description("NVIDIA GeForce RTX 3090"), Some(86));
-        assert_eq!(sm_from_description("NVIDIA GeForce RTX 3060 Laptop"), Some(86));
+        assert_eq!(
+            sm_from_description("NVIDIA GeForce RTX 3060 Laptop"),
+            Some(86)
+        );
         assert_eq!(sm_from_description("NVIDIA GeForce RTX 5090"), Some(120));
         assert_eq!(sm_from_description("NVIDIA A100-SXM4-80GB"), Some(80));
-        assert_eq!(sm_from_description("NVIDIA GeForce RTX 2080 Super"), Some(75));
+        assert_eq!(
+            sm_from_description("NVIDIA GeForce RTX 2080 Super"),
+            Some(75)
+        );
         assert_eq!(sm_from_description("NVIDIA GeForce GTX 1660 Ti"), Some(75));
         assert_eq!(sm_from_description("NVIDIA H100 80GB HBM3"), Some(90));
     }

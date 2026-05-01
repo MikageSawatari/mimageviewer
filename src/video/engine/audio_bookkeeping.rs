@@ -56,8 +56,13 @@ impl AudioBookkeeping {
 
     /// pump 後段 (= processed) ringbuffer 残量 (秒) を上書き publish。
     pub fn set_pump_buf_secs(&self, secs: f64) {
-        let v = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
-        self.pump_buf_secs_bits.store(v.to_bits(), Ordering::Release);
+        let v = if secs.is_finite() && secs >= 0.0 {
+            secs
+        } else {
+            0.0
+        };
+        self.pump_buf_secs_bits
+            .store(v.to_bits(), Ordering::Release);
     }
 
     /// pump 後段 (= processed) ringbuffer 残量を返す。
@@ -67,8 +72,13 @@ impl AudioBookkeeping {
 
     /// pump 前段 (= raw_pending) queue 残量 (秒) を上書き publish。
     pub fn set_raw_pending_secs(&self, secs: f64) {
-        let v = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
-        self.raw_pending_secs_bits.store(v.to_bits(), Ordering::Release);
+        let v = if secs.is_finite() && secs >= 0.0 {
+            secs
+        } else {
+            0.0
+        };
+        self.raw_pending_secs_bits
+            .store(v.to_bits(), Ordering::Release);
     }
 
     /// pump 前段 (= raw_pending) queue 残量を返す。
@@ -143,8 +153,13 @@ impl AudioBookkeeping {
 
     /// VST3 PDC latency (秒) を上書き publish。pump push 時に呼ばれる。
     pub fn set_vst3_pdc_latency_secs(&self, secs: f64) {
-        let v = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
-        self.vst3_pdc_latency_secs_bits.store(v.to_bits(), Ordering::Release);
+        let v = if secs.is_finite() && secs >= 0.0 {
+            secs
+        } else {
+            0.0
+        };
+        self.vst3_pdc_latency_secs_bits
+            .store(v.to_bits(), Ordering::Release);
     }
 
     /// VST3 PDC latency (秒) を返す。decoder pacing が先読み許可量計算に使う。

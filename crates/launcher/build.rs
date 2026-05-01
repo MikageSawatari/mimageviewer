@@ -83,9 +83,7 @@ fn main() {
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
     // 環境変数経由で渡す。core 側を変えると次のビルドで自動反映される。
-    let single_instance_rs = workspace_root
-        .join("src")
-        .join("single_instance.rs");
+    let single_instance_rs = workspace_root.join("src").join("single_instance.rs");
     let src = std::fs::read_to_string(&single_instance_rs).unwrap_or_else(|e| {
         eprintln!("read {} failed: {e}", single_instance_rs.display());
         std::process::exit(1);
@@ -107,10 +105,7 @@ fn main() {
         let mut res = winresource::WindowsResource::new();
         res.set("FileDescription", "mImageViewer");
         res.set("ProductName", "mImageViewer");
-        res.set(
-            "FileVersion",
-            &format!("{}.0", env!("CARGO_PKG_VERSION")),
-        );
+        res.set("FileVersion", &format!("{}.0", env!("CARGO_PKG_VERSION")));
         res.set(
             "ProductVersion",
             &format!("{}.0", env!("CARGO_PKG_VERSION")),

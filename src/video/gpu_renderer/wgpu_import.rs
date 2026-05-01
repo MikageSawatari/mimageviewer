@@ -133,7 +133,8 @@ pub unsafe fn import_shared_d3d11_texture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     };
-    let texture = unsafe { wgpu_device.create_texture_from_hal::<wgpu_hal::api::Dx12>(hal_tex, &desc) };
+    let texture =
+        unsafe { wgpu_device.create_texture_from_hal::<wgpu_hal::api::Dx12>(hal_tex, &desc) };
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     Ok(ImportedTexture {

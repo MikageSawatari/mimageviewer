@@ -23,14 +23,14 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_FENCE_FLAG_SHARED, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_FENCE_FLAG_SHARED,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
     D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Device, ID3D11Device5,
     ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D, ID3D11VideoContext,
     ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
@@ -39,9 +39,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
-    DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020,
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL,
-    DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
 use windows::core::Interface;
@@ -248,15 +247,13 @@ impl GpuVideoDevice {
             GpuVideoError::DeviceCreate("D3D11CreateDevice returned null context".into())
         })?;
 
-        let video_device: ID3D11VideoDevice = device
+        let video_device: ID3D11VideoDevice =
+            device.cast().map_err(|_| GpuVideoError::NoVideoDevice)?;
+        let video_context: ID3D11VideoContext =
+            context.cast().map_err(|_| GpuVideoError::NoVideoDevice)?;
+        let video_context1: ID3D11VideoContext1 = video_context
             .cast()
-            .map_err(|_| GpuVideoError::NoVideoDevice)?;
-        let video_context: ID3D11VideoContext = context
-            .cast()
-            .map_err(|_| GpuVideoError::NoVideoDevice)?;
-        let video_context1: ID3D11VideoContext1 = video_context.cast().map_err(|e| {
-            GpuVideoError::DeviceCreate(format!("ID3D11VideoContext1 cast: {e:?}"))
-        })?;
+            .map_err(|e| GpuVideoError::DeviceCreate(format!("ID3D11VideoContext1 cast: {e:?}")))?;
 
         crate::logger::log(format!(
             "GpuVideoDevice: created (feature_level=0x{:X})",
@@ -269,9 +266,9 @@ impl GpuVideoDevice {
         let device5: ID3D11Device5 = device
             .cast()
             .map_err(|e| GpuVideoError::DeviceCreate(format!("cast ID3D11Device5: {e:?}")))?;
-        let context4: ID3D11DeviceContext4 = context
-            .cast()
-            .map_err(|e| GpuVideoError::DeviceCreate(format!("cast ID3D11DeviceContext4: {e:?}")))?;
+        let context4: ID3D11DeviceContext4 = context.cast().map_err(|e| {
+            GpuVideoError::DeviceCreate(format!("cast ID3D11DeviceContext4: {e:?}"))
+        })?;
         let mut fence_opt: Option<ID3D11Fence> = None;
         unsafe {
             device5
@@ -295,8 +292,7 @@ impl GpuVideoDevice {
         // プロセス内ユニーク世代 ID。0 は予約 (= 未開封キャッシュ判定で使う)、
         // GpuVideoDevice の生成ごとに 1, 2, 3, ... と進む。HANDLE 値は kernel が
         // 再利用しうるので別軸の identity が必要 (Codex P1)。
-        static NEXT_FENCE_GEN: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
+        static NEXT_FENCE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let fence_gen = NEXT_FENCE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         Ok(Arc::new(Self {
@@ -482,10 +478,18 @@ impl GpuVideoDevice {
                 right: out_w as i32,
                 bottom: out_h as i32,
             };
-            self.video_context
-                .VideoProcessorSetStreamSourceRect(&state.processor, 0, true, Some(&src_rect));
-            self.video_context
-                .VideoProcessorSetStreamDestRect(&state.processor, 0, true, Some(&dst_rect));
+            self.video_context.VideoProcessorSetStreamSourceRect(
+                &state.processor,
+                0,
+                true,
+                Some(&src_rect),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &state.processor,
+                0,
+                true,
+                Some(&dst_rect),
+            );
         }
 
         // 100 frame ごとに 1 行診断ログ (= ~1.6 秒に 1 行 @ 60fps)。
@@ -579,15 +583,11 @@ impl GpuVideoDevice {
                         crate::logger::log(format!(
                             "KeyedMutex AcquireSync(0) timeout/err: {e:?} — skipping frame"
                         ));
-                        return Err(GpuVideoError::Blt(format!(
-                            "KeyedMutex AcquireSync: {e:?}"
-                        )));
+                        return Err(GpuVideoError::Blt(format!("KeyedMutex AcquireSync: {e:?}")));
                     }
                 },
                 Err(e) => {
-                    crate::logger::log(format!(
-                        "cast IDXGIKeyedMutex failed: {e:?}"
-                    ));
+                    crate::logger::log(format!("cast IDXGIKeyedMutex failed: {e:?}"));
                     None
                 }
             };
@@ -600,9 +600,7 @@ impl GpuVideoDevice {
             if let Some(km) = km_acquired {
                 if let Err(e) = km.ReleaseSync(1) {
                     crate::logger::log(format!("KeyedMutex ReleaseSync(1) failed: {e:?}"));
-                    return Err(GpuVideoError::Blt(format!(
-                        "KeyedMutex ReleaseSync: {e:?}"
-                    )));
+                    return Err(GpuVideoError::Blt(format!("KeyedMutex ReleaseSync: {e:?}")));
                 }
             }
             self.context.Flush();
@@ -761,8 +759,8 @@ impl GpuVideoDevice {
         format: DXGI_FORMAT,
     ) -> Result<(ID3D11Texture2D, HANDLE), GpuVideoError> {
         let bind_flags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
-        let misc_flags =
-            (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32;
+        let misc_flags = (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
+            | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32;
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -798,12 +796,8 @@ impl GpuVideoDevice {
             .cast()
             .map_err(|e| GpuVideoError::SharedHandle(format!("cast IDXGIResource1: {e:?}")))?;
         let handle = unsafe {
-            dxgi.CreateSharedHandle(
-                None,
-                windows::Win32::Foundation::GENERIC_ALL.0,
-                None,
-            )
-            .map_err(|e| GpuVideoError::SharedHandle(format!("{e:?}")))?
+            dxgi.CreateSharedHandle(None, windows::Win32::Foundation::GENERIC_ALL.0, None)
+                .map_err(|e| GpuVideoError::SharedHandle(format!("{e:?}")))?
         };
         Ok((tex, handle))
     }

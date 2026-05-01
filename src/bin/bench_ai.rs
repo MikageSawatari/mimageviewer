@@ -198,7 +198,9 @@ fn print_help() {
     println!("                          (image, model, tile_size) for visual comparison.");
     println!("  --backend <NAME>        AI backend: directml (default), tensorrt, cpu");
     println!("                          tensorrt requires the pack to be installed at");
-    println!("                          %APPDATA%/mimageviewer/tensorrt/ (run scripts/setup-tensorrt-pack.ps1)");
+    println!(
+        "                          %APPDATA%/mimageviewer/tensorrt/ (run scripts/setup-tensorrt-pack.ps1)"
+    );
     println!("  --json <PATH>           Write a JSON summary of all (image,model,tile) results");
     println!("                          for later cross-backend comparison");
     println!("  --help, -h              Show this help\n");
@@ -260,10 +262,15 @@ fn main() {
                 "ERROR: ワーカー用 mimageviewer.exe が見つからない: {}",
                 main_exe.display()
             );
-            eprintln!("  cargo build --release でメインバイナリも一緒にビルドしてから再実行してください。");
+            eprintln!(
+                "  cargo build --release でメインバイナリも一緒にビルドしてから再実行してください。"
+            );
             std::process::exit(1);
         }
-        println!("Spawning TRT worker pool (sync, worker={})...", main_exe.display());
+        println!(
+            "Spawning TRT worker pool (sync, worker={})...",
+            main_exe.display()
+        );
         let t0 = std::time::Instant::now();
         match mimageviewer::ai::trt_worker_pool::TrtWorkerPool::start_with_exe(&main_exe) {
             Ok(pool) => {
@@ -273,7 +280,9 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("ERROR: failed to start TRT worker pool: {e}");
-                eprintln!("  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/.");
+                eprintln!(
+                    "  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/."
+                );
                 eprintln!("  Run scripts/setup-tensorrt-pack.ps1 to install it, then retry.");
                 std::process::exit(1);
             }
@@ -599,7 +608,7 @@ fn print_model_summary(
     );
 
     BenchRecord {
-        image: String::new(),  // 呼び出し側で詰める
+        image: String::new(), // 呼び出し側で詰める
         image_w: in_w,
         image_h: in_h,
         model: label.to_string(),

@@ -29,8 +29,7 @@ use crate::video::tile_thumbnails::{TileThumbnail, TileThumbnailWorker};
 /// 候補となる間隔 (秒)。タイル数が画面に収まる範囲で最大の間隔を選ぶ
 /// (= タイル数最少 = 抽出待ち最短)。
 const INTERVAL_CANDIDATES_SECS: &[f64] = &[
-    1.0, 2.0, 5.0, 10.0, 20.0, 30.0,
-    60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
+    1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
 ];
 
 /// タイルモード 1 セッション分の状態。S キー初回押下で生成、再押下で None に戻す。
@@ -65,8 +64,7 @@ impl App {
         // 列数の grid から切り替えるとき、古いキーで残った texture が誤マッチする
         // のを防ぐ)。
         self.video_tile_textures.clear();
-        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
-        else {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
         let Some(info) = player.info().cloned() else {
@@ -262,10 +260,8 @@ impl App {
             let row = idx / columns;
             let x0 = grid_left + (tile_w + gap_x) * col as f32;
             let y0 = grid_top + (tile_h + label_h + gap_y) * row as f32;
-            let tile_rect = egui::Rect::from_min_size(
-                egui::pos2(x0, y0),
-                egui::vec2(tile_w, tile_h),
-            );
+            let tile_rect =
+                egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(tile_w, tile_h));
             // 画面下端を超えるタイルはスキップ (描画しない、列の続きが画面外に出る場合)
             if tile_rect.max.y > full_rect.max.y - 20.0 {
                 continue;
@@ -403,7 +399,12 @@ impl App {
         slot_idx: usize,
         thumb: &TileThumbnail,
     ) -> egui::TextureId {
-        let key = (slot_idx as u64, thumb.pts_secs.to_bits(), thumb.width, thumb.height);
+        let key = (
+            slot_idx as u64,
+            thumb.pts_secs.to_bits(),
+            thumb.width,
+            thumb.height,
+        );
         // 既存キャッシュにヒットすればそのまま返す
         if let Some((k, tex)) = self.video_tile_textures.get(&slot_idx) {
             if *k == key {

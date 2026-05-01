@@ -1325,9 +1325,7 @@ impl Settings {
         // (Codex P3 2026-05-01)。
         // legacy migration field (deprecated path/state) のみ App 側を残す。
         for entry in self.vst3_plugins.iter_mut() {
-            if let Some(latest) =
-                src.vst3_plugins.iter().find(|e| e.path == entry.path)
-            {
+            if let Some(latest) = src.vst3_plugins.iter().find(|e| e.path == entry.path) {
                 entry.bypass = latest.bypass;
                 entry.user_hidden = latest.user_hidden;
                 // gui_pos / gui_size / state は runtime 側で更新される field なので、

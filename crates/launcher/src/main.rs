@@ -146,11 +146,11 @@ fn ensure_asset(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// 前面に戻す。`true` を返したら呼び出し側はランチャーを即終了する。
 #[cfg(windows)]
 fn try_activate_existing() -> bool {
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        EVENT_MODIFY_STATE, OpenEventW, OpenMutexW, SetEvent, SYNCHRONIZATION_ACCESS_RIGHTS,
+        EVENT_MODIFY_STATE, OpenEventW, OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent,
     };
+    use windows::core::PCWSTR;
 
     // build.rs が src/single_instance.rs から抜き出して注入する。
     // core 側の定数を変えれば次のビルドで自動的に反映される。
@@ -162,8 +162,7 @@ fn try_activate_existing() -> bool {
     const SYNCHRONIZE: SYNCHRONIZATION_ACCESS_RIGHTS = SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000);
 
     let mutex_wide = wide_nul(MUTEX_NAME);
-    let Ok(mutex_handle) =
-        (unsafe { OpenMutexW(SYNCHRONIZE, false, PCWSTR(mutex_wide.as_ptr())) })
+    let Ok(mutex_handle) = (unsafe { OpenMutexW(SYNCHRONIZE, false, PCWSTR(mutex_wide.as_ptr())) })
     else {
         // Mutex 不在 → 既存 core なし → 通常の起動経路へ
         return false;

@@ -137,11 +137,11 @@ fn run_worker(
     cache: Option<Arc<TileThumbCache>>,
     video_mtime: i64,
 ) {
-    use ffmpeg_the_third as ffmpeg;
     use ffmpeg::format::Pixel;
     use ffmpeg::media::Type as MediaType;
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
     use ffmpeg::util::frame::video::Video;
+    use ffmpeg_the_third as ffmpeg;
 
     // 起動直後にキャッシュをまとめてチェックして state に load。残った None スロット
     // だけが ffmpeg 抽出の対象。キーは絶対 PTS なので間隔切替時にも再利用される。
@@ -254,7 +254,12 @@ fn run_worker(
         let target_pts = (target_secs * 1_000_000.0) as i64;
         let seek_ok = unsafe {
             use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-            av_seek_frame(input.as_mut_ptr(), -1, target_pts, AVSEEK_FLAG_BACKWARD as i32) >= 0
+            av_seek_frame(
+                input.as_mut_ptr(),
+                -1,
+                target_pts,
+                AVSEEK_FLAG_BACKWARD as i32,
+            ) >= 0
         };
         if !seek_ok {
             continue;
@@ -328,14 +333,9 @@ fn run_worker(
             // q=70: グリッドサムネと同等品位、サイズ優先
             let webp_bytes = encoder.encode(70.0).to_vec();
             let timestamp_ms = (target_secs * 1000.0).round() as i64;
-            if let Err(e) = c.store_webp(
-                &path,
-                max_w,
-                timestamp_ms,
-                video_mtime,
-                dst_h,
-                &webp_bytes,
-            ) {
+            if let Err(e) =
+                c.store_webp(&path, max_w, timestamp_ms, video_mtime, dst_h, &webp_bytes)
+            {
                 crate::logger::log(format!("video-tile-thumb cache store failed: {e}"));
             }
         }
@@ -353,7 +353,6 @@ fn run_worker(
         }
     }
 }
-
 
 fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 {

@@ -86,9 +86,8 @@ pub(crate) fn collect_counts(
 
 pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
     let data_dir = crate::data_dir::get();
-    let file_size = |p: &std::path::Path| -> u64 {
-        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-    };
+    let file_size =
+        |p: &std::path::Path| -> u64 { std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) };
     let dir_size = |p: &std::path::Path| -> u64 {
         let Ok(entries) = std::fs::read_dir(p) else {
             return 0;
@@ -161,8 +160,7 @@ impl App {
         if let Some(rx) = self.favorites_index_refresh_rx.as_ref() {
             match rx.try_recv() {
                 Ok((counts, sizes)) => {
-                    self.favorites_index_count_cache =
-                        Some((std::time::Instant::now(), counts));
+                    self.favorites_index_count_cache = Some((std::time::Instant::now(), counts));
                     self.favorites_index_size_cache = Some(sizes);
                     self.favorites_index_refresh_rx = None;
                 }
@@ -841,12 +839,7 @@ fn aggregate_total_eta(etas: &[crate::indexer_progress::EtaSnapshot]) -> Option<
 /// - else: ⏳ 準備中 (supervisor 起動済みだが scan 未着手)
 ///
 /// `file_count > 0` のときは末尾に `(123,456件)` を付ける。
-fn draw_state_inline(
-    ui: &mut egui::Ui,
-    on: bool,
-    flags: Option<(bool, bool)>,
-    file_count: u64,
-) {
+fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, file_count: u64) {
     if !on {
         ui.label(
             egui::RichText::new("—")
@@ -870,4 +863,3 @@ fn draw_state_inline(
     };
     ui.label(egui::RichText::new(text).size(11.0).color(color));
 }
-

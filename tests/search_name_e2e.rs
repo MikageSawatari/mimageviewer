@@ -193,10 +193,8 @@ fn two_supervisors_complete_in_parallel() {
     // 同じ data_dir 配下の search_index.db を共有する (A / B 双方から書き込み)
     std::fs::create_dir_all(data.path()).ok();
     let db = std::sync::Arc::new(
-        mimageviewer::search_index_db::SearchIndexDb::open_at(
-            &data.path().join("search_index.db"),
-        )
-        .unwrap(),
+        mimageviewer::search_index_db::SearchIndexDb::open_at(&data.path().join("search_index.db"))
+            .unwrap(),
     );
     let handle_a = mimageviewer::name_index_supervisor::spawn(
         fav_a.id,
@@ -247,7 +245,11 @@ fn query_supports_exclude_token() {
 
     // `animal -cat` → animal で始まるもののうち cat を含まないもの
     let hits = name_index_search(&db, "animal -cat", &roots);
-    assert_eq!(hits.len(), 1, "animal で cat でないのは dog のみ (got {hits:?})");
+    assert_eq!(
+        hits.len(),
+        1,
+        "animal で cat でないのは dog のみ (got {hits:?})"
+    );
     assert!(hits[0].display_name.contains("dog"));
 }
 
@@ -279,9 +281,8 @@ fn full_scan_removes_stale_entries_from_became_empty_folder() {
     // 索引化対象になるよう Q の中に画像を置く (folder 扱い用)
     write_png_plain(&q.join("cover.png"));
 
-    let db = Arc::new(
-        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
-    );
+    let db =
+        Arc::new(SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"));
     let cancel = AtomicBool::new(false);
 
     // Phase 1: 初期スキャン
@@ -354,9 +355,8 @@ fn nested_favorites_both_scopes_find_shared_path() {
     let sub = root.mkdir("photo/sub");
     write_png_plain(&sub.join("thumb.png"));
 
-    let db = Arc::new(
-        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
-    );
+    let db =
+        Arc::new(SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"));
     let cancel = AtomicBool::new(false);
 
     // お気に入り A (親) と B (子) を順番にバルク
@@ -468,9 +468,8 @@ fn full_scan_removes_offline_deleted_subtree() {
     write_png_plain(&q.join("cover.png")); // Q を folder エントリにするため
     write_empty_zip(&root.path().join("other.zip"));
 
-    let db = Arc::new(
-        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
-    );
+    let db =
+        Arc::new(SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"));
     let cancel = AtomicBool::new(false);
     let roots = vec![root.path().to_path_buf()];
 
@@ -553,9 +552,8 @@ fn prune_stale_does_not_touch_nested_sibling_favorite() {
     let fav_sub = root.mkdir("photo/fav");
     write_empty_zip(&fav_sub.join("x.zip"));
 
-    let db = Arc::new(
-        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
-    );
+    let db =
+        Arc::new(SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"));
     let cancel = AtomicBool::new(false);
 
     // Phase 1: 両 favorite でバルク
@@ -614,9 +612,8 @@ fn back_to_back_full_scans_prune_stale_without_sleep() {
     write_empty_zip(&q.join("a.zip"));
     write_png_plain(&q.join("cover.png"));
 
-    let db = Arc::new(
-        SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"),
-    );
+    let db =
+        Arc::new(SearchIndexDb::open_at(&data.path().join("search_index.db")).expect("open db"));
     let cancel = AtomicBool::new(false);
     let roots = vec![root.path().to_path_buf()];
 

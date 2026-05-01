@@ -1746,12 +1746,8 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         match std::thread::Builder::new()
             .name("pdf-enumerate-nav".into())
             .spawn(move || {
-                let resp = pool.execute(
-                    &req,
-                    Some(&cancel_w),
-                    JobPriority::Critical,
-                    Some(perf_key),
-                );
+                let resp =
+                    pool.execute(&req, Some(&cancel_w), JobPriority::Critical, Some(perf_key));
                 let result = resp.and_then(|bytes| PdfWorkerPool::parse_enumerate_response(&bytes));
                 let _ = tx.send(result);
             }) {

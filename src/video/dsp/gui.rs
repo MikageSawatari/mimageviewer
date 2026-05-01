@@ -30,8 +30,8 @@ use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, TranslateMessage, WINDOW_EX_STYLE,
+    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOMOVE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
     WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WNDCLASSEXW,
     WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
@@ -178,12 +178,7 @@ struct ThreadState {
 
 unsafe impl Send for ThreadState {}
 
-extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_PARENTNOTIFY => {
@@ -201,11 +196,8 @@ extern "system" fn wndproc(
             WM_CLOSE => {
                 // ユーザーが × を押した。メインスレッドに通知し、
                 // メインスレッドからの Cmd::Close を待つ (= ここでは破棄しない)。
-                let tx_opt: Option<Sender<()>> = THREAD_STATE.with(|s| {
-                    s.borrow()
-                        .as_ref()
-                        .and_then(|st| st.close_tx.clone())
-                });
+                let tx_opt: Option<Sender<()>> =
+                    THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.close_tx.clone()));
                 if let Some(tx) = tx_opt {
                     let _ = tx.send(());
                 }
@@ -218,11 +210,8 @@ extern "system" fn wndproc(
                 let w = (lparam_v & 0xFFFF) as u32;
                 let h = ((lparam_v >> 16) & 0xFFFF) as u32;
                 if w > 0 && h > 0 {
-                    let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE.with(|s| {
-                        s.borrow()
-                            .as_ref()
-                            .and_then(|st| st.resize_tx.clone())
-                    });
+                    let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE
+                        .with(|s| s.borrow().as_ref().and_then(|st| st.resize_tx.clone()));
                     if let Some(tx) = tx_opt {
                         let _ = tx.send((w, h));
                     }
@@ -263,11 +252,9 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
     // GUI スレッドで COM を STA 初期化しておかないとプラグイン GUI が
     // 真っ白でハングするケースがある (Pro-Q 4 など)。
     use windows::Win32::System::Com::{
-        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
     };
-    let co_hr = unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-    };
+    let co_hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
 
     // GUI スレッドの per-thread state を初期化
     THREAD_STATE.with(|s| {
@@ -301,7 +288,15 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             } => {
                 let result = create_window(&title, width, height, resizable, initial_pos);
                 match result {
-                    Ok((hwnd_u64, close_rx, resize_rx, resize_session_rx, actual_w, actual_h, used_dpi)) => {
+                    Ok((
+                        hwnd_u64,
+                        close_rx,
+                        resize_rx,
+                        resize_session_rx,
+                        actual_w,
+                        actual_h,
+                        used_dpi,
+                    )) => {
                         let _ = reply.send(ShowReply {
                             hwnd_u64,
                             actual_client_w: actual_w,
@@ -345,8 +340,8 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
 }
 
 fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
-    use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
     use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
+    use windows::Win32::UI::WindowsAndMessaging::PeekMessageW;
     unsafe {
         loop {
             // PeekMessage で非ブロッキング
@@ -396,7 +391,15 @@ fn create_window(
     height: u32,
     resizable: bool,
     initial_pos: Option<(i32, i32)>,
-) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, Receiver<bool>, u32, u32, u32)> {
+) -> std::io::Result<(
+    u64,
+    Receiver<()>,
+    Receiver<(u32, u32)>,
+    Receiver<bool>,
+    u32,
+    u32,
+    u32,
+)> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())
@@ -482,13 +485,7 @@ fn create_window(
             // ダブルクリックも無効化される。
             win_style &= !(WS_THICKFRAME | WS_MAXIMIZEBOX);
         }
-        let _ = AdjustWindowRectExForDpi(
-            &mut rect,
-            win_style,
-            false,
-            ex_style,
-            dpi,
-        );
+        let _ = AdjustWindowRectExForDpi(&mut rect, win_style, false, ex_style, dpi);
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
 
@@ -536,7 +533,15 @@ fn create_window(
                 st.resize_session_tx = Some(resize_session_tx);
             }
         });
-        Ok((hwnd.0 as u64, close_rx, resize_rx, resize_session_rx, actual_w, actual_h, dpi))
+        Ok((
+            hwnd.0 as u64,
+            close_rx,
+            resize_rx,
+            resize_session_rx,
+            actual_w,
+            actual_h,
+            dpi,
+        ))
     }
 }
 
@@ -594,7 +599,15 @@ pub fn bring_to_front(hwnd_u64: u64) {
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
     }
 }
 
@@ -606,9 +619,7 @@ pub fn bring_to_front(hwnd_u64: u64) {
 /// で再適用するために使う (= 元の前後関係を保つ、Codex P1 対応)。
 pub fn snapshot_z_order(targets: &[u64]) -> Vec<u64> {
     use windows::Win32::Foundation::{GetLastError, HWND as Hwnd2};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindow, GW_HWNDNEXT, GetTopWindow,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetTopWindow, GetWindow};
 
     if targets.is_empty() {
         return Vec::new();
@@ -663,11 +674,18 @@ pub fn set_window_topmost(hwnd_u64: u64, topmost: bool) {
     }
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
-        let z = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        let z = if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
         let _ = SetWindowPos(
             hwnd,
             Some(z),
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
@@ -713,6 +731,14 @@ pub fn resize_window_client(hwnd_u64: u64, width: u32, height: u32) {
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
         let hwnd = HWND(hwnd_u64 as *mut _);
-        let _ = SetWindowPos(hwnd, None, 0, 0, outer_w, outer_h, SWP_NOMOVE | SWP_NOZORDER);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            outer_w,
+            outer_h,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
     }
 }

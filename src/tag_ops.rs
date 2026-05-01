@@ -91,7 +91,11 @@ impl App {
         let summary = format!("#{name_owned} のトグル");
         self.optimistic_update_tags_cache(&paths, |before| {
             if before.iter().any(|t| t == &with_hash) {
-                before.iter().filter(|t| *t != &with_hash).cloned().collect()
+                before
+                    .iter()
+                    .filter(|t| *t != &with_hash)
+                    .cloned()
+                    .collect()
             } else {
                 let mut after = before.to_vec();
                 after.push(with_hash.clone());
@@ -341,21 +345,11 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join(" / ");
-            self.show_feedback_toast(format!(
-                "タグ書き込み失敗 {} 件: {}",
-                errors.len(),
-                preview
-            ));
+            self.show_feedback_toast(format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview));
         } else if just_completed && (added + removed + cleared + restored + noop) > 0 {
             let label = self.tag_toast_label.take();
-            let msg = format_completion_toast(
-                label.as_deref(),
-                added,
-                removed,
-                cleared,
-                restored,
-                noop,
-            );
+            let msg =
+                format_completion_toast(label.as_deref(), added, removed, cleared, restored, noop);
             self.show_feedback_toast(msg);
         }
         if just_completed {

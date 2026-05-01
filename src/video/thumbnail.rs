@@ -181,11 +181,11 @@ fn run_worker(
     state: Arc<Mutex<ThumbnailState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    use ffmpeg_the_third as ffmpeg;
     use ffmpeg::format::Pixel;
     use ffmpeg::media::Type as MediaType;
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
     use ffmpeg::util::frame::video::Video;
+    use ffmpeg_the_third as ffmpeg;
 
     if let Err(e) = ffmpeg::init() {
         crate::logger::log(format!("video-thumb: ffmpeg init failed: {e}"));
@@ -274,7 +274,12 @@ fn run_worker(
         let target_pts = (target_secs * 1_000_000.0) as i64;
         let seek_ok = unsafe {
             use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-            av_seek_frame(input.as_mut_ptr(), -1, target_pts, AVSEEK_FLAG_BACKWARD as i32) >= 0
+            av_seek_frame(
+                input.as_mut_ptr(),
+                -1,
+                target_pts,
+                AVSEEK_FLAG_BACKWARD as i32,
+            ) >= 0
         };
         if !seek_ok {
             continue;

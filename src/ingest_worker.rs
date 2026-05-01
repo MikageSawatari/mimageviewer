@@ -157,8 +157,8 @@ impl<'a> IngestSession<'a> {
         // 「FS にあるけど DB に無い」 / 「FS に無いし DB に無い」のいずれかとして
         // 検出可能)。
         let flush_batch = |batch_upserts: &mut Vec<IndexDoc>,
-                               batch_deletes: &mut Vec<String>,
-                               pending_ok_meta: &mut Vec<(String, IndexKind, i64, i64)>|
+                           batch_deletes: &mut Vec<String>,
+                           pending_ok_meta: &mut Vec<(String, IndexKind, i64, i64)>|
          -> tantivy::Result<()> {
             if batch_upserts.is_empty() && batch_deletes.is_empty() {
                 return Ok(());
@@ -167,13 +167,7 @@ impl<'a> IngestSession<'a> {
             let deletes = std::mem::take(batch_deletes);
             let deletes_for_sqlite = deletes.clone();
             let ok_meta = std::mem::take(pending_ok_meta);
-            writer.batch(
-                upserts,
-                deletes,
-                true,
-                true,
-                WriterPriority::Background,
-            )?;
+            writer.batch(upserts, deletes, true, true, WriterPriority::Background)?;
             // ここに来た時点で Tantivy commit + reader reload が完了している。
             // SQLite 側を Tantivy に合わせて更新する。
             for (key, kind, mtime, file_size) in &ok_meta {
@@ -252,20 +246,12 @@ impl<'a> IngestSession<'a> {
             drop(_permit);
             match built {
                 Ok(doc) => {
-                    pending_ok_meta.push((
-                        cand.key.clone(),
-                        doc.kind,
-                        cand.mtime,
-                        cand.file_size,
-                    ));
+                    pending_ok_meta.push((cand.key.clone(), doc.kind, cand.mtime, cand.file_size));
                     batch_upserts.push(doc);
                     stats.ingested_ok += 1;
                 }
                 Err(e) => {
-                    crate::logger::log(format!(
-                        "ingest: {:?} build failed: {e}",
-                        cand.abs_path
-                    ));
+                    crate::logger::log(format!("ingest: {:?} build failed: {e}", cand.abs_path));
                     // build 失敗時は Tantivy 投入も SQLite 書き込みも行わない。
                     // 次回起動の walker が「DB に無い」として再 ingest 候補に乗せる。
                     // 同じファイルが毎回失敗する場合は毎回再試行されるが、abusive な
@@ -288,7 +274,12 @@ impl<'a> IngestSession<'a> {
     }
 
     /// sub-batch 投入閾値判定 (旧 should_flush と同じセマンティクス、引数は件数のみ)。
-    fn batch_should_flush(&self, upsert_count: usize, delete_count: usize, last_flush: Instant) -> bool {
+    fn batch_should_flush(
+        &self,
+        upsert_count: usize,
+        delete_count: usize,
+        last_flush: Instant,
+    ) -> bool {
         let total = upsert_count + delete_count;
         total >= BATCH_FLUSH_COUNT || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
     }
@@ -404,7 +395,10 @@ mod tests {
     fn ingest_empty_queues_is_noop() {
         let (_tmp, meta, fts) = setup();
         let session = IngestSession::new(Uuid::new_v4(), PathBuf::from("C:/x"), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
         let stats = session
@@ -428,7 +422,10 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = tmp.path().to_path_buf();
         let session = IngestSession::new(fav, root.clone(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -477,7 +474,10 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -535,7 +535,10 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -631,7 +634,10 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(true); // 最初から cancel
 
@@ -656,7 +662,10 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -721,7 +730,10 @@ mod tests {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(fts.writer().unwrap(), std::sync::Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
         let sem = GlobalIoSemaphore::new(2);
         let cancel = AtomicBool::new(false);
 
@@ -731,15 +743,7 @@ mod tests {
             cands.push(make_image_file(tmp.path(), &format!("b{:03}.jpg", i)));
         }
         let stats = session
-            .apply(
-                cands,
-                vec![],
-                &writer,
-                &sem,
-                IoPriority::Low,
-                &cancel,
-                None,
-            )
+            .apply(cands, vec![], &writer, &sem, IoPriority::Low, &cancel, None)
             .unwrap();
         assert_eq!(stats.ingested_ok, 130);
         // 全 ok になっている

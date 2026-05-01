@@ -230,9 +230,17 @@ mod tests {
         }
     }
 
-    fn adjust_entry(scope: AdjustUndoScope, before: Option<AdjustParams>, after: Option<AdjustParams>) -> UndoEntry {
+    fn adjust_entry(
+        scope: AdjustUndoScope,
+        before: Option<AdjustParams>,
+        after: Option<AdjustParams>,
+    ) -> UndoEntry {
         UndoEntry::Adjustment {
-            changes: vec![AdjustmentChange { scope, before, after }],
+            changes: vec![AdjustmentChange {
+                scope,
+                before,
+                after,
+            }],
             summary: "adj".into(),
         }
     }

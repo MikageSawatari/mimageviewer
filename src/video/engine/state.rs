@@ -230,7 +230,10 @@ mod tests {
         let mut l = ReadinessLatch::new(1);
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
-        assert!(l.is_ready(false), "video-only: first_frame alone should suffice");
+        assert!(
+            l.is_ready(false),
+            "video-only: first_frame alone should suffice"
+        );
         // has_audio=true ではまだ不足
         assert!(!l.is_ready(true), "with audio: buffer_ready also required");
     }
@@ -240,7 +243,10 @@ mod tests {
         let mut l = ReadinessLatch::new(2);
         l.buffer_ready = true;
         l.audio_anchor = Some((10.0, Instant::now()));
-        assert!(!l.is_ready(true), "buffer_ready alone: not ready (need first_frame)");
+        assert!(
+            !l.is_ready(true),
+            "buffer_ready alone: not ready (need first_frame)"
+        );
         l.first_frame = true;
         l.first_frame_pts = Some(10.0);
         assert!(l.is_ready(true), "first_frame + buffer_ready: ready");
@@ -324,7 +330,10 @@ mod tests {
         let mut l = ReadinessLatch::new(5);
         l.first_frame = true;
         l.first_frame_pts = Some(0.0);
-        assert!(!l.is_ready(true), "has_audio=true, no buffer_ready: not ready");
+        assert!(
+            !l.is_ready(true),
+            "has_audio=true, no buffer_ready: not ready"
+        );
         assert!(l.is_ready(false), "has_audio=false (audio inactive): ready");
     }
 

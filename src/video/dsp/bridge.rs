@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS,
-    PAGE_READWRITE,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    PAGE_READWRITE, UnmapViewOfFile,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
@@ -58,7 +58,9 @@ pub fn shm_size_bytes(capacity_samples: u32) -> u64 {
 #[serde(tag = "cmd")]
 #[serde(rename_all = "lowercase")]
 pub enum Cmd {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Open {
         plugin_path: String,
         sample_rate: u32,
@@ -76,12 +78,16 @@ pub enum Cmd {
     /// シーク等で plugin の内部状態を flush する。`reset_id` は generation ID で、
     /// stale ack race を防ぐ (= timeout した過去 reset の ack が次回成功と誤認されない)。
     /// bridge は `Event::ResetDone { reset_id }` で同じ ID を返す。
-    Reset { reset_id: u64 },
+    Reset {
+        reset_id: u64,
+    },
     Close,
     Shutdown,
     /// プラグイン GUI を指定 HWND にアタッチする。
     #[serde(rename = "show_gui")]
-    ShowGui { hwnd: u64 },
+    ShowGui {
+        hwnd: u64,
+    },
     /// プラグイン GUI を外す。HWND の破棄は host 側の責務。
     #[serde(rename = "hide_gui")]
     HideGui,
@@ -93,18 +99,25 @@ pub enum Cmd {
     /// ホストウィンドウのリサイズが起きたことをプラグインに通知する。
     /// bridge は view->onSize(rect) を呼んでプラグインの子ウィンドウを追従させる。
     #[serde(rename = "notify_host_resize")]
-    NotifyHostResize { width: u32, height: u32 },
+    NotifyHostResize {
+        width: u32,
+        height: u32,
+    },
     /// 診断用: bridge 内で plugin を経由せずに in→out 単純コピーする。
     /// 歪みが消えれば plugin process が原因、残れば bridge パイプラインが原因。
     #[serde(rename = "set_passthrough")]
-    SetPassthrough { enable: u32 },
+    SetPassthrough {
+        enable: u32,
+    },
     /// ユーザー drag によるリサイズが進行中かを bridge に通知する。
     /// `active=true` 中、bridge は plugin の `resizeView` callback で host HWND
     /// への `SetWindowPos` をスキップする (= ユーザー drag と plugin リサイズ要求の
     /// 衝突によるウィンドウ振動を抑止、Codex P4)。
     /// Rust 側 wndproc が `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` を受けて発行する。
     #[serde(rename = "set_user_resizing")]
-    SetUserResizing { active: u32 },
+    SetUserResizing {
+        active: u32,
+    },
     /// プラグイン内部状態 (= EQ カーブ / chunk) を base64 文字列で取得する。
     /// 応答は `Event::PluginState`。終了時 / 永続化トリガで一度だけ呼ぶ想定。
     #[serde(rename = "query_state")]
@@ -113,19 +126,25 @@ pub enum Cmd {
     /// bridge 側で `IComponent::setState` で復元する。fire-and-forget (= ack 無し)。
     /// 失敗時は bridge 側で `Event::Error` を発行する。
     #[serde(rename = "restore_state")]
-    RestoreState { state: String },
+    RestoreState {
+        state: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "event")]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
-    Ready { version: u32 },
+    Ready {
+        version: u32,
+    },
     Loaded {
         plugin_name: String,
         latency_samples: u32,
     },
-    LatencyChanged { latency_samples: u32 },
+    LatencyChanged {
+        latency_samples: u32,
+    },
     /// `Cmd::Reset { reset_id }` への応答。同じ `reset_id` をエコーで返す。
     /// 待機側はこれを照合して「自分が送った reset の ack か」を判定する
     /// (= stale ack race 防止、Codex 助言、2026-05-01)。
@@ -134,8 +153,13 @@ pub enum Event {
         reset_id: u64,
     },
     Closed,
-    Error { detail: String },
-    GuiAttached { width: u32, height: u32 },
+    Error {
+        detail: String,
+    },
+    GuiAttached {
+        width: u32,
+        height: u32,
+    },
     GuiDetached,
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
     /// `resizable` は IPlugView::canResize() の結果 (= ホスト側が WS_THICKFRAME を
@@ -147,7 +171,9 @@ pub enum Event {
         resizable: bool,
     },
     /// `Cmd::QueryState` の応答。プラグイン内部状態を base64 文字列で受け取る。
-    PluginState { state: String },
+    PluginState {
+        state: String,
+    },
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
@@ -252,8 +278,7 @@ impl Bridge {
         // bridge が exit すると stdout EOF → pump 終了 → channel sender drop → recv() で
         // disconnected error。
         let cached_latency = Arc::new(AtomicU32::new(u32::MAX));
-        let (event_tx, event_rx) =
-            crossbeam_channel::bounded::<std::io::Result<Event>>(64);
+        let (event_tx, event_rx) = crossbeam_channel::bounded::<std::io::Result<Event>>(64);
         // ResetDone 専用 ack channel。bridge audio thread が reset 実行後に流す
         // `Event::ResetDone { reset_id }` の reset_id をここに送る。
         // `wait_reset_done(expected_id)` が照合してから受理する (= stale ack 排除)。
@@ -340,9 +365,7 @@ impl Bridge {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         if let Err(e) = self.send(&Cmd::Reset { reset_id: id }) {
-            crate::logger::log(format!(
-                "[VST3] reset_sync: send failed for id={id}: {e}"
-            ));
+            crate::logger::log(format!("[VST3] reset_sync: send failed for id={id}: {e}"));
             return false;
         }
         // ID 照合 loop (= 一致するまで old/future を drop)
@@ -360,7 +383,7 @@ impl Bridge {
                     ));
                     // 続行して expected を待つ
                 }
-                Err(_) => return false,  // timeout
+                Err(_) => return false, // timeout
             }
         }
     }
@@ -377,11 +400,9 @@ impl Bridge {
     /// 期待外の event (= Error / 旧 reset 等) は **drop してログ** し、期待 event を
     /// 待ち続ける (= 他の同期 IPC と混線しないが、想定外があれば情報として残す)。
     /// 戻り値: Ok(state_b64) | Err(原因)。
-    pub fn query_state_sync(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<String, String> {
-        self.send(&Cmd::QueryState).map_err(|e| format!("send: {e}"))?;
+    pub fn query_state_sync(&self, timeout: std::time::Duration) -> Result<String, String> {
+        self.send(&Cmd::QueryState)
+            .map_err(|e| format!("send: {e}"))?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let now = std::time::Instant::now();
@@ -456,7 +477,6 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
 }
 
 impl Bridge {
-
     /// shared memory + named events を作って bridge にアタッチさせる。
     /// `initial_state` を渡すと bridge が audio_thread 起動前にプラグイン内部状態を
     /// 復元する (Codex P2-3、2026-05-01: race-free な auto-restore のため state は
@@ -499,7 +519,12 @@ impl Bridge {
                 (shm_size & 0xFFFF_FFFF) as u32,
                 PCWSTR(wname.as_ptr()),
             )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("CreateFileMappingW: {e}")))?;
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("CreateFileMappingW: {e}"),
+                )
+            })?;
             let base = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, shm_size as usize);
             if base.Value.is_null() {
                 let _ = CloseHandle(handle);
@@ -525,11 +550,19 @@ impl Bridge {
 
             // events
             let win = HSTRING::from(sig_in_name.as_str());
-            let sig_in = CreateEventW(None, false, false, PCWSTR(win.as_ptr()))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("CreateEventW sig_in: {e}")))?;
+            let sig_in = CreateEventW(None, false, false, PCWSTR(win.as_ptr())).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("CreateEventW sig_in: {e}"),
+                )
+            })?;
             let wout = HSTRING::from(sig_out_name.as_str());
-            let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr()))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("CreateEventW sig_out: {e}")))?;
+            let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr())).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("CreateEventW sig_out: {e}"),
+                )
+            })?;
             self.sig_in = Some(EventHandle {
                 handle: sig_in,
                 name: sig_in_name.clone(),
@@ -559,12 +592,19 @@ impl Bridge {
     /// `samples` は f32 packed stereo。
     #[cfg(windows)]
     pub fn push_audio(&self, samples: &[f32]) -> std::io::Result<()> {
-        let shm = self.shm.as_ref().ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
-        let sig_in = self.sig_in.as_ref().ok_or_else(|| std::io::Error::other("sig_in missing"))?;
+        let shm = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
+        let sig_in = self
+            .sig_in
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("sig_in missing"))?;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
             let cap = std::ptr::addr_of!((*header).capacity).read_unaligned();
-            let in_ring = (shm.base.Value as *mut u8).add(std::mem::size_of::<ShmHeader>()) as *mut f32;
+            let in_ring =
+                (shm.base.Value as *mut u8).add(std::mem::size_of::<ShmHeader>()) as *mut f32;
 
             let w_pos = (*header).in_write.load(Ordering::Relaxed);
             // overflow 防止のため modulo 操作を慎重に
@@ -572,7 +612,9 @@ impl Bridge {
                 let idx = (w_pos.wrapping_add(i as u32)) % cap;
                 in_ring.add(idx as usize).write(s);
             }
-            (*header).in_write.store(w_pos.wrapping_add(samples.len() as u32), Ordering::Release);
+            (*header)
+                .in_write
+                .store(w_pos.wrapping_add(samples.len() as u32), Ordering::Release);
             let _ = SetEvent(sig_in.handle);
         }
         Ok(())
@@ -592,13 +634,20 @@ impl Bridge {
     /// 必要量が揃うまで何度でも sig_out を待ち直し、deadline で切り上げる。
     #[cfg(windows)]
     pub fn pull_audio(&self, dst: &mut [f32], timeout_ms: u32) -> std::io::Result<usize> {
-        let shm = self.shm.as_ref().ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
-        let sig_out = self.sig_out.as_ref().ok_or_else(|| std::io::Error::other("sig_out missing"))?;
+        let shm = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
+        let sig_out = self
+            .sig_out
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("sig_out missing"))?;
         let want = dst.len() as u32;
         if want == 0 {
             return Ok(0);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
         let mut total_taken: u32 = 0;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
@@ -668,7 +717,10 @@ impl Drop for Bridge {
             let _ = s.name; // suppress unused
             let _ = s.size;
         }
-        for h in [self.sig_in.take(), self.sig_out.take()].into_iter().flatten() {
+        for h in [self.sig_in.take(), self.sig_out.take()]
+            .into_iter()
+            .flatten()
+        {
             unsafe {
                 let _ = CloseHandle(h.handle);
             }

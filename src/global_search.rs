@@ -160,8 +160,7 @@ pub fn run(
         target: scope.target.clone(),
         mode: scope.mode,
     };
-    let Some(query) =
-        fts_index::build_bigram_and_query(fts.fields(), &include_tokens, &filters)
+    let Some(query) = fts_index::build_bigram_and_query(fts.fields(), &include_tokens, &filters)
     else {
         // bigram が作れない (どこかのトークンが 1 文字等) → early return
         let _ = tx.send(SearchStreamEvent::Done {

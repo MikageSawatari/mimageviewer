@@ -328,10 +328,8 @@ impl App {
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
             #[cfg_attr(not(windows), allow(unused_mut))]
-            let mut new_state = PreferencesState::from_settings(
-                &self.settings,
-                self.ai_runtime.as_deref(),
-            );
+            let mut new_state =
+                PreferencesState::from_settings(&self.settings, self.ai_runtime.as_deref());
             // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
             #[cfg(windows)]
             {
@@ -357,10 +355,7 @@ impl App {
                     } else {
                         0.0
                     };
-                    (
-                        s.plugin_name.unwrap_or_else(|| "(不明)".to_string()),
-                        ms,
-                    )
+                    (s.plugin_name.unwrap_or_else(|| "(不明)".to_string()), ms)
                 })
                 .collect();
         }
@@ -511,7 +506,9 @@ impl App {
                 // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
                 // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
                 // Settings に追加した場合はここにも追記が必要。
-                state.settings.overwrite_non_preferences_from(&mut self.settings);
+                state
+                    .settings
+                    .overwrite_non_preferences_from(&mut self.settings);
 
                 self.settings = state.settings;
                 self.settings.save();
@@ -556,8 +553,7 @@ impl App {
                             // VST3 OFF へのトグル: bridge teardown 前に内部状態と
                             // ウィンドウ位置を保存 (= 次回 ON 時の復元用)。
                             let states = self.snapshot_vst3_states_into_settings();
-                            let positions =
-                                self.snapshot_vst3_window_positions_into_settings();
+                            let positions = self.snapshot_vst3_window_positions_into_settings();
                             if states > 0 || positions > 0 {
                                 self.settings.save();
                             }
@@ -836,7 +832,10 @@ fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(2.0);
     // フォルダ (アドレスバー) は他のツールバーセクションと別位置 (= ツールバー
     // とは別のアドレスバー帯) に出るので、最後にまとめて表示。
-    ui.checkbox(&mut s.show_toolbar_folder, "フォルダ (アドレスバー、別の場所に表示)");
+    ui.checkbox(
+        &mut s.show_toolbar_folder,
+        "フォルダ (アドレスバー、別の場所に表示)",
+    );
 }
 
 fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -1055,10 +1054,7 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     // 起動時にフォールバックが起きた場合のバナー
     if let Some(reason) = &state.current_runtime_fallback_reason {
-        ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 50),
-            format!("⚠ {reason}"),
-        );
+        ui.colored_label(egui::Color32::from_rgb(220, 160, 50), format!("⚠ {reason}"));
         ui.add_space(8.0);
     }
 
@@ -1074,9 +1070,15 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label("バックエンド:");
     let mut new_choice = current_choice;
     ui.horizontal(|ui| {
-        ui.radio_value(&mut new_choice, AiBackend::DirectMl, "DirectML (デフォルト)");
-        let trt_resp =
-            ui.add_enabled(nvidia, egui::RadioButton::new(new_choice == AiBackend::TensorRt, "TensorRT"));
+        ui.radio_value(
+            &mut new_choice,
+            AiBackend::DirectMl,
+            "DirectML (デフォルト)",
+        );
+        let trt_resp = ui.add_enabled(
+            nvidia,
+            egui::RadioButton::new(new_choice == AiBackend::TensorRt, "TensorRT"),
+        );
         if trt_resp.clicked() && nvidia {
             new_choice = AiBackend::TensorRt;
         }
@@ -1165,10 +1167,7 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .small(),
             );
             ui.add_space(4.0);
-            if ui
-                .button("エンジンキャッシュを削除")
-                .clicked()
-            {
+            if ui.button("エンジンキャッシュを削除").clicked() {
                 // Codex P3-2: ボタンクリックで即削除ではなく、確認ダイアログを開く
                 // (= 他のキャッシュ管理 UI と挙動を揃える)
                 state.trt_cache_delete_confirm_open = true;
@@ -1186,9 +1185,7 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                             "エンジンキャッシュ ({} MiB) を削除します。",
                             state.trt_engine_cache_size_mib
                         ));
-                        ui.label(
-                            "再ダウンロードに 5〜15 分かかります。実行してよろしいですか?",
-                        );
+                        ui.label("再ダウンロードに 5〜15 分かかります。実行してよろしいですか?");
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("削除する").clicked() {
@@ -1345,9 +1342,7 @@ fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    ui.label(
-        "閉じるボタンを押したときのアプリ終了挙動と、常駐中のインデックス処理を制御します。",
-    );
+    ui.label("閉じるボタンを押したときのアプリ終了挙動と、常駐中のインデックス処理を制御します。");
     ui.add_space(10.0);
 
     ui.label(egui::RichText::new("閉じるボタンの挙動").strong());
@@ -1453,11 +1448,14 @@ fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(10.0);
 
-    ui.checkbox(&mut s.update_check_enabled, "新バージョンを自動的に確認する")
-        .on_hover_text(
-            "ON (既定): 起動時と 24 時間ごとに GitHub のリリースページに問い合わせ。\n\
+    ui.checkbox(
+        &mut s.update_check_enabled,
+        "新バージョンを自動的に確認する",
+    )
+    .on_hover_text(
+        "ON (既定): 起動時と 24 時間ごとに GitHub のリリースページに問い合わせ。\n\
              OFF: 自動確認を行いません。ヘルプメニューの「更新を確認…」で手動確認は可能。",
-        );
+    );
 
     ui.add_space(8.0);
     ui.label(
@@ -1475,9 +1473,7 @@ fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(6.0);
 
     if let Some(ref skipped) = s.update_check_dismissed_version.clone() {
-        ui.label(format!(
-            "現在「{skipped}」の通知は非表示にしています。"
-        ));
+        ui.label(format!("現在「{skipped}」の通知は非表示にしています。"));
         if ui.button("通知を再度有効にする").clicked() {
             s.update_check_dismissed_version = None;
         }
@@ -1485,11 +1481,7 @@ fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 
     ui.label(
-        egui::RichText::new(format!(
-            "現在のバージョン: v{}",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .size(12.0),
+        egui::RichText::new(format!("現在のバージョン: v{}", env!("CARGO_PKG_VERSION"))).size(12.0),
     );
     ui.add_space(4.0);
     if ui.button("リリース履歴を開く").clicked() {
@@ -1500,24 +1492,19 @@ fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState) {
 fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 
-    ui.label(
-        egui::RichText::new("ハードウェアデコード").strong(),
-    );
+    ui.label(egui::RichText::new("ハードウェアデコード").strong());
     ui.add_space(4.0);
     ui.label(
         "GPU の動画デコード機能 (Direct3D 11) を使って HEVC / 4K 動画の CPU 負荷を下げます。\n\
          ドライバ非対応や初期化失敗の場合は自動的に CPU デコードに切り替わります。",
     );
     ui.add_space(6.0);
-    ui.checkbox(
-        &mut s.video_hw_decode,
-        "ハードウェアデコードを有効にする",
-    )
-    .on_hover_text(
-        "ON: 対応コーデックは GPU でデコード (失敗時は CPU に自動フォールバック)。\n\
+    ui.checkbox(&mut s.video_hw_decode, "ハードウェアデコードを有効にする")
+        .on_hover_text(
+            "ON: 対応コーデックは GPU でデコード (失敗時は CPU に自動フォールバック)。\n\
          OFF (既定): 常に CPU でデコード。\n\
          切り替え後は次に開く動画から反映されます。",
-    );
+        );
 
     ui.add_space(12.0);
     ui.separator();
@@ -1625,11 +1612,9 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if !state.settings.vst3_enabled {
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new(
-                "(チェーンの編集は VST3 プラグイン処理を ON にすると操作できます)",
-            )
-            .weak()
-            .small(),
+            egui::RichText::new("(チェーンの編集は VST3 プラグイン処理を ON にすると操作できます)")
+                .weak()
+                .small(),
         );
         return;
     }
@@ -1660,8 +1645,10 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // ── チェーン編集 ──
     let chain_len = state.settings.vst3_plugins.len();
     ui.label(
-        egui::RichText::new(format!("プラグインチェーン ({chain_len}/{MAX_CHAIN_LEN} 個)"))
-            .strong(),
+        egui::RichText::new(format!(
+            "プラグインチェーン ({chain_len}/{MAX_CHAIN_LEN} 個)"
+        ))
+        .strong(),
     );
     ui.label(
         egui::RichText::new(
@@ -1690,34 +1677,31 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     .unwrap_or("(不明)");
                 ui.label(egui::RichText::new(name).strong())
                     .on_hover_text(entry.path.as_str());
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("チェーンから削除")
-                            .clicked()
-                        {
-                            clicked_remove = Some(idx);
-                        }
-                        let down_enabled = idx + 1 < total;
-                        if ui
-                            .add_enabled(down_enabled, egui::Button::new("↓").small())
-                            .on_hover_text("下へ")
-                            .clicked()
-                        {
-                            clicked_move_down = Some(idx);
-                        }
-                        let up_enabled = idx > 0;
-                        if ui
-                            .add_enabled(up_enabled, egui::Button::new("↑").small())
-                            .on_hover_text("上へ")
-                            .clicked()
-                        {
-                            clicked_move_up = Some(idx);
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("チェーンから削除")
+                        .clicked()
+                    {
+                        clicked_remove = Some(idx);
+                    }
+                    let down_enabled = idx + 1 < total;
+                    if ui
+                        .add_enabled(down_enabled, egui::Button::new("↓").small())
+                        .on_hover_text("下へ")
+                        .clicked()
+                    {
+                        clicked_move_down = Some(idx);
+                    }
+                    let up_enabled = idx > 0;
+                    if ui
+                        .add_enabled(up_enabled, egui::Button::new("↑").small())
+                        .on_hover_text("上へ")
+                        .clicked()
+                    {
+                        clicked_move_up = Some(idx);
+                    }
+                });
             });
         }
     }
@@ -1748,9 +1732,7 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         };
         if ui
             .button(scan_label)
-            .on_hover_text(
-                "%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査して .vst3 を列挙",
-            )
+            .on_hover_text("%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査して .vst3 を列挙")
             .clicked()
         {
             state.vst3_discovered =

@@ -969,7 +969,8 @@ impl App {
         if changed {
             let ai_changed = !original.ai_settings_eq(&edit_params);
             if is_dragging {
-                self.adjustment_page_params.insert(fs_idx, edit_params.clone());
+                self.adjustment_page_params
+                    .insert(fs_idx, edit_params.clone());
             } else {
                 let before = self
                     .adjustment_drag_session

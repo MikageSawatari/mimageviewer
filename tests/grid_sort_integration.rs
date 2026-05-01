@@ -10,13 +10,12 @@
 
 use std::path::PathBuf;
 
-use mimageviewer::grid_item::{sort_folder_block, GridItem};
+use mimageviewer::grid_item::{GridItem, sort_folder_block};
 use mimageviewer::settings::SortOrder;
 
 fn run(items: Vec<(GridItem, i64)>, order: SortOrder) -> Vec<String> {
     let mut folders: Vec<GridItem> = items.iter().map(|(g, _)| g.clone()).collect();
-    let mut metas: Vec<Option<(i64, i64)>> =
-        items.iter().map(|(_, mt)| Some((*mt, 100))).collect();
+    let mut metas: Vec<Option<(i64, i64)>> = items.iter().map(|(_, mt)| Some((*mt, 100))).collect();
     sort_folder_block(&mut folders, &mut metas, order);
     folders.iter().map(|f| f.name().to_string()).collect()
 }
@@ -78,7 +77,10 @@ fn date_desc_tiebreak_by_name_ascending() {
         ],
         SortOrder::DateDesc,
     );
-    assert_eq!(names, vec!["aaa-folder", "bbb-folder", "MMM.pdf", "ZZZ.zip"]);
+    assert_eq!(
+        names,
+        vec!["aaa-folder", "bbb-folder", "MMM.pdf", "ZZZ.zip"]
+    );
 }
 
 #[test]
@@ -92,7 +94,10 @@ fn date_asc_tiebreak_by_name_ascending() {
         ],
         SortOrder::DateAsc,
     );
-    assert_eq!(names, vec!["aaa-folder", "bbb-folder", "MMM.pdf", "ZZZ.zip"]);
+    assert_eq!(
+        names,
+        vec!["aaa-folder", "bbb-folder", "MMM.pdf", "ZZZ.zip"]
+    );
 }
 
 #[test]
@@ -127,11 +132,7 @@ fn folder_block_numeric_natural_order() {
 fn meta_none_is_treated_as_mtime_zero() {
     // `App::load_folder_inner` で metadata 取得失敗時は `None` が入り、
     // sort_folder_block 内で 0 として扱われる。DateDesc では最も古いとして末尾に並ぶ。
-    let mut folders = vec![
-        folder("missing-meta"),
-        folder("recent"),
-        folder("old"),
-    ];
+    let mut folders = vec![folder("missing-meta"), folder("recent"), folder("old")];
     let mut metas: Vec<Option<(i64, i64)>> = vec![None, Some((3000, 100)), Some((1000, 100))];
     sort_folder_block(&mut folders, &mut metas, SortOrder::DateDesc);
     let names: Vec<_> = folders.iter().map(|f| f.name().to_string()).collect();

@@ -20,23 +20,19 @@ use crate::adjustment::AdjustParams;
 use crate::app::App;
 use crate::tag_ops::find_favorite_id;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
-use crate::undo_stack::{
-    AdjustUndoScope, AdjustmentChange, RatingChange, TagChange, UndoEntry,
-};
+use crate::undo_stack::{AdjustUndoScope, AdjustmentChange, RatingChange, TagChange, UndoEntry};
 
 impl App {
     // ── 積み込み (操作直後に呼ぶ) ────────────────────────────────────
 
     /// 1 回のレーティング操作 (単発 / バルク / コンテナ) を Undo スタックに積む。
     /// `before == after` の変更はフィルタ済みで OK。空エントリは undo_stack 側で破棄される。
-    pub(crate) fn push_rating_undo_entry(
-        &mut self,
-        changes: Vec<RatingChange>,
-        summary: String,
-    ) {
+    pub(crate) fn push_rating_undo_entry(&mut self, changes: Vec<RatingChange>, summary: String) {
         // 実質変化のないものは積まない (Ctrl+Z 1 回が "見た目変化なし" になるのを防ぐ)
-        let filtered: Vec<RatingChange> =
-            changes.into_iter().filter(|c| c.before != c.after).collect();
+        let filtered: Vec<RatingChange> = changes
+            .into_iter()
+            .filter(|c| c.before != c.after)
+            .collect();
         if filtered.is_empty() {
             return;
         }
@@ -49,8 +45,10 @@ impl App {
     /// 1 回のタグ操作 (Toggle / ClearMiv / バルク) を Undo スタックに積む。
     /// `before == after` (= XMP 書き込みは発生しない見込み) はフィルタ済み。
     pub(crate) fn push_tag_undo_entry(&mut self, changes: Vec<TagChange>, summary: String) {
-        let filtered: Vec<TagChange> =
-            changes.into_iter().filter(|c| c.before != c.after).collect();
+        let filtered: Vec<TagChange> = changes
+            .into_iter()
+            .filter(|c| c.before != c.after)
+            .collect();
         if filtered.is_empty() {
             return;
         }
@@ -176,9 +174,7 @@ impl App {
             UndoEntry::Adjustment { changes, .. } => {
                 // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
-                order.sort_by_key(|&i| {
-                    std::cmp::Reverse(adjust_scope_priority(&changes[i].scope))
-                });
+                order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
                 for i in order {
                     self.apply_adjustment_change_to_app(&changes[i], false);
                 }
@@ -198,10 +194,8 @@ impl App {
     /// の順で consume することで、Ctrl+Shift+Z が Undo 側に流れない。
     pub(crate) fn handle_meta_undo_keys(&mut self, ctx: &egui::Context) {
         let (undo, redo) = ctx.input_mut(|i| {
-            let redo = i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::Z,
-            ) || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
+            let redo = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
             let undo = i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
             (undo, redo)
         });
@@ -211,10 +205,7 @@ impl App {
         // 完了 (= pending 空 + worker idle) まで待つ。consume はしているのでキーは
         // ここで握り潰し、ユーザーが再度押してもらう運用 (非常に短いウィンドウ)。
         if undo || redo {
-            let tag_busy = self
-                .tag_write_handle
-                .as_ref()
-                .is_some_and(|h| h.is_busy())
+            let tag_busy = self.tag_write_handle.as_ref().is_some_and(|h| h.is_busy())
                 || !self.pending_tag_undos.is_empty();
             if tag_busy {
                 crate::logger::log(
@@ -474,11 +465,7 @@ impl App {
     /// レーティング操作をスタックに積むためのスナップショットを作る。
     /// `records` は (idx, before, after) の列。`before == after` は呼び出し側で
     /// 弾いていなくても [`Self::push_rating_undo_entry`] が落としてくれる。
-    pub(crate) fn capture_rating_undo(
-        &mut self,
-        records: Vec<(usize, u8, u8)>,
-        summary: String,
-    ) {
+    pub(crate) fn capture_rating_undo(&mut self, records: Vec<(usize, u8, u8)>, summary: String) {
         let mut changes = Vec::with_capacity(records.len());
         for (idx, before, after) in records {
             let Some(path_key) = self.rating_path_key(idx) else {

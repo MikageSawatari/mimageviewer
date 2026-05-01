@@ -15,8 +15,8 @@
 //! [`AudioOutput`] が drop されたら自動で停止する。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -252,9 +252,7 @@ pub fn start(
         )
         .map_err(|e| format!("build_output_stream: {e}"))?;
 
-    stream
-        .play()
-        .map_err(|e| format!("stream.play: {e}"))?;
+    stream.play().map_err(|e| format!("stream.play: {e}"))?;
 
     Ok(AudioOutput {
         stream: Some(stream),
@@ -294,17 +292,9 @@ pub fn start(
 /// 音声がブツブツ途切れる退行を起こす。PDC latency は別 metric で publish する
 /// (`set_vst3_pdc_latency_secs`)。先読み許可量だけ `PACE_LEAD + pdc_latency` を加算する設計。
 fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
-    let processed_secs: f64 = buf
-        .processed
-        .iter()
-        .map(|c| c.duration_secs)
-        .sum::<f64>()
+    let processed_secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
         + remaining_first_chunk_secs(buf);
-    let raw_pending_secs: f64 = buf
-        .raw_pending
-        .iter()
-        .map(|f| f.duration_secs)
-        .sum::<f64>();
+    let raw_pending_secs: f64 = buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>();
     clock.set_audio_pump_buf_secs(processed_secs.max(0.0));
     clock.set_audio_raw_pending_secs(raw_pending_secs.max(0.0));
     clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
@@ -456,9 +446,7 @@ fn run_pump(
             // ── 新 seek 世代の検出 → VST plugin sync reset (= 既存挙動) ──
             let frame_seek_serial = frame.seek_serial;
             let cur_clock_serial = clock.current_seek_serial();
-            if frame_seek_serial > last_seen_seek_serial
-                && frame_seek_serial >= cur_clock_serial
-            {
+            if frame_seek_serial > last_seen_seek_serial && frame_seek_serial >= cur_clock_serial {
                 #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {
                     if b.is_enabled() && b.active_slot_count() > 0 {
@@ -515,11 +503,7 @@ fn run_pump(
                 }
 
                 // overflow check: raw 合計秒数を計算 (= duration 単位、Codex P2-A 助言)
-                let raw_secs: f64 = buf
-                    .raw_pending
-                    .iter()
-                    .map(|f| f.duration_secs)
-                    .sum::<f64>()
+                let raw_secs: f64 = buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>()
                     + frame.duration_secs;
 
                 if raw_secs <= RAW_OVERFLOW_SECS {
@@ -617,11 +601,7 @@ fn run_pump(
             // 現在の processed 秒数 (= cap 比較用) を lock 内で取得
             let (current_processed_secs, raw_chunk_opt, target_serial) = {
                 let mut buf = buffer.lock().unwrap();
-                let cur_secs: f64 = buf
-                    .processed
-                    .iter()
-                    .map(|c| c.duration_secs)
-                    .sum::<f64>()
+                let cur_secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
                     + remaining_first_chunk_secs(&buf);
                 if cur_secs >= TARGET_PROCESSED_SECS {
                     (cur_secs, None, buf.pump_seek_serial)
@@ -672,8 +652,7 @@ fn run_pump(
             // ── chunk metadata 計算 ──
             // audible_pts = input_pts - pdc_latency (Codex P1-3 反映、PDC 正しい同期用)
             let duration_secs = output_samples.len() as f64 / samples_per_sec;
-            let audible_pts_secs =
-                (raw.pts_secs - current_pdc_latency_secs).max(0.0);
+            let audible_pts_secs = (raw.pts_secs - current_pdc_latency_secs).max(0.0);
 
             // ── pre-target trim (Codex P1-1: PDC plugin で早すぎる BufferReady 防止) ──
             //
@@ -775,15 +754,10 @@ fn run_pump(
         let (processed_secs, cur_audible_pts, cur_serial) = {
             let buf = buffer.lock().unwrap();
             publish_buffer_secs(&buf, &clock);
-            let secs: f64 = buf
-                .processed
-                .iter()
-                .map(|c| c.duration_secs)
-                .sum::<f64>()
+            let secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
                 + remaining_first_chunk_secs(&buf);
             let audible = if let Some(first) = buf.processed.front() {
-                first.audible_pts_secs
-                    + buf.drain_offset_in_first as f64 / buf.samples_per_sec
+                first.audible_pts_secs + buf.drain_offset_in_first as f64 / buf.samples_per_sec
             } else {
                 buf.next_pts_secs
             };
@@ -854,8 +828,7 @@ fn pre_target_trim_decision(
         let trim_samples_raw = (trim_secs * samples_per_sec).round() as usize;
         // channel-aligned (= interleaved stereo は 2 単位)
         let trim_samples = (trim_samples_raw / channels) * channels;
-        let new_audible_pts =
-            audible_pts_secs + trim_samples as f64 / samples_per_sec;
+        let new_audible_pts = audible_pts_secs + trim_samples as f64 / samples_per_sec;
         TrimResult::TrimFront {
             trim_samples,
             new_audible_pts,
@@ -938,7 +911,10 @@ fn fill_output(
 
     while written < want {
         let take = if let Some(first) = buf.processed.front() {
-            let remaining = first.samples.len().saturating_sub(buf.drain_offset_in_first);
+            let remaining = first
+                .samples
+                .len()
+                .saturating_sub(buf.drain_offset_in_first);
             remaining.min(want - written)
         } else {
             0
@@ -963,13 +939,10 @@ fn fill_output(
         buf.drain_offset_in_first += take;
 
         // chunk 内 drain 後の audible_pts を計算 (= 次に drain される予定の PTS)
-        next_audible_pts = Some(
-            chunk_audible_pts
-                + buf.drain_offset_in_first as f64 / samples_per_sec,
-        );
+        next_audible_pts =
+            Some(chunk_audible_pts + buf.drain_offset_in_first as f64 / samples_per_sec);
 
-        if buf.drain_offset_in_first
-            >= buf.processed.front().map(|c| c.samples.len()).unwrap_or(0)
+        if buf.drain_offset_in_first >= buf.processed.front().map(|c| c.samples.len()).unwrap_or(0)
         {
             buf.processed.pop_front();
             buf.drain_offset_in_first = 0;
@@ -1035,8 +1008,8 @@ mod tests {
     //! 各シナリオで意図通り動くことを構造的に保証する。
 
     use super::*;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     fn make_clock() -> Arc<AvClock> {
         let seek_serial = Arc::new(AtomicU64::new(0));
@@ -1107,7 +1080,8 @@ mod tests {
 
         {
             let mut b = buf.lock().unwrap();
-            b.processed.push_back(make_chunk(vec![0.5; 100], 0.0, samples_per_sec));
+            b.processed
+                .push_back(make_chunk(vec![0.5; 100], 0.0, samples_per_sec));
         }
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
@@ -1137,7 +1111,8 @@ mod tests {
 
         {
             let mut b = buf.lock().unwrap();
-            b.processed.push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
+            b.processed
+                .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
         }
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
@@ -1161,7 +1136,8 @@ mod tests {
 
         {
             let mut b = buf.lock().unwrap();
-            b.processed.push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
+            b.processed
+                .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
         }
         let len_before: usize = buf
             .lock()
@@ -1250,8 +1226,7 @@ mod tests {
         let mut saw_keep_all = false;
         for _ in 0..50 {
             let audible_pts = input_pts - pdc;
-            let result =
-                pre_target_trim_decision(audible_pts, frame_duration, target, sps, 2);
+            let result = pre_target_trim_decision(audible_pts, frame_duration, target, sps, 2);
             match result {
                 TrimResult::DropAll => saw_drop_all = true,
                 TrimResult::TrimFront { .. } => saw_trim_front = true,
@@ -1323,8 +1298,10 @@ mod tests {
 
         {
             let mut b = buf.lock().unwrap();
-            b.processed.push_back(make_chunk(vec![0.5; 240], 0.0, samples_per_sec));
-            b.processed.push_back(make_chunk(vec![0.25; 240], 0.0, samples_per_sec));
+            b.processed
+                .push_back(make_chunk(vec![0.5; 240], 0.0, samples_per_sec));
+            b.processed
+                .push_back(make_chunk(vec![0.25; 240], 0.0, samples_per_sec));
         }
 
         let mut out = [0.0_f32; 480];

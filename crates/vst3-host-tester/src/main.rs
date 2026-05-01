@@ -109,9 +109,11 @@ struct TesterApp {
     /// 現在表示中のプラグイン GUI ウィンドウの HWND (u64 化)。0 = 表示なし。
     gui_hwnd: u64,
     /// GUI ウィンドウの × クリックを GUI スレッドから受け取る側。Some の時のみ表示中。
-    gui_close_signal: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    gui_close_signal:
+        Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
     /// GUI ウィンドウのユーザーリサイズを GUI スレッドから受け取る側。
-    gui_resize_signal: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
+    gui_resize_signal:
+        Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
 
     // log buffer for the bottom panel
     log_lines: Arc<Mutex<Vec<String>>>,
@@ -207,7 +209,11 @@ impl TesterApp {
     }
 
     fn start_audio(&mut self) {
-        match AudioEngine::start(self.bridge.clone(), Arc::clone(&self.mode), self.tone.clone()) {
+        match AudioEngine::start(
+            self.bridge.clone(),
+            Arc::clone(&self.mode),
+            self.tone.clone(),
+        ) {
             Ok(eng) => {
                 self.log(format!(
                     "audio engine started: {}Hz, block_size={}",
@@ -287,8 +293,7 @@ impl TesterApp {
                             return;
                         }
                     }
-                    let sample_rate =
-                        self.audio.as_ref().map(|a| a.sample_rate).unwrap_or(48_000);
+                    let sample_rate = self.audio.as_ref().map(|a| a.sample_rate).unwrap_or(48_000);
                     let block_size = self.audio.as_ref().map(|a| a.block_size).unwrap_or(480);
                     let plugin_path = plugin.path.to_string_lossy().to_string();
                     if let Err(e) = br.open_audio_pipe(&plugin_path, sample_rate, block_size) {
@@ -462,7 +467,10 @@ impl TesterApp {
         }
         if let Some((w, h)) = last {
             if let Some(br) = self.bridge.as_ref() {
-                let _ = br.send(&Cmd::NotifyHostResize { width: w, height: h });
+                let _ = br.send(&Cmd::NotifyHostResize {
+                    width: w,
+                    height: h,
+                });
             }
         }
     }
@@ -547,7 +555,11 @@ impl eframe::App for TesterApp {
                     if ui.button("Rescan").clicked() {
                         self.scan();
                     }
-                    if ui.button("Clear").on_hover_text("検索フィルタをクリア").clicked() {
+                    if ui
+                        .button("Clear")
+                        .on_hover_text("検索フィルタをクリア")
+                        .clicked()
+                    {
                         self.filter.clear();
                     }
                 });
@@ -689,10 +701,7 @@ impl eframe::App for TesterApp {
                             enable: if self.bridge_passthrough { 1 } else { 0 },
                         });
                     }
-                    self.log(format!(
-                        "bridge passthrough: {}",
-                        self.bridge_passthrough
-                    ));
+                    self.log(format!("bridge passthrough: {}", self.bridge_passthrough));
                 }
             });
 

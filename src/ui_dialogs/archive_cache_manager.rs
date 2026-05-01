@@ -81,7 +81,10 @@ impl App {
                     // 変換進行中は削除ボタンを無効化 (本体ダイアログと同じ不変条件)
                     let convert_in_flight = self.archive_convert.is_some();
                     let del_btn = egui::Button::new("  削除する  ");
-                    if ui.add_enabled(!busy && !convert_in_flight, del_btn).clicked() {
+                    if ui
+                        .add_enabled(!busy && !convert_in_flight, del_btn)
+                        .clicked()
+                    {
                         if let Some(db) = self.archive_cache_db.clone() {
                             self.archive_cache_maint_pending =
                                 Some(crate::cache_maintenance::spawn_archive(
@@ -183,15 +186,15 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
             ));
         }
         if ui
-            .add_enabled(delete_allowed && row_count > 0, egui::Button::new("すべて削除"))
+            .add_enabled(
+                delete_allowed && row_count > 0,
+                egui::Button::new("すべて削除"),
+            )
             .clicked()
         {
             app.archive_cache_confirm_delete_all = true;
         }
-        if ui
-            .add_enabled(!busy, egui::Button::new("再読込"))
-            .clicked()
-        {
+        if ui.add_enabled(!busy, egui::Button::new("再読込")).clicked() {
             app.reload_archive_cache_rows();
         }
     });
@@ -280,10 +283,7 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-fn spawn_delete_selected(
-    app: &mut App,
-    db: std::sync::Arc<crate::archive_cache::ArchiveCacheDb>,
-) {
+fn spawn_delete_selected(app: &mut App, db: std::sync::Arc<crate::archive_cache::ArchiveCacheDb>) {
     let Some(rows) = app.archive_cache_rows.as_ref() else {
         return;
     };

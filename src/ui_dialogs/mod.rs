@@ -11,7 +11,6 @@ mod about;
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
 mod cache_creator;
-pub(crate) mod trt_worker_notice;
 mod cache_manager;
 pub(crate) mod context_menu;
 mod fav_add;
@@ -25,6 +24,7 @@ mod tag_editor;
 mod thumb_quality;
 mod thumb_quality_fullscreen;
 pub(crate) mod trt_install;
+pub(crate) mod trt_worker_notice;
 mod update_notice;
 #[cfg(windows)]
 mod vst3_actions;

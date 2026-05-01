@@ -153,15 +153,12 @@ pub(crate) struct PluginSlot {
     /// プラグイン GUI ホスト (Win32 子ウィンドウスレッド)。slot 削除で自動終了する。
     pub gui_host: Option<gui::GuiHost>,
     /// ホストウィンドウの × ボタン押下シグナル。
-    pub gui_close_signal:
-        Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    pub gui_close_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
     /// ホストウィンドウのリサイズシグナル。
-    pub gui_resize_signal:
-        Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
+    pub gui_resize_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
     /// ホストウィンドウの WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE シグナル
     /// (= ユーザー drag による resize/move session 開始 / 終了、Codex P4 対応)。
-    pub gui_resize_session_signal:
-        Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
+    pub gui_resize_session_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
 }
 
 impl DspBridge {
@@ -293,7 +290,7 @@ impl DspBridge {
                 .max_by_key(|(_, s)| s.latency_samples)
                 .map(|(i, _)| i);
             let Some(idx) = target_idx else {
-                break;  // active slot が無いのに total > max は通常起きない、防御
+                break; // active slot が無いのに total > max は通常起きない、防御
             };
             let slot = &mut inner.slots[idx];
             // 既に auto-bypass 済の slot にはログ再発火しない (= ログ連打防止)
@@ -380,8 +377,7 @@ impl DspBridge {
             return Ok(());
         }
         // bridge exe が APPDATA に展開できるか先にテスト (失敗時はここで早期 return)
-        extract::ensure_bridge_extracted()
-            .map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
+        extract::ensure_bridge_extracted().map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
         inner.state = DspState::Enabled;
         self.enabled.store(true, Ordering::Release);
         Ok(())
@@ -420,8 +416,8 @@ impl DspBridge {
         }
 
         // bridge exe path
-        let exe = extract::ensure_bridge_extracted()
-            .map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
+        let exe =
+            extract::ensure_bridge_extracted().map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
 
         // ── 子プロセス spawn + hello 応答待ち (Mutex 外で実施) ──
         let mut bridge = Bridge::spawn(exe, |line| {
@@ -544,16 +540,15 @@ impl DspBridge {
         let timeout = std::time::Duration::from_secs(1);
         // 各 bridge ごとに thread を spawn して query_state_sync を並列実行。
         // bridge は Arc なのでクローンで thread に渡せる。
-        let handles: Vec<std::thread::JoinHandle<(String, Result<String, String>)>> =
-            bridges
-                .into_iter()
-                .map(|(path, b)| {
-                    std::thread::spawn(move || {
-                        let result = b.query_state_sync(timeout);
-                        (path, result)
-                    })
+        let handles: Vec<std::thread::JoinHandle<(String, Result<String, String>)>> = bridges
+            .into_iter()
+            .map(|(path, b)| {
+                std::thread::spawn(move || {
+                    let result = b.query_state_sync(timeout);
+                    (path, result)
                 })
-                .collect();
+            })
+            .collect();
         let mut out = Vec::with_capacity(handles.len());
         for h in handles {
             match h.join() {
@@ -646,7 +641,8 @@ impl DspBridge {
                 crate::logger::log(
                     "[VST3] CRITICAL: reset_plugins_sync ResetDone ack timeout (2s), \
                      pre-seek audio may leak briefly. Plugin may be unresponsive or \
-                     processing too slowly.".to_string()
+                     processing too slowly."
+                        .to_string(),
                 );
             }
         }
@@ -757,7 +753,11 @@ impl DspBridge {
             .send(&Cmd::QueryGuiSize)
             .map_err(|e| format!("send QueryGuiSize: {e}"))?;
         let (pref_w, pref_h, resizable) = match bridge_arc.recv() {
-            Ok(Event::GuiSize { width, height, resizable }) => (width, height, resizable),
+            Ok(Event::GuiSize {
+                width,
+                height,
+                resizable,
+            }) => (width, height, resizable),
             Ok(other) => {
                 crate::logger::log(format!(
                     "vst3 query_gui_size: unexpected {other:?}, fallback 1200x800"
@@ -952,8 +952,7 @@ impl DspBridge {
                 let inner = self.inner.lock().unwrap();
                 inner.last_z_order_snapshot.clone()
             };
-            let shown_set: std::collections::HashSet<u64> =
-                shown_hwnds.iter().copied().collect();
+            let shown_set: std::collections::HashSet<u64> = shown_hwnds.iter().copied().collect();
             for hwnd in snapshot.iter().rev() {
                 if shown_set.contains(hwnd) {
                     let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
@@ -1105,7 +1104,9 @@ impl DspBridge {
                 inner.slots.get(idx).map(|s| s.bridge.clone())
             };
             if let Some(b) = bridge_arc {
-                let _ = b.send(&Cmd::SetUserResizing { active: if active { 1 } else { 0 } });
+                let _ = b.send(&Cmd::SetUserResizing {
+                    active: if active { 1 } else { 0 },
+                });
             }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
@@ -1115,7 +1116,10 @@ impl DspBridge {
                 inner.slots.get(idx).map(|s| s.bridge.clone())
             };
             if let Some(b) = bridge_arc {
-                let _ = b.send(&Cmd::NotifyHostResize { width: w, height: h });
+                let _ = b.send(&Cmd::NotifyHostResize {
+                    width: w,
+                    height: h,
+                });
             }
         }
         user_hidden_paths
@@ -1176,11 +1180,7 @@ impl DspBridge {
                     .slots
                     .iter()
                     .enumerate()
-                    .filter(|(i, s)| {
-                        *i != idx
-                            && !s.bypass
-                            && matches!(s.state, SlotState::Loaded)
-                    })
+                    .filter(|(i, s)| *i != idx && !s.bypass && matches!(s.state, SlotState::Loaded))
                     .map(|(_, s)| s.latency_samples)
                     .sum();
                 let would_be_total = other_active_total.saturating_add(this_latency);

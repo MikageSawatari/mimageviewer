@@ -24,8 +24,8 @@
 //! - UI 側が `pending = None` にすれば job_tx も drop され、worker は自然終了する。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -181,7 +181,11 @@ mod tests {
     #[test]
     fn returns_empty_tags_for_nonexistent_path() {
         let pending = spawn();
-        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), "key1".to_string(), false);
+        pending.push_job(
+            PathBuf::from("Z:/does/not/exist.jpg"),
+            "key1".to_string(),
+            false,
+        );
         let start = Instant::now();
         loop {
             match pending.rx.try_recv() {

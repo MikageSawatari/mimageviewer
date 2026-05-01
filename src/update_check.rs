@@ -28,8 +28,7 @@ use std::time::Duration;
 
 const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/MikageSawatari/mimageviewer/releases/latest";
-const RELEASES_PAGE_URL: &str =
-    "https://github.com/MikageSawatari/mimageviewer/releases/latest";
+const RELEASES_PAGE_URL: &str = "https://github.com/MikageSawatari/mimageviewer/releases/latest";
 
 /// 更新チェック結果。
 #[derive(Clone, Debug)]
@@ -124,8 +123,7 @@ fn parse_release_json(
         })
         .unwrap_or_default();
     let stripped = tag.strip_prefix('v').unwrap_or(&tag);
-    let latest = semver::Version::parse(stripped)
-        .map_err(|e| format!("tag '{tag}' parse: {e}"))?;
+    let latest = semver::Version::parse(stripped).map_err(|e| format!("tag '{tag}' parse: {e}"))?;
     let is_newer = latest > *current;
     Ok(UpdateInfo {
         latest_tag: tag,
@@ -226,11 +224,8 @@ mod tests {
 
     #[test]
     fn parse_missing_tag_name_errs() {
-        let err = parse_release_json(
-            &cur("0.8.1"),
-            &json!({ "html_url": "x", "body": "" }),
-        )
-        .unwrap_err();
+        let err =
+            parse_release_json(&cur("0.8.1"), &json!({ "html_url": "x", "body": "" })).unwrap_err();
         assert!(err.contains("tag_name"));
     }
 
@@ -246,11 +241,8 @@ mod tests {
 
     #[test]
     fn parse_missing_html_url_falls_back() {
-        let info = parse_release_json(
-            &cur("0.8.1"),
-            &json!({ "tag_name": "v0.8.2", "body": "" }),
-        )
-        .unwrap();
+        let info = parse_release_json(&cur("0.8.1"), &json!({ "tag_name": "v0.8.2", "body": "" }))
+            .unwrap();
         assert_eq!(info.release_url, RELEASES_PAGE_URL);
     }
 

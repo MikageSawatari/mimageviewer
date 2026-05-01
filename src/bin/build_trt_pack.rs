@@ -433,7 +433,10 @@ fn main() {
         );
         std::process::exit(1);
     }
-    println!("[build_trt_pack] 静的依存チェック OK ({} provider DLL)", PROVIDER_DLL_IMPORTS.len());
+    println!(
+        "[build_trt_pack] 静的依存チェック OK ({} provider DLL)",
+        PROVIDER_DLL_IMPORTS.len()
+    );
 
     // ── engine pack (AMPERE_PLUS) ──
     // 6 モデルの engine cache (`<model>/<file>.engine` + `<file>.profile`) を 1 zip に。
@@ -541,7 +544,10 @@ fn main() {
     );
     println!();
     println!("次のステップ:");
-    println!("  1. dist/trt-pack-v{}/ 内のすべてのファイルを GitHub Releases にアップロード", PACK_VERSION);
+    println!(
+        "  1. dist/trt-pack-v{}/ 内のすべてのファイルを GitHub Releases にアップロード",
+        PACK_VERSION
+    );
     println!("     (タグ名: trt-pack-v{} 推奨)", PACK_VERSION);
     println!("  2. mIV の `tensorrt_pack` モジュールに manifest URL を埋め込む");
     println!("  3. cargo build --release でビルド & 配布");
@@ -693,8 +699,7 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
 /// `PROVIDER_DLL_IMPORTS` に列挙された hard import が全て `common` に含まれている
 /// ことを検証する。一つでも欠けていたら `Err(Vec<MissingImport>)` を返す。
 fn check_provider_imports(common: &[AssetEntry]) -> Result<(), Vec<MissingImport>> {
-    let names: std::collections::HashSet<&str> =
-        common.iter().map(|a| a.name.as_str()).collect();
+    let names: std::collections::HashSet<&str> = common.iter().map(|a| a.name.as_str()).collect();
     let mut missing = Vec::new();
     for (provider, imports) in PROVIDER_DLL_IMPORTS {
         for imp in *imports {
@@ -805,7 +810,16 @@ fn unix_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let mdays: [u32; 12] = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month: u32 = 1;
     let mut day = days as u32 + 1;

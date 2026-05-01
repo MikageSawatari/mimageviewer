@@ -134,9 +134,7 @@ impl ArchiveCacheDb {
     /// maintenance (`delete_entry` / `clear_all`) は同じ lock を取るため、変換中は待つ。
     /// 呼び出し側で poisoned 時は内側を取り出す — key は「記録欠落」ではなく「直列化」。
     pub fn begin_convert(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.convert_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.convert_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 有効なキャッシュがあれば ZIP パスを返し、`last_access_at` を更新する。
@@ -368,13 +366,11 @@ impl ArchiveCacheDb {
 
         let snapshot: Vec<(String, String)> = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn
-                .prepare("SELECT src_path_key, cached_zip_path FROM converted_archives")?;
-            stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .flatten()
-            .collect()
+            let mut stmt =
+                conn.prepare("SELECT src_path_key, cached_zip_path FROM converted_archives")?;
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .flatten()
+                .collect()
         };
         // convert_lock 保持中は並行 record() が走らないので、snapshot 〜 FS 削除 〜 DB DELETE の
         // 範囲内で「別 worker が同じパスを書き戻す」race は発生しない。
@@ -385,8 +381,7 @@ impl ArchiveCacheDb {
         let tx = conn.transaction()?;
         let mut deleted = 0usize;
         {
-            let mut stmt =
-                tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
+            let mut stmt = tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
             for (key, _) in &snapshot {
                 deleted += stmt.execute(params![key])?;
             }
@@ -478,7 +473,6 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -20,8 +20,8 @@
 use std::sync::Arc;
 
 use egui_wgpu::CallbackTrait;
-use windows::Win32::Foundation::HANDLE;
 use wgpu::util::DeviceExt;
+use windows::Win32::Foundation::HANDLE;
 
 use super::wgpu_import::{ImportedTexture, import_shared_d3d11_texture};
 
@@ -180,7 +180,9 @@ pub fn init_video_pipeline(render_state: &egui_wgpu::RenderState) {
             sampler,
             bind_group_layout,
         });
-    crate::logger::log("Video paint pipeline registered in egui_wgpu callback_resources".to_string());
+    crate::logger::log(
+        "Video paint pipeline registered in egui_wgpu callback_resources".to_string(),
+    );
 }
 
 /// 1 フレーム分の描画コールバック。`prepare` で wgpu テクスチャを import + bind group を作り、

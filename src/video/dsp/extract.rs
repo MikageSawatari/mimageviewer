@@ -15,8 +15,7 @@ pub fn ensure_bridge_extracted() -> Result<&'static PathBuf, String> {
     EXE_PATH
         .get_or_init(|| {
             let dir = crate::data_dir::get().join("vst3");
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("vst3 dir create failed: {e}"))?;
+            std::fs::create_dir_all(&dir).map_err(|e| format!("vst3 dir create failed: {e}"))?;
             let exe = dir.join("mimageviewer-vst3-host.exe");
             crate::data_dir::extract_embedded_file(
                 &exe,

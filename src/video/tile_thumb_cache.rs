@@ -175,10 +175,9 @@ impl TileThumbCache {
             )
             .ok()?;
         let row: Option<(Vec<u8>, i64)> = stmt
-            .query_row(
-                rusqlite::params![key, timestamp_ms],
-                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
-            )
+            .query_row(rusqlite::params![key, timestamp_ms], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+            })
             .ok();
         match row {
             Some((webp, mtime)) if mtime == video_mtime => Some(webp),
@@ -208,7 +207,10 @@ impl TileThumbCache {
         webp: &[u8],
     ) -> Result<(), rusqlite::Error> {
         let key = crate::path_key::normalize_keep_drive(video_path);
-        let conn = self.conn.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute(
             "INSERT INTO video_tile_thumbs
                 (path, tile_w, timestamp_ms, tile_h, webp, video_mtime)
@@ -224,11 +226,11 @@ impl TileThumbCache {
     #[allow(dead_code)]
     pub fn clear_for(&self, video_path: &Path) -> Result<(), rusqlite::Error> {
         let key = crate::path_key::normalize_keep_drive(video_path);
-        let conn = self.conn.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        conn.execute(
-            "DELETE FROM video_tile_thumbs WHERE path = ?1",
-            [&key],
-        )?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute("DELETE FROM video_tile_thumbs WHERE path = ?1", [&key])?;
         Ok(())
     }
 }
@@ -249,9 +251,10 @@ mod tests {
     #[test]
     fn lookup_missing_returns_none() {
         let db = open_in_memory();
-        assert!(db
-            .lookup_webp(Path::new("c:/none.mp4"), 5000, 12345)
-            .is_none());
+        assert!(
+            db.lookup_webp(Path::new("c:/none.mp4"), 5000, 12345)
+                .is_none()
+        );
     }
 
     #[test]
@@ -289,9 +292,7 @@ mod tests {
         let db = open_in_memory();
         db.store_webp(Path::new("C:\\V.MP4"), 320, 5000, 100, 180, &[9])
             .unwrap();
-        assert!(db
-            .lookup_webp(Path::new("c:/v.mp4"), 5000, 100)
-            .is_some());
+        assert!(db.lookup_webp(Path::new("c:/v.mp4"), 5000, 100).is_some());
     }
 
     #[test]

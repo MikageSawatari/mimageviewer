@@ -86,7 +86,10 @@ pub fn spawn_for_folder(db_path: PathBuf, folder_key: String) -> FolderRatingCou
 /// `folder_key/...` を LIKE の prefix パターンにする。
 /// 呼び出し元で `ESCAPE '\'` を指定すること。
 fn build_prefix_pattern(folder_key: &str) -> String {
-    format!("{}/%", crate::adjustment_db::escape_like_pattern(folder_key))
+    format!(
+        "{}/%",
+        crate::adjustment_db::escape_like_pattern(folder_key)
+    )
 }
 
 /// DB 行 (正規化された path) から、current_folder の **直下の子コンテナ** に当たる
@@ -228,37 +231,25 @@ mod tests {
     #[test]
     fn aggregation_key_direct_subfolder() {
         let p = "c:/root/sub/file.jpg";
-        assert_eq!(
-            aggregation_key_for(p, "c:/root/"),
-            Some("c:/root/sub")
-        );
+        assert_eq!(aggregation_key_for(p, "c:/root/"), Some("c:/root/sub"));
     }
 
     #[test]
     fn aggregation_key_deep_descendant_rolls_up() {
         let p = "c:/root/sub/deeper/nested/file.jpg";
-        assert_eq!(
-            aggregation_key_for(p, "c:/root/"),
-            Some("c:/root/sub")
-        );
+        assert_eq!(aggregation_key_for(p, "c:/root/"), Some("c:/root/sub"));
     }
 
     #[test]
     fn aggregation_key_zip_entry() {
         let p = "c:/root/book.zip::chapter1/page01.jpg";
-        assert_eq!(
-            aggregation_key_for(p, "c:/root/"),
-            Some("c:/root/book.zip")
-        );
+        assert_eq!(aggregation_key_for(p, "c:/root/"), Some("c:/root/book.zip"));
     }
 
     #[test]
     fn aggregation_key_pdf_page() {
         let p = "c:/root/doc.pdf::page_0003";
-        assert_eq!(
-            aggregation_key_for(p, "c:/root/"),
-            Some("c:/root/doc.pdf")
-        );
+        assert_eq!(aggregation_key_for(p, "c:/root/"), Some("c:/root/doc.pdf"));
     }
 
     #[test]
@@ -280,10 +271,7 @@ mod tests {
     fn aggregation_key_zip_before_slash() {
         // ZIP の :: が / より先に来るケース
         let p = "c:/root/book.zip::folder/inner.jpg";
-        assert_eq!(
-            aggregation_key_for(p, "c:/root/"),
-            Some("c:/root/book.zip")
-        );
+        assert_eq!(aggregation_key_for(p, "c:/root/"), Some("c:/root/book.zip"));
     }
 
     #[test]
@@ -333,22 +321,13 @@ mod tests {
         }
         assert!(finished, "worker did not emit finished batch in time");
         // sub: ★5×2, ★3×1, ★4×1 (deep 子孫を sub にロールアップ)
-        assert_eq!(
-            totals.get("c:/root/sub"),
-            Some(&[0, 0, 1, 1, 2])
-        );
+        assert_eq!(totals.get("c:/root/sub"), Some(&[0, 0, 1, 1, 2]));
         // other: ★2×1
         assert_eq!(totals.get("c:/root/other"), Some(&[0, 1, 0, 0, 0]));
         // book.zip: ★5×2
-        assert_eq!(
-            totals.get("c:/root/book.zip"),
-            Some(&[0, 0, 0, 0, 2])
-        );
+        assert_eq!(totals.get("c:/root/book.zip"), Some(&[0, 0, 0, 0, 2]));
         // doc.pdf: ★4×1
-        assert_eq!(
-            totals.get("c:/root/doc.pdf"),
-            Some(&[0, 0, 0, 1, 0])
-        );
+        assert_eq!(totals.get("c:/root/doc.pdf"), Some(&[0, 0, 0, 1, 0]));
         // direct.jpg は直下ファイルなのでバッジ対象外 (集計キー None)
         assert!(!totals.contains_key("c:/root/direct.jpg"));
         // otherroot 配下は LIKE prefix で弾かれる

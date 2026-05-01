@@ -26,8 +26,8 @@
 mod common;
 
 use common::{
-    FS_EVENT_TIMEOUT, FixtureRoot, collect_search_hits, delete_file, make_favorite,
-    normalize_path, rename_file, run_search_expecting_done, start_indexer_at, wait_for_search_hits,
+    FS_EVENT_TIMEOUT, FixtureRoot, collect_search_hits, delete_file, make_favorite, normalize_path,
+    rename_file, run_search_expecting_done, start_indexer_at, wait_for_search_hits,
     wait_meta_absent, wait_meta_contains, wait_scan_done, wait_until, write_png_plain,
     write_png_with_text,
 };
@@ -49,10 +49,7 @@ fn initial_scan_hits_embedded_prompt() {
     let a_path = root.path().join("a.png");
     write_png_with_text(&a_path, "a photo of a mountain landscape at sunset");
     // 別のキーワード (ヒットしてはいけない対照群)
-    write_png_with_text(
-        &root.path().join("b.png"),
-        "a portrait of a cat indoors",
-    );
+    write_png_with_text(&root.path().join("b.png"), "a portrait of a cat indoors");
 
     let fav = make_favorite("A", root.path());
     let mgr = start_indexer_at(data.path(), &[fav.clone()]);
@@ -61,7 +58,8 @@ fn initial_scan_hits_embedded_prompt() {
     // 初期スキャン完了 = walker 終了だが、ingest_worker は `BATCH_FLUSH_INTERVAL` /
     // flush で commit するため Tantivy reader が追いつくまで若干のラグがある。
     // `wait_meta_contains` で meta_db の status=Ok を確認 → commit 済みを保証。
-    let meta_db = mimageviewer::fts_meta::FtsMetaDb::open_at(&data.path().join("fts_meta.db")).unwrap();
+    let meta_db =
+        mimageviewer::fts_meta::FtsMetaDb::open_at(&data.path().join("fts_meta.db")).unwrap();
     wait_meta_contains(&meta_db, &normalize_path(&a_path));
 
     // Tantivy reader は `ReloadPolicy::OnCommitWithDelay` で非同期に reload されるため、
@@ -74,7 +72,11 @@ fn initial_scan_hits_embedded_prompt() {
         FS_EVENT_TIMEOUT,
         "search finds 'mountain' in a.png",
     );
-    assert_eq!(hits.len(), 1, "期待: 'mountain' は a.png の 1 件のみヒット (hits={hits:?})");
+    assert_eq!(
+        hits.len(),
+        1,
+        "期待: 'mountain' は a.png の 1 件のみヒット (hits={hits:?})"
+    );
 }
 
 /// ファイル名だけ (tEXt メタなし) でも検索できること。

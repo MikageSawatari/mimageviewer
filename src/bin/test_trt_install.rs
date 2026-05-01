@@ -31,7 +31,10 @@ fn main() {
         std::env::var("MIV_TRT_PACK_BASE_URL")
             .unwrap_or_else(|_| "<default GitHub Releases>".to_string())
     );
-    println!("[test_trt_install] pack_dir: {}", tensorrt_pack::pack_dir().display());
+    println!(
+        "[test_trt_install] pack_dir: {}",
+        tensorrt_pack::pack_dir().display()
+    );
 
     let target_sm = mimageviewer::gpu_info::query_primary_gpu_sm();
     println!("[test_trt_install] target SM: {:?}", target_sm);
@@ -118,10 +121,7 @@ fn main() {
                 InstallProgress::VerifyingFile { name } => {
                     println!("[event] verifying {}", name);
                 }
-                InstallProgress::ExtractingEngine {
-                    entry_index,
-                    total,
-                } => {
+                InstallProgress::ExtractingEngine { entry_index, total } => {
                     if (entry_index + 1) % 5 == 0 || entry_index + 1 == total {
                         println!(
                             "[event] extracting engine entry {}/{}",
@@ -131,10 +131,7 @@ fn main() {
                     }
                 }
                 InstallProgress::Done => {
-                    println!(
-                        "[event] DONE in {:.1}s",
-                        start.elapsed().as_secs_f64()
-                    );
+                    println!("[event] DONE in {:.1}s", start.elapsed().as_secs_f64());
                     break;
                 }
                 InstallProgress::Error { message } => {

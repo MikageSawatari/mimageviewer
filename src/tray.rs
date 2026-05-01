@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::activity_gate::ActivityGate;
 use crate::io_semaphore::GlobalIoSemaphore;
@@ -103,9 +103,7 @@ pub enum TrayEvent {
     /// `pause_indexer_while_minimized` 設定とトレイ checkmark は App 側で反映する。
     /// activity_gate はトレイスレッドが既に反転済みだが、「ウィンドウ表示中は強制 false」等
     /// の統合判断は App 側で行うため、ここでは hint に留める。
-    TogglePauseRequested {
-        new_checked: bool,
-    },
+    TogglePauseRequested { new_checked: bool },
     /// メニュー「終了」。quit_flag は既に true、WM_CLOSE も post 済み。
     /// App は close 経路でそのまま抜けるだけ。
     QuitRequested,
@@ -316,8 +314,8 @@ fn run_tray_thread(
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, IsWindowVisible, PeekMessageW, PostMessageW, SetForegroundWindow,
-        ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
+        DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_SHOW,
+        SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow, TranslateMessage, WM_CLOSE,
     };
 
     // HWND (`*mut c_void`) は Send/Sync ではないので、クロージャでキャプチャするときは
@@ -443,9 +441,7 @@ fn run_tray_thread(
                 // try_send ドロップに備え、App は `pause_checked_snapshot` で reconcile する。
                 let _ = event_tx.try_send(TrayEvent::TogglePauseRequested { new_checked });
                 ctx.request_repaint();
-                crate::logger::log(format!(
-                    "tray: Pause toggled → new_checked = {new_checked}"
-                ));
+                crate::logger::log(format!("tray: Pause toggled → new_checked = {new_checked}"));
             } else if ev.id == quit_id {
                 quit_flag.store(true, Ordering::SeqCst);
                 let hwnd = make_hwnd(hwnd_raw);
@@ -459,7 +455,7 @@ fn run_tray_thread(
                 // 結果として黒フラッシュ / 復元アニメーションを完全に抑制しつつ、インデクサや
                 // tag writer 等の graceful shutdown を保証できる。
                 unsafe {
-                    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+                    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
                     if !IsWindowVisible(hwnd).as_bool() {
                         // BOOL は 4 バイト整数 (TRUE=1)。DWM 側は *const c_void で受ける
                         // のでサイズを厳密に指定するだけでよい (型は BOOL 相当)。
@@ -590,10 +586,7 @@ mod tests {
     #[test]
     fn set_paused_check_updates_atomic_synchronously_before_send() {
         let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
-        assert!(
-            !ctrl.pause_checked_snapshot(),
-            "初期は false"
-        );
+        assert!(!ctrl.pause_checked_snapshot(), "初期は false");
 
         ctrl.set_paused_check(true);
         // 同スレッドからの load: store が return より前に実行されているはず。
@@ -631,4 +624,3 @@ mod tests {
         assert_eq!(count, 2, "同値でも command 2 通は積まれる");
     }
 }
-

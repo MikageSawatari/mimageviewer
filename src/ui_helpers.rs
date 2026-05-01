@@ -479,8 +479,7 @@ pub fn adjacent_navigable_idx(
     let current_in_list = nav_indices.get(insert_pos).is_some_and(|&i| i == current);
     if current_in_list {
         let pos = insert_pos;
-        let new_pos =
-            (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
+        let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
         if new_pos == pos {
             None
         } else {
@@ -596,11 +595,7 @@ fn layout_path_hierarchy(
     min_font: f32,
 ) -> std::sync::Arc<egui::Galley> {
     if components.is_empty() {
-        return painter.layout_no_wrap(
-            String::new(),
-            egui::FontId::proportional(min_font),
-            color,
-        );
+        return painter.layout_no_wrap(String::new(), egui::FontId::proportional(min_font), color);
     }
     // Phase 1: 全コンポーネントで font を max→min へ shrink。
     // 深いパスで max_font が確実に縦にはみ出す場合、高さベースで推定した上限まで
@@ -612,8 +607,7 @@ fn layout_path_hierarchy(
     let full = components.join("\n");
     let mut font = start_font;
     while font >= min_font {
-        let galley =
-            painter.layout_no_wrap(full.clone(), egui::FontId::proportional(font), color);
+        let galley = painter.layout_no_wrap(full.clone(), egui::FontId::proportional(font), color);
         if galley.size().x <= max_size.x && galley.size().y <= max_size.y {
             return galley;
         }
@@ -669,7 +663,9 @@ pub fn layout_path_tail_elided(
     let (mut lo, mut hi) = (1usize, chars.len());
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let candidate: String = std::iter::once('…').chain(chars[mid..].iter().copied()).collect();
+        let candidate: String = std::iter::once('…')
+            .chain(chars[mid..].iter().copied())
+            .collect();
         let galley = painter.layout_no_wrap(candidate, font.clone(), color);
         if galley.size().x <= max_width {
             hi = mid;
@@ -680,7 +676,9 @@ pub fn layout_path_tail_elided(
     if lo >= chars.len() {
         return painter.layout_no_wrap("…".to_string(), font, color);
     }
-    let candidate: String = std::iter::once('…').chain(chars[lo..].iter().copied()).collect();
+    let candidate: String = std::iter::once('…')
+        .chain(chars[lo..].iter().copied())
+        .collect();
     painter.layout_no_wrap(candidate, font, color)
 }
 

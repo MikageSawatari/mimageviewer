@@ -183,7 +183,10 @@ impl ProgressReporter {
 
     /// カウント情報からの ETA スナップショット。カウント未設定なら None。
     pub fn snapshot_eta(&self) -> Option<EtaSnapshot> {
-        self.inner.lock().ok().and_then(|g| g.count.as_ref().map(|c| c.eta()))
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.count.as_ref().map(|c| c.eta()))
     }
 }
 

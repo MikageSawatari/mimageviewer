@@ -13,11 +13,11 @@ impl App {
     /// bridge slot idx と settings idx は load 失敗で詰まるとズレるため
     /// (Codex P2、2026-05-01)、path をキーに entry を引く流儀に統一する。
     /// path は preferences 側で重複追加を弾いているので一意。
-    pub(crate) fn find_vst3_entry_mut(
-        &mut self,
-        path: &str,
-    ) -> Option<&mut Vst3PluginEntry> {
-        self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
+    pub(crate) fn find_vst3_entry_mut(&mut self, path: &str) -> Option<&mut Vst3PluginEntry> {
+        self.settings
+            .vst3_plugins
+            .iter_mut()
+            .find(|e| e.path == path)
     }
 
     /// 全 Loaded プラグインの内部状態 (= EQ カーブ / chunk) を bridge から取得して、

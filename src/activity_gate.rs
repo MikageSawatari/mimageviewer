@@ -23,8 +23,8 @@
 //!
 //! `SystemTime` ではなく `Instant` ベースの単調時刻を使う (DST / 時刻合わせの影響回避)。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// デフォルトの「最終操作からこの ms 以上無操作なら indexer が再開してよい」閾値。

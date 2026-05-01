@@ -450,10 +450,7 @@ const DC_NS: &[u8] = b"http://purl.org/dc/elements/1.1/";
 /// 既存 XMP パケット内の `<dc:subject>...</dc:subject>` をバイト位置で探し、
 /// 新しい Bag 形式の要素で丸ごと置換する。存在しなければ `<rdf:Description>` の
 /// 閉じタグ直前に挿入する。
-fn replace_or_insert_dc_subject(
-    xmp: &[u8],
-    tags: &[String],
-) -> Result<Vec<u8>, WriteError> {
+fn replace_or_insert_dc_subject(xmp: &[u8], tags: &[String]) -> Result<Vec<u8>, WriteError> {
     let new_element = build_dc_subject_element(tags);
 
     if let Some((start, end)) = find_dc_subject_range(xmp)? {
@@ -584,7 +581,6 @@ fn is_dc_subject(ns: &quick_xml::name::ResolveResult<'_>, local: &[u8]) -> bool 
     matches!(ns, quick_xml::name::ResolveResult::Bound(n) if n.as_ref() == DC_NS)
 }
 
-
 /// `<rdf:Description>` の閉じタグ `</rdf:Description>` の開始位置を返す。
 /// 最初に出現するものを採用 (XMP は通常 1 つだけ)。
 fn find_rdf_description_close_pos(xmp: &[u8]) -> Result<Option<usize>, WriteError> {
@@ -605,9 +601,7 @@ fn find_rdf_description_self_close(xmp: &[u8]) -> Result<Option<(usize, usize)>,
         .iter()
         .position(|&b| b == b'>')
         .map(|p| p + from)
-        .ok_or_else(|| {
-            WriteError::MalformedContainer("rdf:Description 開始タグ未閉".into())
-        })?;
+        .ok_or_else(|| WriteError::MalformedContainer("rdf:Description 開始タグ未閉".into()))?;
     // `>` の直前が `/` なら self-close
     if end > 0 && xmp[end - 1] == b'/' {
         return Ok(Some((end - 1, end + 1)));
@@ -758,9 +752,7 @@ fn current_iso8601_utc() -> String {
     let minute = (rem % 3_600) / 60;
     let second = rem % 60;
     let (y, m, d) = civil_from_days(days as i64);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}+00:00"
-    )
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}+00:00")
 }
 
 /// Howard Hinnant's date algorithm: days since UNIX epoch → civil (y, m, d).
@@ -773,7 +765,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { (mp + 3) as u32 } else { (mp - 9) as u32 }; // [1, 12]
+    let m = if mp < 10 {
+        (mp + 3) as u32
+    } else {
+        (mp - 9) as u32
+    }; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }
@@ -902,7 +898,9 @@ fn parse_jpeg_segments(bytes: &[u8]) -> Result<JpegParsed, WriteError> {
         pos = seg_end;
     }
     // SOS 無し → 異常ファイル
-    Err(WriteError::MalformedContainer("SOS marker not found".into()))
+    Err(WriteError::MalformedContainer(
+        "SOS marker not found".into(),
+    ))
 }
 
 fn rebuild_jpeg(
@@ -1153,7 +1151,9 @@ fn parse_webp_chunks(
     bytes: &[u8],
 ) -> Result<(Vec<(String, Vec<u8>)>, Option<Vec<u8>>), WriteError> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return Err(WriteError::MalformedContainer("WebP RIFF ヘッダ不正".into()));
+        return Err(WriteError::MalformedContainer(
+            "WebP RIFF ヘッダ不正".into(),
+        ));
     }
     let mut pos = 12;
     let mut chunks: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1171,7 +1171,9 @@ fn parse_webp_chunks(
         let data_start = pos + 8;
         let data_end = data_start + size;
         if data_end > bytes.len() {
-            return Err(WriteError::MalformedContainer("WebP chunk extends beyond file".into()));
+            return Err(WriteError::MalformedContainer(
+                "WebP chunk extends beyond file".into(),
+            ));
         }
         let data = bytes[data_start..data_end].to_vec();
         if fourcc == "XMP " {
@@ -1312,8 +1314,7 @@ mod tests {
     #[test]
     fn remove_tag() {
         let xmp = sample_xmp_with_subject();
-        let (out, tags) =
-            edit_xmp_packet(&xmp, &TagOp::Remove("Existing".to_string())).unwrap();
+        let (out, tags) = edit_xmp_packet(&xmp, &TagOp::Remove("Existing".to_string())).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("<rdf:li>Existing</rdf:li>"));
         assert!(!tags.contains("Existing"));
@@ -1324,10 +1325,12 @@ mod tests {
         // Undo/Redo の SetTags: dc:subject を完全置換する。既存要素は破棄。
         let xmp = sample_xmp_with_subject();
         let target = vec!["#風景".to_string(), "Author".to_string()];
-        let (out, tags) =
-            edit_xmp_packet(&xmp, &TagOp::Set(target.clone())).unwrap();
+        let (out, tags) = edit_xmp_packet(&xmp, &TagOp::Set(target.clone())).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("<rdf:li>Existing</rdf:li>"), "既存タグは消える: {s}");
+        assert!(
+            !s.contains("<rdf:li>Existing</rdf:li>"),
+            "既存タグは消える: {s}"
+        );
         assert!(s.contains("<rdf:li>#風景</rdf:li>"), "{s}");
         assert!(s.contains("<rdf:li>Author</rdf:li>"), "{s}");
         assert!(tags.contains("#風景"));
@@ -1537,7 +1540,10 @@ mod tests {
         let (out, tags) = apply_tag_op_webp(&webp, &TagOp::Add("#web".to_string())).unwrap();
         assert!(out.starts_with(b"RIFF"));
         assert_eq!(&out[8..12], b"WEBP");
-        assert!(find_subsequence(&out, b"XMP ").is_some(), "XMP chunk present");
+        assert!(
+            find_subsequence(&out, b"XMP ").is_some(),
+            "XMP chunk present"
+        );
         assert!(find_subsequence(&out, b"VP8X").is_some(), "VP8X added");
         assert!(find_subsequence(&out, b"<rdf:li>#web</rdf:li>").is_some());
         assert!(tags.contains("#web"));
@@ -1641,7 +1647,9 @@ mod tests {
     fn minimal_jpeg() -> Vec<u8> {
         let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
         // SOF0 (0xC0): length=11, precision=8, height=1, width=1, 1 component {id=1, sampling=0x11, q_table=0}
-        out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00]);
+        out.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+        ]);
         // SOS (0xDA): length=8, 1 component, id=1, huff=0x00, Ss=0, Se=63, Ah/Al=0
         out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
         // 画像データ (無くても形式上 OK)、EOI
@@ -1662,7 +1670,8 @@ mod tests {
       xmpNote:HasExtendedXMP="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">
     </rdf:Description>
   </rdf:RDF>
-</x:xmpmeta>"#.as_slice();
+</x:xmpmeta>"#
+            .as_slice();
         let mut out: Vec<u8> = vec![0xFF, 0xD8];
 
         // Standard XMP APP1
@@ -1683,7 +1692,9 @@ mod tests {
         push_jpeg_app1(&mut out, &ext_payload);
 
         // SOF0 + SOS + EOI (minimal_jpeg と同じ)
-        out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00]);
+        out.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+        ]);
         out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
         out.extend_from_slice(&[0xFF, 0xD9]);
         out
@@ -1758,7 +1769,11 @@ mod tests {
         let packet = edit_xmp_packet_rating(&[], Some(3)).expect("initial");
         let cleared = edit_xmp_packet_rating(&packet, None).expect("clear");
         assert_eq!(crate::xmp_reader::parse_xmp_rating(&cleared), None);
-        assert!(!std::str::from_utf8(&cleared).unwrap().contains("xmp:Rating="));
+        assert!(
+            !std::str::from_utf8(&cleared)
+                .unwrap()
+                .contains("xmp:Rating=")
+        );
     }
 
     #[test]

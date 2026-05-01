@@ -346,8 +346,8 @@ impl SearchIndexDb {
         &self,
     ) -> rusqlite::Result<std::collections::HashMap<String, u64>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT favorite_root, COUNT(*) FROM entries GROUP BY favorite_root")?;
+        let mut stmt =
+            conn.prepare("SELECT favorite_root, COUNT(*) FROM entries GROUP BY favorite_root")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -456,9 +456,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         pk_cols.len() == 1 && pk_cols[0].1 == "path"
     };
     if old_pk_is_path_only {
-        crate::logger::log(
-            "search_index_db: migrating PRIMARY KEY (path) → (favorite_root, path)",
-        );
+        crate::logger::log("search_index_db: migrating PRIMARY KEY (path) → (favorite_root, path)");
         conn.execute_batch(
             "CREATE TABLE entries_new (
                  path                  TEXT NOT NULL,
@@ -530,12 +528,7 @@ pub(crate) fn next_write_stamp() -> i64 {
     let mut prev = WRITE_STAMP.load(Ordering::Relaxed);
     loop {
         let next = std::cmp::max(prev.saturating_add(1), now_ns);
-        match WRITE_STAMP.compare_exchange_weak(
-            prev,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match WRITE_STAMP.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(v) => prev = v,
         }
@@ -548,12 +541,7 @@ pub(crate) fn next_write_stamp() -> i64 {
 fn bump_write_stamp_floor(floor: i64) {
     let mut prev = WRITE_STAMP.load(Ordering::Relaxed);
     while prev < floor {
-        match WRITE_STAMP.compare_exchange_weak(
-            prev,
-            floor,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match WRITE_STAMP.compare_exchange_weak(prev, floor, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return,
             Err(v) => prev = v,
         }
@@ -679,16 +667,22 @@ mod tests {
         db.upsert_children(&fav, &parent, &children).unwrap();
         assert_eq!(db.total_count().unwrap(), 3);
 
-        let results = db.search("alp", &[], crate::search_query::MatchMode::And).unwrap();
+        let results = db
+            .search("alp", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].display_name, "alpha");
 
-        let results = db.search(".zip", &[], crate::search_query::MatchMode::And).unwrap();
+        let results = db
+            .search(".zip", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, IndexKind::ZipFile);
 
         // 大文字小文字無視
-        let results = db.search("BETA", &[], crate::search_query::MatchMode::And).unwrap();
+        let results = db
+            .search("BETA", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -726,7 +720,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let all = db.search("", &[], crate::search_query::MatchMode::And).unwrap();
+        let all = db
+            .search("", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(all.len(), 3);
         let names: Vec<&str> = all.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"x"));
@@ -748,7 +744,9 @@ mod tests {
 
         db.clear_for_favorite(&fav1).unwrap();
         assert_eq!(db.total_count().unwrap(), 1);
-        let results = db.search("", &[], crate::search_query::MatchMode::And).unwrap();
+        let results = db
+            .search("", &[], crate::search_query::MatchMode::And)
+            .unwrap();
         assert_eq!(results[0].display_name, "b");
     }
 
@@ -770,7 +768,11 @@ mod tests {
         )
         .unwrap();
         let results = db
-            .search("match", &[fav1.clone()], crate::search_query::MatchMode::And)
+            .search(
+                "match",
+                &[fav1.clone()],
+                crate::search_query::MatchMode::And,
+            )
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from(r"C:\Fav1\match"));
@@ -863,7 +865,10 @@ mod tests {
         assert!(names.contains(&"klee"));
         assert!(names.contains(&"nsfw_art"));
         assert!(!names.contains(&"klee_sleep"), "sleep を含むのは常に除外");
-        assert!(!names.contains(&"other"), "include にマッチしない doc は除外");
+        assert!(
+            !names.contains(&"other"),
+            "include にマッチしない doc は除外"
+        );
     }
 
     #[test]

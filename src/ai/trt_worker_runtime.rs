@@ -29,10 +29,7 @@ pub fn run_infer_worker() -> ! {
     // init する。**worker は専用ファイル `trt-worker.log` に append**
     // (= 親の mimageviewer.log を truncate しない)。
     crate::logger::init_for_worker("trt-worker");
-    crate::logger::log(format!(
-        "[TRT-worker] 起動 (pid={})",
-        std::process::id()
-    ));
+    crate::logger::log(format!("[TRT-worker] 起動 (pid={})", std::process::id()));
 
     // Windows: プロセス優先度を HIGH に設定。子プロセスのデフォルトは NORMAL で、
     // Phase 3 計測で worker session.run が main 比 +15 ms/tile かかる原因として
@@ -45,14 +42,10 @@ pub fn run_infer_worker() -> ! {
         let h = GetCurrentProcess();
         match SetPriorityClass(h, HIGH_PRIORITY_CLASS) {
             Ok(_) => {
-                crate::logger::log(
-                    "[TRT-worker] process priority = HIGH に設定".to_string(),
-                );
+                crate::logger::log("[TRT-worker] process priority = HIGH に設定".to_string());
             }
             Err(e) => {
-                crate::logger::log(format!(
-                    "[TRT-worker] SetPriorityClass(HIGH) 失敗: {e:?}"
-                ));
+                crate::logger::log(format!("[TRT-worker] SetPriorityClass(HIGH) 失敗: {e:?}"));
             }
         }
     }
@@ -193,9 +186,7 @@ impl ShmCache {
         size: usize,
     ) -> Result<&'a mut super::trt_worker_shm::SharedMem, String> {
         let needs_open = match slot.as_ref() {
-            Some((cached_name, cached_shm)) => {
-                cached_name != name || cached_shm.size() != size
-            }
+            Some((cached_name, cached_shm)) => cached_name != name || cached_shm.size() != size,
             None => true,
         };
         if needs_open {
@@ -245,7 +236,11 @@ fn handle_infer(
     }
 
     // 共有メモリは ShmCache で使い回す (毎回 open しない、起動時 1 回 + キャッシュ)。
-    let in_shm = match ShmCache::get_or_open(&mut shm_cache.in_shm, input_shm, PERSIST_IN_SHM_SIZE_HINT.max(input_bytes)) {
+    let in_shm = match ShmCache::get_or_open(
+        &mut shm_cache.in_shm,
+        input_shm,
+        PERSIST_IN_SHM_SIZE_HINT.max(input_bytes),
+    ) {
         Ok(s) => s,
         Err(e) => return WorkerResp::err(format!("get_or_open input shm: {e}")),
     };
@@ -342,9 +337,8 @@ fn handle_infer(
             )));
         }
 
-        let raw_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(raw.as_ptr() as *const u8, total_bytes)
-        };
+        let raw_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, total_bytes) };
         let out_shm = ShmCache::get_or_open(out_shm_slot, output_shm, output_capacity)
             .map_err(|e| super::AiError::Ort(format!("get_or_open output shm: {e}")))?;
         out_shm.write(raw_bytes);

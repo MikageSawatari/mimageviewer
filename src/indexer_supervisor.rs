@@ -701,7 +701,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
-        Arc::clone(&gate),
+            Arc::clone(&gate),
         );
 
         // 初期スキャン完了を最長 5 秒待つ
@@ -817,7 +817,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
-        Arc::clone(&gate),
+            Arc::clone(&gate),
         );
         let handle_b = spawn(
             SupervisorParams {
@@ -829,7 +829,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
-        Arc::clone(&gate),
+            Arc::clone(&gate),
         );
 
         // 両方が initial_scan_done になることを 5 秒以内に確認
@@ -841,9 +841,7 @@ mod tests {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!(
-                    "2 supervisor の initial scan が両方完了しない (a={done_a}, b={done_b})"
-                );
+                panic!("2 supervisor の initial scan が両方完了しない (a={done_a}, b={done_b})");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -872,7 +870,7 @@ mod tests {
             Arc::clone(&fts),
             Arc::clone(&writer),
             Arc::clone(&sem),
-        Arc::clone(&gate),
+            Arc::clone(&gate),
         );
 
         // 初期スキャン待ち

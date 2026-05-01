@@ -167,7 +167,8 @@ impl AdjustmentDb {
             .conn
             .prepare_cached("SELECT sidecar_mtime FROM sidecar_sync WHERE folder_key = ?1")
             .ok()?;
-        stmt.query_row([folder_key], |row| row.get::<_, i64>(0)).ok()
+        stmt.query_row([folder_key], |row| row.get::<_, i64>(0))
+            .ok()
     }
 
     /// サイドカー同期状態を upsert。import 成功時に最新 mtime を残す。
@@ -186,8 +187,10 @@ impl AdjustmentDb {
 
     /// サイドカー同期状態を削除 (サイドカーが削除されたフォルダに追従する用)。
     pub fn sidecar_sync_clear(&self, folder_key: &str) -> Result<(), rusqlite::Error> {
-        self.conn
-            .execute("DELETE FROM sidecar_sync WHERE folder_key = ?1", [folder_key])?;
+        self.conn.execute(
+            "DELETE FROM sidecar_sync WHERE folder_key = ?1",
+            [folder_key],
+        )?;
         Ok(())
     }
 
@@ -247,7 +250,9 @@ impl AdjustmentDb {
     /// `keep` に含まれない favorite_id の行を削除する (起動時 orphan cleanup)。
     /// お気に入りが削除された後もロジック上は無害だが、DB が肥大化しないよう定期的に掃除する。
     pub fn prune_favorite_params(&self, keep: &HashSet<Uuid>) -> Result<usize, rusqlite::Error> {
-        let mut stmt = self.conn.prepare("SELECT favorite_id FROM favorite_params")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT favorite_id FROM favorite_params")?;
         let rows: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(Result::ok)
@@ -309,7 +314,11 @@ pub fn normalize_path(path: &Path) -> String {
 /// フォーマットドリフト (= 書き込み側と読み出し側でキーがずれて rating が消える)
 /// を防ぐ目的で 1 箇所に集約している。
 pub fn zip_entry_key(container_path: &Path, entry: &str) -> String {
-    format!("{}::{}", normalize_path(container_path), entry.to_lowercase())
+    format!(
+        "{}::{}",
+        normalize_path(container_path),
+        entry.to_lowercase()
+    )
 }
 
 /// SQL `LIKE` の特殊文字 (`\`, `%`, `_`, `[`) を `\` でエスケープする。

@@ -85,7 +85,9 @@ impl AudioEngine {
         let sample_rate = config.sample_rate().0;
         let channels = config.channels() as u32;
         if channels < 2 {
-            return Err(format!("output device has only {channels} channel(s); need stereo"));
+            return Err(format!(
+                "output device has only {channels} channel(s); need stereo"
+            ));
         }
 
         let block_size = 480u32; // bridge 側に渡す処理ブロックサイズ
@@ -128,7 +130,8 @@ impl AudioEngine {
                         let nu = n_frames as u32;
                         min_n_frames_cb.fetch_min(nu, Ordering::Relaxed);
                         max_n_frames_cb.fetch_max(nu, Ordering::Relaxed);
-                        let amp = tone_for_cb.amplitude_milli.load(Ordering::Relaxed) as f32 / 1000.0;
+                        let amp =
+                            tone_for_cb.amplitude_milli.load(Ordering::Relaxed) as f32 / 1000.0;
                         let muted = tone_for_cb.muted.load(Ordering::Relaxed);
                         let freq = tone_for_cb.freq_hz.load(Ordering::Relaxed) as f32;
                         let mode_val = *mode_for_cb.lock().unwrap();

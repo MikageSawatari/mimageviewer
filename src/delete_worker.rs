@@ -127,8 +127,7 @@ fn recycle_one(path: &std::path::Path) -> Result<(), String> {
         .chain(std::iter::once(0))
         .chain(std::iter::once(0))
         .collect();
-    let flags =
-        (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0) as u16;
+    let flags = (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0) as u16;
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: windows::core::PCWSTR(wide.as_ptr()),

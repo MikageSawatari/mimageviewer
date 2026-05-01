@@ -118,7 +118,7 @@ impl App {
                 *slot.lock().unwrap() = captured;
             }
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+            use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
             unsafe {
                 let _ = ShowWindow(HWND(hwnd_raw as *mut _), SW_HIDE);
             }

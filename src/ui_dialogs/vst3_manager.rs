@@ -74,9 +74,7 @@ impl App {
             1.0,
             egui::Color32::from_rgba_unmultiplied(120, 120, 120, 200),
         );
-        let frame = egui::Frame::window(&ctx.style())
-            .fill(bg)
-            .stroke(stroke);
+        let frame = egui::Frame::window(&ctx.style()).fill(bg).stroke(stroke);
 
         egui::Window::new("VST3")
             .id(egui::Id::new("vst3-playback-panel"))

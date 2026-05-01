@@ -6,9 +6,9 @@
 //! マスクは SQLite (mask_db) に永続化される。
 
 use eframe::egui;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 
 use crate::app::{App, EraseSnapshot, EraseTool, EraseVectorDrag, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
@@ -228,11 +228,7 @@ impl App {
     /// 既存の編集をそのページの inpaint として保存・適用してから、もう一方のページに
     /// 移動して新たに編集モードへ入る ([E] 適用 → 移動 → [E] 開始 と等価)。Undo は
     /// ページごとに独立 (= 切替時にスタックは捨てる)、ズーム/パンは初期化する。
-    pub(crate) fn switch_erase_target_in_spread(
-        &mut self,
-        ctx: &egui::Context,
-        new_idx: usize,
-    ) {
+    pub(crate) fn switch_erase_target_in_spread(&mut self, ctx: &egui::Context, new_idx: usize) {
         // 同ページなら no-op
         if self.fullscreen_idx == Some(new_idx) {
             return;
@@ -1611,9 +1607,7 @@ impl App {
                 // ボタン押下 = 現ページ編集を Apply → 反対ページへ移動 → 編集再開。
                 // 単一ページ (片側のみのページ) から入った場合は erase_spread_ctx が
                 // None なのでこのセクション全体が描画されない (= Single と同じ見た目)。
-                if let Some((left_idx, right_idx)) =
-                    self.erase_spread_ctx.map(|c| c.pair)
-                {
+                if let Some((left_idx, right_idx)) = self.erase_spread_ctx.map(|c| c.pair) {
                     let pages = [("左ページ", left_idx), ("右ページ", right_idx)];
                     let page_w = (pw - 4.0) / 2.0;
                     let mut switch_to: Option<usize> = None;
@@ -1630,9 +1624,11 @@ impl App {
                         };
                         let resp = child.allocate_rect(btn_rect, egui::Sense::click());
                         if resp.hovered() && !is_active {
-                            child
-                                .painter()
-                                .rect_filled(btn_rect, 3.0, egui::Color32::from_gray(70));
+                            child.painter().rect_filled(
+                                btn_rect,
+                                3.0,
+                                egui::Color32::from_gray(70),
+                            );
                         } else {
                             child.painter().rect_filled(btn_rect, 3.0, bg);
                         }
@@ -1966,11 +1962,7 @@ impl App {
         let Some(bitmap) = self.erase_mask.clone() else {
             return false;
         };
-        let Some(original) = self
-            .erase_base_cache
-            .get(&fs_idx)
-            .map(Arc::clone)
-        else {
+        let Some(original) = self.erase_base_cache.get(&fs_idx).map(Arc::clone) else {
             return false;
         };
         let [w, h] = self.erase_mask_size;
@@ -2135,8 +2127,16 @@ impl App {
         std::thread::Builder::new()
             .name("erase-inpaint".to_string())
             .spawn(move || {
-                let result =
-                    run_inpaint_pure(runtime.as_ref(), &manager, &original, &composite, w, h, &cancel_for_thread, log_prefix);
+                let result = run_inpaint_pure(
+                    runtime.as_ref(),
+                    &manager,
+                    &original,
+                    &composite,
+                    w,
+                    h,
+                    &cancel_for_thread,
+                    log_prefix,
+                );
                 if cancel_for_thread.load(Ordering::Relaxed) {
                     return;
                 }
@@ -2253,7 +2253,6 @@ impl App {
             }
         })
     }
-
 }
 
 /// worker thread で走る inpaint 本体。`AiRuntime` が利用可能なら MI-GAN、

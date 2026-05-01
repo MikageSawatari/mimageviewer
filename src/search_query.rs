@@ -34,7 +34,11 @@ pub enum MatchMode {
 impl From<bool> for MatchMode {
     /// UI チェックボックスの `or_mode: bool` → `MatchMode` 変換。`true` で `Or`。
     fn from(or_mode: bool) -> Self {
-        if or_mode { MatchMode::Or } else { MatchMode::And }
+        if or_mode {
+            MatchMode::Or
+        } else {
+            MatchMode::And
+        }
     }
 }
 
@@ -490,23 +494,19 @@ mod tests {
         // OR: include は OR でも、exclude は AND (常に除外)
         let t = parse("klee #klee -sleep -nsfw");
         assert!(matches_with_mode(&t, "klee portrait", MatchMode::Or));
-        assert!(!matches_with_mode(
-            &t,
-            "klee is sleep",
-            MatchMode::Or
-        ));
-        assert!(!matches_with_mode(
-            &t,
-            "#klee nsfw",
-            MatchMode::Or
-        ));
+        assert!(!matches_with_mode(&t, "klee is sleep", MatchMode::Or));
+        assert!(!matches_with_mode(&t, "#klee nsfw", MatchMode::Or));
     }
 
     #[test]
     fn or_mode_none_match_fails() {
         // OR: include が 1 つも含まれなければ不一致
         let t = parse("foo bar");
-        assert!(!matches_with_mode(&t, "neither token present", MatchMode::Or));
+        assert!(!matches_with_mode(
+            &t,
+            "neither token present",
+            MatchMode::Or
+        ));
     }
 
     #[test]

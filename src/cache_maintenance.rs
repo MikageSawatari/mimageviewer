@@ -150,10 +150,7 @@ pub fn spawn(task: CacheMaintTask, cache_dir: PathBuf) -> CacheMaintPending {
                 CacheMaintTask::DeleteOld { days } => {
                     let deleted = crate::catalog::delete_old_cache(&cache_dir, days);
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
-                    CacheMaintResult::DeleteOldDone {
-                        deleted,
-                        new_stats,
-                    }
+                    CacheMaintResult::DeleteOldDone { deleted, new_stats }
                 }
                 CacheMaintTask::DeleteAll => {
                     crate::catalog::delete_all_cache(&cache_dir);

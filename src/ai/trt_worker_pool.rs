@@ -112,10 +112,7 @@ impl WorkerHandle {
                         Ok(_) => {
                             // worker 由来 stderr は logger に流す (= デバッグ時に役立つ)。
                             // logger は別ファイル open + Mutex 保護で thread-safe。
-                            crate::logger::log(format!(
-                                "[TRT-worker stderr] {}",
-                                line.trim_end()
-                            ));
+                            crate::logger::log(format!("[TRT-worker stderr] {}", line.trim_end()));
                         }
                         Err(_) => break,
                     }
@@ -186,8 +183,7 @@ impl WorkerHandle {
     }
 
     fn send_cmd(&mut self, cmd: &WorkerCmd) -> Result<WorkerResp, String> {
-        let s = serde_json::to_string(cmd)
-            .map_err(|e| format!("cmd serialize: {e}"))?;
+        let s = serde_json::to_string(cmd).map_err(|e| format!("cmd serialize: {e}"))?;
         writeln!(self.stdin, "{s}").map_err(|e| format!("stdin write: {e}"))?;
         self.stdin
             .flush()
@@ -311,8 +307,7 @@ impl TrtWorkerPool {
     /// プールを起動 (現在の exe をワーカーとして spawn)。
     /// メインアプリ (mimageviewer.exe) から呼ぶ用途。
     pub fn start() -> Result<Self, String> {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("current_exe: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         Self::start_with_exe(&exe)
     }
 
@@ -399,7 +394,10 @@ impl TrtWorkerPool {
         if self.is_dead() {
             return Err("worker is dead (前段で死亡判定済み)".to_string());
         }
-        let mut guard = self.worker.lock().map_err(|_| "worker mutex poisoned".to_string())?;
+        let mut guard = self
+            .worker
+            .lock()
+            .map_err(|_| "worker mutex poisoned".to_string())?;
         let Some(w) = guard.as_mut() else {
             return Err("worker is shut down".to_string());
         };

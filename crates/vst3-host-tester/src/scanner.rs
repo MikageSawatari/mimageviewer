@@ -25,7 +25,12 @@ pub fn default_vst3_paths() -> Vec<PathBuf> {
         paths.push(PathBuf::from(common).join("VST3"));
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        paths.push(PathBuf::from(local).join("Programs").join("Common").join("VST3"));
+        paths.push(
+            PathBuf::from(local)
+                .join("Programs")
+                .join("Common")
+                .join("VST3"),
+        );
     }
     paths
 }
@@ -39,7 +44,11 @@ pub fn scan(roots: &[PathBuf]) -> Vec<DiscoveredPlugin> {
         }
         scan_dir(root, &mut out, 0);
     }
-    out.sort_by(|a, b| a.display_name.to_ascii_lowercase().cmp(&b.display_name.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+    });
     out.dedup_by(|a, b| a.path == b.path);
     out
 }
@@ -63,7 +72,10 @@ fn scan_dir(dir: &Path, out: &mut Vec<DiscoveredPlugin>, depth: usize) {
 
         // .vst3 拡張子は bundle (= ディレクトリ) でも単一 DLL でも有効
         if name.to_ascii_lowercase().ends_with(".vst3") {
-            let display = name.trim_end_matches(".vst3").trim_end_matches(".VST3").to_string();
+            let display = name
+                .trim_end_matches(".vst3")
+                .trim_end_matches(".VST3")
+                .to_string();
             out.push(DiscoveredPlugin {
                 path: path.clone(),
                 display_name: display,

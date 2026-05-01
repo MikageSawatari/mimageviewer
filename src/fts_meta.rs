@@ -198,9 +198,9 @@ impl FtsMetaDb {
             Ok(()) => {
                 let elapsed = t.elapsed();
                 let after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-                if let Err(e) = conn.execute_batch(&format!(
-                    "PRAGMA application_id = {HOUSEKEEPING_VERSION};"
-                )) {
+                if let Err(e) =
+                    conn.execute_batch(&format!("PRAGMA application_id = {HOUSEKEEPING_VERSION};"))
+                {
                     crate::logger::log(format!(
                         "fts_meta: housekeeping marker bump failed (will retry): {e}"
                     ));
@@ -308,10 +308,7 @@ impl FtsMetaDb {
 
     /// 指定 favorite_id 配下の全 path を返す (status 不問)。
     /// `purge_favorite_metadata` で Tantivy 側にも delete_term を投げるための列挙用。
-    pub fn list_all_paths_for_favorite(
-        &self,
-        favorite_id: Uuid,
-    ) -> rusqlite::Result<Vec<String>> {
+    pub fn list_all_paths_for_favorite(&self, favorite_id: Uuid) -> rusqlite::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT path FROM files WHERE favorite_id = ?1")?;
         let rows = stmt.query_map(params![favorite_id.to_string()], |row| {
@@ -521,11 +518,17 @@ macro_rules! filemeta_select_cols {
     };
 }
 
-const FILEMETA_SELECT_SQL_NOT_OK: &str =
-    concat!("SELECT ", filemeta_select_cols!(), " FROM files WHERE status != 0");
+const FILEMETA_SELECT_SQL_NOT_OK: &str = concat!(
+    "SELECT ",
+    filemeta_select_cols!(),
+    " FROM files WHERE status != 0"
+);
 
-const FILEMETA_SELECT_SQL_BY_PATH: &str =
-    concat!("SELECT ", filemeta_select_cols!(), " FROM files WHERE path = ?1");
+const FILEMETA_SELECT_SQL_BY_PATH: &str = concat!(
+    "SELECT ",
+    filemeta_select_cols!(),
+    " FROM files WHERE path = ?1"
+);
 
 fn row_to_filemeta(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
     let uuid_str: String = row.get(1)?;
@@ -598,8 +601,8 @@ fn needs_rebuild(conn: &Connection) -> rusqlite::Result<bool> {
         return Ok(true);
     }
     // index_version が古い行が残っているケース (将来的な v5 → v6 移行用)。
-    let min_ver: Option<i64> = conn
-        .query_row("SELECT MIN(index_version) FROM files", [], |row| {
+    let min_ver: Option<i64> =
+        conn.query_row("SELECT MIN(index_version) FROM files", [], |row| {
             row.get::<_, Option<i64>>(0)
         })?;
     Ok(matches!(min_ver, Some(v) if v < INDEX_VERSION))
@@ -870,14 +873,24 @@ mod tests {
         db.upsert_meta_ok("c:/b/1.jpg", fav_b, &root_b, IndexKind::Image, 1, 1)
             .unwrap();
         let fav_c = Uuid::new_v4();
-        db.upsert_meta_ok("c:/c/1.jpg", fav_c, &PathBuf::from("C:/c"), IndexKind::Image, 1, 1)
-            .unwrap();
+        db.upsert_meta_ok(
+            "c:/c/1.jpg",
+            fav_c,
+            &PathBuf::from("C:/c"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
         db.mark_failed("c:/c/1.jpg").unwrap();
 
         let counts = db.count_ok_grouped_by_favorite().unwrap();
         assert_eq!(counts.get(&fav_a), Some(&2));
         assert_eq!(counts.get(&fav_b), Some(&1));
-        assert!(!counts.contains_key(&fav_c), "fav_c は ok 0 件なのでキー出ない");
+        assert!(
+            !counts.contains_key(&fav_c),
+            "fav_c は ok 0 件なのでキー出ない"
+        );
     }
 
     #[test]
@@ -902,9 +915,7 @@ mod tests {
             .unwrap();
         db.mark_failed("c:/c/1.jpg").unwrap();
 
-        let rows = db
-            .list_not_ok_paths_for_favorites(&[fav_a, fav_b])
-            .unwrap();
+        let rows = db.list_not_ok_paths_for_favorites(&[fav_a, fav_b]).unwrap();
         assert_eq!(rows.len(), 2);
         for (path, fav, _) in &rows {
             assert!(*fav == fav_a || *fav == fav_b, "unexpected fav for {path}");
@@ -924,8 +935,15 @@ mod tests {
         let fav = Uuid::new_v4();
         let root = PathBuf::from("C:/y");
         for i in 0..5 {
-            db.upsert_meta_ok(&format!("c:/y/{}.jpg", i), fav, &root, IndexKind::Image, i, 1)
-                .unwrap();
+            db.upsert_meta_ok(
+                &format!("c:/y/{}.jpg", i),
+                fav,
+                &root,
+                IndexKind::Image,
+                i,
+                1,
+            )
+            .unwrap();
         }
         db.mark_failed("c:/y/2.jpg").unwrap();
         db.mark_failed("c:/y/3.jpg").unwrap();

@@ -113,14 +113,9 @@ impl SharedMem {
             .chain(std::iter::once(0))
             .collect();
         // Safety: 標準的な Win32 API、name は NULL 終端 wide。
-        let handle = unsafe {
-            OpenFileMappingW(
-                FILE_MAP_ALL_ACCESS.0,
-                false,
-                PCWSTR(wname.as_ptr()),
-            )
-        }
-        .map_err(io_err)?;
+        let handle =
+            unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, PCWSTR(wname.as_ptr())) }
+                .map_err(io_err)?;
 
         if handle.is_invalid() {
             return Err(io::Error::new(
@@ -215,8 +210,10 @@ fn io_err(e: windows::core::Error) -> io::Error {
 
 // 未使用警告対策 (GENERIC_READ/WRITE はコメント参照のため import している)
 #[allow(dead_code)]
-const _UNUSED: (windows::Win32::Foundation::GENERIC_ACCESS_RIGHTS, windows::Win32::Foundation::GENERIC_ACCESS_RIGHTS) =
-    (GENERIC_READ, GENERIC_WRITE);
+const _UNUSED: (
+    windows::Win32::Foundation::GENERIC_ACCESS_RIGHTS,
+    windows::Win32::Foundation::GENERIC_ACCESS_RIGHTS,
+) = (GENERIC_READ, GENERIC_WRITE);
 
 #[cfg(test)]
 mod tests {

@@ -349,7 +349,11 @@ fn run_decoder(
     let video_avg_fps = {
         let r = video_stream.avg_frame_rate();
         let d = r.denominator();
-        if d == 0 { 0.0 } else { r.numerator() as f64 / d as f64 }
+        if d == 0 {
+            0.0
+        } else {
+            r.numerator() as f64 / d as f64
+        }
     };
     // VPP ContentDesc に渡す raw 分数 (= num/den のまま渡すことで丸め誤差を排除)。
     // 0 の場合は VPP 側で 60/1 にフォールバックされる。
@@ -364,7 +368,8 @@ fn run_decoder(
         }
     };
 
-    let mut video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params) {
+    let mut video_decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(video_params)
+    {
         Ok(c) => c,
         Err(e) => {
             let _ = info_tx.send(Err(format!("video codec context: {e}")));
@@ -385,11 +390,7 @@ fn run_decoder(
     let hw_setup_result: Option<HwDevice> = if hw_decode_requested {
         #[cfg(windows)]
         {
-            try_init_d3d11va(
-                codec_id,
-                &mut video_decoder_ctx,
-                gpu_video_device.as_ref(),
-            )
+            try_init_d3d11va(codec_id, &mut video_decoder_ctx, gpu_video_device.as_ref())
         }
         #[cfg(not(windows))]
         {
@@ -409,9 +410,7 @@ fn run_decoder(
         Err(e) => {
             // HW 有効で open 失敗 → SW で再試行
             if hw_active_initially {
-                crate::logger::log(format!(
-                    "HW decoder open failed ({e}), retrying with SW"
-                ));
+                crate::logger::log(format!("HW decoder open failed ({e}), retrying with SW"));
                 let retry_ctx = match ffmpeg::codec::context::Context::from_parameters(
                     input.streams().best(MediaType::Video).unwrap().parameters(),
                 ) {
@@ -585,7 +584,11 @@ fn run_decoder(
     // perf: 動画特性を 1 行に記録 (解析時の最初の手がかり)。
     if crate::perf::is_enabled() {
         let pix_fmt = format!("{:?}", video_decoder.format());
-        let decode_path = if hw_active_initially { "hw_d3d11va" } else { "sw" };
+        let decode_path = if hw_active_initially {
+            "hw_d3d11va"
+        } else {
+            "sw"
+        };
         let file_name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -631,14 +634,12 @@ fn run_decoder(
     // demux horizon を pace_lead (0.60s) + packet queue (5s) ≒ 5.6s まで広げる
     // (= Codex 助言、2026-05-01)。compressed audio packet なのでメモリは軽い
     // (= 数 KB/packet × 256 ≒ 数百 KB)。
-    let audio_stream_idx_for_demux: Option<usize> =
-        audio_setup.as_ref().map(|a| a.stream_idx);
+    let audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
     let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(256);
     // audio decode thread の JoinHandle。run_decoder 終了時に
     // `drop(audio_pkt_tx)` → channel disconnect → audio thread exit を経由して join する。
     // `audio_setup` は ここで consume される (= 以降 demux からは触らない)。
-    let audio_decode_handle: Option<std::thread::JoinHandle<()>> = if let Some(setup) =
-        audio_setup
+    let audio_decode_handle: Option<std::thread::JoinHandle<()>> = if let Some(setup) = audio_setup
     {
         let clock_a = clock.clone();
         let cancel_a = cancel.clone();
@@ -649,13 +650,7 @@ fn run_decoder(
             std::thread::Builder::new()
                 .name("video-audio-decode".into())
                 .spawn(move || {
-                    run_audio_decode(
-                        setup,
-                        audio_pkt_rx,
-                        audio_tx_for_thread,
-                        clock_a,
-                        cancel_a,
-                    );
+                    run_audio_decode(setup, audio_pkt_rx, audio_tx_for_thread, clock_a, cancel_a);
                 })
                 .expect("spawn video-audio-decode thread"),
         )
@@ -748,13 +743,23 @@ fn run_decoder(
             // `avformat_seek_file` (= `Input::seek`) は AVSEEK_FLAG_BACKWARD を
             // 無視するため、デマクサが target を跨いだ前後どちらの keyframe を
             // 選ぶか不定。raw FFI 経由で確実に target 以前へ飛ばす。
-            let backward = |input: &mut ffmpeg::format::context::Input| -> Result<(), ffmpeg::Error> {
-                use ffmpeg_the_third::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-                let ret = unsafe {
-                    av_seek_frame(input.as_mut_ptr(), -1, target_pts, AVSEEK_FLAG_BACKWARD as i32)
+            let backward =
+                |input: &mut ffmpeg::format::context::Input| -> Result<(), ffmpeg::Error> {
+                    use ffmpeg_the_third::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
+                    let ret = unsafe {
+                        av_seek_frame(
+                            input.as_mut_ptr(),
+                            -1,
+                            target_pts,
+                            AVSEEK_FLAG_BACKWARD as i32,
+                        )
+                    };
+                    if ret >= 0 {
+                        Ok(())
+                    } else {
+                        Err(ffmpeg::Error::from(ret))
+                    }
                 };
-                if ret >= 0 { Ok(()) } else { Err(ffmpeg::Error::from(ret)) }
-            };
 
             // Phase 9.F (2026-04-30): 前方/後方/絶対に関係なく **常に backward seek**
             // (= `av_seek_frame + AVSEEK_FLAG_BACKWARD`) を使う。旧コードは前方相対で
@@ -907,14 +912,12 @@ fn run_decoder(
             // Phase 3e: engine にも SeekCompleted を通知 (= Seeking → Buffering 遷移)。
             // これがないと engine は永久 Seeking 状態に張り付き、pacing escape が
             // 解除されない。
-            let _ = engine_event_tx.try_send(
-                crate::video::engine::EngineEvent::Decoder(
-                    crate::video::engine::state::DecoderEvent::SeekCompleted {
-                        epoch: serial,
-                        actual_pts: target_secs,
-                    },
-                ),
-            );
+            let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Decoder(
+                crate::video::engine::state::DecoderEvent::SeekCompleted {
+                    epoch: serial,
+                    actual_pts: target_secs,
+                },
+            ));
         }
 
         // 1 パケット読み込み
@@ -943,10 +946,7 @@ fn run_decoder(
                 // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
                 // 直前の Flush marker と packet の到着順が逆転しない。bounded(64) が
                 // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい。
-                if video_pkt_tx
-                    .send(VideoWorkerMsg::Packet(packet))
-                    .is_err()
-                {
+                if video_pkt_tx.send(VideoWorkerMsg::Packet(packet)).is_err() {
                     // video decode thread が既に終了している → 自分も exit。
                     break 'outer;
                 }
@@ -993,10 +993,7 @@ fn run_decoder(
             let _ = video_pkt_tx.send(VideoWorkerMsg::Eof);
             loop {
                 if cancel.load(Ordering::Acquire) {
-                    crate::logger::log(format!(
-                        "video decoder finished: {}",
-                        path.display()
-                    ));
+                    crate::logger::log(format!("video decoder finished: {}", path.display()));
                     break 'outer;
                 }
                 if clock.peek_seek_request_pending() {
@@ -1066,10 +1063,10 @@ fn run_video_decode(
     video_fps_den: u32,
     hw_active_initially: bool,
 ) {
-    use ffmpeg_the_third as ffmpeg;
     use ffmpeg::format::Pixel;
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
     use ffmpeg::util::frame::video::Video;
+    use ffmpeg_the_third as ffmpeg;
 
     let mut scaler: Option<ScaleContext> = None;
     let mut scaler_key: Option<(Pixel, u32, u32)> = None;
@@ -1088,7 +1085,11 @@ fn run_video_decode(
             Err(_) => break, // demux thread exited → channel disconnect
         };
         let packet = match msg {
-            VideoWorkerMsg::Flush { serial, seek_target_secs: _, trim_before_secs } => {
+            VideoWorkerMsg::Flush {
+                serial,
+                seek_target_secs: _,
+                trim_before_secs,
+            } => {
                 video_decoder.flush();
                 current_seek_serial = serial;
                 drop_before_secs = trim_before_secs;
@@ -1180,10 +1181,10 @@ fn run_video_decode(
                             // 同時に AUDIO_SAFE_LO/HI を AudioBuffer cap (300ms) 前提の値に縮小
                             // (= VST 有効時の steady state 70-80ms で常時 escape にならないため)。
                             const PACE_LEAD_SECS: f64 = 0.30;
-                            const AUDIO_SAFE_LO: f64 = 0.10;   // 旧 0.25 (= cap 1.5s 時代)
-                            const AUDIO_SAFE_HI: f64 = 0.20;   // 旧 0.75 (= cap 300ms に整合)
+                            const AUDIO_SAFE_LO: f64 = 0.10; // 旧 0.25 (= cap 1.5s 時代)
+                            const AUDIO_SAFE_HI: f64 = 0.20; // 旧 0.75 (= cap 300ms に整合)
                             const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
-                            const AUDIO_CRITICAL_LO: f64 = 0.03;  // 旧 0.08 (= 将来 audio 専用 emergency 用に保持)
+                            const AUDIO_CRITICAL_LO: f64 = 0.03; // 旧 0.08 (= 将来 audio 専用 emergency 用に保持)
                             let mut in_audio_escape = false;
                             let mut new_seek_pending = false;
                             // Phase 9.C (2026-04-30): pause-park。旧コードは
@@ -1235,8 +1236,8 @@ fn run_video_decode(
                                 // 達するまで decoder は frame を生産。これにより
                                 // Buffering→Playing 遷移時には buffer がほぼ満杯
                                 // (ユーザー要望: 「バッファが半分まで埋まったら開始」)。
-                                let engine_playing = engine_st
-                                    == crate::video::engine::actor::state_code::PLAYING;
+                                let engine_playing =
+                                    engine_st == crate::video::engine::actor::state_code::PLAYING;
                                 let allow_pace_lead = engine_playing
                                     || engine_st
                                         == crate::video::engine::actor::state_code::BUFFERING;
@@ -1306,7 +1307,7 @@ fn run_video_decode(
                                 // (= seek/burst 直後の post-seek 1 枚目補填) のみ pace_lead を超えた
                                 // 送出を許可。`audio_buf < AUDIO_CRITICAL_LO` 単独 bypass は撤去
                                 // (= Codex 助言、2026-05-01。video frame の過剰生産は audio を救わない)。
-                                let _ = AUDIO_CRITICAL_LO;  // 将来 audio 専用 emergency 用に定数保持
+                                let _ = AUDIO_CRITICAL_LO; // 将来 audio 専用 emergency 用に定数保持
                                 if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
                                     break;
                                 }
@@ -1322,8 +1323,7 @@ fn run_video_decode(
                             use crossbeam_channel::TrySendError;
                             let pts_gap = pts_secs - last_enqueued_pts;
                             let send_result = video_tx.try_send(gpu_frame_out);
-                            let dropped_full =
-                                matches!(&send_result, Err(TrySendError::Full(_)));
+                            let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
                             if !dropped_full && send_result.is_ok() {
                                 last_enqueued_pts = pts_secs;
                                 post_seek_frame_sent = true;
@@ -1341,14 +1341,8 @@ fn run_video_decode(
                                     &[
                                         ("pts", serde_json::Value::from(pts_secs)),
                                         ("path", serde_json::Value::from("gpu_blit")),
-                                        (
-                                            "dropped_full",
-                                            serde_json::Value::from(dropped_full),
-                                        ),
-                                        (
-                                            "pts_gap_ms",
-                                            serde_json::Value::from(pts_gap * 1000.0),
-                                        ),
+                                        ("dropped_full", serde_json::Value::from(dropped_full)),
+                                        ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
                                         (
                                             "audio_buf_secs",
                                             serde_json::Value::from(
@@ -1359,27 +1353,19 @@ fn run_video_decode(
                                         // (Codex 助言、2026-05-01)
                                         (
                                             "audio_processed_secs",
-                                            serde_json::Value::from(
-                                                clock.audio_processed_secs(),
-                                            ),
+                                            serde_json::Value::from(clock.audio_processed_secs()),
                                         ),
                                         (
                                             "audio_raw_pending_secs",
-                                            serde_json::Value::from(
-                                                clock.audio_raw_pending_secs(),
-                                            ),
+                                            serde_json::Value::from(clock.audio_raw_pending_secs()),
                                         ),
                                         (
                                             "audio_tx_queued_secs",
-                                            serde_json::Value::from(
-                                                clock.audio_tx_queued_secs(),
-                                            ),
+                                            serde_json::Value::from(clock.audio_tx_queued_secs()),
                                         ),
                                         (
                                             "pace_now",
-                                            serde_json::Value::from(
-                                                clock.video_pacing_now_secs(),
-                                            ),
+                                            serde_json::Value::from(clock.video_pacing_now_secs()),
                                         ),
                                     ],
                                 );
@@ -1409,15 +1395,9 @@ fn run_video_decode(
                     let mut sw = Video::empty();
                     unsafe {
                         use ffmpeg_the_third::ffi::av_hwframe_transfer_data;
-                        let ret = av_hwframe_transfer_data(
-                            sw.as_mut_ptr(),
-                            frame.as_ptr(),
-                            0,
-                        );
+                        let ret = av_hwframe_transfer_data(sw.as_mut_ptr(), frame.as_ptr(), 0);
                         if ret < 0 {
-                            crate::logger::log(format!(
-                                "av_hwframe_transfer_data failed: {ret}"
-                            ));
+                            crate::logger::log(format!("av_hwframe_transfer_data failed: {ret}"));
                             continue;
                         }
                     }
@@ -1448,7 +1428,10 @@ fn run_video_decode(
                     0,
                     &[
                         ("decode_path", serde_json::Value::from(actual_path)),
-                        ("frame_pix_fmt", serde_json::Value::from(format!("{cur_fmt:?}"))),
+                        (
+                            "frame_pix_fmt",
+                            serde_json::Value::from(format!("{cur_fmt:?}")),
+                        ),
                         ("frame_w", serde_json::Value::from(cur_w as i64)),
                         ("frame_h", serde_json::Value::from(cur_h as i64)),
                     ],
@@ -1510,10 +1493,10 @@ fn run_video_decode(
             // (詳細コメントは旧 run_decoder CPU 経路コメント + GPU 経路コメント参照)。
             // 微小 frame drop 修正 (2026-05-01、Codex 助言): 詳細は GPU 経路コメント参照。
             const PACE_LEAD_SECS: f64 = 0.30;
-            const AUDIO_SAFE_LO: f64 = 0.10;   // 旧 0.25 (= 300ms cap 整合)
-            const AUDIO_SAFE_HI: f64 = 0.20;   // 旧 0.75
+            const AUDIO_SAFE_LO: f64 = 0.10; // 旧 0.25 (= 300ms cap 整合)
+            const AUDIO_SAFE_HI: f64 = 0.20; // 旧 0.75
             const SEEK_BURST_LEAD_MAX_SECS: f64 = 0.20;
-            const AUDIO_CRITICAL_LO: f64 = 0.03;  // 旧 0.08 (= 将来 audio 専用 emergency 用に保持)
+            const AUDIO_CRITICAL_LO: f64 = 0.03; // 旧 0.08 (= 将来 audio 専用 emergency 用に保持)
             let mut in_audio_escape = false;
             let mut new_seek_pending = false;
             // Phase 9.C/D: pause-park (詳細は GPU 経路の同コメント参照)。
@@ -1537,11 +1520,9 @@ fn run_video_decode(
                 let audio_active = clock.is_audio_active();
                 // Phase 9.D (2026-04-30): Buffering 中も PACE_LEAD で lookahead 許可
                 // (詳細は GPU 経路の同コメント参照)。
-                let engine_playing = engine_st
-                    == crate::video::engine::actor::state_code::PLAYING;
+                let engine_playing = engine_st == crate::video::engine::actor::state_code::PLAYING;
                 let allow_pace_lead = engine_playing
-                    || engine_st
-                        == crate::video::engine::actor::state_code::BUFFERING;
+                    || engine_st == crate::video::engine::actor::state_code::BUFFERING;
                 if audio_active {
                     if audio_buf < AUDIO_SAFE_LO {
                         in_audio_escape = true;
@@ -1585,7 +1566,7 @@ fn run_video_decode(
                     break;
                 }
                 // audio_escape bypass: GPU 経路と同じ理屈で `audio_buf < CRITICAL` 単独 bypass を撤去。
-                let _ = AUDIO_CRITICAL_LO;  // 将来 audio 専用 emergency 用に定数保持
+                let _ = AUDIO_CRITICAL_LO; // 将来 audio 専用 emergency 用に定数保持
                 if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
                     break;
                 }
@@ -1614,7 +1595,10 @@ fn run_video_decode(
                     0,
                     &[
                         ("pts", serde_json::Value::from(pts_secs)),
-                        ("decode_ms", serde_json::Value::from(decode_ms.round() / 1.0)),
+                        (
+                            "decode_ms",
+                            serde_json::Value::from(decode_ms.round() / 1.0),
+                        ),
                         ("scale_ms", serde_json::Value::from(scale_ms.round() / 1.0)),
                         ("dropped_full", serde_json::Value::from(dropped_full)),
                         ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
@@ -1706,7 +1690,11 @@ fn run_audio_decode(
             Err(_) => break,
         };
         match msg {
-            AudioWorkerMsg::Flush { serial, seek_target_secs, trim_before_secs } => {
+            AudioWorkerMsg::Flush {
+                serial,
+                seek_target_secs,
+                trim_before_secs,
+            } => {
                 setup.decoder.flush();
                 current_seek_serial = serial;
                 drop_before_secs = trim_before_secs;
@@ -1718,10 +1706,7 @@ fn run_audio_decode(
                 // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
                 use ffmpeg_the_third::ffi::avcodec_send_packet;
                 unsafe {
-                    let _ = avcodec_send_packet(
-                        setup.decoder.as_mut_ptr(),
-                        std::ptr::null(),
-                    );
+                    let _ = avcodec_send_packet(setup.decoder.as_mut_ptr(), std::ptr::null());
                 }
                 let mut frame = Audio::empty();
                 while setup.decoder.receive_frame(&mut frame).is_ok() {
@@ -1759,8 +1744,7 @@ fn run_audio_decode(
                     if pkt_pts != i64::MIN {
                         let pkt_pts_secs =
                             (pkt_pts as f64) * setup.time_base_num / setup.time_base_den;
-                        let pkt_dur_secs = (packet.duration().max(0) as f64)
-                            * setup.time_base_num
+                        let pkt_dur_secs = (packet.duration().max(0) as f64) * setup.time_base_num
                             / setup.time_base_den;
                         if pkt_pts_secs + pkt_dur_secs < min - 0.020 {
                             continue;
@@ -1806,9 +1790,9 @@ fn emit_audio_frame(
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
 ) -> bool {
-    use ffmpeg_the_third as ffmpeg;
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::util::frame::audio::Audio;
+    use ffmpeg_the_third as ffmpeg;
 
     let pts = frame.pts().unwrap_or(0);
     let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
@@ -1860,8 +1844,7 @@ fn emit_audio_frame(
     // 音声フレームが届く。完全に target 前ならフレーム破棄、
     // 跨ぐなら先頭 N サンプルを drain して target ぴったりから始める。
     if let Some(min) = *drop_before_secs {
-        let frame_secs =
-            (samples.len() / CHANNELS) as f64 / setup.out_rate as f64;
+        let frame_secs = (samples.len() / CHANNELS) as f64 / setup.out_rate as f64;
         if pts_secs + frame_secs <= min {
             // 完全に target 前 → 捨てる
             return true;
@@ -2019,9 +2002,7 @@ fn try_init_d3d11va(
                 0,
             );
             if ret < 0 || buf.is_null() {
-                crate::logger::log(format!(
-                    "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
-                ));
+                crate::logger::log(format!("HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"));
                 return None;
             }
             buf
@@ -2037,9 +2018,7 @@ fn try_init_d3d11va(
                 0,
             );
             if ret < 0 || buf.is_null() {
-                crate::logger::log(format!(
-                    "HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"
-                ));
+                crate::logger::log(format!("HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"));
                 return None;
             }
             buf
@@ -2057,9 +2036,7 @@ fn try_init_d3d11va(
         (*avctx).hw_device_ctx = new_ref;
         (*avctx).get_format = Some(get_hw_format);
 
-        crate::logger::log(format!(
-            "HW: D3D11VA initialized for codec {codec_id:?}"
-        ));
+        crate::logger::log(format!("HW: D3D11VA initialized for codec {codec_id:?}"));
         Some(HwDevice { buf_ref })
     }
 }
@@ -2249,17 +2226,17 @@ fn try_gpu_blit_path(
             None,
             0,
             &[
-                ("decode_path", serde_json::Value::from("hw_d3d11va_gpu_blit")),
+                (
+                    "decode_path",
+                    serde_json::Value::from("hw_d3d11va_gpu_blit"),
+                ),
                 (
                     "frame_pix_fmt",
                     serde_json::Value::from(format!("{:?}", in_desc.Format)),
                 ),
                 ("frame_w", serde_json::Value::from(in_desc.Width as i64)),
                 ("frame_h", serde_json::Value::from(in_desc.Height as i64)),
-                (
-                    "hw_active",
-                    serde_json::Value::from(hw_active_initially),
-                ),
+                ("hw_active", serde_json::Value::from(hw_active_initially)),
             ],
         );
         *first_frame_logged = true;

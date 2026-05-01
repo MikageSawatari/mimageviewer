@@ -77,9 +77,7 @@ impl App {
         // VideoPlayer から info() を取り出す。未着のうちはパネル自体は出すがコンテンツが
         // 「読み込み中...」になる (動画 metadata は open 直後に来るので一瞬だけ)。
         let info: Option<VideoInfo> = match self.fs_cache.get(&fs_idx) {
-            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                player.info().cloned()
-            }
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player.info().cloned(),
             _ => None,
         };
 
@@ -112,10 +110,8 @@ impl App {
         );
 
         // ── タイトルバー ──
-        let title_rect = egui::Rect::from_min_size(
-            panel_rect.min,
-            egui::vec2(panel_rect.width(), TITLE_BAR_H),
-        );
+        let title_rect =
+            egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), TITLE_BAR_H));
         painter.rect_filled(
             title_rect,
             0.0,
@@ -221,7 +217,6 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
     put(ui, "デコーダ", decode_label);
 }
 
-
 /// 左パネルでクリックされた行から発生する操作。
 #[derive(Debug)]
 pub(crate) enum JumpPanelAction {
@@ -295,9 +290,10 @@ impl App {
             .as_ref()
             .and_then(|db| db.lookup_pts(&video_path));
         let chapters: Vec<Chapter> = match self.fs_cache.get(&fs_idx) {
-            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                player.info().map(|i| i.chapters.clone()).unwrap_or_default()
-            }
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player
+                .info()
+                .map(|i| i.chapters.clone())
+                .unwrap_or_default(),
             _ => Vec::new(),
         };
 
@@ -378,10 +374,8 @@ impl App {
         );
 
         // タイトルバー
-        let title_rect = egui::Rect::from_min_size(
-            panel_rect.min,
-            egui::vec2(panel_rect.width(), TITLE_BAR_H),
-        );
+        let title_rect =
+            egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), TITLE_BAR_H));
         painter.rect_filled(
             title_rect,
             0.0,
@@ -496,14 +490,8 @@ impl App {
                 // クリックでその位置にシーク。削除はピンボタン側のトグル経由。
                 if let Some(pts) = pin_pts {
                     section_label(ui, "📌 ピン留め");
-                    let acts = self.draw_video_jump_row(
-                        ui,
-                        "📌",
-                        pts,
-                        Some("代表フレーム"),
-                        None,
-                        fs_idx,
-                    );
+                    let acts =
+                        self.draw_video_jump_row(ui, "📌", pts, Some("代表フレーム"), None, fs_idx);
                     scroll_actions.extend(acts);
                     ui.add_space(8.0);
                     had_section = true;
@@ -545,10 +533,7 @@ impl App {
                 if !had_section {
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
-                        ui.colored_label(
-                            DIM_COLOR,
-                            "ブックマーク・チャプターはまだありません",
-                        );
+                        ui.colored_label(DIM_COLOR, "ブックマーク・チャプターはまだありません");
                     });
                 }
 
@@ -602,36 +587,35 @@ impl App {
 
         // 既に video_jump_textures にアップロード済ならそれを使う (Phase 7.G:
         // worker LRU evict 後でも texture が安定して残るので、サムネ「再描画」が消える)。
-        let tex_id: Option<egui::TextureId> = if let Some((_, tex)) =
-            self.video_jump_textures.get(&bucket)
-        {
-            Some(tex.id())
-        } else {
-            // 未アップロードなら worker から最新サムネを取り出して texture を作る。
-            let thumb_data = match self.fs_cache.get(&fs_idx) {
-                Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                    player.nearest_seek_thumbnail(pts_secs)
-                }
-                _ => None,
-            };
-            if let Some(t) = thumb_data {
-                let key = (t.target_secs.to_bits(), t.width, t.height);
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [t.width as usize, t.height as usize],
-                    &t.rgba,
-                );
-                let tex = ui.ctx().load_texture(
-                    format!("video_jump_thumb:{bucket}"),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                );
-                let id = tex.id();
-                self.video_jump_textures.insert(bucket, (key, tex));
-                Some(id)
+        let tex_id: Option<egui::TextureId> =
+            if let Some((_, tex)) = self.video_jump_textures.get(&bucket) {
+                Some(tex.id())
             } else {
-                None
-            }
-        };
+                // 未アップロードなら worker から最新サムネを取り出して texture を作る。
+                let thumb_data = match self.fs_cache.get(&fs_idx) {
+                    Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
+                        player.nearest_seek_thumbnail(pts_secs)
+                    }
+                    _ => None,
+                };
+                if let Some(t) = thumb_data {
+                    let key = (t.target_secs.to_bits(), t.width, t.height);
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [t.width as usize, t.height as usize],
+                        &t.rgba,
+                    );
+                    let tex = ui.ctx().load_texture(
+                        format!("video_jump_thumb:{bucket}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    let id = tex.id();
+                    self.video_jump_textures.insert(bucket, (key, tex));
+                    Some(id)
+                } else {
+                    None
+                }
+            };
 
         // 1 行 = サムネ列 + 時間/タイトル列 + × 列。サムネ size は固定 120x68。
         ui.horizontal(|ui| {
@@ -693,30 +677,20 @@ impl App {
                     out.push(JumpPanelAction::Seek(pts_secs));
                 }
                 if let Some(t) = title {
-                    ui.colored_label(
-                        DIM_COLOR,
-                        egui::RichText::new(t).size(11.0),
-                    );
+                    ui.colored_label(DIM_COLOR, egui::RichText::new(t).size(11.0));
                 }
             });
             // 削除ボタン (右端)
             if let Some(id) = delete_id {
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let x_resp = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new("×")
-                                    .color(DIM_COLOR)
-                                    .size(14.0),
-                            )
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let x_resp = ui.add(
+                        egui::Button::new(egui::RichText::new("×").color(DIM_COLOR).size(14.0))
                             .frame(false),
-                        );
-                        if x_resp.clicked() {
-                            out.push(JumpPanelAction::DeleteBookmark(id));
-                        }
-                    },
-                );
+                    );
+                    if x_resp.clicked() {
+                        out.push(JumpPanelAction::DeleteBookmark(id));
+                    }
+                });
             }
         });
         ui.add_space(2.0);
@@ -839,9 +813,7 @@ impl App {
             }
             _ => None,
         };
-        if let (Some((path, pts)), Some(db)) =
-            (snapshot, self.video_bookmark_db.as_ref())
-        {
+        if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
             if let Err(e) = db.add(&path, pts, None, &[]) {
                 crate::logger::log(format!("video bookmark add failed: {e}"));
             } else {
@@ -861,4 +833,3 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     });
     ui.add_space(2.0);
 }
-

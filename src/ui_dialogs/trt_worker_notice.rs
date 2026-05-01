@@ -50,9 +50,7 @@ impl App {
                 self.trt_auto_restart_attempts += 1;
                 crate::logger::log(format!(
                     "[AI] worker 死亡を検出、自動再起動 (#{} / {}): {}",
-                    self.trt_auto_restart_attempts,
-                    MAX_TRT_AUTO_RESTART_ATTEMPTS,
-                    notice.detail
+                    self.trt_auto_restart_attempts, MAX_TRT_AUTO_RESTART_ATTEMPTS, notice.detail
                 ));
                 // 多重 spawn ガード付き: 並行する複数 AI 推論が同じ死亡通知を
                 // 観測しても、1 個の spawn 試行しか走らない (Codex P2)。
@@ -60,7 +58,10 @@ impl App {
             }
             _ => {
                 // 自動再起動できない (SpawnFailed か、retry 上限到達): バナーで通知。
-                if matches!(notice.kind, crate::ai::runtime::WorkerNoticeKind::DiedDuringInfer) {
+                if matches!(
+                    notice.kind,
+                    crate::ai::runtime::WorkerNoticeKind::DiedDuringInfer
+                ) {
                     crate::logger::log(format!(
                         "[AI] worker 死亡を検出、自動再起動の上限 ({}) に到達。\
                          バナーで手動再起動を促す: {}",

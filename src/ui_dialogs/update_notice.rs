@@ -64,15 +64,13 @@ impl App {
                             );
                             ui.end_row();
                             ui.label("最新バージョン:");
-                            ui.label(
-                                egui::RichText::new(&info.latest_tag)
-                                    .monospace()
-                                    .color(if info.is_newer {
-                                        egui::Color32::from_rgb(100, 170, 100)
-                                    } else {
-                                        egui::Color32::GRAY
-                                    }),
-                            );
+                            ui.label(egui::RichText::new(&info.latest_tag).monospace().color(
+                                if info.is_newer {
+                                    egui::Color32::from_rgb(100, 170, 100)
+                                } else {
+                                    egui::Color32::GRAY
+                                },
+                            ));
                             ui.end_row();
                         });
                     if !info.body.is_empty() {

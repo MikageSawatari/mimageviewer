@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS,
-    PAGE_READWRITE,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    PAGE_READWRITE, UnmapViewOfFile,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
@@ -58,7 +58,9 @@ pub fn shm_size_bytes(capacity_samples: u32) -> u64 {
 #[serde(tag = "cmd")]
 #[serde(rename_all = "lowercase")]
 pub enum Cmd {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Open {
         plugin_path: String,
         sample_rate: u32,
@@ -73,7 +75,9 @@ pub enum Cmd {
     Shutdown,
     /// プラグイン GUI を指定 HWND にアタッチする。
     #[serde(rename = "show_gui")]
-    ShowGui { hwnd: u64 },
+    ShowGui {
+        hwnd: u64,
+    },
     /// プラグイン GUI を外す。HWND の破棄は host 側の責務。
     #[serde(rename = "hide_gui")]
     HideGui,
@@ -85,30 +89,47 @@ pub enum Cmd {
     /// ホストウィンドウのリサイズが起きたことをプラグインに通知する。
     /// bridge は view->onSize(rect) を呼んでプラグインの子ウィンドウを追従させる。
     #[serde(rename = "notify_host_resize")]
-    NotifyHostResize { width: u32, height: u32 },
+    NotifyHostResize {
+        width: u32,
+        height: u32,
+    },
     /// 診断用: bridge 内で plugin を経由せずに in→out 単純コピーする。
     /// 歪みが消えれば plugin process が原因、残れば bridge パイプラインが原因。
     #[serde(rename = "set_passthrough")]
-    SetPassthrough { enable: u32 },
+    SetPassthrough {
+        enable: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "event")]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
-    Ready { version: u32 },
+    Ready {
+        version: u32,
+    },
     Loaded {
         plugin_name: String,
         latency_samples: u32,
     },
-    LatencyChanged { latency_samples: u32 },
+    LatencyChanged {
+        latency_samples: u32,
+    },
     ResetDone,
     Closed,
-    Error { detail: String },
-    GuiAttached { width: u32, height: u32 },
+    Error {
+        detail: String,
+    },
+    GuiAttached {
+        width: u32,
+        height: u32,
+    },
     GuiDetached,
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
-    GuiSize { width: u32, height: u32 },
+    GuiSize {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
@@ -259,7 +280,12 @@ impl Bridge {
                 (shm_size & 0xFFFF_FFFF) as u32,
                 PCWSTR(wname.as_ptr()),
             )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("CreateFileMappingW: {e}")))?;
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("CreateFileMappingW: {e}"),
+                )
+            })?;
             let base = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, shm_size as usize);
             if base.Value.is_null() {
                 let _ = CloseHandle(handle);
@@ -285,11 +311,19 @@ impl Bridge {
 
             // events
             let win = HSTRING::from(sig_in_name.as_str());
-            let sig_in = CreateEventW(None, false, false, PCWSTR(win.as_ptr()))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("CreateEventW sig_in: {e}")))?;
+            let sig_in = CreateEventW(None, false, false, PCWSTR(win.as_ptr())).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("CreateEventW sig_in: {e}"),
+                )
+            })?;
             let wout = HSTRING::from(sig_out_name.as_str());
-            let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr()))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("CreateEventW sig_out: {e}")))?;
+            let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr())).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("CreateEventW sig_out: {e}"),
+                )
+            })?;
             self.sig_in = Some(EventHandle {
                 handle: sig_in,
                 name: sig_in_name.clone(),
@@ -316,12 +350,19 @@ impl Bridge {
     /// `samples` は f32 packed stereo。
     #[cfg(windows)]
     pub fn push_audio(&self, samples: &[f32]) -> std::io::Result<()> {
-        let shm = self.shm.as_ref().ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
-        let sig_in = self.sig_in.as_ref().ok_or_else(|| std::io::Error::other("sig_in missing"))?;
+        let shm = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
+        let sig_in = self
+            .sig_in
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("sig_in missing"))?;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
             let cap = std::ptr::addr_of!((*header).capacity).read_unaligned();
-            let in_ring = (shm.base.Value as *mut u8).add(std::mem::size_of::<ShmHeader>()) as *mut f32;
+            let in_ring =
+                (shm.base.Value as *mut u8).add(std::mem::size_of::<ShmHeader>()) as *mut f32;
 
             let w_pos = (*header).in_write.load(Ordering::Relaxed);
             // overflow 防止のため modulo 操作を慎重に
@@ -329,7 +370,9 @@ impl Bridge {
                 let idx = (w_pos.wrapping_add(i as u32)) % cap;
                 in_ring.add(idx as usize).write(s);
             }
-            (*header).in_write.store(w_pos.wrapping_add(samples.len() as u32), Ordering::Release);
+            (*header)
+                .in_write
+                .store(w_pos.wrapping_add(samples.len() as u32), Ordering::Release);
             let _ = SetEvent(sig_in.handle);
         }
         Ok(())
@@ -339,8 +382,14 @@ impl Bridge {
     /// 戻り値: 実際に読めた sample 数 (タイムアウトすると 0)。
     #[cfg(windows)]
     pub fn pull_audio(&self, dst: &mut [f32], timeout_ms: u32) -> std::io::Result<usize> {
-        let shm = self.shm.as_ref().ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
-        let sig_out = self.sig_out.as_ref().ok_or_else(|| std::io::Error::other("sig_out missing"))?;
+        let shm = self
+            .shm
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("audio pipe not open"))?;
+        let sig_out = self
+            .sig_out
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("sig_out missing"))?;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
             let cap = std::ptr::addr_of!((*header).capacity).read_unaligned();
@@ -354,7 +403,8 @@ impl Bridge {
             let want = dst.len() as u32;
             if avail < want {
                 let res = WaitForSingleObject(sig_out.handle, timeout_ms);
-                if res.0 != 0 { /* WAIT_OBJECT_0 = 0 */
+                if res.0 != 0 {
+                    /* WAIT_OBJECT_0 = 0 */
                     return Ok(0);
                 }
                 w_pos = (*header).out_write.load(Ordering::Acquire);
@@ -365,7 +415,9 @@ impl Bridge {
                 let idx = (r_pos.wrapping_add(i as u32)) % cap;
                 dst[i] = out_ring.add(idx as usize).read();
             }
-            (*header).out_read.store(r_pos.wrapping_add(take as u32), Ordering::Release);
+            (*header)
+                .out_read
+                .store(r_pos.wrapping_add(take as u32), Ordering::Release);
             Ok(take)
         }
     }
@@ -390,7 +442,10 @@ impl Drop for Bridge {
             let _ = s.name; // suppress unused
             let _ = s.size;
         }
-        for h in [self.sig_in.take(), self.sig_out.take()].into_iter().flatten() {
+        for h in [self.sig_in.take(), self.sig_out.take()]
+            .into_iter()
+            .flatten()
+        {
             unsafe {
                 let _ = CloseHandle(h.handle);
             }

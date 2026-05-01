@@ -473,19 +473,20 @@ pub fn build_bigram_and_query(
     // AND モードは per_token_queries を直接 top-level に並べて Must 結合。
     // OR モードは Should 群を 1 つの BooleanQuery で包んで Must として積む (= 少なくとも 1 件一致)。
     // ただし token が 1 個なら OR/AND どちらも実効意味が同じなので、余計な入れ子を避ける。
-    let mut token_queries: Vec<(Occur, Box<dyn Query>)> =
-        if matches!(filters.mode, crate::search_query::MatchMode::Or)
-            && per_token_queries.len() > 1
-        {
-            let any = BooleanQuery::from(per_token_queries);
-            vec![(Occur::Must, Box::new(any))]
-        } else {
-            // 1 token の場合は occur を Must に正規化 (per_token_queries には Should が入っていることがある)
-            per_token_queries
-                .into_iter()
-                .map(|(_, q)| (Occur::Must, q))
-                .collect()
-        };
+    let mut token_queries: Vec<(Occur, Box<dyn Query>)> = if matches!(
+        filters.mode,
+        crate::search_query::MatchMode::Or
+    ) && per_token_queries.len() > 1
+    {
+        let any = BooleanQuery::from(per_token_queries);
+        vec![(Occur::Must, Box::new(any))]
+    } else {
+        // 1 token の場合は occur を Must に正規化 (per_token_queries には Should が入っていることがある)
+        per_token_queries
+            .into_iter()
+            .map(|(_, q)| (Occur::Must, q))
+            .collect()
+    };
     token_queries.reserve(3);
 
     // favorite_id スコープ filter (複数 favorite の OR を更に Must として追加)
@@ -1263,15 +1264,7 @@ mod tests {
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/c.jpg",
-                fav,
-                IndexKind::Image,
-                "夕焼け.jpg",
-                "",
-                "",
-                "",
-            ),
+            &sample_doc_with_sources("c:/c.jpg", fav, IndexKind::Image, "夕焼け.jpg", "", "", ""),
         )
         .unwrap();
         writer.commit().unwrap();
@@ -1339,29 +1332,13 @@ mod tests {
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/a.jpg",
-                fav,
-                IndexKind::Image,
-                "a.jpg",
-                "夕焼け",
-                "",
-                "",
-            ),
+            &sample_doc_with_sources("c:/a.jpg", fav, IndexKind::Image, "a.jpg", "夕焼け", "", ""),
         )
         .unwrap();
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/b.jpg",
-                fav,
-                IndexKind::Image,
-                "b.jpg",
-                "",
-                "夕焼け",
-                "",
-            ),
+            &sample_doc_with_sources("c:/b.jpg", fav, IndexKind::Image, "b.jpg", "", "夕焼け", ""),
         )
         .unwrap();
         upsert_doc(
@@ -1392,8 +1369,7 @@ mod tests {
         .unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: std::collections::HashSet<_> =
-            hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 2, "EXIF + XMP の OR で a,b だけヒット");
         assert!(paths.contains("c:/a.jpg"));
         assert!(paths.contains("c:/b.jpg"));
@@ -1422,43 +1398,19 @@ mod tests {
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/a.zip",
-                fav,
-                IndexKind::Zip,
-                "夕焼け zip",
-                "",
-                "",
-                "",
-            ),
+            &sample_doc_with_sources("c:/a.zip", fav, IndexKind::Zip, "夕焼け zip", "", "", ""),
         )
         .unwrap();
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/b.pdf",
-                fav,
-                IndexKind::Pdf,
-                "夕焼け pdf",
-                "",
-                "",
-                "",
-            ),
+            &sample_doc_with_sources("c:/b.pdf", fav, IndexKind::Pdf, "夕焼け pdf", "", "", ""),
         )
         .unwrap();
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/c.jpg",
-                fav,
-                IndexKind::Image,
-                "夕焼け jpg",
-                "",
-                "",
-                "",
-            ),
+            &sample_doc_with_sources("c:/c.jpg", fav, IndexKind::Image, "夕焼け jpg", "", "", ""),
         )
         .unwrap();
         writer.commit().unwrap();
@@ -1483,8 +1435,7 @@ mod tests {
         )
         .unwrap();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: std::collections::HashSet<_> =
-            hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 2);
         assert!(paths.contains("c:/a.zip"));
         assert!(paths.contains("c:/b.pdf"));
@@ -1507,15 +1458,7 @@ mod tests {
         upsert_doc(
             &writer,
             idx.fields(),
-            &sample_doc_with_sources(
-                "c:/b.jpg",
-                fav,
-                IndexKind::Image,
-                "原神.jpg",
-                "",
-                "",
-                "",
-            ),
+            &sample_doc_with_sources("c:/b.jpg", fav, IndexKind::Image, "原神.jpg", "", "", ""),
         )
         .unwrap();
         writer.commit().unwrap();
@@ -1545,7 +1488,12 @@ mod tests {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "夕焼け")).unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav, "夕焼け"),
+        )
+        .unwrap();
         upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav, "海辺")).unwrap();
         upsert_doc(
             &writer,
@@ -1568,8 +1516,7 @@ mod tests {
         .unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: std::collections::HashSet<_> =
-            hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(paths.contains("c:/a.jpg"));
         assert!(paths.contains("c:/b.jpg"));
         assert!(!paths.contains("c:/c.jpg"), "どちらも含まない doc は除外");
@@ -1582,13 +1529,19 @@ mod tests {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav, "夕焼け 海辺")).unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav, "夕焼け 海辺"),
+        )
+        .unwrap();
         upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav, "朝日")).unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
         let searcher = idx.searcher();
-        let q_and = build_bigram_and_query(idx.fields(), &["夕焼け"], &QueryFilters::default()).unwrap();
+        let q_and =
+            build_bigram_and_query(idx.fields(), &["夕焼け"], &QueryFilters::default()).unwrap();
         let q_or = build_bigram_and_query(
             idx.fields(),
             &["夕焼け"],
@@ -1620,8 +1573,18 @@ mod tests {
         let fav_a = Uuid::new_v4();
         let fav_b = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/a.jpg", fav_a, "夕焼け")).unwrap();
-        upsert_doc(&writer, idx.fields(), &sample_doc("c:/b.jpg", fav_b, "海辺")).unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/a.jpg", fav_a, "夕焼け"),
+        )
+        .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc("c:/b.jpg", fav_b, "海辺"),
+        )
+        .unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 

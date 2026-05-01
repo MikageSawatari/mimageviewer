@@ -202,15 +202,10 @@ pub fn start_name_index_at(
 ) -> (Arc<SearchIndexDb>, NameIndexSupervisorHandle) {
     std::fs::create_dir_all(data_dir).ok();
     let db = Arc::new(
-        SearchIndexDb::open_at(&data_dir.join("search_index.db"))
-            .expect("SearchIndexDb::open_at"),
+        SearchIndexDb::open_at(&data_dir.join("search_index.db")).expect("SearchIndexDb::open_at"),
     );
-    let handle = name_index_supervisor::spawn(
-        favorite.id,
-        favorite.path.clone(),
-        Arc::clone(&db),
-        None,
-    );
+    let handle =
+        name_index_supervisor::spawn(favorite.id, favorite.path.clone(), Arc::clone(&db), None);
     (db, handle)
 }
 
@@ -219,7 +214,10 @@ pub fn wait_name_scan_done(handle: &NameIndexSupervisorHandle) {
     wait_until(
         || handle.snapshot_stats().initial_scan_done,
         INITIAL_SCAN_TIMEOUT,
-        &format!("name index initial scan for favorite {}", handle.favorite_id),
+        &format!(
+            "name index initial scan for favorite {}",
+            handle.favorite_id
+        ),
     );
 }
 
@@ -281,10 +279,7 @@ where
             return;
         }
         if Instant::now() >= deadline {
-            panic!(
-                "wait_until timed out after {:?}: {desc}",
-                timeout
-            );
+            panic!("wait_until timed out after {:?}: {desc}", timeout);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -328,11 +323,9 @@ pub fn wait_meta_contains(meta_db: &FtsMetaDb, normalized_path: &str) {
 /// `fts_meta.db` から指定 path が消える (tombstone or 無し) まで待つ。
 pub fn wait_meta_absent(meta_db: &FtsMetaDb, normalized_path: &str) {
     wait_until(
-        || {
-            match meta_db.get(normalized_path).ok().flatten() {
-                None => true,
-                Some(row) => row.status != mimageviewer::fts_meta::FileStatus::Ok,
-            }
+        || match meta_db.get(normalized_path).ok().flatten() {
+            None => true,
+            Some(row) => row.status != mimageviewer::fts_meta::FileStatus::Ok,
         },
         FS_EVENT_TIMEOUT,
         &format!("fts_meta row disappears for {normalized_path}"),
@@ -367,16 +360,16 @@ pub fn collect_search_hits(
 }
 
 /// SearchStreamEvent の受信ループ。`Done` で終了、`Error` で panic。
-fn drain_rx(
-    rx: &Receiver<SearchStreamEvent>,
-    _cancel: &Arc<AtomicBool>,
-) -> Vec<GlobalHit> {
+fn drain_rx(rx: &Receiver<SearchStreamEvent>, _cancel: &Arc<AtomicBool>) -> Vec<GlobalHit> {
     let mut hits = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            panic!("search did not complete within 10s (collected {} hits)", hits.len());
+            panic!(
+                "search did not complete within 10s (collected {} hits)",
+                hits.len()
+            );
         }
         match rx.recv_timeout(remaining) {
             Ok(SearchStreamEvent::Batch { hits: batch, .. }) => hits.extend(batch),

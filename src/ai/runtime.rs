@@ -93,10 +93,7 @@ fn prepend_dll_search_path(dir: &std::path::Path) {
                     crate::logger::log(format!("[AI] preloaded {}", full.display()));
                 }
                 Err(e) => {
-                    crate::logger::log(format!(
-                        "[AI] preload {} failed: {e:?}",
-                        full.display()
-                    ));
+                    crate::logger::log(format!("[AI] preload {} failed: {e:?}", full.display()));
                 }
             }
         }
@@ -312,10 +309,7 @@ impl AiRuntime {
     /// TRT ワーカープールを attach する (Phase 3、ホットリロード対応)。
     /// 既に attach されている場合は古いものを drop してから差し替える
     /// (drop で worker プロセスが shutdown される)。
-    pub fn attach_worker_pool(
-        &self,
-        pool: std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>,
-    ) {
+    pub fn attach_worker_pool(&self, pool: std::sync::Arc<super::trt_worker_pool::TrtWorkerPool>) {
         *self.worker_pool.lock().unwrap() = Some(pool);
         crate::logger::log("[AI] TRT worker pool attached".to_string());
     }
@@ -426,9 +420,7 @@ impl AiRuntime {
             if pool.is_dead() {
                 self.report_worker_died(format!("load_model({kind:?}): {e}"));
             }
-            return Err(AiError::Ort(format!(
-                "worker.load_model({kind:?}): {e}"
-            )));
+            return Err(AiError::Ort(format!("worker.load_model({kind:?}): {e}")));
         }
         match pool.infer(kind, input) {
             Ok(out) => Ok(out),

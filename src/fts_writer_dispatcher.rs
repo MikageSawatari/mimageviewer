@@ -156,9 +156,9 @@ impl FtsWriterDispatcher {
         let (tx, rx) = mpsc::channel();
         self.submit(build(tx), priority);
         rx.recv().unwrap_or_else(|_| {
-            Err(tantivy::TantivyError::SystemError(
-                format!("{LOG_PREFIX} reply channel closed"),
-            ))
+            Err(tantivy::TantivyError::SystemError(format!(
+                "{LOG_PREFIX} reply channel closed"
+            )))
         })
     }
 
@@ -265,7 +265,14 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
             reload_after_commit,
             reply,
         } => {
-            let r = process_batch(writer, fts, upserts, deletes, commit_after, reload_after_commit);
+            let r = process_batch(
+                writer,
+                fts,
+                upserts,
+                deletes,
+                commit_after,
+                reload_after_commit,
+            );
             let _ = reply.send(r);
         }
         #[cfg(test)]
@@ -391,7 +398,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(disp.pending_snapshot(), (0, 0), "blocker が dispatcher に pop された");
+        assert_eq!(
+            disp.pending_snapshot(),
+            (0, 0),
+            "blocker が dispatcher に pop された"
+        );
 
         // 2. Background ジョブ 3 本を別スレッドから enqueue
         let bg_threads: Vec<_> = (0..3)
@@ -431,7 +442,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(disp.pending_snapshot(), (1, 3), "interactive 1 + background 3 が同時に並ぶ");
+        assert_eq!(
+            disp.pending_snapshot(),
+            (1, 3),
+            "interactive 1 + background 3 が同時に並ぶ"
+        );
 
         // 4. sleep 解放を待つ。dispatcher は Interactive を先に処理し、その後 background 3 件。
         let _ = blocker_done.recv();
