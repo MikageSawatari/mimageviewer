@@ -181,3 +181,66 @@ cargo check --bin mimageviewer-core    # OK
    (= 引数 sprawl 緩和)
 
 返答は P1/P2/P3 サマリ形式で。
+
+## 追記: 第 1 回 Codex レビュー反映 (2026-05-01)
+
+第 1 回レビューで指摘された 2 件を修正済み。レビュー基準コミット
+`a475770..HEAD` で見ると、初回コミット (`2cc9700`) と修正コミット
+(`<次のコミット>`) の差分が以下:
+
+### Codex P2 反映: 「slot idx と settings idx の同一視 → 別プラグインに `user_hidden` が付く」
+
+- 症状: bridge の `add_plugin` がロード失敗時に slot を作らず次へ進むため、
+  bridge の slots は `settings.vst3_plugins` より index が詰まる。GUI × の
+  通知 idx をそのまま `settings.vst3_plugins[idx]` に書き込むと別プラグインに
+  hidden が付く。manager パネルの `clicked_show_gui / hide_gui /
+  toggle_bypass` 経路も同じズレを抱えていた。
+- 修正:
+  - `DspBridge::pump_gui_signals` の戻り値を **`Vec<usize>` → `Vec<String>`**
+    (= plugin_path) に変更。bridge は path を知っているので確実に取れる。
+  - `vst3_pump_gui_signals` (App wrapper) は path で
+    `settings.vst3_plugins.iter_mut().find(|e| e.path == path)` 検索。
+  - vst3_manager.rs の `clicked_show_gui / hide_gui / toggle_bypass` を
+    `Option<usize>` から `Option<(usize, String)>` (bypass は
+    `Option<(usize, String, bool)>`) に変更。bridge への命令は idx で行い、
+    settings の検索は path で行う 2 段構造に整理。
+  - 既存ガード: `preferences.rs` で path の重複 add は弾いている
+    (`!state.settings.vst3_plugins.iter().any(|e| e.path == path)`) ので
+    path → entry の lookup は一意。
+
+### Codex P3 反映: 「Preferences OK で runtime の `user_hidden` / `bypass` が巻き戻る」
+
+- 症状: `state.settings` (= preferences ダイアログ open 時の snapshot) を OK で
+  `self.settings` に上書きするフロー。`overwrite_non_preferences_from` は
+  `vst3_plugins` を **preferences 側 source of truth として丸ごと採用**して
+  いたので、ダイアログ open 中に再生中パネル経由で更新された
+  `user_hidden / bypass` (= self.settings 側に反映済) が巻き戻る。
+- 修正: `overwrite_non_preferences_from` で `state.vst3_plugins`
+  (= self、構造の source of truth) の各 entry を walk しつつ、`src` (= App) で
+  同じ path を持つ entry を引いて `bypass / user_hidden` だけ移送。これで
+  「path / 順序は preferences 編集が優先」「runtime 変動 field は最新値を採用」
+  が両立する。
+
+```rust
+for entry in self.vst3_plugins.iter_mut() {
+    if let Some(latest) = src.vst3_plugins.iter().find(|e| e.path == entry.path) {
+        entry.bypass = latest.bypass;
+        entry.user_hidden = latest.user_hidden;
+    }
+}
+```
+
+### 再レビュー希望ポイント
+
+- F. 上記 path-based lookup に `O(N*M)` の二重ループが入る (= entry 数 ×
+  src entry 数)。チェーン上限 `MAX_CHAIN_LEN = 10` なので実害ゼロだが、
+  HashMap 化する価値はあるか?
+- G. preferences で **既存 entry を削除** して OK した場合: self には削除
+  したい entry が残らないので `iter_mut()` は無関係 entry にしか触らない。
+  逆に **新規 entry を追加** した場合: self には追加 entry の old 値が無いので
+  `find` は None → bypass / user_hidden の初期値 (preferences 入力値) を
+  そのまま採用。両ケースとも期待通りで OK。
+- H. preferences で **同じ path のまま順序入れ替え**: path lookup は順序を
+  気にしないので runtime 値が正しい entry に乗る。順序入れ替えは self が
+  反映されない (= preferences が上書き) → 期待通り。
+

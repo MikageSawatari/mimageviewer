@@ -1298,13 +1298,25 @@ impl Settings {
         self.global_preset = std::mem::take(&mut src.global_preset);
         self.preset_slots = std::mem::take(&mut src.preset_slots);
         // ── VST3 プラグイン (環境設定→VST3 プラグインページで編集) ──
-        // ⚠️ `vst3_plugins` は **環境設定で編集する** フィールド (旧設計では
-        // 管理ウィンドウで編集していた経緯で overwrite していたが、現設計では
-        // preferences が source of truth)。ここで上書きすると preferences で
-        // 追加したプラグインが OK 押下時に消える (= ユーザー報告 2026-04)。
-        // よって `self.vst3_plugins` には触らず、preferences 側の変更をそのまま
-        // 採用する (= state.settings = ... が後段で上書きする)。
+        // ⚠️ `vst3_plugins` の **構造 (= path / 順序)** は preferences が source of truth
+        // (= 旧設計では管理ウィンドウで編集していたが、現設計では preferences で編集する)。
+        // 全置換すると preferences で追加したプラグインが OK 押下時に消えるバグが
+        // あった (= 2026-04 報告)。
+        //
+        // ただし **runtime 変動フィールド** (= `bypass` / `user_hidden`) は再生中パネル
+        // (vst3_manager.rs) で変わるため、preferences を開いている間にも値が更新される。
+        // これらは self (= App) 側が最新値を持っているので、path 一致で entry を引いて
+        // self → state へ移送する。これで preferences OK で巻き戻る不具合を回避する
+        // (Codex P3 2026-05-01)。
         // legacy migration field (deprecated path/state) のみ App 側を残す。
+        for entry in self.vst3_plugins.iter_mut() {
+            if let Some(latest) =
+                src.vst3_plugins.iter().find(|e| e.path == entry.path)
+            {
+                entry.bypass = latest.bypass;
+                entry.user_hidden = latest.user_hidden;
+            }
+        }
         self.vst3_plugin_path = src.vst3_plugin_path.take();
         self.vst3_plugin_state = src.vst3_plugin_state.take();
         // `vst3_gui_visible` は VST ボタン runtime トグルで変わるので App 側を保つ。

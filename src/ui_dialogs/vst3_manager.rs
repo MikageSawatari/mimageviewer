@@ -41,9 +41,12 @@ impl App {
         let mut open = self.show_vst3_manager;
 
         // ── ボタンクリック処理は closure 外で行うため、closure 内ではフラグだけ立てる ──
-        let mut clicked_show_gui: Option<usize> = None;
-        let mut clicked_hide_gui: Option<usize> = None;
-        let mut clicked_toggle_bypass: Option<(usize, bool)> = None;
+        // **plugin_path も同時に取る**: bridge slots の idx と `settings.vst3_plugins` の
+        // idx は **ロード失敗で詰まるとズレる** (Codex P2 2026-05-01)。bridge を idx で
+        // 操作しつつ、settings を path で引くために両方持つ。
+        let mut clicked_show_gui: Option<(usize, String)> = None;
+        let mut clicked_hide_gui: Option<(usize, String)> = None;
+        let mut clicked_toggle_bypass: Option<(usize, String, bool)> = None;
 
         let bridge = self.dsp_bridge.clone();
         let state = bridge.state();
@@ -195,7 +198,8 @@ impl App {
                             .changed()
                         {
                             // on=true → bypass=false に
-                            clicked_toggle_bypass = Some((idx, !on));
+                            clicked_toggle_bypass =
+                                Some((idx, slot.plugin_path.clone(), !on));
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -206,14 +210,16 @@ impl App {
                                         .on_hover_text("プラグイン GUI を閉じる")
                                         .clicked()
                                     {
-                                        clicked_hide_gui = Some(idx);
+                                        clicked_hide_gui =
+                                            Some((idx, slot.plugin_path.clone()));
                                     }
                                 } else if ui
                                     .small_button("GUI")
                                     .on_hover_text("プラグイン GUI を表示")
                                     .clicked()
                                 {
-                                    clicked_show_gui = Some(idx);
+                                    clicked_show_gui =
+                                        Some((idx, slot.plugin_path.clone()));
                                 }
                                 // ── latency 表示 (= プラグインが報告した遅延) ──
                                 // bypass=true や Loaded 以外なら表示しない (= 影響しない)
@@ -285,7 +291,8 @@ impl App {
         });
 
         // ── ボタンクリック処理 (Window closure 外で実行 = self の借用解放後) ──
-        if let Some(idx) = clicked_show_gui {
+        // bridge への命令は **bridge slot idx**、settings 検索は **plugin_path** で行う。
+        if let Some((idx, path)) = clicked_show_gui {
             if let Err(e) = self.dsp_bridge.show_slot_gui(idx) {
                 crate::logger::log(format!("vst3 show_slot_gui: {e}"));
             } else {
@@ -293,7 +300,9 @@ impl App {
                 // 復元した user_hidden=true を、ユーザーが「GUI」ボタンで上書き)。
                 let mut changed = !self.settings.vst3_gui_visible;
                 self.settings.vst3_gui_visible = true;
-                if let Some(entry) = self.settings.vst3_plugins.get_mut(idx) {
+                if let Some(entry) =
+                    self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
+                {
                     if entry.user_hidden {
                         entry.user_hidden = false;
                         changed = true;
@@ -304,21 +313,25 @@ impl App {
                 }
             }
         }
-        if let Some(idx) = clicked_hide_gui {
+        if let Some((idx, path)) = clicked_hide_gui {
             // ユーザーが個別に GUI × した → user_hidden=true をセット
             // (= 以降の VST 全表示でも skip される、再起動後も維持)
             self.dsp_bridge.user_hide_slot_gui(idx);
-            if let Some(entry) = self.settings.vst3_plugins.get_mut(idx) {
+            if let Some(entry) =
+                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
+            {
                 if !entry.user_hidden {
                     entry.user_hidden = true;
                     self.settings.save();
                 }
             }
         }
-        if let Some((idx, bypass)) = clicked_toggle_bypass {
+        if let Some((idx, path, bypass)) = clicked_toggle_bypass {
             self.dsp_bridge.set_bypass(idx, bypass);
             // settings 側も同期 (= 永続化、次回起動時にこの bypass で復元される)
-            if let Some(entry) = self.settings.vst3_plugins.get_mut(idx) {
+            if let Some(entry) =
+                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
+            {
                 entry.bypass = bypass;
                 self.settings.save();
             }

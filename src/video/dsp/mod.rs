@@ -925,9 +925,11 @@ impl DspBridge {
     /// resize 通知 → bridge に notify_host_resize を送る。
     ///
     /// 戻り値: `user_hidden=true` に切り替わった (= ユーザーが × で閉じた) スロットの
-    /// idx 一覧。呼出側 (App) は settings.vst3_plugins[idx].user_hidden へ反映して
-    /// 永続化する (= 再起動後の VST 一括表示でこのスロットを skip させる)。
-    pub fn pump_gui_signals(&self) -> Vec<usize> {
+    /// **plugin_path 一覧**。呼出側 (App) はこれで `settings.vst3_plugins` を path 検索
+    /// して `user_hidden` を反映する。idx を返さないのは bridge slots と
+    /// `settings.vst3_plugins` で index がズレる (= ロード失敗で詰まる) ため
+    /// (Codex P2 2026-05-01)。
+    pub fn pump_gui_signals(&self) -> Vec<String> {
         // close 通知の検出 (Mutex 内で全 slot を調べる)
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
@@ -980,6 +982,18 @@ impl DspBridge {
         // ユーザーの明示的な意図 = `user_hidden=true` をセットして以降の VST 全表示
         // トグルでも復活しないようにする (= ユーザー報告 2026-04 「× で閉じた状態を
         // 記憶したい」)。
+        // path は user_hide_slot_gui で slot を変更する **前** に snapshot で取得する
+        // (= 設計上は user_hide_slot_gui で path は変わらないが、idx の有効性も含めて
+        // ここで一気に取った方が安全)。
+        let mut user_hidden_paths: Vec<String> = Vec::with_capacity(close_targets.len());
+        {
+            let inner = self.inner.lock().unwrap();
+            for &idx in &close_targets {
+                if let Some(slot) = inner.slots.get(idx) {
+                    user_hidden_paths.push(slot.plugin_path.clone());
+                }
+            }
+        }
         for &idx in &close_targets {
             self.user_hide_slot_gui(idx);
         }
@@ -1003,7 +1017,7 @@ impl DspBridge {
                 let _ = b.send(&Cmd::NotifyHostResize { width: w, height: h });
             }
         }
-        close_targets
+        user_hidden_paths
     }
 
     /// 指定 idx のスロットを削除する。bridge 子プロセスは shutdown される。

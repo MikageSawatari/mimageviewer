@@ -11,14 +11,19 @@ impl App {
     /// 毎 frame 呼ぶ: 全プラグイン GUI ホストウィンドウからの close / resize シグナルを処理する。
     /// プラグインウィンドウの × ボタンで閉じられたスロットがあれば、settings 側の
     /// `user_hidden` を true に同期して永続化する (= 再起動後の VST 一括表示で skip)。
+    ///
+    /// `dsp_bridge.pump_gui_signals` は plugin_path 一覧を返す (= bridge slots と
+    /// `settings.vst3_plugins` で index がズレるため、path 一致で entry を引く)。
     pub(crate) fn vst3_pump_gui_signals(&mut self) {
-        let user_hidden_indices = self.dsp_bridge.pump_gui_signals();
-        if user_hidden_indices.is_empty() {
+        let user_hidden_paths = self.dsp_bridge.pump_gui_signals();
+        if user_hidden_paths.is_empty() {
             return;
         }
         let mut changed = false;
-        for idx in user_hidden_indices {
-            if let Some(entry) = self.settings.vst3_plugins.get_mut(idx) {
+        for path in user_hidden_paths {
+            if let Some(entry) =
+                self.settings.vst3_plugins.iter_mut().find(|e| e.path == path)
+            {
                 if !entry.user_hidden {
                     entry.user_hidden = true;
                     changed = true;
