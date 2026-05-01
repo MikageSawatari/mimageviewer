@@ -464,7 +464,15 @@ fn run_decoder(
                         let in_fmt = dec.format();
                         let in_rate = dec.rate();
                         // FFmpeg 7.x API: channel_layout → ch_layout, get → get2
-                        let in_layout = dec.ch_layout();
+                        let raw_in_layout = dec.ch_layout();
+                        let (in_layout, guessed_stereo) =
+                            normalize_audio_input_layout(raw_in_layout);
+                        if guessed_stereo {
+                            crate::logger::log(
+                                "audio channel layout unspecified for 2ch stream; guessing stereo"
+                                    .to_string(),
+                            );
+                        }
                         // 出力は f32 packed stereo / target_audio_sample_rate
                         let out_fmt = Sample::F32(SampleType::Packed);
                         let out_rate = target_audio_sample_rate;
@@ -1903,6 +1911,16 @@ fn emit_audio_frame(
     true
 }
 
+fn normalize_audio_input_layout(
+    layout: ffmpeg_the_third::ChannelLayout<'_>,
+) -> (ffmpeg_the_third::ChannelLayout<'_>, bool) {
+    if layout.mask().is_none() && layout.channels() == 2 {
+        (ffmpeg_the_third::ChannelLayout::STEREO, true)
+    } else {
+        (layout, false)
+    }
+}
+
 struct AudioSetup {
     stream_idx: usize,
     out_rate: u32,
@@ -2512,8 +2530,31 @@ fn try_gpu_blit_path(
 
 #[cfg(test)]
 mod decoder_candidate_tests {
-    use super::{DecoderChoice, preferred_video_decoders};
+    use super::{DecoderChoice, normalize_audio_input_layout, preferred_video_decoders};
+    use ffmpeg_the_third::ChannelLayout;
     use ffmpeg_the_third::codec::Id;
+
+    #[test]
+    fn unspecified_two_channel_audio_layout_is_guessed_as_stereo() {
+        let (layout, guessed) = normalize_audio_input_layout(ChannelLayout::unspecified(2));
+        assert!(guessed);
+        assert_eq!(layout.mask(), ChannelLayout::STEREO.mask());
+    }
+
+    #[test]
+    fn specified_stereo_audio_layout_is_left_unchanged() {
+        let (layout, guessed) = normalize_audio_input_layout(ChannelLayout::STEREO);
+        assert!(!guessed);
+        assert_eq!(layout.mask(), ChannelLayout::STEREO.mask());
+    }
+
+    #[test]
+    fn unspecified_non_stereo_audio_layout_is_not_guessed() {
+        let (layout, guessed) = normalize_audio_input_layout(ChannelLayout::unspecified(6));
+        assert!(!guessed);
+        assert!(layout.mask().is_none());
+        assert_eq!(layout.channels(), 6);
+    }
 
     #[test]
     fn h264_hevc_have_single_default_candidate_even_with_hw() {
