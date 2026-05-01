@@ -52,12 +52,10 @@ pub fn init(enabled: bool, start_override: Option<Instant>) {
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("perf_events.jsonl");
     rotate_logs(&log_dir);
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-    {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    allow_live_log_reading(&mut opts);
+    match opts.open(&log_path) {
         Ok(f) => {
             if FILE
                 .set(Mutex::new(BufWriter::with_capacity(64 * 1024, f)))
@@ -75,6 +73,21 @@ pub fn init(enabled: bool, start_override: Option<Instant>) {
             crate::logger::log(format!("perf: init failed: {e}"));
         }
     }
+}
+
+fn allow_live_log_reading(opts: &mut std::fs::OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    #[cfg(not(windows))]
+    let _ = opts;
 }
 
 /// `perf_events.jsonl` をローテーションする。current → `.1` → `.2` → ... と

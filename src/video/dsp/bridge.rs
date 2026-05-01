@@ -620,6 +620,55 @@ impl Bridge {
         Ok(())
     }
 
+    /// Safe host-side process helper for one bridge.
+    ///
+    /// The shared memory rings are intentionally small (`block_size * channels * 8` samples).
+    /// Some codecs, especially WMA, can emit much larger audio frames. Pushing a whole decoded
+    /// frame at once would wrap and overwrite the input ring before the bridge process can consume
+    /// it, which sounds like a short fragment looping. Keep each IPC transfer at the bridge's
+    /// native audio block size.
+    #[cfg(windows)]
+    pub fn process_audio_blocking(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        timeout_ms: u32,
+    ) -> std::io::Result<()> {
+        if src.len() != dst.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "src/dst length mismatch",
+            ));
+        }
+        let chunk_samples = self.preferred_transfer_samples();
+        let mut offset = 0;
+        while offset < src.len() {
+            let end = (offset + chunk_samples).min(src.len());
+            self.push_audio(&src[offset..end])?;
+            let n = self.pull_audio(&mut dst[offset..end], timeout_ms)?;
+            if n < end - offset {
+                for o in &mut dst[offset + n..end] {
+                    *o = 0.0;
+                }
+            }
+            offset = end;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn preferred_transfer_samples(&self) -> usize {
+        let Some(shm) = self.shm.as_ref() else {
+            return 960;
+        };
+        unsafe {
+            let header = shm.base.Value as *mut ShmHeader;
+            let block_size = std::ptr::addr_of!((*header).block_size).read_unaligned() as usize;
+            let channels = std::ptr::addr_of!((*header).channels).read_unaligned() as usize;
+            (block_size.saturating_mul(channels).max(2) / 2) * 2
+        }
+    }
+
     /// bridge から host への音声読み出し (= out_ring から pop、sig_out を待つ)。
     /// 戻り値: 実際に読めた sample 数 (タイムアウト時は 0〜want 未満)。
     ///

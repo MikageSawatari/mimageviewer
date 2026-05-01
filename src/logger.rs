@@ -34,6 +34,7 @@ fn init_inner(file_name: &str, truncate: bool) {
     let log_path = log_dir.join(file_name);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true);
+    allow_live_log_reading(&mut opts);
     if truncate {
         opts.truncate(true);
     } else {
@@ -45,6 +46,21 @@ fn init_inner(file_name: &str, truncate: bool) {
         }
         Err(e) => eprintln!("ログファイル作成失敗: {e} (path: {})", log_path.display()),
     }
+}
+
+fn allow_live_log_reading(opts: &mut std::fs::OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    #[cfg(not(windows))]
+    let _ = opts;
 }
 
 pub fn log(msg: impl AsRef<str>) {

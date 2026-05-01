@@ -460,18 +460,20 @@ fn run_decoder(
             let params = audio_stream.parameters();
             match ffmpeg::codec::context::Context::from_parameters(params) {
                 Ok(ctx) => match ctx.decoder().audio() {
-                    Ok(dec) => {
+                    Ok(mut dec) => {
                         let in_fmt = dec.format();
                         let in_rate = dec.rate();
                         // FFmpeg 7.x API: channel_layout → ch_layout, get → get2
-                        let raw_in_layout = dec.ch_layout();
-                        let (in_layout, guessed_stereo) =
-                            normalize_audio_input_layout(raw_in_layout);
+                        let (in_layout, guessed_stereo) = {
+                            let raw_in_layout = dec.ch_layout();
+                            normalize_audio_input_layout(raw_in_layout)
+                        };
                         if guessed_stereo {
                             crate::logger::log(
                                 "audio channel layout unspecified for 2ch stream; guessing stereo"
                                     .to_string(),
                             );
+                            dec.set_ch_layout(in_layout.clone());
                         }
                         // 出力は f32 packed stereo / target_audio_sample_rate
                         let out_fmt = Sample::F32(SampleType::Packed);
@@ -1744,7 +1746,7 @@ fn run_audio_decode(
                     }
                     if !emit_audio_frame(
                         &mut setup,
-                        &frame,
+                        &mut frame,
                         &mut drop_before_secs,
                         current_seek_serial,
                         current_seek_target_secs,
@@ -1791,7 +1793,7 @@ fn run_audio_decode(
                     }
                     if !emit_audio_frame(
                         &mut setup,
-                        &frame,
+                        &mut frame,
                         &mut drop_before_secs,
                         current_seek_serial,
                         current_seek_target_secs,
@@ -1812,7 +1814,7 @@ fn run_audio_decode(
 /// drop_before_secs は preroll trim で drain した結果ここで `None` に戻ることがある。
 fn emit_audio_frame(
     setup: &mut AudioSetup,
-    frame: &ffmpeg_the_third::util::frame::audio::Audio,
+    frame: &mut ffmpeg_the_third::util::frame::audio::Audio,
     drop_before_secs: &mut Option<f64>,
     current_seek_serial: u64,
     current_seek_target_secs: Option<f64>,
@@ -1825,6 +1827,10 @@ fn emit_audio_frame(
 
     let pts = frame.pts().unwrap_or(0);
     let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
+    let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
+    if guessed_frame_stereo {
+        frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
+    }
     let mut resampled = Audio::empty();
     if let Err(e) = setup.resampler.run(frame, &mut resampled) {
         crate::logger::log(format!("swr resample: {e}"));
@@ -1913,11 +1919,14 @@ fn emit_audio_frame(
 
 fn normalize_audio_input_layout(
     layout: ffmpeg_the_third::ChannelLayout<'_>,
-) -> (ffmpeg_the_third::ChannelLayout<'_>, bool) {
+) -> (ffmpeg_the_third::ChannelLayout<'static>, bool) {
     if layout.mask().is_none() && layout.channels() == 2 {
         (ffmpeg_the_third::ChannelLayout::STEREO, true)
     } else {
-        (layout, false)
+        (
+            ffmpeg_the_third::ChannelLayout::from(layout.into_owned()),
+            false,
+        )
     }
 }
 

@@ -1267,16 +1267,8 @@ impl DspBridge {
         // 単一プラグイン: 直接 src -> dst で処理 (scratch 不要)
         if active_bridges.len() == 1 {
             active_bridges[0]
-                .push_audio(src)
-                .map_err(|e| format!("push_audio: {e}"))?;
-            let n = active_bridges[0]
-                .pull_audio(dst, 100)
-                .map_err(|e| format!("pull_audio: {e}"))?;
-            if n < dst.len() {
-                for o in &mut dst[n..] {
-                    *o = 0.0;
-                }
-            }
+                .process_audio_blocking(src, dst, 100)
+                .map_err(|e| format!("process_audio: {e}"))?;
             return Ok(());
         }
 
@@ -1324,16 +1316,8 @@ fn chain_process(
 
     // 1: src -> buf[0] (plugin[0] が処理)
     bridges[0]
-        .push_audio(src)
-        .map_err(|e| format!("push_audio[0]: {e}"))?;
-    let n = bridges[0]
-        .pull_audio(&mut buf[0], 100)
-        .map_err(|e| format!("pull_audio[0]: {e}"))?;
-    if n < buf[0].len() {
-        for o in &mut buf[0][n..] {
-            *o = 0.0;
-        }
-    }
+        .process_audio_blocking(src, &mut buf[0], 100)
+        .map_err(|e| format!("process_audio[0]: {e}"))?;
 
     // 2..N-1: buf[i%2] -> buf[(i+1)%2] (plugin[i] が処理)
     for i in 1..bridges.len() {
@@ -1347,16 +1331,8 @@ fn chain_process(
             (&b[0][..], &mut a[0][..])
         };
         bridges[i]
-            .push_audio(input)
-            .map_err(|e| format!("push_audio[{i}]: {e}"))?;
-        let n = bridges[i]
-            .pull_audio(output, 100)
-            .map_err(|e| format!("pull_audio[{i}]: {e}"))?;
-        if n < output.len() {
-            for o in &mut output[n..] {
-                *o = 0.0;
-            }
-        }
+            .process_audio_blocking(input, output, 100)
+            .map_err(|e| format!("process_audio[{i}]: {e}"))?;
     }
 
     // 最終: 最後に書き込まれた buf[(N-1)%2] を dst にコピー
