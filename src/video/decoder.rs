@@ -1255,6 +1255,26 @@ fn run_video_decode(
                                                 clock.total_audio_buffer_secs(),
                                             ),
                                         ),
+                                        // 診断用: raw/processed/tx を分離して記録
+                                        // (Codex 助言、2026-05-01)
+                                        (
+                                            "audio_processed_secs",
+                                            serde_json::Value::from(
+                                                clock.audio_processed_secs(),
+                                            ),
+                                        ),
+                                        (
+                                            "audio_raw_pending_secs",
+                                            serde_json::Value::from(
+                                                clock.audio_raw_pending_secs(),
+                                            ),
+                                        ),
+                                        (
+                                            "audio_tx_queued_secs",
+                                            serde_json::Value::from(
+                                                clock.audio_tx_queued_secs(),
+                                            ),
+                                        ),
                                         (
                                             "pace_now",
                                             serde_json::Value::from(
@@ -1501,6 +1521,20 @@ fn run_video_decode(
                         (
                             "audio_buf_secs",
                             serde_json::Value::from(clock.total_audio_buffer_secs()),
+                        ),
+                        // 診断用: raw/processed/tx を分離して記録
+                        // (Codex 助言、2026-05-01)
+                        (
+                            "audio_processed_secs",
+                            serde_json::Value::from(clock.audio_processed_secs()),
+                        ),
+                        (
+                            "audio_raw_pending_secs",
+                            serde_json::Value::from(clock.audio_raw_pending_secs()),
+                        ),
+                        (
+                            "audio_tx_queued_secs",
+                            serde_json::Value::from(clock.audio_tx_queued_secs()),
                         ),
                         (
                             "pace_now",

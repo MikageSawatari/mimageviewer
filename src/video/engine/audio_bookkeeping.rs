@@ -22,9 +22,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// `Default::default()` で全 0 初期化。
 pub struct AudioBookkeeping {
-    /// pump リングバッファの残量 (秒、f64 bits)。pump push / fill_output pop で
-    /// 直近値を `set_pump_buf_secs` 経由で publish する。
+    /// pump 後段 **processed** queue の残量 (秒、f64 bits、post-VST audible)。
+    /// `set_pump_buf_secs` 経由で publish。EQ latency 指標。
     pump_buf_secs_bits: AtomicU64,
+    /// pump 前段 **raw_pending** queue の残量 (秒、f64 bits、pre-VST)。
+    /// `set_raw_pending_secs` 経由で publish (= Codex 助言、2026-05-01)。
+    /// raw → processed 変換は VST process_block の数 ms 程度なので、decoder pacing は
+    /// raw_pending 内容も「再生可能 audio」として扱う (= `total_secs` に含める)。
+    raw_pending_secs_bits: AtomicU64,
     /// audio_tx に積まれているフレーム合計時間 (秒、f64 bits)。decoder の send 後
     /// `add_tx_queued(+duration)`、pump の recv 後 `add_tx_queued(-duration)`。
     tx_queued_secs_bits: AtomicU64,
@@ -43,20 +48,32 @@ impl AudioBookkeeping {
     pub const fn new() -> Self {
         Self {
             pump_buf_secs_bits: AtomicU64::new(0),
+            raw_pending_secs_bits: AtomicU64::new(0),
             tx_queued_secs_bits: AtomicU64::new(0),
             vst3_pdc_latency_secs_bits: AtomicU64::new(0),
         }
     }
 
-    /// pump 内ringbuffer 残量 (秒) を上書き publish。
+    /// pump 後段 (= processed) ringbuffer 残量 (秒) を上書き publish。
     pub fn set_pump_buf_secs(&self, secs: f64) {
         let v = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
         self.pump_buf_secs_bits.store(v.to_bits(), Ordering::Release);
     }
 
-    /// pump 内ringbuffer 残量を返す。
+    /// pump 後段 (= processed) ringbuffer 残量を返す。
     pub fn pump_buf_secs(&self) -> f64 {
         f64::from_bits(self.pump_buf_secs_bits.load(Ordering::Acquire))
+    }
+
+    /// pump 前段 (= raw_pending) queue 残量 (秒) を上書き publish。
+    pub fn set_raw_pending_secs(&self, secs: f64) {
+        let v = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
+        self.raw_pending_secs_bits.store(v.to_bits(), Ordering::Release);
+    }
+
+    /// pump 前段 (= raw_pending) queue 残量を返す。
+    pub fn raw_pending_secs(&self) -> f64 {
+        f64::from_bits(self.raw_pending_secs_bits.load(Ordering::Acquire))
     }
 
     /// audio_tx queued 合計に `delta` を加算する (= decoder send 時に + 、pump recv 時に -)。
@@ -85,10 +102,16 @@ impl AudioBookkeeping {
         f64::from_bits(self.tx_queued_secs_bits.load(Ordering::Acquire))
     }
 
-    /// pump_buf + tx_queued の合計。decoder pacing が「audio safe lo を割っているか」
-    /// を判定する材料。**actual buffer 残量のみ** (= PDC latency は含まない)。
+    /// pump_buf + raw_pending + tx_queued の合計。decoder pacing が「audio safe lo を
+    /// 割っているか」を判定する材料 (= Codex 助言、2026-05-01)。
+    /// **actual buffer 残量のみ** (= PDC latency は含まない)。
+    ///
+    /// **raw_pending を含める理由**: raw → processed 変換は VST process_block の数 ms
+    /// 程度なので、ユーザー体感上「再生可能 audio」として扱える。逆に含めないと、
+    /// processed 0.3 秒 cap だけが見えて decoder pacing が常に in_audio_escape 発動 →
+    /// video が pacing を無視して emergency burst → 体感的に "ガクガク再生"。
     pub fn total_secs(&self) -> f64 {
-        self.pump_buf_secs() + self.tx_queued_secs()
+        self.pump_buf_secs() + self.raw_pending_secs() + self.tx_queued_secs()
     }
 
     /// VST3 PDC latency (秒) を上書き publish。pump push 時に呼ばれる。
@@ -106,6 +129,7 @@ impl AudioBookkeeping {
     /// 旧挙動と同等)。PDC latency は次の pump push で再 publish されるので reset しない。
     pub fn reset(&self) {
         self.pump_buf_secs_bits.store(0, Ordering::Release);
+        self.raw_pending_secs_bits.store(0, Ordering::Release);
         self.tx_queued_secs_bits.store(0, Ordering::Release);
     }
 }
@@ -190,12 +214,34 @@ mod tests {
     }
 
     #[test]
+    fn total_sums_processed_raw_pending_and_tx() {
+        // Codex 助言 (2026-05-01): raw_pending を含めた 3 way sum を検証。
+        let bk = AudioBookkeeping::new();
+        bk.set_pump_buf_secs(0.3); // post-VST processed
+        bk.set_raw_pending_secs(5.0); // pre-VST raw queue
+        bk.add_tx_queued(0.5); // audio_tx queued
+        // total = 0.3 + 5.0 + 0.5 = 5.8
+        assert!((bk.total_secs() - 5.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn raw_pending_set_persists_and_resets() {
+        let bk = AudioBookkeeping::new();
+        bk.set_raw_pending_secs(7.5);
+        assert!((bk.raw_pending_secs() - 7.5).abs() < 1e-9);
+        bk.reset();
+        assert_eq!(bk.raw_pending_secs(), 0.0);
+    }
+
+    #[test]
     fn reset_zeroes_everything() {
         let bk = AudioBookkeeping::new();
         bk.set_pump_buf_secs(2.0);
+        bk.set_raw_pending_secs(10.0);
         bk.add_tx_queued(0.5);
         bk.reset();
         assert_eq!(bk.pump_buf_secs(), 0.0);
+        assert_eq!(bk.raw_pending_secs(), 0.0);
         assert_eq!(bk.tx_queued_secs(), 0.0);
         assert_eq!(bk.total_secs(), 0.0);
     }

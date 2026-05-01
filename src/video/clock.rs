@@ -557,10 +557,25 @@ impl AvClock {
         self.write_fallback_anchor_at(pts, Instant::now());
     }
 
-    /// pump 内ringbuffer 残量 (秒) を報告 (audio.rs から)。
+    /// pump 後段 (= processed) ringbuffer 残量 (秒) を報告 (audio.rs から)。
     /// Phase 2a: `AudioBookkeeping` に委譲。
     pub fn set_audio_pump_buf_secs(&self, secs: f64) {
         self.audio_bookkeeping.set_pump_buf_secs(secs);
+    }
+
+    /// pump 後段 (= processed) ringbuffer 残量 (秒) を返す。診断ログ用。
+    pub fn audio_processed_secs(&self) -> f64 {
+        self.audio_bookkeeping.pump_buf_secs()
+    }
+
+    /// pump 前段 (= raw_pending) queue 残量 (秒) を報告 (audio.rs から、Codex 助言)。
+    pub fn set_audio_raw_pending_secs(&self, secs: f64) {
+        self.audio_bookkeeping.set_raw_pending_secs(secs);
+    }
+
+    /// pump 前段 (= raw_pending) queue 残量 (秒) を返す。診断ログ用。
+    pub fn audio_raw_pending_secs(&self) -> f64 {
+        self.audio_bookkeeping.raw_pending_secs()
     }
 
     /// audio_tx に積まれているフレーム合計時間 (秒) の差分を加える。
@@ -570,10 +585,15 @@ impl AvClock {
         self.audio_bookkeeping.add_tx_queued(delta_secs);
     }
 
-    /// 現在の総音声バッファ秒数 (= pump + audio_tx queued)。
+    /// audio_tx queued 合計を返す。診断ログ用。
+    pub fn audio_tx_queued_secs(&self) -> f64 {
+        self.audio_bookkeeping.tx_queued_secs()
+    }
+
+    /// 現在の総音声バッファ秒数 (= processed + raw_pending + audio_tx queued)。
     /// decoder pacing が「audio が枯渇しそう (= 沈黙する) を回避すべきか」判定する。
     /// **actual buffer のみ** (= VST3 PDC latency は含まない、`vst3_pdc_latency_secs` で別取得)。
-    /// Phase 2a: `AudioBookkeeping` に委譲。
+    /// raw_pending 含む理由は [`AudioBookkeeping::total_secs`] のドキュメントを参照。
     pub fn total_audio_buffer_secs(&self) -> f64 {
         self.audio_bookkeeping.total_secs()
     }

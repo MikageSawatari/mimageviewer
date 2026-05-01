@@ -265,29 +265,39 @@ pub fn start(
     })
 }
 
-/// `AudioBuffer.samples` の長さを秒に変換して clock に publish する。
+/// `AudioBuffer` の各 queue 残量を秒に変換して clock に publish する。
 /// pump push / fill_output pop の両方から呼ばれる。
 ///
-/// **PDC latency は pump_buf に含めない** (= Codex 助言、2026-05-01)。
+/// **3 つの metric を分離して publish** (Codex 助言、2026-05-01):
+/// - `audio_pump_buf_secs` = post-VST `processed` queue 残量 (= EQ latency 指標)
+/// - `audio_raw_pending_secs` = pre-VST `raw_pending` queue 残量
+/// - `audio_tx_queued_secs` (= 別経路で publish 済、ここでは触らない)
+///
+/// `total_audio_buffer_secs()` は 3 つの合計を返す (= decoder pacing が「audio safe」
+/// 判定で見る値)。raw_pending を含む理由: raw → processed の VST process は数 ms 程度
+/// なので「再生可能 audio」として扱う。除くと processed 0.3 秒 cap だけが見えて
+/// pacing が in_audio_escape 連発 → video burst → "ガクガク再生"。
+///
+/// **PDC latency は pump_buf に含めない** (= Codex 助言、2026-05-01):
 /// 旧版は `secs + pdc_latency_secs` を publish していたが、それだと AudioBuffer が
 /// 完全に空 (= cpal underrun 中) でも「PDC 分のバッファあり」に見えてしまい、
 /// decoder pacing の `audio_escape` / emergency 補充が発動せず、結果として高 latency 時に
-/// 音声がブツブツ途切れる退行を起こす。
-///
-/// **PDC latency は別 metric で publish する** (`set_vst3_pdc_latency_secs`)。
-/// decoder pacing 側は actual buffer 残量で `audio_escape` を判定し、先読み許可量だけ
-/// `PACE_LEAD + pdc_latency` を加算する設計。
+/// 音声がブツブツ途切れる退行を起こす。PDC latency は別 metric で publish する
+/// (`set_vst3_pdc_latency_secs`)。先読み許可量だけ `PACE_LEAD + pdc_latency` を加算する設計。
 fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
-    // **processed audible 秒数のみ** を publish する (Codex P1-2、raw は含めない)。
-    // decoder pacing 側はこれを actual playable backlog として扱い、underrun
-    // 判定や PACE_LEAD 計算に使う。
-    let secs: f64 = buf
+    let processed_secs: f64 = buf
         .processed
         .iter()
         .map(|c| c.duration_secs)
         .sum::<f64>()
         + remaining_first_chunk_secs(buf);
-    clock.set_audio_pump_buf_secs(secs.max(0.0));
+    let raw_pending_secs: f64 = buf
+        .raw_pending
+        .iter()
+        .map(|f| f.duration_secs)
+        .sum::<f64>();
+    clock.set_audio_pump_buf_secs(processed_secs.max(0.0));
+    clock.set_audio_raw_pending_secs(raw_pending_secs.max(0.0));
     clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
 }
 
@@ -315,14 +325,22 @@ fn boost_audio_pump_priority() {
 /// raw / processed 2 段構造の audio pump (Codex 助言、2026-05)。
 ///
 /// **動作**:
-/// 1. audio_rx から `AudioFrame` を受信
+/// 1. audio_rx から `AudioFrame` を受信 (timeout 付き、自律 refill のため)
 /// 2. seek serial 切替時は VST plugin sync reset (= 既存挙動)
-/// 3. raw_pending に push (= cap=10秒 を超えたら overflow)
+/// 3. raw_pending に push (= cap=30秒 を超えたら overflow)
 /// 4. processed が cap (= 0.3秒) 未満の間、raw → VST process → processed をループ
 /// 5. processed の post-VST audible 秒数で BufferReady emit (= raw を**含めない**)
 ///
 /// **mutex ポリシー** (Codex P2-B): VST IPC (= bridge.process_block) 中は
 /// AudioBuffer mutex を解放する。lock → pop raw → unlock → process → lock → push processed。
+///
+/// **自律 refill** (= 2026-05-01 Codex 助言、`processed` starvation 対策):
+/// pump の outer loop は `recv_timeout(REFILL_TICK_MS)` で起き、`audio_rx` が空でも
+/// `raw_pending → processed` の補充ループを毎 tick 実行する。これにより cpal が
+/// processed を drain しても、`audio_rx` の到着を待たずに pump 側が processed を
+/// TARGET (= 0.3秒) に保てる。旧設計では outer loop が `recv` で blocking していたため、
+/// 1x 再生時に「audio_rx 到着 = ~23ms 間隔」と「cpal drain = ~10ms 間隔」のずれで
+/// processed が 0.3秒周期で枯渇 → cpal silence の繰返しになっていた。
 fn run_pump(
     rx: Receiver<AudioFrame>,
     shutdown_rx: crossbeam_channel::Receiver<()>,
@@ -359,6 +377,12 @@ fn run_pump(
     // 旧 10 秒では H264 HW decode の 1-2 秒 Buffering で頻繁に overflow していた。
     const RAW_WARNING_SECS: f64 = 15.0;
     const RAW_OVERFLOW_SECS: f64 = 30.0;
+    // ── 自律 refill tick (Codex 助言、2026-05-01) ──
+    // `recv_timeout` の値。audio_rx が空でも pump をこの間隔で起こし、processed を
+    // raw_pending から自律補充する。cpal の典型的な callback 間隔 (10ms) より短く取り、
+    // processed underrun を防ぐ。**短すぎ**ると CPU 負荷増、**長すぎ**ると starvation 復活。
+    // 5ms 設定: pump iter は通常 < 1ms、overhead は ~0.5% / sec で許容。
+    const REFILL_TICK_MS: u64 = 5;
 
     let sample_rate = buffer.lock().unwrap().sample_rate;
     let samples_per_sec = (sample_rate as f64) * 2.0;
@@ -366,149 +390,161 @@ fn run_pump(
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
-    /// このシーク世代の seek_target (= 最初の post-seek フレームの input PTS)。
-    /// PDC 適用後の chunk が `audible_pts < seek_target` だと「pre-target silence」と
-    /// 判定して push せずに drop する (= Codex P1-1: 早すぎる BufferReady 防止)。
-    /// 新 seek 世代の最初のフレームで Some(pts_secs) に set。
-    /// 「最初の post-target chunk が processed に届いた」時点で None にすると、その後の
-    /// chunk は無条件 push でいい。
+    // このシーク世代の seek_target (= 最初の post-seek フレームの input PTS)。
+    // PDC 適用後の chunk が `audible_pts < seek_target` だと「pre-target silence」と
+    // 判定して push せずに drop する (= Codex P1-1: 早すぎる BufferReady 防止)。
+    // 新 seek 世代の最初のフレームで Some(pts_secs) に set。
+    // 「最初の post-target chunk が processed に届いた」時点で None にすると、その後の
+    // chunk は無条件 push でいい。
     let mut seek_target_secs: Option<f64> = None;
-    /// このシーク世代について overflow fallback (= wall master) に切り替わったか。
-    /// `Some(serial)` なら fill_output / pump とも処理を停止する。
-    /// 新 seek 世代で None にリセット (= 再度 audio master を試す)。
+    // このシーク世代について overflow fallback (= wall master) に切り替わったか。
+    // `Some(serial)` なら fill_output / pump とも処理を停止する。
+    // 新 seek 世代で None にリセット (= 再度 audio master を試す)。
     let mut overflow_for_serial: Option<u64> = None;
     let mut last_warning_at: Option<std::time::Instant> = None;
 
     while !cancel.load(Ordering::Acquire) {
-        let frame = crossbeam_channel::select! {
+        // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
+        let frame_opt: Option<AudioFrame> = crossbeam_channel::select! {
             recv(shutdown_rx) -> _ => return,
             recv(rx) -> msg => match msg {
-                Ok(f) => f,
+                Ok(f) => Some(f),
                 Err(_) => break,
             },
+            default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
         };
 
-        clock.add_audio_tx_queued_secs(-frame.duration_secs);
+        // ── frame intake (Some の場合のみ): seek serial 検出、raw_pending push ──
+        // 'intake ラベル経由で skip するときも下流の refill / publish は実行する
+        // (= Codex 助言の自律 refill)。
+        'intake: {
+            let Some(frame) = frame_opt else {
+                break 'intake;
+            };
 
-        // ── 新 seek 世代の検出 → VST plugin sync reset (= 既存挙動) ──
-        let frame_seek_serial = frame.seek_serial;
-        let cur_clock_serial = clock.current_seek_serial();
-        if frame_seek_serial > last_seen_seek_serial
-            && frame_seek_serial >= cur_clock_serial
-        {
-            #[cfg(windows)]
-            if let Some(b) = &dsp_bridge {
-                if b.is_enabled() && b.active_slot_count() > 0 {
-                    b.reset_plugins_sync();
+            clock.add_audio_tx_queued_secs(-frame.duration_secs);
+
+            // ── 新 seek 世代の検出 → VST plugin sync reset (= 既存挙動) ──
+            let frame_seek_serial = frame.seek_serial;
+            let cur_clock_serial = clock.current_seek_serial();
+            if frame_seek_serial > last_seen_seek_serial
+                && frame_seek_serial >= cur_clock_serial
+            {
+                #[cfg(windows)]
+                if let Some(b) = &dsp_bridge {
+                    if b.is_enabled() && b.active_slot_count() > 0 {
+                        b.reset_plugins_sync();
+                    }
+                }
+                last_seen_seek_serial = frame_seek_serial;
+                // 新 seek 世代: overflow / target / activate を全 reset
+                overflow_for_serial = None;
+                seek_target_secs = Some(frame.pts_secs);
+                activated = false; // 再度 audio master を試す
+            }
+
+            // ── stale check (= clock より古い世代は破棄) ──
+            if frame_seek_serial < cur_clock_serial {
+                break 'intake;
+            }
+
+            // ── overflow 中はその世代について no-op (Codex P1-2 反映) ──
+            // 既に overflow_for_serial に切り替わっている世代は frame を捨てる。
+            // pump は demux/audio_decode を詰まらせないために consume だけする。
+            if overflow_for_serial == Some(frame_seek_serial) {
+                break 'intake;
+            }
+
+            // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
+            let raw_total_secs = {
+                let mut buf = buffer.lock().unwrap();
+
+                // pump_seek_serial 切替 → processed + raw_pending 両方クリア
+                if frame_seek_serial > buf.pump_seek_serial {
+                    buf.processed.clear();
+                    buf.drain_offset_in_first = 0;
+                    buf.raw_pending.clear();
+                    buf.next_pts_secs = frame.pts_secs;
+                    buf.pump_seek_serial = frame_seek_serial;
+                } else if frame_seek_serial < buf.pump_seek_serial {
+                    // pump_seek_serial より更に古い (= レース時の保険)
+                    drop(buf);
+                    break 'intake;
+                } else if buf.processed.is_empty()
+                    && buf.raw_pending.is_empty()
+                    && frame.pts_secs > buf.next_pts_secs
+                {
+                    // underrun resync は前進方向のみ
+                    buf.next_pts_secs = frame.pts_secs;
+                }
+
+                // overflow check: raw 合計秒数を計算 (= duration 単位、Codex P2-A 助言)
+                let raw_secs: f64 = buf
+                    .raw_pending
+                    .iter()
+                    .map(|f| f.duration_secs)
+                    .sum::<f64>()
+                    + frame.duration_secs;
+
+                if raw_secs <= RAW_OVERFLOW_SECS {
+                    buf.raw_pending.push_back(frame);
+                }
+                // else: 後続の overflow_alerted で対応
+                raw_secs
+            };
+
+            // ── overflow / warning 通知 (Codex P1-1: silent drop しない、P1-2 改: soft fallback) ──
+            if raw_total_secs > RAW_OVERFLOW_SECS {
+                // **soft fallback** (= Codex P1-2 修正): その seek 世代では consume only。
+                // 旧版は `clock.mark_audio_inactive()` + `AudioInactive` emit で恒久 fallback
+                // にしていたが、`AudioInactive` は EngineActor の `has_audio` を **永久に**
+                // false にする想定 (= デバイス起動失敗 用)。一時 fallback と混ぜると次 seek で
+                // has_audio が戻らず Buffering→Playing の latch 判定が壊れる。
+                //
+                // 新版: queue を clear + overflow_for_serial を set するだけ。
+                // - processed が空なので fill_output drain なし → set_audio_pts が呼ばれない
+                //   → AvClock の Audio 世代 anchor は更新されず wall extrapolation で進む
+                //   (= 自然に wall fallback)
+                // - 新 seek 世代で overflow_for_serial = None に reset (= 再 audio master 試行)
+                crate::logger::log(format!(
+                    "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
+                     seek_serial={frame_seek_serial}: soft fallback (clear queue, skip serial)",
+                    raw_total_secs, RAW_OVERFLOW_SECS,
+                ));
+                {
+                    let mut buf = buffer.lock().unwrap();
+                    buf.processed.clear();
+                    buf.drain_offset_in_first = 0;
+                    buf.raw_pending.clear();
+                    publish_buffer_secs(&buf, &clock);
+                }
+                overflow_for_serial = Some(frame_seek_serial);
+                break 'intake;
+            } else if raw_total_secs > RAW_WARNING_SECS {
+                // warning: 5秒に 1 度ログ。長時間 Buffering の診断用。
+                let now = std::time::Instant::now();
+                let should_log = match last_warning_at {
+                    None => true,
+                    Some(t) => now.duration_since(t).as_secs() >= 5,
+                };
+                if should_log {
+                    crate::logger::log(format!(
+                        "[audio-pump] raw_pending high water ({:.1}s > {:.1}s warning)",
+                        raw_total_secs, RAW_WARNING_SECS,
+                    ));
+                    last_warning_at = Some(now);
                 }
             }
-            last_seen_seek_serial = frame_seek_serial;
-            // 新 seek 世代: overflow / target / activate を全 reset
-            overflow_for_serial = None;
-            seek_target_secs = Some(frame.pts_secs);
-            activated = false; // 再度 audio master を試す
-        }
 
-        // ── stale check (= clock より古い世代は破棄) ──
-        if frame_seek_serial < cur_clock_serial {
-            continue;
-        }
-
-        // ── overflow 中はその世代について no-op (Codex P1-2 反映) ──
-        // 既に overflow_for_serial に切り替わっている世代は frame を捨てる。
-        // pump は demux/audio_decode を詰まらせないために consume だけする。
-        if overflow_for_serial == Some(frame_seek_serial) {
-            continue;
-        }
-
-        // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
-        let raw_total_secs = {
-            let mut buf = buffer.lock().unwrap();
-
-            // pump_seek_serial 切替 → processed + raw_pending 両方クリア
-            if frame_seek_serial > buf.pump_seek_serial {
-                buf.processed.clear();
-                buf.drain_offset_in_first = 0;
-                buf.raw_pending.clear();
-                buf.next_pts_secs = frame.pts_secs;
-                buf.pump_seek_serial = frame_seek_serial;
-            } else if frame_seek_serial < buf.pump_seek_serial {
-                // pump_seek_serial より更に古い (= レース時の保険)
-                drop(buf);
-                continue;
-            } else if buf.processed.is_empty()
-                && buf.raw_pending.is_empty()
-                && frame.pts_secs > buf.next_pts_secs
-            {
-                // underrun resync は前進方向のみ
-                buf.next_pts_secs = frame.pts_secs;
+            // audio master 化 (= stale 通過後の最初のフレーム)
+            if !activated {
+                clock.notify_audio_active();
+                activated = true;
             }
-
-            // overflow check: raw 合計秒数を計算 (= duration 単位、Codex P2-A 助言)
-            let raw_secs: f64 = buf
-                .raw_pending
-                .iter()
-                .map(|f| f.duration_secs)
-                .sum::<f64>()
-                + frame.duration_secs;
-
-            if raw_secs <= RAW_OVERFLOW_SECS {
-                buf.raw_pending.push_back(frame);
-            }
-            // else: 後続の overflow_alerted で対応
-            raw_secs
-        };
-
-        // ── overflow / warning 通知 (Codex P1-1: silent drop しない、P1-2 改: soft fallback) ──
-        if raw_total_secs > RAW_OVERFLOW_SECS {
-            // **soft fallback** (= Codex P1-2 修正): その seek 世代では consume only。
-            // 旧版は `clock.mark_audio_inactive()` + `AudioInactive` emit で恒久 fallback
-            // にしていたが、`AudioInactive` は EngineActor の `has_audio` を **永久に**
-            // false にする想定 (= デバイス起動失敗 用)。一時 fallback と混ぜると次 seek で
-            // has_audio が戻らず Buffering→Playing の latch 判定が壊れる。
-            //
-            // 新版: queue を clear + overflow_for_serial を set するだけ。
-            // - processed が空なので fill_output drain なし → set_audio_pts が呼ばれない
-            //   → AvClock の Audio 世代 anchor は更新されず wall extrapolation で進む
-            //   (= 自然に wall fallback)
-            // - 新 seek 世代で overflow_for_serial = None に reset (= 再 audio master 試行)
-            crate::logger::log(format!(
-                "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
-                 seek_serial={frame_seek_serial}: soft fallback (clear queue, skip serial)",
-                raw_total_secs, RAW_OVERFLOW_SECS,
-            ));
-            {
-                let mut buf = buffer.lock().unwrap();
-                buf.processed.clear();
-                buf.drain_offset_in_first = 0;
-                buf.raw_pending.clear();
-                publish_buffer_secs(&buf, &clock);
-            }
-            overflow_for_serial = Some(frame_seek_serial);
-            continue;
-        } else if raw_total_secs > RAW_WARNING_SECS {
-            // warning: 5秒に 1 度ログ。長時間 Buffering の診断用。
-            let now = std::time::Instant::now();
-            let should_log = match last_warning_at {
-                None => true,
-                Some(t) => now.duration_since(t).as_secs() >= 5,
-            };
-            if should_log {
-                crate::logger::log(format!(
-                    "[audio-pump] raw_pending high water ({:.1}s > {:.1}s warning)",
-                    raw_total_secs, RAW_WARNING_SECS,
-                ));
-                last_warning_at = Some(now);
-            }
-        }
-
-        // audio master 化 (= stale 通過後の最初のフレーム)
-        if !activated {
-            clock.notify_audio_active();
-            activated = true;
-        }
+        } // 'intake
 
         // ── raw → VST process → processed loop ──
+        // (overflow_for_serial 中は raw_pending が既に clear 済みなので refill loop は no-op)
         // mutex を持たずに VST process_block を呼ぶ (Codex P2-B):
         // 1. lock → pop raw_pending → unlock
         // 2. process_block (no lock)
@@ -817,10 +853,10 @@ fn fill_output(
     let mut real_consumed: usize = 0;
     let mut written = 0;
     let samples_per_sec = buf.samples_per_sec;
-    /// 最後に drain したサンプル「直後」の audible PTS (= 次に drain される予定の PTS)。
-    /// chunk が pop_front されても、その chunk の最終 audible PTS を保持し続ける。
+    // 最後に drain したサンプル「直後」の audible PTS (= 次に drain される予定の PTS)。
+    // chunk が pop_front されても、その chunk の最終 audible PTS を保持し続ける。
     let mut next_audible_pts: Option<f64> = None;
-    /// drain 中に chunk が切り替わったか (= PDC latency が変化した可能性)
+    // drain 中に chunk が切り替わったか (= PDC latency が変化した可能性)
     let mut chunk_pdc_latency_at_drain: Option<f64> = None;
 
     while written < want {
