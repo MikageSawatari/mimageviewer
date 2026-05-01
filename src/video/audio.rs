@@ -270,14 +270,20 @@ pub fn start(
 ///
 /// **3 つの metric を分離して publish** (Codex 助言、2026-05-01 改訂):
 /// - `audio_pump_buf_secs` = post-VST `processed` queue 残量 (= EQ latency 指標、
-///   かつ **唯一 cpal が今すぐ鳴らせる playable**)
-/// - `audio_raw_pending_secs` = pre-VST `raw_pending` queue 残量 (= **supply only**、
+///   かつ **唯一 cpal が今すぐ鳴らせる "cpal-ready playable"**)
+/// - `audio_raw_pending_secs` = pre-VST `raw_pending` queue 残量 (= pump 内 raw supply、
 ///   VST 詰まり / PDC trim drop で playable にならない可能性あり)
-/// - `audio_tx_queued_secs` (= 別経路で publish 済、ここでは触らない、これも supply)
+/// - `audio_tx_queued_secs` (= 別経路で publish 済、ここでは触らない、decoder→pump 間の
+///   bounded supply、cap=audio_tx 32 frames ≒ 0.7 秒)
 ///
-/// `total_audio_buffer_secs()` は **playable** (= `processed + tx_queued`) のみを返す。
-/// raw_pending は含めない (= Codex 改訂: VST が遅い/詰まる/PDC trim で drop される
-/// 場合に raw が満杯でも cpal は silence になりうるため)。raw を playable 扱いすると
+/// `total_audio_buffer_secs()` は **pacing_audio_secs** (= `processed` + `tx_queued` の和)
+/// を返す。これは「cpal-ready playable + decoder→pump 間の bounded 予測補助」であり、
+/// **厳密な playable ではない** (= tx_queued は pre-VST/pre-pump、cpal が今すぐ鳴らせる
+/// audio ではない)。decoder pacing は本値で `in_audio_escape` を判定するが、tx_queued
+/// は cap=0.7 秒に縛られるので暴走 supply 誤認のリスクは小さい。
+///
+/// **raw_pending は含めない** (= Codex 改訂、2026-05-01): VST が遅い/詰まる/PDC trim
+/// で drop される場合に raw が満杯でも cpal は silence になりうるため。raw を含めると
 /// decoder pacing が `in_audio_escape` を解除できず video が burst → audio underrun
 /// したまま映像だけ進む退行。raw_pending は [`AvClock::audio_supply_secs`] で別途参照可。
 ///

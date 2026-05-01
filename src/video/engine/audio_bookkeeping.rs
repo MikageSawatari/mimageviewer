@@ -111,17 +111,25 @@ impl AudioBookkeeping {
         f64::from_bits(self.tx_queued_secs_bits.load(Ordering::Acquire))
     }
 
-    /// pump_buf + tx_queued の合計 (= **playable + decoder supply のみ**)。
-    /// decoder pacing が「audio safe lo を割っているか」を判定する材料。
-    /// **actual buffer 残量のみ** (= PDC latency は含まない)。
+    /// **pacing_audio_secs** = `pump_buf_secs` (= post-VST processed) + `tx_queued_secs`
+    /// (= decoder→pump 間の bounded 供給、cap ≒ 0.7 秒)。decoder pacing が
+    /// `in_audio_escape` 判定で参照する値。
+    ///
+    /// **厳密には playable ではない**: tx_queued は pre-VST/pre-pump なので cpal が
+    /// 今すぐ鳴らせる audio ではない。「cpal-ready playable + 短い予測補助」という
+    /// 折衷値。tx_queued は cap=0.7 秒に縛られるため暴走 supply 誤認のリスクは小さく、
+    /// 旧コード (= 1 段 buffer 時代) からの互換性のためにここに含める。
     ///
     /// **raw_pending は含めない** (= Codex 助言、2026-05-01 改訂):
-    /// raw_pending は **pre-VST** であり、VST process_block が遅い/詰まる、PDC trim で
-    /// drop される場合、実際の playable buffer は 0 でも raw は満杯のことがある。
-    /// raw を含めると decoder pacing が「音声あり」と誤判断 → video が pacing 無視で
-    /// burst → 結果的に audio が underrun したまま動画だけ進む退行。
+    /// raw_pending は **pre-VST** で cap=30 秒。VST process_block が遅い/詰まる、PDC trim
+    /// で drop される場合、実際の playable buffer は 0 でも raw は満杯になる。raw を
+    /// 含めると decoder pacing が「音声あり」と誤判断 → video が pacing 無視で burst →
+    /// 結果的に audio が underrun したまま動画だけ進む退行。
     ///
-    /// 詳細な supply 状態は [`raw_pending_secs`](Self::raw_pending_secs) で別途取得可。
+    /// **actual buffer のみ** (= PDC latency は含まない、`vst3_pdc_latency_secs` で別取得)。
+    ///
+    /// 詳細な supply 状態は [`raw_pending_secs`](Self::raw_pending_secs) や
+    /// [`supply_secs`](Self::supply_secs) で別途取得可。
     pub fn total_secs(&self) -> f64 {
         self.pump_buf_secs() + self.tx_queued_secs()
     }
