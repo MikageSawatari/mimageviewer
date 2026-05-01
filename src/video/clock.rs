@@ -45,6 +45,33 @@ use std::time::Instant;
 use crate::video::engine::audio_bookkeeping::AudioBookkeeping;
 use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 
+/// シーク種別 (= 速度と精度のトレードオフ選択)。
+///
+/// **Fast** はユーザー要望 (= ←→キーの体感を速くしたい) に応える hybrid 設計の
+/// 一部。シークバー / ブックマーク / 自動復元など「正確な位置」が要る経路は
+/// **Precise** を使い、ホットキーによる相対シークだけ **Fast** を使う。
+///
+/// どちらも `av_seek_frame(AVSEEK_FLAG_BACKWARD)` で keyframe ≤ target に着地する
+/// (= 共通基底)。違いは preroll trim を行うかどうかのみ:
+///
+/// - **Precise**: `drop_before_secs = Some(target)` を decode thread に渡し、
+///   keyframe → target までの数 100ms 〜 数秒分を decode + drop して target ぴったりに
+///   再生開始する (= 旧 Phase 9.F 既定動作)。
+/// - **Fast**: `drop_before_secs = None` を渡し、preroll decode を完全にスキップ。
+///   keyframe pts (= target - 0〜3 秒) から即時再生開始する。`notify_seek_completed`
+///   は target でアンカーするので timeline 表示は target を指すが、視聴コンテンツは
+///   GOP 1 個分先行する形になる。audio の monotonic guard が anchor 後退を防ぐので
+///   UI 停止は起きない。0〜3 秒の wall 経過で audio が target に追いつき、その時点で
+///   anchor が更新されて完全同期する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekKind {
+    /// 正確な位置への seek (シークバー / ブックマーク / loop 再生 / EOF replay /
+    /// 自動復元)。preroll decode + trim あり、target ぴったりに着地。
+    Precise,
+    /// 高速 seek (←→ キー)。preroll trim を省略、keyframe 即時再生。
+    Fast,
+}
+
 /// シーク要求の整合性ある 1 件分。AvClock の `seek_request` Mutex が保護する。
 /// `decoder` モジュールが `take_seek_request()` で取り出す。
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +79,8 @@ pub(super) struct SeekRequest {
     pub target_secs: f64,
     /// シーク世代。request 時点で `seek_serial` から取得・進めた値。
     pub serial: u64,
+    /// シーク種別 (Precise / Fast)。decoder が preroll trim の有無を切替える。
+    pub kind: SeekKind,
 }
 
 /// 動画再生用 AV マスタークロック (facade)。
@@ -401,12 +430,22 @@ impl AvClock {
         self.playing.store(playing, Ordering::Release);
     }
 
-    /// シーク要求を出す。デコーダは [`AvClock::take_seek_request`] で取り出す。
+    /// シーク要求を出す (= 既定 [`SeekKind::Precise`])。デコーダは
+    /// [`AvClock::take_seek_request`] で取り出す。
     ///
-    /// 旧 API では `direction` 引数で前方/後方/絶対のヒントを渡していたが、
-    /// Phase 9.F で「方向に関係なく **常に backward+preroll**」に統一したため、
-    /// decoder 側で direction を参照しなくなった。引数は撤去済み。
+    /// シークバー・ブックマーク・loop 再生・EOF replay・自動復元など「正確な位置」が
+    /// 要る経路はこの API を使う。←→ キーのような「速く飛ばしたい」経路は
+    /// [`AvClock::request_seek_with_kind`] に [`SeekKind::Fast`] を渡す。
     pub fn request_seek(&self, target_secs: f64) {
+        self.request_seek_with_kind(target_secs, SeekKind::Precise);
+    }
+
+    /// シーク種別を明示してシーク要求を出す。
+    ///
+    /// [`SeekKind::Fast`] は preroll trim を省略するため keyframe pts に着地する
+    /// (= target ぴったりではない)。動画 timeline 表示は target で固定されるが、
+    /// 視聴コンテンツは 0〜3 秒程度先行する。詳細は [`SeekKind`] のコメント参照。
+    pub fn request_seek_with_kind(&self, target_secs: f64, kind: SeekKind) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
@@ -420,8 +459,13 @@ impl AvClock {
         *guard = Some(SeekRequest {
             target_secs: clamped,
             serial: new_serial,
+            kind,
         });
         if crate::perf::is_enabled() {
+            let kind_str = match kind {
+                SeekKind::Precise => "precise",
+                SeekKind::Fast => "fast",
+            };
             crate::perf::event(
                 "video",
                 "seek_override_set",
@@ -430,6 +474,7 @@ impl AvClock {
                 &[
                     ("target", serde_json::Value::from(clamped)),
                     ("serial", serde_json::Value::from(new_serial as i64)),
+                    ("kind", serde_json::Value::from(kind_str)),
                 ],
             );
         }

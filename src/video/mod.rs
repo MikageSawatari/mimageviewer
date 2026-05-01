@@ -474,14 +474,15 @@ impl VideoPlayer {
         }
     }
 
-    /// 絶対シーク (シークバークリック等)。`..target` のキーフレームにスナップ
-    /// (Phase 9.F 以降、direction に関係なく **常に backward+preroll**)。
+    /// 絶対シーク (シークバークリック / ブックマーク等)。
+    /// **[`SeekKind::Precise`]**: `..target` のキーフレーム + preroll trim で
+    /// target ぴったりに着地。
     /// target は `[0, duration - 0.1s)` にクランプされる。
     /// 一時停止中なら自動的に再生再開する (post-EOF / pause からの seek を
     /// ユーザー操作 1 回で完結させる)。
     pub fn seek(&self, target_secs: f64) {
         let clamped = self.clamp_seek_target(target_secs);
-        self.clock.request_seek(clamped);
+        self.clock.request_seek(clamped); // = SeekKind::Precise
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
@@ -494,15 +495,19 @@ impl VideoPlayer {
         g.apply_command(engine::actor::TransportCommand::Play);
     }
 
-    /// 相対シーク。Phase 9.F 以降、前方/後方どちらでも **常に backward+preroll**
-    /// (= `..target` のキーフレーム + preroll で target に進む) に統一されたため、
-    /// `delta_secs` の符号は target 計算にしか使われない。
+    /// 相対シーク (←→ ホットキー)。
+    /// **[`SeekKind::Fast`]**: keyframe ≤ target に backward seek し、preroll trim
+    /// を省略して即時再生開始する。←→ 連打の体感速度を最優先。
+    /// 着地位置は target ぴったりではなく keyframe pts (= target - 0〜3 秒程度) で、
+    /// 動画 timeline 表示は target を指すが視聴コンテンツは GOP 1 個分だけ先行する形に
+    /// なる。0〜3 秒の wall 経過で audio が target に追いつき完全同期する。
     /// 一時停止中なら自動的に再生再開する。
     pub fn seek_relative(&self, delta_secs: f64) {
         let cur = self.position();
         let raw = (cur + delta_secs).max(0.0);
         let target = self.clamp_seek_target(raw);
-        self.clock.request_seek(target);
+        self.clock
+            .request_seek_with_kind(target, clock::SeekKind::Fast);
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }

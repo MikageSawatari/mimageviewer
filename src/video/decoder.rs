@@ -698,6 +698,7 @@ fn run_decoder(
             let super::clock::SeekRequest {
                 target_secs,
                 serial,
+                kind,
             } = req;
             // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
             // すべて video decode thread のローカル変数として所有される。demux thread は
@@ -718,28 +719,29 @@ fn run_decoder(
                 if ret >= 0 { Ok(()) } else { Err(ffmpeg::Error::from(ret)) }
             };
 
-            // Phase 9.F (2026-04-30): 前方/後方/絶対に関係なく **常に backward+preroll**
-            // を使う。旧コードは前方相対で `input.seek(target..)` (= avformat_seek_file
-            // with min_ts=target、target 以降の keyframe に着地) を使い、preroll なしで
-            // 「最寄り keyframe から再生」する設計だった。
+            // Phase 9.F (2026-04-30): 前方/後方/絶対に関係なく **常に backward seek**
+            // (= `av_seek_frame + AVSEEK_FLAG_BACKWARD`) を使う。旧コードは前方相対で
+            // `input.seek(target..)` (= avformat_seek_file with min_ts=target、target 以降
+            // の keyframe に着地) を使い、preroll なしで「最寄り keyframe から再生」する
+            // 設計だったが、forward seek は target+0.5〜2 秒の keyframe に着地し video
+            // 1 枚目 pts >> target になる。一方 mp4 の音声 packet は keyframe pts より
+            // 少し前から届くため、anchor.pts (= audio_pts) < video frame pts となり、
+            // UI tick の `pts <= now + lead_tol` 判定で video frame が future 扱い →
+            // 表示停止、音声だけ進む現象が起きていた。
             //
-            // しかし forward seek は典型的な GOP (1-3 秒) で **target+0.5〜2 秒の
-            // keyframe** に着地し、video 1 枚目 pts >> target になる。一方 mp4 の
-            // 音声 packet 順は概ね pts 順なので、avformat 内部の read 位置が
-            // keyframe + audio になっていても、最初の audio packet pts は keyframe
-            // pts より少し前に出ることがある (= mp4 muxing で audio が video keyframe
-            // 直前に挟まれているケース)。
+            // backward seek なら video/audio 両方が **target 直前の keyframe** で始まる
+            // ので、anchor を target に書く [`SeekKind::Precise`] / [`SeekKind::Fast`]
+            // どちらでも video frame は anchor より過去 = `pts <= now + lead_tol` で即時
+            // 表示されるため UI 停止しない。差分は preroll trim (= drop_before_secs) を
+            // 行うかどうかのみ:
             //
-            // 結果として transition_to_playing 時に anchor.pts (= audio_pts) が
-            // video frame pts より **数百 ms 〜数秒** 早くなり、UI tick の
-            // `pts <= now + lead_tol` 判定で video frame が future 扱いになって
-            // 表示が止まり、音声だけ進んで video が「早送りで追いつく」現象に。
-            //
-            // backward+preroll なら video/audio 両方が **target 直前の keyframe** で
-            // 始まり drop_before_secs で target にトリム → 確実に同位置で再生開始。
-            // GOP が長い動画では preroll decode のために 0.5〜3 秒余分にかかるが、
-            // SW デコードでも 30fps wall × 数秒 = ~100ms 程度の遅延に収まり実用上
-            // 問題ない。
+            // - **Precise**: drop_before_secs = Some(target)。keyframe → target を decode
+            //   + drop して target ぴったりに着地 (= シークバー / ブックマークの精度)。
+            // - **Fast**: drop_before_secs = None。preroll decode を完全にスキップ。
+            //   keyframe pts (= target - 0〜3 秒) で即時再生開始 (= ←→ キーの体感速度)。
+            //   audio monotonic guard が anchor 後退を防ぐので timeline 表示は target で
+            //   固定、視聴コンテンツが GOP 1 個分先行する形になる。0〜3 秒の wall 経過で
+            //   audio が target に追いつき完全同期する。
             let mut seek_result = backward(&mut input);
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
@@ -749,8 +751,12 @@ fn run_decoder(
                 ));
                 seek_result = input.seek(target_pts, target_pts..);
             }
+            let kind_str = match kind {
+                super::clock::SeekKind::Precise => "precise",
+                super::clock::SeekKind::Fast => "fast",
+            };
             crate::logger::log(format!(
-                "seek: target={target_secs:.3}s serial={serial} result={seek_result:?}"
+                "seek: target={target_secs:.3}s serial={serial} kind={kind_str} result={seek_result:?}"
             ));
             if seek_result.is_err() {
                 // 完全失敗: override を明示解除しないと pace_now が target 固定で
@@ -772,11 +778,17 @@ fn run_decoder(
             // Phase B: video / audio どちらの decoder も別 thread が所有しているので、
             // Flush は channel 経由で送る。順序保証 channel なので、Flush 後に enqueue
             // される packet は前世代として処理されない。
-            // - 成功時: target_secs = Some(t) → 受信側は post-seek preroll 用に
+            // - Precise 成功時: target_secs = Some(t) → 受信側は post-seek preroll 用に
             //   drop_before_secs = Some(t) を設定 (video は post_seek_frame_sent=false に)
-            // - 失敗時: target_secs = None → 受信側は preroll trim せず通常 pacing に戻す
+            // - Fast 成功時: target_secs = None → 受信側は preroll trim せず即時再生
+            //   (= keyframe ≤ target からそのまま再生開始する hybrid 設計)
+            // - 失敗時 (Precise/Fast 共通): target_secs = None → 受信側は preroll trim せず
+            //   通常 pacing に戻す
             let target_for_flush = if seek_result.is_ok() {
-                Some(target_secs)
+                match kind {
+                    super::clock::SeekKind::Precise => Some(target_secs),
+                    super::clock::SeekKind::Fast => None,
+                }
             } else {
                 None
             };
