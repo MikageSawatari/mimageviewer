@@ -20,7 +20,7 @@
 # ヘッダ・lib は ffmpeg-the-third のビルド時に FFMPEG_DIR 経由で参照される。
 #
 # ライセンス:
-#   BtbN の LGPL shared build を使用。LGPLv2.1 表記とソース提供義務を満たすため、
+#   BtbN の LGPL shared build を使用。LGPLv3-or-later 表記とソース提供義務を満たすため、
 #   配布物の「ソフトウェア情報」と installer/readme.txt に LGPL 通知を入れること。
 #   詳細は CLAUDE.md の「FFmpeg ライセンス対応」節を参照。
 
@@ -143,5 +143,5 @@ echo "Libs:"
 ls "$VENDOR_DIR/lib"
 echo ""
 echo "次は cargo build --release で DLL を exe に埋め込みます。"
-echo "ライセンス: LGPLv2.1。配布時は「ソフトウェア情報」に表記、"
-echo "mikage.to にソース tarball を配置してください。"
+echo "ライセンス: LGPLv3-or-later。配布時は「ソフトウェア情報」に表記、"
+echo "docs/ffmpeg-lgpl-source-distribution.md に従って対応ソース情報を確認してください。"

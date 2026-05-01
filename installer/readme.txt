@@ -150,6 +150,8 @@ Windows の「設定」→「アプリ」→「インストールされている
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - libjpeg-turbo (BSD-3-Clause / zlib)
   - eframe / egui (MIT or Apache-2.0): Rerun Technologies
+  - FFmpeg (LGPLv3-or-later): FFmpeg project
+    Source and license notes: https://mikage.to/mimageviewer/
 
 AI モデルは各配布元のライセンスに従います。詳細は
 オンラインマニュアル（下記）を参照してください。

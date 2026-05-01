@@ -16,7 +16,7 @@
 //! ([`ffmpeg_loader::init`])。VC++ 再頒布可能パッケージ非依存。
 //!
 //! ## ライセンス
-//! FFmpeg LGPLv2.1 build。動的リンク + ソフトウェア情報への通知 + ソース提供
+//! FFmpeg LGPLv3-or-later build。動的リンク + ソフトウェア情報への通知 + ソース提供
 //! (mikage.to に tarball 配置) で MIT ライセンスの mIV と共存可能。詳細は
 //! CLAUDE.md の「FFmpeg ライセンス対応」節を参照。
 
@@ -32,6 +32,7 @@ pub mod gpu_renderer;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;
+pub mod upscale;
 
 use std::path::PathBuf;
 use std::sync::Arc;

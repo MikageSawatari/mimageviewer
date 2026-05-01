@@ -1435,6 +1435,7 @@ pub struct App {
     pub(crate) archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
     pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
+    pub(crate) video_upscale: Option<crate::ui_dialogs::video_upscale::VideoUpscaleState>,
     /// 変換済みアーカイブを開いているとき、元 (7z/LZH) のパスを保持する。
     /// `current_folder` はキャッシュ ZIP を指しているので、UI 表示 / BS /
     /// Ctrl+↑↓ / タイトルバーでは本フィールドを優先する。
@@ -2420,6 +2421,7 @@ impl Default for App {
             archive_cache_maint_pending: None,
             archive_cache_db,
             archive_convert: None,
+            video_upscale: None,
             archive_source_override: None,
             show_archive_cache_manager: false,
             archive_cache_rows: None,
@@ -13427,6 +13429,7 @@ impl eframe::App for App {
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
+        self.show_video_upscale_dialog(ctx);
         self.poll_thumb_quality_pending(ctx);
         self.poll_tq_encode_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);

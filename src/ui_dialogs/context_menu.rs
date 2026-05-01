@@ -151,6 +151,12 @@ impl crate::app::App {
                                     close = true;
                                 }
                             }
+                            if matches!(item, GridItem::Video(_)) {
+                                if ui.button("AI動画アップスケール...").clicked() {
+                                    self.request_video_upscale(p.clone());
+                                    close = true;
+                                }
+                            }
                             if ui.button("コピー").clicked() {
                                 copy_files_to_clipboard(&[p.clone()]);
                                 close = true;

@@ -41,6 +41,7 @@
 | [search-test-plan.md](search-test-plan.md) | 検索・notify-rs 監視・キー操作の自動テスト整備計画 |
 | [tag-feature.md](tag-feature.md) | ハッシュタグ型タグ機能 (`dc:subject` に `#タグ` 書き込み + Ctrl+G 連携) の設計ドキュメント |
 | [video-architecture.md](video-architecture.md) | 動画インライン再生サブシステムの設計指針と内部構造 (D3D11VA HW デコード + DX12 zero-copy interop + CPU fallback)。**Phase 2 (DComp / NVIDIA VSR) 撤回の経緯も巻末に記載** |
+| [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md) | FFmpeg LGPLv3-or-later build の配布時チェックリスト、対応ソース、同梱外部ライブラリの確認メモ |
 | [video-engine-redesign.md](video-engine-redesign.md) | エンジン側 (`AvClock` / `EngineActor` / `MasterClock` / `AudioBookkeeping`) のリデザイン経緯と各 Phase 詳細。Phase 8.K の pacing 仕様、Phase 9 の 3-thread 分離、Phase 9.A〜9.G の追加修正 (wall-rate cap / cpal warmup silence / forward seek backward+preroll / perf overlay seek freeze 等) を網羅 |
 | [vst3-integration.md](vst3-integration.md) | VST3 プラグイン統合 (v0.9.0+) — C++ bridge プロセス + Rust IPC、audio-pump からの bridge 経由、プラグイン GUI のクロスプロセス attach、デフォルト OFF + on-demand スキャン、V キートグル |
 

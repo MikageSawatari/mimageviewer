@@ -161,7 +161,7 @@ mimageviewer/
 │       ├── bin/             # avcodec/avformat/avutil/swscale/swresample DLL
 │       ├── include/         # ffmpeg-the-third のビルド時参照 (FFMPEG_DIR)
 │       ├── lib/             # import library (.lib)
-│       └── LICENSE.txt      # LGPLv2.1 本文 (ソフトウェア情報に転載する)
+│       └── LICENSE.txt      # LGPLv3-or-later 本文 (ソフトウェア情報に転載する)
 ├── Cargo.toml
 └── Cargo.lock
 ```
@@ -539,7 +539,7 @@ bash scripts/setup-ffmpeg.sh check     # 新版があるか確認のみ
   - `vendor/ffmpeg/include/`, `vendor/ffmpeg/lib/`
     — `ffmpeg-the-third` の build.rs が `FFMPEG_DIR` 経由で参照
     (`.cargo/config.toml` に `FFMPEG_DIR=vendor/ffmpeg` を設定済み)
-  - `vendor/ffmpeg/LICENSE.txt` — LGPLv2.1 の本文
+  - `vendor/ffmpeg/LICENSE.txt` — LGPLv3-or-later の本文
 - 前提: `gh` (GitHub CLI), `unzip`, `curl` が PATH にあること。
   さらに `ffmpeg-sys-the-third` のビルドに **libclang (LLVM/Clang)** が必要。
   Visual Studio Installer の「C++ Clang コンパイラ」コンポーネントを入れるか、
@@ -592,23 +592,21 @@ core 側はその時点で同居 DLL を直接使う (APPDATA 展開はランチ
 
 ### LGPL ライセンス対応 (リリース時に必須)
 
-mIV 自身は MIT、FFmpeg は LGPLv2.1。**動的リンク** (DLL を別ファイルとして配布し
+mIV 自身は MIT、FFmpeg は LGPLv3-or-later。**動的リンク** (DLL を別ファイルとして配布し
 `LoadLibrary` する形式) なら互換。`include_bytes!` で exe に埋め込んでも、最終的に
 APPDATA の DLL ファイルとして展開されるので動的リンクとして扱える。
 
 リリース前に以下を確認・更新する:
 
-1. **ソフトウェア情報 (環境設定 → ヘルプ)** に LGPL 通知を追記
-   ```
-   This software uses libraries from the FFmpeg project (https://ffmpeg.org/)
-   under the LGPLv2.1.
-   FFmpeg version: <vendor/ffmpeg/VERSION の内容>
-   Source: https://mikage.to/mimageviewer/ffmpeg-<VERSION>-source.tar.xz
-   License: https://www.gnu.org/licenses/lgpl-2.1.html
-   ```
+1. **ソフトウェア情報 (環境設定 → ヘルプ)** に LGPL 通知を追記。
+   通知文面の canonical 版は `docs/ffmpeg-lgpl-source-distribution.md` の
+   "Notice Template" を参照する。
 2. **mikage.to に LGPL 対応ソース tarball を配置**: BtbN がビルドに使った FFmpeg の
    ソース tarball ([ffmpeg.org の Old Releases](https://ffmpeg.org/releases/)) を
    `htdocs/mimageviewer/ffmpeg-<VERSION>-source.tar.xz` として転載。
+   現行 BtbN build は外部ライブラリを DLL 内に含むため、詳細は
+   `docs/ffmpeg-lgpl-source-distribution.md` と
+   `scripts/collect-ffmpeg-lgpl-info.ps1` の出力で確認する。
 3. **DLL ファイル名を改変しない**: `avcodec-61.dll` 等のオリジナル名のまま展開する。
 4. **`installer/readme.txt` (Vector 同梱用)** にも LGPL 注記を 1 行追加。
 5. **GPL build を絶対に使わない**: BtbN の `*-gpl-shared-*` や gyan.dev の

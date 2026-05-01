@@ -40,6 +40,10 @@ impl App {
                         ui.label("MIT — Microsoft");
                         ui.end_row();
 
+                        ui.label("FFmpeg");
+                        ui.label("LGPLv3-or-later — FFmpeg project");
+                        ui.end_row();
+
                         ui.label("Real-ESRGAN");
                         ui.label("BSD-3-Clause — Xintao");
                         ui.end_row();

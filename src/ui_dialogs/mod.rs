@@ -26,6 +26,7 @@ mod thumb_quality_fullscreen;
 pub(crate) mod trt_install;
 pub(crate) mod trt_worker_notice;
 mod update_notice;
+pub(crate) mod video_upscale;
 #[cfg(windows)]
 mod vst3_actions;
 #[cfg(windows)]
