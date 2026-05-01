@@ -168,6 +168,7 @@ pub fn start(
     let pump_engine_event_tx = engine_event_tx.clone();
     #[cfg(windows)]
     let pump_dsp_bridge = dsp_bridge;
+    let pump_engine_state = engine_state.clone();
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
@@ -178,6 +179,7 @@ pub fn start(
                 pump_cancel,
                 pump_clock,
                 pump_engine_event_tx,
+                pump_engine_state,
                 #[cfg(windows)]
                 pump_dsp_bridge,
             );
@@ -260,6 +262,7 @@ fn run_pump(
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_state: Arc<AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
     #[cfg(windows)]
@@ -290,10 +293,20 @@ fn run_pump(
     // ※ samples は interleaved stereo (channels=2)。
     // sample_rate は構築時に固定なので 1 度だけロックして拾う。
     const TARGET_BUFFER_SECS: f64 = 0.3;
-    let cap_samples = {
-        let b = buffer.lock().unwrap();
-        (b.sample_rate as f64 * 2.0 * TARGET_BUFFER_SECS) as usize
-    };
+    // ── Buffering / Seeking 中の cap 拡張 (deadlock 回避、2026-05) ──
+    //
+    // engine が PLAYING 以外のときは fill_output が silence + 非 drain なので、
+    // 通常 cap (= 0.3秒) のままだと pump が cap 待ちで詰まり、上流連鎖
+    // (audio decode block → demux block → video starvation) が発生する。
+    // Buffering/Seeking 中だけ cap を 5 秒に拡張して pump が詰まらないようにする。
+    // 5 秒は AV1 SW 長 GOP の forward decode 時間 (典型 2-5 秒) を上回る安全値。
+    // memory: 5 sec * 96000 samples_per_sec * 4 byte = ~2 MB (許容)。
+    const BUFFERING_BUFFER_SECS: f64 = 5.0;
+    let sample_rate = buffer.lock().unwrap().sample_rate;
+    let cap_samples_playing =
+        (sample_rate as f64 * 2.0 * TARGET_BUFFER_SECS) as usize;
+    let cap_samples_buffering =
+        (sample_rate as f64 * 2.0 * BUFFERING_BUFFER_SECS) as usize;
 
     // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。
     // 設計 v3 では 500ms (= 250ms low + hysteresis 想定) で確定したが、Phase 8.K で
@@ -348,9 +361,19 @@ fn run_pump(
         }
 
         // バッファ満杯なら一旦待つ。Condvar 化は将来の最適化。
+        // **動的 cap** (= 2026-05 deadlock 回避): engine が PLAYING のときは通常 cap、
+        // それ以外 (Buffering/Seeking/Loading) では拡張 cap を使う。fill_output が
+        // 非 drain で silence する間も pump は溜め続けて back-pressure を避ける。
         loop {
             let len = buffer.lock().unwrap().samples.len();
-            if len < cap_samples || cancel.load(Ordering::Acquire) {
+            let cap = if engine_state.load(Ordering::Acquire)
+                == state_code::PLAYING
+            {
+                cap_samples_playing
+            } else {
+                cap_samples_buffering
+            };
+            if len < cap || cancel.load(Ordering::Acquire) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -482,6 +505,23 @@ fn fill_output(
     clock: &Arc<AvClock>,
     engine_state: &Arc<AtomicU8>,
 ) {
+    // ── pre-seek discard は **ガードより先**に実行する (deadlock 回避、2026-05) ──
+    //
+    // engine_state ガードを最初に置くと「stale サンプルが buffer に残ったまま」
+    // になり、pump の cap 待ちが解けない → audio_rx → audio_pkt_tx → demux と
+    // back-pressure が伝播して **video decoder が飢餓して FirstFrameReady が永久
+    // に来ない** = engine が Buffering から抜けられない deadlock になる
+    // (= ユーザー報告「動画を準備中... のまま」の根本原因)。
+    let clock_serial = clock.current_seek_serial();
+    let mut buf = buffer.lock().unwrap();
+
+    if buf.pump_seek_serial < clock_serial {
+        buf.samples.clear();
+        publish_buffer_secs(&buf, clock);
+        out.fill(0.0);
+        return;
+    }
+
     // ── EngineState gate (= 2026-05 ユーザー報告「動画準備中の後に映像が早送り」) ──
     //
     // engine が PLAYING 以外 (= LOADING / SEEKING / BUFFERING / PAUSED / EOF / IDLE)
@@ -494,13 +534,18 @@ fn fill_output(
     // いる → video tick が catch-up モードで「早送り」(= dropped_past を多発)。
     //
     // 対策として PLAYING 以外では audio output 全体を gate する。Buffering 中は
-    // pump が seek_target 起点の audio で buffer を埋め (cap=300ms で blocking)、
+    // pump が seek_target 起点の audio で buffer を埋め (cap=Buffering 専用 5 秒)、
     // engine が Playing に遷移した瞬間に最初の post-seek sample から drain 開始 →
     // video first frame と音声が seek_target で同期して playback 開始する。
     //
     // PAUSED は元々下流の `clock.is_playing()=false` で同様に silence される
     // (= 既存 path と二重に gate がかかっても idempotent)。
+    //
+    // **重要**: `pump` の cap を Buffering 中だけ拡張することで back-pressure 連鎖
+    // (= pump 詰まり → audio decoder block → demux block → video starvation) を
+    // 断ち切る (= run_pump の cap 計算で engine_state を見る、deadlock 回避と一緒)。
     if engine_state.load(Ordering::Acquire) != state_code::PLAYING {
+        publish_buffer_secs(&buf, clock);
         out.fill(0.0);
         return;
     }
