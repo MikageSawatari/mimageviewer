@@ -15,7 +15,7 @@
 //! [`AudioOutput`] が drop されたら自動で停止する。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,6 +23,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
+use super::engine::actor::state_code;
 
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
 /// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
@@ -127,6 +128,7 @@ pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_state: Arc<AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
@@ -185,11 +187,12 @@ pub fn start(
     // ── cpal output callback: buffer → device ──
     let cb_buffer = buffer.clone();
     let cb_clock = clock.clone();
+    let cb_engine_state = engine_state.clone();
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_output(out, &cb_buffer, &cb_clock);
+                fill_output(out, &cb_buffer, &cb_clock, &cb_engine_state);
             },
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
@@ -477,7 +480,31 @@ fn fill_output(
     out: &mut [f32],
     buffer: &Arc<Mutex<AudioBuffer>>,
     clock: &Arc<AvClock>,
+    engine_state: &Arc<AtomicU8>,
 ) {
+    // ── EngineState gate (= 2026-05 ユーザー報告「動画準備中の後に映像が早送り」) ──
+    //
+    // engine が PLAYING 以外 (= LOADING / SEEKING / BUFFERING / PAUSED / EOF / IDLE)
+    // のときは cpal 出力を silence にして audio buffer も drain しない。
+    //
+    // 理由: AV1 等の長 GOP コーデックを resume_secs 付きで開くと「open → seek →
+    // forward decode (~1.5s)」で video の最初の post-seek frame が ~2 秒遅れて
+    // 出る。この間 audio は cpal callback で drain され続け AvClock の anchor が
+    // wall-clock 進行 → video 表示開始時点で audio が seek_target+1.5秒 まで進んで
+    // いる → video tick が catch-up モードで「早送り」(= dropped_past を多発)。
+    //
+    // 対策として PLAYING 以外では audio output 全体を gate する。Buffering 中は
+    // pump が seek_target 起点の audio で buffer を埋め (cap=300ms で blocking)、
+    // engine が Playing に遷移した瞬間に最初の post-seek sample から drain 開始 →
+    // video first frame と音声が seek_target で同期して playback 開始する。
+    //
+    // PAUSED は元々下流の `clock.is_playing()=false` で同様に silence される
+    // (= 既存 path と二重に gate がかかっても idempotent)。
+    if engine_state.load(Ordering::Acquire) != state_code::PLAYING {
+        out.fill(0.0);
+        return;
+    }
+
     // ── 設計 (counter consolidation 後の bookkeeping 上流移動) ──
     //
     // 旧版は cpal callback ごとに無条件で `next_pts_secs += want / samples_per_sec`
@@ -639,6 +666,11 @@ mod tests {
         clock
     }
 
+    /// テスト用 engine_state: PLAYING で初期化 (= drain は通常通り動く path)。
+    fn make_engine_state_playing() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(state_code::PLAYING))
+    }
+
     fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
         Arc::new(Mutex::new(AudioBuffer {
             samples: std::collections::VecDeque::new(),
@@ -662,7 +694,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480]; // non-zero で初期化、silence 化されること確認
-        fill_output(&mut out, &buf, &clock);
+        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         assert_eq!(
@@ -694,7 +726,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock);
+        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 100.0 / (48_000.0 * 2.0);
@@ -730,7 +762,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock);
+        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 480.0 / (48_000.0 * 2.0);
@@ -738,6 +770,65 @@ mod tests {
             (pts_after - pts_before - expected_advance).abs() < 1e-12,
             "full drain: pts advances by want/samples_per_sec (expected {expected_advance:.9}s, got {:.9}s)",
             pts_after - pts_before
+        );
+    }
+
+    /// Buffering / Seeking 中は cpal callback が drain しない (= 2026-05 fix)。
+    /// この保証が無いと、AV1 等の長 GOP コーデックを resume 付きで開いたときに
+    /// audio が seek_target から先に進み、video first frame 表示時に「早送り」状態。
+    #[test]
+    fn fill_output_buffering_state_silences_without_drain() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        // buffer に十分なサンプルを入れておく
+        {
+            let mut b = buf.lock().unwrap();
+            for _ in 0..1000 {
+                b.samples.push_back(0.5);
+            }
+        }
+        let pts_before = buf.lock().unwrap().next_pts_secs;
+        let len_before = buf.lock().unwrap().samples.len();
+
+        let buffering_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let mut out = [1.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &buffering_state);
+
+        let pts_after = buf.lock().unwrap().next_pts_secs;
+        let len_after = buf.lock().unwrap().samples.len();
+        assert_eq!(pts_before, pts_after, "Buffering: pts must not advance");
+        assert_eq!(len_before, len_after, "Buffering: buffer must not drain");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "Buffering: output must be silence"
+        );
+    }
+
+    /// Seeking 中も同様に silence + 非 drain。
+    #[test]
+    fn fill_output_seeking_state_silences_without_drain() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        {
+            let mut b = buf.lock().unwrap();
+            for _ in 0..1000 {
+                b.samples.push_back(0.5);
+            }
+        }
+        let len_before = buf.lock().unwrap().samples.len();
+
+        let seeking_state = Arc::new(AtomicU8::new(state_code::SEEKING));
+        let mut out = [1.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &seeking_state);
+
+        assert_eq!(
+            len_before,
+            buf.lock().unwrap().samples.len(),
+            "Seeking: buffer must not drain"
+        );
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "Seeking: output must be silence"
         );
     }
 }
