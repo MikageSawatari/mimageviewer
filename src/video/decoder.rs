@@ -817,26 +817,38 @@ fn run_decoder(
             // Flush は channel 経由で送る。順序保証 channel なので、Flush 後に enqueue
             // される packet は前世代として処理されない。
             //
-            // **2 つの target を分離管理** (Codex P1 助言、2026-05-01):
+            // **video / audio で trim 下限を分けて送る** (Codex P1 助言、2026-05-01):
+            //
             // - `seek_target_for_flush` (= ユーザー要求 seek 位置): 成功時は常に
             //   `Some(target_secs)`。pump が BufferReady の audio_anchor pts に使う。
             //   これにより Fast モードでも Buffering→Playing 入場時の anchor が target
             //   に維持され、timeline 表示が target 固定になる。失敗時のみ `None`。
-            // - `trim_before_for_flush` (= preroll trim 下限): 受信側で `drop_before_secs`
-            //   として保持。`None` で trim をスキップ。
+            // - `video_trim_before` (= video 用 preroll trim 下限):
             //   - Precise 成功: Some(target) → keyframe → target を decode + drop し
             //     target ぴったりに着地 (post_seek_frame_sent=false で 1 枚目を待機)
             //   - Fast backward 成功: None → preroll trim 無し、keyframe pts から即時再生
             //   - Fast forward retry 成功: Some(target) → retry は keyframe ≥ target に
             //     着地するため、trim 無しだと forward-seek regression (Phase 9.F) を
             //     再発させる (Codex P2 助言)。安全側に Precise 同等の trim を強制
-            //   - 失敗 (Precise/Fast 共通): None → trim せず通常 pacing
+            //   - 失敗: None → trim せず通常 pacing
+            // - `audio_trim_before` (= audio 用 preroll trim 下限):
+            //   - **Fast でも常に Some(target)** が正しい (Codex 2 巡目 P1 助言、
+            //     2026-05-01)。理由:
+            //     audio が trim なしで keyframe から鳴り始めると、`set_audio_pts`
+            //     monotonic guard により clock anchor が target で凍結し、audio が物理
+            //     的に target に追いつくまで (= 数秒) clock が進まず video pacing も
+            //     凍結する (= 6-7 秒の動画フリーズ regression)。Fast では video のみ
+            //     trim を省略して即時 keyframe 再生し、audio は target からスタートさせて
+            //     target 直後から clock を 1x で進める。視覚は GOP 分先行する scrub に
+            //     なるが、audio と clock は target 起点で同期するため freeze は発生しない。
+            //   - Precise / forward retry / Fast: Some(target)
+            //   - 失敗: None
             let seek_target_for_flush = if seek_result.is_ok() {
                 Some(target_secs)
             } else {
                 None
             };
-            let trim_before_for_flush = if seek_result.is_ok() {
+            let video_trim_before = if seek_result.is_ok() {
                 match kind {
                     super::clock::SeekKind::Precise => Some(target_secs),
                     super::clock::SeekKind::Fast => {
@@ -850,6 +862,12 @@ fn run_decoder(
             } else {
                 None
             };
+            // audio は Fast でも常に target まで trim する (= clock freeze 回避)。
+            let audio_trim_before = if seek_result.is_ok() {
+                Some(target_secs)
+            } else {
+                None
+            };
             // video_pkt_tx は drop されない (video decode thread が生きている間ずっと
             // 受信可能)。send は blocking なので順序保証されるが、cancel 中は
             // disconnect になる可能性がある (= video decode thread 終了後)。
@@ -857,7 +875,7 @@ fn run_decoder(
                 .send(VideoWorkerMsg::Flush {
                     serial,
                     seek_target_secs: seek_target_for_flush,
-                    trim_before_secs: trim_before_for_flush,
+                    trim_before_secs: video_trim_before,
                 })
                 .is_err()
             {
@@ -867,7 +885,7 @@ fn run_decoder(
                 let _ = audio_pkt_tx.send(AudioWorkerMsg::Flush {
                     serial,
                     seek_target_secs: seek_target_for_flush,
-                    trim_before_secs: trim_before_for_flush,
+                    trim_before_secs: audio_trim_before,
                 });
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると

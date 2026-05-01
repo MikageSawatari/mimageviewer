@@ -52,28 +52,29 @@ use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 /// **Precise** を使い、ホットキーによる相対シークだけ **Fast** を使う。
 ///
 /// どちらも `av_seek_frame(AVSEEK_FLAG_BACKWARD)` で keyframe ≤ target に着地する
-/// (= 共通基底)。違いは preroll trim を行うかどうかのみ:
+/// (= 共通基底)。違いは **video の preroll trim** を行うかどうか:
 ///
-/// - **Precise**: `Flush.trim_before_secs = Some(target)` を decode thread に渡し、
-///   keyframe → target までの数 100ms 〜 数秒分を decode + drop して target ぴったりに
-///   再生開始する (= 旧 Phase 9.F 既定動作)。
-/// - **Fast**: `Flush.trim_before_secs = None` を渡し、preroll decode を完全にスキップ。
-///   keyframe pts (= target - 0〜3 秒) から即時再生開始する。
+/// - **Precise**: video / audio 両方を target まで trim → target ぴったりに再生開始。
+/// - **Fast**: **video は trim 無し** (= keyframe pts から即時再生)、**audio は
+///   target まで trim** (= 通常 1x 再生)。Codex 2 巡目 P1 助言 (2026-05-01):
+///   audio も trim 無しにすると、keyframe から物理再生する audio の `set_audio_pts`
+///   monotonic guard が clock を target で凍結し、audio が target に追いつくまで
+///   (= 数秒) clock が進まず video pacing も停止する (= 6-7 秒の動画フリーズ)。
+///   Fast では video のみ trim を省略して即時 keyframe 再生し、audio は target から
+///   スタートさせて target 直後から clock を 1x で進めることで freeze を回避する。
 ///
 /// **target 情報は両モードで `Flush.seek_target_secs = Some(target)` で送る** (Codex
-/// P1 助言、2026-05-01): trim 有無と target 情報を分離管理することで、Fast でも pump
-/// が BufferReady の audio_anchor pts に target を反映でき、Buffering→Playing 入場時の
+/// 1 巡目 P1 助言): trim 有無と target 情報を分離管理することで、Fast でも pump が
+/// BufferReady の audio_anchor pts に target を反映でき、Buffering→Playing 入場時の
 /// clock anchor が target に維持される (= timeline 表示が target 固定)。
 ///
-/// **Fast モードの既知トレードオフ**:
-/// notify_seek_completed(target) + BufferReady audio_anchor=target で anchor が target
-/// に固定されている間、decoder は `ahead = pts - now_secs() = pts - target` を見て past
-/// 判定し pacing 抑制無しでバーストする (= keyframe → target の数百 ms 〜 数秒分を
-/// 1〜2 UI tick で消化)。UI tick はキューの「最後の displayable」だけを表示するので
-/// 視覚的には早送り (~5x 〜 10x) になる。一方 audio は cpal callback の 1x 速度で
-/// physical に進行するため、video と audio が短時間 (= GOP 長分の wall 経過) だけ
-/// desync する。このトレードオフは ←→ 連打の skim 用途で受け入れる
-/// (= Precise の preroll 待ちより速いことが優先)。
+/// **Fast モードの視覚的トレードオフ (= 設計の意図)**:
+/// video が trim 無しで keyframe から再生されるため、最初の数 100ms 〜 数秒は GOP 1 個分
+/// の pre-target 内容が見える。decoder が keyframe → target を burst 消費し UI tick が
+/// その都度「最後の displayable」を表示するため、視覚的には早送り (~5x 〜 10x) で
+/// target に追いつく形になる。**audio は target からスタート** するので音の頭出し
+/// は target ぴったり。視覚 burst 完了後は audio / video / clock すべて target+wall で
+/// 1x 同期する (= freeze なし)。←→ 連打の skim 用途で受け入れるトレードオフ。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekKind {
     /// 正確な位置への seek (シークバー / ブックマーク / loop 再生 / EOF replay /
@@ -485,7 +486,11 @@ impl AvClock {
                 &[
                     ("target", serde_json::Value::from(clamped)),
                     ("serial", serde_json::Value::from(new_serial as i64)),
-                    ("kind", serde_json::Value::from(kind_str)),
+                    // **field name は `seek_kind`** (Codex P3 助言): perf JSON の top-level
+                    // `kind` (= イベント種別 = "seek_override_set") と衝突するため、
+                    // 単に "kind" にすると JSON シリアライザでどちらかが上書きされ、
+                    // ログに残らないケースがあった (実ログで kind=seek_override_set 固定)。
+                    ("seek_kind", serde_json::Value::from(kind_str)),
                 ],
             );
         }
