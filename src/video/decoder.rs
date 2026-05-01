@@ -44,13 +44,26 @@ enum VideoWorkerMsg {
     /// `video_tx.try_send` を行う。
     Packet(ffmpeg_the_third::Packet),
     /// シーク完了通知。video decode thread はこれを受けて自分の avcodec デコーダ
-    /// を `flush()` し、`current_seek_serial` を更新、`drop_before_secs` を
-    /// `target_secs` に設定する。`target_secs` が `Some(t)` のときは post-seek
-    /// 1 枚目を待機する (= post_seek_frame_sent=false)、`None` (= seek 失敗) は
-    /// 通常 pacing に戻す。
+    /// を `flush()` し、`current_seek_serial` を更新する。
+    ///
+    /// **2 つの target を分離管理** (Codex P1 助言、2026-05-01):
+    /// - `seek_target_secs`: ユーザー要求 seek 位置 (= timeline 表示位置の意図)。
+    ///   Fast モードでは keyframe pts ではなく target を保つことで、Buffering→Playing
+    ///   入場時の anchor が target に維持される (Fast でも timeline は target 固定)。
+    ///   `None` のときは seek 失敗 / 非 seek flush。
+    /// - `trim_before_secs`: post-seek preroll trim 用。`Some(t)` で受信側は
+    ///   `drop_before_secs = Some(t)` を設定し target ぴったりに着地。`None` で
+    ///   trim をスキップ (= Fast backward の即時再生 / seek 失敗)。
+    ///
+    /// 旧版は `target_secs: Option<f64>` 単一フィールドで両方の役割を兼ねていたが、
+    /// Fast モードで「trim 不要だが target 情報は必要」を表現できなかったため分離。
     Flush {
         serial: u64,
-        target_secs: Option<f64>,
+        /// video decode thread では現状未参照 (= pump 経由で audio 側が消費)。
+        /// 将来 video 側でも post-seek 表示同期に使う可能性があるためフィールドとして保持。
+        #[allow(dead_code)]
+        seek_target_secs: Option<f64>,
+        trim_before_secs: Option<f64>,
     },
     /// EOF 到達通知。video decode thread は何もせずに次の `Packet` か `Flush`
     /// か channel disconnect を待つ (旧 `run_decoder` の挙動と同じく、内部
@@ -85,12 +98,17 @@ enum AudioWorkerMsg {
     /// `send_packet` → `receive_frame` → resample → `audio_tx.send` を行う。
     Packet(ffmpeg_the_third::Packet),
     /// シーク完了通知。audio decode thread はこれを受けたら自分の avcodec デコーダ
-    /// を `flush()` して、`drop_before_secs` を `target_secs` (= preroll 中に切り
-    /// 捨てる下限) に設定する。`target_secs` が `None` なら seek 失敗 (= demux 位置
-    /// は動いていない) なので preroll trim は行わない。
+    /// を `flush()` する。
+    ///
+    /// **2 つの target を分離管理** (= [`VideoWorkerMsg::Flush`] と同じ理由):
+    /// - `seek_target_secs`: pump 経由で BufferReady の audio_anchor pts に伝搬。
+    ///   Fast モードでは keyframe pts ではなく target を維持する。
+    /// - `trim_before_secs`: `drop_before_secs` (= preroll 切り捨て下限) として保持。
+    ///   `None` で trim をスキップ。
     Flush {
         serial: u64,
-        target_secs: Option<f64>,
+        seek_target_secs: Option<f64>,
+        trim_before_secs: Option<f64>,
     },
     /// EOF 到達通知。audio decode thread は内部 decoder を flush して残フレームを
     /// drain (= 末尾の音声を出し切る)、その後次の `Flush` か `Packet` か
@@ -141,6 +159,20 @@ pub struct AudioFrame {
     pub seek_serial: u64,
     /// このフレーム分の再生時間 (秒)。total audio buffer の差分加算に使う。
     pub duration_secs: f64,
+    /// この `seek_serial` におけるユーザー要求 seek 位置 (秒)。
+    ///
+    /// **Codex P1 修正 (2026-05-01)**: Fast モードでは preroll trim を省略するため
+    /// `pts_secs` (= keyframe pts) と user-requested target が一致しない。pump 側で
+    /// BufferReady の audio_anchor を target ベースで報告するため、demux Flush 経由で
+    /// 受け取った target 値を audio decode thread が **同じ seek_serial の全 frame に
+    /// 焼き付けて** 伝搬する (= 1-shot ではなく persistent: pump がどのタイミングで
+    /// frame を観測しても target を取り出せる)。
+    ///
+    /// 値の意味:
+    /// - `Some(target)`: seek が走った世代の frame。pump は target を BufferReady pts
+    ///   の下限としてmax 演算する (= audible_pts.max(target))。
+    /// - `None`: 非 seek flush (= 失敗 or 初期 open)。pump は audible_pts を素朴に使う。
+    pub seek_target_secs: Option<f64>,
 }
 
 /// デコード開始時に分かる動画情報。UI の HUD で利用。
@@ -784,21 +816,32 @@ fn run_decoder(
             // Phase B: video / audio どちらの decoder も別 thread が所有しているので、
             // Flush は channel 経由で送る。順序保証 channel なので、Flush 後に enqueue
             // される packet は前世代として処理されない。
-            // - Precise 成功時: target_secs = Some(t) → 受信側は post-seek preroll 用に
-            //   drop_before_secs = Some(t) を設定 (video は post_seek_frame_sent=false に)
-            // - Fast (backward 成功時のみ): target_secs = None → 受信側は preroll trim
-            //   せず即時再生 (= keyframe ≤ target からそのまま再生開始する hybrid 設計)
-            // - Fast (forward retry 経由): Precise と同じ Some(t) で trim する。retry は
-            //   keyframe ≥ target に着地するため、trim 無しだと anchor < frame_pts な
-            //   forward-seek regression (Phase 9.F) を再発させる (Codex P2 助言)
-            // - 失敗時 (Precise/Fast 共通): target_secs = None → 受信側は preroll trim せず
-            //   通常 pacing に戻す
-            let target_for_flush = if seek_result.is_ok() {
+            //
+            // **2 つの target を分離管理** (Codex P1 助言、2026-05-01):
+            // - `seek_target_for_flush` (= ユーザー要求 seek 位置): 成功時は常に
+            //   `Some(target_secs)`。pump が BufferReady の audio_anchor pts に使う。
+            //   これにより Fast モードでも Buffering→Playing 入場時の anchor が target
+            //   に維持され、timeline 表示が target 固定になる。失敗時のみ `None`。
+            // - `trim_before_for_flush` (= preroll trim 下限): 受信側で `drop_before_secs`
+            //   として保持。`None` で trim をスキップ。
+            //   - Precise 成功: Some(target) → keyframe → target を decode + drop し
+            //     target ぴったりに着地 (post_seek_frame_sent=false で 1 枚目を待機)
+            //   - Fast backward 成功: None → preroll trim 無し、keyframe pts から即時再生
+            //   - Fast forward retry 成功: Some(target) → retry は keyframe ≥ target に
+            //     着地するため、trim 無しだと forward-seek regression (Phase 9.F) を
+            //     再発させる (Codex P2 助言)。安全側に Precise 同等の trim を強制
+            //   - 失敗 (Precise/Fast 共通): None → trim せず通常 pacing
+            let seek_target_for_flush = if seek_result.is_ok() {
+                Some(target_secs)
+            } else {
+                None
+            };
+            let trim_before_for_flush = if seek_result.is_ok() {
                 match kind {
                     super::clock::SeekKind::Precise => Some(target_secs),
                     super::clock::SeekKind::Fast => {
                         if used_forward_retry {
-                            Some(target_secs) // 安全側にフォールバック
+                            Some(target_secs) // 安全側に Precise 同等
                         } else {
                             None
                         }
@@ -813,7 +856,8 @@ fn run_decoder(
             if video_pkt_tx
                 .send(VideoWorkerMsg::Flush {
                     serial,
-                    target_secs: target_for_flush,
+                    seek_target_secs: seek_target_for_flush,
+                    trim_before_secs: trim_before_for_flush,
                 })
                 .is_err()
             {
@@ -822,7 +866,8 @@ fn run_decoder(
             if audio_stream_idx_for_demux.is_some() {
                 let _ = audio_pkt_tx.send(AudioWorkerMsg::Flush {
                     serial,
-                    target_secs: target_for_flush,
+                    seek_target_secs: seek_target_for_flush,
+                    trim_before_secs: trim_before_for_flush,
                 });
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
@@ -1018,13 +1063,16 @@ fn run_video_decode(
             Err(_) => break, // demux thread exited → channel disconnect
         };
         let packet = match msg {
-            VideoWorkerMsg::Flush { serial, target_secs } => {
+            VideoWorkerMsg::Flush { serial, seek_target_secs: _, trim_before_secs } => {
                 video_decoder.flush();
                 current_seek_serial = serial;
-                drop_before_secs = target_secs;
-                // 成功時 (target_secs = Some) → post-seek 1 枚目を待つので false
-                // 失敗時 (target_secs = None) → 通常 pacing に戻すので true
-                post_seek_frame_sent = target_secs.is_none();
+                drop_before_secs = trim_before_secs;
+                // trim_before あり (Precise / Fast forward retry / 安全側) → post-seek
+                // 1 枚目を待つので false。trim_before なし (Fast backward / 失敗) →
+                // 通常 pacing に戻すので true。
+                // seek_target_secs は video decode thread では使わない (= pump 側の
+                // BufferReady audio_anchor 用)。
+                post_seek_frame_sent = trim_before_secs.is_none();
                 continue;
             }
             VideoWorkerMsg::Eof => {
@@ -1606,6 +1654,11 @@ fn run_audio_decode(
     // run_decoder と同じ thread-local state。Flush で reset する。
     let mut current_seek_serial: u64 = 0;
     let mut drop_before_secs: Option<f64> = None;
+    // **Codex P1 (2026-05-01)**: Fast モードで preroll trim を省略しても
+    // BufferReady の audio_anchor を user-requested target に維持するため、Flush
+    // から受け取った `seek_target_secs` を世代単位で保持し、emit する全 AudioFrame
+    // に焼き付ける (= pump がどのタイミングで観測しても target を取り出せる)。
+    let mut current_seek_target_secs: Option<f64> = None;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
@@ -1618,10 +1671,11 @@ fn run_audio_decode(
             Err(_) => break,
         };
         match msg {
-            AudioWorkerMsg::Flush { serial, target_secs } => {
+            AudioWorkerMsg::Flush { serial, seek_target_secs, trim_before_secs } => {
                 setup.decoder.flush();
                 current_seek_serial = serial;
-                drop_before_secs = target_secs;
+                drop_before_secs = trim_before_secs;
+                current_seek_target_secs = seek_target_secs;
             }
             AudioWorkerMsg::Eof => {
                 // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
@@ -1644,6 +1698,7 @@ fn run_audio_decode(
                         &frame,
                         &mut drop_before_secs,
                         current_seek_serial,
+                        current_seek_target_secs,
                         &clock,
                         &audio_tx,
                     ) {
@@ -1691,6 +1746,7 @@ fn run_audio_decode(
                         &frame,
                         &mut drop_before_secs,
                         current_seek_serial,
+                        current_seek_target_secs,
                         &clock,
                         &audio_tx,
                     ) {
@@ -1711,6 +1767,7 @@ fn emit_audio_frame(
     frame: &ffmpeg_the_third::util::frame::audio::Audio,
     drop_before_secs: &mut Option<f64>,
     current_seek_serial: u64,
+    current_seek_target_secs: Option<f64>,
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
 ) -> bool {
@@ -1795,6 +1852,7 @@ fn emit_audio_frame(
         pts_secs,
         seek_serial: current_seek_serial,
         duration_secs,
+        seek_target_secs: current_seek_target_secs,
     };
     // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
     // 競合しないよう順序を保つ。失敗時はロールバック。

@@ -54,26 +54,26 @@ use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 /// どちらも `av_seek_frame(AVSEEK_FLAG_BACKWARD)` で keyframe ≤ target に着地する
 /// (= 共通基底)。違いは preroll trim を行うかどうかのみ:
 ///
-/// - **Precise**: `drop_before_secs = Some(target)` を decode thread に渡し、
+/// - **Precise**: `Flush.trim_before_secs = Some(target)` を decode thread に渡し、
 ///   keyframe → target までの数 100ms 〜 数秒分を decode + drop して target ぴったりに
 ///   再生開始する (= 旧 Phase 9.F 既定動作)。
-/// - **Fast**: `drop_before_secs = None` を渡し、preroll decode を完全にスキップ。
-///   keyframe pts (= target - 0〜3 秒) から即時再生開始する。`notify_seek_completed`
-///   は target でアンカーするので timeline 表示は target を指すが、視聴コンテンツは
-///   GOP 1 個分先行する形になる。audio の monotonic guard が anchor 後退を防ぐので
-///   UI 停止は起きない。0〜3 秒の wall 経過で audio が target に追いつき、その時点で
-///   anchor が更新されて完全同期する。
+/// - **Fast**: `Flush.trim_before_secs = None` を渡し、preroll decode を完全にスキップ。
+///   keyframe pts (= target - 0〜3 秒) から即時再生開始する。
 ///
-/// **Fast モードの既知トレードオフ (Codex P1 助言、2026-05-01)**:
-/// notify_seek_completed(target) で anchor が target に固定されている間、decoder は
-/// `ahead = pts - now_secs() = pts - target` を見て past 判定し pacing 抑制無しで
-/// バーストする (= keyframe → target の数百 ms 〜 数秒分を 1〜2 UI tick で消化)。
-/// UI tick はキューの「最後の displayable」だけを表示するので視覚的には早送り
-/// (~5x 〜 10x) になる。一方 audio は cpal callback の 1x 速度で physical に進行
-/// するため、video と audio が短時間 (= GOP 長分の wall 経過) だけ desync する。
-/// このトレードオフは ←→ 連打の skim 用途で受け入れる (= Precise の preroll 待ち
-/// より速いことが優先)。Precise 経路が必要な用途 (= シークバー直接ジャンプ等) は
-/// 引き続き [`SeekKind::Precise`] を使う。
+/// **target 情報は両モードで `Flush.seek_target_secs = Some(target)` で送る** (Codex
+/// P1 助言、2026-05-01): trim 有無と target 情報を分離管理することで、Fast でも pump
+/// が BufferReady の audio_anchor pts に target を反映でき、Buffering→Playing 入場時の
+/// clock anchor が target に維持される (= timeline 表示が target 固定)。
+///
+/// **Fast モードの既知トレードオフ**:
+/// notify_seek_completed(target) + BufferReady audio_anchor=target で anchor が target
+/// に固定されている間、decoder は `ahead = pts - now_secs() = pts - target` を見て past
+/// 判定し pacing 抑制無しでバーストする (= keyframe → target の数百 ms 〜 数秒分を
+/// 1〜2 UI tick で消化)。UI tick はキューの「最後の displayable」だけを表示するので
+/// 視覚的には早送り (~5x 〜 10x) になる。一方 audio は cpal callback の 1x 速度で
+/// physical に進行するため、video と audio が短時間 (= GOP 長分の wall 経過) だけ
+/// desync する。このトレードオフは ←→ 連打の skim 用途で受け入れる
+/// (= Precise の preroll 待ちより速いことが優先)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekKind {
     /// 正確な位置への seek (シークバー / ブックマーク / loop 再生 / EOF replay /

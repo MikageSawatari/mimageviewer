@@ -405,7 +405,26 @@ fn run_pump(
     // 新 seek 世代の最初のフレームで Some(pts_secs) に set。
     // 「最初の post-target chunk が processed に届いた」時点で None にすると、その後の
     // chunk は無条件 push でいい。
+    //
+    // **Fast モードの注意**: ここでの seek_target は **PDC pre-target silence 判定用**
+    // であり、frame.pts_secs (= Fast では keyframe_pts) を使うのが正しい。
+    // BufferReady audio_anchor 用の **user-requested target** とは別管理
+    // (= `pump_anchor_target_secs` 参照)。
     let mut seek_target_secs: Option<f64> = None;
+    // **Codex P1 (2026-05-01)**: BufferReady の audio_anchor pts として報告する
+    // **user-requested seek target** (Fast モードでも timeline に表示したい値)。
+    // demux Flush 経由で全 AudioFrame に焼き付けられている `frame.seek_target_secs`
+    // を毎 intake で取り出してここに保存する。
+    //
+    // 用途: BufferReady emit 時に `audible_pts.max(pump_anchor_target_secs)` で
+    // 報告する。Precise モードでは audible_pts ≈ target なので max は no-op、
+    // Fast モードでは audible_pts < target なので target 側が採用され、Playing 入場
+    // 時の clock anchor が target に維持される (= timeline 表示が target 固定)。
+    //
+    // 旧版 (Codex P1 修正前) は `audible_pts` のみで BufferReady を出していたため、
+    // Fast で Buffering→Playing 入場時に anchor が keyframe_pts に巻き戻り、
+    // notify_seek_completed(target) で立てた anchor が上書きされていた。
+    let mut pump_anchor_target_secs: Option<f64> = None;
     // このシーク世代について overflow fallback (= wall master) に切り替わったか。
     // `Some(serial)` なら fill_output / pump とも処理を停止する。
     // 新 seek 世代で None にリセット (= 再度 audio master を試す)。
@@ -448,7 +467,14 @@ fn run_pump(
                 last_seen_seek_serial = frame_seek_serial;
                 // 新 seek 世代: overflow / target / activate を全 reset
                 overflow_for_serial = None;
+                // PDC trim 用 seek_target は frame.pts_secs (= Fast では keyframe_pts、
+                // Precise では target ぴったり)。詳細は seek_target_secs の宣言コメント参照。
                 seek_target_secs = Some(frame.pts_secs);
+                // BufferReady anchor 用 target は demux Flush 経由で焼き付けられた
+                // user-requested target (= Fast でも target を維持)。
+                // None フォールバック: 失敗 seek / 初期 open など、target が無い場合は
+                // BufferReady で audible_pts をそのまま使う。
+                pump_anchor_target_secs = frame.seek_target_secs;
                 activated = false; // 再度 audio master を試す
             }
 
@@ -736,6 +762,15 @@ fn run_pump(
         // を使う (Codex P1-1 反映、2026-05): seek 直後 next_pts_secs は input pts のまま
         // なので、PDC 適用後の audible 値を渡さないと engine の audio_anchor が
         // target-pdc に固定される。
+        //
+        // **Codex P1 修正 (2026-05-01)**: Fast モードでは audible_pts = keyframe_pts <
+        // user-requested target なので、`audible_pts` 単独だと Buffering→Playing 入場時の
+        // anchor が keyframe へ巻き戻る。`pump_anchor_target_secs` (= Flush から焼き付け
+        // られた target) との **max** で BufferReady の pts を決定する:
+        //   - Precise: audible ≈ target → max(audible, target) ≈ target. 既存挙動と等価
+        //   - Fast: audible = keyframe < target → max は target. anchor が target で固定
+        //   - 失敗 / 初期 open: pump_anchor_target = None → audible 単独 (既存挙動)
+        //   - BufferStarved (再 buffering): audible は再生位置 >> 旧 target → audible 採用
         let (processed_secs, cur_audible_pts, cur_serial) = {
             let buf = buffer.lock().unwrap();
             publish_buffer_secs(&buf, &clock);
@@ -754,10 +789,14 @@ fn run_pump(
             (secs, audible, buf.pump_seek_serial)
         };
         if processed_secs >= READY_THRESHOLD_SECS {
+            let report_pts = match pump_anchor_target_secs {
+                Some(target) => cur_audible_pts.max(target),
+                None => cur_audible_pts,
+            };
             let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
                 crate::video::engine::state::AudioEvent::BufferReady {
                     epoch: cur_serial,
-                    pts: cur_audible_pts,
+                    pts: report_pts,
                     wall_now: std::time::Instant::now(),
                 },
             ));
