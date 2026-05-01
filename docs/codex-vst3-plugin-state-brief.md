@@ -184,3 +184,110 @@ cmake --build crates/vst3-host/build --config Release  # OK
    実装上の他の改善余地
 
 返答は P1/P2/P3 サマリ形式で。
+
+## 追記: Codex 第 1 回レビュー反映 + ユーザー追加要望 (2026-05-01)
+
+第 1 回レビューで指摘された P2 3 件 + ユーザー報告 2 件を `ddaa00d` で対応。
+
+### Codex P2-1 反映: VST3 OFF 時の snapshot が enabled guard でスキップされる
+
+- 症状: preferences OK のとき `self.settings = state.settings` を **先に** 実行
+  してから VST OFF 経路に入るため、`self.settings.vst3_enabled` は既に false。
+  `snapshot_vst3_states_into_settings()` の先頭 guard が `settings.vst3_enabled`
+  だったので 0 件 return → bridge teardown 前の state 保存が走らない。
+- 修正: guard を **`self.dsp_bridge.is_enabled()`** に変更
+  ([src/ui_dialogs/vst3_actions.rs](../src/ui_dialogs/vst3_actions.rs))。
+  bridge 側は disable 命令が来るまで生きているので、settings flag より
+  bridge runtime 状態を見る方が teardown 前の snapshot 意図と整合する。
+
+### Codex P2-3 反映: RestoreState fire-and-forget は pre-warm 前適用を保証しない
+
+- 症状: 旧設計では Loaded event 受信後・pre-warm 前に `Cmd::RestoreState` を
+  送信していたが、bridge 側で control thread がコマンドを消費する **前** に
+  audio thread が pre-warm input を処理し始める可能性があり、最初の
+  process_block が古い state で走る race。
+- 修正: 初回 auto-restore は **`Cmd::Open` の `state: Option<String>` field に
+  bake** ([src/video/dsp/bridge.rs](../src/video/dsp/bridge.rs))。bridge は
+  `handle_open()` 内で `loader_->load()` 完了直後・**`audio_thread_` 起動前**
+  に `restore_state(bytes)` を呼ぶ ([crates/vst3-host/src/main.cpp](../crates/vst3-host/src/main.cpp))。
+  この時点で完全シングルスレッドなので race ゼロ。runtime 用に
+  `Cmd::RestoreState` は残すが、audio thread fence 経由で適用される。
+
+### Codex P2-2 反映: getState/setState が audio thread の process と並走する
+
+- 症状: `query_state` / `restore_state` が control thread (= run_gui_loop) で
+  直接 `loader_->query_state()` / `restore_state()` を呼んでいた。audio thread は
+  同じ `loader_` で `process_block` を回し続ける → VST3 plugin の thread safety
+  違反 (= setState/getState と process が並走、reset を audio thread に寄せた
+  既存の方針と矛盾)。
+- 修正: control thread はフラグを立てるだけにする。
+  ```cpp
+  std::atomic<bool> query_state_pending_{false};
+  std::atomic<bool> restore_state_pending_{false};
+  std::mutex restore_state_mutex_;
+  std::vector<uint8_t> restore_state_bytes_;
+  ```
+  audio_loop は `read_in_available` の **直後・process_block の前** に flag を
+  exchange して `loader_->query_state()` / `restore_state()` を実行する。これで
+  既存 reset fence (= ループ先頭の reset_pending check) と同じ thread safety
+  保証が得られる。
+- 配置の妥当性: read 後・process 前に置くことで「control が flag を立てた
+  直後に push された input は、setState/getState 反映済の状態で process_block
+  に渡る」性質も同時に得られる (= pre-warm の race 問題は P2-3 で解消済だが、
+  runtime restore_state の場合も同じ性質が活きる)。
+
+### ユーザー追加要望 1: プラグインウィンドウ位置の永続化
+
+- 要望: 「復元されましたが、プラグインウィンドウの位置が復元されません」(2026-05)
+- 実装:
+  - `Vst3PluginEntry` に `gui_pos: Option<(i32, i32)>` / `gui_size: Option<(u32, u32)>`
+    フィールド追加 ([src/settings.rs](../src/settings.rs))。`#[serde(default)]` で
+    旧 settings.json も互換読み込み可
+  - `DspBridge::add_plugin` に `initial_window_pos` 引数を追加し、
+    `PluginSlot.desired_window_pos` に格納
+  - `show_slot_gui` 新規作成時に slot から取り出して `gui::create_window` の
+    新引数 `initial_pos` 経由で `CreateWindowExW(x, y, ...)` に渡す
+  - `DspBridge::snapshot_all_window_positions()` で全 GUI 表示済みスロットの
+    `GetWindowRect` を読んで `(plugin_path, x, y, w, h)` リストを返す
+  - App 側 `snapshot_vst3_window_positions_into_settings()` で path 一致で
+    settings に書き戻す。トリガは state snapshot と同じ
+    (on_exit / VST3 OFF / chain rebuild)
+- 注意点 (= 実装したが UX で気になる点):
+  - 異モニター構成で旧モニターが取り外されたケース: Win32 が後段で
+    SetWindowPos クランプするので画面外に行きっぱなしにはならない (= 検証は
+    実機でモニター抜き挿しが必要)
+  - resizable プラグインの size も保存するが、非 resizable プラグインでは
+    プラグイン要求値が優先される (= `query_gui_size_at_dpi` の値を使う)
+
+### ユーザー追加要望 2: 非 resizable プラグインのタイトルダブルクリック最大化
+
+- 要望: 「タイトルバーをダブルクリックすると、リサイズできないプラグインでも
+  最大化できてしまい、外枠だけが広がる」(2026-05)
+- 原因: 既存実装は `WS_OVERLAPPEDWINDOW` から `WS_THICKFRAME` のみ抜いていた。
+  Windows のタイトルダブルクリック最大化は `WS_MAXIMIZEBOX` で制御されるので、
+  THICKFRAME を抜いてドラッグリサイズを禁止しても MAXIMIZEBOX が残れば
+  ダブルクリック最大化は効く → 外枠だけ大きくなり、中身は固定サイズで残って
+  紛らわしい
+- 修正: 非 resizable のとき `WS_MAXIMIZEBOX` も抹く
+  ([src/video/dsp/gui.rs](../src/video/dsp/gui.rs))
+  ```rust
+  if !resizable {
+      win_style &= !(WS_THICKFRAME | WS_MAXIMIZEBOX);
+  }
+  ```
+
+### 期待する 2 回目レビューフォーカス
+
+- G. **Cmd::Open の state は最大 4 MB**: JSON でエンコードされる open command 全体が
+  `MAX_CONTROL_MSG_SIZE` (= 4 MB) を超えないか? state が ~3 MB 近いプラグインが
+  あると詰む可能性。実用上問題ない範囲か?
+- H. **audio thread fence の配置**: `read_in_available` の **後** に fence を
+  置いている。read 直前 (= ループ先頭、reset fence と同じ位置) の方が望ましい
+  ケースは無いか?
+- I. **gui_pos の取得タイミング**: snapshot は teardown 直前に呼ぶが、ユーザーが
+  通常運用中にウィンドウを動かしたあと、そのウィンドウを × で閉じてから
+  別位置で再度開いたケース、保存タイミングが「閉じる」時ではなく「終了」時
+  なので 2 回開閉した場合 1 回目の位置が記録される。期待動作と一致するか?
+- J. **MAXIMIZEBOX 抹除の副作用**: タイトルバーの右上にあった「最大化」ボタンが
+  消えるか/グレーアウトするか? Windows 11 のスナップ機能 (= ウィンドウ右上に
+  hover で出るスナップメニュー) も WS_MAXIMIZEBOX に依存していないか?
