@@ -585,6 +585,13 @@ impl AvClock {
         self.audio_bookkeeping.add_tx_queued(delta_secs);
     }
 
+    /// audio_tx queued 合計を 0 に強制リセット (Codex P2、2026-05-01)。
+    /// pump の seek staleness cleanup から呼ばれ、旧世代の tx_queued が `total_audio_buffer_secs()`
+    /// (= playable) に残るのを防ぐ。旧世代 frame の `add_tx_queued(-duration)` は clamp される。
+    pub fn zero_audio_tx_queued_secs(&self) {
+        self.audio_bookkeeping.zero_tx_queued();
+    }
+
     /// audio_tx queued 合計を返す。診断ログ用。
     pub fn audio_tx_queued_secs(&self) -> f64 {
         self.audio_bookkeeping.tx_queued_secs()

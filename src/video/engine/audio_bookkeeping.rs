@@ -97,6 +97,15 @@ impl AudioBookkeeping {
         }
     }
 
+    /// audio_tx queued 合計を **0 に強制リセット** (Codex P2、2026-05-01):
+    /// pump の seek staleness cleanup から呼ばれ、旧 seek 世代の tx_queued が
+    /// `total_audio_buffer_secs()` (= playable) に残るのを防ぐ。
+    /// 本リセット後に旧世代 frame が pump に届いても `add_tx_queued(-duration)` は
+    /// `max(0.0)` で clamp されるので 0 を割らない。
+    pub fn zero_tx_queued(&self) {
+        self.tx_queued_secs_bits.store(0, Ordering::Release);
+    }
+
     /// audio_tx queued 合計を返す。
     pub fn tx_queued_secs(&self) -> f64 {
         f64::from_bits(self.tx_queued_secs_bits.load(Ordering::Acquire))
@@ -244,6 +253,29 @@ mod tests {
         assert!((bk.raw_pending_secs() - 7.5).abs() < 1e-9);
         bk.reset();
         assert_eq!(bk.raw_pending_secs(), 0.0);
+    }
+
+    #[test]
+    fn zero_tx_queued_clears_and_clamps_subsequent_negative_delta() {
+        // Codex P2 (2026-05-01): seek staleness cleanup で tx_queued を 0 化。
+        // その後旧世代 frame が pump に届いて -duration が来ても 0 を割らない。
+        let bk = AudioBookkeeping::new();
+        bk.add_tx_queued(0.5);
+        bk.set_pump_buf_secs(0.3);
+        bk.set_raw_pending_secs(2.0);
+        // staleness cleanup 相当: tx_queued を 0 化 (= raw / pump_buf は別途 clear 想定)
+        bk.zero_tx_queued();
+        assert_eq!(bk.tx_queued_secs(), 0.0);
+        // pump_buf / raw_pending は touched でない
+        assert!((bk.pump_buf_secs() - 0.3).abs() < 1e-9);
+        assert!((bk.raw_pending_secs() - 2.0).abs() < 1e-9);
+        // 旧世代 frame の subtract: clamp で 0 に張り付く
+        bk.add_tx_queued(-0.020);
+        bk.add_tx_queued(-0.023);
+        assert_eq!(bk.tx_queued_secs(), 0.0);
+        // 新世代 frame の add は通常通り
+        bk.add_tx_queued(0.040);
+        assert!((bk.tx_queued_secs() - 0.040).abs() < 1e-9);
     }
 
     #[test]

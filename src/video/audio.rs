@@ -268,15 +268,18 @@ pub fn start(
 /// `AudioBuffer` の各 queue 残量を秒に変換して clock に publish する。
 /// pump push / fill_output pop の両方から呼ばれる。
 ///
-/// **3 つの metric を分離して publish** (Codex 助言、2026-05-01):
-/// - `audio_pump_buf_secs` = post-VST `processed` queue 残量 (= EQ latency 指標)
-/// - `audio_raw_pending_secs` = pre-VST `raw_pending` queue 残量
-/// - `audio_tx_queued_secs` (= 別経路で publish 済、ここでは触らない)
+/// **3 つの metric を分離して publish** (Codex 助言、2026-05-01 改訂):
+/// - `audio_pump_buf_secs` = post-VST `processed` queue 残量 (= EQ latency 指標、
+///   かつ **唯一 cpal が今すぐ鳴らせる playable**)
+/// - `audio_raw_pending_secs` = pre-VST `raw_pending` queue 残量 (= **supply only**、
+///   VST 詰まり / PDC trim drop で playable にならない可能性あり)
+/// - `audio_tx_queued_secs` (= 別経路で publish 済、ここでは触らない、これも supply)
 ///
-/// `total_audio_buffer_secs()` は 3 つの合計を返す (= decoder pacing が「audio safe」
-/// 判定で見る値)。raw_pending を含む理由: raw → processed の VST process は数 ms 程度
-/// なので「再生可能 audio」として扱う。除くと processed 0.3 秒 cap だけが見えて
-/// pacing が in_audio_escape 連発 → video burst → "ガクガク再生"。
+/// `total_audio_buffer_secs()` は **playable** (= `processed + tx_queued`) のみを返す。
+/// raw_pending は含めない (= Codex 改訂: VST が遅い/詰まる/PDC trim で drop される
+/// 場合に raw が満杯でも cpal は silence になりうるため)。raw を playable 扱いすると
+/// decoder pacing が `in_audio_escape` を解除できず video が burst → audio underrun
+/// したまま映像だけ進む退行。raw_pending は [`AvClock::audio_supply_secs`] で別途参照可。
 ///
 /// **PDC latency は pump_buf に含めない** (= Codex 助言、2026-05-01):
 /// 旧版は `secs + pdc_latency_secs` を publish していたが、それだと AudioBuffer が
@@ -543,13 +546,19 @@ fn run_pump(
             }
         } // 'intake
 
-        // ── pre-refill seek staleness check (Codex 助言、2026-05-01 改訂) ──
+        // ── pre-refill seek staleness check (Codex 助言、2026-05-01 改訂 + P2 反映) ──
         // timeout tick で起きた場合、'intake で seek serial 更新が走らないため、
         // 旧 seek 世代の raw/processed を保持したまま VST process してしまう可能性がある。
         // 直接 clock.current_seek_serial() と buf.pump_seek_serial を比較し、
-        // pump の方が古ければ raw/processed を clear + publish 0 して refill loop を skip。
-        // (= 旧 seek 世代の chunk が VST で無駄処理されるのを防ぐ + audio_buf を 0 で
-        //  即時 publish して decoder pacing が wall fallback に切り替わるよう促す)
+        // pump の方が古ければ raw/processed を clear + tx_queued を 0 化 + publish 0 して
+        // refill loop を skip。
+        //
+        // **tx_queued も 0 化** (Codex P2、2026-05-01 改訂):
+        // raw/processed だけ消しても、`total_audio_buffer_secs()` には audio_tx_queued が
+        // 残る。decoder の `notify_seek_completed()` が走って add_tx_queued の差分が再構築
+        // されるまでの窓で、旧世代の audio_tx 残量が pacing に「playable あり」と誤判断
+        // させる可能性があった。`zero_audio_tx_queued_secs()` で即座に 0 化。
+        // 旧世代の `add_tx_queued(-duration)` が後から届いても `max(0.0)` で clamp される。
         {
             let cur_clock_serial = clock.current_seek_serial();
             let mut buf = buffer.lock().unwrap();
@@ -557,6 +566,7 @@ fn run_pump(
                 buf.processed.clear();
                 buf.drain_offset_in_first = 0;
                 buf.raw_pending.clear();
+                clock.zero_audio_tx_queued_secs();
                 publish_buffer_secs(&buf, &clock);
                 // pump_seek_serial は変更しない (= 次の 'intake で frame.seek_serial 経由
                 // で正規ルートで更新される)。本 tick は queue clear だけして outer loop へ。
