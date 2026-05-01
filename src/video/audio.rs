@@ -452,17 +452,22 @@ fn run_pump(
             raw_secs
         };
 
-        // ── overflow / warning 通知 (Codex P1-1: silent drop しない、P1-2: 完全 fallback) ──
+        // ── overflow / warning 通知 (Codex P1-1: silent drop しない、P1-2 改: soft fallback) ──
         if raw_total_secs > RAW_OVERFLOW_SECS {
-            // overflow: その seek 世代を terminal fallback として処理する。
-            // - processed + raw_pending を全 clear (= 残った post-VST output で
-            //   audio master が再支配しないように)
-            // - clock.mark_audio_inactive() で wall master に切替
-            // - emit AudioInactive で engine の has_audio=false 化
-            // - overflow_for_serial に set して以降このセッションでは consume only
+            // **soft fallback** (= Codex P1-2 修正): その seek 世代では consume only。
+            // 旧版は `clock.mark_audio_inactive()` + `AudioInactive` emit で恒久 fallback
+            // にしていたが、`AudioInactive` は EngineActor の `has_audio` を **永久に**
+            // false にする想定 (= デバイス起動失敗 用)。一時 fallback と混ぜると次 seek で
+            // has_audio が戻らず Buffering→Playing の latch 判定が壊れる。
+            //
+            // 新版: queue を clear + overflow_for_serial を set するだけ。
+            // - processed が空なので fill_output drain なし → set_audio_pts が呼ばれない
+            //   → AvClock の Audio 世代 anchor は更新されず wall extrapolation で進む
+            //   (= 自然に wall fallback)
+            // - 新 seek 世代で overflow_for_serial = None に reset (= 再 audio master 試行)
             crate::logger::log(format!(
                 "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
-                 seek_serial={frame_seek_serial}: terminal fallback (clear + wall master)",
+                 seek_serial={frame_seek_serial}: soft fallback (clear queue, skip serial)",
                 raw_total_secs, RAW_OVERFLOW_SECS,
             ));
             {
@@ -472,10 +477,6 @@ fn run_pump(
                 buf.raw_pending.clear();
                 publish_buffer_secs(&buf, &clock);
             }
-            clock.mark_audio_inactive();
-            let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
-                crate::video::engine::state::AudioEvent::AudioInactive,
-            ));
             overflow_for_serial = Some(frame_seek_serial);
             continue;
         } else if raw_total_secs > RAW_WARNING_SECS {
@@ -650,8 +651,12 @@ fn run_pump(
         }
 
         // ── publish_buffer_secs + BufferReady emit ──
-        // BufferReady は **processed のみ** で判定 (Codex P1-2、raw を含めない)
-        let (processed_secs, cur_pts, cur_serial) = {
+        // BufferReady は **processed のみ** で判定 (Codex P1-2、raw を含めない)。
+        // pts は **next_audible_pts** = `processed.front().audible_pts + drain_offset/sps`
+        // を使う (Codex P1-1 反映、2026-05): seek 直後 next_pts_secs は input pts のまま
+        // なので、PDC 適用後の audible 値を渡さないと engine の audio_anchor が
+        // target-pdc に固定される。
+        let (processed_secs, cur_audible_pts, cur_serial) = {
             let buf = buffer.lock().unwrap();
             publish_buffer_secs(&buf, &clock);
             let secs: f64 = buf
@@ -660,13 +665,19 @@ fn run_pump(
                 .map(|c| c.duration_secs)
                 .sum::<f64>()
                 + remaining_first_chunk_secs(&buf);
-            (secs, buf.next_pts_secs, buf.pump_seek_serial)
+            let audible = if let Some(first) = buf.processed.front() {
+                first.audible_pts_secs
+                    + buf.drain_offset_in_first as f64 / buf.samples_per_sec
+            } else {
+                buf.next_pts_secs
+            };
+            (secs, audible, buf.pump_seek_serial)
         };
         if processed_secs >= READY_THRESHOLD_SECS {
             let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
                 crate::video::engine::state::AudioEvent::BufferReady {
                     epoch: cur_serial,
-                    pts: cur_pts,
+                    pts: cur_audible_pts,
                     wall_now: std::time::Instant::now(),
                 },
             ));
@@ -788,17 +799,24 @@ fn fill_output(
 
     let vol = clock.effective_volume();
 
-    // ── chunk-based drain (Codex P1-3 / P2-C) ──
+    // ── chunk-based drain (Codex P1-1 反映、2026-05) ──
     // processed の先頭 chunk から `drain_offset_in_first` 経由で順に取り出す。
-    // chunk が完全 drain したら pop_front + drain_offset=0 にリセット。
-    // PDC latency 変化検出は **chunk 切替時** の `pdc_latency_secs_at_process` 比較で
-    // 行う (= 旧 global pdc_latency_secs 比較より精度が高い)。
+    // **drain した最後のサンプルの audible_pts** を track し、`set_audio_pts` に
+    // そのまま渡す (= PDC 引き算は不要、chunk metadata に baked-in 済み)。
+    // 旧版は `buf.next_pts_secs - buf.pdc_latency_secs` で video clock を作って
+    // いたが、`buf.next_pts_secs` は input pts のままなので PDC=1s で seek すると
+    // `pts_for_video = target - 1s` で逆向きジャンプしていた。chunk.audible_pts を
+    // 使えば `target` 起点の正しい時刻になる (Codex P1-1 修正)。
     let mut real_consumed: usize = 0;
     let mut written = 0;
     let samples_per_sec = buf.samples_per_sec;
+    /// 最後に drain したサンプル「直後」の audible PTS (= 次に drain される予定の PTS)。
+    /// chunk が pop_front されても、その chunk の最終 audible PTS を保持し続ける。
+    let mut next_audible_pts: Option<f64> = None;
+    /// drain 中に chunk が切り替わったか (= PDC latency が変化した可能性)
+    let mut chunk_pdc_latency_at_drain: Option<f64> = None;
 
     while written < want {
-        // 先頭 chunk から残量分取り出す
         let take = if let Some(first) = buf.processed.front() {
             let remaining = first.samples.len().saturating_sub(buf.drain_offset_in_first);
             remaining.min(want - written)
@@ -813,13 +831,23 @@ fn fill_output(
             break;
         }
         let first = buf.processed.front().unwrap();
+        let chunk_audible_pts = first.audible_pts_secs;
+        let chunk_latency = first.pdc_latency_secs_at_process;
+        chunk_pdc_latency_at_drain = Some(chunk_latency);
+
         for i in 0..take {
             out[written + i] = first.samples[buf.drain_offset_in_first + i] * vol;
         }
         written += take;
         real_consumed += take;
         buf.drain_offset_in_first += take;
-        // chunk fully drained → pop + reset offset
+
+        // chunk 内 drain 後の audible_pts を計算 (= 次に drain される予定の PTS)
+        next_audible_pts = Some(
+            chunk_audible_pts
+                + buf.drain_offset_in_first as f64 / samples_per_sec,
+        );
+
         if buf.drain_offset_in_first
             >= buf.processed.front().map(|c| c.samples.len()).unwrap_or(0)
         {
@@ -833,65 +861,44 @@ fn fill_output(
         publish_buffer_secs(&buf, clock);
         return;
     }
-    let consumed_secs = real_consumed as f64 / samples_per_sec;
-    buf.next_pts_secs += consumed_secs;
-    let pts_now = buf.next_pts_secs;
+
+    // **buf.next_pts_secs を audible PTS で更新** (= chunk metadata baked-in)。
+    // 以後 publish_buffer_secs / underrun resync は audible PTS ベースで動く。
+    if let Some(audible) = next_audible_pts {
+        buf.next_pts_secs = audible;
+    }
+    let pts_for_video = next_audible_pts.unwrap_or(buf.next_pts_secs);
     let pump_serial = buf.pump_seek_serial;
-    // PDC: 旧 buf.pdc_latency_secs を使う (= 互換)。chunk metadata 単位の latency
-    // jump 判定は将来追加可能だが、現状は global で十分動く。
-    let pdc_latency = buf.pdc_latency_secs;
-    let pts_for_video = (pts_now - pdc_latency).max(0.0);
-    // PDC latency 変化検出 + 閾値付きジャンプ判定:
-    // - **大きい変化 (> 100ms)**: monotonic guard をバイパスして video clock を強制
-    //   再設定 (= 「映像ジャンプ」)。プラグインモード切替や linear-phase ON/OFF 等の
-    //   ステップ変化を凍結時間なしで反映する。
-    // - **小さい変化 (≤ 100ms)**: 通常 set_audio_pts を呼ぶ (= monotonic + wall-rate cap)。
-    //   小刻みなノイズ (= プラグインが ±20-50ms の jitter を出すケース) でも頻繁な
-    //   ジャンプを発生させず、滑らかな再生を維持する。Δ100ms 以内の遅れ/早回しは
-    //   人間の知覚しきい値以下で実用上気付かない。
-    //
-    // 閾値の根拠: 一般的な VST plugin の latency は 0 / 数ms / 数十ms / 数百ms /
-    // 1秒以上 の段差で離散的に変化する。100ms はモード切替を確実に拾えて、サンプル
-    // 単位ノイズ (= ±100ms 以下) には反応しない実用的な値。
+
+    // PDC latency 変化検出 + ジャンプ判定 (= chunk.pdc_latency_secs_at_process ベース、
+    // Codex P2-C 反映)。
+    // chunk が切り替わって新 latency が現 applied と差があれば jump。
     const PDC_JUMP_THRESHOLD_SECS: f64 = 0.1;
-    let delta_secs = pdc_latency - buf.pdc_latency_secs_applied;
-    let latency_jumped = delta_secs.abs() > PDC_JUMP_THRESHOLD_SECS;
-    // 値変化検出のしきい値は微小 (= 1us)。jitter でも applied は更新する
-    // (= 累積による誤検知防止)。jump 判定は別の閾値で行う。
-    if delta_secs.abs() > 1e-6 {
-        buf.pdc_latency_secs_applied = pdc_latency;
-        if latency_jumped {
+    let mut latency_jumped = false;
+    if let Some(latency) = chunk_pdc_latency_at_drain {
+        let delta_secs = latency - buf.pdc_latency_secs_applied;
+        if delta_secs.abs() > PDC_JUMP_THRESHOLD_SECS {
+            latency_jumped = true;
             crate::logger::log(format!(
-                "[VST3 PDC] fill_output: large latency change ({:+.1}ms) -> jump video clock to {:.3}s",
+                "[VST3 PDC] fill_output: chunk latency change ({:+.1}ms) -> jump video clock to {:.3}s",
                 delta_secs * 1000.0,
                 pts_for_video
             ));
         }
+        if delta_secs.abs() > 1e-6 {
+            buf.pdc_latency_secs_applied = latency;
+        }
     }
-    // publish は Mutex 内で行う。Mutex 外に出すと run_pump の push 後 publish が
-    // stale な fill_output 側 publish に上書きされる race がある。
-    // overhead = 1 atomic store ≈ 1 ns 程度なので RT への影響は無視できる。
+
     publish_buffer_secs(&buf, clock);
     drop(buf);
-    // pump が pre-seek サンプルを抱えている間 (clock_serial > pump_serial) に
-    // set_audio_pts を呼ぶとシーク前位置でクロックが進み、シークバーがスナップバック。
-    // 二段読みで race を排除する。
+
     if pump_serial >= clock.current_seek_serial() {
         if latency_jumped {
-            // PDC latency 変化時: monotonic guard をバイパスして anchor を強制再設定。
-            // 後退方向 (= latency 増加) でも前進方向 (= latency 減少) でも、video clock が
-            // 即座に新しい pts_for_video へジャンプし、その後通常 anchor 更新に戻る。
             clock.set_audio_pts_jump(pts_for_video);
         } else {
             clock.set_audio_pts(pts_for_video);
         }
-        // override クリアは「target 近傍のサンプル」を消費した時のみ。
-        // target から大きく離れた場合は decoder 側 seek が外れて古い位置の audio が
-        // 新世代 serial で来ているケースで、ここで clear するとシークバーが
-        // 元位置に戻る (override 中は now_secs が target を返すので diff で判定可能、
-        // 通常再生中は now_secs ≈ pts_now なので diff ~0 で常に clear する)。
-        // NB: override クリア判定は pts_for_video ベース (= clock.now_secs() と同じ
-        // 時間軸) で行うので PDC 適用後の値で比較する。
         let now = clock.now_secs();
         if (pts_for_video - now).abs() <= SEEK_TARGET_TOLERANCE_SECS {
             clock.clear_seek_target_override(pump_serial);
@@ -1135,6 +1142,56 @@ mod tests {
         assert!(saw_drop_all, "early frames should be DropAll");
         assert!(saw_trim_front, "transitional frame should be TrimFront");
         assert!(saw_keep_all, "later frames should be KeepAll");
+    }
+
+    /// chunk の audible_pts ベースで clock が更新される (Codex P1-1 修正の検証)。
+    /// PDC=1s で seek=10 のシナリオを模擬: chunk.audible_pts = 10.0、drain 240 samples
+    /// (= 0.0025秒@96kHz) → next_pts_secs = 10.0025、clock の audio_pts も同値。
+    /// 旧コード `pts_for_video = next_pts - pdc_latency` だと 9.0025 になり target-pdc
+    /// に逆ジャンプしていた。
+    #[test]
+    fn fill_output_uses_chunk_audible_pts_for_clock() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
+        // PDC=1s plugin で input pts=11.0、audible=10.0 (= seek_target) の chunk
+        let target_audible = 10.0;
+        {
+            let mut b = buf.lock().unwrap();
+            // global pdc_latency_secs (= legacy field) は 1.0 にしておく (= PDC ON 状態)
+            b.pdc_latency_secs = 1.0;
+            b.pdc_latency_secs_applied = 1.0;
+            // initial next_pts_secs は 0 のまま (= 旧コードでは pts_for_video=-1.0 になる)
+            b.next_pts_secs = 0.0;
+            // PDC=1s で input pts=11.0 → audible_pts=10.0 (= target)
+            let chunk = ProcessedChunk {
+                samples: vec![0.5; 480],
+                audible_pts_secs: target_audible,
+                duration_secs: 480.0 / samples_per_sec,
+                seek_serial: 0,
+                pdc_latency_secs_at_process: 1.0,
+            };
+            b.processed.push_back(chunk);
+        }
+
+        let mut out = [0.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &playing_state());
+
+        // drain 後、buf.next_pts_secs が audible_pts ベースで更新されている
+        let expected_audible_after = target_audible + 480.0 / samples_per_sec;
+        let actual = buf.lock().unwrap().next_pts_secs;
+        assert!(
+            (actual - expected_audible_after).abs() < 1e-9,
+            "next_pts_secs should be chunk.audible_pts + drain_offset/sps \
+             (expected ~{expected_audible_after}, got {actual})",
+        );
+        // clock.now_secs() も target_audible 付近のはず (= 旧バグだと target-1s 付近)
+        let clock_now = clock.now_secs();
+        assert!(
+            clock_now > target_audible - 0.1,
+            "clock should be near target_audible ({target_audible}), not target-pdc \
+             (got {clock_now})",
+        );
     }
 
     /// 複数 chunk からの drain: 240 + 240 = 480 samples を 1 callback で取る。
