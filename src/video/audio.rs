@@ -15,7 +15,7 @@
 //! [`AudioOutput`] が drop されたら自動で停止する。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,7 +23,6 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
-use super::engine::actor::state_code;
 
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
 /// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
@@ -61,22 +60,9 @@ impl Drop for AudioOutput {
 /// RT 性能が必要なら lock-free に置き換え。今は WASAPI Shared 数 ms 周期なので
 /// Mutex で実用上問題ない (コンテンションは pump thread と RT 1:1)。
 struct AudioBuffer {
-    /// 未消費サンプル列 (interleaved stereo)。fill_output が drain する側。
-    /// 通常 1 callback 分 (= ~10ms 相当) しか保持しない。
+    /// 未消費サンプル列 (interleaved stereo)。
     samples: std::collections::VecDeque<f32>,
-    /// **preroll** バッファ (Codex 助言、2026-05): pump は常にここに push する。
-    /// fill_output が PLAYING 状態のとき必要分だけ samples に転送して drain する。
-    /// 用途: Buffering 中も pump の back-pressure を解消する (= demux/audio decode を
-    /// 止めない)。playback cap (= 0.3秒) は preroll+samples 合計に対するソフトターゲット
-    /// で、この値を超えても pump は WAIT せず push を継続する (= back-pressure 起点を
-    /// 排除)。pump は preroll の **絶対上限** (= 30秒) に達したときだけ block する
-    /// (memory safety net)。
-    /// EQ latency = preroll.len() + samples.len()。Playing 中は ~0.3秒 (= 通常)。
-    /// Buffering 後の Playing 復帰直後は preroll が高水位 (= 5秒等) になり EQ 反映が
-    /// 一時的に遅れるが、preroll 排出後 (= ~5秒) で通常に戻る。
-    preroll: std::collections::VecDeque<f32>,
-    /// `preroll` (空なら samples) の先頭サンプル (= 次に消費されるサンプル) の PTS (秒)。
-    /// pump push 時の更新ロジックは samples.is_empty() && preroll.is_empty() を見る。
+    /// `samples` の先頭サンプル (= 次に消費されるサンプル) の PTS (秒)。
     next_pts_secs: f64,
     /// 出力サンプルレート (Hz)。
     sample_rate: u32,
@@ -141,7 +127,6 @@ pub fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
-    engine_state: Arc<AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
@@ -162,8 +147,7 @@ pub fn start(
     };
 
     let buffer = Arc::new(Mutex::new(AudioBuffer {
-        samples: std::collections::VecDeque::with_capacity((sample_rate as usize) / 4),
-        preroll: std::collections::VecDeque::with_capacity((sample_rate as usize) * 2),
+        samples: std::collections::VecDeque::with_capacity((sample_rate as usize) * 2),
         next_pts_secs: 0.0,
         sample_rate,
         samples_per_sec: sample_rate as f64 * 2.0,
@@ -182,7 +166,6 @@ pub fn start(
     let pump_engine_event_tx = engine_event_tx.clone();
     #[cfg(windows)]
     let pump_dsp_bridge = dsp_bridge;
-    let pump_engine_state = engine_state.clone();
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
@@ -193,7 +176,6 @@ pub fn start(
                 pump_cancel,
                 pump_clock,
                 pump_engine_event_tx,
-                pump_engine_state,
                 #[cfg(windows)]
                 pump_dsp_bridge,
             );
@@ -203,12 +185,11 @@ pub fn start(
     // ── cpal output callback: buffer → device ──
     let cb_buffer = buffer.clone();
     let cb_clock = clock.clone();
-    let cb_engine_state = engine_state.clone();
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_output(out, &cb_buffer, &cb_clock, &cb_engine_state);
+                fill_output(out, &cb_buffer, &cb_clock);
             },
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
@@ -241,10 +222,7 @@ pub fn start(
 /// decoder pacing 側は actual buffer 残量で `audio_escape` を判定し、先読み許可量だけ
 /// `PACE_LEAD + pdc_latency` を加算する設計。
 fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
-    // **EQ 反映遅延 = (preroll + samples) 合計**: pump push の前段にある preroll
-    // も EQ 効果のキューイングに含まれるので両方を合算する。
-    let total = buf.samples.len() + buf.preroll.len();
-    let secs = total as f64 / buf.samples_per_sec;
+    let secs = buf.samples.len() as f64 / buf.samples_per_sec;
     clock.set_audio_pump_buf_secs(secs);
     clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
 }
@@ -279,7 +257,6 @@ fn run_pump(
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
-    engine_state: Arc<AtomicU8>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
     #[cfg(windows)]
@@ -309,20 +286,11 @@ fn run_pump(
     //
     // ※ samples は interleaved stereo (channels=2)。
     // sample_rate は構築時に固定なので 1 度だけロックして拾う。
-    // ── pump 構造変更 (Codex 助言、2026-05) ──
-    //
-    // pump は **常に preroll に push** する。fill_output が PLAYING 中に preroll →
-    // samples 転送して drain する設計。これにより:
-    // - 「PLAYING 復帰時に cap が縮小して pump が長時間待つ」back-pressure を排除
-    // - Buffering 中も demux/audio decode を止めない
-    //
-    // **pump の cap は total (= preroll + samples) に対する上限**で、memory safety net
-    // として 30 秒 (= ~11 MB) に固定。通常運用では preroll は ~0、samples は ~0.3 秒
-    // で steady なので cap には到達しない。Buffering 中だけ preroll が一時的に成長する。
-    const TOTAL_CAP_SECS: f64 = 30.0;
-    let sample_rate = buffer.lock().unwrap().sample_rate;
-    let cap_samples_total =
-        (sample_rate as f64 * 2.0 * TOTAL_CAP_SECS) as usize;
+    const TARGET_BUFFER_SECS: f64 = 0.3;
+    let cap_samples = {
+        let b = buffer.lock().unwrap();
+        (b.sample_rate as f64 * 2.0 * TARGET_BUFFER_SECS) as usize
+    };
 
     // EngineActor::Buffering → Playing 遷移トリガとなる buffer 厚さ (秒)。
     // 設計 v3 では 500ms (= 250ms low + hysteresis 想定) で確定したが、Phase 8.K で
@@ -377,18 +345,9 @@ fn run_pump(
         }
 
         // バッファ満杯なら一旦待つ。Condvar 化は将来の最適化。
-        // **total cap (preroll + samples) = 30 秒** (= memory safety net、Codex P2-2 反映)。
-        // 通常は preroll ≈ 0、samples ≈ 0.3秒で cap に到達しない。Buffering 後の
-        // Playing 復帰直後に preroll が一時的に高水位になるが、cap=30秒なら余裕で収まる。
-        // engine_state は (将来 logging 等で使うため) 引数として保持しているが
-        // 現時点では cap 計算で参照しない。
-        let _ = engine_state.load(Ordering::Acquire);
         loop {
-            let total = {
-                let b = buffer.lock().unwrap();
-                b.samples.len() + b.preroll.len()
-            };
-            if total < cap_samples_total || cancel.load(Ordering::Acquire) {
+            let len = buffer.lock().unwrap().samples.len();
+            if len < cap_samples || cancel.load(Ordering::Acquire) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -447,23 +406,16 @@ fn run_pump(
             activated = true;
         }
         if frame.seek_serial > buf.pump_seek_serial {
-            // 新しい seek 世代: 両方のバッファ (samples + preroll) をクリアして
-            // PTS を再設定。fill_output 側の pre-seek discard と整合する。
+            // 新しい seek 世代: バッファをクリアして PTS を再設定
             buf.samples.clear();
-            buf.preroll.clear();
             buf.next_pts_secs = frame.pts_secs;
             buf.pump_seek_serial = frame.seek_serial;
             // Phase 8.K: BufferReady は level event 化したため latch 不要。
-        } else if buf.samples.is_empty()
-            && buf.preroll.is_empty()
-            && frame.pts_secs > buf.next_pts_secs
-        {
-            // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)。
-            // samples + preroll が両方空のときだけ resync する。
+        } else if buf.samples.is_empty() && frame.pts_secs > buf.next_pts_secs {
+            // underrun resync は前進方向のみ許可 (clock 後退を防ぐため)
             buf.next_pts_secs = frame.pts_secs;
         }
-        // **preroll に push** (samples ではなく)。fill_output が必要分を転送する。
-        buf.preroll.extend(processed_samples.iter().copied());
+        buf.samples.extend(processed_samples.iter().copied());
         // PDC (Plugin Delay Compensation) latency を反映。fill_output で video clock
         // 計算時に減算される。値が変化したらログに残す (= プラグインモード切替の検出)。
         if (buf.pdc_latency_secs - current_pdc_latency_secs).abs() > 1e-6 {
@@ -488,11 +440,7 @@ fn run_pump(
         // EngineActor 側は idempotent (`latch.buffer_ready=true` の repeat set)
         // なので過剰 emit は無害。`bounded(64)` の channel は full なら try_send
         // で drop されるが、次 frame の emit で復旧する。
-        // BufferReady の判定は **preroll + samples 合計** で行う
-        // (= preroll 設計化以後、pump push は preroll に貯まるため samples だけ見ると
-        // 永久に閾値未満で latch が閉じない)。
-        let buf_secs =
-            (buf.samples.len() + buf.preroll.len()) as f64 / buf.samples_per_sec;
+        let buf_secs = buf.samples.len() as f64 / buf.samples_per_sec;
         let cur_pts = buf.next_pts_secs;
         let cur_serial = buf.pump_seek_serial;
         drop(buf);
@@ -528,50 +476,13 @@ fn fill_output(
     out: &mut [f32],
     buffer: &Arc<Mutex<AudioBuffer>>,
     clock: &Arc<AvClock>,
-    engine_state: &Arc<AtomicU8>,
 ) {
-    // ── pre-seek discard は **ガードより先**に実行する (deadlock 回避、2026-05) ──
-    //
-    // engine_state ガードを最初に置くと「stale サンプルが buffer に残ったまま」
-    // になり、pump の cap 待ちが解けない → audio_rx → audio_pkt_tx → demux と
-    // back-pressure が伝播して **video decoder が飢餓して FirstFrameReady が永久
-    // に来ない** = engine が Buffering から抜けられない deadlock になる
-    // (= ユーザー報告「動画を準備中... のまま」の根本原因)。
+    // ── pre-seek discard ──
     let clock_serial = clock.current_seek_serial();
     let mut buf = buffer.lock().unwrap();
 
     if buf.pump_seek_serial < clock_serial {
-        // pre-seek 古サンプルを samples + preroll 両方からクリア
         buf.samples.clear();
-        buf.preroll.clear();
-        publish_buffer_secs(&buf, clock);
-        out.fill(0.0);
-        return;
-    }
-
-    // ── EngineState gate (= 2026-05 ユーザー報告「動画準備中の後に映像が早送り」) ──
-    //
-    // engine が PLAYING 以外 (= LOADING / SEEKING / BUFFERING / PAUSED / EOF / IDLE)
-    // のときは cpal 出力を silence にして audio buffer も drain しない。
-    //
-    // 理由: AV1 等の長 GOP コーデックを resume_secs 付きで開くと「open → seek →
-    // forward decode (~1.5s)」で video の最初の post-seek frame が ~2 秒遅れて
-    // 出る。この間 audio は cpal callback で drain され続け AvClock の anchor が
-    // wall-clock 進行 → video 表示開始時点で audio が seek_target+1.5秒 まで進んで
-    // いる → video tick が catch-up モードで「早送り」(= dropped_past を多発)。
-    //
-    // 対策として PLAYING 以外では audio output 全体を gate する。Buffering 中は
-    // pump が seek_target 起点の audio で buffer を埋め (cap=Buffering 専用 5 秒)、
-    // engine が Playing に遷移した瞬間に最初の post-seek sample から drain 開始 →
-    // video first frame と音声が seek_target で同期して playback 開始する。
-    //
-    // PAUSED は元々下流の `clock.is_playing()=false` で同様に silence される
-    // (= 既存 path と二重に gate がかかっても idempotent)。
-    //
-    // **重要**: `pump` の cap を Buffering 中だけ拡張することで back-pressure 連鎖
-    // (= pump 詰まり → audio decoder block → demux block → video starvation) を
-    // 断ち切る (= run_pump の cap 計算で engine_state を見る、deadlock 回避と一緒)。
-    if engine_state.load(Ordering::Acquire) != state_code::PLAYING {
         publish_buffer_secs(&buf, clock);
         out.fill(0.0);
         return;
@@ -607,18 +518,6 @@ fn fill_output(
     if !clock.is_playing() {
         out.fill(0.0);
         return;
-    }
-
-    // ── preroll → samples 転送 (Codex 助言、2026-05) ──
-    //
-    // pump は preroll に push するため、fill_output が drain する前に samples を
-    // 必要分まで補充する必要がある。「want 分か preroll 全部」のうち少ない方を転送。
-    // 通常運用 (= preroll ~0) では転送 0、Buffering 復帰直後 (= preroll 高水位) は
-    // want 分転送して preroll が drain ペースで shrink する。
-    while buf.samples.len() < want && !buf.preroll.is_empty() {
-        if let Some(s) = buf.preroll.pop_front() {
-            buf.samples.push_back(s);
-        }
     }
 
     let vol = clock.effective_volume();
@@ -739,15 +638,9 @@ mod tests {
         clock
     }
 
-    /// テスト用 engine_state: PLAYING で初期化 (= drain は通常通り動く path)。
-    fn make_engine_state_playing() -> Arc<AtomicU8> {
-        Arc::new(AtomicU8::new(state_code::PLAYING))
-    }
-
     fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
         Arc::new(Mutex::new(AudioBuffer {
             samples: std::collections::VecDeque::new(),
-            preroll: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
             sample_rate,
             samples_per_sec: sample_rate as f64 * 2.0,
@@ -768,7 +661,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480]; // non-zero で初期化、silence 化されること確認
-        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
+        fill_output(&mut out, &buf, &clock);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         assert_eq!(
@@ -800,7 +693,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
+        fill_output(&mut out, &buf, &clock);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 100.0 / (48_000.0 * 2.0);
@@ -836,7 +729,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
+        fill_output(&mut out, &buf, &clock);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 480.0 / (48_000.0 * 2.0);
@@ -847,97 +740,4 @@ mod tests {
         );
     }
 
-    /// Buffering / Seeking 中は cpal callback が drain しない (= 2026-05 fix)。
-    /// この保証が無いと、AV1 等の長 GOP コーデックを resume 付きで開いたときに
-    /// audio が seek_target から先に進み、video first frame 表示時に「早送り」状態。
-    #[test]
-    fn fill_output_buffering_state_silences_without_drain() {
-        let buf = make_buffer(48_000);
-        let clock = make_clock();
-        // buffer に十分なサンプルを入れておく
-        {
-            let mut b = buf.lock().unwrap();
-            for _ in 0..1000 {
-                b.samples.push_back(0.5);
-            }
-        }
-        let pts_before = buf.lock().unwrap().next_pts_secs;
-        let len_before = buf.lock().unwrap().samples.len();
-
-        let buffering_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
-        let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &buffering_state);
-
-        let pts_after = buf.lock().unwrap().next_pts_secs;
-        let len_after = buf.lock().unwrap().samples.len();
-        assert_eq!(pts_before, pts_after, "Buffering: pts must not advance");
-        assert_eq!(len_before, len_after, "Buffering: buffer must not drain");
-        assert!(
-            out.iter().all(|&s| s == 0.0),
-            "Buffering: output must be silence"
-        );
-    }
-
-    /// preroll → samples 転送が動作する: pump が preroll に push、fill_output が
-    /// drain 時に必要分を samples へ転送して output に書く。
-    /// pump's push path をシミュレートする回帰テスト (= 2026-05 preroll buffer 設計)。
-    #[test]
-    fn fill_output_drains_from_preroll_when_samples_empty() {
-        let buf = make_buffer(48_000);
-        let clock = make_clock();
-        // preroll に 480 samples (= want と同じ) を積む。samples は空のまま。
-        {
-            let mut b = buf.lock().unwrap();
-            for _ in 0..480 {
-                b.preroll.push_back(0.5);
-            }
-        }
-        let pts_before = buf.lock().unwrap().next_pts_secs;
-
-        let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &make_engine_state_playing());
-
-        let pts_after = buf.lock().unwrap().next_pts_secs;
-        let expected_advance = 480.0 / (48_000.0 * 2.0);
-        assert!(
-            (pts_after - pts_before - expected_advance).abs() < 1e-12,
-            "preroll drain advances pts by samples-equivalent",
-        );
-        // 出力: 全 480 samples で 0.5 * 0.6 (volume) = 0.3
-        for (i, &v) in out.iter().enumerate() {
-            assert!((v - 0.3).abs() < 1e-6, "sample {i} should be 0.3, got {v}");
-        }
-        // preroll は空、samples も空 (= 全部 transfer して drain した)
-        let b = buf.lock().unwrap();
-        assert!(b.preroll.is_empty(), "preroll fully transferred");
-        assert!(b.samples.is_empty(), "samples fully drained");
-    }
-
-    /// Seeking 中も同様に silence + 非 drain。
-    #[test]
-    fn fill_output_seeking_state_silences_without_drain() {
-        let buf = make_buffer(48_000);
-        let clock = make_clock();
-        {
-            let mut b = buf.lock().unwrap();
-            for _ in 0..1000 {
-                b.samples.push_back(0.5);
-            }
-        }
-        let len_before = buf.lock().unwrap().samples.len();
-
-        let seeking_state = Arc::new(AtomicU8::new(state_code::SEEKING));
-        let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &seeking_state);
-
-        assert_eq!(
-            len_before,
-            buf.lock().unwrap().samples.len(),
-            "Seeking: buffer must not drain"
-        );
-        assert!(
-            out.iter().all(|&s| s == 0.0),
-            "Seeking: output must be silence"
-        );
-    }
 }

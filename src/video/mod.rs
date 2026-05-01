@@ -298,7 +298,6 @@ impl VideoPlayer {
             audio_rx,
             clock.clone(),
             engine_event_tx.clone(),
-            engine_state_handle.clone(),
             #[cfg(windows)]
             dsp_bridge,
         ) {
