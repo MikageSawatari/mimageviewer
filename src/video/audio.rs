@@ -543,6 +543,27 @@ fn run_pump(
             }
         } // 'intake
 
+        // ── pre-refill seek staleness check (Codex 助言、2026-05-01 改訂) ──
+        // timeout tick で起きた場合、'intake で seek serial 更新が走らないため、
+        // 旧 seek 世代の raw/processed を保持したまま VST process してしまう可能性がある。
+        // 直接 clock.current_seek_serial() と buf.pump_seek_serial を比較し、
+        // pump の方が古ければ raw/processed を clear + publish 0 して refill loop を skip。
+        // (= 旧 seek 世代の chunk が VST で無駄処理されるのを防ぐ + audio_buf を 0 で
+        //  即時 publish して decoder pacing が wall fallback に切り替わるよう促す)
+        {
+            let cur_clock_serial = clock.current_seek_serial();
+            let mut buf = buffer.lock().unwrap();
+            if buf.pump_seek_serial < cur_clock_serial {
+                buf.processed.clear();
+                buf.drain_offset_in_first = 0;
+                buf.raw_pending.clear();
+                publish_buffer_secs(&buf, &clock);
+                // pump_seek_serial は変更しない (= 次の 'intake で frame.seek_serial 経由
+                // で正規ルートで更新される)。本 tick は queue clear だけして outer loop へ。
+                continue;
+            }
+        }
+
         // ── raw → VST process → processed loop ──
         // (overflow_for_serial 中は raw_pending が既に clear 済みなので refill loop は no-op)
         // mutex を持たずに VST process_block を呼ぶ (Codex P2-B):

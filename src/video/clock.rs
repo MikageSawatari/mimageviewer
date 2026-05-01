@@ -590,12 +590,20 @@ impl AvClock {
         self.audio_bookkeeping.tx_queued_secs()
     }
 
-    /// 現在の総音声バッファ秒数 (= processed + raw_pending + audio_tx queued)。
+    /// 現在の **playable** 音声バッファ秒数 (= processed + audio_tx queued)。
     /// decoder pacing が「audio が枯渇しそう (= 沈黙する) を回避すべきか」判定する。
-    /// **actual buffer のみ** (= VST3 PDC latency は含まない、`vst3_pdc_latency_secs` で別取得)。
-    /// raw_pending 含む理由は [`AudioBookkeeping::total_secs`] のドキュメントを参照。
+    /// **actual playable のみ**: raw_pending (= pre-VST) は **含めない** (= Codex 助言、
+    /// 2026-05-01 改訂、VST 詰まり / PDC trim drop で raw が playable にならない退行を防ぐ)。
+    /// PDC latency も含まない (`vst3_pdc_latency_secs` で別取得)。
     pub fn total_audio_buffer_secs(&self) -> f64 {
         self.audio_bookkeeping.total_secs()
+    }
+
+    /// 現在の **pre-VST supply** 音声秒数 (= raw_pending + audio_tx queued)。診断用。
+    /// raw_pending と audio_tx_queued の和。decoder pacing が starvation 復旧の予兆等を
+    /// 判断するために playable とは別に参照する。
+    pub fn audio_supply_secs(&self) -> f64 {
+        self.audio_bookkeeping.supply_secs()
     }
 
     /// VST3 PDC latency (秒) を pump push 時に publish する。

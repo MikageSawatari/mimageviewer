@@ -102,16 +102,26 @@ impl AudioBookkeeping {
         f64::from_bits(self.tx_queued_secs_bits.load(Ordering::Acquire))
     }
 
-    /// pump_buf + raw_pending + tx_queued の合計。decoder pacing が「audio safe lo を
-    /// 割っているか」を判定する材料 (= Codex 助言、2026-05-01)。
+    /// pump_buf + tx_queued の合計 (= **playable + decoder supply のみ**)。
+    /// decoder pacing が「audio safe lo を割っているか」を判定する材料。
     /// **actual buffer 残量のみ** (= PDC latency は含まない)。
     ///
-    /// **raw_pending を含める理由**: raw → processed 変換は VST process_block の数 ms
-    /// 程度なので、ユーザー体感上「再生可能 audio」として扱える。逆に含めないと、
-    /// processed 0.3 秒 cap だけが見えて decoder pacing が常に in_audio_escape 発動 →
-    /// video が pacing を無視して emergency burst → 体感的に "ガクガク再生"。
+    /// **raw_pending は含めない** (= Codex 助言、2026-05-01 改訂):
+    /// raw_pending は **pre-VST** であり、VST process_block が遅い/詰まる、PDC trim で
+    /// drop される場合、実際の playable buffer は 0 でも raw は満杯のことがある。
+    /// raw を含めると decoder pacing が「音声あり」と誤判断 → video が pacing 無視で
+    /// burst → 結果的に audio が underrun したまま動画だけ進む退行。
+    ///
+    /// 詳細な supply 状態は [`raw_pending_secs`](Self::raw_pending_secs) で別途取得可。
     pub fn total_secs(&self) -> f64 {
-        self.pump_buf_secs() + self.raw_pending_secs() + self.tx_queued_secs()
+        self.pump_buf_secs() + self.tx_queued_secs()
+    }
+
+    /// raw_pending + tx_queued の合計 (= **pre-VST supply のみ**、診断用)。
+    /// decoder pacing は本値を「playable」とは見なさず、starvation 復旧の予兆等の
+    /// 判断材料として参照する。
+    pub fn supply_secs(&self) -> f64 {
+        self.raw_pending_secs() + self.tx_queued_secs()
     }
 
     /// VST3 PDC latency (秒) を上書き publish。pump push 時に呼ばれる。
@@ -214,14 +224,17 @@ mod tests {
     }
 
     #[test]
-    fn total_sums_processed_raw_pending_and_tx() {
-        // Codex 助言 (2026-05-01): raw_pending を含めた 3 way sum を検証。
+    fn total_excludes_raw_pending() {
+        // Codex 助言 (2026-05-01 改訂): raw_pending は pre-VST なので playable とは
+        // 見なさない。total_secs は processed + tx_queued のみ。
         let bk = AudioBookkeeping::new();
         bk.set_pump_buf_secs(0.3); // post-VST processed
-        bk.set_raw_pending_secs(5.0); // pre-VST raw queue
-        bk.add_tx_queued(0.5); // audio_tx queued
-        // total = 0.3 + 5.0 + 0.5 = 5.8
-        assert!((bk.total_secs() - 5.8).abs() < 1e-9);
+        bk.set_raw_pending_secs(5.0); // pre-VST raw queue (=含めない)
+        bk.add_tx_queued(0.5); // audio_tx queued (= 含める、small decoder supply)
+        // total = 0.3 + 0.5 = 0.8 (raw_pending は除外)
+        assert!((bk.total_secs() - 0.8).abs() < 1e-9);
+        // supply_secs は raw + tx
+        assert!((bk.supply_secs() - 5.5).abs() < 1e-9);
     }
 
     #[test]
