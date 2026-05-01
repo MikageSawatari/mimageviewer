@@ -569,22 +569,11 @@ fn fill_output(
     // wall-rate cap は通常動作で無発動だが、buffer 非空での pre-fill burst (= callback
     // 連続 pop が wall 進行を超えるシナリオ) への保険として残す (Codex P? 反映)。
     //
-    // 残った早期 return:
-    //   - pre-seek サンプル全消去 (= clock_serial > pump_serial)
-    //   - 一時停止中の silence (= clock.is_playing()=false)
-    // どちらも「**buffer から pop しない**」設計上必要な分岐。
-    let clock_serial = clock.current_seek_serial();
-    let mut buf = buffer.lock().unwrap();
-
-    if buf.pump_seek_serial < clock_serial {
-        // 古い (pre-seek) サンプルを破棄。pump がすぐに新世代を埋めてくれる。
-        buf.samples.clear();
-        // pacing が古い残量を読まないよう 0 を publish (Mutex 内、stale 上書き race 回避)。
-        publish_buffer_secs(&buf, clock);
-        out.fill(0.0);
-        return;
-    }
-
+    // 残った早期 return (上記の冒頭ガード経由):
+    //   - pre-seek サンプル全消去 (= clock_serial > pump_serial、関数頭で実行)
+    //   - engine PLAYING 以外 (= state gate、関数頭で実行)
+    //   - 一時停止中の silence (= clock.is_playing()=false、ここで判定)
+    // どれも「**buffer から pop しない**」設計上必要な分岐。
     let want = out.len();
 
     // 一時停止中は無音 (samples 保持、PTS も進めない)
