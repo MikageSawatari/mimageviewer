@@ -63,6 +63,17 @@ use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 ///   GOP 1 個分先行する形になる。audio の monotonic guard が anchor 後退を防ぐので
 ///   UI 停止は起きない。0〜3 秒の wall 経過で audio が target に追いつき、その時点で
 ///   anchor が更新されて完全同期する。
+///
+/// **Fast モードの既知トレードオフ (Codex P1 助言、2026-05-01)**:
+/// notify_seek_completed(target) で anchor が target に固定されている間、decoder は
+/// `ahead = pts - now_secs() = pts - target` を見て past 判定し pacing 抑制無しで
+/// バーストする (= keyframe → target の数百 ms 〜 数秒分を 1〜2 UI tick で消化)。
+/// UI tick はキューの「最後の displayable」だけを表示するので視覚的には早送り
+/// (~5x 〜 10x) になる。一方 audio は cpal callback の 1x 速度で physical に進行
+/// するため、video と audio が短時間 (= GOP 長分の wall 経過) だけ desync する。
+/// このトレードオフは ←→ 連打の skim 用途で受け入れる (= Precise の preroll 待ち
+/// より速いことが優先)。Precise 経路が必要な用途 (= シークバー直接ジャンプ等) は
+/// 引き続き [`SeekKind::Precise`] を使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekKind {
     /// 正確な位置への seek (シークバー / ブックマーク / loop 再生 / EOF replay /

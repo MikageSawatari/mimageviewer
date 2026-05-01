@@ -745,11 +745,17 @@ fn run_decoder(
             let mut seek_result = backward(&mut input);
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
+            // forward retry が走ったかを追跡: Fast モードは backward 成功時のみ preroll
+            // trim を省略する。forward retry は keyframe ≥ target に着地するため、
+            // trim 無しで放流すると Phase 9.F regression (audio_pts < video_pts → video
+            // future stall) を再発させうる (Codex P2 助言、2026-05-01)。
+            let mut used_forward_retry = false;
             if seek_result.is_err() {
                 crate::logger::log(format!(
                     "backward seek failed at {target_secs:.3}s, retry as forward"
                 ));
                 seek_result = input.seek(target_pts, target_pts..);
+                used_forward_retry = true;
             }
             let kind_str = match kind {
                 super::clock::SeekKind::Precise => "precise",
@@ -780,14 +786,23 @@ fn run_decoder(
             // される packet は前世代として処理されない。
             // - Precise 成功時: target_secs = Some(t) → 受信側は post-seek preroll 用に
             //   drop_before_secs = Some(t) を設定 (video は post_seek_frame_sent=false に)
-            // - Fast 成功時: target_secs = None → 受信側は preroll trim せず即時再生
-            //   (= keyframe ≤ target からそのまま再生開始する hybrid 設計)
+            // - Fast (backward 成功時のみ): target_secs = None → 受信側は preroll trim
+            //   せず即時再生 (= keyframe ≤ target からそのまま再生開始する hybrid 設計)
+            // - Fast (forward retry 経由): Precise と同じ Some(t) で trim する。retry は
+            //   keyframe ≥ target に着地するため、trim 無しだと anchor < frame_pts な
+            //   forward-seek regression (Phase 9.F) を再発させる (Codex P2 助言)
             // - 失敗時 (Precise/Fast 共通): target_secs = None → 受信側は preroll trim せず
             //   通常 pacing に戻す
             let target_for_flush = if seek_result.is_ok() {
                 match kind {
                     super::clock::SeekKind::Precise => Some(target_secs),
-                    super::clock::SeekKind::Fast => None,
+                    super::clock::SeekKind::Fast => {
+                        if used_forward_retry {
+                            Some(target_secs) // 安全側にフォールバック
+                        } else {
+                            None
+                        }
+                    }
                 }
             } else {
                 None
