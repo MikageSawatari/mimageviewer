@@ -98,7 +98,7 @@ decoder → audio_rx → audio-pump thread:
 設計判断:
 
 - **plugin process は audio-pump thread で実行する**。cpal RT スレッドではない。
-  bridge IPC roundtrip (~1-2ms) を AudioBuffer の depth (1.5秒) で吸収する。
+  bridge IPC roundtrip (~1-2ms) を AudioBuffer の processed depth (100ms) で吸収する。
 - **enable=false なら処理ゼロオーバーヘッド**。frame をそのまま push。
 - **bridge unload 中も音声は流れる**。ロード前は plugin pass-through (= 何もしない)。
 - **block size は decoder のフレームサイズに依存しない**。bridge 側で variable
@@ -106,7 +106,7 @@ decoder → audio_rx → audio-pump thread:
 
 bridge IPC のレイテンシ実測 (Phase 0b):
 - `set_event` + `wait_event` 1 周: 1-2ms (Windows context switch)
-- 1.5 秒 buffer に対して十分小さい。realtime 維持可能。
+- 100ms buffer に対して十分小さい。realtime 維持可能。
 
 ## 5. プラグイン GUI ホスティング
 

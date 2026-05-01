@@ -167,12 +167,12 @@ forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二
 - ringbuffer 経由で decoder からのサンプルを取り込み
 - AvClock の audio PTS anchor を更新 (内部は `engine::clock::MasterClock` 経由)
 - audio 出力失敗時はクロックを wall-clock fallback に切替
-- 音声バッファ ≥150ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
+- 音声バッファ ≥100ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
   (Phase 8.K で 500ms から下げた、典型的 audio_buf hover 帯に合わせた)
 - VST3 plugin chain 統合 (v0.9.0+): `audio-pump` thread が `audio_rx` から受領した
   AudioFrame を `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた
   処理済みサンプルを ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer
-  1.5s で吸収)
+  processed queue 100ms で吸収)
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want

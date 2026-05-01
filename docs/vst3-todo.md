@@ -49,6 +49,7 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - [x] per-slot `user_hidden` 状態 (= GUI × したものは VST トグルで復活させない)
 - [x] プラグインウィンドウ × も `user_hidden` として記憶 (= パネル GUI × と同じ扱い)
 - [x] 音声 buffer 縮小 (= 1.5s → 300ms、EQ 反映遅延短縮)
+- [x] 音声 buffer 追加縮小 (= 300ms → 150ms → 100ms、refill tick 2ms、ユーザー確認済)
 
 ---
 
@@ -73,6 +74,18 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - LatencyChanged event ハンドリング (flush + anchor reset) は未実装。
   通常は固定 latency なので問題にならない。プラグインモード切替で気になれば後続対応。
 
+### Step 2: 音声 buffer 縮小 (300ms → 100ms) [課題 2] (2026-05-01, 完了)
+- `TARGET_PROCESSED_SECS` を `0.10` に変更。
+  (= post-VST processed queue が EQ / plugin 操作反映遅延の主因)
+- `READY_THRESHOLD_SECS` も `0.10` に変更。
+  (= processed cap を下げた後も Buffering → Playing 条件が満たされるようにする)
+- pump の自律 refill tick を `5ms` → `2ms` に短縮して、低水位追従を速くした。
+- cpal callback 内 IPC は未導入 (= deadline miss リスクを避けるため従来通り P3)。
+- ユーザー確認 (2026-05-01):
+  1. 150ms 版は動作問題なし。ワンテンポ遅れるほどではなくなった。
+  2. 100ms 版でも動作問題なし。反応が少し良くなった。
+  3. Windows / 非 Windows の秒数分岐はノイズになるため削除し、100ms に一本化。
+
 ---
 
 ## 📋 Codex 第 2 弾 回答 → 着手順 (= 次セッションで実装)
@@ -96,10 +109,10 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   4. 直列 2400 + 4800 = 150ms 合算確認
   5. 再生中 latency 変更 → flush/anchor reset 後にジャンプなし
 
-### Step 2 (P1): 音声 buffer 縮小 (300ms → 120-150ms) [課題 2]
-- `TARGET_BUFFER_SECS: 0.3` → `0.12 (Windows) / 0.20 (other)` を提案
+### ~~Step 2 (P1): 音声 buffer 縮小 (300ms → 120-150ms) [課題 2]~~ → ✅ 完了
+- `TARGET_BUFFER_SECS: 0.3` → `0.10` として反映
 - 100ms 未満は実機計測必須、現時点では攻めすぎ
-- pump の sleep 10ms → 2ms に短縮 (= "低水位追従")
+- pump の refill tick 5ms → 2ms に短縮 (= "低水位追従")
 - cpal callback 内 IPC は **P3** (= まだ入れない、deadline miss リスク高)
 - どうしても入れるなら `try_process_block(deadline=2ms)` + bypass fallback
 
@@ -305,7 +318,9 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - 2026-04: ツールバー VST ボタン不要 → 削除
 - 2026-04: z-order 登録順に戻る → snapshot/restore で解消
 - 2026-04: GUI × したものが VST トグルで復活 → user_hidden で解消
-- 2026-04: VST EQ 反映遅延 → buffer 1.5s → 300ms で改善 (さらなる縮小は ⏳)
+- 2026-04: VST EQ 反映遅延 → buffer 1.5s → 300ms で改善
+- 2026-05: VST EQ 反映遅延がまだワンテンポ遅い → 150ms に追加縮小、動作問題なし
+- 2026-05: 150ms は動作問題なし → 100ms に追加縮小、反応改善・動作問題なし
 - 2026-04: パラパラ表示 + チラつき → ⏳ DeferWindowPos 化 Codex 検討中
 - 2026-04: プラグイン × も user_hidden で記憶 → 解消
 - 2026-04: ピーク超過時の挙動 → ⏳ 課題 (Codex に質問中)

@@ -6,7 +6,7 @@
 //!
 //! ## アーキテクチャ
 //! - 別スレッド (`audio-pump`) が `audio_rx` から AudioFrame を取り出し、共有
-//!   ring buffer に push する (バッファ目安 ~1 秒分)。
+//!   ring buffer に push する (バッファ目安 ~100ms 分)。
 //! - `cpal` の出力ストリーム (= `cpal` 内部の RT スレッド) が ring buffer から pop して
 //!   出力バッファに書き込む。バッファ枯渇時は無音で埋める。
 //!
@@ -90,14 +90,14 @@ struct ProcessedChunk {
 
 /// 共有 ring buffer (Mutex 保護)。**raw / processed 2 段構造** (Codex 助言 2026-05)。
 ///
-/// - `raw_pending`: pump が積む pre-VST AudioFrame queue (cap = 10 秒)。Buffering 中も
+/// - `raw_pending`: pump が積む pre-VST AudioFrame queue (cap = 30 秒)。Buffering 中も
 ///   pump が back-pressure せずに処理を続けられるようにするためのバッファ。
-/// - `processed`: post-VST chunk queue (cap = 0.3 秒 audible 相当)。fill_output が drain。
+/// - `processed`: post-VST chunk queue (cap = 0.10 秒 audible 相当)。fill_output が drain。
 ///   ここの長さが **EQ latency = ユーザーの設定変更が音に届くまでの時間**。
 ///
-/// pump は「processed が 0.3 秒未満の間だけ」raw → VST process → processed を実行する。
+/// pump は「processed が target 未満の間だけ」raw → VST process → processed を実行する。
 /// EQ 設定変更後の VST process_block には新しい係数が適用され、processed queue 末尾に
-/// 並んで 0.3 秒以内にスピーカーへ届く。
+/// 並んで 0.10 秒以内にスピーカーへ届く。
 struct AudioBuffer {
     /// post-VST 処理済 chunk queue。fill_output が `drain_offset_in_first` を進めて
     /// drain。chunk が空になったら pop_front + drain_offset_in_first=0 にリセット。
@@ -337,7 +337,7 @@ fn boost_audio_pump_priority() {
 /// 1. audio_rx から `AudioFrame` を受信 (timeout 付き、自律 refill のため)
 /// 2. seek serial 切替時は VST plugin sync reset (= 既存挙動)
 /// 3. raw_pending に push (= cap=30秒 を超えたら overflow)
-/// 4. processed が cap (= 0.3秒) 未満の間、raw → VST process → processed をループ
+/// 4. processed が cap (= 0.10秒) 未満の間、raw → VST process → processed をループ
 /// 5. processed の post-VST audible 秒数で BufferReady emit (= raw を**含めない**)
 ///
 /// **mutex ポリシー** (Codex P2-B): VST IPC (= bridge.process_block) 中は
@@ -347,9 +347,9 @@ fn boost_audio_pump_priority() {
 /// pump の outer loop は `recv_timeout(REFILL_TICK_MS)` で起き、`audio_rx` が空でも
 /// `raw_pending → processed` の補充ループを毎 tick 実行する。これにより cpal が
 /// processed を drain しても、`audio_rx` の到着を待たずに pump 側が processed を
-/// TARGET (= 0.3秒) に保てる。旧設計では outer loop が `recv` で blocking していたため、
+/// TARGET に保てる。旧設計では outer loop が `recv` で blocking していたため、
 /// 1x 再生時に「audio_rx 到着 = ~23ms 間隔」と「cpal drain = ~10ms 間隔」のずれで
-/// processed が 0.3秒周期で枯渇 → cpal silence の繰返しになっていた。
+/// processed が cap 周期で枯渇 → cpal silence の繰返しになっていた。
 fn run_pump(
     rx: Receiver<AudioFrame>,
     shutdown_rx: crossbeam_channel::Receiver<()>,
@@ -369,11 +369,12 @@ fn run_pump(
     let mut fx_out: Vec<f32> = Vec::with_capacity(4096);
 
     // ── processed queue cap (= EQ latency target) ──
-    // EQ 設定変更が音に届くまでの最大時間 = processed 秒数。300ms 目標。
-    const TARGET_PROCESSED_SECS: f64 = 0.3;
+    // EQ 設定変更が音に届くまでの最大時間 = processed 秒数。
+    // VST3 IPC 実測 1-2ms + AboveNormal pump で 100ms を試験する。
+    const TARGET_PROCESSED_SECS: f64 = 0.10;
     // ── BufferReady 閾値 ──
     // Buffering → Playing の遷移トリガ (level event)。
-    const READY_THRESHOLD_SECS: f64 = 0.15;
+    const READY_THRESHOLD_SECS: f64 = 0.10;
     // ── raw_pending overflow / warning ──
     // pump back-pressure を完全に避けるため raw 側は大きく持つが、安全網として上限。
     // 30 秒で overflow (= soft fallback)、15 秒で warning ログ。
@@ -390,8 +391,8 @@ fn run_pump(
     // `recv_timeout` の値。audio_rx が空でも pump をこの間隔で起こし、processed を
     // raw_pending から自律補充する。cpal の典型的な callback 間隔 (10ms) より短く取り、
     // processed underrun を防ぐ。**短すぎ**ると CPU 負荷増、**長すぎ**ると starvation 復活。
-    // 5ms 設定: pump iter は通常 < 1ms、overhead は ~0.5% / sec で許容。
-    const REFILL_TICK_MS: u64 = 5;
+    // 2ms 設定: processed cap を 100ms へ縮めた分、低水位追従を速くする。
+    const REFILL_TICK_MS: u64 = 2;
 
     let sample_rate = buffer.lock().unwrap().sample_rate;
     let samples_per_sec = (sample_rate as f64) * 2.0;
@@ -730,7 +731,7 @@ fn run_pump(
                 continue;
             }
             // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
-            // AAC/Opus 等は 23ms/frame なので通常は cap=300ms に余裕。長い frame
+            // AAC/Opus 等は 23ms/frame なので通常は cap=100ms に余裕。長い frame
             // (= 一部の独自エンコード) では cap を一時的に超える可能性があるので
             // ログだけ出して push する (= 分割は将来課題)。
             let cur_processed_secs: f64 =
