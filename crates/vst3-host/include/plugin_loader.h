@@ -109,6 +109,17 @@ public:
     /// PlugFrame に伝搬し、session 中は `resizeView` の SetWindowPos を抑止する。
     void set_user_resizing(bool active);
 
+    /// プラグイン内部状態 (= EQ カーブ等のパラメータ + chunk) を取得する。
+    /// VST3 `IComponent::getState()` を `MemoryStream` 経由でバイト列に書き出す。
+    /// 戻り値: true=成功 (= `out_bytes` に空でもないバイト列が入る)、false=失敗。
+    bool query_state(std::vector<uint8_t>& out_bytes);
+
+    /// プラグイン内部状態をバイト列から復元する (`IComponent::setState`)。
+    /// `IEditController::setComponentState` も同期で呼んで UI 表示を合わせる。
+    /// 安全のため一時的に `setProcessing(false)` してから復元、終わったら再有効化する。
+    /// 戻り値: true=成功、false=失敗 (= 不正バイト列、setState 拒否)。
+    bool restore_state(const std::vector<uint8_t>& bytes);
+
 private:
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;

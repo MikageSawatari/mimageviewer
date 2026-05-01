@@ -199,15 +199,19 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   idx 一覧) に変更し、App 側 wrapper (`vst3_pump_gui_signals`) で settings.save()
 - 関連: `vst3_gui_visible` (= VST ボタン全体の ON/OFF) は既に永続化されている
 
-### プラグイン内部状態の永続化 (= EQ カーブ等の保存) [P1, 2026-04 ユーザー報告]
-- VST3 `IComponent::getState` / `setState` chunk のシリアライズ
-- 現状: `Vst3PluginEntry::state: Option<String>` フィールドは settings に存在
-  するが **bridge protocol 未実装** (= chunk の query / restore コマンドが無い)
-- 追加が必要なコマンド:
-  - `Cmd::QueryState` → bridge が plugin の getState chunk を base64 で返す
-  - `Cmd::RestoreState { state: String }` → bridge が setState で復元
-- mIV 終了時 / ダイアログ閉じる時に query → settings に保存
-- 起動時 / プラグインロード時に settings から restore
+### ~~プラグイン内部状態の永続化 (= EQ カーブ等の保存)~~ [P1, 2026-04 ユーザー報告] → 🟢 修正済 (2026-05-01)
+- 実装: bridge protocol を拡張 (`Cmd::QueryState` / `Cmd::RestoreState` /
+  `Event::PluginState`) して `IComponent::getState` / `setState` を base64 で
+  IPC する。`MAX_CONTROL_MSG_SIZE` を 64 KB → 4 MB に拡張 (= ML 系 / preset 内蔵
+  plugin の大きい state にも対応)
+- 保存タイミング: `on_exit` (= アプリ終了直前)、VST3 OFF へのトグル直前、
+  チェーン構成変更による rebuild 直前。いずれも snapshot → save の順
+- 復元タイミング: `add_plugin` 内で Loaded event 直後・pre-warm 前に
+  `Cmd::RestoreState` を fire-and-forget 送信 (= warm-up silence 処理時には
+  既に正しい係数で動作 → 初回処理時のクリック軽減)
+- C++ 側: `PluginLoader::query_state` / `restore_state` を `MemoryStream` 経由で
+  実装。`restore_state` は安全のため一時的に `setProcessing(false)` してから
+  `setState` を呼び、終わったら再有効化する
 
 ### 右クリックメニュー即閉じ問題 (SSL Meter Pro) [P1, 既知]
 - bridge 側で plugin child window を `EnumChildWindows` + subclass する案を

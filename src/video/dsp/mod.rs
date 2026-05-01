@@ -405,6 +405,7 @@ impl DspBridge {
         block_size: u32,
         bypass: bool,
         user_hidden: bool,
+        initial_state: Option<&str>,
     ) -> Result<usize, String> {
         // enable 状態チェック (Mutex を保持しない)
         if !self.is_enabled() {
@@ -455,6 +456,23 @@ impl DspBridge {
             sample_rate,
         ));
 
+        // ── 状態の auto-restore (= EQ カーブ / chunk を前回終了時から復元) ──
+        // settings.vst3_plugins[i].state に base64 文字列が保存されていれば bridge
+        // 側で setState する。pre-warm の **前** に流すことで、warm-up 用 silence
+        // 処理時には既に正しいフィルタ係数で動作する (= 初回処理時のクリック軽減)。
+        // fire-and-forget (= ack 不要)、失敗時は bridge が `Event::Error` を発行して
+        // ログに残るので、起動全体は中断しない。
+        if let Some(s) = initial_state {
+            if !s.is_empty() {
+                if let Err(e) = bridge.send(&Cmd::RestoreState { state: s.to_string() }) {
+                    crate::logger::log(format!(
+                        "[VST3] restore_state send failed for '{}': {e} (続行)",
+                        plugin_name,
+                    ));
+                }
+            }
+        }
+
         // ── プラグイン pre-warm: 無音ブロックを数回流し、内部状態 (フィルタ係数の
         //   FTZ 経路 / IIR ステート / 内部 alloc / ページフォルト等) を温める。
         //   これがないと「動画再生開始直後に process_block の応答が遅く、cpal が
@@ -500,6 +518,45 @@ impl DspBridge {
         });
         self.recalc_active_count(&inner);
         Ok(idx)
+    }
+
+    /// 全 Loaded スロットのプラグイン内部状態 (= EQ カーブ / chunk) を順次 query する。
+    /// 戻り値: `(plugin_path, base64_state)` のリスト。失敗した slot は **含めない**
+    /// (= 呼出側は path 検索で既存 state を上書きするだけ、失敗 slot の state は保持される)。
+    ///
+    /// **path をキーにする**: `settings.vst3_plugins` と bridge slots は load 失敗で
+    /// index がズレうるため (Codex P2、2026-05-01)。path 一意性は preferences が保証。
+    ///
+    /// **timeout**: 各 query 1000ms。チェーン上限 10 個で worst case 10 秒。
+    /// shutdown / settings.save 経由で呼ばれるので UI 同期 hot-path には乗らない。
+    /// bypass の slot も query する (= 内部 state はあるので保存対象)。
+    pub fn snapshot_all_plugin_states(&self) -> Vec<(String, String)> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        let bridges: Vec<(String, Arc<Bridge>)> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .filter(|s| matches!(s.state, SlotState::Loaded))
+                .map(|s| (s.plugin_path.clone(), s.bridge.clone()))
+                .collect()
+        };
+        let mut out = Vec::with_capacity(bridges.len());
+        let timeout = std::time::Duration::from_secs(1);
+        for (path, b) in bridges {
+            match b.query_state_sync(timeout) {
+                Ok(state) => out.push((path, state)),
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "[VST3] snapshot_all_plugin_states: query failed for '{}': {e}",
+                        path,
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// シーク時の同期 reset fence (= Codex 助言、2026-05-01):

@@ -100,6 +100,15 @@ pub enum Cmd {
     /// Rust 側 wndproc が `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` を受けて発行する。
     #[serde(rename = "set_user_resizing")]
     SetUserResizing { active: u32 },
+    /// プラグイン内部状態 (= EQ カーブ / chunk) を base64 文字列で取得する。
+    /// 応答は `Event::PluginState`。終了時 / 永続化トリガで一度だけ呼ぶ想定。
+    #[serde(rename = "query_state")]
+    QueryState,
+    /// 起動時の auto-restore: settings.json に保存されていた base64 state を渡し、
+    /// bridge 側で `IComponent::setState` で復元する。fire-and-forget (= ack 無し)。
+    /// 失敗時は bridge 側で `Event::Error` を発行する。
+    #[serde(rename = "restore_state")]
+    RestoreState { state: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,6 +141,8 @@ pub enum Event {
         #[serde(default)]
         resizable: bool,
     },
+    /// `Cmd::QueryState` の応答。プラグイン内部状態を base64 文字列で受け取る。
+    PluginState { state: String },
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
@@ -356,6 +367,36 @@ impl Bridge {
         self.cached_latency_samples.load(Ordering::Acquire)
     }
 
+    /// プラグイン内部状態 (= EQ カーブ / chunk) を base64 文字列で取得する。
+    /// `Cmd::QueryState` を送って `Event::PluginState` を `timeout` 内で待つ。
+    /// 期待外の event (= Error / 旧 reset 等) は **drop してログ** し、期待 event を
+    /// 待ち続ける (= 他の同期 IPC と混線しないが、想定外があれば情報として残す)。
+    /// 戻り値: Ok(state_b64) | Err(原因)。
+    pub fn query_state_sync(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        self.send(&Cmd::QueryState).map_err(|e| format!("send: {e}"))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err("timeout".to_string());
+            }
+            match self.event_rx.recv_timeout(deadline - now) {
+                Ok(Ok(Event::PluginState { state })) => return Ok(state),
+                Ok(Ok(Event::Error { detail })) => return Err(detail),
+                Ok(Ok(other)) => {
+                    crate::logger::log(format!(
+                        "[VST3] query_state: ignored unexpected event: {other:?}"
+                    ));
+                }
+                Ok(Err(e)) => return Err(format!("io: {e}")),
+                Err(_) => return Err("timeout".to_string()),
+            }
+        }
+    }
+
     /// 制御メッセージを送る。
     pub fn send(&self, cmd: &Cmd) -> std::io::Result<()> {
         let payload = serde_json::to_vec(cmd)
@@ -391,7 +432,10 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
     let mut len_buf = [0u8; 4];
     stdout.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 64 * 1024 {
+    // `plugin_state` event の chunk は plugin によって数百 KB になる
+    // (= ML / preset 内蔵 plugin)。C++ 側 `MAX_CONTROL_MSG_SIZE` と揃える。
+    const MAX_CONTROL_MSG_SIZE: usize = 4 * 1024 * 1024;
+    if len > MAX_CONTROL_MSG_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "control message too large",

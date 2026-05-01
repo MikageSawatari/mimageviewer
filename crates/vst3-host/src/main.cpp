@@ -122,6 +122,71 @@ static void send_event_error(const std::string& detail) {
     write_message(msg);
 }
 
+// プラグイン内部状態を IPC で送るための base64 encode/decode (RFC 4648)。
+// 外部依存ライブラリを増やしたくないので最小実装。state チャンクは典型
+// 数 KB - 数十 KB 規模なので速度より簡潔さを優先する。
+static const char kB64Alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64_encode(const std::vector<uint8_t>& bytes) {
+    std::string out;
+    out.reserve(((bytes.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 3 <= bytes.size()) {
+        uint32_t v = (uint32_t(bytes[i]) << 16) |
+                     (uint32_t(bytes[i + 1]) << 8) |
+                     uint32_t(bytes[i + 2]);
+        out.push_back(kB64Alphabet[(v >> 18) & 0x3F]);
+        out.push_back(kB64Alphabet[(v >> 12) & 0x3F]);
+        out.push_back(kB64Alphabet[(v >> 6) & 0x3F]);
+        out.push_back(kB64Alphabet[v & 0x3F]);
+        i += 3;
+    }
+    if (i < bytes.size()) {
+        uint32_t v = uint32_t(bytes[i]) << 16;
+        size_t rem = bytes.size() - i;
+        if (rem == 2) v |= uint32_t(bytes[i + 1]) << 8;
+        out.push_back(kB64Alphabet[(v >> 18) & 0x3F]);
+        out.push_back(kB64Alphabet[(v >> 12) & 0x3F]);
+        out.push_back(rem == 2 ? kB64Alphabet[(v >> 6) & 0x3F] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+static int base64_lookup(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
+    out.clear();
+    out.reserve((in.size() / 4) * 3);
+    uint32_t buf = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            continue;
+        }
+        int v = base64_lookup(c);
+        if (v < 0) {
+            out.clear();
+            return false;
+        }
+        buf = (buf << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    return true;
+}
+
 class Bridge {
 public:
     Bridge() = default;
@@ -352,6 +417,45 @@ private:
             if (!loader_) return true;
             uint64_t active = extract_number_field(msg, "active");
             loader_->set_user_resizing(active != 0);
+            return true;
+        }
+        if (cmd == "query_state") {
+            // プラグイン内部状態 (= EQ カーブ等) を base64 で取得して送り返す。
+            // 親プロセス (mIV) は終了時 / preferences 経由でこれを呼び、
+            // settings.json に永続化する → 次回起動時に restore される。
+            if (!loader_) {
+                send_event_error("query_state: no plugin loaded");
+                return true;
+            }
+            std::vector<uint8_t> bytes;
+            if (!loader_->query_state(bytes)) {
+                send_event_error("query_state: getState failed");
+                return true;
+            }
+            std::string b64 = base64_encode(bytes);
+            std::string reply = "{\"event\":\"plugin_state\",\"state\":\"" + b64 + "\"}";
+            write_message(reply);
+            return true;
+        }
+        if (cmd == "restore_state") {
+            // base64 でエンコードされたプラグイン状態を decode → setState で復元。
+            // 起動直後の auto-restore (= add_plugin 完了後) で使う。
+            // ack は返さない (= 失敗しても起動継続、err は親側でログ確認)。
+            if (!loader_) {
+                send_event_error("restore_state: no plugin loaded");
+                return true;
+            }
+            std::string b64 = extract_string_field(msg, "state");
+            if (b64.empty()) return true;  // 空 state は no-op
+            std::vector<uint8_t> bytes;
+            if (!base64_decode(b64, bytes)) {
+                send_event_error("restore_state: invalid base64");
+                return true;
+            }
+            if (!loader_->restore_state(bytes)) {
+                send_event_error("restore_state: setState failed");
+                return true;
+            }
             return true;
         }
         if (cmd == "close") {

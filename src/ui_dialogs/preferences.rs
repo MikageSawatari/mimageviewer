@@ -548,6 +548,12 @@ impl App {
                         if new_vst3_enabled {
                             self.kick_off_vst3_chain_rebuild();
                         } else {
+                            // VST3 OFF へのトグル: bridge teardown 前に内部状態を保存
+                            // (= 次回 ON 時の復元用)。
+                            let updated = self.snapshot_vst3_states_into_settings();
+                            if updated > 0 {
+                                self.settings.save();
+                            }
                             self.dsp_bridge.disable();
                         }
                     } else if chain_changed && new_vst3_enabled {

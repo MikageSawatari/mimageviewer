@@ -513,6 +513,77 @@ void PluginLoader::reset() {
     process_time_samples_ = 0;
 }
 
+bool PluginLoader::query_state(std::vector<uint8_t>& out_bytes) {
+    out_bytes.clear();
+    if (!component_) return false;
+    Steinberg::MemoryStream stream;
+    if (component_->getState(&stream) != Steinberg::kResultOk) {
+        return false;
+    }
+    Steinberg::TSize size = stream.getSize();
+    if (size <= 0) {
+        return true;  // 空 state も "成功" (= デフォルト)
+    }
+    out_bytes.resize(static_cast<size_t>(size));
+    Steinberg::int64 zero_pos = 0;
+    if (stream.seek(0, Steinberg::IBStream::kIBSeekSet, &zero_pos) != Steinberg::kResultOk) {
+        out_bytes.clear();
+        return false;
+    }
+    Steinberg::int32 num_read = 0;
+    if (stream.read(out_bytes.data(),
+                    static_cast<Steinberg::int32>(size),
+                    &num_read) != Steinberg::kResultOk) {
+        out_bytes.clear();
+        return false;
+    }
+    out_bytes.resize(static_cast<size_t>(num_read));
+    return true;
+}
+
+bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
+    if (!component_ || bytes.empty()) return false;
+    // MemoryStream にバイト列を書き込む (= 終端後、再度先頭にシークしてから setState)。
+    Steinberg::MemoryStream stream;
+    Steinberg::int32 written = 0;
+    // VST3 SDK の MemoryStream::write は `void*` を取るので const_cast が必要。
+    // 中身はコピーされるので呼出側のバイト列は不変。
+    if (stream.write(const_cast<uint8_t*>(bytes.data()),
+                     static_cast<Steinberg::int32>(bytes.size()),
+                     &written) != Steinberg::kResultOk) {
+        return false;
+    }
+    Steinberg::int64 zero_pos = 0;
+    if (stream.seek(0, Steinberg::IBStream::kIBSeekSet, &zero_pos) != Steinberg::kResultOk) {
+        return false;
+    }
+    // setState 中の audio 処理クリック対策: 一時的に setProcessing(false) で停止する。
+    // VST3 仕様上 setState は active でも許可されているが、内部状態の途中書換による
+    // 1 ブロック分のクリックを避けるため。
+    bool was_processing = active_;
+    if (was_processing && processor_) {
+        processor_->setProcessing(false);
+    }
+    auto setres = component_->setState(&stream);
+    if (setres != Steinberg::kResultOk) {
+        if (was_processing && processor_) {
+            processor_->setProcessing(true);
+        }
+        return false;
+    }
+    // controller 側にも同じ state を流して UI 表示と整合させる。
+    if (controller_) {
+        Steinberg::int64 zero2 = 0;
+        if (stream.seek(0, Steinberg::IBStream::kIBSeekSet, &zero2) == Steinberg::kResultOk) {
+            controller_->setComponentState(&stream);
+        }
+    }
+    if (was_processing && processor_) {
+        processor_->setProcessing(true);
+    }
+    return true;
+}
+
 void PluginLoader::flush_with_silence(uint32_t num_samples) {
     if (!processor_ || num_samples == 0) return;
     // process_block の上限 (= setupProcessing 時の maxSamplesPerBlock)。
