@@ -133,6 +133,26 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 
 ## 📋 Codex 回答外 / Future Work
 
+### Buffering 中の audio 先行 decode 制限 [P2, Codex 2026-05-01]
+- 現状: raw_pending cap=30 秒の safety margin で凌ぐ (`34b877e`)
+- 構造的問題: engine_state gate active 中 (= Buffering) は fill_output 非 drain
+  → pump は raw_pending に積み続ける → audio decoder の生成速度 ~23x real-time で
+  Buffering 1 秒あたり 23 秒分の raw が積まれる
+- 30 秒 cap でも Buffering > 1.3 秒 wall で overflow 可能 (= AV1 long GOP / 高負荷時)
+- overflow_for_serial が発動するとその seek 世代では音声が復帰しない設計のため、
+  本来は overflow を「稀な非常時」に抑える必要あり
+- **根本対策の選択肢** (Codex 助言):
+  1. **back-pressure**: pump's `recv from audio_rx` に raw_pending soft cap
+     (= 5 秒等) を入れる。raw 超過時 pump 待機 → audio_tx (0.7秒) → audio_pkt_tx
+     (5.9秒) → demux で頭打ち。Buffering 11.6 秒 wall まで対応可能だが、それを
+     超えると demux 詰まりで video 飢餓のリスク
+  2. **同一 serial 内 re-arm**: overflow 後も fill_output が drain 始めたら
+     overflow_for_serial を解除して pump 再開
+  3. **audio decoder 速度制限**: audio decode thread を audio decoder 単位で
+     throttle (= ProcessSetup mode 切替 / packet read pacing)
+- 関連: `src/video/audio.rs::run_pump`, `RAW_OVERFLOW_SECS`, `RAW_WARNING_SECS`
+- 検証: HW D3D11VA H264 動画で `raw_pending high water` ログが頻発するか観察
+
 ### シーク後の post-seek pre-roll discard [P3, Codex P2-3, 2026-05-01]
 - 現状: シーク時に bridge audio thread が `flush_with_silence(latency)` で plugin
   delay-line を silence で埋める → pre-seek 残留は解消
