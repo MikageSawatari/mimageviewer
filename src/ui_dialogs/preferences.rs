@@ -217,6 +217,9 @@ pub(crate) struct PreferencesState {
     pub vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
     /// VST3 ページ内のフィルタ文字列。
     pub vst3_filter: String,
+    /// Instrument 系 (= MIDI 入力で発音するもの) も候補一覧に表示する。
+    #[cfg(windows)]
+    pub vst3_show_instruments: bool,
     /// 現在 auto-bypass されているスロットのスナップショット (= 名前, latency_ms)。
     /// VST3 ページ下部の赤字警告表示用。`show_preferences_dialog` の頭で
     /// `dsp_bridge` から毎フレーム refresh される (= ON/OFF が即座に反映)。
@@ -285,6 +288,8 @@ impl PreferencesState {
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_filter: String::new(),
+            #[cfg(windows)]
+            vst3_show_instruments: false,
             #[cfg(windows)]
             vst3_auto_bypassed: Vec::new(),
         }
@@ -1752,10 +1757,29 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 crate::video::dsp::scan(&crate::video::dsp::default_vst3_paths());
         }
         if !state.vst3_discovered.is_empty() {
+            let hidden_instruments = state
+                .vst3_discovered
+                .iter()
+                .filter(|p| p.is_instrument)
+                .count();
             ui.label(
-                egui::RichText::new(format!("({} 個検出)", state.vst3_discovered.len()))
-                    .small()
-                    .weak(),
+                egui::RichText::new(if hidden_instruments > 0 && !state.vst3_show_instruments {
+                    format!(
+                        "({} 個検出 / Instrument {} 個は非表示)",
+                        state.vst3_discovered.len(),
+                        hidden_instruments
+                    )
+                } else if hidden_instruments > 0 {
+                    format!(
+                        "({} 個検出 / Instrument {} 個を含む)",
+                        state.vst3_discovered.len(),
+                        hidden_instruments
+                    )
+                } else {
+                    format!("({} 個検出)", state.vst3_discovered.len())
+                })
+                .small()
+                .weak(),
             );
         }
         let chain_full = state.settings.vst3_plugins.len() >= MAX_CHAIN_LEN;
@@ -1776,6 +1800,15 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .desired_width(f32::INFINITY),
         );
     });
+    if state.vst3_discovered.iter().any(|p| p.is_instrument) {
+        ui.checkbox(
+            &mut state.vst3_show_instruments,
+            "Instrument 系も表示",
+        )
+        .on_hover_text(
+            "MIDI 入力で発音するシンセ等も候補に表示します。通常の動画音声処理では Effect 系だけを使います。",
+        );
+    }
     ui.add_space(2.0);
 
     if state.vst3_discovered.is_empty() {
@@ -1795,13 +1828,17 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .iter()
         .map(|e| e.path.clone())
         .collect();
+    let available_height = ui.available_height().max(120.0);
     let mut clicked_add: Option<String> = None;
     egui::ScrollArea::vertical()
         .id_salt("vst3-pref-page-picker-scroll")
-        .max_height(220.0)
+        .max_height(available_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for plugin in &state.vst3_discovered {
+                if plugin.is_instrument && !state.vst3_show_instruments {
+                    continue;
+                }
                 let path_s = plugin.path.to_string_lossy().to_string();
                 let already_in_chain = existing.contains(&path_s);
                 if !filter_lower.is_empty()
