@@ -35,6 +35,22 @@ HWND g_plugin_mouse_hook_host_hwnd = nullptr;
 constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContainer";
 
 LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_ACTIVATEAPP) {
+        blog("bridge container WM_ACTIVATEAPP active=%d", wparam != FALSE ? 1 : 0);
+    }
+    if (msg == WM_ACTIVATEAPP && wparam == FALSE) {
+        // When another application becomes foreground, immediately drop the
+        // bridge-owned plugin surface out of the topmost band. The Rust side
+        // will restore the desired topmost state when mIV/bridge becomes
+        // foreground again.
+        SetWindowPos(hwnd,
+                     HWND_BOTTOM,
+                     0,
+                     0,
+                     0,
+                     0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
@@ -1082,6 +1098,9 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
     if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
         container_hwnd && IsWindow(container_hwnd)) {
         ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (visible && gui_app_active_) {
+            refresh_gui_surface(container_hwnd);
+        }
     }
     blog("show_gui done visible=%d", visible ? 1 : 0);
     return true;
@@ -1091,6 +1110,31 @@ void PluginLoader::set_user_resizing(bool active) {
     if (plug_frame_) {
         plug_frame_->set_user_resizing(active);
     }
+}
+
+void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
+    HWND container_hwnd = reinterpret_cast<HWND>(container_hwnd_ptr);
+    if (!container_hwnd || !IsWindow(container_hwnd)) {
+        return;
+    }
+    if (view_attached_ && view_) {
+        RECT client{};
+        if (GetClientRect(container_hwnd, &client)) {
+            const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
+            const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
+            Steinberg::ViewRect rect{0,
+                                     0,
+                                     static_cast<Steinberg::int32>(width),
+                                     static_cast<Steinberg::int32>(height)};
+            view_->onSize(&rect);
+            last_gui_width_ = width;
+            last_gui_height_ = height;
+        }
+    }
+    RedrawWindow(container_hwnd,
+                 nullptr,
+                 nullptr,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
 }
 
 void PluginLoader::set_gui_visible(bool visible) {
@@ -1110,6 +1154,9 @@ void PluginLoader::set_gui_visible(bool visible) {
             }
         }
         ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNA : SW_HIDE);
+        if (visible && gui_app_active_) {
+            refresh_gui_surface(container_hwnd);
+        }
         blog("set_gui_visible: bridge surface hwnd=0x%llx visible=%d",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
              visible ? 1 : 0);
@@ -1140,8 +1187,7 @@ void PluginLoader::set_gui_app_active(bool active) {
     gui_app_active_ = active;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
-        const bool show_surface = gui_surface_visible_ && gui_app_active_;
-        if (show_surface) {
+        if (gui_surface_visible_ && gui_app_active_) {
             RECT rect{};
             if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
                 SetWindowPos(container_hwnd,
@@ -1152,12 +1198,27 @@ void PluginLoader::set_gui_app_active(bool active) {
                              std::max<LONG>(1, rect.bottom - rect.top),
                              SWP_NOZORDER | SWP_NOACTIVATE);
             }
+            ShowWindow(container_hwnd, SW_SHOWNA);
+            refresh_gui_surface(container_hwnd);
+        } else if (gui_surface_visible_) {
+            // Do not hide here: several D3D-backed plugin editors repaint as a
+            // blank surface after repeated ShowWindow(SW_HIDE/SW_SHOWNA). It is
+            // enough to leave the topmost band and drop behind the foreground
+            // application.
+            SetWindowPos(container_hwnd,
+                         HWND_BOTTOM,
+                         0,
+                         0,
+                         0,
+                         0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else {
+            ShowWindow(container_hwnd, SW_HIDE);
         }
-        ShowWindow(container_hwnd, show_surface ? SW_SHOWNA : SW_HIDE);
-        blog("set_gui_app_active: bridge surface hwnd=0x%llx active=%d show=%d",
+        blog("set_gui_app_active: bridge surface hwnd=0x%llx active=%d visible=%d",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
              active ? 1 : 0,
-             show_surface ? 1 : 0);
+             gui_surface_visible_ ? 1 : 0);
         return;
     }
     blog("set_gui_app_active: no bridge surface active=%d", active ? 1 : 0);

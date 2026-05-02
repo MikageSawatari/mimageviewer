@@ -96,6 +96,9 @@ pub struct DspBridge {
     /// 適用する。これにより fullscreen 中に後から作った HWND にも TOPMOST が
     /// 自動適用される (Codex P3 不具合 3 対応)。
     gui_topmost_desired: AtomicBool,
+    /// Bridge-owned plugin surfaces should stay above the video only while
+    /// mIV itself or one of its VST bridge processes is foreground.
+    gui_app_active_effective: AtomicBool,
     /// audio output の sample_rate (= cpal 出力レート)。`add_plugin` の 1 回目で
     /// 設定される (= 全 slot 同一)。UI で latency を ms 表示する際に使う。
     /// 0 = 未設定 (= プラグイン未追加状態)。
@@ -182,6 +185,7 @@ impl DspBridge {
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             gui_topmost_desired: AtomicBool::new(false),
+            gui_app_active_effective: AtomicBool::new(true),
             sample_rate: AtomicU32::new(0),
         })
     }
@@ -190,6 +194,40 @@ impl DspBridge {
     /// プラグイン latency を ms に変換する際の分母として使う。
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate.load(Ordering::Acquire)
+    }
+
+    #[cfg(windows)]
+    fn foreground_belongs_to_miv_or_bridge(&self) -> bool {
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+
+        let mut foreground_pid = 0_u32;
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return true;
+            }
+            let _ = GetWindowThreadProcessId(hwnd, Some(&mut foreground_pid));
+            if foreground_pid == 0 {
+                return true;
+            }
+            if foreground_pid == GetCurrentProcessId() {
+                return true;
+            }
+        }
+
+        let bridge_pids: Vec<u32> = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.iter().map(|s| s.bridge.process_id()).collect()
+        };
+        bridge_pids.contains(&foreground_pid)
+    }
+
+    #[cfg(not(windows))]
+    fn foreground_belongs_to_miv_or_bridge(&self) -> bool {
+        true
     }
 
     /// `audio-pump` スレッドからのホットパスチェック。Mutex を取らない。
@@ -1304,7 +1342,13 @@ impl DspBridge {
             }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
-        if let Some(active) = app_active_latest {
+        let foreground_active = self.foreground_belongs_to_miv_or_bridge();
+        let active = if cfg!(windows) {
+            foreground_active
+        } else {
+            app_active_latest.unwrap_or(foreground_active)
+        };
+        if self.gui_app_active_effective.swap(active, Ordering::AcqRel) != active {
             self.set_all_guis_app_active(active);
         }
         for (idx, w, h) in resize_targets {

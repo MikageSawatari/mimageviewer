@@ -266,6 +266,10 @@ unsafe impl Send for EventHandle {}
 unsafe impl Sync for EventHandle {}
 
 impl Bridge {
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     /// bridge exe を子プロセスとして起動する。
     /// `stderr_cb` は bridge プロセスの stderr に書かれた 1 行を受け取るコールバック。
     /// tester 側はこれを使ってログファイルにブリッジの内部状態 (show_gui の各ステップ等)

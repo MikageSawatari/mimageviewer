@@ -153,6 +153,7 @@ public:
 private:
     void install_child_focus_hooks(void* host_hwnd);
     void remove_child_focus_hooks();
+    void refresh_gui_surface(void* container_hwnd);
 
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
