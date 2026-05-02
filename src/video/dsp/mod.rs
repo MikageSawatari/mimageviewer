@@ -21,9 +21,10 @@ pub mod scanner;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub use bridge::{Bridge, Cmd, Event};
-pub use scanner::{DiscoveredPlugin, default_vst3_paths, scan};
+pub use scanner::{DiscoveredPlugin, default_vst3_paths, scan, scan_with_audio_probe};
 
 /// PDC (Plugin Delay Compensation) で許容する最大遅延 (秒)。
 ///
@@ -156,6 +157,10 @@ pub(crate) struct PluginSlot {
     pub gui_close_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
     /// ホストウィンドウのリサイズシグナル。
     pub gui_resize_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
+    /// Latest host-window resize waiting for throttled notify_host_resize delivery.
+    pub pending_resize_notify: Option<(u32, u32)>,
+    /// Last notify_host_resize send time for this slot.
+    pub last_resize_notify: Option<Instant>,
     /// ホストウィンドウの WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE シグナル
     /// (= ユーザー drag による resize/move session 開始 / 終了、Codex P4 対応)。
     pub gui_resize_session_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
@@ -503,6 +508,8 @@ impl DspBridge {
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
+            pending_resize_notify: None,
+            last_resize_notify: None,
             gui_resize_session_signal: None,
         });
         self.recalc_active_count(&inner);
@@ -821,6 +828,8 @@ impl DspBridge {
             slot.gui_host = Some(gui_host);
             slot.gui_close_signal = Some(reply.close_signal);
             slot.gui_resize_signal = Some(reply.resize_signal);
+            slot.pending_resize_notify = None;
+            slot.last_resize_notify = None;
             slot.gui_resize_session_signal = Some(reply.resize_session_signal);
         }
         drop(inner);
@@ -923,26 +932,51 @@ impl DspBridge {
         } else {
             // ── show 経路: 全 SW_SHOWNA → snapshot 順序で z-order 復元 ──
             // user_hidden=true のスロットは飛ばす。
+            enum ShowAction {
+                Skip,
+                BatchExisting(u64),
+                Create,
+            }
+
             let n = {
                 let inner = self.inner.lock().unwrap();
                 inner.slots.len()
             };
             let mut shown_hwnds: Vec<u64> = Vec::with_capacity(n);
             for idx in 0..n {
-                let user_hidden = {
-                    let inner = self.inner.lock().unwrap();
-                    inner.slots.get(idx).map(|s| s.user_hidden).unwrap_or(false)
+                let action = {
+                    let mut inner = self.inner.lock().unwrap();
+                    match inner.slots.get_mut(idx) {
+                        Some(slot)
+                            if !slot.user_hidden && matches!(slot.state, SlotState::Loaded) =>
+                        {
+                            if slot.gui_hwnd != 0 {
+                                // Existing HWNDs are shown only by the final DeferWindowPos batch,
+                                // avoiding a visible intermediate z-order before restoration.
+                                slot.gui_visible = true;
+                                slot.user_hidden = false;
+                                ShowAction::BatchExisting(slot.gui_hwnd)
+                            } else {
+                                ShowAction::Create
+                            }
+                        }
+                        _ => ShowAction::Skip,
+                    }
                 };
-                if user_hidden {
-                    continue;
-                }
-                let _ = self.show_slot_gui(idx);
-                let hwnd = {
-                    let inner = self.inner.lock().unwrap();
-                    inner.slots.get(idx).map(|s| s.gui_hwnd).unwrap_or(0)
-                };
-                if hwnd != 0 {
-                    shown_hwnds.push(hwnd);
+
+                match action {
+                    ShowAction::Skip => {}
+                    ShowAction::BatchExisting(hwnd) => shown_hwnds.push(hwnd),
+                    ShowAction::Create => {
+                        let _ = self.show_slot_gui(idx);
+                        let hwnd = {
+                            let inner = self.inner.lock().unwrap();
+                            inner.slots.get(idx).map(|s| s.gui_hwnd).unwrap_or(0)
+                        };
+                        if hwnd != 0 {
+                            shown_hwnds.push(hwnd);
+                        }
+                    }
                 }
             }
             // ── z-order 復元: snapshot を bottom-to-top で SetWindowPos ──
@@ -953,11 +987,18 @@ impl DspBridge {
                 inner.last_z_order_snapshot.clone()
             };
             let shown_set: std::collections::HashSet<u64> = shown_hwnds.iter().copied().collect();
-            for hwnd in snapshot.iter().rev() {
-                if shown_set.contains(hwnd) {
-                    let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-                    gui::set_window_topmost(*hwnd, topmost);
+            let mut restore_order: Vec<u64> = snapshot
+                .into_iter()
+                .filter(|hwnd| shown_set.contains(hwnd))
+                .collect();
+            for hwnd in shown_hwnds {
+                if !restore_order.contains(&hwnd) {
+                    restore_order.push(hwnd);
                 }
+            }
+            if !restore_order.is_empty() {
+                let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
+                gui::show_windows_in_z_order(&restore_order, topmost);
             }
         }
     }
@@ -1034,9 +1075,11 @@ impl DspBridge {
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
         let mut session_targets: Vec<(usize, bool)> = Vec::new();
+        let now = Instant::now();
+        let resize_interval = Duration::from_millis(33);
         {
-            let inner = self.inner.lock().unwrap();
-            for (idx, slot) in inner.slots.iter().enumerate() {
+            let mut inner = self.inner.lock().unwrap();
+            for (idx, slot) in inner.slots.iter_mut().enumerate() {
                 if let Some(arc) = slot.gui_close_signal.as_ref() {
                     if let Ok(guard) = arc.lock() {
                         if let Some(rx) = guard.as_ref() {
@@ -1055,10 +1098,21 @@ impl DspBridge {
                             while let Ok(size) = rx.try_recv() {
                                 latest = Some(size);
                             }
-                            if let Some((w, h)) = latest {
-                                resize_targets.push((idx, w, h));
+                            if let Some(size) = latest {
+                                slot.pending_resize_notify = Some(size);
                             }
                         }
+                    }
+                }
+                if let Some((w, h)) = slot.pending_resize_notify {
+                    let ready = slot
+                        .last_resize_notify
+                        .map(|last| now.duration_since(last) >= resize_interval)
+                        .unwrap_or(true);
+                    if ready {
+                        slot.pending_resize_notify = None;
+                        slot.last_resize_notify = Some(now);
+                        resize_targets.push((idx, w, h));
                     }
                 }
                 if let Some(arc) = slot.gui_resize_session_signal.as_ref() {

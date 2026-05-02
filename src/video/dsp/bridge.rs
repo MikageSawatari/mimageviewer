@@ -75,6 +75,11 @@ pub enum Cmd {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
     },
+    /// プラグインを短時間だけロードし、audio/event bus 数を取得する。
+    /// 環境設定のスキャンで「音声入力を受け取れない VST3」を候補から外すために使う。
+    Probe {
+        plugin_path: String,
+    },
     /// シーク等で plugin の内部状態を flush する。`reset_id` は generation ID で、
     /// stale ack race を防ぐ (= timeout した過去 reset の ack が次回成功と誤認されない)。
     /// bridge は `Event::ResetDone { reset_id }` で同じ ID を返す。
@@ -141,6 +146,16 @@ pub enum Event {
     Loaded {
         plugin_name: String,
         latency_samples: u32,
+    },
+    Probed {
+        plugin_name: String,
+        audio_input_buses: u32,
+        audio_output_buses: u32,
+        event_input_buses: u32,
+        event_output_buses: u32,
+        audio_input_channels: u32,
+        audio_output_channels: u32,
+        usable_audio_effect: bool,
     },
     LatencyChanged {
         latency_samples: u32,
@@ -445,6 +460,23 @@ impl Bridge {
         match self.event_rx.recv() {
             Ok(result) => result,
             Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "event channel disconnected (bridge process likely exited)",
+            )),
+        }
+    }
+
+    /// イベントを timeout 付きで 1 つ受信する。
+    /// VST3 probe のように壊れたプラグインを短時間だけ開く用途で、子プロセスが
+    /// 応答しない場合に UI 側 worker を永久待ちにしないための helper。
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> std::io::Result<Event> {
+        match self.event_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "bridge event timeout",
+            )),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "event channel disconnected (bridge process likely exited)",
             )),

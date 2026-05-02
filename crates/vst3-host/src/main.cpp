@@ -278,6 +278,13 @@ private:
                 }
                 cmd_msg = std::move(cmd_queue_.front());
                 cmd_queue_.pop_front();
+                if (extract_string_field(cmd_msg, "cmd") == "notify_host_resize") {
+                    while (!cmd_queue_.empty() &&
+                           extract_string_field(cmd_queue_.front(), "cmd") == "notify_host_resize") {
+                        cmd_msg = std::move(cmd_queue_.front());
+                        cmd_queue_.pop_front();
+                    }
+                }
             }
             if (!handle_message(cmd_msg)) {
                 running_ = false;
@@ -326,6 +333,38 @@ private:
         }
         if (cmd == "open") {
             return handle_open(msg);
+        }
+        if (cmd == "probe") {
+            std::string plugin_path = extract_string_field(msg, "plugin_path");
+            if (plugin_path.empty()) {
+                send_event_error("probe: plugin_path missing");
+                return true;
+            }
+            PluginProbeInfo info;
+            std::string err;
+            if (!PluginLoader::probe(plugin_path, info, err)) {
+                send_event_error("probe: " + err);
+                return true;
+            }
+            std::string reply = "{\"event\":\"probed\",\"plugin_name\":\"" +
+                                json_escape(info.plugin_name) +
+                                "\",\"audio_input_buses\":" +
+                                std::to_string(info.audio_input_buses) +
+                                ",\"audio_output_buses\":" +
+                                std::to_string(info.audio_output_buses) +
+                                ",\"event_input_buses\":" +
+                                std::to_string(info.event_input_buses) +
+                                ",\"event_output_buses\":" +
+                                std::to_string(info.event_output_buses) +
+                                ",\"audio_input_channels\":" +
+                                std::to_string(info.audio_input_channels) +
+                                ",\"audio_output_channels\":" +
+                                std::to_string(info.audio_output_channels) +
+                                ",\"usable_audio_effect\":" +
+                                (info.usable_audio_effect ? "true" : "false") +
+                                "}";
+            write_message(reply);
+            return true;
         }
         if (cmd == "reset") {
             // JSON から reset_id を取得 (= 旧 protocol で reset_id 無しの場合は 0)。

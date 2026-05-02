@@ -116,19 +116,21 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - cpal callback 内 IPC は **P3** (= まだ入れない、deadline miss リスク高)
 - どうしても入れるなら `try_process_block(deadline=2ms)` + bypass fallback
 
-### Step 3 (P2): リサイズ latest-only coalescing [課題 5]
+### Step 3 (P2): リサイズ latest-only coalescing [課題 5] → ✅ 完了 (2026-05-02)
 - **bridge 側**: `notify_host_resize` を pending に入れて control loop で 1 tick 1 回 onSize
   (= 古い notify を消化しない、Bitwig 並みのレスポンス)
 - **mIV 側**: `last_resize_notify` で 33ms throttle (= 30fps)
 - WM_ENTERSIZEMOVE 中の no-notify は drag 中追従止まるので非推奨
 - ack 方式は実装コスト大、まずは latest-only + throttle で十分
 
-### Step 4 (P1): GUI 一括表示の `DeferWindowPos` 化 [課題 1]
+### Step 4 (P1): GUI 一括表示の `DeferWindowPos` 化 [課題 1] → ✅ 完了 (2026-05-02)
 - `gui.rs` に `show_windows_in_z_order` helper 新設
 - `BeginDeferWindowPos` + `DeferWindowPos(SWP_SHOWWINDOW | SWP_NOACTIVATE | ...)`
   + `EndDeferWindowPos` で **show + z-order を 1 batch にアトミック化**
 - snapshot HWND を bottom-to-top で積む → 最後の HWND が最前面
 - `set_all_guis_visible(true)` 経路で snapshot HWND を優先して使う
+- 既存 HWND の再表示では個別 `ShowWindow` を呼ばず、最終 batch のみで表示する
+- VST ホストウィンドウに `DWMWA_TRANSITIONS_FORCEDISABLED` を適用し、OS フェードを best-effort で抑制
 - fallback は bottom-to-top の個別 SetWindowPos
 
 ### Step 5 (P2): peak indicator [課題 4]
@@ -188,26 +190,24 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   - もしくはユーザーに通知 (= 「plugin が応答しない」warning UI)
 - 現在は 2 秒 timeout で実用的にはほぼ起きない設計
 
-### VST Instrument (MIDI 入力) を一覧から除外する [P2, 2026-04 ユーザー報告]
+### ~~VST Instrument / 音声入力なし plugin を一覧から除外する~~ [P2, 2026-04 ユーザー報告] → 🟢 修正済 (2026-05-02)
 - 症状: 検出済プラグイン一覧に Instrument 系 (= MIDI 入力で音を生成するシンセ) も
   混在している。mIV は MIDI 入力経路を持たず Effect (音声入力→音声出力) のみ
   使えるので、Instrument を出しても無駄に選択肢が増えるだけ
-- VST3 SDK では `IPluginFactory2::PClassInfo2.category` または `PClassInfoW.category`
-  を見れば判別可能:
-  - Effect: `kVstAudioEffectClass` (= "Audio Module Class")。`subCategories` に
-    "Fx" 系のキーワードが入る (例: "Fx|EQ", "Fx|Dynamics", "Fx|Spatial" 等)
-  - Instrument: 同じ `kVstAudioEffectClass` だが `subCategories` に "Instrument"
-    系 (例: "Instrument|Synth", "Instrument|Sampler", "Instrument|Drum") が入る
-- 修正案:
-  - `crates/vst3-host/src/plugin_loader.cpp` (もしくは scanner) で classInfo の
-    subCategories を読み、"Instrument" を含むものに `is_instrument: bool` フラグ
-  - mIV 側 `DiscoveredPlugin` 構造体に `is_instrument: bool` を追加して
-    scanner result に渡す
-  - 環境設定 VST3 プラグインページで Instrument 系をデフォルト非表示
-    (= 「Instrument も表示」チェックボックスを設けて opt-in にしてもよい)
+- 実装:
+  - bridge subprocess の `probe` コマンドで `IComponent::getBusCount`
+    (`kAudio` input/output, `kEvent` input/output) と `getBusInfo` の channelCount を取得
+  - mIV で通常候補に出す条件は **audio input bus > 0 && audio output bus > 0**
+  - 同一 bundle 内に複数 class がある場合は、audio input/output を持つ class を優先採用
+  - Instrument / MIDI FX / 音声入力なし plugin はデフォルト非表示。必要なら
+    「音声入力なしのプラグインも表示」で opt-in
+  - probe error / timeout / crash は一覧に `(error)` として表示するが追加ボタンは disabled。
+    認証が必要な VST3 は他 DAW で一度認証してから再スキャンしてもらう方針
+  - scan/probe は環境設定 UI thread ではなく worker thread で実行し、probe は最大4並列
+    (= plugin crash / hang は個別 bridge subprocess drop で隔離)
 - 関連ファイル:
   - `crates/vst3-host/src/main.cpp` (= scan コマンド or load 時の応答)
-  - `src/video/dsp/scanner.rs` (= DiscoveredPlugin に is_instrument 追加)
+  - `src/video/dsp/scanner.rs` (= DiscoveredPlugin に bus probe 結果を追加)
   - `src/ui_dialogs/preferences.rs` の `page_vst3()` (= フィルタ追加)
 
 ### 環境設定 VST3 プラグインページ: 検出済プラグイン一覧のスクロールエリアが正しく拡張されない [P2, 2026-04 ユーザー報告]
@@ -321,11 +321,11 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - 2026-04: VST EQ 反映遅延 → buffer 1.5s → 300ms で改善
 - 2026-05: VST EQ 反映遅延がまだワンテンポ遅い → 150ms に追加縮小、動作問題なし
 - 2026-05: 150ms は動作問題なし → 100ms に追加縮小、反応改善・動作問題なし
-- 2026-04: パラパラ表示 + チラつき → ⏳ DeferWindowPos 化 Codex 検討中
+- 2026-04: パラパラ表示 + チラつき → ✅ DeferWindowPos 化 + 個別 ShowWindow 回避 + DWM transition 抑制で改善
 - 2026-04: プラグイン × も user_hidden で記憶 → 解消
 - 2026-04: ピーク超過時の挙動 → ⏳ 課題 (Codex に質問中)
 - 2026-04: プラグイン内部状態未保存 → 📋 未着手 (= bridge protocol 拡張要)
-- 2026-04: Insight2 リサイズで「バッファに詰まった更新を再生」挙動 → ⏳ 課題 5
+- 2026-04: Insight2 リサイズで「バッファに詰まった更新を再生」挙動 → ✅ latest-only + throttle で改善
   (Bitwig 比較で発覚、throttle / back-pressure 検討)
 
 ---
