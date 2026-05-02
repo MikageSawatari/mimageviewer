@@ -182,6 +182,8 @@ pub(crate) struct ScannedDir {
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     let mut folders: Vec<(GridItem, Option<(i64, i64)>)> = Vec::new();
     let mut all_media: Vec<(PathBuf, bool, i64, i64)> = Vec::new();
+    let mut entry_file_names_ci: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     let Ok(entries) = std::fs::read_dir(path) else {
         return ScannedDir { folders, all_media };
@@ -190,8 +192,12 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
         // file_type() は FindFirstFile のキャッシュ読み (syscall なし)。
         // metadata() も同様にキャッシュから返るが、失敗しても fallback 0 で続行する。
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
         let p = entry.path();
         if is_dir {
+            if crate::video::upscale::paths::has_work_dir_suffix(&p) {
+                continue;
+            }
             let meta = entry.metadata().ok();
             let mtime = meta
                 .as_ref()
@@ -227,7 +233,73 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
             }
         }
     }
+    filter_upscaled_video_pairs_fast(&mut all_media, &entry_file_names_ci);
     ScannedDir { folders, all_media }
+}
+
+fn filter_upscaled_video_pairs_fast(
+    all_media: &mut Vec<(PathBuf, bool, i64, i64)>,
+    entry_file_names_ci: &std::collections::HashSet<String>,
+) {
+    let mut source_stem_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (path, is_video, _, _) in all_media.iter() {
+        if !*is_video || is_miv_upscaled_derivative(path) {
+            continue;
+        }
+        if let Some(stem) = file_stem_ci(path) {
+            *source_stem_counts.entry(stem).or_insert(0) += 1;
+        }
+    }
+
+    let derivative_source_stems: std::collections::HashSet<String> = all_media
+        .iter()
+        .filter(|(_, is_video, _, _)| *is_video)
+        .filter_map(|(path, _, _, _)| {
+            source_stem_for_miv_upscaled_derivative(path, entry_file_names_ci)
+        })
+        .filter(|source_stem| source_stem_counts.get(source_stem).copied() == Some(1))
+        .collect();
+
+    if derivative_source_stems.is_empty() {
+        return;
+    }
+
+    all_media.retain(|(path, _, _, _)| {
+        if is_miv_upscaled_derivative(path) {
+            return true;
+        }
+        file_stem_ci(path).is_none_or(|stem| !derivative_source_stems.contains(&stem))
+    });
+}
+
+fn is_miv_upscaled_derivative(path: &std::path::Path) -> bool {
+    // Fast UI-path check: a `.miv.mkv` name marks an upscaled derivative visually.
+    // Pairing/hiding stays stricter and also requires the sibling `.miv.json`.
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_lowercase().ends_with(".miv.mkv"))
+}
+
+fn source_stem_for_miv_upscaled_derivative(
+    path: &std::path::Path,
+    entry_file_names_ci: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let file_name = path.file_name()?.to_string_lossy().to_lowercase();
+    let source_stem = file_name.strip_suffix(".miv.mkv")?;
+    if source_stem.is_empty() {
+        return None;
+    }
+    let sidecar_name = format!("{source_stem}.miv.json");
+    entry_file_names_ci
+        .contains(&sidecar_name)
+        .then(|| source_stem.to_owned())
+}
+
+fn file_stem_ci(path: &std::path::Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_lowercase)
 }
 
 /// `ScannedDir` の内容シグネチャ (path + mtime + size + 種別) を u64 ハッシュ化する。
@@ -1436,6 +1508,13 @@ pub struct App {
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
     pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
     pub(crate) video_upscale: Option<crate::ui_dialogs::video_upscale::VideoUpscaleState>,
+    pub(crate) show_video_upscale_tasks: bool,
+    pub(crate) video_upscale_queue: crate::video::upscale::queue::TaskQueue,
+    pub(crate) video_upscale_queue_path: PathBuf,
+    pub(crate) video_upscale_queue_lock: Option<crate::video::upscale::queue::QueueLock>,
+    pub(crate) video_upscale_running:
+        Option<crate::ui_dialogs::video_upscale::VideoUpscaleRunningTask>,
+    pub(crate) video_upscale_delete_pending: Vec<std::sync::mpsc::Receiver<PathBuf>>,
     /// 変換済みアーカイブを開いているとき、元 (7z/LZH) のパスを保持する。
     /// `current_folder` はキャッシュ ZIP を指しているので、UI 表示 / BS /
     /// Ctrl+↑↓ / タイトルバーでは本フィールドを優先する。
@@ -2324,6 +2403,27 @@ impl Default for App {
         let mask_db = crate::mask_db::MaskDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
+        let video_upscale_data_dir = crate::data_dir::get();
+        let video_upscale_queue_lock =
+            crate::video::upscale::queue::QueueLock::acquire(&video_upscale_data_dir).ok();
+        let video_upscale_queue_path =
+            crate::video::upscale::queue::TaskQueue::queue_path(&video_upscale_data_dir);
+        let (mut video_upscale_queue, broken_video_upscale_queue) =
+            crate::video::upscale::queue::TaskQueue::load_or_backup_broken(
+                &video_upscale_queue_path,
+            );
+        if let Some((backup_path, error)) = broken_video_upscale_queue {
+            crate::logger::log(format!(
+                "[VideoUpscale] queue load failed, backed up to {}: {}",
+                backup_path.display(),
+                error
+            ));
+        }
+        crate::ui_dialogs::video_upscale::recover_video_upscale_queue_for_startup(
+            &mut video_upscale_queue,
+        );
+        let _ = video_upscale_queue.save_atomic(&video_upscale_queue_path);
+
         Self {
             address: String::new(),
             current_folder: None,
@@ -2422,6 +2522,12 @@ impl Default for App {
             archive_cache_db,
             archive_convert: None,
             video_upscale: None,
+            show_video_upscale_tasks: false,
+            video_upscale_queue,
+            video_upscale_queue_path,
+            video_upscale_queue_lock,
+            video_upscale_running: None,
+            video_upscale_delete_pending: Vec::new(),
             archive_source_override: None,
             show_archive_cache_manager: false,
             archive_cache_rows: None,
@@ -13419,6 +13525,7 @@ impl eframe::App for App {
         // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
         self.poll_tag_write_results();
         self.poll_rating_write_results();
+        self.poll_video_upscale_queue(ctx);
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
@@ -13430,6 +13537,7 @@ impl eframe::App for App {
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
         self.show_video_upscale_dialog(ctx);
+        self.show_video_upscale_tasks_window(ctx);
         self.poll_thumb_quality_pending(ctx);
         self.poll_tq_encode_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);
@@ -13730,6 +13838,7 @@ impl eframe::App for App {
                 .iter()
                 .any(|t| matches!(t, ThumbnailState::Pending))
             || self.pdf_enumerate_pending.is_some()
+            || self.video_upscale_running.is_some()
         {
             ctx.request_repaint();
         }
@@ -13763,6 +13872,7 @@ impl eframe::App for App {
                 self.settings.save();
             }
         }
+        self.stop_video_upscale_queue_for_exit();
         self.persist_window_state_and_flush();
     }
 }
@@ -14252,6 +14362,9 @@ pub(crate) fn draw_cell(
             // 再生ボタンオーバーレイ（常時表示）
             let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
             draw_play_icon(painter, inner.center(), r);
+            if is_miv_upscaled_derivative(path) {
+                draw_upscaled_video_badge(painter, inner);
+            }
             // ファイル名
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             painter.text(
@@ -14815,6 +14928,32 @@ pub(crate) fn tq_draw_preview(
     response
 }
 
+/// Draws a compact badge for offline-upscaled video derivatives.
+fn draw_upscaled_video_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
+    let font_size = (cell_rect.height() * 0.10).clamp(10.0, 14.0);
+    let pad_x = font_size * 0.45;
+    let pad_y = font_size * 0.22;
+    let galley = painter.layout_no_wrap(
+        "UP".to_owned(),
+        egui::FontId::proportional(font_size),
+        egui::Color32::WHITE,
+    );
+    let badge_rect = egui::Rect::from_min_size(
+        cell_rect.min + egui::vec2(3.0, 3.0),
+        egui::vec2(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0),
+    );
+    painter.rect_filled(
+        badge_rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(20, 120, 130, 215),
+    );
+    painter.galley(
+        badge_rect.min + egui::vec2(pad_x, pad_y),
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
 /// egui::ColorImage → image::DynamicImage 変換ヘルパー。
 /// AI 推論の入力に使う。
 fn color_image_to_dynamic(ci: &egui::ColorImage) -> image::DynamicImage {
@@ -14860,6 +14999,71 @@ mod tests {
     use super::*;
     use crate::archive_converter::ArchiveFormat;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn scan_media_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = scan_directory(dir)
+            .all_media
+            .into_iter()
+            .filter_map(|(path, _, _, _)| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn scan_directory_hides_source_when_upscaled_derivative_sidecar_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+        std::fs::write(tmp.path().join("movie.jpg"), b"cover").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+        assert_eq!(scan_media_names(tmp.path()), vec!["movie.miv.mkv"]);
+    }
+
+    #[test]
+    fn scan_directory_hides_multiple_companion_images_when_derivative_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+        std::fs::write(tmp.path().join("movie.jpg"), b"cover").unwrap();
+        std::fs::write(tmp.path().join("movie.png"), b"thumb").unwrap();
+        std::fs::write(tmp.path().join("movie.webp"), b"thumb2").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+        assert_eq!(scan_media_names(tmp.path()), vec!["movie.miv.mkv"]);
+    }
+
+    #[test]
+    fn scan_directory_keeps_source_when_upscaled_sidecar_is_missing() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+
+        assert_eq!(
+            scan_media_names(tmp.path()),
+            vec!["movie.miv.mkv", "movie.mp4"]
+        );
+    }
+
+    #[test]
+    fn scan_directory_keeps_sources_when_upscaled_stem_is_ambiguous() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("movie.mp4"), b"source-a").unwrap();
+        std::fs::write(tmp.path().join("movie.avi"), b"source-b").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+        std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+        assert_eq!(
+            scan_media_names(tmp.path()),
+            vec!["movie.avi", "movie.miv.mkv", "movie.mp4"]
+        );
+    }
 
     // ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
 

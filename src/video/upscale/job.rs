@@ -1,22 +1,36 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ffmpeg_the_third as ffmpeg;
 use image::{DynamicImage, ImageBuffer, RgbaImage};
+use serde::{Deserialize, Serialize};
 
 use crate::ai::{ModelKind, model_manager::ModelManager, runtime::AiRuntime};
 
+use super::manifest::{
+    JobManifest, ManifestOptions, ManifestOutput, ManifestSource, PlannedSegment, SegmentEntry,
+    SegmentPlan, SegmentPlanState, SegmentPlanStrategy, SegmentState, TimeBase,
+};
+use super::paths::{
+    final_part_path_for, manifest_path_for, segment_file_name, segment_part_file_name,
+    segment_part_path, segment_path, segments_dir_for, work_dir_for, worker_segment_part_path,
+};
 use super::sidecar::{
     EncodeInfo, OutputInfo, UpscaleInfo, VideoUpscaleSidecar, derived_sidecar_path_for,
     derived_video_path_for, output_within_mvp_limit, source_info_for,
 };
 
 const FFMPEG_EAGAIN: i32 = 11;
+const SEGMENT_TARGET_SECONDS: f64 = 5.0;
+const SEGMENT_MIN_SECONDS: f64 = 1.0;
+const SEGMENT_MAX_SECONDS: f64 = 10.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoUpscaleScale {
     X2,
     X4,
@@ -38,7 +52,8 @@ impl VideoUpscaleScale {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoUpscaleModelPreset {
     GeneralFast,
     Anime,
@@ -63,7 +78,8 @@ impl VideoUpscaleModelPreset {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoUpscaleQuality {
     Q1,
     Q2,
@@ -126,7 +142,7 @@ impl VideoUpscaleQuality {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoUpscaleOptions {
     pub scale: VideoUpscaleScale,
     pub model: VideoUpscaleModelPreset,
@@ -151,6 +167,7 @@ pub struct VideoInfo {
     pub height: u32,
     pub fps_num: i32,
     pub fps_den: i32,
+    pub source_time_base: TimeBase,
     pub estimated_frames: Option<u64>,
     pub duration_secs: Option<f64>,
 }
@@ -207,6 +224,7 @@ impl VideoUpscalePreflight {
 pub struct VideoUpscaleProgressShared {
     pub frames_done: AtomicU64,
     pub frames_total: AtomicU64,
+    pub rate_base_frames: AtomicU64,
     pub elapsed_ms: AtomicU64,
 }
 
@@ -215,14 +233,16 @@ impl VideoUpscaleProgressShared {
         Self {
             frames_done: AtomicU64::new(0),
             frames_total: AtomicU64::new(total.unwrap_or(0)),
+            rate_base_frames: AtomicU64::new(0),
             elapsed_ms: AtomicU64::new(0),
         }
     }
 
-    pub fn snapshot(&self) -> (u64, u64, Duration) {
+    pub fn snapshot(&self) -> (u64, u64, u64, Duration) {
         (
             self.frames_done.load(Ordering::Relaxed),
             self.frames_total.load(Ordering::Relaxed),
+            self.rate_base_frames.load(Ordering::Relaxed),
             Duration::from_millis(self.elapsed_ms.load(Ordering::Relaxed)),
         )
     }
@@ -235,6 +255,13 @@ pub struct VideoUpscaleJob {
     pub sidecar_path: PathBuf,
     pub info: VideoInfo,
     pub options: VideoUpscaleOptions,
+    pub parallel_segments: Arc<AtomicU8>,
+}
+
+impl VideoUpscaleJob {
+    fn current_parallel_segments(&self) -> usize {
+        self.parallel_segments.load(Ordering::Relaxed).clamp(1, 5) as usize
+    }
 }
 
 #[derive(Debug)]
@@ -287,20 +314,14 @@ pub fn run_job(
         ));
     }
 
-    let part_path = job.output_path.with_file_name(format!(
-        "{}.part",
-        job.output_path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default()
-    ));
+    let part_path = final_part_path_for(&job.source_path);
     let _ = fs::remove_file(&part_path);
-
-    let result = encode_video_only(&job, &part_path, &runtime, &cancel, &progress);
+    let result =
+        run_segmented_video_only(&job, &part_path, runtime.clone(), &cancel, progress.clone());
     if result.is_err() || cancel.load(Ordering::Relaxed) {
         let _ = fs::remove_file(&part_path);
     }
-    result?;
+    let finalize_result = result?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err("キャンセルされました".to_owned());
@@ -329,7 +350,7 @@ pub fn run_job(
             crf: job.options.quality.crf(),
             preset: job.options.quality.preset(),
             pixel_format: job.options.quality.pixel_format_name().to_owned(),
-            audio: "none".to_owned(),
+            audio: finalize_result.audio_sidecar_value.to_owned(),
         },
         OutputInfo {
             path: job
@@ -345,6 +366,16 @@ pub fn run_job(
         .map_err(|e| format!("sidecar JSONの作成に失敗しました: {e}"))?;
     fs::write(&job.sidecar_path, json)
         .map_err(|e| format!("sidecar JSONの保存に失敗しました: {e}"))?;
+
+    let work_dir = work_dir_for(&job.source_path);
+    if work_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&work_dir) {
+            crate::logger::log(format!(
+                "[VideoUpscale] 作業フォルダの削除に失敗しました (継続): {} {e}",
+                work_dir.display()
+            ));
+        }
+    }
 
     Ok(job.output_path)
 }
@@ -379,18 +410,1352 @@ fn probe_video_info(path: &Path) -> Result<VideoInfo, String> {
         height,
         fps_num,
         fps_den,
+        source_time_base: time_base_from_rational(stream.time_base()),
         estimated_frames,
         duration_secs,
     })
 }
 
-fn encode_video_only(
+struct SegmentEncodeResult {
+    frame_count: u64,
+    total_pts_ticks: i64,
+    output_time_base: TimeBase,
+    source_start_pts: i64,
+    source_last_pts: i64,
+}
+
+struct FinalizeResult {
+    audio_sidecar_value: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyframePoint {
+    frame: u64,
+    pts: i64,
+}
+
+#[derive(Clone)]
+enum SegmentProgressMode {
+    Sequential {
+        prior_done_frames: u64,
+    },
+    Parallel {
+        committed_frames: Arc<AtomicU64>,
+        in_flight_frames: Arc<Vec<AtomicU64>>,
+        started: Instant,
+        slot: usize,
+    },
+}
+
+impl SegmentProgressMode {
+    fn base_frames(&self) -> u64 {
+        match self {
+            Self::Sequential { prior_done_frames } => *prior_done_frames,
+            Self::Parallel {
+                committed_frames, ..
+            } => committed_frames.load(Ordering::Relaxed),
+        }
+    }
+
+    fn update(&self, progress: &VideoUpscaleProgressShared, segment_frames: u64) {
+        match self {
+            Self::Sequential { prior_done_frames } => {
+                progress.frames_done.store(
+                    prior_done_frames.saturating_add(segment_frames),
+                    Ordering::Relaxed,
+                );
+            }
+            Self::Parallel {
+                committed_frames,
+                in_flight_frames,
+                started,
+                slot,
+            } => {
+                if let Some(current) = in_flight_frames.get(*slot) {
+                    current.store(segment_frames, Ordering::Relaxed);
+                }
+                progress.frames_done.store(
+                    committed_frames
+                        .load(Ordering::Relaxed)
+                        .saturating_add(sum_atomic_u64(in_flight_frames.as_slice())),
+                    Ordering::Relaxed,
+                );
+                progress
+                    .elapsed_ms
+                    .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn sum_atomic_u64(values: &[AtomicU64]) -> u64 {
+    values
+        .iter()
+        .map(|value| value.load(Ordering::Relaxed))
+        .sum()
+}
+
+#[derive(Clone, Copy)]
+struct StreamCopyMap {
+    input_index: usize,
+    output_index: usize,
+    input_time_base: ffmpeg::Rational,
+    output_time_base: ffmpeg::Rational,
+}
+
+struct SegmentVideoCursor {
+    segments: Vec<SegmentEntry>,
+    work_dir: PathBuf,
+    output_stream_index: usize,
+    output_time_base: ffmpeg::Rational,
+    next_segment: usize,
+    current: Option<SegmentVideoInput>,
+    cumulative_offset: i64,
+}
+
+struct SegmentVideoInput {
+    segment: SegmentEntry,
+    input: ffmpeg::format::context::Input,
+    input_stream_index: usize,
+    input_time_base: ffmpeg::Rational,
+}
+
+impl SegmentVideoCursor {
+    fn new(
+        manifest: &JobManifest,
+        work_dir: &Path,
+        output_stream_index: usize,
+        output_time_base: ffmpeg::Rational,
+    ) -> Self {
+        Self {
+            segments: sorted_done_segments(manifest)
+                .into_iter()
+                .cloned()
+                .collect(),
+            work_dir: work_dir.to_path_buf(),
+            output_stream_index,
+            output_time_base,
+            next_segment: 0,
+            current: None,
+            cumulative_offset: 0,
+        }
+    }
+
+    fn next_packet(&mut self) -> Result<Option<ffmpeg::Packet>, String> {
+        loop {
+            if self.current.is_none() {
+                let Some(segment) = self.segments.get(self.next_segment).cloned() else {
+                    return Ok(None);
+                };
+                self.next_segment += 1;
+                let path = self.work_dir.join(&segment.path);
+                let input = ffmpeg::format::input(&path)
+                    .map_err(|e| format!("failed to open segment: {e}"))?;
+                let input_stream = input
+                    .streams()
+                    .best(ffmpeg::media::Type::Video)
+                    .ok_or_else(|| "segment has no video stream".to_owned())?;
+                self.current = Some(SegmentVideoInput {
+                    segment,
+                    input_stream_index: input_stream.index(),
+                    input_time_base: input_stream.time_base(),
+                    input,
+                });
+            }
+
+            let current = self.current.as_mut().expect("current segment input exists");
+            let mut packet = ffmpeg::Packet::empty();
+            match packet.read(&mut current.input) {
+                Ok(()) => {
+                    if packet.stream() != current.input_stream_index {
+                        continue;
+                    }
+                    packet.rescale_ts(current.input_time_base, self.output_time_base);
+                    packet.set_pts(packet.pts().map(|pts| pts + self.cumulative_offset));
+                    packet.set_dts(packet.dts().map(|dts| dts + self.cumulative_offset));
+                    packet.set_stream(self.output_stream_index);
+                    return Ok(Some(packet));
+                }
+                Err(ffmpeg::Error::Eof) => {
+                    let segment = &current.segment;
+                    self.cumulative_offset += rescale_ticks(
+                        segment.output_total_pts_ticks,
+                        segment.output_time_base,
+                        time_base_from_rational(self.output_time_base),
+                    );
+                    self.current = None;
+                }
+                Err(e) => return Err(format!("failed to read segment packet: {e}")),
+            }
+        }
+    }
+}
+
+fn run_segmented_video_only(
     job: &VideoUpscaleJob,
+    final_part_path: &Path,
+    runtime: Arc<AiRuntime>,
+    cancel: &Arc<AtomicBool>,
+    progress: Arc<VideoUpscaleProgressShared>,
+) -> Result<FinalizeResult, String> {
+    let work_dir = work_dir_for(&job.source_path);
+    let segments_dir = segments_dir_for(&work_dir);
+    fs::create_dir_all(&segments_dir)
+        .map_err(|e| format!("segment作業フォルダを作成できません: {e}"))?;
+
+    let manifest_path = manifest_path_for(&job.source_path);
+    let mut manifest = if manifest_path.exists() {
+        JobManifest::load(&manifest_path)
+            .map_err(|e| format!("failed to load segment manifest: {e}"))?
+    } else {
+        create_initial_manifest(job)?
+    };
+    if !manifest.is_supported_schema() {
+        return Err("unsupported segment manifest schema".to_owned());
+    }
+    ensure_plan(job, &mut manifest, cancel)?;
+    manifest
+        .save_atomic(&manifest_path)
+        .map_err(|e| format!("failed to save segment manifest: {e}"))?;
+
+    let planned_segments = manifest
+        .plan
+        .as_ref()
+        .map(|plan| plan.segments.clone())
+        .unwrap_or_default();
+    if planned_segments.is_empty() {
+        return Err("segment plan is empty".to_owned());
+    }
+
+    let completed_before = manifest
+        .segments
+        .iter()
+        .filter(|segment| segment.state == SegmentState::Done)
+        .map(|segment| segment.output_frame_count)
+        .sum::<u64>();
+    progress
+        .frames_done
+        .store(completed_before, Ordering::Relaxed);
+    progress
+        .rate_base_frames
+        .store(completed_before, Ordering::Relaxed);
+    progress.elapsed_ms.store(0, Ordering::Relaxed);
+
+    if planned_segments.len() > 1 {
+        run_segments_parallel(
+            job,
+            &manifest_path,
+            &mut manifest,
+            &planned_segments,
+            &work_dir,
+            runtime,
+            cancel,
+            progress.clone(),
+            completed_before,
+        )?;
+        return finalize_segments(job, &manifest, &work_dir, final_part_path, cancel);
+    }
+
+    for planned in &planned_segments {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("canceled".to_owned());
+        }
+        if segment_done_and_reusable(&manifest, &work_dir, planned.index) {
+            continue;
+        }
+
+        let seg_part = segment_part_path(&work_dir, planned.index);
+        let seg_final = segment_path(&work_dir, planned.index);
+        let _ = fs::remove_file(&seg_part);
+        let _ = fs::remove_file(&seg_final);
+
+        let prior_done = manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.state == SegmentState::Done)
+            .map(|segment| segment.output_frame_count)
+            .sum::<u64>();
+        let result = encode_video_segment(
+            job,
+            planned,
+            &seg_part,
+            runtime.as_ref(),
+            cancel,
+            progress.as_ref(),
+            SegmentProgressMode::Sequential {
+                prior_done_frames: prior_done,
+            },
+        );
+        if result.is_err() {
+            let _ = fs::remove_file(&seg_part);
+        }
+        let encoded = result?;
+        if cancel.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&seg_part);
+            return Err("キャンセルされました".to_owned());
+        }
+        validate_segment_file(&seg_part)?;
+
+        let planned_count = planned
+            .target_end_frame_exclusive
+            .saturating_sub(planned.target_start_frame);
+        if planned.target_end_frame_exclusive != u64::MAX && encoded.frame_count != planned_count {
+            return Err(format!(
+                "segment plan drift: planned {} frames, encoded {} frames",
+                planned_count, encoded.frame_count
+            ));
+        }
+
+        fs::rename(&seg_part, &seg_final)
+            .map_err(|e| format!("failed to publish segment file: {e}"))?;
+        let metadata = fs::metadata(&seg_final)
+            .map_err(|e| format!("failed to read segment metadata: {e}"))?;
+        upsert_segment_entry(
+            &mut manifest,
+            SegmentEntry {
+                index: planned.index,
+                path: PathBuf::from(format!(
+                    "segments/{}",
+                    segment_path_file_name(planned.index)
+                )),
+                state: SegmentState::Done,
+                output_frame_start: planned.target_start_frame,
+                output_frame_count: encoded.frame_count,
+                output_total_pts_ticks: encoded.total_pts_ticks,
+                output_time_base: encoded.output_time_base,
+                source_start_pts: encoded.source_start_pts,
+                source_last_pts: encoded.source_last_pts,
+                size: metadata.len(),
+                mtime_unix_ms: file_mtime_unix_ms(&metadata),
+                worker_id: None,
+                worker_pid: None,
+                worker_started_unix_ms: None,
+            },
+        );
+        manifest.progress.completed_frames = manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.state == SegmentState::Done)
+            .map(|segment| segment.output_frame_count)
+            .sum();
+        manifest.progress.next_output_frame_index = manifest.progress.completed_frames;
+        manifest
+            .save_atomic(&manifest_path)
+            .map_err(|e| format!("failed to save segment manifest: {e}"))?;
+    }
+
+    finalize_segments(job, &manifest, &work_dir, final_part_path, cancel)
+}
+
+struct ParallelSegmentMessage {
+    slot: usize,
+    planned: PlannedSegment,
+    part_path: PathBuf,
+    result: Result<SegmentEncodeResult, String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_segments_parallel(
+    job: &VideoUpscaleJob,
+    manifest_path: &Path,
+    manifest: &mut JobManifest,
+    planned_segments: &[PlannedSegment],
+    work_dir: &Path,
+    runtime: Arc<AiRuntime>,
+    cancel: &Arc<AtomicBool>,
+    progress: Arc<VideoUpscaleProgressShared>,
+    completed_before: u64,
+) -> Result<(), String> {
+    let mut pending: std::collections::VecDeque<PlannedSegment> = planned_segments
+        .iter()
+        .filter(|planned| !segment_done_and_reusable(manifest, work_dir, planned.index))
+        .cloned()
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let worker_slots = 5_usize.min(pending.len().max(1));
+    let committed_frames = Arc::new(AtomicU64::new(completed_before));
+    let in_flight_frames = Arc::new(
+        (0..worker_slots)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
+    let (tx, rx) = mpsc::channel::<ParallelSegmentMessage>();
+    let started = Instant::now();
+    let mut active = 0_usize;
+    let mut slot_active = vec![false; worker_slots];
+    let mut first_error: Option<String> = None;
+
+    while active > 0 || (!pending.is_empty() && first_error.is_none()) {
+        let desired_workers = job
+            .current_parallel_segments()
+            .min(worker_slots)
+            .min(active.saturating_add(pending.len()))
+            .max(1);
+        while active < desired_workers
+            && first_error.is_none()
+            && !cancel.load(Ordering::Relaxed)
+            && !pending.is_empty()
+        {
+            let planned = pending.pop_front().expect("pending segment exists");
+            if segment_done_and_reusable(manifest, work_dir, planned.index) {
+                continue;
+            }
+            let Some(slot) = slot_active.iter().position(|active| !*active) else {
+                pending.push_front(planned);
+                break;
+            };
+            slot_active[slot] = true;
+            in_flight_frames[slot].store(0, Ordering::Relaxed);
+
+            let worker_id = format!("{}-{slot}-{}", std::process::id(), planned.index);
+            cleanup_segment_parts(work_dir, planned.index);
+            let _ = fs::remove_file(segment_path(work_dir, planned.index));
+            let part_path = worker_segment_part_path(work_dir, planned.index, &worker_id);
+
+            upsert_segment_entry(
+                manifest,
+                SegmentEntry {
+                    index: planned.index,
+                    path: part_path
+                        .strip_prefix(work_dir)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| part_path.clone()),
+                    state: SegmentState::Running,
+                    output_frame_start: planned.target_start_frame,
+                    output_frame_count: 0,
+                    output_total_pts_ticks: 0,
+                    output_time_base: TimeBase::new(job.info.fps_den, job.info.fps_num),
+                    source_start_pts: planned.target_start_pts,
+                    source_last_pts: planned.target_start_pts,
+                    size: 0,
+                    mtime_unix_ms: 0,
+                    worker_id: Some(worker_id),
+                    worker_pid: Some(std::process::id()),
+                    worker_started_unix_ms: Some(super::manifest::now_unix_ms()),
+                },
+            );
+            manifest
+                .save_atomic(manifest_path)
+                .map_err(|e| format!("failed to save segment manifest: {e}"))?;
+
+            let worker_job = job.clone();
+            let worker_runtime = runtime.clone();
+            let worker_cancel = cancel.clone();
+            let worker_progress = progress.clone();
+            let worker_committed = committed_frames.clone();
+            let worker_in_flight = in_flight_frames.clone();
+            let worker_tx = tx.clone();
+            let worker_planned = planned.clone();
+            let worker_part = part_path.clone();
+            thread::spawn(move || {
+                let progress_mode = SegmentProgressMode::Parallel {
+                    committed_frames: worker_committed,
+                    in_flight_frames: worker_in_flight,
+                    started,
+                    slot,
+                };
+                let result = encode_video_segment(
+                    &worker_job,
+                    &worker_planned,
+                    &worker_part,
+                    worker_runtime.as_ref(),
+                    &worker_cancel,
+                    worker_progress.as_ref(),
+                    progress_mode,
+                )
+                .and_then(|encoded| {
+                    let planned_count = worker_planned
+                        .target_end_frame_exclusive
+                        .saturating_sub(worker_planned.target_start_frame);
+                    if worker_planned.target_end_frame_exclusive != u64::MAX
+                        && encoded.frame_count != planned_count
+                    {
+                        return Err(format!(
+                            "segment plan drift: planned {} frames, encoded {} frames",
+                            planned_count, encoded.frame_count
+                        ));
+                    }
+                    validate_segment_file(&worker_part)?;
+                    Ok(encoded)
+                });
+                let _ = worker_tx.send(ParallelSegmentMessage {
+                    slot,
+                    planned: worker_planned,
+                    part_path: worker_part,
+                    result,
+                });
+            });
+            active += 1;
+        }
+
+        if active == 0 {
+            break;
+        }
+
+        let message = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                progress
+                    .elapsed_ms
+                    .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("segment worker channel closed".to_owned());
+            }
+        };
+        active = active.saturating_sub(1);
+        if let Some(slot) = slot_active.get_mut(message.slot) {
+            *slot = false;
+        }
+        in_flight_frames[message.slot].store(0, Ordering::Relaxed);
+
+        match message.result {
+            Ok(encoded) if first_error.is_none() && !cancel.load(Ordering::Relaxed) => {
+                let publish_result = (|| -> Result<(), String> {
+                    let final_path = segment_path(work_dir, message.planned.index);
+                    fs::rename(&message.part_path, &final_path)
+                        .map_err(|e| format!("failed to publish segment file: {e}"))?;
+                    let metadata = fs::metadata(&final_path)
+                        .map_err(|e| format!("failed to read segment metadata: {e}"))?;
+                    upsert_segment_entry(
+                        manifest,
+                        SegmentEntry {
+                            index: message.planned.index,
+                            path: PathBuf::from(format!(
+                                "segments/{}",
+                                segment_path_file_name(message.planned.index)
+                            )),
+                            state: SegmentState::Done,
+                            output_frame_start: message.planned.target_start_frame,
+                            output_frame_count: encoded.frame_count,
+                            output_total_pts_ticks: encoded.total_pts_ticks,
+                            output_time_base: encoded.output_time_base,
+                            source_start_pts: encoded.source_start_pts,
+                            source_last_pts: encoded.source_last_pts,
+                            size: metadata.len(),
+                            mtime_unix_ms: file_mtime_unix_ms(&metadata),
+                            worker_id: None,
+                            worker_pid: None,
+                            worker_started_unix_ms: None,
+                        },
+                    );
+                    let committed = committed_frames
+                        .fetch_add(encoded.frame_count, Ordering::Relaxed)
+                        .saturating_add(encoded.frame_count);
+                    progress.frames_done.store(
+                        committed.saturating_add(sum_atomic_u64(in_flight_frames.as_slice())),
+                        Ordering::Relaxed,
+                    );
+                    progress
+                        .elapsed_ms
+                        .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    manifest.progress.completed_frames = manifest
+                        .segments
+                        .iter()
+                        .filter(|segment| segment.state == SegmentState::Done)
+                        .map(|segment| segment.output_frame_count)
+                        .sum();
+                    manifest.progress.next_output_frame_index = manifest.progress.completed_frames;
+                    manifest
+                        .save_atomic(manifest_path)
+                        .map_err(|e| format!("failed to save segment manifest: {e}"))?;
+                    Ok(())
+                })();
+                if let Err(err) = publish_result {
+                    let _ = fs::remove_file(&message.part_path);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(&message.part_path);
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&message.part_path);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(first_error.unwrap_or_else(|| "canceled".to_owned()));
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn create_initial_manifest(job: &VideoUpscaleJob) -> Result<JobManifest, String> {
+    let source = source_info_for(&job.source_path)
+        .map_err(|e| format!("failed to read source info for manifest: {e}"))?;
+    let (out_w, out_h) = job.info.output_size(job.options.scale);
+    Ok(JobManifest::new(
+        uuid::Uuid::new_v4(),
+        ManifestSource {
+            file_name: source.file_name,
+            size: source.size,
+            mtime_unix_ms: source.mtime_unix_ms,
+            head_tail_sha256: source.head_tail_sha256,
+            time_base: job.info.source_time_base,
+        },
+        ManifestOutput {
+            final_path: job
+                .output_path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("video.miv.mkv")),
+            sidecar_path: job
+                .sidecar_path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("video.miv.json")),
+            width: out_w,
+            height: out_h,
+        },
+        ManifestOptions {
+            scale: job.options.scale.factor(),
+            model: job.options.model.model_kind().as_str().to_owned(),
+            quality_level: job.options.quality.level(),
+            container: "mkv".to_owned(),
+            video_codec: "av1".to_owned(),
+            encoder: "libsvtav1".to_owned(),
+        },
+        job.info.estimated_frames.unwrap_or(0),
+    ))
+}
+
+fn ensure_plan(
+    job: &VideoUpscaleJob,
+    manifest: &mut JobManifest,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if manifest.plan_is_complete() {
+        return Ok(());
+    }
+    if let Some(segments) = build_keyframe_snap_plan(job, cancel)? {
+        manifest.plan = Some(SegmentPlan {
+            strategy: SegmentPlanStrategy::SourceKeyframeSnap,
+            state: SegmentPlanState::Complete,
+            scan_progress_pts: segments.last().map(|segment| segment.target_end_pts),
+            segments,
+        });
+        return Ok(());
+    }
+    let total_frames = job.info.estimated_frames.unwrap_or(0);
+    let frames_per_segment = segment_frames_for_fps(job.info.fps_num, job.info.fps_den);
+    let mut segments = Vec::new();
+    if total_frames == 0 {
+        segments.push(planned_segment_for_frames(job, 0, 0, u64::MAX));
+    } else {
+        let mut start = 0;
+        let mut index = 0;
+        while start < total_frames {
+            let end = (start + frames_per_segment).min(total_frames);
+            segments.push(planned_segment_for_frames(job, index, start, end));
+            start = end;
+            index += 1;
+        }
+    }
+    manifest.plan = Some(SegmentPlan {
+        strategy: SegmentPlanStrategy::TimeBased,
+        state: SegmentPlanState::Complete,
+        scan_progress_pts: None,
+        segments,
+    });
+    Ok(())
+}
+
+fn build_keyframe_snap_plan(
+    job: &VideoUpscaleJob,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Option<Vec<PlannedSegment>>, String> {
+    let scan = match scan_source_keyframes(job, cancel) {
+        Ok(scan) => scan,
+        Err(err) => {
+            crate::logger::log(format!(
+                "[VideoUpscale] keyframe scan failed; using time-based plan: {err}"
+            ));
+            return Ok(None);
+        }
+    };
+    if scan.total_frames == 0 {
+        return Ok(None);
+    }
+    Ok(plan_segments_from_keyframes(
+        job,
+        scan.total_frames,
+        &scan.keyframes,
+    ))
+}
+
+struct KeyframeScan {
+    total_frames: u64,
+    keyframes: Vec<KeyframePoint>,
+}
+
+fn scan_source_keyframes(
+    job: &VideoUpscaleJob,
+    cancel: &Arc<AtomicBool>,
+) -> Result<KeyframeScan, String> {
+    let mut input = ffmpeg::format::input(&job.source_path)
+        .map_err(|e| format!("failed to open source for keyframe scan: {e}"))?;
+    let video_stream_index = input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| "source has no video stream for keyframe scan".to_owned())?
+        .index();
+    let mut frame = 0_u64;
+    let mut keyframes = Vec::new();
+
+    for packet_result in input.packets() {
+        if frame % 1000 == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("canceled".to_owned());
+        }
+        let (stream, packet) =
+            packet_result.map_err(|e| format!("failed to read source packet for plan: {e}"))?;
+        if stream.index() != video_stream_index {
+            continue;
+        }
+        // We only persist keyframe timestamps; for keyframes PTS and DTS are
+        // equivalent for the seek origin we need, while DTS is a useful
+        // fallback for containers with sparse PTS metadata.
+        let pts = packet
+            .pts()
+            .or_else(|| packet.dts())
+            .unwrap_or_else(|| frame_to_pts(job, frame));
+        if packet.is_key() {
+            keyframes.push(KeyframePoint { frame, pts });
+        }
+        frame = frame.saturating_add(1);
+    }
+
+    if keyframes.first().is_none_or(|keyframe| keyframe.frame != 0) {
+        keyframes.insert(
+            0,
+            KeyframePoint {
+                frame: 0,
+                pts: frame_to_pts(job, 0),
+            },
+        );
+    }
+    keyframes.sort_by_key(|keyframe| keyframe.frame);
+    keyframes.dedup_by_key(|keyframe| keyframe.frame);
+
+    Ok(KeyframeScan {
+        total_frames: frame,
+        keyframes,
+    })
+}
+
+fn plan_segments_from_keyframes(
+    job: &VideoUpscaleJob,
+    total_frames: u64,
+    keyframes: &[KeyframePoint],
+) -> Option<Vec<PlannedSegment>> {
+    if total_frames == 0 || keyframes.len() < 2 {
+        return None;
+    }
+    let target_frames = segment_frames_for_fps(job.info.fps_num, job.info.fps_den).max(1);
+    let min_frames =
+        segment_frames_for_seconds(job.info.fps_num, job.info.fps_den, SEGMENT_MIN_SECONDS);
+    let max_frames =
+        segment_frames_for_seconds(job.info.fps_num, job.info.fps_den, SEGMENT_MAX_SECONDS);
+
+    let mut boundaries = Vec::new();
+    boundaries.push(boundary_for_frame(job, 0, keyframes));
+    let mut start = 0_u64;
+    while start.saturating_add(target_frames) < total_frames {
+        let ideal = start.saturating_add(target_frames);
+        let min_end = start.saturating_add(min_frames).min(total_frames);
+        let max_end = start.saturating_add(max_frames).min(total_frames);
+        let Some(next) = nearest_keyframe_in_range(keyframes, ideal, min_end, max_end) else {
+            return None;
+        };
+        if next.frame <= start || next.frame >= total_frames {
+            return None;
+        }
+        if total_frames.saturating_sub(next.frame) < min_frames {
+            break;
+        }
+        boundaries.push(SegmentBoundary {
+            frame: next.frame,
+            pts: next.pts,
+            seek_frame: next.frame,
+            seek_pts: next.pts,
+        });
+        start = next.frame;
+    }
+    boundaries.push(boundary_for_frame(job, total_frames, keyframes));
+
+    boundaries.dedup_by_key(|boundary| boundary.frame);
+    if boundaries.len() < 2 {
+        return None;
+    }
+
+    Some(
+        boundaries
+            .windows(2)
+            .enumerate()
+            .map(|(index, pair)| PlannedSegment {
+                index: index as u32,
+                target_start_frame: pair[0].frame,
+                target_end_frame_exclusive: pair[1].frame,
+                target_start_pts: pair[0].pts,
+                target_end_pts: pair[1].pts,
+                seek_start_frame: pair[0].seek_frame,
+                seek_start_pts: pair[0].seek_pts,
+            })
+            .collect(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SegmentBoundary {
+    frame: u64,
+    pts: i64,
+    seek_frame: u64,
+    seek_pts: i64,
+}
+
+fn boundary_for_frame(
+    job: &VideoUpscaleJob,
+    frame: u64,
+    keyframes: &[KeyframePoint],
+) -> SegmentBoundary {
+    let seek = previous_keyframe(keyframes, frame).unwrap_or(KeyframePoint {
+        frame: 0,
+        pts: frame_to_pts(job, 0),
+    });
+    let pts = keyframes
+        .iter()
+        .find(|keyframe| keyframe.frame == frame)
+        .map(|keyframe| keyframe.pts)
+        .unwrap_or_else(|| frame_to_pts(job, frame));
+    SegmentBoundary {
+        frame,
+        pts,
+        seek_frame: seek.frame,
+        seek_pts: seek.pts,
+    }
+}
+
+fn nearest_keyframe_in_range(
+    keyframes: &[KeyframePoint],
+    ideal: u64,
+    min_frame: u64,
+    max_frame: u64,
+) -> Option<KeyframePoint> {
+    keyframes
+        .iter()
+        .copied()
+        .filter(|keyframe| keyframe.frame >= min_frame && keyframe.frame <= max_frame)
+        .min_by_key(|keyframe| keyframe.frame.abs_diff(ideal))
+}
+
+fn previous_keyframe(keyframes: &[KeyframePoint], frame: u64) -> Option<KeyframePoint> {
+    keyframes
+        .iter()
+        .copied()
+        .take_while(|keyframe| keyframe.frame <= frame)
+        .last()
+}
+
+fn planned_segment_for_frames(
+    job: &VideoUpscaleJob,
+    index: u32,
+    start_frame: u64,
+    end_frame: u64,
+) -> PlannedSegment {
+    PlannedSegment {
+        index,
+        target_start_frame: start_frame,
+        target_end_frame_exclusive: end_frame,
+        target_start_pts: frame_to_pts(job, start_frame),
+        target_end_pts: if end_frame == u64::MAX {
+            i64::MAX
+        } else {
+            frame_to_pts(job, end_frame)
+        },
+        seek_start_frame: 0,
+        seek_start_pts: 0,
+    }
+}
+
+fn segment_frames_for_fps(fps_num: i32, fps_den: i32) -> u64 {
+    segment_frames_for_seconds(fps_num, fps_den, SEGMENT_TARGET_SECONDS)
+}
+
+fn segment_frames_for_seconds(fps_num: i32, fps_den: i32, seconds: f64) -> u64 {
+    if fps_num <= 0 || fps_den <= 0 {
+        return (30.0 * seconds).round().max(1.0) as u64;
+    }
+    ((fps_num as f64 / fps_den as f64) * seconds)
+        .round()
+        .clamp(1.0, 1200.0) as u64
+}
+
+fn frame_to_pts(job: &VideoUpscaleJob, frame: u64) -> i64 {
+    if job.info.fps_num <= 0 || job.info.fps_den <= 0 {
+        return frame as i64;
+    }
+    let seconds = frame as f64 * job.info.fps_den as f64 / job.info.fps_num as f64;
+    (seconds * job.info.source_time_base.den as f64 / job.info.source_time_base.num as f64).round()
+        as i64
+}
+
+fn segment_done_and_reusable(manifest: &JobManifest, work_dir: &Path, index: u32) -> bool {
+    let Some(segment) = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.index == index && segment.state == SegmentState::Done)
+    else {
+        return false;
+    };
+    let path = segment_path(work_dir, index);
+    path.metadata()
+        .is_ok_and(|metadata| metadata.len() == segment.size && segment.size > 0)
+}
+
+fn cleanup_segment_parts(work_dir: &Path, index: u32) {
+    let segments_dir = segments_dir_for(work_dir);
+    let prefix = format!("{}.part", segment_file_name(index));
+    let Ok(entries) = fs::read_dir(&segments_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == segment_part_file_name(index) || name.starts_with(&prefix) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn validate_segment_file(path: &Path) -> Result<(), String> {
+    let metadata = path
+        .metadata()
+        .map_err(|e| format!("failed to read segment file metadata: {e}"))?;
+    if metadata.len() == 0 {
+        return Err("segment file is empty".to_owned());
+    }
+    let _ = ffmpeg::format::input(path)
+        .map_err(|e| format!("failed to validate segment file with FFmpeg: {e}"))?;
+    Ok(())
+}
+
+fn upsert_segment_entry(manifest: &mut JobManifest, entry: SegmentEntry) {
+    if let Some(existing) = manifest
+        .segments
+        .iter_mut()
+        .find(|segment| segment.index == entry.index)
+    {
+        *existing = entry;
+    } else {
+        manifest.segments.push(entry);
+        manifest.segments.sort_by_key(|segment| segment.index);
+    }
+}
+
+fn segment_path_file_name(index: u32) -> String {
+    segment_file_name(index)
+}
+
+fn file_mtime_unix_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn time_base_from_rational(value: ffmpeg::Rational) -> TimeBase {
+    TimeBase::new(value.numerator(), value.denominator())
+}
+
+fn rescale_ticks(value: i64, source: TimeBase, destination: TimeBase) -> i64 {
+    if source.den == 0 || destination.num == 0 {
+        return value;
+    }
+    let num = value as i128 * source.num as i128 * destination.den as i128;
+    let den = source.den as i128 * destination.num as i128;
+    (num / den) as i64
+}
+
+fn source_pts_to_av_time_base(pts: i64, source: TimeBase) -> i64 {
+    rescale_ticks(pts, source, TimeBase::new(1, 1_000_000))
+}
+
+fn seek_input_to_source_pts(
+    input: &mut ffmpeg::format::context::Input,
+    video_stream_index: usize,
+    source_time_base: TimeBase,
+    source_pts: i64,
+) -> Result<(), ffmpeg::Error> {
+    let ret = unsafe {
+        ffmpeg::ffi::av_seek_frame(
+            input.as_mut_ptr(),
+            video_stream_index as i32,
+            source_pts,
+            ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
+        )
+    };
+    if ret >= 0 {
+        Ok(())
+    } else {
+        let target = source_pts_to_av_time_base(source_pts, source_time_base);
+        input.seek(target, target..)
+    }
+}
+
+fn reset_codec_tag(mut stream: ffmpeg::format::stream::StreamMut<'_>) {
+    let mut parameters = stream.parameters_mut();
+    unsafe {
+        (*parameters.as_mut_ptr()).codec_tag = 0;
+    }
+}
+
+fn sorted_done_segments(manifest: &JobManifest) -> Vec<&SegmentEntry> {
+    let mut done_segments: Vec<_> = manifest
+        .segments
+        .iter()
+        .filter(|segment| segment.state == SegmentState::Done)
+        .collect();
+    done_segments.sort_by_key(|segment| segment.index);
+    done_segments
+}
+
+fn finalize_segments(
+    job: &VideoUpscaleJob,
+    manifest: &JobManifest,
+    work_dir: &Path,
+    final_part_path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<FinalizeResult, String> {
+    let source_input = ffmpeg::format::input(&job.source_path)
+        .map_err(|e| format!("音声確認のため元動画を開けません: {e}"))?;
+    let has_audio = source_input
+        .streams()
+        .any(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio);
+    drop(source_input);
+
+    if has_audio {
+        mux_segments_with_audio(job, manifest, work_dir, final_part_path, cancel)?;
+        Ok(FinalizeResult {
+            audio_sidecar_value: "copy",
+        })
+    } else {
+        concat_video_segments(manifest, work_dir, final_part_path, cancel)?;
+        Ok(FinalizeResult {
+            audio_sidecar_value: "none",
+        })
+    }
+}
+
+fn concat_video_segments(
+    manifest: &JobManifest,
+    work_dir: &Path,
+    final_part_path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let done_segments = sorted_done_segments(manifest);
+    if done_segments.is_empty() {
+        return Err("no completed segments to concatenate".to_owned());
+    }
+
+    let first_path = work_dir.join(&done_segments[0].path);
+    if done_segments.len() == 1 {
+        fs::copy(&first_path, final_part_path)
+            .map_err(|e| format!("failed to copy single segment to final output: {e}"))?;
+        return Ok(());
+    }
+
+    let first_input = ffmpeg::format::input(&first_path)
+        .map_err(|e| format!("failed to open first segment: {e}"))?;
+    let first_stream = first_input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| "first segment has no video stream".to_owned())?;
+    let codec = ffmpeg::codec::encoder::find(first_stream.parameters().id())
+        .ok_or_else(|| "could not find encoder metadata for segment remux".to_owned())?;
+    let mut output = ffmpeg::format::output_as(final_part_path, "matroska")
+        .map_err(|e| format!("failed to create final video output: {e}"))?;
+    let output_stream_index;
+    {
+        let mut output_stream = output
+            .add_stream(codec)
+            .map_err(|e| format!("failed to add final video stream: {e}"))?;
+        output_stream_index = output_stream.index();
+        output_stream.set_parameters(first_stream.parameters());
+        output_stream.set_time_base(first_stream.time_base());
+        reset_codec_tag(output_stream);
+    }
+    drop(first_stream);
+    drop(first_input);
+
+    output
+        .write_header()
+        .map_err(|e| format!("failed to write final video header: {e}"))?;
+    let output_time_base = output
+        .stream(output_stream_index)
+        .ok_or_else(|| "failed to read final video stream".to_owned())?
+        .time_base();
+    let mut cumulative_offset = 0_i64;
+    let mut packet_count = 0_u64;
+
+    for segment in done_segments {
+        check_finalize_cancel(cancel, packet_count)?;
+        let path = work_dir.join(&segment.path);
+        let mut input =
+            ffmpeg::format::input(&path).map_err(|e| format!("failed to open segment: {e}"))?;
+        let input_stream = input
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .ok_or_else(|| "segment has no video stream".to_owned())?;
+        let input_stream_index = input_stream.index();
+        let input_time_base = input_stream.time_base();
+        for packet_result in input.packets() {
+            let (stream, mut packet) =
+                packet_result.map_err(|e| format!("failed to read segment packet: {e}"))?;
+            if stream.index() != input_stream_index {
+                continue;
+            }
+            check_finalize_cancel(cancel, packet_count)?;
+            packet_count = packet_count.saturating_add(1);
+            packet.rescale_ts(input_time_base, output_time_base);
+            packet.set_pts(packet.pts().map(|pts| pts + cumulative_offset));
+            packet.set_dts(packet.dts().map(|dts| dts + cumulative_offset));
+            packet.set_stream(output_stream_index);
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|e| format!("failed to write final video packet: {e}"))?;
+        }
+        cumulative_offset += rescale_ticks(
+            segment.output_total_pts_ticks,
+            segment.output_time_base,
+            time_base_from_rational(output_time_base),
+        );
+    }
+    output
+        .write_trailer()
+        .map_err(|e| format!("failed to write final video trailer: {e}"))?;
+    Ok(())
+}
+
+fn mux_segments_with_audio(
+    job: &VideoUpscaleJob,
+    manifest: &JobManifest,
+    work_dir: &Path,
+    final_part_path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let done_segments = sorted_done_segments(manifest);
+    if done_segments.is_empty() {
+        return Err("no completed segments to mux".to_owned());
+    }
+
+    let first_path = work_dir.join(&done_segments[0].path);
+    let first_input = ffmpeg::format::input(&first_path)
+        .map_err(|e| format!("failed to open first segment: {e}"))?;
+    let first_stream = first_input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| "first segment has no video stream".to_owned())?;
+    let video_codec = first_stream.parameters().id();
+
+    let mut source_input = ffmpeg::format::input(&job.source_path)
+        .map_err(|e| format!("音声コピーのため元動画を開けません: {e}"))?;
+    let audio_inputs: Vec<_> = source_input
+        .streams()
+        .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
+        .map(|stream| (stream.index(), stream.time_base()))
+        .collect();
+    if audio_inputs.is_empty() {
+        // Defensive fallback: the source was reopened after the initial audio probe.
+        return concat_video_segments(manifest, work_dir, final_part_path, cancel);
+    }
+
+    let mut output = ffmpeg::format::output_as(final_part_path, "matroska")
+        .map_err(|e| format!("音声付き出力を作成できません: {e}"))?;
+    let video_output_index;
+    {
+        let mut output_stream = output
+            .add_stream(video_codec)
+            .map_err(|e| format!("failed to add final video stream: {e}"))?;
+        video_output_index = output_stream.index();
+        output_stream.set_parameters(first_stream.parameters());
+        output_stream.set_time_base(first_stream.time_base());
+        reset_codec_tag(output_stream);
+    }
+
+    let mut audio_maps = Vec::new();
+    for (input_index, input_time_base) in &audio_inputs {
+        let input_stream = source_input
+            .stream(*input_index)
+            .ok_or_else(|| format!("音声ストリームを取得できません: {input_index}"))?;
+        let mut output_stream = output
+            .add_stream(input_stream.parameters().id())
+            .map_err(|e| format!("音声出力ストリームの作成に失敗しました: {e}"))?;
+        let output_index = output_stream.index();
+        output_stream.set_parameters(input_stream.parameters());
+        output_stream.set_time_base(*input_time_base);
+        reset_codec_tag(output_stream);
+        audio_maps.push(StreamCopyMap {
+            input_index: *input_index,
+            output_index,
+            input_time_base: *input_time_base,
+            output_time_base: *input_time_base,
+        });
+    }
+    drop(first_stream);
+    drop(first_input);
+
+    output
+        .write_header()
+        .map_err(|e| format!("音声付き出力ヘッダの書き込みに失敗しました: {e}"))?;
+    let video_output_time_base = output
+        .stream(video_output_index)
+        .ok_or_else(|| "failed to read final video stream".to_owned())?
+        .time_base();
+    for map in &mut audio_maps {
+        map.output_time_base = output
+            .stream(map.output_index)
+            .ok_or_else(|| format!("音声出力ストリームを取得できません: {}", map.output_index))?
+            .time_base();
+    }
+
+    write_interleaved_segment_video_and_audio(
+        &mut output,
+        manifest,
+        work_dir,
+        video_output_index,
+        video_output_time_base,
+        &mut source_input,
+        &audio_maps,
+        cancel,
+    )?;
+    output
+        .write_trailer()
+        .map_err(|e| format!("音声付き出力trailerの書き込みに失敗しました: {e}"))?;
+    Ok(())
+}
+
+fn write_interleaved_segment_video_and_audio(
+    output: &mut ffmpeg::format::context::Output,
+    manifest: &JobManifest,
+    work_dir: &Path,
+    video_output_index: usize,
+    video_output_time_base: ffmpeg::Rational,
+    source_input: &mut ffmpeg::format::context::Input,
+    audio_maps: &[StreamCopyMap],
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut video_cursor = SegmentVideoCursor::new(
+        manifest,
+        work_dir,
+        video_output_index,
+        video_output_time_base,
+    );
+    let mut next_video = video_cursor.next_packet()?;
+    let mut next_audio = next_audio_packet(source_input, audio_maps)?;
+    let mut packet_count = 0_u64;
+
+    while next_video.is_some() || next_audio.is_some() {
+        check_finalize_cancel(cancel, packet_count)?;
+        packet_count = packet_count.saturating_add(1);
+        let write_video = match (&next_video, &next_audio) {
+            (Some(video), Some(audio)) => {
+                let audio_map = audio_maps
+                    .iter()
+                    .find(|map| map.output_index == audio.stream())
+                    .ok_or_else(|| "音声stream mapを取得できません".to_owned())?;
+                packet_sort_key(video, video_output_time_base)
+                    <= packet_sort_key(audio, audio_map.output_time_base)
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+
+        if write_video {
+            if let Some(packet) = next_video.take() {
+                packet
+                    .write_interleaved(output)
+                    .map_err(|e| format!("failed to write final video packet: {e}"))?;
+            }
+            next_video = video_cursor.next_packet()?;
+        } else {
+            if let Some(packet) = next_audio.take() {
+                packet
+                    .write_interleaved(output)
+                    .map_err(|e| format!("音声packetの書き込みに失敗しました: {e}"))?;
+            }
+            next_audio = next_audio_packet(source_input, audio_maps)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_finalize_cancel(cancel: &Arc<AtomicBool>, packet_count: u64) -> Result<(), String> {
+    if packet_count % 1000 == 0 && cancel.load(Ordering::Relaxed) {
+        return Err("キャンセルされました".to_owned());
+    }
+    Ok(())
+}
+
+fn next_audio_packet(
+    source_input: &mut ffmpeg::format::context::Input,
+    audio_maps: &[StreamCopyMap],
+) -> Result<Option<ffmpeg::Packet>, String> {
+    loop {
+        let mut packet = ffmpeg::Packet::empty();
+        match packet.read(source_input) {
+            Ok(()) => {
+                let Some(map) = audio_maps
+                    .iter()
+                    .find(|map| map.input_index == packet.stream())
+                else {
+                    continue;
+                };
+                packet.rescale_ts(map.input_time_base, map.output_time_base);
+                packet.set_stream(map.output_index);
+                return Ok(Some(packet));
+            }
+            Err(ffmpeg::Error::Eof) => return Ok(None),
+            Err(e) => return Err(format!("音声packetの読み込みに失敗しました: {e}")),
+        }
+    }
+}
+
+fn packet_sort_key(packet: &ffmpeg::Packet, time_base: ffmpeg::Rational) -> i128 {
+    let ts = packet.dts().or_else(|| packet.pts()).unwrap_or(0) as i128;
+    if time_base.denominator() == 0 {
+        return ts;
+    }
+    ts * time_base.numerator() as i128 * 1_000_000_000_i128 / time_base.denominator() as i128
+}
+
+fn encode_video_segment(
+    job: &VideoUpscaleJob,
+    planned: &PlannedSegment,
     part_path: &Path,
     runtime: &AiRuntime,
     cancel: &Arc<AtomicBool>,
     progress: &VideoUpscaleProgressShared,
-) -> Result<(), String> {
+    progress_mode: SegmentProgressMode,
+) -> Result<SegmentEncodeResult, String> {
     let mut ictx =
         ffmpeg::format::input(&job.source_path).map_err(|e| format!("動画を開けません: {e}"))?;
     let input_stream = ictx
@@ -482,7 +1847,25 @@ fn encode_video_only(
         .time_base();
 
     let started = Instant::now();
-    let mut frame_index = 0_i64;
+    if matches!(progress_mode, SegmentProgressMode::Sequential { .. }) {
+        progress
+            .rate_base_frames
+            .store(progress_mode.base_frames(), Ordering::Relaxed);
+        progress.elapsed_ms.store(0, Ordering::Relaxed);
+    }
+    if planned.seek_start_frame > 0 || planned.seek_start_pts > 0 {
+        seek_input_to_source_pts(
+            &mut ictx,
+            video_stream_index,
+            job.info.source_time_base,
+            planned.seek_start_pts,
+        )
+        .map_err(|e| format!("segment seek failed: {e}"))?;
+    }
+    let mut source_frame_index = planned.seek_start_frame;
+    let mut segment_frame_index = 0_i64;
+    let mut last_source_pts = None;
+    let mut reached_segment_end = false;
     for packet_result in ictx.packets() {
         let (stream, packet) =
             packet_result.map_err(|e| format!("動画パケットの読み込みに失敗しました: {e}"))?;
@@ -498,7 +1881,7 @@ fn encode_video_only(
             match decoder.send_packet(&packet) {
                 Ok(()) => break,
                 Err(ffmpeg::Error::Other { errno }) if errno == FFMPEG_EAGAIN => {
-                    receive_and_encode_frames(
+                    reached_segment_end = receive_and_encode_frames(
                         &mut decoder,
                         &mut rgba_scaler,
                         &mut encode_scaler,
@@ -508,16 +1891,54 @@ fn encode_video_only(
                         encoder_time_base,
                         mux_stream_time_base,
                         job,
+                        planned,
                         runtime,
                         cancel,
                         progress,
                         started,
-                        &mut frame_index,
+                        &progress_mode,
+                        &mut source_frame_index,
+                        &mut segment_frame_index,
+                        &mut last_source_pts,
                     )?;
+                    if reached_segment_end {
+                        break;
+                    }
                 }
                 Err(e) => return Err(format!("動画パケットのデコード投入に失敗しました: {e}")),
             }
         }
+        if reached_segment_end {
+            break;
+        }
+        reached_segment_end = receive_and_encode_frames(
+            &mut decoder,
+            &mut rgba_scaler,
+            &mut encode_scaler,
+            &mut encoder,
+            &mut octx,
+            stream_index,
+            encoder_time_base,
+            mux_stream_time_base,
+            job,
+            planned,
+            runtime,
+            cancel,
+            progress,
+            started,
+            &progress_mode,
+            &mut source_frame_index,
+            &mut segment_frame_index,
+            &mut last_source_pts,
+        )?;
+        if reached_segment_end {
+            break;
+        }
+    }
+    if !reached_segment_end {
+        decoder
+            .send_eof()
+            .map_err(|e| format!("デコーダのflushに失敗しました: {e}"))?;
         receive_and_encode_frames(
             &mut decoder,
             &mut rgba_scaler,
@@ -528,32 +1949,17 @@ fn encode_video_only(
             encoder_time_base,
             mux_stream_time_base,
             job,
+            planned,
             runtime,
             cancel,
             progress,
             started,
-            &mut frame_index,
+            &progress_mode,
+            &mut source_frame_index,
+            &mut segment_frame_index,
+            &mut last_source_pts,
         )?;
     }
-    decoder
-        .send_eof()
-        .map_err(|e| format!("デコーダのflushに失敗しました: {e}"))?;
-    receive_and_encode_frames(
-        &mut decoder,
-        &mut rgba_scaler,
-        &mut encode_scaler,
-        &mut encoder,
-        &mut octx,
-        stream_index,
-        encoder_time_base,
-        mux_stream_time_base,
-        job,
-        runtime,
-        cancel,
-        progress,
-        started,
-        &mut frame_index,
-    )?;
 
     encoder
         .send_eof()
@@ -567,7 +1973,21 @@ fn encode_video_only(
     )?;
     octx.write_trailer()
         .map_err(|e| format!("出力trailerの書き込みに失敗しました: {e}"))?;
-    Ok(())
+    Ok(SegmentEncodeResult {
+        frame_count: segment_frame_index as u64,
+        total_pts_ticks: rescale_ticks(
+            segment_frame_index,
+            TimeBase::new(
+                encoder_time_base.numerator(),
+                encoder_time_base.denominator(),
+            ),
+            time_base_from_rational(mux_stream_time_base),
+        ),
+        output_time_base: time_base_from_rational(mux_stream_time_base),
+        source_start_pts: planned.target_start_pts,
+        source_last_pts: last_source_pts
+            .unwrap_or_else(|| planned.target_end_pts.saturating_sub(1)),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -581,12 +2001,16 @@ fn receive_and_encode_frames(
     encoder_time_base: ffmpeg::Rational,
     mux_stream_time_base: ffmpeg::Rational,
     job: &VideoUpscaleJob,
+    planned: &PlannedSegment,
     runtime: &AiRuntime,
     cancel: &Arc<AtomicBool>,
     progress: &VideoUpscaleProgressShared,
     started: Instant,
-    frame_index: &mut i64,
-) -> Result<(), String> {
+    progress_mode: &SegmentProgressMode,
+    source_frame_index: &mut u64,
+    segment_frame_index: &mut i64,
+    last_source_pts: &mut Option<i64>,
+) -> Result<bool, String> {
     let model_kind = job.options.model.model_kind();
     loop {
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
@@ -599,6 +2023,17 @@ fn receive_and_encode_frames(
         if cancel.load(Ordering::Relaxed) {
             return Err("キャンセルされました".to_owned());
         }
+        let current_source_frame = *source_frame_index;
+        *source_frame_index = source_frame_index.saturating_add(1);
+        if current_source_frame < planned.target_start_frame {
+            continue;
+        }
+        if current_source_frame >= planned.target_end_frame_exclusive {
+            return Ok(true);
+        }
+        let source_pts = decoded
+            .pts()
+            .unwrap_or_else(|| frame_to_pts(job, current_source_frame));
         let mut rgba = ffmpeg::util::frame::video::Video::new(
             ffmpeg::format::Pixel::RGBA,
             decoded.width(),
@@ -622,7 +2057,7 @@ fn receive_and_encode_frames(
         encode_scaler
             .run(&out_rgba, &mut yuv)
             .map_err(|e| format!("エンコード色変換に失敗しました: {e}"))?;
-        yuv.set_pts(Some(*frame_index));
+        yuv.set_pts(Some(*segment_frame_index));
         encoder
             .send_frame(&yuv)
             .map_err(|e| format!("エンコーダへのフレーム投入に失敗しました: {e}"))?;
@@ -634,15 +2069,16 @@ fn receive_and_encode_frames(
             mux_stream_time_base,
         )?;
 
-        *frame_index += 1;
-        progress
-            .frames_done
-            .store(*frame_index as u64, Ordering::Relaxed);
-        progress
-            .elapsed_ms
-            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        *last_source_pts = Some(source_pts);
+        *segment_frame_index += 1;
+        progress_mode.update(progress, *segment_frame_index as u64);
+        if matches!(progress_mode, SegmentProgressMode::Sequential { .. }) {
+            progress
+                .elapsed_ms
+                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn drain_encoder(
@@ -757,6 +2193,58 @@ fn gop_frames_for_fps(fps_num: i32, fps_den: i32) -> u32 {
 mod tests {
     use super::*;
 
+    fn test_job(estimated_frames: Option<u64>) -> VideoUpscaleJob {
+        VideoUpscaleJob {
+            source_path: PathBuf::from("clip.mp4"),
+            output_path: PathBuf::from("clip.miv.mkv"),
+            sidecar_path: PathBuf::from("clip.miv.json"),
+            info: VideoInfo {
+                width: 320,
+                height: 240,
+                fps_num: 24,
+                fps_den: 1,
+                source_time_base: TimeBase::new(1, 24_000),
+                estimated_frames,
+                duration_secs: estimated_frames.map(|frames| frames as f64 / 24.0),
+            },
+            options: VideoUpscaleOptions {
+                scale: VideoUpscaleScale::X2,
+                model: VideoUpscaleModelPreset::GeneralFast,
+                quality: VideoUpscaleQuality::Q3,
+                overwrite: false,
+            },
+            parallel_segments: Arc::new(AtomicU8::new(1)),
+        }
+    }
+
+    fn test_manifest(estimated_frames: u64) -> JobManifest {
+        JobManifest::new(
+            uuid::Uuid::new_v4(),
+            ManifestSource {
+                file_name: "clip.mp4".to_owned(),
+                size: 1234,
+                mtime_unix_ms: 0,
+                head_tail_sha256: "hash".to_owned(),
+                time_base: TimeBase::new(1, 24_000),
+            },
+            ManifestOutput {
+                final_path: PathBuf::from("clip.miv.mkv"),
+                sidecar_path: PathBuf::from("clip.miv.json"),
+                width: 640,
+                height: 480,
+            },
+            ManifestOptions {
+                scale: 2,
+                model: "realesr-general-x4v3".to_owned(),
+                quality_level: 3,
+                container: "mkv".to_owned(),
+                video_codec: "av1".to_owned(),
+                encoder: "libsvtav1".to_owned(),
+            },
+            estimated_frames,
+        )
+    }
+
     #[test]
     fn quality_levels_map_to_expected_encoder_settings() {
         assert_eq!(VideoUpscaleQuality::Q1.crf(), 20);
@@ -773,6 +2261,7 @@ mod tests {
             height: 1080,
             fps_num: 30,
             fps_den: 1,
+            source_time_base: TimeBase::new(1, 30),
             estimated_frames: Some(30),
             duration_secs: Some(1.0),
         };
@@ -787,5 +2276,243 @@ mod tests {
         assert_eq!(gop_frames_for_fps(30000, 1001), 60);
         assert_eq!(gop_frames_for_fps(24000, 1001), 48);
         assert_eq!(gop_frames_for_fps(60000, 1001), 120);
+    }
+
+    #[test]
+    fn segment_frames_for_fps_targets_about_five_seconds() {
+        assert_eq!(segment_frames_for_fps(24, 1), 120);
+        assert_eq!(segment_frames_for_fps(60, 1), 300);
+        assert_eq!(segment_frames_for_fps(24000, 1001), 120);
+        assert_eq!(segment_frames_for_fps(0, 1), 150);
+    }
+
+    #[test]
+    fn job_current_parallel_segments_clamps_atomic_value() {
+        let job = test_job(Some(100));
+        assert_eq!(job.current_parallel_segments(), 1);
+        job.parallel_segments.store(0, Ordering::Relaxed);
+        assert_eq!(job.current_parallel_segments(), 1);
+        job.parallel_segments.store(9, Ordering::Relaxed);
+        assert_eq!(job.current_parallel_segments(), 5);
+        job.parallel_segments.store(3, Ordering::Relaxed);
+        assert_eq!(job.current_parallel_segments(), 3);
+    }
+
+    #[test]
+    fn frame_to_pts_uses_source_time_base() {
+        let job = test_job(Some(240));
+        assert_eq!(frame_to_pts(&job, 0), 0);
+        assert_eq!(frame_to_pts(&job, 24), 24_000);
+        assert_eq!(frame_to_pts(&job, 120), 120_000);
+    }
+
+    #[test]
+    fn rescale_ticks_converts_between_time_bases() {
+        assert_eq!(
+            rescale_ticks(120, TimeBase::new(1, 24), TimeBase::new(1, 1000)),
+            5000
+        );
+        assert_eq!(
+            rescale_ticks(5000, TimeBase::new(1, 1000), TimeBase::new(1, 25)),
+            125
+        );
+    }
+
+    #[test]
+    fn packet_sort_key_compares_different_time_bases() {
+        let mut video = ffmpeg::Packet::empty();
+        video.set_dts(Some(120));
+        let mut audio = ffmpeg::Packet::empty();
+        audio.set_dts(Some(48000));
+
+        assert_eq!(
+            packet_sort_key(&video, ffmpeg::Rational(1, 24)),
+            5_000_000_000
+        );
+        assert_eq!(
+            packet_sort_key(&audio, ffmpeg::Rational(1, 48000)),
+            1_000_000_000
+        );
+        assert!(
+            packet_sort_key(&audio, ffmpeg::Rational(1, 48000))
+                < packet_sort_key(&video, ffmpeg::Rational(1, 24))
+        );
+    }
+
+    #[test]
+    fn packet_sort_key_uses_dts_then_pts_then_zero() {
+        let mut with_dts = ffmpeg::Packet::empty();
+        with_dts.set_pts(Some(100));
+        with_dts.set_dts(Some(90));
+        assert_eq!(
+            packet_sort_key(&with_dts, ffmpeg::Rational(1, 1000)),
+            90_000_000
+        );
+
+        let mut pts_only = ffmpeg::Packet::empty();
+        pts_only.set_pts(Some(100));
+        assert_eq!(
+            packet_sort_key(&pts_only, ffmpeg::Rational(1, 1000)),
+            100_000_000
+        );
+
+        let no_ts = ffmpeg::Packet::empty();
+        assert_eq!(packet_sort_key(&no_ts, ffmpeg::Rational(1, 1000)), 0);
+    }
+
+    #[test]
+    fn finalize_cancel_check_is_throttled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(check_finalize_cancel(&cancel, 0).is_ok());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(check_finalize_cancel(&cancel, 999).is_ok());
+        assert!(check_finalize_cancel(&cancel, 1000).is_err());
+    }
+
+    #[test]
+    fn planned_segment_for_unknown_total_uses_open_ended_pts() {
+        let job = test_job(None);
+        let planned = planned_segment_for_frames(&job, 0, 0, u64::MAX);
+        assert_eq!(planned.target_start_frame, 0);
+        assert_eq!(planned.target_end_frame_exclusive, u64::MAX);
+        assert_eq!(planned.target_start_pts, 0);
+        assert_eq!(planned.target_end_pts, i64::MAX);
+    }
+
+    #[test]
+    fn ensure_plan_creates_single_open_segment_when_total_unknown() {
+        let job = test_job(None);
+        let mut manifest = test_manifest(0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        ensure_plan(&job, &mut manifest, &cancel).unwrap();
+        let plan = manifest.plan.expect("plan");
+        assert_eq!(plan.state, SegmentPlanState::Complete);
+        assert_eq!(plan.segments.len(), 1);
+        assert_eq!(plan.segments[0].target_end_frame_exclusive, u64::MAX);
+    }
+
+    #[test]
+    fn ensure_plan_partitions_total_frames_with_remainder() {
+        let job = test_job(Some(250));
+        let mut manifest = test_manifest(250);
+        let cancel = Arc::new(AtomicBool::new(false));
+        ensure_plan(&job, &mut manifest, &cancel).unwrap();
+        let plan = manifest.plan.expect("plan");
+        let ranges: Vec<_> = plan
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.index,
+                    segment.target_start_frame,
+                    segment.target_end_frame_exclusive,
+                )
+            })
+            .collect();
+        assert_eq!(ranges, vec![(0, 0, 120), (1, 120, 240), (2, 240, 250)]);
+    }
+
+    #[test]
+    fn keyframe_plan_snaps_boundaries_and_records_seek_origin() {
+        let job = test_job(Some(260));
+        let keyframes = vec![
+            KeyframePoint { frame: 0, pts: 0 },
+            KeyframePoint {
+                frame: 121,
+                pts: frame_to_pts(&job, 121),
+            },
+            KeyframePoint {
+                frame: 240,
+                pts: frame_to_pts(&job, 240),
+            },
+        ];
+        let plan = plan_segments_from_keyframes(&job, 260, &keyframes).expect("keyframe plan");
+        let ranges: Vec<_> = plan
+            .iter()
+            .map(|segment| {
+                (
+                    segment.target_start_frame,
+                    segment.target_end_frame_exclusive,
+                    segment.seek_start_frame,
+                )
+            })
+            .collect();
+        assert_eq!(ranges, vec![(0, 121, 0), (121, 260, 121)]);
+        assert_eq!(plan[1].seek_start_pts, frame_to_pts(&job, 121));
+    }
+
+    #[test]
+    fn keyframe_plan_returns_none_when_keyframes_are_too_sparse() {
+        let job = test_job(Some(500));
+        let keyframes = vec![
+            KeyframePoint { frame: 0, pts: 0 },
+            KeyframePoint {
+                frame: 400,
+                pts: frame_to_pts(&job, 400),
+            },
+        ];
+        assert!(plan_segments_from_keyframes(&job, 500, &keyframes).is_none());
+    }
+
+    #[test]
+    fn keyframe_plan_returns_none_when_only_first_keyframe_exists() {
+        let job = test_job(Some(500));
+        let keyframes = vec![KeyframePoint { frame: 0, pts: 0 }];
+        assert!(plan_segments_from_keyframes(&job, 500, &keyframes).is_none());
+    }
+
+    #[test]
+    fn ensure_plan_keeps_existing_complete_plan() {
+        let job = test_job(Some(250));
+        let mut manifest = test_manifest(250);
+        manifest.plan = Some(SegmentPlan {
+            strategy: SegmentPlanStrategy::FrameBased,
+            state: SegmentPlanState::Complete,
+            scan_progress_pts: Some(42),
+            segments: vec![planned_segment_for_frames(&job, 9, 0, 10)],
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        ensure_plan(&job, &mut manifest, &cancel).unwrap();
+        let plan = manifest.plan.expect("plan");
+        assert_eq!(plan.strategy, SegmentPlanStrategy::FrameBased);
+        assert_eq!(plan.segments.len(), 1);
+        assert_eq!(plan.segments[0].index, 9);
+    }
+
+    #[test]
+    fn segment_done_and_reusable_requires_matching_done_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("clip.mp4");
+        let work_dir = work_dir_for(&source);
+        fs::create_dir_all(segments_dir_for(&work_dir)).unwrap();
+        let segment_path = segment_path(&work_dir, 0);
+        fs::write(&segment_path, b"abc").unwrap();
+
+        let mut manifest = test_manifest(120);
+        manifest.segments.push(SegmentEntry {
+            index: 0,
+            path: PathBuf::from("segments/000000.mkv"),
+            state: SegmentState::Done,
+            output_frame_start: 0,
+            output_frame_count: 120,
+            output_total_pts_ticks: 5000,
+            output_time_base: TimeBase::new(1, 1000),
+            source_start_pts: 0,
+            source_last_pts: 119,
+            size: 3,
+            mtime_unix_ms: 0,
+            worker_id: None,
+            worker_pid: None,
+            worker_started_unix_ms: None,
+        });
+
+        assert!(segment_done_and_reusable(&manifest, &work_dir, 0));
+
+        manifest.segments[0].size = 4;
+        assert!(!segment_done_and_reusable(&manifest, &work_dir, 0));
+
+        manifest.segments[0].size = 3;
+        manifest.segments[0].state = SegmentState::Failed;
+        assert!(!segment_done_and_reusable(&manifest, &work_dir, 0));
     }
 }
