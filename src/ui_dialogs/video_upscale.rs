@@ -74,15 +74,15 @@ impl App {
         });
     }
 
-    pub(crate) fn request_video_upscale_artifact_delete(&mut self, source_path: PathBuf) {
+    pub(crate) fn request_video_upscale_artifact_delete(&mut self, target_path: PathBuf) {
         let running_same_source = self
             .video_upscale_running
             .as_ref()
-            .is_some_and(|running| same_path_ci(&running.source_path, &source_path));
+            .is_some_and(|running| same_upscale_target_ci(&running.source_path, &target_path));
 
         let mut removed_queue_task = false;
         self.video_upscale_queue.tasks.retain(|task| {
-            let keep = !same_path_ci(&task.source_path, &source_path)
+            let keep = !same_upscale_target_ci(&task.source_path, &target_path)
                 || (running_same_source
                     && self
                         .video_upscale_running
@@ -96,7 +96,7 @@ impl App {
         }
 
         if let Some(running) = self.video_upscale_running.as_mut()
-            && same_path_ci(&running.source_path, &source_path)
+            && same_upscale_target_ci(&running.source_path, &target_path)
         {
             running.cancel.store(true, Ordering::Relaxed);
             running.delete_artifacts_after_cancel = true;
@@ -107,7 +107,7 @@ impl App {
             return;
         }
 
-        self.enqueue_video_upscale_artifact_delete(source_path);
+        self.enqueue_video_upscale_artifact_delete(target_path);
         self.show_feedback_toast("[アップスケール削除を開始]".to_owned());
     }
 
@@ -530,10 +530,11 @@ impl App {
         }
     }
 
-    fn enqueue_video_upscale_artifact_delete(&mut self, source_path: PathBuf) {
-        let output_path = derived_video_path_for(&source_path);
-        let sidecar_path = derived_sidecar_path_for(&source_path);
-        let work_dir = work_dir_for(&source_path);
+    fn enqueue_video_upscale_artifact_delete(&mut self, target_path: PathBuf) {
+        let artifacts = video_upscale_artifact_paths_for(&target_path);
+        let output_path = artifacts.output_path;
+        let sidecar_path = artifacts.sidecar_path;
+        let work_dir = artifacts.work_dir;
         let (tx, rx) = mpsc::channel();
         let reload_path = output_path.clone();
         thread::spawn(move || {
@@ -900,6 +901,48 @@ fn same_path_ci(a: &Path, b: &Path) -> bool {
     }
 }
 
+#[derive(Debug, Clone)]
+struct VideoUpscaleArtifactPaths {
+    output_path: PathBuf,
+    sidecar_path: PathBuf,
+    work_dir: PathBuf,
+}
+
+fn video_upscale_artifact_paths_for(target_path: &Path) -> VideoUpscaleArtifactPaths {
+    if let Some(source_stem) = miv_upscaled_source_stem(target_path) {
+        let source_stem_path = target_path.with_file_name(&source_stem);
+        return VideoUpscaleArtifactPaths {
+            output_path: target_path.to_path_buf(),
+            sidecar_path: target_path.with_file_name(format!("{source_stem}.miv.json")),
+            work_dir: work_dir_for(&source_stem_path),
+        };
+    }
+
+    VideoUpscaleArtifactPaths {
+        output_path: derived_video_path_for(target_path),
+        sidecar_path: derived_sidecar_path_for(target_path),
+        work_dir: work_dir_for(target_path),
+    }
+}
+
+fn miv_upscaled_source_stem(path: &Path) -> Option<String> {
+    const SUFFIX: &str = ".miv.mkv";
+    let file_name = path.file_name()?.to_string_lossy();
+    if !file_name.to_lowercase().ends_with(SUFFIX) {
+        return None;
+    }
+    let source_len = file_name.len().saturating_sub(SUFFIX.len());
+    if source_len == 0 {
+        return None;
+    }
+    Some(file_name[..source_len].to_owned())
+}
+
+fn same_upscale_target_ci(source_path: &Path, target_path: &Path) -> bool {
+    same_path_ci(source_path, target_path)
+        || same_path_ci(&derived_video_path_for(source_path), target_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +963,51 @@ mod tests {
             created_unix_ms: 1,
             updated_unix_ms: 2,
         }
+    }
+
+    #[test]
+    fn artifact_delete_paths_accept_source_video() {
+        let paths = video_upscale_artifact_paths_for(Path::new("C:\\videos\\movie.mp4"));
+
+        assert_eq!(
+            paths.output_path,
+            PathBuf::from("C:\\videos\\movie.miv.mkv")
+        );
+        assert_eq!(
+            paths.sidecar_path,
+            PathBuf::from("C:\\videos\\movie.miv.json")
+        );
+        assert_eq!(paths.work_dir, PathBuf::from("C:\\videos\\movie.miv.work"));
+    }
+
+    #[test]
+    fn artifact_delete_paths_accept_upscaled_derivative() {
+        let paths = video_upscale_artifact_paths_for(Path::new("C:\\videos\\movie.miv.mkv"));
+
+        assert_eq!(
+            paths.output_path,
+            PathBuf::from("C:\\videos\\movie.miv.mkv")
+        );
+        assert_eq!(
+            paths.sidecar_path,
+            PathBuf::from("C:\\videos\\movie.miv.json")
+        );
+        assert_eq!(paths.work_dir, PathBuf::from("C:\\videos\\movie.miv.work"));
+    }
+
+    #[test]
+    fn same_upscale_target_matches_source_and_derivative() {
+        let source = Path::new("C:\\videos\\movie.mp4");
+
+        assert!(same_upscale_target_ci(source, source));
+        assert!(same_upscale_target_ci(
+            source,
+            Path::new("C:\\videos\\movie.miv.mkv")
+        ));
+        assert!(!same_upscale_target_ci(
+            source,
+            Path::new("C:\\videos\\other.miv.mkv")
+        ));
     }
 
     #[test]

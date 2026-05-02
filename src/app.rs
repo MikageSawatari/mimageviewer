@@ -8249,6 +8249,7 @@ impl App {
         // ページ切替時に補正キャッシュをクリア（前ページの補正結果を残さない）
         // ただし ai_upscale_cache は消さない（再処理が重いため）
         self.adjustment_cache.remove(&idx);
+        let grid_open_intent = std::mem::take(&mut self.fs_open_intent_from_grid);
 
         // 画像切り替え時にズーム/パン/キャッシュをリセット
         self.analysis_zoom = 1.0;
@@ -8283,9 +8284,15 @@ impl App {
                 // start_fs_load の早期分岐で GridItem::Video を検出し、
                 // FsCacheEntry::Video を fs_cache に挿入する。
                 if self.fs_cache.contains_key(&idx) {
+                    if grid_open_intent
+                        && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx)
+                    {
+                        player.set_playing(true);
+                    }
                     crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
                 } else {
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
+                    self.fs_open_intent_from_grid = grid_open_intent;
                     self.start_fs_load(idx);
                 }
             }
@@ -9808,19 +9815,12 @@ impl App {
                 // migration: 旧 video_autoplay=true で video_autoplay_mode が
                 // デフォルト (= Off、つまり明示的に保存していない) なら Always に
                 // bridge する (= 旧設定からのアップグレードで挙動が突然変わらない)。
-                let mode = if self.settings.video_autoplay
-                    && self.settings.video_autoplay_mode == crate::settings::VideoAutoplayMode::Off
-                {
-                    crate::settings::VideoAutoplayMode::Always
-                } else {
-                    self.settings.video_autoplay_mode
-                };
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let autoplay = match mode {
-                    crate::settings::VideoAutoplayMode::Always => true,
-                    crate::settings::VideoAutoplayMode::OnlyFromGrid => from_grid,
-                    crate::settings::VideoAutoplayMode::Off => false,
-                };
+                let autoplay = video_autoplay_for_open(
+                    self.settings.video_autoplay_mode,
+                    self.settings.video_autoplay,
+                    from_grid,
+                );
                 // resume 位置の取得: 直近に保存した位置を渡して最初の info 受領後に
                 // 自動シークさせる。Windows の case-insensitive パスを揃えるため
                 // adjustment_db::normalize_path に合わせる。
@@ -15029,6 +15029,23 @@ pub(crate) fn color_image_to_dynamic_composited(
     image::DynamicImage::ImageRgb8(buf)
 }
 
+fn video_autoplay_for_open(
+    mode: crate::settings::VideoAutoplayMode,
+    legacy_autoplay: bool,
+    from_grid: bool,
+) -> bool {
+    let mode = if legacy_autoplay && mode == crate::settings::VideoAutoplayMode::Off {
+        crate::settings::VideoAutoplayMode::Always
+    } else {
+        mode
+    };
+    match mode {
+        crate::settings::VideoAutoplayMode::Always => true,
+        crate::settings::VideoAutoplayMode::OnlyFromGrid
+        | crate::settings::VideoAutoplayMode::Off => from_grid,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15101,6 +15118,34 @@ mod tests {
     }
 
     // ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
+
+    #[test]
+    fn video_autoplay_for_open_treats_grid_open_as_play_intent() {
+        use crate::settings::VideoAutoplayMode;
+
+        assert!(video_autoplay_for_open(VideoAutoplayMode::Off, false, true));
+        assert!(!video_autoplay_for_open(
+            VideoAutoplayMode::Off,
+            false,
+            false
+        ));
+        assert!(video_autoplay_for_open(
+            VideoAutoplayMode::OnlyFromGrid,
+            false,
+            true
+        ));
+        assert!(!video_autoplay_for_open(
+            VideoAutoplayMode::OnlyFromGrid,
+            false,
+            false
+        ));
+        assert!(video_autoplay_for_open(
+            VideoAutoplayMode::Always,
+            false,
+            false
+        ));
+        assert!(video_autoplay_for_open(VideoAutoplayMode::Off, true, false));
+    }
 
     #[test]
     fn rating_filter_container_uses_all_6_buckets() {
