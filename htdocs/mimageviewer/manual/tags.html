@@ -54,6 +54,8 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         タグ機能は対応形式 (JPEG / PNG / WebP) の<strong>ファイル本体にメタデータを書き込み</strong>ます。
+        動画ファイル (MP4 / MKV / MOV など) の場合は本体を書き換えず、同じフォルダに同名の
+        <code>.xmp</code> サイドカーファイル (例: <code>video.mp4.xmp</code>) を作成して保存します。
         初めて使うときは必ず<a href="#precautions">注意事項</a>を確認してください。
       </div>
     </div>
@@ -209,14 +211,24 @@
         <tr><td>JPEG (.jpg / .jpeg)</td><td>◯</td><td>◯</td></tr>
         <tr><td>PNG</td><td>◯</td><td>◯</td></tr>
         <tr><td>WebP</td><td>◯</td><td>◯</td></tr>
+        <tr><td>動画 (MP4 / MKV / MOV / AVI / WMV / MPG / MPEG)</td><td>◯ (サイドカー)</td><td>◯ (サイドカー)</td></tr>
         <tr><td>HEIC / HEIF</td><td>◯</td><td>✗</td></tr>
         <tr><td>TIFF / GIF / BMP / JXL / AVIF / RAW</td><td>条件付</td><td>✗</td></tr>
         <tr><td>ZIP 内の画像</td><td>◯</td><td>✗</td></tr>
-        <tr><td>PDF / 動画</td><td>✗</td><td>✗</td></tr>
+        <tr><td>PDF</td><td>✗</td><td>✗</td></tr>
       </tbody>
     </table>
     <p>書き込み非対応の形式は、メニュー / ツールバーのタグボタンが<strong>グレーアウト</strong>して
     選択できません。</p>
+
+    <h3>動画ファイルのサイドカー</h3>
+    <p>動画ファイル本体を書き換えると数 GB 規模の書き直しになり実用的でないため、動画では同名の
+    <code>.xmp</code> サイドカー (例: <code>movie.mp4</code> → <code>movie.mp4.xmp</code>) を
+    動画ファイルと同じフォルダに作成し、そこにタグを保存します。Adobe Lightroom / Bridge /
+    Premiere が標準採用している方式と互換なので、それらのソフトでも同じタグが読み書きできます。</p>
+    <p><strong>動画ファイルを別のフォルダ・別のドライブに移動するときは、サイドカーの
+    <code>.xmp</code> ファイルも一緒に移動してください。</strong>サイドカーが分離するとタグが
+    見えなくなります (元の場所に戻すか、新しい場所に <code>.xmp</code> を持っていけば復活します)。</p>
 
     <h3>読み取り専用ファイル</h3>
     <p>ファイル属性が「読み取り専用」になっているとタグ書き込みに失敗します。エラーが記録されるだけで

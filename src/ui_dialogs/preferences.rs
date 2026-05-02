@@ -202,13 +202,9 @@ pub(crate) struct PreferencesState {
     pub trt_pack_installed: bool,
     /// TRT pack の総ディスク使用量 (MiB)
     pub trt_pack_size_mib: u64,
-    /// TRT engine cache の総ディスク使用量 (MiB)
-    pub trt_engine_cache_size_mib: u64,
     /// 「TensorRT パックをダウンロード」ボタンが押されたか。
     /// 環境設定の Apply/Cancel 後に App 側で読み取って TRT install dialog を開く。
     pub start_trt_install_requested: bool,
-    /// エンジンキャッシュ削除の確認ダイアログ表示中フラグ (Codex P3-2)。
-    pub trt_cache_delete_confirm_open: bool,
 
     // ── VST3 プラグイン編集 ────────────────────────────────────────
     /// 環境設定を開いた時点でスキャンされていた VST3 プラグイン候補のスナップショット。
@@ -264,9 +260,6 @@ impl PreferencesState {
         } else {
             0
         };
-        let trt_engine_cache_size_mib =
-            dir_size_bytes(&crate::ai::tensorrt_pack::engine_cache_dir()) / (1024 * 1024);
-
         Self {
             settings: s.clone(),
             selected: PreferencesPage::Thumbnail,
@@ -282,9 +275,7 @@ impl PreferencesState {
             current_runtime_fallback_reason,
             trt_pack_installed,
             trt_pack_size_mib,
-            trt_engine_cache_size_mib,
             start_trt_install_requested: false,
-            trt_cache_delete_confirm_open: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_filter: String::new(),
@@ -1148,80 +1139,6 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 egui::Color32::from_rgb(100, 200, 100),
                 format!("✓ パック展開済み ({} MiB)", state.trt_pack_size_mib),
             );
-            ui.add_space(8.0);
-
-            // エンジンキャッシュ管理
-            // 配布されたエンジンファイル (mikage 側で AMPERE_PLUS で事前ビルド済み、
-            // tensorrt-engines/<model>/<file>.engine として展開) と、ユーザー機固有の
-            // 再コンパイル結果 (将来エンジン互換が崩れた場合の残骸) が同居する。
-            // ドライバ更新後にデシリアライズエラーが出るなら削除して再 DL を促す。
-            ui.label(format!(
-                "エンジンキャッシュ: {} MiB",
-                state.trt_engine_cache_size_mib
-            ));
-            ui.label(
-                egui::RichText::new(
-                    "(配布パックに含まれる事前ビルド済みエンジン。\n\
-                     ドライバ更新後等にエラーが出る場合は削除し、再 DL してください)",
-                )
-                .small(),
-            );
-            ui.add_space(4.0);
-            if ui.button("エンジンキャッシュを削除").clicked() {
-                // Codex P3-2: ボタンクリックで即削除ではなく、確認ダイアログを開く
-                // (= 他のキャッシュ管理 UI と挙動を揃える)
-                state.trt_cache_delete_confirm_open = true;
-            }
-            // 確認ダイアログ
-            if state.trt_cache_delete_confirm_open {
-                let mut do_delete = false;
-                let mut do_cancel = false;
-                egui::Window::new("エンジンキャッシュ削除の確認")
-                    .collapsible(false)
-                    .resizable(false)
-                    .open(&mut state.trt_cache_delete_confirm_open.clone())
-                    .show(ui.ctx(), |ui| {
-                        ui.label(format!(
-                            "エンジンキャッシュ ({} MiB) を削除します。",
-                            state.trt_engine_cache_size_mib
-                        ));
-                        ui.label("再ダウンロードに 5〜15 分かかります。実行してよろしいですか?");
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("削除する").clicked() {
-                                do_delete = true;
-                            }
-                            if ui.button("キャンセル").clicked() {
-                                do_cancel = true;
-                            }
-                        });
-                    });
-                if do_delete {
-                    let dir = crate::ai::tensorrt_pack::engine_cache_dir();
-                    match std::fs::remove_dir_all(&dir) {
-                        Ok(()) => {
-                            state.trt_engine_cache_size_mib = 0;
-                            crate::logger::log(format!(
-                                "[AI] エンジンキャッシュを削除しました: {}",
-                                dir.display()
-                            ));
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            state.trt_engine_cache_size_mib = 0;
-                        }
-                        Err(e) => {
-                            crate::logger::log(format!(
-                                "[AI] エンジンキャッシュ削除に失敗: {} ({})",
-                                dir.display(),
-                                e
-                            ));
-                        }
-                    }
-                    state.trt_cache_delete_confirm_open = false;
-                } else if do_cancel {
-                    state.trt_cache_delete_confirm_open = false;
-                }
-            }
         }
     }
 }

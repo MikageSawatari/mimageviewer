@@ -22,7 +22,7 @@
 //! 5. 一時ファイル → rename でアトミック置換
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use quick_xml::events::Event;
@@ -107,11 +107,38 @@ fn detect_format(path: &Path) -> Option<Format> {
     }
 }
 
-/// パスの拡張子がタグ書き込み対応形式か判定。
-/// 現状 JPEG / PNG / WebP のみ。UI の grayout 判定と worker の処理判定の
-/// 単一ソースにする。
+/// パスの拡張子が **画像メタデータ書き込み対応形式** か判定 (JPEG / PNG / WebP)。
+/// xmp:Rating など「画像本体に埋め込む XMP」を書き込む経路で使う。
+/// 動画は対象外 (rating の動画対応は将来課題)。
 pub fn is_writable_format(path: &Path) -> bool {
     detect_format(path).is_some()
+}
+
+/// パスの拡張子が **タグ書き込み対応形式** か判定。
+/// JPEG / PNG / WebP は埋め込み XMP に直接書き込み、動画 (mp4/mkv/mov/...) は
+/// サイドカー XMP ファイル (`<path>.xmp`) に書き込む。
+/// タグ系 UI (グレーアウト判定 / 対象パス算出 / prewarm キャッシュ) で使う。
+pub fn is_taggable_format(path: &Path) -> bool {
+    detect_format(path).is_some() || is_video_for_sidecar(path)
+}
+
+/// 動画ファイル拡張子か判定 (XMP サイドカー方式でタグを保存する対象)。
+/// Lightroom / Adobe Bridge / Premiere が同名 `.xmp` サイドカーを認識する標準形式。
+/// 拡張子集合は mIV が再生サポートしている動画 (`SUPPORTED_VIDEO_EXTENSIONS`) と一致させる。
+pub fn is_video_for_sidecar(path: &Path) -> bool {
+    let ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(s) => s.to_ascii_lowercase(),
+        None => return false,
+    };
+    crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// 動画ファイルに対する XMP サイドカーのパス (例: `video.mp4` → `video.mp4.xmp`)。
+/// Adobe Premiere / Lightroom と同じ「拡張子保持型」命名。
+pub fn sidecar_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".xmp");
+    PathBuf::from(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +164,12 @@ pub enum TagOp {
 /// 成功時は `Ok(new_tags)` で編集後のタグ列 (スペース区切り `#原神 #風景 既存`) を返す。
 pub fn apply_tag_op(path: &Path, op: &TagOp) -> Result<String, WriteError> {
     let _lock = XMP_WRITE_LOCK.lock().unwrap();
+
+    // 動画は本体を触らずサイドカー XMP に書き込む (Lightroom 互換)。
+    if is_video_for_sidecar(path) {
+        return apply_tag_op_video_sidecar(path, op);
+    }
+
     let format = detect_format(path).ok_or(WriteError::UnsupportedFormat)?;
 
     // 読み取り専用チェック (早期失敗)
@@ -155,6 +188,37 @@ pub fn apply_tag_op(path: &Path, op: &TagOp) -> Result<String, WriteError> {
     };
 
     write_atomically(path, &new_bytes)?;
+    Ok(new_tags)
+}
+
+/// 動画ファイル用: 同名サイドカー (`video.mp4.xmp`) を読み書きする。
+/// 動画ファイル本体には一切触らないので、巨大ファイルでも瞬時に完了する。
+fn apply_tag_op_video_sidecar(path: &Path, op: &TagOp) -> Result<String, WriteError> {
+    let sidecar = sidecar_path_for(path);
+
+    // 既存 sidecar を読む (存在しなければ空 = MINIMAL_XMP_TEMPLATE から生成)
+    let existing: Vec<u8> = match std::fs::read(&sidecar) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(WriteError::Io(e)),
+    };
+
+    // sidecar が既にあって読み取り専用なら早期失敗
+    if !existing.is_empty()
+        && let Ok(meta) = std::fs::metadata(&sidecar)
+        && meta.permissions().readonly()
+    {
+        return Err(WriteError::ReadOnly);
+    }
+
+    let (new_xmp, new_tags) = edit_xmp_packet(&existing, op)?;
+
+    // sidecar が無く、結果もタグなしなら何も書かない (空 sidecar を残さない)
+    if existing.is_empty() && new_tags.is_empty() {
+        return Ok(String::new());
+    }
+
+    write_atomically(&sidecar, &new_xmp)?;
     Ok(new_tags)
 }
 

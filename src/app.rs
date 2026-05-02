@@ -1975,6 +1975,14 @@ pub struct App {
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)。フルスクリーン / グリッド共通。
     /// 命名の `fs_` プレフィックスはフルスクリーン専用だった頃の名残。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
+    /// 動画 HUD の最終ユーザー活動時刻 (マウス移動 / キー入力 / HUD ホバー)。
+    /// `draw_video_hud` がアイドル時間を計算してフェードアウトの αを決定する。
+    /// `None` は「まだ動画を開いた直後 / 直前に活動があったとみなす」状態。
+    pub(crate) video_hud_last_activity: Option<std::time::Instant>,
+    /// 動画 HUD が現在描画されている可視度 (0.0 = 完全非表示、1.0 = フル表示)。
+    /// `video_hud_rect` のクリック判定が「描画されている領域だけクリックを吸収する」
+    /// ように使う (= フェードアウト後の領域は背景クリックを通過させる)。
+    pub(crate) video_hud_visible_factor: f32,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -2593,6 +2601,8 @@ impl Default for App {
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
+            video_hud_last_activity: None,
+            video_hud_visible_factor: 1.0,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9340,12 +9350,15 @@ impl App {
             if self.tag_prewarm_queued.contains(&idx) {
                 continue;
             }
-            let Some(GridItem::Image(p)) = self.items.get(idx) else {
-                // 非 Image (Folder/Zip/Pdf/Video) もキャッシュ対象外。idx を記録して再走回避。
-                self.tag_prewarm_queued.insert(idx);
-                continue;
+            let p = match self.items.get(idx) {
+                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+                _ => {
+                    // 非 Image/Video (Folder/Zip/Pdf 等) はキャッシュ対象外。
+                    self.tag_prewarm_queued.insert(idx);
+                    continue;
+                }
             };
-            if !crate::xmp_writer::is_writable_format(p) {
+            if !crate::xmp_writer::is_taggable_format(p) {
                 self.tag_prewarm_queued.insert(idx);
                 continue;
             }
@@ -9465,8 +9478,9 @@ impl App {
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
     /// キャッシュに載っていない = fts_meta 未登録 → 空を返す (バッジ非表示)。
     pub(crate) fn cell_tag_list(&self, idx: usize) -> &[String] {
-        let Some(GridItem::Image(p)) = self.items.get(idx) else {
-            return &[];
+        let p = match self.items.get(idx) {
+            Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+            _ => return &[],
         };
         let key = crate::adjustment_db::normalize_path(p);
         self.tags_cache
@@ -14183,7 +14197,9 @@ pub(crate) fn draw_cell(
         egui::Color32::from_gray(230)
     };
 
-    let bg = if is_selected {
+    // カーソル位置 (selected) もマルチ選択チェック済み (checked) も同じ青背景に。
+    // カーソル位置を示す太い青枠は selected のときだけ付く (下の border 判定で分岐)。
+    let bg = if is_selected || is_checked {
         if dark {
             egui::Color32::from_rgb(40, 70, 110)
         } else {

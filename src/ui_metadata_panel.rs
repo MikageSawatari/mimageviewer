@@ -330,22 +330,17 @@ impl App {
         tags
     }
 
-    /// 現在のフルスクリーン画像がタグ付与対象 (通常画像 JPEG/PNG/WebP) なら Path を返す。
+    /// 現在のフルスクリーン画像/動画がタグ付与対象なら Path を返す。
     /// ZIP 内・PDF ページ・フォルダなどは None。
+    /// 動画は同名 `.xmp` サイドカー経由で `dc:subject` を読み書きする。
     fn current_taggable_image_path(&self) -> Option<std::path::PathBuf> {
         use crate::grid_item::GridItem;
         let idx = self.fullscreen_idx?;
-        if let Some(GridItem::Image(p)) = self.items.get(idx) {
-            // 拡張子判定は tag_ops と同じ基準
-            let ext = p
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_ascii_lowercase())?;
-            if matches!(ext.as_str(), "jpg" | "jpeg" | "jfif" | "png" | "webp") {
-                return Some(p.clone());
-            }
-        }
-        None
+        let p = match self.items.get(idx)? {
+            GridItem::Image(p) | GridItem::Video(p) => p,
+            _ => return None,
+        };
+        crate::xmp_writer::is_taggable_format(p).then(|| p.clone())
     }
 }
 
