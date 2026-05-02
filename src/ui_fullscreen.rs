@@ -1068,6 +1068,19 @@ impl App {
                             // Phase 5.5: タイルモード中は他のパネルを抑止しオーバーレイのみ描画。
                             #[cfg(windows)]
                             {
+                                if self.video_tile_reopen_pending
+                                    && self.video_tile_state.is_none()
+                                {
+                                    let screen = ctx.content_rect().size();
+                                    self.toggle_video_tile_mode(fs_idx, screen);
+                                    if self.video_tile_state.is_some() {
+                                        self.video_tile_reopen_pending = false;
+                                    } else {
+                                        ctx.request_repaint_after(
+                                            std::time::Duration::from_millis(80),
+                                        );
+                                    }
+                                }
                                 if self.video_tile_state.is_some() {
                                     self.draw_video_tile_overlay(ui, ctx, full_rect, fs_idx);
                                 } else {
@@ -2253,16 +2266,16 @@ impl App {
             self.handle_middle_drag_zoom(ctx, full_rect);
         }
 
-        // 動画タイルモード中は generic ホイール処理を完全にスキップして、
-        // タイル overlay 側の Ctrl+Wheel (= 列数切替) を有効にする。
-        // ここで raw/smooth_scroll_delta をクリアしてしまうと overlay が
-        // wheel を見えず、ユーザー視点で「Ctrl+Wheel が動画ズーム扱い」になる。
+        // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。
+        // Ctrl+Wheel はタイル overlay 側の列数切替に渡すため、ここでは消費しない。
         #[cfg(windows)]
         let in_video_tile = self.video_tile_state.is_some();
         #[cfg(not(windows))]
         let in_video_tile = false;
         let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
-        if wheel_y.abs() > 0.5 && !cursor_in_panel && !in_video_tile {
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let handle_wheel_here = !cursor_in_panel && (!in_video_tile || !ctrl_held);
+        if wheel_y.abs() > 0.5 && handle_wheel_here {
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
@@ -2271,7 +2284,6 @@ impl App {
             });
             // 消しゴムモード: 筆/直線ツールでは修飾なしホイールで太さ調整
             // (Ctrl+ホイールは通常のズームに残す)
-            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
             if !ctrl_held
                 && self.erase_mode
                 && matches!(
@@ -2308,7 +2320,6 @@ impl App {
                     self.maybe_rerender_pdf(self.analysis_zoom);
                 }
             } else {
-                let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
                 if ctrl_held {
                     // 通常モード: Ctrl+ホイールでズーム
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
@@ -2561,6 +2572,29 @@ impl App {
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
 
+    fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        #[cfg(windows)]
+        let restore_video_tile = self.video_tile_state.is_some();
+
+        #[cfg(windows)]
+        if restore_video_tile {
+            self.video_tile_state = None;
+            self.video_tile_textures.clear();
+        }
+
+        self.open_fullscreen(idx);
+
+        #[cfg(windows)]
+        {
+            if restore_video_tile && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+                self.video_tile_reopen_pending = true;
+                ctx.request_repaint();
+            } else if restore_video_tile {
+                self.video_tile_reopen_pending = false;
+            }
+        }
+    }
+
     /// フルスクリーン終了・ナビゲーション・スライドショーを処理する。
     fn handle_fs_navigation(
         &mut self,
@@ -2613,7 +2647,7 @@ impl App {
             }
         } else if !close_fs {
             if let Some(new_idx) = jump_to {
-                self.open_fullscreen(new_idx);
+                self.open_fullscreen_from_fs_navigation(ctx, new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -2624,7 +2658,7 @@ impl App {
                     fs_idx,
                     nav_delta,
                 ) {
-                    self.open_fullscreen(new_idx);
+                    self.open_fullscreen_from_fs_navigation(ctx, new_idx);
                     self.selected = Some(new_idx);
                     self.scroll_to_selected = true;
                     self.update_last_selected_image();
@@ -2670,7 +2704,7 @@ impl App {
                     });
                     match target {
                         Some(idx) => {
-                            self.open_fullscreen(idx);
+                            self.open_fullscreen_from_fs_navigation(ctx, idx);
                             self.selected = Some(idx);
                             self.scroll_to_selected = true;
                         }
