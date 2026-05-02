@@ -215,11 +215,20 @@ pub(crate) struct PreferencesState {
     /// VST3 ページ内でスキャン / 再スキャンで更新する。Apply 後に App 側に反映する。
     #[cfg(windows)]
     pub vst3_discovered: Vec<crate::video::dsp::DiscoveredPlugin>,
+    /// VST3 scan/probe worker の完了通知。bridge subprocess で bus probe するため
+    /// UI thread では直接走らせない。
+    #[cfg(windows)]
+    pub vst3_scan_rx:
+        Option<std::sync::mpsc::Receiver<Result<Vec<crate::video::dsp::DiscoveredPlugin>, String>>>,
+    #[cfg(windows)]
+    pub vst3_scan_in_progress: bool,
+    #[cfg(windows)]
+    pub vst3_scan_error: Option<String>,
     /// VST3 ページ内のフィルタ文字列。
     pub vst3_filter: String,
-    /// Instrument 系 (= MIDI 入力で発音するもの) も候補一覧に表示する。
+    /// 音声入力を持たない plugin (= Instrument / MIDI FX 等) も候補一覧に表示する。
     #[cfg(windows)]
-    pub vst3_show_instruments: bool,
+    pub vst3_show_unusable: bool,
     /// 現在 auto-bypass されているスロットのスナップショット (= 名前, latency_ms)。
     /// VST3 ページ下部の赤字警告表示用。`show_preferences_dialog` の頭で
     /// `dsp_bridge` から毎フレーム refresh される (= ON/OFF が即座に反映)。
@@ -287,9 +296,15 @@ impl PreferencesState {
             trt_cache_delete_confirm_open: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
+            #[cfg(windows)]
+            vst3_scan_rx: None,
+            #[cfg(windows)]
+            vst3_scan_in_progress: false,
+            #[cfg(windows)]
+            vst3_scan_error: None,
             vst3_filter: String::new(),
             #[cfg(windows)]
-            vst3_show_instruments: false,
+            vst3_show_unusable: false,
             #[cfg(windows)]
             vst3_auto_bypassed: Vec::new(),
         }
@@ -1594,6 +1609,31 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     const MAX_CHAIN_LEN: usize = 10;
 
+    if let Some(rx) = state.vst3_scan_rx.as_ref() {
+        match rx.try_recv() {
+            Ok(Ok(found)) => {
+                state.vst3_discovered = found;
+                state.vst3_scan_rx = None;
+                state.vst3_scan_in_progress = false;
+                state.vst3_scan_error = None;
+            }
+            Ok(Err(err)) => {
+                state.vst3_scan_rx = None;
+                state.vst3_scan_in_progress = false;
+                state.vst3_scan_error = Some(err);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.vst3_scan_rx = None;
+                state.vst3_scan_in_progress = false;
+                state.vst3_scan_error = Some("VST3 scan worker が終了しました".to_string());
+            }
+        }
+    }
+
     ui.label(
         "動画音声を VST3 プラグインで加工してから再生します。\n\
          LUFS 測定 (Youlean LM2 等) や EQ (FabFilter Pro-Q 等) で動画の音声を\n\
@@ -1725,38 +1765,69 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     // ── プラグイン追加 ──
     ui.horizontal(|ui| {
-        let scan_label = if state.vst3_discovered.is_empty() {
+        let scan_label = if state.vst3_scan_in_progress {
+            "スキャン中..."
+        } else if state.vst3_discovered.is_empty() {
             "プラグインをスキャン"
         } else {
             "再スキャン"
         };
         if ui
-            .button(scan_label)
-            .on_hover_text("%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査して .vst3 を列挙")
+            .add_enabled(!state.vst3_scan_in_progress, egui::Button::new(scan_label))
+            .on_hover_text(
+                "%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査し、bridge subprocess で audio input/output を確認します",
+            )
             .clicked()
         {
-            state.vst3_discovered =
-                crate::video::dsp::scan(&crate::video::dsp::default_vst3_paths());
+            let (tx, rx) = std::sync::mpsc::channel();
+            state.vst3_scan_rx = Some(rx);
+            state.vst3_scan_in_progress = true;
+            state.vst3_scan_error = None;
+            if let Err(e) = std::thread::Builder::new()
+                .name("vst3-scan-probe".into())
+                .spawn(move || {
+                    let roots = crate::video::dsp::default_vst3_paths();
+                    let result = crate::video::dsp::scan_with_audio_probe(&roots);
+                    let _ = tx.send(result);
+                })
+            {
+                state.vst3_scan_rx = None;
+                state.vst3_scan_in_progress = false;
+                state.vst3_scan_error = Some(format!("scan worker 起動失敗: {e}"));
+            }
         }
         if !state.vst3_discovered.is_empty() {
-            let hidden_instruments = state
+            let hidden_unusable = state
                 .vst3_discovered
                 .iter()
-                .filter(|p| p.is_instrument)
+                .filter(|p| p.hidden_by_default())
+                .count();
+            let probe_errors = state
+                .vst3_discovered
+                .iter()
+                .filter(|p| p.has_probe_error())
                 .count();
             ui.label(
-                egui::RichText::new(if hidden_instruments > 0 && !state.vst3_show_instruments {
-                    format!(
-                        "({} 個検出 / Instrument {} 個は非表示)",
-                        state.vst3_discovered.len(),
-                        hidden_instruments
-                    )
-                } else if hidden_instruments > 0 {
-                    format!(
-                        "({} 個検出 / Instrument {} 個を含む)",
-                        state.vst3_discovered.len(),
-                        hidden_instruments
-                    )
+                egui::RichText::new(if hidden_unusable > 0 && !state.vst3_show_unusable {
+                    let mut text = format!(
+                        "{} 個検出 / 音声入力なし {} 個は非表示",
+                        state.vst3_discovered.len(), hidden_unusable
+                    );
+                    if probe_errors > 0 {
+                        text.push_str(&format!(" / error {probe_errors} 個"));
+                    }
+                    format!("({text})")
+                } else if hidden_unusable > 0 {
+                    let mut text = format!(
+                        "{} 個検出 / 音声入力なし {} 個を含む",
+                        state.vst3_discovered.len(), hidden_unusable
+                    );
+                    if probe_errors > 0 {
+                        text.push_str(&format!(" / error {probe_errors} 個"));
+                    }
+                    format!("({text})")
+                } else if probe_errors > 0 {
+                    format!("({} 個検出 / error {probe_errors} 個)", state.vst3_discovered.len())
                 } else {
                     format!("({} 個検出)", state.vst3_discovered.len())
                 })
@@ -1772,6 +1843,20 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
         }
     });
+    if let Some(err) = &state.vst3_scan_error {
+        ui.label(
+            egui::RichText::new(format!("スキャンに失敗しました: {err}"))
+                .small()
+                .color(egui::Color32::from_rgb(220, 80, 80)),
+        );
+    }
+    ui.label(
+        egui::RichText::new(
+            "認証が必要な VST3 は、他の DAW で 1 度起動して認証を済ませてから再スキャンしてください。",
+        )
+        .small()
+        .weak(),
+    );
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -1782,13 +1867,13 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .desired_width(f32::INFINITY),
         );
     });
-    if state.vst3_discovered.iter().any(|p| p.is_instrument) {
+    if state.vst3_discovered.iter().any(|p| p.hidden_by_default()) {
         ui.checkbox(
-            &mut state.vst3_show_instruments,
-            "Instrument 系も表示",
+            &mut state.vst3_show_unusable,
+            "音声入力なしのプラグインも表示",
         )
         .on_hover_text(
-            "MIDI 入力で発音するシンセ等も候補に表示します。通常の動画音声処理では Effect 系だけを使います。",
+            "Instrument / MIDI FX 等、動画音声を入力として受け取れない VST3 も候補に表示します。",
         );
     }
     ui.add_space(2.0);
@@ -1818,7 +1903,7 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for plugin in &state.vst3_discovered {
-                if plugin.is_instrument && !state.vst3_show_instruments {
+                if plugin.hidden_by_default() && !state.vst3_show_unusable {
                     continue;
                 }
                 let path_s = plugin.path.to_string_lossy().to_string();
@@ -1831,15 +1916,29 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 {
                     continue;
                 }
-                let label = if already_in_chain {
-                    format!("{}  (追加済み)", plugin.display_name)
+                let base_label = if plugin.has_probe_error() {
+                    format!("{}  (error)", plugin.display_name)
+                } else if let Some(reason) = plugin.hidden_reason() {
+                    format!("{}  ({reason})", plugin.display_name)
                 } else {
                     plugin.display_name.clone()
                 };
-                let enabled = !already_in_chain && !chain_full;
+                let label = if already_in_chain {
+                    format!("{base_label}  (追加済み)")
+                } else {
+                    base_label
+                };
+                let enabled = !already_in_chain && !chain_full && !plugin.has_probe_error();
+                let hover = if let Some(err) = &plugin.probe_error {
+                    format!(
+                        "{path_s}\n\nprobe error: {err}\n\n認証が必要な場合は、他の DAW で認証を済ませてから再スキャンしてください。"
+                    )
+                } else {
+                    path_s.clone()
+                };
                 let resp = ui
                     .add_enabled(enabled, egui::Button::new(label))
-                    .on_hover_text(&path_s);
+                    .on_hover_text(hover);
                 if resp.clicked() {
                     clicked_add = Some(path_s);
                 }

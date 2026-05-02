@@ -31,10 +31,27 @@ struct LoadedPluginInfo {
     // params は今後拡張 (Phase A 後半で)
 };
 
+struct PluginProbeInfo {
+    std::string plugin_name;
+    uint32_t audio_input_buses = 0;
+    uint32_t audio_output_buses = 0;
+    uint32_t event_input_buses = 0;
+    uint32_t event_output_buses = 0;
+    uint32_t audio_input_channels = 0;
+    uint32_t audio_output_channels = 0;
+    bool usable_audio_effect = false;
+};
+
 class PluginLoader {
 public:
     PluginLoader();
     ~PluginLoader();
+
+    /// .vst3 を短時間だけロードし、mIV の音声処理に使える audio input/output を
+    /// 持つか調べる。process setup / audio thread / GUI attach は行わない。
+    static bool probe(const std::string& plugin_path,
+                      PluginProbeInfo& info_out,
+                      std::string& error_out);
 
     // .vst3 ファイルをロードし、IAudioProcessor / IComponent をセットアップする。
     // sample_rate と block_size は ProcessSetup に渡される。

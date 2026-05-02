@@ -34,7 +34,7 @@ pub fn disable_transitions_for_thread_windows() {
     }
 }
 
-unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+pub fn disable_transitions_for_window(hwnd: HWND) {
     let disable: BOOL = BOOL(1);
     let _ = unsafe {
         DwmSetWindowAttribute(
@@ -44,5 +44,9 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
             std::mem::size_of::<BOOL>() as u32,
         )
     };
+}
+
+unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    disable_transitions_for_window(hwnd);
     BOOL(1) // TRUE = 列挙続行
 }

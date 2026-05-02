@@ -27,6 +27,8 @@ pub mod cache_maintenance;
 pub mod catalog;
 pub mod data_dir;
 pub mod delete_worker;
+#[cfg(windows)]
+pub mod dwm_transitions;
 pub mod exif_reader;
 pub mod fast_resize;
 pub mod folder_rating_counter;

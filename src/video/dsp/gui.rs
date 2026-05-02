@@ -514,6 +514,7 @@ fn create_window(
         )
         .map_err(|e| std::io::Error::other(format!("CreateWindowExW: {e}")))?;
 
+        crate::dwm_transitions::disable_transitions_for_window(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);
 
         // 実 client rect を確認 (デバッグ用)
@@ -598,6 +599,7 @@ pub fn bring_to_front(hwnd_u64: u64) {
     }
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
+        crate::dwm_transitions::disable_transitions_for_window(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(
             hwnd,
@@ -704,6 +706,7 @@ pub fn set_window_visible(hwnd_u64: u64, visible: bool) {
     }
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
+        crate::dwm_transitions::disable_transitions_for_window(hwnd);
         let _ = ShowWindow(hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
     }
 }
@@ -740,5 +743,84 @@ pub fn resize_window_client(hwnd_u64: u64, width: u32, height: u32) {
             outer_h,
             SWP_NOMOVE | SWP_NOZORDER,
         );
+    }
+}
+
+/// Show the given windows and restore their front-to-back order in one Win32 batch.
+///
+/// `ordered_top_to_bottom` must be the desired z-order snapshot. We submit it
+/// bottom-to-top because each TOPMOST / NOTOPMOST insertion promotes the current
+/// HWND within its group; the last HWND submitted becomes the front-most one.
+pub fn show_windows_in_z_order(ordered_top_to_bottom: &[u64], topmost: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+
+    let hwnds: Vec<u64> = ordered_top_to_bottom
+        .iter()
+        .copied()
+        .filter(|h| *h != 0)
+        .collect();
+    if hwnds.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let mut batch = match BeginDeferWindowPos(hwnds.len() as i32) {
+            Ok(batch) => batch,
+            Err(e) => {
+                crate::logger::log(format!(
+                    "vst3 gui BeginDeferWindowPos failed: {e}; falling back"
+                ));
+                for hwnd in hwnds.iter().rev() {
+                    set_window_visible(*hwnd, true);
+                    set_window_topmost(*hwnd, topmost);
+                }
+                return;
+            }
+        };
+
+        let insert_after = if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        for hwnd_u64 in hwnds.iter().rev() {
+            let hwnd = HWND(*hwnd_u64 as *mut _);
+            crate::dwm_transitions::disable_transitions_for_window(hwnd);
+            match DeferWindowPos(
+                batch,
+                hwnd,
+                Some(insert_after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            ) {
+                Ok(next_batch) => batch = next_batch,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "vst3 gui DeferWindowPos failed: {e}; falling back"
+                    ));
+                    for hwnd in hwnds.iter().rev() {
+                        set_window_visible(*hwnd, true);
+                        set_window_topmost(*hwnd, topmost);
+                    }
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = EndDeferWindowPos(batch) {
+            crate::logger::log(format!(
+                "vst3 gui EndDeferWindowPos failed: {e}; falling back"
+            ));
+            for hwnd in hwnds.iter().rev() {
+                set_window_visible(*hwnd, true);
+                set_window_topmost(*hwnd, topmost);
+            }
+        }
     }
 }

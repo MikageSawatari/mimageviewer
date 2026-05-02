@@ -55,6 +55,91 @@ PluginLoader::~PluginLoader() {
     unload();
 }
 
+bool PluginLoader::probe(const std::string& plugin_path,
+                         PluginProbeInfo& info_out,
+                         std::string& error_out) {
+    std::string load_err;
+    auto module = VST3::Hosting::Module::create(plugin_path, load_err);
+    if (!module) {
+        error_out = "Module::create failed: " + load_err;
+        return false;
+    }
+
+    Steinberg::IPtr<HostApplication> host_app = owned(new HostApplication);
+    const auto& factory = module->getFactory();
+    bool found_audio_effect = false;
+    bool found_usable = false;
+    PluginProbeInfo best{};
+    for (const auto& info : factory.classInfos()) {
+        if (info.category() != kVstAudioEffectClass) {
+            continue;
+        }
+
+        auto component = factory.createInstance<Vst::IComponent>(info.ID());
+        if (!component) {
+            continue;
+        }
+        if (component->initialize(host_app) != kResultOk) {
+            component = nullptr;
+            continue;
+        }
+
+        auto processor = Steinberg::FUnknownPtr<Vst::IAudioProcessor>(component);
+        if (!processor) {
+            component->terminate();
+            component = nullptr;
+            continue;
+        }
+
+        PluginProbeInfo cur{};
+        cur.plugin_name = info.name();
+        const int32 audio_in = component->getBusCount(Vst::kAudio, Vst::kInput);
+        const int32 audio_out = component->getBusCount(Vst::kAudio, Vst::kOutput);
+        const int32 event_in = component->getBusCount(Vst::kEvent, Vst::kInput);
+        const int32 event_out = component->getBusCount(Vst::kEvent, Vst::kOutput);
+        cur.audio_input_buses = audio_in > 0 ? static_cast<uint32_t>(audio_in) : 0;
+        cur.audio_output_buses = audio_out > 0 ? static_cast<uint32_t>(audio_out) : 0;
+        cur.event_input_buses = event_in > 0 ? static_cast<uint32_t>(event_in) : 0;
+        cur.event_output_buses = event_out > 0 ? static_cast<uint32_t>(event_out) : 0;
+
+        auto sum_channels = [&](Vst::MediaType media, Vst::BusDirection direction,
+                                int32 count) -> uint32_t {
+            uint32_t total = 0;
+            for (int32 i = 0; i < count; ++i) {
+                Vst::BusInfo bus{};
+                if (component->getBusInfo(media, direction, i, bus) == kResultOk &&
+                    bus.channelCount > 0) {
+                    total += static_cast<uint32_t>(bus.channelCount);
+                }
+            }
+            return total;
+        };
+        cur.audio_input_channels = audio_in > 0
+            ? sum_channels(Vst::kAudio, Vst::kInput, audio_in)
+            : 0;
+        cur.audio_output_channels = audio_out > 0
+            ? sum_channels(Vst::kAudio, Vst::kOutput, audio_out)
+            : 0;
+        cur.usable_audio_effect = cur.audio_input_buses > 0 &&
+                                  cur.audio_output_buses > 0;
+
+        component->terminate();
+        if (!found_audio_effect || (cur.usable_audio_effect && !found_usable)) {
+            best = cur;
+            found_audio_effect = true;
+            found_usable = cur.usable_audio_effect;
+        }
+    }
+
+    if (found_audio_effect) {
+        info_out = best;
+        return true;
+    }
+
+    error_out = "no AudioEffectClass found in plugin";
+    return false;
+}
+
 bool PluginLoader::load(const std::string& plugin_path,
                          uint32_t sample_rate,
                          uint32_t block_size,
