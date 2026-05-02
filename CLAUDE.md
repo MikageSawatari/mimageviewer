@@ -166,6 +166,55 @@ mimageviewer/
 └── Cargo.lock
 ```
 
+## vendor/ 一括セットアップ (新規 clone / vendor/ 消失時の復旧)
+
+`vendor/` 配下は全て `.gitignore` 対象 (DLL / SDK / モデル等を git に入れないため)。
+新規 clone した直後や、誤って `vendor/` を消してしまった場合は、ビルド前に必要
+ファイルを揃え直す必要がある。`build.rs` が起動時に必須ファイルの存在を検証して
+復旧手順付きでエラーを出すので、**何が足りないかは cargo build のエラーで分かる**。
+
+### ワンコマンドで揃える
+
+```bash
+bash scripts/bootstrap-vendor.sh           # 不足分のみ取得
+bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デバッグ用)
+```
+
+このスクリプトは以下を順に実行する:
+
+1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
+2. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
+3. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
+4. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
+5. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+   (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
+
+### bootstrap で取れないもの
+
+- **`vendor/vst3-host/mimageviewer-vst3-host.exe`**: VST3 SDK の DL が ~490 MB と
+  大きいので bootstrap には含めていない。以下のいずれかで配置する:
+  - **既存ビルド済み exe をコピー** (推奨): 別 worktree やバックアップに残っている
+    `mimageviewer-vst3-host.exe` を `vendor/vst3-host/` に置く。SDK 不要で即解決
+  - **CMake で再ビルド**:
+    ```bash
+    bash scripts/setup-vst3-sdk.sh
+    cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 17 2022" -A x64
+    cmake --build crates/vst3-host/build --config Release
+    cp crates/vst3-host/build/Release/mimageviewer-vst3-host.exe vendor/vst3-host/
+    ```
+    詳細は本書「VST3 host bridge 管理」節を参照
+- **TensorRT pack** (`vendor/tensorrt-cache/`): 開発時には不要。pack 配布作業時
+  だけ `scripts/setup-tensorrt-pack.ps1` を回す
+
+### 前提環境変数 / ツール
+
+- `gh` (GitHub CLI) 認証済み — pdfium / ffmpeg の release 取得に必要
+- `rustup target add i686-pc-windows-msvc` 済み — susie 32bit ワーカービルド
+- `LIBCLANG_PATH` 環境変数登録済み — FFmpeg の bindgen 用 (本書「FFmpeg LGPL DLL
+  管理」節に詳細)
+- `cmake` + Visual Studio 2022 + NASM — TurboJPEG / vst3-host ビルド
+- `unzip`, `tar`, `curl` — setup スクリプト群が使う
+
 ## Implementation Phases
 
 1. **Phase 1** ✅ — コアビューワー（グリッド・フルスクリーン・設定永続化）

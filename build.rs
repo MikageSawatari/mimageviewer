@@ -169,7 +169,14 @@ fn check_vendor_files() {
         eprintln!("      → {how}");
     }
     eprintln!();
-    eprintln!("詳細は CLAUDE.md の vendor/ セクションを参照してください。");
+    eprintln!("不足分をまとめて取得する場合:");
+    eprintln!("  bash scripts/bootstrap-vendor.sh");
+    eprintln!();
+    eprintln!("(vst3-host exe は SDK が ~490 MB なので bootstrap には含まれない。");
+    eprintln!(" 別 worktree やバックアップにビルド済み exe があればコピー、");
+    eprintln!(" 無ければ CLAUDE.md「VST3 host bridge 管理」節の cmake 手順を実行)");
+    eprintln!();
+    eprintln!("詳細は CLAUDE.md の「vendor/ 一括セットアップ」節を参照してください。");
     eprintln!("================================================================");
     eprintln!();
     std::process::exit(1);
