@@ -513,6 +513,13 @@ impl DspBridge {
             gui_resize_session_signal: None,
         });
         self.recalc_active_count(&inner);
+        drop(inner);
+        if let Err(e) = self.prewarm_slot_gui(idx) {
+            crate::logger::log(format!(
+                "[VST3 GUI] hidden prewarm failed for '{}': {e}",
+                plugin_path
+            ));
+        }
         Ok(idx)
     }
 
@@ -709,7 +716,32 @@ impl DspBridge {
     /// 2026-05 ユーザー要望「ウィンドウ位置を復元してほしい」)。
     ///
     /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
+    fn send_slot_gui_visible(&self, idx: usize, visible: bool) {
+        let bridge_arc = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.get(idx).map(|s| s.bridge.clone())
+        };
+        if let Some(bridge) = bridge_arc {
+            let _ = bridge.send(&Cmd::SetGuiVisible {
+                visible: if visible { 1 } else { 0 },
+            });
+        }
+    }
+
+    fn prewarm_slot_gui(&self, idx: usize) -> Result<(), String> {
+        self.ensure_slot_gui_attached(idx, false, false)
+    }
+
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
+        self.ensure_slot_gui_attached(idx, true, true)
+    }
+
+    fn ensure_slot_gui_attached(
+        &self,
+        idx: usize,
+        visible: bool,
+        clear_user_hidden: bool,
+    ) -> Result<(), String> {
         // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
         // **z-order は触らない**: ユーザーが手で並べた前後関係を保持する (Codex P1)。
         // ただし `gui_topmost_desired` の現在値は最後に適用する (= fullscreen 中に
@@ -723,14 +755,19 @@ impl DspBridge {
                 if slot.gui_hwnd != 0 {
                     let hwnd = slot.gui_hwnd;
                     drop(inner);
-                    gui::set_window_visible(hwnd, true);
+                    gui::set_window_visible(hwnd, visible);
+                    self.send_slot_gui_visible(idx, visible);
                     // 現在の topmost desired state を反映
                     let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-                    gui::set_window_topmost(hwnd, topmost);
+                    if visible {
+                        gui::set_window_topmost(hwnd, topmost);
+                    }
                     let mut inner2 = self.inner.lock().unwrap();
                     if let Some(s2) = inner2.slots.get_mut(idx) {
-                        s2.gui_visible = true;
-                        s2.user_hidden = false; // 明示的に show したので user_hidden 解除
+                        s2.gui_visible = visible;
+                        if clear_user_hidden {
+                            s2.user_hidden = false;
+                        }
                     }
                     return Ok(());
                 }
@@ -786,7 +823,14 @@ impl DspBridge {
         };
         let gui_host = gui::GuiHost::spawn();
         let reply = gui_host
-            .show(&plugin_name, pref_w, pref_h, resizable, initial_pos)
+            .show(
+                &plugin_name,
+                pref_w,
+                pref_h,
+                resizable,
+                initial_pos,
+                visible,
+            )
             .map_err(|e| format!("create gui window: {e}"))?;
         if reply.hwnd_u64 == 0 {
             return Err("HWND not returned".to_string());
@@ -795,7 +839,10 @@ impl DspBridge {
 
         // ─ Step 3: bridge に attach 命令 (Mutex 外、bridge_arc 経由) ─
         bridge_arc
-            .send(&Cmd::ShowGui { hwnd })
+            .send(&Cmd::ShowGui {
+                hwnd,
+                visible: if visible { 1 } else { 0 },
+            })
             .map_err(|e| format!("send ShowGui: {e}"))?;
         match bridge_arc.recv() {
             Ok(Event::GuiAttached { width, height }) => {
@@ -820,11 +867,13 @@ impl DspBridge {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(idx) {
             slot.gui_hwnd = hwnd;
-            slot.gui_visible = true;
+            slot.gui_visible = visible;
             // 起動後 settings から復元された user_hidden=true 状態でも、明示的な
             // show_slot_gui (= パネル「GUI」ボタン押下) で初めて作成された window
             // なので user_hidden を解除する (= 既存 hwnd!=0 の早期 return path と同様)。
-            slot.user_hidden = false;
+            if clear_user_hidden {
+                slot.user_hidden = false;
+            }
             slot.gui_host = Some(gui_host);
             slot.gui_close_signal = Some(reply.close_signal);
             slot.gui_resize_signal = Some(reply.resize_signal);
@@ -835,9 +884,11 @@ impl DspBridge {
         drop(inner);
         // 新規作成時も「現在の topmost desired state」を反映
         // (= フルスクリーン中に作った HWND にも TOPMOST が必ず付く、Codex P3 対応)。
-        let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-        if topmost {
-            gui::set_window_topmost(hwnd, true);
+        if visible {
+            let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
+            if topmost {
+                gui::set_window_topmost(hwnd, true);
+            }
         }
         Ok(())
     }
@@ -857,6 +908,7 @@ impl DspBridge {
         };
         if hwnd != 0 {
             gui::set_window_visible(hwnd, false);
+            self.send_slot_gui_visible(idx, false);
         }
     }
 
@@ -877,6 +929,7 @@ impl DspBridge {
         };
         if hwnd != 0 {
             gui::set_window_visible(hwnd, false);
+            self.send_slot_gui_visible(idx, false);
         }
     }
 
@@ -966,7 +1019,10 @@ impl DspBridge {
 
                 match action {
                     ShowAction::Skip => {}
-                    ShowAction::BatchExisting(hwnd) => shown_hwnds.push(hwnd),
+                    ShowAction::BatchExisting(hwnd) => {
+                        self.send_slot_gui_visible(idx, true);
+                        shown_hwnds.push(hwnd);
+                    }
                     ShowAction::Create => {
                         let _ = self.show_slot_gui(idx);
                         let hwnd = {

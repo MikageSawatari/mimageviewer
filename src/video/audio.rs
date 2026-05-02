@@ -147,6 +147,98 @@ struct AudioBuffer {
     pdc_latency_secs_applied: f64,
 }
 
+const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
+const SAFETY_LIMITER_RELEASE_SECS: f64 = 0.100;
+const SAFETY_LIMITER_CEILING_DBFS: f32 = -1.0;
+
+/// VST3 チェーン後段の保険用 lookahead limiter。
+///
+/// ユーザーがチェーン末尾に limiter を入れていない場合でも、過大出力が WASAPI /
+/// OS mixer 側で hard clip するのを避けるための最終安全網。制作向け limiter ではなく
+/// 視聴用の保護なので、パラメータは固定し、VST3 チェーンが active のときだけ動かす。
+struct SafetyLimiter {
+    channels: usize,
+    lookahead_frames: usize,
+    delay: Vec<f32>,
+    delayed_frame: Vec<f32>,
+    write_frame: usize,
+    gain: f32,
+    ceiling: f32,
+    release_coeff: f32,
+    sample_rate: u32,
+}
+
+impl SafetyLimiter {
+    fn new(sample_rate: u32, channels: usize) -> Self {
+        let lookahead_frames =
+            ((sample_rate as f64 * SAFETY_LIMITER_LOOKAHEAD_SECS).round() as usize).max(1);
+        let release_coeff =
+            (-1.0_f32 / (SAFETY_LIMITER_RELEASE_SECS as f32 * sample_rate as f32)).exp();
+        let ceiling = 10.0_f32.powf(SAFETY_LIMITER_CEILING_DBFS / 20.0);
+        Self {
+            channels,
+            lookahead_frames,
+            delay: vec![0.0; lookahead_frames * channels],
+            delayed_frame: vec![0.0; channels],
+            write_frame: 0,
+            gain: 1.0,
+            ceiling,
+            release_coeff,
+            sample_rate,
+        }
+    }
+
+    fn latency_secs(&self) -> f64 {
+        self.lookahead_frames as f64 / self.sample_rate as f64
+    }
+
+    fn reset(&mut self) {
+        self.delay.fill(0.0);
+        self.write_frame = 0;
+        self.gain = 1.0;
+    }
+
+    fn process_block(&mut self, samples: &mut [f32]) {
+        if samples.is_empty() || self.channels == 0 {
+            return;
+        }
+        debug_assert_eq!(samples.len() % self.channels, 0);
+
+        let frames = samples.len() / self.channels;
+        for frame in 0..frames {
+            let in_base = frame * self.channels;
+            let delay_base = self.write_frame * self.channels;
+
+            let mut peak = 0.0_f32;
+            for (ch, delayed_sample) in self.delayed_frame.iter_mut().enumerate() {
+                let d = self.delay[delay_base + ch];
+                *delayed_sample = d;
+                peak = peak.max(d.abs());
+                self.delay[delay_base + ch] = samples[in_base + ch];
+            }
+            for &v in &self.delay {
+                peak = peak.max(v.abs());
+            }
+
+            let target_gain = if peak > self.ceiling {
+                (self.ceiling / peak).min(1.0)
+            } else {
+                1.0
+            };
+            if target_gain < self.gain {
+                self.gain = target_gain;
+            } else {
+                self.gain = target_gain + (self.gain - target_gain) * self.release_coeff;
+            }
+
+            for (ch, &d) in self.delayed_frame.iter().enumerate() {
+                samples[in_base + ch] = (d * self.gain).clamp(-self.ceiling, self.ceiling);
+            }
+            self.write_frame = (self.write_frame + 1) % self.lookahead_frames;
+        }
+    }
+}
+
 /// 既定音声出力デバイスのサンプルレートを取得する (実際にはストリームは開かない)。
 ///
 /// デコーダー (swresample) と音声出力 (cpal) で **同じサンプルレート** を使わないと、
@@ -387,6 +479,7 @@ fn run_pump(
     let sample_rate = buffer.lock().unwrap().sample_rate;
     let samples_per_sec = (sample_rate as f64) * 2.0;
     let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
+    let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
@@ -456,6 +549,7 @@ fn run_pump(
                 last_seen_seek_serial = frame_seek_serial;
                 // 新 seek 世代: overflow / target / activate を全 reset
                 overflow_for_serial = None;
+                safety_limiter.reset();
                 // PDC trim 用 seek_target は frame.pts_secs (= Fast では keyframe_pts、
                 // Precise では target ぴったり)。詳細は seek_target_secs の宣言コメント参照。
                 seek_target_secs = Some(frame.pts_secs);
@@ -620,34 +714,47 @@ fn run_pump(
 
             // ── VST process_block (mutex 解放中) ──
             #[cfg(windows)]
-            let (output_samples, current_pdc_latency_secs): (Vec<f32>, f64) =
-                if let Some(b) = &dsp_bridge {
-                    if b.is_enabled() && b.active_slot_count() > 0 {
-                        fx_out.resize(raw.samples.len(), 0.0);
-                        let success = b.process_block(&raw.samples, &mut fx_out).is_ok();
-                        if !success {
-                            crate::logger::log("vst3 process_block failed");
-                        }
-                        let total_lat_samples = b.total_latency_samples();
-                        let lat_secs = if total_lat_samples > 0 {
-                            total_lat_samples as f64 / sample_rate as f64
-                        } else {
-                            0.0
-                        };
-                        if success {
-                            (fx_out.clone(), lat_secs)
-                        } else {
-                            (raw.samples.clone(), lat_secs)
-                        }
+            let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
+                Vec<f32>,
+                f64,
+                bool,
+            ) = if let Some(b) = &dsp_bridge {
+                if b.is_enabled() && b.active_slot_count() > 0 {
+                    fx_out.resize(raw.samples.len(), 0.0);
+                    let success = b.process_block(&raw.samples, &mut fx_out).is_ok();
+                    if !success {
+                        crate::logger::log("vst3 process_block failed");
+                    }
+                    let total_lat_samples = b.total_latency_samples();
+                    let lat_secs = if total_lat_samples > 0 {
+                        total_lat_samples as f64 / sample_rate as f64
                     } else {
-                        (raw.samples.clone(), 0.0)
+                        0.0
+                    };
+                    if success {
+                        (fx_out.clone(), lat_secs, true)
+                    } else {
+                        (raw.samples.clone(), lat_secs, true)
                     }
                 } else {
-                    (raw.samples.clone(), 0.0)
-                };
+                    (raw.samples.clone(), 0.0, false)
+                }
+            } else {
+                (raw.samples.clone(), 0.0, false)
+            };
             #[cfg(not(windows))]
-            let (output_samples, current_pdc_latency_secs): (Vec<f32>, f64) =
-                (raw.samples.clone(), 0.0);
+            let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
+                Vec<f32>,
+                f64,
+                bool,
+            ) = (raw.samples.clone(), 0.0, false);
+
+            if vst_chain_active {
+                safety_limiter.process_block(&mut output_samples);
+                current_pdc_latency_secs += safety_limiter.latency_secs();
+            } else {
+                safety_limiter.reset();
+            }
 
             // ── chunk metadata 計算 ──
             // audible_pts = input_pts - pdc_latency (Codex P1-3 反映、PDC 正しい同期用)
@@ -1048,6 +1155,102 @@ mod tests {
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
         }
+    }
+
+    #[test]
+    fn safety_limiter_delays_audio_by_lookahead() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        assert_eq!(limiter.lookahead_frames, 5);
+
+        let mut samples = vec![0.0_f32; 12];
+        samples[0] = 0.5;
+        samples[1] = -0.5;
+        limiter.process_block(&mut samples);
+
+        assert!(
+            samples[..10].iter().all(|&v| v == 0.0),
+            "first five stereo frames should be lookahead silence"
+        );
+        assert!((samples[10] - 0.5).abs() < 1e-6);
+        assert!((samples[11] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn safety_limiter_catches_lookahead_spike() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut samples = vec![0.0_f32; 18];
+        samples[0] = 0.25;
+        samples[1] = -0.25;
+        samples[2] = 2.0;
+        samples[3] = -2.0;
+
+        limiter.process_block(&mut samples);
+
+        let ceiling = limiter.ceiling;
+        let max_abs = samples.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_abs <= ceiling + 1e-6,
+            "limiter output should stay under ceiling ({max_abs} > {ceiling})"
+        );
+        assert!(
+            samples.iter().any(|&v| v.abs() > 0.0),
+            "delayed non-silence should still pass through"
+        );
+    }
+
+    #[test]
+    fn safety_limiter_keeps_delay_across_blocks() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut first = vec![0.0_f32; 6];
+        first[0] = 0.5;
+        first[1] = -0.5;
+        limiter.process_block(&mut first);
+        assert!(
+            first.iter().all(|&v| v == 0.0),
+            "first block is shorter than lookahead, so it should be delayed"
+        );
+
+        let mut second = vec![0.0_f32; 6];
+        limiter.process_block(&mut second);
+        assert!((second[4] - 0.5).abs() < 1e-6);
+        assert!((second[5] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn safety_limiter_releases_gain_across_blocks() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut loud = vec![0.0_f32; 14];
+        loud[0] = 2.0;
+        loud[1] = -2.0;
+        limiter.process_block(&mut loud);
+        let gain_after_peak = limiter.gain;
+        assert!(
+            gain_after_peak < 0.6,
+            "loud peak should force immediate gain reduction"
+        );
+
+        let mut quiet = vec![0.0_f32; 200];
+        limiter.process_block(&mut quiet);
+        assert!(
+            limiter.gain > gain_after_peak,
+            "gain should recover across later blocks"
+        );
+        assert!(limiter.gain < 1.0, "release should be gradual, not instant");
+    }
+
+    #[test]
+    fn safety_limiter_reset_clears_delay_line() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut samples = vec![0.5_f32; 12];
+        limiter.process_block(&mut samples);
+        limiter.reset();
+
+        let mut silence = vec![0.0_f32; 12];
+        limiter.process_block(&mut silence);
+        assert!(
+            silence.iter().all(|&v| v == 0.0),
+            "reset should prevent old delayed audio from leaking"
+        );
     }
 
     /// 完全 underrun (= processed 空) で callback が来ても `next_pts_secs` が進まない。

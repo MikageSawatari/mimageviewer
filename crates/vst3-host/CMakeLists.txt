@@ -97,6 +97,7 @@ if(WIN32)
         user32
         ole32
         shell32
+        comctl32    # SetWindowSubclass / RemoveWindowSubclass for plugin child HWND hooks
         advapi32
         avrt        # AvSetMmThreadCharacteristicsW (MMCSS)
     )

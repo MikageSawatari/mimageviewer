@@ -133,11 +133,13 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - VST ホストウィンドウに `DWMWA_TRANSITIONS_FORCEDISABLED` を適用し、OS フェードを best-effort で抑制
 - fallback は bottom-to-top の個別 SetWindowPos
 
-### Step 5 (P2): peak indicator [課題 4]
-- まず **表示だけ** (= "OVER" 表示)、soft limiter は設定付きで後続
-- fill_output 内で `peak = peak.max(y.abs())` を AtomicU32 に publish
-- UI 側 (パネル / HUD) で 200-500ms ホールド表示
-- soft limiter (`x / (1 + x.abs() * 0.25)`) は設定で OFF 可能に
+### Step 5 (P2): VST3 後段の安全 limiter [課題 4]
+- [x] VST3 チェーンが active のときだけ、audio-pump 側で後段 safety limiter を適用する。
+  - 目的: ユーザーがチェーン末尾に limiter を入れなかった場合の音割れ保険。
+  - `cpal` callback ではなく `raw → VST process → processed` の直後で処理し、RT callback に処理を増やさない。
+  - lookahead 5ms、ceiling -1dBFS、release 100ms の固定 sample-peak limiter。
+  - limiter 遅延は PDC latency に加算し、映像同期に反映する。
+- [ ] peak / gain reduction / OVER 表示は後続。Limiter 自体の保護動作とは独立して追加可能。
 
 ### 依存関係 (Codex 指摘)
 - Step 1 (PDC) と Step 2 (latency 縮小) は同じ audio clock/buffer に触るので

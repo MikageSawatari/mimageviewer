@@ -36,4 +36,5 @@ windows = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
+sha2 = "0.10"
 winresource = "0.1"

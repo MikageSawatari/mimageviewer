@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
+
 /// `pub const NAME: &str = "value";` 形式の文字列リテラル定数を抽出する。
 /// `src/single_instance.rs` から MUTEX_NAME / ACTIVATE_EVENT_NAME を拾うために使用。
 fn extract_const(src: &str, name: &str) -> Option<String> {
@@ -75,10 +77,15 @@ fn main() {
             std::process::exit(1);
         }
         println!("cargo:rustc-env={var}={}", p.display());
+        println!("cargo:rustc-env={var}_SHA256={}", sha256_file_hex(&p));
         println!("cargo:rerun-if-changed={}", p.display());
     }
 
     println!("cargo:rustc-env=MIMV_CORE_EXE={}", core_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_CORE_EXE_SHA256={}",
+        sha256_file_hex(&core_exe)
+    );
     println!("cargo:rerun-if-changed={}", core_exe.display());
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
@@ -122,4 +129,24 @@ fn main() {
             eprintln!("winresource compile error: {e}");
         }
     }
+}
+
+fn sha256_file_hex(path: &std::path::Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("read {} failed for sha256: {e}", path.display());
+        std::process::exit(1);
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_lower(&hasher.finalize())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

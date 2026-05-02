@@ -58,5 +58,10 @@ always-active guidance.
 ## Git
 
 - Keep commits focused and do not include unrelated untracked files.
+- Prefer committing completed, coherent chunks promptly, even before the user
+  starts manual verification, when the change has been implemented and the
+  relevant automated checks pass. This keeps rollback points easy to identify.
+- For long-running work, avoid letting many unrelated fixes accumulate in the
+  working tree; split them into focused commits as soon as each piece is safe.
 - Follow the repository's existing git workflow notes in `CLAUDE.md` when a task
   involves review, release, or multi-step coordination.

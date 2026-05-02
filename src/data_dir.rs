@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use sha2::{Digest, Sha256};
+
 pub static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// テスト用の data_dir 上書き。`None` なら本番の OnceLock を参照する。
@@ -72,12 +74,18 @@ fn default() -> PathBuf {
 /// 同サイズ別内容の破損ファイルには気付けないが、これは PDFium / ONNX Runtime DLL 等
 /// 公式配布ファイルを埋め込んでいる前提で許容する (Susie ワーカーのみ別途内容比較)。
 pub fn extract_embedded_file(path: &Path, bytes: &[u8], label: &str) -> std::io::Result<()> {
+    let expected_hash = sha256_hex(bytes);
+    let hash_path = sidecar_hash_path(path);
     let needs_write = match std::fs::metadata(path) {
-        Ok(meta) => meta.len() != bytes.len() as u64,
+        Ok(meta) => {
+            meta.len() != bytes.len() as u64
+                || !embedded_file_hash_matches(path, &hash_path, &expected_hash)?
+        }
         Err(_) => true,
     };
     if needs_write {
-        std::fs::write(path, bytes)?;
+        write_atomic(path, bytes)?;
+        write_atomic(&hash_path, expected_hash.as_bytes())?;
         crate::logger::log(format!(
             "{} extracted to {} ({} bytes)",
             label,
@@ -86,4 +94,83 @@ pub fn extract_embedded_file(path: &Path, bytes: &[u8], label: &str) -> std::io:
         ));
     }
     Ok(())
+}
+
+fn embedded_file_hash_matches(
+    path: &Path,
+    hash_path: &Path,
+    expected_hash: &str,
+) -> std::io::Result<bool> {
+    if let Ok(stored) = std::fs::read_to_string(hash_path) {
+        return Ok(stored.trim().eq_ignore_ascii_case(expected_hash));
+    }
+
+    let actual_hash = sha256_file_hex(path)?;
+    if actual_hash.eq_ignore_ascii_case(expected_hash) {
+        write_atomic(hash_path, expected_hash.as_bytes())?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp_path = tmp_path_for(path);
+    std::fs::write(&tmp_path, bytes)?;
+    let _ = std::fs::remove_file(path);
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp_path = path.to_path_buf();
+    let mut name = tmp_path
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("unknown"));
+    name.push(".tmp");
+    tmp_path.set_file_name(name);
+    tmp_path
+}
+
+fn sidecar_hash_path(path: &Path) -> PathBuf {
+    let mut hash_path = path.to_path_buf();
+    let mut name = hash_path
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("unknown"));
+    name.push(".sha256");
+    hash_path.set_file_name(name);
+    hash_path
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_lower(&hasher.finalize())
+}
+
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

@@ -409,8 +409,9 @@ private:
                 send_event_error("show_gui: hwnd missing");
                 return true;
             }
+            const bool visible = extract_number_field(msg, "visible") != 0;
             std::string err;
-            if (!loader_->show_gui(reinterpret_cast<void*>(hwnd_u), err)) {
+            if (!loader_->show_gui(reinterpret_cast<void*>(hwnd_u), visible, err)) {
                 send_event_error("show_gui: " + err);
                 return true;
             }
@@ -428,6 +429,13 @@ private:
         if (cmd == "hide_gui") {
             if (loader_) loader_->hide_gui();
             write_message("{\"event\":\"gui_detached\"}");
+            return true;
+        }
+        if (cmd == "set_gui_visible") {
+            if (loader_) {
+                uint64_t visible = extract_number_field(msg, "visible");
+                loader_->set_gui_visible(visible != 0);
+            }
             return true;
         }
         if (cmd == "set_passthrough") {

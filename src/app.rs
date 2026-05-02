@@ -1814,6 +1814,13 @@ pub struct App {
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
+    /// 閉じた後に次回表示用の ViewportId を更新するか。
+    ///
+    /// Win+Shift+Arrow など OS 側のモニター移動で eframe/winit の viewport state が
+    /// 壊れることがあるため、ユーザーがフルスクリーンを閉じたら次回は別 ID で
+    /// OS window を作り直す。
+    pub(crate) fs_viewport_recreate_after_hide: bool,
+    pub(crate) fs_viewport_generation: u64,
     /// フルスクリーン開始時刻（フォーカス移行のグレース期間用）
     fs_opened_at: Option<std::time::Instant>,
     /// グレース期間を超えたかのキャッシュ（毎フレーム Instant::elapsed() を避ける）
@@ -2637,6 +2644,8 @@ impl Default for App {
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             fs_viewport_shown: false,
+            fs_viewport_recreate_after_hide: false,
+            fs_viewport_generation: 0,
             fs_opened_at: None,
             fs_focus_grace_elapsed: false,
             fs_prev_focused: false,
@@ -10472,6 +10481,7 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        self.fs_viewport_recreate_after_hide = true;
         // ※ ここで `fs_nav_locked` / `fs_holdover_tex` を即時クリアしてはいけない:
         //   `apply_folder_nav_result` の Fullscreen 分岐は close_fullscreen → load_folder
         //   → open_fullscreen と直列に呼ぶので、その途中で lock を捨てると新ページが
@@ -11270,10 +11280,33 @@ impl App {
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
     pub(crate) fn persist_window_state_and_flush(&mut self) {
         if let Some(rect) = self.last_outer_rect {
-            self.settings.window_pos = Some([rect.min.x, rect.min.y]);
+            if crate::monitor::title_bar_on_some_monitor(rect.min.x, rect.min.y, rect.width()) {
+                self.settings.window_pos = Some([rect.min.x, rect.min.y]);
+            } else {
+                crate::logger::log(format!(
+                    "[window] skipped saving off-screen main window position: ({:.1}, {:.1}) size={:.1}x{:.1}",
+                    rect.min.x,
+                    rect.min.y,
+                    rect.width(),
+                    rect.height()
+                ));
+            }
         }
         if let Some(size) = self.last_inner_size {
-            self.settings.window_size = Some(size);
+            if size[0].is_finite()
+                && size[1].is_finite()
+                && size[0] >= 320.0
+                && size[1] >= 240.0
+                && size[0] <= 16_384.0
+                && size[1] <= 16_384.0
+            {
+                self.settings.window_size = Some(size);
+            } else {
+                crate::logger::log(format!(
+                    "[window] skipped saving invalid main window size: {:.1}x{:.1}",
+                    size[0], size[1]
+                ));
+            }
         }
         self.settings.save();
         self.flush_all_sidecars();

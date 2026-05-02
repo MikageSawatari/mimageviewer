@@ -92,10 +92,18 @@ pub enum Cmd {
     #[serde(rename = "show_gui")]
     ShowGui {
         hwnd: u64,
+        visible: u32,
     },
     /// プラグイン GUI を外す。HWND の破棄は host 側の責務。
     #[serde(rename = "hide_gui")]
     HideGui,
+    /// Already-attached GUI surface visibility toggle. The bridge keeps the
+    /// VST3 view attached and only hides/shows its bridge-owned top-level
+    /// surface.
+    #[serde(rename = "set_gui_visible")]
+    SetGuiVisible {
+        visible: u32,
+    },
     /// プラグインの推奨 GUI サイズだけ取得する (= attached しない)。
     /// host はこのサイズでウィンドウを作ってから ShowGui を送ることで、
     /// プラグインが子ウィンドウを正しいサイズで作成できる。

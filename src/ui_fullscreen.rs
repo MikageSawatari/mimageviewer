@@ -682,6 +682,10 @@ pub(crate) struct FsKeyAction {
 }
 
 impl App {
+    fn fullscreen_viewport_id(&self) -> egui::ViewportId {
+        egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
+    }
+
     /// フルスクリーンビューポートを描画し、終了後のナビゲーション処理も行う。
     /// フルスクリーン表示中でなければ何もしない。
     /// フルスクリーンが非アクティブでもビューポートを非表示で維持する。
@@ -690,7 +694,7 @@ impl App {
         if self.fullscreen_idx.is_some() {
             return; // アクティブなときは render_fullscreen_viewport が担当
         }
-        let fs_id = egui::ViewportId::from_hash_of("fullscreen_viewer");
+        let fs_id = self.fullscreen_viewport_id();
 
         // Ctrl+↑↓ で PDF フォルダを挟む遷移中は fullscreen_idx が None のまま
         // PDF enumerate 完了を待つ。この間ビューポートを隠すとその下のグリッドが
@@ -765,6 +769,10 @@ impl App {
             crate::dwm_transitions::disable_transitions_for_thread_windows();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
             self.fs_viewport_shown = false;
+            if self.fs_viewport_recreate_after_hide {
+                self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
+                self.fs_viewport_recreate_after_hide = false;
+            }
         }
     }
 
@@ -810,7 +818,7 @@ impl App {
         let need_show = !self.fs_viewport_shown;
 
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("fullscreen_viewer"),
+            self.fullscreen_viewport_id(),
             fs_builder,
             |ctx, _class| {
                 // フルスクリーンビューポート内のイベントで IME 状態を更新する

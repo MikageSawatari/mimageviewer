@@ -25,14 +25,16 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    COLOR_WINDOW, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOMOVE,
+    IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOMOVE,
     SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SIZE, WNDCLASSEXW,
+    WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE, WNDCLASSEXW,
     WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
@@ -43,6 +45,7 @@ const WINDOW_CLASS: &str = "MivVst3PluginHostWindow";
 // windows-rs から直接定数を引くのが面倒なので生数値を使う (= 値は安定).
 const WM_ENTERSIZEMOVE_VAL: u32 = 0x0231;
 const WM_EXITSIZEMOVE_VAL: u32 = 0x0232;
+const MIN_VISIBLE_WINDOW_AREA: i64 = 64 * 64;
 
 #[derive(Debug)]
 pub enum Cmd {
@@ -58,6 +61,7 @@ pub enum Cmd {
         width: u32,
         height: u32,
         resizable: bool,
+        visible: bool,
         /// 復元したいウィンドウ位置 (= 前回終了時の `GetWindowRect` の左上座標)。
         /// None ならデフォルト中央配置 (= `CW_USEDEFAULT`) を使う。
         /// 範囲外 (= 旧モニターが取り外された等) は OS 側 `SetWindowPos` で
@@ -128,6 +132,7 @@ impl GuiHost {
         height: u32,
         resizable: bool,
         initial_pos: Option<(i32, i32)>,
+        visible: bool,
     ) -> std::io::Result<ShowReply> {
         let (tx, rx) = channel::<ShowReply>();
         self.cmd_tx
@@ -137,6 +142,7 @@ impl GuiHost {
                 height,
                 resizable,
                 initial_pos,
+                visible,
                 reply: tx,
             })
             .map_err(|_| std::io::Error::other("gui thread terminated"))?;
@@ -183,12 +189,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         match msg {
             WM_PARENTNOTIFY => {
                 // 子ウィンドウ (= プラグインの GUI 本体) でクリックが起きたら
-                // ホストウィンドウを **明示的に foreground** にする。
-                // これがないと SSL Meter Pro 等の `TrackPopupMenu` で開く
-                // 右クリックメニューがフォーカスを取れず即閉じる事象が出る
-                // (= owner top-level window が foreground でないと popup は不安定)。
+                // ホストウィンドウを **明示的に foreground** にする。ただし右クリックは
+                // bridge 側 child-HWND subclass が `SetForegroundWindow + SetFocus(child)`
+                // を行うため、ここでは触らない。後追いで host に foreground を戻すと
+                // SSL Meter Pro のグラフィカルな右クリックメニューが閉じる可能性がある。
                 let event_msg = (wparam.0 & 0xFFFF) as u32;
-                if event_msg == WM_LBUTTONDOWN || event_msg == WM_RBUTTONDOWN {
+                if event_msg == WM_LBUTTONDOWN {
                     let _ = SetForegroundWindow(hwnd);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -203,12 +209,30 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
-            WM_SIZE => {
-                // ユーザーがホストウィンドウをドラッグでリサイズした。
-                // 新しいクライアント領域サイズを取得してメインスレッドに通知。
-                let lparam_v = lparam.0 as u32;
-                let w = (lparam_v & 0xFFFF) as u32;
-                let h = ((lparam_v >> 16) & 0xFFFF) as u32;
+            WM_SIZE | WM_MOVE => {
+                if IsIconic(hwnd).as_bool() {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                // ユーザーがホストウィンドウを移動/リサイズした。
+                // bridge 側 top-level plugin surface の位置同期にも使うため、
+                // WM_MOVE でも現在のクライアント領域サイズを通知する。
+                let (w, h) = if msg == WM_SIZE {
+                    let lparam_v = lparam.0 as u32;
+                    (
+                        (lparam_v & 0xFFFF) as u32,
+                        ((lparam_v >> 16) & 0xFFFF) as u32,
+                    )
+                } else {
+                    let mut rect = RECT::default();
+                    if GetClientRect(hwnd, &mut rect).is_ok() {
+                        (
+                            (rect.right - rect.left).max(0) as u32,
+                            (rect.bottom - rect.top).max(0) as u32,
+                        )
+                    } else {
+                        (0, 0)
+                    }
+                };
                 if w > 0 && h > 0 {
                     let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE
                         .with(|s| s.borrow().as_ref().and_then(|st| st.resize_tx.clone()));
@@ -284,9 +308,10 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                 height,
                 resizable,
                 initial_pos,
+                visible,
                 reply,
             } => {
-                let result = create_window(&title, width, height, resizable, initial_pos);
+                let result = create_window(&title, width, height, resizable, initial_pos, visible);
                 match result {
                     Ok((
                         hwnd_u64,
@@ -385,12 +410,100 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
     }
 }
 
+fn rect_intersection_area(a: &RECT, b: &RECT) -> i64 {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    let w = (right - left).max(0) as i64;
+    let h = (bottom - top).max(0) as i64;
+    w * h
+}
+
+fn monitor_work_rect_for(rect: &RECT) -> Option<RECT> {
+    unsafe {
+        let monitor = MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST);
+        if monitor.0.is_null() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            Some(info.rcWork)
+        } else {
+            None
+        }
+    }
+}
+
+fn rect_visible_on_some_work_area(rect: &RECT) -> bool {
+    monitor_work_rect_for(rect)
+        .map(|work| rect_intersection_area(rect, &work) >= MIN_VISIBLE_WINDOW_AREA)
+        .unwrap_or(true)
+}
+
+fn clamp_rect_origin_to_nearest_work_area(x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let rect = RECT {
+        left: x,
+        top: y,
+        right: x.saturating_add(width),
+        bottom: y.saturating_add(height),
+    };
+    let Some(work) = monitor_work_rect_for(&rect) else {
+        return (x, y);
+    };
+    if rect_intersection_area(&rect, &work) >= MIN_VISIBLE_WINDOW_AREA {
+        return (x, y);
+    }
+
+    let max_x = (work.right - width).max(work.left);
+    let max_y = (work.bottom - height).max(work.top);
+    (x.clamp(work.left, max_x), y.clamp(work.top, max_y))
+}
+
+fn ensure_window_visible_on_monitor(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+
+    unsafe {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        if rect_visible_on_some_work_area(&rect) {
+            return;
+        }
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        let (x, y) = clamp_rect_origin_to_nearest_work_area(rect.left, rect.top, width, height);
+        crate::logger::log(format!(
+            "[VST3 GUI] moved off-screen host window back on-screen: ({}, {}) -> ({}, {}) size={}x{}",
+            rect.left, rect.top, x, y, width, height
+        ));
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 fn create_window(
     title: &str,
     width: u32,
     height: u32,
     resizable: bool,
     initial_pos: Option<(i32, i32)>,
+    visible: bool,
 ) -> std::io::Result<(
     u64,
     Receiver<()>,
@@ -494,7 +607,7 @@ fn create_window(
         // カスケード配置) を使う。指定座標がモニター外でも Win32 が後段で
         // SetWindowPos してくれるので追加クランプは不要。
         let (init_x, init_y) = match initial_pos {
-            Some((x, y)) => (x, y),
+            Some((x, y)) => clamp_rect_origin_to_nearest_work_area(x, y, outer_w, outer_h),
             None => (CW_USEDEFAULT, CW_USEDEFAULT),
         };
         let title_w = HSTRING::from(title);
@@ -515,7 +628,9 @@ fn create_window(
         .map_err(|e| std::io::Error::other(format!("CreateWindowExW: {e}")))?;
 
         crate::dwm_transitions::disable_transitions_for_window(hwnd);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        if visible {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
 
         // 実 client rect を確認 (デバッグ用)
         let mut actual = windows::Win32::Foundation::RECT::default();
@@ -579,6 +694,13 @@ pub fn get_window_rect(hwnd_u64: u64) -> Option<(i32, i32, u32, u32)> {
     let w = (rect.right - rect.left).max(0) as u32;
     let h = (rect.bottom - rect.top).max(0) as u32;
     if w == 0 || h == 0 {
+        return None;
+    }
+    if !rect_visible_on_some_work_area(&rect) {
+        crate::logger::log(format!(
+            "[VST3 GUI] skipped saving off-screen host window rect: ({}, {}) size={}x{}",
+            rect.left, rect.top, w, h
+        ));
         return None;
     }
     Some((rect.left, rect.top, w, h))
@@ -707,6 +829,9 @@ pub fn set_window_visible(hwnd_u64: u64, visible: bool) {
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
         crate::dwm_transitions::disable_transitions_for_window(hwnd);
+        if visible {
+            ensure_window_visible_on_monitor(hwnd);
+        }
         let _ = ShowWindow(hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
     }
 }

@@ -36,15 +36,17 @@ mimageviewer-core.exe (Rust)
 ├─ src/video/audio.rs: audio-pump thread が DspBridge::process_block を呼び、
 │   全アクティブスロットを順番に IPC で通す。enable=false / 全 bypass / 0 個なら no-op
 ├─ src/video/dsp/gui.rs: プラグイン GUI ホスト (Win32 子ウィンドウ)
-│   - WS_EX_TOPMOST で常に最前面 (動画フルスクリーンに隠れない)
-│   - 各スロットが個別の HWND を持つ。V キーで全スロット一斉トグル
+│   - フルスクリーン中は WS_EX_TOPMOST で動画の手前に維持
+│   - 各スロットが個別の HWND を持つ。再生中パネルから全体 / 個別表示を切り替える
 └─ Settings (settings.json):
     - vst3_enabled: bool (default false)
     - vst3_plugins: Vec<Vst3PluginEntry>  ← チェーン定義
     -   .path: String
     -   .bypass: bool
-    -   .state: Option<Base64<...>>  (= IComponent::getState、将来用)
-    - vst3_gui_visible: bool  (V キートグル状態)
+    -   .state: Option<Base64<...>>  (= IComponent::getState)
+    -   .user_hidden: bool
+    -   .window_rect: Option<...>
+    - vst3_gui_visible: bool  (再生中パネルの全体表示状態)
 
 各 PluginSlot は独立した bridge 子プロセス:
 vendor/vst3-host/mimageviewer-vst3-host.exe (C++ bridge)
@@ -72,11 +74,11 @@ include_bytes! でメイン exe に埋め込み、初回 enable 時に
 | `src/video/dsp/scanner.rs` | VST3 plugin scan (`%COMMONPROGRAMFILES%\VST3\` 等) | **新規** (testerからポート) |
 | `src/video/dsp/gui.rs` | プラグイン GUI 用の Win32 親ウィンドウ管理 | **新規** (testerからポート) |
 | `src/video/dsp/extract.rs` | bridge exe の APPDATA 展開 (PDFium pattern) | **新規** |
-| `src/settings.rs` | VST3 設定 4 項目を追加 | 拡張 |
-| `src/ui_dialogs/preferences.rs` | 動画タブに VST3 セクション追加 | 拡張 |
-| `src/ui_dialogs/vst3_manager.rs` | VST3 プラグイン管理ウィンドウ | **新規** |
+| `src/settings.rs` | VST3 設定 (`vst3_enabled`, `vst3_plugins`, `vst3_gui_visible`) | 拡張 |
+| `src/ui_dialogs/preferences.rs` | 環境設定→VST3 プラグインページ | 拡張 |
+| `src/ui_dialogs/vst3_manager.rs` | 動画再生中の VST3 プレイバックパネル | **新規** |
 | `src/video/audio.rs` | pump thread に DspBridge 経由処理を挿入 | 拡張 |
-| `src/app.rs` | DspBridge を Option<Arc<DspBridge>> として保持 + V キーハンドラ | 拡張 |
+| `src/app.rs` | DspBridge を保持し、起動時ロード / 終了時 snapshot を行う | 拡張 |
 | `build.rs` | `vendor/vst3-host/mimageviewer-vst3-host.exe` 存在チェック (PDFium と同様) | 拡張 |
 
 ## 4. 音声経路への結線
@@ -91,6 +93,7 @@ VST3 enable 時:
 decoder → audio_rx → audio-pump thread:
    if vst3_enabled && bridge.is_loaded():
        bridge.process_block(frame.samples) → frame.samples
+       safety_limiter(frame.samples)        → frame.samples
    AudioBuffer に push
                 → cpal RT → 出力 (変更なし)
 ```
@@ -99,6 +102,11 @@ decoder → audio_rx → audio-pump thread:
 
 - **plugin process は audio-pump thread で実行する**。cpal RT スレッドではない。
   bridge IPC roundtrip (~1-2ms) を AudioBuffer の processed depth (100ms) で吸収する。
+- **VST3 チェーン後段には安全 limiter を入れる**。ユーザーが limiter プラグインを
+  末尾に挿していない場合の保険で、5ms lookahead / -1dBFS ceiling / 100ms release の
+  固定 sample-peak limiter とする。true-peak limiter ではないため inter-sample peak は
+  完全保証しないが、視聴時の hard clip 保険として扱う。VST3 が無効、または active
+  plugin が無い場合は完全に bypass する。
 - **enable=false なら処理ゼロオーバーヘッド**。frame をそのまま push。
 - **bridge unload 中も音声は流れる**。ロード前は plugin pass-through (= 何もしない)。
 - **block size は decoder のフレームサイズに依存しない**。bridge 側で variable
@@ -110,11 +118,12 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 
 ## 5. プラグイン GUI ホスティング
 
-要件 (ユーザー要望):
+要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける
-- **V キーで全プラグイン GUI 一斉表示/非表示**トグル
-- プラグイン管理ウィンドウで個別表示/非表示
-- v0.9.0 では 1 個までだが UI は将来の複数対応を見据える
+- 動画再生中のホバーバーから VST3 プレイバックパネルを開き、チェーン全体の
+  ON/OFF、個別 GUI 表示、bypass を操作できる
+- プラグインの追加・削除・並べ替えは環境設定→VST3 プラグインページで行う
+- 閉じた plugin GUI は `user_hidden` として保存し、次回の全体表示で勝手に復活させない
 
 実装:
 - bridge プロセス側で `IPlugView::attached(hwnd)` で親ウィンドウに接続
@@ -124,30 +133,37 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 - `SetParent` はクロスプロセスでも動作する (= bridge が hwnd 値を受け取って
   自プロセス内で `IPlugView::attached(hwnd)` を呼ぶ)
 - リサイズ追従 / DPI 対応は Phase 0b で完成済 (`tester/src/plugin_gui.rs` 参照)
-- V キーは:
-  - メインビューポートの input handler で検知
-  - フルスクリーンビューポートの input handler でも検知 (両方対応)
-  - 全 plugin GUI HWND に対して `ShowWindow(SW_SHOW/SW_HIDE)`
+- 全体表示は snapshot した z-order を尊重し、`DeferWindowPos` でまとめて表示する。
+  個別に閉じた GUI は `user_hidden=true` になり、全体表示から除外する。
 
 ## 6. 設定永続化
 
-settings.json に以下 4 項目を追加:
+settings.json に以下を保存する:
 
 ```json
 {
   "vst3_enabled": false,
-  "vst3_plugin_path": "C:/Program Files/Common Files/VST3/Pro-Q 4.vst3",
-  "vst3_plugin_state": "<base64 of IComponent::getState() chunk>",
-  "vst3_gui_visible": true
+  "vst3_plugins": [
+    {
+      "path": "C:/Program Files/Common Files/VST3/Pro-Q 4.vst3",
+      "bypass": false,
+      "state": "<base64 of IComponent::getState() chunk>",
+      "user_hidden": false,
+      "window_rect": null
+    }
+  ],
+  "vst3_gui_visible": false
 }
 ```
 
-- `vst3_enabled`: 環境設定の動画タブ「VST3 プラグイン処理を有効にする」
-- `vst3_plugin_path`: 管理ウィンドウで選択した最後のプラグイン
-- `vst3_plugin_state`: プラグイン側の現在状態 (= EQ カーブ等)。
+- `vst3_enabled`: 環境設定→VST3 プラグイン「VST3 プラグイン処理を有効にする」
+- `vst3_plugins`: チェーン定義。配列順に音声を通す
+- `state`: プラグイン側の現在状態 (= EQ カーブ等)。
   bridge から `query_state` コマンドで取得し、settings 保存時に更新。
   読み込み時に bridge へ `restore_state` で復元。
-- `vst3_gui_visible`: V キー / 管理ウィンドウのトグル状態
+- `user_hidden`: ユーザーが個別に閉じた GUI を、全体表示で再表示しないためのフラグ
+- `window_rect`: plugin GUI の位置とサイズ
+- `vst3_gui_visible`: 再生中パネルからの全体表示状態
 
 bridge プロトコル拡張 (= Phase 0b に追加):
 
@@ -178,20 +194,21 @@ bridge → 親:
 `setActive(false)` が必要。state は `getState/setState` で chunk 化して保存・復元
 する (= setActive(false) でも内部状態は揺るがない仕様)。
 
-## 8. Phase 別実装順 (v0.9.0 に向けた残作業)
+## 8. 実装状況と残作業
 
-| Phase | 内容 | 規模見積もり |
-| --- | --- | --- |
-| **A1** | bridge exe を `include_bytes!` で埋め込み + APPDATA 展開 | 0.5 日 |
-| **A2** | `src/video/dsp/` モジュールを tester から移植 (build.rs / 単体テスト含む) | 1 日 |
-| **A3** | Settings 4 項目 + 環境設定 UI (動画タブに VST3 セクション) | 0.5 日 |
-| **A4** | audio-pump thread に bridge process 挿入 | 0.5 日 |
-| **A5** | プラグイン GUI ホスト + V キー + 管理ウィンドウ | 1 日 |
-| **A6** | state 保存/復元 (`query_state` / `restore_state` 追加) | 0.5 日 |
-| **A7** | docs (architecture-overview / async-architecture / ui-responsiveness / README) 更新 | 0.5 日 |
-| **A8** | 回帰テスト (perf_smoke / ui_snapshot) + 実機確認 | 0.5 日 |
-
-合計 ~5 日。v0.9.0 に同梱可能。
+| 項目 | 状態 |
+| --- | --- |
+| bridge exe 埋め込み + APPDATA 展開 | 完了 |
+| 複数プラグインチェーン | 完了 |
+| 環境設定→VST3 プラグインページ | 完了 |
+| audio-pump からの `DspBridge::process_block` | 完了 |
+| plugin GUI ホスト / z-order / user_hidden | 完了 |
+| plugin state 保存 / 復元 | 完了 |
+| PDC 最小補正 / safety limiter | 完了 |
+| peak / gain reduction / OVER 表示 | 未実装 |
+| SSL Meter Pro 等の右クリックメニュー即閉じ対策 | 未実装 |
+| Buffering 中の raw_pending back-pressure 改善 | 未実装 |
+| PDC 実機検証 (mIV Test Latency 等) | 検証待ち |
 
 ## 9. ライセンス対応
 
@@ -209,12 +226,10 @@ VST3 SDK 3.8.0 (MIT、2025-10-20 以降) を採用しているため、**追加�
    (Youlean LM2 等) も同じ pattern で動くはずだが未検証。リリース前に
    1-2 個追加検証する
 2. **プラグイン GUI を別ウィンドウで開いたまま動画フルスクリーンに入る挙動**:
-   フルスクリーンウィンドウが foreground を取ると plugin GUI が裏に隠れる
-   可能性。`SetWindowPos(HWND_TOPMOST)` で常に手前にするオプションを
-   管理ウィンドウに追加する (= デフォルト OFF)
+   フルスクリーン中は topmost で手前に維持する。通常表示中は通常ウィンドウとして扱う。
 3. **state 保存タイミング**: 設定保存時に bridge に query_state して同期
-   取得すると UI スレッドがブロックする。**worker 化** (CLAUDE.md
-   ui-responsiveness §4) してから書き戻す
+   取得すると UI スレッドがブロックするため、終了時 / VST3 OFF / chain rebuild 前に
+   worker で snapshot する。
 4. **DPI 異モニター跨ぎ**: Phase 0b で Per-Monitor v2 対応済だが、
    実機で 4K + FHD 跨ぎリサイズを再確認する
 
@@ -234,5 +249,6 @@ CLAUDE.md の「リリース手順チェックリスト」に追記:
 - [ ] `cmake --build crates/vst3-host/build --config Release` 完了済
       (vendor/vst3-host/mimageviewer-vst3-host.exe が更新されている)
 - [ ] Pro-Q 4 等の商用プラグインで音声経路を実機確認
-- [ ] V キー一斉トグル動作確認
-- [ ] settings.json に vst3_plugin_state が保存され、再起動で復元されること
+- [ ] 動画再生中の VST3 パネルから全体表示 / 個別 GUI / bypass が操作できること
+- [ ] settings.json に `vst3_plugins[].state` が保存され、再起動で復元されること
+- [ ] safety limiter 有効時に過大出力が -1dBFS ceiling 以下に抑えられること

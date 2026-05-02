@@ -267,7 +267,12 @@ fn main() -> eframe::Result {
 
     let default_size = [1280.0_f32, 800.0_f32];
     // --window-size WxH 引数があればそれを優先（スクリーンショット用）
-    let size = parse_window_size_arg().unwrap_or_else(|| saved.window_size.unwrap_or(default_size));
+    let size = parse_window_size_arg().unwrap_or_else(|| {
+        saved
+            .window_size
+            .filter(|size| sane_window_size(*size))
+            .unwrap_or(default_size)
+    });
 
     let t = Instant::now();
     let icon = Arc::new(load_icon());
@@ -494,6 +499,15 @@ fn parse_window_size_arg() -> Option<[f32; 2]> {
         }
     }
     None
+}
+
+fn sane_window_size(size: [f32; 2]) -> bool {
+    size[0].is_finite()
+        && size[1].is_finite()
+        && size[0] >= 320.0
+        && size[1] >= 240.0
+        && size[0] <= 16_384.0
+        && size[1] <= 16_384.0
 }
 
 fn load_icon() -> egui::IconData {

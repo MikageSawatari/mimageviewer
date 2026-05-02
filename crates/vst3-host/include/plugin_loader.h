@@ -42,6 +42,11 @@ struct PluginProbeInfo {
     bool usable_audio_effect = false;
 };
 
+struct PluginMouseHookEntry {
+    uint32_t thread_id = 0;
+    void* hook = nullptr;
+};
+
 class PluginLoader {
 public:
     PluginLoader();
@@ -114,7 +119,10 @@ public:
     bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                 bool& resizable_out);
     /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
-    bool show_gui(void* hwnd, std::string& error_out);
+    bool show_gui(void* hwnd, bool visible, std::string& error_out);
+    /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
+    /// attached and only hides/shows the bridge-owned top-level surface.
+    void set_gui_visible(bool visible);
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 
@@ -138,6 +146,9 @@ public:
     bool restore_state(const std::vector<uint8_t>& bytes);
 
 private:
+    void install_child_focus_hooks(void* host_hwnd);
+    void remove_child_focus_hooks();
+
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
     Steinberg::IPtr<PlugFrame> plug_frame_;
@@ -148,6 +159,13 @@ private:
     Steinberg::IPtr<Steinberg::Vst::IEditController> controller_;
     Steinberg::IPtr<Steinberg::IPlugView> view_;
     bool view_attached_ = false;
+    void* view_host_hwnd_ = nullptr;
+    void* view_container_hwnd_ = nullptr;
+    std::vector<void*> child_focus_hook_hwnds_;
+    std::vector<PluginMouseHookEntry> child_focus_mouse_hooks_;
+    void* popup_event_hook_ = nullptr;
+    uint32_t last_gui_width_ = 0;
+    uint32_t last_gui_height_ = 0;
 
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;
