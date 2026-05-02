@@ -21,19 +21,21 @@ impl App {
     ///      対象にならない事故を防ぐ。
     ///   3. checked が空なら selected 単体。
     ///   4. selected も無ければ fullscreen_idx (フルスクリーンに居なくても残っていれば)。
-    /// いずれも `Image` かつ書き込み対応形式 (JPEG/PNG/WebP) のものだけ。
+    /// いずれも `Image` (JPEG/PNG/WebP) または `Video` (XMP サイドカー対応形式) のみ。
     pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
-        let push_writable_image = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem]| {
-            if let Some(GridItem::Image(p)) = items.get(idx) {
-                if crate::xmp_writer::is_writable_format(p) {
-                    out.push(p.clone());
-                }
+        let push_writable = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem]| {
+            let p = match items.get(idx) {
+                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+                _ => return,
+            };
+            if crate::xmp_writer::is_taggable_format(p) {
+                out.push(p.clone());
             }
         };
 
         let mut out: Vec<PathBuf> = Vec::new();
         if let Some(fs_idx) = self.fullscreen_idx {
-            push_writable_image(&mut out, fs_idx, &self.items);
+            push_writable(&mut out, fs_idx, &self.items);
             return out;
         }
         let bulk_intent = match self.selected {
@@ -44,12 +46,12 @@ impl App {
             let mut indices: Vec<usize> = self.checked.iter().copied().collect();
             indices.sort_unstable(); // worker のジョブ投入順 = トースト集計順を安定化
             for idx in indices {
-                push_writable_image(&mut out, idx, &self.items);
+                push_writable(&mut out, idx, &self.items);
             }
             return out;
         }
         if let Some(idx) = self.selected {
-            push_writable_image(&mut out, idx, &self.items);
+            push_writable(&mut out, idx, &self.items);
         }
         out
     }

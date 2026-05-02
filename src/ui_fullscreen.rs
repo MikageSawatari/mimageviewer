@@ -162,6 +162,42 @@ const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 境界ヒントより長めに取る。
 const NO_IMAGE_FOLDER_HINT_DURATION: f32 = 4.0;
 
+/// J/K でマーカー間ジャンプするときの「現在位置とみなす許容幅」(秒)。
+/// 現在位置とほぼ同じマーカーをスキップして次のマーカーへ進めるための余裕。
+const NAV_MARKER_EPSILON: f64 = 0.5;
+
+/// 動画再生中、最後のユーザー操作からこの時間が経過したら HUD のフェードを開始する (秒)。
+const VIDEO_HUD_IDLE_BEFORE_FADE: f32 = 2.0;
+/// 動画 HUD のフェードアウトに掛ける時間 (秒)。`IDLE_BEFORE_FADE` を超えた直後から
+/// この時間で 1.0 → 0.0 まで滑らかに減衰する。
+const VIDEO_HUD_FADE_DURATION: f32 = 0.3;
+
+/// 動画のチャプター・ブックマーク・ピンを 1 本の Vec に集約するための種別タグ。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NavMarkerKind {
+    Chapter,
+    Bookmark,
+    Pin,
+}
+
+/// 動画再生時のジャンプ可能マーカー (チャプター開始 / ブックマーク / ピン)。
+/// シークバー描画と J/K ジャンプの両方から使う。
+#[derive(Clone, Debug)]
+pub(crate) struct NavMarker {
+    pub pts: f64,
+    pub kind: NavMarkerKind,
+    pub title: Option<String>,
+}
+
+/// シークバーのマーカー縦線の色 (kind 別)。チャプター=水色 / ブックマーク=黄 / ピン=緑。
+pub(crate) fn nav_marker_color(kind: NavMarkerKind) -> egui::Color32 {
+    match kind {
+        NavMarkerKind::Chapter => egui::Color32::from_rgb(120, 200, 255),
+        NavMarkerKind::Bookmark => egui::Color32::from_rgb(255, 220, 80),
+        NavMarkerKind::Pin => egui::Color32::from_rgb(100, 230, 130),
+    }
+}
+
 /// フルスクリーン中央のヒントオーバーレイ。
 #[derive(Copy, Clone)]
 pub(crate) enum FsBoundaryHint {
@@ -2407,9 +2443,13 @@ impl App {
                         // の領域を除外。
                         let tile_active = self.video_tile_state.is_some();
                         let pos_opt = fs_response.interact_pointer_pos();
-                        let in_hud = pos_opt
-                            .map(|p| video_hud_rect(full_rect).contains(p))
-                            .unwrap_or(false);
+                        // HUD がフェード中・完全フェード後はクリック判定を映像本体に通す。
+                        // 描画されている (= 視認可能な) HUD 上のクリックだけ吸収する。
+                        let hud_visible = self.video_hud_visible_factor > 0.05;
+                        let in_hud = hud_visible
+                            && pos_opt
+                                .map(|p| video_hud_rect(full_rect).contains(p))
+                                .unwrap_or(false);
                         let in_video_panel = pos_opt
                             .map(|p| {
                                 let left_thresh = full_rect.min.x + full_rect.width() * 0.25;
@@ -4980,6 +5020,49 @@ impl App {
         }
     }
 
+    /// 動画のチャプター開始 / ブックマーク / ピンを 1 本の Vec に集約し pts 昇順で返す。
+    /// シークバー描画 (マーカー縦線) と J/K ジャンプの両方が同じソースを使う。
+    pub(crate) fn collect_video_nav_markers(&self, fs_idx: usize) -> Vec<NavMarker> {
+        let path = match self.fs_video_player(fs_idx) {
+            Some(p) => p.path().clone(),
+            None => return Vec::new(),
+        };
+        let mut markers: Vec<NavMarker> = Vec::new();
+        if let Some(info) = self.fs_video_player(fs_idx).and_then(|p| p.info()) {
+            for c in &info.chapters {
+                markers.push(NavMarker {
+                    pts: c.start_secs,
+                    kind: NavMarkerKind::Chapter,
+                    title: c.title.clone(),
+                });
+            }
+        }
+        if let Some(db) = self.video_bookmark_db.as_ref() {
+            for (pts, title) in db.list_marker_meta(&path) {
+                markers.push(NavMarker {
+                    pts,
+                    kind: NavMarkerKind::Bookmark,
+                    title,
+                });
+            }
+        }
+        if let Some(db) = self.video_pin_db.as_ref()
+            && let Some(pts) = db.lookup_pts(&path)
+        {
+            markers.push(NavMarker {
+                pts,
+                kind: NavMarkerKind::Pin,
+                title: None,
+            });
+        }
+        markers.sort_by(|a, b| {
+            a.pts
+                .partial_cmp(&b.pts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        markers
+    }
+
     /// 動画再生時のキー入力を処理する。フルスクリーン中で `state.is_video` のときに
     /// 1 フレームに 1 回呼ぶ。
     pub(crate) fn handle_video_input(
@@ -5041,6 +5124,10 @@ impl App {
         let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
         let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));
+        // J/K: チャプター・ブックマーク・ピンを 1 本のマーカー列にまとめて前後ジャンプ。
+        // 矢印キーは既に固定秒数シークに使っているので別キー。J=前、K=次。
+        let prev_marker_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::J));
+        let next_marker_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::K));
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
@@ -5134,6 +5221,83 @@ impl App {
             p.seek(0.0);
             if !p.is_playing() {
                 p.toggle_play();
+            }
+        }
+
+        // 何らかの動画ショートカット入力があれば HUD のフェードタイマをリセット
+        // (= HUD を再表示)。マウス活動と同様の扱い。
+        let any_video_key = enter
+            || left
+            || right
+            || shift_left
+            || shift_right
+            || ctrl_left
+            || ctrl_right
+            || shift_up
+            || shift_down
+            || mute_key
+            || loop_key
+            || bookmark_key
+            || tile_key
+            || perf_key
+            || rewind_key
+            || prev_marker_key
+            || next_marker_key;
+        if any_video_key {
+            self.video_hud_last_activity = Some(std::time::Instant::now());
+        }
+
+        // J/K: マーカー (チャプター/ブックマーク/ピン) 間の前後ジャンプ。
+        // 現在再生位置 ± epsilon を境にした最近接探索で「現在マーカーで足踏み」を防ぐ。
+        // ジャンプ先がなければ何もしない (= 端で止まる)。
+        if prev_marker_key || next_marker_key {
+            let markers = self.collect_video_nav_markers(fs_idx);
+            let current = self
+                .fs_video_player(fs_idx)
+                .map(|p| p.position())
+                .unwrap_or(0.0);
+            let target: Option<NavMarker> = if next_marker_key {
+                markers
+                    .iter()
+                    .find(|m| m.pts > current + NAV_MARKER_EPSILON)
+                    .cloned()
+            } else {
+                markers
+                    .iter()
+                    .rev()
+                    .find(|m| m.pts < current - NAV_MARKER_EPSILON)
+                    .cloned()
+            };
+            if let Some(m) = target {
+                if let Some(p) = self.fs_video_player(fs_idx) {
+                    p.seek(m.pts);
+                }
+                let direction = if next_marker_key { "次の" } else { "前の" };
+                let kind_label = match m.kind {
+                    NavMarkerKind::Chapter => "チャプター",
+                    NavMarkerKind::Bookmark => "ブックマーク",
+                    NavMarkerKind::Pin => "ピン",
+                };
+                let toast = match (m.kind, m.title.as_deref()) {
+                    (NavMarkerKind::Chapter, Some(t)) | (NavMarkerKind::Bookmark, Some(t))
+                        if !t.is_empty() =>
+                    {
+                        format!(
+                            "{} {}{}: {}",
+                            crate::ui_helpers::format_hms(m.pts),
+                            direction,
+                            kind_label,
+                            t
+                        )
+                    }
+                    _ => format!(
+                        "{} {}{}",
+                        crate::ui_helpers::format_hms(m.pts),
+                        direction,
+                        kind_label
+                    ),
+                };
+                self.show_feedback_toast(toast);
             }
         }
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
@@ -5850,8 +6014,47 @@ impl App {
             }
         }
 
-        // ── 下部 HUD バー ──
+        // 再生中、ユーザーが一定時間操作しなかったら HUD を滑らかに薄くしていく。
+        // 一時停止中も last_activity を最新化することで、再生再開直後に 2 秒は表示が
+        // 保証される (動画切替直後の初回フレームも同様)。
         let hud_rect = video_hud_rect(full_rect);
+        let now = std::time::Instant::now();
+        let pointer_active = ui.ctx().input(|i| {
+            let in_hud = i.pointer.hover_pos().is_some_and(|p| hud_rect.contains(p));
+            in_hud
+                || i.pointer.is_decidedly_dragging()
+                || i.pointer.any_click()
+                || i.pointer.any_pressed()
+                || i.pointer.velocity().length() > 0.5
+        });
+        if pointer_active || !is_playing {
+            self.video_hud_last_activity = Some(now);
+        }
+        let alpha = if !is_playing {
+            1.0
+        } else {
+            let last = *self.video_hud_last_activity.get_or_insert(now);
+            let idle = now.duration_since(last).as_secs_f32();
+            if idle < VIDEO_HUD_IDLE_BEFORE_FADE {
+                1.0
+            } else if idle < VIDEO_HUD_IDLE_BEFORE_FADE + VIDEO_HUD_FADE_DURATION {
+                1.0 - (idle - VIDEO_HUD_IDLE_BEFORE_FADE) / VIDEO_HUD_FADE_DURATION
+            } else {
+                0.0
+            }
+        };
+        self.video_hud_visible_factor = alpha;
+        if alpha < 0.01 {
+            // 完全フェード後はクリックを映像本体に届かせるため描画自体スキップ。
+            return;
+        }
+        if alpha < 1.0 {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+            ui.set_opacity(alpha);
+        }
+
+        // ── 下部 HUD バー ──
         let painter = ui.painter().clone();
         painter.rect_filled(
             hud_rect,
@@ -6027,55 +6230,20 @@ impl App {
                 painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
             }
 
-            // ── マーカー描画: チャプター / ブックマーク / ピン留め ──
-            // バーより少し上下に飛び出した縦線で位置を可視化。色:
-            //   チャプター: 水色 (📑)
-            //   ブックマーク: 黄  (🔖)
-            //   ピン:     緑   (📌)
-            // クリック判定はシークバー全体に乗せたままで、マーカーは描画のみ。
+            // バーより少し上下に飛び出した縦線で位置を可視化。色は kind ごと
+            // (チャプター=水色 / ブックマーク=黄 / ピン=緑)。クリック判定はシークバー
+            // 全体に乗せたままで、マーカーは描画のみ。
             if duration > 0.0 {
-                let video_path = self.fs_video_player(fs_idx).map(|p| p.path().clone());
-                if let Some(path) = video_path.as_ref() {
-                    // チャプター
-                    let chapters: Vec<f64> = self
-                        .fs_video_player(fs_idx)
-                        .and_then(|p| p.info())
-                        .map(|i| i.chapters.iter().map(|c| c.start_secs).collect())
-                        .unwrap_or_default();
-                    // ブックマーク
-                    let bookmarks: Vec<f64> = self
-                        .video_bookmark_db
-                        .as_ref()
-                        .map(|db| db.list(path).iter().map(|b| b.pts_secs).collect())
-                        .unwrap_or_default();
-                    // ピン留め (1 件)
-                    let pin: Option<f64> = self
-                        .video_pin_db
-                        .as_ref()
-                        .and_then(|db| db.lookup_pts(path));
-
-                    let draw_marker = |pts: f64, color: egui::Color32| {
-                        let x = bar_rect.min.x
-                            + bar_rect.width() * (pts / duration).clamp(0.0, 1.0) as f32;
-                        // バー外に少し飛び出す: 上 6px, 下 6px。
-                        painter.line_segment(
-                            [
-                                egui::pos2(x, bar_rect.min.y - 6.0),
-                                egui::pos2(x, bar_rect.max.y + 6.0),
-                            ],
-                            egui::Stroke::new(2.0, color),
-                        );
-                    };
-
-                    for c in &chapters {
-                        draw_marker(*c, egui::Color32::from_rgb(120, 200, 255));
-                    }
-                    for b in &bookmarks {
-                        draw_marker(*b, egui::Color32::from_rgb(255, 220, 80));
-                    }
-                    if let Some(p) = pin {
-                        draw_marker(p, egui::Color32::from_rgb(100, 230, 130));
-                    }
+                for m in self.collect_video_nav_markers(fs_idx) {
+                    let x = bar_rect.min.x
+                        + bar_rect.width() * (m.pts / duration).clamp(0.0, 1.0) as f32;
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, bar_rect.min.y - 6.0),
+                            egui::pos2(x, bar_rect.max.y + 6.0),
+                        ],
+                        egui::Stroke::new(2.0, nav_marker_color(m.kind)),
+                    );
                 }
             }
             let seek_resp = ui.interact(

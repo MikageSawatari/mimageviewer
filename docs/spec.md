@@ -481,8 +481,6 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
     DirectML に自動退避し、画面右上にバナー通知 → 「ワーカーを再起動」で手動復旧可。
   - 推論は別プロセス (TRT worker) で動作。クラッシュ時は最大 3 回まで自動再起動、それでも
     復旧しなければ DirectML フォールバック + バナー通知。
-  - エンジンキャッシュ削除: 環境設定 → パフォーマンス → AI バックエンド から
-    実行可能 (再ダウンロードで復旧)。
   - tile size の backend-aware 切替: TRT は 256、DirectML は 192 (実測ベース)
 - [x] AI JPEG ノイズ除去（RealPLKSR ~28MB 高品質 / OmniSR ~5.5MB 軽量、ブロックノイズ+モスキートノイズ除去）
 - [x] 画像タイプ自動判別（MobileNetV3 + ヒューリスティクス → モデル自動選択）
@@ -587,7 +585,9 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 
 設計ドキュメント: [docs/tag-feature.md](tag-feature.md)
 
-- [x] XMP `dc:subject` への独自タグ (`#タグ名`) 書き込み (JPEG / PNG / WebP 対応、アトミック rename)
+- [x] XMP `dc:subject` への独自タグ (`#タグ名`) 書き込み (JPEG / PNG / WebP は本体埋め込み、
+      動画 (MP4 / MKV / MOV / AVI / WMV / MPG / MPEG) は同名 `.xmp` サイドカーに書き込み、
+      アトミック rename)
 - [x] 他ソフト由来タグ (`#` なし) と既存プロパティ (`xtw:*` 等の Extended XMP 含む) を保持
 - [x] メニュー「タグ」: タグ定義編集 / 選択中ファイルから mIV タグをクリア / 登録タグのワンクリックトグル
 - [x] ツールバーのタグセクション (トグル式、選択中に全付与されていればハイライト)

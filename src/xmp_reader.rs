@@ -483,6 +483,15 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
 /// `#` で始まるもの・つかないもの問わず全て返す。呼び出し側が必要に応じて
 /// `#` 接頭辞でフィルタする。
 pub fn read_dc_subject(path: &Path) -> Vec<String> {
+    // 動画ファイルは同名 `.xmp` サイドカー (Lightroom 互換形式) を直接読む。
+    // サイドカーは XMP packet そのものなので extract 不要、parse_dc_subject に直行。
+    if crate::xmp_writer::is_video_for_sidecar(path) {
+        let sidecar = crate::xmp_writer::sidecar_path_for(path);
+        return match std::fs::read(&sidecar) {
+            Ok(bytes) => parse_dc_subject(&bytes),
+            Err(_) => Vec::new(),
+        };
+    }
     if !extension_might_have_xmp(path) {
         return Vec::new();
     }

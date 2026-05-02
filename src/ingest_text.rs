@@ -152,6 +152,8 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
     //    AI 生成 PNG (10-30MB) で 3x 倍のディスク読み取りになり、インデクサが
     //    350MB/秒級でディスクを占有してしまう (Codex perf 報告)。
     //    ここで一度だけ読んで bytes 版に渡すことで I/O を 3 分の 1 に減らす。
+    let is_video_sidecar = crate::xmp_writer::is_video_for_sidecar(path);
+
     if let Some(bytes) = read_metadata_bytes(path) {
         // 3a. XMP (mXD Twitter メタ)
         if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(&bytes) {
@@ -166,8 +168,18 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         if !png_text.is_empty() {
             out.png_prompt = normalize_for_match(&png_text);
         }
-        // 3c. XMP dc:subject タグ (tag 機能)
-        let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
+        // 3c. XMP dc:subject タグ。動画は本体ではなくサイドカーが authoritative なので
+        //     ここでは触らず後段に任せる (本体に古い XMP が残っていても無視する)。
+        if !is_video_sidecar {
+            let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
+            out.tags = build_tags_column(&dc_tags);
+        }
+    }
+
+    // 4. 動画ファイルは同名 `.xmp` サイドカーを唯一のタグソースとして扱う
+    //    (空ならタグなしと確定させる; 本体に埋め込まれた古い XMP は読まない)。
+    if is_video_sidecar {
+        let dc_tags = crate::xmp_reader::read_dc_subject(path);
         out.tags = build_tags_column(&dc_tags);
     }
 

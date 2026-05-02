@@ -115,6 +115,11 @@ pub(crate) fn spawn() -> TagPrewarmPending {
 /// XMP パケット抽出も 1 回で済ませる (各 `read_*_from_bytes` を個別に呼ぶと
 /// JPEG APP1 / PNG iTXt 走査が 2 回走り、10 MB JPEG などで CPU が倍になる)。
 fn read_xmp_tags_and_rating(path: &std::path::Path) -> (Vec<String>, Option<u8>) {
+    // 動画はファイル本体に XMP を埋めずサイドカー (.xmp) を使う方式。
+    // タグだけ sidecar から取り、rating は対象外 (動画 rating は本タスクのスコープ外)。
+    if crate::xmp_writer::is_video_for_sidecar(path) {
+        return (crate::xmp_reader::read_dc_subject(path), None);
+    }
     let Ok(bytes) = std::fs::read(path) else {
         return (Vec::new(), None);
     };

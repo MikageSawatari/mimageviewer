@@ -77,6 +77,30 @@ impl VideoBookmarkDb {
         crate::data_dir::get().join("video_bookmarks.db")
     }
 
+    /// `list` の軽量版: thumbnail BLOB を読まずに `(pts_secs, title)` だけ返す。
+    /// シークバーマーカー描画や J/K ジャンプのように毎フレーム呼ばれる経路で使う
+    /// (4K WebP サムネを 60fps でクローンするのを避ける)。
+    pub fn list_marker_meta(&self, video_path: &Path) -> Vec<(f64, Option<String>)> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let stmt = self.conn.prepare_cached(
+            "SELECT pts_secs, title FROM video_bookmarks
+              WHERE path = ?1 ORDER BY pts_secs ASC",
+        );
+        let mut stmt = match stmt {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([&key], |row| {
+            let pts_secs: f64 = row.get(0)?;
+            let title: Option<String> = row.get(1)?;
+            Ok((pts_secs, title.filter(|s| !s.is_empty())))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// 指定動画の全ブックマークを `pts_secs` 昇順で返す。
     pub fn list(&self, video_path: &Path) -> Vec<VideoBookmark> {
         let key = crate::path_key::normalize_keep_drive(video_path);
