@@ -254,3 +254,10 @@ CLAUDE.md の「リリース手順チェックリスト」に追記:
 - [ ] 動画再生中の VST3 パネルから全体表示 / 個別 GUI / bypass が操作できること
 - [ ] settings.json に `vst3_plugins[].state` が保存され、再起動で復元されること
 - [ ] safety limiter 有効時に過大出力が -1dBFS ceiling 以下に抑えられること
+# 2026-05 chain bridge note
+
+The original VST3 implementation used one bridge process per plugin. The
+current direction is one bridge process per VST3 chain, so mIV remains isolated
+from plugin crashes while all plugin editors and audio processing share one
+bridge process. See [vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md)
+for the migration plan and protocol shape.

@@ -120,6 +120,7 @@ struct DspBridgeInner {
 }
 
 pub(crate) struct PluginSlot {
+    pub slot_id: u64,
     /// 子 bridge プロセス。`Arc` 化することで audio-pump が snapshot を取って
     /// inner ロックを解放してから IPC を行えるようにする。
     pub bridge: Arc<Bridge>,
@@ -461,36 +462,49 @@ impl DspBridge {
             return Err("VST3 が無効化されています (enable を先に)".to_string());
         }
 
-        // bridge exe path
-        let exe =
-            extract::ensure_bridge_extracted().map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
+        let (bridge_arc, slot_id) = {
+            let inner = self.inner.lock().unwrap();
+            if let Some(first) = inner.slots.first() {
+                (first.bridge.clone(), inner.slots.len() as u64)
+            } else {
+                drop(inner);
+                let exe = extract::ensure_bridge_extracted()
+                    .map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
+                let mut bridge = Bridge::spawn(exe, |line| {
+                    crate::logger::log(format!("[vst3-bridge] {line}"));
+                })
+                .map_err(|e| format!("bridge spawn 失敗: {e}"))?;
+                bridge
+                    .send(&Cmd::Hello { version: 1 })
+                    .map_err(|e| format!("hello send: {e}"))?;
+                match bridge.recv() {
+                    Ok(Event::Ready { .. }) => {}
+                    Ok(other) => {
+                        return Err(format!("予期しないイベント (ready 待ち): {other:?}"));
+                    }
+                    Err(e) => return Err(format!("ready recv: {e}")),
+                }
+                bridge
+                    .open_audio_pipe(plugin_path, sample_rate, block_size, initial_state)
+                    .map_err(|e| format!("open_audio_pipe: {e}"))?;
+                (Arc::new(bridge), 0)
+            }
+        };
 
-        // ── 子プロセス spawn + hello 応答待ち (Mutex 外で実施) ──
-        let mut bridge = Bridge::spawn(exe, |line| {
-            crate::logger::log(format!("[vst3-bridge] {line}"));
-        })
-        .map_err(|e| format!("bridge spawn 失敗: {e}"))?;
-        bridge
-            .send(&Cmd::Hello { version: 1 })
-            .map_err(|e| format!("hello send: {e}"))?;
-        match bridge.recv() {
-            Ok(Event::Ready { .. }) => {}
-            Ok(other) => return Err(format!("予期しないイベント (ready 待ち): {other:?}")),
-            Err(e) => return Err(format!("ready recv: {e}")),
+        if slot_id != 0 {
+            bridge_arc
+                .add_plugin_to_chain(slot_id, plugin_path, initial_state, bypass)
+                .map_err(|e| format!("add_plugin_to_chain: {e}"))?;
         }
-        // initial_state は `open_audio_pipe` → `Cmd::Open` に bake され、bridge 側で
-        // **audio_thread 起動前**に setState される (= race-free auto-restore、Codex P2-3)。
-        bridge
-            .open_audio_pipe(plugin_path, sample_rate, block_size, initial_state)
-            .map_err(|e| format!("open_audio_pipe: {e}"))?;
 
         // loaded イベントを待つ (= bridge は state 復元 + setActive 完了後に Loaded を返す)
         let (plugin_name, latency_samples) = loop {
-            match bridge.recv() {
+            match bridge_arc.recv() {
                 Ok(Event::Loaded {
                     plugin_name,
                     latency_samples,
-                }) => break (plugin_name, latency_samples),
+                    slot_id: got_slot,
+                }) if got_slot == slot_id => break (plugin_name, latency_samples),
                 Ok(Event::Error { detail }) => {
                     return Err(format!("プラグインロード失敗: {detail}"));
                 }
@@ -498,6 +512,9 @@ impl DspBridge {
                 Err(e) => return Err(format!("recv: {e}")),
             }
         };
+        if bypass {
+            let _ = bridge_arc.set_bypass_slot(slot_id, true);
+        }
         // PDC 診断: プラグインがレポートした latency をログに残す。
         crate::logger::log(format!(
             "[VST3 PDC] plugin loaded: '{}' latency_samples={} ({:.3}ms@{}Hz)",
@@ -513,7 +530,6 @@ impl DspBridge {
         //   下流で underrun してプチプチノイズになる」現象が出る (動画 4-5 個目以降は
         //   別動画が来ても plugin の状態は維持されているので問題なし、初回のみ重い)。
         //   block_size * 2 channels, 20 ブロック ≈ 200ms 相当の silence を流す。
-        let bridge_arc = Arc::new(bridge);
         {
             let n = (block_size as usize) * 2;
             let silence = vec![0.0f32; n];
@@ -535,6 +551,7 @@ impl DspBridge {
         let mut inner = self.inner.lock().unwrap();
         let idx = inner.slots.len();
         inner.slots.push(PluginSlot {
+            slot_id,
             bridge: bridge_arc,
             plugin_path: plugin_path.to_string(),
             plugin_name: Some(plugin_name),
@@ -581,41 +598,28 @@ impl DspBridge {
         if !self.is_enabled() {
             return Vec::new();
         }
-        let bridges: Vec<(String, Arc<Bridge>)> = {
+        let bridges: Vec<(String, Arc<Bridge>, u64)> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .slots
                 .iter()
                 .filter(|s| matches!(s.state, SlotState::Loaded))
-                .map(|s| (s.plugin_path.clone(), s.bridge.clone()))
+                .map(|s| (s.plugin_path.clone(), s.bridge.clone(), s.slot_id))
                 .collect()
         };
         if bridges.is_empty() {
             return Vec::new();
         }
         let timeout = std::time::Duration::from_secs(1);
-        // 各 bridge ごとに thread を spawn して query_state_sync を並列実行。
-        // bridge は Arc なのでクローンで thread に渡せる。
-        let handles: Vec<std::thread::JoinHandle<(String, Result<String, String>)>> = bridges
-            .into_iter()
-            .map(|(path, b)| {
-                std::thread::spawn(move || {
-                    let result = b.query_state_sync(timeout);
-                    (path, result)
-                })
-            })
-            .collect();
-        let mut out = Vec::with_capacity(handles.len());
-        for h in handles {
-            match h.join() {
-                Ok((path, Ok(state))) => out.push((path, state)),
-                Ok((path, Err(e))) => crate::logger::log(format!(
+        // Chain bridge では stdout/event stream を共有するため、slot state は順番に取得する。
+        let mut out = Vec::with_capacity(bridges.len());
+        for (path, bridge, slot_id) in bridges {
+            match bridge.query_state_sync_slot(slot_id, timeout) {
+                Ok(state) => out.push((path, state)),
+                Err(e) => crate::logger::log(format!(
                     "[VST3] snapshot_all_plugin_states: query failed for '{}': {e}",
                     path,
                 )),
-                Err(_) => crate::logger::log(
-                    "[VST3] snapshot_all_plugin_states: worker thread panicked".to_string(),
-                ),
             }
         }
         out
@@ -677,7 +681,7 @@ impl DspBridge {
         if !self.is_enabled() {
             return;
         }
-        let bridges: Vec<Arc<Bridge>> = {
+        let mut bridges: Vec<Arc<Bridge>> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .slots
@@ -686,6 +690,7 @@ impl DspBridge {
                 .map(|s| s.bridge.clone())
                 .collect()
         };
+        bridges.dedup_by(|a, b| Arc::ptr_eq(a, b));
         if bridges.is_empty() {
             return;
         }
@@ -720,7 +725,7 @@ impl DspBridge {
         if !self.is_enabled() {
             return;
         }
-        let bridges: Vec<Arc<Bridge>> = {
+        let mut bridges: Vec<Arc<Bridge>> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .slots
@@ -729,6 +734,7 @@ impl DspBridge {
                 .map(|s| s.bridge.clone())
                 .collect()
         };
+        bridges.dedup_by(|a, b| Arc::ptr_eq(a, b));
         if bridges.is_empty() {
             return;
         }
@@ -759,38 +765,44 @@ impl DspBridge {
     ///
     /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
     fn send_slot_gui_visible(&self, idx: usize, visible: bool) {
-        let bridge_arc = {
+        let slot = {
             let inner = self.inner.lock().unwrap();
-            inner.slots.get(idx).map(|s| s.bridge.clone())
+            inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
         };
-        if let Some(bridge) = bridge_arc {
-            let _ = bridge.send(&Cmd::SetGuiVisible {
-                visible: if visible { 1 } else { 0 },
-            });
+        if let Some((bridge, slot_id)) = slot {
+            let _ = bridge.send_value(&serde_json::json!({
+                "cmd": "set_gui_visible",
+                "slot_id": slot_id,
+                "visible": if visible { 1 } else { 0 },
+            }));
         }
     }
 
     fn send_slot_gui_topmost(&self, idx: usize, topmost: bool) {
-        let bridge_arc = {
+        let slot = {
             let inner = self.inner.lock().unwrap();
-            inner.slots.get(idx).map(|s| s.bridge.clone())
+            inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
         };
-        if let Some(bridge) = bridge_arc {
-            let _ = bridge.send(&Cmd::SetGuiTopmost {
-                topmost: if topmost { 1 } else { 0 },
-            });
+        if let Some((bridge, slot_id)) = slot {
+            let _ = bridge.send_value(&serde_json::json!({
+                "cmd": "set_gui_topmost",
+                "slot_id": slot_id,
+                "topmost": if topmost { 1 } else { 0 },
+            }));
         }
     }
 
     fn send_slot_gui_app_active(&self, idx: usize, active: bool) {
-        let bridge_arc = {
+        let slot = {
             let inner = self.inner.lock().unwrap();
-            inner.slots.get(idx).map(|s| s.bridge.clone())
+            inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
         };
-        if let Some(bridge) = bridge_arc {
-            let _ = bridge.send(&Cmd::SetGuiAppActive {
-                active: if active { 1 } else { 0 },
-            });
+        if let Some((bridge, slot_id)) = slot {
+            let _ = bridge.send_value(&serde_json::json!({
+                "cmd": "set_gui_app_active",
+                "slot_id": slot_id,
+                "active": if active { 1 } else { 0 },
+            }));
         }
     }
 
@@ -844,12 +856,12 @@ impl DspBridge {
         }
 
         // ─ Step 1: bridge に推奨 GUI サイズを問い合わせる (Mutex 外) ─
-        let bridge_arc = {
+        let (bridge_arc, slot_id) = {
             let inner = self.inner.lock().unwrap();
             inner
                 .slots
                 .get(idx)
-                .map(|s| s.bridge.clone())
+                .map(|s| (s.bridge.clone(), s.slot_id))
                 .ok_or_else(|| "スロット範囲外".to_string())?
         };
         let plugin_name = {
@@ -861,7 +873,10 @@ impl DspBridge {
                 .unwrap_or_else(|| "VST3 Plugin".to_string())
         };
         bridge_arc
-            .send(&Cmd::QueryGuiSize)
+            .send_value(&serde_json::json!({
+                "cmd": "query_gui_size",
+                "slot_id": slot_id,
+            }))
             .map_err(|e| format!("send QueryGuiSize: {e}"))?;
         let (pref_w, pref_h, resizable) = match bridge_arc.recv() {
             Ok(Event::GuiSize {
@@ -906,13 +921,19 @@ impl DspBridge {
 
         // ─ Step 3: bridge に attach 命令 (Mutex 外、bridge_arc 経由) ─
         bridge_arc
-            .send(&Cmd::ShowGui {
-                hwnd,
-                visible: if visible { 1 } else { 0 },
-            })
+            .send_value(&serde_json::json!({
+                "cmd": "show_gui",
+                "slot_id": slot_id,
+                "hwnd": hwnd,
+                "visible": if visible { 1 } else { 0 },
+            }))
             .map_err(|e| format!("send ShowGui: {e}"))?;
         match bridge_arc.recv() {
-            Ok(Event::GuiAttached { width, height }) => {
+            Ok(Event::GuiAttached {
+                width,
+                height,
+                slot_id: got_slot,
+            }) if got_slot == slot_id => {
                 if width > 0 && height > 0 && (width != pref_w || height != pref_h) {
                     gui::resize_window_client(hwnd, width, height);
                 }
@@ -1328,14 +1349,16 @@ impl DspBridge {
         }
         // session 切替は bridge に最初に伝える (= 後続の resize より先に状態確定)
         for (idx, active) in session_targets {
-            let bridge_arc = {
+            let slot = {
                 let inner = self.inner.lock().unwrap();
-                inner.slots.get(idx).map(|s| s.bridge.clone())
+                inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
             };
-            if let Some(b) = bridge_arc {
-                let _ = b.send(&Cmd::SetUserResizing {
-                    active: if active { 1 } else { 0 },
-                });
+            if let Some((b, slot_id)) = slot {
+                let _ = b.send_value(&serde_json::json!({
+                    "cmd": "set_user_resizing",
+                    "slot_id": slot_id,
+                    "active": if active { 1 } else { 0 },
+                }));
             }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
@@ -1349,15 +1372,17 @@ impl DspBridge {
             self.set_all_guis_app_active(active);
         }
         for (idx, w, h) in resize_targets {
-            let bridge_arc = {
+            let slot = {
                 let inner = self.inner.lock().unwrap();
-                inner.slots.get(idx).map(|s| s.bridge.clone())
+                inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
             };
-            if let Some(b) = bridge_arc {
-                let _ = b.send(&Cmd::NotifyHostResize {
-                    width: w,
-                    height: h,
-                });
+            if let Some((b, slot_id)) = slot {
+                let _ = b.send_value(&serde_json::json!({
+                    "cmd": "notify_host_resize",
+                    "slot_id": slot_id,
+                    "width": w,
+                    "height": h,
+                }));
             }
         }
         user_hidden_paths
@@ -1372,17 +1397,30 @@ impl DspBridge {
             return;
         }
         let mut slot = inner.slots.remove(idx);
+        let shared_count = inner
+            .slots
+            .iter()
+            .filter(|s| Arc::ptr_eq(&s.bridge, &slot.bridge))
+            .count()
+            + 1;
         // GUI が作られていたら撤収
         if slot.gui_hwnd != 0 {
             // bridge にデタッチ命令 (= plugin view->removed())
-            let _ = slot.bridge.send(&Cmd::HideGui);
+            let _ = slot.bridge.send_value(&serde_json::json!({
+                "cmd": "hide_gui",
+                "slot_id": slot.slot_id,
+            }));
             // GuiHost drop で Cmd::Quit が送られてスレッドが close_window 経由で
             // DestroyWindow → 自然 exit する (detach 方式)。
             if let Some(host) = slot.gui_host.take() {
                 host.close();
             }
         }
-        let _ = slot.bridge.shutdown_async();
+        if shared_count <= 1 {
+            let _ = slot.bridge.shutdown_async();
+        } else {
+            let _ = slot.bridge.set_bypass_slot(slot.slot_id, true);
+        }
         self.recalc_active_count(&inner);
     }
 
@@ -1407,6 +1445,7 @@ impl DspBridge {
         };
 
         let mut inner = self.inner.lock().unwrap();
+        let mut bridge_update: Option<(Arc<Bridge>, u64, bool)> = None;
         if let Some(slot) = inner.slots.get_mut(idx) {
             // 手動 ON 時の事前チェック (= Codex P1-G、2026-05-01):
             // この slot を ON にして active total が MAX_PDC_LATENCY_SECS を
@@ -1448,9 +1487,14 @@ impl DspBridge {
                 if !bypass {
                     s.auto_bypassed_for_latency = false;
                 }
+                bridge_update = Some((s.bridge.clone(), s.slot_id, bypass));
             }
         }
         self.recalc_active_count(&inner);
+        drop(inner);
+        if let Some((bridge, slot_id, bypass)) = bridge_update {
+            let _ = bridge.set_bypass_slot(slot_id, bypass);
+        }
     }
 
     /// 指定 idx の GUI HWND を更新する (UI ホスト側がウィンドウ作成 / 破棄したときに呼ぶ)。
@@ -1481,7 +1525,7 @@ impl DspBridge {
         // process_block は audio-pump からのみ呼ばれるが、UI からの add/remove と
         // 競合する可能性があるので Mutex で snapshot を取る (= IPC roundtrip 中は
         // ロック解放済み)。
-        let active_bridges: Vec<Arc<Bridge>> = {
+        let mut active_bridges: Vec<Arc<Bridge>> = {
             let mut inner = self.inner.lock().unwrap();
             // scratch バッファをこの timing で resize (audio frame サイズが変わる可能性)
             let n = src.len();
@@ -1496,6 +1540,7 @@ impl DspBridge {
                 .map(|s| s.bridge.clone())
                 .collect()
         };
+        active_bridges.dedup_by(|a, b| Arc::ptr_eq(a, b));
 
         if active_bridges.is_empty() {
             dst.copy_from_slice(src);

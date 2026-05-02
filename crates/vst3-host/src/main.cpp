@@ -234,8 +234,16 @@ public:
             stdin_thread.detach();
         }
 
-        if (loader_) {
-            loader_->unload();
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            if (loader_) {
+                loader_->unload();
+            }
+            for (auto& loader : extra_loaders_) {
+                if (loader) {
+                    loader->unload();
+                }
+            }
         }
         if (SUCCEEDED(co_hr)) {
             CoUninitialize();
@@ -257,13 +265,16 @@ private:
             // VST3 では UI でモード切替等が起きると plugin が IComponentHandler::
             // restartComponent(kLatencyChanged) を呼ぶ。ComponentHandler が flag を立て、
             // ここで polling して親プロセス (mIV) に通知する。
-            if (loader_) {
+            size_t slot_id = 0;
+            for (PluginLoader* loader : all_loaders()) {
                 uint32_t new_latency = 0;
-                if (loader_->poll_latency_change(new_latency)) {
+                if (loader->poll_latency_change(new_latency)) {
                     std::string reply = "{\"event\":\"latency_changed\",\"latency_samples\":" +
-                                        std::to_string(new_latency) + "}";
+                                        std::to_string(new_latency) +
+                                        ",\"slot_id\":" + std::to_string(slot_id) + "}";
                     write_message(reply);
                 }
+                ++slot_id;
             }
             // 3) コマンドキューを 1 件処理
             std::string cmd_msg;
@@ -323,6 +334,48 @@ private:
         return v;
     }
 
+    PluginLoader* loader_at(uint64_t slot_id) {
+        std::lock_guard<std::mutex> lk(loaders_mutex_);
+        return loader_at_unlocked(slot_id);
+    }
+
+    PluginLoader* loader_at_unlocked(uint64_t slot_id) {
+        if (slot_id == 0) {
+            return loader_.get();
+        }
+        size_t idx = static_cast<size_t>(slot_id - 1);
+        if (idx >= extra_loaders_.size()) {
+            return nullptr;
+        }
+        return extra_loaders_[idx].get();
+    }
+
+    PluginLoader* loader_for_message(const std::string& msg) {
+        return loader_at(extract_number_field(msg, "slot_id"));
+    }
+
+    std::vector<PluginLoader*> all_loaders() {
+        std::lock_guard<std::mutex> lk(loaders_mutex_);
+        return all_loaders_unlocked();
+    }
+
+    std::vector<PluginLoader*> all_loaders_unlocked() {
+        std::vector<PluginLoader*> out;
+        if (loader_) {
+            out.push_back(loader_.get());
+        }
+        for (auto& loader : extra_loaders_) {
+            if (loader) {
+                out.push_back(loader.get());
+            }
+        }
+        return out;
+    }
+
+    bool slot_bypassed(size_t slot) const {
+        return slot < plugin_bypass_.size() && plugin_bypass_[slot];
+    }
+
     bool handle_message(const std::string& msg) {
         std::string cmd = extract_string_field(msg, "cmd");
         if (cmd == "hello") {
@@ -333,6 +386,9 @@ private:
         }
         if (cmd == "open") {
             return handle_open(msg);
+        }
+        if (cmd == "add_plugin") {
+            return handle_add_plugin(msg);
         }
         if (cmd == "probe") {
             std::string plugin_path = extract_string_field(msg, "plugin_path");
@@ -379,7 +435,8 @@ private:
             // プラグインの推奨 GUI サイズ + canResize 属性を scale 込みで取得して返す。
             // bridge プロセスは Per-Monitor v2 Aware なので GetDpiForSystem は
             // primary monitor の DPI (= ユーザー環境では 144 等) を返す。
-            if (!loader_) {
+            PluginLoader* loader = loader_for_message(msg);
+            if (!loader) {
                 send_event_error("query_gui_size: no plugin loaded");
                 return true;
             }
@@ -387,7 +444,7 @@ private:
             if (dpi == 0) dpi = 96;
             uint32_t w = 0, h = 0;
             bool resizable = false;
-            if (!loader_->query_gui_size_at_dpi(dpi, w, h, resizable)) {
+            if (!loader->query_gui_size_at_dpi(dpi, w, h, resizable)) {
                 send_event_error("query_gui_size: getSize failed");
                 return true;
             }
@@ -400,7 +457,9 @@ private:
             return true;
         }
         if (cmd == "show_gui") {
-            if (!loader_) {
+            uint64_t slot_id = extract_number_field(msg, "slot_id");
+            PluginLoader* loader = loader_for_message(msg);
+            if (!loader) {
                 send_event_error("show_gui: no plugin loaded");
                 return true;
             }
@@ -411,44 +470,55 @@ private:
             }
             const bool visible = extract_number_field(msg, "visible") != 0;
             std::string err;
-            if (!loader_->show_gui(reinterpret_cast<void*>(hwnd_u), visible, err)) {
+            if (!loader->show_gui(reinterpret_cast<void*>(hwnd_u), visible, err)) {
                 send_event_error("show_gui: " + err);
                 return true;
             }
             uint32_t w = 0, h = 0;
-            if (loader_->get_gui_size(w, h)) {
+            if (loader->get_gui_size(w, h)) {
                 std::string reply = "{\"event\":\"gui_attached\",\"width\":" +
                                     std::to_string(w) + ",\"height\":" +
-                                    std::to_string(h) + "}";
+                                    std::to_string(h) +
+                                    ",\"slot_id\":" + std::to_string(slot_id) + "}";
                 write_message(reply);
             } else {
-                write_message("{\"event\":\"gui_attached\",\"width\":0,\"height\":0}");
+                std::string reply = "{\"event\":\"gui_attached\",\"width\":0,\"height\":0,\"slot_id\":" +
+                                    std::to_string(slot_id) + "}";
+                write_message(reply);
             }
             return true;
         }
         if (cmd == "hide_gui") {
-            if (loader_) loader_->hide_gui();
+            if (PluginLoader* loader = loader_for_message(msg)) loader->hide_gui();
             write_message("{\"event\":\"gui_detached\"}");
             return true;
         }
         if (cmd == "set_gui_visible") {
-            if (loader_) {
+            if (PluginLoader* loader = loader_for_message(msg)) {
                 uint64_t visible = extract_number_field(msg, "visible");
-                loader_->set_gui_visible(visible != 0);
+                loader->set_gui_visible(visible != 0);
             }
             return true;
         }
         if (cmd == "set_gui_topmost") {
-            if (loader_) {
+            if (PluginLoader* loader = loader_for_message(msg)) {
                 uint64_t topmost = extract_number_field(msg, "topmost");
-                loader_->set_gui_topmost(topmost != 0);
+                loader->set_gui_topmost(topmost != 0);
             }
             return true;
         }
         if (cmd == "set_gui_app_active") {
-            if (loader_) {
+            if (PluginLoader* loader = loader_for_message(msg)) {
                 uint64_t active = extract_number_field(msg, "active");
-                loader_->set_gui_app_active(active != 0);
+                loader->set_gui_app_active(active != 0);
+            }
+            return true;
+        }
+        if (cmd == "set_bypass") {
+            uint64_t slot = extract_number_field(msg, "slot_id");
+            if (slot < plugin_bypass_.size()) {
+                plugin_bypass_[static_cast<size_t>(slot)] =
+                    extract_number_field(msg, "bypass") != 0;
             }
             return true;
         }
@@ -463,11 +533,12 @@ private:
         if (cmd == "notify_host_resize") {
             // host (tester) ウィンドウがユーザーリサイズされた → プラグインに通知して
             // 子ウィンドウを追従させる。応答は不要。
-            if (!loader_) return true;
+            PluginLoader* loader = loader_for_message(msg);
+            if (!loader) return true;
             uint32_t w = static_cast<uint32_t>(extract_number_field(msg, "width"));
             uint32_t h = static_cast<uint32_t>(extract_number_field(msg, "height"));
             if (w > 0 && h > 0) {
-                loader_->notify_host_resize(w, h);
+                loader->notify_host_resize(w, h);
             }
             return true;
         }
@@ -475,9 +546,10 @@ private:
             // ユーザー drag による resize/move session の開始 / 終了通知 (Codex P4)。
             // session 中は plugin の resizeView による host SetWindowPos を抑止して
             // ユーザー drag との衝突 (= ウィンドウ振動) を防ぐ。
-            if (!loader_) return true;
+            PluginLoader* loader = loader_for_message(msg);
+            if (!loader) return true;
             uint64_t active = extract_number_field(msg, "active");
-            loader_->set_user_resizing(active != 0);
+            loader->set_user_resizing(active != 0);
             return true;
         }
         if (cmd == "query_state") {
@@ -488,10 +560,11 @@ private:
             // **audio thread fence** (Codex P2-2、2026-05-01): control thread からは
             // フラグを立てるだけ。audio thread が loop 境界で getState を実行して
             // event を発行する。process() と並走しないので thread safety を保てる。
-            if (!loader_ || !audio_running_) {
+            if (!loader_for_message(msg) || !audio_running_) {
                 send_event_error("query_state: no plugin loaded");
                 return true;
             }
+            pending_state_slot_.store(extract_number_field(msg, "slot_id"), std::memory_order_release);
             query_state_pending_.store(true, std::memory_order_release);
             return true;
         }
@@ -500,7 +573,7 @@ private:
             // **初回 auto-restore は Cmd::Open の state field 経由** (= audio_thread 起動前)
             // で適用されるので、こちらは runtime restore (= 将来のプリセット切替等) 用。
             // 現状の使い方では呼ばれない。
-            if (!loader_ || !audio_running_) {
+            if (!loader_for_message(msg) || !audio_running_) {
                 send_event_error("restore_state: no plugin loaded");
                 return true;
             }
@@ -515,15 +588,24 @@ private:
                 std::lock_guard<std::mutex> lk(restore_state_mutex_);
                 restore_state_bytes_ = std::move(bytes);
             }
+            pending_state_slot_.store(extract_number_field(msg, "slot_id"), std::memory_order_release);
             restore_state_pending_.store(true, std::memory_order_release);
             return true;
         }
         if (cmd == "close") {
-            if (loader_) loader_->unload();
-            loader_.reset();
             audio_running_ = false;
             if (audio_thread_.joinable()) audio_thread_.join();
             pipe_.detach();
+            {
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                if (loader_) loader_->unload();
+                for (auto& loader : extra_loaders_) {
+                    if (loader) loader->unload();
+                }
+                loader_.reset();
+                extra_loaders_.clear();
+                plugin_bypass_.clear();
+            }
             write_message("{\"event\":\"closed\"}");
             return true;
         }
@@ -548,17 +630,38 @@ private:
             return true;
         }
 
+        if (audio_thread_.joinable()) {
+            audio_running_ = false;
+            audio_thread_.join();
+            pipe_.detach();
+        }
+
         std::string err;
         if (!pipe_.attach(shm_name, shm_size, sig_in_name, sig_out_name, err)) {
             send_event_error("attach failed: " + err);
             return true;
         }
+        sample_rate_ = sample_rate;
+        block_size_ = block_size;
 
-        loader_ = std::make_unique<PluginLoader>();
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            if (loader_) loader_->unload();
+            for (auto& loader : extra_loaders_) {
+                if (loader) loader->unload();
+            }
+            extra_loaders_.clear();
+            plugin_bypass_.clear();
+            loader_ = std::make_unique<PluginLoader>();
+        }
+
         LoadedPluginInfo info;
         if (!loader_->load(plugin_path, sample_rate, block_size, info, err)) {
             send_event_error("load failed: " + err);
-            loader_.reset();
+            {
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                loader_.reset();
+            }
             pipe_.detach();
             return true;
         }
@@ -582,15 +685,79 @@ private:
             }
             std::fflush(stderr);
         }
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            plugin_bypass_.push_back(false);
+        }
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
-                            "\",\"latency_samples\":" +
+                            "\",\"slot_id\":0,\"latency_samples\":" +
                             std::to_string(info.latency_samples) + "}";
         write_message(reply);
 
         audio_running_ = true;
         audio_thread_ = std::thread(&Bridge::audio_loop, this, block_size);
+        return true;
+    }
+
+    bool handle_add_plugin(const std::string& msg) {
+        std::string plugin_path = extract_string_field(msg, "plugin_path");
+        if (plugin_path.empty()) {
+            send_event_error("add_plugin: plugin_path missing");
+            return true;
+        }
+        if (!audio_running_) {
+            send_event_error("add_plugin: chain is not open");
+            return true;
+        }
+        uint64_t requested_slot = extract_number_field(msg, "slot_id");
+        size_t slot_id = 0;
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            slot_id = requested_slot == 0
+                ? (extra_loaders_.size() + 1)
+                : static_cast<size_t>(requested_slot);
+            if (slot_id == 0 || slot_id != extra_loaders_.size() + 1) {
+                send_event_error("add_plugin: slot_id must append to the current chain");
+                return true;
+            }
+        }
+
+        auto loader = std::make_unique<PluginLoader>();
+        LoadedPluginInfo info;
+        std::string err;
+        if (!loader->load(plugin_path, sample_rate_, block_size_, info, err)) {
+            send_event_error("add_plugin: load failed: " + err);
+            return true;
+        }
+
+        std::string init_state = extract_string_field(msg, "state");
+        if (!init_state.empty()) {
+            std::vector<uint8_t> bytes;
+            if (base64_decode(init_state, bytes)) {
+                if (!loader->restore_state(bytes)) {
+                    std::fprintf(stderr,
+                        "[BRIDGE] add_plugin restore_state failed (continuing with default)\n");
+                }
+            } else {
+                std::fprintf(stderr,
+                    "[BRIDGE] add_plugin state base64 decode failed (continuing with default)\n");
+            }
+            std::fflush(stderr);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            extra_loaders_.push_back(std::move(loader));
+            plugin_bypass_.push_back(extract_number_field(msg, "bypass") != 0);
+        }
+        std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
+                            json_escape(info.plugin_name) +
+                            "\",\"slot_id\":" + std::to_string(slot_id) +
+                            ",\"latency_samples\":" +
+                            std::to_string(info.latency_samples) + "}";
+        write_message(reply);
         return true;
     }
 
@@ -603,6 +770,7 @@ private:
         const uint32_t channels = 2;
         std::vector<float> input(max_block_size * channels);
         std::vector<float> output(max_block_size * channels);
+        std::vector<float> temp(max_block_size * channels);
 
         // ── audio thread を realtime 優先度に上げる ──
         // VST3 host の責務: audio スレッドを GUI thread 等より高優先度にすることで、
@@ -667,6 +835,34 @@ private:
             if (reset_pending_.exchange(false, std::memory_order_acq_rel)) {
                 uint64_t reset_id = pending_reset_id_.load(std::memory_order_acquire);
                 pipe_.discard_all();
+                uint32_t total_latency = 0;
+                uint32_t active_loaders = 0;
+                {
+                    std::lock_guard<std::mutex> lk(loaders_mutex_);
+                    auto loaders = all_loaders_unlocked();
+                    for (size_t slot = 0; slot < loaders.size(); ++slot) {
+                        PluginLoader* loader = loaders[slot];
+                        if (!loader || slot_bypassed(slot)) continue;
+                        ++active_loaders;
+                        loader->reset();
+                        uint32_t lat = loader->latency_samples();
+                        total_latency += lat;
+                        if (lat > 0) {
+                            loader->flush_with_silence(lat);
+                        }
+                    }
+                }
+                if (active_loaders > 0) {
+                    std::fprintf(stderr,
+                                 "[BRIDGE] reset done id=%llu (in/out ring drained, %u plugins reset, %u samples silence flushed)\n",
+                                 (unsigned long long)reset_id,
+                                 active_loaders,
+                                 total_latency);
+                } else {
+                    std::fprintf(stderr, "[BRIDGE] reset done id=%llu (no loader)\n",
+                                 (unsigned long long)reset_id);
+                }
+#if 0
                 if (loader_) {
                     loader_->reset();
                     // setProcessing(false/true) の後に **silence で delay-line を埋める**。
@@ -687,6 +883,7 @@ private:
                     std::fprintf(stderr, "[BRIDGE] reset done id=%llu (no loader)\n",
                                  (unsigned long long)reset_id);
                 }
+#endif
                 std::fflush(stderr);
                 // ack に reset_id をエコー (= mIV 側 wait が ID 照合する)
                 std::string reply = "{\"event\":\"reset_done\",\"reset_id\":" +
@@ -706,12 +903,16 @@ private:
             // - control が flag を立てた直後に push された input は、setState 反映済の
             //   状態で次の process_block に渡る (= pre-warm が古い state で走る race を防止)
             if (query_state_pending_.exchange(false, std::memory_order_acq_rel)) {
-                if (loader_) {
+                uint64_t slot_id = pending_state_slot_.load(std::memory_order_acquire);
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                PluginLoader* loader = loader_at_unlocked(slot_id);
+                if (loader) {
                     std::vector<uint8_t> bytes;
-                    if (loader_->query_state(bytes)) {
+                    if (loader->query_state(bytes)) {
                         std::string b64 = base64_encode(bytes);
                         std::string reply = "{\"event\":\"plugin_state\",\"state\":\"" +
-                                            b64 + "\"}";
+                                            b64 + "\",\"slot_id\":" +
+                                            std::to_string(slot_id) + "}";
                         write_message(reply);
                     } else {
                         send_event_error("query_state: getState failed");
@@ -724,8 +925,11 @@ private:
                     std::lock_guard<std::mutex> lk(restore_state_mutex_);
                     bytes = std::move(restore_state_bytes_);
                 }
-                if (loader_ && !bytes.empty()) {
-                    if (!loader_->restore_state(bytes)) {
+                uint64_t slot_id = pending_state_slot_.load(std::memory_order_acquire);
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                PluginLoader* loader = loader_at_unlocked(slot_id);
+                if (loader && !bytes.empty()) {
+                    if (!loader->restore_state(bytes)) {
                         send_event_error("restore_state: setState failed");
                     }
                 }
@@ -756,10 +960,36 @@ private:
             if (passthrough_.load(std::memory_order_relaxed)) {
                 // 診断用パススルー: plugin 経由せずそのままコピー
                 std::memcpy(output.data(), input.data(), aligned * sizeof(float));
-            } else if (loader_ && !loader_->process_block(input.data(), output.data(), frames)) {
-                send_event_error("process_block failed");
-                audio_running_ = false;
-                break;
+            } else {
+                bool processed_any = false;
+                const float* current_in = input.data();
+                float* current_out = output.data();
+                {
+                    std::lock_guard<std::mutex> lk(loaders_mutex_);
+                    auto loaders = all_loaders_unlocked();
+                    for (size_t slot = 0; slot < loaders.size(); ++slot) {
+                        PluginLoader* loader = loaders[slot];
+                        if (!loader || slot_bypassed(slot)) continue;
+                        current_out = processed_any
+                            ? (current_out == output.data() ? temp.data() : output.data())
+                            : output.data();
+                        if (!loader->process_block(current_in, current_out, frames)) {
+                            send_event_error("process_block failed");
+                            audio_running_ = false;
+                            break;
+                        }
+                        processed_any = true;
+                        current_in = current_out;
+                    }
+                }
+                if (!audio_running_) {
+                    break;
+                }
+                if (!processed_any) {
+                    std::memcpy(output.data(), input.data(), aligned * sizeof(float));
+                } else if (current_in != output.data()) {
+                    std::memcpy(output.data(), current_in, aligned * sizeof(float));
+                }
             }
             ++blocks_processed;
             for (uint32_t i = 0; i < aligned; ++i) {
@@ -782,8 +1012,13 @@ private:
         std::fflush(stderr);
     }
 
+    std::mutex loaders_mutex_;
     std::unique_ptr<PluginLoader> loader_;
+    std::vector<std::unique_ptr<PluginLoader>> extra_loaders_;
+    std::vector<bool> plugin_bypass_;
     AudioPipe pipe_;
+    uint32_t sample_rate_ = 0;
+    uint32_t block_size_ = 0;
 
     // GUI / コマンドキュー
     std::mutex cmd_mutex_;
@@ -816,6 +1051,7 @@ private:
     /// VST3 plugin の thread safety を担保し、process と setState/getState の race を排除。
     std::atomic<bool> query_state_pending_{false};
     std::atomic<bool> restore_state_pending_{false};
+    std::atomic<uint64_t> pending_state_slot_{0};
     std::mutex restore_state_mutex_;          // protects restore_state_bytes_
     std::vector<uint8_t> restore_state_bytes_;
 };

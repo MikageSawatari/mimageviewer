@@ -167,6 +167,8 @@ pub enum Event {
     Loaded {
         plugin_name: String,
         latency_samples: u32,
+        #[serde(default)]
+        slot_id: u64,
     },
     Probed {
         plugin_name: String,
@@ -180,6 +182,8 @@ pub enum Event {
     },
     LatencyChanged {
         latency_samples: u32,
+        #[serde(default)]
+        slot_id: u64,
     },
     /// `Cmd::Reset { reset_id }` への応答。同じ `reset_id` をエコーで返す。
     /// 待機側はこれを照合して「自分が送った reset の ack か」を判定する
@@ -195,6 +199,8 @@ pub enum Event {
     GuiAttached {
         width: u32,
         height: u32,
+        #[serde(default)]
+        slot_id: u64,
     },
     GuiDetached,
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
@@ -209,6 +215,8 @@ pub enum Event {
     /// `Cmd::QueryState` の応答。プラグイン内部状態を base64 文字列で受け取る。
     PluginState {
         state: String,
+        #[serde(default)]
+        slot_id: u64,
     },
 }
 
@@ -331,9 +339,14 @@ impl Bridge {
                 let mut stdout = stdout;
                 loop {
                     match read_event_blocking(&mut stdout) {
-                        Ok(Event::LatencyChanged { latency_samples }) => {
-                            cached_latency_for_pump
-                                .store(latency_samples, Ordering::Release);
+                        Ok(Event::LatencyChanged {
+                            latency_samples,
+                            slot_id,
+                        }) => {
+                            if slot_id == 0 {
+                                cached_latency_for_pump
+                                    .store(latency_samples, Ordering::Release);
+                            }
                             // 通知ログ (mIV 側 audio-pump が次に total_latency_samples を
                             // 呼んだ時に拾う想定)
                             crate::logger::log(format!(
@@ -353,9 +366,16 @@ impl Bridge {
                         Ok(other) => {
                             // Loaded を受信したら cached_latency にも反映する
                             // (= 起動直後は LatencyChanged 通知が来ないプラグインに対応)
-                            if let Event::Loaded { latency_samples, .. } = &other {
-                                cached_latency_for_pump
-                                    .store(*latency_samples, Ordering::Release);
+                            if let Event::Loaded {
+                                latency_samples,
+                                slot_id,
+                                ..
+                            } = &other
+                            {
+                                if *slot_id == 0 {
+                                    cached_latency_for_pump
+                                        .store(*latency_samples, Ordering::Release);
+                                }
                             }
                             if event_tx.send(Ok(other)).is_err() {
                                 break;  // receiver dropped
@@ -435,6 +455,33 @@ impl Bridge {
         self.cached_latency_samples.load(Ordering::Acquire)
     }
 
+    pub fn add_plugin_to_chain(
+        &self,
+        slot_id: u64,
+        plugin_path: &str,
+        initial_state: Option<&str>,
+        bypass: bool,
+    ) -> std::io::Result<()> {
+        let mut msg = serde_json::json!({
+            "cmd": "add_plugin",
+            "slot_id": slot_id,
+            "plugin_path": plugin_path,
+            "bypass": if bypass { 1 } else { 0 },
+        });
+        if let Some(state) = initial_state.filter(|s| !s.is_empty()) {
+            msg["state"] = serde_json::Value::String(state.to_string());
+        }
+        self.send_value(&msg)
+    }
+
+    pub fn set_bypass_slot(&self, slot_id: u64, bypass: bool) -> std::io::Result<()> {
+        self.send_value(&serde_json::json!({
+            "cmd": "set_bypass",
+            "slot_id": slot_id,
+            "bypass": if bypass { 1 } else { 0 },
+        }))
+    }
+
     /// プラグイン内部状態 (= EQ カーブ / chunk) を base64 文字列で取得する。
     /// `Cmd::QueryState` を送って `Event::PluginState` を `timeout` 内で待つ。
     /// 期待外の event (= Error / 旧 reset 等) は **drop してログ** し、期待 event を
@@ -450,7 +497,7 @@ impl Bridge {
                 return Err("timeout".to_string());
             }
             match self.event_rx.recv_timeout(deadline - now) {
-                Ok(Ok(Event::PluginState { state })) => return Ok(state),
+                Ok(Ok(Event::PluginState { state, .. })) => return Ok(state),
                 Ok(Ok(Event::Error { detail })) => return Err(detail),
                 Ok(Ok(other)) => {
                     crate::logger::log(format!(
@@ -463,9 +510,57 @@ impl Bridge {
         }
     }
 
+    pub fn query_state_sync_slot(
+        &self,
+        slot_id: u64,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        self.send_value(&serde_json::json!({
+            "cmd": "query_state",
+            "slot_id": slot_id,
+        }))
+        .map_err(|e| format!("send: {e}"))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err("timeout".to_string());
+            }
+            match self.event_rx.recv_timeout(deadline - now) {
+                Ok(Ok(Event::PluginState {
+                    state,
+                    slot_id: got,
+                })) if got == slot_id => {
+                    return Ok(state);
+                }
+                Ok(Ok(Event::Error { detail })) => return Err(detail),
+                Ok(Ok(other)) => {
+                    crate::logger::log(format!(
+                        "[VST3] query_state(slot={slot_id}): ignored unexpected event: {other:?}"
+                    ));
+                }
+                Ok(Err(e)) => return Err(format!("io: {e}")),
+                Err(_) => return Err("timeout".to_string()),
+            }
+        }
+    }
+
     /// 制御メッセージを送る。
     pub fn send(&self, cmd: &Cmd) -> std::io::Result<()> {
         let payload = serde_json::to_vec(cmd)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let len = u32::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
+        })?;
+        let mut stdin = self.stdin.lock().unwrap();
+        stdin.write_all(&len.to_le_bytes())?;
+        stdin.write_all(&payload)?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    pub fn send_value(&self, value: &serde_json::Value) -> std::io::Result<()> {
+        let payload = serde_json::to_vec(value)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
