@@ -1705,9 +1705,10 @@ pub struct App {
     /// 同左ジャンプパネル用。
     #[cfg(windows)]
     pub(crate) show_video_jump_panel_visible: bool,
-    /// 次の `open_fullscreen` を「グリッド (サムネ一覧) からのオープン」として扱う
-    /// フラグ (Phase 7.J)。`VideoAutoplayMode::OnlyFromGrid` のときに自動再生する
-    /// かどうかの判定に使う。`open_fullscreen` 経由で動画を実際に open するときに
+    /// 次の `open_fullscreen` を「グリッド (サムネ一覧) から明示的に開いた」
+    /// ケースとして扱うフラグ (Phase 7.J)。一覧から開いた動画は再生開始し、
+    /// 動画送りで開いた動画は一時停止するかどうかの判定に使う。
+    /// `open_fullscreen` 経由で動画を実際に open するときに
     /// `mem::take` で取り出して reset される (= 1 度だけ有効)。
     pub(crate) fs_open_intent_from_grid: bool,
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
@@ -9815,7 +9816,7 @@ impl App {
                 // ミュートだけ切る (= 解除時に元の音量に戻る)。0.0 を渡してしまうと
                 // 「ミュート解除しても音が出ない」状態になり Codex に指摘された。
                 let vol = self.settings.video_volume;
-                // Phase 7.J: 自動再生 3 モード化 (Off / OnlyFromGrid / Always)。
+                // 一覧から明示的に開いた動画は再生開始、動画送りでは停止する。
                 // migration: 旧 video_autoplay=true で video_autoplay_mode が
                 // デフォルト (= Off、つまり明示的に保存していない) なら Always に
                 // bridge する (= 旧設定からのアップグレードで挙動が突然変わらない)。

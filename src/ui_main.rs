@@ -1323,8 +1323,8 @@ impl App {
                     // 動画も画像と同じくフルスクリーン化 → VideoPlayer がインライン再生する。
                     // 外部プレイヤーで開きたい場合はフルスクリーン中の Shift+Enter または
                     // 右クリックメニューから (近日対応予定)。
-                    // Phase 7.J: グリッドから明示的に開いたケースなので
-                    // VideoAutoplayMode::OnlyFromGrid のときに自動再生される。
+                    // Phase 7.J: グリッドから明示的に開いたケースなので、
+                    // 「一覧から開いたときだけ再生する」設定でも再生開始する。
                     self.bump_input_seq_for_item("grid_double_click", idx);
                     self.fs_open_intent_from_grid = true;
                     self.open_fullscreen(idx);

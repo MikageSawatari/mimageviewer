@@ -813,8 +813,9 @@ pub struct Settings {
     #[serde(default = "default_video_volume")]
     pub video_volume: f64,
     /// フルスクリーン化時に自動再生を開始するか (旧: bool)。
-    /// Phase 7.J で 3 モード (Off / OnlyFromGrid / Always) に拡張。新フィールド
-    /// `video_autoplay_mode` を見るのが推奨。本フィールドは migration 用に残す:
+    /// Phase 7.J で `VideoAutoplayMode` に拡張。現在の UI は
+    /// Off / Always の 2 択で、OnlyFromGrid は旧設定互換として Off に正規化する。
+    /// 新フィールド `video_autoplay_mode` を見るのが推奨。本フィールドは migration 用に残す:
     /// `video_autoplay_mode` がデフォルト値 (= 未保存) のときだけ参照される。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -927,12 +928,10 @@ fn default_video_tile_columns() -> usize {
 /// 動画フルスクリーン時の自動再生ポリシー (Phase 7.J)。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VideoAutoplayMode {
-    /// 開いた瞬間は常に一時停止状態 (= 旧 video_autoplay=false 相当)。
+    /// 一覧から明示的に開いたときだけ再生する。フルスクリーン中の移動では一時停止。
     #[default]
     Off,
-    /// サムネイル一覧 (グリッド) から開いたときだけ自動再生する。
-    /// フルスクリーン中の ↑↓ / ホイール等での切替時は一時停止のまま
-    /// (= 動画と認識せずにファイル送りした場合に備え)。
+    /// 旧設定互換。読み込み時に Off に正規化する。
     OnlyFromGrid,
     /// 常に自動再生 (= 旧 video_autoplay=true 相当)。
     Always,
@@ -941,13 +940,13 @@ pub enum VideoAutoplayMode {
 impl VideoAutoplayMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off => "動画は自動再生しない",
-            Self::OnlyFromGrid => "サムネイル一覧から開いたときだけ自動再生する",
+            Self::Off => "一覧から開いたときだけ再生する",
+            Self::OnlyFromGrid => "一覧から開いたときだけ再生する",
             Self::Always => "常に自動再生する",
         }
     }
     pub fn all() -> &'static [Self] {
-        &[Self::Off, Self::OnlyFromGrid, Self::Always]
+        &[Self::Off, Self::Always]
     }
 }
 
@@ -1208,12 +1207,14 @@ impl Settings {
         });
         // migration: UUID nil チェック → 割り当てが発生したかを検出
         let had_nil_uuids = settings.favorites.iter().any(|f| f.id.is_nil());
+        let autoplay_mode_migrated =
+            settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
         // migration: VST3 旧形式 (vst3_plugin_path / vst3_plugin_state) を Vec に移送
         let vst3_migrated = settings.migrate_vst3_legacy();
         settings.sanitize();
         // 新規 UUID を発行したので settings.json に書き戻して永続化する。
         // これで次回起動以降は sanitize でのマイグレーションが不要になる。
-        if had_nil_uuids || vst3_migrated {
+        if had_nil_uuids || vst3_migrated || autoplay_mode_migrated {
             settings.save();
         }
         settings
@@ -1253,6 +1254,10 @@ impl Settings {
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
         // 長時間走り UI 非応答を招くので、両側クランプする。
         self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
+        if self.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid {
+            self.video_autoplay = false;
+            self.video_autoplay_mode = VideoAutoplayMode::Off;
+        }
 
         // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
         // 旧形式 / id フィールド欠落時は deserialize で Uuid::nil() が入っているので、
@@ -1484,6 +1489,27 @@ mod tests {
         s.folder_skip_limit = 999;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 30);
+    }
+
+    #[test]
+    fn sanitize_migrates_legacy_only_from_grid_autoplay_to_off() {
+        let mut s = Settings::default();
+        s.video_autoplay = true;
+        s.video_autoplay_mode = VideoAutoplayMode::OnlyFromGrid;
+        s.sanitize();
+        assert_eq!(s.video_autoplay_mode, VideoAutoplayMode::Off);
+        assert!(
+            !s.video_autoplay,
+            "legacy OnlyFromGrid should not be bridged back to Always by video_autoplay"
+        );
+    }
+
+    #[test]
+    fn video_autoplay_mode_choices_hide_legacy_only_from_grid() {
+        assert_eq!(
+            VideoAutoplayMode::all(),
+            &[VideoAutoplayMode::Off, VideoAutoplayMode::Always]
+        );
     }
 
     // -- FavoriteEntry serde --

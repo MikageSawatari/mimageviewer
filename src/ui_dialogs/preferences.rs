@@ -1642,7 +1642,7 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.label(egui::RichText::new("再生").strong());
     ui.add_space(4.0);
-    // Phase 7.J: 自動再生 3 モード (Off / OnlyFromGrid / Always)。
+    // 一覧から明示的に開いた動画は再生開始、動画送りでは停止するモードと Always の 2 択。
     // 旧 video_autoplay (bool) も内部で migration 用に保持。
     ui.label("自動再生:");
     use crate::settings::VideoAutoplayMode;
