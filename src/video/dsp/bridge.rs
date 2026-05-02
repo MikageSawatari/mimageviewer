@@ -9,6 +9,7 @@
 //! 持ち込まない。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -234,6 +235,7 @@ pub struct Bridge {
     /// を更新する。プラグインが UI でモード切替して `restartComponent(kLatencyChanged)`
     /// を発火すると、event-pump がここを atomically 更新する。
     cached_latency_samples: Arc<AtomicU32>,
+    cached_latency_by_slot: Arc<Mutex<HashMap<u64, u32>>>,
     /// シーク時の同期 reset 用 ack channel。bridge audio thread が in/out ring drain +
     /// `loader_->reset()` を実行した後に `Event::ResetDone { reset_id }` を返してくる。
     /// 一般 `event_rx` に流すと `query_gui_size` などの同期 recv() が誤って拾うので分離。
@@ -326,6 +328,7 @@ impl Bridge {
         // bridge が exit すると stdout EOF → pump 終了 → channel sender drop → recv() で
         // disconnected error。
         let cached_latency = Arc::new(AtomicU32::new(u32::MAX));
+        let cached_latency_by_slot = Arc::new(Mutex::new(HashMap::<u64, u32>::new()));
         let (event_tx, event_rx) = crossbeam_channel::bounded::<std::io::Result<Event>>(64);
         // ResetDone 専用 ack channel。bridge audio thread が reset 実行後に流す
         // `Event::ResetDone { reset_id }` の reset_id をここに送る。
@@ -333,6 +336,7 @@ impl Bridge {
         // bounded(8) は十分 (= 通常 1 個ずつ即消費、複数 reset 連続でも全 ID を保持)。
         let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
         let cached_latency_for_pump = cached_latency.clone();
+        let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
             .name("bridge-event-pump".into())
             .spawn(move || {
@@ -346,6 +350,9 @@ impl Bridge {
                             if slot_id == 0 {
                                 cached_latency_for_pump
                                     .store(latency_samples, Ordering::Release);
+                            }
+                            if let Ok(mut map) = cached_latency_by_slot_for_pump.lock() {
+                                map.insert(slot_id, latency_samples);
                             }
                             // 通知ログ (mIV 側 audio-pump が次に total_latency_samples を
                             // 呼んだ時に拾う想定)
@@ -376,6 +383,9 @@ impl Bridge {
                                     cached_latency_for_pump
                                         .store(*latency_samples, Ordering::Release);
                                 }
+                                if let Ok(mut map) = cached_latency_by_slot_for_pump.lock() {
+                                    map.insert(*slot_id, *latency_samples);
+                                }
                             }
                             if event_tx.send(Ok(other)).is_err() {
                                 break;  // receiver dropped
@@ -395,6 +405,7 @@ impl Bridge {
             stdin: Mutex::new(stdin),
             event_rx,
             cached_latency_samples: cached_latency,
+            cached_latency_by_slot,
             reset_ack_rx,
             next_reset_id: AtomicU64::new(0),
             #[cfg(windows)]
@@ -455,6 +466,14 @@ impl Bridge {
         self.cached_latency_samples.load(Ordering::Acquire)
     }
 
+    pub fn cached_latency_samples_value_slot(&self, slot_id: u64) -> u32 {
+        self.cached_latency_by_slot
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&slot_id).copied())
+            .unwrap_or(u32::MAX)
+    }
+
     pub fn add_plugin_to_chain(
         &self,
         slot_id: u64,
@@ -479,6 +498,18 @@ impl Bridge {
             "cmd": "set_bypass",
             "slot_id": slot_id,
             "bypass": if bypass { 1 } else { 0 },
+        }))
+    }
+
+    pub fn move_plugin_slot(
+        &self,
+        slot_id: u64,
+        before_slot_id: Option<u64>,
+    ) -> std::io::Result<()> {
+        self.send_value(&serde_json::json!({
+            "cmd": "move_plugin",
+            "slot_id": slot_id,
+            "before_slot_id": before_slot_id.unwrap_or(u64::MAX),
         }))
     }
 

@@ -522,6 +522,21 @@ private:
             }
             return true;
         }
+        if (cmd == "move_plugin") {
+            uint64_t slot = extract_number_field(msg, "slot_id");
+            uint64_t before = extract_number_field(msg, "before_slot_id");
+            auto it = std::find(processing_order_.begin(), processing_order_.end(), slot);
+            if (it != processing_order_.end()) {
+                processing_order_.erase(it);
+            }
+            auto before_it = std::find(processing_order_.begin(), processing_order_.end(), before);
+            if (before_it != processing_order_.end()) {
+                processing_order_.insert(before_it, slot);
+            } else {
+                processing_order_.push_back(slot);
+            }
+            return true;
+        }
         if (cmd == "set_passthrough") {
             // 診断用: plugin を経由せず in→out 単純コピー。
             // これで歪みが消えれば plugin process 経路が原因、残れば bridge
@@ -605,6 +620,7 @@ private:
                 loader_.reset();
                 extra_loaders_.clear();
                 plugin_bypass_.clear();
+                processing_order_.clear();
             }
             write_message("{\"event\":\"closed\"}");
             return true;
@@ -652,6 +668,7 @@ private:
             }
             extra_loaders_.clear();
             plugin_bypass_.clear();
+            processing_order_.clear();
             loader_ = std::make_unique<PluginLoader>();
         }
 
@@ -688,6 +705,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
             plugin_bypass_.push_back(false);
+            processing_order_.push_back(0);
         }
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
@@ -751,6 +769,7 @@ private:
             std::lock_guard<std::mutex> lk(loaders_mutex_);
             extra_loaders_.push_back(std::move(loader));
             plugin_bypass_.push_back(extract_number_field(msg, "bypass") != 0);
+            processing_order_.push_back(slot_id);
         }
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
@@ -839,10 +858,9 @@ private:
                 uint32_t active_loaders = 0;
                 {
                     std::lock_guard<std::mutex> lk(loaders_mutex_);
-                    auto loaders = all_loaders_unlocked();
-                    for (size_t slot = 0; slot < loaders.size(); ++slot) {
-                        PluginLoader* loader = loaders[slot];
-                        if (!loader || slot_bypassed(slot)) continue;
+                    for (uint64_t slot_id : processing_order_) {
+                        PluginLoader* loader = loader_at_unlocked(slot_id);
+                        if (!loader || slot_bypassed(static_cast<size_t>(slot_id))) continue;
                         ++active_loaders;
                         loader->reset();
                         uint32_t lat = loader->latency_samples();
@@ -966,10 +984,9 @@ private:
                 float* current_out = output.data();
                 {
                     std::lock_guard<std::mutex> lk(loaders_mutex_);
-                    auto loaders = all_loaders_unlocked();
-                    for (size_t slot = 0; slot < loaders.size(); ++slot) {
-                        PluginLoader* loader = loaders[slot];
-                        if (!loader || slot_bypassed(slot)) continue;
+                    for (uint64_t slot_id : processing_order_) {
+                        PluginLoader* loader = loader_at_unlocked(slot_id);
+                        if (!loader || slot_bypassed(static_cast<size_t>(slot_id))) continue;
                         current_out = processed_any
                             ? (current_out == output.data() ? temp.data() : output.data())
                             : output.data();
@@ -1016,6 +1033,7 @@ private:
     std::unique_ptr<PluginLoader> loader_;
     std::vector<std::unique_ptr<PluginLoader>> extra_loaders_;
     std::vector<bool> plugin_bypass_;
+    std::vector<uint64_t> processing_order_;
     AudioPipe pipe_;
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;

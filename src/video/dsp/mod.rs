@@ -108,6 +108,7 @@ pub struct DspBridge {
 struct DspBridgeInner {
     state: DspState,
     slots: Vec<PluginSlot>,
+    next_slot_id: u64,
     /// 直近 `process_block` が使う scratch バッファ。Mutex 内に持たせて毎回 alloc を回避。
     /// 2 本必要なのは ping-pong 時のみだが、シンプルさのため常に 2 本持つ。
     scratch_a: Vec<f32>,
@@ -179,6 +180,7 @@ impl DspBridge {
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
                 slots: Vec::new(),
+                next_slot_id: 0,
                 scratch_a: Vec::new(),
                 scratch_b: Vec::new(),
                 last_z_order_snapshot: Vec::new(),
@@ -289,7 +291,7 @@ impl DspBridge {
             if !matches!(s.state, SlotState::Loaded) {
                 continue;
             }
-            let latest = s.bridge.cached_latency_samples_value();
+            let latest = s.bridge.cached_latency_samples_value_slot(s.slot_id);
             if latest != u32::MAX && latest != s.latency_samples {
                 crate::logger::log(format!(
                     "[VST3 PDC] slot latency_samples updated: '{}' {} -> {}",
@@ -441,6 +443,7 @@ impl DspBridge {
             // Drop 経路で kill される。
             let _ = slot.bridge.shutdown_async();
         }
+        inner.next_slot_id = 0;
         inner.state = DspState::Disabled;
     }
 
@@ -465,7 +468,8 @@ impl DspBridge {
         let (bridge_arc, slot_id) = {
             let inner = self.inner.lock().unwrap();
             if let Some(first) = inner.slots.first() {
-                (first.bridge.clone(), inner.slots.len() as u64)
+                let slot_id = inner.next_slot_id.max(inner.slots.len() as u64).max(1);
+                (first.bridge.clone(), slot_id)
             } else {
                 drop(inner);
                 let exe = extract::ensure_bridge_extracted()
@@ -550,6 +554,7 @@ impl DspBridge {
         // ── 完成したスロットを Vec に追加 (Mutex 内で短時間) ──
         let mut inner = self.inner.lock().unwrap();
         let idx = inner.slots.len();
+        inner.next_slot_id = inner.next_slot_id.max(slot_id.saturating_add(1)).max(1);
         inner.slots.push(PluginSlot {
             slot_id,
             bridge: bridge_arc,
@@ -1418,6 +1423,9 @@ impl DspBridge {
         }
         if shared_count <= 1 {
             let _ = slot.bridge.shutdown_async();
+            if inner.slots.is_empty() {
+                inner.next_slot_id = 0;
+            }
         } else {
             let _ = slot.bridge.set_bypass_slot(slot.slot_id, true);
         }
@@ -1432,7 +1440,12 @@ impl DspBridge {
         }
         let slot = inner.slots.remove(from);
         let to = to.min(inner.slots.len());
+        let bridge = slot.bridge.clone();
+        let slot_id = slot.slot_id;
         inner.slots.insert(to, slot);
+        let before_slot_id = inner.slots.get(to + 1).map(|s| s.slot_id);
+        drop(inner);
+        let _ = bridge.move_plugin_slot(slot_id, before_slot_id);
     }
 
     /// 指定 idx の bypass フラグを設定する。
