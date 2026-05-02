@@ -1000,7 +1000,7 @@ void PluginLoader::install_child_focus_hooks(void* host_hwnd_raw) {
     g_plugin_mouse_hook_host_hwnd = focus_host;
     if (!popup_event_hook_) {
         HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_CREATE,
-                                             EVENT_OBJECT_DESTROY,
+                                             EVENT_OBJECT_HIDE,
                                              nullptr,
                                              PluginPopupWinEventProc,
                                              GetCurrentProcessId(),
@@ -1204,12 +1204,12 @@ void PluginLoader::set_gui_visible(bool visible) {
             RECT rect{};
             if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
                 SetWindowPos(container_hwnd,
-                             HWND_TOP,
+                             nullptr,
                              rect.left,
                              rect.top,
                              std::max<LONG>(1, rect.right - rect.left),
                              std::max<LONG>(1, rect.bottom - rect.top),
-                             SWP_NOACTIVATE);
+                             SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
         ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNA : SW_HIDE);

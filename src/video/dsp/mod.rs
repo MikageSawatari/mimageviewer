@@ -1088,9 +1088,6 @@ impl DspBridge {
                 match action {
                     ShowAction::Skip => {}
                     ShowAction::BatchExisting(hwnd) => {
-                        self.send_slot_gui_visible(idx, true);
-                        let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-                        self.send_slot_gui_topmost(idx, topmost);
                         shown_hwnds.push(hwnd);
                         shown_indices.push(idx);
                     }
