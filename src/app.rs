@@ -13337,11 +13337,12 @@ impl eframe::App for App {
             if is_fs != self.vst3_was_fullscreen {
                 self.dsp_bridge.set_all_guis_topmost(is_fs);
                 if !is_fs {
-                    // フルスクリーン解除 → VST 関連 UI を全部畳む
+                    // フルスクリーン解除 → VST 関連 UI を全部畳む。
+                    // 動画 compact の設定値は保持し、次に VST を開いた時に復元する。
                     self.dsp_bridge.set_all_guis_visible(false);
                     self.show_vst3_manager = false;
-                    if self.settings.vst3_video_compact {
-                        self.settings.vst3_video_compact = false;
+                    if self.settings.vst3_gui_visible {
+                        self.settings.vst3_gui_visible = false;
                         self.settings.save();
                     }
                 }

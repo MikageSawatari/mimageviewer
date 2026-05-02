@@ -6,6 +6,7 @@
 #include "plugin_loader.h"
 
 #include <algorithm>
+#include <cwchar>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -37,19 +38,11 @@ constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContaine
 LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_ACTIVATEAPP) {
         blog("bridge container WM_ACTIVATEAPP active=%d", wparam != FALSE ? 1 : 0);
-    }
-    if (msg == WM_ACTIVATEAPP && wparam == FALSE) {
-        // When another application becomes foreground, immediately drop the
-        // bridge-owned plugin surface out of the topmost band. The Rust side
-        // will restore the desired topmost state when mIV/bridge becomes
-        // foreground again.
-        SetWindowPos(hwnd,
-                     HWND_BOTTOM,
-                     0,
-                     0,
-                     0,
-                     0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // Do not lower the surface directly here. Moving focus between the Rust
+        // host HWND and the bridge-owned container can deactivate this process
+        // even though the mIV window group is still the foreground UI. The Rust
+        // side polls the actual foreground process and sends set_gui_app_active
+        // when the group really leaves or re-enters the foreground.
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
@@ -195,6 +188,67 @@ const char* win_event_name(DWORD event) {
     }
 }
 
+void normalize_plugin_top_level_window(HWND hwnd) {
+    HWND owner_hwnd = g_plugin_mouse_hook_host_hwnd;
+    if (!hwnd || !IsWindow(hwnd) || !owner_hwnd || !IsWindow(owner_hwnd) || hwnd == owner_hwnd) {
+        return;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return;
+    }
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) {
+        return;
+    }
+    HWND parent = GetParent(hwnd);
+    if (parent != nullptr) {
+        return;
+    }
+
+    wchar_t class_name[128] = {};
+    GetClassNameW(hwnd, class_name, 128);
+    if (std::wcscmp(class_name, L"#32768") == 0) {
+        return;  // system menu window
+    }
+
+    LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    HWND current_owner = GetWindow(hwnd, GW_OWNER);
+    const bool needs_toolwindow = (ex_style & WS_EX_TOOLWINDOW) == 0 ||
+                                  (ex_style & WS_EX_APPWINDOW) != 0;
+    const bool needs_owner = current_owner == nullptr;
+    if (!needs_toolwindow && !needs_owner) {
+        return;
+    }
+
+    if (needs_owner) {
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner_hwnd));
+    }
+    if (needs_toolwindow) {
+        LONG_PTR next_ex_style = (ex_style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next_ex_style);
+    }
+    SetWindowPos(hwnd,
+                 nullptr,
+                 0,
+                 0,
+                 0,
+                 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                     SWP_FRAMECHANGED);
+    blog("normalized plugin top-level hwnd=0x%llx owner=0x%llx",
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(owner_hwnd)));
+}
+
+BOOL CALLBACK EnumPluginTopLevelNormalizeProc(HWND hwnd, LPARAM) {
+    normalize_plugin_top_level_window(hwnd);
+    return TRUE;
+}
+
 void log_window_event(DWORD event, HWND hwnd, LONG object_id, LONG child_id) {
     if (!hwnd || object_id != OBJID_WINDOW || child_id != CHILDID_SELF || !IsWindow(hwnd)) {
         return;
@@ -248,6 +302,10 @@ void CALLBACK PluginPopupWinEventProc(HWINEVENTHOOK,
                                       LONG child_id,
                                       DWORD,
                                       DWORD) {
+    if ((event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) &&
+        object_id == OBJID_WINDOW && child_id == CHILDID_SELF) {
+        normalize_plugin_top_level_window(hwnd);
+    }
     log_window_event(event, hwnd, object_id, child_id);
 }
 
@@ -960,6 +1018,7 @@ void PluginLoader::install_child_focus_hooks(void* host_hwnd_raw) {
     if (!enum_root || !IsWindow(enum_root)) {
         enum_root = host_hwnd;
     }
+    EnumWindows(EnumPluginTopLevelNormalizeProc, 0);
     ChildFocusHookContext ctx{focus_host, &child_focus_hook_hwnds_, &child_focus_mouse_hooks_};
     EnumChildFocusHookProc(enum_root, reinterpret_cast<LPARAM>(&ctx));
     EnumChildWindows(enum_root, EnumChildFocusHookProc, reinterpret_cast<LPARAM>(&ctx));
@@ -1203,10 +1262,13 @@ void PluginLoader::set_gui_app_active(bool active) {
         } else if (gui_surface_visible_) {
             // Do not hide here: several D3D-backed plugin editors repaint as a
             // blank surface after repeated ShowWindow(SW_HIDE/SW_SHOWNA). It is
-            // enough to leave the topmost band and drop behind the foreground
-            // application.
+            // enough to leave the topmost band. Do not send it to HWND_BOTTOM:
+            // clicking the Rust host can temporarily deactivate the bridge
+            // process while the mIV window group is still foreground, and
+            // bottoming the surface makes the editor appear to vanish behind
+            // the video.
             SetWindowPos(container_hwnd,
-                         HWND_BOTTOM,
+                         HWND_NOTOPMOST,
                          0,
                          0,
                          0,

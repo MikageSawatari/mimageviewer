@@ -1326,6 +1326,13 @@ impl App {
                     // Phase 7.J: グリッドから明示的に開いたケースなので、
                     // 「一覧から開いたときだけ再生する」設定でも再生開始する。
                     self.bump_input_seq_for_item("grid_double_click", idx);
+                    if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+                        // Prevent the second click of the grid double-click from
+                        // reaching the newly-opened fullscreen video and toggling
+                        // playback back to paused.
+                        self.fs_suppress_primary_until_release = true;
+                        self.fs_focus_regained_at = Some(std::time::Instant::now());
+                    }
                     self.fs_open_intent_from_grid = true;
                     self.open_fullscreen(idx);
                 }
