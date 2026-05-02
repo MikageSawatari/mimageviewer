@@ -88,6 +88,45 @@ fn make_progress_hook(progress: Arc<Mutex<String>>) -> crate::indexer_manager::S
     })
 }
 
+#[cfg(windows)]
+fn run_vst3_startup_load(
+    bridge: std::sync::Arc<crate::video::dsp::DspBridge>,
+    plugins: Vec<crate::settings::Vst3PluginEntry>,
+    progress: Arc<Mutex<String>>,
+) {
+    if let Ok(mut p) = progress.lock() {
+        *p = "VST3 プラグインを初期化中…".to_string();
+    }
+    if let Err(e) = bridge.enable() {
+        crate::logger::log(format!("vst3 startup enable failed: {e}"));
+        return;
+    }
+    if plugins.is_empty() {
+        return;
+    }
+    let sample_rate = crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
+    let total = plugins.len();
+    for (idx, entry) in plugins.into_iter().enumerate() {
+        if let Ok(mut p) = progress.lock() {
+            *p = format!("VST3 プラグインを初期化中… ({}/{})", idx + 1, total);
+        }
+        if let Err(e) = bridge.add_plugin(
+            &entry.path,
+            sample_rate,
+            480,
+            entry.bypass,
+            entry.user_hidden,
+            entry.state.as_deref(),
+            entry.gui_pos,
+        ) {
+            crate::logger::log(format!(
+                "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
+                entry.path
+            ));
+        }
+    }
+}
+
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
@@ -3396,61 +3435,6 @@ impl App {
 
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
     /// 1 度しか走らせない。
-    /// 起動時 1 回だけ呼び出される: settings.vst3_enabled が true なら bridge を spawn し、
-    /// settings.vst3_plugins のチェーン全体を順番に自動ロードする。
-    /// **worker thread で実行する** (= 1 個ロードあたり ~数百 ms 〜数秒、UI スレッドを止めない)。
-    #[cfg(windows)]
-    pub(crate) fn kick_off_vst3_startup(&mut self) {
-        if self.vst3_init_kicked {
-            return;
-        }
-        self.vst3_init_kicked = true;
-        if !self.settings.vst3_enabled {
-            return;
-        }
-        let bridge = self.dsp_bridge.clone();
-        let plugins = self.settings.vst3_plugins.clone();
-        if plugins.is_empty() {
-            // チェーン未設定なら enable だけしてプラグインは管理ウィンドウで追加してもらう
-            std::thread::Builder::new()
-                .name("vst3-startup".into())
-                .spawn(move || {
-                    if let Err(e) = bridge.enable() {
-                        crate::logger::log(format!("vst3 startup enable failed: {e}"));
-                    }
-                })
-                .ok();
-            return;
-        }
-        std::thread::Builder::new()
-            .name("vst3-startup".into())
-            .spawn(move || {
-                if let Err(e) = bridge.enable() {
-                    crate::logger::log(format!("vst3 startup enable failed: {e}"));
-                    return;
-                }
-                let sample_rate =
-                    crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
-                for entry in plugins {
-                    if let Err(e) = bridge.add_plugin(
-                        &entry.path,
-                        sample_rate,
-                        480,
-                        entry.bypass,
-                        entry.user_hidden,
-                        entry.state.as_deref(),
-                        entry.gui_pos,
-                    ) {
-                        crate::logger::log(format!(
-                            "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
-                            entry.path
-                        ));
-                    }
-                }
-            })
-            .ok();
-    }
-
     pub(crate) fn kick_off_startup_init(&mut self) {
         if self.startup_init.is_some() || self.startup_done {
             return;
@@ -3459,6 +3443,16 @@ impl App {
         let speed = self.settings.indexer_speed_profile;
         let activity_gate = Arc::clone(&self.activity_gate);
         let progress = Arc::clone(&self.startup_progress);
+        #[cfg(windows)]
+        let vst3_enabled = self.settings.vst3_enabled;
+        #[cfg(windows)]
+        let vst3_plugins = self.settings.vst3_plugins.clone();
+        #[cfg(windows)]
+        let vst3_bridge = self.dsp_bridge.clone();
+        #[cfg(windows)]
+        if vst3_enabled {
+            self.vst3_init_kicked = true;
+        }
         let (tx, rx) = mpsc::channel();
         let started_at = std::time::Instant::now();
         let hook = make_progress_hook(Arc::clone(&progress));
@@ -3475,6 +3469,10 @@ impl App {
                         Some(hook),
                     );
                     crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
+                    #[cfg(windows)]
+                    if vst3_enabled {
+                        run_vst3_startup_load(vst3_bridge, vst3_plugins, Arc::clone(&progress));
+                    }
                     let _ = tx.send(mgr);
                 }
             });
@@ -3490,6 +3488,14 @@ impl App {
                 Arc::clone(&self.activity_gate),
                 Some(hook),
             );
+            #[cfg(windows)]
+            if self.settings.vst3_enabled {
+                run_vst3_startup_load(
+                    self.dsp_bridge.clone(),
+                    self.settings.vst3_plugins.clone(),
+                    Arc::clone(&self.startup_progress),
+                );
+            }
             self.startup_done = true;
             self.housekeeping_armed = true;
             return;
@@ -13315,10 +13321,9 @@ impl eframe::App for App {
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
         self.poll_housekeeping_arm();
-        // VST3 起動時の bridge enable + 自動ロード (1 回だけ、settings.vst3_enabled が true のときのみ)。
-        // worker thread で実行されるので UI スレッドはブロックされない。
-        #[cfg(windows)]
-        self.kick_off_vst3_startup();
+        // VST3 起動時の bridge enable + 自動ロードは startup-init worker 内で完了させる。
+        // 動画再生開始後にプラグイン初期化が走ると音声が一瞬途切れるため、通常 UI へ
+        // 進む前に prewarm まで済ませる。
         // VST3 プラグイン GUI の TOPMOST 切替 + フルスクリーン解除時の cleanup。
         // - 遷移時 (= フルスクリーン入退) のみ操作 (毎フレーム呼ぶと余計な SetWindowPos
         //   が発生してプラグイン GUI のフォーカスを乱す)。

@@ -1087,12 +1087,12 @@ void PluginLoader::set_gui_visible(bool visible) {
             RECT rect{};
             if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
                 SetWindowPos(container_hwnd,
-                             nullptr,
+                             HWND_TOP,
                              rect.left,
                              rect.top,
                              std::max<LONG>(1, rect.right - rect.left),
                              std::max<LONG>(1, rect.bottom - rect.top),
-                             SWP_NOZORDER | SWP_NOACTIVATE);
+                             SWP_NOACTIVATE);
             }
         }
         ShowWindow(container_hwnd, visible ? SW_SHOWNA : SW_HIDE);
