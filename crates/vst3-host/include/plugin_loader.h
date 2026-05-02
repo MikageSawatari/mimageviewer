@@ -123,6 +123,11 @@ public:
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
+    /// Toggle topmost state for the bridge-owned plugin surface. The Rust side
+    /// applies the same state to the host HWND so the two windows stay together.
+    void set_gui_topmost(bool topmost);
+    /// Relay mIV app activation to the bridge-owned plugin surface.
+    void set_gui_app_active(bool active);
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 
@@ -161,6 +166,8 @@ private:
     bool view_attached_ = false;
     void* view_host_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
+    bool gui_surface_visible_ = false;
+    bool gui_app_active_ = true;
     std::vector<void*> child_focus_hook_hwnds_;
     std::vector<PluginMouseHookEntry> child_focus_mouse_hooks_;
     void* popup_event_hook_ = nullptr;

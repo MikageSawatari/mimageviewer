@@ -104,6 +104,19 @@ pub enum Cmd {
     SetGuiVisible {
         visible: u32,
     },
+    /// Already-attached bridge-owned GUI surface topmost toggle. Rust owns the
+    /// host HWND, while the bridge owns the actual plugin surface HWND.
+    #[serde(rename = "set_gui_topmost")]
+    SetGuiTopmost {
+        topmost: u32,
+    },
+    /// Application foreground state relay for bridge-owned GUI surfaces.
+    /// When mIV loses activation, the bridge hides plugin surfaces so they do
+    /// not float above the foreground application.
+    #[serde(rename = "set_gui_app_active")]
+    SetGuiAppActive {
+        active: u32,
+    },
     /// プラグインの推奨 GUI サイズだけ取得する (= attached しない)。
     /// host はこのサイズでウィンドウを作ってから ShowGui を送ることで、
     /// プラグインが子ウィンドウを正しいサイズで作成できる。

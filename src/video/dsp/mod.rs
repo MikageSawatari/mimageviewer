@@ -164,6 +164,9 @@ pub(crate) struct PluginSlot {
     /// ホストウィンドウの WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE シグナル
     /// (= ユーザー drag による resize/move session 開始 / 終了、Codex P4 対応)。
     pub gui_resize_session_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
+    /// Host HWND WM_ACTIVATEAPP signal. Used to hide bridge-owned plugin
+    /// surfaces while another application is foreground.
+    pub gui_app_active_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
 }
 
 impl DspBridge {
@@ -511,6 +514,7 @@ impl DspBridge {
             pending_resize_notify: None,
             last_resize_notify: None,
             gui_resize_session_signal: None,
+            gui_app_active_signal: None,
         });
         self.recalc_active_count(&inner);
         drop(inner);
@@ -728,6 +732,30 @@ impl DspBridge {
         }
     }
 
+    fn send_slot_gui_topmost(&self, idx: usize, topmost: bool) {
+        let bridge_arc = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.get(idx).map(|s| s.bridge.clone())
+        };
+        if let Some(bridge) = bridge_arc {
+            let _ = bridge.send(&Cmd::SetGuiTopmost {
+                topmost: if topmost { 1 } else { 0 },
+            });
+        }
+    }
+
+    fn send_slot_gui_app_active(&self, idx: usize, active: bool) {
+        let bridge_arc = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.get(idx).map(|s| s.bridge.clone())
+        };
+        if let Some(bridge) = bridge_arc {
+            let _ = bridge.send(&Cmd::SetGuiAppActive {
+                active: if active { 1 } else { 0 },
+            });
+        }
+    }
+
     fn prewarm_slot_gui(&self, idx: usize) -> Result<(), String> {
         self.ensure_slot_gui_attached(idx, false, false)
     }
@@ -761,6 +789,7 @@ impl DspBridge {
                     let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
                     if visible {
                         gui::set_window_topmost(hwnd, topmost);
+                        self.send_slot_gui_topmost(idx, topmost);
                     }
                     let mut inner2 = self.inner.lock().unwrap();
                     if let Some(s2) = inner2.slots.get_mut(idx) {
@@ -880,15 +909,15 @@ impl DspBridge {
             slot.pending_resize_notify = None;
             slot.last_resize_notify = None;
             slot.gui_resize_session_signal = Some(reply.resize_session_signal);
+            slot.gui_app_active_signal = Some(reply.app_active_signal);
         }
         drop(inner);
         // 新規作成時も「現在の topmost desired state」を反映
         // (= フルスクリーン中に作った HWND にも TOPMOST が必ず付く、Codex P3 対応)。
         if visible {
             let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-            if topmost {
-                gui::set_window_topmost(hwnd, true);
-            }
+            gui::set_window_topmost(hwnd, topmost);
+            self.send_slot_gui_topmost(idx, topmost);
         }
         Ok(())
     }
@@ -996,6 +1025,7 @@ impl DspBridge {
                 inner.slots.len()
             };
             let mut shown_hwnds: Vec<u64> = Vec::with_capacity(n);
+            let mut shown_indices: Vec<usize> = Vec::with_capacity(n);
             for idx in 0..n {
                 let action = {
                     let mut inner = self.inner.lock().unwrap();
@@ -1021,7 +1051,10 @@ impl DspBridge {
                     ShowAction::Skip => {}
                     ShowAction::BatchExisting(hwnd) => {
                         self.send_slot_gui_visible(idx, true);
+                        let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
+                        self.send_slot_gui_topmost(idx, topmost);
                         shown_hwnds.push(hwnd);
+                        shown_indices.push(idx);
                     }
                     ShowAction::Create => {
                         let _ = self.show_slot_gui(idx);
@@ -1031,6 +1064,7 @@ impl DspBridge {
                         };
                         if hwnd != 0 {
                             shown_hwnds.push(hwnd);
+                            shown_indices.push(idx);
                         }
                     }
                 }
@@ -1055,6 +1089,10 @@ impl DspBridge {
             if !restore_order.is_empty() {
                 let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
                 gui::show_windows_in_z_order(&restore_order, topmost);
+                for idx in shown_indices {
+                    self.send_slot_gui_topmost(idx, topmost);
+                    self.send_slot_gui_visible(idx, true);
+                }
             }
         }
     }
@@ -1101,6 +1139,42 @@ impl DspBridge {
         for hwnd in ordered_top_to_bottom.iter().rev() {
             gui::set_window_topmost(*hwnd, topmost);
         }
+        let n = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.len()
+        };
+        for idx in 0..n {
+            self.send_slot_gui_topmost(idx, topmost);
+        }
+    }
+
+    /// mIV が他アプリへ切り替わった時は plugin GUI を NOTOPMOST/非表示にし、
+    /// フルスクリーンへ戻った時だけ動画の上へ復帰させる。
+    fn set_all_guis_app_active(&self, active: bool) {
+        let effective_topmost = active && self.gui_topmost_desired.load(Ordering::Acquire);
+        let target_hwnds: Vec<u64> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .filter(|s| s.gui_hwnd != 0)
+                .map(|s| s.gui_hwnd)
+                .collect()
+        };
+        if !target_hwnds.is_empty() {
+            let ordered_top_to_bottom = gui::snapshot_z_order(&target_hwnds);
+            for hwnd in ordered_top_to_bottom.iter().rev() {
+                gui::set_window_topmost(*hwnd, effective_topmost);
+            }
+        }
+        let n = {
+            let inner = self.inner.lock().unwrap();
+            inner.slots.len()
+        };
+        for idx in 0..n {
+            self.send_slot_gui_topmost(idx, effective_topmost);
+            self.send_slot_gui_app_active(idx, active);
+        }
     }
 
     /// V キーハンドラ用: 「現在 1 個でも表示されているなら全て非表示」
@@ -1131,6 +1205,7 @@ impl DspBridge {
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
         let mut session_targets: Vec<(usize, bool)> = Vec::new();
+        let mut app_active_latest: Option<bool> = None;
         let now = Instant::now();
         let resize_interval = Duration::from_millis(33);
         {
@@ -1185,6 +1260,15 @@ impl DspBridge {
                         }
                     }
                 }
+                if let Some(arc) = slot.gui_app_active_signal.as_ref() {
+                    if let Ok(guard) = arc.lock() {
+                        if let Some(rx) = guard.as_ref() {
+                            while let Ok(active) = rx.try_recv() {
+                                app_active_latest = Some(active);
+                            }
+                        }
+                    }
+                }
             }
         }
         // close は Mutex 外で実施 (DspBridge::user_hide_slot_gui が再 lock するので)。
@@ -1220,6 +1304,9 @@ impl DspBridge {
             }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
+        if let Some(active) = app_active_latest {
+            self.set_all_guis_app_active(active);
+        }
         for (idx, w, h) in resize_targets {
             let bridge_arc = {
                 let inner = self.inner.lock().unwrap();

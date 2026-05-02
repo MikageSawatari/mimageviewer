@@ -34,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOMOVE,
     SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE,
+    WNDCLASSEXW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -93,6 +93,9 @@ pub struct ShowReply {
     /// `true` = 開始 (WM_ENTERSIZEMOVE)、`false` = 終了 (WM_EXITSIZEMOVE)。
     /// メインスレッドはこれを polling し、bridge に SetUserResizing で伝える。
     pub resize_session_signal: Arc<Mutex<Option<Receiver<bool>>>>,
+    /// mIV process activation changes from the host HWND (WM_ACTIVATEAPP).
+    /// The bridge surface uses this to hide while another app is foreground.
+    pub app_active_signal: Arc<Mutex<Option<Receiver<bool>>>>,
 }
 
 /// 専用スレッドで Win32 メッセージループを回す GUI ホスト。
@@ -179,6 +182,9 @@ struct ThreadState {
     /// メインスレッドはこれを受けて bridge に SetUserResizing を送り、bridge 側の
     /// resizeView feedback を抑止する。Codex P4 対応。
     resize_session_tx: Option<Sender<bool>>,
+    /// WM_ACTIVATEAPP relay. This is intentionally process-level, not viewport
+    /// focus, so clicking the plugin itself does not hide the plugin surface.
+    app_active_tx: Option<Sender<bool>>,
     class_registered: bool,
 }
 
@@ -257,6 +263,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+            WM_ACTIVATEAPP => {
+                let active = wparam.0 != 0;
+                let tx_opt: Option<Sender<bool>> = THREAD_STATE
+                    .with(|s| s.borrow().as_ref().and_then(|st| st.app_active_tx.clone()));
+                if let Some(tx) = tx_opt {
+                    let _ = tx.send(active);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_DESTROY => {
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -287,6 +302,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             close_tx: None,
             resize_tx: None,
             resize_session_tx: None,
+            app_active_tx: None,
             class_registered: false,
         }));
     });
@@ -318,6 +334,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                         close_rx,
                         resize_rx,
                         resize_session_rx,
+                        app_active_rx,
                         actual_w,
                         actual_h,
                         used_dpi,
@@ -330,6 +347,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                             close_signal: Arc::new(Mutex::new(Some(close_rx))),
                             resize_signal: Arc::new(Mutex::new(Some(resize_rx))),
                             resize_session_signal: Arc::new(Mutex::new(Some(resize_session_rx))),
+                            app_active_signal: Arc::new(Mutex::new(Some(app_active_rx))),
                         });
                         // ウィンドウ作成成功 → メッセージループを回す。
                         // 並行して cmd_rx も polling する必要があるので、
@@ -347,6 +365,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
                             close_signal: Arc::new(Mutex::new(None)),
                             resize_signal: Arc::new(Mutex::new(None)),
                             resize_session_signal: Arc::new(Mutex::new(None)),
+                            app_active_signal: Arc::new(Mutex::new(None)),
                         });
                         eprintln!("create_window failed: {e}");
                     }
@@ -399,6 +418,7 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
                         close_signal: Arc::new(Mutex::new(None)),
                         resize_signal: Arc::new(Mutex::new(None)),
                         resize_session_signal: Arc::new(Mutex::new(None)),
+                        app_active_signal: Arc::new(Mutex::new(None)),
                     });
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -508,6 +528,7 @@ fn create_window(
     u64,
     Receiver<()>,
     Receiver<(u32, u32)>,
+    Receiver<bool>,
     Receiver<bool>,
     u32,
     u32,
@@ -641,12 +662,14 @@ fn create_window(
         let (close_tx, close_rx) = channel::<()>();
         let (resize_tx, resize_rx) = channel::<(u32, u32)>();
         let (resize_session_tx, resize_session_rx) = channel::<bool>();
+        let (app_active_tx, app_active_rx) = channel::<bool>();
         THREAD_STATE.with(|s| {
             if let Some(st) = s.borrow_mut().as_mut() {
                 st.hwnd = Some(hwnd);
                 st.close_tx = Some(close_tx);
                 st.resize_tx = Some(resize_tx);
                 st.resize_session_tx = Some(resize_session_tx);
+                st.app_active_tx = Some(app_active_tx);
             }
         });
         Ok((
@@ -654,6 +677,7 @@ fn create_window(
             close_rx,
             resize_rx,
             resize_session_rx,
+            app_active_rx,
             actual_w,
             actual_h,
             dpi,
@@ -671,6 +695,9 @@ fn close_window() {
                 }
             }
             st.close_tx = None;
+            st.resize_tx = None;
+            st.resize_session_tx = None;
+            st.app_active_tx = None;
         }
     });
 }

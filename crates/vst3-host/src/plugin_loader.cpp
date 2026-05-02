@@ -1054,11 +1054,22 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
     // これも描画開始トリガとして必要なプラグインが多い。
     Steinberg::ViewRect rect{};
     if (view_->getSize(&rect) == Steinberg::kResultOk) {
-        blog("show_gui: getSize=%dx%d, onSize",
-             rect.right - rect.left, rect.bottom - rect.top);
+        const int preferred_w = std::max<Steinberg::int32>(1, rect.right - rect.left);
+        const int preferred_h = std::max<Steinberg::int32>(1, rect.bottom - rect.top);
+        blog("show_gui: getSize=%dx%d, resize container, onSize", preferred_w, preferred_h);
+        if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+            container_hwnd && IsWindow(container_hwnd)) {
+            SetWindowPos(container_hwnd,
+                         nullptr,
+                         0,
+                         0,
+                         preferred_w,
+                         preferred_h,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         view_->onSize(&rect);
-        last_gui_width_ = static_cast<uint32_t>(std::max<Steinberg::int32>(1, rect.right - rect.left));
-        last_gui_height_ = static_cast<uint32_t>(std::max<Steinberg::int32>(1, rect.bottom - rect.top));
+        last_gui_width_ = static_cast<uint32_t>(preferred_w);
+        last_gui_height_ = static_cast<uint32_t>(preferred_h);
         blog("show_gui: onSize done");
     } else {
         last_gui_width_ = 0;
@@ -1066,9 +1077,11 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
         blog("show_gui: getSize failed");
     }
     install_child_focus_hooks(hwnd);
+    gui_surface_visible_ = visible;
+    gui_app_active_ = true;
     if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
         container_hwnd && IsWindow(container_hwnd)) {
-        ShowWindow(container_hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+        ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNOACTIVATE : SW_HIDE);
     }
     blog("show_gui done visible=%d", visible ? 1 : 0);
     return true;
@@ -1081,9 +1094,10 @@ void PluginLoader::set_user_resizing(bool active) {
 }
 
 void PluginLoader::set_gui_visible(bool visible) {
+    gui_surface_visible_ = visible;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
-        if (visible) {
+        if (visible && gui_app_active_) {
             RECT rect{};
             if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
                 SetWindowPos(container_hwnd,
@@ -1095,13 +1109,58 @@ void PluginLoader::set_gui_visible(bool visible) {
                              SWP_NOACTIVATE);
             }
         }
-        ShowWindow(container_hwnd, visible ? SW_SHOWNA : SW_HIDE);
+        ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNA : SW_HIDE);
         blog("set_gui_visible: bridge surface hwnd=0x%llx visible=%d",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
              visible ? 1 : 0);
         return;
     }
     blog("set_gui_visible: no bridge surface visible=%d", visible ? 1 : 0);
+}
+
+void PluginLoader::set_gui_topmost(bool topmost) {
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (container_hwnd && IsWindow(container_hwnd)) {
+        SetWindowPos(container_hwnd,
+                     topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0,
+                     0,
+                     0,
+                     0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        blog("set_gui_topmost: bridge surface hwnd=0x%llx topmost=%d",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+             topmost ? 1 : 0);
+        return;
+    }
+    blog("set_gui_topmost: no bridge surface topmost=%d", topmost ? 1 : 0);
+}
+
+void PluginLoader::set_gui_app_active(bool active) {
+    gui_app_active_ = active;
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (container_hwnd && IsWindow(container_hwnd)) {
+        const bool show_surface = gui_surface_visible_ && gui_app_active_;
+        if (show_surface) {
+            RECT rect{};
+            if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
+                SetWindowPos(container_hwnd,
+                             nullptr,
+                             rect.left,
+                             rect.top,
+                             std::max<LONG>(1, rect.right - rect.left),
+                             std::max<LONG>(1, rect.bottom - rect.top),
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        ShowWindow(container_hwnd, show_surface ? SW_SHOWNA : SW_HIDE);
+        blog("set_gui_app_active: bridge surface hwnd=0x%llx active=%d show=%d",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+             active ? 1 : 0,
+             show_surface ? 1 : 0);
+        return;
+    }
+    blog("set_gui_app_active: no bridge surface active=%d", active ? 1 : 0);
 }
 
 bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
@@ -1176,6 +1235,8 @@ void PluginLoader::hide_gui() {
     view_attached_ = false;
     view_host_hwnd_ = nullptr;
     view_container_hwnd_ = nullptr;
+    gui_surface_visible_ = false;
+    gui_app_active_ = true;
     last_gui_width_ = 0;
     last_gui_height_ = 0;
     view_ = nullptr;

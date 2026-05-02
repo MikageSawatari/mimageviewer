@@ -438,6 +438,20 @@ private:
             }
             return true;
         }
+        if (cmd == "set_gui_topmost") {
+            if (loader_) {
+                uint64_t topmost = extract_number_field(msg, "topmost");
+                loader_->set_gui_topmost(topmost != 0);
+            }
+            return true;
+        }
+        if (cmd == "set_gui_app_active") {
+            if (loader_) {
+                uint64_t active = extract_number_field(msg, "active");
+                loader_->set_gui_app_active(active != 0);
+            }
+            return true;
+        }
         if (cmd == "set_passthrough") {
             // 診断用: plugin を経由せず in→out 単純コピー。
             // これで歪みが消えれば plugin process 経路が原因、残れば bridge
