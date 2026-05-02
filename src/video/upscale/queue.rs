@@ -216,7 +216,7 @@ impl Default for TaskQueue {
 }
 
 fn default_parallel_segments() -> u8 {
-    2
+    1
 }
 
 impl QueueLock {
@@ -331,11 +331,11 @@ mod tests {
     fn queue_parallel_segments_defaults_and_clamps() {
         let legacy = r#"{"schema":1,"paused":false,"tasks":[]}"#;
         let parsed: TaskQueue = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.parallel_segments, 2);
+        assert_eq!(parsed.parallel_segments, 1);
 
         let mut queue = TaskQueue::new();
-        assert_eq!(queue.parallel_segments, 2);
-        assert!(queue.set_parallel_segments(1));
+        assert_eq!(queue.parallel_segments, 1);
+        assert!(!queue.set_parallel_segments(1));
         assert!(queue.set_parallel_segments(4));
         assert_eq!(queue.parallel_segments, 4);
         assert!(queue.set_parallel_segments(9));

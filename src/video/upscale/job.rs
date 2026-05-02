@@ -161,6 +161,13 @@ impl Default for VideoUpscaleOptions {
     }
 }
 
+impl VideoUpscaleOptions {
+    pub fn normalized_for_video_export(mut self) -> Self {
+        self.model = VideoUpscaleModelPreset::GeneralFast;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
     pub width: u32,
@@ -256,11 +263,16 @@ pub struct VideoUpscaleJob {
     pub info: VideoInfo,
     pub options: VideoUpscaleOptions,
     pub parallel_segments: Arc<AtomicU8>,
+    pub pause: Arc<AtomicBool>,
 }
 
 impl VideoUpscaleJob {
     fn current_parallel_segments(&self) -> usize {
-        self.parallel_segments.load(Ordering::Relaxed).clamp(1, 5) as usize
+        1
+    }
+
+    fn pause_requested(&self) -> bool {
+        self.pause.load(Ordering::Relaxed)
     }
 }
 
@@ -789,14 +801,29 @@ fn run_segments_parallel(
     let mut first_error: Option<String> = None;
 
     while active > 0 || (!pending.is_empty() && first_error.is_none()) {
-        let desired_workers = job
-            .current_parallel_segments()
-            .min(worker_slots)
-            .min(active.saturating_add(pending.len()))
-            .max(1);
+        if active == 0 && job.pause_requested() && first_error.is_none() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            progress
+                .elapsed_ms
+                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        let desired_workers = if job.pause_requested() {
+            active
+        } else {
+            job.current_parallel_segments()
+                .min(worker_slots)
+                .min(active.saturating_add(pending.len()))
+                .max(1)
+        };
         while active < desired_workers
             && first_error.is_none()
             && !cancel.load(Ordering::Relaxed)
+            && !job.pause_requested()
             && !pending.is_empty()
         {
             let planned = pending.pop_front().expect("pending segment exists");
@@ -2214,6 +2241,7 @@ mod tests {
                 overwrite: false,
             },
             parallel_segments: Arc::new(AtomicU8::new(1)),
+            pause: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2293,9 +2321,9 @@ mod tests {
         job.parallel_segments.store(0, Ordering::Relaxed);
         assert_eq!(job.current_parallel_segments(), 1);
         job.parallel_segments.store(9, Ordering::Relaxed);
-        assert_eq!(job.current_parallel_segments(), 5);
+        assert_eq!(job.current_parallel_segments(), 1);
         job.parallel_segments.store(3, Ordering::Relaxed);
-        assert_eq!(job.current_parallel_segments(), 3);
+        assert_eq!(job.current_parallel_segments(), 1);
     }
 
     #[test]

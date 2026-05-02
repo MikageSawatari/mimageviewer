@@ -236,6 +236,13 @@ impl App {
         let mut fav_nav: Option<PathBuf> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
+        let selected_video_path =
+            self.selected
+                .and_then(|idx| self.items.get(idx))
+                .and_then(|item| match item {
+                    GridItem::Video(path) => Some(path.clone()),
+                    _ => None,
+                });
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -319,6 +326,39 @@ impl App {
                                 ui.close();
                             }
                         }
+                    }
+                });
+
+                ui.menu_button("動画", |ui| {
+                    let can_apply_to_selected = selected_video_path.is_some();
+                    if ui
+                        .add_enabled(
+                            can_apply_to_selected,
+                            egui::Button::new("この動画をアップスケール登録…"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = selected_video_path.clone() {
+                            self.request_video_upscale(path);
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            can_apply_to_selected,
+                            egui::Button::new("この動画のアップスケールを削除"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = selected_video_path.clone() {
+                            self.request_video_upscale_artifact_delete(path);
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("アップスケールタスク表示").clicked() {
+                        self.show_video_upscale_tasks = true;
+                        ui.close();
                     }
                 });
 

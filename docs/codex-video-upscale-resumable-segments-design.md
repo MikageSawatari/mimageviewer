@@ -21,9 +21,9 @@ The Phase E UX is a persistent background task queue:
 - `アップスケールタスク表示`
 
 Registration opens a small options dialog, then queues the task and shows a toast. Progress is
-checked in the task window. Phase E starts with one background task at a time. Task reordering,
-global pause, and queue-level segment parallelism controls are available; actual segment
-parallel execution is experimental and defaults to `1` until real workloads prove a useful speedup.
+checked in the task window. The release UI intentionally keeps the feature conservative: it uses
+the fast general-purpose upscale model only, keeps segment execution serial, and exposes only
+scale and compression presets. Segment files are still used for pause/resume durability.
 
 ## Why Segment-Based Resume
 
@@ -594,18 +594,20 @@ For video files:
 - separator
 - `アップスケールタスク表示`
 
+These commands live in the top-level `動画` menu rather than the grid context menu. Commands that
+act on "this video" are disabled unless the selected grid item is a video.
+
 ### Task Window
 
 Phase E uses a compact two-row layout per task:
 
 - row 1: source file name, state, and action buttons
-- row 2: progress bar / frames / fps when running, plus model / scale / quality
+- row 2: progress bar / frames / fps when running, plus scale / quality
 
 Controls:
 
-- pause/resume all. Phase E pauses before starting the next task; deeper per-segment pause checks
-  remain part of Phase F/keyframe-snap work.
-- segment parallelism selector (`自動`, `1`, `2`, `3`, `4`, `5`) in Phase F
+- pause/resume all. Phase E pauses before starting the next task and also stops the current task
+  from starting another segment after the active segment finishes.
 - move task up/down when queued
 - cancel running task
 - remove failed/done/pending task
@@ -701,31 +703,26 @@ applicable:
 ### Phase E: Queue UI
 
 - Add persistent queue.
-- Add context menu register/delete/task-window actions.
+- Add top-level video menu register/delete/task-window actions.
 - Add sequential background dispatcher.
 - Add compact two-row task window with pause/resume, queued task reorder, cancel/remove/retry
   controls, ETA, and failure reason display.
 - Hide `<stem>.miv.work/` from folder scan results.
 - On app exit, mark the running task back to `queued`, signal cancellation, and exit without waiting;
   startup recovery resumes it.
-- Delete final output, sidecar, and work directory from the context menu delete action.
-- Add segment parallelism controls. Execution defaults to `1`; higher values are experimental.
+- Delete final output, sidecar, and work directory from the video menu delete action.
+- Keep the normal UI serial. Advanced segment parallelism was tested but is not exposed because
+  speedups were workload-dependent and confusing.
 
-### Phase F: Parallel Segment Workers
+### Phase F: Keyframe-Snapped Segment Planning
 
-- Phase F-A stores a queue-level `parallel_segments` setting and exposes the conservative `1..5`
-  selector in the task window. The default remains `1`.
-- Phase F-B builds a keyframe-snapped segment plan before workers start, then dispatches multiple
-  segment workers for the same task when `parallel_segments > 1`.
-  Each worker writes `NNNNNN.mkv.part.<worker_id>`, marks its segment `running`, publishes it to
-  `NNNNNN.mkv` only after validation, and aggregates in-flight frame progress into the task ETA.
-- The running dispatcher reads `parallel_segments` dynamically. Raising the value starts additional
-  segment workers as slots become available; lowering it does not stop segments already running,
-  but prevents new workers from being launched until the active count falls below the new limit.
-- Add/extend segment claiming and crash-reset logic around the keyframe-snapped plan.
-- Keep the task-window parallelism selector visible but conservative.
-- Benchmark `1`, `2`, `3`, `4`, `5` on representative videos.
-- Keep default conservative until real speedup is proven.
+- Build a keyframe-snapped segment plan before workers start so resume/pause does not require
+  decoding from the beginning for each segment.
+- Keep segment execution serial in the release UI. Parallel segment workers may remain as an
+  internal experiment, but normal tasks should behave as one active segment at a time.
+- Low-bitrate or noisy sources should be described as limited-benefit inputs in the registration
+  dialog; the feature is primarily intended for already-clean low/mid-resolution videos viewed on
+  higher-resolution displays.
 
 ## Review Questions For ClaudeCode
 

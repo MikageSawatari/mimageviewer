@@ -9,9 +9,8 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::video::upscale::job::{
-    VideoUpscaleJob, VideoUpscaleMessage, VideoUpscaleModelPreset, VideoUpscaleOptions,
-    VideoUpscalePreflight, VideoUpscaleProgressShared, VideoUpscaleQuality, VideoUpscaleScale,
-    preflight, run_job,
+    VideoUpscaleJob, VideoUpscaleMessage, VideoUpscaleOptions, VideoUpscalePreflight,
+    VideoUpscaleProgressShared, VideoUpscaleQuality, VideoUpscaleScale, preflight, run_job,
 };
 use crate::video::upscale::paths::{manifest_path_for, work_dir_for};
 use crate::video::upscale::queue::{FailureReason, TaskQueue, TaskState};
@@ -35,8 +34,8 @@ pub(crate) struct VideoUpscaleRunningTask {
     pub task_id: Uuid,
     pub source_path: PathBuf,
     pub cancel: Arc<AtomicBool>,
+    pub pause: Arc<AtomicBool>,
     pub progress: Arc<VideoUpscaleProgressShared>,
-    pub parallel_segments: Arc<AtomicU8>,
     pub rx: mpsc::Receiver<VideoUpscaleMessage>,
     pub delete_artifacts_after_cancel: bool,
 }
@@ -130,7 +129,6 @@ impl App {
         let mut register = false;
         let mut overwrite = state.options.overwrite;
         let mut scale = state.options.scale;
-        let mut model = state.options.model;
         let mut quality = state.options.quality;
 
         egui::Window::new("AI動画アップスケール登録")
@@ -154,7 +152,7 @@ impl App {
                     }
                     VideoUpscalePhase::Configure => {
                         if let Some(preflight) = &state.preflight {
-                            render_options(ui, &mut scale, &mut model, &mut quality, &mut overwrite);
+                            render_options(ui, &mut scale, &mut quality, &mut overwrite);
                             ui.add_space(8.0);
                             let (out_w, out_h) = preflight.output_size(scale);
                             let allowed = preflight.info.output_allowed(scale);
@@ -172,6 +170,12 @@ impl App {
                             if let Some(frames) = preflight.info.estimated_frames {
                                 ui.label(format!("フレーム数: {frames}"));
                             }
+                            ui.label(
+                                egui::RichText::new(
+                                    "低ビットレート・ノイズが多い動画では効果が限定的です。",
+                                )
+                                .color(egui::Color32::from_rgb(210, 150, 60)),
+                            );
                             ui.label("音声は最終出力時に元動画からコピーします。");
                             ui.label(format!(
                                 "出力: {}",
@@ -240,7 +244,6 @@ impl App {
 
         if let Some(state) = self.video_upscale.as_mut() {
             state.options.scale = scale;
-            state.options.model = model;
             state.options.quality = quality;
             state.options.overwrite = overwrite;
         }
@@ -264,7 +267,6 @@ impl App {
         let mut open = true;
         let tasks = self.video_upscale_queue.tasks.clone();
         let queue_paused = self.video_upscale_queue.paused;
-        let parallel_segments = self.video_upscale_queue.parallel_segments.clamp(1, 5);
         let running_task_id = self.video_upscale_running.as_ref().map(|r| r.task_id);
         let running_progress = self.video_upscale_running.as_ref().map(|r| {
             (
@@ -291,19 +293,6 @@ impl App {
                     if ui.button(pause_label).clicked() {
                         action = TaskUiAction::TogglePause;
                     }
-                    ui.label("セグメント並列");
-                    egui::ComboBox::from_id_salt("video_upscale_parallel_segments")
-                        .selected_text(parallel_segments.to_string())
-                        .show_ui(ui, |ui| {
-                            for value in 1..=5 {
-                                if ui
-                                    .selectable_label(parallel_segments == value, value.to_string())
-                                    .clicked()
-                                {
-                                    action = TaskUiAction::SetParallel(value);
-                                }
-                            }
-                        });
                     if self.video_upscale_running.is_some() {
                         ui.spinner();
                     }
@@ -394,6 +383,7 @@ impl App {
         else {
             return;
         };
+        let options = options.normalized_for_video_export();
         if self.video_upscale_queue.tasks.iter().any(|task| {
             same_path_ci(&task.source_path, &preflight.source_path)
                 && !matches!(task.state, TaskState::Done | TaskState::Failed)
@@ -449,15 +439,14 @@ impl App {
         };
         let model_manager = self.ai_model_manager.clone();
         let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(self.video_upscale_queue.paused));
         let progress = Arc::new(VideoUpscaleProgressShared::new(None));
         let (tx, rx) = mpsc::channel();
         let task_for_worker = task.clone();
         let cancel_worker = cancel.clone();
+        let pause_worker = pause.clone();
         let progress_worker = progress.clone();
-        let parallel_segments = Arc::new(AtomicU8::new(
-            self.video_upscale_queue.parallel_segments.clamp(1, 5),
-        ));
-        let parallel_segments_worker = parallel_segments.clone();
+        let parallel_segments_worker = Arc::new(AtomicU8::new(1));
 
         self.video_upscale_queue
             .mark_state(task.task_id, TaskState::Running);
@@ -473,8 +462,9 @@ impl App {
                     output_path: pre.output_path,
                     sidecar_path: pre.sidecar_path,
                     info: pre.info,
-                    options: task_for_worker.options,
+                    options: task_for_worker.options.normalized_for_video_export(),
                     parallel_segments: parallel_segments_worker,
+                    pause: pause_worker,
                 };
                 run_job(job, runtime, model_manager, cancel_worker, progress_worker)
             });
@@ -485,8 +475,8 @@ impl App {
             task_id: task.task_id,
             source_path: task.source_path,
             cancel,
+            pause,
             progress,
-            parallel_segments,
             rx,
             delete_artifacts_after_cancel: false,
         });
@@ -585,18 +575,12 @@ impl App {
             TaskUiAction::None => {}
             TaskUiAction::TogglePause => {
                 self.video_upscale_queue.paused = !self.video_upscale_queue.paused;
-                self.save_video_upscale_queue();
-            }
-            TaskUiAction::SetParallel(value) => {
-                if self.video_upscale_queue.set_parallel_segments(value) {
-                    if let Some(running) = self.video_upscale_running.as_ref() {
-                        running.parallel_segments.store(
-                            self.video_upscale_queue.parallel_segments.clamp(1, 5),
-                            Ordering::Relaxed,
-                        );
-                    }
-                    self.save_video_upscale_queue();
+                if let Some(running) = self.video_upscale_running.as_ref() {
+                    running
+                        .pause
+                        .store(self.video_upscale_queue.paused, Ordering::Relaxed);
                 }
+                self.save_video_upscale_queue();
             }
             TaskUiAction::Cancel(task_id) => {
                 if let Some(running) = self.video_upscale_running.as_ref()
@@ -663,7 +647,6 @@ fn cleanup_video_upscale_work_dir(source_path: PathBuf) {
 enum TaskUiAction {
     None,
     TogglePause,
-    SetParallel(u8),
     Cancel(Uuid),
     Remove(Uuid),
     Retry(Uuid),
@@ -775,7 +758,7 @@ fn render_task_row(
                 }
                 _ => {
                     ui.add_sized([180.0, 16.0], egui::ProgressBar::new(0.0));
-                    ui.label(task.options.model.label());
+                    ui.label("待機中");
                 }
             }
         }
@@ -869,7 +852,6 @@ fn state_label(state: TaskState) -> &'static str {
 fn render_options(
     ui: &mut egui::Ui,
     scale: &mut VideoUpscaleScale,
-    model: &mut VideoUpscaleModelPreset,
     quality: &mut VideoUpscaleQuality,
     overwrite: &mut bool,
 ) {
@@ -877,24 +859,6 @@ fn render_options(
         ui.label("倍率");
         ui.selectable_value(scale, VideoUpscaleScale::X2, VideoUpscaleScale::X2.label());
         ui.selectable_value(scale, VideoUpscaleScale::X4, VideoUpscaleScale::X4.label());
-    });
-    ui.horizontal(|ui| {
-        ui.label("モデル");
-        ui.selectable_value(
-            model,
-            VideoUpscaleModelPreset::GeneralFast,
-            VideoUpscaleModelPreset::GeneralFast.label(),
-        );
-        ui.selectable_value(
-            model,
-            VideoUpscaleModelPreset::Anime,
-            VideoUpscaleModelPreset::Anime.label(),
-        );
-        ui.selectable_value(
-            model,
-            VideoUpscaleModelPreset::Photo,
-            VideoUpscaleModelPreset::Photo.label(),
-        );
     });
     egui::ComboBox::from_label("圧縮率")
         .selected_text(quality.label())

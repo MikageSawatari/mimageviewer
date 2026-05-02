@@ -151,22 +151,6 @@ impl crate::app::App {
                                     close = true;
                                 }
                             }
-                            if matches!(item, GridItem::Video(_)) {
-                                if ui.button("この動画をアップスケール登録").clicked()
-                                {
-                                    self.request_video_upscale(p.clone());
-                                    close = true;
-                                }
-                                if ui.button("この動画のアップスケールを削除").clicked()
-                                {
-                                    self.request_video_upscale_artifact_delete(p.clone());
-                                    close = true;
-                                }
-                                if ui.button("アップスケールタスク表示").clicked() {
-                                    self.show_video_upscale_tasks = true;
-                                    close = true;
-                                }
-                            }
                             if ui.button("コピー").clicked() {
                                 copy_files_to_clipboard(&[p.clone()]);
                                 close = true;
