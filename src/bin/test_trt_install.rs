@@ -7,7 +7,7 @@
 //!
 //! ```bash
 //! # 別ターミナルで
-//! cd dist/trt-pack-v2
+//! cd dist/trt-pack-v3
 //! python -m http.server 8000
 //!
 //! # 本ターミナルで (空の tensorrt/ ディレクトリから始める想定)

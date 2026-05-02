@@ -51,6 +51,19 @@ pub fn run_worker_process() -> ! {
         }
     };
 
+    // pack v3 以降、`UpscaleRealEsrGeneralV3` は in-process DirectML 経路に固定で、
+    // 配布 pack には含めない方針 (`should_route_to_worker` / `REQUIRED_ENGINE_MODELS`)。
+    // ここでも build を拒否しておかないと、ユーザが `--tensorrt-build realesr_general_v3`
+    // を打つと無意味な engine を生成し、`build_trt_pack` 検証で「想定外の engine が
+    // 余分にある」状態を作ってしまう。
+    if matches!(kind, ModelKind::UpscaleRealEsrGeneralV3) {
+        eprintln!(
+            "[skip] {kind_str}: TRT pack v3 ではこのモデルは DirectML 専用です。\n\
+             build をスキップします (engine cache は作成されません)。"
+        );
+        std::process::exit(0);
+    }
+
     // モデルパスの取得
     super::model_manager::ensure_models_extracted();
     let mm = super::model_manager::ModelManager::new();

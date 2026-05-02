@@ -73,7 +73,12 @@ mImageViewer.exe (メインプロセス、DirectML 専用)
 
 実データ (input/output テンソル) は shm 経由
 親が input_shm にデータを書き → コマンド送信 → 子が output_shm に書く →
-レスポンス受信後に親が output_shm から読む
+レスポンス受信後に親が output_shm から読む。
+
+親側は、現在の worker でロード済みのモデルを `TrtWorkerPool` 内で記録する。
+初回だけ `LoadModel` を送り、以後の同一モデル推論では `Infer` のみ送る。
+worker 側の `LoadModel` は idempotent だが、毎 tile 送ると JSON IPC 往復が
+1 回増えるため、特に 1 tile/frame の低解像度動画で相対的な負荷が大きい。
 ```
 
 ### 共有メモリ管理
@@ -367,7 +372,7 @@ runtime shape を返し、`load_model` 直後にダミー `session.run()` する
 | ClassifierMobileNet | 1×3×384×384 | `ai/classify.rs::SIZE` |
 | DenoiseRealplksr | 1×3×256×256 | モデル仕様 (固定) |
 | InpaintMiGan | 1×**4**×512×512 | `ui_erase.rs::MIGAN_SIZE`、4 ch (RGB+mask) |
-| UpscaleRealEsrGeneralV3 | 1×3×512×512 | TRT tile=512 |
+| UpscaleRealEsrGeneralV3 | 1×3×512×512 | TRT tile=512 (pack v3 では build しないが warmup shape は残す) |
 | その他 Upscale 4 種 | 1×3×256×256 | TRT tile=256 |
 
 これらは `upscale.rs::model_tile_size` / `classify.rs::preprocess` /
@@ -423,7 +428,6 @@ GPU が冷えた状態 / 他に重いプロセスがいない状態で実測す�
 |---|---:|---:|---:|
 | upscale_realesrgan_x4plus | ~3500 | ~1800 | ~1.9x |
 | upscale_realesrgan_anime6b | ~3200 | ~960 | ~3.4x |
-| upscale_realesrgan_general_v3 | ~2200 | ~1500 | ~1.5x |
 | upscale_realcugan_4x | ~3800 | ~2700 | ~1.4x |
 | upscale_nmkd_siax_4x | ~4000 | ~1500 | ~2.7x |
 | denoise_realplksr | ~1100 | ~240 | ~4.5x |
@@ -433,3 +437,23 @@ GPU が冷えた状態 / 他に重いプロセスがいない状態で実測す�
 
 これらの倍率はマニュアル `htdocs/.../settings.html` の「アップスケール 1.4〜3.4 倍、
 ノイズ除去 約 4.5 倍」表記の根拠。
+
+### `upscale_realesrgan_general_v3` (= 高速汎用) を pack に含めない理由 (pack v3)
+
+2026-05 に取り直した bench (RTX 4090、tile=512、in-process DirectML vs TRT worker IPC):
+
+| 入力サイズ | tile 数 | DirectML wall | TRT wall | TRT/DirectML |
+|---|---:|---:|---:|---:|
+| 480×360 | 1 | 65.7 ms | 64.1 ms | 1.03× (互角) |
+| 640×480 | 2 | 127.2 ms | 115.4 ms | 1.10× (TRT わずか勝ち) |
+| 1280×720 | 6 | 355.8 ms | 342.5 ms | 1.04× (互角) |
+| 1920×1080 | 12 | 651.2 ms | 718.9 ms | 0.91× (DirectML わずか勝ち) |
+
+GeneralV3 は元から軽量モデル (= 1 tile あたり ~30 ms) で TRT の最適化余地が小さい。
+worker IPC overhead (~5-10 ms/tile) を払うと利得が完全に相殺される。よって pack v3
+からは engine を同梱せず、`runtime.rs::should_route_to_worker` が GeneralV3 を
+in-process DirectML へ送る運用に切り替えた。tile 数が多い長尺動画でも GeneralV3 は
+DirectML の方が速い。
+
+なお他のアップスケール 4 モデル + denoise は同じ 2026-05 bench で 1.5-2.8× の改善が
+維持されているので pack 同梱を継続。

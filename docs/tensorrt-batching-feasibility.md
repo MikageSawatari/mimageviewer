@@ -82,3 +82,33 @@ GPU 推論部分が総時間の 60-90% を占めるので、**バッチ化で GP
 
 - `src/ai/upscale.rs` の `upscale_with_timings`, `run_tile_inference`
 - `src/ai/runtime.rs` の `register_tensorrt_eps`
+
+
+## 追記 (2026-05): pack v3 で `realesr_general_v3` を除外
+
+bench を取り直したところ、`realesr_general_v3` (= 高速汎用) は本ドキュメントの 1.55-1.80x
+カテゴリに収まらず、**全サイズで TRT/DirectML がほぼ互角〜DirectML 微優位**だった
+(RTX 4090、tile=512、in-process DirectML vs TRT worker IPC):
+
+| 入力サイズ | tile 数 | DirectML wall | TRT wall | TRT/DirectML |
+|---|---:|---:|---:|---:|
+| 480×360 | 1 | 65.7 ms | 64.1 ms | 1.03× |
+| 640×480 | 2 | 127.2 ms | 115.4 ms | 1.10× |
+| 1280×720 | 6 | 355.8 ms | 342.5 ms | 1.04× |
+| 1920×1080 | 12 | 651.2 ms | 718.9 ms | 0.91× |
+
+理由:
+
+- GeneralV3 は元々軽量モデル (= 1 tile あたり ~30 ms session_run) で TRT kernel fusion の
+  最適化余地が小さい
+- worker IPC overhead (~5-10 ms/tile、shared memory + named pipe 往復) が利得を相殺
+- 他のアップスケール 4 モデル / denoise はモデル自体が重く、kernel fusion で稼げる時間が
+  IPC overhead を上回るため依然として 1.5-2.8× 高速
+
+→ **pack v3 では GeneralV3 engine を同梱せず**、`runtime.rs::should_route_to_worker` が
+本モデルだけ in-process DirectML へ流す方針に変更。設定 UI には「高速汎用モデルは
+TensorRT を選択しても DirectML で動作します」と注記。
+
+明示バッチングについては、本来この検討の主対象だった軽量モデル (= GeneralV3) は
+そもそも TRT を使わなくなったため、バッチング検討の優先度はさらに下がった。残る
+「重量モデル × バッチ」の組み合わせは、デノイズ (固定 256×256) がまだ筋の良い候補。

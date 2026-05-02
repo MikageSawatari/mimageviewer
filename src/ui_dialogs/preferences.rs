@@ -209,6 +209,11 @@ pub(crate) struct PreferencesState {
     pub start_trt_install_requested: bool,
     /// エンジンキャッシュ削除の確認ダイアログ表示中フラグ (Codex P3-2)。
     pub trt_cache_delete_confirm_open: bool,
+    /// 「TensorRT パックを削除」ボタンで実行された pack 全体削除をリクエスト。
+    /// dialog 内では state 更新だけ行い、実際の worker pool detach + ファイル削除は
+    /// App 側で Preferences ウィンドウ closure 抜けた後に処理する
+    /// (= worker pool が DLL を握ったままだと remove_dir_all が失敗するため)。
+    pub uninstall_trt_pack_requested: bool,
 
     // ── VST3 プラグイン編集 ────────────────────────────────────────
     /// 環境設定を開いた時点でスキャンされていた VST3 プラグイン候補のスナップショット。
@@ -285,6 +290,7 @@ impl PreferencesState {
             trt_engine_cache_size_mib,
             start_trt_install_requested: false,
             trt_cache_delete_confirm_open: false,
+            uninstall_trt_pack_requested: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_filter: String::new(),
@@ -599,6 +605,74 @@ impl App {
                 );
             }
         }
+
+        // 「TensorRT パックを削除」ボタンが確定されていたら、worker pool を停止 →
+        // ファイル削除 → live settings を DirectML に切替 → save をまとめて実行。
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.uninstall_trt_pack_requested {
+                ps.uninstall_trt_pack_requested = false;
+                self.uninstall_trt_pack_now();
+            }
+        }
+    }
+
+    /// TRT パック削除フロー本体。
+    /// - 走行中の worker pool を detach (= 子プロセス停止 + DLL ハンドル解放、UI thread)
+    /// - live `settings.ai_backend` を DirectML に切替して save (UI thread、瞬時)
+    /// - `tensorrt/` と `tensorrt-engines/` を **背景 thread で** 削除 (= 多 GB の I/O で
+    ///   UI thread をブロックしないため Codex P2 指摘)。削除完了は logger に出力するのみ
+    ///   (UI 状態は呼び出し時点で既に「削除済」相当に同期されている)。
+    pub(crate) fn uninstall_trt_pack_now(&mut self) {
+        // 1. worker pool 停止 (DLL ハンドル解放)。これは速い (ms オーダー) ので UI thread で OK。
+        if let Some(runtime) = self.ai_runtime.as_ref() {
+            if runtime.has_worker_pool() {
+                crate::logger::log(
+                    "[AI] TRT パック削除のため worker pool を停止します".to_string(),
+                );
+                runtime.detach_worker_pool();
+            }
+        }
+
+        // 2. live settings を DirectML に固定 → save (UI thread、瞬時)
+        let was_trt =
+            self.settings.ai_backend.as_deref() == Some(crate::ai::AiBackend::TensorRt.as_str());
+        if was_trt {
+            self.settings.ai_backend = Some(crate::ai::AiBackend::DirectMl.as_str().to_string());
+            self.settings.save();
+            crate::logger::log(
+                "[AI] AI バックエンドを DirectML に切替しました (TRT パック削除後)".to_string(),
+            );
+        }
+
+        // 3. ファイル削除は背景 thread に逃がす。
+        //    pack ~2 GB + engine cache 数百 MB の remove_dir_all は秒〜十数秒かかり、
+        //    UI を凍らせるため (CLAUDE.md: UI thread 同期 I/O 禁止)。
+        //    削除完了前に再 install を要求した場合、install 側の atomic rename + INSTALL_OK
+        //    最終書き込みパターンで上書きできるので race は実害なし。
+        let pack_dir = crate::ai::tensorrt_pack::pack_dir();
+        let engine_cache_dir = crate::ai::tensorrt_pack::engine_cache_dir();
+        std::thread::Builder::new()
+            .name("trt-pack-uninstall".to_string())
+            .spawn(move || {
+                for dir in [pack_dir, engine_cache_dir] {
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {
+                            crate::logger::log(format!(
+                                "[AI] TensorRT を削除しました: {}",
+                                dir.display()
+                            ));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "[AI] TensorRT 削除に失敗: {} ({e})",
+                                dir.display()
+                            ));
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 }
 
@@ -1037,7 +1111,16 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "AI アップスケール / ノイズ除去 / 消しゴム機能で使う実行環境を選択します。\n\
          TensorRT は NVIDIA GPU 専用ですが、DirectML より大幅に高速 \
-         (アップスケール 1.4-3.4x、ノイズ除去 約 4.5x)。",
+         (アップスケール 1.5-2.7x、ノイズ除去 2.6-2.8x)。",
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "※「高速汎用」モデルは TensorRT を選択しても DirectML で動作します \
+             (このモデルでは DirectML が最速のため)。",
+        )
+        .size(12.0)
+        .color(egui::Color32::from_rgb(170, 170, 170)),
     );
     ui.add_space(8.0);
 
@@ -1097,17 +1180,34 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     } else {
         "DirectML"
     };
-    let pending_change = match new_choice {
-        AiBackend::TensorRt => !state.trt_worker_active,
-        AiBackend::DirectMl | AiBackend::Cpu => state.trt_worker_active,
+    // TensorRT を選択しているが pack が未インストールの場合、OK 押下時に
+    // worker spawn 失敗 → エラー通知が出る代わりに、UI 上で「実際には
+    // DirectML で動作する」ことを明示する (= apply_ai_backend_change 側でも
+    // spawn 試行を skip する仕様と整合)。
+    let trt_unavailable = new_choice == AiBackend::TensorRt && !state.trt_pack_installed;
+    let pending_change = if trt_unavailable {
+        false
+    } else {
+        match new_choice {
+            AiBackend::TensorRt => !state.trt_worker_active,
+            AiBackend::DirectMl | AiBackend::Cpu => state.trt_worker_active,
+        }
     };
     ui.horizontal(|ui| {
-        ui.label(format!("現在動作中: {current_label}"));
-        if pending_change {
+        if trt_unavailable {
+            ui.label("現在動作中: DirectML");
             ui.colored_label(
-                egui::Color32::from_rgb(120, 180, 220),
-                "(OK を押すと反映、再起動不要)",
+                egui::Color32::from_rgb(220, 160, 50),
+                "(パックが未インストールのため TensorRT は使用されません)",
             );
+        } else {
+            ui.label(format!("現在動作中: {current_label}"));
+            if pending_change {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 180, 220),
+                    "(OK を押すと反映、再起動不要)",
+                );
+            }
         }
     });
     ui.add_space(8.0);
@@ -1132,9 +1232,11 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
             ui.add_space(8.0);
             if ui
-                .button("TensorRT パックをダウンロード")
+                .button("TensorRT パックをダウンロード (即時実行)")
                 .on_hover_text(
-                    "GitHub Releases から CUDA / cuDNN / TensorRT runtime と \
+                    "押すとすぐダウンロードを開始します。\n\
+                     OK / キャンセルとは無関係です。\n\n\
+                     GitHub Releases から CUDA / cuDNN / TensorRT runtime と \
                      事前ビルド済み AI エンジンをダウンロードします (約 1.97 GB)。\n\
                      対応 GPU: RTX 30 / 40 / 50 シリーズ。",
                 )
@@ -1150,42 +1252,51 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
             ui.add_space(8.0);
 
-            // エンジンキャッシュ管理
-            // 配布されたエンジンファイル (mikage 側で AMPERE_PLUS で事前ビルド済み、
-            // tensorrt-engines/<model>/<file>.engine として展開) と、ユーザー機固有の
-            // 再コンパイル結果 (将来エンジン互換が崩れた場合の残骸) が同居する。
-            // ドライバ更新後にデシリアライズエラーが出るなら削除して再 DL を促す。
+            // パック削除 / 再 DL 管理
+            // 削除ボタンは pack 全体 (DLL + エンジンキャッシュ + INSTALL_OK) を消し、
+            // 再起動なしでこのダイアログ上で「ダウンロード」フローへ戻る。
+            // 削除/DL は OK/キャンセルとは独立な即時実行 (ファイル操作のため)。
             ui.label(format!(
                 "エンジンキャッシュ: {} MiB",
                 state.trt_engine_cache_size_mib
             ));
             ui.label(
                 egui::RichText::new(
-                    "(配布パックに含まれる事前ビルド済みエンジン。\n\
-                     ドライバ更新後等にエラーが出る場合は削除し、再 DL してください)",
+                    "(ドライバ更新後等にエラーが出る場合や再 DL を試したい場合は\n\
+                     パックを削除すると、次のステップでダウンロードに戻れます)",
                 )
                 .small(),
             );
             ui.add_space(4.0);
-            if ui.button("エンジンキャッシュを削除").clicked() {
-                // Codex P3-2: ボタンクリックで即削除ではなく、確認ダイアログを開く
-                // (= 他のキャッシュ管理 UI と挙動を揃える)
+            if ui
+                .button("TensorRT パックを削除 (即時実行)")
+                .on_hover_text(
+                    "押すとすぐ実行されます。\n\
+                     OK / キャンセルとは無関係です。",
+                )
+                .clicked()
+            {
                 state.trt_cache_delete_confirm_open = true;
             }
             // 確認ダイアログ
             if state.trt_cache_delete_confirm_open {
                 let mut do_delete = false;
                 let mut do_cancel = false;
-                egui::Window::new("エンジンキャッシュ削除の確認")
+                let mut window_open = state.trt_cache_delete_confirm_open;
+                let pack_total_mib = state.trt_pack_size_mib + state.trt_engine_cache_size_mib;
+                egui::Window::new("TensorRT パック削除の確認")
                     .collapsible(false)
                     .resizable(false)
-                    .open(&mut state.trt_cache_delete_confirm_open.clone())
+                    .open(&mut window_open)
                     .show(ui.ctx(), |ui| {
                         ui.label(format!(
-                            "エンジンキャッシュ ({} MiB) を削除します。",
-                            state.trt_engine_cache_size_mib
+                            "TensorRT パック ({} MiB) を削除します。",
+                            pack_total_mib
                         ));
-                        ui.label("再ダウンロードに 5〜15 分かかります。実行してよろしいですか?");
+                        ui.label(
+                            "削除後は同じダイアログで「TensorRT パックをダウンロード」\n\
+                             ボタンが表示されます。再 DL に 5〜15 分かかります。",
+                        );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("削除する").clicked() {
@@ -1196,27 +1307,31 @@ fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                             }
                         });
                     });
+                // 確認ダイアログの × でも閉じれるよう、open フラグを反映する。
+                // (`.open(&mut state.x.clone())` は clone 経由で書き戻しが届かないバグ)
+                state.trt_cache_delete_confirm_open = window_open;
                 if do_delete {
-                    let dir = crate::ai::tensorrt_pack::engine_cache_dir();
-                    match std::fs::remove_dir_all(&dir) {
-                        Ok(()) => {
-                            state.trt_engine_cache_size_mib = 0;
-                            crate::logger::log(format!(
-                                "[AI] エンジンキャッシュを削除しました: {}",
-                                dir.display()
-                            ));
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            state.trt_engine_cache_size_mib = 0;
-                        }
-                        Err(e) => {
-                            crate::logger::log(format!(
-                                "[AI] エンジンキャッシュ削除に失敗: {} ({})",
-                                dir.display(),
-                                e
-                            ));
-                        }
-                    }
+                    // 実際の削除は App 側に委譲。理由:
+                    // - TRT worker pool が DLL を握ったままだと remove_dir_all が失敗する
+                    //   ため、先に worker pool を detach する必要がある (= AiRuntime API)
+                    // - ai_backend = TensorRT のままだと AI 機能呼び出し時に再 attach で
+                    //   失敗 (= 削除直後の DLL 不在) → エラーダイアログが出る
+                    // → App 側で「detach → 削除 → ai_backend を DirectML に切替 → save」を
+                    //   一括処理する
+                    state.uninstall_trt_pack_requested = true;
+                    // dialog 上の表示も即時切替 (= 「ダウンロード」分岐へ)
+                    state.trt_pack_installed = false;
+                    state.trt_pack_size_mib = 0;
+                    state.trt_engine_cache_size_mib = 0;
+                    // 「現在動作中」表記も DirectML に同期 (= App 側で detach するので
+                    // 実際の worker pool は止まる。state は dialog 開いた時のスナップ
+                    // ショットなので、ここで明示的に false にしないと表記が古いまま)。
+                    state.trt_worker_active = false;
+                    state.current_runtime_fallback_reason = None;
+                    // 設定 UI 上のラジオボタンも DirectML に同期
+                    // (= state.settings は draft、live settings は App 側で切替)
+                    state.settings.ai_backend =
+                        Some(crate::ai::AiBackend::DirectMl.as_str().to_string());
                     state.trt_cache_delete_confirm_open = false;
                 } else if do_cancel {
                     state.trt_cache_delete_confirm_open = false;

@@ -1,8 +1,8 @@
-# Upload the TensorRT acceleration pack (trt-pack-v2) to GitHub Releases as a draft.
+# Upload the TensorRT acceleration pack (v3) to GitHub Releases as a draft.
 # Equivalent to docs/tensorrt-pack-distribution.md section 6, expressed as PowerShell.
 #
 # Prerequisites:
-#   - dist\trt-pack-v2\ must contain the 21 files produced by
+#   - dist\trt-pack-v3\ must contain the 21 files produced by
 #     `cargo run --release --bin build_trt_pack`
 #   - gh CLI must be on PATH and authenticated as MikageSawatari
 #     (run `gh auth status` to check)
@@ -12,10 +12,10 @@
 #
 # This script creates a DRAFT release. Nothing is published until you flip the
 # draft flag. Inspect the contents in the Web UI first, then publish via:
-#   gh release edit trt-pack-v2 --repo MikageSawatari/mimageviewer --draft=false --prerelease
+#   gh release edit trt-pack-v3 --repo MikageSawatari/mimageviewer --draft=false --prerelease
 #
 # To roll back (safe while still draft):
-#   gh release delete trt-pack-v2 --repo MikageSawatari/mimageviewer --yes --cleanup-tag
+#   gh release delete trt-pack-v3 --repo MikageSawatari/mimageviewer --yes --cleanup-tag
 #
 # IMPORTANT: this file is intentionally ASCII-only. Windows PowerShell 5.1 reads
 # .ps1 files as ANSI (CP932 in JP locale) unless they carry a UTF-8 BOM, so
@@ -28,16 +28,17 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RepoRoot = Split-Path -Parent $ScriptDir
 Set-Location $RepoRoot
 
-$Tag       = 'trt-pack-v2'
+$Tag       = 'trt-pack-v3'
 $Repo      = 'MikageSawatari/mimageviewer'
-$Title     = 'TensorRT acceleration pack v2'
+$Title     = 'TensorRT acceleration pack v3'
 $NotesFile = 'docs\tensorrt-pack-release-notes.md'
-$DistDir   = 'dist\trt-pack-v2'
+$DistDir   = 'dist\trt-pack-v3'
 
 # 21 assets, listed explicitly so an unrelated file in dist\ cannot leak in.
 # Order: manifest -> notices -> 17 DLLs -> engine zip.
-# v2 differences from v1: added 4 DLLs (cublas64_12, cudnn64_9, cudnn_graph64_9,
-# nvonnxparser_10) that were incorrectly removed in v1 trim, causing CPU fallback.
+# v3 difference from v2: engines-ampere_plus.zip excludes realesr_general_v3
+# (now routed to in-process DirectML; bench shows TRT/DirectML are tied for that
+# model, so paying worker IPC overhead is not worth it). Asset count unchanged.
 $Assets = @(
     'manifest.json',
     'NOTICE-NVIDIA.txt',
@@ -64,7 +65,7 @@ $Assets = @(
 
 # --- Pre-flight: every asset exists and is non-empty -----------------------
 Write-Host '============================================='
-Write-Host " Pre-flight: dist\trt-pack-v2\ verification"
+Write-Host " Pre-flight: dist\trt-pack-v3\ verification"
 Write-Host '============================================='
 $totalBytes = [int64]0
 foreach ($name in $Assets) {

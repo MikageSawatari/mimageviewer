@@ -29,18 +29,26 @@ NuGet / NVIDIA developer redist URL から ORT 1.24.2 GPU + CUDA 12.9 系 + cuDN
 ## 2. 全モデルの AMPERE_PLUS engine を事前ビルド
 
 ```powershell
-# 全 6 モデル分、シリアル実行で ~10-20 分
+# 全 5 モデル分、シリアル実行で ~10-15 分
 foreach ($kind in @(
-  "upscale_realesrgan_x4plus",
-  "upscale_realesrgan_anime6b",
-  "upscale_realesr_general_v3",
-  "upscale_realcugan_4x",
-  "upscale_nmkd_siax_4x",
+  "realesrgan_x4plus",
+  "realesrgan_anime6b",
+  "realcugan_4x",
+  "nmkd_siax_4x",
   "denoise_realplksr"
 )) {
   .\target\release\mimageviewer.exe --tensorrt-build $kind
 }
 ```
+
+### `realesr_general_v3` を含めない理由 (pack v3、2026-05)
+
+bench (RTX 4090、tile=512、1 tile/frame〜12 tile/image) で本モデルだけ
+**TRT と DirectML がほぼ互角〜DirectML 微優位**となった (`docs/tensorrt-batching-feasibility.md`
+末尾の比較表)。worker IPC overhead を払う価値が無いため、`runtime.rs::should_route_to_worker`
+が本モデルを in-process DirectML へ流す設計。**`--tensorrt-build realesr_general_v3` は
+no-op (= "skip" 出力して exit 0) で engine cache を作成しない**ため、上記ループに
+含めていても実害は無いが、混乱を避けて削除している。
 
 各 model に対し `%APPDATA%/mimageviewer/tensorrt-engines/<kind>/` に `.engine` +
 `.profile` が出力される。`runtime.rs` の `with_engine_hw_compatible(true)` で
@@ -69,7 +77,7 @@ cargo run --release --bin build_trt_pack
 出力:
 
 ```
-dist/trt-pack-v2/
+dist/trt-pack-v3/
   manifest.json                       # SHA-256 一覧 + バージョン情報
   NOTICE-NVIDIA.txt                   # 同梱必須 attribution
   LICENSE-onnxruntime.txt             # ONNX Runtime MIT 全文
@@ -90,10 +98,11 @@ dist/trt-pack-v2/
   onnxruntime_providers_shared.dll
   onnxruntime_providers_cuda.dll
   onnxruntime_providers_tensorrt.dll
-  engines-ampere_plus.zip             # 6 モデル分の事前 build engine zip (108 MiB)
+  engines-ampere_plus.zip             # 5 モデル分の事前 build engine zip
 ```
 
-ユーザー DL 量の合計は約 2.16 GB。
+ユーザー DL 量の合計は約 2.16 GB (`realesr_general_v3` 除外で v2 比 ~10-30 MB 減、
+誤差レベル)。
 
 ## 5. ローカル HTTP サーバーでの E2E 動作検証
 
@@ -101,8 +110,8 @@ GitHub Releases にアップロードする前に、ローカルで実際の DL 
 全フローを通す。
 
 ```bash
-# (a) HTTP サーバー起動 (dist/trt-pack-v2/ をルートにする)
-cd dist/trt-pack-v2
+# (a) HTTP サーバー起動 (dist/trt-pack-v3/ をルートにする)
+cd dist/trt-pack-v3
 python -m http.server 8000
 # → http://127.0.0.1:8000/manifest.json で manifest が見える状態にする
 ```
@@ -150,7 +159,7 @@ Running フェーズ中に [キャンセル] を押す → 部分 DL ファイ�
 
 ### Hash mismatch の処理確認 (任意)
 
-`dist/trt-pack-v2/manifest.json` の中の `sha256` をわざと書き換えて HTTP サーバー
+`dist/trt-pack-v3/manifest.json` の中の `sha256` をわざと書き換えて HTTP サーバー
 を再起動 → インストール走らせる → Error フェーズで `SHA-256 が一致しません` の
 メッセージが出るか確認。
 
@@ -158,16 +167,16 @@ Running フェーズ中に [キャンセル] を押す → 部分 DL ファイ�
 
 ```bash
 # (a) タグを切る (git tag 名は manifest_format/PACK_VERSION と整合させる)
-TAG="trt-pack-v2"
+TAG="trt-pack-v3"
 git tag $TAG
 git push origin $TAG
 
 # (b) gh CLI でリリースを作成 + アセットを一括アップロード
 gh release create $TAG \
-  --title "TensorRT acceleration pack v2 (mImageViewer)" \
+  --title "TensorRT acceleration pack v3 (mImageViewer)" \
   --notes-file docs/tensorrt-pack-release-notes.md \
   --prerelease \
-  dist/trt-pack-v2/*
+  dist/trt-pack-v3/*
 ```
 
 `--prerelease` で `latest` リリースとして見えなくする (mIV 本体のリリースタグ

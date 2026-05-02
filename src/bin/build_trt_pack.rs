@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 /// - v2 (Apr 29): trim test を `session_run min < 200ms` 判定に強化して再決定。
 ///   v1 で誤って REMOVABLE 判定していた 4 個 (cublas64_12, cudnn64_9,
 ///   cudnn_graph64_9, nvonnxparser_10) を REQUIRED に戻した
-const PACK_VERSION: u32 = 2;
+const PACK_VERSION: u32 = 3;
 
 /// `NOTICE-NVIDIA.txt` 文面。pack に同梱する NVIDIA コンポーネントの attribution と
 /// 利用条件 (= mIV 専用、抽出再配布禁止、リバースエンジニアリング禁止) を明記する。
@@ -584,24 +584,67 @@ fn write_and_hash_notices(dist_dir: &Path) -> std::io::Result<Vec<AssetEntry>> {
 }
 
 /// pack に同梱必須なモデル一覧 (= worker 経由で TRT 動作させたい全モデル)。
-/// `runtime.rs::should_route_to_worker` で TRT に route される 6 モデルと一致させる。
+/// `runtime.rs::should_route_to_worker` で TRT に route される 5 モデルと一致させる。
 /// build_engine_zip がこれら全モデルの engine を見つけられなかったら build を失敗
 /// させて出荷ミスを未然に防ぐ (Codex P2.4 指摘)。
+///
+/// **`realesr_general_v3` は意図的に除外** (pack v3、2026-05): RTX 4090 bench で
+/// 全サイズで TRT/DirectML がほぼ互角だったため、worker IPC overhead を払うより
+/// in-process DirectML へ流す方針 (`should_route_to_worker` 参照)。
 const REQUIRED_ENGINE_MODELS: &[&str] = &[
     "realesrgan_x4plus",
     "realesrgan_anime6b",
-    "realesr_general_v3",
     "realcugan_4x",
     "nmkd_siax_4x",
     "denoise_realplksr",
 ];
 
-/// 6 モデル分の engine cache を 1 つの zip にまとめる。
+/// 入力 shape が動的 = `.profile` ファイルが必須なモデル。ORT TRT EP は dynamic
+/// shape model に対してのみ `.profile` を書き出す。これらが `.profile` を欠く場合
+/// engine cache が壊れている疑いが強い (= ユーザー機で deserialize エラー)。
+const DYNAMIC_SHAPE_MODELS: &[&str] = &[
+    "realesrgan_x4plus",
+    "realesrgan_anime6b",
+    "realcugan_4x",
+    "nmkd_siax_4x",
+];
+
+/// 入力 shape が固定 = `.profile` が生成されない既知モデル (= `.engine` 単独で OK)。
+const FIXED_SHAPE_MODELS: &[&str] = &["denoise_realplksr"];
+
+/// 5 モデル分の engine cache を 1 つの zip にまとめる。
 /// 戻り値: 生成された zip ファイルのバイト数。
 ///
 /// 全 `REQUIRED_ENGINE_MODELS` が揃っていることを検証し、欠けているモデルが
 /// あれば build を失敗させる (= 中途半端な pack を distribute しないためのガード)。
+///
+/// **走査ポリシー (Codex P1 指摘)**: `REQUIRED_ENGINE_MODELS` のみを走査する。
+/// `read_dir(src_engines)` で全 directory を回ると、過去 build (例: pack v2 時代の
+/// `realesr_general_v3`) が残っていると stale engine が zip に混入してしまうため。
+/// 余分な directory が `tensorrt-engines/` に居る場合は warning を出して気付かせる
+/// (= silent inclusion を防ぐ)。
 fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
+    // 不要 directory の検出 (warning のみ、build は続行)。
+    if let Ok(entries) = fs::read_dir(src_engines) {
+        let allowed: std::collections::HashSet<&str> =
+            REQUIRED_ENGINE_MODELS.iter().copied().collect();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !allowed.contains(name.as_str()) {
+                println!(
+                    "  warning: stale model dir found, NOT included in pack: {} \
+                     (削除推奨: rm -rf {})",
+                    name,
+                    path.display()
+                );
+            }
+        }
+    }
+
     let file = fs::File::create(dst_zip).map_err(|e| format!("create zip: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
     let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
@@ -611,18 +654,17 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
 
     let mut total_files: usize = 0;
     let mut total_bytes_in: u64 = 0;
-    let mut found_models: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for model_entry in fs::read_dir(src_engines).map_err(|e| format!("read_dir engines: {e}"))? {
-        let model_entry = model_entry.map_err(|e| format!("entry: {e}"))?;
-        let model_dir = model_entry.path();
+    let mut missing_engine: Vec<&str> = Vec::new();
+    let mut missing_profile: Vec<&str> = Vec::new();
+
+    // 必須モデルだけを順に走査 (= stale dir は無視)。
+    for &model_name in REQUIRED_ENGINE_MODELS {
+        let model_dir = src_engines.join(model_name);
         if !model_dir.is_dir() {
+            missing_engine.push(model_name);
             continue;
         }
-        let model_name = model_dir.file_name().unwrap().to_string_lossy().to_string();
 
-        // 各モデルディレクトリの中身 (.engine + .profile) を zip に。
-        // ファイル名は ORT TRT EP のハッシュ命名を保つ必要がある (deserialize 時の lookup
-        // キーになる)。
         let mut has_engine_file = false;
         let mut has_profile_file = false;
         for f in fs::read_dir(&model_dir).map_err(|e| format!("read_dir model: {e}"))? {
@@ -655,27 +697,42 @@ fn build_engine_zip(src_engines: &Path, dst_zip: &Path) -> Result<u64, String> {
             }
             total_files += 1;
         }
-        if has_engine_file && has_profile_file {
-            found_models.insert(model_name);
+
+        if !has_engine_file {
+            missing_engine.push(model_name);
         }
+        // dynamic shape モデルは `.profile` 必須。`.profile` が無ければ engine cache が
+        // 壊れている疑い (= 別バージョンの ORT で生成された) なのでエラーにする。
+        // 固定 shape モデル (denoise_realplksr) は `.profile` が無いのが正常。
+        if !has_profile_file && DYNAMIC_SHAPE_MODELS.contains(&model_name) {
+            missing_profile.push(model_name);
+        }
+        // FIXED_SHAPE_MODELS の `.profile` 不在は OK
+        let _ = FIXED_SHAPE_MODELS;
     }
     zip.finish().map_err(|e| format!("zip finish: {e}"))?;
 
-    // 必須モデルがすべて揃っているかチェック (= .engine + .profile 両方ある)
-    let missing: Vec<&str> = REQUIRED_ENGINE_MODELS
-        .iter()
-        .filter(|m| !found_models.contains(**m))
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        // zip は既に書き終わっているので削除して errror.
+    if !missing_engine.is_empty() || !missing_profile.is_empty() {
+        // zip は既に書き終わっているので削除して error.
         let _ = fs::remove_file(dst_zip);
-        return Err(format!(
-            "engine pack に以下のモデルの engine/.profile が見つからない:\n  - {}\n\
-             先に `mimageviewer.exe --tensorrt-build <model_kind>` でこれらの engine を\n\
-             build してください。",
-            missing.join("\n  - ")
-        ));
+        let mut msg = String::from("engine pack の検証に失敗:\n");
+        if !missing_engine.is_empty() {
+            msg.push_str(&format!(
+                "  .engine が無い:\n    - {}\n",
+                missing_engine.join("\n    - ")
+            ));
+        }
+        if !missing_profile.is_empty() {
+            msg.push_str(&format!(
+                "  dynamic shape モデルなのに .profile が無い (engine cache 不整合の疑い):\n    - {}\n",
+                missing_profile.join("\n    - ")
+            ));
+        }
+        msg.push_str(
+            "先に `mimageviewer.exe --tensorrt-build <model_kind>` でこれらの engine を\n\
+             build (または再 build) してください。",
+        );
+        return Err(msg);
     }
 
     let zip_size = fs::metadata(dst_zip)

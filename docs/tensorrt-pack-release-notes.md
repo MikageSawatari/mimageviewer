@@ -12,12 +12,16 @@ mIV の環境設定で「TensorRT」を選択し「TensorRT パックをダウ�
 - **cuDNN 9.21** - `cudnn64_9.dll`, `cudnn_graph64_9.dll`, `cudnn_ops64_9.dll`
 - **TensorRT 10.16 runtime** - `nvinfer_10.dll`, `nvinfer_plugin_10.dll`,
   `nvonnxparser_10.dll`
-- **6 モデル分の事前ビルド済み engine** (`engines-ampere_plus.zip`)
-  - Real-ESRGAN x4plus / anime6b / general_v3
+- **5 モデル分の事前ビルド済み engine** (`engines-ampere_plus.zip`)
+  - Real-ESRGAN x4plus / anime6b
   - Real-CUGAN 4x
   - NMKD-Siax 4x
   - RealPLKSR (デノイズ)
   - AMPERE_PLUS hardware-compatible モード (sm80+ で動作)
+  - **`Real-ESRGAN general_v3` は本 pack に含まれません** (= pack v3、2026-05): bench で
+    TRT/DirectML がほぼ互角だったため、worker IPC overhead を払うより in-process
+    DirectML へ流す方針 (`runtime.rs::should_route_to_worker`)。本モデルが選ばれた場合は
+    pack の有無に関わらず DirectML が使用されます。
 
 各ファイルの SHA-256 と総バイト数は `manifest.json` に記載されており、mIV
 ダウンローダーが各アセットの整合性を検証します。
@@ -52,5 +56,5 @@ mIV の環境設定で「TensorRT」を選択し「TensorRT パックをダウ�
 
 ```bash
 # manifest.json を読み取って各ファイルの sha256 を確認
-curl -fsSL https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v2/manifest.json | jq .
+curl -fsSL https://github.com/MikageSawatari/mimageviewer/releases/download/trt-pack-v3/manifest.json | jq .
 ```

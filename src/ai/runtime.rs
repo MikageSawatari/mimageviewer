@@ -380,6 +380,11 @@ impl AiRuntime {
     ///   - Denoise: 4.5x 高速化
     ///   - MI-GAN: TRT エンジンビルドが 5+ 分かかるため、安定するまで DirectML
     ///   - Classifier: TRT で engine 生成されない (CUDA EP fallback、効果なし)
+    ///   - **UpscaleRealEsrGeneralV3**: 軽量モデルで bench 上 TRT/DirectML が
+    ///     互角〜DirectML 微優位 (2026-05 RTX 4090 計測、tile=512)。worker IPC
+    ///     overhead を払うほどの利得が無いため、TRT pack を入れていても本モデル
+    ///     だけは in-process DirectML へルーティングする。pack v3 ではこのモデル
+    ///     用 engine を同梱しない方針。
     pub fn should_route_to_worker(&self, kind: ModelKind) -> bool {
         if !self.has_worker_pool() {
             return false;
@@ -387,9 +392,9 @@ impl AiRuntime {
         match kind {
             ModelKind::InpaintMiGan => false,
             ModelKind::ClassifierMobileNet => false,
+            ModelKind::UpscaleRealEsrGeneralV3 => false,
             ModelKind::UpscaleRealEsrganX4Plus
             | ModelKind::UpscaleRealEsrganAnime6B
-            | ModelKind::UpscaleRealEsrGeneralV3
             | ModelKind::UpscaleRealCugan4x
             | ModelKind::UpscaleNmkdSiax4x
             | ModelKind::DenoiseRealplksr => true,

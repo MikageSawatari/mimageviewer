@@ -10565,6 +10565,17 @@ impl App {
             == Some(crate::ai::AiBackend::TensorRt);
         let has_trt = runtime.has_worker_pool();
 
+        // TRT 選択でも pack が未インストールなら spawn 試行しない
+        // (= UI 側で「DirectML で動作」と既に表示済みだが、pack を後で
+        // インストールしたときに settings.json の TensorRT が活きるよう設定値は維持)。
+        if want_trt && !crate::ai::tensorrt_pack::is_pack_installed() {
+            crate::logger::log(
+                "[AI] AI バックエンド: TensorRT 選択中だが pack 未インストール、DirectML で動作"
+                    .to_string(),
+            );
+            return;
+        }
+
         match (want_trt, has_trt) {
             (true, false) => {
                 crate::logger::log(
@@ -10606,15 +10617,23 @@ impl App {
                     ));
                     let runtime_arc = std::sync::Arc::new(rt);
 
-                    // 設定が TRT のとき、子プロセスでワーカープールを起動して attach
+                    // 設定が TRT のとき、子プロセスでワーカープールを起動して attach。
+                    // pack 未インストールの場合は試行せず DirectML 単独で動作 (= UI 側で
+                    // 「パック未インストール」表記を出す。`apply_ai_backend_change` と同じ
+                    // ガード)。
                     let want_trt = self
                         .settings
                         .ai_backend
                         .as_deref()
                         .and_then(crate::ai::AiBackend::from_str)
                         == Some(crate::ai::AiBackend::TensorRt);
-                    if want_trt {
+                    if want_trt && crate::ai::tensorrt_pack::is_pack_installed() {
                         Self::spawn_trt_worker_pool(&runtime_arc);
+                    } else if want_trt {
+                        crate::logger::log(
+                            "[AI] 起動時 TensorRT 選択中だが pack 未インストール、DirectML で動作"
+                                .to_string(),
+                        );
                     }
 
                     self.ai_runtime = Some(runtime_arc);

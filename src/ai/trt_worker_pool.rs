@@ -25,10 +25,11 @@
 //!   └─ stdin に Shutdown 送信 → 子 exit → child.wait()
 //! ```
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 /// SHM 名の seq 部分。プロセス内で start_with_exe が呼ばれるたびに 1 加算する。
 ///
@@ -45,6 +46,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// seq を毎回更新すれば、上記のような残骸 SHM があっても新規 start は成功する。
 /// SHM 名は `WorkerCmd::Infer` で子プロセスに毎回送るので、子側の互換性問題はない。
 static SHM_SEQ: AtomicU32 = AtomicU32::new(0);
+static TRT_INFER_BREAKDOWN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LOG_ALL_TRT_INFER_BREAKDOWN: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("MIV_TRT_INFER_BREAKDOWN_LOG").is_some());
 
 use super::trt_worker_proto::{TRT_INFER_WORKER_ARG, WorkerCmd, WorkerResp};
 
@@ -284,6 +288,12 @@ const PERSIST_OUT_SHM_SIZE: usize = 64 * 1024 * 1024;
 #[cfg(windows)]
 pub struct TrtWorkerPool {
     worker: Mutex<Option<WorkerHandle>>,
+    /// Parent-side view of models already loaded in the current worker.
+    ///
+    /// The worker also keeps sessions cached, but sending an idempotent
+    /// LoadModel command before every tile still costs a JSON IPC round trip.
+    /// Cache it here so steady-state inference only sends Infer commands.
+    loaded_models: Mutex<HashSet<super::ModelKind>>,
     /// 永続入力共有メモリ。pool 起動時に 1 回 create、Drop で破棄。
     in_shm: Mutex<Option<super::trt_worker_shm::SharedMem>>,
     /// 永続出力共有メモリ。同上。
@@ -300,6 +310,7 @@ pub struct TrtWorkerPool {
 #[cfg(not(windows))]
 pub struct TrtWorkerPool {
     worker: Mutex<Option<WorkerHandle>>,
+    loaded_models: Mutex<HashSet<super::ModelKind>>,
     is_dead: AtomicBool,
 }
 
@@ -347,6 +358,7 @@ impl TrtWorkerPool {
         ));
         Ok(Self {
             worker: Mutex::new(Some(worker)),
+            loaded_models: Mutex::new(HashSet::new()),
             in_shm: Mutex::new(Some(in_shm)),
             out_shm: Mutex::new(Some(out_shm)),
             in_shm_name,
@@ -394,6 +406,14 @@ impl TrtWorkerPool {
         if self.is_dead() {
             return Err("worker is dead (前段で死亡判定済み)".to_string());
         }
+        if self
+            .loaded_models
+            .lock()
+            .map_err(|_| "loaded_models mutex poisoned".to_string())?
+            .contains(&kind)
+        {
+            return Ok(0);
+        }
         let mut guard = self
             .worker
             .lock()
@@ -413,6 +433,10 @@ impl TrtWorkerPool {
         if !resp.ok {
             return Err(resp.error.unwrap_or_else(|| "(error 不明)".to_string()));
         }
+        self.loaded_models
+            .lock()
+            .map_err(|_| "loaded_models mutex poisoned".to_string())?
+            .insert(kind);
         Ok(resp.elapsed_ms.unwrap_or(0))
     }
 
@@ -500,14 +524,22 @@ impl TrtWorkerPool {
 
         // 計装: ワーカー breakdown を logger に出す (bench でログから集計可能)
         if let Some(b) = resp.breakdown.as_ref() {
-            crate::logger::log(format!(
-                "[TRT-pool] infer breakdown: read_input={:.3} tensor_build={:.3} session_run={:.3} extract_and_write={:.3} total={:.3} ms",
-                b.read_input_ms,
-                b.tensor_build_ms,
-                b.session_run_ms,
-                b.extract_and_write_ms,
-                b.read_input_ms + b.tensor_build_ms + b.session_run_ms + b.extract_and_write_ms
-            ));
+            let seq = TRT_INFER_BREAKDOWN_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if *LOG_ALL_TRT_INFER_BREAKDOWN || seq % 256 == 0 {
+                crate::logger::log(format!(
+                    "[TRT-pool] infer breakdown{}: read_input={:.3} tensor_build={:.3} session_run={:.3} extract_and_write={:.3} total={:.3} ms",
+                    if *LOG_ALL_TRT_INFER_BREAKDOWN {
+                        ""
+                    } else {
+                        " (sampled)"
+                    },
+                    b.read_input_ms,
+                    b.tensor_build_ms,
+                    b.session_run_ms,
+                    b.extract_and_write_ms,
+                    b.read_input_ms + b.tensor_build_ms + b.session_run_ms + b.extract_and_write_ms
+                ));
+            }
         }
 
         // 永続出力 shm から bytes 読み取り → Vec<f32>
