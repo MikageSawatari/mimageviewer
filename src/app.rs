@@ -1680,6 +1680,8 @@ pub struct App {
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
     pub(crate) video_tile_reopen_pending: bool,
+    #[cfg(windows)]
+    pub(crate) video_tile_reopen_deadline: Option<std::time::Instant>,
     /// タイルモードのサムネ texture キャッシュ (slot_idx → (key, tex))。
     /// state Drop 時にこちらも `clear()` で解放する想定。
     #[cfg(windows)]
@@ -2597,6 +2599,8 @@ impl Default for App {
             video_tile_state: None,
             #[cfg(windows)]
             video_tile_reopen_pending: false,
+            #[cfg(windows)]
+            video_tile_reopen_deadline: None,
             #[cfg(windows)]
             video_tile_textures: std::collections::HashMap::new(),
             #[cfg(windows)]
@@ -10493,6 +10497,7 @@ impl App {
         {
             self.video_tile_state = None;
             self.video_tile_reopen_pending = false;
+            self.video_tile_reopen_deadline = None;
             self.video_tile_textures.clear();
             self.video_jump_textures.clear();
         }

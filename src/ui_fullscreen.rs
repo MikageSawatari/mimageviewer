@@ -1071,14 +1071,26 @@ impl App {
                                 if self.video_tile_reopen_pending
                                     && self.video_tile_state.is_none()
                                 {
-                                    let screen = ctx.content_rect().size();
-                                    self.toggle_video_tile_mode(fs_idx, screen);
-                                    if self.video_tile_state.is_some() {
+                                    let now = std::time::Instant::now();
+                                    let deadline =
+                                        *self.video_tile_reopen_deadline.get_or_insert_with(|| {
+                                            now + std::time::Duration::from_secs(3)
+                                        });
+                                    if now >= deadline {
                                         self.video_tile_reopen_pending = false;
+                                        self.video_tile_reopen_deadline = None;
                                     } else {
-                                        ctx.request_repaint_after(
-                                            std::time::Duration::from_millis(80),
-                                        );
+                                        let screen = ctx.content_rect().size();
+                                        self.toggle_video_tile_mode(fs_idx, screen);
+                                        if self.video_tile_state.is_some() {
+                                            self.video_tile_reopen_pending = false;
+                                            self.video_tile_reopen_deadline = None;
+                                        } else {
+                                            let retry = std::time::Duration::from_millis(80);
+                                            let wait =
+                                                deadline.saturating_duration_since(now).min(retry);
+                                            ctx.request_repaint_after(wait);
+                                        }
                                     }
                                 }
                                 if self.video_tile_state.is_some() {
@@ -2588,9 +2600,12 @@ impl App {
         {
             if restore_video_tile && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                 self.video_tile_reopen_pending = true;
+                self.video_tile_reopen_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                 ctx.request_repaint();
             } else if restore_video_tile {
                 self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
             }
         }
     }
