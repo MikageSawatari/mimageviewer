@@ -2225,6 +2225,26 @@ impl App {
         let mut nav_delta = 0i32;
         let mut close = false;
 
+        // VST editor windows are separate native windows. After interacting with
+        // them, egui may still consider the fullscreen viewport unfocused until
+        // we explicitly claim focus from the next click on the video/image area.
+        let focus_restore_click = ctx.input(|i| {
+            let focused = i.viewport().focused.unwrap_or(true);
+            let primary_down = i.pointer.primary_down();
+            let in_fullscreen = i
+                .pointer
+                .interact_pos()
+                .map(|p| full_rect.contains(p))
+                .unwrap_or(false);
+            !focused && primary_down && in_fullscreen
+        });
+        if focus_restore_click {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.fs_focus_regained_at = Some(std::time::Instant::now());
+            self.fs_suppress_primary_until_release = true;
+            return (0, false);
+        }
+
         // ── ホイール ──
         // パネル領域内ではホイールナビゲーションを抑制
         let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
