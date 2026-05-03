@@ -231,6 +231,8 @@ namespace miv {
 
 using namespace Steinberg;
 
+void send_event_error(const std::string& detail);
+
 namespace {
 constexpr UINT kPluginGuiThreadTaskMsg = WM_APP + 0x4D1;
 constexpr auto kGuiQueryTimeout = std::chrono::milliseconds(2000);
@@ -247,6 +249,11 @@ constexpr DWORD kGuiShutdownTimeoutMs = 2000;
          label ? label : "(unknown)",
          gui_tid,
          timeout_ms);
+    std::string detail = std::string("bridge poisoned: GUI task '") +
+                         (label ? label : "unknown") +
+                         "' timed out after " + std::to_string(timeout_ms) +
+                         "ms (gui_tid=" + std::to_string(gui_tid) + ")";
+    send_event_error(detail);
     std::fflush(stdout);
     std::fflush(stderr);
     ::ExitProcess(1);
@@ -272,6 +279,9 @@ public:
         return thread_id_.load(std::memory_order_acquire);
     }
 
+    // A timeout means the slot GUI thread is stuck in plugin code. The bridge
+    // process exits from terminate_bridge_after_gui_timeout rather than
+    // returning to the caller with a poisoned plugin instance still alive.
     template <typename Fn>
     auto invoke_sync_for(std::chrono::milliseconds timeout,
                          const char* label,
@@ -302,6 +312,7 @@ public:
         return future.get();
     }
 
+    // Same timeout policy as invoke_sync_for: timeouts terminate the bridge.
     bool invoke_void_sync_for(std::chrono::milliseconds timeout,
                               const char* label,
                               std::function<void()> fn) {
@@ -551,6 +562,8 @@ void PluginLoader::abandon_gui_thread(const char* reason) {
 bool PluginLoader::probe(const std::string& plugin_path,
                          PluginProbeInfo& info_out,
                          std::string& error_out) {
+    // Probe runs in a short-lived metadata process and never creates or
+    // attaches an editor view, so it does not need the per-slot GUI thread.
     std::string load_err;
     auto module = VST3::Hosting::Module::create(plugin_path, load_err);
     if (!module) {
@@ -815,8 +828,10 @@ bool PluginLoader::load(const std::string& plugin_path,
     processor_->setProcessing(true);
     active_ = true;
 
-    cached_latency_samples_ = static_cast<uint32_t>(processor_->getLatencySamples());
-    info_out.latency_samples = cached_latency_samples_;
+    cached_latency_samples_.store(
+        static_cast<uint32_t>(processor_->getLatencySamples()),
+        std::memory_order_release);
+    info_out.latency_samples = cached_latency_samples_.load(std::memory_order_acquire);
 
     // 事前確保: planar バッファ (各 channel あたり block_size sample)
     in_buffer_l_.resize(block_size);
@@ -1652,7 +1667,7 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
             "poll_latency_change",
             [this]() -> uint32_t {
                 uint32_t latest = static_cast<uint32_t>(processor_->getLatencySamples());
-                cached_latency_samples_ = latest;
+                cached_latency_samples_.store(latest, std::memory_order_release);
                 return latest;
             });
         if (!result) {
@@ -1667,7 +1682,7 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
     // のみ行う。プラグインによっては「内部が再構成されるまで latency が古い値」のことも
     // あるが、次回 polling で正しい値が拾える設計で許容する (= 実害は数十 ms 程度)。
     uint32_t latest = static_cast<uint32_t>(processor_->getLatencySamples());
-    cached_latency_samples_ = latest;
+    cached_latency_samples_.store(latest, std::memory_order_release);
     new_latency_out = latest;
     blog("poll_latency_change: new latency_samples=%u", latest);
     return true;

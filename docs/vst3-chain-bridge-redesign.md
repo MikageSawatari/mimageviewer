@@ -160,8 +160,11 @@ Design rules:
   be created during `initialize` on the bridge main thread, so a single stuck
   editor can later block bridge-main `DispatchMessageW` even if the slot itself
   has been quarantined. Killing the bridge process is the safe recovery path for
-  the current architecture; Rust disables VST3 for the rest of the session and
-  keeps playback/UI responsive.
+  the current architecture. Before exiting, the bridge emits a structured error
+  event such as `bridge poisoned: GUI task 'show_gui' timed out ...`; Rust then
+  disables VST3 for the rest of the session and keeps playback/UI responsive.
+- Probe mode is unaffected. It runs in a short-lived metadata process and does
+  not create or attach editor views, so it does not create slot GUI threads.
 - We intentionally do not use `TerminateThread`. A plugin that never returns
   from `attached()` is cleaned up by ending the bridge process rather than
   killing only the stuck thread and risking heap or DLL state corruption.

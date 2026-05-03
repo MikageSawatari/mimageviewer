@@ -97,7 +97,9 @@ public:
     void unload();
 
     // 現在のプラグイン latency (= IAudioProcessor::getLatencySamples())。
-    uint32_t latency_samples() const { return cached_latency_samples_; }
+    uint32_t latency_samples() const {
+        return cached_latency_samples_.load(std::memory_order_acquire);
+    }
 
     /// プラグインから `restartComponent(kLatencyChanged)` が来ていないか polling し、
     /// 来ていれば最新値を取得して返す。main loop で 1 イテレーションに 1 回呼ぶ想定。
@@ -206,7 +208,7 @@ private:
 
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;
-    uint32_t cached_latency_samples_ = 0;
+    std::atomic<uint32_t> cached_latency_samples_{0};
     bool active_ = false;
 
     bool editor_drag_active_ = false;

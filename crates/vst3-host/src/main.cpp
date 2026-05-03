@@ -163,7 +163,7 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-static void send_event_error(const std::string& detail) {
+void send_event_error(const std::string& detail) {
     std::string msg = "{\"event\":\"error\",\"detail\":\"" + json_escape(detail) + "\"}";
     write_message(msg);
 }
