@@ -208,6 +208,59 @@ impl DspBridge {
         self.main_hwnd.store(hwnd, Ordering::Release);
     }
 
+    /// VST editor の owner にする mIV 側 HWND を返す。フルスクリーン中は
+    /// foreground viewport を優先し、取れない場合だけ main HWND に戻す。
+    #[cfg(windows)]
+    fn current_gui_owner_hwnd(&self) -> u64 {
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+
+        let fallback = self.main_hwnd.load(Ordering::Acquire);
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return fallback;
+            }
+            let mut foreground_pid = 0_u32;
+            let _ = GetWindowThreadProcessId(hwnd, Some(&mut foreground_pid));
+            if foreground_pid == GetCurrentProcessId() {
+                return hwnd.0 as u64;
+            }
+        }
+        fallback
+    }
+
+    #[cfg(not(windows))]
+    fn current_gui_owner_hwnd(&self) -> u64 {
+        self.main_hwnd.load(Ordering::Acquire)
+    }
+
+    fn sync_existing_gui_owner_to_current_viewport(&self) {
+        let owner_hwnd = self.current_gui_owner_hwnd();
+        if owner_hwnd == 0 {
+            return;
+        }
+        let bridges: Vec<Arc<Bridge>> = {
+            let inner = self.inner.lock().unwrap();
+            let mut bridges: Vec<Arc<Bridge>> = Vec::new();
+            for slot in inner.slots.iter().filter(|s| s.gui_hwnd != 0) {
+                if !bridges.iter().any(|b| Arc::ptr_eq(b, &slot.bridge)) {
+                    bridges.push(slot.bridge.clone());
+                }
+            }
+            bridges
+        };
+        for bridge in bridges {
+            if let Err(err) = bridge.set_chain_owner(owner_hwnd) {
+                crate::logger::log(format!(
+                    "[VST3 GUI] set_chain_owner failed owner=0x{owner_hwnd:x}: {err}"
+                ));
+            }
+        }
+    }
+
     /// audio output の sample_rate (= cpal 出力レート)。0 = 未設定。UI で
     /// プラグイン latency を ms に変換する際の分母として使う。
     pub fn sample_rate(&self) -> u32 {
@@ -933,6 +986,9 @@ impl DspBridge {
                 if slot.gui_hwnd != 0 {
                     let hwnd = slot.gui_hwnd;
                     drop(inner);
+                    if visible {
+                        self.sync_existing_gui_owner_to_current_viewport();
+                    }
                     gui::set_window_visible(hwnd, visible);
                     self.send_slot_gui_visible(idx, visible);
                     // 現在の topmost desired state を反映
@@ -1004,7 +1060,7 @@ impl DspBridge {
             let inner = self.inner.lock().unwrap();
             inner.slots.get(idx).and_then(|s| s.desired_window_pos)
         };
-        let owner_hwnd = self.main_hwnd.load(Ordering::Acquire);
+        let owner_hwnd = self.current_gui_owner_hwnd();
         if owner_hwnd == 0 {
             return Err("main HWND not ready".to_string());
         }
@@ -1189,6 +1245,8 @@ impl DspBridge {
         } else {
             // ── show 経路: 全 SW_SHOWNA → snapshot 順序で z-order 復元 ──
             // user_hidden=true のスロットは飛ばす。
+            self.sync_existing_gui_owner_to_current_viewport();
+
             enum ShowAction {
                 Skip,
                 BatchExisting(u64),
@@ -1299,6 +1357,9 @@ impl DspBridge {
         };
         if target_hwnds.is_empty() {
             return;
+        }
+        if topmost {
+            self.sync_existing_gui_owner_to_current_viewport();
         }
 
         // 現在の z-order を top-to-bottom で snapshot (= EnumWindows で desktop の

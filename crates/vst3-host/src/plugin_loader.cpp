@@ -845,6 +845,34 @@ void PluginLoader::set_gui_topmost(bool topmost) {
     blog("set_gui_topmost: no bridge surface topmost=%d", topmost ? 1 : 0);
 }
 
+void PluginLoader::set_gui_owner(void* owner_hwnd) {
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    HWND new_owner = reinterpret_cast<HWND>(owner_hwnd);
+    if (!container_hwnd || !IsWindow(container_hwnd) || !new_owner || !IsWindow(new_owner)) {
+        blog("set_gui_owner: skipped surface=0x%llx owner=0x%llx",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(new_owner)));
+        return;
+    }
+    HWND old_owner = reinterpret_cast<HWND>(GetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT));
+    if (old_owner == new_owner) {
+        view_host_hwnd_ = owner_hwnd;
+        return;
+    }
+    SetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(new_owner));
+    SetWindowPos(container_hwnd,
+                 nullptr,
+                 0,
+                 0,
+                 0,
+                 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    view_host_hwnd_ = owner_hwnd;
+    blog("set_gui_owner: surface=0x%llx owner=0x%llx",
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(new_owner)));
+}
+
 void PluginLoader::set_gui_app_active(bool active) {
     gui_app_active_ = active;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);

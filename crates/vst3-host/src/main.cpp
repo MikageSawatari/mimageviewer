@@ -631,6 +631,11 @@ private:
             apply_chain_visible(ordered_slots, visible, topmost);
             return true;
         }
+        if (cmd == "set_chain_owner") {
+            HWND owner_hwnd = reinterpret_cast<HWND>(extract_number_field(msg, "owner_hwnd"));
+            apply_chain_owner(owner_hwnd);
+            return true;
+        }
         if (cmd == "set_bypass") {
             uint64_t slot = extract_number_field(msg, "slot_id");
             {
@@ -908,6 +913,25 @@ private:
                             std::to_string(info.latency_samples) + "}";
         write_message(reply);
         return true;
+    }
+
+    void apply_chain_owner(HWND owner_hwnd) {
+        if (!owner_hwnd || !IsWindow(owner_hwnd)) {
+            return;
+        }
+        std::vector<PluginLoader*> loaders;
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            loaders.reserve(processing_order_.size());
+            for (uint64_t slot_id : processing_order_) {
+                if (PluginLoader* loader = loader_at_unlocked(slot_id)) {
+                    loaders.push_back(loader);
+                }
+            }
+        }
+        for (PluginLoader* loader : loaders) {
+            loader->set_gui_owner(owner_hwnd);
+        }
     }
 
     void apply_chain_z_order(const std::vector<uint64_t>& ordered_slots_top_to_bottom,

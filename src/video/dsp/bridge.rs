@@ -526,6 +526,14 @@ impl Bridge {
         }))
     }
 
+    /// 既に作成済みの editor surface の owner HWND を一括更新する。
+    pub fn set_chain_owner(&self, owner_hwnd: u64) -> std::io::Result<()> {
+        self.send_value(&serde_json::json!({
+            "cmd": "set_chain_owner",
+            "owner_hwnd": owner_hwnd,
+        }))
+    }
+
     /// プラグイン内部状態 (= EQ カーブ / chunk) を base64 文字列で取得する。
     /// `Cmd::QueryState` を送って `Event::PluginState` を `timeout` 内で待つ。
     /// 期待外の event (= Error / 旧 reset 等) は **drop してログ** し、期待 event を
