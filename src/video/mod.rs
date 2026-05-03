@@ -766,112 +766,109 @@ impl VideoPlayer {
             // GPU フレームは `gpu_latest` に **所有権ごと** 引き取り、UI は handle を
             // view で参照する。これで前フレームの HANDLE が次フレーム到着まで保持され、
             // 描画中に CloseHandle される race を防ぐ。
-            #[cfg(windows)]
-            if matches!(frame.data, decoder::VideoFrameData::Gpu(_)) {
-                let pts = frame.pts_secs;
-                let serial = frame.seek_serial;
-                let was_none = self.gpu_latest.is_none();
-                if let decoder::VideoFrameData::Gpu(d3d) = frame.data {
-                    self.gpu_latest = Some(d3d);
-                }
-                if was_none {
-                    crate::logger::log(format!(
-                        "VideoPlayer::tick: GPU frame received and stored in gpu_latest \
-                         (pts={pts:.3}, serial={serial})"
-                    ));
-                }
-                let now_for_clear = self.clock.now_secs();
-                if clock::pts_clears_seek_override(pts, now_for_clear) {
-                    if self.clock.is_audio_active() {
-                        self.clock.set_audio_pts(pts);
-                    } else {
-                        self.clock.set_fallback_anchor(pts);
-                    }
-                    self.clock.clear_seek_target_override(serial);
-                } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                    // override 中で frame pts < target - 0.75 (= preroll 不足で
-                    // 解除条件を満たさない経路) を perflog から特定するための診断。
-                    crate::perf::event(
-                        "video",
-                        "seek_override_skip_clear_gpu",
-                        None,
-                        0,
-                        &[
-                            ("frame_pts", serde_json::Value::from(pts)),
-                            ("now", serde_json::Value::from(now_for_clear)),
-                            ("frame_serial", serde_json::Value::from(serial as i64)),
-                        ],
-                    );
-                }
-                self.emit_first_frame_event(pts);
-                self.displayed_frame_seq.fetch_add(1, Ordering::Release);
-                if dropped_past > 0 {
-                    self.ui_dropped_past_count
-                        .fetch_add(dropped_past, Ordering::Relaxed);
-                }
-                let _ = pts_for_log;
-                return next_due;
-            }
-
-            let cpu_bytes = match &frame.data {
-                decoder::VideoFrameData::Cpu(b) => b.as_slice(),
+            match frame.data {
                 #[cfg(windows)]
-                decoder::VideoFrameData::Gpu(_) => unreachable!("handled above"),
-            };
-            let color = ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                cpu_bytes,
-            );
-            // override は frame.pts が override target 近傍のときだけ解除する。
-            // backward seek が外れて pts ≈ 元位置のフレームが新世代 serial で来た
-            // 場合に override を消すと、シークバーが target → 元位置にスナップバック
-            // する (= 「← シークが効かない」現象の本質)。target 近傍チェックを
-            // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
-            let now_after = self.clock.now_secs();
-            if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
-                // post-seek フリッカー対策: override クリア前に anchor を「今 = frame.pts」
-                // に巻き戻す。これをしないと clear 直後に notify_seek_completed 時点の
-                // 古い anchor + 経過 wall でクロックが一気に進み、続くフレームが pts
-                // ジャンプ表示 (= ちらつき) になる。audio あり時は set_audio_pts の
-                // 単調性ガード経由で安全。audio path 任せにすると pause / 末尾近傍 etc.
-                // で override が永久残留するケースがあるので UI 側でも明示 clear する。
-                if self.clock.is_audio_active() {
-                    self.clock.set_audio_pts(frame.pts_secs);
-                } else {
-                    self.clock.set_fallback_anchor(frame.pts_secs);
+                decoder::VideoFrameData::Gpu(d3d) => {
+                    let pts = frame.pts_secs;
+                    let serial = frame.seek_serial;
+                    let was_none = self.gpu_latest.is_none();
+                    self.gpu_latest = Some(d3d);
+                    if was_none {
+                        crate::logger::log(format!(
+                            "VideoPlayer::tick: GPU frame received and stored in gpu_latest \
+                         (pts={pts:.3}, serial={serial})"
+                        ));
+                    }
+                    let now_for_clear = self.clock.now_secs();
+                    if clock::pts_clears_seek_override(pts, now_for_clear) {
+                        if self.clock.is_audio_active() {
+                            self.clock.set_audio_pts(pts);
+                        } else {
+                            self.clock.set_fallback_anchor(pts);
+                        }
+                        self.clock.clear_seek_target_override(serial);
+                    } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                        // override 中で frame pts < target - 0.75 (= preroll 不足で
+                        // 解除条件を満たさない経路) を perflog から特定するための診断。
+                        crate::perf::event(
+                            "video",
+                            "seek_override_skip_clear_gpu",
+                            None,
+                            0,
+                            &[
+                                ("frame_pts", serde_json::Value::from(pts)),
+                                ("now", serde_json::Value::from(now_for_clear)),
+                                ("frame_serial", serde_json::Value::from(serial as i64)),
+                            ],
+                        );
+                    }
+                    self.emit_first_frame_event(pts);
+                    self.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                    displayed_pts = Some(pts);
+                    // GPU frames do not need a CPU texture upload, but they still
+                    // must flow through the common dropped_past accounting and
+                    // perf event below. Returning here used to hide UI-side frame
+                    // batching from perf logs on the D3D11VA path.
                 }
-                self.clock.clear_seek_target_override(frame.seek_serial);
-            } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
-                crate::perf::event(
-                    "video",
-                    "seek_override_skip_clear_cpu",
-                    None,
-                    0,
-                    &[
-                        ("frame_pts", serde_json::Value::from(frame.pts_secs)),
-                        ("now", serde_json::Value::from(now_after)),
-                        (
-                            "frame_serial",
-                            serde_json::Value::from(frame.seek_serial as i64),
-                        ),
-                    ],
-                );
+                decoder::VideoFrameData::Cpu(b) => {
+                    let cpu_bytes = b.as_slice();
+                    let color = ColorImage::from_rgba_unmultiplied(
+                        [frame.width as usize, frame.height as usize],
+                        cpu_bytes,
+                    );
+                    // override は frame.pts が override target 近傍のときだけ解除する。
+                    // backward seek が外れて pts ≈ 元位置のフレームが新世代 serial で来た
+                    // 場合に override を消すと、シークバーが target → 元位置にスナップバック
+                    // する (= 「← シークが効かない」現象の本質)。target 近傍チェックを
+                    // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
+                    let now_after = self.clock.now_secs();
+                    if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
+                        // post-seek フリッカー対策: override クリア前に anchor を「今 = frame.pts」
+                        // に巻き戻す。これをしないと clear 直後に notify_seek_completed 時点の
+                        // 古い anchor + 経過 wall でクロックが一気に進み、続くフレームが pts
+                        // ジャンプ表示 (= ちらつき) になる。audio あり時は set_audio_pts の
+                        // 単調性ガード経由で安全。audio path 任せにすると pause / 末尾近傍 etc.
+                        // で override が永久残留するケースがあるので UI 側でも明示 clear する。
+                        if self.clock.is_audio_active() {
+                            self.clock.set_audio_pts(frame.pts_secs);
+                        } else {
+                            self.clock.set_fallback_anchor(frame.pts_secs);
+                        }
+                        self.clock.clear_seek_target_override(frame.seek_serial);
+                    } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                        // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
+                        crate::perf::event(
+                            "video",
+                            "seek_override_skip_clear_cpu",
+                            None,
+                            0,
+                            &[
+                                ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                                ("now", serde_json::Value::from(now_after)),
+                                (
+                                    "frame_serial",
+                                    serde_json::Value::from(frame.seek_serial as i64),
+                                ),
+                            ],
+                        );
+                    }
+                    let upload_t0 = std::time::Instant::now();
+                    match self.texture.as_mut() {
+                        Some(tex) => {
+                            tex.set(color, TextureOptions::LINEAR);
+                        }
+                        None => {
+                            let label = format!("video:{}", self.path.display());
+                            self.texture =
+                                Some(ctx.load_texture(label, color, TextureOptions::LINEAR));
+                        }
+                    }
+                    upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    self.emit_first_frame_event(pts_for_log);
+                    self.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                    displayed_pts = Some(pts_for_log);
+                }
             }
-            let upload_t0 = std::time::Instant::now();
-            match self.texture.as_mut() {
-                Some(tex) => {
-                    tex.set(color, TextureOptions::LINEAR);
-                }
-                None => {
-                    let label = format!("video:{}", self.path.display());
-                    self.texture = Some(ctx.load_texture(label, color, TextureOptions::LINEAR));
-                }
-            }
-            upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
-            self.emit_first_frame_event(pts_for_log);
-            self.displayed_frame_seq.fetch_add(1, Ordering::Release);
-            displayed_pts = Some(pts_for_log);
         }
 
         // UI 側 skip 計上: latest_renderable を上書きした際に古い候補を捨てた

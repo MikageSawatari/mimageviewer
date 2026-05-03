@@ -12578,6 +12578,11 @@ impl App {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
                 if let Some(d) = player.tick(ctx) {
+                    let d = if player.is_playing() {
+                        d.min(std::time::Duration::from_millis(16))
+                    } else {
+                        d
+                    };
                     next_repaint = Some(match next_repaint {
                         Some(prev) => prev.min(d),
                         None => d,

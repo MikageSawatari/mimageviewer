@@ -5790,6 +5790,28 @@ impl App {
                             buffer_len: buf_clamped,
                             is_warmup,
                         });
+                    if crate::perf::is_enabled()
+                        && (expected_misses > 0 || decoder_delta > 0 || ui_delta > 0)
+                    {
+                        crate::perf::event(
+                            "video",
+                            "display_miss",
+                            None,
+                            0,
+                            &[
+                                ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                                ("seq", serde_json::Value::from(cur_seq as i64)),
+                                ("interval_ms", serde_json::Value::from(interval_ms)),
+                                ("expected_ms", serde_json::Value::from(expected_ms)),
+                                ("hitch_ms", serde_json::Value::from(hitch_ms)),
+                                ("expected_misses", serde_json::Value::from(expected_misses)),
+                                ("decoder_skips", serde_json::Value::from(decoder_delta)),
+                                ("ui_skips", serde_json::Value::from(ui_delta)),
+                                ("buffer_len", serde_json::Value::from(buf_clamped)),
+                                ("is_warmup", serde_json::Value::from(is_warmup)),
+                            ],
+                        );
+                    }
                     // Phase 8.K: 容量 200 だと 60fps で 3.3 秒分しか保持できず、
                     // graph の WINDOW_SECS=6.0 に対し左 半分以上が空欄になる。
                     // 6 秒 × 100fps の余裕を持たせて 600 に拡大。

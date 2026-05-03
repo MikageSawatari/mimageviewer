@@ -717,7 +717,15 @@ displayed-frame intervals that exceed the source FPS cadence. This catches
 slow-playback/stutter cases where no decoder channel overflow (`dropped_full`)
 and no UI `dropped_past` event occurs, but the presenter still fails to show the
 number of frames implied by the nominal FPS. The overlay shows these as `miss:N`
-in the header and as thick red vertical bars in the interval graph.
+in the header and as thick red vertical bars in the interval graph. The same
+condition is emitted to perf JSON as `video/display_miss` with `interval_ms`,
+`expected_ms`, `expected_misses`, decoder/UI skip deltas, and the current
+render-queue length. GPU/D3D11VA playback uses the same `video/tick`
+diagnostics as the CPU path, so UI-side batching is visible in logs on both
+paths. While a video is actively playing, the app also clamps the next
+`request_repaint_after` delay to at most 16ms. This keeps the fullscreen UI
+waking at roughly display cadence even for 24fps sources, avoiding timer
+oversleep that previously let one UI tick consume several ready frames at once.
 
 **Codex P2: EOF replay seek の engine epoch 二重 ++ (`mod.rs`)**
 
