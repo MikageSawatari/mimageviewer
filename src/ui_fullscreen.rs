@@ -50,7 +50,16 @@ const CHECKMARK_RADIUS: f32 = 18.0;
 const CHECKER_TILE_PX: f32 = 16.0;
 
 #[cfg(windows)]
-fn focus_native_window_under_cursor() -> bool {
+struct NativeFocusClaim {
+    foreground_hwnd: usize,
+    target_hwnd: usize,
+    foreign_foreground: bool,
+    set_foreground_ok: bool,
+    set_focus_ok: bool,
+}
+
+#[cfg(windows)]
+fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -61,25 +70,58 @@ fn focus_native_window_under_cursor() -> bool {
     unsafe {
         let mut pt = POINT::default();
         if GetCursorPos(&mut pt).is_err() {
-            return false;
+            return NativeFocusClaim {
+                foreground_hwnd: 0,
+                target_hwnd: 0,
+                foreign_foreground: false,
+                set_foreground_ok: false,
+                set_focus_ok: false,
+            };
         }
         let hovered = WindowFromPoint(pt);
         if hovered.0.is_null() {
-            return false;
+            return NativeFocusClaim {
+                foreground_hwnd: 0,
+                target_hwnd: 0,
+                foreign_foreground: false,
+                set_foreground_ok: false,
+                set_focus_ok: false,
+            };
         }
         let root = GetAncestor(hovered, GA_ROOT);
         let target = if root.0.is_null() { hovered } else { root };
-        let previous = GetForegroundWindow();
-        let changed = previous != target;
-        let _ = SetForegroundWindow(target);
-        let _ = SetFocus(Some(target));
-        changed
+        let foreground = GetForegroundWindow();
+        let foreign_foreground = !foreground.0.is_null() && foreground != target;
+        let set_foreground_ok = SetForegroundWindow(target).as_bool();
+        let set_focus_ok = SetFocus(Some(target)).is_ok();
+        NativeFocusClaim {
+            foreground_hwnd: foreground.0 as usize,
+            target_hwnd: target.0 as usize,
+            foreign_foreground,
+            set_foreground_ok,
+            set_focus_ok,
+        }
     }
 }
 
 #[cfg(not(windows))]
-fn focus_native_window_under_cursor() -> bool {
-    false
+struct NativeFocusClaim {
+    foreground_hwnd: usize,
+    target_hwnd: usize,
+    foreign_foreground: bool,
+    set_foreground_ok: bool,
+    set_focus_ok: bool,
+}
+
+#[cfg(not(windows))]
+fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
+    NativeFocusClaim {
+        foreground_hwnd: 0,
+        target_hwnd: 0,
+        foreign_foreground: false,
+        set_foreground_ok: false,
+        set_focus_ok: false,
+    }
 }
 
 /// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
@@ -2258,24 +2300,37 @@ impl App {
         let mut nav_delta = 0i32;
         let mut close = false;
 
-        // VST editor windows are separate native windows. After interacting with
-        // them, mouse events can reach the fullscreen viewport before keyboard
-        // focus has fully returned. Claim both egui and native Win32 focus from
-        // the next click on the video/image area.
-        let (fullscreen_primary_down, viewport_focused) = ctx.input(|i| {
+        // VST editor windows are bridge-process native windows. In the
+        // cross-process owner-popup case, egui can still report this viewport as
+        // focused while Win32 sends keyboard input to the VST editor. Check the
+        // actual foreground HWND when the user clicks back into fullscreen.
+        let (fullscreen_primary_event, viewport_focused) = ctx.input(|i| {
             let focused = i.viewport().focused.unwrap_or(true);
-            let primary_down = i.pointer.primary_down();
+            let primary_event = i.pointer.primary_down()
+                || i.pointer.primary_pressed()
+                || i.pointer.primary_released();
             let in_fullscreen = i
                 .pointer
                 .interact_pos()
                 .map(|p| full_rect.contains(p))
                 .unwrap_or(false);
-            (primary_down && in_fullscreen, focused)
+            (primary_event && in_fullscreen, focused)
         });
-        if fullscreen_primary_down {
-            let native_focus_changed = focus_native_window_under_cursor();
+        if fullscreen_primary_event {
+            let focus = claim_native_window_under_cursor_focus();
+            let focus_restore_click = focus.target_hwnd != 0 && focus.foreign_foreground;
+            crate::logger::log(format!(
+                "[fs-focus] foreground=0x{:x} fullscreen=0x{:x} foreign={} viewport_focused={} suppress={} set_foreground={} set_focus={}",
+                focus.foreground_hwnd,
+                focus.target_hwnd,
+                focus.foreign_foreground,
+                viewport_focused,
+                focus_restore_click,
+                focus.set_foreground_ok,
+                focus.set_focus_ok
+            ));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            if !viewport_focused || native_focus_changed {
+            if focus_restore_click {
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_suppress_primary_until_release = true;
                 return (0, false);

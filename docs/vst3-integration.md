@@ -35,6 +35,9 @@ focus from another native window, mIV treats it as focus restoration only and
 suppresses the click until the primary button is released. This lets shortcuts
 such as `W` work again after clicking the fullscreen content without
 accidentally toggling play/pause or navigating on the focus-restoring click.
+The handoff check uses Win32 `GetForegroundWindow()` rather than only
+`viewport().focused`, because cross-process owner windows can keep egui's focus
+flag true while the OS foreground window is still the VST editor.
 
 ## 2. 全体構成
 
