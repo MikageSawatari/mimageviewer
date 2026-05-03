@@ -55,16 +55,19 @@ struct NativeFocusClaim {
     post_foreground_hwnd: usize,
     target_hwnd: usize,
     set_foreground_ok: bool,
+    attach_thread_input_ok: bool,
+    set_active_ok: bool,
     set_focus_ok: bool,
 }
 
 #[cfg(windows)]
 fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
     use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, SetForegroundWindow,
-        WindowFromPoint,
+        GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+        SetForegroundWindow, WindowFromPoint,
     };
 
     unsafe {
@@ -75,6 +78,8 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
                 post_foreground_hwnd: 0,
                 target_hwnd: 0,
                 set_foreground_ok: false,
+                attach_thread_input_ok: false,
+                set_active_ok: false,
                 set_focus_ok: false,
             };
         }
@@ -85,20 +90,37 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
                 post_foreground_hwnd: 0,
                 target_hwnd: 0,
                 set_foreground_ok: false,
+                attach_thread_input_ok: false,
+                set_active_ok: false,
                 set_focus_ok: false,
             };
         }
         let root = GetAncestor(hovered, GA_ROOT);
         let target = if root.0.is_null() { hovered } else { root };
         let foreground = GetForegroundWindow();
+        let this_tid = GetCurrentThreadId();
+        let foreground_tid = if !foreground.0.is_null() {
+            GetWindowThreadProcessId(foreground, None)
+        } else {
+            0
+        };
+        let attached = foreground_tid != 0
+            && foreground_tid != this_tid
+            && AttachThreadInput(this_tid, foreground_tid, true).as_bool();
         let set_foreground_ok = SetForegroundWindow(target).as_bool();
+        let set_active_ok = SetActiveWindow(target).is_ok();
         let set_focus_ok = SetFocus(Some(target)).is_ok();
         let post_foreground = GetForegroundWindow();
+        if attached {
+            let _ = AttachThreadInput(this_tid, foreground_tid, false);
+        }
         NativeFocusClaim {
             foreground_hwnd: foreground.0 as usize,
             post_foreground_hwnd: post_foreground.0 as usize,
             target_hwnd: target.0 as usize,
             set_foreground_ok,
+            attach_thread_input_ok: attached,
+            set_active_ok,
             set_focus_ok,
         }
     }
@@ -110,6 +132,8 @@ struct NativeFocusClaim {
     post_foreground_hwnd: usize,
     target_hwnd: usize,
     set_foreground_ok: bool,
+    attach_thread_input_ok: bool,
+    set_active_ok: bool,
     set_focus_ok: bool,
 }
 
@@ -120,6 +144,8 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
         post_foreground_hwnd: 0,
         target_hwnd: 0,
         set_foreground_ok: false,
+        attach_thread_input_ok: false,
+        set_active_ok: false,
         set_focus_ok: false,
     }
 }
@@ -134,6 +160,64 @@ fn current_foreground_hwnd() -> usize {
 #[cfg(not(windows))]
 fn current_foreground_hwnd() -> usize {
     0
+}
+
+fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ArrowLeft
+            | egui::Key::ArrowRight
+            | egui::Key::ArrowUp
+            | egui::Key::ArrowDown
+            | egui::Key::W
+            | egui::Key::Enter
+            | egui::Key::Escape
+            | egui::Key::Space
+            | egui::Key::S
+            | egui::Key::M
+            | egui::Key::L
+            | egui::Key::J
+            | egui::Key::K
+            | egui::Key::B
+            | egui::Key::P
+            | egui::Key::I
+            | egui::Key::Z
+            | egui::Key::R
+    )
+}
+
+fn fullscreen_shortcut_event_summary(ctx: &egui::Context) -> Option<String> {
+    let parts = ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|event| {
+                if let egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } = event
+                    && is_fullscreen_shortcut_probe_key(*key)
+                {
+                    Some(format!(
+                        "{:?}:{}{}:{:?}",
+                        key,
+                        if *pressed { "down" } else { "up" },
+                        if *repeat { ":repeat" } else { "" },
+                        modifiers
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
 }
 
 /// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
@@ -949,6 +1033,15 @@ impl App {
                         let full_rect = ui.max_rect();
 
                         // ── キー入力 ──
+                        if let Some(keys) = fullscreen_shortcut_event_summary(ctx) {
+                            let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+                            crate::logger::log(format!(
+                                "[fs-key] source=fullscreen focused={} foreground=0x{:x} keys={}",
+                                focused,
+                                current_foreground_hwnd(),
+                                keys
+                            ));
+                        }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         if key_action.close { close_fs = true; }
                         nav_delta = key_action.nav_delta;
@@ -1779,6 +1872,53 @@ impl App {
 
     // ── キー入力 ────────────────────────────────────────────────────────
 
+    /// フルスクリーン表示中にメインビューポートへ届いたキーを、フルスクリーン操作として処理する。
+    ///
+    /// VST editor の owner 切り替えや cross-process focus handoff のタイミングによっては、
+    /// マウスイベントは fullscreen viewport に届く一方で、キーだけ main viewport に届くことがある。
+    /// main 側の通常ショートカットは fullscreen 中にブロックされるため、ここで同じ key handler に通す。
+    pub(crate) fn handle_fullscreen_root_key_input(&mut self, ctx: &egui::Context) -> bool {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        let Some(keys) = fullscreen_shortcut_event_summary(ctx) else {
+            return false;
+        };
+
+        let root_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        crate::logger::log(format!(
+            "[fs-key] source=root focused={} foreground=0x{:x} keys={}",
+            root_focused,
+            current_foreground_hwnd(),
+            keys
+        ));
+
+        let spread_pair = self.resolve_spread_pair(fs_idx);
+        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
+        let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+
+        if key_action.nav_delta != 0 {
+            self.bump_input_seq(
+                "fs_root_key",
+                Some(&format!("delta={}", key_action.nav_delta)),
+            );
+        } else if key_action.ctrl_nav.is_some() {
+            self.bump_input_seq("fs_root_ctrl_nav", None);
+        } else if key_action.close {
+            self.bump_input_seq("fs_root_close_key", None);
+        }
+
+        self.handle_fs_navigation(
+            ctx,
+            key_action.close,
+            key_action.ctrl_nav,
+            key_action.nav_delta,
+            key_action.jump_to,
+            fs_idx,
+        );
+        true
+    }
+
     /// フルスクリーンのキー入力を処理し、アクションを返す。
     fn handle_fs_key_input(
         &mut self,
@@ -2342,17 +2482,22 @@ impl App {
             let previous_foreign_foreground = prev_foreground_hwnd != 0
                 && focus.target_hwnd != 0
                 && prev_foreground_hwnd != focus.target_hwnd;
-            let focus_restore_click = previous_foreign_foreground;
+            let vst_gui_visible =
+                cfg!(windows) && self.settings.vst3_enabled && self.settings.vst3_gui_visible;
+            let focus_restore_click = previous_foreign_foreground || vst_gui_visible;
             crate::logger::log(format!(
-                "[fs-focus] prev_foreground=0x{:x} foreground=0x{:x} post_foreground=0x{:x} fullscreen=0x{:x} prev_foreign={} viewport_focused={} suppress={} set_foreground={} set_focus={}",
+                "[fs-focus] prev_foreground=0x{:x} foreground=0x{:x} post_foreground=0x{:x} fullscreen=0x{:x} prev_foreign={} vst_gui_visible={} viewport_focused={} suppress={} set_foreground={} attach_thread_input={} set_active={} set_focus={}",
                 prev_foreground_hwnd,
                 focus.foreground_hwnd,
                 focus.post_foreground_hwnd,
                 focus.target_hwnd,
                 previous_foreign_foreground,
+                vst_gui_visible,
                 viewport_focused,
                 focus_restore_click,
                 focus.set_foreground_ok,
+                focus.attach_thread_input_ok,
+                focus.set_active_ok,
                 focus.set_focus_ok
             ));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

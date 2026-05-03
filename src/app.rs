@@ -13630,9 +13630,16 @@ impl eframe::App for App {
             }
         }
 
-        self.handle_clipboard_shortcuts(ctx);
+        let fullscreen_root_key_handled = self.handle_fullscreen_root_key_input(ctx);
+        if !fullscreen_root_key_handled {
+            self.handle_clipboard_shortcuts(ctx);
+        }
 
-        let keyboard_nav = self.handle_keyboard(ctx);
+        let keyboard_nav = if fullscreen_root_key_handled {
+            None
+        } else {
+            self.handle_keyboard(ctx)
+        };
 
         // ── フルスクリーンビューポート ──────────────────────────────────
         // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
