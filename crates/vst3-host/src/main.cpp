@@ -888,7 +888,7 @@ private:
                 SetWindowPos(*it,
                              topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
                              0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
             return;
         }
@@ -898,14 +898,14 @@ private:
                                        *it,
                                        insert_after,
                                        0, 0, 0, 0,
-                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             if (!next) {
                 EndDeferWindowPos(batch);
                 for (auto fallback = hwnds.rbegin(); fallback != hwnds.rend(); ++fallback) {
                     SetWindowPos(*fallback,
                                  insert_after,
                                  0, 0, 0, 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
                 return;
             }

@@ -1225,7 +1225,7 @@ impl DspBridge {
             inner
                 .slots
                 .iter()
-                .filter(|s| s.gui_hwnd != 0)
+                .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
                 .map(|s| s.gui_hwnd)
                 .collect()
         };
@@ -1255,7 +1255,7 @@ impl DspBridge {
             inner
                 .slots
                 .iter()
-                .filter(|s| s.gui_hwnd != 0)
+                .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
                 .map(|s| s.gui_hwnd)
                 .collect()
         };
