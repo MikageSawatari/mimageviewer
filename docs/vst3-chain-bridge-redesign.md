@@ -168,7 +168,9 @@ Design rules:
   the next `add_plugin`, mIV disables the VST3 bridge for the rest of the
   session and stops startup loading. Playback must not keep a partially poisoned
   bridge in the active DSP path; the user can remove the bad plugin or restart
-  to try the chain again.
+  to try the chain again. The playback-panel VST button reports this as a
+  session stop with the offending plugin path instead of saying that VST3 is
+  disabled in preferences.
 - The bridge emits a watchdog heartbeat while it is running:
   `[BRIDGE main heartbeat] state=... current_cmd=... reader_state=...
   queue_size=... cmds_received=... cmds_processed=...`. This is intentionally

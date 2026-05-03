@@ -124,6 +124,25 @@ impl App {
                 return;
             }
             if matches!(state, DspState::Disabled) {
+                if let Some(reason) = bridge.session_disabled_reason() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 180, 80),
+                        "VST3 はこのセッションでは一時停止しています。",
+                    );
+                    ui.label(
+                        egui::RichText::new(reason)
+                            .small()
+                            .color(egui::Color32::from_rgb(210, 210, 210)),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "応答しないプラグインからアプリを保護するため、VST3 bridge を停止しました。\n問題のプラグインをチェーンから外して再起動してください。",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(170, 170, 170)),
+                    );
+                    return;
+                }
                 ui.colored_label(
                     egui::Color32::from_rgb(230, 180, 80),
                     "VST3 機能は環境設定→動画 タブから\n有効にしてください。",

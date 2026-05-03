@@ -90,6 +90,7 @@ pub struct DspBridge {
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
     /// audio-pump はこれが 0 ならパススルーで早期 return できる。
     active_slot_count: AtomicUsize,
+    session_disabled_reason: Mutex<Option<String>>,
     /// プラグイン GUI ウィンドウを TOPMOST にしておきたいか (= フルスクリーン
     /// 動画再生中の "希望状態")。`set_all_guis_topmost` で更新され、`show_slot_gui`
     /// の新規作成・再表示パスで「現在の希望状態に合わせて」最終的な TOPMOST を
@@ -196,6 +197,7 @@ impl DspBridge {
             }),
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
+            session_disabled_reason: Mutex::new(None),
             gui_topmost_desired: AtomicBool::new(false),
             gui_app_active_effective: AtomicBool::new(true),
             gui_app_inactive_since: Mutex::new(None),
@@ -335,6 +337,10 @@ impl DspBridge {
     #[inline]
     pub fn active_slot_count(&self) -> usize {
         self.active_slot_count.load(Ordering::Acquire)
+    }
+
+    pub fn session_disabled_reason(&self) -> Option<String> {
+        self.session_disabled_reason.lock().unwrap().clone()
     }
 
     /// PDC (Plugin Delay Compensation) 用: アクティブな (Loaded && !bypass) スロットの
@@ -519,14 +525,20 @@ impl DspBridge {
         // bridge exe が APPDATA に展開できるか先にテスト (失敗時はここで早期 return)
         extract::ensure_bridge_extracted().map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
         inner.state = DspState::Enabled;
+        *self.session_disabled_reason.lock().unwrap() = None;
         self.enabled.store(true, Ordering::Release);
         Ok(())
     }
 
     /// VST3 機能を無効化する。全スロットを破棄して各 bridge 子プロセスを終了する。
     pub fn disable(&self) {
+        self.disable_with_reason(None);
+    }
+
+    pub fn disable_with_reason(&self, reason: Option<String>) {
         self.enabled.store(false, Ordering::Release);
         self.active_slot_count.store(0, Ordering::Release);
+        *self.session_disabled_reason.lock().unwrap() = reason;
         let mut inner = self.inner.lock().unwrap();
         for slot in inner.slots.drain(..) {
             // bridge は Arc<Bridge> なので、まだ使用中なら解放されない。
@@ -604,7 +616,7 @@ impl DspBridge {
             let now = std::time::Instant::now();
             if now >= load_deadline {
                 drop(_sync_guard);
-                self.disable();
+                self.disable_with_reason(Some(format!("Plugin load timed out: {plugin_path}")));
                 return Err(format!("plugin load timed out: {plugin_path}"));
             }
             match bridge_arc.recv_timeout(load_deadline - now) {
@@ -622,14 +634,18 @@ impl DspBridge {
                         crate::logger::log(format!(
                             "[VST3] disabling bridge for this session after plugin load error: {detail}"
                         ));
-                        self.disable();
+                        self.disable_with_reason(Some(format!(
+                            "Plugin load error for {plugin_path}: {detail}"
+                        )));
                     }
                     return Err(format!("プラグインロード失敗: {detail}"));
                 }
                 Ok(_) => continue,
                 Err(e) => {
                     drop(_sync_guard);
-                    self.disable();
+                    self.disable_with_reason(Some(format!(
+                        "Bridge event receive failed while loading {plugin_path}: {e}"
+                    )));
                     return Err(format!("recv: {e}"));
                 }
             }
@@ -708,7 +724,9 @@ impl DspBridge {
                     "[VST3] disabling bridge for this session after GUI prewarm failure in '{}'",
                     plugin_path
                 ));
-                self.disable();
+                self.disable_with_reason(Some(format!(
+                    "GUI prewarm timed out for {plugin_path}: {e}"
+                )));
                 return Err(format!(
                     "hidden prewarm failed; VST3 bridge disabled for this session: {e}"
                 ));
