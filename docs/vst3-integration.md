@@ -28,12 +28,13 @@
 
 VST editor windows are native windows owned by the bridge process. When a plugin
 editor has focus, fullscreen keyboard shortcuts must stay inactive so the plugin
-can receive keys. If the user clicks the fullscreen video/image area while that
-viewport is unfocused, mIV treats that click as focus restoration only: it sends
-`ViewportCommand::Focus` to the fullscreen viewport and suppresses the click
-until the primary button is released. This lets shortcuts such as `W` work again
-after clicking the fullscreen content without accidentally toggling play/pause or
-navigating on the focus-restoring click.
+can receive keys. If the user clicks the fullscreen video/image area, mIV
+reclaims focus for that native fullscreen window with `SetForegroundWindow` /
+`SetFocus` and also sends `ViewportCommand::Focus`. If the click actually moved
+focus from another native window, mIV treats it as focus restoration only and
+suppresses the click until the primary button is released. This lets shortcuts
+such as `W` work again after clicking the fullscreen content without
+accidentally toggling play/pause or navigating on the focus-restoring click.
 
 ## 2. 全体構成
 

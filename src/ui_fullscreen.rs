@@ -49,6 +49,39 @@ const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
 const CHECKER_TILE_PX: f32 = 16.0;
 
+#[cfg(windows)]
+fn focus_native_window_under_cursor() -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, SetForegroundWindow,
+        WindowFromPoint,
+    };
+
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return false;
+        }
+        let hovered = WindowFromPoint(pt);
+        if hovered.0.is_null() {
+            return false;
+        }
+        let root = GetAncestor(hovered, GA_ROOT);
+        let target = if root.0.is_null() { hovered } else { root };
+        let previous = GetForegroundWindow();
+        let changed = previous != target;
+        let _ = SetForegroundWindow(target);
+        let _ = SetFocus(Some(target));
+        changed
+    }
+}
+
+#[cfg(not(windows))]
+fn focus_native_window_under_cursor() -> bool {
+    false
+}
+
 /// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
 /// 解決 (`App::resolve_adjust_scope`) と書き込み (`App::write_params_for_scope`) は
 /// App 側にメソッドとして実装され、ここには enum 定義とラベルだけ置く。
@@ -2226,9 +2259,10 @@ impl App {
         let mut close = false;
 
         // VST editor windows are separate native windows. After interacting with
-        // them, egui may still consider the fullscreen viewport unfocused until
-        // we explicitly claim focus from the next click on the video/image area.
-        let focus_restore_click = ctx.input(|i| {
+        // them, mouse events can reach the fullscreen viewport before keyboard
+        // focus has fully returned. Claim both egui and native Win32 focus from
+        // the next click on the video/image area.
+        let (fullscreen_primary_down, viewport_focused) = ctx.input(|i| {
             let focused = i.viewport().focused.unwrap_or(true);
             let primary_down = i.pointer.primary_down();
             let in_fullscreen = i
@@ -2236,13 +2270,16 @@ impl App {
                 .interact_pos()
                 .map(|p| full_rect.contains(p))
                 .unwrap_or(false);
-            !focused && primary_down && in_fullscreen
+            (primary_down && in_fullscreen, focused)
         });
-        if focus_restore_click {
+        if fullscreen_primary_down {
+            let native_focus_changed = focus_native_window_under_cursor();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.fs_focus_regained_at = Some(std::time::Instant::now());
-            self.fs_suppress_primary_until_release = true;
-            return (0, false);
+            if !viewport_focused || native_focus_changed {
+                self.fs_focus_regained_at = Some(std::time::Instant::now());
+                self.fs_suppress_primary_until_release = true;
+                return (0, false);
+            }
         }
 
         // ── ホイール ──
