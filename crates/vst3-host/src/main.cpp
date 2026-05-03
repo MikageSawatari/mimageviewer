@@ -933,7 +933,7 @@ private:
                 SetWindowPos(*it,
                              topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
                              0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             }
             return;
         }
@@ -943,14 +943,14 @@ private:
                                        *it,
                                        insert_after,
                                        0, 0, 0, 0,
-                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             if (!next) {
                 EndDeferWindowPos(batch);
                 for (auto fallback = hwnds.rbegin(); fallback != hwnds.rend(); ++fallback) {
                     SetWindowPos(*fallback,
                                  insert_after,
                                  0, 0, 0, 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
                 }
                 return;
             }
@@ -1011,7 +1011,7 @@ private:
 
         HWND insert_after = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
         for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
-            UINT flags = SWP_NOACTIVATE;
+            UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
             int x = 0;
             int y = 0;
             int width = 0;
@@ -1056,7 +1056,7 @@ private:
 
     static void apply_visible_entry_fallback(const ChainVisibleEntry& entry, bool topmost) {
         if (entry.show) {
-            UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW;
             int x = 0;
             int y = 0;
             int width = 0;
@@ -1083,7 +1083,7 @@ private:
                          0,
                          0,
                          0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_HIDEWINDOW);
         }
     }
 

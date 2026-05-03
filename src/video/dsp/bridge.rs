@@ -660,8 +660,15 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
     // (= ML / preset 内蔵 plugin)。
     // **C++ 側 `crates/vst3-host/include/protocol.h::MAX_CONTROL_MSG_SIZE`
     // と必ず一致**させること。protocol.h を変えたらここも変える。
-    const MAX_CONTROL_MSG_SIZE: usize = 4 * 1024 * 1024;
+    const MAX_CONTROL_MSG_SIZE: usize = 32 * 1024 * 1024;
     if len > MAX_CONTROL_MSG_SIZE {
+        let mut remaining = len;
+        let mut scratch = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let chunk = remaining.min(scratch.len());
+            stdout.read_exact(&mut scratch[..chunk])?;
+            remaining -= chunk;
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "control message too large",

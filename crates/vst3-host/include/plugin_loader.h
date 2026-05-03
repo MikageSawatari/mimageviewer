@@ -43,11 +43,6 @@ struct PluginProbeInfo {
     bool usable_audio_effect = false;
 };
 
-struct PluginMouseHookEntry {
-    uint32_t thread_id = 0;
-    void* hook = nullptr;
-};
-
 struct GuiWindowOptions {
     void* owner_hwnd = nullptr;
     uint32_t width = 0;
@@ -171,8 +166,6 @@ public:
     bool restore_state(const std::vector<uint8_t>& bytes);
 
 private:
-    void install_child_focus_hooks(void* host_hwnd);
-    void remove_child_focus_hooks();
     void refresh_gui_surface(void* container_hwnd);
 
     Steinberg::IPtr<HostApplication> host_app_;
@@ -189,9 +182,6 @@ private:
     void* view_container_hwnd_ = nullptr;
     bool gui_surface_visible_ = false;
     bool gui_app_active_ = true;
-    std::vector<void*> child_focus_hook_hwnds_;
-    std::vector<PluginMouseHookEntry> child_focus_mouse_hooks_;
-    void* popup_event_hook_ = nullptr;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;
 

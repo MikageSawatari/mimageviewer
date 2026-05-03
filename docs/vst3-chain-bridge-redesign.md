@@ -90,6 +90,19 @@ processes. Scanner/probe can continue to spawn a short-lived bridge process.
   batch. Rust no longer sends one topmost/visible command per process.
 - App deactivation never hides plugin surfaces. It only drops topmost. Explicit
   VST OFF / per-slot close may still hide surfaces.
+- The earlier SSL Meter Pro diagnostic hooks (`SetWindowSubclass`,
+  `WH_MOUSE`, and WinEvent popup logging) are no longer installed. The framed
+  editor HWND lives in the bridge process, so native plugin popup/menu ownership
+  works without those hooks, and removing them avoids log storms during GUI
+  show/hide and tooltip activity.
+
+## Control Message Size
+
+Plugin state snapshots can be several megabytes for analyzer/limiter plugins.
+The bridge protocol allows control messages up to 32 MiB. If a future plugin
+exceeds that limit, Rust drains the oversized payload before reporting the
+error so the length-prefixed stdout stream remains synchronized for later
+events.
 
 ## Migration Plan
 

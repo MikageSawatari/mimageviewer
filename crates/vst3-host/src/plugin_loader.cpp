@@ -6,15 +6,11 @@
 #include "plugin_loader.h"
 
 #include <algorithm>
-#include <cwchar>
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
 #include <vector>
 
 #include <windows.h>
-#include <CommCtrl.h>
-
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
 namespace {
@@ -31,8 +27,6 @@ inline void blog(const char* msg) {
     std::fflush(stderr);
 }
 
-constexpr UINT_PTR kPluginChildFocusSubclassId = 0x4D495653534C4D50ull;  // "MIVSSMP"
-HWND g_plugin_mouse_hook_host_hwnd = nullptr;
 constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContainer";
 
 std::wstring utf8_to_wide(const std::string& text) {
@@ -90,7 +84,6 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         }
     }
     if (msg == WM_ACTIVATEAPP) {
-        blog("bridge container WM_ACTIVATEAPP active=%d", wparam != FALSE ? 1 : 0);
         // Do not lower the surface directly here. Moving focus between the Rust
         // host HWND and the bridge-owned container can deactivate this process
         // even though the mIV window group is still the foreground UI. The Rust
@@ -194,409 +187,6 @@ HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::Plu
     return container;
 }
 
-bool is_context_menu_message(UINT msg) {
-    return msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
-           msg == WM_NCRBUTTONDOWN || msg == WM_NCRBUTTONUP ||
-           msg == WM_CONTEXTMENU;
-}
-
-bool should_prepare_context_menu_focus(UINT msg) {
-    return msg == WM_RBUTTONDOWN || msg == WM_NCRBUTTONDOWN ||
-           msg == WM_CONTEXTMENU;
-}
-
-bool is_context_diagnostic_message(UINT msg) {
-    return is_context_menu_message(msg) || msg == WM_CANCELMODE ||
-           msg == WM_CAPTURECHANGED || msg == WM_KILLFOCUS ||
-           msg == WM_SETFOCUS || msg == WM_MOUSEACTIVATE;
-}
-
-const char* window_message_name(UINT msg) {
-    switch (msg) {
-    case WM_RBUTTONDOWN:
-        return "WM_RBUTTONDOWN";
-    case WM_RBUTTONUP:
-        return "WM_RBUTTONUP";
-    case WM_NCRBUTTONDOWN:
-        return "WM_NCRBUTTONDOWN";
-    case WM_NCRBUTTONUP:
-        return "WM_NCRBUTTONUP";
-    case WM_CONTEXTMENU:
-        return "WM_CONTEXTMENU";
-    case WM_CANCELMODE:
-        return "WM_CANCELMODE";
-    case WM_CAPTURECHANGED:
-        return "WM_CAPTURECHANGED";
-    case WM_KILLFOCUS:
-        return "WM_KILLFOCUS";
-    case WM_SETFOCUS:
-        return "WM_SETFOCUS";
-    case WM_MOUSEACTIVATE:
-        return "WM_MOUSEACTIVATE";
-    default:
-        return "WM_*";
-    }
-}
-
-const char* win_event_name(DWORD event) {
-    switch (event) {
-    case EVENT_OBJECT_CREATE:
-        return "create";
-    case EVENT_OBJECT_SHOW:
-        return "show";
-    case EVENT_OBJECT_HIDE:
-        return "hide";
-    case EVENT_OBJECT_DESTROY:
-        return "destroy";
-    default:
-        return "event";
-    }
-}
-
-void normalize_plugin_top_level_window(HWND hwnd) {
-    HWND owner_hwnd = g_plugin_mouse_hook_host_hwnd;
-    if (!hwnd || !IsWindow(hwnd) || !owner_hwnd || !IsWindow(owner_hwnd) || hwnd == owner_hwnd) {
-        return;
-    }
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId()) {
-        return;
-    }
-
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if ((style & WS_CHILD) != 0) {
-        return;
-    }
-    HWND parent = GetParent(hwnd);
-    if (parent != nullptr) {
-        return;
-    }
-
-    wchar_t class_name[128] = {};
-    GetClassNameW(hwnd, class_name, 128);
-    if (std::wcscmp(class_name, L"#32768") == 0) {
-        return;  // system menu window
-    }
-
-    LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    HWND current_owner = GetWindow(hwnd, GW_OWNER);
-    const bool needs_toolwindow = (ex_style & WS_EX_TOOLWINDOW) == 0 ||
-                                  (ex_style & WS_EX_APPWINDOW) != 0;
-    const bool needs_owner = current_owner == nullptr;
-    if (!needs_toolwindow && !needs_owner) {
-        return;
-    }
-
-    if (needs_owner) {
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner_hwnd));
-    }
-    if (needs_toolwindow) {
-        LONG_PTR next_ex_style = (ex_style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next_ex_style);
-    }
-    SetWindowPos(hwnd,
-                 nullptr,
-                 0,
-                 0,
-                 0,
-                 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-                     SWP_FRAMECHANGED);
-    blog("normalized plugin top-level hwnd=0x%llx owner=0x%llx",
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(owner_hwnd)));
-}
-
-BOOL CALLBACK EnumPluginTopLevelNormalizeProc(HWND hwnd, LPARAM) {
-    normalize_plugin_top_level_window(hwnd);
-    return TRUE;
-}
-
-void log_window_event(DWORD event, HWND hwnd, LONG object_id, LONG child_id) {
-    if (!hwnd || object_id != OBJID_WINDOW || child_id != CHILDID_SELF || !IsWindow(hwnd)) {
-        return;
-    }
-
-    DWORD pid = 0;
-    DWORD thread_id = GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId()) {
-        return;
-    }
-
-    wchar_t class_name[128] = {};
-    GetClassNameW(hwnd, class_name, 128);
-    wchar_t title[128] = {};
-    GetWindowTextW(hwnd, title, 128);
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    HWND owner = GetWindow(hwnd, GW_OWNER);
-    HWND parent = GetParent(hwnd);
-
-    char class_utf8[256] = {};
-    WideCharToMultiByte(CP_UTF8, 0, class_name, -1, class_utf8, sizeof(class_utf8), nullptr, nullptr);
-    char title_utf8[256] = {};
-    WideCharToMultiByte(CP_UTF8, 0, title, -1, title_utf8, sizeof(title_utf8), nullptr, nullptr);
-
-    const bool is_popup = (style & WS_POPUP) != 0;
-    const bool is_toolwindow = (ex_style & WS_EX_TOOLWINDOW) != 0;
-    const bool is_menuish = std::strstr(class_utf8, "Menu") != nullptr ||
-                            std::strstr(class_utf8, "Popup") != nullptr ||
-                            std::strstr(class_utf8, "SSL") != nullptr ||
-                            is_popup || is_toolwindow;
-
-    blog("winevent %s hwnd=0x%llx class=\"%s\" title=\"%s\" thread=%lu owner=0x%llx parent=0x%llx style=0x%llx ex=0x%llx menuish=%d fg=0x%llx",
-         win_event_name(event),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)),
-         class_utf8,
-         title_utf8,
-         static_cast<unsigned long>(thread_id),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(owner)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(parent)),
-         static_cast<unsigned long long>(style),
-         static_cast<unsigned long long>(ex_style),
-         is_menuish ? 1 : 0,
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(GetForegroundWindow())));
-}
-
-void CALLBACK PluginPopupWinEventProc(HWINEVENTHOOK,
-                                      DWORD event,
-                                      HWND hwnd,
-                                      LONG object_id,
-                                      LONG child_id,
-                                      DWORD,
-                                      DWORD) {
-    if ((event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) &&
-        object_id == OBJID_WINDOW && child_id == CHILDID_SELF) {
-        normalize_plugin_top_level_window(hwnd);
-    }
-    log_window_event(event, hwnd, object_id, child_id);
-}
-
-void prepare_context_menu_focus(HWND host_hwnd, HWND focus_hwnd, const char* source, UINT msg) {
-    if (!host_hwnd || !IsWindow(host_hwnd)) {
-        return;
-    }
-
-    HWND root_hwnd = GetAncestor(host_hwnd, GA_ROOT);
-    if (!root_hwnd || !IsWindow(root_hwnd)) {
-        root_hwnd = host_hwnd;
-    }
-
-    HWND foreground_before = GetForegroundWindow();
-    HWND active_before = GetActiveWindow();
-    HWND focus_before = GetFocus();
-
-    DWORD root_pid = 0;
-    const DWORD root_thread = GetWindowThreadProcessId(root_hwnd, &root_pid);
-    DWORD focus_pid = 0;
-    const DWORD focus_thread =
-        focus_hwnd && IsWindow(focus_hwnd) ? GetWindowThreadProcessId(focus_hwnd, &focus_pid) : 0;
-    DWORD foreground_pid = 0;
-    const DWORD foreground_thread = foreground_before
-        ? GetWindowThreadProcessId(foreground_before, &foreground_pid)
-        : 0;
-    const DWORD current_thread = GetCurrentThreadId();
-
-    blog("right-click %s: msg=0x%X focus=0x%llx host=0x%llx root=0x%llx fg=0x%llx active=0x%llx prev_focus=0x%llx threads cur=%lu root=%lu focus=%lu fg=%lu",
-         source,
-         static_cast<unsigned int>(msg),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(focus_hwnd)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_hwnd)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(root_hwnd)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(foreground_before)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(active_before)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(focus_before)),
-         static_cast<unsigned long>(current_thread),
-         static_cast<unsigned long>(root_thread),
-         static_cast<unsigned long>(focus_thread),
-         static_cast<unsigned long>(foreground_thread));
-
-    const bool attach_root = root_thread != 0 && root_thread != current_thread;
-    const bool attach_focus = focus_thread != 0 && focus_thread != current_thread &&
-                              focus_thread != root_thread;
-    const bool attach_foreground = foreground_thread != 0 && foreground_thread != current_thread &&
-                                   foreground_thread != root_thread &&
-                                   foreground_thread != focus_thread;
-
-    if (attach_root) {
-        AttachThreadInput(current_thread, root_thread, TRUE);
-    }
-    if (attach_focus) {
-        AttachThreadInput(current_thread, focus_thread, TRUE);
-    }
-    if (attach_foreground) {
-        AttachThreadInput(current_thread, foreground_thread, TRUE);
-    }
-
-    SetForegroundWindow(root_hwnd);
-    BringWindowToTop(root_hwnd);
-    SetActiveWindow(root_hwnd);
-
-    if (focus_hwnd && IsWindow(focus_hwnd)) {
-        SetFocus(focus_hwnd);
-    }
-
-    HWND foreground_after = GetForegroundWindow();
-    HWND active_after = GetActiveWindow();
-    HWND focus_after = GetFocus();
-    blog("right-click %s after: fg=0x%llx active=0x%llx focus=0x%llx",
-         source,
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(foreground_after)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(active_after)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(focus_after)));
-
-    if (attach_foreground) {
-        AttachThreadInput(current_thread, foreground_thread, FALSE);
-    }
-    if (attach_focus) {
-        AttachThreadInput(current_thread, focus_thread, FALSE);
-    }
-    if (attach_root) {
-        AttachThreadInput(current_thread, root_thread, FALSE);
-    }
-}
-
-LRESULT CALLBACK PluginChildFocusSubclassProc(HWND hwnd,
-                                              UINT msg,
-                                              WPARAM wparam,
-                                              LPARAM lparam,
-                                              UINT_PTR subclass_id,
-                                              DWORD_PTR ref_data) {
-    HWND host_hwnd = reinterpret_cast<HWND>(ref_data);
-    if (is_context_diagnostic_message(msg)) {
-        blog("plugin child msg: %s(0x%X) hwnd=0x%llx host=0x%llx fg=0x%llx active=0x%llx focus=0x%llx capture=0x%llx w=0x%llx l=0x%llx",
-             window_message_name(msg),
-             static_cast<unsigned int>(msg),
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)),
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_hwnd)),
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(GetForegroundWindow())),
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(GetActiveWindow())),
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(GetFocus())),
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(GetCapture())),
-             static_cast<unsigned long long>(wparam),
-             static_cast<unsigned long long>(lparam));
-    }
-    if (should_prepare_context_menu_focus(msg) && host_hwnd && IsWindow(host_hwnd)) {
-        // SSL Meter Pro opens its popup menu from the plugin child HWND. The
-        // popup is stable only when the top-level owner is foreground before
-        // the plugin's own WndProc reaches TrackPopupMenu. Its graphical menu
-        // also appears to require focus to remain on the plugin child itself
-        // (Pro-Q's simpler text menu works without this extra focus nudge).
-        prepare_context_menu_focus(host_hwnd, hwnd, "subclass", msg);
-    }
-    if (msg == WM_NCDESTROY) {
-        RemoveWindowSubclass(hwnd, PluginChildFocusSubclassProc, subclass_id);
-    }
-    return DefSubclassProc(hwnd, msg, wparam, lparam);
-}
-
-LRESULT CALLBACK PluginMouseHookProc(int code, WPARAM wparam, LPARAM lparam) {
-    if (code >= 0 && is_context_menu_message(static_cast<UINT>(wparam))) {
-        auto* mouse = reinterpret_cast<MOUSEHOOKSTRUCT*>(lparam);
-        HWND target_hwnd = mouse ? mouse->hwnd : nullptr;
-        HWND host_hwnd = g_plugin_mouse_hook_host_hwnd;
-        if (host_hwnd && IsWindow(host_hwnd)) {
-            DWORD_PTR existing_ref_data = 0;
-            const bool covered_by_subclass =
-                target_hwnd && IsWindow(target_hwnd) &&
-                GetWindowSubclass(target_hwnd,
-                                  PluginChildFocusSubclassProc,
-                                  kPluginChildFocusSubclassId,
-                                  &existing_ref_data) != FALSE;
-            if (covered_by_subclass) {
-                blog("right-click mouse hook covered-by-subclass: %s(0x%X) focus=0x%llx host=0x%llx",
-                     window_message_name(static_cast<UINT>(wparam)),
-                     static_cast<unsigned int>(wparam),
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(target_hwnd)),
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_hwnd)));
-            } else if (should_prepare_context_menu_focus(static_cast<UINT>(wparam))) {
-                prepare_context_menu_focus(host_hwnd, target_hwnd, "mouse hook", static_cast<UINT>(wparam));
-            } else {
-                blog("right-click mouse hook observed: %s(0x%X) focus=0x%llx host=0x%llx",
-                     window_message_name(static_cast<UINT>(wparam)),
-                     static_cast<unsigned int>(wparam),
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(target_hwnd)),
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_hwnd)));
-            }
-        }
-    }
-    return CallNextHookEx(nullptr, code, wparam, lparam);
-}
-
-struct ChildFocusHookContext {
-    HWND host_hwnd = nullptr;
-    std::vector<void*>* tracked = nullptr;
-    std::vector<miv::PluginMouseHookEntry>* mouse_hooks = nullptr;
-};
-
-BOOL CALLBACK EnumChildFocusHookProc(HWND child_hwnd, LPARAM lparam) {
-    auto* ctx = reinterpret_cast<ChildFocusHookContext*>(lparam);
-    if (!ctx || !ctx->tracked || !child_hwnd || !IsWindow(child_hwnd)) {
-        return TRUE;
-    }
-
-    DWORD pid = 0;
-    DWORD thread_id = GetWindowThreadProcessId(child_hwnd, &pid);
-    if (pid != GetCurrentProcessId()) {
-        return TRUE;
-    }
-
-    if (ctx->mouse_hooks && thread_id != 0) {
-        const bool already_hooked =
-            std::any_of(ctx->mouse_hooks->begin(),
-                        ctx->mouse_hooks->end(),
-                        [thread_id](const miv::PluginMouseHookEntry& entry) {
-                            return entry.thread_id == thread_id && entry.hook != nullptr;
-                        });
-        if (!already_hooked) {
-            HHOOK hook = SetWindowsHookExW(WH_MOUSE, PluginMouseHookProc, nullptr, thread_id);
-            if (hook) {
-                ctx->mouse_hooks->push_back(
-                    miv::PluginMouseHookEntry{thread_id, reinterpret_cast<void*>(hook)});
-                blog("child focus mouse hook installed thread=%lu",
-                     static_cast<unsigned long>(thread_id));
-            } else {
-                blog("child focus mouse hook install failed thread=%lu err=%lu",
-                     static_cast<unsigned long>(thread_id),
-                     static_cast<unsigned long>(GetLastError()));
-            }
-        }
-    }
-
-    DWORD_PTR existing_ref_data = 0;
-    const bool already_subclassed =
-        GetWindowSubclass(child_hwnd,
-                          PluginChildFocusSubclassProc,
-                          kPluginChildFocusSubclassId,
-                          &existing_ref_data) != FALSE;
-    void* raw = reinterpret_cast<void*>(child_hwnd);
-    const bool already_tracked =
-        std::find(ctx->tracked->begin(), ctx->tracked->end(), raw) != ctx->tracked->end();
-    if (already_subclassed) {
-        if (!already_tracked) {
-            ctx->tracked->push_back(raw);
-        }
-        return TRUE;
-    }
-
-    if (SetWindowSubclass(child_hwnd,
-                          PluginChildFocusSubclassProc,
-                          kPluginChildFocusSubclassId,
-                          reinterpret_cast<DWORD_PTR>(ctx->host_hwnd))) {
-        if (!already_tracked) {
-            ctx->tracked->push_back(raw);
-        }
-        blog("child focus hook installed hwnd=0x%llx",
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(child_hwnd)));
-    } else {
-        blog("child focus hook install failed hwnd=0x%llx err=%lu",
-             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(child_hwnd)),
-             static_cast<unsigned long>(GetLastError()));
-    }
-    return TRUE;
-}
 }  // namespace
 
 #include "host_app.h"
@@ -1039,85 +629,6 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
     return true;
 }
 
-void PluginLoader::install_child_focus_hooks(void* host_hwnd_raw) {
-    HWND host_hwnd = reinterpret_cast<HWND>(host_hwnd_raw);
-    if (!host_hwnd || !IsWindow(host_hwnd)) {
-        return;
-    }
-
-    // Drop stale HWNDs left by plugin-side child recreation. Live hooks remain
-    // installed; repeated enumeration is cheap and lets resize-created children
-    // pick up the same foreground fix without a global WinEvent hook.
-    child_focus_hook_hwnds_.erase(
-        std::remove_if(child_focus_hook_hwnds_.begin(),
-                       child_focus_hook_hwnds_.end(),
-                       [](void* raw) {
-                           HWND hwnd = reinterpret_cast<HWND>(raw);
-                           return !hwnd || !IsWindow(hwnd);
-                       }),
-        child_focus_hook_hwnds_.end());
-
-    HWND focus_host = reinterpret_cast<HWND>(view_container_hwnd_);
-    if (!focus_host || !IsWindow(focus_host)) {
-        focus_host = host_hwnd;
-    }
-    const auto before = child_focus_hook_hwnds_.size();
-    g_plugin_mouse_hook_host_hwnd = focus_host;
-    if (!popup_event_hook_) {
-        HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_CREATE,
-                                             EVENT_OBJECT_HIDE,
-                                             nullptr,
-                                             PluginPopupWinEventProc,
-                                             GetCurrentProcessId(),
-                                             0,
-                                             WINEVENT_OUTOFCONTEXT);
-        if (hook) {
-            popup_event_hook_ = reinterpret_cast<void*>(hook);
-            blog("popup WinEvent hook installed");
-        } else {
-            blog("popup WinEvent hook install failed err=%lu",
-                 static_cast<unsigned long>(GetLastError()));
-        }
-    }
-    HWND enum_root = reinterpret_cast<HWND>(view_container_hwnd_);
-    if (!enum_root || !IsWindow(enum_root)) {
-        enum_root = host_hwnd;
-    }
-    EnumWindows(EnumPluginTopLevelNormalizeProc, 0);
-    ChildFocusHookContext ctx{focus_host, &child_focus_hook_hwnds_, &child_focus_mouse_hooks_};
-    EnumChildFocusHookProc(enum_root, reinterpret_cast<LPARAM>(&ctx));
-    EnumChildWindows(enum_root, EnumChildFocusHookProc, reinterpret_cast<LPARAM>(&ctx));
-    const auto installed = child_focus_hook_hwnds_.size() - before;
-    if (installed > 0) {
-        blog("install_child_focus_hooks: installed=%zu total=%zu",
-             installed,
-             child_focus_hook_hwnds_.size());
-    }
-}
-
-void PluginLoader::remove_child_focus_hooks() {
-    if (popup_event_hook_) {
-        UnhookWinEvent(reinterpret_cast<HWINEVENTHOOK>(popup_event_hook_));
-        popup_event_hook_ = nullptr;
-    }
-    for (const auto& entry : child_focus_mouse_hooks_) {
-        HHOOK hook = reinterpret_cast<HHOOK>(entry.hook);
-        if (hook) {
-            UnhookWindowsHookEx(hook);
-        }
-    }
-    child_focus_mouse_hooks_.clear();
-    g_plugin_mouse_hook_host_hwnd = nullptr;
-
-    for (void* raw : child_focus_hook_hwnds_) {
-        HWND hwnd = reinterpret_cast<HWND>(raw);
-        if (hwnd && IsWindow(hwnd)) {
-            RemoveWindowSubclass(hwnd, PluginChildFocusSubclassProc, kPluginChildFocusSubclassId);
-        }
-    }
-    child_focus_hook_hwnds_.clear();
-}
-
 bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out) {
     blog("show_gui start owner=0x%llx visible=%d",
          (unsigned long long)options.owner_hwnd,
@@ -1228,7 +739,6 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         last_gui_height_ = 0;
         blog("show_gui: getSize failed");
     }
-    install_child_focus_hooks(attach_hwnd);
     gui_surface_visible_ = visible;
     gui_app_active_ = true;
     if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
@@ -1326,7 +836,7 @@ void PluginLoader::set_gui_topmost(bool topmost) {
                      0,
                      0,
                      0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         blog("set_gui_topmost: bridge surface hwnd=0x%llx topmost=%d",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
              topmost ? 1 : 0);
@@ -1356,7 +866,7 @@ void PluginLoader::set_gui_app_active(bool active) {
                          0,
                          0,
                          0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         } else {
             ShowWindow(container_hwnd, SW_HIDE);
         }
@@ -1447,11 +957,9 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
         plug_frame_->mark_user_resize();
     }
     view_->onSize(&rect);
-    install_child_focus_hooks(view_host_hwnd_);
 }
 
 void PluginLoader::hide_gui() {
-    remove_child_focus_hooks();
     if (view_attached_ && view_) {
         view_->removed();
         view_->setFrame(nullptr);

@@ -84,6 +84,6 @@ constexpr uint32_t PROTOCOL_VERSION = 1;
 // 困らない。
 // **Rust 側 `src/video/dsp/bridge.rs::read_event_blocking` の同名定数と必ず
 // 一致**させること。ここを変えたら Rust 側も同期する。
-constexpr uint32_t MAX_CONTROL_MSG_SIZE = 4 * 1024 * 1024;
+constexpr uint32_t MAX_CONTROL_MSG_SIZE = 32 * 1024 * 1024;
 
 }  // namespace miv
