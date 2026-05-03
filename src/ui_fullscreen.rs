@@ -5767,12 +5767,24 @@ impl App {
                 let decoder_delta = cur_decoder_skip.saturating_sub(prev_decoder_skip) as u32;
                 let ui_delta = cur_ui_skip.saturating_sub(prev_ui_skip) as u32;
                 let buf_clamped = cur_buf.min(255) as u8;
-                let transient_threshold = expected_ms * 3.0;
+                // Keep short slow-playback samples in the graph so "expected
+                // frame opportunities missed" is visible even when decoder/UI
+                // drop counters stay at zero. Longer stalls are still treated
+                // as transient pauses and skipped.
+                let transient_threshold = (expected_ms * 8.0).max(250.0);
                 if interval_ms <= transient_threshold {
+                    let hitch_ms = (expected_ms * 1.5).max(20.0);
+                    let expected_misses = if !is_warmup && interval_ms > hitch_ms {
+                        (interval_ms / expected_ms).round() as u32
+                    } else {
+                        1
+                    }
+                    .saturating_sub(1);
                     self.video_perf_history
                         .push_back(crate::app::VideoPerfSample {
                             interval_ms,
                             arrival: now,
+                            expected_misses,
                             decoder_skips: decoder_delta,
                             ui_skips: ui_delta,
                             buffer_len: buf_clamped,
@@ -5873,6 +5885,11 @@ impl App {
             .map(|s| s.decoder_skips)
             .sum();
         let ui_skips: u32 = self.video_perf_history.iter().map(|s| s.ui_skips).sum();
+        let expected_misses: u32 = self
+            .video_perf_history
+            .iter()
+            .map(|s| s.expected_misses)
+            .sum();
         let cur_buf = self
             .video_perf_history
             .back()
@@ -5882,13 +5899,14 @@ impl App {
         // 平均値は wall rate と一致するのが正常で、max が target を超えるほど
         // pipeline の変動が大きい。
         // Phase 8.K: header 文字列を短縮 (360px 枠を超えないため)。
-        // "60.0fps/16.7ms  jit 17.0/25.5  d:1 ui:5  buf:3/24"
+        // "60.0fps/16.7ms  jit 17.0/25.5  miss:2 d:1 ui:5  buf:3/24"
         let header = format!(
-            "{:.1}fps/{:.1}ms  jit {:.1}/{:.1}  d:{} ui:{}  buf:{}/{}",
+            "{:.1}fps/{:.1}ms  jit {:.1}/{:.1}  miss:{} d:{} ui:{}  buf:{}/{}",
             1000.0 / expected_ms,
             expected_ms,
             avg,
             max,
+            expected_misses,
             decoder_skips,
             ui_skips,
             cur_buf,
@@ -6066,10 +6084,22 @@ impl App {
         }
 
         // skip 縦線:
+        // - expected miss: source FPS から見て到着しなかった表示機会。太い赤で表示。
         // - decoder dropped_full: video_tx overflow。濃い赤で表示。
         // - UI dropped_past: tick が複数 displayable frame をまとめて消費。橙で表示。
         // 同一サンプルで両方発生した場合も見えるよう、横に少しずらして描く。
         for sample in &self.video_perf_history {
+            if sample.expected_misses > 0 {
+                let alpha = (145 + (sample.expected_misses * 35).min(110)) as u8;
+                let x = x_for(sample.arrival);
+                painter.line_segment(
+                    [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
+                    egui::Stroke::new(
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 45, 45, alpha),
+                    ),
+                );
+            }
             if sample.decoder_skips > 0 {
                 let alpha = (130 + (sample.decoder_skips * 45).min(125)) as u8;
                 let x = x_for(sample.arrival) - 0.8;

@@ -473,6 +473,20 @@ fn run_pump(
     // backlog. If they do, the audio master clock advances only as that
     // backlog drains and video playback looks artificially slow.
     const RAW_SEEK_SOFT_CAP_SECS: f64 = 2.0;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RawReanchorReason {
+        Overflow,
+        SeekSoftCap,
+    }
+
+    impl RawReanchorReason {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Overflow => "overflow",
+                Self::SeekSoftCap => "seek soft cap",
+            }
+        }
+    }
     // ── 自律 refill tick (Codex 助言、2026-05-01) ──
     // `recv_timeout` の値。audio_rx が空でも pump をこの間隔で起こし、processed を
     // raw_pending から自律補充する。cpal の典型的な callback 間隔 (10ms) より短く取り、
@@ -577,7 +591,7 @@ fn run_pump(
             // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
             let frame_pts_secs = frame.pts_secs;
             let frame_seek_target_secs = frame.seek_target_secs;
-            let mut raw_reanchor_reason: Option<&'static str> = None;
+            let mut raw_reanchor_reason: Option<RawReanchorReason> = None;
             let mut raw_reanchor_threshold_secs = RAW_OVERFLOW_SECS;
             let raw_total_secs = {
                 let mut buf = buffer.lock().unwrap();
@@ -618,10 +632,10 @@ fn run_pump(
                     buf.raw_pending.push_back(frame);
                     publish_buffer_secs(&buf, &clock);
                     if raw_overflow {
-                        raw_reanchor_reason = Some("overflow");
+                        raw_reanchor_reason = Some(RawReanchorReason::Overflow);
                         raw_reanchor_threshold_secs = RAW_OVERFLOW_SECS;
                     } else {
-                        raw_reanchor_reason = Some("seek soft cap");
+                        raw_reanchor_reason = Some(RawReanchorReason::SeekSoftCap);
                         raw_reanchor_threshold_secs = RAW_SEEK_SOFT_CAP_SECS;
                     }
                 } else {
@@ -637,7 +651,11 @@ fn run_pump(
                             };
                             capped_raw_secs -= dropped.duration_secs;
                         }
-                        if buf.processed.is_empty() && buf.drain_offset_in_first == 0 {
+                        // After the first seek soft-cap re-anchor, keep already processed
+                        // audio authoritative. Only move next_pts_secs when processed is
+                        // fully drained; otherwise fill_output's processed queue still owns
+                        // the audible clock anchor.
+                        if processed_is_drained(&buf) {
                             if let Some(front) = buf.raw_pending.front() {
                                 buf.next_pts_secs = front.pts_secs;
                             }
@@ -654,16 +672,19 @@ fn run_pump(
                 // queued backlog and treat the current frame as the new audio
                 // anchor, which lets old AVI/DivX files recover after seek.
                 crate::logger::log(format!(
-                    "[audio-pump] raw_pending {raw_reanchor_reason} ({:.1}s > {:.1}s threshold) \
+                    "[audio-pump] raw_pending {} ({:.1}s > {:.1}s threshold) \
                      at seek_serial={frame_seek_serial}: re-anchor at {:.3}s",
-                    raw_total_secs, raw_reanchor_threshold_secs, frame_pts_secs,
+                    raw_reanchor_reason.label(),
+                    raw_total_secs,
+                    raw_reanchor_threshold_secs,
+                    frame_pts_secs,
                 ));
                 clock.zero_audio_tx_queued_secs();
                 seek_target_secs = Some(frame_pts_secs);
                 if pump_anchor_target_secs.is_none() {
                     pump_anchor_target_secs = frame_seek_target_secs.or(Some(frame_pts_secs));
                 }
-                if raw_reanchor_reason == "seek soft cap" {
+                if matches!(raw_reanchor_reason, RawReanchorReason::SeekSoftCap) {
                     seek_soft_reanchor_serial = Some(frame_seek_serial);
                 }
                 #[cfg(windows)]
@@ -985,6 +1006,10 @@ fn pre_target_trim_decision(
 /// processed.front() の残り audible 秒数を返す (= drain_offset_in_first 後の未消費部分)。
 /// `cur_secs` の計算で `processed.iter().sum(duration_secs)` は完全な chunk のみカウント
 /// するため、front の途中まで drain したケースを補正するために加算する。
+fn processed_is_drained(buf: &AudioBuffer) -> bool {
+    buf.processed.is_empty() && buf.drain_offset_in_first == 0
+}
+
 fn remaining_first_chunk_secs(buf: &AudioBuffer) -> f64 {
     if let Some(first) = buf.processed.front() {
         let consumed = buf.drain_offset_in_first as f64 / buf.samples_per_sec;

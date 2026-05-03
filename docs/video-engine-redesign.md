@@ -712,6 +712,13 @@ clock.is_seeking()` を新たな freeze 条件として使う。`sample_video_pe
 freeze 中 graph の "now" を最後のサンプル時刻に固定。pre-seek の折れ線が post-seek
 の赤線エリアに滑らかに繋がる。
 
+2026-05-03 follow-up: the perf overlay now records `expected_misses` for
+displayed-frame intervals that exceed the source FPS cadence. This catches
+slow-playback/stutter cases where no decoder channel overflow (`dropped_full`)
+and no UI `dropped_past` event occurs, but the presenter still fails to show the
+number of frames implied by the nominal FPS. The overlay shows these as `miss:N`
+in the header and as thick red vertical bars in the interval graph.
+
 **Codex P2: EOF replay seek の engine epoch 二重 ++ (`mod.rs`)**
 
 `apply_command(Play)` を `handle_seek_request` より先に呼ぶと、state=Eof のとき

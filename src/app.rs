@@ -919,6 +919,9 @@ use crate::ui_helpers::{
 pub(crate) struct VideoPerfSample {
     pub interval_ms: f32,
     pub arrival: std::time::Instant,
+    /// Frames that should have appeared at the source FPS during this interval
+    /// but did not reach the fullscreen presenter.
+    pub expected_misses: u32,
     pub decoder_skips: u32,
     pub ui_skips: u32,
     pub buffer_len: u8,
