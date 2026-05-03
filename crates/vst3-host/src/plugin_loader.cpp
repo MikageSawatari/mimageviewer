@@ -236,6 +236,8 @@ constexpr UINT kPluginGuiThreadTaskMsg = WM_APP + 0x4D1;
 constexpr auto kGuiQueryTimeout = std::chrono::milliseconds(2000);
 constexpr auto kGuiShowTimeout = std::chrono::milliseconds(3000);
 constexpr auto kGuiMutationTimeout = std::chrono::milliseconds(1000);
+constexpr auto kPluginLoadTimeout = std::chrono::milliseconds(20000);
+constexpr auto kPluginStateTimeout = std::chrono::milliseconds(5000);
 constexpr DWORD kGuiShutdownTimeoutMs = 2000;
 
 [[noreturn]] void terminate_bridge_after_gui_timeout(const char* label,
@@ -494,6 +496,12 @@ struct GuiShowResult {
     std::string error;
 };
 
+struct LoadResult {
+    bool ok = false;
+    LoadedPluginInfo info;
+    std::string error;
+};
+
 PluginLoader::PluginLoader() {
     host_app_ = owned(new HostApplication);
     component_handler_ = owned(new ComponentHandler);
@@ -630,8 +638,33 @@ bool PluginLoader::load(const std::string& plugin_path,
                          uint32_t block_size,
                          LoadedPluginInfo& info_out,
                          std::string& error_out) {
+    if (!is_gui_thread()) {
+        std::string path = plugin_path;
+        auto result = gui_thread().invoke_sync_for(
+            kPluginLoadTimeout,
+            "load_plugin",
+            [this, path, sample_rate, block_size]() -> LoadResult {
+                LoadResult out{};
+                out.ok = load(path, sample_rate, block_size, out.info, out.error);
+                return out;
+            });
+        if (!result) {
+            error_out = "load_plugin timed out";
+            return false;
+        }
+        if (!result->ok) {
+            error_out = result->error;
+            return false;
+        }
+        info_out = result->info;
+        return true;
+    }
+
     sample_rate_ = sample_rate;
     block_size_ = block_size;
+    blog("load: plugin lifecycle on gui_tid=%lu path=\"%s\"",
+         GetCurrentThreadId(),
+         plugin_path.c_str());
 
     // VST3 SDK の Module ヘルパで .vst3 をロード
     std::string load_err;
@@ -1610,6 +1643,25 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
     if (!component_handler_->consume_latency_changed_flag()) {
         return false;
     }
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return false;
+        }
+        auto result = gui_thread().invoke_sync_for(
+            kGuiQueryTimeout,
+            "poll_latency_change",
+            [this]() -> uint32_t {
+                uint32_t latest = static_cast<uint32_t>(processor_->getLatencySamples());
+                cached_latency_samples_ = latest;
+                return latest;
+            });
+        if (!result) {
+            return false;
+        }
+        new_latency_out = *result;
+        blog("poll_latency_change: new latency_samples=%u", new_latency_out);
+        return true;
+    }
     // VST3 規約: kLatencyChanged を受けたら audio 処理を一旦止めて latency を再問い合わせる
     // のが正しい順序。実装簡易のため bridge 側では setActive 再起動はせずに最新値の取得
     // のみ行う。プラグインによっては「内部が再構成されるまで latency が古い値」のことも
@@ -1725,6 +1777,24 @@ void PluginLoader::reset() {
 
 bool PluginLoader::query_state(std::vector<uint8_t>& out_bytes) {
     out_bytes.clear();
+    if (!is_gui_thread()) {
+        if (!gui_thread_) return false;
+        auto result = gui_thread().invoke_sync_for(
+            kPluginStateTimeout,
+            "query_state",
+            [this]() -> std::optional<std::vector<uint8_t>> {
+                std::vector<uint8_t> bytes;
+                if (!query_state(bytes)) {
+                    return std::nullopt;
+                }
+                return bytes;
+            });
+        if (!result || !*result) {
+            return false;
+        }
+        out_bytes = std::move(**result);
+        return true;
+    }
     if (!component_) return false;
     Steinberg::MemoryStream stream;
     if (component_->getState(&stream) != Steinberg::kResultOk) {
@@ -1752,6 +1822,17 @@ bool PluginLoader::query_state(std::vector<uint8_t>& out_bytes) {
 }
 
 bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) return false;
+        std::vector<uint8_t> copy = bytes;
+        auto result = gui_thread().invoke_sync_for(
+            kPluginStateTimeout,
+            "restore_state",
+            [this, copy = std::move(copy)]() -> bool {
+                return restore_state(copy);
+            });
+        return result.value_or(false);
+    }
     if (!component_ || bytes.empty()) return false;
     // MemoryStream にバイト列を書き込む (= 終端後、再度先頭にシークしてから setState)。
     Steinberg::MemoryStream stream;
@@ -1831,6 +1912,14 @@ void PluginLoader::flush_with_silence(uint32_t num_samples) {
 }
 
 void PluginLoader::unload() {
+    if (!is_gui_thread() && gui_thread_) {
+        gui_thread_->invoke_void_sync_for(kPluginStateTimeout, "unload_plugin", [this]() {
+            unload();
+        });
+        gui_thread_.reset();
+        return;
+    }
+
     // GUI が出ていれば先に外す (順序逆だとプラグインが crash することがある)
     hide_gui();
     if (active_ && processor_) {

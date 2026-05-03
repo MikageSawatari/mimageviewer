@@ -135,6 +135,12 @@ Design rules:
   `getSize`, `onSize`, `setContentScaleFactor`) runs on that slot's GUI thread.
   This preserves VST3's STA-style editor expectations while isolating editor
   message queues.
+- Plugin lifecycle calls (`Module::create`, `createInstance`,
+  `component/controller initialize`, component-controller connection, state IO,
+  and unload/terminate) also run on the slot GUI thread. Some plugins create
+  hidden helper windows or COM/OLE objects during initialization, before
+  `IPlugView::attached`; keeping initialization off the bridge main thread
+  prevents those plugin-owned windows from poisoning the bridge IPC pump.
 - Each slot GUI thread calls `OleInitialize` at start and `OleUninitialize` at
   exit. `CoInitializeEx(COINIT_APARTMENTTHREADED)` alone is not enough for
   plugin editor features that use OLE services such as context menus,
