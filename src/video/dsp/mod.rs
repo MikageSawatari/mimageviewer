@@ -100,6 +100,13 @@ pub struct DspBridge {
     /// Bridge-owned plugin surfaces should stay above the video only while
     /// mIV itself or one of its VST bridge processes is foreground.
     gui_app_active_effective: AtomicBool,
+    /// True while a background first-visible editor attach batch is running.
+    /// GUI attach can take seconds for some plugins, so VST button handling must
+    /// never wait for it on the egui/UI thread.
+    gui_show_all_in_progress: AtomicBool,
+    /// Latest requested all-GUI visibility. A background attach batch checks
+    /// this before applying final z-order so a quick hide request wins.
+    gui_all_visible_desired: AtomicBool,
     /// Debounce transient foreground changes so clicking the fullscreen
     /// viewport does not briefly drop plugin editors behind the video.
     gui_app_inactive_since: Mutex<Option<Instant>>,
@@ -200,6 +207,8 @@ impl DspBridge {
             session_disabled_reason: Mutex::new(None),
             gui_topmost_desired: AtomicBool::new(false),
             gui_app_active_effective: AtomicBool::new(true),
+            gui_show_all_in_progress: AtomicBool::new(false),
+            gui_all_visible_desired: AtomicBool::new(false),
             gui_app_inactive_since: Mutex::new(None),
             sample_rate: AtomicU32::new(0),
             main_hwnd: AtomicU64::new(0),
@@ -1041,7 +1050,6 @@ impl DspBridge {
                     return Err("プラグイン未ロード".to_string());
                 }
                 if slot.gui_hwnd != 0 {
-                    let hwnd = slot.gui_hwnd;
                     drop(inner);
                     if visible {
                         self.sync_existing_gui_owner_to_current_viewport();
@@ -1256,6 +1264,52 @@ impl DspBridge {
     /// true のスロットは、VST 全体トグルで show=true にしても表示しない
     /// (= ユーザーが個別に GUI × した状態を尊重)。
     pub fn set_all_guis_visible(&self, target_visible: bool) {
+        self.gui_all_visible_desired
+            .store(target_visible, Ordering::Release);
+        self.set_all_guis_visible_blocking(target_visible);
+    }
+
+    /// UI-facing VST-button path. Hiding existing GUI windows is quick and stays
+    /// synchronous, but first-visible editor attach may block inside a plugin for
+    /// many seconds, so showing missing editors runs on a background worker.
+    pub fn set_all_guis_visible_async(self: Arc<Self>, target_visible: bool) {
+        self.gui_all_visible_desired
+            .store(target_visible, Ordering::Release);
+        if !target_visible {
+            self.set_all_guis_visible_blocking(false);
+            return;
+        }
+
+        if self.gui_show_all_in_progress.swap(true, Ordering::AcqRel) {
+            crate::logger::log(
+                "[VST3 GUI] show-all already in progress; keeping latest visible request"
+                    .to_string(),
+            );
+            return;
+        }
+
+        let bridge = Arc::clone(&self);
+        if let Err(err) = std::thread::Builder::new()
+            .name("vst3-gui-show-all".to_string())
+            .spawn(move || {
+                crate::logger::log("[VST3 GUI] async show-all begin".to_string());
+                bridge.set_all_guis_visible_blocking(true);
+                if !bridge.gui_all_visible_desired.load(Ordering::Acquire) {
+                    bridge.set_all_guis_visible_blocking(false);
+                }
+                bridge
+                    .gui_show_all_in_progress
+                    .store(false, Ordering::Release);
+                crate::logger::log("[VST3 GUI] async show-all end".to_string());
+            })
+        {
+            self.gui_show_all_in_progress
+                .store(false, Ordering::Release);
+            crate::logger::log(format!("[VST3 GUI] failed to spawn async show-all: {err}"));
+        }
+    }
+
+    fn set_all_guis_visible_blocking(&self, target_visible: bool) {
         if !target_visible {
             // ── hide 経路: 現 z-order を snapshot してから全 hide ──
             let target_hwnds: Vec<u64> = {
@@ -1340,12 +1394,19 @@ impl DspBridge {
                         shown_hwnds.push(hwnd);
                     }
                     ShowAction::Create => {
-                        let _ = self.ensure_slot_gui_attached(idx, true, true);
+                        if let Err(err) = self.ensure_slot_gui_attached(idx, true, true) {
+                            crate::logger::log(format!(
+                                "[VST3 GUI] show-all attach failed idx={idx}: {err}"
+                            ));
+                            continue;
+                        }
                         let hwnd = {
                             let mut inner = self.inner.lock().unwrap();
                             if let Some(slot) = inner.slots.get_mut(idx) {
-                                slot.gui_visible = true;
-                                slot.user_hidden = false;
+                                if slot.gui_hwnd != 0 {
+                                    slot.gui_visible = true;
+                                    slot.user_hidden = false;
+                                }
                                 slot.gui_hwnd
                             } else {
                                 0
@@ -1374,7 +1435,7 @@ impl DspBridge {
                     restore_order.push(hwnd);
                 }
             }
-            if !restore_order.is_empty() {
+            if !restore_order.is_empty() && self.gui_all_visible_desired.load(Ordering::Acquire) {
                 let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
                 self.send_chain_visible(&restore_order, true, topmost);
             }

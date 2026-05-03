@@ -1239,7 +1239,8 @@ impl App {
                             if vst3_pressed {
                                 let opening = !self.show_vst3_manager;
                                 self.show_vst3_manager = opening;
-                                self.dsp_bridge.set_all_guis_visible(opening);
+                                std::sync::Arc::clone(&self.dsp_bridge)
+                                    .set_all_guis_visible_async(opening);
                                 self.settings.vst3_gui_visible = opening;
                                 self.settings.save();
                             }

@@ -197,6 +197,11 @@ Design rules:
   show/hide toggles after the first visible attach, at the cost of allowing
   plugins such as Insight 2 to report a latency change when their GUI is first
   opened.
+- First visible show must not block the egui/UI thread. The fullscreen VST
+  button shows/hides already-created editor HWNDs immediately, but missing
+  editor HWNDs are attached from a background worker. This preserves the fast
+  z-order toggle path after editors exist while preventing plugins that spend
+  seconds in `attached()` from freezing video playback or the fullscreen UI.
 - `query_state` / `restore_state` currently use the bridge audio-thread fence to
   avoid racing VST3 `process`. Keep that ownership explicit during the GUI
   thread refactor. If a plugin proves to require GUI-thread state I/O, add a
