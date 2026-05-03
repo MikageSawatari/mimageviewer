@@ -386,5 +386,11 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   preset state is not overwritten by the previously running chain. Plugin
   order, bypass, user-hidden GUI state, plugin state, and editor position/size
   are restored through the normal path.
+- Follow-up fix (2026-05-03): saving a chain slot snapshots the current
+  per-plugin GUI visibility into `user_hidden` when global VST GUI visibility is
+  on. Loading a slot restores global GUI visibility only after all plugins have
+  been added, and the manager panel keeps placeholder rows from
+  `settings.vst3_plugins` while the bridge is rebuilding. This avoids all-GUI
+  hidden loads and prevents the plugin list from growing one row at a time.
 - Follow-up: add a small rename UI for slot names. Phase 1 keeps existing names
   on overwrite and gives empty slots default names such as `Slot 1`.

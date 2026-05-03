@@ -77,6 +77,29 @@ impl App {
         updated
     }
 
+    /// VST3 全体表示中の per-plugin GUI 表示状態を `user_hidden` に同期する。
+    ///
+    /// 全体非表示 (`vst3_gui_visible=false`) のときは全 slot が見えなくなるため、
+    /// 個別 user-hidden と区別できない。保存時は全体表示中だけ実 HWND の可視状態を
+    /// 反映し、slot preset の「一部だけ非表示」を保持する。
+    pub(crate) fn snapshot_vst3_gui_visibility_into_settings(&mut self) -> usize {
+        if !self.dsp_bridge.is_enabled() || !self.settings.vst3_gui_visible {
+            return 0;
+        }
+        let snapshots = self.dsp_bridge.slots();
+        let mut updated = 0;
+        for slot in snapshots {
+            if let Some(entry) = self.find_vst3_entry_mut(&slot.plugin_path) {
+                let user_hidden = !slot.gui_visible;
+                if entry.user_hidden != user_hidden {
+                    entry.user_hidden = user_hidden;
+                    updated += 1;
+                }
+            }
+        }
+        updated
+    }
+
     /// 毎 frame 呼ぶ: 全プラグイン GUI ホストウィンドウからの close / resize シグナルを処理する。
     /// プラグインウィンドウの × ボタンで閉じられたスロットがあれば、settings 側の
     /// `user_hidden` を true に同期して永続化する (= 再起動後の VST 一括表示で skip)。
@@ -119,6 +142,7 @@ impl App {
 
         let states = self.snapshot_vst3_states_into_settings();
         let positions = self.snapshot_vst3_window_positions_into_settings();
+        let visibility = self.snapshot_vst3_gui_visibility_into_settings();
         let existing_name = self.settings.vst3_chain_slots.slots[slot_idx]
             .as_ref()
             .map(|slot| slot.name.trim().to_string())
@@ -135,8 +159,8 @@ impl App {
         });
         self.settings.save();
         crate::logger::log(format!(
-            "[VST3 chain slot] saved slot={} plugins={} state_updates={} position_updates={}",
-            key_label, plugin_count, states, positions
+            "[VST3 chain slot] saved slot={} plugins={} state_updates={} position_updates={} visibility_updates={}",
+            key_label, plugin_count, states, positions, visibility
         ));
         self.show_feedback_toast(format!(
             "[VST3 Slot {key_label}: {name} 保存 ({plugin_count}件)]"
@@ -199,6 +223,7 @@ impl App {
         }
         let bridge = self.dsp_bridge.clone();
         let plugins = self.settings.vst3_plugins.clone();
+        let gui_visible = self.settings.vst3_gui_visible;
         std::thread::Builder::new()
             .name("vst3-chain-rebuild".into())
             .spawn(move || {
@@ -224,6 +249,9 @@ impl App {
                             entry.path
                         ));
                     }
+                }
+                if gui_visible {
+                    bridge.set_all_guis_visible(true);
                 }
             })
             .ok();

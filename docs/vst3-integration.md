@@ -228,6 +228,11 @@ settings.json に以下を保存する:
 - `vst3_chain_slots`: 再生中パネルから保存・読込する 10 個のチェーンスロット。
   各 slot は `vst3_plugins` と同じ plugin entry 配列を持つため、plugin bypass、
   `user_hidden`、state chunk、GUI 位置/サイズ、動画表示モードをまとめて復元できる。
+  2026-05-03 follow-up: Save snapshots the current per-plugin GUI visibility
+  into `user_hidden` when global VST GUI visibility is on. Load restores global
+  GUI visibility only after all plugins have been added, and the manager panel
+  uses `vst3_plugins` as disabled placeholder rows while the bridge rebuilds so
+  the plugin list count stays stable.
 
 bridge プロトコル拡張 (= Phase 0b に追加):
 

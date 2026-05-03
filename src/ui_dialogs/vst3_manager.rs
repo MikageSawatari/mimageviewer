@@ -34,6 +34,15 @@ use crate::adjustment::slot_key_label;
 use crate::app::App;
 use crate::video::dsp::{DspState, SlotState};
 
+fn vst3_plugin_label_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .or_else(|| std::path::Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "(unknown)".to_string())
+}
+
 fn vst3_gui_visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
     if response.hovered() {
@@ -221,7 +230,8 @@ impl App {
             ui.separator();
 
             // ── プラグイン一覧 (ON/OFF + GUI のみ) ──
-            if slots.is_empty() {
+            let display_count = slots.len().max(self.settings.vst3_plugins.len());
+            if display_count == 0 {
                 ui.label(
                     egui::RichText::new("プラグイン未設定")
                         .color(egui::Color32::from_rgb(190, 190, 190)),
@@ -235,8 +245,9 @@ impl App {
                 );
             } else {
                 let sample_rate = self.dsp_bridge.sample_rate();
-                for (idx, slot) in slots.iter().enumerate() {
+                for idx in 0..display_count {
                     ui.horizontal(|ui| {
+                        if let Some(slot) = slots.get(idx) {
                         // ON/OFF: bypass を反転して「ON = 効いている」表示にする
                         let mut on = !slot.bypass;
                         let label = format!(
@@ -327,6 +338,30 @@ impl App {
                                 }
                             },
                         );
+                        } else if let Some(entry) = self.settings.vst3_plugins.get(idx) {
+                            let mut on = !entry.bypass;
+                            ui.add_enabled(
+                                false,
+                                egui::Checkbox::new(
+                                    &mut on,
+                                    format!(
+                                        "{}. {} (...)",
+                                        idx + 1,
+                                        vst3_plugin_label_from_path(&entry.path)
+                                    ),
+                                ),
+                            )
+                            .on_hover_text("VST3チェーンを再構築中です");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_enabled_ui(false, |ui| {
+                                        let _ =
+                                            vst3_gui_visibility_button(ui, !entry.user_hidden);
+                                    });
+                                },
+                            );
+                        }
                     });
                 }
             }
