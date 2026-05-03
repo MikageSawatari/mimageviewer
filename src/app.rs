@@ -10442,7 +10442,9 @@ impl App {
             // editors, but doing it here keeps bridge-owned plugin surfaces
             // from lingering for a frame after the fullscreen viewport closes.
             self.dsp_bridge.set_all_guis_visible(false);
+            self.dsp_bridge.set_all_guis_topmost(false);
             self.show_vst3_manager = false;
+            self.vst3_was_fullscreen = false;
             if self.settings.vst3_gui_visible {
                 self.settings.vst3_gui_visible = false;
                 self.settings.save();
