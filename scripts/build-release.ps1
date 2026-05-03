@@ -77,6 +77,30 @@ $appDataProcessNames = @(
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
+$appDataVst3Bridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
+
+function Ensure-VendorVst3BridgeFromCache {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $VendorExe,
+        [string] $Reason = 'VST3 bridge rebuild skipped'
+    )
+
+    if (Test-Path $VendorExe) {
+        return $true
+    }
+    if (-not (Test-Path $appDataVst3Bridge)) {
+        return $false
+    }
+
+    $vendorDir = Split-Path -Parent $VendorExe
+    if (-not (Test-Path $vendorDir)) {
+        New-Item -ItemType Directory -Path $vendorDir | Out-Null
+    }
+    Copy-Item -LiteralPath $appDataVst3Bridge -Destination $VendorExe -Force
+    Write-Warning ("[build-release] {0}; copied extracted bridge cache back to vendor: {1}" -f $Reason, $VendorExe)
+    return $true
+}
 
 # Match all "mimageviewer*" prefix processes (Get-Process -Name does not accept
 # wildcards, hence the Where-Object filter).
@@ -192,21 +216,32 @@ if (-not $SkipVst3Bridge) {
         throw "[build-release] cmake was not found. Install CMake or pass -SkipVst3Bridge to reuse the existing vendor bridge."
     }
     if (-not (Test-Path $vst3SdkLicense)) {
-        throw "[build-release] VST3 SDK was not found at vendor\vst3sdk. Run scripts\setup-vst3-sdk.sh or pass -SkipVst3Bridge to reuse the existing vendor bridge."
+        if (Ensure-VendorVst3BridgeFromCache -VendorExe $vst3VendorExe -Reason 'VST3 SDK was not found at vendor\vst3sdk') {
+            Write-Warning "[build-release] reusing existing VST3 bridge. Run scripts\setup-vst3-sdk.sh to rebuild bridge changes."
+            $SkipVst3Bridge = $true
+        } else {
+            throw "[build-release] VST3 SDK was not found at vendor\vst3sdk, and no reusable bridge exe was found in vendor\vst3-host or APPDATA. Run scripts\setup-vst3-sdk.sh, or restore an existing vendor bridge and pass -SkipVst3Bridge."
+        }
     }
-    if (-not (Test-Path (Join-Path -Path $vst3BuildDir -ChildPath 'CMakeCache.txt'))) {
+    if (-not $SkipVst3Bridge -and -not (Test-Path (Join-Path -Path $vst3BuildDir -ChildPath 'CMakeCache.txt'))) {
         Write-Host "[build-release] configuring VST3 bridge (cmake)"
         & cmake -S $vst3SourceDir -B $vst3BuildDir -G "Visual Studio 17 2022" -A x64
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
-    Write-Host "[build-release] (1/3) cmake --build crates/vst3-host/build --config Release"
-    & cmake --build $vst3BuildDir --config Release
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    if (-not (Test-Path $vst3VendorExe)) {
-        throw "[build-release] VST3 bridge build did not produce $vst3VendorExe"
+    if (-not $SkipVst3Bridge) {
+        Write-Host "[build-release] (1/3) cmake --build crates/vst3-host/build --config Release"
+        & cmake --build $vst3BuildDir --config Release
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if (-not (Test-Path $vst3VendorExe)) {
+            throw "[build-release] VST3 bridge build did not produce $vst3VendorExe"
+        }
     }
 } else {
+    $vst3VendorExe = Join-Path -Path $repoRoot -ChildPath 'vendor\vst3-host\mimageviewer-vst3-host.exe'
+    if (-not (Ensure-VendorVst3BridgeFromCache -VendorExe $vst3VendorExe -Reason 'VST3 bridge rebuild skipped')) {
+        throw "[build-release] -SkipVst3Bridge was specified, but no reusable bridge exe was found in vendor\vst3-host or APPDATA."
+    }
     Write-Warning "[build-release] skipping VST3 bridge rebuild; core will embed the existing vendor/vst3-host exe."
 }
 
