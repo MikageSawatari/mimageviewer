@@ -588,6 +588,11 @@ impl DspBridge {
             return Err("VST3 が無効化されています (enable を先に)".to_string());
         }
 
+        crate::logger::log(format!(
+            "[VST3 GUI] add_plugin request path=\"{}\" bypass={} hidden={} initial_pos={:?} initial_size={:?}",
+            plugin_path, bypass, user_hidden, initial_window_pos, initial_window_size
+        ));
+
         let (bridge_arc, slot_id) = {
             let inner = self.inner.lock().unwrap();
             if let Some(first) = inner.slots.first() {
@@ -1183,6 +1188,18 @@ impl DspBridge {
         if owner_hwnd == 0 {
             return Err("main HWND not ready".to_string());
         }
+        crate::logger::log(format!(
+            "[VST3 GUI] show_gui request idx={} slot={} name=\"{}\" visible={} initial_pos={:?} initial_size={:?} pref={}x{} resizable={}",
+            idx,
+            slot_id,
+            plugin_name,
+            visible,
+            initial_pos,
+            initial_size,
+            pref_w,
+            pref_h,
+            resizable
+        ));
 
         // ─ Step 3: bridge に attach 命令 (Mutex 外、bridge_arc 経由) ─
         bridge_arc

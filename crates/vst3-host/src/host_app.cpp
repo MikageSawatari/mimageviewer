@@ -123,10 +123,10 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
     // WM_ENTERSIZEMOVE-EXITSIZEMOVE 中だけ SetWindowPos を抑止する。
     // 直近 WM_SIZE の時間ベース抑止は、プラグイン内蔵 resize handle から来る
     // 正規 resizeView まで捨ててしまい、外枠と editor 内部サイズの不一致を作る。
-    bool suppressed = user_resizing_;
+    bool suppressed = user_resizing_ || !host_resize_enabled_;
     if (suppressed || w <= 0 || h <= 0) {
         std::fprintf(stderr,
-                     "[BRIDGE] resizeView: rect=(%d,%d,%d,%d) size=%dx%d suppressed=%d user_resizing=%d last_user_resize_ms=%llu\n",
+                     "[BRIDGE] resizeView: rect=(%d,%d,%d,%d) size=%dx%d suppressed=%d user_resizing=%d host_resize_enabled=%d last_user_resize_ms=%llu\n",
                      newSize->left,
                      newSize->top,
                      newSize->right,
@@ -135,6 +135,7 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
                      h,
                      suppressed ? 1 : 0,
                      user_resizing_ ? 1 : 0,
+                     host_resize_enabled_ ? 1 : 0,
                      static_cast<unsigned long long>(last_user_resize_tick_));
     }
     if (host_hwnd_ && w > 0 && h > 0 && !suppressed) {

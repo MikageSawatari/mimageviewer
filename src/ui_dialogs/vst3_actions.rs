@@ -67,7 +67,12 @@ impl App {
             if let Some(entry) = self.find_vst3_entry_mut(&path) {
                 let new_pos = Some((x, y));
                 let new_size = Some((w, h));
-                if entry.gui_pos != new_pos || entry.gui_size != new_size {
+                let changed = entry.gui_pos != new_pos || entry.gui_size != new_size;
+                crate::logger::log(format!(
+                    "[VST3 window snapshot] path=\"{}\" rect=({},{} {}x{}) changed={}",
+                    path, x, y, w, h, changed
+                ));
+                if changed {
                     entry.gui_pos = new_pos;
                     entry.gui_size = new_size;
                     updated += 1;
@@ -157,6 +162,19 @@ impl App {
             gui_visible: self.settings.vst3_gui_visible,
             video_compact: self.settings.vst3_video_compact,
         });
+        if let Some(slot) = self.settings.vst3_chain_slots.slots[slot_idx].as_ref() {
+            for (plugin_idx, entry) in slot.plugins.iter().enumerate() {
+                crate::logger::log(format!(
+                    "[VST3 chain slot] save slot={} plugin={} path=\"{}\" gui_pos={:?} gui_size={:?} hidden={}",
+                    key_label,
+                    plugin_idx,
+                    entry.path,
+                    entry.gui_pos,
+                    entry.gui_size,
+                    entry.user_hidden
+                ));
+            }
+        }
         self.settings.save();
         crate::logger::log(format!(
             "[VST3 chain slot] saved slot={} plugins={} state_updates={} position_updates={} visibility_updates={}",
@@ -181,6 +199,12 @@ impl App {
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         let name = slot.name.clone();
         let plugin_count = slot.plugins.len();
+        for (plugin_idx, entry) in slot.plugins.iter().enumerate() {
+            crate::logger::log(format!(
+                "[VST3 chain slot] load slot={} plugin={} path=\"{}\" gui_pos={:?} gui_size={:?} hidden={}",
+                key_label, plugin_idx, entry.path, entry.gui_pos, entry.gui_size, entry.user_hidden
+            ));
+        }
         self.settings.vst3_plugins = slot.plugins;
         self.settings.vst3_gui_visible = slot.gui_visible;
         self.settings.vst3_video_compact = slot.video_compact;

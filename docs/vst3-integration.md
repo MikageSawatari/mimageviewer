@@ -365,3 +365,15 @@ calls as the previous startup path. Loading is intentionally sequential for now
 because the Rust-side startup protocol sends one command at a time; the bridge's
 per-slot GUI/load threads make future batch or parallel loading possible without
 changing the fullscreen waiting behavior.
+
+## 2026-05 fixed-size editor restore policy
+
+Some fixed-size VST3 editors (`IPlugView::canResize() == false`) still call
+`IPlugFrame::resizeView` during `attached()` or the first `onSize()` to request
+their natural editor size. When mIV is restoring a user-saved outer editor shell
+size, that plugin request must not resize the host-owned shell back to the
+natural size. During the initial restored attach for fixed-size plugins, the
+bridge forwards `onSize()` to the plugin but temporarily suppresses the host
+HWND `SetWindowPos` side effect from `resizeView`. After the restored attach
+settles, host resizing is re-enabled so explicit plugin/user resize paths keep
+their existing behavior.

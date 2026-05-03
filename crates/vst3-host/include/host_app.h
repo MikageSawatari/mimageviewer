@@ -58,6 +58,10 @@ public:
     /// resizeView で SetWindowPos するために必要 (= プロセス境界をまたぐ HWND
     /// 操作も Win32 API は許容)。
     void set_host_hwnd(void* hwnd) { host_hwnd_ = hwnd; }
+    /// When false, `resizeView` still forwards `onSize` to the plugin view but
+    /// does not resize the host outer HWND. Used for fixed-size plugins after
+    /// restoring a user-saved outer shell size.
+    void set_host_resize_enabled(bool enabled) { host_resize_enabled_ = enabled; }
 
     /// ホスト主導の `onSize` を送る直前に呼ぶ。ログ診断用に時刻を保持するが、
     /// `resizeView` の抑止判定は `user_resizing_` のみで行う。直近 WM_SIZE の
@@ -85,6 +89,7 @@ private:
     /// host wndproc の WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE で true/false が
     /// 設定される。true 中は resizeView の SetWindowPos を常にスキップする。
     bool user_resizing_ = false;
+    bool host_resize_enabled_ = true;
 };
 
 class ComponentHandler : public Steinberg::Vst::IComponentHandler {

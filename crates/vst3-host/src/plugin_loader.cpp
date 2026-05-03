@@ -1494,12 +1494,19 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     }
 
     plug_frame_->set_host_hwnd(frame_hwnd);
+    const bool suppress_host_resize_for_restore = options.has_initial_size && !options.resizable;
+    plug_frame_->set_host_resize_enabled(!suppress_host_resize_for_restore);
+    if (suppress_host_resize_for_restore) {
+        blog("show_gui: suppress host resizeView during fixed-size restore plugin=\"%s\"",
+             plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str());
+    }
     blog("show_gui: attached(hwnd, HWND) gui_tid=%lu frame=0x%llx child=0x%llx",
          GetCurrentThreadId(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(frame_hwnd)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(attach_hwnd)));
     if (view_->attached(attach_hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
         error_out = "attached() failed";
+        plug_frame_->set_host_resize_enabled(true);
         if (IsWindow(frame_hwnd)) {
             DestroyWindow(frame_hwnd);
         }
@@ -1558,6 +1565,11 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         last_gui_width_ = 0;
         last_gui_height_ = 0;
         blog("show_gui: getSize failed");
+    }
+    if (suppress_host_resize_for_restore) {
+        plug_frame_->set_host_resize_enabled(true);
+        blog("show_gui: host resizeView re-enabled after fixed-size restore plugin=\"%s\"",
+             plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str());
     }
     gui_surface_visible_ = visible;
     gui_app_active_ = true;
