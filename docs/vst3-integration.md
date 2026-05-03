@@ -121,7 +121,7 @@ include_bytes! でメイン exe に埋め込み、初回 enable 時に
 | `src/video/dsp/scanner.rs` | VST3 plugin scan (`%COMMONPROGRAMFILES%\VST3\` 等) | **新規** (testerからポート) |
 | `src/video/dsp/gui.rs` | プラグイン GUI 用の Win32 親ウィンドウ管理 | **新規** (testerからポート) |
 | `src/video/dsp/extract.rs` | bridge exe の APPDATA 展開 (PDFium pattern) | **新規** |
-| `src/settings.rs` | VST3 設定 (`vst3_enabled`, `vst3_plugins`, `vst3_gui_visible`) | 拡張 |
+| `src/settings.rs` | VST3 設定 (`vst3_enabled`, `vst3_plugins`, `vst3_gui_visible`, `vst3_chain_slots`) | 拡張 |
 | `src/ui_dialogs/preferences.rs` | 環境設定→VST3 プラグインページ | 拡張 |
 | `src/ui_dialogs/vst3_manager.rs` | 動画再生中の VST3 プレイバックパネル | **新規** |
 | `src/video/audio.rs` | pump thread に DspBridge 経由処理を挿入 | 拡張 |
@@ -199,7 +199,18 @@ settings.json に以下を保存する:
       "window_rect": null
     }
   ],
-  "vst3_gui_visible": false
+  "vst3_gui_visible": false,
+  "vst3_video_compact": false,
+  "vst3_chain_slots": {
+    "slots": [
+      {
+        "name": "Slot 1",
+        "plugins": [ /* same schema as vst3_plugins */ ],
+        "gui_visible": true,
+        "video_compact": false
+      }
+    ]
+  }
 }
 ```
 
@@ -213,6 +224,10 @@ settings.json に以下を保存する:
   表示中はオレンジ、非表示は灰色で描画する。
 - `window_rect`: plugin GUI の位置とサイズ
 - `vst3_gui_visible`: 再生中パネルからの全体表示状態
+- `vst3_video_compact`: 再生中パネルの動画フル / 右上 1/4 表示状態
+- `vst3_chain_slots`: 再生中パネルから保存・読込する 10 個のチェーンスロット。
+  各 slot は `vst3_plugins` と同じ plugin entry 配列を持つため、plugin bypass、
+  `user_hidden`、state chunk、GUI 位置/サイズ、動画表示モードをまとめて復元できる。
 
 bridge プロトコル拡張 (= Phase 0b に追加):
 

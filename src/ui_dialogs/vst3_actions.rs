@@ -6,7 +6,7 @@
 #![cfg(windows)]
 
 use crate::app::App;
-use crate::settings::Vst3PluginEntry;
+use crate::settings::{Vst3ChainPresetSlot, Vst3PluginEntry};
 
 impl App {
     /// `settings.vst3_plugins` を **plugin_path** で検索する共通 helper。
@@ -110,6 +110,67 @@ impl App {
         }
     }
 
+    /// 現在の VST3 チェーンを 10 個のスロットへ保存する。
+    /// 保存直前に plugin state と editor window 位置/サイズを snapshot する。
+    pub(crate) fn save_vst3_chain_slot(&mut self, slot_idx: usize) {
+        if slot_idx >= self.settings.vst3_chain_slots.slots.len() {
+            return;
+        }
+
+        let states = self.snapshot_vst3_states_into_settings();
+        let positions = self.snapshot_vst3_window_positions_into_settings();
+        let existing_name = self.settings.vst3_chain_slots.slots[slot_idx]
+            .as_ref()
+            .map(|slot| slot.name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        let name = existing_name.unwrap_or_else(|| format!("Slot {key_label}"));
+        let plugin_count = self.settings.vst3_plugins.len();
+
+        self.settings.vst3_chain_slots.slots[slot_idx] = Some(Vst3ChainPresetSlot {
+            name: name.clone(),
+            plugins: self.settings.vst3_plugins.clone(),
+            gui_visible: self.settings.vst3_gui_visible,
+            video_compact: self.settings.vst3_video_compact,
+        });
+        self.settings.save();
+        crate::logger::log(format!(
+            "[VST3 chain slot] saved slot={} plugins={} state_updates={} position_updates={}",
+            key_label, plugin_count, states, positions
+        ));
+        self.show_feedback_toast(format!(
+            "[VST3 Slot {key_label}: {name} 保存 ({plugin_count}件)]"
+        ));
+    }
+
+    pub(crate) fn load_vst3_chain_slot(&mut self, slot_idx: usize) {
+        if slot_idx >= self.settings.vst3_chain_slots.slots.len() {
+            return;
+        }
+
+        let Some(slot) = self.settings.vst3_chain_slots.slots[slot_idx].clone() else {
+            let key_label = crate::adjustment::slot_key_label(slot_idx);
+            self.show_feedback_toast(format!("[VST3 Slot {key_label} は空です]"));
+            return;
+        };
+
+        let key_label = crate::adjustment::slot_key_label(slot_idx);
+        let name = slot.name.clone();
+        let plugin_count = slot.plugins.len();
+        self.settings.vst3_plugins = slot.plugins;
+        self.settings.vst3_gui_visible = slot.gui_visible;
+        self.settings.vst3_video_compact = slot.video_compact;
+        self.settings.save();
+        self.kick_off_vst3_chain_rebuild_without_snapshot();
+        crate::logger::log(format!(
+            "[VST3 chain slot] loaded slot={} plugins={} name=\"{}\"",
+            key_label, plugin_count, name
+        ));
+        self.show_feedback_toast(format!(
+            "[VST3 Slot {key_label}: {name} 読込 ({plugin_count}件)]"
+        ));
+    }
+
     /// `settings.vst3_plugins` を bridge に再反映する (= 順序・追加・削除を bridge へ伝搬)。
     /// worker thread で bridge を nuke + re-enable + チェーン全部 add_plugin する。
     /// 環境設定→VST3 ページの編集後、enable トグル後に呼ぶ。
@@ -118,13 +179,23 @@ impl App {
     /// (= 動作中の EQ カーブ等を re-add 時の `entry.state` で復元するため)。
     /// snapshot しないとチェーン編集 OK の度に EQ がデフォルトに戻る。
     pub(crate) fn kick_off_vst3_chain_rebuild(&mut self) {
+        self.kick_off_vst3_chain_rebuild_impl(true);
+    }
+
+    fn kick_off_vst3_chain_rebuild_without_snapshot(&mut self) {
+        self.kick_off_vst3_chain_rebuild_impl(false);
+    }
+
+    fn kick_off_vst3_chain_rebuild_impl(&mut self, snapshot_runtime: bool) {
         if !self.settings.vst3_enabled {
             return;
         }
-        let states = self.snapshot_vst3_states_into_settings();
-        let positions = self.snapshot_vst3_window_positions_into_settings();
-        if states > 0 || positions > 0 {
-            self.settings.save();
+        if snapshot_runtime {
+            let states = self.snapshot_vst3_states_into_settings();
+            let positions = self.snapshot_vst3_window_positions_into_settings();
+            if states > 0 || positions > 0 {
+                self.settings.save();
+            }
         }
         let bridge = self.dsp_bridge.clone();
         let plugins = self.settings.vst3_plugins.clone();

@@ -880,6 +880,8 @@ pub struct Settings {
     /// true: 動画を右上 1/4 (幅・高さ各 1/2 = 面積 1/4) に縮小、左下 3/4 はプラグイン GUI 用に空く。
     #[serde(default)]
     pub vst3_video_compact: bool,
+    #[serde(default)]
+    pub vst3_chain_slots: Vst3ChainPresetSlots,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -916,6 +918,22 @@ pub struct Vst3PluginEntry {
     /// (記録は残しておくが復元時の参照は resizable プラグインのみに限定)。
     #[serde(default)]
     pub gui_size: Option<(u32, u32)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct Vst3ChainPresetSlot {
+    pub name: String,
+    #[serde(default)]
+    pub plugins: Vec<Vst3PluginEntry>,
+    #[serde(default = "default_true")]
+    pub gui_visible: bool,
+    #[serde(default)]
+    pub video_compact: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct Vst3ChainPresetSlots {
+    pub slots: [Option<Vst3ChainPresetSlot>; 10],
 }
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
@@ -1178,6 +1196,7 @@ impl Default for Settings {
             vst3_plugin_state: None,
             vst3_gui_visible: true,
             vst3_video_compact: false,
+            vst3_chain_slots: Vst3ChainPresetSlots::default(),
         }
     }
 }
@@ -1352,6 +1371,7 @@ impl Settings {
         // `vst3_video_compact` も同様 (= プレイバックパネルで切替)。
         self.vst3_gui_visible = src.vst3_gui_visible;
         self.vst3_video_compact = src.vst3_video_compact;
+        self.vst3_chain_slots = std::mem::take(&mut src.vst3_chain_slots);
     }
 
     pub fn save(&self) {
@@ -1641,6 +1661,43 @@ mod tests {
             let back: IndexerSpeedProfile = serde_json::from_str(&json).unwrap();
             assert_eq!(back, *p);
         }
+    }
+
+    #[test]
+    fn vst3_chain_slots_default_when_missing() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(loaded.vst3_chain_slots.slots.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn vst3_chain_slots_roundtrip() {
+        let mut settings = Settings::default();
+        settings.vst3_chain_slots.slots[0] = Some(Vst3ChainPresetSlot {
+            name: "Mix".to_string(),
+            plugins: vec![Vst3PluginEntry {
+                path: r"C:\VST3\Test.vst3".to_string(),
+                bypass: true,
+                state: Some("state".to_string()),
+                user_hidden: true,
+                gui_pos: Some((12, 34)),
+                gui_size: Some((640, 480)),
+            }],
+            gui_visible: false,
+            video_compact: true,
+        });
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
+        let slot = loaded.vst3_chain_slots.slots[0].as_ref().unwrap();
+        assert_eq!(slot.name, "Mix");
+        assert!(!slot.gui_visible);
+        assert!(slot.video_compact);
+        assert_eq!(slot.plugins.len(), 1);
+        assert_eq!(slot.plugins[0].path, r"C:\VST3\Test.vst3");
+        assert!(slot.plugins[0].bypass);
+        assert_eq!(slot.plugins[0].state.as_deref(), Some("state"));
+        assert_eq!(slot.plugins[0].gui_pos, Some((12, 34)));
+        assert_eq!(slot.plugins[0].gui_size, Some((640, 480)));
     }
 
     // -- SortOrder --

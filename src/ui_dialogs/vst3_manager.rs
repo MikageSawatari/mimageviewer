@@ -30,6 +30,7 @@
 
 #![cfg(windows)]
 
+use crate::adjustment::slot_key_label;
 use crate::app::App;
 use crate::video::dsp::{DspState, SlotState};
 
@@ -87,6 +88,8 @@ impl App {
         let mut clicked_show_gui: Option<(usize, String)> = None;
         let mut clicked_hide_gui: Option<(usize, String)> = None;
         let mut clicked_toggle_bypass: Option<(usize, String, bool)> = None;
+        let mut clicked_load_chain_slot: Option<usize> = None;
+        let mut clicked_save_chain_slot: Option<usize> = None;
 
         let bridge = self.dsp_bridge.clone();
         let state = bridge.state();
@@ -330,6 +333,56 @@ impl App {
 
             ui.separator();
             ui.label(
+                egui::RichText::new("チェーンスロット")
+                    .small()
+                    .strong()
+                    .color(egui::Color32::from_rgb(210, 210, 210)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("読込").small());
+                for slot_idx in 0..10 {
+                    let key = slot_key_label(slot_idx);
+                    let slot = self.settings.vst3_chain_slots.slots[slot_idx].as_ref();
+                    let response = ui
+                        .add_enabled(slot.is_some(), egui::Button::new(key.clone()).small())
+                        .on_hover_text(match slot {
+                            Some(slot) => format!(
+                                "{}\n{} 件 / GUI: {} / 動画: {}",
+                                slot.name,
+                                slot.plugins.len(),
+                                if slot.gui_visible { "表示" } else { "非表示" },
+                                if slot.video_compact { "右上1/4" } else { "フル" }
+                            ),
+                            None => format!("VST3 Slot {key} は空です"),
+                        });
+                    if response.clicked() {
+                        clicked_load_chain_slot = Some(slot_idx);
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("保存").small());
+                for slot_idx in 0..10 {
+                    let key = slot_key_label(slot_idx);
+                    let slot = self.settings.vst3_chain_slots.slots[slot_idx].as_ref();
+                    let response = ui.add(egui::Button::new(key.clone()).small()).on_hover_text(
+                        match slot {
+                            Some(slot) => format!(
+                                "現在のVST3チェーンで上書き\n{} / {} 件",
+                                slot.name,
+                                slot.plugins.len()
+                            ),
+                            None => "現在のVST3チェーンを保存".to_string(),
+                        },
+                    );
+                    if response.clicked() {
+                        clicked_save_chain_slot = Some(slot_idx);
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.label(
                 egui::RichText::new(
                     "プラグインの追加・並べ替えは 環境設定→VST3 プラグイン から行います。",
                 )
@@ -340,6 +393,12 @@ impl App {
 
         // ── ボタンクリック処理 (Window closure 外で実行 = self の借用解放後) ──
         // bridge への命令は **bridge slot idx**、settings 検索は **plugin_path** で行う。
+        if let Some(slot_idx) = clicked_save_chain_slot {
+            self.save_vst3_chain_slot(slot_idx);
+        }
+        if let Some(slot_idx) = clicked_load_chain_slot {
+            self.load_vst3_chain_slot(slot_idx);
+        }
         if let Some((idx, path)) = clicked_show_gui {
             std::sync::Arc::clone(&self.dsp_bridge).show_slot_gui_async(idx);
             // 明示的な show は user_hidden 解除も意味する (= 起動時 settings から

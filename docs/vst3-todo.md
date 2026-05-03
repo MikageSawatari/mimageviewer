@@ -369,5 +369,22 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   as the old host close signal. Resize invalidates both the outer frame and
   inner plugin host to avoid stale pixels, and the plugin host avoids mouse
   activation to keep the mIV window group from surfacing unexpectedly.
-- Follow-up: a fully custom title bar with inline power/bypass and latency
-  control still needs a Rust-side bypass IPC event and settings sync.
+- Phase 2 controls done: the custom title bar now has an inline power/bypass
+  toggle and latency readout. The bypass toggle uses the same Rust
+  `DspBridge::set_bypass` path as the playback panel, keeping settings and the
+  editor chrome synchronized.
+
+## 2026-05 chain preset slots
+
+- Phase 1 done: the playback VST3 panel has 10 chain slots with Save/Load
+  buttons.
+- Save snapshots current plugin state and editor window positions first, then
+  stores `vst3_plugins`, `vst3_gui_visible`, and `vst3_video_compact` in
+  `settings.vst3_chain_slots`.
+- Load replaces the current chain settings and reuses the existing chain
+  rebuild worker without taking a fresh runtime snapshot first, so the loaded
+  preset state is not overwritten by the previously running chain. Plugin
+  order, bypass, user-hidden GUI state, plugin state, and editor position/size
+  are restored through the normal path.
+- Follow-up: add a small rename UI for slot names. Phase 1 keeps existing names
+  on overwrite and gives empty slots default names such as `Slot 1`.
