@@ -149,16 +149,16 @@ Design rules:
   `set_gui_app_active`, `notify_host_resize`) are posted and coalesced where
   possible.
 - Synchronous GUI marshals are bounded. If a plugin blocks inside editor
-  `attached`, `getSize`, or another required reply path, the bridge logs a
-  `plugin GUI task timeout ... gui_tid=...` line and returns an error instead of
-  blocking chain initialization or the control IPC thread indefinitely.
-- A slot that times out in an editor operation is quarantined. Its stuck GUI
-  helper is abandoned for the lifetime of the bridge process, future GUI
-  commands for that slot become no-ops, and the rest of the chain may continue
-  only while the bridge control thread keeps accepting IPC. We intentionally do
-  not use `TerminateThread`; a plugin that
-  never returns from `attached()` is leaked until bridge process exit rather
-  than risking heap or DLL state corruption.
+  `attached`, `getSize`, or another required reply path, the bridge treats the
+  whole bridge process as poisoned and exits. Hidden plugin helper windows can
+  be created during `initialize` on the bridge main thread, so a single stuck
+  editor can later block bridge-main `DispatchMessageW` even if the slot itself
+  has been quarantined. Killing the bridge process is the safe recovery path for
+  the current architecture; Rust disables VST3 for the rest of the session and
+  keeps playback/UI responsive.
+- We intentionally do not use `TerminateThread`. A plugin that never returns
+  from `attached()` is cleaned up by ending the bridge process rather than
+  killing only the stuck thread and risking heap or DLL state corruption.
 - Startup loading also uses bounded waits and logs both the Rust-side
   `[VST3 startup] loading ...` line and the bridge-side `add_plugin start ...`
   line. If a plugin blocks before it can emit `loaded`, the startup worker times
@@ -180,6 +180,9 @@ Design rules:
   HWND, and elapsed dispatch time while the main thread is pumping messages.
   This is required because some plugins create hidden main-thread windows even
   after editor HWND ownership moved to per-slot GUI threads.
+- After plugin load, the bridge dumps HWND/class/title information for windows
+  owned by the bridge main thread. This helps identify plugin helper windows
+  that should move with the future lifecycle refactor.
 - Chain-wide owner, visibility, and z-order batches skip quarantined editor
   slots. Once an editor helper is abandoned, the bridge must not keep touching
   that slot's HWND from chain-level operations.

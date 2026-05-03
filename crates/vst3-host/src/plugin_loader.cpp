@@ -237,6 +237,18 @@ constexpr auto kGuiQueryTimeout = std::chrono::milliseconds(2000);
 constexpr auto kGuiShowTimeout = std::chrono::milliseconds(3000);
 constexpr auto kGuiMutationTimeout = std::chrono::milliseconds(1000);
 constexpr DWORD kGuiShutdownTimeoutMs = 2000;
+
+[[noreturn]] void terminate_bridge_after_gui_timeout(const char* label,
+                                                     DWORD gui_tid,
+                                                     unsigned long long timeout_ms) {
+    blog("VST3 bridge poisoned by plugin GUI timeout label=%s gui_tid=%lu timeout_ms=%llu; terminating bridge process",
+         label ? label : "(unknown)",
+         gui_tid,
+         timeout_ms);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    ::ExitProcess(1);
+}
 }
 
 class PluginGuiThread {
@@ -275,11 +287,15 @@ public:
             (*task)();
         });
         if (future.wait_for(timeout) != std::future_status::ready) {
+            DWORD gui_tid = thread_id_.load(std::memory_order_acquire);
             blog("plugin GUI task timeout label=%s gui_tid=%lu timeout_ms=%llu",
                  label ? label : "(unknown)",
-                 thread_id_.load(std::memory_order_acquire),
+                 gui_tid,
                  static_cast<unsigned long long>(timeout.count()));
-            return std::nullopt;
+            terminate_bridge_after_gui_timeout(
+                label,
+                gui_tid,
+                static_cast<unsigned long long>(timeout.count()));
         }
         return future.get();
     }
@@ -299,11 +315,15 @@ public:
             (*task)();
         });
         if (future.wait_for(timeout) != std::future_status::ready) {
+            DWORD gui_tid = thread_id_.load(std::memory_order_acquire);
             blog("plugin GUI task timeout label=%s gui_tid=%lu timeout_ms=%llu",
                  label ? label : "(unknown)",
-                 thread_id_.load(std::memory_order_acquire),
+                 gui_tid,
                  static_cast<unsigned long long>(timeout.count()));
-            return false;
+            terminate_bridge_after_gui_timeout(
+                label,
+                gui_tid,
+                static_cast<unsigned long long>(timeout.count()));
         }
         future.get();
         return true;

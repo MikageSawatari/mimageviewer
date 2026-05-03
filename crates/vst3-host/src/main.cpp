@@ -168,6 +168,41 @@ static void send_event_error(const std::string& detail) {
     write_message(msg);
 }
 
+static std::string wide_to_utf8(const wchar_t* text) {
+    if (!text || !*text) {
+        return {};
+    }
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static BOOL CALLBACK enum_current_thread_window_proc(HWND hwnd, LPARAM param) {
+    const char* label = reinterpret_cast<const char*>(param);
+    wchar_t class_name[256] = {};
+    wchar_t title[256] = {};
+    GetClassNameW(hwnd, class_name, 256);
+    GetWindowTextW(hwnd, title, 256);
+    std::fprintf(stderr,
+                 "[BRIDGE] main thread window %s hwnd=0x%llx class=\"%s\" title=\"%s\"\n",
+                 label ? label : "(unknown)",
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)),
+                 wide_to_utf8(class_name).c_str(),
+                 wide_to_utf8(title).c_str());
+    return TRUE;
+}
+
+static void debug_dump_current_thread_windows(const char* label) {
+    EnumThreadWindows(GetCurrentThreadId(),
+                      enum_current_thread_window_proc,
+                      reinterpret_cast<LPARAM>(label));
+    std::fflush(stderr);
+}
+
 // プラグイン内部状態を IPC で送るための base64 encode/decode (RFC 4648)。
 // 外部依存ライブラリを増やしたくないので最小実装。state チャンクは典型
 // 数 KB - 数十 KB 規模なので速度より簡潔さを優先する。
@@ -1017,6 +1052,7 @@ private:
             }
             std::fflush(stderr);
         }
+        debug_dump_current_thread_windows("after open_chain load");
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
             plugin_bypass_.push_back(false);
@@ -1087,6 +1123,7 @@ private:
             }
             std::fflush(stderr);
         }
+        debug_dump_current_thread_windows("after add_plugin load");
 
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
