@@ -234,6 +234,8 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
     SetBkMode(hdc, TRANSPARENT);
     std::wstring latency_text = editor_latency_text(loader);
     const LONG title_left = power_rect.right + 10;
+    // Keep a fixed right-side readout wide enough for "123 ms" / "1.23 s",
+    // but collapse it toward the power button on very narrow plugin frames.
     RECT latency_rect{std::max<LONG>(power_rect.right + 24, close_rect.left - 96),
                       0,
                       close_rect.left - 10,
