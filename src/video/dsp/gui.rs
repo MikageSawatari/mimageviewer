@@ -26,19 +26,21 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetMonitorInfoW, HBRUSH,
     MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, PAINTSTRUCT,
 };
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SC_CLOSE, SW_SHOW,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_PARENTNOTIFY, WM_SIZE,
-    WM_SYSCOMMAND, WNDCLASSEXW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
-    WS_THICKFRAME,
+    GetWindowRect, IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
+    SC_CLOSE, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
+    WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT,
+    WM_PARENTNOTIFY, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN,
+    WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -211,6 +213,10 @@ fn notify_user_close_for_thread() {
     }
 }
 
+fn bridge_container_hwnd_for_thread() -> Option<HWND> {
+    THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.bridge_container_hwnd))
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -273,6 +279,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if let Some(tx) = tx_opt {
                         let _ = tx.send((w, h));
                     }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_WINDOWPOSCHANGING => {
+                if lparam.0 != 0 && !IsIconic(hwnd).as_bool() {
+                    sync_bridge_container_to_pending_window_pos(hwnd, lparam.0 as *const WINDOWPOS);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -340,8 +352,7 @@ thread_local! {
 }
 
 fn sync_bridge_container_to_host(host_hwnd: HWND) {
-    let container_hwnd =
-        THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.bridge_container_hwnd));
+    let container_hwnd = bridge_container_hwnd_for_thread();
     let Some(container_hwnd) = container_hwnd else {
         return;
     };
@@ -369,6 +380,52 @@ fn sync_bridge_container_to_host(host_hwnd: HWND) {
             height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         );
+    }
+}
+
+fn sync_bridge_container_to_pending_window_pos(host_hwnd: HWND, pending: *const WINDOWPOS) {
+    let Some(container_hwnd) = bridge_container_hwnd_for_thread() else {
+        return;
+    };
+
+    unsafe {
+        if container_hwnd.0.is_null() || pending.is_null() {
+            return;
+        }
+
+        let pending = &*pending;
+        let mut window_rect = RECT::default();
+        let mut client_rect = RECT::default();
+        let mut client_origin = POINT { x: 0, y: 0 };
+        if GetWindowRect(host_hwnd, &mut window_rect).is_err()
+            || GetClientRect(host_hwnd, &mut client_rect).is_err()
+            || !ClientToScreen(host_hwnd, &mut client_origin).as_bool()
+        {
+            return;
+        }
+
+        let client_offset_x = client_origin.x - window_rect.left;
+        let client_offset_y = client_origin.y - window_rect.top;
+        let width = (client_rect.right - client_rect.left).max(1);
+        let height = (client_rect.bottom - client_rect.top).max(1);
+
+        let x = if pending.flags.contains(SWP_NOMOVE) {
+            client_origin.x
+        } else {
+            pending.x + client_offset_x
+        };
+        let y = if pending.flags.contains(SWP_NOMOVE) {
+            client_origin.y
+        } else {
+            pending.y + client_offset_y
+        };
+
+        let flags = if pending.flags.contains(SWP_NOSIZE) {
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE
+        } else {
+            SWP_NOZORDER | SWP_NOACTIVATE
+        };
+        let _ = SetWindowPos(container_hwnd, None, x, y, width, height, flags);
     }
 }
 
@@ -758,6 +815,15 @@ fn create_window(
         .map_err(|e| std::io::Error::other(format!("CreateWindowExW: {e}")))?;
 
         crate::dwm_transitions::disable_transitions_for_window(hwnd);
+        if std::env::var_os("MIV_VST_NO_FRAME_EXTEND").is_none() {
+            let margins = MARGINS {
+                cxLeftWidth: -1,
+                cxRightWidth: -1,
+                cyTopHeight: -1,
+                cyBottomHeight: -1,
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        }
         if visible {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }
