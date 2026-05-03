@@ -833,6 +833,8 @@ struct FsFrameState {
     /// 表示は縮小版を使っているとき true。ホバーバーに⚠マーカーを出すのに使う。
     image_downscaled: bool,
     is_loading: bool,
+    /// 起動時 VST3 チェーンロードが終わるまで動画開始を待っている状態。
+    vst3_waiting_for_video: bool,
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
@@ -1145,7 +1147,8 @@ impl App {
                                     Self::draw_fs_image(
                                         ui, image_rect,
                                         state.tex.as_ref(), state.thumb_tex.as_ref(),
-                                        state.is_video, state.fs_load_failed, fs_rotation, zp,
+                                        state.is_video, state.vst3_waiting_for_video,
+                                        state.fs_load_failed, fs_rotation, zp,
                                         free_rot, &bg_style, &state.location_display,
                                         #[cfg(windows)]
                                         state.gpu_video_frame,
@@ -1704,6 +1707,16 @@ impl App {
             .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
         let is_loading =
             !is_video && !is_separator && !fs_load_failed && !self.fs_cache.contains_key(&fs_idx);
+        #[cfg(windows)]
+        let vst3_waiting_for_video = is_video
+            && self.vst3_deferred_video_open == Some(fs_idx)
+            && self.vst3_startup_load.is_some();
+        #[cfg(not(windows))]
+        let vst3_waiting_for_video = false;
+        #[cfg(windows)]
+        if vst3_waiting_for_video {
+            location_display = self.vst3_startup_progress_text();
+        }
 
         let pdf_content_type = match self.items.get(fs_idx) {
             Some(GridItem::PdfPage { content_type, .. }) => *content_type,
@@ -1726,6 +1739,7 @@ impl App {
             image_file_size,
             image_downscaled,
             is_loading,
+            vst3_waiting_for_video,
             fs_load_failed,
             pdf_content_type,
             #[cfg(windows)]
@@ -3100,6 +3114,7 @@ impl App {
         tex: Option<&egui::TextureHandle>,
         thumb_tex: Option<&egui::TextureHandle>,
         is_video: bool,
+        vst3_waiting_for_video: bool,
         fs_load_failed: bool,
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
@@ -3200,14 +3215,17 @@ impl App {
             );
         } else {
             let painter = ui.painter();
+            let loading_label = if vst3_waiting_for_video {
+                "VST3 プラグインを初期化中..."
+            } else if is_video {
+                "動画サムネイル 読込中..."
+            } else {
+                "読込中..."
+            };
             painter.text(
                 full_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                if is_video {
-                    "動画サムネイル 読込中..."
-                } else {
-                    "読込中..."
-                },
+                loading_label,
                 egui::FontId::proportional(24.0),
                 egui::Color32::from_gray(180),
             );

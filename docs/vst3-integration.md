@@ -294,3 +294,20 @@ Bitwig-style owner/z-order refactor still show 250-300ms editor message gaps,
 so the next GUI architecture is one STA editor/message-pump thread per plugin
 slot inside the same bridge process. The detailed design lives in
 [vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md).
+
+## 2026-05 startup load policy
+
+VST3 startup chain loading runs on a dedicated `vst3-startup-load` worker, not
+inside the blocking startup-init path. This keeps image browsing responsive when
+the user starts mIV only to view images or thumbnails.
+
+If the user opens a video while the startup VST3 chain is still loading, the
+fullscreen video open is deferred. The fullscreen viewport stays black and shows
+the current VST3 startup progress text in the center. When the worker completes,
+the deferred video open resumes automatically.
+
+The worker still performs the same bridge enable and sequential `add_plugin`
+calls as the previous startup path. Loading is intentionally sequential for now
+because the Rust-side startup protocol sends one command at a time; the bridge's
+per-slot GUI/load threads make future batch or parallel loading possible without
+changing the fullscreen waiting behavior.

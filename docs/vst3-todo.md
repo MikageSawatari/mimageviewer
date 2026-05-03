@@ -342,3 +342,15 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - 特定 sample 数の固定遅延を返すだけ
 - PDC 実装の動作確認に使う
 - 動画と音声の同期が取れるかを目視 + 計測で確認可能
+
+## 2026-05 background startup load
+
+- Done: startup VST3 chain load now runs on a dedicated `vst3-startup-load`
+  worker instead of blocking the general startup-init path.
+- Image browsing can start before VST3 loading finishes.
+- If the user opens a video while the VST3 startup load is still running,
+  fullscreen shows a black loading state with VST3 progress text and starts the
+  video automatically once the worker completes.
+- Remaining follow-up: add a bridge batch-load command if startup VST3 loading
+  should become parallel. The current Rust-side command path still loads the
+  configured chain sequentially.

@@ -70,6 +70,30 @@ impl StartupInitPending {
     }
 }
 
+/// 起動後にバックグラウンドで走らせる VST3 チェーンロードの状態。
+#[cfg(windows)]
+pub(crate) struct Vst3StartupLoadPending {
+    rx: mpsc::Receiver<()>,
+    progress: Arc<Mutex<String>>,
+    started_at: std::time::Instant,
+}
+
+#[cfg(windows)]
+impl Vst3StartupLoadPending {
+    fn try_recv(&self) -> Result<(), mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+    fn elapsed_ms(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64() * 1000.0
+    }
+    fn progress_text(&self) -> String {
+        self.progress
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| "VST3 プラグインを初期化中…".to_string())
+    }
+}
+
 /// 進行中の更新チェックワーカー。`rx` が結果を運び、`manual` は失敗時の UI 表示判定。
 /// `App::update_check_pending = None` で両方をまとめて落とせるため、リセットの整合性が
 /// 取りやすい (rx だけ落として manual を残すミスが起きない)。
@@ -2406,6 +2430,12 @@ pub struct App {
     /// プラグイン GUI とその HWND は [`crate::video::dsp::DspBridge`] 内のスロットに
     /// per-plugin で持たれている (= App には保持しない)。
     pub(crate) vst3_init_kicked: bool,
+    /// 起動直後に UI を塞がず走らせる VST3 チェーンロード。
+    #[cfg(windows)]
+    pub(crate) vst3_startup_load: Option<Vst3StartupLoadPending>,
+    /// VST3 起動ロードが終わるまで動画開始を保留している fullscreen idx。
+    #[cfg(windows)]
+    pub(crate) vst3_deferred_video_open: Option<usize>,
     /// 直前フレームでフルスクリーンモードだったか (= TOPMOST 切替検出用)。
     /// 状態が遷移したら `dsp_bridge.set_all_guis_topmost` を呼んでプラグイン GUI の
     /// z-order を調整する (= 動画再生中だけ手前)。
@@ -2871,6 +2901,10 @@ impl Default for App {
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             vst3_init_kicked: false,
+            #[cfg(windows)]
+            vst3_startup_load: None,
+            #[cfg(windows)]
+            vst3_deferred_video_open: None,
             #[cfg(windows)]
             vst3_was_fullscreen: false,
         }
@@ -3489,20 +3523,12 @@ impl App {
         if self.startup_init.is_some() || self.startup_done {
             return;
         }
+        #[cfg(windows)]
+        self.kick_off_vst3_startup_load();
         let favorites = self.settings.favorites.clone();
         let speed = self.settings.indexer_speed_profile;
         let activity_gate = Arc::clone(&self.activity_gate);
         let progress = Arc::clone(&self.startup_progress);
-        #[cfg(windows)]
-        let vst3_enabled = self.settings.vst3_enabled;
-        #[cfg(windows)]
-        let vst3_plugins = self.settings.vst3_plugins.clone();
-        #[cfg(windows)]
-        let vst3_bridge = self.dsp_bridge.clone();
-        #[cfg(windows)]
-        if vst3_enabled {
-            self.vst3_init_kicked = true;
-        }
         let (tx, rx) = mpsc::channel();
         let started_at = std::time::Instant::now();
         let hook = make_progress_hook(Arc::clone(&progress));
@@ -3519,10 +3545,6 @@ impl App {
                         Some(hook),
                     );
                     crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
-                    #[cfg(windows)]
-                    if vst3_enabled {
-                        run_vst3_startup_load(vst3_bridge, vst3_plugins, Arc::clone(&progress));
-                    }
                     let _ = tx.send(mgr);
                 }
             });
@@ -3538,19 +3560,107 @@ impl App {
                 Arc::clone(&self.activity_gate),
                 Some(hook),
             );
-            #[cfg(windows)]
-            if self.settings.vst3_enabled {
-                run_vst3_startup_load(
-                    self.dsp_bridge.clone(),
-                    self.settings.vst3_plugins.clone(),
-                    Arc::clone(&self.startup_progress),
-                );
-            }
             self.startup_done = true;
             self.housekeeping_armed = true;
             return;
         }
         self.startup_init = Some(StartupInitPending { rx, started_at });
+    }
+
+    /// 起動直後の VST3 bridge enable + チェーン自動ロードを UI とは独立に開始する。
+    #[cfg(windows)]
+    pub(crate) fn kick_off_vst3_startup_load(&mut self) {
+        if self.vst3_init_kicked || !self.settings.vst3_enabled {
+            return;
+        }
+        self.vst3_init_kicked = true;
+        let plugins = self.settings.vst3_plugins.clone();
+        if plugins.is_empty() {
+            crate::logger::log("[VST3 startup] skipped: no configured plugins");
+            return;
+        }
+
+        let bridge = self.dsp_bridge.clone();
+        let progress = Arc::new(Mutex::new("VST3 プラグインを初期化中…".to_string()));
+        let worker_progress = Arc::clone(&progress);
+        let (tx, rx) = mpsc::channel();
+        let started_at = std::time::Instant::now();
+        let spawn_result = std::thread::Builder::new()
+            .name("vst3-startup-load".to_string())
+            .spawn(move || {
+                run_vst3_startup_load(bridge, plugins, worker_progress);
+                let _ = tx.send(());
+            });
+        match spawn_result {
+            Ok(_) => {
+                crate::logger::log("[VST3 startup] background load started");
+                self.vst3_startup_load = Some(Vst3StartupLoadPending {
+                    rx,
+                    progress,
+                    started_at,
+                });
+            }
+            Err(e) => {
+                crate::logger::log(format!("[VST3 startup] background load spawn failed: {e}"));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn poll_vst3_startup_load(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.vst3_startup_load.as_ref() else {
+            return;
+        };
+        match pending.try_recv() {
+            Ok(()) => {
+                crate::logger::log(format!(
+                    "[VST3 startup] background load completed in {:.0} ms",
+                    pending.elapsed_ms()
+                ));
+                self.vst3_startup_load = None;
+                if let Some(idx) = self.vst3_deferred_video_open.take() {
+                    if self.fullscreen_idx == Some(idx)
+                        && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                        && !self.fs_cache.contains_key(&idx)
+                    {
+                        crate::logger::log(format!(
+                            "[VST3 startup] deferred video open resumes idx={idx}"
+                        ));
+                        self.start_fs_load(idx);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                crate::logger::log("[VST3 startup] background load worker disconnected");
+                self.vst3_startup_load = None;
+                if let Some(idx) = self.vst3_deferred_video_open.take() {
+                    if self.fullscreen_idx == Some(idx)
+                        && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                        && !self.fs_cache.contains_key(&idx)
+                    {
+                        self.start_fs_load(idx);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn vst3_startup_load_pending(&self) -> bool {
+        self.vst3_startup_load.is_some()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn vst3_startup_progress_text(&self) -> String {
+        self.vst3_startup_load
+            .as_ref()
+            .map(|p| p.progress_text())
+            .unwrap_or_else(|| "VST3 プラグインを初期化中…".to_string())
     }
 
     /// 起動 init の完了を確認する。完了していれば `indexer_manager` に注入し
@@ -8359,6 +8469,10 @@ impl App {
                 // start_fs_load の早期分岐で GridItem::Video を検出し、
                 // FsCacheEntry::Video を fs_cache に挿入する。
                 if self.fs_cache.contains_key(&idx) {
+                    #[cfg(windows)]
+                    {
+                        self.vst3_deferred_video_open = None;
+                    }
                     if grid_open_intent
                         && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx)
                     {
@@ -8366,6 +8480,15 @@ impl App {
                     }
                     crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
                 } else {
+                    #[cfg(windows)]
+                    if self.vst3_startup_load_pending() {
+                        crate::logger::log(format!(
+                            "[VST3 startup] defer video open idx={idx} until background load completes"
+                        ));
+                        self.fs_open_intent_from_grid = grid_open_intent;
+                        self.vst3_deferred_video_open = Some(idx);
+                        return;
+                    }
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
                     self.fs_open_intent_from_grid = grid_open_intent;
                     self.start_fs_load(idx);
@@ -10487,6 +10610,10 @@ impl App {
     pub(crate) fn close_fullscreen(&mut self) {
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
+        #[cfg(windows)]
+        {
+            self.vst3_deferred_video_open = None;
+        }
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {
             // The normal per-frame fullscreen-state watcher also hides VST
@@ -13395,9 +13522,9 @@ impl eframe::App for App {
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
         self.poll_housekeeping_arm();
-        // VST3 起動時の bridge enable + 自動ロードは startup-init worker 内で完了させる。
-        // 動画再生開始後にプラグイン初期化が走ると音声が一瞬途切れるため、通常 UI へ
-        // 進む前に prewarm まで済ませる。
+        // VST3 起動時の bridge enable + 自動ロードは専用 worker で走らせる。
+        // 画像閲覧だけの起動では通常 UI を先に出し、動画を開いた時点でまだロード中なら
+        // フルスクリーン側で待機表示にする。
         // VST3 プラグイン GUI の TOPMOST 切替 + フルスクリーン解除時の cleanup。
         // - 遷移時 (= フルスクリーン入退) のみ操作 (毎フレーム呼ぶと余計な SetWindowPos
         //   が発生してプラグイン GUI のフォーカスを乱す)。
@@ -13427,6 +13554,8 @@ impl eframe::App for App {
         if !self.startup_done {
             self.kick_off_startup_init();
             self.poll_startup_init();
+            #[cfg(windows)]
+            self.poll_vst3_startup_load(ctx);
             if self.startup_init.is_some() {
                 self.render_startup_overlay(ctx);
                 self.consume_input_during_startup(ctx);
@@ -13437,6 +13566,8 @@ impl eframe::App for App {
             // 誤発火しないよう一掃してから通常 update に進む。
             self.consume_input_during_startup(ctx);
         }
+        #[cfg(windows)]
+        self.poll_vst3_startup_load(ctx);
 
         // バージョン更新通知: 起動完了後の初回 + 24h 周期で auto kick。
         self.maybe_auto_update_check();
