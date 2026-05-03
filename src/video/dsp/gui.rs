@@ -25,18 +25,19 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+    COLOR_WINDOW, ClientToScreen, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromRect,
 };
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     HWND_NOTOPMOST, IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CLOSE,
-    WM_DESTROY, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE,
+    WNDCLASSEXW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -74,6 +75,9 @@ pub enum Cmd {
     Close,
     /// GUI スレッド自体を終了する (tester 終了時)。
     Quit,
+    /// Update the bridge-owned top-level surface HWND paired with this host
+    /// window. The GUI thread uses it for low-latency move/resize following.
+    SetBridgeContainerHwnd(u64),
 }
 
 #[derive(Debug)]
@@ -157,6 +161,10 @@ impl GuiHost {
     pub fn close(&self) {
         let _ = self.cmd_tx.send(Cmd::Close);
     }
+
+    pub fn set_bridge_container_hwnd(&self, hwnd_u64: u64) {
+        let _ = self.cmd_tx.send(Cmd::SetBridgeContainerHwnd(hwnd_u64));
+    }
 }
 
 impl Drop for GuiHost {
@@ -186,6 +194,9 @@ struct ThreadState {
     /// WM_ACTIVATEAPP relay. This is intentionally process-level, not viewport
     /// focus, so clicking the plugin itself does not hide the plugin surface.
     app_active_tx: Option<Sender<bool>>,
+    /// Bridge-owned plugin surface HWND. It lives in the bridge process, but
+    /// Win32 allows SetWindowPos from this host thread.
+    bridge_container_hwnd: Option<HWND>,
     class_registered: bool,
 }
 
@@ -241,6 +252,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 };
                 if w > 0 && h > 0 {
+                    sync_bridge_container_to_host(hwnd);
                     let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE
                         .with(|s| s.borrow().as_ref().and_then(|st| st.resize_tx.clone()));
                     if let Some(tx) = tx_opt {
@@ -298,6 +310,55 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+fn sync_bridge_container_to_host(host_hwnd: HWND) {
+    let container_hwnd =
+        THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.bridge_container_hwnd));
+    let Some(container_hwnd) = container_hwnd else {
+        return;
+    };
+
+    unsafe {
+        if container_hwnd.0.is_null() || IsIconic(host_hwnd).as_bool() {
+            return;
+        }
+        let mut client = RECT::default();
+        if GetClientRect(host_hwnd, &mut client).is_err() {
+            return;
+        }
+        let width = (client.right - client.left).max(1);
+        let height = (client.bottom - client.top).max(1);
+        let mut origin = POINT { x: 0, y: 0 };
+        if !ClientToScreen(host_hwnd, &mut origin).as_bool() {
+            return;
+        }
+        let _ = SetWindowPos(
+            container_hwnd,
+            None,
+            origin.x,
+            origin.y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+    }
+}
+
+fn set_bridge_container_hwnd_for_thread(hwnd_u64: u64) {
+    let host_hwnd = THREAD_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let st = state.as_mut()?;
+        st.bridge_container_hwnd = (hwnd_u64 != 0).then_some(HWND(hwnd_u64 as *mut _));
+        if st.bridge_container_hwnd.is_some() {
+            st.hwnd
+        } else {
+            None
+        }
+    });
+    if let Some(host_hwnd) = host_hwnd {
+        sync_bridge_container_to_host(host_hwnd);
+    }
+}
+
 fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
     // VST3 GUI は STA (Single-Threaded Apartment) を要求する。
     // GUI スレッドで COM を STA 初期化しておかないとプラグイン GUI が
@@ -315,6 +376,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             resize_tx: None,
             resize_session_tx: None,
             app_active_tx: None,
+            bridge_container_hwnd: None,
             class_registered: false,
         }));
     });
@@ -329,6 +391,9 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             Cmd::Quit => break,
             Cmd::Close => {
                 close_window();
+            }
+            Cmd::SetBridgeContainerHwnd(hwnd_u64) => {
+                set_bridge_container_hwnd_for_thread(hwnd_u64);
             }
             Cmd::Show {
                 title,
@@ -418,6 +483,9 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
                 Ok(Cmd::Quit) => {
                     close_window();
                     return;
+                }
+                Ok(Cmd::SetBridgeContainerHwnd(hwnd_u64)) => {
+                    set_bridge_container_hwnd_for_thread(hwnd_u64);
                 }
                 Ok(Cmd::Show { reply, .. }) => {
                     // すでにウィンドウがあるのに Show 来た。reply に既存 HWND を返さず、
@@ -682,6 +750,7 @@ fn create_window(
                 st.resize_tx = Some(resize_tx);
                 st.resize_session_tx = Some(resize_session_tx);
                 st.app_active_tx = Some(app_active_tx);
+                st.bridge_container_hwnd = None;
             }
         });
         Ok((
@@ -710,6 +779,7 @@ fn close_window() {
             st.resize_tx = None;
             st.resize_session_tx = None;
             st.app_active_tx = None;
+            st.bridge_container_hwnd = None;
         }
     });
 }

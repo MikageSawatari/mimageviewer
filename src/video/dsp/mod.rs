@@ -1022,7 +1022,11 @@ impl DspBridge {
                 width,
                 height,
                 slot_id: got_slot,
+                container_hwnd,
             }) if got_slot == slot_id => {
+                if container_hwnd != 0 {
+                    gui_host.set_bridge_container_hwnd(container_hwnd);
+                }
                 if width > 0 && height > 0 && (width != pref_w || height != pref_h) {
                     gui::resize_window_client(hwnd, width, height);
                 }
