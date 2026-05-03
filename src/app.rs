@@ -1891,6 +1891,10 @@ pub struct App {
     /// この直後のクリックは他アプリからの復帰クリックとみなし、
     /// ナビ・ドラッグ等のアプリ側処理を抑制する。
     pub(crate) fs_focus_regained_at: Option<std::time::Instant>,
+    /// フルスクリーン前フレーム末尾で観測した Win32 foreground HWND。
+    /// VST editor が fullscreen HWND の owned popup になると egui focus が true の
+    /// まま残ることがあるため、クリック復帰判定では OS 側の前フレーム値を使う。
+    pub(crate) fs_prev_foreground_hwnd: usize,
     /// フォーカス復帰クリックを検出中で、離されるまで全ての左クリック操作を抑制するフラグ。
     /// 押下 → 離しの間に複数フレームあるため、時間ベースだけでなく状態でも追跡する。
     pub(crate) fs_suppress_primary_until_release: bool,
@@ -2709,6 +2713,7 @@ impl Default for App {
             fs_focus_grace_elapsed: false,
             fs_prev_focused: false,
             fs_focus_regained_at: None,
+            fs_prev_foreground_hwnd: 0,
             fs_suppress_primary_until_release: false,
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
@@ -8283,6 +8288,7 @@ impl App {
         // true 始まりにする (グレース期間中にフォーカス復帰扱いされるのを防ぐ)
         self.fs_prev_focused = true;
         self.fs_focus_regained_at = None;
+        self.fs_prev_foreground_hwnd = 0;
         self.fs_suppress_primary_until_release = false;
         self.reset_erase_mode();
 
@@ -10538,6 +10544,7 @@ impl App {
         self.fs_focus_grace_elapsed = false;
         self.fs_prev_focused = false;
         self.fs_focus_regained_at = None;
+        self.fs_prev_foreground_hwnd = 0;
         self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;

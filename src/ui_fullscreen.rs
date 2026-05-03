@@ -52,8 +52,8 @@ const CHECKER_TILE_PX: f32 = 16.0;
 #[cfg(windows)]
 struct NativeFocusClaim {
     foreground_hwnd: usize,
+    post_foreground_hwnd: usize,
     target_hwnd: usize,
-    foreign_foreground: bool,
     set_foreground_ok: bool,
     set_focus_ok: bool,
 }
@@ -72,8 +72,8 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
         if GetCursorPos(&mut pt).is_err() {
             return NativeFocusClaim {
                 foreground_hwnd: 0,
+                post_foreground_hwnd: 0,
                 target_hwnd: 0,
-                foreign_foreground: false,
                 set_foreground_ok: false,
                 set_focus_ok: false,
             };
@@ -82,8 +82,8 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
         if hovered.0.is_null() {
             return NativeFocusClaim {
                 foreground_hwnd: 0,
+                post_foreground_hwnd: 0,
                 target_hwnd: 0,
-                foreign_foreground: false,
                 set_foreground_ok: false,
                 set_focus_ok: false,
             };
@@ -91,13 +91,13 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
         let root = GetAncestor(hovered, GA_ROOT);
         let target = if root.0.is_null() { hovered } else { root };
         let foreground = GetForegroundWindow();
-        let foreign_foreground = !foreground.0.is_null() && foreground != target;
         let set_foreground_ok = SetForegroundWindow(target).as_bool();
         let set_focus_ok = SetFocus(Some(target)).is_ok();
+        let post_foreground = GetForegroundWindow();
         NativeFocusClaim {
             foreground_hwnd: foreground.0 as usize,
+            post_foreground_hwnd: post_foreground.0 as usize,
             target_hwnd: target.0 as usize,
-            foreign_foreground,
             set_foreground_ok,
             set_focus_ok,
         }
@@ -107,8 +107,8 @@ fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
 #[cfg(not(windows))]
 struct NativeFocusClaim {
     foreground_hwnd: usize,
+    post_foreground_hwnd: usize,
     target_hwnd: usize,
-    foreign_foreground: bool,
     set_foreground_ok: bool,
     set_focus_ok: bool,
 }
@@ -117,11 +117,23 @@ struct NativeFocusClaim {
 fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
     NativeFocusClaim {
         foreground_hwnd: 0,
+        post_foreground_hwnd: 0,
         target_hwnd: 0,
-        foreign_foreground: false,
         set_foreground_ok: false,
         set_focus_ok: false,
     }
+}
+
+#[cfg(windows)]
+fn current_foreground_hwnd() -> usize {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    unsafe { GetForegroundWindow().0 as usize }
+}
+
+#[cfg(not(windows))]
+fn current_foreground_hwnd() -> usize {
+    0
 }
 
 /// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
@@ -887,6 +899,7 @@ impl App {
         // いれば「このフレームで再設定されていない」= 打ち切ってよい、と判定する。
         let hint_start_before = self.fs_boundary_hint.map(|h| h.started_at());
         let mut had_user_input_in_frame = false;
+        let prev_foreground_hwnd = self.fs_prev_foreground_hwnd;
 
         // ── ビューポート構築 ──
         let fs_builder = self.build_fullscreen_viewport_builder();
@@ -952,7 +965,12 @@ impl App {
 
                         // ── ホイール & クリック ──
                         let (wheel_nav, click_close) = self.handle_fs_wheel_and_click(
-                            ui, ctx, full_rect, &state, is_spread_double,
+                            ui,
+                            ctx,
+                            full_rect,
+                            &state,
+                            is_spread_double,
+                            prev_foreground_hwnd,
                         );
                         if wheel_nav != 0 { nav_delta = wheel_nav; }
                         if click_close { close_fs = true; }
@@ -1371,6 +1389,8 @@ impl App {
                     self.show_vst3_manager(ctx);
                     self.vst3_pump_gui_signals();
                 }
+
+                self.fs_prev_foreground_hwnd = current_foreground_hwnd();
             },
         );
 
@@ -2296,6 +2316,7 @@ impl App {
         full_rect: egui::Rect,
         state: &FsFrameState,
         is_spread_double: bool,
+        prev_foreground_hwnd: usize,
     ) -> (i32, bool) {
         let mut nav_delta = 0i32;
         let mut close = false;
@@ -2318,12 +2339,17 @@ impl App {
         });
         if fullscreen_primary_event {
             let focus = claim_native_window_under_cursor_focus();
-            let focus_restore_click = focus.target_hwnd != 0 && focus.foreign_foreground;
+            let previous_foreign_foreground = prev_foreground_hwnd != 0
+                && focus.target_hwnd != 0
+                && prev_foreground_hwnd != focus.target_hwnd;
+            let focus_restore_click = previous_foreign_foreground;
             crate::logger::log(format!(
-                "[fs-focus] foreground=0x{:x} fullscreen=0x{:x} foreign={} viewport_focused={} suppress={} set_foreground={} set_focus={}",
+                "[fs-focus] prev_foreground=0x{:x} foreground=0x{:x} post_foreground=0x{:x} fullscreen=0x{:x} prev_foreign={} viewport_focused={} suppress={} set_foreground={} set_focus={}",
+                prev_foreground_hwnd,
                 focus.foreground_hwnd,
+                focus.post_foreground_hwnd,
                 focus.target_hwnd,
-                focus.foreign_foreground,
+                previous_foreign_foreground,
                 viewport_focused,
                 focus_restore_click,
                 focus.set_foreground_ok,
