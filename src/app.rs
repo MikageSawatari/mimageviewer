@@ -71,6 +71,10 @@ impl StartupInitPending {
 }
 
 /// 起動後にバックグラウンドで走らせる VST3 チェーンロードの状態。
+///
+/// `rx` は worker の完了通知、`progress` は `add_plugin` 中の表示テキスト、
+/// `started_at` は完了ログ用の所要時間計測に使う。`Some` の間は動画 open だけを
+/// `vst3_deferred_video_open` で保留し、画像閲覧や通常 UI は先に進める。
 #[cfg(windows)]
 pub(crate) struct Vst3StartupLoadPending {
     rx: mpsc::Receiver<()>,
@@ -3607,6 +3611,22 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn resume_deferred_vst3_video_open(&mut self, ctx: &egui::Context) {
+        if let Some(idx) = self.vst3_deferred_video_open.take() {
+            if self.fullscreen_idx == Some(idx)
+                && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                && !self.fs_cache.contains_key(&idx)
+            {
+                crate::logger::log(format!(
+                    "[VST3 startup] deferred video open resumes idx={idx}"
+                ));
+                self.start_fs_load(idx);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn poll_vst3_startup_load(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.vst3_startup_load.as_ref() else {
             return;
@@ -3618,18 +3638,7 @@ impl App {
                     pending.elapsed_ms()
                 ));
                 self.vst3_startup_load = None;
-                if let Some(idx) = self.vst3_deferred_video_open.take() {
-                    if self.fullscreen_idx == Some(idx)
-                        && matches!(self.items.get(idx), Some(GridItem::Video(_)))
-                        && !self.fs_cache.contains_key(&idx)
-                    {
-                        crate::logger::log(format!(
-                            "[VST3 startup] deferred video open resumes idx={idx}"
-                        ));
-                        self.start_fs_load(idx);
-                        ctx.request_repaint();
-                    }
-                }
+                self.resume_deferred_vst3_video_open(ctx);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -3637,15 +3646,7 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => {
                 crate::logger::log("[VST3 startup] background load worker disconnected");
                 self.vst3_startup_load = None;
-                if let Some(idx) = self.vst3_deferred_video_open.take() {
-                    if self.fullscreen_idx == Some(idx)
-                        && matches!(self.items.get(idx), Some(GridItem::Video(_)))
-                        && !self.fs_cache.contains_key(&idx)
-                    {
-                        self.start_fs_load(idx);
-                        ctx.request_repaint();
-                    }
-                }
+                self.resume_deferred_vst3_video_open(ctx);
             }
         }
     }
@@ -8408,6 +8409,10 @@ impl App {
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize) {
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
+        #[cfg(windows)]
+        if self.vst3_deferred_video_open.is_some() && self.vst3_deferred_video_open != Some(idx) {
+            self.vst3_deferred_video_open = None;
+        }
         // フルスクリーン側ではページ単位 (= 1 ファイル/1 ページ) 操作中心になるため、
         // グリッド側で積み上げた Undo は破棄する。フルスクリーン中の操作は新しい
         // スタックで管理する (画像移動でさらにクリアされる)。
