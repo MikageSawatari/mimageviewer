@@ -3,9 +3,11 @@
 # When mimageviewer.exe is running (e.g. tray-resident), cargo cannot overwrite
 # target\release\mimageviewer.exe at link time, failing with LNK1104.
 # This script:
-#   1. Stops mimageviewer-* processes started from this repo
+#   1. Stops mimageviewer-* processes started from this repo or extracted to APPDATA
 #   2. Polls for file-handle release (up to 10 seconds)
-#   3. Runs `cargo build --release --bin mimageviewer` (extra args are passed through)
+#   3. Rebuilds the VST3 C++ bridge before core embeds it
+#   4. Builds release core + launcher (extra cargo args are passed through)
+#   5. Clears the extracted VST3 bridge cache so next launch re-extracts it
 #
 # Usage:
 #   PS> scripts\build-release.ps1
@@ -13,11 +15,52 @@
 
 [CmdletBinding()]
 param(
+    [switch] $SkipVst3Bridge,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $CargoArgs
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Ensure-LibclangPath {
+    if ($env:LIBCLANG_PATH) {
+        $configured = Join-Path -Path $env:LIBCLANG_PATH -ChildPath 'libclang.dll'
+        if (Test-Path $configured) {
+            return
+        }
+    }
+
+    $candidateDirs = @(
+        'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\Llvm\x64\bin',
+        'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\Llvm\bin',
+        'C:\Program Files (x86)\Microsoft Visual Studio\17\BuildTools\VC\Tools\Llvm\x64\bin',
+        'C:\Program Files (x86)\Microsoft Visual Studio\17\BuildTools\VC\Tools\Llvm\bin',
+        'C:\Program Files\LLVM\bin'
+    )
+    foreach ($dir in $candidateDirs) {
+        if (Test-Path (Join-Path -Path $dir -ChildPath 'libclang.dll')) {
+            $env:LIBCLANG_PATH = $dir
+            Write-Host ("[build-release] using LIBCLANG_PATH={0}" -f $dir)
+            return
+        }
+    }
+
+    $vsRoots = @(
+        'C:\Program Files (x86)\Microsoft Visual Studio',
+        'C:\Program Files\Microsoft Visual Studio'
+    )
+    foreach ($root in $vsRoots) {
+        if (-not (Test-Path $root)) { continue }
+        $found = Get-ChildItem -Path $root -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue |
+            Sort-Object @{ Expression = { if ($_.FullName -like '*\x64\bin\libclang.dll') { 0 } else { 1 } } }, FullName |
+            Select-Object -First 1
+        if ($found) {
+            $env:LIBCLANG_PATH = $found.DirectoryName
+            Write-Host ("[build-release] using LIBCLANG_PATH={0}" -f $found.DirectoryName)
+            return
+        }
+    }
+}
 
 $repoRoot = (Get-Location).Path
 # Append a trailing separator for path-boundary scoping. Without this, sibling
@@ -26,6 +69,14 @@ $repoRoot = (Get-Location).Path
 $repoRootPrefix = $repoRoot.TrimEnd('\') + '\'
 $repoRootPrefixLower = $repoRootPrefix.ToLower()
 $releaseExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer.exe'
+$appDataRoot = Join-Path -Path $env:APPDATA -ChildPath 'mimageviewer'
+$appDataRootPrefix = $appDataRoot.TrimEnd('\') + '\'
+$appDataRootPrefixLower = $appDataRootPrefix.ToLower()
+$appDataProcessNames = @(
+    'mimageviewer-core',
+    'mimageviewer-vst3-host',
+    'mimageviewer-susie32'
+)
 
 # Match all "mimageviewer*" prefix processes (Get-Process -Name does not accept
 # wildcards, hence the Where-Object filter).
@@ -44,9 +95,11 @@ foreach ($p in $candidates) {
         $pl = $path.ToLower()
         if ($pl.StartsWith($repoRootPrefixLower)) {
             $included = $true
-        } elseif ($p.Name -eq 'mimageviewer-susie32') {
-            # susie32 worker is extracted to APPDATA but spawned as a child of the
-            # repo-built mimageviewer.exe, so stop it together.
+        } elseif ($appDataProcessNames -contains $p.Name -and $pl.StartsWith($appDataRootPrefixLower)) {
+            # The launcher extracts core and helper processes to APPDATA. During
+            # local release testing they are children of the repo-built launcher,
+            # so stop them together; otherwise stale bridge/core processes can
+            # keep running while cargo successfully rebuilds the launcher.
             $included = $true
         }
     }
@@ -124,16 +177,64 @@ if (Test-Path $releaseExe) {
 #   2. launcher (FFmpeg 非依存、core + 5 DLL を include_bytes! で内包) を
 #      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
 #
-# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 2 回呼ぶ。
+# VST3 bridge is built first because mimageviewer-core embeds it with
+# include_bytes!. Cargo also cannot express the core -> launcher ordering, so
+# the two Rust binaries are built explicitly after the bridge.
+
+if (-not $SkipVst3Bridge) {
+    $cmakeExe = Get-Command cmake -ErrorAction SilentlyContinue
+    $vst3SdkLicense = Join-Path -Path $repoRoot -ChildPath 'vendor\vst3sdk\LICENSE.txt'
+    $vst3SourceDir = Join-Path -Path $repoRoot -ChildPath 'crates\vst3-host'
+    $vst3BuildDir = Join-Path -Path $vst3SourceDir -ChildPath 'build'
+    $vst3VendorExe = Join-Path -Path $repoRoot -ChildPath 'vendor\vst3-host\mimageviewer-vst3-host.exe'
+
+    if (-not $cmakeExe) {
+        throw "[build-release] cmake was not found. Install CMake or pass -SkipVst3Bridge to reuse the existing vendor bridge."
+    }
+    if (-not (Test-Path $vst3SdkLicense)) {
+        throw "[build-release] VST3 SDK was not found at vendor\vst3sdk. Run scripts\setup-vst3-sdk.sh or pass -SkipVst3Bridge to reuse the existing vendor bridge."
+    }
+    if (-not (Test-Path (Join-Path -Path $vst3BuildDir -ChildPath 'CMakeCache.txt'))) {
+        Write-Host "[build-release] configuring VST3 bridge (cmake)"
+        & cmake -S $vst3SourceDir -B $vst3BuildDir -G "Visual Studio 17 2022" -A x64
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+
+    Write-Host "[build-release] (1/3) cmake --build crates/vst3-host/build --config Release"
+    & cmake --build $vst3BuildDir --config Release
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (-not (Test-Path $vst3VendorExe)) {
+        throw "[build-release] VST3 bridge build did not produce $vst3VendorExe"
+    }
+} else {
+    Write-Warning "[build-release] skipping VST3 bridge rebuild; core will embed the existing vendor/vst3-host exe."
+}
+
+Ensure-LibclangPath
 
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
-Write-Host ("[build-release] (1/2) cargo {0}" -f ($coreCmd -join ' '))
+Write-Host ("[build-release] (2/3) cargo {0}" -f ($coreCmd -join ' '))
 & cargo @coreCmd
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
-Write-Host ("[build-release] (2/2) cargo {0}" -f ($launcherCmd -join ' '))
+Write-Host ("[build-release] (3/3) cargo {0}" -f ($launcherCmd -join ' '))
 & cargo @launcherCmd
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$extractedBridge = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe'
+$extractedBridgeHash = Join-Path -Path $appDataRoot -ChildPath 'vst3\mimageviewer-vst3-host.exe.sha256'
+foreach ($path in @($extractedBridge, $extractedBridgeHash)) {
+    if (Test-Path $path) {
+        try {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            Write-Host ("[build-release] removed stale extracted VST3 bridge cache: {0}" -f $path)
+        } catch {
+            Write-Warning ("[build-release] failed to remove {0}: {1}" -f $path, $_)
+        }
+    }
+}
+
+exit 0
