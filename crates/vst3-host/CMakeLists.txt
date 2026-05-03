@@ -95,6 +95,7 @@ if(WIN32)
     target_link_libraries(mimageviewer-vst3-host PRIVATE
         kernel32
         user32
+        dwmapi
         ole32
         shell32
         comctl32    # SetWindowSubclass / RemoveWindowSubclass for plugin child HWND hooks

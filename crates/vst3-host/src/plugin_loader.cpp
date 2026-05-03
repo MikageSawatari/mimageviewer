@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <ole2.h>
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
@@ -39,6 +40,19 @@ inline void blog(const char* msg) {
 }
 
 constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContainer";
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
 
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) {
@@ -163,6 +177,29 @@ bool host_client_rect_on_screen(HWND host_hwnd, RECT& out_rect) {
     return true;
 }
 
+void apply_dark_editor_chrome(HWND hwnd) {
+    if (!hwnd) return;
+    BOOL dark = TRUE;
+    HRESULT hr = DwmSetWindowAttribute(hwnd,
+                                       DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                       &dark,
+                                       sizeof(dark));
+    if (FAILED(hr)) {
+        // Older Windows 10 SDKs used 19 for the same private attribute.
+        constexpr DWORD kCompatDarkModeAttribute = 19;
+        DwmSetWindowAttribute(hwnd,
+                              kCompatDarkModeAttribute,
+                              &dark,
+                              sizeof(dark));
+    }
+    const COLORREF caption = RGB(18, 18, 18);
+    const COLORREF text = RGB(230, 230, 230);
+    const COLORREF border = RGB(56, 56, 56);
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text, sizeof(text));
+    DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
+}
+
 HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::PluginLoader* loader) {
     HWND owner_hwnd = reinterpret_cast<HWND>(options.owner_hwnd);
     if (!ensure_bridge_view_container_class()) {
@@ -200,6 +237,7 @@ HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::Plu
         blog("bridge view container create failed err=%lu", GetLastError());
         return nullptr;
     }
+    apply_dark_editor_chrome(container);
     blog("bridge editor window created gui_tid=%lu hwnd=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d",
          GetCurrentThreadId(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container)),

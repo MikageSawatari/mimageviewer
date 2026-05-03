@@ -354,3 +354,13 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - Remaining follow-up: add a bridge batch-load command if startup VST3 loading
   should become parallel. The current Rust-side command path still loads the
   configured chain sequentially.
+
+## 2026-05 editor chrome
+
+- Phase 1 done: bridge-owned VST3 editor windows request DWM dark caption,
+  text, and border colors after `CreateWindowExW`. This removes the bright
+  native white title bar without changing the editor HWND ownership model.
+- Follow-up: a fully custom title bar with inline power/bypass and latency
+  display requires splitting the current top-level editor surface into a frame
+  HWND plus a child plugin-host HWND. Keep that as a separate refactor because
+  it touches drag, resize, owner, z-order, and `IPlugView::attached()` sizing.
