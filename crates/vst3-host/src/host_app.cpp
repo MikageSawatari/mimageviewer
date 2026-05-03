@@ -2,6 +2,7 @@
 
 #include "host_app.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cwchar>
 
@@ -14,6 +15,10 @@
 namespace miv {
 
 using namespace Steinberg;
+
+namespace {
+constexpr UINT kBridgeResizePluginClientMsg = WM_APP + 0x4D9;
+}
 
 // IHostApplication 実装
 HostApplication::HostApplication() {
@@ -151,16 +156,10 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
     }
     if (host_hwnd_ && w > 0 && h > 0 && !suppressed) {
         HWND hwnd = reinterpret_cast<HWND>(host_hwnd_);
-        UINT dpi = GetDpiForWindow(hwnd);
-        if (dpi == 0) dpi = 96;
-        RECT rect{0, 0, w, h};
-        DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
-        DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
-        AdjustWindowRectExForDpi(&rect, style, FALSE, ex_style, dpi);
-        int outer_w = rect.right - rect.left;
-        int outer_h = rect.bottom - rect.top;
-        SetWindowPos(hwnd, nullptr, 0, 0, outer_w, outer_h,
-                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SendMessageW(hwnd,
+                     kBridgeResizePluginClientMsg,
+                     static_cast<WPARAM>(std::max<int32>(1, w)),
+                     static_cast<LPARAM>(std::max<int32>(1, h)));
     }
     view->onSize(newSize);
     return kResultOk;

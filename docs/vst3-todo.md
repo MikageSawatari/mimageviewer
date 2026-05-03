@@ -360,7 +360,9 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - Phase 1 done: bridge-owned VST3 editor windows request DWM dark caption,
   text, and border colors after `CreateWindowExW`. This removes the bright
   native white title bar without changing the editor HWND ownership model.
+- Phase 2 started: the bridge editor surface is split into an outer mIV frame
+  HWND and an inner child HWND used for `IPlugView::attached()`. The outer frame
+  draws a black title bar with plugin name, latency, and a close button, while
+  drag/resize/z-order still target the outer HWND.
 - Follow-up: a fully custom title bar with inline power/bypass and latency
-  display requires splitting the current top-level editor surface into a frame
-  HWND plus a child plugin-host HWND. Keep that as a separate refactor because
-  it touches drag, resize, owner, z-order, and `IPlugView::attached()` sizing.
+  control still needs a Rust-side bypass IPC event and settings sync.

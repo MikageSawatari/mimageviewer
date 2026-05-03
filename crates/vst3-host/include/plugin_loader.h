@@ -143,6 +143,18 @@ public:
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
     void* gui_container_hwnd() const;
+    void* gui_plugin_host_hwnd() const {
+        return view_plugin_host_hwnd_;
+    }
+    std::string editor_chrome_title() const {
+        return plugin_name_;
+    }
+    uint32_t editor_chrome_latency_samples() const {
+        return latency_samples();
+    }
+    uint32_t editor_chrome_sample_rate() const {
+        return sample_rate_;
+    }
     bool is_editor_quarantined() const {
         return editor_quarantined_.load(std::memory_order_acquire);
     }
@@ -198,6 +210,7 @@ private:
     bool view_attached_ = false;
     void* view_host_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
+    void* view_plugin_host_hwnd_ = nullptr;
     std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
     bool gui_surface_visible_ = false;
     bool gui_app_active_ = true;

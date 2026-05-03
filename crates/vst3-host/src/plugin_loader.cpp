@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <windowsx.h>
 #include <dwmapi.h>
 #include <ole2.h>
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
@@ -40,6 +41,8 @@ inline void blog(const char* msg) {
 }
 
 constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContainer";
+constexpr const wchar_t* kBridgePluginHostClass = L"MivVst3PluginHost";
+constexpr UINT kBridgeResizePluginClientMsg = WM_APP + 0x4D9;
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -67,6 +70,113 @@ std::wstring utf8_to_wide(const std::string& text) {
     return out;
 }
 
+int editor_titlebar_height(HWND hwnd) {
+    UINT dpi = hwnd ? GetDpiForWindow(hwnd) : GetDpiForSystem();
+    if (dpi == 0) dpi = 96;
+    return std::max(28, MulDiv(34, static_cast<int>(dpi), 96));
+}
+
+RECT editor_close_button_rect(HWND hwnd) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int title_h = editor_titlebar_height(hwnd);
+    const int button = std::max(18, title_h - 10);
+    const int top = std::max(0, (title_h - button) / 2);
+    return RECT{client.right - button - 8, top, client.right - 8, top + button};
+}
+
+bool point_in_rect(const RECT& rect, POINT pt) {
+    return pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom;
+}
+
+void layout_editor_child(HWND frame_hwnd, HWND child_hwnd) {
+    if (!frame_hwnd || !child_hwnd || !IsWindow(frame_hwnd) || !IsWindow(child_hwnd)) {
+        return;
+    }
+    RECT client{};
+    if (!GetClientRect(frame_hwnd, &client)) {
+        return;
+    }
+    const int title_h = editor_titlebar_height(frame_hwnd);
+    const int width = std::max<LONG>(1, client.right - client.left);
+    const int height = std::max<LONG>(1, client.bottom - client.top - title_h);
+    SetWindowPos(child_hwnd,
+                 nullptr,
+                 0,
+                 title_h,
+                 width,
+                 height,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+bool resize_frame_for_plugin_client(HWND frame_hwnd, int plugin_w, int plugin_h) {
+    if (!frame_hwnd || !IsWindow(frame_hwnd) || plugin_w <= 0 || plugin_h <= 0) {
+        return false;
+    }
+    const int title_h = editor_titlebar_height(frame_hwnd);
+    RECT outer{0, 0, plugin_w, plugin_h + title_h};
+    DWORD style = static_cast<DWORD>(GetWindowLongPtrW(frame_hwnd, GWL_STYLE));
+    DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(frame_hwnd, GWL_EXSTYLE));
+    UINT dpi = GetDpiForWindow(frame_hwnd);
+    if (dpi == 0) dpi = 96;
+    AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
+    SetWindowPos(frame_hwnd,
+                 nullptr,
+                 0,
+                 0,
+                 std::max<LONG>(1, outer.right - outer.left),
+                 std::max<LONG>(1, outer.bottom - outer.top),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return true;
+}
+
+void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
+    PAINTSTRUCT ps{};
+    HDC hdc = BeginPaint(hwnd, &ps);
+    if (!hdc) return;
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    RECT title_rect{0, 0, client.right, editor_titlebar_height(hwnd)};
+    HBRUSH bg = CreateSolidBrush(RGB(18, 18, 18));
+    FillRect(hdc, &title_rect, bg);
+    DeleteObject(bg);
+
+    RECT close_rect = editor_close_button_rect(hwnd);
+    HBRUSH close_bg = CreateSolidBrush(RGB(38, 38, 38));
+    FillRect(hdc, &close_rect, close_bg);
+    DeleteObject(close_bg);
+    HPEN close_pen = CreatePen(PS_SOLID, 2, RGB(230, 230, 230));
+    HGDIOBJ old_pen = SelectObject(hdc, close_pen);
+    MoveToEx(hdc, close_rect.left + 6, close_rect.top + 6, nullptr);
+    LineTo(hdc, close_rect.right - 6, close_rect.bottom - 6);
+    MoveToEx(hdc, close_rect.right - 6, close_rect.top + 6, nullptr);
+    LineTo(hdc, close_rect.left + 6, close_rect.bottom - 6);
+    SelectObject(hdc, old_pen);
+    DeleteObject(close_pen);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(228, 228, 228));
+    std::wstring title = utf8_to_wide(loader ? loader->editor_chrome_title() : std::string{});
+    if (loader) {
+        const uint32_t latency = loader->editor_chrome_latency_samples();
+        const uint32_t sample_rate = loader->editor_chrome_sample_rate();
+        if (latency > 0 && sample_rate > 0) {
+            wchar_t suffix[96]{};
+            swprintf_s(suffix,
+                       L"  |  %.1f ms",
+                       static_cast<double>(latency) * 1000.0 / static_cast<double>(sample_rate));
+            title += suffix;
+        }
+    }
+    RECT text_rect{12, 0, close_rect.left - 10, title_rect.bottom};
+    DrawTextW(hdc,
+              title.c_str(),
+              static_cast<int>(title.size()),
+              &text_rect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    EndPaint(hwnd, &ps);
+}
+
 LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_NCCREATE) {
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(lparam);
@@ -75,6 +185,15 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         }
     }
     auto* loader = reinterpret_cast<miv::PluginLoader*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == kBridgeResizePluginClientMsg) {
+        resize_frame_for_plugin_client(hwnd,
+                                       static_cast<int>(wparam),
+                                       static_cast<int>(lparam));
+        if (loader) {
+            layout_editor_child(hwnd, reinterpret_cast<HWND>(loader->gui_plugin_host_hwnd()));
+        }
+        return 0;
+    }
     if (msg == WM_CLOSE) {
         if (loader) {
             loader->set_gui_surface_visible_state(false);
@@ -91,9 +210,54 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
     }
     if (msg == WM_SIZE && wparam != SIZE_MINIMIZED) {
         if (loader) {
+            layout_editor_child(hwnd, reinterpret_cast<HWND>(loader->gui_plugin_host_hwnd()));
             loader->handle_editor_drag_tick(msg);
             loader->handle_editor_window_size();
         }
+    }
+    if (msg == WM_NCHITTEST) {
+        POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        ScreenToClient(hwnd, &pt);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        UINT dpi = GetDpiForWindow(hwnd);
+        if (dpi == 0) dpi = 96;
+        const int frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
+                          GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        const bool resizable =
+            (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME) == WS_THICKFRAME;
+        if (resizable) {
+            const bool left = pt.x < frame;
+            const bool right = pt.x >= client.right - frame;
+            const bool top = pt.y < frame;
+            const bool bottom = pt.y >= client.bottom - frame;
+            if (top && left) return HTTOPLEFT;
+            if (top && right) return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left) return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top) return HTTOP;
+            if (bottom) return HTBOTTOM;
+        }
+        if (pt.y < editor_titlebar_height(hwnd) && !point_in_rect(editor_close_button_rect(hwnd), pt)) {
+            return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+    if (msg == WM_LBUTTONUP) {
+        POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
+            if (loader) {
+                loader->set_gui_surface_visible_state(false);
+            }
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+    }
+    if (msg == WM_PAINT) {
+        draw_editor_chrome(hwnd, loader);
+        return 0;
     }
     if (msg == WM_ENTERSIZEMOVE) {
         if (loader) {
@@ -132,6 +296,10 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+LRESULT CALLBACK BridgePluginHostProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
 bool ensure_bridge_view_container_class() {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -139,6 +307,19 @@ bool ensure_bridge_view_container_class() {
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = kBridgeViewContainerClass;
+    if (RegisterClassExW(&wc) != 0) {
+        return true;
+    }
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+bool ensure_bridge_plugin_host_class() {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = BridgePluginHostProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kBridgePluginHostClass;
     if (RegisterClassExW(&wc) != 0) {
         return true;
     }
@@ -200,21 +381,28 @@ void apply_dark_editor_chrome(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
 }
 
-HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::PluginLoader* loader) {
+struct BridgeEditorWindows {
+    HWND frame = nullptr;
+    HWND plugin_host = nullptr;
+};
+
+BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& options,
+                                                 miv::PluginLoader* loader) {
     HWND owner_hwnd = reinterpret_cast<HWND>(options.owner_hwnd);
-    if (!ensure_bridge_view_container_class()) {
-        return nullptr;
+    if (!ensure_bridge_view_container_class() || !ensure_bridge_plugin_host_class()) {
+        return {};
     }
-    const DWORD style = WS_POPUP | WS_CAPTION |
+    const DWORD style = WS_POPUP | WS_BORDER |
                         (options.resizable ? WS_THICKFRAME : 0) |
                         WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
     const DWORD ex_style = WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE;
     UINT dpi = owner_hwnd ? GetDpiForWindow(owner_hwnd) : GetDpiForSystem();
     if (dpi == 0) dpi = 96;
+    const int title_h = std::max(28, MulDiv(34, static_cast<int>(dpi), 96));
     RECT outer{0,
                0,
                static_cast<LONG>(std::max<uint32_t>(1, options.width)),
-               static_cast<LONG>(std::max<uint32_t>(1, options.height))};
+               static_cast<LONG>(std::max<uint32_t>(1, options.height)) + title_h};
     AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
     const int width = std::max<LONG>(1, outer.right - outer.left);
     const int height = std::max<LONG>(1, outer.bottom - outer.top);
@@ -235,20 +423,40 @@ HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::Plu
                                      loader);
     if (!container) {
         blog("bridge view container create failed err=%lu", GetLastError());
-        return nullptr;
+        return {};
     }
+    HWND plugin_host = CreateWindowExW(0,
+                                       kBridgePluginHostClass,
+                                       L"",
+                                       WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                                       0,
+                                       title_h,
+                                       static_cast<int>(options.width),
+                                       static_cast<int>(options.height),
+                                       container,
+                                       nullptr,
+                                       GetModuleHandleW(nullptr),
+                                       nullptr);
+    if (!plugin_host) {
+        blog("bridge plugin host child create failed err=%lu", GetLastError());
+        DestroyWindow(container);
+        return {};
+    }
+    layout_editor_child(container, plugin_host);
     apply_dark_editor_chrome(container);
-    blog("bridge editor window created gui_tid=%lu hwnd=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d",
+    blog("bridge editor window created gui_tid=%lu frame=0x%llx child=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d title_h=%d",
          GetCurrentThreadId(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container)),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(plugin_host)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(owner_hwnd)),
          x,
          y,
          options.width,
          options.height,
          width,
-         height);
-    return container;
+         height,
+         title_h);
+    return {container, plugin_host};
 }
 
 }  // namespace
@@ -1160,22 +1368,25 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         blog("show_gui: plugin does not implement IPlugViewContentScaleSupport");
     }
 
-    HWND attach_hwnd = create_bridge_view_container(options, this);
-    if (!attach_hwnd) {
+    BridgeEditorWindows editor_hwnds = create_bridge_view_container(options, this);
+    HWND frame_hwnd = editor_hwnds.frame;
+    HWND attach_hwnd = editor_hwnds.plugin_host;
+    if (!frame_hwnd || !attach_hwnd) {
         error_out = "failed to create editor window";
         view_->setFrame(nullptr);
         view_ = nullptr;
         return false;
     }
 
-    plug_frame_->set_host_hwnd(attach_hwnd);
-    blog("show_gui: attached(hwnd, HWND) gui_tid=%lu editor=0x%llx",
+    plug_frame_->set_host_hwnd(frame_hwnd);
+    blog("show_gui: attached(hwnd, HWND) gui_tid=%lu frame=0x%llx child=0x%llx",
          GetCurrentThreadId(),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(frame_hwnd)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(attach_hwnd)));
     if (view_->attached(attach_hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
         error_out = "attached() failed";
-        if (IsWindow(attach_hwnd)) {
-            DestroyWindow(attach_hwnd);
+        if (IsWindow(frame_hwnd)) {
+            DestroyWindow(frame_hwnd);
         }
         view_->setFrame(nullptr);
         view_ = nullptr;
@@ -1183,8 +1394,9 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     }
     view_attached_ = true;
     view_host_hwnd_ = options.owner_hwnd;
-    view_container_hwnd_ = attach_hwnd;
-    view_container_hwnd_snapshot_.store(attach_hwnd, std::memory_order_release);
+    view_container_hwnd_ = frame_hwnd;
+    view_plugin_host_hwnd_ = attach_hwnd;
+    view_container_hwnd_snapshot_.store(frame_hwnd, std::memory_order_release);
     blog("show_gui: attached ok");
 
     // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
@@ -1196,19 +1408,8 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         blog("show_gui: getSize=%dx%d, resize container, onSize", preferred_w, preferred_h);
         if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
             container_hwnd && IsWindow(container_hwnd)) {
-            RECT outer{0, 0, preferred_w, preferred_h};
-            DWORD style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_STYLE));
-            DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_EXSTYLE));
-            UINT dpi = GetDpiForWindow(container_hwnd);
-            if (dpi == 0) dpi = 96;
-            AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
-            SetWindowPos(container_hwnd,
-                         nullptr,
-                         0,
-                         0,
-                         outer.right - outer.left,
-                         outer.bottom - outer.top,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            resize_frame_for_plugin_client(container_hwnd, preferred_w, preferred_h);
+            layout_editor_child(container_hwnd, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
         }
         view_->onSize(&rect);
         last_gui_width_ = static_cast<uint32_t>(preferred_w);
@@ -1256,9 +1457,11 @@ void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
     if (!container_hwnd || !IsWindow(container_hwnd)) {
         return;
     }
+    HWND plugin_hwnd = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
+    layout_editor_child(container_hwnd, plugin_hwnd);
     if (view_attached_ && view_) {
         RECT client{};
-        if (GetClientRect(container_hwnd, &client)) {
+        if (plugin_hwnd && IsWindow(plugin_hwnd) && GetClientRect(plugin_hwnd, &client)) {
             const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
             const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
             Steinberg::ViewRect rect{0,
@@ -1530,8 +1733,10 @@ void PluginLoader::handle_editor_window_size() {
     if (!view_attached_ || !view_ || !container_hwnd || !IsWindow(container_hwnd)) {
         return;
     }
+    HWND plugin_hwnd = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
+    layout_editor_child(container_hwnd, plugin_hwnd);
     RECT client{};
-    if (!GetClientRect(container_hwnd, &client)) {
+    if (!plugin_hwnd || !IsWindow(plugin_hwnd) || !GetClientRect(plugin_hwnd, &client)) {
         return;
     }
     const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
@@ -1743,19 +1948,10 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     if (!view_attached_ || !view_) return;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd) && width > 0 && height > 0) {
-        RECT outer{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-        DWORD style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_STYLE));
-        DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_EXSTYLE));
-        UINT dpi = GetDpiForWindow(container_hwnd);
-        if (dpi == 0) dpi = 96;
-        AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
-        SetWindowPos(container_hwnd,
-                     nullptr,
-                     0,
-                     0,
-                     outer.right - outer.left,
-                     outer.bottom - outer.top,
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        resize_frame_for_plugin_client(container_hwnd,
+                                       static_cast<int>(width),
+                                       static_cast<int>(height));
+        layout_editor_child(container_hwnd, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
     }
     const bool size_changed = width != last_gui_width_ || height != last_gui_height_;
     if (!size_changed) {
@@ -1781,6 +1977,7 @@ void PluginLoader::hide_gui() {
             abandon_gui_thread("hide_gui quarantined");
             view_host_hwnd_ = nullptr;
             view_container_hwnd_ = nullptr;
+            view_plugin_host_hwnd_ = nullptr;
             view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
             gui_surface_visible_ = false;
             gui_app_active_ = true;
@@ -1811,6 +2008,7 @@ void PluginLoader::hide_gui() {
     view_attached_ = false;
     view_host_hwnd_ = nullptr;
     view_container_hwnd_ = nullptr;
+    view_plugin_host_hwnd_ = nullptr;
     view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
     gui_surface_visible_ = false;
     gui_app_active_ = true;
